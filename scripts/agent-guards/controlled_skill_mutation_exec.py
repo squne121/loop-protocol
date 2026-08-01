@@ -3628,8 +3628,14 @@ def _run_issue_relationship_update(args, input_data, gh_bin, _fail, _ok) -> int:
             )
 
     parent_noop = parent_action["action"] == "unchanged" or desired_parent_number == current_parent_number
-    if parent_noop and not add_bb and not rm_bb and not add_bl and not rm_bl:
-        # AC8: idempotent no-op -- current == desired, zero mutation calls.
+    # PR #1897 P1-2: idempotent no-op is decided by the *effective* diff
+    # (current == desired), not by whether the caller's raw add/remove
+    # lists happen to be empty. A caller can request add_blocked_by for a
+    # target already present, or remove_blocked_by for a target that is not
+    # present -- both are redundant no-ops for that entry, and the AC8
+    # contract ("current == desired native state produces zero mutation
+    # calls") must still hold even when the raw request lists are non-empty.
+    if parent_noop and desired_snapshot == before_snapshot:
         return _ok(
             {
                 "status": "no_op",
@@ -3643,6 +3649,15 @@ def _run_issue_relationship_update(args, input_data, gh_bin, _fail, _ok) -> int:
                 "actor_permission": permission,
             }
         )
+
+    # Operations are built from the *effective* diff (desired vs. current),
+    # never from the raw caller-declared add/remove sets, so a redundant
+    # add-of-an-already-present-target or remove-of-an-absent-target never
+    # produces a GraphQL mutation call.
+    effective_remove_bb = sorted(set(current_blocked_by) - set(desired_blocked_by))
+    effective_add_bb = sorted(set(desired_blocked_by) - set(current_blocked_by))
+    effective_remove_bl = sorted(set(current_blocking) - set(desired_blocking))
+    effective_add_bl = sorted(set(desired_blocking) - set(current_blocking))
 
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
     pre_mutation_changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
@@ -3659,16 +3674,19 @@ def _run_issue_relationship_update(args, input_data, gh_bin, _fail, _ok) -> int:
         if parent_action["action"] == "remove" and current_parent_number is not None:
             operations.append({"kind": "remove_parent", "target": current_parent_number})
         elif parent_action["action"] == "set":
-            if current_parent_number is not None:
-                operations.append({"kind": "remove_parent", "target": current_parent_number})
+            # PR #1897 P1-3: addSubIssue(replaceParent: true) already atomically
+            # replaces any existing parent in a single mutation -- issuing a
+            # separate remove_parent first only creates an unnecessary
+            # window where the issue is briefly parentless if the
+            # subsequent set_parent call fails.
             operations.append({"kind": "set_parent", "target": desired_parent_number})
-    for n in sorted(rm_bb):
+    for n in effective_remove_bb:
         operations.append({"kind": "remove_blocked_by", "target": n})
-    for n in sorted(add_bb):
+    for n in effective_add_bb:
         operations.append({"kind": "add_blocked_by", "target": n})
-    for n in sorted(rm_bl):
+    for n in effective_remove_bl:
         operations.append({"kind": "remove_blocking", "target": n})
-    for n in sorted(add_bl):
+    for n in effective_add_bl:
         operations.append({"kind": "add_blocking", "target": n})
 
     all_operation_labels = [f"{op['kind']}:{op['target']}" for op in operations]

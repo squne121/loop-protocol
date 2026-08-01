@@ -1498,3 +1498,117 @@ class TestIssueRelationshipUpdateActorPermission:
         assert results["outcome"] == "fail"
         assert results["status"] == "precondition_rejected"
         assert "credential_actor_not_authorized" in results["reason"]
+
+
+class TestIssueRelationshipUpdateEffectiveDiffNoOp:
+    """PR #1897 P1-2: idempotent no-op is decided by the effective diff
+    (current == desired), not by whether the raw add/remove lists are
+    empty."""
+
+    def test_redundant_add_remove_produces_zero_graphql_mutations(self, monkeypatch):
+        # add_blocked_by=[10] is already present; remove_blocked_by=[99] is
+        # not present. Both are redundant -- current == desired -- so this
+        # must resolve to no_op with zero GraphQL mutation calls. The
+        # side_effect list intentionally only contains the pre-mutation
+        # readback calls (self+parent, blockedBy, blocking); any further
+        # call would raise StopIteration and fail this test.
+        input_data = _relationship_input(
+            expected_before={"parent": None, "blocked_by": [10], "blocking": []},
+            add_blocked_by=[10],
+            remove_blocked_by=[99],
+        )
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", [_rel_node("N10", 10)]), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "ok"
+        assert results["status"] == "no_op"
+        assert results["mutation_attempted"] is False
+
+
+class TestIssueRelationshipUpdateParentRebindSingleMutation:
+    """PR #1897 P1-3: a parent rebind (old parent -> new parent) must use a
+    single addSubIssue(replaceParent: true) mutation, never a
+    remove_parent + set_parent pair."""
+
+    def test_parent_rebind_uses_single_add_sub_issue_replace_parent(self, monkeypatch):
+        input_data = _relationship_input(
+            expected_before={"parent": 1674, "blocked_by": [], "blocking": []},
+            parent={"action": "set", "issue_number": 1860},
+        )
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent={"id": "IOLD", "number": 1674, "state": "OPEN"}), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+            # ancestor walk for candidate parent 1860 -- no ancestor cycle.
+            (_relationship_self_and_parent("INEW", 1860, parent=None), ""),
+            (_relationship_node_lookup("INEW", 1860), ""),  # lookup target for set_parent
+            (
+                {"addSubIssue": {"issue": {"id": "INEW", "number": 1860}, "subIssue": {"id": "ISELF", "number": 1883}}},
+                "",
+            ),
+            (_relationship_self_and_parent("ISELF", 1883, parent={"id": "INEW", "number": 1860, "state": "OPEN"}), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "ok"
+        assert results["status"] == "applied"
+        assert results["completed_operations"] == ["set_parent:1860"]
+
+    def test_parent_rebind_never_calls_remove_sub_issue_first(self, monkeypatch):
+        # No removeSubIssue-shaped response is included in this call list --
+        # if the implementation issued a remove_parent operation before
+        # set_parent, the extra _lookup_relationship_issue_node +
+        # _REMOVE_SUB_ISSUE_MUTATION calls would consume the wrong list
+        # entries and this test would fail (StopIteration or a shape
+        # mismatch), proving only a single addSubIssue mutation is issued.
+        input_data = _relationship_input(
+            expected_before={"parent": 1674, "blocked_by": [], "blocking": []},
+            parent={"action": "set", "issue_number": 1860},
+        )
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent={"id": "IOLD", "number": 1674, "state": "OPEN"}), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+            (_relationship_self_and_parent("INEW", 1860, parent=None), ""),
+            (_relationship_node_lookup("INEW", 1860), ""),
+            (
+                {"addSubIssue": {"issue": {"id": "INEW", "number": 1860}, "subIssue": {"id": "ISELF", "number": 1883}}},
+                "",
+            ),
+            (_relationship_self_and_parent("ISELF", 1883, parent={"id": "INEW", "number": 1860, "state": "OPEN"}), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "ok"
+        assert results["completed_operations"] == ["set_parent:1860"]
+
+    def test_parent_rebind_is_single_replace_parent_mutation(self, monkeypatch):
+        """Same scenario as above, verified via the shared _run_relationship
+        harness for consistency with the rest of this test module."""
+        input_data = _relationship_input(
+            expected_before={"parent": 1674, "blocked_by": [], "blocking": []},
+            parent={"action": "set", "issue_number": 1860},
+        )
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent={"id": "IOLD", "number": 1674, "state": "OPEN"}), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+            (_relationship_self_and_parent("INEW", 1860, parent=None), ""),
+            (_relationship_node_lookup("INEW", 1860), ""),
+            (
+                {"addSubIssue": {"issue": {"id": "INEW", "number": 1860}, "subIssue": {"id": "ISELF", "number": 1883}}},
+                "",
+            ),
+            (_relationship_self_and_parent("ISELF", 1883, parent={"id": "INEW", "number": 1860, "state": "OPEN"}), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "ok"
+        assert len(results["completed_operations"]) == 1
+        assert results["completed_operations"][0] == "set_parent:1860"

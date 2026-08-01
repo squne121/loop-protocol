@@ -785,6 +785,11 @@ def test_native_mutation_failure_blocks_content_update(
     monkeypatch.setattr(
         txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
     )
+    # Issue #1897 P0-1: candidate body guard/hygiene/readiness now run
+    # *before* the native relationship mutation is attempted, so this test
+    # (which exercises a native mutation failure) must let that content
+    # validation pass in order to reach the relationship executor call.
+    _stub_content_flow(monkeypatch, repo_tmp)
 
     calls: list[str] = []
 
@@ -835,6 +840,10 @@ def test_native_parent_set_and_remove_readback(
     readbacks = iter(
         [
             {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+            # Issue #1897 P1-7: after the native relationship mutation
+            # succeeds, the transaction re-reads title/body/updatedAt before
+            # attempting the content mutation.
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
             {"title": "old", "body": "new issue body", "updatedAt": "2026-07-03T10:41:51Z"},
         ]
     )
@@ -887,13 +896,18 @@ def test_native_blocked_by_add_remove_full_pagination_exact_set(
         repo_tmp,
         _base_relationships(
             expected_before={"parent": None, "blocked_by": [10, 20], "blocking": []},
-            add_blocked_by=[30, 5, 5],
+            # Issue #1897 P1-1: add_blocked_by must already be sorted/unique
+            # -- validate_issue_relationship_update_input() rejects
+            # duplicate/unsorted raw input, and the caller no longer
+            # deduplicates/sorts before validation.
+            add_blocked_by=[5, 30],
             remove_blocked_by=[10],
         ),
     )
     readbacks = iter(
         [
             {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
             {"title": "old", "body": "new issue body", "updatedAt": "2026-07-03T10:41:51Z"},
         ]
     )
@@ -955,6 +969,7 @@ def test_native_blocking_add_remove_full_pagination_exact_set(
     readbacks = iter(
         [
             {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
             {"title": "old", "body": "new issue body", "updatedAt": "2026-07-03T10:41:51Z"},
         ]
     )
@@ -996,6 +1011,10 @@ def test_final_readback_all_fields_match_required_for_ok(
     readbacks = iter(
         [
             {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+            # Issue #1897 P1-7: post-relationship-mutation refresh readback --
+            # unchanged, so it does not itself trigger the concurrent-drift
+            # guard.
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
             # Final readback returns an unrelated body -- content mismatch.
             {"title": "old", "body": "DRIFTED body", "updatedAt": "2026-07-03T10:41:51Z"},
         ]
@@ -1063,6 +1082,7 @@ def test_identical_desired_state_is_idempotent_no_op(
     readbacks = iter(
         [
             {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
             {"title": "old", "body": "new issue body", "updatedAt": "2026-07-03T10:41:51Z"},
         ]
     )
@@ -1111,6 +1131,9 @@ def test_partial_native_mutation_returns_failed_after_mutation(
     monkeypatch.setattr(
         txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
     )
+    # Issue #1897 P0-1: candidate body guard/hygiene/readiness now run
+    # before the native relationship mutation is attempted.
+    _stub_content_flow(monkeypatch, repo_tmp)
 
     calls: list[str] = []
 
@@ -1260,6 +1283,7 @@ def test_body_parent_rebind_updates_native_parent_1679_fixture(
     readbacks = iter(
         [
             {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
             {"title": "old", "body": rebind_body, "updatedAt": "2026-07-03T10:41:51Z"},
         ]
     )
@@ -1288,3 +1312,477 @@ def test_body_parent_rebind_updates_native_parent_1679_fixture(
     result = txn.run_transaction(_normal_input_with_new_body_from(payload, repo_tmp, rebind_body))
     assert result["status"] == "ok"
     assert result["native_relationships"]["after"]["parent"] == 1860
+
+
+# ---------------------------------------------------------------------------
+# PR #1897 iteration-4 fix_delta: transaction-integrity regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_missing_body_file_never_invokes_relationship_executor(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-1 bullet 1: new_body_file is read (and must exist) before any
+    native relationship mutation is attempted."""
+    payload = _minimal_input_with_relationships(repo_tmp, _base_relationships(add_blocked_by=[3]))
+    payload["new_body_file"] = "tmp/does_not_exist.md"
+
+    def _fetch(*_a: object, **_k: object) -> tuple[dict, str]:
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    monkeypatch.setattr(
+        txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
+    )
+
+    def _invoke(*_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        pytest.fail("relationship executor must never run before new_body_file is read")
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    with pytest.raises(ValueError):
+        txn.run_transaction(payload)
+
+
+def test_body_guard_failure_never_invokes_relationship_executor(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-1: candidate body guard failure blocks the native relationship
+    mutation entirely, and the transaction reports no native mutation
+    attempt at all."""
+    payload = _minimal_input_with_relationships(repo_tmp, _base_relationships(add_blocked_by=[3]))
+
+    def _fetch(*_a: object, **_k: object) -> tuple[dict, str]:
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+
+    def _run(args: list[str]) -> _CP:
+        if str(txn.GUARD_SCRIPT) in args:
+            return _CP(2, stderr="guard failed")
+        pytest.fail(f"unexpected command: {args}")
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_run_command", _run)
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    monkeypatch.setattr(
+        txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
+    )
+
+    def _invoke(*_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        pytest.fail("relationship executor must never run when candidate body guard fails")
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(payload)
+    assert result["status"] == "failed_no_mutation"
+    assert result["mutation_started"] is False
+    assert result["native_relationships"]["attempted"] is False
+    assert result["native_relationships"]["status"] == "not_run"
+
+
+def test_readiness_failure_never_invokes_relationship_executor(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-1: candidate body readiness failure blocks the native relationship
+    mutation entirely."""
+    payload = _minimal_input_with_relationships(repo_tmp, _base_relationships(add_blocked_by=[3]))
+
+    def _fetch(*_a: object, **_k: object) -> tuple[dict, str]:
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+
+    def _run(args: list[str]) -> _CP:
+        if str(txn.GUARD_SCRIPT) in args:
+            return _CP(0, stdout='{"status":"pass"}')
+        if str(txn.HYGIENE_SCRIPT) in args:
+            return _CP(0)
+        if str(txn.READINESS_SCRIPT) in args:
+            return _CP(1, stderr="readiness failed")
+        pytest.fail(f"unexpected command: {args}")
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_run_command", _run)
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    monkeypatch.setattr(
+        txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
+    )
+
+    def _invoke(*_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        pytest.fail("relationship executor must never run when candidate body readiness fails")
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(payload)
+    assert result["status"] == "failed_no_mutation"
+    assert result["mutation_started"] is False
+    assert result["native_relationships"]["attempted"] is False
+
+
+def test_exception_after_native_apply_never_reports_failed_no_mutation(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-1 bullet 5: an unexpected exception raised after a native
+    relationship mutation has already been attempted must never surface as
+    failed_no_mutation."""
+    payload = _minimal_input_with_relationships(repo_tmp, _base_relationships(add_blocked_by=[3]))
+
+    def _fetch(*_a: object, **_k: object) -> tuple[dict, str]:
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    monkeypatch.setattr(
+        txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
+    )
+    _stub_content_flow(monkeypatch, repo_tmp)
+
+    def _invoke(command_id: str, *_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        if command_id == "issue_relationship.update":
+            return _CP(0), {
+                "status": "applied",
+                "mutation_attempted": True,
+                "before": {"parent": None, "blocked_by": [], "blocking": []},
+                "desired": {"parent": None, "blocked_by": [3], "blocking": []},
+                "after": {"parent": None, "blocked_by": [3], "blocking": []},
+                "completed_operations": ["add_blocked_by:3"],
+                "pending_operations": [],
+            }
+        raise RuntimeError("simulated unexpected failure after native apply")
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(_normal_input_with_new_body_from(payload, repo_tmp, "new issue body"))
+    assert result["status"] != "failed_no_mutation"
+    assert result["mutation_started"] is True
+    assert result["native_relationships"]["status"] == "applied"
+
+
+def test_native_apply_then_body_failure_reports_failed_after_mutation(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-1: a real native relationship mutation followed by a body
+    controlled-executor failure must report failed_after_mutation, not
+    failed_no_mutation."""
+    payload = _minimal_input_with_relationships(repo_tmp, _base_relationships(add_blocked_by=[3]))
+    readbacks = iter(
+        [
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
+        ]
+    )
+    monkeypatch.setattr(txn, "_fetch_issue", lambda *_a, **_k: (next(readbacks), ""))
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    monkeypatch.setattr(
+        txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
+    )
+    _stub_content_flow(monkeypatch, repo_tmp)
+
+    def _invoke(command_id: str, *_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        if command_id == "issue_relationship.update":
+            return _CP(0), {
+                "status": "applied",
+                "mutation_attempted": True,
+                "before": {"parent": None, "blocked_by": [], "blocking": []},
+                "desired": {"parent": None, "blocked_by": [3], "blocking": []},
+                "after": {"parent": None, "blocked_by": [3], "blocking": []},
+                "completed_operations": ["add_blocked_by:3"],
+                "pending_operations": [],
+            }
+        return _CP(1), {"status": "failed"}
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(_normal_input_with_new_body_from(payload, repo_tmp, "new issue body"))
+    assert result["status"] != "failed_no_mutation"
+    assert result["mutation_started"] is True
+    assert result["native_relationships"]["status"] == "applied"
+
+
+def test_final_combined_readback_rejects_parent_drift(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-2: a native parent drift observed after content mutation completes
+    must prevent an `ok` result."""
+    payload = _minimal_input_with_relationships(
+        repo_tmp,
+        _base_relationships(
+            expected_before={"parent": None, "blocked_by": [], "blocking": []},
+            parent={"action": "set", "issue_number": 1860},
+        ),
+    )
+    readbacks = iter(
+        [
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
+            {"title": "old", "body": "new issue body", "updatedAt": "2026-07-03T10:41:51Z"},
+        ]
+    )
+    monkeypatch.setattr(txn, "_fetch_issue", lambda *_a, **_k: (next(readbacks), ""))
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    monkeypatch.setattr(
+        txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
+    )
+    _stub_content_flow(monkeypatch, repo_tmp)
+
+    calls: list[str] = []
+
+    def _invoke(command_id: str, *_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        calls.append(command_id)
+        if command_id == "issue_relationship.update":
+            if len([c for c in calls if c == "issue_relationship.update"]) == 1:
+                return _CP(0), {
+                    "status": "applied",
+                    "mutation_attempted": True,
+                    "before": {"parent": None, "blocked_by": [], "blocking": []},
+                    "desired": {"parent": 1860, "blocked_by": [], "blocking": []},
+                    "after": {"parent": 1860, "blocked_by": [], "blocking": []},
+                    "completed_operations": ["set_parent:1860"],
+                    "pending_operations": [],
+                }
+            # Final combined readback (Phase C) -- someone else changed the
+            # parent after Phase B confirmed it.
+            return _CP(0), {
+                "status": "precondition_rejected",
+                "mutation_attempted": False,
+                "before": {"parent": 999, "blocked_by": [], "blocking": []},
+                "desired": {"parent": 1860, "blocked_by": [], "blocking": []},
+                "after": None,
+            }
+        return _CP(0), {"new_body_sha256": txn._sha256_text("new issue body")}
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(_normal_input_with_new_body_from(payload, repo_tmp, "new issue body"))
+    assert result["status"] == "failed_after_mutation"
+    codes = [e["code"] for e in result["native_relationships"]["errors"]]
+    assert "final_native_relationship_readback_drift" in codes
+
+
+def test_final_combined_readback_rejects_blocked_by_drift(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-2: a native blocked_by drift observed after content mutation
+    completes must prevent an `ok` result, mirroring the parent-drift
+    regression test above for the blocked_by relation."""
+    payload = _minimal_input_with_relationships(repo_tmp, _base_relationships(add_blocked_by=[3]))
+    readbacks = iter(
+        [
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
+            {"title": "old", "body": "new issue body", "updatedAt": "2026-07-03T10:41:51Z"},
+        ]
+    )
+    monkeypatch.setattr(txn, "_fetch_issue", lambda *_a, **_k: (next(readbacks), ""))
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    monkeypatch.setattr(
+        txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
+    )
+    _stub_content_flow(monkeypatch, repo_tmp)
+
+    calls: list[str] = []
+
+    def _invoke(command_id: str, *_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        calls.append(command_id)
+        if command_id == "issue_relationship.update":
+            if len([c for c in calls if c == "issue_relationship.update"]) == 1:
+                return _CP(0), {
+                    "status": "applied",
+                    "mutation_attempted": True,
+                    "before": {"parent": None, "blocked_by": [], "blocking": []},
+                    "desired": {"parent": None, "blocked_by": [3], "blocking": []},
+                    "after": {"parent": None, "blocked_by": [3], "blocking": []},
+                    "completed_operations": ["add_blocked_by:3"],
+                    "pending_operations": [],
+                }
+            # Final combined readback: blocked_by has drifted since Phase B.
+            return _CP(0), {
+                "status": "precondition_rejected",
+                "mutation_attempted": False,
+                "before": {"parent": None, "blocked_by": [], "blocking": []},
+                "desired": {"parent": None, "blocked_by": [3], "blocking": []},
+                "after": None,
+            }
+        return _CP(0), {"new_body_sha256": txn._sha256_text("new issue body")}
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(_normal_input_with_new_body_from(payload, repo_tmp, "new issue body"))
+    assert result["status"] == "failed_after_mutation"
+    codes = [e["code"] for e in result["native_relationships"]["errors"]]
+    assert "final_native_relationship_readback_drift" in codes
+
+
+def test_raw_duplicate_relationship_input_is_rejected(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-1: duplicate entries in add_blocked_by must be rejected by the
+    graph-invariant validator, not silently deduplicated before
+    validation."""
+    payload = _minimal_input_with_relationships(
+        repo_tmp, _base_relationships(add_blocked_by=[5, 5, 30])
+    )
+
+    def _fetch(*_a: object, **_k: object) -> tuple[dict, str]:
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    monkeypatch.setattr(
+        txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
+    )
+
+    def _invoke(*_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        pytest.fail("malformed duplicate relationship input must be rejected before any mutation")
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(payload)
+    assert result["status"] == "failed_no_mutation"
+    codes = [e["code"] for e in result["native_relationships"]["errors"]]
+    assert "graph_invariant_violation" in codes
+
+
+def test_raw_unsorted_relationship_input_is_rejected(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-1: unsorted entries in add_blocked_by must be rejected, not
+    silently sorted before validation."""
+    payload = _minimal_input_with_relationships(
+        repo_tmp, _base_relationships(add_blocked_by=[30, 5])
+    )
+
+    def _fetch(*_a: object, **_k: object) -> tuple[dict, str]:
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    monkeypatch.setattr(
+        txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
+    )
+
+    def _invoke(*_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        pytest.fail("malformed unsorted relationship input must be rejected before any mutation")
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(payload)
+    assert result["status"] == "failed_no_mutation"
+    codes = [e["code"] for e in result["native_relationships"]["errors"]]
+    assert "graph_invariant_violation" in codes
+
+
+def test_child_timeout_triggers_independent_readback(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-5: a controlled-executor child timeout after launch must trigger
+    an independent readback rather than being assumed to be
+    failed_no_mutation."""
+    payload = _minimal_input_with_relationships(repo_tmp, _base_relationships(add_blocked_by=[3]))
+
+    def _fetch(*_a: object, **_k: object) -> tuple[dict, str]:
+        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    _stub_content_flow(monkeypatch, repo_tmp)
+
+    readback_calls = {"count": 0}
+
+    def _fetch_native(*_a: object, **_k: object) -> tuple[dict | None, str]:
+        readback_calls["count"] += 1
+        if readback_calls["count"] == 1:
+            return {"parent": None, "blocked_by": [], "blocking": []}, ""
+        # Independent post-timeout readback: the mutation actually landed.
+        return {"parent": None, "blocked_by": [3], "blocking": []}, ""
+
+    monkeypatch.setattr(txn, "_fetch_native_relationships", _fetch_native)
+
+    def _invoke(*_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        return _CP(124, stderr="child command timeout after 30s"), None
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(payload)
+    assert readback_calls["count"] == 2
+    nr = result["native_relationships"]
+    assert nr["attempted"] is True
+    assert nr["status"] != "failed_no_mutation"
+    assert result["status"] != "failed_no_mutation"
+
+
+def test_native_only_apply_is_not_reported_as_no_change(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-5: when native_relationships applies a real change but title/body
+    are unchanged, the top-level transaction must not report `no_change` --
+    a real remote mutation occurred."""
+    payload = _minimal_input_with_relationships(repo_tmp, _base_relationships(add_blocked_by=[3]))
+    payload["comment_mode"] = {"mode": "skip"}
+    readbacks = iter(
+        [
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"},
+            {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:41:00Z"},
+        ]
+    )
+    monkeypatch.setattr(txn, "_fetch_issue", lambda *_a, **_k: (next(readbacks), ""))
+    monkeypatch.setattr(txn, "_relationship_capability_preflight", lambda: (True, ""))
+    monkeypatch.setattr(
+        txn, "_fetch_native_relationships", lambda *_a, **_k: ({"parent": None, "blocked_by": [], "blocking": []}, "")
+    )
+    # `_minimal_input` always sets new_body_file content to "new issue body";
+    # override it here so the body itself is unchanged (only the native
+    # relationship changes).
+    (repo_tmp / "tmp" / "new_body.md").write_text("old issue body", encoding="utf-8")
+
+    def _invoke(command_id: str, *_a: object, **_k: object) -> tuple[_CP, dict | None]:
+        if command_id == "issue_relationship.update":
+            return _CP(0), {
+                "status": "applied",
+                "mutation_attempted": True,
+                "before": {"parent": None, "blocked_by": [], "blocking": []},
+                "desired": {"parent": None, "blocked_by": [3], "blocking": []},
+                "after": {"parent": None, "blocked_by": [3], "blocking": []},
+                "completed_operations": ["add_blocked_by:3"],
+                "pending_operations": [],
+            }
+        pytest.fail("content executor must not be invoked when title/body are unchanged")
+
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+
+    result = txn.run_transaction(payload)
+    assert result["status"] != "no_change"
+    assert result["status"] == "ok"
+    assert result["mutation_started"] is True
+    assert result["native_relationships"]["status"] == "applied"
+
+
+def test_total_count_mismatch_rejects_exact_set(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-4: _fetch_native_relationships fails closed (rather than
+    reporting a truncated exact set) when GraphQL totalCount does not match
+    the number of nodes actually returned on a single page."""
+    import json as _json
+
+    def _run(_args: list[str]) -> _CP:
+        payload = {
+            "data": {
+                "repository": {
+                    "issue": {
+                        "parent": None,
+                        "blockedBy": {
+                            "pageInfo": {"hasNextPage": False},
+                            "totalCount": 5,
+                            "nodes": [{"number": 1}],
+                        },
+                        "blocking": {"pageInfo": {"hasNextPage": False}, "totalCount": 0, "nodes": []},
+                    }
+                }
+            }
+        }
+        return _CP(0, stdout=_json.dumps(payload))
+
+    monkeypatch.setattr(txn, "_run_command", _run)
+    result, err = txn._fetch_native_relationships(1287, "squne121/loop-protocol")
+    assert result is None
+    assert err == "blocked_by_total_count_mismatch"

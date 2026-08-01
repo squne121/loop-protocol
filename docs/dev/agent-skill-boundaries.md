@@ -1970,8 +1970,9 @@ cycle）は live traversal を要するため executor 側
 3. `parent`（単一ノード）・`blockedBy`（全ページ）・`blocking`（全ページ）を pre-readback する
 4. `expected_before` と pre-readback の完全一致を確認する。不一致は mutation を一切実行せず `precondition_rejected` を返す（destructive remove の drift 検出。AC11）
 5. `parent.action == "set"` かつ現在の parent と異なる場合、祖先チェーンを bounded walk（最大 50 hop）し、`issue_number` 自身または既存サイクルを検出したら mutation 前に拒否する（AC12 ancestor cycle）
-6. 現在値と desired 値が完全一致する場合は mutation を一切呼ばず `no_op` を返す（AC8 idempotent no-op）
-7. `remove_parent` → `set_parent` → `remove_blocked_by` → `add_blocked_by` → `remove_blocking` → `add_blocking` の順で、operation を一件ずつ固定 argv・`shell=False`・sanitized environment・no automatic retry で直列実行する（`addSubIssue(replaceParent:true)`/`removeSubIssue`/`addBlockedBy`/`removeBlockedBy` を `gh api graphql --input -` 経由で呼び出す。GraphQL query/host/mutation 文字列は executor 内蔵の固定文字列のみ）
+6. 現在値と desired 値が完全一致する場合は mutation を一切呼ばず `no_op` を返す（AC8 idempotent no-op。PR #1897 P1-2: この一致判定は caller が渡した raw add/remove list が空かどうかではなく、`current` と `desired`（effective diff）の完全一致で決める。既存 blocker の再 add や非存在 blocker の remove 指定のような redundant な raw 入力でも、effective diff が空なら `no_op` になる）
+7. `set_parent`（`parent.action == "remove"` の場合は `remove_parent`）→ `remove_blocked_by` → `add_blocked_by` → `remove_blocking` → `add_blocking` の順で、operation を一件ずつ固定 argv・`shell=False`・sanitized environment・no automatic retry で直列実行する（`addSubIssue(replaceParent:true)`/`removeSubIssue`/`addBlockedBy`/`removeBlockedBy` を `gh api graphql --input -` 経由で呼び出す。GraphQL query/host/mutation 文字列は executor 内蔵の固定文字列のみ。PR #1897 P1-3: parent の付け替え（rebind）は `addSubIssue(replaceParent: true)` が既存 parent を単一 mutation で atomically 置換するため、旧 parent を先に `remove_parent` する 2 段階操作は行わない。旧 parent が一時的に外れる window を作らないため）
+7'. blocked_by/blocking の add/remove operation の対象集合も、caller の raw add/remove list ではなく `current`/`desired` の effective diff から構築する（PR #1897 P1-2）
 8. 一部 operation が失敗しても残りを継続実行せず、直ちに post-readback へ進む（部分実行の観測性を優先し、cascading failure を防ぐ）
 9. `parent`・`blockedBy`（全ページ）・`blocking`（全ページ）を post-readback する（mutation 成否に関わらず必ず実行する。AC9）
 10. 一部 operation が失敗していた場合は `partial` を返し、`before`/`desired`/`after`（fresh readback 値）/`completed_operations`/`pending_operations` を含める（AC9）
@@ -1983,23 +1984,54 @@ GraphQL `AddBlockedByInput`/`RemoveBlockedByInput` は `issueId=X`（block さ�
 operation は内部的にこの向きで `addBlockedBy`/`removeBlockedBy` を呼び出す
 （`blocked_by` 側とは issueId/blockingIssueId の割り当てが逆になる）。
 
-### `edit_issue_txn.py` 側の呼び出し（`_run_native_relationship_step`）
+### `edit_issue_txn.py` 側の呼び出し（Phase A/B/C、PR #1897 iteration-4 で再構成）
 
 `ISSUE_EDIT_TXN_INPUT_V1.native_relationships` が非 null の場合、
-`edit_issue_txn.py` は title/body content mutation の前に次を実行する
-（Required Transaction Order Step 1-7、Issue #1883）。
+`edit_issue_txn.py` は 3 つの phase に分けて処理する。PR #1897 P0-1 の
+transaction-integrity 修正により、実際に GitHub を書き換える呼び出し
+（Phase B）は candidate body の guard/hygiene/readiness 検証が完了した
+**後** にのみ行われる（以前は Phase B が content 検証より先に走っていたため、
+Phase B 成功後に content 検証が失敗すると `failed_no_mutation` を誤って
+返しうる状態だった）。
+
+**Phase A（`_prepare_native_relationship`、read-only・純粋関数のみ）**
 
 1. `gh` binary の存在と `gh auth status --hostname github.com` の到達性を preflight する（環境 blocker と runtime permission rejection を区別する。AC10。preflight 成功は write permission の証明にはならない）
-2. `parent`/`blockedBy`（先頭ページ 100 件）/`blocking`（先頭ページ 100 件）を read-only snapshot として取得する（`totalCount` 不一致・pagination 未消化は fail closed とし、切り詰められたデータを「完全」として扱わない）
+2. `parent`/`blockedBy`（先頭ページ 100 件）/`blocking`（先頭ページ 100 件）を read-only snapshot として取得する（`totalCount` 不一致・pagination 未消化は fail closed とし、切り詰められたデータを「完全」として扱わない。PR #1897 P1-4: この caller 側 100 件 cap 実装は executor 側の全ページ cursor traversal と別実装のままであり、完全な canonical reader 統合は follow-up）
 3. `native_relationships.expected_before` が省略されていれば直前の read-only snapshot を採用し、指定されていれば snapshot と完全一致するかを確認する（不一致は `failed_no_mutation`）
-4. `issue_relationship.update` 用の executor 入力（`ISSUE_RELATIONSHIP_UPDATE_INPUT_V1`）を組み立て、`validate_issue_relationship_update_input` で再検証する
+4. `issue_relationship.update` 用の executor 入力（`ISSUE_RELATIONSHIP_UPDATE_INPUT_V1`）を、caller 宣言の add/remove 集合を deduplicate/sort せず raw のまま組み立て、`validate_issue_relationship_update_input` で再検証する（PR #1897 P1-1: 事前の deduplicate/sort は validator の malformed-input 拒否を無力化するため廃止した）
+
+Phase A が失敗した場合、native mutation は一切試みられておらず（`attempted: false`）、
+`failed_no_mutation` を返す。
+
+**候補 body 検証（Phase A と Phase B の間、既存の pre-#1883 パイプライン）**
+
+candidate body が変更を含む場合、guard／hygiene／readiness を実行する。ここで
+失敗した場合も Phase B（実際の GraphQL mutation）はまだ一切試みられていない
+ため `failed_no_mutation` を返す。
+
+**Phase B（`_execute_native_relationship`、実際の GraphQL 書き込み）**
+
 5. `artifacts/{issue_number}/issue-metadata/issue_relationship.update/` 配下に入力ファイルを書き、controlled executor を起動する
-6. executor の `status` が `no_op`/`applied` の場合のみ content mutation（Step 8 以降）へ進む。それ以外（`precondition_rejected`/`postcondition_rejected`/`partial`/`transport_or_schema_error`）は content mutation を一切開始せず、`mutation_attempted` に応じて `failed_no_mutation`（未着手）または `failed_after_mutation`（部分実行後）を返す（AC1/AC2）
+6. executor の `status` が `no_op`/`applied` の場合のみ content mutation へ進む。それ以外（`precondition_rejected`/`postcondition_rejected`/`partial`/`transport_or_schema_error`）は content mutation を一切開始せず、`mutation_attempted` に応じて `failed_no_mutation`（未着手）または `failed_after_mutation`（部分実行後）を返す（AC1/AC2）。子プロセスが timeout（returncode 124）または non-JSON 出力を返した場合は「mutation なし」と即断せず、独立readback を実行し observed state を desired/before と比較したうえで分類する（PR #1897 P1-5: `applied_with_receipt_loss`/`failed_no_mutation`/`failed_after_mutation`）
+7. Phase B が成功した場合、title/body/updatedAt を再読取し、content-lane の `expected_previous_updated_at` に fresh な値を使う。再読取で title/body の concurrent drift を検出したら `failed_after_mutation` で停止する（PR #1897 P1-7）
+
+**Phase C（`_finalize_native_relationships`、最終 combined readback）**
+
+content mutation（または確定した no-op）が完了したら、`issue_relationship.update`
+を zero-delta（`expected_before=desired`、add/remove 空、`parent.action=unchanged`）
+で再実行する verify-only readback を行う（PR #1897 P0-2）。新しい command id や
+スキーマは追加せず、既存 operation を read-only probe として再利用する
+（#1860 minimal harness 方針）。この最終確認が desired と一致しない限り
+`ok`/`no_change` を返さない。
 
 `ISSUE_EDIT_TXN_RESULT_V1.native_relationships` は常に含まれるフィールドであり、
 `native_relationships` が transaction input に含まれない場合、または
 readiness gate／stale precondition 等の relationship gate 到達前の失敗の場合は
-`{"attempted": false, "status": "not_run", ...}` を返す。
+`{"attempted": false, "status": "not_run", ...}` を返す。native relationship が
+`attempted: true` の場合、`ISSUE_EDIT_TXN_RESULT_V1.mutation_started` は常に
+`true` になる（PR #1897 P0-1 bullet 5: 一度でも remote write の可能性が
+生じたら `failed_no_mutation`／`mutation_started: false` を返さない）。
 
 ### Allowed Paths
 
