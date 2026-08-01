@@ -9,6 +9,8 @@ from __future__ import annotations
 import builtins
 import importlib.util
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -244,6 +246,57 @@ class TestSimpleYamlParser:
         assert inner["integer"] == "42"
         assert inner["quoted"] == "quoted"
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            '{"issue_number":NaN}',
+            '{"issue_number":Infinity}',
+            '{"issue_number":-Infinity}',
+            '{"root":{"duplicate":1,"duplicate":2}}',
+            '{"duplicate":1,"duplicate":2}',
+        ],
+    )
+    def test_fallback_rejects_nonstandard_or_ambiguous_json(self, monkeypatch, value):
+        """GIVEN non-RFC JSON WHEN fallback parses THEN it fails closed."""
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        with pytest.raises(SimpleYamlParseError):
+            _parse_simple_yaml_block(f"root:\n  candidate: {value}\n")
+
+    def test_fallback_bounds_flow_collection_size_and_depth(self, monkeypatch):
+        """GIVEN hostile flow JSON WHEN fallback parses THEN it rejects before recursion."""
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        with pytest.raises(SimpleYamlParseError, match="too_large"):
+            _parse_simple_yaml_block(f"root:\n  candidate: [{'1' * 16_384}]\n")
+        with pytest.raises(SimpleYamlParseError, match="too_deep"):
+            _parse_simple_yaml_block(f"root:\n  candidate: {'[' * 33}{']' * 33}\n")
+
+    def test_fallback_does_not_expand_arbitrary_indentation_mappings(self, monkeypatch):
+        """GIVEN unrecognized deep YAML WHEN fallback parses THEN it remains scalar-only."""
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        result = _parse_simple_yaml_block("root:\n  child:\n    deep: ignored\n")
+        assert result == {"root": {"child": None}}
+
     @pytest.mark.parametrize("value", ["{bad}", "[1,]"])
     def test_fallback_rejects_malformed_json_flow_collections(self, monkeypatch, value):
         original_import = builtins.__import__
@@ -417,6 +470,40 @@ class TestParseContractReviewResults:
         results = parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL)
         # Wrong generated_by → not valid
         assert len(results) == 0
+
+    def test_fallback_skips_hostile_block_and_keeps_later_trusted_result(self, monkeypatch):
+        """GIVEN a hostile earlier comment WHEN fallback parses THEN later authority survives."""
+        def yaml_value_error(_block):
+            raise ValueError("simulated PyYAML integer conversion failure")
+
+        monkeypatch.setitem(sys.modules, "yaml", types.SimpleNamespace(safe_load=yaml_value_error))
+        malicious = _make_go_comment(comment_id=1001)
+        malicious.update(
+            author="mallory",
+            author_association="NONE",
+            author_id=1,
+            author_type="User",
+        )
+        malicious["body"] = malicious["body"].replace(
+            "  issue_url: " + _ISSUE_URL,
+            "  issue_url: " + _ISSUE_URL + "\n  bomb: [" + "1" * 5_000 + "]",
+        )
+        trusted = _make_go_comment(
+            comment_id=1002, created_at="2026-06-13T09:00:00Z"
+        )
+        trusted.update(
+            author="squne121",
+            author_association="OWNER",
+            author_id=63350259,
+            author_type="User",
+        )
+
+        results = parse_contract_review_results(
+            [malicious, trusted], expected_issue_url=_ISSUE_URL
+        )
+
+        assert [result["comment_id"] for result in results] == [1002]
+        assert results[0]["is_trusted_author"] is True
 
     def test_human_judgment_status_not_valid(self):
         """
