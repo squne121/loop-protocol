@@ -475,6 +475,7 @@ jobs:
           }
           run_timed pnpm_build pnpm build
         env:
+          VITE_E2E_MODE: "false"
           VITE_LOOP_RUN_ID: ${{ github.run_id }}
           VITE_LOOP_RUN_ATTEMPT: ${{ github.run_attempt }}
           VITE_LOOP_PAGE_URL: "unknown"
@@ -483,6 +484,8 @@ jobs:
           VITE_LOOP_ARTIFACT_DIGEST_OR_ATTESTATION: "unknown"
           VITE_LOOP_RETENTION_DAYS: "30"
           VITE_LOOP_SCREENSHOT_PATH: "manual_capture_required"
+      - name: Verify production dist E2E boundary
+        run: pnpm dist:e2e-boundary --mode production --dist dist
       - name: Collect ci_runtime_baseline_v1 artifact
         if: ${{ !cancelled() }}
         env:
@@ -632,6 +635,8 @@ jobs:
             return $status
           }
           run_timed pnpm_build_e2e env VITE_E2E_MODE=true pnpm build
+      - name: Verify E2E dist boundary
+        run: pnpm dist:e2e-boundary --mode e2e --dist dist
       - name: Run E2E tests (timed)
         id: timed-e2e
         run: |
@@ -703,6 +708,7 @@ jobs:
         # playwright.config.ts LOOP_E2E_PREVIEW_NAMESPACE_LANE handling.
         id: timed-build-preview-namespace
         env:
+          VITE_E2E_MODE: "false"
           VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.preview-namespace.outputs.namespace }}
         run: |
           run_timed() {
@@ -722,6 +728,8 @@ jobs:
           }
           run_timed clean_dist_preview_namespace rm -rf dist
           run_timed pnpm_build_preview_namespace pnpm build
+      - name: Verify preview-namespace production dist E2E boundary
+        run: pnpm dist:e2e-boundary --mode production --dist dist
       - name: Run AC9 preview-namespace E2E lane (timed)
         # LOOP_E2E_PREVIEW_NAMESPACE_LANE=true selects the dedicated
         # playwright.config.ts testMatch (only this spec) and forces

@@ -23,6 +23,8 @@
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:debug": "playwright test --debug",
     "test:e2e:headed": "playwright test --headed",
+    "dist:e2e-boundary": "node scripts/check-dist-e2e-boundary.mjs",
+    "verify:issue-1425": "pnpm test -- tests/check-dist-e2e-boundary.test.ts tests/storage.test.ts && pnpm typecheck && pnpm lint && pnpm test && pnpm build",
     "test:e2e:preview-namespace": "rm -rf dist && pnpm build && LOOP_E2E_PREVIEW_NAMESPACE_LANE=true playwright test",
     "test:vrt": "VITE_E2E_MODE=true pnpm build && LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts",
     "test:vrt:e2e": "LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts",
