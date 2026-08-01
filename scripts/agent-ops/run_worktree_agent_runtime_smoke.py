@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -336,7 +337,8 @@ def run_interactive_herdr(
     herdr_bin: str = "herdr",
 ) -> dict:
     """Drive a herdr sibling pane + agent lifecycle. Returns evidence dict."""
-    agent_name = f"runtime-smoke-{runtime}-{run_id}"[:48]
+    # herdr agent names must be 1-32 chars: lowercase letters, digits, "-", "_".
+    agent_name = f"rts-{runtime}-{run_id}"[:32]
     pane_id: str | None = None
     evidence: dict = {
         "pane_id": None,
@@ -356,20 +358,39 @@ def run_interactive_herdr(
             raise HerdrLaneError(f"herdr pane split failed: {_redact(err or out)}")
         try:
             payload = json.loads(out)
-            pane_id = str(payload.get("pane_id") or payload.get("id") or "").strip()
+            result = payload.get("result") if isinstance(payload, dict) else None
+            pane = (result or {}).get("pane") if isinstance(result, dict) else None
+            pane_id = None
+            if isinstance(pane, dict):
+                pane_id = str(pane.get("pane_id") or "").strip() or None
+            if pane_id is None:
+                # Fallback for shapes without the {"result": {"pane": ...}} envelope.
+                pane_id = str((payload or {}).get("pane_id") or "").strip() or None
         except (json.JSONDecodeError, ValueError):
             pane_id = out.strip().splitlines()[-1].strip() if out.strip() else None
         if not pane_id:
             raise HerdrLaneError("could not parse pane_id from herdr pane split output")
         evidence["pane_id"] = pane_id
 
-        rc, out, err, timed_out = _run(
-            [herdr_bin, "agent", "start", agent_name, "--kind", runtime,
-             "--pane", pane_id, "--timeout", str(int(min(timeout_seconds, 300.0) * 1000))],
-            timeout=timeout_seconds,
-        )
-        if timed_out or rc != 0:
-            raise HerdrLaneError(f"herdr agent start failed: {_redact(err or out)}")
+        # A freshly split pane's shell may not be an "available shell" yet
+        # (still initializing). Retry ``agent start`` with a bounded, short
+        # backoff instead of failing on the first race.
+        start_rc = None
+        start_out = start_err = ""
+        start_timed_out = False
+        for attempt in range(5):
+            start_rc, start_out, start_err, start_timed_out = _run(
+                [herdr_bin, "agent", "start", agent_name, "--kind", runtime,
+                 "--pane", pane_id, "--timeout", str(int(min(timeout_seconds, 300.0) * 1000))],
+                timeout=timeout_seconds,
+            )
+            if start_timed_out or start_rc == 0:
+                break
+            if "agent_pane_busy" not in (start_err or "") and "agent_pane_busy" not in (start_out or ""):
+                break
+            time.sleep(1.0 + attempt * 0.5)
+        if start_timed_out or start_rc != 0:
+            raise HerdrLaneError(f"herdr agent start failed: {_redact(start_err or start_out)}")
 
         rc, out, err, timed_out = _run(
             [herdr_bin, "agent", "prompt", agent_name, prompt, "--wait",
@@ -387,7 +408,13 @@ def run_interactive_herdr(
         state = None
         if rc == 0:
             try:
-                state = json.loads(out).get("state")
+                payload = json.loads(out)
+                result = payload.get("result") if isinstance(payload, dict) else None
+                agent_obj = (result or {}).get("agent") if isinstance(result, dict) else None
+                if isinstance(agent_obj, dict):
+                    state = agent_obj.get("agent_status")
+                else:
+                    state = (payload or {}).get("agent_status") or (payload or {}).get("state")
             except (json.JSONDecodeError, ValueError):
                 state = out.strip()
         evidence["final_state"] = state
