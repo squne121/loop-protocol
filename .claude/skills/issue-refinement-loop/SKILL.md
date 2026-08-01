@@ -119,7 +119,7 @@ root checkout（canonical main root / default branch）から anchor comment を
 
 <!-- policy-example --><!-- 以下は方針の例を示すコメントであり、実行対象のコマンド構文には影響しない -->
 ```bash
-uv run python3 scripts/agent-guards/skill_runtime_exec.py \
+uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
   --command-id preflight.run.with_anchor \
   --issue-number <N> \
   --repo <owner/repo> \
@@ -127,6 +127,20 @@ uv run python3 scripts/agent-guards/skill_runtime_exec.py \
 ```
 
 `--anchor-comment-url` は `https://github.com/<owner>/<repo>/issues/<N>#issuecomment-<M>` の canonical shape のみを受け付け、`--issue-number` / `--repo` と URL 内の owner/repo/issue 番号が一致しない場合は拒否される（context-binding）。`preflight.run` 自体の argv / placeholders / execution_class はこの sibling profile の追加によって一切変更されない。
+
+#### Step 0g: trusted contract update（main control-planeを実行する親control-plane限定）
+
+`preflight.run.with_anchor` が trusted contract patch plan を得た後だけ、main control-plane は canonical main root / default branch から次の明示phaseを実行できる。preflight entryの `mutation: false` は変更せず、このphase以外に `--consume-contract-patch-plan` を渡してはならない。
+
+```bash
+uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
+  --command-id contract_update.run.with_anchor \
+  --issue-number <N> \
+  --repo <owner/repo> \
+  --anchor-comment-url <canonical GitHub issue comment URL>
+```
+
+このphaseは既存patch planをtransaction-localにconsumerへ渡し、candidate static readiness、controlled transaction、final readback、fresh preflight/review/readiness入力までを一続きに実行する。subagent / isolation worktree はこのcommandを直接実行しない。新しい永続schema、receipt、publisher、state storeは作らない。
 
 wrapper の出力フィールドを確認する:
 
