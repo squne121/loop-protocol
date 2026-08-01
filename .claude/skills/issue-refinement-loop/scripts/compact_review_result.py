@@ -116,7 +116,7 @@ def _validate_artifact_containment(artifact_path: Path, repo_root: Path) -> Path
         raise ValueError("artifact base escapes repository root")
     resolved = artifact_path.resolve()
     if not resolved.is_relative_to(root):
-        raise ValueError("artifact path escapes repository root")
+        raise ValueError("artifact path escapes base directory")
     if not resolved.is_relative_to(base):
         raise ValueError("artifact path escapes base directory")
     return resolved
