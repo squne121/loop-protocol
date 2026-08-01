@@ -1,0 +1,1483 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+SCRIPT = REPO_ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("run_worktree_agent_runtime_smoke", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True, env=env)
+
+
+def _build_repo_with_worktree(tmp_path: Path, *, include_runner_script: bool = False) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-b", "main", cwd=repo)
+    _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    _git("add", "README.md", cwd=repo)
+    if include_runner_script:
+        # Mirror the real repo layout where this runner script is itself
+        # checked out inside linked worktrees under scripts/agent-ops/, so a
+        # fixture-built worktree can exercise --repo-root default resolution
+        # exactly as it happens for a real .claude/worktrees/<slug>/ checkout
+        # (Issue #1887 fix-delta iteration 1).
+        script_dst = repo / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
+        script_dst.parent.mkdir(parents=True, exist_ok=True)
+        script_dst.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+        _git("add", str(script_dst.relative_to(repo)), cwd=repo)
+    _git("commit", "-m", "seed", cwd=repo)
+
+    worktree = repo / ".claude" / "worktrees" / "issue-0000-fixture"
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    _git("branch", "worktree-fixture", cwd=repo)
+    _git("worktree", "add", str(worktree), "worktree-fixture", cwd=repo)
+    return repo, worktree
+
+
+@pytest.fixture()
+def repo_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    return _build_repo_with_worktree(tmp_path)
+
+
+@pytest.fixture()
+def repo_with_worktree_and_script(tmp_path: Path) -> tuple[Path, Path]:
+    """Like ``repo_with_worktree``, but the runner script itself is checked
+    out at scripts/agent-ops/ so the worktree contains a real, physical copy
+    of it (mirroring the real .claude/worktrees/<slug>/ layout)."""
+    return _build_repo_with_worktree(tmp_path, include_runner_script=True)
+
+
+def _write_fake_exe(path: Path, script_body: str) -> None:
+    path.write_text(f"#!/usr/bin/env bash\n{script_body}\n", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _prompt_file(tmp_path: Path, text: str = "hello from test\n") -> Path:
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text(text, encoding="utf-8")
+    return prompt
+
+
+def _run(
+    repo: Path,
+    worktree: Path,
+    *args: str,
+    fake_bin_dir: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    if fake_bin_dir is not None:
+        env["PATH"] = f"{fake_bin_dir}:{env['PATH']}"
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--repo-root", str(repo),
+            "--worktree", str(worktree),
+            *args,
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+
+# claude --help fake branch. Must advertise every flag preflight_claude_flags
+# requires, including --max-turns (Issue #1921 P1 fix-delta: bounded turns).
+_HELP_BRANCH = """
+if [ "$1" = "--help" ]; then
+  echo "--output-format --include-hook-events --no-session-persistence --max-turns"
+  exit 0
+fi
+"""
+
+
+FAKE_CLAUDE_SUCCESS_BODY = (
+    "\n"
+    "cat > /dev/null\n"
+    'echo \'{"type":"system","subtype":"init"}\'\n'
+    'echo \'{"type":"result","subtype":"success","marker":"MARKER_TOKEN_WT"}\'\n'
+    "exit 0\n"
+)
+
+
+# ---------------------------------------------------------------------------
+# AC2: worktree / repository identity rejection
+# ---------------------------------------------------------------------------
+
+
+def test_given_root_checkout_when_runner_starts_then_rejected(repo_with_worktree, tmp_path):
+    repo, _worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, repo,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+    )
+    assert result.returncode == 1
+    assert "root checkout" in result.stderr
+
+
+def test_given_different_repository_when_runner_starts_then_rejected(repo_with_worktree, tmp_path):
+    repo, _worktree = repo_with_worktree
+    other_repo = tmp_path / "other"
+    other_repo.mkdir()
+    _git("init", "-b", "main", cwd=other_repo)
+    (other_repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git("add", "f.txt", cwd=other_repo)
+    _git("commit", "-m", "seed", cwd=other_repo)
+
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, other_repo,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+    )
+    assert result.returncode == 1
+    assert "different repository" in result.stderr
+
+
+def test_given_missing_worktree_path_when_runner_starts_then_rejected(repo_with_worktree, tmp_path):
+    repo, _worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, repo / ".claude" / "worktrees" / "does-not-exist",
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+    )
+    assert result.returncode == 1
+    assert "does not exist" in result.stderr
+
+
+def test_given_non_worktree_dir_under_claude_worktrees_when_runner_starts_then_cwd_mismatch(
+    repo_with_worktree, tmp_path
+):
+    repo, _worktree = repo_with_worktree
+    stray_dir = repo / ".claude" / "worktrees"
+    prompt = _prompt_file(tmp_path)
+    # ``.claude/worktrees`` itself resolves to the repo's own toplevel (still the
+    # canonical repo checkout), so it is rejected for cwd mismatch, not accepted.
+    result = _run(
+        repo, stray_dir,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+    )
+    assert result.returncode == 1
+
+
+# ---------------------------------------------------------------------------
+# Output directory exclusivity (Issue #1921 P0-4)
+# ---------------------------------------------------------------------------
+
+
+def test_given_output_dir_already_exists_when_runner_starts_then_rejected(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "exists-run"
+    out_dir.mkdir(parents=True)
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+    )
+    assert result.returncode == 1
+    assert "already exists" in result.stderr
+
+
+def test_given_output_dir_is_symlink_when_runner_starts_then_rejected(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    real_target = tmp_path / "elsewhere"
+    real_target.mkdir()
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "symlinked-run"
+    out_dir.parent.mkdir(parents=True)
+    out_dir.symlink_to(real_target)
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+    )
+    assert result.returncode == 1
+    assert "symlink" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# AC3 / AC8: structured Claude lane — argv, exit codes, timeout
+# ---------------------------------------------------------------------------
+
+
+def test_given_fake_claude_success_when_structured_lane_runs_then_exit0_and_summary_has_event_count(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+echo '{"type":"system","subtype":"init"}'
+echo '{"type":"result","subtype":"success","marker":"MARKER_TOKEN_1"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path, "MARKER_TOKEN_1\n")
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "claude-structured"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--timeout-seconds", "30", "--expect-marker", "MARKER_TOKEN_1",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "native_event_count: 2" in summary
+    # Only summary.md is persisted (Issue #1921 P1 evidence-hygiene fix-delta).
+    assert sorted(p.name for p in out_dir.iterdir()) == ["summary.md"]
+
+
+def test_given_fake_claude_help_missing_max_turns_flag_when_preflight_runs_then_skip77(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", """
+if [ "$1" = "--help" ]; then
+  echo "--output-format --include-hook-events --no-session-persistence"
+  exit 0
+fi
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 77
+    assert result.stderr.startswith("SKIP:")
+    assert "max-turns" in result.stderr or "--max-turns" in result.stderr
+
+
+def test_given_no_claude_binary_when_preflight_runs_then_skip77(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        # Keep system dirs (git) reachable while excluding the real claude/codex
+        # binaries that normally live under ~/.local/bin.
+        extra_env={"PATH": f"{empty_bin}:/usr/bin:/bin"},
+    )
+    assert result.returncode == 77
+
+
+def test_given_fake_claude_nonzero_exit_when_structured_lane_runs_then_exit1(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+exit 1
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1
+    assert "exited non-zero" in result.stderr
+
+
+def test_given_fake_claude_hangs_when_timeout_elapses_then_exit1(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+sleep 30
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--timeout-seconds", "2",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1
+    assert "timed out" in result.stderr
+
+
+def test_given_fake_claude_argv_when_structured_lane_runs_then_max_turns_flag_present(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    argv_log = tmp_path / "claude_argv.txt"
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + f"""
+cat > /dev/null
+echo "$@" > "{argv_log}"
+echo '{{"type":"result"}}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--max-turns", "7",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    argv_text = argv_log.read_text(encoding="utf-8")
+    assert "--max-turns 7" in argv_text
+
+
+def test_given_structured_lane_events_with_no_terminal_event_when_run_then_exit1(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+echo '{"type":"system","subtype":"init"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1
+    assert "no terminal/result event" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# AC4: structured Codex lane — argv (-C worktree --json --ephemeral -), prompt
+# via stdin (Issue #1921 P1 fix-delta: prompt must never appear in argv).
+# ---------------------------------------------------------------------------
+
+
+def test_given_fake_codex_when_structured_lane_runs_then_prompt_delivered_via_stdin_not_argv(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    argv_log = tmp_path / "codex_argv.txt"
+    stdin_log = tmp_path / "codex_stdin.txt"
+    _write_fake_exe(fake_bin / "codex", f"""
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "--json --ephemeral -C"
+  exit 0
+fi
+echo "$@" > "{argv_log}"
+cat > "{stdin_log}"
+echo '{{"type":"item.completed"}}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path, "codex prompt text\n")
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "codex", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    argv_text = argv_log.read_text(encoding="utf-8")
+    assert "-C" in argv_text
+    assert str(worktree) in argv_text
+    assert "--json" in argv_text
+    assert "--ephemeral" in argv_text
+    assert "codex prompt text" not in argv_text
+    stdin_text = stdin_log.read_text(encoding="utf-8")
+    assert "codex prompt text" in stdin_text
+
+
+# ---------------------------------------------------------------------------
+# AC9 / postcondition (Issue #1921 P0-5: full repository fingerprint)
+# ---------------------------------------------------------------------------
+
+
+def test_given_require_clean_postcondition_and_unexpected_write_when_lane_runs_then_exit1(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+echo "unexpected" > rogue-file.txt
+echo '{"type":"result"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "run1"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--require-clean-postcondition",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1
+    assert "unexpected postcondition" in result.stderr
+    (worktree / "rogue-file.txt").unlink()
+
+
+def test_given_evidence_only_write_when_postcondition_checked_then_ignored_and_exit0(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+echo '{"type":"result"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "run2"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--require-clean-postcondition",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_given_output_dir_prefix_sibling_path_when_postcondition_checked_then_not_ignored(
+    repo_with_worktree, tmp_path
+):
+    """A path that merely shares the output directory name as a *string*
+    prefix (e.g. ``artifacts/runtime-smoke/run3-evil``) must not be silently
+    excluded just because ``artifacts/runtime-smoke/run3`` is the evidence
+    directory (Issue #1921 P0-5: exact directory-boundary matching, not
+    ``str.startswith`` on the raw output-dir string)."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+echo "unexpected" > artifacts/runtime-smoke/run3-evil-sibling.txt
+echo '{"type":"result"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    (worktree / "artifacts" / "runtime-smoke").mkdir(parents=True)
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "run3"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--require-clean-postcondition",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1
+    assert "unexpected postcondition" in result.stderr
+    (worktree / "artifacts" / "runtime-smoke" / "run3-evil-sibling.txt").unlink()
+
+
+def test_given_already_dirty_file_further_modified_when_postcondition_checked_then_detected(
+    repo_with_worktree, tmp_path
+):
+    """A file that was already dirty (status ``M``) before the run, and gets
+    further modified by the agent (status stays ``M``), must still be
+    detected — a status-line-set diff alone cannot see this (Issue #1921
+    P0-5)."""
+    repo, worktree = repo_with_worktree
+    (worktree / "README.md").write_text("pre-dirty content\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+echo "further changed content" > README.md
+echo '{"type":"result"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "dirty-run"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--require-clean-postcondition",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1
+    assert "README.md" in result.stderr
+    (worktree / "README.md").write_text("seed\n", encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# AC5 / AC6: interactive herdr lane — isolated named session
+# (Issue #1921 P0-1..P0-4 fix-delta)
+# ---------------------------------------------------------------------------
+
+
+# Fake herdr models an isolated named session as filesystem markers under
+# $FAKE_HERDR_STATE_DIR: "<name>.session" (exists) / "<name>.stopped"
+# (stopped). ``herdr session list --json`` reflects that state so the
+# collision-check / creation / cleanup-confirmation flow can be exercised
+# without a real herdr daemon.
+_FAKE_ISOLATED_HERDR_BODY = """
+STATE_DIR="$FAKE_HERDR_STATE_DIR"
+mkdir -p "$STATE_DIR"
+if [ "$1" = "--session" ]; then
+  touch "$STATE_DIR/$2.session"
+  sleep 300
+  exit 0
+fi
+case "$1 $2" in
+  "status server")
+    exit 0
+    ;;
+esac
+case "$1" in
+  session)
+    case "$2" in
+      list)
+        out="{\\"sessions\\":["
+        first=1
+        for f in "$STATE_DIR"/*.session; do
+          [ -e "$f" ] || continue
+          name=$(basename "$f" .session)
+          if [ -e "$STATE_DIR/$name.stopped" ]; then running=false; else running=true; fi
+          if [ $first -eq 0 ]; then out="$out,"; fi
+          out="$out{\\"name\\":\\"$name\\",\\"running\\":$running}"
+          first=0
+        done
+        out="$out]}"
+        echo "$out"
+        exit 0
+        ;;
+      stop)
+        touch "$STATE_DIR/$3.stopped"
+        exit 0
+        ;;
+      delete)
+        rm -f "$STATE_DIR/$3.session" "$STATE_DIR/$3.stopped"
+        exit 0
+        ;;
+    esac
+    ;;
+  workspace)
+    case "$2" in
+      create)
+        touch "$STATE_DIR/${HERDR_SESSION}.session"
+        echo '{"result":{"root_pane":{"pane_id":"pane-xyz"},"workspace":{"workspace_id":"w1"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+  agent)
+    case "$2" in
+      start) exit 0 ;;
+      prompt) exit 0 ;;
+      get) echo '{"state":"idle"}'; exit 0 ;;
+      explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
+      read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
+    esac
+    ;;
+esac
+exit 0
+"""
+
+
+def test_given_isolated_herdr_lane_when_interactive_runs_then_session_created_and_cleaned_up(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--expect-marker", "OBSERVED_MARKER",
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "detected_agent: claude" in summary
+    assert "cleanup_confirmed_removed: True" in summary
+    assert "session_name: rts-" in summary
+    # Only summary.md is persisted (no pane-output.txt / agent-detection.json).
+    assert sorted(p.name for p in out_dir.iterdir()) == ["summary.md"]
+    # Session marker files must be gone after cleanup.
+    assert not list(state_dir.glob("*.session"))
+
+
+def test_given_sigterm_during_interactive_lane_when_process_killed_then_isolated_session_still_cleaned_up(
+    repo_with_worktree, tmp_path
+):
+    """SIGTERM's default disposition terminates a process immediately without
+    running Python ``finally`` blocks. The runner must install a handler that
+    converts SIGTERM into a raised exception so isolated-session cleanup
+    (Issue #1921 P0-2) still runs even under a forceful external kill."""
+    import signal
+    import time as _time
+
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # ``agent prompt`` sleeps well past our SIGTERM, so the runner is
+    # guaranteed to still be inside run_interactive_herdr_isolated's try
+    # block when the signal arrives.
+    body = _FAKE_ISOLATED_HERDR_BODY.replace("prompt) exit 0 ;;", "prompt) sleep 30; exit 0 ;;")
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["HERDR_ENV"] = "1"
+    env["FAKE_HERDR_STATE_DIR"] = str(state_dir)
+
+    proc = subprocess.Popen(
+        [
+            sys.executable, str(SCRIPT),
+            "--repo-root", str(repo), "--worktree", str(worktree),
+            "--runtime", "claude", "--mode", "interactive",
+            "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+            "--timeout-seconds", "60",
+        ],
+        cwd=str(repo), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    # Give the runner time to create the isolated session and reach the
+    # (sleeping) ``agent prompt`` call before terminating it.
+    deadline = _time.monotonic() + 10.0
+    session_created = False
+    while _time.monotonic() < deadline:
+        if list(state_dir.glob("*.session")):
+            session_created = True
+            break
+        _time.sleep(0.1)
+    assert session_created, "isolated session was never created before SIGTERM"
+
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=15.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        pytest.fail("runner did not exit within 15s of SIGTERM")
+
+    assert proc.returncode == 1
+    # Cleanup must have run: no dangling isolated session marker files.
+    assert not list(state_dir.glob("*.session")), "isolated session leaked after SIGTERM"
+
+
+def test_given_two_isolated_interactive_runs_when_executed_sequentially_then_distinct_sessions_used(
+    repo_with_worktree, tmp_path
+):
+    """Distinct named sessions per run demonstrate the ownership boundary
+    required for safe concurrent execution (Issue #1921 P0-4): each run's
+    cleanup only ever targets the session name it created itself."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+
+    session_names = []
+    for i in range(2):
+        out_dir = tmp_path / f"out{i}"
+        result = _run(
+            repo, worktree,
+            "--runtime", "claude", "--mode", "interactive",
+            "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+            fake_bin_dir=fake_bin,
+            extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
+        )
+        assert result.returncode == 0, result.stderr
+        summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+        for line in summary.splitlines():
+            if line.startswith("- session_name:"):
+                session_names.append(line.split(":", 1)[1].strip())
+    assert len(session_names) == 2
+    assert session_names[0] != session_names[1]
+
+
+def test_given_herdr_env_unset_when_interactive_lane_runs_then_skip77(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY)
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+        # Explicitly override (not merely omit) HERDR_ENV so a real ambient
+        # HERDR_ENV=1 in the outer test-runner environment cannot leak in.
+        extra_env={"HERDR_ENV": ""},
+    )
+    assert result.returncode == 77
+    assert "HERDR_ENV" in result.stderr
+
+
+def test_given_agent_state_blocked_when_interactive_lane_runs_then_not_treated_as_pass(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    body = _FAKE_ISOLATED_HERDR_BODY.replace('echo \'{"state":"idle"}\'', 'echo \'{"state":"blocked"}\'')
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(tmp_path / "herdr-state")},
+    )
+    assert result.returncode == 1
+    assert "blocked" in result.stderr
+
+
+def test_given_agent_state_unknown_when_interactive_lane_runs_then_not_treated_as_pass(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    body = _FAKE_ISOLATED_HERDR_BODY.replace('echo \'{"state":"idle"}\'', 'echo \'{"state":"unknown"}\'')
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(tmp_path / "herdr-state")},
+    )
+    assert result.returncode in (1, 77)
+    assert "unusable" in result.stderr or "unknown" in result.stderr
+
+
+def test_given_isolated_session_cleanup_not_confirmed_removed_when_lane_finishes_then_exit1(
+    repo_with_worktree, tmp_path
+):
+    """Cleanup that cannot be confirmed removed must override an otherwise
+    successful run to FAIL (Issue #1921 P0-2 fix-delta)."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # ``session delete`` is a no-op: the session marker is never removed, so
+    # the post-cleanup ``session list --json`` still reports it.
+    body = _FAKE_ISOLATED_HERDR_BODY.replace(
+        "      delete)\n        rm -f \"$STATE_DIR/$3.session\" \"$STATE_DIR/$3.stopped\"\n        exit 0\n        ;;",
+        "      delete)\n        exit 0\n        ;;",
+    )
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(tmp_path / "herdr-state")},
+    )
+    assert result.returncode == 1
+    assert "cleanup" in result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "cleanup_confirmed_removed: False" in summary
+
+
+# ---------------------------------------------------------------------------
+# Session collision avoidance (Issue #1921 P0-4) — unit-level, exercised via
+# direct import since it requires deterministic control over uuid4() to
+# force a collision on the first candidate.
+# ---------------------------------------------------------------------------
+
+
+class _FakeUUID:
+    def __init__(self, hex_value: str):
+        self.hex = hex_value
+
+
+def test_given_first_candidate_collides_when_new_session_name_generated_then_retries_until_unique(monkeypatch):
+    module = _load_module()
+    taken = f"rts-{'1' * 32}"[:32]
+    fresh = f"rts-{'2' * 32}"[:32]
+    calls = {"n": 0}
+
+    def fake_uuid4():
+        calls["n"] += 1
+        return _FakeUUID("1" * 32 if calls["n"] == 1 else "2" * 32)
+
+    def fake_names(_herdr_bin):
+        return {taken}
+
+    monkeypatch.setattr(module.uuid, "uuid4", fake_uuid4)
+    monkeypatch.setattr(module, "_herdr_session_names", fake_names)
+
+    name = module.new_isolated_session_name("herdr")
+    assert name == fresh
+    assert calls["n"] == 2
+
+
+def test_given_collision_check_cannot_enumerate_sessions_when_generating_name_then_hard_error(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "_herdr_session_names", lambda _herdr_bin: None)
+    with pytest.raises(module.HerdrLaneError):
+        module.new_isolated_session_name("herdr")
+
+
+# ---------------------------------------------------------------------------
+# Fix-delta iteration 2: Claude Code multi-line prompt paste-collapse stall
+# recovery (Issue #1887 PR #1921 review). ``herdr agent prompt`` can leave a
+# multi-line prompt sitting as an unsubmitted "[Pasted text #N +M lines]"
+# block in Claude Code's input box instead of submitting it, which herdr
+# reports as ``agent_prompt_stalled`` after its own 5000ms post-submission
+# state-change check. The runner must recover deterministically (send an
+# explicit ``enter`` keypress, then re-observe via ``agent wait``) instead of
+# treating the stall as a hard failure or silently downgrading it to SKIP.
+# ---------------------------------------------------------------------------
+
+
+_FAKE_ISOLATED_HERDR_STALL_THEN_RECOVER_BODY = """
+STATE_DIR="$FAKE_HERDR_STATE_DIR"
+mkdir -p "$STATE_DIR"
+if [ "$1" = "--session" ]; then
+  touch "$STATE_DIR/$2.session"
+  sleep 300
+  exit 0
+fi
+case "$1 $2" in
+  "status server")
+    exit 0
+    ;;
+esac
+case "$1" in
+  session)
+    case "$2" in
+      list)
+        out="{\\"sessions\\":["
+        first=1
+        for f in "$STATE_DIR"/*.session; do
+          [ -e "$f" ] || continue
+          name=$(basename "$f" .session)
+          if [ -e "$STATE_DIR/$name.stopped" ]; then running=false; else running=true; fi
+          if [ $first -eq 0 ]; then out="$out,"; fi
+          out="$out{\\"name\\":\\"$name\\",\\"running\\":$running}"
+          first=0
+        done
+        out="$out]}"
+        echo "$out"
+        exit 0
+        ;;
+      stop) touch "$STATE_DIR/$3.stopped"; exit 0 ;;
+      delete) rm -f "$STATE_DIR/$3.session" "$STATE_DIR/$3.stopped"; exit 0 ;;
+    esac
+    ;;
+  workspace)
+    case "$2" in
+      create)
+        touch "$STATE_DIR/${HERDR_SESSION}.session"
+        echo '{"result":{"root_pane":{"pane_id":"pane-xyz"},"workspace":{"workspace_id":"w1"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+  agent)
+    case "$2" in
+      start) exit 0 ;;
+      prompt)
+        echo '{"error":{"code":"agent_prompt_stalled","message":"no state change within 5000 ms"}}' 1>&2
+        exit 1
+        ;;
+      send-keys) exit 0 ;;
+      wait) exit 0 ;;
+      get) echo '{"state":"done"}'; exit 0 ;;
+      explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
+      read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
+    esac
+    ;;
+esac
+exit 0
+"""
+
+
+def test_given_agent_prompt_stalled_when_recovery_send_keys_and_wait_succeed_then_exit0_and_recovery_recorded(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_STALL_THEN_RECOVER_BODY)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path, "line one\nline two\nOBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--expect-marker", "OBSERVED_MARKER",
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(tmp_path / "herdr-state")},
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "prompt_stall_recovered: True" in summary
+
+
+def test_given_agent_prompt_stalled_when_recovery_send_keys_fails_then_exit1_not_skip(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    body = _FAKE_ISOLATED_HERDR_STALL_THEN_RECOVER_BODY.replace(
+        "send-keys) exit 0 ;;", "send-keys) exit 1 ;;"
+    )
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path, "line one\nline two\n")
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(tmp_path / "herdr-state")},
+    )
+    assert result.returncode == 1
+    assert "recovery send-keys failed" in result.stderr
+
+
+def test_given_agent_prompt_stalled_when_recovery_wait_also_stalls_then_exit1_not_skip(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    body = _FAKE_ISOLATED_HERDR_STALL_THEN_RECOVER_BODY.replace(
+        "wait) exit 0 ;;", "wait) exit 1 ;;"
+    )
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path, "line one\nline two\n")
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(tmp_path / "herdr-state")},
+    )
+    assert result.returncode == 1
+    assert "recovery wait failed" in result.stderr
+
+
+def test_given_agent_prompt_stalled_and_recovery_never_observes_state_change_then_exit1_not_false_pass(
+    repo_with_worktree, tmp_path
+):
+    """``herdr agent wait`` matches immediately if the agent is already idle
+    at call time (no observed-change requirement), so a naive
+    prompt->send-keys->wait recovery can report success even when the
+    paste-collapsed prompt was never actually submitted. The runner must
+    poll for a genuine ``state_change_seq`` change before trusting
+    ``agent wait``; a fake herdr whose ``state_change_seq`` never changes
+    (and whose ``agent wait`` would otherwise trivially match) must still
+    surface a hard failure, not a false pass."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    get_call_log = tmp_path / "get_calls.log"
+    state_dir = tmp_path / "herdr-state"
+    body = """
+STATE_DIR="$FAKE_HERDR_STATE_DIR"
+mkdir -p "$STATE_DIR"
+if [ "$1" = "--session" ]; then
+  touch "$STATE_DIR/$2.session"
+  sleep 300
+  exit 0
+fi
+case "$1 $2" in
+  "status server")
+    exit 0
+    ;;
+esac
+case "$1" in
+  session)
+    case "$2" in
+      list)
+        out="{\\"sessions\\":["
+        first=1
+        for f in "$STATE_DIR"/*.session; do
+          [ -e "$f" ] || continue
+          name=$(basename "$f" .session)
+          if [ -e "$STATE_DIR/$name.stopped" ]; then running=false; else running=true; fi
+          if [ $first -eq 0 ]; then out="$out,"; fi
+          out="$out{\\"name\\":\\"$name\\",\\"running\\":$running}"
+          first=0
+        done
+        out="$out]}"
+        echo "$out"
+        exit 0
+        ;;
+      stop) touch "$STATE_DIR/$3.stopped"; exit 0 ;;
+      delete) rm -f "$STATE_DIR/$3.session" "$STATE_DIR/$3.stopped"; exit 0 ;;
+    esac
+    ;;
+  workspace)
+    case "$2" in
+      create)
+        touch "$STATE_DIR/${HERDR_SESSION}.session"
+        echo '{"result":{"root_pane":{"pane_id":"pane-xyz"},"workspace":{"workspace_id":"w1"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+  agent)
+    case "$2" in
+      start) exit 0 ;;
+      prompt)
+        echo '{"error":{"code":"agent_prompt_stalled","message":"no state change within 5000 ms"}}' 1>&2
+        exit 1
+        ;;
+      send-keys) exit 0 ;;
+      wait) exit 0 ;;
+      get)
+        echo "called" >> "%s"
+        echo '{"result":{"agent":{"state_change_seq":42}}}'
+        exit 0
+        ;;
+      explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
+      read) echo "pane transcript"; exit 0 ;;
+    esac
+    ;;
+esac
+exit 0
+""" % (get_call_log,)
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path, "line one\nline two\n")
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        "--timeout-seconds", "3",
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
+    )
+    assert result.returncode == 1
+    assert "no observed state change" in result.stderr
+    # ``agent get`` must have been polled (baseline + at least one recheck)
+    # rather than trusting a single, possibly-stale ``agent wait`` match.
+    assert get_call_log.read_text(encoding="utf-8").count("called") >= 2
+
+
+def test_given_agent_prompt_fails_for_non_stall_reason_when_lane_runs_then_no_recovery_attempted(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    send_keys_log = tmp_path / "send_keys.log"
+    state_dir = tmp_path / "herdr-state"
+    body = """
+STATE_DIR="$FAKE_HERDR_STATE_DIR"
+mkdir -p "$STATE_DIR"
+if [ "$1" = "--session" ]; then
+  touch "$STATE_DIR/$2.session"
+  sleep 300
+  exit 0
+fi
+case "$1 $2" in
+  "status server")
+    exit 0
+    ;;
+esac
+case "$1" in
+  session)
+    case "$2" in
+      list)
+        out="{\\"sessions\\":["
+        first=1
+        for f in "$STATE_DIR"/*.session; do
+          [ -e "$f" ] || continue
+          name=$(basename "$f" .session)
+          if [ -e "$STATE_DIR/$name.stopped" ]; then running=false; else running=true; fi
+          if [ $first -eq 0 ]; then out="$out,"; fi
+          out="$out{\\"name\\":\\"$name\\",\\"running\\":$running}"
+          first=0
+        done
+        out="$out]}"
+        echo "$out"
+        exit 0
+        ;;
+      stop) touch "$STATE_DIR/$3.stopped"; exit 0 ;;
+      delete) rm -f "$STATE_DIR/$3.session" "$STATE_DIR/$3.stopped"; exit 0 ;;
+    esac
+    ;;
+  workspace)
+    case "$2" in
+      create)
+        touch "$STATE_DIR/${HERDR_SESSION}.session"
+        echo '{"result":{"root_pane":{"pane_id":"pane-xyz"},"workspace":{"workspace_id":"w1"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+  agent)
+    case "$2" in
+      start) exit 0 ;;
+      prompt)
+        echo '{"error":{"code":"agent_pane_gone","message":"pane no longer exists"}}' 1>&2
+        exit 1
+        ;;
+      send-keys) echo called >> "%s"; exit 0 ;;
+      wait) exit 0 ;;
+      get) echo '{"state":"done"}'; exit 0 ;;
+      explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
+      read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
+    esac
+    ;;
+esac
+exit 0
+""" % (send_keys_log,)
+    _write_fake_exe(fake_bin / "herdr", body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    prompt = _prompt_file(tmp_path, "single line prompt\n")
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
+    )
+    assert result.returncode == 1
+    assert "agent_pane_gone" in result.stderr
+    assert not send_keys_log.exists()
+
+
+# ---------------------------------------------------------------------------
+# AC6 / AC7: evidence hygiene, redaction, session-log metadata
+# (Issue #1921 P1 fix-delta: summary.md only, no raw native event / pane
+# transcript / agent-explain persistence)
+# ---------------------------------------------------------------------------
+
+
+def test_given_home_path_and_long_token_in_error_output_when_evidence_written_then_redacted(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    secret_token = "A" * 60
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + f"""
+cat > /dev/null
+echo "failure at /home/someone/.ssh/id_rsa token={secret_token}" 1>&2
+exit 1
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1
+    summary_text = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "/home/someone" not in summary_text
+    assert secret_token not in summary_text
+    assert "<redacted>" in summary_text
+
+
+def test_given_ansi_escape_codes_in_error_output_when_evidence_written_then_stripped(
+    repo_with_worktree, tmp_path
+):
+    """A real herdr binary emits ANSI color codes on stderr (observed live
+    against herdr v0.7.5). These are cosmetic noise, not secrets, but must
+    not be persisted verbatim into evidence."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+printf '\\033[1merror:\\033[0m nested herdr is disabled\\n' 1>&2
+exit 1
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1
+    summary_text = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "\x1b[" not in summary_text
+    assert "nested herdr is disabled" in summary_text
+
+
+def test_given_raw_prompt_text_when_evidence_written_then_prompt_body_not_persisted(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+echo '{"type":"result"}'
+exit 0
+""")
+    secret_prompt = "UNIQUE_RAW_PROMPT_SENTINEL_TEXT"
+    prompt = _prompt_file(tmp_path, secret_prompt + "\n")
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    for evidence_file in out_dir.glob("*"):
+        assert secret_prompt not in evidence_file.read_text(encoding="utf-8")
+
+
+def test_given_evidence_written_when_output_dir_listed_then_only_summary_present(
+    repo_with_worktree, tmp_path
+):
+    """No native-events.jsonl / pane-output.txt / agent-detection.json /
+    session-log-metadata.txt is persisted (Issue #1921 P1 fix-delta)."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+for i in $(seq 1 5); do echo "{\\"type\\":\\"event\\",\\"i\\":$i}"; done
+echo '{"type":"result"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--inspect-session-log-metadata",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    assert sorted(p.name for p in out_dir.iterdir()) == ["summary.md"]
+
+
+def test_given_require_session_log_metadata_and_unavailable_when_lane_runs_then_skip(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+echo 'not-json-output-at-all'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--require-session-log-metadata",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 77
+    assert "session-log metadata" in result.stderr
+
+
+def test_given_inspect_session_log_metadata_when_events_have_allowlist_fields_then_count_recorded(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+echo '{"type":"hook_event","subagent":"test-runner","timestamp":"2026-01-01T00:00:00Z","reasoning":"should not leak"}'
+echo '{"type":"result"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--inspect-session-log-metadata",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary_text = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "session_log_metadata_count: 2" in summary_text
+    assert "should not leak" not in summary_text
+    assert "test-runner" not in summary_text
+
+
+# ---------------------------------------------------------------------------
+# Fix-delta iteration 1: --repo-root default resolution from inside a linked
+# worktree (Issue #1887 PR #1921 review).
+# ---------------------------------------------------------------------------
+
+
+def test_given_script_checked_out_inside_linked_worktree_when_invoked_without_repo_root_then_not_rejected_as_root(
+    repo_with_worktree_and_script, tmp_path
+):
+    repo, worktree = repo_with_worktree_and_script
+    script_in_worktree = worktree / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
+    assert script_in_worktree.is_file()
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    prompt = _prompt_file(tmp_path, "MARKER_TOKEN_WT\n")
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "claude-structured"
+    env = dict(os.environ)
+    path_key = "PATH"
+    env[path_key] = str(fake_bin) + ":" + env[path_key]
+    # Invoke the script's own on-disk copy that lives *inside the worktree*,
+    # from the worktree cwd, without --repo-root -- this is exactly the
+    # real-world invocation pattern for Issue #1887 AC3-AC7.
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script_in_worktree),
+            "--worktree", str(worktree),
+            "--runtime", "claude", "--mode", "structured",
+            "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+            "--timeout-seconds", "30", "--expect-marker", "MARKER_TOKEN_WT",
+        ],
+        cwd=str(worktree),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert "root checkout rejected" not in result.stderr
+    assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# AC8: exit code matrix sanity
+# ---------------------------------------------------------------------------
+
+
+def test_given_no_flags_when_runner_invoked_without_required_args_then_exits_nonzero():
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+
+
+def test_given_repo_when_runner_invoked_with_removed_transport_flag_then_argparse_rejects(
+    repo_with_worktree, tmp_path
+):
+    """``--transport`` was removed entirely (Issue #1921 P0-1/P1 fix-delta:
+    structured lane is always direct, interactive lane is always an isolated
+    herdr session — there is no longer a caller-selectable transport)."""
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured", "--transport", "direct",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+    )
+    assert result.returncode != 0
+    assert "unrecognized arguments" in result.stderr
+
+
+def test_given_repo_when_runner_invoked_with_removed_keep_pane_flag_then_argparse_rejects(
+    repo_with_worktree, tmp_path
+):
+    """``--keep-pane`` was removed entirely (Issue #1921 P0-2 fix-delta:
+    cleanup is unconditional and success-verified, never opt-out)."""
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive", "--keep-pane",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+    )
+    assert result.returncode != 0
+    assert "unrecognized arguments" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Thin Codex wrapper contract (AC1)
+# ---------------------------------------------------------------------------
+
+
+def test_given_repo_when_thin_wrapper_checked_then_points_to_canonical_body():
+    wrapper = REPO_ROOT / ".agents" / "skills" / "worktree-agent-runtime-smoke" / "SKILL.md"
+    canonical = REPO_ROOT / ".claude" / "skills" / "worktree-agent-runtime-smoke" / "SKILL.md"
+    assert wrapper.is_file()
+    assert canonical.is_file()
+    text = wrapper.read_text(encoding="utf-8")
+    assert "derived/non-canonical" in text
+    assert "../../../.claude/skills/worktree-agent-runtime-smoke/SKILL.md" in text
+    assert "## Procedure" not in text
