@@ -1819,13 +1819,29 @@ def consume_trusted_anchor_contract_patch_plan(
         temporary_paths.extend([candidate_path, input_path])
         from scope_signal_delta import build_issue_edit_txn_input
 
+        # The readiness checker exposes a richer result for callers, while
+        # edit_issue_txn.py intentionally accepts only its closed forwarding
+        # payload. Keep this narrowing transaction-local so the controlled
+        # executor's input validation remains strict.
+        readiness_forwarding = {
+            key: readiness[key]
+            for key in (
+                "status",
+                "body_sha256",
+                "source_checks",
+                "errors",
+                "readiness_result_ref",
+                "resolution_evidence",
+            )
+            if key in readiness
+        }
         transaction_input = build_issue_edit_txn_input(
             issue_number=issue_number,
             repo=repo,
             previous_body_sha256=f"sha256:{_sha256(current_issue.get('body', ''))}",
             previous_updated_at=current_issue["updatedAt"],
             new_body_file=str(candidate_path.relative_to(repo_root)),
-            readiness_result=readiness,
+            readiness_result=readiness_forwarding,
         )
         input_path.write_text(json.dumps(transaction_input, ensure_ascii=False), encoding="utf-8")
         transaction_script = _SCRIPTS_DIR.parent.parent / "edit-issue" / "scripts" / "edit_issue_txn.py"
@@ -1895,6 +1911,83 @@ def consume_trusted_anchor_contract_patch_plan(
                 path.unlink()
             except OSError:
                 pass
+
+
+def _satisfied_trusted_directive_noop_patch_plan(
+    *,
+    plan: dict[str, Any],
+    issue: dict[str, Any],
+    repo: str,
+    issue_number: int,
+    anchor_url: str,
+    anchor_payload: dict[str, Any],
+    anchor_body: str,
+) -> dict[str, Any] | None:
+    """Reconstruct only a proven-satisfied trusted directive as a no-op.
+
+    The planner intentionally omits a patch plan after it sees that a
+    previously applied directive is already present.  Contract-update mode
+    must not turn that safe replay into a failed mutation phase.  This helper
+    is deliberately narrower than a generic missing-plan fallback: it accepts
+    only the planner's ``no_scope_signal`` outcome, then independently derives
+    explicit trusted operations and requires the section-aware builder to
+    report no body change.
+    """
+    sidecar = plan.get("scope_signal_guard_decision_v2")
+    if not isinstance(sidecar, dict):
+        return None
+    raw_signal = sidecar.get("raw_signal")
+    if not isinstance(raw_signal, dict) or raw_signal.get("triggered") is not False:
+        return None
+    if raw_signal.get("reason_code") != "no_scope_signal":
+        return None
+
+    try:
+        from scope_signal_delta import (
+            build_contract_patch_plan_v1,
+            build_section_aware_candidate_body,
+            derive_contract_patch_operations,
+            normalize_trusted_anchor_iteration_zero,
+        )
+    except ImportError:
+        return None
+
+    evidence = _build_scope_delta_authority_evidence(
+        comment_payload=anchor_payload,
+        comment_body=anchor_body,
+        repo=repo,
+        issue_number=issue_number,
+        anchor_url=anchor_url,
+        captured_at=_now_iso(),
+    )
+    if not isinstance(evidence, dict) or evidence.get("confidence") != "explicit":
+        return None
+    if evidence.get("boundary_flags"):
+        return None
+    normalized = normalize_trusted_anchor_iteration_zero(
+        repo=repo,
+        issue_number=issue_number,
+        anchor=anchor_payload,
+        source_body=anchor_body,
+    )
+    if not normalized.get("accepted"):
+        return None
+    operations = derive_contract_patch_operations([evidence])
+    if not operations:
+        return None
+    candidate = build_section_aware_candidate_body(
+        body=issue.get("body", ""),
+        operations=operations,
+        source_identity=normalized["source_identity"],
+    )
+    if candidate.get("changed"):
+        return None
+    return build_contract_patch_plan_v1(
+        target_issue_number=issue_number,
+        base_issue_body_sha256=_sha256(issue.get("body", "")),
+        source_evidence=[evidence],
+        operations=operations,
+    )
 
 
 def run_preflight(
@@ -2263,6 +2356,21 @@ def run_preflight(
         sidecar = plan.get("scope_signal_guard_decision_v2")
         authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else None
         patch_plan = authority.get("contract_patch_plan") if isinstance(authority, dict) else None
+        if (
+            not isinstance(patch_plan, dict)
+            and anchor_payload_for_consumer is not None
+            and anchor_body_for_consumer is not None
+            and anchor_url_for_consumer is not None
+        ):
+            patch_plan = _satisfied_trusted_directive_noop_patch_plan(
+                plan=plan,
+                issue=issue,
+                repo=repo,
+                issue_number=issue_number,
+                anchor_url=anchor_url_for_consumer,
+                anchor_payload=anchor_payload_for_consumer,
+                anchor_body=anchor_body_for_consumer,
+            )
         if (
             isinstance(patch_plan, dict)
             and anchor_payload_for_consumer is not None

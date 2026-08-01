@@ -594,6 +594,13 @@ def _snapshot_repo_paths(
             allowed_parent_dirs.add(parent)
             if parent == root:
                 break
+    if command_id == "contract_update.run.with_anchor":
+        # The existing edit-issue transaction uses the repository-approved
+        # transaction-local ``tmp/`` workspace for its candidate and input
+        # files, and deletes those files before returning.  Ignore only the
+        # directory-node mtime churn here; any residual child path remains in
+        # the snapshot and is still rejected below.
+        allowed_parent_dirs.add(root / "tmp")
     # Issue #1409: also skip recording the directory-node entry (its own
     # mtime/size) for every ancestor of each race-tolerant-unattributable
     # root. Without this, a *new* top-level ancestor directory (e.g.

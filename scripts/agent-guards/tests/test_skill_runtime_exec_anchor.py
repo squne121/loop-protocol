@@ -10,8 +10,10 @@ and AC9 (real executor chain positive + negative smoke).
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -80,6 +82,215 @@ def select_issue_worktree(catalog, issue_number, root_realpath):
     return None
 """,
     )
+    _write_text(
+        repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "command_registry.py",
+        """from __future__ import annotations
+
+REGISTRY = {
+    "preflight.run": {
+        "id": "preflight.run",
+        "argv": [
+            "uv", "run", "python3",
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}", "--repo", "{repo}",
+        ],
+        "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime",
+        "required_cwd": "canonical_main_root", "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_read_only",
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+        },
+    },
+    "preflight.run.with_anchor": {
+        "id": "preflight.run.with_anchor",
+        "argv": [
+            "uv", "run", "python3",
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}", "--repo", "{repo}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+        ],
+        "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_anchor",
+        "required_cwd": "canonical_main_root", "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_read_only",
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "anchor_comment_url": {
+                "type": "github_issue_comment_url", "required": True,
+            },
+        },
+    },
+}
+
+
+def render_command(command_id: str, values: dict[str, object]) -> list[str]:
+    return [str(values[token[1:-1]]) if token.startswith("{") else token for token in REGISTRY[command_id]["argv"]]
+""",
+    )
+    _write_text(
+        repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "run_refinement_preflight.py",
+        """from __future__ import annotations
+import argparse
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--issue-number", required=True)
+parser.add_argument("--repo", required=True)
+parser.add_argument("--anchor-comment-url")
+parser.add_argument("--consume-contract-patch-plan", action="store_true")
+args = parser.parse_args()
+artifact = Path(".claude/artifacts/issue-refinement-loop") / args.issue_number
+artifact.mkdir(parents=True, exist_ok=True)
+payload = {"issue_number": args.issue_number, "repo": args.repo, "anchor_comment_url": args.anchor_comment_url}
+(artifact / "preflight.json").write_text(json.dumps(payload))
+print(json.dumps({"ok": True, **payload}))
+""",
+    )
+
+
+def _copy_tree(source: Path, destination: Path) -> None:
+    """Copy a production skill subtree into an isolated process fixture."""
+    shutil.copytree(source, destination, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
+
+
+def _install_real_contract_update_fixture(repo_root: Path) -> Path:
+    """Install the production wrapper and its direct consumers.
+
+    Only GitHub and the controlled mutation executor are replaced.  The
+    registry, policy, privileged executor, production preflight wrapper,
+    planner, candidate readiness, review, and edit transaction helper all run
+    as their production files in the temporary repository.
+    """
+    source_root = REPO_ROOT
+    for skill in (
+        "issue-refinement-loop",
+        "edit-issue",
+        "issue-contract-review",
+        "review-issue",
+    ):
+        _copy_tree(
+            source_root / ".claude" / "skills" / skill,
+            repo_root / ".claude" / "skills" / skill,
+        )
+    _copy_tree(
+        source_root / ".claude" / "skills" / "create-issue" / "scripts",
+        repo_root / ".claude" / "skills" / "create-issue" / "scripts",
+    )
+    _copy_tree(source_root / ".github" / "ISSUE_TEMPLATE", repo_root / ".github" / "ISSUE_TEMPLATE")
+    _copy_tree(source_root / "docs" / "dev", repo_root / "docs" / "dev")
+    for rel in (
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "scripts/agent-guards/skill_runtime_command_policy.py",
+    ):
+        src = source_root / rel
+        _write_text(repo_root / rel, src.read_text())
+
+    for rel in ("pyproject.toml", "uv.lock"):
+        _write_text(repo_root / rel, (source_root / rel).read_text())
+    # Materialize the project environment before the executor snapshots the
+    # fixture repository; the runtime command itself must not create an
+    # unrelated `.venv/` write.
+    subprocess.run(["uv", "sync", "--locked"], cwd=str(repo_root), check=True, capture_output=True, text=True)
+
+    _write_text(
+        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
+        """from __future__ import annotations
+
+class Deadline:
+    def subprocess_timeout(self, seconds: float) -> float:
+        return seconds
+
+
+def list_worktrees(project_root: str, deadline=None):
+    return []
+
+
+def select_issue_worktree(catalog, issue_number, root_realpath):
+    return None
+""",
+    )
+
+    # The transaction helper remains production code.  This fake is its
+    # external controlled-executor boundary and mutates only the fixture's
+    # artifact-root backed fake remote state.
+    _write_text(
+        repo_root / "scripts" / "agent-guards" / "controlled_skill_mutation_exec.py",
+        """from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--command-id", required=True)
+    parser.add_argument("--issue-number", required=True)
+    parser.add_argument("--input-file", required=True)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    payload = json.loads(Path(args.input_file).read_text(encoding="utf-8"))
+    artifact = Path(".claude/artifacts/issue-refinement-loop") / args.issue_number
+    state_path = artifact / "fake_remote_issue.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["title"] = payload["new_title"]
+    state["body"] = payload["new_body"]
+    state["updatedAt"] = "2026-08-01T00:00:01Z"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    (artifact / "controlled_transaction_request.json").write_text(
+        json.dumps({"command_id": args.command_id, "payload": payload}), encoding="utf-8"
+    )
+    print(json.dumps({"new_body_sha256": payload["new_body_sha256"]}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+""",
+    )
+
+    fake_bin = repo_root / "fake-bin"
+    _write_text(
+        fake_bin / "gh",
+        """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+ROOT = Path.cwd()
+ARTIFACT = ROOT / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+STATE = ARTIFACT / "fake_remote_issue.json"
+ANCHOR = ARTIFACT / "fake_anchor.json"
+CALLS = ARTIFACT / "fake_gh_calls.jsonl"
+
+
+def emit(value):
+    print(json.dumps(value))
+    return 0
+
+
+args = sys.argv[1:]
+CALLS.parent.mkdir(parents=True, exist_ok=True)
+with CALLS.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(args) + "\\n")
+if args[:2] == ["issue", "view"]:
+    emit(json.loads(STATE.read_text(encoding="utf-8")))
+elif args[:1] == ["api"] and args[1].startswith("repos/squne121/loop-protocol/issues/1498/comments?"):
+    emit([[json.loads(ANCHOR.read_text(encoding="utf-8"))]])
+elif args[:2] == ["api", "repos/squne121/loop-protocol/issues/comments/1"]:
+    emit(json.loads(ANCHOR.read_text(encoding="utf-8")))
+else:
+    print("unexpected fake gh argv", file=sys.stderr)
+    raise SystemExit(2)
+""",
+    )
+    (fake_bin / "gh").chmod(0o755)
+    return fake_bin
 
     _write_text(
         repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "command_registry.py",
@@ -273,6 +484,7 @@ def _run_executor(
     anchor_comment_url: "str | None" = _VALID_URL,
     extra_args: "list[str] | None" = None,
     extra_env: "dict[str, str] | None" = None,
+    fake_gh: "Path | None" = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo)}
     if extra_env:
@@ -291,6 +503,38 @@ def _run_executor(
         argv += ["--anchor-comment-url", anchor_comment_url]
     if extra_args:
         argv += extra_args
+    if fake_gh is not None:
+        # `skill_runtime_exec.py` intentionally permits only trusted system
+        # PATH entries.  Mount the fake executable over that trusted `gh`
+        # path inside a private user+mount namespace, so the executed
+        # registry/policy/executor/wrapper files remain byte-identical
+        # production files and the host's gh binary is never modified.
+        runner = repo / "fixture_mount_fake_gh.py"
+        _write_text(
+            runner,
+            """from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+fake_gh, command = sys.argv[1], sys.argv[2:]
+subprocess.run(["/usr/bin/mount", "--bind", fake_gh, "/usr/bin/gh"], check=True)
+os.execvp(command[0], command)
+""",
+        )
+        argv = [
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--propagation",
+            "private",
+            sys.executable,
+            str(runner),
+            str(fake_gh),
+            *argv,
+        ]
     return subprocess.run(
         argv,
         cwd=str(repo),
@@ -395,39 +639,98 @@ def test_executor_preflight_run_unaffected_without_anchor(tmp_path: Path) -> Non
 
 
 def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_path: Path) -> None:
-    """#1877 AC3/AC6/AC10: real registry -> policy -> executor -> phase process.
+    """#1877 AC3/AC6/AC10: production process path and fake external boundary.
 
-    The fixture retains the production command id and argv shape, then uses a
-    separate fake controlled transaction process so this test never writes a
-    live GitHub Issue.  A second invocation proves idempotent no-change
-    routing without a second transaction write.
+    This runs the real registry, policy, privileged executor,
+    ``run_refinement_preflight.py``, planner, candidate readiness, review,
+    and ``edit_issue_txn.py`` in a temporary git repository.  Only GitHub
+    and the controlled mutation executable are faked, in a private mount
+    namespace; no fixture replaces the phase wrapper.
     """
     repo = _make_repo(tmp_path)
-    _install_skill_runtime_exec_fixture(repo)
-
-    first = _run_executor(repo, command_id="contract_update.run.with_anchor")
-    assert first.returncode == 0, first.stderr
+    fake_bin = _install_real_contract_update_fixture(repo)
+    # Canonical repositories provision this approved transaction-local
+    # workspace.  Create it before the executor's before-snapshot; the real
+    # consumer removes its candidate/input files before the child returns.
+    (repo / "tmp").mkdir()
     artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
-    request = json.loads((artifact_dir / "issue_edit_txn_input.json").read_text())
-    assert request["schema"] == "ISSUE_EDIT_TXN_INPUT_V1"
-    assert (artifact_dir / "transaction_invoked.json").exists()
-    assert (repo / "artifacts" / "1498" / "issue-metadata" / "transaction.json").exists()
-    assert (artifact_dir / "final_body.txt").exists()
-    assert (artifact_dir / "fresh_check_input.json").exists()
-    assert json.loads(first.stdout)["contract_update"] == {
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    immutable = json.loads(
+        (
+            REPO_ROOT
+            / ".claude/skills/issue-refinement-loop/tests/fixtures/issue_1835_trusted_anchor_iteration_zero.json"
+        ).read_text(encoding="utf-8")
+    )
+    pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    anchor = {
+        "id": 1,
+        "body": "## Revised AC\n- AC2: trusted fixture directive\n",
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
+
+    first = _run_executor(
+        repo,
+        command_id="contract_update.run.with_anchor",
+        fake_gh=fake_bin / "gh",
+    )
+    assert first.returncode == 0, first.stderr
+    request = json.loads((artifact_dir / "controlled_transaction_request.json").read_text())
+    assert request["command_id"] == "issue_content.update"
+    assert request["payload"]["schema"] == "ISSUE_CONTENT_UPDATE_INPUT_V1"
+    assert "AC2: trusted fixture directive" in json.loads(
+        (artifact_dir / "fake_remote_issue.json").read_text()
+    )["body"]
+    calls = [json.loads(line) for line in (artifact_dir / "fake_gh_calls.jsonl").read_text().splitlines()]
+    assert calls.count(["api", "repos/squne121/loop-protocol/issues/comments/1"]) >= 2
+    assert sum(call[:2] == ["issue", "view"] for call in calls) >= 4
+    result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
+    assert result["contract_update"] == {
         "status": "applied",
         "writes": 1,
         "iterations": 0,
         "final_readback": "verified",
         "fresh_preflight": "pass",
-        "fresh_review": "approve",
+        # The synthetic directive intentionally introduces a new AC without
+        # its matching verification-command marker.  The important boundary
+        # is that a fresh reviewer receives the post-mutation body, and its
+        # valid independent outcome is propagated rather than suppressed.
+        "fresh_review": "needs_fix",
         "fresh_readiness": "go",
     }
 
-    replay = _run_executor(repo, command_id="contract_update.run.with_anchor")
+    replay = _run_executor(
+        repo,
+        command_id="contract_update.run.with_anchor",
+        fake_gh=fake_bin / "gh",
+    )
     assert replay.returncode == 0, replay.stderr
-    assert json.loads(replay.stdout)["contract_update"]["status"] == "no_change"
-    assert json.loads(replay.stdout)["contract_update"]["writes"] == 0
+    replay_result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
+    assert replay_result["contract_update"]["status"] == "no_change"
+    assert replay_result["contract_update"]["writes"] == 0
+    assert not (repo / "artifacts" / "1498" / "issue-metadata").exists() or len(
+        list((repo / "artifacts" / "1498" / "issue-metadata").rglob("*.input.json"))
+    ) == 1
 
 
 def test_contract_update_phase_cannot_be_reached_through_preflight_command(tmp_path: Path) -> None:
