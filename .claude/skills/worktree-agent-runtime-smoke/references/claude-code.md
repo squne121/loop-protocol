@@ -43,5 +43,5 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示の
 
 ## 観測できる主な evidence
 
-- structured lane: `type: system/init`、`type: result`、hook lifecycle event の件数
-- interactive lane: pane transcript（bounded／redacted）、`agent explain` の native detection response
+- structured lane: `type: system/init`、`type: result`、hook lifecycle event の件数を確認できる
+- interactive lane: pane transcript（bounded／redacted）、`agent explain` の native detection response を確認できる

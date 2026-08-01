@@ -1964,7 +1964,7 @@ cycle）は live traversal を要するため executor 側
 `edit_issue_txn.py` は同じ純粋関数を import して executor 呼び出し前に defense-in-depth
 として再検証する（`_validate_relationship_graph_invariants`）。
 
-### Required Transaction Order（executor 内 saga、`_run_issue_relationship_update`）
+### Required Transaction Order（executor 内 saga の必須実行順序、`_run_issue_relationship_update`）
 
 1. 入力を `validate_issue_relationship_update_input` で再検証する（caller 契約の defense in depth）
 2. 認証済み actor の repository permission を確認する（`admin`/`write`/`maintain` のみ許可。それ以外は `precondition_rejected`）
@@ -2017,7 +2017,7 @@ candidate body が変更を含む場合、guard／hygiene／readiness を実行�
 6. executor の `status` が `no_op`/`applied` の場合のみ content mutation へ進む。それ以外（`precondition_rejected`/`postcondition_rejected`/`partial`/`transport_or_schema_error`）は content mutation を一切開始せず、`mutation_attempted` に応じて `failed_no_mutation`（未着手）または `failed_after_mutation`（部分実行後）を返す（AC1/AC2）。子プロセスが timeout（returncode 124）または non-JSON 出力を返した場合は「mutation なし」と即断せず、独立readback を実行し observed state を desired/before と比較したうえで分類する（PR #1897 P1-5: `applied_with_receipt_loss`/`failed_no_mutation`/`failed_after_mutation`）
 7. Phase B が成功した場合、title/body/updatedAt を再読取し、content-lane の `expected_previous_updated_at` に fresh な値を使う。再読取で title/body の concurrent drift を検出したら `failed_after_mutation` で停止する（PR #1897 P1-7）
 
-**Phase C（`_finalize_native_relationships`、最終 combined readback）**
+**Phase C（`_finalize_native_relationships`。最終段階の combined readback を担う）**
 
 content mutation（または確定した no-op）が完了したら、`issue_relationship.update`
 を zero-delta（`expected_before=desired`、add/remove 空、`parent.action=unchanged`）
@@ -2036,12 +2036,14 @@ readiness gate／stale precondition 等の relationship gate 到達前の失敗�
 
 ### Allowed Paths
 
-- `.claude/skills/edit-issue/scripts/edit_issue_txn.py`
-- `scripts/agent-guards/controlled_skill_mutation_policy.py`
-- `scripts/agent-guards/controlled_skill_mutation_exec.py`
-- `.claude/skills/edit-issue/tests/`
-- `scripts/agent-guards/tests/test_controlled_skill_mutation_policy.py`
-- `scripts/agent-guards/tests/test_controlled_skill_mutation_exec.py`
+本セクションが対象とする編集許可パスは以下の通り。
+
+- `.claude/skills/edit-issue/scripts/edit_issue_txn.py` — transaction 本体
+- `scripts/agent-guards/controlled_skill_mutation_policy.py` — policy 定義
+- `scripts/agent-guards/controlled_skill_mutation_exec.py` — executor 実装
+- `.claude/skills/edit-issue/tests/` — 対応テスト一式
+- `scripts/agent-guards/tests/test_controlled_skill_mutation_policy.py` — policy のテスト
+- `scripts/agent-guards/tests/test_controlled_skill_mutation_exec.py` — executor のテスト
 
 ## edit-issue 向け transaction helper の契約定義（Issue #1287）
 

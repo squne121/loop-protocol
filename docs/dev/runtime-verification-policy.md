@@ -458,7 +458,7 @@ safety_claims:
 
 ---
 
-## 10. worktree-agent-runtime-smoke（Claude Code／Codex CLI runtime smoke の共有 Skill）
+## 10. worktree-agent-runtime-smoke（Claude Code／Codex CLI の runtime smoke を担う共有 Skill の説明）
 
 Claude Code／Codex CLI の実 process／TUI を起動して runtime verification を行う Issue（例: hook
 lifecycle、session 非永続化、worktree cwd binding の観測が必要な場合）は、`.claude/skills/worktree-agent-runtime-smoke/SKILL.md`

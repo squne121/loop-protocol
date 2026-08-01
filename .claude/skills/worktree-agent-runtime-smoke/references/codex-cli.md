@@ -37,5 +37,5 @@ PR #1864 の先行 herdr smoke（`/status`、Skill 一覧、filesystem read、pa
 
 ## 観測できる主な evidence
 
-- structured lane: `item.completed` 等の JSONL event 件数、process exit code
-- interactive lane: pane transcript（bounded／redacted）、`agent explain` の native detection response
+- structured lane: `item.completed` 等の JSONL event 件数と process exit code を確認できる
+- interactive lane: pane transcript（bounded／redacted）、`agent explain` の native detection response を確認できる

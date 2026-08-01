@@ -34,7 +34,7 @@ herdr pane close <pane-id>
   `SKIP:` と exit 77 を返す（`herdr status server` で running server を確認する）
 - herdr unavailable を structured lane の失敗へ波及させない
 
-## `agent_prompt_stalled`（Claude Code multi-line prompt）
+## `agent_prompt_stalled`（Claude Code の複数行 prompt で発生する事象）
 
 `herdr agent prompt` は、送信後 5000ms 以内に agent lifecycle state の変化が
 観測できないと `agent_prompt_stalled` を返す（herdr 自身の固定挙動、
@@ -53,7 +53,7 @@ lifecycle state を再観測する（1 回だけ）。回復に成功した場�
 evidence の `prompt_stall_recovered: true` として記録し、成功を偽装しない。
 回復にも失敗した場合は SKIP へ降格せず exit 1 を返す。
 
-## Safety Boundary
+## Safety Boundary（安全境界）
 
 - 既存 pane の focus を奪わない（`--no-focus`）
 - unique agent name は run-local とする

@@ -539,7 +539,7 @@ authority にならないことを保証する純粋な決定コアである。`
 `secret_boundary_violation`・`forbidden_path`・`public_checkpoint`・`secrets_mode` は
 `PermissionRequest` でも `deny` を維持する。
 
-## Worktree Agent Runtime Smoke（Issue #1887）
+## Worktree Agent Runtime Smoke（実機起動による動作検証。Issue #1887）
 
 Claude Code／Codex CLI の runtime smoke（linked worktree 内での fresh session 起動と observation）は
 `.claude/skills/worktree-agent-runtime-smoke/SKILL.md` に集約する。structured lane（既定、非対話

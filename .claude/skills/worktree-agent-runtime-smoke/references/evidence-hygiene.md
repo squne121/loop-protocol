@@ -16,17 +16,17 @@ session-log-metadata.txt  # requested and available の場合のみ
 ## 保存可能な証跡
 
 - runtime 名と version
-- tested HEAD
-- repo-relative worktree
-- branch
+- 検証対象の tested HEAD
+- repo-relative な worktree のパス
+- 対象 branch 名
 - 実行 lane／transport
 - process exit code
 - herdr pane ID／agent name
-- observed lifecycle state
+- observed lifecycle state（観測された状態）
 - native event type の件数
 - caller 指定の expected marker の有無
-- bounded redacted output
-- filesystem／Git postcondition
+- bounded redacted output（制限・redact 済みの出力）
+- filesystem／Git postcondition（事後条件）
 - session-log metadata の取得可否
 
 ## 既定で保存しないもの
@@ -48,7 +48,7 @@ session-log-metadata.txt  # requested and available の場合のみ
 - native event は 1 ラン最大 400 行、1 行最大 2000 文字へ bound する
 - pane output も同じ bound を適用する
 
-## Session-log metadata boundary（#1887 Design Decision 5）
+## Session-log metadata boundary（session-log metadata の扱いの境界。#1887 Design Decision 5）
 
 - structured event または herdr output で判定可能な case では session log を必須にしない
 - caller が明示的に要求した場合のみ metadata を読み取る（`--inspect-session-log-metadata`）
