@@ -1,5 +1,13 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  copyFileSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -16,6 +24,7 @@ import {
 } from '../scripts/e2e-control-marker-manifest.mjs'
 
 const checkerPath = resolve('scripts/check-dist-e2e-boundary.mjs')
+const manifestPath = resolve('scripts/e2e-control-marker-manifest.mjs')
 const temporaryRoots: string[] = []
 
 function makeDist() {
@@ -26,6 +35,30 @@ function makeDist() {
 
 function runChecker(args: string[]) {
   return spawnSync(process.execPath, [checkerPath, ...args], { encoding: 'utf8' })
+}
+
+function copyCheckerIntoTemporaryPath() {
+  const root = makeDist()
+  const scriptDirectory = join(root, 'checker path # \u65e5\u672c\u8a9e')
+  mkdirSync(scriptDirectory)
+  const copiedChecker = join(scriptDirectory, 'check-dist-e2e-boundary.mjs')
+  const copiedManifest = join(scriptDirectory, 'e2e-control-marker-manifest.mjs')
+  copyFileSync(checkerPath, copiedChecker)
+  copyFileSync(manifestPath, copiedManifest)
+  return { copiedChecker, copiedManifest, root }
+}
+
+function runCopiedChecker(checker: string, args: string[]) {
+  return spawnSync(process.execPath, [checker, ...args], { encoding: 'utf8' })
+}
+
+function buildTo(outDir: string, env: NodeJS.ProcessEnv) {
+  const options = {
+    cwd: resolve('.'),
+    env,
+  }
+  execFileSync('pnpm', ['exec', 'tsc'], options)
+  execFileSync('pnpm', ['exec', 'vite', 'build', '--outDir', outDir, '--emptyOutDir'], options)
 }
 
 function fakeStat(kind: 'directory' | 'file' | 'socket') {
@@ -71,7 +104,7 @@ describe('E2E control marker manifest', () => {
 })
 
 describe('check-dist-e2e-boundary', () => {
-  it('GIVEN production artifacts contain multiple control markers WHEN checked THEN it fails with stable relative diagnostics', () => {
+  it('GIVEN marker and path order conflict WHEN production artifacts are checked THEN stderr is ordered by POSIX relative path and marker', () => {
     const root = makeDist()
     mkdirSync(join(root, 'nested'))
     writeFileSync(join(root, 'z.js'), '__LOOP_E2E__')
@@ -80,9 +113,42 @@ describe('check-dist-e2e-boundary', () => {
     const result = runChecker(['--mode', 'production', '--dist', root])
 
     expect(result.status).toBe(1)
-    expect(result.stderr).toContain('__LOOP_E2E__: test-root/z.js')
-    expect(result.stderr).toContain('__LOOP_VISUAL_SCENARIO__: test-root/nested/a.map')
+    expect(result.stderr).toBe([
+      'ERROR: __LOOP_VISUAL_SCENARIO__: test-root/nested/a.map',
+      '__LOOP_E2E__: test-root/z.js',
+      '',
+    ].join('\n'))
+  })
+
+  it('GIVEN copied checker and manifest paths contain a POSIX space, hash, and non-ASCII characters WHEN a contaminated dist is checked THEN the CLI entrypoint fails closed', () => {
+    const { copiedChecker, root } = copyCheckerIntoTemporaryPath()
+    const contaminatedDist = join(root, 'contaminated-dist')
+    mkdirSync(contaminatedDist)
+    writeFileSync(join(contaminatedDist, 'bundle.js'), '__LOOP_E2E__')
+
+    const result = runCopiedChecker(copiedChecker, ['--mode', 'production', '--dist', contaminatedDist])
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toBe('ERROR: __LOOP_E2E__: test-root/bundle.js\n')
+  })
+
+  it('GIVEN an invalid copied manifest WHEN delivered through the CLI THEN it fails closed with sanitized stderr', () => {
+    const { copiedChecker, copiedManifest, root } = copyCheckerIntoTemporaryPath()
+    const invalidManifest = readFileSync(copiedManifest, 'utf8').replace(
+      "name: '__LOOP_E2E_BOOTSTRAP__'",
+      "name: '__LOOP_E2E__'",
+    )
+    writeFileSync(copiedManifest, invalidManifest)
+    const dist = join(root, 'clean-dist')
+    mkdirSync(dist)
+    writeFileSync(join(dist, 'bundle.js'), 'clean production artifact')
+
+    const result = runCopiedChecker(copiedChecker, ['--mode', 'production', '--dist', dist])
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toBe('ERROR: invalid E2E control marker manifest\n')
     expect(result.stderr).not.toContain(root)
+    expect(result.stderr).not.toContain('at ')
   })
 
   it('GIVEN an E2E artifact misses one required marker WHEN checked THEN it fails', () => {
@@ -158,16 +224,20 @@ describe('check-dist-e2e-boundary', () => {
 
   it('GIVEN real production, E2E, and preview-namespace builds WHEN checked THEN their boundaries are enforced', async () => {
     const baseEnv = { ...process.env }
-    execFileSync('pnpm', ['build'], { cwd: resolve('.'), env: { ...baseEnv, VITE_E2E_MODE: 'false' } })
-    await expect(verifyDistE2EBoundary({ mode: 'production', distPath: resolve('dist') })).resolves.toBeUndefined()
+    const productionDist = join(makeDist(), 'dist')
+    buildTo(productionDist, { ...baseEnv, VITE_E2E_MODE: 'false' })
+    await expect(verifyDistE2EBoundary({ mode: 'production', distPath: productionDist })).resolves.toBeUndefined()
 
-    execFileSync('pnpm', ['build'], { cwd: resolve('.'), env: { ...baseEnv, VITE_E2E_MODE: 'true' } })
-    await expect(verifyDistE2EBoundary({ mode: 'e2e', distPath: resolve('dist') })).resolves.toBeUndefined()
+    const e2eDist = join(makeDist(), 'dist')
+    buildTo(e2eDist, { ...baseEnv, VITE_E2E_MODE: 'true' })
+    await expect(verifyDistE2EBoundary({ mode: 'e2e', distPath: e2eDist })).resolves.toBeUndefined()
 
-    execFileSync('pnpm', ['build'], {
-      cwd: resolve('.'),
-      env: { ...baseEnv, VITE_E2E_MODE: 'false', VITE_LOOP_STORAGE_NAMESPACE: 'pr-1425' },
+    const previewDist = join(makeDist(), 'dist')
+    buildTo(previewDist, {
+      ...baseEnv,
+      VITE_E2E_MODE: 'false',
+      VITE_LOOP_STORAGE_NAMESPACE: 'pr-1425',
     })
-    await expect(verifyDistE2EBoundary({ mode: 'production', distPath: resolve('dist') })).resolves.toBeUndefined()
+    await expect(verifyDistE2EBoundary({ mode: 'production', distPath: previewDist })).resolves.toBeUndefined()
   }, 60_000)
 })

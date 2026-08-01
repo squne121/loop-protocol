@@ -28,5 +28,3 @@ export function validateE2EControlMarkerManifest(manifest) {
 
   return manifest
 }
-
-validateE2EControlMarkerManifest(e2eControlMarkers)

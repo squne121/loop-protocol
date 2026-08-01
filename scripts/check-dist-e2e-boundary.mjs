@@ -2,12 +2,20 @@
 
 import { lstat, readFile, readdir } from 'node:fs/promises'
 import { relative, resolve, sep } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { e2eControlMarkers, validateE2EControlMarkerManifest } from './e2e-control-marker-manifest.mjs'
 
-const MARKERS = validateE2EControlMarkerManifest(e2eControlMarkers)
-
 class BoundaryError extends Error {}
+class InvalidManifestError extends Error {}
+
+function getMarkers() {
+  try {
+    return validateE2EControlMarkerManifest(e2eControlMarkers)
+  } catch {
+    throw new InvalidManifestError('invalid E2E control marker manifest')
+  }
+}
 
 function posixPath(value) {
   return value.split(sep).join('/')
@@ -64,6 +72,7 @@ async function inspectPath(root, candidate, fsOps, files) {
 }
 
 export async function scanArtifactTree(distPath, fsOps = { lstat, readFile, readdir }) {
+  const markers = getMarkers()
   const root = resolve(distPath)
   let rootStat
   try {
@@ -89,15 +98,15 @@ export async function scanArtifactTree(distPath, fsOps = { lstat, readFile, read
     } catch {
       throw new BoundaryError(`unreadable regular file: ${file.displayPath}`)
     }
-    for (const marker of MARKERS) {
+    for (const marker of markers) {
       if (content.includes(marker.name)) {
         matches.push({ marker: marker.name, path: file.displayPath })
       }
     }
   }
   matches.sort((left, right) => {
-    const leftKey = `${left.marker}\u0000${left.path}`
-    const rightKey = `${right.marker}\u0000${right.path}`
+    const leftKey = `${left.path}\u0000${left.marker}`
+    const rightKey = `${right.path}\u0000${right.marker}`
     return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
   })
   return matches
@@ -113,7 +122,7 @@ export async function verifyDistE2EBoundary({ mode, distPath }) {
   }
   if (mode === 'e2e') {
     const found = new Set(matches.map(({ marker }) => marker))
-    const missing = MARKERS.filter(({ name, requiredInE2E }) => requiredInE2E && !found.has(name))
+    const missing = getMarkers().filter(({ name, requiredInE2E }) => requiredInE2E && !found.has(name))
     if (missing.length > 0) {
       throw new BoundaryError(missing.map(({ name }) => `missing marker: ${name}`).join('\n'))
     }
@@ -139,11 +148,16 @@ async function main() {
   try {
     await verifyDistE2EBoundary(parseArguments(process.argv.slice(2)))
   } catch (error) {
-    process.stderr.write(`ERROR: ${error instanceof Error ? error.message : 'boundary check failed'}\n`)
+    const message = error instanceof InvalidManifestError
+      ? 'invalid E2E control marker manifest'
+      : error instanceof Error
+        ? error.message
+        : 'boundary check failed'
+    process.stderr.write(`ERROR: ${message}\n`)
     process.exitCode = 1
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await main()
 }
