@@ -353,6 +353,38 @@ devicePixelRatio 約 0.667）を受けた REQUEST_CHANGES で、combat HUD が C
   `tests/e2e/visual.freeze.css` の generic `sans-serif` 固定込み, run id
   `30696103540`, job id `91359166114`）で生成された画像そのものである。
 
+### legacy-result-surface コンパクト化に伴う baseline 更新（owner 実機再テスト対応、明示）
+
+owner の実機プレイテスト（PR #1925 コメント issuecomment-5151416762、Windows/Chrome,
+viewport 1437x1365）で「敗北してゲームが進行できなくなった」と報告された。原因は
+`.legacy-result-surface`（3 panel 縦積み）の合計高さが `.battle-stage__viewport`
+（Canvas 実描画高、`overflow: hidden`）を超え、`Return to hangar` ボタンが
+`.battle-hud-layer` の `overflow-y: auto` スクロール範囲外（視認困難な位置）に
+押し出されていたため。`src/style.css` の `.legacy-result-surface` 系セレクタ
+（padding / gap / `.stat-grid` 関連）を圧縮し、3 panel が Canvas 実描画高内に収まる
+よう修正した。この修正で以下 baseline との間に許容差を超える差分が生じた。
+
+- `m2-timeout-overlay-baseline.png`（legacy-result-surface 全体を含む capture）
+- `title-menu` / `load-menu-empty` / `load-menu-available` / `load-menu-failure` /
+  `preparation-default` / `preparation-upgrade-available`（`phase-screens.spec.ts`、
+  `[data-battle-ui-root]` capture。`.battle-hud-layer` 内のスペーシング変更が
+  周辺レイアウトにも軽微に影響）
+
+- **判断根拠**: 意図しない退行ではなく、owner 報告の defeat 進行不能 defect を修正する
+  ための意図した spacing 圧縮の副作用である（§4 checklist 適用）。差分画像を目視確認し、
+  `Return to hangar` ボタンが可視領域内に収まるようになったことを確認した（修正前は
+  `test-results` artifact 上でボタンが panel 下端付近に押し出されていた）。
+- **evidence**: worktree `issue-1375-combat-hud-overlay`。CI 実行（run id
+  `30701007468`, job id `91371935097`, e2e job, head sha
+  `b9cab3f679ce6777383afa0bf705ec323cc8f7bc`）で 7 件が再発したため、CI 実行結果の
+  `test-results` artifact（artifact id `8818851481`）から該当する `*-actual.png` を
+  取得し、それを最終 baseline として採用した。
+- **maturity**: 変更なし。
+- **tolerance**: 変更なし。
+- **environment fingerprint**: 最終的に採用した baseline（上記 7 件）は CI 実行環境
+  （GitHub Actions ubuntu runner, Chromium, run id `30701007468`, job id
+  `91371935097`）で生成された画像そのものである。
+
 ## 4. baseline update policy（更新ポリシー）
 
 ### 自動更新の禁止
