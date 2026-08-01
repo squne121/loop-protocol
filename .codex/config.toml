@@ -112,6 +112,7 @@ enabled = true
 
 [permissions.loop-protocol-web-research.network]
 enabled = true
+mode = "full"
 allow_local_binding = false
 
 [permissions.loop-protocol-web-research.network.domains]
