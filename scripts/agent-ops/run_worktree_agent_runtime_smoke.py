@@ -6,9 +6,10 @@ and observes either:
 
 - ``structured`` lane: a non-interactive process (``claude -p`` /
   ``codex exec``) whose exit code and native structured stdout are the
-  evidence, or
-- ``interactive`` lane: a herdr sibling pane + agent lifecycle whose bounded,
-  redacted pane output and native agent detection are the evidence.
+  evidence, always run as a direct subprocess (never via herdr), or
+- ``interactive`` lane: a herdr agent lifecycle inside a freshly created,
+  isolated named herdr session (never the caller's own attached session)
+  whose bounded, allowlist-only summary is the evidence.
 
 This runner does not own semantic verdicts (hook-reason classification,
 mutation-deny correctness, Skill preload domain judgement, context-budget
@@ -17,19 +18,37 @@ runtime started, ran in the requested worktree, reached a settled/terminal
 state within the timeout, produced the requested evidence, and left the
 worktree in the expected postcondition.
 
+Isolation (PR #1921 human OWNER fix-delta iteration 5):
+
+- ``mode=interactive`` never touches the human operator's own attached
+  Herdr session. It always creates a brand-new, high-entropy named session
+  (``herdr session list --json`` collision check, then lazily created via
+  ``HERDR_SESSION=<name>``), runs the agent lifecycle inside it, and tears
+  the whole session down (``herdr session stop`` -> ``herdr session
+  delete`` -> ``herdr session list --json`` removal confirmation) in every
+  controlled exit path (success, failure, timeout, SIGINT, SIGTERM).
+  Cleanup that cannot be confirmed removed overrides an otherwise-successful
+  run to FAIL (fail-closed).
+- Inherited ``HERDR_SESSION`` / ``HERDR_SOCKET_PATH`` / ``HERDR_PANE_ID`` /
+  ``HERDR_TAB_ID`` / ``HERDR_WORKSPACE_ID`` are stripped before targeting the
+  isolated session, so a caller's own runtime namespace never leaks in.
+
 Exit codes:
   0  success
   1  runtime failure / timeout / identity mismatch / unexpected postcondition
+     / cleanup not confirmed removed
   77 SKIP (unavailable runtime/auth/capability/herdr — never promoted to PASS)
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -42,10 +61,10 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_SKIP = 77
 
-_MAX_EVENT_LINES = 400
 _MAX_PANE_LINES = 400
 _MAX_LINE_CHARS = 2000
 _MAX_SESSION_LOG_LINES = 200
+_DEFAULT_MAX_TURNS = 30
 
 # Absolute path / long-base64-token redaction (mirrors git_worktree_probe.py).
 _SECRET_LIKE_RE = re.compile(
@@ -53,6 +72,15 @@ _SECRET_LIKE_RE = re.compile(
     r"([A-Za-z0-9+/]{40,}=*)"
 )
 
+# CLI color/formatting escape sequences (observed in real ``herdr`` stderr
+# output) are cosmetic noise, not secrets, but they degrade the readability
+# of persisted evidence and are stripped for cleanliness.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+# Deliberately narrow: only presence-signalling keys, never a value that
+# could carry prose (reasoning, prompt text, tool output). ``cwd`` and
+# ``session_id`` were dropped (PR #1921 P1 fix-delta) — they are not needed
+# for a presence signal and add unnecessary exposure surface.
 _ALLOWLIST_SESSION_LOG_KEYS = {
     "type",
     "event",
@@ -61,13 +89,19 @@ _ALLOWLIST_SESSION_LOG_KEYS = {
     "label",
     "timestamp",
     "ts",
-    "cwd",
-    "session_id",
-    "sessionId",
 }
+
+_ISOLATION_ENV_KEYS_TO_STRIP = (
+    "HERDR_SESSION",
+    "HERDR_SOCKET_PATH",
+    "HERDR_PANE_ID",
+    "HERDR_TAB_ID",
+    "HERDR_WORKSPACE_ID",
+)
 
 
 def _redact(text: str) -> str:
+    text = _ANSI_ESCAPE_RE.sub("", text)
     return _SECRET_LIKE_RE.sub("<redacted>", text)
 
 
@@ -80,8 +114,19 @@ def _bounded_redacted_lines(raw: str, max_lines: int) -> list[str]:
     return out
 
 
+class _TerminateRequested(BaseException):
+    """Raised from a SIGTERM handler so ``finally`` cleanup still runs."""
+
+
+def _install_signal_handlers() -> None:
+    def _handler(signum, _frame):
+        raise _TerminateRequested(f"received signal {signum}")
+
+    signal.signal(signal.SIGTERM, _handler)
+
+
 def _run(argv: list[str], *, cwd: str | None = None, timeout: float,
-          input_text: str | None = None) -> tuple[int | None, str, str, bool]:
+          input_text: str | None = None, env: dict[str, str] | None = None) -> tuple[int | None, str, str, bool]:
     """Run argv with shell=False. Returns (returncode, stdout, stderr, timed_out)."""
     try:
         proc = subprocess.run(
@@ -92,6 +137,7 @@ def _run(argv: list[str], *, cwd: str | None = None, timeout: float,
             timeout=timeout,
             input=input_text,
             shell=False,
+            env=env,
         )
         return proc.returncode, proc.stdout, proc.stderr, False
     except subprocess.TimeoutExpired as exc:
@@ -207,43 +253,135 @@ def verify_worktree_identity(worktree_arg: str, repo_root: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Postcondition
+# Output directory (exclusive create — Issue #1921 P0-4)
 # ---------------------------------------------------------------------------
 
 
-def _git_status_porcelain(path: str) -> str | None:
+def prepare_output_dir(output_dir: Path) -> str | None:
+    """Return an error message if ``output_dir`` cannot be exclusively used."""
+    if output_dir.is_symlink():
+        return f"output directory must not be a symlink: {_redact(str(output_dir))}"
+    if output_dir.exists():
+        return f"output directory already exists (exclusive create required): {_redact(str(output_dir))}"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Postcondition (Issue #1921 P0-5 — full repository fingerprint, not a
+# porcelain-line-set diff)
+# ---------------------------------------------------------------------------
+
+
+def _git_rev_parse(path: str, rev: str) -> str | None:
     git = shutil.which("git")
     if git is None:
         return None
-    rc, out, _err, _timed_out = _run([git, "-C", path, "status", "--porcelain"], timeout=10.0)
+    rc, out, _err, _timed_out = _run([git, "-C", path, "rev-parse", rev], timeout=10.0)
+    if rc != 0:
+        return None
+    return out.strip()
+
+
+def _git_symbolic_branch(path: str) -> str | None:
+    git = shutil.which("git")
+    if git is None:
+        return None
+    rc, out, _err, _timed_out = _run([git, "-C", path, "symbolic-ref", "--short", "-q", "HEAD"], timeout=10.0)
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _git_status_porcelain_all(path: str) -> str | None:
+    git = shutil.which("git")
+    if git is None:
+        return None
+    rc, out, _err, _timed_out = _run(
+        [git, "-C", path, "status", "--porcelain", "--untracked-files=all"], timeout=15.0
+    )
     if rc != 0:
         return None
     return out
 
 
-def _filter_evidence_lines(porcelain: str, output_dir_rel: str | None) -> list[str]:
-    lines = [line for line in porcelain.splitlines() if line.strip()]
+def _content_fingerprint(path: str, rel: str, status: str) -> str | None:
+    """Content-level fingerprint for a single changed path.
+
+    Untracked paths are hashed directly (raw bytes). Tracked paths are
+    fingerprinted via ``git diff HEAD -- <path>`` so that a status code that
+    stays the same across before/after (e.g. an already-dirty file receiving
+    further edits) is still detected as a change.
+    """
+    if status.strip() == "??" or status[:1] == "?":
+        target = Path(path) / rel
+        try:
+            data = target.read_bytes()
+        except OSError:
+            return None
+        return hashlib.sha256(data).hexdigest()
+    git = shutil.which("git")
+    if git is None:
+        return None
+    rc, out, _err, _timed_out = _run([git, "-C", path, "diff", "HEAD", "--", rel], timeout=15.0)
+    if rc is None:
+        return None
+    return hashlib.sha256(out.encode("utf-8", "replace")).hexdigest()
+
+
+def _within_output_dir(target: str, output_dir_rel: str | None) -> bool:
     if not output_dir_rel:
-        return lines
-    filtered = []
-    for line in lines:
-        path_part = line[3:].strip()
-        if path_part.startswith(output_dir_rel):
+        return False
+    normalized = output_dir_rel.rstrip("/")
+    return target == normalized or target.startswith(normalized + "/")
+
+
+def _parse_porcelain_entries(porcelain: str, output_dir_rel: str | None) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    for line in porcelain.splitlines():
+        if not line.strip():
             continue
-        filtered.append(line)
-    return filtered
+        status = line[:2]
+        rest = line[3:]
+        target = rest.split(" -> ")[-1].strip().strip('"')
+        if _within_output_dir(target, output_dir_rel):
+            continue
+        entries[target] = status
+    return entries
+
+
+def repo_fingerprint(path: str, output_dir_rel: str | None) -> dict | None:
+    head = _git_rev_parse(path, "HEAD")
+    porcelain = _git_status_porcelain_all(path)
+    if head is None or porcelain is None:
+        return None
+    branch = _git_symbolic_branch(path) or f"DETACHED:{head}"
+    entries = _parse_porcelain_entries(porcelain, output_dir_rel)
+    content = {
+        rel: {"status": status, "hash": _content_fingerprint(path, rel, status)}
+        for rel, status in entries.items()
+    }
+    return {"head": head, "branch": branch, "entries": content}
+
+
+def diff_fingerprints(before: dict | None, after: dict | None) -> list[str]:
+    if before is None or after is None:
+        return ["could not evaluate postcondition (git probe failed)"]
+    diffs: list[str] = []
+    if before["head"] != after["head"]:
+        diffs.append(f"HEAD moved: {before['head']} -> {after['head']}")
+    if before["branch"] != after["branch"]:
+        diffs.append(f"branch changed: {before['branch']} -> {after['branch']}")
+    before_entries = before["entries"]
+    after_entries = after["entries"]
+    for key in sorted(set(before_entries) | set(after_entries)):
+        if before_entries.get(key) != after_entries.get(key):
+            diffs.append(f"path changed: {key} ({before_entries.get(key)} -> {after_entries.get(key)})")
+    return diffs
 
 
 # ---------------------------------------------------------------------------
 # Capability preflight
 # ---------------------------------------------------------------------------
-
-
-def preflight_runtime(runtime: str) -> str | None:
-    exe = shutil.which(runtime)
-    if exe is None:
-        return f"required command not found: {runtime}"
-    return None
 
 
 def preflight_claude_flags() -> str | None:
@@ -254,7 +392,7 @@ def preflight_claude_flags() -> str | None:
     if timed_out or rc != 0:
         return "unable to introspect claude --help capability"
     text = out + err
-    required = ["--output-format", "--include-hook-events", "--no-session-persistence"]
+    required = ["--output-format", "--include-hook-events", "--no-session-persistence", "--max-turns"]
     missing = [flag for flag in required if flag not in text]
     if missing:
         return f"claude CLI missing required structured-lane flags: {missing}"
@@ -298,18 +436,19 @@ def read_prompt(prompt_file: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Structured lane
+# Structured lane (always a direct subprocess — never herdr)
 # ---------------------------------------------------------------------------
 
 
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
-                           claude_bin: str = "claude") -> tuple[int | None, str, str, bool]:
+                           max_turns: int, claude_bin: str = "claude") -> tuple[int | None, str, str, bool]:
     argv = [
         claude_bin,
         "-p",
         "--output-format", "stream-json",
         "--include-hook-events",
         "--no-session-persistence",
+        "--max-turns", str(max_turns),
         "--verbose",
     ]
     return _run(argv, cwd=worktree, timeout=timeout_seconds, input_text=prompt)
@@ -317,18 +456,20 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
 
 def run_structured_codex(worktree: str, prompt: str, timeout_seconds: float,
                           codex_bin: str = "codex") -> tuple[int | None, str, str, bool]:
+    # ``-`` reads the prompt from stdin instead of argv, so the prompt text
+    # never appears in the process list (Issue #1921 P1 fix-delta).
     argv = [
         codex_bin,
         "exec",
         "-C", worktree,
         "--json",
         "--ephemeral",
-        prompt,
+        "-",
     ]
-    return _run(argv, cwd=worktree, timeout=timeout_seconds)
+    return _run(argv, cwd=worktree, timeout=timeout_seconds, input_text=prompt)
 
 
-def parse_native_event_count(runtime: str, stdout: str) -> int:
+def parse_native_event_count(stdout: str) -> int:
     count = 0
     for line in stdout.splitlines():
         line = line.strip()
@@ -342,8 +483,33 @@ def parse_native_event_count(runtime: str, stdout: str) -> int:
     return count
 
 
+def has_terminal_event(runtime: str, stdout: str) -> bool:
+    """Whether at least one native event looks like a runtime-reported
+    terminal/result event (Issue #1921 P1 fix-delta: a non-empty event
+    stream with no terminal event must not be treated as PASS just because
+    the process exit code was 0)."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if runtime == "claude":
+            if payload.get("type") == "result":
+                return True
+        else:
+            event_type = str(payload.get("type") or "")
+            if event_type in ("item.completed", "turn.completed", "error") or event_type.endswith(".completed"):
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
-# Interactive herdr lane
+# Interactive herdr lane — isolated named session (Issue #1921 P0-1..P0-4)
 # ---------------------------------------------------------------------------
 
 
@@ -365,6 +531,38 @@ def _extract_agent_field(raw: str, field: str):
     return None
 
 
+def _extract_pane_id_from_workspace(raw: str) -> str | None:
+    """Parse the ``pane_id`` out of ``herdr workspace create`` JSON output.
+
+    Confirmed against a real ``herdr`` binary (v0.7.5): the shape is
+    ``{"result": {"root_pane": {"pane_id": ...}, "workspace": {...}, ...}}``
+    -- ``root_pane`` is a sibling of ``workspace`` under ``result``, not
+    nested inside it. Fallback shapes are tolerated defensively for
+    forward/backward compatibility, but the confirmed shape is checked
+    first.
+    """
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        stripped = raw.strip()
+        return stripped.splitlines()[-1].strip() if stripped else None
+    if not isinstance(payload, dict):
+        return None
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    for candidate in (
+        result,
+        result.get("workspace") if isinstance(result.get("workspace"), dict) else {},
+        payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {},
+        payload,
+    ):
+        root_pane = candidate.get("root_pane") if isinstance(candidate, dict) else None
+        if isinstance(root_pane, dict) and root_pane.get("pane_id"):
+            return str(root_pane["pane_id"]).strip() or None
+    if payload.get("pane_id"):
+        return str(payload["pane_id"]).strip() or None
+    return None
+
+
 class HerdrLaneError(Exception):
     def __init__(self, message: str, *, skip: bool = False):
         super().__init__(message)
@@ -372,64 +570,169 @@ class HerdrLaneError(Exception):
         self.skip = skip
 
 
-def run_interactive_herdr(
+def _isolated_env() -> dict[str, str]:
+    """Environment with any inherited caller-session Herdr identity stripped."""
+    env = dict(os.environ)
+    for key in _ISOLATION_ENV_KEYS_TO_STRIP:
+        env.pop(key, None)
+    return env
+
+
+def _herdr_sessions(herdr_bin: str) -> list[dict] | None:
+    rc, out, _err, _timed_out = _run([herdr_bin, "session", "list", "--json"], timeout=15.0)
+    if rc != 0:
+        return None
+    try:
+        payload = json.loads(out)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    sessions = payload.get("sessions") if isinstance(payload, dict) else None
+    if not isinstance(sessions, list):
+        return []
+    return [entry for entry in sessions if isinstance(entry, dict)]
+
+
+def _herdr_session_names(herdr_bin: str) -> set[str] | None:
+    sessions = _herdr_sessions(herdr_bin)
+    if sessions is None:
+        return None
+    return {str(entry["name"]) for entry in sessions if entry.get("name")}
+
+
+def new_isolated_session_name(herdr_bin: str) -> str:
+    """A high-entropy session name not currently present in
+    ``herdr session list``. Never reuses the caller's own session."""
+    for _attempt in range(5):
+        candidate = f"rts-{uuid.uuid4().hex}"[:32]
+        existing = _herdr_session_names(herdr_bin)
+        if existing is None:
+            raise HerdrLaneError("could not enumerate existing herdr sessions for collision check")
+        if candidate not in existing:
+            return candidate
+    raise HerdrLaneError("could not generate a unique isolated herdr session name")
+
+
+def create_isolated_session(herdr_bin: str, session_name: str, *, timeout_seconds: float = 20.0) -> subprocess.Popen:
+    """Spawn a brand-new, detached, named Herdr session and block until its
+    appearance in ``herdr session list --json`` is confirmed.
+
+    This never reuses -- and never silently falls back to -- the caller's
+    own ambient/attached session. A real ``herdr`` refuses to nest a new
+    session launch inside a shell that is already running inside an active
+    Herdr pane by default ("nested herdr is disabled by default"); any such
+    failure (or any other failure to observe the new session actually
+    appear) is a hard SKIP, not a fallback to operating in the ambient
+    session (Issue #1921 P0-1 fix-delta).
+    """
+    isolation_env = _isolated_env()
+    try:
+        proc = subprocess.Popen(
+            [herdr_bin, "--session", session_name],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=isolation_env, start_new_session=True,
+        )
+    except OSError as exc:
+        raise HerdrLaneError(f"could not spawn isolated herdr session: {exc}", skip=True) from exc
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            try:
+                _out, err = proc.communicate(timeout=2.0)
+            except (subprocess.TimeoutExpired, ValueError):
+                err = ""
+            raise HerdrLaneError(
+                "herdr isolated session process exited before becoming ready "
+                f"(nested-session restrictions may be in effect): {_redact((err or '').strip()[:300])}",
+                skip=True,
+            )
+        names = _herdr_session_names(herdr_bin)
+        if names is not None and session_name in names:
+            return proc
+        time.sleep(0.3)
+    proc.terminate()
+    raise HerdrLaneError("herdr isolated session did not appear in session list within timeout", skip=True)
+
+
+def _session_socket_path(herdr_bin: str, session_name: str) -> str | None:
+    sessions = _herdr_sessions(herdr_bin)
+    if not sessions:
+        return None
+    for entry in sessions:
+        if str(entry.get("name")) == session_name and entry.get("socket_path"):
+            return str(entry["socket_path"])
+    return None
+
+
+def run_interactive_herdr_isolated(
     runtime: str,
     worktree: str,
     prompt: str,
     timeout_seconds: float,
     run_id: str,
+    evidence: dict,
     *,
-    keep_pane: bool,
     herdr_bin: str = "herdr",
-) -> dict:
-    """Drive a herdr sibling pane + agent lifecycle. Returns evidence dict."""
-    # herdr agent names must be 1-32 chars: lowercase letters, digits, "-", "_".
+    max_turns: int | None = None,
+) -> list[str]:
+    """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
+    in place (so cleanup/session identity survive even if this raises) and
+    returns the bounded, redacted pane output lines."""
+    session_name = new_isolated_session_name(herdr_bin)
+    evidence["session_name"] = session_name
+
     agent_name = f"rts-{runtime}-{run_id}"[:32]
-    pane_id: str | None = None
-    evidence: dict = {
-        "pane_id": None,
-        "agent_name": agent_name,
-        "final_state": None,
-        "pane_output_lines": [],
-        "agent_explain": None,
-        "cleaned_up": False,
-        "prompt_stall_recovered": None,
-    }
+    evidence["agent_name"] = agent_name
+    pane_output_lines: list[str] = []
+    session_proc: subprocess.Popen | None = None
     try:
+        # Actually create the isolated session (not merely set an env var and
+        # hope) and block until its independent existence is confirmed via
+        # ``herdr session list --json`` (Issue #1921 P0-1 fix-delta). Any
+        # failure here (including a shell already nested inside an active
+        # Herdr pane, which real herdr refuses by default) raises a SKIP --
+        # it never falls through to operating against the caller's own
+        # session. This call (and everything after it) is inside the same
+        # try/finally as the rest of the lifecycle so a signal/exception
+        # arriving *during* creation confirmation still triggers cleanup
+        # (Issue #1921 P0-2 fix-delta iteration 2: a session/process leak
+        # was observed here when creation and the rest of the lifecycle
+        # were in separate try scopes).
+        session_proc = create_isolated_session(herdr_bin, session_name, timeout_seconds=20.0)
+
+        socket_path = _session_socket_path(herdr_bin, session_name)
+        isolated_env = _isolated_env()
+        isolated_env["HERDR_SESSION"] = session_name
+        if socket_path:
+            isolated_env["HERDR_SOCKET_PATH"] = socket_path
+
         rc, out, err, timed_out = _run(
-            [herdr_bin, "pane", "split", "--current", "--direction", "right",
-             "--cwd", worktree, "--no-focus"],
-            timeout=20.0,
+            [herdr_bin, "workspace", "create", "--cwd", worktree, "--no-focus"],
+            timeout=20.0, env=isolated_env,
         )
         if timed_out or rc != 0:
-            raise HerdrLaneError(f"herdr pane split failed: {_redact(err or out)}")
-        try:
-            payload = json.loads(out)
-            result = payload.get("result") if isinstance(payload, dict) else None
-            pane = (result or {}).get("pane") if isinstance(result, dict) else None
-            pane_id = None
-            if isinstance(pane, dict):
-                pane_id = str(pane.get("pane_id") or "").strip() or None
-            if pane_id is None:
-                # Fallback for shapes without the {"result": {"pane": ...}} envelope.
-                pane_id = str((payload or {}).get("pane_id") or "").strip() or None
-        except (json.JSONDecodeError, ValueError):
-            pane_id = out.strip().splitlines()[-1].strip() if out.strip() else None
+            raise HerdrLaneError(f"herdr workspace create failed: {_redact(err or out)}")
+        pane_id = _extract_pane_id_from_workspace(out)
         if not pane_id:
-            raise HerdrLaneError("could not parse pane_id from herdr pane split output")
+            raise HerdrLaneError("could not parse pane_id from herdr workspace create output")
         evidence["pane_id"] = pane_id
 
-        # A freshly split pane's shell may not be an "available shell" yet
-        # (still initializing). Retry ``agent start`` with a bounded, short
-        # backoff instead of failing on the first race.
+        agent_extra_args: list[str] = []
+        if runtime == "claude" and max_turns:
+            agent_extra_args = ["--", "--max-turns", str(max_turns)]
+
+        # A freshly created workspace's shell may not be an "available shell"
+        # yet (still initializing). Retry ``agent start`` with a bounded,
+        # short backoff instead of failing on the first race.
         start_rc = None
         start_out = start_err = ""
         start_timed_out = False
         for attempt in range(5):
             start_rc, start_out, start_err, start_timed_out = _run(
                 [herdr_bin, "agent", "start", agent_name, "--kind", runtime,
-                 "--pane", pane_id, "--timeout", str(int(min(timeout_seconds, 300.0) * 1000))],
-                timeout=timeout_seconds,
+                 "--pane", pane_id, "--timeout", str(int(min(timeout_seconds, 300.0) * 1000)),
+                 *agent_extra_args],
+                timeout=timeout_seconds, env=isolated_env,
             )
             if start_timed_out or start_rc == 0:
                 break
@@ -443,38 +746,21 @@ def run_interactive_herdr(
         rc, out, err, timed_out = _run(
             [herdr_bin, "agent", "prompt", agent_name, prompt, "--wait",
              "--timeout", str(int(timeout_seconds * 1000))],
-            timeout=timeout_seconds + 20.0,
+            timeout=timeout_seconds + 20.0, env=isolated_env,
         )
         if timed_out:
             raise HerdrLaneError("herdr agent prompt timed out")
         if rc != 0:
             if "agent_prompt_stalled" in (err or "") or "agent_prompt_stalled" in (out or ""):
-                # Multi-line prompt text submitted through ``herdr agent
-                # prompt`` can land in Claude Code's terminal input box as a
-                # collapsed "[Pasted text #N +M lines]" block instead of
-                # being submitted: Claude Code's bracketed-paste handling
-                # absorbs the trailing newline that would otherwise act as
-                # the submit keystroke, so the agent lifecycle state never
-                # leaves ``idle`` and herdr's own 5000ms post-submission
-                # state-change check reports ``agent_prompt_stalled``. Codex
-                # CLI does not exhibit this because it auto-submits pasted
-                # multi-line input. Recover deterministically, exactly once,
-                # by sending an explicit ``enter`` keypress to complete the
-                # submission the CLI left pending.
-                #
-                # ``herdr agent wait`` (default ``--until idle,done,blocked``)
-                # matches immediately if the agent is *already* idle at call
-                # time -- it does not require an observed change. Calling it
-                # right after ``send-keys`` therefore races the keystroke and
-                # can report a spurious match before the Enter has actually
-                # been processed, leaving the paste unsubmitted while exit 0
-                # is returned (a false pass). Poll ``agent get`` for a
-                # genuine ``state_change_seq`` change before trusting
-                # ``agent wait``, so recovery only reports success once the
-                # submission provably happened.
+                # See references/herdr.md — Claude Code's bracketed-paste
+                # handling can leave a multi-line prompt unsubmitted. Recover
+                # deterministically, exactly once, by sending an explicit
+                # ``enter`` keypress, then poll for a genuine
+                # ``state_change_seq`` change before trusting ``agent wait``
+                # (which matches immediately if already idle at call time).
                 evidence["prompt_stall_recovered"] = False
                 baseline_rc, baseline_out, _e, _t = _run(
-                    [herdr_bin, "agent", "get", agent_name], timeout=15.0
+                    [herdr_bin, "agent", "get", agent_name], timeout=15.0, env=isolated_env,
                 )
                 baseline_seq = (
                     _extract_agent_field(baseline_out, "state_change_seq")
@@ -484,7 +770,7 @@ def run_interactive_herdr(
                 remaining = max(1.0, prompt_deadline - time.monotonic())
                 send_rc, send_out, send_err, send_timed_out = _run(
                     [herdr_bin, "agent", "send-keys", agent_name, "enter"],
-                    timeout=min(20.0, remaining),
+                    timeout=min(20.0, remaining), env=isolated_env,
                 )
                 if send_timed_out or send_rc != 0:
                     raise HerdrLaneError(
@@ -496,7 +782,7 @@ def run_interactive_herdr(
                 observed_change = baseline_seq is None
                 while not observed_change and time.monotonic() < poll_deadline:
                     poll_rc, poll_out, _e, _t = _run(
-                        [herdr_bin, "agent", "get", agent_name], timeout=10.0
+                        [herdr_bin, "agent", "get", agent_name], timeout=10.0, env=isolated_env,
                     )
                     if poll_rc == 0:
                         seq = _extract_agent_field(poll_out, "state_change_seq")
@@ -514,7 +800,7 @@ def run_interactive_herdr(
                 wait_rc, wait_out, wait_err, wait_timed_out = _run(
                     [herdr_bin, "agent", "wait", agent_name,
                      "--timeout", str(int(remaining * 1000))],
-                    timeout=remaining + 20.0,
+                    timeout=remaining + 20.0, env=isolated_env,
                 )
                 if wait_timed_out or wait_rc != 0:
                     raise HerdrLaneError(
@@ -526,7 +812,7 @@ def run_interactive_herdr(
                 raise HerdrLaneError(f"herdr agent prompt failed: {_redact(err or out)}")
 
         rc, out, err, timed_out = _run(
-            [herdr_bin, "agent", "get", agent_name], timeout=20.0
+            [herdr_bin, "agent", "get", agent_name], timeout=20.0, env=isolated_env,
         )
         state = None
         if rc == 0:
@@ -545,71 +831,71 @@ def run_interactive_herdr(
             raise HerdrLaneError(f"agent lifecycle state is unusable for evidence: {state}")
 
         rc, out, _err, _timed_out = _run(
-            [herdr_bin, "agent", "explain", agent_name, "--json"], timeout=20.0
+            [herdr_bin, "agent", "explain", agent_name, "--json"], timeout=20.0, env=isolated_env,
         )
         if rc == 0:
             try:
-                evidence["agent_explain"] = json.loads(out)
+                explain_payload = json.loads(out)
+                if isinstance(explain_payload, dict):
+                    evidence["detected_agent"] = explain_payload.get("agent")
+                    evidence["detected_agent_confidence"] = explain_payload.get("confidence")
             except (json.JSONDecodeError, ValueError):
-                evidence["agent_explain"] = {"raw": _redact(out[:2000])}
+                pass
 
         rc, out, _err, _timed_out = _run(
             [herdr_bin, "agent", "read", agent_name, "--source", "recent-unwrapped",
              "--lines", str(_MAX_PANE_LINES)],
-            timeout=20.0,
+            timeout=20.0, env=isolated_env,
         )
         if rc == 0:
-            evidence["pane_output_lines"] = _bounded_redacted_lines(out, _MAX_PANE_LINES)
+            pane_output_lines = _bounded_redacted_lines(out, _MAX_PANE_LINES)
 
-        return evidence
+        return pane_output_lines
     finally:
-        if pane_id and not keep_pane:
-            _run([herdr_bin, "pane", "close", pane_id], timeout=15.0)
-            evidence["cleaned_up"] = True
+        cleanup = evidence["cleanup"]
+        cleanup["attempted"] = True
+        stop_rc, _o, _e, _t = _run(
+            [herdr_bin, "session", "stop", session_name, "--json"], timeout=20.0,
+        )
+        cleanup["stop_rc"] = stop_rc
+        delete_rc, _o2, _e2, _t2 = _run(
+            [herdr_bin, "session", "delete", session_name, "--json"], timeout=20.0,
+        )
+        cleanup["delete_rc"] = delete_rc
+        remaining = _herdr_session_names(herdr_bin)
+        cleanup["confirmed_removed"] = bool(remaining is not None and session_name not in remaining)
+        # Defense in depth: ``session stop``/``session delete`` should have
+        # already ended the spawned client process, but terminate it
+        # explicitly in case it did not (never leave an orphaned process).
+        # ``session_proc`` can still be ``None`` here if session creation
+        # itself never completed (e.g. it raised before returning).
+        if session_proc is not None and session_proc.poll() is None:
+            session_proc.terminate()
+            try:
+                session_proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                session_proc.kill()
 
 
 # ---------------------------------------------------------------------------
-# Evidence writing
+# Evidence writing — allowlist-only summary.md (Issue #1921 P1 fix-delta:
+# no raw transcript, no native event dump, no agent-explain blob).
 # ---------------------------------------------------------------------------
 
 
-def write_evidence(
-    output_dir: Path,
-    *,
-    schema_summary: dict,
-    native_events: list[str] | None,
-    pane_output: list[str] | None,
-    agent_detection: dict | None,
-    session_log_metadata: list[dict] | None,
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+def write_evidence(output_dir: Path, *, schema_summary: dict) -> None:
+    output_dir.mkdir(parents=True, exist_ok=False)
     summary_lines = ["# Runtime Smoke Summary", ""]
     for key in sorted(schema_summary.keys()):
         summary_lines.append(f"- {key}: {schema_summary[key]}")
     (output_dir / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
-    if native_events is not None:
-        with (output_dir / "native-events.jsonl").open("w", encoding="utf-8") as fh:
-            for line in native_events:
-                fh.write(line + "\n")
 
-    if pane_output is not None:
-        (output_dir / "pane-output.txt").write_text("\n".join(pane_output) + "\n", encoding="utf-8")
-
-    if agent_detection is not None:
-        (output_dir / "agent-detection.json").write_text(
-            json.dumps(agent_detection, ensure_ascii=True, indent=2), encoding="utf-8"
-        )
-
-    if session_log_metadata is not None:
-        lines = [json.dumps(entry, ensure_ascii=True) for entry in session_log_metadata]
-        (output_dir / "session-log-metadata.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def extract_session_log_metadata(raw_lines: list[str]) -> list[dict]:
-    """Extract allowlist-only metadata from native structured event lines."""
-    out: list[dict] = []
+def count_session_log_metadata(raw_lines: list[str]) -> int:
+    """Count lines whose parsed JSON object carries at least one allowlisted
+    presence-signal key. Values are never persisted (Issue #1921 P1
+    fix-delta): only the count is reported."""
+    count = 0
     for line in raw_lines[:_MAX_SESSION_LOG_LINES]:
         try:
             payload = json.loads(line)
@@ -617,10 +903,9 @@ def extract_session_log_metadata(raw_lines: list[str]) -> list[dict]:
             continue
         if not isinstance(payload, dict):
             continue
-        entry = {k: payload[k] for k in _ALLOWLIST_SESSION_LOG_KEYS if k in payload}
-        if entry:
-            out.append(entry)
-    return out
+        if any(key in payload for key in _ALLOWLIST_SESSION_LOG_KEYS):
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -632,21 +917,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="worktree-agent-runtime-smoke runner")
     parser.add_argument("--runtime", choices=["claude", "codex"], required=True)
     parser.add_argument("--mode", choices=["structured", "interactive"], required=True)
-    parser.add_argument("--transport", choices=["auto", "direct", "herdr"], default="auto")
     parser.add_argument("--worktree", required=True)
     parser.add_argument("--prompt-file", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=180)
+    parser.add_argument("--max-turns", type=int, default=_DEFAULT_MAX_TURNS,
+                         help="bounded turn count for Claude Code (structured and interactive lanes)")
     parser.add_argument("--expect-marker", action="append", default=[])
     parser.add_argument("--require-clean-postcondition", action="store_true")
     parser.add_argument("--inspect-session-log-metadata", action="store_true")
     parser.add_argument("--require-session-log-metadata", action="store_true")
-    parser.add_argument("--keep-pane", action="store_true")
     parser.add_argument("--repo-root", default=None, help="override canonical repository root (tests only)")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    _install_signal_handlers()
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -660,31 +946,6 @@ def main(argv: list[str] | None = None) -> int:
     except IdentityError as exc:
         print(f"[FAIL] {exc.message}", file=sys.stderr)
         return EXIT_FAIL
-
-    transport = args.transport
-    if args.mode == "interactive" and transport == "direct":
-        print("[FAIL] --mode interactive requires --transport herdr or auto", file=sys.stderr)
-        return EXIT_FAIL
-    if args.mode == "interactive":
-        transport = "herdr"
-    elif transport == "auto":
-        transport = "herdr" if os.environ.get("HERDR_ENV") == "1" else "direct"
-
-    if transport == "herdr":
-        skip_reason = preflight_herdr()
-        if skip_reason and args.mode == "interactive":
-            print(f"SKIP: {skip_reason}", file=sys.stderr)
-            return EXIT_SKIP
-        if skip_reason and args.mode == "structured":
-            transport = "direct"
-
-    if args.runtime == "claude":
-        skip_reason = preflight_claude_flags()
-    else:
-        skip_reason = preflight_codex_flags()
-    if skip_reason:
-        print(f"SKIP: {skip_reason}", file=sys.stderr)
-        return EXIT_SKIP
 
     try:
         prompt = read_prompt(args.prompt_file)
@@ -700,7 +961,27 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         output_dir_rel = None
 
-    before_status = _git_status_porcelain(worktree) if args.require_clean_postcondition else None
+    # Cheap, environment-independent checks (output directory exclusivity)
+    # run before any capability/herdr preflight so they fail fast regardless
+    # of whether claude/codex/herdr happen to be installed.
+    dir_error = prepare_output_dir(output_dir)
+    if dir_error:
+        print(f"[FAIL] {dir_error}", file=sys.stderr)
+        return EXIT_FAIL
+
+    if args.mode == "interactive":
+        skip_reason = preflight_herdr()
+        if skip_reason:
+            print(f"SKIP: {skip_reason}", file=sys.stderr)
+            return EXIT_SKIP
+
+    if args.runtime == "claude":
+        skip_reason = preflight_claude_flags()
+    else:
+        skip_reason = preflight_codex_flags()
+    if skip_reason:
+        print(f"SKIP: {skip_reason}", file=sys.stderr)
+        return EXIT_SKIP
 
     exit_code = EXIT_OK
     schema_summary: dict = {
@@ -708,111 +989,124 @@ def main(argv: list[str] | None = None) -> int:
         "run_id": run_id,
         "runtime": args.runtime,
         "mode": args.mode,
-        "transport": transport,
+        "transport": "direct" if args.mode == "structured" else "herdr_isolated_session",
         "worktree": os.path.relpath(worktree, repo_root),
         "timeout_seconds": args.timeout_seconds,
     }
 
-    native_events: list[str] | None = None
-    pane_output: list[str] | None = None
-    agent_detection: dict | None = None
-    session_log_metadata: list[dict] | None = None
+    before_fp = repo_fingerprint(worktree, output_dir_rel) if args.require_clean_postcondition else None
 
-    if args.mode == "structured":
-        if args.runtime == "claude":
-            rc, out, err, timed_out = run_structured_claude(worktree, prompt, float(args.timeout_seconds))
-        else:
-            rc, out, err, timed_out = run_structured_codex(worktree, prompt, float(args.timeout_seconds))
+    try:
+        if args.mode == "structured":
+            if args.runtime == "claude":
+                rc, out, err, timed_out = run_structured_claude(
+                    worktree, prompt, float(args.timeout_seconds), args.max_turns
+                )
+            else:
+                rc, out, err, timed_out = run_structured_codex(worktree, prompt, float(args.timeout_seconds))
 
-        native_events = _bounded_redacted_lines(out, _MAX_EVENT_LINES)
-        event_count = parse_native_event_count(args.runtime, out)
-        schema_summary["process_exit_code"] = rc
-        schema_summary["timed_out"] = timed_out
-        schema_summary["native_event_count"] = event_count
+            event_count = parse_native_event_count(out)
+            schema_summary["process_exit_code"] = rc
+            schema_summary["timed_out"] = timed_out
+            schema_summary["native_event_count"] = event_count
 
-        if timed_out:
-            errors.append("structured lane timed out")
-            exit_code = EXIT_FAIL
-        elif rc is None:
-            errors.append(f"structured lane failed to start: {_redact(err[:500])}")
-            exit_code = EXIT_FAIL
-        elif rc != 0:
-            errors.append(f"structured lane exited non-zero: {rc}")
-            exit_code = EXIT_FAIL
-
-        if args.expect_marker:
-            combined = out + "\n" + err
-            missing = [m for m in args.expect_marker if m not in combined]
-            schema_summary["expected_markers_missing"] = missing
-            if missing:
-                errors.append(f"expected markers not observed: {missing}")
+            if timed_out:
+                errors.append("structured lane timed out")
                 exit_code = EXIT_FAIL
-
-        if args.require_session_log_metadata or args.inspect_session_log_metadata:
-            session_log_metadata = extract_session_log_metadata(out.splitlines())
-            if args.require_session_log_metadata and not session_log_metadata:
-                errors.append("session-log metadata required but unavailable")
-                exit_code = EXIT_SKIP if exit_code == EXIT_OK else exit_code
-
-    else:  # interactive
-        try:
-            evidence = run_interactive_herdr(
-                args.runtime, worktree, prompt, float(args.timeout_seconds), run_id,
-                keep_pane=args.keep_pane,
-            )
-            pane_output = evidence["pane_output_lines"]
-            agent_detection = evidence.get("agent_explain")
-            schema_summary["pane_id"] = evidence.get("pane_id")
-            schema_summary["agent_name"] = evidence.get("agent_name")
-            schema_summary["final_state"] = evidence.get("final_state")
-            schema_summary["prompt_stall_recovered"] = evidence.get("prompt_stall_recovered")
-
-            if evidence.get("final_state") == "blocked":
-                errors.append("agent reached blocked state; evidence captured, not auto-approved")
+            elif rc is None:
+                errors.append(f"structured lane failed to start: {_redact(err[:500])}")
+                exit_code = EXIT_FAIL
+            elif rc != 0:
+                errors.append(f"structured lane exited non-zero: {rc}: {_redact(err[:500])}")
+                exit_code = EXIT_FAIL
+            elif event_count > 0 and not has_terminal_event(args.runtime, out):
+                errors.append("no terminal/result event observed in structured output")
                 exit_code = EXIT_FAIL
 
             if args.expect_marker:
-                combined = "\n".join(pane_output or [])
+                combined = out + "\n" + err
                 missing = [m for m in args.expect_marker if m not in combined]
                 schema_summary["expected_markers_missing"] = missing
                 if missing:
-                    errors.append(f"expected markers not observed in pane output: {missing}")
+                    errors.append(f"expected markers not observed: {missing}")
                     exit_code = EXIT_FAIL
 
             if args.require_session_log_metadata or args.inspect_session_log_metadata:
-                session_log_metadata = []
-                if args.require_session_log_metadata and not session_log_metadata:
-                    errors.append("session-log metadata required but unavailable in interactive lane")
+                metadata_count = count_session_log_metadata(out.splitlines())
+                schema_summary["session_log_metadata_count"] = metadata_count
+                if args.require_session_log_metadata and metadata_count == 0:
+                    errors.append("session-log metadata required but unavailable")
                     exit_code = EXIT_SKIP if exit_code == EXIT_OK else exit_code
-        except HerdrLaneError as exc:
-            errors.append(exc.message)
-            exit_code = EXIT_SKIP if exc.skip else EXIT_FAIL
 
-    if args.require_clean_postcondition and before_status is not None:
-        after_status = _git_status_porcelain(worktree)
-        if after_status is None:
-            errors.append("could not evaluate postcondition (git status failed)")
-            exit_code = EXIT_FAIL
-        else:
-            before_lines = set(_filter_evidence_lines(before_status, output_dir_rel))
-            after_lines = set(_filter_evidence_lines(after_status, output_dir_rel))
-            unexpected = after_lines - before_lines
-            schema_summary["postcondition_unexpected_changes"] = sorted(unexpected)
-            if unexpected:
-                errors.append(f"unexpected postcondition changes: {sorted(unexpected)}")
+        else:  # interactive
+            evidence = {
+                "session_name": None,
+                "pane_id": None,
+                "agent_name": None,
+                "final_state": None,
+                "detected_agent": None,
+                "detected_agent_confidence": None,
+                "prompt_stall_recovered": None,
+                "cleanup": {"attempted": False, "stop_rc": None, "delete_rc": None, "confirmed_removed": False},
+            }
+            pane_output_lines: list[str] = []
+            try:
+                pane_output_lines = run_interactive_herdr_isolated(
+                    args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
+                    max_turns=args.max_turns if args.runtime == "claude" else None,
+                )
+
+                if evidence.get("final_state") == "blocked":
+                    errors.append("agent reached blocked state; evidence captured, not auto-approved")
+                    exit_code = EXIT_FAIL
+
+                if args.expect_marker:
+                    combined = "\n".join(pane_output_lines)
+                    missing = [m for m in args.expect_marker if m not in combined]
+                    schema_summary["expected_markers_missing"] = missing
+                    if missing:
+                        errors.append(f"expected markers not observed in pane output: {missing}")
+                        exit_code = EXIT_FAIL
+
+                if args.require_session_log_metadata or args.inspect_session_log_metadata:
+                    schema_summary["session_log_metadata_count"] = 0
+                    if args.require_session_log_metadata:
+                        errors.append("session-log metadata required but unavailable in interactive lane")
+                        exit_code = EXIT_SKIP if exit_code == EXIT_OK else exit_code
+            except HerdrLaneError as exc:
+                errors.append(exc.message)
+                exit_code = EXIT_SKIP if exc.skip else EXIT_FAIL
+
+            schema_summary["session_name"] = evidence.get("session_name")
+            schema_summary["pane_id"] = evidence.get("pane_id")
+            schema_summary["agent_name"] = evidence.get("agent_name")
+            schema_summary["final_state"] = evidence.get("final_state")
+            schema_summary["detected_agent"] = evidence.get("detected_agent")
+            schema_summary["detected_agent_confidence"] = evidence.get("detected_agent_confidence")
+            schema_summary["prompt_stall_recovered"] = evidence.get("prompt_stall_recovered")
+
+            cleanup = evidence.get("cleanup") or {}
+            schema_summary["cleanup_attempted"] = cleanup.get("attempted", False)
+            schema_summary["cleanup_confirmed_removed"] = cleanup.get("confirmed_removed", False)
+            if cleanup.get("attempted") and not cleanup.get("confirmed_removed"):
+                errors.append("herdr isolated session cleanup could not be confirmed removed")
                 exit_code = EXIT_FAIL
+
+        if args.require_clean_postcondition and before_fp is not None:
+            after_fp = repo_fingerprint(worktree, output_dir_rel)
+            diffs = diff_fingerprints(before_fp, after_fp)
+            schema_summary["postcondition_unexpected_changes"] = diffs
+            if diffs:
+                errors.append(f"unexpected postcondition changes: {diffs}")
+                exit_code = EXIT_FAIL
+    except _TerminateRequested as exc:
+        errors.append(f"runner terminated: {exc}")
+        exit_code = EXIT_FAIL
 
     schema_summary["errors"] = errors
     schema_summary["exit_code"] = exit_code
 
-    write_evidence(
-        output_dir,
-        schema_summary=schema_summary,
-        native_events=native_events,
-        pane_output=pane_output,
-        agent_detection=agent_detection,
-        session_log_metadata=session_log_metadata,
-    )
+    write_evidence(output_dir, schema_summary=schema_summary)
 
     for error in errors:
         print(f"[FAIL] {error}" if exit_code == EXIT_FAIL else f"SKIP: {error}", file=sys.stderr)

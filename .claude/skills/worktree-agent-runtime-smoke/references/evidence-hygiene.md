@@ -4,35 +4,39 @@
 
 `<worktree>/artifacts/runtime-smoke/<run-id>/` に保存する（worktree-local untracked
 directory。schema、receipt、digest、publisher、approval authority ではない）。
+`--output-dir` は排他的作成（既存ディレクトリ・symlink は拒否）とする。
 
 ```text
-summary.md
-native-events.jsonl       # structured lane。native output を bounded／redacted
-pane-output.txt           # interactive lane。bounded／redacted
-agent-detection.json      # herdr agent explain の native response
-session-log-metadata.txt  # requested and available の場合のみ
+summary.md   # 唯一の永続 evidence ファイル。allowlist-only、redacted。
 ```
 
-## 保存可能な証跡
+raw native event dump（`native-events.jsonl`）、raw pane transcript
+（`pane-output.txt`）、`herdr agent explain` の生 JSON（`agent-detection.json`）、
+session-log metadata の raw dump（`session-log-metadata.txt`）は保存しない
+（PR #1921 human OWNER fix-delta: 先行 PR #1864 で pane transcript にアカウント情報等が
+残留した実績があるため、summary.md への allowlist-only 集約へ縮小した）。
+
+## `summary.md` に保存可能な証跡
 
 - runtime 名と version
 - 検証対象の tested HEAD
 - repo-relative な worktree のパス
 - 対象 branch 名
-- 実行 lane／transport
+- 実行 lane（`direct` または `herdr_isolated_session`）
 - process exit code
-- herdr pane ID／agent name
+- isolated herdr session 名／pane ID／agent name（識別子のみ。transcript は含まない）
 - observed lifecycle state（観測された状態）
-- native event type の件数
+- 検出された agent kind／confidence（`herdr agent explain` から抽出した 2 フィールドのみ）
+- native event の件数・terminal event の有無
 - caller 指定の expected marker の有無
-- bounded redacted output（制限・redact 済みの出力）
-- filesystem／Git postcondition（事後条件）
-- session-log metadata の取得可否
+- filesystem／Git postcondition（事後条件）の差分一覧
+- isolated session cleanup の試行有無・消失確認可否
+- session-log metadata の allowlist キー該当件数（値そのものは含まない）
 
 ## 既定で保存しないもの
 
 - raw prompt 全文
-- raw transcript 全文
+- raw transcript 全文（native event 本体、pane 出力本体）
 - reasoning
 - tool output 全文
 - credential
@@ -45,17 +49,16 @@ session-log-metadata.txt  # requested and available の場合のみ
 
 - 絶対パス（`/home/*`、`/root/*`、`/Users/*` 等）は `<redacted>` へ置換する
 - 40 文字以上の base64-like token は `<redacted>` へ置換する
-- native event は 1 ラン最大 400 行、1 行最大 2000 文字へ bound する
-- pane output も同じ bound を適用する
+- `summary.md` に含める process エラーメッセージ（stderr 抜粋）は上記 redaction を必ず通す
 
 ## Session-log metadata boundary（session-log metadata の扱いの境界。#1887 Design Decision 5）
 
 - structured event または herdr output で判定可能な case では session log を必須にしない
 - caller が明示的に要求した場合のみ metadata を読み取る（`--inspect-session-log-metadata`）
-- session ID または runtime が公開する session reference に束縛する
-- allowlist metadata（`type`、`event`、`role`、`subagent`、`label`、`timestamp`、`ts`、`cwd`、
-  `session_id`、`sessionId`）だけを抽出する。`reasoning`、raw prompt、tool output 全文は
-  allowlist に含まれず抽出しない
+- allowlist metadata キー（`type`、`event`、`role`、`subagent`、`label`、`timestamp`、`ts`）の
+  該当有無だけをカウントし、`summary.md` へは件数のみを記録する。値そのもの・`cwd`・
+  `session_id` は抽出・保存しない（PR #1921 P1 fix-delta: 過度に許容的な allowlist を縮小）
+- `reasoning`、raw prompt、tool output 全文は allowlist に含まれず抽出しない
 - undocumented な log path または record shape を stable schema として扱わない
 - log が見つからないことを runtime 成功・失敗へ自動変換しない
 - `--require-session-log-metadata` が指定された case だけ、取得不能を exit 77（SKIP）とする

@@ -468,7 +468,9 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
   stream JSON／JSONL event と exit code を証跡とする。TUI screen scraping は使わない。
 - **interactive herdr lane** は TUI `/status`、Skill picker、approval 画面、subagent UI 等、structured lane で
   露出しない状態の観測が必要な場合だけ使用する。herdr 未検出・`HERDR_ENV` 未設定は `mode=interactive` の
-  SKIP（exit 77）とし、structured lane の失敗へ波及させない。
+  SKIP（exit 77）とし、structured lane の失敗へ波及させない。人間の使用中 Herdr session には一切相乗り
+  せず、実行のたびに isolated named session を新規生成し、終了時に cleanup 完了（session 消失）を
+  確認できない場合は fail-closed で exit 1 とする（PR #1921 human OWNER fix-delta）。
 - Runner（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は runtime 起動・観測・証跡収集だけを所有し、
   hook reason の意味分類・mutation deny の妥当性・review verdict 等の semantic 判定は caller が引き続き所有する。
 

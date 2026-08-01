@@ -1,12 +1,13 @@
 ---
 name: worktree-agent-runtime-smoke
-description: linked worktree 内で Claude Code / Codex CLI の fresh runtime を起動し、structured output（既定）または herdr interactive pane（TUI 固有挙動が必要な場合のみ）で観測し、redacted evidence を worktree-local に保存する共有 Skill。「runtime smoke」「動作検証を実行」「Claude/Codex を worktree で起動して確認」のトリガーで使う。
+description: linked worktree 内で Claude Code / Codex CLI の fresh runtime を起動し、structured output（既定・常に direct subprocess）または herdr interactive lane（TUI 固有挙動が必要な場合のみ・常に人間の Herdr session とは分離した isolated named session）で観測し、allowlist-only summary evidence を worktree-local に保存する共有 Skill。「runtime smoke」「動作検証を実行」「Claude/Codex を worktree で起動して確認」のトリガーで使う。
 ---
 
 # Worktree Agent Runtime Smoke
 
 Claude Code と Codex CLI について、linked worktree 内で fresh session を起動し、
-structured event（既定）または herdr pane observation（TUI 固有挙動が必要な場合）で
+structured event（既定・常に direct subprocess）または herdr pane observation
+（TUI 固有挙動が必要な場合・常に呼び出し元とは分離した isolated named herdr session）で
 runtime evidence を収集する。semantic verdict（hook reason 分類、mutation deny 妥当性、
 Skill preload 判定、context budget 評価、review verdict、merge readiness）は callerの責務。
 
@@ -28,25 +29,29 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 
 - `--runtime claude|codex`
 - `--mode structured|interactive`
-- `--transport auto|direct|herdr`
 - `--worktree <linked worktree の絶対パス>`
 - `--prompt-file <検証用 prompt ファイル>`（raw prompt を argument interpolation しない）
-- `--output-dir <evidence 出力先。既定は worktree 配下の untracked ディレクトリ>`
+- `--output-dir <evidence 出力先。既定は worktree 配下の untracked ディレクトリ。排他的作成（既存ディレクトリ／symlink は拒否）>`
 - `--timeout-seconds <bounded timeout>`
+- `--max-turns <Claude Code の bounded turn 数。既定 30>`
 - `--expect-marker <literal>`（repeatable、任意）
 - `--require-clean-postcondition`（任意）
 - `--inspect-session-log-metadata` / `--require-session-log-metadata`（任意。既定では session log を読まない）
-- `--keep-pane`（任意。既定では検証 pane を閉じる）
+
+`--transport` と `--keep-pane` は存在しない（PR #1921 human OWNER fix-delta）。structured lane は
+常に direct subprocess、interactive lane は常に isolated named herdr session であり、
+呼び出し元は transport を選択できない。検証 session は常に cleanup 対象であり、残す
+オプションは提供しない。
 
 ## Lane 選択
 
 ### Lane A: structured smoke（既定・非対話ラン）
 
 非対話の fresh process から stream JSON / JSONL event と exit code を取得する。
-TUI screen scraping を使わない。
+TUI screen scraping を使わない。herdr を経由しない（常に direct subprocess）。
 
-- Claude Code の起動コマンド例: `claude -p --output-format stream-json --include-hook-events --no-session-persistence`
-- Codex CLI の起動コマンド例: `codex exec -C <worktree> --json --ephemeral <prompt>`
+- Claude Code の起動コマンド例: `claude -p --output-format stream-json --include-hook-events --no-session-persistence --max-turns <n>`
+- Codex CLI の起動コマンド例: `codex exec -C <worktree> --json --ephemeral -`（prompt は stdin 経由。argv には出さない）
 
 詳細は `references/claude-code.md` / `references/codex-cli.md` を参照。
 
@@ -55,7 +60,10 @@ TUI screen scraping を使わない。
 TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示等、structured lane で
 露出しない状態の観測が必要な場合だけ使用する。herdr が必須。
 
-詳細は `references/herdr.md` を参照。
+**人間の使用中 Herdr session には一切相乗りしない。** 実行のたびに高エントロピーな
+named session を新規生成し、その session 内だけで agent lifecycle を駆動し、
+終了時に session そのものを stop／delete し、`herdr session list --json` で消失を
+確認する（確認できない場合は fail-closed で exit 1）。詳細は `references/herdr.md` を参照。
 
 ## 手順
 
@@ -64,15 +72,15 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示等
 3. **runner を実行する**:
    ```bash
    uv run --locked python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py \
-     --runtime claude --mode structured --transport auto \
+     --runtime claude --mode structured \
      --worktree "$WORKTREE" \
      --prompt-file tmp/runtime-smoke/claude-structured.md \
      --output-dir artifacts/runtime-smoke/claude-structured \
      --timeout-seconds 180 \
      --require-clean-postcondition
    ```
-4. **exit code を確認する**: `0`=成功／`1`=runtime failure・timeout・identity mismatch・postcondition 違反／`77`=SKIP（capability・auth・herdr 不足。PASS へ昇格しない）
-5. **evidence を確認する**: `<output-dir>/summary.md` の redacted excerpt だけを caller の PR 本文へ引用する。raw prompt／raw transcript／reasoning／credential／HOME 絶対パスは保存しない（`references/evidence-hygiene.md` 参照）
+4. **exit code を確認する**: `0`=成功／`1`=runtime failure・timeout・identity mismatch・postcondition 違反・cleanup 未確認／`77`=SKIP（capability・auth・herdr 不足。PASS へ昇格しない）
+5. **evidence を確認する**: `<output-dir>/summary.md`（唯一の永続 evidence ファイル）を caller の PR 本文へ引用する。raw prompt／raw transcript／reasoning／credential／HOME 絶対パスは保存しない（`references/evidence-hygiene.md` 参照）
 6. **caller が semantic verdict を判定する**: runner の役割は起動・観測・証跡収集までで終わる
 
 ## Safety Boundary（安全境界）
@@ -82,7 +90,11 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示等
 - `--dangerously-bypass-approvals-and-sandbox` / `--yolo` / `danger-full-access` への自動変更を行わない
 - herdr 未検出・`HERDR_ENV` 未設定は `mode=interactive` の SKIP（exit 77）とし、structured lane の失敗へ波及させない
 - `blocked` / `unknown` の agent lifecycle state を成功として扱わない
-- caller pane、別 agent、別 workspace を変更しない。検証用 pane だけを閉じる（`--keep-pane` 指定時は残す）
+- interactive lane は毎回新規 isolated named session を生成し、人間の使用中 session・pane・
+  agent・workspace には一切触れない。検証終了時は session 全体を stop／delete し、
+  `herdr session list --json` での消失確認が取れない場合は exit 1 とする（`--keep-pane` 相当の
+  opt-out は存在しない）
+- SIGINT／SIGTERM を含む全ての終了経路で isolated session cleanup を実行する
 - 新しい schema、digest、receipt、publisher、state store、semantic verdict classifier を追加しない
 
 ## Reference Map（参照資料の一覧）
