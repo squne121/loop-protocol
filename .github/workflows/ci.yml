@@ -593,6 +593,18 @@ jobs:
             return $status
           }
           run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Verify resolved required-CI snapshot mode
+        # JSON reporter emits Playwright FullConfig without running browser tests.
+        run: |
+          CI=true pnpm exec playwright test --list --reporter=json > playwright-full-config.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          config = json.loads(Path("playwright-full-config.json").read_text())["config"]
+          assert config["updateSnapshots"] == "none", config["updateSnapshots"]
+          print("PLAYWRIGHT_FULL_CONFIG_SNAPSHOT_POLICY_V1 status: pass")
+          PY
       - name: Verify Playwright Docker image version
         run: |
           PW_VERSION="$(node -p "require('@playwright/test/package.json').version")"
@@ -1184,6 +1196,8 @@ jobs:
         run: uv run --locked python scripts/check_input_command_schema.py
       - name: Check visual artifact pipeline wiring
         run: uv run --locked python scripts/check-visual-artifact-pipeline.py
+      - name: Check required-CI VRT snapshot policy
+        run: uv run --locked python scripts/check-vrt-snapshot-policy.py
       - name: Verify python-test plan paths + lane union
         # Fail-closed plan checks (Issue #1064 review): every plan path exists, and the
         # collected node IDs satisfy  parallel ∪ serial == scope  and  parallel ∩ serial == ∅.

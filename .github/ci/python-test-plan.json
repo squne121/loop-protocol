@@ -47,6 +47,7 @@
     "scripts/tests/test_check_agy_causal_claim_drift.py",
     "scripts/tests/test_check_agy_causal_claim_drift_ci_gate.py",
     "scripts/tests/test_check_visual_artifact_pipeline.py",
+    "scripts/tests/test_check_vrt_snapshot_policy.py",
     "tests/context_mode/",
     "tests/test_summarize_agent_transcript.py",
     "tests/agent_ops/",
