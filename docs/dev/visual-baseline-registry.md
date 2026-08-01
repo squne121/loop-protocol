@@ -336,15 +336,22 @@ devicePixelRatio 約 0.667）を受けた REQUEST_CHANGES で、combat HUD が C
   `playwright test tests/e2e/phase-screens.spec.ts tests/e2e/visual-overlay.spec.ts
   tests/e2e/m2-combat-mvp.spec.ts --update-snapshots` により baseline を再生成した。
   #1374 / #1375 の前例（本ファイル上記セクション）で観測された CI runner とのフォント
-  fallback 差に起因する追加差分が本 PR の CI 実行でも再発する可能性があるため、CI 実行
-  結果の `test-results` artifact から該当する `*-actual.png` を取得し、それを最終
-  baseline として採用する運用を維持する（このローカル再生成は暫定コミットであり、CI
-  実行結果による最終採用は control-plane が別途行う）。
+  fallback 差に起因する追加差分が本 PR の CI 実行（run id `30696103540`, job id
+  `91359166114`, e2e job, head sha `968af36ec82acc9fc6d20291888bbcc0313c0db3`）で
+  8 件（`m2-running-hud-baseline` / `m2-timeout-overlay-baseline` / `title-menu` /
+  `load-menu-empty` / `load-menu-available` / `load-menu-failure` /
+  `preparation-default` / `preparation-upgrade-available`）再発したため、CI 実行結果の
+  `test-results` artifact（artifact id `8817325110`）から該当する `*-actual.png` を
+  取得し、それを最終 baseline として採用した（`running-hud-overlay-legacy-current` /
+  `running-minimal-hud` は今回の CI 実行では許容差内に収まり差分なし）。各差分は目視確認の
+  上、P0-1/P0-2 修正に伴う数px 単位の位置シフトであり、意図しない退行の固定化ではないことを
+  確認した（§4 checklist 適用）。
 - **maturity**: 変更なし（対象はすべて既存 `legacy-current` / `provisional` のまま）。
 - **tolerance**: 変更なし（既存 `maxDiffPixels` 設定を維持）。
-- **environment fingerprint**: 本更新はローカル worktree 環境で生成した暫定 baseline
-  であり、CI 実行環境（GitHub Actions ubuntu runner）で再取得した `*-actual.png` への
-  差し替えが必要になる可能性がある（#1374 / #1375 の前例と同じ運用）。
+- **environment fingerprint**: 最終的に採用した baseline（上記 8 件）は CI 実行環境
+  （GitHub Actions ubuntu runner, Chromium, Playwright config 既定 viewport,
+  `tests/e2e/visual.freeze.css` の generic `sans-serif` 固定込み, run id
+  `30696103540`, job id `91359166114`）で生成された画像そのものである。
 
 ## 4. baseline update policy（更新ポリシー）
 
