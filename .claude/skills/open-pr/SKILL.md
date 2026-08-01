@@ -30,26 +30,15 @@ clean HEAD、Allowed Paths、PR body validator、GitHub readback で判定する
 - `dry_run`: `true` で PR 作成プレビューのみ実行（gh pr create はしない）
 - `draft`: `true` で Draft PR として作成（デフォルト: true）
 - `branch`: ブランチ名（省略時は現在の HEAD ブランチを使う）
-- `overlap_preflight`: 任意の advisory telemetry。欠落・不正・drift で publication を停止しない。フィールド:
-  - `required`: `true` / `false`。ただし linked issue が `phase/implementation` ラベルを持つ場合、`open_pr.py` が自らラベルを判定して `false` でも gate を省略しない（bypass-via-omission 対策、AC2）
-  - `evidence_file`: `check_implementation_overlap.py` が出力した evidence JSON（`IMPLEMENT_SCOPE_COLLISION_PREFLIGHT_V1`）のパス
-  - `expected_evidence_sha256`: `sha256:...`。stored evidence file の embedded `evidence_sha256`（`collected_at` / `decision_inputs_sha256` を含めて計算された、timestamp 込みの artifact 全体ハッシュ）との一致確認に使う
-  - `expected_decision_inputs_sha256`: `sha256:...`。`collected_at` 等の timestamp フィールドを含めずに計算された `decision_inputs_sha256`（timestamp 非依存）と、`open_pr.py` が `gh pr create` 直前にオンライン再実行して得た fresh `decision_inputs_sha256` との drift 比較に使う
 
-  両ハッシュの canonicalization 契約は `check_implementation_overlap.py` の producer 実装と同一（`json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))` を経て sha256 hex 化し `sha256:` を前置する。evidence ファイルは `indent=2` で pretty 保存されるため素の `sha256sum evidence_file.json` とは一致しない）。
-
-  CLI 引数（`scripts/open_pr.py`）:
-  ```bash
-  uv run --locked python3 .claude/skills/open-pr/scripts/open_pr.py \
-    --pr-title "<title>" \
-    --linked-issue <N> \
-    --publish yes \
-    --pr-body-file /tmp/pr-body.md \
-    --overlap-preflight-required \
-    --overlap-preflight-evidence-file /tmp/overlap_preflight_<N>_recheck.json \
-    --overlap-preflight-expected-evidence-sha256 "sha256:<evidence_sha256>" \
-    --overlap-preflight-expected-decision-inputs-sha256 "sha256:<decision_inputs_sha256>"
-  ```
+CLI 引数（`scripts/open_pr.py`）:
+```bash
+uv run --locked python3 .claude/skills/open-pr/scripts/open_pr.py \
+  --pr-title "<title>" \
+  --linked-issue <N> \
+  --publish yes \
+  --pr-body-file /tmp/pr-body.md
+```
 
 ## Procedure（手順）
 
@@ -158,70 +147,15 @@ EXISTING_PR=$(gh pr list --head <branch> --state open --json number,url --jq '.[
 - 既存 PR あり → 重複作成せず、既存 PR URL を返す（必要なら本文 update を提案）
 - 既存 PR なし → 次のステップへ
 
-### 4.5. Overlap Preflight（`gh pr create` 直前のオンライン再検証。canonical repository 解決 / repository binding は fail-closed hard gate、evidence の妥当性検証（drift・unsafe route 含む）は advisory、Issue #1458 / repository binding は Issue #1470 / advisory 化は #1851）
+### 4.5. Canonical Repository 解決（`gh pr create` 直前の PR mutation target を解決する。fail-closed hard gate、Issue #1470）
 
-`open_pr.py` は既存 PR 検出・dry-run 処理より後、`gh pr create` 呼び出し直前に以下を実行する。**PR mutation target の canonical repository 解決（0）と、evidence に埋め込まれた `repository` field の binding 検証（1 の repository 部分・4）は、`overlap_gate_active`（`overlap_preflight` が `required: true`、または linked issue が `phase/implementation` ラベルを持つ場合）の値に関わらず常に fail-closed（`gh pr create` を一切呼ばない）である。** それ以外の evidence 妥当性検証（stored/fresh の hash・provenance・collection contract・drift・safety predicate route を含む 1〜3・5・6）は、`overlap_gate_active` の場合のみ実行され、失敗しても **advisory**（WARNING として記録し `gh pr create` を継続、成功後に固定 marker 付き PR コメントとして永続化）であり、PR publication を止めない（#1851）。
+`open_pr.py` は既存 PR 検出・dry-run 処理より後、`gh pr create` 呼び出し直前に PR mutation target の `canonical_repository` を解決する（Issue #1470）。peer OPEN Issue の overlap preflight（旧 Issue #1458 / #1851 hard gate）は #1679 により production path から完全に撤去され、この canonical repository resolution はそれとは独立した唯一の fail-closed 安全境界として残る。
 
-0. PR mutation target の `canonical_repository` 解決（Issue #1470 / #1851 Blocker 2）: `--repo` または `git remote` から得た requested repository を `resolve_canonical_repository()` で GitHub Repository API（`GET /repos/{owner}/{name}`）を通じて **一度だけ** 解決し、`full_name` の小文字化形を `canonical_repository` とする。以降のオンライン再実行（`--repo`）と `gh pr create --repo` の両方に、この単一の `canonical_repository` 変数を使う。この解決は `overlap_gate_active` に関わらず常に行われ、API 呼び出しに失敗した場合は静的正規化へフォールバックせず fail-closed（`E_OVERLAP_PREFLIGHT_SOURCE_FAILURE`、`gh pr create` を呼ばない）で停止する（`check_implementation_overlap.py` の producer 側 `_canonicalize_repo(online=True)` はオフライン fallback を持つが、consumer 側の `resolve_canonical_repository()` は持たない）。mixed-case な入力（例 `SQUNE121/LOOP-PROTOCOL`）や rename / transfer 後の alias も、この単一の API 呼び出しで現在の `full_name` へ解決される。
-1. `evidence_file` の再読込と `expected_evidence_sha256`（stored evidence の embedded `evidence_sha256` との一致確認、evidence 自体の integrity 検証）。stored evidence は `repository`（string, 非空, canonical 小文字化形）を required field として持たなければならない。**`repository` の欠落・型不正・非canonical・`canonical_repository` との不一致のみ** は `E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID` で fail-closed 停止する（`gh pr create` を呼ばない、Issue #1470 の binding 安全境界）。`repository` field 自体を持たない legacy V1 evidence も同様に fail-closed で拒否される（新しい evidence を `check_implementation_overlap.py` で再生成すること）。それ以外（schema 不一致・`evidence_sha256` 不一致など）の integrity 検証失敗は `E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID` の advisory warning として記録し、`gh pr create` へ処理を継続する（#1851）
-2. stored evidence の `decision_inputs_sha256` と、呼び出し元が指定した `expected_decision_inputs_sha256` との一致確認（PR #1467 review fix, P2-1: stored artifact がどの preflight collection chain に属するかを確定する provenance チェック）。不一致は `E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID` の advisory warning として記録し、`gh pr create` へ処理を継続する（#1851）
-3. integrity 確認済み stored evidence の `source.limit` を正の整数として検証し、その値以外の caller input は使わず、`check_implementation_overlap.py`（`.claude/skills/implement-issue/scripts/check_implementation_overlap.py`。producer は変更せず subprocess として再実行するのみ）へ同一 `--repo <canonical_repository>` / `--issue-number` / `--limit <stored source.limit>` でオンライン再実行する。stored evidence の `source` に collection contract（`collection_mode` / `page_size` / `page_count` / `fetched_count` / `has_next_page`、#1493 AC1）のいずれかが欠けている場合は、GraphQL cursor pagination 未対応の legacy evidence として `E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID` の advisory warning として記録し、`gh pr create` へ処理を継続する（#1851）
-4. fresh evidence の `repository` field（string, `canonical_repository` と一致必須）を、汎用の `decision_inputs_sha256` drift 検出（5）より **前** に検証する（Issue #1470, AC5）。この順序は、`repository` binding という明示的不変条件（PR mutation target の identity）を、汎用ハッシュ比較より先に独立した predicate として確認し、検証順序とエラー分類を安定させるためのものである。欠落・不一致は `E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID` で fail-closed 停止し、`gh pr create` は呼ばれない（#1851 でも変更されない安全境界）
-5. fresh evidence の `source.limit` が正の整数かつ stored `source.limit` と一致すること、さらに fresh evidence の `decision_inputs_sha256` と `expected_decision_inputs_sha256` が一致することを確認する（collection 時点からの drift 検出）。fresh evidence の collection contract（`collection_mode` / `page_size` / `page_count` / `fetched_count` / `has_next_page`）が欠けている、または `collection_mode` が stored と一致しない場合も含め、いずれも `E_OVERLAP_PREFLIGHT_DRIFT` の advisory warning として記録し、`gh pr create` へ処理を継続する（#1851。#1493 AC3 の collection contract 自体は変更なし — caller は依然 collection contract を上書きできない）
-6. fresh evidence の `route`（`proceed` / `proceed_with_collision_evidence` のみ安全）・`source.complete`（`true` 必須）・`source.saturated`（`false` 必須）・`validation_errors`（空必須）・`dependency_resolution.unresolved_refs`（空配列必須）・`dependency_resolution.blocking_predecessor`（`null` 必須）・`current_issue.number`（`linked_issue` と一致必須）の安全性 predicate 検証。不成立は `E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE` の advisory warning として記録し、`gh pr create` へ処理を継続する（#1851）
+`--repo` または `git remote` から得た requested repository を `resolve_canonical_repository()` で GitHub Repository API（`GET /repos/{owner}/{name}`）を通じて **一度だけ** 解決し、`full_name` の小文字化形を `canonical_repository` とする。以降 `gh pr create --repo` にはこの単一の `canonical_repository` 変数を使う。API 呼び出しに失敗した場合は静的正規化へフォールバックせず fail-closed（`E_CANONICAL_REPOSITORY_RESOLUTION_FAILED`、`gh pr create` を呼ばない）で停止する。mixed-case な入力（例 `SQUNE121/LOOP-PROTOCOL`）や rename / transfer 後の alias も、この単一の API 呼び出しで現在の `full_name` へ解決される。
 
-repository A の stored evidence を、同じ Issue 番号を持つ repository B の PR 作成に再利用しようとした場合、上記 1 の stored repository 不一致チェックによってオンライン再実行（3）より前に必ず拒否され、`gh pr create` は一度も呼ばれない（Issue #1470, AC7。#1851 でも維持される fail-closed 安全境界）。
-
-Issue #1477 の限定例として、fresh evidence の `human_review_required` が #519・#520・#1429 の `readback_incomplete` **だけ**に起因するときは、次の全条件を満たす `overlap_readback_waiver` を live Issue body と同一 SHA の `CONTRACT_REVIEW_RESULT_V1 status: go` snapshot から検証してから、その3件だけを safe route 判定から除外できる。
-
-- `issue_numbers: [519, 520, 1429]`
-- `reason: human_approved_readback_ignore`
-- `expires_on: "2026-07-13"`（当日を含む）
-- `approved_by: user_session`
-
-対象外 Issue、他の incomplete candidate、`readback_incomplete` 以外の reason、期限切れ、live body / snapshot SHA 不一致、または waiver のキー・値不一致はすべて fail-closed とする。この例外は `source`、`validation_errors`、依存解決、current issue binding の既存 predicate を緩めず、任意 waiver を受け付ける一般機構ではない。
-
-#### 期限付き契約束縛 waiver の一般化（Issue #1509）
-
-上記の #1477 固定 binding（`issue_numbers: [519, 520, 1429]` に決め打ちされた単一の例外）に加えて、`open_pr.py` は ANY の `(repository, linked_issue)` の組（#1477 の固定 binding を除く）に対して、**その linked issue 自身の live body に自己宣言された** `overlap_readback_waiver` を検証する generic consumer を持つ。live body / trusted `status: go` snapshot への SHA 束縛は、#1477 固定 binding と generic waiver の両方が同一の generic contract validation core（`_load_verified_waiver_binding`）を共有し、この共有 core の上に、#1477 は固定 literal 値との完全一致チェックを、generic waiver はスキーマ検証をそれぞれ独自に積む（Issue #1509 AC4）。#1477 固定 binding の外部から見える挙動は既存の `test_open_pr_overlap_gate.py`（本 skill の Allowed Paths 外の regression gate）でカバーされており、一切変化しない。generic consumer は完全に独立した追加の経路であり、`linked_issue` が `1477`（かつ `repository` が `squne121/loop-protocol`）の場合は generic 経路に一切到達しない。
-
-generic waiver のスキーマ（linked issue の live body、`## Machine-Readable Contract` 等の fenced YAML block 内）:
-
-```yaml
-overlap_readback_waiver:
-  repository: <owner/repo>       # 呼び出し元が解決した canonical PR mutation target と一致必須
-  linked_issue: <positive int>   # `open_pr.py --linked-issue` と一致必須（自己参照 binding）
-  candidates:
-    - issue_number: <positive int>
-      updated_at: <RFC 3339 UTC, 例: 2026-06-01T00:00:00Z>  # fresh evidence の該当 candidate の
-                                                             # updated_at と一致必須
-      reason: <string>           # `readback_incomplete` で始まり、fresh candidate の reasons と
-                                  # 完全一致必須（subset/superset ではない単一 reason）
-  expires_on: <YYYY-MM-DD>       # UTC の当日を含めて超過していないこと（実行ホストの local
-                                  # timezone には依存しない）
-  approved_by: <string>
-```
-
-waiver block は fenced ```yaml ブロックのうち `overlap_readback_waiver` を含むものが正確に1個だけ存在する場合にのみ有効とする（複数あれば曖昧なので無効）。YAML の重複キー、top-level / `candidates[]` 双方の未知キーはいずれも fail-closed で拒否する。
-
-fresh evidence の `human_review_required` が、この waiver が宣言する `candidates` の `readback_incomplete` **だけ**に起因し（candidate 集合・reason・updated_at が完全一致し）、他の readback 完了済み candidate が C1/C2a だけである場合に限り、その candidate 群を safe route 判定から除外できる。candidate 集合の差分、reason / updated_at drift、追加の C2b/C3 candidate、`repository` / `linked_issue` の不一致、期限切れ、live body に waiver ブロックが存在しない、trusted でない・SHA 不一致の contract snapshot は、いずれも fail-closed とする。`source` / `validation_errors` / 依存解決 / current issue binding の既存 predicate はこの generic waiver によっても緩められない。
-
-さらに、fresh evidence 自身の `current_issue.body_sha256`（producer が readback した時点の live body SHA）と、この waiver 検証がこの呼び出しで読み戻した live body SHA が一致することを必須とする（PR #1627 review fix_delta）。candidate 番号・reason・updated_at が一致するだけでは、producer が本文Aを読んだ後に本文がBへ更新され、waiver 側の live 読み戻しがBを見て一致してしまう TOCTOU を検出できない。`current_issue.body_sha256` の欠落・型不正・`sha256:<64 hex>` 形式不正はいずれも fail-closed で拒否する。
-
-この waiver 機構は上記 6（safety predicate route 検証）の一部であり、いずれかが不成立の場合は `E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID` / `E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE` の advisory warning として記録し、`gh pr create` へ処理を継続する（#1851。canonical repository 解決失敗や repository binding 不一致とは異なり、fail-closed 停止ではない）。オンライン再実行に使う `--repo` は `gh pr create --repo` にもそのまま渡される同一の `canonical_repository` 変数であり、これが AC8（Issue #1458）の cross-repo binding mitigation の根拠。evidence 自体への `repository` フィールド追加は #1462（マージ済み）、consumer 側の required-field 検証・canonical identity 束縛・legacy evidence 拒否は #1470（本節、fail-closed のまま維持）の scope。
-
-`overlap_gate_active`（gate 起動要否, `forced_by_label` 判定）は `gh pr create` 呼び出し直前に毎回オンラインで linked issue の labels を再取得して決定する（PR #1467 review fix, P1-1）。処理前半で取得した labels のキャッシュはこの security decision には使わない（TOCTOU 対策）。labels 再取得が失敗した場合（認証エラー・JSON 不正・型不正等）は「ラベルなし」として扱わず fail-closed（gate を必ず有効化する）。
-
-注記: 本機構は「TOCTOU を完全に排除する」ものではない。GitHub の PR 作成 API には issue body の SHA に紐づく precondition / If-Match 機構が存在しないため、これは **mutation 直前の bounded freshness gate**（race window を狭める設計）であり、atomic な保証ではない。
+`canonical_repository` が requested repository と異なる場合（mixed-case / rename alias）、既存 PR を `canonical_repository` で再確認する（idempotency チェックの canonical target 追従）。
 
 `dry_run: true` の場合、本 gate は実行されない（`gh pr create` 自体を呼ばないため）。
-
-#### 既知の限界（暫定的 mitigation であることの明記, PR #1467 review fix, #1470 review fix で native dependency 記述を修正）
-
-- producer（`check_implementation_overlap.py`）は native GitHub issue dependency の `blocked_by` / `blocking` を GitHub 公式 REST issue-dependencies endpoint（`repos/{repo}/issues/{issue_number}/dependencies/{direction}`）から全ページ取得し、Machine-Readable Contract の `blocked_by:` YAML および legacy `Depends on #N` テキスト参照と統合済みである（producer は `implement-issue` skill、Allowed Paths 外であり本 skill の Allowed Paths では変更できない）。
-- 候補 Issue 収集の全件性は GraphQL cursor pagination の `pageInfo.hasNextPage` によって証明され、stored/fresh 双方の collection contract 一致を本 gate が検証する（#1493）。残存限界は、repository ID（`id` / `node_id`）による binding 未実装（`owner/name` の canonical full_name 小文字化形までの binding）、および PR mutation との非原子性（本節末尾の bounded freshness gate の注記を参照）である。
-- `repository` フィールドの producer 側 schema migration（#1462、additive migration・V1 のまま拡張、マージ済み）と、consumer 側の required-field 検証・canonical identity 束縛（#1470、本節）により、stored/fresh evidence と `gh pr create --repo` の cross-repo binding gap（#1458 が残した gap）は解消されている。
-- `repository` field の binding は `owner/name` の canonical full_name（小文字化形）までであり、repository ID（`id` / `node_id`）による binding は行わない（将来の evidence schema V2 で検討、#1470 の Out of Scope）。
 
 ### 5. PR 作成
 
@@ -257,7 +191,7 @@ PR_BODY_PREVIEW_FIRST_LINES=...
 
 エラー時:
 ```
-ERROR=E_APPROVAL_MISSING | E_PR_BODY_VALIDATION_FAILED | E_LINKED_ISSUE_STATE_UNKNOWN | E_GH_FAILURE | E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING | E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID | E_OVERLAP_PREFLIGHT_DRIFT | E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE | E_OVERLAP_PREFLIGHT_SOURCE_FAILURE
+ERROR=E_APPROVAL_MISSING | E_PR_BODY_VALIDATION_FAILED | E_LINKED_ISSUE_STATE_UNKNOWN | E_GH_FAILURE | E_CANONICAL_REPOSITORY_RESOLUTION_FAILED
 ERROR_DETAIL=<エラー詳細>
 ```
 
@@ -293,12 +227,7 @@ uv run --locked python3 .claude/skills/open-pr/scripts/open_pr.py \
 | `E_SCHEMA_CONSUMER_INVENTORY_MISSING` | `schema_change` / `uncertain` PR で Schema Consumer Inventory が欠落または placeholder（LP050 / LP052 による検出） | `## Schema Consumer Inventory` セクションを追加し、before/after、consumer 列挙、更新状況を記載する |
 | `E_LINKED_ISSUE_STATE_UNKNOWN` | linked issue の state 取得失敗 | gh 認証 / linked_issue 番号を確認 |
 | `E_GH_FAILURE` | `gh pr create` 失敗 | stderr の詳細を確認、リポジトリ権限 / ブランチ存在 / リモート push 済みを確認 |
-| `E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID` | **fail-closed（`gh pr create` を呼ばない）**。stored evidence の `repository` の欠落・型不正・非canonical・`canonical_repository` との不一致、または fresh evidence の `repository` の欠落・`canonical_repository` との不一致（Issue #1470、#1851 でも維持される安全境界） | evidence を `canonical_repository` に対応する `check_implementation_overlap.py` で再生成する |
-| `E_OVERLAP_PREFLIGHT_EVIDENCE_MISSING` | advisory。`overlap_preflight` gate が有効（`required: true` または `phase/implementation` ラベルによる強制）だが `evidence_file` が存在しない・読み込めない（#1851: PR 作成は継続し、WARNING として記録・PR コメントへ永続化） | `check_implementation_overlap.py` を再実行して evidence file を再生成し、正しいパスを渡す |
-| `E_OVERLAP_PREFLIGHT_EVIDENCE_INVALID` | advisory。stored evidence の parse 失敗・スキーマ不一致・embedded `evidence_sha256` と `expected_evidence_sha256` の不一致、stored `source.limit` の欠落・非整数・0以下、または stored `source` の collection contract フィールド（`collection_mode` 等、#1493）の欠落（#1851: PR 作成は継続し、WARNING として記録・PR コメントへ永続化。`repository` field 由来の失敗は上記 `E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID` を参照） | evidence file が破損していないか、`expected_evidence_sha256` と stored `source.limit` / collection contract が正しいか確認し、必要なら再収集する |
-| `E_OVERLAP_PREFLIGHT_DRIFT` | advisory。オンライン再実行の fresh `decision_inputs_sha256` が `expected_decision_inputs_sha256` と不一致、fresh `source.limit` の欠落・非整数・0以下・stored 値との不一致、または fresh `source` の collection contract フィールドの欠落・`collection_mode` の stored との不一致（#1493）（#1851: PR 作成は継続し、WARNING として記録・PR コメントへ永続化。`repository` field 由来の失敗は上記 `E_OVERLAP_PREFLIGHT_REPOSITORY_BINDING_INVALID` を参照） | `implement-issue/SKILL.md` の overlap preflight（Step 2）を再実行し、新しい evidence で再度 `open_pr.py` を呼び出す |
-| `E_OVERLAP_PREFLIGHT_UNSAFE_ROUTE` | advisory。fresh evidence の `route` / `source.complete` / `source.saturated` / `validation_errors` / `dependency_resolution.unresolved_refs` / `dependency_resolution.blocking_predecessor` / `current_issue.number` のいずれかが不安全（#1851: PR 作成は継続し、WARNING として記録・PR コメントへ永続化） | `route` と関連フィールドを確認し、必要なら人間判断で follow-up する |
-| `E_OVERLAP_PREFLIGHT_SOURCE_FAILURE` | `resolve_canonical_repository()` が `canonical_repository` を解決できなかった場合は **fail-closed**（`gh pr create` を呼ばない、Issue #1470 / #1851 Blocker 2、`overlap_gate_active` に関わらず常に有効）。`check_implementation_overlap.py` のオンライン再実行が subprocess timeout / 非ゼロ終了 / 非 JSON 出力 / 認証失敗を起こした場合は advisory（#1851: PR 作成は継続） | gh 認証・ネットワーク・スクリプトの実行環境を確認し、再実行する |
+| `E_CANONICAL_REPOSITORY_RESOLUTION_FAILED` | `resolve_canonical_repository()` が `canonical_repository` を解決できなかった場合は **fail-closed**（`gh pr create` を呼ばない、Issue #1470、常に有効） | gh 認証・ネットワーク・GitHub Repository API 疎通を確認し、再実行する |
 
 ### Branch publish failure の扱い
 
@@ -318,7 +247,7 @@ impl-review-loop の publish failure lane に戻す。force update / reset へ�
 - 同一ブランチに OPEN PR がある場合は重複作成せず既存 URL を返す
 - `dry_run: true` でも publish ゲートと validator は実行する
 - 既存 PR が見つかった場合、本文 update は必ず update_pr.py wrapper 経由で行う（validator bypass 防止）
-- linked issue が `phase/implementation` ラベルを持つ場合、`overlap_preflight` の未指定 / `required: false` だけでは overlap preflight gate を省略できない（Issue #1458, AC2）。canonical repository 解決と repository binding 検証は fail-closed、evidence の妥当性検証（drift・unsafe route 含む）は advisory（#1851）
+- peer OPEN Issue の overlap preflight は production path から撤去済み（#1679）。canonical repository 解決（PR mutation target binding、Issue #1470）だけが独立した fail-closed 安全境界として残る
 
 ## PR 作成・PR 更新前の必須ローカル preflight
 
@@ -487,7 +416,6 @@ VALIDATOR_RULE_IDS=<rule_ids>  # validator fail 時
 - `scripts/open_pr.py` — PR 作成手順を実装する Python wrapper
 - `scripts/update_pr.py` — PR body 更新 wrapper with validator pre-write hook
 - `docs/dev/agent-run-report.md` — PR open 後のレポート posting handoff 規約
-- `.claude/skills/implement-issue/scripts/check_implementation_overlap.py` — overlap preflight gate（Issue #1458）がオンライン subprocess 再実行する producer script（open-pr の Allowed Paths 外、変更しない）
 
 ## 出力制約 (OUTPUT_BUDGET_V1)
 

@@ -54,7 +54,6 @@ related_issue: "#135"
 | `delegation_model_policy/v1` | `.claude/skills/gemini-cli-headless-delegation/scripts/build_request.py`（`model-policy` サブコマンド）、`.claude/skills/gemini-cli-headless-delegation/references/model-routing.md` | build_request.py の `build_model_policy()` / `main_model_policy()`（読み取り専用・副作用なしの dry-run inspector。`run_gemini_headless.py` の `load_model_routing()` / `resolve_model_chain()` / `PROVIDER_AUTO_*` を直接呼び出す） | 人間オペレータ・エージェント（`model-policy` CLI 呼び出しの stdout consumer）、test_build_request_model_policy.py | `rg -n "delegation_model_policy/v1\|model-policy\|build_model_policy" .claude/skills/gemini-cli-headless-delegation` |
 | `AGY_CAUSAL_CLAIM_MANIFEST_V1` | `.claude/skills/gemini-cli-headless-delegation/schemas/agy_causal_claim_manifest_v1.schema.json`（JSON Schema draft 2020-12。Issue #1778、CLOSED 済み #1494 の敵対的再監査 follow-up） | `.claude/skills/gemini-cli-headless-delegation/scripts/audit_agy_auth_surface.py`（`agy_permission_policy.py` の認証 surface 露出・`read_only` 命名関数の OS レベル強制有無を静的検出）、`scripts/check_agy_causal_claim_drift.py`（`agy_permission_policy.py` / `run_gemini_headless.py` の `Issue #N` 参照コメントと `references/*.md` frontmatter `status` の整合を検出し fail-close） | 人間レビュワー・エージェント（両スクリプトの stdout JSON consumer）、`test_audit_agy_auth_surface.py`、`test_check_agy_causal_claim_drift.py` | `rg -n "AGY_CAUSAL_CLAIM_MANIFEST_V1" .claude/skills/gemini-cli-headless-delegation scripts docs/dev/schema-governance.md` |
 | `AGY_GROUNDING_EVIDENCE_VERDICT_V1` | `.claude/skills/gemini-cli-headless-delegation/scripts/validate_agy_grounding_evidence.py` | validate_agy_grounding_evidence.py（causal claim extraction + evidence binding check） | pr-review-judge（clean-room review の experimental-validity reviewer）、test_validate_agy_grounding_evidence.py | `rg -n "AGY_GROUNDING_EVIDENCE_VERDICT_V1\|validate_agy_grounding_evidence" .` |
-| `OVERLAP_GATE_BYPASS_V1` | `.claude/skills/open-pr/scripts/validate_pr_body.py` | PR 本文の作者（overlap gate C2a/C3 バイパス時） | validate_pr_body.py、test_validate_pr_body_overlap_gate_bypass.py | `rg -n "OVERLAP_GATE_BYPASS_V1\|bypassed_gate_class" .` |
 
 **Compatibility Decision**: `AGY_CAUSAL_CLAIM_MANIFEST_V1` は本 Issue（#1778）で新規追加された schema であり、既存 schema の破壊的変更は含まない（`additive` — 新規 producer 2 件、既存 consumer への影響なし）。`agy_permission_policy.py` / `run_gemini_headless.py` はどちらも read-only の分析対象であり、本 Issue の PR では一切変更されない（behavior change なし）。
 
@@ -293,50 +292,9 @@ notes:
   - "モデルの自己申告のみに基づく causal claim を検出するための clean-room review 支援ツールであり、merge-blocking 判定自体は pr-review-judge の責務（本 schema は verdict 材料の一つ）。"
 ```
 
-## OVERLAP_GATE_BYPASS_V1 詳細登録
+## OVERLAP_GATE_BYPASS_V1（#1679 により削除・supersede 済み）
 
-```yaml
-schema_id: OVERLAP_GATE_BYPASS_V1
-definition: .claude/skills/open-pr/scripts/validate_pr_body.py（`_validate_overlap_gate_bypass()` / LP059・E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID）
-related_issue: "#1776"
-producer:
-  - PR 本文の作者（open_pr.py の hard overlap gate を C2a（closed_predecessor）/ C3（parent_child_collision）ルートで意図的にバイパスして `gh pr create` を直接実行する場合に、PR 本文中へ fenced ```yaml``` ブロックとして自ら記述する）
-consumer:
-  - .claude/skills/open-pr/scripts/validate_pr_body.py（LP059: ブロック欠落を fail、E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID: スキーマ不正を fail）
-  - .claude/skills/open-pr/tests/test_validate_pr_body_overlap_gate_bypass.py
-shape: |
-  トリガー条件（PR 本文中に overlap + C2a/C3 + bypass 系語彙が共起した場合のみ
-  検証対象）を満たす PR 本文は、fenced YAML ブロック内に以下いずれかの形で
-  OVERLAP_GATE_BYPASS_V1 を記述する: (a) トップレベルキーとして
-  bypass_reason / approver / independent_verification_basis /
-  bypassed_gate_class / precedent_refs を直接持つ、または (b) 単一の
-  トップレベルキー `OVERLAP_GATE_BYPASS_V1:` の下にネストする。
-  必須キー（非空文字列）: bypass_reason, approver,
-  independent_verification_basis, bypassed_gate_class（列挙値 C2a | C3
-  のみ）。任意キー: precedent_refs（非空文字列のリスト）。
-control_flow_order: |
-  PR 本文全体を対象に OVERLAP_GATE_BYPASS_TRIGGER_PATTERN で trigger 判定
-  （overlap 語彙と C2a/C3 と bypass 語彙の近接共起）→ trigger しない場合は
-  検証をスキップ（既存 PR 本文への非破壊）→ trigger した場合は fenced YAML
-  ブロックを本文全体からスキャンして抽出 → YAML parse → 必須キー・
-  bypassed_gate_class の列挙値・precedent_refs の型を検証。
-compatibility:
-  breaking_changes:
-    - 必須キー集合の変更・削除
-    - bypassed_gate_class の許容値（C2a | C3）の変更
-    - トリガー条件の後方非互換な拡大（既存の非バイパス PR 本文が新たに fail になる変更）
-  non_breaking_changes:
-    - precedent_refs 以外の新規オプショナルキーの追加
-    - トリガー語彙の追加（誤検知抑制方向のみ）
-detection_patterns:
-  - 'OVERLAP_GATE_BYPASS_V1'
-  - 'bypassed_gate_class'
-  - '_validate_overlap_gate_bypass'
-validation_commands:
-  - "uv run --locked pytest .claude/skills/open-pr/tests/test_validate_pr_body_overlap_gate_bypass.py -q"
-notes:
-  - "#1752/PR#1756・#1753/PR#1763・#1771/PR#1772 で観測された「自由記述のみでバイパスを正当化し、後続バイパスが先行バイパスを前例として引用する自己強化パターン」への対策として、bypass の説明責任を構造化データとして固定する（Issue #1776 背景）。過去 PR 本文の遡及的な修正は求めない（forward-only）。"
-```
+`OVERLAP_GATE_BYPASS_V1`（Issue #1776 で導入された、open_pr.py の hard overlap gate を C2a/C3 経由で意図的にバイパスした場合の説明責任 fenced YAML 記録）は、元の overlap hard gate 自体が Issue #1679 で production path から完全に削除されたことに伴い、補助 gate として存続する意味を失ったため同 Issue で削除された。`validate_pr_body.py` の `_validate_overlap_gate_bypass()` / `LP059` / `E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID` と `schemas/catalog.yaml` の該当エントリ、`.claude/skills/open-pr/tests/test_validate_pr_body_overlap_gate_bypass.py` は撤去済み。#1776 は overlap-bypass 補助 gate 部分のみ #1679 により superseded であり、#1776 の他の変更点には影響しない。
 
 ## #934 public-surface boundary cleanup note（公開境界クリーンアップ注記）
 
