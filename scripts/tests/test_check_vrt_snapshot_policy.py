@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -24,21 +25,26 @@ def _write_repo(
     ci_run: str = "pnpm test:e2e:ci",
     package_scripts: dict[str, str] | None = None,
     action_run: str | None = None,
-    config: str = "export default { updateSnapshots: process.env.CI ? 'none' : 'missing' }\n",
+    action_with: str | None = None,
+    reusable_workflow: bool = False,
+    config: str = "export default { updateSnapshots: 'all' }\n",
     malformed_ci: bool = False,
-    include_wiring: bool = True,
+    wiring_run: str | None = "uv run --locked python scripts/check-vrt-snapshot-policy.py",
+    wiring_if: str | None = None,
 ) -> None:
     workflows = root / ".github" / "workflows"
     workflows.mkdir(parents=True, exist_ok=True)
     scripts = package_scripts or {"test:e2e:ci": "playwright test"}
-    package_entries = ",\n".join(f'    "{name}": "{value}"' for name, value in scripts.items())
-    (root / "package.json").write_text('{\n  "scripts": {\n' + package_entries + '\n  }\n}\n', encoding="utf-8")
+    (root / "package.json").write_text(json.dumps({"scripts": scripts}, indent=2) + "\n", encoding="utf-8")
     (root / "playwright.config.ts").write_text(config, encoding="utf-8")
     if malformed_ci:
         (workflows / "ci.yml").write_text("jobs: [broken\n", encoding="utf-8")
         return
 
-    wiring = "      - run: uv run --locked python scripts/check-vrt-snapshot-policy.py\n" if include_wiring else ""
+    wiring = ""
+    if wiring_run is not None:
+        condition = f"\n        if: {wiring_if}" if wiring_if is not None else ""
+        wiring = f"      - run: {wiring_run}{condition}\n"
     action = ""
     if action_run is not None:
         action_dir = root / ".github" / "actions" / "vrt"
@@ -49,14 +55,21 @@ def _write_repo(
             + "\n",
             encoding="utf-8",
         )
-        action = "      - uses: ./.github/actions/vrt\n"
+        with_block = ""
+        if action_with is not None:
+            with_block = f"\n        with:\n          script: {action_with}"
+        action = f"      - uses: ./.github/actions/vrt{with_block}\n"
+    reusable = ""
+    if reusable_workflow:
+        reusable = "  delegated:\n    uses: ./.github/workflows/reusable.yml\n"
     (workflows / "ci.yml").write_text(
         "jobs:\n  python-test-core:\n    steps:\n"
         + wiring
         + action
         + "      - run: |\n          "
         + ci_run.replace("\n", "\n          ")
-        + "\n",
+        + "\n"
+        + reusable,
         encoding="utf-8",
     )
 
@@ -66,46 +79,74 @@ def _errors(root: Path) -> list[str]:
 
 
 def test_rejects_write_capable_playwright_and_vitest_modes(tmp_path: Path):
-    _write_repo(tmp_path, ci_run="playwright test --update-snapshots=all")
-    assert any("Playwright" in error for error in _errors(tmp_path))
-
-    _write_repo(tmp_path, ci_run="vitest run --update")
-    assert any("Vitest" in error for error in _errors(tmp_path))
+    for command in [
+        "playwright test -u",
+        "playwright test --update-snapshots",
+        "playwright test --update-snapshots=all",
+        "vitest -u",
+        "vitest --update",
+        "vitest --update=all",
+        "vitest --update=new",
+        "vitest run --update",
+        "vitest watch --update=all",
+    ]:
+        _write_repo(tmp_path, ci_run=command)
+        assert any("write-capable" in error for error in _errors(tmp_path)), command
 
 
 def test_rejects_indirect_package_script_and_composite_action_paths(tmp_path: Path):
     _write_repo(
         tmp_path,
         package_scripts={
-            "test:e2e:ci": "pnpm run vrt:delegate",
-            "vrt:delegate": "pnpm test:vrt:update:e2e",
+            "test:e2e:ci": 'pnpm run "vrt:delegate"',
+            "vrt:delegate": "pnpm run " + "\\\n" + "  test:vrt:update:e2e",
             "test:vrt:update:e2e": "playwright test --update-snapshots=all",
         },
     )
     assert any("test:vrt:update:e2e" in error for error in _errors(tmp_path))
 
-    _write_repo(tmp_path, ci_run="echo safe", action_run="pnpm test:vrt:update:e2e")
-    assert any("test:vrt:update:e2e" in error for error in _errors(tmp_path))
+    _write_repo(
+        tmp_path,
+        ci_run="echo safe",
+        action_run="pnpm run " + "$" + "{{ inputs.script }}",
+        action_with="test:vrt:update:e2e",
+    )
+    assert any("unresolved interpolation" in error for error in _errors(tmp_path))
 
 
-def test_allows_safe_modes_python_u_and_comment_text(tmp_path: Path):
+def test_allows_safe_modes_python_u_and_explanatory_text(tmp_path: Path):
     _write_repo(
         tmp_path,
         ci_run="""python -u scripts/check.py
-# playwright test --update-snapshots=all
+echo \"playwright test --update-snapshots=all\"
+printf '%s\\n' 'vitest --update=all'
 playwright test --update-snapshots=none
-vitest run --update=none""",
+vitest --update=none
+vitest run --update=false""",
     )
     errors = _errors(tmp_path)
     assert errors == [], errors
 
 
-def test_fails_closed_for_interpolation_malformed_yaml_and_missing_wiring(tmp_path: Path):
-    _write_repo(tmp_path, ci_run="playwright test ${{ matrix.snapshot_mode }}")
+def test_fails_closed_for_dynamic_paths_malformed_yaml_and_structural_wiring(tmp_path: Path):
+    _write_repo(tmp_path, ci_run="pnpm run ${{ matrix.script }}")
     assert any("unresolved interpolation" in error for error in _errors(tmp_path))
+
+    _write_repo(tmp_path, ci_run="echo safe", action_run="echo safe", action_with="${{ matrix.script }}")
+    assert any("local composite action input" in error for error in _errors(tmp_path))
+
+    _write_repo(tmp_path, reusable_workflow=True)
+    assert any("local reusable workflow" in error for error in _errors(tmp_path))
 
     _write_repo(tmp_path, malformed_ci=True)
     assert any("YAML parse failure" in error for error in _errors(tmp_path))
 
-    _write_repo(tmp_path, include_wiring=False)
-    assert any("validator CI wiring" in error for error in _errors(tmp_path))
+    _write_repo(tmp_path, wiring_run="echo uv run --locked python scripts/check-vrt-snapshot-policy.py")
+    assert any("wiring" in error for error in _errors(tmp_path))
+
+    _write_repo(tmp_path, wiring_if="false")
+    assert any("wiring" in error for error in _errors(tmp_path))
+
+
+def test_current_repository_policy_passes():
+    assert _errors(REPO_ROOT) == []

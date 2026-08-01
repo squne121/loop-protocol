@@ -593,6 +593,18 @@ jobs:
             return $status
           }
           run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Verify resolved required-CI snapshot mode
+        # JSON reporter emits Playwright FullConfig without running browser tests.
+        run: |
+          CI=true pnpm exec playwright test --list --reporter=json > playwright-full-config.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          config = json.loads(Path("playwright-full-config.json").read_text())["config"]
+          assert config["updateSnapshots"] == "none", config["updateSnapshots"]
+          print("PLAYWRIGHT_FULL_CONFIG_SNAPSHOT_POLICY_V1 status: pass")
+          PY
       - name: Verify Playwright Docker image version
         run: |
           PW_VERSION="$(node -p "require('@playwright/test/package.json').version")"
