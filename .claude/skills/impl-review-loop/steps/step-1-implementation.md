@@ -1,20 +1,31 @@
 # Step 1: Implementation
 
 `implementation-worker` SubAgent に委譲し、`implement-issue` skill の手順を実行させる。
-
-Codex CLI: spawn the custom agent named implementation-worker for this step; the root thread must not edit files, run tests, commit, push, or make the review judgment directly.
+root/main（root thread）は最終 routing と mutation authorization を保持し、明示的に委譲された mechanical executor だけが既存の bounded contract 内で実行する。
 
 ## 委譲呼び出し
 
-Agent ツールで以下を呼ぶ:
+Agent ツールで以下の static call shape を使って起動する:
 
+```yaml
+spawn_agent:
+  task_name: implementation_i{iteration}
+  agent_type: implementation-worker
+  fork_turns: none
+  message: |
+    Objective: execute Step 1 implementation through implement-issue for the actual live Issue.
+    Live reference: bind the actual Issue number, full Issue URL, and contract snapshot URL when supplied.
+    Bounded scope: bind the actual live Allowed Paths and serialized fix_delta only.
+    Expected result: IMPLEMENT_RESULT_V1 with the actual worktree, branch, PR, and verification facts.
 ```
-subagent_type: implementation-worker
-inputs:
-  issue_number: <LOOP_STATE.issue_number>
-  contract_snapshot_url: <LOOP_STATE.contract_snapshot_url>
-  fix_delta: <前イテレーションの blockers_history、初回 iteration では null>
-```
+
+This dispatch block defines static call shape only. It does not prove runtime capability, permission enforcement, or security-boundary verification. Native runtime verification is owned by #1841. この静的な記述は実行時の能力・権限強制・security boundary を証明しません。
+
+### Materialization rule（実値を具体化する規則）
+
+`task_name` は実行直前に実際の非負 iteration で `implementation_i{iteration}` から materialize し、同一 root session 内で既に保存済みの canonical task name を再利用してはならない。`fork_turns: none` のため、root は message に実際の Issue number、完全な Issue URL、contract snapshot URL（指定された場合）、Allowed Paths、serialized `fix_delta` を値として埋め込む。`LOOP_STATE.issue_number`、変数名、`current`、波括弧・山括弧の placeholder を child message に渡してはならない。この static template 自体を tool call として送信してはならない。
+
+完了の扱いは4 site 共通の [Common Completion Protocol](step-4-pr-review.md#common-completion-protocol) に従う。
 
 SubAgent 側は `.claude/skills/implement-issue/SKILL.md` を実行し、worktree 作成・実装・検証・PR 起票（`open-pr` skill 経由）まで完了させる。
 
