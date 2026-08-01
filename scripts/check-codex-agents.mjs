@@ -87,7 +87,7 @@ const allowedRuntimeStatuses = new Set([
   'followup_required',
 ]);
 
-const expectedProfiles = new Set(['loop-protocol-readonly', 'loop-protocol-rtk']);
+const expectedProfiles = new Set(['loop-protocol-readonly', 'loop-protocol-rtk', 'loop-protocol-web-research']);
 function loadReasoningMap() {
   const contract = JSON.parse(fs.readFileSync(runtimeContractPath, 'utf8'));
   if (!contract || typeof contract !== 'object' || !contract.required_agents || typeof contract.required_agents !== 'object') {
@@ -119,13 +119,14 @@ function loadReasoningMap() {
 
 const reasoningMap = loadReasoningMap();
 
+const READ_ONLY_PROFILE_OVERRIDES = { 'web-researcher': 'loop-protocol-web-research' };
+
 const readOnlyAgents = new Set([
   'codebase-investigator',
   'issue-reviewer',
   'pr-reviewer-lite',
   'pr-reviewer',
   'scope-rollup-runner',
-  'spark-deep',
   'spark-skim',
   'test-runner',
   'web-researcher',
@@ -136,6 +137,7 @@ const writeAgents = new Set([
   'issue-author',
   'post-merge-cleanup-worker',
   'review-issue',
+  'spark-deep',
   'spark-worker',
 ]);
 
@@ -801,7 +803,10 @@ function validateAgents() {
     assert(instructions.includes('Known limitation'), `${file}: developer_instructions must include Known limitation wording`, failures);
 
     if (readOnlyAgents.has(name)) {
-      assert(parsed.default_permissions === 'loop-protocol-readonly', `${file}: read-only agent must use loop-protocol-readonly`, failures);
+      // Issue #1915: web-researcher stays filesystem read-only but uses a
+      // dedicated profile that widens outbound web beyond GitHub domains.
+      const expectedReadOnlyProfile = READ_ONLY_PROFILE_OVERRIDES[name] ?? 'loop-protocol-readonly';
+      assert(parsed.default_permissions === expectedReadOnlyProfile, `${file}: read-only agent must use ${expectedReadOnlyProfile}`, failures);
     }
     if (writeAgents.has(name)) {
       assert(parsed.default_permissions === 'loop-protocol-rtk', `${file}: write-capable agent must use loop-protocol-rtk`, failures);

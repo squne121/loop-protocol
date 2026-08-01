@@ -95,6 +95,39 @@ enabled = true
 # release / upload endpoints only; keep readonly/bootstrap narrower.
 "uploads.github.com" = "allow"
 
+# Issue #1915: web-researcher-only profile. Filesystem stays read-only
+# (identical to loop-protocol-readonly), but outbound web is widened beyond
+# GitHub domains to cover the official documentation domains web-researcher
+# needs for external spec / API fact-check. allow_local_binding stays false
+# and repository tracked files remain non-writable under this profile.
+[permissions.loop-protocol-web-research.filesystem]
+":minimal" = "read"
+"~/.codex/packages/standalone/releases" = "read"
+
+[permissions.loop-protocol-web-research.filesystem.":workspace_roots"]
+"." = "read"
+"assets" = "read"
+"LICENSES" = "read"
+"secrets" = "read"
+
+[permissions.loop-protocol-web-research.network]
+enabled = true
+mode = "full"
+allow_local_binding = false
+
+[permissions.loop-protocol-web-research.network.domains]
+"github.com" = "allow"
+"api.github.com" = "allow"
+"objects.githubusercontent.com" = "allow"
+"**.openai.com" = "allow"
+"**.anthropic.com" = "allow"
+"**.npmjs.com" = "allow"
+"**.npmjs.org" = "allow"
+"**.python.org" = "allow"
+"**.pypi.org" = "allow"
+"**.mozilla.org" = "allow"
+"**.w3.org" = "allow"
+
 [permissions.loop-protocol-readonly.filesystem]
 ":minimal" = "read"
 "~/.codex/packages/standalone/releases" = "read"
