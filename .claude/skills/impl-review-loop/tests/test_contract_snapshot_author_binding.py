@@ -11,8 +11,10 @@ AC4: run_contract_review_once.py / ensure_contract_snapshot.py /
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import json
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -38,6 +40,10 @@ _parser_mod = _load(
     _ICR_SCRIPTS_DIR / "contract_review_result_parser.py",
 )
 _capsule_mod = _load("build_intake_capsule_binding", _SCRIPTS_DIR / "build_intake_capsule.py")
+_materializer_mod = _load(
+    "materialize_issue_scope_snapshot_binding",
+    _HERE.parents[3] / "scripts" / "agent-guards" / "materialize_issue_scope_snapshot.py",
+)
 
 _ISSUE_NUMBER = 1475
 _REPO = "squne121/loop-protocol"
@@ -140,6 +146,62 @@ def _make_go_review_result() -> dict:
     }
 
 
+def _fallback_authority_fixture(comment_id: int = 5150877720) -> tuple[dict, dict]:
+    """Build the same JSON flow-mapping shape posted for Issue #1153."""
+    fingerprint = {
+        "issue_number": _ISSUE_NUMBER,
+        "contract_source_kind": "issue_comment",
+        "contract_source_id": str(comment_id),
+        "contract_body_sha256": _SAMPLE_BODY_SHA256,
+        "allowed_paths_normalized_sha256": "b" * 64,
+        "base_ref": "main",
+        "base_sha_at_snapshot": "a" * 40,
+    }
+    body = _ecs_mod._build_contract_review_comment(
+        issue_number=_ISSUE_NUMBER,
+        repo=_REPO,
+        review_result=_make_go_review_result(),
+        idempotency_marker="<!-- contract-snapshot -->",
+        body_sha256=_SAMPLE_BODY_SHA256,
+        expected_contract_fingerprint=fingerprint,
+    )
+    comment = {
+        "id": comment_id,
+        "html_url": f"{_ISSUE_URL}#issuecomment-{comment_id}",
+        "created_at": _SAMPLE_UPDATED_AT,
+        "updated_at": _SAMPLE_UPDATED_AT,
+        "author": _TRUSTED_LOGIN,
+        "author_association": _TRUSTED_ASSOCIATION,
+        "author_id": _TRUSTED_AUTHOR_ID,
+        "author_type": _TRUSTED_TYPE,
+        "body": body,
+    }
+    return comment, fingerprint
+
+
+def _reject_yaml_import(name, *args, **kwargs):
+    if name == "yaml":
+        raise ImportError("forced fallback")
+    return _ORIGINAL_IMPORT(name, *args, **kwargs)
+
+
+_ORIGINAL_IMPORT = builtins.__import__
+_FINGERPRINT_FLOW_LINE_RE = re.compile(
+    r"(?m)^(  expected_contract_fingerprint: )(\{.*\})$"
+)
+
+
+def _with_comment_fingerprint(comment: dict, fingerprint: object) -> dict:
+    """Return the same authoritative comment with its emitted JSON value replaced."""
+    updated = dict(comment)
+    updated["body"], count = _FINGERPRINT_FLOW_LINE_RE.subn(
+        lambda match: match.group(1) + json.dumps(fingerprint),
+        str(comment["body"]),
+    )
+    assert count == 1
+    return updated
+
+
 def _mock_parser_mod_no_go() -> MagicMock:
     mod = MagicMock()
     mod.fetch_issue_comments.return_value = ([], None)
@@ -238,6 +300,124 @@ def test_controlled_publisher_comment_id_binding_is_required():
 
     assert matched_result["status"] == "ok"
     assert matched_result["contract_snapshot_url"] is not None
+
+
+def test_authority_postcondition_accepts_json_flow_fingerprint_via_fallback_parser():
+    """The real comparator accepts the producer's JSON flow mapping without PyYAML."""
+    comment, fingerprint = _fallback_authority_fixture()
+    expected_comment_body_sha256 = _ecs_mod.sha256_of(comment["body"])
+
+    with patch.object(_ecs_mod, "_import_parser_module", return_value=_parser_mod):
+        with patch.object(
+            _ecs_mod,
+            "fetch_issue_snapshot",
+            return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+        ):
+            with patch.object(_ecs_mod, "capture_base_ref_and_sha", return_value=("main", "a" * 40)):
+                with patch.object(
+                    _ecs_mod,
+                    "verify_controlled_publisher_comment_id_binding",
+                    return_value=(True, None),
+                ):
+                    with patch.object(_parser_mod, "fetch_issue_comments", return_value=([comment], None)):
+                        with patch("builtins.__import__", side_effect=_reject_yaml_import):
+                            ok, reason = _ecs_mod.verify_snapshot_authority_postcondition(
+                                issue_number=_ISSUE_NUMBER,
+                                repo=_REPO,
+                                expected_body_sha256=_SAMPLE_BODY_SHA256,
+                                expected_updated_at=_SAMPLE_UPDATED_AT,
+                                expected_comment_id=comment["id"],
+                                expected_comment_body_sha256=expected_comment_body_sha256,
+                                expected_fingerprint=fingerprint,
+                            )
+
+    assert ok is True, reason
+    assert reason is None
+
+
+def test_authority_postcondition_rejects_malformed_actual_comment_fingerprints():
+    """Actual emitted comment bodies with wrong fingerprint shape fail closed."""
+    comment, fingerprint = _fallback_authority_fixture()
+
+    def verify(mutated_comment):
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=_parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(_ecs_mod, "capture_base_ref_and_sha", return_value=("main", "a" * 40)):
+                    with patch.object(
+                        _ecs_mod,
+                        "verify_controlled_publisher_comment_id_binding",
+                        return_value=(True, None),
+                    ):
+                        with patch.object(
+                            _parser_mod,
+                            "fetch_issue_comments",
+                            return_value=([mutated_comment], None),
+                        ):
+                            with patch("builtins.__import__", side_effect=_reject_yaml_import):
+                                return _ecs_mod.verify_snapshot_authority_postcondition(
+                                    issue_number=_ISSUE_NUMBER,
+                                    repo=_REPO,
+                                    expected_body_sha256=_SAMPLE_BODY_SHA256,
+                                    expected_updated_at=_SAMPLE_UPDATED_AT,
+                                    expected_comment_id=comment["id"],
+                                    expected_comment_body_sha256=_ecs_mod.sha256_of(
+                                        mutated_comment["body"]
+                                    ),
+                                    expected_fingerprint=fingerprint,
+                                )
+
+    changed_value = dict(fingerprint)
+    changed_value["allowed_paths_normalized_sha256"] = "c" * 64
+    malformed_fingerprints = [
+        changed_value,
+        {key: value for key, value in fingerprint.items() if key != "base_sha_at_snapshot"},
+        {**fingerprint, "unexpected": "value"},
+        json.dumps(fingerprint),
+    ]
+    for malformed_fingerprint in malformed_fingerprints:
+        assert verify(_with_comment_fingerprint(comment, malformed_fingerprint)) == (
+            False,
+            "authority_comment_fingerprint_mismatch",
+        )
+
+
+def test_materializer_accepts_json_flow_fingerprint_via_forced_fallback():
+    """The controlled materializer consumes the real parser's bounded fallback."""
+    comment, _fingerprint = _fallback_authority_fixture()
+    with patch.object(_materializer_mod, "_load_contract_parser", return_value=_parser_mod):
+        with patch.object(
+            _materializer_mod,
+            "_fetch_comments_with_identity",
+            return_value=[comment],
+        ):
+            with patch.object(
+                _materializer_mod,
+                "compute_allowed_paths_sha256",
+                return_value="b" * 64,
+            ):
+                with patch("builtins.__import__", side_effect=_reject_yaml_import):
+                    source_id, source_body, ordered_bodies = (
+                        _materializer_mod._validate_contract_source(
+                            gh_bin="gh",
+                            repo=_REPO,
+                            issue_number=_ISSUE_NUMBER,
+                            contract_snapshot_url=comment["html_url"],
+                            issue_body=_SAMPLE_BODY,
+                            base_ref="main",
+                            base_sha="a" * 40,
+                            allowed_paths=["README.md"],
+                            project_root=_HERE.parents[3],
+                            env={},
+                        )
+                    )
+
+    assert source_id == str(comment["id"])
+    assert source_body == comment["body"]
+    assert ordered_bodies == [comment["body"]]
 
 
 def test_all_snapshot_consumers_reject_untrusted_go():
