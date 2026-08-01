@@ -65,6 +65,45 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # import し、per-command timeout の単一の正本として参照する（drift防止）。
 from baseline_vc_preflight import DEFAULT_TIMEOUT_SECONDS as _VC_PREFLIGHT_PER_COMMAND_TIMEOUT  # noqa: E402
 
+# Issue #1914: reuse the existing strict resolver (no new YAML parser /
+# allowlist) to determine whether the target Issue is a canonical parent
+# with parent_mode: delivery-rollup and no `## Verification Commands`
+# section, so Step 5 below can skip baseline_vc_preflight.py for that case
+# (mirrors #1878's skip inside contract_readiness_check.py's own
+# execute-mode call, but must be re-derived here because Step 5 invokes
+# baseline_vc_preflight.py directly and independently of that internal skip).
+_CREATE_ISSUE_SCRIPTS_DIR = _SCRIPTS_DIR.parent.parent / "create-issue" / "scripts"
+if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS_DIR))
+
+from baseline_vc_preflight import extract_verification_commands_section  # noqa: E402
+from contract_readiness_check import (  # noqa: E402
+    fetch_body_from_github,
+    resolve_existing_issue_validation_profile,
+)
+from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
+
+_DELIVERY_ROLLUP_PARENT_MODE = "delivery-rollup"
+_DELIVERY_ROLLUP_SKIP_REASON_CODE = "delivery_rollup_parent_without_verification_commands"
+
+
+def _is_delivery_rollup_parent_without_vc_section(body: str) -> bool:
+    """Issue #1914: True iff body is a canonical parent (issue_kind: parent)
+    with parent_mode: delivery-rollup and no `## Verification Commands`
+    section. Reuses resolve_existing_issue_validation_profile (the same
+    strict resolver contract_readiness_check.py already uses) — no new
+    YAML parser or allowlist is introduced."""
+    resolution = resolve_existing_issue_validation_profile(body)
+    if resolution.status != "profile" or resolution.canonical_issue_kind != "parent":
+        return False
+    parsed = parse_machine_readable_contract(body)
+    if not parsed.ok or not isinstance(parsed.data, dict):
+        return False
+    parent_mode = parsed.data.get("parent_mode")
+    if parent_mode != _DELIVERY_ROLLUP_PARENT_MODE:
+        return False
+    return not bool(extract_verification_commands_section(body))
+
 # Issue #1333 AC2: _VC_PREFLIGHT_TIMEOUT は per-command timeout の named
 # constant から関係式として導出する（単純な独立リテラル引き上げは禁止）。
 # _VC_PREFLIGHT_MAX_COMMAND_BUDGET: Issue #1333 の暫定的な wrapper timeout
@@ -567,6 +606,31 @@ def run_once(
     else:
         # not_applicable → treat as pass
         result["checks"]["product_spec"] = "pass"
+
+    # Step 4.5 (Issue #1914): delivery-rollup parent applicability check.
+    # A canonical parent Issue (issue_kind: parent) with
+    # parent_mode: delivery-rollup and no `## Verification Commands`
+    # section is exempt from the Final Gate's baseline_vc_preflight
+    # requirement (OWNER decision, Issue #1890 / #1914). baseline_vc_preflight.py
+    # itself is not modified; Step 5 below is simply not invoked for this case.
+    delivery_rollup_body, delivery_rollup_body_err = fetch_body_from_github(issue_number, repo)
+    if delivery_rollup_body_err:
+        result["errors"].append(
+            f"delivery_rollup_applicability_check_error: {delivery_rollup_body_err}"
+        )
+        # non-fatal: fall through to the normal Step 5 execution path below.
+    elif delivery_rollup_body is not None and _is_delivery_rollup_parent_without_vc_section(
+        delivery_rollup_body
+    ):
+        result["checks"]["vc_preflight"] = "not_applicable"
+        result["vc_preflight_status"] = "not_applicable"
+        result["vc_preflight_classifications"] = []
+        result["checks"]["declared_path_overlap"] = _run_declared_path_overlap_check(
+            issue_number, repo
+        )
+        result["status"] = "go"
+        result["source"] = _DELIVERY_ROLLUP_SKIP_REASON_CODE
+        return result
 
     # Step 5: baseline_vc_preflight.py (run in all modes)
     vc_command = [
