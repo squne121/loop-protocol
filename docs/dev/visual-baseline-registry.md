@@ -270,13 +270,30 @@ HUD 構成要素（Hull/Kills/Elapsed/Weapon/Assist/Pause のみの compact pane
   （Linux, Playwright chromium, `tests/e2e/visual.freeze.css` の generic `sans-serif` 固定込み）
   で `playwright test --update-snapshots` により baseline を再生成した。#1374 の前例
   （本ファイル上記セクション）で観測された CI runner とのフォント fallback 差に起因する
-  追加 diff が本 PR でも再発する場合は、CI 実行結果の `test-results` artifact から
-  `*-actual.png` を取得し、それを最終 baseline として採用する同じ運用に従う。
+  追加 diff が本 PR の CI 実行（run id `30693615617`, job id `91352588428`, e2e job,
+  head sha `b328589b5acd25b2df688b8704d0d8da7e428a95`）で 9 件（`m2-running-hud-baseline` /
+  `title-menu` / `load-menu-empty` / `load-menu-available` / `load-menu-failure` /
+  `preparation-default` / `preparation-upgrade-available` / `running-minimal-hud` /
+  `vrt-running-hud-overlay`）再発したため、CI 実行結果の `test-results` artifact
+  （artifact id `8816541152`）から該当する `*-actual.png` を取得し、それを最終 baseline
+  として採用した（CI 環境自身が描画した画像を人間承認済みの Scope Delta commit として
+  反映する運用。CI が自動で baseline を書き換えるわけではない — §4「自動更新の禁止」に
+  抵触しない）。差分は目視確認の上、font-rasterization / 環境差、または AC1/AC2 が要求する
+  意図した仕様変更の副作用であり、意図しない退行の固定化ではないことを確認した
+  （§4 checklist 適用）。
 - **maturity**: 変更なし（`running-hud` は `legacy-current`、`running-hud-overlay-legacy-current`
   も `legacy-current` のまま）。`frozen` 化条件（#1376/#1377 マージ後）は本更新の対象外。
 - **tolerance**: `running-hud` は `maxDiffPixelRatio: 0.08` から `maxDiffPixels: 150` へ変更
   （capture root が単一 field から複数 field を含むパネルへ拡張されたため）。
   `running-hud-overlay-legacy-current` の `maxDiffPixels: 100` は変更なし。
+- **environment fingerprint**: 最終的に採用した baseline（上記 9 件）は CI 実行環境
+  （GitHub Actions ubuntu runner, Chromium, Playwright config 既定 viewport,
+  `tests/e2e/visual.freeze.css` の generic `sans-serif` 固定込み, run id `30693615617`,
+  job id `91352588428`）で生成された画像そのものである。以降の CI 再実行
+  （同一コミット・同一 runner image 前提）でこの baseline との一致が期待される
+  （`title-menu` / `load-menu-*` / `preparation-*` / `running-minimal-hud` は
+  `phase-screens.spec.ts` の既存 baseline であり、本 Issue の AC1/AC2 実装による
+  combat HUD 再配置に伴う周辺レイアウト・フォント差分の再取得として扱う）。
 
 ## 4. baseline update policy（更新ポリシー）
 
