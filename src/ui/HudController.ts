@@ -279,28 +279,28 @@ export function createHudController(
       // -----------------------------------------------------------------
       // Combat HUD (data-combat-hud, running only) — AC2, AC3, AC4, AC6
       // -----------------------------------------------------------------
-      const combatView = buildCombatHudViewModel(state, isPaused, activeFixedDeltaMs)
+      const combatHudViewModel = buildCombatHudViewModel(state, isPaused, activeFixedDeltaMs)
 
-      combatHudHull.textContent = combatView.hullLabel
-      combatHudKills.textContent = `${combatView.kills}`
+      combatHudHull.textContent = combatHudViewModel.hullLabel
+      combatHudKills.textContent = `${combatHudViewModel.kills}`
       // AC4: derived from elapsedTicks * activeFixedDeltaMs — never masked
       // for VRT (Timer / Volatile Text Policy: this IS the display
       // authority, unlike the legacy elapsedTicks/60 approximation below).
-      combatHudElapsed.textContent = combatView.elapsedLabel
+      combatHudElapsed.textContent = combatHudViewModel.elapsedLabel
       combatHudElapsed.removeAttribute('data-visual-mask')
-      combatHudWeapon.textContent = combatView.weaponLabel
+      combatHudWeapon.textContent = combatHudViewModel.weaponLabel
 
-      assistPlayerButton.disabled = combatView.assistDisabled
+      assistPlayerButton.disabled = combatHudViewModel.assistDisabled
       // AC6: Assist is the sole live-region field in the combat HUD; Hull /
       // Kills / Elapsed / Weapon are updated in place, not inside a
       // role="status" region.
-      combatHudAssistStatus.textContent = combatView.assistStatus
+      combatHudAssistStatus.textContent = combatHudViewModel.assistStatus
 
       // AC3: visible label is fixed ("Pause"); aria-pressed represents the
       // toggle state instead of swapping the accessible name.
       togglePauseButton.textContent = 'Pause'
-      togglePauseButton.setAttribute('aria-pressed', combatView.paused ? 'true' : 'false')
-      togglePauseButton.disabled = combatView.pauseDisabled
+      togglePauseButton.setAttribute('aria-pressed', combatHudViewModel.paused ? 'true' : 'false')
+      togglePauseButton.disabled = combatHudViewModel.pauseDisabled
 
       // -----------------------------------------------------------------
       // Legacy result/debrief compatibility surface — hidden during
