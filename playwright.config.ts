@@ -65,6 +65,10 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   /* Retry on CI only */
   retries: process.env.CI ? 1 : 0,
+  /* Required CI is read-only. Local runs retain Playwright's normal missing
+   * snapshot behaviour, while the explicit test:vrt:update:e2e script is the
+   * only candidate-generation entry point. */
+  updateSnapshots: process.env.CI ? 'none' : 'missing',
   /* One worker for consistent simulation timing */
   workers: 1,
   /* Reporter to use.

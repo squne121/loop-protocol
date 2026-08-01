@@ -26,6 +26,7 @@
     "test:e2e:preview-namespace": "rm -rf dist && pnpm build && LOOP_E2E_PREVIEW_NAMESPACE_LANE=true playwright test",
     "test:vrt": "VITE_E2E_MODE=true pnpm build && LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts",
     "test:vrt:e2e": "LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts",
+    "test:vrt:update:e2e": "VITE_E2E_MODE=true pnpm build && LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts --update-snapshots=all",
     "playwright:install": "playwright install",
     "playwright:install:ci": "playwright install --with-deps chromium",
     "policy:check:secret": "uv run --locked python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md",
