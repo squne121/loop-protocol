@@ -135,6 +135,7 @@ def render_command(command_id: str, values: dict[str, object]) -> list[str]:
         """from __future__ import annotations
 import argparse
 import json
+import os
 from pathlib import Path
 
 parser = argparse.ArgumentParser()
@@ -254,43 +255,52 @@ if __name__ == "__main__":
 """,
     )
 
-    fake_bin = repo_root / "fake-bin"
     _write_text(
-        fake_bin / "gh",
-        """#!/usr/bin/env python3
+        next((repo_root / ".venv").glob("lib/python*/site-packages")) / "sitecustomize.py",
+        """# Fixture-only external GitHub boundary for subprocess tests.
 import json
-import sys
 from pathlib import Path
+import subprocess
+import sys
 
-ROOT = Path.cwd()
-ARTIFACT = ROOT / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
-STATE = ARTIFACT / "fake_remote_issue.json"
-ANCHOR = ARTIFACT / "fake_anchor.json"
-CALLS = ARTIFACT / "fake_gh_calls.jsonl"
+_real_run = subprocess.run
 
 
-def emit(value):
-    print(json.dumps(value))
-    return 0
+def _fake_gh(args, *positional, **kwargs):
+    if not isinstance(args, (list, tuple)) or not args:
+        return _real_run(args, *positional, **kwargs)
+    executable = Path(str(args[0])).name
+    if executable == "uv":
+        child_env = dict(kwargs.get("env") or os.environ)
+        child_env["PYTHONPATH"] = str(Path(__file__).parent)
+        kwargs["env"] = child_env
+        return _real_run(args, *positional, **kwargs)
+    if executable != "gh":
+        return _real_run(args, *positional, **kwargs)
+    artifact = Path.cwd() / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    state = artifact / "fake_remote_issue.json"
+    anchor = artifact / "fake_anchor.json"
+    calls = artifact / "fake_gh_calls.jsonl"
+    argv = [str(value) for value in args[1:]]
+    calls.parent.mkdir(parents=True, exist_ok=True)
+    with calls.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(argv) + "\\n")
+    if argv[:2] == ["issue", "view"]:
+        payload = json.loads(state.read_text(encoding="utf-8"))
+    elif argv[:1] == ["api"] and argv[1].startswith(
+        "repos/squne121/loop-protocol/issues/1498/comments?"
+    ):
+        payload = [[json.loads(anchor.read_text(encoding="utf-8"))]]
+    elif argv[:2] == ["api", "repos/squne121/loop-protocol/issues/comments/1"]:
+        payload = json.loads(anchor.read_text(encoding="utf-8"))
+    else:
+        return subprocess.CompletedProcess(args, 2, "", "unexpected fake gh argv")
+    return subprocess.CompletedProcess(args, 0, json.dumps(payload) + "\\n", "")
 
-
-args = sys.argv[1:]
-CALLS.parent.mkdir(parents=True, exist_ok=True)
-with CALLS.open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps(args) + "\\n")
-if args[:2] == ["issue", "view"]:
-    emit(json.loads(STATE.read_text(encoding="utf-8")))
-elif args[:1] == ["api"] and args[1].startswith("repos/squne121/loop-protocol/issues/1498/comments?"):
-    emit([[json.loads(ANCHOR.read_text(encoding="utf-8"))]])
-elif args[:2] == ["api", "repos/squne121/loop-protocol/issues/comments/1"]:
-    emit(json.loads(ANCHOR.read_text(encoding="utf-8")))
-else:
-    print("unexpected fake gh argv", file=sys.stderr)
-    raise SystemExit(2)
+subprocess.run = _fake_gh
 """,
     )
-    (fake_bin / "gh").chmod(0o755)
-    return fake_bin
+    return
 
     _write_text(
         repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "command_registry.py",
@@ -484,13 +494,14 @@ def _run_executor(
     anchor_comment_url: "str | None" = _VALID_URL,
     extra_args: "list[str] | None" = None,
     extra_env: "dict[str, str] | None" = None,
-    fake_gh: "Path | None" = None,
+    use_fixture_runtime: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo)}
     if extra_env:
         env.update(extra_env)
+    runtime = ["uv", "run", "--locked", "python3"] if use_fixture_runtime else [sys.executable]
     argv = [
-        sys.executable,
+        *runtime,
         "scripts/agent-guards/skill_runtime_exec.py",
         "--command-id",
         command_id,
@@ -503,38 +514,6 @@ def _run_executor(
         argv += ["--anchor-comment-url", anchor_comment_url]
     if extra_args:
         argv += extra_args
-    if fake_gh is not None:
-        # `skill_runtime_exec.py` intentionally permits only trusted system
-        # PATH entries.  Mount the fake executable over that trusted `gh`
-        # path inside a private user+mount namespace, so the executed
-        # registry/policy/executor/wrapper files remain byte-identical
-        # production files and the host's gh binary is never modified.
-        runner = repo / "fixture_mount_fake_gh.py"
-        _write_text(
-            runner,
-            """from __future__ import annotations
-
-import os
-import subprocess
-import sys
-
-fake_gh, command = sys.argv[1], sys.argv[2:]
-subprocess.run(["/usr/bin/mount", "--bind", fake_gh, "/usr/bin/gh"], check=True)
-os.execvp(command[0], command)
-""",
-        )
-        argv = [
-            "unshare",
-            "--user",
-            "--map-root-user",
-            "--mount",
-            "--propagation",
-            "private",
-            sys.executable,
-            str(runner),
-            str(fake_gh),
-            *argv,
-        ]
     return subprocess.run(
         argv,
         cwd=str(repo),
@@ -643,12 +622,12 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
 
     This runs the real registry, policy, privileged executor,
     ``run_refinement_preflight.py``, planner, candidate readiness, review,
-    and ``edit_issue_txn.py`` in a temporary git repository.  Only GitHub
-    and the controlled mutation executable are faked, in a private mount
-    namespace; no fixture replaces the phase wrapper.
+    and ``edit_issue_txn.py`` in a temporary git repository. Only GitHub
+    and the controlled mutation executable are faked; no fixture replaces
+    the phase wrapper or changes the executor's production PATH trust.
     """
     repo = _make_repo(tmp_path)
-    fake_bin = _install_real_contract_update_fixture(repo)
+    _install_real_contract_update_fixture(repo)
     # Canonical repositories provision this approved transaction-local
     # workspace.  Create it before the executor's before-snapshot; the real
     # consumer removes its candidate/input files before the child returns.
@@ -692,7 +671,7 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     first = _run_executor(
         repo,
         command_id="contract_update.run.with_anchor",
-        fake_gh=fake_bin / "gh",
+        use_fixture_runtime=True,
     )
     assert first.returncode == 0, first.stderr
     request = json.loads((artifact_dir / "controlled_transaction_request.json").read_text())
@@ -722,7 +701,7 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     replay = _run_executor(
         repo,
         command_id="contract_update.run.with_anchor",
-        fake_gh=fake_bin / "gh",
+        use_fixture_runtime=True,
     )
     assert replay.returncode == 0, replay.stderr
     replay_result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
