@@ -84,6 +84,9 @@ def _default_artifact_dir() -> Path:
     return Path(".claude/artifacts/issue-refinement-loop")
 
 
+_CANONICAL_ARTIFACT_DIR = Path(".claude/artifacts/issue-refinement-loop")
+
+
 def _validate_artifact_path(path: str | Path) -> Path:
     """
     Validate artifact path component: reject .. and absolute paths.
@@ -100,19 +103,60 @@ def _validate_artifact_path(path: str | Path) -> Path:
     return p
 
 
-def _validate_artifact_containment(artifact_path: Path, repo_root: Path) -> None:
+def _validate_artifact_containment(artifact_path: Path, repo_root: Path) -> Path:
     """
     Validate that the resolved artifact path is contained within the expected base directory.
 
     Uses Path.resolve() to follow symlinks and eliminate '..' before checking containment.
     Raises ValueError if the resolved path escapes the base directory.
     """
-    base = (repo_root / ".claude/artifacts/issue-refinement-loop").resolve()
+    root = repo_root.resolve()
+    base = (root / _CANONICAL_ARTIFACT_DIR).resolve()
+    if not base.is_relative_to(root):
+        raise ValueError("artifact base escapes repository root")
     resolved = artifact_path.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError("artifact path escapes base directory")
     if not resolved.is_relative_to(base):
-        raise ValueError(
-            f"Artifact path escapes base directory: resolved={resolved}, base={base}"
-        )
+        raise ValueError("artifact path escapes base directory")
+    return resolved
+
+
+def _artifact_path_and_wire(
+    artifact_dir: Path,
+    issue_slot: str,
+    filename: str,
+    repo_root: Path | None,
+) -> tuple[Path, str]:
+    """Return a checked filesystem path and a canonical lexical wire path."""
+    if repo_root is None:
+        path = artifact_dir / issue_slot / filename
+        return path, path.as_posix()
+
+    root = repo_root.resolve()
+    canonical_base = root / _CANONICAL_ARTIFACT_DIR
+    if ".." in artifact_dir.parts:
+        raise ValueError("artifact_dir_not_canonical")
+    if artifact_dir.is_absolute():
+        supplied_base = artifact_dir
+    else:
+        supplied_base = root / artifact_dir
+    if supplied_base != canonical_base:
+        raise ValueError("artifact_dir_not_canonical")
+
+    _reject_canonical_symlink_components(root, issue_slot)
+    wire_path = (_CANONICAL_ARTIFACT_DIR / issue_slot / filename).as_posix()
+    path = root / wire_path
+    _validate_artifact_containment(path, root)
+    return path, wire_path
+
+
+def _safe_failure_detail(detail: str) -> str:
+    """Avoid persisting absolute host paths in a failure artifact."""
+    value = str(detail)
+    if "/" in value or "\\" in value:
+        return "producer failure (path detail redacted)"
+    return value[:240]
 
 
 def _validate_issue_slot(slot: str) -> None:
@@ -121,9 +165,43 @@ def _validate_issue_slot(slot: str) -> None:
         raise ValueError(f"Invalid issue slot: {slot!r}")
 
 
-def _atomic_write(path: Path, content: bytes) -> None:
+def _positive_issue_number(value: str) -> int:
+    """Parse the producer's required positive issue-number CLI argument."""
+    try:
+        issue_number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if issue_number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return issue_number
+
+
+def _reject_canonical_symlink_components(root: Path, issue_slot: str) -> None:
+    """Reject existing symlinks in the canonical artifact hierarchy."""
+    current = root
+    for component in (*_CANONICAL_ARTIFACT_DIR.parts, issue_slot):
+        current = current / component
+        try:
+            os.lstat(current)
+        except FileNotFoundError:
+            continue
+        if os.path.islink(current):
+            raise ValueError("artifact_symlink_component_rejected")
+
+
+def _atomic_write(
+    path: Path,
+    content: bytes,
+    *,
+    canonical_root: Path | None = None,
+    issue_slot: str | None = None,
+) -> None:
     """Write content atomically with 0600 permissions."""
+    if canonical_root is not None and issue_slot is not None:
+        _reject_canonical_symlink_components(canonical_root, issue_slot)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if canonical_root is not None and issue_slot is not None:
+        _reject_canonical_symlink_components(canonical_root, issue_slot)
     fd, tmp_path = tempfile.mkstemp(dir=path.parent)
     try:
         os.chmod(tmp_path, 0o600)
@@ -194,7 +272,7 @@ def _write_failure_artifact(
     detail: str,
     repo_root: Path | None = None,
     extra: "dict[str, Any] | None" = None,
-) -> "tuple[Path, str]":
+) -> "tuple[Path, str, str]":
     """
     Write a PRODUCER_FAILURE_V1 artifact and return (path, sha256).
 
@@ -204,25 +282,29 @@ def _write_failure_artifact(
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     slot = str(issue_number) if issue_number else "unknown"
     _validate_issue_slot(slot)
-    # AC7: use canonical base when repo_root is provided
-    if repo_root is not None:
-        base = repo_root / ".claude" / "artifacts" / "issue-refinement-loop"
-    else:
-        base = artifact_dir
-    artifact_subdir = base / slot
-    artifact_path = artifact_subdir / f"producer_failure_{reason_code}_{ts}.json"
+    artifact_path, wire_path = _artifact_path_and_wire(
+        artifact_dir,
+        slot,
+        f"producer_failure_{reason_code}_{ts}.json",
+        repo_root,
+    )
     payload: "dict[str, Any]" = {
         "schema": "PRODUCER_FAILURE_V1",
         "generated_at": ts,
         "reason_code": reason_code,
-        "detail": str(detail),
+        "detail": _safe_failure_detail(detail),
     }
     if extra:
         payload.update(extra)
     content = _strict_json_dumps(payload, indent=2).encode("utf-8")
     sha256 = hashlib.sha256(content).hexdigest()
-    _atomic_write(artifact_path, content)
-    return artifact_path, sha256
+    _atomic_write(
+        artifact_path,
+        content,
+        canonical_root=repo_root,
+        issue_slot=slot,
+    )
+    return artifact_path, wire_path, sha256
 
 
 def _emit_failure_envelope(
@@ -247,13 +329,15 @@ def _emit_failure_envelope(
     artifact_ref = "producer_failure_v1=<write_failed>"
     artifact_sha256 = "write_failed"
     try:
-        artifact_path, sha256 = _write_failure_artifact(
+        if repo_root is None and artifact_dir.is_absolute():
+            raise ValueError("absolute_artifact_dir_requires_repo_root")
+        _artifact_path, wire_path, sha256 = _write_failure_artifact(
             artifact_dir, issue_number, reason_code, detail, repo_root, extra
         )
-        artifact_ref = f"producer_failure_v1={artifact_path}"
+        artifact_ref = f"producer_failure_v1={wire_path}"
         artifact_sha256 = sha256
     except Exception:
-        pass  # Artifact write failed; emit envelope with write_failed sentinel
+        pass
 
     lines = [
         "STATUS: failed",
@@ -347,13 +431,13 @@ def compact_review_result(
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     slot = str(issue_number) if issue_number else "unknown"
     _validate_issue_slot(slot)
-    artifact_subdir = artifact_dir / slot
     artifact_filename = f"compact_review_result_{ts}.json"
-    artifact_path = artifact_subdir / artifact_filename
-
-    # B4: containment check — resolve symlinks and verify artifact stays under base
-    if repo_root is not None:
-        _validate_artifact_containment(artifact_path, repo_root)
+    artifact_path, wire_artifact_path = _artifact_path_and_wire(
+        artifact_dir,
+        slot,
+        artifact_filename,
+        repo_root,
+    )
 
     # Build full artifact JSON (contains full structured data, never returned raw to main context)
     full_artifact: dict[str, Any] = {
@@ -406,8 +490,8 @@ def compact_review_result(
         "BLOCKERS": str(blockers_count),
         "NEXT_ACTION": next_action,
         "MUST_READ": "",
-        "EVIDENCE": str(artifact_path),
-        "ARTIFACT": f"compact_review_result_v1={artifact_path}",
+        "EVIDENCE": wire_artifact_path,
+        "ARTIFACT": f"compact_review_result_v1={wire_artifact_path}",
         "REVIEWED_BODY_SHA256": reviewed_body_sha256,
     }
 
@@ -447,8 +531,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--issue-number",
-        type=int,
-        default=None,
+        type=_positive_issue_number,
+        required=True,
         help="Issue number for artifact sub-directory",
     )
     parser.add_argument(
@@ -458,6 +542,22 @@ def main() -> int:
         help="Repository root for artifact containment check (B4)",
     )
     args = parser.parse_args()
+
+    # Without an explicit root, retain the established default invocation
+    # only.  Arbitrary relative paths would let the producer emit wire values
+    # that the validator correctly rejects.
+    if args.repo_root is None and args.artifact_dir != _CANONICAL_ARTIFACT_DIR:
+        _emit_failure_envelope(
+            reason_code="schema_mismatch",
+            next_action="human_judgment_required",
+            detail="artifact_dir_not_canonical_without_repo_root",
+            artifact_dir=_CANONICAL_ARTIFACT_DIR,
+            issue_number=args.issue_number,
+            repo_root=Path.cwd(),
+        )
+        return 2
+
+    effective_repo_root = args.repo_root or Path.cwd()
 
     # Read input
     try:
@@ -473,7 +573,7 @@ def main() -> int:
             detail=f"JSON parse error: {e}",
             artifact_dir=args.artifact_dir,
             issue_number=args.issue_number,
-            repo_root=args.repo_root,
+            repo_root=effective_repo_root,
         )
         return 2
     except Exception as e:
@@ -483,7 +583,7 @@ def main() -> int:
             detail=f"Input read error: {e}",
             artifact_dir=args.artifact_dir,
             issue_number=args.issue_number,
-            repo_root=args.repo_root,
+            repo_root=effective_repo_root,
         )
         return 2
 
@@ -493,7 +593,7 @@ def main() -> int:
             raw_result,
             artifact_dir=args.artifact_dir,
             issue_number=args.issue_number,
-            repo_root=args.repo_root,
+            repo_root=effective_repo_root,
         )
     except (ValueError, _jsonschema.ValidationError, OSError) as e:
         _emit_failure_envelope(
@@ -502,7 +602,7 @@ def main() -> int:
             detail=str(e),
             artifact_dir=args.artifact_dir,
             issue_number=args.issue_number,
-            repo_root=args.repo_root,
+            repo_root=effective_repo_root,
         )
         return 2
 
@@ -516,7 +616,7 @@ def main() -> int:
             detail=f"secret-like strings detected in stdout: {violations}",
             artifact_dir=args.artifact_dir,
             issue_number=args.issue_number,
-            repo_root=args.repo_root,
+            repo_root=effective_repo_root,
         )
         return 2
 
@@ -550,7 +650,23 @@ def main() -> int:
         return 2
 
     # Budget OK: now write success artifact atomically
-    _atomic_write(artifact_path, artifact_content)
+    try:
+        _atomic_write(
+            artifact_path,
+            artifact_content,
+            canonical_root=effective_repo_root,
+            issue_slot=str(args.issue_number),
+        )
+    except OSError as e:
+        _emit_failure_envelope(
+            reason_code="schema_mismatch",
+            next_action="human_judgment_required",
+            detail=str(e),
+            artifact_dir=args.artifact_dir,
+            issue_number=args.issue_number,
+            repo_root=effective_repo_root,
+        )
+        return 2
 
     # Output compact lines
     for line in stdout_lines:
