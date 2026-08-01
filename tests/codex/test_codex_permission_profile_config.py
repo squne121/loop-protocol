@@ -47,6 +47,9 @@ PR_ARTIFACT_DIR = ARTIFACT_DIR / "pr-1864"
 
 READONLY_PROFILE = "loop-protocol-readonly"
 WRITE_PROFILE = "loop-protocol-rtk"
+# Issue #1915: web-researcher-only profile -- filesystem read-only like
+# READONLY_PROFILE, but with a widened outbound web domain allowlist.
+WEB_RESEARCH_PROFILE = "loop-protocol-web-research"
 ROOT_DEFAULT_PROFILE = "loop-protocol-personal-dev"
 ROOT_DEFAULT_EXTENDS = ":workspace"
 
@@ -231,7 +234,7 @@ def test_agent_profile_declarations_remain_valid() -> None:
             agent = tomllib.load(handle)
         actual = agent.get("default_permissions")
         expected_profile = expected["default_permissions"]
-        assert expected_profile in {READONLY_PROFILE, WRITE_PROFILE}, (
+        assert expected_profile in {READONLY_PROFILE, WRITE_PROFILE, WEB_RESEARCH_PROFILE}, (
             f"{agent_name}: fixture default_permissions must be a repo-defined profile, got {expected_profile!r}"
         )
         assert actual == expected_profile, (
