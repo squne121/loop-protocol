@@ -325,11 +325,22 @@ if (app) {
         </div>
         <p class="battle-stage__copy">WASD to reposition. Hold pointer down to pressure the firing lane.</p>
       </div>
-      <canvas class="battle-stage__canvas" aria-label="Battle arena" tabindex="0"></canvas>
-      <!-- Interactive HUD descendants opt in via data-battle-interactive="true". -->
-      <div class="battle-ui-layer" data-battle-ui-root>
-        <div class="battle-hud-layer" data-battle-layer="hud"></div>
-        <div class="battle-screen-layer" data-battle-layer="screen" hidden inert></div>
+      <!--
+        Issue #1375 PR #1925 review (owner playtest, P0-1): the HUD overlay's
+        containing block must be the Canvas viewport only, never the whole
+        battle-stage (which also contains battle-stage__header). Previously
+        .battle-ui-layer was a direct sibling of .battle-stage__header under
+        .battle-stage's position: relative, so its inset: 0 absolute
+        positioning covered the header too. .battle-stage__viewport is the
+        sole positioned ancestor for canvas + overlay layers now.
+      -->
+      <div class="battle-stage__viewport">
+        <canvas class="battle-stage__canvas" aria-label="Battle arena" tabindex="0"></canvas>
+        <!-- Interactive HUD descendants opt in via data-battle-interactive="true". -->
+        <div class="battle-ui-layer" data-battle-ui-root>
+          <div class="battle-hud-layer" data-battle-layer="hud"></div>
+          <div class="battle-screen-layer" data-battle-layer="screen" hidden inert></div>
+        </div>
       </div>
     </section>
     <aside class="command-rail" aria-label="Command rail"></aside>
@@ -396,6 +407,17 @@ const renderer = canvas ? createCanvasRenderer(canvas) : null
 // Product pause state (runtime-local, not persisted) — AC10, AC11
 const productPause = createProductPauseState()
 const inputState = createInputState()
+
+/**
+ * Fixed simulation timestep currently driving `state.sortie.elapsedTicks`
+ * (Issue #1375, AC4). Runtime-local (not part of `GameState.sortie` — Out
+ * of Scope) so the combat HUD's Elapsed timer can be derived as
+ * `elapsedTicks * activeFixedDeltaMs` instead of `elapsedTicks / 60` or
+ * wall-clock time. Defaults to the production simulation config and is
+ * overridden only by a deterministic 'running' visual scenario fixture
+ * (`applyVisualScenarioFixture()` below), never by ordinary gameplay.
+ */
+let activeFixedDeltaMs = defaultSimulationConfig.fixedDeltaMs
 
 // Issue #1282: M4 minimal upgrade catalog only has a single definition
 // (weapon_power_plus_1). HUD upgrade purchase surface targets it directly;
@@ -594,6 +616,9 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
     if (!started) {
       return
     }
+    // AC4: combat HUD Elapsed timer uses the production simulation timestep
+    // for an ordinary (non-fixture) sortie.
+    activeFixedDeltaMs = defaultSimulationConfig.fixedDeltaMs
     setHudFeedback('Sortie started.', 'Preparation controls are now locked until result.')
   },
   onSave() {
@@ -636,7 +661,7 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
       },
       renderHud() {
         syncBattleOverlayLayout()
-        hud?.render(state, productPause.isPaused)
+        hud?.render(state, productPause.isPaused, activeFixedDeltaMs)
         phaseScreens?.render(state, buildUpgradeView())
       },
     })
@@ -882,6 +907,10 @@ function applyVisualScenarioFixture(fixture: VisualScenarioFixture): void {
   state.progress.weaponPower = fixture.progress.weaponPower
   state.telemetry.status = fixture.telemetry.status
   state.telemetry.lastCommandSummary = fixture.telemetry.summary
+  // AC4/AC8: the fixture's fixedDeltaMs becomes the combat HUD's Elapsed
+  // timer authority for this scenario (elapsedTicks * activeFixedDeltaMs),
+  // overriding the production defaultSimulationConfig.fixedDeltaMs value.
+  activeFixedDeltaMs = fixture.sortie.fixedDeltaMs
 
   if (fixture.sortie.status === 'timeout') {
     state.sortie = {
@@ -1042,7 +1071,7 @@ function frame(now: number): void {
 
   // AC4: render and HUD continue regardless of pause state
   syncBattleOverlayLayout()
-  hud.render(state, productPause.isPaused)
+  hud.render(state, productPause.isPaused, activeFixedDeltaMs)
   phaseScreens?.render(state, buildUpgradeView())
   renderer.render(state)
   window.requestAnimationFrame(frame)
@@ -1092,6 +1121,7 @@ function maybeAutoStartRuntime(): void {
 
   if (state.loopPhase === 'preparation' && state.sortie.status === 'idle') {
     startSortie(state, defaultSimulationConfig.fixedDeltaMs)
+    activeFixedDeltaMs = defaultSimulationConfig.fixedDeltaMs
   }
 }
 

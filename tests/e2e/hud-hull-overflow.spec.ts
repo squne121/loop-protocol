@@ -27,7 +27,10 @@ import { test, expect, type Page } from '@playwright/test'
  */
 async function injectHullText(page: Page, text: string): Promise<void> {
   await page.evaluate((hullText) => {
-    const hpEl = document.querySelector<HTMLElement>('[data-field="hp"]')
+    // Scope Delta (Issue #1375): the Hull field moved from
+    // `[data-field="hp"]` (all phases) to `[data-field="combat-hud-hull"]`
+    // inside the running-only `data-combat-hud` root.
+    const hpEl = document.querySelector<HTMLElement>('[data-field="combat-hud-hull"]')
     if (hpEl) {
       hpEl.textContent = hullText
     }
@@ -124,6 +127,15 @@ const HULL_VALUES = [
 // Tests
 // ---------------------------------------------------------------------------
 
+// Issue #1375 PR #1925 review (owner playtest, P0-3): the AC7 desktop
+// resolutions from the Issue body were never covered by an automated
+// viewport matrix. Added alongside the existing AC2 overflow matrix.
+const GEOMETRY_VIEWPORTS = [
+  ...VIEWPORTS,
+  { width: 1366, height: 768, label: '1366x768' },
+  { width: 1920, height: 1080, label: '1920x1080' },
+]
+
 test.describe('hud overflow: stat-grid dd does not overflow in any viewport', () => {
   for (const vp of VIEWPORTS) {
     for (const hullText of HULL_VALUES) {
@@ -135,8 +147,8 @@ test.describe('hud overflow: stat-grid dd does not overflow in any viewport', ()
 
         // Navigate to app
         await page.goto('/')
-        // Wait for HUD to be rendered (data-field="hp" must be present)
-        await page.waitForSelector('[data-field="hp"]', { timeout: 10_000 })
+        // Wait for HUD to be rendered (data-field="combat-hud-hull" must be present)
+        await page.waitForSelector('[data-field="combat-hud-hull"]', { timeout: 10_000 })
 
         // Inject large hull text (AC2a)
         await injectHullText(page, hullText)
@@ -163,5 +175,258 @@ test.describe('hud overflow: stat-grid dd does not overflow in any viewport', ()
         ).toBe(false)
       })
     }
+  }
+})
+
+// ---------------------------------------------------------------------------
+// AC7 (Issue #1375 PR #1925 review, owner playtest, P0-3): the combat HUD's
+// bounding box must stay inside the Canvas viewport (not the header) with a
+// 16px safe margin, never overlap the header rect, and both Assist allies
+// and Pause must stay in the viewport together, across desktop resolutions.
+// ---------------------------------------------------------------------------
+
+const HUD_SAFE_MARGIN_PX = 16
+
+interface Rect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+function rectsIntersect(a: Rect, b: Rect): boolean {
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y
+}
+
+/** Asserts `inner` is fully contained within `outer` expanded by `margin` on every side. */
+function assertWithinSafeMargin(inner: Rect, outer: Rect, margin: number, label: string): void {
+  expect(inner.x, `${label}: left edge inside safe margin`).toBeGreaterThanOrEqual(outer.x - margin)
+  expect(inner.y, `${label}: top edge inside safe margin`).toBeGreaterThanOrEqual(outer.y - margin)
+  expect(inner.x + inner.width, `${label}: right edge inside safe margin`).toBeLessThanOrEqual(
+    outer.x + outer.width + margin,
+  )
+  expect(inner.y + inner.height, `${label}: bottom edge inside safe margin`).toBeLessThanOrEqual(
+    outer.y + outer.height + margin,
+  )
+}
+
+async function assertHudGeometry(page: Page, label: string): Promise<void> {
+  const hud = page.locator('[data-combat-hud]')
+  const canvas = page.locator('canvas.battle-stage__canvas')
+  const header = page.locator('.battle-stage__header')
+
+  await expect(hud).toBeVisible()
+
+  const hudBox = await hud.boundingBox()
+  const canvasBox = await canvas.boundingBox()
+  const headerBox = await header.boundingBox()
+
+  expect(hudBox, `${label}: combat HUD must have a bounding box`).not.toBeNull()
+  expect(canvasBox, `${label}: canvas must have a bounding box`).not.toBeNull()
+  expect(headerBox, `${label}: header must have a bounding box`).not.toBeNull()
+
+  if (!hudBox || !canvasBox || !headerBox) {
+    return
+  }
+
+  // HUD is within the Canvas viewport (16px safe margin), not the header
+  // (P0-1: the HUD's containing block is `.battle-stage__viewport`, whose
+  // bounds match the canvas).
+  assertWithinSafeMargin(hudBox, canvasBox, HUD_SAFE_MARGIN_PX, `${label} HUD-in-canvas`)
+
+  // HUD and header never overlap as rectangles.
+  expect(
+    rectsIntersect(hudBox, headerBox),
+    `${label}: HUD box ${JSON.stringify(hudBox)} must not intersect header box ${JSON.stringify(headerBox)}`,
+  ).toBe(false)
+
+  // Assist allies and Pause both stay in the viewport together.
+  await expect(page.getByRole('button', { name: 'Assist allies' })).toBeInViewport()
+  await expect(page.getByRole('button', { name: 'Pause' })).toBeInViewport()
+
+  // HUD element itself has no internal overflow (neither axis).
+  const overflow = await hud.evaluate((el) => ({
+    scrollWidth: el.scrollWidth,
+    clientWidth: el.clientWidth,
+    scrollHeight: el.scrollHeight,
+    clientHeight: el.clientHeight,
+  }))
+  expect(overflow.scrollWidth, `${label}: HUD scrollWidth <= clientWidth`).toBeLessThanOrEqual(
+    overflow.clientWidth,
+  )
+  expect(overflow.scrollHeight, `${label}: HUD scrollHeight <= clientHeight`).toBeLessThanOrEqual(
+    overflow.clientHeight,
+  )
+}
+
+test.describe('hud geometry: combat HUD stays inside the Canvas viewport (AC7)', () => {
+  for (const vp of GEOMETRY_VIEWPORTS) {
+    test(`viewport=${vp.label}: HUD is within canvas bounds, never overlaps header, Assist+Pause in viewport, no internal overflow`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width: vp.width, height: vp.height })
+      await page.goto('/')
+      await page.waitForSelector('[data-combat-hud]', { timeout: 10_000 })
+
+      await assertHudGeometry(page, vp.label)
+    })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Regression case for the owner's actual playtest report: Windows/Chrome,
+// viewport 1437x1365, devicePixelRatio ~= 0.667 (effectively a wider/taller
+// *logical* viewport than the physical display, e.g. OS display scaling
+// below 100%). Playwright cannot emulate OS-level zoom directly, but
+// `deviceScaleFactor` is the closest supported lever and can only be set at
+// browser-context creation, so this test opens its own context rather than
+// reusing the default `page` fixture.
+//
+// Issue #1375 PR #1925 owner playtest (P1, iteration 4): this is an
+// approximation, not a substitute for real evidence. Chromium's
+// `deviceScaleFactor` models device pixel ratio, which is a different
+// mechanism from a real browser's page zoom or the OS's display-scaling
+// setting the owner actually reported (Windows Chrome, ~150% logical vs.
+// physical mismatch). A regression this test misses because the two
+// mechanisms diverge in some edge case would not be caught here — real
+// browser zoom / OS scaling still needs to be re-checked against actual
+// hardware/browser combinations when in doubt, this test only guards
+// against DPR-shaped layout regressions in CI.
+// ---------------------------------------------------------------------------
+
+test.describe('hud geometry: low-DPR regression (owner playtest report)', () => {
+  test('viewport=1437x1365 deviceScaleFactor=0.667 (approx): HUD stays within canvas bounds', async ({
+    browser,
+  }) => {
+    const context = await browser.newContext({
+      viewport: { width: 1437, height: 1365 },
+      // Chromium requires deviceScaleFactor > 0; 0.667 approximates the
+      // owner's report of an effectively higher-resolution logical viewport
+      // than the physical display (DPR below 1).
+      deviceScaleFactor: 0.667,
+    })
+    const page = await context.newPage()
+
+    try {
+      await page.goto('/')
+      await page.waitForSelector('[data-combat-hud]', { timeout: 10_000 })
+
+      await assertHudGeometry(page, 'DPR~0.667 1437x1365')
+    } finally {
+      await context.close()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Owner playtest regression (PR #1925 owner comment
+// https://github.com/squne121/loop-protocol/pull/1925#issuecomment-5151416762,
+// iteration 4, P0): "defeated and could not proceed". Root cause: the
+// `.legacy-result-surface`'s three `.panel` rows (Sortie / Pilot updates /
+// actions=Return to hangar etc.) could overflow `.battle-stage__viewport`'s
+// clipped Canvas height, pushing `[data-action="confirm-result"]` below the
+// fold with no visible affordance that `.battle-hud-layer`'s
+// `overflow-y: auto` scroll was required.
+//
+// Reaches the result phase through the SAME deterministic fixture
+// `tests/e2e/m2-combat-mvp.spec.ts` already uses for its defeat coverage
+// (`__E2E_PLAYER_HP_OVERRIDE__ = 1`: first enemy contact ends the sortie in
+// defeat) — never a DOM/state shortcut into the result phase. Deliberately
+// does NOT call `confirmButton.click()`: Playwright auto-scrolls a click
+// target into view first, which is exactly the behavior that let this bug
+// go undetected by `tests/e2e/m3-loop-mvp.spec.ts` (Issue #1375 Allowed
+// Paths does not include that file, so it is not modified here). Instead
+// this asserts the button's actual rendered geometry directly.
+// ---------------------------------------------------------------------------
+
+const RESULT_ACTION_VIEWPORTS = [
+  { width: 1280, height: 720, label: '1280x720' },
+  { width: 1366, height: 768, label: '1366x768' },
+  { width: 1920, height: 1080, label: '1920x1080' },
+  { width: 1437, height: 1365, label: '1437x1365' },
+  { width: 956, height: 1032, label: '956x1032' },
+]
+
+async function getSortieStatus(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const hook = (
+      window as Window & {
+        __LOOP_E2E__?: { getState: () => { sortie: { status: string } } }
+      }
+    ).__LOOP_E2E__
+    if (!hook) {
+      throw new Error('__LOOP_E2E__ hook not found. Was the app built with VITE_E2E_MODE=true?')
+    }
+    return hook.getState().sortie.status
+  })
+}
+
+/**
+ * Asserts `inner` is fully contained within `outer` with no safe margin
+ * (unlike `assertWithinSafeMargin()` above): the button must not be clipped
+ * by `.battle-stage__viewport`'s `overflow: hidden`, so any edge escaping
+ * `outer`'s bounds means the button is (at least partially) not actually
+ * reachable/visible to the player. `epsilon` absorbs sub-pixel rounding
+ * only.
+ */
+function assertFullyContained(inner: Rect, outer: Rect, label: string): void {
+  const epsilon = 1
+  expect(inner.x, `${label}: left edge inside canvas viewport`).toBeGreaterThanOrEqual(
+    outer.x - epsilon,
+  )
+  expect(inner.y, `${label}: top edge inside canvas viewport`).toBeGreaterThanOrEqual(
+    outer.y - epsilon,
+  )
+  expect(inner.x + inner.width, `${label}: right edge inside canvas viewport`).toBeLessThanOrEqual(
+    outer.x + outer.width + epsilon,
+  )
+  expect(inner.y + inner.height, `${label}: bottom edge inside canvas viewport`).toBeLessThanOrEqual(
+    outer.y + outer.height + epsilon,
+  )
+}
+
+test.describe('hud result action geometry: confirm-result stays reachable after defeat (owner playtest regression)', () => {
+  for (const vp of RESULT_ACTION_VIEWPORTS) {
+    test(`viewport=${vp.label}: Return to hangar is in the browser viewport and inside the Canvas viewport rect after defeat`, async ({
+      page,
+    }) => {
+      test.setTimeout(30_000)
+
+      // Deterministic defeat fixture (same mechanism as
+      // tests/e2e/m2-combat-mvp.spec.ts's existing defeat coverage): 1 HP
+      // means the first enemy contact ends the sortie in defeat.
+      await page.addInitScript(() => {
+        ;(
+          window as Window & { __E2E_PLAYER_HP_OVERRIDE__?: number }
+        ).__E2E_PLAYER_HP_OVERRIDE__ = 1
+      })
+      await page.setViewportSize({ width: vp.width, height: vp.height })
+      await page.goto('/')
+
+      await expect
+        .poll(async () => getSortieStatus(page), { timeout: 25_000, intervals: [200] })
+        .toBe('defeat')
+
+      const confirmButton = page.locator('[data-action="confirm-result"]')
+      const viewport = page.locator('.battle-stage__viewport')
+
+      // Do NOT call confirmButton.click() here — Playwright's auto-scroll-
+      // into-view before clicking would silently paper over exactly the bug
+      // this test exists to catch.
+      await expect(confirmButton).toBeInViewport()
+
+      const buttonBox = await confirmButton.boundingBox()
+      const viewportBox = await viewport.boundingBox()
+      expect(buttonBox, `${vp.label}: confirm-result must have a bounding box`).not.toBeNull()
+      expect(
+        viewportBox,
+        `${vp.label}: .battle-stage__viewport must have a bounding box`,
+      ).not.toBeNull()
+      if (!buttonBox || !viewportBox) {
+        return
+      }
+
+      assertFullyContained(buttonBox, viewportBox, `${vp.label} confirm-result-in-canvas-viewport`)
+    })
   }
 })

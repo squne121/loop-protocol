@@ -340,8 +340,11 @@ test.describe('VRT baselines', () => {
     // continuously in motion; pausing freezes those HUD readouts so the
     // capture is deterministic (no shared fixture-freeze registry available
     // -- visual-utils.ts is outside this Issue's Allowed Paths).
-    await page.getByRole('button', { name: 'Pause simulation' }).click()
-    await expect(page.getByRole('button', { name: 'Resume simulation' })).toBeVisible()
+    // Issue #1375 AC3: the Pause button's visible label is fixed to "Pause"
+    // (no aria-label swap to "Resume simulation") -- state is conveyed via
+    // aria-pressed instead.
+    await page.getByRole('button', { name: 'Pause', exact: true }).click()
+    await expect(page.locator('[data-action="toggle-pause"]')).toHaveAttribute('aria-pressed', 'true')
 
     // Combat readouts (shots fired, elapsed-tick-derived duration) keep
     // advancing for a few frames between the Pause click registering and
@@ -359,14 +362,11 @@ test.describe('VRT baselines', () => {
       maxDiffPixels: 150,
       mask: [
         page.locator('canvas'),
-        page.locator('[data-field="hp"]'),
-        page.locator('[data-field="shots"]'),
-        page.locator('[data-field="cooldown"]'),
-        page.locator('[data-field="assist-status"]'),
-        page.locator('[data-field="sortie-status"]'),
-        page.locator('[data-field="sortie-duration"]'),
-        page.locator('[data-field="sortie-kills"]'),
-        page.locator('[data-field="sortie-result"]'),
+        page.locator('[data-field="combat-hud-hull"]'),
+        page.locator('[data-field="combat-hud-kills"]'),
+        page.locator('[data-field="combat-hud-elapsed"]'),
+        page.locator('[data-field="combat-hud-weapon"]'),
+        page.locator('[data-field="combat-hud-assist-status"]'),
       ],
     })
   })

@@ -72,14 +72,6 @@ async function getPauseButtonAriaPressed(page: Page): Promise<string | null> {
   })
 }
 
-/** Get the current textContent of the pause-status live region. */
-async function getPauseStatusText(page: Page): Promise<string> {
-  return page.evaluate(() => {
-    const el = document.querySelector<HTMLElement>('[data-field="pause-status"]')
-    return el ? (el.textContent ?? '') : ''
-  })
-}
-
 /** Wait for aria-pressed to reach the expected value with polling. */
 async function waitForAriaPressed(page: Page, expected: string): Promise<void> {
   await expect
@@ -112,17 +104,15 @@ test('GIVEN running phase WHEN Pause button clicked THEN aria-pressed becomes "t
   // aria-pressed must flip to true
   await waitForAriaPressed(page, 'true')
 
-  // pause-status live region should show "Paused"
-  await expect
-    .poll(() => getPauseStatusText(page), { timeout: 2_000 })
-    .toBe('Paused')
-
-  // Button textContent remains fixed (no switching between "Pause" / "Resume")
-  const btnText = await page.evaluate(() => {
-    const btn = document.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')
-    return btn?.textContent ?? ''
+  // Button textContent remains fixed (no switching between "Pause" / "Resume"),
+  // and no aria-label override -- the accessible name IS the visible label
+  // (Issue #1375 AC3: visible label and accessible name never disagree).
+  const btn = await page.evaluate(() => {
+    const button = document.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')
+    return { text: button?.textContent ?? '', hasAriaLabel: button?.hasAttribute('aria-label') ?? null }
   })
-  expect(btnText).toBe('Pause')
+  expect(btn.text).toBe('Pause')
+  expect(btn.hasAriaLabel).toBe(false)
 })
 
 test('GIVEN paused WHEN Pause button clicked again THEN aria-pressed becomes "false" (resume)', async ({
@@ -135,8 +125,6 @@ test('GIVEN paused WHEN Pause button clicked again THEN aria-pressed becomes "fa
   // Resume
   await page.click('[data-action="toggle-pause"]')
   await waitForAriaPressed(page, 'false')
-
-  await expect.poll(() => getPauseStatusText(page), { timeout: 2_000 }).toBe('')
 })
 
 // ---------------------------------------------------------------------------

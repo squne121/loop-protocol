@@ -1,19 +1,30 @@
 /**
  * @vitest-environment jsdom
  *
- * Issue #1374 PR #1815 review fix: `HudController` now owns only the minimal
- * running-time HUD (`battle-hud-layer`). Title / load / preparation moved to
- * `phaseScreens.ts`'s `createPhaseScreenController()` (`battle-screen-layer`)
- * -- this file tests both modules (both live under `tests/hud-controller.test.ts`
- * in Issue #1374's Allowed Paths; there is no separate phaseScreens unit test
- * file). Real role/name/visibility/focus verification for the phase screens
- * now lives in `tests/e2e/phase-screens.spec.ts` (real Playwright, not a
- * hand-rolled DOM query) per the review's required fix 3.
+ * Issue #1375: `HudController` now composes two DOM roots inside
+ * `battle-hud-layer`:
+ *
+ * - `data-combat-hud` (Hull / Kills / Elapsed / Weapon / Assist / Pause) --
+ *   visible only during `running` (`src/ui/combatHud.ts` owns the view
+ *   model formatter; `HudController` owns phase routing).
+ * - `data-legacy-result-surface` -- the temporary compatibility surface
+ *   that keeps `Return to hangar` / `Collect payout` / `Prepare next
+ *   sortie` alive until #1376. Visible everywhere EXCEPT `running`.
+ *
+ * Title / load / preparation moved to `phaseScreens.ts`'s
+ * `createPhaseScreenController()` (`battle-screen-layer`, Issue #1374) --
+ * this file tests both modules (both live under `tests/hud-controller.test.ts`
+ * in Issue #1374/#1375's Allowed Paths; there is no separate phaseScreens
+ * unit test file). Real role/name/visibility/focus verification for the
+ * phase screens and for the combat HUD lives in
+ * `tests/e2e/phase-screens.spec.ts` / `tests/e2e/m2-combat-mvp.spec.ts`
+ * (real Playwright).
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createHudController, getUpgradeStatusCopy } from '../src/ui/HudController'
+import { buildCombatHudViewModel, getCombatHudAssistStatusCopy } from '../src/ui/combatHud'
 import {
   createPhaseScreenController,
   getVisiblePhaseScreen,
@@ -25,6 +36,9 @@ import {
 } from '../src/main'
 import type { GameState, LoopPhase, ResultRewardStatus, SortieResult } from '../src/state'
 import { createDefaultAllyState, createGameSnapshot } from '../src/state'
+
+/** Production fixed simulation timestep (matches `defaultSimulationConfig.fixedDeltaMs`). */
+const PROD_FIXED_DELTA_MS = 1000 / 60
 
 const TERMINAL_SORTIE_RESULT = {
   outcome: 'victory',
@@ -125,7 +139,23 @@ function queryButton(container: HTMLElement, action: string): HTMLButtonElement 
   return button
 }
 
-describe('HudController (minimal running-time HUD)', () => {
+function combatHudRoot(container: HTMLElement): HTMLElement {
+  const root = container.querySelector<HTMLElement>('[data-combat-hud]')
+  if (!root) {
+    throw new Error('data-combat-hud root not found')
+  }
+  return root
+}
+
+function legacyResultSurface(container: HTMLElement): HTMLElement {
+  const root = container.querySelector<HTMLElement>('[data-legacy-result-surface]')
+  if (!root) {
+    throw new Error('data-legacy-result-surface root not found')
+  }
+  return root
+}
+
+describe('HudController: data-combat-hud (running only, Issue #1375)', () => {
   let container: HTMLElement
   let actions: {
     onAssistPlayerCommand: ReturnType<typeof vi.fn>
@@ -148,106 +178,236 @@ describe('HudController (minimal running-time HUD)', () => {
     hudController = createHudController(container, actions)
   })
 
-  it('GIVEN preparation WHEN render called THEN Hull/Shots/Cooldown render and legacy debrief actions are disabled', () => {
-    hudController.render(createState('preparation'), false)
+  it('GIVEN running WHEN render called THEN data-combat-hud is visible/focusable and data-legacy-result-surface is hidden/inert (AC1)', () => {
+    hudController.render(createState('running'), false, PROD_FIXED_DELTA_MS)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Pre-launch')
-    expect(container.querySelector('[data-field="hp"]')?.textContent).toBe('8/8')
-    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
-    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
-    expect(queryButton(container, 'next-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'assist-player').disabled).toBe(true)
+    const combat = combatHudRoot(container)
+    const legacy = legacyResultSurface(container)
+
+    expect(combat.hidden).toBe(false)
+    expect(combat.hasAttribute('inert')).toBe(false)
+    expect(legacy.hidden).toBe(true)
+    expect(legacy.hasAttribute('inert')).toBe(true)
   })
 
-  it('GIVEN running WHEN render called THEN button.disabled marks the legacy debrief action surface as disabled and assist is enabled', () => {
-    hudController.render(createState('running'), false)
+  it('GIVEN preparation (or any non-running phase) WHEN render called THEN data-combat-hud is hidden/inert and data-legacy-result-surface is visible (AC1)', () => {
+    hudController.render(createState('preparation'), false, PROD_FIXED_DELTA_MS)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Sortie active')
-    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
-    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
-    expect(queryButton(container, 'next-sortie').disabled).toBe(true)
-    expect(queryButton(container, 'assist-player').disabled).toBe(false)
+    const combat = combatHudRoot(container)
+    const legacy = legacyResultSurface(container)
+
+    expect(combat.hidden).toBe(true)
+    expect(combat.hasAttribute('inert')).toBe(true)
+    expect(legacy.hidden).toBe(false)
+    expect(legacy.hasAttribute('inert')).toBe(false)
   })
 
-  it('GIVEN the HUD action surface WHEN rendered THEN interactive buttons opt in via data-battle-interactive', () => {
-    // Overlay inactivity is enforced by the shell layer via hidden/inert;
-    // this test covers the complementary HUD-side pointer opt-in contract.
-    hudController.render(createState('preparation'), false)
+  it('GIVEN running WHEN render called THEN the combat HUD surface contains only Hull/Kills/Elapsed/Weapon/Assist/Pause, never Mission phase/status/outcome/Pilot updates/raw telemetry/result actions (AC2)', () => {
+    hudController.render(createState('running'), false, PROD_FIXED_DELTA_MS)
 
-    const interactiveButtons = Array.from(
-      container.querySelectorAll<HTMLButtonElement>('[data-action]'),
-    )
-    expect(interactiveButtons.length).toBeGreaterThan(0)
-    expect(interactiveButtons.every((button) => button.dataset.battleInteractive === 'true')).toBe(true)
+    const combat = combatHudRoot(container)
+    const text = combat.textContent ?? ''
+
+    expect(combat.querySelector('[data-field="combat-hud-hull"]')).not.toBeNull()
+    expect(combat.querySelector('[data-field="combat-hud-kills"]')).not.toBeNull()
+    expect(combat.querySelector('[data-field="combat-hud-elapsed"]')).not.toBeNull()
+    expect(combat.querySelector('[data-field="combat-hud-weapon"]')).not.toBeNull()
+    expect(combat.querySelector('[data-action="assist-player"]')).not.toBeNull()
+    expect(combat.querySelector('[data-action="toggle-pause"]')).not.toBeNull()
+
+    expect(combat.querySelector('[data-field="loop-phase"]')).toBeNull()
+    expect(combat.querySelector('[data-field="sortie-status"]')).toBeNull()
+    expect(combat.querySelector('[data-field="sortie-result"]')).toBeNull()
+    expect(combat.querySelector('[data-field="status"]')).toBeNull()
+    expect(combat.querySelector('[data-field="command"]')).toBeNull()
+    expect(combat.querySelector('[data-action="claim-reward"]')).toBeNull()
+    expect(combat.querySelector('[data-action="confirm-result"]')).toBeNull()
+    expect(combat.querySelector('[data-action="next-sortie"]')).toBeNull()
+    expect(text).not.toContain('Collect payout')
+    expect(text).not.toContain('Return to hangar')
+    expect(text).not.toContain('Prepare next sortie')
   })
 
-  it('GIVEN running WHEN render called THEN disabled overlay buttons remain present but are inert-ready hit-test surfaces', () => {
-    hudController.render(createState('running'), false)
+  it('GIVEN Hull 6/8 WHEN render called THEN combat-hud-hull shows the formatted Hull value (AC2)', () => {
+    const state = createState('running')
+    state.player.hp = 6
+    state.player.maxHp = 8
 
-    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
-    expect(queryButton(container, 'claim-reward').dataset.battleInteractive).toBe('true')
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
+
+    expect(combatHudRoot(container).querySelector('[data-field="combat-hud-hull"]')?.textContent).toBe('6/8')
   })
 
-  it('GIVEN running with ally and living enemy WHEN render called THEN assist status reports ready and assist button is reachable', () => {
+  it('GIVEN 2 defeated enemies WHEN render called THEN combat-hud-kills reflects the live count (AC2)', () => {
+    const state = createState('running')
+    state.enemies = [
+      { id: 1, definitionId: 'enemy-basic', hp: 0, maxHp: 5, x: 0, y: 0, radius: 12, speedPxPerSec: 60, contactDamage: 1, defeated: true, defeatedAtTick: 10, faction: 'enemy', role: 'enemy_chaser', behaviorState: 'move_to_engage', targetingPolicy: 'focus_player', targetEntityId: null },
+      { id: 2, definitionId: 'enemy-basic', hp: 5, maxHp: 5, x: 0, y: 0, radius: 12, speedPxPerSec: 60, contactDamage: 1, defeated: false, defeatedAtTick: null, faction: 'enemy', role: 'enemy_chaser', behaviorState: 'move_to_engage', targetingPolicy: 'focus_player', targetEntityId: null },
+    ]
+
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
+
+    expect(combatHudRoot(container).querySelector('[data-field="combat-hud-kills"]')?.textContent).toBe('1')
+  })
+
+  it('GIVEN elapsedTicks: 900 and activeFixedDeltaMs: 16 WHEN render called THEN combat-hud-elapsed reads 14.4 s, not /60 or wall-clock derived (AC4)', () => {
+    const state = createState('running')
+    state.sortie = { status: 'running', elapsedTicks: 900, targetTicks: 3600, result: null }
+
+    hudController.render(state, false, 16)
+
+    const elapsedField = combatHudRoot(container).querySelector('[data-field="combat-hud-elapsed"]')
+    expect(elapsedField?.textContent).toBe('14.4 s')
+    expect(elapsedField?.hasAttribute('data-visual-mask')).toBe(false)
+  })
+
+  it('GIVEN the same view model WHEN render is called twice THEN combat HUD text nodes are not reassigned on the second render (AC6, Issue #1375 PR #1925 review P1-1)', () => {
+    const state = createState('running')
+    state.sortie = { status: 'running', elapsedTicks: 900, targetTicks: 3600, result: null }
+
+    hudController.render(state, false, 16)
+
+    const observer = new MutationObserver(() => {})
+    observer.observe(combatHudRoot(container), {
+      characterData: true,
+      childList: true,
+      subtree: true,
+    })
+
+    // Same state object, same isPaused, same activeFixedDeltaMs -> identical
+    // view model on the second render.
+    hudController.render(state, false, 16)
+
+    // MutationObserver callbacks are microtask-queued; `takeRecords()`
+    // synchronously drains the pending queue so this assertion does not
+    // depend on the callback having flushed yet.
+    const observed = observer.takeRecords().map((mutation) => mutation.type)
+    observer.disconnect()
+    expect(observed).toEqual([])
+  })
+
+  it('GIVEN only the Assist status changes WHEN render is called THEN only combat-hud-assist-status is patched, not Hull/Kills/Elapsed/Weapon (AC6, Issue #1375 PR #1925 review P1-1)', () => {
     const state = createState('running')
     state.allies = [createDefaultAllyState(1)]
     state.enemies = [
-      {
-        id: 1,
-        definitionId: 'enemy-basic',
-        hp: 5,
-        maxHp: 5,
-        x: 360,
-        y: 270,
-        radius: 12,
-        speedPxPerSec: 60,
-        contactDamage: 1,
-        defeated: false,
-        defeatedAtTick: null,
-        faction: 'enemy',
-        role: 'enemy_chaser',
-        behaviorState: 'move_to_engage',
-        targetingPolicy: 'focus_player',
-        targetEntityId: 'player:player-alpha',
-      },
+      { id: 1, definitionId: 'enemy-basic', hp: 5, maxHp: 5, x: 0, y: 0, radius: 12, speedPxPerSec: 60, contactDamage: 1, defeated: false, defeatedAtTick: null, faction: 'enemy', role: 'enemy_chaser', behaviorState: 'move_to_engage', targetingPolicy: 'focus_player', targetEntityId: null },
     ]
 
-    hudController.render(state, false)
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
 
-    const assistStatus = container.querySelector('[data-field="assist-status"]')
+    const root = combatHudRoot(container)
+    const observer = new MutationObserver(() => {})
+    observer.observe(root, { characterData: true, childList: true, subtree: true })
+
+    // Only the assist-relevant state changes; Hull/Kills/Elapsed/Weapon
+    // inputs are unchanged.
+    state.commandIntentRuntime.activeIntent = 'assist_player'
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
+
+    // MutationObserver callbacks are microtask-queued; `takeRecords()`
+    // synchronously drains the pending queue so this assertion does not
+    // depend on the callback having flushed yet.
+    const mutations = observer.takeRecords()
+    observer.disconnect()
+
+    const changedNodes = mutations
+      .map((mutation) =>
+        mutation.target.nodeType === Node.TEXT_NODE
+          ? mutation.target.parentElement
+          : (mutation.target as Element),
+      )
+      .filter((node): node is Element => node !== null)
+
+    const changedFields = new Set(
+      changedNodes
+        .map((node) => node.closest('[data-field]')?.getAttribute('data-field'))
+        .filter((field): field is string => field !== null && field !== undefined),
+    )
+
+    expect(changedFields.has('combat-hud-assist-status')).toBe(true)
+    expect(changedFields.has('combat-hud-hull')).toBe(false)
+    expect(changedFields.has('combat-hud-kills')).toBe(false)
+    expect(changedFields.has('combat-hud-elapsed')).toBe(false)
+    expect(changedFields.has('combat-hud-weapon')).toBe(false)
+  })
+
+  it('GIVEN weaponCooldownMs 0 WHEN render called THEN combat-hud-weapon shows Ready, never the raw millisecond value (AC2)', () => {
+    const state = createState('running')
+    state.player.weaponCooldownMs = 0
+
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
+
+    const weaponField = combatHudRoot(container).querySelector('[data-field="combat-hud-weapon"]')
+    expect(weaponField?.textContent).toBe('Ready')
+  })
+
+  it('GIVEN weaponCooldownMs > 0 WHEN render called THEN combat-hud-weapon shows Recharging, never the raw millisecond value (AC2)', () => {
+    const state = createState('running')
+    state.player.weaponCooldownMs = 137.4
+
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
+
+    const weaponField = combatHudRoot(container).querySelector('[data-field="combat-hud-weapon"]')
+    expect(weaponField?.textContent).toBe('Recharging')
+    expect(container.textContent).not.toContain('137')
+  })
+
+  it('GIVEN combat HUD rendered WHEN queried by role THEN Assist allies is a unique button with a fixed accessible name (AC3)', () => {
+    hudController.render(createState('running'), false, PROD_FIXED_DELTA_MS)
+
+    const assistButtons = Array.from(container.querySelectorAll('button')).filter(
+      (button) => button.textContent?.trim() === 'Assist allies',
+    )
+    expect(assistButtons).toHaveLength(1)
+    expect(assistButtons[0].getAttribute('aria-label')).toBe('Assist allies')
+  })
+
+  it('GIVEN Pause toggled WHEN render called THEN the visible label stays "Pause" and aria-pressed represents the toggle state (AC3)', () => {
+    hudController.render(createState('running'), false, PROD_FIXED_DELTA_MS)
+    const pauseButton = queryButton(container, 'toggle-pause')
+    expect(pauseButton.textContent?.trim()).toBe('Pause')
+    expect(pauseButton.getAttribute('aria-pressed')).toBe('false')
+    // Accessible name (no aria-label override) equals the visible label.
+    expect(pauseButton.hasAttribute('aria-label')).toBe(false)
+
+    hudController.render(createState('running'), true, PROD_FIXED_DELTA_MS)
+    expect(pauseButton.textContent?.trim()).toBe('Pause')
+    expect(pauseButton.getAttribute('aria-pressed')).toBe('true')
+    expect(pauseButton.hasAttribute('aria-label')).toBe(false)
+  })
+
+  it('GIVEN running with ally and living enemy WHEN render called THEN combat-hud-assist-status reports ready and is the sole polite live region for combat feedback (AC2, AC6)', () => {
+    const state = createState('running')
+    state.allies = [createDefaultAllyState(1)]
+    state.enemies = [
+      { id: 1, definitionId: 'enemy-basic', hp: 5, maxHp: 5, x: 360, y: 270, radius: 12, speedPxPerSec: 60, contactDamage: 1, defeated: false, defeatedAtTick: null, faction: 'enemy', role: 'enemy_chaser', behaviorState: 'move_to_engage', targetingPolicy: 'focus_player', targetEntityId: 'player:player-alpha' },
+    ]
+
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
+
+    const assistStatus = combatHudRoot(container).querySelector('[data-field="combat-hud-assist-status"]')
     expect(queryButton(container, 'assist-player').disabled).toBe(false)
     expect(assistStatus?.textContent).toBe('Assist ready.')
     expect(assistStatus?.getAttribute('role')).toBe('status')
     expect(assistStatus?.getAttribute('aria-live')).toBe('polite')
     expect(assistStatus?.getAttribute('aria-atomic')).toBe('true')
+
+    // AC6: Hull/Kills/Elapsed/Weapon are not inside a role="status" region.
+    const combat = combatHudRoot(container)
+    for (const field of ['combat-hud-hull', 'combat-hud-kills', 'combat-hud-elapsed', 'combat-hud-weapon']) {
+      expect(combat.querySelector(`[data-field="${field}"]`)?.getAttribute('role')).toBeNull()
+    }
   })
 
   it('GIVEN running without allies WHEN render called THEN assist status reports no ally available', () => {
     const state = createState('running')
     state.enemies = [
-      {
-        id: 1,
-        definitionId: 'enemy-basic',
-        hp: 5,
-        maxHp: 5,
-        x: 360,
-        y: 270,
-        radius: 12,
-        speedPxPerSec: 60,
-        contactDamage: 1,
-        defeated: false,
-        defeatedAtTick: null,
-        faction: 'enemy',
-        role: 'enemy_chaser',
-        behaviorState: 'move_to_engage',
-        targetingPolicy: 'focus_player',
-        targetEntityId: 'player:player-alpha',
-      },
+      { id: 1, definitionId: 'enemy-basic', hp: 5, maxHp: 5, x: 360, y: 270, radius: 12, speedPxPerSec: 60, contactDamage: 1, defeated: false, defeatedAtTick: null, faction: 'enemy', role: 'enemy_chaser', behaviorState: 'move_to_engage', targetingPolicy: 'focus_player', targetEntityId: 'player:player-alpha' },
     ]
 
-    hudController.render(state, false)
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
 
-    expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
+    expect(combatHudRoot(container).querySelector('[data-field="combat-hud-assist-status"]')?.textContent).toBe(
       'No ally available.',
     )
   })
@@ -256,55 +416,24 @@ describe('HudController (minimal running-time HUD)', () => {
     const state = createState('running')
     state.allies = [createDefaultAllyState(1)]
 
-    hudController.render(state, false)
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
 
-    expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
+    expect(combatHudRoot(container).querySelector('[data-field="combat-hud-assist-status"]')?.textContent).toBe(
       'No target to assist.',
     )
-  })
-
-  it('GIVEN running WHEN render called THEN HUD renders without a result-specific layout override', () => {
-    hudController.render(createState('running'), false)
-
-    expect(container.dataset.battleHudLayout).toBeUndefined()
-  })
-
-  it('GIVEN result WHEN render called THEN HUD keeps its action surface in the shared overlay shell', () => {
-    hudController.render(createState('result'), false)
-
-    expect(container.dataset.battleHudLayout).toBeUndefined()
-    expect(queryButton(container, 'confirm-result').disabled).toBe(false)
-    expect(container.querySelectorAll('[data-action]').length).toBeGreaterThan(0)
   })
 
   it('GIVEN active assist without assigned target WHEN render called THEN assist status reports signal sent', () => {
     const state = createState('running')
     state.allies = [createDefaultAllyState(1)]
     state.enemies = [
-      {
-        id: 1,
-        definitionId: 'enemy-basic',
-        hp: 5,
-        maxHp: 5,
-        x: 360,
-        y: 270,
-        radius: 12,
-        speedPxPerSec: 60,
-        contactDamage: 1,
-        defeated: false,
-        defeatedAtTick: null,
-        faction: 'enemy',
-        role: 'enemy_chaser',
-        behaviorState: 'move_to_engage',
-        targetingPolicy: 'focus_player',
-        targetEntityId: 'player:player-alpha',
-      },
+      { id: 1, definitionId: 'enemy-basic', hp: 5, maxHp: 5, x: 360, y: 270, radius: 12, speedPxPerSec: 60, contactDamage: 1, defeated: false, defeatedAtTick: null, faction: 'enemy', role: 'enemy_chaser', behaviorState: 'move_to_engage', targetingPolicy: 'focus_player', targetEntityId: 'player:player-alpha' },
     ]
     state.commandIntentRuntime.activeIntent = 'assist_player'
 
-    hudController.render(state, false)
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
 
-    expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
+    expect(combatHudRoot(container).querySelector('[data-field="combat-hud-assist-status"]')?.textContent).toBe(
       'Assist signal sent.',
     )
   })
@@ -315,45 +444,96 @@ describe('HudController (minimal running-time HUD)', () => {
     ally.targetEntityId = 'enemy:1'
     state.allies = [ally]
     state.enemies = [
-      {
-        id: 1,
-        definitionId: 'enemy-basic',
-        hp: 5,
-        maxHp: 5,
-        x: 360,
-        y: 270,
-        radius: 12,
-        speedPxPerSec: 60,
-        contactDamage: 1,
-        defeated: false,
-        defeatedAtTick: null,
-        faction: 'enemy',
-        role: 'enemy_chaser',
-        behaviorState: 'move_to_engage',
-        targetingPolicy: 'focus_player',
-        targetEntityId: 'player:player-alpha',
-      },
+      { id: 1, definitionId: 'enemy-basic', hp: 5, maxHp: 5, x: 360, y: 270, radius: 12, speedPxPerSec: 60, contactDamage: 1, defeated: false, defeatedAtTick: null, faction: 'enemy', role: 'enemy_chaser', behaviorState: 'move_to_engage', targetingPolicy: 'focus_player', targetEntityId: 'player:player-alpha' },
     ]
     state.commandIntentRuntime.activeIntent = 'assist_player'
 
-    hudController.render(state, false)
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
 
-    expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
+    expect(combatHudRoot(container).querySelector('[data-field="combat-hud-assist-status"]')?.textContent).toBe(
       'Allies covering you.',
     )
   })
 
-  it('GIVEN non-running phase WHEN render called THEN assist status reports available during sortie', () => {
-    hudController.render(createState('preparation'), false)
+  it('GIVEN combat HUD rendered WHEN clicking Assist / Pause THEN their own callbacks fire and nothing else does', () => {
+    const state = createState('running')
+    state.allies = [createDefaultAllyState(1)]
+    state.enemies = [
+      { id: 1, definitionId: 'enemy-basic', hp: 5, maxHp: 5, x: 360, y: 270, radius: 12, speedPxPerSec: 60, contactDamage: 1, defeated: false, defeatedAtTick: null, faction: 'enemy', role: 'enemy_chaser', behaviorState: 'move_to_engage', targetingPolicy: 'focus_player', targetEntityId: 'player:player-alpha' },
+    ]
 
-    expect(container.querySelector('[data-field="assist-status"]')?.textContent).toBe(
-      'Assist is available during sortie.',
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
+
+    queryButton(container, 'assist-player').click()
+    queryButton(container, 'toggle-pause').click()
+
+    expect(actions.onAssistPlayerCommand).toHaveBeenCalledTimes(1)
+    expect(actions.onTogglePause).toHaveBeenCalledTimes(1)
+    expect(actions.onClaimReward).not.toHaveBeenCalled()
+    expect(actions.onConfirmResult).not.toHaveBeenCalled()
+    expect(actions.onNextSortie).not.toHaveBeenCalled()
+  })
+})
+
+describe('combatHud.ts: buildCombatHudViewModel / getCombatHudAssistStatusCopy (Issue #1375)', () => {
+  it('GIVEN elapsedTicks 900 and activeFixedDeltaMs 16 WHEN buildCombatHudViewModel is called THEN elapsedLabel is 14.4 s (AC4, AC8 fixture parity)', () => {
+    const state = createState('running')
+    state.sortie = { status: 'running', elapsedTicks: 900, targetTicks: 3600, result: null }
+
+    const view = buildCombatHudViewModel(state, false, 16)
+
+    expect(view.elapsedLabel).toBe('14.4 s')
+  })
+
+  it('GIVEN non-running phase WHEN getCombatHudAssistStatusCopy is called THEN it reports available during sortie', () => {
+    expect(getCombatHudAssistStatusCopy(createState('preparation'))).toBe('Assist is available during sortie.')
+  })
+})
+
+describe('HudController: data-legacy-result-surface (temporary compatibility, Issue #1375)', () => {
+  let container: HTMLElement
+  let actions: {
+    onAssistPlayerCommand: ReturnType<typeof vi.fn>
+    onClaimReward: ReturnType<typeof vi.fn>
+    onConfirmResult: ReturnType<typeof vi.fn>
+    onNextSortie: ReturnType<typeof vi.fn>
+    onTogglePause: ReturnType<typeof vi.fn>
+  }
+  let hudController: ReturnType<typeof createHudController>
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    actions = {
+      onAssistPlayerCommand: vi.fn(),
+      onClaimReward: vi.fn(),
+      onConfirmResult: vi.fn(),
+      onNextSortie: vi.fn(),
+      onTogglePause: vi.fn(),
+    }
+    hudController = createHudController(container, actions)
+  })
+
+  it('GIVEN preparation WHEN render called THEN legacy action surface renders and is not gated by combat-only fields', () => {
+    hudController.render(createState('preparation'), false, PROD_FIXED_DELTA_MS)
+
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Pre-launch')
+    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
+    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
+    expect(queryButton(container, 'next-sortie').disabled).toBe(true)
+  })
+
+  it('GIVEN the legacy action surface WHEN rendered THEN interactive buttons opt in via data-battle-interactive', () => {
+    hudController.render(createState('preparation'), false, PROD_FIXED_DELTA_MS)
+
+    const interactiveButtons = Array.from(
+      legacyResultSurface(container).querySelectorAll<HTMLButtonElement>('[data-action]'),
     )
-    expect(queryButton(container, 'assist-player').disabled).toBe(true)
+    expect(interactiveButtons.length).toBeGreaterThan(0)
+    expect(interactiveButtons.every((button) => button.dataset.battleInteractive === 'true')).toBe(true)
   })
 
   it('GIVEN result phase with pending reward WHEN render called THEN confirm-result enabled, claim-reward disabled (AC4, AC5)', () => {
-    hudController.render(createState('result', 'pending'), false)
+    hudController.render(createState('result', 'pending'), false, PROD_FIXED_DELTA_MS)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Mission review')
     expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
@@ -365,7 +545,7 @@ describe('HudController (minimal running-time HUD)', () => {
   })
 
   it('GIVEN result phase with claimed reward WHEN render called THEN confirm-result is still enabled (AC5)', () => {
-    hudController.render(createState('result', 'claimed'), false)
+    hudController.render(createState('result', 'claimed'), false, PROD_FIXED_DELTA_MS)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Mission review')
     expect(queryButton(container, 'confirm-result').disabled).toBe(false)
@@ -373,7 +553,7 @@ describe('HudController (minimal running-time HUD)', () => {
   })
 
   it('GIVEN debrief_pending_reward WHEN render called THEN debrief copy enables reward collection only', () => {
-    hudController.render(createState('debrief_pending_reward'), false)
+    hudController.render(createState('debrief_pending_reward'), false, PROD_FIXED_DELTA_MS)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief in progress')
     expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
@@ -383,7 +563,7 @@ describe('HudController (minimal running-time HUD)', () => {
   })
 
   it('GIVEN debrief_reward_claimed WHEN render called THEN debrief complete copy enables next sortie only', () => {
-    hudController.render(createState('debrief_reward_claimed'), false)
+    hudController.render(createState('debrief_reward_claimed'), false, PROD_FIXED_DELTA_MS)
 
     expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief complete')
     expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
@@ -392,12 +572,12 @@ describe('HudController (minimal running-time HUD)', () => {
     expect(queryButton(container, 'claim-reward').disabled).toBe(true)
   })
 
-  it('GIVEN feedback copy WHEN render called THEN status region exposes player-facing progress copy without innerHTML', () => {
+  it('GIVEN result feedback copy WHEN render called THEN status region exposes player-facing progress copy without innerHTML', () => {
     const state = createState('debrief_reward_claimed')
     state.telemetry.status = 'Reward claimed for this session.'
     state.telemetry.lastCommandSummary = 'Confirm result to save and return to preparation.'
 
-    hudController.render(state, false)
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
 
     const status = container.querySelector('[data-field="status"]')
     expect(status?.textContent).toBe('Reward claimed for this session.')
@@ -408,51 +588,38 @@ describe('HudController (minimal running-time HUD)', () => {
     )
   })
 
-  it('GIVEN running WHEN disabled buttons are clicked THEN callbacks are not invoked', () => {
-    hudController.render(createState('running'), false)
+  it('GIVEN preparation WHEN render called THEN the legacy status/command fields keep rendering telemetry unconditionally (phaseScreens.ts prep-status is an additional, not exclusive, surface)', () => {
+    const state = createState('preparation')
+    state.telemetry.status = 'Save complete.'
+    state.telemetry.lastCommandSummary = 'Progression snapshot saved locally.'
 
-    queryButton(container, 'claim-reward').click()
-    queryButton(container, 'confirm-result').click()
-    queryButton(container, 'next-sortie').click()
-    queryButton(container, 'assist-player').click()
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
 
-    expect(actions.onClaimReward).not.toHaveBeenCalled()
-    expect(actions.onConfirmResult).not.toHaveBeenCalled()
-    expect(actions.onNextSortie).not.toHaveBeenCalled()
-    expect(actions.onAssistPlayerCommand).toHaveBeenCalledTimes(1)
-  })
-
-  it('GIVEN HUD rendered WHEN checking text surface THEN normal-play vocabulary boundary is preserved', () => {
-    hudController.render(createState('preparation'), false)
-
-    const textSurface = container.textContent ?? ''
-    expect(textSurface).toContain('Pilot updates')
-    expect(textSurface).not.toContain('Loop Phase')
-    expect(textSurface).not.toContain('Telemetry')
-    expect(textSurface).not.toContain('Claim reward')
-    expect(textSurface).not.toContain('title_menu')
-    expect(textSurface).not.toContain('load_menu')
-    expect(textSurface).not.toContain('debrief_pending_reward')
-    expect(textSurface).not.toContain('debrief_reward_claimed')
-    expect(textSurface).not.toContain('illegal-transition')
-  })
-
-  it('GIVEN HUD rendered WHEN reading mission copy THEN player-facing copy boundary is preserved', () => {
-    hudController.render(createState('debrief_pending_reward'), false)
-
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief in progress')
-    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
-    expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
+    expect(container.querySelector('[data-field="status"]')?.textContent).toBe('Save complete.')
+    expect(container.querySelector('[data-field="command"]')?.textContent).toBe(
+      'Progression snapshot saved locally.',
+    )
   })
 
   it('GIVEN debrief_reward_claimed WHEN disabled claim button is clicked THEN claim callback remains a no-op surface', () => {
-    hudController.render(createState('debrief_reward_claimed'), false)
+    hudController.render(createState('debrief_reward_claimed'), false, PROD_FIXED_DELTA_MS)
 
     queryButton(container, 'claim-reward').click()
     queryButton(container, 'next-sortie').click()
 
     expect(actions.onClaimReward).not.toHaveBeenCalled()
     expect(actions.onNextSortie).toHaveBeenCalledTimes(1)
+  })
+
+  it('GIVEN HUD rendered WHEN checking text surface THEN normal-play vocabulary boundary is preserved', () => {
+    hudController.render(createState('result'), false, PROD_FIXED_DELTA_MS)
+
+    const textSurface = container.textContent ?? ''
+    expect(textSurface).not.toContain('title_menu')
+    expect(textSurface).not.toContain('load_menu')
+    expect(textSurface).not.toContain('debrief_pending_reward')
+    expect(textSurface).not.toContain('debrief_reward_claimed')
+    expect(textSurface).not.toContain('illegal-transition')
   })
 })
 
@@ -487,10 +654,10 @@ describe('Issue #914: HUD action harness -- next-sortie and confirm-result', () 
       onTogglePause: vi.fn(),
     })
 
-    hudController.render(state, false)
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
 
     function renderHudAfterAction() {
-      hudController.render(state, false)
+      hudController.render(state, false, PROD_FIXED_DELTA_MS)
     }
 
     expect(queryButton(container, 'next-sortie').disabled).toBe(false)
@@ -499,10 +666,12 @@ describe('Issue #914: HUD action harness -- next-sortie and confirm-result', () 
     expect(onNextSortie).toHaveBeenCalledTimes(1)
     expect(state.loopPhase).toBe('preparation')
     expect(container.querySelector('[data-field="status"]')?.textContent).toBe('Returned to preparation.')
-    expect(container.querySelector('[data-field="command"]')?.textContent).toBe('Use Start sortie to begin the next sortie.')
+    expect(container.querySelector('[data-field="command"]')?.textContent).toBe(
+      'Use Start sortie to begin the next sortie.',
+    )
   })
 
-  it('AC2-AC3: GIVEN result + pending reward WHEN confirm-result click via runConfirmResultHandler with fake save success THEN HUD shows "Result confirmed." / "Progress saved locally." and fakeProgressionStorageSave called exactly once', () => {
+  it('AC2-AC3: GIVEN result + pending reward WHEN confirm-result click via runConfirmResultHandler with fake save success THEN state.telemetry shows "Result confirmed." / "Progress saved locally." and fakeProgressionStorageSave called exactly once', () => {
     const state = createState('result', 'pending')
     const fakeProgressionStorageSave = vi.fn(() => ({ ok: true as const }))
 
@@ -530,10 +699,10 @@ describe('Issue #914: HUD action harness -- next-sortie and confirm-result', () 
       onTogglePause: vi.fn(),
     })
 
-    hudController.render(state, false)
+    hudController.render(state, false, PROD_FIXED_DELTA_MS)
 
     function renderHudAfterAction() {
-      hudController.render(state, false)
+      hudController.render(state, false, PROD_FIXED_DELTA_MS)
     }
 
     expect(queryButton(container, 'confirm-result').disabled).toBe(false)
@@ -790,5 +959,34 @@ describe('phaseScreens: createPhaseScreenController', () => {
     expect(textSurface).not.toContain('load_menu')
     expect(textSurface).not.toContain('debrief_pending_reward')
     expect(textSurface).not.toContain('debrief_reward_claimed')
+  })
+
+  // -------------------------------------------------------------------
+  // Issue #1375 In Scope: preparation Save/Reset/New Game feedback now
+  // renders inside this screen's own prep-status field.
+  // -------------------------------------------------------------------
+
+  it('GIVEN preparation with a Save success telemetry message WHEN rendered THEN prep-status shows the feedback (In Scope, Issue #1375)', () => {
+    const state = createState('preparation')
+    state.telemetry.status = 'Save complete.'
+    state.telemetry.lastCommandSummary = 'Progression snapshot saved locally.'
+
+    controller.render(state)
+
+    expect(container.querySelector('[data-field="prep-status"]')?.textContent).toBe(
+      'Save complete. Progression snapshot saved locally.',
+    )
+    expect(container.querySelector('[data-field="prep-status"]')?.getAttribute('role')).toBe('status')
+    expect(container.querySelector('[data-field="prep-status"]')?.getAttribute('aria-live')).toBe('polite')
+  })
+
+  it('GIVEN a non-preparation phase WHEN rendered THEN prep-status renders nothing (feedback stays phase-scoped)', () => {
+    const state = createState('title_menu')
+    state.telemetry.status = 'Load Game failed.'
+    state.telemetry.lastCommandSummary = 'No save data available.'
+
+    controller.render(state)
+
+    expect(container.querySelector('[data-field="prep-status"]')?.textContent).toBe('')
   })
 })

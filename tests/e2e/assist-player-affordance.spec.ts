@@ -134,13 +134,23 @@ test('assist-player-affordance routes through DOM activation and KeyZ', async ({
   await waitForRunningWithCombatActors(page)
 
   const assistButton = page.locator('[data-action="assist-player"]')
-  const assistStatus = page.locator('[data-field="assist-status"]')
+  const assistStatus = page.locator('[data-field="combat-hud-assist-status"]')
 
   await expect(assistButton).toBeVisible()
   await expect(assistButton).toBeEnabled()
   await expect(assistStatus).toHaveText('Assist ready.')
 
-  await assistButton.click()
+  // Scope Delta (Issue #1375): the combat HUD's compact new layout
+  // (`data-combat-hud`, fewer stacked `.panel` sections than the pre-#1375
+  // HUD) sits higher on screen, now underneath the top-right
+  // `?playtest_evidence=1` debug panel's covered region at this viewport
+  // (`click({ force: true })` still hit-tests at the element's real screen
+  // coordinates and would land on that unrelated dev-only overlay instead).
+  // This test validates DOM-click -> command-intent routing, not manual
+  // pointer hit-testing (covered separately by
+  // `tests/e2e/m2-combat-mvp.spec.ts`'s AC5 pointerdown tests), so it
+  // invokes the button's own `click()` method directly instead.
+  await assistButton.evaluate((button) => (button as HTMLButtonElement).click())
   await expect
     .poll(async () => {
       const state = await getGameState(page)
@@ -186,7 +196,7 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
     await page.waitForTimeout(100)
 
     const assistButton = page.locator('[data-action="assist-player"]')
-    const assistStatus = page.locator('[data-field="assist-status"]')
+    const assistStatus = page.locator('[data-field="combat-hud-assist-status"]')
 
     await expect(assistButton).toBeVisible()
     await expect(assistStatus).toBeVisible()

@@ -179,6 +179,13 @@ export function createPhaseScreenController(
       inert
     >
       <p class="eyebrow" id="phase-screen-preparation-heading" tabindex="-1">Mission briefing</p>
+      <p
+        class="status-copy"
+        data-field="prep-status"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      ></p>
       <dl class="stat-grid">
         <div><dt>Resources</dt><dd data-field="prep-resources"></dd></div>
         <div><dt>Weapon Power</dt><dd data-field="prep-weapon-power"></dd></div>
@@ -220,6 +227,7 @@ export function createPhaseScreenController(
   const prepWeaponPowerField = queryField(container, 'prep-weapon-power')
   const prepUpgradeCostField = queryField(container, 'prep-upgrade-cost')
   const prepUpgradeStatusField = queryField(container, 'prep-upgrade-status')
+  const prepStatusField = queryField(container, 'prep-status')
 
   newGameButton.addEventListener('click', actions.onNewGame)
   openLoadMenuTitleButton.addEventListener('click', () => actions.onOpenLoadMenu('title_menu'))
@@ -313,6 +321,16 @@ export function createPhaseScreenController(
       // Load-specific feedback lives inside the load screen itself (PR #1815
       // review, required fix 4) instead of a separate persistent panel.
       loadStatusField.textContent = state.loopPhase === 'load_menu' ? state.telemetry.status : ''
+
+      // Preparation's Save / Reset / New Game player-facing feedback (In
+      // Scope, Issue #1375): rendered here, inside the preparation phase
+      // screen itself, instead of `HudController`'s HUD layer -- the HUD
+      // layer sits BEHIND this modal overlay in paint order, so feedback
+      // rendered there was invisible while this screen is open.
+      prepStatusField.textContent =
+        state.loopPhase === 'preparation'
+          ? `${state.telemetry.status} ${state.telemetry.lastCommandSummary}`.trim()
+          : ''
 
       prepResourcesField.textContent = `${state.progress.resources}`
       prepWeaponPowerField.textContent = `${upgradeView?.weaponPower ?? state.progress.weaponPower}`
