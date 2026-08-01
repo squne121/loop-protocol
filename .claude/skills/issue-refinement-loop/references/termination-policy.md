@@ -249,7 +249,7 @@ LOOP_POLICY_V1:
 
 `issue_kind: parent` かつ `parent_mode: delivery-rollup` の Issue が `approved` 終了する場合:
 
-- `LOOP_HANDOFF_RESULT_V1` marker は出力しない（`impl-review-loop` への handoff は発生しないため）
+- `LOOP_HANDOFF_RESULT_V1` marker は出力しない（`impl-review-loop` への handoff は発生しないため）。marker が出力されない以上、marker 内の `status: impl_ready` / `routing_action: run_impl_review_loop` フィールドも一切出力されない（#1940 review: marker 非出力の帰結として明示する）
 - plain Markdown の終了要約（fenced YAML marker を伴わない）のみを投稿する
 - 既存の `FOLLOW_UP_MATERIALIZATION_RESULT_V1`（child issue materialization 結果）は変更なく併記する
 - 終了要約本文に `Final Gate: not applicable` と reason code（例: `delivery_rollup_parent_without_verification_commands`）を明記し、上記「Final Gate 適用除外」節の「Final Gate 成功」（`status: go` を実際に確認した通常経路）と区別する

@@ -15,6 +15,8 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Import module under test
@@ -36,6 +38,33 @@ HTTP_ERROR_CLASSIFICATIONS = _rcr_mod.HTTP_ERROR_CLASSIFICATIONS
 _ISSUE_NUMBER = 817
 _REPO = "squne121/loop-protocol"
 _ISSUE_URL = f"https://github.com/{_REPO}/issues/{_ISSUE_NUMBER}"
+
+# Issue #1914 P0-3: run_once() now fetches the Issue body exactly once, at
+# the very start of every invocation, before Step 1's idempotency check even
+# runs (see run_contract_review_once.py module docstring). None of the
+# existing tests in this file exercise body content directly (they intercept
+# _run_script's parsed JSON output), so a single generic default body is
+# supplied here for every test in this file. Tests that need to control the
+# fetch (e.g. a fetch failure) patch fetch_body_from_github themselves
+# inside their own `with` block, which takes precedence over this default
+# fixture for the duration of that block.
+_DEFAULT_BODY_SNAPSHOT = (
+    "## Machine-Readable Contract\n\n"
+    "```yaml\n"
+    "contract_schema_version: v1\n"
+    "issue_kind: implementation\n"
+    'parent_issue: "none"\n'
+    "```\n\n"
+    "## Outcome\n\nfixture body for run_contract_review_once unit tests.\n"
+)
+
+
+@pytest.fixture(autouse=True)
+def _default_body_snapshot_fetch():
+    with patch.object(
+        _rcr_mod, "fetch_body_from_github", return_value=(_DEFAULT_BODY_SNAPSHOT, None)
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------
