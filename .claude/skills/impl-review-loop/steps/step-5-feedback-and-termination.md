@@ -293,7 +293,7 @@ follow-up 候補を `reviewer_verdict.warnings[]`（non-blocker の場合）ま�
 優先度で判断する:
 
 - APPROVE を妨げない改善提案として明記されたテキストで、独立した follow-up Issue 化が妥当と main thread が
-  判断したもの → APPROVE 確定後に `issue-author` SubAgent に委譲して `create-issue` 経由で起票する
+  判断したもの → APPROVE 確定後に `issue-creator` SubAgent に委譲して `create-issue` 経由で起票する
 - APPROVE 前に materialize が必須と reviewer が明記したもの（`severity: mandatory_follow_up` 相当の記述）
   → APPROVE 確定**前**に create/reuse する。未 materialize の状態で APPROVE してはならない
 - 単なる観察・記録のみでよいもの → 終了報告コメントの本文に記載するのみで起票しない
