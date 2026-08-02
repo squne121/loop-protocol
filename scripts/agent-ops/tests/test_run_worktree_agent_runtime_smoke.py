@@ -1469,19 +1469,20 @@ def test_given_repo_when_runner_invoked_with_removed_keep_pane_flag_then_argpars
 
 
 # ---------------------------------------------------------------------------
-# Thin Codex wrapper contract (AC1)
+# Root Codex skill-directory symlink contract (AC1)
 # ---------------------------------------------------------------------------
 
 
-def test_given_repo_when_thin_wrapper_checked_then_points_to_canonical_body():
-    wrapper = REPO_ROOT / ".agents" / "skills" / "worktree-agent-runtime-smoke" / "SKILL.md"
+def test_given_repo_when_root_skill_symlink_checked_then_reads_canonical_body():
+    surface = REPO_ROOT / ".agents" / "skills"
+    wrapper = surface / "worktree-agent-runtime-smoke" / "SKILL.md"
     canonical = REPO_ROOT / ".claude" / "skills" / "worktree-agent-runtime-smoke" / "SKILL.md"
+    assert surface.is_symlink()
+    assert surface.readlink().as_posix() == "../.claude/skills"
     assert wrapper.is_file()
     assert canonical.is_file()
-    text = wrapper.read_text(encoding="utf-8")
-    assert "derived/non-canonical" in text
-    assert "../../../.claude/skills/worktree-agent-runtime-smoke/SKILL.md" in text
-    assert "## Procedure" not in text
+    assert wrapper.samefile(canonical)
+    assert wrapper.read_text(encoding="utf-8") == canonical.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
