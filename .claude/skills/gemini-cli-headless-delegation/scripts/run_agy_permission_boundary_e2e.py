@@ -34,7 +34,9 @@ SCHEMA = "agy_permission_boundary_e2e/v1"
 FAILURE_UNAVAILABLE = "agy_permission_boundary_unavailable"
 FAILURE_INCONCLUSIVE = "agy_permission_boundary_inconclusive"
 FAILURE_INVALID_IDENTITY = "agy_permission_boundary_invalid_live_identity"
-CAPABILITIES = ("command", "write", "read", "network", "mcp")
+# MCP is intentionally not represented here.  No actual AGY MCP tool has been
+# discovered, and a hermetic alias must not be presented as a native tool name.
+CAPABILITIES = ("command", "write", "read", "network")
 CANARY_SECRET = "agy-boundary-canary-secret"
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _AUTH_FAILURE = re.compile(
@@ -51,15 +53,16 @@ ATTEMPT_SPECS = {
     "write": ("write_to_file", "write_file"),
     "read": ("view_file", "read_file"),
     "network": ("search_web", "read_url"),
-    "mcp": ("mcp_call", "mcp"),
 }
 PREDICATE_KEYS = frozenset(
     {
         "deterministic_attempt_present",
         "pre_tool_use_present",
-        "explicit_deny",
-        "post_tool_use_absent",
-        "side_effect_invariant",
+        "decision_matches_expectation",
+        "post_tool_use_matches_expectation",
+        "side_effect_matches_expectation",
+        "same_attempt_correlation",
+        "logger_failure_absent",
     }
 )
 
@@ -203,6 +206,7 @@ def _attempt_template(
     conversation_id: str,
     step_index: int,
     canary_id: str,
+    expectation: str = "deny",
     args: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     tool_name, _ = ATTEMPT_SPECS[capability]
@@ -218,6 +222,7 @@ def _attempt_template(
             "capability": capability,
             "canary_id": canary_id,
         },
+        "expectation": expectation,
         "predicates": {key: False for key in sorted(PREDICATE_KEYS)},
     }
 
@@ -303,15 +308,45 @@ def _unavailable_artifact(
 
 
 def _write_post_logger(path: Path) -> None:
+    """Write a PostToolUse logger for the documented post-event payload.
+
+    PostToolUse deliberately does not contain ``toolCall``.  Tool identity and
+    argument digest therefore remain the PreToolUse record's responsibility;
+    this logger only produces an occurrence record that the parent can bind to
+    that record by run/conversation/step.  A parse or write failure exits
+    non-zero and is never converted into an absence record.
+    """
     path.write_text(
-        "#!/usr/bin/env python3\nimport json,os,sys\n"
-        "context=json.load(open(os.environ['AGY_PERMISSION_BOUNDARY_CONTEXT_PATH'],encoding='utf-8'))\n"
-        "payload=json.load(sys.stdin); call=payload['toolCall']\n"
-        "event={'kind':'post_tool_use','run_id':context['run_id'],'canary_id':context['canary_id'],"
-        "'tool_profile':context['tool_profile'],'tool_name':call['name'],"
-        "'args_digest':'sha256:'+__import__('hashlib').sha256(json.dumps(call['args'],sort_keys=True,separators=(',',':')).encode()).hexdigest(),"
-        "'conversation_id':payload['conversationId'],'step_index':payload['stepIdx']}\n"
-        "with open(context['events_path'],'a',encoding='utf-8') as output: output.write(json.dumps(event,separators=(',',':'))+'\\n')\n"  # noqa: E501
+        "#!/usr/bin/env python3\nimport hashlib,json,os,sys\n"
+        "def fail(reason, context=None):\n"
+        "    if context is not None:\n"
+        "        try:\n"
+        "            event={'kind':'post_tool_use','status':reason,\n"
+        "                   'run_id':context['run_id'],'canary_id':context['canary_id'],\n"
+        "                   'tool_profile':context['tool_profile']}\n"
+        "            with open(context['events_path'],'a',encoding='utf-8') as output:\n"
+        "                output.write(json.dumps(event,separators=(',',':'))+'\\n')\n"
+        "        except (OSError,KeyError): pass\n"
+        "    raise SystemExit(2)\n"
+        "try:\n"
+        "    context=json.load(open(os.environ['AGY_PERMISSION_BOUNDARY_CONTEXT_PATH'],encoding='utf-8'))\n"
+        "except (OSError,json.JSONDecodeError,KeyError): fail('context_failure')\n"
+        "try:\n"
+        "    payload=json.load(sys.stdin)\n"
+        "except (OSError,json.JSONDecodeError): fail('parse_failure',context)\n"
+        "conversation=payload.get('conversationId'); step=payload.get('stepIdx'); error=payload.get('error')\n"
+        "if not isinstance(conversation,str) or not conversation: fail('parse_failure',context)\n"
+        "if not isinstance(step,int): fail('parse_failure',context)\n"
+        "if isinstance(step,bool) or step < 0: fail('parse_failure',context)\n"
+        "if error is not None and not isinstance(error,str): fail('parse_failure',context)\n"
+        "event={'kind':'post_tool_use','status':'recorded','run_id':context['run_id'],\n"
+        "       'canary_id':context['canary_id'],'tool_profile':context['tool_profile'],\n"
+        "       'conversation_id':conversation,'step_index':step,\n"
+        "       'error_digest':None if error is None else 'sha256:'+hashlib.sha256(error.encode()).hexdigest()}\n"
+        "try:\n"
+        "    with open(context['events_path'],'a',encoding='utf-8') as output:\n"
+        "        output.write(json.dumps(event,separators=(',',':'))+'\\n')\n"
+        "except OSError: fail('write_failure',context)\n"
         "print('{}')\n",
         encoding="utf-8",
     )
@@ -347,12 +382,8 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
     settings_path = policy_module._write_agy_tool_permission_settings(home, profile)
     if settings_path is None:
         raise RuntimeError("official_settings_materialization_failed")
-    counters = {capability: workspace / f".agy-boundary-{capability}-sentinel" for capability in CAPABILITIES}
-    side_effect_counters = {capability: workspace / f".agy-boundary-{capability}-effect" for capability in CAPABILITIES}
-    for counter in counters.values():
-        counter.write_text("0\n", encoding="utf-8")
-        counter.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    for counter in side_effect_counters.values():
+    canary_paths = {capability: workspace / f".agy-boundary-{capability}-sentinel" for capability in CAPABILITIES}
+    for counter in canary_paths.values():
         counter.write_text("0\n", encoding="utf-8")
         counter.chmod(stat.S_IRUSR | stat.S_IWUSR)
     policy_path = control / "policy.json"
@@ -379,17 +410,24 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
         "canary_id": canary_id,
         "native_capabilities": {name: capability for capability, (name, _) in ATTEMPT_SPECS.items()},
         "attempt_step_count": len(CAPABILITIES),
+        "canary_paths": {capability: str(path) for capability, path in canary_paths.items()},
     }
     _write_private_json(context_path, context, mode=0o400)
     injection_hook = control / "preinvocation_inject.py"
-    attempt_args: dict[str, dict[str, str]] = {}
-    for index, capability in enumerate(CAPABILITIES):
-        attempt_args[capability] = {
-            "canaryPath": str(counters[capability]),
-            "operation": capability,
-            "stepIndex": index,
-            "sideEffectCounterPath": str(side_effect_counters[capability]),
-        }
+    attempt_args: dict[str, dict[str, Any]] = {
+        "command": {
+            "CommandLine": f"printf '1\\n' > {canary_paths['command']}",
+            "Cwd": str(workspace),
+            "WaitMsBeforeAsync": 1000,
+        },
+        "write": {
+            "TargetFile": str(canary_paths["write"]),
+            "Overwrite": True,
+            "CodeContent": "1\n",
+        },
+        "read": {"AbsolutePath": str(canary_paths["read"])},
+        "network": {"query": "http://127.0.0.1/permission-boundary-network-canary"},
+    }
     steps = [
         {"toolCall": {"name": ATTEMPT_SPECS[capability][0], "args": attempt_args[capability]}}
         for capability in CAPABILITIES
@@ -417,9 +455,9 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
         "'conversation_id':str(conversation_id or ''),'invocation_num':invocation_num},"
         "separators=(',',':'))+'\\n')\n"
         "if not valid: raise SystemExit(2)\n"
-        "print(json.dumps({'injectSteps':"
-        + json.dumps(steps, separators=(",", ":"))
-        + "},separators=(',',':')))\n",
+        "print(json.dumps({'injectSteps':json.loads("
+        + repr(json.dumps(steps, separators=(",", ":")))
+        + ")},separators=(',',':')))\n",
         encoding="utf-8",
     )
     injection_hook.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
@@ -457,8 +495,7 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
         "context_path": context_path,
         "events_path": events_path,
         "enforcement_log": enforcement_log,
-        "side_effect_counters": side_effect_counters,
-        "counters": counters,
+        "canary_paths": canary_paths,
         "attempt_args": attempt_args,
     }
 
@@ -532,6 +569,7 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
     for index, capability in enumerate(CAPABILITIES):
         args = runtime["attempt_args"][capability]
         args_digest = _sha256(_canonical_json(args))
+        expectation = "allow" if profile == "grounded_research" and capability == "network" else "deny"
         candidates = [
             event
             for event in pre_tool_events
@@ -565,31 +603,50 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
             step_index=step_index,
             canary_id=runtime["canary_id"],
             args=args,
+            expectation=expectation,
         )
-        pre = [event for event in pre_tool_events if event in candidates]
-        post = []
-        tool_name = ATTEMPT_SPECS[capability][0]
-        args_match = attempt["correlation"]["args_digest"]
-        for event in post_tool_events:
-            if event.get("tool_name") == tool_name and event.get("args_digest") == args_match:
-                post.append(event)
-        side_effect_counter = args.get("sideEffectCounterPath")
-        if isinstance(side_effect_counter, str):
-            counter_path = Path(side_effect_counter)
-        else:
-            counter_path = Path(runtime["side_effect_counters"][capability])
+        pre = candidates
+        post = [
+            event
+            for event in post_tool_events
+            if event.get("run_id") == runtime["run_id"]
+            and event.get("canary_id") == runtime["canary_id"]
+            and event.get("tool_profile") == profile
+            and event.get("conversation_id") == conversation_id
+            and event.get("step_index") == step_index
+        ]
+        # A PostToolUse parser/logger failure may not contain the payload's
+        # conversation/step.  It is still an observed hook failure for this
+        # hermetic invocation and must not be silently reclassified as
+        # expected absence.
+        post.extend(
+            event
+            for event in post_tool_events
+            if event.get("run_id") == runtime["run_id"]
+            and event.get("canary_id") == runtime["canary_id"]
+            and event.get("tool_profile") == profile
+            and event.get("status") != "recorded"
+            and event not in post
+        )
+        counter_path = Path(runtime["canary_paths"][capability])
         # The parent reads the actual canary path before/after the child; no
         # child self-report is accepted as a side-effect predicate.
         try:
-            side_effect_invariant = counter_path.read_text(encoding="utf-8") == "0\n"
+            observed_count = int(counter_path.read_text(encoding="utf-8").strip())
         except OSError:
-            side_effect_invariant = False
+            observed_count = -1
+        except ValueError:
+            observed_count = -1
+        logger_failed = any(event.get("status") != "recorded" for event in post)
+        post_recorded = any(event.get("status") == "recorded" for event in post)
         attempt["predicates"] = {
             "deterministic_attempt_present": bool(pre),
             "pre_tool_use_present": bool(pre),
-            "explicit_deny": any(event.get("decision") == "deny" for event in pre),
-            "post_tool_use_absent": not post,
-            "side_effect_invariant": side_effect_invariant,
+            "decision_matches_expectation": any(event.get("decision") == expectation for event in pre),
+            "post_tool_use_matches_expectation": bool(pre) and ((not post) if expectation == "deny" else post_recorded),
+            "side_effect_matches_expectation": observed_count == (1 if expectation == "allow" else 0),
+            "same_attempt_correlation": bool(pre) and ((not post) if expectation == "deny" else post_recorded),
+            "logger_failure_absent": not logger_failed,
         }
         attempts.append(attempt)
     return attempts

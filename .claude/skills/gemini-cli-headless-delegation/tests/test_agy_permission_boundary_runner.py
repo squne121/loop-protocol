@@ -22,7 +22,7 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
-def _fake_agy(path: Path, *, exit_code: int = 0) -> None:
+def _fake_agy(path: Path, *, exit_code: int = 0, post_mode: str = "normal") -> None:
     """Create a fake runtime which dispatches configured hooks, never events."""
     script = """#!/usr/bin/env python3
 import http.server
@@ -49,6 +49,7 @@ hooks = json.loads((home / ".gemini" / "config" / "hooks.json").read_text())
 workspace = pathlib.Path(os.getcwd())
 base = {"conversationId": "conversation-hook", "invocationNum": 7, "workspacePaths": [str(workspace)]}
 state = {"network": 0, "mcp": 0}
+context = json.loads(pathlib.Path(os.environ["AGY_PERMISSION_BOUNDARY_CONTEXT_PATH"]).read_text())
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -69,13 +70,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         return
 
-def invoke(command, payload):
+def invoke(command, payload, *, strict=True):
     if isinstance(command, str):
         command = shlex.split(command)
-    result = subprocess.run(command, input=json.dumps(payload), text=True, capture_output=True, env=os.environ.copy(), check=False)
-    if result.returncode:
+    input_data = payload if isinstance(payload, str) else json.dumps(payload)
+    result = subprocess.run(command, input=input_data, text=True, capture_output=True, env=os.environ.copy(), check=False)
+    if strict and result.returncode:
+        sys.stderr.write(result.stderr)
         raise SystemExit(result.returncode)
-    return json.loads(result.stdout)
+    return result if not strict else json.loads(result.stdout)
+
+
+def record_post_failure(status):
+    event = {"kind": "post_tool_use", "status": status, "run_id": context["run_id"], "canary_id": context["canary_id"], "tool_profile": context["tool_profile"]}
+    with open(context["events_path"], "a", encoding="utf-8") as output:
+        output.write(json.dumps(event, separators=(",", ":")) + "\\n")
 
 
 with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
@@ -102,31 +111,28 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
                 break
         if not dispatched or decision.get("decision") != "allow":
             continue
+        capability = context["native_capabilities"][tool_call["name"]]
         if tool_call["name"] == "search_web":
             urllib.request.urlopen(server_url + "/network?canary=1", timeout=1)
-        elif tool_call["name"] == "mcp_call":
-            req = urllib.request.Request(server_url + "/mcp", data=b"{}", method="POST")
-            urllib.request.urlopen(req, timeout=1)
-
-        side_effect = tool_call["args"].get("sideEffectCounterPath")
-        if isinstance(side_effect, str):
-            side_effect_path = pathlib.Path(side_effect)
-            side_effect_path.write_text(
-                str(int(side_effect_path.read_text(encoding="utf-8").strip() or 0) + 1) + "\\n",
-                encoding="utf-8",
-            )
-        canary = tool_call["args"].get("canaryPath")
-        if isinstance(canary, str):
-            pathlib.Path(canary).write_text("1\\n", encoding="utf-8")
+        side_effect_path = pathlib.Path(context["canary_paths"][capability])
+        side_effect_path.write_text("1\\n", encoding="utf-8")
         for item in hooks["permission-boundary-postlogger"]["PostToolUse"]:
             if item["matcher"] == tool_call["name"]:
-                invoke(item["hooks"][0]["command"], payload)
+                post_payload = {"conversationId": base["conversationId"], "stepIdx": index, "error": None}
+                if "__POST_MODE__" == "parse_failure":
+                    result = invoke(item["hooks"][0]["command"], "{malformed", strict=False)
+                elif "__POST_MODE__" == "nonzero":
+                    result = subprocess.CompletedProcess([], 9, "", "forced")
+                else:
+                    result = invoke(item["hooks"][0]["command"], post_payload, strict=False)
+                if result.returncode:
+                    record_post_failure("logger_nonzero")
     server.shutdown()
     server.server_close()
     thread.join()
     raise SystemExit(__EXIT_CODE__)
 """
-    script = script.replace("__EXIT_CODE__", str(exit_code))
+    script = script.replace("__EXIT_CODE__", str(exit_code)).replace("__POST_MODE__", post_mode)
     path.write_text(script, encoding="utf-8")
     path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
 
@@ -162,19 +168,14 @@ def test_hermetic_fake_dispatches_actual_hooks_and_parent_observes_all_denied_ce
     assert artifact["matrix"]["capabilities"] == list(MODULE.CAPABILITIES)
     assert {attempt["correlation"]["capability"] for attempt in artifact["attempts"]} == set(MODULE.CAPABILITIES)
     for attempt in artifact["attempts"]:
-        assert attempt["predicates"] == {
-            "deterministic_attempt_present": True,
-            "pre_tool_use_present": True,
-            "explicit_deny": True,
-            "post_tool_use_absent": True,
-            "side_effect_invariant": True,
-        }
+        assert attempt["expectation"] == "deny"
+        assert all(attempt["predicates"].values())
     assert artifact["diagnostic_ledger"] == {
         "pre_invocation_hook_started": True,
         "pre_invocation_context_accepted": True,
-        "injected_step_count": 5,
-        "enforcement_event_count": 5,
-        "pre_tool_use_event_count": 5,
+        "injected_step_count": 4,
+        "enforcement_event_count": 4,
+        "pre_tool_use_event_count": 4,
         "post_tool_use_event_count": 0,
         "raw_payload_persisted": False,
     }
@@ -196,10 +197,34 @@ def test_fake_dispatches_registered_posttooluse_only_after_an_allowed_attempt(tm
     _fake_agy(fake)
     assert _run(tmp_path, fake, "--profile", "grounded_research").returncode == 1
     network = next(item for item in _artifact(tmp_path)["attempts"] if item["correlation"]["capability"] == "network")
+    assert network["expectation"] == "allow"
+    assert all(network["predicates"].values())
+
+
+@pytest.mark.parametrize("post_mode", ["parse_failure", "nonzero"])
+def test_posttooluse_logger_failure_is_inconclusive_not_expected_absence(tmp_path: Path, post_mode: str) -> None:
+    fake = tmp_path / "fake-agy"
+    _fake_agy(fake, post_mode=post_mode)
+    run = _run(tmp_path, fake, "--profile", "grounded_research")
+    artifact = _artifact(tmp_path)
+    network = next(item for item in artifact["attempts"] if item["correlation"]["capability"] == "network")
+    assert run.returncode == 1
+    assert network["expectation"] == "allow"
     assert network["predicates"]["pre_tool_use_present"] is True
-    assert network["predicates"]["explicit_deny"] is False
-    assert network["predicates"]["post_tool_use_absent"] is False
-    assert network["predicates"]["side_effect_invariant"] is False
+    assert network["predicates"]["logger_failure_absent"] is False
+    assert network["predicates"]["post_tool_use_matches_expectation"] is False
+    assert network["predicates"]["same_attempt_correlation"] is False
+    assert artifact["failure_taxonomy"]["completion"] is False
+
+
+def test_hermetic_attempts_use_documented_args_and_exclude_undiscovered_mcp(tmp_path: Path) -> None:
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    assert set(runtime["attempt_args"]) == {"command", "write", "read", "network"}
+    assert runtime["attempt_args"]["command"].keys() == {"CommandLine", "Cwd", "WaitMsBeforeAsync"}
+    assert runtime["attempt_args"]["write"].keys() == {"TargetFile", "Overwrite", "CodeContent"}
+    assert runtime["attempt_args"]["read"].keys() == {"AbsolutePath"}
+    assert runtime["attempt_args"]["network"].keys() == {"query"}
+    assert "mcp_call" not in MODULE.ATTEMPT_SPECS
 
 
 def test_live_rejects_agy_override_before_execution(tmp_path: Path) -> None:
@@ -443,9 +468,11 @@ def test_missing_injected_attempt_is_inconclusive(tmp_path: Path, monkeypatch: p
         assert attempt["predicates"] == {
             "deterministic_attempt_present": False,
             "pre_tool_use_present": False,
-            "explicit_deny": False,
-            "post_tool_use_absent": True,
-            "side_effect_invariant": True,
+            "decision_matches_expectation": False,
+            "post_tool_use_matches_expectation": False,
+            "side_effect_matches_expectation": True,
+            "same_attempt_correlation": False,
+            "logger_failure_absent": True,
         }
     assert MODULE.validate_artifact(artifact) == (True, "valid")
 

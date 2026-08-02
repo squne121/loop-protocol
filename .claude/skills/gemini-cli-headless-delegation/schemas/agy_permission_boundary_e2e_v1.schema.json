@@ -33,17 +33,17 @@
       "required": ["profile", "capabilities"],
       "properties": {
         "profile": {"type": "string"},
-        "capabilities": {"type": "array", "minItems": 5, "uniqueItems": true, "items": {"enum": ["command", "write", "read", "network", "mcp"]}}
+        "capabilities": {"type": "array", "minItems": 4, "uniqueItems": true, "items": {"enum": ["command", "write", "read", "network"]}}
       }
     },
-    "attempts": {"type": "array", "minItems": 5, "items": {"$ref": "#/$defs/attempt"}},
+    "attempts": {"type": "array", "minItems": 4, "items": {"$ref": "#/$defs/attempt"}},
     "diagnostic_ledger": {
       "type": "object", "additionalProperties": false,
       "required": ["pre_invocation_hook_started", "pre_invocation_context_accepted", "injected_step_count", "enforcement_event_count", "pre_tool_use_event_count", "post_tool_use_event_count", "raw_payload_persisted"],
       "properties": {
         "pre_invocation_hook_started": {"type": "boolean"},
         "pre_invocation_context_accepted": {"type": "boolean"},
-        "injected_step_count": {"type": "integer", "minimum": 0, "maximum": 5},
+        "injected_step_count": {"type": "integer", "minimum": 0, "maximum": 4},
         "enforcement_event_count": {"type": "integer", "minimum": 0},
         "pre_tool_use_event_count": {"type": "integer", "minimum": 0},
         "post_tool_use_event_count": {"type": "integer", "minimum": 0},
@@ -66,7 +66,7 @@
   "$defs": {
     "attempt": {
       "type": "object", "additionalProperties": false,
-      "required": ["correlation", "predicates"],
+      "required": ["correlation", "expectation", "predicates"],
       "properties": {
         "correlation": {
           "type": "object", "additionalProperties": false,
@@ -78,19 +78,22 @@
             "tool_name": {"type": "string", "minLength": 1},
             "args_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
             "profile": {"type": "string", "minLength": 1},
-            "capability": {"enum": ["command", "write", "read", "network", "mcp"]},
+            "capability": {"enum": ["command", "write", "read", "network"]},
             "canary_id": {"type": "string", "minLength": 1}
           }
         },
+        "expectation": {"enum": ["allow", "deny"]},
         "predicates": {
           "type": "object", "additionalProperties": false,
-          "required": ["deterministic_attempt_present", "pre_tool_use_present", "explicit_deny", "post_tool_use_absent", "side_effect_invariant"],
+          "required": ["deterministic_attempt_present", "pre_tool_use_present", "decision_matches_expectation", "post_tool_use_matches_expectation", "side_effect_matches_expectation", "same_attempt_correlation", "logger_failure_absent"],
           "properties": {
             "deterministic_attempt_present": {"type": "boolean"},
             "pre_tool_use_present": {"type": "boolean"},
-            "explicit_deny": {"type": "boolean"},
-            "post_tool_use_absent": {"type": "boolean"},
-            "side_effect_invariant": {"type": "boolean"}
+            "decision_matches_expectation": {"type": "boolean"},
+            "post_tool_use_matches_expectation": {"type": "boolean"},
+            "side_effect_matches_expectation": {"type": "boolean"},
+            "same_attempt_correlation": {"type": "boolean"},
+            "logger_failure_absent": {"type": "boolean"}
           }
         }
       }

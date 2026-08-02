@@ -49,7 +49,6 @@ NATIVE_TO_RESOURCE: dict[str, str] = {
     "multi_replace_file_content": "write_file",
     "search_web": "read_url",
     "read_url_content": "read_url",
-    "mcp_call": "mcp",
 }
 
 
