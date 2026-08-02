@@ -142,7 +142,7 @@ planner が受け取るのは normalized decision / hash / provenance のみと�
 - `segment`: `# you asked` / `# chatgpt response`（大文字小文字・前後空白差を正規化）マーカーで本文を分節し、各セグメントに `speaker: owner | quoted_assistant | unknown` と `start_line` / `end_line` を付与する。マーカーが存在しない区間の `speaker` は常に `unknown`（`owner` への自動昇格はしない）。
 - `candidates`: `segment` の出力から箇条書き・prose directive 候補を `source_span` 付きで抽出する。各候補は `relation: unclassified` を持ち、単一の `final_candidate` を選択するロジックは持たない。セグメント間の意味関係分類（add/replace/retract/confirm/narrow/conditional/explanation/quotation/unknown）は Out of Scope。
 
-### scope_delta_decision への route（#1891 AC4 / #1950 AC1）
+### scope_delta_decision への経路（#1891 AC4 / #1950 AC1）
 
 `run_refinement_preflight.py` の `_apply_multi_turn_candidate_route()` は、`segment` が検出したマーカー付きセグメントが 2 つ以上あり、かつ `candidates` が複数候補を返した場合に、`known_context.scope_delta_decision` を更新する。単一ターンの通常レビューコメント（マーカーなし）はこの経路の対象外であり、既存の分類結果を維持する。
 
@@ -153,7 +153,7 @@ planner が受け取るのは normalized decision / hash / provenance のみと�
 
 **chronology ≠ semantic relation ≠ technical recommendation ≠ mutation authorization** という 4 軸の分離が本節の前提である。最後の owner turn という chronology の事実だけで、残り 3 軸（そのターンが持つ意味関係・技術推奨・mutation authorization）を決定してはならない。
 
-### material conflict 時の owner reaction 手順（#1950 AC3/AC4）
+### 競合（material conflict）発生時の owner reaction 手順（#1950 AC3/AC4）
 
 trusted OWNER の multi-turn anchor で advisory route に入った後、候補間に material conflict（相互に矛盾する複数の重い変更提案）が存在する場合、root control-plane は以下の手順で owner reaction を読み取り、対象 mutation だけを保留する。
 
