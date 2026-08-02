@@ -19,6 +19,9 @@ Covers:
 
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,6 +31,7 @@ import pytest
 
 _SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
+_LIVE_CANARY_SCRIPT = Path(__file__).parent / "live_canary_blocking_direction.sh"
 
 import create_issue_txn as txn  # noqa: E402
 
@@ -228,6 +232,61 @@ def test_invalid_dependency_inputs_rejected_before_mutation(monkeypatch: pytest.
 
 
 # ---------------------------------------------------------------------------
+# #1946 Owner P0-2 (required test 2): reconcile_transaction rejects 0/negative/bool
+# --blocked-by/--blocking values BEFORE any label/parent/dependency mutation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("invalid_value", [0, -1, True])
+def test_reconcile_transaction_rejects_invalid_dependency_before_any_mutation(
+    invalid_value: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reconcile_transaction must reject 0/negative/bool --blocked-by/--blocking values
+    before mutating labels, parent, or dependency/blocking links (#1946 Owner P0-2).
+
+    Previously reconcile_transaction only ran _validate_dependency_directions (duplicate/
+    self-reference/cross-direction checks), never _normalize_dependency_numbers, so an
+    input like ``--blocking 0`` would reach label mutation before failing while resolving
+    issue #0's node id.
+    """
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError(f"no GitHub mutation should be attempted for invalid input {invalid_value!r}")
+
+    monkeypatch.setattr(txn, "run_command", _boom)
+    monkeypatch.setattr(txn, "_run_gh_json", _boom)
+    monkeypatch.setattr(txn, "_run_gh_text", _boom)
+    monkeypatch.setattr(txn, "_issue_apply_labels", _boom)
+    monkeypatch.setattr(txn, "_issue_register_sub_issue_idempotent", _boom)
+    monkeypatch.setattr(txn, "_issue_register_dependency", _boom)
+    monkeypatch.setattr(txn, "_issue_register_blocking", _boom)
+    monkeypatch.setattr(txn, "_issue_graphql_ids", _boom)
+
+    result = txn.reconcile_transaction(
+        repo="owner/repo",
+        issue_number=99,
+        labels=["x"],
+        parent_issue_number=40,
+        dependency_issue_numbers=[invalid_value],
+        gh_bin="gh",
+    )
+    assert result.status == "failure"
+    assert result.failure_stage == "dependency-parse"
+
+    result_blocking = txn.reconcile_transaction(
+        repo="owner/repo",
+        issue_number=99,
+        labels=["x"],
+        parent_issue_number=40,
+        dependency_issue_numbers=[],
+        blocking_issue_numbers=[invalid_value],
+        gh_bin="gh",
+    )
+    assert result_blocking.status == "failure"
+    assert result_blocking.failure_stage == "dependency-parse"
+
+
+# ---------------------------------------------------------------------------
 # AC4: direction-specific strict readback
 # ---------------------------------------------------------------------------
 
@@ -334,6 +393,10 @@ def test_dedupe_reconcile_partial_failure_bidirectional(monkeypatch: pytest.Monk
         "_readback_labels_with_result",
         lambda *_a, **_k: MagicMock(expected_labels=[], actual_labels=[], attempts=1, retry_delays=[]),
     )
+    # #1946 Owner P0-1: the shared apply/readback helper diffs against the CURRENT
+    # relationship state before mutating. Simulate "nothing registered yet" so both
+    # requested numbers are computed as missing and must be mutated.
+    monkeypatch.setattr(txn, "_current_relationship_numbers", lambda *_a, **_k: ("ok", set()))
 
     register_calls: list[tuple[Any, ...]] = []
 
@@ -365,6 +428,9 @@ def test_dedupe_reconcile_partial_failure_bidirectional(monkeypatch: pytest.Monk
         sleep_fn=fake_sleep,
     )
     assert len(register_calls) == 2, f"Expected 2 register calls, got {register_calls}"
+    # Exact GraphQL node ids must be used for both the issue itself and each target.
+    assert {c[1] for c in register_calls} == {"node-99"}
+    assert {c[2] for c in register_calls} == {"node-10", "node-20"}
     assert len(readback_calls) >= 1, "_readback_blocking must be called at least once"
     assert result.status == "success"
     assert result.blocking_verified is True
@@ -396,6 +462,9 @@ def test_dedupe_reconcile_partial_failure_bidirectional(monkeypatch: pytest.Monk
     assert result2.blocking_verified is True
 
     # --- run_transaction (create path): blocking readback failure -> partial_failure ---
+    # #1946 Owner P1-2: --blocked-by succeeded (dependency_verified stays True from the
+    # prior scenario's registration path) while --blocking fails; both directions must be
+    # reported independently rather than collapsing to null.
     monkeypatch.setattr(txn, "_issue_create", lambda *_a, **_k: "https://github.com/owner/repo/issues/501")
     monkeypatch.setattr(txn, "_readback_blocking", lambda *_a, **_k: False)
     monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
@@ -408,18 +477,39 @@ def test_dedupe_reconcile_partial_failure_bidirectional(monkeypatch: pytest.Monk
         body_file="",
         labels=[],
         parent_issue_number=0,
-        dependency_issue_numbers=[],
+        dependency_issue_numbers=[11],
         blocking_issue_numbers=[30],
         gh_bin="gh",
         sleep_fn=fake_sleep3,
     )
     assert result3.status == "partial_failure"
     assert result3.failure_stage == "blocking-readback"
+    assert result3.dependency_verified is True, "dependency (blocked-by) succeeded and must not be nulled out"
+    assert result3.blocking_verified is False, "blocking failed a readback and must be False, not null"
 
-    # --- dedupe path also reconciles the --blocking direction ---
+    # --- dedupe path also reconciles the --blocking direction: link missing -> mutation
+    # runs -> readback confirms -> status=dedupe (#1946 Owner required test 1 / P0-1) ---
     monkeypatch.setattr(txn, "_find_open_issues_by_title", lambda *_a, **_k: [700])
     monkeypatch.setattr(txn, "_run_gh_json", lambda *_a, **_k: {"body": "", "number": 700})
-    monkeypatch.setattr(txn, "_readback_blocking", lambda *_a, **_k: True)
+
+    dedupe_register_calls: list[tuple[Any, ...]] = []
+
+    def _spy_register_dedupe(repo: str, child_node_id: str, target_node_id: str, gh_bin: str) -> None:
+        dedupe_register_calls.append((repo, child_node_id, target_node_id))
+
+    dedupe_readback_attempts: list[int] = []
+
+    def _spy_readback_mismatch_then_match(
+        repo: str, issue_number: int, nums: list[int], gh_bin: str
+    ) -> bool:
+        # First call (before mutation would be observed): mismatch. Second call (after
+        # mutation): match. This proves the mutation is what causes the transition, not
+        # an unconditional True stub (the exact false-positive Owner flagged).
+        dedupe_readback_attempts.append(1)
+        return len(dedupe_readback_attempts) > 1
+
+    monkeypatch.setattr(txn, "_issue_register_blocking", _spy_register_dedupe)
+    monkeypatch.setattr(txn, "_readback_blocking", _spy_readback_mismatch_then_match)
 
     fake_sleep4 = FakeSleep()
     result4 = txn.run_transaction(
@@ -437,6 +527,11 @@ def test_dedupe_reconcile_partial_failure_bidirectional(monkeypatch: pytest.Monk
     assert result4.status == "dedupe"
     assert result4.dedupe_number == 700
     assert result4.blocking_verified is True
+    assert len(dedupe_register_calls) == 1, (
+        f"dedupe path must actually mutate the missing blocking link, got {dedupe_register_calls}"
+    )
+    assert dedupe_register_calls[0][2] == "node-42"
+    assert len(dedupe_readback_attempts) >= 2, "readback must be retried after mutation, not stubbed unconditionally"
 
     # --- recovery hint covers the blocking stage ---
     hint = txn._recovery_hint_for_stage("blocking-readback", "owner/repo", 42, 0, [], [99])
@@ -473,3 +568,262 @@ def test_issue_create_does_not_forward_dependency_flags(monkeypatch: pytest.Monk
     names = set(sig.parameters.keys())
     assert "dependency_issue_numbers" not in names
     assert "blocking_issue_numbers" not in names
+
+
+# ---------------------------------------------------------------------------
+# #1946 Owner P1-3 (required tests 4/5): full pagination + null-issue handling
+# for the target-side blockedBy cross-check used by the --blocking direction.
+# ---------------------------------------------------------------------------
+
+
+def test_target_blockedby_contains_paginates_past_100_and_finds_second_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Required test 4: a target issue with more than 100 existing blockers, where the
+    expected issue is only on the SECOND page, must not produce a false negative.
+
+    Regression: the previous _target_blockedby_contains() fetched only blockedBy(first:100)
+    with no pageInfo/cursor traversal, so an expected issue past the first 100 nodes
+    was silently missed.
+    """
+    calls: list[list[str]] = []
+
+    def _payload(*, total_count: int, has_next_page: bool, end_cursor: Any, numbers: list[int]) -> str:
+        return json.dumps(
+            {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "blockedBy": {
+                                "totalCount": total_count,
+                                "pageInfo": {"hasNextPage": has_next_page, "endCursor": end_cursor},
+                                "nodes": [{"number": n} for n in numbers],
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+    def _fake_run(args: list[str], **_k: Any) -> Any:
+        calls.append(args)
+        has_after = any(a.startswith("after=") for a in args)
+        if not has_after:
+            # First page: 100 filler numbers, hasNextPage true.
+            return _make_gh_result(
+                stdout=_payload(
+                    total_count=101, has_next_page=True, end_cursor="CURSOR1", numbers=list(range(1, 101))
+                )
+            )
+        # Second page: the expected issue (number 999) plus hasNextPage false.
+        return _make_gh_result(
+            stdout=_payload(total_count=101, has_next_page=False, end_cursor=None, numbers=[999])
+        )
+
+    monkeypatch.setattr(txn, "run_command", _fake_run)
+    assert txn._target_blockedby_contains("owner/repo", 500, 999, "gh") is True
+    assert len(calls) == 2, f"expected exactly 2 paginated calls, got {len(calls)}"
+    assert any("after=CURSOR1" in a for a in calls[1]), "second call must pass the endCursor from page 1"
+
+    # Same setup, but looking for an issue number that does NOT appear on either page.
+    calls.clear()
+    monkeypatch.setattr(txn, "run_command", _fake_run)
+    assert txn._target_blockedby_contains("owner/repo", 500, 12345, "gh") is False
+
+
+def test_paginated_relationship_numbers_handles_null_issue_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Required test 5: a GraphQL response with `issue: null` (deleted/inaccessible issue)
+    must be a structured failure, never an uncaught AttributeError/traceback.
+    """
+    monkeypatch.setattr(
+        txn,
+        "run_command",
+        lambda *_a, **_k: _make_gh_result(
+            stdout='{"data":{"repository":{"issue":null}}}'
+        ),
+    )
+
+    # Low-level pagination primitive: structured "issue_not_found", not an exception.
+    status, numbers = txn._paginated_relationship_numbers("owner/repo", 999999, "blockedBy", "gh")
+    assert status == "issue_not_found"
+    assert numbers == set()
+
+    # Callers built on top of it must degrade to a safe False/empty result, not raise.
+    assert txn._target_blockedby_contains("owner/repo", 999999, 1, "gh") is False
+    assert txn._readback_dependencies("owner/repo", 999999, [1], "gh") is False
+    assert txn._readback_blocking("owner/repo", 999999, [1], "gh") is False
+
+    current_status, current_numbers = txn._current_relationship_numbers(
+        "owner/repo", 999999, "blocked_by", "gh"
+    )
+    assert current_status == "issue_not_found"
+    assert current_numbers == set()
+
+
+def test_apply_relationship_direction_reports_actual_state_unavailable_on_current_state_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the current-state readback (used to compute the mutation diff) returns
+    issue_not_found/invalid_payload, _apply_relationship_direction must not raise and
+    must report failed_readback.actual_issue_numbers as the literal sentinel
+    "actual_state_unavailable" (#1946 Owner P1-2), not a fabricated empty list.
+    """
+    monkeypatch.setattr(
+        txn, "_current_relationship_numbers", lambda *_a, **_k: ("issue_not_found", set())
+    )
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("no mutation should be attempted when current-state is unavailable")
+
+    monkeypatch.setattr(txn, "_issue_register_dependency", _boom)
+    monkeypatch.setattr(txn, "_issue_graphql_ids", _boom)
+
+    result = txn._apply_relationship_direction(
+        "owner/repo", 42, [10, 20], "blocked_by", "gh", sleep_fn=lambda _d: None
+    )
+    assert result.verified is False
+    assert result.mutated_numbers == []
+    assert result.failed_readback is not None
+    assert result.failed_readback["actual_issue_numbers"] == "actual_state_unavailable"
+    assert result.failed_readback["error_kind"] == "actual_state_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# #1946 Owner P1-1 (required tests 6/7): live_canary_blocking_direction.sh's
+# _cleanup() function, driven via `bash -c` (no new repo-tracked test file --
+# stays within this file's Allowed Paths). Sources the canary script with
+# LIVE_CANARY_TEST_MODE=1 (skips preflight/steps/trap registration; see the
+# guard added to that script), stubs `gh` with a controllable fake function,
+# and asserts on _cleanup's exit code / whether it discovered+removed a
+# leftover relationship.
+# ---------------------------------------------------------------------------
+
+
+def _run_cleanup_scenario(gh_fake_body: str, state_lines: str) -> tuple[int, str]:
+    """Run live_canary_blocking_direction.sh's _cleanup() in isolation via bash -c.
+
+    ``gh_fake_body`` is the body of a ``gh() { ... }`` shell function that stands in for
+    the real ``gh`` CLI (no live GitHub calls). ``state_lines`` sets up
+    DISPOSABLE_A_NUMBER/DISPOSABLE_B_NUMBER/RELATIONSHIP_REGISTERED/CLEANUP_FAILED/REPO/
+    LOG_FILE before invoking ``_cleanup`` in a subshell.
+    """
+    if shutil.which("bash") is None:
+        pytest.skip("bash not available")
+    script_lines = [
+        "set -u",
+        "export LIVE_CANARY_TEST_MODE=1",
+        f'source "{_LIVE_CANARY_SCRIPT}"',
+        state_lines,
+        "gh() {",
+        gh_fake_body,
+        "}",
+        "export -f gh",
+        "( _cleanup )",
+        'echo "EXITCODE=$?"',
+    ]
+    script = "\n".join(script_lines)
+    cp = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    return cp.returncode, cp.stdout + cp.stderr
+
+
+def test_live_canary_cleanup_exits_nonzero_when_relationship_removal_fails() -> None:
+    """Required test 6: relationship-removal mutation failure -> _cleanup exits 1, not 0.
+
+    Regression: the previous _cleanup only set CLEANUP_FAILED but never changed the exit
+    code, so the trap-driven exit stayed whatever the main script last set (often 0).
+    """
+    gh_fake_body = (
+        '  local args=("$@")\n'
+        '  if [[ "${args[*]}" == *"removeBlockedBy"* ]]; then\n'
+        "    return 1\n"
+        "  fi\n"
+        '  if [[ "${args[*]}" == *"blocking(first:10)"* ]]; then\n'
+        '    echo "200"\n'
+        "    return 0\n"
+        "  fi\n"
+        "  return 0\n"
+    )
+    state_lines = "\n".join(
+        [
+            'REPO="owner/repo"',
+            'LOG_FILE="$(mktemp)"',
+            'DISPOSABLE_A_NUMBER="100"',
+            'DISPOSABLE_B_NUMBER="200"',
+            'RELATIONSHIP_REGISTERED="unknown"',
+            'CLEANUP_FAILED="0"',
+        ]
+    )
+    _rc, out = _run_cleanup_scenario(gh_fake_body, state_lines)
+    assert "EXITCODE=1" in out, f"expected _cleanup to exit 1 on removal failure; got: {out!r}"
+
+
+def test_live_canary_cleanup_exits_nonzero_when_issue_close_fails() -> None:
+    """Required test 6 (variant): issue-close failure alone -> _cleanup exits 1."""
+    gh_fake_body = (
+        '  local args=("$@")\n'
+        '  if [[ "${args[*]}" == *"issue"*"close"* ]]; then\n'
+        "    return 1\n"
+        "  fi\n"
+        "  return 0\n"
+    )
+    state_lines = "\n".join(
+        [
+            'REPO="owner/repo"',
+            'LOG_FILE="$(mktemp)"',
+            'DISPOSABLE_A_NUMBER="101"',
+            'DISPOSABLE_B_NUMBER="201"',
+            'RELATIONSHIP_REGISTERED="yes"',
+            'CLEANUP_FAILED="0"',
+        ]
+    )
+    _rc, out = _run_cleanup_scenario(gh_fake_body, state_lines)
+    assert "EXITCODE=1" in out, f"expected _cleanup to exit 1 on issue-close failure; got: {out!r}"
+
+
+def test_live_canary_cleanup_discovers_and_removes_leftover_relationship_after_partial_failure() -> None:
+    """Required test 7: even when RELATIONSHIP_REGISTERED is left "unknown" (as happens
+    after a create_issue_txn.py partial_failure -- the caller does not know whether the
+    mutation actually landed), _cleanup independently reads back the current relationship
+    state and removes it if present, rather than skipping cleanup entirely.
+    """
+    marker_flag = "REMOVED_MARKER_SEEN"
+    gh_fake_body = (
+        '  local args=("$@")\n'
+        '  if [[ "${args[*]}" == *"removeBlockedBy"* ]]; then\n'
+        f'    echo "{marker_flag}" >> "${{LOG_FILE}}.marker"\n'
+        "    return 0\n"
+        "  fi\n"
+        '  if [[ "${args[*]}" == *"issue"*"close"* ]]; then\n'
+        "    return 0\n"
+        "  fi\n"
+        '  if [[ "${args[*]}" == *"blocking(first:10)"* ]]; then\n'
+        '    if [ ! -f "${LOG_FILE}.marker" ]; then\n'
+        '      echo "202"\n'
+        "    fi\n"
+        "    return 0\n"
+        "  fi\n"
+        '  if [[ "${args[*]}" == *"{issue(number:\\$number){id}}"* ]]; then\n'
+        '    echo "NODE_ID_STUB"\n'
+        "    return 0\n"
+        "  fi\n"
+        "  return 0\n"
+    )
+    state_lines = "\n".join(
+        [
+            'REPO="owner/repo"',
+            'LOG_FILE="$(mktemp)"',
+            'DISPOSABLE_A_NUMBER="102"',
+            'DISPOSABLE_B_NUMBER="202"',
+            'RELATIONSHIP_REGISTERED="unknown"',
+            'CLEANUP_FAILED="0"',
+        ]
+    )
+    _rc, out = _run_cleanup_scenario(gh_fake_body, state_lines)
+    assert "EXITCODE=0" in out, (
+        f"expected _cleanup to exit 0 after successfully removing the leftover link; got: {out!r}"
+    )
+    assert marker_flag in out or "cleanup: relationship readback confirms" in out, (
+        f"expected _cleanup to have discovered and removed the leftover relationship; got: {out!r}"
+    )

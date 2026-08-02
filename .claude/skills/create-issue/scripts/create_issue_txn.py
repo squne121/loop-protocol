@@ -1276,12 +1276,17 @@ def _readback_dependencies(repo: str, issue_number: int, dependency_issue_number
     ]
     payload = _run_gh_json(args, stage="dependency-readback")
     try:
-        conn = payload["data"]["repository"]["issue"].get("blockedBy", {}) or {}
+        issue_payload = payload["data"]["repository"]["issue"]
+        if issue_payload is None:
+            # GraphQL responded successfully but the issue is null (deleted/inaccessible):
+            # a structured False, not a traceback (#1946 Owner P1-3).
+            return False
+        conn = issue_payload.get("blockedBy", {}) or {}
         nodes = conn.get("nodes", []) or []
         readback_numbers = {int(item.get("number")) for item in nodes if item.get("number") is not None}
         total_count = conn.get("totalCount")
         has_next_page = conn.get("pageInfo", {}).get("hasNextPage")
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, AttributeError):
         return False
     expected = set(dependency_issue_numbers)
     if readback_numbers != expected:
@@ -1293,38 +1298,242 @@ def _readback_dependencies(repo: str, issue_number: int, dependency_issue_number
     return True
 
 
+# max_pages guard: caps full-connection pagination at 50 pages * 100 nodes/page = 5000
+# relationships. This bounds worst-case GraphQL round trips for _paginated_relationship_numbers
+# while remaining far above any realistic blockedBy/blocking connection size.
+_RELATIONSHIP_PAGINATION_MAX_PAGES = 50
+
+
+def _paginated_relationship_numbers(
+    repo: str, target_issue_number: int, connection_field: str, gh_bin: str
+) -> tuple[str, set[int]]:
+    """Fully paginate a ``blockedBy``/``blocking`` connection for ``target_issue_number``
+    (#1946 Owner P1-3: a single ``first:100`` page is not enough once a target issue has
+    more than 100 relationships in that direction; this walks every page via cursor).
+
+    Returns ``(status, numbers)`` where ``status`` is one of:
+      "ok"              — ``numbers`` contains the complete connection (all pages).
+      "issue_not_found" — GraphQL responded successfully but ``issue`` is null
+                           (deleted/inaccessible issue); a structured failure, never a
+                           traceback.
+      "invalid_payload" — the payload shape was unexpected (missing keys, or pagination
+                           did not terminate within ``_RELATIONSHIP_PAGINATION_MAX_PAGES``).
+    """
+    owner, name = _github_owner_repo(repo)
+    numbers: set[int] = set()
+    after: str | None = None
+    # NOTE: connection_field is interpolated via plain string concatenation (not an
+    # f-string) on purpose -- mixing f-string {{ }} escaping with plain-string literal
+    # braces in the same expression is exactly the kind of off-by-one-brace bug this
+    # helper must not have (a prior draft of this function had this bug and produced
+    # invalid GraphQL that gh rejected with a syntax error, silently downgrading every
+    # --blocking readback to "invalid_payload" -- caught by the #1946 AC8 live canary).
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!,$after:String){"
+        "repository(owner:$owner,name:$name){"
+        "issue(number:$number){"
+        + connection_field
+        + "(first:100,after:$after){"
+        "totalCount pageInfo{hasNextPage endCursor} nodes{number}"
+        "}}}}"
+    )
+    for _ in range(_RELATIONSHIP_PAGINATION_MAX_PAGES):
+        args = [
+            gh_bin,
+            "api",
+            "graphql",
+            "-f",
+            "query=\n" + query,
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={target_issue_number}",
+        ]
+        if after:
+            args += ["-F", f"after={after}"]
+        try:
+            payload = _run_gh_json(args, stage="relationship-readback")
+            repository = payload["data"]["repository"]
+        except (TransactionError, KeyError, TypeError):
+            return "invalid_payload", set()
+        if not isinstance(repository, dict):
+            return "invalid_payload", set()
+        issue_payload = repository.get("issue")
+        if issue_payload is None:
+            # GraphQL responded successfully but the issue is null: structured failure,
+            # never an AttributeError traceback (#1946 Owner P1-3).
+            return "issue_not_found", set()
+        conn = issue_payload.get(connection_field) or {}
+        nodes = conn.get("nodes", []) or []
+        for item in nodes:
+            item_number = item.get("number")
+            if item_number is not None:
+                numbers.add(int(item_number))
+        page_info = conn.get("pageInfo") or {}
+        if page_info.get("hasNextPage"):
+            after = page_info.get("endCursor")
+            if not after:
+                return "invalid_payload", numbers
+            continue
+        return "ok", numbers
+    return "invalid_payload", numbers
+
+
 def _target_blockedby_contains(repo: str, target_issue_number: int, expected_issue_number: int, gh_bin: str) -> bool:
     """Return True if ``target_issue_number``'s ``blockedBy`` connection contains
     ``expected_issue_number`` (used as the target-side cross-check for the ``--blocking``
     direction: AC4 requires confirming each blocking target's blockedBy sees the new
-    issue, not just that the new issue's own ``blocking`` connection reports it)."""
-    owner, name = _github_owner_repo(repo)
-    query = (
-        "query($owner:String!,$name:String!,$number:Int!){"
-        "repository(owner:$owner,name:$name){"
-        "issue(number:$number){blockedBy(first:100){nodes{number}}}"
-        "}}"
-    )
-    args = [
-        gh_bin,
-        "api",
-        "graphql",
-        "-f",
-        "query=\n" + query,
-        "-F",
-        f"owner={owner}",
-        "-F",
-        f"name={name}",
-        "-F",
-        f"number={target_issue_number}",
-    ]
-    try:
-        payload = _run_gh_json(args, stage="blocking-readback")
-        nodes = payload["data"]["repository"]["issue"].get("blockedBy", {}).get("nodes", []) or []
-        numbers = {int(item.get("number")) for item in nodes if item.get("number") is not None}
-    except (TransactionError, KeyError, TypeError):
+    issue, not just that the new issue's own ``blocking`` connection reports it).
+
+    Uses full pagination (#1946 Owner P1-3) so a target issue with more than 100
+    existing blockers does not produce a false negative when the expected issue is on a
+    later page, and treats a null ``issue`` payload as a structured non-match rather than
+    an uncaught ``AttributeError``.
+    """
+    status, numbers = _paginated_relationship_numbers(repo, target_issue_number, "blockedBy", gh_bin)
+    if status != "ok":
         return False
     return expected_issue_number in numbers
+
+
+def _current_relationship_numbers(
+    repo: str,
+    issue_number: int,
+    direction: Literal["blocked_by", "blocking"],
+    gh_bin: str,
+) -> tuple[str, set[int]]:
+    """Return the current (fully paginated) relationship numbers for ``issue_number`` in
+    the given direction. Thin, direction-aware wrapper around
+    ``_paginated_relationship_numbers`` used by ``_apply_relationship_direction`` to
+    compute the mutation diff (#1946 Owner P0-1)."""
+    connection_field = "blockedBy" if direction == "blocked_by" else "blocking"
+    return _paginated_relationship_numbers(repo, issue_number, connection_field, gh_bin)
+
+
+@dataclass(frozen=True)
+class RelationshipApplyResult:
+    """Result of a shared relationship apply/readback pass (#1946 Owner P0-1)."""
+
+    verified: bool
+    mutated_numbers: list[int]
+    already_present_numbers: list[int]
+    completed_steps: list[str]
+    failed_readback: dict | None = None
+
+
+def _apply_relationship_direction(
+    repo: str,
+    issue_number: int,
+    desired_issue_numbers: list[int],
+    direction: Literal["blocked_by", "blocking"],
+    gh_bin: str,
+    *,
+    assume_current_empty: bool = False,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> RelationshipApplyResult:
+    """Shared relationship apply/readback helper used by the create, dedupe
+    (``_reconcile_issue_links``), and ``reconcile_transaction`` paths alike (#1946 Owner
+    P0-1). Computes the diff between ``desired_issue_numbers`` and the issue's CURRENT
+    relationship state (full pagination via ``_current_relationship_numbers``), mutates
+    ONLY the numbers that are missing (already-present numbers are never re-mutated),
+    then re-reads back to confirm the final state strictly matches ``desired_issue_numbers``.
+
+    ``assume_current_empty=True`` skips the current-state query entirely and treats every
+    desired number as missing. This is safe (and avoids a redundant GraphQL round trip)
+    only for a just-created issue, which by construction cannot already have any
+    blockedBy/blocking relationships.
+    """
+    step_name = "dependency" if direction == "blocked_by" else "blocking"
+
+    if not desired_issue_numbers:
+        return RelationshipApplyResult(
+            verified=True, mutated_numbers=[], already_present_numbers=[], completed_steps=[]
+        )
+
+    desired_set = set(desired_issue_numbers)
+
+    if assume_current_empty:
+        current_numbers: set[int] = set()
+        missing = sorted(desired_set)
+    else:
+        status, current_numbers = _current_relationship_numbers(repo, issue_number, direction, gh_bin)
+        if status != "ok":
+            return RelationshipApplyResult(
+                verified=False,
+                mutated_numbers=[],
+                already_present_numbers=[],
+                completed_steps=[],
+                failed_readback={
+                    "stage": f"{step_name}-readback",
+                    "direction": direction,
+                    "expected_issue_numbers": sorted(desired_set),
+                    "actual_issue_numbers": "actual_state_unavailable",
+                    "expected_labels": [],
+                    "actual_labels": [],
+                    "attempts": 1,
+                    "retry_delays": [],
+                    "error_kind": "actual_state_unavailable" if status == "issue_not_found" else "invalid_payload",
+                    "message": f"{step_name} current-state readback returned {status} for #{issue_number}",
+                },
+            )
+        missing = sorted(desired_set - current_numbers)
+
+    completed_steps: list[str] = []
+    if missing:
+        child_node_id, _ = _issue_graphql_ids(repo, issue_number, gh_bin)
+        for target_number in missing:
+            target_node_id, _ = _issue_graphql_ids(repo, target_number, gh_bin)
+            if direction == "blocked_by":
+                _issue_register_dependency(repo, child_node_id, target_node_id, gh_bin)
+            else:
+                _issue_register_blocking(repo, child_node_id, target_node_id, gh_bin)
+        completed_steps.append(step_name)
+
+    verify_fn = _readback_dependencies if direction == "blocked_by" else _readback_blocking
+    verified = verify_fn(repo, issue_number, sorted(desired_set), gh_bin)
+    if not verified:
+        sleep_fn(2.0)
+        verified = verify_fn(repo, issue_number, sorted(desired_set), gh_bin)
+
+    if verified:
+        completed_steps.append(f"{step_name}-readback")
+        return RelationshipApplyResult(
+            verified=True,
+            mutated_numbers=missing,
+            already_present_numbers=sorted(desired_set & current_numbers),
+            completed_steps=completed_steps,
+        )
+
+    # Final readback failed: fetch actual numbers for diagnostics (best-effort). Skipped
+    # for assume_current_empty (create path) to avoid an extra live query on a failure
+    # path that is already about to raise/report; "actual_state_unavailable" is reported
+    # instead (#1946 Owner P1-2).
+    if assume_current_empty:
+        actual_report: Any = "actual_state_unavailable"
+    else:
+        actual_status, actual_numbers = _current_relationship_numbers(repo, issue_number, direction, gh_bin)
+        actual_report = sorted(actual_numbers) if actual_status == "ok" else "actual_state_unavailable"
+
+    return RelationshipApplyResult(
+        verified=False,
+        mutated_numbers=missing,
+        already_present_numbers=sorted(desired_set & current_numbers),
+        completed_steps=completed_steps,
+        failed_readback={
+            "stage": f"{step_name}-readback",
+            "direction": direction,
+            "expected_issue_numbers": sorted(desired_set),
+            "actual_issue_numbers": actual_report,
+            "expected_labels": [],
+            "actual_labels": [],
+            "attempts": 2,
+            "retry_delays": [2.0],
+            "error_kind": "missing_expected_labels",
+            "message": f"{step_name} read-back mismatch after retries",
+        },
+    )
 
 
 def _readback_blocking(repo: str, issue_number: int, blocking_issue_numbers: list[int], gh_bin: str) -> bool:
@@ -1360,12 +1569,17 @@ def _readback_blocking(repo: str, issue_number: int, blocking_issue_numbers: lis
     ]
     payload = _run_gh_json(args, stage="blocking-readback")
     try:
-        conn = payload["data"]["repository"]["issue"].get("blocking", {}) or {}
+        issue_payload = payload["data"]["repository"]["issue"]
+        if issue_payload is None:
+            # GraphQL responded successfully but the issue is null (deleted/inaccessible):
+            # a structured False, not a traceback (#1946 Owner P1-3).
+            return False
+        conn = issue_payload.get("blocking", {}) or {}
         nodes = conn.get("nodes", []) or []
         readback_numbers = {int(item.get("number")) for item in nodes if item.get("number") is not None}
         total_count = conn.get("totalCount")
         has_next_page = conn.get("pageInfo", {}).get("hasNextPage")
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, AttributeError):
         return False
     expected = set(blocking_issue_numbers)
     if readback_numbers != expected:
@@ -1687,21 +1901,38 @@ def _reconcile_issue_links(
         completed.append("sub-issue-readback")
 
     if dependency_issue_numbers:
-        dependency_verified = _readback_dependencies(repo, issue_number, dependency_issue_numbers, gh_bin)
-        if not dependency_verified:
-            # Retry once after a brief delay (GitHub API propagation)
-            sleep_fn(2.0)
-            dependency_verified = _readback_dependencies(repo, issue_number, dependency_issue_numbers, gh_bin)
+        # #1946 Owner P0-1: the previous implementation only read back the --blocked-by
+        # direction here and never mutated it, so a dedupe issue missing the link was
+        # silently left unregistered. _apply_relationship_direction computes the diff
+        # against the CURRENT state and mutates only what is missing.
+        dep_apply = _apply_relationship_direction(
+            repo,
+            issue_number,
+            list(dependency_issue_numbers),
+            "blocked_by",
+            gh_bin,
+            sleep_fn=sleep_fn,
+        )
+        if dep_apply.mutated_numbers:
+            completed.append("dependency")
+        dependency_verified = dep_apply.verified
         if not dependency_verified:
             raise TransactionError(stage="dependency-readback", message="dependency (blocked-by) read-back mismatch")
         completed.append("dependency-readback")
 
     if blocking_issue_numbers:
-        blocking_verified = _readback_blocking(repo, issue_number, blocking_issue_numbers, gh_bin)
-        if not blocking_verified:
-            # Retry once after a brief delay (GitHub API propagation)
-            sleep_fn(2.0)
-            blocking_verified = _readback_blocking(repo, issue_number, blocking_issue_numbers, gh_bin)
+        # #1946 Owner P0-1: same fix as above, mirrored for the --blocking direction.
+        blk_apply = _apply_relationship_direction(
+            repo,
+            issue_number,
+            list(blocking_issue_numbers),
+            "blocking",
+            gh_bin,
+            sleep_fn=sleep_fn,
+        )
+        if blk_apply.mutated_numbers:
+            completed.append("blocking")
+        blocking_verified = blk_apply.verified
         if not blocking_verified:
             raise TransactionError(stage="blocking-readback", message="blocking read-back mismatch")
         completed.append("blocking-readback")
@@ -2163,6 +2394,17 @@ def run_transaction(
     pending_steps: list[str] = []
     failed_readbacks: list[dict] = []
 
+    # #1946 Owner P1-2: initialize each verification state OUTSIDE the try block so an
+    # exception raised partway through (e.g. --blocked-by succeeds, --blocking then fails)
+    # carries the TRUE partial-progress state into the except handler below, instead of
+    # a hardcoded None/None/None that contradicts verified_steps.
+    #   None  -> not attempted
+    #   False -> readback attempted but did not match
+    #   True  -> readback confirmed
+    parent_verified: bool | None = None
+    dependency_verified: bool | None = None
+    blocking_verified: bool | None = None
+
     try:
         # AC3: reject self-reference before any dependency mutation -- the newly
         # created issue cannot be its own --blocked-by/--blocking entry. This can only
@@ -2260,79 +2502,52 @@ def run_transaction(
             completed.append("sub_issue")
             applied_steps.append("sub_issue")
 
-        dependency_registered = True
         if normalized_dependency_issue_numbers:
-            dep_ids: list[str] = []
-            for dependency in normalized_dependency_issue_numbers:
-                dep_node_id, _ = _issue_graphql_ids(repo, dependency, gh_bin)
-                dep_ids.append(dep_node_id)
-
-            if len(dep_ids) != len(normalized_dependency_issue_numbers):
-                raise TransactionError(stage="dependency-register", message="dependency id query mismatch")
-
-            for dep_node_id in dep_ids:
-                _issue_register_dependency(repo, child_node_id, dep_node_id, gh_bin)
-            completed.append("dependency")
-            applied_steps.append("dependency")
-
-            dependency_registered = _readback_dependencies(
+            # #1946 Owner P0-1: shared apply/readback helper (also used by dedupe/reconcile).
+            # assume_current_empty=True is safe here: the issue was just created, so it
+            # cannot already have any blockedBy relationships.
+            dep_apply = _apply_relationship_direction(
                 repo,
                 issue_number,
                 normalized_dependency_issue_numbers,
+                "blocked_by",
                 gh_bin,
+                assume_current_empty=True,
+                sleep_fn=sleep_fn,
             )
-            if not dependency_registered:
-                # Retry once after a brief delay (GitHub API propagation)
-                sleep_fn(2.0)
-                dependency_registered = _readback_dependencies(
-                    repo,
-                    issue_number,
-                    normalized_dependency_issue_numbers,
-                    gh_bin,
-                )
-            if not dependency_registered:
+            if dep_apply.mutated_numbers:
+                completed.append("dependency")
+                applied_steps.append("dependency")
+
+            dependency_verified = dep_apply.verified
+            if not dependency_verified:
                 raise TransactionError(stage="dependency-readback", message="dependency read-back mismatch")
 
             completed.append("dependency-readback")
             verified_steps.append("dependency-readback")
 
-        blocking_registered = True
         if normalized_blocking_issue_numbers:
-            target_ids: list[str] = []
-            for target_number in normalized_blocking_issue_numbers:
-                target_node_id, _ = _issue_graphql_ids(repo, target_number, gh_bin)
-                target_ids.append(target_node_id)
-
-            if len(target_ids) != len(normalized_blocking_issue_numbers):
-                raise TransactionError(stage="blocking-register", message="blocking id query mismatch")
-
-            for target_node_id in target_ids:
-                _issue_register_blocking(repo, child_node_id, target_node_id, gh_bin)
-            completed.append("blocking")
-            applied_steps.append("blocking")
-
-            blocking_registered = _readback_blocking(
+            # #1946 Owner P0-1: same shared helper, mirrored for --blocking.
+            blk_apply = _apply_relationship_direction(
                 repo,
                 issue_number,
                 normalized_blocking_issue_numbers,
+                "blocking",
                 gh_bin,
+                assume_current_empty=True,
+                sleep_fn=sleep_fn,
             )
-            if not blocking_registered:
-                # Retry once after a brief delay (GitHub API propagation)
-                sleep_fn(2.0)
-                blocking_registered = _readback_blocking(
-                    repo,
-                    issue_number,
-                    normalized_blocking_issue_numbers,
-                    gh_bin,
-                )
-            if not blocking_registered:
+            if blk_apply.mutated_numbers:
+                completed.append("blocking")
+                applied_steps.append("blocking")
+
+            blocking_verified = blk_apply.verified
+            if not blocking_verified:
                 raise TransactionError(stage="blocking-readback", message="blocking read-back mismatch")
 
             completed.append("blocking-readback")
             verified_steps.append("blocking-readback")
 
-        parent_verified = True
         if parent_issue_number:
             parent_verified = _readback_parent_issue_with_retry(
                 repo, issue_number, parent_issue_number, gh_bin, sleep_fn=sleep_fn
@@ -2371,8 +2586,8 @@ def run_transaction(
                 failure_stage=failed_readbacks[0]["stage"],
                 failure_message=failed_readbacks[0]["message"],
                 parent_verified=parent_verified if parent_issue_number else None,
-                dependency_verified=dependency_registered if normalized_dependency_issue_numbers else None,
-                blocking_verified=blocking_registered if normalized_blocking_issue_numbers else None,
+                dependency_verified=dependency_verified if normalized_dependency_issue_numbers else None,
+                blocking_verified=blocking_verified if normalized_blocking_issue_numbers else None,
                 failed_readbacks=failed_readbacks,
                 applied_steps=applied_steps,
                 verified_steps=verified_steps,
@@ -2386,8 +2601,8 @@ def run_transaction(
             issue_url=issue_url,
             completed_steps=completed,
             parent_verified=parent_verified if parent_issue_number else None,
-            dependency_verified=dependency_registered if normalized_dependency_issue_numbers else None,
-            blocking_verified=blocking_registered if normalized_blocking_issue_numbers else None,
+            dependency_verified=dependency_verified if normalized_dependency_issue_numbers else None,
+            blocking_verified=blocking_verified if normalized_blocking_issue_numbers else None,
             applied_steps=applied_steps,
             verified_steps=verified_steps,
             pending_steps=pending_steps,
@@ -2405,8 +2620,14 @@ def run_transaction(
             dependency_issue_numbers=normalized_dependency_issue_numbers,
             blocking_issue_numbers=normalized_blocking_issue_numbers,
             gh_bin=gh_bin,
-            parent_verified=None,
-            dependency_verified=None,
+            # #1946 Owner P1-2: pass through the ACTUAL partial-progress state (tracked
+            # outside the try block above) instead of hardcoded None, so a receipt like
+            # "dependency-readback completed but blocking-readback failed" is represented
+            # faithfully (dependency_verified=True, blocking_verified=False) rather than
+            # both collapsing to null.
+            parent_verified=parent_verified,
+            dependency_verified=dependency_verified,
+            blocking_verified=blocking_verified,
             failure_context="\n".join(
                 [
                     f"matching_issue_numbers={matching_issue_numbers}",
@@ -2427,9 +2648,9 @@ def reconcile_transaction(
     issue_number: int,
     labels: list[str],
     parent_issue_number: int,
-    dependency_issue_numbers: list[int],
+    dependency_issue_numbers: list[int | str],
     gh_bin: str,
-    blocking_issue_numbers: list[int] | None = None,
+    blocking_issue_numbers: list[int | str] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> TransactionResult:
     """Recover a partial_failure caused by label-readback mismatch.
@@ -2445,10 +2666,23 @@ def reconcile_transaction(
     pending_steps: list[str] = []
     failed_readbacks: list[dict] = []
 
-    # AC3: reject invalid/self-referencing inputs before any mutation.
+    # #1946 Owner P0-2: normalize BEFORE validate, and both BEFORE any GitHub operation
+    # (including the label re-apply below). The previous implementation validated
+    # duplicate/self-ref/cross-direction shape via _validate_dependency_directions but
+    # never rejected non-positive integers/booleans/cross-repo URLs here (unlike
+    # run_transaction, which normalizes first) -- an input like `--blocking 0` would
+    # reach label mutation before failing at node-id resolution for issue #0.
     try:
+        normalized_dependency_issue_numbers = _normalize_dependency_numbers(
+            list(dependency_issue_numbers), label="--blocked-by"
+        )
+        normalized_blocking_issue_numbers = _normalize_dependency_numbers(
+            list(blocking_issue_numbers), label="--blocking"
+        )
         _validate_dependency_directions(
-            list(dependency_issue_numbers), list(blocking_issue_numbers), self_issue_number=issue_number
+            normalized_dependency_issue_numbers,
+            normalized_blocking_issue_numbers,
+            self_issue_number=issue_number,
         )
     except TransactionError as exc:
         return TransactionResult(
@@ -2459,6 +2693,8 @@ def reconcile_transaction(
             failure_stage=exc.stage,
             failure_message=exc.message,
         )
+    dependency_issue_numbers = normalized_dependency_issue_numbers
+    blocking_issue_numbers = normalized_blocking_issue_numbers
 
     # Re-apply labels (idempotent)
     if labels:
@@ -2548,51 +2784,42 @@ def reconcile_transaction(
                 pending_steps=pending_steps,
             )
 
-    # Re-register dependencies if requested (Blocker 3: no-op 解消)
+    # Re-register dependencies if requested. #1946 Owner P0-1: uses the same shared
+    # apply/readback helper as create/dedupe -- computes the diff against the current
+    # state and mutates only what's missing (idempotent, and avoids relying on 422
+    # swallowing to detect "already registered").
     dependency_verified: bool | None = None
     if dependency_issue_numbers:
         try:
-            child_node_id, _ = _issue_graphql_ids(repo, issue_number, gh_bin)
-            for dep_number in dependency_issue_numbers:
-                dep_node_id, _ = _issue_graphql_ids(repo, dep_number, gh_bin)
-                try:
-                    _issue_register_dependency(repo, child_node_id, dep_node_id, gh_bin)
-                except TransactionError as dep_exc:
-                    # Blocker D: only swallow 422 (already registered = idempotent pass).
-                    # For the GraphQL addBlockedBy mutation, a "duplicate" error from GitHub
-                    # surfaces as a non-zero returncode; we cannot distinguish 422 vs other HTTP
-                    # errors at the GraphQL layer, so we rely on the subsequent readback to
-                    # confirm correctness. If readback fails, that will be recorded below.
-                    # Non-transient failures (e.g., 403/404 surfaced as TransactionError with
-                    # stage != "dependency-register" from graphql_ids) are re-raised; only
-                    # stage="dependency-register" errors are treated as possible 422 idempotency.
-                    if dep_exc.stage != "dependency-register":
-                        raise
-                    # stage="dependency-register": may be 422 already-registered; readback will verify
-            applied_steps.append("dependency")
+            dep_apply = _apply_relationship_direction(
+                repo,
+                issue_number,
+                list(dependency_issue_numbers),
+                "blocked_by",
+                gh_bin,
+                sleep_fn=sleep_fn,
+            )
+            if dep_apply.mutated_numbers:
+                applied_steps.append("dependency")
 
-            # Readback to verify
-            dependency_verified = _readback_dependencies(repo, issue_number, dependency_issue_numbers, gh_bin)
-            if not dependency_verified:
-                sleep_fn(2.0)
-                dependency_verified = _readback_dependencies(repo, issue_number, dependency_issue_numbers, gh_bin)
-
+            dependency_verified = dep_apply.verified
             if dependency_verified:
                 completed.append("dependency-readback")
                 verified_steps.append("dependency-readback")
             else:
-                failed_readbacks.append({
+                failed_readback = dep_apply.failed_readback or {
                     "stage": "dependency-readback",
                     "direction": "blocked_by",
                     "expected_issue_numbers": list(dependency_issue_numbers),
-                    "actual_issue_numbers": [],
+                    "actual_issue_numbers": "actual_state_unavailable",
                     "expected_labels": [],
                     "actual_labels": [],
                     "attempts": 2,
                     "retry_delays": [2.0],
                     "error_kind": "missing_expected_labels",
                     "message": "dependency (blocked-by) read-back mismatch after reconcile",
-                })
+                }
+                failed_readbacks.append(failed_readback)
                 pending_steps.append("dependency-readback")
         except TransactionError as exc:
             return TransactionResult(
@@ -2608,44 +2835,40 @@ def reconcile_transaction(
                 pending_steps=pending_steps,
             )
 
-    # Re-register blocking relationships if requested (mirrors the --blocked-by block above,
-    # using the direction-fixed _issue_register_blocking primitive).
+    # Re-register blocking relationships if requested (mirrors the --blocked-by block
+    # above, using the same shared apply/readback helper).
     blocking_verified: bool | None = None
     if blocking_issue_numbers:
         try:
-            child_node_id, _ = _issue_graphql_ids(repo, issue_number, gh_bin)
-            for target_number in blocking_issue_numbers:
-                target_node_id, _ = _issue_graphql_ids(repo, target_number, gh_bin)
-                try:
-                    _issue_register_blocking(repo, child_node_id, target_node_id, gh_bin)
-                except TransactionError as blk_exc:
-                    # Only swallow "blocking-register" stage errors (possible 422
-                    # already-registered idempotency); readback below verifies correctness.
-                    if blk_exc.stage != "blocking-register":
-                        raise
-            applied_steps.append("blocking")
+            blk_apply = _apply_relationship_direction(
+                repo,
+                issue_number,
+                list(blocking_issue_numbers),
+                "blocking",
+                gh_bin,
+                sleep_fn=sleep_fn,
+            )
+            if blk_apply.mutated_numbers:
+                applied_steps.append("blocking")
 
-            blocking_verified = _readback_blocking(repo, issue_number, blocking_issue_numbers, gh_bin)
-            if not blocking_verified:
-                sleep_fn(2.0)
-                blocking_verified = _readback_blocking(repo, issue_number, blocking_issue_numbers, gh_bin)
-
+            blocking_verified = blk_apply.verified
             if blocking_verified:
                 completed.append("blocking-readback")
                 verified_steps.append("blocking-readback")
             else:
-                failed_readbacks.append({
+                failed_readback = blk_apply.failed_readback or {
                     "stage": "blocking-readback",
                     "direction": "blocking",
                     "expected_issue_numbers": list(blocking_issue_numbers),
-                    "actual_issue_numbers": [],
+                    "actual_issue_numbers": "actual_state_unavailable",
                     "expected_labels": [],
                     "actual_labels": [],
                     "attempts": 2,
                     "retry_delays": [2.0],
                     "error_kind": "missing_expected_labels",
                     "message": "blocking read-back mismatch after reconcile",
-                })
+                }
+                failed_readbacks.append(failed_readback)
                 pending_steps.append("blocking-readback")
         except TransactionError as exc:
             return TransactionResult(

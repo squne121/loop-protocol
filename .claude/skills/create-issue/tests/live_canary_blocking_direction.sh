@@ -66,38 +66,82 @@ _skip() {
   exit 77
 }
 
-# -- Environment preflight --
-command -v gh >/dev/null 2>&1 || _skip "gh_binary_not_found"
-gh auth status --hostname github.com >/dev/null 2>&1 || _skip "gh_auth_status_unreachable"
-gh api graphql -f query='query{ viewer { login } }' >/dev/null 2>&1 || _skip "gh_api_graphql_unreachable"
+# LIVE_CANARY_TEST_MODE: when set (any non-empty value), this script may be
+# sourced (not executed) so a test harness can define its own stub `_cleanup`
+# fixtures/state and invoke `_cleanup` directly, without running the live
+# preflight/trap-registration/steps below (#1946 Owner required tests 6/7).
+# `_cleanup` itself and the state variables it reads/writes remain always
+# defined (outside this guard) so a test harness can call `_cleanup` directly
+# after sourcing.
+if [ -z "${LIVE_CANARY_TEST_MODE:-}" ]; then
+  # -- Environment preflight --
+  command -v gh >/dev/null 2>&1 || _skip "gh_binary_not_found"
+  gh auth status --hostname github.com >/dev/null 2>&1 || _skip "gh_auth_status_unreachable"
+  gh api graphql -f query='query{ viewer { login } }' >/dev/null 2>&1 || _skip "gh_api_graphql_unreachable"
 
-_log "preflight: gh binary + auth + graphql reachability confirmed"
+  _log "preflight: gh binary + auth + graphql reachability confirmed"
+fi
 
 DISPOSABLE_A_NUMBER=""
 DISPOSABLE_B_NUMBER=""
 RELATIONSHIP_REGISTERED="unknown"
 CLEANUP_FAILED="0"
 
+# #1946 Owner P1-1: _cleanup previously only attempted relationship removal when
+# RELATIONSHIP_REGISTERED="yes" (set only after create_issue_txn.py itself reported
+# status=success). If the transaction returned partial_failure (mutation succeeded but
+# readback did not confirm it, or vice versa), RELATIONSHIP_REGISTERED stayed "unknown"
+# and a relationship that DOES exist on GitHub could be left behind unremoved. This
+# version always reads back the CURRENT relationship state (independent of
+# RELATIONSHIP_REGISTERED) whenever both disposable issue numbers are known, and removes
+# it only if actually present.
 _cleanup() {
-  if [ "${RELATIONSHIP_REGISTERED}" = "yes" ] && [ -n "${DISPOSABLE_A_NUMBER}" ] && [ -n "${DISPOSABLE_B_NUMBER}" ]; then
-    _log "cleanup: removing blocking relationship (A=#${DISPOSABLE_A_NUMBER} blocks B=#${DISPOSABLE_B_NUMBER})"
-    A_NODE_ID="$(gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){id}}}' \
-      -F owner="$(echo "${REPO}" | cut -d/ -f1)" -F name="$(echo "${REPO}" | cut -d/ -f2)" -F number="${DISPOSABLE_A_NUMBER}" \
-      --jq '.data.repository.issue.id' 2>>"${LOG_FILE}")"
-    B_NODE_ID="$(gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){id}}}' \
-      -F owner="$(echo "${REPO}" | cut -d/ -f1)" -F name="$(echo "${REPO}" | cut -d/ -f2)" -F number="${DISPOSABLE_B_NUMBER}" \
-      --jq '.data.repository.issue.id' 2>>"${LOG_FILE}")"
-    if [ -n "${A_NODE_ID}" ] && [ -n "${B_NODE_ID}" ]; then
-      gh api graphql -f query='mutation($input:RemoveBlockedByInput!){removeBlockedBy(input:$input){clientMutationId}}' \
-        -F "input[issueId]=${B_NODE_ID}" -F "input[blockingIssueId]=${A_NODE_ID}" >>"${LOG_FILE}" 2>&1
-      if [ $? -ne 0 ]; then
-        _log "cleanup_failed: could not remove blocking relationship -- manual cleanup required"
+  local status=$?
+  # Prevent re-entrancy / a second EXIT trap firing from within this handler's own
+  # gh calls' subshells (harmless here, but explicit per Owner's fix example).
+  trap - EXIT
+
+  if [ -n "${DISPOSABLE_A_NUMBER}" ] && [ -n "${DISPOSABLE_B_NUMBER}" ]; then
+    OWNER_C="$(echo "${REPO}" | cut -d/ -f1)"
+    NAME_C="$(echo "${REPO}" | cut -d/ -f2)"
+    CURRENT_A_BLOCKING="$(gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){blocking(first:10){nodes{number}}}}}' \
+      -F owner="${OWNER_C}" -F name="${NAME_C}" -F number="${DISPOSABLE_A_NUMBER}" \
+      --jq '.data.repository.issue.blocking.nodes[].number' 2>>"${LOG_FILE}")"
+    if echo "${CURRENT_A_BLOCKING}" | grep -qx "${DISPOSABLE_B_NUMBER}"; then
+      _log "cleanup: relationship readback confirms A(#${DISPOSABLE_A_NUMBER}) still blocks B(#${DISPOSABLE_B_NUMBER}); removing"
+      A_NODE_ID="$(gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){id}}}' \
+        -F owner="${OWNER_C}" -F name="${NAME_C}" -F number="${DISPOSABLE_A_NUMBER}" \
+        --jq '.data.repository.issue.id' 2>>"${LOG_FILE}")"
+      B_NODE_ID="$(gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){id}}}' \
+        -F owner="${OWNER_C}" -F name="${NAME_C}" -F number="${DISPOSABLE_B_NUMBER}" \
+        --jq '.data.repository.issue.id' 2>>"${LOG_FILE}")"
+      if [ -n "${A_NODE_ID}" ] && [ -n "${B_NODE_ID}" ]; then
+        gh api graphql -f query='mutation($input:RemoveBlockedByInput!){removeBlockedBy(input:$input){clientMutationId}}' \
+          -F "input[issueId]=${B_NODE_ID}" -F "input[blockingIssueId]=${A_NODE_ID}" >>"${LOG_FILE}" 2>&1
+        if [ $? -ne 0 ]; then
+          _log "cleanup_failed: could not remove blocking relationship -- manual cleanup required"
+          CLEANUP_FAILED="1"
+        else
+          # Confirm removal actually took effect (readback), not just mutation exit 0.
+          POST_REMOVE_A_BLOCKING="$(gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){blocking(first:10){nodes{number}}}}}' \
+            -F owner="${OWNER_C}" -F name="${NAME_C}" -F number="${DISPOSABLE_A_NUMBER}" \
+            --jq '.data.repository.issue.blocking.nodes[].number' 2>>"${LOG_FILE}")"
+          if echo "${POST_REMOVE_A_BLOCKING}" | grep -qx "${DISPOSABLE_B_NUMBER}"; then
+            _log "cleanup_failed: relationship removal mutation reported success but readback still shows the link -- manual cleanup required"
+            CLEANUP_FAILED="1"
+          fi
+        fi
+      else
+        _log "cleanup_failed: could not resolve node IDs to remove relationship -- manual cleanup required"
         CLEANUP_FAILED="1"
       fi
     else
-      _log "cleanup_failed: could not resolve node IDs to remove relationship -- manual cleanup required"
-      CLEANUP_FAILED="1"
+      _log "cleanup: relationship readback shows no A->B blocking link to remove"
     fi
+  elif [ "${RELATIONSHIP_REGISTERED}" = "yes" ]; then
+    # Owner numbers unknown but a registration was reported: cannot verify -- fail closed.
+    _log "cleanup_failed: relationship reported registered but issue numbers incomplete -- manual cleanup required"
+    CLEANUP_FAILED="1"
   fi
 
   if [ -n "${DISPOSABLE_A_NUMBER}" ]; then
@@ -119,8 +163,16 @@ _cleanup() {
 
   if [ "${CLEANUP_FAILED}" = "1" ]; then
     _log "partial_failure: one or more cleanup steps failed; see log for manual recovery commands"
+    # #1946 Owner P1-1: a cleanup failure must surface as a non-zero exit code even when
+    # the main script body already reached `exit 0` -- otherwise a leaked relationship or
+    # an un-closed disposable Issue is silently reported as canary PASS.
+    status=1
   fi
+  exit "${status}"
 }
+
+if [ -z "${LIVE_CANARY_TEST_MODE:-}" ]; then
+
 trap _cleanup EXIT
 
 # -- Step 1: create target Issue B ---------------------------------------------
@@ -226,3 +278,5 @@ _log "PASS(step5): A.blockedBy does NOT contain B (reversal bug not present)"
 # -- Step 6: cleanup (relationship removal + close A/B) happens in the EXIT trap --
 _log "PASS: blocking direction registered correctly on disposable issues A=#${DISPOSABLE_A_NUMBER}/B=#${DISPOSABLE_B_NUMBER}"
 exit 0
+
+fi # LIVE_CANARY_TEST_MODE guard
