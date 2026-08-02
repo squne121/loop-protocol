@@ -7,7 +7,7 @@ last_updated: 2026-07-26
 note: "本ドキュメントは Issue 1752 の静的調査結果、Issue 1758 の live agy 実行による Finding 1 仮説検証結果、および Issue 1768 の Finding 2（hooks.json discover パス）live 再調査・対処結果を記録する。"
 ---
 
-## Stale / Superseded Note（Issue #1814）
+## 旧版・置換済みの注記（Issue #1814）
 
 - 本資料の根因分析は維持し、permission-boundary artifact の形状定義だけを追加する。
 
