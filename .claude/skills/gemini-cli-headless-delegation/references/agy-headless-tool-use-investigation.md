@@ -7,7 +7,7 @@ last_updated: 2026-07-25
 note: "本ドキュメントは Issue 1749 の調査結果を日本語で記録する"
 ---
 
-## Stale / Superseded Note（Issue #1814）
+## 更新済み・廃止済みの注記（Issue #1814）
 
 - 本資料の既存観測を置換せず、permission-boundary runner の artifact schema を追加する。
 
