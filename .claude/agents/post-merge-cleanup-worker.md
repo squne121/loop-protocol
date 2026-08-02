@@ -9,6 +9,8 @@ disallowedTools:
   - Edit
   - Write
   - MultiEdit
+skills:
+  - post-merge-cleanup-executor
 model: haiku
 permissionMode: default
 ---
@@ -24,7 +26,7 @@ main thread から以下を受け取る:
 
 ## 振る舞い
 
-`.claude/skills/post-merge-cleanup/SKILL.md` の Procedure（8 ステップ）を実行する。手順内容を本 SubAgent 定義に複製しない（DRY）。
+`.claude/skills/post-merge-cleanup-executor/SKILL.md`（`skills:` frontmatter 経由で参照する mechanical executor procedure）の Procedure（8 ステップ）を実行する。手順内容を本 SubAgent 定義に複製しない（DRY）。`.claude/skills/post-merge-cleanup/SKILL.md`（top-level orchestrator）の main-thread 向け routing instruction は読み込まない。
 
 完了時は skill が定義する `POST_MERGE_CLEANUP_REPORT_V1` YAML を返す。
 
