@@ -3,6 +3,8 @@ import { drawEnemyHpLabel } from './renderUtils'
 
 export interface CanvasRenderer {
   render(state: GameState): void
+  /** Synchronise CSS display dimensions and backing store without changing logical state. */
+  resize(state: GameState): void
 }
 
 /** Fixed length of the aim indicator line in logical pixels (AC2). */
@@ -103,28 +105,73 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
   if (!context) {
     throw new Error('2D canvas context is not available.')
   }
+  const renderingContext = context
 
-  let lastArenaWidth = 0
-  let lastArenaHeight = 0
+  let lastLogicalWidth = 0
+  let lastLogicalHeight = 0
+  let lastDisplayWidth = 0
+  let lastDisplayHeight = 0
   let lastDpr = 0
 
+  function resolveDisplaySize(logicalWidth: number, logicalHeight: number): {
+    width: number
+    height: number
+  } {
+    const bounds = canvas.getBoundingClientRect()
+    // jsdom and a temporarily detached canvas report a zero rectangle. The
+    // logical arena remains the safe fallback; browser rendering always uses
+    // the CSS display rectangle, never the logical dimensions directly.
+    if (bounds.width > 0 && bounds.height > 0) {
+      return { width: bounds.width, height: bounds.height }
+    }
+    return { width: logicalWidth, height: logicalHeight }
+  }
+
+  function syncCanvasResolution(state: GameState): void {
+    const logicalWidth = state.arena.width
+    const logicalHeight = state.arena.height
+    const display = resolveDisplaySize(logicalWidth, logicalHeight)
+    const dpr = window.devicePixelRatio ?? 1
+
+    if (
+      logicalWidth === lastLogicalWidth &&
+      logicalHeight === lastLogicalHeight &&
+      display.width === lastDisplayWidth &&
+      display.height === lastDisplayHeight &&
+      dpr === lastDpr
+    ) {
+      return
+    }
+
+    canvas.width = Math.max(1, Math.round(display.width * dpr))
+    canvas.height = Math.max(1, Math.round(display.height * dpr))
+    lastLogicalWidth = logicalWidth
+    lastLogicalHeight = logicalHeight
+    lastDisplayWidth = display.width
+    lastDisplayHeight = display.height
+    lastDpr = dpr
+
+    // Draw in fixed logical coordinates. CSS display dimensions and backing
+    // store dimensions may vary independently with container size, DPR, and
+    // browser zoom, while gameplay coordinates remain unchanged.
+    renderingContext.setTransform(
+      canvas.width / logicalWidth,
+      0,
+      0,
+      canvas.height / logicalHeight,
+      0,
+      0,
+    )
+  }
+
   return {
+    resize(state) {
+      syncCanvasResolution(state)
+    },
     render(state) {
-      const dpr = window.devicePixelRatio ?? 1
       const arenaW = state.arena.width
       const arenaH = state.arena.height
-
-      // Resize backing store when arena or dpr changes
-      if (arenaW !== lastArenaWidth || arenaH !== lastArenaHeight || dpr !== lastDpr) {
-        canvas.width = Math.round(arenaW * dpr)
-        canvas.height = Math.round(arenaH * dpr)
-        canvas.style.width = `${arenaW}px`
-        canvas.style.height = `${arenaH}px`
-        lastArenaWidth = arenaW
-        lastArenaHeight = arenaH
-        lastDpr = dpr
-        context.setTransform(dpr, 0, 0, dpr, 0, 0)
-      }
+      syncCanvasResolution(state)
 
       // --- Layer 1: background ---
       context.fillStyle = '#07111f'

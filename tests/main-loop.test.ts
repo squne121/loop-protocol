@@ -9,6 +9,7 @@ import {
 } from '../src/systems/SortieSystem'
 import {
   createTransitionedInitialGameState,
+  observeCanvasPresentation,
   queueAssistPlayerCommand,
   runLoadGame,
   runNextSortieHandler,
@@ -26,6 +27,43 @@ const MAX_SKIP = defaultSimulationConfig.maxFrameSkip
 
 // Use a config with integer-friendly fixed step for deterministic tests
 const integerConfig = { fixedDeltaMs: 16, maxFrameSkip: 5 }
+
+describe('responsive canvas presentation lifecycle', () => {
+  it('GIVEN a stable viewport observer WHEN a resize or DPR-capable observation occurs THEN it refreshes presentation and cleans up listeners', () => {
+    const onResize = vi.fn()
+    const addEventListener = vi.fn()
+    const removeEventListener = vi.fn()
+    const observe = vi.fn()
+    const disconnect = vi.fn()
+    let callback: ResizeObserverCallback | undefined
+
+    class FakeResizeObserver {
+      constructor(next: ResizeObserverCallback) {
+        callback = next
+      }
+
+      observe = observe
+      disconnect = disconnect
+    }
+
+    const target = {} as Element
+    const dispose = observeCanvasPresentation(
+      target,
+      onResize,
+      { addEventListener, removeEventListener },
+      FakeResizeObserver as unknown as typeof ResizeObserver,
+    )
+
+    expect(observe).toHaveBeenCalledWith(target, { box: 'device-pixel-content-box' })
+    expect(onResize).toHaveBeenCalledTimes(1)
+    callback?.([], {} as ResizeObserver)
+    expect(onResize).toHaveBeenCalledTimes(2)
+
+    dispose()
+    expect(disconnect).toHaveBeenCalledOnce()
+    expect(removeEventListener).toHaveBeenCalledWith('resize', expect.any(Function))
+  })
+})
 
 describe('advanceSimulationLoop', () => {
   it('GIVEN accumulatorMs < fixedDeltaMs WHEN deltaMs is small THEN executes 0 steps and accumulates', () => {

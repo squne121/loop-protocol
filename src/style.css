@@ -95,33 +95,8 @@ button:focus-visible {
   position: relative;
   isolation: isolate;
   border-radius: 28px;
-  /* Issue #1375 PR #1925 review (owner playtest, P0-1 follow-through):
-   * `CanvasRenderer.render()` (src/render/CanvasRenderer.ts, out of this
-   * Issue's Allowed Paths) always sets `canvas.style.width/height` to a
-   * fixed px size derived from `state.arena` (capped well below typical
-   * desktop viewport widths by `resizeArena()`'s legacy sidebar math in
-   * `src/main.ts`), which permanently overrides this stylesheet's
-   * `.battle-stage__canvas { width: 100% }` rule. The Canvas therefore
-   * never actually fills a full-width grid column — a stretched
-   * `.battle-stage`/`.battle-stage__viewport` box left a large empty region
-   * to the right of the real Canvas pixels, and the HUD (right-aligned
-   * within that stretched box) rendered far outside the Canvas's true
-   * bounds. Shrinking `.battle-stage` to its content's width keeps the
-   * whole panel (header + viewport) sized to what the Canvas actually
-   * renders, so `justify-items: end` HUD placement lands at the Canvas's
-   * real right edge instead of the grid column's. */
-  width: fit-content;
-  /* The header's own flex row (title block + copy paragraph) has an
-   * unconstrained max-content width that can exceed the Canvas's fixed
-   * pixel width (`resizeArena()` in src/main.ts caps `state.arena.width` at
-   * 960 — kept in sync with that constant here), which previously let the
-   * header force `.battle-stage` (and therefore `.battle-stage__viewport`,
-   * the HUD's containing block) wider than the actual Canvas at large
-   * viewports even after switching to `width: fit-content` above. Capping
-   * at the same 960px ceiling forces the header's flex children to shrink
-   * (and its copy paragraph to wrap) instead of dictating a wider panel
-   * than the Canvas actually renders. */
-  max-width: min(960px, 100%);
+  width: 100%;
+  max-width: 100%;
 }
 
 .battle-stage__header {
@@ -317,6 +292,20 @@ button:focus-visible {
 
   .combat-hud .eyebrow {
     margin-bottom: 4px;
+  }
+}
+
+/* The Canvas preserves its 16:9 world presentation even on a narrow phone.
+ * Scale the DOM-only status surface instead of changing logical arena or
+ * stretching the world layer to make room for it. */
+@media (max-width: 500px) {
+  .battle-hud-layer {
+    padding: 8px;
+  }
+
+  .combat-hud {
+    transform: scale(0.5);
+    transform-origin: top right;
   }
 }
 

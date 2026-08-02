@@ -126,6 +126,26 @@ describe('pointer hover tracking — AC1 (pointerKnown + pointermove always proc
     expect(input.pointerKnown).toBe(true)
   })
 
+  it('GIVEN a CSS-scaled canvas WHEN pointer visits each corner and centre THEN it maps to fixed logical coordinates', () => {
+    const canvas = makeFakeCanvas({ left: 50, top: 30, width: 1440, height: 810 })
+    const input = createInputState()
+    bindInput(canvas, input, () => ({ width: 960, height: 540 }), makeFakeKeyTarget())
+
+    const points = [
+      { clientX: 50, clientY: 30, x: 0, y: 0 },
+      { clientX: 1490, clientY: 30, x: 960, y: 0 },
+      { clientX: 50, clientY: 840, x: 0, y: 540 },
+      { clientX: 1490, clientY: 840, x: 960, y: 540 },
+      { clientX: 770, clientY: 435, x: 480, y: 270 },
+    ]
+
+    for (const point of points) {
+      canvas.dispatchPointer('pointermove', { isPrimary: true, ...point })
+      expect(input.pointerX).toBeCloseTo(point.x)
+      expect(input.pointerY).toBeCloseTo(point.y)
+    }
+  })
+
   it('GIVEN multiple pointermoves WHEN dispatched THEN each updates coordinates', () => {
     const canvas = makeFakeCanvas()
     const input = createInputState()

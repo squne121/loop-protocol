@@ -26,7 +26,6 @@ import {
 } from './storage'
 import {
   advanceSimulationLoop,
-  clampPlayerToArena,
   claimPendingReward,
   confirmResult,
   purchaseUpgrade,
@@ -228,6 +227,47 @@ export function queueAssistPlayerCommand(
   }
   inputState.assistPlayerRisingEdge = true
   return true
+}
+
+type CanvasPresentationWindow = Pick<Window, 'addEventListener' | 'removeEventListener'>
+
+type ResizeObserverConstructor = new (
+  callback: ResizeObserverCallback,
+) => Pick<ResizeObserver, 'disconnect' | 'observe'>
+
+/**
+ * Observe the stable Canvas viewport rather than the window alone. The
+ * device-pixel-content-box request catches DPR/zoom changes where supported;
+ * older engines fall back to the standard content box. The returned cleanup
+ * owns both observer and window listener lifecycle.
+ */
+export function observeCanvasPresentation(
+  target: Element,
+  onResize: () => void,
+  windowTarget: CanvasPresentationWindow = window,
+  Observer: ResizeObserverConstructor | undefined =
+    typeof ResizeObserver === 'undefined' ? undefined : ResizeObserver,
+): () => void {
+  const onWindowResize = () => onResize()
+  windowTarget.addEventListener('resize', onWindowResize)
+
+  if (!Observer) {
+    onResize()
+    return () => windowTarget.removeEventListener('resize', onWindowResize)
+  }
+
+  const observer = new Observer(() => onResize())
+  try {
+    observer.observe(target, { box: 'device-pixel-content-box' })
+  } catch {
+    observer.observe(target)
+  }
+  onResize()
+
+  return () => {
+    observer.disconnect()
+    windowTarget.removeEventListener('resize', onWindowResize)
+  }
 }
 
 export function createTransitionedInitialGameState(
@@ -548,7 +588,6 @@ const hud = battleHudLayer ? createHudController(battleHudLayer, {
     if (!runNextSortieHandler(state, { setHudFeedback })) {
       return
     }
-    resizeArena(state)
     productPause.isPaused = false
   },
   onTogglePause() {
@@ -571,7 +610,6 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
       return
     }
     state = nextState
-    resizeArena(state)
     productPause.isPaused = false
     setHudFeedback('New Game started.', 'Preparation phase. Start sortie when ready.')
   },
@@ -601,7 +639,6 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
           return
         }
         state = nextState
-        resizeArena(state)
         hasLoadableSnapshot = true
         productPause.isPaused = false
       },
@@ -635,7 +672,6 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
       return
     }
     state = nextState
-    resizeArena(state)
     // Reset product pause on state transition to preparation
     productPause.isPaused = false
     setHudFeedback(
@@ -678,8 +714,14 @@ if (!startupProbe.ok) {
 
 if (canvas) {
   bindInput(canvas, inputState, () => state.arena)
-  resizeArena(state)
-  window.addEventListener('resize', () => resizeArena(state))
+  const viewport = canvas.parentElement
+  if (viewport) {
+    const disposeCanvasPresentation = observeCanvasPresentation(
+      viewport,
+      () => renderer?.resize(state),
+    )
+    window.addEventListener('beforeunload', disposeCanvasPresentation, { once: true })
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,15 +1181,6 @@ function persistProgressionSnapshot(
     reportSaveFailure: (result) => reportStorageFailure('save', result),
     setHudFeedback,
   })
-}
-
-function resizeArena(currentState: typeof state): void {
-  const safeSidebar = window.innerWidth > 980 ? 380 : 32
-  const width = Math.min(960, Math.max(640, window.innerWidth - safeSidebar))
-  currentState.arena.width = width
-  currentState.arena.height = Math.round(width * 0.5625)
-  // Re-clamp player after arena resize to prevent out-of-bounds position.
-  clampPlayerToArena(currentState)
 }
 
 function reportStorageFailure(

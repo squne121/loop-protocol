@@ -29,6 +29,10 @@ interface LoopE2EState {
     width: number
     height: number
   }
+  player: {
+    aimX: number
+    aimY: number
+  }
 }
 
 type Scenario = {
@@ -45,6 +49,7 @@ type EvidenceEntry = {
   screenshot_path: string
   canvas_css: { width: number; height: number }
   canvas_backing_store: { width: number; height: number }
+  logical_arena: { width: number; height: number }
 }
 
 const SCENARIOS: Scenario[] = [
@@ -110,6 +115,11 @@ async function collectEvidence(page: Page): Promise<Omit<EvidenceEntry, 'viewpor
     }
 
     const rect = canvas.getBoundingClientRect()
+    const hook = (window as Window & { __LOOP_E2E__?: { getState: () => LoopE2EState } }).__LOOP_E2E__
+    if (!hook) {
+      throw new Error('__LOOP_E2E__ hook not found')
+    }
+    const state = hook.getState()
     return {
       observed_devicePixelRatio: window.devicePixelRatio ?? 1,
       observed_visualViewportScale: window.visualViewport?.scale ?? null,
@@ -122,8 +132,45 @@ async function collectEvidence(page: Page): Promise<Omit<EvidenceEntry, 'viewpor
         width: canvas.width,
         height: canvas.height,
       },
+      logical_arena: state.arena,
     }
   })
+}
+
+async function assertPointerMapsToLogicalArena(page: Page): Promise<void> {
+  const box = await page.locator('canvas.battle-stage__canvas').boundingBox()
+  expect(box).not.toBeNull()
+  if (!box) return
+
+  const state = await getGameState(page)
+  const canvas = page.locator('canvas.battle-stage__canvas')
+  for (const point of [
+    { x: 0, y: 0 },
+    { x: 1, y: 0 },
+    { x: 0, y: 1 },
+    { x: 1, y: 1 },
+    { x: 0.5, y: 0.5 },
+  ]) {
+    // Dispatch against the Canvas itself so the right/bottom rectangle edges
+    // remain testable; physical hit-testing treats those outer edges as
+    // outside the element.
+    await canvas.dispatchEvent('pointermove', {
+      clientX: box.x + box.width * point.x,
+      clientY: box.y + box.height * point.y,
+      isPrimary: true,
+      pointerId: 1,
+    })
+    await expect.poll(async () => {
+      const current = await getGameState(page)
+      return {
+        x: Math.round(current.player.aimX),
+        y: Math.round(current.player.aimY),
+      }
+    }).toEqual({
+      x: Math.round(state.arena.width * point.x),
+      y: Math.round(state.arena.height * point.y),
+    })
+  }
 }
 
 test('assist-player-affordance routes through DOM activation and KeyZ', async ({
@@ -235,6 +282,15 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
     })
 
     const observed = await collectEvidence(page)
+    expect(observed.logical_arena).toEqual({ width: 960, height: 540 })
+    expect(observed.canvas_backing_store.width).toBeCloseTo(
+      observed.canvas_css.width * observed.observed_devicePixelRatio,
+      0,
+    )
+    expect(observed.canvas_backing_store.height).toBeCloseTo(
+      observed.canvas_css.height * observed.observed_devicePixelRatio,
+      0,
+    )
     evidence.push({
       viewport: scenario.viewport.label,
       browser_zoom: scenario.zoom.label,
@@ -254,6 +310,46 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
       non_conflict_reason: 'C1 benign overlap; overlay font stack untouched',
       evidence,
     }, null, 2),
+    'utf8',
+  )
+})
+
+test('responsive canvas keeps backing store and pointer mapping aligned at DPR 1, 1.25, and 2', async ({
+  browser,
+}, testInfo) => {
+  test.setTimeout(90_000)
+  const evidence: Array<EvidenceEntry & { dpr: number }> = []
+
+  for (const dpr of [1, 1.25, 2]) {
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+      deviceScaleFactor: dpr,
+    })
+    const page = await context.newPage()
+    await page.goto('/')
+    await waitForRunningWithCombatActors(page)
+    await assertPointerMapsToLogicalArena(page)
+
+    const observed = await collectEvidence(page)
+    expect(observed.logical_arena).toEqual({ width: 960, height: 540 })
+    expect(observed.canvas_backing_store.width).toBe(Math.round(observed.canvas_css.width * dpr))
+    expect(observed.canvas_backing_store.height).toBe(Math.round(observed.canvas_css.height * dpr))
+
+    const screenshotPath = testInfo.outputPath(`responsive-canvas-dpr-${dpr}.png`)
+    await page.screenshot({ path: screenshotPath, fullPage: true })
+    evidence.push({
+      viewport: '1280x720',
+      browser_zoom: '100%',
+      screenshot_path: screenshotPath,
+      dpr,
+      ...observed,
+    })
+    await context.close()
+  }
+
+  await writeFile(
+    testInfo.outputPath('responsive-canvas-runtime-evidence.json'),
+    JSON.stringify({ head_sha: process.env.GITHUB_SHA ?? 'local', evidence }, null, 2),
     'utf8',
   )
 })
