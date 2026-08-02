@@ -124,6 +124,98 @@ child に対する immutable authority boundary や secrecy を保証しない�
 attempt correlation は parent runner が記録し、child hook の event は correlation
 authority として扱わない。
 
+#### `agy_permission_boundary_inconclusive` の根本原因（Issue #1814 再調査）
+
+過去の live run が一貫して `agy_permission_boundary_inconclusive`（exit 1）を返していた
+根本原因を、実インストール済み `agy`（Antigravity CLI 1.1.9、`~/.local/bin/agy`。
+`@google/gemini-cli` npm パッケージとは別の Google 内製バイナリであり、`strings` で
+抽出できる同バイナリ埋め込みの hooks リファレンス文書が正本）に対する直接的な
+再現実験で特定した。二つの独立した原因が存在する。
+
+**原因 1（この PR で修正済み）: `workspacePaths` が常に空になる欠落 `--add-dir`。**
+
+`_invoke()` は `cwd=runtime["workspace"]` で `agy --print ...` を起動していたが、
+`--add-dir <workspace>` を渡していなかった。実 AGY の hook 共通入力フィールド
+`workspacePaths` は `cwd` からではなく `--add-dir` で明示的に登録した
+workspace のリストからのみ生成される（`cwd` だけを設定した再現実験では
+`"workspacePaths":[]`、`--add-dir` を追加すると
+`"workspacePaths":["<workspace>"]` に変わることを直接確認した）。
+`_prepare_runtime()` の `PreInvocation` injection hook は
+`context['workspace'] in payload.get('workspacePaths', [])` を要求するため、
+`--add-dir` 欠落時はこの workspace-binding check が常に失敗し、
+`injectSteps` が一度も受理されず、結果として `PreToolUse` イベントが
+一件も発生しない。これが過去のすべての live run で
+`diagnostic_ledger.pre_invocation_context_accepted` が `false` になっていた
+直接の原因であり、`run_agy_permission_boundary_e2e.py` の `_invoke()` に
+`--add-dir` を追加することで解消した（`diagnostic_ledger.pre_invocation_context_accepted`
+は `true` に変わることを live run で確認済み）。
+
+**原因 2（未解決。live exit 0 の contract/implementation mismatch として記録）:
+`PreInvocation` の `injectSteps` の `toolCall` ステップ型が実バイナリで機能しない。**
+
+原因 1 を修正した後も、live run は依然として exit 1 になる。これは
+`PreInvocation` hook が返す `injectSteps` の `toolCall` ステップ
+（`agy` 自身が埋め込んでいる hooks リファレンス文書に記載された、
+`{"toolCall": {"name": "...", "args": {...}}}` という契約どおりの形）を
+実バイナリが受理しないためである。この PR とは独立した最小 hooks.json
+だけを使う再現実験で、以下を確認した。
+
+- `PreInvocation` / `PreToolUse` hook 自体は正しく発火し、実際のモデルが
+  発行した `view_file` tool call を `PreToolUse` の `{"decision": "deny", "reason": "..."}`
+  で確実に deny できる（モデル応答に
+  `tool call denied with reason: probe deny` が反映され、実行はされなかった）。
+  つまり `PreToolUse` deny 境界そのものは実 runtime で機能する。
+- `injectSteps` の `{"ephemeralMessage": "..."}` ステップは受理され、
+  agy は exit 0 で完了する（camelCase / snake_case のどちらの outer key
+  `injectSteps` / `inject_steps` でも同様に受理された）。
+- `injectSteps` の `{"toolCall": {"name": "...", "args": {...}}}` ステップ
+  （camelCase / snake_case のどちらの key 組み合わせでも）は agy 自身の
+  `--log-file` 出力に
+  `error in pre-invocation hook: failed to inject steps from hook ...:
+  unknown injected step type: <nil>` を出力して agent 実行全体を
+  `Error: Agent execution terminated due to error.`（exit 1）で
+  中断させる。permission 設定を完全に外した（`permissions` 制約なしの
+  素の isolated HOME）状態でも同一のエラーになるため、これは
+  permission boundary の deny ではなく、`toolCall` ステップの
+  デシリアライズに関する実装側の欠陥または同バイナリの埋め込み文書との
+  version skew である。
+- `{"type": "toolCall", "toolCall": {...}}` のように discriminator を
+  追加すると、エラーメッセージ自体が変化し
+  (`unmarshal result ... via protojson: ... unknown field "type"`)、
+  hook 結果は protojson で厳格にデコードされることが分かる。すなわち
+  `toolCall` という field 名自体は protojson レベルでは受理される
+  （`unknown field` エラーにならない）にもかかわらず、その後段の
+  アプリケーションコード（`executor.go`）側で "unknown injected step
+  type: <nil>" として扱われる。これはクライアント側の JSON key
+  ケーシングの誤りではなく、実バイナリ内部の型解決ロジック側の
+  問題であることを強く示唆する。
+
+**この Issue の Stop Condition への該当性。** 上記は
+「実 AGY の仕様が公式資料と runtime で矛盾し、fail-closed な判定を確定できない」
+に該当する。`agy` 自身が埋め込む公式ドキュメントどおりの `toolCall` 注入
+契約が実バイナリで機能しないことをクライアント側の再現実験で確認したが、
+Google 非公開の内製バイナリ（`google3/third_party/jetski/...`）であるため、
+ソースコードにアクセスできないこの環境から追加の JSON エンコーディングを
+機械的に探索し続けても収束する保証がない。したがって AC3/AC5 が要求する
+「`PreInvocation` の `injectSteps` による、モデル選択に依存しない決定論的
+5-capability 注入」は、この agy ビルドでは現状確認できていない。人間判断
+として以下のいずれかを選択する必要がある。
+
+1. Google / Antigravity サポート経路で正しい `toolCall` 注入 JSON 形式を
+   確認し、判明した形式で再検証する。
+2. `injectSteps` の `toolCall` 注入に依存しない代替のデターミニズム設計
+   （例: `PreToolUse` deny 自体は live で実証済みなので、モデルへの
+   明示的・一意な単一 tool 呼び出し指示プロンプトと厳格な
+   correlation/deny 検証を組み合わせる設計）へ、Issue の Out of Scope
+   条項（「モデルが任意に tool を選択することだけに依存する E2E」の禁止）
+   と両立する形で contract を改訂する。
+3. AC3/AC5 を model capability 待ちの follow-up Issue へ切り出し、
+   本 Issue は `PreToolUse` deny 境界の live 実証（原因 1 の修正と
+   diagnostic_ledger 改善）までをスコープとして再定義する。
+
+いずれも Issue 契約の変更を伴うため、この PR は Draft のまま
+`Refs #1814` を維持し、`Closes #1814` を使用しない。
+
 ### provider_auto_policy_v1 fallback classes（フォールバック分類、Issue #1270）
 
 `provider=auto`（`provider_auto_dispatch()`）が provider fallback の
