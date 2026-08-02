@@ -180,13 +180,14 @@ SubAgent（役割）── Skill（作業手順）
 
 | SubAgent | 役割 | 使う Skill |
 |---|---|---|
-| `post-merge-cleanup-worker` | PR マージ後 cleanup の役割 | `post-merge-cleanup` |
+| `post-merge-cleanup-worker` | PR マージ後 cleanup の役割（既存の単一 agent。`post-merge-cleanup`（top-level orchestrator。main-thread routing）を起動元とし、`post-merge-cleanup-executor`（mechanical executor procedure。`skills:` frontmatter 経由で preload）を実行本文として参照する。新規 agent role は追加しない） | `post-merge-cleanup`、`post-merge-cleanup-executor` |
 
 | Skill | 手順 |
 |---|---|
 | `impl-review-loop` | 実装→検証→PR レビュー の 4 段ループ手順 |
 | `open-pr` | PR 起票手順 |
-| `post-merge-cleanup` | PR マージ後の cleanup 手順 |
+| `post-merge-cleanup` | PR マージ後の cleanup 手順（top-level orchestrator。worker 起動・follow-up/parent/superseded routing のみを保持し、worker の8ステップ Procedure は保持しない。Issue #1733） |
+| `post-merge-cleanup-executor` | PR マージ後 cleanup の mechanical executor procedure（8 ステップ deterministic cleanup commands、`POST_MERGE_CLEANUP_REPORT_V1` 生成。main-thread 向け routing instruction を含まない。canonical body: `.claude/skills/post-merge-cleanup-executor/SKILL.md`、Codex thin wrapper: `.agents/skills/post-merge-cleanup-executor/SKILL.md`。Issue #1733） |
 
 ## 補助系
 

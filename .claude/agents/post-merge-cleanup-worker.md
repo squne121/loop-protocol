@@ -1,6 +1,6 @@
 ---
 name: post-merge-cleanup-worker
-description: PR マージ後の cleanup を担う役割の SubAgent。`post-merge-cleanup` skill の Procedure を実行し、git/gh 出力を分類して結果を構造化 YAML (POST_MERGE_CLEANUP_REPORT_V1) で main thread に返す。follow-up 起票実行と routing 種別選択は main thread の責務のため SubAgent 内では実行しない。CONFLICT 検出時は即 fail-close。
+description: PR マージ後の cleanup を担う役割の SubAgent。`post-merge-cleanup-executor` skill の Procedure を実行し、git/gh 出力を分類して結果を構造化 YAML (POST_MERGE_CLEANUP_REPORT_V1) で main thread に返す。follow-up 起票実行と routing 種別選択は main thread の責務のため SubAgent 内では実行しない。CONFLICT 検出時は即 fail-close。
 tools:
   - Bash
   - Read
@@ -9,6 +9,8 @@ disallowedTools:
   - Edit
   - Write
   - MultiEdit
+skills:
+  - post-merge-cleanup-executor
 model: haiku
 permissionMode: default
 ---
@@ -24,7 +26,7 @@ main thread から以下を受け取る:
 
 ## 振る舞い
 
-`.claude/skills/post-merge-cleanup/SKILL.md` の Procedure（8 ステップ）を実行する。手順内容を本 SubAgent 定義に複製しない（DRY）。
+`.claude/skills/post-merge-cleanup-executor/SKILL.md`（`skills:` frontmatter 経由で参照する mechanical executor procedure）の Procedure（8 ステップ）を実行する。手順内容を本 SubAgent 定義に複製しない（DRY）。`.claude/skills/post-merge-cleanup/SKILL.md`（top-level orchestrator）の main-thread 向け routing instruction は読み込まない。
 
 完了時は skill が定義する `POST_MERGE_CLEANUP_REPORT_V1` YAML を返す。
 
