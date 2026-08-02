@@ -29,7 +29,7 @@ worker や CI/review/security/permission/publication の safety stop と混同�
 | `test-runner` | read-only | `dontAsk` | Read, Grep, Glob, Bash | Edit, Write, MultiEdit |
 | `review-issue`（standalone SubAgent） | write | `acceptEdits` | Bash, Read, Grep, Glob, Write | Edit, MultiEdit |
 | `issue-reviewer`（loop worker SubAgent） | read-only | `dontAsk` | Bash, Read, Grep, Glob | Agent, Edit, Write, MultiEdit, Skill |
-| `issue-author` | write | `acceptEdits` | Bash, Read, Write | Agent, Edit, MultiEdit |
+| `issue-author` | write | `acceptEdits` | Bash, Read, Skill | Agent, Edit, MultiEdit, Write |
 | `implementation-worker` | write | `acceptEdits` | Read, Grep, Glob, Bash, Edit, Write, MultiEdit | — |
 | `post-merge-cleanup-worker` | cleanup | `default` | Bash, Read | Agent, Edit, Write, MultiEdit |
 
@@ -152,6 +152,30 @@ SubAgent（役割）── Skill（作業手順）
 
 共通参照: [`create-issue/references/body-authoring.md`](../../.claude/skills/create-issue/references/body-authoring.md)
 （VC 作成ガイダンス・Anchor Verification・Machine-Readable Contract block guidance 等。`edit-issue` / `issue-author` も参照する）
+
+### `issue-author` の Skill capability gate（Agent-local deterministic dispatcher）
+
+`issue-author`（Issue #1734）は `tools: [Bash, Read, Skill]` を持ち、Agent frontmatter の
+`skills:` フィールドで `{create-issue, edit-issue}` の exact set のみを許可 Skill として宣言する。
+`skills:` フィールドは Claude Code 実行系が Skill tool 呼び出し時にネイティブに評価する
+allowlist であり、宣言されていない Skill 名（未知 Skill・他 SubAgent 専用 Skill 等）への
+呼び出しは実行時に拒否される。これは `.claude/hooks/` の PreToolUse hook と同等の
+deterministic な allow/deny 判定を Agent 定義ファイル単体で提供する「Agent-local
+deterministic dispatcher」であり、新規の hook script や `.claude/settings.json` 変更を
+必要としない。
+
+**nested Skill invocation と nested SubAgent invocation の区別**: `issue-author` が禁止するのは
+「Skill tool 経由で他の Skill を呼ぶこと」（nested Skill invocation。例: `create-issue` skill の
+手順内から別の Skill を Skill tool で呼び出すこと）であり、「SubAgent から別の SubAgent を
+起動すること」（nested SubAgent invocation。例: `issue-contract-fixer` SubAgent の呼び出し）
+とは別概念である。nested Skill invocation 禁止は `issue-author` の許可 Skill 集合を
+`{create-issue, edit-issue}` に固定したまま維持する制約であり、`issue-contract-fixer` 等の
+既存 nested SubAgent delegation パターンを妨げない。
+
+raw `gh issue create` / `gh issue edit` の production use を拒否する境界は本 dispatcher の
+責務ではなく、既存の controlled executor（`scripts/agent-guards/controlled_skill_mutation_exec.py`）
+と PreToolUse hookchain（`local_main_branch_guard` の shared classifier 等）が別レイヤーで
+担う。`issue-author` はこの既存レイヤーを新規実装しない。
 
 ## 実装系
 
