@@ -251,6 +251,47 @@ def get_tracked_paths_decoded(repo_root: Path) -> list[str]:
     return paths
 
 
+AGENT_SKILLS_ROOT = ".agents/skills"
+CANONICAL_SKILLS_ROOT = ".claude/skills"
+
+
+def _tracked_agents_skills_root_is_safe(repo_root: Path, tracked_paths: set[str]) -> bool:
+    """Return whether the tracked root bridge resolves to canonical skills.
+
+    A Git directory symlink is represented by its root path only, not each
+    descendant. Critical `.agents/skills/**` surfaces may therefore inherit
+    tracked status only from this exact, mode-120000 root bridge.
+    """
+    if AGENT_SKILLS_ROOT not in tracked_paths:
+        return False
+
+    root = repo_root / AGENT_SKILLS_ROOT
+    canonical_root = repo_root / CANONICAL_SKILLS_ROOT
+    try:
+        if not root.is_symlink() or not canonical_root.is_dir():
+            return False
+        repo_resolved = repo_root.resolve()
+        canonical_resolved = canonical_root.resolve()
+        canonical_resolved.relative_to(repo_resolved)
+        if root.resolve() != canonical_resolved:
+            return False
+    except (OSError, ValueError):
+        return False
+
+    result = subprocess.run(
+        ["git", "ls-files", "-s", "--", AGENT_SKILLS_ROOT],
+        cwd=str(repo_root),
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return False
+    return any(
+        line.split(maxsplit=1)[0] == b"120000"
+        for line in result.stdout.splitlines()
+        if line
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Security guards
 # ──────────────────────────────────────────────────────────────────────────────
@@ -443,6 +484,18 @@ def build_agent_ops_inventory(
         critical_surfaces, contract_errors = [], []
 
     tracked_set = set(tracked_paths)
+    tracked_agents_skills_root_is_safe = _tracked_agents_skills_root_is_safe(
+        repo_root, tracked_set
+    )
+
+    def is_effectively_tracked(rel_path: str) -> bool:
+        if rel_path.startswith(f"{AGENT_SKILLS_ROOT}/"):
+            # A root symlink has no independently tracked descendants in the
+            # index. Do not let a caller-supplied descendant override an
+            # unsafe or noncanonical root bridge.
+            if (repo_root / AGENT_SKILLS_ROOT).is_symlink():
+                return tracked_agents_skills_root_is_safe
+        return rel_path in tracked_set
 
     # Expected paths that are not critical but should warn if missing
     expected_paths: list[str] = list(profile.expected_paths)
@@ -464,7 +517,7 @@ def build_agent_ops_inventory(
             "path": rel_path,
             "exists": abs_path.exists(),
             "kind": classify_path_kind(rel_path),
-            "tracked": rel_path in tracked_set,
+            "tracked": is_effectively_tracked(rel_path),
         })
 
     # Add all tracked paths matching target prefixes
@@ -488,9 +541,9 @@ def build_agent_ops_inventory(
     for path in critical_set:
         abs_path = repo_root / path
         # A symlink that escapes the repo is treated as a security violation (blocked)
-        if _is_symlink_escape(repo_root, path):
+        if not is_containment_safe(repo_root, path):
             missing_critical.append(path)
-        elif not abs_path.exists() or path not in tracked_set:
+        elif not abs_path.exists() or not is_effectively_tracked(path):
             missing_critical.append(path)
 
     missing_expected: list[str] = []
