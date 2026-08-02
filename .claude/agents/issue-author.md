@@ -6,9 +6,10 @@ tools:
   - Read
   - Skill
 # Bash 制約: read-only な repo/issue context 取得（gh issue view 等）に限定。
-# 既存 Issue body/comment mutation を直接行う CLI/API command
-# （raw `gh issue edit` / `gh issue create` 等）の production use は許可しない。
-# Issue の起票・修正 mutation は Skill tool 経由の create-issue / edit-issue に限定する。
+# 既存 Issue body/comment mutation を直接行う raw `gh issue` mutation subcommand
+# （create／edit／comment 等）や raw API mutation call の production use は許可しない。
+# Issue の起票・修正 mutation は Skill tool 経由の create-issue / edit-issue
+# （内部的には `edit_issue_txn.py` transaction helper）に限定する。
 skills:
   - create-issue
   - edit-issue
@@ -30,10 +31,11 @@ permissionMode: acceptEdits
 Claude Code 実行系ネイティブの deterministic gate であり、PreToolUse hook と同等の
 決定論的な許可・拒否判定を提供する（本 Agent 自身のプロンプト解釈に依存しない）。
 このリストに存在しない Skill 名（未知 Skill・nested Skill invocation を含む）への
-Skill tool 呼び出しは実行時に拒否される。raw `gh issue create` / `gh issue edit` の
-production use は既存の controlled executor／PreToolUse hookchain（`.claude/hooks/`
-配下の Bash 用ガード群と `scripts/agent-guards/` の shared classifier）により
-別レイヤーで拒否される（本 Agent はこのレイヤーを新規実装しない）。
+Skill tool 呼び出しは実行時に拒否される。raw `gh issue` mutation subcommand
+（create／edit／comment 等）の production use は既存の controlled executor／
+PreToolUse hookchain（`.claude/hooks/` 配下の Bash 用ガード群と
+`scripts/agent-guards/` の shared classifier）により別レイヤーで拒否される
+（本 Agent はこのレイヤーを新規実装しない）。
 
 ## 入力
 

@@ -12,6 +12,7 @@
     ".claude/skills/create-issue/scripts/tests/",
     ".claude/skills/ssot-discovery/tests/",
     ".claude/hooks/tests/",
+    ".claude/agents/tests/",
     "tests/agent_guards/",
     ".claude/skills/issue-contract-review/scripts/tests/",
     ".claude/skills/ci-test-performance/scripts/tests/",

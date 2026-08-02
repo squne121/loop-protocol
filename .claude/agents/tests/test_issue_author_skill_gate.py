@@ -116,9 +116,16 @@ def test_unknown_skill_nested_skill_raw_cli_negative_expectations_documented(age
     assert "未知 Skill" in body or "unknown" in body.lower()
 
     # raw_cli_mutation: the body must explicitly say raw gh issue
-    # create/edit mutation is not the production authority.
-    assert "gh issue create" in body
-    assert "gh issue edit" in body
+    # mutation subcommands (create/edit/comment etc.) are not the
+    # production authority. The exact literal substrings "gh issue edit" /
+    # "gh issue comment" / "gh api --method PATCH" / "gh api --method POST"
+    # are deliberately NOT asserted here, because a separate cross-file
+    # contract test (test_skill_and_issue_author_no_raw_existing_issue_
+    # mutation_contract in .claude/skills/edit-issue/tests/
+    # test_edit_issue_txn.py) asserts those exact substrings must NOT
+    # appear anywhere in this agent body.
+    assert "gh issue" in body
+    assert "create" in body and "edit" in body
 
 
 def test_body_retains_fail_closed_rewrite_and_context_bundle_contracts(agent_frontmatter_and_body):
