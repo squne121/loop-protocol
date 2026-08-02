@@ -1594,7 +1594,8 @@ def test_given_claude_agent_tool_use_event_when_structured_run_then_child_spawn_
     fake_bin.mkdir()
     _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + _FAKE_CLAUDE_VERSION_BRANCH + """
 cat > /dev/null
-echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Agent","input":{"subagent_type":"implementation-worker"}}]}}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use",'\
+'"name":"Agent","input":{"subagent_type":"implementation-worker"}}]}}'
 echo '{"type":"result"}'
 exit 0
 """)
@@ -1623,7 +1624,8 @@ def test_given_claude_bash_self_restart_command_when_structured_run_then_self_re
     fake_bin.mkdir()
     _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + _FAKE_CLAUDE_VERSION_BRANCH + """
 cat > /dev/null
-echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"claude -p --output-format stream-json"}}]}}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use",'\
+'"name":"Bash","input":{"command":"claude -p --output-format stream-json"}}]}}'
 echo '{"type":"result"}'
 exit 0
 """)
@@ -1649,7 +1651,8 @@ def test_given_claude_bash_orchestration_command_when_structured_run_then_orches
     fake_bin.mkdir()
     _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + _FAKE_CLAUDE_VERSION_BRANCH + """
 cat > /dev/null
-echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"gh issue close 1234"}}]}}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use",'\
+'"name":"Bash","input":{"command":"gh issue close 1234"}}]}}'
 echo '{"type":"result"}'
 exit 0
 """)
