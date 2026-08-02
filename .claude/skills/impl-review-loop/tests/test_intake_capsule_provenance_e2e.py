@@ -230,7 +230,9 @@ def test_cli_human_and_agent_context_urls_resolve_into_artifact_not_stdout(tmp_p
 
     agent_entry = artifact_ctx["agent_generated"][0]
     assert agent_entry["comment_id"] == _AGENT_COMMENT_ID
-    assert agent_entry["structured_marker_present"] is True
+    assert agent_entry["validated_schema_id"] == "IMPLEMENT_RESULT_V1"
+    assert agent_entry["validation_status"] == "ok"
+    assert agent_entry["validation_errors"] == []
     assert "IMPLEMENT_RESULT_V1" in agent_entry["body"]
 
 
@@ -316,7 +318,7 @@ def test_cli_agent_report_missing_structured_marker_is_fail_closed(tmp_path):
         ]
     )
     artifact_dir = tmp_path / "artifacts"
-    # The unrelated comment has no structured marker in its body.
+    # The unrelated comment has no fenced structured block in its body.
     argv = [
         "build_intake_capsule.py",
         "--issue-number",
@@ -334,8 +336,171 @@ def test_cli_agent_report_missing_structured_marker_is_fail_closed(tmp_path):
     assert exit_code == 1, stdout_text
     stdout_payload = json.loads(stdout_text)
     assert any(
-        err.startswith("agent_report_missing_structured_marker:")
+        err.startswith("agent_report_no_structured_block:")
         for err in stdout_payload["fatal_errors"]
+    ), stdout_payload
+
+
+# ---------------------------------------------------------------------------
+# PR #1973 (OWNER REQUEST_CHANGES, P1-3): allowlisted schema-validation lane
+# for agent_generated -- a bare regex marker match (quoted / unrelated schema
+# mention, multiple blocks, non-allowlisted schema id) must fail-closed.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_agent_report_marker_only_inside_quoted_text_is_fail_closed(tmp_path):
+    """A comment body that merely mentions a schema-shaped token in quoted
+    prose text (not as the actual top-level key of a fenced structured
+    block) must NOT satisfy the allowlist check."""
+    quoted_only_comment_id = 5155550002
+    quoted_only_body = (
+        'The previous comment said "IMPLEMENT_RESULT_V1: status ok" but this '
+        "is plain prose, not a fenced structured block."
+    )
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (
+                0,
+                "\n".join(
+                    [
+                        _comments_stdout(),
+                        _comment_ndjson_line(
+                            comment_id=quoted_only_comment_id,
+                            body=quoted_only_body,
+                            html_url=f"{_ISSUE_URL}#issuecomment-{quoted_only_comment_id}",
+                        ),
+                    ]
+                ),
+                "",
+            ),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--agent-report-comment-url",
+        f"{_ISSUE_URL}#issuecomment-{quoted_only_comment_id}",
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 1, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    assert any(
+        err.startswith("agent_report_no_structured_block:")
+        for err in stdout_payload["fatal_errors"]
+    ), stdout_payload
+
+
+def test_cli_agent_report_non_allowlisted_schema_id_is_fail_closed(tmp_path):
+    """A well-formed single fenced block whose top-level key is NOT in
+    `_ALLOWED_AGENT_REPORT_SCHEMA_IDS` must fail-closed."""
+    unlisted_comment_id = 5155550003
+    unlisted_body = "```yaml\nSOME_UNLISTED_SCHEMA_V1:\n  status: ok\n```\n"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (
+                0,
+                "\n".join(
+                    [
+                        _comments_stdout(),
+                        _comment_ndjson_line(
+                            comment_id=unlisted_comment_id,
+                            body=unlisted_body,
+                            html_url=f"{_ISSUE_URL}#issuecomment-{unlisted_comment_id}",
+                        ),
+                    ]
+                ),
+                "",
+            ),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--agent-report-comment-url",
+        f"{_ISSUE_URL}#issuecomment-{unlisted_comment_id}",
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 1, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    assert any(
+        err.startswith("agent_report_schema_not_allowlisted:")
+        for err in stdout_payload["fatal_errors"]
+    ), stdout_payload
+
+
+def test_cli_agent_report_multiple_blocks_is_fail_closed(tmp_path):
+    """More than one top-level fenced block in the comment body must
+    fail-closed, even if one of them is allowlisted."""
+    multi_block_comment_id = 5155550004
+    multi_block_body = (
+        "```yaml\nIMPLEMENT_RESULT_V1:\n  status: ok\n```\n"
+        "```yaml\nTEST_VERDICT:\n  status: pass\n```\n"
+    )
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (
+                0,
+                "\n".join(
+                    [
+                        _comments_stdout(),
+                        _comment_ndjson_line(
+                            comment_id=multi_block_comment_id,
+                            body=multi_block_body,
+                            html_url=f"{_ISSUE_URL}#issuecomment-{multi_block_comment_id}",
+                        ),
+                    ]
+                ),
+                "",
+            ),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--agent-report-comment-url",
+        f"{_ISSUE_URL}#issuecomment-{multi_block_comment_id}",
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 1, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    assert any(
+        err.startswith("agent_report_multiple_blocks:") for err in stdout_payload["fatal_errors"]
     ), stdout_payload
 
 
@@ -399,3 +564,139 @@ def test_skill_md_declares_provenance_inputs():
     body = SKILL_MD.read_text(encoding="utf-8")
     assert "human_context_comment_urls" in body
     assert "agent_report_comment_urls" in body
+
+
+# ---------------------------------------------------------------------------
+# PR #1973 (OWNER REQUEST_CHANGES, P0-2): `build_capsule_argv()` is the
+# single source of truth for the CLI argv preparation.md "0-a" documents;
+# `validate_step1_dispatch_payload()` is the enforceable version of the
+# step-1-implementation.md "#1950 AC10" prose.
+# ---------------------------------------------------------------------------
+
+
+def test_build_capsule_argv_materializes_canonical_command_with_additive_flags():
+    """`build_capsule_argv()` must produce the exact canonical command
+    documented in preparation.md "0-a", with `--human-context-comment-url` /
+    `--agent-report-comment-url` appended additively (not a separate code
+    path) when those inputs are non-empty."""
+    argv_no_context = mod.build_capsule_argv(issue_number=_ISSUE_NUMBER, repo=_REPO)
+    assert argv_no_context == [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/impl-review-loop/scripts/build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--max-stdout-bytes",
+        "4096",
+    ]
+
+    argv_with_context = mod.build_capsule_argv(
+        issue_number=_ISSUE_NUMBER,
+        repo=_REPO,
+        human_context_comment_urls=[_HUMAN_COMMENT_URL],
+        agent_report_comment_urls=[_AGENT_COMMENT_URL],
+    )
+    # The base command is an unmodified prefix -- additive, not a fork.
+    assert argv_with_context[: len(argv_no_context)] == argv_no_context
+    assert argv_with_context[len(argv_no_context) :] == [
+        "--human-context-comment-url",
+        _HUMAN_COMMENT_URL,
+        "--agent-report-comment-url",
+        _AGENT_COMMENT_URL,
+    ]
+
+
+def test_build_capsule_argv_e2e_subprocess_invocation_resolves_context_inputs(tmp_path):
+    """#1950 AC6/AC7 (P0-2 fix_delta test): actually invoke
+    `build_intake_capsule.py` through the EXACT argv `build_capsule_argv()`
+    materializes (mirroring the CLI-entrypoint harness already established
+    by `_run_main()` / `test_cli_human_and_agent_context_urls_resolve_into_artifact_not_stdout`
+    above), and confirm the resulting `context_inputs.human_supplied` /
+    `context_inputs.agent_generated` reflect the requested URLs."""
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, _comments_stdout(), ""),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    materialized_argv = mod.build_capsule_argv(
+        issue_number=_ISSUE_NUMBER,
+        repo=_REPO,
+        max_stdout_bytes=65536,
+        human_context_comment_urls=[_HUMAN_COMMENT_URL],
+        agent_report_comment_urls=[_AGENT_COMMENT_URL],
+    )
+    # Translate the shell-oriented argv (`uv run python3 <script> ...`) into
+    # the in-process sys.argv shape `_run_main()` expects (program name +
+    # flags), reusing the SAME flag values `build_capsule_argv()` produced --
+    # no separate argv construction.
+    cli_argv = ["build_intake_capsule.py", *materialized_argv[4:], "--artifact-dir", str(artifact_dir)]
+
+    exit_code, stdout_text = _run_main(cli_argv, run_cmd)
+
+    assert exit_code == 0, stdout_text
+    artifact_path = artifact_dir / f"intake-capsule-{_ISSUE_NUMBER}.json"
+    artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    context_inputs = artifact_payload["context_inputs"]
+
+    assert context_inputs["human_supplied"][0]["url"] == _HUMAN_COMMENT_URL
+    assert context_inputs["agent_generated"][0]["url"] == _AGENT_COMMENT_URL
+    assert context_inputs["agent_generated"][0]["validated_schema_id"] == "IMPLEMENT_RESULT_V1"
+
+    # (i) message_fields WITH technical_recommendation + evidence IDs -> allowed.
+    allowed_ok, errors_ok = mod.validate_step1_dispatch_payload(
+        context_inputs,
+        {
+            "technical_recommendation": "Apply the reviewed fix per repository diff/tests.",
+            "human_context_comment_ids": [context_inputs["human_supplied"][0]["comment_id"]],
+            "agent_report_comment_ids": [context_inputs["agent_generated"][0]["comment_id"]],
+        },
+    )
+    assert allowed_ok is True, errors_ok
+    assert errors_ok == []
+
+    # (ii) message_fields WITHOUT technical_recommendation -> blocked.
+    allowed_missing_rec, errors_missing_rec = mod.validate_step1_dispatch_payload(
+        context_inputs,
+        {
+            "human_context_comment_ids": [context_inputs["human_supplied"][0]["comment_id"]],
+        },
+    )
+    assert allowed_missing_rec is False
+    assert "step1_dispatch_missing_technical_recommendation" in errors_missing_rec
+
+    # (iii) message_fields embedding a human_supplied comment's raw body
+    # verbatim -> blocked (raw human comment must never be bound as an
+    # execution instruction directly).
+    raw_human_body = context_inputs["human_supplied"][0]["body"]
+    allowed_raw_embed, errors_raw_embed = mod.validate_step1_dispatch_payload(
+        context_inputs,
+        {
+            "technical_recommendation": f"Do exactly what the owner said: {raw_human_body}",
+            "human_context_comment_ids": [context_inputs["human_supplied"][0]["comment_id"]],
+        },
+    )
+    assert allowed_raw_embed is False
+    assert any(err.startswith("step1_dispatch_raw_human_comment_embedded:") for err in errors_raw_embed)
+
+
+def test_validate_step1_dispatch_payload_noop_when_context_inputs_absent():
+    """When `context_inputs` is None/empty, `validate_step1_dispatch_payload()`
+    is a no-op (per step-1-implementation.md: "context_inputs が存在しない
+    場合、この節は no-op")."""
+    allowed, errors = mod.validate_step1_dispatch_payload(None, {})
+    assert allowed is True
+    assert errors == []
+
+    allowed_empty, errors_empty = mod.validate_step1_dispatch_payload(
+        {"human_supplied": [], "agent_generated": []}, {}
+    )
+    assert allowed_empty is True
+    assert errors_empty == []

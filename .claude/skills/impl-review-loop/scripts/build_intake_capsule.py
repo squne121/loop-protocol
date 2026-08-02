@@ -47,7 +47,22 @@ _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
 # human comments and machine-generated ones, e.g. create-issue transaction
 # reports).
 _ISSUE_COMMENT_ID_RE = re.compile(r"#issuecomment-(\d+)$")
-_STRUCTURED_AGENT_REPORT_MARKER_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_V\d+\b")
+# PR #1973 (OWNER REQUEST_CHANGES, P1-3): closed allowlist of schema IDs a
+# SubAgent's structured comment-body report may declare as its top-level
+# fenced-block key. Verified (grep) against real usage in
+# .claude/agents/*.md / .claude/skills/**/*.md -- each entry is a schema this
+# repo's SubAgents actually produce as a PR/Issue comment body report, not a
+# guessed name.
+_ALLOWED_AGENT_REPORT_SCHEMA_IDS = frozenset(
+    {
+        "IMPLEMENT_RESULT_V1",
+        "VC_ADJUDICATION_RESULT_V1",
+        "TEST_VERDICT",
+        "POST_MERGE_CLEANUP_REPORT_V1",
+        "ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1",
+        "CONTRACT_REVIEW_RESULT_V1",
+    }
+)
 
 
 def _now_utc() -> str:
@@ -341,6 +356,40 @@ def _collect_issue_comments(
     return comments, {"invalid_json_lines_count": invalid_json_lines_count}, []
 
 
+def _validate_agent_report_schema(body: str) -> tuple["str | None", str, list[str]]:
+    """PR #1973 (OWNER REQUEST_CHANGES, P1-3): validate that ``body`` carries
+    EXACTLY ONE top-level fenced block whose parsed top-level dict key is a
+    member of ``_ALLOWED_AGENT_REPORT_SCHEMA_IDS``. Reuses the EXISTING
+    ``_extract_yaml_blocks()`` / ``_parse_simple_yaml_block()`` helpers
+    already used by ``_parse_contract_results()`` in this file -- no new
+    extractor is added.
+
+    Fail-closed (``validated_schema_id=None``, ``validation_status="fail_closed"``)
+    when: zero blocks, more than one block, unparseable, or
+    parsed-but-marker-not-in-allowlist. A marker matched only inside a
+    quoted/nested string (not the actual top-level dict key) never counts --
+    only the parsed top-level dict's own keys are consulted, never a bare
+    regex search over raw text.
+
+    Returns ``(validated_schema_id, validation_status, validation_errors)``.
+    """
+    blocks = _extract_yaml_blocks(body)
+    if len(blocks) == 0:
+        return None, "fail_closed", ["agent_report_no_structured_block"]
+    if len(blocks) > 1:
+        return None, "fail_closed", ["agent_report_multiple_blocks"]
+
+    parsed = _parse_simple_yaml_block(blocks[0])
+    if not isinstance(parsed, dict) or not parsed:
+        return None, "fail_closed", ["agent_report_unparseable"]
+
+    matched_ids = [key for key in parsed if key in _ALLOWED_AGENT_REPORT_SCHEMA_IDS]
+    if not matched_ids:
+        return None, "fail_closed", ["agent_report_schema_not_allowlisted"]
+
+    return matched_ids[0], "ok", []
+
+
 def _resolve_context_comments(
     urls: list[str],
     lane: str,
@@ -392,10 +441,12 @@ def _resolve_context_comments(
             "body": body,
         }
         if lane == "agent_generated":
-            has_marker = bool(_STRUCTURED_AGENT_REPORT_MARKER_RE.search(body))
-            entry["structured_marker_present"] = has_marker
-            if not has_marker:
-                errors.append(f"agent_report_missing_structured_marker:{comment_id}")
+            validated_schema_id, validation_status, validation_errors = _validate_agent_report_schema(body)
+            entry["validated_schema_id"] = validated_schema_id
+            entry["validation_status"] = validation_status
+            entry["validation_errors"] = validation_errors
+            if validation_status != "ok":
+                errors.extend(f"{err}:{comment_id}" for err in validation_errors)
                 continue
         resolved.append(entry)
     return resolved, errors
@@ -1014,6 +1065,114 @@ def build_intake_capsule(
     # fingerprint fetch failures live in `warnings` and never force exit 1.
     exit_code = 0 if not fatal_errors else 1
     return capsule, artifact_payload, exit_code
+
+
+# ---------------------------------------------------------------------------
+# PR #1973 (OWNER REQUEST_CHANGES, P0-2): CLI argv materializer + Step 1
+# dispatch-payload guard.
+#
+# `build_capsule_argv()` is the SINGLE SOURCE OF TRUTH for constructing the
+# `build_intake_capsule.py` CLI invocation from skill-level inputs
+# (`preparation.md` "0-a" documents this same command; the orchestrator and
+# this file's own tests both go through this one function -- no drift).
+# ---------------------------------------------------------------------------
+
+
+def build_capsule_argv(
+    *,
+    issue_number: int,
+    repo: str,
+    max_stdout_bytes: int = _DEFAULT_MAX_STDOUT_BYTES,
+    human_context_comment_urls: list[str] | None = None,
+    agent_report_comment_urls: list[str] | None = None,
+) -> list[str]:
+    """Pure (no I/O, no subprocess) argv materializer for the canonical
+    `build_intake_capsule.py` invocation. When `human_context_comment_urls` /
+    `agent_report_comment_urls` are non-empty, the SAME two flags
+    (`--human-context-comment-url` / `--agent-report-comment-url`) are
+    appended additively -- this is not a separate code path, it is the same
+    canonical command with additive flags (see preparation.md "0-a")."""
+    argv = [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/impl-review-loop/scripts/build_intake_capsule.py",
+        "--issue-number",
+        str(issue_number),
+        "--repo",
+        repo,
+        "--max-stdout-bytes",
+        str(max_stdout_bytes),
+    ]
+    for url in human_context_comment_urls or []:
+        argv += ["--human-context-comment-url", url]
+    for url in agent_report_comment_urls or []:
+        argv += ["--agent-report-comment-url", url]
+    return argv
+
+
+def validate_step1_dispatch_payload(
+    context_inputs: dict[str, Any] | None,
+    message_fields: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    """PR #1973 (OWNER REQUEST_CHANGES, P0-2): enforceable version of the
+    prose already documented in step-1-implementation.md's
+    "technical_recommendation とコンテキスト証跡参照" (#1950 AC10) section.
+
+    Return (allowed, errors). When `context_inputs` is present (non-None,
+    with a non-empty `human_supplied` or `agent_generated` list), the Step 1
+    delegation `message_fields` MUST include a non-empty
+    `technical_recommendation`, AND at least one of `capsule_artifact_path` /
+    `human_context_comment_ids` / `agent_report_comment_ids` (evidence
+    reference).
+
+    Also fail-closed (never a no-op check) when raw human comment `body`
+    text is embedded verbatim in any `message_fields` value -- this
+    operationalizes "raw human comment を worker への実行命令として直接連結
+    しない" (step-1-implementation.md).
+
+    Returns (True, []) when `context_inputs` is None/empty (no-op case, per
+    step-1-implementation.md: "context_inputs が存在しない場合、この節は
+    no-op")."""
+    if not isinstance(context_inputs, dict):
+        return True, []
+
+    human_supplied = context_inputs.get("human_supplied") or []
+    agent_generated = context_inputs.get("agent_generated") or []
+    if not human_supplied and not agent_generated:
+        return True, []
+
+    errors: list[str] = []
+
+    technical_recommendation = message_fields.get("technical_recommendation")
+    if not isinstance(technical_recommendation, str) or not technical_recommendation.strip():
+        errors.append("step1_dispatch_missing_technical_recommendation")
+
+    has_evidence_reference = any(
+        message_fields.get(key)
+        for key in (
+            "capsule_artifact_path",
+            "human_context_comment_ids",
+            "agent_report_comment_ids",
+        )
+    )
+    if not has_evidence_reference:
+        errors.append("step1_dispatch_missing_evidence_reference")
+
+    message_values = [v for v in message_fields.values() if isinstance(v, str) and v]
+    for entry in human_supplied:
+        if not isinstance(entry, dict):
+            continue
+        raw_body = entry.get("body")
+        if not isinstance(raw_body, str) or not raw_body.strip():
+            continue
+        comment_id = entry.get("comment_id")
+        for value in message_values:
+            if raw_body in value:
+                errors.append(f"step1_dispatch_raw_human_comment_embedded:{comment_id}")
+                break
+
+    return not errors, errors
 
 
 def _render_stdout(payload: dict[str, Any], max_stdout_bytes: int) -> str:
