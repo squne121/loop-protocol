@@ -105,6 +105,20 @@ stdout / stderr の両方から判別する failure_class。`_normalize_agy_resu
 | `agy_unexpected_error` | AGY 実行時の未分類例外（terminal / non-retryable） | no |
 | `agy_invocation_policy_denied` | agy 実行用 argv が位置ベースの構造 allowlist （`_validate_agy_invocation_argv()`、Issue #1807）に違反（`--dangerously-skip-permissions` 等の permission-bypass flag を含む未知の trailing option 混入等）。`agy_permission_denied`（AGY 側/OS レベルの権限拒否）とは異なり、wrapper 側が `subprocess.run()` 呼び出し前にfail-closed で拒否したことを示す。retryable: false | no |
 
+### AGY permission-boundary runner failure classes（Issue #1814）
+
+この二つは provider fallback の入力ではない。専用 runner は fallback provider を
+起動せず、pytest skip やモデルの自己申告でこれらを成功へ置換しない。
+
+| `failure_class` | runner exit | completion | retry / recovery |
+|---|---:|---|---|
+| `agy_permission_boundary_unavailable` | 77 | false | binary、既存 auth、または required runtime capability が unavailable。外部状態が復旧した後に dedicated runner を再実行する。|
+| `agy_permission_boundary_inconclusive` | 1 | false | injected attempt 不在、attempt correlation 不成立、hook lifecycle evidence 不足、または artifact invalid。実装または runtime evidence を修復して再実行する。|
+
+predicate violation、unexpected `PostToolUse`、または side-effect counter の増加も
+exit 1 / `completion: false` とする。fallback provider が成功してもこの分類を
+上書きしてはならない。
+
 ### provider_auto_policy_v1 fallback classes（フォールバック分類、Issue #1270）
 
 `provider=auto`（`provider_auto_dispatch()`）が provider fallback の

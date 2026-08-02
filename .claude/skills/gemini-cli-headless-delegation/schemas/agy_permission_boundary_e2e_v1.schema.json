@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/agy_permission_boundary_e2e_v1.schema.json",
+  "title": "AGY permission-boundary E2E evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generated_at", "runner", "artifact", "matrix", "attempts", "fallback", "failure_taxonomy", "cleanup", "secret_scan"],
+  "properties": {
+    "schema": {"const": "agy_permission_boundary_e2e/v1"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "runner": {
+      "type": "object", "additionalProperties": false,
+      "required": ["identity", "exit_code", "actual_agy_executed", "executable_ref", "executable_version", "binary_digest", "artifact_digest"],
+      "properties": {
+        "identity": {"const": "run_agy_permission_boundary_e2e"},
+        "exit_code": {"enum": [0, 1, 77]},
+        "actual_agy_executed": {"type": "boolean"},
+        "executable_ref": {"type": "string", "pattern": "^[^/]+$"},
+        "executable_version": {"type": "string", "minLength": 1},
+        "binary_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "artifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["digest"],
+      "properties": {"digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}
+    },
+    "matrix": {
+      "type": "object", "additionalProperties": false,
+      "required": ["profile", "capabilities"],
+      "properties": {
+        "profile": {"type": "string"},
+        "capabilities": {"type": "array", "items": {"enum": ["command", "write", "read", "network", "mcp"]}}
+      }
+    },
+    "attempts": {"type": "array", "items": {"$ref": "#/$defs/attempt"}},
+    "fallback": {"type": "object", "additionalProperties": false, "required": ["used"], "properties": {"used": {"const": false}}},
+    "failure_taxonomy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["class", "completion", "retry"],
+      "properties": {"class": {"type": "string"}, "completion": {"type": "boolean"}, "retry": {"type": "string"}}
+    },
+    "cleanup": {
+      "type": "object", "additionalProperties": false,
+      "required": ["temporary_processes_removed", "loopback_servers_stopped"],
+      "properties": {"temporary_processes_removed": {"type": "boolean"}, "loopback_servers_stopped": {"type": "boolean"}}
+    },
+    "secret_scan": {"type": "object", "additionalProperties": false, "required": ["clean"], "properties": {"clean": {"const": true}}}
+  },
+  "$defs": {
+    "attempt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["correlation", "predicates"],
+      "properties": {
+        "correlation": {"type": "object", "additionalProperties": {"type": ["string", "integer"]}},
+        "predicates": {"type": "object", "additionalProperties": {"type": "boolean"}}
+      }
+    }
+  }
+}

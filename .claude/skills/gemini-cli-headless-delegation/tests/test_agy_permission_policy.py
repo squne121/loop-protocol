@@ -53,6 +53,42 @@ ALL_DENY_PROFILES = [
 ]
 
 
+def test_official_settings_deny_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Official isolated settings use resource ``action(target)`` deny rules.
+
+    ``ask`` and ``allow`` are deliberately hostile here: a matching deny
+    still wins, so the expectation model cannot accidentally treat a
+    confirmation policy as a hard permission boundary.
+    """
+    settings = app.build_official_agy_settings(app.NO_TOOLS_PROFILE)
+    denied = set(settings["permissions"]["deny"])
+    assert denied == {f"{resource}(*)" for resource in app.CANONICAL_PERMISSION_RESOURCES}
+    assert settings["toolPermission"] == app.AGY_TOOL_PERMISSION_ALWAYS_PROCEED
+
+    hostile = {
+        "permissions": {
+            "deny": settings["permissions"]["deny"],
+            "ask": ["command(*)"],
+            "allow": ["command(*)"],
+        }
+    }
+    assert app.resolve_official_permission_action(hostile, "command", "anything") == "deny"
+    assert app.resolve_official_permission_action(hostile, "read_file", "anything") == "deny"
+
+    fake_home = tmp_path / "real-home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    workspace = app.materialize_isolated_agy_workspace(app.NO_TOOLS_PROFILE, parent_dir=tmp_path)
+    try:
+        assert workspace.agy_tool_permission_settings_path == (
+            workspace.workspace_dir / ".gemini" / "antigravity-cli" / "settings.json"
+        )
+        assert json.loads(workspace.agy_tool_permission_settings_path.read_text(encoding="utf-8")) == settings
+    finally:
+        import shutil
+
+        shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # AC1: no_tools profile denies all AGY direct tools
 # ---------------------------------------------------------------------------
@@ -377,13 +413,14 @@ def test_isolated_workspace_does_not_copy_credential_files(
             settings_text = workspace.settings_path.read_text(encoding="utf-8")
             assert "should-never-be-copied" not in settings_text
             assert str(fake_real_home) not in workspace.env.get("HOME", "")
-            # Issue #1758: the real-AGY-settings file is always a fresh
-            # fixed-value document, never a copy/reuse of the fake real
-            # home's settings.json (which sets permissions.default: "allow").
-            tool_permission_text = workspace.agy_tool_permission_settings_path.read_text(encoding="utf-8")
-            assert "should-never-be-copied" not in tool_permission_text
-            assert "permissions" not in tool_permission_text
-            assert json.loads(tool_permission_text) == {"toolPermission": "always-proceed"}
+            # The official settings file is always fresh and never reuses the
+            # hostile real-home policy.  It contains the Issue #1814 primary
+            # ``permissions.deny`` boundary alongside confirmation policy.
+            official_settings_text = workspace.agy_tool_permission_settings_path.read_text(
+                encoding="utf-8"
+            )
+            assert "should-never-be-copied" not in official_settings_text
+            assert json.loads(official_settings_text) == app.build_official_agy_settings(profile)
         finally:
             import shutil
 

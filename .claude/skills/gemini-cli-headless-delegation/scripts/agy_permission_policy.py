@@ -134,7 +134,9 @@ class AgyReadOnlyBoundaryError(RuntimeError):
     profile's read-only guarantee.
     """
 
-# Canonical taxonomy of the AGY *direct* tool surface this policy governs:
+# Legacy expectation taxonomy of the AGY *direct* tool surface.  It remains
+# for older hermetic wrapper tests only; AGY does not consume it as a runtime
+# permission source.
 # shell/command execution, filesystem, MCP, GitHub, browser, and web tools.
 # This is used to populate the explicit `deny` list in the generated policy
 # document (informational / auditable) -- the actual enforcement is via
@@ -161,6 +163,31 @@ AGY_DIRECT_TOOL_NAMES: frozenset[str] = frozenset(
         "read_url_content",
     }
 )
+
+# Official AGY permission resources are deliberately distinct from the native
+# hook tool names above.  The runtime settings format consumes
+# ``action(target)`` rules (for example ``command(*)``), whereas a PreToolUse
+# event reports a native dispatcher name such as ``run_command``.  Keeping
+# the two vocabularies separate prevents a native tool name from being
+# accidentally serialized as an official permission rule.
+CANONICAL_PERMISSION_RESOURCES: frozenset[str] = frozenset(
+    {
+        "command",
+        "read_file",
+        "write_file",
+        "read_url",
+        "execute_url",
+        "unsandboxed",
+        "mcp",
+    }
+)
+
+PROFILE_ALLOWED_PERMISSION_RESOURCES: dict[str, frozenset[str]] = {
+    NO_TOOLS_PROFILE: frozenset(),
+    LOCAL_ASSET_RESEARCH_PROFILE: frozenset(),
+    GROUNDED_RESEARCH_PROFILE: frozenset({"read_url"}),
+    PROPOSAL_ONLY_PROFILE: frozenset(),
+}
 
 GROUNDED_RESEARCH_ALLOWLIST: frozenset[str] = frozenset({"search_web", "read_url_content"})
 
@@ -204,14 +231,11 @@ def profile_allowed_tools(profile: str) -> frozenset[str]:
 
 
 def build_workspace_permission_policy(profile: str) -> dict[str, Any]:
-    """Build the workspace-scoped permission policy document for *profile*.
+    """Build a legacy, wrapper-side expectation document for *profile*.
 
-    This is the document written into the isolated workspace's
-    `.antigravity/settings.json`. `permissions.default` is always `"deny"`;
-    only tool names in `permissions.allow` may execute. For every profile in
-    this Issue's scope (`no_tools` / `local_asset_research` / `proposal_only`)
-    `permissions.allow` is empty -- AGY direct tools are fully denied.
-    `grounded_research` allows exactly `search_web` and `read_url_content`.
+    This is not an official AGY settings file and does not enforce an AGY
+    runtime decision.  Issue #1814 uses the isolated HOME's official
+    settings and an independent PreToolUse hook for that purpose.
     """
     validate_profile(profile)
     allow = sorted(PROFILE_ALLOWED_TOOLS[profile])
@@ -266,14 +290,68 @@ def resolve_tool_permission(
 
     `global_settings` is accepted only to make the config-precedence
     guarantee explicit and testable: it is intentionally **never** consulted
-    to widen the workspace allowlist. Workspace-scoped deny always wins over
-    a global allow (Issue #1705 AC5/AC6), including when `global_settings`
-    is a `hostile_global_settings_fixture()` that allows everything.
+    to widen this legacy expectation model.  It is not an official AGY
+    permission decision.
     """
     validate_profile(profile)
     del global_settings  # intentionally unused: workspace policy is authoritative
     allowed = PROFILE_ALLOWED_TOOLS[profile]
     return "allow" if tool_name in allowed else "deny"
+
+
+def _permission_action(resource: str, target: str = "*") -> str:
+    """Return the official settings spelling for one permission resource."""
+    if resource not in CANONICAL_PERMISSION_RESOURCES:
+        raise ValueError(f"unknown official AGY permission resource: {resource!r}")
+    return f"{resource}({target})"
+
+
+def build_official_agy_settings(profile: str) -> dict[str, Any]:
+    """Build the isolated HOME's official AGY settings document.
+
+    The CLI consumes this document from
+    ``~/.gemini/antigravity-cli/settings.json``.  ``permissions.deny`` is a
+    list of official ``action(target)`` rules and is the primary expectation
+    model for restrictive profiles.  ``toolPermission`` only suppresses an
+    interactive confirmation prompt; it is never treated as a deny boundary.
+    """
+    validate_profile(profile)
+    allowed = PROFILE_ALLOWED_PERMISSION_RESOURCES[profile]
+    denied = CANONICAL_PERMISSION_RESOURCES - allowed
+    return {
+        "toolPermission": AGY_TOOL_PERMISSION_ALWAYS_PROCEED,
+        "permissions": {
+            "deny": [_permission_action(resource) for resource in sorted(denied)],
+            "ask": [],
+            "allow": [_permission_action(resource) for resource in sorted(allowed)],
+        },
+    }
+
+
+def resolve_official_permission_action(
+    settings: Mapping[str, Any], resource: str, target: str = "*"
+) -> str:
+    """Evaluate the settings expectation model with explicit deny precedence.
+
+    This helper is intentionally an expectation/test model, not a substitute
+    for the real AGY runtime.  It makes hostile ``ask``/``allow`` fixtures
+    deterministic: a matching official deny is always returned as ``deny``.
+    Unknown or malformed values also fail closed to ``deny``.
+    """
+    try:
+        action = _permission_action(resource, target)
+    except ValueError:
+        return "deny"
+    permissions = settings.get("permissions")
+    if not isinstance(permissions, Mapping):
+        return "deny"
+    for decision in ("deny", "ask", "allow"):
+        rules = permissions.get(decision)
+        if not isinstance(rules, list) or not all(isinstance(rule, str) for rule in rules):
+            continue
+        if action in rules or _permission_action(resource) in rules:
+            return decision
+    return "deny"
 
 
 # ---------------------------------------------------------------------------
@@ -615,10 +693,13 @@ def _build_bwrap_ro_bind_prefix(
     return argv
 
 
-# Issue #1758: AGY's *own* built-in safety preset -- distinct from and
-# evaluated *before* this module's workspace-scoped `.antigravity/settings.json`
-# deny policy / `workspace_deny_gate` PreToolCall hook above -- is controlled by
-# a `toolPermission` field inside the real AGY settings file
+# AGY's official runtime settings live under the isolated HOME, not under the
+# legacy expectation-only `.antigravity/` directory.  ``toolPermission`` is a
+# confirmation policy and the official ``permissions`` object contains the
+# primary restrictive rules.
+#
+# Issue #1758: AGY's *own* built-in confirmation preset is controlled by a
+# `toolPermission` field inside the real AGY settings file
 # (`~/.gemini/antigravity-cli/settings.json`, confirmed via live WebFetch of
 # `https://antigravity.google/docs/cli/reference` /
 # `https://antigravity.google/docs/cli/using`; see
@@ -646,9 +727,10 @@ AGY_TOOL_PERMISSION_ALWAYS_PROCEED = "always-proceed"
 AGY_SETTINGS_FILENAME = "settings.json"
 
 
-def _write_agy_tool_permission_settings(isolated_home: Path) -> "Path | None":
-    """Write `<isolated_home>/.gemini/antigravity-cli/settings.json` with an
-    explicit `toolPermission: "always-proceed"` value.
+def _write_agy_tool_permission_settings(
+    isolated_home: Path, profile: str
+) -> "Path | None":
+    """Write official restrictive settings under an isolated AGY HOME.
 
     Unlike `_expose_gcloud_adc_read_only()` / `_expose_agy_oauth_token_read_only()`
     above, this function never reads or reuses any value from the real host's
@@ -673,7 +755,7 @@ def _write_agy_tool_permission_settings(isolated_home: Path) -> "Path | None":
     settings_path = settings_dir / AGY_SETTINGS_FILENAME
     try:
         settings_path.write_text(
-            json.dumps({"toolPermission": AGY_TOOL_PERMISSION_ALWAYS_PROCEED}, indent=2, sort_keys=True),
+            json.dumps(build_official_agy_settings(profile), indent=2, sort_keys=True),
             encoding="utf-8",
         )
     except OSError:
@@ -851,7 +933,7 @@ def materialize_isolated_agy_workspace(
     # toolPermission so the isolated `agy` subprocess does not fall back to
     # the built-in "request-review" default, which silently drops tool calls
     # in headless print mode; see `_write_agy_tool_permission_settings()`.
-    agy_tool_permission_settings_path = _write_agy_tool_permission_settings(workspace_dir)
+    agy_tool_permission_settings_path = _write_agy_tool_permission_settings(workspace_dir, profile)
 
     # Issue #1779 AC4/AC5/AC6: determine the actual (not merely claimed)
     # read-only enforcement mode for `agy_oauth_token_path`, and build the

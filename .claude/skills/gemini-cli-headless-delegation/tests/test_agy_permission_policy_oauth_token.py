@@ -264,17 +264,17 @@ def test_expose_agy_oauth_token_minimal_subpath_only(tmp_path: Path, monkeypatch
             # not appear; the workspace's own .antigravity/settings.json
             # (freshly generated policy doc) is a distinct, expected file.
             # Issue #1758: `<workspace>/.gemini/antigravity-cli/settings.json`
-            # now legitimately exists -- but only as the fresh, fixed-value
-            # toolPermission document `_write_agy_tool_permission_settings()`
-            # generates, never a copy of the *real* fake_real_home
+            # now legitimately exists -- but only as freshly generated
+            # official settings (toolPermission plus permissions.deny), never
+            # a copy of the *real* fake_real_home
             # `.gemini/antigravity-cli/settings.json` (`{}`) written above.
             gemini_settings_paths = [
                 p for p in workspace.workspace_dir.rglob("settings.json") if "antigravity-cli" in p.parts
             ]
             assert gemini_settings_paths == [workspace.agy_tool_permission_settings_path]
-            assert json.loads(gemini_settings_paths[0].read_text(encoding="utf-8")) == {
-                "toolPermission": "always-proceed"
-            }
+            assert json.loads(gemini_settings_paths[0].read_text(encoding="utf-8")) == (
+                app.build_official_agy_settings(profile)
+            )
         finally:
             shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
 
