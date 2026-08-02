@@ -25,6 +25,9 @@ implementation child issue を **実装 → 検証 → PR レビュー** の 3 �
 - `issue_number`（必須）: implementation child issue 番号
 - `contract_snapshot_url`（任意）: 参照用 telemetry。欠落時に materialize を要求せず routing を継続する。
 - `max_iterations`（任意、デフォルト 3）: 上限回数。超過時は fail-close で人間判断を仰ぐ
+- `human_context_comment_urls`（任意、repeatable, #1950 AC6）: root/main thread が「人間が投稿した自然言語コンテキスト」として明示的に渡す Issue comment URL のリスト。origin はコメント本文・投稿アカウント・`author_association`・構造化 marker の有無から推測せず、**この引数として渡されたこと自体だけ**を origin 判定根拠にする。
+- `agent_report_comment_urls`（任意、repeatable, #1950 AC6）: root/main thread が「SubAgent が返した構造化 report」として明示的に渡す Issue comment URL のリスト。同様に本引数として渡されたことだけが origin 判定根拠であり、投稿アカウントが human_context 側と同一でも構わない（例: `create-issue transaction partial-failure` のような機械生成コメントと人間コメントが同一アカウントから混在する場合がある）。
+- 同一 URL が `human_context_comment_urls` と `agent_report_comment_urls` の両方に渡された場合は provenance conflict として fail-closed にする（`build_intake_capsule.py` の `--human-context-comment-url` / `--agent-report-comment-url` 参照）。
 
 ## Loop Structure（ループ構造）
 
