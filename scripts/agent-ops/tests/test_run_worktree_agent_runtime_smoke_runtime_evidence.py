@@ -155,3 +155,48 @@ exit 0
     assert "capability_decision: runtime_outcome" in summary
     assert "runtime_version: 2.1.220" in summary
     assert "tested_head:" in summary
+
+
+def test_resolved_executable_is_single_path_shared_by_version_capture_and_invocation(
+    repo_with_worktree, tmp_path
+):
+    """Issue #1960 Design Decision 5 (P1-2 fix-delta, PR #1976 owner
+    REQUEST_CHANGES): the runtime executable must be resolved ONCE via
+    ``shutil.which()`` and that same resolved absolute path must be used
+    for both version capture and the actual fixed-argv invocation, recorded
+    in evidence as ``resolved_executable``. This fixture places the real
+    fake ``claude`` binary at a symlink-resolved absolute path and asserts
+    ``resolved_executable`` in summary.md points at exactly that same
+    on-disk file the invocation marker proves was actually executed."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    claude_path = fake_bin / "claude"
+    invoked_marker = tmp_path / "invoked.marker"
+    _write_fake_exe(claude_path, f"""
+if [ "$1" = "--version" ]; then
+  echo "9.9.9 (Claude Code)"
+  exit 0
+fi
+cat > /dev/null
+touch "{invoked_marker}"
+echo '{{"type":"result","subtype":"success"}}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    assert invoked_marker.exists()
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "runtime_version: 9.9.9" in summary
+    resolved_line = next(
+        line for line in summary.splitlines() if line.startswith("- resolved_executable:")
+    )
+    resolved_value = resolved_line.split(":", 1)[1].strip()
+    assert resolved_value == os.path.realpath(str(claude_path))

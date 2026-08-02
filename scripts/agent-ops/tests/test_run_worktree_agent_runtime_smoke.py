@@ -381,19 +381,83 @@ def test_given_max_turns_zero_or_negative_when_parsed_then_argument_error(repo_w
 
 
 def test_given_no_claude_binary_when_preflight_runs_then_skip77(repo_with_worktree, tmp_path):
+    """Issue #1960 P1-1 fix-delta (PR #1976 owner REQUEST_CHANGES): a
+    controlled SKIP 77 caused by ``claude`` preflight failure must still
+    emit allowlist-only summary.md evidence, not merely return exit 77 with
+    no evidence at all (AC7)."""
     repo, worktree = repo_with_worktree
     empty_bin = tmp_path / "empty-bin"
     empty_bin.mkdir()
     prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
     result = _run(
         repo, worktree,
         "--runtime", "claude", "--mode", "structured",
-        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
         # Keep system dirs (git) reachable while excluding the real claude/codex
         # binaries that normally live under ~/.local/bin.
         extra_env={"PATH": f"{empty_bin}:/usr/bin:/bin"},
     )
     assert result.returncode == 77
+    summary_path = out_dir / "summary.md"
+    assert summary_path.exists(), "no-claude preflight SKIP must still write summary.md (AC7)"
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "exit_code: 77" in summary
+    assert "required command not found: claude" in summary
+
+
+def test_given_codex_help_introspection_fails_when_preflight_runs_then_skip77_with_summary(
+    repo_with_worktree, tmp_path
+):
+    """Issue #1960 P1-1 fix-delta: a controlled SKIP 77 caused by the codex
+    capability preflight (``codex exec --help`` introspection failing or
+    missing required flags) must still emit summary.md evidence (AC7)."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # Missing --json/--ephemeral/-C in --help output triggers the
+    # capability-missing skip branch of preflight_codex_flags().
+    _write_fake_exe(fake_bin / "codex", 'echo "nothing useful"\nexit 0\n')
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "codex", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 77
+    summary_path = out_dir / "summary.md"
+    assert summary_path.exists(), "codex capability preflight SKIP must still write summary.md (AC7)"
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "exit_code: 77" in summary
+    assert "codex CLI missing required structured-lane flags" in summary
+    assert "resolved_executable:" in summary
+
+
+def test_given_herdr_preflight_fails_when_interactive_mode_runs_then_skip77_with_summary(
+    repo_with_worktree, tmp_path
+):
+    """Issue #1960 P1-1 fix-delta: a controlled SKIP 77 caused by
+    ``preflight_herdr`` failure (HERDR_ENV unset) must still emit
+    summary.md evidence (AC7)."""
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        # Explicitly override (not merely omit) HERDR_ENV so a real ambient
+        # HERDR_ENV=1 in the outer test-runner environment cannot leak in.
+        extra_env={"HERDR_ENV": ""},
+    )
+    assert result.returncode == 77
+    summary_path = out_dir / "summary.md"
+    assert summary_path.exists(), "herdr preflight SKIP must still write summary.md (AC7)"
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "exit_code: 77" in summary
+    assert "HERDR_ENV=1 not set" in summary
 
 
 def test_given_fake_claude_nonzero_exit_when_structured_lane_runs_then_exit1(repo_with_worktree, tmp_path):

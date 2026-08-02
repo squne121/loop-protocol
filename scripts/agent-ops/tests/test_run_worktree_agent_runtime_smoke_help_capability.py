@@ -353,6 +353,74 @@ def test_interactive_claude_does_not_require_or_forward_structured_only_flags(
     assert "--no-session-persistence" not in argv_text
 
 
+def test_stdout_prose_saying_unknown_option_with_unrelated_stderr_failure_is_not_misclassified_as_skip(
+    repo_with_worktree, tmp_path
+):
+    """Issue #1960 P1-3 fix-delta (PR #1976 owner REQUEST_CHANGES,
+    adversarial case 1): if the model's OWN assistant-message text (a valid
+    stream-json event on stdout) merely contains the prose "unknown
+    option", and the real failure signal on stderr is an unrelated
+    authentication failure, this must classify as FAIL 1 -- never a
+    capability SKIP 77. Text-based capability_skip classification must only
+    ever consult stderr, never stdout (which is an untrusted native
+    model/tool-output event stream)."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_OMITS_MAX_TURNS + """
+cat > /dev/null
+echo '{"type":"assistant","message":{"content":[{"type":"text",\
+"text":"I noticed an unknown option was mentioned in the docs."}]}}'
+echo "Error: Not authenticated. Run claude login." >&2
+exit 1
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1, result.stderr
+    assert not result.stderr.startswith("SKIP:")
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "capability_decision: runtime_outcome" in summary
+
+
+def test_stdout_quoted_max_turns_text_does_not_override_genuine_stderr_parser_rejection(
+    repo_with_worktree, tmp_path
+):
+    """Issue #1960 P1-3 fix-delta (PR #1976 owner REQUEST_CHANGES,
+    adversarial case 2): if stdout/tool-output happens to contain the quoted
+    text "Reached max turns" while stderr carries a genuine parser-level
+    ``error: unknown option '--max-turns'`` diagnostic, this must correctly
+    resolve to the parser-rejection (capability_skip / SKIP 77)
+    classification -- the stdout-only quoted text must never be prioritized
+    over (or even considered for) the real stderr parser diagnostic."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_OMITS_MAX_TURNS + """
+cat > /dev/null
+echo "Tool output (quoted, not a real runtime signal): 'Reached max turns'"
+echo "error: unknown option '--max-turns'" >&2
+exit 1
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 77, result.stderr
+    assert result.stderr.startswith("SKIP:")
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "capability_decision: capability_skip" in summary
+
+
 def test_max_turns_must_be_positive(repo_with_worktree, tmp_path):
     """AC6: ``--max-turns`` only accepts positive integers; ``0`` and
     negative values are rejected as an argument error."""
