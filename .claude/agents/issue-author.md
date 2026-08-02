@@ -13,7 +13,7 @@ model: sonnet
 permissionMode: acceptEdits
 ---
 
-## DEPRECATED
+## 廃止（DEPRECATED）
 
 この SubAgent は分割済みです（Issue #1734）。create/edit の手順本文は含みません。
 
