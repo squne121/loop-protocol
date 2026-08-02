@@ -45,6 +45,25 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 
 ## Lane 選択
 
+### capability 判定の方針(help への非掲載は capability 不足を意味しない)
+
+Claude Code の `--help` 出力は human-oriented な概要であり、network-exhaustive
+ではない。`--max-turns` は Claude Code 2.1.220 の `--help` から欠落している
+にも関わらず有効な documented print-mode flag として受理される(Issue #1960)。
+そのため runner は `claude --help` のテキストから capability を判定しない。
+preflight は `claude` 実行ファイルの存在確認のみを行い、structured lane の
+capability 判定は実際の fixed-argv invocation 結果に基づく
+(unknown/unrecognized option 診断が一致した場合のみ capability SKIP。
+`--max-turns` 到達は flag 受理の証拠として bounded turn failure 扱いとし、
+capability SKIP には昇格させない)。
+
+structured lane と interactive lane は異なる bounded-execution 保証を持ち、
+interactive lane は `--output-format` / `--include-hook-events` /
+`--no-session-persistence` / `--max-turns` のような structured-only flag を
+forward しない(herdr の wait timeout・process termination・isolated
+session の stop／delete／removal 確認で bounded execution を担保する)。
+詳細は `references/claude-code.md` を参照。
+
 ### Lane A: structured smoke（既定・非対話ラン）
 
 非対話の fresh process から stream JSON / JSONL event と exit code を取得する。
