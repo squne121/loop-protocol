@@ -63,6 +63,15 @@ PreToolUse hookchain（`.claude/hooks/` 配下の Bash 用ガード群と
 - 本 Agent の責務は、candidate body・`readiness_forwarding_payload`（`READINESS_FORWARDING_PAYLOAD_V1`）・`issue_number` 等の入力を用意して `edit-issue` skill を呼び出し、返ってきた結果を「結果ルーティング」に従って routing することに限定する
 - `title_update.required == true` は v1 scope 外。別 routing に切り分ける
 
+## 呼び出し元からの readiness 転送契約の受け取り方
+
+- `readiness_forwarding_payload` は `READINESS_FORWARDING_PAYLOAD_V1` として渡す
+- `READINESS_FORWARDING_PAYLOAD_V1.readiness_result.status` の許可値は
+  `status: go | needs_fix | human_judgment | input_or_runtime_error`
+- `status: go` の場合は pre-author static readiness blocker がない candidate body として扱う
+- `status: needs_fix` の場合は `errors[]` と `readiness_result_ref` を source of truth にして candidate body を作り直す
+- `status: human_judgment` または `status: input_or_runtime_error` の場合は helper 実行を急がず fail-closed で owner 判断へ送る
+
 ## 結果ルーティング (Result Routing)
 
 - `ok` → readback success
