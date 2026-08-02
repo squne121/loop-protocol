@@ -24,7 +24,7 @@ EXECUTION_POLICY
 
 RUNTIME
 - runtime_dependency_status: codex_skill_required
-- runtime_followup_route: post-merge-cleanup
+- runtime_followup_route: post-merge-cleanup-executor
 - repo_local_skill_surface: .agents/skills/post-merge-cleanup-executor/SKILL.md
 
 FAIL_CLOSED

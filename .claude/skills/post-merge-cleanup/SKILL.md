@@ -121,6 +121,12 @@ routing に使うフィールドのみ）は上記「main thread が返却され
 `post-merge-cleanup-executor` Skill 側の Output セクションおよび
 `scripts/check_post_merge_cleanup_boundary.py` を正本とする。
 
+executor（`post-merge-cleanup-executor` Skill）は branch / worktree の状態確認に
+`scripts/agent-ops/git_ref_probe.py` と `scripts/agent-ops/git_worktree_probe.py` を使う
+（raw `git for-each-ref` / raw `git worktree list --porcelain` を直接呼ばない）。
+probe script の呼び出し手順そのものは executor 側の canonical body を参照し、本 orchestrator には
+複製しない。
+
 ## Guardrails / ガードレール（orchestrator 側）
 
 - follow-up 起票は main thread（本 orchestrator）でのみ実行する。worker / executor 側は候補列挙のみで `gh issue create` を直接呼び出さない
