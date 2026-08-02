@@ -229,7 +229,7 @@ uv run --locked python3 .claude/skills/create-issue/scripts/validate_issue_body.
 
 validator が exit 0 を返した後、人間承認なしで即座に `.claude/skills/create-issue/scripts/create_issue_txn.py` を実行し、transaction として起票する。
 
-helper は `--title` / `--body-file` / `--label` / `--parent-issue` / `--dependency` を受け取り、labels / sub-issue / dependency の read-back を同一 transaction で実施する。
+helper は `--title` / `--body-file` / `--label` / `--parent-issue` / `--blocked-by` / `--blocking` を受け取り、labels / sub-issue / dependency（両方向）の read-back を同一 transaction で実施する。`--blocked-by` が正式名称（新規 Issue が指定 Issue にブロックされる方向）で、`--dependency` は legacy alias（後方互換のため同じ destination に吸収される）。`--blocking` は新規 Issue が指定 Issue を **ブロックする**（前提Issue/hard predecessor として起票する）方向で、`--blocked-by`/`--dependency` とは別 destination を持つ（#1946）。
 
 **post-create ready tuple validation（起票後の状態検証、implementation issue のみ）**:
 
@@ -325,7 +325,7 @@ uv run --locked python3 .claude/skills/create-issue/scripts/materialize_child_is
 1. **closed-schema 検証（fail-closed）**: unknown key / duplicate `child_id` / `issue_lookup.complete: false` / 不正 `action` / 非整数 `depends_on` / 空 `allowed_paths` / AC↔VC の AC set 不一致を exit 2 で拒否する。非 JSON 入力は YAML fallback せず拒否する。
 2. **canonical body render（spec-driven）**: `ISSUE_TEMPLATE/<kind>.yml` の required label order（`validate_issue_body._load_required_section_labels`）に従って body を生成し、`validate_issue_body.py --kind <kind> --title <title>` を通過した body だけを起票に回す。
 3. **起票は `create_issue_txn.py` 経由のみ**: `materialize_child_issues.py` は `gh issue create` を直接呼ばない。`--label-profile standard|triage_only` も `create_issue_txn.py` に転送する。
-4. **`depends_on` 写像 + read-back**: 各依存を `create_issue_txn.py --dependency <n>` に写像し、GitHub dependency read-back（`_readback_dependencies`）まで `create_issue_txn.py` が確認する。
+4. **`depends_on` 写像 + read-back**: 各依存を `create_issue_txn.py --blocked-by <n>`（正式名称。`--dependency` は legacy alias）に写像し、GitHub dependency read-back（`_readback_dependencies`）まで `create_issue_txn.py` が確認する。`depends_on` は「この child が既存 Issue にブロックされる」方向（child が後続）であり `--blocking`（hard-predecessor 方向）ではない。#1946 AC7 inventory の結果、本 Issue 起票時点では新規 Issue を既存 Issue の hard predecessor として `--blocking` で配線する自動 caller は存在しない（producer は直接 CLI 起票のみ。詳細はスクリプト内コメントを参照）。
 5. **parent checklist 安全 patch**: parent body の `## Child Issues` section 内で `body_sha256` 一致 / exact `old_line` / `expected_match_count == 1` / post-edit read-back を満たす場合のみ patch する。`partial_failure` では parent patch を一切行わない。
 6. **overlap gate**: overlap preflight（#948）が未導入（`overlap.status: not_run|deferred_to_issue`）の場合は各 child が #948 を `depends_on` に明記していることを要求し、満たさなければ `human_escalation`。`overlap.status: undeterminable` は無条件で `human_escalation`。
 7. **出力**: `CHILD_MATERIALIZATION_RESULT_V2`（schema 正本は `docs/dev/agent-skill-boundaries.md`）を stdout に JSON で返す。exit code は `ok`=0 / `human_escalation`=3 / それ以外=1。
@@ -367,7 +367,11 @@ uv run --locked python3 .claude/skills/create-issue/scripts/materialize_child_is
    - `none` / `null` / `なし` / `N/A` は「親なし」として None を返す
 
 2. **`Depends on #N` は parent として解釈しない**: `Depends on #N` は dependency/blocker 表現であり、
-   MUST NOT parent issue として解釈すること。dependency 登録には `--dependency` / `--blocked-by` 引数を使う。
+   MUST NOT parent issue として解釈すること。dependency 登録には `--blocked-by`（正式名称。`--dependency` は
+   legacy alias で同じ destination に吸収される）を使う。前提Issue（hard predecessor）として新規 Issue を
+   起票する場合、つまり新規 Issue が既存 Issue を **ブロックする** 方向にしたい場合は `--blocking` を使う
+   （`--blocked-by`/`--dependency` とは逆方向。混同すると #1946 で修正した native dependency 方向逆登録
+   バグを再現するので注意）。
 
 3. **body と `--parent-issue` の照合（fail-closed）**: `--parent-issue` と body 内 parent が **矛盾した場合**、
    issue 作成・dedupe reconcile の前に `TransactionError(stage="parent-arg-body-mismatch")` で **fail-closed** する。
@@ -419,7 +423,9 @@ gh api repos/{owner}/{repo}/issues/{parent_number}/sub_issues --method POST -F s
 - 同一ファイルを変更する別 PR がオープンでコンフリクト可能性がある
 - 本 Issue の AC が別 Issue の完了を条件としている
 
-### 設定方法
+### 設定方法（`--blocked-by`: 新規 Issue が既存 Issue にブロックされる方向）
+
+`--blocked-by` が正式名称、`--dependency` は legacy alias（同じ destination に吸収される。後方互換のため残存）。
 
 ```bash
 uv run --locked python3 .claude/skills/create-issue/scripts/create_issue_txn.py \
@@ -446,6 +452,50 @@ query {
 ```
 
 `state/blocked` ラベルを付与し、blocker が解除されるまでキューに入れないことを推奨する。
+
+### 前提Issue（hard predecessor）を起票する場合: `--blocking`
+
+新規 Issue を、既存 Issue の **前提Issue（hard predecessor）** として起票したい場合（＝新規 Issue が既存
+Issue を **ブロックする** 方向にしたい場合）は `--blocking` を使う。`--blocked-by`/`--dependency` と混同して
+逆方向に登録すると #1946 で修正した native dependency 方向逆登録バグ（`#1943` が `#1842` の hard
+predecessor として起票されるはずが、逆方向 `#1943 blocked by #1842` として誤登録された事例）を再現するので
+注意すること。
+
+```bash
+uv run --locked python3 .claude/skills/create-issue/scripts/create_issue_txn.py \
+  --repo <owner>/<repo> \
+  --title "実装: <タイトル>" \
+  --blocking <existing_issue_number_this_new_issue_blocks>
+```
+
+```bash
+# blocking 関係（新規 Issue 側）が登録されたことを GraphQL で確認
+gh api graphql -f query='
+query {
+  repository(owner:"<owner>", name:"<repo>") {
+    issue(number: <new_issue_number>) {
+      blocking(first: 10) {
+        nodes { number title }
+      }
+    }
+  }
+}'
+# 逆方向確認（既存 Issue 側の blockedBy に新規 Issue が存在すること）
+gh api graphql -f query='
+query {
+  repository(owner:"<owner>", name:"<repo>") {
+    issue(number: <existing_issue_number>) {
+      blockedBy(first: 10) {
+        nodes { number title }
+      }
+    }
+  }
+}'
+```
+
+hard-successor（`--blocking` で配線すべき自動 caller）の inventory は #1946 AC7 で確認済み。本 Issue
+起票時点では該当する自動 caller は存在せず、follow-up hard-successor Issue の起票は不要と判断した
+（詳細は `create_issue_txn.py` モジュール docstring を参照）。
 
 ## Partial-failure Recovery 手順
 
