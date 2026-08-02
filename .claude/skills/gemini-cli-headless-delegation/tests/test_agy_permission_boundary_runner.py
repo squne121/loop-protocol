@@ -35,7 +35,7 @@ import sys
 if sys.argv[1:] == ["--version"]:
     print("fake-agy 1.1.9")
     raise SystemExit(0)
-if sys.argv[1:] != ["--print", "permission-boundary-harness"]:
+if len(sys.argv) < 4 or sys.argv[1:3] != ["--print", "permission-boundary-harness"] or sys.argv[3] != "--add-dir":
     raise SystemExit(12)
 home = pathlib.Path(os.environ["HOME"])
 hooks = json.loads((home / ".gemini" / "config" / "hooks.json").read_text())
@@ -112,6 +112,15 @@ def test_hermetic_fake_dispatches_actual_hooks_and_parent_observes_all_denied_ce
             "post_tool_use_absent": True,
             "side_effect_invariant": True,
         }
+    assert artifact["diagnostic_ledger"] == {
+        "pre_invocation_hook_started": True,
+        "pre_invocation_context_accepted": True,
+        "injected_step_count": 5,
+        "enforcement_event_count": 5,
+        "pre_tool_use_event_count": 5,
+        "post_tool_use_event_count": 0,
+        "raw_payload_persisted": False,
+    }
     assert MODULE.validate_artifact(artifact) == (True, "valid")
 
 
@@ -159,9 +168,10 @@ def test_live_rejects_agy_override_before_execution(tmp_path: Path) -> None:
     assert _artifact(tmp_path)["failure_taxonomy"]["class"] == "agy_permission_boundary_invalid_live_identity"
 
 
-def test_live_without_preconfirmed_runtime_is_exit_77(tmp_path: Path) -> None:
+def test_literal_ac5_command_is_cost_guarded_preflight_exit_77(tmp_path: Path) -> None:
+    """The Issue command lacks --allow-live and must not invoke real AGY."""
     run = subprocess.run(
-        [sys.executable, str(RUNNER), "--artifact-dir", str(tmp_path / "artifacts"), "--mode", "live"],
+        [sys.executable, str(RUNNER), "--profile", "no_tools", "--artifact-dir", str(tmp_path / "artifacts")],
         text=True,
         capture_output=True,
         check=False,
@@ -170,6 +180,30 @@ def test_live_without_preconfirmed_runtime_is_exit_77(tmp_path: Path) -> None:
     assert run.returncode == 77
     assert artifact["failure_taxonomy"]["class"] == MODULE.FAILURE_UNAVAILABLE
     assert artifact["runner"]["actual_agy_executed"] is False
+    assert MODULE.validate_artifact(artifact) == (True, "valid")
+
+
+def test_missing_allow_live_never_invokes_discovered_agy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = tmp_path / "agy"
+    _fake_agy(fake)
+    artifact_dir = tmp_path / "artifacts"
+    monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
+    monkeypatch.setattr(
+        MODULE,
+        "_invoke",
+        lambda *_args, **_kwargs: pytest.fail("cost guard must stop before AGY invocation"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(RUNNER), "--profile", "no_tools", "--artifact-dir", str(artifact_dir)],
+    )
+
+    assert MODULE.main() == 77
+    artifact = json.loads((artifact_dir / "agy_permission_boundary_e2e.json").read_text())
+    assert artifact["runner"]["actual_agy_executed"] is False
+    assert artifact["failure_taxonomy"]["class"] == MODULE.FAILURE_UNAVAILABLE
+    assert MODULE.validate_artifact(artifact) == (True, "valid")
 
 
 def test_live_authentication_unavailable_is_exit_77_without_capability_probe(
@@ -256,6 +290,8 @@ def test_live_uses_supported_isolated_auth_bootstrap_and_bwrap_prefix(
         str(tmp_path / "agy"),
         "--print",
         "permission-boundary-harness",
+        "--add-dir",
+        str(runtime["workspace"]),
     ]
     assert observed["env"] is not None
     assert observed["env"]["HOME"] == runtime["env"]["HOME"]  # type: ignore[index]
@@ -310,6 +346,51 @@ def test_live_hook_nonfire_is_inconclusive_not_auth_unavailable(
     assert artifact["failure_taxonomy"]["class"] == MODULE.FAILURE_INCONCLUSIVE
     assert artifact["runner"]["actual_agy_executed"] is True
     assert all(not attempt["predicates"]["pre_tool_use_present"] for attempt in artifact["attempts"])
+    assert artifact["diagnostic_ledger"] == {
+        "pre_invocation_hook_started": False,
+        "pre_invocation_context_accepted": False,
+        "injected_step_count": 0,
+        "enforcement_event_count": 0,
+        "pre_tool_use_event_count": 0,
+        "post_tool_use_event_count": 0,
+        "raw_payload_persisted": False,
+    }
+
+
+def test_missing_injected_attempt_is_inconclusive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An absent injected attempt is boundary failure, never completion evidence."""
+    fake = tmp_path / "agy"
+    _fake_agy(fake)
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
+    monkeypatch.setattr(MODULE, "_version", lambda _path: ("agy 1.1.9", True))
+    monkeypatch.setattr(MODULE, "_prepare_runtime", lambda *_args, **_kwargs: runtime)
+    monkeypatch.setattr(
+        MODULE,
+        "_invoke",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(["agy"], 0, "", ""),
+    )
+
+    exit_code, artifact = MODULE._run(
+        argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
+    )
+
+    assert exit_code == 1
+    assert artifact["failure_taxonomy"] == {
+        "class": MODULE.FAILURE_INCONCLUSIVE,
+        "completion": False,
+        "retry": "fix_or_reprobe",
+    }
+    assert artifact["runner"]["actual_agy_executed"] is True
+    for attempt in artifact["attempts"]:
+        assert attempt["predicates"] == {
+            "deterministic_attempt_present": False,
+            "pre_tool_use_present": False,
+            "explicit_deny": False,
+            "post_tool_use_absent": True,
+            "side_effect_invariant": True,
+        }
+    assert MODULE.validate_artifact(artifact) == (True, "valid")
 
 
 def test_live_runtime_launch_failure_is_exit_77_but_unknown_runner_error_is_exit_1(
@@ -417,3 +498,11 @@ def test_evidence_artifact_rejects_stdout_only_or_secret_data() -> None:
     artifact["artifact"]["digest"] = MODULE._artifact_digest(artifact)
     artifact["runner"]["artifact_digest"] = artifact["artifact"]["digest"]
     assert MODULE.validate_artifact(artifact)[1] == "secret_or_absolute_path_detected"
+
+
+def test_evidence_artifact_rejects_raw_diagnostic_payload() -> None:
+    artifact = MODULE._unavailable_artifact(MODULE.FAILURE_UNAVAILABLE)
+    artifact["diagnostic_ledger"]["raw_payload"] = {"toolCall": {"args": "forbidden"}}
+    artifact["artifact"]["digest"] = MODULE._artifact_digest(artifact)
+    artifact["runner"]["artifact_digest"] = artifact["artifact"]["digest"]
+    assert MODULE.validate_artifact(artifact) == (False, "draft202012_invalid")

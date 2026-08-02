@@ -4,7 +4,7 @@
   "title": "AGY permission-boundary E2E evidence v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "generated_at", "runner", "artifact", "matrix", "attempts", "fallback", "failure_taxonomy", "cleanup", "secret_scan"],
+  "required": ["schema", "generated_at", "runner", "artifact", "matrix", "attempts", "diagnostic_ledger", "fallback", "failure_taxonomy", "cleanup", "secret_scan"],
   "properties": {
     "schema": {"const": "agy_permission_boundary_e2e/v1"},
     "generated_at": {"type": "string", "format": "date-time"},
@@ -37,6 +37,19 @@
       }
     },
     "attempts": {"type": "array", "minItems": 5, "items": {"$ref": "#/$defs/attempt"}},
+    "diagnostic_ledger": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pre_invocation_hook_started", "pre_invocation_context_accepted", "injected_step_count", "enforcement_event_count", "pre_tool_use_event_count", "post_tool_use_event_count", "raw_payload_persisted"],
+      "properties": {
+        "pre_invocation_hook_started": {"type": "boolean"},
+        "pre_invocation_context_accepted": {"type": "boolean"},
+        "injected_step_count": {"type": "integer", "minimum": 0, "maximum": 5},
+        "enforcement_event_count": {"type": "integer", "minimum": 0},
+        "pre_tool_use_event_count": {"type": "integer", "minimum": 0},
+        "post_tool_use_event_count": {"type": "integer", "minimum": 0},
+        "raw_payload_persisted": {"const": false}
+      }
+    },
     "fallback": {"type": "object", "additionalProperties": false, "required": ["used"], "properties": {"used": {"const": false}}},
     "failure_taxonomy": {
       "type": "object", "additionalProperties": false,

@@ -233,6 +233,7 @@ def _artifact(
     profile: str,
     failure_class: str,
     cleanup_ok: bool,
+    diagnostic_ledger: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     digest = _file_digest(executable) if executable is not None and executable.is_file() else "sha256:" + "0" * 64
     result: dict[str, Any] = {
@@ -252,6 +253,7 @@ def _artifact(
         "artifact": {"digest": None},
         "matrix": {"profile": profile, "capabilities": list(CAPABILITIES)},
         "attempts": attempts,
+        "diagnostic_ledger": dict(diagnostic_ledger or _empty_diagnostic_ledger()),
         "fallback": {"used": False},
         "failure_taxonomy": {
             "class": failure_class,
@@ -379,8 +381,14 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
     injection_hook.write_text(
         "#!/usr/bin/env python3\nimport json,os,sys\n"
         "context=json.load(open(os.environ['AGY_PERMISSION_BOUNDARY_CONTEXT_PATH'],encoding='utf-8'))\n"
-        "payload=json.load(sys.stdin)\n"
-        "if context['workspace'] not in payload.get('workspacePaths',[]) or not isinstance(payload.get('conversationId'),str) or not isinstance(payload.get('invocationNum'),int): raise SystemExit(2)\n"  # noqa: E501
+        "def record(accepted,count):\n"
+        " event={'kind':'pre_invocation','hook_started':True,'context_accepted':accepted,'injected_step_count':count}\n"
+        " with open(context['events_path'],'a',encoding='utf-8') as output: output.write(json.dumps(event)+'\\n')\n"
+        "try: payload=json.load(sys.stdin)\n"
+        "except (json.JSONDecodeError,TypeError): record(False,0); raise SystemExit(2)\n"
+        "valid=context['workspace'] in payload.get('workspacePaths',[]) and isinstance(payload.get('conversationId'),str) and isinstance(payload.get('invocationNum'),int)\n"  # noqa: E501
+        "record(valid," + str(len(steps)) + " if valid else 0)\n"
+        "if not valid: raise SystemExit(2)\n"
         "print(json.dumps({'injectSteps':" + json.dumps(steps, separators=(",", ":")) + "},separators=(',',':')))\n",
         encoding="utf-8",
     )
@@ -438,6 +446,48 @@ def _read_events(path: Path) -> list[dict[str, Any]]:
     return result
 
 
+def _empty_diagnostic_ledger() -> dict[str, Any]:
+    """Return the schema-fixed, raw-payload-free ledger for non-runtime paths."""
+    return {
+        "pre_invocation_hook_started": False,
+        "pre_invocation_context_accepted": False,
+        "injected_step_count": 0,
+        "enforcement_event_count": 0,
+        "pre_tool_use_event_count": 0,
+        "post_tool_use_event_count": 0,
+        "raw_payload_persisted": False,
+    }
+
+
+def _diagnostic_ledger(runtime: Mapping[str, Any]) -> dict[str, Any]:
+    """Persist only aggregate lifecycle facts before isolated-runtime cleanup."""
+    events = _read_events(Path(runtime["events_path"]))
+    enforcement_events = [
+        event
+        for event in _read_events(Path(runtime["enforcement_log"]))
+        if event.get("schema") == "agy_permission_boundary_hook/v1"
+    ]
+    pre_invocation = [event for event in events if event.get("kind") == "pre_invocation"]
+    accepted = [event for event in pre_invocation if event.get("context_accepted") is True]
+    injected_count = max(
+        (
+            event.get("injected_step_count", 0)
+            for event in accepted
+            if isinstance(event.get("injected_step_count"), int)
+        ),
+        default=0,
+    )
+    return {
+        "pre_invocation_hook_started": bool(pre_invocation),
+        "pre_invocation_context_accepted": bool(accepted),
+        "injected_step_count": injected_count,
+        "enforcement_event_count": len(enforcement_events),
+        "pre_tool_use_event_count": len(enforcement_events),
+        "post_tool_use_event_count": sum(event.get("kind") == "post_tool_use" for event in events),
+        "raw_payload_persisted": False,
+    }
+
+
 def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) -> list[dict[str, Any]]:
     events = _read_events(Path(runtime["events_path"]))
     for event in _read_events(Path(runtime["enforcement_log"])):
@@ -485,8 +535,21 @@ def _invoke(agy: Path, runtime: Mapping[str, Any], *, live: bool) -> subprocess.
         }
     )
     env.setdefault("PATH", os.environ.get("PATH", ""))
+    # Issue #1814 root-cause fix: without an explicit `--add-dir`, live AGY's
+    # common hook payload field `workspacePaths` is `[]` (empty), even though
+    # `cwd` is set to the same directory.  The PreInvocation injection hook's
+    # workspace-binding check (`context['workspace'] in
+    # payload.get('workspacePaths', [])`) then always fails, so no
+    # `injectSteps` are ever accepted and no PreToolUse events are ever
+    # observed -- this was the actual cause of every historical
+    # `agy_permission_boundary_inconclusive` live result, independent of the
+    # separate `injectSteps` `toolCall` defect documented in
+    # `references/failure-class-taxonomy.md`.  Verified via a live,
+    # hooks.json-only reproduction outside this runner (see that reference).
+    workspace_str = str(runtime["workspace"])
     return subprocess.run(
-        list(runtime["agy_command_prefix"]) + [str(agy), "--print", "permission-boundary-harness"],
+        list(runtime["agy_command_prefix"])
+        + [str(agy), "--print", "permission-boundary-harness", "--add-dir", workspace_str],
         cwd=runtime["workspace"],
         env=env,
         text=True,
@@ -537,6 +600,7 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 completed = None
                 runtime_unavailable = args.mode == "live"
             attempts = _attempts_from_parent_observation(runtime, args.profile)
+            diagnostic_ledger = _diagnostic_ledger(runtime)
             output = "" if completed is None else (completed.stdout or "") + (completed.stderr or "")
             child_returncode = None if completed is None else completed.returncode
             auth_unavailable = args.mode == "live" and bool(_AUTH_FAILURE.search(output))
@@ -556,6 +620,7 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 profile=args.profile,
                 failure_class=failure,
                 cleanup_ok=True,
+                diagnostic_ledger=diagnostic_ledger,
             )
     except Exception:
         result = _unavailable_artifact(FAILURE_INCONCLUSIVE, profile=args.profile, exit_code=EXIT_FAIL)
