@@ -596,3 +596,210 @@ def test_preview_namespace_lane_cleanup_does_not_clobber_standard_lane_artifacts
         "evidence (Issue #1387 / PR #1813 review fix, P1 Blocker 3)"
     )
     assert marker.read_bytes() == b"standard-lane-evidence"
+
+
+# ---------------------------------------------------------------------------
+# AC10 (Issue #1389) — Vitest Browser Mode component VRT comparator support.
+# Additive audit path, independent of the jobs.e2e-only tests above.
+# ---------------------------------------------------------------------------
+
+
+def _write_component_vrt_test(tmp_path: Path, filename: str, body: str) -> Path:
+    component_dir = tmp_path / "tests" / "component"
+    component_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = component_dir / filename
+    spec_path.write_text(body, encoding="utf-8")
+    return component_dir
+
+
+def test_parse_vitest_comparator_recognizes_allowed_mismatched_pixel_ratio():
+    kind, value, errors = mod._parse_vitest_comparator("allowedMismatchedPixelRatio: 0.02,")
+    assert (kind, value, errors) == ("allowedMismatchedPixelRatio", "0.02", [])
+
+
+def test_parse_vitest_comparator_recognizes_allowed_mismatched_pixels():
+    kind, value, errors = mod._parse_vitest_comparator("allowedMismatchedPixels: 5,")
+    assert (kind, value, errors) == ("allowedMismatchedPixels", "5", [])
+
+
+def test_parse_vitest_comparator_recognizes_threshold():
+    kind, value, errors = mod._parse_vitest_comparator("threshold: 0.1,")
+    assert (kind, value, errors) == ("threshold", "0.1", [])
+
+
+def test_parse_vitest_comparator_fails_closed_when_none_declared():
+    kind, value, errors = mod._parse_vitest_comparator("")
+    assert kind is None
+    assert value is None
+    assert any("neither" in e for e in errors)
+
+
+def test_parse_vitest_comparator_fails_closed_when_both_pixel_axes_declared():
+    kind, value, errors = mod._parse_vitest_comparator(
+        "allowedMismatchedPixels: 5, allowedMismatchedPixelRatio: 0.02,"
+    )
+    assert kind is None
+    assert value is None
+    assert any("mutually exclusive" in e for e in errors)
+
+
+def test_extract_derived_vitest_component_captures_parses_real_call_site(tmp_path):
+    component_dir = _write_component_vrt_test(
+        tmp_path,
+        "combat-hud-running.vrt.test.ts",
+        """
+        test('x', async () => {
+          await expect(page.elementLocator(el)).toMatchScreenshot('combat-hud-running.png', {
+            comparatorOptions: {
+              allowedMismatchedPixelRatio: 0.02,
+            },
+          })
+        })
+        """,
+    )
+    captures, errors = mod.extract_derived_vitest_component_captures(component_dir)
+    assert errors == []
+    assert len(captures) == 1
+    capture = captures[0]
+    assert capture["capture_id"] == "combat-hud-running.vrt.test.ts::combat-hud-running.png"
+    assert capture["directory"] == "tests/component/__screenshots__/combat-hud-running.vrt.test.ts/"
+    assert capture["comparator_kind"] == "allowedMismatchedPixelRatio"
+    assert capture["comparator_value"] == "0.02"
+
+
+def test_extract_derived_vitest_component_captures_returns_empty_when_dir_missing(tmp_path):
+    captures, errors = mod.extract_derived_vitest_component_captures(tmp_path / "does-not-exist")
+    assert captures == []
+    assert errors == []
+
+
+def test_extract_derived_vitest_component_captures_hard_fails_missing_comparator(tmp_path):
+    component_dir = _write_component_vrt_test(
+        tmp_path,
+        "broken.vrt.test.ts",
+        """
+        test('x', async () => {
+          await expect(page.elementLocator(el)).toMatchScreenshot('broken.png', {
+            comparatorOptions: {},
+          })
+        })
+        """,
+    )
+    captures, errors = mod.extract_derived_vitest_component_captures(component_dir)
+    assert len(captures) == 1
+    assert any("neither" in e for e in errors)
+
+
+def test_extract_derived_vitest_component_captures_skips_guard_only_call(tmp_path):
+    component_dir = _write_component_vrt_test(
+        tmp_path,
+        "guard.vrt.test.ts",
+        """
+        test('x', async () => {
+          await expect(bad()).rejects.toThrow()
+          await expect(page.elementLocator(el)).toMatchScreenshot('real.png', {
+            comparatorOptions: { threshold: 0.1 },
+          })
+        })
+        """,
+    )
+    captures, errors = mod.extract_derived_vitest_component_captures(component_dir)
+    assert errors == []
+    assert [c["capture_id"] for c in captures] == ["guard.vrt.test.ts::real.png"]
+
+
+def test_validate_vitest_component_captures_hard_fails_wrong_root():
+    captures = [
+        {
+            "capture_id": "x.vrt.test.ts::x.png",
+            "directory": "tests/e2e/__screenshots__/x.vrt.test.ts/",
+            "comparator_kind": "threshold",
+            "comparator_value": "0.1",
+        }
+    ]
+    failures = mod.validate_vitest_component_captures(captures)
+    assert any("outside the reserved Vitest component snapshot root" in f for f in failures)
+
+
+def test_validate_vitest_component_captures_hard_fails_unknown_comparator_kind():
+    captures = [
+        {
+            "capture_id": "x.vrt.test.ts::x.png",
+            "directory": "tests/component/__screenshots__/x.vrt.test.ts/",
+            "comparator_kind": "maxDiffPixels",
+            "comparator_value": "1",
+        }
+    ]
+    failures = mod.validate_vitest_component_captures(captures)
+    assert any("comparator_kind must be one of" in f for f in failures)
+
+
+def test_validate_vitest_component_captures_passes_for_valid_capture():
+    captures = [
+        {
+            "capture_id": "x.vrt.test.ts::x.png",
+            "directory": "tests/component/__screenshots__/x.vrt.test.ts/",
+            "comparator_kind": "allowedMismatchedPixelRatio",
+            "comparator_value": "0.02",
+        }
+    ]
+    assert mod.validate_vitest_component_captures(captures) == []
+
+
+def test_extract_derived_vitest_component_captures_against_real_repo_spec_files():
+    component_dir = REPO_ROOT / "tests" / "component"
+    captures, errors = mod.extract_derived_vitest_component_captures(component_dir)
+    assert errors == []
+    capture_ids = {c["capture_id"] for c in captures}
+    assert "combat-hud-running.vrt.test.ts::combat-hud-running.png" in capture_ids
+    assert mod.validate_vitest_component_captures(captures) == []
+
+
+def test_main_passes_against_real_ci_yml_including_component_vrt_audit():
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "status: pass" in result.stdout
+
+
+def test_main_hard_fails_when_component_vrt_capture_missing_comparator(tmp_path):
+    workflow_src = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    workflow_path = tmp_path / "ci.yml"
+    workflow_path.write_text(workflow_src, encoding="utf-8")
+    pw_config = REPO_ROOT / "playwright.config.ts"
+    e2e_dir = REPO_ROOT / "tests" / "e2e"
+    visual_utils = REPO_ROOT / "tests" / "e2e" / "visual-utils.ts"
+    registry_doc = REPO_ROOT / "docs" / "dev" / "visual-baseline-registry.md"
+    component_dir = _write_component_vrt_test(
+        tmp_path,
+        "broken.vrt.test.ts",
+        """
+        test('x', async () => {
+          await expect(page.elementLocator(el)).toMatchScreenshot('broken.png', {})
+        })
+        """,
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            str(workflow_path),
+            str(pw_config),
+            str(e2e_dir),
+            str(visual_utils),
+            str(registry_doc),
+            str(component_dir),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "status: fail" in result.stdout
+    assert "component vrt capture" in result.stdout

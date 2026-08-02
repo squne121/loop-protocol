@@ -116,6 +116,8 @@ DEFAULT_PW_CONFIG = "playwright.config.ts"
 DEFAULT_E2E_DIR = "tests/e2e"
 DEFAULT_VISUAL_UTILS = "tests/e2e/visual-utils.ts"
 DEFAULT_REGISTRY_DOC = "docs/dev/visual-baseline-registry.md"
+DEFAULT_COMPONENT_DIR = "tests/component"
+VITEST_COMPONENT_TEST_GLOB = "*.vrt.test.ts"
 
 ACTIVE_CAPTURES_BEGIN_MARKER = "ACTIVE_VRT_CAPTURES_BEGIN"
 ACTIVE_CAPTURES_END_MARKER = "ACTIVE_VRT_CAPTURES_END"
@@ -312,6 +314,33 @@ def _parse_comparator(options_blob: str) -> tuple[str | None, str | None, list[s
     if ratio:
         return "maxDiffPixelRatio", ratio[0], errors
     errors.append("neither maxDiffPixels nor maxDiffPixelRatio declared")
+    return None, None, errors
+
+
+def _parse_vitest_comparator(options_blob: str) -> tuple[str | None, str | None, list[str]]:
+    """Return (comparator_kind, comparator_value, errors) from a Vitest
+    Browser Mode `toMatchScreenshot()` `comparatorOptions` blob (AC10, Issue
+    #1389). Vitest's counterpart of Playwright's `maxDiffPixels` /
+    `maxDiffPixelRatio` (`_parse_comparator` above, unmodified by this
+    Issue): `allowedMismatchedPixels` / `allowedMismatchedPixelRatio` are
+    mutually exclusive absolute-count/ratio axes, `threshold` is a separate
+    per-pixel color-difference axis that may be declared on its own."""
+    px = re.findall(r"allowedMismatchedPixels:\s*(\d+(?:\.\d+)?)", options_blob)
+    ratio = re.findall(r"allowedMismatchedPixelRatio:\s*(\d+(?:\.\d+)?)", options_blob)
+    threshold = re.findall(r"threshold:\s*(\d+(?:\.\d+)?)", options_blob)
+    errors: list[str] = []
+    if px and ratio:
+        errors.append(
+            "both allowedMismatchedPixels and allowedMismatchedPixelRatio declared (mutually exclusive)"
+        )
+        return None, None, errors
+    if px:
+        return "allowedMismatchedPixels", px[0], errors
+    if ratio:
+        return "allowedMismatchedPixelRatio", ratio[0], errors
+    if threshold:
+        return "threshold", threshold[0], errors
+    errors.append("neither allowedMismatchedPixels, allowedMismatchedPixelRatio, nor threshold declared")
     return None, None, errors
 
 
@@ -749,6 +778,112 @@ def cross_validate_active_captures(
     return failures
 
 
+# ---------------------------------------------------------------------------
+# Vitest Browser Mode component VRT support (AC10, Issue #1389)
+#
+# Parallel, additive audit path for `tests/component/**/*.vrt.test.ts`
+# (Vitest Browser Mode `toMatchScreenshot()`), independent of the
+# Playwright-only `jobs.e2e` ACTIVE_VRT_CAPTURES declared/derived
+# cross-validation above (which this Issue does not touch). The
+# `component-vrt-report` CI job is non-required/report-only (Issue #1389 In
+# Scope), so there is no declared-in-workflow CAPTURES literal to
+# cross-validate against here -- this function makes the derived captures
+# themselves the audit target: every `.toMatchScreenshot(` call site must
+# resolve to a real comparator and the reserved Vitest snapshot root.
+# ---------------------------------------------------------------------------
+
+
+def extract_derived_vitest_component_captures(component_dir: Path) -> tuple[list[dict], list[str]]:
+    """Statically re-derive active Vitest Browser Mode component VRT captures
+    from `tests/component/**/*.vrt.test.ts`. Mirrors the direct
+    `.toHaveScreenshot(` branch of `extract_derived_active_captures` above
+    (unmodified by this Issue), but for `.toMatchScreenshot(` call sites."""
+    captures: list[dict] = []
+    errors: list[str] = []
+    if not component_dir.is_dir():
+        return captures, errors
+
+    for spec_path in sorted(component_dir.rglob(VITEST_COMPONENT_TEST_GLOB)):
+        if not spec_path.is_file():
+            continue
+        text = spec_path.read_text(encoding="utf-8")
+        masked = _mask_ts_noise(text)
+        spec_filename = spec_path.name
+
+        for m in re.finditer(r"\.toMatchScreenshot\(", masked):
+            open_idx = m.end() - 1
+            call_end = _find_balanced_call(masked, open_idx)
+            if _is_guard_only_call(text, m.start(), call_end):
+                continue
+            inner = text[open_idx + 1 : call_end - 1]
+            masked_inner = masked[open_idx + 1 : call_end - 1]
+            if not inner.strip():
+                errors.append(
+                    f"{spec_path}: toMatchScreenshot() called with no arguments (implicit "
+                    "name) is not supported by the static active-capture validator; pass an "
+                    "explicit name argument"
+                )
+                continue
+            args = _split_top_level_args(inner, masked_inner)
+            if not args:
+                errors.append(f"{spec_path}: malformed toMatchScreenshot() call (no args)")
+                continue
+            first_arg = args[0].strip()
+            if first_arg.startswith("{"):
+                errors.append(
+                    f"{spec_path}: options-only toMatchScreenshot({{...}}) (implicit name) is "
+                    "not supported by the static active-capture validator; pass an explicit "
+                    "name argument"
+                )
+                continue
+            screenshot_name, name_errs = _parse_screenshot_name(first_arg)
+            if screenshot_name is None:
+                for e in name_errs:
+                    errors.append(f"{spec_path}: {e}")
+                continue
+            options_blob = args[1] if len(args) > 1 else ""
+            comparator_kind, comparator_value, cmp_errors = _parse_vitest_comparator(options_blob)
+            for e in cmp_errors:
+                errors.append(f"{spec_path}::{screenshot_name}: {e}")
+            captures.append(
+                {
+                    "capture_id": f"{spec_filename}::{screenshot_name}",
+                    "spec_file": f"tests/component/{spec_filename}",
+                    "screenshot_name": screenshot_name,
+                    "directory": f"{VITEST_COMPONENT_SNAPSHOT_ROOT_PREFIX}{spec_filename}/",
+                    "comparator_kind": comparator_kind,
+                    "comparator_value": comparator_value,
+                }
+            )
+
+    return captures, errors
+
+
+def validate_vitest_component_captures(captures: list[dict]) -> list[str]:
+    """Hard-fail (not presence-only) checks for each derived Vitest component
+    VRT capture: directory must be under the reserved Vitest component
+    snapshot root (never the Playwright root), and a recognised comparator
+    must be declared."""
+    failures: list[str] = []
+    for capture in captures:
+        capture_id = capture["capture_id"]
+        directory = capture.get("directory", "")
+        if not directory.startswith(VITEST_COMPONENT_SNAPSHOT_ROOT_PREFIX):
+            failures.append(
+                f"{capture_id}: directory '{directory}' is outside the reserved Vitest "
+                f"component snapshot root '{VITEST_COMPONENT_SNAPSHOT_ROOT_PREFIX}'"
+            )
+        kind = capture.get("comparator_kind")
+        if kind not in ("allowedMismatchedPixels", "allowedMismatchedPixelRatio", "threshold"):
+            failures.append(
+                f"{capture_id}: comparator_kind must be one of allowedMismatchedPixels/"
+                f"allowedMismatchedPixelRatio/threshold, got {kind!r}"
+            )
+        if capture.get("comparator_value") in (None, ""):
+            failures.append(f"{capture_id}: comparator_value is missing")
+    return failures
+
+
 def check_artifact_status_wiring(summary_run_text: str) -> list[str]:
     """AC7: the summary step must classify each upload step's outcome into
     uploaded / no_files / step_not_run / upload_failed — not just presence."""
@@ -765,6 +900,7 @@ def main(argv: list[str]) -> int:
     e2e_dir = Path(argv[3]) if len(argv) > 3 else Path(DEFAULT_E2E_DIR)
     visual_utils = Path(argv[4]) if len(argv) > 4 else Path(DEFAULT_VISUAL_UTILS)
     registry_doc = Path(argv[5]) if len(argv) > 5 else Path(DEFAULT_REGISTRY_DOC)
+    component_dir = Path(argv[6]) if len(argv) > 6 else Path(DEFAULT_COMPONENT_DIR)
 
     if not path.is_file():
         print("VISUAL_ARTIFACT_PIPELINE_CHECK_V1")
@@ -901,6 +1037,15 @@ def main(argv: list[str]) -> int:
         if not declared_errors and not derived_errors:
             for f in cross_validate_active_captures(declared_captures, derived_captures, registry_maturity):
                 _fail(failures, f"active capture: {f}")
+
+    # Vitest Browser Mode component VRT audit (AC10, Issue #1389) — additive,
+    # independent of the jobs.e2e-only checks above.
+    vitest_captures, vitest_errors = extract_derived_vitest_component_captures(component_dir)
+    for e in vitest_errors:
+        _fail(failures, f"component vrt capture (derived): {e}")
+    if not vitest_errors:
+        for f in validate_vitest_component_captures(vitest_captures):
+            _fail(failures, f"component vrt capture: {f}")
 
     return _emit(path, upload_steps, upload_ids, summary_ok, failures)
 

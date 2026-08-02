@@ -1112,6 +1112,94 @@ jobs:
           PY
           } >> "$GITHUB_STEP_SUMMARY"
 
+  component-vrt-report:
+    # Issue #1389 (Scope Delta): non-required, report-only Vitest Browser
+    # Mode component VRT lane — distinct from the Playwright `e2e` job
+    # above (In Scope / Out of Scope: never registered in GitHub branch
+    # protection required checks, never replaces Playwright E2E VRT). The
+    # `pnpm test:vrt:component` step below never uses `continue-on-error`
+    # or `|| true` — its real exit code determines this job's own
+    # conclusion. That conclusion never blocks merge-ready:
+    # `component-vrt-report` is classified `excluded` in
+    # .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py
+    # CLASSIFICATION_MAP (Scope Delta) so determine_check_verdict() never
+    # treats it as blocking regardless of pass/fail.
+    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLAYWRIGHT_VERSION: "1.60.0"
+    container:
+      image: mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948
+      options: --ipc=host
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Enable pnpm via corepack
+        run: |
+          corepack enable pnpm
+          corepack prepare pnpm@11.7.0 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify Playwright Docker image version
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version")"
+          if [ "$PW_VERSION" != "$PLAYWRIGHT_VERSION" ]; then
+            echo "::error::resolved @playwright/test=$PW_VERSION but Docker image expects v$PLAYWRIGHT_VERSION. Update PLAYWRIGHT_VERSION and container.image digest in ci.yml."
+            exit 1
+          fi
+          echo "playwright_version_match=ok resolved=$PW_VERSION expected=$PLAYWRIGHT_VERSION"
+      - name: Run component VRT (Vitest Browser Mode, report-only)
+        id: run-component-vrt
+        run: pnpm test:vrt:component
+      - name: Upload component VRT screenshots (baseline + actual/diff/expected on failure)
+        id: upload-component-vrt-screenshots
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: component-vrt-screenshots
+          path: tests/component/__screenshots__/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Summarize component VRT evidence
+        if: ${{ always() }}
+        env:
+          RUN_OUTCOME: ${{ steps.run-component-vrt.outcome }}
+          SCREENSHOTS_URL: ${{ steps.upload-component-vrt-screenshots.outputs.artifact-url || 'N/A' }}
+          SCREENSHOTS_DIGEST: ${{ steps.upload-component-vrt-screenshots.outputs.artifact-digest || 'sha256:none' }}
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version" 2>/dev/null || echo 'unknown')"
+          {
+            echo "## Component VRT (report-only, non-required — Issue #1389)"
+            echo ""
+            echo "This job's pass/fail never blocks merge-ready: see the \`excluded\`"
+            echo "CLASSIFICATION_MAP entry for \`component-vrt-report\` in"
+            echo "\`.claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py\`."
+            echo ""
+            echo "### Environment fingerprint"
+            echo "- run outcome (exit code): ${RUN_OUTCOME}"
+            echo "- runner: ${RUNNER_OS} ${RUNNER_ARCH} (image ${ImageOS:-unknown} ${ImageVersion:-unknown})"
+            echo "- node: $(node -p 'process.version')"
+            echo "- Playwright: ${PW_VERSION}"
+            echo "- browser: chromium"
+            echo "- viewport: 1280x720"
+            echo "- deviceScaleFactor: 1"
+            echo "- screenshot directory: tests/component/__screenshots__/"
+            echo ""
+            echo "### Artifacts"
+            echo "- component-vrt-screenshots (baseline + actual/expected/diff on failure): ${SCREENSHOTS_URL} (digest: ${SCREENSHOTS_DIGEST})"
+            echo ""
+            echo "### actual / expected / diff"
+            if [ "${RUN_OUTCOME}" = "failure" ]; then
+              echo "- visual mismatch or run failure detected: see the component-vrt-screenshots artifact above for any *-actual.png / *-expected.png / *-diff.png Vitest Browser Mode wrote"
+            else
+              echo "- N/A (no visual mismatch; expected/actual/diff are only emitted on toMatchScreenshot() failure)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   python-test-core:
     runs-on: ubuntu-latest
     steps:
