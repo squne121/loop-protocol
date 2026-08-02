@@ -29,7 +29,8 @@ worker や CI/review/security/permission/publication の safety stop と混同�
 | `test-runner` | read-only | `dontAsk` | Read, Grep, Glob, Bash | Edit, Write, MultiEdit |
 | `review-issue`（standalone SubAgent） | write | `acceptEdits` | Bash, Read, Grep, Glob, Write | Edit, MultiEdit |
 | `issue-reviewer`（loop worker SubAgent） | read-only | `dontAsk` | Bash, Read, Grep, Glob | Agent, Edit, Write, MultiEdit, Skill |
-| `issue-author` | write | `acceptEdits` | Bash, Read, Write | Agent, Edit, MultiEdit |
+| `issue-creator` | write | `acceptEdits` | Bash, Read | Agent, Edit, MultiEdit, Write, Skill |
+| `issue-editor` | write | `acceptEdits` | Bash, Read | Agent, Edit, MultiEdit, Write, Skill |
 | `implementation-worker` | write | `acceptEdits` | Read, Grep, Glob, Bash, Edit, Write, MultiEdit | — |
 | `post-merge-cleanup-worker` | cleanup | `default` | Bash, Read | Agent, Edit, Write, MultiEdit |
 
@@ -57,11 +58,11 @@ Codex の変更操作制御は標準の隔離環境と承認機構による
 | Agent | Permissions | 想定用途 | 補足 |
 |---|---|---|---|
 | `spark-skim` | `loop-protocol-readonly` | 軽量な read-only triage / 要点抽出 | low reasoning |
-| `spark-worker` | `loop-protocol-rtk` | Allowed Paths 内の manual bounded edit helper | medium reasoning。`implementation-worker` / `issue-author` / `pr-reviewer` の代替ではない |
+| `spark-worker` | `loop-protocol-rtk` | Allowed Paths 内の manual bounded edit helper | medium reasoning。`implementation-worker` / `issue-creator` / `issue-editor` / `pr-reviewer` の代替ではない |
 | `spark-deep` | `loop-protocol-readonly` | 複雑な read-only analysis / risk surfacing | high reasoning |
 
 - `xhigh` reasoning は今回採用しない。account plan / rollout 差分や運用実績を踏まえた follow-up 判断対象とする。
-- heavy agent 非置換を原則とし、既存 `implementation-worker` / `issue-author` / `pr-reviewer` / `test-runner` の routing は維持する。
+- heavy agent 非置換を原則とし、既存 `implementation-worker` / `issue-creator` / `issue-editor` / `pr-reviewer` / `test-runner` の routing は維持する。
 - `spark-worker` は manual bounded edit helper であり、Issue authoring、PR review judgment、loop orchestration、publish 操作を担当しない。
 - `HOOK_COMMAND_REPAIR_HINT_V1` は agent steering 用の bounded diagnostics であり、rules / hooks の authorization を上書きしない。
 - `HOOK_COMMAND_REPAIR_HINT_V1` が `suggested_command` を返しても、それは `direct rtk git ...` の exact / bounded repair 候補に限る。wrapper 展開や bypass shell を agent が自動採用してはならない。
@@ -139,19 +140,20 @@ SubAgent（役割）── Skill（作業手順）
 
 | SubAgent | 役割 | 使う Skill |
 |---|---|---|
-| `issue-author` | Issue を **起票・修正** する役割 | `create-issue`（新規起票）、`edit-issue`（既存修正）|
+| `issue-creator` | Issue を **新規起票** する役割（`Skill` tool 非保持。preload は `create-issue` のみ） | `create-issue`（新規起票）|
+| `issue-editor` | 既存 Issue を **修正** する役割（`Skill` tool 非保持。preload は `edit-issue` のみ） | `edit-issue`（既存修正）|
 | `issue-reviewer` | `issue-refinement-loop` の loop worker として Issue 品質を判定する役割（read-only） | `review-issue` |
 
 | Skill | 手順 | 呼び出し元の例 |
 |---|---|---|
-| `create-issue` | 新規 Issue 起票の手順（Template Guard / Outcome Quality Guard / scope 重複チェック / `gh issue create`） | `issue-author` SubAgent、main session、`issue-refinement-loop`、`post-merge-cleanup` |
-| `edit-issue` | 既存 Issue 本文更新の transaction 手順（candidate body / guard / readiness / controlled executor / bounded result）| `issue-author` SubAgent、`issue-refinement-loop`、`post-merge-cleanup`、`review-issue`（needs-fix 適用時） |
+| `create-issue` | 新規 Issue 起票の手順（Template Guard / Outcome Quality Guard / scope 重複チェック / `gh issue create`） | `issue-creator` SubAgent、main session、`issue-refinement-loop`、`post-merge-cleanup` |
+| `edit-issue` | 既存 Issue 本文更新の transaction 手順（candidate body / guard / readiness / controlled executor / bounded result）| `issue-editor` SubAgent、`issue-refinement-loop`、`post-merge-cleanup`、`review-issue`（needs-fix 適用時） |
 | `review-issue` | Issue 本文の品質を決定論的にチェックして verdict と差分提案を返す | main session、`issue-reviewer` SubAgent（`issue-refinement-loop` loop worker 経由） |
 | `issue-contract-review` | 実装着手直前に作業計画・コンテクスト・開発フロー適合性を preflight | main session、`implement-issue` の手前 |
 | `issue-refinement-loop` | Issue 改善 4 段ループのオーケストレーター | main session |
 
 共通参照: [`create-issue/references/body-authoring.md`](../../.claude/skills/create-issue/references/body-authoring.md)
-（VC 作成ガイダンス・Anchor Verification・Machine-Readable Contract block guidance 等。`edit-issue` / `issue-author` も参照する）
+（VC 作成ガイダンス・Anchor Verification・Machine-Readable Contract block guidance 等。`edit-issue` / `issue-creator` / `issue-editor` も参照する）
 
 ## 実装系
 
@@ -339,7 +341,7 @@ upstream 名をそのまま採用（ADR 0002 確定方針 — `upstream_name_ado
 | `speckit-plan` | 152 | 機能の開発計画（plan.md）を生成する | Tier 2 | 必要時のみ読む |
 | `speckit-specify` | 330 | 機能仕様（spec.md）を生成する | **Tier 3** | 250 行超 / auto_load_prohibited |
 | `speckit-tasks` | 202 | spec から実装タスク（tasks.md）を生成する | Tier 2 | tasks.md は staging artifact / materialize 後 archived に降格 |
-| `speckit-taskstoissues` | 106 | tasks.md から GitHub Issues を起票する | Tier 2 | `issue-author` / `create-issue` 経由で実行 |
+| `speckit-taskstoissues` | 106 | tasks.md から GitHub Issues を起票する | Tier 2 | `issue-creator` / `create-issue` 経由で実行 |
 
 ### Tier 定義（speckit スキルにおける適用）
 
@@ -403,7 +405,7 @@ speckit_implement_policy:
 
 | 役割 | Runtime Verification に関する責務 |
 |---|---|
-| `issue-author` | Issue に `## Runtime Verification Applicability` セクション（decision: not_applicable \| immediate \| deferred）を記載する。`deferred` の場合は後続 Issue / フェーズ / 条件を明記する |
+| `issue-creator` / `issue-editor` | Issue に `## Runtime Verification Applicability` セクション（decision: not_applicable \| immediate \| deferred）を記載する。`deferred` の場合は後続 Issue / フェーズ / 条件を明記する |
 | `review-issue` | 適用判定不在（C9 warning）、`deferred` の検証先不明（C10 blocker）を検出する |
 | `issue-contract-review` | `immediate` の Issue で VC preflight を実施し、SKIP 規約・証跡保存・Stop Condition 連動が設計されているかを審査する |
 | `implementation-worker` | `immediate` のときのみ VC スクリプトと artifacts/ 出力ロジックを実装する。`deferred` の場合は実装中に動作検証を捏造しない |
@@ -441,7 +443,7 @@ triage せずに積まれた Issue は定期 triage セッション（または 
 ### FOLLOW_UP_ISSUE_REQUEST_V1
 
 Skill / SubAgent が「後で Issue にすべき観察」を main thread に返す際に使う構造化スキーマ。
-main thread（impl-review-loop Step 5 / post-merge-cleanup 等）が受け取り、`issue-author` / `create-issue` 経由で起票責務を担う。
+main thread（impl-review-loop Step 5 / post-merge-cleanup 等）が受け取り、`issue-creator` / `create-issue` 経由で起票責務を担う。
 
 ```yaml
 FOLLOW_UP_ISSUE_REQUEST_V1:
@@ -534,7 +536,7 @@ for each request:
   1. dedupe チェック: dedupe_key で既存 Issue を検索（open / closed すべて対象）
      gh issue list --repo <owner>/<repo> --state all \
        --search '"<dedupe_key>"' --json number,title,url,state,stateReason,labels
-  2. 重複なし → issue-author SubAgent に委譲して create-issue 経由で起票
+  2. 重複なし → issue-creator SubAgent に委譲して create-issue 経由で起票
      ※ Issue 本文に ## Source セクション（dedupe_key を含む）を必須で付与
   3. 重複あり（open）→ スキップ（既存 Issue 番号をレポートに記録、status: reused_open）
   4. 重複あり（closed / not_planned）→ 起票せずスキップ（status: skipped_closed_not_planned）
@@ -571,10 +573,10 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 **責務境界**:
 
 - `pr-review-judge`: non-blocker observations を `FOLLOW_UP_ISSUE_REQUEST_V1` として `LOOP_VERDICT.follow_up_issue_requests` に出力する。**Issue 起票は行わない**。`follow_up_issues` フィールドを `LOOP_VERDICT` に出力してはならない（**negative rule**）。
-- `post-merge-cleanup-worker`: `FOLLOW_UP_ISSUE_REQUEST_V1[]` を列挙して main thread に返す。**`gh issue create` / `issue-author` / `create-issue` を直接呼び出してはならない**。Issue の実際の作成は必ず main thread が担う。
-- `post-merge-cleanup`（main thread cleanup phase）: `post-merge-cleanup-worker` から受け取ったリクエストを dedupe 後に `issue-author` / `create-issue` 経由で materialize する **terminal materializer**（terminal materialization coordinator）。follow-up の raw context を保持・判断する context owner ではなく、PR / impl-review-loop 由来の蓄積済み `FOLLOW_UP_ISSUE_REQUEST_V1[]` を終端で materialize・report する。
+- `post-merge-cleanup-worker`: `FOLLOW_UP_ISSUE_REQUEST_V1[]` を列挙して main thread に返す。**`gh issue create` / `issue-creator` / `create-issue` を直接呼び出してはならない**。Issue の実際の作成は必ず main thread が担う。
+- `post-merge-cleanup`（main thread cleanup phase）: `post-merge-cleanup-worker` から受け取ったリクエストを dedupe 後に `issue-creator` / `create-issue` 経由で materialize する **terminal materializer**（terminal materialization coordinator）。follow-up の raw context を保持・判断する context owner ではなく、PR / impl-review-loop 由来の蓄積済み `FOLLOW_UP_ISSUE_REQUEST_V1[]` を終端で materialize・report する。
 - `issue-refinement-loop`: scope split / out-of-scope discovery / child materialization の出口を持つ **thin orchestrator**。review-issue 由来の観察を routing するだけで、follow-up の raw context を保持・再解釈しない。終了コメントには materialization 結果（`FOLLOW_UP_MATERIALIZATION_RESULT_V1`）のみを出す。
-- main thread（impl-review-loop Step 5 / post-merge-cleanup）: リクエストを受け取り、dedupe_key で dedupe チェック後に `issue-author` / `create-issue` 経由で起票する。
+- main thread（impl-review-loop Step 5 / post-merge-cleanup）: リクエストを受け取り、dedupe_key で dedupe チェック後に `issue-creator` / `create-issue` 経由で起票する。
 
 ## CHILD_MATERIALIZATION_PLAN_V2
 
@@ -696,7 +698,7 @@ plan_child_materialization.py
 
 ## CHILD_MATERIALIZATION_RESULT_V2
 
-`issue-author` SubAgent が `task: materialize_children` を実行した後に返す出力スキーマ。
+`issue-creator`（子 Issue 起票）と `issue-editor`（親 body 更新）が協調して `task: materialize_children` を実行した後に返す出力スキーマ。
 `issue-refinement-loop` の Step 4.5 がこのスキーマを消費して `termination_reason` を決定する。
 
 ```yaml
@@ -778,7 +780,7 @@ uv run --locked python3 .claude/skills/create-issue/scripts/materialize_child_is
 2. プロジェクト全体に関わる方針なら `docs/dev/` に置く
 3. 独立 Skill にはしない（Skill は「何かを実行する手順」であり、共有参照は手順ではないため）
 
-例: VC 作成ガイダンスは `create-issue/references/body-authoring.md` に置き、`edit-issue` / `issue-author` SubAgent から参照する。
+例: VC 作成ガイダンスは `create-issue/references/body-authoring.md` に置き、`edit-issue` / `issue-creator` / `issue-editor` SubAgent から参照する。
 
 ## ORCHESTRATOR_IO_BOUNDARY_V1
 
@@ -825,7 +827,7 @@ forbidden_context:
 ```
 
 > **Note**: `diff_proposal` / `blocking_issues` の内容テキストは routing 判断に使用してはならないが、
-> 後続 SubAgent（`issue-author` 等）への **opaque forwarding payload** として LOOP_STATE に保持・転送することは許可する。
+> 後続 SubAgent（`issue-editor` 等）への **opaque forwarding payload** として LOOP_STATE に保持・転送することは許可する。
 > orchestrator はこれらの内容を再解釈せず、受け取ったまま転送する（`detail_payload_policy: opaque_ref_only`）。
 
 **禁止の理由**: raw コンテンツをオーケストレーターが直接保持すると以下の問題が生じる。
@@ -846,7 +848,7 @@ WRONG（禁止パターン）:
 CORRECT（正しいパターン）:
   orchestrator → issue-reviewer SubAgent → review-issue skill
   orchestrator → implementation-worker SubAgent → implement-issue skill
-  orchestrator → issue-author SubAgent → edit-issue skill
+  orchestrator → issue-editor SubAgent → edit-issue skill
 ```
 
 #### 違反パターンの例示
@@ -952,7 +954,7 @@ temporary_exceptions:
       reason: issue-227 first-stage scope. anchor comment classification は今回スコープでは main thread に残す
       allowed_until: follow-up issue (impl-review-loop boundary conformance check)
       constraints:
-        - must not be forwarded raw to issue-author
+        - must not be forwarded raw to issue-editor
         - must be normalized before Step 4
         - must not be used as generic reviewer_feedback_text
 ```
@@ -972,7 +974,7 @@ temporary_exceptions:
 | 実装 / conflict resolve / push | `implementation-worker` SubAgent（data-plane） |
 | Verification Commands 実行 | `test-runner` SubAgent（data-plane） |
 | PR レビュー verdict 投稿 | `pr-reviewer` SubAgent（data-plane） |
-| Issue 本文編集 | `issue-author` SubAgent + `edit-issue` skill（data-plane） |
+| Issue 本文編集 | `issue-editor` SubAgent + `edit-issue` skill（data-plane） |
 
 ### ループ内の人間承認原則
 

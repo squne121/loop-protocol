@@ -1,6 +1,6 @@
 ---
-name: issue-author
-description: Test author agent
+name: issue-creator
+description: Test issue creator agent
 model: sonnet
 tools:
   - Bash
@@ -10,6 +10,8 @@ disallowedTools:
   - Agent
   - Edit
   - Write
+skills:
+  - create-issue
 ---
 
 ## 出力契約（ISSUE_AUTHOR_RESULT_COMPACT_V1 / artifact_only: ISSUE_AUTHOR_RESULT_V1）
@@ -19,7 +21,7 @@ Internal artifact only: `ISSUE_AUTHOR_RESULT_V1`.
 
 RUNTIME
 - runtime_dependency_status: codex_skill_required
-- runtime_followup_route: create-issue|edit-issue
+- runtime_followup_route: create-issue
 
 Known limitation
 - hooks are local guardrails.

@@ -37,7 +37,7 @@ spawn_agent:
 
 3. main thread が返却された YAML に応じて以下を実行:
    - `human_review_required: true` → 不明事項を人間に判断委ね
-   - `follow_up_issue_requests` あり → main thread が **即時** `issue-author` SubAgent に委譲して `create-issue` 経由で自動起票する（dedupe_key ベースで重複チェック。SubAgent 内では起票しない。候補列挙のみ）
+   - `follow_up_issue_requests` あり → main thread が **即時** `issue-creator` SubAgent に委譲して `create-issue` 経由で自動起票する（dedupe_key ベースで重複チェック。SubAgent 内では起票しない。候補列挙のみ）
    - `superseded_prs` あり → `gh pr close` / `gh pr comment` を実行
    - `parent_issue_status.recommended_action` あり → `gh issue close` を実行
    - `stash_restored: false` → `stash_entry_ref` を確認、人間判断
@@ -51,7 +51,7 @@ for each request in follow_up_issue_requests:
   1. dedupe チェック: dedupe_key で既存 Issue を検索（open / closed すべて対象）
      gh issue list --repo squne121/loop-protocol --state all \
        --search '"<dedupe_key>"' --json number,title,url,state,stateReason,labels
-  2. 重複なし → issue-author SubAgent に委譲して create-issue skill 経由で起票
+  2. 重複なし → issue-creator SubAgent に委譲して create-issue skill 経由で起票
      ※ Issue 本文に ## Source セクション（dedupe_key を含む）を必須で付与
   3. 重複あり（open）→ スキップ（既存 Issue 番号をレポートに記録、status: reused_open）
   4. 重複あり（closed / not_planned）→ 起票せずスキップ（status: skipped_closed_not_planned）
@@ -251,7 +251,7 @@ merged PR の本文 / コメントから以下を抽出:
 - `## Follow-ups Intentionally Deferred` セクション（あれば）
 - レビューコメントで follow-up 化が示唆された項目
 
-候補を `follow_up_issue_requests` に `FOLLOW_UP_ISSUE_REQUEST_V1` 形式で列挙する（起票実行は main thread が `issue-author` SubAgent / `create-issue` 経由で実行）。
+候補を `follow_up_issue_requests` に `FOLLOW_UP_ISSUE_REQUEST_V1` 形式で列挙する（起票実行は main thread が `issue-creator` SubAgent / `create-issue` 経由で実行）。
 
 ### 6a. Delivery-rollup Parent の残り child 検出（追加ステップ）
 
