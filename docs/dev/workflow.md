@@ -132,7 +132,7 @@ planner / `open-pr` / `implement-issue` / `impl-review-loop` の production impl
 - `git worktree add` CLI を直接利用（特定エージェント専用機能には依存しない）
 - リポジトリ外配置は禁止（Claude Code の workspace trust prompt が再発し承認マシーン化）
 
-## Cross-runtime skill discovery
+## Cross-runtime skill discovery（クロスランタイム skill discovery）
 
 - `.agents/skills` は Git mode `120000` の root skill-directory symlink であり、link text は
   `../.claude/skills` に固定する。Codex は前者、Claude Code は後者から同一 skill package tree を読む。
