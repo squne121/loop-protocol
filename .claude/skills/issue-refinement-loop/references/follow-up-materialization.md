@@ -1,13 +1,13 @@
 # Follow-up Materialization
 
-## Step 4.5 gate
+## Step 4.5 ゲート（Step 4.5 gate）
 
 `approve` の直後は Step 5 に進む前に child / follow-up materialization gate を通す。
 
 - delivery-rollup parent で child slot が未 materialize の場合は、main thread が routing 先を確認してから `issue-creator` に委譲する
 - 通常の implementation / refinement issue では gate を通過してそのまま Step 5 へ進む
 
-## Derived follow-up issues
+## 派生する follow-up issue（Derived follow-up issues）
 
 scope 外だが記録価値のある改善候補を見つけた場合は、別 Issue として分離する。
 
@@ -16,7 +16,7 @@ scope 外だが記録価値のある改善候補を見つけた場合は、別 I
 - closed issue の reopen は自動実行しない
 - 起票またはスキップ結果は終了報告に列挙する
 
-## Step 5 Result Block
+## Step 5 結果ブロック（Step 5 Result Block）
 
 Step 5（終了コメント）では、起票結果を `FOLLOW_UP_MATERIALIZATION_RESULT_V1` として報告する。`issue-refinement-loop` は thin orchestrator として raw context を保持せず、routing・reporting のみを担う。
 
@@ -48,7 +48,7 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
   note_only_observations: []
 ```
 
-## Must not
+## 禁止事項（Must not）
 
 - title の類似検索だけで dedupe を済ませない
 - 本体 Issue の scope に押し込んで `1 Issue = 1 PR` を崩さない
