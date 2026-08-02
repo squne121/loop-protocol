@@ -190,6 +190,42 @@ workspace のリストからのみ生成される（`cwd` だけを設定した�
   ケーシングの誤りではなく、実バイナリ内部の型解決ロジック側の
   問題であることを強く示唆する。
 
+**追加の独立確認（Issue #1814 再々調査、current head `ffd0fb83`）。**
+コード読み取りのみ（`strings ~/.local/bin/agy`、追加の live 起動なし）で
+上記の結論を補強する事実を確認した。埋め込み `hooks_go_proto.HookInjectedStep`
+の oneof フィールド `Step` が取りうる型は、シンボルテーブルから
+`HookInjectedStep_ToolCall` / `HookInjectedStep_UserMessage` /
+`HookInjectedStep_EphemeralMessage` / `HookInjectedStep_ErrorMessage` /
+`HookInjectedStep_SystemMessage` / `HookInjectedStep_HookUserMessage` /
+`HookInjectedStep_HookEphemeralMessage` の 7 種類だけであり、
+`HookInjectedStep_HookToolCall`（`HookUserMessage` / `HookEphemeralMessage`
+と対になる、新しい `HookToolCall` message 型を包む oneof variant）は
+**存在しない**。つまり `toolCall` を注入するために protojson が受理しうる
+JSON key は `toolCall`（または proto 原名の `tool_call`）以外に存在せず、
+この形は既に確認済みで `unknown injected step type: <nil>` になる。
+また `{"type": "toolCall", ...}` のような discriminator 付与は
+`HookInjectedStep` に `type` という宣言フィールドが存在しないため
+protojson の unknown-field 拒否（`unknown field "type"`）に一致する。
+`type` の値を `tool_call` / `TOOL_CALL` に変えても、拒否理由は
+フィールド名 `type` 自体の不存在であって値ではないため、同一の
+`unknown field "type"` エラーになることが構造的に導ける。したがって
+`--profile no_tools --mode live --allow-live` による追加の live 起動を
+伴わずに、これらの discriminator variant は同じ結果になると判断できる。
+
+current head `ffd0fb83` に対して `--profile no_tools --mode live
+--allow-live` を再実行し、`_prepare_runtime()` の `injectSteps` 構築
+（`args` に `stepIndex` / `sideEffectCounterPath` を追加した correlation
+強化後の形）でも同一の failure_class になることを再確認した。
+artifact の `diagnostic_ledger` は
+`pre_invocation_hook_started: true`、`pre_invocation_context_accepted: true`、
+`injected_step_count: 5`（`PreInvocation` hook 自体は正しく発火し
+5 attempt すべてが `injectSteps` として受理された）に対し、
+`pre_tool_use_event_count: 0`（`PreToolUse` は一件も発火しなかった）、
+`runner.child_returncode: 1`（`agy` 本体が deserialize 失敗で
+エージェント実行全体を中断した）であった。`failure_taxonomy.class` は
+`agy_permission_boundary_inconclusive`、`completion: false`。この結果は
+原因 2 が correlation 強化コミット後も未解消であることを示す。
+
 **この Issue の Stop Condition への該当性。** 上記は
 「実 AGY の仕様が公式資料と runtime で矛盾し、fail-closed な判定を確定できない」
 に該当する。`agy` 自身が埋め込む公式ドキュメントどおりの `toolCall` 注入
