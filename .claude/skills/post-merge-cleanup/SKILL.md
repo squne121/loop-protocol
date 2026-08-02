@@ -213,6 +213,14 @@ materialize 不能になり、bare-git ルートは `--no-verify` 無しでは�
 `operation` / claim-first consume + tombstone）は agent 向けの cleanup 経路ではなく、guard 層の
 **defense-in-depth** として残す内部機構である。post-merge-cleanup skill は bare git cleanup を案内しない。
 
+通常 cleanup で `worktree_remove` が成功した後に内部 `git branch -d` が ancestry 理由で失敗した場合、
+`cleanup_exec` は**同じ cleanup_exec invocation 内だけで**既存 branch-only authorization を再実行する。
+この same cleanup_exec invocation は新しい agent-facing cleanup command を追加しない。
+merged PR・PR head branch・local branch tip/head OID（または限定 squash equivalence）・default base・
+same-repository・linked issue・worktree disk/catalog 不在・他 worktree 未使用の全条件を再確認できた場合のみ、
+executor 内部の subprocess array で `git branch -D` を使う。再認可が拒否された場合も既に完了した
+`worktree_remove` は `actions_taken` に保持する。agent は bare または wrapper 経由の force delete を実行しない。
+
 削除できないものは `unresolved_cleanup_items` に記録する。
 
 ### 4. parent issue クローズ条件確認
