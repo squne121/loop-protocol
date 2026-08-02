@@ -15,6 +15,10 @@ function isAllowedRuntimeStorageKey(value: string): boolean {
 }
 
 function getRuntimeStorageKey(): string | null {
+  if (import.meta.env.VITE_E2E_MODE !== 'true') {
+    return null
+  }
+
   const loopWindow = globalThis as unknown as WindowWithLoopStorageRuntime
   const override = loopWindow.__LOOP_STORAGE_KEY__
 
