@@ -153,7 +153,7 @@ SubAgent（役割）── Skill（作業手順）
 共通参照: [`create-issue/references/body-authoring.md`](../../.claude/skills/create-issue/references/body-authoring.md)
 （VC 作成ガイダンス・Anchor Verification・Machine-Readable Contract block guidance 等。`edit-issue` / `issue-author` も参照する）
 
-### `issue-author` の Skill capability gate（Agent-local deterministic dispatcher）
+### `issue-author` の Skill 能力ゲート（Agent ローカルな決定論的ディスパッチャー）
 
 `issue-author`（Issue #1734）は `tools: [Bash, Read, Skill]` を持ち、Agent frontmatter の
 `skills:` フィールドで `{create-issue, edit-issue}` の exact set のみを許可 Skill として宣言する。
