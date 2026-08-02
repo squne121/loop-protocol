@@ -408,7 +408,7 @@ def check_parent_close_condition_explicit(orchestrator_skill_path: Path) -> Vali
 # the *orchestrator* Skill body is required by AC4.
 _ORCHESTRATION_EXECUTION_MARKERS = (
     "post-merge-cleanup-worker` SubAgent を Agent tool で起動する",
-    "issue-author SubAgent に委譲して create-issue skill 経由で起票",
+    "issue-creator SubAgent に委譲して create-issue skill 経由で起票",
     "gh pr close` / `gh pr comment` を実行",
     "gh issue close` を実行",
 )
@@ -508,7 +508,7 @@ def check_followup_routing_ownership(orchestrator_skill_path: Path, executor_ski
     orchestrator_text = orchestrator_skill_path.read_text(encoding="utf-8")
     executor_text = executor_skill_path.read_text(encoding="utf-8")
 
-    if "issue-author SubAgent に委譲して create-issue skill 経由で起票" not in orchestrator_text:
+    if "issue-creator SubAgent に委譲して create-issue skill 経由で起票" not in orchestrator_text:
         errors.append("orchestrator missing the follow-up materialization ownership instruction")
 
     if _GH_ISSUE_CREATE_INVOCATION_RE.search(executor_text):

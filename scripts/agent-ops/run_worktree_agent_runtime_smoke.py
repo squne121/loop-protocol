@@ -452,7 +452,8 @@ def read_prompt(prompt_file: str) -> str:
 
 
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
-                           max_turns: int, claude_bin: str = "claude") -> tuple[int | None, str, str, bool]:
+                           max_turns: int, claude_bin: str = "claude",
+                           claude_agent_name: str | None = None) -> tuple[int | None, str, str, bool]:
     argv = [
         claude_bin,
         "-p",
@@ -462,6 +463,14 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
         "--max-turns", str(max_turns),
         "--verbose",
     ]
+    # Issue #1734 fix_delta 3 (AC7): purely additive, opt-in persona binding.
+    # When ``claude_agent_name`` is provided, insert ``--agent <name>`` so the
+    # underlying ``claude`` process actually launches with that Agent as the
+    # active session persona (rather than just declaring a static label via
+    # ``--agent-type``, which is never forwarded to the CLI). Omitted by
+    # default, so every pre-existing caller's argv is unchanged.
+    if claude_agent_name:
+        argv += ["--agent", claude_agent_name]
     return _run(argv, cwd=worktree, timeout=timeout_seconds, input_text=prompt)
 
 
@@ -1161,6 +1170,21 @@ def build_parser() -> argparse.ArgumentParser:
             "a real value."
         ),
     )
+    parser.add_argument(
+        "--claude-agent-name",
+        default=None,
+        help=(
+            "Issue #1734 fix_delta 3 (AC7): backward-compatible, additive, "
+            "opt-in flag. When passed (claude runtime + structured mode "
+            "only), inserts '--agent <name>' into the underlying 'claude' "
+            "subprocess invocation inside run_structured_claude(), actually "
+            "launching that Agent as the active session persona (unlike "
+            "--agent-type, which is only a static declaration label never "
+            "forwarded to the CLI). Defaults to None: omitted entirely, "
+            "leaving every pre-existing caller's argv and behavior "
+            "unchanged."
+        ),
+    )
     return parser
 
 
@@ -1262,7 +1286,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "structured":
             if args.runtime == "claude":
                 rc, out, err, timed_out = run_structured_claude(
-                    worktree, prompt, float(args.timeout_seconds), args.max_turns
+                    worktree, prompt, float(args.timeout_seconds), args.max_turns,
+                    claude_agent_name=args.claude_agent_name,
                 )
             else:
                 rc, out, err, timed_out = run_structured_codex(worktree, prompt, float(args.timeout_seconds))

@@ -5,7 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.parent.parent
 SKILL_MD = ROOT / "skills" / "issue-refinement-loop" / "SKILL.md"
-ISSUE_AUTHOR_MD = ROOT / "agents" / "issue-author.md"
+ISSUE_EDITOR_MD = ROOT / "agents" / "issue-editor.md"
 EDIT_ISSUE_MD = ROOT / "skills" / "edit-issue" / "SKILL.md"
 
 
@@ -39,20 +39,20 @@ def test_step4_routes_all_readiness_statuses():
     text = read(SKILL_MD)
     for fragment in [
         "exit_code_0:",
-        "action: invoke_issue_author",
+        "action: invoke_issue_editor",
         "readiness_errors: []",
         "exit_code_1:",
-        "action: invoke_issue_author_with_readiness_result",
+        "action: invoke_issue_editor_with_readiness_result",
         "exit_code_2:",
-        "action: skip_issue_author_and_go_step5",
+        "action: skip_issue_editor_and_go_step5",
         "exit_code_3:",
         "action: human_escalation",
     ]:
         assert fragment in text, f"missing routing fragment: {fragment}"
 
 
-def test_issue_author_consumes_readiness_forwarding_payload():
-    text = read(ISSUE_AUTHOR_MD)
+def test_issue_editor_consumes_readiness_forwarding_payload():
+    text = read(ISSUE_EDITOR_MD)
     for fragment in [
         "readiness_forwarding_payload",
         "READINESS_FORWARDING_PAYLOAD_V1",
@@ -61,7 +61,7 @@ def test_issue_author_consumes_readiness_forwarding_payload():
         "`status: needs_fix`",
         "`status: human_judgment` または `status: input_or_runtime_error`",
     ]:
-        assert fragment in text, f"missing issue-author consumer fragment: {fragment}"
+        assert fragment in text, f"missing issue-editor consumer fragment: {fragment}"
 
 
 def test_edit_issue_consumes_readiness_forwarding_payload():

@@ -458,22 +458,26 @@ class TestMaxRewriteAttemptsAndNoProgress:
 class TestTerminalResultFields:
     """AC11: Terminal result field names are documented in references."""
 
-    def test_terminal_result_fields_documented_in_issue_author(self):
-        """AC11: issue-author.md documents checked_body_sha256, checker_exit_code, etc."""
-        agent_doc = AGENTS_DIR / "issue-author.md"
-        assert agent_doc.exists(), f"issue-author.md must exist: {agent_doc}"
+    def test_terminal_result_fields_documented_in_issue_editor(self):
+        """AC11: issue-editor.md documents checked_body_sha256, checker_exit_code, etc.
+
+        Issue #1734: this content moved from issue-author.md (now a deprecated
+        stub) to issue-editor.md, which owns existing-Issue rewrite.
+        """
+        agent_doc = AGENTS_DIR / "issue-editor.md"
+        assert agent_doc.exists(), f"issue-editor.md must exist: {agent_doc}"
         content = agent_doc.read_text(encoding="utf-8")
         assert "checked_body_sha256" in content, (
-            "issue-author.md must document checked_body_sha256"
+            "issue-editor.md must document checked_body_sha256"
         )
         assert "checker_exit_code" in content, (
-            "issue-author.md must document checker_exit_code"
+            "issue-editor.md must document checker_exit_code"
         )
         assert "missing_sections" in content, (
-            "issue-author.md must document missing_sections"
+            "issue-editor.md must document missing_sections"
         )
         assert "missing_contract_keys" in content, (
-            "issue-author.md must document missing_contract_keys"
+            "issue-editor.md must document missing_contract_keys"
         )
 
 
