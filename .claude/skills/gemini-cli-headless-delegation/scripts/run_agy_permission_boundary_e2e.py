@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import http.server
 import importlib.util
 import json
 import os
@@ -20,10 +21,12 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
 
@@ -65,6 +68,53 @@ PREDICATE_KEYS = frozenset(
         "logger_failure_absent",
     }
 )
+
+
+class _LoopbackCanary:
+    """Parent-owned, single-purpose loopback counter for ``search_web``.
+
+    The endpoint is generated before the injected step and records only a
+    request to that exact URL.  This prevents the fake runtime from claiming a
+    network side effect by writing a file unrelated to the injected query.
+    """
+
+    def __init__(self, counter_path: Path, *, run_id: str, canary_id: str) -> None:
+        self._counter_path = counter_path
+        self._lock = threading.Lock()
+        state: dict[str, str] = {"expected_path": ""}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == state["expected_path"]:
+                    with self.server._canary._lock:  # type: ignore[attr-defined]
+                        current = int(self.server._canary._counter_path.read_text(encoding="utf-8").strip())  # type: ignore[attr-defined]
+                        self.server._canary._counter_path.write_text(f"{current + 1}\n", encoding="utf-8")  # type: ignore[attr-defined]
+                    self.send_response(200)
+                else:
+                    self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server._canary = self  # type: ignore[attr-defined]
+        self.url = (
+            f"http://127.0.0.1:{self._server.server_address[1]}"
+            f"/permission-boundary-network-canary?run={run_id}&canary={canary_id}"
+        )
+        state["expected_path"] = urlsplit(self.url).path + "?" + urlsplit(self.url).query
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> bool:
+        try:
+            self._server.shutdown()
+            self._server.server_close()
+            self._thread.join(timeout=5)
+        except OSError:
+            return False
+        return not self._thread.is_alive()
 
 
 class AgyAuthBootstrapUnavailable(RuntimeError):
@@ -386,6 +436,9 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
     for counter in canary_paths.values():
         counter.write_text("0\n", encoding="utf-8")
         counter.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    # The parent, rather than the fake child, owns the loopback listener and
+    # its counter.  ``search_web`` must use this exact generated URL.
+    loopback_canary = _LoopbackCanary(canary_paths["network"], run_id=run_id, canary_id=canary_id)
     policy_path = control / "policy.json"
     policy = {
         "schema": "agy_permission_boundary_policy/v1",
@@ -426,7 +479,7 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
             "CodeContent": "1\n",
         },
         "read": {"AbsolutePath": str(canary_paths["read"])},
-        "network": {"query": "http://127.0.0.1/permission-boundary-network-canary"},
+        "network": {"query": loopback_canary.url},
     }
     steps = [
         {"toolCall": {"name": ATTEMPT_SPECS[capability][0], "args": attempt_args[capability]}}
@@ -497,6 +550,7 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
         "enforcement_log": enforcement_log,
         "canary_paths": canary_paths,
         "attempt_args": attempt_args,
+        "loopback_canary": loopback_canary,
     }
 
 
@@ -711,6 +765,7 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         return EXIT_UNAVAILABLE, _unavailable_artifact(FAILURE_UNAVAILABLE, profile=args.profile)
     temporary = Path(tempfile.mkdtemp(prefix="agy-boundary-", dir=args.artifact_dir))
     result: dict[str, Any]
+    runtime: Mapping[str, Any] | None = None
     exit_code = EXIT_FAIL
     try:
         try:
@@ -752,6 +807,10 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         result = _unavailable_artifact(FAILURE_INCONCLUSIVE, profile=args.profile, exit_code=EXIT_FAIL)
     finally:
         cleanup_ok = True
+        if runtime is not None:
+            loopback_canary = runtime.get("loopback_canary")
+            if isinstance(loopback_canary, _LoopbackCanary):
+                cleanup_ok = loopback_canary.stop()
         try:
             shutil.rmtree(temporary)
         except OSError:

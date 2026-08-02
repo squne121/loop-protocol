@@ -25,14 +25,11 @@ SPEC.loader.exec_module(MODULE)
 def _fake_agy(path: Path, *, exit_code: int = 0, post_mode: str = "normal") -> None:
     """Create a fake runtime which dispatches configured hooks, never events."""
     script = """#!/usr/bin/env python3
-import http.server
 import json
 import os
 import pathlib
 import shlex
-import socketserver
 import subprocess
-import threading
 import urllib.request
 import sys
 
@@ -48,89 +45,95 @@ home = pathlib.Path(os.environ["HOME"])
 hooks = json.loads((home / ".gemini" / "config" / "hooks.json").read_text())
 workspace = pathlib.Path(os.getcwd())
 base = {"conversationId": "conversation-hook", "invocationNum": 7, "workspacePaths": [str(workspace)]}
-state = {"network": 0, "mcp": 0}
 context = json.loads(pathlib.Path(os.environ["AGY_PERMISSION_BOUNDARY_CONTEXT_PATH"]).read_text())
 
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        if self.path.startswith("/network"):
-            state["network"] += 1
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-    def do_POST(self) -> None:
-        if self.path.startswith("/mcp"):
-            state["mcp"] += 1
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-        return
-
-def invoke(command, payload, *, strict=True):
+def invoke(command, payload):
     if isinstance(command, str):
         command = shlex.split(command)
     input_data = payload if isinstance(payload, str) else json.dumps(payload)
     result = subprocess.run(command, input=input_data, text=True, capture_output=True, env=os.environ.copy(), check=False)
-    if strict and result.returncode:
-        sys.stderr.write(result.stderr)
-        raise SystemExit(result.returncode)
-    return result if not strict else json.loads(result.stdout)
+    return result
 
+def require_keys(args, keys):
+    return isinstance(args, dict) and set(args) == set(keys)
 
-def record_post_failure(status):
-    event = {"kind": "post_tool_use", "status": status, "run_id": context["run_id"], "canary_id": context["canary_id"], "tool_profile": context["tool_profile"]}
-    with open(context["events_path"], "a", encoding="utf-8") as output:
-        output.write(json.dumps(event, separators=(",", ":")) + "\\n")
+def execute(tool_call):
+    name, args = tool_call["name"], tool_call["args"]
+    capability = context["native_capabilities"].get(name)
+    if capability == "command":
+        if not require_keys(args, ("CommandLine", "Cwd", "WaitMsBeforeAsync")):
+            return False
+        if args["Cwd"] != str(workspace) or not isinstance(args["WaitMsBeforeAsync"], int):
+            return False
+        return subprocess.run(args["CommandLine"], cwd=args["Cwd"], shell=True, check=False).returncode == 0
+    if capability == "write":
+        if not require_keys(args, ("TargetFile", "Overwrite", "CodeContent")):
+            return False
+        target = pathlib.Path(args["TargetFile"])
+        if target != pathlib.Path(context["canary_paths"]["write"]) or args["Overwrite"] is not True:
+            return False
+        target.write_text(args["CodeContent"], encoding="utf-8")
+        return True
+    if capability == "read":
+        if not require_keys(args, ("AbsolutePath",)):
+            return False
+        target = pathlib.Path(args["AbsolutePath"])
+        if target != pathlib.Path(context["canary_paths"]["read"]):
+            return False
+        target.read_text(encoding="utf-8")
+        return True
+    if capability == "network":
+        if not require_keys(args, ("query",)) or not isinstance(args["query"], str):
+            return False
+        response = urllib.request.urlopen(args["query"], timeout=2)
+        return response.status == 200
+    return False
 
+if "__POST_MODE__" == "nonzero":
+    failing_logger = workspace / "forced_post_logger.py"
+    failing_logger.write_text(
+        "import json,os,sys\\n"
+        "context=json.load(open(os.environ['AGY_PERMISSION_BOUNDARY_CONTEXT_PATH']))\\n"
+        "payload=json.load(sys.stdin)\\n"
+        "event={'kind':'post_tool_use','status':'logger_nonzero','run_id':context['run_id'],'canary_id':context['canary_id'],'tool_profile':context['tool_profile'],'conversation_id':payload.get('conversationId'),'step_index':payload.get('stepIdx')}\\n"
+        "open(context['events_path'],'a').write(json.dumps(event,separators=(',',':'))+'\\\\n')\\n"
+        "raise SystemExit(9)\\n",
+        encoding="utf-8",
+    )
+    failing_logger.chmod(0o700)
+    for item in hooks["permission-boundary-postlogger"]["PostToolUse"]:
+        item["hooks"][0]["command"] = f"{sys.executable} {failing_logger}"
+    (home / ".gemini" / "config" / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+    hooks = json.loads((home / ".gemini" / "config" / "hooks.json").read_text())
 
-with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    server_url = "http://127.0.0.1:%d" % server.server_address[1]
-
-    injection = hooks["permission-boundary-injector"]["PreInvocation"][0]["command"]
-    steps = invoke([injection], base)["injectSteps"]
-    for index, step in enumerate(steps):
-        tool_call = step["toolCall"]
-        payload = {
-            "toolCall": tool_call,
-            "stepIdx": index,
-            "conversationId": base["conversationId"],
-            "workspacePaths": base["workspacePaths"],
-        }
-        dispatched = False
-        decision = {"decision": "deny"}
-        for item in hooks["permission-boundary-enforcement"]["PreToolUse"]:
-            if item["matcher"] == tool_call["name"]:
-                dispatched = True
-                decision = invoke(item["hooks"][0]["command"], payload)
-                break
-        if not dispatched or decision.get("decision") != "allow":
-            continue
-        capability = context["native_capabilities"][tool_call["name"]]
-        if tool_call["name"] == "search_web":
-            urllib.request.urlopen(server_url + "/network?canary=1", timeout=1)
-        side_effect_path = pathlib.Path(context["canary_paths"][capability])
-        side_effect_path.write_text("1\\n", encoding="utf-8")
-        for item in hooks["permission-boundary-postlogger"]["PostToolUse"]:
-            if item["matcher"] == tool_call["name"]:
-                post_payload = {"conversationId": base["conversationId"], "stepIdx": index, "error": None}
-                if "__POST_MODE__" == "parse_failure":
-                    result = invoke(item["hooks"][0]["command"], "{malformed", strict=False)
-                elif "__POST_MODE__" == "nonzero":
-                    result = subprocess.CompletedProcess([], 9, "", "forced")
-                else:
-                    result = invoke(item["hooks"][0]["command"], post_payload, strict=False)
-                if result.returncode:
-                    record_post_failure("logger_nonzero")
-    server.shutdown()
-    server.server_close()
-    thread.join()
-    raise SystemExit(__EXIT_CODE__)
+injection = hooks["permission-boundary-injector"]["PreInvocation"][0]["command"]
+injected = invoke([injection], base)
+if injected.returncode:
+    sys.stderr.write(injected.stderr)
+    raise SystemExit(injected.returncode)
+steps = json.loads(injected.stdout)["injectSteps"]
+for index, step in enumerate(steps):
+    tool_call = step["toolCall"]
+    payload = {"toolCall": tool_call, "stepIdx": index, "conversationId": base["conversationId"], "workspacePaths": base["workspacePaths"]}
+    matching = [item for item in hooks["permission-boundary-enforcement"]["PreToolUse"] if item["matcher"] == tool_call["name"]]
+    if len(matching) != 1:
+        raise SystemExit(14)
+    pre = invoke(matching[0]["hooks"][0]["command"], payload)
+    if pre.returncode:
+        raise SystemExit(pre.returncode)
+    decision = json.loads(pre.stdout)
+    if decision.get("decision") != "allow":
+        continue
+    if not execute(tool_call):
+        raise SystemExit(15)
+    matching_post = [item for item in hooks["permission-boundary-postlogger"]["PostToolUse"] if item["matcher"] == tool_call["name"]]
+    if len(matching_post) != 1:
+        raise SystemExit(16)
+    post_payload = {"conversationId": base["conversationId"], "stepIdx": index, "error": None}
+    post = invoke(matching_post[0]["hooks"][0]["command"], "{malformed" if "__POST_MODE__" == "parse_failure" else post_payload)
+    if post.returncode and "__POST_MODE__" not in ("parse_failure", "nonzero"):
+        raise SystemExit(post.returncode)
+raise SystemExit(__EXIT_CODE__)
 """
     script = script.replace("__EXIT_CODE__", str(exit_code)).replace("__POST_MODE__", post_mode)
     path.write_text(script, encoding="utf-8")
@@ -199,6 +202,63 @@ def test_fake_dispatches_registered_posttooluse_only_after_an_allowed_attempt(tm
     network = next(item for item in _artifact(tmp_path)["attempts"] if item["correlation"]["capability"] == "network")
     assert network["expectation"] == "allow"
     assert all(network["predicates"].values())
+
+
+def test_allow_control_binds_exact_injected_loopback_effect_and_full_lifecycle_tuple(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The parent counter accepts only the query the injected tool received."""
+    fake = tmp_path / "fake-agy"
+    _fake_agy(fake)
+    monkeypatch.setattr(MODULE.shutil, "rmtree", lambda *_args, **_kwargs: None)
+    exit_code, artifact = MODULE._run(
+        argparse.Namespace(mode="hermetic", agy=str(fake), allow_live=False, profile="grounded_research", artifact_dir=tmp_path)
+    )
+    assert exit_code == 1  # Hermetic evidence never claims a live completion.
+    runtime = next(tmp_path.glob("agy-boundary-*"))
+    network_counter = runtime / "workspace" / ".agy-boundary-network-sentinel"
+    assert network_counter.read_text(encoding="utf-8") == "1\n"
+    events = [json.loads(line) for line in (runtime / "control" / "events.jsonl").read_text().splitlines()]
+    pre_events = [
+        json.loads(line)
+        for line in (runtime / "control" / "enforcement.jsonl").read_text().splitlines()
+        if json.loads(line)["tool_name"] == "search_web"
+    ]
+    post_events = [event for event in events if event["kind"] == "post_tool_use"]
+    assert len(pre_events) == len(post_events) == 1
+    pre, post = pre_events[0], post_events[0]
+    assert (pre["run_id"], pre["conversation_id"], pre["step_index"], pre["canary_id"]) == (
+        post["run_id"],
+        post["conversation_id"],
+        post["step_index"],
+        post["canary_id"],
+    )
+    assert pre["args_digest"] == artifact["attempts"][-1]["correlation"]["args_digest"]
+    assert "toolCall" not in post
+
+
+def test_denied_attempts_preserve_actual_sentinels_and_emit_no_posttooluse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake-agy"
+    _fake_agy(fake)
+    monkeypatch.setattr(MODULE.shutil, "rmtree", lambda *_args, **_kwargs: None)
+    exit_code, _artifact_value = MODULE._run(
+        argparse.Namespace(mode="hermetic", agy=str(fake), allow_live=False, profile="no_tools", artifact_dir=tmp_path)
+    )
+    assert exit_code == 1
+    runtime = next(tmp_path.glob("agy-boundary-*"))
+    assert {
+        path.name: path.read_text(encoding="utf-8")
+        for path in (runtime / "workspace").glob(".agy-boundary-*-sentinel")
+    } == {
+        ".agy-boundary-command-sentinel": "0\n",
+        ".agy-boundary-write-sentinel": "0\n",
+        ".agy-boundary-read-sentinel": "0\n",
+        ".agy-boundary-network-sentinel": "0\n",
+    }
+    events_path = runtime / "control" / "events.jsonl"
+    assert all(json.loads(line)["kind"] != "post_tool_use" for line in events_path.read_text().splitlines())
 
 
 @pytest.mark.parametrize("post_mode", ["parse_failure", "nonzero"])
