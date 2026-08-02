@@ -1236,6 +1236,7 @@ def _apply_exit_code_mapping(
     planner_fail_closed: Optional[bool],
     blockers: list[str],
     plan: Optional[dict] = None,
+    scope_delta_decision: Optional[dict] = None,
 ) -> tuple[str, int]:
     """
     Apply the Planner ↔ Wrapper Exit Code Mapping table.
@@ -1244,6 +1245,12 @@ def _apply_exit_code_mapping(
 
     warn condition: planner exit 0 AND fail_closed=false AND >=1 unknown confidence
     → status: warn / exit 1
+
+    PR #1973 (OWNER REQUEST_CHANGES, P1-5): a genuine multi-turn
+    trusted-owner advisory route (`scope_delta_decision.status == "warn"`,
+    set by `_apply_multi_turn_candidate_route()`) must also surface as a
+    CI-visible warn/EXIT_WARN, not silently stay `pass`/EXIT_PASS just
+    because `_has_unknown_confidence(plan)` happens to be False.
     """
     # Pre-planner blockers (anchor mismatch, gh failure)
     if blockers:
@@ -1296,6 +1303,9 @@ def _apply_exit_code_mapping(
             return "blocked", EXIT_BLOCKED
         # Check warn condition: >=1 decision has confidence: unknown
         if plan is not None and _has_unknown_confidence(plan):
+            return "warn", EXIT_WARN
+        # Check warn condition: multi-turn trusted-owner advisory route
+        if scope_delta_decision is not None and scope_delta_decision.get("status") == "warn":
             return "warn", EXIT_WARN
         return "pass", EXIT_PASS
 
@@ -1731,16 +1741,42 @@ def _apply_multi_turn_candidate_route(
     scope_delta_decision: dict,
     segments_result: "dict | None",
     candidates_result: "dict | None",
+    *,
+    integrity_predicates: "dict | None" = None,
 ) -> dict:
-    """#1891 AC4: route to human judgment when anchor_context.py finds
-    multiple unclassified candidates spread across a genuine multi-turn
-    transcript (>=2 marker-delimited segments).
+    """#1891 AC4 / #1950 AC1: route multi-turn anchors when anchor_context.py
+    finds multiple unclassified candidates spread across a genuine
+    multi-turn transcript (>=2 marker-delimited segments).
 
     This does not fire for an ordinary single-turn review comment that
     happens to contain several bullet points -- it is scoped to the
     multi-turn/supersession scenario this Issue targets, so it never
     auto-selects a single winning candidate and never silently overrides an
     existing fail-closed decision with a weaker one.
+
+    #1950 AC1 (chronology vs. precedence vs. authorization are separate
+    axes): when the anchor comment's author is a trusted OWNER
+    (``scope_delta_decision["anchor_author_association"] == "OWNER"``), a
+    genuine multi-turn transcript is no longer a hard stop by itself. The
+    index / source span of the *last* OWNER-speaker segment is recorded as
+    ``latest_owner_turn`` chronology metadata only -- it is never promoted
+    to a technical_recommendation or mutation_authorization precedence
+    signal, and multi-turn ambiguity alone still does not grant
+    implementation_go. Non-OWNER (or untrusted) multi-turn anchors keep the
+    pre-existing hard `fail_closed` route unchanged.
+
+    PR #1973 (OWNER REQUEST_CHANGES, P0-1): the advisory `warn` route must
+    never silently overwrite an ORIGINAL `approved_by_trusted_anchor`
+    decision (which would break the heavy-mutation gate's OWNER-explicit
+    check downstream) or an ORIGINAL `fail_closed` decision whose reason is
+    something other than the ordinary "no structured payload" case (e.g.
+    `schema_invalid`, `wrong_repo`, `wrong_issue_number`,
+    `untrusted_author_association`) -- those reflect a distinct integrity
+    problem that a multi-turn transcript does not resolve. The advisory
+    downgrade is applied ONLY when the original decision is
+    `fail_closed` / `no_anchor_scope_reframe_v1_payload` AND retrieval
+    integrity (`integrity_predicates`: fetch complete, hash verified, source
+    ranges covered) is fully confirmed.
     """
     if not isinstance(segments_result, dict) or not isinstance(candidates_result, dict):
         return scope_delta_decision
@@ -1749,12 +1785,72 @@ def _apply_multi_turn_candidate_route(
     candidates = candidates_result.get("candidates", [])
 
     if len(marked_segments) >= 2 and len(candidates) >= 2:
+        is_trusted_owner = scope_delta_decision.get("anchor_author_association") == "OWNER"
+        owner_segments = [
+            seg for seg in marked_segments if seg.get("speaker") == anchor_context.SPEAKER_OWNER
+        ]
+
+        if is_trusted_owner and owner_segments:
+            last_owner_segment = owner_segments[-1]
+            latest_owner_turn = {
+                "segment_index": last_owner_segment.get("index"),
+                "source_range": {
+                    "start_line": last_owner_segment.get("start_line"),
+                    "end_line": last_owner_segment.get("end_line"),
+                },
+                # chronology metadata only; not technical_recommendation or
+                # mutation_authorization precedence (#1950 AC1).
+                "note": (
+                    "chronology metadata only -- not technical_recommendation "
+                    "or mutation_authorization precedence"
+                ),
+            }
+
+            original_status = scope_delta_decision.get("status")
+            original_reason = scope_delta_decision.get("reason")
+
+            if original_status == "approved_by_trusted_anchor":
+                # Never overwrite a valid owner approval with `warn` -- the
+                # heavy-mutation gate depends on this status surviving
+                # unchanged.
+                updated = dict(scope_delta_decision)
+                updated["latest_owner_turn"] = latest_owner_turn
+                return updated
+
+            predicates = integrity_predicates or {}
+            integrity_confirmed = (
+                predicates.get("source_fetch_complete") is True
+                and predicates.get("source_hash_verified") is True
+                and predicates.get("source_ranges_covered") is True
+            )
+
+            if (
+                original_status == "fail_closed"
+                and original_reason == "no_anchor_scope_reframe_v1_payload"
+                and integrity_confirmed
+            ):
+                updated = dict(scope_delta_decision)
+                updated["anchor_context_candidate_count"] = len(candidates)
+                updated["anchor_context_marked_segment_count"] = len(marked_segments)
+                updated["implementation_go"] = False
+                updated["status"] = "warn"
+                updated["reason"] = "multi_turn_anchor_context_trusted_owner_advisory"
+                updated["latest_owner_turn"] = latest_owner_turn
+                return updated
+
+            # Any other original status/reason (schema_invalid, wrong_repo,
+            # wrong_issue_number, untrusted_author_association, or
+            # unconfirmed retrieval integrity) is returned unchanged -- the
+            # multi-turn advisory route never masks a distinct integrity
+            # problem.
+            return scope_delta_decision
+
         updated = dict(scope_delta_decision)
-        updated["status"] = "fail_closed"
-        updated["reason"] = "multi_turn_anchor_context_requires_human_judgment"
         updated["anchor_context_candidate_count"] = len(candidates)
         updated["anchor_context_marked_segment_count"] = len(marked_segments)
         updated["implementation_go"] = False
+        updated["status"] = "fail_closed"
+        updated["reason"] = "multi_turn_anchor_context_requires_human_judgment"
         return updated
 
     return scope_delta_decision
@@ -2347,7 +2443,11 @@ def run_preflight(
             # evidence against the live repository even though planner input
             # intentionally omits raw issue URLs.
             _kc["repo"] = repo
-            _kc["anchor_reframe"] = scope_delta_decision["status"] == "approved_by_trusted_anchor"
+            # NOTE(PR #1973 P0-1 fix_delta): anchor_reframe is intentionally
+            # NOT set here from the pre-route `scope_delta_decision`. It is
+            # computed further below, AFTER `_apply_multi_turn_candidate_route()`
+            # runs, from the FINAL routed status -- otherwise it can go stale
+            # / contradict the routed decision (split-brain).
             _kc["anchor_comment_url"] = anchor_url
             _kc["anchor_comment_hash"] = scope_delta_decision.get("anchor_comment_hash", "")
             _kc["scope_delta_decision"] = scope_delta_decision
@@ -2401,8 +2501,20 @@ def run_preflight(
             # ambiguity, using the same _segments_result / _candidates_result
             # this call site just fetched and forwarded above. ---
             _kc["scope_delta_decision"] = _apply_multi_turn_candidate_route(
-                _kc["scope_delta_decision"], _segments_result, _candidates_result
+                _kc["scope_delta_decision"],
+                _segments_result,
+                _candidates_result,
+                integrity_predicates={
+                    "source_fetch_complete": _kc.get("source_fetch_complete"),
+                    "source_hash_verified": _kc.get("source_hash_verified"),
+                    "source_ranges_covered": _kc.get("source_ranges_covered"),
+                },
             )
+
+            # PR #1973 (OWNER REQUEST_CHANGES, P0-1): anchor_reframe is
+            # computed from the FINAL routed status (post-route), so it never
+            # contradicts `_kc["scope_delta_decision"]["status"]`.
+            _kc["anchor_reframe"] = _kc["scope_delta_decision"].get("status") == "approved_by_trusted_anchor"
 
             # --- #1891 iteration 2 (PR #1923 OWNER REQUEST_CHANGES): the
             # multi-turn fail_closed route must actually reach `blockers`
@@ -2730,7 +2842,16 @@ def run_preflight(
         )
 
     # --- Apply exit code mapping (with plan for warn detection, after all blockers finalized) ---
-    status, exit_code = _apply_exit_code_mapping(planner_exit_code, planner_fail_closed, blockers, plan=plan)
+    _scope_delta_decision_for_exit_mapping = (
+        known_context.get("scope_delta_decision") if isinstance(known_context, dict) else None
+    )
+    status, exit_code = _apply_exit_code_mapping(
+        planner_exit_code,
+        planner_fail_closed,
+        blockers,
+        plan=plan,
+        scope_delta_decision=_scope_delta_decision_for_exit_mapping,
+    )
 
     # Determine next_action
     if status == "pass":

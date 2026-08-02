@@ -142,9 +142,34 @@ planner が受け取るのは normalized decision / hash / provenance のみと�
 - `segment`: `# you asked` / `# chatgpt response`（大文字小文字・前後空白差を正規化）マーカーで本文を分節し、各セグメントに `speaker: owner | quoted_assistant | unknown` と `start_line` / `end_line` を付与する。マーカーが存在しない区間の `speaker` は常に `unknown`（`owner` への自動昇格はしない）。
 - `candidates`: `segment` の出力から箇条書き・prose directive 候補を `source_span` 付きで抽出する。各候補は `relation: unclassified` を持ち、単一の `final_candidate` を選択するロジックは持たない。セグメント間の意味関係分類（add/replace/retract/confirm/narrow/conditional/explanation/quotation/unknown）は Out of Scope。
 
-### scope_delta_decision への route（AC4）
+### scope_delta_decision への経路（#1891 AC4 / #1950 AC1）
 
-`run_refinement_preflight.py` の `_apply_multi_turn_candidate_route()` は、`segment` が検出したマーカー付きセグメントが 2 つ以上あり、かつ `candidates` が複数候補を返した場合に限り、`known_context.scope_delta_decision.status` を既存の `fail_closed`（human 判断待ち）に上書きする。単一ターンの通常レビューコメント（マーカーなし）はこの経路の対象外であり、既存の分類結果を維持する。
+`run_refinement_preflight.py` の `_apply_multi_turn_candidate_route()` は、`segment` が検出したマーカー付きセグメントが 2 つ以上あり、かつ `candidates` が複数候補を返した場合に、`known_context.scope_delta_decision` を更新する。単一ターンの通常レビューコメント（マーカーなし）はこの経路の対象外であり、既存の分類結果を維持する。
+
+分岐は anchor comment の投稿者が trusted OWNER（`anchor_author_association == "OWNER"`）かどうかで変わる:
+
+- **trusted OWNER の場合（advisory route）**: `status` を `warn` にし、`reason: multi_turn_anchor_context_trusted_owner_advisory` を設定する。最後の owner-speaker セグメントの `index` / `start_line` / `end_line` は `latest_owner_turn` として **chronology metadata のみ**を記録する。`latest_owner_turn` は `technical_recommendation`（repository facts・diff・test・外部仕様から control-plane が決定する推奨内容）にも `mutation_authorization`（明示的な owner 承認）にも昇格させない。multi-turn であること自体は hard block の理由にならないが、`implementation_go` は `false` のままであり、単独で実装 go を意味しない。
+- **trusted OWNER 以外の場合（hard block を維持）**: 従来通り `status: fail_closed`、`reason: multi_turn_anchor_context_requires_human_judgment` を設定し、blockers へ `ANCHOR_MULTI_TURN_FAIL_CLOSED` を伝搬する。untrusted author、取得不完全、hash 不一致、source range 欠落の fail-closed 不変条件はこの advisory route の対象外であり、緩和されない。
+
+**chronology ≠ semantic relation ≠ technical recommendation ≠ mutation authorization** という 4 軸の分離が本節の前提である。最後の owner turn という chronology の事実だけで、残り 3 軸（そのターンが持つ意味関係・技術推奨・mutation authorization）を決定してはならない。
+
+### 競合（material conflict）発生時の owner reaction 手順（#1950 AC3/AC4）
+
+trusted OWNER の multi-turn anchor で advisory route に入った後、候補間に material conflict（相互に矛盾する複数の重い変更提案）が存在する場合、root control-plane は以下の手順で owner reaction を読み取り、対象 mutation だけを保留する。
+
+1. **選択肢の提示**: controlled comment lane（既存の投稿権限を持つ control-plane 経由）で、最大 3 案の選択肢と推奨案を Issue コメントとして投稿する。各選択肢には reaction mapping を明記する:
+   - `+1`: 選択肢 1（多くは推奨案）を採用
+   - `eyes`: 選択肢 2 を採用
+   - `rocket`: 選択肢 3 を採用（3 案未満の場合は未使用）
+   - `-1`: いずれも採用せず、再提案を要求
+2. **owner reaction の全ページ取得**: 対象コメントの reaction 一覧を pagination で全件取得する。GitHub reaction API は排他的なラジオボタンではなく、reacting user と content を持つレコード一覧であるため、1 principal が複数種類の reaction を残せることを前提にする。
+3. **principal の固定**: 有効な principal は stable user ID（login 文字列ではない）で固定する。repository owner の stable user ID と一致する reaction だけを owner reaction の候補とする。
+4. **drift readback**: 対象 comment / anchor / Issue body を再取得し、選択肢提示時点の snapshot と一致することを確認する。drift が検出された場合は reaction を決定として消費せず、再評価（選択肢の再提示）に戻す。
+5. **untrusted reaction の除外**: repository owner の stable user ID と一致しない reaction（= untrusted reaction）は、どれだけ多くても決定として消費しない。owner 以外の reaction は記録のみで、mutation の可否判断には使わない。
+6. **有効 reaction の一意性判定**: 同一 principal（owner）が複数種類の有効 reaction（例: `+1` と `eyes` の両方）を残している場合、一意に解決できないため unresolved として再評価に戻す。一意な有効 reaction が確認できるまで、disputed heavy mutation（close / not planned / replacement Issue creation / dependency removal / parent-child change）は適用しない。
+7. **保留 mutation の適用**: 一意な有効 owner reaction が確認できた時点で、対応する選択肢の heavy mutation だけを適用する。material conflict と無関係な non-heavy mutation（body improvement 等）は、この手順を待たずに `warn` で継続してよい。
+
+この手順は新規 decision ledger・独立 schema・publisher を追加せず、既存の Issue コメント投稿と GitHub reaction API readback のみで完結させる。
 
 ### known_context の取得完全性フィールド（AC5）
 
