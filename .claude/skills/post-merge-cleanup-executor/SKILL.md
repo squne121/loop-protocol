@@ -10,7 +10,7 @@ mechanical executor procedure。呼び出し元は `.claude/skills/post-merge-cl
 （top-level orchestrator）であり、本 Skill は orchestrator から static dispatch で
 起動された worker の実行本文としてのみ使われる。
 
-## Instruction Boundary（instruction hygiene の境界）
+## Instruction Boundary（本手順が扱う指示衛生の境界線を明確化する）
 
 本 Skill には以下を **一切含めない**（Issue #1733）:
 
@@ -22,7 +22,7 @@ mechanical executor procedure。呼び出し元は `.claude/skills/post-merge-cl
 
 worker がこの手順本文だけを読む限り、role confusion（自分が main-thread orchestrator であるかのような指示の混入）が起きない。
 
-## no-child policy（nested delegation 禁止）
+## no-child policy（子エージェントへの入れ子委譲を完全に禁止する方針）
 
 worker は次のいずれの経路でも子 agent を起動しない:
 
