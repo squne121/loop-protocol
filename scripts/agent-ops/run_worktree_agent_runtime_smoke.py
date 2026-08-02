@@ -395,34 +395,55 @@ def diff_fingerprints(before: dict | None, after: dict | None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def preflight_claude_flags() -> str | None:
+def preflight_claude_available() -> tuple[str | None, str | None]:
+    """Resolve the ``claude`` executable exactly once and return
+    ``(resolved_executable, skip_reason)``.
+
+    Issue #1960: capability (which flags a given Claude Code version
+    accepts) is no longer decided from ``claude --help`` text. The CLI
+    reference explicitly documents that ``--help`` output is
+    human-oriented and non-exhaustive, and help omission of a flag does
+    not mean the flag is unsupported (``--max-turns`` was observed missing
+    from ``--help`` in Claude Code 2.1.220 while still being a documented,
+    accepted print-mode flag). Capability is now decided from the actual
+    fixed-argv invocation result (see
+    ``classify_claude_structured_outcome``), which applies to the
+    structured lane only. The interactive lane does not depend on this
+    check's flag list at all -- it only needs the binary to exist so
+    ``herdr agent start --kind claude`` has something to launch.
+
+    Issue #1960 Design Decision 5 (P1-2 fix-delta): the executable is
+    resolved to a single absolute path here, once, via ``shutil.which()``.
+    Callers must thread this same resolved path through both version
+    capture (``capture_runtime_version``) and structured-lane execution
+    (``run_structured_claude``) instead of independently re-resolving
+    ``"claude"`` by name in each place, which risks a different binary
+    being used for version-capture vs. execution if PATH/shims/symlinks
+    change mid-run.
+    """
     exe = shutil.which("claude")
     if exe is None:
-        return "required command not found: claude"
-    rc, out, err, timed_out = _run([exe, "--help"], timeout=20.0)
-    if timed_out or rc != 0:
-        return "unable to introspect claude --help capability"
-    text = out + err
-    required = ["--output-format", "--include-hook-events", "--no-session-persistence", "--max-turns"]
-    missing = [flag for flag in required if flag not in text]
-    if missing:
-        return f"claude CLI missing required structured-lane flags: {missing}"
-    return None
+        return None, "required command not found: claude"
+    return os.path.realpath(exe), None
 
 
-def preflight_codex_flags() -> str | None:
+def preflight_codex_flags() -> tuple[str | None, str | None]:
+    """Resolve the ``codex`` executable exactly once and return
+    ``(resolved_executable, skip_reason)`` (Issue #1960 Design Decision 5,
+    P1-2 fix-delta -- see ``preflight_claude_available`` docstring)."""
     exe = shutil.which("codex")
     if exe is None:
-        return "required command not found: codex"
-    rc, out, err, timed_out = _run([exe, "exec", "--help"], timeout=20.0)
+        return None, "required command not found: codex"
+    resolved = os.path.realpath(exe)
+    rc, out, err, timed_out = _run([resolved, "exec", "--help"], timeout=20.0)
     if timed_out or rc != 0:
-        return "unable to introspect codex exec --help capability"
+        return resolved, "unable to introspect codex exec --help capability"
     text = out + err
     required = ["--json", "--ephemeral", "-C"]
     missing = [flag for flag in required if flag not in text]
     if missing:
-        return f"codex CLI missing required structured-lane flags: {missing}"
-    return None
+        return resolved, f"codex CLI missing required structured-lane flags: {missing}"
+    return resolved, None
 
 
 def preflight_herdr() -> str | None:
@@ -501,6 +522,126 @@ def parse_native_event_count(stdout: str) -> int:
             continue
         count += 1
     return count
+
+
+# Issue #1960: capability classification is now derived from the actual
+# fixed-argv invocation result, not from ``claude --help`` text. Only a
+# narrowly-matched, known parser-level "unknown/unrecognized option"
+# diagnostic is treated as a capability gap (Design Decision #4 -- "任意の
+# non-zero exit を capability 不足として扱わない"). Any other non-zero exit
+# (auth failure, network failure, model failure, generic runtime error)
+# falls through to the existing FAIL classification unchanged (AC3).
+#
+# Issue #1960 P1-3 fix-delta (owner REQUEST_CHANGES, PR #1976 review): text
+# -based classification is now restricted to ``stderr`` only. ``stdout`` is
+# Claude's native ``stream-json`` event stream, which can carry assistant-
+# message / tool-output prose containing the literal words "unknown option"
+# or "Reached max turns" without those words meaning anything about this
+# invocation's own argv handling -- searching ``stdout`` for either pattern
+# risked misclassifying a model that merely talks about these phrases (or a
+# quoted tool-output artifact) as a capability SKIP or a turn-limit FAIL.
+
+# ``Reached max turns`` (or equivalent phrasing), observed on the runtime's
+# own diagnostic channel (stderr), is evidence the flag WAS recognized and
+# honored -- it must never be classified as a capability SKIP (AC4). It is a
+# bounded-turn runtime failure (FAIL 1).
+_CLAUDE_MAX_TURNS_REACHED_RE = re.compile(
+    r"reached max turns|max turns reached|max[_ ]turns limit|turn limit reached",
+    re.IGNORECASE,
+)
+
+# This runner's own fixed-argv flags (see ``run_structured_claude``). A
+# parser-error line is only trusted as evidence of *this* runner's flag
+# being rejected if it explicitly names one of these -- a diagnostic about
+# some unrelated flag must never be misclassified as this runner's flags
+# being unsupported.
+_CLAUDE_FIXED_ARGV_FLAGS = (
+    "--max-turns",
+    "--output-format",
+    "--include-hook-events",
+    "--no-session-persistence",
+)
+
+# Anchored to look like an actual CLI parser error line -- ``error:``
+# (case-insensitive) near the start of the line, optionally prefixed by a
+# short program/log-level tag, immediately followed on the same line by an
+# "unknown/unrecognized option|argument" or "not recognized as a valid
+# option|argument" phrase. This is deliberately NOT a loose substring match
+# anywhere in arbitrary text (Issue #1960 P1-3 fix-delta).
+_CLAUDE_PARSER_ERROR_LINE_RE = re.compile(
+    r"^\s*(?:[\w.\-]{0,40}:\s*)?error:.*?(?:unknown|unrecognized)\s+(?:option|argument)|"
+    r"^\s*(?:[\w.\-]{0,40}:\s*)?error:.*?not\s+recognized\s+as\s+a\s+valid\s+(?:option|argument)",
+    re.IGNORECASE,
+)
+
+
+def _is_json_object_line(line: str) -> bool:
+    line = line.strip()
+    if not line:
+        return False
+    try:
+        payload = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(payload, dict)
+
+
+def _claude_parser_rejection_reason(stderr: str) -> str | None:
+    """Return the matched diagnostic line if ``stderr`` contains a narrow,
+    parser-level "unknown/unrecognized option" rejection that explicitly
+    names one of this runner's own fixed-argv flags, else ``None`` (Issue
+    #1960 P1-3 fix-delta)."""
+    for line in stderr.splitlines():
+        if not _CLAUDE_PARSER_ERROR_LINE_RE.search(line):
+            continue
+        for flag in _CLAUDE_FIXED_ARGV_FLAGS:
+            if flag in line:
+                return line.strip()[:300]
+    return None
+
+
+def classify_claude_structured_outcome(
+    rc: int | None, stdout: str, stderr: str, timed_out: bool
+) -> tuple[str, str | None]:
+    """Classify a completed (or errored) structured Claude invocation.
+
+    Returns ``(decision, reason)``:
+
+    - ``"capability_skip"``: ``stderr`` carries a known, narrowly-matched
+      parser-level unknown/unrecognized-option diagnostic naming one of
+      this runner's own fixed-argv flags, AND no valid JSON stream-json
+      event was observed in ``stdout`` (a genuine parser-level rejection
+      happens before the runtime ever emits a stream-json event; observing
+      one is evidence the runtime actually started executing, not that
+      argv was rejected) (SKIP 77, Design Decision #4 -- narrow
+      classification only).
+    - ``"turn_limit_reached"``: ``stderr`` reports the ``--max-turns``
+      bound was reached (the flag was accepted); this is a runtime
+      failure, not a capability gap (FAIL 1, AC4).
+    - ``"runtime_outcome"``: none of the above matched; the existing
+      exit-code / terminal-event based judgement applies unchanged (AC3).
+
+    ``reason`` is a short, redaction-safe human string recorded as
+    ``capability_error_classification`` evidence, or ``None`` for
+    ``"runtime_outcome"``.
+    """
+    if timed_out or rc is None:
+        return "runtime_outcome", None
+    if _CLAUDE_MAX_TURNS_REACHED_RE.search(stderr):
+        return "turn_limit_reached", "max turns limit reached (flag accepted; not a capability gap)"
+    if rc != 0:
+        observed_valid_json_event = any(
+            _is_json_object_line(line) for line in stdout.splitlines()
+        )
+        if not observed_valid_json_event:
+            reason_line = _claude_parser_rejection_reason(stderr)
+            if reason_line:
+                return (
+                    "capability_skip",
+                    "claude runtime rejected a fixed-argv flag as unknown/unrecognized "
+                    f"option (exit {rc}): {reason_line}",
+                )
+    return "runtime_outcome", None
 
 
 def has_terminal_event(runtime: str, stdout: str) -> bool:
@@ -902,7 +1043,6 @@ def run_interactive_herdr_isolated(
     evidence: dict,
     *,
     herdr_bin: str = "herdr",
-    max_turns: int | None = None,
 ) -> list[str]:
     """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
     in place (so cleanup/session identity survive even if this raises) and
@@ -946,9 +1086,16 @@ def run_interactive_herdr_isolated(
             raise HerdrLaneError("could not parse pane_id from herdr workspace create output")
         evidence["pane_id"] = pane_id
 
+        # Issue #1960 AC5: the interactive lane never forwards
+        # structured-only flags (``--output-format`` / ``--include-hook-events``
+        # / ``--no-session-persistence`` / ``--max-turns``) to the TUI
+        # launch. Bounded execution for this lane comes from herdr's own
+        # wait timeout, process termination, and isolated-session
+        # stop/delete/removal confirmation (see Outcome / Interactive lane
+        # in Issue #1960) -- not from a structured-lane print-mode flag
+        # that has not been separately confirmed to be honored by an
+        # interactive Claude Code launch.
         agent_extra_args: list[str] = []
-        if runtime == "claude" and max_turns:
-            agent_extra_args = ["--", "--max-turns", str(max_turns)]
 
         # A freshly created workspace's shell may not be an "available shell"
         # yet (still initializing). Retry ``agent start`` with a bounded,
@@ -1142,6 +1289,20 @@ def count_session_log_metadata(raw_lines: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _positive_int(value: str) -> int:
+    """argparse ``type`` for ``--max-turns`` (Issue #1960 AC6): only accepts
+    integers >= 1. ``0`` and negative values are rejected as an argument
+    error (argparse ``error()`` -> exit code 2), not silently clamped or
+    accepted."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--max-turns must be a positive integer, got: {value!r}") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"--max-turns must be a positive integer, got: {parsed}")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="worktree-agent-runtime-smoke runner")
     parser.add_argument("--runtime", choices=["claude", "codex"], required=True)
@@ -1150,8 +1311,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-file", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=180)
-    parser.add_argument("--max-turns", type=int, default=_DEFAULT_MAX_TURNS,
-                         help="bounded turn count for Claude Code (structured and interactive lanes)")
+    parser.add_argument("--max-turns", type=_positive_int, default=_DEFAULT_MAX_TURNS,
+                         help="bounded turn count for Claude Code (structured lane only; positive integer)")
     parser.add_argument("--expect-marker", action="append", default=[])
     parser.add_argument("--require-clean-postcondition", action="store_true")
     parser.add_argument("--inspect-session-log-metadata", action="store_true")
@@ -1220,27 +1381,51 @@ def main(argv: list[str] | None = None) -> int:
 
     # Cheap, environment-independent checks (output directory exclusivity)
     # run before any capability/herdr preflight so they fail fast regardless
-    # of whether claude/codex/herdr happen to be installed.
+    # of whether claude/codex/herdr happen to be installed. This check
+    # itself cannot emit summary.md evidence (its very failure is that
+    # output_dir is unusable to write into), so it remains an early return.
     dir_error = prepare_output_dir(output_dir)
     if dir_error:
         print(f"[FAIL] {dir_error}", file=sys.stderr)
         return EXIT_FAIL
 
+    # From this point on, worktree/prompt/output_dir are all confirmed
+    # usable, so EVERY controlled exit below -- including the
+    # capability/herdr preflight SKIPs -- must emit allowlist-only
+    # summary.md evidence (Issue #1960 AC7 P1-1 fix-delta: prior to this
+    # fix, ``preflight_herdr`` / ``preflight_claude_available`` /
+    # ``preflight_codex_flags`` failures each did an early ``return
+    # EXIT_SKIP`` before ``schema_summary`` was ever constructed, so those
+    # three controlled SKIP 77 paths silently produced no summary.md at
+    # all). There is no further early ``return`` below this line; every
+    # path falls through to the single ``write_evidence`` call at the
+    # bottom of this function.
+    exit_code = EXIT_OK
+    resolved_runtime_bin: str | None = None
+
     if args.mode == "interactive":
         skip_reason = preflight_herdr()
         if skip_reason:
-            print(f"SKIP: {skip_reason}", file=sys.stderr)
-            return EXIT_SKIP
+            errors.append(skip_reason)
+            exit_code = EXIT_SKIP
 
-    if args.runtime == "claude":
-        skip_reason = preflight_claude_flags()
-    else:
-        skip_reason = preflight_codex_flags()
-    if skip_reason:
-        print(f"SKIP: {skip_reason}", file=sys.stderr)
-        return EXIT_SKIP
-
-    exit_code = EXIT_OK
+    if exit_code == EXIT_OK:
+        # Issue #1960 Design Decision 5 (P1-2 fix-delta): resolve the
+        # runtime executable exactly ONCE here via ``shutil.which()``
+        # (inside ``preflight_claude_available`` / ``preflight_codex_flags``)
+        # and thread that same absolute path through version capture and
+        # structured-lane execution below, instead of independently
+        # re-resolving "claude"/"codex" by name in each place. Structured
+        # -lane flag capability itself is still decided from the actual
+        # fixed-argv invocation result (classify_claude_structured_outcome),
+        # never from ``claude --help`` text (AC1/AC5).
+        if args.runtime == "claude":
+            resolved_runtime_bin, skip_reason = preflight_claude_available()
+        else:
+            resolved_runtime_bin, skip_reason = preflight_codex_flags()
+        if skip_reason:
+            errors.append(skip_reason)
+            exit_code = EXIT_SKIP
 
     # Structured telemetry fields that are trivially and deterministically
     # derivable up front (Issue #1733 Scope Delta, 2026-08-02 owner-approved
@@ -1248,8 +1433,7 @@ def main(argv: list[str] | None = None) -> int:
     # ``prompt_sha256`` are captured once at run start; ``loaded_skills`` is a
     # static frontmatter fact independent of the run itself.
     tested_head = _git_rev_parse(worktree, "HEAD")
-    runtime_bin = "claude" if args.runtime == "claude" else "codex"
-    runtime_version = capture_runtime_version(runtime_bin)
+    runtime_version = capture_runtime_version(resolved_runtime_bin) if resolved_runtime_bin else None
     requested_agent_type = args.agent_type
     # No independent runtime signal of "which persona was effectively
     # active" was found beyond what was requested: neither Claude Code's
@@ -1273,29 +1457,71 @@ def main(argv: list[str] | None = None) -> int:
         "timeout_seconds": args.timeout_seconds,
         "tested_head": tested_head,
         "runtime_version": runtime_version,
+        "resolved_executable": resolved_runtime_bin,
         "requested_agent_type": requested_agent_type,
         "effective_agent_type": effective_agent_type,
         "loaded_skills": loaded_skills,
         "loaded_skills_source": "static_frontmatter" if loaded_skills is not None else None,
         "prompt_sha256": prompt_sha256,
     }
+    if args.mode == "interactive":
+        # Issue #1960 Design Decision 5 (P1-2 fix-delta): the interactive
+        # lane launches via ``herdr agent start --kind <runtime>``, which
+        # resolves the runtime binary through herdr's own PATH lookup
+        # rather than accepting an explicit binary path from this runner.
+        # The preflight-resolved absolute path above is therefore not
+        # passed through to herdr, and exact-binary identity between this
+        # preflight resolution and the process herdr actually launches is
+        # not independently confirmed for this lane -- an honest,
+        # documented constraint rather than a silently omitted guarantee.
+        schema_summary["resolved_executable_binding_note"] = (
+            "interactive lane launches via `herdr agent start --kind "
+            "<runtime>`, which re-resolves the binary via herdr's own PATH "
+            "lookup; resolved_executable above (from this runner's own "
+            "preflight) is not passed through explicitly, so exact-binary "
+            "identity is not independently confirmed for this lane."
+        )
 
-    before_fp = repo_fingerprint(worktree, output_dir_rel) if args.require_clean_postcondition else None
+    before_fp = (
+        repo_fingerprint(worktree, output_dir_rel)
+        if args.require_clean_postcondition and exit_code == EXIT_OK
+        else None
+    )
 
     try:
-        if args.mode == "structured":
+        if exit_code != EXIT_OK:
+            # A capability/herdr preflight above already decided this run is
+            # a controlled SKIP -- do not attempt to launch either lane.
+            # Evidence (schema_summary as built so far, including
+            # resolved_executable and the SKIP reason already appended to
+            # ``errors``) is still written unconditionally below (Issue
+            # #1960 AC7 P1-1 fix-delta).
+            pass
+        elif args.mode == "structured":
             if args.runtime == "claude":
                 rc, out, err, timed_out = run_structured_claude(
                     worktree, prompt, float(args.timeout_seconds), args.max_turns,
+                    claude_bin=resolved_runtime_bin,
                     claude_agent_name=args.claude_agent_name,
                 )
+                capability_decision, capability_reason = classify_claude_structured_outcome(
+                    rc, out, err, timed_out
+                )
             else:
-                rc, out, err, timed_out = run_structured_codex(worktree, prompt, float(args.timeout_seconds))
+                rc, out, err, timed_out = run_structured_codex(
+                    worktree, prompt, float(args.timeout_seconds), codex_bin=resolved_runtime_bin
+                )
+                # Codex CLI capability preflight (help-based) is out of scope
+                # for Issue #1960 -- see Out of Scope: "Codex CLI lane の
+                # capability preflight 見直しは本 Issue の対象外".
+                capability_decision, capability_reason = "runtime_outcome", None
 
             event_count = parse_native_event_count(out)
             schema_summary["process_exit_code"] = rc
             schema_summary["timed_out"] = timed_out
             schema_summary["native_event_count"] = event_count
+            schema_summary["capability_decision"] = capability_decision
+            schema_summary["capability_error_classification"] = capability_reason
 
             if args.runtime == "claude":
                 spawn_events, self_restart_count, orchestration_count = classify_claude_events(out)
@@ -1306,11 +1532,23 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["self_restart_event_count"] = self_restart_count
             schema_summary["orchestration_action_count"] = orchestration_count
 
-            if timed_out:
+            if capability_decision == "capability_skip":
+                # AC2: a known unknown/unrecognized-option parser diagnostic
+                # -- SKIP 77, never promoted to FAIL. summary.md (written
+                # unconditionally below) records runtime_version and
+                # capability_error_classification as evidence.
+                errors.append(capability_reason)
+                exit_code = EXIT_SKIP
+            elif timed_out:
                 errors.append("structured lane timed out")
                 exit_code = EXIT_FAIL
             elif rc is None:
                 errors.append(f"structured lane failed to start: {_redact(err[:500])}")
+                exit_code = EXIT_FAIL
+            elif capability_decision == "turn_limit_reached":
+                # AC4: the flag was accepted (evidence of capability); this
+                # is a bounded-turn runtime failure, not a capability SKIP.
+                errors.append(capability_reason)
                 exit_code = EXIT_FAIL
             elif rc != 0:
                 errors.append(f"structured lane exited non-zero: {rc}: {_redact(err[:500])}")
@@ -1349,7 +1587,6 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
-                    max_turns=args.max_turns if args.runtime == "claude" else None,
                 )
 
                 if evidence.get("final_state") == "blocked":
