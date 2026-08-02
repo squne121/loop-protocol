@@ -10,14 +10,16 @@
     "generated_at": {"type": "string", "format": "date-time"},
     "runner": {
       "type": "object", "additionalProperties": false,
-      "required": ["identity", "exit_code", "actual_agy_executed", "executable_ref", "executable_version", "binary_digest", "artifact_digest"],
+      "required": ["identity", "exit_code", "actual_agy_executed", "identity_verified", "executable_ref", "executable_version", "binary_digest", "child_returncode", "artifact_digest"],
       "properties": {
         "identity": {"const": "run_agy_permission_boundary_e2e"},
         "exit_code": {"enum": [0, 1, 77]},
         "actual_agy_executed": {"type": "boolean"},
+        "identity_verified": {"type": "boolean"},
         "executable_ref": {"type": "string", "pattern": "^[^/]+$"},
         "executable_version": {"type": "string", "minLength": 1},
         "binary_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "child_returncode": {"type": ["integer", "null"]},
         "artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
       }
     },
@@ -31,10 +33,10 @@
       "required": ["profile", "capabilities"],
       "properties": {
         "profile": {"type": "string"},
-        "capabilities": {"type": "array", "items": {"enum": ["command", "write", "read", "network", "mcp"]}}
+        "capabilities": {"type": "array", "minItems": 5, "uniqueItems": true, "items": {"enum": ["command", "write", "read", "network", "mcp"]}}
       }
     },
-    "attempts": {"type": "array", "items": {"$ref": "#/$defs/attempt"}},
+    "attempts": {"type": "array", "minItems": 5, "items": {"$ref": "#/$defs/attempt"}},
     "fallback": {"type": "object", "additionalProperties": false, "required": ["used"], "properties": {"used": {"const": false}}},
     "failure_taxonomy": {
       "type": "object", "additionalProperties": false,
@@ -53,8 +55,31 @@
       "type": "object", "additionalProperties": false,
       "required": ["correlation", "predicates"],
       "properties": {
-        "correlation": {"type": "object", "additionalProperties": {"type": ["string", "integer"]}},
-        "predicates": {"type": "object", "additionalProperties": {"type": "boolean"}}
+        "correlation": {
+          "type": "object", "additionalProperties": false,
+          "required": ["run_id", "conversation_id", "step_index", "tool_name", "args_digest", "profile", "capability", "canary_id"],
+          "properties": {
+            "run_id": {"type": "string", "minLength": 1, "description": "Recorded by the parent runner."},
+            "conversation_id": {"type": "string", "const": "parent-observed", "description": "Parent-observation marker; no child-supplied conversation identifier is persisted."},
+            "step_index": {"type": "integer", "minimum": 0},
+            "tool_name": {"type": "string", "minLength": 1},
+            "args_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "profile": {"type": "string", "minLength": 1},
+            "capability": {"enum": ["command", "write", "read", "network", "mcp"]},
+            "canary_id": {"type": "string", "minLength": 1}
+          }
+        },
+        "predicates": {
+          "type": "object", "additionalProperties": false,
+          "required": ["deterministic_attempt_present", "pre_tool_use_present", "explicit_deny", "post_tool_use_absent", "side_effect_invariant"],
+          "properties": {
+            "deterministic_attempt_present": {"type": "boolean"},
+            "pre_tool_use_present": {"type": "boolean"},
+            "explicit_deny": {"type": "boolean"},
+            "post_tool_use_absent": {"type": "boolean"},
+            "side_effect_invariant": {"type": "boolean"}
+          }
+        }
       }
     }
   }

@@ -137,9 +137,7 @@ def test_tool_permission_injection_never_reuses_real_host_settings(
     try:
         content_text = workspace.agy_tool_permission_settings_path.read_text(encoding="utf-8")
         assert "/should/never/leak" not in content_text
-        assert json.loads(content_text) == app.build_official_agy_settings(
-            app.GROUNDED_RESEARCH_PROFILE
-        )
+        assert json.loads(content_text) == app.build_official_agy_settings(app.GROUNDED_RESEARCH_PROFILE)
         assert str(fake_real_home) not in workspace.env.get("HOME", "")
     finally:
         import shutil

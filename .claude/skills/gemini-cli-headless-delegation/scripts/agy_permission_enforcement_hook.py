@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Independent, fail-closed AGY ``PreToolUse`` enforcement hook.
 
-The hook accepts only the official camelCase event payload on stdin.  Profile,
-policy and run bindings are read from a private, immutable run-context file;
-stdin is never an authority source.  The provenance hook remains observe-only
-and is intentionally not imported here.
+The hook accepts only the official camelCase event payload on stdin. Profile,
+policy and run bindings are read from runner-local context; stdin never selects
+the profile. File modes are local fail-closed guardrails, not an immutable
+authority boundary or a secrecy guarantee. The parent runner alone constructs
+and persists attempt correlation. The provenance hook remains observe-only and
+is intentionally not imported here.
 """
 
 from __future__ import annotations
@@ -34,9 +36,7 @@ CANONICAL_PERMISSION_RESOURCES: frozenset[str] = frozenset(
         "mcp",
     }
 )
-ALLOWED_PROFILES: frozenset[str] = frozenset(
-    {"no_tools", "local_asset_research", "grounded_research", "proposal_only"}
-)
+ALLOWED_PROFILES: frozenset[str] = frozenset({"no_tools", "local_asset_research", "grounded_research", "proposal_only"})
 
 # Native hook tool names are not official permission resources.  Unknown
 # dispatchers deny; the map stays deliberately small until live evidence can
@@ -49,6 +49,7 @@ NATIVE_TO_RESOURCE: dict[str, str] = {
     "multi_replace_file_content": "write_file",
     "search_web": "read_url",
     "read_url_content": "read_url",
+    "mcp_call": "mcp",
 }
 
 
@@ -66,15 +67,15 @@ def _canonical_digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _is_private_immutable_file(path: Path) -> bool:
-    """Require a regular same-user file that is not writable by group/other."""
+def _is_private_readonly_file(path: Path) -> bool:
+    """Apply a local fail-closed mode check; this is not a security boundary."""
     try:
         file_stat = path.lstat()
     except OSError:
         return False
     if not stat.S_ISREG(file_stat.st_mode) or stat.S_ISLNK(file_stat.st_mode):
         return False
-    if file_stat.st_uid != os.getuid() or file_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    if file_stat.st_uid != os.getuid() or file_stat.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
         return False
     return True
 
@@ -83,7 +84,7 @@ def _read_private_json(path_value: Any) -> tuple[dict[str, Any] | None, str | No
     if not isinstance(path_value, str) or not path_value:
         return None, "context_load_failure"
     path = Path(path_value)
-    if not _is_private_immutable_file(path):
+    if not _is_private_readonly_file(path):
         return None, "context_load_failure"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -102,7 +103,6 @@ def _load_context() -> tuple[dict[str, Any] | None, str | None]:
         return None, "context_load_failure"
     required_strings = (
         "run_id",
-        "conversation_id",
         "workspace",
         "tool_profile",
         "policy_path",
@@ -113,9 +113,6 @@ def _load_context() -> tuple[dict[str, Any] | None, str | None]:
         return None, "context_load_failure"
     if context["tool_profile"] not in ALLOWED_PROFILES:
         return None, "context_load_failure"
-    invocation = context.get("invocation_number")
-    if not isinstance(invocation, int) or isinstance(invocation, bool) or invocation < 0:
-        return None, "context_load_failure"
     return context, None
 
 
@@ -124,7 +121,7 @@ def _load_policy(context: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str
     if not isinstance(path_value, str) or not path_value:
         return None, "policy_load_failure"
     path = Path(path_value)
-    if not _is_private_immutable_file(path):
+    if not _is_private_readonly_file(path):
         return None, "policy_load_failure"
     try:
         raw = path.read_bytes()
@@ -142,8 +139,7 @@ def _load_policy(context: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str
     for key in ("allowed_resources", "denied_resources"):
         resources = policy.get(key)
         if not isinstance(resources, list) or not all(
-            isinstance(resource, str) and resource in CANONICAL_PERMISSION_RESOURCES
-            for resource in resources
+            isinstance(resource, str) and resource in CANONICAL_PERMISSION_RESOURCES for resource in resources
         ):
             return None, "policy_load_failure"
     return policy, None
@@ -181,26 +177,16 @@ def _parse_payload(payload: Any) -> tuple[dict[str, Any] | None, str | None]:
     }, None
 
 
-def _event(
-    *, context: Mapping[str, Any], payload: Mapping[str, Any], resource: str, decision: str, reason: str
-) -> dict[str, Any]:
+def _event(*, payload: Mapping[str, Any], resource: str, decision: str, reason: str) -> dict[str, Any]:
     """Build a secret-safe record: no raw args, paths, prompt or payload."""
     event = {
         "schema": "agy_permission_boundary_hook/v1",
         "decision": decision,
         "reason": _reason(reason),
-        "run_id": context["run_id"],
-        "conversation_id": payload["conversation_id"],
-        "invocation_number": context["invocation_number"],
-        "step_index": payload["step_index"],
         "tool_name": payload["tool_name"],
         "resource": resource,
-        "tool_profile": context["tool_profile"],
         "args_digest": payload["args_digest"],
     }
-    canary_id = context.get("canary_id")
-    if isinstance(canary_id, str) and canary_id:
-        event["canary_id"] = canary_id
     return event
 
 
@@ -225,27 +211,35 @@ def _evaluate(payload: Any) -> tuple[dict[str, str], dict[str, Any] | None, dict
     parsed, payload_error = _parse_payload(payload)
     if payload_error or parsed is None:
         return _decision(payload_error or "malformed_payload"), context, None
-    if parsed["conversation_id"] != context["conversation_id"]:
-        return _decision("conversation_mismatch"), context, _event(
-            context=context, payload=parsed, resource="", decision=DECISION_DENY, reason="conversation_mismatch"
-        )
     if context["workspace"] not in parsed["workspace_paths"]:
-        return _decision("workspace_binding_mismatch"), context, _event(
-            context=context, payload=parsed, resource="", decision=DECISION_DENY, reason="workspace_binding_mismatch"
+        return (
+            _decision("workspace_binding_mismatch"),
+            context,
+            _event(
+                payload=parsed,
+                resource="",
+                decision=DECISION_DENY,
+                reason="workspace_binding_mismatch",
+            ),
         )
     policy, policy_error = _load_policy(context)
     if policy_error or policy is None:
-        return _decision(policy_error or "policy_load_failure"), context, _event(
-            context=context,
-            payload=parsed,
-            resource="",
-            decision=DECISION_DENY,
-            reason=policy_error or "policy_load_failure",
+        return (
+            _decision(policy_error or "policy_load_failure"),
+            context,
+            _event(
+                payload=parsed,
+                resource="",
+                decision=DECISION_DENY,
+                reason=policy_error or "policy_load_failure",
+            ),
         )
     resource = NATIVE_TO_RESOURCE.get(parsed["tool_name"])
     if resource is None:
-        return _decision("unknown_native_tool"), context, _event(
-            context=context, payload=parsed, resource="", decision=DECISION_DENY, reason="unknown_native_tool"
+        return (
+            _decision("unknown_native_tool"),
+            context,
+            _event(payload=parsed, resource="", decision=DECISION_DENY, reason="unknown_native_tool"),
         )
     denied = set(policy["denied_resources"])
     allowed = set(policy["allowed_resources"])
@@ -255,8 +249,10 @@ def _evaluate(payload: Any) -> tuple[dict[str, str], dict[str, Any] | None, dict
         decision, reason = DECISION_ALLOW, "policy_allow"
     else:
         decision, reason = DECISION_DENY, "policy_default_deny"
-    return {"decision": decision, "reason": _reason(reason)}, context, _event(
-        context=context, payload=parsed, resource=resource, decision=decision, reason=reason
+    return (
+        {"decision": decision, "reason": _reason(reason)},
+        context,
+        _event(payload=parsed, resource=resource, decision=decision, reason=reason),
     )
 
 

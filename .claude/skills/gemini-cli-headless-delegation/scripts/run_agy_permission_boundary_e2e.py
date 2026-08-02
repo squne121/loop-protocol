@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Run the AGY permission-boundary evidence harness.
+"""Produce fail-closed, secret-safe AGY permission-boundary evidence.
 
-The hermetic lane only accepts an explicit fake executable.  The live lane is
-opt-in and refuses to start unless its caller has separately established that
-the existing session can be used without an additional charge.  Neither lane
-uses model text as evidence: the verdict is derived solely from the structured
-event file and the secret-safe artifact written by this program.
+The runner's parent process observes canary sentinels directly.  Child output
+and synthetic ``side_effects`` events are never verdict input.  The hermetic
+lane proves hook dispatch only; it can never manufacture live completion.
 """
 
 from __future__ import annotations
@@ -27,20 +25,43 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from jsonschema import Draft202012Validator
+
 EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_UNAVAILABLE = 77
 SCHEMA = "agy_permission_boundary_e2e/v1"
 FAILURE_UNAVAILABLE = "agy_permission_boundary_unavailable"
 FAILURE_INCONCLUSIVE = "agy_permission_boundary_inconclusive"
+FAILURE_INVALID_IDENTITY = "agy_permission_boundary_invalid_live_identity"
 CAPABILITIES = ("command", "write", "read", "network", "mcp")
 CANARY_SECRET = "agy-boundary-canary-secret"
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+_AUTH_FAILURE = re.compile(
+    r"(?:auth(?:entication)?(?:[ _-]?required|[ _-]?failed)?|unauthori[sz]ed|login|required credential)", re.I
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = SCRIPT_DIR.parent / "schemas" / "agy_permission_boundary_e2e_v1.schema.json"
 HOOK_PATH = SCRIPT_DIR / "agy_permission_enforcement_hook.py"
 POLICY_PATH = SCRIPT_DIR / "agy_permission_policy.py"
+
+ATTEMPT_SPECS = {
+    "command": ("run_command", "command"),
+    "write": ("write_to_file", "write_file"),
+    "read": ("view_file", "read_file"),
+    "network": ("search_web", "read_url"),
+    "mcp": ("mcp_call", "mcp"),
+}
+PREDICATE_KEYS = frozenset(
+    {
+        "deterministic_attempt_present",
+        "pre_tool_use_present",
+        "explicit_deny",
+        "post_tool_use_absent",
+        "side_effect_invariant",
+    }
+)
 
 
 def _load_policy_module() -> Any:
@@ -65,17 +86,36 @@ def _file_digest(path: Path) -> str:
     return _sha256(path.read_bytes())
 
 
-def _write_private_json(path: Path, value: Mapping[str, Any]) -> None:
-    path.write_bytes(_canonical_json(value))
-    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+def _write_private_json(path: Path, value: Mapping[str, Any], *, mode: int) -> None:
+    """Atomically write and read back runner-local configuration.
+
+    The mode check is a local fail-closed guardrail only. It is not an
+    immutable authority boundary or a secrecy guarantee against the child.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = _canonical_json(value)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, mode)
+        observed = temporary.read_bytes()
+        if observed != encoded or stat.S_IMODE(temporary.stat().st_mode) != mode:
+            raise RuntimeError("private_json_readback_failed")
+        os.replace(temporary, path)
+        if path.read_bytes() != encoded or stat.S_IMODE(path.stat().st_mode) != mode:
+            raise RuntimeError("private_json_final_readback_failed")
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _artifact_digest(artifact: Mapping[str, Any]) -> str:
-    """Digest canonical payload with both digest copies excluded from input.
-
-    ``runner.artifact_digest`` is a redundant convenience field; excluding it
-    as well as ``artifact.digest`` prevents a self-referential hash contract.
-    """
     payload = copy.deepcopy(artifact)
     payload["artifact"]["digest"] = None
     payload["runner"]["artifact_digest"] = None
@@ -87,250 +127,102 @@ def _contains_forbidden(value: Any, forbidden: tuple[str, ...]) -> bool:
     return any(token and token in encoded for token in forbidden)
 
 
+def _schema_errors(artifact: Mapping[str, Any]) -> list[Any]:
+    try:
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ["schema_load_failed"]
+    return list(Draft202012Validator(schema).iter_errors(artifact))
+
+
 def validate_artifact(artifact: Mapping[str, Any], *, forbidden: tuple[str, ...] = ()) -> tuple[bool, str]:
-    """Validate the v1 invariant surface without treating stdout as evidence."""
-    if not isinstance(artifact, Mapping) or artifact.get("schema") != SCHEMA:
-        return False, "schema_invalid"
-    required = {
-        "schema", "generated_at", "runner", "artifact", "matrix", "attempts", "fallback",
-        "failure_taxonomy", "cleanup", "secret_scan",
-    }
-    if set(artifact) != required:
-        return False, "schema_keys_invalid"
-    runner = artifact.get("runner")
-    stored = artifact.get("artifact")
-    if not isinstance(runner, Mapping) or not isinstance(stored, Mapping):
-        return False, "schema_runner_invalid"
-    runner_required = {
-        "identity", "exit_code", "actual_agy_executed", "executable_ref", "executable_version",
-        "binary_digest", "artifact_digest",
-    }
-    if set(runner) != runner_required or runner.get("exit_code") not in {0, 1, 77}:
-        return False, "schema_runner_invalid"
-    if not isinstance(runner.get("actual_agy_executed"), bool):
-        return False, "schema_runner_invalid"
-    if not isinstance(runner.get("executable_ref"), str) or "/" in runner["executable_ref"]:
-        return False, "executable_reference_invalid"
-    if not isinstance(runner.get("executable_version"), str):
-        return False, "schema_runner_invalid"
-    if not _SHA256.fullmatch(str(runner.get("binary_digest"))) or not _SHA256.fullmatch(
-        str(runner.get("artifact_digest"))
-    ):
-        return False, "digest_invalid"
-    if set(stored) != {"digest"} or stored.get("digest") != runner.get("artifact_digest"):
-        return False, "artifact_digest_invalid"
-    if stored["digest"] != _artifact_digest(artifact):
+    """Use Draft 2020-12 plus cross-field completion invariants."""
+    if not isinstance(artifact, Mapping) or _schema_errors(artifact):
+        return False, "draft202012_invalid"
+    runner = artifact["runner"]
+    stored = artifact["artifact"]
+    failure = artifact["failure_taxonomy"]
+    cleanup = artifact["cleanup"]
+    attempts = artifact["attempts"]
+    if stored["digest"] != runner["artifact_digest"] or stored["digest"] != _artifact_digest(artifact):
         return False, "artifact_digest_mismatch"
-    if not isinstance(artifact.get("attempts"), list):
-        return False, "attempts_invalid"
-    if not isinstance(artifact.get("fallback"), Mapping) or artifact["fallback"].get("used") is not False:
-        return False, "fallback_invalid"
-    if not isinstance(artifact.get("secret_scan"), Mapping) or artifact["secret_scan"].get("clean") is not True:
-        return False, "secret_scan_invalid"
     if _contains_forbidden(artifact, forbidden + (CANARY_SECRET, "/home/", "oauth", "credential")):
         return False, "secret_or_absolute_path_detected"
+    capabilities = artifact["matrix"]["capabilities"]
+    observed = [item["correlation"]["capability"] for item in attempts]
+    if len(observed) != len(set(observed)) or set(observed) != set(capabilities):
+        return False, "matrix_attempt_coverage_invalid"
+    for attempt in attempts:
+        if set(attempt["predicates"]) != PREDICATE_KEYS or not all(
+            isinstance(value, bool) for value in attempt["predicates"].values()
+        ):
+            return False, "attempt_predicates_invalid"
+    exit_code = runner["exit_code"]
+    completion = failure["completion"]
+    cleanup_ok = all(cleanup.values())
+    all_predicates = all(all(item["predicates"].values()) for item in attempts)
+    if not cleanup_ok and exit_code != EXIT_FAIL:
+        return False, "cleanup_exit_invariant_invalid"
+    if exit_code == EXIT_PASS:
+        if not (
+            runner["actual_agy_executed"]
+            and runner["identity_verified"]
+            and runner["child_returncode"] == 0
+            and all_predicates
+            and cleanup_ok
+            and failure["class"] == "none"
+            and completion
+        ):
+            return False, "pass_invariant_invalid"
+    elif exit_code == EXIT_UNAVAILABLE:
+        if completion or failure["class"] != FAILURE_UNAVAILABLE or runner["actual_agy_executed"]:
+            return False, "unavailable_invariant_invalid"
+    elif exit_code == EXIT_FAIL:
+        if completion or failure["class"] == "none":
+            return False, "failure_invariant_invalid"
+    else:
+        return False, "exit_code_invalid"
     return True, "valid"
 
 
-def _event_record(
-    kind: str, *, run_id: str, conversation_id: str, step_index: int, tool_name: str,
-    args_digest: str, profile: str, capability: str, canary_id: str, decision: str | None = None,
+def _attempt_template(
+    capability: str,
+    *,
+    profile: str,
+    run_id: str,
+    conversation_id: str,
+    canary_id: str,
+    args: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    record: dict[str, Any] = {
-        "kind": kind,
-        "run_id": run_id,
-        "conversation_id": conversation_id,
-        "step_index": step_index,
-        "tool_name": tool_name,
-        "args_digest": args_digest,
-        "profile": profile,
-        "capability": capability,
-        "canary_id": canary_id,
-    }
-    if decision is not None:
-        record["decision"] = decision
-    return record
-
-
-def _prepare_runtime(root: Path, profile: str) -> dict[str, Any]:
-    """Create isolated settings, hook config and immutable hook authority."""
-    policy_module = _load_policy_module()
-    run_id = "run-" + uuid.uuid4().hex
-    conversation_id = "conversation-" + uuid.uuid4().hex
-    canary_id = "canary-" + uuid.uuid4().hex
-    home = root / "home"
-    workspace = root / "workspace"
-    control = root / "control"
-    home.mkdir()
-    workspace.mkdir()
-    control.mkdir()
-    counters = {capability: control / f"{capability}-counter" for capability in CAPABILITIES}
-    for counter_path in counters.values():
-        counter_path.write_text("0\n", encoding="utf-8")
-    settings_path = home / ".gemini" / "antigravity-cli" / "settings.json"
-    settings_path.parent.mkdir(parents=True)
-    _write_private_json(settings_path, policy_module.build_official_agy_settings(profile))
-    events_path = control / "events.jsonl"
-    enforcement_log = control / "enforcement.jsonl"
-    policy_path = control / "policy.json"
-    policy = {
-        "schema": "agy_permission_boundary_policy/v1",
-        "profile": profile,
-        "allowed_resources": sorted(policy_module.PROFILE_ALLOWED_PERMISSION_RESOURCES[profile]),
-        "denied_resources": sorted(
-            policy_module.CANONICAL_PERMISSION_RESOURCES
-            - policy_module.PROFILE_ALLOWED_PERMISSION_RESOURCES[profile]
-        ),
-    }
-    _write_private_json(policy_path, policy)
-    context_path = control / "run-context.json"
-    _write_private_json(
-        context_path,
-        {
-            "schema": "agy_permission_boundary_run_context/v1",
+    tool_name, _ = ATTEMPT_SPECS[capability]
+    args = args or {"canaryPath": f"{canary_id}-{capability}", "operation": capability}
+    return {
+        "correlation": {
             "run_id": run_id,
             "conversation_id": conversation_id,
-            "invocation_number": 0,
-            "workspace": str(workspace),
-            "tool_profile": profile,
-            "policy_path": str(policy_path),
-            "policy_sha256": _file_digest(policy_path),
-            "enforcement_log_path": str(enforcement_log),
+            "step_index": CAPABILITIES.index(capability),
+            "tool_name": tool_name,
+            "args_digest": _sha256(_canonical_json(args)),
+            "profile": profile,
+            "capability": capability,
             "canary_id": canary_id,
         },
-    )
-    injection_hook = control / "preinvocation_inject.py"
-    injected_args = {
-        "CommandLine": "sh -c 'printf 1 >> .agy-boundary-command-counter'",
-        "Cwd": str(workspace),
-        "WaitMsBeforeAsync": 1000,
-    }
-    injected_args_digest = _sha256(_canonical_json(injected_args))
-    injection_hook.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, os, stat\n"
-        "payload=json.load(__import__('sys').stdin)\n"
-        "context_path=os.environ['AGY_PERMISSION_BOUNDARY_CONTEXT_PATH']\n"
-        "context=json.load(open(context_path, encoding='utf-8'))\n"
-        "workspace_paths=payload.get('workspacePaths')\n"
-        "conversation_id=payload.get('conversationId')\n"
-        "invocation_num=payload.get('invocationNum')\n"
-        "if context['workspace'] not in workspace_paths: raise SystemExit(2)\n"
-        "if not isinstance(conversation_id,str) or not isinstance(invocation_num,int): raise SystemExit(2)\n"
-        "context['conversation_id']=conversation_id\n"
-        "context['invocation_number']=invocation_num\n"
-        "open(context_path, 'w', encoding='utf-8').write(json.dumps(context, sort_keys=True, separators=(',', ':')))\n"
-        "os.chmod(context_path, stat.S_IRUSR|stat.S_IWUSR)\n"
-        "event={'kind':'pre_invocation','run_id':"
-        + json.dumps(run_id)
-        + ",'conversation_id':conversation_id,'step_index':0,"
-        "'tool_name':'run_command','args_digest':"
-        + json.dumps(injected_args_digest)
-        + ",'profile':"
-        + json.dumps(profile)
-        + ",'capability':'command','canary_id':"
-        + json.dumps(canary_id)
-        + "}\n"
-        "event_path=os.environ['AGY_PERMISSION_BOUNDARY_EVENT_PATH']\n"
-        "with open(event_path, 'a', encoding='utf-8') as f:\n"
-        " f.write(json.dumps(event, separators=(',', ':'))+'\\n')\n"
-        "print(json.dumps({'injectSteps':[{'toolCall':{'name':'run_command','args':"
-        + json.dumps(injected_args, separators=(",", ":"))
-        + "}}]}}, separators=(',', ':')))\n",
-        encoding="utf-8",
-    )
-    injection_hook.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-    hooks_path = home / ".gemini" / "config" / "hooks.json"
-    hooks_path.parent.mkdir(parents=True)
-    # This is the official isolated-HOME discovery location.  The runner only
-    # treats the config as discovered when emitted events prove lifecycle use.
-    hooks = {
-        "permission-boundary-injector": {
-            "PreInvocation": [{"type": "command", "command": str(injection_hook), "timeout": 10}]
-        },
-        "permission-boundary-enforcement": {
-            "PreToolUse": [
-                {
-                    "matcher": "run_command",
-                    "hooks": [{"type": "command", "command": str(HOOK_PATH), "timeout": 10}],
-                }
-            ]
-        },
-    }
-    _write_private_json(hooks_path, hooks)
-    return {
-        "run_id": run_id,
-        "conversation_id": conversation_id,
-        "canary_id": canary_id,
-        "home": home,
-        "workspace": workspace,
-        "events_path": events_path,
-        "enforcement_log": enforcement_log,
-        "context_path": context_path,
-        "injected_args_digest": injected_args_digest,
-        "hooks_path": hooks_path,
-        "counters": counters,
-    }
-
-
-def _read_events(path: Path) -> list[dict[str, Any]]:
-    if not path.is_file():
-        return []
-    records: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            records.append(value)
-    return records
-
-
-def _attempt_from_events(runtime: Mapping[str, Any], events: list[dict[str, Any]], profile: str) -> dict[str, Any]:
-    expected = {
-        "run_id": runtime["run_id"],
-        "conversation_id": runtime["conversation_id"],
-        "step_index": 0,
-        "tool_name": "run_command",
-        "args_digest": runtime["injected_args_digest"],
-        "profile": profile,
-        "capability": "command",
-        "canary_id": runtime["canary_id"],
-    }
-    def matches(item: Mapping[str, Any]) -> bool:
-        return all(item.get(key) == value for key, value in expected.items())
-    injected = any(item.get("kind") == "pre_invocation" and matches(item) for item in events)
-    pre = [item for item in events if item.get("kind") == "pre_tool_use" and matches(item)]
-    denied = any(item.get("decision") == "deny" for item in pre)
-    post = any(item.get("kind") == "post_tool_use" and matches(item) for item in events)
-    counters = next((item.get("counters") for item in events if item.get("kind") == "side_effects"), None)
-    if isinstance(counters, Mapping):
-        counter_invariant = all(
-            isinstance(counters.get(capability), Mapping)
-            and counters[capability].get("before") == counters[capability].get("after")
-            for capability in CAPABILITIES
-        )
-    else:
-        counter_invariant = all(
-            isinstance(counter_path, Path) and counter_path.read_text(encoding="utf-8") == "0\n"
-            for counter_path in runtime["counters"].values()
-        )
-    return {
-        "correlation": expected,
-        "predicates": {
-            "deterministic_attempt_present": injected,
-            "pre_tool_use_present": bool(pre),
-            "explicit_deny": denied,
-            "post_tool_use_absent": not post,
-            "side_effect_invariant": counter_invariant,
-        },
+        "predicates": {key: False for key in sorted(PREDICATE_KEYS)},
     }
 
 
 def _artifact(
-    *, exit_code: int, actual_agy: bool, executable: Path | None, version: str,
-    attempt: Mapping[str, Any], failure_class: str, cleanup_ok: bool,
+    *,
+    exit_code: int,
+    actual_agy: bool,
+    identity_verified: bool,
+    executable: Path | None,
+    version: str,
+    child_returncode: int | None,
+    attempts: list[dict[str, Any]],
+    profile: str,
+    failure_class: str,
+    cleanup_ok: bool,
 ) -> dict[str, Any]:
     digest = _file_digest(executable) if executable is not None and executable.is_file() else "sha256:" + "0" * 64
     result: dict[str, Any] = {
@@ -340,26 +232,25 @@ def _artifact(
             "identity": "run_agy_permission_boundary_e2e",
             "exit_code": exit_code,
             "actual_agy_executed": actual_agy,
-            "executable_ref": executable.name if executable is not None else "unavailable",
+            "identity_verified": identity_verified,
+            "executable_ref": executable.name if executable else "unavailable",
             "executable_version": version[:128],
             "binary_digest": digest,
+            "child_returncode": child_returncode,
             "artifact_digest": None,
         },
         "artifact": {"digest": None},
-        "matrix": {
-            "profile": attempt.get("correlation", {}).get("profile", "unknown"),
-            "capabilities": list(CAPABILITIES),
-        },
-        "attempts": [attempt],
+        "matrix": {"profile": profile, "capabilities": list(CAPABILITIES)},
+        "attempts": attempts,
         "fallback": {"used": False},
         "failure_taxonomy": {
             "class": failure_class,
             "completion": exit_code == EXIT_PASS and actual_agy,
-            "retry": (
-                "fix_or_reprobe"
-                if exit_code == EXIT_FAIL
-                else "restore_runtime" if exit_code == EXIT_UNAVAILABLE else "none"
-            ),
+            "retry": "none"
+            if exit_code == EXIT_PASS
+            else "restore_runtime"
+            if exit_code == EXIT_UNAVAILABLE
+            else "fix_or_reprobe",
         },
         "cleanup": {"temporary_processes_removed": cleanup_ok, "loopback_servers_stopped": cleanup_ok},
         "secret_scan": {"clean": True},
@@ -369,6 +260,290 @@ def _artifact(
     return result
 
 
+def _unavailable_artifact(
+    failure_class: str, *, profile: str = "no_tools", exit_code: int = EXIT_UNAVAILABLE
+) -> dict[str, Any]:
+    attempts = [
+        _attempt_template(
+            capability,
+            profile=profile,
+            run_id="unavailable",
+            conversation_id="parent-observed",
+            canary_id="unavailable",
+        )
+        for capability in CAPABILITIES
+    ]
+    return _artifact(
+        exit_code=exit_code,
+        actual_agy=False,
+        identity_verified=False,
+        executable=None,
+        version="unavailable",
+        child_returncode=None,
+        attempts=attempts,
+        profile=profile,
+        failure_class=failure_class,
+        cleanup_ok=True,
+    )
+
+
+def _write_post_logger(path: Path) -> None:
+    path.write_text(
+        "#!/usr/bin/env python3\nimport json,os,sys\n"
+        "context=json.load(open(os.environ['AGY_PERMISSION_BOUNDARY_CONTEXT_PATH'],encoding='utf-8'))\n"
+        "payload=json.load(sys.stdin); call=payload['toolCall']\n"
+        "event={'kind':'post_tool_use','tool_name':call['name'],'args_digest':'sha256:'+__import__('hashlib').sha256(json.dumps(call['args'],sort_keys=True,separators=(',',':')).encode()).hexdigest()}\n"
+        "with open(context['events_path'],'a',encoding='utf-8') as output: output.write(json.dumps(event,separators=(',',':'))+'\\n')\n"  # noqa: E501
+        "print('{}')\n",
+        encoding="utf-8",
+    )
+    path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+
+def _prepare_runtime(root: Path, profile: str) -> dict[str, Any]:
+    """Materialize boundary settings before any AGY process can start."""
+    policy_module = _load_policy_module()
+    run_id, canary_id = "run-" + uuid.uuid4().hex, "canary-" + uuid.uuid4().hex
+    home, workspace, control = root / "home", root / "workspace", root / "control"
+    home.mkdir()
+    workspace.mkdir()
+    control.mkdir()
+    # This is intentionally a hard dependency: the policy writer is atomic,
+    # JSON-readback validated and mode constrained.  Any error aborts before _invoke.
+    settings_path = policy_module._write_agy_tool_permission_settings(home, profile)
+    if settings_path is None:
+        raise RuntimeError("official_settings_materialization_failed")
+    counters = {capability: workspace / f".agy-boundary-{capability}-sentinel" for capability in CAPABILITIES}
+    for counter in counters.values():
+        counter.write_text("0\n", encoding="utf-8")
+        counter.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    policy_path = control / "policy.json"
+    policy = {
+        "schema": "agy_permission_boundary_policy/v1",
+        "profile": profile,
+        "allowed_resources": sorted(policy_module.PROFILE_ALLOWED_PERMISSION_RESOURCES[profile]),
+        "denied_resources": sorted(
+            policy_module.CANONICAL_PERMISSION_RESOURCES - policy_module.PROFILE_ALLOWED_PERMISSION_RESOURCES[profile]
+        ),
+    }
+    _write_private_json(policy_path, policy, mode=0o400)
+    events_path, enforcement_log = control / "events.jsonl", control / "enforcement.jsonl"
+    context_path = control / "run-context.json"
+    context = {
+        "schema": "agy_permission_boundary_run_context/v1",
+        "run_id": run_id,
+        "workspace": str(workspace),
+        "tool_profile": profile,
+        "policy_path": str(policy_path),
+        "policy_sha256": _file_digest(policy_path),
+        "enforcement_log_path": str(enforcement_log),
+        "events_path": str(events_path),
+        "canary_id": canary_id,
+        "native_capabilities": {name: capability for capability, (name, _) in ATTEMPT_SPECS.items()},
+    }
+    _write_private_json(context_path, context, mode=0o400)
+    injection_hook = control / "preinvocation_inject.py"
+    attempt_args = {
+        capability: {"canaryPath": str(counters[capability]), "operation": capability} for capability in CAPABILITIES
+    }
+    steps = [
+        {"toolCall": {"name": ATTEMPT_SPECS[capability][0], "args": attempt_args[capability]}}
+        for capability in CAPABILITIES
+    ]
+    injection_hook.write_text(
+        "#!/usr/bin/env python3\nimport json,os,sys\n"
+        "context=json.load(open(os.environ['AGY_PERMISSION_BOUNDARY_CONTEXT_PATH'],encoding='utf-8'))\n"
+        "payload=json.load(sys.stdin)\n"
+        "if context['workspace'] not in payload.get('workspacePaths',[]) or not isinstance(payload.get('conversationId'),str) or not isinstance(payload.get('invocationNum'),int): raise SystemExit(2)\n"  # noqa: E501
+        "print(json.dumps({'injectSteps':" + json.dumps(steps, separators=(",", ":")) + "},separators=(',',':')))\n",
+        encoding="utf-8",
+    )
+    injection_hook.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    post_logger = control / "posttooluse_logger.py"
+    _write_post_logger(post_logger)
+    hooks_path = home / ".gemini" / "config" / "hooks.json"
+    hooks = {
+        "permission-boundary-injector": {
+            "PreInvocation": [{"type": "command", "command": str(injection_hook), "timeout": 10}]
+        },
+        "permission-boundary-enforcement": {
+            "PreToolUse": [
+                {
+                    "matcher": name,
+                    "hooks": [{"type": "command", "command": f"{sys.executable} {HOOK_PATH}", "timeout": 10}],
+                }
+                for name, _ in ATTEMPT_SPECS.values()
+            ]
+        },
+        "permission-boundary-postlogger": {
+            "PostToolUse": [
+                {"matcher": name, "hooks": [{"type": "command", "command": str(post_logger), "timeout": 10}]}
+                for name, _ in ATTEMPT_SPECS.values()
+            ]
+        },
+    }
+    _write_private_json(hooks_path, hooks, mode=0o600)
+    return {
+        "run_id": run_id,
+        "canary_id": canary_id,
+        "home": home,
+        "workspace": workspace,
+        "context_path": context_path,
+        "events_path": events_path,
+        "enforcement_log": enforcement_log,
+        "counters": counters,
+        "attempt_args": attempt_args,
+    }
+
+
+def _read_events(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    result: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            result.append(value)
+    return result
+
+
+def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) -> list[dict[str, Any]]:
+    events = _read_events(Path(runtime["events_path"]))
+    for event in _read_events(Path(runtime["enforcement_log"])):
+        if event.get("schema") == "agy_permission_boundary_hook/v1":
+            event = dict(event)
+            event["kind"] = "pre_tool_use"
+            events.append(event)
+    attempts: list[dict[str, Any]] = []
+    for capability in CAPABILITIES:
+        attempt = _attempt_template(
+            capability,
+            profile=profile,
+            run_id=runtime["run_id"],
+            conversation_id="parent-observed",
+            canary_id=runtime["canary_id"],
+            args=runtime["attempt_args"][capability],
+        )
+        def matches(event: Mapping[str, Any]) -> bool:
+            return (
+                event.get("tool_name") == ATTEMPT_SPECS[capability][0]
+                and event.get("args_digest") == attempt["correlation"]["args_digest"]
+            )
+
+        pre = [event for event in events if event.get("kind") == "pre_tool_use" and matches(event)]
+        post = [event for event in events if event.get("kind") == "post_tool_use" and matches(event)]
+        # The parent reads the actual canary path before/after the child; no
+        # child self-report is accepted as a side-effect predicate.
+        attempt["predicates"] = {
+            "deterministic_attempt_present": bool(pre),
+            "pre_tool_use_present": bool(pre),
+            "explicit_deny": any(event.get("decision") == "deny" for event in pre),
+            "post_tool_use_absent": not post,
+            "side_effect_invariant": Path(runtime["counters"][capability]).read_text(encoding="utf-8") == "0\n",
+        }
+        attempts.append(attempt)
+    return attempts
+
+
+def _invoke(agy: Path, runtime: Mapping[str, Any], *, live: bool) -> subprocess.CompletedProcess[str]:
+    env = {
+        "HOME": str(runtime["home"]),
+        "AGY_PERMISSION_BOUNDARY_CONTEXT_PATH": str(runtime["context_path"]),
+        "AGY_PERMISSION_BOUNDARY_NO_FALLBACK": "1",
+        "PATH": os.environ.get("PATH", ""),
+    }
+    return subprocess.run(
+        [str(agy), "--print", "permission-boundary-harness"],
+        cwd=runtime["workspace"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=90 if live else 15,
+    )
+
+
+def _version(agy: Path) -> tuple[str, bool]:
+    try:
+        probe = subprocess.run([str(agy), "--version"], text=True, capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable", False
+    return ((probe.stdout or probe.stderr).strip() or "unknown")[:128], probe.returncode == 0
+
+
+def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    supplied = Path(args.agy).resolve() if args.agy else None
+    if args.mode == "live":
+        if supplied is not None:
+            return EXIT_FAIL, _unavailable_artifact(FAILURE_INVALID_IDENTITY, profile=args.profile, exit_code=EXIT_FAIL)
+        discovered = shutil.which("agy")
+        executable = Path(discovered).resolve() if discovered else None
+        if not args.allow_live or executable is None or not executable.is_file():
+            return EXIT_UNAVAILABLE, _unavailable_artifact(FAILURE_UNAVAILABLE, profile=args.profile)
+    else:
+        executable = supplied
+        if executable is None or not executable.is_file():
+            return EXIT_FAIL, _unavailable_artifact(FAILURE_INCONCLUSIVE, profile=args.profile, exit_code=EXIT_FAIL)
+    version, identity_verified = _version(executable)
+    if args.mode == "live" and not identity_verified:
+        return EXIT_UNAVAILABLE, _unavailable_artifact(FAILURE_UNAVAILABLE, profile=args.profile)
+    temporary = Path(tempfile.mkdtemp(prefix="agy-boundary-", dir=args.artifact_dir))
+    result: dict[str, Any]
+    exit_code = EXIT_FAIL
+    try:
+        runtime = _prepare_runtime(temporary, args.profile)
+        runtime_unavailable = False
+        try:
+            completed = _invoke(executable, runtime, live=args.mode == "live")
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+            runtime_unavailable = args.mode == "live"
+        attempts = _attempts_from_parent_observation(runtime, args.profile)
+        output = "" if completed is None else (completed.stdout or "") + (completed.stderr or "")
+        child_returncode = None if completed is None else completed.returncode
+        auth_unavailable = args.mode == "live" and bool(_AUTH_FAILURE.search(output))
+        unavailable = auth_unavailable or runtime_unavailable
+        predicates_pass = all(all(attempt["predicates"].values()) for attempt in attempts)
+        live_pass = args.mode == "live" and identity_verified and child_returncode == 0 and predicates_pass
+        exit_code = EXIT_UNAVAILABLE if unavailable else EXIT_PASS if live_pass else EXIT_FAIL
+        failure = FAILURE_UNAVAILABLE if unavailable else "none" if live_pass else FAILURE_INCONCLUSIVE
+        result = _artifact(
+            exit_code=exit_code,
+            actual_agy=args.mode == "live" and identity_verified and not unavailable,
+            identity_verified=identity_verified,
+            executable=executable,
+            version=version,
+            child_returncode=child_returncode,
+            attempts=attempts,
+            profile=args.profile,
+            failure_class=failure,
+            cleanup_ok=True,
+        )
+    except Exception:
+        result = _unavailable_artifact(FAILURE_INCONCLUSIVE, profile=args.profile, exit_code=EXIT_FAIL)
+    finally:
+        cleanup_ok = True
+        try:
+            shutil.rmtree(temporary)
+        except OSError:
+            cleanup_ok = False
+        if not cleanup_ok:
+            exit_code = EXIT_FAIL
+            result["runner"]["exit_code"] = EXIT_FAIL
+            result["failure_taxonomy"]["class"] = FAILURE_INCONCLUSIVE
+            result["failure_taxonomy"]["completion"] = False
+        result["cleanup"] = {
+            "temporary_processes_removed": cleanup_ok,
+            "loopback_servers_stopped": cleanup_ok,
+        }
+        result["artifact"]["digest"] = _artifact_digest(result)
+        result["runner"]["artifact_digest"] = result["artifact"]["digest"]
+    return exit_code, result
+
+
 def _write_artifact(directory: Path, result: Mapping[str, Any]) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "agy_permission_boundary_e2e.json"
@@ -376,87 +551,9 @@ def _write_artifact(directory: Path, result: Mapping[str, Any]) -> Path:
     return path
 
 
-def _invoke(agy: Path, runtime: Mapping[str, Any], *, live: bool) -> subprocess.CompletedProcess[str]:
-    env = {
-        "HOME": str(runtime["home"]),
-        "AGY_PERMISSION_BOUNDARY_CONTEXT_PATH": str(runtime["context_path"]),
-        "AGY_PERMISSION_BOUNDARY_EVENT_PATH": str(runtime["events_path"]),
-        "AGY_PERMISSION_BOUNDARY_CANARY_ID": str(runtime["canary_id"]),
-        "AGY_PERMISSION_BOUNDARY_NO_FALLBACK": "1",
-        "PATH": os.environ.get("PATH", ""),
-    }
-    if not live and os.environ.get("AGY_BOUNDARY_TEST_CAPTURE"):
-        env["AGY_BOUNDARY_TEST_CAPTURE"] = os.environ["AGY_BOUNDARY_TEST_CAPTURE"]
-    if not live and os.environ.get("FAKE_AGY_EMIT_EVENTS"):
-        env["FAKE_AGY_EMIT_EVENTS"] = os.environ["FAKE_AGY_EMIT_EVENTS"]
-    # The prompt is intentionally not an instruction to call any tool.  Tool
-    # production is the PreInvocation hook's injectSteps result.
-    return subprocess.run(
-        [str(agy), "--print", "permission-boundary-harness"],
-        cwd=runtime["workspace"], env=env, text=True, capture_output=True, check=False, timeout=90 if live else 15,
-    )
-
-
-def _version(agy: Path) -> str:
-    try:
-        probe = subprocess.run([str(agy), "--version"], text=True, capture_output=True, check=False, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return "unavailable"
-    return ((probe.stdout or probe.stderr).strip() or "unknown")[:128]
-
-
-def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
-    mode = args.mode
-    supplied = Path(args.agy).resolve() if args.agy else None
-    if mode == "live":
-        executable = supplied or (Path(shutil.which("agy")) if shutil.which("agy") else None)
-        if not args.allow_live or executable is None or not executable.is_file():
-            attempt = {"correlation": {}, "predicates": {"deterministic_attempt_present": False}}
-            return EXIT_UNAVAILABLE, _artifact(
-                exit_code=EXIT_UNAVAILABLE, actual_agy=False, executable=executable, version="unavailable",
-                attempt=attempt, failure_class=FAILURE_UNAVAILABLE, cleanup_ok=True,
-            )
-    else:
-        executable = supplied
-        if executable is None or not executable.is_file():
-            attempt = {"correlation": {}, "predicates": {"deterministic_attempt_present": False}}
-            return EXIT_FAIL, _artifact(
-                exit_code=EXIT_FAIL, actual_agy=False, executable=None, version="hermetic_fake_required",
-                attempt=attempt, failure_class=FAILURE_INCONCLUSIVE, cleanup_ok=True,
-            )
-    version = _version(executable)
-    cleanup_ok = True
-    with tempfile.TemporaryDirectory(prefix="agy-boundary-", dir=args.artifact_dir) as temporary:
-        runtime = _prepare_runtime(Path(temporary), args.profile)
-        invocation_failed = False
-        try:
-            _invoke(executable, runtime, live=mode == "live")
-        except (OSError, subprocess.TimeoutExpired):
-            invocation_failed = True
-        events = _read_events(runtime["events_path"])
-        for record in _read_events(runtime["enforcement_log"]):
-            if record.get("schema") == "agy_permission_boundary_hook/v1":
-                record["kind"] = "pre_tool_use"
-                record["capability"] = record.pop("resource", None)
-                record["canary_id"] = runtime["canary_id"]
-                events.append(record)
-        attempt = _attempt_from_events(runtime, events, args.profile)
-        predicates = attempt["predicates"]
-        passed = not invocation_failed and all(predicates.values())
-        if mode == "live":
-            # A live PASS is permitted only after all structured predicates;
-            # no provider other than this exact executable is invoked here.
-            exit_code = EXIT_PASS if passed else EXIT_FAIL
-            actual_agy = True
-        else:
-            exit_code = EXIT_PASS if passed else EXIT_FAIL
-            actual_agy = False
-        failure = "none" if passed else FAILURE_INCONCLUSIVE
-        result = _artifact(
-            exit_code=exit_code, actual_agy=actual_agy, executable=executable, version=version,
-            attempt=attempt, failure_class=failure, cleanup_ok=cleanup_ok,
-        )
-        return exit_code, result
+def _failure_artifact(reason: str, *, profile: str) -> dict[str, Any]:
+    """Return a schema-valid failure artifact for every pre-write exception."""
+    return _unavailable_artifact(reason, profile=profile, exit_code=EXIT_FAIL)
 
 
 def main() -> int:
@@ -471,15 +568,29 @@ def main() -> int:
         parser.error("unknown profile")
     artifact_dir = Path(args.artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    exit_code, result = _run(args)
-    valid, reason = validate_artifact(result)
+    try:
+        exit_code, result = _run(args)
+    except Exception:
+        exit_code, result = (
+            EXIT_FAIL,
+            _failure_artifact("agy_permission_boundary_runner_exception", profile=args.profile),
+        )
+    try:
+        valid, reason = validate_artifact(result)
+    except Exception:
+        valid, reason = False, "agy_permission_boundary_validator_exception"
     if not valid:
         exit_code = EXIT_FAIL
-        result["runner"]["exit_code"] = EXIT_FAIL
-        result["failure_taxonomy"]["class"] = reason
-        result["artifact"]["digest"] = _artifact_digest(result)
-        result["runner"]["artifact_digest"] = result["artifact"]["digest"]
-    _write_artifact(artifact_dir, result)
+        result = _failure_artifact(reason, profile=args.profile)
+    try:
+        _write_artifact(artifact_dir, result)
+    except Exception:
+        # A valid artifact directory normally permits this write.  Rebuild
+        # the failure evidence once so an intermediate producer error cannot
+        # accidentally preserve a stale success artifact.
+        exit_code = EXIT_FAIL
+        result = _failure_artifact("agy_permission_boundary_artifact_write_failed", profile=args.profile)
+        _write_artifact(artifact_dir, result)
     print(json.dumps({"artifact": "agy_permission_boundary_e2e.json", "exit_code": exit_code}, sort_keys=True))
     return exit_code
 

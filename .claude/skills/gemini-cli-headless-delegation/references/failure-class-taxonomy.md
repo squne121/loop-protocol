@@ -112,12 +112,17 @@ stdout / stderr の両方から判別する failure_class。`_normalize_agy_resu
 
 | `failure_class` | runner exit | completion | retry / recovery |
 |---|---:|---|---|
-| `agy_permission_boundary_unavailable` | 77 | false | binary、既存 auth、または required runtime capability が unavailable。外部状態が復旧した後に dedicated runner を再実行する。|
+| `agy_permission_boundary_unavailable` | 77 | false | binary、既存 auth、または required runtime capability が unavailable。artifact は schema-valid で `actual_agy_executed: false` を記録し、外部状態が復旧した後に dedicated runner を再実行する。|
 | `agy_permission_boundary_inconclusive` | 1 | false | injected attempt 不在、attempt correlation 不成立、hook lifecycle evidence 不足、または artifact invalid。実装または runtime evidence を修復して再実行する。|
 
 predicate violation、unexpected `PostToolUse`、または side-effect counter の増加も
 exit 1 / `completion: false` とする。fallback provider が成功してもこの分類を
 上書きしてはならない。
+
+runner-local の file mode / readback check は fail-closed local guardrail であり、
+child に対する immutable authority boundary や secrecy を保証しない。artifact の
+attempt correlation は parent runner が記録し、child hook の event は correlation
+authority として扱わない。
 
 ### provider_auto_policy_v1 fallback classes（フォールバック分類、Issue #1270）
 

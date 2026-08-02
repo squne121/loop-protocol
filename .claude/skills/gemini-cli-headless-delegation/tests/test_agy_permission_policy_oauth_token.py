@@ -84,6 +84,7 @@ def _force_bwrap_available(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(app, "_bwrap_available", lambda: True)
 
+
 ALL_PROFILES = [
     app.NO_TOOLS_PROFILE,
     app.LOCAL_ASSET_RESEARCH_PROFILE,
@@ -129,9 +130,7 @@ def test_agy_oauth_token_exposed_read_only(tmp_path: Path, monkeypatch: pytest.M
             )
             # Issue #1743 AC1: never placed under XDG_CONFIG_HOME (the
             # pre-#1743 buggy placement `agy` never actually reads from).
-            assert not (
-                Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token"
-            ).exists()
+            assert not (Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token").exists()
         finally:
             shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
 
@@ -395,15 +394,11 @@ def test_agy_oauth_token_reachability_integration(tmp_path: Path, monkeypatch: p
         # `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`, matching
         # the state-directory layout its own auth flow writes to on a
         # non-isolated host -- not from `$XDG_CONFIG_HOME`.
-        isolated_token_path = (
-            Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-        )
+        isolated_token_path = Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
         assert isolated_token_path.exists()
         assert isolated_token_path.is_symlink()
         # the pre-#1743 (buggy) XDG_CONFIG_HOME placement must be absent.
-        assert not (
-            Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token"
-        ).exists()
+        assert not (Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token").exists()
 
         # HOME/XDG_CACHE_HOME/XDG_STATE_HOME stay isolated even while agy
         # OAuth token reachability is preserved.
