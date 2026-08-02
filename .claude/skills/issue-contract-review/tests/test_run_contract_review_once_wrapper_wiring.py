@@ -23,6 +23,8 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Import module under test (既存 test_run_contract_review_once.py と同じ
 # importlib ベースのロード方式に合わせる)
@@ -41,6 +43,28 @@ run_once = _rcr_mod.run_once
 
 _ISSUE_NUMBER = 1333
 _REPO = "squne121/loop-protocol"
+
+# Issue #1914 P0-3: see test_run_contract_review_once.py for rationale — a
+# generic default body snapshot fetch is supplied for every test in this
+# file, since run_once() now fetches the body once at the start of every
+# invocation.
+_DEFAULT_BODY_SNAPSHOT = (
+    "## Machine-Readable Contract\n\n"
+    "```yaml\n"
+    "contract_schema_version: v1\n"
+    "issue_kind: implementation\n"
+    'parent_issue: "none"\n'
+    "```\n\n"
+    "## Outcome\n\nfixture body for wrapper wiring unit tests.\n"
+)
+
+
+@pytest.fixture(autouse=True)
+def _default_body_snapshot_fetch():
+    with patch.object(
+        _rcr_mod, "fetch_body_from_github", return_value=(_DEFAULT_BODY_SNAPSHOT, None)
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------

@@ -30,17 +30,31 @@ Check execution order (all modes):
      (vc_preflight is run in all modes, not only execute)
 
 All four checks pass → status: go with checks summary.
+
+Issue #1914 P0-3 (#1940 adversarial review): the Issue body is fetched
+EXACTLY ONCE, at the very start of run_once(), and that single snapshot is
+threaded through every subsequent step that reads body content (Step 1
+idempotency freshness check, Step 2 readiness check, Step 4 product spec
+check, Step 4.5 delivery-rollup applicability check, Step 5 VC preflight)
+via --body-file / direct in-process reuse. No step independently re-fetches
+the body from GitHub. This removes (not merely detects) the TOCTOU window
+where Step 2 and Step 4.5 could previously observe two different Issue
+body snapshots if the Issue body changed between two separate network
+fetches, and their independently-derived judgments were combined into a
+single status: go with no equality check between them.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 # parents: [0]=issue-contract-review, [1]=skills, [2]=.claude, [3]=<repo root>
@@ -64,6 +78,119 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # Issue #1333 AC2/AC3: baseline_vc_preflight.py の DEFAULT_TIMEOUT_SECONDS を
 # import し、per-command timeout の単一の正本として参照する（drift防止）。
 from baseline_vc_preflight import DEFAULT_TIMEOUT_SECONDS as _VC_PREFLIGHT_PER_COMMAND_TIMEOUT  # noqa: E402
+
+# Issue #1914: reuse the existing strict resolver (no new YAML parser /
+# allowlist) to determine whether the target Issue is a canonical parent
+# with parent_mode: delivery-rollup and no `## Verification Commands`
+# section, so Step 5 below can skip baseline_vc_preflight.py for that case
+# (mirrors #1878's skip inside contract_readiness_check.py's own
+# execute-mode call, but must be re-derived here because Step 5 invokes
+# baseline_vc_preflight.py directly and independently of that internal skip).
+_CREATE_ISSUE_SCRIPTS_DIR = _SCRIPTS_DIR.parent.parent / "create-issue" / "scripts"
+if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS_DIR))
+
+from baseline_vc_preflight import extract_verification_commands_section  # noqa: E402
+from contract_readiness_check import (  # noqa: E402
+    fetch_body_from_github,
+    resolve_existing_issue_validation_profile,
+    sha256_of,
+)
+from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
+
+_DELIVERY_ROLLUP_PARENT_MODE = "delivery-rollup"
+_DELIVERY_ROLLUP_SKIP_REASON_CODE = "delivery_rollup_parent_without_verification_commands"
+
+
+# ---------------------------------------------------------------------------
+# Issue #1914 P1-1 (#1940 review): shared applicability result
+# ---------------------------------------------------------------------------
+
+
+class DeliveryRollupApplicability(NamedTuple):
+    """Single shared applicability result, computed once from the same
+    primitives (resolve_existing_issue_validation_profile,
+    parse_machine_readable_contract, extract_verification_commands_section)
+    instead of being independently re-derived at each call site. Both the
+    boolean predicate used by Step 4.5 and any future caller within this
+    module should consume this single result rather than recombining the
+    underlying primitives themselves (#1940 P1-1 review: recombining
+    primitives at each caller reintroduces the duplicated-policy-logic
+    problem #1878 already solved for canonical parents).
+
+    Note: this dataclass is local to run_contract_review_once.py. The
+    equivalent skip-decision inside contract_readiness_check.py's own
+    execute-mode call (`skip_preflight = is_canonical_parent and not
+    parent_has_vc_section`, #1878/#1867) still independently recomputes the
+    same primitives — full cross-file de-duplication would require also
+    exposing this dataclass from contract_readiness_check.py, which is
+    outside this Issue's Allowed Paths (only run_contract_review_once.py is
+    listed; contract_readiness_check.py is not) and is therefore left as a
+    follow-up recommendation rather than an in-PR Scope Delta.
+    """
+
+    applicable: bool
+    issue_kind: Optional[str]
+    parent_mode: Optional[str]
+    reason_code: Optional[str]
+    body_sha256: str
+
+
+def _resolve_delivery_rollup_applicability(body: str) -> DeliveryRollupApplicability:
+    """Compute the delivery-rollup Final-Gate-exemption applicability once."""
+    body_sha256 = sha256_of(body)
+    resolution = resolve_existing_issue_validation_profile(body)
+    if resolution.status != "profile" or resolution.canonical_issue_kind != "parent":
+        return DeliveryRollupApplicability(
+            applicable=False,
+            issue_kind=resolution.canonical_issue_kind,
+            parent_mode=None,
+            reason_code=None,
+            body_sha256=body_sha256,
+        )
+    parsed = parse_machine_readable_contract(body)
+    if not parsed.ok or not isinstance(parsed.data, dict):
+        return DeliveryRollupApplicability(
+            applicable=False,
+            issue_kind=resolution.canonical_issue_kind,
+            parent_mode=None,
+            reason_code="mrc_parse_failed",
+            body_sha256=body_sha256,
+        )
+    parent_mode = parsed.data.get("parent_mode")
+    if parent_mode != _DELIVERY_ROLLUP_PARENT_MODE:
+        return DeliveryRollupApplicability(
+            applicable=False,
+            issue_kind=resolution.canonical_issue_kind,
+            parent_mode=parent_mode if isinstance(parent_mode, str) else None,
+            reason_code=None,
+            body_sha256=body_sha256,
+        )
+    if extract_verification_commands_section(body):
+        return DeliveryRollupApplicability(
+            applicable=False,
+            issue_kind=resolution.canonical_issue_kind,
+            parent_mode=parent_mode,
+            reason_code="vc_section_present",
+            body_sha256=body_sha256,
+        )
+    return DeliveryRollupApplicability(
+        applicable=True,
+        issue_kind=resolution.canonical_issue_kind,
+        parent_mode=parent_mode,
+        reason_code=_DELIVERY_ROLLUP_SKIP_REASON_CODE,
+        body_sha256=body_sha256,
+    )
+
+
+def _is_delivery_rollup_parent_without_vc_section(body: str) -> bool:
+    """Backward-compatible bool predicate (existing call sites / tests).
+
+    True iff body is a canonical parent (issue_kind: parent) with
+    parent_mode: delivery-rollup and no `## Verification Commands` section.
+    Delegates to _resolve_delivery_rollup_applicability() so there is a
+    single computation, not a second independent re-derivation."""
+    return _resolve_delivery_rollup_applicability(body).applicable
 
 # Issue #1333 AC2: _VC_PREFLIGHT_TIMEOUT は per-command timeout の named
 # constant から関係式として導出する（単純な独立リテラル引き上げは禁止）。
@@ -182,12 +309,19 @@ def _is_current_go_snapshot(go_result: object, expected_body_sha256: str) -> boo
 def check_existing_go_comment(
     issue_number: int,
     repo: str,
+    current_body_sha256: Optional[str] = None,
 ) -> tuple[Optional[dict], Optional[str]]:
     """
     Return a current, complete go snapshot or None.
 
     Dedupe is only safe when the existing comment satisfies the same
     currentness predicate consumed by impl-review-loop.
+
+    Issue #1914 P0-3: ``current_body_sha256`` lets the caller reuse the
+    single Issue body snapshot fetched once at the top of run_once(),
+    instead of this function performing its own independent
+    ``gh issue view`` fetch. When not supplied (e.g. direct/legacy callers),
+    this function falls back to fetching it itself.
     """
     try:
         from contract_review_result_parser import (
@@ -242,25 +376,25 @@ def check_existing_go_comment(
     if go is None:
         return None, None
 
-    try:
-        issue = subprocess.run(
-            ["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"],
-            capture_output=True,
-            text=True,
-            timeout=_DEFAULT_TIMEOUT,
-        )
-        if issue.returncode != 0:
+    if current_body_sha256 is not None:
+        current_body_sha256_value = current_body_sha256
+    else:
+        try:
+            issue = subprocess.run(
+                ["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"],
+                capture_output=True,
+                text=True,
+                timeout=_DEFAULT_TIMEOUT,
+            )
+            if issue.returncode != 0:
+                return None, "issue_body_fetch_error"
+            current_body = json.loads(issue.stdout).get("body", "")
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
             return None, "issue_body_fetch_error"
-        current_body = json.loads(issue.stdout).get("body", "")
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
-        return None, "issue_body_fetch_error"
 
-    import hashlib
+        current_body_sha256_value = sha256_of(current_body)
 
-    current_body_sha256 = "sha256:" + hashlib.sha256(
-        current_body.encode("utf-8")
-    ).hexdigest()
-    if _is_current_go_snapshot(go, current_body_sha256):
+    if _is_current_go_snapshot(go, current_body_sha256_value):
         return go, None
     return None, None
 
@@ -361,6 +495,23 @@ def run_once(
         "repo": repo,
         "mode": mode,
         "status": "runtime_error",
+        # Issue #1914 P0-1 (#1940 adversarial review): "applicability"
+        # distinguishes "the Final Gate's VC-preflight requirement does not
+        # apply to this Issue (delivery-rollup parent exemption)" from
+        # "the VC preflight requirement applies and was satisfied". A
+        # consumer reading only `status: go` cannot make this distinction;
+        # this field exists so any consumer inspecting the FULL result can.
+        # Value "applicable" is the safe default (Final Gate presumed to
+        # apply) unless a specific check below proves otherwise. This is a
+        # field-level-only backward-compatible addition: existing readers
+        # that only inspect `status` are UNCHANGED in behavior and are NOT
+        # made semantically safe by this field alone — they must be updated
+        # to read `applicability` to gain the distinction (see Known Gaps
+        # in this PR's description; impl-review-loop / implement-issue
+        # consumer code documented to read only `status: go` lives outside
+        # this Issue's Allowed Paths and was intentionally NOT modified
+        # here).
+        "applicability": "applicable",
         "source": None,
         "go_comment_url": None,
         "readiness_status": None,
@@ -369,6 +520,7 @@ def run_once(
         "vc_preflight_classifications": [],
         "vc_evidence": {"mode": evidence_mode},
         "current_vc_result": None,
+        "body_sha256": None,
         "checks": {
             "readiness": None,
             "blockers": None,
@@ -384,273 +536,341 @@ def run_once(
         "errors": [],
     }
 
-    # Step 1: idempotency check — if existing go exists, return early
-    if not skip_idempotency_check:
-        existing_go, id_err = check_existing_go_comment(issue_number, repo)
-        existing_url = existing_go.get("html_url") if existing_go else None
-        result["idempotency_check"]["existing_go_url"] = existing_url
-        if id_err:
-            result["errors"].append(f"idempotency_check_error: {id_err}")
-            # non-fatal: continue
-        elif existing_go:
-            # Already has a valid go comment — return deduped.
-            # P0-2 (#1794 PR review): declared_path_overlap observes the
-            # *live* OPEN PR set, which can change at any time independent
-            # of the issue body. It must therefore be recomputed fresh on
-            # every reuse rather than replayed from the saved comment's
-            # checks -- a saved value would go stale immediately. This is
-            # advisory-only: recomputing it here never changes result["status"].
-            result["status"] = "go"
-            result["source"] = "existing_go_comment"
-            result["go_comment_url"] = existing_url
-            result["idempotency_check"]["deduped"] = True
-            checks = existing_go.get("inner", {}).get("checks", {})
-            result["checks"]["product_spec_check"] = checks.get("product_spec_check")
-            result["checks"]["declared_path_overlap"] = _run_declared_path_overlap_check(
-                issue_number, repo
+    # Issue #1914 P0-3 (#1940 review): fetch the Issue body exactly once, at
+    # the very start of run_once(), before any check that reads body
+    # content. This single snapshot (and its body_sha256) is threaded
+    # through Step 1 (idempotency freshness), Step 2 (readiness check),
+    # Step 4 (product spec check), Step 4.5 (delivery-rollup applicability),
+    # and Step 5 (VC preflight) via --body-file / direct in-process reuse,
+    # so no step can independently observe a different body.
+    body_snapshot, body_snapshot_err = fetch_body_from_github(issue_number, repo)
+    if body_snapshot_err:
+        result["errors"].append(f"body_snapshot_fetch_error: {body_snapshot_err}")
+        result["status"] = "runtime_error"
+        return result
+    body_snapshot_sha256 = sha256_of(body_snapshot)
+    result["body_sha256"] = body_snapshot_sha256
+
+    body_snapshot_fd, body_snapshot_path = tempfile.mkstemp(
+        suffix=".md", prefix="contract_review_once_body_"
+    )
+    try:
+        with os.fdopen(body_snapshot_fd, "w", encoding="utf-8") as body_snapshot_file:
+            body_snapshot_file.write(body_snapshot)
+
+        # Step 1: idempotency check — if existing go exists, return early
+        if not skip_idempotency_check:
+            existing_go, id_err = check_existing_go_comment(
+                issue_number, repo, current_body_sha256=body_snapshot_sha256
             )
-            return result
+            existing_url = existing_go.get("html_url") if existing_go else None
+            result["idempotency_check"]["existing_go_url"] = existing_url
+            if id_err:
+                result["errors"].append(f"idempotency_check_error: {id_err}")
+                # non-fatal: continue
+            elif existing_go:
+                # Already has a valid go comment — return deduped.
+                # P0-2 (#1794 PR review): declared_path_overlap observes the
+                # *live* OPEN PR set, which can change at any time independent
+                # of the issue body. It must therefore be recomputed fresh on
+                # every reuse rather than replayed from the saved comment's
+                # checks -- a saved value would go stale immediately. This is
+                # advisory-only: recomputing it here never changes result["status"].
+                result["status"] = "go"
+                result["source"] = "existing_go_comment"
+                result["go_comment_url"] = existing_url
+                result["idempotency_check"]["deduped"] = True
+                checks = existing_go.get("inner", {}).get("checks", {})
+                result["checks"]["product_spec_check"] = checks.get("product_spec_check")
+                saved_vc_preflight = checks.get("vc_preflight")
+                if saved_vc_preflight is not None:
+                    result["checks"]["vc_preflight"] = saved_vc_preflight
+                # Issue #1914 P0-1: propagate the not_applicable marker from
+                # the saved snapshot too, so a deduped delivery-rollup go
+                # remains distinguishable from a deduped normal-pass go.
+                result["applicability"] = (
+                    "not_applicable" if saved_vc_preflight == "not_applicable" else "applicable"
+                )
+                result["checks"]["declared_path_overlap"] = _run_declared_path_overlap_check(
+                    issue_number, repo
+                )
+                return result
 
-    # Step 2: contract_readiness_check.py (static check)
-    readiness_cmd = [
-        sys.executable,
-        str(_CONTRACT_READINESS_CHECK_PY),
-        "--issue",
-        str(issue_number),
-        "--repo",
-        repo,
-        "--mode",
-        mode if mode in ("static", "preflight-static", "execute") else "static",
-    ]
-
-    readiness_json, readiness_rc, readiness_err = _run_script(readiness_cmd)
-
-    if readiness_err:
-        result["errors"].append(f"readiness_check_error: {readiness_err}")
-        result["status"] = "runtime_error"
-        return result
-
-    if readiness_json is None:
-        result["errors"].append("readiness_check_no_output")
-        result["status"] = "runtime_error"
-        return result
-
-    readiness_status = readiness_json.get("status", "")
-    result["readiness_status"] = readiness_status
-    result["readiness_errors"] = readiness_json.get("errors", [])
-
-    # Map readiness status
-    if readiness_status == "human_judgment":
-        result["checks"]["readiness"] = "human_judgment"
-        result["status"] = "human_judgment"
-        result["source"] = "readiness_check"
-        return result
-    elif readiness_status == "needs_fix":
-        result["checks"]["readiness"] = "needs_fix"
-        result["status"] = "blocked"
-        result["source"] = "readiness_check"
-        return result
-    elif readiness_status != "go":
-        # Unknown status from readiness check
-        result["status"] = "runtime_error"
-        result["errors"].append(f"unknown_readiness_status: {readiness_status}")
-        return result
-    else:
-        result["checks"]["readiness"] = "go"
-
-    # Step 3: check_blockers.sh
-    blockers_rc, blockers_stdout, blockers_stderr = _run_shell_script(
-        ["bash", str(_CHECK_BLOCKERS_SH), str(issue_number), repo],
-        timeout=_DEFAULT_TIMEOUT,
-    )
-
-    if blockers_rc == -1:
-        # Script not found or timeout
-        result["errors"].append(f"check_blockers_error: {blockers_stderr}")
-        result["status"] = "runtime_error"
-        return result
-    elif blockers_rc == 0:
-        result["checks"]["blockers"] = "pass"
-    else:
-        # exit 1 from check_blockers.sh:
-        #   "blocker が open" → deterministic blocked
-        #   "native dependency API unavailable" / "不一致" (mismatch) → human_judgment
-        stderr_lower = blockers_stderr.lower()
-        # Detect truly-ambiguous cases: API unavailable with no fallback, or mismatch
-        is_ambiguous = (
-            "unavailable" in stderr_lower
-            or "mismatch" in stderr_lower
-            or "不一致" in blockers_stderr
-            or "ambiguous" in stderr_lower
-        )
-        if is_ambiguous:
-            result["checks"]["blockers"] = "human_judgment"
-            result["status"] = "human_judgment"
-            result["source"] = "check_blockers"
-            result["errors"].append(f"check_blockers_human_judgment: {blockers_stderr.strip()}")
-            return result
-        else:
-            # blocker open OR fallback-based determination
-            result["checks"]["blockers"] = "blocked"
-            result["status"] = "blocked"
-            result["source"] = "check_blockers"
-            result["errors"].append(f"check_blockers_blocked: {blockers_stderr.strip()}")
-            return result
-
-    # Step 4: check_product_spec_contract.py
-    product_spec_json, product_spec_rc, product_spec_err = _run_script(
-        [
+        # Step 2: contract_readiness_check.py (static check)
+        readiness_cmd = [
             sys.executable,
-            str(_CHECK_PRODUCT_SPEC_PY),
-            "--issue-number",
-            str(issue_number),
-            "--repo",
-            repo,
-        ],
-        timeout=_DEFAULT_TIMEOUT,
-    )
-
-    if product_spec_err:
-        result["errors"].append(f"product_spec_check_error: {product_spec_err}")
-        result["status"] = "runtime_error"
-        return result
-
-    if product_spec_json is None:
-        result["errors"].append("product_spec_check_no_output")
-        result["status"] = "runtime_error"
-        return result
-
-    if product_spec_rc not in (0, 1):
-        result["errors"].append(
-            f"product_spec_check_nonzero_exit: rc={product_spec_rc}"
-        )
-        result["status"] = "runtime_error"
-        return result
-
-    gate = evaluate_product_spec_payload(
-        product_spec_json,
-        issue_url=f"https://github.com/{repo}/issues/{issue_number}",
-        body_sha256=product_spec_json.get("body_sha256") if isinstance(product_spec_json, dict) else None,
-        exit_code=product_spec_rc,
-    )
-    ps_applicability = gate.get("applicability")
-    ps_decision = gate.get("decision")
-
-    if gate.get("routing_action") == "refresh_contract_snapshot":
-        result["errors"].append(
-            f"product_spec_check_invalid_output: {gate.get('reason', 'unknown')}"
-        )
-        result["status"] = "runtime_error"
-        return result
-
-    # Preserve the validated evaluator payload for consumers that need to
-    # distinguish a legacy scalar summary from a schema-valid Product Spec
-    # decision bound to this review run.
-    result["checks"]["product_spec_check"] = product_spec_json
-
-    if ps_applicability == "applicable":
-        if ps_decision == "fail":
-            result["checks"]["product_spec"] = "fail"
-            result["status"] = "blocked"
-            result["source"] = "product_spec_check"
-            result["errors"].append(
-                f"product_spec_check_fail: {json.dumps(product_spec_json.get('blocked_reasons', []))}"
-            )
-            return result
-        elif ps_decision == "human_judgment":
-            result["checks"]["product_spec"] = "human_judgment"
-            result["status"] = "human_judgment"
-            result["source"] = "product_spec_check"
-            return result
-        else:
-            result["checks"]["product_spec"] = "pass"
-    else:
-        # not_applicable → treat as pass
-        result["checks"]["product_spec"] = "pass"
-
-    # Step 5: baseline_vc_preflight.py (run in all modes)
-    vc_command = [
-            sys.executable,
-            str(_BASELINE_VC_PREFLIGHT_PY),
+            str(_CONTRACT_READINESS_CHECK_PY),
             "--issue",
             str(issue_number),
             "--repo",
             repo,
-            "--timeout-seconds",
-            str(_VC_PREFLIGHT_PER_COMMAND_TIMEOUT),
-            "--max-workers",
-            str(_VC_PREFLIGHT_MAX_WORKERS),
-    ]
-    if evidence_mode == "current-head":
-        if not cwd or not reviewed_head_sha:
-            result["status"] = "blocked"
-            result["source"] = "vc_preflight"
-            result["checks"]["vc_preflight"] = "blocked"
-            result["errors"].append("current_head_requires_cwd_and_reviewed_head_sha")
-            return result
-        vc_command.extend([
-            "--cwd", cwd,
-            "--evidence-mode", "current-head",
-            "--reviewed-head-sha", reviewed_head_sha,
-            "--format", "json",
-        ])
-    vc_result_json, vc_rc, vc_err = _run_script(
-        vc_command,
-        timeout=_VC_PREFLIGHT_TIMEOUT,
-    )
+            "--mode",
+            mode if mode in ("static", "preflight-static", "execute") else "static",
+            "--body-file",
+            body_snapshot_path,
+        ]
 
-    if vc_err:
-        result["errors"].append(f"vc_preflight_error: {vc_err}")
-        result["status"] = "runtime_error"
-        return result
+        readiness_json, readiness_rc, readiness_err = _run_script(readiness_cmd)
 
-    if vc_result_json is None:
-        result["errors"].append("vc_preflight_no_output")
-        result["status"] = "runtime_error"
-        return result
-
-    vc_status = vc_result_json.get("status", "")
-    result["vc_preflight_status"] = vc_status
-    result["vc_preflight_classifications"] = vc_result_json.get("results", [])
-    result["current_vc_result"] = vc_result_json
-    result["vc_evidence"] = vc_result_json
-
-    if evidence_mode == "current-head":
-        envelope_errors = validate_current_head_envelope(vc_result_json, vc_rc)
-        if envelope_errors:
-            result["checks"]["vc_preflight"] = "blocked"
-            result["status"] = "blocked"
-            result["source"] = "vc_preflight"
-            result["errors"].extend(
-                f"uncertified_current_head_vc_evidence:{error}"
-                for error in envelope_errors
-            )
+        if readiness_err:
+            result["errors"].append(f"readiness_check_error: {readiness_err}")
+            result["status"] = "runtime_error"
             return result
 
-    if vc_status == "human_judgment":
-        result["checks"]["vc_preflight"] = "human_judgment"
-        result["status"] = "human_judgment"
-        result["source"] = "vc_preflight"
-        return result
-    elif vc_status == "blocked":
-        result["checks"]["vc_preflight"] = "blocked"
-        result["status"] = "blocked"
-        result["source"] = "vc_preflight"
-        return result
-    elif vc_status == "pass":
-        result["checks"]["vc_preflight"] = "pass"
-        # Step 6: declared_path_overlap (Issue #1680, advisory only).
-        result["checks"]["declared_path_overlap"] = _run_declared_path_overlap_check(
-            issue_number, repo
+        if readiness_json is None:
+            result["errors"].append("readiness_check_no_output")
+            result["status"] = "runtime_error"
+            return result
+
+        readiness_status = readiness_json.get("status", "")
+        result["readiness_status"] = readiness_status
+        result["readiness_errors"] = readiness_json.get("errors", [])
+
+        # Map readiness status
+        if readiness_status == "human_judgment":
+            result["checks"]["readiness"] = "human_judgment"
+            result["status"] = "human_judgment"
+            result["source"] = "readiness_check"
+            return result
+        elif readiness_status == "needs_fix":
+            result["checks"]["readiness"] = "needs_fix"
+            result["status"] = "blocked"
+            result["source"] = "readiness_check"
+            return result
+        elif readiness_status != "go":
+            # Unknown status from readiness check
+            result["status"] = "runtime_error"
+            result["errors"].append(f"unknown_readiness_status: {readiness_status}")
+            return result
+        else:
+            result["checks"]["readiness"] = "go"
+
+        # Step 3: check_blockers.sh
+        blockers_rc, blockers_stdout, blockers_stderr = _run_shell_script(
+            ["bash", str(_CHECK_BLOCKERS_SH), str(issue_number), repo],
+            timeout=_DEFAULT_TIMEOUT,
         )
-        result["status"] = "go"
-        result["source"] = "all_checks_pass"
-        return result
-    else:
-        # Unknown vc status
-        result["status"] = "runtime_error"
-        result["errors"].append(f"unknown_vc_preflight_status: {vc_status}")
-        return result
+
+        if blockers_rc == -1:
+            # Script not found or timeout
+            result["errors"].append(f"check_blockers_error: {blockers_stderr}")
+            result["status"] = "runtime_error"
+            return result
+        elif blockers_rc == 0:
+            result["checks"]["blockers"] = "pass"
+        else:
+            # exit 1 from check_blockers.sh:
+            #   "blocker が open" → deterministic blocked
+            #   "native dependency API unavailable" / "不一致" (mismatch) → human_judgment
+            stderr_lower = blockers_stderr.lower()
+            # Detect truly-ambiguous cases: API unavailable with no fallback, or mismatch
+            is_ambiguous = (
+                "unavailable" in stderr_lower
+                or "mismatch" in stderr_lower
+                or "不一致" in blockers_stderr
+                or "ambiguous" in stderr_lower
+            )
+            if is_ambiguous:
+                result["checks"]["blockers"] = "human_judgment"
+                result["status"] = "human_judgment"
+                result["source"] = "check_blockers"
+                result["errors"].append(f"check_blockers_human_judgment: {blockers_stderr.strip()}")
+                return result
+            else:
+                # blocker open OR fallback-based determination
+                result["checks"]["blockers"] = "blocked"
+                result["status"] = "blocked"
+                result["source"] = "check_blockers"
+                result["errors"].append(f"check_blockers_blocked: {blockers_stderr.strip()}")
+                return result
+
+        # Step 4: check_product_spec_contract.py
+        product_spec_json, product_spec_rc, product_spec_err = _run_script(
+            [
+                sys.executable,
+                str(_CHECK_PRODUCT_SPEC_PY),
+                "--issue-number",
+                str(issue_number),
+                "--repo",
+                repo,
+                "--body-file",
+                body_snapshot_path,
+            ],
+            timeout=_DEFAULT_TIMEOUT,
+        )
+
+        if product_spec_err:
+            result["errors"].append(f"product_spec_check_error: {product_spec_err}")
+            result["status"] = "runtime_error"
+            return result
+
+        if product_spec_json is None:
+            result["errors"].append("product_spec_check_no_output")
+            result["status"] = "runtime_error"
+            return result
+
+        if product_spec_rc not in (0, 1):
+            result["errors"].append(
+                f"product_spec_check_nonzero_exit: rc={product_spec_rc}"
+            )
+            result["status"] = "runtime_error"
+            return result
+
+        gate = evaluate_product_spec_payload(
+            product_spec_json,
+            issue_url=f"https://github.com/{repo}/issues/{issue_number}",
+            body_sha256=product_spec_json.get("body_sha256") if isinstance(product_spec_json, dict) else None,
+            exit_code=product_spec_rc,
+        )
+        ps_applicability = gate.get("applicability")
+        ps_decision = gate.get("decision")
+
+        if gate.get("routing_action") == "refresh_contract_snapshot":
+            result["errors"].append(
+                f"product_spec_check_invalid_output: {gate.get('reason', 'unknown')}"
+            )
+            result["status"] = "runtime_error"
+            return result
+
+        # Preserve the validated evaluator payload for consumers that need to
+        # distinguish a legacy scalar summary from a schema-valid Product Spec
+        # decision bound to this review run.
+        result["checks"]["product_spec_check"] = product_spec_json
+
+        if ps_applicability == "applicable":
+            if ps_decision == "fail":
+                result["checks"]["product_spec"] = "fail"
+                result["status"] = "blocked"
+                result["source"] = "product_spec_check"
+                result["errors"].append(
+                    f"product_spec_check_fail: {json.dumps(product_spec_json.get('blocked_reasons', []))}"
+                )
+                return result
+            elif ps_decision == "human_judgment":
+                result["checks"]["product_spec"] = "human_judgment"
+                result["status"] = "human_judgment"
+                result["source"] = "product_spec_check"
+                return result
+            else:
+                result["checks"]["product_spec"] = "pass"
+        else:
+            # not_applicable → treat as pass
+            result["checks"]["product_spec"] = "pass"
+
+        # Step 4.5 (Issue #1914): delivery-rollup parent applicability check.
+        # A canonical parent Issue (issue_kind: parent) with
+        # parent_mode: delivery-rollup and no `## Verification Commands`
+        # section is exempt from the Final Gate's baseline_vc_preflight
+        # requirement (OWNER decision, Issue #1890 / #1914). baseline_vc_preflight.py
+        # itself is not modified; Step 5 below is simply not invoked for this case.
+        #
+        # P0-3 fix: this reuses body_snapshot (the SAME single fetch used by
+        # Step 2 above) directly in-process. There is no second
+        # fetch_body_from_github() call here anymore, so Step 2 and Step 4.5
+        # are now structurally guaranteed to observe identical body bytes.
+        delivery_rollup_applicability = _resolve_delivery_rollup_applicability(body_snapshot)
+        if delivery_rollup_applicability.applicable:
+            result["checks"]["vc_preflight"] = "not_applicable"
+            result["vc_preflight_status"] = "not_applicable"
+            result["vc_preflight_classifications"] = []
+            result["applicability"] = "not_applicable"
+            result["checks"]["declared_path_overlap"] = _run_declared_path_overlap_check(
+                issue_number, repo
+            )
+            result["status"] = "go"
+            result["source"] = _DELIVERY_ROLLUP_SKIP_REASON_CODE
+            return result
+
+        # Step 5: baseline_vc_preflight.py (run in all modes)
+        vc_command = [
+                sys.executable,
+                str(_BASELINE_VC_PREFLIGHT_PY),
+                "--issue",
+                str(issue_number),
+                "--repo",
+                repo,
+                "--timeout-seconds",
+                str(_VC_PREFLIGHT_PER_COMMAND_TIMEOUT),
+                "--max-workers",
+                str(_VC_PREFLIGHT_MAX_WORKERS),
+                "--body-file",
+                body_snapshot_path,
+        ]
+        if evidence_mode == "current-head":
+            if not cwd or not reviewed_head_sha:
+                result["status"] = "blocked"
+                result["source"] = "vc_preflight"
+                result["checks"]["vc_preflight"] = "blocked"
+                result["errors"].append("current_head_requires_cwd_and_reviewed_head_sha")
+                return result
+            vc_command.extend([
+                "--cwd", cwd,
+                "--evidence-mode", "current-head",
+                "--reviewed-head-sha", reviewed_head_sha,
+                "--format", "json",
+            ])
+        vc_result_json, vc_rc, vc_err = _run_script(
+            vc_command,
+            timeout=_VC_PREFLIGHT_TIMEOUT,
+        )
+
+        if vc_err:
+            result["errors"].append(f"vc_preflight_error: {vc_err}")
+            result["status"] = "runtime_error"
+            return result
+
+        if vc_result_json is None:
+            result["errors"].append("vc_preflight_no_output")
+            result["status"] = "runtime_error"
+            return result
+
+        vc_status = vc_result_json.get("status", "")
+        result["vc_preflight_status"] = vc_status
+        result["vc_preflight_classifications"] = vc_result_json.get("results", [])
+        result["current_vc_result"] = vc_result_json
+        result["vc_evidence"] = vc_result_json
+
+        if evidence_mode == "current-head":
+            envelope_errors = validate_current_head_envelope(vc_result_json, vc_rc)
+            if envelope_errors:
+                result["checks"]["vc_preflight"] = "blocked"
+                result["status"] = "blocked"
+                result["source"] = "vc_preflight"
+                result["errors"].extend(
+                    f"uncertified_current_head_vc_evidence:{error}"
+                    for error in envelope_errors
+                )
+                return result
+
+        if vc_status == "human_judgment":
+            result["checks"]["vc_preflight"] = "human_judgment"
+            result["status"] = "human_judgment"
+            result["source"] = "vc_preflight"
+            return result
+        elif vc_status == "blocked":
+            result["checks"]["vc_preflight"] = "blocked"
+            result["status"] = "blocked"
+            result["source"] = "vc_preflight"
+            return result
+        elif vc_status == "pass":
+            result["checks"]["vc_preflight"] = "pass"
+            # Step 6: declared_path_overlap (Issue #1680, advisory only).
+            result["checks"]["declared_path_overlap"] = _run_declared_path_overlap_check(
+                issue_number, repo
+            )
+            result["status"] = "go"
+            result["source"] = "all_checks_pass"
+            return result
+        else:
+            # Unknown vc status
+            result["status"] = "runtime_error"
+            result["errors"].append(f"unknown_vc_preflight_status: {vc_status}")
+            return result
+    finally:
+        try:
+            os.unlink(body_snapshot_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
