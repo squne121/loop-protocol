@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { resolveProgressionSaveFailureFeedback, runNextSortieHandler, runProgressionSave } from '../src/main'
 // Note: ProgressionSaveReason is now 'reward-claim' | 'save' (Quick Save renamed to Save — #619)
@@ -29,6 +29,14 @@ function createMemoryStorage(initialEntries?: Record<string, string>) {
 }
 
 describe('LocalGameStorage', () => {
+  beforeEach(() => {
+    vi.stubEnv('VITE_E2E_MODE', 'true')
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
   it('GIVEN no override WHEN resolveStorageKey is called THEN returns production save key', () => {
     expect(resolveStorageKey()).toBe(defaultSaveKey)
   })
@@ -136,6 +144,33 @@ describe('LocalGameStorage', () => {
     try {
       storageWindow.__LOOP_STORAGE_KEY__ = 123
       expect(() => resolveStorageKey()).toThrowError('__LOOP_STORAGE_KEY__ must be a string')
+    } finally {
+      if (previousOverride === undefined) {
+        Reflect.deleteProperty(storageWindow, '__LOOP_STORAGE_KEY__')
+      } else {
+        storageWindow.__LOOP_STORAGE_KEY__ = previousOverride
+      }
+    }
+  })
+
+  it('GIVEN production mode and a valid runtime storage override WHEN createLocalGameStorage writes THEN it uses only the default save key', () => {
+    const storageWindow = globalThis as Window & { __LOOP_STORAGE_KEY__?: string }
+    const previousOverride = storageWindow.__LOOP_STORAGE_KEY__
+    const overrideKey = 'loop-protocol.e2e.production-leak.mvp.save'
+
+    try {
+      vi.stubEnv('VITE_E2E_MODE', 'false')
+      storageWindow.__LOOP_STORAGE_KEY__ = overrideKey
+      expect(resolveStorageKey()).toBe(defaultSaveKey)
+
+      const storage = createMemoryStorage()
+      const gameStorage = createLocalGameStorage(undefined, storage)
+      expect(gameStorage.save({ schemaVersion: 1, resources: 1, weaponPower: 2, playerMaxHp: 3 }))
+        .toEqual({ ok: true, reason: 'saved' })
+      expect(storage.getItem(defaultSaveKey)).toBe(
+        '{"schemaVersion":1,"resources":1,"weaponPower":2,"playerMaxHp":3}',
+      )
+      expect(storage.getItem(overrideKey)).toBeNull()
     } finally {
       if (previousOverride === undefined) {
         Reflect.deleteProperty(storageWindow, '__LOOP_STORAGE_KEY__')
