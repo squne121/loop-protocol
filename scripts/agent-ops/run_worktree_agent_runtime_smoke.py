@@ -55,7 +55,18 @@ import time
 import uuid
 from pathlib import Path
 
+import yaml
+
 SCHEMA = "WORKTREE_AGENT_RUNTIME_SMOKE_RESULT_V1"
+
+# Default requested_agent_type when the caller does not declare one (Issue
+# #1733 Scope Delta, 2026-08-02 owner-approved harness extension). Existing
+# callers of this script predate the ``--agent-type`` flag (the harness's own
+# test suite invokes it without this flag in >100 places), so the flag is
+# deliberately optional with a clearly-labeled placeholder default rather than
+# a hard-required argument that would break them. Issue #1733 AC12's own
+# invocation always passes a real ``--agent-type`` value.
+_UNSPECIFIED_AGENT_TYPE = "unspecified"
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -509,6 +520,215 @@ def has_terminal_event(runtime: str, stdout: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Structured telemetry fields (Issue #1733 Scope Delta, 2026-08-02
+# owner-approved harness extension) — tested_head / runtime_version /
+# requested_agent_type / effective_agent_type / loaded_skills / spawn_events /
+# child_spawn_event_count / self_restart_event_count /
+# orchestration_action_count / prompt_sha256. Derived only from data
+# genuinely available during the run (native JSON event stream already
+# captured by the structured lane, static agent-definition frontmatter, git,
+# and hashlib) -- never fabricated. A value that cannot be honestly derived
+# is left as ``None`` (rendered by ``write_evidence`` as the literal string
+# ``None``, distinguishable from a real value) rather than guessed.
+# ---------------------------------------------------------------------------
+
+# Claude Code's SubAgent-spawning tool is named ``Agent`` (confirmed from this
+# same repository's own PreToolUse hook matcher configuration, which targets
+# the literal tool name ``Agent`` -- see docs/dev/agent-skill-boundaries.md's
+# settings.json excerpt, matcher: "Agent" -- and from
+# ``.claude/agents/post-merge-cleanup-worker.md``'s ``disallowedTools:
+# [Agent]``). It is not named ``Task``.
+_CLAUDE_SPAWN_TOOL_NAME = "Agent"
+
+# Codex CLI's native sub-agent dispatch (`spawn_agent`, `namespace:
+# collaboration`) was empirically observed (Issue #1859/#1864 evidence,
+# artifacts/codex-permission-profile-smoke/pr-1864/*-exec-events.jsonl,
+# codex-cli 0.146.0) to NOT surface the ``spawn_agent`` function_call itself
+# as a top-level ``item.completed``/``item.started`` event in ``codex exec
+# --json`` stdout -- only the full session *rollout* log (not captured by
+# this harness, which only reads stdout) shows
+# ``payload.type=="function_call"`` with ``payload.name=="spawn_agent"``. The
+# only visible signal in the ``--json`` stdout stream is
+# ``item.type=="collab_tool_call"`` (observed with ``tool":"wait"`` in that
+# evidence, corresponding to the parent's ``wait_agent`` call after a spawn).
+# Because a ``spawn_agent`` call is virtually always followed by a
+# corresponding ``wait``/``interrupt``/``send_message`` collaboration item
+# that IS visible here, any ``collab_tool_call`` item is treated as spawn
+# evidence (best-effort, documented over/under-count risk: a lone
+# ``collab_tool_call`` cannot positively distinguish "this session spawned an
+# agent" from "some other collaboration-tool activity occurred", but for a
+# fresh no-child-policy smoke run any such item at all is itself worth
+# surfacing rather than silently discarding).
+_CODEX_COLLAB_ITEM_TYPE = "collab_tool_call"
+
+# Bash/shell command patterns that indicate the worker re-invoked its own
+# agent runtime (self-restart) -- mirrors
+# scripts/check_post_merge_cleanup_boundary.py's
+# ``_EXTERNAL_AGENT_CLI_INVOCATION_RE`` / ``_AGENT_CLI_BINARY_IN_CODE_RE``
+# static-text detection patterns, applied here to genuine runtime Bash
+# tool_use commands instead of Skill-body prose.
+_SELF_RESTART_COMMAND_RE = re.compile(
+    r"(?:^|[\s/'\"();|&])(?:env\s+|command\s+)*(?:\S*/)?(codex\s+exec|claude\s+-p)\b"
+)
+
+# Bash/shell command patterns that indicate main-thread-only orchestration
+# routing actions (follow-up Issue creation/closure, parent Issue closure,
+# superseded PR closure/comment) -- actions the executor Skill explicitly
+# says workers must not perform.
+_ORCHESTRATION_ACTION_COMMAND_RE = re.compile(
+    r"(?:^|[\s/'\"();|&])gh\s+(?:issue\s+close|issue\s+comment|pr\s+close|pr\s+comment)\b"
+)
+
+
+def capture_runtime_version(bin_path: str) -> str | None:
+    """``<bin> --version`` output, captured once at run start. Returns
+    ``None`` (never a fabricated string) if the binary does not respond.
+
+    ``input_text=""`` is passed explicitly (rather than left unset) so a
+    binary that happens to read stdin before checking its argv (as some test
+    fixtures do) is handed an immediate EOF instead of depending on the
+    caller process's own ambient stdin state. The first line is also
+    sanity-checked against JSON-event-stream leakage (a version string is
+    never a JSON object) and redacted/bounded like other captured process
+    output, defense-in-depth against a binary that does not behave like a
+    well-formed ``--version`` implementation."""
+    rc, out, err, timed_out = _run([bin_path, "--version"], timeout=15.0, input_text="")
+    if timed_out or rc != 0:
+        return None
+    text = (out or err).strip()
+    if not text:
+        return None
+    first_line = _redact(text.splitlines()[0].strip())[:_MAX_LINE_CHARS]
+    if not first_line or first_line.startswith("{") or '"type"' in first_line:
+        return None
+    return first_line
+
+
+def compute_prompt_sha256(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
+def load_static_declared_skills(checkout_root: str, agent_type: str) -> list[str] | None:
+    """Real, independently-verifiable ground truth: the ``skills:``
+    frontmatter list declared in ``.claude/agents/<agent_type>.md`` for the
+    given ``requested_agent_type``. This is a STATIC declaration (what the
+    agent is configured to preload), not a runtime-observed fact -- callers
+    must not read this as "the CLI actually preloaded X" (no such signal is
+    available from the native event stream). Returns ``None`` (not a
+    fabricated empty list) when the agent definition file does not exist or
+    has no ``skills:`` frontmatter key, e.g. for the ``unspecified``
+    placeholder agent type.
+
+    ``checkout_root`` must be the *tested worktree*, not the canonical
+    repository root: a worktree may carry an in-flight change to the agent
+    definition (e.g. a not-yet-merged ``skills:`` frontmatter addition) that
+    the canonical root does not yet have, and the smoke evidence must reflect
+    the checkout actually being verified.
+    """
+    if not agent_type or agent_type == _UNSPECIFIED_AGENT_TYPE:
+        return None
+    agent_md = Path(checkout_root) / ".claude" / "agents" / f"{agent_type}.md"
+    if not agent_md.is_file():
+        return None
+    text = agent_md.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return None
+    _, _, remainder = text.partition("---\n")
+    frontmatter_text, _, _ = remainder.partition("\n---\n")
+    try:
+        frontmatter = yaml.safe_load(frontmatter_text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(frontmatter, dict):
+        return None
+    skills = frontmatter.get("skills")
+    if not isinstance(skills, list):
+        return None
+    return [str(s) for s in skills]
+
+
+def classify_claude_events(stdout: str) -> tuple[list[dict], int, int]:
+    """Classify the already-captured native ``stream-json`` event stream for
+    Claude Code. Returns ``(spawn_events, self_restart_event_count,
+    orchestration_action_count)``. ``spawn_events`` entries are short
+    structured labels (tool name + a small allowlisted param, never raw
+    prompt/task content) per evidence-hygiene discipline."""
+    spawn_events: list[dict] = []
+    self_restart_count = 0
+    orchestration_count = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "assistant":
+            continue
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            tool_name = block.get("name")
+            if tool_name == _CLAUDE_SPAWN_TOOL_NAME:
+                spawn_events.append({"runtime": "claude", "tool": _CLAUDE_SPAWN_TOOL_NAME})
+                continue
+            if tool_name != "Bash":
+                continue
+            tool_input = block.get("input")
+            command = tool_input.get("command") if isinstance(tool_input, dict) else None
+            command = command if isinstance(command, str) else ""
+            if _SELF_RESTART_COMMAND_RE.search(command):
+                self_restart_count += 1
+            if _ORCHESTRATION_ACTION_COMMAND_RE.search(command):
+                orchestration_count += 1
+    return spawn_events, self_restart_count, orchestration_count
+
+
+def classify_codex_events(stdout: str) -> tuple[list[dict], int, int]:
+    """Classify the already-captured native ``--json`` JSONL event stream for
+    Codex CLI. Returns ``(spawn_events, self_restart_event_count,
+    orchestration_action_count)``. See ``_CODEX_COLLAB_ITEM_TYPE`` docstring
+    above for the empirical basis and documented limitation of the
+    ``collab_tool_call`` best-effort signal."""
+    spawn_events: list[dict] = []
+    self_restart_count = 0
+    orchestration_count = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else None
+        if item is not None and item.get("type") == _CODEX_COLLAB_ITEM_TYPE:
+            spawn_events.append(
+                {"runtime": "codex", "item_type": _CODEX_COLLAB_ITEM_TYPE, "tool": item.get("tool")}
+            )
+        # Codex's structured lane invokes the model's own shell/exec tool
+        # (not a "Bash" tool_use block) -- best-effort scan any string value
+        # under an item.completed/item.started payload for the same
+        # self-restart / orchestration command patterns observed for the
+        # Claude lane, without persisting the raw payload.
+        if item is not None:
+            command = item.get("command")
+            command = command if isinstance(command, str) else ""
+            if _SELF_RESTART_COMMAND_RE.search(command):
+                self_restart_count += 1
+            if _ORCHESTRATION_ACTION_COMMAND_RE.search(command):
+                orchestration_count += 1
+    return spawn_events, self_restart_count, orchestration_count
+
+
+# ---------------------------------------------------------------------------
 # Interactive herdr lane — isolated named session (Issue #1921 P0-1..P0-4)
 # ---------------------------------------------------------------------------
 
@@ -928,6 +1148,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inspect-session-log-metadata", action="store_true")
     parser.add_argument("--require-session-log-metadata", action="store_true")
     parser.add_argument("--repo-root", default=None, help="override canonical repository root (tests only)")
+    parser.add_argument(
+        "--agent-type",
+        default=_UNSPECIFIED_AGENT_TYPE,
+        help=(
+            "declares which worker/agent persona this smoke run represents "
+            "(e.g. post-merge-cleanup-worker), used to derive "
+            "requested_agent_type / effective_agent_type / loaded_skills "
+            "evidence. Optional (defaults to the placeholder "
+            f"'{_UNSPECIFIED_AGENT_TYPE}') so pre-existing callers that do not "
+            "pass this flag are not broken; AC12-grade invocations must pass "
+            "a real value."
+        ),
+    )
     return parser
 
 
@@ -984,6 +1217,28 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_SKIP
 
     exit_code = EXIT_OK
+
+    # Structured telemetry fields that are trivially and deterministically
+    # derivable up front (Issue #1733 Scope Delta, 2026-08-02 owner-approved
+    # harness extension). ``tested_head``/``runtime_version``/
+    # ``prompt_sha256`` are captured once at run start; ``loaded_skills`` is a
+    # static frontmatter fact independent of the run itself.
+    tested_head = _git_rev_parse(worktree, "HEAD")
+    runtime_bin = "claude" if args.runtime == "claude" else "codex"
+    runtime_version = capture_runtime_version(runtime_bin)
+    requested_agent_type = args.agent_type
+    # No independent runtime signal of "which persona was effectively
+    # active" was found beyond what was requested: neither Claude Code's
+    # stream-json ``system``/``result`` events nor Codex's ``--json`` event
+    # types echo back a caller-declared agent/persona name (only Codex's
+    # rollout-only ``spawn_agent`` calls carry an ``agent_type`` -- for a
+    # *sub*-agent spawned *by* this run, not for this run's own identity --
+    # see the ``_CODEX_COLLAB_ITEM_TYPE`` note above). Documented finding:
+    # effective_agent_type is therefore set equal to requested_agent_type.
+    effective_agent_type = requested_agent_type
+    loaded_skills = load_static_declared_skills(worktree, requested_agent_type)
+    prompt_sha256 = compute_prompt_sha256(prompt)
+
     schema_summary: dict = {
         "schema": SCHEMA,
         "run_id": run_id,
@@ -992,6 +1247,13 @@ def main(argv: list[str] | None = None) -> int:
         "transport": "direct" if args.mode == "structured" else "herdr_isolated_session",
         "worktree": os.path.relpath(worktree, repo_root),
         "timeout_seconds": args.timeout_seconds,
+        "tested_head": tested_head,
+        "runtime_version": runtime_version,
+        "requested_agent_type": requested_agent_type,
+        "effective_agent_type": effective_agent_type,
+        "loaded_skills": loaded_skills,
+        "loaded_skills_source": "static_frontmatter" if loaded_skills is not None else None,
+        "prompt_sha256": prompt_sha256,
     }
 
     before_fp = repo_fingerprint(worktree, output_dir_rel) if args.require_clean_postcondition else None
@@ -1009,6 +1271,15 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["process_exit_code"] = rc
             schema_summary["timed_out"] = timed_out
             schema_summary["native_event_count"] = event_count
+
+            if args.runtime == "claude":
+                spawn_events, self_restart_count, orchestration_count = classify_claude_events(out)
+            else:
+                spawn_events, self_restart_count, orchestration_count = classify_codex_events(out)
+            schema_summary["spawn_events"] = spawn_events
+            schema_summary["child_spawn_event_count"] = len(spawn_events)
+            schema_summary["self_restart_event_count"] = self_restart_count
+            schema_summary["orchestration_action_count"] = orchestration_count
 
             if timed_out:
                 errors.append("structured lane timed out")
@@ -1084,6 +1355,20 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["detected_agent"] = evidence.get("detected_agent")
             schema_summary["detected_agent_confidence"] = evidence.get("detected_agent_confidence")
             schema_summary["prompt_stall_recovered"] = evidence.get("prompt_stall_recovered")
+
+            # Best-effort text-scan classification over the bounded, redacted
+            # pane transcript (no native JSON event stream exists for the
+            # interactive lane). self_restart / orchestration commands are
+            # plausibly visible as literal shell text in the pane; a nested
+            # ``Agent`` tool_use invocation is NOT reliably distinguishable
+            # from ordinary TUI prose in a plain-text pane transcript, so
+            # child_spawn_event_count / spawn_events are left ``None``
+            # (documented gap) rather than guessed for this lane.
+            pane_text = "\n".join(pane_output_lines)
+            schema_summary["spawn_events"] = None
+            schema_summary["child_spawn_event_count"] = None
+            schema_summary["self_restart_event_count"] = len(_SELF_RESTART_COMMAND_RE.findall(pane_text))
+            schema_summary["orchestration_action_count"] = len(_ORCHESTRATION_ACTION_COMMAND_RE.findall(pane_text))
 
             cleanup = evidence.get("cleanup") or {}
             schema_summary["cleanup_attempted"] = cleanup.get("attempted", False)
