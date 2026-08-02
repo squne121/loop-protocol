@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import stat
 import subprocess
@@ -1481,3 +1482,277 @@ def test_given_repo_when_thin_wrapper_checked_then_points_to_canonical_body():
     assert "derived/non-canonical" in text
     assert "../../../.claude/skills/worktree-agent-runtime-smoke/SKILL.md" in text
     assert "## Procedure" not in text
+
+
+# ---------------------------------------------------------------------------
+# Issue #1733 Scope Delta (2026-08-02, owner-approved harness extension):
+# structured telemetry fields -- tested_head / runtime_version /
+# requested_agent_type / effective_agent_type / loaded_skills / spawn_events /
+# child_spawn_event_count / self_restart_event_count /
+# orchestration_action_count / prompt_sha256.
+# ---------------------------------------------------------------------------
+
+
+_FAKE_CLAUDE_VERSION_BRANCH = """
+if [ "$1" = "--version" ]; then
+  echo "2.1.220 (Claude Code)"
+  exit 0
+fi
+"""
+
+
+def _write_fake_agent_md(checkout_root: Path, agent_type: str, skills: list[str]) -> None:
+    agents_dir = checkout_root / ".claude" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    skills_yaml = "\n".join(f"  - {s}" for s in skills)
+    (agents_dir / f"{agent_type}.md").write_text(
+        f"---\nname: {agent_type}\nskills:\n{skills_yaml}\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+
+
+def test_given_agent_type_flag_and_declared_agent_md_when_structured_run_succeeds_then_loaded_skills_recorded(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    _write_fake_agent_md(worktree, "post-merge-cleanup-worker", ["post-merge-cleanup-executor"])
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + _FAKE_CLAUDE_VERSION_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    prompt = _prompt_file(tmp_path, "MARKER_TOKEN_WT\n")
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--agent-type", "post-merge-cleanup-worker",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "requested_agent_type: post-merge-cleanup-worker" in summary
+    assert "effective_agent_type: post-merge-cleanup-worker" in summary
+    assert "loaded_skills: ['post-merge-cleanup-executor']" in summary
+    assert "loaded_skills_source: static_frontmatter" in summary
+
+
+def test_given_no_agent_type_flag_when_structured_run_succeeds_then_defaults_to_unspecified_and_loaded_skills_none(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + _FAKE_CLAUDE_VERSION_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    prompt = _prompt_file(tmp_path, "MARKER_TOKEN_WT\n")
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "requested_agent_type: unspecified" in summary
+    assert "effective_agent_type: unspecified" in summary
+    assert "loaded_skills: None" in summary
+    assert "loaded_skills_source: None" in summary
+
+
+def test_given_fake_claude_success_when_structured_run_then_tested_head_runtime_version_prompt_sha256_recorded(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + _FAKE_CLAUDE_VERSION_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    prompt_text = "MARKER_TOKEN_WT\n"
+    prompt = _prompt_file(tmp_path, prompt_text)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    expected_head = _git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+    assert f"tested_head: {expected_head}" in summary
+    assert "runtime_version: 2.1.220 (Claude Code)" in summary
+    import hashlib
+
+    expected_sha256 = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    assert f"prompt_sha256: {expected_sha256}" in summary
+
+
+def test_given_claude_agent_tool_use_event_when_structured_run_then_child_spawn_event_count_recorded(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + _FAKE_CLAUDE_VERSION_BRANCH + """
+cat > /dev/null
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Agent","input":{"subagent_type":"implementation-worker"}}]}}'
+echo '{"type":"result"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "child_spawn_event_count: 1" in summary
+    assert "spawn_events: [{'runtime': 'claude', 'tool': 'Agent'}]" in summary
+    # No raw prompt/task content (e.g. the subagent_type input value) leaks
+    # into the allowlist-only evidence (evidence-hygiene discipline).
+    assert "implementation-worker" not in summary
+
+
+def test_given_claude_bash_self_restart_command_when_structured_run_then_self_restart_event_count_recorded(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + _FAKE_CLAUDE_VERSION_BRANCH + """
+cat > /dev/null
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"claude -p --output-format stream-json"}}]}}'
+echo '{"type":"result"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "self_restart_event_count: 1" in summary
+    assert "child_spawn_event_count: 0" in summary
+
+
+def test_given_claude_bash_orchestration_command_when_structured_run_then_orchestration_action_count_recorded(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + _FAKE_CLAUDE_VERSION_BRANCH + """
+cat > /dev/null
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"gh issue close 1234"}}]}}'
+echo '{"type":"result"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "orchestration_action_count: 1" in summary
+
+
+def test_given_codex_collab_tool_call_item_when_structured_run_then_child_spawn_event_count_recorded(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "codex", """
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "--json --ephemeral -C"
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo "codex-cli 0.146.0"
+  exit 0
+fi
+cat > /dev/null
+echo '{"type":"item.completed","item":{"id":"item_1","type":"collab_tool_call","tool":"wait"}}'
+echo '{"type":"item.completed"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "codex", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "child_spawn_event_count: 1" in summary
+    assert "runtime_version: codex-cli 0.146.0" in summary
+
+
+# ---------------------------------------------------------------------------
+# Unit-level coverage for the classification / derivation helpers themselves
+# (direct import, per the established pattern for internal-function tests).
+# ---------------------------------------------------------------------------
+
+
+def test_given_no_matching_events_when_classify_claude_events_then_empty_result():
+    module = _load_module()
+    stdout = "\n".join([
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({"type": "result"}),
+    ])
+    spawn_events, self_restart, orchestration = module.classify_claude_events(stdout)
+    assert spawn_events == []
+    assert self_restart == 0
+    assert orchestration == 0
+
+
+def test_given_non_bash_non_agent_tool_use_when_classify_claude_events_then_not_counted():
+    module = _load_module()
+    stdout = json.dumps({
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "x.py"}}]},
+    })
+    spawn_events, self_restart, orchestration = module.classify_claude_events(stdout)
+    assert spawn_events == []
+    assert self_restart == 0
+    assert orchestration == 0
+
+
+def test_given_agent_type_and_missing_agent_md_when_load_static_declared_skills_then_none(tmp_path):
+    module = _load_module()
+    assert module.load_static_declared_skills(str(tmp_path), "does-not-exist-worker") is None
+
+
+def test_given_unspecified_agent_type_when_load_static_declared_skills_then_none(tmp_path):
+    module = _load_module()
+    assert module.load_static_declared_skills(str(tmp_path), module._UNSPECIFIED_AGENT_TYPE) is None
+
+
+def test_given_agent_md_with_skills_frontmatter_when_load_static_declared_skills_then_list_returned(tmp_path):
+    module = _load_module()
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "some-worker.md").write_text(
+        "---\nname: some-worker\nskills:\n  - alpha\n  - beta\n---\n\nbody\n", encoding="utf-8"
+    )
+    assert module.load_static_declared_skills(str(tmp_path), "some-worker") == ["alpha", "beta"]
+
+
+def test_given_prompt_text_when_compute_prompt_sha256_then_matches_stdlib_hashlib():
+    module = _load_module()
+    import hashlib
+
+    text = "hello world\n"
+    assert module.compute_prompt_sha256(text) == hashlib.sha256(text.encode("utf-8")).hexdigest()

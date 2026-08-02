@@ -566,44 +566,38 @@ def check_agent_parity_strict(repo_root: Path = REPO_ROOT) -> ValidationResult:
 # self-restart/orchestration-action events occurred, or whether the artifact
 # was produced against the current HEAD.
 #
-# Iteration 6 regression (fixed here, iteration 7): iteration 5's rewrite
-# required an explicit ``--artifact-path`` for *any* PASS, which meant the
-# Issue's own literal AC12 Verification Command (which never passes
-# ``--artifact-path``) could structurally never PASS -- only SKIP. It also
-# hard-failed the check whenever any of the 11 structured fields were
-# absent, even though the current shared harness
-# (``scripts/agent-ops/run_worktree_agent_runtime_smoke.py``, outside Issue
-# #1733's Allowed Paths) deliberately writes an allowlist-only ``summary.md``
-# (Issue #1921 P1 fix-delta) that does not yet emit most of them -- so a real
-# harness-produced artifact could never PASS either, even with
-# ``--artifact-path`` supplied.
+# Iteration 6 regression (fixed in iteration 7, then genuinely resolved in
+# iteration 8): iteration 5's rewrite required an explicit ``--artifact-path``
+# for *any* PASS, which meant the Issue's own literal AC12 Verification
+# Command (which never passes ``--artifact-path``) could structurally never
+# PASS -- only SKIP. It also hard-failed the check whenever any of the 11
+# structured fields were absent, even though the shared harness
+# (``scripts/agent-ops/run_worktree_agent_runtime_smoke.py``) did not yet
+# emit them at the time -- so a real harness-produced artifact could never
+# PASS either, even with ``--artifact-path`` supplied.
 #
-# This rewrite (iteration 7):
-# - when ``--artifact-path`` is omitted, falls back to a single, fixed,
-#   deterministic default location (``_DEFAULT_ARTIFACT_PATH`` below) --
-#   never a glob-first-match across multiple candidate directories. If that
-#   fixed default does not exist, the result is SKIP (77), preserving
-#   fail-closed behavior for environments with no evidence at all.
-# - treats the structured fields (``tested_head``, ``runtime_version``,
-#   ``requested_agent_type``, ``effective_agent_type``, ``loaded_skills``,
-#   ``child_spawn_event_count``, ``spawn_events``,
-#   ``self_restart_event_count``, ``orchestration_action_count``,
-#   ``prompt_sha256``) as best-effort: if present, each is validated
-#   strictly (unchanged rules from iteration 5/6); if absent because the
-#   current harness does not yet emit it, the check does NOT fail on that
-#   field alone -- the field name is collected into ``harness_gap_fields``
-#   and printed as a visible WARNING (never silently dropped).
-# - still hard-requires and hard-validates the legacy generic-health fields
-#   (``exit_code``, ``timed_out``, ``expected_markers_missing``, ``errors``,
-#   ``postcondition_unexpected_changes``) and, when ``tested_head`` IS
-#   present, still hard-fails on an actual mismatch against the current
-#   ``git rev-parse HEAD`` (a wrong value is worse than an absent field).
+# Iteration 7 (superseded by iteration 8 below) temporarily downgraded the
+# structured fields to best-effort (WARNING on absence, not FAIL) as a
+# stop-gap, because the harness itself was outside Issue #1733's Allowed
+# Paths at that time and structurally could not emit them.
 #
-# Known gap (explicitly reported, not silently worked around): a real
-# harness-produced artifact still will not carry most of the structured
-# fields until the harness is extended (follow-up Issue, out of Issue
-# #1733's Allowed Paths). That gap is now surfaced as a WARNING rather than
-# blocking every possible PASS.
+# Iteration 8 (Issue #1733 Scope Delta, 2026-08-02 owner-approved extension
+# of Allowed Paths to include the harness): the harness
+# (``scripts/agent-ops/run_worktree_agent_runtime_smoke.py``) now genuinely
+# derives and emits all 10 structured fields (``tested_head``,
+# ``runtime_version``, ``requested_agent_type``, ``effective_agent_type``,
+# ``loaded_skills``, ``child_spawn_event_count``, ``spawn_events``,
+# ``self_restart_event_count``, ``orchestration_action_count``,
+# ``prompt_sha256``) for the structured lane, so the iteration 7 best-effort
+# downgrade is reverted: this checker again HARD-REQUIRES and HARD-VALIDATES
+# all of them (missing -> FAIL, not a WARNING), matching the original
+# iteration 6 intent. When ``--artifact-path`` is omitted, this still falls
+# back to a single, fixed, deterministic default location
+# (``_DEFAULT_ARTIFACT_PATH`` below) -- never a glob-first-match across
+# multiple candidate directories -- and SKIP (77) when that default does not
+# exist, preserving fail-closed behavior for environments with no evidence at
+# all (the iteration 7 fix for the AC12-VC-can-never-PASS regression is
+# retained; only the field-strictness downgrade is reverted).
 # ---------------------------------------------------------------------------
 
 # Single, fixed, deterministic default artifact location used when
@@ -684,12 +678,12 @@ def check_runtime_smoke_evidence(repo_root: Path = REPO_ROOT, artifact_path: str
     the check falls back to the single fixed default location
     (``_DEFAULT_ARTIFACT_PATH``). SKIP (77) is returned when the resolved
     path does not exist — this is never promoted to PASS. When an artifact
-    exists, it is hard-validated against the legacy generic-health fields
-    and best-effort-validated against the structured worker-identity /
-    Skill-load / spawn-event / tested-head fields (Blocker 1, Issue #1733
-    PR #1947 fix_delta; best-effort downgrade applied in iteration 7 to fix
-    the iteration 6 regression that made the literal AC12 VC structurally
-    unable to ever PASS).
+    exists, it is hard-validated against both the legacy generic-health
+    fields and the structured worker-identity / Skill-load / spawn-event /
+    tested-head fields (Blocker 1, Issue #1733 PR #1947 fix_delta; iteration 8
+    reverted the iteration 7 best-effort/WARNING-only downgrade now that the
+    harness genuinely emits all 10 structured fields — a missing or
+    unresolved (``None``) structured field is a hard FAIL, not a warning).
     """
     if not artifact_path:
         summary_path = repo_root / _DEFAULT_ARTIFACT_PATH
@@ -727,45 +721,49 @@ def check_runtime_smoke_evidence(repo_root: Path = REPO_ROOT, artifact_path: str
             f"postcondition_unexpected_changes={fields.get('postcondition_unexpected_changes')!r} (expected [])"
         )
 
-    # Structured fields (Blocker 1): best-effort. A field that IS present is
-    # validated strictly (unchanged rules below); a field that is ABSENT
-    # because the current harness does not yet emit it is not a failure —
-    # it is surfaced as a visible warning instead (harness_gap_fields).
-    harness_gap_fields = [key for key in _REQUIRED_STRUCTURED_SMOKE_FIELDS if key not in fields]
-    if harness_gap_fields:
-        print(
-            f"WARNING: harness does not yet emit structured field(s) {harness_gap_fields}; "
-            "tracked as follow-up (harness extension out of Issue #1733 Allowed Paths)",
-        )
+    # Structured fields (Blocker 1, iteration 8: hard-required again). A
+    # field is missing either because the "- key: value" line is absent
+    # entirely, or because it is present with the literal value ``None``
+    # (the harness's own documented "could not be honestly derived" marker,
+    # e.g. loaded_skills when --agent-type was not supplied). Both count as
+    # a hard FAIL now — a real AC12-grade harness invocation must supply
+    # ``--agent-type`` and run in the linked worktree so every field
+    # genuinely resolves.
+    missing_structured_fields = [
+        key for key in _REQUIRED_STRUCTURED_SMOKE_FIELDS
+        if key not in fields or _parse_field_value(fields.get(key)) is None
+    ]
+    if missing_structured_fields:
+        errors.append(f"missing or unresolved structured field(s): {missing_structured_fields}")
 
-    if "tested_head" in fields:
+    if _parse_field_value(fields.get("tested_head")) is not None:
         expected_head = _current_head(repo_root)
         if expected_head is None:
             errors.append("could not resolve current repository HEAD via git rev-parse HEAD")
         elif fields["tested_head"] != expected_head:
             errors.append(f"tested_head={fields['tested_head']!r} does not match current HEAD {expected_head!r}")
 
-    if "loaded_skills" in fields:
+    if fields.get("loaded_skills") is not None:
         loaded_skills = _parse_field_value(fields["loaded_skills"])
         if loaded_skills != _EXPECTED_LOADED_SKILLS:
             errors.append(f"loaded_skills={loaded_skills!r} (expected {_EXPECTED_LOADED_SKILLS!r})")
 
-    if "child_spawn_event_count" in fields:
+    if fields.get("child_spawn_event_count") is not None:
         count = _parse_field_value(fields["child_spawn_event_count"])
         if count != 0:
             errors.append(f"child_spawn_event_count={count!r} (expected 0)")
 
-    if "self_restart_event_count" in fields:
+    if fields.get("self_restart_event_count") is not None:
         count = _parse_field_value(fields["self_restart_event_count"])
         if count != 0:
             errors.append(f"self_restart_event_count={count!r} (expected 0)")
 
-    if "orchestration_action_count" in fields:
+    if fields.get("orchestration_action_count") is not None:
         count = _parse_field_value(fields["orchestration_action_count"])
         if count != 0:
             errors.append(f"orchestration_action_count={count!r} (expected 0)")
 
-    if "requested_agent_type" in fields and "effective_agent_type" in fields:
+    if fields.get("requested_agent_type") is not None and fields.get("effective_agent_type") is not None:
         if fields["requested_agent_type"] != fields["effective_agent_type"]:
             errors.append(
                 "requested_agent_type "
@@ -773,7 +771,7 @@ def check_runtime_smoke_evidence(repo_root: Path = REPO_ROOT, artifact_path: str
                 "(possible self-restart / runtime mismatch)"
             )
 
-    if "prompt_sha256" in fields:
+    if fields.get("prompt_sha256") is not None:
         prompt_sha256 = fields["prompt_sha256"]
         if not re.fullmatch(r"[0-9a-f]{64}", prompt_sha256 or ""):
             errors.append(f"prompt_sha256={prompt_sha256!r} is not a 64-char hex sha256 digest")

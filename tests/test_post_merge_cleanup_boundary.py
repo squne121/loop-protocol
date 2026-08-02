@@ -565,15 +565,12 @@ def test_runtime_smoke_evidence_fails_on_stale_tested_head(tmp_path):
     assert rc == boundary.EXIT_FAIL
 
 
-def test_runtime_smoke_evidence_passes_on_missing_structured_fields_only_warns(capsys):
-    # Simulates the real current harness output, which does not yet emit
-    # tested_head / loaded_skills / spawn_events / etc (known gap: harness
-    # is outside Issue #1733's Allowed Paths). Iteration 7 fix: missing
-    # structured fields alone must NOT fail the check -- they only produce a
-    # visible warning -- otherwise the Issue's literal AC12 VC (which never
-    # passes --artifact-path, and whose fixed default artifact will only
-    # ever carry the legacy fields until the harness is extended) could
-    # never PASS.
+def test_runtime_smoke_evidence_fails_on_missing_structured_fields(capsys):
+    # Iteration 8 (Issue #1733 Scope Delta, 2026-08-02 owner-approved harness
+    # extension): the harness now genuinely emits all 10 structured fields,
+    # so the iteration 7 best-effort/WARNING-only downgrade is reverted --
+    # legacy-fields-only evidence (missing tested_head / loaded_skills /
+    # spawn_events / etc) must hard FAIL, not WARN-and-PASS.
     legacy_only_fields = {
         "exit_code": "0",
         "timed_out": "False",
@@ -586,10 +583,29 @@ def test_runtime_smoke_evidence_passes_on_missing_structured_fields_only_warns(c
     summary_path = _write_summary(tmp_dir, legacy_only_fields)
     try:
         rc = boundary.check_runtime_smoke_evidence(REPO_ROOT, artifact_path=str(summary_path))
-        assert rc == boundary.EXIT_OK
+        assert rc == boundary.EXIT_FAIL
         captured = capsys.readouterr()
-        assert "WARNING: harness does not yet emit structured field(s)" in captured.out
-        assert "tested_head" in captured.out
+        assert "missing or unresolved structured field(s)" in captured.err
+        assert "tested_head" in captured.err
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp_dir)
+
+
+def test_runtime_smoke_evidence_fails_when_structured_field_value_is_literal_none(capsys):
+    # A field present as a "- key: None" line (the harness's own documented
+    # "could not be honestly derived" marker, e.g. loaded_skills when
+    # --agent-type was not supplied) must be treated the same as a fully
+    # absent field -- a hard FAIL, not silently accepted as a present value.
+    tmp_dir = REPO_ROOT / "tests" / "_tmp_none_valued_summary_for_test"
+    summary_path = _write_summary(tmp_dir, _synthetic_summary_fields(loaded_skills="None"))
+    try:
+        rc = boundary.check_runtime_smoke_evidence(REPO_ROOT, artifact_path=str(summary_path))
+        assert rc == boundary.EXIT_FAIL
+        captured = capsys.readouterr()
+        assert "missing or unresolved structured field(s)" in captured.err
+        assert "loaded_skills" in captured.err
     finally:
         import shutil
 
@@ -598,14 +614,38 @@ def test_runtime_smoke_evidence_passes_on_missing_structured_fields_only_warns(c
 
 def test_runtime_smoke_evidence_default_path_used_when_artifact_path_omitted(tmp_path):
     # The Issue's literal AC12 VC never passes --artifact-path. Iteration 7
-    # fix: this must resolve to a single fixed default location (not a
-    # glob across multiple candidates) and be able to genuinely PASS when a
-    # valid legacy-fields-only artifact exists there.
+    # fix (retained in iteration 8): this must resolve to a single fixed
+    # default location (not a glob across multiple candidates). Iteration 8:
+    # now that structured fields are hard-required again, a genuine PASS at
+    # the default location requires a full structured-fields artifact, not
+    # just the legacy-fields-only shape -- exercised here against a fresh
+    # throwaway git repo (its own real HEAD) rather than REPO_ROOT, since
+    # ``tested_head`` is cross-checked against ``repo_root``'s actual HEAD.
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "user.email=t@example.com", "-c", "user.name=t",
+         "commit", "--allow-empty", "-q", "-m", "seed"],
+        check=True,
+    )
+    head = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
     fields = {
         "exit_code": "0",
         "timed_out": "False",
         "expected_markers_missing": "[]",
         "errors": "[]",
+        "tested_head": head,
+        "runtime_version": "'claude 2.1.220'",
+        "requested_agent_type": "claude",
+        "effective_agent_type": "claude",
+        "loaded_skills": "['post-merge-cleanup-executor']",
+        "child_spawn_event_count": "0",
+        "spawn_events": "[]",
+        "self_restart_event_count": "0",
+        "orchestration_action_count": "0",
+        "prompt_sha256": "a" * 64,
         "postcondition_unexpected_changes": "[]",
     }
     summary_dir = tmp_path / boundary._DEFAULT_ARTIFACT_PATH.parent
