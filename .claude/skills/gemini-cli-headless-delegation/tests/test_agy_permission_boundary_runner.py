@@ -223,6 +223,95 @@ def test_main_preserves_schema_valid_live_auth_unavailable_exit_77(
     assert MODULE.validate_artifact(artifact) == (True, "valid")
 
 
+def test_live_uses_supported_isolated_auth_bootstrap_and_bwrap_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_home = tmp_path / "real-home"
+    token_dir = real_home / ".gemini" / "antigravity-cli"
+    token_dir.mkdir(parents=True)
+    (token_dir / "antigravity-oauth-token").write_text("fixture-token", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(real_home))
+    policy = MODULE._load_policy_module()
+    monkeypatch.setattr(MODULE, "_load_policy_module", lambda: policy)
+    monkeypatch.setattr(policy, "_bwrap_available", lambda: True)
+
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools", auth_bootstrap=True)
+
+    assert runtime["env"]["HOME"] == str(runtime["home"])
+    assert Path(runtime["env"]["HOME"]) != real_home
+    assert (Path(runtime["env"]["HOME"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").is_symlink()
+    assert runtime["agy_command_prefix"][0] == "bwrap"
+
+    observed: dict[str, object] = {}
+
+    def capture(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed["command"] = command
+        observed["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(MODULE.subprocess, "run", capture)
+    MODULE._invoke(tmp_path / "agy", runtime, live=True)
+
+    assert observed["command"] == runtime["agy_command_prefix"] + [
+        str(tmp_path / "agy"),
+        "--print",
+        "permission-boundary-harness",
+    ]
+    assert observed["env"] is not None
+    assert observed["env"]["HOME"] == runtime["env"]["HOME"]  # type: ignore[index]
+    assert observed["env"]["HOME"] != str(real_home)  # type: ignore[index]
+
+
+def test_live_auth_bootstrap_unavailable_is_exit_77_before_hook_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "agy"
+    _fake_agy(fake)
+    real_home = tmp_path / "real-home"
+    token_dir = real_home / ".gemini" / "antigravity-cli"
+    token_dir.mkdir(parents=True)
+    (token_dir / "antigravity-oauth-token").write_text("fixture-token", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(real_home))
+    policy = MODULE._load_policy_module()
+    monkeypatch.setattr(MODULE, "_load_policy_module", lambda: policy)
+    monkeypatch.setattr(policy, "_bwrap_available", lambda: False)
+    monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
+    monkeypatch.setattr(MODULE, "_version", lambda _path: ("agy 1.1.9", True))
+
+    exit_code, artifact = MODULE._run(
+        argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
+    )
+
+    assert exit_code == 77
+    assert artifact["failure_taxonomy"]["class"] == MODULE.FAILURE_UNAVAILABLE
+    assert artifact["runner"]["actual_agy_executed"] is False
+
+
+def test_live_hook_nonfire_is_inconclusive_not_auth_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "agy"
+    _fake_agy(fake)
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
+    monkeypatch.setattr(MODULE, "_version", lambda _path: ("agy 1.1.9", True))
+    monkeypatch.setattr(MODULE, "_prepare_runtime", lambda *_args, **_kwargs: runtime)
+    monkeypatch.setattr(
+        MODULE,
+        "_invoke",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(["agy"], 0, "", ""),
+    )
+
+    exit_code, artifact = MODULE._run(
+        argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
+    )
+
+    assert exit_code == 1
+    assert artifact["failure_taxonomy"]["class"] == MODULE.FAILURE_INCONCLUSIVE
+    assert artifact["runner"]["actual_agy_executed"] is True
+    assert all(not attempt["predicates"]["pre_tool_use_present"] for attempt in artifact["attempts"])
+
+
 def test_live_runtime_launch_failure_is_exit_77_but_unknown_runner_error_is_exit_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -64,6 +64,16 @@ PREDICATE_KEYS = frozenset(
 )
 
 
+class AgyAuthBootstrapUnavailable(RuntimeError):
+    """The supported isolated auth bootstrap cannot safely launch AGY.
+
+    This is a runtime-unavailable condition, not permission-boundary
+    evidence.  In particular, a security-sensitive profile must not fall
+    back to an unprotected OAuth-token symlink when the policy materializer
+    cannot provide its required read-only boundary.
+    """
+
+
 def _load_policy_module() -> Any:
     spec = importlib.util.spec_from_file_location("agy_permission_policy_for_boundary", POLICY_PATH)
     if spec is None or spec.loader is None:
@@ -300,12 +310,28 @@ def _write_post_logger(path: Path) -> None:
     path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
 
 
-def _prepare_runtime(root: Path, profile: str) -> dict[str, Any]:
+def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) -> dict[str, Any]:
     """Materialize boundary settings before any AGY process can start."""
     policy_module = _load_policy_module()
     run_id, canary_id = "run-" + uuid.uuid4().hex, "canary-" + uuid.uuid4().hex
-    home, workspace, control = root / "home", root / "workspace", root / "control"
-    home.mkdir()
+    root.mkdir(parents=True, exist_ok=True)
+    workspace, control = root / "workspace", root / "control"
+    command_prefix: list[str] = []
+    if auth_bootstrap:
+        # The live runner must use the same supported isolated-auth path as
+        # run_gemini_headless.py.  It only checks/references the host token
+        # path; it never reads, copies, mutates, or reports credential data.
+        try:
+            auth_workspace = policy_module.materialize_isolated_agy_workspace(profile, parent_dir=root)
+        except (policy_module.AgyReadOnlyBoundaryError, policy_module.AgyPermissionSettingsError) as exc:
+            raise AgyAuthBootstrapUnavailable("isolated_auth_bootstrap_unavailable") from exc
+        home = Path(auth_workspace.env["HOME"])
+        runtime_env = dict(auth_workspace.env)
+        command_prefix = list(auth_workspace.agy_oauth_token_bwrap_prefix or ())
+    else:
+        home = root / "home"
+        home.mkdir()
+        runtime_env = {"HOME": str(home)}
     workspace.mkdir()
     control.mkdir()
     # This is intentionally a hard dependency: the policy writer is atomic,
@@ -388,6 +414,8 @@ def _prepare_runtime(root: Path, profile: str) -> dict[str, Any]:
         "canary_id": canary_id,
         "home": home,
         "workspace": workspace,
+        "env": runtime_env,
+        "agy_command_prefix": command_prefix,
         "context_path": context_path,
         "events_path": events_path,
         "enforcement_log": enforcement_log,
@@ -449,14 +477,16 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
 
 
 def _invoke(agy: Path, runtime: Mapping[str, Any], *, live: bool) -> subprocess.CompletedProcess[str]:
-    env = {
-        "HOME": str(runtime["home"]),
-        "AGY_PERMISSION_BOUNDARY_CONTEXT_PATH": str(runtime["context_path"]),
-        "AGY_PERMISSION_BOUNDARY_NO_FALLBACK": "1",
-        "PATH": os.environ.get("PATH", ""),
-    }
+    env = dict(runtime["env"])
+    env.update(
+        {
+            "AGY_PERMISSION_BOUNDARY_CONTEXT_PATH": str(runtime["context_path"]),
+            "AGY_PERMISSION_BOUNDARY_NO_FALLBACK": "1",
+        }
+    )
+    env.setdefault("PATH", os.environ.get("PATH", ""))
     return subprocess.run(
-        [str(agy), "--print", "permission-boundary-harness"],
+        list(runtime["agy_command_prefix"]) + [str(agy), "--print", "permission-boundary-harness"],
         cwd=runtime["workspace"],
         env=env,
         text=True,
@@ -494,34 +524,39 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     result: dict[str, Any]
     exit_code = EXIT_FAIL
     try:
-        runtime = _prepare_runtime(temporary, args.profile)
-        runtime_unavailable = False
         try:
-            completed = _invoke(executable, runtime, live=args.mode == "live")
-        except (OSError, subprocess.TimeoutExpired):
-            completed = None
-            runtime_unavailable = args.mode == "live"
-        attempts = _attempts_from_parent_observation(runtime, args.profile)
-        output = "" if completed is None else (completed.stdout or "") + (completed.stderr or "")
-        child_returncode = None if completed is None else completed.returncode
-        auth_unavailable = args.mode == "live" and bool(_AUTH_FAILURE.search(output))
-        unavailable = auth_unavailable or runtime_unavailable
-        predicates_pass = all(all(attempt["predicates"].values()) for attempt in attempts)
-        live_pass = args.mode == "live" and identity_verified and child_returncode == 0 and predicates_pass
-        exit_code = EXIT_UNAVAILABLE if unavailable else EXIT_PASS if live_pass else EXIT_FAIL
-        failure = FAILURE_UNAVAILABLE if unavailable else "none" if live_pass else FAILURE_INCONCLUSIVE
-        result = _artifact(
-            exit_code=exit_code,
-            actual_agy=args.mode == "live" and identity_verified and not unavailable,
-            identity_verified=identity_verified,
-            executable=executable,
-            version=version,
-            child_returncode=child_returncode,
-            attempts=attempts,
-            profile=args.profile,
-            failure_class=failure,
-            cleanup_ok=True,
-        )
+            runtime = _prepare_runtime(temporary, args.profile, auth_bootstrap=args.mode == "live")
+        except AgyAuthBootstrapUnavailable:
+            exit_code = EXIT_UNAVAILABLE
+            result = _unavailable_artifact(FAILURE_UNAVAILABLE, profile=args.profile)
+        else:
+            runtime_unavailable = False
+            try:
+                completed = _invoke(executable, runtime, live=args.mode == "live")
+            except (OSError, subprocess.TimeoutExpired):
+                completed = None
+                runtime_unavailable = args.mode == "live"
+            attempts = _attempts_from_parent_observation(runtime, args.profile)
+            output = "" if completed is None else (completed.stdout or "") + (completed.stderr or "")
+            child_returncode = None if completed is None else completed.returncode
+            auth_unavailable = args.mode == "live" and bool(_AUTH_FAILURE.search(output))
+            unavailable = auth_unavailable or runtime_unavailable
+            predicates_pass = all(all(attempt["predicates"].values()) for attempt in attempts)
+            live_pass = args.mode == "live" and identity_verified and child_returncode == 0 and predicates_pass
+            exit_code = EXIT_UNAVAILABLE if unavailable else EXIT_PASS if live_pass else EXIT_FAIL
+            failure = FAILURE_UNAVAILABLE if unavailable else "none" if live_pass else FAILURE_INCONCLUSIVE
+            result = _artifact(
+                exit_code=exit_code,
+                actual_agy=args.mode == "live" and identity_verified and not unavailable,
+                identity_verified=identity_verified,
+                executable=executable,
+                version=version,
+                child_returncode=child_returncode,
+                attempts=attempts,
+                profile=args.profile,
+                failure_class=failure,
+                cleanup_ok=True,
+            )
     except Exception:
         result = _unavailable_artifact(FAILURE_INCONCLUSIVE, profile=args.profile, exit_code=EXIT_FAIL)
     finally:
