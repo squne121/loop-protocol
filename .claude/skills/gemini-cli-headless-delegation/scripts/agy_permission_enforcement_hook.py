@@ -108,10 +108,16 @@ def _load_context() -> tuple[dict[str, Any] | None, str | None]:
         "policy_path",
         "policy_sha256",
         "enforcement_log_path",
+        "canary_id",
     )
     if any(not isinstance(context.get(key), str) or not context[key] for key in required_strings):
         return None, "context_load_failure"
     if context["tool_profile"] not in ALLOWED_PROFILES:
+        return None, "context_load_failure"
+    native_capabilities = context.get("native_capabilities")
+    if not isinstance(native_capabilities, Mapping) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in native_capabilities.items()
+    ):
         return None, "context_load_failure"
     return context, None
 
@@ -177,12 +183,24 @@ def _parse_payload(payload: Any) -> tuple[dict[str, Any] | None, str | None]:
     }, None
 
 
-def _event(*, payload: Mapping[str, Any], resource: str, decision: str, reason: str) -> dict[str, Any]:
+def _event(
+    *,
+    payload: Mapping[str, Any],
+    resource: str,
+    decision: str,
+    reason: str,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
     """Build a secret-safe record: no raw args, paths, prompt or payload."""
     event = {
         "schema": "agy_permission_boundary_hook/v1",
         "decision": decision,
         "reason": _reason(reason),
+        "run_id": context["run_id"],
+        "conversation_id": payload["conversation_id"],
+        "step_index": payload["step_index"],
+        "tool_profile": context["tool_profile"],
+        "canary_id": context["canary_id"],
         "tool_name": payload["tool_name"],
         "resource": resource,
         "args_digest": payload["args_digest"],
@@ -216,6 +234,7 @@ def _evaluate(payload: Any) -> tuple[dict[str, str], dict[str, Any] | None, dict
             _decision("workspace_binding_mismatch"),
             context,
             _event(
+                context=context,
                 payload=parsed,
                 resource="",
                 decision=DECISION_DENY,
@@ -228,6 +247,7 @@ def _evaluate(payload: Any) -> tuple[dict[str, str], dict[str, Any] | None, dict
             _decision(policy_error or "policy_load_failure"),
             context,
             _event(
+                context=context,
                 payload=parsed,
                 resource="",
                 decision=DECISION_DENY,
@@ -239,7 +259,13 @@ def _evaluate(payload: Any) -> tuple[dict[str, str], dict[str, Any] | None, dict
         return (
             _decision("unknown_native_tool"),
             context,
-            _event(payload=parsed, resource="", decision=DECISION_DENY, reason="unknown_native_tool"),
+            _event(
+                context=context,
+                payload=parsed,
+                resource="",
+                decision=DECISION_DENY,
+                reason="unknown_native_tool",
+            ),
         )
     denied = set(policy["denied_resources"])
     allowed = set(policy["allowed_resources"])
@@ -252,7 +278,13 @@ def _evaluate(payload: Any) -> tuple[dict[str, str], dict[str, Any] | None, dict
     return (
         {"decision": decision, "reason": _reason(reason)},
         context,
-        _event(payload=parsed, resource=resource, decision=decision, reason=reason),
+        _event(
+            context=context,
+            payload=parsed,
+            resource=resource,
+            decision=decision,
+            reason=reason,
+        ),
     )
 
 

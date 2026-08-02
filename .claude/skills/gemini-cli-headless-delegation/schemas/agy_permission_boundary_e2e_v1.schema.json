@@ -73,7 +73,7 @@
           "required": ["run_id", "conversation_id", "step_index", "tool_name", "args_digest", "profile", "capability", "canary_id"],
           "properties": {
             "run_id": {"type": "string", "minLength": 1, "description": "Recorded by the parent runner."},
-            "conversation_id": {"type": "string", "const": "parent-observed", "description": "Parent-observation marker; no child-supplied conversation identifier is persisted."},
+            "conversation_id": {"type": "string", "minLength": 1, "description": "Captured from live hook payload and validated by parent attempt correlation."},
             "step_index": {"type": "integer", "minimum": 0},
             "tool_name": {"type": "string", "minLength": 1},
             "args_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},

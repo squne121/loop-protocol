@@ -49,6 +49,14 @@ def _context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, profile: str = 
             "policy_path": str(policy_path),
             "policy_sha256": digest,
             "enforcement_log_path": str(tmp_path / "enforcement.jsonl"),
+            "canary_id": "canary-1",
+            "native_capabilities": {
+                "run_command": "command",
+                "view_file": "read_file",
+                "write_to_file": "write_file",
+                "search_web": "read_url",
+                "mcp_call": "mcp",
+            },
         },
         mode=stat.S_IRUSR,
     )
@@ -121,8 +129,11 @@ def test_allowed_event_logs_only_canonical_args_digest(tmp_path: Path, monkeypat
     assert record["args_digest"].startswith("sha256:")
     assert secret not in json.dumps(record)
     assert "/isolated/workspace" not in json.dumps(record)
-    correlation_fields = {"run_id", "conversation_id", "invocation_number", "step_index", "tool_profile", "canary_id"}
-    assert correlation_fields.isdisjoint(record)
+    assert record["run_id"] == "run-1"
+    assert record["conversation_id"] == "conversation-1"
+    assert record["step_index"] == 2
+    assert record["tool_profile"] == "grounded_research"
+    assert record["canary_id"] == "canary-1"
 
 
 def test_untrusted_context_permissions_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

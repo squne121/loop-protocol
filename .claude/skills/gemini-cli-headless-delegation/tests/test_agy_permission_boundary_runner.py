@@ -24,52 +24,109 @@ SPEC.loader.exec_module(MODULE)
 
 def _fake_agy(path: Path, *, exit_code: int = 0) -> None:
     """Create a fake runtime which dispatches configured hooks, never events."""
-    script = rf"""#!/usr/bin/env python3
+    script = """#!/usr/bin/env python3
+import http.server
 import json
 import os
 import pathlib
 import shlex
+import socketserver
 import subprocess
+import threading
+import urllib.request
 import sys
+
 
 if sys.argv[1:] == ["--version"]:
     print("fake-agy 1.1.9")
     raise SystemExit(0)
 if len(sys.argv) < 4 or sys.argv[1:3] != ["--print", "permission-boundary-harness"] or sys.argv[3] != "--add-dir":
     raise SystemExit(12)
+
+
 home = pathlib.Path(os.environ["HOME"])
 hooks = json.loads((home / ".gemini" / "config" / "hooks.json").read_text())
 workspace = pathlib.Path(os.getcwd())
-base = {{"conversationId": "conversation-hook", "invocationNum": 7, "workspacePaths": [str(workspace)]}}
+base = {"conversationId": "conversation-hook", "invocationNum": 7, "workspacePaths": [str(workspace)]}
+state = {"network": 0, "mcp": 0}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path.startswith("/network"):
+            state["network"] += 1
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def do_POST(self) -> None:
+        if self.path.startswith("/mcp"):
+            state["mcp"] += 1
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        return
 
 def invoke(command, payload):
-    if isinstance(command, str): command = shlex.split(command)
-    result = subprocess.run(command, input=json.dumps(payload), text=True, capture_output=True, env=os.environ.copy(), check=False)  # noqa: E501
+    if isinstance(command, str):
+        command = shlex.split(command)
+    result = subprocess.run(command, input=json.dumps(payload), text=True, capture_output=True, env=os.environ.copy(), check=False)
     if result.returncode:
         raise SystemExit(result.returncode)
     return json.loads(result.stdout)
 
-injection = hooks["permission-boundary-injector"]["PreInvocation"][0]["command"]
-steps = invoke([injection], base)["injectSteps"]
-for index, step in enumerate(steps):
-    tool_call = step["toolCall"]
-    payload = {{"toolCall": tool_call, "stepIdx": index, "conversationId": base["conversationId"], "workspacePaths": base["workspacePaths"]}}  # noqa: E501
-    dispatched = False
-    decision = {{"decision": "deny"}}
-    for item in hooks["permission-boundary-enforcement"]["PreToolUse"]:
-        if item["matcher"] == tool_call["name"]:
-            dispatched = True
-            decision = invoke(item["hooks"][0]["command"], payload)
-            break
-    if not dispatched or decision.get("decision") != "allow":
-        continue
-    canary = tool_call["args"]["canaryPath"]
-    pathlib.Path(canary).write_text("1\\n", encoding="utf-8")
-    for item in hooks["permission-boundary-postlogger"]["PostToolUse"]:
-        if item["matcher"] == tool_call["name"]:
-            invoke(item["hooks"][0]["command"], payload)
-raise SystemExit({exit_code})
+
+with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    server_url = "http://127.0.0.1:%d" % server.server_address[1]
+
+    injection = hooks["permission-boundary-injector"]["PreInvocation"][0]["command"]
+    steps = invoke([injection], base)["injectSteps"]
+    for index, step in enumerate(steps):
+        tool_call = step["toolCall"]
+        payload = {
+            "toolCall": tool_call,
+            "stepIdx": index,
+            "conversationId": base["conversationId"],
+            "workspacePaths": base["workspacePaths"],
+        }
+        dispatched = False
+        decision = {"decision": "deny"}
+        for item in hooks["permission-boundary-enforcement"]["PreToolUse"]:
+            if item["matcher"] == tool_call["name"]:
+                dispatched = True
+                decision = invoke(item["hooks"][0]["command"], payload)
+                break
+        if not dispatched or decision.get("decision") != "allow":
+            continue
+        if tool_call["name"] == "search_web":
+            urllib.request.urlopen(server_url + "/network?canary=1", timeout=1)
+        elif tool_call["name"] == "mcp_call":
+            req = urllib.request.Request(server_url + "/mcp", data=b"{}", method="POST")
+            urllib.request.urlopen(req, timeout=1)
+
+        side_effect = tool_call["args"].get("sideEffectCounterPath")
+        if isinstance(side_effect, str):
+            side_effect_path = pathlib.Path(side_effect)
+            side_effect_path.write_text(
+                str(int(side_effect_path.read_text(encoding="utf-8").strip() or 0) + 1) + "\\n",
+                encoding="utf-8",
+            )
+        canary = tool_call["args"].get("canaryPath")
+        if isinstance(canary, str):
+            pathlib.Path(canary).write_text("1\\n", encoding="utf-8")
+        for item in hooks["permission-boundary-postlogger"]["PostToolUse"]:
+            if item["matcher"] == tool_call["name"]:
+                invoke(item["hooks"][0]["command"], payload)
+    server.shutdown()
+    server.server_close()
+    thread.join()
+    raise SystemExit(__EXIT_CODE__)
 """
+    script = script.replace("__EXIT_CODE__", str(exit_code))
     path.write_text(script, encoding="utf-8")
     path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
 

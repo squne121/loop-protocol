@@ -201,6 +201,7 @@ def _attempt_template(
     profile: str,
     run_id: str,
     conversation_id: str,
+    step_index: int,
     canary_id: str,
     args: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -210,7 +211,7 @@ def _attempt_template(
         "correlation": {
             "run_id": run_id,
             "conversation_id": conversation_id,
-            "step_index": CAPABILITIES.index(capability),
+            "step_index": step_index,
             "tool_name": tool_name,
             "args_digest": _sha256(_canonical_json(args)),
             "profile": profile,
@@ -280,10 +281,12 @@ def _unavailable_artifact(
             capability,
             profile=profile,
             run_id="unavailable",
-            conversation_id="parent-observed",
+            conversation_id="unavailable",
+            step_index=index,
             canary_id="unavailable",
+            args={"canaryPath": f"unavailable-{capability}", "operation": capability},
         )
-        for capability in CAPABILITIES
+        for index, capability in enumerate(CAPABILITIES)
     ]
     return _artifact(
         exit_code=exit_code,
@@ -304,7 +307,10 @@ def _write_post_logger(path: Path) -> None:
         "#!/usr/bin/env python3\nimport json,os,sys\n"
         "context=json.load(open(os.environ['AGY_PERMISSION_BOUNDARY_CONTEXT_PATH'],encoding='utf-8'))\n"
         "payload=json.load(sys.stdin); call=payload['toolCall']\n"
-        "event={'kind':'post_tool_use','tool_name':call['name'],'args_digest':'sha256:'+__import__('hashlib').sha256(json.dumps(call['args'],sort_keys=True,separators=(',',':')).encode()).hexdigest()}\n"
+        "event={'kind':'post_tool_use','run_id':context['run_id'],'canary_id':context['canary_id'],"
+        "'tool_profile':context['tool_profile'],'tool_name':call['name'],"
+        "'args_digest':'sha256:'+__import__('hashlib').sha256(json.dumps(call['args'],sort_keys=True,separators=(',',':')).encode()).hexdigest(),"
+        "'conversation_id':payload['conversationId'],'step_index':payload['stepIdx']}\n"
         "with open(context['events_path'],'a',encoding='utf-8') as output: output.write(json.dumps(event,separators=(',',':'))+'\\n')\n"  # noqa: E501
         "print('{}')\n",
         encoding="utf-8",
@@ -342,7 +348,11 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
     if settings_path is None:
         raise RuntimeError("official_settings_materialization_failed")
     counters = {capability: workspace / f".agy-boundary-{capability}-sentinel" for capability in CAPABILITIES}
+    side_effect_counters = {capability: workspace / f".agy-boundary-{capability}-effect" for capability in CAPABILITIES}
     for counter in counters.values():
+        counter.write_text("0\n", encoding="utf-8")
+        counter.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    for counter in side_effect_counters.values():
         counter.write_text("0\n", encoding="utf-8")
         counter.chmod(stat.S_IRUSR | stat.S_IWUSR)
     policy_path = control / "policy.json"
@@ -368,12 +378,18 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
         "events_path": str(events_path),
         "canary_id": canary_id,
         "native_capabilities": {name: capability for capability, (name, _) in ATTEMPT_SPECS.items()},
+        "attempt_step_count": len(CAPABILITIES),
     }
     _write_private_json(context_path, context, mode=0o400)
     injection_hook = control / "preinvocation_inject.py"
-    attempt_args = {
-        capability: {"canaryPath": str(counters[capability]), "operation": capability} for capability in CAPABILITIES
-    }
+    attempt_args: dict[str, dict[str, str]] = {}
+    for index, capability in enumerate(CAPABILITIES):
+        attempt_args[capability] = {
+            "canaryPath": str(counters[capability]),
+            "operation": capability,
+            "stepIndex": index,
+            "sideEffectCounterPath": str(side_effect_counters[capability]),
+        }
     steps = [
         {"toolCall": {"name": ATTEMPT_SPECS[capability][0], "args": attempt_args[capability]}}
         for capability in CAPABILITIES
@@ -381,15 +397,29 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
     injection_hook.write_text(
         "#!/usr/bin/env python3\nimport json,os,sys\n"
         "context=json.load(open(os.environ['AGY_PERMISSION_BOUNDARY_CONTEXT_PATH'],encoding='utf-8'))\n"
-        "def record(accepted,count):\n"
-        " event={'kind':'pre_invocation','hook_started':True,'context_accepted':accepted,'injected_step_count':count}\n"
-        " with open(context['events_path'],'a',encoding='utf-8') as output: output.write(json.dumps(event)+'\\n')\n"
-        "try: payload=json.load(sys.stdin)\n"
-        "except (json.JSONDecodeError,TypeError): record(False,0); raise SystemExit(2)\n"
-        "valid=context['workspace'] in payload.get('workspacePaths',[]) and isinstance(payload.get('conversationId'),str) and isinstance(payload.get('invocationNum'),int)\n"  # noqa: E501
-        "record(valid," + str(len(steps)) + " if valid else 0)\n"
+        "try:\n"
+        "    payload=json.load(sys.stdin)\n"
+        "except (json.JSONDecodeError,TypeError):\n"
+        "    with open(context['events_path'],'a',encoding='utf-8') as output:\n"
+        "        output.write("
+        + "json.dumps({'kind':'pre_invocation','hook_started':True,'context_accepted':False,'"
+        + "injected_step_count':0},separators=(',',':'))+'\\n')\n"
+        "    raise SystemExit(2)\n"
+        "conversation_id=payload.get('conversationId')\n"
+        "invocation_num=payload.get('invocationNum')\n"
+        "valid=context['workspace'] in payload.get('workspacePaths',[]) and isinstance(conversation_id,str) and isinstance(invocation_num,int)\n"  # noqa: E501
+        "with open(context['events_path'],'a',encoding='utf-8') as output:\n"
+        "    output.write("
+        "json.dumps({'kind':'pre_invocation','hook_started':True,'context_accepted':valid,"
+        "'injected_step_count':"
+        + str(len(steps))
+        + " if valid else 0,"
+        "'conversation_id':str(conversation_id or ''),'invocation_num':invocation_num},"
+        "separators=(',',':'))+'\\n')\n"
         "if not valid: raise SystemExit(2)\n"
-        "print(json.dumps({'injectSteps':" + json.dumps(steps, separators=(",", ":")) + "},separators=(',',':')))\n",
+        "print(json.dumps({'injectSteps':"
+        + json.dumps(steps, separators=(",", ":"))
+        + "},separators=(',',':')))\n",
         encoding="utf-8",
     )
     injection_hook.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
@@ -427,6 +457,7 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
         "context_path": context_path,
         "events_path": events_path,
         "enforcement_log": enforcement_log,
+        "side_effect_counters": side_effect_counters,
         "counters": counters,
         "attempt_args": attempt_args,
     }
@@ -495,32 +526,70 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
             event = dict(event)
             event["kind"] = "pre_tool_use"
             events.append(event)
+    pre_tool_events = [event for event in events if event.get("kind") == "pre_tool_use"]
+    post_tool_events = [event for event in events if event.get("kind") == "post_tool_use"]
     attempts: list[dict[str, Any]] = []
-    for capability in CAPABILITIES:
+    for index, capability in enumerate(CAPABILITIES):
+        args = runtime["attempt_args"][capability]
+        args_digest = _sha256(_canonical_json(args))
+        candidates = [
+            event
+            for event in pre_tool_events
+            if event.get("tool_name") == ATTEMPT_SPECS[capability][0]
+            and event.get("args_digest") == args_digest
+            and event.get("run_id") == runtime["run_id"]
+            and event.get("canary_id") == runtime["canary_id"]
+            and event.get("tool_profile") == profile
+        ]
+        conversation_id = next(
+            (
+                event.get("conversation_id")
+                for event in candidates
+                if isinstance(event.get("conversation_id"), str) and event.get("conversation_id")
+            ),
+            "unavailable",
+        )
+        step_index = next(
+            (
+                event.get("step_index", index)
+                for event in candidates
+                if isinstance(event.get("step_index"), int) and event.get("step_index") >= 0
+            ),
+            index,
+        )
         attempt = _attempt_template(
             capability,
             profile=profile,
             run_id=runtime["run_id"],
-            conversation_id="parent-observed",
+            conversation_id=conversation_id,
+            step_index=step_index,
             canary_id=runtime["canary_id"],
-            args=runtime["attempt_args"][capability],
+            args=args,
         )
-        def matches(event: Mapping[str, Any]) -> bool:
-            return (
-                event.get("tool_name") == ATTEMPT_SPECS[capability][0]
-                and event.get("args_digest") == attempt["correlation"]["args_digest"]
-            )
-
-        pre = [event for event in events if event.get("kind") == "pre_tool_use" and matches(event)]
-        post = [event for event in events if event.get("kind") == "post_tool_use" and matches(event)]
+        pre = [event for event in pre_tool_events if event in candidates]
+        post = []
+        tool_name = ATTEMPT_SPECS[capability][0]
+        args_match = attempt["correlation"]["args_digest"]
+        for event in post_tool_events:
+            if event.get("tool_name") == tool_name and event.get("args_digest") == args_match:
+                post.append(event)
+        side_effect_counter = args.get("sideEffectCounterPath")
+        if isinstance(side_effect_counter, str):
+            counter_path = Path(side_effect_counter)
+        else:
+            counter_path = Path(runtime["side_effect_counters"][capability])
         # The parent reads the actual canary path before/after the child; no
         # child self-report is accepted as a side-effect predicate.
+        try:
+            side_effect_invariant = counter_path.read_text(encoding="utf-8") == "0\n"
+        except OSError:
+            side_effect_invariant = False
         attempt["predicates"] = {
             "deterministic_attempt_present": bool(pre),
             "pre_tool_use_present": bool(pre),
             "explicit_deny": any(event.get("decision") == "deny" for event in pre),
             "post_tool_use_absent": not post,
-            "side_effect_invariant": Path(runtime["counters"][capability]).read_text(encoding="utf-8") == "0\n",
+            "side_effect_invariant": side_effect_invariant,
         }
         attempts.append(attempt)
     return attempts
