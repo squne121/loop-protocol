@@ -7,9 +7,11 @@ Verifies AC1-AC4, AC8-AC10 from the live Issue #1734 contract:
 - AC8: both agent bodies document the controlled-executor procedural contract
   and do not claim a technical Bash-tool-level denial of raw `gh issue`
   mutation
-- AC9: both agent bodies document that nested Skill invocation is
-  structurally impossible (no `Skill` tool) and is a distinct concept from
-  nested SubAgent invocation (e.g. issue-contract-fixer, Issue #998)
+- AC9: both agent bodies document that both nested Skill invocation (no
+  `Skill` tool) and nested SubAgent invocation (no `Agent` tool; e.g.
+  issue-contract-fixer, Issue #998) are structurally impossible -- the
+  earlier "distinct concept, does not block" claim is corrected and no
+  longer asserted
 - AC10: issue-editor.md retains the #995 FAIL_CLOSED_REWRITE_CONSTRAINTS_V1
   contract and documents the #1909 context_bundle_path forward-compat input
 """
@@ -47,37 +49,57 @@ def _read_body(path: Path) -> str:
 
 
 def test_issue_creator_frontmatter_tools_exact_set():
-    """AC1: issue-creator.md tools is the exact set {Read, Bash}, no Skill."""
+    """AC1: issue-creator.md tools is the exact set {Read, Bash}, no Skill.
+
+    Uses sorted(tools) == sorted([...]) plus a duplicate-count check (not a
+    bare set() comparison), so a duplicated list entry does not silently PASS.
+    """
     fm = _read_frontmatter(ISSUE_CREATOR_PATH)
     tools = fm.get("tools")
     assert isinstance(tools, list), "tools must be a list"
-    assert set(tools) == {"Read", "Bash"}, f"tools must be exact set {{Read, Bash}}, got {tools}"
+    assert sorted(tools) == sorted(["Read", "Bash"]), f"tools must be exact set {{Read, Bash}}, got {tools}"
+    assert len(tools) == len(set(tools)), f"tools must not contain duplicate entries, got {tools}"
     assert "Skill" not in tools
 
 
 def test_issue_editor_frontmatter_tools_exact_set():
-    """AC2: issue-editor.md tools is the exact set {Read, Bash}, no Skill."""
+    """AC2: issue-editor.md tools is the exact set {Read, Bash}, no Skill.
+
+    Uses sorted(tools) == sorted([...]) plus a duplicate-count check (not a
+    bare set() comparison), so a duplicated list entry does not silently PASS.
+    """
     fm = _read_frontmatter(ISSUE_EDITOR_PATH)
     tools = fm.get("tools")
     assert isinstance(tools, list), "tools must be a list"
-    assert set(tools) == {"Read", "Bash"}, f"tools must be exact set {{Read, Bash}}, got {tools}"
+    assert sorted(tools) == sorted(["Read", "Bash"]), f"tools must be exact set {{Read, Bash}}, got {tools}"
+    assert len(tools) == len(set(tools)), f"tools must not contain duplicate entries, got {tools}"
     assert "Skill" not in tools
 
 
 def test_issue_creator_skills_exact_set():
-    """AC3: issue-creator.md skills is the exact set [create-issue]."""
+    """AC3: issue-creator.md skills is the exact set [create-issue].
+
+    Uses sorted(skills) == sorted([...]) plus a duplicate-count check (not a
+    bare set() comparison), so a duplicated list entry does not silently PASS.
+    """
     fm = _read_frontmatter(ISSUE_CREATOR_PATH)
     skills = fm.get("skills")
     assert isinstance(skills, list), "skills must be a list"
-    assert set(skills) == {"create-issue"}, f"skills must be exact set [create-issue], got {skills}"
+    assert sorted(skills) == sorted(["create-issue"]), f"skills must be exact set [create-issue], got {skills}"
+    assert len(skills) == len(set(skills)), f"skills must not contain duplicate entries, got {skills}"
 
 
 def test_issue_editor_skills_exact_set():
-    """AC4: issue-editor.md skills is the exact set [edit-issue]."""
+    """AC4: issue-editor.md skills is the exact set [edit-issue].
+
+    Uses sorted(skills) == sorted([...]) plus a duplicate-count check (not a
+    bare set() comparison), so a duplicated list entry does not silently PASS.
+    """
     fm = _read_frontmatter(ISSUE_EDITOR_PATH)
     skills = fm.get("skills")
     assert isinstance(skills, list), "skills must be a list"
-    assert set(skills) == {"edit-issue"}, f"skills must be exact set [edit-issue], got {skills}"
+    assert sorted(skills) == sorted(["edit-issue"]), f"skills must be exact set [edit-issue], got {skills}"
+    assert len(skills) == len(set(skills)), f"skills must not contain duplicate entries, got {skills}"
 
 
 def test_both_agents_document_controlled_executor_procedural_contract():
@@ -98,19 +120,29 @@ def test_both_agents_document_controlled_executor_procedural_contract():
 
 
 def test_both_agents_document_nested_invocation_distinction():
-    """AC9: both agents document that nested Skill invocation is structurally
-    impossible (no Skill tool) and is distinct from nested SubAgent
-    invocation (e.g. issue-contract-fixer, #998), which is not blocked.
+    """AC9 (Issue #1734 fix_delta 3): both agents document that both nested
+    Skill invocation (no Skill tool) and nested SubAgent invocation (no
+    Agent tool; e.g. issue-contract-fixer, #998) are structurally
+    impossible. The earlier "nested SubAgent invocation is a distinct
+    concept and is not blocked" claim is rejected and must not appear.
     """
     creator_body = _read_body(ISSUE_CREATOR_PATH)
     editor_body = _read_body(ISSUE_EDITOR_PATH)
 
     for body in (creator_body, editor_body):
         assert "nested Skill invocation" in body
-        assert "構造的に不可能" in body
         assert "nested SubAgent invocation" in body
         assert "issue-contract-fixer" in body
         assert "#998" in body
+        assert body.count("構造的に不可能") >= 2, (
+            "both nested Skill invocation and nested SubAgent invocation "
+            "must each be documented as structurally impossible"
+        )
+        assert "妨げない" not in body, (
+            "the corrected AC9 wording must not claim nested SubAgent "
+            "invocation is unaffected/not blocked"
+        )
+        assert "disallowedTools" in body
 
 
 def test_issue_editor_retains_fail_closed_rewrite_and_context_bundle_contracts():

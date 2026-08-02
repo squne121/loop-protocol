@@ -1,11 +1,18 @@
-"""Issue #1734 AC7: runtime smoke evidence that issue-editor's canonical Skill
-body (edit-issue/SKILL.md) is actually read by a fresh Claude Code session.
+"""Issue #1734 AC7 (fix_delta 3): runtime smoke evidence that `issue-editor`
+is actually launched as the active Claude Code session persona
+(`claude --agent issue-editor -p ...`), and that its canonical Skill body
+(edit-issue/SKILL.md) and a referenced file are actually read in that
+persona-bound session.
 
 This is a pytest wrapper around `.claude/skills/worktree-agent-runtime-smoke`
 (`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`). It does not fabricate
-runtime evidence: a real `claude -p` structured-lane subprocess is launched
-against the linked worktree, and the test's outcome is derived strictly from
-the runner's exit code and its persisted `summary.md` evidence file.
+runtime evidence: a real `claude --agent issue-editor -p` structured-lane
+subprocess is launched against the linked worktree via the runner's opt-in
+`--claude-agent-name` flag, and the test's outcome is derived strictly from
+the runner's exit code and its persisted `summary.md` evidence file. Static
+declaration of `--agent-type` alone (without `--claude-agent-name`) does not
+bind any persona to the real CLI process and is not sufficient evidence for
+this AC.
 
 Runtime Verification Applicability (live Issue #1734 body): decision=immediate,
 applicable_acs=[AC7]. Per `docs/dev/runtime-verification-policy.md`, an
@@ -74,6 +81,10 @@ def test_canonical_skill_read_smoke():
             "180",
             "--max-turns",
             "8",
+            "--agent-type",
+            "issue-editor",
+            "--claude-agent-name",
+            "issue-editor",
             "--expect-marker",
             EXPECT_MARKER,
             "--require-clean-postcondition",

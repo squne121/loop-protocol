@@ -32,7 +32,7 @@ skills:
 
 - 本 SubAgent は `tools: [Read, Bash]` のみを持ち、`Skill` tool 自体を保持しない
 - **nested Skill invocation は構造的に不可能**（`Skill` tool 非保持のため）。これは preload allowlist の主張ではなく、frontmatter の strict parser 検証だけで技術的に証明可能な境界である
-- **nested SubAgent invocation**（例: `issue-contract-fixer`。Issue #998）とは別概念であり、本 SubAgent の `Skill` tool 非保持はこれを妨げない。両者は独立した仕組みであり、`Skill` tool 非保持が nested SubAgent delegation の可否に影響することはない
+- **nested SubAgent invocation**（例: `issue-contract-fixer`。Issue #998）も**構造的に不可能**である。本 SubAgent の frontmatter は `disallowedTools: [Agent, ...]` を持ち、`Agent` tool 自体を保持しないため、nested Skill invocation だけでなく nested SubAgent invocation も同様に技術的に遮断される（旧来の「別概念であり影響しない」という主張は誤りであったため不採用とした）。#998（`issue-contract-fixer` の先行呼び出し）を実現する場合、本 SubAgent 自身からnested 呼び出しすることはできず、呼び出し元（`issue-refinement-loop` 等の mainthread）が `issue-contract-fixer` → 本 SubAgent の順で明示的に sequential chainする必要がある（nested delegation ではなく main-thread orchestration）
 
 ## mutation の procedural contract（技術的強制ではない）
 

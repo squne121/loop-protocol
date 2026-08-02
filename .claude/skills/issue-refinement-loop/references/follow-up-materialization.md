@@ -4,7 +4,7 @@
 
 `approve` の直後は Step 5 に進む前に child / follow-up materialization gate を通す。
 
-- delivery-rollup parent で child slot が未 materialize の場合は、main thread が routing 先を確認してから `issue-author` に委譲する
+- delivery-rollup parent で child slot が未 materialize の場合は、main thread が routing 先を確認してから `issue-creator` に委譲する
 - 通常の implementation / refinement issue では gate を通過してそのまま Step 5 へ進む
 
 ## Derived follow-up issues
