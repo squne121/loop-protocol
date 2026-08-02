@@ -40,6 +40,14 @@ _ALLOWED_PATHS_GATE_PATH = (
 )
 _FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL)
 _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
+# #1950 AC6-AC8: comment-id resolution for --human-context-comment-url /
+# --agent-report-comment-url. Origin is decided ONLY by which CLI flag the
+# caller passed the URL to -- never inferred from comment body shape,
+# author account, or author_association (a single account can post both
+# human comments and machine-generated ones, e.g. create-issue transaction
+# reports).
+_ISSUE_COMMENT_ID_RE = re.compile(r"#issuecomment-(\d+)$")
+_STRUCTURED_AGENT_REPORT_MARKER_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_V\d+\b")
 
 
 def _now_utc() -> str:
@@ -331,6 +339,66 @@ def _collect_issue_comments(
             invalid_json_lines_count += 1
 
     return comments, {"invalid_json_lines_count": invalid_json_lines_count}, []
+
+
+def _resolve_context_comments(
+    urls: list[str],
+    lane: str,
+    comments_by_id: dict[int, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """#1950 AC6/AC7/AC8: resolve --human-context-comment-url /
+    --agent-report-comment-url values against the already-fetched comments
+    list (no new fetch path is added -- this only additively binds comment
+    IDs the caller explicitly designated into ``comments_by_id``, which was
+    built from the single existing all-pages ``_collect_issue_comments()``
+    call).
+
+    ``lane`` is either "human_supplied" or "agent_generated" -- it is never
+    inferred from ``comment`` contents, only from which CLI flag the caller
+    used to pass ``urls``.
+
+    Returns ``(resolved_entries, errors)``. Any resolution failure
+    (unparseable URL, comment not found, html_url readback mismatch, or --
+    for the agent_generated lane only -- a missing structured report
+    marker) is fail-closed: the offending URL is dropped from
+    ``resolved_entries`` and an error string is appended instead.
+    """
+    resolved: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for url in urls:
+        match = _ISSUE_COMMENT_ID_RE.search(url)
+        if match is None:
+            errors.append(f"{lane}_comment_url_unparseable:{url}")
+            continue
+        comment_id = int(match.group(1))
+        comment = comments_by_id.get(comment_id)
+        if comment is None:
+            errors.append(f"{lane}_comment_not_found:{comment_id}")
+            continue
+        html_url = str(comment.get("html_url") or "")
+        if html_url != url:
+            errors.append(f"{lane}_comment_url_html_url_mismatch:{comment_id}")
+            continue
+        body = str(comment.get("body") or "")
+        entry: dict[str, Any] = {
+            "comment_id": comment_id,
+            "url": url,
+            "author": comment.get("author"),
+            "author_id": comment.get("author_id"),
+            "author_type": comment.get("author_type"),
+            "author_association": comment.get("author_association"),
+            "updated_at": comment.get("updated_at"),
+            "body_sha256": _sha256(body),
+            "body": body,
+        }
+        if lane == "agent_generated":
+            has_marker = bool(_STRUCTURED_AGENT_REPORT_MARKER_RE.search(body))
+            entry["structured_marker_present"] = has_marker
+            if not has_marker:
+                errors.append(f"agent_report_missing_structured_marker:{comment_id}")
+                continue
+        resolved.append(entry)
+    return resolved, errors
 
 
 def _parse_contract_results(
@@ -668,6 +736,8 @@ def build_intake_capsule(
     issue_number: int,
     repo: str = _DEFAULT_REPO,
     ensure_contract_snapshot_result: str | None = None,
+    human_context_comment_urls: list[str] | None = None,
+    agent_report_comment_urls: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
     # #1869 fix_delta P0-4: `errors` is split into `fatal_errors` (blocks
     # intake / forces exit 1 — reserved for live Issue not accessible,
@@ -761,6 +831,78 @@ def build_intake_capsule(
             parse_warning_counts,
         )
 
+    # #1950 AC6-AC8: resolve --human-context-comment-url /
+    # --agent-report-comment-url against the already-fetched comments list.
+    # Reuses the single existing _collect_issue_comments() call site -- no
+    # new fetch path is added. If the contract snapshot came from
+    # ensure_contract_snapshot_result (comments not fetched above), and
+    # context comment URLs were requested, this calls the exact same
+    # _collect_issue_comments() function once more (not a new fetch
+    # mechanism).
+    human_context_comment_urls = list(human_context_comment_urls or [])
+    agent_report_comment_urls = list(agent_report_comment_urls or [])
+    context_inputs_full: dict[str, Any] | None = None
+    context_inputs_summary: dict[str, Any] | None = None
+    if human_context_comment_urls or agent_report_comment_urls:
+        provenance_conflict_urls = sorted(
+            set(human_context_comment_urls) & set(agent_report_comment_urls)
+        )
+        if ensure_contract_snapshot_result:
+            _ctx_comments, _ctx_counts, _ctx_errors = _collect_issue_comments(
+                issue_number, repo, command_log
+            )
+            fatal_errors.extend(_ctx_errors)
+        else:
+            _ctx_comments = comments_for_digest
+        comments_by_id: dict[int, dict[str, Any]] = {
+            comment["id"]: comment
+            for comment in _ctx_comments
+            if isinstance(comment.get("id"), int)
+        }
+
+        human_urls_to_resolve = [
+            url for url in human_context_comment_urls if url not in provenance_conflict_urls
+        ]
+        agent_urls_to_resolve = [
+            url for url in agent_report_comment_urls if url not in provenance_conflict_urls
+        ]
+        human_resolved, human_errors = _resolve_context_comments(
+            human_urls_to_resolve, "human_supplied", comments_by_id
+        )
+        agent_resolved, agent_errors = _resolve_context_comments(
+            agent_urls_to_resolve, "agent_generated", comments_by_id
+        )
+        provenance_conflict_entries = [
+            {"url": url, "reason": "provenance_conflict_url_in_both_lanes"}
+            for url in provenance_conflict_urls
+        ]
+
+        # AC8: repository/Issue/comment mismatch, dual-lane URLs, missing
+        # comments, and invalid structured agent reports are all fail-closed
+        # -- they block intake (fatal_errors), not merely advisory warnings.
+        fatal_errors.extend(human_errors)
+        fatal_errors.extend(agent_errors)
+        fatal_errors.extend(
+            f"provenance_conflict:{url}" for url in provenance_conflict_urls
+        )
+
+        context_inputs_full = {
+            "human_supplied": human_resolved,
+            "agent_generated": agent_resolved,
+            "provenance_conflicts": provenance_conflict_entries,
+        }
+        # AC7: stdout projection excludes raw comment body -- only
+        # provenance/hash/metadata is surfaced in the stdout-facing capsule.
+        context_inputs_summary = {
+            "human_supplied": [
+                {k: v for k, v in entry.items() if k != "body"} for entry in human_resolved
+            ],
+            "agent_generated": [
+                {k: v for k, v in entry.items() if k != "body"} for entry in agent_resolved
+            ],
+            "provenance_conflicts": provenance_conflict_entries,
+        }
+
     for key, count in parse_warning_counts.items():
         if count:
             warnings.append(f"{key}:{count}")
@@ -830,6 +972,12 @@ def build_intake_capsule(
         "fatal_errors": fatal_errors,
         "errors": fatal_errors,  # backward-compat alias (deprecated)
     }
+    if context_inputs_summary is not None:
+        # #1950 AC6/AC7: backward-compatible optional section -- absent when
+        # no --human-context-comment-url / --agent-report-comment-url was
+        # passed, so existing consumers of IMPL_REVIEW_INTAKE_CAPSULE_V1 are
+        # unaffected.
+        capsule["context_inputs"] = context_inputs_summary
 
     artifact_payload = {
         "schema": _SCHEMA_NAME,
@@ -856,6 +1004,10 @@ def build_intake_capsule(
         "fatal_errors": fatal_errors,
         "errors": fatal_errors,  # backward-compat alias (deprecated)
     }
+    if context_inputs_full is not None:
+        # Full body snapshot lives ONLY in the artifact -- never projected
+        # to stdout (AC7).
+        artifact_payload["context_inputs"] = context_inputs_full
 
     # #1869 fix_delta P0-4: exit code depends ONLY on fatal_errors (live
     # Issue not accessible / repo state unreadable). Comment/snapshot/body
@@ -900,6 +1052,22 @@ def main() -> int:
     parser.add_argument("--max-stdout-bytes", type=int, default=_DEFAULT_MAX_STDOUT_BYTES)
     parser.add_argument("--ensure-contract-snapshot-result")
     parser.add_argument("--artifact-dir", default=str(_DEFAULT_ARTIFACT_DIR))
+    # #1950 AC6: provenance-separated context inputs. Origin is decided
+    # solely by which flag the caller used -- never inferred from comment
+    # body/author. Repeatable; same URL passed to both flags is a
+    # provenance conflict (fail-closed, AC8).
+    parser.add_argument(
+        "--human-context-comment-url",
+        dest="human_context_comment_urls",
+        action="append",
+        default=[],
+    )
+    parser.add_argument(
+        "--agent-report-comment-url",
+        dest="agent_report_comment_urls",
+        action="append",
+        default=[],
+    )
     args = parser.parse_args()
 
     if args.max_stdout_bytes <= 0:
@@ -921,6 +1089,8 @@ def main() -> int:
         issue_number=args.issue_number,
         repo=args.repo,
         ensure_contract_snapshot_result=args.ensure_contract_snapshot_result,
+        human_context_comment_urls=args.human_context_comment_urls,
+        agent_report_comment_urls=args.agent_report_comment_urls,
     )
 
     artifact_dir = Path(args.artifact_dir)

@@ -265,6 +265,77 @@ def test_multiple_candidates_route_to_human_judgment():
     assert routed["anchor_context_marked_segment_count"] >= 2
 
 
+def test_trusted_owner_multi_turn_routes_to_advisory_chronology_metadata():
+    """#1950 AC1: trusted OWNER multi-turn anchors are not a hard stop. The
+    last OWNER-speaker segment's index/source span is recorded as
+    `latest_owner_turn` chronology metadata only -- it must never be
+    promoted to `technical_recommendation` or `mutation_authorization`
+    precedence, and multi-turn ambiguity alone still does not grant
+    implementation_go."""
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+
+    baseline_decision = {
+        "status": "fail_closed",
+        "reason": "no_anchor_scope_reframe_v1_payload",
+        "implementation_go": False,
+        "anchor_author_association": "OWNER",
+    }
+    routed = _apply_multi_turn_candidate_route(baseline_decision, segments_result, candidates_result)
+
+    assert routed["status"] == "warn"
+    assert routed["reason"] == "multi_turn_anchor_context_trusted_owner_advisory"
+    assert routed["implementation_go"] is False
+    assert routed["anchor_context_candidate_count"] == len(candidates_result["candidates"])
+    assert routed["anchor_context_marked_segment_count"] >= 2
+
+    owner_segments = [
+        seg for seg in segments_result["segments"] if seg.get("speaker") == ac.SPEAKER_OWNER
+    ]
+    assert owner_segments, "fixture must contain at least one owner segment"
+    last_owner_segment = owner_segments[-1]
+
+    latest_owner_turn = routed["latest_owner_turn"]
+    assert latest_owner_turn["segment_index"] == last_owner_segment["index"]
+    assert latest_owner_turn["source_range"]["start_line"] == last_owner_segment["start_line"]
+    assert latest_owner_turn["source_range"]["end_line"] == last_owner_segment["end_line"]
+    # chronology metadata must never claim precedence or authorization.
+    assert "technical_recommendation" not in latest_owner_turn
+    assert "mutation_authorization" not in latest_owner_turn
+
+
+def test_non_owner_multi_turn_route_is_unaffected_by_owner_advisory_path():
+    """#1950 AC2 regression: a multi-turn anchor whose author is trusted but
+    NOT the strict `OWNER` association (e.g. `MEMBER`/`COLLABORATOR`) must
+    still hit the pre-existing hard fail_closed route, unchanged by the
+    #1950 AC1 advisory carve-out."""
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+
+    baseline_decision = {
+        "status": "fail_closed",
+        "reason": "no_anchor_scope_reframe_v1_payload",
+        "implementation_go": False,
+        "anchor_author_association": "MEMBER",
+    }
+    routed = _apply_multi_turn_candidate_route(baseline_decision, segments_result, candidates_result)
+
+    assert routed["status"] == "fail_closed"
+    assert routed["reason"] == "multi_turn_anchor_context_requires_human_judgment"
+    assert "latest_owner_turn" not in routed
+
+
+def test_anchor_comment_handling_reference_documents_owner_reaction_procedure():
+    """#1950 AC3/AC4: the material-conflict owner-reaction procedure (up to
+    3 options, reaction mapping, drift readback, untrusted-reaction
+    re-evaluation) is defined in the anchor reference doc."""
+    reference_doc = (
+        SKILL_ROOT / "references" / "anchor-comment-handling.md"
+    ).read_text(encoding="utf-8")
+    assert "owner reaction" in reference_doc
+    assert "untrusted reaction" in reference_doc
+
+
 def test_single_turn_comment_does_not_trigger_multi_turn_route():
     # A single-turn comment (no markers) must not be routed to fail_closed by
     # this specific mechanism, even if it has several bullet candidates --
@@ -576,11 +647,48 @@ def _base_fixture(issue_number: int, *, known_context: "dict | None" = None) -> 
     }
 
 
-def test_run_preflight_subprocess_multi_turn_ambiguity_blocks(tmp_path):
-    """Multiple marker-delimited segments + multiple candidates (the real
-    869-line fixture) must make the real subprocess entrypoint report
-    `status: blocked` / exit code EXIT_BLOCKED -- not merely an in-memory
-    dict field."""
+def test_run_preflight_subprocess_multi_turn_ambiguity_non_owner_blocks(tmp_path):
+    """#1950 AC2: multiple marker-delimited segments + multiple candidates,
+    authored by a non-OWNER (trusted-but-not-OWNER `MEMBER`), must still
+    make the real subprocess entrypoint report `status: blocked` / exit code
+    EXIT_BLOCKED -- the #1950 AC1 advisory route is scoped strictly to
+    `anchor_author_association == "OWNER"`, matching the pre-existing heavy
+    mutation gate's OWNER-only check."""
+    fixture = _base_fixture(_SUBPROC_ISSUE_MULTI_TURN)
+    fixture["anchor_comment_urls"] = [_SUBPROC_ANCHOR_URL]
+    fixture["anchor_comments"] = [
+        {
+            "id": _SUBPROC_COMMENT_ID,
+            "body": FIXTURE_869_LINES,
+            "issue_url": f"https://api.github.com/repos/{_SUBPROC_REPO}/issues/{_SUBPROC_ISSUE_MULTI_TURN}",
+            "author_association": "MEMBER",
+            "user": {"login": "reviewer", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "html_url": _SUBPROC_ANCHOR_URL,
+            "url": f"https://api.github.com/repos/{_SUBPROC_REPO}/issues/comments/{_SUBPROC_COMMENT_ID}",
+        }
+    ]
+
+    result, exit_code = _run_subprocess_fixture(
+        tmp_path,
+        issue_number=_SUBPROC_ISSUE_MULTI_TURN,
+        repo=_SUBPROC_REPO,
+        fixture=fixture,
+        anchor_comment_url=_SUBPROC_ANCHOR_URL,
+    )
+
+    assert exit_code == preflight.EXIT_BLOCKED, (result, exit_code)
+    assert result.get("status") == "blocked", result
+    assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED in result.get("blockers", []), result
+
+
+def test_run_preflight_subprocess_multi_turn_ambiguity_trusted_owner_advisory_not_blocked(tmp_path):
+    """#1950 AC1: the identical multi-turn transcript, authored by a trusted
+    OWNER, must NOT hard-block the real subprocess entrypoint. multi-turn
+    ambiguity alone is chronology metadata (`latest_owner_turn`), not a
+    precedence or mutation-authorization signal, so it routes to an advisory
+    `warn` / exit code EXIT_WARN instead of `blocked`."""
     fixture = _base_fixture(_SUBPROC_ISSUE_MULTI_TURN)
     fixture["anchor_comment_urls"] = [_SUBPROC_ANCHOR_URL]
     fixture["anchor_comments"] = [
@@ -605,9 +713,9 @@ def test_run_preflight_subprocess_multi_turn_ambiguity_blocks(tmp_path):
         anchor_comment_url=_SUBPROC_ANCHOR_URL,
     )
 
-    assert exit_code == preflight.EXIT_BLOCKED, (result, exit_code)
-    assert result.get("status") == "blocked", result
-    assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED in result.get("blockers", []), result
+    assert exit_code != preflight.EXIT_BLOCKED, (result, exit_code)
+    assert result.get("status") != "blocked", result
+    assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED not in result.get("blockers", []), result
 
 
 def test_run_preflight_subprocess_heavy_mutation_without_owner_blocks(tmp_path):
