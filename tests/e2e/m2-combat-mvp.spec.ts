@@ -778,7 +778,7 @@ test('GIVEN short sortie fixture WHEN timeout overlay baseline then Canvas scree
   await page.waitForTimeout(200)
   await page.addStyleTag({
     content:
-      '[data-self-explanation-card="true"] { visibility: hidden !important; }',
+      '[data-self-explanation-card="true"], [data-legacy-result-surface] { visibility: hidden !important; }',
   })
 
   await expect(page.locator('canvas.battle-stage__canvas')).toHaveScreenshot(
