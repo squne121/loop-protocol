@@ -30,8 +30,20 @@ interface LoopE2EState {
     height: number
   }
   player: {
+    x: number
+    y: number
     aimX: number
     aimY: number
+  }
+  projectiles: Array<{
+    id: number
+    x: number
+    y: number
+  }>
+  input: {
+    pointerX: number
+    pointerY: number
+    pointerKnown: boolean
   }
 }
 
@@ -50,6 +62,19 @@ type EvidenceEntry = {
   canvas_css: { width: number; height: number }
   canvas_backing_store: { width: number; height: number }
   logical_arena: { width: number; height: number }
+  effective_zoom: number
+  pointer_mapping?: PointerMappingEvidence[]
+  frozen_gameplay?: FrozenGameplayState
+}
+
+type PointerMappingEvidence = {
+  relative: { x: number; y: number }
+  logical: { x: number; y: number }
+}
+
+type FrozenGameplayState = Pick<LoopE2EState, 'arena'> & {
+  player: LoopE2EState['player']
+  projectiles: LoopE2EState['projectiles']
 }
 
 const SCENARIOS: Scenario[] = [
@@ -65,6 +90,21 @@ const SCENARIOS: Scenario[] = [
   { viewport: { width: 1920, height: 1080, label: '1920x1080' }, zoom: { factor: 1.25, label: '125%' } },
   { viewport: { width: 1920, height: 1080, label: '1920x1080' }, zoom: { factor: 1.5, label: '150%' } },
   { viewport: { width: 1920, height: 1080, label: '1920x1080' }, zoom: { factor: 2, label: '200%' } },
+]
+
+const RESPONSIVE_VIEWPORTS = [
+  { width: 1280, height: 720, label: '1280x720' },
+  { width: 1366, height: 768, label: '1366x768' },
+  { width: 1920, height: 1080, label: '1920x1080' },
+  { width: 1437, height: 1365, label: '1437x1365' },
+]
+
+const RESPONSIVE_DPRS = [1, 1.25, 2, 0.667]
+const RESPONSIVE_ZOOMS = [
+  { factor: 1, label: '100%' },
+  { factor: 1.25, label: '125%' },
+  { factor: 1.5, label: '150%' },
+  { factor: 2, label: '200%' },
 ]
 
 async function getGameState(page: Page): Promise<LoopE2EState> {
@@ -123,6 +163,7 @@ async function collectEvidence(page: Page): Promise<Omit<EvidenceEntry, 'viewpor
     return {
       observed_devicePixelRatio: window.devicePixelRatio ?? 1,
       observed_visualViewportScale: window.visualViewport?.scale ?? null,
+      effective_zoom: window.visualViewport?.scale ?? 1,
       userAgent: navigator.userAgent,
       canvas_css: {
         width: rect.width,
@@ -137,13 +178,14 @@ async function collectEvidence(page: Page): Promise<Omit<EvidenceEntry, 'viewpor
   })
 }
 
-async function assertPointerMapsToLogicalArena(page: Page): Promise<void> {
+async function assertPointerMapsToLogicalArena(page: Page): Promise<PointerMappingEvidence[]> {
   const box = await page.locator('canvas.battle-stage__canvas').boundingBox()
   expect(box).not.toBeNull()
-  if (!box) return
+  if (!box) return []
 
   const state = await getGameState(page)
   const canvas = page.locator('canvas.battle-stage__canvas')
+  const evidence: PointerMappingEvidence[] = []
   for (const point of [
     { x: 0, y: 0 },
     { x: 1, y: 0 },
@@ -160,16 +202,32 @@ async function assertPointerMapsToLogicalArena(page: Page): Promise<void> {
       isPrimary: true,
       pointerId: 1,
     })
+    const expected = {
+      x: Math.round(state.arena.width * point.x),
+      y: Math.round(state.arena.height * point.y),
+      known: true,
+    }
     await expect.poll(async () => {
       const current = await getGameState(page)
       return {
-        x: Math.round(current.player.aimX),
-        y: Math.round(current.player.aimY),
+        x: Math.round(current.input.pointerX),
+        y: Math.round(current.input.pointerY),
+        known: current.input.pointerKnown,
       }
-    }).toEqual({
-      x: Math.round(state.arena.width * point.x),
-      y: Math.round(state.arena.height * point.y),
+    }).toEqual(expected)
+    evidence.push({
+      relative: point,
+      logical: { x: expected.x, y: expected.y },
     })
+  }
+  return evidence
+}
+
+function frozenGameplayState(state: LoopE2EState): FrozenGameplayState {
+  return {
+    arena: state.arena,
+    player: state.player,
+    projectiles: state.projectiles,
   }
 }
 
@@ -314,42 +372,80 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
   )
 })
 
-test('responsive canvas keeps backing store and pointer mapping aligned at DPR 1, 1.25, and 2', async ({
+test('responsive canvas preserves the logical arena, frozen combat positions, backing store, and pointer mapping across viewport, DPR, and zoom', async ({
   browser,
 }, testInfo) => {
-  test.setTimeout(90_000)
-  const evidence: Array<EvidenceEntry & { dpr: number }> = []
+  test.setTimeout(240_000)
+  const evidence: Array<EvidenceEntry & { declared_dpr: number }> = []
 
-  for (const dpr of [1, 1.25, 2]) {
+  for (const dpr of RESPONSIVE_DPRS) {
     const context = await browser.newContext({
-      viewport: { width: 1280, height: 720 },
+      viewport: RESPONSIVE_VIEWPORTS[0],
       deviceScaleFactor: dpr,
     })
     const page = await context.newPage()
     await page.goto('/')
     await waitForRunningWithCombatActors(page)
-    await assertPointerMapsToLogicalArena(page)
 
-    const observed = await collectEvidence(page)
-    expect(observed.logical_arena).toEqual({ width: 960, height: 540 })
-    expect(observed.canvas_backing_store.width).toBe(Math.round(observed.canvas_css.width * dpr))
-    expect(observed.canvas_backing_store.height).toBe(Math.round(observed.canvas_css.height * dpr))
+    const canvas = page.locator('canvas.battle-stage__canvas')
+    await canvas.hover({ position: { x: 480, y: 270 } })
+    await page.mouse.down()
+    await expect.poll(async () => (await getGameState(page)).projectiles.length).toBeGreaterThan(0)
+    await page.mouse.up()
+    await page.locator('[data-action="toggle-pause"]').evaluate((button) => (button as HTMLButtonElement).click())
+    await expect(page.locator('[data-action="toggle-pause"]')).toHaveAttribute('aria-pressed', 'true')
 
-    const screenshotPath = testInfo.outputPath(`responsive-canvas-dpr-${dpr}.png`)
-    await page.screenshot({ path: screenshotPath, fullPage: true })
-    evidence.push({
-      viewport: '1280x720',
-      browser_zoom: '100%',
-      screenshot_path: screenshotPath,
-      dpr,
-      ...observed,
-    })
+    const frozenBeforeResize = frozenGameplayState(await getGameState(page))
+    expect(frozenBeforeResize.arena).toEqual({ width: 960, height: 540 })
+
+    for (const viewport of RESPONSIVE_VIEWPORTS) {
+      for (const zoom of RESPONSIVE_ZOOMS) {
+        await page.setViewportSize(viewport)
+        await applyBrowserZoom(page, zoom.factor)
+        await page.waitForTimeout(100)
+
+        const pointerMapping = await assertPointerMapsToLogicalArena(page)
+        const observed = await collectEvidence(page)
+        const frozenAfterResize = frozenGameplayState(await getGameState(page))
+
+        expect(observed.logical_arena).toEqual({ width: 960, height: 540 })
+        expect(observed.canvas_css.width).toBeGreaterThan(0)
+        expect(observed.canvas_css.height).toBeGreaterThan(0)
+        expect(observed.canvas_css.height).toBeCloseTo(observed.canvas_css.width * 9 / 16, 2)
+        expect(observed.canvas_backing_store.width).toBe(
+          Math.round(observed.canvas_css.width * observed.observed_devicePixelRatio),
+        )
+        expect(observed.canvas_backing_store.height).toBe(
+          Math.round(observed.canvas_css.height * observed.observed_devicePixelRatio),
+        )
+        expect(observed.effective_zoom).toBeCloseTo(zoom.factor, 2)
+        expect(frozenAfterResize).toEqual(frozenBeforeResize)
+
+        evidence.push({
+          viewport: viewport.label,
+          browser_zoom: zoom.label,
+          screenshot_path: 'not-captured; JSON contains the runtime measurement',
+          declared_dpr: dpr,
+          pointer_mapping: pointerMapping,
+          frozen_gameplay: frozenAfterResize,
+          ...observed,
+        })
+      }
+    }
     await context.close()
   }
 
   await writeFile(
     testInfo.outputPath('responsive-canvas-runtime-evidence.json'),
-    JSON.stringify({ head_sha: process.env.GITHUB_SHA ?? 'local', evidence }, null, 2),
+    JSON.stringify({
+      head_sha: process.env.GITHUB_SHA ?? 'local-uncommitted',
+      matrix: {
+        viewports: RESPONSIVE_VIEWPORTS,
+        device_scale_factors: RESPONSIVE_DPRS,
+        browser_zooms: RESPONSIVE_ZOOMS,
+      },
+      evidence,
+    }, null, 2),
     'utf8',
   )
 })

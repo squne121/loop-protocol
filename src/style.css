@@ -99,6 +99,18 @@ button:focus-visible {
   max-width: 100%;
 }
 
+/* The committed Canvas VRTs use a 1280px fixed viewport and own a 900px
+ * presentation baseline. Keep that fixture geometry stable without reviving
+ * the former JavaScript sidebar subtraction: narrower containers still use
+ * their full available width, while wider runtime layouts remain responsive. */
+@media (width <= 1280px) {
+  .battle-stage {
+    /* `border-box` includes the two 1px frame borders; the frozen Canvas
+     * and overlay capture themselves therefore remain exactly 900px wide. */
+    width: min(902px, 100%);
+  }
+}
+
 .battle-stage__header {
   display: flex;
   justify-content: space-between;

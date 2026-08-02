@@ -63,6 +63,49 @@ describe('responsive canvas presentation lifecycle', () => {
     expect(disconnect).toHaveBeenCalledOnce()
     expect(removeEventListener).toHaveBeenCalledWith('resize', expect.any(Function))
   })
+
+  it('GIVEN device-pixel-content-box is unsupported WHEN observation starts THEN it falls back to the standard observer box', () => {
+    const onResize = vi.fn()
+    const observe = vi.fn()
+      .mockImplementationOnce(() => { throw new TypeError('unsupported box') })
+    const disconnect = vi.fn()
+
+    class ThrowingBoxObserver {
+      observe = observe
+      disconnect = disconnect
+    }
+
+    const dispose = observeCanvasPresentation(
+      {} as Element,
+      onResize,
+      { addEventListener: vi.fn(), removeEventListener: vi.fn() },
+      ThrowingBoxObserver as unknown as typeof ResizeObserver,
+    )
+
+    expect(observe).toHaveBeenNthCalledWith(1, expect.anything(), { box: 'device-pixel-content-box' })
+    expect(observe).toHaveBeenNthCalledWith(2, expect.anything())
+    expect(onResize).toHaveBeenCalledOnce()
+    dispose()
+    expect(disconnect).toHaveBeenCalledOnce()
+  })
+
+  it('GIVEN ResizeObserver is unavailable WHEN presentation is bound THEN window resize remains active and cleanup removes it', () => {
+    const onResize = vi.fn()
+    const addEventListener = vi.fn()
+    const removeEventListener = vi.fn()
+
+    const dispose = observeCanvasPresentation(
+      {} as Element,
+      onResize,
+      { addEventListener, removeEventListener },
+      undefined,
+    )
+
+    expect(onResize).toHaveBeenCalledOnce()
+    expect(addEventListener).toHaveBeenCalledWith('resize', expect.any(Function))
+    dispose()
+    expect(removeEventListener).toHaveBeenCalledWith('resize', expect.any(Function))
+  })
 })
 
 describe('advanceSimulationLoop', () => {

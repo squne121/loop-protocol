@@ -1240,6 +1240,9 @@ export interface LoopE2ESnapshot {
   input: {
     primaryPressed: boolean
     activePointerId: number | null
+    pointerX: number
+    pointerY: number
+    pointerKnown: boolean
   }
   commandIntent: {
     activeIntent: 'none' | 'assist_player'
@@ -1306,6 +1309,9 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
         input: {
           primaryPressed: inputState.primaryPressed,
           activePointerId: inputState.activePointerId,
+          pointerX: inputState.pointerX,
+          pointerY: inputState.pointerY,
+          pointerKnown: inputState.pointerKnown,
         },
         commandIntent: {
           activeIntent: state.commandIntentRuntime.activeIntent,
