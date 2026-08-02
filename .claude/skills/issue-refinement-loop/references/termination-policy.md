@@ -56,6 +56,17 @@ reviewer が `approve` を返しても、最新の `CONTRACT_REVIEW_RESULT_V1.st
 - `next_action: human_judgment` の場合は `human_escalation` とする（`CONTRACT_REVIEW_RESULT_V1.status` は `go | blocked` のみ。`human_judgment` は `next_action` フィールドで表現）
 - 本ルールは `issue-refinement-loop/SKILL.md` が本ファイルを normative reference として消費するため、SKILL.md を変更せずとも実効性がある
 
+### Final Gate 適用除外（issue_kind: parent + parent_mode: delivery-rollup, #1914）
+
+`issue_kind: parent` かつ `parent_mode: delivery-rollup` の Machine-Readable Contract を持つ Issue（`## Verification Commands` セクションを持たない調査・整理系 delivery-rollup parent）には、本 Final Gate（`CONTRACT_REVIEW_RESULT_V1.status == "go"` 必須化）を適用しない。
+
+- 適用除外の判定は `run_contract_review_once.py` が Step 2（`contract_readiness_check.py` 呼び出し、既存の strict resolver `resolve_existing_issue_validation_profile` による canonical parent 判定）の結果を再利用して行う。新しい YAML parser・allowlist は追加しない
+- 適用除外の対象は `parent_mode: delivery-rollup` のみ（保守的な選択）。`quality-gate` / `routing-map` / `decision-log` へは拡大しない
+- 適用除外に該当する Issue では、`run_contract_review_once.py` は `baseline_vc_preflight.py` を呼ばずに `CONTRACT_REVIEW_RESULT_V1.status` を `go` として確定する（`blocked` にはしない）
+- `issue_kind: parent` かつ `parent_mode` が `delivery-rollup` 以外の場合、および `issue_kind: implementation` の場合は本適用除外の対象外であり、`## Verification Commands` セクションがなければ従来通り `status: blocked`（`VC001_NO_VERIFICATION_COMMANDS_SECTION`）のままとする
+- **「Final Gate 非適用」と「Final Gate 成功」は区別する**: 適用除外に該当する delivery-rollup parent の `approved` 終了は「Final Gate 非適用（not applicable）」であり、`## Verification Commands` を実際に検証して `status: go` を得た通常経路の「Final Gate 成功（passed）」とは異なる。両者は終了要約（下記 `LOOP_HANDOFF_RESULT_V1` 節参照）で明確に区別する
+- 発端: Issue #1890（delivery-rollup parent、`## Verification Commands` セクションなしを理由に `run_contract_review_once.py` が `status: blocked` を返し、`issue-reviewer approve` にもかかわらず `approved` 終了できなかった事故）に対する OWNER 決定の恒久反映
+
 ### implement-issue Handoff Gate（引き渡しゲート）
 
 | `CONTRACT_REVIEW_RESULT_V1` フィールド | handoff 判定 |
@@ -233,6 +244,15 @@ LOOP_POLICY_V1:
 
 `issue-refinement-loop` が `approved` 終了するとき、終了コメントに `LOOP_HANDOFF_RESULT_V1` marker を出力する。  
 本セクションが `LOOP_HANDOFF_RESULT_V1` の唯一の SSOT である。
+
+**適用範囲（implementation Issue 専用、#1914）**: `LOOP_HANDOFF_RESULT_V1` marker は `issue_kind: implementation` の Issue（`impl-review-loop` への handoff を伴う通常実装 Issue）専用の終端契約であり、`issue_kind: parent`（delivery-rollup parent を含む）の Issue には出力しない。
+
+`issue_kind: parent` かつ `parent_mode: delivery-rollup` の Issue が `approved` 終了する場合:
+
+- `LOOP_HANDOFF_RESULT_V1` marker は出力しない（`impl-review-loop` への handoff は発生しないため）。marker が出力されない以上、marker 内の `status: impl_ready` / `routing_action: run_impl_review_loop` フィールドも一切出力されない（#1940 review: marker 非出力の帰結として明示する）
+- plain Markdown の終了要約（fenced YAML marker を伴わない）のみを投稿する
+- 既存の `FOLLOW_UP_MATERIALIZATION_RESULT_V1`（child issue materialization 結果）は変更なく併記する
+- 終了要約本文に `Final Gate: not applicable` と reason code（例: `delivery_rollup_parent_without_verification_commands`）を明記し、上記「Final Gate 適用除外」節の「Final Gate 成功」（`status: go` を実際に確認した通常経路）と区別する
 
 ### Output Format（出力形式）
 

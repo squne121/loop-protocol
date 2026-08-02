@@ -267,7 +267,16 @@ def test_run_contract_review_once_treats_transport_error_exit_as_runtime_error()
         "body_sha256": "sha256:test",
     }
 
-    with mock.patch.object(review_once, "check_existing_go_comment", return_value=(None, None)), \
+    # Issue #1914 P0-3 (#1940 fix_delta iteration 4): run_once() now fetches
+    # the Issue body exactly once at the start of every invocation via
+    # fetch_body_from_github(). This test predates that change and did not
+    # mock it, so it was hitting a real (unmocked) network call. Mock it
+    # here with a benign default body, matching the pattern already applied
+    # in test_run_contract_review_once.py / test_run_contract_review_once_wrapper_wiring.py.
+    with mock.patch.object(
+             review_once, "fetch_body_from_github", return_value=("## Outcome\n\ntest body\n", None)
+         ), \
+         mock.patch.object(review_once, "check_existing_go_comment", return_value=(None, None)), \
          mock.patch.object(review_once, "_run_shell_script", return_value=(0, "", "")), \
          mock.patch.object(
              review_once,
@@ -299,7 +308,11 @@ def test_run_contract_review_once_treats_invalid_product_spec_pair_as_runtime_er
         "body_sha256": "sha256:test",
     }
 
-    with mock.patch.object(review_once, "check_existing_go_comment", return_value=(None, None)), \
+    # Issue #1914 P0-3 (#1940 fix_delta iteration 4): see rationale above.
+    with mock.patch.object(
+             review_once, "fetch_body_from_github", return_value=("## Outcome\n\ntest body\n", None)
+         ), \
+         mock.patch.object(review_once, "check_existing_go_comment", return_value=(None, None)), \
          mock.patch.object(review_once, "_run_shell_script", return_value=(0, "", "")), \
          mock.patch.object(
              review_once,
