@@ -681,9 +681,12 @@ def test_executor_inputs_under_issue_metadata_namespace(
     assert len(calls) == 2
 
 
-def test_skill_and_issue_author_no_raw_existing_issue_mutation_contract() -> None:
+def test_skill_and_issue_editor_no_raw_existing_issue_mutation_contract() -> None:
+    """Issue #1734: issue-author was split into issue-creator/issue-editor;
+    existing-Issue mutation now lives in issue-editor.md.
+    """
     skill = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text(encoding="utf-8")
-    agent = (Path(__file__).resolve().parents[3] / "agents" / "issue-author.md").read_text(encoding="utf-8")
+    agent = (Path(__file__).resolve().parents[3] / "agents" / "issue-editor.md").read_text(encoding="utf-8")
     forbidden = ["gh issue edit", "gh issue comment", "gh api --method PATCH", "gh api --method POST"]
     for token in forbidden:
         assert token not in skill

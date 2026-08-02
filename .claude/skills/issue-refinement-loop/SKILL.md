@@ -238,9 +238,9 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/decide_next
 
 ### Step 4: 書き換え (Rewrite)
 
-`issue-author` SubAgent に opaque forwarding payload を渡して本文を更新する。AC/VC の baseline fail expectation と review 時の扱いを取り違えないこと。詳細な reflection guard は `references/ac-vc-reflection.md` を参照する。
+`issue-editor` SubAgent に opaque forwarding payload を渡して本文を更新する（Issue #1734: `issue-author` は `issue-creator` / `issue-editor` に分割済み。既存 Issue の書き換えは `issue-editor` が担う）。AC/VC の baseline fail expectation と review 時の扱いを取り違えないこと。詳細な reflection guard は `references/ac-vc-reflection.md` を参照する。
 
-issue-author 起動前に、現在本文に対して pre-author static readiness check を実行する。
+issue-editor 起動前に、現在本文に対して pre-edit static readiness check を実行する。
 
 ```bash
 uv run --locked python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py \
@@ -270,14 +270,14 @@ readiness 結果に応じた分岐処理 (readiness routing):
 ```yaml
 exit_code_0:
   status: go
-  action: invoke_issue_author
+  action: invoke_issue_editor
   readiness_errors: []
 exit_code_1:
   status: needs_fix
-  action: invoke_issue_author_with_readiness_result
+  action: invoke_issue_editor_with_readiness_result
 exit_code_2:
   status: human_judgment
-  action: skip_issue_author_and_go_step5
+  action: skip_issue_editor_and_go_step5
 exit_code_3:
   status: input_or_runtime_error
   action: human_escalation
@@ -288,7 +288,7 @@ exit_code_3:
 - `STATUS: ok` / `BODY_HASH: <sha256>` → 更新成功、`NEXT_ACTION: proceed` で Step 2 に戻る
 - `STATUS: no_change` → 変更なし、`NEXT_ACTION: proceed` で Step 2 に戻る
 - `STATUS: failed` → 修正失敗、`NEXT_ACTION: human_judgment_required`、Step 5 human_escalation へ
-- `partial_failure` は廃止。issue-author は `ok` / `no_change` / `failed` の 3 値のみを返す。
+- `partial_failure` は廃止。issue-editor は `ok` / `no_change` / `failed` の 3 値のみを返す。
 - full mutation result は `ARTIFACT:` パスから取得する（main context には返らない）
 
 rewrite ループの反復ごとに、checker 実行後に `scripts/decide_rewrite_route.py` を呼び出して `max_rewrite_attempts` 超過・body hash 変化なし・missing set 単調減少なしを runtime で強制し、`route`（`continue_rewrite` / `proceed_to_review` / `human_judgment_required`）に従って routing する。invocation 手順・state 永続化・`human_judgment_required` 連動は `references/termination-policy.md` の「Rewrite Loop Runtime Router（#664）」セクションを SSOT とする。orchestrator は attempt 数や no-progress を prose で再判定しない。
