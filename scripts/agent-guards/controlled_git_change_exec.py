@@ -905,7 +905,11 @@ def execute_controlled_change(
                 delta_records=commit_records,
                 allowed_paths=snapshot.allowed_paths,
             )
-            if commit_paths != delta_paths or committed_bounded_root_skill_replacement != bounded_root_skill_replacement:
+            if (
+                commit_paths != delta_paths
+                or committed_bounded_root_skill_replacement
+                != bounded_root_skill_replacement
+            ):
                 post_commit_violation = True
             else:
                 for path in commit_paths:
