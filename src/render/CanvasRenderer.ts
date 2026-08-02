@@ -264,17 +264,23 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
       }
 
       // --- Layer 5b: enemy HP labels (above enemy circles, below projectiles) ---
-      for (const enemy of state.enemies) {
-        if (enemy.defeated) continue
-        drawEnemyHpLabel({
-          ctx: context,
-          enemyX: enemy.x,
-          enemyY: enemy.y,
-          enemyRadius: enemy.radius,
-          enemyHp: enemy.hp,
-          arenaWidth: arenaW,
-          arenaHeight: arenaH,
-        })
+      // A terminal sortie freezes world interaction beneath its result overlay.
+      // Do not retain a live Canvas text raster here: its platform-dependent
+      // anti-aliasing would make the terminal overlay differ without changing
+      // gameplay or the result surface that owns the outcome copy.
+      if (state.sortie.result === null) {
+        for (const enemy of state.enemies) {
+          if (enemy.defeated) continue
+          drawEnemyHpLabel({
+            ctx: context,
+            enemyX: enemy.x,
+            enemyY: enemy.y,
+            enemyRadius: enemy.radius,
+            enemyHp: enemy.hp,
+            arenaWidth: arenaW,
+            arenaHeight: arenaH,
+          })
+        }
       }
 
       // --- Layer 5c: active assist cue (non-authoritative only) ---

@@ -68,4 +68,58 @@ describe('CanvasRenderer responsive presentation', () => {
     expect(context.setTransform).toHaveBeenLastCalledWith(2400 / 960, 0, 0, 1350 / 540, 0, 0)
     expect(state.arena).toEqual({ width: 960, height: 540 })
   })
+
+  it('GIVEN a terminal sortie WHEN Canvas renders THEN live enemy HP text is omitted beneath the result overlay', () => {
+    const context = makeCanvasContextSpy()
+    const canvas = document.createElement('canvas')
+    vi.spyOn(canvas, 'getContext').mockReturnValue(context as unknown as CanvasRenderingContext2D)
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 0,
+      top: 0,
+      left: 0,
+      right: 960,
+      bottom: 540,
+      width: 960,
+      height: 540,
+      toJSON: () => ({}),
+    })
+
+    const state = createInitialGameState()
+    state.enemies = [{
+      id: 1,
+      definitionId: 'enemy-basic',
+      hp: 3,
+      maxHp: 3,
+      x: 800,
+      y: 270,
+      radius: 16,
+      speedPxPerSec: 60,
+      contactDamage: 1,
+      defeated: false,
+      defeatedAtTick: null,
+      faction: 'enemy',
+      role: 'enemy_chaser',
+      behaviorState: 'move_to_engage',
+      targetingPolicy: 'focus_player',
+      targetEntityId: 'player:player-alpha',
+    }]
+    state.sortie = {
+      status: 'timeout',
+      elapsedTicks: 30,
+      targetTicks: 30,
+      result: {
+        outcome: 'timeout',
+        endReason: 'timeout',
+        durationMs: 500,
+        kills: 0,
+        shotsFired: 0,
+        playerHpRemaining: state.player.hp,
+      },
+    }
+
+    createCanvasRenderer(canvas).render(state)
+
+    expect(context.fillText).not.toHaveBeenCalled()
+  })
 })
