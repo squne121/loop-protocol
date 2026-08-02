@@ -138,8 +138,27 @@ _log "created disposable target issue B #${DISPOSABLE_B_NUMBER}: ${TARGET_URL}"
 # -- Step 2: create predecessor Issue A via create_issue_txn.py --blocking B ---
 PRED_TITLE="[disposable-canary] blocking direction predecessor A ${TS}"
 PRED_BODY_FILE="$(mktemp)"
+# create_issue_txn.py runs validate_issue_body.py before any mutation
+# (Blocker 2.5); when --issue-kind is omitted the validator falls back to a
+# minimal required-section set (Acceptance Criteria / Verification Commands /
+# Allowed Paths), so the disposable body must include them even though this
+# is a throwaway canary Issue with no real code change.
 cat > "${PRED_BODY_FILE}" <<EOF
 Disposable predecessor Issue A created by live_canary_blocking_direction.sh (#1946 AC8). Will be closed immediately after this canary run. Safe to delete/ignore.
+
+## Acceptance Criteria
+
+- AC1: この使い捨て Issue はテストが終わったら即座に close される。
+
+## Verification Commands
+
+\`\`\`bash
+\$ echo "disposable canary issue - no verification required"
+\`\`\`
+
+## Allowed Paths
+
+- (none; disposable canary issue, no code changes)
 EOF
 
 CREATE_OUTPUT="$(cd "${REPO_ROOT}" && uv run --locked python3 "${CREATE_TXN}" \
