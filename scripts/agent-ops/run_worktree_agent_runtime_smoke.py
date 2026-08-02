@@ -395,18 +395,25 @@ def diff_fingerprints(before: dict | None, after: dict | None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def preflight_claude_flags() -> str | None:
+def preflight_claude_available() -> str | None:
+    """Only checks that a ``claude`` executable is resolvable on PATH.
+
+    Issue #1960: capability (which flags a given Claude Code version
+    accepts) is no longer decided from ``claude --help`` text. The CLI
+    reference explicitly documents that ``--help`` output is
+    human-oriented and non-exhaustive, and help omission of a flag does
+    not mean the flag is unsupported (``--max-turns`` was observed missing
+    from ``--help`` in Claude Code 2.1.220 while still being a documented,
+    accepted print-mode flag). Capability is now decided from the actual
+    fixed-argv invocation result (see
+    ``classify_claude_structured_outcome``), which applies to the
+    structured lane only. The interactive lane does not depend on this
+    check's flag list at all -- it only needs the binary to exist so
+    ``herdr agent start --kind claude`` has something to launch.
+    """
     exe = shutil.which("claude")
     if exe is None:
         return "required command not found: claude"
-    rc, out, err, timed_out = _run([exe, "--help"], timeout=20.0)
-    if timed_out or rc != 0:
-        return "unable to introspect claude --help capability"
-    text = out + err
-    required = ["--output-format", "--include-hook-events", "--no-session-persistence", "--max-turns"]
-    missing = [flag for flag in required if flag not in text]
-    if missing:
-        return f"claude CLI missing required structured-lane flags: {missing}"
     return None
 
 
@@ -492,6 +499,61 @@ def parse_native_event_count(stdout: str) -> int:
             continue
         count += 1
     return count
+
+
+# Issue #1960: capability classification is now derived from the actual
+# fixed-argv invocation result, not from ``claude --help`` text. Only a
+# narrowly-matched, known parser-level "unknown/unrecognized option"
+# diagnostic is treated as a capability gap (Design Decision #4 -- "任意の
+# non-zero exit を capability 不足として扱わない"). Any other non-zero exit
+# (auth failure, network failure, model failure, generic runtime error)
+# falls through to the existing FAIL classification unchanged (AC3).
+_CLAUDE_UNKNOWN_OPTION_RE = re.compile(
+    r"unknown option|unrecognized option|unknown argument|"
+    r"not recognized as a valid (?:option|argument)",
+    re.IGNORECASE,
+)
+
+# ``Reached max turns`` (or equivalent phrasing) is evidence the flag WAS
+# recognized and honored -- it must never be classified as a capability
+# SKIP (AC4). It is a bounded-turn runtime failure (FAIL 1).
+_CLAUDE_MAX_TURNS_REACHED_RE = re.compile(
+    r"reached max turns|max turns reached|max[_ ]turns limit|turn limit reached",
+    re.IGNORECASE,
+)
+
+
+def classify_claude_structured_outcome(
+    rc: int | None, stdout: str, stderr: str, timed_out: bool
+) -> tuple[str, str | None]:
+    """Classify a completed (or errored) structured Claude invocation.
+
+    Returns ``(decision, reason)``:
+
+    - ``"capability_skip"``: the fixed argv was rejected via a known
+      unknown/unrecognized-option parser diagnostic (SKIP 77, Design
+      Decision #4 -- narrow classification only).
+    - ``"turn_limit_reached"``: the ``--max-turns`` bound was reached (the
+      flag was accepted); this is a runtime failure, not a capability gap
+      (FAIL 1, AC4).
+    - ``"runtime_outcome"``: none of the above matched; the existing
+      exit-code / terminal-event based judgement applies unchanged (AC3).
+
+    ``reason`` is a short, redaction-safe human string recorded as
+    ``capability_error_classification`` evidence, or ``None`` for
+    ``"runtime_outcome"``.
+    """
+    if timed_out or rc is None:
+        return "runtime_outcome", None
+    combined = f"{stdout}\n{stderr}"
+    if _CLAUDE_MAX_TURNS_REACHED_RE.search(combined):
+        return "turn_limit_reached", "max turns limit reached (flag accepted; not a capability gap)"
+    if rc != 0 and _CLAUDE_UNKNOWN_OPTION_RE.search(combined):
+        return (
+            "capability_skip",
+            f"claude runtime rejected a fixed-argv flag as unknown/unrecognized option (exit {rc})",
+        )
+    return "runtime_outcome", None
 
 
 def has_terminal_event(runtime: str, stdout: str) -> bool:
@@ -893,7 +955,6 @@ def run_interactive_herdr_isolated(
     evidence: dict,
     *,
     herdr_bin: str = "herdr",
-    max_turns: int | None = None,
 ) -> list[str]:
     """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
     in place (so cleanup/session identity survive even if this raises) and
@@ -937,9 +998,16 @@ def run_interactive_herdr_isolated(
             raise HerdrLaneError("could not parse pane_id from herdr workspace create output")
         evidence["pane_id"] = pane_id
 
+        # Issue #1960 AC5: the interactive lane never forwards
+        # structured-only flags (``--output-format`` / ``--include-hook-events``
+        # / ``--no-session-persistence`` / ``--max-turns``) to the TUI
+        # launch. Bounded execution for this lane comes from herdr's own
+        # wait timeout, process termination, and isolated-session
+        # stop/delete/removal confirmation (see Outcome / Interactive lane
+        # in Issue #1960) -- not from a structured-lane print-mode flag
+        # that has not been separately confirmed to be honored by an
+        # interactive Claude Code launch.
         agent_extra_args: list[str] = []
-        if runtime == "claude" and max_turns:
-            agent_extra_args = ["--", "--max-turns", str(max_turns)]
 
         # A freshly created workspace's shell may not be an "available shell"
         # yet (still initializing). Retry ``agent start`` with a bounded,
@@ -1133,6 +1201,20 @@ def count_session_log_metadata(raw_lines: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _positive_int(value: str) -> int:
+    """argparse ``type`` for ``--max-turns`` (Issue #1960 AC6): only accepts
+    integers >= 1. ``0`` and negative values are rejected as an argument
+    error (argparse ``error()`` -> exit code 2), not silently clamped or
+    accepted."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--max-turns must be a positive integer, got: {value!r}") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"--max-turns must be a positive integer, got: {parsed}")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="worktree-agent-runtime-smoke runner")
     parser.add_argument("--runtime", choices=["claude", "codex"], required=True)
@@ -1141,8 +1223,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-file", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=180)
-    parser.add_argument("--max-turns", type=int, default=_DEFAULT_MAX_TURNS,
-                         help="bounded turn count for Claude Code (structured and interactive lanes)")
+    parser.add_argument("--max-turns", type=_positive_int, default=_DEFAULT_MAX_TURNS,
+                         help="bounded turn count for Claude Code (structured lane only; positive integer)")
     parser.add_argument("--expect-marker", action="append", default=[])
     parser.add_argument("--require-clean-postcondition", action="store_true")
     parser.add_argument("--inspect-session-log-metadata", action="store_true")
@@ -1209,7 +1291,11 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_SKIP
 
     if args.runtime == "claude":
-        skip_reason = preflight_claude_flags()
+        # Issue #1960: only checks binary existence, for both structured and
+        # interactive modes. Structured-lane flag capability is decided from
+        # the actual fixed-argv invocation result (classify_claude_structured
+        # _outcome), never from ``claude --help`` text (AC1/AC5).
+        skip_reason = preflight_claude_available()
     else:
         skip_reason = preflight_codex_flags()
     if skip_reason:
@@ -1264,13 +1350,22 @@ def main(argv: list[str] | None = None) -> int:
                 rc, out, err, timed_out = run_structured_claude(
                     worktree, prompt, float(args.timeout_seconds), args.max_turns
                 )
+                capability_decision, capability_reason = classify_claude_structured_outcome(
+                    rc, out, err, timed_out
+                )
             else:
                 rc, out, err, timed_out = run_structured_codex(worktree, prompt, float(args.timeout_seconds))
+                # Codex CLI capability preflight (help-based) is out of scope
+                # for Issue #1960 -- see Out of Scope: "Codex CLI lane の
+                # capability preflight 見直しは本 Issue の対象外".
+                capability_decision, capability_reason = "runtime_outcome", None
 
             event_count = parse_native_event_count(out)
             schema_summary["process_exit_code"] = rc
             schema_summary["timed_out"] = timed_out
             schema_summary["native_event_count"] = event_count
+            schema_summary["capability_decision"] = capability_decision
+            schema_summary["capability_error_classification"] = capability_reason
 
             if args.runtime == "claude":
                 spawn_events, self_restart_count, orchestration_count = classify_claude_events(out)
@@ -1281,11 +1376,23 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["self_restart_event_count"] = self_restart_count
             schema_summary["orchestration_action_count"] = orchestration_count
 
-            if timed_out:
+            if capability_decision == "capability_skip":
+                # AC2: a known unknown/unrecognized-option parser diagnostic
+                # -- SKIP 77, never promoted to FAIL. summary.md (written
+                # unconditionally below) records runtime_version and
+                # capability_error_classification as evidence.
+                errors.append(capability_reason)
+                exit_code = EXIT_SKIP
+            elif timed_out:
                 errors.append("structured lane timed out")
                 exit_code = EXIT_FAIL
             elif rc is None:
                 errors.append(f"structured lane failed to start: {_redact(err[:500])}")
+                exit_code = EXIT_FAIL
+            elif capability_decision == "turn_limit_reached":
+                # AC4: the flag was accepted (evidence of capability); this
+                # is a bounded-turn runtime failure, not a capability SKIP.
+                errors.append(capability_reason)
                 exit_code = EXIT_FAIL
             elif rc != 0:
                 errors.append(f"structured lane exited non-zero: {rc}: {_redact(err[:500])}")
@@ -1324,7 +1431,6 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
-                    max_turns=args.max_turns if args.runtime == "claude" else None,
                 )
 
                 if evidence.get("final_state") == "blocked":

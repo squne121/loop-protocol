@@ -263,7 +263,16 @@ exit 0
     assert sorted(p.name for p in out_dir.iterdir()) == ["summary.md"]
 
 
-def test_given_fake_claude_help_missing_max_turns_flag_when_preflight_runs_then_skip77(repo_with_worktree, tmp_path):
+def test_given_fake_claude_help_omits_max_turns_but_runtime_accepts_it_when_structured_lane_runs_then_exit0(
+    repo_with_worktree, tmp_path
+):
+    """Issue #1960 fix: ``claude --help`` not advertising ``--max-turns``
+    (observed for real in Claude Code 2.1.220) must not SKIP the structured
+    lane as long as the actual fixed-argv invocation accepts the flag and
+    returns a terminal result. This is the regression test for the exact
+    false-SKIP unit test this Issue's Background/Problem section (point 7)
+    identified as encoding the wrong behavior; it also unblocks the #1734
+    consumer that was previously starved by this false SKIP."""
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -272,18 +281,103 @@ if [ "$1" = "--help" ]; then
   echo "--output-format --include-hook-events --no-session-persistence"
   exit 0
 fi
+cat > /dev/null
+echo '{"type":"result","subtype":"success"}'
 exit 0
 """)
     prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
     result = _run(
         repo, worktree,
         "--runtime", "claude", "--mode", "structured",
-        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "capability_decision: runtime_outcome" in summary
+
+
+def test_given_fake_claude_rejects_max_turns_as_unknown_option_when_structured_lane_runs_then_skip77_with_summary(
+    repo_with_worktree, tmp_path
+):
+    """Issue #1960 AC2: a real parser-level unknown/unrecognized-option
+    rejection (not merely a help-text omission) is the only condition that
+    SKIPs -- and it must still write summary.md with runtime version and
+    capability reason evidence."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", """
+if [ "$1" = "--version" ]; then
+  echo "2.1.220 (Claude Code)"
+  exit 0
+fi
+if [ "$1" = "--help" ]; then
+  echo "--output-format --include-hook-events --no-session-persistence --max-turns"
+  exit 0
+fi
+cat > /dev/null
+echo "error: unknown option '--max-turns'" >&2
+exit 1
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
         fake_bin_dir=fake_bin,
     )
     assert result.returncode == 77
     assert result.stderr.startswith("SKIP:")
-    assert "max-turns" in result.stderr or "--max-turns" in result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "capability_decision: capability_skip" in summary
+    assert "runtime_version: 2.1.220" in summary
+
+
+def test_given_fake_claude_reaches_max_turns_when_structured_lane_runs_then_fail_not_skip(
+    repo_with_worktree, tmp_path
+):
+    """Issue #1960 AC4: reaching the ``--max-turns`` bound is evidence the
+    flag WAS accepted -- it must classify as FAIL (exit 1), never as a
+    capability SKIP."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+cat > /dev/null
+echo "Error: Reached max turns limit: 3" >&2
+exit 1
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--max-turns", "3",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1
+    assert not result.stderr.startswith("SKIP:")
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "capability_decision: turn_limit_reached" in summary
+
+
+def test_given_max_turns_zero_or_negative_when_parsed_then_argument_error(repo_with_worktree, tmp_path):
+    """Issue #1960 AC6: ``--max-turns`` only accepts positive integers."""
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    for bad_value in ("0", "-1"):
+        result = _run(
+            repo, worktree,
+            "--runtime", "claude", "--mode", "structured",
+            "--prompt-file", str(prompt), "--output-dir", str(tmp_path / f"out-{bad_value}"),
+            "--max-turns", bad_value,
+        )
+        assert result.returncode == 2, result.stderr
+        assert "--max-turns" in result.stderr
 
 
 def test_given_no_claude_binary_when_preflight_runs_then_skip77(repo_with_worktree, tmp_path):
