@@ -1,6 +1,6 @@
 ---
 name: issue-reviewer
-description: Delegation drift test reviewer
+description: Advisory delegation intent hint mismatch test reviewer
 model: haiku
 tools:
   - Bash
