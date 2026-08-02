@@ -4,8 +4,12 @@
 Extended to detect:
 - Output schema name drift (final output vs artifact-only schemas)
 - Mutation permission drift (DECLARED_PERMISSION / MUTATION_BOUNDARY / RUNTIME_PROOF_NOTE)
-- Nested delegation prohibition drift
 - Model/reasoning_effort config declaration (advisory, not runtime proof)
+
+Nested delegation (delegation_intent_hint) is advisory-only (PR #1879, af511e17,
+Issue #1948): a Claude/Codex delegation_intent_hint mismatch alone is surfaced in
+nested_delegation_report but never added to the drift list below, and never
+changes STATUS or exit code.
 """
 
 from __future__ import annotations
@@ -512,8 +516,15 @@ def compare_parity(
     artifact_only_schema_names is supplementary info about Claude docs;
     it does NOT suppress drift when Codex final schema matches a Claude artifact-only schema.
 
-    B3: schema / permission / delegation drifts are all fail-level (returned as evidence).
-    The caller promotes all drift to 'fail' status.
+    B3: schema and permission drift are fail-level (returned as evidence). The
+    caller promotes all returned drift to 'fail' status.
+
+    delegation_intent_hint mismatch alone never emits NESTED_DELEGATION_001 and
+    is never appended to the returned drift list (advisory-only, PR #1879
+    af511e17, Issue #1948); it is reported separately via
+    nested_delegation_report. This advisory-only scoping applies specifically
+    to the delegation_intent_hint prose heuristic and does not extend to any
+    future normalized delegation policy contract (e.g. Issue #1943).
     """
     drifts: list[DriftEvidence] = []
 
@@ -870,7 +881,9 @@ def main(argv: list[str] | None = None) -> int:
         })
 
     # --- Determine overall status ---
-    # B3: schema / permission / delegation drifts are fail-level.
+    # B3: schema / permission drifts are fail-level. delegation_intent_hint
+    # mismatch alone is advisory-only and is never added to all_drifts, so it
+    # cannot affect status here.
     # Model/reasoning_effort mismatch (advisory) remains warn-only.
     if failures or all_drifts:
         status = "fail"
