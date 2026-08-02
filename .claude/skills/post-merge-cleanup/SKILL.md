@@ -39,7 +39,7 @@ spawn_agent:
    - `human_review_required: true` → 不明事項を人間に判断委ね
    - `follow_up_issue_requests` あり → main thread が **即時** `issue-author` SubAgent に委譲して `create-issue` 経由で自動起票する（dedupe_key ベースで重複チェック。SubAgent 内では起票しない。候補列挙のみ）
    - `superseded_prs` あり → `gh pr close` / `gh pr comment` を実行
-   - `parent_issue_status.recommended_action` あり → `gh issue close` を実行
+   - `parent_issue_status.recommended_action == "close"` かつ `parent_issue_status.all_children_closed == true` かつ `parent_issue_status.parent_issue_number` が正の整数（1 以上）のときに限り `gh issue close` を実行する。`recommended_action` は必須フィールドであるため単純な非 null 判定（「あり」）で close してはならない。`recommended_action` が `keep_open` または `n/a` の場合、`all_children_closed` が `false` の場合、または `parent_issue_number` が正の整数でない場合は `gh issue close` を実行しない
    - `stash_restored: false` → `stash_entry_ref` を確認、人間判断
 
 ### follow_up_issue_requests の自動起票フロー

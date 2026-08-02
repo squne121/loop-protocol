@@ -17,7 +17,7 @@ OUTPUT_CONTRACT
 - raw transcript、raw diff、raw logs は返さない。
 
 EXECUTION_POLICY
-- `post-merge-cleanup` skill を正本とする。
+- `post-merge-cleanup-executor`（`.agents/skills/post-merge-cleanup-executor/SKILL.md`）を唯一の canonical procedure とする。orchestrator Skill（`post-merge-cleanup`）の読込み・実行は禁止する。
 - progressive disclosure を守り、必要な workflow docs・helper scripts だけを読む。
 - validator-first / script-first を優先し、git state と PR state を deterministic に確認する。
 - follow-up issue の actual creation は main thread が承認・委譲したときだけ行う。

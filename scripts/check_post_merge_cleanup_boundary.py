@@ -26,6 +26,7 @@ Exit codes (CLI):
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import subprocess
 import sys
@@ -72,6 +73,32 @@ _PARENT_ISSUE_STATUS_KEYS = {
     "recommended_action",
 }
 _PARENT_ISSUE_STATUS_ALLOWED_ACTIONS = {"close", "keep_open", "n/a"}
+
+# Nested list-item schemas (P1: report validator gaps — Issue #1733 PR #1947
+# fix_delta). ``dict`` for closed required-key/type validation of a single
+# list element; a ``None`` value in the source dict means "type-only, no
+# further nested closed-key validation" (used for scalar-typed sub-fields).
+_FOLLOW_UP_ISSUE_REQUEST_KEYS: dict[str, tuple[type, ...]] = {
+    "title": (str,),
+    "issue_kind": (str,),
+    "severity": (str,),
+    "source": (dict,),
+    "dedupe_key": (str,),
+    "desired_destination": (str,),
+    "validated_scope_delta": (str,),
+    "origin_skill": (str,),
+    "labels": (list,),
+}
+_FOLLOW_UP_ISSUE_REQUEST_SOURCE_KEYS: dict[str, tuple[type, ...]] = {
+    "kind": (str,),
+    "url": (str,),
+    "note_id": (str,),
+}
+_SUPERSEDED_PR_KEYS: dict[str, tuple[type, ...]] = {
+    "number": (int,),
+    "title": (str,),
+    "url": (str,),
+}
 
 
 class ValidationResult:
@@ -123,7 +150,69 @@ def validate_report_v1(data: Any) -> ValidationResult:
     if "parent_issue_status" in data and isinstance(data["parent_issue_status"], dict):
         errors.extend(_validate_parent_issue_status(data["parent_issue_status"]))
 
+    if "follow_up_issue_requests" in data and isinstance(data["follow_up_issue_requests"], list):
+        errors.extend(
+            _validate_list_items(
+                data["follow_up_issue_requests"],
+                "follow_up_issue_requests",
+                _FOLLOW_UP_ISSUE_REQUEST_KEYS,
+            )
+        )
+        for index, item in enumerate(data["follow_up_issue_requests"]):
+            if isinstance(item, dict) and isinstance(item.get("source"), dict):
+                errors.extend(
+                    _validate_closed_dict(
+                        item["source"],
+                        f"follow_up_issue_requests[{index}].source",
+                        _FOLLOW_UP_ISSUE_REQUEST_SOURCE_KEYS,
+                    )
+                )
+
+    if "superseded_prs" in data and isinstance(data["superseded_prs"], list):
+        errors.extend(_validate_list_items(data["superseded_prs"], "superseded_prs", _SUPERSEDED_PR_KEYS))
+
     return ValidationResult(len(errors) == 0, errors)
+
+
+def _is_strict_int(value: Any) -> bool:
+    """``bool`` is a subclass of ``int`` in Python; a literal ``true``/``false``
+    must not silently pass an ``int``-typed field (e.g. ``parent_issue_number``)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_strict_bool(value: Any) -> bool:
+    return isinstance(value, bool)
+
+
+def _validate_closed_dict(value: dict, label: str, schema: dict[str, tuple[type, ...]]) -> list[str]:
+    """Closed-key structural validation for a nested dict (required keys,
+    unknown-key rejection, per-key type checking). Shared by
+    ``parent_issue_status`` and nested list-item sub-objects."""
+    errors: list[str] = []
+    unknown = sorted(set(value.keys()) - set(schema.keys()))
+    if unknown:
+        errors.append(f"{label}: unknown key(s): {unknown}")
+    missing = sorted(set(schema.keys()) - set(value.keys()))
+    if missing:
+        errors.append(f"{label}: missing key(s): {missing}")
+    for key, expected_types in schema.items():
+        if key not in value:
+            continue
+        item_value = value[key]
+        if not isinstance(item_value, expected_types):
+            type_names = " | ".join(t.__name__ for t in expected_types)
+            errors.append(f"{label}.{key} expected type ({type_names}), got {type(item_value).__name__}")
+    return errors
+
+
+def _validate_list_items(items: list, label: str, schema: dict[str, tuple[type, ...]]) -> list[str]:
+    errors: list[str] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            errors.append(f"{label}[{index}]: expected a mapping, got {type(item).__name__}")
+            continue
+        errors.extend(_validate_closed_dict(item, f"{label}[{index}]", schema))
+    return errors
 
 
 def _validate_parent_issue_status(value: dict) -> list[str]:
@@ -134,6 +223,20 @@ def _validate_parent_issue_status(value: dict) -> list[str]:
     missing = sorted(_PARENT_ISSUE_STATUS_KEYS - set(value.keys()))
     if missing:
         errors.append(f"parent_issue_status: missing key(s): {missing}")
+    if "parent_issue_number" in value and not _is_strict_int(value["parent_issue_number"]):
+        errors.append(
+            "parent_issue_status.parent_issue_number expected type (int), "
+            f"got {type(value['parent_issue_number']).__name__}"
+        )
+    elif "parent_issue_number" in value and value["parent_issue_number"] <= 0:
+        errors.append(
+            f"parent_issue_status.parent_issue_number must be a positive integer, got {value['parent_issue_number']!r}"
+        )
+    if "all_children_closed" in value and not _is_strict_bool(value["all_children_closed"]):
+        errors.append(
+            "parent_issue_status.all_children_closed expected type (bool), "
+            f"got {type(value['all_children_closed']).__name__}"
+        )
     action = value.get("recommended_action")
     if action is not None and action not in _PARENT_ISSUE_STATUS_ALLOWED_ACTIONS:
         errors.append(f"parent_issue_status.recommended_action has invalid value: {action!r}")
@@ -144,6 +247,10 @@ def validate_report_yaml(text: str) -> ValidationResult:
     """Parse and validate raw YAML text for POST_MERGE_CLEANUP_REPORT_V1.
 
     Malformed YAML is reported as a validation failure (not an exception).
+    When the payload uses the wrapper form (``{POST_MERGE_CLEANUP_REPORT_V1:
+    {...}}``), any sibling key alongside the wrapper key at the top level is
+    rejected — a wrapper-only unwrap must not silently ignore
+    attacker-controlled sibling keys (P1, Issue #1733 PR #1947 fix_delta).
     """
     try:
         import yaml
@@ -156,6 +263,11 @@ def validate_report_yaml(text: str) -> ValidationResult:
         return ValidationResult(False, [f"malformed YAML: {exc}"])
 
     if isinstance(data, dict) and SCHEMA_REPORT_V1 in data:
+        sibling_keys = sorted(set(data.keys()) - {SCHEMA_REPORT_V1})
+        if sibling_keys:
+            return ValidationResult(
+                False, [f"unknown sibling key(s) alongside wrapper key '{SCHEMA_REPORT_V1}': {sibling_keys}"]
+            )
         data = data[SCHEMA_REPORT_V1]
 
     return validate_report_v1(data)
@@ -211,6 +323,85 @@ def check_codex_skill_surface(toml_path: Path) -> ValidationResult:
     return ValidationResult(True)
 
 
+# ---------------------------------------------------------------------------
+# Blocker 2 (Issue #1733 PR #1947 fix_delta): worker canonical-procedure
+# instruction hygiene — the Codex worker's ``developer_instructions`` and the
+# Claude worker's frontmatter ``description`` must both name
+# ``post-merge-cleanup-executor`` as the sole canonical procedure, not the
+# orchestrator Skill (``post-merge-cleanup``).
+# ---------------------------------------------------------------------------
+
+_STALE_CODEX_CANONICAL_MARKER = "skill を正本とする"
+_CODEX_CANONICAL_REQUIRED_MARKER = "唯一の canonical procedure とする"
+_CODEX_ORCHESTRATOR_FORBID_MARKER = "orchestrator Skill（`post-merge-cleanup`）の読込み・実行は禁止する"
+
+_STALE_CLAUDE_DESC_PROCEDURE_MARKER = "post-merge-cleanup` skill の Procedure を実行し"
+_CLAUDE_DESC_EXECUTOR_REQUIRED_MARKER = "post-merge-cleanup-executor` skill の Procedure を実行し"
+
+
+def check_codex_no_stale_canonical(toml_path: Path) -> ValidationResult:
+    """Blocker 2: Codex worker developer_instructions must name
+    post-merge-cleanup-executor as the sole canonical procedure and must not
+    retain the stale ``post-merge-cleanup`` skill を正本とする instruction."""
+    with toml_path.open("rb") as fh:
+        data = tomllib.load(fh)
+    instructions = data.get("developer_instructions", "")
+    errors: list[str] = []
+    if _STALE_CODEX_CANONICAL_MARKER in instructions:
+        errors.append(f"developer_instructions retains stale canonical marker: {_STALE_CODEX_CANONICAL_MARKER!r}")
+    if _CODEX_CANONICAL_REQUIRED_MARKER not in instructions:
+        errors.append(
+            f"developer_instructions missing explicit canonical marker: {_CODEX_CANONICAL_REQUIRED_MARKER!r}"
+        )
+    if _CODEX_ORCHESTRATOR_FORBID_MARKER not in instructions:
+        errors.append(
+            "developer_instructions missing explicit orchestrator-load prohibition: "
+            f"{_CODEX_ORCHESTRATOR_FORBID_MARKER!r}"
+        )
+    return ValidationResult(len(errors) == 0, errors)
+
+
+def check_claude_worker_description_no_stale_procedure(worker_md_path: Path) -> ValidationResult:
+    """Blocker 2: Claude worker frontmatter description must describe
+    executing post-merge-cleanup-executor, not the old orchestrator
+    Procedure."""
+    text = worker_md_path.read_text(encoding="utf-8")
+    fm = extract_frontmatter(text)
+    description = fm.get("description", "")
+    errors: list[str] = []
+    if _STALE_CLAUDE_DESC_PROCEDURE_MARKER in description:
+        errors.append(
+            f"description retains stale orchestrator-Procedure marker: {_STALE_CLAUDE_DESC_PROCEDURE_MARKER!r}"
+        )
+    if _CLAUDE_DESC_EXECUTOR_REQUIRED_MARKER not in description:
+        errors.append(f"description missing executor-Procedure marker: {_CLAUDE_DESC_EXECUTOR_REQUIRED_MARKER!r}")
+    return ValidationResult(len(errors) == 0, errors)
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3 (Issue #1733 PR #1947 fix_delta): the orchestrator Skill text
+# must not describe parent-issue close as firing on mere presence of
+# recommended_action (a required field), and must explicitly gate close on
+# recommended_action == "close" AND all_children_closed AND a valid
+# parent_issue_number.
+# ---------------------------------------------------------------------------
+
+_AMBIGUOUS_PARENT_CLOSE_MARKER = "recommended_action` あり → `gh issue close`"
+_EXPLICIT_PARENT_CLOSE_MARKER = 'recommended_action == "close"'
+
+
+def check_parent_close_condition_explicit(orchestrator_skill_path: Path) -> ValidationResult:
+    text = orchestrator_skill_path.read_text(encoding="utf-8")
+    errors: list[str] = []
+    if _AMBIGUOUS_PARENT_CLOSE_MARKER in text:
+        errors.append(
+            f"orchestrator still contains ambiguous parent-close phrasing: {_AMBIGUOUS_PARENT_CLOSE_MARKER!r}"
+        )
+    if _EXPLICIT_PARENT_CLOSE_MARKER not in text:
+        errors.append(f"orchestrator missing explicit parent-close condition: {_EXPLICIT_PARENT_CLOSE_MARKER!r}")
+    return ValidationResult(len(errors) == 0, errors)
+
+
 # Phrases that indicate main-thread orchestration execution (not candidate
 # listing). Presence of these inside the *executor* Skill body is a boundary
 # violation (AC5). Absence of the deterministic 8-step procedure heading in
@@ -234,6 +425,25 @@ _EXTERNAL_AGENT_CLI_INVOCATION_RE = re.compile(
     r"(?m)^[ \t]*\$?[ \t]*(codex exec|claude -p)\b"
 )
 _GH_ISSUE_CREATE_INVOCATION_RE = re.compile(r"(?m)^[ \t]*\$?[ \t]*gh issue create\b")
+
+# P1 (Issue #1733 PR #1947 fix_delta): the line-start-only regex above misses
+# `env codex exec`, `command codex exec`, absolute-path invocations
+# (`/usr/bin/codex exec`), and invocations wrapped inside `bash -lc '...'`.
+# Broaden detection to scan *inside fenced code blocks only* (never prose,
+# to avoid self-poisoning on this file's own documented prohibition
+# sentences, e.g. "`codex exec` の起動を禁止する") for the binary name
+# preceded by a shell-token boundary (start, whitespace, slash, quote,
+# paren, pipe, ampersand) and optional `env `/`command `/path prefixes.
+# This is explicitly defense-in-depth, secondary to the AC12 runtime-trace
+# assertions (Blocker 1) per the reviewer's guidance.
+_FENCED_CODE_BLOCK_RE = re.compile(r"```(?:[a-zA-Z0-9_-]*)\n(.*?)```", re.S)
+_AGENT_CLI_BINARY_IN_CODE_RE = re.compile(
+    r"(?:^|[\s/'\"();|&])(?:env\s+|command\s+)*(?:\S*/)?(codex\s+exec|claude\s+-p)\b"
+)
+
+
+def _extract_fenced_code_block_text(text: str) -> str:
+    return "\n".join(m.group(1) for m in _FENCED_CODE_BLOCK_RE.finditer(text))
 
 
 def check_orchestrator_no_procedure(orchestrator_skill_path: Path) -> ValidationResult:
@@ -277,6 +487,13 @@ def check_no_child_policy(worker_md_path: Path, executor_skill_path: Path) -> Va
     invocation_match = _EXTERNAL_AGENT_CLI_INVOCATION_RE.search(combined)
     if invocation_match:
         errors.append(f"forbidden external agent CLI invocation pattern present: {invocation_match.group(0)!r}")
+
+    code_block_text = _extract_fenced_code_block_text(combined)
+    broadened_match = _AGENT_CLI_BINARY_IN_CODE_RE.search(code_block_text)
+    if broadened_match:
+        errors.append(
+            f"forbidden external agent CLI invocation pattern present in code block: {broadened_match.group(0)!r}"
+        )
 
     if "no-child policy" not in executor_text and "no_child" not in executor_text.replace(" ", "_").lower():
         errors.append("executor SKILL.md does not declare a no-child policy section")
@@ -338,10 +555,60 @@ def check_agent_parity_strict(repo_root: Path = REPO_ROOT) -> ValidationResult:
 
 # ---------------------------------------------------------------------------
 # AC12: runtime_smoke_evidence (preflight-scope: runtime_only)
+#
+# Blocker 1 (Issue #1733 PR #1947 fix_delta): the previous implementation
+# picked the lexicographically-first ``artifacts/runtime-smoke/*/summary.md``
+# via glob and only checked 4 generic health fields (exit_code, timed_out,
+# expected_markers_missing, errors). That is a false-positive-prone design:
+# it can silently accept a stale/unrelated success artifact, and it never
+# checks *which* worker/agent ran, *which* Skill it loaded, whether any
+# child/spawn or self-restart/orchestration-action events occurred, or
+# whether the artifact was produced against the current HEAD.
+#
+# This rewrite:
+# - requires an explicit ``--artifact-path`` (no glob-first-match at all);
+#   omitting it is treated the same as "no evidence" (SKIP, never PASS).
+# - requires a structured set of fields beyond the 4 generic ones:
+#   ``tested_head``, ``runtime_version``, ``requested_agent_type``,
+#   ``effective_agent_type``, ``loaded_skills``, ``child_spawn_event_count``,
+#   ``spawn_events``, ``self_restart_event_count``,
+#   ``orchestration_action_count``, ``prompt_sha256``,
+#   ``postcondition_unexpected_changes``.
+# - independently re-derives the expected current HEAD via ``git`` (not
+#   trusted from the artifact) and fails if ``tested_head`` does not match.
+#
+# Known gap (explicitly reported, not silently worked around): the shared
+# ``worktree-agent-runtime-smoke`` harness
+# (``scripts/agent-ops/run_worktree_agent_runtime_smoke.py``) does not
+# currently emit most of these fields in its allowlist-only ``summary.md``,
+# and that harness file is outside Issue #1733's Allowed Paths. Until the
+# harness is extended (follow-up Issue), a real harness-produced artifact
+# will correctly FAIL this stricter check rather than false-positive PASS —
+# this is intentional fail-closed behavior, not a bug in this checker.
 # ---------------------------------------------------------------------------
+
+_REQUIRED_STRUCTURED_SMOKE_FIELDS = (
+    "tested_head",
+    "runtime_version",
+    "requested_agent_type",
+    "effective_agent_type",
+    "loaded_skills",
+    "child_spawn_event_count",
+    "spawn_events",
+    "self_restart_event_count",
+    "orchestration_action_count",
+    "prompt_sha256",
+    "postcondition_unexpected_changes",
+)
+
+_EXPECTED_LOADED_SKILLS = ["post-merge-cleanup-executor"]
 
 
 def find_runtime_smoke_summary(repo_root: Path = REPO_ROOT) -> Path | None:
+    """Deprecated glob-first-match lookup, retained only as a diagnostic
+    helper (e.g. to suggest a candidate path in error output). Never used to
+    silently select evidence for the CLI check — Blocker 1 requires an
+    explicit ``--artifact-path``."""
     smoke_dir = repo_root / "artifacts" / "runtime-smoke"
     if not smoke_dir.is_dir():
         return None
@@ -349,28 +616,71 @@ def find_runtime_smoke_summary(repo_root: Path = REPO_ROOT) -> Path | None:
     return candidates[0] if candidates else None
 
 
-def check_runtime_smoke_evidence(repo_root: Path = REPO_ROOT) -> int:
-    """Return an exit code (0/1/77) per docs/dev/runtime-verification-policy.md.
-
-    SKIP (77) is returned when no runtime evidence directory exists (the
-    execution environment did not run worktree-agent-runtime-smoke) — this
-    is never promoted to PASS. When evidence exists, it is inspected for a
-    clean, non-timed-out, error-free structured run with no missing markers.
-    """
-    summary_path = find_runtime_smoke_summary(repo_root)
-    if summary_path is None:
-        print("SKIP: no worktree-agent-runtime-smoke evidence found under artifacts/runtime-smoke/", file=sys.stderr)
-        return EXIT_SKIP
-
-    text = summary_path.read_text(encoding="utf-8")
-    fields = {}
+def _parse_summary_fields(text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("- ") and ":" in line:
             key, _, value = line[2:].partition(":")
             fields[key.strip()] = value.strip()
+    return fields
+
+
+def _parse_field_value(raw: str | None) -> Any:
+    """Best-effort structural parse of a summary.md field value (e.g. Python
+    ``repr()`` output of a list/int/bool/None). Falls back to the raw string
+    when it is not a literal (e.g. a bare sha/string)."""
+    if raw is None:
+        return None
+    try:
+        return ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        return raw
+
+
+def _current_head(repo_root: Path) -> str | None:
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def check_runtime_smoke_evidence(repo_root: Path = REPO_ROOT, artifact_path: str | None = None) -> int:
+    """Return an exit code (0/1/77) per docs/dev/runtime-verification-policy.md.
+
+    SKIP (77) is returned when no explicit ``artifact_path`` is given, or the
+    given path does not exist — this is never promoted to PASS. When an
+    artifact exists at the explicit path, it is inspected for both the
+    legacy generic-health fields and the structured worker-identity /
+    Skill-load / spawn-event / tested-head fields (Blocker 1, Issue #1733
+    PR #1947 fix_delta).
+    """
+    if not artifact_path:
+        print(
+            "SKIP: no --artifact-path given; explicit runtime-smoke evidence path is required "
+            "(glob-first-match auto-discovery was removed as a false-positive source)",
+            file=sys.stderr,
+        )
+        return EXIT_SKIP
+
+    summary_path = Path(artifact_path)
+    if not summary_path.is_absolute():
+        summary_path = repo_root / summary_path
+    if not summary_path.is_file():
+        print(f"SKIP: --artifact-path does not exist: {summary_path}", file=sys.stderr)
+        return EXIT_SKIP
+
+    text = summary_path.read_text(encoding="utf-8")
+    fields = _parse_summary_fields(text)
 
     errors: list[str] = []
+
+    # Legacy generic-health fields (retained).
     if fields.get("exit_code") not in {"0"}:
         errors.append(f"exit_code={fields.get('exit_code')!r} (expected 0)")
     if fields.get("timed_out") not in {"False", "false"}:
@@ -379,6 +689,60 @@ def check_runtime_smoke_evidence(repo_root: Path = REPO_ROOT) -> int:
         errors.append(f"expected_markers_missing={fields.get('expected_markers_missing')!r} (expected [])")
     if fields.get("errors") not in {"[]"}:
         errors.append(f"errors={fields.get('errors')!r} (expected [])")
+
+    # Structured fields (Blocker 1): presence is mandatory; a real harness
+    # artifact that does not yet emit these fields correctly FAILs here.
+    missing_structured = [key for key in _REQUIRED_STRUCTURED_SMOKE_FIELDS if key not in fields]
+    if missing_structured:
+        errors.append(
+            "artifact is missing required structured field(s) (harness gap — "
+            f"see scripts/agent-ops/run_worktree_agent_runtime_smoke.py): {missing_structured}"
+        )
+
+    if "tested_head" in fields:
+        expected_head = _current_head(repo_root)
+        if expected_head is None:
+            errors.append("could not resolve current repository HEAD via git rev-parse HEAD")
+        elif fields["tested_head"] != expected_head:
+            errors.append(f"tested_head={fields['tested_head']!r} does not match current HEAD {expected_head!r}")
+
+    if "loaded_skills" in fields:
+        loaded_skills = _parse_field_value(fields["loaded_skills"])
+        if loaded_skills != _EXPECTED_LOADED_SKILLS:
+            errors.append(f"loaded_skills={loaded_skills!r} (expected {_EXPECTED_LOADED_SKILLS!r})")
+
+    if "child_spawn_event_count" in fields:
+        count = _parse_field_value(fields["child_spawn_event_count"])
+        if count != 0:
+            errors.append(f"child_spawn_event_count={count!r} (expected 0)")
+
+    if "self_restart_event_count" in fields:
+        count = _parse_field_value(fields["self_restart_event_count"])
+        if count != 0:
+            errors.append(f"self_restart_event_count={count!r} (expected 0)")
+
+    if "orchestration_action_count" in fields:
+        count = _parse_field_value(fields["orchestration_action_count"])
+        if count != 0:
+            errors.append(f"orchestration_action_count={count!r} (expected 0)")
+
+    if "postcondition_unexpected_changes" in fields:
+        changes = _parse_field_value(fields["postcondition_unexpected_changes"])
+        if changes != []:
+            errors.append(f"postcondition_unexpected_changes={changes!r} (expected [])")
+
+    if "requested_agent_type" in fields and "effective_agent_type" in fields:
+        if fields["requested_agent_type"] != fields["effective_agent_type"]:
+            errors.append(
+                "requested_agent_type "
+                f"{fields['requested_agent_type']!r} != effective_agent_type {fields['effective_agent_type']!r} "
+                "(possible self-restart / runtime mismatch)"
+            )
+
+    if "prompt_sha256" in fields:
+        prompt_sha256 = fields["prompt_sha256"]
+        if not re.fullmatch(r"[0-9a-f]{64}", prompt_sha256 or ""):
+            errors.append(f"prompt_sha256={prompt_sha256!r} is not a 64-char hex sha256 digest")
 
     if errors:
         for err in errors:
@@ -423,6 +787,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--assert-current-repository", action="store_true")
     parser.add_argument("--check", choices=["runtime_smoke_evidence"], required=True)
     parser.add_argument("--repo-root", default=str(REPO_ROOT))
+    parser.add_argument(
+        "--artifact-path",
+        default=None,
+        help=(
+            "explicit path to a worktree-agent-runtime-smoke summary.md "
+            "(required for a PASS; no glob-first-match auto-discovery)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root).resolve()
@@ -431,7 +803,7 @@ def main(argv: list[str] | None = None) -> int:
         _assert_current_repository(repo_root)
 
     if args.check == "runtime_smoke_evidence":
-        return check_runtime_smoke_evidence(repo_root)
+        return check_runtime_smoke_evidence(repo_root, artifact_path=args.artifact_path)
 
     return EXIT_FAIL  # pragma: no cover - argparse choices exhaustive
 

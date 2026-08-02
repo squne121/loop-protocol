@@ -1,6 +1,6 @@
 ---
 name: post-merge-cleanup-worker
-description: PR マージ後の cleanup を担う役割の SubAgent。`post-merge-cleanup` skill の Procedure を実行し、git/gh 出力を分類して結果を構造化 YAML (POST_MERGE_CLEANUP_REPORT_V1) で main thread に返す。follow-up 起票実行と routing 種別選択は main thread の責務のため SubAgent 内では実行しない。CONFLICT 検出時は即 fail-close。
+description: PR マージ後の cleanup を担う役割の SubAgent。`post-merge-cleanup-executor` skill の Procedure を実行し、git/gh 出力を分類して結果を構造化 YAML (POST_MERGE_CLEANUP_REPORT_V1) で main thread に返す。follow-up 起票実行と routing 種別選択は main thread の責務のため SubAgent 内では実行しない。CONFLICT 検出時は即 fail-close。
 tools:
   - Bash
   - Read

@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -68,6 +70,45 @@ def test_codex_skill_surface():
     assert result.valid, result.errors
 
 
+def test_codex_worker_no_stale_canonical():
+    result = boundary.check_codex_no_stale_canonical(WORKER_TOML)
+    assert result.valid, result.errors
+
+
+def test_codex_worker_no_stale_canonical_detects_reintroduced_marker():
+    import tomllib
+
+    with WORKER_TOML.open("rb") as fh:
+        data = tomllib.load(fh)
+    poisoned_instructions = data["developer_instructions"] + "\n- `post-merge-cleanup` skill を正本とする。\n"
+    tmp_path = REPO_ROOT / "tests" / "_tmp_poisoned_worker_toml_for_test.toml"
+    tmp_path.write_text(f'name = "x"\ndeveloper_instructions = """\n{poisoned_instructions}\n"""\n', encoding="utf-8")
+    try:
+        result = boundary.check_codex_no_stale_canonical(tmp_path)
+        assert not result.valid
+    finally:
+        tmp_path.unlink()
+
+
+def test_claude_worker_description_no_stale_procedure():
+    result = boundary.check_claude_worker_description_no_stale_procedure(WORKER_MD)
+    assert result.valid, result.errors
+
+
+def test_claude_worker_description_detects_reintroduced_orchestrator_reference():
+    poisoned = WORKER_MD.read_text(encoding="utf-8").replace(
+        "post-merge-cleanup-executor` skill の Procedure を実行し",
+        "post-merge-cleanup` skill の Procedure を実行し",
+    )
+    tmp_path = REPO_ROOT / "tests" / "_tmp_poisoned_worker_md_for_test.md"
+    tmp_path.write_text(poisoned, encoding="utf-8")
+    try:
+        result = boundary.check_claude_worker_description_no_stale_procedure(tmp_path)
+        assert not result.valid
+    finally:
+        tmp_path.unlink()
+
+
 def test_codex_skill_surface_value_is_exact():
     import tomllib
 
@@ -93,6 +134,30 @@ def test_orchestrator_retains_worker_launch_and_routing():
     text = ORCHESTRATOR_SKILL.read_text(encoding="utf-8")
     assert "post-merge-cleanup-worker` SubAgent を Agent tool で起動する" in text
     assert "POST_MERGE_CLEANUP_REPORT_V1" in text
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3 (Issue #1733 PR #1947 fix_delta): parent-issue close must be
+# gated on recommended_action == "close", not mere field presence.
+# ---------------------------------------------------------------------------
+
+
+def test_parent_close_condition_explicit():
+    result = boundary.check_parent_close_condition_explicit(ORCHESTRATOR_SKILL)
+    assert result.valid, result.errors
+
+
+def test_parent_close_condition_detects_reintroduced_ambiguous_phrasing():
+    poisoned = ORCHESTRATOR_SKILL.read_text(encoding="utf-8") + (
+        "\n   - `parent_issue_status.recommended_action` あり → `gh issue close` を実行\n"
+    )
+    tmp_path = REPO_ROOT / "tests" / "_tmp_poisoned_orchestrator_for_test.md"
+    tmp_path.write_text(poisoned, encoding="utf-8")
+    try:
+        result = boundary.check_parent_close_condition_explicit(tmp_path)
+        assert not result.valid
+    finally:
+        tmp_path.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +248,96 @@ def test_report_validator_accepts_wrapped_schema_key():
 
 
 # ---------------------------------------------------------------------------
+# AC6 / P1: report validator closed-key + type gaps (Issue #1733 PR #1947
+# fix_delta — OWNER REQUEST_CHANGES review comment 5154801090)
+# ---------------------------------------------------------------------------
+
+
+def test_report_validator_rejects_non_int_parent_issue_number():
+    data = _valid_report()
+    data["parent_issue_status"]["parent_issue_number"] = "not-an-integer"
+    result = boundary.validate_report_v1(data)
+    assert not result.valid
+    assert any("parent_issue_number" in e for e in result.errors)
+
+
+def test_report_validator_rejects_bool_masquerading_as_parent_issue_number():
+    # bool is a subclass of int in Python; must not silently pass.
+    data = _valid_report()
+    data["parent_issue_status"]["parent_issue_number"] = True
+    result = boundary.validate_report_v1(data)
+    assert not result.valid
+    assert any("parent_issue_number" in e for e in result.errors)
+
+
+def test_report_validator_rejects_non_positive_parent_issue_number():
+    data = _valid_report()
+    data["parent_issue_status"]["parent_issue_number"] = 0
+    result = boundary.validate_report_v1(data)
+    assert not result.valid
+    assert any("positive integer" in e for e in result.errors)
+
+
+def test_report_validator_rejects_non_bool_all_children_closed():
+    data = _valid_report()
+    data["parent_issue_status"]["all_children_closed"] = "yes"
+    result = boundary.validate_report_v1(data)
+    assert not result.valid
+    assert any("all_children_closed" in e for e in result.errors)
+
+
+def test_report_validator_rejects_malformed_follow_up_issue_request_item():
+    data = _valid_report()
+    data["follow_up_issue_requests"] = [
+        {
+            "title": "x",
+            # missing required keys, plus an unknown key
+            "unexpected": "surprise",
+        }
+    ]
+    result = boundary.validate_report_v1(data)
+    assert not result.valid
+    assert any("follow_up_issue_requests[0]" in e for e in result.errors)
+
+
+def test_report_validator_rejects_malformed_follow_up_issue_request_source():
+    data = _valid_report()
+    data["follow_up_issue_requests"] = [
+        {
+            "title": "x",
+            "issue_kind": "implementation",
+            "severity": "optional_follow_up",
+            "source": {"kind": "post_merge_cleanup", "url": "https://example.com"},  # missing note_id
+            "dedupe_key": "follow-up:x:1",
+            "desired_destination": "x",
+            "validated_scope_delta": "x",
+            "origin_skill": "post-merge-cleanup",
+            "labels": [],
+        }
+    ]
+    result = boundary.validate_report_v1(data)
+    assert not result.valid
+    assert any("follow_up_issue_requests[0].source" in e for e in result.errors)
+
+
+def test_report_validator_rejects_malformed_superseded_pr_item():
+    data = _valid_report()
+    data["superseded_prs"] = [{"number": "not-an-int", "title": "x", "url": "https://example.com"}]
+    result = boundary.validate_report_v1(data)
+    assert not result.valid
+    assert any("superseded_prs[0]" in e for e in result.errors)
+
+
+def test_report_validator_rejects_unknown_sibling_key_in_wrapper():
+    import yaml
+
+    wrapped = {"POST_MERGE_CLEANUP_REPORT_V1": _valid_report(), "attacker_controlled": "injected"}
+    result = boundary.validate_report_yaml(yaml.safe_dump(wrapped))
+    assert not result.valid
+    assert any("sibling key" in e for e in result.errors)
+
+
+# ---------------------------------------------------------------------------
 # AC7: no_child_policy
 # ---------------------------------------------------------------------------
 
@@ -204,6 +359,41 @@ def test_no_child_policy_detects_forbidden_cli_pattern():
         assert any("codex exec" in e for e in result.errors)
     finally:
         tmp_path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# P1 (Issue #1733 PR #1947 fix_delta): the no-child regex denylist must catch
+# evasions the original line-start-only pattern missed, without matching
+# this file's own documented prose prohibition sentences (self-poisoning).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "evasive_command",
+    [
+        "env codex exec --json -",
+        "command codex exec --json -",
+        "/usr/bin/codex exec --json -",
+        "bash -lc 'codex exec --json -'",
+    ],
+)
+def test_no_child_policy_detects_broadened_evasion_patterns(evasive_command):
+    poisoned = EXECUTOR_SKILL.read_text(encoding="utf-8") + f"\n```bash\n{evasive_command}\n```\n"
+    tmp_path = REPO_ROOT / "tests" / "_tmp_poisoned_executor_evasion_for_test.md"
+    tmp_path.write_text(poisoned, encoding="utf-8")
+    try:
+        result = boundary.check_no_child_policy(WORKER_MD, tmp_path)
+        assert not result.valid, f"evasion not detected: {evasive_command!r}"
+    finally:
+        tmp_path.unlink()
+
+
+def test_no_child_policy_does_not_self_poison_on_own_prose_prohibition():
+    # The executor Skill's own guardrail prose mentions `codex exec` /
+    # `claude -p` outside any fenced code block; this must not trigger a
+    # false-positive violation.
+    result = boundary.check_no_child_policy(WORKER_MD, EXECUTOR_SKILL)
+    assert result.valid, result.errors
 
 
 # ---------------------------------------------------------------------------
@@ -306,3 +496,112 @@ def test_runtime_smoke_evidence_cli_skips_cleanly_without_evidence(tmp_path):
         timeout=30,
     )
     assert proc.returncode == 77, proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Blocker 1 (Issue #1733 PR #1947 fix_delta): explicit artifact path (no
+# glob-first-match), independent tested_head cross-check, and structured
+# worker-identity / Skill-load / spawn-event field validation.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_summary_fields(**overrides) -> dict:
+    fields = {
+        "exit_code": "0",
+        "timed_out": "False",
+        "expected_markers_missing": "[]",
+        "errors": "[]",
+        "tested_head": boundary._current_head(REPO_ROOT),
+        "runtime_version": "'claude 2.1.220'",
+        "requested_agent_type": "claude",
+        "effective_agent_type": "claude",
+        "loaded_skills": "['post-merge-cleanup-executor']",
+        "child_spawn_event_count": "0",
+        "spawn_events": "[]",
+        "self_restart_event_count": "0",
+        "orchestration_action_count": "0",
+        "prompt_sha256": "a" * 64,
+        "postcondition_unexpected_changes": "[]",
+    }
+    fields.update(overrides)
+    return fields
+
+
+def _write_summary(tmp_path: Path, fields: dict) -> Path:
+    lines = ["# Runtime Smoke Summary", ""]
+    for key, value in fields.items():
+        lines.append(f"- {key}: {value}")
+    summary_dir = tmp_path / "artifacts" / "runtime-smoke" / "run1"
+    summary_dir.mkdir(parents=True)
+    summary_path = summary_dir / "summary.md"
+    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return summary_path
+
+
+def test_runtime_smoke_evidence_skips_without_explicit_artifact_path(tmp_path):
+    summary_path = _write_summary(tmp_path, _synthetic_summary_fields())
+    # A glob-discoverable artifact exists, but no --artifact-path is given —
+    # the checker must not auto-pick it (Blocker 1: no glob-first-match).
+    assert boundary.find_runtime_smoke_summary(tmp_path) == summary_path
+    rc = boundary.check_runtime_smoke_evidence(tmp_path, artifact_path=None)
+    assert rc == boundary.EXIT_SKIP
+
+
+def test_runtime_smoke_evidence_skips_when_artifact_path_missing(tmp_path):
+    missing_path = "artifacts/runtime-smoke/does-not-exist/summary.md"
+    rc = boundary.check_runtime_smoke_evidence(tmp_path, artifact_path=missing_path)
+    assert rc == boundary.EXIT_SKIP
+
+
+def test_runtime_smoke_evidence_passes_with_full_structured_fields(tmp_path):
+    summary_path = _write_summary(tmp_path, _synthetic_summary_fields())
+    rc = boundary.check_runtime_smoke_evidence(REPO_ROOT, artifact_path=str(summary_path))
+    assert rc == boundary.EXIT_OK
+
+
+def test_runtime_smoke_evidence_fails_on_stale_tested_head(tmp_path):
+    summary_path = _write_summary(tmp_path, _synthetic_summary_fields(tested_head="0" * 40))
+    rc = boundary.check_runtime_smoke_evidence(REPO_ROOT, artifact_path=str(summary_path))
+    assert rc == boundary.EXIT_FAIL
+
+
+def test_runtime_smoke_evidence_fails_on_missing_structured_fields():
+    # Simulates the real current harness output, which does not yet emit
+    # tested_head / loaded_skills / spawn_events / etc (known gap: harness
+    # is outside Issue #1733's Allowed Paths).
+    legacy_only_fields = {
+        "exit_code": "0",
+        "timed_out": "False",
+        "expected_markers_missing": "[]",
+        "errors": "[]",
+        "native_event_count": "6",
+    }
+    tmp_dir = REPO_ROOT / "tests" / "_tmp_legacy_summary_for_test"
+    summary_path = _write_summary(tmp_dir, legacy_only_fields)
+    try:
+        rc = boundary.check_runtime_smoke_evidence(REPO_ROOT, artifact_path=str(summary_path))
+        assert rc == boundary.EXIT_FAIL
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp_dir)
+
+
+def test_runtime_smoke_evidence_fails_on_non_matching_loaded_skills(tmp_path):
+    summary_path = _write_summary(
+        tmp_path, _synthetic_summary_fields(loaded_skills="['post-merge-cleanup', 'post-merge-cleanup-executor']")
+    )
+    rc = boundary.check_runtime_smoke_evidence(REPO_ROOT, artifact_path=str(summary_path))
+    assert rc == boundary.EXIT_FAIL
+
+
+def test_runtime_smoke_evidence_fails_on_nonzero_child_spawn_event_count(tmp_path):
+    summary_path = _write_summary(tmp_path, _synthetic_summary_fields(child_spawn_event_count="1"))
+    rc = boundary.check_runtime_smoke_evidence(REPO_ROOT, artifact_path=str(summary_path))
+    assert rc == boundary.EXIT_FAIL
+
+
+def test_runtime_smoke_evidence_fails_on_agent_type_mismatch(tmp_path):
+    summary_path = _write_summary(tmp_path, _synthetic_summary_fields(effective_agent_type="codex"))
+    rc = boundary.check_runtime_smoke_evidence(REPO_ROOT, artifact_path=str(summary_path))
+    assert rc == boundary.EXIT_FAIL

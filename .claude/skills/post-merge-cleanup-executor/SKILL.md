@@ -161,12 +161,18 @@ gh api repos/{owner}/{repo}/issues/{parent_issue}/sub_issues --jq '.[] | {number
 
 `merged_pr_number` 未提供時は skip して `unresolved_cleanup_items` に `merged_pr_number not provided, steps 5/6 skipped` を記録。
 
-同じ Issue を Closes する他の OPEN PR を検索:
+同じ Issue を Closes する他の OPEN PR を検索する。`gh pr list --search "linked:issue/<N> is:open"` の
+`linked:issue/<N>` は GitHub が公式に文書化した search qualifier ではないため使用しない。代わりに
+`gh issue view --json closedByPullRequestsReferences` （公式に文書化された GitHub CLI フィールド）を使う:
+
 ```bash
-gh pr list --search "linked:issue/<linked_issue> is:open" --json number,title,headRefName,url
+gh issue view "$linked_issue" \
+  --json closedByPullRequestsReferences \
+  --jq '.closedByPullRequestsReferences[] | select(.state == "OPEN") | {number,title,url}'
 ```
 
-候補を `superseded_prs` に列挙して返す（close / comment の実行は main thread（orchestrator））。
+結果から現在の merged PR 自身（`merged_pr_number`）を除外し、残りの候補を `superseded_prs` に列挙して返す
+（close / comment の実行は main thread（orchestrator））。
 
 ### 5a. （廃止・Issue #1873）
 
