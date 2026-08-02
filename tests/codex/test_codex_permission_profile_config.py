@@ -82,7 +82,12 @@ def _fixture_repo(tmp_path: Path) -> Path:
                 ignored.append(name)
         return ignored
 
-    shutil.copytree(REPO_ROOT, dest, ignore=ignore)
+    shutil.copytree(REPO_ROOT, dest, ignore=ignore, symlinks=True)
+    # The root-symlink contract validates the Git index mode as well as the
+    # filesystem topology.  Fixtures intentionally omit the source .git, so
+    # stage just this link in an isolated repository with its 120000 mode.
+    subprocess.run(["git", "init", "--quiet", str(dest)], check=True)
+    subprocess.run(["git", "-C", str(dest), "add", "--", ".agents/skills"], check=True)
     return dest
 
 

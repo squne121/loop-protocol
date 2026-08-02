@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -28,6 +29,7 @@ from controlled_git_change_exec import (  # noqa: E402
     compute_allowed_paths_sha256,
     compute_comments_digest_sha256,
     execute_controlled_change,
+    execute_controlled_merge_continue,
     resolve_authority,
 )
 from git_mutation_command_policy import classify_agent_lane_add_commit  # noqa: E402
@@ -92,6 +94,43 @@ def _log(repo: Path) -> str:
     return subprocess.run(
         ["git", "log", "--oneline"], cwd=repo, check=True, capture_output=True, text=True
     ).stdout
+
+
+def _start_root_skill_file_directory_merge(repo: Path) -> tuple[str, str]:
+    """Create the #1926 root-symlink F/D conflict and resolve it in the WT."""
+    surface = repo / ".agents" / "skills"
+    (surface / "legacy").mkdir(parents=True)
+    (surface / "legacy" / "SKILL.md").write_text("legacy\n")
+    subprocess.run(["git", "add", ".agents/skills"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add legacy surface"], cwd=repo, check=True)
+
+    shutil.rmtree(surface)
+    os.symlink("../.claude/skills", surface)
+    subprocess.run(["git", "add", "-A", ".agents/skills"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "use root symlink"], cwd=repo, check=True)
+    topic_head = _head(repo)
+
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    main_skill = repo / ".claude" / "skills" / "post-merge-cleanup-executor" / "SKILL.md"
+    main_skill.parent.mkdir(parents=True)
+    main_skill.write_text("canonical\n")
+    (surface / "post-merge-cleanup-executor").mkdir(parents=True)
+    (surface / "post-merge-cleanup-executor" / "SKILL.md").write_text("legacy bridge\n")
+    subprocess.run(["git", "add", ".claude/skills", ".agents/skills"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add cleanup skill"], cwd=repo, check=True)
+    main_head = _head(repo)
+
+    subprocess.run(["git", "checkout", "-q", "topic"], cwd=repo, check=True)
+    merge = subprocess.run(["git", "merge", "--no-commit", "main"], cwd=repo, check=False)
+    assert merge.returncode != 0
+
+    # Git parks the topic symlink under ``skills~HEAD`` while the main-side
+    # directory occupies the canonical path.  The resolver selects the
+    # Issue #1926 topology: the canonical root symlink.
+    shutil.rmtree(surface)
+    os.unlink(repo / ".agents" / "skills~HEAD")
+    os.symlink("../.claude/skills", surface)
+    return topic_head, main_head
 
 
 # ─── AC1 ──────────────────────────────────────────────────────────────────
@@ -201,6 +240,106 @@ def test_explicit_pathspec_stage_commit_allowed(tmp_path: Path):
     assert result.commit_sha is not None
     assert result.staged_paths == ("scripts/agent-guards/new_file.py",)
     assert "add new file" in _log(repo)
+
+
+def test_normal_lane_keeps_merge_in_progress_fail_closed(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    topic_head, main_head = _start_root_skill_file_directory_merge(repo)
+    snapshot = _build_snapshot(
+        repo,
+        allowed_paths=[".agents/skills"],
+        base_sha=main_head,
+    )
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=[".agents/skills"],
+        commit_message="merge: continue",
+        expected_head=topic_head,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "merge_in_progress"
+
+
+def test_merge_continue_resolves_root_skill_file_directory_conflict(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    topic_head, main_head = _start_root_skill_file_directory_merge(repo)
+    snapshot = _build_snapshot(
+        repo,
+        allowed_paths=[".agents/skills"],
+        base_sha=main_head,
+    )
+
+    result = execute_controlled_merge_continue(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=[".agents/skills"],
+        commit_message="merge: resolve root skill surface conflict",
+        expected_head=topic_head,
+    )
+
+    assert result.status == "committed"
+    assert result.reason_code == "merge_continued"
+    assert result.commit_sha == _head(repo)
+    assert os.path.islink(repo / ".agents" / "skills")
+    assert os.readlink(repo / ".agents" / "skills") == "../.claude/skills"
+    assert (repo / ".claude" / "skills" / "post-merge-cleanup-executor" / "SKILL.md").is_file()
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", f"{main_head}..HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert changed
+    assert all(path == ".agents/skills" or path.startswith(".agents/skills/") for path in changed)
+
+
+def test_merge_continue_rejects_unresolved_or_out_of_scope_path(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    topic_head, main_head = _start_root_skill_file_directory_merge(repo)
+    snapshot = _build_snapshot(
+        repo,
+        allowed_paths=["outside.txt"],
+        base_sha=main_head,
+    )
+
+    result = execute_controlled_merge_continue(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=[".agents/skills"],
+        commit_message="merge: reject scope escape",
+        expected_head=topic_head,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "path_outside_allowed_paths"
+
+
+def test_merge_continue_requires_existing_unmerged_merge(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    snapshot = _build_snapshot(repo, allowed_paths=["README.md"])
+
+    result = execute_controlled_merge_continue(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["README.md"],
+        commit_message="merge: reject clean repository",
+        expected_head=_head(repo),
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "merge_continue_requires_merge_head"
 
 
 def test_explicit_pathspec_outside_allowed_paths_denied(tmp_path: Path):
@@ -469,6 +608,41 @@ def test_pathspec_magic_and_directory_pathspec_rejected(tmp_path: Path):
             "pathspec_broad_root_rejected",
         ), (bad_pathspec, result.reason_code)
         assert _staged_name_only(repo) == "", bad_pathspec
+
+
+def test_root_skill_directory_replacement_is_literally_bounded(tmp_path: Path):
+    """A single root path may replace only legacy children with the exact link.
+
+    This covers the Git shape for #1926 without making directory pathspecs or
+    arbitrary symlinks an authorization mechanism.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    legacy = repo / ".agents" / "skills" / "legacy-skill"
+    legacy.mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("legacy\n")
+    (legacy / "references.md").write_text("legacy\n")
+    subprocess.run(["git", "add", ".agents/skills"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed legacy skill surface"], cwd=repo, check=True)
+
+    shutil.rmtree(repo / ".agents" / "skills")
+    os.symlink("../.claude/skills", repo / ".agents" / "skills", target_is_directory=True)
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=_build_snapshot(repo, allowed_paths=[".agents/skills"]),
+        requested_pathspecs=[".agents/skills"],
+        commit_message="feat: replace root skill surface with tracked symlink",
+        expected_head=_head(repo),
+    )
+
+    assert result.status == "committed", result
+    records = {record["path"]: record for record in result.classified_records}
+    assert records[".agents/skills"]["old_mode"] == "000000"
+    assert records[".agents/skills"]["new_mode"] == "120000"
+    assert records[".agents/skills/legacy-skill/SKILL.md"]["git_status"] == "removed"
+    assert records[".agents/skills/legacy-skill/references.md"]["git_status"] == "removed"
 
 
 # ─── AC7 ──────────────────────────────────────────────────────────────────

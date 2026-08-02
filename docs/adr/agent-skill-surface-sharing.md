@@ -1,9 +1,9 @@
 ---
 adr_id: "0005"
-title: "Agent skill surface sharing policy"
-status: proposed
+title: "エージェント skill surface 共有方針"
+status: accepted
 decision_date: "2026-06-11"
-confirmed_date: null
+confirmed_date: "2026-08-02"
 issue_relations:
   implements:
     - "#779"
@@ -12,14 +12,14 @@ issue_relations:
     - "#780"
   non_precedent_references:
     - issue: "#381"
-      reason: "session-recording-policy-specific SSOT and thin-pointer concern; not precedent for general custom-agent skill surface policy"
+      reason: "session-recording-policy 固有の SSOT と thin-pointer concern であり、一般的な custom-agent skill surface policy の先例ではない"
 supersedes: []
 superseded_by: null
 ---
 
-# ADR 0005: Agent skill surface sharing policy
+# ADR 0005: エージェント skill surface 共有方針
 
-## Context
+## 背景
 
 Issue #776 は、Codex custom agent が repo-local skill surface として `.claude/skills` に依存し続ける状態を解消し、Codex 側の repo-shared skill entrypoint を `.agents/skills/*/SKILL.md` に統一する implementation issue である。後続の #780 は `.codex/agents/*.toml` を thin runtime contract 化し、不要な workflow prose の重複を validator で防ぐ issue として切り出されている。
 
@@ -31,27 +31,41 @@ Issue #776 は、Codex custom agent が repo-local skill surface として `.cla
 
 本 ADR は、#776 / #780 の後続 implementation issue と PR が同じ判断基準を参照できるよう、Codex / Claude 間の skill surface sharing policy を decision record として固定する。
 
-## Considered Options
+## 検討した選択肢
 
-**Option A**: Codex-only skill bodies を `.codex/skills/*/SKILL.md` に複製する
+**選択肢 A**: Codex-only skill bodies を `.codex/skills/*/SKILL.md` に複製する
 - メリット: Codex 専用の書き分けがしやすい
 - デメリット: `.agents/skills` を Codex repo-shared surface に統一する #776 と衝突する。自然言語本文の重複管理が発生し、review / security / token cost が増える
 
-**Option B**: `.agents/skills` を Codex repo-shared skill surface とし、shared body は symlink または thin wrapper で共有する
+**選択肢 B**: `.agents/skills` を Codex repo-shared skill surface とし、shared body は symlink または thin wrapper で共有する
 - メリット: #776 の surface policy と整合する。shared workflow を一箇所に寄せやすく、本文 drift を抑制できる。Codex / Claude の runtime 差分は wrapper や companion file に局所化できる
 - デメリット: portability と platform-specific metadata の境界を明文化しないと、file symlink や frontmatter 差分で運用が崩れやすい
 
-**Option C**: Claude / Codex の skill surface を完全分離し、内容差分を許容する
+**選択肢 C**: Claude / Codex の skill surface を完全分離し、内容差分を許容する
 - メリット: 各 runtime に最適化しやすい
 - デメリット: 同一 workflow の別文書化が常態化し、#780 の thin runtime contract 方針と逆行する。reviewer がどちらを正本として見るべきか不明確になる
 
-**Option D**: skill 化をやめて `.codex/agents/*.toml` や agent 定義へ workflow 本文を直接埋め込む
+**選択肢 D**: skill 化をやめて `.codex/agents/*.toml` や agent 定義へ workflow 本文を直接埋め込む
 - メリット: skill 参照を減らせる
 - デメリット: subagent 定義の context が肥大化し、description / routing / dependency だけに絞る #780 の意図に反する。shared procedure の再利用性も低い
 
-## Decision
+## 決定
 
-**Option B を採用候補とする。**
+**Option B を採用する。Issue #1926 により root skill-directory symlink topology を確定する。**
+
+`.agents/skills` は Git mode `120000` で追跡する directory symlink とし、link text を正確に
+`../.claude/skills` とする。Codex はこの root skill-directory symlink 経由で、Claude Code は
+`.claude/skills` 経由で、同一の skill package tree（`SKILL.md`、`references/`、`scripts/` を含む）を
+discovery する。これにより既存の `.agents/skills/**/SKILL.md` thin wrapper は廃止する。
+
+この決定は以下の portability と runtime reload 条件を伴う。WSL2/Linux と GitHub Actions の checkout では
+Git symlink mode `120000` を保持し、regular directory、file symlink、absolute target、repo 外 target、
+broken target、誤った relative target は validator で fail-closed に拒否する。runtime は新しい process
+または明示的 reload で discovery を取り直し、両 runtime の inventory・重複なし・required file readback を
+linked worktree の artifact に保存する。
+
+以下の thin wrapper を default とする記述は、本決定より前の設計経緯であり、root topology に対する
+normative policy としては superseded である。
 
 Codex custom agent の repo-local shared skill surface は `.agents/skills/` を正本候補とする。`.codex/skills/` を第二の repo-shared skill surface として導入してはならない。
 
@@ -65,13 +79,18 @@ Claude Code 公式 docs は `.claude/skills/*/SKILL.md` を project skill surfac
 
 この portable subset は「Claude と Codex の公式共通最小要件」ではなく、**この repo で cross-runtime shared body を扱うための policy** である。特に `name` と `description` を必須にするのは Codex repository skill compatibility を満たすための repo rule であり、Claude Code の最小要件をそのまま言い換えたものではない。
 
-### Machine-readable policy
+### 機械可読方針
 
 ```yaml
 agent_skill_surface_sharing:
-  decision: proposed
-  codex_repo_shared_surface: ".agents/skills/"
+  decision: accepted
+  codex_repo_shared_surface: ".agents/skills -> ../.claude/skills"
   claude_project_skill_surface: ".claude/skills/"
+  root_skill_directory_symlink:
+    git_mode: "120000"
+    link_text: "../.claude/skills"
+    thin_wrappers: prohibited
+    runtime_reload_required_after_topology_change: true
   codex_skills_directory_policy:
     default: "do_not_use_as_second_repo_shared_surface"
     allowed_only_as:
@@ -126,9 +145,18 @@ agent_skill_surface_sharing:
     - "#780"
 ```
 
-## Consequences
+## 結果
 
-### Policy rules for future implementation issues
+### 将来の implementation issue 向け方針
+
+#### root skill-directory symlink（ルート skill-directory symlink）
+
+- `.agents/skills` は root skill-directory symlink の単一 entrypoint とし、tracked regular directory や
+  per-skill wrapper を再導入しない。
+- `.agents/skills/<skill>/...` と `.claude/skills/<skill>/...` は同一 package tree を解決し、個別の
+  Codex-only `SKILL.md` を作らない。
+- runtime evidence は fresh Codex / Claude Code process ごとに inventory、重複判定、required file
+  readback を記録する。topology を変更した既存 process の結果は再利用しない。
 
 1. Codex repo-shared skill entrypoint を追加・修正する issue は `.agents/skills/<skill-name>/SKILL.md` を主語にする。
 2. Claude project skill entrypoint は `.claude/skills/<skill-name>/SKILL.md` を主語にする。
@@ -136,13 +164,13 @@ agent_skill_surface_sharing:
 4. `.codex/agents/*.toml` は workflow 本文の正本保存先ではなく、thin runtime contract と routing / dependency 記述に留める。
 5. shared workflow を両 runtime で使う場合、まず shared body をどこに置くかを決め、その上で platform-specific wrapper が必要かを判断する。
 
-### Distribution boundary
+### 配布境界
 
 - repo-scoped workflow は `.agents/skills/` 配下の direct skill folder として管理する
 - 他 repo や他開発者へ再利用可能な installable artifact として配布する場合は plugin packaging を選ぶ
 - `.codex/skills/` を repo-local と distribution の中間のような pseudo-distribution surface として使ってはならない
 
-### Shared body の最低条件
+### 共有 body の最低条件
 
 shared body として許容するのは、両 runtime で同じ意味に読める手順本文だけである。最低条件は次のとおり。
 
@@ -152,7 +180,7 @@ shared body として許容するのは、両 runtime で同じ意味に読め�
 - 長い reference、examples、補助資料は supporting files に逃がし、本文を過剰に肥大化させない
 - runtime 固有 metadata は wrapper / companion file へ分離する
 
-### Shared body に入れてはならないもの
+### 共有 body に入れてはならないもの
 
 shared body に次を直接埋め込んではならない。
 
@@ -218,28 +246,28 @@ tracked な `.codex/skills/**/SKILL.md` 独立本文は許可しない。将来 
 - #780 は `.codex/agents/*.toml` を thin runtime contract 化する際、workflow 本文を agent 定義へ再複製しない判断根拠として本 ADR を参照する
 - validator / runtime contract は `runtime_dependency_status: codex_skill_required` など既存の canonical status と整合させ、`.claude/skills` を Codex runtime dependency として主張したら fail-closed にする
 
-### Positive impact
+### 正の影響
 
 - shared workflow 本文の drift を抑制できる
 - token / context budget の無駄な重複消費を減らせる
 - reviewer が canonical surface を一意に追いやすくなる
 - Codex / Claude の runtime 差分を wrapper や companion metadata に限定できる
 
-### Negative impact / trade-offs
+### 負の影響 / trade-offs
 
-- symlink portability を安易に前提化できない
-- wrapper 設計を雑にすると pointer だけが増え、かえって探索コストが上がる
+- symlink portability は Git mode と fresh runtime evidence で継続確認する必要がある
+- root surface は Claude 側の skill package をまとめて Codex discovery に公開する
 - runtime ごとの convenience field を shared body に直接書けないため、短期的には少し不便になる
 
-## References
+## 参考資料
 
 - Issue #779
 - Issue #776
 - Issue #780
 - Issue #381
-- Owner comment on #779: `https://github.com/squne121/loop-protocol/issues/779#issuecomment-4680357198`
-- OpenAI Codex docs: Agent Skills `https://developers.openai.com/codex/skills`
-- OpenAI Codex docs: Best practices `https://developers.openai.com/codex/learn/best-practices`
-- OpenAI Codex docs: Subagents `https://developers.openai.com/codex/subagents`
-- Anthropic Claude Code docs: Skills `https://code.claude.com/docs/en/skills`
-- Anthropic Claude Code docs: Sub-agents `https://code.claude.com/docs/en/sub-agents`
+- #779 の Owner comment: `https://github.com/squne121/loop-protocol/issues/779#issuecomment-4680357198`
+- OpenAI Codex docs: Agent Skills（エージェント skill） `https://developers.openai.com/codex/skills`
+- OpenAI Codex docs: Best practices（ベストプラクティス） `https://developers.openai.com/codex/learn/best-practices`
+- OpenAI Codex docs: Subagents（サブエージェント） `https://developers.openai.com/codex/subagents`
+- Anthropic Claude Code docs: Skills（skill） `https://code.claude.com/docs/en/skills`
+- Anthropic Claude Code docs: Sub-agents（サブエージェント） `https://code.claude.com/docs/en/sub-agents`

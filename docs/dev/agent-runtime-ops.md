@@ -281,10 +281,10 @@ GitHub への issue / PR 更新、コメント投稿、draft PR 起票は `docs/
 - root default は `.codex/agents/*.toml` の agent-local `default_permissions`（`loop-protocol-readonly` / `loop-protocol-rtk`）を上書きしない。custom agent は自身の profile を明示宣言し続ける
 - `.codex/rules/default.rules` が command rules を持つ
 - `AGENTS.md` が Codex 向けの project-local instruction surface になる
-- `.agents/skills/` が Codex custom agent の repo-local discovery surface になる
-- `.claude/skills/` は Claude 側 prompt / skill surface であり、現時点では thin bridge が読む canonical body の保管場所でもある
-- repo-local authoring/discovery surface は `.agents/skills/` を discovery、`.claude/skills/` を canonical body として分ける
-- Codex 公式の `symlinked skill folders` support は確認済みだが、この repo では symlink portability is unproven; thin bridge is the default
+- `.agents/skills` は Git mode `120000` の root skill-directory symlink（link text: `../.claude/skills`）であり、Codex custom agent の repo-local discovery surface になる
+- `.claude/skills/` は Claude 側 prompt / skill surface であり、上記 symlink の canonical package tree でもある
+- regular directory、file symlink、absolute / repo 外 / broken / 誤った relative target は validator で fail-closed に拒否する
+- topology 変更後は fresh process または明示的 reload で Codex / Claude Code の discovery を再実行し、inventory、重複なし、required file readback を linked worktree artifact に記録する
 - installable artifact として配布したい場合は direct repo surface を増やさず plugin packaging を別 concern として扱う
 - したがってこの PR 系列で揃えるのは「discovery surface の整合」であり、`.claude/skills/` 実体の全面移設までは主張しない
 
