@@ -576,6 +576,58 @@ required check が fail して止まる。手元実行だけのゲートにし�
   `behavior test`（フォーカス移動 / inert 化 / キーボード遷移 / dialog 開閉）が完了していることを
   先行条件として参照する。
 
+### component VRT の PR #1977 review fix（OWNER REQUEST_CHANGES 対応、明示）
+
+PR #1977（Issue #1389）は OWNER の詳細な REQUEST_CHANGES（既存 `impl-review-loop: APPROVE`
+を上書きするマージ前必須条件）を受け、以下 5 点を修正した。
+
+- **hidden attachment upload の欠落**: `.github/workflows/ci.yml` の
+  `component-vrt-report` job の `actions/upload-artifact@v6` step に
+  `include-hidden-files: true` を追加した。`.vitest-attachments/` は隠しディレクトリ
+  （dot-prefixed）であり、`include-hidden-files` なしでは失敗時の actual/diff 画像が
+  silent に artifact から欠落し得る問題を修正した。加えて、意図的な visual mismatch を
+  発生させる controlled negative control fixture
+  （`tests/component/__negative_control__/hidden-attachment-negative-control.vrt.test.ts`。
+  実 baseline とは別の committed reference PNG を持つ throwaway 用途。
+  `VITE_VRT_NEGATIVE_CONTROL=true` gate で通常実行時は skip）を追加し、CI 側で
+  upload → download → `*-actual-*.png`/`*-diff-*.png` の存在確認まで実施することで、
+  「YAML が正しく見える」だけでなく hidden-file upload が実際に機能することを証明する。
+- **snapshot root 監査の循環参照**: `scripts/check-visual-artifact-pipeline.py` の
+  `extract_derived_vitest_component_captures()` が自己生成した期待値と自己比較していた
+  circularity を修正した。`vitest.visual.config.ts` の実際の `test.include` パターンと
+  screenshot directory 設定（`parse_vitest_visual_config()`）から directory を導出し、
+  実際に committed された PNG ファイルと突合する。`vitest.visual.config.ts` は
+  Vitest 4.1.6 の `browser.screenshotDirectory` shorthand が config 正規化時に絶対パス化
+  され `@vitest/browser` 側の `resolveScreenshotPath` デフォルトと二重結合してバグる
+  （ローカル再現済み）ため、`browser.expect.toMatchScreenshot.resolveScreenshotPath` を
+  明示実装する形で AC4 を満たす（`vitest.visual.config.ts` 内コメント参照）。`test.include`
+  も `tests/component/*.vrt.test.ts`（非再帰）に制限し、nested spec が audit 対象外の
+  root へ silent に解決される経路を防いだ。mutation test
+  （`test_extract_derived_vitest_component_captures_mutation_wrong_screenshot_directory_fails`）
+  で、config の screenshot directory を変更すると validator が実際に fail することを確認した。
+- **comparator 監査の Vitest 仕様不一致**: `allowedMismatchedPixels` /
+  `allowedMismatchedPixelRatio` を mutually exclusive として拒否していた誤りを修正し、
+  Vitest 同様に両方の併記を許可した（厳しい方が適用される）。コメント/文字列を mask した
+  構造解析（`_parse_vitest_comparator_options()`）に置き換え、コメントアウトされた
+  comparator option が誤検出されないことを regression test で確認した。数値範囲
+  （ratio/threshold は `[0, 1]`、pixels は非負整数）・型検証、`comparatorOptions` の
+  直接プロパティのみを対象とする scoping、spread/変数参照/計算プロパティの fail-closed
+  も追加した。
+- **capture 0 件時の silent pass**: `cross_validate_component_vrt_captures()` を追加し、
+  `docs/dev/visual-baseline-registry.md`（本ファイル）の component VRT registry
+  エントリと、derived capture を 1 対 1 で cross-validate する。capture 0 件、
+  missing PNG、orphan PNG、重複 capture id、comparator/directory drift を
+  hard fail にする。
+- **freeze CSS 未再利用**: `tests/component/combat-hud-running.vrt.test.ts` が
+  `tests/e2e/visual.freeze.css`（read-only import。当該ファイル自体は Allowed Paths 外の
+  ため変更していない）を読み込むよう変更した。mount container には既に
+  `data-battle-ui-root` 属性があり、freeze CSS の font-family pin / animation 停止が
+  直接適用される。baseline PNG は CI-pinned Docker container
+  （`mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948`。
+  前回 iteration と同一 digest）内で freeze CSS 適用後に再生成し、同一 container 内で
+  複数回実行して pixel drift がないことを確認した（evidence は PR #1977 本文 / commit
+  message に記録する）。
+
 ## 6. 関連
 
 - #681（`toHaveScreenshot` baseline 追加 / auto-update pipeline は out of scope）

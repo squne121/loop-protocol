@@ -3,6 +3,20 @@ import { page } from 'vitest/browser'
 import { createHudController, type HudActions } from '../../src/ui/HudController'
 import { createInitialGameState } from '../../src/state/GameState'
 import '../../src/style.css'
+// PR #1977 review fix (P1 item 5, OWNER REQUEST_CHANGES): reuse the
+// existing shared freeze CSS (Issue #1385) that
+// `tests/e2e/visual-overlay.spec.ts` already applies via Playwright's
+// `stylePath` option (Issue #1389's own In Scope text: "既存 freeze CSS
+// 再利用"). Read-only import from `tests/component/**` — this file itself
+// is NOT modified (it is outside this Issue's Allowed Paths). Pins
+// `[data-battle-ui-root]` (present on this test's mount `container` below)
+// to a generic `sans-serif` font stack and disables
+// animation/transition/caret/smooth-scroll, removing the named-font
+// fallback-chain drift that `src/style.css` alone leaves host-dependent —
+// the same class of determinism gap the CI-environment baseline
+// regeneration (Issue #1389 fix_delta, PR #1977 prior iteration) already
+// had to work around for the Canvas/Chromium rendering side.
+import '../e2e/visual.freeze.css'
 
 /**
  * tests/component/combat-hud-running.vrt.test.ts — Vitest Browser Mode
