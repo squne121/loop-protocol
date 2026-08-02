@@ -132,6 +132,15 @@ planner / `open-pr` / `implement-issue` / `impl-review-loop` の production impl
 - `git worktree add` CLI を直接利用（特定エージェント専用機能には依存しない）
 - リポジトリ外配置は禁止（Claude Code の workspace trust prompt が再発し承認マシーン化）
 
+## Cross-runtime skill discovery
+
+- `.agents/skills` は Git mode `120000` の root skill-directory symlink であり、link text は
+  `../.claude/skills` に固定する。Codex は前者、Claude Code は後者から同一 skill package tree を読む。
+- thin wrapper を追加せず、`SKILL.md`、`references/`、`scripts/` を package 単位で共有する。
+- topology を変更した PR は linked worktree の fresh Codex / Claude Code discovery を実行し、inventory、
+  重複なし、required file readback を artifact として保存する。既存 process は restart または reload 後に
+  再検証する。
+
 ### マージ後クリーンアップ
 
 PR マージ後は `post-merge-cleanup` skill 経由で自動的に:

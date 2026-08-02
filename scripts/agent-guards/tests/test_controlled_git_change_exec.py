@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -469,6 +470,41 @@ def test_pathspec_magic_and_directory_pathspec_rejected(tmp_path: Path):
             "pathspec_broad_root_rejected",
         ), (bad_pathspec, result.reason_code)
         assert _staged_name_only(repo) == "", bad_pathspec
+
+
+def test_root_skill_directory_replacement_is_literally_bounded(tmp_path: Path):
+    """A single root path may replace only legacy children with the exact link.
+
+    This covers the Git shape for #1926 without making directory pathspecs or
+    arbitrary symlinks an authorization mechanism.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    legacy = repo / ".agents" / "skills" / "legacy-skill"
+    legacy.mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("legacy\n")
+    (legacy / "references.md").write_text("legacy\n")
+    subprocess.run(["git", "add", ".agents/skills"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed legacy skill surface"], cwd=repo, check=True)
+
+    shutil.rmtree(repo / ".agents" / "skills")
+    os.symlink("../.claude/skills", repo / ".agents" / "skills", target_is_directory=True)
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=_build_snapshot(repo, allowed_paths=[".agents/skills"]),
+        requested_pathspecs=[".agents/skills"],
+        commit_message="feat: replace root skill surface with tracked symlink",
+        expected_head=_head(repo),
+    )
+
+    assert result.status == "committed", result
+    records = {record["path"]: record for record in result.classified_records}
+    assert records[".agents/skills"]["old_mode"] == "000000"
+    assert records[".agents/skills"]["new_mode"] == "120000"
+    assert records[".agents/skills/legacy-skill/SKILL.md"]["git_status"] == "removed"
+    assert records[".agents/skills/legacy-skill/references.md"]["git_status"] == "removed"
 
 
 # ─── AC7 ──────────────────────────────────────────────────────────────────

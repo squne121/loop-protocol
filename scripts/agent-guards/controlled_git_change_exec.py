@@ -343,6 +343,8 @@ def detect_stale_snapshot(
 
 _PATHSPEC_MAGIC_CHARS = frozenset("*?[]")
 _PATHSPEC_BROAD_ROOTS = frozenset({".", "..", ":/", "/"})
+_ROOT_SKILL_DIRECTORY_PATH = ".agents/skills"
+_ROOT_SKILL_DIRECTORY_TARGET = "../.claude/skills"
 
 
 def _validate_pathspec_literal(pathspec: str, cwd: str) -> Tuple[bool, Optional[str]]:
@@ -595,6 +597,50 @@ def _staged_matches_requested(staged_comparison_set: set, requested_set: set) ->
     return staged_comparison_set == requested_set
 
 
+def _is_bounded_root_skill_directory_replacement(
+    *,
+    cwd: str,
+    requested_set: set,
+    delta_records: List[ChangedFileRecord],
+    allowed_paths: Sequence[str],
+) -> bool:
+    """Allow only the one root-directory-to-link topology transition.
+
+    Replacing a tracked directory with one tracked symlink necessarily
+    produces the root link plus removals of every previously tracked child.
+    The normal one-requested-path/one-delta-path invariant would therefore
+    reject this Git representation.  Keep the exception literal and
+    fail-closed: it is not a general directory-path or recursive staging
+    authorization.
+    """
+    if requested_set != {_ROOT_SKILL_DIRECTORY_PATH}:
+        return False
+    if _ROOT_SKILL_DIRECTORY_PATH not in allowed_paths:
+        return False
+
+    surface = os.path.join(cwd, _ROOT_SKILL_DIRECTORY_PATH)
+    try:
+        if not os.path.islink(surface) or os.readlink(surface) != _ROOT_SKILL_DIRECTORY_TARGET:
+            return False
+    except OSError:
+        return False
+
+    root_records = [record for record in delta_records if record.path == _ROOT_SKILL_DIRECTORY_PATH]
+    removed_children = [record for record in delta_records if record.path.startswith(_ROOT_SKILL_DIRECTORY_PATH + "/")]
+    if len(root_records) != 1 or len(root_records) + len(removed_children) != len(delta_records):
+        return False
+    root_record = root_records[0]
+    if root_record.new_mode != "120000" or root_record.old_mode != "000000":
+        return False
+    return all(
+        record.status == "removed"
+        and record.old_mode != "000000"
+        and record.new_mode == "000000"
+        and record.previous_path is None
+        for record in removed_children
+    )
+
+
 def _unstage(cwd: str, pathspecs: List[str]) -> None:
     if not pathspecs:
         return
@@ -770,8 +816,16 @@ def execute_controlled_change(
         for record in delta_records
     ]
 
-    # 7. Delta set must exactly equal the requested set (AC7).
-    if not _staged_matches_requested(delta_paths, requested_set):
+    # 7. Delta set must exactly equal the requested set (AC7).  A single,
+    # literal root-skill-directory replacement is the only exception: Git
+    # represents it as the root symlink plus removed legacy children.
+    bounded_root_skill_replacement = _is_bounded_root_skill_directory_replacement(
+        cwd=cwd,
+        requested_set=requested_set,
+        delta_records=delta_records,
+        allowed_paths=snapshot.allowed_paths,
+    )
+    if not _staged_matches_requested(delta_paths, requested_set) and not bounded_root_skill_replacement:
         _unstage(cwd, requested_pathspecs)
         return _denied(
             "staged_requested_mismatch",
@@ -793,7 +847,15 @@ def execute_controlled_change(
     # 9. Every delta path (current + previous, for renames) must be within
     # the snapshot's Allowed Paths (AC2/AC3/AC4).
     out_of_scope = sorted(
-        {path for path in delta_paths if not AllowedPathsMatcher.is_file_allowed(path, list(snapshot.allowed_paths))}
+        {
+            path
+            for path in delta_paths
+            if not AllowedPathsMatcher.is_file_allowed(path, list(snapshot.allowed_paths))
+            and not (
+                bounded_root_skill_replacement
+                and path.startswith(_ROOT_SKILL_DIRECTORY_PATH + "/")
+            )
+        }
     )
     if out_of_scope:
         _unstage(cwd, requested_pathspecs)
@@ -837,12 +899,22 @@ def execute_controlled_change(
             post_commit_violation = True
         else:
             commit_paths = _record_full_paths(commit_records)
-            if commit_paths != requested_set:
+            committed_bounded_root_skill_replacement = _is_bounded_root_skill_directory_replacement(
+                cwd=cwd,
+                requested_set=requested_set,
+                delta_records=commit_records,
+                allowed_paths=snapshot.allowed_paths,
+            )
+            if commit_paths != delta_paths or committed_bounded_root_skill_replacement != bounded_root_skill_replacement:
                 post_commit_violation = True
             else:
                 for path in commit_paths:
-                    if protected_paths_policy.is_protected_path(path) or not AllowedPathsMatcher.is_file_allowed(
-                        path, list(snapshot.allowed_paths)
+                    if protected_paths_policy.is_protected_path(path) or (
+                        not AllowedPathsMatcher.is_file_allowed(path, list(snapshot.allowed_paths))
+                        and not (
+                            committed_bounded_root_skill_replacement
+                            and path.startswith(_ROOT_SKILL_DIRECTORY_PATH + "/")
+                        )
                     ):
                         post_commit_violation = True
                         break

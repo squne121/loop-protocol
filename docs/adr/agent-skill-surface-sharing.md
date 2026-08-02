@@ -1,9 +1,9 @@
 ---
 adr_id: "0005"
 title: "Agent skill surface sharing policy"
-status: proposed
+status: accepted
 decision_date: "2026-06-11"
-confirmed_date: null
+confirmed_date: "2026-08-02"
 issue_relations:
   implements:
     - "#779"
@@ -51,7 +51,21 @@ Issue #776 は、Codex custom agent が repo-local skill surface として `.cla
 
 ## Decision
 
-**Option B を採用候補とする。**
+**Option B を採用する。Issue #1926 により root skill-directory symlink topology を確定する。**
+
+`.agents/skills` は Git mode `120000` で追跡する directory symlink とし、link text を正確に
+`../.claude/skills` とする。Codex はこの root skill-directory symlink 経由で、Claude Code は
+`.claude/skills` 経由で、同一の skill package tree（`SKILL.md`、`references/`、`scripts/` を含む）を
+discovery する。これにより既存の `.agents/skills/**/SKILL.md` thin wrapper は廃止する。
+
+この決定は以下の portability と runtime reload 条件を伴う。WSL2/Linux と GitHub Actions の checkout では
+Git symlink mode `120000` を保持し、regular directory、file symlink、absolute target、repo 外 target、
+broken target、誤った relative target は validator で fail-closed に拒否する。runtime は新しい process
+または明示的 reload で discovery を取り直し、両 runtime の inventory・重複なし・required file readback を
+linked worktree の artifact に保存する。
+
+以下の thin wrapper を default とする記述は、本決定より前の設計経緯であり、root topology に対する
+normative policy としては superseded である。
 
 Codex custom agent の repo-local shared skill surface は `.agents/skills/` を正本候補とする。`.codex/skills/` を第二の repo-shared skill surface として導入してはならない。
 
@@ -69,9 +83,14 @@ Claude Code 公式 docs は `.claude/skills/*/SKILL.md` を project skill surfac
 
 ```yaml
 agent_skill_surface_sharing:
-  decision: proposed
-  codex_repo_shared_surface: ".agents/skills/"
+  decision: accepted
+  codex_repo_shared_surface: ".agents/skills -> ../.claude/skills"
   claude_project_skill_surface: ".claude/skills/"
+  root_skill_directory_symlink:
+    git_mode: "120000"
+    link_text: "../.claude/skills"
+    thin_wrappers: prohibited
+    runtime_reload_required_after_topology_change: true
   codex_skills_directory_policy:
     default: "do_not_use_as_second_repo_shared_surface"
     allowed_only_as:
@@ -129,6 +148,15 @@ agent_skill_surface_sharing:
 ## Consequences
 
 ### Policy rules for future implementation issues
+
+#### root skill-directory symlink
+
+- `.agents/skills` は root skill-directory symlink の単一 entrypoint とし、tracked regular directory や
+  per-skill wrapper を再導入しない。
+- `.agents/skills/<skill>/...` と `.claude/skills/<skill>/...` は同一 package tree を解決し、個別の
+  Codex-only `SKILL.md` を作らない。
+- runtime evidence は fresh Codex / Claude Code process ごとに inventory、重複判定、required file
+  readback を記録する。topology を変更した既存 process の結果は再利用しない。
 
 1. Codex repo-shared skill entrypoint を追加・修正する issue は `.agents/skills/<skill-name>/SKILL.md` を主語にする。
 2. Claude project skill entrypoint は `.claude/skills/<skill-name>/SKILL.md` を主語にする。
@@ -227,8 +255,8 @@ tracked な `.codex/skills/**/SKILL.md` 独立本文は許可しない。将来 
 
 ### Negative impact / trade-offs
 
-- symlink portability を安易に前提化できない
-- wrapper 設計を雑にすると pointer だけが増え、かえって探索コストが上がる
+- symlink portability は Git mode と fresh runtime evidence で継続確認する必要がある
+- root surface は Claude 側の skill package をまとめて Codex discovery に公開する
 - runtime ごとの convenience field を shared body に直接書けないため、短期的には少し不便になる
 
 ## References

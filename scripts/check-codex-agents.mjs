@@ -150,9 +150,8 @@ const prohibitedRootActionKinds = new Set([
   'review_judgment',
   'cleanup_git_mutation',
 ]);
-const requiredDerivedMarker = 'derived/non-canonical';
-const requiredImperative = 'Before executing this skill, read the canonical body at';
-const maxBridgeBodyLines = 3;
+const rootSkillDirectory = '.agents/skills';
+const rootSkillDirectoryTarget = '../.claude/skills';
 
 function readText(filePath) {
   return fs.readFileSync(filePath, 'utf8');
@@ -348,65 +347,44 @@ function extractRuntimeFollowupRoute(instructions) {
   return match?.[1] ?? null;
 }
 
-function extractCanonicalBodyTarget(skillSurfacePath) {
-  const body = readText(skillSurfacePath);
-  const match = body.match(/`([^`]*\.claude\/skills\/[^`]+\/SKILL\.md)`/);
-  return match?.[1] ?? null;
-}
-
-function expectedCanonicalTargetForSurface(skillSurfacePath) {
-  return `../../../.claude/skills/${path.basename(path.dirname(skillSurfacePath))}/SKILL.md`;
-}
-
-function extractBridgeBodyLines(body) {
-  const remainder = body.split('\n---\n').slice(-1)[0];
-  return remainder
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith('# '));
-}
-
-function validateBridgeSurface(skillSurfacePath, failures) {
-  const body = readText(skillSurfacePath);
-  const relPath = path.relative(repoRoot, skillSurfacePath);
-  const bodyLines = extractBridgeBodyLines(body);
-
-  assert(body.includes(requiredDerivedMarker), `${relPath}: derived/non-canonical marker required`, failures);
-  assert(body.includes(requiredImperative), `${relPath}: exact imperative required`, failures);
-
-  const canonicalTarget = extractCanonicalBodyTarget(skillSurfacePath);
-  const expectedTarget = expectedCanonicalTargetForSurface(skillSurfacePath);
-  if (!canonicalTarget) {
-    failures.push(`${relPath}: wrong skill target - canonical target missing`);
-  } else if (canonicalTarget !== expectedTarget) {
-    failures.push(`${relPath}: wrong skill target - expected ${JSON.stringify(expectedTarget)} got ${JSON.stringify(canonicalTarget)}`);
-  } else {
-    const canonicalTargetPath = path.resolve(path.dirname(skillSurfacePath), canonicalTarget);
-    assert(fs.existsSync(canonicalTargetPath), `${relPath}: canonical skill body target missing for ${canonicalTarget}`, failures);
+function validateRootSkillDirectorySymlink(failures) {
+  const surface = path.join(repoRoot, rootSkillDirectory);
+  let stat;
+  try {
+    stat = fs.lstatSync(surface);
+  } catch {
+    failures.push('.agents/skills: root skill-directory symlink is missing');
+    return;
+  }
+  if (!stat.isSymbolicLink()) {
+    failures.push('.agents/skills: must be a root skill-directory symlink, not a regular directory');
+    return;
   }
 
-  assert(bodyLines.length <= maxBridgeBodyLines, `${relPath}: required thin wrapper - body bloat detected`, failures);
-  assert(
-    !['```', '## ', '### ', '\n- ', '\n* '].some((token) => body.includes(token)),
-    `${relPath}: required thin wrapper - stale procedure body detected`,
-    failures,
-  );
-}
+  const target = fs.readlinkSync(surface);
+  if (target !== rootSkillDirectoryTarget) {
+    failures.push(`.agents/skills: root skill-directory symlink target must be ${JSON.stringify(rootSkillDirectoryTarget)}, got ${JSON.stringify(target)}`);
+  }
+  if (path.isAbsolute(target)) {
+    failures.push('.agents/skills: absolute symlink targets are prohibited');
+  }
 
-function validateDuplicateCanonicalTargets(skillSurfacePaths, failures) {
-  const seenTargets = new Map();
-  for (const skillSurfacePath of skillSurfacePaths) {
-    const canonicalTarget = extractCanonicalBodyTarget(skillSurfacePath);
-    if (!canonicalTarget) {
-      continue;
+  try {
+    const resolved = fs.realpathSync(surface);
+    const expected = fs.realpathSync(path.join(repoRoot, '.claude', 'skills'));
+    if (!fs.statSync(resolved).isDirectory()) {
+      failures.push('.agents/skills: root skill-directory symlink must resolve to a directory');
     }
-    if (seenTargets.has(canonicalTarget)) {
-      failures.push(
-        `duplicate canonical target: ${canonicalTarget} used by ${path.relative(repoRoot, seenTargets.get(canonicalTarget))} and ${path.relative(repoRoot, skillSurfacePath)}`,
-      );
-      continue;
+    if (resolved !== expected) {
+      failures.push('.agents/skills: root skill-directory symlink must resolve inside this repository');
     }
-    seenTargets.set(canonicalTarget, skillSurfacePath);
+  } catch {
+    failures.push('.agents/skills: root skill-directory symlink target is broken');
+  }
+
+  const index = spawnSync('git', ['-C', repoRoot, 'ls-files', '-s', '--', rootSkillDirectory], { encoding: 'utf8' });
+  if (index.status !== 0 || !/^120000\s/.test(index.stdout)) {
+    failures.push('.agents/skills: Git index must track the root skill-directory symlink with mode 120000');
   }
 }
 
@@ -579,7 +557,7 @@ function validateAgents() {
   const failures = [];
   const warnings = [];
   const files = getAgentFiles();
-  const bridgeSurfacePaths = [];
+  validateRootSkillDirectorySymlink(failures);
   assert(files.length === requiredAgentNames.length, `expected ${requiredAgentNames.length} agent files, found ${files.length}`, failures);
 
   const seenNames = new Set();
@@ -784,11 +762,9 @@ function validateAgents() {
         const fullSkillSurfacePath = path.join(repoRoot, skillSurfacePath);
         assert(fs.existsSync(fullSkillSurfacePath), `${file}: missing repo-local skill surface ${skillSurfacePath}`, failures);
         if (fs.existsSync(fullSkillSurfacePath)) {
-          bridgeSurfacePaths.push(fullSkillSurfacePath);
           const body = readText(fullSkillSurfacePath);
           assert(body.includes('name:'), `${file}: ${skillSurfacePath} must declare name frontmatter`, failures);
           assert(body.includes('description:'), `${file}: ${skillSurfacePath} must declare description frontmatter`, failures);
-          validateBridgeSurface(fullSkillSurfacePath, failures);
         }
       }
     }
@@ -812,8 +788,6 @@ function validateAgents() {
       assert(parsed.default_permissions === 'loop-protocol-rtk', `${file}: write-capable agent must use loop-protocol-rtk`, failures);
     }
   }
-
-  validateDuplicateCanonicalTargets([...new Set(bridgeSurfacePaths)], failures);
 
   return { failures, warnings };
 }
