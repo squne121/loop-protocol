@@ -1,5 +1,36 @@
 # Claude Code Runtime Reference
 
+## capability 判定の方針(help への非掲載は capability 不足を意味しない)
+
+`claude --help` は human-oriented な概要出力であり、network-exhaustive ではない。
+実際に、`--max-turns` は Claude Code 2.1.220 の `--help` 出力から欠落しているにも
+関わらず、有効な documented print-mode flag として受理される(Issue #1960)。
+そのため runner は `claude --help` のテキストから flag capability を推定しない
+(旧 `preflight_claude_flags` は削除済み)。preflight は `claude` 実行ファイルが
+PATH 上に存在するかどうかのみを確認する(`preflight_claude_available`)。
+
+structured lane の capability 判定は、実際の fixed-argv invocation 結果
+(`classify_claude_structured_outcome`)に基づく:
+
+- runtime が `unknown option` / `unrecognized option` 等の狭く一致する
+  parser-level diagnostic を返した場合のみ capability SKIP(exit 77)とする
+- `--max-turns` の bound に到達した(`Reached max turns` 等)場合は flag が
+  受理された証拠であり、capability SKIP に昇格させず bounded turn failure
+  (FAIL 1)として扱う
+- それ以外の非ゼロ終了(認証失敗、network 失敗、model 失敗、汎用 runtime
+  エラー等)は既存の FAIL 分類のまま変化しない
+
+interactive lane(herdr 経由)は `--output-format` / `--include-hook-events` /
+`--no-session-persistence` / `--max-turns` のような structured-only flag に
+一切依存しない。structured lane と interactive lane は異なる bounded-execution
+保証を持つ:
+
+- structured lane: 実際の fixed-argv invocation 結果(exit code・terminal
+  event・capability 分類)
+- interactive lane: herdr の wait timeout、process termination、isolated
+  session の stop・delete・removal 確認(`herdr session list --json` での
+  消失確認)。structured-only flag の forward には依存しない
+
 ## Structured lane（既定）
 
 ```bash
