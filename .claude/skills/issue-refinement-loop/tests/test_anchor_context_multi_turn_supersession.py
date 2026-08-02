@@ -265,6 +265,242 @@ def test_multiple_candidates_route_to_human_judgment():
     assert routed["anchor_context_marked_segment_count"] >= 2
 
 
+_FULL_INTEGRITY_PREDICATES = {
+    "source_fetch_complete": True,
+    "source_hash_verified": True,
+    "source_ranges_covered": True,
+}
+
+
+def test_trusted_owner_multi_turn_routes_to_advisory_chronology_metadata():
+    """#1950 AC1: trusted OWNER multi-turn anchors are not a hard stop. The
+    last OWNER-speaker segment's index/source span is recorded as
+    `latest_owner_turn` chronology metadata only -- it must never be
+    promoted to `technical_recommendation` or `mutation_authorization`
+    precedence, and multi-turn ambiguity alone still does not grant
+    implementation_go.
+
+    PR #1973 (OWNER REQUEST_CHANGES, P0-1): the advisory downgrade is now
+    gated on full retrieval-integrity confirmation (source fetch complete,
+    hash verified, source ranges covered) in addition to trusted-OWNER
+    authorship and the "no structured payload" reason."""
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+
+    baseline_decision = {
+        "status": "fail_closed",
+        "reason": "no_anchor_scope_reframe_v1_payload",
+        "implementation_go": False,
+        "anchor_author_association": "OWNER",
+    }
+    routed = _apply_multi_turn_candidate_route(
+        baseline_decision,
+        segments_result,
+        candidates_result,
+        integrity_predicates=_FULL_INTEGRITY_PREDICATES,
+    )
+
+    assert routed["status"] == "warn"
+    assert routed["reason"] == "multi_turn_anchor_context_trusted_owner_advisory"
+    assert routed["implementation_go"] is False
+    assert routed["anchor_context_candidate_count"] == len(candidates_result["candidates"])
+    assert routed["anchor_context_marked_segment_count"] >= 2
+
+    owner_segments = [
+        seg for seg in segments_result["segments"] if seg.get("speaker") == ac.SPEAKER_OWNER
+    ]
+    assert owner_segments, "fixture must contain at least one owner segment"
+    last_owner_segment = owner_segments[-1]
+
+    latest_owner_turn = routed["latest_owner_turn"]
+    assert latest_owner_turn["segment_index"] == last_owner_segment["index"]
+    assert latest_owner_turn["source_range"]["start_line"] == last_owner_segment["start_line"]
+    assert latest_owner_turn["source_range"]["end_line"] == last_owner_segment["end_line"]
+    # chronology metadata must never claim precedence or authorization.
+    assert "technical_recommendation" not in latest_owner_turn
+    assert "mutation_authorization" not in latest_owner_turn
+
+
+# ---------------------------------------------------------------------------
+# PR #1973 (OWNER REQUEST_CHANGES, P0-1): the advisory `warn` route must
+# never silently overwrite a valid `fail_closed` decision whose reason is a
+# distinct integrity problem, nor a valid `approved_by_trusted_anchor`
+# decision -- and `known_context.anchor_reframe` must always reflect the
+# FINAL routed status, never the pre-route status.
+# ---------------------------------------------------------------------------
+
+
+def test_owner_multi_turn_schema_invalid_not_downgraded_to_warn():
+    """OWNER + multi-turn + `schema_invalid` reason must stay `fail_closed`
+    unchanged -- never downgraded to `warn`."""
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+
+    baseline_decision = {
+        "status": "fail_closed",
+        "reason": "schema_invalid: ['some error']",
+        "implementation_go": False,
+        "anchor_author_association": "OWNER",
+    }
+    routed = _apply_multi_turn_candidate_route(
+        baseline_decision,
+        segments_result,
+        candidates_result,
+        integrity_predicates=_FULL_INTEGRITY_PREDICATES,
+    )
+
+    assert routed == baseline_decision
+    assert routed["status"] == "fail_closed"
+    assert "schema_invalid" in routed["reason"]
+
+
+def test_owner_multi_turn_wrong_repo_not_downgraded_to_warn():
+    """OWNER + multi-turn + `wrong_repo` reason must stay `fail_closed`
+    unchanged."""
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+
+    baseline_decision = {
+        "status": "fail_closed",
+        "reason": "wrong_repo: expected 'a/b', got 'c/d'",
+        "implementation_go": False,
+        "anchor_author_association": "OWNER",
+    }
+    routed = _apply_multi_turn_candidate_route(
+        baseline_decision,
+        segments_result,
+        candidates_result,
+        integrity_predicates=_FULL_INTEGRITY_PREDICATES,
+    )
+
+    assert routed == baseline_decision
+    assert routed["status"] == "fail_closed"
+
+
+def test_owner_multi_turn_wrong_issue_number_not_downgraded_to_warn():
+    """OWNER + multi-turn + `wrong_issue_number` reason must stay
+    `fail_closed` unchanged."""
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+
+    baseline_decision = {
+        "status": "fail_closed",
+        "reason": "wrong_issue_number: expected 1, got 2",
+        "implementation_go": False,
+        "anchor_author_association": "OWNER",
+    }
+    routed = _apply_multi_turn_candidate_route(
+        baseline_decision,
+        segments_result,
+        candidates_result,
+        integrity_predicates=_FULL_INTEGRITY_PREDICATES,
+    )
+
+    assert routed == baseline_decision
+    assert routed["status"] == "fail_closed"
+
+
+def test_owner_multi_turn_approved_by_trusted_anchor_status_preserved():
+    """OWNER + multi-turn + a valid structured ANCHOR_SCOPE_REFRAME_V1
+    payload (`approved_by_trusted_anchor`) must STAY `approved_by_trusted_anchor`
+    -- not downgraded to `warn` -- while still recording `latest_owner_turn`
+    chronology metadata."""
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+
+    baseline_decision = {
+        "status": "approved_by_trusted_anchor",
+        "implementation_go": False,
+        "reason": "trusted_anchor_scope_reframe",
+        "anchor_author_association": "OWNER",
+        "allowed_path_deltas": [],
+        "required_rerun": [],
+    }
+    routed = _apply_multi_turn_candidate_route(
+        baseline_decision,
+        segments_result,
+        candidates_result,
+        integrity_predicates=_FULL_INTEGRITY_PREDICATES,
+    )
+
+    assert routed["status"] == "approved_by_trusted_anchor"
+    assert routed["reason"] == "trusted_anchor_scope_reframe"
+    assert "latest_owner_turn" in routed
+
+    owner_segments = [
+        seg for seg in segments_result["segments"] if seg.get("speaker") == ac.SPEAKER_OWNER
+    ]
+    last_owner_segment = owner_segments[-1]
+    assert routed["latest_owner_turn"]["segment_index"] == last_owner_segment["index"]
+
+
+def test_owner_multi_turn_advisory_not_applied_when_integrity_incomplete():
+    """OWNER + multi-turn + `no_anchor_scope_reframe_v1_payload`, but with an
+    incomplete/unconfirmed retrieval integrity predicate (e.g.
+    `source_ranges_covered: False`), must NOT get the advisory downgrade --
+    the original fail_closed decision is returned unchanged."""
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+
+    baseline_decision = {
+        "status": "fail_closed",
+        "reason": "no_anchor_scope_reframe_v1_payload",
+        "implementation_go": False,
+        "anchor_author_association": "OWNER",
+    }
+
+    for missing_key in ("source_fetch_complete", "source_hash_verified", "source_ranges_covered"):
+        predicates = dict(_FULL_INTEGRITY_PREDICATES)
+        predicates[missing_key] = False
+        routed = _apply_multi_turn_candidate_route(
+            baseline_decision,
+            segments_result,
+            candidates_result,
+            integrity_predicates=predicates,
+        )
+        assert routed == baseline_decision, (missing_key, routed)
+        assert routed["status"] == "fail_closed"
+
+    # Also: integrity_predicates omitted entirely (None) must not apply the
+    # advisory downgrade either (fail-closed default).
+    routed_no_predicates = _apply_multi_turn_candidate_route(
+        baseline_decision, segments_result, candidates_result
+    )
+    assert routed_no_predicates == baseline_decision
+
+
+def test_non_owner_multi_turn_route_is_unaffected_by_owner_advisory_path():
+    """#1950 AC2 regression: a multi-turn anchor whose author is trusted but
+    NOT the strict `OWNER` association (e.g. `MEMBER`/`COLLABORATOR`) must
+    still hit the pre-existing hard fail_closed route, unchanged by the
+    #1950 AC1 advisory carve-out."""
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+
+    baseline_decision = {
+        "status": "fail_closed",
+        "reason": "no_anchor_scope_reframe_v1_payload",
+        "implementation_go": False,
+        "anchor_author_association": "MEMBER",
+    }
+    routed = _apply_multi_turn_candidate_route(baseline_decision, segments_result, candidates_result)
+
+    assert routed["status"] == "fail_closed"
+    assert routed["reason"] == "multi_turn_anchor_context_requires_human_judgment"
+    assert "latest_owner_turn" not in routed
+
+
+def test_anchor_comment_handling_reference_documents_owner_reaction_procedure():
+    """#1950 AC3/AC4: the material-conflict owner-reaction procedure (up to
+    3 options, reaction mapping, drift readback, untrusted-reaction
+    re-evaluation) is defined in the anchor reference doc."""
+    reference_doc = (
+        SKILL_ROOT / "references" / "anchor-comment-handling.md"
+    ).read_text(encoding="utf-8")
+    assert "owner reaction" in reference_doc
+    assert "untrusted reaction" in reference_doc
+
+
 def test_single_turn_comment_does_not_trigger_multi_turn_route():
     # A single-turn comment (no markers) must not be routed to fail_closed by
     # this specific mechanism, even if it has several bullet candidates --
@@ -546,6 +782,56 @@ def _run_subprocess_fixture(
     return result, completed.returncode
 
 
+def _run_subprocess_fixture_with_planner_input(
+    tmp_path: Path,
+    *,
+    issue_number: int,
+    repo: str,
+    fixture: dict,
+    anchor_comment_url: "str | None" = None,
+) -> tuple[dict, dict, int]:
+    """Like `_run_subprocess_fixture()`, but also returns the
+    `planner_input.json` artifact contents (which carries
+    `known_context.anchor_reframe` / `known_context.scope_delta_decision`)."""
+    fixture_path = tmp_path / f"fixture_{issue_number}.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    repo_root = _repo_root_for_test()
+    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+
+    argv = [
+        sys.executable,
+        str(TARGET_SCRIPT),
+        "--issue-number",
+        str(issue_number),
+        "--repo",
+        repo,
+        "--fixture",
+        str(fixture_path),
+    ]
+    if anchor_comment_url:
+        argv.extend(["--anchor-comment-url", anchor_comment_url])
+
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        result_path = artifact_dir / "refinement_preflight_result_v1.json"
+        result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
+        planner_input_path = artifact_dir / "planner_input.json"
+        planner_input = (
+            json.loads(planner_input_path.read_text(encoding="utf-8")) if planner_input_path.exists() else {}
+        )
+    finally:
+        if artifact_dir.exists():
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+
+    return result, planner_input, completed.returncode
+
+
 _SUBPROC_ISSUE_MULTI_TURN = 99931891
 _SUBPROC_ISSUE_HEAVY_MUTATION_BLOCKED = 99941891
 _SUBPROC_ISSUE_HEAVY_MUTATION_OWNER_APPROVED = 99951891
@@ -576,11 +862,48 @@ def _base_fixture(issue_number: int, *, known_context: "dict | None" = None) -> 
     }
 
 
-def test_run_preflight_subprocess_multi_turn_ambiguity_blocks(tmp_path):
-    """Multiple marker-delimited segments + multiple candidates (the real
-    869-line fixture) must make the real subprocess entrypoint report
-    `status: blocked` / exit code EXIT_BLOCKED -- not merely an in-memory
-    dict field."""
+def test_run_preflight_subprocess_multi_turn_ambiguity_non_owner_blocks(tmp_path):
+    """#1950 AC2: multiple marker-delimited segments + multiple candidates,
+    authored by a non-OWNER (trusted-but-not-OWNER `MEMBER`), must still
+    make the real subprocess entrypoint report `status: blocked` / exit code
+    EXIT_BLOCKED -- the #1950 AC1 advisory route is scoped strictly to
+    `anchor_author_association == "OWNER"`, matching the pre-existing heavy
+    mutation gate's OWNER-only check."""
+    fixture = _base_fixture(_SUBPROC_ISSUE_MULTI_TURN)
+    fixture["anchor_comment_urls"] = [_SUBPROC_ANCHOR_URL]
+    fixture["anchor_comments"] = [
+        {
+            "id": _SUBPROC_COMMENT_ID,
+            "body": FIXTURE_869_LINES,
+            "issue_url": f"https://api.github.com/repos/{_SUBPROC_REPO}/issues/{_SUBPROC_ISSUE_MULTI_TURN}",
+            "author_association": "MEMBER",
+            "user": {"login": "reviewer", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "html_url": _SUBPROC_ANCHOR_URL,
+            "url": f"https://api.github.com/repos/{_SUBPROC_REPO}/issues/comments/{_SUBPROC_COMMENT_ID}",
+        }
+    ]
+
+    result, exit_code = _run_subprocess_fixture(
+        tmp_path,
+        issue_number=_SUBPROC_ISSUE_MULTI_TURN,
+        repo=_SUBPROC_REPO,
+        fixture=fixture,
+        anchor_comment_url=_SUBPROC_ANCHOR_URL,
+    )
+
+    assert exit_code == preflight.EXIT_BLOCKED, (result, exit_code)
+    assert result.get("status") == "blocked", result
+    assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED in result.get("blockers", []), result
+
+
+def test_run_preflight_subprocess_multi_turn_ambiguity_trusted_owner_advisory_not_blocked(tmp_path):
+    """#1950 AC1: the identical multi-turn transcript, authored by a trusted
+    OWNER, must NOT hard-block the real subprocess entrypoint. multi-turn
+    ambiguity alone is chronology metadata (`latest_owner_turn`), not a
+    precedence or mutation-authorization signal, so it routes to an advisory
+    `warn` / exit code EXIT_WARN instead of `blocked`."""
     fixture = _base_fixture(_SUBPROC_ISSUE_MULTI_TURN)
     fixture["anchor_comment_urls"] = [_SUBPROC_ANCHOR_URL]
     fixture["anchor_comments"] = [
@@ -605,9 +928,9 @@ def test_run_preflight_subprocess_multi_turn_ambiguity_blocks(tmp_path):
         anchor_comment_url=_SUBPROC_ANCHOR_URL,
     )
 
-    assert exit_code == preflight.EXIT_BLOCKED, (result, exit_code)
-    assert result.get("status") == "blocked", result
-    assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED in result.get("blockers", []), result
+    assert exit_code != preflight.EXIT_BLOCKED, (result, exit_code)
+    assert result.get("status") != "blocked", result
+    assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED not in result.get("blockers", []), result
 
 
 def test_run_preflight_subprocess_heavy_mutation_without_owner_blocks(tmp_path):
@@ -654,6 +977,7 @@ def test_run_preflight_subprocess_heavy_mutation_with_owner_approval_not_blocked
 
     assert preflight.BLOCKER_HEAVY_MUTATION_FAIL_CLOSED not in result.get("blockers", []), result
     assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED not in result.get("blockers", []), result
+    # -- end of test_run_preflight_subprocess_heavy_mutation_with_owner_approval_not_blocked_by_gate --
 
 
 def test_run_preflight_subprocess_non_heavy_mutation_not_blocked_by_gate(tmp_path):
@@ -673,3 +997,182 @@ def test_run_preflight_subprocess_non_heavy_mutation_not_blocked_by_gate(tmp_pat
 
     assert preflight.BLOCKER_HEAVY_MUTATION_FAIL_CLOSED not in result.get("blockers", []), result
     assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED not in result.get("blockers", []), result
+
+
+# ---------------------------------------------------------------------------
+# PR #1973 (OWNER REQUEST_CHANGES, P0-1 / P1-5): `known_context.anchor_reframe`
+# must reflect the FINAL routed `scope_delta_decision.status` (post-route),
+# never the pre-route status -- and the CI-visible wrapper `status`/exit code
+# must surface the multi-turn trusted-owner advisory `warn` route.
+# ---------------------------------------------------------------------------
+
+_SUBPROC_ISSUE_ANCHOR_REFRAME_ADVISORY = 99971891
+_SUBPROC_ISSUE_ANCHOR_REFRAME_APPROVED = 99981891
+# The ANCHOR_SCOPE_REFRAME_V1 schema hardcodes `target.repo` to this repo's
+# real slug (`squne121/loop-protocol`), so the "approved_by_trusted_anchor
+# survives multi-turn routing" case below must use the real repo slug, not
+# the generic `_SUBPROC_REPO` fixture placeholder used elsewhere in this file.
+_REAL_REPO_SLUG = "squne121/loop-protocol"
+
+
+def test_run_preflight_subprocess_anchor_reframe_reflects_post_route_warn_status(tmp_path):
+    """#1950 P0-1 fix_delta (test 7, advisory branch): when the multi-turn
+    route downgrades an OWNER `fail_closed` / `no_anchor_scope_reframe_v1_payload`
+    decision to `warn`, `known_context.anchor_reframe` in the planner_input.json
+    artifact must be `False` (since `warn != approved_by_trusted_anchor`) --
+    never left stale from a pre-route computation."""
+    issue_number = _SUBPROC_ISSUE_ANCHOR_REFRAME_ADVISORY
+    comment_id = 88891892
+    anchor_url = (
+        f"https://github.com/{_SUBPROC_REPO}/issues/{issue_number}#issuecomment-{comment_id}"
+    )
+    fixture = _base_fixture(issue_number)
+    fixture["issue"]["number"] = issue_number
+    fixture["anchor_comment_urls"] = [anchor_url]
+    fixture["anchor_comments"] = [
+        {
+            "id": comment_id,
+            "body": FIXTURE_869_LINES,
+            "issue_url": f"https://api.github.com/repos/{_SUBPROC_REPO}/issues/{issue_number}",
+            "author_association": "OWNER",
+            "user": {"login": "owner", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "html_url": anchor_url,
+            "url": f"https://api.github.com/repos/{_SUBPROC_REPO}/issues/comments/{comment_id}",
+        }
+    ]
+
+    result, planner_input, exit_code = _run_subprocess_fixture_with_planner_input(
+        tmp_path,
+        issue_number=issue_number,
+        repo=_SUBPROC_REPO,
+        fixture=fixture,
+        anchor_comment_url=anchor_url,
+    )
+
+    known_context = planner_input.get("known_context", {})
+    scope_delta_decision = known_context.get("scope_delta_decision", {})
+    assert scope_delta_decision.get("status") == "warn", (planner_input, result)
+    assert scope_delta_decision.get("reason") == "multi_turn_anchor_context_trusted_owner_advisory"
+    assert known_context.get("anchor_reframe") is False, planner_input
+
+    # Fix 2 (P1-5): the wrapper-level status/exit code must also surface the
+    # advisory route as `warn`/EXIT_WARN.
+    assert result.get("status") == "warn", result
+    assert exit_code == preflight.EXIT_WARN, (result, exit_code)
+
+
+def test_run_preflight_subprocess_anchor_reframe_reflects_post_route_approved_status(tmp_path):
+    """#1950 P0-1 fix_delta (test 7, approved branch): a genuine multi-turn
+    transcript authored by OWNER, carrying a VALID structured
+    ANCHOR_SCOPE_REFRAME_V1 payload, keeps `scope_delta_decision.status ==
+    "approved_by_trusted_anchor"` through the multi-turn route, so
+    `known_context.anchor_reframe` (computed post-route) must be `True`."""
+    issue_number = _SUBPROC_ISSUE_ANCHOR_REFRAME_APPROVED
+    comment_id = 88891893
+    anchor_url = (
+        f"https://github.com/{_REAL_REPO_SLUG}/issues/{issue_number}#issuecomment-{comment_id}"
+    )
+    reframe_body = FIXTURE_ADDITION_ONLY + (
+        "\n\n# You Asked\n\nFormal decision below.\n\n"
+        "```yaml\n"
+        "schema_version: ANCHOR_SCOPE_REFRAME_V1\n"
+        "target:\n"
+        f"  repo: {_REAL_REPO_SLUG}\n"
+        f"  issue_number: {issue_number}\n"
+        "decision: approve_scope_delta\n"
+        "allowed_path_deltas:\n"
+        "  - scripts/example.py\n"
+        "rationale: Formal owner approval of the scope delta.\n"
+        "required_rerun:\n"
+        "  - refinement_preflight\n"
+        "```\n"
+    )
+
+    fixture = _base_fixture(issue_number)
+    fixture["repo"] = _REAL_REPO_SLUG
+    fixture["issue"]["number"] = issue_number
+    fixture["anchor_comment_urls"] = [anchor_url]
+    fixture["anchor_comments"] = [
+        {
+            "id": comment_id,
+            "body": reframe_body,
+            "issue_url": f"https://api.github.com/repos/{_REAL_REPO_SLUG}/issues/{issue_number}",
+            "author_association": "OWNER",
+            "user": {"login": "owner", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "html_url": anchor_url,
+            "url": f"https://api.github.com/repos/{_REAL_REPO_SLUG}/issues/comments/{comment_id}",
+        }
+    ]
+
+    result, planner_input, exit_code = _run_subprocess_fixture_with_planner_input(
+        tmp_path,
+        issue_number=issue_number,
+        repo=_REAL_REPO_SLUG,
+        fixture=fixture,
+        anchor_comment_url=anchor_url,
+    )
+
+    known_context = planner_input.get("known_context", {})
+    scope_delta_decision = known_context.get("scope_delta_decision", {})
+    assert scope_delta_decision.get("status") == "approved_by_trusted_anchor", (planner_input, result)
+    assert known_context.get("anchor_reframe") is True, planner_input
+    assert "latest_owner_turn" in scope_delta_decision, scope_delta_decision
+
+
+# ---------------------------------------------------------------------------
+# PR #1973 (OWNER REQUEST_CHANGES, P1-5), test 8: `_apply_exit_code_mapping()`
+# direct-call assertion for the advisory-warn scenario.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_exit_code_mapping_warn_scope_delta_decision_produces_exit_warn():
+    """A `scope_delta_decision.status == "warn"` (set by
+    `_apply_multi_turn_candidate_route()`) must make
+    `_apply_exit_code_mapping()` return `("warn", EXIT_WARN)`, even when
+    `plan` has no unknown-confidence decisions (the pre-existing warn
+    condition)."""
+    plan_no_unknown_confidence = {
+        "decisions": {
+            "some_policy": {"confidence": "high"},
+        }
+    }
+    scope_delta_decision_warn = {
+        "status": "warn",
+        "reason": "multi_turn_anchor_context_trusted_owner_advisory",
+    }
+
+    status, exit_code = preflight._apply_exit_code_mapping(
+        planner_exit_code=0,
+        planner_fail_closed=False,
+        blockers=[],
+        plan=plan_no_unknown_confidence,
+        scope_delta_decision=scope_delta_decision_warn,
+    )
+
+    assert status == "warn"
+    assert exit_code == preflight.EXIT_WARN
+
+    # Regression: scope_delta_decision absent / not warn must not force warn.
+    status_pass, exit_code_pass = preflight._apply_exit_code_mapping(
+        planner_exit_code=0,
+        planner_fail_closed=False,
+        blockers=[],
+        plan=plan_no_unknown_confidence,
+        scope_delta_decision=None,
+    )
+    assert status_pass == "pass"
+    assert exit_code_pass == preflight.EXIT_PASS
+
+    status_pass2, exit_code_pass2 = preflight._apply_exit_code_mapping(
+        planner_exit_code=0,
+        planner_fail_closed=False,
+        blockers=[],
+        plan=plan_no_unknown_confidence,
+        scope_delta_decision={"status": "approved_by_trusted_anchor"},
+    )
+    assert status_pass2 == "pass"
+    assert exit_code_pass2 == preflight.EXIT_PASS
