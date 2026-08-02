@@ -343,6 +343,9 @@ def detect_stale_snapshot(
 
 _PATHSPEC_MAGIC_CHARS = frozenset("*?[]")
 _PATHSPEC_BROAD_ROOTS = frozenset({".", "..", ":/", "/"})
+_ROOT_SKILL_DIRECTORY_PATH = ".agents/skills"
+_ROOT_SKILL_DIRECTORY_TARGET = "../.claude/skills"
+_ROOT_SKILL_MERGE_BACKUP_PATH = _ROOT_SKILL_DIRECTORY_PATH + "~HEAD"
 
 
 def _validate_pathspec_literal(pathspec: str, cwd: str) -> Tuple[bool, Optional[str]]:
@@ -516,6 +519,35 @@ def _has_unmerged_index(cwd: str) -> bool:
     return bool(result.stdout.strip())
 
 
+def _unmerged_index_paths(cwd: str) -> Optional[set[str]]:
+    """Read every unresolved index path without lossy line parsing."""
+    result = _run_git(["ls-files", "--unmerged", "-z"], cwd)
+    if result.returncode != 0:
+        return None
+    paths: set[str] = set()
+    for entry in result.stdout.split("\0"):
+        if not entry:
+            continue
+        _metadata, separator, path = entry.partition("\t")
+        if not separator or not path:
+            return None
+        paths.add(path)
+    return paths
+
+
+def _merge_head_is_present(cwd: str) -> bool:
+    """Return whether this worktree has an explicit merge to continue."""
+    result = _run_git(["rev-parse", "--git-path", "MERGE_HEAD"], cwd)
+    if result.returncode != 0:
+        return False
+    merge_head = result.stdout.strip()
+    if not merge_head:
+        return False
+    if not os.path.isabs(merge_head):
+        merge_head = os.path.join(cwd, merge_head)
+    return os.path.exists(merge_head)
+
+
 _GITLINK_MODE = GITLINK_MODE  # backward-compat alias
 
 
@@ -541,6 +573,14 @@ def _diff_tree_raw(cwd: str, commit_sha: str) -> Tuple[bool, bytes]:
         ["diff-tree", "--no-commit-id", "-r", "--raw", "--full-index", "-z", "-M", commit_sha],
         cwd,
         binary=True,
+    )
+    return result.returncode == 0, result.stdout
+
+
+def _diff_range_raw(cwd: str, base_sha: str, head_sha: str) -> Tuple[bool, bytes]:
+    """Return the mode-aware PR delta from ``base_sha`` to ``head_sha``."""
+    result = _run_git(
+        ["diff", "--raw", "--full-index", "-z", "-M", base_sha, head_sha], cwd, binary=True
     )
     return result.returncode == 0, result.stdout
 
@@ -593,6 +633,68 @@ def _staged_matches_requested(staged_comparison_set: set, requested_set: set) ->
     directly unit-testable, independent of any particular git scenario
     that would produce a mismatched `staged_comparison_set`."""
     return staged_comparison_set == requested_set
+
+
+def _is_bounded_root_skill_directory_replacement(
+    *,
+    cwd: str,
+    requested_set: set,
+    delta_records: List[ChangedFileRecord],
+    allowed_paths: Sequence[str],
+) -> bool:
+    """Allow only the one root-directory-to-link topology transition.
+
+    Replacing a tracked directory with one tracked symlink necessarily
+    produces the root link plus removals of every previously tracked child.
+    The normal one-requested-path/one-delta-path invariant would therefore
+    reject this Git representation.  Keep the exception literal and
+    fail-closed: it is not a general directory-path or recursive staging
+    authorization.
+    """
+    if requested_set != {_ROOT_SKILL_DIRECTORY_PATH}:
+        return False
+    if _ROOT_SKILL_DIRECTORY_PATH not in allowed_paths:
+        return False
+
+    surface = os.path.join(cwd, _ROOT_SKILL_DIRECTORY_PATH)
+    try:
+        if not os.path.islink(surface) or os.readlink(surface) != _ROOT_SKILL_DIRECTORY_TARGET:
+            return False
+    except OSError:
+        return False
+
+    root_records = [record for record in delta_records if record.path == _ROOT_SKILL_DIRECTORY_PATH]
+    removed_children = [record for record in delta_records if record.path.startswith(_ROOT_SKILL_DIRECTORY_PATH + "/")]
+    if len(root_records) != 1 or len(root_records) + len(removed_children) != len(delta_records):
+        return False
+    root_record = root_records[0]
+    if root_record.new_mode != "120000" or root_record.old_mode != "000000":
+        return False
+    return all(
+        record.status == "removed"
+        and record.old_mode != "000000"
+        and record.new_mode == "000000"
+        and record.previous_path is None
+        for record in removed_children
+    )
+
+
+def _contains_bounded_root_skill_directory_replacement(
+    *, cwd: str, requested_set: set, records: List[ChangedFileRecord], allowed_paths: Sequence[str]
+) -> bool:
+    """Recognize the same root topology replacement within a larger PR delta."""
+    root_and_children = [
+        record
+        for record in records
+        if record.path == _ROOT_SKILL_DIRECTORY_PATH
+        or record.path.startswith(_ROOT_SKILL_DIRECTORY_PATH + "/")
+    ]
+    return bool(root_and_children) and _is_bounded_root_skill_directory_replacement(
+        cwd=cwd,
+        requested_set=requested_set,
+        delta_records=root_and_children,
+        allowed_paths=allowed_paths,
+    )
 
 
 def _unstage(cwd: str, pathspecs: List[str]) -> None:
@@ -770,8 +872,16 @@ def execute_controlled_change(
         for record in delta_records
     ]
 
-    # 7. Delta set must exactly equal the requested set (AC7).
-    if not _staged_matches_requested(delta_paths, requested_set):
+    # 7. Delta set must exactly equal the requested set (AC7).  A single,
+    # literal root-skill-directory replacement is the only exception: Git
+    # represents it as the root symlink plus removed legacy children.
+    bounded_root_skill_replacement = _is_bounded_root_skill_directory_replacement(
+        cwd=cwd,
+        requested_set=requested_set,
+        delta_records=delta_records,
+        allowed_paths=snapshot.allowed_paths,
+    )
+    if not _staged_matches_requested(delta_paths, requested_set) and not bounded_root_skill_replacement:
         _unstage(cwd, requested_pathspecs)
         return _denied(
             "staged_requested_mismatch",
@@ -793,7 +903,15 @@ def execute_controlled_change(
     # 9. Every delta path (current + previous, for renames) must be within
     # the snapshot's Allowed Paths (AC2/AC3/AC4).
     out_of_scope = sorted(
-        {path for path in delta_paths if not AllowedPathsMatcher.is_file_allowed(path, list(snapshot.allowed_paths))}
+        {
+            path
+            for path in delta_paths
+            if not AllowedPathsMatcher.is_file_allowed(path, list(snapshot.allowed_paths))
+            and not (
+                bounded_root_skill_replacement
+                and path.startswith(_ROOT_SKILL_DIRECTORY_PATH + "/")
+            )
+        }
     )
     if out_of_scope:
         _unstage(cwd, requested_pathspecs)
@@ -837,12 +955,26 @@ def execute_controlled_change(
             post_commit_violation = True
         else:
             commit_paths = _record_full_paths(commit_records)
-            if commit_paths != requested_set:
+            committed_bounded_root_skill_replacement = _is_bounded_root_skill_directory_replacement(
+                cwd=cwd,
+                requested_set=requested_set,
+                delta_records=commit_records,
+                allowed_paths=snapshot.allowed_paths,
+            )
+            if (
+                commit_paths != delta_paths
+                or committed_bounded_root_skill_replacement
+                != bounded_root_skill_replacement
+            ):
                 post_commit_violation = True
             else:
                 for path in commit_paths:
-                    if protected_paths_policy.is_protected_path(path) or not AllowedPathsMatcher.is_file_allowed(
-                        path, list(snapshot.allowed_paths)
+                    if protected_paths_policy.is_protected_path(path) or (
+                        not AllowedPathsMatcher.is_file_allowed(path, list(snapshot.allowed_paths))
+                        and not (
+                            committed_bounded_root_skill_replacement
+                            and path.startswith(_ROOT_SKILL_DIRECTORY_PATH + "/")
+                        )
                     ):
                         post_commit_violation = True
                         break
@@ -867,6 +999,214 @@ def execute_controlled_change(
         staged_paths=tuple(sorted(delta_paths)),
         requested_paths=tuple(sorted(requested_set)),
         classified_records=tuple(classified_records),
+    )
+
+
+def execute_controlled_merge_continue(
+    *,
+    cwd: str,
+    snapshot: IssueScopeSnapshot,
+    requested_pathspecs: List[str],
+    commit_message: str,
+    expected_head: str,
+    current_issue_body_sha256: Optional[str] = None,
+    current_comments_digest_sha256: Optional[str] = None,
+    current_allowed_paths_sha256: Optional[str] = None,
+) -> ControlledChangeResult:
+    """Resolve and continue one already-started merge through this executor.
+
+    This is deliberately separate from :func:`execute_controlled_change`:
+    the normal transaction continues to reject every in-progress operation.
+    The lane accepts only an existing ``MERGE_HEAD`` plus an unmerged index,
+    stages explicit literal paths, and audits the resulting PR delta against
+    the snapshot base before completing the merge commit.
+    """
+    if snapshot.authority_mode == AUTHORITY_NEW_DISABLED_FAIL_CLOSED:
+        return _denied("authority_new_disabled_fail_closed_add_commit_stopped")
+    if snapshot.authority_mode not in AUTHORITY_MODE_STATES:
+        return _denied("unknown_authority_mode")
+
+    stale_reason = detect_stale_snapshot(
+        snapshot,
+        current_issue_body_sha256=current_issue_body_sha256,
+        current_comments_digest_sha256=current_comments_digest_sha256,
+        current_allowed_paths_sha256=current_allowed_paths_sha256,
+    )
+    if stale_reason is not None:
+        return _denied(stale_reason)
+    if not commit_message or not commit_message.strip():
+        return _denied("commit_message_required")
+    if not expected_head:
+        return _denied("expected_head_required")
+
+    repo_root = _git_toplevel(cwd)
+    if repo_root is None:
+        return _denied("repository_binding_unavailable")
+    if os.path.realpath(repo_root) != snapshot.worktree_realpath:
+        return _denied("worktree_binding_mismatch")
+    if os.path.realpath(cwd) != os.path.realpath(repo_root) and not os.path.realpath(cwd).startswith(
+        os.path.realpath(repo_root) + os.sep
+    ):
+        return _denied("cwd_outside_worktree")
+    if _is_detached_head(cwd):
+        return _denied("detached_head_rejected")
+    if _is_unborn_branch(cwd):
+        return _denied("unborn_branch_rejected")
+    if not _merge_head_is_present(cwd):
+        return _denied("merge_continue_requires_merge_head")
+    unmerged_paths = _unmerged_index_paths(cwd)
+    if not unmerged_paths:
+        return _denied("merge_continue_requires_unmerged_index")
+
+    current_branch = _current_branch(cwd)
+    expected_branch = (
+        snapshot.branch_ref.removeprefix("refs/heads/")
+        if snapshot.branch_ref.startswith("refs/heads/")
+        else snapshot.branch_ref
+    )
+    if not current_branch or current_branch != expected_branch:
+        return _denied("branch_binding_mismatch")
+    if _current_head(cwd) != expected_head:
+        return _denied("head_race_detected")
+    if not requested_pathspecs:
+        return _denied("no_pathspecs_requested")
+
+    normalized_requested: List[str] = []
+    for pathspec in requested_pathspecs:
+        is_valid, reason = _validate_pathspec_literal(pathspec, cwd)
+        if not is_valid:
+            return _denied(reason or "pathspec_rejected", denied_paths=(pathspec,))
+        repo_relative = _pathspec_to_repo_relative(pathspec, cwd, repo_root)
+        if repo_relative is None:
+            return _denied("pathspec_outside_repository", denied_paths=(pathspec,))
+        normalized_requested.append(repo_relative)
+    requested_set = set(normalized_requested)
+
+    # The dedicated lane intentionally handles only the #1926 root
+    # directory-symlink F/D shape.  Git materializes that one conflict as a
+    # generated ``skills~HEAD`` unmerged entry; accepting any other path
+    # would turn this narrow continuation lane into a generic merge resolver.
+    if requested_set != {_ROOT_SKILL_DIRECTORY_PATH} or unmerged_paths != {_ROOT_SKILL_MERGE_BACKUP_PATH}:
+        return _denied(
+            "merge_continue_requested_path_mismatch",
+            staged_paths=tuple(sorted(unmerged_paths)),
+            requested_paths=tuple(sorted(requested_set)),
+        )
+
+    protected_requested = sorted(
+        path for path in requested_set if protected_paths_policy.is_protected_path(path)
+    )
+    if protected_requested:
+        return _denied("protected_path_denied", protected_paths_hit=tuple(protected_requested))
+    disallowed_requested = sorted(
+        path
+        for path in requested_set
+        if not AllowedPathsMatcher.is_file_allowed(path, list(snapshot.allowed_paths))
+    )
+    if disallowed_requested:
+        return _denied("path_outside_allowed_paths", denied_paths=tuple(disallowed_requested))
+    if _current_head(cwd) != expected_head:
+        return _denied("head_race_detected_before_stage")
+
+    staging_pathspecs = [*requested_pathspecs, _ROOT_SKILL_MERGE_BACKUP_PATH]
+    stdin_bytes = _pathspecs_to_nul_stdin(staging_pathspecs)
+    add_result = _run_git_stdin(
+        ["--literal-pathspecs", "add", "--pathspec-from-file=-", "--pathspec-file-nul"], cwd, stdin_bytes
+    )
+    if add_result.returncode != 0:
+        return _denied("git_add_failed", detail=add_result.stderr.decode("utf-8", errors="replace").strip())
+    if _has_unmerged_index(cwd):
+        return _denied("merge_unresolved_after_staging")
+    if _current_head(cwd) != expected_head:
+        return _denied("head_race_detected_before_commit")
+
+    index_ok, index_raw = _diff_index_raw(cwd, snapshot.base_sha)
+    if not index_ok:
+        return _denied("merge_pr_delta_audit_failed")
+    try:
+        index_records = parse_git_diff_index_raw_z(index_raw, source=SOURCE_GIT_DIFF_INDEX_RAW_Z)
+    except (UnsupportedPathEncodingError, ValueError) as exc:
+        return _denied("merge_pr_delta_parse_failed", detail=str(exc))
+    index_paths = _record_full_paths(index_records)
+    bounded_index_root_replacement = _contains_bounded_root_skill_directory_replacement(
+        cwd=cwd,
+        requested_set=requested_set,
+        records=index_records,
+        allowed_paths=snapshot.allowed_paths,
+    )
+    index_out_of_scope = sorted(
+        path
+        for path in index_paths
+        if not AllowedPathsMatcher.is_file_allowed(path, list(snapshot.allowed_paths))
+        and not (bounded_index_root_replacement and path.startswith(_ROOT_SKILL_DIRECTORY_PATH + "/"))
+    )
+    index_protected_hits = sorted(path for path in index_paths if protected_paths_policy.is_protected_path(path))
+    if index_out_of_scope or index_protected_hits or not requested_set.issubset(index_paths):
+        return _denied(
+            "merge_pr_delta_audit_denied",
+            staged_paths=tuple(sorted(index_paths)),
+            requested_paths=tuple(sorted(requested_set)),
+            denied_paths=tuple(index_out_of_scope),
+            protected_paths_hit=tuple(index_protected_hits),
+        )
+
+    commit_result = _run_git(["commit", "-m", commit_message], cwd)
+    if commit_result.returncode != 0:
+        return _denied("merge_continue_commit_failed", detail=commit_result.stderr.strip())
+    commit_sha = _current_head(cwd)
+    if commit_sha is None:
+        return _denied("commit_sha_unavailable")
+    if _merge_head_is_present(cwd) or _has_unmerged_index(cwd):
+        return _denied("merge_continue_postcondition_failed")
+
+    range_ok, range_raw = _diff_range_raw(cwd, snapshot.base_sha, commit_sha)
+    if not range_ok:
+        return _denied("merge_pr_delta_audit_failed")
+    try:
+        range_records = parse_git_diff_index_raw_z(range_raw, source=SOURCE_GIT_DIFF_INDEX_RAW_Z)
+    except (UnsupportedPathEncodingError, ValueError) as exc:
+        return _denied("merge_pr_delta_parse_failed", detail=str(exc))
+    range_paths = _record_full_paths(range_records)
+    bounded_root_replacement = _contains_bounded_root_skill_directory_replacement(
+        cwd=cwd,
+        requested_set=requested_set,
+        records=range_records,
+        allowed_paths=snapshot.allowed_paths,
+    )
+    out_of_scope = sorted(
+        path
+        for path in range_paths
+        if not AllowedPathsMatcher.is_file_allowed(path, list(snapshot.allowed_paths))
+        and not (bounded_root_replacement and path.startswith(_ROOT_SKILL_DIRECTORY_PATH + "/"))
+    )
+    protected_hits = sorted(path for path in range_paths if protected_paths_policy.is_protected_path(path))
+    if out_of_scope or protected_hits or not requested_set.issubset(range_paths):
+        return _denied(
+            "merge_pr_delta_audit_denied",
+            staged_paths=tuple(sorted(range_paths)),
+            requested_paths=tuple(sorted(requested_set)),
+            denied_paths=tuple(out_of_scope),
+            protected_paths_hit=tuple(protected_hits),
+        )
+    return ControlledChangeResult(
+        status="committed",
+        reason_code="merge_continued",
+        commit_sha=commit_sha,
+        staged_paths=tuple(sorted(range_paths)),
+        requested_paths=tuple(sorted(requested_set)),
+        classified_records=tuple(
+            {
+                "path": record.path,
+                "previous_path": record.previous_path,
+                "git_status": record.status,
+                "old_mode": record.old_mode,
+                "new_mode": record.new_mode,
+                "old_oid": record.old_oid,
+                "new_oid": record.new_oid,
+                "is_submodule_gitlink_change": record.is_submodule_gitlink_change,
+            }
+            for record in range_records
+        ),
     )
 
 
@@ -1073,6 +1413,11 @@ def _build_cli_parser():
     parser.add_argument("--message", default=None, help="commit message")
     parser.add_argument("--message-file", default=None, help="path to a file containing the commit message")
     parser.add_argument("--expected-head", required=True, help="expected local HEAD SHA (race guard, required)")
+    parser.add_argument(
+        "--merge-continue",
+        action="store_true",
+        help="continue only an already-started, unresolved merge through the dedicated controlled lane",
+    )
     return parser
 
 
@@ -1134,7 +1479,8 @@ def _main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps({"status": "denied", "reason_code": f"materialize_request_failed: {exc}"}))
         return 1
 
-    result = execute_controlled_change(
+    executor = execute_controlled_merge_continue if args.merge_continue else execute_controlled_change
+    result = executor(
         cwd=args.cwd,
         snapshot=snapshot,
         requested_pathspecs=args.paths,
