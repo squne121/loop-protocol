@@ -679,6 +679,24 @@ def _is_bounded_root_skill_directory_replacement(
     )
 
 
+def _contains_bounded_root_skill_directory_replacement(
+    *, cwd: str, requested_set: set, records: List[ChangedFileRecord], allowed_paths: Sequence[str]
+) -> bool:
+    """Recognize the same root topology replacement within a larger PR delta."""
+    root_and_children = [
+        record
+        for record in records
+        if record.path == _ROOT_SKILL_DIRECTORY_PATH
+        or record.path.startswith(_ROOT_SKILL_DIRECTORY_PATH + "/")
+    ]
+    return bool(root_and_children) and _is_bounded_root_skill_directory_replacement(
+        cwd=cwd,
+        requested_set=requested_set,
+        delta_records=root_and_children,
+        allowed_paths=allowed_paths,
+    )
+
+
 def _unstage(cwd: str, pathspecs: List[str]) -> None:
     if not pathspecs:
         return
@@ -1110,10 +1128,10 @@ def execute_controlled_merge_continue(
     except (UnsupportedPathEncodingError, ValueError) as exc:
         return _denied("merge_pr_delta_parse_failed", detail=str(exc))
     index_paths = _record_full_paths(index_records)
-    bounded_index_root_replacement = _is_bounded_root_skill_directory_replacement(
+    bounded_index_root_replacement = _contains_bounded_root_skill_directory_replacement(
         cwd=cwd,
         requested_set=requested_set,
-        delta_records=index_records,
+        records=index_records,
         allowed_paths=snapshot.allowed_paths,
     )
     index_out_of_scope = sorted(
@@ -1149,10 +1167,10 @@ def execute_controlled_merge_continue(
     except (UnsupportedPathEncodingError, ValueError) as exc:
         return _denied("merge_pr_delta_parse_failed", detail=str(exc))
     range_paths = _record_full_paths(range_records)
-    bounded_root_replacement = _is_bounded_root_skill_directory_replacement(
+    bounded_root_replacement = _contains_bounded_root_skill_directory_replacement(
         cwd=cwd,
         requested_set=requested_set,
-        delta_records=range_records,
+        records=range_records,
         allowed_paths=snapshot.allowed_paths,
     )
     out_of_scope = sorted(
