@@ -362,6 +362,115 @@ class TestStatusLevels:
         # test_critical_surface_not_tracked_gives_blocked above
         assert True  # sentinel
 
+    def test_critical_surface_resolves_via_agents_skills_symlink(self, tmp_path):
+        """GIVEN .agents/skills symlink WHEN contract surface is under it THEN status is ok."""
+        repo_root = self._make_git_repo(tmp_path)
+
+        claude_skill_root = repo_root / ".claude" / "skills"
+        claude_skill_root.mkdir(parents=True, exist_ok=True)
+        skill_root = claude_skill_root / "test-agent"
+        skill_root.mkdir(parents=True, exist_ok=True)
+        (skill_root / "SKILL.md").write_text("# test agent skill")
+
+        agents_root = repo_root / ".agents" / "skills"
+        agents_root.parent.mkdir(parents=True, exist_ok=True)
+        agents_root.symlink_to(claude_skill_root, target_is_directory=True)
+
+        critical_surface = ".agents/skills/test-agent/SKILL.md"
+        self._make_fake_contract(repo_root, [critical_surface])
+
+        settings = repo_root / ".claude" / "settings.json"
+        settings.write_text("{}")
+        subprocess.run(
+            [
+                "git", "add", ".agents/skills",
+                "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+                ".claude/settings.json", ".claude/skills/test-agent/SKILL.md",
+            ],
+            cwd=str(repo_root), check=True, capture_output=True,
+        )
+
+        tracked = self._get_tracked(repo_root)
+        inventory = build_agent_ops_inventory(repo_root, tracked)
+
+        assert inventory["status"] == "ok", (
+            f"Expected STATUS: ok with .agents/skills symlinked from .claude/skills, got {inventory['status']!r}"
+        )
+        items = {item["path"]: item for item in inventory["items"]}
+        assert critical_surface in items, (
+            f"Expected critical surface {critical_surface!r} to be represented in inventory items"
+        )
+        assert items[critical_surface]["tracked"] is True
+
+    def test_critical_surface_rejected_when_agents_skills_symlink_escapes(self, tmp_path):
+        """GIVEN .agents/skills symlink outside repo WHEN critical surface is under it THEN blocked."""
+        repo_root = self._make_git_repo(tmp_path / "repo")
+
+        outside_root = tmp_path / "outside"
+        outside_skill_root = outside_root / "skills"
+        outside_skill_root.mkdir(parents=True, exist_ok=True)
+        outside_skill = outside_skill_root / "attack-agent"
+        outside_skill.mkdir(parents=True, exist_ok=True)
+        (outside_skill / "SKILL.md").write_text("# outside agent skill")
+
+        agents_root = repo_root / ".agents" / "skills"
+        agents_root.parent.mkdir(parents=True, exist_ok=True)
+        agents_root.symlink_to(outside_skill_root, target_is_directory=True)
+
+        critical_surface = ".agents/skills/attack-agent/SKILL.md"
+        self._make_fake_contract(repo_root, [critical_surface])
+
+        settings = repo_root / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text("{}")
+        subprocess.run(
+            [
+                "git", "add", ".agents/skills",
+                "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+                ".claude/settings.json",
+            ],
+            cwd=str(repo_root), check=True, capture_output=True,
+        )
+
+        # Even if callers provide the contract surface as tracked explicitly,
+        # unsafe symlink-backed surfaces should still be blocked.
+        tracked = self._get_tracked(repo_root) + [critical_surface]
+        inventory = build_agent_ops_inventory(repo_root, tracked)
+        assert inventory["status"] == "blocked", (
+            f"Expected STATUS: blocked for symlink-escape .agents/skills root, got {inventory['status']!r}"
+        )
+
+    def test_critical_surface_rejected_when_agents_skills_symlink_is_not_canonical(self, tmp_path):
+        """GIVEN an in-repo noncanonical root symlink THEN critical surfaces are blocked."""
+        repo_root = self._make_git_repo(tmp_path)
+
+        alternate_root = repo_root / ".claude" / "alternate-skills"
+        alternate_root.mkdir(parents=True, exist_ok=True)
+        alternate_skill = alternate_root / "test-agent"
+        alternate_skill.mkdir(parents=True, exist_ok=True)
+        (alternate_skill / "SKILL.md").write_text("# alternate agent skill")
+
+        agents_root = repo_root / ".agents" / "skills"
+        agents_root.parent.mkdir(parents=True, exist_ok=True)
+        agents_root.symlink_to(alternate_root, target_is_directory=True)
+
+        critical_surface = ".agents/skills/test-agent/SKILL.md"
+        self._make_fake_contract(repo_root, [critical_surface])
+        settings = repo_root / ".claude" / "settings.json"
+        settings.write_text("{}")
+        subprocess.run(
+            [
+                "git", "add", ".agents/skills",
+                "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+                ".claude/settings.json", ".claude/alternate-skills/test-agent/SKILL.md",
+            ],
+            cwd=str(repo_root), check=True, capture_output=True,
+        )
+
+        tracked = self._get_tracked(repo_root) + [critical_surface]
+        inventory = build_agent_ops_inventory(repo_root, tracked)
+        assert inventory["status"] == "blocked"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # AC5: stdout compliance
@@ -492,15 +601,17 @@ class TestArtifactSecurity:
             )
 
     def test_artifact_all_paths_are_tracked(self):
-        """GIVEN inventory items WHEN tracked field inspected THEN all are from git ls-files."""
+        """GIVEN inventory items WHEN tracked field inspected THEN root-symlink descendants are accepted."""
         tracked = get_tracked_paths_decoded(REPO_ROOT)
         tracked_set = set(tracked)
         inventory = build_agent_ops_inventory(REPO_ROOT, tracked)
         for item in inventory["items"]:
             if item["tracked"]:
-                assert item["path"] in tracked_set, (
-                    f"Item marked tracked but not in git ls-files: {item['path']!r}"
-                )
+                assert item["path"] in tracked_set or (
+                    item["path"].startswith(".agents/skills/")
+                    and ".agents/skills" in tracked_set
+                    and (REPO_ROOT / ".agents" / "skills").is_symlink()
+                ), f"Item marked tracked without a tracked root bridge: {item['path']!r}"
 
     def test_artifact_0600_permissions(self):
         """GIVEN write_artifact called WHEN permissions inspected THEN 0600."""
@@ -646,16 +757,17 @@ class TestArtifactSecurity:
 class TestAgentSkilllContractSync:
     def test_contract_surfaces_match_agents_skills_dir(self):
         """GIVEN expected-runtime-contract.json WHEN repo_local_skill_surfaces inspected
-        THEN all surfaces start with .agents/skills/ and are tracked in git."""
+        THEN all surfaces start with .agents/skills/ and resolve through the tracked root bridge."""
         surfaces = load_critical_surfaces_from_contract(REPO_ROOT)
         tracked = set(get_tracked_paths_decoded(REPO_ROOT))
         for surface in surfaces:
             assert surface.startswith(".agents/skills/"), (
                 f"Contract surface not under .agents/skills/: {surface!r}"
             )
-            assert surface in tracked, (
-                f"Contract surface not tracked in git: {surface!r}"
-            )
+            assert surface in tracked or (
+                ".agents/skills" in tracked
+                and (REPO_ROOT / ".agents" / "skills").is_symlink()
+            ), f"Contract surface is not covered by the tracked root bridge: {surface!r}"
 
     def test_inventory_critical_surfaces_match_contract(self):
         """GIVEN inventory WHEN critical_surfaces field inspected THEN matches contract surfaces."""

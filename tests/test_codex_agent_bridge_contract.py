@@ -18,6 +18,8 @@ assert spec and spec.loader
 spec.loader.exec_module(module)
 
 
+ROOT_SKILL_DIRECTORY_TARGET = "../.claude/skills"
+
 FIXTURE_PATHS = [
     ".agents/skills",
     ".claude/agents",
@@ -32,102 +34,47 @@ FIXTURE_PATHS = [
 ]
 
 
-def _bridge_text(target: str, extra: str = "") -> str:
-    return f"""---
-name: sample
-description: sample
----
-
-# Sample
-
-This file is a derived/non-canonical thin wrapper for the Codex repo-local discovery surface.
-Before executing this skill, read the canonical body at `{target}`.
-Do not treat this wrapper as the workflow procedure body.
-{extra}"""
+def _replace_root_skill_link(repo: Path, target: str) -> None:
+    surface = repo / ".agents/skills"
+    surface.unlink()
+    os.symlink(target, surface, target_is_directory=True)
 
 
-def test_missing_marker_detected(tmp_path: Path):
-    surface = tmp_path / ".agents/skills/create-issue/SKILL.md"
-    canonical = tmp_path / ".claude/skills/create-issue/SKILL.md"
-    canonical.parent.mkdir(parents=True)
-    canonical.write_text("ok", encoding="utf-8")
-    surface.parent.mkdir(parents=True)
-    text = _bridge_text("../../../.claude/skills/create-issue/SKILL.md").replace(
-        "derived/non-canonical ", ""
-    )
-    surface.write_text(text, encoding="utf-8")
-    failures = module.validate_bridge_surface(surface)
-    assert any("derived/non-canonical marker required" in failure for failure in failures)
+def test_root_skill_directory_symlink_contract_passes(tmp_path: Path):
+    repo = _copy_fixture_repo(tmp_path)
+
+    surface = repo / ".agents/skills"
+    assert surface.is_symlink()
+    assert os.readlink(surface) == ROOT_SKILL_DIRECTORY_TARGET
+    assert surface.resolve() == (repo / ".claude/skills").resolve()
+    assert module.validate_root_skill_directory_symlink(repo) == []
 
 
-def test_missing_imperative_detected(tmp_path: Path):
-    surface = tmp_path / ".agents/skills/create-issue/SKILL.md"
-    canonical = tmp_path / ".claude/skills/create-issue/SKILL.md"
-    canonical.parent.mkdir(parents=True)
-    canonical.write_text("ok", encoding="utf-8")
-    surface.parent.mkdir(parents=True)
-    text = _bridge_text("../../../.claude/skills/create-issue/SKILL.md").replace(
-        "Before executing this skill, read the canonical body at", "Read"
-    )
-    surface.write_text(text, encoding="utf-8")
-    assert any("exact imperative required" in failure for failure in module.validate_bridge_surface(surface))
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        ("regular_directory", "must be a root skill-directory symlink"),
+        ("../.claude/skills/issue-refinement-loop/SKILL.md", "target must be '../.claude/skills'"),
+        ("/tmp/agent-skills", "target must be '../.claude/skills'"),
+        ("../../outside", "target must be '../.claude/skills'"),
+        ("../.claude/missing-skills", "target must be '../.claude/skills'"),
+        ("../.claude/agents", "target must be '../.claude/skills'"),
+    ],
+)
+def test_root_skill_directory_symlink_rejects_invalid_topologies(
+    tmp_path: Path, target: str, expected: str
+):
+    repo = _copy_fixture_repo(tmp_path)
+    surface = repo / ".agents/skills"
+    surface.unlink()
+    if target == "regular_directory":
+        surface.mkdir()
+    else:
+        os.symlink(target, surface, target_is_directory=True)
 
+    failures = module.validate_root_skill_directory_symlink(repo)
 
-def test_wrong_target_detected(tmp_path: Path):
-    surface = tmp_path / ".agents/skills/create-issue/SKILL.md"
-    surface.parent.mkdir(parents=True)
-    surface.write_text(_bridge_text("../../../.claude/skills/edit-issue/SKILL.md"), encoding="utf-8")
-    assert any("wrong skill target" in failure for failure in module.validate_bridge_surface(surface))
-
-
-def test_target_missing_detected(tmp_path: Path):
-    surface = tmp_path / ".agents/skills/create-issue/SKILL.md"
-    surface.parent.mkdir(parents=True)
-    surface.write_text(_bridge_text("../../../.claude/skills/create-issue/SKILL.md"), encoding="utf-8")
-    assert any("canonical skill body target missing" in failure for failure in module.validate_bridge_surface(surface))
-
-
-def test_stale_procedure_body_detected(tmp_path: Path):
-    surface = tmp_path / ".agents/skills/create-issue/SKILL.md"
-    canonical = tmp_path / ".claude/skills/create-issue/SKILL.md"
-    canonical.parent.mkdir(parents=True)
-    canonical.write_text("ok", encoding="utf-8")
-    surface.parent.mkdir(parents=True)
-    text = _bridge_text(
-        "../../../.claude/skills/create-issue/SKILL.md", extra="\n## Procedure\n- step\n"
-    )
-    surface.write_text(text, encoding="utf-8")
-    failures = module.validate_bridge_surface(surface)
-    assert any("stale procedure body detected" in failure for failure in failures)
-
-
-def test_body_bloat_detected(tmp_path: Path):
-    surface = tmp_path / ".agents/skills/create-issue/SKILL.md"
-    canonical = tmp_path / ".claude/skills/create-issue/SKILL.md"
-    canonical.parent.mkdir(parents=True)
-    canonical.write_text("ok", encoding="utf-8")
-    surface.parent.mkdir(parents=True)
-    text = _bridge_text(
-        "../../../.claude/skills/create-issue/SKILL.md", extra="\nExtra line.\n"
-    )
-    surface.write_text(text, encoding="utf-8")
-    failures = module.validate_bridge_surface(surface)
-    assert any("body bloat detected" in failure for failure in failures)
-
-
-def test_duplicate_target_detected(tmp_path: Path):
-    canonical = tmp_path / ".claude/skills/create-issue/SKILL.md"
-    canonical.parent.mkdir(parents=True)
-    canonical.write_text("ok", encoding="utf-8")
-    first = tmp_path / ".agents/skills/create-issue/SKILL.md"
-    second = tmp_path / ".agents/skills/edit-issue/SKILL.md"
-    first.parent.mkdir(parents=True)
-    second.parent.mkdir(parents=True)
-    target = "../../../.claude/skills/create-issue/SKILL.md"
-    first.write_text(_bridge_text(target), encoding="utf-8")
-    second.write_text(_bridge_text(target), encoding="utf-8")
-    duplicates = module.find_duplicate_canonical_targets([first, second])
-    assert any("duplicate canonical target" in failure for failure in duplicates)
+    assert any(expected in failure for failure in failures)
 
 
 def test_negative_guard_text_present():
@@ -218,7 +165,10 @@ def _copy_fixture_repo(tmp_path: Path) -> Path:
     for rel_path in FIXTURE_PATHS:
         src = REPO_ROOT / rel_path
         dst = repo / rel_path
-        if src.is_dir():
+        if src.is_symlink():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(os.readlink(src), dst, target_is_directory=True)
+        elif src.is_dir():
             shutil.copytree(src, dst, dirs_exist_ok=True)
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -235,6 +185,8 @@ def _copy_fixture_repo(tmp_path: Path) -> Path:
         + "\n## 出力契約（ISSUE_AUTHOR_RESULT_COMPACT_V1）\n\nfixture parity marker.\n",
         encoding="utf-8",
     )
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "add", ".agents/skills"], cwd=repo, check=True)
     return repo
 
 
@@ -277,13 +229,14 @@ def test_python_cli_passes_on_fixture_repo(tmp_path: Path):
     assert "OK: Codex agent contract validation passed" in result.stdout
 
 
-def test_python_bridge_validator_detects_missing_marker_in_fixture(tmp_path: Path):
+def test_python_cli_detects_wrong_root_skill_target_via_subprocess(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
-    bridge = repo / ".agents/skills/create-issue/SKILL.md"
-    bridge.write_text(bridge.read_text(encoding="utf-8").replace("derived/non-canonical ", ""), encoding="utf-8")
+    _replace_root_skill_link(repo, "../.claude/agents")
 
-    failures = module.validate_bridge_surface(bridge)
-    assert any("derived/non-canonical marker required" in failure for failure in failures)
+    result = _run_python_validator(repo)
+
+    assert result.returncode == 1
+    assert "root skill-directory symlink target must be '../.claude/skills'" in result.stdout
 
 
 def test_python_cli_detects_route_surface_mismatch_via_subprocess(tmp_path: Path):
@@ -401,29 +354,23 @@ def test_js_cli_passes_on_fixture_repo(tmp_path: Path):
     assert "ok 14 agents validated" in result.stdout
 
 
-def test_js_cli_detects_missing_marker_via_subprocess(tmp_path: Path):
+def test_js_cli_detects_regular_directory_skill_surface_via_subprocess(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
-    bridge = repo / ".agents/skills/create-issue/SKILL.md"
-    bridge.write_text(bridge.read_text(encoding="utf-8").replace("derived/non-canonical ", ""), encoding="utf-8")
+    surface = repo / ".agents/skills"
+    surface.unlink()
+    surface.mkdir()
 
     result = _run_js_validator(repo)
 
     assert result.returncode == 1
-    assert "derived/non-canonical marker required" in result.stdout + result.stderr
+    assert "must be a root skill-directory symlink" in result.stdout + result.stderr
 
 
-def test_js_cli_detects_duplicate_canonical_target_via_subprocess(tmp_path: Path):
+def test_js_cli_detects_broken_root_skill_target_via_subprocess(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
-    second_bridge = repo / ".agents/skills/edit-issue/SKILL.md"
-    second_bridge.write_text(
-        second_bridge.read_text(encoding="utf-8").replace(
-            "../../../.claude/skills/edit-issue/SKILL.md",
-            "../../../.claude/skills/create-issue/SKILL.md",
-        ),
-        encoding="utf-8",
-    )
+    _replace_root_skill_link(repo, "../.claude/missing-skills")
 
     result = _run_js_validator(repo)
 
     assert result.returncode == 1
-    assert "duplicate canonical target:" in result.stdout + result.stderr
+    assert "root skill-directory symlink target is broken" in result.stdout + result.stderr
