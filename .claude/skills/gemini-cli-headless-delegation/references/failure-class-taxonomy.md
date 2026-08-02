@@ -105,7 +105,7 @@ stdout / stderr の両方から判別する failure_class。`_normalize_agy_resu
 | `agy_unexpected_error` | AGY 実行時の未分類例外（terminal / non-retryable） | no |
 | `agy_invocation_policy_denied` | agy 実行用 argv が位置ベースの構造 allowlist （`_validate_agy_invocation_argv()`、Issue #1807）に違反（`--dangerously-skip-permissions` 等の permission-bypass flag を含む未知の trailing option 混入等）。`agy_permission_denied`（AGY 側/OS レベルの権限拒否）とは異なり、wrapper 側が `subprocess.run()` 呼び出し前にfail-closed で拒否したことを示す。retryable: false | no |
 
-### AGY permission-boundary runner failure classes（Issue #1814）
+### AGY permission-boundary runner failure classes（実行時の失敗分類、Issue #1814）
 
 この二つは provider fallback の入力ではない。専用 runner は fallback provider を
 起動せず、pytest skip やモデルの自己申告でこれらを成功へ置換しない。
