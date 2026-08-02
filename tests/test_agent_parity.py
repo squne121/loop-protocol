@@ -4,23 +4,50 @@ Covers:
 - AC1: compact schema drift detection
 - AC2: mutation permission boundary diff
 - AC3: model/reasoning_effort as config declaration (not runtime proof)
-- AC4: nested delegation prohibition detection
+- AC4: nested delegation is advisory-only (delegation_intent_hint); no
+  NESTED_DELEGATION_001 drift is generated (PR #1879, af511e17)
 - AC5: STATUS: warn / fail on drift
 - AC7: artifact-only schema does not cause compact schema parity fail
 - AC8: DECLARED_PERMISSION / MUTATION_BOUNDARY / RUNTIME_PROOF_NOTE 3-layer report
-- AC9: Claude nested delegation from disallowedTools; Codex from max_depth
+- AC9: Claude nested delegation from disallowedTools (still strict, bool | None);
+  Codex delegation_intent_hint derived from developer_instructions prose
+  (advisory only, not from max_depth)
 - AC10: drift evidence contains rule_id / file:line / launcher / agent / expected / actual
 - AC11: STATUS:warn exit code default 0, --strict exit 1
+
+Advisory-only delegation semantics (Issue #1948, following PR #1879 af511e17):
+- TestAdvisoryDelegationSemantics fixes delegation_intent_hint (blocked | allowed |
+  unknown) as an advisory-only heuristic that never generates NESTED_DELEGATION_001
+  drift and never changes STATUS / exit code.
 
 fix_delta regression tests (B1-B8):
 - B1: Codex final schema that matches Claude artifact-only schema is still drift (fail)
 - B2: artifact-only schema extraction handles heading pattern 'SCHEMA（artifact のみ）'
-- B3: schema/permission/delegation drift produces STATUS:fail (not warn)
+- B3: schema/permission drift produces STATUS:fail (not warn); delegation intent hint
+  mismatch alone remains STATUS:ok (advisory-only, superseded by PR #1879 af511e17)
 - B4: real repo parity produces no unexpected blocker drift
 - B5: Claude nested delegation is blocked when Agent absent from explicit tools allowlist
-- B6: Codex delegation keywords in developer_instructions produce NESTED_DELEGATION_001
+- B6: (superseded by PR #1879 af511e17) Codex delegation keywords in
+  developer_instructions no longer produce NESTED_DELEGATION_001; they only feed
+  the advisory delegation_intent_hint via classify_delegation_intent_hint()
 - B7: DECLARED_PERMISSION includes claude.tools and claude.disallowedTools
 - B8: find_line_number returns 0 for empty/None search
+
+Issue #1948 fix_delta (PR #1959 REQUEST_CHANGES review, 2026-08):
+- item 1 (AC2): the delegation_intent_hint mismatch itself is now asserted
+  explicitly (claude_intent_hint != codex_intent_hint) before no-drift/STATUS
+  assertions.
+- item 2 (AC3): TestNestedDelegation.test_nested_delegation_report_fields
+  iterates over every nested_delegation_report element, not just the first,
+  and asserts old-key absence explicitly.
+- item 3: TestV1V2ConfigSeparation isolates legacy V1 .codex/config.toml
+  ([agents].max_depth) fixtures away from the default V2
+  ([features.multi_agent_v2]) fixture used by _run_cli.
+- item 4: stale drift-era vocabulary in test/fixture names has been renamed
+  to describe the actual (advisory) behavior; see individual test docstrings
+  for the historical name each renamed test supersedes.
+- item 6: delegation-advisory phrasing is scoped specifically to
+  delegation_intent_hint mismatches, not to delegation checks in general.
 """
 
 from __future__ import annotations
@@ -143,10 +170,46 @@ def _write_codex_toml(
     full = header + 'developer_instructions = """\n' + instructions_body + '"""\n'
     path.write_text(full, encoding="utf-8")
 
-def _write_config_toml(tmp_path: Path, max_depth: int = 1) -> Path:
+def _write_v1_config_toml(tmp_path: Path, max_depth: int = 1) -> Path:
+    """Legacy V1 .codex/config.toml with [agents].max_depth.
+
+    Issue #1948 fix_delta item 3: this legacy shape is isolated to a
+    dedicated regression test (test_v1_max_depth_does_not_define_v2_delegation_state)
+    and must NOT be used as the default fixture for ordinary tests, because
+    the real repository config is V2 ([features.multi_agent_v2]). Per the
+    pinned Codex CLI 0.146.0 implementation, max_depth is V1-only and is
+    ignored under V2.
+    """
     config = tmp_path / ".codex" / "config.toml"
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text(f"[agents]\nmax_depth = {max_depth}\n", encoding="utf-8")
+    return config
+
+
+def _write_v2_config_toml(
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    max_concurrent_threads_per_session: int = 4,
+    max_depth: int | None = None,
+) -> Path:
+    """V2 .codex/config.toml with [features.multi_agent_v2] (default fixture).
+
+    Matches the real repository config shape (Issue #1948 fix_delta item 3).
+    When ``max_depth`` is provided, a legacy [agents] table is also written
+    alongside the V2 block so tests can assert that V2 does not treat
+    max_depth as delegation authority.
+    """
+    config = tmp_path / ".codex" / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    body = (
+        "[features.multi_agent_v2]\n"
+        f"enabled = {'true' if enabled else 'false'}\n"
+        f"max_concurrent_threads_per_session = {max_concurrent_threads_per_session}\n"
+    )
+    if max_depth is not None:
+        body += f"\n[agents]\nmax_depth = {max_depth}\n"
+    config.write_text(body, encoding="utf-8")
     return config
 
 
@@ -185,10 +248,15 @@ def _run_cli(
     output_schema_codex: str = "ISSUE_REVIEW_RESULT_COMPACT_V1",
     agent_name: str = "issue-reviewer",
     extra_args: list[str] | None = None,
-    max_depth: int = 1,
     codex_permissions: str = "loop-protocol-readonly",
 ) -> subprocess.CompletedProcess[str]:
-    """Write fixture files and run the parity script via subprocess."""
+    """Write fixture files and run the parity script via subprocess.
+
+    Issue #1948 fix_delta item 3: uses the V2 config.toml fixture
+    (_write_v2_config_toml) by default, matching the real repository config.
+    Legacy V1 max_depth behavior is exercised only by the dedicated
+    regression tests in TestV1V2ConfigSeparation, not through this helper.
+    """
     claude_dir = tmp_path / ".claude" / "agents"
     claude_dir.mkdir(parents=True, exist_ok=True)
     (claude_dir / f"{agent_name}.md").write_text(claude_md, encoding="utf-8")
@@ -202,7 +270,7 @@ def _run_cli(
         output_schema=output_schema_codex,
     )
 
-    config = _write_config_toml(tmp_path, max_depth=max_depth)
+    config = _write_v2_config_toml(tmp_path)
     _write_minimal_contract(tmp_path, agent_name)
 
     expectation_file = tmp_path / "tests" / "fixtures" / "codex-agent-config" / "expected-runtime-contract.json"
@@ -410,27 +478,46 @@ class TestModelDeclaration:
 # ---------------------------------------------------------------------------
 
 class TestNestedDelegation:
-    def test_delegation_blocked_both_no_drift(self, tmp_path: Path):
-        """AC4: both block nested delegation -> no drift."""
+    def test_delegation_never_produces_drift_advisory_only(self, tmp_path: Path):
+        """AC4 (advisory-only, PR #1879 af511e17): even when Claude and Codex
+        both structurally block delegation, NESTED_DELEGATION_001 is never
+        generated. Narrow scope (Issue #1948 fix_delta item 6): this applies
+        specifically to delegation_intent_hint mismatches, not to delegation
+        checks in general."""
         result = _run_cli(
             tmp_path,
             _claude_md(disallowed_tools=["Agent", "Edit"]),
-            max_depth=1,
         )
         data = json.loads(result.stdout)
         deleg_drifts = [d for d in data["drift"] if d["rule_id"] == "NESTED_DELEGATION_001"]
         assert deleg_drifts == []
 
-    def test_delegation_mismatch_produces_drift(self, tmp_path: Path):
-        """AC4: Claude allows Agent while Codex blocks -> drift."""
+    def test_prose_intent_hint_mismatch_is_advisory(self, tmp_path: Path):
+        """(renamed from test_delegation_mismatch_produces_drift, Issue #1948
+        fix_delta item 4/1) AC4: Claude allows Agent while Codex's
+        delegation_intent_hint differs -> the mismatch is fixed explicitly
+        (claude_intent_hint != codex_intent_hint) and must still not produce
+        NESTED_DELEGATION_001 drift; the mismatch is only visible in
+        nested_delegation_report."""
         result = _run_cli(
             tmp_path,
             _claude_md(tools=["Bash", "Read", "Agent"], disallowed_tools=["Edit"]),
-            max_depth=1,
         )
         data = json.loads(result.stdout)
+        entry = next(
+            d for d in data["nested_delegation_report"] if d["agent"] == "issue-reviewer"
+        )
+        # Fix the actual hint mismatch before asserting no-drift (Issue #1948
+        # fix_delta item 1).
+        assert entry["claude_intent_hint"] == "allowed"
+        assert entry["codex_intent_hint"] == "unknown"
+        assert entry["claude_intent_hint"] != entry["codex_intent_hint"]
+
         deleg_drifts = [d for d in data["drift"] if d["rule_id"] == "NESTED_DELEGATION_001"]
-        assert len(deleg_drifts) == 1
+        assert deleg_drifts == [], (
+            f"delegation_intent_hint is advisory-only and must never produce "
+            f"NESTED_DELEGATION_001 drift, got: {deleg_drifts}"
+        )
 
     def test_claude_delegation_from_disallowed_tools(self, tmp_path: Path):
         """AC9: Claude nested delegation prohibition determined from disallowedTools."""
@@ -441,25 +528,13 @@ class TestNestedDelegation:
         assert facts.nested_delegation_blocked is True
         assert "Agent" in facts.nested_delegation_evidence or "disallowedTools" in facts.nested_delegation_evidence
 
-    def test_codex_delegation_from_max_depth(self, tmp_path: Path):
-        """AC9: Codex nested delegation prohibition determined from .codex/config.toml max_depth."""
-        config = _write_config_toml(tmp_path, max_depth=1)
-        old_config = MOD.CODEX_CONFIG_PATH
-        MOD.CODEX_CONFIG_PATH = config
-        try:
-            codex_path = tmp_path / "issue-reviewer.toml"
-            _write_codex_toml(codex_path)
-            with codex_path.open("rb") as f:
-                import tomllib
-                codex_doc = tomllib.load(f)
-            facts = MOD.extract_codex_facts("issue-reviewer", codex_path, codex_doc)
-            assert facts.nested_delegation_blocked is True
-            assert "max_depth" in facts.nested_delegation_evidence
-        finally:
-            MOD.CODEX_CONFIG_PATH = old_config
-
     def test_delegation_report_in_output(self, tmp_path: Path):
-        """AC4: nested_delegation_report is present in JSON output."""
+        """AC4 (advisory-only, PR #1879 af511e17): nested_delegation_report is
+        present in JSON output with agent / claude_intent_hint / claude_evidence /
+        codex_intent_hint / codex_evidence fields. The old claude_blocked /
+        codex_blocked / match fields must not have reappeared -- asserted
+        explicitly (Issue #1948 fix_delta item 2), not merely implied by the
+        presence check of the new keys."""
         result = _run_cli(
             tmp_path,
             _claude_md(disallowed_tools=["Agent", "Edit"]),
@@ -469,9 +544,90 @@ class TestNestedDelegation:
         dr = data["nested_delegation_report"]
         assert len(dr) >= 1
         entry = dr[0]
-        assert "claude_blocked" in entry
-        assert "codex_blocked" in entry
-        assert "match" in entry
+        assert "agent" in entry
+        assert "claude_intent_hint" in entry
+        assert "claude_evidence" in entry
+        assert "codex_intent_hint" in entry
+        assert "codex_evidence" in entry
+        assert "claude_blocked" not in entry, (
+            "old claude_blocked field must not have reappeared"
+        )
+        assert "codex_blocked" not in entry, (
+            "old codex_blocked field must not have reappeared"
+        )
+        assert "match" not in entry, "old match field must not have reappeared"
+
+
+# ---------------------------------------------------------------------------
+# V1 vs V2 .codex/config.toml fixture separation (Issue #1948 fix_delta item 3)
+# ---------------------------------------------------------------------------
+
+class TestV1V2ConfigSeparation:
+    """The real repository .codex/config.toml is V2
+    ([features.multi_agent_v2]); legacy V1 ([agents].max_depth) is a
+    superseded shape. Ordinary tests use the V2 fixture by default via
+    _run_cli/_write_v2_config_toml; the V1 shape is isolated to the dedicated
+    regression test below only."""
+
+    def test_v1_max_depth_does_not_define_v2_delegation_state(self, tmp_path: Path):
+        """(renamed from test_codex_delegation_from_max_depth, Issue #1948
+        fix_delta item 4) AC9: with a legacy V1 .codex/config.toml, Codex
+        nested_delegation_blocked is always unknown (None); max_depth does
+        not drive a strict blocked/allowed decision. delegation_intent_hint
+        is instead derived from developer_instructions prose via
+        classify_delegation_intent_hint()."""
+        config = _write_v1_config_toml(tmp_path, max_depth=1)
+        old_config = MOD.CODEX_CONFIG_PATH
+        MOD.CODEX_CONFIG_PATH = config
+        try:
+            codex_path = tmp_path / "issue-reviewer.toml"
+            _write_codex_toml(codex_path)
+            with codex_path.open("rb") as f:
+                codex_doc = tomllib.load(f)
+            facts = MOD.extract_codex_facts("issue-reviewer", codex_path, codex_doc)
+            assert facts.nested_delegation_blocked is None, (
+                f"advisory-only design: Codex nested_delegation_blocked must stay "
+                f"unknown (None) regardless of max_depth, got: "
+                f"{facts.nested_delegation_blocked}"
+            )
+            assert facts.delegation_intent_hint == "unknown", (
+                "developer_instructions has no delegation keywords -> hint unknown"
+            )
+        finally:
+            MOD.CODEX_CONFIG_PATH = old_config
+
+    def test_v2_enabled_does_not_treat_max_depth_as_authority(self, tmp_path: Path):
+        """Issue #1948 fix_delta item 3 regression: with V2 enabled
+        ([features.multi_agent_v2].enabled = true) and a legacy [agents]
+        table with max_depth also present in the same config.toml, V2 must
+        not treat max_depth as delegation authority; nested_delegation_blocked
+        stays unknown (None), and nested_delegation_evidence is produced and
+        reflects the V2 branch."""
+        config = _write_v2_config_toml(tmp_path, enabled=True, max_depth=99)
+        old_config = MOD.CODEX_CONFIG_PATH
+        MOD.CODEX_CONFIG_PATH = config
+        try:
+            codex_path = tmp_path / "issue-reviewer.toml"
+            _write_codex_toml(codex_path)
+            with codex_path.open("rb") as f:
+                codex_doc = tomllib.load(f)
+            facts = MOD.extract_codex_facts("issue-reviewer", codex_path, codex_doc)
+            assert facts.nested_delegation_blocked is None, (
+                f"V2 must not derive a strict blocked/allowed decision from "
+                f"max_depth, got: {facts.nested_delegation_blocked}"
+            )
+            assert facts.nested_delegation_evidence, (
+                "nested_delegation_evidence must be produced when V2 is enabled"
+            )
+            assert "multi_agent_v2" in facts.nested_delegation_evidence, (
+                f"nested_delegation_evidence should reflect the V2 branch, got: "
+                f"{facts.nested_delegation_evidence!r}"
+            )
+            assert facts.delegation_intent_hint == "unknown", (
+                "developer_instructions has no delegation keywords -> hint unknown"
+            )
+        finally:
+            MOD.CODEX_CONFIG_PATH = old_config
 
 
 # ---------------------------------------------------------------------------
@@ -495,15 +651,20 @@ class TestStatusOutput:
         data = json.loads(result.stdout)
         assert data["STATUS"] in ("warn", "fail")
 
-    def test_delegation_drift_status_warn(self, tmp_path: Path):
-        """AC5: delegation drift -> STATUS: warn or fail."""
+    def test_intent_hint_mismatch_keeps_status_ok(self, tmp_path: Path):
+        """(renamed from test_delegation_drift_status_warn, Issue #1948
+        fix_delta item 4) AC5 (advisory-only, PR #1879 af511e17): a
+        delegation_intent_hint mismatch alone does not change STATUS -- it
+        stays ok because NESTED_DELEGATION_001 is no longer generated."""
         result = _run_cli(
             tmp_path,
             _claude_md(tools=["Bash", "Read", "Agent"], disallowed_tools=["Edit"]),
-            max_depth=1,
         )
         data = json.loads(result.stdout)
-        assert data["STATUS"] in ("warn", "fail")
+        assert data["STATUS"] == "ok", (
+            f"delegation_intent_hint mismatch is advisory-only and must not "
+            f"change STATUS away from ok, got: {data['STATUS']}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +787,7 @@ class TestFixtureFiles:
         claude_dir.mkdir(parents=True, exist_ok=True)
         codex_dir = tmp_path / ".codex" / "agents"
         codex_dir.mkdir(parents=True, exist_ok=True)
-        config = _write_config_toml(tmp_path)
+        config = _write_v2_config_toml(tmp_path)
 
         (claude_dir / f"{agent_name}.md").write_text(
             (FIXTURE_DIR / claude_fixture).read_text(encoding="utf-8"), encoding="utf-8"
@@ -683,15 +844,28 @@ class TestFixtureFiles:
         perm_drifts = [d for d in data["drift"] if d["rule_id"] == "PERMISSION_BOUNDARY_001"]
         assert len(perm_drifts) == 1
 
-    def test_drift_delegation_mismatch_fixture(self, tmp_path: Path):
-        """Delegation mismatch fixture produces delegation drift evidence."""
+    def test_advisory_delegation_mismatch_fixture(self, tmp_path: Path):
+        """(renamed from test_drift_delegation_mismatch_fixture, Issue #1948
+        fix_delta item 4; advisory-only, PR #1879 af511e17) Delegation
+        mismatch fixture no longer produces NESTED_DELEGATION_001 drift
+        evidence; the mismatch (claude allows Agent, codex has no delegation
+        keywords -> unknown) surfaces only in nested_delegation_report
+        intent-hint fields."""
         data = self._run_with_fixtures(
             tmp_path,
-            "drift-claude-delegation-mismatch.md",
+            "advisory-claude-delegation-mismatch.md",
             "ok-codex-issue-reviewer.toml",
         )
         deleg_drifts = [d for d in data["drift"] if d["rule_id"] == "NESTED_DELEGATION_001"]
-        assert len(deleg_drifts) == 1
+        assert deleg_drifts == [], (
+            f"advisory-only: delegation mismatch fixture must not produce "
+            f"drift, got: {deleg_drifts}"
+        )
+        entry = next(
+            d for d in data["nested_delegation_report"] if d["agent"] == "issue-reviewer"
+        )
+        assert entry["claude_intent_hint"] == "allowed"
+        assert entry["codex_intent_hint"] == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -793,16 +967,20 @@ class TestB3DriftIsFail:
             f"B3: Permission drift must produce STATUS:fail, got: {data['STATUS']}"
         )
 
-    def test_delegation_drift_produces_fail(self, tmp_path: Path):
-        """B3: delegation drift -> STATUS: fail."""
+    def test_intent_hint_mismatch_does_not_fail(self, tmp_path: Path):
+        """(renamed from test_delegation_drift_produces_fail, Issue #1948
+        fix_delta item 4) B3 (superseded by advisory-only design, PR #1879
+        af511e17): delegation_intent_hint mismatch alone must NOT produce
+        STATUS:fail -- only schema/permission drift remain fail-level;
+        delegation_intent_hint is advisory-only."""
         result = _run_cli(
             tmp_path,
             _claude_md(tools=["Bash", "Read", "Agent"], disallowed_tools=["Edit"]),
-            max_depth=1,
         )
         data = json.loads(result.stdout)
-        assert data["STATUS"] == "fail", (
-            f"B3: Delegation drift must produce STATUS:fail, got: {data['STATUS']}"
+        assert data["STATUS"] == "ok", (
+            f"B3 superseded: delegation_intent_hint mismatch is advisory-only "
+            f"and must not produce STATUS:fail, got: {data['STATUS']}"
         )
 
 
@@ -812,11 +990,15 @@ class TestB3DriftIsFail:
 
 class TestB4RealRepoParity:
     def test_real_repo_parity(self):
-        """B4: Real repo parity check produces no schema/permission/delegation drift.
+        """B4: Real repo parity check produces no schema/permission drift, and
+        (advisory-only, PR #1879 af511e17) never produces NESTED_DELEGATION_001
+        delegation drift by design.
 
         Runs the parity script against actual .claude/agents/ and .codex/agents/ files.
-        Schema/permission/delegation drift would indicate a real config mismatch that
-        must be fixed before merging.
+        Schema/permission drift would indicate a real config mismatch that must be
+        fixed before merging. The delegation-drift assertion below is kept as a
+        regression guard even though compare_parity() no longer emits
+        NESTED_DELEGATION_001 for any input.
         """
         result = subprocess.run(
             [sys.executable, str(MODULE_PATH), "--format", "json"],
@@ -984,3 +1166,99 @@ class TestB8FindLineNumber:
         text = "alpha\nbeta\n"
         result = MOD.find_line_number(text, "delta")
         assert result == 0, f"B8: missing search should return 0, got: {result}"
+
+
+# ---------------------------------------------------------------------------
+# TestAdvisoryDelegationSemantics: advisory-only delegation_intent_hint
+# semantics (Issue #1948, following PR #1879 af511e17)
+# ---------------------------------------------------------------------------
+
+class TestAdvisoryDelegationSemantics:
+    """Behavioral pinning for the advisory-only delegation design.
+
+    PR #1879 (af511e17) removed the strict NESTED_DELEGATION_001 drift block
+    from compare_parity() and replaced it with delegation_intent_hint
+    (blocked | allowed | unknown), an advisory prose heuristic derived from
+    Codex developer_instructions via classify_delegation_intent_hint(). These
+    tests fix that advisory semantics as behavior: hint mismatches never
+    generate drift and never change STATUS or exit code.
+    """
+
+    def test_intent_hint_mismatch_no_drift(self, tmp_path: Path):
+        """A Claude/Codex delegation_intent_hint mismatch must not produce
+        NESTED_DELEGATION_001 drift in all_drifts, and STATUS stays ok with
+        exit code 0 even under --strict. Issue #1948 fix_delta item 1: the
+        hint mismatch itself is fixed as an explicit assertion first, so this
+        test cannot silently pass if the fixture no longer produces a
+        mismatch."""
+        result = _run_cli(
+            tmp_path,
+            _claude_md(tools=["Bash", "Read", "Agent"], disallowed_tools=["Edit"]),
+            extra_args=["--strict"],
+        )
+        data = json.loads(result.stdout)
+        entry = next(
+            d for d in data["nested_delegation_report"] if d["agent"] == "issue-reviewer"
+        )
+        assert entry["claude_intent_hint"] == "allowed"
+        assert entry["codex_intent_hint"] == "unknown"
+        assert entry["claude_intent_hint"] != entry["codex_intent_hint"]
+
+        deleg_drifts = [d for d in data["drift"] if d["rule_id"] == "NESTED_DELEGATION_001"]
+        assert deleg_drifts == [], (
+            f"delegation_intent_hint mismatch must never generate "
+            f"NESTED_DELEGATION_001 drift, got: {deleg_drifts}"
+        )
+        assert data["STATUS"] == "ok", (
+            f"delegation_intent_hint mismatch must not change STATUS, got: "
+            f"{data['STATUS']}"
+        )
+        assert result.returncode == 0, (
+            f"delegation_intent_hint mismatch must not change --strict exit "
+            f"code, got: {result.returncode}"
+        )
+
+    def test_nested_delegation_report_fields(self, tmp_path: Path):
+        """Every nested_delegation_report element (not just the first) has
+        agent / claude_intent_hint / claude_evidence / codex_intent_hint /
+        codex_evidence, with hint values in the correct value domain and
+        evidence fields as strings (Issue #1948 fix_delta item 2)."""
+        result = _run_cli(tmp_path, _claude_md())
+        data = json.loads(result.stdout)
+        report = data["nested_delegation_report"]
+        assert report, "nested_delegation_report must not be empty"
+        required_keys = {
+            "agent",
+            "claude_intent_hint",
+            "claude_evidence",
+            "codex_intent_hint",
+            "codex_evidence",
+        }
+        for entry in report:
+            assert required_keys <= entry.keys(), (
+                f"nested_delegation_report entry missing required keys: {entry}"
+            )
+            assert entry["claude_intent_hint"] in {"blocked", "allowed", "unknown"}
+            assert entry["codex_intent_hint"] in {"blocked", "allowed", "unknown"}
+            assert isinstance(entry["claude_evidence"], str)
+            assert isinstance(entry["codex_evidence"], str)
+
+    def test_classify_delegation_intent_hint_precedence(self):
+        """classify_delegation_intent_hint() returns blocked | allowed | unknown,
+        and a blocked phrase takes priority over an allowed keyword when both
+        are present in the same instructions text."""
+        assert MOD.classify_delegation_intent_hint("no delegation keywords here") == "unknown"
+        assert MOD.classify_delegation_intent_hint(
+            "You may use spawn_agents_on_csv for batch delegation."
+        ) == "allowed"
+        assert MOD.classify_delegation_intent_hint(
+            "Do not spawn subagents under any circumstance."
+        ) == "blocked"
+        # Precedence: a blocked phrase co-occurring with an allowed keyword -> blocked wins.
+        mixed = (
+            "You must not spawn subagents. Some legacy docs mention "
+            "spawn_agents_on_csv but it is disabled here."
+        )
+        assert MOD.classify_delegation_intent_hint(mixed) == "blocked", (
+            "blocked phrases must take priority over allowed keywords"
+        )
