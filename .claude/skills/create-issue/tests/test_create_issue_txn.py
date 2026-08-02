@@ -2105,6 +2105,10 @@ class TestReconcileDependencyIsNotNoop:
         monkeypatch.setattr(txn, "_issue_graphql_ids", _spy_graphql_ids)
         monkeypatch.setattr(txn, "_issue_register_dependency", _spy_register)
         monkeypatch.setattr(txn, "_readback_dependencies", _spy_readback)
+        # #1946 Owner P0-1: the shared apply/readback helper diffs against the CURRENT
+        # state before mutating; simulate "nothing registered yet" so both requested
+        # numbers are computed as missing.
+        monkeypatch.setattr(txn, "_current_relationship_numbers", lambda *_a, **_k: ("ok", set()))
 
         fake_sleep = FakeSleep()
         result = txn.reconcile_transaction(
@@ -2445,6 +2449,9 @@ class TestReconcileDependencyRegistrationNon422ErrorIsRecorded:
         monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
         monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
         monkeypatch.setattr(txn, "_issue_graphql_ids", _spy_graphql_ids)
+        # #1946 Owner P0-1: current-state diffing must find #10 missing so the mutation
+        # loop (and thus the second _issue_graphql_ids call under test) actually runs.
+        monkeypatch.setattr(txn, "_current_relationship_numbers", lambda *_a, **_k: ("ok", set()))
 
         fake_sleep = FakeSleep()
         result = txn.reconcile_transaction(
