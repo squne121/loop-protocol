@@ -162,9 +162,9 @@
       "model_reasoning_effort": "low",
       "default_permissions": "loop-protocol-rtk",
       "runtime_dependency_status": "codex_skill_required",
-      "runtime_followup_route": "post-merge-cleanup",
+      "runtime_followup_route": "post-merge-cleanup-executor",
       "repo_local_skill_surfaces": [
-        ".agents/skills/post-merge-cleanup/SKILL.md"
+        ".agents/skills/post-merge-cleanup-executor/SKILL.md"
       ]
     },
     "codebase-investigator": {
