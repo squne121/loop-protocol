@@ -1161,7 +1161,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: component-vrt-screenshots
-          path: tests/component/__screenshots__/
+          path: |
+            tests/component/__screenshots__/
+            .vitest-attachments/tests/component/**
           if-no-files-found: warn
           retention-days: 30
       - name: Summarize component VRT evidence

@@ -33,6 +33,24 @@ export default defineConfig({
         contextOptions: {
           deviceScaleFactor: 1,
         },
+        // AC6 (Issue #1389 fix_delta): explicit Chromium font-rendering /
+        // color-profile determinism flags. Without these, local dev
+        // environments (varying fontconfig / GPU rasterization paths) and
+        // the actual GitHub Actions Ubuntu runner (software rendering,
+        // container fontconfig) can rasterize text and colors slightly
+        // differently, producing pixel mismatches above
+        // `allowedMismatchedPixelRatio` even though nothing visually
+        // meaningful changed. These flags pin font hinting/anti-aliasing
+        // and color management so headless Chromium renders identically
+        // regardless of host GPU/font stack.
+        launchOptions: {
+          args: [
+            '--font-render-hinting=none',
+            '--disable-lcd-text',
+            '--force-color-profile=srgb',
+            '--disable-gpu',
+          ],
+        },
       }),
       instances: [{ browser: 'chromium' }],
       viewport: {
