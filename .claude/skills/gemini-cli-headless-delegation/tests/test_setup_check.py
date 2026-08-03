@@ -250,6 +250,68 @@ def test_agy_provider_fix_fails_closed_without_mutation(monkeypatch, tmp_path):
     assert "unsupported_provider_option: provider=agy does not support --fix" in result["warnings"]
 
 
+def test_check_agy_preflight_real_call_path_populates_capability_matrix(monkeypatch, tmp_path):
+    """Issue #1941 fix_delta P1-6: `check_agy_preflight()` itself is NOT
+    monkeypatched here (unlike the tests above) -- only the sibling
+    preflight_agy module's `_run` subprocess boundary is faked, so this
+    exercises the REAL `check_agy_preflight() -> run_preflight(
+    compute_capabilities=True)` wiring end-to-end and confirms
+    `agy_capabilities` is genuinely populated, and that a 77-class predicate
+    is never silently folded into overall success."""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    preflight_module = sc._load_preflight_agy_module()
+    # Issue #1941 fix_delta P1-1: force hermetic binary resolution -- this
+    # test must not depend on whether a real `agy` binary happens to be
+    # installed on the host PATH.
+    monkeypatch.setattr(preflight_module.shutil, "which", lambda *_a, **_kw: None)
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+    def fake_preflight_run(argv, cwd=None, timeout=None, env=None):
+        bin_ = preflight_module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _make_completed(0, stdout="agy 1.1.9\n")
+        if argv == [bin_, "--help"]:
+            return _make_completed(0, stdout="Usage: agy [OPTIONS]\n  -p, --print   print mode\n")
+        if argv == [bin_, "-p", preflight_module.SMOKE_PROMPT]:
+            return _make_completed(0, stdout=preflight_module.EXPECTED_SMOKE)
+        if argv == [bin_, "--disable-slash-commands", "--help"]:
+            return _make_completed(0, stdout="Usage: agy [OPTIONS]\n")
+        raise AssertionError(f"unexpected agy command: {argv}")
+
+    monkeypatch.setattr(preflight_module, "_run", fake_preflight_run)
+    monkeypatch.setattr(sc, "_load_preflight_agy_module", lambda: preflight_module)
+
+    def fake_run(command: list[str], timeout: int | None = None):
+        tool = command[0]
+        versions = {"agy": "agy 1.1.9\n", "python3": "Python 3.12.0\n", "uv": "uv 0.7.0\n"}
+        if tool in versions and "--version" in command:
+            return _make_completed(0, stdout=versions[tool])
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(sc, "_run", fake_run)
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="agy")
+
+    assert result["ok"] is True
+    assert result["agy_capabilities"] is not None
+    assert set(result["agy_capabilities"].keys()) == set(preflight_module.CAPABILITY_PREDICATES.keys())
+
+    parser_status = preflight_module.get_capability_status(
+        result["agy_capabilities"], "disable_slash_commands", "parser_accepts_flag"
+    )
+    assert parser_status["status"] == "supported"
+
+    # 77 (unavailable-only) must never be silently treated as success by
+    # a --require-capability-style caller reusing this same matrix.
+    exit_code = preflight_module.compute_require_capability_exit_code(
+        result["agy_capabilities"], ["hooks.pre_invocation_injected_tool_call"]
+    )
+    assert exit_code == 1  # fixed `unsupported` while upstream #728 is open -- never a success code
+
+
 def test_auto_provider_reports_attempt_order(monkeypatch, tmp_path):
     """provider=auto は agy→gemini の precedence と provider_attempts を返す。"""
     sc = load_setup_check()

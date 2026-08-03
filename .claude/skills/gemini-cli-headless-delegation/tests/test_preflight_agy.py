@@ -8,8 +8,27 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_real_agy_binary_on_path(monkeypatch):
+    """Force hermetic binary resolution for every test in this file.
+
+    Issue #1941 fix_delta P1-1: `run_preflight()` now resolves the agy binary
+    via `shutil.which()` exactly once at the very start. Tests must never
+    depend on whether a real `agy` binary happens to be installed on the host
+    PATH -- force resolution to fail so `run_preflight()` falls back to the
+    raw (mocked) binary name, matching every existing `fake_run` fixture's
+    `module._resolve_binary()`-based argv expectations. Individual tests that
+    need to exercise real resolution re-monkeypatch `shutil.which` locally to
+    override this.
+    """
+    monkeypatch.setattr(shutil, "which", lambda *_a, **_kw: None)
 
 
 def load_module():

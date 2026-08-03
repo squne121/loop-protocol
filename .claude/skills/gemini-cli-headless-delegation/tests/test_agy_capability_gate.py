@@ -9,7 +9,26 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_real_agy_binary_on_path(monkeypatch):
+    """Force hermetic binary resolution for every test in this file.
+
+    Issue #1941 fix_delta P1-1: `run_preflight()` now resolves the agy binary
+    via `shutil.which()` exactly once at the very start. Tests must never
+    depend on whether a real `agy` binary happens to be installed on the host
+    PATH -- force resolution to fail so `run_preflight()` falls back to the
+    raw (mocked) binary name, matching every existing `fake_run` fixture's
+    `module._resolve_binary()`-based argv expectations. Individual tests that
+    need to exercise real resolution (e.g. the binary-identity drift
+    integration test) re-monkeypatch `shutil.which` locally to override this.
+    """
+    monkeypatch.setattr(shutil, "which", lambda *_a, **_kw: None)
 
 
 def load_module():
@@ -483,9 +502,10 @@ def test_version_parser_fixture_matrix():
 
 
 def test_capability_probe_memoized_within_process_only():
-    """AC9: identical (binary_identity, config_digest) keys reuse the cached
-    matrix within the same process (no recomputation); the cache is a plain
-    in-process module dict with no on-disk persistence."""
+    """AC9: identical (binary_identity_before, binary_identity_check,
+    config_digest) keys reuse the cached evidence bundle within the same
+    process (no recomputation); the cache is a plain in-process module dict
+    with no on-disk persistence."""
     module = load_module()
     module._CAPABILITY_MEMO_CACHE.clear()
 
@@ -505,16 +525,574 @@ def test_capability_probe_memoized_within_process_only():
         call_count["n"] += 1
         return {"computed": call_count["n"]}
 
-    first = module.get_or_compute_capability_matrix(binary_identity, config_digest, compute)
-    second = module.get_or_compute_capability_matrix(binary_identity, config_digest, compute)
+    first = module.get_or_compute_capability_matrix(binary_identity, binary_identity, config_digest, compute)
+    second = module.get_or_compute_capability_matrix(binary_identity, binary_identity, config_digest, compute)
     assert first == second
     assert call_count["n"] == 1
 
     other_identity = dict(binary_identity, sha256="d" * 64)
-    third = module.get_or_compute_capability_matrix(other_identity, config_digest, compute)
+    third = module.get_or_compute_capability_matrix(other_identity, other_identity, config_digest, compute)
     assert call_count["n"] == 2
     assert third != first
 
     # Never persisted to disk — verify by asserting no on-disk cache file
     # attribute/method exists on the module for this purpose.
     assert not hasattr(module, "_CAPABILITY_DISK_CACHE_PATH")
+
+
+def test_capability_probe_cache_bypassed_when_pre_run_and_pre_probe_identity_differ():
+    """AC9/P1-7: if the pre-run and pre-runtime-probe identities differ
+    (drift occurred before the cached-matrix decision was even made),
+    `compute_fn()` must always run rather than reusing an unrelated cache
+    entry that happens to match one of the two identities alone."""
+    module = load_module()
+    module._CAPABILITY_MEMO_CACHE.clear()
+
+    identity_a = {
+        "realpath": "/usr/local/bin/agy",
+        "sha256": "a" * 64,
+        "size": 42,
+        "mtime_ns": 1,
+        "platform": "Linux",
+        "arch": "x86_64",
+    }
+    identity_b = dict(identity_a, sha256="b" * 64)
+    config_digest = "digest-a"
+
+    call_count = {"n": 0}
+
+    def compute():
+        call_count["n"] += 1
+        return {"computed": call_count["n"]}
+
+    # Prime a legitimate (non-drifted) cache entry for identity_b alone.
+    module.get_or_compute_capability_matrix(identity_b, identity_b, config_digest, compute)
+    assert call_count["n"] == 1
+
+    # A run that drifted from identity_a to identity_b mid-run must NOT reuse
+    # the identity_b-only cache entry above -- compute_fn() must run again.
+    module.get_or_compute_capability_matrix(identity_a, identity_b, config_digest, compute)
+    assert call_count["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #1941 fix_delta P1-1: binary-identity binding to a single resolved
+# path, verified via a REAL subprocess round-trip against a fake binary.
+# ---------------------------------------------------------------------------
+
+_REAL_SHUTIL_WHICH = shutil.which
+
+
+def _write_fake_agy_script(path: Path, extra_marker: str = "") -> None:
+    script = (
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        "  --version) echo 'agy 1.1.9';;\n"
+        "  --help) echo 'Usage: agy [OPTIONS]'; echo '  -p, --print, --prompt  print mode';;\n"
+        "  --disable-slash-commands)\n"
+        "    shift\n"
+        "    if [ \"$1\" = '--help' ]; then echo 'Usage: agy [OPTIONS]'; fi\n"
+        "    if [ \"$1\" = '-p' ]; then echo 'LOOP_AGY_SMOKE_OK'; fi\n"
+        "    ;;\n"
+        "  -p) echo 'LOOP_AGY_SMOKE_OK';;\n"
+        "  *) echo 'unknown';;\n"
+        "esac\n"
+        f"# marker:{extra_marker}\n"
+    )
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def test_binary_identity_binding_catches_binary_swapped_out_from_under_resolved_path(monkeypatch, tmp_path):
+    """P1-1 integration test: run_preflight() resolves the agy binary exactly
+    once via a real subprocess round-trip against a fake/swappable binary.
+    The binary at the resolved absolute path is swapped for different
+    content mid-run (simulating a PATH/binary-tamper attack) -- proving the
+    binary-identity fingerprint is bound to what was actually executed (not
+    just re-derived from a name lookup) and that drift is caught, forcing
+    every capability predicate to `evidence_invalid`."""
+    module = load_module()
+    # Override this file's autouse hermetic-resolution fixture: this test
+    # specifically needs a real `shutil.which()` round-trip against a real
+    # (fake) binary on disk.
+    monkeypatch.setattr(shutil, "which", _REAL_SHUTIL_WHICH)
+
+    bin_path = tmp_path / "agy"
+    _write_fake_agy_script(bin_path, extra_marker="v1")
+
+    monkeypatch.setenv("AGY_BIN", str(bin_path))
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+    original_probe = module._run_disable_slash_commands_probe
+
+    def swap_binary_then_probe(agy_bin):
+        probe_result = original_probe(agy_bin)
+        # Simulate a mid-run binary swap: overwrite the SAME resolved path
+        # with different content (different sha256/size) after the cheap
+        # probe already ran against it, but before the drift check re-stats
+        # the path for `binary_identity_after`.
+        _write_fake_agy_script(bin_path, extra_marker="v2-swapped")
+        return probe_result
+
+    monkeypatch.setattr(module, "_run_disable_slash_commands_probe", swap_binary_then_probe)
+
+    result = module.run_preflight(compute_capabilities=True)
+
+    assert result["ok"] is True
+    assert result["binary_identity"]["sha256"] is not None
+    assert result["binary_identity_after"]["sha256"] is not None
+    assert result["binary_identity"]["sha256"] != result["binary_identity_after"]["sha256"]
+    for group, predicates in module.CAPABILITY_PREDICATES.items():
+        for predicate in predicates:
+            entry = result["capabilities"][group][predicate]
+            assert entry["status"] == "evidence_invalid", f"{group}.{predicate}: {entry}"
+            assert entry["reason_code"] == "binary_identity_drift"
+
+
+def test_binary_identity_binding_no_drift_when_binary_unchanged(monkeypatch, tmp_path):
+    """P1-1 control case: the same real fake-binary round-trip with NO swap
+    must NOT report drift -- proves the drift detector is not just always
+    tripping."""
+    module = load_module()
+    monkeypatch.setattr(shutil, "which", _REAL_SHUTIL_WHICH)
+
+    bin_path = tmp_path / "agy"
+    _write_fake_agy_script(bin_path, extra_marker="stable")
+
+    monkeypatch.setenv("AGY_BIN", str(bin_path))
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+    result = module.run_preflight(compute_capabilities=True)
+
+    assert result["ok"] is True
+    assert result["binary_identity"]["sha256"] == result["binary_identity_after"]["sha256"]
+    for entry in result["capabilities"]["disable_slash_commands"].values():
+        assert entry["reason_code"] != "binary_identity_drift"
+
+
+def test_run_preflight_binds_every_probe_to_the_single_resolved_path(monkeypatch, tmp_path):
+    """P1-1: once resolved, every subsequent probe (version/help/smoke/
+    capability) is invoked against the exact same resolved absolute path --
+    never a bare re-resolved name -- verified by asserting every recorded
+    argv[0] is identical to the initially resolved path."""
+    module = load_module()
+    monkeypatch.setattr(shutil, "which", _REAL_SHUTIL_WHICH)
+
+    bin_path = tmp_path / "agy"
+    _write_fake_agy_script(bin_path)
+    monkeypatch.setenv("AGY_BIN", str(bin_path))
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+    seen_argv0: set[str] = set()
+    original_run = module._run
+
+    def spy_run(argv, cwd=None, timeout=None, env=None):
+        seen_argv0.add(argv[0])
+        return original_run(argv, cwd=cwd, timeout=timeout, env=env)
+
+    monkeypatch.setattr(module, "_run", spy_run)
+
+    result = module.run_preflight(compute_capabilities=True)
+
+    assert result["ok"] is True
+    resolved_path = str(bin_path.resolve())
+    assert seen_argv0 == {resolved_path}
+
+
+# ---------------------------------------------------------------------------
+# Issue #1941 fix_delta P1-2: leading_slash_is_literal uses the exact
+# production argv and prioritizes expansion-error evidence.
+# ---------------------------------------------------------------------------
+
+
+def test_leading_slash_probe_uses_exact_production_argv(monkeypatch):
+    """P1-2: the probe argv must be exactly
+    `agy --disable-slash-commands -p <prompt>` -- the production argv, not a
+    bare `-p <prompt>` (which only tests default expansion behavior)."""
+    module = load_module()
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(argv, cwd=None, timeout=None, env=None):
+        captured["argv"] = argv
+        return _FakeCompleted(0, module.EXPECTED_SMOKE, "")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    module._run_leading_slash_literal_probe("agy")
+
+    assert captured["argv"][0] == "agy"
+    assert captured["argv"][1] == "--disable-slash-commands"
+    assert captured["argv"][2] == "-p"
+
+
+def test_leading_slash_probe_expansion_evidence_takes_priority_over_sentinel(monkeypatch):
+    """P1-2: when the combined output contains BOTH the sentinel text AND
+    explicit expansion-rejection evidence, expansion evidence must win --
+    the probe must never be misclassified as `literal_confirmed`."""
+    module = load_module()
+
+    def fake_run(argv, cwd=None, timeout=None, env=None):
+        return _FakeCompleted(
+            1,
+            module.EXPECTED_SMOKE,
+            "unknown command: /nonexistent-loop-agy-capability-probe",
+        )
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    probe = module._run_leading_slash_literal_probe("agy")
+
+    assert probe["expansion_detected"] is True
+    assert probe["literal_confirmed"] is False
+
+
+def test_leading_slash_probe_literal_confirmed_requires_exit_zero(monkeypatch):
+    """P1-2: sentinel presence alone (without exit 0 and without expansion
+    evidence) is not sufficient for `literal_confirmed`."""
+    module = load_module()
+
+    def fake_run(argv, cwd=None, timeout=None, env=None):
+        return _FakeCompleted(1, module.EXPECTED_SMOKE, "")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    probe = module._run_leading_slash_literal_probe("agy")
+
+    assert probe["literal_confirmed"] is False
+    assert probe["expansion_detected"] is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #1941 fix_delta P1-3: isolated probe env + cost-confirmation gate +
+# memoization-before-probe ordering.
+# ---------------------------------------------------------------------------
+
+
+def test_leading_slash_probe_isolates_home_and_xdg_env(monkeypatch):
+    """P1-3: the probe's subprocess env overrides HOME/XDG_* to an isolated
+    temp root -- never the real user's HOME/XDG_* -- so the real
+    `~/.gemini/config/` hooks/permissions/skills/plugins cannot be
+    discovered or loaded by this model-backed probe."""
+    module = load_module()
+    monkeypatch.setenv("HOME", "/home/real-user-do-not-leak")
+    captured_env: dict[str, str] = {}
+
+    def fake_run(argv, cwd=None, timeout=None, env=None):
+        captured_env.update(env or {})
+        return _FakeCompleted(0, module.EXPECTED_SMOKE, "")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    module._run_leading_slash_literal_probe("agy")
+
+    assert captured_env["HOME"] != "/home/real-user-do-not-leak"
+    assert "isolated-home" in captured_env["HOME"]
+    assert captured_env["XDG_CONFIG_HOME"].startswith(captured_env["HOME"])
+    assert captured_env["XDG_CACHE_HOME"].startswith(captured_env["HOME"])
+    assert captured_env["XDG_STATE_HOME"].startswith(captured_env["HOME"])
+
+
+def _fake_run_for_capability_computation(module):
+    def fake_run(argv, cwd=None, timeout=None, env=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.1.9\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "Usage: agy [OPTIONS]\n  -p, --print   print mode\n", "")
+        if argv == [bin_, "-p", module.SMOKE_PROMPT]:
+            return _FakeCompleted(0, module.EXPECTED_SMOKE, "")
+        if argv == [bin_, "--disable-slash-commands", "--help"]:
+            return _FakeCompleted(0, "Usage: agy [OPTIONS]\n", "")
+        if argv[:2] == [bin_, "--disable-slash-commands"] and argv[2] == "-p":
+            return _FakeCompleted(0, module.EXPECTED_SMOKE, "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    return fake_run
+
+
+def test_runtime_probe_cost_gate_skips_by_default(monkeypatch, tmp_path):
+    """P1-3: compute_capabilities=True does NOT invoke the model-backed
+    leading_slash_literal probe unless the cost-confirmation env var is
+    explicitly set -- the predicate resolves to `unavailable` with a
+    cost-related reason_code instead."""
+    module = load_module()
+    monkeypatch.delenv(module.AGY_RUNTIME_PROBE_COST_CONFIRM_ENV_VAR, raising=False)
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path))
+
+    called = {"leading_slash": False}
+    real_leading_slash = module._run_leading_slash_literal_probe
+
+    def spy_leading_slash(agy_bin):
+        called["leading_slash"] = True
+        return real_leading_slash(agy_bin)
+
+    monkeypatch.setattr(module, "_run_leading_slash_literal_probe", spy_leading_slash)
+    monkeypatch.setattr(module, "_run", _fake_run_for_capability_computation(module))
+
+    result = module.run_preflight(compute_capabilities=True)
+
+    assert called["leading_slash"] is False
+    status = module.get_capability_status(
+        result["capabilities"], "disable_slash_commands", "leading_slash_is_literal"
+    )
+    assert status["status"] == "unavailable"
+    assert status["reason_code"] == "runtime_probe_cost_unconfirmed"
+
+
+def test_runtime_probe_cost_gate_runs_when_explicitly_confirmed(monkeypatch, tmp_path):
+    """P1-3: setting the cost-confirmation env var actually runs the
+    real probe and lets it contribute `supported` evidence."""
+    module = load_module()
+    monkeypatch.setenv(module.AGY_RUNTIME_PROBE_COST_CONFIRM_ENV_VAR, "1")
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path))
+    monkeypatch.setattr(module, "_run", _fake_run_for_capability_computation(module))
+
+    result = module.run_preflight(compute_capabilities=True)
+
+    status = module.get_capability_status(
+        result["capabilities"], "disable_slash_commands", "leading_slash_is_literal"
+    )
+    assert status["status"] == "supported"
+
+
+def test_costly_probe_never_runs_twice_on_cache_hit(monkeypatch, tmp_path):
+    """P1-3/P1-7: the memoization cache lookup happens BEFORE the costly
+    probe -- a second run_preflight() call with an identical (unchanged)
+    binary/config must reuse the cached bundle and never invoke the costly
+    probe a second time, even with cost confirmed."""
+    module = load_module()
+    module._CAPABILITY_MEMO_CACHE.clear()
+    monkeypatch.setenv(module.AGY_RUNTIME_PROBE_COST_CONFIRM_ENV_VAR, "1")
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path))
+
+    call_count = {"n": 0}
+    real_leading_slash = module._run_leading_slash_literal_probe
+
+    def counting_leading_slash(agy_bin):
+        call_count["n"] += 1
+        return real_leading_slash(agy_bin)
+
+    monkeypatch.setattr(module, "_run_leading_slash_literal_probe", counting_leading_slash)
+    monkeypatch.setattr(module, "_run", _fake_run_for_capability_computation(module))
+    # Binary identity is None-realpath in this fully-mocked (no real file)
+    # scenario, which is stable across both calls -- config digest is also
+    # stable, so the second call is expected to be a cache hit.
+
+    module.run_preflight(compute_capabilities=True)
+    module.run_preflight(compute_capabilities=True)
+
+    assert call_count["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #1941 fix_delta P1-4: sanitization leakage — version_evidence.raw,
+# agy.version, and every external-facing output surface.
+# ---------------------------------------------------------------------------
+
+
+def test_version_evidence_raw_and_agy_version_sanitized_in_return_value(monkeypatch, tmp_path):
+    """P1-4: run_preflight()'s actual RETURN VALUE (not just the on-disk
+    artifact) never carries the raw combined `agy --version` output
+    verbatim -- version_evidence.raw is redacted and agy.version is limited
+    to a normalized value plus a separately redacted bounded sample."""
+    module = load_module()
+    leaked_url = "https://accounts.google.com/o/oauth2/auth?code=SECRET123&state=xyz"
+
+    def fake_run(argv, cwd=None, timeout=None, env=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, f"agy 1.1.9\nWarning: {leaked_url}\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "Usage: agy [OPTIONS]\n  -p, --print   print mode\n", "")
+        if argv == [bin_, "-p", module.SMOKE_PROMPT]:
+            return _FakeCompleted(0, module.EXPECTED_SMOKE, "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path))
+
+    result = module.run_preflight()
+
+    serialized = json.dumps(result)
+    assert leaked_url not in serialized
+    assert "SECRET123" not in serialized
+    assert result["agy"]["version"] == "1.1.9"
+    assert "accounts.google.com" not in (result["agy"].get("version_raw_sample") or "")
+    assert "accounts.google.com" not in (result["version_evidence"].get("raw") or "")
+
+
+def test_capability_probe_raw_fields_sanitized_in_return_value(monkeypatch, tmp_path):
+    """P1-4: capability_probes stdout/stderr/argv must never survive on
+    run_preflight()'s return value -- which is exactly what `--json` /
+    `--output-file` serialize in `main()` -- only the artifact-safe shape."""
+    module = load_module()
+    monkeypatch.setenv(module.AGY_RUNTIME_PROBE_COST_CONFIRM_ENV_VAR, "1")
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path))
+    secret_marker = "SECRET_CAPABILITY_PROBE_STDOUT_DO_NOT_LEAK"
+
+    def fake_run(argv, cwd=None, timeout=None, env=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.1.9\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(0, "Usage: agy [OPTIONS]\n  -p, --print   print mode\n", "")
+        if argv == [bin_, "-p", module.SMOKE_PROMPT]:
+            return _FakeCompleted(0, module.EXPECTED_SMOKE, "")
+        if argv == [bin_, "--disable-slash-commands", "--help"]:
+            return _FakeCompleted(0, f"Usage: agy [OPTIONS]\n{secret_marker}\n", "")
+        if argv[:2] == [bin_, "--disable-slash-commands"] and argv[2] == "-p":
+            return _FakeCompleted(0, module.EXPECTED_SMOKE, "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    result = module.run_preflight(compute_capabilities=True)
+
+    serialized = json.dumps(result)
+    assert secret_marker not in serialized
+    for probe in result["capability_probes"].values():
+        if isinstance(probe, dict):
+            assert "stdout" not in probe
+            assert "stderr" not in probe
+            assert "argv" not in probe
+
+
+# ---------------------------------------------------------------------------
+# Issue #1941 fix_delta P1-5: parser-rejection classification is narrow.
+# ---------------------------------------------------------------------------
+
+
+def test_generic_invalid_option_without_flag_name_is_not_parser_rejection():
+    """P1-5: a bare "invalid option"/"unknown option" string that never
+    names --disable-slash-commands must not be classified as a parser
+    rejection -- it stays ambiguous/inconclusive."""
+    module = load_module()
+    result = module.classify_parser_acceptance(1, "", "Error: invalid option --some-unrelated-flag")
+    assert result["accepted"] is None
+    assert result["evidence_source"] == "exit_nonzero_unclassified"
+
+    status = module.derive_parser_accepts_flag_status(result)
+    assert status["status"] == "inconclusive"
+
+
+def test_auth_evidence_in_stderr_takes_priority_over_generic_parser_error_string():
+    """P1-5: an unrelated config warning containing "invalid option"
+    alongside an authoritative auth-failure signal -- both in stderr this
+    time, not split across stdout/stderr -- must classify as auth-blocked,
+    never as a parser rejection."""
+    module = load_module()
+    result = module.classify_parser_acceptance(
+        1,
+        "",
+        "Please sign in with Google to continue. (config warning: invalid option somewhere)",
+    )
+    assert result["auth_signal"] is not None
+    assert result["accepted"] is None
+    assert result["evidence_source"] == "auth_signal"
+
+    status = module.derive_parser_accepts_flag_status(result)
+    assert status["status"] == "inconclusive"
+    assert status["reason_code"] == "auth_blocked_probe"
+
+
+# ---------------------------------------------------------------------------
+# Issue #1941 fix_delta P1-7: config digest includes the real hooks config.
+# ---------------------------------------------------------------------------
+
+
+def test_config_digest_changes_when_hooks_config_changes(tmp_path):
+    """P1-7: the config digest must change when `.agents/hooks.json`
+    changes -- previously it only covered `.claude/settings.json` and
+    `.agents/mcp_config.json`, so a hooks config change never invalidated a
+    cached capability matrix."""
+    module = load_module()
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".agents").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+    (tmp_path / ".agents" / "mcp_config.json").write_text("{}", encoding="utf-8")
+
+    digest_without_hooks = module.compute_config_digest(tmp_path)
+
+    (tmp_path / ".agents" / "hooks.json").write_text('{"hooks": []}', encoding="utf-8")
+    digest_with_hooks = module.compute_config_digest(tmp_path)
+
+    assert digest_without_hooks != digest_with_hooks
+
+
+# ---------------------------------------------------------------------------
+# Issue #1941 fix_delta P2-1: controlled early exits still populate the
+# capability matrix shape with per-predicate reasons (lower priority).
+# ---------------------------------------------------------------------------
+
+
+def test_cli_missing_early_exit_still_populates_capability_matrix(monkeypatch, tmp_path):
+    """P2-1: a binary-missing early exit with compute_capabilities=True still
+    returns a full-shaped matrix (every predicate present) instead of an
+    absent/None `capabilities` field."""
+    module = load_module()
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path))
+
+    def fake_run_missing(argv, cwd=None, timeout=None, env=None):
+        raise FileNotFoundError("agy: command not found")
+
+    monkeypatch.setattr(module, "_run", fake_run_missing)
+
+    result = module.run_preflight(compute_capabilities=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "cli_missing"
+    assert result["capabilities"] is not None
+    for group, predicates in module.CAPABILITY_PREDICATES.items():
+        assert set(result["capabilities"][group].keys()) == set(predicates)
+    # --require-capability must never treat this as a success signal.
+    exit_code = module.compute_require_capability_exit_code(
+        result["capabilities"], ["disable_slash_commands.parser_accepts_flag"]
+    )
+    assert exit_code in (1, 77)
+
+
+def test_help_failure_early_exit_populates_capability_matrix_with_help_unavailable_reason(monkeypatch, tmp_path):
+    """P2-1: a help-failure early exit records a help-specific reason_code on
+    the parser_accepts_flag predicate rather than a generic probe_not_run."""
+    module = load_module()
+    monkeypatch.setenv("AGY_PREFLIGHT_ARTIFACT_DIR", str(tmp_path))
+
+    def fake_run(argv, cwd=None, timeout=None, env=None):
+        bin_ = module._resolve_binary()
+        if argv == [bin_, "--version"]:
+            return _FakeCompleted(0, "agy 1.1.9\n", "")
+        if argv == [bin_, "--help"]:
+            return _FakeCompleted(2, "", "help failed")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    result = module.run_preflight(compute_capabilities=True)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "cli_incompatible"
+    status = module.get_capability_status(result["capabilities"], "disable_slash_commands", "parser_accepts_flag")
+    assert status["status"] == "unavailable"
+    assert status["reason_code"] == "help_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Issue #1941 fix_delta P2-2: version parser rejects conflicting/unanchored
+# version-shaped tokens.
+# ---------------------------------------------------------------------------
+
+
+def test_version_parser_ignores_unrelated_dependency_version_line():
+    """P2-2: a leading unrelated warning line with its own version-shaped
+    token (e.g. a dependency version) must not be picked over the real
+    `agy <version>` line."""
+    module = load_module()
+    parsed = module.parse_agy_version_string("dependency 2.4.0 deprecated\nagy 1.1.9\n")
+    assert parsed["status"] == "parsed"
+    assert parsed["version"] == "1.1.9"
+    assert parsed["core"] == (1, 1, 9)
+
+
+def test_version_parser_rejects_multiple_conflicting_agy_anchored_versions():
+    """P2-2: multiple version-shaped tokens both anchored to an `agy`
+    program-name context line are ambiguous and must be rejected rather than
+    guessed at."""
+    module = load_module()
+    parsed = module.parse_agy_version_string("agy 1.1.9\nagy 2.0.0\n")
+    assert parsed["status"] == "version_evidence_invalid"
+    assert parsed["version"] is None

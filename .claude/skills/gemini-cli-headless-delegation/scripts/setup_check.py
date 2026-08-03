@@ -178,9 +178,19 @@ def check_agy_preflight() -> dict[str, Any]:
     TTY condition — Issue #1267). preflight_agy.py is the SSOT for this schema;
     this function surfaces it unmodified at agy_preflight.auth without re-deriving
     or reconstructing the auth/keyring diagnostics (schema drift is not permitted).
+
+    Issue #1941 fix_delta P1-6: explicitly requests the `agy_capability_matrix/v1`
+    predicate set (`compute_capabilities=True`) so the real invocation path
+    actually populates it -- previously this called `run_preflight()` with no
+    arguments, so `capabilities` was always `None` on this path (only the
+    tests, which monkeypatch `check_agy_preflight()` wholesale with a
+    pre-filled fake dict, ever exercised a populated matrix). The existing
+    `ok`-boolean derivation in `_run_agy_provider_checks()` is unaffected by
+    this — it is still driven solely by `agy_preflight["ok"]`, never by the
+    capability matrix.
     """
     module = _load_preflight_agy_module()
-    return module.run_preflight()
+    return module.run_preflight(compute_capabilities=True)
 
 
 def _extract_agy_auth_failure_class(agy_preflight: dict[str, Any]) -> str | None:
