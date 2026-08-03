@@ -48,6 +48,14 @@ function updatePointerCoords(
   getArena: () => { width: number; height: number },
 ): void {
   const bounds = canvas.getBoundingClientRect()
+  // Issue #1956 fix 4: a temporarily detached or zero-sized Canvas (e.g.
+  // mid-layout-transition) reports bounds.width/height <= 0. Dividing by
+  // that would write Infinity/NaN into pointerX/pointerY and corrupt
+  // downstream aim/assist logic. Leave the previous known-good pointer
+  // position in place instead of writing a non-finite value.
+  if (bounds.width <= 0 || bounds.height <= 0) {
+    return
+  }
   const arena = getArena()
   input.pointerX = ((event.clientX - bounds.left) / bounds.width) * arena.width
   input.pointerY = ((event.clientY - bounds.top) / bounds.height) * arena.height

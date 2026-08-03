@@ -11,7 +11,7 @@ import {
   mapInputToCommands,
   type InputState,
 } from './input'
-import { createCanvasRenderer } from './render'
+import { createCanvasRenderer, type CanvasPresentation } from './render'
 import {
   createGameSnapshot,
   createInitialGameState,
@@ -26,7 +26,6 @@ import {
 } from './storage'
 import {
   advanceSimulationLoop,
-  clampPlayerToArena,
   claimPendingReward,
   confirmResult,
   purchaseUpgrade,
@@ -228,6 +227,155 @@ export function queueAssistPlayerCommand(
   }
   inputState.assistPlayerRisingEdge = true
   return true
+}
+
+type CanvasPresentationWindow = Pick<Window, 'addEventListener' | 'removeEventListener'>
+
+type ResizeObserverConstructor = new (
+  callback: ResizeObserverCallback,
+) => Pick<ResizeObserver, 'disconnect' | 'observe'>
+
+/**
+ * Derive presentation metrics from a single observed `ResizeObserverEntry`
+ * (Issue #1956 fix 3). Priority order:
+ *   1. `devicePixelContentBoxSize[0]` — physical device pixels for the
+ *      backing store, already DPR/zoom-correct where supported.
+ *   2. `contentBoxSize[0]` — logical CSS pixels; multiplied by the current
+ *      `devicePixelRatio` to derive device pixels.
+ *   3. `contentRect` — the widest-supported fallback, same DPR handling as
+ *      (2).
+ * Returns `null` only if none of the three shapes are present/usable
+ * (should not happen for a real ResizeObserverEntry, but keeps the caller
+ * fail-safe).
+ */
+function derivePresentationFromEntry(entry: ResizeObserverEntry): CanvasPresentation | null {
+  const dpr = typeof window === 'undefined' ? 1 : (window.devicePixelRatio ?? 1)
+
+  // Independent CSS-pixel cross-check for the devicePixelContentBoxSize
+  // branch below (Issue #1956 fix 6 hardening): some emulated-DPR
+  // environments (verified empirically against a Playwright persistent
+  // context using the `deviceScaleFactor` context option, i.e. a CDP
+  // `Emulation.setDeviceMetricsOverride`-driven override rather than a
+  // real physical display) report a `devicePixelContentBoxSize` that does
+  // NOT reflect the emulated ratio (effectively DPR 1), while
+  // `window.devicePixelRatio` DOES correctly reflect it. Trusting a
+  // present-but-wrong devicePixelContentBoxSize would silently mis-size the
+  // backing store. `entry.contentRect` is always populated by the browser
+  // (unlike the other two, which require opt-in `box` options) and is
+  // authoritative CSS-pixel-space, independent of any device-pixel
+  // reporting path -- use it to validate devicePixelContentBoxSize's
+  // implied CSS size before trusting it.
+  const referenceCssWidth = entry.contentRect?.width
+  const referenceCssHeight = entry.contentRect?.height
+
+  function agreesWithReference(cssWidth: number, cssHeight: number): boolean {
+    if (referenceCssWidth === undefined || referenceCssHeight === undefined) {
+      return true
+    }
+    const widthDelta = Math.abs(cssWidth - referenceCssWidth)
+    const heightDelta = Math.abs(cssHeight - referenceCssHeight)
+    return widthDelta <= 2 && heightDelta <= 2
+  }
+
+  const devicePixelBox = (
+    entry as unknown as {
+      devicePixelContentBoxSize?: ReadonlyArray<{ inlineSize: number; blockSize: number }>
+    }
+  ).devicePixelContentBoxSize
+  const devicePixelEntry = devicePixelBox?.[0]
+  if (devicePixelEntry && devicePixelEntry.inlineSize > 0 && devicePixelEntry.blockSize > 0) {
+    const impliedCssWidth = devicePixelEntry.inlineSize / dpr
+    const impliedCssHeight = devicePixelEntry.blockSize / dpr
+    if (agreesWithReference(impliedCssWidth, impliedCssHeight)) {
+      return {
+        deviceWidth: devicePixelEntry.inlineSize,
+        deviceHeight: devicePixelEntry.blockSize,
+        cssWidth: impliedCssWidth,
+        cssHeight: impliedCssHeight,
+      }
+    }
+    // Falls through to the contentBoxSize/contentRect tiers below, which
+    // derive device pixels from window.devicePixelRatio directly instead
+    // of trusting the disagreeing devicePixelContentBoxSize entry.
+  }
+
+  const contentBoxEntry = entry.contentBoxSize?.[0]
+  if (contentBoxEntry && contentBoxEntry.inlineSize > 0 && contentBoxEntry.blockSize > 0) {
+    return {
+      cssWidth: contentBoxEntry.inlineSize,
+      cssHeight: contentBoxEntry.blockSize,
+      deviceWidth: contentBoxEntry.inlineSize * dpr,
+      deviceHeight: contentBoxEntry.blockSize * dpr,
+    }
+  }
+
+  const rect = entry.contentRect
+  if (rect && rect.width > 0 && rect.height > 0) {
+    return {
+      cssWidth: rect.width,
+      cssHeight: rect.height,
+      deviceWidth: rect.width * dpr,
+      deviceHeight: rect.height * dpr,
+    }
+  }
+
+  return null
+}
+
+/**
+ * Observe the stable Canvas viewport rather than the window alone. The
+ * device-pixel-content-box request catches DPR/zoom changes where supported;
+ * older engines fall back to the standard content box. The returned cleanup
+ * owns both observer and window listener lifecycle.
+ *
+ * `onResize` receives the derived `CanvasPresentation` metrics for the
+ * observed entry when available (Issue #1956 fix 3), so the caller
+ * (`renderer.resize`) can avoid its own `getBoundingClientRect()` read.
+ * When no observer entry is available (window-resize fallback, or the
+ * ResizeObserver constructor/observe() itself failed), `onResize` is called
+ * with no argument and the caller falls back to its own
+ * `getBoundingClientRect()`-based resolution.
+ */
+export function observeCanvasPresentation(
+  target: Element,
+  onResize: (presentation?: CanvasPresentation) => void,
+  windowTarget: CanvasPresentationWindow = window,
+  Observer: ResizeObserverConstructor | undefined =
+    typeof ResizeObserver === 'undefined' ? undefined : ResizeObserver,
+): () => void {
+  const onWindowResize = () => onResize()
+  windowTarget.addEventListener('resize', onWindowResize)
+
+  if (!Observer) {
+    onResize()
+    return () => windowTarget.removeEventListener('resize', onWindowResize)
+  }
+
+  let observer: Pick<ResizeObserver, 'disconnect' | 'observe'>
+  try {
+    observer = new Observer((entries) => {
+      const entry = entries[0]
+      const presentation = entry ? derivePresentationFromEntry(entry) ?? undefined : undefined
+      onResize(presentation)
+    })
+  } catch {
+    // The ResizeObserver constructor itself threw (Issue #1956 fix 3): fall
+    // back to the window-resize-only path already registered above.
+    onResize()
+    return () => windowTarget.removeEventListener('resize', onWindowResize)
+  }
+
+  try {
+    observer.observe(target, { box: 'device-pixel-content-box' })
+  } catch {
+    observer.observe(target)
+  }
+  onResize()
+
+  return () => {
+    observer.disconnect()
+    windowTarget.removeEventListener('resize', onWindowResize)
+  }
 }
 
 export function createTransitionedInitialGameState(
@@ -587,7 +735,6 @@ const hud = battleHudLayer ? createHudController(battleHudLayer, {
     if (!runNextSortieHandler(state, { setHudFeedback })) {
       return
     }
-    resizeArena(state)
     productPause.isPaused = false
   },
   onTogglePause(invoker) {
@@ -610,7 +757,6 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
       return
     }
     state = nextState
-    resizeArena(state)
     productPause.isPaused = false
     setHudFeedback('New Game started.', 'Preparation phase. Start sortie when ready.')
   },
@@ -640,7 +786,6 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
           return
         }
         state = nextState
-        resizeArena(state)
         hasLoadableSnapshot = true
         productPause.isPaused = false
       },
@@ -674,7 +819,6 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
       return
     }
     state = nextState
-    resizeArena(state)
     // Reset product pause on state transition to preparation
     productPause.isPaused = false
     setHudFeedback(
@@ -747,8 +891,14 @@ if (!startupProbe.ok) {
 
 if (canvas) {
   bindInput(canvas, inputState, () => state.arena)
-  resizeArena(state)
-  window.addEventListener('resize', () => resizeArena(state))
+  const viewport = canvas.parentElement
+  if (viewport) {
+    const disposeCanvasPresentation = observeCanvasPresentation(
+      viewport,
+      (presentation) => renderer?.resize(state, presentation),
+    )
+    window.addEventListener('beforeunload', disposeCanvasPresentation, { once: true })
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,15 +1390,6 @@ function persistProgressionSnapshot(
   })
 }
 
-function resizeArena(currentState: typeof state): void {
-  const safeSidebar = window.innerWidth > 980 ? 380 : 32
-  const width = Math.min(960, Math.max(640, window.innerWidth - safeSidebar))
-  currentState.arena.width = width
-  currentState.arena.height = Math.round(width * 0.5625)
-  // Re-clamp player after arena resize to prevent out-of-bounds position.
-  clampPlayerToArena(currentState)
-}
-
 function reportStorageFailure(
   operation: 'load' | 'save',
   result: Extract<LoadResult | SaveResult, { ok: false }>,
@@ -1306,6 +1447,9 @@ export interface LoopE2ESnapshot {
   input: {
     primaryPressed: boolean
     activePointerId: number | null
+    pointerX: number
+    pointerY: number
+    pointerKnown: boolean
   }
   commandIntent: {
     activeIntent: 'none' | 'assist_player'
@@ -1372,6 +1516,9 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
         input: {
           primaryPressed: inputState.primaryPressed,
           activePointerId: inputState.activePointerId,
+          pointerX: inputState.pointerX,
+          pointerY: inputState.pointerY,
+          pointerKnown: inputState.pointerKnown,
         },
         commandIntent: {
           activeIntent: state.commandIntentRuntime.activeIntent,
