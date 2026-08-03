@@ -178,9 +178,19 @@ def check_agy_preflight() -> dict[str, Any]:
     TTY condition — Issue #1267). preflight_agy.py is the SSOT for this schema;
     this function surfaces it unmodified at agy_preflight.auth without re-deriving
     or reconstructing the auth/keyring diagnostics (schema drift is not permitted).
+
+    Issue #1941 fix_delta P1-6: explicitly requests the `agy_capability_matrix/v1`
+    predicate set (`compute_capabilities=True`) so the real invocation path
+    actually populates it -- previously this called `run_preflight()` with no
+    arguments, so `capabilities` was always `None` on this path (only the
+    tests, which monkeypatch `check_agy_preflight()` wholesale with a
+    pre-filled fake dict, ever exercised a populated matrix). The existing
+    `ok`-boolean derivation in `_run_agy_provider_checks()` is unaffected by
+    this — it is still driven solely by `agy_preflight["ok"]`, never by the
+    capability matrix.
     """
     module = _load_preflight_agy_module()
-    return module.run_preflight()
+    return module.run_preflight(compute_capabilities=True)
 
 
 def _extract_agy_auth_failure_class(agy_preflight: dict[str, Any]) -> str | None:
@@ -641,6 +651,12 @@ def _run_agy_provider_checks(repo_root: Path | None = None, fix: bool = False) -
     if unsupported_fix:
         warnings.append("unsupported_provider_option: provider=agy does not support --fix")
 
+    # Issue #1941 AC3: surface the additive `capabilities` matrix (if the
+    # caller/producer computed one) unmodified — this consumer does NOT
+    # implement its own version/help parser and does NOT let the matrix
+    # affect the existing `ok` boolean derivation above.
+    capabilities = agy_preflight.get("capabilities") if isinstance(agy_preflight, dict) else None
+
     return {
         "ok": ok,
         "exit_code": exit_code,
@@ -648,6 +664,7 @@ def _run_agy_provider_checks(repo_root: Path | None = None, fix: bool = False) -
         "selected_provider": "agy",
         "tools": tools_result,
         "agy_preflight": agy_preflight,
+        "agy_capabilities": capabilities,
         "skipped_gemini_checks": [
             "trusted_folders",
             "serena_mcp",
