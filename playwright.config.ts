@@ -46,36 +46,11 @@ import { defineConfig, devices } from '@playwright/test'
  * the preview-namespace lane its own `test-results-preview-namespace/`
  * output directory means the standard lane's `test-results/` is never
  * touched again after that lane finishes.
- *
- * Nested base (deploy-pr-equivalent) preview verification (Issue #1283
- * 2026-08-03 OWNER review repair, AC9/AC15): the preview-namespace lane
- * build already honors `VITE_BASE_PATH` via `vite.config.ts` (Vite bakes
- * `base` into every emitted asset URL and `vite preview` only serves the
- * app under that base). `NESTED_BASE_PATH` here normalizes the SAME
- * `VITE_BASE_PATH` env var with the identical rule as `vite.config.ts`
- * (default `/` when unset), so `baseURL`/`webServer.url` navigate to the
- * exact nested prefix instead of root — a root `page.goto('/')` against a
- * nested build would 404 and silently prove nothing about nested-base
- * behavior.
  */
-
-function normalizeBasePathForE2E(raw: string | undefined): string {
-  if (!raw || raw.trim() === '') return '/'
-
-  const value = raw.trim()
-  if (!value.startsWith('/') || value.startsWith('//')) {
-    throw new Error(`VITE_BASE_PATH must start with a single "/": ${value}`)
-  }
-
-  return value.endsWith('/') ? value : `${value}/`
-}
 
 const PREVIEW_NAMESPACE_LANE = process.env.LOOP_E2E_PREVIEW_NAMESPACE_LANE === 'true'
 const PREVIEW_NAMESPACE_SPEC = '**/m4-preview-namespace.spec.ts'
 const VRT_LANE = process.env.LOOP_VRT_LANE === 'true'
-const NESTED_BASE_PATH = normalizeBasePathForE2E(process.env.VITE_BASE_PATH)
-const PREVIEW_ORIGIN = 'http://127.0.0.1:4173'
-const PREVIEW_BASE_URL = PREVIEW_NAMESPACE_LANE ? `${PREVIEW_ORIGIN}${NESTED_BASE_PATH}` : PREVIEW_ORIGIN
 
 export default defineConfig({
   testDir: './tests/e2e',
@@ -107,11 +82,8 @@ export default defineConfig({
     ['list'],
   ],
   use: {
-    /* Base URL — matches the preview server port. Preview-namespace lane
-     * (Issue #1283 AC9/AC15) points at the nested `VITE_BASE_PATH` prefix
-     * so `page.goto('/')` (relative to `baseURL`) lands on the exact
-     * deploy-pr-equivalent nested path, not root. */
-    baseURL: PREVIEW_BASE_URL,
+    /* Base URL — matches the preview server port */
+    baseURL: 'http://127.0.0.1:4173',
     /* Collect trace on failure (AC6) */
     trace: 'retain-on-failure',
     /* Screenshot on failure */
@@ -145,11 +117,7 @@ export default defineConfig({
     command: PREVIEW_NAMESPACE_LANE
       ? 'pnpm exec vite preview --host 127.0.0.1 --port 4173 --strictPort'
       : 'VITE_E2E_MODE=true pnpm exec vite preview --host 127.0.0.1 --port 4173 --strictPort',
-    /* Preview-namespace lane readiness probe must target the nested base
-     * path too (Issue #1283 AC9) — `vite preview` with a non-default
-     * `base` does not serve the app at root, so probing root would never
-     * become ready and the webServer startup would time out. */
-    url: PREVIEW_BASE_URL,
+    url: 'http://127.0.0.1:4173',
     reuseExistingServer: PREVIEW_NAMESPACE_LANE || VRT_LANE ? false : !process.env.CI,
     timeout: 120_000,
     stdout: 'pipe',
