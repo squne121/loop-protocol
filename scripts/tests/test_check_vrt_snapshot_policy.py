@@ -148,5 +148,20 @@ def test_fails_closed_for_interpolation_malformed_yaml_and_missing_wiring(tmp_pa
     assert any("wiring" in error for error in _errors(tmp_path))
 
 
+def test_rejects_component_update_script_reachable_from_ci(tmp_path: Path):
+    # AC8 (Issue #1389): UPDATE_SCRIPTS extends the required-CI reachability
+    # check from a single "test:vrt:update:e2e" string to a set that also
+    # covers "test:vrt:update:component" (the Vitest Browser Mode component
+    # VRT update script).
+    _write_repo(
+        tmp_path,
+        package_scripts={
+            "test:e2e:ci": "pnpm run test:vrt:update:component",
+            "test:vrt:update:component": "vitest run --config vitest.visual.config.ts --update",
+        },
+    )
+    assert any("test:vrt:update:component" in error for error in _errors(tmp_path))
+
+
 def test_current_repository_policy_passes():
     assert _errors(REPO_ROOT) == []

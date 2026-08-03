@@ -103,6 +103,7 @@ registry は推測ではなく現行テスト実体に基づいて分類する�
 | running-hud-paused | screenshot-baseline | pending-baseline | pending: no PNG/test | #1380 / #1375 / #1376 / #1377 / #1391 | running HUD の停止状態でも command-rail / right rail / two-column shell / `.battle-stage` 外 controls への依存がないことを明示し、pause overlay の focus / inert / keyboard 証跡を #1376 側で確認する | frozen 適用対象外。duration 等の固定は `durationMs` / `fixedDeltaMs` で判定可能な場合に限定 | pending: no PNG/test（active PASS claim 保留） | §4 の `maturity transition` を満たした時点で `pending-baseline -> frozen` | #1370 / #1375 / #1376 / #1377 / #1380 |
 | result-overlay-timeout | screenshot-baseline | pending-baseline | pending: no PNG/test | #1380 / #1376 / #1377 / #1392 | result overlay timeout の timeout 時間表現を、`elapsedTicks` 由来表示ではなく `durationMs` / `fixedDeltaMs` を優先し、result overlay の focus / inert / keyboard / dialog 証跡を #1376 側で確認する | 右寄り controls への依存や focus / inert / keyboard / dialog 条件は frozen 直前に検証 | pending: no PNG/test（active PASS claim 保留） | §4 の `maturity transition` を満たした時点で `pending-baseline -> frozen` | #1380 / #1376 / #1377 |
 | final-no-command-rail | screenshot-baseline | pending-baseline | pending: no PNG/test | #1380 / #1370 / #1377 | 最終結果画面が `command rail` 未依存でも意図読取できること。right rail / battle-stage 外依存は frozen 禁止条件 | #1370 / #1377 の影響条件を満たすまで固定化しない | pending: no PNG/test（active PASS claim 保留） | `merged PR SHA` と `artifact URL` / `artifact digest` / `environment fingerprint` が確定した時点で `legacy-current -> frozen` | #1380 / #1370 / #1377 |
+| combat-hud-running (component VRT) | screenshot-baseline | provisional | `tests/component/__screenshots__/combat-hud-running.vrt.test.ts/`（`tests/component/combat-hud-running.vrt.test.ts`。Vitest Browser Mode、Playwright E2E VRT とは別の baseline root） | #1389 / #1380 / #1370 | `createHudController()` の production DOM を `src/style.css` 適用済みで mount し、`[data-combat-hud]` のみを撮影すること（full page / Canvas / legacy result surface / command rail は撮影しない） | 色味 / 詳細配置は UI 再設計まで可変。`combat-hud-running` 以外のシナリオは本 Issue の Out of Scope | `allowedMismatchedPixelRatio: 0.02`（Vitest Browser Mode `toMatchScreenshot()` の comparator。理由: `running-hud`/`running-hud-overlay-legacy-current` と同じ combat HUD 表示だが独立した capture root であり、font-rasterization ノイズに対する余裕として比率指定を採用） | component VRT は non-required/report-only（`component-vrt-report` CI job）のままである限り maturity 遷移条件は適用しない。required gate 化する場合は別 Issue で本行を frozen 遷移条件つきに更新する | #1380（VRT rollout tracker） |
 
 ### pending-baseline / legacy-current の遷移規則
 
@@ -533,22 +534,99 @@ required check が fail して止まる。手元実行だけのゲートにし�
 
 ### component VRT / active suite 依存（コンポーネント視覚テストの前提）
 
-- 現行 repo には `@vitest/browser-playwright` と `vitest.visual.config.ts` が未導入である。
-  これらと対象 overlay module の 3 要件が揃うまでは、Component VRT は未導入として扱い、
-  上記 `running-hud-paused` / `result-overlay-timeout` /
-  `final-no-command-rail` は `pending-baseline` 維持とする。
+- Issue #1389 で `@vitest/browser-playwright@4.1.6` と `vitest.visual.config.ts` を
+  導入し、`tests/component/combat-hud-running.vrt.test.ts`（`combat-hud-running` 1
+  シナリオのみ、maturity `provisional`）を追加した。ただし
+  `running-hud-paused` / `result-overlay-timeout` / `final-no-command-rail`
+  （result / pause modal / final-no-command-rail 等の他シナリオ）は本 Issue の
+  Out of Scope のまま `pending-baseline` を維持する（対象 UI の stable module 化が
+  進んだ後続 Issue で扱う）。
 - **Playwright / Vitest baseline root 分離契約**: Playwright E2E VRT の baseline は
-  `tests/e2e/__screenshots__/` 配下にのみ置く。将来 Vitest component VRT を導入する
-  際は、専用の別ルート `tests/component/__screenshots__/`（予約済み）配下にのみ
-  baseline を置き、両者のディレクトリを混線させない。
+  `tests/e2e/__screenshots__/` 配下にのみ置く。Vitest component VRT の baseline は
+  専用の別ルート `tests/component/__screenshots__/` 配下にのみ置き、両者の
+  ディレクトリを混線させない。
   `scripts/check-visual-artifact-pipeline.py` はこの 2 ルートを定数として保持し、
   capture の宣言ディレクトリがどちらのルートにも一致しない、または誤って
   Vitest 側ルートに置かれている場合は hard fail する。
+- **component VRT の comparator 監査（AC10, Issue #1389）**:
+  `scripts/check-visual-artifact-pipeline.py` は
+  `tests/component/**/*.vrt.test.ts` の `.toMatchScreenshot()` 呼び出しを
+  `extract_derived_vitest_component_captures()` で静的に再導出し、
+  `validate_vitest_component_captures()` で comparator（`allowedMismatchedPixels` /
+  `allowedMismatchedPixelRatio` / `threshold` のいずれか）と snapshot root が
+  `tests/component/__screenshots__/` 配下であることを hard fail 検査する。この
+  audit は `jobs.e2e` の宣言済み `CAPTURES` 配列との cross-validation（Playwright
+  専用、上記「capture 単位の CI 証跡契約」参照）とは独立しており、
+  `component-vrt-report` CI job は non-required/report-only のため対応する
+  declared-in-workflow の `CAPTURES` 配列は持たない。
+- **CI 配線（Issue #1389）**: `.github/workflows/ci.yml` の `component-vrt-report`
+  job は non-required（branch protection の required check には登録しない）で
+  `pnpm test:vrt:component` を実行し、`continue-on-error` / `|| true` を使わず
+  実際の exit code をそのまま job の conclusion に反映する。artifact upload と
+  summary step は `if: ${{ always() }}` で実行し、
+  `tests/component/__screenshots__/`（committed baseline と、mismatch 時の
+  actual/expected/diff）を artifact として保存する。この job の pass/fail が
+  `ci-verdict-summary` の merge-ready 判定を絶対にブロックしないよう、
+  `.claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py` の
+  `CLASSIFICATION_MAP` に `("ci", "component-vrt-report"): "excluded"` を登録
+  済み（Scope Delta）。
 - `active CI suites` と `check-visual-artifact-pipeline` の `cross-validation` が揃っていない場合、`legacy-current` / `pending-baseline`
   からの frozen 昇格は保留する。frozen 昇格時には `merged PR SHA`、`CI summary`、`artifact path` を再確認する。
 - `focus` / `inert` / `keyboard` / `dialog` の振る舞いを理由に frozen 昇格を代替しない。#1373-#1376 の
   `behavior test`（フォーカス移動 / inert 化 / キーボード遷移 / dialog 開閉）が完了していることを
   先行条件として参照する。
+
+### component VRT の PR #1977 review fix（OWNER REQUEST_CHANGES 対応、明示）
+
+PR #1977（Issue #1389）は OWNER の詳細な REQUEST_CHANGES（既存 `impl-review-loop: APPROVE`
+を上書きするマージ前必須条件）を受け、以下 5 点を修正した。
+
+- **hidden attachment upload の欠落**: `.github/workflows/ci.yml` の
+  `component-vrt-report` job の `actions/upload-artifact@v6` step に
+  `include-hidden-files: true` を追加した。`.vitest-attachments/` は隠しディレクトリ
+  （dot-prefixed）であり、`include-hidden-files` なしでは失敗時の actual/diff 画像が
+  silent に artifact から欠落し得る問題を修正した。加えて、意図的な visual mismatch を
+  発生させる controlled negative control fixture
+  （`tests/component/__negative_control__/hidden-attachment-negative-control.vrt.test.ts`。
+  実 baseline とは別の committed reference PNG を持つ throwaway 用途。
+  `VITE_VRT_NEGATIVE_CONTROL=true` gate で通常実行時は skip）を追加し、CI 側で
+  upload → download → `*-actual-*.png`/`*-diff-*.png` の存在確認まで実施することで、
+  「YAML が正しく見える」だけでなく hidden-file upload が実際に機能することを証明する。
+- **snapshot root 監査の循環参照**: `scripts/check-visual-artifact-pipeline.py` の
+  `extract_derived_vitest_component_captures()` が自己生成した期待値と自己比較していた
+  circularity を修正した。`vitest.visual.config.ts` の実際の `test.include` パターンと
+  screenshot directory 設定（`parse_vitest_visual_config()`）から directory を導出し、
+  実際に committed された PNG ファイルと突合する。`vitest.visual.config.ts` は
+  Vitest 4.1.6 の `browser.screenshotDirectory` shorthand が config 正規化時に絶対パス化
+  され `@vitest/browser` 側の `resolveScreenshotPath` デフォルトと二重結合してバグる
+  （ローカル再現済み）ため、`browser.expect.toMatchScreenshot.resolveScreenshotPath` を
+  明示実装する形で AC4 を満たす（`vitest.visual.config.ts` 内コメント参照）。`test.include`
+  も `tests/component/*.vrt.test.ts`（非再帰）に制限し、nested spec が audit 対象外の
+  root へ silent に解決される経路を防いだ。mutation test
+  （`test_extract_derived_vitest_component_captures_mutation_wrong_screenshot_directory_fails`）
+  で、config の screenshot directory を変更すると validator が実際に fail することを確認した。
+- **comparator 監査の Vitest 仕様不一致**: `allowedMismatchedPixels` /
+  `allowedMismatchedPixelRatio` を mutually exclusive として拒否していた誤りを修正し、
+  Vitest 同様に両方の併記を許可した（厳しい方が適用される）。コメント/文字列を mask した
+  構造解析（`_parse_vitest_comparator_options()`）に置き換え、コメントアウトされた
+  comparator option が誤検出されないことを regression test で確認した。数値範囲
+  （ratio/threshold は `[0, 1]`、pixels は非負整数）・型検証、`comparatorOptions` の
+  直接プロパティのみを対象とする scoping、spread/変数参照/計算プロパティの fail-closed
+  も追加した。
+- **capture 0 件時の silent pass**: `cross_validate_component_vrt_captures()` を追加し、
+  `docs/dev/visual-baseline-registry.md`（本ファイル）の component VRT registry
+  エントリと、derived capture を 1 対 1 で cross-validate する。capture 0 件、
+  missing PNG、orphan PNG、重複 capture id、comparator/directory drift を
+  hard fail にする。
+- **freeze CSS 未再利用**: `tests/component/combat-hud-running.vrt.test.ts` が
+  `tests/e2e/visual.freeze.css`（read-only import。当該ファイル自体は Allowed Paths 外の
+  ため変更していない）を読み込むよう変更した。mount container には既に
+  `data-battle-ui-root` 属性があり、freeze CSS の font-family pin / animation 停止が
+  直接適用される。baseline PNG は CI-pinned Docker container
+  （`mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948`。
+  前回 iteration と同一 digest）内で freeze CSS 適用後に再生成し、同一 container 内で
+  複数回実行して pixel drift がないことを確認した（evidence は PR #1977 本文 / commit
+  message に記録する）。
 
 ## 6. 関連
 
