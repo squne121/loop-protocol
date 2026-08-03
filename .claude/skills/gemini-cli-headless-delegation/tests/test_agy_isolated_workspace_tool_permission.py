@@ -3,7 +3,8 @@
 Covers AC3 (materialize_isolated_agy_workspace() writes a real AGY
 settings.json with an explicit toolPermission under the isolated workspace)
 and AC5 (grounded_research profile hermetic tool-permission/tool-deny
-regression coverage after the fix), without regressing the tool deny matrix
+regression coverage after the fix), without regressing the legacy wrapper
+expectation matrix
 established by Issue #1705 / #1740 / #1743.
 """
 
@@ -85,7 +86,7 @@ def test_isolated_workspace_injects_tool_permission_for_grounded_research(
         # value that removes AGY's own confirmation gate entirely -- required
         # because headless print mode (`agy -p`) has nobody to answer a
         # "request-review" (the AGY built-in default) confirmation prompt.
-        assert content == {"toolPermission": "always-proceed"}
+        assert content == app.build_official_agy_settings(app.GROUNDED_RESEARCH_PROFILE)
     finally:
         import shutil
 
@@ -105,7 +106,7 @@ def test_isolated_workspace_injects_tool_permission_for_every_profile(
             assert workspace.agy_tool_permission_settings_path is not None
             assert workspace.agy_tool_permission_settings_path.is_file()
             content = json.loads(workspace.agy_tool_permission_settings_path.read_text(encoding="utf-8"))
-            assert content == {"toolPermission": "always-proceed"}
+            assert content == app.build_official_agy_settings(profile)
         finally:
             import shutil
 
@@ -136,7 +137,7 @@ def test_tool_permission_injection_never_reuses_real_host_settings(
     try:
         content_text = workspace.agy_tool_permission_settings_path.read_text(encoding="utf-8")
         assert "/should/never/leak" not in content_text
-        assert json.loads(content_text) == {"toolPermission": "always-proceed"}
+        assert json.loads(content_text) == app.build_official_agy_settings(app.GROUNDED_RESEARCH_PROFILE)
         assert str(fake_real_home) not in workspace.env.get("HOME", "")
     finally:
         import shutil
@@ -149,9 +150,9 @@ def test_tool_permission_injection_never_reuses_real_host_settings(
 # local_asset_research fully deny all AGY direct tools; grounded_research
 # allows exactly search_web/read_url_content) must remain unaffected by the
 # toolPermission injection -- `resolve_tool_permission()` never consults
-# AGY's own toolPermission value; the workspace-scoped `.antigravity/
-# settings.json` deny policy + `workspace_deny_gate` PreToolCall hook remain
-# the sole tool-allowlist authority.
+# AGY's own toolPermission value.  The workspace-scoped `.antigravity/`
+# document is retained only as a legacy expectation fixture; the isolated
+# HOME settings and PreToolUse hook are Issue #1814's runtime boundaries.
 # ---------------------------------------------------------------------------
 
 

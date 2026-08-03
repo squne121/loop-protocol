@@ -47,6 +47,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,9 +105,7 @@ ALLOWED_PROFILES: frozenset[str] = frozenset(
 AGY_AUTH_PROFILE_MINIMAL = "auth_minimal"
 AGY_AUTH_PROFILE_EXTENDED = "auth_extended"
 
-ALLOWED_AUTH_PROFILES: frozenset[str] = frozenset(
-    {AGY_AUTH_PROFILE_MINIMAL, AGY_AUTH_PROFILE_EXTENDED}
-)
+ALLOWED_AUTH_PROFILES: frozenset[str] = frozenset({AGY_AUTH_PROFILE_MINIMAL, AGY_AUTH_PROFILE_EXTENDED})
 
 # Profiles for which materialize_isolated_agy_workspace() fail-closes
 # (refuses to create a workspace at all) when the real agy OAuth token file
@@ -118,9 +117,7 @@ ALLOWED_AUTH_PROFILES: frozenset[str] = frozenset(
 # filesystem/tool-call attack surface materially widened by a readable
 # (but not kernel-enforced-read-only) token symlink, so degraded-mode
 # continuation is judged acceptable for them (Issue #1779 In Scope item 2).
-_AUTH_READONLY_FAIL_CLOSED_PROFILES: frozenset[str] = frozenset(
-    {NO_TOOLS_PROFILE, LOCAL_ASSET_RESEARCH_PROFILE}
-)
+_AUTH_READONLY_FAIL_CLOSED_PROFILES: frozenset[str] = frozenset({NO_TOOLS_PROFILE, LOCAL_ASSET_RESEARCH_PROFILE})
 
 
 class AgyReadOnlyBoundaryError(RuntimeError):
@@ -134,7 +131,18 @@ class AgyReadOnlyBoundaryError(RuntimeError):
     profile's read-only guarantee.
     """
 
-# Canonical taxonomy of the AGY *direct* tool surface this policy governs:
+
+class AgyPermissionSettingsError(RuntimeError):
+    """The primary official permission settings could not be materialized.
+
+    A restrictive profile must never launch AGY after this error: absent
+    official deny settings can restore AGY's workspace-default permissions.
+    """
+
+
+# Legacy expectation taxonomy of the AGY *direct* tool surface.  It remains
+# for older hermetic wrapper tests only; AGY does not consume it as a runtime
+# permission source.
 # shell/command execution, filesystem, MCP, GitHub, browser, and web tools.
 # This is used to populate the explicit `deny` list in the generated policy
 # document (informational / auditable) -- the actual enforcement is via
@@ -162,6 +170,31 @@ AGY_DIRECT_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# Official AGY permission resources are deliberately distinct from the native
+# hook tool names above.  The runtime settings format consumes
+# ``action(target)`` rules (for example ``command(*)``), whereas a PreToolUse
+# event reports a native dispatcher name such as ``run_command``.  Keeping
+# the two vocabularies separate prevents a native tool name from being
+# accidentally serialized as an official permission rule.
+CANONICAL_PERMISSION_RESOURCES: frozenset[str] = frozenset(
+    {
+        "command",
+        "read_file",
+        "write_file",
+        "read_url",
+        "execute_url",
+        "unsandboxed",
+        "mcp",
+    }
+)
+
+PROFILE_ALLOWED_PERMISSION_RESOURCES: dict[str, frozenset[str]] = {
+    NO_TOOLS_PROFILE: frozenset(),
+    LOCAL_ASSET_RESEARCH_PROFILE: frozenset(),
+    GROUNDED_RESEARCH_PROFILE: frozenset({"read_url"}),
+    PROPOSAL_ONLY_PROFILE: frozenset(),
+}
+
 GROUNDED_RESEARCH_ALLOWLIST: frozenset[str] = frozenset({"search_web", "read_url_content"})
 
 PROFILE_ALLOWED_TOOLS: dict[str, frozenset[str]] = {
@@ -187,9 +220,7 @@ WRAPPER_SERENA_SOURCE = "wrapper_serena_mcp"
 
 def validate_profile(profile: str) -> None:
     if profile not in ALLOWED_PROFILES:
-        raise ValueError(
-            f"unknown AGY tool_profile: {profile!r}; expected one of {sorted(ALLOWED_PROFILES)}"
-        )
+        raise ValueError(f"unknown AGY tool_profile: {profile!r}; expected one of {sorted(ALLOWED_PROFILES)}")
 
 
 def profile_allowed_tools(profile: str) -> frozenset[str]:
@@ -204,14 +235,11 @@ def profile_allowed_tools(profile: str) -> frozenset[str]:
 
 
 def build_workspace_permission_policy(profile: str) -> dict[str, Any]:
-    """Build the workspace-scoped permission policy document for *profile*.
+    """Build a legacy, wrapper-side expectation document for *profile*.
 
-    This is the document written into the isolated workspace's
-    `.antigravity/settings.json`. `permissions.default` is always `"deny"`;
-    only tool names in `permissions.allow` may execute. For every profile in
-    this Issue's scope (`no_tools` / `local_asset_research` / `proposal_only`)
-    `permissions.allow` is empty -- AGY direct tools are fully denied.
-    `grounded_research` allows exactly `search_web` and `read_url_content`.
+    This is not an official AGY settings file and does not enforce an AGY
+    runtime decision.  Issue #1814 uses the isolated HOME's official
+    settings and an independent PreToolUse hook for that purpose.
     """
     validate_profile(profile)
     allow = sorted(PROFILE_ALLOWED_TOOLS[profile])
@@ -266,14 +294,66 @@ def resolve_tool_permission(
 
     `global_settings` is accepted only to make the config-precedence
     guarantee explicit and testable: it is intentionally **never** consulted
-    to widen the workspace allowlist. Workspace-scoped deny always wins over
-    a global allow (Issue #1705 AC5/AC6), including when `global_settings`
-    is a `hostile_global_settings_fixture()` that allows everything.
+    to widen this legacy expectation model.  It is not an official AGY
+    permission decision.
     """
     validate_profile(profile)
     del global_settings  # intentionally unused: workspace policy is authoritative
     allowed = PROFILE_ALLOWED_TOOLS[profile]
     return "allow" if tool_name in allowed else "deny"
+
+
+def _permission_action(resource: str, target: str = "*") -> str:
+    """Return the official settings spelling for one permission resource."""
+    if resource not in CANONICAL_PERMISSION_RESOURCES:
+        raise ValueError(f"unknown official AGY permission resource: {resource!r}")
+    return f"{resource}({target})"
+
+
+def build_official_agy_settings(profile: str) -> dict[str, Any]:
+    """Build the isolated HOME's official AGY settings document.
+
+    The CLI consumes this document from
+    ``~/.gemini/antigravity-cli/settings.json``.  ``permissions.deny`` is a
+    list of official ``action(target)`` rules and is the primary expectation
+    model for restrictive profiles.  ``toolPermission`` only suppresses an
+    interactive confirmation prompt; it is never treated as a deny boundary.
+    """
+    validate_profile(profile)
+    allowed = PROFILE_ALLOWED_PERMISSION_RESOURCES[profile]
+    denied = CANONICAL_PERMISSION_RESOURCES - allowed
+    return {
+        "toolPermission": AGY_TOOL_PERMISSION_ALWAYS_PROCEED,
+        "permissions": {
+            "deny": [_permission_action(resource) for resource in sorted(denied)],
+            "ask": [],
+            "allow": [_permission_action(resource) for resource in sorted(allowed)],
+        },
+    }
+
+
+def resolve_official_permission_action(settings: Mapping[str, Any], resource: str, target: str = "*") -> str:
+    """Evaluate the settings expectation model with explicit deny precedence.
+
+    This helper is intentionally an expectation/test model, not a substitute
+    for the real AGY runtime.  It makes hostile ``ask``/``allow`` fixtures
+    deterministic: a matching official deny is always returned as ``deny``.
+    Unknown or malformed values also fail closed to ``deny``.
+    """
+    try:
+        action = _permission_action(resource, target)
+    except ValueError:
+        return "deny"
+    permissions = settings.get("permissions")
+    if not isinstance(permissions, Mapping):
+        return "deny"
+    for decision in ("deny", "ask", "allow"):
+        rules = permissions.get(decision)
+        if not isinstance(rules, list) or not all(isinstance(rule, str) for rule in rules):
+            continue
+        if action in rules or _permission_action(resource) in rules:
+            return decision
+    return "deny"
 
 
 # ---------------------------------------------------------------------------
@@ -582,9 +662,7 @@ def _bwrap_available() -> bool:
     return shutil.which("bwrap") is not None
 
 
-def _build_bwrap_ro_bind_prefix(
-    scratch_dir: Path, ro_bind_pairs: Sequence[tuple[Path, Path]]
-) -> list[str]:
+def _build_bwrap_ro_bind_prefix(scratch_dir: Path, ro_bind_pairs: Sequence[tuple[Path, Path]]) -> list[str]:
     """Build a `bwrap` argv prefix that kernel-enforces read-only access to
     each `dest` in *ro_bind_pairs*, prepended to the real `agy` subprocess
     argv by `run_gemini_headless.py::_run_agy()`.
@@ -615,10 +693,13 @@ def _build_bwrap_ro_bind_prefix(
     return argv
 
 
-# Issue #1758: AGY's *own* built-in safety preset -- distinct from and
-# evaluated *before* this module's workspace-scoped `.antigravity/settings.json`
-# deny policy / `workspace_deny_gate` PreToolCall hook above -- is controlled by
-# a `toolPermission` field inside the real AGY settings file
+# AGY's official runtime settings live under the isolated HOME, not under the
+# legacy expectation-only `.antigravity/` directory.  ``toolPermission`` is a
+# confirmation policy and the official ``permissions`` object contains the
+# primary restrictive rules.
+#
+# Issue #1758: AGY's *own* built-in confirmation preset is controlled by a
+# `toolPermission` field inside the real AGY settings file
 # (`~/.gemini/antigravity-cli/settings.json`, confirmed via live WebFetch of
 # `https://antigravity.google/docs/cli/reference` /
 # `https://antigravity.google/docs/cli/using`; see
@@ -646,9 +727,8 @@ AGY_TOOL_PERMISSION_ALWAYS_PROCEED = "always-proceed"
 AGY_SETTINGS_FILENAME = "settings.json"
 
 
-def _write_agy_tool_permission_settings(isolated_home: Path) -> "Path | None":
-    """Write `<isolated_home>/.gemini/antigravity-cli/settings.json` with an
-    explicit `toolPermission: "always-proceed"` value.
+def _write_agy_tool_permission_settings(isolated_home: Path, profile: str) -> Path:
+    """Write official restrictive settings under an isolated AGY HOME.
 
     Unlike `_expose_gcloud_adc_read_only()` / `_expose_agy_oauth_token_read_only()`
     above, this function never reads or reuses any value from the real host's
@@ -660,24 +740,39 @@ def _write_agy_tool_permission_settings(isolated_home: Path) -> "Path | None":
     happens to have configured on their real host) rather than symlinking the
     real settings file the way the OAuth token / gcloud ADC exposures do.
 
-    Returns the path to the written file, or `None` if directory creation or
-    the write itself fails for any reason -- like the other exposure helpers
-    in this module, this is an additive reachability improvement, never a
-    hard requirement for workspace materialization to succeed.
+    The operation is atomic and fail-closed: content is written to a private
+    temporary file, JSON-read back, mode-checked, atomically renamed, then
+    read back again.  Any failure raises ``AgyPermissionSettingsError``;
+    callers must stop before starting AGY.
     """
     settings_dir = isolated_home / ".gemini" / ANTIGRAVITY_CLI_DIRNAME
     try:
         settings_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return None
+    except OSError as exc:
+        raise AgyPermissionSettingsError("settings_directory_create_failed") from exc
     settings_path = settings_dir / AGY_SETTINGS_FILENAME
+    expected = build_official_agy_settings(profile)
+    encoded = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    temporary = settings_dir / f".{AGY_SETTINGS_FILENAME}.{next(tempfile._get_candidate_names())}.tmp"
     try:
-        settings_path.write_text(
-            json.dumps({"toolPermission": AGY_TOOL_PERMISSION_ALWAYS_PROCEED}, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-    except OSError:
-        return None
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o600)
+        if temporary.read_bytes() != encoded or stat.S_IMODE(temporary.stat().st_mode) != 0o600:
+            raise AgyPermissionSettingsError("settings_temporary_readback_failed")
+        os.replace(temporary, settings_path)
+        if settings_path.read_bytes() != encoded or stat.S_IMODE(settings_path.stat().st_mode) != 0o600:
+            raise AgyPermissionSettingsError("settings_final_readback_failed")
+    except (OSError, ValueError, TypeError) as exc:
+        raise AgyPermissionSettingsError("settings_materialization_failed") from exc
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
     return settings_path
 
 
@@ -721,10 +816,7 @@ def materialize_isolated_agy_workspace(
     """
     validate_profile(profile)
     if auth_profile not in ALLOWED_AUTH_PROFILES:
-        raise ValueError(
-            f"unknown AGY auth_profile: {auth_profile!r}; expected one of "
-            f"{sorted(ALLOWED_AUTH_PROFILES)}"
-        )
+        raise ValueError(f"unknown AGY auth_profile: {auth_profile!r}; expected one of {sorted(ALLOWED_AUTH_PROFILES)}")
 
     # Issue #1779 AC7: fail-closed *before* any workspace is created (not
     # merely annotated as degraded) when a security-sensitive profile cannot
@@ -851,7 +943,14 @@ def materialize_isolated_agy_workspace(
     # toolPermission so the isolated `agy` subprocess does not fall back to
     # the built-in "request-review" default, which silently drops tool calls
     # in headless print mode; see `_write_agy_tool_permission_settings()`.
-    agy_tool_permission_settings_path = _write_agy_tool_permission_settings(workspace_dir)
+    try:
+        agy_tool_permission_settings_path = _write_agy_tool_permission_settings(workspace_dir, profile)
+    except AgyPermissionSettingsError:
+        # The official settings are the primary boundary, not optional
+        # reachability metadata.  Remove the incomplete isolated workspace
+        # and fail before any caller can construct an AGY command.
+        shutil.rmtree(workspace_dir, ignore_errors=True)
+        raise
 
     # Issue #1779 AC4/AC5/AC6: determine the actual (not merely claimed)
     # read-only enforcement mode for `agy_oauth_token_path`, and build the
@@ -864,14 +963,9 @@ def materialize_isolated_agy_workspace(
         # real_token_file is not None here: agy_oauth_token_path (a symlink
         # to it) was just successfully created above.
         ro_bind_pairs: list[tuple[Path, Path]] = [(real_token_file, agy_oauth_token_path)]  # type: ignore[list-item]
-        if agy_tool_permission_settings_path is not None:
-            ro_bind_pairs.append(
-                (agy_tool_permission_settings_path, agy_tool_permission_settings_path)
-            )
+        ro_bind_pairs.append((agy_tool_permission_settings_path, agy_tool_permission_settings_path))
         agy_oauth_token_readonly_mode = AGY_OAUTH_TOKEN_READONLY_KERNEL_ENFORCED
-        agy_oauth_token_bwrap_prefix = _build_bwrap_ro_bind_prefix(
-            agy_oauth_token_path.parent, ro_bind_pairs
-        )
+        agy_oauth_token_bwrap_prefix = _build_bwrap_ro_bind_prefix(agy_oauth_token_path.parent, ro_bind_pairs)
     else:
         agy_oauth_token_readonly_mode = AGY_OAUTH_TOKEN_READONLY_DEGRADED
         agy_oauth_token_bwrap_prefix = None
@@ -911,9 +1005,7 @@ def find_credential_like_files(workspace: IsolatedAgyWorkspace) -> list[Path]:
     `workspace.workspace_dir` must still be exactly what
     `materialize_isolated_agy_workspace()` freshly created.
     """
-    exposed_paths = [
-        p for p in (workspace.gcloud_adc_path, workspace.agy_oauth_token_path) if p is not None
-    ]
+    exposed_paths = [p for p in (workspace.gcloud_adc_path, workspace.agy_oauth_token_path) if p is not None]
     hits: list[Path] = []
     for path in workspace.workspace_dir.rglob("*"):
         excluded = False
@@ -1076,9 +1168,7 @@ def classify_tool_call_events(
         else:
             unexpected_tool_calls.append(event)
 
-    executed_direct_count = sum(
-        1 for e in (expected_tool_calls + unexpected_tool_calls) if e.get("executed") is True
-    )
+    executed_direct_count = sum(1 for e in (expected_tool_calls + unexpected_tool_calls) if e.get("executed") is True)
 
     return {
         "schema": SCHEMA_GATE_RESULT,
@@ -1121,9 +1211,7 @@ def build_agy_run_context(
     the actual `agy` subprocess argv when kernel enforcement is available.
     """
     validate_profile(profile)
-    workspace = materialize_isolated_agy_workspace(
-        profile, parent_dir=parent_dir, auth_profile=auth_profile
-    )
+    workspace = materialize_isolated_agy_workspace(profile, parent_dir=parent_dir, auth_profile=auth_profile)
     return {
         "profile": profile,
         "workspace_dir": str(workspace.workspace_dir),
@@ -1132,8 +1220,6 @@ def build_agy_run_context(
         "env": dict(workspace.env),
         "agy_oauth_token_readonly_mode": workspace.agy_oauth_token_readonly_mode,
         "agy_oauth_token_bwrap_prefix": (
-            list(workspace.agy_oauth_token_bwrap_prefix)
-            if workspace.agy_oauth_token_bwrap_prefix is not None
-            else None
+            list(workspace.agy_oauth_token_bwrap_prefix) if workspace.agy_oauth_token_bwrap_prefix is not None else None
         ),
     }

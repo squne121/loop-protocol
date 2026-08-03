@@ -53,6 +53,61 @@ ALL_DENY_PROFILES = [
 ]
 
 
+def test_official_settings_deny_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Official isolated settings use resource ``action(target)`` deny rules.
+
+    ``ask`` and ``allow`` are deliberately hostile here: a matching deny
+    still wins, so the expectation model cannot accidentally treat a
+    confirmation policy as a hard permission boundary.
+    """
+    settings = app.build_official_agy_settings(app.NO_TOOLS_PROFILE)
+    denied = set(settings["permissions"]["deny"])
+    assert denied == {f"{resource}(*)" for resource in app.CANONICAL_PERMISSION_RESOURCES}
+    assert settings["toolPermission"] == app.AGY_TOOL_PERMISSION_ALWAYS_PROCEED
+
+    hostile = {
+        "permissions": {
+            "deny": settings["permissions"]["deny"],
+            "ask": ["command(*)"],
+            "allow": ["command(*)"],
+        }
+    }
+    assert app.resolve_official_permission_action(hostile, "command", "anything") == "deny"
+    assert app.resolve_official_permission_action(hostile, "read_file", "anything") == "deny"
+
+    fake_home = tmp_path / "real-home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    workspace = app.materialize_isolated_agy_workspace(app.NO_TOOLS_PROFILE, parent_dir=tmp_path)
+    try:
+        assert workspace.agy_tool_permission_settings_path == (
+            workspace.workspace_dir / ".gemini" / "antigravity-cli" / "settings.json"
+        )
+        assert json.loads(workspace.agy_tool_permission_settings_path.read_text(encoding="utf-8")) == settings
+    finally:
+        import shutil
+
+        shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
+def test_official_settings_writer_is_atomic_readback_checked_and_mode_restricted(tmp_path: Path) -> None:
+    path = app._write_agy_tool_permission_settings(tmp_path / "isolated-home", app.NO_TOOLS_PROFILE)
+    assert json.loads(path.read_text(encoding="utf-8")) == app.build_official_agy_settings(app.NO_TOOLS_PROFILE)
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert not list(path.parent.glob(".settings.json.*.tmp"))
+
+
+def test_materialization_stops_when_primary_official_settings_cannot_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> Path:
+        raise app.AgyPermissionSettingsError("injected_write_failure")
+
+    monkeypatch.setattr(app, "_write_agy_tool_permission_settings", fail)
+    with pytest.raises(app.AgyPermissionSettingsError):
+        app.materialize_isolated_agy_workspace(app.NO_TOOLS_PROFILE, parent_dir=tmp_path)
+    assert not list(tmp_path.glob("agy-isolated-*"))
+
+
 # ---------------------------------------------------------------------------
 # AC1: no_tools profile denies all AGY direct tools
 # ---------------------------------------------------------------------------
@@ -136,16 +191,12 @@ def test_hostile_global_settings_do_not_override_workspace_deny() -> None:
     for profile in ALL_DENY_PROFILES:
         for tool_name in sorted(app.AGY_DIRECT_TOOL_NAMES):
             decision = app.resolve_tool_permission(profile, tool_name, global_settings=hostile)
-            assert decision == "deny", (
-                f"hostile global settings must not widen {profile!r} allowlist for {tool_name!r}"
-            )
+            assert decision == "deny", f"hostile global settings must not widen {profile!r} allowlist for {tool_name!r}"
 
     # grounded_research: hostile global settings must not widen the exact
     # allowlist beyond search_web / read_url_content either.
     for tool_name in sorted(app.AGY_DIRECT_TOOL_NAMES - {"search_web", "read_url_content"}):
-        decision = app.resolve_tool_permission(
-            app.GROUNDED_RESEARCH_PROFILE, tool_name, global_settings=hostile
-        )
+        decision = app.resolve_tool_permission(app.GROUNDED_RESEARCH_PROFILE, tool_name, global_settings=hostile)
         assert decision == "deny"
 
     # the isolated workspace env also structurally isolates HOME/XDG_* away
@@ -176,10 +227,7 @@ def test_workspace_hook_deny_precedence_over_global_allow() -> None:
     # which global_settings payload is supplied (including None / omitted).
     for global_settings in (None, {}, hostile):
         for profile in ALL_DENY_PROFILES:
-            assert (
-                app.resolve_tool_permission(profile, "shell", global_settings=global_settings)
-                == "deny"
-            )
+            assert app.resolve_tool_permission(profile, "shell", global_settings=global_settings) == "deny"
 
 
 # ---------------------------------------------------------------------------
@@ -192,9 +240,7 @@ def test_denied_tool_attempt_is_recorded_secret_safe() -> None:
         "command": "curl -H 'Authorization: Bearer sk-abcdefghijklmnopqrstuvwx' https://internal",
         "cwd": "/home/realuser/secret-project",
     }
-    record = app.record_denied_tool_attempt(
-        app.NO_TOOLS_PROFILE, "shell", raw_args=secret_args
-    )
+    record = app.record_denied_tool_attempt(app.NO_TOOLS_PROFILE, "shell", raw_args=secret_args)
     assert record["schema"] == app.SCHEMA_DENIED_EVENT
     assert record["decision"] == "deny"
     assert record["tool_name"] == "shell"
@@ -271,9 +317,7 @@ def test_profile_result_counts_match_gate_predicates() -> None:
     local_asset_events = [
         {"tool_name": "find_symbol", "source": app.WRAPPER_SERENA_SOURCE, "executed": True},
     ]
-    local_asset_result = app.classify_tool_call_events(
-        app.LOCAL_ASSET_RESEARCH_PROFILE, local_asset_events
-    )
+    local_asset_result = app.classify_tool_call_events(app.LOCAL_ASSET_RESEARCH_PROFILE, local_asset_events)
     assert local_asset_result["agy_direct_tool_calls_count"] == 0
 
     # grounded_research: unexpected tool calls count is 0 when only the
@@ -334,9 +378,7 @@ def test_result_preserves_retrieval_and_analysis_actor_fields() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_isolated_workspace_does_not_copy_credential_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_isolated_workspace_does_not_copy_credential_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Simulate a real $HOME that has credential-bearing files sitting next
     # to it, to prove materialize_isolated_agy_workspace() never reaches
     # into (or copies out of) that directory.
@@ -377,13 +419,12 @@ def test_isolated_workspace_does_not_copy_credential_files(
             settings_text = workspace.settings_path.read_text(encoding="utf-8")
             assert "should-never-be-copied" not in settings_text
             assert str(fake_real_home) not in workspace.env.get("HOME", "")
-            # Issue #1758: the real-AGY-settings file is always a fresh
-            # fixed-value document, never a copy/reuse of the fake real
-            # home's settings.json (which sets permissions.default: "allow").
-            tool_permission_text = workspace.agy_tool_permission_settings_path.read_text(encoding="utf-8")
-            assert "should-never-be-copied" not in tool_permission_text
-            assert "permissions" not in tool_permission_text
-            assert json.loads(tool_permission_text) == {"toolPermission": "always-proceed"}
+            # The official settings file is always fresh and never reuses the
+            # hostile real-home policy.  It contains the Issue #1814 primary
+            # ``permissions.deny`` boundary alongside confirmation policy.
+            official_settings_text = workspace.agy_tool_permission_settings_path.read_text(encoding="utf-8")
+            assert "should-never-be-copied" not in official_settings_text
+            assert json.loads(official_settings_text) == app.build_official_agy_settings(profile)
         finally:
             import shutil
 
