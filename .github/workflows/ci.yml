@@ -702,44 +702,37 @@ jobs:
           esac
           echo "namespace=$namespace" >> "$GITHUB_OUTPUT"
           echo "expected_key=loop-protocol.preview.${namespace}.mvp.save" >> "$GITHUB_OUTPUT"
-      - name: Build for AC9 preview-namespace lane (timed)
-        # Clean dist + production-like build (no VITE_E2E_MODE) — see
-        # tests/e2e/m4-preview-namespace.spec.ts file header and
-        # playwright.config.ts LOOP_E2E_PREVIEW_NAMESPACE_LANE handling.
-        id: timed-build-preview-namespace
-        env:
-          VITE_E2E_MODE: "false"
-          VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.preview-namespace.outputs.namespace }}
-        run: |
-          run_timed() {
-            local step_id="$1"; shift
-            local start_ms end_ms elapsed_ms status
-            start_ms=$(date +%s%3N)
-            set +e
-            "$@"
-            status=$?
-            set -e
-            end_ms=$(date +%s%3N)
-            elapsed_ms=$((end_ms - start_ms))
-            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
-              "$step_id" "$step_id" "$status" "$elapsed_ms" \
-              >> measurements.jsonl
-            return $status
-          }
-          run_timed clean_dist_preview_namespace rm -rf dist
-          run_timed pnpm_build_preview_namespace pnpm build
-      - name: Verify preview-namespace production dist E2E boundary
-        run: pnpm dist:e2e-boundary --mode production --dist dist
-      - name: Run AC9 preview-namespace E2E lane (timed)
-        # LOOP_E2E_PREVIEW_NAMESPACE_LANE=true selects the dedicated
-        # playwright.config.ts testMatch (only this spec) and forces
-        # reuseExistingServer: false. LOOP_EXPECTED_STORAGE_KEY is required
-        # by the spec — it throws (hard FAIL, not a skip) if unset or equal
-        # to the production key.
+          # Issue #1283 (2026-08-03 OWNER review repair, AC9/AC15): deploy-pr
+          # equivalent nested base -- matches deploy-pages.yml deploy-pr job
+          # (Resolve Vite base path step).
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          base_path="/${repo_name}/${namespace}/"
+          case "$base_path" in
+            /*/) ;;
+            *) echo "Invalid preview base path: $base_path" >&2; exit 1 ;;
+          esac
+          echo "base_path=$base_path" >> "$GITHUB_OUTPUT"
+      - name: Run AC9 preview-namespace lane via pnpm run test:e2e:preview-namespace (timed)
+        # Issue #1283 repair iteration 1 (P1 Blocker 4): CI previously
+        # reimplemented the build + dist:e2e-boundary + playwright
+        # invocation directly instead of calling the package.json script
+        # whose fail-closed guard this Issue hardens -- so a broken guard
+        # would stay green in CI even though the guard itself never ran.
+        # This step now calls the SAME `pnpm run test:e2e:preview-namespace`
+        # script a local dedicated-lane invocation uses (guard validation +
+        # clean dist + production build + dist:e2e-boundary check +
+        # Playwright run), so CI actually exercises the guard.
+        # GITHUB_REPOSITORY is set by default on GitHub-hosted runners, so
+        # the guard's VITE_BASE_PATH-vs-repo-name cross-check (P1 Blocker 4)
+        # is active here.
         id: timed-e2e-preview-namespace
         env:
-          LOOP_E2E_PREVIEW_NAMESPACE_LANE: "true"
+          VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.preview-namespace.outputs.namespace }}
           LOOP_EXPECTED_STORAGE_KEY: ${{ steps.preview-namespace.outputs.expected_key }}
+          # Issue #1283 (2026-08-03 OWNER review repair, AC9): playwright.config.ts
+          # reads VITE_BASE_PATH at config-load time to resolve the nested baseURL/
+          # webServer.url for this lane -- must match the same value the guard/build use.
+          VITE_BASE_PATH: ${{ steps.preview-namespace.outputs.base_path }}
         run: |
           run_timed() {
             local step_id="$1"; shift
@@ -756,7 +749,7 @@ jobs:
               >> measurements.jsonl
             return $status
           }
-          run_timed test_e2e_preview_namespace pnpm exec playwright test
+          run_timed test_e2e_preview_namespace pnpm run test:e2e:preview-namespace
       - name: Upload AC9 preview-namespace Playwright report
         id: upload-playwright-report-preview-namespace
         if: ${{ !cancelled() }}
