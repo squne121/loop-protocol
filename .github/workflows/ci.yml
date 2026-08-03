@@ -1112,6 +1112,190 @@ jobs:
           PY
           } >> "$GITHUB_STEP_SUMMARY"
 
+  component-vrt-report:
+    # Issue #1389 (Scope Delta): non-required, report-only Vitest Browser
+    # Mode component VRT lane — distinct from the Playwright `e2e` job
+    # above (In Scope / Out of Scope: never registered in GitHub branch
+    # protection required checks, never replaces Playwright E2E VRT). The
+    # `pnpm test:vrt:component` step below never uses `continue-on-error`
+    # or `|| true` — its real exit code determines this job's own
+    # conclusion. That conclusion never blocks merge-ready:
+    # `component-vrt-report` is classified `excluded` in
+    # .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py
+    # CLASSIFICATION_MAP (Scope Delta) so determine_check_verdict() never
+    # treats it as blocking regardless of pass/fail.
+    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLAYWRIGHT_VERSION: "1.60.0"
+    container:
+      image: mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948
+      options: --ipc=host
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Enable pnpm via corepack
+        run: |
+          corepack enable pnpm
+          corepack prepare pnpm@11.7.0 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify Playwright Docker image version
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version")"
+          if [ "$PW_VERSION" != "$PLAYWRIGHT_VERSION" ]; then
+            echo "::error::resolved @playwright/test=$PW_VERSION but Docker image expects v$PLAYWRIGHT_VERSION. Update PLAYWRIGHT_VERSION and container.image digest in ci.yml."
+            exit 1
+          fi
+          echo "playwright_version_match=ok resolved=$PW_VERSION expected=$PLAYWRIGHT_VERSION"
+      - name: Typecheck component VRT
+        id: typecheck-component-vrt
+        run: pnpm typecheck:component-vrt
+      - name: Run component VRT (Vitest Browser Mode, report-only)
+        id: run-component-vrt
+        run: pnpm test:vrt:component
+      - name: Upload component VRT screenshots (baseline + actual/diff/expected on failure)
+        id: upload-component-vrt-screenshots
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: component-vrt-screenshots
+          path: |
+            tests/component/__screenshots__/
+            .vitest-attachments/tests/component/**
+          if-no-files-found: warn
+          retention-days: 30
+          # PR #1977 review fix (P0 item 1, OWNER REQUEST_CHANGES):
+          # `.vitest-attachments/` is a hidden (dot-prefixed) directory.
+          # `actions/upload-artifact` excludes hidden files/directories by
+          # default, so without this the actual/diff evidence
+          # (Issue #1389 AC9) would silently never be uploaded on the case
+          # that matters most: a real visual mismatch. The negative-control
+          # steps below prove this end to end (not just that the YAML looks
+          # right).
+          include-hidden-files: true
+      # --- Hidden-attachment-upload negative control (PR #1977 review fix,
+      # P0 item 1) --------------------------------------------------------
+      # Deliberately runs a controlled, guaranteed-mismatch fixture
+      # (tests/component/__negative_control__/hidden-attachment-negative-control.vrt.test.ts,
+      # never the real combat-hud-running baseline) and proves that its
+      # actual/diff attachments survive a real upload-artifact round trip
+      # via download-artifact, not merely that the workflow YAML declares
+      # `include-hidden-files: true`.
+      - name: Run hidden-attachment negative control (expected to mismatch)
+        id: run-negative-control
+        continue-on-error: true
+        env:
+          VITE_VRT_NEGATIVE_CONTROL: "true"
+        run: pnpm exec vitest run --config vitest.visual.config.ts tests/component/__negative_control__/hidden-attachment-negative-control.vrt.test.ts
+      - name: Verify the negative control actually mismatched
+        if: ${{ always() }}
+        env:
+          NEGATIVE_CONTROL_OUTCOME: ${{ steps.run-negative-control.outcome }}
+        run: |
+          if [ "${NEGATIVE_CONTROL_OUTCOME}" != "failure" ]; then
+            echo "::error::hidden-attachment negative control outcome was '${NEGATIVE_CONTROL_OUTCOME}', expected 'failure' (the fixture is designed to ALWAYS mismatch). If it passed or was skipped, the fixture itself is broken and can no longer prove the actual/diff artifact pipeline works end to end."
+            exit 1
+          fi
+          echo "negative_control_outcome=ok (mismatched as expected)"
+      - name: Upload negative control attachments
+        id: upload-negative-control-attachments
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: component-vrt-negative-control-attachments
+          path: .vitest-attachments/tests/component/__negative_control__/**
+          if-no-files-found: error
+          retention-days: 30
+          include-hidden-files: true
+      - name: Download negative control attachments (round-trip proof)
+        if: ${{ always() }}
+        uses: actions/download-artifact@v6
+        with:
+          name: component-vrt-negative-control-attachments
+          path: negative-control-download
+      - name: Assert actual/diff PNGs survived the hidden-file upload round trip
+        if: ${{ always() }}
+        id: verify-negative-control-attachments
+        run: |
+          shopt -s globstar nullglob
+          actual_files=(negative-control-download/**/*-actual-*.png)
+          diff_files=(negative-control-download/**/*-diff-*.png)
+          if [ "${#actual_files[@]}" -eq 0 ]; then
+            echo "::error::no *-actual-*.png found in the downloaded component-vrt-negative-control-attachments artifact — the hidden .vitest-attachments upload is NOT working end to end."
+            find negative-control-download -type f
+            exit 1
+          fi
+          if [ "${#diff_files[@]}" -eq 0 ]; then
+            echo "::error::no *-diff-*.png found in the downloaded component-vrt-negative-control-attachments artifact — the hidden .vitest-attachments upload is NOT working end to end."
+            find negative-control-download -type f
+            exit 1
+          fi
+          echo "hidden_attachment_upload_proof=ok actual=${actual_files[*]} diff=${diff_files[*]}"
+      # --- end negative control ------------------------------------------
+      - name: Summarize component VRT evidence
+        if: ${{ always() }}
+        env:
+          RUN_OUTCOME: ${{ steps.run-component-vrt.outcome }}
+          TYPECHECK_OUTCOME: ${{ steps.typecheck-component-vrt.outcome }}
+          NEGATIVE_CONTROL_OUTCOME: ${{ steps.run-negative-control.outcome }}
+          NEGATIVE_CONTROL_PROOF_OUTCOME: ${{ steps.verify-negative-control-attachments.outcome }}
+          SCREENSHOTS_URL: ${{ steps.upload-component-vrt-screenshots.outputs.artifact-url || 'N/A' }}
+          SCREENSHOTS_DIGEST: ${{ steps.upload-component-vrt-screenshots.outputs.artifact-digest || 'sha256:none' }}
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version" 2>/dev/null || echo 'unknown')"
+          # PR #1977 review fix (P2 item, OWNER REQUEST_CHANGES): a GitHub
+          # Actions step `outcome` is `success` / `failure` / `skipped` /
+          # `cancelled` — never an "exit code" — and each state is reported
+          # distinctly below so a `skipped` step (e.g. from an earlier
+          # dependency-install failure) is never conflated with "no visual
+          # mismatch".
+          classify_outcome() {
+            case "$1" in
+              success) echo "success (no visual mismatch)" ;;
+              failure) echo "failure (visual mismatch or run failure detected)" ;;
+              skipped) echo "skipped (step did not run — NOT the same as a pass)" ;;
+              cancelled) echo "cancelled" ;;
+              *) echo "unknown ($1)" ;;
+            esac
+          }
+          {
+            echo "## Component VRT (report-only, non-required — Issue #1389)"
+            echo ""
+            echo "This job's pass/fail never blocks merge-ready: see the \`excluded\`"
+            echo "CLASSIFICATION_MAP entry for \`component-vrt-report\` in"
+            echo "\`.claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py\`."
+            echo ""
+            echo "### Environment fingerprint"
+            echo "- typecheck outcome: $(classify_outcome "${TYPECHECK_OUTCOME}")"
+            echo "- run outcome: $(classify_outcome "${RUN_OUTCOME}")"
+            echo "- runner: ${RUNNER_OS} ${RUNNER_ARCH} (image ${ImageOS:-unknown} ${ImageVersion:-unknown})"
+            echo "- node: $(node -p 'process.version')"
+            echo "- Playwright: ${PW_VERSION}"
+            echo "- browser: chromium"
+            echo "- viewport: 1280x720"
+            echo "- deviceScaleFactor: 1"
+            echo "- screenshot directory: tests/component/__screenshots__/"
+            echo ""
+            echo "### Artifacts"
+            echo "- component-vrt-screenshots (baseline + actual/expected/diff on failure): ${SCREENSHOTS_URL} (digest: ${SCREENSHOTS_DIGEST})"
+            echo ""
+            echo "### actual / expected / diff"
+            if [ "${RUN_OUTCOME}" = "failure" ]; then
+              echo "- visual mismatch or run failure detected: see the component-vrt-screenshots artifact above for any *-actual.png / *-expected.png / *-diff.png Vitest Browser Mode wrote"
+            else
+              echo "- N/A (no visual mismatch; expected/actual/diff are only emitted on toMatchScreenshot() failure)"
+            fi
+            echo ""
+            echo "### Hidden-attachment upload proof (negative control)"
+            echo "- fixture outcome: $(classify_outcome "${NEGATIVE_CONTROL_OUTCOME}") (expected: failure — the fixture is a deliberate, controlled mismatch)"
+            echo "- round-trip verification: $(classify_outcome "${NEGATIVE_CONTROL_PROOF_OUTCOME}") (proves the uploaded artifact ZIP actually contains *-actual-*.png / *-diff-*.png)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   python-test-core:
     runs-on: ubuntu-latest
     steps:

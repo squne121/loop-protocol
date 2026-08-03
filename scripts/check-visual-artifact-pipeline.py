@@ -116,6 +116,16 @@ DEFAULT_PW_CONFIG = "playwright.config.ts"
 DEFAULT_E2E_DIR = "tests/e2e"
 DEFAULT_VISUAL_UTILS = "tests/e2e/visual-utils.ts"
 DEFAULT_REGISTRY_DOC = "docs/dev/visual-baseline-registry.md"
+DEFAULT_COMPONENT_DIR = "tests/component"
+DEFAULT_VITEST_CONFIG = "vitest.visual.config.ts"
+VITEST_COMPONENT_TEST_GLOB = "*.vrt.test.ts"
+# Recognised, infra-only `test.include` entry (PR #1977 review fix, P0 item
+# 1) backing the hidden-attachment-upload negative control fixture. Any
+# `vitest.visual.config.ts` include pattern containing this marker is
+# excluded from production component VRT capture derivation / registry
+# cross-validation below -- it is a deliberate, controlled test double, not
+# a real visual-baseline contract.
+VITEST_COMPONENT_NEGATIVE_CONTROL_DIR = "__negative_control__"
 
 ACTIVE_CAPTURES_BEGIN_MARKER = "ACTIVE_VRT_CAPTURES_BEGIN"
 ACTIVE_CAPTURES_END_MARKER = "ACTIVE_VRT_CAPTURES_END"
@@ -313,6 +323,160 @@ def _parse_comparator(options_blob: str) -> tuple[str | None, str | None, list[s
         return "maxDiffPixelRatio", ratio[0], errors
     errors.append("neither maxDiffPixels nor maxDiffPixelRatio declared")
     return None, None, errors
+
+
+_VITEST_COMPARATOR_KEYS = ("allowedMismatchedPixels", "allowedMismatchedPixelRatio", "threshold")
+_VITEST_COMPARATOR_RATIO_KEYS = ("allowedMismatchedPixelRatio", "threshold")
+_IDENTIFIER_KV_RE = re.compile(r"^([A-Za-z_$][\w$]*)\s*:\s*(.*)$", re.DOTALL)
+_NUMERIC_LITERAL_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _find_balanced_brace(masked_text: str, open_brace_idx: int) -> int:
+    """Return the index just past the matching '}' for the '{' at
+    open_brace_idx, scanning `masked_text` (string/comment interiors
+    neutralised) so a brace inside a string/comment cannot desynchronise
+    the depth count."""
+    depth = 0
+    for i in range(open_brace_idx, len(masked_text)):
+        ch = masked_text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    raise ValueError("unbalanced braces")
+
+
+def _parse_vitest_comparator_options(options_blob: str) -> tuple[dict[str, str], list[str]]:
+    """Return (comparator: {kind: value_str, ...}, errors) from a Vitest
+    Browser Mode `toMatchScreenshot()` second-argument options object text
+    (AC10, Issue #1389; PR #1977 review fix, P0 item 3, OWNER
+    REQUEST_CHANGES).
+
+    Unlike the removed regex-anywhere `_parse_vitest_comparator`, this:
+      1. only recognises keys that are DIRECT properties of a
+         `comparatorOptions: { ... }` object literal (not anywhere in the
+         file / options blob) -- so `// allowedMismatchedPixelRatio: 0.02`
+         (a comment) can never be misdetected as present, because comments
+         and string/template-literal interiors are neutralised by
+         `_mask_ts_noise` before any key is matched;
+      2. allows `allowedMismatchedPixels` and `allowedMismatchedPixelRatio`
+         to coexist (Vitest applies the stricter of the two -- they are
+         NOT mutually exclusive, unlike this validator's prior, incorrect
+         assumption);
+      3. validates numeric ranges/types (`allowedMismatchedPixelRatio` /
+         `threshold` in [0, 1]; `allowedMismatchedPixels` a non-negative
+         integer);
+      4. fails closed (hard error, not a silent skip) on spread syntax,
+         computed keys, string/quoted keys, or any value that is not a
+         plain numeric literal (variable reference / expression) -- these
+         are ambiguous/unparseable by this structural (not full AST)
+         approach and must never be silently treated as "no comparator
+         declared" (which could otherwise mask a real, working config as a
+         validator false negative) or silently accepted (a false
+         positive).
+    """
+    masked_options_blob = _mask_ts_noise(options_blob)
+    m = re.search(r"comparatorOptions\s*:\s*\{", masked_options_blob)
+    if not m:
+        return {}, [
+            "neither allowedMismatchedPixels, allowedMismatchedPixelRatio, nor threshold declared "
+            "(no comparatorOptions object found as a direct property)"
+        ]
+    open_idx = m.end() - 1
+    try:
+        close_idx = _find_balanced_brace(masked_options_blob, open_idx)
+    except ValueError:
+        return {}, ["unbalanced braces in comparatorOptions object"]
+
+    inner = options_blob[open_idx + 1 : close_idx - 1]
+    masked_inner = masked_options_blob[open_idx + 1 : close_idx - 1]
+    if not inner.strip():
+        return {}, [
+            "neither allowedMismatchedPixels, allowedMismatchedPixelRatio, nor threshold declared "
+            "(comparatorOptions is empty)"
+        ]
+
+    comparator: dict[str, str] = {}
+    errors: list[str] = []
+    for entry in _split_top_level_args(inner, masked_inner):
+        entry_stripped = entry.strip()
+        if not entry_stripped:
+            continue
+        masked_entry = _mask_ts_noise(entry_stripped)
+        if not masked_entry.strip():
+            # Entirely a comment (already neutralised to whitespace by
+            # `_mask_ts_noise`) or otherwise empty once comments/strings are
+            # stripped -- not an error, simply nothing to parse in this
+            # entry (PR #1977 review fix, P0 item 3: a commented-out
+            # comparator option must be silently ignored, not misdetected
+            # AND not hard-failed as "unparseable" -- it is legitimately
+            # absent).
+            continue
+        if masked_entry.lstrip().startswith("..."):
+            errors.append(
+                f"comparatorOptions: spread syntax is not supported by the static validator "
+                f"and fails closed: {entry_stripped!r}"
+            )
+            continue
+        # Matched against the MASKED text (comments/strings neutralised),
+        # not the original, so a key/value that only exists inside a
+        # comment or string literal can never be misdetected as a real
+        # `identifier: value` pair (PR #1977 review fix, P0 item 3).
+        km = _IDENTIFIER_KV_RE.match(masked_entry)
+        if not km:
+            errors.append(
+                f"comparatorOptions: unparseable entry (not a plain 'identifier: value' pair, "
+                f"e.g. a computed/quoted key) and fails closed: {entry_stripped!r}"
+            )
+            continue
+        key = km.group(1)
+        raw_value = km.group(2).strip()
+        if key not in _VITEST_COMPARATOR_KEYS:
+            # Not a recognised comparator axis (Vitest's comparatorOptions
+            # type may legitimately carry other, unrelated fields) -- not
+            # an error by itself.
+            continue
+        if not _NUMERIC_LITERAL_RE.match(raw_value):
+            errors.append(
+                f"comparatorOptions.{key}: value {raw_value!r} is not a plain numeric literal "
+                "(variable reference / expression / computed value is not supported by the "
+                "static validator and fails closed)"
+            )
+            continue
+        numeric_value = float(raw_value)
+        if key in _VITEST_COMPARATOR_RATIO_KEYS and not (0.0 <= numeric_value <= 1.0):
+            errors.append(f"comparatorOptions.{key}: value {raw_value} is out of range [0, 1]")
+            continue
+        if key == "allowedMismatchedPixels" and (numeric_value < 0 or "." in raw_value):
+            errors.append(
+                f"comparatorOptions.allowedMismatchedPixels: value {raw_value} must be a "
+                "non-negative integer"
+            )
+            continue
+        comparator[key] = raw_value
+
+    if not comparator and not errors:
+        errors.append("neither allowedMismatchedPixels, allowedMismatchedPixelRatio, nor threshold declared")
+    return comparator, errors
+
+
+def _comparator_singular(comparator: dict[str, str]) -> tuple[str | None, str | None]:
+    """Collapse a (possibly multi-key, PR #1977 review fix) comparator dict
+    into the legacy singular (comparator_kind, comparator_value)
+    representation used elsewhere in this module's capture schema. A
+    single declared key maps 1:1; multiple co-declared keys (Vitest applies
+    the stricter of the two) are joined deterministically so no information
+    is silently dropped."""
+    if not comparator:
+        return None, None
+    if len(comparator) == 1:
+        (kind, value), = comparator.items()
+        return kind, value
+    joined_keys = "+".join(sorted(comparator))
+    joined_values = ",".join(f"{k}={comparator[k]}" for k in sorted(comparator))
+    return joined_keys, joined_values
 
 
 def _parse_path_template_override(options_blob: str) -> str | None:
@@ -749,6 +913,402 @@ def cross_validate_active_captures(
     return failures
 
 
+# ---------------------------------------------------------------------------
+# Vitest Browser Mode component VRT support (AC10, Issue #1389)
+#
+# Parallel, additive audit path for `tests/component/*.vrt.test.ts` (Vitest
+# Browser Mode `toMatchScreenshot()`), independent of the Playwright-only
+# `jobs.e2e` ACTIVE_VRT_CAPTURES declared/derived cross-validation above
+# (which this Issue does not touch). The `component-vrt-report` CI job is
+# non-required/report-only (Issue #1389 In Scope), so there is no
+# declared-in-workflow CAPTURES literal to cross-validate against -- the
+# audit target instead is the registry (docs/dev/visual-baseline-registry.md
+# §"component VRT / active suite 依存") cross-validated against BOTH the
+# derived call sites AND the real committed PNG files (PR #1977 review fix,
+# P0 item 2 / P1 item 4, OWNER REQUEST_CHANGES):
+#
+# - `extract_derived_vitest_component_captures()` no longer re-synthesizes
+#   its own expected snapshot directory from a hardcoded prefix constant
+#   (the prior version's circularity bug -- it compared its own
+#   self-generated string against itself and could never detect real root
+#   drift). It now reads `vitest.visual.config.ts`'s actual `include`
+#   patterns and screenshot-directory config
+#   (`parse_vitest_visual_config()`), resolves each capture's directory
+#   from that, and cross-checks the resolved directory against a REAL,
+#   independently-committed PNG file on disk.
+# - `cross_validate_component_vrt_captures()` cross-validates the derived
+#   captures 1:1 against `docs/dev/visual-baseline-registry.md`'s declared
+#   component-VRT registry entries, hard-failing on zero captures, missing
+#   PNG, orphan PNG, duplicate capture ids, and comparator/directory drift
+#   against the registry's declared values.
+# ---------------------------------------------------------------------------
+
+
+def parse_vitest_visual_config(config_text: str) -> dict[str, object]:
+    """Genuinely re-derive the screenshot directory and `test.include`
+    patterns from `vitest.visual.config.ts`'s actual source text (PR #1977
+    review fix, P0 item 2) -- not a re-synthesized constant.
+
+    Two forms are recognised for the screenshot directory (both "explicit"
+    per AC4, neither left to the Vitest Browser Mode default):
+      (a) the `browser.screenshotDirectory: '<dir>'` shorthand, or
+      (b) a `const <NAME> = '<dir>'` top-level constant consumed by an
+          explicit `browser.expect.toMatchScreenshot.resolveScreenshotPath`
+          override (the form this repo's `vitest.visual.config.ts` actually
+          uses, to avoid a Vitest 4.1.6 double-join bug in form (a) -- see
+          the comment there).
+    """
+    result: dict[str, object] = {}
+    m = re.search(r"screenshotDirectory:\s*['\"]([^'\"]+)['\"]", config_text)
+    if m:
+        result["screenshot_directory"] = m.group(1)
+    else:
+        const_m = re.search(
+            r"const\s+[A-Za-z_$][\w$]*\s*=\s*['\"]([^'\"]+)['\"]",
+            config_text,
+        )
+        has_resolver = "resolveScreenshotPath" in config_text
+        result["screenshot_directory"] = const_m.group(1) if (const_m and has_resolver) else None
+
+    m = re.search(r"include:\s*\[(.*?)\]", config_text, re.DOTALL)
+    result["include_patterns"] = re.findall(r"""['"]([^'"]+)['"]""", m.group(1)) if m else []
+    return result
+
+
+def parse_component_vrt_registry_entries(registry_md_text: str) -> list[dict]:
+    """Extract component-VRT rows (`id` cell containing "component VRT")
+    from `docs/dev/visual-baseline-registry.md` §3's contract table (PR
+    #1977 review fix, P1 item 4). Returns each row's declared directory,
+    spec file, and comparator kind/value, parsed from the `artifact/test`
+    and `tolerance` cells respectively."""
+    entries: list[dict] = []
+    for line in registry_md_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or stripped.startswith("|---"):
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if len(cells) < 10 or cells[0] in ("id", ""):
+            continue
+        entry_id = cells[0]
+        if "component VRT" not in entry_id:
+            continue
+        artifact_cell = cells[3]
+        tolerance_cell = cells[7]
+        dir_m = re.search(r"`(tests/component/__screenshots__/[^`]+/)`", artifact_cell)
+        spec_m = re.search(r"`(tests/component/[^`]+\.vrt\.test\.ts)`", artifact_cell)
+        cmp_m = re.search(
+            r"`(allowedMismatchedPixels|allowedMismatchedPixelRatio|threshold):\s*([\d.]+)`",
+            tolerance_cell,
+        )
+        entries.append(
+            {
+                "id": entry_id,
+                "directory": dir_m.group(1) if dir_m else None,
+                "spec_file": spec_m.group(1) if spec_m else None,
+                "comparator_kind": cmp_m.group(1) if cmp_m else None,
+                "comparator_value": cmp_m.group(2) if cmp_m else None,
+            }
+        )
+    return entries
+
+
+def extract_derived_vitest_component_captures(
+    component_dir: Path, vitest_config: dict[str, object] | None = None
+) -> tuple[list[dict], list[str]]:
+    """Statically re-derive active Vitest Browser Mode component VRT
+    captures from the spec files actually reachable via
+    `vitest.visual.config.ts`'s own `test.include` patterns (PR #1977
+    review fix, P0 item 2).
+
+    `vitest_config` (from `parse_vitest_visual_config()`) drives directory
+    resolution -- this is the fix for the prior version's circularity bug:
+    the expected directory is derived from the REAL config value, then
+    cross-checked against a REAL, independently-committed PNG file on disk
+    (`png_exists`), rather than being compared against a self-generated
+    string built from the same hardcoded prefix constant."""
+    captures: list[dict] = []
+    errors: list[str] = []
+    if not component_dir.is_dir():
+        return captures, errors
+
+    vitest_config = vitest_config or {}
+    screenshot_directory = vitest_config.get("screenshot_directory")
+    include_patterns = vitest_config.get("include_patterns") or []
+
+    if not screenshot_directory:
+        errors.append(
+            "vitest.visual.config.ts does not explicitly declare a screenshot directory (AC4 "
+            "requires an explicit config value, not the Vitest Browser Mode default)"
+        )
+        return captures, errors
+    if not include_patterns:
+        errors.append("vitest.visual.config.ts does not declare a non-empty test.include")
+        return captures, errors
+
+    # Reported/registry-comparable paths always use the fixed, structural
+    # `DEFAULT_COMPONENT_DIR` ("tests/component") root segment -- this is a
+    # repo-layout fact, not the thing under audit (unlike the removed
+    # hardcoded snapshot-root SUFFIX, which used to be self-generated
+    # regardless of the real config). `component_dir` itself (which callers
+    # may legitimately pass as an absolute or tmp-relative Path, e.g. in
+    # tests) is used ONLY for real filesystem I/O below.
+    relative_patterns: list[str] = []
+    for pattern in include_patterns:
+        if VITEST_COMPONENT_NEGATIVE_CONTROL_DIR in pattern:
+            # Recognised, infra-only pattern (PR #1977 review fix, P0 item
+            # 1): backs the hidden-attachment-upload negative control
+            # fixture, not a production visual-baseline capture. Excluded
+            # from production capture derivation and the registry
+            # cross-validation below by design.
+            continue
+        if "**" in pattern:
+            errors.append(
+                f"vitest.visual.config.ts test.include pattern '{pattern}' is recursive; "
+                "component VRT include must be restricted to a flat, non-recursive pattern "
+                "(e.g. 'tests/component/*.vrt.test.ts') so a nested spec's Vitest-resolved "
+                "screenshot directory cannot silently land outside this audited root"
+            )
+            continue
+        if pattern != f"{DEFAULT_COMPONENT_DIR}/*{VITEST_COMPONENT_TEST_GLOB[1:]}":
+            errors.append(
+                f"vitest.visual.config.ts test.include pattern '{pattern}' is not the expected "
+                f"flat production pattern '{DEFAULT_COMPONENT_DIR}/*{VITEST_COMPONENT_TEST_GLOB[1:]}'"
+            )
+            continue
+        relative_patterns.append(f"*{VITEST_COMPONENT_TEST_GLOB[1:]}")
+
+    if errors:
+        return captures, errors
+
+    spec_paths: set[Path] = set()
+    for rel in relative_patterns:
+        for p in component_dir.glob(rel):
+            if p.is_file():
+                spec_paths.add(p)
+
+    for spec_path in sorted(spec_paths):
+        text = spec_path.read_text(encoding="utf-8")
+        masked = _mask_ts_noise(text)
+        spec_filename = spec_path.name
+        expected_directory = f"{DEFAULT_COMPONENT_DIR}/{screenshot_directory}/{spec_filename}/"
+        real_directory = component_dir / str(screenshot_directory) / spec_filename
+
+        for m in re.finditer(r"\.toMatchScreenshot\(", masked):
+            open_idx = m.end() - 1
+            call_end = _find_balanced_call(masked, open_idx)
+            if _is_guard_only_call(text, m.start(), call_end):
+                continue
+            inner = text[open_idx + 1 : call_end - 1]
+            masked_inner = masked[open_idx + 1 : call_end - 1]
+            if not inner.strip():
+                errors.append(
+                    f"{spec_path}: toMatchScreenshot() called with no arguments (implicit "
+                    "name) is not supported by the static active-capture validator; pass an "
+                    "explicit name argument"
+                )
+                continue
+            args = _split_top_level_args(inner, masked_inner)
+            if not args:
+                errors.append(f"{spec_path}: malformed toMatchScreenshot() call (no args)")
+                continue
+            first_arg = args[0].strip()
+            if first_arg.startswith("{"):
+                errors.append(
+                    f"{spec_path}: options-only toMatchScreenshot({{...}}) (implicit name) is "
+                    "not supported by the static active-capture validator; pass an explicit "
+                    "name argument"
+                )
+                continue
+            screenshot_name, name_errs = _parse_screenshot_name(first_arg)
+            if screenshot_name is None:
+                for e in name_errs:
+                    errors.append(f"{spec_path}: {e}")
+                continue
+            options_blob = args[1] if len(args) > 1 else ""
+            comparator, cmp_errors = _parse_vitest_comparator_options(options_blob)
+            for e in cmp_errors:
+                errors.append(f"{spec_path}::{screenshot_name}: {e}")
+            comparator_kind, comparator_value = _comparator_singular(comparator)
+
+            # Real, independently-derived committed PNG filename (PR #1977
+            # review fix, P0 item 2): mirrors @vitest/browser's own
+            # `${arg}-${browserName}-${platform}${ext}` filename template
+            # (this validator only targets the `chromium`/`linux` CI-pinned
+            # capture -- AC4 -- so the suffix is fixed, matching the
+            # committed baseline filenames actually observed).
+            name_stem, _, ext = screenshot_name.rpartition(".")
+            name_stem = name_stem or screenshot_name
+            ext = f".{ext}" if ext else ".png"
+            png_filename = f"{name_stem}-chromium-linux{ext}"
+            png_path = f"{expected_directory}{png_filename}"
+            png_exists = (real_directory / png_filename).is_file()
+            if not png_exists:
+                errors.append(
+                    f"{spec_path}::{screenshot_name}: expected committed PNG not found at "
+                    f"{png_path} (directory genuinely derived from vitest.visual.config.ts, not "
+                    "a self-generated constant)"
+                )
+
+            captures.append(
+                {
+                    "capture_id": f"{spec_filename}::{screenshot_name}",
+                    "spec_file": f"{DEFAULT_COMPONENT_DIR}/{spec_filename}",
+                    "screenshot_name": screenshot_name,
+                    "directory": expected_directory,
+                    "comparator": comparator,
+                    "comparator_kind": comparator_kind,
+                    "comparator_value": comparator_value,
+                    "png_path": png_path,
+                    "png_exists": png_exists,
+                }
+            )
+
+    # Orphan PNG detection (PR #1977 review fix, P1 item 4): every
+    # committed PNG under the resolved screenshot root must correspond to a
+    # real `.toMatchScreenshot()` call site above; a PNG with no matching
+    # capture is stale/orphaned and hard-fails rather than being silently
+    # ignored.
+    screenshot_root = component_dir / str(screenshot_directory)
+    if screenshot_root.is_dir():
+        known_png_paths = {c["png_path"] for c in captures}
+        for png in sorted(screenshot_root.rglob("*.png")):
+            png_relative = png.relative_to(screenshot_root).as_posix()
+            logical_png_path = f"{DEFAULT_COMPONENT_DIR}/{screenshot_directory}/{png_relative}"
+            if logical_png_path not in known_png_paths:
+                errors.append(
+                    f"orphan committed PNG not referenced by any toMatchScreenshot() call: {logical_png_path}"
+                )
+
+    return captures, errors
+
+
+def validate_vitest_component_captures(captures: list[dict]) -> list[str]:
+    """Hard-fail (not presence-only) checks for each derived Vitest component
+    VRT capture: directory must be under the reserved Vitest component
+    snapshot root (never the Playwright root), and a recognised comparator
+    must be declared. Accepts either the multi-key `comparator` dict (PR
+    #1977 review fix, P0 item 3) or the legacy singular
+    `comparator_kind`/`comparator_value` pair (kept for hand-authored unit
+    test capture fixtures that predate the dict form)."""
+    failures: list[str] = []
+    for capture in captures:
+        capture_id = capture["capture_id"]
+        directory = capture.get("directory", "")
+        if not directory.startswith(VITEST_COMPONENT_SNAPSHOT_ROOT_PREFIX):
+            failures.append(
+                f"{capture_id}: directory '{directory}' is outside the reserved Vitest "
+                f"component snapshot root '{VITEST_COMPONENT_SNAPSHOT_ROOT_PREFIX}'"
+            )
+
+        comparator = capture.get("comparator")
+        if comparator is not None:
+            if not comparator:
+                failures.append(f"{capture_id}: no recognised comparator declared")
+            else:
+                for kind in comparator:
+                    if kind not in _VITEST_COMPARATOR_KEYS:
+                        failures.append(
+                            f"{capture_id}: comparator_kind must be one of "
+                            f"{'/'.join(_VITEST_COMPARATOR_KEYS)}, got {kind!r}"
+                        )
+        else:
+            kind = capture.get("comparator_kind")
+            if kind not in _VITEST_COMPARATOR_KEYS:
+                failures.append(
+                    f"{capture_id}: comparator_kind must be one of "
+                    f"{'/'.join(_VITEST_COMPARATOR_KEYS)}, got {kind!r}"
+                )
+            if capture.get("comparator_value") in (None, ""):
+                failures.append(f"{capture_id}: comparator_value is missing")
+
+        if capture.get("png_exists") is False:
+            failures.append(f"{capture_id}: missing committed PNG at {capture.get('png_path')}")
+
+    return failures
+
+
+def cross_validate_component_vrt_captures(captures: list[dict], registry_entries: list[dict]) -> list[str]:
+    """Cross-validate derived component VRT captures 1:1 against
+    `docs/dev/visual-baseline-registry.md`'s declared component-VRT
+    entries (PR #1977 review fix, P1 item 4, OWNER REQUEST_CHANGES).
+    Hard-fails on: zero captures found, duplicate capture ids, a capture
+    with no matching registry entry, a registry entry with no matching
+    active capture, and comparator/directory drift against the registry's
+    declared values."""
+    failures: list[str] = []
+    if not registry_entries:
+        return failures  # nothing declared to cross-validate against yet.
+
+    if not captures:
+        failures.append(
+            "zero component VRT captures found (component directory missing, no specs "
+            "reachable via test.include, or no toMatchScreenshot() call sites) but "
+            "docs/dev/visual-baseline-registry.md declares component VRT registry entries "
+            "requiring at least one active capture"
+        )
+        return failures
+
+    capture_ids = [c["capture_id"] for c in captures]
+    dupes = sorted({cid for cid in capture_ids if capture_ids.count(cid) > 1})
+    if dupes:
+        failures.append(f"duplicate component VRT capture_id(s): {dupes}")
+
+    registry_by_spec = {e["spec_file"]: e for e in registry_entries if e.get("spec_file")}
+    matched_specs: set[str] = set()
+
+    for capture in captures:
+        capture_id = capture["capture_id"]
+        spec_file = capture.get("spec_file")
+        entry = registry_by_spec.get(spec_file)
+        if entry is None:
+            failures.append(
+                f"{capture_id}: no matching component VRT registry entry for spec '{spec_file}' "
+                "in docs/dev/visual-baseline-registry.md"
+            )
+            continue
+        matched_specs.add(spec_file)
+
+        comparator = capture.get("comparator")
+        if comparator is not None:
+            reg_kind = entry.get("comparator_kind")
+            reg_value = entry.get("comparator_value")
+            if reg_kind and (reg_kind not in comparator or str(comparator[reg_kind]) != str(reg_value)):
+                failures.append(
+                    f"{capture_id}: comparator {comparator!r} does not match registry-declared "
+                    f"{reg_kind}={reg_value!r} for '{entry['id']}'"
+                )
+        else:
+            if entry.get("comparator_kind") and capture.get("comparator_kind") != entry.get("comparator_kind"):
+                failures.append(
+                    f"{capture_id}: comparator_kind {capture.get('comparator_kind')!r} does not "
+                    f"match registry-declared {entry.get('comparator_kind')!r} for '{entry['id']}'"
+                )
+            if entry.get("comparator_value") and str(capture.get("comparator_value")) != str(
+                entry.get("comparator_value")
+            ):
+                failures.append(
+                    f"{capture_id}: comparator_value {capture.get('comparator_value')!r} does not "
+                    f"match registry-declared {entry.get('comparator_value')!r} for '{entry['id']}'"
+                )
+
+        if entry.get("directory") and capture.get("directory") != entry.get("directory"):
+            failures.append(
+                f"{capture_id}: directory {capture.get('directory')!r} does not match "
+                f"registry-declared {entry.get('directory')!r} for '{entry['id']}'"
+            )
+
+    unmatched_registry = sorted(
+        e["id"] for e in registry_entries if e.get("spec_file") and e["spec_file"] not in matched_specs
+    )
+    if unmatched_registry:
+        failures.append(
+            f"docs/dev/visual-baseline-registry.md declares component VRT entries with no "
+            f"matching active capture: {unmatched_registry}"
+        )
+
+    return failures
+
+
 def check_artifact_status_wiring(summary_run_text: str) -> list[str]:
     """AC7: the summary step must classify each upload step's outcome into
     uploaded / no_files / step_not_run / upload_failed — not just presence."""
@@ -765,6 +1325,8 @@ def main(argv: list[str]) -> int:
     e2e_dir = Path(argv[3]) if len(argv) > 3 else Path(DEFAULT_E2E_DIR)
     visual_utils = Path(argv[4]) if len(argv) > 4 else Path(DEFAULT_VISUAL_UTILS)
     registry_doc = Path(argv[5]) if len(argv) > 5 else Path(DEFAULT_REGISTRY_DOC)
+    component_dir = Path(argv[6]) if len(argv) > 6 else Path(DEFAULT_COMPONENT_DIR)
+    vitest_config = Path(argv[7]) if len(argv) > 7 else Path(DEFAULT_VITEST_CONFIG)
 
     if not path.is_file():
         print("VISUAL_ARTIFACT_PIPELINE_CHECK_V1")
@@ -901,6 +1463,26 @@ def main(argv: list[str]) -> int:
         if not declared_errors and not derived_errors:
             for f in cross_validate_active_captures(declared_captures, derived_captures, registry_maturity):
                 _fail(failures, f"active capture: {f}")
+
+    # Vitest Browser Mode component VRT audit (AC10, Issue #1389) — additive,
+    # independent of the jobs.e2e-only checks above. PR #1977 review fix,
+    # P0 item 2 / P1 item 4: directory derivation now reads the real
+    # `vitest.visual.config.ts` and cross-validates against the registry.
+    vitest_config_text = vitest_config.read_text(encoding="utf-8") if vitest_config.is_file() else ""
+    vitest_config_data = parse_vitest_visual_config(vitest_config_text)
+    component_registry_doc_text = registry_doc.read_text(encoding="utf-8") if registry_doc.is_file() else ""
+    component_registry_entries = parse_component_vrt_registry_entries(component_registry_doc_text)
+
+    vitest_captures, vitest_errors = extract_derived_vitest_component_captures(
+        component_dir, vitest_config_data
+    )
+    for e in vitest_errors:
+        _fail(failures, f"component vrt capture (derived): {e}")
+    if not vitest_errors:
+        for f in validate_vitest_component_captures(vitest_captures):
+            _fail(failures, f"component vrt capture: {f}")
+        for f in cross_validate_component_vrt_captures(vitest_captures, component_registry_entries):
+            _fail(failures, f"component vrt registry: {f}")
 
     return _emit(path, upload_steps, upload_ids, summary_ok, failures)
 

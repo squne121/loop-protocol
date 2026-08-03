@@ -59,6 +59,13 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     ("ci", "agy-causal-claim-drift-gate"): "required",
     # ci-verdict-summary aggregator (evidence producer)
     ("ci", "ci-verdict-summary"): "evidence",
+    # Issue #1389: component-vrt-report is a non-required, report-only CI job
+    # (Vitest Browser Mode component VRT). Without an explicit entry it falls
+    # through to "unknown" -> determine_check_verdict() would treat it as
+    # ALWAYS blocking (gh_error), which is the exact regression this Issue's
+    # Scope Delta calls out. Classified "excluded" (not "evidence"/"required")
+    # because this job's pass/fail must never affect merge-ready.
+    ("ci", "component-vrt-report"): "excluded",
     # Check Japanese Content workflow
     ("Check Japanese Content", "PR Body Japanese Check"): "required",
     # Retrospective / conditional — allowlisted excluded
