@@ -641,6 +641,12 @@ def _run_agy_provider_checks(repo_root: Path | None = None, fix: bool = False) -
     if unsupported_fix:
         warnings.append("unsupported_provider_option: provider=agy does not support --fix")
 
+    # Issue #1941 AC3: surface the additive `capabilities` matrix (if the
+    # caller/producer computed one) unmodified — this consumer does NOT
+    # implement its own version/help parser and does NOT let the matrix
+    # affect the existing `ok` boolean derivation above.
+    capabilities = agy_preflight.get("capabilities") if isinstance(agy_preflight, dict) else None
+
     return {
         "ok": ok,
         "exit_code": exit_code,
@@ -648,6 +654,7 @@ def _run_agy_provider_checks(repo_root: Path | None = None, fix: bool = False) -
         "selected_provider": "agy",
         "tools": tools_result,
         "agy_preflight": agy_preflight,
+        "agy_capabilities": capabilities,
         "skipped_gemini_checks": [
             "trusted_folders",
             "serena_mcp",

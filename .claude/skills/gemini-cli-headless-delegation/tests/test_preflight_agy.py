@@ -241,7 +241,11 @@ def test_help_flag_detection(monkeypatch):
 
 
 def test_missing_noninteractive_flags(monkeypatch):
-    """AC4: help output without noninteractive flags → failure_class: cli_incompatible."""
+    """Issue #1941 In Scope: `agy --help` not listing -p/--print/--prompt must
+    NOT early-exit as cli_incompatible before the runtime smoke check runs
+    (help non-listing is supporting evidence only, per PR #1976 design). When
+    the fixed-argv smoke invocation still succeeds, the overall result is ok,
+    with a warning recorded (not a `cli_incompatible` failure_class)."""
     module = load_module()
 
     def fake_run(argv, cwd=None, timeout=None):
@@ -254,16 +258,19 @@ def test_missing_noninteractive_flags(monkeypatch):
                 "Usage: agy [OPTIONS]\n  --model   Model to use\n  --debug   Debug mode\n",
                 "",
             )
+        if argv == [bin_, "-p", module.SMOKE_PROMPT]:
+            return _FakeCompleted(0, module.EXPECTED_SMOKE, "")
         raise AssertionError(f"unexpected command: {argv}")
 
     monkeypatch.setattr(module, "_run", fake_run)
     result = module.run_preflight()
 
-    assert result["ok"] is False
-    assert result["failure_class"] == "cli_incompatible"
+    assert result["ok"] is True
+    assert result["failure_class"] is None
     assert result["help"]["noninteractive_flags"]["-p"] is False
     assert result["help"]["noninteractive_flags"]["--print"] is False
     assert result["help"]["noninteractive_flags"]["--prompt"] is False
+    assert any("deferring to runtime smoke" in warning for warning in result["warnings"])
 
 
 # ---------------------------------------------------------------------------

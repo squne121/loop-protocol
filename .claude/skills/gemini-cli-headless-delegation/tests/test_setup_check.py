@@ -967,6 +967,63 @@ def test_agy_provider_auth_diagnostics_surfaced(monkeypatch, tmp_path):
     )
 
 
+def test_setup_check_consumes_additive_capability_matrix_without_breaking_ok_boolean(monkeypatch, tmp_path):
+    """Issue #1941 AC3: setup_check.py surfaces the additive
+    `agy_preflight.capabilities` matrix (if present) as `agy_capabilities`
+    without re-implementing any version/help parser, and without changing the
+    existing single-boolean `agy_preflight["ok"]` consumption path."""
+    sc = load_setup_check()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    fake_capabilities = {
+        "disable_slash_commands": {
+            "parser_accepts_flag": {
+                "status": "supported",
+                "reason_code": "parser_accepted_fixed_argv",
+                "evidence_source": "parser_acceptance",
+                "detail": None,
+            },
+            "leading_slash_is_literal": {
+                "status": "inconclusive",
+                "reason_code": "ambiguous_runtime_output",
+                "evidence_source": "runtime_semantic_observation",
+                "detail": None,
+            },
+        },
+    }
+
+    def fake_run(command: list[str], timeout: int | None = None):
+        tool = command[0]
+        versions = {"agy": "agy 1.1.9\n", "python3": "Python 3.12.0\n", "uv": "uv 0.7.0\n"}
+        if tool in versions and "--version" in command:
+            return _make_completed(0, stdout=versions[tool])
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(sc, "_run", fake_run)
+    monkeypatch.setattr(
+        sc,
+        "check_agy_preflight",
+        lambda: {
+            "schema": "agy_preflight_result/v1",
+            "ok": True,
+            "failure_class": None,
+            "auth": {"checked": True},
+            "capabilities": fake_capabilities,
+            "capability_schema": "agy_capability_matrix/v1",
+        },
+    )
+
+    result = sc.run_all_checks(repo_root=repo_root, provider="agy")
+
+    # Existing single-boolean consumption path is unchanged: `ok` still comes
+    # from `agy_preflight["ok"]` (True here), independent of the capability
+    # matrix contents (which include a non-supported predicate).
+    assert result["ok"] is True
+    assert result["agy_preflight"]["ok"] is True
+    assert result["agy_capabilities"] == fake_capabilities
+
+
 def test_auto_provider_preserves_agy_auth_failure_class(monkeypatch, tmp_path):
     """AC6: provider=auto preserves the AGY attempt's auth/keyring failure class in
     provider_attempts, and does not implement runtime fallback policy (#1270)."""

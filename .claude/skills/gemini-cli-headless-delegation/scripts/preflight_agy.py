@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -1188,6 +1189,7 @@ def run_preflight(
     live_serena: bool = False,
     mcp_config_path: Path | None = None,
     grounded_research: bool = False,
+    compute_capabilities: bool = False,
 ) -> dict[str, Any]:
     """Run version → help → smoke checks for agy binary.
 
@@ -1240,22 +1242,30 @@ def run_preflight(
         result["failure_class"] = "cli_missing"
         result["recovery_action"] = "install agy or set AGY_BIN to a valid path"
         result["warnings"].append(result["failure_reason"])
-        return result
+        return _finalize(result)
 
     if version_proc.returncode != 0:
         result["failure_reason"] = f"agy --version failed (exit {version_proc.returncode})"
         result["failure_class"] = "cli_missing"
         result["warnings"].append(result["failure_reason"])
-        return result
+        return _finalize(result)
 
     version_str = version_proc.stdout.strip() or None
     result["agy"]["version"] = version_str
+    combined_version_text = "\n".join(
+        part for part in [version_proc.stdout, version_proc.stderr] if part
+    )
+    result["version_evidence"] = parse_agy_version_string(combined_version_text)
+    _resolved_realpath: str | None = None
     try:
         import shutil
         resolved = shutil.which(agy_bin)
+        _resolved_realpath = resolved
         result["agy"]["resolved_path"] = _mask_resolved_path(resolved)
     except Exception:
         pass
+    binary_identity_before = compute_binary_identity(_resolved_realpath)
+    result["binary_identity"] = binary_identity_before
 
     # Step 2: help check
     try:
@@ -1264,13 +1274,13 @@ def run_preflight(
         result["failure_reason"] = f"{agy_bin}: command not found"
         result["failure_class"] = "cli_missing"
         result["warnings"].append(result["failure_reason"])
-        return result
+        return _finalize(result)
 
     if help_proc.returncode != 0:
         result["failure_reason"] = "agy --help failed"
         result["failure_class"] = "cli_incompatible"
         result["warnings"].append(result["failure_reason"])
-        return result
+        return _finalize(result)
 
     # Store redacted help output as live probe evidence.
     result["help"]["stdout_sample"] = _redact_output_sample(help_proc.stdout)
@@ -1283,12 +1293,13 @@ def run_preflight(
 
     has_noninteractive = any(noninteractive_flags.values())
     result["help"]["ok"] = has_noninteractive
-
     if not has_noninteractive:
-        result["failure_reason"] = "agy --help is missing noninteractive flags (-p / --print / --prompt)"
-        result["failure_class"] = "cli_incompatible"
-        result["recovery_action"] = "upgrade agy to a version that supports -p / --print / --prompt"
-        return result
+        # Issue #1941 In Scope: help non-listing is supporting evidence only.
+        # It is recorded as a warning, but the actual fixed-argv runtime smoke
+        # below is still the authority on whether -p/--print/--prompt work.
+        result["warnings"].append(
+            "agy --help does not list -p/--print/--prompt; deferring to runtime smoke (PR #1976 design)"
+        )
 
     # Step 3: smoke check
     try:
@@ -1319,7 +1330,7 @@ def run_preflight(
         result["failure_reason"] = "agy smoke check timed out"
         result["failure_class"] = "client_subprocess_timeout"
         result["recovery_action"] = "check agy network connectivity or increase timeout"
-        return result
+        return _finalize(result)
 
     if not smoke["ok"]:
         result["failure_reason"] = smoke.get("failure_reason") or "agy smoke check failed"
@@ -1327,7 +1338,7 @@ def run_preflight(
         result["recovery_action"] = (
             result["auth"].get("recovery_action") or "check agy configuration and rerun preflight"
         )
-        return result
+        return _finalize(result)
 
     if grounded_research:
         grounded_result = _run_grounded_research_smoke(agy_bin)
@@ -1336,7 +1347,7 @@ def run_preflight(
             result["failure_reason"] = grounded_result.get("failure_reason") or "agy grounded_research probe failed"
             result["failure_class"] = grounded_result.get("failure_class") or "agy_grounded_research_failed"
             result["recovery_action"] = "check AGY WebSearch/WebGrounding connectivity and rerun preflight"
-            return result
+            return _finalize(result)
         result["grounded_research"]["ok"] = True
 
     if validate_local_asset_contract:
@@ -1375,10 +1386,36 @@ def run_preflight(
 
     if result.get("local_asset_research") is not None and not result["local_asset_research"]["ok"]:
         result["ok"] = False
-        return result
+        return _finalize(result)
+
+    if compute_capabilities:
+        capability_probes: dict[str, Any] = {}
+        try:
+            capability_probes["disable_slash_commands"] = _run_disable_slash_commands_probe(agy_bin)
+            capability_probes["leading_slash_literal"] = _run_leading_slash_literal_probe(agy_bin)
+        except Exception as exc:  # pragma: no cover - defensive fail-closed path
+            result["warnings"].append(f"capability_probe_failed: {exc}")
+        binary_identity_after = compute_binary_identity(_resolved_realpath)
+        result["binary_identity_after"] = binary_identity_after
+        config_digest = compute_config_digest()
+
+        def _compute_matrix() -> dict[str, Any]:
+            return build_capability_matrix(
+                version_result=result["version_evidence"],
+                disable_slash_probe=capability_probes.get("disable_slash_commands"),
+                leading_slash_probe=capability_probes.get("leading_slash_literal"),
+                binary_identity_before=binary_identity_before,
+                binary_identity_after=binary_identity_after,
+            )
+
+        result["capabilities"] = get_or_compute_capability_matrix(
+            binary_identity_after, config_digest, _compute_matrix
+        )
+        result["capability_probes"] = capability_probes
+        result["capability_schema"] = CAPABILITY_MATRIX_SCHEMA_VERSION
 
     result["ok"] = True
-    return result
+    return _finalize(result)
 
 
 def build_evidence_envelope(
@@ -1506,6 +1543,624 @@ def render_evidence_markdown(envelope: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+
+# ---------------------------------------------------------------------------
+# Capability gate (Issue #1941 — agy_capability_matrix/v1)
+#
+# preflight_agy.py is the single implementation SSOT for capability detection.
+# Consumers (setup_check.py, run_gemini_headless.py) MUST consume this result
+# and MUST NOT re-implement a version parser or help-text parser of their own
+# (Issue #1941 AC3).
+#
+# Evidence priority (highest authority first): runtime_semantic_observation >
+# parser_acceptance > changelog > help > version. `help` and `version` are
+# supporting evidence only and never independently confirm `supported`
+# (Issue #1941 Outcome / AC2 / AC6).
+# ---------------------------------------------------------------------------
+
+CAPABILITY_MATRIX_SCHEMA_VERSION = "agy_capability_matrix/v1"
+
+CAPABILITY_STATUSES = frozenset(
+    {"supported", "unsupported", "unavailable", "inconclusive", "evidence_invalid"}
+)
+
+CAPABILITY_PREDICATES: dict[str, list[str]] = {
+    "headless_permission_policy": [
+        "persisted_settings_loaded",
+        "deny_precedence_enforced",
+        "ask_is_soft_denied_noninteractive",
+    ],
+    "hooks": [
+        "workspace_hooks_config_loaded",
+        "pre_invocation_hook_dispatch",
+        "pre_invocation_ephemeral_message",
+        "pre_invocation_injected_tool_call",
+        "pre_tool_use_verdict",
+        "post_tool_use_dispatch",
+        "post_tool_use_matcher_semantics",
+    ],
+    "disable_slash_commands": [
+        "parser_accepts_flag",
+        "leading_slash_is_literal",
+    ],
+}
+
+EVIDENCE_PRIORITY = (
+    "runtime_semantic_observation",
+    "parser_acceptance",
+    "changelog",
+    "help",
+    "version",
+)
+
+# google-antigravity/antigravity-cli#728 ("unknown injected step type: <nil>"
+# on agy 1.1.9) is open as of 2026-08-03. Until resolved, this predicate is
+# fixed `unsupported` regardless of version/help/runtime evidence (Issue #1941
+# In Scope).
+UPSTREAM_ANTIGRAVITY_CLI_728_OPEN = True
+
+# Minimum agy version at which the official CHANGELOG.md confirms a given
+# capability was introduced. Used only as supporting (changelog) evidence —
+# never sufficient on its own to claim `supported` for a predicate that
+# requires runtime/parser proof (Issue #1941 In Scope, AC6).
+_CHANGELOG_MIN_VERSION: dict[str, tuple[int, int, int]] = {
+    "persisted_settings_loaded": (1, 1, 4),
+    "parser_accepts_flag": (1, 1, 9),
+    "leading_slash_is_literal": (1, 1, 9),
+}
+
+_UNKNOWN_OPTION_RE = re.compile(
+    r"unknown (?:option|flag)|unrecognized (?:option|flag|arguments?)|invalid option",
+    re.IGNORECASE,
+)
+
+# Matches `agy 1.1.9`, bare `1.1.9`, and prerelease/build metadata suffixes
+# such as `1.1.9-beta.1+build.5`. Anchored on a preceding start-of-line,
+# whitespace, or colon so it does not match version-looking substrings mid
+# word.
+_VERSION_LINE_RE = re.compile(
+    r"(?:^|[\s:])v?(?P<ver>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]*)?)(?:\s|$)"
+)
+
+
+def parse_agy_version_string(raw_text: str | None) -> dict[str, Any]:
+    """Parse `agy --version` (or combined stdout+stderr) output, fail-closed.
+
+    Returns ``{"status": "parsed" | "version_evidence_invalid", "version":
+    str | None, "core": (major, minor, patch) | None, "raw": raw_text}``.
+
+    Handles: ``agy 1.1.9``-shape, bare ``1.1.9``, prerelease/build metadata,
+    empty-stdout-with-version-in-stderr (caller passes combined text),
+    multi-line warning-prefixed output, malformed/locale-dependent text, and
+    exit-0-but-unparsable output. A parse failure is classified as
+    ``version_evidence_invalid`` — never as ``unsupported`` (Issue #1941 AC8).
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return {"status": "version_evidence_invalid", "version": None, "core": None, "raw": raw_text}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = _VERSION_LINE_RE.search(line)
+        if match:
+            ver = match.group("ver")
+            core_match = re.match(r"(\d+)\.(\d+)\.(\d+)", ver)
+            core = tuple(int(part) for part in core_match.groups()) if core_match else None
+            return {"status": "parsed", "version": ver, "core": core, "raw": raw_text}
+    return {"status": "version_evidence_invalid", "version": None, "core": None, "raw": raw_text}
+
+
+def compute_binary_identity(resolved_path: str | None) -> dict[str, Any]:
+    """Compute an identity fingerprint for the resolved agy binary.
+
+    Returns ``realpath``/``sha256``/``size``/``mtime_ns``/``platform``/``arch``.
+    A binary that cannot be resolved/read returns an all-``None`` identity
+    (except platform/arch) so drift detection can distinguish "no binary" from
+    "binary changed" (Issue #1941 AC6).
+    """
+    identity: dict[str, Any] = {
+        "realpath": None,
+        "sha256": None,
+        "size": None,
+        "mtime_ns": None,
+        "platform": platform.system(),
+        "arch": platform.machine(),
+    }
+    if not resolved_path:
+        return identity
+    try:
+        real = str(Path(resolved_path).resolve())
+        stat_result = os.stat(real)
+        digest = hashlib.sha256()
+        with open(real, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        identity["realpath"] = real
+        identity["sha256"] = digest.hexdigest()
+        identity["size"] = stat_result.st_size
+        identity["mtime_ns"] = stat_result.st_mtime_ns
+    except OSError:
+        pass
+    return identity
+
+
+def binary_identity_matches(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Return True iff two identity fingerprints denote the same binary."""
+    keys = ("realpath", "sha256", "size", "mtime_ns", "platform", "arch")
+    return all(before.get(key) == after.get(key) for key in keys)
+
+
+def _predicate_result(
+    status: str,
+    *,
+    reason_code: str,
+    evidence_source: str,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    if status not in CAPABILITY_STATUSES:
+        raise ValueError(f"invalid capability status: {status!r}")
+    if evidence_source not in EVIDENCE_PRIORITY:
+        raise ValueError(f"invalid evidence_source: {evidence_source!r}")
+    return {
+        "status": status,
+        "reason_code": reason_code,
+        "evidence_source": evidence_source,
+        "detail": detail,
+    }
+
+
+def classify_parser_acceptance(
+    exit_code: int | None,
+    stdout: str | None,
+    stderr: str | None,
+) -> dict[str, Any]:
+    """Classify parser acceptance/rejection of a fixed-argv flag probe.
+
+    Only unknown-option rejection text is treated as parser-level rejection
+    evidence. Auth/keyring/quota failure signals are never treated as parser
+    rejection, and an unrelated ``stdout`` "unknown option" string never
+    overrides an authoritative ``stderr`` auth-failure classification
+    (Issue #1941 AC2).
+    """
+    stdout_text = stdout or ""
+    stderr_text = stderr or ""
+    auth_signal = _classify_auth_signal("\n".join([stdout_text, stderr_text]))
+    stderr_unknown = bool(_UNKNOWN_OPTION_RE.search(stderr_text))
+    stdout_unknown = bool(_UNKNOWN_OPTION_RE.search(stdout_text))
+
+    if stderr_unknown:
+        return {"accepted": False, "evidence_source": "stderr_unknown_option", "auth_signal": auth_signal}
+
+    if auth_signal and stdout_unknown:
+        # An authoritative stderr auth-failure signal is never overridden by
+        # an incidental stdout "unknown option" string.
+        return {"accepted": None, "evidence_source": "auth_signal", "auth_signal": auth_signal}
+
+    if stdout_unknown:
+        return {"accepted": False, "evidence_source": "stdout_unknown_option", "auth_signal": auth_signal}
+
+    if exit_code == 0:
+        return {"accepted": True, "evidence_source": "exit_zero", "auth_signal": auth_signal}
+
+    if auth_signal:
+        # Non-zero exit caused by an auth failure must never reclassify
+        # parser acceptance as `unsupported` (Issue #1941 AC2).
+        return {"accepted": None, "evidence_source": "auth_signal", "auth_signal": auth_signal}
+
+    return {"accepted": None, "evidence_source": "exit_nonzero_unclassified", "auth_signal": auth_signal}
+
+
+def derive_parser_accepts_flag_status(parser_result: dict[str, Any]) -> dict[str, Any]:
+    """Derive the ``disable_slash_commands.parser_accepts_flag`` status.
+
+    ``--help`` flag visibility is intentionally NOT a parameter here: help
+    absence never blocks `supported`, and help presence never overrides a
+    parser rejection (Issue #1941 In Scope / PR #1976 design).
+    """
+    if parser_result["accepted"] is True:
+        return _predicate_result(
+            "supported", reason_code="parser_accepted_fixed_argv", evidence_source="parser_acceptance"
+        )
+    if parser_result["accepted"] is False:
+        return _predicate_result(
+            "unsupported", reason_code="parser_rejected_fixed_argv", evidence_source="parser_acceptance"
+        )
+    if parser_result.get("auth_signal"):
+        return _predicate_result(
+            "inconclusive", reason_code="auth_blocked_probe", evidence_source="parser_acceptance"
+        )
+    return _predicate_result(
+        "inconclusive",
+        reason_code="ambiguous_exit_without_rejection_evidence",
+        evidence_source="parser_acceptance",
+    )
+
+
+def _resolve_predicate(
+    group: str,
+    predicate: str,
+    *,
+    version_result: dict[str, Any],
+    disable_slash_probe: dict[str, Any] | None,
+    leading_slash_probe: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if predicate == "pre_invocation_injected_tool_call" and UPSTREAM_ANTIGRAVITY_CLI_728_OPEN:
+        return _predicate_result(
+            "unsupported",
+            reason_code="upstream_known_runtime_rejection",
+            evidence_source="runtime_semantic_observation",
+            detail="google-antigravity/antigravity-cli#728 open as of 2026-08-03",
+        )
+
+    if predicate == "parser_accepts_flag":
+        if disable_slash_probe is None:
+            return _predicate_result(
+                "unavailable", reason_code="probe_not_run", evidence_source="parser_acceptance"
+            )
+        parser_result = classify_parser_acceptance(
+            disable_slash_probe.get("exit_code"),
+            disable_slash_probe.get("stdout", ""),
+            disable_slash_probe.get("stderr", ""),
+        )
+        return derive_parser_accepts_flag_status(parser_result)
+
+    if predicate == "leading_slash_is_literal":
+        if leading_slash_probe is None:
+            return _predicate_result(
+                "unavailable", reason_code="probe_not_run", evidence_source="runtime_semantic_observation"
+            )
+        if leading_slash_probe.get("timed_out"):
+            return _predicate_result(
+                "inconclusive",
+                reason_code="client_subprocess_timeout",
+                evidence_source="runtime_semantic_observation",
+            )
+        if leading_slash_probe.get("literal_confirmed"):
+            return _predicate_result(
+                "supported",
+                reason_code="runtime_sentinel_echoed_literally",
+                evidence_source="runtime_semantic_observation",
+            )
+        if leading_slash_probe.get("expansion_detected"):
+            return _predicate_result(
+                "unsupported",
+                reason_code="slash_command_expansion_detected",
+                evidence_source="runtime_semantic_observation",
+            )
+        return _predicate_result(
+            "inconclusive", reason_code="ambiguous_runtime_output", evidence_source="runtime_semantic_observation"
+        )
+
+    if predicate == "persisted_settings_loaded":
+        if version_result.get("status") != "parsed":
+            return _predicate_result(
+                "evidence_invalid", reason_code="version_evidence_invalid", evidence_source="version"
+            )
+        version_core = version_result.get("core")
+        min_version = _CHANGELOG_MIN_VERSION["persisted_settings_loaded"]
+        if version_core and version_core >= min_version:
+            return _predicate_result(
+                "inconclusive",
+                reason_code="changelog_supported_pending_runtime_verification",
+                evidence_source="changelog",
+            )
+        return _predicate_result(
+            "unsupported", reason_code="below_changelog_min_version", evidence_source="changelog"
+        )
+
+    # Remaining hooks / headless_permission_policy predicates: actual live
+    # enforcement (does persisted settings.json really force deny? does the
+    # hook actually dispatch/inject/verdict/match?) is Issue #1979's
+    # responsibility, explicitly Out of Scope for #1941. We never claim
+    # `supported` without a runtime semantic observation this Issue does not
+    # perform for these predicates.
+    return _predicate_result(
+        "inconclusive",
+        reason_code="runtime_semantic_observation_deferred_to_1979",
+        evidence_source="changelog",
+        detail="live enforcement verification is Issue #1979's responsibility per #1941 Out of Scope",
+    )
+
+
+def get_capability_status(matrix: dict[str, Any], group: str, predicate: str) -> dict[str, Any]:
+    """Look up a single predicate result. Unknown capability names are never
+    `supported` — they resolve to `unavailable` (Issue #1941 AC2).
+    """
+    group_matrix = matrix.get(group) if isinstance(matrix, dict) else None
+    if not isinstance(group_matrix, dict) or predicate not in group_matrix:
+        return _predicate_result(
+            "unavailable", reason_code="unknown_capability", evidence_source="runtime_semantic_observation"
+        )
+    return group_matrix[predicate]
+
+
+def build_capability_matrix(
+    *,
+    version_result: dict[str, Any],
+    disable_slash_probe: dict[str, Any] | None = None,
+    leading_slash_probe: dict[str, Any] | None = None,
+    binary_identity_before: dict[str, Any] | None = None,
+    binary_identity_after: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the full `agy_capability_matrix/v1` predicate matrix.
+
+    If both binary identities are supplied and they diverge, every predicate
+    is forced to `evidence_invalid` (binary identity drift — Issue #1941 AC6);
+    no partial trust is given to probes gathered against a different binary.
+    """
+    drift = False
+    if binary_identity_before is not None and binary_identity_after is not None:
+        drift = not binary_identity_matches(binary_identity_before, binary_identity_after)
+
+    matrix: dict[str, Any] = {}
+    for group, predicates in CAPABILITY_PREDICATES.items():
+        matrix[group] = {}
+        for predicate in predicates:
+            if drift:
+                matrix[group][predicate] = _predicate_result(
+                    "evidence_invalid",
+                    reason_code="binary_identity_drift",
+                    evidence_source="runtime_semantic_observation",
+                )
+                continue
+            matrix[group][predicate] = _resolve_predicate(
+                group,
+                predicate,
+                version_result=version_result,
+                disable_slash_probe=disable_slash_probe,
+                leading_slash_probe=leading_slash_probe,
+            )
+    return matrix
+
+
+_CAPABILITY_MEMO_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+
+def compute_config_digest(repo_root: Path | None = None) -> str:
+    """Digest of the config files relevant to hooks/permission capability
+    memoization. Never itself part of persistent cache — only used as an
+    in-process memoization key component (Issue #1941 AC9).
+    """
+    root = repo_root or _repo_root()
+    relevant_paths = [
+        root / ".claude" / "settings.json",
+        root / ".agents" / "mcp_config.json",
+    ]
+    digest = hashlib.sha256()
+    for path in relevant_paths:
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"\x00missing\x00")
+    return digest.hexdigest()
+
+
+def _capability_cache_key(binary_identity: dict[str, Any], config_digest: str) -> tuple[Any, ...]:
+    return (
+        binary_identity.get("realpath"),
+        binary_identity.get("sha256"),
+        binary_identity.get("size"),
+        binary_identity.get("mtime_ns"),
+        binary_identity.get("platform"),
+        binary_identity.get("arch"),
+        config_digest,
+    )
+
+
+def get_or_compute_capability_matrix(
+    binary_identity: dict[str, Any],
+    config_digest: str,
+    compute_fn: Any,
+) -> dict[str, Any]:
+    """In-process-only memoization for capability probe results.
+
+    There is intentionally no persistent (cross-process) cache — the module
+    dict lives only for the current process lifetime, so a fresh process
+    always re-probes (Issue #1941 AC9 / Out of Scope: no persistent cache).
+    """
+    key = _capability_cache_key(binary_identity, config_digest)
+    if key in _CAPABILITY_MEMO_CACHE:
+        return _CAPABILITY_MEMO_CACHE[key]
+    result = compute_fn()
+    _CAPABILITY_MEMO_CACHE[key] = result
+    return result
+
+
+def _run_disable_slash_commands_probe(agy_bin: str) -> dict[str, Any]:
+    """Fixed-argv parser acceptance probe for ``--disable-slash-commands``.
+
+    Deliberately combined with ``--help`` so the probe never triggers a real
+    (possibly costly) generation call — only parser-level accept/reject
+    evidence is needed for this predicate.
+    """
+    argv = [agy_bin, "--disable-slash-commands", "--help"]
+    probe: dict[str, Any] = {
+        "argv": argv,
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+    }
+    try:
+        proc = _run(argv, timeout=SMOKE_TIMEOUT_SECONDS)
+        probe["exit_code"] = proc.returncode
+        probe["stdout"] = proc.stdout or ""
+        probe["stderr"] = proc.stderr or ""
+    except subprocess.TimeoutExpired:
+        probe["timed_out"] = True
+    except FileNotFoundError:
+        probe["exit_code"] = None
+    return probe
+
+
+_SLASH_LITERAL_PROMPT_SUFFIX = "/nonexistent-loop-agy-capability-probe"
+
+
+def _run_leading_slash_literal_probe(agy_bin: str) -> dict[str, Any]:
+    """Isolated runtime smoke probing whether a leading ``/`` in a print-mode
+    prompt is treated as a literal character (expected) rather than expanded
+    as a slash-command (the known 1.1.9 print-mode expansion issue).
+    """
+    prompt = f"{_SLASH_LITERAL_PROMPT_SUFFIX} {SMOKE_PROMPT}"
+    argv = [agy_bin, "-p", prompt]
+    probe: dict[str, Any] = {
+        "argv": argv,
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "literal_confirmed": False,
+        "expansion_detected": False,
+    }
+    with tempfile.TemporaryDirectory(prefix="agy-preflight-slash-") as temp_dir:
+        try:
+            proc = _run(argv, cwd=Path(temp_dir), timeout=SMOKE_TIMEOUT_SECONDS)
+            probe["exit_code"] = proc.returncode
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            probe["stdout"] = stdout
+            probe["stderr"] = stderr
+            if EXPECTED_SMOKE in stdout:
+                probe["literal_confirmed"] = True
+            elif re.search(r"unknown command|no such command|unrecognized command", stdout + stderr, re.IGNORECASE):
+                probe["expansion_detected"] = True
+        except subprocess.TimeoutExpired:
+            probe["timed_out"] = True
+        except FileNotFoundError:
+            probe["exit_code"] = None
+    return probe
+
+
+
+def _argv_shape(argv: list[str]) -> dict[str, Any]:
+    return {"flags": [tok for tok in argv if tok.startswith("-")], "arg_count": len(argv)}
+
+
+def _prompt_digest(prompt: str | None) -> dict[str, Any]:
+    if not prompt:
+        return {"kind": "none", "sha256": None, "byte_length": 0}
+    encoded = prompt.encode("utf-8")
+    return {
+        "kind": "fixed_sentinel",
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "byte_length": len(encoded),
+    }
+
+
+def _sanitize_probe_in_place(probe: dict[str, Any] | None, agy_bin: str) -> None:
+    if not isinstance(probe, dict):
+        return
+    argv = probe.pop("argv", None)
+    if not isinstance(argv, list):
+        return
+    probe["argv_shape"] = _argv_shape(argv)
+    prompt_text = next(
+        (tok for tok in argv if tok != agy_bin and not tok.startswith("-")),
+        None,
+    )
+    probe["prompt"] = _prompt_digest(prompt_text)
+    # never persist raw stdout/stderr beyond the already-redacted samples.
+    probe.pop("stdout", None)
+    probe.pop("stderr", None)
+
+
+def _sanitize_for_artifact(result: dict[str, Any]) -> dict[str, Any]:
+    """Return a JSON-safe deep copy of *result* safe to persist to disk.
+
+    Never persists prompt text, raw credential paths, absolute HOME, or
+    un-redacted stderr — only ``argv_shape.flags`` and
+    ``prompt.sha256``/``prompt.byte_length`` (Issue #1941 AC7).
+    """
+    sanitized = json.loads(json.dumps(result, default=str))
+    agy_bin = (sanitized.get("agy") or {}).get("bin") or "agy"
+
+    _sanitize_probe_in_place(sanitized.get("smoke"), agy_bin)
+    grounded_check = (sanitized.get("grounded_research") or {}).get("check")
+    _sanitize_probe_in_place(grounded_check, agy_bin)
+    capability_probes = sanitized.get("capability_probes")
+    if isinstance(capability_probes, dict):
+        for probe in capability_probes.values():
+            _sanitize_probe_in_place(probe, agy_bin)
+
+    home = os.environ.get("HOME")
+    if home:
+        def _scrub_home(value: Any) -> Any:
+            if isinstance(value, str):
+                return value.replace(home, "$HOME")
+            if isinstance(value, dict):
+                return {k: _scrub_home(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_scrub_home(v) for v in value]
+            return value
+
+        sanitized = _scrub_home(sanitized)
+
+    return sanitized
+
+
+def _artifact_output_dir(repo_root: Path | None = None) -> Path:
+    override = os.environ.get("AGY_PREFLIGHT_ARTIFACT_DIR")
+    if override:
+        return Path(override)
+    root = repo_root or _repo_root()
+    return root / ".claude" / "tmp"
+
+
+def write_sanitized_artifact(result: dict[str, Any], *, repo_root: Path | None = None) -> Path:
+    """Write a sanitized JSON artifact for a controlled-exit `run_preflight`
+    result. This is the single finalizer path used by every controlled exit
+    (binary missing, help failure, auth unavailable, cost unconfirmed,
+    timeout, cleanup failure) — Issue #1941 AC7.
+    """
+    out_dir = _artifact_output_dir(repo_root)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    out_path = out_dir / f"agy_preflight_result_{timestamp}_{os.getpid()}.json"
+    sanitized = _sanitize_for_artifact(result)
+    out_path.write_text(json.dumps(sanitized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return out_path
+
+
+def _finalize(result: dict[str, Any]) -> dict[str, Any]:
+    """Single finalizer invoked on every `run_preflight` return path.
+
+    Always attempts to write the sanitized artifact; a write failure is
+    recorded as a warning but never raises (cleanup failure is itself a
+    controlled-exit path per Issue #1941 In Scope).
+    """
+    try:
+        artifact_path = write_sanitized_artifact(result)
+        result["artifact_path"] = str(artifact_path)
+    except OSError as exc:
+        result.setdefault("warnings", []).append(f"artifact_write_failed: {exc}")
+        result["artifact_path"] = None
+    return result
+
+
+def compute_require_capability_exit_code(matrix: dict[str, Any], requested: list[str]) -> int:
+    """Derive the `--require-capability` exit code from the capability matrix.
+
+    0 = every requested predicate is `supported`.
+    1 = any requested predicate is `unsupported` / `inconclusive` / `evidence_invalid`.
+    77 = no `1`-triggering predicate remains, but at least one requested
+         predicate is still `unavailable` (Issue #1941 AC4). 77 is never a
+         success/close/merge signal on its own — callers must not treat it as
+         PASS.
+    """
+    statuses: list[str] = []
+    for dotted in requested:
+        group, _, predicate = dotted.partition(".")
+        status_obj = get_capability_status(matrix, group, predicate)
+        statuses.append(status_obj.get("status", "unavailable"))
+
+    if statuses and all(status == "supported" for status in statuses):
+        return 0
+    if any(status in {"unsupported", "inconclusive", "evidence_invalid"} for status in statuses):
+        return 1
+    return 77
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for CLI invocation.
 
@@ -1575,13 +2230,32 @@ def main(argv: list[str] | None = None) -> int:
         default=1266,
         help="Issue number to record in the rendered evidence doc.",
     )
+    parser.add_argument(
+        "--require-capability",
+        required=False,
+        default=None,
+        help=(
+            "Comma-separated capability.predicate list (e.g. "
+            "disable_slash_commands.parser_accepts_flag). When given, exit code is "
+            "0=all supported / 1=any unsupported|inconclusive|evidence_invalid / "
+            "77=only unavailable remains (never a success signal). Default invocation "
+            "(flag omitted) is unaffected and keeps the existing ok-boolean exit 0/1."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    requested_capabilities = (
+        [item.strip() for item in args.require_capability.split(",") if item.strip()]
+        if args.require_capability
+        else None
+    )
 
     result = run_preflight(
         validate_local_asset_contract=args.local_asset_research,
         live_serena=args.live_serena,
         mcp_config_path=args.mcp_config,
         grounded_research=args.grounded_research,
+        compute_capabilities=bool(requested_capabilities),
     )
 
     if args.json_stdout:
@@ -1607,6 +2281,14 @@ def main(argv: list[str] | None = None) -> int:
         markdown = render_evidence_markdown(envelope)
         args.render_evidence_doc.parent.mkdir(parents=True, exist_ok=True)
         args.render_evidence_doc.write_text(markdown, encoding="utf-8")
+
+    if requested_capabilities:
+        # Issue #1941 AC4: --require-capability mode derives its own exit
+        # code taxonomy from the capability matrix; it never reuses the
+        # default ok-boolean exit 0/1 semantics.
+        return compute_require_capability_exit_code(
+            result.get("capabilities") or {}, requested_capabilities
+        )
 
     return 0 if result["ok"] else 1
 
