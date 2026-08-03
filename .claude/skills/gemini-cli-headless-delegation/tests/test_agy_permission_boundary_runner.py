@@ -89,6 +89,10 @@ def execute(tool_call):
         return response.status == 200
     return False
 
+if "__POST_MODE__" == "start_failure":
+    for item in hooks["permission-boundary-postlogger"]["PostToolUse"]:
+        item["hooks"][0]["command"] = str(workspace / "nonexistent_post_logger_does_not_exist.py")
+
 if "__POST_MODE__" == "nonzero":
     failing_logger = workspace / "forced_post_logger.py"
     failing_logger.write_text(
@@ -130,8 +134,23 @@ for index, step in enumerate(steps):
     if len(matching_post) != 1:
         raise SystemExit(16)
     post_payload = {"conversationId": base["conversationId"], "stepIdx": index, "error": None}
-    post = invoke(matching_post[0]["hooks"][0]["command"], "{malformed" if "__POST_MODE__" == "parse_failure" else post_payload)
-    if post.returncode and "__POST_MODE__" not in ("parse_failure", "nonzero"):
+    post_command = matching_post[0]["hooks"][0]["command"]
+    try:
+        post = invoke(post_command, "{malformed" if "__POST_MODE__" == "parse_failure" else post_payload)
+    except OSError:
+        # The dispatch source (this fake runtime), not the unstartable logger
+        # itself, is the only party able to observe a spawn failure.
+        dispatch_failure_event = {
+            "kind": "post_tool_use",
+            "status": "dispatch_start_failure",
+            "run_id": context["run_id"],
+            "canary_id": context["canary_id"],
+            "tool_profile": context["tool_profile"],
+        }
+        with open(context["events_path"], "a") as events_output:
+            events_output.write(json.dumps(dispatch_failure_event, separators=(",", ":")) + "\\n")
+        post = None
+    if post is not None and post.returncode and "__POST_MODE__" not in ("parse_failure", "nonzero"):
         raise SystemExit(post.returncode)
 raise SystemExit(__EXIT_CODE__)
 """
@@ -261,7 +280,7 @@ def test_denied_attempts_preserve_actual_sentinels_and_emit_no_posttooluse(
     assert all(json.loads(line)["kind"] != "post_tool_use" for line in events_path.read_text().splitlines())
 
 
-@pytest.mark.parametrize("post_mode", ["parse_failure", "nonzero"])
+@pytest.mark.parametrize("post_mode", ["parse_failure", "nonzero", "start_failure"])
 def test_posttooluse_logger_failure_is_inconclusive_not_expected_absence(tmp_path: Path, post_mode: str) -> None:
     fake = tmp_path / "fake-agy"
     _fake_agy(fake, post_mode=post_mode)
