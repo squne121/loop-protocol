@@ -26,7 +26,7 @@
     "test:e2e:headed": "playwright test --headed",
     "dist:e2e-boundary": "node scripts/check-dist-e2e-boundary.mjs",
     "verify:issue-1425": "pnpm test -- tests/check-dist-e2e-boundary.test.ts tests/storage.test.ts && pnpm typecheck && pnpm lint && pnpm test && pnpm build",
-    "test:e2e:preview-namespace": "rm -rf dist && pnpm build && LOOP_E2E_PREVIEW_NAMESPACE_LANE=true playwright test",
+    "test:e2e:preview-namespace": ": \"${VITE_LOOP_STORAGE_NAMESPACE:?missing VITE_LOOP_STORAGE_NAMESPACE}\" && case \"$VITE_LOOP_STORAGE_NAMESPACE\" in pr-[0-9]*) ;; *) echo \"invalid VITE_LOOP_STORAGE_NAMESPACE: $VITE_LOOP_STORAGE_NAMESPACE\" >&2; exit 1 ;; esac && : \"${LOOP_EXPECTED_STORAGE_KEY:?missing LOOP_EXPECTED_STORAGE_KEY}\" && case \"$LOOP_EXPECTED_STORAGE_KEY\" in loop-protocol.preview.*.mvp.save) ;; *) echo \"invalid LOOP_EXPECTED_STORAGE_KEY: $LOOP_EXPECTED_STORAGE_KEY\" >&2; exit 1 ;; esac && : \"${VITE_BASE_PATH:?missing VITE_BASE_PATH}\" && case \"$VITE_BASE_PATH\" in /*/) ;; *) echo \"invalid VITE_BASE_PATH: $VITE_BASE_PATH\" >&2; exit 1 ;; esac && rm -rf dist && VITE_E2E_MODE=false pnpm build && pnpm dist:e2e-boundary --mode production --dist dist && LOOP_E2E_PREVIEW_NAMESPACE_LANE=true playwright test tests/e2e/m4-preview-namespace.spec.ts",
     "test:vrt": "VITE_E2E_MODE=true pnpm build && LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts",
     "test:vrt:e2e": "LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts",
     "test:vrt:update:e2e": "VITE_E2E_MODE=true pnpm build && LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts --update-snapshots=all",

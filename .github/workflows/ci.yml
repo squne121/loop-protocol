@@ -702,6 +702,16 @@ jobs:
           esac
           echo "namespace=$namespace" >> "$GITHUB_OUTPUT"
           echo "expected_key=loop-protocol.preview.${namespace}.mvp.save" >> "$GITHUB_OUTPUT"
+          # Issue #1283 (2026-08-03 OWNER review repair, AC9/AC15): deploy-pr
+          # equivalent nested base -- matches deploy-pages.yml deploy-pr job
+          # (Resolve Vite base path step).
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          base_path="/${repo_name}/${namespace}/"
+          case "$base_path" in
+            /*/) ;;
+            *) echo "Invalid preview base path: $base_path" >&2; exit 1 ;;
+          esac
+          echo "base_path=$base_path" >> "$GITHUB_OUTPUT"
       - name: Build for AC9 preview-namespace lane (timed)
         # Clean dist + production-like build (no VITE_E2E_MODE) — see
         # tests/e2e/m4-preview-namespace.spec.ts file header and
@@ -710,6 +720,10 @@ jobs:
         env:
           VITE_E2E_MODE: "false"
           VITE_LOOP_STORAGE_NAMESPACE: ${{ steps.preview-namespace.outputs.namespace }}
+          # Issue #1283 (2026-08-03 OWNER review repair, AC9): deploy-pr equivalent
+          # nested base, so the AC9 dedicated lane below exercises the same nested
+          # asset/navigation boundary a real PR preview deploy uses.
+          VITE_BASE_PATH: ${{ steps.preview-namespace.outputs.base_path }}
         run: |
           run_timed() {
             local step_id="$1"; shift
@@ -740,6 +754,10 @@ jobs:
         env:
           LOOP_E2E_PREVIEW_NAMESPACE_LANE: "true"
           LOOP_EXPECTED_STORAGE_KEY: ${{ steps.preview-namespace.outputs.expected_key }}
+          # Issue #1283 (2026-08-03 OWNER review repair, AC9): playwright.config.ts
+          # reads VITE_BASE_PATH at config-load time to resolve the nested baseURL/
+          # webServer.url for this lane -- must match the build VITE_BASE_PATH above.
+          VITE_BASE_PATH: ${{ steps.preview-namespace.outputs.base_path }}
         run: |
           run_timed() {
             local step_id="$1"; shift
