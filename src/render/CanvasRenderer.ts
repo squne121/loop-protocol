@@ -1,8 +1,33 @@
 import type { GameState } from '../state'
 import { drawEnemyHpLabel } from './renderUtils'
 
+/**
+ * Observed presentation metrics for the Canvas, derived from a
+ * `ResizeObserverEntry` (Issue #1956 fix 3). `deviceWidth`/`deviceHeight`
+ * are physical device pixels (the authority for the backing store,
+ * `canvas.width`/`canvas.height`); `cssWidth`/`cssHeight` are logical CSS
+ * pixels (the Canvas's own display size). Passing this to `resize()` lets
+ * the renderer avoid a synchronous `getBoundingClientRect()` layout read.
+ */
+export interface CanvasPresentation {
+  deviceWidth: number
+  deviceHeight: number
+  cssWidth: number
+  cssHeight: number
+}
+
 export interface CanvasRenderer {
   render(state: GameState): void
+  /**
+   * Synchronise CSS display dimensions and backing store without changing
+   * logical state. When `presentation` is supplied (from an observed
+   * `ResizeObserverEntry`), it is used directly as the authority and no
+   * `getBoundingClientRect()` read is performed. When omitted, falls back
+   * to `getBoundingClientRect()` + `window.devicePixelRatio` (used for the
+   * window-resize-only path when `ResizeObserver` is unavailable, and for
+   * the very first frame before any observer entry has arrived).
+   */
+  resize(state: GameState, presentation?: CanvasPresentation): void
 }
 
 /** Fixed length of the aim indicator line in logical pixels (AC2). */
@@ -103,27 +128,106 @@ export function createCanvasRenderer(canvas: HTMLCanvasElement): CanvasRenderer 
   if (!context) {
     throw new Error('2D canvas context is not available.')
   }
+  const renderingContext = context
 
-  let lastArenaWidth = 0
-  let lastArenaHeight = 0
-  let lastDpr = 0
+  // Cached backing-store/logical-transform metrics. Only `resize()` (driven
+  // by the observer callback in `observeCanvasPresentation`, or the
+  // window-resize fallback when ResizeObserver is unavailable) updates
+  // these. `render()` reads them every frame WITHOUT re-deriving them, so
+  // it never performs a synchronous `getBoundingClientRect()` layout read
+  // in its hot path (Issue #1956 fix 3).
+  let lastLogicalWidth = 0
+  let lastLogicalHeight = 0
+  let lastDeviceWidth = 0
+  let lastDeviceHeight = 0
+  let hasAppliedResolution = false
+
+  function applyResolution(
+    logicalWidth: number,
+    logicalHeight: number,
+    deviceWidth: number,
+    deviceHeight: number,
+  ): void {
+    if (
+      hasAppliedResolution &&
+      logicalWidth === lastLogicalWidth &&
+      logicalHeight === lastLogicalHeight &&
+      deviceWidth === lastDeviceWidth &&
+      deviceHeight === lastDeviceHeight
+    ) {
+      return
+    }
+
+    canvas.width = Math.max(1, Math.round(deviceWidth))
+    canvas.height = Math.max(1, Math.round(deviceHeight))
+    lastLogicalWidth = logicalWidth
+    lastLogicalHeight = logicalHeight
+    lastDeviceWidth = deviceWidth
+    lastDeviceHeight = deviceHeight
+    hasAppliedResolution = true
+
+    // Draw in fixed logical coordinates. CSS display dimensions and backing
+    // store dimensions may vary independently with container size, DPR, and
+    // browser zoom, while gameplay coordinates remain unchanged.
+    renderingContext.setTransform(
+      canvas.width / logicalWidth,
+      0,
+      0,
+      canvas.height / logicalHeight,
+      0,
+      0,
+    )
+  }
+
+  /**
+   * Fallback presentation resolution via `getBoundingClientRect()` +
+   * `window.devicePixelRatio`. Used only when no `ResizeObserverEntry`
+   * metrics were supplied to `resize()`: the window-resize-only path
+   * (ResizeObserver unavailable) and the very first frame before any
+   * observer entry has arrived.
+   */
+  function resolveFallbackPresentation(
+    logicalWidth: number,
+    logicalHeight: number,
+  ): CanvasPresentation {
+    const bounds = canvas.getBoundingClientRect()
+    // jsdom and a temporarily detached canvas report a zero rectangle. The
+    // logical arena remains the safe fallback; browser rendering always uses
+    // the CSS display rectangle, never the logical dimensions directly.
+    const cssWidth = bounds.width > 0 ? bounds.width : logicalWidth
+    const cssHeight = bounds.height > 0 ? bounds.height : logicalHeight
+    const dpr = window.devicePixelRatio ?? 1
+    return {
+      cssWidth,
+      cssHeight,
+      deviceWidth: cssWidth * dpr,
+      deviceHeight: cssHeight * dpr,
+    }
+  }
+
+  function syncCanvasResolution(state: GameState, presentation?: CanvasPresentation): void {
+    const logicalWidth = state.arena.width
+    const logicalHeight = state.arena.height
+    const resolved = presentation ?? resolveFallbackPresentation(logicalWidth, logicalHeight)
+    applyResolution(logicalWidth, logicalHeight, resolved.deviceWidth, resolved.deviceHeight)
+  }
 
   return {
+    resize(state, presentation) {
+      syncCanvasResolution(state, presentation)
+    },
     render(state) {
-      const dpr = window.devicePixelRatio ?? 1
       const arenaW = state.arena.width
       const arenaH = state.arena.height
-
-      // Resize backing store when arena or dpr changes
-      if (arenaW !== lastArenaWidth || arenaH !== lastArenaHeight || dpr !== lastDpr) {
-        canvas.width = Math.round(arenaW * dpr)
-        canvas.height = Math.round(arenaH * dpr)
-        canvas.style.width = `${arenaW}px`
-        canvas.style.height = `${arenaH}px`
-        lastArenaWidth = arenaW
-        lastArenaHeight = arenaH
-        lastDpr = dpr
-        context.setTransform(dpr, 0, 0, dpr, 0, 0)
+      // Issue #1956 fix 3: render() must not perform a synchronous
+      // getBoundingClientRect() read every frame. Only the very first
+      // render (before any resize() has run, e.g. a renderer used directly
+      // without observeCanvasPresentation) falls back to the
+      // getBoundingClientRect()-based resync; all subsequent frames reuse
+      // the cached backing-store/logical-transform values that only
+      // resize() updates.
+      if (!hasAppliedResolution) {
+        syncCanvasResolution(state)
       }
 
       // --- Layer 1: background ---
