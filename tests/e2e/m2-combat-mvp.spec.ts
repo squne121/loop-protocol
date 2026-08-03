@@ -327,8 +327,11 @@ test('GIVEN combat HUD Assist / Pause buttons WHEN clicked THEN no Canvas pointe
 
   await page.locator('[data-action="assist-player"]').click()
   await page.locator('[data-action="toggle-pause"]').click()
-  // Resume so the rest of the suite (if run after this) is not left paused.
-  await page.locator('[data-action="toggle-pause"]').click()
+  // Resume via the pause dialog's own Resume control (Issue #1376: the HUD
+  // toggle-pause button becomes pointer-unreachable while paused, since the
+  // pause dialog overlay intercepts pointer events and the combat HUD goes
+  // inert -- consistent with tests/e2e/product-pause.spec.ts).
+  await page.locator('[data-action="resume"]').click()
 
   const after = await getGameState(page)
   expect(after.projectiles.length).toBe(before.projectiles.length)
@@ -695,7 +698,7 @@ test('GIVEN sortie running WHEN HUD rendered THEN the combat HUD (data-combat-hu
     .toBe('running')
 
   await expect(page.locator('[data-combat-hud]')).toBeVisible({ timeout: 3000 })
-  await expect(page.locator('[data-legacy-result-surface]')).toBeHidden({ timeout: 3000 })
+  await expect(page.locator('[data-legacy-debrief-surface]')).toBeHidden({ timeout: 3000 })
   await expect(page.locator('[data-field="combat-hud-weapon"]')).toHaveText(/Ready|Recharging/, {
     timeout: 3000,
   })
