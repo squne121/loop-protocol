@@ -353,6 +353,45 @@ async function resolveHeadSha(): Promise<string> {
  */
 const POINTER_EPSILON_PX = 50
 
+/**
+ * Wait for the real Chrome tab zoom (Issue #1956 fix 6) to have actually
+ * propagated to the page's rendering pipeline before trusting any
+ * `getBoundingClientRect()` read.
+ *
+ * Root cause (Issue #1956 responsive-canvas iteration 2 fix): a prior
+ * version of this harness called `zoomCtx.setZoom(zoom.factor)` and then
+ * immediately proceeded to poll `getBoundingClientRect()` for two
+ * consecutive stable reads via `waitForCanvasLayoutToSettle()`. That
+ * `await` on `chrome.tabs.setZoom()` (a background-service-worker-side
+ * extension API call) resolves once the BROWSER PROCESS has accepted the
+ * new zoom level -- it does NOT wait for that zoom change to have actually
+ * propagated to the PAGE's renderer process and retriggered layout. Two
+ * consecutive `getBoundingClientRect()` reads taken before that
+ * propagation lands are trivially "stable" (both still report the OLD,
+ * pre-zoom geometry), so `waitForCanvasLayoutToSettle()` falsely declared
+ * settlement on stale geometry. This was empirically confirmed with debug
+ * instrumentation: `window.devicePixelRatio` itself (the earliest
+ * page-observable signal that a real Chrome tab zoom has taken visual
+ * effect -- see the module header comment) was ALSO still reporting the
+ * previous zoom's value at that point, not merely the CSS box.
+ *
+ * `window.devicePixelRatio` for a real Chrome tab zoom is the context's
+ * declared `deviceScaleFactor` multiplied by the current chrome tab zoom
+ * factor (see module header comment). Polling for THIS specific target
+ * value (rather than mere read-to-read stability) closes the race: it is
+ * the earliest reliable page-observable proof that the zoom has actually
+ * been applied to this page's rendering, so any `getBoundingClientRect()`
+ * read taken afterward is guaranteed to reflect the new, settled geometry.
+ */
+async function waitForZoomToApply(page: Page, expectedDevicePixelRatio: number): Promise<void> {
+  await expect
+    .poll(
+      async () => page.evaluate(() => window.devicePixelRatio),
+      { timeout: 8_000, intervals: [20, 50, 100, 200] },
+    )
+    .toBeCloseTo(expectedDevicePixelRatio, 2)
+}
+
 async function waitForCanvasLayoutToSettle(page: Page): Promise<void> {
   // Empirically observed in this harness: after setViewportSize()/real
   // Chrome tab zoom, the Canvas's own CSS layout box can keep changing
@@ -713,6 +752,13 @@ test('responsive canvas preserves the logical arena, frozen combat positions, ba
         for (const zoom of RESPONSIVE_ZOOMS) {
           await page.setViewportSize(viewport)
           await zoomCtx.setZoom(zoom.factor)
+          // Issue #1956 responsive-canvas iteration 2 fix: `setZoom()`
+          // resolving does not guarantee the zoom has propagated to this
+          // page's renderer yet (see `waitForZoomToApply()` doc comment) --
+          // wait for the page-observable `devicePixelRatio` to actually
+          // reach the expected (declared DPR x zoom factor) value before
+          // trusting any subsequent `getBoundingClientRect()` read.
+          await waitForZoomToApply(page, dpr * zoom.factor)
           // Reset the (virtual) cursor to a known-good position inside the
           // new viewport immediately after every resize/zoom change --
           // otherwise it may still be resting at a coordinate from the
