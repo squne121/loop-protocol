@@ -38,12 +38,20 @@
  *   the nested prefix (zero root-relative requests); every response must
  *   be 2xx; and there must be zero `requestfailed` events and zero 404
  *   responses.
- * - A Node-side write-set operation-history audit (same mechanism as
- *   `m4-upgrade-loop.spec.ts`: `context.exposeBinding()` +
- *   `context.addInitScript()` patching `Storage.prototype`) now verifies
- *   that the production key AND any E2E-runtime-shaped key
- *   (`loop-protocol.e2e.*`) receive zero operations, and that only the
- *   resolved preview-namespace key is written (AC15).
+ * - A Node-side write-set operation-history audit now verifies that the
+ *   production key AND any E2E-runtime-shaped key (`loop-protocol.e2e.*`)
+ *   receive zero operations, and that only the resolved preview-namespace
+ *   key is written (AC15).
+ *
+ * 2026-08-03 OWNER REQUEST_CHANGES repair, iteration 1
+ * (issuecomment-5167160762 on PR #1981): the write-set operation-history
+ * audit mechanism had the same three unresolved false-green paths as
+ * `m4-upgrade-loop.spec.ts` (P1 Blockers 1-3), fixed identically here — see
+ * that file's header for the full rationale (order reset per reload,
+ * fire-and-forget log delivery, named-property access bypassing the
+ * prototype patch). This spec duplicates the same `createAuditedContext()`
+ * shape rather than importing a shared module, because extracting it into
+ * a new file would fall outside this Issue's Allowed Paths.
  *
  * Dedicated lane invocation (see `pnpm run test:e2e:preview-namespace`):
  *
@@ -53,19 +61,22 @@
  *     pnpm run test:e2e:preview-namespace
  *
  * `pnpm run test:e2e:preview-namespace` self-validates namespace / expected
- * key / expected base path (fail-closed, before build), self-fixes
- * `VITE_E2E_MODE=false` (does not rely on caller env), removes any stale
- * `dist/`, builds a production-like bundle (still honoring
- * `VITE_LOOP_STORAGE_NAMESPACE` and `VITE_BASE_PATH` via Vite's
- * `import.meta.env` build-time replacement regardless of `VITE_E2E_MODE`),
- * runs the production artifact boundary checker
+ * key / expected base path (fail-closed, before build — Issue #1283 repair
+ * iteration 1 P1 Blocker 4 replaced the prior shell-glob guard with a Node
+ * validation script inlined via `node -e` in the `package.json` script; see
+ * that script for the exact contract), self-fixes `VITE_E2E_MODE=false`
+ * (does not rely on caller env), removes any stale `dist/`, builds a
+ * production-like bundle
+ * (still honoring `VITE_LOOP_STORAGE_NAMESPACE` and `VITE_BASE_PATH` via
+ * Vite's `import.meta.env` build-time replacement regardless of
+ * `VITE_E2E_MODE`), runs the production artifact boundary checker
  * (`pnpm dist:e2e-boundary --mode production --dist dist`), and only then
  * runs Playwright with `LOOP_E2E_PREVIEW_NAMESPACE_LANE=true`, which also
  * forces `reuseExistingServer: false` in `playwright.config.ts` so a stale
  * server from a different worktree/build cannot be reused.
  */
 
-import { test, expect, type Page, type BrowserContext, type Browser } from '@playwright/test'
+import { test, expect, type Page, type BrowserContext, type Browser, type CDPSession } from '@playwright/test'
 
 const PRODUCTION_KEY = 'loop-protocol.mvp.save'
 // Matches the E2E-runtime key shape m4-upgrade-loop.spec.ts's
@@ -114,24 +125,40 @@ async function readStorageKey(page: Page, key: string): Promise<StoredSnapshot |
   return JSON.parse(raw) as StoredSnapshot
 }
 
+// ---------------------------------------------------------------------------
+// Write-set operation-history audit (AC15). Issue #1283 repair iteration 1:
+// rebuilt on the CDP `DOMStorage` domain — see `m4-upgrade-loop.spec.ts`'s
+// file header for the full P1 Blocker 1-3 rationale this duplicated helper
+// addresses (order reset per reload, fire-and-forget log delivery,
+// named-property access bypassing Storage.prototype patches). Duplicated
+// (not extracted to a shared module) because a new helper file would fall
+// outside this Issue's Allowed Paths.
+// ---------------------------------------------------------------------------
+
 type WriteOp = {
   type: 'setItem' | 'removeItem' | 'clear'
   key: string | null
+  /** Global, monotonically-increasing sequence number assigned from this
+   *  Node-side counter. Never reset by navigation/reload (P1 Blocker 1). */
   order: number
+  /** Bumped on every main-frame `framenavigated` (including reload). */
+  documentEpoch: number
+  /** Sequence local to `documentEpoch`, reset to 0 on every navigation. */
+  epochOrder: number
 }
 
 /**
  * Context-level, one-time production sentinel seeding (Design Constraints:
  * "production sentinel と E2E seed は最初の navigation 前に一度だけ
- * context-level で初期化") + the same write-set operation-history audit
- * used by m4-upgrade-loop.spec.ts. This lane never needs a reload, but the
- * one-time-init requirement and audit mechanism are shared with the
- * runtime lane deliberately (single source of truth for the pattern).
+ * context-level で初期化") + the same CDP-based write-set operation-history
+ * audit used by m4-upgrade-loop.spec.ts. This lane never needs a reload,
+ * but the one-time-init requirement and audit mechanism are shared with
+ * the runtime lane deliberately (single source of truth for the pattern).
  */
 async function createAuditedContext(
   browser: Browser,
   baseURL: string,
-): Promise<{ context: BrowserContext; page: Page; writeLog: WriteOp[] }> {
+): Promise<{ context: BrowserContext; page: Page; writeLog: WriteOp[]; flushAudit: () => Promise<void> }> {
   const writeLog: WriteOp[] = []
 
   const context = await browser.newContext({
@@ -147,42 +174,53 @@ async function createAuditedContext(
     },
   })
 
-  await context.exposeBinding(
-    '__loopE2EWriteLog',
-    (_source: unknown, op: { type: 'setItem' | 'removeItem' | 'clear'; key: string | null; order: number }) => {
-      writeLog.push(op)
-    },
-  )
+  const page = await context.newPage()
 
-  await context.addInitScript(() => {
-    let order = 0
-    const w = window as Window & { __loopE2EWriteLog?: (op: unknown) => void }
-    const originalSetItem = Storage.prototype.setItem
-    const originalRemoveItem = Storage.prototype.removeItem
-    const originalClear = Storage.prototype.clear
+  // CDP-based write-set audit (Issue #1283 repair iteration 1, P1 Blockers
+  // 1-3): attached after the page exists but before the first navigation,
+  // so it never observes the storageState seeding above (empirically
+  // verified against this exact Chromium build — see
+  // `m4-upgrade-loop.spec.ts` file header).
+  let globalOrder = 0
+  let documentEpoch = 0
+  let epochOrder = 0
 
-    Storage.prototype.setItem = function patchedSetItem(key: string, value: string) {
-      if (this === window.localStorage && w.__loopE2EWriteLog) {
-        w.__loopE2EWriteLog({ type: 'setItem', key, order: order++ })
-      }
-      return originalSetItem.call(this, key, value)
-    }
-    Storage.prototype.removeItem = function patchedRemoveItem(key: string) {
-      if (this === window.localStorage && w.__loopE2EWriteLog) {
-        w.__loopE2EWriteLog({ type: 'removeItem', key, order: order++ })
-      }
-      return originalRemoveItem.call(this, key)
-    }
-    Storage.prototype.clear = function patchedClear() {
-      if (this === window.localStorage && w.__loopE2EWriteLog) {
-        w.__loopE2EWriteLog({ type: 'clear', key: null, order: order++ })
-      }
-      return originalClear.call(this)
+  page.on('framenavigated', (frame) => {
+    if (frame === page.mainFrame()) {
+      documentEpoch += 1
+      epochOrder = 0
     }
   })
 
-  const page = await context.newPage()
-  return { context, page, writeLog }
+  const client: CDPSession = await context.newCDPSession(page)
+  await client.send('DOMStorage.enable')
+
+  function record(type: WriteOp['type'], key: string | null): void {
+    writeLog.push({ type, key, order: globalOrder, documentEpoch, epochOrder })
+    globalOrder += 1
+    epochOrder += 1
+  }
+
+  client.on('DOMStorage.domStorageItemAdded', (event) => {
+    if (event.storageId.isLocalStorage) record('setItem', event.key)
+  })
+  client.on('DOMStorage.domStorageItemUpdated', (event) => {
+    if (event.storageId.isLocalStorage) record('setItem', event.key)
+  })
+  client.on('DOMStorage.domStorageItemRemoved', (event) => {
+    if (event.storageId.isLocalStorage) record('removeItem', event.key)
+  })
+  client.on('DOMStorage.domStorageItemsCleared', (event) => {
+    if (event.storageId.isLocalStorage) record('clear', null)
+  })
+
+  // P1 Blocker 2 fix: forces delivery of any DOMStorage event the browser
+  // already sent on this SAME CDP session before this call resolves.
+  async function flushAudit(): Promise<void> {
+    await client.send('DOMStorage.enable')
+  }
+
+  return { context, page, writeLog, flushAudit }
 }
 
 test(
@@ -201,7 +239,7 @@ test(
         'below vacuous (AC9).',
     ).not.toBe('/')
 
-    const { context, page, writeLog } = await createAuditedContext(browser, baseURL!)
+    const { context, page, writeLog, flushAudit } = await createAuditedContext(browser, baseURL!)
 
     const allRequests: Array<{ url: string; resourceType: string }> = []
     const failedRequests: string[] = []
@@ -287,6 +325,10 @@ test(
           '(AC9/AC15 sanity check)',
       ).toEqual([PRODUCTION_KEY, EXPECTED_KEY].sort())
 
+      // Issue #1283 repair iteration 1 (P1 Blocker 2): drain barrier before
+      // the zero-count / ordering assertions below.
+      await flushAudit()
+
       // AC15: the write-set operation-history audit must record zero
       // operations against the production key or any E2E-runtime-shaped key,
       // and zero clear() calls (which implicitly operate outside scope).
@@ -322,6 +364,21 @@ test(
         inScopeOps.length,
         'write-set operation history must have captured at least the Save write (AC15 harness sanity check)',
       ).toBeGreaterThan(0)
+
+      // Issue #1283 repair iteration 1 (P1 Blocker 1): order must be unique
+      // and strictly increasing across the whole scenario — proves the
+      // Node-side global counter is never reset by navigation.
+      const orders = writeLog.map((op) => op.order)
+      expect(
+        orders,
+        'write-set audit order values must be unique across the full scenario (P1 Blocker 1)',
+      ).toEqual([...new Set(orders)])
+      for (let i = 1; i < orders.length; i += 1) {
+        expect(
+          orders[i],
+          `write-set audit order must be strictly increasing at index ${i} (P1 Blocker 1)`,
+        ).toBeGreaterThan(orders[i - 1])
+      }
 
       // AC9: every script/stylesheet request must be under the nested prefix.
       const scriptAndStyleRequests = allRequests.filter((r) =>
