@@ -95,20 +95,15 @@ button:focus-visible {
   position: relative;
   isolation: isolate;
   border-radius: 28px;
+  /* Issue #1956: `.battle-stage` width is a pure function of its own
+   * container box only (no viewport-width media query, no snap to a
+   * fixture pixel value). The Canvas itself (`.battle-stage__canvas`,
+   * `width: 100%; aspect-ratio: 16/9` below) and the fixed logical arena
+   * (`state.arena`) are unaffected by this rule; only the DOM chrome around
+   * the Canvas follows the grid column's available width continuously as
+   * it shrinks or grows, with no discontinuous jump at any breakpoint. */
   width: 100%;
   max-width: 100%;
-}
-
-/* The committed Canvas VRTs use a 1280px fixed viewport and own a 900px
- * presentation baseline. Keep that fixture geometry stable without reviving
- * the former JavaScript sidebar subtraction: narrower containers still use
- * their full available width, while wider runtime layouts remain responsive. */
-@media (width <= 1280px) {
-  .battle-stage {
-    /* `border-box` includes the two 1px frame borders; the frozen Canvas
-     * and overlay capture themselves therefore remain exactly 900px wide. */
-    width: min(902px, 100%);
-  }
 }
 
 .battle-stage__header {
@@ -307,19 +302,6 @@ button:focus-visible {
   }
 }
 
-/* The Canvas preserves its 16:9 world presentation even on a narrow phone.
- * Scale the DOM-only status surface instead of changing logical arena or
- * stretching the world layer to make room for it. */
-@media (max-width: 500px) {
-  .battle-hud-layer {
-    padding: 8px;
-  }
-
-  .combat-hud {
-    transform: scale(0.5);
-    transform-origin: top right;
-  }
-}
 
 /* Temporary result/debrief compatibility surface (Issue #1375, removed by
  * #1376). Behaves like the pre-#1375 single-column HUD stack it replaces:

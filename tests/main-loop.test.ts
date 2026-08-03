@@ -106,6 +106,232 @@ describe('responsive canvas presentation lifecycle', () => {
     dispose()
     expect(removeEventListener).toHaveBeenCalledWith('resize', expect.any(Function))
   })
+
+  it('GIVEN an observed entry with devicePixelContentBoxSize WHEN the callback fires THEN it is used as the backing-store authority (device pixels, no DPR re-multiplication)', () => {
+    const onResize = vi.fn()
+    const observe = vi.fn()
+    const disconnect = vi.fn()
+    let callback: ResizeObserverCallback | undefined
+
+    class FakeResizeObserver {
+      constructor(next: ResizeObserverCallback) {
+        callback = next
+      }
+
+      observe = observe
+      disconnect = disconnect
+    }
+
+    vi.stubGlobal('window', { devicePixelRatio: 2 })
+    observeCanvasPresentation(
+      {} as Element,
+      onResize,
+      { addEventListener: vi.fn(), removeEventListener: vi.fn() },
+      FakeResizeObserver as unknown as typeof ResizeObserver,
+    )
+
+    const entry = {
+      devicePixelContentBoxSize: [{ inlineSize: 1600, blockSize: 900 }],
+      contentBoxSize: [{ inlineSize: 800, blockSize: 450 }],
+      contentRect: { width: 800, height: 450 },
+    } as unknown as ResizeObserverEntry
+
+    callback?.([entry], {} as ResizeObserver)
+
+    expect(onResize).toHaveBeenLastCalledWith({
+      deviceWidth: 1600,
+      deviceHeight: 900,
+      cssWidth: 800,
+      cssHeight: 450,
+    })
+    vi.unstubAllGlobals()
+  })
+
+  it('GIVEN devicePixelContentBoxSize disagrees with contentRect (emulated-DPR environment) WHEN the callback fires THEN it falls back to contentBoxSize x devicePixelRatio instead of trusting the disagreeing entry (Issue #1956 fix 6 hardening)', () => {
+    const onResize = vi.fn()
+    const observe = vi.fn()
+    const disconnect = vi.fn()
+    let callback: ResizeObserverCallback | undefined
+
+    class FakeResizeObserver {
+      constructor(next: ResizeObserverCallback) {
+        callback = next
+      }
+
+      observe = observe
+      disconnect = disconnect
+    }
+
+    // devicePixelRatio is 1.25, but devicePixelContentBoxSize reports raw
+    // CSS pixels (as if DPR were 1) -- an emulated-DPR discrepancy verified
+    // empirically against a Playwright persistent context using the
+    // deviceScaleFactor context option. contentRect (always CSS pixels,
+    // independent of any device-pixel reporting path) disagrees with what
+    // devicePixelContentBoxSize implies at DPR 1.25 (960 vs 1215), so the
+    // devicePixelContentBoxSize entry must not be trusted.
+    vi.stubGlobal('window', { devicePixelRatio: 1.25 })
+    observeCanvasPresentation(
+      {} as Element,
+      onResize,
+      { addEventListener: vi.fn(), removeEventListener: vi.fn() },
+      FakeResizeObserver as unknown as typeof ResizeObserver,
+    )
+
+    const entry = {
+      devicePixelContentBoxSize: [{ inlineSize: 1215, blockSize: 683.4375 }],
+      contentBoxSize: [{ inlineSize: 1215, blockSize: 683.4375 }],
+      contentRect: { width: 1215, height: 683.4375 },
+    } as unknown as ResizeObserverEntry
+
+    callback?.([entry], {} as ResizeObserver)
+
+    // Falls through to the contentBoxSize tier, deriving device pixels from
+    // window.devicePixelRatio directly (1215 * 1.25 = 1518.75) instead of
+    // trusting devicePixelContentBoxSize's untrustworthy 1215 (which would
+    // silently imply DPR 1).
+    expect(onResize).toHaveBeenLastCalledWith({
+      deviceWidth: 1518.75,
+      deviceHeight: 854.296875,
+      cssWidth: 1215,
+      cssHeight: 683.4375,
+    })
+    vi.unstubAllGlobals()
+  })
+
+  it('GIVEN an observed entry without devicePixelContentBoxSize WHEN the callback fires THEN it falls back to contentBoxSize multiplied by devicePixelRatio', () => {
+    const onResize = vi.fn()
+    const observe = vi.fn()
+    const disconnect = vi.fn()
+    let callback: ResizeObserverCallback | undefined
+
+    class FakeResizeObserver {
+      constructor(next: ResizeObserverCallback) {
+        callback = next
+      }
+
+      observe = observe
+      disconnect = disconnect
+    }
+
+    vi.stubGlobal('window', { devicePixelRatio: 1.5 })
+    observeCanvasPresentation(
+      {} as Element,
+      onResize,
+      { addEventListener: vi.fn(), removeEventListener: vi.fn() },
+      FakeResizeObserver as unknown as typeof ResizeObserver,
+    )
+
+    const entry = {
+      contentBoxSize: [{ inlineSize: 700, blockSize: 393.75 }],
+      contentRect: { width: 700, height: 393.75 },
+    } as unknown as ResizeObserverEntry
+
+    callback?.([entry], {} as ResizeObserver)
+
+    expect(onResize).toHaveBeenLastCalledWith({
+      deviceWidth: 1050,
+      deviceHeight: 590.625,
+      cssWidth: 700,
+      cssHeight: 393.75,
+    })
+    vi.unstubAllGlobals()
+  })
+
+  it('GIVEN an observed entry with only contentRect WHEN the callback fires THEN it falls back to contentRect multiplied by devicePixelRatio', () => {
+    const onResize = vi.fn()
+    const observe = vi.fn()
+    const disconnect = vi.fn()
+    let callback: ResizeObserverCallback | undefined
+
+    class FakeResizeObserver {
+      constructor(next: ResizeObserverCallback) {
+        callback = next
+      }
+
+      observe = observe
+      disconnect = disconnect
+    }
+
+    vi.stubGlobal('window', { devicePixelRatio: 1 })
+    observeCanvasPresentation(
+      {} as Element,
+      onResize,
+      { addEventListener: vi.fn(), removeEventListener: vi.fn() },
+      FakeResizeObserver as unknown as typeof ResizeObserver,
+    )
+
+    const entry = {
+      contentRect: { width: 640, height: 360 },
+    } as unknown as ResizeObserverEntry
+
+    callback?.([entry], {} as ResizeObserver)
+
+    expect(onResize).toHaveBeenLastCalledWith({
+      deviceWidth: 640,
+      deviceHeight: 360,
+      cssWidth: 640,
+      cssHeight: 360,
+    })
+    vi.unstubAllGlobals()
+  })
+
+  it('GIVEN the ResizeObserver constructor itself throws WHEN observation starts THEN it falls back gracefully to the window-resize-only path (no throw escapes)', () => {
+    const onResize = vi.fn()
+    const addEventListener = vi.fn()
+    const removeEventListener = vi.fn()
+
+    class ThrowingConstructorObserver {
+      constructor() {
+        throw new Error('ResizeObserver construction not supported in this environment')
+      }
+
+      observe = vi.fn()
+      disconnect = vi.fn()
+    }
+
+    let dispose: () => void = () => {}
+    expect(() => {
+      dispose = observeCanvasPresentation(
+        {} as Element,
+        onResize,
+        { addEventListener, removeEventListener },
+        ThrowingConstructorObserver as unknown as typeof ResizeObserver,
+      )
+    }).not.toThrow()
+
+    expect(onResize).toHaveBeenCalledOnce()
+    expect(addEventListener).toHaveBeenCalledWith('resize', expect.any(Function))
+    expect(() => dispose()).not.toThrow()
+    expect(removeEventListener).toHaveBeenCalledWith('resize', expect.any(Function))
+  })
+
+  it('GIVEN repeated observe/dispose cycles WHEN each cycle completes THEN no observer or window listener leaks across cycles', () => {
+    const addEventListener = vi.fn()
+    const removeEventListener = vi.fn()
+    const observe = vi.fn()
+    const disconnect = vi.fn()
+
+    class FakeResizeObserver {
+      observe = observe
+      disconnect = disconnect
+    }
+
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      const onResize = vi.fn()
+      const dispose = observeCanvasPresentation(
+        {} as Element,
+        onResize,
+        { addEventListener, removeEventListener },
+        FakeResizeObserver as unknown as typeof ResizeObserver,
+      )
+      dispose()
+    }
+
+    expect(observe).toHaveBeenCalledTimes(3)
+    expect(disconnect).toHaveBeenCalledTimes(3)
+    expect(addEventListener).toHaveBeenCalledTimes(3)
+    expect(removeEventListener).toHaveBeenCalledTimes(3)
+  })
 })
 
 describe('advanceSimulationLoop', () => {
