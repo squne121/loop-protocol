@@ -105,6 +105,153 @@ stdout / stderr の両方から判別する failure_class。`_normalize_agy_resu
 | `agy_unexpected_error` | AGY 実行時の未分類例外（terminal / non-retryable） | no |
 | `agy_invocation_policy_denied` | agy 実行用 argv が位置ベースの構造 allowlist （`_validate_agy_invocation_argv()`、Issue #1807）に違反（`--dangerously-skip-permissions` 等の permission-bypass flag を含む未知の trailing option 混入等）。`agy_permission_denied`（AGY 側/OS レベルの権限拒否）とは異なり、wrapper 側が `subprocess.run()` 呼び出し前にfail-closed で拒否したことを示す。retryable: false | no |
 
+### AGY permission-boundary runner failure classes（実行時の失敗分類、Issue #1814）
+
+この二つは provider fallback の入力ではない。専用 runner は fallback provider を
+起動せず、pytest skip やモデルの自己申告でこれらを成功へ置換しない。
+
+| `failure_class` | runner exit | completion | retry / recovery |
+|---|---:|---|---|
+| `agy_permission_boundary_unavailable` | 77 | false | binary、既存 auth、または required runtime capability が unavailable。artifact は schema-valid で `actual_agy_executed: false` を記録し、外部状態が復旧した後に dedicated runner を再実行する。|
+| `agy_permission_boundary_inconclusive` | 1 | false | injected attempt 不在、attempt correlation 不成立、hook lifecycle evidence 不足、または artifact invalid。実装または runtime evidence を修復して再実行する。|
+
+predicate violation、unexpected `PostToolUse`、または side-effect counter の増加も
+exit 1 / `completion: false` とする。fallback provider が成功してもこの分類を
+上書きしてはならない。
+
+runner-local の file mode / readback check は fail-closed local guardrail であり、
+child に対する immutable authority boundary や secrecy を保証しない。artifact の
+attempt correlation は parent runner が記録し、child hook の event は correlation
+authority として扱わない。
+
+#### `agy_permission_boundary_inconclusive` の根本原因（Issue #1814 再調査）
+
+過去の live run が一貫して `agy_permission_boundary_inconclusive`（exit 1）を返していた
+根本原因を、実インストール済み `agy`（Antigravity CLI 1.1.9、`~/.local/bin/agy`。
+`@google/gemini-cli` npm パッケージとは別の Google 内製バイナリであり、`strings` で
+抽出できる同バイナリ埋め込みの hooks リファレンス文書が正本）に対する直接的な
+再現実験で特定した。二つの独立した原因が存在する。
+
+**原因 1（この PR で修正済み）: `workspacePaths` が常に空になる欠落 `--add-dir`。**
+
+`_invoke()` は `cwd=runtime["workspace"]` で `agy --print ...` を起動していたが、
+`--add-dir <workspace>` を渡していなかった。実 AGY の hook 共通入力フィールド
+`workspacePaths` は `cwd` からではなく `--add-dir` で明示的に登録した
+workspace のリストからのみ生成される（`cwd` だけを設定した再現実験では
+`"workspacePaths":[]`、`--add-dir` を追加すると
+`"workspacePaths":["<workspace>"]` に変わることを直接確認した）。
+`_prepare_runtime()` の `PreInvocation` injection hook は
+`context['workspace'] in payload.get('workspacePaths', [])` を要求するため、
+`--add-dir` 欠落時はこの workspace-binding check が常に失敗し、
+`injectSteps` が一度も受理されず、結果として `PreToolUse` イベントが
+一件も発生しない。これが過去のすべての live run で
+`diagnostic_ledger.pre_invocation_context_accepted` が `false` になっていた
+直接の原因であり、`run_agy_permission_boundary_e2e.py` の `_invoke()` に
+`--add-dir` を追加することで解消した（`diagnostic_ledger.pre_invocation_context_accepted`
+は `true` に変わることを live run で確認済み）。
+
+**原因 2（未解決。live exit 0 の contract/implementation mismatch として記録）:
+`PreInvocation` の `injectSteps` の `toolCall` ステップ型が実バイナリで機能しない。**
+
+原因 1 を修正した後も、live run は依然として exit 1 になる。これは
+`PreInvocation` hook が返す `injectSteps` の `toolCall` ステップ
+（`agy` 自身が埋め込んでいる hooks リファレンス文書に記載された、
+`{"toolCall": {"name": "...", "args": {...}}}` という契約どおりの形）を
+実バイナリが受理しないためである。この PR とは独立した最小 hooks.json
+だけを使う再現実験で、以下を確認した。
+
+- `PreInvocation` / `PreToolUse` hook 自体は正しく発火し、実際のモデルが
+  発行した `view_file` tool call を `PreToolUse` の `{"decision": "deny", "reason": "..."}`
+  で確実に deny できる（モデル応答に
+  `tool call denied with reason: probe deny` が反映され、実行はされなかった）。
+  つまり `PreToolUse` deny 境界そのものは実 runtime で機能する。
+- `injectSteps` の `{"ephemeralMessage": "..."}` ステップは受理され、
+  agy は exit 0 で完了する（camelCase / snake_case のどちらの outer key
+  `injectSteps` / `inject_steps` でも同様に受理された）。
+- `injectSteps` の `{"toolCall": {"name": "...", "args": {...}}}` ステップ
+  （camelCase / snake_case のどちらの key 組み合わせでも）は agy 自身の
+  `--log-file` 出力に
+  `error in pre-invocation hook: failed to inject steps from hook ...:
+  unknown injected step type: <nil>` を出力して agent 実行全体を
+  `Error: Agent execution terminated due to error.`（exit 1）で
+  中断させる。permission 設定を完全に外した（`permissions` 制約なしの
+  素の isolated HOME）状態でも同一のエラーになるため、これは
+  permission boundary の deny ではなく、`toolCall` ステップの
+  デシリアライズに関する実装側の欠陥または同バイナリの埋め込み文書との
+  version skew である。
+- `{"type": "toolCall", "toolCall": {...}}` のように discriminator を
+  追加すると、エラーメッセージ自体が変化し
+  (`unmarshal result ... via protojson: ... unknown field "type"`)、
+  hook 結果は protojson で厳格にデコードされることが分かる。すなわち
+  `toolCall` という field 名自体は protojson レベルでは受理される
+  （`unknown field` エラーにならない）にもかかわらず、その後段の
+  アプリケーションコード（`executor.go`）側で "unknown injected step
+  type: <nil>" として扱われる。これはクライアント側の JSON key
+  ケーシングの誤りではなく、実バイナリ内部の型解決ロジック側の
+  問題であることを強く示唆する。
+
+**追加の独立確認（Issue #1814 再々調査、current head `ffd0fb83`）。**
+コード読み取りのみ（`strings ~/.local/bin/agy`、追加の live 起動なし）で
+上記の結論を補強する事実を確認した。埋め込み `hooks_go_proto.HookInjectedStep`
+の oneof フィールド `Step` が取りうる型は、シンボルテーブルから
+`HookInjectedStep_ToolCall` / `HookInjectedStep_UserMessage` /
+`HookInjectedStep_EphemeralMessage` / `HookInjectedStep_ErrorMessage` /
+`HookInjectedStep_SystemMessage` / `HookInjectedStep_HookUserMessage` /
+`HookInjectedStep_HookEphemeralMessage` の 7 種類だけであり、
+`HookInjectedStep_HookToolCall`（`HookUserMessage` / `HookEphemeralMessage`
+と対になる、新しい `HookToolCall` message 型を包む oneof variant）は
+**存在しない**。つまり `toolCall` を注入するために protojson が受理しうる
+JSON key は `toolCall`（または proto 原名の `tool_call`）以外に存在せず、
+この形は既に確認済みで `unknown injected step type: <nil>` になる。
+また `{"type": "toolCall", ...}` のような discriminator 付与は
+`HookInjectedStep` に `type` という宣言フィールドが存在しないため
+protojson の unknown-field 拒否（`unknown field "type"`）に一致する。
+`type` の値を `tool_call` / `TOOL_CALL` に変えても、拒否理由は
+フィールド名 `type` 自体の不存在であって値ではないため、同一の
+`unknown field "type"` エラーになることが構造的に導ける。したがって
+`--profile no_tools --mode live --allow-live` による追加の live 起動を
+伴わずに、これらの discriminator variant は同じ結果になると判断できる。
+
+current head `ffd0fb83` に対して `--profile no_tools --mode live
+--allow-live` を再実行し、`_prepare_runtime()` の `injectSteps` 構築
+（`args` に `stepIndex` / `sideEffectCounterPath` を追加した correlation
+強化後の形）でも同一の failure_class になることを再確認した。
+artifact の `diagnostic_ledger` は
+`pre_invocation_hook_started: true`、`pre_invocation_context_accepted: true`、
+`injected_step_count: 5`（`PreInvocation` hook 自体は正しく発火し
+5 attempt すべてが `injectSteps` として受理された）に対し、
+`pre_tool_use_event_count: 0`（`PreToolUse` は一件も発火しなかった）、
+`runner.child_returncode: 1`（`agy` 本体が deserialize 失敗で
+エージェント実行全体を中断した）であった。`failure_taxonomy.class` は
+`agy_permission_boundary_inconclusive`、`completion: false`。この結果は
+原因 2 が correlation 強化コミット後も未解消であることを示す。
+
+**この Issue の Stop Condition への該当性。** 上記は
+「実 AGY の仕様が公式資料と runtime で矛盾し、fail-closed な判定を確定できない」
+に該当する。`agy` 自身が埋め込む公式ドキュメントどおりの `toolCall` 注入
+契約が実バイナリで機能しないことをクライアント側の再現実験で確認したが、
+Google 非公開の内製バイナリ（`google3/third_party/jetski/...`）であるため、
+ソースコードにアクセスできないこの環境から追加の JSON エンコーディングを
+機械的に探索し続けても収束する保証がない。したがって AC3/AC5 が要求する
+「`PreInvocation` の `injectSteps` による、モデル選択に依存しない決定論的
+5-capability 注入」は、この agy ビルドでは現状確認できていない。人間判断
+として以下のいずれかを選択する必要がある。
+
+1. Google / Antigravity サポート経路で正しい `toolCall` 注入 JSON 形式を
+   確認し、判明した形式で再検証する。
+2. `injectSteps` の `toolCall` 注入に依存しない代替のデターミニズム設計
+   （例: `PreToolUse` deny 自体は live で実証済みなので、モデルへの
+   明示的・一意な単一 tool 呼び出し指示プロンプトと厳格な
+   correlation/deny 検証を組み合わせる設計）へ、Issue の Out of Scope
+   条項（「モデルが任意に tool を選択することだけに依存する E2E」の禁止）
+   と両立する形で contract を改訂する。
+3. AC3/AC5 を model capability 待ちの follow-up Issue へ切り出し、
+   本 Issue は `PreToolUse` deny 境界の live 実証（原因 1 の修正と
+   diagnostic_ledger 改善）までをスコープとして再定義する。
+
+いずれも Issue 契約の変更を伴うため、この PR は Draft のまま
+`Refs #1814` を維持し、`Closes #1814` を使用しない。
+
 ### provider_auto_policy_v1 fallback classes（フォールバック分類、Issue #1270）
 
 `provider=auto`（`provider_auto_dispatch()`）が provider fallback の

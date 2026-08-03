@@ -84,6 +84,7 @@ def _force_bwrap_available(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(app, "_bwrap_available", lambda: True)
 
+
 ALL_PROFILES = [
     app.NO_TOOLS_PROFILE,
     app.LOCAL_ASSET_RESEARCH_PROFILE,
@@ -129,9 +130,7 @@ def test_agy_oauth_token_exposed_read_only(tmp_path: Path, monkeypatch: pytest.M
             )
             # Issue #1743 AC1: never placed under XDG_CONFIG_HOME (the
             # pre-#1743 buggy placement `agy` never actually reads from).
-            assert not (
-                Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token"
-            ).exists()
+            assert not (Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token").exists()
         finally:
             shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
 
@@ -264,17 +263,17 @@ def test_expose_agy_oauth_token_minimal_subpath_only(tmp_path: Path, monkeypatch
             # not appear; the workspace's own .antigravity/settings.json
             # (freshly generated policy doc) is a distinct, expected file.
             # Issue #1758: `<workspace>/.gemini/antigravity-cli/settings.json`
-            # now legitimately exists -- but only as the fresh, fixed-value
-            # toolPermission document `_write_agy_tool_permission_settings()`
-            # generates, never a copy of the *real* fake_real_home
+            # now legitimately exists -- but only as freshly generated
+            # official settings (toolPermission plus permissions.deny), never
+            # a copy of the *real* fake_real_home
             # `.gemini/antigravity-cli/settings.json` (`{}`) written above.
             gemini_settings_paths = [
                 p for p in workspace.workspace_dir.rglob("settings.json") if "antigravity-cli" in p.parts
             ]
             assert gemini_settings_paths == [workspace.agy_tool_permission_settings_path]
-            assert json.loads(gemini_settings_paths[0].read_text(encoding="utf-8")) == {
-                "toolPermission": "always-proceed"
-            }
+            assert json.loads(gemini_settings_paths[0].read_text(encoding="utf-8")) == (
+                app.build_official_agy_settings(profile)
+            )
         finally:
             shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
 
@@ -395,15 +394,11 @@ def test_agy_oauth_token_reachability_integration(tmp_path: Path, monkeypatch: p
         # `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`, matching
         # the state-directory layout its own auth flow writes to on a
         # non-isolated host -- not from `$XDG_CONFIG_HOME`.
-        isolated_token_path = (
-            Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-        )
+        isolated_token_path = Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
         assert isolated_token_path.exists()
         assert isolated_token_path.is_symlink()
         # the pre-#1743 (buggy) XDG_CONFIG_HOME placement must be absent.
-        assert not (
-            Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token"
-        ).exists()
+        assert not (Path(workspace.env["XDG_CONFIG_HOME"]) / "antigravity-cli" / "antigravity-oauth-token").exists()
 
         # HOME/XDG_CACHE_HOME/XDG_STATE_HOME stay isolated even while agy
         # OAuth token reachability is preserved.
