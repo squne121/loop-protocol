@@ -19,7 +19,7 @@ from typing import Any
 import yaml
 
 
-UPDATE_SCRIPT = "test:vrt:update:e2e"
+UPDATE_SCRIPTS = {"test:vrt:update:e2e", "test:vrt:update:component"}
 WIRING_SCRIPT = "scripts/check-vrt-snapshot-policy.py"
 INTERPOLATION = re.compile(r"\$\{\{|\$\{|\$[A-Za-z_]")
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
@@ -300,8 +300,8 @@ def _scan_reachable_scripts(initial: list[str], scripts: dict[str, str], errors:
         if name in visited:
             continue
         visited.add(name)
-        if name == UPDATE_SCRIPT:
-            errors.append(f"package script: {UPDATE_SCRIPT} is reachable from required CI")
+        if name in UPDATE_SCRIPTS:
+            errors.append(f"package script: {name} is reachable from required CI")
             continue
         command = scripts.get(name)
         if command is None:
