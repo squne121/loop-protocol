@@ -115,15 +115,15 @@ test('GIVEN running phase WHEN Pause button clicked THEN aria-pressed becomes "t
   expect(btn.hasAriaLabel).toBe(false)
 })
 
-test('GIVEN paused WHEN Pause button clicked again THEN aria-pressed becomes "false" (resume)', async ({
+test('GIVEN paused WHEN Resume is clicked THEN aria-pressed becomes "false" (resume) (Issue #1376: the HUD Pause button itself becomes pointer-unreachable while paused, since combat HUD is inert behind the modal pause dialog -- AC4 -- so resume goes through the pause dialog\'s own Resume button instead of a second click on the same HUD button)', async ({
   page,
 }) => {
   // Enter pause
   await page.click('[data-action="toggle-pause"]')
   await waitForAriaPressed(page, 'true')
 
-  // Resume
-  await page.click('[data-action="toggle-pause"]')
+  // Resume via the pause dialog's Resume button (AC3, AC4, AC6).
+  await page.click('[data-action="resume"]')
   await waitForAriaPressed(page, 'false')
 })
 
@@ -170,7 +170,7 @@ test('GIVEN canvas focused WHEN P pressed THEN aria-pressed becomes "true" (paus
   await waitForAriaPressed(page, 'true')
 })
 
-test('GIVEN paused with canvas focused WHEN P pressed THEN aria-pressed becomes "false" (resume)', async ({
+test('GIVEN paused via P key WHEN P is pressed again THEN it does NOT resume, because the Canvas is inert while paused (AC4) and therefore cannot hold focus, so the AC3/AC15 canvas-focus guard blocks the second P press -- resume happens via Escape or the pause dialog\'s Resume button instead', async ({
   page,
 }) => {
   // Focus canvas and pause
@@ -178,8 +178,22 @@ test('GIVEN paused with canvas focused WHEN P pressed THEN aria-pressed becomes 
   await page.keyboard.press('p')
   await waitForAriaPressed(page, 'true')
 
-  // Resume with P
+  // AC4: the Canvas is now inert, so it cannot be (or remain) the active
+  // element -- confirm the guard's precondition is actually false here,
+  // not just assume it.
+  const canvasIsActiveElement = await page.evaluate(
+    () => document.activeElement === document.querySelector('.battle-stage__canvas'),
+  )
+  expect(canvasIsActiveElement, 'Canvas must not be the active element while paused (AC4)').toBe(false)
+
+  // P key is a no-op here (WCAG 2.1.4 canvas-focus guard cannot be
+  // satisfied while the Canvas is inert) -- still paused.
   await page.keyboard.press('p')
+  await page.waitForTimeout(200)
+  expect(await getPauseButtonAriaPressed(page)).toBe('true')
+
+  // Escape resumes regardless of focus location (AC3, AC5, AC6).
+  await page.keyboard.press('Escape')
   await waitForAriaPressed(page, 'false')
 })
 
@@ -288,3 +302,111 @@ test('GIVEN auto-paused WHEN visibilitychange visible fired THEN aria-pressed st
   const ariaPressed = await getPauseButtonAriaPressed(page)
   expect(ariaPressed).toBe('true')
 })
+
+// ---------------------------------------------------------------------------
+// Issue #1376 AC4: pause dialog inert/focus. AC5: Escape single-toggle
+// (repeat / bubbling guard). AC6: resume focus (invoker restore / Canvas
+// fallback).
+// ---------------------------------------------------------------------------
+
+test('GIVEN Pause button clicked THEN the pause dialog is a role="dialog" with Canvas and combat HUD inert, and focus moves to Resume (AC4)', async ({
+  page,
+}) => {
+  await page.click('[data-action="toggle-pause"]')
+  await waitForAriaPressed(page, 'true')
+
+  const pauseDialog = page.locator('[data-phase-screen="pause"]')
+  await expect(pauseDialog).toBeVisible()
+  await expect(pauseDialog).toHaveAttribute('role', 'dialog')
+  await expect(pauseDialog).toHaveAttribute('aria-modal', 'true')
+
+  const resumeButton = page.locator('[data-action="resume"]')
+  await expect(resumeButton).toBeFocused()
+
+  const canvasInert = await page.evaluate(() =>
+    document.querySelector('canvas.battle-stage__canvas')?.hasAttribute('inert'),
+  )
+  const combatHudInert = await page.evaluate(() =>
+    document.querySelector('[data-combat-hud]')?.hasAttribute('inert'),
+  )
+  expect(canvasInert, 'Canvas must be inert while paused (AC4)').toBe(true)
+  expect(combatHudInert, 'combat HUD must be inert while paused (AC4)').toBe(true)
+
+  // combat HUD stays visible (not hidden) -- Hull/Kills/Elapsed keep updating
+  // behind the modal pause overlay (AC4).
+  const combatHudHidden = await page.evaluate(
+    () => (document.querySelector('[data-combat-hud]') as HTMLElement | null)?.hidden,
+  )
+  expect(combatHudHidden).toBe(false)
+})
+
+test('GIVEN Pause button clicked WHEN Resume clicked THEN the invoking Pause button regains focus (AC6)', async ({
+  page,
+}) => {
+  const pauseButton = page.locator('[data-action="toggle-pause"]')
+  await pauseButton.click()
+  await waitForAriaPressed(page, 'true')
+
+  await page.click('[data-action="resume"]')
+  await waitForAriaPressed(page, 'false')
+
+  await expect(pauseButton).toBeFocused()
+
+  const canvasInert = await page.evaluate(() =>
+    document.querySelector('canvas.battle-stage__canvas')?.hasAttribute('inert'),
+  )
+  expect(canvasInert, 'Canvas must no longer be inert after resume (AC4)').toBe(false)
+})
+
+test('GIVEN auto-paused via visibilitychange (no invoker) WHEN resumed via the HUD button THEN Canvas or the resuming control ends up focused, never a stale element (AC6)', async ({
+  page,
+}) => {
+  // Auto-pause: no explicit invoker is recorded.
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', {
+      value: 'hidden',
+      writable: true,
+      configurable: true,
+    })
+    Object.defineProperty(document, 'hidden', { value: true, writable: true, configurable: true })
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await waitForAriaPressed(page, 'true')
+
+  const resumeButton = page.locator('[data-action="resume"]')
+  await expect(resumeButton).toBeFocused()
+
+  await resumeButton.click()
+  await waitForAriaPressed(page, 'false')
+
+  // AC6: no invoker was recorded for auto-pause, so resume falls back to the
+  // Canvas -- but Resume itself was just clicked, so the browser's own
+  // "focus follows click" leaves Resume's invoker (the button just clicked)
+  // irrelevant here; the important invariant is that focus is NOT left on a
+  // now-hidden/inert pause-dialog element.
+  const activeElementInPauseDialog = await page.evaluate(() => {
+    const pauseDialog = document.querySelector('[data-phase-screen="pause"]')
+    return pauseDialog ? pauseDialog.contains(document.activeElement) : false
+  })
+  expect(activeElementInPauseDialog, 'focus must not remain inside the now-hidden pause dialog').toBe(
+    false,
+  )
+})
+
+test('GIVEN Escape held (event.repeat) WHEN fired repeatedly THEN only the first keydown toggles pause (AC5)', async ({
+  page,
+}) => {
+  await waitForAriaPressed(page, 'false')
+
+  // Simulate a held key: first event has repeat=false, subsequent events
+  // have repeat=true (browser auto-repeat semantics) -- only the first may
+  // toggle.
+  await page.evaluate(() => {
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', repeat: false, bubbles: true }))
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', repeat: true, bubbles: true }))
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', repeat: true, bubbles: true }))
+  })
+
+  await waitForAriaPressed(page, 'true')
+})
+

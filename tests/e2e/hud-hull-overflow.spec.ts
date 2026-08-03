@@ -430,3 +430,75 @@ test.describe('hud result action geometry: confirm-result stays reachable after 
     })
   }
 })
+
+// ---------------------------------------------------------------------------
+// Issue #1376 AC11: browser zoom 200% -- Playwright has no native "page zoom"
+// control, so this approximates it the same way the codebase already
+// documents for OS display scaling (see the low-DPR describe block above):
+// Chromium supports the non-standard CSS `zoom` property, applied to the
+// root element, as the closest available lever. Not a substitute for real
+// browser zoom on actual hardware, but guards against zoom-shaped layout
+// regressions in CI (result heading and Return to hangar must stay inside
+// the browser viewport and fully reachable).
+// ---------------------------------------------------------------------------
+
+test.describe('hud result action geometry: 200% browser zoom (AC11, Issue #1376)', () => {
+  // Playwright has no native "real browser page zoom" control (well-known
+  // limitation -- Chrome's Ctrl+ zoom is not exposed via CDP for this
+  // purpose). This approximates it the same way the low-DPR describe block
+  // above already documents for OS display scaling: the CSS `zoom` property
+  // (Chromium-only, non-standard) applied to the root element scales
+  // rendered content within the SAME layout viewport, which is directionally
+  // similar to how real browser zoom shrinks the effective CSS-pixel space
+  // available for layout. It is NOT a substitute for testing against real
+  // browser zoom on actual hardware. Because this approximation is more
+  // aggressive than real zoom typically is in practice, the assertion here
+  // is scroll-reachability (matches Playwright's own `click()` semantics,
+  // which auto-scrolls the target into view) rather than strict
+  // "no-scroll-required" viewport containment -- a scrollable
+  // `.battle-screen-layer` with `overflow-y: auto` is an acceptable
+  // affordance at this extreme zoom level, unlike being clipped/hidden
+  // entirely.
+  test('viewport=1280x720 zoom=200%: result heading is visible and Return to hangar remains scroll-reachable and clickable after defeat', async ({
+    page,
+  }) => {
+    test.setTimeout(30_000)
+
+    await page.addInitScript(() => {
+      ;(window as Window & { __E2E_PLAYER_HP_OVERRIDE__?: number }).__E2E_PLAYER_HP_OVERRIDE__ = 1
+    })
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await page.goto('/')
+
+    await expect
+      .poll(async () => getSortieStatus(page), { timeout: 25_000, intervals: [200] })
+      .toBe('defeat')
+
+    // Approximate 200% browser zoom via the CSS `zoom` property.
+    await page.evaluate(() => {
+      document.documentElement.style.zoom = '2'
+    })
+
+    const resultHeading = page.locator('#phase-screen-result-heading')
+    const confirmButton = page.locator('[data-action="confirm-result"]')
+
+    await expect(resultHeading).toBeVisible({ timeout: 5_000 })
+    // AC11: Return to hangar must not be clipped/hidden -- it must still be
+    // reachable (scroll-into-view + click) and actually invoke the action.
+    await confirmButton.scrollIntoViewIfNeeded()
+    await expect(confirmButton).toBeVisible()
+    await confirmButton.click()
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(() => {
+            const hook = (
+              window as Window & { __LOOP_E2E__?: { getState: () => { loopPhase: string } } }
+            ).__LOOP_E2E__
+            return hook ? hook.getState().loopPhase : 'no-hook'
+          }),
+        { timeout: 5_000, intervals: [50] },
+      )
+      .toBe('preparation')
+  })
+})
