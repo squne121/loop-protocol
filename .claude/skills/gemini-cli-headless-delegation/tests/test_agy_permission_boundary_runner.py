@@ -22,6 +22,33 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
+def _supported_capability_gate() -> dict[str, object]:
+    """Issue #1979 AC2 test double: a bootstrap predicate reported `supported`.
+
+    Used to exercise post-gate live-runner behavior in isolation from the
+    real (currently hardcoded-unsupported, per upstream #728) gate result.
+    """
+    return {
+        "bootstrap_predicate": "pre_invocation_injected_tool_call",
+        "predicate_kind": "bootstrap_prerequisite",
+        "status": "supported",
+        "reason_code": "test_override_supported",
+        "evidence_source": "runtime_semantic_observation",
+    }
+
+
+def _invoke_result(returncode: int | None, stdout: str = "", stderr: str = "", *, timed_out: bool = False) -> dict[str, object]:
+    """Issue #1979 AC7: build a fake `_invoke` dict return value for tests."""
+    return {
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": timed_out,
+        "process_group_isolated": True,
+        "descendant_processes_absent": True,
+    }
+
+
 def _fake_agy(path: Path, *, exit_code: int = 0, post_mode: str = "normal") -> None:
     """Create a fake runtime which dispatches configured hooks, never events."""
     script = """#!/usr/bin/env python3
@@ -83,9 +110,9 @@ def execute(tool_call):
         target.read_text(encoding="utf-8")
         return True
     if capability == "network":
-        if not require_keys(args, ("query",)) or not isinstance(args["query"], str):
+        if not require_keys(args, ("Url",)) or not isinstance(args["Url"], str):
             return False
-        response = urllib.request.urlopen(args["query"], timeout=2)
+        response = urllib.request.urlopen(args["Url"], timeout=2)
         return response.status == 200
     return False
 
@@ -241,7 +268,7 @@ def test_allow_control_binds_exact_injected_loopback_effect_and_full_lifecycle_t
     pre_events = [
         json.loads(line)
         for line in (runtime / "control" / "enforcement.jsonl").read_text().splitlines()
-        if json.loads(line)["tool_name"] == "search_web"
+        if json.loads(line)["tool_name"] == "read_url_content"
     ]
     post_events = [event for event in events if event["kind"] == "post_tool_use"]
     assert len(pre_events) == len(post_events) == 1
@@ -302,7 +329,7 @@ def test_hermetic_attempts_use_documented_args_and_exclude_undiscovered_mcp(tmp_
     assert runtime["attempt_args"]["command"].keys() == {"CommandLine", "Cwd", "WaitMsBeforeAsync"}
     assert runtime["attempt_args"]["write"].keys() == {"TargetFile", "Overwrite", "CodeContent"}
     assert runtime["attempt_args"]["read"].keys() == {"AbsolutePath"}
-    assert runtime["attempt_args"]["network"].keys() == {"query"}
+    assert runtime["attempt_args"]["network"].keys() == {"Url"}
     assert "mcp_call" not in MODULE.ATTEMPT_SPECS
 
 
@@ -439,12 +466,17 @@ def test_live_uses_supported_isolated_auth_bootstrap_and_bwrap_prefix(
 
     observed: dict[str, object] = {}
 
-    def capture(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        observed["command"] = command
-        observed["env"] = kwargs["env"]
-        return subprocess.CompletedProcess(command, 0, "", "")
+    class _FakePopen:
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            observed["command"] = command
+            observed["env"] = kwargs.get("env")
+            self.pid = 999999
+            self.returncode = 0
 
-    monkeypatch.setattr(MODULE.subprocess, "run", capture)
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            return "", ""
+
+    monkeypatch.setattr(MODULE.subprocess, "Popen", _FakePopen)
     MODULE._invoke(tmp_path / "agy", runtime, live=True)
 
     assert observed["command"] == runtime["agy_command_prefix"] + [
@@ -493,11 +525,8 @@ def test_live_hook_nonfire_is_inconclusive_not_auth_unavailable(
     monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
     monkeypatch.setattr(MODULE, "_version", lambda _path: ("agy 1.1.9", True))
     monkeypatch.setattr(MODULE, "_prepare_runtime", lambda *_args, **_kwargs: runtime)
-    monkeypatch.setattr(
-        MODULE,
-        "_invoke",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(["agy"], 0, "", ""),
-    )
+    monkeypatch.setattr(MODULE, "_bootstrap_capability_gate", _supported_capability_gate)
+    monkeypatch.setattr(MODULE, "_invoke", lambda *_args, **_kwargs: _invoke_result(0))
 
     exit_code, artifact = MODULE._run(
         argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
@@ -526,11 +555,8 @@ def test_missing_injected_attempt_is_inconclusive(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
     monkeypatch.setattr(MODULE, "_version", lambda _path: ("agy 1.1.9", True))
     monkeypatch.setattr(MODULE, "_prepare_runtime", lambda *_args, **_kwargs: runtime)
-    monkeypatch.setattr(
-        MODULE,
-        "_invoke",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(["agy"], 0, "", ""),
-    )
+    monkeypatch.setattr(MODULE, "_bootstrap_capability_gate", _supported_capability_gate)
+    monkeypatch.setattr(MODULE, "_invoke", lambda *_args, **_kwargs: _invoke_result(0))
 
     exit_code, artifact = MODULE._run(
         argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
@@ -563,6 +589,7 @@ def test_live_runtime_launch_failure_is_exit_77_but_unknown_runner_error_is_exit
     _fake_agy(fake)
     monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
     monkeypatch.setattr(MODULE, "_version", lambda _path: ("agy 1.1.9", True))
+    monkeypatch.setattr(MODULE, "_bootstrap_capability_gate", _supported_capability_gate)
     monkeypatch.setattr(MODULE, "_invoke", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unavailable")))
     exit_code, artifact = MODULE._run(
         argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
@@ -600,7 +627,12 @@ def test_main_writes_structured_exit_1_artifact_and_cleans_runtime_after_runner_
     assert MODULE.main() == 1
     artifact = json.loads((artifact_dir / "agy_permission_boundary_e2e.json").read_text())
     assert artifact["runner"]["exit_code"] == 1
-    assert artifact["cleanup"] == {"temporary_processes_removed": True, "loopback_servers_stopped": True}
+    assert artifact["cleanup"] == {
+        "temporary_processes_removed": True,
+        "loopback_servers_stopped": True,
+        "process_group_isolated": True,
+        "descendant_processes_absent": True,
+    }
     assert not list(artifact_dir.glob("agy-boundary-*"))
 
 
