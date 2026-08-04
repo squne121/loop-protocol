@@ -46,12 +46,22 @@
  * 2026-08-03 OWNER REQUEST_CHANGES repair, iteration 1
  * (issuecomment-5167160762 on PR #1981): the write-set operation-history
  * audit mechanism had the same three unresolved false-green paths as
- * `m4-upgrade-loop.spec.ts` (P1 Blockers 1-3), fixed identically here — see
+ * `m4-upgrade-loop.spec.ts` (P1 Blockers 1-3), fixed identically — see
  * that file's header for the full rationale (order reset per reload,
  * fire-and-forget log delivery, named-property access bypassing the
- * prototype patch). This spec duplicates the same `createAuditedContext()`
- * shape rather than importing a shared module, because extracting it into
- * a new file would fall outside this Issue's Allowed Paths.
+ * prototype patch).
+ *
+ * 2026-08-04 (Issue #1987): the CDP-based write-set audit core this spec
+ * used to duplicate has been extracted into the shared
+ * `./write-set-audit-helper` module (`attachWriteSetAudit(context, page)`)
+ * and is now imported here instead. This lane's `browser.newContext()` /
+ * `storageState` seeding stays inline in this file, deliberately WITHOUT
+ * any `addInitScript` runtime storage override — this lane must rely
+ * purely on the build-time `VITE_LOOP_STORAGE_NAMESPACE` resolution baked
+ * into the production-like build, and introducing a runtime override here
+ * would silently defeat the build-time namespace verification this spec
+ * exists to prove (see `./write-set-audit-helper` for the extracted audit
+ * core and its preconditions/contract).
  *
  * Dedicated lane invocation (see `pnpm run test:e2e:preview-namespace`):
  *
@@ -76,7 +86,8 @@
  * server from a different worktree/build cannot be reused.
  */
 
-import { test, expect, type Page, type BrowserContext, type Browser, type CDPSession } from '@playwright/test'
+import { test, expect, type Page } from '@playwright/test'
+import { attachWriteSetAudit } from './write-set-audit-helper'
 
 const PRODUCTION_KEY = 'loop-protocol.mvp.save'
 // Matches the E2E-runtime key shape m4-upgrade-loop.spec.ts's
@@ -125,104 +136,6 @@ async function readStorageKey(page: Page, key: string): Promise<StoredSnapshot |
   return JSON.parse(raw) as StoredSnapshot
 }
 
-// ---------------------------------------------------------------------------
-// Write-set operation-history audit (AC15). Issue #1283 repair iteration 1:
-// rebuilt on the CDP `DOMStorage` domain — see `m4-upgrade-loop.spec.ts`'s
-// file header for the full P1 Blocker 1-3 rationale this duplicated helper
-// addresses (order reset per reload, fire-and-forget log delivery,
-// named-property access bypassing Storage.prototype patches). Duplicated
-// (not extracted to a shared module) because a new helper file would fall
-// outside this Issue's Allowed Paths.
-// ---------------------------------------------------------------------------
-
-type WriteOp = {
-  type: 'setItem' | 'removeItem' | 'clear'
-  key: string | null
-  /** Global, monotonically-increasing sequence number assigned from this
-   *  Node-side counter. Never reset by navigation/reload (P1 Blocker 1). */
-  order: number
-  /** Bumped on every main-frame `framenavigated` (including reload). */
-  documentEpoch: number
-  /** Sequence local to `documentEpoch`, reset to 0 on every navigation. */
-  epochOrder: number
-}
-
-/**
- * Context-level, one-time production sentinel seeding (Design Constraints:
- * "production sentinel と E2E seed は最初の navigation 前に一度だけ
- * context-level で初期化") + the same CDP-based write-set operation-history
- * audit used by m4-upgrade-loop.spec.ts. This lane never needs a reload,
- * but the one-time-init requirement and audit mechanism are shared with
- * the runtime lane deliberately (single source of truth for the pattern).
- */
-async function createAuditedContext(
-  browser: Browser,
-  baseURL: string,
-): Promise<{ context: BrowserContext; page: Page; writeLog: WriteOp[]; flushAudit: () => Promise<void> }> {
-  const writeLog: WriteOp[] = []
-
-  const context = await browser.newContext({
-    baseURL,
-    storageState: {
-      cookies: [],
-      origins: [
-        {
-          origin: new URL(baseURL).origin,
-          localStorage: [{ name: PRODUCTION_KEY, value: PRODUCTION_SENTINEL }],
-        },
-      ],
-    },
-  })
-
-  const page = await context.newPage()
-
-  // CDP-based write-set audit (Issue #1283 repair iteration 1, P1 Blockers
-  // 1-3): attached after the page exists but before the first navigation,
-  // so it never observes the storageState seeding above (empirically
-  // verified against this exact Chromium build — see
-  // `m4-upgrade-loop.spec.ts` file header).
-  let globalOrder = 0
-  let documentEpoch = 0
-  let epochOrder = 0
-
-  page.on('framenavigated', (frame) => {
-    if (frame === page.mainFrame()) {
-      documentEpoch += 1
-      epochOrder = 0
-    }
-  })
-
-  const client: CDPSession = await context.newCDPSession(page)
-  await client.send('DOMStorage.enable')
-
-  function record(type: WriteOp['type'], key: string | null): void {
-    writeLog.push({ type, key, order: globalOrder, documentEpoch, epochOrder })
-    globalOrder += 1
-    epochOrder += 1
-  }
-
-  client.on('DOMStorage.domStorageItemAdded', (event) => {
-    if (event.storageId.isLocalStorage) record('setItem', event.key)
-  })
-  client.on('DOMStorage.domStorageItemUpdated', (event) => {
-    if (event.storageId.isLocalStorage) record('setItem', event.key)
-  })
-  client.on('DOMStorage.domStorageItemRemoved', (event) => {
-    if (event.storageId.isLocalStorage) record('removeItem', event.key)
-  })
-  client.on('DOMStorage.domStorageItemsCleared', (event) => {
-    if (event.storageId.isLocalStorage) record('clear', null)
-  })
-
-  // P1 Blocker 2 fix: forces delivery of any DOMStorage event the browser
-  // already sent on this SAME CDP session before this call resolves.
-  async function flushAudit(): Promise<void> {
-    await client.send('DOMStorage.enable')
-  }
-
-  return { context, page, writeLog, flushAudit }
-}
-
 test(
   'M4 upgrade loop: AC9/AC15 GIVEN a production-like nested-base build with VITE_LOOP_STORAGE_NAMESPACE WHEN New Game -> Save THEN only the resolved preview-namespace key is written, the production sentinel and any E2E-runtime key remain untouched, and every navigation/asset request stays under the nested VITE_BASE_PATH prefix',
   async ({ browser }, testInfo) => {
@@ -239,7 +152,33 @@ test(
         'below vacuous (AC9).',
     ).not.toBe('/')
 
-    const { context, page, writeLog, flushAudit } = await createAuditedContext(browser, baseURL!)
+    // Lane-specific context creation (Issue #1987 In Scope): production
+    // sentinel seeded exactly once via context-level `storageState`
+    // (Design Constraints: "production sentinel と E2E seed は最初の
+    // navigation 前に一度だけ context-level で初期化"). Deliberately does
+    // NOT install any `addInitScript` runtime storage override — this lane
+    // relies purely on the build-time `VITE_LOOP_STORAGE_NAMESPACE`
+    // resolution baked into the production-like build (see file header).
+    const context = await browser.newContext({
+      baseURL,
+      storageState: {
+        cookies: [],
+        origins: [
+          {
+            origin: new URL(baseURL!).origin,
+            localStorage: [{ name: PRODUCTION_KEY, value: PRODUCTION_SENTINEL }],
+          },
+        ],
+      },
+    })
+    const page = await context.newPage()
+    // CDP-based write-set audit (Issue #1283 repair iteration 1, P1
+    // Blockers 1-3; extracted to ./write-set-audit-helper by Issue #1987):
+    // attached after the page exists but before the first navigation, so
+    // it never observes the storageState seeding above (empirically
+    // verified — see `./write-set-audit-helper` and
+    // `m4-upgrade-loop.spec.ts`'s file header).
+    const { writeLog, flushAudit } = await attachWriteSetAudit(context, page)
 
     const allRequests: Array<{ url: string; resourceType: string }> = []
     const failedRequests: string[] = []
