@@ -748,6 +748,15 @@ test('responsive canvas preserves the logical arena, frozen combat positions, ba
       const frozenBeforeResize = frozenGameplayState(await getGameState(page))
       expect(frozenBeforeResize.arena).toEqual({ width: 960, height: 540 })
 
+      // Pass 1 (paused, Issue #1376 AC4 fix): verify canvas geometry and the
+      // frozen-combat-position invariant across the full viewport x zoom
+      // matrix while the pause dialog is open. AC4 makes the Canvas `inert`
+      // while paused, so this pass intentionally performs no pointer
+      // input/mapping assertions -- a real OS-level pointer cannot reach an
+      // `inert` element, and asserting otherwise would contradict AC4.
+      // Pass-1 results are keyed by viewport+zoom and consumed by Pass 2
+      // below, which resumes the game to exercise real pointer delivery.
+      const frozenResults = new Map<string, FrozenGameplayState>()
       for (const viewport of RESPONSIVE_VIEWPORTS) {
         for (const zoom of RESPONSIVE_ZOOMS) {
           await page.setViewportSize(viewport)
@@ -759,14 +768,6 @@ test('responsive canvas preserves the logical arena, frozen combat positions, ba
           // reach the expected (declared DPR x zoom factor) value before
           // trusting any subsequent `getBoundingClientRect()` read.
           await waitForZoomToApply(page, dpr * zoom.factor)
-          // Reset the (virtual) cursor to a known-good position inside the
-          // new viewport immediately after every resize/zoom change --
-          // otherwise it may still be resting at a coordinate from the
-          // previous (larger) viewport that now falls outside the new one,
-          // which was observed empirically to desynchronize subsequent
-          // page.mouse.move() position tracking across rapid successive
-          // viewport/zoom changes in this harness.
-          await page.mouse.move(10, 10)
 
           // The ResizeObserver-driven presentation update (Issue #1956 fix
           // 3) is asynchronous relative to setViewportSize()/setZoom() --
@@ -788,7 +789,6 @@ test('responsive canvas preserves the logical arena, frozen combat positions, ba
             )
             .toBeLessThanOrEqual(1)
 
-          const pointerMapping = await assertPointerMapsToLogicalArena(page)
           const observed = await collectEvidence(page)
           const observedZoom = await zoomCtx.getZoom()
           const frozenAfterResize = frozenGameplayState(await getGameState(page))
@@ -817,6 +817,64 @@ test('responsive canvas preserves the logical arena, frozen combat positions, ba
           ).toBeLessThanOrEqual(1)
           expect(observedZoom).toBeCloseTo(zoom.factor, 2)
           expect(frozenAfterResize).toEqual(frozenBeforeResize)
+
+          frozenResults.set(`${viewport.label}:${zoom.label}`, frozenAfterResize)
+        }
+      }
+
+      // Resume before Pass 2 (Issue #1376 AC4 fix): once resumed, the Canvas
+      // and combat HUD regain hit-testing, so real page.mouse.move() input
+      // can legitimately reach the Canvas again. `[data-action="toggle-pause"]`
+      // itself is pointer-unreachable while paused (the pause dialog overlay
+      // intercepts pointer events -- consistent with
+      // tests/e2e/product-pause.spec.ts and tests/e2e/m2-combat-mvp.spec.ts),
+      // so resume goes through the pause dialog's own Resume control.
+      await page.locator('[data-action="resume"]').click()
+      await expect(page.locator('[data-action="toggle-pause"]')).toHaveAttribute('aria-pressed', 'false')
+
+      // Pass 2 (resumed): verify pointer-to-arena coordinate mapping across
+      // the same viewport x zoom matrix now that pointer input can actually
+      // reach the Canvas. Gameplay is intentionally no longer frozen in this
+      // pass (AC4's pointer exclusion is scoped to the paused state only),
+      // so no frozen-gameplay comparison is made here; the Pass-1 frozen
+      // result captured above is reused for evidence purposes.
+      for (const viewport of RESPONSIVE_VIEWPORTS) {
+        for (const zoom of RESPONSIVE_ZOOMS) {
+          await page.setViewportSize(viewport)
+          await zoomCtx.setZoom(zoom.factor)
+          await waitForZoomToApply(page, dpr * zoom.factor)
+          // Reset the (virtual) cursor to a known-good position inside the
+          // new viewport immediately after every resize/zoom change --
+          // otherwise it may still be resting at a coordinate from the
+          // previous (larger) viewport that now falls outside the new one,
+          // which was observed empirically to desynchronize subsequent
+          // page.mouse.move() position tracking across rapid successive
+          // viewport/zoom changes in this harness.
+          await page.mouse.move(10, 10)
+
+          await expect
+            .poll(
+              async () => {
+                const snapshot = await collectEvidence(page)
+                return Math.abs(
+                  snapshot.canvas_backing_store.width
+                    - Math.round(snapshot.canvas_css.width * snapshot.observed_devicePixelRatio),
+                )
+              },
+              { timeout: 5_000, intervals: [50, 100, 250] },
+            )
+            .toBeLessThanOrEqual(1)
+
+          const pointerMapping = await assertPointerMapsToLogicalArena(page)
+          const observed = await collectEvidence(page)
+          const observedZoom = await zoomCtx.getZoom()
+
+          expect(observed.logical_arena).toEqual({ width: 960, height: 540 })
+
+          const frozenAfterResize = frozenResults.get(`${viewport.label}:${zoom.label}`)
+          if (!frozenAfterResize) {
+            throw new Error(`missing Pass 1 frozen-gameplay result for ${viewport.label}:${zoom.label}`)
+          }
 
           // Fix 6 point 4: every matrix cell gets a real screenshot; no
           // 'not-captured' placeholder path.
