@@ -364,6 +364,57 @@ export async function expectDomOverlayScreenshot(
 
   const canvasVisibility = options.canvasVisibility ?? 'mask'
 
+  if (canvasVisibility === 'mask') {
+    // Fail-closed geometric guard (Issue #1980 review fix, P1 Blocker 2):
+    // this Issue's root cause was a `mask` rectangle silently painting over
+    // the ENTIRE capture root (including the HUD drawn on top of the
+    // canvas) whenever the capture root and the canvas share nearly the
+    // same bounding box -- the resulting screenshot assertion still passed,
+    // but no longer verified anything. Rather than rely on every future
+    // call site remembering to pass `canvasVisibility: 'hidden'` for a
+    // capture root shaped like this, detect the dangerous geometry here and
+    // throw instead of silently producing a no-op capture. The DEFAULT
+    // behavior (`'mask'`) is unchanged for every capture root where the
+    // canvas does NOT cover most of the root's area -- this only adds a new
+    // throw path for the specific case that caused this Issue, and does not
+    // run at all for the `'hidden'` branch below (so the existing
+    // `running-hud-overlay-legacy-current` call site, which already passes
+    // `canvasVisibility: 'hidden'`, never reaches this check).
+    const canvasLocator = page.locator('canvas')
+    const canvasCount = await canvasLocator.count()
+    if (canvasCount > 0) {
+      const [rootBox, canvasBox] = await Promise.all([locator.boundingBox(), canvasLocator.first().boundingBox()])
+      if (rootBox && canvasBox && rootBox.width > 0 && rootBox.height > 0) {
+        const rootArea = rootBox.width * rootBox.height
+        const intersectionLeft = Math.max(rootBox.x, canvasBox.x)
+        const intersectionTop = Math.max(rootBox.y, canvasBox.y)
+        const intersectionRight = Math.min(rootBox.x + rootBox.width, canvasBox.x + canvasBox.width)
+        const intersectionBottom = Math.min(rootBox.y + rootBox.height, canvasBox.y + canvasBox.height)
+        const intersectionWidth = Math.max(0, intersectionRight - intersectionLeft)
+        const intersectionHeight = Math.max(0, intersectionBottom - intersectionTop)
+        const intersectionArea = intersectionWidth * intersectionHeight
+        // Threshold chosen to match the geometry that actually caused this
+        // Issue (canvas and capture root sharing ~the same bounding box
+        // since PR #1925's `.battle-stage__viewport`) while leaving margin
+        // for legitimate capture roots where a canvas only partially
+        // overlaps (e.g. a small inline canvas icon inside a larger DOM
+        // overlay), which should keep using the default `mask` behavior.
+        const CANVAS_MASK_COVERAGE_GUARD_THRESHOLD = 0.9
+        const coverageRatio = intersectionArea / rootArea
+        if (coverageRatio > CANVAS_MASK_COVERAGE_GUARD_THRESHOLD) {
+          throw new Error(
+            "expectDomOverlayScreenshot(): canvasVisibility 'mask' (default) would cover " +
+              `${(coverageRatio * 100).toFixed(1)}% of the capture root's area with an opaque mask ` +
+              "rectangle -- this reproduces Issue #1980's root cause (a mask painting over the " +
+              'content under test, e.g. the HUD drawn on top of the canvas). Pass ' +
+              "canvasVisibility: 'hidden' instead so the canvas element is excluded via CSS " +
+              'visibility rather than masked over.',
+          )
+        }
+      }
+    }
+  }
+
   if (canvasVisibility === 'hidden') {
     // Issue #1980: exclude the canvas via CSS visibility (freeze CSS opt-in
     // flag) instead of a Playwright `mask` rectangle, so a capture root that
