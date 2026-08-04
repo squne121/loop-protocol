@@ -2124,15 +2124,24 @@ def build_capability_matrix(
     return matrix
 
 
-# Issue #1979 AC5: MCP is unsupported_by_design, not merely unavailable/
-# untested. `agy_permission_enforcement_hook.py` never imports
-# `agy_permission_policy.py`, so direct MCP access is disabled for every
-# profile by construction -- there is no code path a runtime probe could ever
-# observe as "supported". This is therefore excluded from completion
-# blockers rather than left as an inconclusive/unavailable predicate.
+# Issue #1979 AC5 / fix_delta major_7: MCP is unsupported_by_design, not
+# merely unavailable/untested. The reason cites the actual dispatch
+# mechanism -- not merely the (true, but non-exhaustive) fact that
+# `agy_permission_enforcement_hook.py` never imports
+# `agy_permission_policy.py` for ANY tool. The real deny mechanism is that
+# `NATIVE_TO_RESOURCE` (the hook's tool-name -> resource dispatch table) has
+# no entry mapping any `mcp_*` tool name to a resource, so unknown-native-tool
+# calls are denied by default (`unknown_native_tool`); additionally
+# `agy_permission_policy.AGY_DIRECT_MCP_ACCESS` is `False` and no profile's
+# `PROFILE_ALLOWED_PERMISSION_RESOURCES` includes `"mcp"`. There is no code
+# path a runtime probe could ever observe as "supported". This is therefore
+# excluded from completion blockers rather than left as an
+# inconclusive/unavailable predicate.
 MCP_UNSUPPORTED_BY_DESIGN_REASON = (
-    "agy_permission_enforcement_hook.py never imports agy_permission_policy.py; "
-    "direct MCP access is disabled for every profile by construction"
+    "agy_permission_enforcement_hook.py's NATIVE_TO_RESOURCE dispatch table has no entry mapping "
+    "any mcp_* tool name to a resource (unknown-native-tool calls are denied by default); "
+    "agy_permission_policy.AGY_DIRECT_MCP_ACCESS is False; no profile's PROFILE_ALLOWED_PERMISSION_RESOURCES "
+    "includes \"mcp\"; and agy_permission_enforcement_hook.py never imports agy_permission_policy.py for any tool"
 )
 
 

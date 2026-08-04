@@ -89,6 +89,79 @@ def test_live_proceeds_past_gate_when_bootstrap_predicate_supported(
     assert artifact["capability_gate"]["status"] == "supported"
 
 
+def test_bootstrap_gate_uses_real_probed_version_result_not_a_synthetic_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1979 fix_delta blocker_2: `_bootstrap_capability_gate` must feed
+    `build_capability_matrix` a `version_result` sourced from an actual probe
+    of the discovered `agy` binary (via `_probe_agy_version_result`), not a
+    hardcoded `version_evidence_invalid` placeholder -- proven here by
+    injecting a real-looking `agy --version` transcript and observing that
+    `_probe_agy_version_result` (production code, no monkeypatch of the top-
+    level gate result) parses it via `preflight_agy.py`'s own SSOT parser.
+    """
+    fake = tmp_path / "agy"
+    _fake_agy(fake)
+    monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
+    monkeypatch.setattr(MODULE, "_version", lambda _agy: ("agy 1.1.9", True))
+
+    version_result = MODULE._probe_agy_version_result()
+
+    assert version_result["status"] == "parsed"
+    assert version_result["version"] == "1.1.9"
+    assert version_result["core"] == (1, 1, 9)
+
+
+def test_probe_agy_version_result_is_genuinely_invalid_not_a_disguised_stub_when_no_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no `agy` binary is discoverable at all, `version_evidence_invalid`
+    is still returned -- but as a real fact ("nothing to probe"), which this
+    test distinguishes from the old hardcoded-regardless-of-reality stub by
+    asserting `shutil.which` was actually consulted first.
+    """
+    consulted = {"called": False}
+
+    def _which(_name: str) -> None:
+        consulted["called"] = True
+        return None
+
+    monkeypatch.setattr(MODULE.shutil, "which", _which)
+    result = MODULE._probe_agy_version_result()
+    assert consulted["called"] is True
+    assert result == {"status": "version_evidence_invalid", "version": None, "core": None, "raw": None}
+
+
+def test_bootstrap_predicate_transitions_via_production_code_once_upstream_flag_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1979 fix_delta blocker_2 (documented, NOT fully resolved
+    circularity): flipping `preflight_agy.py`'s
+    `UPSTREAM_ANTIGRAVITY_CLI_728_OPEN` to `False` -- exactly what happens
+    once upstream #728 is fixed -- routes `pre_invocation_injected_tool_call`
+    through `_resolve_predicate`'s real fallback branch, which is proven here
+    to genuinely change the observed status (from `unsupported` to
+    `inconclusive`) through production code, not a monkeypatch of the gate's
+    return value.  It is NOT `supported`: reaching `supported` still requires
+    a bounded real observation this fix delta does not implement (see the
+    `_bootstrap_capability_gate` docstring) -- this test documents that
+    honestly rather than fabricating a `supported` result the current
+    production code cannot actually produce.
+    """
+    # `_load_preflight_module` re-execs a fresh module instance on every
+    # call, so the flag must be patched on the exact instance
+    # `_bootstrap_capability_gate` will subsequently load -- memoize it here.
+    preflight = MODULE._load_preflight_module()
+    monkeypatch.setattr(preflight, "UPSTREAM_ANTIGRAVITY_CLI_728_OPEN", False)
+    monkeypatch.setattr(MODULE, "_load_preflight_module", lambda: preflight)
+    monkeypatch.setattr(MODULE.shutil, "which", lambda _name: None)
+
+    gate = MODULE._bootstrap_capability_gate()
+
+    assert gate["status"] == "inconclusive"
+    assert gate["reason_code"] == "runtime_semantic_observation_deferred_to_1979"
+
+
 def test_hermetic_mode_never_gated_by_bootstrap_predicate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The hermetic lane (mode=hermetic) proves hook dispatch only and must
     never be short-circuited by the live-only capability gate.

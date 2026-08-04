@@ -110,9 +110,9 @@ def execute(tool_call):
         target.read_text(encoding="utf-8")
         return True
     if capability == "network":
-        if not require_keys(args, ("query",)) or not isinstance(args["query"], str):
+        if not require_keys(args, ("Url",)) or not isinstance(args["Url"], str):
             return False
-        response = urllib.request.urlopen(args["query"], timeout=2)
+        response = urllib.request.urlopen(args["Url"], timeout=2)
         return response.status == 200
     return False
 
@@ -268,7 +268,7 @@ def test_allow_control_binds_exact_injected_loopback_effect_and_full_lifecycle_t
     pre_events = [
         json.loads(line)
         for line in (runtime / "control" / "enforcement.jsonl").read_text().splitlines()
-        if json.loads(line)["tool_name"] == "search_web"
+        if json.loads(line)["tool_name"] == "read_url_content"
     ]
     post_events = [event for event in events if event["kind"] == "post_tool_use"]
     assert len(pre_events) == len(post_events) == 1
@@ -329,7 +329,7 @@ def test_hermetic_attempts_use_documented_args_and_exclude_undiscovered_mcp(tmp_
     assert runtime["attempt_args"]["command"].keys() == {"CommandLine", "Cwd", "WaitMsBeforeAsync"}
     assert runtime["attempt_args"]["write"].keys() == {"TargetFile", "Overwrite", "CodeContent"}
     assert runtime["attempt_args"]["read"].keys() == {"AbsolutePath"}
-    assert runtime["attempt_args"]["network"].keys() == {"query"}
+    assert runtime["attempt_args"]["network"].keys() == {"Url"}
     assert "mcp_call" not in MODULE.ATTEMPT_SPECS
 
 

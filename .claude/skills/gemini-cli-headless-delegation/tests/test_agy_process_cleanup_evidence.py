@@ -108,6 +108,64 @@ def test_invoke_timeout_kills_process_group_and_reports_timed_out(tmp_path: Path
     assert result["descendant_processes_absent"] is True
 
 
+def test_invoke_terminates_lingering_descendant_after_leader_exits_normally(tmp_path: Path) -> None:
+    """Issue #1979 fix_delta blocker_5: the leader may exit normally while a
+    detached descendant (its stdout/stderr closed, still sharing the
+    leader's process group because it was NOT started with its own new
+    session) keeps running.  `_invoke` must actively terminate that lingering
+    group -- not merely detect and report it as present -- and still report
+    `descendant_processes_absent: True` once it has done so.
+    """
+    script = tmp_path / "leaves-descendant-agy.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess, sys, time\n"
+        "subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+        "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,\n"
+        ")\n"
+        "print('leader-exiting-now')\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    runtime = {
+        "env": {"PATH": os.environ.get("PATH", "")},
+        "context_path": tmp_path / "context.json",
+        "agy_command_prefix": [sys.executable],
+        "workspace": tmp_path,
+    }
+    (tmp_path / "context.json").write_text("{}", encoding="utf-8")
+
+    result = MODULE._invoke(script, runtime, live=False)
+
+    assert result["timed_out"] is False
+    assert result["returncode"] == 0
+    # If the lingering descendant had merely been detected (not terminated),
+    # this would be False -- the descendant sleeps for 30s, far longer than
+    # `_terminate_process_group`'s bounded wait window.
+    assert result["descendant_processes_absent"] is True
+
+
+def test_failure_artifact_preserves_real_cleanup_failure_evidence() -> None:
+    """Issue #1979 fix_delta blocker_5: replacing a result (e.g. on schema
+    validation failure) must never silently reset a genuine cleanup failure
+    back to the `True`/`True` "no subprocess launched" default.
+    """
+    prior = MODULE._unavailable_artifact(
+        MODULE.FAILURE_INCONCLUSIVE,
+        profile="no_tools",
+        process_group_isolated=True,
+        descendant_processes_absent=False,
+    )
+    replacement = MODULE._failure_artifact(
+        "agy_permission_boundary_validator_exception", profile="no_tools", prior_result=prior
+    )
+    assert replacement["cleanup"]["descendant_processes_absent"] is False
+    assert replacement["cleanup"]["process_group_isolated"] is True
+
+
 def test_cleanup_evidence_is_separate_predicate_from_directory_cleanup() -> None:
     schema_props = MODULE.SCHEMA_PATH.read_text(encoding="utf-8")
     assert "process_group_isolated" in schema_props

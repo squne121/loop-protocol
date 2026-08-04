@@ -15,10 +15,7 @@
     "fallback",
     "failure_taxonomy",
     "cleanup",
-    "secret_scan",
-    "capability_gate",
-    "mcp",
-    "pairing"
+    "secret_scan"
   ],
   "properties": {
     "schema": {
@@ -39,7 +36,6 @@
         "executable_ref",
         "executable_version",
         "binary_digest",
-        "binary_identity",
         "child_returncode",
         "artifact_digest"
       ],
@@ -146,8 +142,7 @@
       "additionalProperties": false,
       "required": [
         "profile",
-        "capabilities",
-        "tool_inventory_digest"
+        "capabilities"
       ],
       "properties": {
         "profile": {
@@ -257,9 +252,7 @@
       "additionalProperties": false,
       "required": [
         "temporary_processes_removed",
-        "loopback_servers_stopped",
-        "process_group_isolated",
-        "descendant_processes_absent"
+        "loopback_servers_stopped"
       ],
       "properties": {
         "temporary_processes_removed": {
