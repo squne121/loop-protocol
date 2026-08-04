@@ -13,12 +13,13 @@
  *
  * Out of scope for this Issue (see `docs/dev/visual-baseline-registry.md`
  * and the Issue #1386 contract): adding a `frozen` baseline for any final
- * overlay surface, and implementing the `running-hud-paused` /
- * `result-timeout` / `final-no-command-rail` overlay UIs themselves
- * (#1375 / #1376 / #1377). Those scenarios remain `pending-fixture`
+ * overlay surface, and implementing the `final-no-command-rail` overlay UI
+ * (#1377). `running-hud-paused` and `result-timeout` were promoted to
+ * `active-fixture-only` / `legacy-current` by Issue #1376 (AC12) and are
+ * captured below; `final-no-command-rail` remains `pending-fixture`
  * (`VISUAL_SCENARIO_STATUS`) / `pending-baseline` (registry `maturity`)
- * here and are only exercised as explicit-pending / fail-closed proofs
- * (AC4) — never captured.
+ * and is only exercised as an explicit-pending / fail-closed proof (AC4) —
+ * never captured.
  */
 
 import { test, expect } from '@playwright/test'
@@ -49,9 +50,9 @@ const RUNNING_HUD_FIXTURE: VisualScenarioFixture = {
 }
 
 /**
- * `pending-fixture` fixture payload, used only to prove the fail-closed
- * rejection below (AC4) — never installed successfully and never used to
- * capture a screenshot.
+ * `active-fixture-only` (Scenario Support Matrix, Issue #1376 AC12 promotion)
+ * — the pause overlay (`[data-phase-screen="pause"]`, Resume-focused modal
+ * dialog with the combat HUD and Canvas rendered inert behind it).
  */
 const RUNNING_HUD_PAUSED_FIXTURE: VisualScenarioFixture = {
   name: 'running-hud-paused',
@@ -60,6 +61,39 @@ const RUNNING_HUD_PAUSED_FIXTURE: VisualScenarioFixture = {
   sortie: { status: 'running', elapsedTicks: 900, fixedDeltaMs: 16 },
   player: { hp: 80, maxHp: 100 },
   progress: { resources: 12, weaponPower: 1 },
+  telemetry: { status: '', summary: '' },
+  viewportLabel: 'desktop-1280x720',
+}
+
+/**
+ * `active-fixture-only` (Scenario Support Matrix, Issue #1376 AC12 promotion)
+ * — the result screen (`[data-phase-screen="result"]`) after a timeout-
+ * terminal sortie, reward summary built from `RewardSystem.calculate()`.
+ */
+const RESULT_TIMEOUT_FIXTURE: VisualScenarioFixture = {
+  name: 'result-timeout',
+  loopPhase: 'result',
+  paused: false,
+  sortie: { status: 'timeout', elapsedTicks: 900, fixedDeltaMs: 16, durationMs: 14400, kills: 5 },
+  player: { hp: 42, maxHp: 100 },
+  progress: { resources: 30, weaponPower: 2 },
+  telemetry: { status: '', summary: '' },
+  viewportLabel: 'desktop-1280x720',
+}
+
+/**
+ * `pending-fixture` fixture payload for `final-no-command-rail` (#1377, not
+ * yet implemented), used only to prove the fail-closed rejection below
+ * (AC4) — never installed successfully and never used to capture a
+ * screenshot.
+ */
+const FINAL_NO_COMMAND_RAIL_FIXTURE: VisualScenarioFixture = {
+  name: 'final-no-command-rail',
+  loopPhase: 'result',
+  paused: false,
+  sortie: { status: 'timeout', elapsedTicks: 900, fixedDeltaMs: 16, durationMs: 14400, kills: 5 },
+  player: { hp: 42, maxHp: 100 },
+  progress: { resources: 30, weaponPower: 2 },
   telemetry: { status: '', summary: '' },
   viewportLabel: 'desktop-1280x720',
 }
@@ -104,21 +138,66 @@ test('GIVEN the running-hud active-fixture-only scenario WHEN the DOM overlay ro
 })
 
 // ---------------------------------------------------------------------------
+// Active captures promoted by Issue #1376 (AC12): running-hud-paused / result-timeout
+// ---------------------------------------------------------------------------
+//
+// These two scenarios were `pending-baseline` through Issue #1386; Issue
+// #1376 built the pause dialog / result screen controller
+// (`src/ui/phaseScreens.ts`) that these captures now exercise. Both target
+// the same `[data-battle-ui-root]` DOM overlay root as the running-hud
+// capture above (registry `legacy-current`, not `frozen` — `frozen`
+// requires a merged PR SHA per docs/dev/visual-baseline-registry.md's
+// transition rules, deferred until after #1377 per the established
+// precedent for the other overlay rows).
+
+test('GIVEN the running-hud-paused active-fixture-only scenario WHEN the DOM overlay root is captured THEN it matches the legacy-current pause dialog baseline (AC12)', async ({
+  page,
+}) => {
+  await installVisualScenario(page, RUNNING_HUD_PAUSED_FIXTURE)
+  await page.goto('/')
+
+  const overlayRoot = page.locator('[data-battle-ui-root]')
+  // registryId + explicit maxDiffPixels: `running-hud-paused` is its own
+  // registry row (docs/dev/visual-baseline-registry.md), distinct from
+  // `running-hud-overlay-legacy-current`. The tolerance is an absolute
+  // pixel budget measured empirically against this capture root (pause
+  // dialog panel over the inert combat HUD/Canvas, masked).
+  await expectDomOverlayScreenshot(overlayRoot, 'vrt-running-hud-paused-overlay.png', 'running-hud-paused', {
+    maxDiffPixels: 100,
+  })
+})
+
+test('GIVEN the result-timeout active-fixture-only scenario WHEN the DOM overlay root is captured THEN it matches the legacy-current result screen baseline (AC12)', async ({
+  page,
+}) => {
+  await installVisualScenario(page, RESULT_TIMEOUT_FIXTURE)
+  await page.goto('/')
+
+  const overlayRoot = page.locator('[data-battle-ui-root]')
+  // registryId + explicit maxDiffPixels: `result-overlay-timeout` is the
+  // registry id for the `result-timeout` VisualScenarioName (registry ids
+  // and scenario names intentionally differ here, see
+  // `tests/e2e/visual-utils.ts`'s `VISUAL_BASELINE_REGISTRY_IDS` comment).
+  await expectDomOverlayScreenshot(overlayRoot, 'vrt-result-timeout-overlay.png', 'result-overlay-timeout', {
+    maxDiffPixels: 100,
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Pending-baseline scenarios (AC4)
 // ---------------------------------------------------------------------------
 //
-// `running-hud-paused` / `result-overlay-timeout` / `final-no-command-rail`
-// (docs/dev/visual-baseline-registry.md registry ids; `result-timeout` is
-// the corresponding `VisualScenarioName`) are `pending-baseline` in the
-// registry and `pending-fixture` in the Scenario Support Matrix — their
-// overlay surface implementation child issues (#1375 / #1376 / #1377) have
-// not merged. This primary VRT suite marks them `pending-baseline`
-// explicitly via `test.skip()` rather than silently omitting them or
+// `final-no-command-rail` (docs/dev/visual-baseline-registry.md registry id)
+// is still `pending-baseline` in the registry and `pending-fixture` in the
+// Scenario Support Matrix — its overlay surface implementation child issue
+// (#1377) has not merged. `running-hud-paused` / `result-overlay-timeout`
+// were promoted to active captures by Issue #1376 (AC12, see the active
+// capture tests above) and are intentionally no longer listed here. This
+// primary VRT suite marks the remaining pending scenario `pending-baseline`
+// explicitly via `test.skip()` rather than silently omitting it or
 // capturing a premature baseline of the current pre-overlay UI.
 
 const PENDING_SCENARIO_REGISTRY_IDS = {
-  'running-hud-paused': 'running-hud-paused',
-  'result-timeout': 'result-overlay-timeout',
   'final-no-command-rail': 'final-no-command-rail',
 } as const
 
@@ -182,11 +261,11 @@ for (const [scenarioName, registryId] of Object.entries(PENDING_SCENARIO_REGISTR
   })
 }
 
-test('GIVEN the running-hud-paused pending-fixture scenario WHEN installVisualScenario is called THEN it fails closed instead of silently freezing the current pre-overlay UI (AC4)', async ({
+test('GIVEN the final-no-command-rail pending-fixture scenario WHEN installVisualScenario is called THEN it fails closed instead of silently freezing the current pre-overlay UI (AC4)', async ({
   page,
 }) => {
-  expect(isPendingFixtureScenario(RUNNING_HUD_PAUSED_FIXTURE.name)).toBe(true)
-  await expect(installVisualScenario(page, RUNNING_HUD_PAUSED_FIXTURE)).rejects.toThrow(
+  expect(isPendingFixtureScenario(FINAL_NO_COMMAND_RAIL_FIXTURE.name)).toBe(true)
+  await expect(installVisualScenario(page, FINAL_NO_COMMAND_RAIL_FIXTURE)).rejects.toThrow(
     /pending-fixture/,
   )
 })
