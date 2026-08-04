@@ -201,47 +201,61 @@ gh pr comment <PR番号> --repo <owner>/<repo> --body-file <本文テキスト�
 - Allowed Paths / contract 監査結果は `LOOP_VERDICT_V2.allowed_paths_gate` という専用フィールド
   ではなく、`status != ok` の場合に具体的な違反内容を `blockers[]` へ記載する形で受け渡す
   （`references/allowed-paths-gate.md` 参照）。
+- production consumer（`route_loop_verdict_v2(reviewer_verdict, live_mergeability)`、2引数のみ。
+  action は router 自身が単一合成する）の挙動は、待機条件（stale な issue 参照）ではなく、
+  実装（`.claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py`）の以下 10 分岐で固定する
+  （AC11。production fixture: `impl-review-loop/tests/fixtures/step5_routing_consumer/
+  test_route_loop_verdict_v2.py` および `test_route_loop_verdict_v2_merge_state_status_only.py`）:
 
-### ALLOWED_PATHS_GATE_RESULT_V1（Allowed Paths 判定結果）
+  1. `mergeable: CONFLICTING` → `conflict_hard_stop`（reviewer verdict に関係なく最優先）
+  2. `merge_state_status: DIRTY` → `conflict_hard_stop`（同上）
+  3. `verdict: HUMAN_REVIEW_REQUIRED` → `route_human_escalation`
+  4. `verdict: REQUEST_CHANGES` → `continue_loop`
+  5. `verdict: APPROVE` かつ `blockers` 非空 → `fail_closed`
+     （reason_code: `approve_with_blockers_inconsistent`）
+  6. `verdict: APPROVE` かつ `reviewed_head_sha` が live head と不一致 → `route_stale_head_rereview`
+  7. `verdict: APPROVE` かつ `mergeable: UNKNOWN` または `merge_state_status: UNKNOWN`
+     → `fail_closed`（reason_code: `mergeability_unknown`）
+  8. `verdict: APPROVE` かつ `merge_state_status: BEHIND` → `route_to_update_branch`
+     （`update_branch` action を router が合成、`rerun_required` は verification/pr_review 双方 true）
+  9. `verdict: APPROVE` かつ `merge_state_status` が `BLOCKED`/`UNSTABLE`/`DRAFT`
+     → `fail_closed`（current-head required-CI / branch-protection evaluator へ defer。
+     人間 escalation は自動発生しない）
+  10. `verdict: APPROVE` かつ `merge_state_status` が `CLEAN`/`HAS_HOOKS` かつ `mergeable: MERGEABLE`
+      → `approved`
 
-PR review 後に `allowed_paths_review_gate.py` を使って changed files の契約違反を再計算。
-Allowed Paths パターンの canonical source は **live linked issue 本文**（review 実行ごとに `gh issue
-view` で取得）であり、contract snapshot / capsule のコピーは advisory cache に過ぎない。
-snapshot freshness 用の `contract_fingerprint.base_sha_at_snapshot` と、local fallback changed files 算出用の
-`diff_base_sha` は別物として扱う。local fallback の `changed_files_source` は
-`git_diff_current_merge_base_head` で、snapshot base を changed files diff には使わない。
+### ALLOWED_PATHS_GATE_RESULT_V1（Allowed Paths 判定結果、正本移譲先: references/allowed-paths-gate.md）
 
-`status` は判定状態として `ok | fail_closed | indeterminate` を取る（fingerprint drift による
-`stale_snapshot` は `status` を占有しない）。
-
-`fail_closed`（path が Allowed Paths 外）と rename provenance を確定できない `indeterminate` は
-merge-blocking 状態として扱う。contract snapshot の fingerprint が live 本文と乖離している場合は
-`warnings[]`（`stale_snapshot: ...`）に advisory として記録するのみで、単独では merge-blocking に
-しない -- live 本文で評価した結果（`ok` / `fail_closed`）が canonical。
-
-changed files source hierarchy は `github_pull_request_files_api_with_previous_filename` を preferred oracle、
-`git_diff_name_status_find_renames_z` を deterministic local fallback とする。
-`gh_pr_diff_name_only` / `git_diff_current_merge_base_head_name_only` は rename provenance では
-insufficient_for_rename_provenance であり、`git_diff_snapshot_base_head` は禁止経路である。
-local fallback は `current_base_sha` と `head_sha` から evaluator 内で `git merge-base` を検証できた場合だけ
-`git_diff_name_status_find_renames_z` を名乗る。provenance の保証は script output（`ALLOWED_PATHS_GATE_RESULT_V1`）
-に限り、reviewer_verdict（`blockers[]`/`warnings[]` へのテキスト反映のみ）が詳細 provenance を直接
-carry するとまでは主張しない。
-
-### リネーム元 provenance（`previous_filename`）監査（Issue #1300）
-
-canonical な判定 input は `audited_paths[]`（`changed_file_records[]` から派生）であり、`changed_files[]` は
-post-image filename のみの backward-compatible alias に過ぎない。`status: renamed` の record は rename 元
-（`previous_filename` ロール）と rename 先（`filename` ロール）の両方を `audited_paths` に含め、双方を
-Allowed Paths 判定対象とする。rename 元・先のどちらかが Allowed Paths 外なら `fail_closed`（false green 禁止）。
-`status: renamed` なのに `previous_filename` を取得できない場合は `indeterminate` とし、filename-only fallback
-で `ok` に倒してはならない。詳細は `references/allowed-paths-gate.md` を参照する。
+PR review 後に `allowed_paths_review_gate.py` を使って changed files の契約違反を再計算する。
+canonical source（live linked issue 本文の扱い）・`status`（`ok | fail_closed | indeterminate`）の
+意味・changed files source hierarchy・rename/copy provenance（`previous_filename`、Issue #1300）の
+判定手順は `references/allowed-paths-gate.md` を正本とし、本節では複製しない。
 
 ## Output Constraint（OUTPUT_BUDGET_V1 出力制約）
 
 出力上限は `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` を遵守。
 
 最小 convention のフィールド（`verdict` / `reviewed_head_sha` / `blockers` / `warnings`）は全て維持。
+
+## Deterministic Processing Script の禁止事項（AC6）
+
+`.claude/skills/pr-review-judge/scripts/` 配下の deterministic processing script（request
+builder／validator／classifier／executor／renderer）は以下を行わない:
+
+- semantic findings（コード品質・設計判断等の主観的知見）の自動生成
+- `gh pr review` / `gh issue edit` 等の GitHub mutation の直接実行
+- publisher（`open-pr` skill）が所有する hash／identity／TOCTOU gate の再実装
+- test 専用の shadow implementation（pytest 検出による分岐等）
+
+script が計算するのは G1–G5（`references/deterministic-gates.md`）等の決定論的 gate 判定のみであり、
+`verdict` 自体（APPROVE/REQUEST_CHANGES の意味判断）は reviewer_verdict（本 SKILL.md の Procedure）が
+決める。
+
+**semantic findings 禁止と gate 集約の区別**: `check_pr_review_gates.py` の `finalize_verdict()`
+（G1–G5 の機械的 gate boolean から `verdict: APPROVE/REQUEST_CHANGES` を決定論的に集約する既存関数）
+は、上記で禁止する「semantic findings（コード品質・設計判断等の主観的知見）の自動生成」の対象では
+ない。`finalize_verdict()` は LLM 呼び出しや外部 mutation を一切含まない純粋な boolean 集約
+（`any(gate.status == FAIL for gate in gates)` の要約）であり、決定論的 gate 判定の範囲内に留まる。
 
 ## Reference Loading Map（読取条件）
 
