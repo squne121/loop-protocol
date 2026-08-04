@@ -51,13 +51,13 @@
  *   assigned `order` inside the `context.addInitScript()` closure, which
  *   Playwright re-evaluates on every navigation/reload/frame-attach, so the
  *   sequence silently restarted at 0 after every reload and never proved
- *   cross-reload ordering. `createAuditedContext()` now assigns `order`
- *   from a Node-side counter that lives in this test process (never reset
- *   by navigation), plus a per-navigation `documentEpoch` (bumped on every
- *   main-frame `framenavigated`) and a `epochOrder` sequence local to that
- *   epoch. The final assertions below prove `order` is unique and strictly
- *   increasing across the whole scenario, including across the reload
- *   boundary (`documentEpoch` spans at least two values).
+ *   cross-reload ordering. The audit now assigns `order` from a Node-side
+ *   counter that lives in this test process (never reset by navigation),
+ *   plus a per-navigation `documentEpoch` (bumped on every main-frame
+ *   `framenavigated`) and a `epochOrder` sequence local to that epoch. The
+ *   final assertions below prove `order` is unique and strictly increasing
+ *   across the whole scenario, including across the reload boundary
+ *   (`documentEpoch` spans at least two values).
  * - P1 Blocker 2 (fire-and-forget log delivery): the prior
  *   `exposeBinding()` callback was invoked without any drain barrier before
  *   the zero-count assertions ran. The audit mechanism no longer uses
@@ -74,7 +74,7 @@
  *   mechanism) cannot intercept `localStorage[key] = value` /
  *   `delete localStorage[key]` — the HTML Standard's Storage exotic-object
  *   [[Set]]/[[Delete]] internal methods do not go through those prototype
- *   methods. `createAuditedContext()` now uses the CDP `DOMStorage` domain
+ *   methods. The audit now uses the CDP `DOMStorage` domain
  *   (`DOMStorage.domStorageItemAdded/Updated/Removed/ItemsCleared`), which
  *   observes every localStorage mutation at the browser-engine level,
  *   independent of which JS API triggered it. This is Chromium-specific
@@ -95,13 +95,25 @@
  * the audit never spuriously records the initial sentinel/seed writes as
  * app-triggered operations (preserving the existing AC7 "never
  * (re-)written by the app via setItem" semantics).
+ *
+ * 2026-08-04 (Issue #1987): the CDP-based write-set audit core (`WriteOp`
+ * type, CDP session setup, `DOMStorage.*` listeners, `writeLog` /
+ * `flushAudit`) has been extracted into the shared
+ * `./write-set-audit-helper` module (`attachWriteSetAudit(context, page)`)
+ * and is now imported here instead of being duplicated locally. Only the
+ * lane-specific context creation (this lane's per-test E2E key seeding and
+ * the runtime `__LOOP_STORAGE_KEY__` / `__LOOP_E2E_BOOTSTRAP__`
+ * `addInitScript` override) stays inline in this file — see
+ * `./write-set-audit-helper` for the extracted audit core and its
+ * preconditions/contract.
  */
 
-import { test, expect, type Page, type BrowserContext, type Browser, type CDPSession } from '@playwright/test'
+import { test, expect, type Page, type Browser, type BrowserContext } from '@playwright/test'
 // Type-only import from the single source of truth (Issue #1283 PR #1517
 // review fix): avoids a locally-duplicated snapshot type that can silently
 // drift from the real `__LOOP_E2E__.getState()` return shape.
 import type { LoopE2ESnapshot } from '../../src/main'
+import { attachWriteSetAudit, type WriteOp } from './write-set-audit-helper'
 
 // ---------------------------------------------------------------------------
 // Helper: read-only __LOOP_E2E__ observability hook
@@ -155,55 +167,26 @@ async function readStorageKey(page: Page, key: string): Promise<StoredSnapshot |
 }
 
 // ---------------------------------------------------------------------------
-// Write-set operation-history audit (AC7 / AC8, Design Constraints)
+// Runtime-lane context creation (Design Constraints, Issue #1987 In Scope)
 //
-// Issue #1283 repair iteration 1: rebuilt on the CDP `DOMStorage` domain
-// (see file header for the three P1 Blockers this replaces). Both spec
-// files (`m4-upgrade-loop.spec.ts` and `m4-preview-namespace.spec.ts`)
-// duplicate this helper rather than importing a shared module — extracting
-// it into a new file would fall outside this Issue's Allowed Paths
-// (`tests/e2e/m4-upgrade-loop.spec.ts`, `tests/e2e/m4-preview-namespace.spec.ts`,
-// `playwright.config.ts`, `package.json`, `.github/workflows/ci.yml` only),
-// so the two copies are kept structurally identical instead.
+// Lane-specific: seeds a per-test E2E key (via context-level `storageState`,
+// applied exactly once, before any `addInitScript` re-runs on navigation)
+// and installs a runtime `__LOOP_STORAGE_KEY__` / `__LOOP_E2E_BOOTSTRAP__`
+// override via `addInitScript` (safe to reinstall on every navigation/
+// reload: it never writes to storage, only configures the app's runtime E2E
+// hooks). This context-creation shape is specific to this lane and is kept
+// inline here rather than shared with `m4-preview-namespace.spec.ts`, which
+// must never receive a runtime storage override (see
+// `m4-preview-namespace.spec.ts`'s file header). The CDP write-set audit
+// itself is attached separately via `attachWriteSetAudit()` from
+// `./write-set-audit-helper`.
 // ---------------------------------------------------------------------------
 
-type WriteOp = {
-  type: 'setItem' | 'removeItem' | 'clear'
-  key: string | null
-  /** Global, monotonically-increasing sequence number assigned from this
-   *  Node-side counter. Never reset by navigation/reload (P1 Blocker 1). */
-  order: number
-  /** Bumped on every main-frame `framenavigated` (including reload) — proves
-   *  operations are attributable to a specific navigation/document, and lets
-   *  the final assertions prove the audit actually observed operations
-   *  spanning the reload boundary, not just before it (P1 Blocker 1). */
-  documentEpoch: number
-  /** Sequence local to `documentEpoch`, reset to 0 on every navigation. The
-   *  CDP `DOMStorage` domain does not expose a frame/document id, so this
-   *  (navigation-epoch, local-sequence) pair is the practical equivalent of
-   *  a per-document sequence for a single-frame same-origin scenario. */
-  epochOrder: number
-}
-
-/**
- * Creates a browser context whose production sentinel and E2E seed are
- * initialized exactly once, at context creation, via
- * `browser.newContext({ storageState })` (never via `addInitScript`, which
- * reruns on every navigation/reload — the exact false-green mechanism the
- * 2026-08-03 repair fixed). Also installs the Node-side write-set
- * operation-history audit via the CDP `DOMStorage` domain (Issue #1283
- * repair iteration 1, P1 Blockers 1-3 — see file header): every
- * setItem/removeItem/clear-equivalent localStorage mutation is observed at
- * the browser-engine level, independent of which JS API triggered it, with
- * a Node-side monotonic `order` that survives reload.
- */
-async function createAuditedContext(
+async function createRuntimeLaneContext(
   browser: Browser,
   baseURL: string,
   seed: { productionKey: string; productionSentinel: string; e2eKey: string; e2eSeed: string },
-): Promise<{ context: BrowserContext; page: Page; writeLog: WriteOp[]; flushAudit: () => Promise<void> }> {
-  const writeLog: WriteOp[] = []
-
+): Promise<{ context: BrowserContext; page: Page }> {
   const context = await browser.newContext({
     baseURL,
     storageState: {
@@ -234,55 +217,7 @@ async function createAuditedContext(
   )
 
   const page = await context.newPage()
-
-  // CDP-based write-set audit (Issue #1283 repair iteration 1, P1 Blockers
-  // 1-3): attached after the page exists but before the first navigation,
-  // so it never observes the storageState seeding above (empirically
-  // verified — see file header) and so it is in place before any app code
-  // can run.
-  let globalOrder = 0
-  let documentEpoch = 0
-  let epochOrder = 0
-
-  page.on('framenavigated', (frame) => {
-    if (frame === page.mainFrame()) {
-      documentEpoch += 1
-      epochOrder = 0
-    }
-  })
-
-  const client: CDPSession = await context.newCDPSession(page)
-  await client.send('DOMStorage.enable')
-
-  function record(type: WriteOp['type'], key: string | null): void {
-    writeLog.push({ type, key, order: globalOrder, documentEpoch, epochOrder })
-    globalOrder += 1
-    epochOrder += 1
-  }
-
-  client.on('DOMStorage.domStorageItemAdded', (event) => {
-    if (event.storageId.isLocalStorage) record('setItem', event.key)
-  })
-  client.on('DOMStorage.domStorageItemUpdated', (event) => {
-    if (event.storageId.isLocalStorage) record('setItem', event.key)
-  })
-  client.on('DOMStorage.domStorageItemRemoved', (event) => {
-    if (event.storageId.isLocalStorage) record('removeItem', event.key)
-  })
-  client.on('DOMStorage.domStorageItemsCleared', (event) => {
-    if (event.storageId.isLocalStorage) record('clear', null)
-  })
-
-  // P1 Blocker 2 fix: forces delivery of any DOMStorage event the browser
-  // already sent on this SAME CDP session before this call resolves (CDP
-  // messages on one session are delivered strictly in send order), so
-  // callers can await this immediately before reload / before reading
-  // writeLog for assertions.
-  async function flushAudit(): Promise<void> {
-    await client.send('DOMStorage.enable')
-  }
-
-  return { context, page, writeLog, flushAudit }
+  return { context, page }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,12 +238,18 @@ test(
     })
     const baseURL = (testInfo.project.use.baseURL as string | undefined) ?? 'http://127.0.0.1:4173'
 
-    const { context, page, writeLog, flushAudit } = await createAuditedContext(browser, baseURL, {
+    const { context, page } = await createRuntimeLaneContext(browser, baseURL, {
       productionKey: PRODUCTION_KEY,
       productionSentinel: PRODUCTION_SENTINEL,
       e2eKey,
       e2eSeed,
     })
+    // CDP-based write-set audit (Issue #1283 repair iteration 1, P1 Blockers
+    // 1-3; extracted to ./write-set-audit-helper by Issue #1987): attached
+    // after the page exists but before the first navigation, so it never
+    // observes the storageState seeding above (empirically verified — see
+    // file header) and so it is in place before any app code can run.
+    const { writeLog, flushAudit } = await attachWriteSetAudit(context, page)
 
     try {
       // './' (not '/') — a leading '/' is an absolute path that REPLACES the
@@ -613,7 +554,7 @@ test(
       // AC7: the write-set operation-history audit records zero
       // setItem/removeItem/clear operations against the production key
       // across the entire scenario (including the reload).
-      const productionKeyOps = writeLog.filter((op) => op.key === PRODUCTION_KEY)
+      const productionKeyOps: WriteOp[] = writeLog.filter((op) => op.key === PRODUCTION_KEY)
       expect(
         productionKeyOps,
         'write-set operation history must record zero operations against the production key (AC7)',
@@ -730,12 +671,13 @@ test(
     })
     const baseURL = (testInfo.project.use.baseURL as string | undefined) ?? 'http://127.0.0.1:4173'
 
-    const { context, page, writeLog, flushAudit } = await createAuditedContext(browser, baseURL, {
+    const { context, page } = await createRuntimeLaneContext(browser, baseURL, {
       productionKey: PRODUCTION_KEY,
       productionSentinel: PRODUCTION_SENTINEL,
       e2eKey,
       e2eSeed,
     })
+    const { writeLog, flushAudit } = await attachWriteSetAudit(context, page)
 
     try {
       await page.goto('./')
