@@ -31,7 +31,7 @@ PR 番号が欠落していれば即座に `INSUFFICIENT_CONTEXT` を報告し�
 
 `.claude/skills/pr-review-judge/SKILL.md` の Procedure を実行する。手順内容を本 SubAgent 定義に複製しない（DRY）。
 
-### Allowed Paths Gate（destination: pr-review-judge references/allowed-paths-gate.md）
+### Allowed Paths Gate（正本移譲先: pr-review-judge references/allowed-paths-gate.md）
 
 Allowed Paths Gate の再計算手順（live linked issue 本文からの抽出・changed files 取得・
 fail_closed/indeterminate の扱い）は `pr-review-judge` skill の
