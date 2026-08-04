@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,12 @@ from typing import Any
 EXPECTED_SMOKE = "LOOP_AGY_SMOKE_OK"
 SMOKE_PROMPT = f"Return exactly: {EXPECTED_SMOKE}"
 SMOKE_TIMEOUT_SECONDS = 20
+# Issue #1941 fix_delta P1-3: the `leading_slash_is_literal` runtime probe is a
+# real, model-backed `agy -p` call — there is no mechanical way to prove it is
+# free. Rather than silently spending quota/cost on every capability
+# computation, the probe is skipped by default unless this env var is
+# explicitly set (never inferred, never on by default).
+AGY_RUNTIME_PROBE_COST_CONFIRM_ENV_VAR = "AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST"
 GROUNDING_PROBE_PROMPT = "Search for: latest reliable news and return exactly one source URL."
 GROUNDING_TIMEOUT_SECONDS = 40
 NONINTERACTIVE_FLAGS = ["-p", "--print", "--prompt"]
@@ -989,8 +997,16 @@ def _run(
     argv: list[str],
     cwd: Path | None = None,
     timeout: float | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """subprocess.run wrapper — shell=False is enforced."""
+    """subprocess.run wrapper — shell=False is enforced.
+
+    *env* defaults to `_minimal_agy_env()` (pass-through of the real user's
+    allowlisted env). Callers that need an isolated environment (e.g. the
+    model-backed runtime probe — Issue #1941 fix_delta P1-3) pass an explicit
+    override so global `~/.gemini/config/` hooks/permissions/skills/plugins
+    are never implicitly loaded by that probe.
+    """
     return subprocess.run(
         argv,
         cwd=str(cwd) if cwd is not None else None,
@@ -998,9 +1014,29 @@ def _run(
         text=True,
         check=False,
         timeout=timeout,
-        env=_minimal_agy_env(),
+        env=env if env is not None else _minimal_agy_env(),
         shell=False,
     )
+
+
+def _isolated_probe_env(isolated_home: Path) -> dict[str, str]:
+    """Return an env for a model-backed probe subprocess with HOME/XDG_*
+    overridden to a temp root (Issue #1941 fix_delta P1-3).
+
+    Starts from the same allowlisted `_minimal_agy_env()` base (never leaks
+    unrelated env values) but rebinds HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME/
+    XDG_STATE_HOME to *isolated_home* so the real user's global
+    `~/.gemini/config/` hooks/permissions/skills/plugins cannot be discovered
+    or loaded by this probe — only the specific read-only credential channel
+    (an isolated, empty HOME) is bound.
+    """
+    env = _minimal_agy_env()
+    isolated_home_str = str(isolated_home)
+    env["HOME"] = isolated_home_str
+    env["XDG_CONFIG_HOME"] = str(isolated_home / ".config")
+    env["XDG_CACHE_HOME"] = str(isolated_home / ".cache")
+    env["XDG_STATE_HOME"] = str(isolated_home / ".local" / "state")
+    return env
 
 
 def _run_version(agy_bin: str) -> subprocess.CompletedProcess[str]:
@@ -1182,12 +1218,55 @@ def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
     return result
 
 
+def _early_exit_capability_matrix(result: dict[str, Any], reason_code: str) -> dict[str, Any]:
+    """Build a full-shaped, fail-closed capability matrix for a controlled
+    early-exit path (Issue #1941 fix_delta P2-1).
+
+    Controlled early exits (binary missing, help failure, smoke/auth
+    failure, grounded-research failure, local-asset-contract failure)
+    previously returned before ever reaching the capability-computation
+    block, so `--require-capability` mode silently evaluated an effectively
+    empty matrix with no record of *why* each predicate was unavailable.
+    This builds the real matrix shape using whatever version evidence is
+    already available, with every predicate that has no probe evidence
+    recorded as `unavailable` and *reason_code* explaining which early-exit
+    condition prevented the probe from running.
+    """
+    version_result = result.get("version_evidence") or {
+        "status": "version_evidence_invalid",
+        "version": None,
+        "core": None,
+        "raw": None,
+    }
+    matrix = build_capability_matrix(
+        version_result=version_result,
+        disable_slash_probe=None,
+        leading_slash_probe=None,
+    )
+    for predicates in matrix.values():
+        for entry in predicates.values():
+            if entry.get("reason_code") == "probe_not_run":
+                entry["reason_code"] = reason_code
+    return matrix
+
+
+def _finalize_early_exit(result: dict[str, Any], compute_capabilities: bool, reason_code: str) -> dict[str, Any]:
+    """`_finalize()` wrapper for controlled early-exit return paths that also
+    requested `compute_capabilities=True` (Issue #1941 fix_delta P2-1)."""
+    if compute_capabilities:
+        result.setdefault("capabilities", _early_exit_capability_matrix(result, reason_code))
+        result.setdefault("capability_probes", {})
+        result.setdefault("capability_schema", CAPABILITY_MATRIX_SCHEMA_VERSION)
+    return _finalize(result)
+
+
 def run_preflight(
     *,
     validate_local_asset_contract: bool = False,
     live_serena: bool = False,
     mcp_config_path: Path | None = None,
     grounded_research: bool = False,
+    compute_capabilities: bool = False,
 ) -> dict[str, Any]:
     """Run version → help → smoke checks for agy binary.
 
@@ -1232,45 +1311,63 @@ def run_preflight(
     # (no agy output yet) and refined with smoke output evidence below.
     result["auth"] = _build_auth_diagnostics()
 
+    # Issue #1941 fix_delta P1-1: resolve the executable exactly once, at the
+    # very start, and bind every subsequent probe invocation (version / help /
+    # smoke / capability probes) to this single resolved absolute path. The
+    # binary-identity fingerprint (`binary_identity` / `binary_identity_after`)
+    # is measured against exactly what was executed — never re-resolved by
+    # name mid-run, which previously left a TOCTOU/PATH-swap gap where a probe
+    # could silently execute a different binary than the one fingerprinted.
+    _resolved_realpath: str | None = None
+    try:
+        which_result = shutil.which(agy_bin)
+        if which_result:
+            _resolved_realpath = os.path.realpath(which_result)
+    except Exception:
+        pass
+    exec_bin = _resolved_realpath if _resolved_realpath else agy_bin
+    result["agy"]["resolved_path"] = _mask_resolved_path(_resolved_realpath)
+
+    binary_identity_before = compute_binary_identity(_resolved_realpath)
+    result["binary_identity"] = binary_identity_before
+
     # Step 1: version check
     try:
-        version_proc = _run_version(agy_bin)
+        version_proc = _run_version(exec_bin)
     except FileNotFoundError:
         result["failure_reason"] = f"{agy_bin}: command not found"
         result["failure_class"] = "cli_missing"
         result["recovery_action"] = "install agy or set AGY_BIN to a valid path"
         result["warnings"].append(result["failure_reason"])
-        return result
+        return _finalize_early_exit(result, compute_capabilities, "cli_missing")
 
     if version_proc.returncode != 0:
         result["failure_reason"] = f"agy --version failed (exit {version_proc.returncode})"
         result["failure_class"] = "cli_missing"
         result["warnings"].append(result["failure_reason"])
-        return result
+        return _finalize_early_exit(result, compute_capabilities, "cli_missing")
 
     version_str = version_proc.stdout.strip() or None
     result["agy"]["version"] = version_str
-    try:
-        import shutil
-        resolved = shutil.which(agy_bin)
-        result["agy"]["resolved_path"] = _mask_resolved_path(resolved)
-    except Exception:
-        pass
+    combined_version_text = "\n".join(
+        part for part in [version_proc.stdout, version_proc.stderr] if part
+    )
+    result["version_evidence"] = parse_agy_version_string(combined_version_text)
 
     # Step 2: help check
     try:
-        help_proc = _run_help(agy_bin)
+        help_proc = _run_help(exec_bin)
     except FileNotFoundError:
         result["failure_reason"] = f"{agy_bin}: command not found"
         result["failure_class"] = "cli_missing"
         result["warnings"].append(result["failure_reason"])
-        return result
+        return _finalize_early_exit(result, compute_capabilities, "cli_missing")
 
     if help_proc.returncode != 0:
         result["failure_reason"] = "agy --help failed"
         result["failure_class"] = "cli_incompatible"
         result["warnings"].append(result["failure_reason"])
-        return result
+        return _finalize_early_exit(result, compute_capabilities, "help_unavailable")
 
     # Store redacted help output as live probe evidence.
     result["help"]["stdout_sample"] = _redact_output_sample(help_proc.stdout)
@@ -1283,20 +1380,21 @@ def run_preflight(
 
     has_noninteractive = any(noninteractive_flags.values())
     result["help"]["ok"] = has_noninteractive
-
     if not has_noninteractive:
-        result["failure_reason"] = "agy --help is missing noninteractive flags (-p / --print / --prompt)"
-        result["failure_class"] = "cli_incompatible"
-        result["recovery_action"] = "upgrade agy to a version that supports -p / --print / --prompt"
-        return result
+        # Issue #1941 In Scope: help non-listing is supporting evidence only.
+        # It is recorded as a warning, but the actual fixed-argv runtime smoke
+        # below is still the authority on whether -p/--print/--prompt work.
+        result["warnings"].append(
+            "agy --help does not list -p/--print/--prompt; deferring to runtime smoke (PR #1976 design)"
+        )
 
     # Step 3: smoke check
     try:
-        smoke = _run_smoke(agy_bin)
+        smoke = _run_smoke(exec_bin)
     except subprocess.TimeoutExpired:
         smoke = {
             "ok": False,
-            "argv": [agy_bin, "-p", SMOKE_PROMPT],
+            "argv": [exec_bin, "-p", SMOKE_PROMPT],
             "exit_code": None,
             "timed_out": True,
             "failure_reason": "agy smoke timed out",
@@ -1319,7 +1417,7 @@ def run_preflight(
         result["failure_reason"] = "agy smoke check timed out"
         result["failure_class"] = "client_subprocess_timeout"
         result["recovery_action"] = "check agy network connectivity or increase timeout"
-        return result
+        return _finalize_early_exit(result, compute_capabilities, "smoke_timed_out")
 
     if not smoke["ok"]:
         result["failure_reason"] = smoke.get("failure_reason") or "agy smoke check failed"
@@ -1327,16 +1425,29 @@ def run_preflight(
         result["recovery_action"] = (
             result["auth"].get("recovery_action") or "check agy configuration and rerun preflight"
         )
-        return result
+        _auth_failure_classes = {
+            "system_keyring_locked",
+            "system_keyring_access_denied",
+            "system_keyring_backend_missing",
+            "system_keyring_unavailable",
+            "google_sign_in_required",
+            "noninteractive_auth_prompt_required",
+            "agy_auth_unknown",
+        }
+        if result["failure_class"] in _auth_failure_classes:
+            early_exit_reason = "auth_blocked_probe"
+        else:
+            early_exit_reason = "smoke_check_failed"
+        return _finalize_early_exit(result, compute_capabilities, early_exit_reason)
 
     if grounded_research:
-        grounded_result = _run_grounded_research_smoke(agy_bin)
+        grounded_result = _run_grounded_research_smoke(exec_bin)
         result["grounded_research"]["check"] = grounded_result
         if not grounded_result["ok"]:
             result["failure_reason"] = grounded_result.get("failure_reason") or "agy grounded_research probe failed"
             result["failure_class"] = grounded_result.get("failure_class") or "agy_grounded_research_failed"
             result["recovery_action"] = "check AGY WebSearch/WebGrounding connectivity and rerun preflight"
-            return result
+            return _finalize_early_exit(result, compute_capabilities, "grounded_research_failed")
         result["grounded_research"]["ok"] = True
 
     if validate_local_asset_contract:
@@ -1375,10 +1486,64 @@ def run_preflight(
 
     if result.get("local_asset_research") is not None and not result["local_asset_research"]["ok"]:
         result["ok"] = False
-        return result
+        return _finalize_early_exit(result, compute_capabilities, "local_asset_contract_invalid")
+
+    if compute_capabilities:
+        capability_probes: dict[str, Any] = {}
+        try:
+            capability_probes["disable_slash_commands"] = _run_disable_slash_commands_probe(exec_bin)
+        except Exception as exc:  # pragma: no cover - defensive fail-closed path
+            result["warnings"].append(f"capability_probe_failed: {exc}")
+
+        # Issue #1941 fix_delta P1-3 / P1-7: the memoization cache lookup
+        # happens BEFORE the potentially costly, model-backed
+        # leading_slash_literal runtime probe runs -- a cache hit skips that
+        # probe entirely rather than always paying for it and discarding the
+        # result. The cache key binds BOTH the pre-run and
+        # pre-runtime-probe binary identities (not a single snapshot), so any
+        # drift between them always causes a cache miss/bypass instead of
+        # silently reusing a matrix computed against a different binary.
+        binary_identity_pre_runtime_probe = compute_binary_identity(_resolved_realpath)
+        config_digest = compute_config_digest()
+
+        def _compute_bundle() -> dict[str, Any]:
+            try:
+                if _runtime_probe_cost_confirmed():
+                    leading_slash_probe = _run_leading_slash_literal_probe(exec_bin)
+                else:
+                    # Issue #1941 fix_delta P1-3: there is no mechanical way to
+                    # prove `agy -p <prompt>` is free -- skip the real
+                    # model-backed call rather than silently spending
+                    # quota/cost, and record `unavailable` instead.
+                    leading_slash_probe = {"skipped": True, "skip_reason": "runtime_probe_cost_unconfirmed"}
+            except Exception as exc:  # pragma: no cover - defensive fail-closed path
+                result["warnings"].append(f"capability_probe_failed: {exc}")
+                leading_slash_probe = None
+            capability_probes["leading_slash_literal"] = leading_slash_probe
+            binary_identity_after = compute_binary_identity(_resolved_realpath)
+            matrix = build_capability_matrix(
+                version_result=result["version_evidence"],
+                disable_slash_probe=capability_probes.get("disable_slash_commands"),
+                leading_slash_probe=leading_slash_probe,
+                binary_identity_before=binary_identity_before,
+                binary_identity_after=binary_identity_after,
+            )
+            return {
+                "matrix": matrix,
+                "capability_probes": dict(capability_probes),
+                "binary_identity_after": binary_identity_after,
+            }
+
+        bundle = get_or_compute_capability_matrix(
+            binary_identity_before, binary_identity_pre_runtime_probe, config_digest, _compute_bundle
+        )
+        result["capabilities"] = bundle["matrix"]
+        result["capability_probes"] = bundle["capability_probes"]
+        result["binary_identity_after"] = bundle["binary_identity_after"]
+        result["capability_schema"] = CAPABILITY_MATRIX_SCHEMA_VERSION
 
     result["ok"] = True
-    return result
+    return _finalize(result)
 
 
 def build_evidence_envelope(
@@ -1506,6 +1671,799 @@ def render_evidence_markdown(envelope: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+
+# ---------------------------------------------------------------------------
+# Capability gate (Issue #1941 — agy_capability_matrix/v1)
+#
+# preflight_agy.py is the single implementation SSOT for capability detection.
+# Consumers (setup_check.py, run_gemini_headless.py) MUST consume this result
+# and MUST NOT re-implement a version parser or help-text parser of their own
+# (Issue #1941 AC3).
+#
+# Evidence priority (highest authority first): runtime_semantic_observation >
+# parser_acceptance > changelog > help > version. `help` and `version` are
+# supporting evidence only and never independently confirm `supported`
+# (Issue #1941 Outcome / AC2 / AC6).
+# ---------------------------------------------------------------------------
+
+CAPABILITY_MATRIX_SCHEMA_VERSION = "agy_capability_matrix/v1"
+
+CAPABILITY_STATUSES = frozenset(
+    {"supported", "unsupported", "unavailable", "inconclusive", "evidence_invalid"}
+)
+
+CAPABILITY_PREDICATES: dict[str, list[str]] = {
+    "headless_permission_policy": [
+        "persisted_settings_loaded",
+        "deny_precedence_enforced",
+        "ask_is_soft_denied_noninteractive",
+    ],
+    "hooks": [
+        "workspace_hooks_config_loaded",
+        "pre_invocation_hook_dispatch",
+        "pre_invocation_ephemeral_message",
+        "pre_invocation_injected_tool_call",
+        "pre_tool_use_verdict",
+        "post_tool_use_dispatch",
+        "post_tool_use_matcher_semantics",
+    ],
+    "disable_slash_commands": [
+        "parser_accepts_flag",
+        "leading_slash_is_literal",
+    ],
+}
+
+EVIDENCE_PRIORITY = (
+    "runtime_semantic_observation",
+    "parser_acceptance",
+    "changelog",
+    "help",
+    "version",
+)
+
+# google-antigravity/antigravity-cli#728 ("unknown injected step type: <nil>"
+# on agy 1.1.9) is open as of 2026-08-03. Until resolved, this predicate is
+# fixed `unsupported` regardless of version/help/runtime evidence (Issue #1941
+# In Scope).
+UPSTREAM_ANTIGRAVITY_CLI_728_OPEN = True
+
+# Minimum agy version at which the official CHANGELOG.md confirms a given
+# capability was introduced. Used only as supporting (changelog) evidence —
+# never sufficient on its own to claim `supported` for a predicate that
+# requires runtime/parser proof (Issue #1941 In Scope, AC6).
+_CHANGELOG_MIN_VERSION: dict[str, tuple[int, int, int]] = {
+    "persisted_settings_loaded": (1, 1, 4),
+    "parser_accepts_flag": (1, 1, 9),
+    "leading_slash_is_literal": (1, 1, 9),
+}
+
+_UNKNOWN_OPTION_RE = re.compile(
+    r"unknown (?:option|flag)|unrecognized (?:option|flag|arguments?)|invalid option",
+    re.IGNORECASE,
+)
+
+# Issue #1941 fix_delta P1-5: a narrow parser-rejection line shape requiring
+# BOTH a generic unknown-option/flag phrase AND the specific
+# `--disable-slash-commands` flag name on the same line -- a bare "invalid
+# option" string appearing alongside an unrelated warning must never be
+# treated as evidence that this specific flag was rejected.
+_PARSER_REJECTION_LINE_RE = re.compile(
+    r"(?:unknown|unrecognized|invalid)\s+(?:option|flag|arguments?)[^\n]*--disable-slash-commands"
+    r"|--disable-slash-commands[^\n]*(?:unknown|unrecognized|invalid)\s+(?:option|flag|arguments?)",
+    re.IGNORECASE,
+)
+
+# Matches `agy 1.1.9`, bare `1.1.9`, and prerelease/build metadata suffixes
+# such as `1.1.9-beta.1+build.5`. Anchored on a preceding start-of-line,
+# whitespace, or colon so it does not match version-looking substrings mid
+# word.
+_VERSION_LINE_RE = re.compile(
+    r"(?:^|[\s:])v?(?P<ver>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]*)?)(?:\s|$)"
+)
+
+
+def parse_agy_version_string(raw_text: str | None) -> dict[str, Any]:
+    """Parse `agy --version` (or combined stdout+stderr) output, fail-closed.
+
+    Returns ``{"status": "parsed" | "version_evidence_invalid", "version":
+    str | None, "core": (major, minor, patch) | None, "raw": raw_text}``.
+
+    Handles: ``agy 1.1.9``-shape, bare ``1.1.9``, prerelease/build metadata,
+    empty-stdout-with-version-in-stderr (caller passes combined text),
+    multi-line warning-prefixed output, malformed/locale-dependent text, and
+    exit-0-but-unparsable output. A parse failure is classified as
+    ``version_evidence_invalid`` — never as ``unsupported`` (Issue #1941 AC8).
+
+    Issue #1941 fix_delta P2-2: when the output contains more than one
+    version-shaped token (e.g. an unrelated dependency-version warning line
+    preceding the real ``agy <version>`` line), only a candidate anchored to
+    an explicit ``agy`` program-name context line is accepted; if zero or
+    more than one candidate line matches that anchor, the evidence is
+    ambiguous and rejected (``version_evidence_invalid``) rather than
+    guessing at the first match found.
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return {"status": "version_evidence_invalid", "version": None, "core": None, "raw": raw_text}
+
+    candidates: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = _VERSION_LINE_RE.search(line)
+        if match:
+            candidates.append((line, match.group("ver")))
+
+    if not candidates:
+        return {"status": "version_evidence_invalid", "version": None, "core": None, "raw": raw_text}
+
+    if len(candidates) == 1:
+        ver = candidates[0][1]
+    else:
+        agy_anchored = [(line, ver) for line, ver in candidates if re.search(r"\bagy\b", line, re.IGNORECASE)]
+        if len(agy_anchored) != 1:
+            return {"status": "version_evidence_invalid", "version": None, "core": None, "raw": raw_text}
+        ver = agy_anchored[0][1]
+
+    core_match = re.match(r"(\d+)\.(\d+)\.(\d+)", ver)
+    core = tuple(int(part) for part in core_match.groups()) if core_match else None
+    return {"status": "parsed", "version": ver, "core": core, "raw": raw_text}
+
+
+def compute_binary_identity(resolved_path: str | None) -> dict[str, Any]:
+    """Compute an identity fingerprint for the resolved agy binary.
+
+    Returns ``realpath``/``sha256``/``size``/``mtime_ns``/``platform``/``arch``.
+    A binary that cannot be resolved/read returns an all-``None`` identity
+    (except platform/arch) so drift detection can distinguish "no binary" from
+    "binary changed" (Issue #1941 AC6).
+    """
+    identity: dict[str, Any] = {
+        "realpath": None,
+        "sha256": None,
+        "size": None,
+        "mtime_ns": None,
+        "platform": platform.system(),
+        "arch": platform.machine(),
+    }
+    if not resolved_path:
+        return identity
+    try:
+        real = str(Path(resolved_path).resolve())
+        stat_result = os.stat(real)
+        digest = hashlib.sha256()
+        with open(real, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        identity["realpath"] = real
+        identity["sha256"] = digest.hexdigest()
+        identity["size"] = stat_result.st_size
+        identity["mtime_ns"] = stat_result.st_mtime_ns
+    except OSError:
+        pass
+    return identity
+
+
+def binary_identity_matches(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Return True iff two identity fingerprints denote the same binary."""
+    keys = ("realpath", "sha256", "size", "mtime_ns", "platform", "arch")
+    return all(before.get(key) == after.get(key) for key in keys)
+
+
+def _predicate_result(
+    status: str,
+    *,
+    reason_code: str,
+    evidence_source: str,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    if status not in CAPABILITY_STATUSES:
+        raise ValueError(f"invalid capability status: {status!r}")
+    if evidence_source not in EVIDENCE_PRIORITY:
+        raise ValueError(f"invalid evidence_source: {evidence_source!r}")
+    return {
+        "status": status,
+        "reason_code": reason_code,
+        "evidence_source": evidence_source,
+        "detail": detail,
+    }
+
+
+def classify_parser_acceptance(
+    exit_code: int | None,
+    stdout: str | None,
+    stderr: str | None,
+) -> dict[str, Any]:
+    """Classify parser acceptance/rejection of a fixed-argv flag probe.
+
+    Issue #1941 fix_delta P1-5: auth/quota/runtime evidence is checked FIRST
+    and always takes priority over a generic parser-error string match (an
+    unrelated config warning containing "invalid option" alongside an auth
+    error must never be misclassified as a parser rejection). A parser
+    rejection is only recognized when a non-zero exit code is combined with a
+    narrow parser-error line shape that names the specific
+    ``--disable-slash-commands`` flag -- a bare "unknown option"/"invalid
+    option" string anywhere in the output is never sufficient on its own
+    (Issue #1941 AC2 / fix_delta P1-5).
+    """
+    stdout_text = stdout or ""
+    stderr_text = stderr or ""
+    combined = "\n".join([stdout_text, stderr_text])
+    auth_signal = _classify_auth_signal(combined)
+
+    if auth_signal:
+        return {"accepted": None, "evidence_source": "auth_signal", "auth_signal": auth_signal}
+
+    parser_rejection_line = bool(_PARSER_REJECTION_LINE_RE.search(stderr_text)) or bool(
+        _PARSER_REJECTION_LINE_RE.search(stdout_text)
+    )
+
+    if exit_code not in (0, None) and parser_rejection_line:
+        return {"accepted": False, "evidence_source": "parser_rejection_line", "auth_signal": auth_signal}
+
+    if exit_code == 0:
+        return {"accepted": True, "evidence_source": "exit_zero", "auth_signal": auth_signal}
+
+    return {"accepted": None, "evidence_source": "exit_nonzero_unclassified", "auth_signal": auth_signal}
+
+
+def derive_parser_accepts_flag_status(parser_result: dict[str, Any]) -> dict[str, Any]:
+    """Derive the ``disable_slash_commands.parser_accepts_flag`` status.
+
+    ``--help`` flag visibility is intentionally NOT a parameter here: help
+    absence never blocks `supported`, and help presence never overrides a
+    parser rejection (Issue #1941 In Scope / PR #1976 design).
+    """
+    if parser_result["accepted"] is True:
+        return _predicate_result(
+            "supported", reason_code="parser_accepted_fixed_argv", evidence_source="parser_acceptance"
+        )
+    if parser_result["accepted"] is False:
+        return _predicate_result(
+            "unsupported", reason_code="parser_rejected_fixed_argv", evidence_source="parser_acceptance"
+        )
+    if parser_result.get("auth_signal"):
+        return _predicate_result(
+            "inconclusive", reason_code="auth_blocked_probe", evidence_source="parser_acceptance"
+        )
+    return _predicate_result(
+        "inconclusive",
+        reason_code="ambiguous_exit_without_rejection_evidence",
+        evidence_source="parser_acceptance",
+    )
+
+
+def _resolve_predicate(
+    group: str,
+    predicate: str,
+    *,
+    version_result: dict[str, Any],
+    disable_slash_probe: dict[str, Any] | None,
+    leading_slash_probe: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if predicate == "pre_invocation_injected_tool_call" and UPSTREAM_ANTIGRAVITY_CLI_728_OPEN:
+        return _predicate_result(
+            "unsupported",
+            reason_code="upstream_known_runtime_rejection",
+            evidence_source="runtime_semantic_observation",
+            detail="google-antigravity/antigravity-cli#728 open as of 2026-08-03",
+        )
+
+    if predicate == "parser_accepts_flag":
+        if disable_slash_probe is None:
+            return _predicate_result(
+                "unavailable", reason_code="probe_not_run", evidence_source="parser_acceptance"
+            )
+        parser_result = classify_parser_acceptance(
+            disable_slash_probe.get("exit_code"),
+            disable_slash_probe.get("stdout", ""),
+            disable_slash_probe.get("stderr", ""),
+        )
+        return derive_parser_accepts_flag_status(parser_result)
+
+    if predicate == "leading_slash_is_literal":
+        if leading_slash_probe is None:
+            return _predicate_result(
+                "unavailable", reason_code="probe_not_run", evidence_source="runtime_semantic_observation"
+            )
+        if leading_slash_probe.get("skipped"):
+            # Issue #1941 fix_delta P1-3: the real model-backed probe was
+            # skipped because its no-cost contract could not be mechanically
+            # confirmed. `unavailable` here is never a success/adoption
+            # signal on its own.
+            return _predicate_result(
+                "unavailable",
+                reason_code=leading_slash_probe.get("skip_reason") or "probe_cost_unconfirmed",
+                evidence_source="runtime_semantic_observation",
+            )
+        if leading_slash_probe.get("timed_out"):
+            return _predicate_result(
+                "inconclusive",
+                reason_code="client_subprocess_timeout",
+                evidence_source="runtime_semantic_observation",
+            )
+        if leading_slash_probe.get("literal_confirmed"):
+            return _predicate_result(
+                "supported",
+                reason_code="runtime_sentinel_echoed_literally",
+                evidence_source="runtime_semantic_observation",
+            )
+        if leading_slash_probe.get("expansion_detected"):
+            return _predicate_result(
+                "unsupported",
+                reason_code="slash_command_expansion_detected",
+                evidence_source="runtime_semantic_observation",
+            )
+        return _predicate_result(
+            "inconclusive", reason_code="ambiguous_runtime_output", evidence_source="runtime_semantic_observation"
+        )
+
+    if predicate == "persisted_settings_loaded":
+        if version_result.get("status") != "parsed":
+            return _predicate_result(
+                "evidence_invalid", reason_code="version_evidence_invalid", evidence_source="version"
+            )
+        version_core = version_result.get("core")
+        min_version = _CHANGELOG_MIN_VERSION["persisted_settings_loaded"]
+        if version_core and version_core >= min_version:
+            return _predicate_result(
+                "inconclusive",
+                reason_code="changelog_supported_pending_runtime_verification",
+                evidence_source="changelog",
+            )
+        return _predicate_result(
+            "unsupported", reason_code="below_changelog_min_version", evidence_source="changelog"
+        )
+
+    # Remaining hooks / headless_permission_policy predicates: actual live
+    # enforcement (does persisted settings.json really force deny? does the
+    # hook actually dispatch/inject/verdict/match?) is Issue #1979's
+    # responsibility, explicitly Out of Scope for #1941. We never claim
+    # `supported` without a runtime semantic observation this Issue does not
+    # perform for these predicates.
+    return _predicate_result(
+        "inconclusive",
+        reason_code="runtime_semantic_observation_deferred_to_1979",
+        evidence_source="changelog",
+        detail="live enforcement verification is Issue #1979's responsibility per #1941 Out of Scope",
+    )
+
+
+def get_capability_status(matrix: dict[str, Any], group: str, predicate: str) -> dict[str, Any]:
+    """Look up a single predicate result. Unknown capability names are never
+    `supported` — they resolve to `unavailable` (Issue #1941 AC2).
+    """
+    group_matrix = matrix.get(group) if isinstance(matrix, dict) else None
+    if not isinstance(group_matrix, dict) or predicate not in group_matrix:
+        return _predicate_result(
+            "unavailable", reason_code="unknown_capability", evidence_source="runtime_semantic_observation"
+        )
+    return group_matrix[predicate]
+
+
+def build_capability_matrix(
+    *,
+    version_result: dict[str, Any],
+    disable_slash_probe: dict[str, Any] | None = None,
+    leading_slash_probe: dict[str, Any] | None = None,
+    binary_identity_before: dict[str, Any] | None = None,
+    binary_identity_after: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the full `agy_capability_matrix/v1` predicate matrix.
+
+    If both binary identities are supplied and they diverge, every predicate
+    is forced to `evidence_invalid` (binary identity drift — Issue #1941 AC6);
+    no partial trust is given to probes gathered against a different binary.
+    """
+    drift = False
+    if binary_identity_before is not None and binary_identity_after is not None:
+        drift = not binary_identity_matches(binary_identity_before, binary_identity_after)
+
+    matrix: dict[str, Any] = {}
+    for group, predicates in CAPABILITY_PREDICATES.items():
+        matrix[group] = {}
+        for predicate in predicates:
+            if drift:
+                matrix[group][predicate] = _predicate_result(
+                    "evidence_invalid",
+                    reason_code="binary_identity_drift",
+                    evidence_source="runtime_semantic_observation",
+                )
+                continue
+            matrix[group][predicate] = _resolve_predicate(
+                group,
+                predicate,
+                version_result=version_result,
+                disable_slash_probe=disable_slash_probe,
+                leading_slash_probe=leading_slash_probe,
+            )
+    return matrix
+
+
+_CAPABILITY_MEMO_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+
+def compute_config_digest(repo_root: Path | None = None) -> str:
+    """Digest of the config files relevant to hooks/permission capability
+    memoization. Never itself part of persistent cache — only used as an
+    in-process memoization key component (Issue #1941 AC9).
+    """
+    root = repo_root or _repo_root()
+    relevant_paths = [
+        root / ".claude" / "settings.json",
+        root / ".agents" / "mcp_config.json",
+        # Issue #1941 fix_delta P1-7: the digest previously omitted the real
+        # hooks config file location(s) entirely, so a hooks config change
+        # never invalidated a cached capability matrix. Repo-root workspace
+        # hooks config (may not exist for a normal run -- missing is digested
+        # deterministically the same as the other optional inputs above).
+        root / ".agents" / "hooks.json",
+    ]
+    home = os.environ.get("HOME")
+    if home:
+        # Global hooks location AGY actually consults (see
+        # agy_tool_provenance.py's canonical_hooks_dir /
+        # `<HOME>/.gemini/config/hooks.json`).
+        relevant_paths.append(Path(home) / ".gemini" / "config" / "hooks.json")
+    digest = hashlib.sha256()
+    for path in relevant_paths:
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"\x00missing\x00")
+    return digest.hexdigest()
+
+
+def _identity_key_tuple(binary_identity: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        binary_identity.get("realpath"),
+        binary_identity.get("sha256"),
+        binary_identity.get("size"),
+        binary_identity.get("mtime_ns"),
+        binary_identity.get("platform"),
+        binary_identity.get("arch"),
+    )
+
+
+def _capability_cache_key(
+    binary_identity_before: dict[str, Any],
+    binary_identity_check: dict[str, Any],
+    config_digest: str,
+) -> tuple[Any, ...]:
+    """Cache key bound to BOTH identity snapshots (Issue #1941 fix_delta P1-7).
+
+    Binding to a single identity snapshot allowed a cache entry computed for
+    binary B (from an earlier, unrelated run) to be silently reused for a run
+    in which the binary drifted mid-run from A to B, since `compute_fn()`
+    would never be called at all in that case -- bypassing the
+    binary-identity-drift check entirely. Requiring BOTH the pre-run and
+    pre-runtime-probe identities to match means any drift between them
+    produces a key that cannot collide with a legitimate (non-drifted) prior
+    run's key, guaranteeing `compute_fn()` always runs when drift occurred.
+    """
+    return (
+        _identity_key_tuple(binary_identity_before),
+        _identity_key_tuple(binary_identity_check),
+        config_digest,
+    )
+
+
+def get_or_compute_capability_matrix(
+    binary_identity_before: dict[str, Any],
+    binary_identity_check: dict[str, Any],
+    config_digest: str,
+    compute_fn: Any,
+) -> dict[str, Any]:
+    """In-process-only memoization for capability probe evidence bundles.
+
+    There is intentionally no persistent (cross-process) cache — the module
+    dict lives only for the current process lifetime, so a fresh process
+    always re-probes (Issue #1941 AC9 / Out of Scope: no persistent cache).
+
+    *compute_fn* is expected to return the full evidence bundle for the run
+    (matrix + capability_probes + binary_identity_after), not just the
+    matrix, so a cache hit can never leave `capabilities` and
+    `capability_probes` mutually inconsistent (Issue #1941 fix_delta P1-7).
+    """
+    key = _capability_cache_key(binary_identity_before, binary_identity_check, config_digest)
+    if key in _CAPABILITY_MEMO_CACHE:
+        return _CAPABILITY_MEMO_CACHE[key]
+    result = compute_fn()
+    _CAPABILITY_MEMO_CACHE[key] = result
+    return result
+
+
+def _run_disable_slash_commands_probe(agy_bin: str) -> dict[str, Any]:
+    """Fixed-argv parser acceptance probe for ``--disable-slash-commands``.
+
+    Deliberately combined with ``--help`` so the probe never triggers a real
+    (possibly costly) generation call — only parser-level accept/reject
+    evidence is needed for this predicate.
+    """
+    argv = [agy_bin, "--disable-slash-commands", "--help"]
+    probe: dict[str, Any] = {
+        "argv": argv,
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+    }
+    try:
+        proc = _run(argv, timeout=SMOKE_TIMEOUT_SECONDS)
+        probe["exit_code"] = proc.returncode
+        probe["stdout"] = proc.stdout or ""
+        probe["stderr"] = proc.stderr or ""
+    except subprocess.TimeoutExpired:
+        probe["timed_out"] = True
+    except FileNotFoundError:
+        probe["exit_code"] = None
+    return probe
+
+
+_SLASH_LITERAL_PROMPT_SUFFIX = "/nonexistent-loop-agy-capability-probe"
+
+_SLASH_EXPANSION_ERROR_RE = re.compile(
+    r"unknown command|no such command|unrecognized command", re.IGNORECASE
+)
+
+
+def _runtime_probe_cost_confirmed() -> bool:
+    """Return True iff the caller explicitly confirmed acceptance of the real
+    (model-backed) cost incurred by the leading-slash-literal runtime probe.
+
+    There is no mechanical way to prove `agy -p <prompt>` is free -- it is a
+    real model-backed call. Issue #1941 fix_delta P1-3: rather than silently
+    spending quota/cost on every capability computation, this probe is
+    skipped by default unless the caller sets
+    ``AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST=1`` (never inferred).
+    """
+    return os.environ.get(AGY_RUNTIME_PROBE_COST_CONFIRM_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _run_leading_slash_literal_probe(agy_bin: str) -> dict[str, Any]:
+    """Isolated runtime smoke probing whether a leading ``/`` in a print-mode
+    prompt is treated as a literal character (expected) rather than expanded
+    as a slash-command (the known 1.1.9 print-mode expansion issue).
+
+    Issue #1941 fix_delta:
+      P1-2: runs the exact production argv
+      ``agy --disable-slash-commands -p <prompt>`` (not bare ``-p``), and
+      classifies expansion-error evidence ahead of sentinel-presence when
+      both appear in the combined output -- a "did you mean" style
+      diagnostic can legitimately echo the sentinel text alongside an
+      unknown-command rejection.
+      P1-3: isolates HOME/XDG_* (not just cwd) so this model-backed probe
+      never discovers or loads the real user's global
+      ``~/.gemini/config/`` hooks/permissions/skills/plugins. Caller is
+      responsible for the cost-confirmation gate (this function always
+      actually invokes the subprocess when called).
+    """
+    prompt = f"{_SLASH_LITERAL_PROMPT_SUFFIX} {SMOKE_PROMPT}"
+    argv = [agy_bin, "--disable-slash-commands", "-p", prompt]
+    probe: dict[str, Any] = {
+        "argv": argv,
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "literal_confirmed": False,
+        "expansion_detected": False,
+    }
+    with tempfile.TemporaryDirectory(prefix="agy-preflight-slash-") as temp_dir:
+        temp_root = Path(temp_dir)
+        isolated_home = temp_root / "isolated-home"
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        isolated_cwd = temp_root / "cwd"
+        isolated_cwd.mkdir(parents=True, exist_ok=True)
+        try:
+            proc = _run(
+                argv,
+                cwd=isolated_cwd,
+                timeout=SMOKE_TIMEOUT_SECONDS,
+                env=_isolated_probe_env(isolated_home),
+            )
+            probe["exit_code"] = proc.returncode
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            probe["stdout"] = stdout
+            probe["stderr"] = stderr
+            combined = stdout + "\n" + stderr
+            # P1-2: expansion-error evidence takes priority over sentinel
+            # presence -- a combined output containing both must never be
+            # misclassified as `literal_confirmed`.
+            if _SLASH_EXPANSION_ERROR_RE.search(combined):
+                probe["expansion_detected"] = True
+            elif proc.returncode == 0 and EXPECTED_SMOKE in stdout:
+                probe["literal_confirmed"] = True
+        except subprocess.TimeoutExpired:
+            probe["timed_out"] = True
+        except FileNotFoundError:
+            probe["exit_code"] = None
+    return probe
+
+
+
+def _argv_shape(argv: list[str]) -> dict[str, Any]:
+    return {"flags": [tok for tok in argv if tok.startswith("-")], "arg_count": len(argv)}
+
+
+def _prompt_digest(prompt: str | None) -> dict[str, Any]:
+    if not prompt:
+        return {"kind": "none", "sha256": None, "byte_length": 0}
+    encoded = prompt.encode("utf-8")
+    return {
+        "kind": "fixed_sentinel",
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "byte_length": len(encoded),
+    }
+
+
+def _sanitize_probe_in_place(probe: dict[str, Any] | None, agy_bin: str) -> None:
+    if not isinstance(probe, dict):
+        return
+    argv = probe.pop("argv", None)
+    if not isinstance(argv, list):
+        return
+    probe["argv_shape"] = _argv_shape(argv)
+    prompt_text = next(
+        (tok for tok in argv if tok != agy_bin and not tok.startswith("-")),
+        None,
+    )
+    probe["prompt"] = _prompt_digest(prompt_text)
+    # never persist raw stdout/stderr beyond the already-redacted samples.
+    probe.pop("stdout", None)
+    probe.pop("stderr", None)
+
+
+def _sanitize_for_artifact(result: dict[str, Any]) -> dict[str, Any]:
+    """Return a JSON-safe deep copy of *result* safe to persist to disk AND
+    safe to return to the caller / print via ``--json`` / write via
+    ``--output-file`` (Issue #1941 fix_delta P1-4: this is the single
+    sanitizer every external-facing output surface must route through —
+    return value, ``--json``, ``--output-file``, and the artifact file — so
+    none of them can independently leak evidence the others redact).
+
+    Never persists prompt text, raw credential paths, absolute HOME,
+    un-redacted stderr, or an unredacted combined-output ``version_evidence
+    .raw`` / ``agy.version`` sample — only ``argv_shape.flags`` and
+    ``prompt.sha256``/``prompt.byte_length`` for probes, and a normalized
+    version plus a redacted bounded sample for the version fields
+    (Issue #1941 AC7 / fix_delta P1-4).
+    """
+    sanitized = json.loads(json.dumps(result, default=str))
+    agy_bin = (sanitized.get("agy") or {}).get("bin") or "agy"
+
+    _sanitize_probe_in_place(sanitized.get("smoke"), agy_bin)
+    grounded_check = (sanitized.get("grounded_research") or {}).get("check")
+    _sanitize_probe_in_place(grounded_check, agy_bin)
+    capability_probes = sanitized.get("capability_probes")
+    if isinstance(capability_probes, dict):
+        for probe in capability_probes.values():
+            _sanitize_probe_in_place(probe, agy_bin)
+
+    # P1-4: `version_evidence.raw` previously stored the full, unredacted
+    # combined `agy --version` stdout+stderr verbatim -- a warning line in
+    # that output could contain an auth URL or credential path. Replace it
+    # with the same bounded/redacted sample used everywhere else.
+    version_evidence = sanitized.get("version_evidence")
+    if isinstance(version_evidence, dict) and version_evidence.get("raw") is not None:
+        version_evidence["raw"] = _redact_output_sample(str(version_evidence["raw"]))
+
+    # P1-4: `agy.version` previously stored the raw first-line stdout
+    # verbatim (same leakage risk as version_evidence.raw). Limit it to the
+    # normalized, already-validated value from `version_evidence.version`
+    # plus a separate redacted bounded sample of the raw text -- never the
+    # raw value itself.
+    agy_info = sanitized.get("agy")
+    if isinstance(agy_info, dict) and agy_info.get("version") is not None:
+        raw_version_value = str(agy_info["version"])
+        normalized_version = (
+            version_evidence.get("version") if isinstance(version_evidence, dict) else None
+        )
+        agy_info["version"] = normalized_version
+        agy_info["version_raw_sample"] = _redact_output_sample(raw_version_value)
+
+    home = os.environ.get("HOME")
+    if home:
+        def _scrub_home(value: Any) -> Any:
+            if isinstance(value, str):
+                return value.replace(home, "$HOME")
+            if isinstance(value, dict):
+                return {k: _scrub_home(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_scrub_home(v) for v in value]
+            return value
+
+        sanitized = _scrub_home(sanitized)
+
+    return sanitized
+
+
+def _artifact_output_dir(repo_root: Path | None = None) -> Path:
+    override = os.environ.get("AGY_PREFLIGHT_ARTIFACT_DIR")
+    if override:
+        return Path(override)
+    root = repo_root or _repo_root()
+    return root / ".claude" / "tmp"
+
+
+def write_sanitized_artifact(
+    result: dict[str, Any],
+    *,
+    repo_root: Path | None = None,
+    sanitized: dict[str, Any] | None = None,
+) -> Path:
+    """Write a sanitized JSON artifact for a controlled-exit `run_preflight`
+    result. This is the single finalizer path used by every controlled exit
+    (binary missing, help failure, auth unavailable, cost unconfirmed,
+    timeout, cleanup failure) — Issue #1941 AC7.
+
+    *sanitized* lets callers that already computed the sanitized payload
+    (e.g. `_finalize`) reuse it instead of re-running `_sanitize_for_artifact`
+    a second time.
+    """
+    out_dir = _artifact_output_dir(repo_root)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    out_path = out_dir / f"agy_preflight_result_{timestamp}_{os.getpid()}.json"
+    payload = sanitized if sanitized is not None else _sanitize_for_artifact(result)
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return out_path
+
+
+def _finalize(result: dict[str, Any]) -> dict[str, Any]:
+    """Single finalizer invoked on every `run_preflight` return path.
+
+    Issue #1941 fix_delta P1-4: sanitizes *result* FIRST and returns the
+    sanitized dict as `run_preflight()`'s actual return value -- previously
+    only the artifact file was sanitized, while the in-memory return value
+    (and therefore `--json` / `--output-file`, which both serialize that same
+    return value in `main()`) still carried raw capability-probe
+    argv/stdout/stderr and an unredacted `version_evidence.raw`.
+
+    Always attempts to write the sanitized artifact; a write failure is
+    recorded as a warning but never raises (cleanup failure is itself a
+    controlled-exit path per Issue #1941 In Scope).
+    """
+    sanitized = _sanitize_for_artifact(result)
+    try:
+        artifact_path = write_sanitized_artifact(result, sanitized=sanitized)
+        sanitized["artifact_path"] = str(artifact_path)
+    except OSError as exc:
+        sanitized.setdefault("warnings", []).append(f"artifact_write_failed: {exc}")
+        sanitized["artifact_path"] = None
+    return sanitized
+
+
+def compute_require_capability_exit_code(matrix: dict[str, Any], requested: list[str]) -> int:
+    """Derive the `--require-capability` exit code from the capability matrix.
+
+    0 = every requested predicate is `supported`.
+    1 = any requested predicate is `unsupported` / `inconclusive` / `evidence_invalid`.
+    77 = no `1`-triggering predicate remains, but at least one requested
+         predicate is still `unavailable` (Issue #1941 AC4). 77 is never a
+         success/close/merge signal on its own — callers must not treat it as
+         PASS.
+    """
+    statuses: list[str] = []
+    for dotted in requested:
+        group, _, predicate = dotted.partition(".")
+        status_obj = get_capability_status(matrix, group, predicate)
+        statuses.append(status_obj.get("status", "unavailable"))
+
+    if statuses and all(status == "supported" for status in statuses):
+        return 0
+    if any(status in {"unsupported", "inconclusive", "evidence_invalid"} for status in statuses):
+        return 1
+    return 77
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for CLI invocation.
 
@@ -1575,13 +2533,32 @@ def main(argv: list[str] | None = None) -> int:
         default=1266,
         help="Issue number to record in the rendered evidence doc.",
     )
+    parser.add_argument(
+        "--require-capability",
+        required=False,
+        default=None,
+        help=(
+            "Comma-separated capability.predicate list (e.g. "
+            "disable_slash_commands.parser_accepts_flag). When given, exit code is "
+            "0=all supported / 1=any unsupported|inconclusive|evidence_invalid / "
+            "77=only unavailable remains (never a success signal). Default invocation "
+            "(flag omitted) is unaffected and keeps the existing ok-boolean exit 0/1."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    requested_capabilities = (
+        [item.strip() for item in args.require_capability.split(",") if item.strip()]
+        if args.require_capability
+        else None
+    )
 
     result = run_preflight(
         validate_local_asset_contract=args.local_asset_research,
         live_serena=args.live_serena,
         mcp_config_path=args.mcp_config,
         grounded_research=args.grounded_research,
+        compute_capabilities=bool(requested_capabilities),
     )
 
     if args.json_stdout:
@@ -1607,6 +2584,14 @@ def main(argv: list[str] | None = None) -> int:
         markdown = render_evidence_markdown(envelope)
         args.render_evidence_doc.parent.mkdir(parents=True, exist_ok=True)
         args.render_evidence_doc.write_text(markdown, encoding="utf-8")
+
+    if requested_capabilities:
+        # Issue #1941 AC4: --require-capability mode derives its own exit
+        # code taxonomy from the capability matrix; it never reuses the
+        # default ok-boolean exit 0/1 semantics.
+        return compute_require_capability_exit_code(
+            result.get("capabilities") or {}, requested_capabilities
+        )
 
     return 0 if result["ok"] else 1
 
