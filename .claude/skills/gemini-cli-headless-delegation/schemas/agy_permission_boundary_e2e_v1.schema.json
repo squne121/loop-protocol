@@ -4,96 +4,491 @@
   "title": "AGY permission-boundary E2E evidence v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "generated_at", "runner", "artifact", "matrix", "attempts", "diagnostic_ledger", "fallback", "failure_taxonomy", "cleanup", "secret_scan"],
+  "required": [
+    "schema",
+    "generated_at",
+    "runner",
+    "artifact",
+    "matrix",
+    "attempts",
+    "diagnostic_ledger",
+    "fallback",
+    "failure_taxonomy",
+    "cleanup",
+    "secret_scan"
+  ],
   "properties": {
-    "schema": {"const": "agy_permission_boundary_e2e/v1"},
-    "generated_at": {"type": "string", "format": "date-time"},
+    "schema": {
+      "const": "agy_permission_boundary_e2e/v1"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
     "runner": {
-      "type": "object", "additionalProperties": false,
-      "required": ["identity", "exit_code", "actual_agy_executed", "identity_verified", "executable_ref", "executable_version", "binary_digest", "child_returncode", "artifact_digest"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "exit_code",
+        "actual_agy_executed",
+        "identity_verified",
+        "executable_ref",
+        "executable_version",
+        "binary_digest",
+        "child_returncode",
+        "artifact_digest"
+      ],
       "properties": {
-        "identity": {"const": "run_agy_permission_boundary_e2e"},
-        "exit_code": {"enum": [0, 1, 77]},
-        "actual_agy_executed": {"type": "boolean"},
-        "identity_verified": {"type": "boolean"},
-        "executable_ref": {"type": "string", "pattern": "^[^/]+$"},
-        "executable_version": {"type": "string", "minLength": 1},
-        "binary_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-        "child_returncode": {"type": ["integer", "null"]},
-        "artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        "identity": {
+          "const": "run_agy_permission_boundary_e2e"
+        },
+        "exit_code": {
+          "enum": [
+            0,
+            1,
+            77
+          ]
+        },
+        "actual_agy_executed": {
+          "type": "boolean"
+        },
+        "identity_verified": {
+          "type": "boolean"
+        },
+        "executable_ref": {
+          "type": "string",
+          "pattern": "^[^/]+$"
+        },
+        "executable_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "binary_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "binary_identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "realpath",
+            "sha256",
+            "size",
+            "mtime_ns",
+            "platform",
+            "arch"
+          ],
+          "properties": {
+            "realpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sha256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "size": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "mtime_ns": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "platform": {
+              "type": "string"
+            },
+            "arch": {
+              "type": "string"
+            }
+          }
+        },
+        "child_returncode": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "artifact_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
       }
     },
     "artifact": {
-      "type": "object", "additionalProperties": false,
-      "required": ["digest"],
-      "properties": {"digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "digest"
+      ],
+      "properties": {
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
     },
     "matrix": {
-      "type": "object", "additionalProperties": false,
-      "required": ["profile", "capabilities"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "capabilities"
+      ],
       "properties": {
-        "profile": {"type": "string"},
-        "capabilities": {"type": "array", "minItems": 4, "uniqueItems": true, "items": {"enum": ["command", "write", "read", "network"]}}
+        "profile": {
+          "type": "string"
+        },
+        "capabilities": {
+          "type": "array",
+          "minItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "command",
+              "write",
+              "read",
+              "network"
+            ]
+          }
+        },
+        "tool_inventory_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
       }
     },
-    "attempts": {"type": "array", "minItems": 4, "items": {"$ref": "#/$defs/attempt"}},
+    "attempts": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "$ref": "#/$defs/attempt"
+      }
+    },
     "diagnostic_ledger": {
-      "type": "object", "additionalProperties": false,
-      "required": ["pre_invocation_hook_started", "pre_invocation_context_accepted", "injected_step_count", "enforcement_event_count", "pre_tool_use_event_count", "post_tool_use_event_count", "raw_payload_persisted"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pre_invocation_hook_started",
+        "pre_invocation_context_accepted",
+        "injected_step_count",
+        "enforcement_event_count",
+        "pre_tool_use_event_count",
+        "post_tool_use_event_count",
+        "raw_payload_persisted"
+      ],
       "properties": {
-        "pre_invocation_hook_started": {"type": "boolean"},
-        "pre_invocation_context_accepted": {"type": "boolean"},
-        "injected_step_count": {"type": "integer", "minimum": 0, "maximum": 4},
-        "enforcement_event_count": {"type": "integer", "minimum": 0},
-        "pre_tool_use_event_count": {"type": "integer", "minimum": 0},
-        "post_tool_use_event_count": {"type": "integer", "minimum": 0},
-        "raw_payload_persisted": {"const": false}
+        "pre_invocation_hook_started": {
+          "type": "boolean"
+        },
+        "pre_invocation_context_accepted": {
+          "type": "boolean"
+        },
+        "injected_step_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "enforcement_event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pre_tool_use_event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "post_tool_use_event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "raw_payload_persisted": {
+          "const": false
+        }
       }
     },
-    "fallback": {"type": "object", "additionalProperties": false, "required": ["used"], "properties": {"used": {"const": false}}},
+    "fallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "used"
+      ],
+      "properties": {
+        "used": {
+          "const": false
+        }
+      }
+    },
     "failure_taxonomy": {
-      "type": "object", "additionalProperties": false,
-      "required": ["class", "completion", "retry"],
-      "properties": {"class": {"type": "string"}, "completion": {"type": "boolean"}, "retry": {"type": "string"}}
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "completion",
+        "retry"
+      ],
+      "properties": {
+        "class": {
+          "type": "string"
+        },
+        "completion": {
+          "type": "boolean"
+        },
+        "retry": {
+          "type": "string"
+        }
+      }
     },
     "cleanup": {
-      "type": "object", "additionalProperties": false,
-      "required": ["temporary_processes_removed", "loopback_servers_stopped"],
-      "properties": {"temporary_processes_removed": {"type": "boolean"}, "loopback_servers_stopped": {"type": "boolean"}}
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "temporary_processes_removed",
+        "loopback_servers_stopped"
+      ],
+      "properties": {
+        "temporary_processes_removed": {
+          "type": "boolean"
+        },
+        "loopback_servers_stopped": {
+          "type": "boolean"
+        },
+        "process_group_isolated": {
+          "type": "boolean",
+          "description": "Issue #1979 AC7: distinct from directory cleanup -- whether the invocation ran in its own OS process group."
+        },
+        "descendant_processes_absent": {
+          "type": "boolean",
+          "description": "Issue #1979 AC7: whether no process remains in that process group after the run."
+        }
+      }
     },
-    "secret_scan": {"type": "object", "additionalProperties": false, "required": ["clean"], "properties": {"clean": {"const": true}}}
+    "secret_scan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clean"
+      ],
+      "properties": {
+        "clean": {
+          "const": true
+        }
+      }
+    },
+    "capability_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bootstrap_predicate",
+        "predicate_kind",
+        "status",
+        "reason_code",
+        "evidence_source"
+      ],
+      "properties": {
+        "bootstrap_predicate": {
+          "type": "string",
+          "minLength": 1
+        },
+        "predicate_kind": {
+          "enum": [
+            "bootstrap_prerequisite",
+            "claim_under_test"
+          ]
+        },
+        "status": {
+          "enum": [
+            "supported",
+            "unsupported",
+            "unavailable",
+            "inconclusive",
+            "evidence_invalid"
+          ]
+        },
+        "reason_code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_source": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "completion_blocker",
+        "reason"
+      ],
+      "properties": {
+        "status": {
+          "const": "unsupported_by_design"
+        },
+        "completion_blocker": {
+          "const": false
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "pairing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "counterpart_role",
+        "counterpart_digest",
+        "bound"
+      ],
+      "properties": {
+        "role": {
+          "enum": [
+            "allow",
+            "deny",
+            "n/a"
+          ]
+        },
+        "counterpart_role": {
+          "enum": [
+            "allow",
+            "deny",
+            "n/a"
+          ]
+        },
+        "counterpart_digest": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bound": {
+          "type": "boolean"
+        }
+      }
+    }
   },
   "$defs": {
     "attempt": {
-      "type": "object", "additionalProperties": false,
-      "required": ["correlation", "expectation", "predicates"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "correlation",
+        "expectation",
+        "predicates"
+      ],
       "properties": {
         "correlation": {
-          "type": "object", "additionalProperties": false,
-          "required": ["run_id", "conversation_id", "step_index", "tool_name", "args_digest", "profile", "capability", "canary_id"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "run_id",
+            "conversation_id",
+            "step_index",
+            "tool_name",
+            "args_digest",
+            "profile",
+            "capability",
+            "canary_id"
+          ],
           "properties": {
-            "run_id": {"type": "string", "minLength": 1, "description": "Recorded by the parent runner."},
-            "conversation_id": {"type": "string", "minLength": 1, "description": "Captured from live hook payload and validated by parent attempt correlation."},
-            "step_index": {"type": "integer", "minimum": 0},
-            "tool_name": {"type": "string", "minLength": 1},
-            "args_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-            "profile": {"type": "string", "minLength": 1},
-            "capability": {"enum": ["command", "write", "read", "network"]},
-            "canary_id": {"type": "string", "minLength": 1}
+            "run_id": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Recorded by the parent runner."
+            },
+            "conversation_id": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Captured from live hook payload and validated by parent attempt correlation."
+            },
+            "step_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "tool_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "args_digest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "profile": {
+              "type": "string",
+              "minLength": 1
+            },
+            "capability": {
+              "enum": [
+                "command",
+                "write",
+                "read",
+                "network"
+              ]
+            },
+            "canary_id": {
+              "type": "string",
+              "minLength": 1
+            }
           }
         },
-        "expectation": {"enum": ["allow", "deny"]},
+        "expectation": {
+          "enum": [
+            "allow",
+            "deny"
+          ]
+        },
         "predicates": {
-          "type": "object", "additionalProperties": false,
-          "required": ["deterministic_attempt_present", "pre_tool_use_present", "decision_matches_expectation", "post_tool_use_matches_expectation", "side_effect_matches_expectation", "same_attempt_correlation", "logger_failure_absent"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "deterministic_attempt_present",
+            "pre_tool_use_present",
+            "decision_matches_expectation",
+            "post_tool_use_matches_expectation",
+            "side_effect_matches_expectation",
+            "same_attempt_correlation",
+            "logger_failure_absent"
+          ],
           "properties": {
-            "deterministic_attempt_present": {"type": "boolean"},
-            "pre_tool_use_present": {"type": "boolean"},
-            "decision_matches_expectation": {"type": "boolean"},
-            "post_tool_use_matches_expectation": {"type": "boolean"},
-            "side_effect_matches_expectation": {"type": "boolean"},
-            "same_attempt_correlation": {"type": "boolean"},
-            "logger_failure_absent": {"type": "boolean"}
+            "deterministic_attempt_present": {
+              "type": "boolean"
+            },
+            "pre_tool_use_present": {
+              "type": "boolean"
+            },
+            "decision_matches_expectation": {
+              "type": "boolean"
+            },
+            "post_tool_use_matches_expectation": {
+              "type": "boolean"
+            },
+            "side_effect_matches_expectation": {
+              "type": "boolean"
+            },
+            "same_attempt_correlation": {
+              "type": "boolean"
+            },
+            "logger_failure_absent": {
+              "type": "boolean"
+            }
           }
         }
       }
