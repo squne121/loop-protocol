@@ -460,6 +460,79 @@ controller（`src/ui/phaseScreens.ts`）を実装した。この実装により�
   `test-results` artifact の `*-actual.png` を最終 baseline として採用する運用を
   適用する。
 
+### running-hud-overlay-legacy-current の canvas mask capture defect 修正（Issue #1980、明示）
+
+owner レビュー（issuecomment-5172060362、REQUEST_CHANGES / P0 blocker）により、PR #1925
+（コミット `968af36e`）が Canvas と `.battle-ui-layer` を同一 `.battle-stage__viewport` 内へ
+移した結果、両者がほぼ同一の bounding box を持つようになり、`expectDomOverlayScreenshot()`
+が適用していた Playwright `mask: [page.locator('canvas')]` が capture root 全面（HUD を含む）
+を単色で覆ってしまう capture defect が判明した（旧 baseline は単色ピクセル比率 99.8% 以上）。
+
+- **判断根拠**: HUD を実際に検証できない baseline は VRT として無意味であり、意図しない退行では
+  なく capture 方式そのものの欠陥である。修正方針は、既存の `[data-visual-mask='true']` opt-in
+  visibility 除外パターンを踏襲し、canvas を Playwright `mask` ではなく CSS `visibility: hidden`
+  （`data-visual-canvas-hidden` 属性 + `tests/e2e/visual.freeze.css`）で除外する方式へ変更した
+  （§4 checklist 適用。capture root を `[data-combat-hud]` に切り替える案は不採用 — Out of
+  Scope、別 Issue 判断）。
+- **capture policy 変更**: `tests/e2e/visual-utils.ts` の `expectDomOverlayScreenshot()` に
+  `canvasVisibility` オプション（既定 `'mask'` = 従来挙動、`'hidden'` = 新方式）を追加。
+  `running-hud-overlay-legacy-current` の呼び出し箇所（`tests/e2e/visual-overlay.spec.ts`）のみ
+  `canvasVisibility: 'hidden'` を指定し、他の DOM overlay baseline は既定値のまま変更していない。
+- **機械的な検証追加**: 単一色ピクセル比率が閾値（0.9）未満であることを canvas `getImageData`
+  で検証する pixel diversity test、および `[data-combat-hud]` を意図的に非表示化すると screenshot
+  assertion が確実に fail することを確認する negative control test を
+  `tests/e2e/visual-overlay.spec.ts` に追加した。
+- **evidence**: worktree `.claude/worktrees/issue-1980-vrt-canvas-hidden-hud`。ローカル環境
+  （Playwright chromium v1223、`pnpm run test:vrt:update:e2e` で `VITE_E2E_MODE=true pnpm build`
+  済みの dist を `LOOP_VRT_LANE=true` で配信、`playwright.config.ts` 既定 viewport 1280x720、
+  `tests/e2e/visual.freeze.css` の generic `sans-serif` 固定込み）で候補 PNG を生成し、
+  expected/actual を目視確認した（HUD の Hull/Kills/Elapsed/Weapon/Assist/Pause が実際に描画さ
+  れていることを確認）。`pnpm run test:vrt:e2e` で pixel diversity / negative control を含む
+  全 4 件のアクティブテストが PASS することを確認した。CI 実行環境での再現確認は本 PR のレビュー
+  プロセスで行う（candidate producer はこの worktree、canonicalization authority は本 PR の
+  レビュー・マージ）。
+- **maturity**: 変更なし（`legacy-current` のまま。`frozen` 化条件は変更なし）。
+- **tolerance**: 変更なし（`maxDiffPixels: 100`）。capture 内容が canvas 単色塗り潰しから HUD
+  実描画へ変わったため、絶対ピクセル数の意味が「単色領域を除いた非mask領域の差分」から「HUD 全体
+  領域の差分」へ変わった点に注意。
+
+### running-hud-overlay-legacy-current の negative control 実装欠陥修正（Issue #1980 iteration 1、明示）
+
+独立 test-runner 検証（PR #1988 レビュー、iteration 1 fix_delta）により、上記セクションで追加した
+negative control test（`[data-combat-hud]` を意図的に非表示化すると screenshot assertion が
+fail することを確認するテスト）が実際には fail せず、`.rejects.toThrow()` が resolved
+（意図せず PASS）してしまう欠陥が判明した。
+
+- **根本原因**: negative control test が、実 baseline capture（AC5/AC6 テスト）と同じ
+  snapshot 名（`'vrt-running-hud-overlay.png'`）を `expectDomOverlayScreenshot()` /
+  `toHaveScreenshot()` 経由で指定していたため、AC2 の VC コマンドである
+  `pnpm run test:vrt:update:e2e`（`--update-snapshots=all`）実行時、`toHaveScreenshot()` は
+  比較せず常に対象ファイルへ上書き保存する。ファイル内のテスト実行順（AC5/AC6 → pixel diversity
+  → negative control）により、negative control の「HUD 非表示」capture が最後に同名ファイルへ
+  上書きされ、実 baseline PNG 自体を HUD が写らない空の capture へ静かに破壊していた
+  （このセクション冒頭で「HUD の Hull/Kills/Elapsed/Weapon/Assist/Pause が実際に描画されている
+  ことを確認した」と記録した候補 PNG は、この経路で committed baseline から後日破壊されたことを
+  worktree 上の未コミット diff で確認済み）。この結果、`toHaveScreenshot` の比較対象 baseline
+  自体が既に HUD 非表示状態と近似していたため、negative control が「差分なし」と判定して
+  resolved していた。
+- **判断根拠**: `--update-snapshots=all` を使う AC2 の VC コマンドと同じ snapshot 名を
+  negative control が共有する設計は、negative control 自身が実 baseline を破壊しうる
+  構造的欠陥であり、修正対象は `In Scope` の「negative control test の追加」の実装詳細
+  （snapshot 名選択）であって、Issue #1980 の capture policy（`canvasVisibility: 'hidden'`）
+  自体の妥当性ではない。
+- **修正内容**: negative control test を `toHaveScreenshot()` の snapshot 読み書きパイプライン
+  から独立させ、`Locator.screenshot()` で直接取得した「HUD 非表示」capture と、ディスク上の
+  committed baseline PNG（読み取り専用）を、pixel diversity test と同じ `canvas` 2D
+  `getImageData()` 手法でブラウザ内 pixel-diff し、差分ピクセル数が実アサーションの
+  `maxDiffPixels: 100` を上回ることを確認する方式へ変更した（`tests/e2e/visual-overlay.spec.ts`）。
+  この方式は `--update-snapshots` フラグの有無に関わらず baseline ファイルへ一切書き込まない。
+- **evidence**: worktree `.claude/worktrees/issue-1980-vrt-canvas-hidden-hud`。修正後、
+  `pnpm run test:vrt:update:e2e` を複数回実行しても baseline PNG が安定（2回目以降
+  re-generate 差分なし）で HUD 実描画のまま保たれることを確認し、`pnpm run test:vrt:e2e`
+  （4 active test 全 PASS、3 pending-baseline skip）、および AC2 / AC3 個別実行（いずれも
+  PASS）で再検証した。
+- **maturity / tolerance**: 変更なし。
+
 ## 4. baseline update policy（更新ポリシー）
 
 ### 自動更新の禁止
