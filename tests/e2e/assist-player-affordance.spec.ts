@@ -822,36 +822,44 @@ test('responsive canvas preserves the logical arena, frozen combat positions, ba
         }
       }
 
-      // Resume before Pass 2 (Issue #1376 AC4 fix): once resumed, the Canvas
-      // and combat HUD regain hit-testing, so real page.mouse.move() input
-      // can legitimately reach the Canvas again. `[data-action="toggle-pause"]`
-      // itself is pointer-unreachable while paused (the pause dialog overlay
-      // intercepts pointer events -- consistent with
-      // tests/e2e/product-pause.spec.ts and tests/e2e/m2-combat-mvp.spec.ts),
-      // so resume goes through the pause dialog's own Resume control.
-      await page.locator('[data-action="resume"]').click()
-      await expect(page.locator('[data-action="toggle-pause"]')).toHaveAttribute('aria-pressed', 'false')
-
-      // Pass 2 (resumed): verify pointer-to-arena coordinate mapping across
-      // the same viewport x zoom matrix now that pointer input can actually
-      // reach the Canvas. Gameplay is intentionally no longer frozen in this
-      // pass (AC4's pointer exclusion is scoped to the paused state only),
-      // so no frozen-gameplay comparison is made here; the Pass-1 frozen
-      // result captured above is reused for evidence purposes.
+      // Pass 2: verify pointer-to-arena coordinate mapping across the same
+      // viewport x zoom matrix. Issue #1376 iteration 7 fix: an earlier
+      // version of this pass resumed the SAME paused sortie (either once for
+      // the whole matrix, or per combo) to let real pointer input reach the
+      // Canvas again -- but the underlying combat simulation genuinely ticks
+      // while resumed, and empirically the ambient enemy fire always
+      // depleted the player's hull to defeat after roughly the same ~10s of
+      // cumulative real resumed time, regardless of how that exposure was
+      // chunked across combos, well before all 16 combos could be checked.
+      // Pointer-to-arena mapping (unlike the frozen-position invariant in
+      // Pass 1) has no dependency on pause state at all -- AC4 only
+      // constrains input while paused -- so this pass instead starts a
+      // FRESH sortie (full hull, `running` phase, Canvas never paused/inert)
+      // for every combo via `page.goto('/')`, bounding each combo's combat
+      // exposure to just that one combo's check instead of accumulating
+      // across the whole matrix.
       for (const viewport of RESPONSIVE_VIEWPORTS) {
         for (const zoom of RESPONSIVE_ZOOMS) {
+          await page.goto('/')
+          await waitForRunningWithCombatActors(page)
+
           await page.setViewportSize(viewport)
           await zoomCtx.setZoom(zoom.factor)
+          // Issue #1956 responsive-canvas iteration 2 fix: `setZoom()`
+          // resolving does not guarantee the zoom has propagated to this
+          // page's renderer yet (see `waitForZoomToApply()` doc comment) --
+          // wait for the page-observable `devicePixelRatio` to actually
+          // reach the expected (declared DPR x zoom factor) value before
+          // trusting any subsequent `getBoundingClientRect()` read.
           await waitForZoomToApply(page, dpr * zoom.factor)
-          // Reset the (virtual) cursor to a known-good position inside the
-          // new viewport immediately after every resize/zoom change --
-          // otherwise it may still be resting at a coordinate from the
-          // previous (larger) viewport that now falls outside the new one,
-          // which was observed empirically to desynchronize subsequent
-          // page.mouse.move() position tracking across rapid successive
-          // viewport/zoom changes in this harness.
-          await page.mouse.move(10, 10)
 
+          // The ResizeObserver-driven presentation update (Issue #1956 fix
+          // 3) is asynchronous relative to setViewportSize()/setZoom() --
+          // poll until the backing store has actually settled to the new
+          // CSS size x DPR instead of a fixed sleep (which was empirically
+          // flaky: 150ms was not always enough for the observer callback to
+          // fire and CanvasRenderer.resize() to apply before evidence was
+          // collected).
           await expect
             .poll(
               async () => {
@@ -865,16 +873,20 @@ test('responsive canvas preserves the logical arena, frozen combat positions, ba
             )
             .toBeLessThanOrEqual(1)
 
+          // Reset the (virtual) cursor to a known-good position inside the
+          // new viewport immediately after every resize/zoom change --
+          // otherwise it may still be resting at a coordinate from the
+          // previous (larger) viewport that now falls outside the new one,
+          // which was observed empirically to desynchronize subsequent
+          // page.mouse.move() position tracking across rapid successive
+          // viewport/zoom changes in this harness.
+          await page.mouse.move(10, 10)
+
           const pointerMapping = await assertPointerMapsToLogicalArena(page)
           const observed = await collectEvidence(page)
           const observedZoom = await zoomCtx.getZoom()
 
           expect(observed.logical_arena).toEqual({ width: 960, height: 540 })
-
-          const frozenAfterResize = frozenResults.get(`${viewport.label}:${zoom.label}`)
-          if (!frozenAfterResize) {
-            throw new Error(`missing Pass 1 frozen-gameplay result for ${viewport.label}:${zoom.label}`)
-          }
 
           // Fix 6 point 4: every matrix cell gets a real screenshot; no
           // 'not-captured' placeholder path.
@@ -883,6 +895,11 @@ test('responsive canvas preserves the logical arena, frozen combat positions, ba
           )
           await page.screenshot({ path: screenshotPath })
           expect(existsSync(screenshotPath), `screenshot must exist on disk: ${screenshotPath}`).toBe(true)
+
+          const frozenAfterResize = frozenResults.get(`${viewport.label}:${zoom.label}`)
+          if (!frozenAfterResize) {
+            throw new Error(`missing Pass 1 frozen-gameplay result for ${viewport.label}:${zoom.label}`)
+          }
 
           evidence.push({
             head_sha: headSha,
