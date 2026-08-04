@@ -1713,6 +1713,49 @@ CAPABILITY_PREDICATES: dict[str, list[str]] = {
     ],
 }
 
+CAPABILITY_PREDICATE_KINDS = frozenset({"bootstrap_prerequisite", "claim_under_test"})
+
+# Issue #1979 AC1: classify each predicate as a bootstrap_prerequisite (must
+# be confirmed supported before a live run is attempted at all -- e.g. the
+# base injection mechanism the live runner depends on) or a claim_under_test
+# (the actual behavior a permission-boundary live run exists to prove; a live
+# run is never gated on these being pre-confirmed supported, since the live
+# run itself is how they get confirmed).
+CAPABILITY_PREDICATE_CLASSIFICATION: dict[str, dict[str, str]] = {
+    "headless_permission_policy": {
+        "persisted_settings_loaded": "bootstrap_prerequisite",
+        "deny_precedence_enforced": "claim_under_test",
+        "ask_is_soft_denied_noninteractive": "claim_under_test",
+    },
+    "hooks": {
+        "workspace_hooks_config_loaded": "bootstrap_prerequisite",
+        "pre_invocation_hook_dispatch": "bootstrap_prerequisite",
+        "pre_invocation_ephemeral_message": "bootstrap_prerequisite",
+        "pre_invocation_injected_tool_call": "bootstrap_prerequisite",
+        "pre_tool_use_verdict": "claim_under_test",
+        "post_tool_use_dispatch": "claim_under_test",
+        "post_tool_use_matcher_semantics": "claim_under_test",
+    },
+    "disable_slash_commands": {
+        "parser_accepts_flag": "bootstrap_prerequisite",
+        "leading_slash_is_literal": "bootstrap_prerequisite",
+    },
+}
+
+
+def classify_predicate_kind(group: str, predicate: str) -> str:
+    """Return "bootstrap_prerequisite" or "claim_under_test" for *predicate*.
+
+    Unknown (group, predicate) pairs are never silently treated as either
+    kind -- ValueError is raised so a typo or a newly added predicate that
+    was not classified cannot fall through unnoticed (Issue #1979 AC1).
+    """
+    group_map = CAPABILITY_PREDICATE_CLASSIFICATION.get(group)
+    if group_map is None or predicate not in group_map:
+        raise ValueError(f"unclassified capability predicate: {group}.{predicate}")
+    return group_map[predicate]
+
+
 EVIDENCE_PRIORITY = (
     "runtime_semantic_observation",
     "parser_acceptance",
@@ -2079,6 +2122,32 @@ def build_capability_matrix(
                 leading_slash_probe=leading_slash_probe,
             )
     return matrix
+
+
+# Issue #1979 AC5: MCP is unsupported_by_design, not merely unavailable/
+# untested. `agy_permission_enforcement_hook.py` never imports
+# `agy_permission_policy.py`, so direct MCP access is disabled for every
+# profile by construction -- there is no code path a runtime probe could ever
+# observe as "supported". This is therefore excluded from completion
+# blockers rather than left as an inconclusive/unavailable predicate.
+MCP_UNSUPPORTED_BY_DESIGN_REASON = (
+    "agy_permission_enforcement_hook.py never imports agy_permission_policy.py; "
+    "direct MCP access is disabled for every profile by construction"
+)
+
+
+def mcp_capability_status() -> dict[str, Any]:
+    """Return the fixed `unsupported_by_design` capability record for MCP.
+
+    Never derived from a runtime probe -- MCP access is disabled by
+    construction (see `MCP_UNSUPPORTED_BY_DESIGN_REASON`), so there is no
+    probe outcome that could ever change this value (Issue #1979 AC5).
+    """
+    return {
+        "status": "unsupported_by_design",
+        "completion_blocker": False,
+        "reason": MCP_UNSUPPORTED_BY_DESIGN_REASON,
+    }
 
 
 _CAPABILITY_MEMO_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}

@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -50,6 +51,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = SCRIPT_DIR.parent / "schemas" / "agy_permission_boundary_e2e_v1.schema.json"
 HOOK_PATH = SCRIPT_DIR / "agy_permission_enforcement_hook.py"
 POLICY_PATH = SCRIPT_DIR / "agy_permission_policy.py"
+PREFLIGHT_PATH = SCRIPT_DIR / "preflight_agy.py"
+BOOTSTRAP_PREDICATE_GROUP = "hooks"
+BOOTSTRAP_PREDICATE_NAME = "pre_invocation_injected_tool_call"
 
 ATTEMPT_SPECS = {
     "command": ("run_command", "command"),
@@ -125,6 +129,56 @@ class AgyAuthBootstrapUnavailable(RuntimeError):
     back to an unprotected OAuth-token symlink when the policy materializer
     cannot provide its required read-only boundary.
     """
+
+
+def _load_preflight_module() -> Any:
+    spec = importlib.util.spec_from_file_location("agy_preflight_for_boundary", PREFLIGHT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("preflight_module_load_failed")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _bootstrap_capability_gate() -> dict[str, Any]:
+    """Resolve the live-runner bootstrap predicate via preflight_agy.py.
+
+    Issue #1979 AC2: the live runner must never attempt an actual AGY
+    invocation when the bootstrap predicate it depends on
+    (``pre_invocation_injected_tool_call``) is not ``supported`` --
+    ``preflight_agy.py`` (Issue #1941) is the single SSOT for this
+    determination; this runner never re-implements its own detection.
+    """
+    preflight = _load_preflight_module()
+    version_result = {"status": "version_evidence_invalid", "version": None, "core": None, "raw": None}
+    matrix = preflight.build_capability_matrix(version_result=version_result)
+    predicate_result = preflight.get_capability_status(matrix, BOOTSTRAP_PREDICATE_GROUP, BOOTSTRAP_PREDICATE_NAME)
+    kind = preflight.classify_predicate_kind(BOOTSTRAP_PREDICATE_GROUP, BOOTSTRAP_PREDICATE_NAME)
+    return {
+        "bootstrap_predicate": BOOTSTRAP_PREDICATE_NAME,
+        "predicate_kind": kind,
+        "status": predicate_result["status"],
+        "reason_code": predicate_result["reason_code"],
+        "evidence_source": predicate_result["evidence_source"],
+    }
+
+
+def _mcp_capability_record() -> dict[str, Any]:
+    """Issue #1979 AC5: MCP is `unsupported_by_design`, sourced from preflight_agy.py."""
+    preflight = _load_preflight_module()
+    return preflight.mcp_capability_status()
+
+
+def _tool_inventory_digest() -> str:
+    """Digest of the runtime-discovered native tool inventory (Issue #1979 AC6).
+
+    ``ATTEMPT_SPECS`` native tool names are this runner's SSOT for actual
+    discovered tool identity (Issue #1979 Outcome); the digest binds the
+    artifact to that exact inventory so drift is detectable.
+    """
+    names = sorted(tool_name for tool_name, _ in ATTEMPT_SPECS.values())
+    return _sha256(_canonical_json(names))
 
 
 def _load_policy_module() -> Any:
@@ -277,6 +331,43 @@ def _attempt_template(
     }
 
 
+def _binary_identity(executable: Path | None) -> dict[str, Any]:
+    """Issue #1979 AC6: full binary identity fingerprint, reusing preflight_agy.py's SSOT."""
+    preflight = _load_preflight_module()
+    return preflight.compute_binary_identity(str(executable) if executable is not None else None)
+
+
+def _pairing_binding(profile: str, artifact_dir: Path) -> dict[str, Any]:
+    """Issue #1979 AC6: allow/deny paired-run binding.
+
+    `grounded_research` is the allow case (AC3) and `no_tools` is the deny
+    case (AC4); other profiles have no paired role. Binding is only claimed
+    when the sibling `allow`/`deny` directory holds a schema-shaped
+    artifact with a digest this run can read back -- an absent or unreadable
+    counterpart is recorded as unbound, never guessed at.
+    """
+    role = {"grounded_research": "allow", "no_tools": "deny"}.get(profile, "n/a")
+    counterpart_role = {"allow": "deny", "deny": "allow"}.get(role, "n/a")
+    counterpart_digest: str | None = None
+    bound = False
+    if counterpart_role in ("allow", "deny") and artifact_dir.name in ("allow", "deny"):
+        counterpart_path = artifact_dir.parent / counterpart_role / "agy_permission_boundary_e2e.json"
+        try:
+            counterpart_raw = json.loads(counterpart_path.read_text(encoding="utf-8"))
+            candidate = counterpart_raw.get("artifact", {}).get("digest")
+            if isinstance(candidate, str) and _SHA256.match(candidate):
+                counterpart_digest = candidate
+                bound = True
+        except (OSError, json.JSONDecodeError, AttributeError):
+            counterpart_digest, bound = None, False
+    return {
+        "role": role,
+        "counterpart_role": counterpart_role,
+        "counterpart_digest": counterpart_digest,
+        "bound": bound,
+    }
+
+
 def _artifact(
     *,
     exit_code: int,
@@ -289,9 +380,14 @@ def _artifact(
     profile: str,
     failure_class: str,
     cleanup_ok: bool,
+    artifact_dir: Path,
     diagnostic_ledger: Mapping[str, Any] | None = None,
+    capability_gate: Mapping[str, Any] | None = None,
+    process_group_isolated: bool = True,
+    descendant_processes_absent: bool = True,
 ) -> dict[str, Any]:
     digest = _file_digest(executable) if executable is not None and executable.is_file() else "sha256:" + "0" * 64
+    resolved_capability_gate = dict(capability_gate) if capability_gate is not None else _bootstrap_capability_gate()
     result: dict[str, Any] = {
         "schema": SCHEMA,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -303,11 +399,16 @@ def _artifact(
             "executable_ref": executable.name if executable else "unavailable",
             "executable_version": version[:128],
             "binary_digest": digest,
+            "binary_identity": _binary_identity(executable),
             "child_returncode": child_returncode,
             "artifact_digest": None,
         },
         "artifact": {"digest": None},
-        "matrix": {"profile": profile, "capabilities": list(CAPABILITIES)},
+        "matrix": {
+            "profile": profile,
+            "capabilities": list(CAPABILITIES),
+            "tool_inventory_digest": _tool_inventory_digest(),
+        },
         "attempts": attempts,
         "diagnostic_ledger": dict(diagnostic_ledger or _empty_diagnostic_ledger()),
         "fallback": {"used": False},
@@ -320,8 +421,16 @@ def _artifact(
             if exit_code == EXIT_UNAVAILABLE
             else "fix_or_reprobe",
         },
-        "cleanup": {"temporary_processes_removed": cleanup_ok, "loopback_servers_stopped": cleanup_ok},
+        "cleanup": {
+            "temporary_processes_removed": cleanup_ok,
+            "loopback_servers_stopped": cleanup_ok,
+            "process_group_isolated": process_group_isolated,
+            "descendant_processes_absent": descendant_processes_absent,
+        },
         "secret_scan": {"clean": True},
+        "capability_gate": resolved_capability_gate,
+        "mcp": _mcp_capability_record(),
+        "pairing": _pairing_binding(profile, artifact_dir),
     }
     result["artifact"]["digest"] = _artifact_digest(result)
     result["runner"]["artifact_digest"] = result["artifact"]["digest"]
@@ -329,7 +438,12 @@ def _artifact(
 
 
 def _unavailable_artifact(
-    failure_class: str, *, profile: str = "no_tools", exit_code: int = EXIT_UNAVAILABLE
+    failure_class: str,
+    *,
+    profile: str = "no_tools",
+    exit_code: int = EXIT_UNAVAILABLE,
+    artifact_dir: Path | None = None,
+    capability_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     attempts = [
         _attempt_template(
@@ -350,6 +464,8 @@ def _unavailable_artifact(
         executable=None,
         version="unavailable",
         child_returncode=None,
+        artifact_dir=artifact_dir if artifact_dir is not None else Path("unavailable"),
+        capability_gate=capability_gate,
         attempts=attempts,
         profile=profile,
         failure_class=failure_class,
@@ -706,7 +822,25 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
     return attempts
 
 
-def _invoke(agy: Path, runtime: Mapping[str, Any], *, live: bool) -> subprocess.CompletedProcess[str]:
+def _verify_process_group_absent(pgid: int) -> bool:
+    """Issue #1979 AC7: confirm no process remains in *pgid*'s process group.
+
+    Distinct from directory cleanup -- this checks the OS process table, not
+    the filesystem. `ProcessLookupError` from `os.killpg(pgid, 0)` is the
+    only positive confirmation; any other outcome (a live process, or a
+    permission error that prevents the check) is treated as not confirmed
+    absent (fail closed).
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def _invoke(agy: Path, runtime: Mapping[str, Any], *, live: bool) -> dict[str, Any]:
     env = dict(runtime["env"])
     env.update(
         {
@@ -727,16 +861,46 @@ def _invoke(agy: Path, runtime: Mapping[str, Any], *, live: bool) -> subprocess.
     # `references/failure-class-taxonomy.md`.  Verified via a live,
     # hooks.json-only reproduction outside this runner (see that reference).
     workspace_str = str(runtime["workspace"])
-    return subprocess.run(
-        list(runtime["agy_command_prefix"])
-        + [str(agy), "--print", "permission-boundary-harness", "--add-dir", workspace_str],
+    argv = list(runtime["agy_command_prefix"]) + [
+        str(agy),
+        "--print",
+        "permission-boundary-harness",
+        "--add-dir",
+        workspace_str,
+    ]
+    timeout = 90 if live else 15
+    # Issue #1979 AC7: `start_new_session=True` isolates this call in its own
+    # process group so every descendant AGY spawns can be located and its
+    # absence verified after this call returns -- independent of and in
+    # addition to the temp-directory cleanup already performed elsewhere.
+    process = subprocess.Popen(
+        argv,
         cwd=runtime["workspace"],
         env=env,
         text=True,
-        capture_output=True,
-        check=False,
-        timeout=90 if live else 15,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     )
+    timed_out = False
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        stdout, stderr = process.communicate()
+    descendant_processes_absent = _verify_process_group_absent(process.pid)
+    return {
+        "returncode": None if timed_out else process.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": timed_out,
+        "process_group_isolated": True,
+        "descendant_processes_absent": descendant_processes_absent,
+    }
 
 
 def _version(agy: Path) -> tuple[str, bool]:
@@ -748,42 +912,84 @@ def _version(agy: Path) -> tuple[str, bool]:
 
 
 def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    artifact_dir = Path(args.artifact_dir)
     supplied = Path(args.agy).resolve() if args.agy else None
+    capability_gate: dict[str, Any] | None = None
     if args.mode == "live":
+        # An explicit `--agy` override is always an identity violation in
+        # live mode, independent of capability -- checked first so it is
+        # never masked by a capability-gate short-circuit.
         if supplied is not None:
-            return EXIT_FAIL, _unavailable_artifact(FAILURE_INVALID_IDENTITY, profile=args.profile, exit_code=EXIT_FAIL)
+            return EXIT_FAIL, _unavailable_artifact(
+                FAILURE_INVALID_IDENTITY,
+                profile=args.profile,
+                exit_code=EXIT_FAIL,
+                artifact_dir=artifact_dir,
+            )
+        # Issue #1979 AC2: bind the live runner to the capability gate's
+        # bootstrap predicate BEFORE attempting any live AGY invocation.
+        # preflight_agy.py (Issue #1941) is the single SSOT for this
+        # determination; a bootstrap predicate it does not report
+        # `supported` blocks live execution outright.
+        capability_gate = _bootstrap_capability_gate()
+        if args.allow_live and capability_gate["status"] != "supported":
+            return EXIT_UNAVAILABLE, _unavailable_artifact(
+                FAILURE_UNAVAILABLE,
+                profile=args.profile,
+                artifact_dir=artifact_dir,
+                capability_gate=capability_gate,
+            )
         discovered = shutil.which("agy")
         executable = Path(discovered).resolve() if discovered else None
         if not args.allow_live or executable is None or not executable.is_file():
-            return EXIT_UNAVAILABLE, _unavailable_artifact(FAILURE_UNAVAILABLE, profile=args.profile)
+            return EXIT_UNAVAILABLE, _unavailable_artifact(
+                FAILURE_UNAVAILABLE,
+                profile=args.profile,
+                artifact_dir=artifact_dir,
+                capability_gate=capability_gate,
+            )
     else:
         executable = supplied
         if executable is None or not executable.is_file():
-            return EXIT_FAIL, _unavailable_artifact(FAILURE_INCONCLUSIVE, profile=args.profile, exit_code=EXIT_FAIL)
+            return EXIT_FAIL, _unavailable_artifact(
+                FAILURE_INCONCLUSIVE, profile=args.profile, exit_code=EXIT_FAIL, artifact_dir=artifact_dir
+            )
     version, identity_verified = _version(executable)
     if args.mode == "live" and not identity_verified:
-        return EXIT_UNAVAILABLE, _unavailable_artifact(FAILURE_UNAVAILABLE, profile=args.profile)
+        return EXIT_UNAVAILABLE, _unavailable_artifact(
+            FAILURE_UNAVAILABLE, profile=args.profile, artifact_dir=artifact_dir, capability_gate=capability_gate
+        )
     temporary = Path(tempfile.mkdtemp(prefix="agy-boundary-", dir=args.artifact_dir))
     result: dict[str, Any]
     runtime: Mapping[str, Any] | None = None
     exit_code = EXIT_FAIL
+    process_group_isolated = True
+    descendant_processes_absent = True
     try:
         try:
             runtime = _prepare_runtime(temporary, args.profile, auth_bootstrap=args.mode == "live")
         except AgyAuthBootstrapUnavailable:
             exit_code = EXIT_UNAVAILABLE
-            result = _unavailable_artifact(FAILURE_UNAVAILABLE, profile=args.profile)
+            result = _unavailable_artifact(
+                FAILURE_UNAVAILABLE, profile=args.profile, artifact_dir=artifact_dir, capability_gate=capability_gate
+            )
         else:
             runtime_unavailable = False
+            invoked: dict[str, Any] | None
             try:
-                completed = _invoke(executable, runtime, live=args.mode == "live")
-            except (OSError, subprocess.TimeoutExpired):
-                completed = None
+                invoked = _invoke(executable, runtime, live=args.mode == "live")
+            except OSError:
+                invoked = None
                 runtime_unavailable = args.mode == "live"
+            else:
+                process_group_isolated = invoked["process_group_isolated"]
+                descendant_processes_absent = invoked["descendant_processes_absent"]
+                if invoked["timed_out"]:
+                    runtime_unavailable = args.mode == "live"
             attempts = _attempts_from_parent_observation(runtime, args.profile)
             diagnostic_ledger = _diagnostic_ledger(runtime)
-            output = "" if completed is None else (completed.stdout or "") + (completed.stderr or "")
-            child_returncode = None if completed is None else completed.returncode
+            output = "" if invoked is None else (invoked["stdout"] or "") + (invoked["stderr"] or "")
+            child_returncode = None if invoked is None else invoked["returncode"]
             auth_unavailable = args.mode == "live" and bool(_AUTH_FAILURE.search(output))
             unavailable = auth_unavailable or runtime_unavailable
             predicates_pass = all(all(attempt["predicates"].values()) for attempt in attempts)
@@ -801,10 +1007,20 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 profile=args.profile,
                 failure_class=failure,
                 cleanup_ok=True,
+                artifact_dir=artifact_dir,
                 diagnostic_ledger=diagnostic_ledger,
+                capability_gate=capability_gate,
+                process_group_isolated=process_group_isolated,
+                descendant_processes_absent=descendant_processes_absent,
             )
     except Exception:
-        result = _unavailable_artifact(FAILURE_INCONCLUSIVE, profile=args.profile, exit_code=EXIT_FAIL)
+        result = _unavailable_artifact(
+            FAILURE_INCONCLUSIVE,
+            profile=args.profile,
+            exit_code=EXIT_FAIL,
+            artifact_dir=artifact_dir,
+            capability_gate=capability_gate,
+        )
     finally:
         cleanup_ok = True
         if runtime is not None:
@@ -823,6 +1039,8 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         result["cleanup"] = {
             "temporary_processes_removed": cleanup_ok,
             "loopback_servers_stopped": cleanup_ok,
+            "process_group_isolated": process_group_isolated,
+            "descendant_processes_absent": descendant_processes_absent,
         }
         result["artifact"]["digest"] = _artifact_digest(result)
         result["runner"]["artifact_digest"] = result["artifact"]["digest"]
@@ -836,9 +1054,9 @@ def _write_artifact(directory: Path, result: Mapping[str, Any]) -> Path:
     return path
 
 
-def _failure_artifact(reason: str, *, profile: str) -> dict[str, Any]:
+def _failure_artifact(reason: str, *, profile: str, artifact_dir: Path | None = None) -> dict[str, Any]:
     """Return a schema-valid failure artifact for every pre-write exception."""
-    return _unavailable_artifact(reason, profile=profile, exit_code=EXIT_FAIL)
+    return _unavailable_artifact(reason, profile=profile, exit_code=EXIT_FAIL, artifact_dir=artifact_dir)
 
 
 def main() -> int:
@@ -858,7 +1076,9 @@ def main() -> int:
     except Exception:
         exit_code, result = (
             EXIT_FAIL,
-            _failure_artifact("agy_permission_boundary_runner_exception", profile=args.profile),
+            _failure_artifact(
+                "agy_permission_boundary_runner_exception", profile=args.profile, artifact_dir=artifact_dir
+            ),
         )
     try:
         valid, reason = validate_artifact(result)
@@ -866,7 +1086,7 @@ def main() -> int:
         valid, reason = False, "agy_permission_boundary_validator_exception"
     if not valid:
         exit_code = EXIT_FAIL
-        result = _failure_artifact(reason, profile=args.profile)
+        result = _failure_artifact(reason, profile=args.profile, artifact_dir=artifact_dir)
     try:
         _write_artifact(artifact_dir, result)
     except Exception:
@@ -874,7 +1094,9 @@ def main() -> int:
         # the failure evidence once so an intermediate producer error cannot
         # accidentally preserve a stale success artifact.
         exit_code = EXIT_FAIL
-        result = _failure_artifact("agy_permission_boundary_artifact_write_failed", profile=args.profile)
+        result = _failure_artifact(
+            "agy_permission_boundary_artifact_write_failed", profile=args.profile, artifact_dir=artifact_dir
+        )
         _write_artifact(artifact_dir, result)
     print(json.dumps({"artifact": "agy_permission_boundary_e2e.json", "exit_code": exit_code}, sort_keys=True))
     return exit_code
