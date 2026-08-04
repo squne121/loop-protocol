@@ -874,6 +874,22 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
             "TargetFile": str(canary_paths["write"]),
             "Overwrite": True,
             "CodeContent": "1\n",
+            # Issue #1979 write-capability prompt-noncompliance root cause
+            # (confirmed via a live investigative probe with a raw stdin tee
+            # on the write_to_file PreToolUse matcher): the real `agy` 1.1.x
+            # `write_to_file` tool call always includes a `Description`
+            # argument in addition to `TargetFile`/`Overwrite`/`CodeContent`
+            # -- omitting it from this expected-args dict made every
+            # genuine, compliant AGY tool call (observed in
+            # `enforcement.jsonl` with `decision: deny`/`policy_deny`, i.e.
+            # AGY did call the tool) fail the exact `args_digest`
+            # correlation match in `_resolve_prompt_compliance`, a false
+            # `prompt_noncompliance` verdict rather than a genuine one. A
+            # fixed literal `Description` value, included verbatim in the
+            # `ephemeralMessage` instruction, is reproduced byte-for-byte by
+            # the real AGY tool call (empirically confirmed: the resulting
+            # `args_digest` matches exactly), so it is safe to correlate on.
+            "Description": "Writing boundary probe sentinel file",
         },
         "read": {"AbsolutePath": str(canary_paths["read"])},
         # Issue #1979 fix_delta blocker_3: `read_url_content` (not

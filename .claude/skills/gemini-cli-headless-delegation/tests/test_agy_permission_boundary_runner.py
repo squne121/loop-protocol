@@ -327,7 +327,11 @@ def test_hermetic_attempts_use_documented_args_and_exclude_undiscovered_mcp(tmp_
     runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
     assert set(runtime["attempt_args"]) == {"command", "write", "read", "network"}
     assert runtime["attempt_args"]["command"].keys() == {"CommandLine", "Cwd", "WaitMsBeforeAsync"}
-    assert runtime["attempt_args"]["write"].keys() == {"TargetFile", "Overwrite", "CodeContent"}
+    # Issue #1979: `Description` is required -- confirmed via a live investigative
+    # probe that the real AGY `write_to_file` tool call always includes it, and that
+    # a fixed literal value is reproduced byte-for-byte (see run_agy_permission_
+    # boundary_e2e.py `attempt_args["write"]` comment for the empirical evidence).
+    assert runtime["attempt_args"]["write"].keys() == {"TargetFile", "Overwrite", "CodeContent", "Description"}
     assert runtime["attempt_args"]["read"].keys() == {"AbsolutePath"}
     assert runtime["attempt_args"]["network"].keys() == {"Url"}
     assert "mcp_call" not in MODULE.ATTEMPT_SPECS
