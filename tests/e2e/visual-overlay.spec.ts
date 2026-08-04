@@ -173,6 +173,12 @@ test('GIVEN the running-hud-paused active-fixture-only scenario WHEN the DOM ove
   // dialog panel over the inert combat HUD/Canvas, masked).
   await expectDomOverlayScreenshot(overlayRoot, 'vrt-running-hud-paused-overlay.png', 'running-hud-paused', {
     maxDiffPixels: 100,
+    // Issue #1980: same capture root (`[data-battle-ui-root]`) as
+    // `running-hud-overlay-legacy-current` above, so the same canvas +
+    // `.battle-ui-layer` bounding-box overlap applies here. `'hidden'`
+    // excludes the canvas via CSS visibility instead of masking over the
+    // pause dialog panel.
+    canvasVisibility: 'hidden',
   })
 })
 
@@ -189,6 +195,12 @@ test('GIVEN the result-timeout active-fixture-only scenario WHEN the DOM overlay
   // `tests/e2e/visual-utils.ts`'s `VISUAL_BASELINE_REGISTRY_IDS` comment).
   await expectDomOverlayScreenshot(overlayRoot, 'vrt-result-timeout-overlay.png', 'result-overlay-timeout', {
     maxDiffPixels: 100,
+    // Issue #1980: same capture root (`[data-battle-ui-root]`) as
+    // `running-hud-overlay-legacy-current` above, so the same canvas +
+    // `.battle-ui-layer` bounding-box overlap applies here. `'hidden'`
+    // excludes the canvas via CSS visibility instead of masking over the
+    // result screen panel.
+    canvasVisibility: 'hidden',
   })
 })
 
