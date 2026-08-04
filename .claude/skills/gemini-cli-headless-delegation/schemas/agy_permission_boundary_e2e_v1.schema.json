@@ -47,7 +47,8 @@
           "enum": [
             0,
             1,
-            77
+            77,
+            78
           ]
         },
         "actual_agy_executed": {
@@ -381,6 +382,34 @@
         },
         "bound": {
           "type": "boolean"
+        }
+      }
+    },
+    "attempt_method": {
+      "description": "Issue #1979 AC6/AC8: additive, optional. Fixed value -- the only tool-call-elicitation method this runner implements for live mode.",
+      "enum": [
+        "ephemeral_message_prompt"
+      ]
+    },
+    "prompt_compliance": {
+      "description": "Issue #1979 AC6/AC8: additive, optional. Per-capability ephemeralMessage bounded-retry compliance record. Empty for hermetic mode / non-live non-completion paths that never attempted ephemeralMessage injection.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempts",
+          "compliant"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3
+          },
+          "compliant": {
+            "type": "boolean"
+          }
         }
       }
     }

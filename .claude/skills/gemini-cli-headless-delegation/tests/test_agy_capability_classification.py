@@ -25,8 +25,18 @@ def test_every_capability_predicate_has_a_classification() -> None:
             assert kind in MODULE.CAPABILITY_PREDICATE_KINDS
 
 
-def test_pre_invocation_injected_tool_call_is_bootstrap_prerequisite() -> None:
-    """The live runner's binding target (AC2) must be a bootstrap_prerequisite."""
+def test_pre_invocation_ephemeral_message_injection_is_bootstrap_prerequisite() -> None:
+    """The live runner's binding target (AC1/AC2) must be a bootstrap_prerequisite."""
+    assert (
+        MODULE.classify_predicate_kind("hooks", "pre_invocation_ephemeral_message_injection")
+        == "bootstrap_prerequisite"
+    )
+
+
+def test_pre_invocation_injected_tool_call_remains_bootstrap_prerequisite() -> None:
+    """Retained (unrenamed) for the hermetic hook-dispatch harness's toolCall
+    contract and `test_setup_check.py` -- still bootstrap_prerequisite, just
+    no longer the live runner's own binding target (Issue #1979)."""
     assert MODULE.classify_predicate_kind("hooks", "pre_invocation_injected_tool_call") == "bootstrap_prerequisite"
 
 
@@ -66,6 +76,7 @@ def test_bootstrap_prerequisite_predicates_cover_the_live_runner_gate_target() -
         for predicate, kind in predicates.items()
         if kind == "bootstrap_prerequisite"
     }
+    assert "pre_invocation_ephemeral_message_injection" in bootstrap
     assert "pre_invocation_injected_tool_call" in bootstrap
 
 

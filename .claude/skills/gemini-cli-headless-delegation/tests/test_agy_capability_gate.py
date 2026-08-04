@@ -78,7 +78,7 @@ def test_hooks_capability_matrix_splits_into_predicates():
     expected = {
         "workspace_hooks_config_loaded",
         "pre_invocation_hook_dispatch",
-        "pre_invocation_ephemeral_message",
+        "pre_invocation_ephemeral_message_injection",
         "pre_invocation_injected_tool_call",
         "pre_tool_use_verdict",
         "post_tool_use_dispatch",
@@ -108,6 +108,23 @@ def test_pre_invocation_injected_tool_call_unsupported_while_upstream_728_open()
     predicate_result = matrix["hooks"]["pre_invocation_injected_tool_call"]
     assert predicate_result["status"] == "unsupported"
     assert predicate_result["reason_code"] == "upstream_known_runtime_rejection"
+
+
+def test_pre_invocation_ephemeral_message_injection_is_never_hardcoded_unsupported():
+    """Issue #1979: unlike `pre_invocation_injected_tool_call`, this predicate
+    is NOT tied to upstream #728 (which only breaks toolCall injectSteps) --
+    it must never resolve `unsupported` for the `upstream_known_runtime_rejection`
+    reason. It resolves `inconclusive` via the generic deferred-to-live-run
+    branch instead (no hardcoded claim of `supported` without evidence)."""
+    module = load_module()
+    assert module.UPSTREAM_ANTIGRAVITY_CLI_728_OPEN is True
+
+    matrix = module.build_capability_matrix(
+        version_result={"status": "parsed", "version": "1.1.9", "core": (1, 1, 9), "raw": "agy 1.1.9"},
+    )
+    predicate_result = matrix["hooks"]["pre_invocation_ephemeral_message_injection"]
+    assert predicate_result["status"] != "unsupported"
+    assert predicate_result["reason_code"] != "upstream_known_runtime_rejection"
 
 
 # ---------------------------------------------------------------------------

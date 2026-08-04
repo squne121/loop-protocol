@@ -1701,7 +1701,7 @@ CAPABILITY_PREDICATES: dict[str, list[str]] = {
     "hooks": [
         "workspace_hooks_config_loaded",
         "pre_invocation_hook_dispatch",
-        "pre_invocation_ephemeral_message",
+        "pre_invocation_ephemeral_message_injection",
         "pre_invocation_injected_tool_call",
         "pre_tool_use_verdict",
         "post_tool_use_dispatch",
@@ -1730,7 +1730,20 @@ CAPABILITY_PREDICATE_CLASSIFICATION: dict[str, dict[str, str]] = {
     "hooks": {
         "workspace_hooks_config_loaded": "bootstrap_prerequisite",
         "pre_invocation_hook_dispatch": "bootstrap_prerequisite",
-        "pre_invocation_ephemeral_message": "bootstrap_prerequisite",
+        # Issue #1979: this is the live runner's actual bootstrap predicate
+        # (`run_agy_permission_boundary_e2e.py::BOOTSTRAP_PREDICATE_NAME`) --
+        # it gates whether ephemeralMessage-based PreInvocation injection is
+        # attempted at all, replacing the toolCall-only
+        # `pre_invocation_injected_tool_call` predicate below in that role
+        # (upstream google-antigravity/antigravity-cli#728 only breaks
+        # `toolCall`; ephemeralMessage injectSteps are independently
+        # confirmed accepted -- see references/failure-class-taxonomy.md).
+        "pre_invocation_ephemeral_message_injection": "bootstrap_prerequisite",
+        # Retained (unrenamed) for the hermetic hook-dispatch harness's own
+        # toolCall-based injection contract (#1814/PR #1957 hermetic harness
+        # reimplementation is explicitly Out of Scope for #1979) and for
+        # `test_setup_check.py`'s existing `--require-capability` assertion,
+        # which is outside this Issue's Allowed Paths.
         "pre_invocation_injected_tool_call": "bootstrap_prerequisite",
         "pre_tool_use_verdict": "claim_under_test",
         "post_tool_use_dispatch": "claim_under_test",

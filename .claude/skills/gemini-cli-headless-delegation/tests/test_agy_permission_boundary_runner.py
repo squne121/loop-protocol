@@ -26,10 +26,10 @@ def _supported_capability_gate() -> dict[str, object]:
     """Issue #1979 AC2 test double: a bootstrap predicate reported `supported`.
 
     Used to exercise post-gate live-runner behavior in isolation from the
-    real (currently hardcoded-unsupported, per upstream #728) gate result.
+    real (currently `inconclusive`, deferred-to-live-run) gate result.
     """
     return {
-        "bootstrap_predicate": "pre_invocation_injected_tool_call",
+        "bootstrap_predicate": "pre_invocation_ephemeral_message_injection",
         "predicate_kind": "bootstrap_prerequisite",
         "status": "supported",
         "reason_code": "test_override_supported",
@@ -401,10 +401,16 @@ def test_live_authentication_unavailable_is_exit_77_without_capability_probe(
     _fake_agy(fake)
     monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
     monkeypatch.setattr(MODULE, "_version", lambda _path: ("agy 1.1.9", True))
+    # Issue #1979 (2026-08-04 revision): the gate now only short-circuits on
+    # a genuine `unsupported` bootstrap predicate, not `inconclusive` -- so
+    # this test (which targets the auth-failure-output detection path, not
+    # the capability gate) supplies an explicit `supported` override to
+    # isolate that behavior from the real predicate's `inconclusive` result.
+    monkeypatch.setattr(MODULE, "_bootstrap_capability_gate", _supported_capability_gate)
     monkeypatch.setattr(
         MODULE,
         "_invoke",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(["agy"], 1, "", "authentication required"),
+        lambda *_args, **_kwargs: _invoke_result(1, stderr="authentication required"),
     )
     exit_code, artifact = MODULE._run(
         argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
@@ -427,10 +433,11 @@ def test_main_preserves_schema_valid_live_auth_unavailable_exit_77(
     artifact_dir = tmp_path / "artifacts"
     monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
     monkeypatch.setattr(MODULE, "_version", lambda _path: ("agy 1.1.9", True))
+    monkeypatch.setattr(MODULE, "_bootstrap_capability_gate", _supported_capability_gate)
     monkeypatch.setattr(
         MODULE,
         "_invoke",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(["agy"], 1, "", "authentication required"),
+        lambda *_args, **_kwargs: _invoke_result(1, stderr="authentication required"),
     )
     monkeypatch.setattr(
         sys,
@@ -516,9 +523,14 @@ def test_live_auth_bootstrap_unavailable_is_exit_77_before_hook_probe(
     assert artifact["runner"]["actual_agy_executed"] is False
 
 
-def test_live_hook_nonfire_is_inconclusive_not_auth_unavailable(
+def test_live_hook_nonfire_is_prompt_noncompliant_not_auth_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Issue #1979 AC8: when `_invoke` never produces any `PreToolUse`
+    evidence across the bounded retry budget, every capability ends up
+    prompt-noncompliant -- `EXIT_PROMPT_NONCOMPLIANT`(78), never the old
+    `FAILURE_INCONCLUSIVE`/exit-1 (which would silently conflate "hook never
+    fired" with "prompt not complied with")."""
     fake = tmp_path / "agy"
     _fake_agy(fake)
     runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
@@ -532,10 +544,14 @@ def test_live_hook_nonfire_is_inconclusive_not_auth_unavailable(
         argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
     )
 
-    assert exit_code == 1
-    assert artifact["failure_taxonomy"]["class"] == MODULE.FAILURE_INCONCLUSIVE
+    assert exit_code == MODULE.EXIT_PROMPT_NONCOMPLIANT
+    assert artifact["failure_taxonomy"]["class"] == MODULE.FAILURE_PROMPT_NONCOMPLIANT
     assert artifact["runner"]["actual_agy_executed"] is True
     assert all(not attempt["predicates"]["pre_tool_use_present"] for attempt in artifact["attempts"])
+    assert set(artifact["prompt_compliance"]) == set(MODULE.CAPABILITIES)
+    for record in artifact["prompt_compliance"].values():
+        assert record["compliant"] is False
+        assert record["attempts"] == 3
     assert artifact["diagnostic_ledger"] == {
         "pre_invocation_hook_started": False,
         "pre_invocation_context_accepted": False,
@@ -547,8 +563,11 @@ def test_live_hook_nonfire_is_inconclusive_not_auth_unavailable(
     }
 
 
-def test_missing_injected_attempt_is_inconclusive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """An absent injected attempt is boundary failure, never completion evidence."""
+def test_missing_injected_attempt_is_prompt_noncompliant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #1979 AC8: an absent injected attempt (no `PreToolUse` ever
+    observed for a capability across the bounded retry budget) is a distinct
+    prompt-noncompliance non-completion path -- `EXIT_PROMPT_NONCOMPLIANT`(78),
+    never silently scored as an allow/deny verdict."""
     fake = tmp_path / "agy"
     _fake_agy(fake)
     runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
@@ -562,11 +581,11 @@ def test_missing_injected_attempt_is_inconclusive(tmp_path: Path, monkeypatch: p
         argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
     )
 
-    assert exit_code == 1
+    assert exit_code == MODULE.EXIT_PROMPT_NONCOMPLIANT
     assert artifact["failure_taxonomy"] == {
-        "class": MODULE.FAILURE_INCONCLUSIVE,
+        "class": MODULE.FAILURE_PROMPT_NONCOMPLIANT,
         "completion": False,
-        "retry": "fix_or_reprobe",
+        "retry": "reattempt_prompt",
     }
     assert artifact["runner"]["actual_agy_executed"] is True
     for attempt in artifact["attempts"]:
@@ -579,6 +598,8 @@ def test_missing_injected_attempt_is_inconclusive(tmp_path: Path, monkeypatch: p
             "same_attempt_correlation": False,
             "logger_failure_absent": True,
         }
+    assert set(artifact["prompt_compliance"]) == set(MODULE.CAPABILITIES)
+    assert all(record["compliant"] is False for record in artifact["prompt_compliance"].values())
     assert MODULE.validate_artifact(artifact) == (True, "valid")
 
 

@@ -32,7 +32,7 @@ def test_unavailable_artifact_carries_the_new_fields_and_is_schema_valid() -> No
     schema = json.loads(MODULE.SCHEMA_PATH.read_text(encoding="utf-8"))
     assert list(Draft202012Validator(schema).iter_errors(artifact)) == []
 
-    assert artifact["capability_gate"]["bootstrap_predicate"] == "pre_invocation_injected_tool_call"
+    assert artifact["capability_gate"]["bootstrap_predicate"] == "pre_invocation_ephemeral_message_injection"
     assert artifact["capability_gate"]["status"] in {"supported", "unsupported", "unavailable", "inconclusive", "evidence_invalid"}
     assert artifact["mcp"] == {
         "status": "unsupported_by_design",
@@ -179,12 +179,14 @@ def test_producer_still_always_emits_the_additive_fields() -> None:
     runner's own producer never regresses to omitting the new evidence.
     """
     artifact = MODULE._unavailable_artifact(MODULE.FAILURE_UNAVAILABLE, profile="no_tools")
-    for key in ("capability_gate", "mcp", "pairing"):
+    for key in ("capability_gate", "mcp", "pairing", "attempt_method", "prompt_compliance"):
         assert key in artifact
     assert "binary_identity" in artifact["runner"]
     assert "tool_inventory_digest" in artifact["matrix"]
     assert "process_group_isolated" in artifact["cleanup"]
     assert "descendant_processes_absent" in artifact["cleanup"]
+    assert artifact["attempt_method"] == "ephemeral_message_prompt"
+    assert artifact["prompt_compliance"] == {}
 
 
 # Issue #1979 fix_delta blocker_4: aggregate manifest is a non-self-referential
