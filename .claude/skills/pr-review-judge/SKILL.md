@@ -219,7 +219,7 @@ gh pr comment <PR番号> --repo <owner>/<repo> --body-file <本文テキスト�
   8. `unknown action-executor-skill` — action の routing 先 skill が routing table に存在しない場合
      → `status: blocked` で人間判断へ差し戻す
 
-### ALLOWED_PATHS_GATE_RESULT_V1（Allowed Paths 判定結果、destination: references/allowed-paths-gate.md）
+### ALLOWED_PATHS_GATE_RESULT_V1（Allowed Paths 判定結果、正本移譲先: references/allowed-paths-gate.md）
 
 PR review 後に `allowed_paths_review_gate.py` を使って changed files の契約違反を再計算する。
 canonical source（live linked issue 本文の扱い）・`status`（`ok | fail_closed | indeterminate`）の
