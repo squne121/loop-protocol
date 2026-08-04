@@ -41,13 +41,33 @@
  *   tracking remains valid and continuous across reloads within the same
  *   page.
  *
- * `flushAudit()` contract: performs a round-trip `send()` on the SAME CDP
- * session used for the audit. CDP delivers messages on a single session
- * strictly in the order the browser sent them, so any `DOMStorage.*` event
- * already dispatched by the browser before `flushAudit()` is called is
- * guaranteed to have been delivered to this module's event handlers (and
- * therefore be present in `writeLog`) before `flushAudit()`'s returned
- * promise resolves. Callers MUST await `flushAudit()` immediately before
+ * `flushAudit()` contract (OWNER REQUEST_CHANGES repair, PR #1989 review,
+ * issuecomment-5179331591, P1 blocker): a bare CDP command round-trip (e.g.
+ * re-sending `DOMStorage.enable`) is NOT a causal drain. Chromium's
+ * `localStorage.setItem()` updates the renderer-side cache synchronously,
+ * but notifies the browser process (the source of `DOMStorage.*` CDP
+ * events) via an async Mojo `Put()` call — the Inspector-facing event is
+ * only generated later, from `StorageAreaObserver::KeyChanged()`. A command
+ * round-trip only proves that events already IN FLIGHT to this CDP session
+ * have been delivered; it does NOT prove that a JS-level write which just
+ * returned has already been turned into a delivered event.
+ *
+ * `flushAudit()` instead writes-then-deletes a reserved marker key (a
+ * per-`attachWriteSetAudit()`-call random key, never exposed in `writeLog`)
+ * from the SAME page/origin via `page.evaluate()`, and waits for this
+ * module's own listener to observe the marker's
+ * `DOMStorage.domStorageItemRemoved` event. Chromium tracks pending storage
+ * mutations from a given source in a per-source FIFO queue, so the
+ * marker's removal event cannot be observed before every mutation this
+ * module's caller triggered earlier from the same page/origin has already
+ * been turned into its own event — making the marker's arrival a genuine
+ * causal boundary for "every prior mutation from this page has an event
+ * recorded in `writeLog`" (not merely "every event already in flight to
+ * this session has been delivered"). The marker never remains in
+ * `localStorage` after `flushAudit()` resolves (write and delete happen in
+ * the same `page.evaluate()` call) and is filtered out of the public
+ * `writeLog` so it never pollutes caller assertions (exact key-set checks
+ * included). Callers MUST await `flushAudit()` immediately before
  * `page.reload()` and immediately before reading `writeLog` for assertions
  * — without this drain barrier, a fire-and-forget event delivery race could
  * silently produce a false-green (an in-scope or out-of-scope mutation that
@@ -116,26 +136,73 @@ export async function attachWriteSetAudit(
     epochOrder += 1
   }
 
+  // OWNER REQUEST_CHANGES repair (PR #1989 review, issuecomment-5179331591,
+  // P1 blocker): reserved marker key used by `flushAudit()` below as a
+  // causal drain boundary. Random per `attachWriteSetAudit()` call so it
+  // cannot collide with any real application key. Never recorded into the
+  // public `writeLog` (filtered in every listener below) and never left
+  // behind in `localStorage` (write + delete happen in the same
+  // `page.evaluate()` call inside `flushAudit()`).
+  const FLUSH_MARKER_KEY = `__attachWriteSetAudit_flush_marker_${Math.random().toString(36).slice(2)}__`
+  const pendingFlushWaiters: Array<() => void> = []
+
   client.on('DOMStorage.domStorageItemAdded', (event) => {
-    if (event.storageId.isLocalStorage) record('setItem', event.key)
+    if (!event.storageId.isLocalStorage) return
+    if (event.key === FLUSH_MARKER_KEY) return
+    record('setItem', event.key)
   })
   client.on('DOMStorage.domStorageItemUpdated', (event) => {
-    if (event.storageId.isLocalStorage) record('setItem', event.key)
+    if (!event.storageId.isLocalStorage) return
+    if (event.key === FLUSH_MARKER_KEY) return
+    record('setItem', event.key)
   })
   client.on('DOMStorage.domStorageItemRemoved', (event) => {
-    if (event.storageId.isLocalStorage) record('removeItem', event.key)
+    if (!event.storageId.isLocalStorage) return
+    if (event.key === FLUSH_MARKER_KEY) {
+      // Causal drain signal for flushAudit() — see module-level doc comment
+      // and flushAudit()'s own comment below. Not a recorded operation.
+      const waiter = pendingFlushWaiters.shift()
+      waiter?.()
+      return
+    }
+    record('removeItem', event.key)
   })
   client.on('DOMStorage.domStorageItemsCleared', (event) => {
     if (event.storageId.isLocalStorage) record('clear', null)
   })
 
-  // P1 Blocker 2 fix: forces delivery of any DOMStorage event the browser
-  // already sent on this SAME CDP session before this call resolves (CDP
-  // messages on one session are delivered strictly in send order), so
-  // callers can await this immediately before reload / before reading
-  // writeLog for assertions.
+  // OWNER REQUEST_CHANGES repair (PR #1989 review, issuecomment-5179331591,
+  // P1 blocker): see the module-level `flushAudit()` contract doc comment
+  // above for the full causal-drain rationale. In short: a bare CDP command
+  // round-trip proves only that events already in flight to this session
+  // have arrived, not that a JS write which just returned has already
+  // become an event. Writing-then-deleting a same-page/origin marker key
+  // and waiting for the marker's OWN removal event to arrive gives a
+  // genuine causal boundary, because Chromium processes pending storage
+  // mutations from a given source in FIFO order.
   async function flushAudit(): Promise<void> {
-    await client.send('DOMStorage.enable')
+    const markerObserved = new Promise<void>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        reject(
+          new Error(
+            'flushAudit: timed out waiting for the internal drain marker\'s ' +
+              'DOMStorage.domStorageItemRemoved event (this indicates a CDP ' +
+              'DOMStorage event delivery problem, not a normal test failure)',
+          ),
+        )
+      }, 5_000)
+      pendingFlushWaiters.push(() => {
+        clearTimeout(timeoutId)
+        resolve()
+      })
+    })
+
+    await page.evaluate((markerKey: string) => {
+      window.localStorage.setItem(markerKey, '1')
+      window.localStorage.removeItem(markerKey)
+    }, FLUSH_MARKER_KEY)
+
+    await markerObserved
   }
 
   return { writeLog, flushAudit }
