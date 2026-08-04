@@ -47,8 +47,12 @@ export type VisualScenarioFixtureStatus = 'active-fixture-only' | 'pending-fixtu
  */
 export const VISUAL_SCENARIO_STATUS: Readonly<Record<VisualScenarioName, VisualScenarioFixtureStatus>> = {
   'running-hud': 'active-fixture-only',
-  'running-hud-paused': 'pending-fixture',
-  'result-timeout': 'pending-fixture',
+  // Issue #1376 AC12: pause overlay / result screen surfaces merged in this
+  // PR, so these two scenarios are promoted from 'pending-fixture' to
+  // 'active-fixture-only'. 'final-no-command-rail' remains pending
+  // ('final' command-rail removal is #1377's Out of Scope boundary).
+  'running-hud-paused': 'active-fixture-only',
+  'result-timeout': 'active-fixture-only',
   'final-no-command-rail': 'pending-fixture',
 }
 
@@ -132,8 +136,12 @@ export const VISUAL_BASELINE_REGISTRY_MATURITY: Readonly<
 > = {
   'timeout-overlay': 'frozen',
   'running-hud': 'legacy-current',
-  'running-hud-paused': 'pending-baseline',
-  'result-overlay-timeout': 'pending-baseline',
+  // Issue #1376 AC12: promoted 'pending-baseline' -> 'legacy-current' (not
+  // 'frozen' -- frozen requires a merged PR SHA per
+  // docs/dev/visual-baseline-registry.md's transition rules, deferred to
+  // after #1377 per established precedent for the other overlay rows).
+  'running-hud-paused': 'legacy-current',
+  'result-overlay-timeout': 'legacy-current',
   'final-no-command-rail': 'pending-baseline',
   'running-hud-overlay-legacy-current': 'legacy-current',
 }

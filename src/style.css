@@ -177,7 +177,7 @@ button:focus-visible {
    * "content clipped inside an inner frame" look. The compact `.combat-hud`
    * (P1-3) is sized/lightened to fit the Canvas viewport without needing
    * scroll during the running phase; `overflow-y: auto` is kept only as a
-   * last-resort safety net (e.g. the `.legacy-result-surface` compatibility
+   * last-resort safety net (e.g. the `.legacy-debrief-surface` compatibility
    * panels, pre-existing before #1375) and must not be relied on to make
    * running-phase HUD content fit. */
   overflow-y: auto;
@@ -228,7 +228,7 @@ button:focus-visible {
 }
 
 .battle-hud-layer > .panel,
-.battle-hud-layer .legacy-result-surface > .panel {
+.battle-hud-layer .legacy-debrief-surface > .panel {
   inline-size: min(320px, calc(100% - 16px));
   max-inline-size: 100%;
 }
@@ -307,7 +307,7 @@ button:focus-visible {
  * #1376). Behaves like the pre-#1375 single-column HUD stack it replaces:
  * a grid of `.panel` rows, right-aligned, matching `.battle-hud-layer`'s
  * own grid so both HUD roots occupy the same layout track. */
-.legacy-result-surface {
+.legacy-debrief-surface {
   display: grid;
   /* Issue #1375 PR #1925 owner playtest (P0, iteration 4): the three
    * `.panel` rows below (Sortie / Pilot updates / actions) stacked with the
@@ -328,7 +328,7 @@ button:focus-visible {
  * the `display: grid` rule directly above has higher specificity/origin
  * than the UA stylesheet's `[hidden] { display: none }` and must be
  * restated here explicitly. */
-.legacy-result-surface[hidden] {
+.legacy-debrief-surface[hidden] {
   display: none;
 }
 
@@ -348,11 +348,11 @@ button:focus-visible {
 }
 
 /* Issue #1375 PR #1925 owner playtest (P0, iteration 4): reduce padding
- * specifically for the `.legacy-result-surface` compatibility panels (see
+ * specifically for the `.legacy-debrief-surface` compatibility panels (see
  * that rule's comment) so their combined height fits the Canvas viewport
  * without a scroll boundary hiding the action buttons. Does not affect
  * `.panel` usage elsewhere (there is none outside this legacy surface). */
-.legacy-result-surface > .panel {
+.legacy-debrief-surface > .panel {
   padding: 14px;
 }
 
@@ -362,30 +362,30 @@ button:focus-visible {
  * "hud result action geometry" describe block) still overflowed
  * `.battle-stage__viewport` by ~40px at 1280x720/1366x768/1920x1080/
  * 1437x1365. These additional scoped rules only apply inside
- * `.legacy-result-surface` (never the shared `.stat-grid` / `.eyebrow` /
+ * `.legacy-debrief-surface` (never the shared `.stat-grid` / `.eyebrow` /
  * `button` styles used elsewhere, e.g. the preparation phase screen or the
  * combat HUD) so they cannot regress any other surface. */
-.legacy-result-surface .stat-grid {
+.legacy-debrief-surface .stat-grid {
   gap: 8px;
 }
 
-.legacy-result-surface .stat-grid div {
+.legacy-debrief-surface .stat-grid div {
   padding: 6px 10px;
 }
 
-.legacy-result-surface .stat-grid dt {
+.legacy-debrief-surface .stat-grid dt {
   margin-bottom: 4px;
 }
 
-.legacy-result-surface .stat-grid dd {
+.legacy-debrief-surface .stat-grid dd {
   font-size: 1.05rem;
 }
 
-.legacy-result-surface .eyebrow {
+.legacy-debrief-surface .eyebrow {
   margin: 0 0 4px;
 }
 
-.legacy-result-surface .status-copy--muted {
+.legacy-debrief-surface .status-copy--muted {
   margin-top: 4px;
 }
 
@@ -401,13 +401,13 @@ button:focus-visible {
 }
 
 /* Issue #1375 PR #1925 owner playtest (P0, iteration 4): tighten the action
- * button stack inside `.legacy-result-surface` alongside the panel padding /
+ * button stack inside `.legacy-debrief-surface` alongside the panel padding /
  * surface gap changes above, for the same fit-without-scroll reason. */
-.legacy-result-surface .panel--actions {
+.legacy-debrief-surface .panel--actions {
   gap: 8px;
 }
 
-.legacy-result-surface .panel--actions button {
+.legacy-debrief-surface .panel--actions button {
   padding: 0.55rem 1rem;
 }
 

@@ -147,10 +147,10 @@ function combatHudRoot(container: HTMLElement): HTMLElement {
   return root
 }
 
-function legacyResultSurface(container: HTMLElement): HTMLElement {
-  const root = container.querySelector<HTMLElement>('[data-legacy-result-surface]')
+function legacyDebriefSurface(container: HTMLElement): HTMLElement {
+  const root = container.querySelector<HTMLElement>('[data-legacy-debrief-surface]')
   if (!root) {
-    throw new Error('data-legacy-result-surface root not found')
+    throw new Error('data-legacy-debrief-surface root not found')
   }
   return root
 }
@@ -160,7 +160,6 @@ describe('HudController: data-combat-hud (running only, Issue #1375)', () => {
   let actions: {
     onAssistPlayerCommand: ReturnType<typeof vi.fn>
     onClaimReward: ReturnType<typeof vi.fn>
-    onConfirmResult: ReturnType<typeof vi.fn>
     onNextSortie: ReturnType<typeof vi.fn>
     onTogglePause: ReturnType<typeof vi.fn>
   }
@@ -171,18 +170,17 @@ describe('HudController: data-combat-hud (running only, Issue #1375)', () => {
     actions = {
       onAssistPlayerCommand: vi.fn(),
       onClaimReward: vi.fn(),
-      onConfirmResult: vi.fn(),
       onNextSortie: vi.fn(),
       onTogglePause: vi.fn(),
     }
     hudController = createHudController(container, actions)
   })
 
-  it('GIVEN running WHEN render called THEN data-combat-hud is visible/focusable and data-legacy-result-surface is hidden/inert (AC1)', () => {
+  it('GIVEN running WHEN render called THEN data-combat-hud is visible/focusable and data-legacy-debrief-surface is hidden/inert (AC1)', () => {
     hudController.render(createState('running'), false, PROD_FIXED_DELTA_MS)
 
     const combat = combatHudRoot(container)
-    const legacy = legacyResultSurface(container)
+    const legacy = legacyDebriefSurface(container)
 
     expect(combat.hidden).toBe(false)
     expect(combat.hasAttribute('inert')).toBe(false)
@@ -190,16 +188,54 @@ describe('HudController: data-combat-hud (running only, Issue #1375)', () => {
     expect(legacy.hasAttribute('inert')).toBe(true)
   })
 
-  it('GIVEN preparation (or any non-running phase) WHEN render called THEN data-combat-hud is hidden/inert and data-legacy-result-surface is visible (AC1)', () => {
+  it('GIVEN preparation (or any other non-debrief, non-running phase) WHEN render called THEN data-combat-hud AND data-legacy-debrief-surface are both hidden/inert (AC1, Issue #1376: result moved to phaseScreens.ts, legacy surface is debrief-only now)', () => {
     hudController.render(createState('preparation'), false, PROD_FIXED_DELTA_MS)
 
     const combat = combatHudRoot(container)
-    const legacy = legacyResultSurface(container)
+    const legacy = legacyDebriefSurface(container)
 
     expect(combat.hidden).toBe(true)
     expect(combat.hasAttribute('inert')).toBe(true)
-    expect(legacy.hidden).toBe(false)
-    expect(legacy.hasAttribute('inert')).toBe(false)
+    expect(legacy.hidden).toBe(true)
+    expect(legacy.hasAttribute('inert')).toBe(true)
+  })
+
+  it('GIVEN result phase WHEN render called THEN data-legacy-debrief-surface stays hidden/inert (AC1, Issue #1376: result responsibility moved to phaseScreens.ts)', () => {
+    hudController.render(createState('result'), false, PROD_FIXED_DELTA_MS)
+
+    const legacy = legacyDebriefSurface(container)
+    expect(legacy.hidden).toBe(true)
+    expect(legacy.hasAttribute('inert')).toBe(true)
+    expect(legacy.querySelector('[data-action="confirm-result"]')).toBeNull()
+  })
+
+  it('GIVEN debrief_pending_reward or debrief_reward_claimed WHEN render called THEN data-legacy-debrief-surface is visible (AC1)', () => {
+    hudController.render(createState('debrief_pending_reward'), false, PROD_FIXED_DELTA_MS)
+    expect(legacyDebriefSurface(container).hidden).toBe(false)
+    expect(legacyDebriefSurface(container).hasAttribute('inert')).toBe(false)
+
+    hudController.render(createState('debrief_reward_claimed'), false, PROD_FIXED_DELTA_MS)
+    expect(legacyDebriefSurface(container).hidden).toBe(false)
+    expect(legacyDebriefSurface(container).hasAttribute('inert')).toBe(false)
+  })
+
+  it('GIVEN running AND paused WHEN render called THEN combat HUD stays visible but becomes inert (AC4)', () => {
+    hudController.render(createState('running'), true, PROD_FIXED_DELTA_MS)
+
+    const combat = combatHudRoot(container)
+    expect(combat.hidden).toBe(false)
+    expect(combat.hasAttribute('inert')).toBe(true)
+    expect(combat.getAttribute('aria-hidden')).toBe('true')
+  })
+
+  it('GIVEN running AND unpaused WHEN render called after a paused render THEN combat HUD becomes non-inert again (AC4)', () => {
+    hudController.render(createState('running'), true, PROD_FIXED_DELTA_MS)
+    hudController.render(createState('running'), false, PROD_FIXED_DELTA_MS)
+
+    const combat = combatHudRoot(container)
+    expect(combat.hidden).toBe(false)
+    expect(combat.hasAttribute('inert')).toBe(false)
+    expect(combat.hasAttribute('aria-hidden')).toBe(false)
   })
 
   it('GIVEN running WHEN render called THEN the combat HUD surface contains only Hull/Kills/Elapsed/Weapon/Assist/Pause, never Mission phase/status/outcome/Pilot updates/raw telemetry/result actions (AC2)', () => {
@@ -470,8 +506,17 @@ describe('HudController: data-combat-hud (running only, Issue #1375)', () => {
     expect(actions.onAssistPlayerCommand).toHaveBeenCalledTimes(1)
     expect(actions.onTogglePause).toHaveBeenCalledTimes(1)
     expect(actions.onClaimReward).not.toHaveBeenCalled()
-    expect(actions.onConfirmResult).not.toHaveBeenCalled()
     expect(actions.onNextSortie).not.toHaveBeenCalled()
+  })
+
+  it('GIVEN Pause clicked WHEN onTogglePause fires THEN the invoking button element is threaded through (AC3, AC6)', () => {
+    hudController.render(createState('running'), false, PROD_FIXED_DELTA_MS)
+
+    const pauseButton = queryButton(container, 'toggle-pause')
+    pauseButton.click()
+
+    expect(actions.onTogglePause).toHaveBeenCalledTimes(1)
+    expect(actions.onTogglePause).toHaveBeenCalledWith(pauseButton)
   })
 })
 
@@ -490,12 +535,11 @@ describe('combatHud.ts: buildCombatHudViewModel / getCombatHudAssistStatusCopy (
   })
 })
 
-describe('HudController: data-legacy-result-surface (temporary compatibility, Issue #1375)', () => {
+describe('HudController: data-legacy-debrief-surface (temporary compatibility, Issue #1375/#1376)', () => {
   let container: HTMLElement
   let actions: {
     onAssistPlayerCommand: ReturnType<typeof vi.fn>
     onClaimReward: ReturnType<typeof vi.fn>
-    onConfirmResult: ReturnType<typeof vi.fn>
     onNextSortie: ReturnType<typeof vi.fn>
     onTogglePause: ReturnType<typeof vi.fn>
   }
@@ -506,50 +550,28 @@ describe('HudController: data-legacy-result-surface (temporary compatibility, Is
     actions = {
       onAssistPlayerCommand: vi.fn(),
       onClaimReward: vi.fn(),
-      onConfirmResult: vi.fn(),
       onNextSortie: vi.fn(),
       onTogglePause: vi.fn(),
     }
     hudController = createHudController(container, actions)
   })
 
-  it('GIVEN preparation WHEN render called THEN legacy action surface renders and is not gated by combat-only fields', () => {
-    hudController.render(createState('preparation'), false, PROD_FIXED_DELTA_MS)
+  it('GIVEN debrief_pending_reward WHEN render called THEN legacy action surface renders and is not gated by combat-only fields', () => {
+    hudController.render(createState('debrief_pending_reward'), false, PROD_FIXED_DELTA_MS)
 
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Pre-launch')
-    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
-    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
+    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Debrief in progress')
+    expect(queryButton(container, 'claim-reward').disabled).toBe(false)
     expect(queryButton(container, 'next-sortie').disabled).toBe(true)
   })
 
-  it('GIVEN the legacy action surface WHEN rendered THEN interactive buttons opt in via data-battle-interactive', () => {
-    hudController.render(createState('preparation'), false, PROD_FIXED_DELTA_MS)
+  it('GIVEN the legacy action surface WHEN rendered THEN interactive buttons opt in via data-battle-interactive, and confirm-result no longer exists on this surface (AC1, Issue #1376)', () => {
+    hudController.render(createState('debrief_pending_reward'), false, PROD_FIXED_DELTA_MS)
 
-    const interactiveButtons = Array.from(
-      legacyResultSurface(container).querySelectorAll<HTMLButtonElement>('[data-action]'),
-    )
+    const surface = legacyDebriefSurface(container)
+    const interactiveButtons = Array.from(surface.querySelectorAll<HTMLButtonElement>('[data-action]'))
     expect(interactiveButtons.length).toBeGreaterThan(0)
     expect(interactiveButtons.every((button) => button.dataset.battleInteractive === 'true')).toBe(true)
-  })
-
-  it('GIVEN result phase with pending reward WHEN render called THEN confirm-result enabled, claim-reward disabled (AC4, AC5)', () => {
-    hudController.render(createState('result', 'pending'), false, PROD_FIXED_DELTA_MS)
-
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Mission review')
-    expect(container.querySelector('[data-field="sortie-status"]')?.textContent).toBe('Area secured')
-    expect(container.querySelector('[data-field="sortie-result"]')?.textContent).toBe('Victory')
-    // AC5: confirmResult auto-claims; claim-reward is legacy debrief only
-    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
-    expect(queryButton(container, 'confirm-result').disabled).toBe(false)
-    expect(queryButton(container, 'next-sortie').disabled).toBe(true)
-  })
-
-  it('GIVEN result phase with claimed reward WHEN render called THEN confirm-result is still enabled (AC5)', () => {
-    hudController.render(createState('result', 'claimed'), false, PROD_FIXED_DELTA_MS)
-
-    expect(container.querySelector('[data-field="loop-phase"]')?.textContent).toBe('Mission review')
-    expect(queryButton(container, 'confirm-result').disabled).toBe(false)
-    expect(queryButton(container, 'claim-reward').disabled).toBe(true)
+    expect(surface.querySelector('[data-action="confirm-result"]')).toBeNull()
   })
 
   it('GIVEN debrief_pending_reward WHEN render called THEN debrief copy enables reward collection only', () => {
@@ -649,7 +671,6 @@ describe('Issue #914: HUD action harness -- next-sortie and confirm-result', () 
 
     const hudController = createHudController(container, {
       onClaimReward: vi.fn(),
-      onConfirmResult: vi.fn(),
       onNextSortie,
       onTogglePause: vi.fn(),
     })
@@ -671,7 +692,7 @@ describe('Issue #914: HUD action harness -- next-sortie and confirm-result', () 
     )
   })
 
-  it('AC2-AC3: GIVEN result + pending reward WHEN confirm-result click via runConfirmResultHandler with fake save success THEN state.telemetry shows "Result confirmed." / "Progress saved locally." and fakeProgressionStorageSave called exactly once', () => {
+  it('AC2-AC3: GIVEN result + pending reward WHEN confirm-result click via runConfirmResultHandler with fake save success THEN state.telemetry shows "Result confirmed." / "Progress saved locally." and fakeProgressionStorageSave called exactly once (Issue #1376: Return to hangar moved to phaseScreens.ts)', () => {
     const state = createState('result', 'pending')
     const fakeProgressionStorageSave = vi.fn(() => ({ ok: true as const }))
 
@@ -689,20 +710,27 @@ describe('Issue #914: HUD action harness -- next-sortie and confirm-result', () 
         },
         resetDebugPause: vi.fn(),
       })
-      renderHudAfterAction()
+      renderAfterAction()
     })
 
-    const hudController = createHudController(container, {
-      onClaimReward: vi.fn(),
+    const controller = createPhaseScreenController(container, {
+      onNewGame: vi.fn(),
+      onOpenLoadMenu: vi.fn(),
+      onBackFromLoadMenu: vi.fn(),
+      onConfirmLoad: vi.fn(),
+      onStartSortie: vi.fn(),
+      onSave: vi.fn(),
+      onReset: vi.fn(),
+      onUpgradeWeapon: vi.fn(),
+      canLoadGame: vi.fn(() => false),
       onConfirmResult,
-      onNextSortie: vi.fn(),
-      onTogglePause: vi.fn(),
+      onResume: vi.fn(),
     })
 
-    hudController.render(state, false, PROD_FIXED_DELTA_MS)
+    controller.render(state, false)
 
-    function renderHudAfterAction() {
-      hudController.render(state, false, PROD_FIXED_DELTA_MS)
+    function renderAfterAction() {
+      controller.render(state, false)
     }
 
     expect(queryButton(container, 'confirm-result').disabled).toBe(false)
@@ -710,8 +738,8 @@ describe('Issue #914: HUD action harness -- next-sortie and confirm-result', () 
 
     expect(onConfirmResult).toHaveBeenCalledTimes(1)
     expect(state.loopPhase).toBe('preparation')
-    expect(container.querySelector('[data-field="status"]')?.textContent).toBe('Result confirmed.')
-    expect(container.querySelector('[data-field="command"]')?.textContent).toBe('Progress saved locally.')
+    expect(state.telemetry.status).toBe('Result confirmed.')
+    expect(state.telemetry.lastCommandSummary).toBe('Progress saved locally.')
     expect(fakeProgressionStorageSave).toHaveBeenCalledTimes(1)
   })
 })
@@ -721,14 +749,20 @@ describe('Issue #914: HUD action harness -- next-sortie and confirm-result', () 
 // ---------------------------------------------------------------------------
 
 describe('phaseScreens: pure helpers', () => {
-  it('getVisiblePhaseScreen maps title_menu/load_menu/preparation to their screen id and everything else to null (AC5)', () => {
-    expect(getVisiblePhaseScreen('title_menu')).toBe('title')
-    expect(getVisiblePhaseScreen('load_menu')).toBe('load')
-    expect(getVisiblePhaseScreen('preparation')).toBe('preparation')
-    expect(getVisiblePhaseScreen('running')).toBeNull()
-    expect(getVisiblePhaseScreen('result')).toBeNull()
-    expect(getVisiblePhaseScreen('debrief_pending_reward')).toBeNull()
-    expect(getVisiblePhaseScreen('debrief_reward_claimed')).toBeNull()
+  it('getVisiblePhaseScreen maps title_menu/load_menu/preparation/result to their screen id and everything else to null when unpaused (AC2, AC5, Issue #1376: result joined the phase table)', () => {
+    expect(getVisiblePhaseScreen('title_menu', false)).toBe('title')
+    expect(getVisiblePhaseScreen('load_menu', false)).toBe('load')
+    expect(getVisiblePhaseScreen('preparation', false)).toBe('preparation')
+    expect(getVisiblePhaseScreen('result', false)).toBe('result')
+    expect(getVisiblePhaseScreen('running', false)).toBeNull()
+    expect(getVisiblePhaseScreen('debrief_pending_reward', false)).toBeNull()
+    expect(getVisiblePhaseScreen('debrief_reward_claimed', false)).toBeNull()
+  })
+
+  it('getVisiblePhaseScreen returns "pause" whenever isPaused is true, regardless of loopPhase (AC2, AC3, Issue #1376)', () => {
+    expect(getVisiblePhaseScreen('running', true)).toBe('pause')
+    expect(getVisiblePhaseScreen('preparation', true)).toBe('pause')
+    expect(getVisiblePhaseScreen('result', true)).toBe('pause')
   })
 
   it('resolveLoadMenuBackIntent selects back_to_preparation for preparation origin and back_to_title otherwise (AC8)', () => {
@@ -759,6 +793,8 @@ describe('phaseScreens: createPhaseScreenController', () => {
     onReset: ReturnType<typeof vi.fn>
     onUpgradeWeapon: ReturnType<typeof vi.fn>
     canLoadGame: ReturnType<typeof vi.fn>
+    onConfirmResult: ReturnType<typeof vi.fn>
+    onResume: ReturnType<typeof vi.fn>
   }
   let controller: ReturnType<typeof createPhaseScreenController>
 
@@ -774,12 +810,14 @@ describe('phaseScreens: createPhaseScreenController', () => {
       onReset: vi.fn(),
       onUpgradeWeapon: vi.fn(),
       canLoadGame: vi.fn(() => true),
+      onConfirmResult: vi.fn(),
+      onResume: vi.fn(),
     }
     controller = createPhaseScreenController(container, actions)
   })
 
   it('GIVEN title_menu WHEN render called THEN only the title screen is visible (not hidden/inert) and New Game / Open save exist (AC1)', () => {
-    controller.render(createState('title_menu'))
+    controller.render(createState('title_menu'), false)
 
     const title = container.querySelector<HTMLElement>('[data-phase-screen="title"]')
     const load = container.querySelector<HTMLElement>('[data-phase-screen="load"]')
@@ -796,7 +834,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
   })
 
   it('GIVEN preparation WHEN render called THEN the preparation screen is visible and Launch sortie / Save / Reset are enabled (AC2)', () => {
-    controller.render(createState('preparation'))
+    controller.render(createState('preparation'), false)
 
     const preparation = container.querySelector<HTMLElement>('[data-phase-screen="preparation"]')
     expect(preparation?.hidden).toBe(false)
@@ -807,7 +845,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
   })
 
   it('GIVEN running WHEN render called THEN the outer screen layer and every phase screen are hidden and inert (AC3, AC6)', () => {
-    controller.render(createState('running'))
+    controller.render(createState('running'), false)
 
     expect(container.hidden).toBe(true)
     expect(container.hasAttribute('inert')).toBe(true)
@@ -820,7 +858,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
   })
 
   it('GIVEN title_menu WHEN Open save is clicked THEN onOpenLoadMenu fires with origin title_menu (intent-only, AC8)', () => {
-    controller.render(createState('title_menu'))
+    controller.render(createState('title_menu'), false)
 
     queryButton(container, 'open-load-menu-title').click()
 
@@ -828,7 +866,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
   })
 
   it('GIVEN preparation WHEN Open save is clicked THEN onOpenLoadMenu fires with origin preparation (intent-only, AC8)', () => {
-    controller.render(createState('preparation'))
+    controller.render(createState('preparation'), false)
 
     queryButton(container, 'open-load-menu-preparation').click()
 
@@ -836,7 +874,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
   })
 
   it('GIVEN load_menu WHEN Back is clicked THEN onBackFromLoadMenu fires (intent-only -- origin bookkeeping lives in main.ts, AC8)', () => {
-    controller.render(createState('load_menu'))
+    controller.render(createState('load_menu'), false)
 
     queryButton(container, 'back-from-load-menu').click()
 
@@ -844,7 +882,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
   })
 
   it('GIVEN load_menu WHEN Load saved game is clicked THEN onConfirmLoad fires (AC9)', () => {
-    controller.render(createState('load_menu'))
+    controller.render(createState('load_menu'), false)
 
     queryButton(container, 'confirm-load').click()
 
@@ -856,7 +894,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
     state.telemetry.status = 'Load Game failed.'
     state.telemetry.lastCommandSummary = 'No save data found.'
 
-    controller.render(state)
+    controller.render(state, false)
 
     expect(container.querySelector('[data-field="load-status"]')?.textContent).toBe('Load Game failed.')
     const loadScreen = container.querySelector<HTMLElement>('[data-phase-screen="load"]')
@@ -870,15 +908,15 @@ describe('phaseScreens: createPhaseScreenController', () => {
     // save" messaging there -- only the confirm action is gated.
     actions.canLoadGame.mockReturnValue(false)
 
-    controller.render(createState('title_menu'))
+    controller.render(createState('title_menu'), false)
     expect(queryButton(container, 'open-load-menu-title').disabled).toBe(false)
 
-    controller.render(createState('load_menu'))
+    controller.render(createState('load_menu'), false)
     expect(queryButton(container, 'confirm-load').disabled).toBe(true)
   })
 
   it('GIVEN preparation WHEN render called with an upgradeView THEN Weapon Power, cost, and status render (AC2)', () => {
-    controller.render(createState('preparation'), {
+    controller.render(createState('preparation'), false, {
       definitionId: 'weapon_power_plus_1',
       cost: 100,
       weaponPower: 9,
@@ -898,7 +936,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
     const state = createState('preparation')
     state.progress.weaponPower = 4
 
-    controller.render(state)
+    controller.render(state, false)
 
     expect(container.querySelector('[data-field="prep-weapon-power"]')?.textContent).toBe('4')
     expect(queryButton(container, 'upgrade-weapon').disabled).toBe(true)
@@ -906,7 +944,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
   })
 
   it('GIVEN an enabled upgrade button WHEN it is clicked THEN onUpgradeWeapon fires exactly once', () => {
-    controller.render(createState('preparation'), {
+    controller.render(createState('preparation'), false, {
       definitionId: 'weapon_power_plus_1',
       cost: 100,
       weaponPower: 1,
@@ -920,7 +958,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
   })
 
   it('does not leak internal upgrade failure reason (AC4 mapping table boundary)', () => {
-    controller.render(createState('preparation'), {
+    controller.render(createState('preparation'), false, {
       definitionId: 'weapon_power_plus_1',
       cost: 100,
       weaponPower: 1,
@@ -952,7 +990,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
   })
 
   it('GIVEN any state WHEN rendered THEN no raw LoopPhase enum copy leaks into overlay text', () => {
-    controller.render(createState('load_menu'))
+    controller.render(createState('load_menu'), false)
 
     const textSurface = container.textContent ?? ''
     expect(textSurface).not.toContain('title_menu')
@@ -971,7 +1009,7 @@ describe('phaseScreens: createPhaseScreenController', () => {
     state.telemetry.status = 'Save complete.'
     state.telemetry.lastCommandSummary = 'Progression snapshot saved locally.'
 
-    controller.render(state)
+    controller.render(state, false)
 
     expect(container.querySelector('[data-field="prep-status"]')?.textContent).toBe(
       'Save complete. Progression snapshot saved locally.',
@@ -985,8 +1023,210 @@ describe('phaseScreens: createPhaseScreenController', () => {
     state.telemetry.status = 'Load Game failed.'
     state.telemetry.lastCommandSummary = 'No save data available.'
 
-    controller.render(state)
+    controller.render(state, false)
 
     expect(container.querySelector('[data-field="prep-status"]')?.textContent).toBe('')
   })
 })
+
+// ---------------------------------------------------------------------------
+// phaseScreens: result screen (Issue #1376, AC1, AC7, AC8, AC9)
+//
+// Moved from HudController's temporary legacy result surface. jsdom-level
+// coverage here targets DOM wiring / reward math / disabled-state gating;
+// real accessible-role/name uniqueness (AC9) and focus semantics (AC7) are
+// covered by the real Playwright checks in tests/e2e/m3-loop-mvp.spec.ts
+// (Runtime Verification Applicability: immediate).
+// ---------------------------------------------------------------------------
+
+describe('phaseScreens: result screen (Issue #1376)', () => {
+  let container: HTMLElement
+  let actions: {
+    onNewGame: ReturnType<typeof vi.fn>
+    onOpenLoadMenu: ReturnType<typeof vi.fn>
+    onBackFromLoadMenu: ReturnType<typeof vi.fn>
+    onConfirmLoad: ReturnType<typeof vi.fn>
+    onStartSortie: ReturnType<typeof vi.fn>
+    onSave: ReturnType<typeof vi.fn>
+    onReset: ReturnType<typeof vi.fn>
+    onUpgradeWeapon: ReturnType<typeof vi.fn>
+    canLoadGame: ReturnType<typeof vi.fn>
+    onConfirmResult: ReturnType<typeof vi.fn>
+    onResume: ReturnType<typeof vi.fn>
+  }
+  let controller: ReturnType<typeof createPhaseScreenController>
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    actions = {
+      onNewGame: vi.fn(),
+      onOpenLoadMenu: vi.fn(),
+      onBackFromLoadMenu: vi.fn(),
+      onConfirmLoad: vi.fn(),
+      onStartSortie: vi.fn(),
+      onSave: vi.fn(),
+      onReset: vi.fn(),
+      onUpgradeWeapon: vi.fn(),
+      canLoadGame: vi.fn(() => true),
+      onConfirmResult: vi.fn(),
+      onResume: vi.fn(),
+    }
+    controller = createPhaseScreenController(container, actions)
+  })
+
+  it('GIVEN result phase WHEN render called THEN the result screen is the only visible dialog and Return to hangar is enabled (AC1, AC7)', () => {
+    controller.render(createState('result'), false)
+
+    const result = container.querySelector<HTMLElement>('[data-phase-screen="result"]')
+    const preparation = container.querySelector<HTMLElement>('[data-phase-screen="preparation"]')
+    expect(result?.hidden).toBe(false)
+    expect(result?.hasAttribute('inert')).toBe(false)
+    expect(result?.getAttribute('role')).toBe('dialog')
+    expect(result?.getAttribute('aria-modal')).toBe('true')
+    expect(preparation?.hidden).toBe(true)
+    expect(preparation?.hasAttribute('inert')).toBe(true)
+    expect(queryButton(container, 'confirm-result').disabled).toBe(false)
+  })
+
+  it('GIVEN a non-result phase WHEN render called THEN Return to hangar is disabled (AC9)', () => {
+    controller.render(createState('preparation'), false)
+    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
+
+    controller.render(createState('running'), false)
+    expect(queryButton(container, 'confirm-result').disabled).toBe(true)
+  })
+
+  it('GIVEN result phase with a victory outcome WHEN render called THEN the reward summary is built ONLY from RewardSystem.calculate(state.sortie.result) (AC8)', () => {
+    const state = createState('result', 'pending')
+    // TERMINAL_SORTIE_RESULT: victory, kills:4, durationMs:30000, playerHpRemaining:6
+    // RewardSystem.calculate: base=100 (victory), killBonus=4*5=20, hpBonus=6 (victory), delta=126.
+    controller.render(state, false)
+
+    expect(container.querySelector('[data-field="result-outcome"]')?.textContent).toBe('Victory')
+    expect(container.querySelector('[data-field="result-kills"]')?.textContent).toBe('4')
+    expect(container.querySelector('[data-field="result-duration"]')?.textContent).toBe('30.0s')
+    expect(container.querySelector('[data-field="reward-base"]')?.textContent).toBe('100')
+    expect(container.querySelector('[data-field="reward-kill-bonus"]')?.textContent).toBe('20')
+    expect(container.querySelector('[data-field="reward-hp-bonus"]')?.textContent).toBe('6')
+    expect(container.querySelector('[data-field="reward-delta"]')?.textContent).toBe('126')
+  })
+
+  it('GIVEN result phase with an already-claimed reward WHEN render called THEN the reward summary is unchanged (AC8: display-only, never re-derives from claim status)', () => {
+    const pending = createState('result', 'pending')
+    const claimed = createState('result', 'claimed')
+
+    controller.render(pending, false)
+    const pendingDelta = container.querySelector('[data-field="reward-delta"]')?.textContent
+
+    controller.render(claimed, false)
+    const claimedDelta = container.querySelector('[data-field="reward-delta"]')?.textContent
+
+    expect(pendingDelta).toBe('126')
+    expect(claimedDelta).toBe('126')
+  })
+
+  it('GIVEN Return to hangar WHEN clicked THEN onConfirmResult fires exactly once and nothing else does', () => {
+    controller.render(createState('result'), false)
+
+    queryButton(container, 'confirm-result').click()
+
+    expect(actions.onConfirmResult).toHaveBeenCalledTimes(1)
+    expect(actions.onResume).not.toHaveBeenCalled()
+    expect(actions.onSave).not.toHaveBeenCalled()
+  })
+
+  it('GIVEN result screen text WHEN rendered THEN Collect payout / Prepare next sortie never appear (AC9: legacy actions stay on HudController only)', () => {
+    controller.render(createState('result'), false)
+
+    const text = container.textContent ?? ''
+    expect(text).not.toContain('Collect payout')
+    expect(text).not.toContain('Prepare next sortie')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// phaseScreens: pause screen (Issue #1376, AC2, AC3, AC4-structural, AC6-structural)
+//
+// jsdom-level coverage here targets DOM wiring / visibility derivation /
+// disabled-state gating. Real inert/focus/Tab-trap/Escape behavioral
+// verification (AC4, AC5, AC6) is covered by the real Playwright checks in
+// tests/e2e/product-pause.spec.ts (Runtime Verification Applicability:
+// immediate).
+// ---------------------------------------------------------------------------
+
+describe('phaseScreens: pause screen (Issue #1376)', () => {
+  let container: HTMLElement
+  let actions: {
+    onNewGame: ReturnType<typeof vi.fn>
+    onOpenLoadMenu: ReturnType<typeof vi.fn>
+    onBackFromLoadMenu: ReturnType<typeof vi.fn>
+    onConfirmLoad: ReturnType<typeof vi.fn>
+    onStartSortie: ReturnType<typeof vi.fn>
+    onSave: ReturnType<typeof vi.fn>
+    onReset: ReturnType<typeof vi.fn>
+    onUpgradeWeapon: ReturnType<typeof vi.fn>
+    canLoadGame: ReturnType<typeof vi.fn>
+    onConfirmResult: ReturnType<typeof vi.fn>
+    onResume: ReturnType<typeof vi.fn>
+  }
+  let controller: ReturnType<typeof createPhaseScreenController>
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    actions = {
+      onNewGame: vi.fn(),
+      onOpenLoadMenu: vi.fn(),
+      onBackFromLoadMenu: vi.fn(),
+      onConfirmLoad: vi.fn(),
+      onStartSortie: vi.fn(),
+      onSave: vi.fn(),
+      onReset: vi.fn(),
+      onUpgradeWeapon: vi.fn(),
+      canLoadGame: vi.fn(() => true),
+      onConfirmResult: vi.fn(),
+      onResume: vi.fn(),
+    }
+    controller = createPhaseScreenController(container, actions)
+  })
+
+  it('GIVEN running AND isPaused=true WHEN render called THEN the pause dialog is the only visible screen (AC2, AC3)', () => {
+    controller.render(createState('running'), true)
+
+    const pause = container.querySelector<HTMLElement>('[data-phase-screen="pause"]')
+    const preparation = container.querySelector<HTMLElement>('[data-phase-screen="preparation"]')
+    expect(pause?.hidden).toBe(false)
+    expect(pause?.hasAttribute('inert')).toBe(false)
+    expect(pause?.getAttribute('role')).toBe('dialog')
+    expect(pause?.getAttribute('aria-modal')).toBe('true')
+    expect(preparation?.hidden).toBe(true)
+    expect(preparation?.hasAttribute('inert')).toBe(true)
+    expect(queryButton(container, 'resume').disabled).toBe(false)
+  })
+
+  it('GIVEN isPaused=false WHEN render called THEN the pause dialog is hidden/inert and Resume is disabled (AC3)', () => {
+    controller.render(createState('running'), false)
+
+    const pause = container.querySelector<HTMLElement>('[data-phase-screen="pause"]')
+    expect(pause?.hidden).toBe(true)
+    expect(pause?.hasAttribute('inert')).toBe(true)
+    expect(queryButton(container, 'resume').disabled).toBe(true)
+  })
+
+  it('GIVEN isPaused=true regardless of loopPhase WHEN render called THEN the pause dialog interrupts whatever screen would otherwise be visible (AC2, AC3)', () => {
+    controller.render(createState('preparation'), true)
+
+    const pause = container.querySelector<HTMLElement>('[data-phase-screen="pause"]')
+    const preparation = container.querySelector<HTMLElement>('[data-phase-screen="preparation"]')
+    expect(pause?.hidden).toBe(false)
+    expect(preparation?.hidden).toBe(true)
+  })
+
+  it('GIVEN Resume WHEN clicked THEN onResume fires exactly once', () => {
+    controller.render(createState('running'), true)
+
+    queryButton(container, 'resume').click()
+
+    expect(actions.onResume).toHaveBeenCalledTimes(1)
+  })
+})
+
