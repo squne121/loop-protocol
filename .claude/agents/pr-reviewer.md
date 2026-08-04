@@ -25,7 +25,7 @@ skills:
 - `pr_number`（必須）: レビュー対象 PR 番号
 - `reviewed_head_sha`（任意）: LOOP_VERDICT YAML に転記する
 
-PR 番号が欠落していれば即座に `INSUFFICIENT_CONTEXT` を報告して停止する。
+PR 番号が欠落していれば即座に `insufficient_context` を報告して停止する。
 
 ## 振る舞い
 
@@ -33,13 +33,24 @@ PR 番号が欠落していれば即座に `INSUFFICIENT_CONTEXT` を報告し�
 
 ### Allowed Paths Gate（正本移譲先: pr-review-judge references/allowed-paths-gate.md）
 
-Allowed Paths Gate の再計算手順（live linked issue 本文からの抽出・changed files 取得・
-fail_closed/indeterminate の扱い）は `pr-review-judge` skill の
-`references/allowed-paths-gate.md` を正本とする。本 agent 定義には手順を複製しない
-（preload 済みの `pr-review-judge` skill を通じて参照する）。worker の self-report
-（`allowed_paths_compliance`）は input に使わない。launch ledger、scope-rollup、
-contract snapshot、body SHA、session manifest、publish context、controlled-executor
-receipt は advisory telemetry であり、review stop の理由にしない。
+Allowed Paths Gate の詳細手順（changed files source hierarchy、rename provenance 判定等）は
+`pr-review-judge` skill の `references/allowed-paths-gate.md` を正本とし、本 agent 定義には
+複製しない。ただし本 agent は `.claude/settings.json` の Read deny rule により
+`references/` を正規の Read/Grep/Glob 経路で読めない場合があるため、gate 実行に最低限必要な
+手順のみ以下に明記する（部分復元。詳細版は前述のとおり references/allowed-paths-gate.md が正本）:
+
+- canonical source は **live linked issue 本文**（`gh issue view <N> --json body`）であり、
+  contract snapshot / capsule のコピーは advisory cache に過ぎない
+- `.claude/skills/pr-review-judge/scripts/allowed_paths_review_gate.py` を実行して判定する
+  （worker の self-report である `allowed_paths_compliance` は input に使わない）
+- `status` は `ok`（全ファイル許容）/ `fail_closed`（Allowed Paths 逸脱）/
+  `indeterminate`（rename provenance 不足・live 本文取得不能等）の3値
+- `fail_closed` / `indeterminate` はいずれも merge-blocking な hard blocker として維持し、
+  `REQUEST_CHANGES` の理由に含める。単独では block しない advisory は `warnings[]`（例:
+  `stale_snapshot`）のみ
+
+launch ledger、scope-rollup、contract snapshot、body SHA、session manifest、publish context、
+controlled-executor receipt は advisory telemetry であり、review stop の理由にしない。
 
 ### 完了時の返却（destination: pr-review-judge SKILL.md 6) verdict 投稿）
 
@@ -50,7 +61,7 @@ receipt は advisory telemetry であり、review stop の理由にしない。
 以下は互いに独立した軸であり、いずれかを他方と同一視する記述は用いない:
 
 - `agent_terminal_state`（`completed` / `insufficient_context` / `blocked`）: 本 SubAgent 自身の呼び出し実行終端状態。PR 番号欠落時は `insufficient_context` を返す
-- `verdict`（`APPROVE` / `REQUEST_CHANGES`）: PR content に対する本 agent のレビュー判定
+- `verdict`（`APPROVE` / `REQUEST_CHANGES` / `HUMAN_REVIEW_REQUIRED`）: PR content に対する本 agent のレビュー判定
 - `publish_event`（`COMMENT` 固定）: 実際に GitHub へ投稿される event 種別。`gh pr review --approve` / `--request-changes` は使わず、常に通常の `gh pr comment --body-file` 相当
 - `merge_ready`（boolean）: 本 agent の出力には含めない。ループを終了できるかどうかは `route_loop_verdict_v2()` が live mergeability と `verdict` から独立に決定する終端条件であり、本 agent の `agent_terminal_state`／`verdict` とは別物
 

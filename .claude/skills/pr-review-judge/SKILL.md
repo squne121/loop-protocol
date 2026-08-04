@@ -201,23 +201,28 @@ gh pr comment <PR番号> --repo <owner>/<repo> --body-file <本文テキスト�
 - Allowed Paths / contract 監査結果は `LOOP_VERDICT_V2.allowed_paths_gate` という専用フィールド
   ではなく、`status != ok` の場合に具体的な違反内容を `blockers[]` へ記載する形で受け渡す
   （`references/allowed-paths-gate.md` 参照）。
-- production consumer（`route_loop_verdict_v2()`）の挙動は、待機条件（stale な issue 参照）ではなく
-  次の 8 fixture で固定する（AC11。各 fixture は `impl-review-loop/tests/` の production consumer test
-  が参照する現行挙動のスナップショット）:
+- production consumer（`route_loop_verdict_v2(reviewer_verdict, live_mergeability)`、2引数のみ。
+  action は router 自身が単一合成する）の挙動は、待機条件（stale な issue 参照）ではなく、
+  実装（`.claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py`）の以下 10 分岐で固定する
+  （AC11。production fixture: `impl-review-loop/tests/fixtures/step5_routing_consumer/
+  test_route_loop_verdict_v2.py` および `test_route_loop_verdict_v2_merge_state_status_only.py`）:
 
-  1. `APPROVE+CLEAN+no actions` — `verdict: APPROVE` かつ `merge_state_status: CLEAN` かつ
-     action 不要 → `route: approved`
-  2. `APPROVE+BEHIND+valid update_branch` — `verdict: APPROVE` かつ `BEHIND` かつ有効な
-     `expected_head_sha` → `route_loop_verdict_v2()` が `update_branch` action を合成
-  3. `APPROVE+BEHIND+missing action` — `verdict: APPROVE` かつ `BEHIND` だが action 合成に
-     必要な情報が欠落 → fail-closed で human escalation
-  4. `REQUEST_CHANGES` — blocker が非空 → 次イテレーション（`implementation-worker` へ fix_delta 委譲）
-  5. `stale expected_head_sha` — `reviewed_head_sha` が live head と不一致 → fresh review 要求
-  6. `multiple actions` — 複数 action 候補が合成された場合 → 単一 action への収束または human escalation
-  7. `body-only action while BEHIND` — action が PR body 更新のみで `BEHIND` の update_branch を
-     伴わない場合 → 両方を並行に扱う（`rerun_required` の整合を維持）
-  8. `unknown action-executor-skill` — action の routing 先 skill が routing table に存在しない場合
-     → `status: blocked` で人間判断へ差し戻す
+  1. `mergeable: CONFLICTING` → `conflict_hard_stop`（reviewer verdict に関係なく最優先）
+  2. `merge_state_status: DIRTY` → `conflict_hard_stop`（同上）
+  3. `verdict: HUMAN_REVIEW_REQUIRED` → `route_human_escalation`
+  4. `verdict: REQUEST_CHANGES` → `continue_loop`
+  5. `verdict: APPROVE` かつ `blockers` 非空 → `fail_closed`
+     （reason_code: `approve_with_blockers_inconsistent`）
+  6. `verdict: APPROVE` かつ `reviewed_head_sha` が live head と不一致 → `route_stale_head_rereview`
+  7. `verdict: APPROVE` かつ `mergeable: UNKNOWN` または `merge_state_status: UNKNOWN`
+     → `fail_closed`（reason_code: `mergeability_unknown`）
+  8. `verdict: APPROVE` かつ `merge_state_status: BEHIND` → `route_to_update_branch`
+     （`update_branch` action を router が合成、`rerun_required` は verification/pr_review 双方 true）
+  9. `verdict: APPROVE` かつ `merge_state_status` が `BLOCKED`/`UNSTABLE`/`DRAFT`
+     → `fail_closed`（current-head required-CI / branch-protection evaluator へ defer。
+     人間 escalation は自動発生しない）
+  10. `verdict: APPROVE` かつ `merge_state_status` が `CLEAN`/`HAS_HOOKS` かつ `mergeable: MERGEABLE`
+      → `approved`
 
 ### ALLOWED_PATHS_GATE_RESULT_V1（Allowed Paths 判定結果、正本移譲先: references/allowed-paths-gate.md）
 
@@ -245,6 +250,12 @@ builder／validator／classifier／executor／renderer）は以下を行わな�
 script が計算するのは G1–G5（`references/deterministic-gates.md`）等の決定論的 gate 判定のみであり、
 `verdict` 自体（APPROVE/REQUEST_CHANGES の意味判断）は reviewer_verdict（本 SKILL.md の Procedure）が
 決める。
+
+**semantic findings 禁止と gate 集約の区別**: `check_pr_review_gates.py` の `finalize_verdict()`
+（G1–G5 の機械的 gate boolean から `verdict: APPROVE/REQUEST_CHANGES` を決定論的に集約する既存関数）
+は、上記で禁止する「semantic findings（コード品質・設計判断等の主観的知見）の自動生成」の対象では
+ない。`finalize_verdict()` は LLM 呼び出しや外部 mutation を一切含まない純粋な boolean 集約
+（`any(gate.status == FAIL for gate in gates)` の要約）であり、決定論的 gate 判定の範囲内に留まる。
 
 ## Reference Loading Map（読取条件）
 
