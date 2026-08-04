@@ -97,7 +97,7 @@ registry は推測ではなく現行テスト実体に基づいて分類する�
 |---|---|---|---|---|---|---|---|---|---|
 | timeout-overlay | screenshot-baseline | frozen | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-timeout-overlay-baseline.png`（`m2-combat-mvp.spec.ts` の timeout overlay baseline test） | #732 / #681 / #747 | timeout は defeat ではない中立終了表示であること・背景 tint・可読性・整数段階表示 | 色味 / 最終配置は UI 再設計で変更可 | `maxDiffPixels: 1`（理由: CI Chromium + 固定 viewport 1280x720 + 決定論的 E2E モード前提でのみ妥当） | 意図した視覚仕様変更を人間がレビューし承認した場合のみ（§4 checklist 経由） | #727（HUD/layout 再設計） |
 | running-hud | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-running-hud-baseline.png`（`m2-combat-mvp.spec.ts` の running HUD baseline test。Issue #1375 で capture root を `[data-field="sortie-status"]` 単一 field から `[data-combat-hud]` パネル全体に変更し、Hull/Kills/Elapsed/Weapon/Assist status の各 field は mask 済み） | #681 / #726 / #727 / #1370 / #1375 / #1377 / #1380 | running HUD が描画されること・HULL/HP の小数露出がないこと・桁溢れがないこと・combat HUD が Hull/Kills/Elapsed/Weapon/Assist/Pause のみで構成されること（#1375 AC2） | 色味 / 詳細配置 / right rail 依存は再設計まで可変 | `maxDiffPixels: 150`（Issue #1375 で `maxDiffPixelRatio: 0.08` から変更。理由: capture root を単一 field から複数 field を含むパネル全体へ拡張したため、絶対ピクセル数の許容差に統一した。masked field 以外のパネル chrome/ラベルのみを比較） | #727 再開時または #1370 / #1375 / #1377 / #1380 系の overlay rollout 進行時に破棄 / 再分類可 | #727 / #1370 / #1375 / #1377 / #1380（HUD/layout 再設計と overlay rollout） |
-| running-hud-overlay-legacy-current | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test） | #1386 / #1380 / #1370 / #1374 | `[data-battle-ui-root]` DOM overlay 全体（HUD 各 field を含む）が描画されること。`running-hud`（`m2-combat-mvp.spec.ts` の単一 field baseline）とは別の独立した baseline であり、両者は衝突しない | 色味 / 詳細配置 / right rail・command-rail 依存は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。理由: capture root が canvas mask を含み全体の過半を占めるため `maxDiffPixelRatio` は不採用。非mask領域のfont-rasterizationノイズに対しこのworktree環境で複数回実測し PASS した最小幅に margin を加えた値。`tests/e2e/visual.freeze.css` で capture root 配下の font-family を generic family（`sans-serif`）に固定し、host font fallback chain 依存を除去済み） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1375/#1376/#1377 マージ後） | #1375 / #1376 / #1377 / #1380（overlay UI 実装マージで破棄・再生成対象） |
+| running-hud-overlay-legacy-current | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test。canvas 除外は `expectDomOverlayScreenshot(..., { canvasVisibility: 'hidden' })` — Issue #1980 で `mask` から変更） | #1386 / #1380 / #1370 / #1374 / #1980 | `[data-battle-ui-root]` DOM overlay 全体（HUD 各 field を含む）が描画されること。`running-hud`（`m2-combat-mvp.spec.ts` の単一 field baseline）とは別の独立した baseline であり、両者は衝突しない。Issue #1980 以降、canvas は Playwright `mask` ではなく `canvasVisibility: 'hidden'`（`tests/e2e/visual.freeze.css` の `[data-visual-canvas-hidden='true'] canvas { visibility: hidden !important; }`、`[data-visual-mask='true']` opt-in パターン踏襲）で除外されるため、HUD（Hull/Kills/Elapsed/Weapon/Assist/Pause）が実際に撮影・比較される | 色味 / 詳細配置 / right rail・command-rail 依存は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。Issue #1980 で capture policy を canvas `mask` から `canvasVisibility: 'hidden'` へ変更したため、キャプチャ内容は canvas 矩形の単色塗り潰しではなく HUD 実描画になった。値自体は変更なし — 非HUD領域のfont-rasterizationノイズに対しこのworktree環境で複数回実測し PASS した最小幅に margin を加えた値。`tests/e2e/visual.freeze.css` で capture root 配下の font-family を generic family（`sans-serif`）に固定し、host font fallback chain 依存を除去済み） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1375/#1376/#1377 マージ後） | #1375 / #1376 / #1377 / #1380（overlay UI 実装マージで破棄・再生成対象） |
 | defeat-overlay | pixel-contract | predicate-only | `getImageData` smoke（`m2-combat-mvp.spec.ts` の defeat overlay 赤支配ピクセル検証 / AC8） | #681 / #732 | defeat overlay が赤系・終端状態として識別可能であること | exact pixels は未固定。最終 layout / 色味は未確定 | N/A（screenshot baseline ではない） | predicate（赤支配）が壊れた場合のみテスト側を調整 | #727 |
 | hp-label | predicate-only | predicate-only | HP label bounds smoke（`m2-combat-mvp.spec.ts` の HP label bounding box 検証 / AC5） | #726 / #727 | HP label が viewport 外 / NaN 表示にならない・bounds 内・可読であること | 最終 UI 表現 / 配置は未固定 | N/A（screenshot baseline ではない） | predicate（bounds / 可読）が壊れた場合のみテスト側を調整 | #727 |
 | running-hud-paused | screenshot-baseline | pending-baseline | pending: no PNG/test | #1380 / #1375 / #1376 / #1377 / #1391 | running HUD の停止状態でも command-rail / right rail / two-column shell / `.battle-stage` 外 controls への依存がないことを明示し、pause overlay の focus / inert / keyboard 証跡を #1376 側で確認する | frozen 適用対象外。duration 等の固定は `durationMs` / `fixedDeltaMs` で判定可能な場合に限定 | pending: no PNG/test（active PASS claim 保留） | §4 の `maturity transition` を満たした時点で `pending-baseline -> frozen` | #1370 / #1375 / #1376 / #1377 / #1380 |
@@ -385,6 +385,79 @@ viewport 1437x1365）で「敗北してゲームが進行できなくなった�
 - **environment fingerprint**: 最終的に採用した baseline（上記 7 件）は CI 実行環境
   （GitHub Actions ubuntu runner, Chromium, run id `30701007468`, job id
   `91371935097`）で生成された画像そのものである。
+
+### running-hud-overlay-legacy-current の canvas mask capture defect 修正（Issue #1980、明示）
+
+owner レビュー（issuecomment-5172060362、REQUEST_CHANGES / P0 blocker）により、PR #1925
+（コミット `968af36e`）が Canvas と `.battle-ui-layer` を同一 `.battle-stage__viewport` 内へ
+移した結果、両者がほぼ同一の bounding box を持つようになり、`expectDomOverlayScreenshot()`
+が適用していた Playwright `mask: [page.locator('canvas')]` が capture root 全面（HUD を含む）
+を単色で覆ってしまう capture defect が判明した（旧 baseline は単色ピクセル比率 99.8% 以上）。
+
+- **判断根拠**: HUD を実際に検証できない baseline は VRT として無意味であり、意図しない退行では
+  なく capture 方式そのものの欠陥である。修正方針は、既存の `[data-visual-mask='true']` opt-in
+  visibility 除外パターンを踏襲し、canvas を Playwright `mask` ではなく CSS `visibility: hidden`
+  （`data-visual-canvas-hidden` 属性 + `tests/e2e/visual.freeze.css`）で除外する方式へ変更した
+  （§4 checklist 適用。capture root を `[data-combat-hud]` に切り替える案は不採用 — Out of
+  Scope、別 Issue 判断）。
+- **capture policy 変更**: `tests/e2e/visual-utils.ts` の `expectDomOverlayScreenshot()` に
+  `canvasVisibility` オプション（既定 `'mask'` = 従来挙動、`'hidden'` = 新方式）を追加。
+  `running-hud-overlay-legacy-current` の呼び出し箇所（`tests/e2e/visual-overlay.spec.ts`）のみ
+  `canvasVisibility: 'hidden'` を指定し、他の DOM overlay baseline は既定値のまま変更していない。
+- **機械的な検証追加**: 単一色ピクセル比率が閾値（0.9）未満であることを canvas `getImageData`
+  で検証する pixel diversity test、および `[data-combat-hud]` を意図的に非表示化すると screenshot
+  assertion が確実に fail することを確認する negative control test を
+  `tests/e2e/visual-overlay.spec.ts` に追加した。
+- **evidence**: worktree `.claude/worktrees/issue-1980-vrt-canvas-hidden-hud`。ローカル環境
+  （Playwright chromium v1223、`pnpm run test:vrt:update:e2e` で `VITE_E2E_MODE=true pnpm build`
+  済みの dist を `LOOP_VRT_LANE=true` で配信、`playwright.config.ts` 既定 viewport 1280x720、
+  `tests/e2e/visual.freeze.css` の generic `sans-serif` 固定込み）で候補 PNG を生成し、
+  expected/actual を目視確認した（HUD の Hull/Kills/Elapsed/Weapon/Assist/Pause が実際に描画さ
+  れていることを確認）。`pnpm run test:vrt:e2e` で pixel diversity / negative control を含む
+  全 4 件のアクティブテストが PASS することを確認した。CI 実行環境での再現確認は本 PR のレビュー
+  プロセスで行う（candidate producer はこの worktree、canonicalization authority は本 PR の
+  レビュー・マージ）。
+- **maturity**: 変更なし（`legacy-current` のまま。`frozen` 化条件は変更なし）。
+- **tolerance**: 変更なし（`maxDiffPixels: 100`）。capture 内容が canvas 単色塗り潰しから HUD
+  実描画へ変わったため、絶対ピクセル数の意味が「単色領域を除いた非mask領域の差分」から「HUD 全体
+  領域の差分」へ変わった点に注意。
+
+### running-hud-overlay-legacy-current の negative control 実装欠陥修正（Issue #1980 iteration 1、明示）
+
+独立 test-runner 検証（PR #1988 レビュー、iteration 1 fix_delta）により、上記セクションで追加した
+negative control test（`[data-combat-hud]` を意図的に非表示化すると screenshot assertion が
+fail することを確認するテスト）が実際には fail せず、`.rejects.toThrow()` が resolved
+（意図せず PASS）してしまう欠陥が判明した。
+
+- **根本原因**: negative control test が、実 baseline capture（AC5/AC6 テスト）と同じ
+  snapshot 名（`'vrt-running-hud-overlay.png'`）を `expectDomOverlayScreenshot()` /
+  `toHaveScreenshot()` 経由で指定していたため、AC2 の VC コマンドである
+  `pnpm run test:vrt:update:e2e`（`--update-snapshots=all`）実行時、`toHaveScreenshot()` は
+  比較せず常に対象ファイルへ上書き保存する。ファイル内のテスト実行順（AC5/AC6 → pixel diversity
+  → negative control）により、negative control の「HUD 非表示」capture が最後に同名ファイルへ
+  上書きされ、実 baseline PNG 自体を HUD が写らない空の capture へ静かに破壊していた
+  （このセクション冒頭で「HUD の Hull/Kills/Elapsed/Weapon/Assist/Pause が実際に描画されている
+  ことを確認した」と記録した候補 PNG は、この経路で committed baseline から後日破壊されたことを
+  worktree 上の未コミット diff で確認済み）。この結果、`toHaveScreenshot` の比較対象 baseline
+  自体が既に HUD 非表示状態と近似していたため、negative control が「差分なし」と判定して
+  resolved していた。
+- **判断根拠**: `--update-snapshots=all` を使う AC2 の VC コマンドと同じ snapshot 名を
+  negative control が共有する設計は、negative control 自身が実 baseline を破壊しうる
+  構造的欠陥であり、修正対象は `In Scope` の「negative control test の追加」の実装詳細
+  （snapshot 名選択）であって、Issue #1980 の capture policy（`canvasVisibility: 'hidden'`）
+  自体の妥当性ではない。
+- **修正内容**: negative control test を `toHaveScreenshot()` の snapshot 読み書きパイプライン
+  から独立させ、`Locator.screenshot()` で直接取得した「HUD 非表示」capture と、ディスク上の
+  committed baseline PNG（読み取り専用）を、pixel diversity test と同じ `canvas` 2D
+  `getImageData()` 手法でブラウザ内 pixel-diff し、差分ピクセル数が実アサーションの
+  `maxDiffPixels: 100` を上回ることを確認する方式へ変更した（`tests/e2e/visual-overlay.spec.ts`）。
+  この方式は `--update-snapshots` フラグの有無に関わらず baseline ファイルへ一切書き込まない。
+- **evidence**: worktree `.claude/worktrees/issue-1980-vrt-canvas-hidden-hud`。修正後、
+  `pnpm run test:vrt:update:e2e` を複数回実行しても baseline PNG が安定（2回目以降
+  re-generate 差分なし）で HUD 実描画のまま保たれることを確認し、`pnpm run test:vrt:e2e`
+  （4 active test 全 PASS、3 pending-baseline skip）、および AC2 / AC3 個別実行（いずれも
+  PASS）で再検証した。
+- **maturity / tolerance**: 変更なし。
 
 ## 4. baseline update policy（更新ポリシー）
 
