@@ -659,3 +659,99 @@ test('AC9: GIVEN E2E config WHEN page loaded THEN origin is http://127.0.0.1:417
   const origin = await page.evaluate(() => window.location.origin)
   expect(origin, 'origin must be http://127.0.0.1:4173 (AC9)').toBe('http://127.0.0.1:4173')
 })
+
+// ---------------------------------------------------------------------------
+// Issue #1376 AC7: result heading receives initial focus; Return to hangar
+// moves focus to the new preparation heading (never the old result control).
+// Issue #1376 AC10: rapid Return to hangar activation applies reward/save
+// exactly once.
+// ---------------------------------------------------------------------------
+
+test.describe('Issue #1376: result screen focus (AC7) and rapid-activation exactly-once (AC10)', () => {
+  test(
+    'AC7: GIVEN result phase WHEN reached THEN the result heading receives initial focus, and after Return to hangar the new preparation heading receives focus',
+    async ({ page }) => {
+      test.setTimeout(30_000)
+      await page.addInitScript(() => {
+        ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
+      })
+      await page.goto('/')
+
+      await expect
+        .poll(async () => (await getGameState(page)).loopPhase, { timeout: 15_000, intervals: [100] })
+        .toBe('result')
+
+      const resultHeading = page.locator('#phase-screen-result-heading')
+      await expect(resultHeading).toBeVisible({ timeout: 5_000 })
+      // AC7: the result heading (tabindex="-1") is the initial focus target.
+      await expect(resultHeading).toBeFocused()
+
+      await page.locator('[data-action="confirm-result"]').click()
+
+      await expect
+        .poll(async () => (await getGameState(page)).loopPhase, { timeout: 5_000, intervals: [50] })
+        .toBe('preparation')
+
+      // AC7: focus must land on the NEW preparation heading, never a stale
+      // result control (the old result screen/heading is now hidden+inert).
+      const preparationHeading = page.locator('#phase-screen-preparation-heading')
+      await expect(preparationHeading).toBeFocused()
+      await expect(resultHeading).toBeHidden()
+    },
+  )
+
+  test(
+    'AC10: GIVEN result phase WHEN Return to hangar is activated rapidly (two click events dispatched back-to-back, no wait between them) THEN reward/save apply exactly once',
+    async ({ page }) => {
+      test.setTimeout(30_000)
+      const testInfo = test.info()
+      const e2eKey = buildE2EStorageKey(testInfo)
+      await page.addInitScript(
+        (key: string) => {
+          ;(window as Window & { __LOOP_STORAGE_KEY__?: string }).__LOOP_STORAGE_KEY__ = key
+          ;(window as Window & { __E2E_SHORT_SORTIE__?: boolean }).__E2E_SHORT_SORTIE__ = true
+        },
+        e2eKey,
+      )
+      await page.goto('/')
+
+      await expect
+        .poll(async () => (await getGameState(page)).loopPhase, { timeout: 15_000, intervals: [100] })
+        .toBe('result')
+
+      // Rapid activation (AC10): two click events dispatched back-to-back in
+      // the same page.evaluate() call, with no Playwright actionability wait
+      // (and no animation frame) between them -- this is the actual race the
+      // AC covers, not two separate .click() calls with a render() in
+      // between. The exactly-once guard is confirmResult()'s own synchronous
+      // loopPhase check (src/systems/SortieSystem.ts): the FIRST dispatch's
+      // handler mutates state.loopPhase from 'result' to 'preparation'
+      // synchronously before the second dispatch's handler runs, so the
+      // second confirmResult() call is a synchronous no-op -- this holds
+      // even though confirmResultButton.disabled itself is only refreshed on
+      // the next render() (~16ms later).
+      await page.evaluate(() => {
+        const btn = document.querySelector<HTMLButtonElement>('[data-action="confirm-result"]')
+        btn?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+        btn?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      })
+
+      await expect
+        .poll(async () => (await getGameState(page)).loopPhase, { timeout: 5_000, intervals: [50] })
+        .toBe('preparation')
+
+      const resources = await page.evaluate((k: string) => {
+        const raw = window.localStorage.getItem(k)
+        if (!raw) return null
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return (JSON.parse(raw) as any).resources as number
+      }, e2eKey)
+
+      expect(
+        resources,
+        'rapid double-activation must not double-apply the timeout reward (AC10)',
+      ).toBe(EXPECTED_RESOURCES_AFTER_TIMEOUT)
+    },
+  )
+})
+

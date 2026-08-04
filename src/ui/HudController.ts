@@ -3,31 +3,40 @@ import type { UpgradePurchaseFailureReason } from '../systems/UpgradeSystem'
 import { buildCombatHudViewModel, COMBAT_HUD_MARKUP, type CombatHudViewModel } from './combatHud'
 
 /**
- * Running-time HUD (Issue #1375): `HudController` now owns two DOM roots
- * inside `battle-hud-layer`:
+ * Running-time HUD (Issue #1375, narrowed further by Issue #1376): `HudController`
+ * now owns two DOM roots inside `battle-hud-layer`:
  *
  * - `data-combat-hud` (`src/ui/combatHud.ts`'s markup + view model): the
  *   single compact player-facing surface visible only during `running`
- *   (Hull, Kills, Elapsed, Weapon readiness, Assist allies, Pause).
- * - `data-legacy-result-surface`: a temporary compatibility surface that
- *   keeps the pre-#1375 result/debrief action surface (`Return to hangar` /
- *   `Collect payout` / `Prepare next sortie`) and sortie/telemetry copy
- *   alive until #1376 replaces it with a dedicated result/pause overlay.
- *   Visible everywhere EXCEPT `running` (never visible/focusable together
- *   with the combat HUD).
+ *   (Hull, Kills, Elapsed, Weapon readiness, Assist allies, Pause). Becomes
+ *   `inert` (but stays visible) while `productPause.isPaused` is true, so it
+ *   is excluded from the tab order behind the pause dialog (Issue #1376 AC4)
+ *   without losing its live Hull/Kills/Elapsed readout.
+ * - `data-legacy-debrief-surface`: a temporary compatibility surface that
+ *   keeps the pre-#1375 legacy debrief action surface (`Collect payout` /
+ *   `Prepare next sortie`) alive for the `debrief_pending_reward` /
+ *   `debrief_reward_claimed` phases only. `Return to hangar` and all other
+ *   result responsibilities moved to `phaseScreens.ts`'s single
+ *   `battle-screen-layer` result screen in Issue #1376 — this surface is
+ *   hidden and inert everywhere else (never visible during `running` or the
+ *   normal `result` flow).
  *
- * Title / load / preparation are owned by `phaseScreens.ts`'s
+ * Title / load / preparation / result / pause are owned by `phaseScreens.ts`'s
  * `createPhaseScreenController()`, rendered into the separate
- * `battle-screen-layer` overlay, never this layer (Issue #1374 PR #1815).
+ * `battle-screen-layer` overlay, never this layer (Issue #1374 PR #1815,
+ * Issue #1376).
  */
 export interface HudActions {
   onAssistPlayerCommand?(): void
   onClaimReward(): void
-  /** Confirm result and return to preparation (AC5). */
-  onConfirmResult?(): void
   onNextSortie(): void
-  /** Called when the pause/resume button is clicked (AC1). */
-  onTogglePause(): void
+  /**
+   * Called when the pause/resume button is clicked (AC1, AC3). `invoker` is
+   * the button element itself, threaded through to the caller so the shared
+   * pause-entry seam (`enterProductPause()` in `src/main.ts`) can record it
+   * as the element to restore focus to on resume (AC6).
+   */
+  onTogglePause(invoker: HTMLElement): void
 }
 
 /**
@@ -107,7 +116,7 @@ export interface HudUpgradeViewModel {
 export interface HudController {
   /**
    * Render the HUD. `isPaused` is the runtime-local product pause flag
-   * (AC1, AC4). `activeFixedDeltaMs` is the fixed simulation timestep
+   * (AC1, AC3, AC4). `activeFixedDeltaMs` is the fixed simulation timestep
    * currently driving `state.sortie.elapsedTicks` (AC4) — supplied by the
    * caller (`src/main.ts`), never read from `GameState` (Out of Scope:
    * `GameState.sortie` does not carry `fixedDeltaMs`).
@@ -192,6 +201,27 @@ function setHudRootVisibility(
   }
 }
 
+/**
+ * Sets only `inert`/`aria-hidden` (never `hidden`) so the combat HUD stays
+ * visible-but-non-interactive while a pause dialog is open (AC4, Issue
+ * #1376): Hull/Kills/Elapsed/Weapon readouts must keep updating behind the
+ * modal pause overlay, but the surface must drop out of the keyboard tab
+ * order and accessibility tree while the pause dialog owns focus.
+ */
+function setCombatHudInertOnly(element: HTMLElement, inert: boolean, previousInert: boolean | undefined): void {
+  if (previousInert === inert) {
+    return
+  }
+
+  if (inert) {
+    element.setAttribute('inert', '')
+    element.setAttribute('aria-hidden', 'true')
+  } else {
+    element.removeAttribute('inert')
+    element.removeAttribute('aria-hidden')
+  }
+}
+
 function queryRoot(container: HTMLElement, attribute: string): HTMLElement {
   const element = container.querySelector<HTMLElement>(`[${attribute}]`)
 
@@ -222,13 +252,18 @@ function queryField(container: HTMLElement, name: string): HTMLElement {
   return element
 }
 
+/** Phases the temporary legacy debrief surface remains visible for (Issue #1376). */
+function isLegacyDebriefPhase(state: GameState): boolean {
+  return state.loopPhase === 'debrief_pending_reward' || state.loopPhase === 'debrief_reward_claimed'
+}
+
 export function createHudController(
   container: HTMLElement,
   actions: HudActions,
 ): HudController {
   container.innerHTML = `
     ${COMBAT_HUD_MARKUP}
-    <div class="legacy-result-surface" data-legacy-result-surface hidden inert>
+    <div class="legacy-debrief-surface" data-legacy-debrief-surface hidden inert>
       <section class="panel">
         <p class="eyebrow">Sortie</p>
         <dl class="stat-grid">
@@ -246,33 +281,30 @@ export function createHudController(
       </section>
       <section class="panel panel--actions">
         <button type="button" data-action="claim-reward" data-battle-interactive="true">Collect payout</button>
-        <button type="button" data-action="confirm-result" data-battle-interactive="true">Return to hangar</button>
         <button type="button" data-action="next-sortie" data-battle-interactive="true">Prepare next sortie</button>
       </section>
     </div>
   `
 
   const combatHudRoot = queryRoot(container, 'data-combat-hud')
-  const legacyResultSurface = queryRoot(container, 'data-legacy-result-surface')
+  const legacyDebriefSurface = queryRoot(container, 'data-legacy-debrief-surface')
 
   if (actions.onAssistPlayerCommand) {
     combatHudRoot
       .querySelector<HTMLButtonElement>('[data-action="assist-player"]')
       ?.addEventListener('click', actions.onAssistPlayerCommand)
   }
-  combatHudRoot
-    .querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')
-    ?.addEventListener('click', actions.onTogglePause)
+  const togglePauseButtonEl = combatHudRoot.querySelector<HTMLButtonElement>('[data-action="toggle-pause"]')
+  togglePauseButtonEl?.addEventListener('click', () => {
+    // AC3, AC6: thread the invoking button through so the pause-entry seam
+    // can restore focus to it on resume.
+    actions.onTogglePause(togglePauseButtonEl)
+  })
 
-  legacyResultSurface
+  legacyDebriefSurface
     .querySelector<HTMLButtonElement>('[data-action="claim-reward"]')
     ?.addEventListener('click', actions.onClaimReward)
-  if (actions.onConfirmResult) {
-    legacyResultSurface
-      .querySelector<HTMLButtonElement>('[data-action="confirm-result"]')
-      ?.addEventListener('click', actions.onConfirmResult)
-  }
-  legacyResultSurface
+  legacyDebriefSurface
     .querySelector<HTMLButtonElement>('[data-action="next-sortie"]')
     ?.addEventListener('click', actions.onNextSortie)
 
@@ -284,16 +316,15 @@ export function createHudController(
   const assistPlayerButton = queryAction(combatHudRoot, 'assist-player')
   const togglePauseButton = queryAction(combatHudRoot, 'toggle-pause')
 
-  const status = queryField(legacyResultSurface, 'status')
-  const command = queryField(legacyResultSurface, 'command')
-  const loopPhaseField = queryField(legacyResultSurface, 'loop-phase')
-  const sortieStatus = queryField(legacyResultSurface, 'sortie-status')
-  const sortieKills = queryField(legacyResultSurface, 'sortie-kills')
-  const sortieDuration = queryField(legacyResultSurface, 'sortie-duration')
-  const sortieResult = queryField(legacyResultSurface, 'sortie-result')
-  const claimRewardButton = queryAction(legacyResultSurface, 'claim-reward')
-  const confirmResultButton = queryAction(legacyResultSurface, 'confirm-result')
-  const nextSortieButton = queryAction(legacyResultSurface, 'next-sortie')
+  const status = queryField(legacyDebriefSurface, 'status')
+  const command = queryField(legacyDebriefSurface, 'command')
+  const loopPhaseField = queryField(legacyDebriefSurface, 'loop-phase')
+  const sortieStatus = queryField(legacyDebriefSurface, 'sortie-status')
+  const sortieKills = queryField(legacyDebriefSurface, 'sortie-kills')
+  const sortieDuration = queryField(legacyDebriefSurface, 'sortie-duration')
+  const sortieResult = queryField(legacyDebriefSurface, 'sortie-result')
+  const claimRewardButton = queryAction(legacyDebriefSurface, 'claim-reward')
+  const nextSortieButton = queryAction(legacyDebriefSurface, 'next-sortie')
 
   // AC3: the Pause button's visible label is a fixed constant, so it only
   // needs to be set once at construction time (Issue #1375 PR #1925 review
@@ -304,6 +335,8 @@ export function createHudController(
   // render() can skip DOM writes for unchanged values (AC6). `null` means
   // "no previous render yet" so the first render always writes every field.
   let previousIsRunning: boolean | undefined
+  let previousLegacyDebriefSurfaceVisible: boolean | undefined
+  let previousCombatHudPausedInert: boolean | undefined
   let previousCombatHudViewModel: CombatHudViewModel | null = null
 
   return {
@@ -311,21 +344,39 @@ export function createHudController(
       // AC1: exactly one of the two HUD roots is the active player-facing
       // surface for the current phase; the other is hidden + inert.
       const isRunning = state.loopPhase === 'running'
-      const legacyResultSurfaceWasVisible =
-        previousIsRunning === undefined ? undefined : !previousIsRunning
+      const legacyDebriefSurfaceVisible = isLegacyDebriefPhase(state)
       setHudRootVisibility(combatHudRoot, isRunning, previousIsRunning)
-      setHudRootVisibility(legacyResultSurface, !isRunning, legacyResultSurfaceWasVisible)
+      // Issue #1376: the legacy debrief surface's visibility is now derived
+      // from loopPhase directly (debrief_pending_reward / debrief_reward_claimed
+      // only), not the "everything except running" predicate it used before
+      // #1376 moved the result screen to phaseScreens.ts.
+      setHudRootVisibility(legacyDebriefSurface, legacyDebriefSurfaceVisible, previousLegacyDebriefSurfaceVisible)
       // Issue #1375 PR #1925 owner playtest (P0, iteration 4): reset scroll
-      // position exactly once, on the transition into visible (running ->
-      // result/debrief), so a leftover scroll offset from a previous visit
-      // never hides `.panel--actions` (Return to hangar) below the fold on
-      // first paint. Guarded by the same visibility-change check as
-      // `setHudRootVisibility()` above (AC6: no unconditional per-frame
-      // writes) — only runs when the surface just became visible.
-      if (!isRunning && legacyResultSurfaceWasVisible !== true) {
-        legacyResultSurface.scrollTop = 0
+      // position exactly once, on the transition into visible, so a leftover
+      // scroll offset from a previous visit never hides the action buttons
+      // below the fold on first paint. Guarded so it only runs on a
+      // false -> true visibility transition (AC6: no unconditional
+      // per-frame writes).
+      if (legacyDebriefSurfaceVisible && previousLegacyDebriefSurfaceVisible !== true) {
+        legacyDebriefSurface.scrollTop = 0
       }
       previousIsRunning = isRunning
+      previousLegacyDebriefSurfaceVisible = legacyDebriefSurfaceVisible
+
+      // AC4 (Issue #1376): while running AND paused, the combat HUD stays
+      // visible (Hull/Kills/Elapsed/Weapon keep updating) but becomes inert
+      // so it drops out of the tab order behind the pause dialog. Never
+      // hidden here — hidden is exclusively driven by isRunning above. Only
+      // touches the inert attribute while isRunning: when !isRunning,
+      // setHudRootVisibility() above already owns hidden+inert together and
+      // this must not clobber it (previousCombatHudPausedInert is left
+      // untouched so re-entering `running` always re-evaluates correctly).
+      if (isRunning) {
+        setCombatHudInertOnly(combatHudRoot, isPaused, previousCombatHudPausedInert)
+        previousCombatHudPausedInert = isPaused
+      } else {
+        previousCombatHudPausedInert = undefined
+      }
 
       // -----------------------------------------------------------------
       // Combat HUD (data-combat-hud, running only) — AC2, AC3, AC4, AC6
@@ -356,16 +407,15 @@ export function createHudController(
       previousCombatHudViewModel = combatHudViewModel
 
       // -----------------------------------------------------------------
-      // Legacy result/debrief compatibility surface — hidden during
-      // running (temporary until #1376 replaces it with a dedicated
-      // result/pause overlay).
+      // Legacy debrief compatibility surface — visible only for
+      // debrief_pending_reward / debrief_reward_claimed (temporary until
+      // those legacy phases are retired; Issue #1376 removed result
+      // responsibility from this surface entirely).
       // -----------------------------------------------------------------
       loopPhaseField.textContent = missionPhaseLabel(state.loopPhase)
 
-      // claim-reward: legacy debrief_pending_reward phase only (AC5: result uses confirm-result)
+      // claim-reward: legacy debrief_pending_reward phase only
       claimRewardButton.disabled = state.loopPhase !== 'debrief_pending_reward'
-      // confirm-result: only in result phase (AC5)
-      confirmResultButton.disabled = state.loopPhase !== 'result'
       // next-sortie: only for legacy debrief_reward_claimed phase
       nextSortieButton.disabled = state.loopPhase !== 'debrief_reward_claimed'
 
@@ -376,15 +426,16 @@ export function createHudController(
       // paints BEHIND the modal preparation phase-screen overlay (so it was
       // invisible while the player was looking at that screen). This
       // surface keeps rendering `state.telemetry` unconditionally (as
-      // before #1375) so other phases/consumers are unaffected.
+      // before #1375) so other phases/consumers are unaffected, even though
+      // it is hidden + inert outside the two legacy debrief phases.
       status.textContent = state.telemetry.status
       command.textContent = state.telemetry.lastCommandSummary
 
-      // Sortie status display (AC4, AC10)
+      // Sortie status display
       const s = state.sortie
       sortieStatus.textContent = getSortieStatusCopy(state)
 
-      // Kills (AC10)
+      // Kills
       if (s.result !== null) {
         sortieKills.textContent = `${s.result.kills}`
       } else {
@@ -393,7 +444,7 @@ export function createHudController(
         sortieKills.textContent = `${kills}`
       }
 
-      // Duration (AC10, AC11)
+      // Duration
       // Terminal: use result.durationMs; running: use elapsedTicks-derived ticks
       if (s.result !== null) {
         const durationSec = (s.result.durationMs / 1000).toFixed(1)
@@ -412,7 +463,7 @@ export function createHudController(
         sortieDuration.setAttribute('data-visual-mask', 'true')
       }
 
-      // Result (AC9, AC10): both Canvas overlay and HUD use result.outcome as authority
+      // Result: both Canvas overlay and this legacy surface use result.outcome as authority
       sortieResult.textContent = getOutcomeCopy(state)
     },
   }
@@ -420,8 +471,8 @@ export function createHudController(
 
 /**
  * Player-facing mission phase copy (AC contract: raw `LoopPhase` never
- * reaches overlay text). Kept minimal here since title/load/preparation own
- * their own headings now (`phaseScreens.ts`).
+ * reaches overlay text). Kept minimal here since title/load/preparation/
+ * result/pause own their own headings now (`phaseScreens.ts`).
  */
 function missionPhaseLabel(loopPhase: GameState['loopPhase']): string {
   switch (loopPhase) {
