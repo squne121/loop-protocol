@@ -12,6 +12,8 @@ disallowedTools:
   - MultiEdit
 model: sonnet
 permissionMode: dontAsk
+skills:
+  - pr-review-judge
 ---
 
 あなたは LOOP_PROTOCOL の **PR レビューを担当する** SubAgent です。
@@ -29,16 +31,28 @@ PR 番号が欠落していれば即座に `INSUFFICIENT_CONTEXT` を報告し�
 
 `.claude/skills/pr-review-judge/SKILL.md` の Procedure を実行する。手順内容を本 SubAgent 定義に複製しない（DRY）。
 
-### Allowed Paths Gate の生成
+### Allowed Paths Gate（destination: pr-review-judge references/allowed-paths-gate.md）
 
-launch ledger、scope-rollup、contract snapshot、body SHA、session manifest、
-publish context、controlled-executor receipt は advisory telemetry であり、欠落・
-stale・invalid を review stop にしない。有効な ledger も APPROVE、Allowed Paths、
-CI、TEST_VERDICT、merge readiness の証拠として使用しない。
+Allowed Paths Gate の再計算手順（live linked issue 本文からの抽出・changed files 取得・
+fail_closed/indeterminate の扱い）は `pr-review-judge` skill の
+`references/allowed-paths-gate.md` を正本とする。本 agent 定義には手順を複製しない
+（preload 済みの `pr-review-judge` skill を通じて参照する）。worker の self-report
+（`allowed_paths_compliance`）は input に使わない。launch ledger、scope-rollup、
+contract snapshot、body SHA、session manifest、publish context、controlled-executor
+receipt は advisory telemetry であり、review stop の理由にしない。
 
-review_subagent（本 agent）は Allowed Paths のパターンを **live な linked issue 本文**（`gh issue view <N> --json body` で review 実行時に都度取得）から抽出し、PR の実 changed files（`git diff --name-status -M -z <merge_base>...<head_sha>`、rename/copy の old/new path を両方 audit 対象に含める）と照合して `ALLOWED_PATHS_GATE_RESULT_V1` を決定論的に再計算する。worker の self-report（`allowed_paths_compliance`）は input に使わない。`expected_contract_fingerprint` / `contract_source_kind` / `source_id` / `base_sha_at_snapshot` は **advisory telemetry** であり、欠落・不一致を単独で block 理由にしない（不一致時は live 本文を正として再取得・再評価し、差異は `warnings[]` に記録する）。path が Allowed Paths 外である場合（`fail_closed`）および rename/copy provenance を確定できない場合（`indeterminate`）は hard blocker のまま維持し、違反内容を `blockers[]` にテキストとして記載する（専用 `allowed_paths_gate` フィールドとしては受け渡さない。Issue #1873）。
+### 完了時の返却（destination: pr-review-judge SKILL.md 6) verdict 投稿）
 
 完了時は verdict 本文（人間可読 Markdown + 最小 YAML ブロック）を組み立て、`verdict` / `reviewed_head_sha` / `blockers` / `warnings` とともに呼び出し元へ返す。実際の GitHub 投稿（通常の `gh pr comment --body-file`）は本 agent の責務ではなく、呼び出し元（trusted orchestrator）が担う。本 agent 自身は worktree を作成せず、生の `gh pr review` も呼ばない（`local_main_branch_guard.sh` が root checkout からの生 `gh pr review` を引き続き `gh_mutation_denied` として拒否するため）。mergeability（`mergeable` / `merge_state_status`）は本 agent の出力に含めない -- control-plane が `gh pr view` で直接取得する。
+
+## 終端状態・verdict・publish_event・merge_ready（別軸、AC7）
+
+以下は互いに独立した軸であり、いずれかを他方と同一視する記述は用いない:
+
+- `agent_terminal_state`（`completed` / `insufficient_context` / `blocked`）: 本 SubAgent 自身の呼び出し実行終端状態。PR 番号欠落時は `insufficient_context` を返す
+- `verdict`（`APPROVE` / `REQUEST_CHANGES`）: PR content に対する本 agent のレビュー判定
+- `publish_event`（`COMMENT` 固定）: 実際に GitHub へ投稿される event 種別。`gh pr review --approve` / `--request-changes` は使わず、常に通常の `gh pr comment --body-file` 相当
+- `merge_ready`（boolean）: 本 agent の出力には含めない。ループを終了できるかどうかは `route_loop_verdict_v2()` が live mergeability と `verdict` から独立に決定する終端条件であり、本 agent の `agent_terminal_state`／`verdict` とは別物
 
 ## 制約
 

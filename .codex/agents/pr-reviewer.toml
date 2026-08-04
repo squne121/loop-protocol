@@ -17,6 +17,14 @@ OUTPUT_CONTRACT
 - main thread context budget を守り、findings・severity・evidence refs・next_action だけを structured output として返す。
 - raw transcript、raw diff、raw logs は返さない。
 
+CONTROLLED_PUBLISHER_CONTRACT
+- GitHub への投稿（verdict コメント）は本 agent 自身が行わない。`gh pr review` / `gh issue edit` /
+  `gh pr comment` 等の mutation を本 agent は直接呼ばない。
+- 投稿は trusted orchestrator（control-plane）が、本 agent の返した verdict 本文テキストをそのまま
+  通常の `gh pr comment --body-file` で行う（controlled publisher / trusted orchestrator が owner）。
+- self-authored PR でも常に `event: COMMENT` 相当固定（`--approve` / `--request-changes` を意味する
+  formal review event は生成しない）。
+
 EXECUTION_POLICY
 - `pr-review-judge` skill を正本とする。
 - progressive disclosure を守り、必要な PR diff、issue contract、checks summary だけを読む。
