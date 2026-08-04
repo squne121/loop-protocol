@@ -9,6 +9,8 @@ import json
 import stat
 import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -930,3 +932,61 @@ def test_deny_post_tool_use_characterization_schema_valid(tmp_path: Path) -> Non
             "secret_scan_passed",
         }
     assert MODULE.validate_artifact(artifact) == (True, "valid")
+
+
+def test_loopback_canary_stops_cleanly_and_promptly_after_a_real_hit(tmp_path: Path) -> None:
+    """Issue #1979 fix_delta regression test.
+
+    Driving ``_LoopbackCanary`` through an actual GET request (as happens
+    whenever ``read_url_content`` is genuinely invoked in the allow profile)
+    must not leave ``stop()`` unbounded.  Before the fix,
+    ``socketserver.ThreadingMixIn.server_close()``'s default
+    ``block_on_close=True`` behaviour performed an *unbounded* join over the
+    per-request handler thread spawned to serve that hit -- a race distinct
+    from (and not bounded by) the ``self._thread.join(timeout=5)`` applied to
+    the ``serve_forever`` accept-loop thread.  This test would have caught
+    that: it exercises the real request-then-shutdown path and asserts both a
+    ``True`` result and a bounded wall-clock cost.
+    """
+    counter_path = tmp_path / "network-canary-counter"
+    counter_path.write_text("0\n", encoding="utf-8")
+    canary = MODULE._LoopbackCanary(counter_path, run_id="test-run", canary_id="test-canary")
+    try:
+        response = urllib.request.urlopen(canary.url, timeout=5)
+        assert response.status == 200
+        assert counter_path.read_text(encoding="utf-8").strip() == "1"
+    finally:
+        started_at = time.time()
+        stopped = canary.stop()
+        elapsed = time.time() - started_at
+
+    assert stopped is True
+    assert elapsed < 5.0, f"loopback canary shutdown after a real hit took {elapsed:.3f}s (expected < 5.0s)"
+    assert canary._thread.is_alive() is False
+
+
+def test_cleanup_evidence_fields_are_independent_not_a_shared_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1979 fix_delta regression test.
+
+    ``loopback_servers_stopped`` and ``temporary_processes_removed`` used to
+    be backed by a single shared ``cleanup_ok`` boolean, so an unrelated
+    temp-directory removal failure would silently also report the loopback
+    server as unstopped (and vice versa).  Forcing only the ``shutil.rmtree``
+    step to fail must leave ``loopback_servers_stopped`` ``True`` while
+    ``temporary_processes_removed`` is ``False``.
+    """
+    fake = tmp_path / "fake-agy"
+    _fake_agy(fake)
+
+    def _raise_rmtree(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated temp directory removal failure")
+
+    monkeypatch.setattr(MODULE.shutil, "rmtree", _raise_rmtree)
+    exit_code, artifact = MODULE._run(
+        argparse.Namespace(mode="hermetic", agy=str(fake), allow_live=False, profile="grounded_research", artifact_dir=tmp_path)
+    )
+    assert exit_code == 1
+    assert artifact["cleanup"]["temporary_processes_removed"] is False
+    assert artifact["cleanup"]["loopback_servers_stopped"] is True

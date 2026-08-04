@@ -131,7 +131,40 @@ class _LoopbackCanary:
             def log_message(self, _format: str, *_args: object) -> None:
                 return
 
+        # Issue #1979 fix_delta: bound the per-connection socket read so an
+        # idle/pre-opened keep-alive-style connection can never leave the
+        # per-request handler thread blocked indefinitely on
+        # ``rfile.readline()`` waiting for a request that never arrives.
+        Handler.timeout = 2
+
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        # Issue #1979 fix_delta (cleanup-after-real-hit race): by default,
+        # ``socketserver.ThreadingMixIn.server_close()`` performs an
+        # *unbounded* ``self._threads.join()`` over every per-request
+        # handler thread it has ever spawned (``block_on_close`` defaults to
+        # ``True``).  That join has no timeout at all -- unlike the
+        # ``self._thread.join(timeout=5)`` below, which only bounds the
+        # ``serve_forever`` accept-loop thread, not the per-request handler
+        # threads.  When this canary never receives a real request (the deny
+        # profile), no per-request thread is ever spawned, so
+        # ``server_close()`` returns immediately regardless -- that is why
+        # the deny profile's shutdown was always clean.  When a real request
+        # *is* handled (the allow profile), a per-request handler thread is
+        # spawned and tracked; if it is even slightly slow to fully unwind
+        # (GC pause, CPU contention from the concurrently-running AGY child
+        # process, TCP FIN/TIME_WAIT teardown latency), the unbounded join
+        # inside ``server_close()`` can stall past whatever wall-clock
+        # budget the caller expected, without ever raising or timing out.
+        # Disabling ``block_on_close`` removes this unbounded blocking call
+        # entirely: the listening socket is still closed synchronously by
+        # ``super().server_close()``, which is the operation that actually
+        # defines "the server is stopped" for this canary's purposes.  Any
+        # already-completed-or-completing per-request thread is harmless to
+        # leave unaccounted-for -- it holds no resources this process still
+        # needs, and ``daemon_threads=True`` ensures the interpreter never
+        # waits on it at process exit either.
+        self._server.daemon_threads = True
+        self._server.block_on_close = False
         self._server._canary = self  # type: ignore[attr-defined]
         self.url = (
             f"http://127.0.0.1:{self._server.server_address[1]}"
@@ -1497,23 +1530,34 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             capability_gate=capability_gate,
         )
     finally:
-        cleanup_ok = True
+        # Issue #1979 fix_delta: these two facts were previously collapsed
+        # into a single shared ``cleanup_ok`` boolean, so a loopback-server
+        # shutdown failure and an unrelated temp-directory removal failure
+        # were indistinguishable in the artifact -- either one silently
+        # reported as *both* ``loopback_servers_stopped: false`` and
+        # ``temporary_processes_removed: false``, even though they are
+        # distinct facts about distinct resources.  Tracking them
+        # independently makes the artifact an honest record of which
+        # specific cleanup step actually failed.
+        loopback_stopped_ok = True
         if runtime is not None:
             loopback_canary = runtime.get("loopback_canary")
             if isinstance(loopback_canary, _LoopbackCanary):
-                cleanup_ok = loopback_canary.stop()
+                loopback_stopped_ok = loopback_canary.stop()
+        temporary_removed_ok = True
         try:
             shutil.rmtree(temporary)
         except OSError:
-            cleanup_ok = False
+            temporary_removed_ok = False
+        cleanup_ok = loopback_stopped_ok and temporary_removed_ok
         if not cleanup_ok:
             exit_code = EXIT_FAIL
             result["runner"]["exit_code"] = EXIT_FAIL
             result["failure_taxonomy"]["class"] = FAILURE_INCONCLUSIVE
             result["failure_taxonomy"]["completion"] = False
         result["cleanup"] = {
-            "temporary_processes_removed": cleanup_ok,
-            "loopback_servers_stopped": cleanup_ok,
+            "temporary_processes_removed": temporary_removed_ok,
+            "loopback_servers_stopped": loopback_stopped_ok,
             "process_group_isolated": process_group_isolated,
             "descendant_processes_absent": descendant_processes_absent,
         }
