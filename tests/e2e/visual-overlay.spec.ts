@@ -29,6 +29,7 @@ import {
   expectDomOverlayScreenshot,
   isPendingFixtureScenario,
   VISUAL_BASELINE_REGISTRY_MATURITY,
+  VISUAL_FREEZE_CSS_PATH,
   type VisualScenarioFixture,
 } from './visual-utils'
 
@@ -124,8 +125,26 @@ test('GIVEN the running-hud active-fixture-only scenario WHEN the DOM overlay ro
 // two tests are a machine-checkable proof that the regenerated baseline
 // (captured with `canvasVisibility: 'hidden'`, see above) does not have
 // that defect: the PNG is not single-color-dominated (pixel diversity), and
-// deliberately breaking the HUD makes the screenshot assertion fail
-// (negative control).
+// deliberately breaking the HUD would make the real screenshot assertion
+// fail (negative control).
+//
+// The negative control below deliberately does NOT call
+// `expectDomOverlayScreenshot()` / `toHaveScreenshot(name, ...)` with the
+// SAME snapshot name ('vrt-running-hud-overlay.png') as the real baseline
+// capture above (Issue #1980 iteration-1 fix_delta root cause). Under
+// `pnpm run test:vrt:update:e2e` (`--update-snapshots=all`, the AC2 VC
+// command), `toHaveScreenshot()` never throws — it always (re)writes the
+// target snapshot file — so a shared-name negative control silently
+// OVERWRITES the real baseline with this hidden-HUD capture instead of
+// proving detection (whichever test runs last in file order wins on disk).
+// That is exactly how the committed baseline previously became a near-empty
+// (no-HUD) capture despite the AC2 pixel-diversity test passing against it.
+// The negative control instead does a read-only, `--update-snapshots`-immune
+// pixel diff: it captures the hidden-HUD DOM directly via
+// `Locator.screenshot()` (never touches the `toHaveScreenshot()` snapshot
+// read/write pipeline) and diffs it in-browser against the CHECKED-IN
+// baseline PNG bytes read from disk, asserting the differing-pixel count
+// exceeds the real assertion's `maxDiffPixels: 100` tolerance.
 
 /**
  * Committed baseline PNG path for the pixel diversity check below. Computed
@@ -194,7 +213,7 @@ test('GIVEN the regenerated running-hud-overlay-legacy-current baseline PNG WHEN
   ).toBeLessThan(SINGLE_COLOR_DOMINANCE_THRESHOLD)
 })
 
-test('GIVEN [data-combat-hud] is forcibly hidden WHEN the running-hud-overlay-legacy-current screenshot assertion runs THEN it fails instead of silently passing (negative control, AC3)', async ({
+test('GIVEN [data-combat-hud] is forcibly hidden WHEN the hidden-HUD capture is pixel-diffed against the committed running-hud-overlay-legacy-current baseline THEN the differing-pixel count exceeds the real assertion\'s tolerance (negative control, AC3)', async ({
   page,
 }) => {
   await installVisualScenario(page, RUNNING_HUD_FIXTURE)
@@ -206,13 +225,79 @@ test('GIVEN [data-combat-hud] is forcibly hidden WHEN the running-hud-overlay-le
     element.setAttribute('style', `${element.getAttribute('style') ?? ''};visibility:hidden!important;`)
   })
 
+  // Mirrors expectDomOverlayScreenshot()'s canvasVisibility: 'hidden' path
+  // (visual-utils.ts) without going through toHaveScreenshot()'s
+  // snapshot-name-keyed read/write pipeline (see the file-level comment
+  // above this test for why that pipeline is unsafe for a negative control
+  // that shares the real baseline's snapshot name).
+  await page.evaluate(() => {
+    document.documentElement.setAttribute('data-visual-canvas-hidden', 'true')
+  })
+  await page.addStyleTag({ path: VISUAL_FREEZE_CSS_PATH })
+
   const overlayRoot = page.locator('[data-battle-ui-root]')
-  await expect(
-    expectDomOverlayScreenshot(overlayRoot, 'vrt-running-hud-overlay.png', 'running-hud-overlay-legacy-current', {
-      maxDiffPixels: 100,
-      canvasVisibility: 'hidden',
-    }),
-  ).rejects.toThrow()
+  let hiddenHudPngBase64: string
+  try {
+    const buffer = await overlayRoot.screenshot({ animations: 'disabled' })
+    hiddenHudPngBase64 = buffer.toString('base64')
+  } finally {
+    await page.evaluate(() => {
+      document.documentElement.removeAttribute('data-visual-canvas-hidden')
+    })
+  }
+
+  const baselinePngBase64 = readFileSync(RUNNING_HUD_OVERLAY_BASELINE_PNG_PATH).toString('base64')
+
+  const diffPixelCount = await page.evaluate(
+    async ([baselineBase64, actualBase64]) => {
+      async function decode(base64: string): Promise<ImageData> {
+        const image = new Image()
+        const decoded = new Promise<void>((resolve, reject) => {
+          image.onload = () => resolve()
+          image.onerror = () => reject(new Error('failed to decode PNG in-browser'))
+        })
+        image.src = `data:image/png;base64,${base64}`
+        await decoded
+        const canvas = document.createElement('canvas')
+        canvas.width = image.naturalWidth
+        canvas.height = image.naturalHeight
+        const ctx = canvas.getContext('2d')
+        if (!ctx) {
+          throw new Error('2D canvas context unavailable')
+        }
+        ctx.drawImage(image, 0, 0)
+        return ctx.getImageData(0, 0, canvas.width, canvas.height)
+      }
+      const baseline = await decode(baselineBase64)
+      const actual = await decode(actualBase64)
+      if (baseline.width !== actual.width || baseline.height !== actual.height) {
+        // A dimension mismatch is itself a maximal-confidence regression
+        // signal — treat every pixel as differing.
+        return Math.max(baseline.width * baseline.height, actual.width * actual.height)
+      }
+      let diffCount = 0
+      for (let i = 0; i < baseline.data.length; i += 4) {
+        if (
+          baseline.data[i] !== actual.data[i] ||
+          baseline.data[i + 1] !== actual.data[i + 1] ||
+          baseline.data[i + 2] !== actual.data[i + 2] ||
+          baseline.data[i + 3] !== actual.data[i + 3]
+        ) {
+          diffCount += 1
+        }
+      }
+      return diffCount
+    },
+    [baselinePngBase64, hiddenHudPngBase64],
+  )
+
+  expect(
+    diffPixelCount,
+    `hiding [data-combat-hud] produced only ${diffPixelCount} differing pixel(s) vs the committed ` +
+      "baseline — at or below the real assertion's maxDiffPixels: 100 tolerance, which would mean " +
+      'the running-hud-overlay-legacy-current screenshot assertion does NOT actually detect the HUD ' +
+      'being hidden (Issue #1980 negative control).',
+  ).toBeGreaterThan(100)
 })
 
 // ---------------------------------------------------------------------------
