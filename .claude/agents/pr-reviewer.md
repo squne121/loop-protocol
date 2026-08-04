@@ -50,7 +50,7 @@ Allowed Paths Gate の詳細手順（changed files source hierarchy、rename pro
   `stale_snapshot`）のみ
 
 launch ledger、scope-rollup、contract snapshot、body SHA、session manifest、publish context、
-controlled-executor receipt は advisory telemetry であり、review stop の理由にしない。
+controlled-executor receipt は補助的な観測情報（advisory telemetry）にすぎず、これらの欠落や不整合を理由にレビューを停止しない。
 
 ### 完了時の返却（destination: pr-review-judge SKILL.md 6) verdict 投稿）
 
