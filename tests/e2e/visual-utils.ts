@@ -257,6 +257,25 @@ export interface DomOverlayScreenshotOptions {
   maxDiffPixels?: number
   /** `toHaveScreenshot()` `maxDiffPixelRatio` (fraction of TOTAL pixels, mask included). */
   maxDiffPixelRatio?: number
+  /**
+   * Canvas exclusion strategy for this capture (Issue #1980). Defaults to
+   * `'mask'` — the pre-existing Playwright `mask: [page.locator('canvas')]`
+   * behavior, unchanged for every DOM overlay baseline that does not pass
+   * this option. `'hidden'` instead sets `data-visual-canvas-hidden="true"`
+   * on `<html>` before the screenshot (removed again in a `finally` block)
+   * so `tests/e2e/visual.freeze.css`'s `[data-visual-canvas-hidden='true']
+   * canvas { visibility: hidden !important; }` rule actually excludes the
+   * `<canvas>` element from layout/paint, instead of Playwright drawing an
+   * opaque mask rectangle OVER the canvas's bounding box. When the capture
+   * root and the canvas share nearly the same bounding box (as
+   * `running-hud-overlay-legacy-current` does since PR #1925,
+   * `.battle-stage__viewport`), a `mask` rectangle covers the whole capture
+   * root — including the HUD drawn on top of the canvas — so the baseline
+   * silently stops verifying the HUD at all. `'hidden'` avoids that by
+   * actually removing the canvas from the rendered output instead of
+   * painting over the capture root.
+   */
+  canvasVisibility?: 'mask' | 'hidden'
 }
 
 /**
@@ -343,13 +362,40 @@ export async function expectDomOverlayScreenshot(
       ? { maxDiffPixels: options.maxDiffPixels }
       : { maxDiffPixelRatio: options.maxDiffPixelRatio }
 
+  const canvasVisibility = options.canvasVisibility ?? 'mask'
+
+  if (canvasVisibility === 'hidden') {
+    // Issue #1980: exclude the canvas via CSS visibility (freeze CSS opt-in
+    // flag) instead of a Playwright `mask` rectangle, so a capture root that
+    // shares nearly the same bounding box as the canvas (e.g.
+    // `running-hud-overlay-legacy-current`) does not get its whole area
+    // painted over — the HUD drawn on top of the canvas stays capturable.
+    await page.evaluate(() => {
+      document.documentElement.setAttribute('data-visual-canvas-hidden', 'true')
+    })
+    try {
+      await expect(locator).toHaveScreenshot(name, {
+        animations: 'disabled',
+        ...diffToleranceOption,
+        stylePath: VISUAL_FREEZE_CSS_PATH,
+      })
+    } finally {
+      await page.evaluate(() => {
+        document.documentElement.removeAttribute('data-visual-canvas-hidden')
+      })
+    }
+    return
+  }
+
   await expect(locator).toHaveScreenshot(name, {
     animations: 'disabled',
     ...diffToleranceOption,
     stylePath: VISUAL_FREEZE_CSS_PATH,
     // BLOCKER 4 (Issue #1385 review): mask every canvas so a transparent
     // DOM overlay (e.g. `.battle-ui-layer`, `position: absolute; inset: 0`)
-    // never captures the Canvas bitmap rendered behind it.
+    // never captures the Canvas bitmap rendered behind it. Only used when
+    // `canvasVisibility` is `'mask'` (default) — see the `'hidden'` branch
+    // above for `running-hud-overlay-legacy-current` (Issue #1980).
     mask: [page.locator('canvas')],
   })
 }

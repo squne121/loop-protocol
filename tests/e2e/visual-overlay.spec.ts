@@ -22,7 +22,7 @@
  */
 
 import { test, expect } from '@playwright/test'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import {
   installVisualScenario,
@@ -79,11 +79,13 @@ const RUNNING_HUD_PAUSED_FIXTURE: VisualScenarioFixture = {
 // baseline (Out of Scope).
 //
 // `expectDomOverlayScreenshot()` (tests/e2e/visual-utils.ts) applies the
-// shared freeze CSS via Playwright's `stylePath` option (AC6) and masks
-// every `canvas` element so the DOM overlay capture never bleeds in Canvas
+// shared freeze CSS via Playwright's `stylePath` option (AC6) and excludes
+// the `canvas` element so the DOM overlay capture never bleeds in Canvas
 // battle-stage pixels (AC5's "Canvas is only included via mask or an
 // explicit registered canvas visual cue baseline" — this capture uses the
-// `mask` path, not a Canvas visual cue exception).
+// explicit `canvasVisibility: 'hidden'` CSS-visibility exclusion path
+// (Issue #1980), not the default `mask` path, and not a Canvas visual cue
+// exception — see the call site's inline comment below for why).
 
 test('GIVEN the running-hud active-fixture-only scenario WHEN the DOM overlay root is captured THEN it matches the provisional/legacy-current baseline (AC5, AC6)', async ({
   page,
@@ -100,7 +102,117 @@ test('GIVEN the running-hud active-fixture-only scenario WHEN the DOM overlay ro
   // the registry row's `tolerance` column for the measurement method.
   await expectDomOverlayScreenshot(overlayRoot, 'vrt-running-hud-overlay.png', 'running-hud-overlay-legacy-current', {
     maxDiffPixels: 100,
+    // Issue #1980: canvas + `.battle-ui-layer` share nearly the same
+    // bounding box since PR #1925's `.battle-stage__viewport`, so the
+    // default `mask`-based canvas exclusion painted over the whole capture
+    // root (including the HUD drawn on top of the canvas). `'hidden'`
+    // excludes the canvas via CSS visibility instead, so the HUD stays
+    // capturable.
+    canvasVisibility: 'hidden',
   })
+})
+
+// ---------------------------------------------------------------------------
+// Pixel diversity / negative control (AC2, AC3, Issue #1980)
+// ---------------------------------------------------------------------------
+//
+// The previous `mask`-based canvas exclusion painted an opaque rectangle
+// over the whole capture root for this baseline (canvas and
+// `[data-battle-ui-root]` share nearly the same bounding box since PR
+// #1925), so the committed PNG was ~99.8% a single mask color and the
+// screenshot assertion could not actually detect an HUD regression. These
+// two tests are a machine-checkable proof that the regenerated baseline
+// (captured with `canvasVisibility: 'hidden'`, see above) does not have
+// that defect: the PNG is not single-color-dominated (pixel diversity), and
+// deliberately breaking the HUD makes the screenshot assertion fail
+// (negative control).
+
+/**
+ * Committed baseline PNG path for the pixel diversity check below. Computed
+ * independently of `SCREENSHOTS_DIR` (declared further below in this file,
+ * Issue #1386 PR #1721 review fix P2 Blocker #6) to avoid a module-load-time
+ * temporal-dead-zone reference to a `const` declared later in the file.
+ */
+const RUNNING_HUD_OVERLAY_BASELINE_PNG_PATH = fileURLToPath(
+  new URL('./__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay.png', import.meta.url),
+)
+
+/**
+ * A single color (including a fully-transparent/mask color) covering this
+ * fraction or more of the baseline's pixels is treated as "mask-dominated".
+ * The pre-fix defect measured ~99.8% single-color coverage (Issue #1980
+ * Current Validated Scope); 0.9 leaves ample margin above legitimate
+ * anti-aliasing/gradient variance while still catching a full-mask
+ * regression.
+ */
+const SINGLE_COLOR_DOMINANCE_THRESHOLD = 0.9
+
+test('GIVEN the regenerated running-hud-overlay-legacy-current baseline PNG WHEN its pixel composition is inspected via canvas getImageData THEN it is not dominated by a single color (pixel diversity, AC2)', async ({
+  page,
+}) => {
+  const pngBase64 = readFileSync(RUNNING_HUD_OVERLAY_BASELINE_PNG_PATH).toString('base64')
+
+  const dominantColorRatio = await page.evaluate(async (base64) => {
+    const image = new Image()
+    const decoded = new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve()
+      image.onerror = () => reject(new Error('failed to decode baseline PNG in-browser'))
+    })
+    image.src = `data:image/png;base64,${base64}`
+    await decoded
+
+    const canvas = document.createElement('canvas')
+    canvas.width = image.naturalWidth
+    canvas.height = image.naturalHeight
+    const ctx = canvas.getContext('2d')
+    if (!ctx) {
+      throw new Error('2D canvas context unavailable')
+    }
+    ctx.drawImage(image, 0, 0)
+    const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height)
+
+    const colorCounts = new Map<string, number>()
+    for (let i = 0; i < data.length; i += 4) {
+      const key = `${data[i]},${data[i + 1]},${data[i + 2]},${data[i + 3]}`
+      colorCounts.set(key, (colorCounts.get(key) ?? 0) + 1)
+    }
+    let maxCount = 0
+    for (const count of colorCounts.values()) {
+      if (count > maxCount) {
+        maxCount = count
+      }
+    }
+    const totalPixels = canvas.width * canvas.height
+    return totalPixels > 0 ? maxCount / totalPixels : 1
+  }, pngBase64)
+
+  expect(
+    dominantColorRatio,
+    `baseline PNG is ${(dominantColorRatio * 100).toFixed(1)}% a single color — this reproduces ` +
+      'the pre-Issue-#1980 canvas-mask capture defect (Current Validated Scope: ~99.8% single ' +
+      'color) instead of an actual HUD capture.',
+  ).toBeLessThan(SINGLE_COLOR_DOMINANCE_THRESHOLD)
+})
+
+test('GIVEN [data-combat-hud] is forcibly hidden WHEN the running-hud-overlay-legacy-current screenshot assertion runs THEN it fails instead of silently passing (negative control, AC3)', async ({
+  page,
+}) => {
+  await installVisualScenario(page, RUNNING_HUD_FIXTURE)
+  await page.goto('/')
+
+  const combatHud = page.locator('[data-combat-hud]')
+  await expect(combatHud).toBeVisible()
+  await combatHud.evaluate((element) => {
+    element.setAttribute('style', `${element.getAttribute('style') ?? ''};visibility:hidden!important;`)
+  })
+
+  const overlayRoot = page.locator('[data-battle-ui-root]')
+  await expect(
+    expectDomOverlayScreenshot(overlayRoot, 'vrt-running-hud-overlay.png', 'running-hud-overlay-legacy-current', {
+      maxDiffPixels: 100,
+      canvasVisibility: 'hidden',
+    }),
+  ).rejects.toThrow()
 })
 
 // ---------------------------------------------------------------------------

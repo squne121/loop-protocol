@@ -52,6 +52,26 @@
 }
 
 /*
+ * Canvas-hidden opt-in (Issue #1980). `expectDomOverlayScreenshot()`
+ * (tests/e2e/visual-utils.ts) sets `data-visual-canvas-hidden="true"` on
+ * `<html>` right before capture when a call site passes
+ * `canvasVisibility: 'hidden'` (currently only
+ * `running-hud-overlay-legacy-current`), and removes it again afterward.
+ * This excludes the `<canvas>` from the rendered output via CSS visibility
+ * instead of Playwright's `mask` option: `mask` paints an opaque rectangle
+ * OVER the canvas's bounding box, which blankets the whole capture root
+ * when the capture root and the canvas share nearly the same bounding box
+ * (true for `running-hud-overlay-legacy-current` since PR #1925's
+ * `.battle-stage__viewport`), silently hiding the HUD drawn on top of the
+ * canvas as well. `visibility: hidden` instead removes only the canvas
+ * element from paint, leaving the HUD overlay drawn above it fully visible
+ * and comparable.
+ */
+[data-visual-canvas-hidden='true'] canvas {
+  visibility: hidden !important;
+}
+
+/*
  * Deterministic font pin for the DOM overlay VRT capture root (Issue #1386
  * PR #1721 review fix, P1 Blocker 1). `src/style.css`'s `--sans` /
  * `--mono` custom properties resolve through a named-font fallback chain
