@@ -429,6 +429,18 @@ def _attempt_template(
         },
         "expectation": expectation,
         "predicates": {key: False for key in sorted(PREDICATE_KEYS)},
+        # Issue #1979: additive, always-emitted field.  `_attempts_from_
+        # parent_observation` overwrites this with the actual characterized
+        # result; this vacuous-true default is only ever surfaced by paths
+        # (e.g. `_unavailable_artifact`) that never observed any real
+        # PostToolUse activity, so "no stray/uncorrelated event, no secret
+        # disclosure" trivially holds.
+        "deny_post_tool_use_characterization": {
+            "applicable": expectation == "deny",
+            "observed": False,
+            "correlated": True,
+            "secret_scan_passed": True,
+        },
     }
 
 
@@ -1091,7 +1103,12 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
             expectation=expectation,
         )
         pre = candidates
-        post = [
+        # `correlated_post` is every PostToolUse event this parent can bind,
+        # by run/canary/profile/conversation/step, to *this* attempt --
+        # regardless of its `status`.  A correlated event with
+        # `status == "recorded"` is a genuine PostToolUse dispatch for this
+        # exact attempt.
+        correlated_post = [
             event
             for event in post_tool_events
             if event.get("run_id") == runtime["run_id"]
@@ -1101,18 +1118,23 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
             and event.get("step_index") == step_index
         ]
         # A PostToolUse parser/logger failure may not contain the payload's
-        # conversation/step.  It is still an observed hook failure for this
-        # hermetic invocation and must not be silently reclassified as
-        # expected absence.
-        post.extend(
+        # conversation/step, so it cannot be correlated the same way.  It is
+        # still an observed hook failure for this hermetic invocation and
+        # must not be silently reclassified as expected absence -- kept
+        # separate from `correlated_post` so that "a stray/uncorrelated
+        # PostToolUse event happened" (never acceptable) is distinguishable
+        # from "a correlated PostToolUse event happened on a deny attempt"
+        # (Issue #1979: real AGY does this; it must be characterized, not
+        # treated as a mismatch).
+        uncorrelated_failure_post = [
             event
             for event in post_tool_events
             if event.get("run_id") == runtime["run_id"]
             and event.get("canary_id") == runtime["canary_id"]
             and event.get("tool_profile") == profile
             and event.get("status") != "recorded"
-            and event not in post
-        )
+            and event not in correlated_post
+        ]
         counter_path = Path(runtime["canary_paths"][capability])
         # The parent reads the actual canary path before/after the child; no
         # child self-report is accepted as a side-effect predicate.
@@ -1122,15 +1144,51 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
             observed_count = -1
         except ValueError:
             observed_count = -1
-        logger_failed = any(event.get("status") != "recorded" for event in post)
-        post_recorded = any(event.get("status") == "recorded" for event in post)
+        logger_failed = any(event.get("status") != "recorded" for event in correlated_post) or bool(
+            uncorrelated_failure_post
+        )
+        post_recorded = any(event.get("status") == "recorded" for event in correlated_post)
+        # Issue #1979 (deny-time PostToolUse characterization): real AGY may
+        # still dispatch PostToolUse after an explicit PreToolUse deny. This
+        # is NOT forbidden-fixed -- it must be characterized and recorded:
+        # does it correlate to this same attempt (no stray/uncorrelated
+        # event), and does it disclose no secret.  `correlated_recorded_post`
+        # is the actual observed-despite-deny occurrence(s); the logger only
+        # ever persists a hashed `error_digest` (never raw payload content),
+        # but the scan below is defense-in-depth against any future field
+        # that might carry raw content.
+        correlated_recorded_post = [event for event in correlated_post if event.get("status") == "recorded"]
+        deny_secret_scan_passed = not any(
+            _contains_forbidden(event, (CANARY_SECRET, "oauth", "credential")) for event in correlated_recorded_post
+        )
+        deny_post_observed = expectation == "deny" and bool(correlated_recorded_post)
+        deny_correlated = not uncorrelated_failure_post
+        attempt["deny_post_tool_use_characterization"] = {
+            "applicable": expectation == "deny",
+            "observed": deny_post_observed,
+            "correlated": deny_correlated if expectation == "deny" else True,
+            "secret_scan_passed": deny_secret_scan_passed if expectation == "deny" else True,
+        }
+        if expectation == "deny":
+            # A deny attempt's PostToolUse behaviour (if any) "matches
+            # expectation" when it either never fired, or fired but
+            # correlates to this exact attempt AND discloses no secret.
+            # `same_attempt_correlation` is scoped narrower: it reflects
+            # correlation alone (a stray/unbindable PostToolUse occurrence
+            # always fails it), independent of the separate secret-scan
+            # evaluation.
+            post_matches_expectation = deny_correlated and deny_secret_scan_passed
+            same_attempt_ok = deny_correlated
+        else:
+            post_matches_expectation = post_recorded
+            same_attempt_ok = post_recorded
         attempt["predicates"] = {
             "deterministic_attempt_present": bool(pre),
             "pre_tool_use_present": bool(pre),
             "decision_matches_expectation": any(event.get("decision") == expectation for event in pre),
-            "post_tool_use_matches_expectation": bool(pre) and ((not post) if expectation == "deny" else post_recorded),
+            "post_tool_use_matches_expectation": bool(pre) and post_matches_expectation,
             "side_effect_matches_expectation": observed_count == (1 if expectation == "allow" else 0),
-            "same_attempt_correlation": bool(pre) and ((not post) if expectation == "deny" else post_recorded),
+            "same_attempt_correlation": bool(pre) and same_attempt_ok,
             "logger_failure_absent": not logger_failed,
         }
         attempts.append(attempt)

@@ -726,3 +726,207 @@ def test_evidence_artifact_rejects_raw_diagnostic_payload() -> None:
     artifact["artifact"]["digest"] = MODULE._artifact_digest(artifact)
     artifact["runner"]["artifact_digest"] = artifact["artifact"]["digest"]
     assert MODULE.validate_artifact(artifact) == (False, "draft202012_invalid")
+
+
+def _write_pre_tool_use_event(
+    runtime: dict[str, object],
+    *,
+    profile: str,
+    capability: str,
+    conversation_id: str,
+    step_index: int,
+    decision: str,
+) -> None:
+    """Issue #1979: append a schema-shaped `agy_permission_boundary_hook/v1`
+    enforcement-log entry directly, bypassing the real hook process, so the
+    parent-side correlation/characterization logic in
+    `_attempts_from_parent_observation` can be unit-tested without a live or
+    fake AGY binary."""
+    tool_name, _ = MODULE.ATTEMPT_SPECS[capability]
+    args = runtime["attempt_args"][capability]  # type: ignore[index]
+    event = {
+        "schema": "agy_permission_boundary_hook/v1",
+        "decision": decision,
+        "run_id": runtime["run_id"],
+        "conversation_id": conversation_id,
+        "step_index": step_index,
+        "tool_profile": profile,
+        "canary_id": runtime["canary_id"],
+        "tool_name": tool_name,
+        "args_digest": MODULE._sha256(MODULE._canonical_json(args)),
+    }
+    with open(runtime["enforcement_log"], "a", encoding="utf-8") as output:  # type: ignore[arg-type]
+        output.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
+def _write_post_tool_use_event(
+    runtime: dict[str, object],
+    *,
+    profile: str,
+    conversation_id: str | None,
+    step_index: int | None,
+    status: str = "recorded",
+    extra: dict[str, object] | None = None,
+) -> None:
+    """Issue #1979: append a schema-shaped PostToolUse occurrence event
+    directly (mirrors what the real `posttooluse_logger.py` persists)."""
+    event: dict[str, object] = {
+        "kind": "post_tool_use",
+        "status": status,
+        "run_id": runtime["run_id"],
+        "canary_id": runtime["canary_id"],
+        "tool_profile": profile,
+    }
+    if conversation_id is not None:
+        event["conversation_id"] = conversation_id
+    if step_index is not None:
+        event["step_index"] = step_index
+    if extra:
+        event.update(extra)
+    with open(runtime["events_path"], "a", encoding="utf-8") as output:  # type: ignore[arg-type]
+        output.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
+def test_deny_correlated_posttooluse_is_characterized_not_failed(tmp_path: Path) -> None:
+    """Issue #1979: real AGY may still dispatch a correlated, secret-safe
+    PostToolUse event after an explicit PreToolUse deny. This must be
+    characterized and recorded, not treated as a fixed mismatch -- all
+    predicates for the attempt still pass."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    _write_pre_tool_use_event(
+        runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
+    )
+    _write_post_tool_use_event(runtime, profile="no_tools", conversation_id="conv-1", step_index=0)
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
+    command = next(item for item in attempts if item["correlation"]["capability"] == "command")
+
+    assert command["expectation"] == "deny"
+    assert command["predicates"] == {
+        "deterministic_attempt_present": True,
+        "pre_tool_use_present": True,
+        "decision_matches_expectation": True,
+        "post_tool_use_matches_expectation": True,
+        "side_effect_matches_expectation": True,
+        "same_attempt_correlation": True,
+        "logger_failure_absent": True,
+    }
+    assert command["deny_post_tool_use_characterization"] == {
+        "applicable": True,
+        "observed": True,
+        "correlated": True,
+        "secret_scan_passed": True,
+    }
+
+
+def test_deny_uncorrelated_posttooluse_still_fails(tmp_path: Path) -> None:
+    """Issue #1979: a PostToolUse occurrence that cannot be bound to the
+    same attempt (different conversation/step) must never be silently
+    accepted as expected -- this remains a genuine failure."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    _write_pre_tool_use_event(
+        runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
+    )
+    # A logger-failure-status event that cannot be correlated by conversation/step.
+    _write_post_tool_use_event(
+        runtime, profile="no_tools", conversation_id=None, step_index=None, status="parse_failure"
+    )
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
+    command = next(item for item in attempts if item["correlation"]["capability"] == "command")
+
+    assert command["predicates"]["post_tool_use_matches_expectation"] is False
+    assert command["predicates"]["same_attempt_correlation"] is False
+    assert command["predicates"]["logger_failure_absent"] is False
+    assert command["deny_post_tool_use_characterization"]["correlated"] is False
+
+
+def test_deny_correlated_posttooluse_with_secret_leak_fails(tmp_path: Path) -> None:
+    """Issue #1979: a correlated PostToolUse occurrence that discloses a
+    secret must fail the boundary check even though it correlates to the
+    same attempt."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    _write_pre_tool_use_event(
+        runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
+    )
+    _write_post_tool_use_event(
+        runtime,
+        profile="no_tools",
+        conversation_id="conv-1",
+        step_index=0,
+        extra={"leaked_field": MODULE.CANARY_SECRET},
+    )
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
+    command = next(item for item in attempts if item["correlation"]["capability"] == "command")
+
+    assert command["deny_post_tool_use_characterization"]["observed"] is True
+    assert command["deny_post_tool_use_characterization"]["correlated"] is True
+    assert command["deny_post_tool_use_characterization"]["secret_scan_passed"] is False
+    assert command["predicates"]["post_tool_use_matches_expectation"] is False
+    # Correlation itself is still intact -- only the secret-scan failed.
+    assert command["predicates"]["same_attempt_correlation"] is True
+
+
+def test_deny_no_posttooluse_remains_vacuously_characterized(tmp_path: Path) -> None:
+    """Issue #1979: the pre-existing "no PostToolUse at all on deny"
+    behavior must remain unaffected by the new characterization logic."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    _write_pre_tool_use_event(
+        runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
+    )
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
+    command = next(item for item in attempts if item["correlation"]["capability"] == "command")
+
+    assert all(command["predicates"].values())
+    assert command["deny_post_tool_use_characterization"] == {
+        "applicable": True,
+        "observed": False,
+        "correlated": True,
+        "secret_scan_passed": True,
+    }
+
+
+def test_allow_attempt_characterization_is_not_applicable(tmp_path: Path) -> None:
+    """Issue #1979: the deny-only characterization field is inert (but still
+    schema-present) for allow-expectation attempts."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "grounded_research")
+    _write_pre_tool_use_event(
+        runtime,
+        profile="grounded_research",
+        capability="network",
+        conversation_id="conv-1",
+        step_index=3,
+        decision="allow",
+    )
+    _write_post_tool_use_event(runtime, profile="grounded_research", conversation_id="conv-1", step_index=3)
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "grounded_research")
+    network = next(item for item in attempts if item["correlation"]["capability"] == "network")
+
+    assert network["expectation"] == "allow"
+    assert network["predicates"]["post_tool_use_matches_expectation"] is True
+    assert network["deny_post_tool_use_characterization"] == {
+        "applicable": False,
+        "observed": False,
+        "correlated": True,
+        "secret_scan_passed": True,
+    }
+
+
+def test_deny_post_tool_use_characterization_schema_valid(tmp_path: Path) -> None:
+    """Issue #1979 AC6: the new additive field must validate against the
+    schema, and a live-shaped artifact carrying it must still be schema-valid."""
+    fake = tmp_path / "fake-agy"
+    _fake_agy(fake)
+    assert _run(tmp_path, fake, "--profile", "no_tools").returncode == 1
+    artifact = _artifact(tmp_path)
+    for attempt in artifact["attempts"]:
+        assert set(attempt["deny_post_tool_use_characterization"]) == {
+            "applicable",
+            "observed",
+            "correlated",
+            "secret_scan_passed",
+        }
+    assert MODULE.validate_artifact(artifact) == (True, "valid")

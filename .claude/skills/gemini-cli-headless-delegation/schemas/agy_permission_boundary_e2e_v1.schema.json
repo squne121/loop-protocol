@@ -484,6 +484,31 @@
             "deny"
           ]
         },
+        "deny_post_tool_use_characterization": {
+          "description": "Issue #1979: additive, optional. Present when this attempt has been observed by `_attempts_from_parent_observation` -- characterizes a deny-expectation attempt's PostToolUse activity (if any) rather than treating any PostToolUse occurrence on deny as a fixed mismatch. `applicable` is false for allow-expectation attempts (vacuous default values).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "applicable",
+            "observed",
+            "correlated",
+            "secret_scan_passed"
+          ],
+          "properties": {
+            "applicable": {
+              "type": "boolean"
+            },
+            "observed": {
+              "type": "boolean"
+            },
+            "correlated": {
+              "type": "boolean"
+            },
+            "secret_scan_passed": {
+              "type": "boolean"
+            }
+          }
+        },
         "predicates": {
           "type": "object",
           "additionalProperties": false,
