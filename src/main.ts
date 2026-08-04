@@ -597,23 +597,77 @@ function buildUpgradeView(): HudUpgradeViewModel {
   }
 }
 
-/** Toggle pause and reset firing state to prevent held-fire bleed (AC5). */
-function handleTogglePause(): void {
+/**
+ * Tracks the element that invoked the current pause dialog (AC6). Read by
+ * `phaseScreens.ts`'s `getPauseInvoker` option at pause-dialog open time so
+ * it becomes the sole source of truth for resume focus restoration (never
+ * duplicated here) -- `null` means no meaningful invoker was recorded (e.g.
+ * auto-pause via visibilitychange), which `phaseScreens.ts` falls back to
+ * the Canvas for (AC6).
+ */
+let pauseInvokerElement: HTMLElement | null = null
+
+/**
+ * Idempotent pause-entry seam (AC3, In Scope, Issue #1376): the single entry
+ * point every pause trigger (HUD Pause button, Escape/P key,
+ * visibilitychange) must go through. Only transitions on a false -> true
+ * edge -- a second call while already paused is a no-op, so no caller needs
+ * its own re-entrancy guard.
+ */
+function enterProductPause(
+  invoker: HTMLElement | null,
+  feedback: { status: string; summary: string } = {
+    status: 'Paused',
+    summary: 'Simulation frozen. Rendering and HUD continue.',
+  },
+): void {
   if (productPause.isPaused) {
-    // AC5: clear firing/pointer active state accumulated during pause, then resume
-    resetInputOnPause(inputState)
-    toggleProductPause(productPause)
-    setHudFeedback('Resumed', 'Simulation resumed.')
+    return
+  }
+  // BLOCKER 1 parity (Issue #1374/#1375): pause entry is only allowed during
+  // the running phase.
+  if (state.loopPhase !== 'running') {
     return
   }
 
-  // BLOCKER 1: pause entry is only allowed during running phase
-  if (state.loopPhase !== 'running') return
-
+  pauseInvokerElement = invoker
   toggleProductPause(productPause)
-  // AC5: clear firing/pointer active state on pause entry
+  // AC5: clear firing/pointer active state on pause entry.
   resetInputOnPause(inputState)
-  setHudFeedback('Paused', 'Simulation frozen. Rendering and HUD continue.')
+  // Prevent a stale wall-clock accumulator from producing catch-up
+  // simulation steps once resumed (frame()'s paused branch also resets this
+  // every frame as defense-in-depth).
+  accumulatorMs = 0
+  setHudFeedback(feedback.status, feedback.summary)
+}
+
+/**
+ * Idempotent resume seam (AC3, AC6, In Scope, Issue #1376): only
+ * transitions on a true -> false edge. Focus restoration (AC6) is owned by
+ * `phaseScreens.ts`'s render()-driven pause-dialog close logic (single
+ * source of truth for the actual DOM `.focus()` call), using the invoker it
+ * captured via `getPauseInvoker()` at pause-open time -- this function only
+ * clears the runtime-local bookkeeping.
+ */
+function resumeProductPause(): void {
+  if (!productPause.isPaused) {
+    return
+  }
+
+  // AC5: clear firing/pointer active state accumulated during pause, then resume.
+  resetInputOnPause(inputState)
+  toggleProductPause(productPause)
+  setHudFeedback('Resumed', 'Simulation resumed.')
+  pauseInvokerElement = null
+}
+
+/** Toggle pause/resume through the shared idempotent seam (AC3). */
+function handleTogglePause(invoker: HTMLElement | null): void {
+  if (productPause.isPaused) {
+    resumeProductPause()
+  } else {
+    enterProductPause(invoker)
+  }
 }
 
 /**
@@ -674,21 +728,6 @@ const hud = battleHudLayer ? createHudController(battleHudLayer, {
         return
     }
   },
-  onConfirmResult() {
-    // B3: confirm result auto-claims pending reward, then transitions to preparation and saves.
-    if (!confirmResult(state)) {
-      return
-    }
-
-    // Reset product pause on state transition to preparation
-    productPause.isPaused = false
-    // B2/B3: storage.save() called after preparation transition (AC2, AC8 compliant)
-    // persistProgressionSnapshot sets HUD feedback internally (success or failure).
-    // Do NOT call setHudFeedback() unconditionally here — that would overwrite a
-    // save-failure message with a false success copy (AC6 fix).
-    // Use 'reward-claim' reason so feedback reads "Result confirmed." on success (AC5).
-    persistProgressionSnapshot('reward-claim')
-  },
   onNextSortie() {
     // B5: legacy debrief_reward_claimed → preparation (not directly to running).
     // startSortie() only accepts preparation phase, so transition to preparation first.
@@ -698,8 +737,8 @@ const hud = battleHudLayer ? createHudController(battleHudLayer, {
     }
     productPause.isPaused = false
   },
-  onTogglePause() {
-    handleTogglePause()
+  onTogglePause(invoker) {
+    handleTogglePause(invoker)
   },
 }) : null
 
@@ -806,13 +845,43 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
       renderHud() {
         syncBattleOverlayLayout()
         hud?.render(state, productPause.isPaused, activeFixedDeltaMs)
-        phaseScreens?.render(state, buildUpgradeView())
+        phaseScreens?.render(state, productPause.isPaused, buildUpgradeView())
       },
     })
   },
   canLoadGame() {
     return hasLoadableSnapshot
   },
+  onConfirmResult() {
+    // B3: confirm result auto-claims pending reward, then transitions to
+    // preparation and saves (AC1, AC5, AC7, AC9; moved from HudController's
+    // legacy result surface in Issue #1376 -- confirmResult() itself is the
+    // exactly-once guard together with confirmResultButton.disabled, AC10).
+    if (!confirmResult(state)) {
+      return
+    }
+
+    // Reset product pause on state transition to preparation (defensive;
+    // pause entry is gated on 'running' so this should already be false).
+    productPause.isPaused = false
+    // B2/B3: storage.save() called after preparation transition (AC2, AC8 compliant)
+    // persistProgressionSnapshot sets HUD feedback internally (success or failure).
+    // Do NOT call setHudFeedback() unconditionally here — that would overwrite a
+    // save-failure message with a false success copy (AC6 fix).
+    // Use 'reward-claim' reason so feedback reads "Result confirmed." on success (AC5).
+    persistProgressionSnapshot('reward-claim')
+  },
+  onResume() {
+    // AC3, AC6: Resume always resumes (never toggles) -- routes through the
+    // same idempotent seam every other pause trigger uses.
+    resumeProductPause()
+  },
+}, {
+  canvas: canvas ?? undefined,
+  // AC6: the pause dialog's own invoker-capture (single source of truth for
+  // resume focus restoration) reads the invoker recorded by
+  // enterProductPause() rather than re-deriving it independently.
+  getPauseInvoker: () => pauseInvokerElement,
 }) : null
 
 // B1: startup probe failure is non-fatal — title_menu state is always the starting point.
@@ -1128,16 +1197,19 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
 // AC12: visibilitychange hidden auto-pauses only during running phase; visible does NOT auto-resume
 if (app) {
   window.addEventListener('keydown', (event: KeyboardEvent) => {
-    // AC2: Escape toggles pause regardless of focus
+    // AC2, AC5 (Issue #1376 In Scope): Escape toggles pause regardless of
+    // focus and owns the event -- preventDefault() so no other window-level
+    // handler can double-toggle via bubbling.
     if (event.key === 'Escape' && !event.repeat) {
-      handleTogglePause()
+      event.preventDefault()
+      handleTogglePause(document.activeElement instanceof HTMLElement ? document.activeElement : null)
       return
     }
     // AC3, AC15: KeyP (P key) only when canvas is active element (WCAG 2.1.4 Character Key Shortcuts)
     // event.code === 'KeyP' uses physical key position (layout-agnostic)
     if (event.code === 'KeyP') {
       if (!event.repeat && canvas && document.activeElement === canvas) {
-        handleTogglePause()
+        handleTogglePause(canvas)
       }
     }
   })
@@ -1146,9 +1218,12 @@ if (app) {
   // visible restore does NOT auto-resume (intentional: user must explicitly resume)
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && state.loopPhase === 'running' && !productPause.isPaused) {
-      toggleProductPause(productPause)
-      resetInputOnPause(inputState)
-      setHudFeedback('Paused', 'Simulation paused: window hidden.')
+      // AC3, In Scope (Issue #1376): routes through the same idempotent
+      // pause-entry seam as every other pause trigger (previously called
+      // toggleProductPause() directly, bypassing handleTogglePause()). No
+      // invoker: auto-pause has no explicit trigger control, so resume
+      // falls back to the Canvas (AC6).
+      enterProductPause(null, { status: 'Paused', summary: 'Simulation paused: window hidden.' })
     }
     // AC8: visible restoration does NOT auto-resume
   })
@@ -1190,6 +1265,15 @@ if (app) {
 let accumulatorMs = 0
 let previousFrameTime = performance.now()
 
+/**
+ * Previous-frame snapshot so the Canvas's inert/aria-hidden pair (AC4) is
+ * only written on an actual isPaused transition, matching the
+ * previous-value-skip pattern `HudController.ts` / `phaseScreens.ts` use
+ * elsewhere in this codebase (avoids unconditional per-frame attribute
+ * churn).
+ */
+let previousCanvasPausedInert: boolean | undefined
+
 function frame(now: number): void {
   if (!hud || !renderer) {
     return
@@ -1219,10 +1303,25 @@ function frame(now: number): void {
     accumulatorMs = 0
   }
 
+  // AC4 (Issue #1376): the Canvas becomes inert (excluded from the
+  // accessibility tree / keyboard tab order / pointer input) while the pause
+  // dialog is open, alongside the combat HUD (HudController.ts). Never
+  // `hidden` -- rendering continues underneath the modal pause overlay.
+  if (canvas && previousCanvasPausedInert !== productPause.isPaused) {
+    if (productPause.isPaused) {
+      canvas.setAttribute('inert', '')
+      canvas.setAttribute('aria-hidden', 'true')
+    } else {
+      canvas.removeAttribute('inert')
+      canvas.removeAttribute('aria-hidden')
+    }
+    previousCanvasPausedInert = productPause.isPaused
+  }
+
   // AC4: render and HUD continue regardless of pause state
   syncBattleOverlayLayout()
   hud.render(state, productPause.isPaused, activeFixedDeltaMs)
-  phaseScreens?.render(state, buildUpgradeView())
+  phaseScreens?.render(state, productPause.isPaused, buildUpgradeView())
   renderer.render(state)
   window.requestAnimationFrame(frame)
 }
