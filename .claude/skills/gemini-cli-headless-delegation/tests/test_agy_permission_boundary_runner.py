@@ -9,6 +9,8 @@ import json
 import stat
 import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -26,10 +28,10 @@ def _supported_capability_gate() -> dict[str, object]:
     """Issue #1979 AC2 test double: a bootstrap predicate reported `supported`.
 
     Used to exercise post-gate live-runner behavior in isolation from the
-    real (currently hardcoded-unsupported, per upstream #728) gate result.
+    real (currently `inconclusive`, deferred-to-live-run) gate result.
     """
     return {
-        "bootstrap_predicate": "pre_invocation_injected_tool_call",
+        "bootstrap_predicate": "pre_invocation_ephemeral_message_injection",
         "predicate_kind": "bootstrap_prerequisite",
         "status": "supported",
         "reason_code": "test_override_supported",
@@ -327,7 +329,11 @@ def test_hermetic_attempts_use_documented_args_and_exclude_undiscovered_mcp(tmp_
     runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
     assert set(runtime["attempt_args"]) == {"command", "write", "read", "network"}
     assert runtime["attempt_args"]["command"].keys() == {"CommandLine", "Cwd", "WaitMsBeforeAsync"}
-    assert runtime["attempt_args"]["write"].keys() == {"TargetFile", "Overwrite", "CodeContent"}
+    # Issue #1979: `Description` is required -- confirmed via a live investigative
+    # probe that the real AGY `write_to_file` tool call always includes it, and that
+    # a fixed literal value is reproduced byte-for-byte (see run_agy_permission_
+    # boundary_e2e.py `attempt_args["write"]` comment for the empirical evidence).
+    assert runtime["attempt_args"]["write"].keys() == {"TargetFile", "Overwrite", "CodeContent", "Description"}
     assert runtime["attempt_args"]["read"].keys() == {"AbsolutePath"}
     assert runtime["attempt_args"]["network"].keys() == {"Url"}
     assert "mcp_call" not in MODULE.ATTEMPT_SPECS
@@ -401,10 +407,16 @@ def test_live_authentication_unavailable_is_exit_77_without_capability_probe(
     _fake_agy(fake)
     monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
     monkeypatch.setattr(MODULE, "_version", lambda _path: ("agy 1.1.9", True))
+    # Issue #1979 (2026-08-04 revision): the gate now only short-circuits on
+    # a genuine `unsupported` bootstrap predicate, not `inconclusive` -- so
+    # this test (which targets the auth-failure-output detection path, not
+    # the capability gate) supplies an explicit `supported` override to
+    # isolate that behavior from the real predicate's `inconclusive` result.
+    monkeypatch.setattr(MODULE, "_bootstrap_capability_gate", _supported_capability_gate)
     monkeypatch.setattr(
         MODULE,
         "_invoke",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(["agy"], 1, "", "authentication required"),
+        lambda *_args, **_kwargs: _invoke_result(1, stderr="authentication required"),
     )
     exit_code, artifact = MODULE._run(
         argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
@@ -427,10 +439,11 @@ def test_main_preserves_schema_valid_live_auth_unavailable_exit_77(
     artifact_dir = tmp_path / "artifacts"
     monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
     monkeypatch.setattr(MODULE, "_version", lambda _path: ("agy 1.1.9", True))
+    monkeypatch.setattr(MODULE, "_bootstrap_capability_gate", _supported_capability_gate)
     monkeypatch.setattr(
         MODULE,
         "_invoke",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(["agy"], 1, "", "authentication required"),
+        lambda *_args, **_kwargs: _invoke_result(1, stderr="authentication required"),
     )
     monkeypatch.setattr(
         sys,
@@ -516,9 +529,14 @@ def test_live_auth_bootstrap_unavailable_is_exit_77_before_hook_probe(
     assert artifact["runner"]["actual_agy_executed"] is False
 
 
-def test_live_hook_nonfire_is_inconclusive_not_auth_unavailable(
+def test_live_hook_nonfire_is_prompt_noncompliant_not_auth_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Issue #1979 AC8: when `_invoke` never produces any `PreToolUse`
+    evidence across the bounded retry budget, every capability ends up
+    prompt-noncompliant -- `EXIT_PROMPT_NONCOMPLIANT`(78), never the old
+    `FAILURE_INCONCLUSIVE`/exit-1 (which would silently conflate "hook never
+    fired" with "prompt not complied with")."""
     fake = tmp_path / "agy"
     _fake_agy(fake)
     runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
@@ -532,10 +550,14 @@ def test_live_hook_nonfire_is_inconclusive_not_auth_unavailable(
         argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
     )
 
-    assert exit_code == 1
-    assert artifact["failure_taxonomy"]["class"] == MODULE.FAILURE_INCONCLUSIVE
+    assert exit_code == MODULE.EXIT_PROMPT_NONCOMPLIANT
+    assert artifact["failure_taxonomy"]["class"] == MODULE.FAILURE_PROMPT_NONCOMPLIANT
     assert artifact["runner"]["actual_agy_executed"] is True
     assert all(not attempt["predicates"]["pre_tool_use_present"] for attempt in artifact["attempts"])
+    assert set(artifact["prompt_compliance"]) == set(MODULE.CAPABILITIES)
+    for record in artifact["prompt_compliance"].values():
+        assert record["compliant"] is False
+        assert record["attempts"] == 3
     assert artifact["diagnostic_ledger"] == {
         "pre_invocation_hook_started": False,
         "pre_invocation_context_accepted": False,
@@ -547,8 +569,11 @@ def test_live_hook_nonfire_is_inconclusive_not_auth_unavailable(
     }
 
 
-def test_missing_injected_attempt_is_inconclusive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """An absent injected attempt is boundary failure, never completion evidence."""
+def test_missing_injected_attempt_is_prompt_noncompliant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #1979 AC8: an absent injected attempt (no `PreToolUse` ever
+    observed for a capability across the bounded retry budget) is a distinct
+    prompt-noncompliance non-completion path -- `EXIT_PROMPT_NONCOMPLIANT`(78),
+    never silently scored as an allow/deny verdict."""
     fake = tmp_path / "agy"
     _fake_agy(fake)
     runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
@@ -562,11 +587,11 @@ def test_missing_injected_attempt_is_inconclusive(tmp_path: Path, monkeypatch: p
         argparse.Namespace(mode="live", agy=None, allow_live=True, profile="no_tools", artifact_dir=tmp_path)
     )
 
-    assert exit_code == 1
+    assert exit_code == MODULE.EXIT_PROMPT_NONCOMPLIANT
     assert artifact["failure_taxonomy"] == {
-        "class": MODULE.FAILURE_INCONCLUSIVE,
+        "class": MODULE.FAILURE_PROMPT_NONCOMPLIANT,
         "completion": False,
-        "retry": "fix_or_reprobe",
+        "retry": "reattempt_prompt",
     }
     assert artifact["runner"]["actual_agy_executed"] is True
     for attempt in artifact["attempts"]:
@@ -579,6 +604,8 @@ def test_missing_injected_attempt_is_inconclusive(tmp_path: Path, monkeypatch: p
             "same_attempt_correlation": False,
             "logger_failure_absent": True,
         }
+    assert set(artifact["prompt_compliance"]) == set(MODULE.CAPABILITIES)
+    assert all(record["compliant"] is False for record in artifact["prompt_compliance"].values())
     assert MODULE.validate_artifact(artifact) == (True, "valid")
 
 
@@ -701,3 +728,371 @@ def test_evidence_artifact_rejects_raw_diagnostic_payload() -> None:
     artifact["artifact"]["digest"] = MODULE._artifact_digest(artifact)
     artifact["runner"]["artifact_digest"] = artifact["artifact"]["digest"]
     assert MODULE.validate_artifact(artifact) == (False, "draft202012_invalid")
+
+
+def _write_pre_tool_use_event(
+    runtime: dict[str, object],
+    *,
+    profile: str,
+    capability: str,
+    conversation_id: str,
+    step_index: int,
+    decision: str,
+) -> None:
+    """Issue #1979: append a schema-shaped `agy_permission_boundary_hook/v1`
+    enforcement-log entry directly, bypassing the real hook process, so the
+    parent-side correlation/characterization logic in
+    `_attempts_from_parent_observation` can be unit-tested without a live or
+    fake AGY binary."""
+    tool_name, _ = MODULE.ATTEMPT_SPECS[capability]
+    args = runtime["attempt_args"][capability]  # type: ignore[index]
+    event = {
+        "schema": "agy_permission_boundary_hook/v1",
+        "decision": decision,
+        "run_id": runtime["run_id"],
+        "conversation_id": conversation_id,
+        "step_index": step_index,
+        "tool_profile": profile,
+        "canary_id": runtime["canary_id"],
+        "tool_name": tool_name,
+        "args_digest": MODULE._sha256(MODULE._canonical_json(args)),
+    }
+    with open(runtime["enforcement_log"], "a", encoding="utf-8") as output:  # type: ignore[arg-type]
+        output.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
+def _write_post_tool_use_event(
+    runtime: dict[str, object],
+    *,
+    profile: str,
+    conversation_id: str | None,
+    step_index: int | None,
+    status: str = "recorded",
+    extra: dict[str, object] | None = None,
+) -> None:
+    """Issue #1979: append a schema-shaped PostToolUse occurrence event
+    directly (mirrors what the real `posttooluse_logger.py` persists)."""
+    event: dict[str, object] = {
+        "kind": "post_tool_use",
+        "status": status,
+        "run_id": runtime["run_id"],
+        "canary_id": runtime["canary_id"],
+        "tool_profile": profile,
+    }
+    if conversation_id is not None:
+        event["conversation_id"] = conversation_id
+    if step_index is not None:
+        event["step_index"] = step_index
+    if extra:
+        event.update(extra)
+    with open(runtime["events_path"], "a", encoding="utf-8") as output:  # type: ignore[arg-type]
+        output.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
+def test_deny_correlated_posttooluse_with_null_error_digest_fails(tmp_path: Path) -> None:
+    """Issue #1979 fix_delta (P0-1): a correlated PostToolUse event whose
+    `error_digest` is null means the tool call *actually completed
+    successfully* despite the PreToolUse deny -- a genuine permission-
+    boundary breach (AC4 requires "successful PostToolUse count == 0" for
+    deny). This must FAIL the attempt even though the event correlates and
+    discloses no secret."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    _write_pre_tool_use_event(
+        runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
+    )
+    _write_post_tool_use_event(
+        runtime, profile="no_tools", conversation_id="conv-1", step_index=0, extra={"error_digest": None}
+    )
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
+    command = next(item for item in attempts if item["correlation"]["capability"] == "command")
+
+    assert command["expectation"] == "deny"
+    assert command["predicates"]["post_tool_use_matches_expectation"] is False
+    assert command["predicates"]["same_attempt_correlation"] is True
+    assert command["deny_post_tool_use_characterization"] == {
+        "applicable": True,
+        "observed": True,
+        "correlated": True,
+        "secret_scan_passed": True,
+    }
+
+
+def test_deny_correlated_posttooluse_with_error_digest_is_characterized_not_failed(tmp_path: Path) -> None:
+    """Issue #1979: real AGY may still dispatch a correlated, secret-safe
+    PostToolUse event after an explicit PreToolUse deny -- but only when
+    the tool call itself errored/was rejected (non-null `error_digest`).
+    This must be characterized and recorded, not treated as a fixed
+    mismatch -- all predicates for the attempt still pass."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    _write_pre_tool_use_event(
+        runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
+    )
+    _write_post_tool_use_event(
+        runtime,
+        profile="no_tools",
+        conversation_id="conv-1",
+        step_index=0,
+        extra={"error_digest": "sha256:" + "0" * 64},
+    )
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
+    command = next(item for item in attempts if item["correlation"]["capability"] == "command")
+
+    assert command["expectation"] == "deny"
+    assert command["predicates"] == {
+        "deterministic_attempt_present": True,
+        "pre_tool_use_present": True,
+        "decision_matches_expectation": True,
+        "post_tool_use_matches_expectation": True,
+        "side_effect_matches_expectation": True,
+        "same_attempt_correlation": True,
+        "logger_failure_absent": True,
+    }
+    assert command["deny_post_tool_use_characterization"] == {
+        "applicable": True,
+        "observed": True,
+        "correlated": True,
+        "secret_scan_passed": True,
+    }
+
+
+def test_deny_uncorrelated_posttooluse_still_fails(tmp_path: Path) -> None:
+    """Issue #1979: a PostToolUse occurrence that cannot be bound to the
+    same attempt (different conversation/step) must never be silently
+    accepted as expected -- this remains a genuine failure."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    _write_pre_tool_use_event(
+        runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
+    )
+    # A logger-failure-status event that cannot be correlated by conversation/step.
+    _write_post_tool_use_event(
+        runtime, profile="no_tools", conversation_id=None, step_index=None, status="parse_failure"
+    )
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
+    command = next(item for item in attempts if item["correlation"]["capability"] == "command")
+
+    assert command["predicates"]["post_tool_use_matches_expectation"] is False
+    assert command["predicates"]["same_attempt_correlation"] is False
+    assert command["predicates"]["logger_failure_absent"] is False
+    assert command["deny_post_tool_use_characterization"]["correlated"] is False
+
+
+def test_deny_correlated_posttooluse_with_secret_leak_fails(tmp_path: Path) -> None:
+    """Issue #1979: a correlated PostToolUse occurrence that discloses a
+    secret must fail the boundary check even though it correlates to the
+    same attempt."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    _write_pre_tool_use_event(
+        runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
+    )
+    _write_post_tool_use_event(
+        runtime,
+        profile="no_tools",
+        conversation_id="conv-1",
+        step_index=0,
+        extra={"leaked_field": MODULE.CANARY_SECRET},
+    )
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
+    command = next(item for item in attempts if item["correlation"]["capability"] == "command")
+
+    assert command["deny_post_tool_use_characterization"]["observed"] is True
+    assert command["deny_post_tool_use_characterization"]["correlated"] is True
+    assert command["deny_post_tool_use_characterization"]["secret_scan_passed"] is False
+    assert command["predicates"]["post_tool_use_matches_expectation"] is False
+    # Correlation itself is still intact -- only the secret-scan failed.
+    assert command["predicates"]["same_attempt_correlation"] is True
+
+
+def test_deny_no_posttooluse_remains_vacuously_characterized(tmp_path: Path) -> None:
+    """Issue #1979: the pre-existing "no PostToolUse at all on deny"
+    behavior must remain unaffected by the new characterization logic."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    _write_pre_tool_use_event(
+        runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
+    )
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
+    command = next(item for item in attempts if item["correlation"]["capability"] == "command")
+
+    assert all(command["predicates"].values())
+    assert command["deny_post_tool_use_characterization"] == {
+        "applicable": True,
+        "observed": False,
+        "correlated": True,
+        "secret_scan_passed": True,
+    }
+
+
+def test_allow_attempt_characterization_is_not_applicable(tmp_path: Path) -> None:
+    """Issue #1979: the deny-only characterization field is inert (but still
+    schema-present) for allow-expectation attempts."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "grounded_research")
+    _write_pre_tool_use_event(
+        runtime,
+        profile="grounded_research",
+        capability="network",
+        conversation_id="conv-1",
+        step_index=3,
+        decision="allow",
+    )
+    _write_post_tool_use_event(runtime, profile="grounded_research", conversation_id="conv-1", step_index=3)
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "grounded_research")
+    network = next(item for item in attempts if item["correlation"]["capability"] == "network")
+
+    assert network["expectation"] == "allow"
+    assert network["predicates"]["post_tool_use_matches_expectation"] is True
+    assert network["deny_post_tool_use_characterization"] == {
+        "applicable": False,
+        "observed": False,
+        "correlated": True,
+        "secret_scan_passed": True,
+    }
+
+
+def test_deny_post_tool_use_characterization_schema_valid(tmp_path: Path) -> None:
+    """Issue #1979 AC6: the new additive field must validate against the
+    schema, and a live-shaped artifact carrying it must still be schema-valid."""
+    fake = tmp_path / "fake-agy"
+    _fake_agy(fake)
+    assert _run(tmp_path, fake, "--profile", "no_tools").returncode == 1
+    artifact = _artifact(tmp_path)
+    for attempt in artifact["attempts"]:
+        assert set(attempt["deny_post_tool_use_characterization"]) == {
+            "applicable",
+            "observed",
+            "correlated",
+            "secret_scan_passed",
+        }
+    assert MODULE.validate_artifact(artifact) == (True, "valid")
+
+
+def test_loopback_canary_stops_cleanly_and_promptly_after_a_real_hit(tmp_path: Path) -> None:
+    """Issue #1979 fix_delta regression test.
+
+    Driving ``_LoopbackCanary`` through an actual GET request (as happens
+    whenever ``read_url_content`` is genuinely invoked in the allow profile)
+    must not leave ``stop()`` unbounded.  Before the fix,
+    ``socketserver.ThreadingMixIn.server_close()``'s default
+    ``block_on_close=True`` behaviour performed an *unbounded* join over the
+    per-request handler thread spawned to serve that hit -- a race distinct
+    from (and not bounded by) the ``self._thread.join(timeout=5)`` applied to
+    the ``serve_forever`` accept-loop thread.  This test would have caught
+    that: it exercises the real request-then-shutdown path and asserts both a
+    ``True`` result and a bounded wall-clock cost.
+    """
+    counter_path = tmp_path / "network-canary-counter"
+    counter_path.write_text("0\n", encoding="utf-8")
+    canary = MODULE._LoopbackCanary(counter_path, run_id="test-run", canary_id="test-canary")
+    try:
+        response = urllib.request.urlopen(canary.url, timeout=5)
+        assert response.status == 200
+        assert counter_path.read_text(encoding="utf-8").strip() == "1"
+    finally:
+        started_at = time.time()
+        stopped = canary.stop()
+        elapsed = time.time() - started_at
+
+    assert stopped is True
+    assert elapsed < 5.0, f"loopback canary shutdown after a real hit took {elapsed:.3f}s (expected < 5.0s)"
+    assert canary._thread.is_alive() is False
+
+
+def test_stop_waits_for_a_slow_handler_thread_to_actually_finish(tmp_path: Path) -> None:
+    """Issue #1979 fix_delta (P1-2) regression test.
+
+    `block_on_close=False` / `daemon_threads=True` alone only prove the
+    listening socket stopped accepting connections -- neither one waits for
+    an in-flight per-request handler thread to actually finish (per
+    `socketserver`'s own documentation). This deliberately holds the handler
+    thread open (a `Handler.finish` override that sleeps before returning,
+    simulating a slow-writing response / GC pause / TCP teardown latency)
+    and asserts `stop()` genuinely bound-waits for it -- both that it
+    returns `True` only once the handler has actually finished, and that it
+    took measurably longer than the request itself (proving real waiting,
+    not merely inferring completion from the accept-loop having stopped)."""
+    import threading
+
+    counter_path = tmp_path / "network-canary-counter"
+    counter_path.write_text("0\n", encoding="utf-8")
+    canary = MODULE._LoopbackCanary(counter_path, run_id="test-run", canary_id="test-canary")
+    handler_finished = threading.Event()
+    real_finish = canary._server.RequestHandlerClass.finish
+
+    def _slow_finish(self) -> None:  # type: ignore[no-untyped-def]
+        time.sleep(0.3)
+        try:
+            real_finish(self)
+        finally:
+            handler_finished.set()
+
+    canary._server.RequestHandlerClass.finish = _slow_finish
+    try:
+        response = urllib.request.urlopen(canary.url, timeout=5)
+        assert response.status == 200
+        assert counter_path.read_text(encoding="utf-8").strip() == "1"
+    finally:
+        started_at = time.time()
+        stopped = canary.stop(handler_drain_timeout=3.0)
+        elapsed = time.time() - started_at
+        canary._server.RequestHandlerClass.finish = real_finish
+
+    assert stopped is True
+    assert handler_finished.is_set()
+    assert elapsed >= 0.25, f"stop() returned after only {elapsed:.3f}s -- it did not actually wait for the slow handler"
+
+
+def test_stop_detects_a_lingering_handler_thread_and_returns_false(tmp_path: Path) -> None:
+    """Issue #1979 fix_delta (P1-2) regression test.
+
+    A handler thread that never finishes within the bound must make
+    `stop()` return `False` -- proving this predicate actually detects
+    handler-thread non-absence rather than trivially returning `True`
+    whenever the listening socket/accept-loop has stopped (the previous
+    implementation's only check, which cannot distinguish this case at
+    all)."""
+    counter_path = tmp_path / "network-canary-counter"
+    counter_path.write_text("0\n", encoding="utf-8")
+    canary = MODULE._LoopbackCanary(counter_path, run_id="test-run", canary_id="test-canary")
+    # Simulate a handler thread that started but will never signal
+    # completion (e.g. permanently blocked) -- `Handler.finish` never runs
+    # for this synthetic ident, so it is never discarded from the set.
+    with canary._lock:
+        canary._active_handler_threads.add(999999999)
+    try:
+        stopped = canary.stop(handler_drain_timeout=0.2)
+    finally:
+        with canary._lock:
+            canary._active_handler_threads.discard(999999999)
+
+    assert stopped is False
+
+
+def test_cleanup_evidence_fields_are_independent_not_a_shared_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1979 fix_delta regression test.
+
+    ``loopback_servers_stopped`` and ``temporary_processes_removed`` used to
+    be backed by a single shared ``cleanup_ok`` boolean, so an unrelated
+    temp-directory removal failure would silently also report the loopback
+    server as unstopped (and vice versa).  Forcing only the ``shutil.rmtree``
+    step to fail must leave ``loopback_servers_stopped`` ``True`` while
+    ``temporary_processes_removed`` is ``False``.
+    """
+    fake = tmp_path / "fake-agy"
+    _fake_agy(fake)
+
+    def _raise_rmtree(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated temp directory removal failure")
+
+    monkeypatch.setattr(MODULE.shutil, "rmtree", _raise_rmtree)
+    exit_code, artifact = MODULE._run(
+        argparse.Namespace(mode="hermetic", agy=str(fake), allow_live=False, profile="grounded_research", artifact_dir=tmp_path)
+    )
+    assert exit_code == 1
+    assert artifact["cleanup"]["temporary_processes_removed"] is False
+    assert artifact["cleanup"]["loopback_servers_stopped"] is True

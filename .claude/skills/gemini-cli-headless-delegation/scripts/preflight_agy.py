@@ -1701,7 +1701,7 @@ CAPABILITY_PREDICATES: dict[str, list[str]] = {
     "hooks": [
         "workspace_hooks_config_loaded",
         "pre_invocation_hook_dispatch",
-        "pre_invocation_ephemeral_message",
+        "pre_invocation_ephemeral_message_injection",
         "pre_invocation_injected_tool_call",
         "pre_tool_use_verdict",
         "post_tool_use_dispatch",
@@ -1730,7 +1730,20 @@ CAPABILITY_PREDICATE_CLASSIFICATION: dict[str, dict[str, str]] = {
     "hooks": {
         "workspace_hooks_config_loaded": "bootstrap_prerequisite",
         "pre_invocation_hook_dispatch": "bootstrap_prerequisite",
-        "pre_invocation_ephemeral_message": "bootstrap_prerequisite",
+        # Issue #1979: this is the live runner's actual bootstrap predicate
+        # (`run_agy_permission_boundary_e2e.py::BOOTSTRAP_PREDICATE_NAME`) --
+        # it gates whether ephemeralMessage-based PreInvocation injection is
+        # attempted at all, replacing the toolCall-only
+        # `pre_invocation_injected_tool_call` predicate below in that role
+        # (upstream google-antigravity/antigravity-cli#728 only breaks
+        # `toolCall`; ephemeralMessage injectSteps are independently
+        # confirmed accepted -- see references/failure-class-taxonomy.md).
+        "pre_invocation_ephemeral_message_injection": "bootstrap_prerequisite",
+        # Retained (unrenamed) for the hermetic hook-dispatch harness's own
+        # toolCall-based injection contract (#1814/PR #1957 hermetic harness
+        # reimplementation is explicitly Out of Scope for #1979) and for
+        # `test_setup_check.py`'s existing `--require-capability` assertion,
+        # which is outside this Issue's Allowed Paths.
         "pre_invocation_injected_tool_call": "bootstrap_prerequisite",
         "pre_tool_use_verdict": "claim_under_test",
         "post_tool_use_dispatch": "claim_under_test",
@@ -1857,13 +1870,29 @@ def parse_agy_version_string(raw_text: str | None) -> dict[str, Any]:
 def compute_binary_identity(resolved_path: str | None) -> dict[str, Any]:
     """Compute an identity fingerprint for the resolved agy binary.
 
-    Returns ``realpath``/``sha256``/``size``/``mtime_ns``/``platform``/``arch``.
-    A binary that cannot be resolved/read returns an all-``None`` identity
-    (except platform/arch) so drift detection can distinguish "no binary" from
-    "binary changed" (Issue #1941 AC6).
+    Returns ``realpath_class``/``realpath_digest``/``sha256``/``size``/
+    ``mtime_ns``/``platform``/``arch``.  A binary that cannot be
+    resolved/read returns an all-``None`` identity (except platform/arch) so
+    drift detection can distinguish "no binary" from "binary changed" (Issue
+    #1941 AC6).
+
+    Issue #1979 fix_delta (P1-3): this identity is embedded verbatim in the
+    distributed, secret-safe ``agy_permission_boundary_e2e`` artifact.  A raw
+    absolute realpath (e.g. ``/home/<username>/.local/bin/agy``) would leak
+    the host username/home layout into that artifact -- sanitizing that at
+    the *scan* layer only (blanking a deep-copy before the forbidden-
+    substring check) still leaves the raw path in the real, on-disk/returned
+    artifact.  Sanitizing at the source instead: ``realpath_class`` is a
+    generalized/classified form of the path (``$HOME``-relative when under
+    the current user's home, otherwise just the basename -- see
+    ``_mask_resolved_path``) and ``realpath_digest`` is a hash of the actual
+    real path, so exact-match / drift comparison (``binary_identity_matches``)
+    remains possible without disclosing the raw path anywhere in the
+    artifact.
     """
     identity: dict[str, Any] = {
-        "realpath": None,
+        "realpath_class": None,
+        "realpath_digest": None,
         "sha256": None,
         "size": None,
         "mtime_ns": None,
@@ -1879,7 +1908,8 @@ def compute_binary_identity(resolved_path: str | None) -> dict[str, Any]:
         with open(real, "rb") as fh:
             for chunk in iter(lambda: fh.read(1024 * 1024), b""):
                 digest.update(chunk)
-        identity["realpath"] = real
+        identity["realpath_class"] = _mask_resolved_path(real)
+        identity["realpath_digest"] = "sha256:" + hashlib.sha256(real.encode("utf-8")).hexdigest()
         identity["sha256"] = digest.hexdigest()
         identity["size"] = stat_result.st_size
         identity["mtime_ns"] = stat_result.st_mtime_ns
@@ -1890,7 +1920,7 @@ def compute_binary_identity(resolved_path: str | None) -> dict[str, Any]:
 
 def binary_identity_matches(before: dict[str, Any], after: dict[str, Any]) -> bool:
     """Return True iff two identity fingerprints denote the same binary."""
-    keys = ("realpath", "sha256", "size", "mtime_ns", "platform", "arch")
+    keys = ("realpath_digest", "sha256", "size", "mtime_ns", "platform", "arch")
     return all(before.get(key) == after.get(key) for key in keys)
 
 
@@ -2195,7 +2225,7 @@ def compute_config_digest(repo_root: Path | None = None) -> str:
 
 def _identity_key_tuple(binary_identity: dict[str, Any]) -> tuple[Any, ...]:
     return (
-        binary_identity.get("realpath"),
+        binary_identity.get("realpath_digest"),
         binary_identity.get("sha256"),
         binary_identity.get("size"),
         binary_identity.get("mtime_ns"),
