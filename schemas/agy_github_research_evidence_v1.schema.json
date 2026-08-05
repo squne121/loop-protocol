@@ -32,18 +32,32 @@
     },
     "status": {
       "type": "string",
-      "enum": ["pass", "skip", "fail"]
+      "enum": [
+        "pass",
+        "skip",
+        "fail"
+      ]
     },
     "skip_reason": {
-      "type": ["string", "null"]
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "provider": {
       "type": "object",
-      "required": ["requested", "observed"],
+      "required": [
+        "requested",
+        "observed"
+      ],
       "additionalProperties": false,
       "properties": {
-        "requested": { "const": "agy" },
-        "observed": { "type": "string" }
+        "requested": {
+          "const": "agy"
+        },
+        "observed": {
+          "type": "string"
+        }
       }
     },
     "profile": {
@@ -51,11 +65,18 @@
     },
     "repository_binding": {
       "type": "object",
-      "required": ["host", "repo"],
+      "required": [
+        "host",
+        "repo"
+      ],
       "additionalProperties": false,
       "properties": {
-        "host": { "const": "github.com" },
-        "repo": { "const": "squne121/loop-protocol" }
+        "host": {
+          "const": "github.com"
+        },
+        "repo": {
+          "const": "squne121/loop-protocol"
+        }
       }
     },
     "limits": {
@@ -72,14 +93,30 @@
       ],
       "additionalProperties": false,
       "properties": {
-        "max_iterations": { "const": 8 },
-        "command_timeout_seconds": { "const": 30 },
-        "total_route_timeout_seconds": { "const": 180 },
-        "stdout_bytes_per_command": { "const": 65536 },
-        "stderr_bytes_per_command": { "const": 16384 },
-        "aggregate_retained_bytes": { "const": 262144 },
-        "max_records_per_command": { "const": 100 },
-        "pagination": { "const": false }
+        "max_iterations": {
+          "const": 8
+        },
+        "command_timeout_seconds": {
+          "const": 30
+        },
+        "total_route_timeout_seconds": {
+          "const": 180
+        },
+        "stdout_bytes_per_command": {
+          "const": 65536
+        },
+        "stderr_bytes_per_command": {
+          "const": 16384
+        },
+        "aggregate_retained_bytes": {
+          "const": 262144
+        },
+        "max_records_per_command": {
+          "const": 100
+        },
+        "pagination": {
+          "const": false
+        }
       }
     },
     "iterations": {
@@ -96,51 +133,104 @@
         ],
         "additionalProperties": false,
         "properties": {
-          "index": { "type": "integer", "minimum": 0 },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
           "command_requested": {
             "type": "object",
-            "required": ["argv"],
+            "required": [
+              "argv"
+            ],
             "additionalProperties": false,
             "properties": {
               "argv": {
                 "type": "array",
-                "items": { "type": "string" }
+                "items": {
+                  "type": "string"
+                }
               }
             }
           },
           "decision": {
             "type": "string",
-            "enum": ["allow", "deny"]
+            "enum": [
+              "allow",
+              "deny"
+            ]
           },
-          "reason": { "type": "string" },
-          "exit_code": { "type": ["integer", "null"] },
-          "redacted_output_digest": { "type": ["string", "null"] },
-          "truncated": { "type": "boolean" },
-          "duration_ms": { "type": ["integer", "null"] }
+          "reason": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "redacted_output_digest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
         }
       }
     },
     "close_evidence": {
       "type": "object",
-      "required": ["positive_run", "negative_probes"],
+      "required": [
+        "positive_run",
+        "negative_probes"
+      ],
       "additionalProperties": false,
       "properties": {
         "positive_run": {
           "type": "object",
-          "required": ["observed", "exit_code", "iteration_count", "adaptive_next_command_observed"],
+          "required": [
+            "observed",
+            "exit_code",
+            "iteration_count",
+            "adaptive_next_command_observed"
+          ],
           "additionalProperties": false,
           "properties": {
-            "observed": { "type": "boolean" },
-            "exit_code": { "type": ["integer", "null"] },
-            "iteration_count": { "type": "integer", "minimum": 0 },
-            "adaptive_next_command_observed": { "type": "boolean" }
+            "observed": {
+              "type": "boolean"
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "iteration_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "adaptive_next_command_observed": {
+              "type": "boolean"
+            }
           }
         },
         "negative_probes": {
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["probe_class", "denied_pre_execution", "reason"],
+            "required": [
+              "probe_class",
+              "denied_pre_execution",
+              "reason"
+            ],
             "additionalProperties": false,
             "properties": {
               "probe_class": {
@@ -153,8 +243,12 @@
                   "credential_display"
                 ]
               },
-              "denied_pre_execution": { "type": "boolean" },
-              "reason": { "type": "string" }
+              "denied_pre_execution": {
+                "type": "boolean"
+              },
+              "reason": {
+                "type": "string"
+              }
             }
           }
         }
@@ -165,6 +259,7 @@
       "required": [
         "agy_binary_digest",
         "agy_version",
+        "gh_binary_digest",
         "permission_policy_digest",
         "hook_executable_digest",
         "isolated_settings_digest",
@@ -172,12 +267,48 @@
       ],
       "additionalProperties": false,
       "properties": {
-        "agy_binary_digest": { "type": ["string", "null"] },
-        "agy_version": { "type": ["string", "null"] },
-        "permission_policy_digest": { "type": ["string", "null"] },
-        "hook_executable_digest": { "type": ["string", "null"] },
-        "isolated_settings_digest": { "type": ["string", "null"] },
-        "pr_1994_schema_version": { "type": ["string", "null"] }
+        "agy_binary_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agy_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permission_policy_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hook_executable_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isolated_settings_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pr_1994_schema_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gh_binary_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "gemini_invocation_count": {
@@ -185,5 +316,46 @@
       "const": 0,
       "description": "Fixed at 0: this route never falls back to the Gemini provider."
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "close_evidence": {
+            "type": "object",
+            "properties": {
+              "positive_run": {
+                "type": "object",
+                "properties": {
+                  "observed": {
+                    "const": true
+                  },
+                  "exit_code": {
+                    "const": 0
+                  }
+                },
+                "required": [
+                  "observed",
+                  "exit_code"
+                ]
+              }
+            },
+            "required": [
+              "positive_run"
+            ]
+          }
+        }
+      }
+    }
+  ]
 }
