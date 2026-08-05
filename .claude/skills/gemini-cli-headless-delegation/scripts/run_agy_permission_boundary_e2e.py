@@ -35,10 +35,25 @@ from jsonschema import Draft202012Validator
 EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_UNAVAILABLE = 77
+# Issue #1979 AC8: a non-completion path distinct from EXIT_UNAVAILABLE.  The
+# bootstrap predicate was `supported` (or the gate short-circuit never
+# applied) and AGY was genuinely invoked, but at least one capability never
+# achieved ephemeralMessage prompt compliance within the bounded retry
+# budget -- this must never fall through to the normal allow/deny verdict
+# logic (that would silently score an unattempted capability as a false
+# deny / false negative).
+EXIT_PROMPT_NONCOMPLIANT = 78
 SCHEMA = "agy_permission_boundary_e2e/v1"
 FAILURE_UNAVAILABLE = "agy_permission_boundary_unavailable"
 FAILURE_INCONCLUSIVE = "agy_permission_boundary_inconclusive"
 FAILURE_INVALID_IDENTITY = "agy_permission_boundary_invalid_live_identity"
+FAILURE_PROMPT_NONCOMPLIANT = "agy_permission_boundary_prompt_noncompliant"
+# Issue #1979: fixed value for the artifact's `attempt_method` field -- the
+# only tool-call-elicitation method this runner implements for live mode.
+ATTEMPT_METHOD = "ephemeral_message_prompt"
+# Issue #1979 AC8: max ephemeralMessage re-injection attempts per capability
+# before it is recorded `prompt_noncompliance`.
+MAX_PROMPT_COMPLIANCE_ATTEMPTS = 3
 # MCP is intentionally not represented here.  No actual AGY MCP tool has been
 # discovered, and a hermetic alias must not be presented as a native tool name.
 CAPABILITIES = ("command", "write", "read", "network")
@@ -54,7 +69,13 @@ HOOK_PATH = SCRIPT_DIR / "agy_permission_enforcement_hook.py"
 POLICY_PATH = SCRIPT_DIR / "agy_permission_policy.py"
 PREFLIGHT_PATH = SCRIPT_DIR / "preflight_agy.py"
 BOOTSTRAP_PREDICATE_GROUP = "hooks"
-BOOTSTRAP_PREDICATE_NAME = "pre_invocation_injected_tool_call"
+# Issue #1979: switched from `pre_invocation_injected_tool_call` (the
+# toolCall injectSteps mechanism, broken by upstream
+# google-antigravity/antigravity-cli#728) to
+# `pre_invocation_ephemeral_message_injection` -- this runner's live-mode
+# PreInvocation injection now uses ephemeralMessage injectSteps exclusively
+# (see `_ephemeral_message_prompt` / `_resolve_prompt_compliance` below).
+BOOTSTRAP_PREDICATE_NAME = "pre_invocation_ephemeral_message_injection"
 
 ATTEMPT_SPECS = {
     "command": ("run_command", "command"),
@@ -94,9 +115,35 @@ class _LoopbackCanary:
     def __init__(self, counter_path: Path, *, run_id: str, canary_id: str) -> None:
         self._counter_path = counter_path
         self._lock = threading.Lock()
+        # Issue #1979 fix_delta (P1-2): `block_on_close=False` and
+        # `daemon_threads=True` (below) only guarantee the *listening
+        # socket* is closed and that the interpreter never blocks on a
+        # handler thread at process exit -- per Python's own `socketserver`
+        # documentation, neither one waits for an in-flight per-request
+        # handler thread to actually finish.  A handler thread could still
+        # be alive (slow response write, GC pause, ...) even though the
+        # accept-loop has stopped and the socket is closed.  This set,
+        # populated by `Handler.setup`/`Handler.finish` below, is this
+        # canary's own bounded, independently-verifiable record of which
+        # handler threads are actually still running -- `stop()` bound-waits
+        # on it directly instead of merely inferring absence from the
+        # listener/accept-loop state.
+        self._active_handler_threads: set[int] = set()
         state: dict[str, str] = {"expected_path": ""}
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            def setup(self) -> None:  # noqa: D102
+                super().setup()
+                with self.server._canary._lock:  # type: ignore[attr-defined]
+                    self.server._canary._active_handler_threads.add(threading.get_ident())  # type: ignore[attr-defined]
+
+            def finish(self) -> None:  # noqa: D102
+                try:
+                    super().finish()
+                finally:
+                    with self.server._canary._lock:  # type: ignore[attr-defined]
+                        self.server._canary._active_handler_threads.discard(threading.get_ident())  # type: ignore[attr-defined]
+
             def do_GET(self) -> None:  # noqa: N802
                 if self.path == state["expected_path"]:
                     with self.server._canary._lock:  # type: ignore[attr-defined]
@@ -110,7 +157,40 @@ class _LoopbackCanary:
             def log_message(self, _format: str, *_args: object) -> None:
                 return
 
+        # Issue #1979 fix_delta: bound the per-connection socket read so an
+        # idle/pre-opened keep-alive-style connection can never leave the
+        # per-request handler thread blocked indefinitely on
+        # ``rfile.readline()`` waiting for a request that never arrives.
+        Handler.timeout = 2
+
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        # Issue #1979 fix_delta (cleanup-after-real-hit race): by default,
+        # ``socketserver.ThreadingMixIn.server_close()`` performs an
+        # *unbounded* ``self._threads.join()`` over every per-request
+        # handler thread it has ever spawned (``block_on_close`` defaults to
+        # ``True``).  That join has no timeout at all -- unlike the
+        # ``self._thread.join(timeout=5)`` below, which only bounds the
+        # ``serve_forever`` accept-loop thread, not the per-request handler
+        # threads.  When this canary never receives a real request (the deny
+        # profile), no per-request thread is ever spawned, so
+        # ``server_close()`` returns immediately regardless -- that is why
+        # the deny profile's shutdown was always clean.  When a real request
+        # *is* handled (the allow profile), a per-request handler thread is
+        # spawned and tracked; if it is even slightly slow to fully unwind
+        # (GC pause, CPU contention from the concurrently-running AGY child
+        # process, TCP FIN/TIME_WAIT teardown latency), the unbounded join
+        # inside ``server_close()`` can stall past whatever wall-clock
+        # budget the caller expected, without ever raising or timing out.
+        # Disabling ``block_on_close`` removes this unbounded blocking call
+        # entirely: the listening socket is still closed synchronously by
+        # ``super().server_close()``, which is the operation that actually
+        # defines "the server is stopped" for this canary's purposes.  Any
+        # already-completed-or-completing per-request thread is harmless to
+        # leave unaccounted-for -- it holds no resources this process still
+        # needs, and ``daemon_threads=True`` ensures the interpreter never
+        # waits on it at process exit either.
+        self._server.daemon_threads = True
+        self._server.block_on_close = False
         self._server._canary = self  # type: ignore[attr-defined]
         self.url = (
             f"http://127.0.0.1:{self._server.server_address[1]}"
@@ -120,14 +200,36 @@ class _LoopbackCanary:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
-    def stop(self) -> bool:
+    def stop(self, *, handler_drain_timeout: float = 3.0) -> bool:
+        """Stop the listener and bound-wait for tracked handler threads.
+
+        Issue #1979 fix_delta (P1-2): closing the listening socket
+        (`server_close()`, with `block_on_close=False`) and confirming the
+        accept-loop thread has exited (`self._thread.join`) prove the
+        server has stopped *accepting new connections* -- they do not, by
+        themselves, prove no per-request handler thread is still running.
+        This bound-waits (up to *handler_drain_timeout* seconds) on the
+        `_active_handler_threads` set `Handler.setup`/`Handler.finish`
+        actually maintain, so `stop()`'s return value genuinely reflects
+        handler-thread absence rather than merely inferring it from the
+        listener/accept-loop having stopped.
+        """
         try:
             self._server.shutdown()
             self._server.server_close()
             self._thread.join(timeout=5)
         except OSError:
             return False
-        return not self._thread.is_alive()
+        if self._thread.is_alive():
+            return False
+        deadline = time.monotonic() + handler_drain_timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not self._active_handler_threads:
+                    return True
+            time.sleep(0.02)
+        with self._lock:
+            return not self._active_handler_threads
 
 
 class AgyAuthBootstrapUnavailable(RuntimeError):
@@ -175,29 +277,26 @@ def _bootstrap_capability_gate() -> dict[str, Any]:
 
     Issue #1979 AC2: the live runner must never attempt an actual AGY
     invocation when the bootstrap predicate it depends on
-    (``pre_invocation_injected_tool_call``) is not ``supported`` --
+    (``pre_invocation_ephemeral_message_injection``) is not ``supported`` --
     ``preflight_agy.py`` (Issue #1941) is the single SSOT for this
     determination; this runner never re-implements its own detection.
 
-    Issue #1979 fix_delta blocker_2 (known, NOT fully resolved circularity):
-    while ``UPSTREAM_ANTIGRAVITY_CLI_728_OPEN`` in `preflight_agy.py` is
-    ``True``, `pre_invocation_injected_tool_call` is fixed ``unsupported``
-    regardless of `version_result` (see `preflight_agy.py::_resolve_predicate`),
-    so this function's real evidence never changes today's SKIP outcome.
-    The documented concern is what happens once upstream #728 resolves and
-    that hardcoded branch is removed: `_resolve_predicate` then falls through
-    to its final branch, which returns `inconclusive` /
-    `runtime_semantic_observation_deferred_to_1979` -- i.e. it defers back to
-    THIS runner for a live observation, while this runner in turn only
-    re-asks `preflight_agy.py`.  Neither side can independently reach
-    `supported` this way.  Breaking that circularity requires this runner to
-    perform its OWN bounded real observation of the bootstrap prerequisites
-    (settings-load, hook-config-load, PreInvocation dispatch, injected-step
-    acceptance) via a short, capped live probe BEFORE the full permission-
-    boundary attempt matrix runs -- that probe is not implemented by this fix
-    delta (it requires upstream #728 to first resolve so a real probe is
-    even possible to design/test against; tracked as a follow-up, not
-    fabricated here against an unresolvable upstream blocker).
+    Issue #1979 (2026-08-04 contract revision): `pre_invocation_injected_tool_call`
+    (the toolCall injectSteps mechanism) is fixed `unsupported` while upstream
+    `google-antigravity/antigravity-cli#728` is open, but this runner's
+    bootstrap predicate no longer depends on it -- ephemeralMessage
+    injectSteps are unaffected by #728 (confirmed accepted by the real
+    binary; see `references/failure-class-taxonomy.md`).
+    `pre_invocation_ephemeral_message_injection` has no hardcoded-unsupported
+    branch in `preflight_agy.py::_resolve_predicate`, so it falls through to
+    that function's generic `inconclusive` /
+    `runtime_semantic_observation_deferred_to_1979` result: this runner never
+    claims `supported` without an actual live observation.  Live mode itself
+    (`_resolve_prompt_compliance` below) IS that live observation -- each
+    capability's ephemeralMessage compliance is bounded-retried and recorded,
+    and any capability that never complies ends the run at
+    `EXIT_PROMPT_NONCOMPLIANT` (AC8) rather than being silently scored as a
+    false allow/deny.
     """
     preflight = _load_preflight_module()
     version_result = _probe_agy_version_result()
@@ -217,6 +316,32 @@ def _mcp_capability_record() -> dict[str, Any]:
     """Issue #1979 AC5: MCP is `unsupported_by_design`, sourced from preflight_agy.py."""
     preflight = _load_preflight_module()
     return preflight.mcp_capability_status()
+
+
+def _promote_capability_gate_after_live_completion(
+    capability_gate: Mapping[str, Any], attempts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Issue #1979 fix_delta (P0-2): promote `capability_gate` to reflect a
+    genuine live-run observation, instead of leaving the artifact's
+    `capability_gate.status` frozen at whatever the static bootstrap probe
+    reported (typically `inconclusive`, since ephemeralMessage support
+    cannot be statically confirmed pre-live).
+
+    Only called when this run has actually reached exit-0 completion (all
+    capabilities prompt-compliant, allow/deny judged correctly per
+    AC3/AC4).  The original static preflight result is preserved unchanged
+    as `preflight_status` so "statically inconclusive" and "runtime-
+    observed supported" are never conflated -- `status`/`observed_status`
+    are only ever promoted to `supported` here, never fabricated for a
+    run that did not genuinely complete.
+    """
+    promoted = dict(capability_gate)
+    promoted["preflight_status"] = capability_gate.get("status")
+    promoted["status"] = "supported"
+    promoted["observed_status"] = "supported"
+    promoted["evidence_source"] = "runtime_semantic_observation"
+    promoted["observation_digest"] = _sha256(_canonical_json(attempts))
+    return promoted
 
 
 def _tool_inventory_digest() -> str:
@@ -316,6 +441,15 @@ def validate_artifact(artifact: Mapping[str, Any], *, forbidden: tuple[str, ...]
     attempts = artifact["attempts"]
     if stored["digest"] != runner["artifact_digest"] or stored["digest"] != _artifact_digest(artifact):
         return False, "artifact_digest_mismatch"
+    # Issue #1979 fix_delta (P1-3): `runner.binary_identity` no longer
+    # embeds a raw absolute realpath at all -- `compute_binary_identity()`
+    # (preflight_agy.py) now produces `realpath_class` (a generalized/
+    # classified form, e.g. `$HOME/.local/bin/agy` or just the basename) and
+    # `realpath_digest` (a hash of the real path) instead.  Sanitizing at
+    # that source means the scan below can run directly against the real
+    # artifact with no scan-only carve-out/deep-copy -- every field,
+    # including any stdout/stderr/env leakage, is genuinely scanned in the
+    # artifact that is actually written to disk / returned to callers.
     if _contains_forbidden(artifact, forbidden + (CANARY_SECRET, "/home/", "oauth", "credential")):
         return False, "secret_or_absolute_path_detected"
     capabilities = artifact["matrix"]["capabilities"]
@@ -350,6 +484,21 @@ def validate_artifact(artifact: Mapping[str, Any], *, forbidden: tuple[str, ...]
     elif exit_code == EXIT_FAIL:
         if completion or failure["class"] == "none":
             return False, "failure_invariant_invalid"
+    elif exit_code == EXIT_PROMPT_NONCOMPLIANT:
+        # Issue #1979 AC8: a genuine live invocation occurred (unlike
+        # EXIT_UNAVAILABLE) but at least one capability never achieved
+        # ephemeralMessage prompt compliance -- never a completion, never
+        # the generic FAILURE_INCONCLUSIVE class, and its own distinct
+        # non-compliant `prompt_compliance` record must actually be present.
+        prompt_compliance = artifact.get("prompt_compliance")
+        if (
+            completion
+            or failure["class"] != FAILURE_PROMPT_NONCOMPLIANT
+            or not runner["actual_agy_executed"]
+            or not isinstance(prompt_compliance, Mapping)
+            or not any(not record.get("compliant") for record in prompt_compliance.values())
+        ):
+            return False, "prompt_noncompliant_invariant_invalid"
     else:
         return False, "exit_code_invalid"
     return True, "valid"
@@ -381,6 +530,18 @@ def _attempt_template(
         },
         "expectation": expectation,
         "predicates": {key: False for key in sorted(PREDICATE_KEYS)},
+        # Issue #1979: additive, always-emitted field.  `_attempts_from_
+        # parent_observation` overwrites this with the actual characterized
+        # result; this vacuous-true default is only ever surfaced by paths
+        # (e.g. `_unavailable_artifact`) that never observed any real
+        # PostToolUse activity, so "no stray/uncorrelated event, no secret
+        # disclosure" trivially holds.
+        "deny_post_tool_use_characterization": {
+            "applicable": expectation == "deny",
+            "observed": False,
+            "correlated": True,
+            "secret_scan_passed": True,
+        },
     }
 
 
@@ -447,6 +608,7 @@ def _artifact(
     capability_gate: Mapping[str, Any] | None = None,
     process_group_isolated: bool = True,
     descendant_processes_absent: bool = True,
+    prompt_compliance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     digest = _file_digest(executable) if executable is not None and executable.is_file() else "sha256:" + "0" * 64
     resolved_capability_gate = dict(capability_gate) if capability_gate is not None else _bootstrap_capability_gate()
@@ -481,6 +643,8 @@ def _artifact(
             if exit_code == EXIT_PASS
             else "restore_runtime"
             if exit_code == EXIT_UNAVAILABLE
+            else "reattempt_prompt"
+            if exit_code == EXIT_PROMPT_NONCOMPLIANT
             else "fix_or_reprobe",
         },
         "cleanup": {
@@ -493,6 +657,13 @@ def _artifact(
         "capability_gate": resolved_capability_gate,
         "mcp": _mcp_capability_record(),
         "pairing": _pairing_binding(profile, artifact_dir),
+        # Issue #1979 AC6/AC8: additive, always-emitted, schema-optional
+        # fields -- `attempt_method` is a fixed value (the only elicitation
+        # method this runner implements), `prompt_compliance` is empty for
+        # hermetic mode / non-live non-completion paths that never attempted
+        # ephemeralMessage injection.
+        "attempt_method": ATTEMPT_METHOD,
+        "prompt_compliance": dict(prompt_compliance) if prompt_compliance is not None else {},
     }
     result["artifact"]["digest"] = _artifact_digest(result)
     result["runner"]["artifact_digest"] = result["artifact"]["digest"]
@@ -596,6 +767,152 @@ def _write_post_logger(path: Path) -> None:
     path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
 
 
+def _ephemeral_message_prompt(capability: str, tool_name: str, args: Mapping[str, Any]) -> str:
+    """Natural-language ephemeralMessage instructing AGY to call *tool_name*.
+
+    Issue #1979: replaces the toolCall injectSteps mechanism (broken by
+    upstream google-antigravity/antigravity-cli#728 -- `injectSteps` payload
+    ``{"toolCall": {...}}`` triggers ``unknown injected step type: <nil>``)
+    with a plain-text instruction injected as an ``ephemeralMessage``
+    injectSteps entry.  Upstream confirms ephemeralMessage injectSteps ARE
+    accepted by the real binary (see
+    ``references/failure-class-taxonomy.md``).  The instruction names the
+    exact tool and exact arguments so a compliant response is unambiguous
+    and mechanically verifiable via the resulting `PreToolUse` event's
+    `tool_name` / `args_digest`.
+    """
+    args_json = json.dumps(args, sort_keys=True, separators=(",", ":"))
+    return (
+        f"Call the tool named exactly `{tool_name}` right now with exactly "
+        f"these arguments (JSON): {args_json}. Do not ask for confirmation, "
+        f"do not explain your reasoning, and do not call any other tool "
+        f"first. This single tool call is the only action required for "
+        f"capability `{capability}`."
+    )
+
+
+def _write_ephemeral_injection_hook(injection_hook_path: Path, steps: list[dict[str, str]]) -> None:
+    """(Re)write the PreInvocation hook to inject ``ephemeralMessage`` steps.
+
+    Issue #1979: the live-mode counterpart of `_prepare_runtime`'s
+    toolCall-based injection hook (which remains unchanged for hermetic mode
+    -- see that function's docstring).  Called once per bounded-retry round
+    by `_resolve_prompt_compliance`, with *steps* limited to the
+    capabilities still pending compliance for that round.  Same
+    workspace-binding / `pre_invocation` event-logging contract as the
+    toolCall version, so `_diagnostic_ledger` / `_attempts_from_parent_observation`
+    need no changes to consume it.
+    """
+    injection_hook_path.write_text(
+        "#!/usr/bin/env python3\nimport json,os,sys\n"
+        "context=json.load(open(os.environ['AGY_PERMISSION_BOUNDARY_CONTEXT_PATH'],encoding='utf-8'))\n"
+        "try:\n"
+        "    payload=json.load(sys.stdin)\n"
+        "except (json.JSONDecodeError,TypeError):\n"
+        "    with open(context['events_path'],'a',encoding='utf-8') as output:\n"
+        "        output.write("
+        + "json.dumps({'kind':'pre_invocation','hook_started':True,'context_accepted':False,'"
+        + "injected_step_count':0},separators=(',',':'))+'\\n')\n"
+        "    raise SystemExit(2)\n"
+        "conversation_id=payload.get('conversationId')\n"
+        "invocation_num=payload.get('invocationNum')\n"
+        "valid=context['workspace'] in payload.get('workspacePaths',[]) and isinstance(conversation_id,str) and isinstance(invocation_num,int)\n"  # noqa: E501
+        "with open(context['events_path'],'a',encoding='utf-8') as output:\n"
+        "    output.write("
+        "json.dumps({'kind':'pre_invocation','hook_started':True,'context_accepted':valid,"
+        "'injected_step_count':"
+        + str(len(steps))
+        + " if valid else 0,"
+        "'conversation_id':str(conversation_id or ''),'invocation_num':invocation_num},"
+        "separators=(',',':'))+'\\n')\n"
+        "if not valid: raise SystemExit(2)\n"
+        "print(json.dumps({'injectSteps':json.loads("
+        + repr(json.dumps(steps, separators=(",", ":")))
+        + ")},separators=(',',':')))\n",
+        encoding="utf-8",
+    )
+    injection_hook_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+
+def _resolve_prompt_compliance(
+    executable: Path,
+    runtime: Mapping[str, Any],
+    *,
+    live: bool,
+    max_attempts: int = MAX_PROMPT_COMPLIANCE_ATTEMPTS,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any] | None, bool, bool]:
+    """Bounded-retry ephemeralMessage prompt-compliance resolution (Issue #1979 AC8).
+
+    For each capability in `CAPABILITIES`, (re-)injects an ephemeralMessage
+    instructing AGY to call that capability's tool, re-invoking AGY -- and
+    re-injecting only the still-noncompliant capabilities -- up to
+    *max_attempts* rounds.  A capability is "compliant" once its expected
+    `PreToolUse` event (matching tool name, args digest, run/canary id) is
+    observed in the parent-owned events/enforcement logs; a capability still
+    unresolved after *max_attempts* rounds is recorded `compliant: False`.
+
+    An `OSError` from `_invoke` (AGY could not even be launched) aborts the
+    loop immediately -- that is a genuine availability failure, not a prompt
+    -compliance failure, and is signalled to the caller via a `None` second
+    return value so `_run()` can route it to `EXIT_UNAVAILABLE` instead of
+    `EXIT_PROMPT_NONCOMPLIANT`.
+
+    Returns ``(prompt_compliance, last_invoked, process_group_isolated,
+    descendant_processes_absent)``.
+    """
+    injection_hook_path = Path(runtime["injection_hook_path"])
+    pending = list(CAPABILITIES)
+    prompt_compliance: dict[str, dict[str, Any]] = {}
+    last_invoked: dict[str, Any] | None = None
+    process_group_isolated = True
+    descendant_processes_absent = True
+    attempt_round = 0
+    while pending and attempt_round < max_attempts:
+        attempt_round += 1
+        steps = [
+            {
+                "ephemeralMessage": _ephemeral_message_prompt(
+                    capability, ATTEMPT_SPECS[capability][0], runtime["attempt_args"][capability]
+                )
+            }
+            for capability in pending
+        ]
+        _write_ephemeral_injection_hook(injection_hook_path, steps)
+        try:
+            invoked = _invoke(executable, runtime, live=live)
+        except OSError:
+            break
+        last_invoked = invoked
+        process_group_isolated = invoked["process_group_isolated"]
+        descendant_processes_absent = invoked["descendant_processes_absent"]
+        events = _read_events(Path(runtime["events_path"]))
+        for event in _read_events(Path(runtime["enforcement_log"])):
+            if event.get("schema") == "agy_permission_boundary_hook/v1":
+                event = dict(event)
+                event["kind"] = "pre_tool_use"
+                events.append(event)
+        pre_tool_events = [event for event in events if event.get("kind") == "pre_tool_use"]
+        still_pending: list[str] = []
+        for capability in pending:
+            args_digest = _sha256(_canonical_json(runtime["attempt_args"][capability]))
+            observed = any(
+                event.get("tool_name") == ATTEMPT_SPECS[capability][0]
+                and event.get("args_digest") == args_digest
+                and event.get("run_id") == runtime["run_id"]
+                and event.get("canary_id") == runtime["canary_id"]
+                for event in pre_tool_events
+            )
+            if observed:
+                prompt_compliance[capability] = {"attempts": attempt_round, "compliant": True}
+            else:
+                still_pending.append(capability)
+        pending = still_pending
+    for capability in pending:
+        attempts_used = min(attempt_round, max_attempts) or max_attempts
+        prompt_compliance[capability] = {"attempts": attempts_used, "compliant": False}
+    return prompt_compliance, last_invoked, process_group_isolated, descendant_processes_absent
+
+
 def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) -> dict[str, Any]:
     """Materialize boundary settings before any AGY process can start."""
     policy_module = _load_policy_module()
@@ -670,6 +987,22 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
             "TargetFile": str(canary_paths["write"]),
             "Overwrite": True,
             "CodeContent": "1\n",
+            # Issue #1979 write-capability prompt-noncompliance root cause
+            # (confirmed via a live investigative probe with a raw stdin tee
+            # on the write_to_file PreToolUse matcher): the real `agy` 1.1.x
+            # `write_to_file` tool call always includes a `Description`
+            # argument in addition to `TargetFile`/`Overwrite`/`CodeContent`
+            # -- omitting it from this expected-args dict made every
+            # genuine, compliant AGY tool call (observed in
+            # `enforcement.jsonl` with `decision: deny`/`policy_deny`, i.e.
+            # AGY did call the tool) fail the exact `args_digest`
+            # correlation match in `_resolve_prompt_compliance`, a false
+            # `prompt_noncompliance` verdict rather than a genuine one. A
+            # fixed literal `Description` value, included verbatim in the
+            # `ephemeralMessage` instruction, is reproduced byte-for-byte by
+            # the real AGY tool call (empirically confirmed: the resulting
+            # `args_digest` matches exactly), so it is safe to correlate on.
+            "Description": "Writing boundary probe sentinel file",
         },
         "read": {"AbsolutePath": str(canary_paths["read"])},
         # Issue #1979 fix_delta blocker_3: `read_url_content` (not
@@ -755,6 +1088,13 @@ def _prepare_runtime(root: Path, profile: str, *, auth_bootstrap: bool = False) 
         "canary_paths": canary_paths,
         "attempt_args": attempt_args,
         "loopback_canary": loopback_canary,
+        # Issue #1979: exposed so live mode can overwrite this hook's
+        # content with ephemeralMessage-based injectSteps before each
+        # bounded-retry invocation (`_resolve_prompt_compliance`).  Hermetic
+        # mode never rewrites it -- the toolCall-based content written above
+        # is the #1814/PR #1957 hermetic hook-dispatch harness's contract,
+        # which #1979 does not reimplement (Out of Scope).
+        "injection_hook_path": injection_hook,
     }
 
 
@@ -864,7 +1204,12 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
             expectation=expectation,
         )
         pre = candidates
-        post = [
+        # `correlated_post` is every PostToolUse event this parent can bind,
+        # by run/canary/profile/conversation/step, to *this* attempt --
+        # regardless of its `status`.  A correlated event with
+        # `status == "recorded"` is a genuine PostToolUse dispatch for this
+        # exact attempt.
+        correlated_post = [
             event
             for event in post_tool_events
             if event.get("run_id") == runtime["run_id"]
@@ -874,18 +1219,23 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
             and event.get("step_index") == step_index
         ]
         # A PostToolUse parser/logger failure may not contain the payload's
-        # conversation/step.  It is still an observed hook failure for this
-        # hermetic invocation and must not be silently reclassified as
-        # expected absence.
-        post.extend(
+        # conversation/step, so it cannot be correlated the same way.  It is
+        # still an observed hook failure for this hermetic invocation and
+        # must not be silently reclassified as expected absence -- kept
+        # separate from `correlated_post` so that "a stray/uncorrelated
+        # PostToolUse event happened" (never acceptable) is distinguishable
+        # from "a correlated PostToolUse event happened on a deny attempt"
+        # (Issue #1979: real AGY does this; it must be characterized, not
+        # treated as a mismatch).
+        uncorrelated_failure_post = [
             event
             for event in post_tool_events
             if event.get("run_id") == runtime["run_id"]
             and event.get("canary_id") == runtime["canary_id"]
             and event.get("tool_profile") == profile
             and event.get("status") != "recorded"
-            and event not in post
-        )
+            and event not in correlated_post
+        ]
         counter_path = Path(runtime["canary_paths"][capability])
         # The parent reads the actual canary path before/after the child; no
         # child self-report is accepted as a side-effect predicate.
@@ -895,15 +1245,67 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
             observed_count = -1
         except ValueError:
             observed_count = -1
-        logger_failed = any(event.get("status") != "recorded" for event in post)
-        post_recorded = any(event.get("status") == "recorded" for event in post)
+        logger_failed = any(event.get("status") != "recorded" for event in correlated_post) or bool(
+            uncorrelated_failure_post
+        )
+        post_recorded = any(event.get("status") == "recorded" for event in correlated_post)
+        # Issue #1979 (deny-time PostToolUse characterization): real AGY may
+        # still dispatch PostToolUse after an explicit PreToolUse deny. This
+        # is NOT forbidden-fixed -- it must be characterized and recorded:
+        # does it correlate to this same attempt (no stray/uncorrelated
+        # event), and does it disclose no secret.  `correlated_recorded_post`
+        # is the actual observed-despite-deny occurrence(s); the logger only
+        # ever persists a hashed `error_digest` (never raw payload content),
+        # but the scan below is defense-in-depth against any future field
+        # that might carry raw content.
+        correlated_recorded_post = [event for event in correlated_post if event.get("status") == "recorded"]
+        deny_secret_scan_passed = not any(
+            _contains_forbidden(event, (CANARY_SECRET, "oauth", "credential")) for event in correlated_recorded_post
+        )
+        deny_post_observed = expectation == "deny" and bool(correlated_recorded_post)
+        # Issue #1979 fix_delta (P0-1): a correlated PostToolUse event whose
+        # `error_digest` is null means the *actual tool call itself
+        # completed successfully* (the PostToolUse logger only records
+        # `error_digest: None` when the payload's `error` field was absent --
+        # see `_write_post_logger`).  On a deny-expected attempt, that is
+        # exactly the "successful side effect after deny" permission-
+        # boundary breach AC4 forbids -- it must never be waved through just
+        # because it correlates and discloses no secret.  A correlated event
+        # with a non-null `error_digest` (the tool call itself errored/was
+        # rejected) is the "explicit deny still triggered a failed dispatch"
+        # case the Issue's `characterize_and_record` language accepts.
+        deny_post_success_outcome = any(
+            event.get("error_digest") is None for event in correlated_recorded_post
+        )
+        deny_correlated = not uncorrelated_failure_post
+        attempt["deny_post_tool_use_characterization"] = {
+            "applicable": expectation == "deny",
+            "observed": deny_post_observed,
+            "correlated": deny_correlated if expectation == "deny" else True,
+            "secret_scan_passed": deny_secret_scan_passed if expectation == "deny" else True,
+        }
+        if expectation == "deny":
+            # A deny attempt's PostToolUse behaviour (if any) "matches
+            # expectation" when it either never fired, or fired but
+            # correlates to this exact attempt AND discloses no secret.
+            # `same_attempt_correlation` is scoped narrower: it reflects
+            # correlation alone (a stray/unbindable PostToolUse occurrence
+            # always fails it), independent of the separate secret-scan
+            # evaluation.
+            post_matches_expectation = (
+                deny_correlated and deny_secret_scan_passed and not deny_post_success_outcome
+            )
+            same_attempt_ok = deny_correlated
+        else:
+            post_matches_expectation = post_recorded
+            same_attempt_ok = post_recorded
         attempt["predicates"] = {
             "deterministic_attempt_present": bool(pre),
             "pre_tool_use_present": bool(pre),
             "decision_matches_expectation": any(event.get("decision") == expectation for event in pre),
-            "post_tool_use_matches_expectation": bool(pre) and ((not post) if expectation == "deny" else post_recorded),
+            "post_tool_use_matches_expectation": bool(pre) and post_matches_expectation,
             "side_effect_matches_expectation": observed_count == (1 if expectation == "allow" else 0),
-            "same_attempt_correlation": bool(pre) and ((not post) if expectation == "deny" else post_recorded),
+            "same_attempt_correlation": bool(pre) and same_attempt_ok,
             "logger_failure_absent": not logger_failed,
         }
         attempts.append(attempt)
@@ -1059,13 +1461,26 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 exit_code=EXIT_FAIL,
                 artifact_dir=artifact_dir,
             )
-        # Issue #1979 AC2: bind the live runner to the capability gate's
-        # bootstrap predicate BEFORE attempting any live AGY invocation.
-        # preflight_agy.py (Issue #1941) is the single SSOT for this
-        # determination; a bootstrap predicate it does not report
-        # `supported` blocks live execution outright.
+        # Issue #1979 AC2 (2026-08-04 revision): bind the live runner to the
+        # capability gate's bootstrap predicate BEFORE attempting any live
+        # AGY invocation.  preflight_agy.py (Issue #1941) is the single SSOT
+        # for this determination.  Gate condition is specifically `status ==
+        # "unsupported"` -- NOT `!= "supported"` -- because
+        # `pre_invocation_ephemeral_message_injection` has no hardcoded-
+        # unsupported branch and is never claimed `supported` by
+        # `preflight_agy.py` without an actual live observation (see
+        # `_resolve_predicate`'s generic deferred branch); gating on
+        # `!= "supported"` would make this predicate permanently
+        # unreachable-live (the same unresolved circularity the old
+        # toolCall-bound predicate had).  `inconclusive` -- "not yet
+        # observed, but not known-broken either" -- is allowed through so
+        # THIS runner's own bounded live observation
+        # (`_resolve_prompt_compliance`, AC8) can be that live observation.
+        # Only a genuine `unsupported` (a real known-broken signal, as
+        # `pre_invocation_injected_tool_call` has today for upstream #728)
+        # blocks live execution outright.
         capability_gate = _bootstrap_capability_gate()
-        if args.allow_live and capability_gate["status"] != "supported":
+        if args.allow_live and capability_gate["status"] == "unsupported":
             return EXIT_UNAVAILABLE, _unavailable_artifact(
                 FAILURE_UNAVAILABLE,
                 profile=args.profile,
@@ -1109,43 +1524,98 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         else:
             runtime_unavailable = False
             invoked: dict[str, Any] | None
-            try:
-                invoked = _invoke(executable, runtime, live=args.mode == "live")
-            except OSError:
-                invoked = None
-                runtime_unavailable = args.mode == "live"
+            prompt_compliance: dict[str, dict[str, Any]] = {}
+            if args.mode == "live":
+                # Issue #1979 AC8: bounded-retry ephemeralMessage compliance
+                # resolution replaces the single toolCall `_invoke` call for
+                # live mode only -- hermetic mode's `_invoke` call (below)
+                # and its toolCall-based injection hook are unchanged
+                # (#1814/PR #1957 hermetic harness reimplementation is Out
+                # of Scope for #1979).
+                prompt_compliance, invoked, process_group_isolated, descendant_processes_absent = (
+                    _resolve_prompt_compliance(executable, runtime, live=True)
+                )
+                if invoked is None:
+                    runtime_unavailable = True
+                elif invoked["timed_out"]:
+                    runtime_unavailable = True
             else:
-                process_group_isolated = invoked["process_group_isolated"]
-                descendant_processes_absent = invoked["descendant_processes_absent"]
-                if invoked["timed_out"]:
-                    runtime_unavailable = args.mode == "live"
+                try:
+                    invoked = _invoke(executable, runtime, live=False)
+                except OSError:
+                    invoked = None
+                else:
+                    process_group_isolated = invoked["process_group_isolated"]
+                    descendant_processes_absent = invoked["descendant_processes_absent"]
             attempts = _attempts_from_parent_observation(runtime, args.profile)
             diagnostic_ledger = _diagnostic_ledger(runtime)
             output = "" if invoked is None else (invoked["stdout"] or "") + (invoked["stderr"] or "")
             child_returncode = None if invoked is None else invoked["returncode"]
             auth_unavailable = args.mode == "live" and bool(_AUTH_FAILURE.search(output))
             unavailable = auth_unavailable or runtime_unavailable
-            predicates_pass = all(all(attempt["predicates"].values()) for attempt in attempts)
-            live_pass = args.mode == "live" and identity_verified and child_returncode == 0 and predicates_pass
-            exit_code = EXIT_UNAVAILABLE if unavailable else EXIT_PASS if live_pass else EXIT_FAIL
-            failure = FAILURE_UNAVAILABLE if unavailable else "none" if live_pass else FAILURE_INCONCLUSIVE
-            result = _artifact(
-                exit_code=exit_code,
-                actual_agy=args.mode == "live" and identity_verified and not unavailable,
-                identity_verified=identity_verified,
-                executable=executable,
-                version=version,
-                child_returncode=child_returncode,
-                attempts=attempts,
-                profile=args.profile,
-                failure_class=failure,
-                cleanup_ok=True,
-                artifact_dir=artifact_dir,
-                diagnostic_ledger=diagnostic_ledger,
-                capability_gate=capability_gate,
-                process_group_isolated=process_group_isolated,
-                descendant_processes_absent=descendant_processes_absent,
+            noncompliant_capabilities = sorted(
+                capability for capability, record in prompt_compliance.items() if not record.get("compliant")
             )
+            if args.mode == "live" and noncompliant_capabilities and not unavailable:
+                # Issue #1979 AC8: any capability that never achieves
+                # ephemeralMessage prompt compliance within the bounded
+                # retry budget is a distinct non-completion path -- it must
+                # never fall through to the normal allow/deny verdict logic
+                # below (which would silently score an unattempted
+                # capability as a false deny / false negative).
+                exit_code = EXIT_PROMPT_NONCOMPLIANT
+                result = _artifact(
+                    exit_code=exit_code,
+                    actual_agy=True,
+                    identity_verified=identity_verified,
+                    executable=executable,
+                    version=version,
+                    child_returncode=child_returncode,
+                    attempts=attempts,
+                    profile=args.profile,
+                    failure_class=FAILURE_PROMPT_NONCOMPLIANT,
+                    cleanup_ok=True,
+                    artifact_dir=artifact_dir,
+                    diagnostic_ledger=diagnostic_ledger,
+                    capability_gate=capability_gate,
+                    process_group_isolated=process_group_isolated,
+                    descendant_processes_absent=descendant_processes_absent,
+                    prompt_compliance=prompt_compliance,
+                )
+            else:
+                predicates_pass = all(all(attempt["predicates"].values()) for attempt in attempts)
+                live_pass = args.mode == "live" and identity_verified and child_returncode == 0 and predicates_pass
+                exit_code = EXIT_UNAVAILABLE if unavailable else EXIT_PASS if live_pass else EXIT_FAIL
+                failure = FAILURE_UNAVAILABLE if unavailable else "none" if live_pass else FAILURE_INCONCLUSIVE
+                # Issue #1979 fix_delta (P0-2): a genuine exit-0 live
+                # completion IS the runtime observation this bootstrap
+                # predicate was deferred pending -- promote the artifact's
+                # `capability_gate` to reflect that real observation instead
+                # of leaving it at the static bootstrap probe's (typically
+                # `inconclusive`) result forever.
+                resolved_capability_gate = capability_gate
+                if live_pass and capability_gate is not None:
+                    resolved_capability_gate = _promote_capability_gate_after_live_completion(
+                        capability_gate, attempts
+                    )
+                result = _artifact(
+                    exit_code=exit_code,
+                    actual_agy=args.mode == "live" and identity_verified and not unavailable,
+                    identity_verified=identity_verified,
+                    executable=executable,
+                    version=version,
+                    child_returncode=child_returncode,
+                    attempts=attempts,
+                    profile=args.profile,
+                    failure_class=failure,
+                    cleanup_ok=True,
+                    artifact_dir=artifact_dir,
+                    diagnostic_ledger=diagnostic_ledger,
+                    capability_gate=resolved_capability_gate,
+                    process_group_isolated=process_group_isolated,
+                    descendant_processes_absent=descendant_processes_absent,
+                    prompt_compliance=prompt_compliance,
+                )
     except Exception:
         result = _unavailable_artifact(
             FAILURE_INCONCLUSIVE,
@@ -1155,23 +1625,34 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             capability_gate=capability_gate,
         )
     finally:
-        cleanup_ok = True
+        # Issue #1979 fix_delta: these two facts were previously collapsed
+        # into a single shared ``cleanup_ok`` boolean, so a loopback-server
+        # shutdown failure and an unrelated temp-directory removal failure
+        # were indistinguishable in the artifact -- either one silently
+        # reported as *both* ``loopback_servers_stopped: false`` and
+        # ``temporary_processes_removed: false``, even though they are
+        # distinct facts about distinct resources.  Tracking them
+        # independently makes the artifact an honest record of which
+        # specific cleanup step actually failed.
+        loopback_stopped_ok = True
         if runtime is not None:
             loopback_canary = runtime.get("loopback_canary")
             if isinstance(loopback_canary, _LoopbackCanary):
-                cleanup_ok = loopback_canary.stop()
+                loopback_stopped_ok = loopback_canary.stop()
+        temporary_removed_ok = True
         try:
             shutil.rmtree(temporary)
         except OSError:
-            cleanup_ok = False
+            temporary_removed_ok = False
+        cleanup_ok = loopback_stopped_ok and temporary_removed_ok
         if not cleanup_ok:
             exit_code = EXIT_FAIL
             result["runner"]["exit_code"] = EXIT_FAIL
             result["failure_taxonomy"]["class"] = FAILURE_INCONCLUSIVE
             result["failure_taxonomy"]["completion"] = False
         result["cleanup"] = {
-            "temporary_processes_removed": cleanup_ok,
-            "loopback_servers_stopped": cleanup_ok,
+            "temporary_processes_removed": temporary_removed_ok,
+            "loopback_servers_stopped": loopback_stopped_ok,
             "process_group_isolated": process_group_isolated,
             "descendant_processes_absent": descendant_processes_absent,
         }
@@ -1350,14 +1831,22 @@ def main() -> int:
 
 
 def _maybe_write_aggregate_manifest(artifact_dir: Path, result: Mapping[str, Any]) -> None:
-    """Best-effort: write ``aggregate/manifest.json`` once both allow/deny
-    artifacts exist as siblings of *artifact_dir*.
+    """Best-effort: write ``aggregate/manifest.json`` (and the actually-
+    invoked ``aggregate/validation.json``) once both allow/deny artifacts
+    exist as siblings of *artifact_dir*.
 
-    Issue #1979 fix_delta blocker_4: never raises and never affects
-    `exit_code` -- an allow/deny counterpart that is not yet present (e.g.
-    only one profile has been run so far) is simply not an error for this
-    run.  `validate_aggregate_manifest()` is the separate, explicit
-    completion check a caller runs once both artifacts exist.
+    Issue #1979 fix_delta blocker_4 / P0-2: never raises and never affects
+    *this* run's own `exit_code` -- an allow/deny counterpart that is not
+    yet present (e.g. only one profile has been run so far) is simply not
+    an error for this run.  `validate_aggregate_manifest()` is the separate,
+    explicit completion check the Issue's own contract requires
+    (``aggregate_validator_exit_0``); previously it was defined but never
+    actually called anywhere in this runner's own execution flow (only from
+    tests), so the aggregate invariant it encodes was never genuinely
+    surfaced by a real run.  It is now invoked here, once both artifacts
+    exist, and its result is persisted to ``aggregate/validation.json`` so a
+    human/CI can read the real, actually-computed verdict rather than
+    re-deriving it out-of-band.
     """
     role = {"grounded_research": "allow", "no_tools": "deny"}.get(str(result.get("matrix", {}).get("profile")))
     if role is None or artifact_dir.name not in ("allow", "deny"):
@@ -1375,6 +1864,15 @@ def _maybe_write_aggregate_manifest(artifact_dir: Path, result: Mapping[str, Any
         aggregate_dir.mkdir(parents=True, exist_ok=True)
         (aggregate_dir / "manifest.json").write_bytes(
             json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
+        )
+        valid, reason = validate_aggregate_manifest(manifest, allow_artifact, deny_artifact)
+        validation_record = {
+            "schema": "agy_permission_boundary_aggregate_validation/v1",
+            "valid": valid,
+            "reason": reason,
+        }
+        (aggregate_dir / "validation.json").write_bytes(
+            json.dumps(validation_record, sort_keys=True, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
         )
     except (OSError, KeyError, TypeError):
         # Best-effort only: a missing/malformed counterpart field must never
