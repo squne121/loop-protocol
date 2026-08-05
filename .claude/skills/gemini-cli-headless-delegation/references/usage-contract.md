@@ -986,7 +986,7 @@ request に `gh_commands` field を追加することで、wrapper が argv ベ�
 - `gh_cli.ok: true`: `gh --version` と `gh auth status` が成功している
 - `gh_cli.ok: false` + `failure_class: "gh_auth_required"`: `gh auth login` で認証が必要
 
-### github_research（provider=agy、Issue #1920）
+### github_research 機能（provider=agy 経由で実装、Issue #1920）
 
 `provider=agy` の `github_research` は上記 Gemini 側の静的 `gh_commands` 事前バッチとは別契約であり、
 `run_agy_github_research_e2e.py` が最大 8 回、AGY 自身の判断に応じて単一 `gh` invocation を反復実行する。
