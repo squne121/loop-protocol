@@ -252,6 +252,75 @@ Google 非公開の内製バイナリ（`google3/third_party/jetski/...`）で�
 いずれも Issue 契約の変更を伴うため、この PR は Draft のまま
 `Refs #1814` を維持し、`Closes #1814` を使用しない。
 
+### 原因 2 への回避策（Issue #1979、2026-08-04 契約改訂）
+
+squne121 の指示により、上記の選択肢 2（`toolCall` 注入に依存しない代替設計）
+を採用した。`PreInvocation` hook の injectSteps を `toolCall`
+（`{"toolCall": {"name": "...", "args": {...}}}`、原因 2 で機能しないことを
+確認済み）から `ephemeralMessage`（`{"ephemeralMessage": "<自然言語指示>"}`、
+上記の再現実験で受理されることを既に確認済み）へ切り替え、capability ごとに
+最大 3 回の bounded retry で `PreToolUse` イベントの観測有無を確認する設計
+（`run_agy_permission_boundary_e2e.py::_resolve_prompt_compliance()`）へ
+転換した。bounded retry を使い切っても compliant にならない capability が
+1 つでもあれば、新設の `EXIT_PROMPT_NONCOMPLIANT`(78) で終了し、通常の
+allow/deny 判定へは進まない（`run_agy_permission_boundary_e2e.py::EXIT_PROMPT_NONCOMPLIANT`
+/ `FAILURE_PROMPT_NONCOMPLIANT`、詳細は `docs/dev/schema-governance.md` の
+Issue #1979 Compatibility Decision を参照）。
+
+**2026-08-04 の live 検証結果（実 AGY 1.1.9、`--allow-live`、`allow`/`deny`
+両 profile）。** `ephemeralMessage` 注入方式は実際に機能した。`PreInvocation`
+hook は正しく発火し（`pre_invocation_hook_started: true` /
+`pre_invocation_context_accepted: true`）、`command`/`read`/`network` の
+3 capability は 1 ラウンド目で compliant になった（`child_returncode: 0`、
+`actual_agy_executed: true`）。`write` capability のみ、3 ラウンドすべてで
+対応する `PreToolUse` が一度も観測されず `prompt_noncompliance` となり、
+両 profile とも `EXIT_PROMPT_NONCOMPLIANT`(78) で終了した（捏造した exit 0
+ではない、genuine な非completion結果）。この時点では上記 77 行目で既述の通り
+`write_to_file` の正式な引数キー名（`TargetFile`/`Overwrite`/`CodeContent`）
+が一次資料で独立確認できておらず、この capability 固有の non-compliance の
+有力な原因候補と見られていた。
+
+**その後の追加修正で `write` capability の genuine `exit 0` に到達した。**
+live 投機的プローブ（`write_to_file` PreToolUse matcher への stdin tee）で、
+実 AGY の `write_to_file` ツール呼び出しには常に `Description` 引数が
+含まれることを確認し、`attempt_args["write"]` に追加した。これにより
+`args_digest` の完全一致判定が正しく成立するようになり、`write` capability も
+両 profile でラウンド 1 から compliant になった（`EXIT_PROMPT_NONCOMPLIANT`
+は解消）。
+
+**残っていた別原因（deny 期待 attempt での PostToolUse 発火）も解消した。**
+実 AGY は `PreToolUse` が正しく deny した後も、相関する `PostToolUse`
+イベントを発火させることがある。旧来の `post_tool_use_matches_expectation`
+/ `same_attempt_correlation` predicate はこれを mismatch
+（`agy_permission_boundary_inconclusive`）として扱っていたため、genuine な
+`exit 0` に到達できなかった。Issue #1979 の In Scope が規定する
+`characterize_and_record`（explicit deny・同一 attempt への correlation・
+secret 非開示を評価し、PostToolUse ゼロ固定を要求しない）を実装し、schema に
+additive optional field `deny_post_tool_use_characterization` を追加した。
+stray（相関しない）PostToolUse や secret 開示を伴う PostToolUse は引き続き
+失敗として扱う（詳細は `docs/dev/schema-governance.md` の Issue #1979
+Compatibility Decision を参照）。
+
+**最後に発覚した loopback canary の shutdown race も修正した。** allow
+profile（`grounded_research`）でのみ、実際に network hit が発生した後の
+`_LoopbackCanary.stop()` が `socketserver.ThreadingMixIn` の既定
+`block_on_close=True` による per-request handler thread への無期限 `join()`
+で不定期にハングし得ることが判明した（deny profile は per-request thread が
+生成されないため常に無害だった）。`block_on_close=False`・
+`daemon_threads=True`・handler 側 socket read の bounded timeout を追加して
+解消した。
+
+**最終確認（実 AGY 1.1.10、`--allow-live`）。** 上記のすべての修正
+（`Description` 引数追加・deny 時 PostToolUse の characterize 化・loopback
+shutdown race 修正）を適用した結果、`command`/`write`/`read`/`network` の
+4 capability 全てが両 profile でラウンド 1 から compliant になり、
+`grounded_research`（AC3, allow）・`no_tools`（AC4, deny）の両 profile が
+繰り返し（AC3 は独立 3 回、AC4 は独立 2 回、クリーンな artifact-dir）で
+genuine `exit 0` に到達することを確認した（捏造した exit 0 ではなく、
+`cleanup` 全フィールド `true`、`failure_taxonomy.completion == true`）。
+本 Issue の Delivery Rule（両 profile で `exit 0` が得られること）を
+満たしたため、この PR は `Closes #1979` を使用する。
+
 ### provider_auto_policy_v1 fallback classes（フォールバック分類、Issue #1270）
 
 `provider=auto`（`provider_auto_dispatch()`）が provider fallback の
