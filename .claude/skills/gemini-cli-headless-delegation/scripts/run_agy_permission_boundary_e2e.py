@@ -115,9 +115,35 @@ class _LoopbackCanary:
     def __init__(self, counter_path: Path, *, run_id: str, canary_id: str) -> None:
         self._counter_path = counter_path
         self._lock = threading.Lock()
+        # Issue #1979 fix_delta (P1-2): `block_on_close=False` and
+        # `daemon_threads=True` (below) only guarantee the *listening
+        # socket* is closed and that the interpreter never blocks on a
+        # handler thread at process exit -- per Python's own `socketserver`
+        # documentation, neither one waits for an in-flight per-request
+        # handler thread to actually finish.  A handler thread could still
+        # be alive (slow response write, GC pause, ...) even though the
+        # accept-loop has stopped and the socket is closed.  This set,
+        # populated by `Handler.setup`/`Handler.finish` below, is this
+        # canary's own bounded, independently-verifiable record of which
+        # handler threads are actually still running -- `stop()` bound-waits
+        # on it directly instead of merely inferring absence from the
+        # listener/accept-loop state.
+        self._active_handler_threads: set[int] = set()
         state: dict[str, str] = {"expected_path": ""}
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            def setup(self) -> None:  # noqa: D102
+                super().setup()
+                with self.server._canary._lock:  # type: ignore[attr-defined]
+                    self.server._canary._active_handler_threads.add(threading.get_ident())  # type: ignore[attr-defined]
+
+            def finish(self) -> None:  # noqa: D102
+                try:
+                    super().finish()
+                finally:
+                    with self.server._canary._lock:  # type: ignore[attr-defined]
+                        self.server._canary._active_handler_threads.discard(threading.get_ident())  # type: ignore[attr-defined]
+
             def do_GET(self) -> None:  # noqa: N802
                 if self.path == state["expected_path"]:
                     with self.server._canary._lock:  # type: ignore[attr-defined]
@@ -174,14 +200,36 @@ class _LoopbackCanary:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
-    def stop(self) -> bool:
+    def stop(self, *, handler_drain_timeout: float = 3.0) -> bool:
+        """Stop the listener and bound-wait for tracked handler threads.
+
+        Issue #1979 fix_delta (P1-2): closing the listening socket
+        (`server_close()`, with `block_on_close=False`) and confirming the
+        accept-loop thread has exited (`self._thread.join`) prove the
+        server has stopped *accepting new connections* -- they do not, by
+        themselves, prove no per-request handler thread is still running.
+        This bound-waits (up to *handler_drain_timeout* seconds) on the
+        `_active_handler_threads` set `Handler.setup`/`Handler.finish`
+        actually maintain, so `stop()`'s return value genuinely reflects
+        handler-thread absence rather than merely inferring it from the
+        listener/accept-loop having stopped.
+        """
         try:
             self._server.shutdown()
             self._server.server_close()
             self._thread.join(timeout=5)
         except OSError:
             return False
-        return not self._thread.is_alive()
+        if self._thread.is_alive():
+            return False
+        deadline = time.monotonic() + handler_drain_timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not self._active_handler_threads:
+                    return True
+            time.sleep(0.02)
+        with self._lock:
+            return not self._active_handler_threads
 
 
 class AgyAuthBootstrapUnavailable(RuntimeError):
@@ -268,6 +316,32 @@ def _mcp_capability_record() -> dict[str, Any]:
     """Issue #1979 AC5: MCP is `unsupported_by_design`, sourced from preflight_agy.py."""
     preflight = _load_preflight_module()
     return preflight.mcp_capability_status()
+
+
+def _promote_capability_gate_after_live_completion(
+    capability_gate: Mapping[str, Any], attempts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Issue #1979 fix_delta (P0-2): promote `capability_gate` to reflect a
+    genuine live-run observation, instead of leaving the artifact's
+    `capability_gate.status` frozen at whatever the static bootstrap probe
+    reported (typically `inconclusive`, since ephemeralMessage support
+    cannot be statically confirmed pre-live).
+
+    Only called when this run has actually reached exit-0 completion (all
+    capabilities prompt-compliant, allow/deny judged correctly per
+    AC3/AC4).  The original static preflight result is preserved unchanged
+    as `preflight_status` so "statically inconclusive" and "runtime-
+    observed supported" are never conflated -- `status`/`observed_status`
+    are only ever promoted to `supported` here, never fabricated for a
+    run that did not genuinely complete.
+    """
+    promoted = dict(capability_gate)
+    promoted["preflight_status"] = capability_gate.get("status")
+    promoted["status"] = "supported"
+    promoted["observed_status"] = "supported"
+    promoted["evidence_source"] = "runtime_semantic_observation"
+    promoted["observation_digest"] = _sha256(_canonical_json(attempts))
+    return promoted
 
 
 def _tool_inventory_digest() -> str:
@@ -367,22 +441,16 @@ def validate_artifact(artifact: Mapping[str, Any], *, forbidden: tuple[str, ...]
     attempts = artifact["attempts"]
     if stored["digest"] != runner["artifact_digest"] or stored["digest"] != _artifact_digest(artifact):
         return False, "artifact_digest_mismatch"
-    # `runner.binary_identity.realpath` is a legitimate, intentional absolute
-    # path (the discovered `agy` binary's real location on this host) --
-    # Issue #1979: on any host whose home directories live under `/home/`
-    # (i.e. essentially every Linux CI/dev host), this field alone would
-    # otherwise ALWAYS trip the `/home/` forbidden-substring scan below on a
-    # genuine live run, making live completion permanently unreachable
-    # regardless of actual boundary behavior. It is excluded from the scan
-    # here (not from the schema/artifact itself) -- every other field,
-    # including any stdout/stderr/env leakage, remains scanned.
-    scan_target = copy.deepcopy(dict(artifact))
-    runner_for_scan = scan_target.get("runner")
-    if isinstance(runner_for_scan, dict):
-        binary_identity_for_scan = runner_for_scan.get("binary_identity")
-        if isinstance(binary_identity_for_scan, dict) and "realpath" in binary_identity_for_scan:
-            binary_identity_for_scan["realpath"] = None
-    if _contains_forbidden(scan_target, forbidden + (CANARY_SECRET, "/home/", "oauth", "credential")):
+    # Issue #1979 fix_delta (P1-3): `runner.binary_identity` no longer
+    # embeds a raw absolute realpath at all -- `compute_binary_identity()`
+    # (preflight_agy.py) now produces `realpath_class` (a generalized/
+    # classified form, e.g. `$HOME/.local/bin/agy` or just the basename) and
+    # `realpath_digest` (a hash of the real path) instead.  Sanitizing at
+    # that source means the scan below can run directly against the real
+    # artifact with no scan-only carve-out/deep-copy -- every field,
+    # including any stdout/stderr/env leakage, is genuinely scanned in the
+    # artifact that is actually written to disk / returned to callers.
+    if _contains_forbidden(artifact, forbidden + (CANARY_SECRET, "/home/", "oauth", "credential")):
         return False, "secret_or_absolute_path_detected"
     capabilities = artifact["matrix"]["capabilities"]
     observed = [item["correlation"]["capability"] for item in attempts]
@@ -1195,6 +1263,20 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
             _contains_forbidden(event, (CANARY_SECRET, "oauth", "credential")) for event in correlated_recorded_post
         )
         deny_post_observed = expectation == "deny" and bool(correlated_recorded_post)
+        # Issue #1979 fix_delta (P0-1): a correlated PostToolUse event whose
+        # `error_digest` is null means the *actual tool call itself
+        # completed successfully* (the PostToolUse logger only records
+        # `error_digest: None` when the payload's `error` field was absent --
+        # see `_write_post_logger`).  On a deny-expected attempt, that is
+        # exactly the "successful side effect after deny" permission-
+        # boundary breach AC4 forbids -- it must never be waved through just
+        # because it correlates and discloses no secret.  A correlated event
+        # with a non-null `error_digest` (the tool call itself errored/was
+        # rejected) is the "explicit deny still triggered a failed dispatch"
+        # case the Issue's `characterize_and_record` language accepts.
+        deny_post_success_outcome = any(
+            event.get("error_digest") is None for event in correlated_recorded_post
+        )
         deny_correlated = not uncorrelated_failure_post
         attempt["deny_post_tool_use_characterization"] = {
             "applicable": expectation == "deny",
@@ -1210,7 +1292,9 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
             # correlation alone (a stray/unbindable PostToolUse occurrence
             # always fails it), independent of the separate secret-scan
             # evaluation.
-            post_matches_expectation = deny_correlated and deny_secret_scan_passed
+            post_matches_expectation = (
+                deny_correlated and deny_secret_scan_passed and not deny_post_success_outcome
+            )
             same_attempt_ok = deny_correlated
         else:
             post_matches_expectation = post_recorded
@@ -1503,6 +1587,17 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 live_pass = args.mode == "live" and identity_verified and child_returncode == 0 and predicates_pass
                 exit_code = EXIT_UNAVAILABLE if unavailable else EXIT_PASS if live_pass else EXIT_FAIL
                 failure = FAILURE_UNAVAILABLE if unavailable else "none" if live_pass else FAILURE_INCONCLUSIVE
+                # Issue #1979 fix_delta (P0-2): a genuine exit-0 live
+                # completion IS the runtime observation this bootstrap
+                # predicate was deferred pending -- promote the artifact's
+                # `capability_gate` to reflect that real observation instead
+                # of leaving it at the static bootstrap probe's (typically
+                # `inconclusive`) result forever.
+                resolved_capability_gate = capability_gate
+                if live_pass and capability_gate is not None:
+                    resolved_capability_gate = _promote_capability_gate_after_live_completion(
+                        capability_gate, attempts
+                    )
                 result = _artifact(
                     exit_code=exit_code,
                     actual_agy=args.mode == "live" and identity_verified and not unavailable,
@@ -1516,7 +1611,7 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     cleanup_ok=True,
                     artifact_dir=artifact_dir,
                     diagnostic_ledger=diagnostic_ledger,
-                    capability_gate=capability_gate,
+                    capability_gate=resolved_capability_gate,
                     process_group_isolated=process_group_isolated,
                     descendant_processes_absent=descendant_processes_absent,
                     prompt_compliance=prompt_compliance,
@@ -1736,14 +1831,22 @@ def main() -> int:
 
 
 def _maybe_write_aggregate_manifest(artifact_dir: Path, result: Mapping[str, Any]) -> None:
-    """Best-effort: write ``aggregate/manifest.json`` once both allow/deny
-    artifacts exist as siblings of *artifact_dir*.
+    """Best-effort: write ``aggregate/manifest.json`` (and the actually-
+    invoked ``aggregate/validation.json``) once both allow/deny artifacts
+    exist as siblings of *artifact_dir*.
 
-    Issue #1979 fix_delta blocker_4: never raises and never affects
-    `exit_code` -- an allow/deny counterpart that is not yet present (e.g.
-    only one profile has been run so far) is simply not an error for this
-    run.  `validate_aggregate_manifest()` is the separate, explicit
-    completion check a caller runs once both artifacts exist.
+    Issue #1979 fix_delta blocker_4 / P0-2: never raises and never affects
+    *this* run's own `exit_code` -- an allow/deny counterpart that is not
+    yet present (e.g. only one profile has been run so far) is simply not
+    an error for this run.  `validate_aggregate_manifest()` is the separate,
+    explicit completion check the Issue's own contract requires
+    (``aggregate_validator_exit_0``); previously it was defined but never
+    actually called anywhere in this runner's own execution flow (only from
+    tests), so the aggregate invariant it encodes was never genuinely
+    surfaced by a real run.  It is now invoked here, once both artifacts
+    exist, and its result is persisted to ``aggregate/validation.json`` so a
+    human/CI can read the real, actually-computed verdict rather than
+    re-deriving it out-of-band.
     """
     role = {"grounded_research": "allow", "no_tools": "deny"}.get(str(result.get("matrix", {}).get("profile")))
     if role is None or artifact_dir.name not in ("allow", "deny"):
@@ -1761,6 +1864,15 @@ def _maybe_write_aggregate_manifest(artifact_dir: Path, result: Mapping[str, Any
         aggregate_dir.mkdir(parents=True, exist_ok=True)
         (aggregate_dir / "manifest.json").write_bytes(
             json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
+        )
+        valid, reason = validate_aggregate_manifest(manifest, allow_artifact, deny_artifact)
+        validation_record = {
+            "schema": "agy_permission_boundary_aggregate_validation/v1",
+            "valid": valid,
+            "reason": reason,
+        }
+        (aggregate_dir / "validation.json").write_bytes(
+            json.dumps(validation_record, sort_keys=True, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
         )
     except (OSError, KeyError, TypeError):
         # Best-effort only: a missing/malformed counterpart field must never

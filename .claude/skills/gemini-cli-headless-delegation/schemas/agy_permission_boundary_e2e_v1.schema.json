@@ -73,7 +73,8 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "realpath",
+            "realpath_class",
+            "realpath_digest",
             "sha256",
             "size",
             "mtime_ns",
@@ -81,11 +82,20 @@
             "arch"
           ],
           "properties": {
-            "realpath": {
+            "realpath_class": {
+              "description": "Issue #1979 fix_delta (P1-3): a generalized/classified form of the resolved binary path (e.g. `$HOME/.local/bin/agy` or just the basename) -- never the raw absolute realpath, so the artifact never discloses the host username/home layout.",
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "realpath_digest": {
+              "description": "Issue #1979 fix_delta (P1-3): a hash of the actual raw realpath, enabling exact-match/drift comparison without disclosing the path itself.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^sha256:[0-9a-f]{64}$"
             },
             "sha256": {
               "type": [
@@ -321,6 +331,25 @@
         "evidence_source": {
           "type": "string",
           "minLength": 1
+        },
+        "preflight_status": {
+          "description": "Issue #1979 fix_delta (P0-2): additive, optional. The original static bootstrap-preflight `status` (e.g. `inconclusive`), preserved unchanged when `status` is later promoted after a genuine live-run observation, so the two are never conflated.",
+          "enum": [
+            "supported",
+            "unsupported",
+            "unavailable",
+            "inconclusive",
+            "evidence_invalid"
+          ]
+        },
+        "observed_status": {
+          "description": "Issue #1979 fix_delta (P0-2): additive, optional. Present only when a live run reached genuine completion (all capabilities prompt-compliant, allow/deny judged correctly) -- always `supported` when present.",
+          "const": "supported"
+        },
+        "observation_digest": {
+          "description": "Issue #1979 fix_delta (P0-2): additive, optional. A digest binding the `observed_status` promotion to this run's actual attempt evidence.",
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
         }
       }
     },

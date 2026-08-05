@@ -789,16 +789,52 @@ def _write_post_tool_use_event(
         output.write(json.dumps(event, separators=(",", ":")) + "\n")
 
 
-def test_deny_correlated_posttooluse_is_characterized_not_failed(tmp_path: Path) -> None:
-    """Issue #1979: real AGY may still dispatch a correlated, secret-safe
-    PostToolUse event after an explicit PreToolUse deny. This must be
-    characterized and recorded, not treated as a fixed mismatch -- all
-    predicates for the attempt still pass."""
+def test_deny_correlated_posttooluse_with_null_error_digest_fails(tmp_path: Path) -> None:
+    """Issue #1979 fix_delta (P0-1): a correlated PostToolUse event whose
+    `error_digest` is null means the tool call *actually completed
+    successfully* despite the PreToolUse deny -- a genuine permission-
+    boundary breach (AC4 requires "successful PostToolUse count == 0" for
+    deny). This must FAIL the attempt even though the event correlates and
+    discloses no secret."""
     runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
     _write_pre_tool_use_event(
         runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
     )
-    _write_post_tool_use_event(runtime, profile="no_tools", conversation_id="conv-1", step_index=0)
+    _write_post_tool_use_event(
+        runtime, profile="no_tools", conversation_id="conv-1", step_index=0, extra={"error_digest": None}
+    )
+
+    attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
+    command = next(item for item in attempts if item["correlation"]["capability"] == "command")
+
+    assert command["expectation"] == "deny"
+    assert command["predicates"]["post_tool_use_matches_expectation"] is False
+    assert command["predicates"]["same_attempt_correlation"] is True
+    assert command["deny_post_tool_use_characterization"] == {
+        "applicable": True,
+        "observed": True,
+        "correlated": True,
+        "secret_scan_passed": True,
+    }
+
+
+def test_deny_correlated_posttooluse_with_error_digest_is_characterized_not_failed(tmp_path: Path) -> None:
+    """Issue #1979: real AGY may still dispatch a correlated, secret-safe
+    PostToolUse event after an explicit PreToolUse deny -- but only when
+    the tool call itself errored/was rejected (non-null `error_digest`).
+    This must be characterized and recorded, not treated as a fixed
+    mismatch -- all predicates for the attempt still pass."""
+    runtime = MODULE._prepare_runtime(tmp_path / "runtime", "no_tools")
+    _write_pre_tool_use_event(
+        runtime, profile="no_tools", capability="command", conversation_id="conv-1", step_index=0, decision="deny"
+    )
+    _write_post_tool_use_event(
+        runtime,
+        profile="no_tools",
+        conversation_id="conv-1",
+        step_index=0,
+        extra={"error_digest": "sha256:" + "0" * 64},
+    )
 
     attempts = MODULE._attempts_from_parent_observation(runtime, "no_tools")
     command = next(item for item in attempts if item["correlation"]["capability"] == "command")
@@ -963,6 +999,76 @@ def test_loopback_canary_stops_cleanly_and_promptly_after_a_real_hit(tmp_path: P
     assert stopped is True
     assert elapsed < 5.0, f"loopback canary shutdown after a real hit took {elapsed:.3f}s (expected < 5.0s)"
     assert canary._thread.is_alive() is False
+
+
+def test_stop_waits_for_a_slow_handler_thread_to_actually_finish(tmp_path: Path) -> None:
+    """Issue #1979 fix_delta (P1-2) regression test.
+
+    `block_on_close=False` / `daemon_threads=True` alone only prove the
+    listening socket stopped accepting connections -- neither one waits for
+    an in-flight per-request handler thread to actually finish (per
+    `socketserver`'s own documentation). This deliberately holds the handler
+    thread open (a `Handler.finish` override that sleeps before returning,
+    simulating a slow-writing response / GC pause / TCP teardown latency)
+    and asserts `stop()` genuinely bound-waits for it -- both that it
+    returns `True` only once the handler has actually finished, and that it
+    took measurably longer than the request itself (proving real waiting,
+    not merely inferring completion from the accept-loop having stopped)."""
+    import threading
+
+    counter_path = tmp_path / "network-canary-counter"
+    counter_path.write_text("0\n", encoding="utf-8")
+    canary = MODULE._LoopbackCanary(counter_path, run_id="test-run", canary_id="test-canary")
+    handler_finished = threading.Event()
+    real_finish = canary._server.RequestHandlerClass.finish
+
+    def _slow_finish(self) -> None:  # type: ignore[no-untyped-def]
+        time.sleep(0.3)
+        try:
+            real_finish(self)
+        finally:
+            handler_finished.set()
+
+    canary._server.RequestHandlerClass.finish = _slow_finish
+    try:
+        response = urllib.request.urlopen(canary.url, timeout=5)
+        assert response.status == 200
+        assert counter_path.read_text(encoding="utf-8").strip() == "1"
+    finally:
+        started_at = time.time()
+        stopped = canary.stop(handler_drain_timeout=3.0)
+        elapsed = time.time() - started_at
+        canary._server.RequestHandlerClass.finish = real_finish
+
+    assert stopped is True
+    assert handler_finished.is_set()
+    assert elapsed >= 0.25, f"stop() returned after only {elapsed:.3f}s -- it did not actually wait for the slow handler"
+
+
+def test_stop_detects_a_lingering_handler_thread_and_returns_false(tmp_path: Path) -> None:
+    """Issue #1979 fix_delta (P1-2) regression test.
+
+    A handler thread that never finishes within the bound must make
+    `stop()` return `False` -- proving this predicate actually detects
+    handler-thread non-absence rather than trivially returning `True`
+    whenever the listening socket/accept-loop has stopped (the previous
+    implementation's only check, which cannot distinguish this case at
+    all)."""
+    counter_path = tmp_path / "network-canary-counter"
+    counter_path.write_text("0\n", encoding="utf-8")
+    canary = MODULE._LoopbackCanary(counter_path, run_id="test-run", canary_id="test-canary")
+    # Simulate a handler thread that started but will never signal
+    # completion (e.g. permanently blocked) -- `Handler.finish` never runs
+    # for this synthetic ident, so it is never discarded from the set.
+    with canary._lock:
+        canary._active_handler_threads.add(999999999)
+    try:
+        stopped = canary.stop(handler_drain_timeout=0.2)
+    finally:
+        with canary._lock:
+            canary._active_handler_threads.discard(999999999)
+
+    assert stopped is False
 
 
 def test_cleanup_evidence_fields_are_independent_not_a_shared_flag(

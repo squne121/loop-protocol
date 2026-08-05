@@ -373,7 +373,8 @@ def test_binary_identity_drift_between_version_and_runtime_is_detected():
     identity observed after probes, every predicate becomes `evidence_invalid`."""
     module = load_module()
     before = {
-        "realpath": "/usr/local/bin/agy",
+        "realpath_class": "agy",
+        "realpath_digest": "sha256:" + "c" * 64,
         "sha256": "a" * 64,
         "size": 1000,
         "mtime_ns": 123,
@@ -527,7 +528,8 @@ def test_capability_probe_memoized_within_process_only():
     module._CAPABILITY_MEMO_CACHE.clear()
 
     binary_identity = {
-        "realpath": "/usr/local/bin/agy",
+        "realpath_class": "agy",
+        "realpath_digest": "sha256:" + "c" * 64,
         "sha256": "c" * 64,
         "size": 42,
         "mtime_ns": 1,
@@ -566,7 +568,8 @@ def test_capability_probe_cache_bypassed_when_pre_run_and_pre_probe_identity_dif
     module._CAPABILITY_MEMO_CACHE.clear()
 
     identity_a = {
-        "realpath": "/usr/local/bin/agy",
+        "realpath_class": "agy",
+        "realpath_digest": "sha256:" + "c" * 64,
         "sha256": "a" * 64,
         "size": 42,
         "mtime_ns": 1,
