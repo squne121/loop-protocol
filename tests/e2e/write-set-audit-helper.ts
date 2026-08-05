@@ -88,6 +88,23 @@
  * was not attached to — mutations happening in a different CDP target are
  * simply never observed by this session regardless of the recorded
  * `securityOrigin`/`storageKey` values.
+ *
+ * fail-closed metadata retention (PR #1996 OWNER REQUEST_CHANGES repair,
+ * issuecomment-5191160187, P2): the CDP protocol schema marks both
+ * `DOMStorage.StorageId.securityOrigin` and `.storageKey` as optional.
+ * Silently substituting `''` for a missing field would fabricate a value
+ * indistinguishable from a real empty string, which is not "verbatim"
+ * retention. Instead, if either field is missing on any observed event,
+ * this module records an `auditFailure` (the first such failure only) and
+ * DROPS that specific event from `writeLog` rather than recording a
+ * fabricated value. `flushAudit()` throws the recorded `auditFailure` (if
+ * any) once the causal drain itself has completed — not directly from the
+ * CDP event listener, since throwing synchronously from inside a CDP event
+ * callback is not a reliably observable failure mode for Playwright test
+ * code (a promise/microtask started there is not awaited by anything).
+ * Routing the failure back through `flushAudit()`'s own already-awaited
+ * Promise gives callers a guaranteed, synchronous-from-their-perspective
+ * failure point.
  */
 
 import type { BrowserContext, CDPSession, Page } from '@playwright/test'
@@ -142,6 +159,11 @@ export async function attachWriteSetAudit(
   let globalOrder = 0
   let documentEpoch = 0
   let epochOrder = 0
+  // Fail-closed metadata repair (PR #1996 review, issuecomment-5191160187,
+  // P2) — see module-level doc comment. First missing-field failure wins;
+  // thrown from `flushAudit()` once the causal drain completes, not
+  // directly from the CDP event callback.
+  let auditFailure: Error | null = null
 
   page.on('framenavigated', (frame) => {
     if (frame === page.mainFrame()) {
@@ -179,28 +201,44 @@ export async function attachWriteSetAudit(
 
   // CDP's `DOMStorage.StorageId` marks both `securityOrigin` and
   // `storageKey` as optional in the protocol type (older Chrome revisions
-  // only populated `securityOrigin`), but the Chromium builds this repo
-  // targets always populate both fields together for `isLocalStorage`
-  // events. The `?? ''` fallback below only guards the TS type against the
-  // protocol-level optionality; it does not represent an expected runtime
-  // value — an unexpectedly empty string here would surface as a failing
-  // assertion in `write-set-audit-helper.spec.ts` rather than a silent gap.
-  function storageOrigin(storageId: { securityOrigin?: string }): string {
-    return storageId.securityOrigin ?? ''
-  }
-  function storageKeyOf(storageId: { storageKey?: string }): string {
-    return storageId.storageKey ?? ''
+  // only populated `securityOrigin`). PR #1996 review (issuecomment-
+  // 5191160187, P2): a missing field must NOT be silently converted into a
+  // fake `''` — that is indistinguishable from a real empty string and is
+  // not verbatim retention. Instead, a missing field records `auditFailure`
+  // (first failure wins) and the event carrying it is dropped from
+  // `writeLog` — `flushAudit()` throws `auditFailure` once the drain
+  // completes (see module-level doc comment).
+  function requireStorageMetadata(
+    storageId: { securityOrigin?: string; storageKey?: string },
+  ): { securityOrigin: string; storageKey: string } | null {
+    if (storageId.securityOrigin == null || storageId.storageKey == null) {
+      if (auditFailure === null) {
+        auditFailure = new Error(
+          'attachWriteSetAudit: DOMStorage event is missing required storage ' +
+            `metadata (securityOrigin=${String(storageId.securityOrigin)}, ` +
+            `storageKey=${String(storageId.storageKey)}) — refusing to ` +
+            'substitute a fabricated empty string (Issue #1993 P2 fail-closed ' +
+            'repair, PR #1996 review issuecomment-5191160187)',
+        )
+      }
+      return null
+    }
+    return { securityOrigin: storageId.securityOrigin, storageKey: storageId.storageKey }
   }
 
   client.on('DOMStorage.domStorageItemAdded', (event) => {
     if (!event.storageId.isLocalStorage) return
     if (event.key === FLUSH_MARKER_KEY) return
-    record('setItem', event.key, storageOrigin(event.storageId), storageKeyOf(event.storageId))
+    const metadata = requireStorageMetadata(event.storageId)
+    if (metadata === null) return
+    record('setItem', event.key, metadata.securityOrigin, metadata.storageKey)
   })
   client.on('DOMStorage.domStorageItemUpdated', (event) => {
     if (!event.storageId.isLocalStorage) return
     if (event.key === FLUSH_MARKER_KEY) return
-    record('setItem', event.key, storageOrigin(event.storageId), storageKeyOf(event.storageId))
+    const metadata = requireStorageMetadata(event.storageId)
+    if (metadata === null) return
+    record('setItem', event.key, metadata.securityOrigin, metadata.storageKey)
   })
   client.on('DOMStorage.domStorageItemRemoved', (event) => {
     if (!event.storageId.isLocalStorage) return
@@ -211,12 +249,15 @@ export async function attachWriteSetAudit(
       waiter?.()
       return
     }
-    record('removeItem', event.key, storageOrigin(event.storageId), storageKeyOf(event.storageId))
+    const metadata = requireStorageMetadata(event.storageId)
+    if (metadata === null) return
+    record('removeItem', event.key, metadata.securityOrigin, metadata.storageKey)
   })
   client.on('DOMStorage.domStorageItemsCleared', (event) => {
-    if (event.storageId.isLocalStorage) {
-      record('clear', null, storageOrigin(event.storageId), storageKeyOf(event.storageId))
-    }
+    if (!event.storageId.isLocalStorage) return
+    const metadata = requireStorageMetadata(event.storageId)
+    if (metadata === null) return
+    record('clear', null, metadata.securityOrigin, metadata.storageKey)
   })
 
   // OWNER REQUEST_CHANGES repair (PR #1989 review, issuecomment-5179331591,
@@ -251,6 +292,15 @@ export async function attachWriteSetAudit(
     }, FLUSH_MARKER_KEY)
 
     await markerObserved
+
+    // Fail-closed metadata repair (PR #1996 review, issuecomment-5191160187,
+    // P2): thrown here (after the causal drain has already completed) so
+    // ALL prior mutations from this page are guaranteed to have already
+    // been turned into DOMStorage.* events and checked, not just whatever
+    // had already been delivered when the missing-field event occurred.
+    if (auditFailure !== null) {
+      throw auditFailure
+    }
   }
 
   return { writeLog, flushAudit }
