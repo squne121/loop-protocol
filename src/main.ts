@@ -977,7 +977,7 @@ export type VisualScenarioFixture =
       sortie: TimeoutVisualSortie
     })
   | (VisualScenarioFixtureCommon & {
-      name: 'final-overlay-only'
+      name: 'final-no-command-rail'
       loopPhase: 'result'
       sortie: TimeoutVisualSortie
     })
@@ -986,7 +986,7 @@ const VISUAL_SCENARIO_NAMES = [
   'running-hud',
   'running-hud-paused',
   'result-timeout',
-  'final-overlay-only',
+  'final-no-command-rail',
 ] as const
 
 function isFiniteNumber(value: unknown): value is number {

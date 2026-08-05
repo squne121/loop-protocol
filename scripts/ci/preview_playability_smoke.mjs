@@ -118,7 +118,16 @@ async function collectLayoutEvidence(frame) {
   })
 }
 
-const DECLARED_BROWSER_ZOOM = '100% (Chromium default; not adjusted by this automated check)'
+// PR #1998 review (owner, MINOR): browser zoom is a *declared* value (this
+// automated check never adjusts zoom), not a genuinely measured one like
+// userAgent / devicePixelRatio / timeZone below -- so it is structured
+// separately, distinguishing its value from its provenance instead of being
+// a flat string indistinguishable from a real measurement.
+const DECLARED_BROWSER_ZOOM = {
+  value: 1,
+  source: 'declared',
+  enforcement: 'no zoom override configured',
+}
 
 async function collectRuntimeEnvironment(page) {
   const evaluated = await page.evaluate(() => ({
@@ -129,7 +138,7 @@ async function collectRuntimeEnvironment(page) {
 
   return {
     ...evaluated,
-    declaredBrowserZoom: DECLARED_BROWSER_ZOOM,
+    browserZoom: DECLARED_BROWSER_ZOOM,
   }
 }
 

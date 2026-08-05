@@ -34,7 +34,7 @@
  *   「既存値がない場合のみ」に限定する（保存済みスナップショットの上書き防止）。
  */
 
-import { test, expect, type Page } from '@playwright/test'
+import { test, expect, type Locator, type Page } from '@playwright/test'
 
 // ---------------------------------------------------------------------------
 // Helper: __LOOP_E2E__ observability hook
@@ -757,14 +757,66 @@ test.describe('Issue #1376: result screen focus (AC7) and rapid-activation exact
 
 
 // ---------------------------------------------------------------------------
-// AC3 (Issue #1377): keyboard-only title -> preparation -> running ->
-// pause/resume -> result -> preparation flow, driven entirely through
-// `.battle-stage` overlay descendants (never the legacy `.command-rail`,
-// removed by this Issue).
+// Helper: bounded real-keyboard `Tab` / `Shift+Tab` navigation (Issue #1377
+// PR #1998 review, BLOCKER 2: `.focus()` injection never exercises Tab
+// order and would not catch a regression where a control falls out of it,
+// so AC3/AC4 below drive actual `Tab` / `Shift+Tab` key presses instead).
+// NOTE: the document also mounts an always-visible, out-of-scope
+// `[data-playtest-toggle]` control at `document.body` (src/ui/playtestEvidence.ts,
+// not part of this Issue's Allowed Paths), so Tab order legitimately visits
+// elements outside `.battle-stage` -- `pressUntilFocused()` only bounds the
+// search for `target`, it does not assert every intermediate stop is inside
+// `.battle-stage`.
+// ---------------------------------------------------------------------------
+
+async function pressUntilFocused(
+  page: Page,
+  target: Locator,
+  key: 'Tab' | 'Shift+Tab' = 'Tab',
+  maxPresses = 8,
+): Promise<void> {
+  for (let attempt = 0; attempt < maxPresses; attempt += 1) {
+    await page.keyboard.press(key)
+    const isTarget = await target.evaluate((element) => element === document.activeElement)
+    if (isTarget) {
+      return
+    }
+  }
+  throw new Error(`Target was not keyboard reachable within ${maxPresses} ${key} press(es).`)
+}
+
+/**
+ * Presses `Tab` `maxPresses` times (enough to cycle through every
+ * `.battle-stage` focusable element more than once) and asserts none of
+ * `forbidden` ever becomes `document.activeElement` -- i.e. it is provably
+ * absent from the Tab order, not merely unfocused right now.
+ */
+async function assertNeverTabReachable(
+  page: Page,
+  forbidden: Locator[],
+  maxPresses = 20,
+): Promise<void> {
+  for (let attempt = 0; attempt < maxPresses; attempt += 1) {
+    await page.keyboard.press('Tab')
+    for (const locator of forbidden) {
+      const isForbiddenFocused = await locator.evaluate(
+        (element) => element === document.activeElement,
+      )
+      expect(isForbiddenFocused).toBe(false)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AC3/AC4 (Issue #1377): keyboard-only title -> preparation -> running ->
+// pause/resume -> result -> preparation flow, driven entirely through real
+// `Tab` / `Shift+Tab` / `Enter` / `Escape` / `P` key presses (never
+// `Locator.focus()` injection) over `.battle-stage` overlay descendants
+// (never the legacy `.command-rail`, removed by this Issue).
 // ---------------------------------------------------------------------------
 
 test(
-  'AC3 (#1377): GIVEN keyboard-only input WHEN navigating title -> preparation -> running -> pause/resume -> result -> preparation THEN it never depends on the legacy command rail',
+  'AC3/AC4 (#1377): GIVEN keyboard-only input WHEN navigating title -> preparation -> running -> pause/resume -> result -> preparation THEN it never depends on the legacy command rail and running-only management controls stay outside Tab order',
   async ({ page }) => {
     test.setTimeout(45_000)
 
@@ -786,44 +838,84 @@ test(
     })
     await page.goto('/')
 
+    // AC3/AC4 (10): every locator below is scoped from `.battle-stage`.
+    const stage = page.locator('.battle-stage')
+
     await expect
       .poll(async () => (await getGameState(page)).loopPhase, { timeout: 5_000, intervals: [50] })
       .toBe('title_menu')
 
-    // title_menu -> preparation: keyboard-activate "Begin new run" (Tab-focus
-    // + Enter, never a mouse click) -- a `.battle-stage` overlay descendant.
-    const beginNewRun = page.getByRole('button', { name: 'Begin new run' })
-    await beginNewRun.focus()
-    await expect(beginNewRun).toBeFocused()
+    // (1) title_menu opens with the title heading as initial focus
+    // (`phaseScreens.ts`'s `getInitialFocusTarget()` contract, AC7).
+    const titleHeading = stage.locator('#phase-screen-title-heading')
+    await expect(titleHeading).toBeFocused()
+
+    // (2) title_menu -> preparation: real `Tab` navigation (never
+    // `.focus()` injection) from the title heading to "Begin new run", then
+    // `Enter`.
+    const beginNewRun = stage.getByRole('button', { name: 'Begin new run' })
+    await pressUntilFocused(page, beginNewRun)
     await page.keyboard.press('Enter')
     await expect
       .poll(async () => (await getGameState(page)).loopPhase, { timeout: 5_000, intervals: [50] })
       .toBe('preparation')
 
-    // preparation -> running: keyboard-activate "Launch sortie".
-    const launchSortie = page.getByRole('button', { name: 'Launch sortie' })
-    await launchSortie.focus()
-    await expect(launchSortie).toBeFocused()
+    // preparation opens with its own heading focused first (AC7).
+    const preparationHeading = stage.locator('#phase-screen-preparation-heading')
+    await expect(preparationHeading).toBeFocused()
+
+    // (3) preparation -> running: real `Tab` navigation from the
+    // preparation heading to "Launch sortie", then `Enter`.
+    const launchSortie = stage.getByRole('button', { name: 'Launch sortie' })
+    await pressUntilFocused(page, launchSortie)
     await page.keyboard.press('Enter')
     await expect
       .poll(async () => (await getGameState(page)).loopPhase, { timeout: 5_000, intervals: [50] })
       .toBe('running')
 
-    // running: pause/resume via the P key, which requires
-    // `.battle-stage__canvas` focus (tests/e2e/product-pause.spec.ts AC17
-    // keyboard contract) -- entirely within the `.battle-stage` overlay,
-    // never the legacy command rail.
-    await page.focus('.battle-stage__canvas')
+    // (4) AC4: running-only management controls (Save / Open save / Reset /
+    // New Game) are neither visible nor keyboard-reachable while `running`
+    // -- verified via a bounded real Tab-order traversal, not merely
+    // `document.activeElement` at a single instant (PR #1998 review
+    // BLOCKER 2).
+    const forbiddenRunningControls = [
+      stage.locator('[data-action="new-game"]'),
+      stage.locator('[data-action="save"]'),
+      stage.locator('[data-action="open-load-menu-preparation"]'),
+      stage.locator('[data-action="reset"]'),
+    ]
+    for (const control of forbiddenRunningControls) {
+      await expect(control).toBeHidden()
+    }
+    await assertNeverTabReachable(page, forbiddenRunningControls)
+
+    // (5) running: real `Tab` navigation to the Canvas, then press `P` (a
+    // real user path, matching tests/e2e/product-pause.spec.ts AC17's
+    // keyboard contract) -- entirely within `.battle-stage`, never the
+    // legacy command rail.
+    const canvas = stage.locator('.battle-stage__canvas')
+    await pressUntilFocused(page, canvas)
     await page.keyboard.press('p')
-    await expect(page.locator('[data-action="toggle-pause"]')).toHaveAttribute(
-      'aria-pressed',
-      'true',
-    )
+    const togglePauseIndicator = stage.locator('[data-action="toggle-pause"]')
+    await expect(togglePauseIndicator).toHaveAttribute('aria-pressed', 'true')
+
+    // (6) the pause dialog opens with Resume focused immediately (AC3, AC6).
+    const resumeButton = stage.locator('[data-action="resume"]')
+    await expect(resumeButton).toBeFocused()
+
+    // (7) focus-trap check inside the pause dialog: Resume is currently its
+    // sole focusable descendant, so both `Tab` and `Shift+Tab` must keep
+    // focus on it (WAI-ARIA APG modal dialog pattern).
+    await page.keyboard.press('Tab')
+    await expect(resumeButton).toBeFocused()
+    await page.keyboard.press('Shift+Tab')
+    await expect(resumeButton).toBeFocused()
+
+    // (8) Escape closes the dialog; focus returns to the Canvas (the P-key
+    // invoker recorded by `enterProductPause()` in src/main.ts, AC6).
     await page.keyboard.press('Escape')
-    await expect(page.locator('[data-action="toggle-pause"]')).toHaveAttribute(
-      'aria-pressed',
-      'false',
-    )
+    await expect(togglePauseIndicator).toHaveAttribute('aria-pressed', 'false')
+    await expect(canvas).toBeFocused()
 
     // running -> result: without player movement input, the default enemy
     // spawn reaches the player and ends the sortie deterministically
@@ -840,10 +932,14 @@ test(
       .poll(async () => (await getGameState(page)).loopPhase, { timeout: 3_000, intervals: [50] })
       .toBe('result')
 
-    // result -> preparation: keyboard-activate "Return to hangar" (Confirm result).
-    const confirmResult = page.locator('[data-action="confirm-result"]')
-    await confirmResult.focus()
-    await expect(confirmResult).toBeFocused()
+    // result opens with its own heading focused first (AC7).
+    const resultHeading = stage.locator('#phase-screen-result-heading')
+    await expect(resultHeading).toBeFocused()
+
+    // (9) result -> preparation: real `Tab` navigation from the result
+    // heading to "Return to hangar" (Confirm result), then `Enter`.
+    const confirmResult = stage.locator('[data-action="confirm-result"]')
+    await pressUntilFocused(page, confirmResult)
     await page.keyboard.press('Enter')
     await expect
       .poll(async () => (await getGameState(page)).loopPhase, { timeout: 5_000, intervals: [50] })
@@ -852,7 +948,7 @@ test(
     // AC3/AC4: the entire flow above ran within `.battle-stage` overlay
     // descendants only -- the legacy `.command-rail` never existed as a DOM
     // target (Issue #1377 removes it entirely).
-    await expect(page.locator('aside.command-rail')).toHaveCount(0)
-    await expect(page.locator('.battle-stage')).toBeVisible()
+    await expect(stage.locator('aside.command-rail')).toHaveCount(0)
+    await expect(stage).toBeVisible()
   },
 )

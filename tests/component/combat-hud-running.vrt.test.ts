@@ -25,7 +25,7 @@ import '../e2e/visual.freeze.css'
  * Report-only lane: backs the non-required `component-vrt-report` CI job
  * only (In Scope / Out of Scope). `combat-hud-running` is the ONLY
  * scenario in this Issue's Current Validated Scope — result / pause modal
- * / final-overlay-only are explicitly excluded until their UI stabilizes
+ * / final-no-command-rail are explicitly excluded until their UI stabilizes
  * in a later Issue.
  *
  * Mounts production DOM via `createHudController()`
