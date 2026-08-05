@@ -73,6 +73,21 @@
  * silently produce a false-green (an in-scope or out-of-scope mutation that
  * had already fired at the browser level but had not yet reached
  * `writeLog`).
+ *
+ * `securityOrigin`/`storageKey` metadata retention (Issue #1993, follow-up
+ * to PR #1989 review, issuecomment-5179331591 / issuecomment-5185109001):
+ * every `WriteOp` now also records the CDP `DOMStorage.StorageId`'s
+ * `securityOrigin` and `storageKey` fields verbatim (same field names as
+ * the CDP type — no renaming). This is metadata RETENTION only, not
+ * boundary enforcement: this module does not filter, reject, or assert on
+ * these values anywhere; it only stores what CDP already reports for each
+ * event. This CDP session is bound to a single page/target (see the
+ * single-page/single-origin precondition above), so recording these
+ * fields does NOT make the audit cover OOPIF (out-of-process iframes
+ * attached as separate CDP targets) or any other page/target this session
+ * was not attached to — mutations happening in a different CDP target are
+ * simply never observed by this session regardless of the recorded
+ * `securityOrigin`/`storageKey` values.
  */
 
 import type { BrowserContext, CDPSession, Page } from '@playwright/test'
@@ -93,6 +108,14 @@ export type WriteOp = {
    *  (navigation-epoch, local-sequence) pair is the practical equivalent of
    *  a per-document sequence for a single-frame same-origin scenario. */
   epochOrder: number
+  /** CDP `DOMStorage.StorageId.securityOrigin` verbatim (Issue #1993:
+   *  metadata retention only, not boundary enforcement — see module-level
+   *  doc comment). */
+  securityOrigin: string
+  /** CDP `DOMStorage.StorageId.storageKey` verbatim (Issue #1993: metadata
+   *  retention only, not boundary enforcement — see module-level doc
+   *  comment). */
+  storageKey: string
 }
 
 /**
@@ -130,8 +153,16 @@ export async function attachWriteSetAudit(
   const client: CDPSession = await context.newCDPSession(page)
   await client.send('DOMStorage.enable')
 
-  function record(type: WriteOp['type'], key: string | null): void {
-    writeLog.push({ type, key, order: globalOrder, documentEpoch, epochOrder })
+  function record(type: WriteOp['type'], key: string | null, securityOrigin: string, storageKey: string): void {
+    writeLog.push({
+      type,
+      key,
+      order: globalOrder,
+      documentEpoch,
+      epochOrder,
+      securityOrigin,
+      storageKey,
+    })
     globalOrder += 1
     epochOrder += 1
   }
@@ -146,15 +177,30 @@ export async function attachWriteSetAudit(
   const FLUSH_MARKER_KEY = `__attachWriteSetAudit_flush_marker_${Math.random().toString(36).slice(2)}__`
   const pendingFlushWaiters: Array<() => void> = []
 
+  // CDP's `DOMStorage.StorageId` marks both `securityOrigin` and
+  // `storageKey` as optional in the protocol type (older Chrome revisions
+  // only populated `securityOrigin`), but the Chromium builds this repo
+  // targets always populate both fields together for `isLocalStorage`
+  // events. The `?? ''` fallback below only guards the TS type against the
+  // protocol-level optionality; it does not represent an expected runtime
+  // value — an unexpectedly empty string here would surface as a failing
+  // assertion in `write-set-audit-helper.spec.ts` rather than a silent gap.
+  function storageOrigin(storageId: { securityOrigin?: string }): string {
+    return storageId.securityOrigin ?? ''
+  }
+  function storageKeyOf(storageId: { storageKey?: string }): string {
+    return storageId.storageKey ?? ''
+  }
+
   client.on('DOMStorage.domStorageItemAdded', (event) => {
     if (!event.storageId.isLocalStorage) return
     if (event.key === FLUSH_MARKER_KEY) return
-    record('setItem', event.key)
+    record('setItem', event.key, storageOrigin(event.storageId), storageKeyOf(event.storageId))
   })
   client.on('DOMStorage.domStorageItemUpdated', (event) => {
     if (!event.storageId.isLocalStorage) return
     if (event.key === FLUSH_MARKER_KEY) return
-    record('setItem', event.key)
+    record('setItem', event.key, storageOrigin(event.storageId), storageKeyOf(event.storageId))
   })
   client.on('DOMStorage.domStorageItemRemoved', (event) => {
     if (!event.storageId.isLocalStorage) return
@@ -165,10 +211,12 @@ export async function attachWriteSetAudit(
       waiter?.()
       return
     }
-    record('removeItem', event.key)
+    record('removeItem', event.key, storageOrigin(event.storageId), storageKeyOf(event.storageId))
   })
   client.on('DOMStorage.domStorageItemsCleared', (event) => {
-    if (event.storageId.isLocalStorage) record('clear', null)
+    if (event.storageId.isLocalStorage) {
+      record('clear', null, storageOrigin(event.storageId), storageKeyOf(event.storageId))
+    }
   })
 
   // OWNER REQUEST_CHANGES repair (PR #1989 review, issuecomment-5179331591,
