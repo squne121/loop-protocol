@@ -124,14 +124,16 @@ unknown kind（上記以外）は routing が確定しないため、実行せ�
 ```yaml
 IMPLEMENTATION_WORKER_RESULT_V2:
   status: ok | failed | blocked | permission_blocked
-  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted | transport_error | unknown_http_status
+  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | primary_rate_limit | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted | unexpected_head_change | transport_error | unknown_http_status
   # reason_code は update_branch エラー時の fail-closed 分類を表す:
   #   expected_head_sha_missing:        expected_head_sha 未指定
   #   expected_head_sha_mismatch:       preflight または 422 で head SHA mismatch
-  #   secondary_rate_limit:             403 / 429 / 422 の rate limit 系
+  #   primary_rate_limit:               403 / 429 で x-ratelimit-remaining: 0（一次レート制限。#1429 iteration-1 で secondary と分離）
+  #   secondary_rate_limit:             403 / 429 / 422 の abuse-detection / secondary rate limit メッセージ系
   #   validation_failed:                その他の 422
   #   permission_denied:                403
   #   head_unchanged_after_accepted:    202 Accepted 後も bounded poll で head 不変
+  #   unexpected_head_change:           202 Accepted 後 head は変化したが expected_head_sha / base SHA の祖先関係を検証できず fail-closed（#1429 iteration-1 P1-2）
   #   transport_error:                  HTTP status 抽出不能 / gh transport error
   #   unknown_http_status:              上記以外の HTTP status
   #   null:                       エラーなし（status: ok）
@@ -195,6 +197,8 @@ PR ブランチを base branch の最新 HEAD まで更新する mode。`.claude
 
 `expected_head_sha` が未指定の場合は実行しない（`status: blocked` を返す）。
 stale verdict（SHA mismatch）による誤更新を防ぐための race guard。
+
+`update_branch.py` の `--caller` は既知ラベルの typo 検知のみに用いる（`KNOWN_CALLER_LABELS`）。呼び出し元プロセス／identity を独立検証する authorization・provenance 機構ではない（#1429 iteration-1 P2）。
 
 ### HTTP ステータス別分岐
 

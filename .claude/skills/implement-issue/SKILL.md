@@ -279,10 +279,11 @@ UPDATE_BRANCH_REQUEST_V1:
 ```yaml
 UPDATE_BRANCH_RESULT_V1:
   status: ok | failed | blocked | permission_blocked
-  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | permission_denied | secondary_rate_limit | validation_failed | head_unchanged_after_accepted | transport_error | unknown_http_status
+  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | permission_denied | primary_rate_limit | secondary_rate_limit | validation_failed | head_unchanged_after_accepted | unexpected_head_change | transport_error | unknown_http_status
   update_method: merge_only  # リクエストの update_method を echo（検証用）
   http_status: 202 | 403 | 422 | 429 | <other>
   before_head_sha: <sha>
+  before_base_sha: <sha | null>  # 202 受理直後に取得した base ブランチ head（postcondition の祖先関係検証用、#1429 iteration-1）
   after_head_sha: <sha>
   new_head_sha: <sha>    # 202 + poll 成功時のみ（head 更新後の headRefOid）
   poll_attempts: <int>
@@ -297,13 +298,17 @@ UPDATE_BRANCH_RESULT_V1:
     fork_pr: true | false
     maintainer_can_modify: true | false
     required_permissions: <string>
-  rate_limit_diagnostics:  # secondary_rate_limit 時のみ
+  rate_limit_diagnostics:  # primary_rate_limit / secondary_rate_limit 時のみ
     retry_after_seconds: <int | null>
     x_ratelimit_remaining: <int | null>
     x_ratelimit_reset: <epoch | null>
   error_body: <string>   # 分類根拠の body
   errors: []
 ```
+
+`reason_code: unexpected_head_change` は、202 Accepted 後の poll で headRefOid が変化したものの、`expected_head_sha` および `before_base_sha` の祖先関係（GitHub compare API 経由）を検証できなかった場合に返す（malformed SHA、無関係な commit、concurrent force-push 等）。この場合 `status: blocked` とし `rerun_required.verification` / `rerun_required.pr_review` をいずれも `true` にする（#1429 iteration-1 P1-2 — 従来は headRefOid が単に `expected_head_sha` と異なるという理由のみで `status: ok` を返しており、この postcondition 検証が欠落していた）。
+
+`primary_rate_limit` は `x-ratelimit-remaining: 0` ヘッダで判定する一次 REST レート制限、`secondary_rate_limit` は abuse-detection / secondary rate limit メッセージ本文で判定する二次レート制限であり、両者は互いに独立した reason_code として区別する（#1429 iteration-1 P2 — 従来は本文中の汎用 `"rate limit"` 文字列一致のみで一次レート制限応答も `secondary_rate_limit` に誤分類しうる状態だった）。
 
 ### 呼び出し形式
 
@@ -326,8 +331,10 @@ uv run --locked python3 \
 - `pr_number > 0`
 - `repo == squne121/loop-protocol`（canonical repository binding）
 - `expected_head_sha` が完全長 hexadecimal commit SHA（非空の場合）
-- `caller` が既知の production caller allowlist（`impl-review-loop.step-5` 等）に含まれる
+- `caller` が既知の caller ラベル一覧（`KNOWN_CALLER_LABELS`。`impl-review-loop.step-5` 等）に含まれる
 - `update_method == merge_only`
+
+`caller` チェックは既知ラベルの typo 検知に過ぎず、呼び出し元プロセス／identity を独立検証する authorization・provenance 機構ではない（#1429 iteration-1 P2）。
 
 GitHub の branch 更新 REST エンドポイントへの raw `gh api` 直接呼び出し、および `gh` の branch 更新用サブコマンドは、`update_branch.py` の wrapper 内部実装としてのみ使用され、production caller が直接実行することはない。
 
@@ -341,7 +348,8 @@ GitHub の branch 更新 REST エンドポイントへの raw `gh api` 直接呼
 
 update が受け付けられた。headRefOid が `EXPECTED_HEAD_SHA` から変化するまで poll する（bounded retry: 5 秒 × 最大 12 回。この既定値は production invocation では caller から緩和できない固定値 — `PRODUCTION_POLL_MAX` / `PRODUCTION_POLL_INTERVAL`）。
 
-- poll 中に headRefOid が変化 → `UPDATE_BRANCH_RESULT_V1.status: ok`、`new_head_sha: <新 headRefOid>` を記録
+- poll 中に headRefOid が変化し、かつ `expected_head_sha` と `before_base_sha`（poll 開始直前に取得した base ブランチ head）の両方が新 headRefOid の祖先であることを GitHub compare API で検証できた場合 → `UPDATE_BRANCH_RESULT_V1.status: ok`、`new_head_sha: <新 headRefOid>` を記録
+- poll 中に headRefOid が変化したが、上記祖先関係を検証できなかった場合（malformed SHA、無関係な commit、concurrent force-push 等）→ `status: blocked` / `reason_code: unexpected_head_change`（fail-closed。「headRefOid が単に変化した」だけでは `ok` としない）
 - bounded retry 上限到達まで変化なし → `status: failed` / `reason_code: head_unchanged_after_accepted`
 
 **403 Forbidden（権限拒否）:**
@@ -355,8 +363,12 @@ body 内容で分類する（422 全体を `expected_head_sha` mismatch とは�
 | body の内容 | status |
 |---|---|
 | `expected_head_sha` mismatch | `expected_head_sha_mismatch` — Step 4 re-review 後 Step 5 再実行 |
-| secondary rate limit | `secondary_rate_limit` — fail-closed。header 由来の diagnostics を返して再実行判断を人間へ委譲 |
+| abuse-detection / secondary rate limit メッセージ | `secondary_rate_limit` — fail-closed。header 由来の diagnostics を返して再実行判断を人間へ委譲 |
 | その他 validation failure | `validation_failed` |
+
+**403 / 429（一次・二次レート制限の区別）:**
+
+403・429 応答は `x-ratelimit-remaining: 0` ヘッダを一次レート制限（`reason_code: primary_rate_limit`）の判定に使う。abuse-detection / secondary rate limit のメッセージ本文一致は二次レート制限（`reason_code: secondary_rate_limit`）として別に分類する。汎用的な `"rate limit"` 文字列一致のみでの判定は行わない（#1429 iteration-1 P2 — 一次レート制限応答の誤分類を避けるため）。
 
 ### Bash 許可例外
 
