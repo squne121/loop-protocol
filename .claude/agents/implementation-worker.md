@@ -11,7 +11,8 @@ tools:
   - MultiEdit
 # Bash 制約: pnpm typecheck / lint / test / build と
 # .claude/skills/*/scripts/ 配下のスクリプト実行に限定。
-# 例外: gh api -X PUT repos/{owner}/{repo}/pulls/{pull_number}/update-branch（update_branch contract 実行 — #453）
+# 例外: uv run --locked python3 .claude/skills/implement-issue/scripts/update_branch.py
+#       （update_branch contract の canonical invocation。raw gh api 直接実行は許可しない — #1429）
 # git push / gh pr create は open-pr skill 経由のみ。
 # 新規 SubAgent ファイル（.claude/agents/*.md）の追加は禁止 — PR repair 機能を新 SubAgent として分離してはならない。
 model: sonnet
@@ -123,14 +124,16 @@ unknown kind（上記以外）は routing が確定しないため、実行せ�
 ```yaml
 IMPLEMENTATION_WORKER_RESULT_V2:
   status: ok | failed | blocked | permission_blocked
-  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted | transport_error | unknown_http_status
+  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | primary_rate_limit | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted | unexpected_head_change | transport_error | unknown_http_status
   # reason_code は update_branch エラー時の fail-closed 分類を表す:
   #   expected_head_sha_missing:        expected_head_sha 未指定
   #   expected_head_sha_mismatch:       preflight または 422 で head SHA mismatch
-  #   secondary_rate_limit:             403 / 429 / 422 の rate limit 系
+  #   primary_rate_limit:               403 / 429 で x-ratelimit-remaining: 0（一次レート制限。#1429 iteration-1 で secondary と分離）
+  #   secondary_rate_limit:             403 / 429 / 422 の abuse-detection / secondary rate limit メッセージ系
   #   validation_failed:                その他の 422
   #   permission_denied:                403
   #   head_unchanged_after_accepted:    202 Accepted 後も bounded poll で head 不変
+  #   unexpected_head_change:           202 Accepted 後 head は変化したが expected_head_sha / base SHA の祖先関係を検証できず fail-closed（#1429 iteration-1 P1-2）
   #   transport_error:                  HTTP status 抽出不能 / gh transport error
   #   unknown_http_status:              上記以外の HTTP status
   #   null:                       エラーなし（status: ok）
@@ -188,12 +191,14 @@ validator が fail を返した場合（`update_pr.py` が exit 1）、PR body �
 
 ## update_branch mode（ブランチ更新モード）
 
-PR ブランチを base branch の最新 HEAD まで更新する mode。GitHub REST API `PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch` を使用する（`UPDATE_BRANCH_REQUEST_V1` contract 参照）。
+PR ブランチを base branch の最新 HEAD まで更新する mode。`.claude/skills/implement-issue/scripts/update_branch.py` の canonical invocation 経由で GitHub REST の branch 更新エンドポイントを呼び出す（`UPDATE_BRANCH_REQUEST_V1` contract 参照。エンドポイント詳細は `implement-issue` SKILL.md の `## update_branch Contract` を参照）。
 
 ### expected_head_sha 必須
 
 `expected_head_sha` が未指定の場合は実行しない（`status: blocked` を返す）。
 stale verdict（SHA mismatch）による誤更新を防ぐための race guard。
+
+`update_branch.py` の `--caller` は既知ラベルの typo 検知のみに用いる（`KNOWN_CALLER_LABELS`）。呼び出し元プロセス／identity を独立検証する authorization・provenance 機構ではない（#1429 iteration-1 P2）。
 
 ### HTTP ステータス別分岐
 
