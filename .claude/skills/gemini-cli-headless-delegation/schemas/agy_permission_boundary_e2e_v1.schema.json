@@ -47,7 +47,8 @@
           "enum": [
             0,
             1,
-            77
+            77,
+            78
           ]
         },
         "actual_agy_executed": {
@@ -72,7 +73,8 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "realpath",
+            "realpath_class",
+            "realpath_digest",
             "sha256",
             "size",
             "mtime_ns",
@@ -80,11 +82,20 @@
             "arch"
           ],
           "properties": {
-            "realpath": {
+            "realpath_class": {
+              "description": "Issue #1979 fix_delta (P1-3): a generalized/classified form of the resolved binary path (e.g. `$HOME/.local/bin/agy` or just the basename) -- never the raw absolute realpath, so the artifact never discloses the host username/home layout.",
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "realpath_digest": {
+              "description": "Issue #1979 fix_delta (P1-3): a hash of the actual raw realpath, enabling exact-match/drift comparison without disclosing the path itself.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^sha256:[0-9a-f]{64}$"
             },
             "sha256": {
               "type": [
@@ -320,6 +331,25 @@
         "evidence_source": {
           "type": "string",
           "minLength": 1
+        },
+        "preflight_status": {
+          "description": "Issue #1979 fix_delta (P0-2): additive, optional. The original static bootstrap-preflight `status` (e.g. `inconclusive`), preserved unchanged when `status` is later promoted after a genuine live-run observation, so the two are never conflated.",
+          "enum": [
+            "supported",
+            "unsupported",
+            "unavailable",
+            "inconclusive",
+            "evidence_invalid"
+          ]
+        },
+        "observed_status": {
+          "description": "Issue #1979 fix_delta (P0-2): additive, optional. Present only when a live run reached genuine completion (all capabilities prompt-compliant, allow/deny judged correctly) -- always `supported` when present.",
+          "const": "supported"
+        },
+        "observation_digest": {
+          "description": "Issue #1979 fix_delta (P0-2): additive, optional. A digest binding the `observed_status` promotion to this run's actual attempt evidence.",
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
         }
       }
     },
@@ -381,6 +411,34 @@
         },
         "bound": {
           "type": "boolean"
+        }
+      }
+    },
+    "attempt_method": {
+      "description": "Issue #1979 AC6/AC8: additive, optional. Fixed value -- the only tool-call-elicitation method this runner implements for live mode.",
+      "enum": [
+        "ephemeral_message_prompt"
+      ]
+    },
+    "prompt_compliance": {
+      "description": "Issue #1979 AC6/AC8: additive, optional. Per-capability ephemeralMessage bounded-retry compliance record. Empty for hermetic mode / non-live non-completion paths that never attempted ephemeralMessage injection.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempts",
+          "compliant"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3
+          },
+          "compliant": {
+            "type": "boolean"
+          }
         }
       }
     }
@@ -454,6 +512,31 @@
             "allow",
             "deny"
           ]
+        },
+        "deny_post_tool_use_characterization": {
+          "description": "Issue #1979: additive, optional. Present when this attempt has been observed by `_attempts_from_parent_observation` -- characterizes a deny-expectation attempt's PostToolUse activity (if any) rather than treating any PostToolUse occurrence on deny as a fixed mismatch. `applicable` is false for allow-expectation attempts (vacuous default values).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "applicable",
+            "observed",
+            "correlated",
+            "secret_scan_passed"
+          ],
+          "properties": {
+            "applicable": {
+              "type": "boolean"
+            },
+            "observed": {
+              "type": "boolean"
+            },
+            "correlated": {
+              "type": "boolean"
+            },
+            "secret_scan_passed": {
+              "type": "boolean"
+            }
+          }
         },
         "predicates": {
           "type": "object",

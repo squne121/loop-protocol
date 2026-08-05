@@ -1,4 +1,4 @@
-"""Issue #1979 AC2: live runner binds to preflight_agy.py's bootstrap gate."""
+"""Issue #1979 AC2/AC8: live runner binds to preflight_agy.py's bootstrap gate."""
 # ruff: noqa: E501
 
 from __future__ import annotations
@@ -23,16 +23,20 @@ def _fake_agy(path: Path) -> None:
     path.chmod(0o755)
 
 
-def test_bootstrap_capability_gate_reflects_hardcoded_upstream_728_block() -> None:
-    """As of Issue #1979, upstream #728 keeps the bootstrap predicate
-    hardcoded `unsupported` in preflight_agy.py -- the runner's gate function
-    must faithfully reflect that (hermetic fake, no real `agy` invoked).
+def test_bootstrap_capability_gate_binds_to_the_ephemeral_message_predicate() -> None:
+    """Issue #1979 (2026-08-04 revision): the runner's gate function binds to
+    `pre_invocation_ephemeral_message_injection`, not the toolCall-only
+    `pre_invocation_injected_tool_call` predicate -- real (hermetic-fake, no
+    real `agy` invoked) production evidence, not a monkeypatch.
     """
     gate = MODULE._bootstrap_capability_gate()
-    assert gate["bootstrap_predicate"] == "pre_invocation_injected_tool_call"
+    assert gate["bootstrap_predicate"] == "pre_invocation_ephemeral_message_injection"
     assert gate["predicate_kind"] == "bootstrap_prerequisite"
-    assert gate["status"] == "unsupported"
-    assert gate["reason_code"] == "upstream_known_runtime_rejection"
+    # Unlike the old toolCall-bound predicate, this one is never hardcoded
+    # `unsupported` by the still-open upstream #728 -- it falls through to
+    # the generic deferred-to-live-run branch.
+    assert gate["status"] != "unsupported"
+    assert gate["reason_code"] != "upstream_known_runtime_rejection"
 
 
 def test_live_allow_live_never_invokes_agy_when_bootstrap_predicate_unsupported(
@@ -41,6 +45,17 @@ def test_live_allow_live_never_invokes_agy_when_bootstrap_predicate_unsupported(
     fake = tmp_path / "agy"
     _fake_agy(fake)
     monkeypatch.setattr(MODULE.shutil, "which", lambda _name: str(fake))
+
+    def _unsupported_gate() -> dict[str, object]:
+        return {
+            "bootstrap_predicate": "pre_invocation_ephemeral_message_injection",
+            "predicate_kind": "bootstrap_prerequisite",
+            "status": "unsupported",
+            "reason_code": "hermetic_test_override_unsupported",
+            "evidence_source": "runtime_semantic_observation",
+        }
+
+    monkeypatch.setattr(MODULE, "_bootstrap_capability_gate", _unsupported_gate)
     monkeypatch.setattr(
         MODULE,
         "_invoke",
@@ -54,7 +69,7 @@ def test_live_allow_live_never_invokes_agy_when_bootstrap_predicate_unsupported(
     assert exit_code == MODULE.EXIT_UNAVAILABLE
     assert artifact["runner"]["actual_agy_executed"] is False
     assert artifact["capability_gate"]["status"] == "unsupported"
-    assert artifact["capability_gate"]["bootstrap_predicate"] == "pre_invocation_injected_tool_call"
+    assert artifact["capability_gate"]["bootstrap_predicate"] == "pre_invocation_ephemeral_message_injection"
     assert artifact["failure_taxonomy"]["class"] == MODULE.FAILURE_UNAVAILABLE
     assert MODULE.validate_artifact(artifact) == (True, "valid")
 
@@ -69,7 +84,7 @@ def test_live_proceeds_past_gate_when_bootstrap_predicate_supported(
 
     def _supported_gate() -> dict[str, object]:
         return {
-            "bootstrap_predicate": "pre_invocation_injected_tool_call",
+            "bootstrap_predicate": "pre_invocation_ephemeral_message_injection",
             "predicate_kind": "bootstrap_prerequisite",
             "status": "supported",
             "reason_code": "hermetic_test_override",
@@ -132,28 +147,20 @@ def test_probe_agy_version_result_is_genuinely_invalid_not_a_disguised_stub_when
     assert result == {"status": "version_evidence_invalid", "version": None, "core": None, "raw": None}
 
 
-def test_bootstrap_predicate_transitions_via_production_code_once_upstream_flag_clears(
+def test_bootstrap_predicate_is_inconclusive_by_default_pending_a_live_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Issue #1979 fix_delta blocker_2 (documented, NOT fully resolved
-    circularity): flipping `preflight_agy.py`'s
-    `UPSTREAM_ANTIGRAVITY_CLI_728_OPEN` to `False` -- exactly what happens
-    once upstream #728 is fixed -- routes `pre_invocation_injected_tool_call`
-    through `_resolve_predicate`'s real fallback branch, which is proven here
-    to genuinely change the observed status (from `unsupported` to
-    `inconclusive`) through production code, not a monkeypatch of the gate's
-    return value.  It is NOT `supported`: reaching `supported` still requires
-    a bounded real observation this fix delta does not implement (see the
-    `_bootstrap_capability_gate` docstring) -- this test documents that
-    honestly rather than fabricating a `supported` result the current
-    production code cannot actually produce.
+    """Issue #1979 (2026-08-04 revision): `pre_invocation_ephemeral_message_injection`
+    has no hardcoded-unsupported branch tied to upstream #728 (that branch
+    only applies to `pre_invocation_injected_tool_call`), so real production
+    code (no monkeypatch of the gate's return value) resolves it via
+    `_resolve_predicate`'s generic deferred branch: `inconclusive` /
+    `runtime_semantic_observation_deferred_to_1979`.  It is NOT `supported`:
+    reaching `supported` requires an actual live ephemeralMessage-compliance
+    observation, which is exactly what `_resolve_prompt_compliance` performs
+    during a genuine live run (AC8), not what this bootstrap gate claims in
+    advance.
     """
-    # `_load_preflight_module` re-execs a fresh module instance on every
-    # call, so the flag must be patched on the exact instance
-    # `_bootstrap_capability_gate` will subsequently load -- memoize it here.
-    preflight = MODULE._load_preflight_module()
-    monkeypatch.setattr(preflight, "UPSTREAM_ANTIGRAVITY_CLI_728_OPEN", False)
-    monkeypatch.setattr(MODULE, "_load_preflight_module", lambda: preflight)
     monkeypatch.setattr(MODULE.shutil, "which", lambda _name: None)
 
     gate = MODULE._bootstrap_capability_gate()

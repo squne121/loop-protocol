@@ -78,7 +78,7 @@ def test_hooks_capability_matrix_splits_into_predicates():
     expected = {
         "workspace_hooks_config_loaded",
         "pre_invocation_hook_dispatch",
-        "pre_invocation_ephemeral_message",
+        "pre_invocation_ephemeral_message_injection",
         "pre_invocation_injected_tool_call",
         "pre_tool_use_verdict",
         "post_tool_use_dispatch",
@@ -108,6 +108,23 @@ def test_pre_invocation_injected_tool_call_unsupported_while_upstream_728_open()
     predicate_result = matrix["hooks"]["pre_invocation_injected_tool_call"]
     assert predicate_result["status"] == "unsupported"
     assert predicate_result["reason_code"] == "upstream_known_runtime_rejection"
+
+
+def test_pre_invocation_ephemeral_message_injection_is_never_hardcoded_unsupported():
+    """Issue #1979: unlike `pre_invocation_injected_tool_call`, this predicate
+    is NOT tied to upstream #728 (which only breaks toolCall injectSteps) --
+    it must never resolve `unsupported` for the `upstream_known_runtime_rejection`
+    reason. It resolves `inconclusive` via the generic deferred-to-live-run
+    branch instead (no hardcoded claim of `supported` without evidence)."""
+    module = load_module()
+    assert module.UPSTREAM_ANTIGRAVITY_CLI_728_OPEN is True
+
+    matrix = module.build_capability_matrix(
+        version_result={"status": "parsed", "version": "1.1.9", "core": (1, 1, 9), "raw": "agy 1.1.9"},
+    )
+    predicate_result = matrix["hooks"]["pre_invocation_ephemeral_message_injection"]
+    assert predicate_result["status"] != "unsupported"
+    assert predicate_result["reason_code"] != "upstream_known_runtime_rejection"
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +373,8 @@ def test_binary_identity_drift_between_version_and_runtime_is_detected():
     identity observed after probes, every predicate becomes `evidence_invalid`."""
     module = load_module()
     before = {
-        "realpath": "/usr/local/bin/agy",
+        "realpath_class": "agy",
+        "realpath_digest": "sha256:" + "c" * 64,
         "sha256": "a" * 64,
         "size": 1000,
         "mtime_ns": 123,
@@ -510,7 +528,8 @@ def test_capability_probe_memoized_within_process_only():
     module._CAPABILITY_MEMO_CACHE.clear()
 
     binary_identity = {
-        "realpath": "/usr/local/bin/agy",
+        "realpath_class": "agy",
+        "realpath_digest": "sha256:" + "c" * 64,
         "sha256": "c" * 64,
         "size": 42,
         "mtime_ns": 1,
@@ -549,7 +568,8 @@ def test_capability_probe_cache_bypassed_when_pre_run_and_pre_probe_identity_dif
     module._CAPABILITY_MEMO_CACHE.clear()
 
     identity_a = {
-        "realpath": "/usr/local/bin/agy",
+        "realpath_class": "agy",
+        "realpath_digest": "sha256:" + "c" * 64,
         "sha256": "a" * 64,
         "size": 42,
         "mtime_ns": 1,
