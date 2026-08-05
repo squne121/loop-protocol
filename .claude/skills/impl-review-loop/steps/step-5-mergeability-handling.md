@@ -104,8 +104,11 @@ expected_head_sha: <reviewed_head_sha>
      caller: impl-review-loop.step-5
    ```
 
-2. `implementation-worker` に `UPDATE_BRANCH_REQUEST_V1` を渡して委譲する。
-   実行手順（`gh api -i -X PUT`、202 poll loop、422/403 分岐）は `implement-issue` SKILL.md の `## update_branch Contract` セクションを参照。
+2. `implementation-worker` に `UPDATE_BRANCH_REQUEST_V1` を渡して委譲する。`implementation-worker` は
+   `.claude/skills/implement-issue/scripts/update_branch.py` の canonical invocation を実行する
+   worker 実行経路である。REST 呼び出し・202 poll・403 / 422 分岐は `update_branch.py` wrapper 内部の
+   責務であり、orchestrator は `UPDATE_BRANCH_RESULT_V1` のみを消費する。詳細は `implement-issue`
+   SKILL.md の `## update_branch Contract` セクションを参照。
 
 3. `UPDATE_BRANCH_RESULT_V1` を受け取り、`status` で分岐する:
 
