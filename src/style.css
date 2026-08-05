@@ -69,18 +69,17 @@ button:focus-visible {
   padding: 24px;
 }
 
+/* Issue #1377: the legacy right-hand command rail column is removed. The
+ * app shell is a single-column, stage-centered layout unconditionally now
+ * (previously toggled via a JS-set `data-battle-layout='overlay-hud'`
+ * attribute while the rail placeholder still existed). */
 .app-shell {
-  width: min(1320px, 100%);
+  width: min(1480px, 100%);
   margin: 0 auto;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 24px;
   align-items: start;
-}
-
-.app-shell[data-battle-layout='overlay-hud'] {
-  width: min(1480px, 100%);
-  grid-template-columns: minmax(0, 1fr);
 }
 
 .battle-stage,
@@ -329,16 +328,6 @@ button:focus-visible {
  * than the UA stylesheet's `[hidden] { display: none }` and must be
  * restated here explicitly. */
 .legacy-debrief-surface[hidden] {
-  display: none;
-}
-
-.command-rail {
-  display: grid;
-  gap: 16px;
-}
-
-.command-rail[hidden],
-.command-rail[data-battle-placeholder='true'] {
   display: none;
 }
 

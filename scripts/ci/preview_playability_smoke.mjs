@@ -97,35 +97,49 @@ async function captureFailureScreenshot(page, outputPath) {
 async function collectLayoutEvidence(frame) {
   return frame.evaluate(() => {
     const appShell = globalThis.document.querySelector('.app-shell')
-    const commandRail = globalThis.document.querySelector('aside.command-rail')
-    if (
-      !(appShell instanceof globalThis.HTMLElement) ||
-      !(commandRail instanceof globalThis.HTMLElement)
-    ) {
+    if (!(appShell instanceof globalThis.HTMLElement)) {
       throw new Error('Required overlay layout elements are missing.')
     }
 
     const shellStyle = globalThis.window.getComputedStyle(appShell)
-    const railStyle = globalThis.window.getComputedStyle(commandRail)
 
     return {
-      battleLayout: appShell.getAttribute('data-battle-layout'),
       gridTemplateColumns: shellStyle.gridTemplateColumns,
       gridTemplateColumnCount: shellStyle.gridTemplateColumns
         .trim()
         .split(/\s+/)
         .filter(Boolean).length,
-      commandRailHiddenAttribute: commandRail.hasAttribute('hidden'),
-      commandRailAriaHidden: commandRail.getAttribute('aria-hidden'),
-      commandRailDisplay: railStyle.display,
-      commandRailVisibility: railStyle.visibility,
-      commandRailPointerEvents: railStyle.pointerEvents,
-      commandRailWidth: Math.round(commandRail.getBoundingClientRect().width),
-      interactiveDescendantCount: commandRail.querySelectorAll(
-        'button, a, input, select, textarea, [data-action], [data-battle-interactive="true"]',
-      ).length,
+      // Issue #1377: the legacy `.command-rail` element is removed entirely
+      // -- its absence from the DOM is the required-element check now,
+      // replacing the previous width/visibility/interactive-descendant
+      // assertions against a placeholder rail that no longer exists.
+      commandRailPresent: globalThis.document.querySelector('aside.command-rail') !== null,
     }
   })
+}
+
+// PR #1998 review (owner, MINOR): browser zoom is a *declared* value (this
+// automated check never adjusts zoom), not a genuinely measured one like
+// userAgent / devicePixelRatio / timeZone below -- so it is structured
+// separately, distinguishing its value from its provenance instead of being
+// a flat string indistinguishable from a real measurement.
+const DECLARED_BROWSER_ZOOM = {
+  value: 1,
+  source: 'declared',
+  enforcement: 'no zoom override configured',
+}
+
+async function collectRuntimeEnvironment(page) {
+  const evaluated = await page.evaluate(() => ({
+    userAgent: globalThis.navigator.userAgent,
+    devicePixelRatio: globalThis.window.devicePixelRatio,
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  }))
+
+  return {
+    ...evaluated,
+    browserZoom: DECLARED_BROWSER_ZOOM,
+  }
 }
 
 async function runPlayabilityFlow(page, frame, timeoutMs) {
@@ -276,15 +290,12 @@ async function runScenario(browser, options, mode, viewport) {
     const layout = await poll(
       `${mode} overlay layout evidence`,
       async () => collectLayoutEvidence(frame),
-      (value) =>
-        value.battleLayout === 'overlay-hud' &&
-        value.gridTemplateColumnCount === 1 &&
-        value.interactiveDescendantCount === 0 &&
-        (value.commandRailHiddenAttribute === true || value.commandRailWidth === 0),
+      (value) => value.gridTemplateColumnCount === 1 && value.commandRailPresent === false,
       options.timeoutMs,
     )
 
     const playability = await runPlayabilityFlow(page, frame, options.timeoutMs)
+    const runtimeEnvironment = await collectRuntimeEnvironment(page)
     await page.screenshot({ path: screenshotPath, fullPage: true })
 
     return {
@@ -295,6 +306,7 @@ async function runScenario(browser, options, mode, viewport) {
       failure_screenshot: null,
       layout,
       playability,
+      runtime_environment: runtimeEnvironment,
       console_messages: consoleMessages,
       page_errors: pageErrors,
     }
