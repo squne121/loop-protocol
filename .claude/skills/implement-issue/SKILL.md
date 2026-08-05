@@ -307,68 +307,46 @@ UPDATE_BRANCH_RESULT_V1:
 
 ### 呼び出し形式
 
+production caller（`implementation-worker` を含む）は、raw `gh api` を直接実行せず、次の canonical `update_branch.py` invocation のみを使用する。
+
 ```bash
-set -euo pipefail
-
-REPO=$(git remote get-url origin | sed 's/.*github.com[:/]//' | sed 's/\.git$//')
-PR_NUMBER=<番号>
-EXPECTED_HEAD_SHA=<reviewed_head_sha>
-
-# gh api -i でヘッダと body を切り分ける
-# 出力形式: HTTP/X.X <status> <reason>\n<headers>\n\n<body>
-UPDATE_RESPONSE=$(gh api -i -X PUT "repos/$REPO/pulls/$PR_NUMBER/update-branch" \
-  -H "Accept: application/vnd.github+json" \
-  -H "X-GitHub-Api-Version: 2022-11-28" \
-  -f expected_head_sha="$EXPECTED_HEAD_SHA" 2>&1 || true)
-
-# HTTP status 行を抽出
-HTTP_STATUS=$(echo "$UPDATE_RESPONSE" | head -n1 | grep -oE '[0-9]{3}' | head -n1)
-# body 部分（空行以降）を抽出
-RESPONSE_BODY=$(echo "$UPDATE_RESPONSE" | awk '/^\r?$/{found=1; next} found{print}')
+uv run --locked python3 \
+  .claude/skills/implement-issue/scripts/update_branch.py \
+  --pr-number <pull-request-number> \
+  --repo squne121/loop-protocol \
+  --expected-head-sha <reviewed-head-sha> \
+  --caller impl-review-loop.step-5 \
+  --update-method merge_only
 ```
 
-`gh pr update-branch` は使用しない（`expected_head_sha` オプションがないため）。
+`update_branch.py` は `UPDATE_BRANCH_REQUEST_V1` の各フィールドを上記 CLI 引数へそのままマッピングし、標準出力へ `UPDATE_BRANCH_RESULT_V1` 相当の JSON を出力する（exit code は `status == ok` で 0、それ以外で 1）。
+
+`update_branch.py` は API 呼び出し前に次を自己検証し、違反時は GitHub API を呼ばず `reason_code: validation_failed`（またはその他の対応する reason_code）を返す:
+
+- `pr_number > 0`
+- `repo == squne121/loop-protocol`（canonical repository binding）
+- `expected_head_sha` が完全長 hexadecimal commit SHA（非空の場合）
+- `caller` が既知の production caller allowlist（`impl-review-loop.step-5` 等）に含まれる
+- `update_method == merge_only`
+
+GitHub の branch 更新 REST エンドポイントへの raw `gh api` 直接呼び出し、および `gh` の branch 更新用サブコマンドは、`update_branch.py` の wrapper 内部実装としてのみ使用され、production caller が直接実行することはない。
 
 本 contract は **REST merge update 固定**（`update_method: merge_only`）。linear history またはリベース必須リポジトリは out-of-scope であり、403 / 422 / 429 / transport error は `UPDATE_BRANCH_RESULT_V1` の reason_code に決定論的に正規化する。GraphQL `updatePullRequestBranch` mutation および rebase update は本 contract 対象外（Out of Scope）。
 
-### HTTP ステータス別分岐
+### HTTP ステータス別分岐（wrapper 内部実装の責務）
+
+以下は `update_branch.py` 内部が行う分岐であり、production caller が個別に bash で再実装するものではない。
 
 **202 Accepted（リクエスト受理）:**
 
-update が受け付けられた。headRefOid が `EXPECTED_HEAD_SHA` から変化するまで poll する（bounded retry: 5 秒 × 最大 12 回）:
+update が受け付けられた。headRefOid が `EXPECTED_HEAD_SHA` から変化するまで poll する（bounded retry: 5 秒 × 最大 12 回。この既定値は production invocation では caller から緩和できない固定値 — `PRODUCTION_POLL_MAX` / `PRODUCTION_POLL_INTERVAL`）。
 
-```bash
-POLL_MAX=12
-POLL_INTERVAL=5
-UPDATED=false  # 決定論的フラグ（空文字誤認防止）
-
-for i in $(seq 1 $POLL_MAX); do
-  NEW_HEAD=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
-  if [ -n "$NEW_HEAD" ] && [ "$NEW_HEAD" != "$EXPECTED_HEAD_SHA" ]; then
-    UPDATED=true
-    break
-  fi
-  sleep $POLL_INTERVAL
-done
-```
-
-- `UPDATED=true` → `UPDATE_BRANCH_RESULT_V1.status: ok`、`new_head_sha: $NEW_HEAD` を記録
-- `UPDATED=false`（bounded retry 上限到達）→ `status: failed` / `reason_code: head_unchanged_after_accepted`
+- poll 中に headRefOid が変化 → `UPDATE_BRANCH_RESULT_V1.status: ok`、`new_head_sha: <新 headRefOid>` を記録
+- bounded retry 上限到達まで変化なし → `status: failed` / `reason_code: head_unchanged_after_accepted`
 
 **403 Forbidden（権限拒否）:**
 
-権限不足またはフォーク PR の書き込み制限。以下の `permission_diagnostics` を出力して `status: permission_blocked` / `reason_code: permission_denied` とする:
-
-```bash
-# auth_actor の確認
-gh api user --jq .login
-
-# PR の fork / maintainer_can_modify 確認
-gh pr view "$PR_NUMBER" --json headRepository,maintainerCanModify \
-  --jq '{head_repo: .headRepository.nameWithOwner, maintainer_can_modify: .maintainerCanModify}'
-```
-
-403 時は `UPDATE_BRANCH_RESULT_V1.permission_diagnostics` に auth_actor、head_repo、base_repo、fork_pr、maintainer_can_modify、required_permissions を含めて記録する。`required_permissions` には `pull_requests:write` と `contents:write_on_head_repository_when_github_app` の両方を明記する。
+権限不足またはフォーク PR の書き込み制限。`permission_diagnostics`（auth_actor、head_repo、base_repo、fork_pr、maintainer_can_modify、required_permissions）を出力して `status: permission_blocked` / `reason_code: permission_denied` とする。`required_permissions` には `pull_requests:write` と `contents:write_on_head_repository_when_github_app` の両方を明記する。
 
 **422 Unprocessable Entity（処理不可）:**
 
@@ -382,7 +360,7 @@ body 内容で分類する（422 全体を `expected_head_sha` mismatch とは�
 
 ### Bash 許可例外
 
-`gh api -X PUT repos/{owner}/{repo}/pulls/{pull_number}/update-branch` の実行は `implementation-worker`（`.claude/agents/implementation-worker.md`）に許可された Bash 操作例外に含まれる。
+`implementation-worker`（`.claude/agents/implementation-worker.md`）は `update_branch.py` の canonical invocation（上記「呼び出し形式」）のみを Bash 操作例外として許可される。GitHub の branch 更新 REST エンドポイントへの raw 直接呼び出しを production caller として実行することは許可されない。
 
 ## IMPLEMENTATION_WORKER_REQUEST_V2 対応
 

@@ -11,7 +11,8 @@ tools:
   - MultiEdit
 # Bash 制約: pnpm typecheck / lint / test / build と
 # .claude/skills/*/scripts/ 配下のスクリプト実行に限定。
-# 例外: gh api -X PUT repos/{owner}/{repo}/pulls/{pull_number}/update-branch（update_branch contract 実行 — #453）
+# 例外: uv run --locked python3 .claude/skills/implement-issue/scripts/update_branch.py
+#       （update_branch contract の canonical invocation。raw gh api 直接実行は許可しない — #1429）
 # git push / gh pr create は open-pr skill 経由のみ。
 # 新規 SubAgent ファイル（.claude/agents/*.md）の追加は禁止 — PR repair 機能を新 SubAgent として分離してはならない。
 model: sonnet
@@ -188,7 +189,7 @@ validator が fail を返した場合（`update_pr.py` が exit 1）、PR body �
 
 ## update_branch mode（ブランチ更新モード）
 
-PR ブランチを base branch の最新 HEAD まで更新する mode。GitHub REST API `PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch` を使用する（`UPDATE_BRANCH_REQUEST_V1` contract 参照）。
+PR ブランチを base branch の最新 HEAD まで更新する mode。`.claude/skills/implement-issue/scripts/update_branch.py` の canonical invocation 経由で GitHub REST の branch 更新エンドポイントを呼び出す（`UPDATE_BRANCH_REQUEST_V1` contract 参照。エンドポイント詳細は `implement-issue` SKILL.md の `## update_branch Contract` を参照）。
 
 ### expected_head_sha 必須
 

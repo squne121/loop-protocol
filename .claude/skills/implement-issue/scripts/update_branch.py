@@ -30,6 +30,23 @@ RATE_LIMIT_MARKERS = (
     'abuse detection',
 )
 
+# Canonical repository binding. execute_update_branch() refuses to call the
+# GitHub API for any other repository (input validation, #1429).
+CANONICAL_REPO = 'squne121/loop-protocol'
+
+# Known production callers of update_branch.py (#1429 canonical executor
+# unification). 'manual' covers ad-hoc human-invoked runs from the default
+# branch; every automated production caller must be added explicitly.
+ALLOWED_CALLERS = frozenset({'impl-review-loop.step-5', 'manual'})
+
+# Full-length hexadecimal commit SHA (git SHA-1, 40 hex chars).
+_FULL_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
+
+# Production poll bounds. These are intentionally not exposed as CLI flags
+# so a caller cannot relax them (#1429 AC8).
+PRODUCTION_POLL_MAX = 12
+PRODUCTION_POLL_INTERVAL = 5.0
+
 
 @dataclass(frozen=True)
 class CommandResult:
@@ -65,8 +82,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--expected-head-sha', required=True)
     parser.add_argument('--caller', default='manual')
     parser.add_argument('--update-method', default=UPDATE_METHOD)
-    parser.add_argument('--poll-max', type=int, default=12)
-    parser.add_argument('--poll-interval', type=float, default=5.0)
+    # NOTE: poll count/interval are intentionally NOT exposed as CLI flags.
+    # Production invocation always uses PRODUCTION_POLL_MAX /
+    # PRODUCTION_POLL_INTERVAL so a caller cannot relax the bounded retry
+    # (#1429 AC8). Tests exercise poll bounds directly via
+    # execute_update_branch(poll_max=..., poll_interval=...).
     return parser.parse_args(argv)
 
 
@@ -240,13 +260,34 @@ def _is_secondary_rate_limit(http_status: int | None, body: str) -> bool:
     return any(marker in lowered for marker in RATE_LIMIT_MARKERS)
 
 
+def _validate_request(request: UpdateBranchRequest) -> str | None:
+    """Self-contained input validation, executed before any API call.
+
+    Returns an error message when the request violates the executor
+    contract (#1429), or None when the request passes all boundary checks.
+    Each violation is fail-closed: execute_update_branch() must not call
+    the GitHub API when this returns a non-None message.
+    """
+    if request.pr_number <= 0:
+        return f'pr_number must be a positive integer, got {request.pr_number!r}'
+    if request.repo != CANONICAL_REPO:
+        return f'repo must be {CANONICAL_REPO!r}, got {request.repo!r}'
+    if request.caller not in ALLOWED_CALLERS:
+        allowed = ', '.join(sorted(ALLOWED_CALLERS))
+        return f'caller {request.caller!r} is not in the production caller allowlist ({allowed})'
+    expected_head_sha = request.expected_head_sha.strip()
+    if expected_head_sha and not _FULL_SHA_RE.match(expected_head_sha):
+        return 'expected_head_sha must be a full-length hexadecimal commit SHA'
+    return None
+
+
 def execute_update_branch(
     request: UpdateBranchRequest,
     *,
     gh_runner: GhRunner = run_gh,
     sleep_fn: SleepFn = time.sleep,
-    poll_max: int = 12,
-    poll_interval: float = 5.0,
+    poll_max: int = PRODUCTION_POLL_MAX,
+    poll_interval: float = PRODUCTION_POLL_INTERVAL,
 ) -> dict[str, object]:
     result = _base_result(request)
 
@@ -254,6 +295,13 @@ def execute_update_branch(
         result['reason_code'] = REASON_VALIDATION_FAILED
         result['error_body'] = f'Unsupported update_method={request.update_method!r}; merge_only only.'
         result['errors'].append('update_method must be merge_only')
+        return result
+
+    validation_error = _validate_request(request)
+    if validation_error:
+        result['reason_code'] = REASON_VALIDATION_FAILED
+        result['error_body'] = validation_error
+        result['errors'].append(validation_error)
         return result
 
     expected_head_sha = request.expected_head_sha.strip()
@@ -382,8 +430,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     result = execute_update_branch(
         request,
-        poll_max=args.poll_max,
-        poll_interval=args.poll_interval,
+        poll_max=PRODUCTION_POLL_MAX,
+        poll_interval=PRODUCTION_POLL_INTERVAL,
     )
     json.dump(result, sys.stdout, ensure_ascii=True, indent=2)
     sys.stdout.write('\n')

@@ -51,7 +51,7 @@ class FakeGhRunner:
         raise AssertionError(f'Unexpected gh args: {args}')
 
 
-def request(expected_head_sha: str = 'abc123') -> UpdateBranchRequest:
+def request(expected_head_sha: str = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2') -> UpdateBranchRequest:
     return UpdateBranchRequest(
         pr_number=42,
         repo='squne121/loop-protocol',
@@ -86,23 +86,23 @@ class TestUpdateBranchRestContract:
 
     def test_given_preflight_mismatch_when_execute_then_block_before_rest_call(self):
         runner = FakeGhRunner({
-            'head': [CommandResult(0, 'def456\n')],
+            'head': [CommandResult(0, 'b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3\n')],
         })
 
         result = execute_update_branch(request(), gh_runner=runner)
 
         assert result['status'] == 'blocked'
         assert result['reason_code'] == 'expected_head_sha_mismatch'
-        assert result['before_head_sha'] == 'def456'
+        assert result['before_head_sha'] == 'b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3'
         assert all(call[:4] != ['api', '-i', '-X', 'PUT'] for call in runner.calls)
 
     def test_given_202_and_head_changes_when_execute_then_return_ok_and_rerun_both(self):
         sleeps: list[float] = []
         runner = FakeGhRunner({
             'head': [
-                CommandResult(0, 'abc123\n'),
-                CommandResult(0, 'abc123\n'),
-                CommandResult(0, 'def456\n'),
+                CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n'),
+                CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n'),
+                CommandResult(0, 'b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3\n'),
             ],
             'update': [CommandResult(0, http_response(202, {'message': 'accepted'}))],
         })
@@ -116,9 +116,9 @@ class TestUpdateBranchRestContract:
         )
 
         assert result['status'] == 'ok'
-        assert result['before_head_sha'] == 'abc123'
-        assert result['after_head_sha'] == 'def456'
-        assert result['new_head_sha'] == 'def456'
+        assert result['before_head_sha'] == 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
+        assert result['after_head_sha'] == 'b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3'
+        assert result['new_head_sha'] == 'b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3'
         assert result['rerun_required'] == {
             'verification': True,
             'pr_review': True,
@@ -130,9 +130,9 @@ class TestUpdateBranchRestContract:
         sleeps: list[float] = []
         runner = FakeGhRunner({
             'head': [
-                CommandResult(0, 'abc123\n'),
-                CommandResult(0, 'abc123\n'),
-                CommandResult(0, 'abc123\n'),
+                CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n'),
+                CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n'),
+                CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n'),
             ],
             'update': [CommandResult(0, http_response(202, {'message': 'accepted'}))],
         })
@@ -147,13 +147,13 @@ class TestUpdateBranchRestContract:
 
         assert result['status'] == 'failed'
         assert result['reason_code'] == 'head_unchanged_after_accepted'
-        assert result['after_head_sha'] == 'abc123'
+        assert result['after_head_sha'] == 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
         assert result['poll_attempts'] == 2
         assert sleeps == [0.5]
 
     def test_given_403_permission_denied_when_execute_then_collect_permission_diagnostics(self):
         runner = FakeGhRunner({
-            'head': [CommandResult(0, 'abc123\n')],
+            'head': [CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n')],
             'update': [CommandResult(1, http_response(403, {'message': 'Forbidden'}))],
             'user': [CommandResult(0, 'squne121\n')],
             'permission_view': [
@@ -187,7 +187,7 @@ class TestUpdateBranchRestContract:
     @pytest.mark.parametrize('status', [403, 422, 429])
     def test_given_secondary_rate_limit_when_execute_then_fail_closed_with_header_diagnostics(self, status: int):
         runner = FakeGhRunner({
-            'head': [CommandResult(0, 'abc123\n')],
+            'head': [CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n')],
             'update': [
                 CommandResult(
                     1,
@@ -217,8 +217,8 @@ class TestUpdateBranchRestContract:
     def test_given_422_expected_head_sha_mismatch_when_execute_then_block_and_refetch_current_head(self):
         runner = FakeGhRunner({
             'head': [
-                CommandResult(0, 'abc123\n'),
-                CommandResult(0, 'def456\n'),
+                CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n'),
+                CommandResult(0, 'b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3\n'),
             ],
             'update': [
                 CommandResult(
@@ -232,12 +232,12 @@ class TestUpdateBranchRestContract:
 
         assert result['status'] == 'blocked'
         assert result['reason_code'] == 'expected_head_sha_mismatch'
-        assert result['after_head_sha'] == 'def456'
+        assert result['after_head_sha'] == 'b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3'
 
     def test_given_422_expected_head_sha_mismatch_and_refetch_fails_when_execute_then_keep_after_head_null(self):
         runner = FakeGhRunner({
             'head': [
-                CommandResult(0, 'abc123\n'),
+                CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n'),
                 CommandResult(1, '', 'gh pr view failed'),
             ],
             'update': [
@@ -257,7 +257,7 @@ class TestUpdateBranchRestContract:
 
     def test_given_422_validation_failure_when_execute_then_fail_closed(self):
         runner = FakeGhRunner({
-            'head': [CommandResult(0, 'abc123\n')],
+            'head': [CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n')],
             'update': [CommandResult(1, http_response(422, {'message': 'Validation failed'}))],
         })
 
@@ -268,7 +268,7 @@ class TestUpdateBranchRestContract:
 
     def test_given_transport_error_when_execute_then_return_transport_error(self):
         runner = FakeGhRunner({
-            'head': [CommandResult(0, 'abc123\n')],
+            'head': [CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n')],
             'update': [CommandResult(1, '', 'dial tcp timeout')],
         })
 
@@ -279,7 +279,7 @@ class TestUpdateBranchRestContract:
 
     def test_given_unknown_http_status_when_execute_then_fail_closed(self):
         runner = FakeGhRunner({
-            'head': [CommandResult(0, 'abc123\n')],
+            'head': [CommandResult(0, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n')],
             'update': [CommandResult(1, http_response(500, {'message': 'server error'}))],
         })
 
