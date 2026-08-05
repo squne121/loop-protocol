@@ -726,16 +726,14 @@ test('GIVEN short sortie fixture at review viewport WHEN timeout result THEN ove
 
   const layout = await page.locator('.app-shell').evaluate((shell) => {
     const appShell = shell as HTMLElement
-    const commandRail = appShell.querySelector<HTMLElement>('aside.command-rail')
     const hudLayer = appShell.querySelector<HTMLElement>('.battle-hud-layer')
     const shellStyle = window.getComputedStyle(appShell)
-    const interactiveSelector =
-      'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"]), [data-battle-interactive="true"]'
 
     return {
-      battleLayout: appShell.getAttribute('data-battle-layout'),
-      commandRailInteractiveCount: commandRail?.querySelectorAll(interactiveSelector).length ?? -1,
-      commandRailWidth: commandRail?.getBoundingClientRect().width ?? -1,
+      // Issue #1377: the legacy `.command-rail` aside is removed entirely --
+      // its absence is the required assertion now, replacing the previous
+      // width/interactive-descendant checks against a placeholder rail.
+      commandRailPresent: appShell.querySelector('aside.command-rail') !== null,
       gridTemplateColumns: shellStyle.gridTemplateColumns,
       hudActionCount: hudLayer?.querySelectorAll('button, [data-action]').length ?? -1,
       viewportHeight: window.innerHeight,
@@ -745,10 +743,8 @@ test('GIVEN short sortie fixture at review viewport WHEN timeout result THEN ove
 
   expect(layout.viewportWidth).toBe(1437)
   expect(layout.viewportHeight).toBe(1365)
-  expect(layout.battleLayout).toBe('overlay-hud')
+  expect(layout.commandRailPresent).toBe(false)
   expect(layout.gridTemplateColumns).not.toContain('340px')
-  expect(layout.commandRailWidth).toBe(0)
-  expect(layout.commandRailInteractiveCount).toBe(0)
   expect(layout.hudActionCount).toBeGreaterThan(0)
 })
 

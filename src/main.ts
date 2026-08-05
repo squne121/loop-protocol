@@ -43,7 +43,6 @@ import {
   createPhaseScreenController,
   getUpgradeStatusCopy,
   resolveBattleOverlayElements,
-  syncBattleOverlayPlaceholderRail,
   type HudUpgradeStatusCopy,
   type HudUpgradeViewModel,
 } from './ui'
@@ -491,7 +490,6 @@ if (app) {
         </div>
       </div>
     </section>
-    <aside class="command-rail" aria-label="Command rail"></aside>
   </div>
 `
 }
@@ -502,16 +500,10 @@ if (battleOverlay) {
 }
 
 const canvas = battleOverlay?.canvas ?? null
-const commandRail = battleOverlay?.commandRail ?? null
 const battleHudLayer = battleOverlay?.hudLayer ?? null
 const battleScreenLayer = battleOverlay?.screenLayer ?? null
 
-function syncBattleOverlayLayout(): void {
-  if (!commandRail) return
-  syncBattleOverlayPlaceholderRail({ commandRail })
-}
-
-if ((!canvas || !commandRail || !battleHudLayer || !battleScreenLayer) && !isTestRuntime) {
+if ((!canvas || !battleHudLayer || !battleScreenLayer) && !isTestRuntime) {
   throw new Error('Application shell is incomplete.')
 }
 
@@ -843,7 +835,6 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
         hasLoadableSnapshot = true
       },
       renderHud() {
-        syncBattleOverlayLayout()
         hud?.render(state, productPause.isPaused, activeFixedDeltaMs)
         phaseScreens?.render(state, productPause.isPaused, buildUpgradeView())
       },
@@ -1319,7 +1310,6 @@ function frame(now: number): void {
   }
 
   // AC4: render and HUD continue regardless of pause state
-  syncBattleOverlayLayout()
   hud.render(state, productPause.isPaused, activeFixedDeltaMs)
   phaseScreens?.render(state, productPause.isPaused, buildUpgradeView())
   renderer.render(state)
