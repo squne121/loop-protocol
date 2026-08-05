@@ -92,7 +92,7 @@ denied alias（`.tmp/` `.temp/` `.tmp-*/`）配下は、有効な `temp_residue_
 - root temporary residue の read-only 分類は `scripts/agent-ops/temp_residue_classifier.py`（`temp_residue_classification/v1`）が担う。ownership marker 不明の `.tmp/**` / `.temp/**` / `.tmp-*/**` は report-only とし、classifier 自体は削除を実行しない。実削除 executor は別 scope。
 - deploy/release/preview artifact へ temporary folder を含めたい場合は、この文書と consumer docs を同一 PR で更新し、別 issue で publication rule を明示する。
 
-## Canonical / Deprecated 区別（Issue #1995）
+## 正本と非推奨の区別（Canonical / Deprecated, Issue #1995）
 
 - `tmp/` を新規書き込みの canonical write destination とする。エージェントが新たに session artifact を書き出す場合は `tmp/` を使う。
 - `.claude/tmp/` は非推奨（deprecated）の legacy root である。構造・read/scan/report・`never_delete` safety rule は温存し、新規の書き込み先としては使わない。既存 residue の分類（`temp_residue_classifier.py`）・marker（`temp_residue_marker.py`）・schema（`repo_temp_folder_advice_v1.schema.json`）は本 Issue のスコープでは変更しない。
