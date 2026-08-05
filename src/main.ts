@@ -43,7 +43,6 @@ import {
   createPhaseScreenController,
   getUpgradeStatusCopy,
   resolveBattleOverlayElements,
-  syncBattleOverlayPlaceholderRail,
   type HudUpgradeStatusCopy,
   type HudUpgradeViewModel,
 } from './ui'
@@ -491,7 +490,6 @@ if (app) {
         </div>
       </div>
     </section>
-    <aside class="command-rail" aria-label="Command rail"></aside>
   </div>
 `
 }
@@ -502,16 +500,10 @@ if (battleOverlay) {
 }
 
 const canvas = battleOverlay?.canvas ?? null
-const commandRail = battleOverlay?.commandRail ?? null
 const battleHudLayer = battleOverlay?.hudLayer ?? null
 const battleScreenLayer = battleOverlay?.screenLayer ?? null
 
-function syncBattleOverlayLayout(): void {
-  if (!commandRail) return
-  syncBattleOverlayPlaceholderRail({ commandRail })
-}
-
-if ((!canvas || !commandRail || !battleHudLayer || !battleScreenLayer) && !isTestRuntime) {
+if ((!canvas || !battleHudLayer || !battleScreenLayer) && !isTestRuntime) {
   throw new Error('Application shell is incomplete.')
 }
 
@@ -843,7 +835,6 @@ const phaseScreens = battleScreenLayer ? createPhaseScreenController(battleScree
         hasLoadableSnapshot = true
       },
       renderHud() {
-        syncBattleOverlayLayout()
         hud?.render(state, productPause.isPaused, activeFixedDeltaMs)
         phaseScreens?.render(state, productPause.isPaused, buildUpgradeView())
       },
@@ -986,7 +977,7 @@ export type VisualScenarioFixture =
       sortie: TimeoutVisualSortie
     })
   | (VisualScenarioFixtureCommon & {
-      name: 'final-no-command-rail'
+      name: 'final-overlay-only'
       loopPhase: 'result'
       sortie: TimeoutVisualSortie
     })
@@ -995,7 +986,7 @@ const VISUAL_SCENARIO_NAMES = [
   'running-hud',
   'running-hud-paused',
   'result-timeout',
-  'final-no-command-rail',
+  'final-overlay-only',
 ] as const
 
 function isFiniteNumber(value: unknown): value is number {
@@ -1319,7 +1310,6 @@ function frame(now: number): void {
   }
 
   // AC4: render and HUD continue regardless of pause state
-  syncBattleOverlayLayout()
   hud.render(state, productPause.isPaused, activeFixedDeltaMs)
   phaseScreens?.render(state, productPause.isPaused, buildUpgradeView())
   renderer.render(state)

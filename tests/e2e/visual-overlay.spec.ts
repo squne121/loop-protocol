@@ -13,10 +13,10 @@
  *
  * Out of scope for this Issue (see `docs/dev/visual-baseline-registry.md`
  * and the Issue #1386 contract): adding a `frozen` baseline for any final
- * overlay surface, and implementing the `final-no-command-rail` overlay UI
+ * overlay surface, and implementing the `final-overlay-only` overlay UI
  * (#1377). `running-hud-paused` and `result-timeout` were promoted to
  * `active-fixture-only` / `legacy-current` by Issue #1376 (AC12) and are
- * captured below; `final-no-command-rail` remains `pending-fixture`
+ * captured below; `final-overlay-only` remains `pending-fixture`
  * (`VISUAL_SCENARIO_STATUS`) / `pending-baseline` (registry `maturity`)
  * and is only exercised as an explicit-pending / fail-closed proof (AC4) —
  * never captured.
@@ -82,13 +82,13 @@ const RESULT_TIMEOUT_FIXTURE: VisualScenarioFixture = {
 }
 
 /**
- * `pending-fixture` fixture payload for `final-no-command-rail` (#1377, not
+ * `pending-fixture` fixture payload for `final-overlay-only` (#1377, not
  * yet implemented), used only to prove the fail-closed rejection below
  * (AC4) — never installed successfully and never used to capture a
  * screenshot.
  */
-const FINAL_NO_COMMAND_RAIL_FIXTURE: VisualScenarioFixture = {
-  name: 'final-no-command-rail',
+const FINAL_OVERLAY_ONLY_FIXTURE: VisualScenarioFixture = {
+  name: 'final-overlay-only',
   loopPhase: 'result',
   paused: false,
   sortie: { status: 'timeout', elapsedTicks: 900, fixedDeltaMs: 16, durationMs: 14400, kills: 5 },
@@ -354,7 +354,7 @@ test('GIVEN [data-combat-hud] is forcibly hidden WHEN the real running-hud-overl
 // Pending-baseline scenarios (AC4)
 // ---------------------------------------------------------------------------
 //
-// `final-no-command-rail` (docs/dev/visual-baseline-registry.md registry id)
+// `final-overlay-only` (docs/dev/visual-baseline-registry.md registry id)
 // is still `pending-baseline` in the registry and `pending-fixture` in the
 // Scenario Support Matrix — its overlay surface implementation child issue
 // (#1377) has not merged. `running-hud-paused` / `result-overlay-timeout`
@@ -365,7 +365,7 @@ test('GIVEN [data-combat-hud] is forcibly hidden WHEN the real running-hud-overl
 // capturing a premature baseline of the current pre-overlay UI.
 
 const PENDING_SCENARIO_REGISTRY_IDS = {
-  'final-no-command-rail': 'final-no-command-rail',
+  'final-overlay-only': 'final-overlay-only',
 } as const
 
 /**
@@ -428,11 +428,11 @@ for (const [scenarioName, registryId] of Object.entries(PENDING_SCENARIO_REGISTR
   })
 }
 
-test('GIVEN the final-no-command-rail pending-fixture scenario WHEN installVisualScenario is called THEN it fails closed instead of silently freezing the current pre-overlay UI (AC4)', async ({
+test('GIVEN the final-overlay-only pending-fixture scenario WHEN installVisualScenario is called THEN it fails closed instead of silently freezing the current pre-overlay UI (AC4)', async ({
   page,
 }) => {
-  expect(isPendingFixtureScenario(FINAL_NO_COMMAND_RAIL_FIXTURE.name)).toBe(true)
-  await expect(installVisualScenario(page, FINAL_NO_COMMAND_RAIL_FIXTURE)).rejects.toThrow(
+  expect(isPendingFixtureScenario(FINAL_OVERLAY_ONLY_FIXTURE.name)).toBe(true)
+  await expect(installVisualScenario(page, FINAL_OVERLAY_ONLY_FIXTURE)).rejects.toThrow(
     /pending-fixture/,
   )
 })

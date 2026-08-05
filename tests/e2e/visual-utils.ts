@@ -26,7 +26,7 @@ export const VISUAL_SCENARIOS: readonly VisualScenarioName[] = [
   'running-hud',
   'running-hud-paused',
   'result-timeout',
-  'final-no-command-rail',
+  'final-overlay-only',
 ]
 
 export type VisualScenarioFixtureStatus = 'active-fixture-only' | 'pending-fixture'
@@ -49,11 +49,11 @@ export const VISUAL_SCENARIO_STATUS: Readonly<Record<VisualScenarioName, VisualS
   'running-hud': 'active-fixture-only',
   // Issue #1376 AC12: pause overlay / result screen surfaces merged in this
   // PR, so these two scenarios are promoted from 'pending-fixture' to
-  // 'active-fixture-only'. 'final-no-command-rail' remains pending
+  // 'active-fixture-only'. 'final-overlay-only' remains pending
   // ('final' command-rail removal is #1377's Out of Scope boundary).
   'running-hud-paused': 'active-fixture-only',
   'result-timeout': 'active-fixture-only',
-  'final-no-command-rail': 'pending-fixture',
+  'final-overlay-only': 'pending-fixture',
 }
 
 export function isPendingFixtureScenario(scenario: VisualScenarioName): boolean {
@@ -102,7 +102,7 @@ export const VISUAL_BASELINE_REGISTRY_IDS = [
   'hp-label',
   'running-hud-paused',
   'result-overlay-timeout',
-  'final-no-command-rail',
+  'final-overlay-only',
   // Issue #1386 / PR #1721 review fix, P1 Blocker 2: a distinct id for this
   // spec's `[data-battle-ui-root]` full-overlay capture. Deliberately NOT
   // `running-hud` — the existing `running-hud` registry row already points
@@ -142,7 +142,7 @@ export const VISUAL_BASELINE_REGISTRY_MATURITY: Readonly<
   // after #1377 per established precedent for the other overlay rows).
   'running-hud-paused': 'legacy-current',
   'result-overlay-timeout': 'legacy-current',
-  'final-no-command-rail': 'pending-baseline',
+  'final-overlay-only': 'pending-baseline',
   'running-hud-overlay-legacy-current': 'legacy-current',
 }
 

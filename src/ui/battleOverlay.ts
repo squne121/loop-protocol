@@ -1,7 +1,6 @@
 export interface BattleOverlayElements {
   battleStage: HTMLElement
   canvas: HTMLCanvasElement
-  commandRail: HTMLElement
   uiLayer: HTMLElement
   hudLayer: HTMLElement
   screenLayer: HTMLElement
@@ -15,7 +14,6 @@ export function resolveBattleOverlayElements(root: ParentNode): BattleOverlayEle
   // markup comment for why the containing block was split.
   const viewport = battleStage?.querySelector<HTMLElement>(':scope > .battle-stage__viewport') ?? null
   const canvas = viewport?.querySelector<HTMLCanvasElement>(':scope > .battle-stage__canvas') ?? null
-  const commandRail = root.querySelector<HTMLElement>('.command-rail')
   const uiLayer =
     viewport?.querySelector<HTMLElement>(':scope > .battle-ui-layer[data-battle-ui-root]') ?? null
   const hudLayer =
@@ -26,39 +24,29 @@ export function resolveBattleOverlayElements(root: ParentNode): BattleOverlayEle
       ':scope > .battle-screen-layer[data-battle-layer="screen"]',
     ) ?? null
 
-  if (!battleStage || !canvas || !commandRail || !uiLayer || !hudLayer || !screenLayer) {
+  if (!battleStage || !canvas || !uiLayer || !hudLayer || !screenLayer) {
     return null
   }
 
   return {
     battleStage,
     canvas,
-    commandRail,
     uiLayer,
     hudLayer,
     screenLayer,
   }
 }
 
-export function syncBattleOverlayPlaceholderRail(
-  elements: Pick<BattleOverlayElements, 'commandRail'>,
-): void {
-  const appShell = elements.commandRail.closest<HTMLElement>('.app-shell')
-
-  if (appShell) {
-    appShell.setAttribute('data-battle-layout', 'overlay-hud')
-  }
-
-  elements.commandRail.hidden = true
-  elements.commandRail.setAttribute('aria-hidden', 'true')
-  elements.commandRail.setAttribute('data-battle-placeholder', 'true')
-}
-
+/**
+ * Configures the battle overlay's initial foundation state (Issue #1377: the
+ * legacy `.command-rail` placeholder and its sync helper were removed —
+ * `.battle-stage` overlay layers are the sole normal-play surface now). Only
+ * the result/pause screen layer needs an initial inert/hidden state; ordinary
+ * gameplay reveals it via `src/ui/phaseScreens.ts`'s controller.
+ */
 export function configureBattleOverlayFoundation(
-  elements: Pick<BattleOverlayElements, 'commandRail' | 'screenLayer'>,
+  elements: Pick<BattleOverlayElements, 'screenLayer'>,
 ): void {
-  elements.commandRail.replaceChildren()
-  syncBattleOverlayPlaceholderRail(elements)
   elements.screenLayer.hidden = true
   elements.screenLayer.setAttribute('inert', '')
   elements.screenLayer.setAttribute('aria-hidden', 'true')

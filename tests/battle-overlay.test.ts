@@ -4,11 +4,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import {
-  configureBattleOverlayFoundation,
-  resolveBattleOverlayElements,
-  syncBattleOverlayPlaceholderRail,
-} from '../src/ui/battleOverlay'
+import { configureBattleOverlayFoundation, resolveBattleOverlayElements } from '../src/ui/battleOverlay'
 
 function renderShell() {
   document.body.innerHTML = `
@@ -23,15 +19,12 @@ function renderShell() {
           </div>
         </div>
       </section>
-      <aside class="command-rail" aria-label="Command rail">
-        <button type="button" data-action="legacy">Legacy</button>
-      </aside>
     </div>
   `
 }
 
 describe('battleOverlay', () => {
-  it('GIVEN a battle-stage shell WHEN resolved THEN overlay layers and placeholder rail are returned', () => {
+  it('GIVEN a battle-stage shell with no legacy command rail WHEN resolved THEN overlay layers are returned (#1377)', () => {
     renderShell()
 
     const overlay = resolveBattleOverlayElements(document)
@@ -42,7 +35,7 @@ describe('battleOverlay', () => {
     expect(overlay?.screenLayer.dataset.battleLayer).toBe('screen')
   })
 
-  it('GIVEN legacy rail content WHEN foundation is configured THEN command rail is emptied and screen layer becomes inactive', () => {
+  it('GIVEN the overlay shell WHEN foundation is configured THEN the screen layer becomes inactive and no command-rail markup is required (#1377)', () => {
     renderShell()
 
     const overlay = resolveBattleOverlayElements(document)
@@ -50,36 +43,10 @@ describe('battleOverlay', () => {
 
     configureBattleOverlayFoundation(overlay!)
 
-    expect(overlay?.commandRail.children).toHaveLength(0)
-    expect(overlay?.commandRail.hidden).toBe(true)
-    expect(overlay?.commandRail.getAttribute('data-battle-placeholder')).toBe('true')
-    expect(document.querySelector('.app-shell')?.getAttribute('data-battle-layout')).toBe('overlay-hud')
     expect(overlay?.screenLayer.hidden).toBe(true)
     expect(overlay?.screenLayer.hasAttribute('inert')).toBe(true)
     expect(overlay?.screenLayer.getAttribute('aria-hidden')).toBe('true')
-  })
-
-  it('GIVEN a result-like layout fallback WHEN placeholder sync reruns THEN overlay layout and hidden rail are restored', () => {
-    renderShell()
-
-    const overlay = resolveBattleOverlayElements(document)
-    expect(overlay).not.toBeNull()
-
-    configureBattleOverlayFoundation(overlay!)
-    document.querySelector('.app-shell')?.removeAttribute('data-battle-layout')
-    overlay!.commandRail.hidden = false
-    overlay!.commandRail.removeAttribute('aria-hidden')
-    overlay!.commandRail.removeAttribute('data-battle-placeholder')
-
-    syncBattleOverlayPlaceholderRail(overlay!)
-
-    expect(document.querySelector('.app-shell')?.getAttribute('data-battle-layout')).toBe(
-      'overlay-hud',
-    )
-    expect(overlay?.commandRail.hidden).toBe(true)
-    expect(overlay?.commandRail.getAttribute('aria-hidden')).toBe('true')
-    expect(overlay?.commandRail.getAttribute('data-battle-placeholder')).toBe('true')
-    expect(overlay?.commandRail.querySelectorAll('[data-action]')).toHaveLength(0)
+    expect(document.querySelector('aside.command-rail')).toBeNull()
   })
 
   it('GIVEN a stray battle-hud-layer outside battle-ui-layer WHEN resolved THEN resolver fails closed', () => {
@@ -89,6 +56,16 @@ describe('battleOverlay', () => {
       '<div class="battle-hud-layer" data-battle-layer="hud"></div>',
     )
     document.querySelector('.battle-ui-layer .battle-hud-layer')?.remove()
+
+    expect(resolveBattleOverlayElements(document)).toBeNull()
+  })
+
+  it('GIVEN a battle-stage with no canvas or overlay layers WHEN resolved THEN resolver fails closed (#1377)', () => {
+    document.body.innerHTML = `
+      <div class="app-shell">
+        <section class="battle-stage"></section>
+      </div>
+    `
 
     expect(resolveBattleOverlayElements(document)).toBeNull()
   })

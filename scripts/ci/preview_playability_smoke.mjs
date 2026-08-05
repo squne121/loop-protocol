@@ -97,33 +97,23 @@ async function captureFailureScreenshot(page, outputPath) {
 async function collectLayoutEvidence(frame) {
   return frame.evaluate(() => {
     const appShell = globalThis.document.querySelector('.app-shell')
-    const commandRail = globalThis.document.querySelector('aside.command-rail')
-    if (
-      !(appShell instanceof globalThis.HTMLElement) ||
-      !(commandRail instanceof globalThis.HTMLElement)
-    ) {
+    if (!(appShell instanceof globalThis.HTMLElement)) {
       throw new Error('Required overlay layout elements are missing.')
     }
 
     const shellStyle = globalThis.window.getComputedStyle(appShell)
-    const railStyle = globalThis.window.getComputedStyle(commandRail)
 
     return {
-      battleLayout: appShell.getAttribute('data-battle-layout'),
       gridTemplateColumns: shellStyle.gridTemplateColumns,
       gridTemplateColumnCount: shellStyle.gridTemplateColumns
         .trim()
         .split(/\s+/)
         .filter(Boolean).length,
-      commandRailHiddenAttribute: commandRail.hasAttribute('hidden'),
-      commandRailAriaHidden: commandRail.getAttribute('aria-hidden'),
-      commandRailDisplay: railStyle.display,
-      commandRailVisibility: railStyle.visibility,
-      commandRailPointerEvents: railStyle.pointerEvents,
-      commandRailWidth: Math.round(commandRail.getBoundingClientRect().width),
-      interactiveDescendantCount: commandRail.querySelectorAll(
-        'button, a, input, select, textarea, [data-action], [data-battle-interactive="true"]',
-      ).length,
+      // Issue #1377: the legacy `.command-rail` element is removed entirely
+      // -- its absence from the DOM is the required-element check now,
+      // replacing the previous width/visibility/interactive-descendant
+      // assertions against a placeholder rail that no longer exists.
+      commandRailPresent: globalThis.document.querySelector('aside.command-rail') !== null,
     }
   })
 }
@@ -276,11 +266,7 @@ async function runScenario(browser, options, mode, viewport) {
     const layout = await poll(
       `${mode} overlay layout evidence`,
       async () => collectLayoutEvidence(frame),
-      (value) =>
-        value.battleLayout === 'overlay-hud' &&
-        value.gridTemplateColumnCount === 1 &&
-        value.interactiveDescendantCount === 0 &&
-        (value.commandRailHiddenAttribute === true || value.commandRailWidth === 0),
+      (value) => value.gridTemplateColumnCount === 1 && value.commandRailPresent === false,
       options.timeoutMs,
     )
 

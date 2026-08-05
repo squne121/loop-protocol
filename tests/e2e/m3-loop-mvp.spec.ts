@@ -755,3 +755,104 @@ test.describe('Issue #1376: result screen focus (AC7) and rapid-activation exact
   )
 })
 
+
+// ---------------------------------------------------------------------------
+// AC3 (Issue #1377): keyboard-only title -> preparation -> running ->
+// pause/resume -> result -> preparation flow, driven entirely through
+// `.battle-stage` overlay descendants (never the legacy `.command-rail`,
+// removed by this Issue).
+// ---------------------------------------------------------------------------
+
+test(
+  'AC3 (#1377): GIVEN keyboard-only input WHEN navigating title -> preparation -> running -> pause/resume -> result -> preparation THEN it never depends on the legacy command rail',
+  async ({ page }) => {
+    test.setTimeout(45_000)
+
+    await page.addInitScript(() => {
+      // Issue #1283: disable the legacy VITE_E2E_MODE auto-start so this
+      // test drives the normal player-facing keyboard navigation itself,
+      // starting at title_menu. NOTE: `__E2E_SHORT_SORTIE__` is intentionally
+      // NOT used here -- it only applies at module-init time, gated on
+      // `state.loopPhase === 'running'` at that instant (src/main.ts), which
+      // is never true while auto-start is disabled and 'running' is only
+      // reached later via manual keyboard navigation. Without player
+      // movement input, the default enemy spawn reaches the player and ends
+      // the sortie deterministically well inside this test's timeout (see
+      // tests/e2e/m2-combat-mvp.spec.ts's ~8-9s defeat cases), so no
+      // short-sortie override is needed for a deterministic terminal state.
+      ;(
+        window as Window & { __LOOP_E2E_BOOTSTRAP__?: { autoStart?: boolean } }
+      ).__LOOP_E2E_BOOTSTRAP__ = { autoStart: false }
+    })
+    await page.goto('/')
+
+    await expect
+      .poll(async () => (await getGameState(page)).loopPhase, { timeout: 5_000, intervals: [50] })
+      .toBe('title_menu')
+
+    // title_menu -> preparation: keyboard-activate "Begin new run" (Tab-focus
+    // + Enter, never a mouse click) -- a `.battle-stage` overlay descendant.
+    const beginNewRun = page.getByRole('button', { name: 'Begin new run' })
+    await beginNewRun.focus()
+    await expect(beginNewRun).toBeFocused()
+    await page.keyboard.press('Enter')
+    await expect
+      .poll(async () => (await getGameState(page)).loopPhase, { timeout: 5_000, intervals: [50] })
+      .toBe('preparation')
+
+    // preparation -> running: keyboard-activate "Launch sortie".
+    const launchSortie = page.getByRole('button', { name: 'Launch sortie' })
+    await launchSortie.focus()
+    await expect(launchSortie).toBeFocused()
+    await page.keyboard.press('Enter')
+    await expect
+      .poll(async () => (await getGameState(page)).loopPhase, { timeout: 5_000, intervals: [50] })
+      .toBe('running')
+
+    // running: pause/resume via the P key, which requires
+    // `.battle-stage__canvas` focus (tests/e2e/product-pause.spec.ts AC17
+    // keyboard contract) -- entirely within the `.battle-stage` overlay,
+    // never the legacy command rail.
+    await page.focus('.battle-stage__canvas')
+    await page.keyboard.press('p')
+    await expect(page.locator('[data-action="toggle-pause"]')).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    await page.keyboard.press('Escape')
+    await expect(page.locator('[data-action="toggle-pause"]')).toHaveAttribute(
+      'aria-pressed',
+      'false',
+    )
+
+    // running -> result: without player movement input, the default enemy
+    // spawn reaches the player and ends the sortie deterministically
+    // (defeat) well inside this timeout; any terminal sortie status
+    // reaching the 'result' loopPhase satisfies this flow assertion (the
+    // outcome itself is not this AC's concern).
+    await expect
+      .poll(async () => (await getGameState(page)).sortie.status, {
+        timeout: 20_000,
+        intervals: [100],
+      })
+      .not.toBe('running')
+    await expect
+      .poll(async () => (await getGameState(page)).loopPhase, { timeout: 3_000, intervals: [50] })
+      .toBe('result')
+
+    // result -> preparation: keyboard-activate "Return to hangar" (Confirm result).
+    const confirmResult = page.locator('[data-action="confirm-result"]')
+    await confirmResult.focus()
+    await expect(confirmResult).toBeFocused()
+    await page.keyboard.press('Enter')
+    await expect
+      .poll(async () => (await getGameState(page)).loopPhase, { timeout: 5_000, intervals: [50] })
+      .toBe('preparation')
+
+    // AC3/AC4: the entire flow above ran within `.battle-stage` overlay
+    // descendants only -- the legacy `.command-rail` never existed as a DOM
+    // target (Issue #1377 removes it entirely).
+    await expect(page.locator('aside.command-rail')).toHaveCount(0)
+    await expect(page.locator('.battle-stage')).toBeVisible()
+  },
+)
