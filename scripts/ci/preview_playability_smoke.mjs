@@ -118,6 +118,21 @@ async function collectLayoutEvidence(frame) {
   })
 }
 
+const DECLARED_BROWSER_ZOOM = '100% (Chromium default; not adjusted by this automated check)'
+
+async function collectRuntimeEnvironment(page) {
+  const evaluated = await page.evaluate(() => ({
+    userAgent: globalThis.navigator.userAgent,
+    devicePixelRatio: globalThis.window.devicePixelRatio,
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  }))
+
+  return {
+    ...evaluated,
+    declaredBrowserZoom: DECLARED_BROWSER_ZOOM,
+  }
+}
+
 async function runPlayabilityFlow(page, frame, timeoutMs) {
   const beginNewRun = frame.locator('button[data-action="new-game"]')
   await beginNewRun.waitFor({ state: 'visible', timeout: timeoutMs })
@@ -271,6 +286,7 @@ async function runScenario(browser, options, mode, viewport) {
     )
 
     const playability = await runPlayabilityFlow(page, frame, options.timeoutMs)
+    const runtimeEnvironment = await collectRuntimeEnvironment(page)
     await page.screenshot({ path: screenshotPath, fullPage: true })
 
     return {
@@ -281,6 +297,7 @@ async function runScenario(browser, options, mode, viewport) {
       failure_screenshot: null,
       layout,
       playability,
+      runtime_environment: runtimeEnvironment,
       console_messages: consoleMessages,
       page_errors: pageErrors,
     }
