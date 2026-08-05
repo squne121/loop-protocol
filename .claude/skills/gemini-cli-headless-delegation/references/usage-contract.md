@@ -61,14 +61,14 @@
 |---|---|
 | `schema` | `"delegation_request_v1"` 固定。 |
 | `provider` | `"agy"` 固定。 |
-| `tool_profile` | `"no_tools"`、`"proposal_only"`、`"local_asset_research"`、または `"grounded_research"`。 |
+| `tool_profile` | `"no_tools"`、`"proposal_only"`、`"local_asset_research"`、`"grounded_research"`、または `"github_research"`（Issue #1920）。 |
 | `prompt` | 必須。空文字・空白のみは `agy_empty_prompt` で拒否。 |
 | `context_files` | `local_asset_research` 時は必須。repo 境界とシンボリックリンク境界検証後に wrapper が repo-relative JSON evidence envelope を集約し、AGY へ prompt 注入する。 |
 | `evidence_targets` | Issue #1638 の targeted-evidence 契約（任意、`local_asset_research` 専用）。指定時は `context_files` の代わりに使われ、legacy 全文 context path 要件を置き換える。形式は「`evidence_targets` （targeted-evidence 契約）」セクション参照。 |
 | `model` | 指定禁止。`unsupported_provider_option` で拒否。 |
 | `post_to_issue_url` | 指定禁止。`provider_forbids_post_to_issue_url` で拒否。 |
 | `grounded_research` | `agy` ネイティブの WebSearch/WebGrounding（`agy -p` 実行）を使用。 Gemini API `google_search` tool や Google Search grounding API は呼ばない（Gemini provider の `grounded_research` とは別の provider-specific 実装）。 |
-| `github_research` | 使用禁止。`unsupported_provider_profile` で拒否。 |
+| `github_research` | **実装済み（Issue #1920）**。`run_agy_github_research_e2e.py` へ委譲。AGY はネイティブ tool-call 権限を一切持たず（`agy_permission_policy.PROFILE_ALLOWED_TOOLS["github_research"]` は空集合）、単一 `gh` invocation の選択をテキスト応答のみで行う。実行と `GH_TOKEN` 保有は `run_agy_github_research_broker.py` が単独で担う。詳細は「github_research（provider=agy、Issue #1920）」節参照。 |
 
 `provider=agy + grounded_research` は `implemented_agy_native_websearch_grounding` として扱う。
 `wrapper_side_google_search_grounding: forbidden` であり、wrapper は Gemini API Google Search / Google Search grounding API / wrapper-side Web retrieval を呼ばない。
@@ -985,6 +985,37 @@ request に `gh_commands` field を追加することで、wrapper が argv ベ�
 `github_research` を使う前に preflight の `gh_cli` セクションを確認すること:
 - `gh_cli.ok: true`: `gh --version` と `gh auth status` が成功している
 - `gh_cli.ok: false` + `failure_class: "gh_auth_required"`: `gh auth login` で認証が必要
+
+### github_research（provider=agy、Issue #1920）
+
+`provider=agy` の `github_research` は上記 Gemini 側の静的 `gh_commands` 事前バッチとは別契約であり、
+`run_agy_github_research_e2e.py` が最大 8 回、AGY 自身の判断に応じて単一 `gh` invocation を反復実行する。
+
+- リクエスト形式は他の agy profile と同じ prompt-first 契約（`schema` / `provider: agy` /
+  `tool_profile: github_research` / `prompt`）のみで、`model` は指定禁止、`gh_commands` field は
+  使用しない（AGY 側は静的事前バッチではなく反復選択のため）。
+- AGY はネイティブ tool-call 権限を一切持たない
+  （`agy_permission_policy.PROFILE_ALLOWED_TOOLS["github_research"] == frozenset()`）。単一 `gh`
+  コマンドの選択は AGY のテキスト応答（`NEXT_COMMAND: {"argv": [...]}` 形式、または `STOP`）を
+  wrapper 側が解析するのみで行う。
+- 実行主体は `run_agy_github_research_broker.py`（`GH_TOKEN` を保有する唯一のプロセス）。
+  `--repo github.com/squne121/loop-protocol` を強制注入し、`GH_CONFIG_DIR` を空の private temporary
+  directory に固定して既存 auth/alias/extension/pager 設定を遮断する。AGY プロセス自体は
+  `GH_TOKEN` を一切受け取らない。
+- 許可コマンドは `gh issue view/list`、`gh pr view/list/diff/checks`、`gh repo view`、
+  `gh search issues/prs/repos`、`gh release view/list`、`gh api`（GET のみ、`graphql` 不可）。
+  mutation、`gh auth`/`alias`/`extension`、compound shell token、credential-display 試行は
+  `run_agy_github_research_broker.validate_gh_argv()` が実行前に deny する。
+- 数値契約: `max_iterations: 8` / `command_timeout_seconds: 30` /
+  `total_route_timeout_seconds: 180` / `stdout_bytes_per_command: 65536` /
+  `stderr_bytes_per_command: 16384` / `aggregate_retained_bytes: 262144`。出力は
+  redaction-before-truncate（token 形状の文字列を truncate 前に `[REDACTED]` へ置換）。
+- `agy` CLI、`GH_TOKEN`、read-only 認証、`GH_HOST`/`GH_REPO` binding のいずれかが利用不可な場合は
+  exit 77 の structured SKIP を返す（`status: "skip"`、`ok: false`）。SKIP は PASS ではない。
+  Gemini / direct fallback は行わない。
+- evidence artifact は `agy_github_research_evidence/v1`
+  （`schemas/agy_github_research_evidence_v1.schema.json`）として
+  `.claude/artifacts/agent-provider-route/<run-id>/` に保存される。
 
 ## REPO_EVIDENCE_REF_V1
 

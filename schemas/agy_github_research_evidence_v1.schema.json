@@ -1,0 +1,189 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://loop-protocol.local/schemas/agy_github_research_evidence_v1.schema.json",
+  "title": "agy_github_research_evidence/v1",
+  "description": "Evidence artifact produced by run_agy_github_research_e2e.py for the AGY-driven, repository-bound, read-only `gh` research route (Issue #1920). Distinct from the unrelated/undefined AGENT_PROVIDER_ROUTE_SMOKE_V1 schema, which is not reused here.",
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "generated_at",
+    "status",
+    "provider",
+    "profile",
+    "repository_binding",
+    "limits",
+    "iterations",
+    "close_evidence",
+    "digest_binding"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "agy_github_research_evidence/v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pass", "skip", "fail"]
+    },
+    "skip_reason": {
+      "type": ["string", "null"]
+    },
+    "provider": {
+      "type": "object",
+      "required": ["requested", "observed"],
+      "additionalProperties": false,
+      "properties": {
+        "requested": { "const": "agy" },
+        "observed": { "type": "string" }
+      }
+    },
+    "profile": {
+      "const": "github_research"
+    },
+    "repository_binding": {
+      "type": "object",
+      "required": ["host", "repo"],
+      "additionalProperties": false,
+      "properties": {
+        "host": { "const": "github.com" },
+        "repo": { "const": "squne121/loop-protocol" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "required": [
+        "max_iterations",
+        "command_timeout_seconds",
+        "total_route_timeout_seconds",
+        "stdout_bytes_per_command",
+        "stderr_bytes_per_command",
+        "aggregate_retained_bytes",
+        "max_records_per_command",
+        "pagination"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "max_iterations": { "const": 8 },
+        "command_timeout_seconds": { "const": 30 },
+        "total_route_timeout_seconds": { "const": 180 },
+        "stdout_bytes_per_command": { "const": 65536 },
+        "stderr_bytes_per_command": { "const": 16384 },
+        "aggregate_retained_bytes": { "const": 262144 },
+        "max_records_per_command": { "const": 100 },
+        "pagination": { "const": false }
+      }
+    },
+    "iterations": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": [
+          "index",
+          "command_requested",
+          "decision",
+          "reason",
+          "truncated"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "index": { "type": "integer", "minimum": 0 },
+          "command_requested": {
+            "type": "object",
+            "required": ["argv"],
+            "additionalProperties": false,
+            "properties": {
+              "argv": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          },
+          "decision": {
+            "type": "string",
+            "enum": ["allow", "deny"]
+          },
+          "reason": { "type": "string" },
+          "exit_code": { "type": ["integer", "null"] },
+          "redacted_output_digest": { "type": ["string", "null"] },
+          "truncated": { "type": "boolean" },
+          "duration_ms": { "type": ["integer", "null"] }
+        }
+      }
+    },
+    "close_evidence": {
+      "type": "object",
+      "required": ["positive_run", "negative_probes"],
+      "additionalProperties": false,
+      "properties": {
+        "positive_run": {
+          "type": "object",
+          "required": ["observed", "exit_code", "iteration_count", "adaptive_next_command_observed"],
+          "additionalProperties": false,
+          "properties": {
+            "observed": { "type": "boolean" },
+            "exit_code": { "type": ["integer", "null"] },
+            "iteration_count": { "type": "integer", "minimum": 0 },
+            "adaptive_next_command_observed": { "type": "boolean" }
+          }
+        },
+        "negative_probes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["probe_class", "denied_pre_execution", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "probe_class": {
+                "type": "string",
+                "enum": [
+                  "mutation",
+                  "cross_repository",
+                  "alternate_host",
+                  "compound_shell",
+                  "credential_display"
+                ]
+              },
+              "denied_pre_execution": { "type": "boolean" },
+              "reason": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "digest_binding": {
+      "type": "object",
+      "required": [
+        "agy_binary_digest",
+        "agy_version",
+        "permission_policy_digest",
+        "hook_executable_digest",
+        "isolated_settings_digest",
+        "pr_1994_schema_version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "agy_binary_digest": { "type": ["string", "null"] },
+        "agy_version": { "type": ["string", "null"] },
+        "permission_policy_digest": { "type": ["string", "null"] },
+        "hook_executable_digest": { "type": ["string", "null"] },
+        "isolated_settings_digest": { "type": ["string", "null"] },
+        "pr_1994_schema_version": { "type": ["string", "null"] }
+      }
+    },
+    "gemini_invocation_count": {
+      "type": "integer",
+      "const": 0,
+      "description": "Fixed at 0: this route never falls back to the Gemini provider."
+    }
+  }
+}

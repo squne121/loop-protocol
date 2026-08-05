@@ -566,12 +566,25 @@ def test_ac7_agy_local_asset_research_rejects_context_outside_repo_before_read(t
     assert result["failure_class"] == "local_asset_research context file must be inside repository"
 
 
-def test_ac7_agy_github_research_rejected() -> None:
-    """AC7: provider=agy with github_research -> unsupported_provider_profile."""
+def test_ac7_agy_github_research_dispatches_to_e2e_route(monkeypatch, tmp_path) -> None:
+    """AC7 (superseded by Issue #1920): provider=agy + github_research is now
+    implemented, dispatched entirely to run_agy_github_research_e2e.py's
+    bounded, broker-backed route -- it is no longer unsupported_provider_profile.
+    Without a live agy CLI / GH_TOKEN in this hermetic test environment, the
+    route SKIPs (exit_code 77) fail-closed rather than reporting a fabricated
+    PASS or falling back to Gemini; see test_agy_github_research_contract.py
+    and test_agy_github_research_e2e.py for the full contract.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
     req = _agy_request(tool_profile="github_research")
     result = rgh.run_delegation(req)
-    assert result["ok"] is False
-    assert result["failure_class"] == "unsupported_provider_profile"
+    assert result["tool_profile"] == "github_research"
+    assert result["failure_class"] != "unsupported_provider_profile"
+    assert result["exit_code"] in (0, 77)
+    if result["exit_code"] == 77:
+        assert result["ok"] is False
+        assert result["failure_class"] == "github_research_skip"
 
 
 # ---------------------------------------------------------------------------
