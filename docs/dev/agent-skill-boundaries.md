@@ -208,6 +208,7 @@ SubAgent（役割）── Skill（作業手順）
 - `.tmp/` / `.temp/` / `.tmp-*` の扱いを変える変更は、hook advisory・schema・tests・cleanup docs を同一 PR で更新する。
 - `tmp/`、`.claude/tmp/`、`.claude/worktrees/` の cleanup authority を変える場合は、folder policy SSOT と `post-merge-cleanup` の safety rules を同時に更新する。
 - root temporary residue policy は advisory hook と operator docs まではこの boundary で扱うが、cleanup classifier の専用 output field や ownership marker executor 実装まで同時に存在するとは限らない。PR / review では未実装部分を `Not controlled` として扱う。
+- 新規書き込みの canonical write destination は `tmp/` である。`.claude/tmp/` は非推奨（deprecated）の legacy root であり、構造・read/scan/report・`never_delete` safety rule は温存するが新規書き込み先としては案内しない（Issue #1995）。
 
 
 ## gh CLI コマンド 5 分類語彙（Issue #1124）

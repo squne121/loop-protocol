@@ -86,6 +86,7 @@ TEMP_CLEANUP_SAFETY_RULES_V1:
 
 - `root temporary residue` は `scripts/agent-ops/temp_residue_classifier.py` が `temp_residue_classification/v1` として read-only 分類する（Issue #1417）。分類は `report_only` または `eligible_for_delete` の `recommendation` を返すのみで、filesystem mutation は一切行わない。
 - `tmp/`、`.claude/tmp/`、`.claude/worktrees/` の root 全体削除は自動実行対象にしない。
+- `tmp/` は repo-approved local temporary workspace の canonical write destination であり、`.claude/tmp/` は非推奨（deprecated）の legacy root である（Issue #1995）。deprecated であっても`never_delete` / `report_only` の safety boundary は変更せず、構造・read/scan/report は継続する。
 - `eligible_for_delete` は「実削除 executor が削除直前に再検査してよい候補」を意味する advisory であり、classifier の serialized 出力単体を deletion authorization として扱ってはならない。ownership marker が valid であることも同様に deletion authorization ではない（accidental-isolation モデルの advisory hint に過ぎない）。実削除 executor（marker replay 防止・dir-fd I/O・postcondition 検証を含む）は本 Skill の scope 外であり、必要になった時点で別 Issue として設計する。それまでの間、本 Skill / SubAgent は `temp_residue_classification` の内容に関わらず一切の削除を実行しない。
 
 ### 2. main を origin/main に整合
