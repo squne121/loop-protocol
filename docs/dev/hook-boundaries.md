@@ -462,6 +462,7 @@ hook_boundaries_manifest_v1:
       inner payload スキーマ: schemas/repo_temp_folder_advice_v1.schema.json
       block: false を固定し、tool call を止めずに `tmp/` または `.claude/tmp/` への移行を案内する。
       local_main_branch_guard の classification: blocker は維持し、この hook に deny logic を混在させない。
+      schema（`repo_temp_folder_advice_v1.schema.json`）の `approved_temporary_roots` enum は `tmp/` / `.claude/tmp/` の 2 値のままとし、本 Issue #1995 では変更しない（enum を 1 値化する breaking change は schema v2 migration の follow-up Issue で扱う）。ドキュメント上の推奨は `tmp/` を canonical とし、`.claude/tmp/` は非推奨（deprecated）の legacy root として案内するが、 advisory 出力自体（block: false・両 root への言及）は変更しない。
 ```
 
 ## HOOK_COMMAND_REPAIR_HINT_V1（Hook コマンド修復ヒント）
