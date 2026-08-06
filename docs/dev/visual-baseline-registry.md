@@ -533,6 +533,55 @@ fail することを確認するテスト）が実際には fail せず、`.reje
   PASS）で再検証した。
 - **maturity / tolerance**: 変更なし。
 
+### `phase-screens.spec.ts` VRT baseline 6 件の更新見送り判断（Issue #1986、明示）
+
+Issue #1986 は、PR #1984（Issue #1376）由来の E2E 不整合の follow-up として、
+`phase-screens.spec.ts` の VRT baseline 6 件（`title-menu` / `load-menu-empty` /
+`load-menu-available` / `load-menu-failure` / `preparation-default` /
+`preparation-upgrade-available`）が CI `e2e` job で mismatch しているという観測を
+出発点としていた。実装着手時（`scope_revalidation.base_sha`
+`1c4f938bab337723b65d8fe87d75e64180d3e399`、PR #1998 マージ後の `origin/main`）に
+再調査した結果、**baseline 更新は不要と判断し、6 件とも変更していない**。
+
+- **判断根拠**: `base_sha` と同一コミット（`1c4f938b`）に対する直近 CI 実行
+  （run id `31049091799`, job `e2e`, `2026-08-05T21:32:40Z`, `conclusion: success`）を
+  `gh run view --log` で確認したところ、`title-menu` / `load-menu-empty` /
+  `load-menu-available` / `load-menu-failure` / `preparation-default` /
+  `preparation-upgrade-available` の 6 件すべてが現行コミット済み baseline に対して
+  **PASS** していた（`running-minimal-hud` および `m2-combat-mvp.spec.ts` の
+  `timeout overlay baseline` / `running HUD baseline` を含む他の screenshot test も
+  同一 CI 実行で全件 PASS）。CI が正本環境（`mcr.microsoft.com/playwright@sha256:
+  9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948`、
+  Playwright `1.60.0`、`chromium`）で既に一致しているため、Issue 起票時点の
+  「CI で mismatch している」という観測は、その後 PR #1998 のマージにより解消済みの
+  stale な情報だったと判断した。
+- **ローカル再現との切り分け**: 同一環境（Playwright `1.60.0`、`chromium`、
+  `VITE_E2E_MODE=true pnpm build` 後の `dist` を `CI=true pnpm exec playwright test
+  tests/e2e/phase-screens.spec.ts --project=chromium` で実行、Linux ローカルホスト）で
+  実行したところ、対象 6 件すべてで `ratio 0.01` 前後の小さな pixel diff が発生し FAIL した
+  （`running-minimal-hud` を含む他の phase-screens テストおよび `m2-combat-mvp.spec.ts` の
+  `timeout overlay baseline` は PASS、`running HUD baseline` のみ同種の `ratio 0.02` diff で
+  FAIL）。同一パターン（複数 screenshot test に一様に生じる小さい pixel diff、CI では
+  PASS）は、本台帳 §1/§5 で既知の「CI runner とのフォント fallback 差」に一致し、
+  意図した DOM/CSS 変更ではなく local-vs-CI 環境差（フォントレンダリング）由来と判断した。
+  Issue #1986 の Stop Condition（「差分がフォント・DPR・ブラウザバージョン等の環境差と
+  区別できない場合」「clean current-main でも同一の VRT 差分が再現する場合」）に該当するため、
+  baseline は更新しない。
+- **AC2/AC3 修正との切り分け**: 本 Issue で `tests/e2e/m2-combat-mvp.spec.ts:780` の
+  `data-legacy-result-surface` → `data-legacy-debrief-surface` 修正を行った際、この修正が
+  `m2-timeout-overlay-baseline.png` の canvas capture に視覚的影響を与えるかを
+  `src/systems/PhaseTransitionSystem.ts` / `src/ui/HudController.ts` のソース読解で
+  検証した。`running` → `sortie_terminal` の遷移先は `result`（`debrief_pending_reward` /
+  `debrief_reward_claimed` ではない）であり、`isLegacyDebriefPhase()` は
+  `debrief_pending_reward` / `debrief_reward_claimed` のみを true とするため、timeout
+  シナリオ実行中 `data-legacy-debrief-surface` 要素は常に `hidden` のままである。よって
+  masking selector の属性名修正は当該テストに対して視覚的に no-op であり、上記ローカル
+  FAIL はこの修正由来ではなく環境差由来と結論した。
+- **evidence**: worktree `.claude/worktrees/issue-1986-e2e-followup-1984`。
+  `git status --porcelain -- tests/e2e/__screenshots__/phase-screens.spec.ts/` は
+  空（変更なし）。CI run `31049091799`（job `e2e`）のログに全 6 件の PASS 行を確認。
+- **maturity / tolerance**: 変更なし（baseline PNG 6 件は既存のまま）。
+
 ## 4. baseline update policy（更新ポリシー）
 
 ### 自動更新の禁止

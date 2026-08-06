@@ -698,6 +698,7 @@ test('GIVEN sortie running WHEN HUD rendered THEN the combat HUD (data-combat-hu
     .toBe('running')
 
   await expect(page.locator('[data-combat-hud]')).toBeVisible({ timeout: 3000 })
+  await expect(page.locator('[data-legacy-debrief-surface]')).toHaveCount(1, { timeout: 3000 })
   await expect(page.locator('[data-legacy-debrief-surface]')).toBeHidden({ timeout: 3000 })
   await expect(page.locator('[data-field="combat-hud-weapon"]')).toHaveText(/Ready|Recharging/, {
     timeout: 3000,
@@ -777,7 +778,7 @@ test('GIVEN short sortie fixture WHEN timeout overlay baseline then Canvas scree
   await page.waitForTimeout(200)
   await page.addStyleTag({
     content:
-      '[data-self-explanation-card="true"], [data-legacy-result-surface] { visibility: hidden !important; }',
+      '[data-self-explanation-card="true"], [data-legacy-debrief-surface] { visibility: hidden !important; }',
   })
 
   await expect(page.locator('canvas.battle-stage__canvas')).toHaveScreenshot(
