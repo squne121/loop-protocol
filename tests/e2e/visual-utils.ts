@@ -111,6 +111,18 @@ export const VISUAL_BASELINE_REGISTRY_IDS = [
   // same id for two unrelated baselines (different test file, different
   // capture root, different tolerance) would make the registry ambiguous.
   'running-hud-overlay-legacy-current',
+  // Issue #1958 AC8 (owner decision #2): representative boundary-cell VRT
+  // baselines for the SAME `[data-battle-ui-root]` capture root /
+  // `running-hud` fixture as `running-hud-overlay-legacy-current` above, at
+  // the four documented desktop/low-DPR/minimum-mobile boundary viewports
+  // `tests/e2e/hud-hull-overflow.spec.ts`'s geometry assertions already
+  // exercise behaviorally. Distinct ids (not the same id reused four times)
+  // because each is an independent baseline PNG / registry row per
+  // docs/dev/visual-baseline-registry.md's one-row-per-baseline convention.
+  'running-hud-overlay-legacy-current-1366x768',
+  'running-hud-overlay-legacy-current-1920x1080',
+  'running-hud-overlay-legacy-current-1437x1365-dpr0667',
+  'running-hud-overlay-legacy-current-375x667',
 ] as const
 
 export type VisualBaselineRegistryId = (typeof VISUAL_BASELINE_REGISTRY_IDS)[number]
@@ -144,6 +156,13 @@ export const VISUAL_BASELINE_REGISTRY_MATURITY: Readonly<
   'result-overlay-timeout': 'legacy-current',
   'final-no-command-rail': 'pending-baseline',
   'running-hud-overlay-legacy-current': 'legacy-current',
+  // Issue #1958 AC8: boundary-cell captures share the SAME maturity as the
+  // base 1280x720 `running-hud-overlay-legacy-current` baseline (identical
+  // capture root / fixture / tolerance, only the viewport differs).
+  'running-hud-overlay-legacy-current-1366x768': 'legacy-current',
+  'running-hud-overlay-legacy-current-1920x1080': 'legacy-current',
+  'running-hud-overlay-legacy-current-1437x1365-dpr0667': 'legacy-current',
+  'running-hud-overlay-legacy-current-375x667': 'legacy-current',
 }
 
 // ---------------------------------------------------------------------------

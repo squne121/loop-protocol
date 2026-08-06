@@ -147,6 +147,155 @@ test('GIVEN the running-hud active-fixture-only scenario WHEN the DOM overlay ro
 })
 
 // ---------------------------------------------------------------------------
+// AC8: representative boundary-cell VRT baselines (Issue #1958, owner
+// decision #2 — https://github.com/squne121/loop-protocol/issues/1958#issuecomment-5209263609)
+// ---------------------------------------------------------------------------
+//
+// AC8 requires representative BOUNDARY cells, not a full combinatorial
+// matrix. The default viewport (1280x720, playwright.config.ts) is already
+// captured above (`running-hud-overlay-legacy-current`). The four cells
+// below reuse the SAME boundary set `tests/e2e/hud-hull-overflow.spec.ts`'s
+// geometry assertions already exercise behaviorally for this Issue
+// (desktop laptop / desktop wide / low-DPR owner-report / minimum supported
+// mobile), so the VRT evidence and the geometry proof cover the identical
+// documented boundary set.
+//
+// `installVisualScenario()` forces `page.setViewportSize()` from
+// `RUNNING_HUD_FIXTURE.viewportLabel` ('desktop-1280x720', see
+// `tests/e2e/visual-utils.ts`'s `VIEWPORT_LABELS`, itself exhaustive over
+// `VisualScenarioViewportLabel` from `src/main.ts` — outside this Issue's
+// Allowed Paths, so it is deliberately not extended). Each test below
+// re-applies `page.setViewportSize()` with the boundary cell's dimensions
+// immediately AFTER `installVisualScenario()` (and before `page.goto()`) so
+// the boundary viewport wins, without touching that exhaustive label union.
+// `deviceScaleFactor` (the 1437x1365 low-DPR cell only) is a `BrowserContext`
+// launch-time option and is NOT re-settable via `setViewportSize()`, so it
+// is set via `test.use()` at the `describe` scope below instead — the same
+// mechanism `tests/e2e/hud-hull-overflow.spec.ts`'s "low-DPR regression"
+// describe block uses.
+//
+// Reuses the SAME running-hud fixture/registry-id family, the same
+// `canvasVisibility: 'hidden'` Canvas exclusion (never the removed
+// full-mask path, Issue #1980), and the same `maxDiffPixels: 100` tolerance
+// as the primary 1280x720 capture above — only the viewport (and, for the
+// low-DPR cell, deviceScaleFactor) differ, so pixel-diversity / negative-
+// control coverage already proven for that capture root/tolerance carries
+// over.
+
+// `scripts/check-visual-artifact-pipeline.py`'s static active-capture
+// derivation requires a plain quoted-string literal for BOTH the screenshot
+// name and the registryId argument at each `expectDomOverlayScreenshot()`
+// call site (Issue #1387 "active capture, not suite" contract) — a
+// template-literal with `${...}` interpolation cannot be statically
+// resolved to the real runtime value and is a hard fail there by design.
+// The four boundary cells are therefore four separate, explicitly-literal
+// `test.describe()` blocks (not a `for` loop building interpolated names),
+// even though this repeats the call shape four times.
+
+test.describe('AC8 boundary cell: 1366x768', () => {
+  test.use({ viewport: { width: 1366, height: 768 } })
+
+  test('GIVEN the running-hud active-fixture-only scenario at boundary viewport 1366x768 WHEN the DOM overlay root is captured THEN it matches the representative boundary-cell baseline (AC8)', async ({
+    page,
+  }) => {
+    await installVisualScenario(page, RUNNING_HUD_FIXTURE)
+    // Re-applies the boundary cell's viewport AFTER installVisualScenario()
+    // (which forces RUNNING_HUD_FIXTURE.viewportLabel's 1280x720) and
+    // BEFORE page.goto() — see the file-header comment above.
+    await page.setViewportSize({ width: 1366, height: 768 })
+    await page.goto('/')
+
+    const overlayRoot = page.locator('[data-battle-ui-root]')
+    await expectDomOverlayScreenshot(
+      overlayRoot,
+      'vrt-running-hud-overlay-1366x768.png',
+      'running-hud-overlay-legacy-current-1366x768',
+      {
+        maxDiffPixels: 100,
+        canvasVisibility: 'hidden',
+      },
+    )
+  })
+})
+
+test.describe('AC8 boundary cell: 1920x1080', () => {
+  test.use({ viewport: { width: 1920, height: 1080 } })
+
+  test('GIVEN the running-hud active-fixture-only scenario at boundary viewport 1920x1080 WHEN the DOM overlay root is captured THEN it matches the representative boundary-cell baseline (AC8)', async ({
+    page,
+  }) => {
+    await installVisualScenario(page, RUNNING_HUD_FIXTURE)
+    await page.setViewportSize({ width: 1920, height: 1080 })
+    await page.goto('/')
+
+    const overlayRoot = page.locator('[data-battle-ui-root]')
+    await expectDomOverlayScreenshot(
+      overlayRoot,
+      'vrt-running-hud-overlay-1920x1080.png',
+      'running-hud-overlay-legacy-current-1920x1080',
+      {
+        maxDiffPixels: 100,
+        canvasVisibility: 'hidden',
+      },
+    )
+  })
+})
+
+test.describe('AC8 boundary cell: 1437x1365 low-DPR (owner playtest report)', () => {
+  test.use({
+    viewport: { width: 1437, height: 1365 },
+    // Chromium requires deviceScaleFactor > 0; 0.667 approximates the
+    // owner playtest report's effectively higher-resolution logical
+    // viewport than the physical display (DPR below 1) — the identical
+    // approximation `tests/e2e/hud-hull-overflow.spec.ts`'s "low-DPR
+    // regression (owner playtest report)" describe block uses.
+    deviceScaleFactor: 0.667,
+  })
+
+  test('GIVEN the running-hud active-fixture-only scenario at boundary viewport 1437x1365 deviceScaleFactor 0.667 (approx) WHEN the DOM overlay root is captured THEN it matches the representative boundary-cell baseline (AC8)', async ({
+    page,
+  }) => {
+    await installVisualScenario(page, RUNNING_HUD_FIXTURE)
+    await page.setViewportSize({ width: 1437, height: 1365 })
+    await page.goto('/')
+
+    const overlayRoot = page.locator('[data-battle-ui-root]')
+    await expectDomOverlayScreenshot(
+      overlayRoot,
+      'vrt-running-hud-overlay-1437x1365-dpr0667.png',
+      'running-hud-overlay-legacy-current-1437x1365-dpr0667',
+      {
+        maxDiffPixels: 100,
+        canvasVisibility: 'hidden',
+      },
+    )
+  })
+})
+
+test.describe('AC8 boundary cell: 375x667 (minimum supported viewport)', () => {
+  test.use({ viewport: { width: 375, height: 667 } })
+
+  test('GIVEN the running-hud active-fixture-only scenario at boundary viewport 375x667 WHEN the DOM overlay root is captured THEN it matches the representative boundary-cell baseline (AC8)', async ({
+    page,
+  }) => {
+    await installVisualScenario(page, RUNNING_HUD_FIXTURE)
+    await page.setViewportSize({ width: 375, height: 667 })
+    await page.goto('/')
+
+    const overlayRoot = page.locator('[data-battle-ui-root]')
+    await expectDomOverlayScreenshot(
+      overlayRoot,
+      'vrt-running-hud-overlay-375x667.png',
+      'running-hud-overlay-legacy-current-375x667',
+      {
+        maxDiffPixels: 100,
+        canvasVisibility: 'hidden',
+      },
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Active captures promoted by Issue #1376 (AC12): running-hud-paused / result-timeout
 // ---------------------------------------------------------------------------
 //

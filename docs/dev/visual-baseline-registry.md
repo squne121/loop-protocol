@@ -98,6 +98,10 @@ registry は推測ではなく現行テスト実体に基づいて分類する�
 | timeout-overlay | screenshot-baseline | frozen | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-timeout-overlay-baseline.png`（`m2-combat-mvp.spec.ts` の timeout overlay baseline test） | #732 / #681 / #747 | timeout は defeat ではない中立終了表示であること・背景 tint・可読性・整数段階表示 | 色味 / 最終配置は UI 再設計で変更可 | `maxDiffPixels: 1`（理由: CI Chromium + 固定 viewport 1280x720 + 決定論的 E2E モード前提でのみ妥当） | 意図した視覚仕様変更を人間がレビューし承認した場合のみ（§4 checklist 経由） | #727（HUD/layout 再設計） |
 | running-hud | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/m2-combat-mvp.spec.ts/m2-running-hud-baseline.png`（`m2-combat-mvp.spec.ts` の running HUD baseline test。Issue #1375 で capture root を `[data-field="sortie-status"]` 単一 field から `[data-combat-hud]` パネル全体に変更し、Hull/Kills/Elapsed/Weapon/Assist status の各 field は mask 済み） | #681 / #726 / #727 / #1370 / #1375 / #1377 / #1380 | running HUD が描画されること・HULL/HP の小数露出がないこと・桁溢れがないこと・combat HUD が Hull/Kills/Elapsed/Weapon/Assist/Pause のみで構成されること（#1375 AC2） | 色味 / 詳細配置 / right rail 依存は再設計まで可変 | `maxDiffPixels: 150`（Issue #1375 で `maxDiffPixelRatio: 0.08` から変更。理由: capture root を単一 field から複数 field を含むパネル全体へ拡張したため、絶対ピクセル数の許容差に統一した。masked field 以外のパネル chrome/ラベルのみを比較） | #727 再開時または #1370 / #1375 / #1377 / #1380 系の overlay rollout 進行時に破棄 / 再分類可 | #727 / #1370 / #1375 / #1377 / #1380（HUD/layout 再設計と overlay rollout） |
 | running-hud-overlay-legacy-current | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test） | #1386 / #1380 / #1370 / #1374 | `[data-battle-ui-root]` DOM overlay 全体（HUD 各 field を含む）が描画されること。`running-hud`（`m2-combat-mvp.spec.ts` の単一 field baseline）とは別の独立した baseline であり、両者は衝突しない | 色味 / 詳細配置 / right rail・command-rail 依存は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。理由: capture root が canvas mask を含み全体の過半を占めるため `maxDiffPixelRatio` は不採用。非mask領域のfont-rasterizationノイズに対しこのworktree環境で複数回実測し PASS した最小幅に margin を加えた値。`tests/e2e/visual.freeze.css` で capture root 配下の font-family を generic family（`sans-serif`）に固定し、host font fallback chain 依存を除去済み） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1375/#1376/#1377 マージ後） | #1375 / #1376 / #1377 / #1380（overlay UI 実装マージで破棄・再生成対象） |
+| running-hud-overlay-legacy-current-1366x768 | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay-1366x768.png`（`tests/e2e/visual-overlay.spec.ts` の `AC8 boundary cell: 1366x768` describe block） | #1958 | `running-hud-overlay-legacy-current` と同一の `[data-battle-ui-root]` capture root / `running-hud` fixture を、`tests/e2e/hud-hull-overflow.spec.ts` の geometry 境界セット（AC8）のうちデスクトップ・ラップトップ解像度で描画すること | 色味 / 詳細配置は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（`running-hud-overlay-legacy-current` と同一の絶対ピクセル許容差。同一 capture root・同一 tolerance 根拠） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（`running-hud-overlay-legacy-current` と同時遷移） | #1375 / #1376 / #1377 / #1380 |
+| running-hud-overlay-legacy-current-1920x1080 | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay-1920x1080.png`（`tests/e2e/visual-overlay.spec.ts` の `AC8 boundary cell: 1920x1080` describe block） | #1958 | `running-hud-overlay-legacy-current` と同一の capture root / fixture を、デスクトップワイド解像度境界（AC8）で描画すること | 色味 / 詳細配置は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（同上） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（`running-hud-overlay-legacy-current` と同時遷移） | #1375 / #1376 / #1377 / #1380 |
+| running-hud-overlay-legacy-current-1437x1365-dpr0667 | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay-1437x1365-dpr0667.png`（`tests/e2e/visual-overlay.spec.ts` の `AC8 boundary cell: 1437x1365 low-DPR` describe block。`test.use({ deviceScaleFactor: 0.667 })`） | #1958 | `running-hud-overlay-legacy-current` と同一の capture root / fixture を、owner playtest report が指摘した低 DPR 境界（`tests/e2e/hud-hull-overflow.spec.ts` の「low-DPR regression」describe block と同一近似）で描画すること | 色味 / 詳細配置は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（同上） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（`running-hud-overlay-legacy-current` と同時遷移） | #1375 / #1376 / #1377 / #1380 |
+| running-hud-overlay-legacy-current-375x667 | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay-375x667.png`（`tests/e2e/visual-overlay.spec.ts` の `AC8 boundary cell: 375x667` describe block） | #1958 | `running-hud-overlay-legacy-current` と同一の capture root / fixture を、`Supported minimum viewport`（375x667、AC7/AC8 の最小サポート境界）で描画すること | 色味 / 詳細配置は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（同上） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（`running-hud-overlay-legacy-current` と同時遷移） | #1375 / #1376 / #1377 / #1380 |
 | defeat-overlay | pixel-contract | predicate-only | `getImageData` smoke（`m2-combat-mvp.spec.ts` の defeat overlay 赤支配ピクセル検証 / AC8） | #681 / #732 | defeat overlay が赤系・終端状態として識別可能であること | exact pixels は未固定。最終 layout / 色味は未確定 | N/A（screenshot baseline ではない） | predicate（赤支配）が壊れた場合のみテスト側を調整 | #727 |
 | hp-label | predicate-only | predicate-only | HP label bounds smoke（`m2-combat-mvp.spec.ts` の HP label bounding box 検証 / AC5） | #726 / #727 | HP label が viewport 外 / NaN 表示にならない・bounds 内・可読であること | 最終 UI 表現 / 配置は未固定 | N/A（screenshot baseline ではない） | predicate（bounds / 可読）が壊れた場合のみテスト側を調整 | #727 |
 | running-hud-paused | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-paused-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test。Issue #1376 AC12 で active 昇格） | #1380 / #1375 / #1376 / #1377 / #1391 | running HUD の停止状態でも command-rail / right rail / two-column shell / `.battle-stage` 外 controls への依存がないことを明示し、pause dialog（`role="dialog"`、Resume 初期 focus、Canvas/combat HUD inert 化）が描画されること | 色味 / 詳細配置は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。`running-hud-overlay-legacy-current` と同じ capture root・同じ理由で採用。ローカル環境で複数回実測し PASS した） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1377 マージ後） | #1370 / #1375 / #1376 / #1377 / #1380 |
@@ -632,6 +636,82 @@ overlay UI E2E 検証）を含む後続コミットに過ぎない。以下、�
   `git status --porcelain -- tests/e2e/__screenshots__/phase-screens.spec.ts/` は
   空（変更なし）。CI run `31049091799`（job `e2e`）のログに全 6 件の PASS 行を確認。
 - **maturity / tolerance**: 変更なし（baseline PNG 6 件は既存のまま）。
+
+### AC8 representative boundary-cell baseline 4 件の新規追加（Issue #1958、owner decision #2、明示）
+
+Issue #1958 AC8 は、combat HUD の safe-zone 配置が代表的な境界ビューポートで
+VRT 証跡化されることを要求する。owner decision #2
+（https://github.com/squne121/loop-protocol/issues/1958#issuecomment-5209263609）で、
+`scripts/check-visual-artifact-pipeline.py` が単一 run-wide viewport fingerprint
+しか表現できない構造的制約を解消するスキーマ拡張と、AC8 の代表境界セル baseline
+登録が承認された。
+
+- **root cause と解消**: `scripts/check-visual-artifact-pipeline.py` の
+  `extract_derived_active_captures()` は、`playwright.config.ts` の単一デフォルト
+  project から正規表現で抽出した `viewport` を `common_fields` 経由で全 capture に
+  一律適用していた（PR #1387 時点の設計）。`_find_describe_scopes()` /
+  `_find_test_use_overrides()` / `_resolve_viewport_context()` を追加し、各
+  capture call site を包含する `test.describe()` scope に `test.use({ viewport:
+  {...}, deviceScaleFactor: ... })` override が存在する場合はそれを優先する
+  per-capture 解決に変更した（sibling describe block の override が漏れ込まない
+  よう、`test.describe()` の balanced-brace scope 境界で限定）。suite レベルの
+  単一 fingerprint には戻していない（PR #1813 review fix, P1 Blocker 2 の
+  「suite レベル fingerprint を残さない」制約を維持）。
+- **登録した baseline**（境界セル。全て `running-hud` fixture / `[data-battle-ui-root]`
+  capture root / `canvasVisibility: 'hidden'` / `maxDiffPixels: 100` は
+  `running-hud-overlay-legacy-current` と同一。差分はビューポートと、1437x1365
+  セルのみ `deviceScaleFactor: 0.667`）:
+  - `running-hud-overlay-legacy-current-1366x768`
+    （`vrt-running-hud-overlay-1366x768.png`、デスクトップ・ラップトップ境界）
+  - `running-hud-overlay-legacy-current-1920x1080`
+    （`vrt-running-hud-overlay-1920x1080.png`、デスクトップワイド境界）
+  - `running-hud-overlay-legacy-current-1437x1365-dpr0667`
+    （`vrt-running-hud-overlay-1437x1365-dpr0667.png`、owner playtest report の
+    低 DPR 境界。`tests/e2e/hud-hull-overflow.spec.ts` の「low-DPR regression」
+    describe block と同一の deviceScaleFactor 0.667 近似）
+  - `running-hud-overlay-legacy-current-375x667`
+    （`vrt-running-hud-overlay-375x667.png`、`Supported minimum viewport` 境界）
+  - 既存の 1280x720 baseline（`running-hud-overlay-legacy-current`、
+    `vrt-running-hud-overlay.png`）は変更していない。
+- **既存 1280x720 baseline との衝突なし**: `pnpm run test:vrt:update:e2e`
+  （`--update-snapshots=all`）実行時に `vrt-running-hud-overlay.png` も
+  無条件で再書込みされたが、regenerate 前後で blob が異なっていた
+  （font-rasterization ノイズ、既知の local-vs-CI 環境差パターン、上記
+  Issue #1986 セクション参照）ため、AC8 の Scope 外である当該ファイルは
+  `git checkout -- tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay.png`
+  でコミット済みバイトへ復元し、変更なしのまま維持した。
+- **pixel diversity 確認**（新規 4 PNG。マスク支配の全面塗り defect（Issue
+  #1980 参照）が再発していないことを、AC2 の dominant-color-ratio 手法と同じ
+  アルゴリズムで個別確認した。0.9 未満であれば非degenerate）:
+  - `vrt-running-hud-overlay-1366x768.png`: 1316x742, dominant_ratio=0.5804,
+    unique_colors=1295
+  - `vrt-running-hud-overlay-1920x1080.png`: 1478x833, dominant_ratio=0.5256,
+    unique_colors=1096
+  - `vrt-running-hud-overlay-1437x1365-dpr0667.png`: 1387x781,
+    dominant_ratio=0.3749, unique_colors=1085
+  - `vrt-running-hud-overlay-375x667.png`: 353x199, dominant_ratio=0.3054,
+    unique_colors=524
+  （全件 `SINGLE_COLOR_DOMINANCE_THRESHOLD`（0.9）を大きく下回り、Canvas
+  exclusion が `'hidden'` 方式のまま維持されている＝mask 全面被覆へ回帰して
+  いないことを裏付ける）
+- **negative control**: 既存の `running-hud-overlay-legacy-current` 用
+  negative control（hidden-HUD capture を real production matcher で reject
+  することを証明するテスト）は変更していない。境界セルごとの個別 negative
+  control は本 owner decision の Scope（「最小限の schema/matrix 変更」）外
+  として追加していない。
+- **generation / verification**（このworktree環境。ローカル Chromium、
+  `VITE_E2E_MODE=true pnpm build` 済み `dist` を使用）:
+  - 生成: `pnpm run test:vrt:update:e2e` — 11 tests 中 9 passed / 2 skipped
+    （既存の pending-baseline skip・negative control skip は
+    `--update-snapshots=all` 下で従来通り skip）
+  - 検証（real comparison, non-update）: `pnpm run test:vrt` — 11 tests 中
+    10 passed / 1 skipped（pending-baseline のみ skip）。新規 4 件を含む
+    全 active capture が実 Chromium 比較で PASS、negative control も
+    hidden-HUD capture を正しく reject
+  - `uv run --locked python scripts/check-visual-artifact-pipeline.py`:
+    `status: pass`（`.github/workflows/ci.yml` の `CAPTURES` literal 4 件追加後）
+- **maturity**: 新規 4 件とも `legacy-current`（`running-hud-overlay-legacy-current`
+  と同一。§4 の `maturity transition` を満たすまで `frozen` 化しない）。
 
 ## 4. baseline update policy（更新ポリシー）
 
