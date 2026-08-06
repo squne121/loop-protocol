@@ -70,6 +70,11 @@ NO_TOOLS_PROFILE = "no_tools"
 LOCAL_ASSET_RESEARCH_PROFILE = "local_asset_research"
 GROUNDED_RESEARCH_PROFILE = "grounded_research"
 PROPOSAL_ONLY_PROFILE = "proposal_only"
+# Issue #1920: AGY has zero native tool-call surface under this profile (see
+# PROFILE_ALLOWED_TOOLS below) -- the actual `gh` invocation is executed by
+# `run_agy_github_research_broker.py`, a process external to AGY, never by an
+# AGY-native tool call. AGY only ever produces plain-text turn responses.
+GITHUB_RESEARCH_PROFILE = "github_research"
 
 ALLOWED_PROFILES: frozenset[str] = frozenset(
     {
@@ -77,6 +82,7 @@ ALLOWED_PROFILES: frozenset[str] = frozenset(
         LOCAL_ASSET_RESEARCH_PROFILE,
         GROUNDED_RESEARCH_PROFILE,
         PROPOSAL_ONLY_PROFILE,
+        GITHUB_RESEARCH_PROFILE,
     }
 )
 
@@ -117,7 +123,12 @@ ALLOWED_AUTH_PROFILES: frozenset[str] = frozenset({AGY_AUTH_PROFILE_MINIMAL, AGY
 # filesystem/tool-call attack surface materially widened by a readable
 # (but not kernel-enforced-read-only) token symlink, so degraded-mode
 # continuation is judged acceptable for them (Issue #1779 In Scope item 2).
-_AUTH_READONLY_FAIL_CLOSED_PROFILES: frozenset[str] = frozenset({NO_TOOLS_PROFILE, LOCAL_ASSET_RESEARCH_PROFILE})
+# github_research has zero native tool-call surface (identical posture to
+# no_tools/local_asset_research for this invariant), so it joins the same
+# fail-closed set (Issue #1920).
+_AUTH_READONLY_FAIL_CLOSED_PROFILES: frozenset[str] = frozenset(
+    {NO_TOOLS_PROFILE, LOCAL_ASSET_RESEARCH_PROFILE, GITHUB_RESEARCH_PROFILE}
+)
 
 
 class AgyReadOnlyBoundaryError(RuntimeError):
@@ -193,6 +204,10 @@ PROFILE_ALLOWED_PERMISSION_RESOURCES: dict[str, frozenset[str]] = {
     LOCAL_ASSET_RESEARCH_PROFILE: frozenset(),
     GROUNDED_RESEARCH_PROFILE: frozenset({"read_url"}),
     PROPOSAL_ONLY_PROFILE: frozenset(),
+    # Issue #1920: no native permission resource is granted; the single
+    # `gh` invocation per turn is executed by the external broker, never by
+    # an AGY-native tool call under this profile.
+    GITHUB_RESEARCH_PROFILE: frozenset(),
 }
 
 GROUNDED_RESEARCH_ALLOWLIST: frozenset[str] = frozenset({"search_web", "read_url_content"})
@@ -202,6 +217,7 @@ PROFILE_ALLOWED_TOOLS: dict[str, frozenset[str]] = {
     LOCAL_ASSET_RESEARCH_PROFILE: frozenset(),
     GROUNDED_RESEARCH_PROFILE: GROUNDED_RESEARCH_ALLOWLIST,
     PROPOSAL_ONLY_PROFILE: frozenset(),
+    GITHUB_RESEARCH_PROFILE: frozenset(),
 }
 
 # Fixed policy invariants (Issue #1705 AC11): AGY never receives direct MCP
