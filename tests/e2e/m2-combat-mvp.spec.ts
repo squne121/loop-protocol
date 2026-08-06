@@ -93,6 +93,48 @@ async function waitForTicks(
     .toBeGreaterThan(fromTick + count - 1)
 }
 
+/**
+ * Assert the legacy debrief surface (`[data-legacy-debrief-surface]`) is
+ * inactive (present exactly once, hidden, inert, aria-hidden='true') per the
+ * app's own visibility contract (HudController.ts `setHudRootVisibility`).
+ *
+ * Used before screenshot captures that intentionally CSS-mask
+ * `[data-self-explanation-card="true"]` but must NOT also mask this legacy
+ * surface -- masking it would silently hide a real integration regression
+ * (the legacy surface incorrectly showing up) instead of letting the
+ * screenshot diff catch it (Issue #1986, PR #2003 review).
+ *
+ * A single `expect.poll()` observation point is used (rather than separate
+ * assertions per field) so all four properties are read from the same DOM
+ * snapshot instead of being re-evaluated independently against a
+ * potentially-changing element between calls.
+ */
+async function expectLegacyDebriefInactive(page: Page): Promise<void> {
+  const legacyDebrief = page.locator('[data-legacy-debrief-surface]')
+
+  await expect
+    .poll(
+      () =>
+        legacyDebrief.evaluateAll((nodes) => {
+          const element = nodes[0] as HTMLElement | undefined
+
+          return {
+            count: nodes.length,
+            hidden: element?.hidden ?? null,
+            inert: element?.hasAttribute('inert') ?? null,
+            ariaHidden: element?.getAttribute('aria-hidden') ?? null,
+          }
+        }),
+      { timeout: 3000 },
+    )
+    .toEqual({
+      count: 1,
+      hidden: true,
+      inert: true,
+      ariaHidden: 'true',
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -775,10 +817,21 @@ test('GIVEN short sortie fixture WHEN timeout overlay baseline then Canvas scree
     )
     .toBe('timeout')
 
+  // Allow a couple of render frames to ensure the canvas overlay is painted
+  // before asserting/capturing (same rationale as the other terminal-state
+  // tests in this file that use this fixed wait after a `.poll()` on
+  // sortie.status; expectLegacyDebriefInactive() below polls DOM attribute
+  // state, not canvas paint completion, so it does not substitute for this).
   await page.waitForTimeout(200)
+
+  // Issue #1986 PR #2003 review: assert the legacy debrief surface is
+  // actually inactive per the app's own contract instead of forcibly
+  // CSS-masking it before the screenshot -- masking it here would silently
+  // hide a real integration regression rather than let the diff catch it.
+  await expectLegacyDebriefInactive(page)
+
   await page.addStyleTag({
-    content:
-      '[data-self-explanation-card="true"], [data-legacy-debrief-surface] { visibility: hidden !important; }',
+    content: '[data-self-explanation-card="true"] { visibility: hidden !important; }',
   })
 
   await expect(page.locator('canvas.battle-stage__canvas')).toHaveScreenshot(
