@@ -294,6 +294,10 @@ evidence_ref:
 caller_action: "Manual verification required — provide explicit commit SHA + verified line numbers"
 ```
 
+## Reserved: context_bundle_path（#1909 予約・未実装）
+
+`context_bundle_path` は #1909（現在 OPEN・未マージ）が所有する契約であり、本 SubAgent（本ファイル）はこの契約を実装・参照しない。本 Issue（#1886）のスコープは #1909 の `context_bundle_path` 契約そのものの実装を明示的に除外しており、本セクションは #1909 マージ後に同一 line / semantic contract と衝突しないための予約コメントに過ぎない。機能的なロジック・スキーマフィールド・挙動は一切追加しない。
+
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
