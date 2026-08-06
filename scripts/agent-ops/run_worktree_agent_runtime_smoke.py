@@ -1024,11 +1024,72 @@ def extract_codex_parent_session_id(stdout: str) -> str | None:
     return None
 
 
+def _codex_agent_id_from_spawn_agent_calls(candidate: Path) -> str | None:
+    """Parse ``spawn_agent`` ``function_call``/``function_call_output`` pairs
+    out of a single Codex rollout log file and return the resulting
+    ``agent_id``, if any. Extracted as a helper so both the primary
+    (filename-substring) and fallback (content-linked) lookup strategies in
+    ``extract_codex_child_session_id`` can reuse the same parsing logic."""
+    try:
+        pending_call_ids: set[str] = set()
+        for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            payload = record.get("payload") if isinstance(record, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "function_call" and payload.get("name") == "spawn_agent":
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    pending_call_ids.add(call_id)
+                continue
+            if payload.get("type") == "function_call_output" and payload.get("call_id") in pending_call_ids:
+                output = payload.get("output")
+                if isinstance(output, str):
+                    try:
+                        parsed_output = json.loads(output)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    agent_id = parsed_output.get("agent_id") if isinstance(parsed_output, dict) else None
+                    if isinstance(agent_id, str) and agent_id:
+                        return agent_id
+        return None
+    except OSError:
+        return None
+
+
 def extract_codex_child_session_id(parent_session_id: str | None) -> str | None:
-    """Best-effort ``agent_id`` extraction from the on-disk Codex rollout log
-    matching ``parent_session_id`` (searched under
-    ``~/.codex/sessions/**/rollout-*<parent_session_id>*.jsonl``). Returns
-    ``None`` on any lookup failure."""
+    """``agent_id``/child thread id extraction for the Codex CLI child
+    sub-agent spawned by this run.
+
+    Primary source (unchanged): the on-disk Codex rollout log whose
+    *filename* contains ``parent_session_id``, parsed for
+    ``spawn_agent`` ``function_call``/``function_call_output`` pairs. This
+    only ever matches when the parent thread's own rollout log is itself
+    persisted to disk under that id.
+
+    Fallback source (Issue #1886 AC7 fix-delta, iteration 7): this runner
+    invokes ``codex exec --ephemeral`` (see ``run_structured_codex``), which
+    -- analogous to Claude Code's ``--no-session-persistence`` -- suppresses
+    persistence of the *parent* thread's own rollout log. No file's
+    filename will ever contain ``parent_session_id`` in that case. However,
+    a spawned child sub-agent thread's *own* rollout log is still written
+    to disk, and its first record (``type: session_meta``) carries a
+    ``payload.parent_thread_id`` (also duplicated as ``payload.session_id``)
+    equal to the spawning parent's own ``thread_id`` -- this is genuine,
+    content-level linkage recorded by the Codex CLI itself, not an
+    inference. Once such a file is found, its own ``payload.id`` (also
+    embedded in the filename) is returned as the child thread's session id
+    -- direct evidence of a distinct, non-empty child session that differs
+    from ``parent_session_id`` (see ``native_spawn_event_observed``).
+
+    Returns ``None`` on any lookup failure -- this is read-only,
+    best-effort evidence collection, never a guess."""
     if not parent_session_id:
         return None
     try:
@@ -1037,36 +1098,31 @@ def extract_codex_child_session_id(parent_session_id: str | None) -> str | None:
             return None
         matches = list(sessions_dir.glob(f"**/*{parent_session_id}*.jsonl"))
         for candidate in matches:
+            agent_id = _codex_agent_id_from_spawn_agent_calls(candidate)
+            if agent_id:
+                return agent_id
+        for candidate in sorted(sessions_dir.glob("**/*.jsonl")):
             try:
-                pending_call_ids: set[str] = set()
-                for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    payload = record.get("payload") if isinstance(record, dict) else None
-                    if not isinstance(payload, dict):
-                        continue
-                    if payload.get("type") == "function_call" and payload.get("name") == "spawn_agent":
-                        call_id = payload.get("call_id")
-                        if isinstance(call_id, str):
-                            pending_call_ids.add(call_id)
-                        continue
-                    if payload.get("type") == "function_call_output" and payload.get("call_id") in pending_call_ids:
-                        output = payload.get("output")
-                        if isinstance(output, str):
-                            try:
-                                parsed_output = json.loads(output)
-                            except (json.JSONDecodeError, ValueError):
-                                continue
-                            agent_id = parsed_output.get("agent_id") if isinstance(parsed_output, dict) else None
-                            if isinstance(agent_id, str) and agent_id:
-                                return agent_id
+                first_line = candidate.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
             except OSError:
                 continue
+            if not first_line:
+                continue
+            try:
+                record = json.loads(first_line[0].strip())
+            except (json.JSONDecodeError, ValueError, IndexError):
+                continue
+            if not isinstance(record, dict) or record.get("type") != "session_meta":
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            linked_parent_id = payload.get("parent_thread_id") or payload.get("session_id")
+            if linked_parent_id != parent_session_id:
+                continue
+            own_id = payload.get("id")
+            if isinstance(own_id, str) and own_id:
+                return own_id
         return None
     except OSError:
         return None
