@@ -533,6 +533,106 @@ fail することを確認するテスト）が実際には fail せず、`.reje
   PASS）で再検証した。
 - **maturity / tolerance**: 変更なし。
 
+### `phase-screens.spec.ts` VRT baseline 6 件の更新見送り判断（Issue #1986、明示）
+
+Issue #1986 は、PR #1984（Issue #1376）由来の E2E 不整合の follow-up として、
+`phase-screens.spec.ts` の VRT baseline 6 件（`title-menu` / `load-menu-empty` /
+`load-menu-available` / `load-menu-failure` / `preparation-default` /
+`preparation-upgrade-available`）が CI `e2e` job で mismatch しているという観測を
+出発点としていた。実装着手時（`scope_revalidation.base_sha`
+`1c4f938bab337723b65d8fe87d75e64180d3e399`、PR #1998 マージ後の `origin/main`）に
+再調査した結果、**baseline 更新は不要と判断し、6 件とも変更していない**。
+
+PR #2003 レビュー（OWNER REQUEST_CHANGES, issuecomment-5204495941）で、下記の
+「判断根拠」が canonicalization（baseline を正本として採用した経緯）を PR #1998 の
+マージに誤って帰属させていた欠陥を指摘された。実際の canonicalization source は
+PR #1996 であり、PR #1998 は無関係な変更（`#1377` 由来の command rail 削除・
+overlay UI E2E 検証）を含む後続コミットに過ぎない。以下、修正した経緯を記録する。
+
+- **canonicalization source**（実際に 6 件の baseline を含む計 10 件の PNG を
+  生成・確定した PR）:
+  - PR: #1996（`test(e2e): record securityOrigin/storageKey metadata in write-set
+    audit helper`、Issue #1993 の follow-up）
+  - baseline 生成コミット: `d6217bba050d725aa962e1811c5df9b99945f9e7`
+    （owner 承認によるスコープ拡張。コミットメッセージ:
+    `fix(e2e): regenerate pre-existing VRT baselines (owner-authorized scope
+    expansion, Issue #1993)`）
+  - merge コミット: `10925fbe9ed5d2e80ab2b448cc261c257f5112c8`
+  - regenerated artifacts: `phase-screens.spec.ts` の 6 PNG
+    （`title-menu` / `load-menu-empty` / `load-menu-available` /
+    `load-menu-failure` / `preparation-default` /
+    `preparation-upgrade-available`）を含む、`m2-combat-mvp.spec.ts` 2 PNG
+    （`m2-timeout-overlay-baseline` / `m2-running-hud-baseline`）と
+    `visual-overlay.spec.ts` 2 PNG（`vrt-result-timeout-overlay` /
+    `vrt-running-hud-paused-overlay`）を合わせた計 10 PNG
+  - generation environment: CI が使う pinned Playwright container
+    （`mcr.microsoft.com/playwright@sha256:9bd26ad900...`）内で
+    `playwright test ... --update-snapshots=all` を実行
+  - verification: 同一 container 内で再生成後の 3 spec ファイル全体を実行し
+    `41 passed, 2 skipped`（既存の pending-baseline scenario 2 件、本コミットと
+    無関係）を確認
+  - `git merge-base --is-ancestor 10925fbe 1c4f938b` で PR #1996 の merge コミットが
+    `scope_revalidation.base_sha`（`1c4f938b`, PR #1998 merge コミット）の祖先で
+    あることを確認済み（PR #1996 が PR #1998 より先に main へ merge されている）。
+- **Issue #1986 revalidation checkpoint**（canonicalization ではなく、既に
+  canonicalize 済みの baseline が引き続き CI で PASS することを確認した再検証）:
+  - base SHA: `1c4f938bab337723b65d8fe87d75e64180d3e399`
+  - context: PR #1998 マージ後（PR #1998 自体は baseline 生成・canonicalization を
+    行っていない。この base_sha は単に Issue #1986 実装着手時点の `origin/main`
+    HEAD であり、その時点で PR #1996 由来の baseline が既にコミット済みだった、
+    という意味に過ぎない）
+  - CI 実行: run id `31049091799`, job `e2e`, `2026-08-05T21:32:40Z`,
+    `conclusion: success`（`gh run view --log` で確認）
+  - conclusion: `title-menu` / `load-menu-empty` / `load-menu-available` /
+    `load-menu-failure` / `preparation-default` /
+    `preparation-upgrade-available` の 6 件すべてが現行コミット済み baseline に
+    対して **PASS**（`running-minimal-hud` および `m2-combat-mvp.spec.ts` の
+    `timeout overlay baseline` / `running HUD baseline` を含む他の screenshot
+    test も同一 CI 実行で全件 PASS）。追加更新なし。Issue 起票時点の「CI で
+    mismatch している」という観測は、PR #1996 での baseline 再生成により
+    解消済みの stale な情報だったと判断した。
+- **environment_fingerprint**（上記 canonicalization/revalidation 双方が参照する
+  CI 実行環境。他セクションから推測させず、この記録に明示的に紐づける）:
+  - runner: `ubuntu-24.04`
+  - container digest:
+    `mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948`
+  - Playwright: `1.60.0`
+  - browser: `chromium`
+  - project: `chromium`（`Desktop Chrome`）
+  - viewport: `1280x720`
+  - device_scale_factor: `1`
+  - snapshot_path_template: `{testDir}/__screenshots__/{testFilePath}/{arg}{ext}`
+- **visual_diff_artifacts**（この revalidation checkpoint に対応する証跡）:
+  - expected/actual/diff: N/A（reason: 正本 CI 実行（run id `31049091799`）が
+    既存 baseline に対して全件 PASS したため、diff artifact は生成されていない。
+    baseline の追加更新も行っていない）
+- **ローカル再現との切り分け**: 同一環境（Playwright `1.60.0`、`chromium`、
+  `VITE_E2E_MODE=true pnpm build` 後の `dist` を `CI=true pnpm exec playwright test
+  tests/e2e/phase-screens.spec.ts --project=chromium` で実行、Linux ローカルホスト）で
+  実行したところ、対象 6 件すべてで `ratio 0.01` 前後の小さな pixel diff が発生し FAIL した
+  （`running-minimal-hud` を含む他の phase-screens テストおよび `m2-combat-mvp.spec.ts` の
+  `timeout overlay baseline` は PASS、`running HUD baseline` のみ同種の `ratio 0.02` diff で
+  FAIL）。同一パターン（複数 screenshot test に一様に生じる小さい pixel diff、CI では
+  PASS）は、本台帳 §1/§5 で既知の「CI runner とのフォント fallback 差」に一致し、
+  意図した DOM/CSS 変更ではなく local-vs-CI 環境差（フォントレンダリング）由来と判断した。
+  Issue #1986 の Stop Condition（「差分がフォント・DPR・ブラウザバージョン等の環境差と
+  区別できない場合」「clean current-main でも同一の VRT 差分が再現する場合」）に該当するため、
+  baseline は更新しない。
+- **AC2/AC3 修正との切り分け**: 本 Issue で `tests/e2e/m2-combat-mvp.spec.ts:780` の
+  `data-legacy-result-surface` → `data-legacy-debrief-surface` 修正を行った際、この修正が
+  `m2-timeout-overlay-baseline.png` の canvas capture に視覚的影響を与えるかを
+  `src/systems/PhaseTransitionSystem.ts` / `src/ui/HudController.ts` のソース読解で
+  検証した。`running` → `sortie_terminal` の遷移先は `result`（`debrief_pending_reward` /
+  `debrief_reward_claimed` ではない）であり、`isLegacyDebriefPhase()` は
+  `debrief_pending_reward` / `debrief_reward_claimed` のみを true とするため、timeout
+  シナリオ実行中 `data-legacy-debrief-surface` 要素は常に `hidden` のままである。よって
+  masking selector の属性名修正は当該テストに対して視覚的に no-op であり、上記ローカル
+  FAIL はこの修正由来ではなく環境差由来と結論した。
+- **evidence**: worktree `.claude/worktrees/issue-1986-e2e-followup-1984`。
+  `git status --porcelain -- tests/e2e/__screenshots__/phase-screens.spec.ts/` は
+  空（変更なし）。CI run `31049091799`（job `e2e`）のログに全 6 件の PASS 行を確認。
+- **maturity / tolerance**: 変更なし（baseline PNG 6 件は既存のまま）。
+
 ## 4. baseline update policy（更新ポリシー）
 
 ### 自動更新の禁止
