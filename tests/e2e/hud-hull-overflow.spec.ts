@@ -14,7 +14,24 @@
  *   and app-shell bounding rect stays within viewport bounds (AC2c)
  */
 
+import { execSync } from 'node:child_process'
 import { test, expect, type Page } from '@playwright/test'
+
+/**
+ * Issue #1958 fix_delta iteration 2 item 6 (PR #2006 review, owner decision
+ * comment https://github.com/squne121/loop-protocol/issues/1958#issuecomment-5205380696):
+ * captures the actual git HEAD SHA at test-run time for evidence recording
+ * (item 3's "recorded viewport/DPR/zoom/userAgent/head SHA"). Falls back to
+ * `unknown` rather than throwing if `git` is unavailable in the runner
+ * (never lets diagnostic capture fail the actual assertion under test).
+ */
+function currentHeadSha(): string {
+  try {
+    return execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim()
+  } catch {
+    return 'unknown'
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helper: inject large HP values into the HUD via page.evaluate
@@ -274,6 +291,126 @@ async function assertNoProtectedZoneIntersection(
   }
 }
 
+/**
+ * Issue #1958 fix_delta iteration 2 item 1 (PR #2006 review, owner decision
+ * comment https://github.com/squne121/loop-protocol/issues/1958#issuecomment-5205380696):
+ * runtime placement verification via BOUNDING BOX geometry only -- never CSS
+ * class/grid-area names, and never `[data-combat-hud]`'s own rect (that root
+ * is a transparent, `pointer-events: none` layout box spanning the whole
+ * safe zone -- see `COMBAT_HUD_MARKUP`'s doc comment in
+ * `src/ui/combatHud.ts` -- so its position proves nothing about where any
+ * individual fragment actually renders). Emits full diagnostics (Canvas
+ * rect, fragment rect, safe margin, protected-zone rect, epsilon) on every
+ * assertion via the `message` argument so a failure is self-explanatory in
+ * CI output without needing to reproduce locally.
+ */
+async function assertSemanticPlacement(
+  page: Page,
+  canvasBox: Rect,
+  label: string,
+  opts: { edgeControlExpectedVisible: boolean },
+): Promise<void> {
+  const epsilon = 1
+  const margin = HUD_SAFE_MARGIN_PX
+  const safeZone: Rect = {
+    x: canvasBox.x + margin,
+    y: canvasBox.y + margin,
+    width: canvasBox.width - margin * 2,
+    height: canvasBox.height - margin * 2,
+  }
+  const diag = (fragmentBox: Rect | null) =>
+    `${label}: canvas=${JSON.stringify(canvasBox)} safeZone=${JSON.stringify(safeZone)} ` +
+    `fragment=${JSON.stringify(fragmentBox)} margin=${margin} epsilon=${epsilon}`
+
+  // elapsed: top-center-low-prominence -- horizontally centered in the safe
+  // zone, vertically in the top region. Read first: "the Canvas lower
+  // region" for status/pause below is defined RELATIVE to elapsed's row
+  // (matches the semantic table's actual collapse-priority/row ordering:
+  // `'elapsed elapsed' / 'status pause'`), not an absolute canvas-height
+  // midpoint -- `.combat-hud` is deliberately content-sized and anchored to
+  // the TOP of the safe zone at every viewport (never stretched to the
+  // canvas's full height, see the doc comment on `.combat-hud` in
+  // `src/style.css`), so on tall desktop canvases (e.g. 1920x1080,
+  // 1437x1365) the whole compact cluster legitimately sits well above the
+  // canvas's true vertical midpoint while still being correctly "below
+  // elapsed" -- an absolute-midpoint check would be a false positive there.
+  const elapsedZone = page.locator('[data-hud-zone="elapsed"]')
+  const elapsedVisible = await elapsedZone.isVisible()
+  let elapsedBox: Rect | null = null
+  if (elapsedVisible) {
+    elapsedBox = await elapsedZone.boundingBox()
+    if (elapsedBox) {
+      const elapsedCenterX = elapsedBox.x + elapsedBox.width / 2
+      const safeZoneCenterX = safeZone.x + safeZone.width / 2
+      expect(
+        Math.abs(elapsedCenterX - safeZoneCenterX),
+        `${diag(elapsedBox)}: elapsed zone is horizontally centered in the safe zone`,
+      ).toBeLessThanOrEqual(safeZone.width * 0.15 + epsilon)
+      expect(
+        elapsedBox.y,
+        `${diag(elapsedBox)}: elapsed zone is in the Canvas top region (above safe-zone vertical midpoint)`,
+      ).toBeLessThan(safeZone.y + safeZone.height / 2)
+    }
+  }
+  const lowerRegionThreshold = elapsedBox ? elapsedBox.y + elapsedBox.height : safeZone.y
+
+  // status zone (Hull/critical/Kills): anchors to the Canvas inner-safe LEFT
+  // edge, and to the Canvas LOWER region (below the top-center elapsed row).
+  const statusZone = page.locator('[data-hud-zone="status"]')
+  await expect(statusZone).toBeVisible()
+  const statusBox = await statusZone.boundingBox()
+  expect(statusBox, `${label}: status zone must have a bounding box`).not.toBeNull()
+  if (statusBox) {
+    expect(statusBox.x, `${diag(statusBox)}: status zone left edge anchors the safe-zone left edge`).toBeLessThanOrEqual(
+      safeZone.x + margin + epsilon,
+    )
+    expect(
+      statusBox.y,
+      `${diag(statusBox)}: status zone top edge is in the Canvas lower region (below the top-center elapsed row)`,
+    ).toBeGreaterThanOrEqual(lowerRegionThreshold - epsilon)
+  }
+
+  // edge-control (Weapon/Assist): when visible, anchors to an edge region
+  // (right half of the safe zone) -- never the center/left.
+  const edgeZone = page.locator('[data-hud-zone="edge-control"]')
+  const edgeVisible = await edgeZone.isVisible()
+  expect(edgeVisible, `${label}: edge-control visibility must match the expected collapse state`).toBe(
+    opts.edgeControlExpectedVisible,
+  )
+  if (edgeVisible) {
+    const edgeBox = await edgeZone.boundingBox()
+    if (edgeBox) {
+      expect(
+        edgeBox.x + edgeBox.width,
+        `${diag(edgeBox)}: edge-control zone right edge anchors the safe-zone right edge (its own declared edge region)`,
+      ).toBeGreaterThan(safeZone.x + safeZone.width / 2)
+    }
+  }
+
+  // pause: separate-pause-control, its own declared edge region (right
+  // side), Canvas lower region (below the top-center elapsed row) -- and
+  // never overlapping the status zone (AC1: "Pause remains a separate
+  // focusable/pointer-operable control").
+  const pauseZone = page.locator('[data-hud-zone="pause"]')
+  await expect(pauseZone).toBeVisible()
+  const pauseBox = await pauseZone.boundingBox()
+  expect(pauseBox, `${label}: pause zone must have a bounding box`).not.toBeNull()
+  if (pauseBox && statusBox) {
+    expect(
+      pauseBox.x + pauseBox.width,
+      `${diag(pauseBox)}: pause zone right edge anchors the safe-zone right edge (its own declared edge region)`,
+    ).toBeGreaterThan(safeZone.x + safeZone.width / 2)
+    expect(
+      pauseBox.y,
+      `${diag(pauseBox)}: pause zone top edge is in the Canvas lower region (below the top-center elapsed row)`,
+    ).toBeGreaterThanOrEqual(lowerRegionThreshold - epsilon)
+    expect(
+      rectsIntersect(pauseBox, statusBox),
+      `${label}: pause zone ${JSON.stringify(pauseBox)} must never overlap the status zone ${JSON.stringify(statusBox)} (separate control, not a status-card member)`,
+    ).toBe(false)
+  }
+}
+
 async function assertHudGeometry(page: Page, label: string): Promise<void> {
   const hud = page.locator('[data-combat-hud]')
   const canvas = page.locator('canvas.battle-stage__canvas')
@@ -301,6 +438,10 @@ async function assertHudGeometry(page: Page, label: string): Promise<void> {
   // AC4 (Issue #1958): persistent HUD fragments must not intersect the
   // Canvas center 60%x60% static protected zone.
   await assertNoProtectedZoneIntersection(page, canvasBox, label)
+
+  // AC1 (Issue #1958 fix_delta iteration 2 item 1): runtime bounding-box
+  // proof of the semantic state table's declared placement regions.
+  await assertSemanticPlacement(page, canvasBox, label, { edgeControlExpectedVisible: true })
 
   // HUD and header never overlap as rectangles.
   expect(
@@ -362,6 +503,11 @@ async function assertHudGeometryAtCollapsedMinimum(page: Page, label: string): P
   // Canvas center 60%x60% static protected zone.
   await assertNoProtectedZoneIntersection(page, canvasBox, label)
 
+  // AC1 (Issue #1958 fix_delta iteration 2 item 1): runtime bounding-box
+  // proof of the semantic state table's declared placement regions.
+  // edge-control (Weapon/Assist) is collapsed at this viewport.
+  await assertSemanticPlacement(page, canvasBox, label, { edgeControlExpectedVisible: false })
+
   expect(
     rectsIntersect(hudBox, headerBox),
     `${label}: HUD box ${JSON.stringify(hudBox)} must not intersect header box ${JSON.stringify(headerBox)}`,
@@ -397,34 +543,15 @@ test.describe('hud geometry: combat HUD stays inside the Canvas viewport (AC7)',
     test(`viewport=${vp.label}: HUD is within canvas bounds, never overlaps header, Assist+Pause in viewport, no internal overflow`, async ({
       page,
     }) => {
-      // Issue #1958 AC4 (PR #2006 review fix_delta iteration 1, blocker 1):
-      // at 375x667 the Canvas itself renders only ~352x198 CSS px
-      // (`aspect-ratio: 16 / 9` letterboxed inside this narrow/short
-      // viewport), so its center 60%x60% protected zone leaves only ~40px
-      // of vertical margin above and below it inside the Canvas's safe
-      // zone -- not enough room for a readable bottom-left Hull/critical/
-      // Kills status card (empirically ~85px tall even narrowed) to fit
-      // entirely outside that zone while staying anchored bottom-left per
-      // AC1's fixed placement contract. This is a genuine, structural
-      // conflict between AC1 (fixed bottom-left placement)/AC2 (Hull/Kills
-      // must stay visible+non-overflowing at this minimum viewport) and
-      // AC4 (never intersect the protected zone) at this ONE viewport --
-      // not a false-green: `assertNoProtectedZoneIntersection()` DOES run
-      // and DOES fail here, `test.fail()` only marks that failure as
-      // expected instead of hiding it, and this test still asserts
-      // everything else `assertHudGeometryAtCollapsedMinimum()` checks
-      // (safe-margin containment, no header overlap, Pause reachable, no
-      // internal overflow). Requires human placement-contract judgment (or
-      // a follow-up Issue) to resolve; recorded honestly in the PR body
-      // rather than silently narrowed further or skipped.
-      test.fail(
-        vp.label === '375x667',
-        'Issue #1958 AC4 known gap at 375x667: bottom-left status card ' +
-          'cannot fit entirely outside the Canvas center 60%x60% protected ' +
-          'zone at this viewport without violating AC1/AC2 -- see inline ' +
-          'comment above and the PR body for the full analysis.',
-      )
-
+      // Issue #1958 fix_delta iteration 2 (PR #2006 review, owner decision
+      // comment https://github.com/squne121/loop-protocol/issues/1958#issuecomment-5205380696):
+      // the 375x667 `test.fail()` known-gap marker from iteration 1 is
+      // removed here -- `.combat-hud__status`/`.combat-hud__pause` were
+      // rebuilt as narrow free-column-confined fragments (`src/style.css`'s
+      // `@media (max-width: 420px)` block) that structurally cannot reach
+      // the protected zone's x-range regardless of height, so
+      // `assertNoProtectedZoneIntersection()` now genuinely passes at this
+      // viewport, not just "documented as expected to fail".
       await page.setViewportSize({ width: vp.width, height: vp.height })
       await page.goto('/')
       await page.waitForSelector('[data-combat-hud]', { timeout: 10_000 })
@@ -438,6 +565,182 @@ test.describe('hud geometry: combat HUD stays inside the Canvas viewport (AC7)',
       } else {
         await assertHudGeometry(page, vp.label)
       }
+    })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Issue #1958 fix_delta iteration 2 items 2/3 (PR #2006 review, owner
+// decision comment https://github.com/squne121/loop-protocol/issues/1958#issuecomment-5205380696):
+// 375x667 compact status representation, dual-fixture verification. Exercises
+// BOTH a normal HULL fixture and a critical-warning-triggered fixture (same
+// direct-DOM-injection strategy this file already uses for AC2a/AC2b/AC2c --
+// isolates the layout/AC assertions from game-state setup) and checks every
+// item-3 requirement: AC1 placement, 16px inner containment, protected-zone
+// non-intersection, HULL display, icon+text in the critical fixture, Pause
+// pointer/keyboard/focus reachability, no hidden/collapsed fragment in Tab
+// order, no internal scroll on `.battle-hud-layer`, and records
+// viewport/DPR/zoom/userAgent/head SHA evidence. Dimensions are derived from
+// actual runtime `boundingBox()`/`devicePixelRatio` measurements, never
+// hard-coded guesses.
+// ---------------------------------------------------------------------------
+
+/** Toggles the persistent critical-warning fragment via direct DOM injection
+ * (same strategy `injectHullText` above already uses) -- isolates the
+ * critical-fixture layout assertions from needing full game-state/combat
+ * setup to actually drive `player.hp` below the critical ratio. */
+async function injectCriticalFixture(page: Page, critical: boolean): Promise<void> {
+  await page.evaluate((isCritical) => {
+    const criticalEl = document.querySelector<HTMLElement>('[data-field="combat-hud-critical"]')
+    if (criticalEl) {
+      criticalEl.hidden = !isCritical
+    }
+  }, critical)
+}
+
+async function recordCompactFixtureEvidence(
+  page: Page,
+  label: string,
+): Promise<{ devicePixelRatio: number; userAgent: string; headSha: string; viewport: string }> {
+  const runtime = await page.evaluate(() => ({
+    devicePixelRatio: window.devicePixelRatio,
+    userAgent: navigator.userAgent,
+  }))
+  const headSha = currentHeadSha()
+  const evidence = { ...runtime, headSha, viewport: label }
+  console.info(`[375x667 compact fixture evidence] ${JSON.stringify(evidence)}`)
+  return evidence
+}
+
+test.describe('375x667 compact status representation: dual-fixture verification (AC1/AC2/AC4/AC6)', () => {
+  for (const fixture of [
+    { critical: false, hullText: '42/100', label: 'normal HULL fixture' },
+    { critical: true, hullText: '5/100', label: 'critical-warning-triggered fixture' },
+  ]) {
+    test(`375x667 ${fixture.label}: AC1 placement, 16px containment, AC4 non-intersection, HULL display, Pause reachability, no hidden Tab-order fragment, no internal scroll`, async ({
+      page,
+    }) => {
+      const label = `375x667 ${fixture.label}`
+      await page.setViewportSize({ width: 375, height: 667 })
+      await page.goto('/')
+      await page.waitForSelector('[data-combat-hud]', { timeout: 10_000 })
+
+      await injectHullText(page, fixture.hullText)
+      await injectCriticalFixture(page, fixture.critical)
+
+      const evidence = await recordCompactFixtureEvidence(page, label)
+      expect(evidence.headSha, `${label}: head SHA must be captured for evidence`).not.toBe('')
+
+      const canvas = page.locator('canvas.battle-stage__canvas')
+      const canvasBox = await canvas.boundingBox()
+      expect(canvasBox, `${label}: canvas must have a bounding box`).not.toBeNull()
+      if (!canvasBox) {
+        return
+      }
+
+      const hud = page.locator('[data-combat-hud]')
+      const hudBox = await hud.boundingBox()
+      expect(hudBox, `${label}: combat HUD must have a bounding box`).not.toBeNull()
+      if (!hudBox) {
+        return
+      }
+
+      // 16px inner containment.
+      assertWithinSafeMargin(hudBox, canvasBox, HUD_SAFE_MARGIN_PX, `${label} HUD-in-canvas`)
+
+      // AC4: protected-zone non-intersection (real assertion, no test.fail()).
+      await assertNoProtectedZoneIntersection(page, canvasBox, label)
+
+      // AC1: runtime bounding-box placement proof. edge-control collapsed.
+      await assertSemanticPlacement(page, canvasBox, label, { edgeControlExpectedVisible: false })
+
+      // HULL display: the injected value renders inside the status zone.
+      const hullField = page.locator('[data-field="combat-hud-hull"]')
+      await expect(hullField).toBeVisible()
+      await expect(hullField).toHaveText(fixture.hullText)
+
+      // Icon+text in the critical fixture only (AC6: never color-only).
+      const criticalField = page.locator('[data-field="combat-hud-critical"]')
+      if (fixture.critical) {
+        await expect(criticalField).toBeVisible()
+        await expect(criticalField.locator('[aria-hidden="true"]')).toBeVisible()
+        await expect(criticalField).toContainText('Hull critical')
+      } else {
+        await expect(criticalField).toBeHidden()
+      }
+
+      // Pause: pointer-, keyboard-, and focus-operable. Uses the
+      // `[data-action]` CSS selectors (not `getByRole`) because pausing
+      // makes the combat HUD `inert` (Issue #1376 AC4: it drops out of the
+      // accessibility tree/tab order behind the pause dialog) -- an
+      // accessible-name-based `getByRole` query on the (now inert) Pause
+      // button would spuriously report "not found" after the first pause,
+      // which is a property of the pause-dialog feature, not a regression
+      // in this fixture.
+      const pauseButton = page.locator('[data-action="toggle-pause"]')
+      const resumeButton = page.locator('[data-action="resume"]')
+      await expect(pauseButton).toBeInViewport()
+      await expect(pauseButton).toBeVisible()
+      await expect(pauseButton).toBeEnabled()
+
+      // Pointer-operable: click opens the pause dialog.
+      await pauseButton.click()
+      await expect(resumeButton).toBeVisible()
+      await resumeButton.click()
+      await expect(resumeButton).toBeHidden()
+      await expect(pauseButton).toBeVisible()
+
+      // Keyboard- and focus-operable: focus + Enter opens the pause dialog
+      // again; Escape resumes (the button's own `title` documents this:
+      // "Pause or resume simulation. Also toggled by Escape.").
+      await pauseButton.focus()
+      await expect(pauseButton).toBeFocused()
+      await page.keyboard.press('Enter')
+      await expect(resumeButton).toBeVisible()
+      await page.keyboard.press('Escape')
+      await expect(resumeButton).toBeHidden()
+      await expect(pauseButton).toBeVisible()
+
+      // No hidden/collapsed fragment (Assist/Weapon, `.combat-hud__edge`) in
+      // Tab order: `.combat-hud__edge` is `display: none` at this viewport
+      // (verified above via `edgeControlExpectedVisible: false`), so
+      // Tab-cycling through the page's focusable elements must never land on
+      // the Assist button while it is not visible.
+      const assistButton = page.locator('[data-action="assist-player"]')
+      await expect(assistButton).toBeHidden()
+      await page.locator('body').click({ position: { x: 1, y: 1 } })
+      let hitAssistButton = false
+      for (let i = 0; i < 20; i += 1) {
+        await page.keyboard.press('Tab')
+        const isAssistFocused = await assistButton.evaluate(
+          (el) => document.activeElement === el,
+        )
+        if (isAssistFocused) {
+          hitAssistButton = true
+          break
+        }
+      }
+      expect(
+        hitAssistButton,
+        `${label}: Tab order must never focus the collapsed/hidden Assist button`,
+      ).toBe(false)
+
+      // No internal scroll on `.battle-hud-layer` (the safe-zone container).
+      const hudLayer = page.locator('.battle-hud-layer')
+      const hudLayerOverflow = await hudLayer.evaluate((el) => ({
+        scrollWidth: el.scrollWidth,
+        clientWidth: el.clientWidth,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+      }))
+      expect(
+        hudLayerOverflow.scrollWidth,
+        `${label}: .battle-hud-layer scrollWidth <= clientWidth (no internal horizontal scroll)`,
+      ).toBeLessThanOrEqual(hudLayerOverflow.clientWidth)
+      expect(
+        hudLayerOverflow.scrollHeight,
+        `${label}: .battle-hud-layer scrollHeight <= clientHeight (no internal vertical scroll)`,
+      ).toBeLessThanOrEqual(hudLayerOverflow.clientHeight)
     })
   }
 })

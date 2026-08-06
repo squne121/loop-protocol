@@ -475,45 +475,125 @@ button:focus-visible {
   }
 }
 
-/* Issue #1958 AC1/AC2: at the supported minimum viewport (375x667, where
- * `.battle-stage__canvas`'s `aspect-ratio: 16 / 9` letterboxes the Canvas to
- * a very short safe-zone box), the edge-control (Weapon/Assist) collapses
- * first per the semantic state table's collapse priority -- Hull/critical,
- * Kills, elapsed and Pause remain visible and reachable. `max-width: 420px`
- * targets narrow/portrait viewports specifically (not short-but-wide
- * desktop windows, which are already handled by the `max-height` rule
- * above). */
+/* Issue #1958 AC1/AC2/AC4 (PR #2006 review fix_delta iteration 2, owner
+ * decision comment https://github.com/squne121/loop-protocol/issues/1958#issuecomment-5205380696):
+ * at the supported minimum viewport (375x667), the Canvas letterboxes
+ * (`aspect-ratio: 16 / 9`) to a very short safe-zone box whose center
+ * 60%x60% protected zone (AC4) leaves almost no free vertical room below or
+ * above it -- but it DOES leave a full-height ~54px-wide free column on
+ * each side (left of the protected zone's left edge, right of its right
+ * edge), because the protected zone's 60%-width band is horizontally
+ * centered and narrower than the full safe-zone width. Iteration 1 used a
+ * horizontal bottom-left card (~85px tall, full safe-zone width) that
+ * necessarily crossed into the protected zone's x-range once it grew past
+ * the ~24px bottom strip -- a genuine AC1(bottom-left)/AC2(readable)/AC4
+ * (non-intersection) conflict flagged `test.fail()` pending owner review.
+ * The owner decision requires a REAL compact form, not a scaled-down card:
+ * this rebuilds `.combat-hud__status` as a NARROW VERTICAL COLUMN confined
+ * to that left free column's width (never crossing into the protected
+ * zone's x-range regardless of its height), anchored to the true left edge
+ * (AC1 "left edge") and to the bottom of the safe zone via `align-self:
+ * end` (AC1 "lower region") -- height grows upward within the free column,
+ * never sideways into the protected zone, so long Hull values (AC2a: up to
+ * `999999999/999999999`) simply wrap onto more lines instead of
+ * overflowing horizontally (`overflow-wrap: anywhere` below).
+ * `.combat-hud__pause` is mirrored into the equivalent right free column
+ * (previously it was ~73px wide and reached left past x=280, well inside
+ * the protected zone's x-range at this viewport -- also a real, previously
+ * unasserted-per-zone AC4 violation masked by `assertNoProtectedZoneIntersection`
+ * throwing on the `status` zone first). `max-width: 420px` targets
+ * narrow/portrait viewports specifically (not short-but-wide desktop
+ * windows, already handled by the `max-height` rule above). */
 @media (max-width: 420px) {
   .combat-hud {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr) auto;
     grid-template-areas:
-      'elapsed'
-      'status'
-      'pause';
+      'elapsed elapsed'
+      'status  pause';
     row-gap: 4px;
+    column-gap: 4px;
+    align-items: end;
   }
 
+  /* Narrow left-column status card: width is deliberately well inside the
+   * measured ~54.5px free-column budget at 375x667 (Canvas ~352.5px wide,
+   * 16px safe-margin inset, protected zone left edge at 20% of Canvas
+   * width -- see the E2E comment above `assertNoProtectedZoneIntersection`)
+   * so it never reaches the protected zone's x-range even with the epsilon
+   * `assertWithinSafeMargin`/`assertNoProtectedZoneIntersection` allow. */
   .combat-hud__status {
-    justify-self: stretch;
-    inline-size: 100%;
-    padding: 6px 8px;
+    justify-self: start;
+    align-self: end;
+    inline-size: 48px;
+    max-inline-size: 48px;
+    padding: 3px 4px;
+    gap: 2px;
+  }
+
+  /* AC6: "Combat" is a decorative section label, not player-facing state --
+   * dropped only at this width to leave room for the stats themselves. */
+  .combat-hud__status .eyebrow {
+    display: none;
   }
 
   .combat-hud__edge {
     display: none;
   }
 
+  /* Mirrors `.combat-hud__status` into the right free column so Pause never
+   * reaches into the protected zone's x-range either, independent of its
+   * y position (AC4). */
   .combat-hud__pause {
     justify-self: end;
+    align-self: end;
     margin-top: 0;
+    inline-size: 48px;
+    max-inline-size: 48px;
+    padding: 4px 5px;
+    font-size: 0.68rem;
+    /* AC6: >= 24x24 CSS px hit target preserved. */
+    min-width: 24px;
+    min-height: 24px;
   }
 
   .combat-hud__status .stat-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .combat-hud__status .stat-grid div {
+    padding: 2px 3px;
+  }
+
+  .combat-hud__status .stat-grid dt {
+    font-size: 0.55rem;
+    margin-bottom: 0;
   }
 
   .combat-hud__status .stat-grid dd {
-    font-size: 0.92rem;
+    font-size: 0.62rem;
+    /* AC2a: long Hull values (up to `999999999/999999999`) must not
+     * horizontally overflow this 48px column -- wrap instead. */
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  /* The default `.combat-hud__critical` layout is a single-row flex (icon +
+   * text inline) -- at this column width that wraps mid-word across many
+   * short lines and grows too tall to fit the free column's measured height
+   * budget alongside the Hull/Kills stat-grid rows above it. Stacking the
+   * icon above the text (column direction) is more height-efficient here:
+   * the icon renders on its own short line, and "Hull critical" wraps onto
+   * at most two lines at this reduced font-size, empirically verified via
+   * `tests/e2e/hud-hull-overflow.spec.ts`'s dual-fixture 375x667 test. */
+  .combat-hud__critical {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    margin-top: 2px;
+    font-size: 0.5rem;
+    line-height: 1.15;
+    overflow-wrap: anywhere;
   }
 }
 
