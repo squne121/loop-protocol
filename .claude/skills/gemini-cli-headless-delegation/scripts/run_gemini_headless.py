@@ -462,6 +462,11 @@ AGY_SUPPORTED_PROFILES: frozenset[str] = frozenset(
         "proposal_only",
         "local_asset_research",
         "grounded_research",
+        # Issue #1920: bounded, read-only, repository-bound gh research route.
+        # Dispatch is handled entirely by run_agy_github_research_e2e.py, not
+        # by the generic agy execution loop below (see the early-return
+        # branch in _run_delegation_core()'s provider=="agy" section).
+        "github_research",
     }
 )
 LOCAL_ASSET_RESEARCH_PROFILE = "local_asset_research"
@@ -4892,6 +4897,18 @@ def _run_delegation_core(
                 "subtask_id": request.get("subtask_id"),
                 "attempt_id": request.get("attempt_id"),
             }
+        # Issue #1920: github_research is dispatched entirely to
+        # run_agy_github_research_e2e.py -- a bounded, iterative, read-only
+        # gh research route with its own broker-owned GH_TOKEN, allowlist,
+        # and evidence artifact. It does not reuse _run_agy()'s single-shot
+        # retry loop below (local_asset_research / grounded_research /
+        # proposal_only / no_tools), since those profiles have no analogous
+        # multi-turn command-selection contract. The import is local to
+        # avoid a module-load-time dependency between the two files.
+        if tool_profile == GITHUB_RESEARCH_PROFILE:
+            from run_agy_github_research_e2e import run_github_research_route  # type: ignore[import]
+
+            return run_github_research_route(request, request_warnings=request_warnings)
         # local_asset_research uses wrapper-side Serena evidence + prompt injection.
         local_asset_retrieval_metadata: dict[str, Any] | None = None
         # Issue #1706: set only for fan-out-correlated targeted-evidence

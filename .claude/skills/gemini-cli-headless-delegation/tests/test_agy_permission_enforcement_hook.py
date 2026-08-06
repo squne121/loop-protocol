@@ -156,3 +156,42 @@ def test_allowed_attempt_fails_closed_when_safe_event_logging_fails(
     _context(tmp_path, monkeypatch, profile="grounded_research")
     monkeypatch.setattr(HOOK, "_write_event", lambda context, event: False)
     assert HOOK.decide(_payload("search_web"))["reason"] == "log_write_failed"
+
+
+# ---------------------------------------------------------------------------
+# Issue #1920: github_research ALLOWED_PROFILES connection
+# ---------------------------------------------------------------------------
+
+
+def test_github_research_is_in_allowed_profiles() -> None:
+    assert "github_research" in HOOK.ALLOWED_PROFILES
+
+
+def test_github_research_context_loads_successfully_instead_of_context_load_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before Issue #1920, any run-context stamped with tool_profile="github_research"
+    was rejected at context-load time (profile not in ALLOWED_PROFILES) --
+    i.e. every attempt failed with "context_load_failure" regardless of the
+    payload. This must no longer happen: a well-formed github_research
+    context/policy pair must be evaluated on its own merits (denied here
+    because "run_command" is not in this profile's empty allowed_resources
+    set, not because the profile itself could not be loaded).
+    """
+    _context(tmp_path, monkeypatch, profile="github_research")
+    decision = HOOK.decide(_payload("run_command"))
+    assert decision["reason"] != "context_load_failure"
+
+
+def test_github_research_denies_every_native_tool_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """github_research has zero native tool-call surface (Issue #1920): the
+    single `gh` invocation per turn is executed by the external broker
+    (run_agy_github_research_broker.py), never by an AGY-native tool call.
+    """
+    _context(tmp_path, monkeypatch, profile="github_research")
+    for tool_name in ("run_command", "view_file", "write_to_file", "search_web"):
+        decision = HOOK.decide(_payload(tool_name))
+        assert decision["decision"] == "deny"
+        assert decision["reason"] == "policy_deny"
