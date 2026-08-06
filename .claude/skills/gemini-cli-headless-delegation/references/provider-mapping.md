@@ -30,7 +30,7 @@ uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_
 | `grounded_research` | Gemini CLI を isolated temp cwd から起動し、Google Search grounding を許可する。 | 外部調査のみ。repo 探索はしない。 |
 | `local_asset_research` | `.gemini/settings.json` の Serena allowlist を確認したうえで repo root から起動する。 | WSL 上の Serena MCP を使った read-only ローカル資産調査のみ。 |
 | `proposal_only` | Gemini CLI を isolated temp cwd から起動し、bounded draft text だけを返す。 | `implementation_draft` / `issue_authoring_draft` / `patch_proposal` / `command_plan` のみ。最終 write は Codex 側で行う。 |
-| `github_research` | Gemini 側: wrapper が request の `gh_commands`（argv ベースの許可コマンドリスト）を pre-exec で実行し、その出力を `inline_context` に前置してから Gemini CLI を起動する。AGY 側: `unsupported_provider_profile` として fail-closed（`AGY_SUPPORTED_PROFILES` に含まれない）。 | `gh_commands` は `tool_profile=github_research` でのみ許可される（それ以外の profile で指定すると validation で拒否）。GitHub read-only 調査のみで、書込は許可しない。 |
+| `github_research` | Gemini 側: wrapper が request の `gh_commands`（argv ベースの許可コマンドリスト）を pre-exec で実行し、その出力を `inline_context` に前置してから Gemini CLI を起動する。AGY 側（Issue #1920）: `run_agy_github_research_e2e.py` が最大 8 回、AGY の判断に応じて単一 `gh` invocation を反復実行する。gh 実行は `run_agy_github_research_broker.py`（GH_TOKEN を保有する唯一のプロセス）が担い、AGY プロセス自体には GH_TOKEN を渡さない。 | Gemini の `gh_commands` は `tool_profile=github_research` でのみ許可される（それ以外の profile で指定すると validation で拒否）。AGY 側は `agy_permission_policy.PROFILE_ALLOWED_TOOLS["github_research"]` が空集合であり、AGY 自身のネイティブ tool-call は一切許可されない（broker が外部プロセスとして単一 gh invocation のみを実行する）。両側とも GitHub read-only 調査のみで、書込は許可しない。 |
 
 `local_asset_research` は `grounded_research` とは意図的に分離している。
 Web 調査プロファイルではないため、Serena MCP 検証に失敗したときの fallback 先として使ってはならない。
@@ -86,9 +86,9 @@ Gemini CLI と同様に wrapper 経由で呼び出すが、出力形式・cwd po
 | `proposal_only` | supported | isolated temp cwd から agy を呼び出す。返却は draft text のみ。 |
 | `grounded_research` | **supported** | AGY native WebSearch/WebGrounding （`agy -p`、Gemini API `google_search` 不使用）を使用。`grounded` 判定には構造化 `tool_calls` トレース（認識済み web tool 名）が必須で、stdout 中の bare URL 文字列だけでは実行証跡と扱わない（トレース欠如は `agy_web_grounding_tool_call_missing` で fail-closed）。quota exhaustion / secret・repo path leakage も専用 failure class で fail-closed する。 |
 | `local_asset_research` | supported | wrapper 側だけが pinned SerenaMCP read-only retrieval を実行し、repo-relative JSON evidence envelope だけを prompt-only で AGY に渡す。 |
-| `github_research` | **unsupported_provider_profile** | agy は GitHub アクセス機能を持たない。fail-closed。 |
+| `github_research` | **supported**（Issue #1920） | `run_agy_github_research_e2e.py` に委譲。AGY はネイティブ tool-call を一切持たず（`PROFILE_ALLOWED_TOOLS` が空集合）、単一 `gh` invocation の選択をテキスト応答のみで行う。実行は GH_TOKEN を保有する `run_agy_github_research_broker.py` が担う。agy CLI / GH_TOKEN / read-only 認証のいずれかが利用不可な場合は exit 77 の structured SKIP を返す（SKIP は PASS ではない）。 |
 
-unsupported_provider_profile を request で指定した場合、wrapper は `ok: false` を即時返却する。
+`github_research` 以外で unsupported_provider_profile を request で指定した場合、wrapper は `ok: false` を即時返却する。
 fallback や自動 profile 変換は行わず、fail-closed を維持する。
 
 ### AC2: 実行境界（agy の cwd / env）
@@ -140,8 +140,9 @@ declared target ごとに実ファイルを直接 read-only で読み、selector
   direct tool access 手順は含まれない（既存の prompt-only 境界をそのまま継承する）。
 
 `evidence_targets` は legacy `context_files` + live SerenaMCP retrieval 経路とは排他的であり、
-`grounded_research` / `github_research` の AGY 対応や Serena MCP upstream の manifest allowlist
-拡張は本契約の scope 外のままとする。
+Serena MCP upstream の manifest allowlist 拡張は本契約の scope 外のままとする。
+`github_research` の AGY 対応は Issue #1920 で実装済み（別契約、`run_agy_github_research_e2e.py` /
+`run_agy_github_research_broker.py`）であり、`evidence_targets` / SerenaMCP 経路とは独立している。
 
 ### fan-out task-linked hash chain（Issue #1706 の相関ハッシュ連鎖）
 
@@ -169,13 +170,13 @@ agy の stdout text は wrapper 側で `delegation_result/v1` スキーマに正
 
 ### AC6: 非対応 profile の fail-closed
 
-以下のプロファイルは `provider=agy` で `unsupported_provider_profile` として fail-closed する。
+Issue #1920 で `github_research` が `provider=agy` に実装されたことにより、
+`AGY_SUPPORTED_PROFILES` は `ALLOWED_TOOL_PROFILES`（`no_tools` / `grounded_research` /
+`local_asset_research` / `proposal_only` / `github_research`）の全件と一致し、
+現時点で `provider=agy` が `unsupported_provider_profile` を返す既知プロファイルは存在しない。
 
-- `github_research` : GitHub 調査契約がないため現状は非対応。
-
-`github_research` は agy 対応 contract が未定義のため fail-closed とする。
-
-fallback 経路は提供せず、`ok: false` で即時終了する。
+未知の `tool_profile` 値（`ALLOWED_TOOL_PROFILES` に存在しない値）は引き続き validation で
+拒否される。fallback 経路は提供せず、`ok: false` で即時終了する。
 unsupported_provider_profile エラーは caller に返し、人間判断または別 provider への切り替えを促す。
 
 ### AC7: 安全モードの扱い
@@ -301,11 +302,15 @@ GeminiCLI を default provider から外す（legacy 化する）べきかどう
   `profile_provider_contract_matrix.yaml` が `implemented` と判定した 9 セルは
   GeminiCLI 側でも実装済みだが、agy 側で最近追加された provenance / permission
   boundary 系の専用テスト密度には及ばない。
-- ただし GeminiCLI は `no_tools` / `proposal_only` / `grounded_research` /
-  `local_asset_research` / `github_research` の全 5 profile が `implemented`
-  であるのに対し、agy は `github_research` が `unsupported_by_design` であり、
-  profile カバレッジでは GeminiCLI が上回る（`profile_provider_contract_matrix.yaml`
-  参照）。
+- Issue #1920 以前は GeminiCLI のみが `no_tools` / `proposal_only` /
+  `grounded_research` / `local_asset_research` / `github_research` の全 5
+  profile を `implemented` としており、agy は `github_research` が
+  `unsupported_by_design` だったため profile カバレッジで GeminiCLI が上回って
+  いた。Issue #1920 で agy 側の `github_research` も `implemented` になり
+  （`profile_provider_contract_matrix.yaml` 参照）、両 provider の profile
+  カバレッジは同等になった。下記 `legacy_decision` の `blocking_gap` /
+  `reevaluate_when` はこの変化を前提とした再評価が必要（本 Issue 自体は
+  `legacy_decision.state` の変更を行わない — 別スコープの判断のため）。
 
 ### 認証堅牢性
 

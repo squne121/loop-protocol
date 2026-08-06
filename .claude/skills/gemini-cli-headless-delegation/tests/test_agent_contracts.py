@@ -375,13 +375,15 @@ class TestReferencesDocsRuntimeDrift:
             " runtime の fail-closed メッセージが明記されていない"
         )
 
-    def test_provider_mapping_github_research_unsupported_for_agy(self):
+    def test_provider_mapping_github_research_supported_for_agy(self):
+        """Issue #1920: provider=agy + tool_profile=github_research is now
+        implemented (dispatched to run_agy_github_research_e2e.py), not
+        unsupported_provider_profile. This test supersedes the pre-#1920
+        test_provider_mapping_github_research_unsupported_for_agy."""
         text = _read(PROVIDER_MAPPING_MD)
-        assert re.search(
-            r"`github_research`\s*\|\s*\*\*unsupported_provider_profile\*\*", text
-        ), (
+        assert re.search(r"`github_research`\s*\|\s*\*\*supported", text), (
             "provider-mapping.md の agy 対応表で github_research が"
-            " unsupported_provider_profile と明記されていない"
+            " supported と明記されていない（Issue #1920）"
         )
 
     def test_provider_mapping_agy_supported_profiles_match_runtime(self):
@@ -396,10 +398,14 @@ class TestReferencesDocsRuntimeDrift:
                 f"provider-mapping.md の agy 対応表に runtime AGY_SUPPORTED_PROFILES の"
                 f" '{profile}' が supported として記載されていない"
             )
-        # github_research is intentionally excluded from AGY_SUPPORTED_PROFILES.
-        assert rgh.GITHUB_RESEARCH_PROFILE not in rgh.AGY_SUPPORTED_PROFILES, (
-            "runtime AGY_SUPPORTED_PROFILES に github_research が含まれるようになった。"
-            " docs 側の unsupported 記述を見直すこと。"
+        # Issue #1920: github_research is now implemented for provider=agy,
+        # dispatched to run_agy_github_research_e2e.py -- AGY_SUPPORTED_PROFILES
+        # now equals the full ALLOWED_TOOL_PROFILES set (profile parity with
+        # Gemini). This supersedes the pre-#1920 "intentionally excluded"
+        # assertion that used to live here.
+        assert rgh.GITHUB_RESEARCH_PROFILE in rgh.AGY_SUPPORTED_PROFILES, (
+            "runtime AGY_SUPPORTED_PROFILES から github_research が外れた。"
+            " Issue #1920 の実装が退行していないか確認すること。"
         )
 
     def test_usage_contract_agy_auth_precondition_documented(self):

@@ -56,6 +56,7 @@ related_issue: "#135"
 | `AGY_GROUNDING_EVIDENCE_VERDICT_V1` | `.claude/skills/gemini-cli-headless-delegation/scripts/validate_agy_grounding_evidence.py` | validate_agy_grounding_evidence.py（causal claim extraction + evidence binding check） | pr-review-judge（clean-room review の experimental-validity reviewer）、test_validate_agy_grounding_evidence.py | `rg -n "AGY_GROUNDING_EVIDENCE_VERDICT_V1\|validate_agy_grounding_evidence" .` |
 | `agy_permission_boundary_e2e/v1` | `.claude/skills/gemini-cli-headless-delegation/schemas/agy_permission_boundary_e2e_v1.schema.json` | permission-boundary runner | artifact validator / reviewer | `rg -n "agy_permission_boundary_e2e/v1" .claude/skills/gemini-cli-headless-delegation docs/dev/schema-governance.md` |
 | `agy_preflight_result/v1`（additive `capabilities` matrix, Issue #1941） | `.claude/skills/gemini-cli-headless-delegation/scripts/preflight_agy.py`（`build_capability_matrix()` / `run_preflight(compute_capabilities=True)` が唯一の実装 SSOT） | preflight_agy.py | `setup_check.py`（`agy_capabilities` として additive に surface。既存 `agy_preflight["ok"]` 単一 boolean 消費は不変）、`run_gemini_headless.py` | `rg -n "agy_capability_matrix/v1\|CAPABILITY_PREDICATES\|build_capability_matrix" .claude/skills/gemini-cli-headless-delegation` |
+| `agy_github_research_evidence/v1`（Issue #1920） | `schemas/agy_github_research_evidence_v1.schema.json` | `.claude/skills/gemini-cli-headless-delegation/scripts/run_agy_github_research_e2e.py`（`_build_evidence()` / `_write_evidence()`） | `run_gemini_headless.py`（`provider=agy` + `tool_profile=github_research` の dispatch）、`run_agy_github_research_broker.py`（per-iteration `agy_github_research_broker_command_result/v1` record の source）、人間・エージェント reviewer（`.claude/artifacts/agent-provider-route/<run-id>/` artifact consumer）、`test_agy_github_research_contract.py` / `test_agy_github_research_e2e.py` | `rg -n "agy_github_research_evidence/v1\|agy_github_research_broker_command_result/v1\|run_agy_github_research_broker\|run_agy_github_research_e2e" .claude/skills/gemini-cli-headless-delegation schemas` |
 
 **Compatibility Decision**: `AGY_CAUSAL_CLAIM_MANIFEST_V1` は本 Issue（#1778）で新規追加された schema であり、既存 schema の破壊的変更は含まない（`additive` — 新規 producer 2 件、既存 consumer への影響なし）。`agy_permission_policy.py` / `run_gemini_headless.py` はどちらも read-only の分析対象であり、本 Issue の PR では一切変更されない（behavior change なし）。
 
@@ -337,6 +338,36 @@ validation_commands:
 notes:
   - "モデルの自己申告のみに基づく causal claim を検出するための clean-room review 支援ツールであり、merge-blocking 判定自体は pr-review-judge の責務（本 schema は verdict 材料の一つ）。"
 ```
+
+## agy_github_research_evidence/v1 詳細登録
+
+**Compatibility Decision（Issue #1920）**: `agy_github_research_evidence/v1` は新規追加の schema であり、既存 schema
+（`delegation_request_v1` / `delegation_result/v1` / `AGY_CAUSAL_CLAIM_MANIFEST_V1` /
+`agy_permission_boundary_e2e/v1` 等）への破壊的変更は含まない（additive — 新規 producer / consumer のみ）。
+`agy_permission_boundary_e2e/v1`（#1814/#1979、PR #1994）とは別 schema であり、`agy_github_research_evidence/v1`
+は #1979 / PR #1994 の live E2E 安全証拠を copy しない。代わりに `digest_binding` フィールド
+（`agy_binary_digest` / `agy_version` / `permission_policy_digest` / `hook_executable_digest` /
+`isolated_settings_digest` / `pr_1994_schema_version`）で当該証拠を digest 参照するのみであり、異なる
+binary/configuration で得られた証拠を流用しない。
+
+producer は `run_agy_github_research_e2e.py`（`_build_evidence()` / `_write_evidence()`）。schema は
+`schemas/agy_github_research_evidence_v1.schema.json`（JSON Schema draft-07）に固定する。
+`limits`（`max_iterations: 8` / `command_timeout_seconds: 30` / `total_route_timeout_seconds: 180` /
+`stdout_bytes_per_command: 65536` / `stderr_bytes_per_command: 16384` /
+`aggregate_retained_bytes: 262144` / `max_records_per_command: 100` / `pagination: false`）は
+Issue #1920 の numeric contract に一致する固定値（`const`）として schema に記録し、producer/consumer 双方が
+同じ値を参照する。
+
+`iterations[]` の各要素は per-command の allow/deny・exit code・`redacted_output_digest`
+（sha256、redaction-before-truncate 後）・`truncated` フラグを保持するが、raw な `gh` stdout/stderr は
+schema に含めない（bounded な `redacted_*_sample` は `run_agy_github_research_broker.py` の内部戻り値
+`agy_github_research_broker_command_result/v1` のみが保持し、evidence artifact 自体には digest のみを残す）。
+
+`close_evidence.positive_run` / `close_evidence.negative_probes` は Issue #1920 の close_requirements
+（genuine live positive run: `exit_code: 0` かつ `iteration_count >= 2` かつ
+`adaptive_next_command_observed: true` / negative probe: mutation・cross_repository・alternate_host・
+compound_shell・credential_display の各 probe_class が `denied_pre_execution: true`）を機械可読に記録する。
+`status: "skip"`（exit 77）はいずれの close_requirements も満たさない。
 
 ## OVERLAP_GATE_BYPASS_V1（#1679 により削除・supersede 済み）
 

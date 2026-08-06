@@ -783,10 +783,12 @@ def test_matrix_agy_unsupported_profile_matches_runtime_agy_supported_profiles()
     None
 ):
     """GIVEN the runtime AGY_SUPPORTED_PROFILES constant WHEN diffed against
-    _EXPECTED_PROFILES THEN the only profile excluded from
-    AGY_SUPPORTED_PROFILES is github_research, matching the matrix's
-    github_research/agy == unsupported_by_design cell. This detects drift if
-    the runtime constant is changed without updating the matrix.
+    _EXPECTED_PROFILES THEN no profile is excluded (Issue #1920:
+    github_research is now implemented for provider=agy, so
+    AGY_SUPPORTED_PROFILES == the full ALLOWED_TOOL_PROFILES set and the
+    matrix no longer has any agy cell marked unsupported_by_design). This
+    detects drift if the runtime constant is changed without updating the
+    matrix (in either direction).
     """
     rgh = _load_run_gemini_headless_for_drift_check()
     runtime_agy_supported = set(rgh.AGY_SUPPORTED_PROFILES)
@@ -799,8 +801,9 @@ def test_matrix_agy_unsupported_profile_matches_runtime_agy_supported_profiles()
         if providers["agy"]["value"] == "unsupported_by_design"
     }
 
-    assert unsupported_in_runtime == matrix_unsupported == {"github_research"}, (
-        "matrix github_research/agy=unsupported_by_design has drifted from "
-        f"runtime AGY_SUPPORTED_PROFILES (runtime-excluded={unsupported_in_runtime}, "
-        f"matrix-unsupported={matrix_unsupported})"
+    assert unsupported_in_runtime == matrix_unsupported == set(), (
+        "matrix agy unsupported_by_design cells have drifted from runtime "
+        f"AGY_SUPPORTED_PROFILES (runtime-excluded={unsupported_in_runtime}, "
+        f"matrix-unsupported={matrix_unsupported}); expected both empty "
+        "after Issue #1920 (github_research is now implemented for agy)"
     )
