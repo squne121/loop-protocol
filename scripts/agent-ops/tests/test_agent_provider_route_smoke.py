@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SCHEMA_PATH = REPO_ROOT / "schemas" / "agent_provider_route_smoke_v1.schema.json"
 PRODUCER_PATH = REPO_ROOT / "scripts" / "agent-ops" / "run_agent_provider_route_smoke.py"
 VALIDATOR_PATH = REPO_ROOT / "scripts" / "agent-ops" / "validate_agent_provider_route_smoke.py"
+RUNTIME_SMOKE_PATH = REPO_ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
 
 
 def _load_module(path: Path, name: str) -> types.ModuleType:
@@ -36,6 +37,11 @@ def producer() -> types.ModuleType:
 @pytest.fixture(scope="module")
 def validator() -> types.ModuleType:
     return _load_module(VALIDATOR_PATH, "test_agent_provider_route_smoke_validator")
+
+
+@pytest.fixture(scope="module")
+def runtime_smoke() -> types.ModuleType:
+    return _load_module(RUNTIME_SMOKE_PATH, "test_agent_provider_route_smoke_runtime_smoke")
 
 
 @pytest.fixture(scope="module")
@@ -349,3 +355,244 @@ class TestValidator:
 
     def test_latest_run_directory_none_when_missing(self, validator, tmp_path):
         assert validator.latest_run_directory(tmp_path / "does-not-exist") is None
+
+
+# ---------------------------------------------------------------------------
+# Claude Code child session id: derivable from captured stdout stream
+# without depending on a persisted session transcript file (Issue #1886 AC7
+# fix-delta, iteration 6). Merged from
+# test_run_worktree_agent_runtime_smoke_stream_child_session_id.py per
+# fix-delta iteration 8 (Allowed Paths compliance).
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_claude_stream_lines() -> list[dict]:
+    """Shaped after a real captured stdout stream for a single Task/Agent
+    tool_use under ``--no-session-persistence`` (no transcript file is ever
+    written for this stream)."""
+    parent_session_id = "parent-session-aaaa"
+    child_agent_id = "a72066e6f732aa768"
+    return [
+        {"type": "system", "subtype": "init", "session_id": parent_session_id},
+        {
+            "type": "assistant",
+            "session_id": parent_session_id,
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Agent", "input": {}},
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "session_id": parent_session_id,
+            "message": {
+                "content": [
+                    {
+                        "tool_use_id": "toolu_x",
+                        "type": "tool_result",
+                        "content": [
+                            {"type": "text", "text": "OK"},
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"agentId: {child_agent_id} (use SendMessage with "
+                                    f"to: '{child_agent_id}', summary: '...' to continue "
+                                    "this agent)"
+                                ),
+                            },
+                        ],
+                    }
+                ]
+            },
+            "tool_use_result": {
+                "status": "completed",
+                "agentId": child_agent_id,
+                "agentType": "general-purpose",
+            },
+        },
+        {"type": "result", "subtype": "success", "session_id": parent_session_id},
+    ]
+
+
+class TestClaudeChildSessionIdFromStdoutStream:
+    def test_extract_claude_child_session_id_from_stdout_without_transcript_file(
+        self, runtime_smoke, tmp_path
+    ):
+        """Primary path: ``tool_use_result.agentId`` on a ``type: "user"``
+        event is found directly in the captured stdout stream, with no
+        dependency on any file under a (here, deliberately nonexistent)
+        ``~/.claude/projects`` directory -- proving the fix works precisely
+        in the ``--no-session-persistence`` case this bug was about."""
+        stdout = "\n".join(json.dumps(line) for line in _synthetic_claude_stream_lines())
+
+        parent_session_id = runtime_smoke.extract_claude_parent_session_id(stdout)
+        assert parent_session_id == "parent-session-aaaa"
+
+        # cwd is an arbitrary nonexistent path -- the stream-based primary
+        # path must succeed without ever touching the filesystem-based
+        # fallback.
+        child_session_id = runtime_smoke.extract_claude_child_session_id(
+            parent_session_id, str(tmp_path / "does-not-exist"), stdout
+        )
+        assert child_session_id == "a72066e6f732aa768"
+        assert child_session_id != parent_session_id
+
+    def test_extract_claude_child_session_id_falls_back_to_text_block_regex(
+        self, runtime_smoke, tmp_path
+    ):
+        """Fallback within the stream path: if ``tool_use_result`` is absent
+        but the human-readable ``agentId: <hex>`` text line is still present
+        in a tool_result content block, it must still be recovered."""
+        lines = _synthetic_claude_stream_lines()
+        # Drop the structured tool_use_result field to exercise the
+        # text-block regex fallback exclusively.
+        for line in lines:
+            line.pop("tool_use_result", None)
+        stdout = "\n".join(json.dumps(line) for line in lines)
+
+        parent_session_id = runtime_smoke.extract_claude_parent_session_id(stdout)
+        child_session_id = runtime_smoke.extract_claude_child_session_id(
+            parent_session_id, str(tmp_path / "does-not-exist"), stdout
+        )
+        assert child_session_id == "a72066e6f732aa768"
+
+    def test_extract_claude_child_session_id_returns_none_without_spawn_evidence(
+        self, runtime_smoke
+    ):
+        """Fail-closed: no Agent/Task tool_use in the stream -> ``None``,
+        never a guess."""
+        stdout = "\n".join(
+            json.dumps(line)
+            for line in [
+                {"type": "system", "subtype": "init", "session_id": "parent-only"},
+                {"type": "result", "subtype": "success", "session_id": "parent-only"},
+            ]
+        )
+        parent_session_id = runtime_smoke.extract_claude_parent_session_id(stdout)
+        assert (
+            runtime_smoke.extract_claude_child_session_id(parent_session_id, "/nonexistent", stdout)
+            is None
+        )
+
+
+# ---------------------------------------------------------------------------
+# Codex CLI child session id: derivable from a rollout log's own content
+# linkage under --ephemeral, not solely a filename-substring match (Issue
+# #1886 AC7 fix-delta, iteration 7). Merged from
+# test_run_worktree_agent_runtime_smoke_codex_child_session_id.py per
+# fix-delta iteration 8 (Allowed Paths compliance).
+# ---------------------------------------------------------------------------
+
+
+def _write_codex_child_rollout_log(sessions_dir: Path, *, own_id: str, parent_thread_id: str) -> Path:
+    """Shaped after a real, live-observed rollout log written for a spawned
+    Codex CLI sub-agent thread: the file's own id is embedded both in its
+    filename and in the first ``session_meta`` record's ``payload.id``; the
+    spawning parent's own ``thread_id`` is recorded as
+    ``payload.parent_thread_id`` (and duplicated as ``payload.session_id``)
+    -- never in the filename."""
+    day_dir = sessions_dir / "2026" / "08" / "06"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    path = day_dir / f"rollout-2026-08-06T21-51-04-{own_id}.jsonl"
+    lines = [
+        {
+            "timestamp": "2026-08-06T12:51:04.552Z",
+            "type": "session_meta",
+            "payload": {
+                "session_id": parent_thread_id,
+                "id": own_id,
+                "parent_thread_id": parent_thread_id,
+                "cwd": "/home/example/worktree",
+                "thread_source": "subagent",
+                "agent_role": "codebase-investigator",
+            },
+        },
+        {"timestamp": "2026-08-06T12:51:05.000Z", "type": "turn_context", "payload": {}},
+    ]
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+    return path
+
+
+class TestCodexChildSessionIdViaContentLinkedRolloutLog:
+    @pytest.fixture()
+    def fake_home(self, tmp_path: Path) -> Path:
+        home = tmp_path / "home"
+        home.mkdir()
+        return home
+
+    def test_extract_codex_child_session_id_via_content_linked_rollout_log_under_ephemeral(
+        self, runtime_smoke, fake_home: Path, monkeypatch
+    ):
+        """Fallback path (iteration 7 fix): under ``--ephemeral``, no
+        rollout log's *filename* ever contains the parent's own
+        ``thread_id`` -- the child's own rollout log must instead be
+        located by its content-level ``parent_thread_id`` linkage, and the
+        child's own thread id (its ``payload.id``) returned as evidence of
+        a distinct native spawn."""
+        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
+
+        parent_thread_id = "019fd720-2814-7362-b530-cb659cec97f8"
+        child_own_id = "019fd720-9458-7703-b3f0-07aac6e6b350"
+        _write_codex_child_rollout_log(
+            fake_home / ".codex" / "sessions", own_id=child_own_id, parent_thread_id=parent_thread_id
+        )
+
+        child_session_id = runtime_smoke.extract_codex_child_session_id(parent_thread_id)
+        assert child_session_id == child_own_id
+        assert child_session_id != parent_thread_id
+
+    def test_extract_codex_child_session_id_prefers_filename_match_when_present(
+        self, runtime_smoke, fake_home: Path, monkeypatch
+    ):
+        """Primary path (unchanged): if a rollout log's filename directly
+        contains the parent's ``thread_id`` (the parent's own transcript
+        was persisted, e.g. a future non-``--ephemeral`` caller), the
+        existing ``spawn_agent`` function_call/function_call_output parsing
+        must still take precedence over the content-linked fallback."""
+        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
+
+        parent_thread_id = "parent-thread-zzzz"
+        sessions_dir = fake_home / ".codex" / "sessions" / "2026" / "08" / "06"
+        sessions_dir.mkdir(parents=True)
+        parent_log = sessions_dir / f"rollout-2026-08-06T00-00-00-{parent_thread_id}.jsonl"
+        lines = [
+            {
+                "type": "response_item",
+                "payload": {"type": "function_call", "name": "spawn_agent", "call_id": "call_1"},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": json.dumps({"agent_id": "spawned-agent-id-from-tool-output"}),
+                },
+            },
+        ]
+        parent_log.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+        child_session_id = runtime_smoke.extract_codex_child_session_id(parent_thread_id)
+        assert child_session_id == "spawned-agent-id-from-tool-output"
+
+    def test_extract_codex_child_session_id_returns_none_without_any_linkage(
+        self, runtime_smoke, fake_home: Path, monkeypatch
+    ):
+        """Fail-closed: no filename match and no rollout log content links
+        back to the given parent id -> ``None``, never a guess."""
+        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
+
+        _write_codex_child_rollout_log(
+            fake_home / ".codex" / "sessions",
+            own_id="unrelated-child-id",
+            parent_thread_id="some-other-parent-thread-id",
+        )
+
+        assert runtime_smoke.extract_codex_child_session_id("this-parent-id-has-no-match") is None
+
+    def test_extract_codex_child_session_id_returns_none_for_empty_parent_id(
+        self, runtime_smoke, fake_home: Path, monkeypatch
+    ):
+        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
+        assert runtime_smoke.extract_codex_child_session_id(None) is None
+        assert runtime_smoke.extract_codex_child_session_id("") is None
