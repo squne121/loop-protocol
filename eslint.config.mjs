@@ -3,7 +3,7 @@ import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
   {
-    ignores: ['dist/**', 'node_modules/**', '.claude/worktrees/**', '**/.claude/worktrees/**', '.claude/skills/.system/**', 'playwright-report/**', 'test-results/**'],
+    ignores: ['dist/**', 'node_modules/**', '.claude/worktrees/**', '**/.claude/worktrees/**', '.claude/skills/.system/**', 'playwright-report/**', 'test-results/**', '.claude/tmp/**', '**/.claude/tmp/**', 'tmp/**'],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
