@@ -5,108 +5,96 @@
  * .claude/tmp/ を非推奨化する。
  *
  * eslint.config.mjs の ignores 配列に '.claude/tmp/**' と 'tmp/**' が
- * 追加されたことを、実際に `pnpm lint` を子プロセスで実行して runtime に
- * 確認する（GIVEN/WHEN/THEN）。fixture はテスト内で生成・確実に削除する。
+ * 追加されたことを、ESLint Node.js API（`ESLint#isPathIgnored()` /
+ * `ESLint#lintText()`）により in-process で検証する。
+ *
+ * OWNER 敵対的レビュー（PR #2001 issuecomment-5203294136）を受け、実ファイル
+ * fixture の固定パス書き込みや `pnpm lint` の子プロセス多重起動は行わない。
  *
  * Covers AC3, AC4, AC5 from Issue #1995 (Runtime Verification Applicability:
  * decision: immediate).
  */
 
-import { execFileSync } from 'child_process'
-import { mkdirSync, rmSync, writeFileSync } from 'fs'
+import { ESLint } from 'eslint'
 import { resolve } from 'path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'vitest'
 
 const REPO_ROOT = resolve(__dirname, '..')
 
-// Invalid JS content guaranteed to produce an ESLint parse error if scanned.
+// Invalid JS content guaranteed to produce an ESLint parse error if linted.
 const INVALID_JS_CONTENT = 'const x = {\n'
 
-interface LintRunResult {
-  stdout: string
-  stderr: string
-  exitCode: number
+function createEslint(): ESLint {
+  return new ESLint({
+    cwd: REPO_ROOT,
+    overrideConfigFile: resolve(REPO_ROOT, 'eslint.config.mjs'),
+  })
 }
-
-function runPnpmLint(): LintRunResult {
-  try {
-    const stdout = execFileSync('pnpm', ['lint'], {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: REPO_ROOT,
-    })
-    return { stdout, stderr: '', exitCode: 0 }
-  } catch (error) {
-    const err = error as { stdout?: string; stderr?: string; status?: number }
-    return {
-      stdout: err.stdout || '',
-      stderr: err.stderr || '',
-      exitCode: err.status ?? 1,
-    }
-  }
-}
-
-const fixturePathsToCleanup: string[] = []
-
-afterEach(() => {
-  while (fixturePathsToCleanup.length > 0) {
-    const p = fixturePathsToCleanup.pop()
-    if (p) {
-      rmSync(p, { recursive: true, force: true })
-    }
-  }
-})
 
 describe('eslint-ignore-policy (Issue #1995)', () => {
-  it(
-    'GIVEN an invalid JS fixture under .claude/tmp/ WHEN pnpm lint runs THEN it is not scanned (claude/tmp fixture is not scanned by pnpm lint)',
-    () => {
-      const fixtureDir = resolve(REPO_ROOT, '.claude/tmp/__eslint_ignore_policy_fixture__')
-      const fixtureFile = resolve(fixtureDir, 'invalid.js')
-      fixturePathsToCleanup.push(fixtureDir)
+  it('GIVEN .claude/tmp/__fixture__/invalid.js THEN ignored=true', async () => {
+    const eslint = createEslint()
+    const targetPath = resolve(REPO_ROOT, '.claude/tmp/__fixture__/invalid.js')
 
-      mkdirSync(fixtureDir, { recursive: true })
-      writeFileSync(fixtureFile, INVALID_JS_CONTENT, 'utf-8')
+    const ignored = await eslint.isPathIgnored(targetPath)
 
-      const result = runPnpmLint()
+    expect(ignored).toBe(true)
+  })
 
-      expect(result.stdout + result.stderr).not.toContain('__eslint_ignore_policy_fixture__')
-      expect(result.exitCode).toBe(0)
-    },
-    120_000
-  )
+  it('GIVEN nested/.claude/tmp/__fixture__/invalid.js THEN ignored=true', async () => {
+    const eslint = createEslint()
+    const targetPath = resolve(REPO_ROOT, 'nested/.claude/tmp/__fixture__/invalid.js')
 
-  it(
-    'GIVEN an invalid JS fixture under tmp/ WHEN pnpm lint runs THEN it is not scanned (tmp fixture is not scanned by pnpm lint)',
-    () => {
-      const fixtureDir = resolve(REPO_ROOT, 'tmp/__eslint_ignore_policy_fixture__')
-      const fixtureFile = resolve(fixtureDir, 'invalid.js')
-      fixturePathsToCleanup.push(fixtureDir)
+    const ignored = await eslint.isPathIgnored(targetPath)
 
-      mkdirSync(fixtureDir, { recursive: true })
-      writeFileSync(fixtureFile, INVALID_JS_CONTENT, 'utf-8')
+    expect(ignored).toBe(true)
+  })
 
-      const result = runPnpmLint()
+  it('GIVEN tmp/__fixture__/invalid.js THEN ignored=true', async () => {
+    const eslint = createEslint()
+    const targetPath = resolve(REPO_ROOT, 'tmp/__fixture__/invalid.js')
 
-      expect(result.stdout + result.stderr).not.toContain('__eslint_ignore_policy_fixture__')
-      expect(result.exitCode).toBe(0)
-    },
-    120_000
-  )
+    const ignored = await eslint.isPathIgnored(targetPath)
 
-  it(
-    'GIVEN an invalid TS fixture under a normal source path WHEN pnpm lint runs THEN it is still scanned (negative control: normal source path fixture is still scanned by pnpm lint)',
-    () => {
-      const fixtureFile = resolve(REPO_ROOT, 'src/__eslint_ignore_policy_fixture__.ts')
-      fixturePathsToCleanup.push(fixtureFile)
+    expect(ignored).toBe(true)
+  })
 
-      writeFileSync(fixtureFile, INVALID_JS_CONTENT, 'utf-8')
+  it('GIVEN src/__fixture__.ts THEN ignored=false', async () => {
+    const eslint = createEslint()
+    const targetPath = resolve(REPO_ROOT, 'src/__fixture__.ts')
 
-      const result = runPnpmLint()
+    const ignored = await eslint.isPathIgnored(targetPath)
 
-      expect(result.stdout + result.stderr).toContain('__eslint_ignore_policy_fixture__')
-      expect(result.exitCode).not.toBe(0)
-    },
-    120_000
-  )
+    expect(ignored).toBe(false)
+  })
+
+  it('GIVEN .claude/tmp/__fixture__/invalid.js WHEN lintText runs THEN the ignored path is not linted at all', async () => {
+    const eslint = createEslint()
+    const filePath = resolve(REPO_ROOT, '.claude/tmp/__fixture__/invalid.js')
+
+    // warnIgnored: false — do not synthesize an "ignored file" warning result;
+    // an ignored path must simply produce no lint result (not scanned).
+    const results = await eslint.lintText(INVALID_JS_CONTENT, { filePath, warnIgnored: false })
+
+    expect(results).toHaveLength(0)
+  })
+
+  it('GIVEN tmp/__fixture__/invalid.js WHEN lintText runs THEN the ignored path is not linted at all', async () => {
+    const eslint = createEslint()
+    const filePath = resolve(REPO_ROOT, 'tmp/__fixture__/invalid.js')
+
+    const results = await eslint.lintText(INVALID_JS_CONTENT, { filePath, warnIgnored: false })
+
+    expect(results).toHaveLength(0)
+  })
+
+  it('GIVEN src/__fixture__.ts WHEN lintText runs THEN lint errors are actually reported (negative control)', async () => {
+    const eslint = createEslint()
+    const filePath = resolve(REPO_ROOT, 'src/__fixture__.ts')
+
+    const results = await eslint.lintText(INVALID_JS_CONTENT, { filePath })
+
+    expect(results).toHaveLength(1)
+    expect(results[0].errorCount).toBeGreaterThan(0)
+  })
 })

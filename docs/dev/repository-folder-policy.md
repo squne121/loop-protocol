@@ -23,7 +23,7 @@ REPOSITORY_FOLDER_POLICY_V1:
     lifecycle: per_session_or_per_issue
     cleanup_authority: delete_only_owned_session_subdirectory_or_report
     publication_rule: never_publish_without_explicit_whitelist
-    guidance: repo-approved local temporary workspace
+    guidance: tmp/ is the canonical write destination for repo-approved local temporary workspace
 
   - path: ".claude/tmp/"
     folder_class: repo_approved_temporary_workspace
@@ -31,7 +31,7 @@ REPOSITORY_FOLDER_POLICY_V1:
     lifecycle: per_session_or_per_issue
     cleanup_authority: delete_only_owned_session_subdirectory_or_report
     publication_rule: never_publish_without_explicit_whitelist
-    guidance: repo-approved local temporary workspace
+    guidance: .claude/tmp/ is a deprecated legacy root (read/scan/report only; do not use for new writes)
 
   - path: ".claude/worktrees/"
     folder_class: managed_worktree_root
@@ -87,7 +87,7 @@ denied alias（`.tmp/` `.temp/` `.tmp-*/`）配下は、有効な `temp_residue_
 ## 運用ルール
 
 - `.tmp/`、`.temp/`、`.tmp-*` は作業を block しない。ただし hook は `REPO_TEMP_FOLDER_ADVICE_V1` を返し、`tmp/` または `.claude/tmp/` への移行を案内する。
-- `tmp/` と `.claude/tmp/` は repo-approved local temporary workspace として使えるが、終了時に自分の session subdirectory を削除するか、残置理由を報告する。owned session subdirectory かどうかは `temp_residue_owner/v1` ownership marker（`scripts/agent-ops/temp_residue_marker.py`）で判定できる。
+- 新規書き込みは `tmp/` のみ。`.claude/tmp/` は legacy residue の read/scan/report と登録済み例外のみとし、新規の書き込み先として使わない。終了時に自分の session subdirectory を削除するか、残置理由を報告する。owned session subdirectory かどうかは `temp_residue_owner/v1` ownership marker（`scripts/agent-ops/temp_residue_marker.py`）で判定できる。
 - `.claude/worktrees/` は managed worktree root であり、agent が ad hoc temporary workspace の代替として使わない。cleanup は `cleanup_exec.py` の認可境界に限定する。
 - root temporary residue の read-only 分類は `scripts/agent-ops/temp_residue_classifier.py`（`temp_residue_classification/v1`）が担う。ownership marker 不明の `.tmp/**` / `.temp/**` / `.tmp-*/**` は report-only とし、classifier 自体は削除を実行しない。実削除 executor は別 scope。
 - deploy/release/preview artifact へ temporary folder を含めたい場合は、この文書と consumer docs を同一 PR で更新し、別 issue で publication rule を明示する。
