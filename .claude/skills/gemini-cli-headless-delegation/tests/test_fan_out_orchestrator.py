@@ -220,9 +220,15 @@ def test_profile_concurrency_limit_is_respected(tmp_path):
 
 def test_provider_profile_compatibility_preflight(tmp_path):
     module = load_module()
-    # agy does not support github_research (AGY_SUPPORTED_PROFILES excludes it).
+    # Issue #1920: provider=agy now supports github_research (dispatched to
+    # run_agy_github_research_e2e.py), so AGY_SUPPORTED_PROFILES == the full
+    # ALLOWED_TOOL_PROFILES set and there is no longer a real profile value
+    # that is incompatible with provider=agy. Use an unknown/invalid
+    # tool_profile value instead, which is still genuinely incompatible
+    # (never a member of AGY_SUPPORTED_PROFILES) and exercises the same
+    # provider_profile_incompatible preflight branch.
     incompatible = make_subtask(
-        tmp_path, subtask_id="incompatible", provider="agy", tool_profile="github_research"
+        tmp_path, subtask_id="incompatible", provider="agy", tool_profile="not_a_real_profile"
     )
     compatible = make_subtask(tmp_path, subtask_id="compatible", provider="gemini", tool_profile="no_tools")
 

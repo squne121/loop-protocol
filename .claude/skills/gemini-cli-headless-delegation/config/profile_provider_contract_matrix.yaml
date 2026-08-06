@@ -119,13 +119,22 @@ profiles:
       known_gaps:
         - "gh_commands は argv ベースの許可コマンドリストに限定され、tool_profile=github_research 以外での指定は validation で拒否される。GitHub read-only 調査のみで書込は許可しない"
     agy:
-      value: unsupported_by_design
+      value: implemented
       evidence:
         - kind: repo_file
           path: .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py
+        - kind: repo_file
+          path: .claude/skills/gemini-cli-headless-delegation/scripts/run_agy_github_research_broker.py
+        - kind: repo_file
+          path: .claude/skills/gemini-cli-headless-delegation/scripts/run_agy_github_research_e2e.py
         - kind: test
-          path: .claude/skills/gemini-cli-headless-delegation/tests/test_agy_provider.py
+          path: .claude/skills/gemini-cli-headless-delegation/tests/test_agy_github_research_contract.py
+        - kind: test
+          path: .claude/skills/gemini-cli-headless-delegation/tests/test_agy_github_research_e2e.py
         - kind: repo_file
           path: .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
+        - kind: issue
+          ref: "#1920"
       known_gaps:
-        - "upstream の Antigravity CLI 自体に GitHub アクセス能力が無いという主張ではない。repo wrapper のポリシー（`AGY_SUPPORTED_PROFILES`、scripts/run_gemini_headless.py）が github_research を対象 profile の集合に含めていないという設計判断が原因であり、fail-closed（unsupported_provider_profile）で拒否する。fallback や自動 profile 変換は行わない"
+        - "AGY has zero native tool-call surface under github_research (agy_permission_policy.PROFILE_ALLOWED_TOOLS['github_research'] is empty); every gh invocation is a single broker-executed command chosen by AGY only as parsed plain text, not an AGY-native tool call. AGY never receives GH_TOKEN; run_agy_github_research_broker.py is the sole token-owning process"
+        - "close_requirements (Issue #1920: a genuine live positive run with iteration>=2 and adaptive next command, plus a pre-execution-denied negative run per probe class) require a live agy CLI + repository-bound read-only GH_TOKEN environment; the route SKIPs (exit 77) fail-closed when either is unavailable"
