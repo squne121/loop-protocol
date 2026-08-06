@@ -119,15 +119,32 @@ def _git_head_sha(repo_root: Path) -> str | None:
     return sha
 
 
-def _runtime_version(bin_name: str) -> str | None:
+_RUNTIME_VERSION_UNAVAILABLE_SENTINEL = "unavailable (binary not found or --version produced no output)"
+
+
+def _runtime_version(bin_name: str) -> str:
+    """Best-effort ``<bin_name> --version`` detection.
+
+    The schema (``agent_provider_route_smoke_v1.schema.json``) requires
+    ``subject.runtime_version`` to be a non-empty string in every artifact,
+    including ``--dry-run`` ones (Issue #1886 fix_delta iteration 3): CI
+    runners do not have ``claude`` / ``codex`` on ``PATH`` the way a local
+    interactive dev environment does, so a bare ``None`` here previously
+    failed schema validation in CI while passing locally. Rather than
+    fabricating a fake version string, an absent/unusable binary is recorded
+    with an explicit, documented sentinel string -- never ``None`` -- so the
+    artifact stays schema-valid while still being honest that no real
+    version could be observed.
+    """
     try:
         result = subprocess.run(
             [bin_name, "--version"], capture_output=True, text=True, timeout=15, check=False,
         )
     except OSError:
-        return None
+        return _RUNTIME_VERSION_UNAVAILABLE_SENTINEL
     text = (result.stdout or result.stderr).strip()
-    return text.splitlines()[0].strip() if text else None
+    first_line = text.splitlines()[0].strip() if text else ""
+    return first_line if first_line else _RUNTIME_VERSION_UNAVAILABLE_SENTINEL
 
 
 def _agent_definition_path(agent: str, runtime: str, repo_root: Path) -> Path:
