@@ -52,6 +52,7 @@ BUILDER_INVOCATION:
 - command: `build_request.py --provider agy --profile grounded_research --prompt <non-empty>`
 - direct_fallback: disabled（WebSearch / WebFetch は `disallowedTools`）
 - gemini_state: disabled_by_operator
+備考: 上記4項目は機械可読契約であり値は変更しない（日本語注記）
 
 ## FAIL_CLOSED（失敗時停止）
 
@@ -93,7 +94,7 @@ Gemini CLI は operator により `disabled_by_operator` 状態にあり一切�
 - `context`（任意）: 主張の出典（Issue 番号 / URL）
 - `critical`（任意、デフォルト false）: Outcome / In Scope / AC / VC を左右する主張は `true`
 
-## Execution: AGY canonical builder invocation（実行手順）
+## Execution: AGY canonical builder invocation（正規 builder 呼び出しの実行手順）
 
 本 SubAgent は `grounded_research` の品質検証、および AGY route の failure 分類を自律的に行う。direct fallback（WebSearch / WebFetch / gh api）は実行せず、`disallowedTools` で技術的にもブロックされている。
 
