@@ -287,6 +287,71 @@ def extract_skill_surface_paths(instructions: str) -> list[str]:
     return [part for part in re.split(r"\s*,\s*|\s*\|\s*", match.group(1).strip()) if part]
 
 
+def extract_builder_invocation_block(instructions: str) -> str:
+    """Issue #1886: extract the BUILDER_INVOCATION prose block, if present."""
+    match = re.search(
+        r"BUILDER_INVOCATION\n(.*?)(?:\n\n|\nFAIL_CLOSED|\nNETWORK_LIMITATION|\nKnown limitation|\Z)",
+        instructions,
+        re.DOTALL,
+    )
+    return match.group(1) if match else ""
+
+
+def extract_builder_invocation_provider(instructions: str) -> str | None:
+    block = extract_builder_invocation_block(instructions)
+    match = re.search(r"- provider:\s*([a-z_]+)", block)
+    return match.group(1) if match else None
+
+
+def extract_builder_invocation_profiles(instructions: str) -> list[str]:
+    block = extract_builder_invocation_block(instructions)
+    match = re.search(r"- profiles?:\s*(.+)", block)
+    if not match:
+        return []
+    return [part.strip() for part in match.group(1).split(",") if part.strip()]
+
+
+def validate_agy_builder_invocation(expectations: dict) -> list[str]:
+    """Issue #1886 AC4: codebase-investigator / web-researcher must declare an
+    AGY-only canonical builder invocation (provider=agy, expected profiles),
+    must not hand-write a provider-specific request JSON literal, and must
+    not claim Gemini-mandatory delegation (Gemini is disabled_by_operator)."""
+    failures: list[str] = []
+    for agent_name, expected in expectations["required_agents"].items():
+        expected_profiles = expected.get("agy_builder_profiles")
+        if not expected_profiles:
+            continue
+        expected_provider = expected.get("agy_builder_provider", "agy")
+        path = REPO_ROOT / expected["path"]
+        if not path.exists():
+            continue
+        agent = load_agent(path)
+        instructions = str(agent.get("developer_instructions", ""))
+        provider = extract_builder_invocation_provider(instructions)
+        profiles = extract_builder_invocation_profiles(instructions)
+        if provider != expected_provider:
+            failures.append(
+                f"{expected['path']}: BUILDER_INVOCATION provider must be {expected_provider!r}, got {provider!r}"
+            )
+        if profiles != expected_profiles:
+            failures.append(
+                f"{expected['path']}: BUILDER_INVOCATION profiles must be {expected_profiles!r}, got {profiles!r}"
+            )
+        if re.search(r'"provider"\s*:', instructions):
+            failures.append(f"{expected['path']}: must not hand-write a provider JSON literal")
+        if "disabled_by_operator" not in instructions:
+            failures.append(f"{expected['path']}: must declare Gemini disabled_by_operator policy")
+        if agent_name in {"codebase-investigator", "web-researcher"}:
+            claude_path = REPO_ROOT / expected["claude_agent_path"]
+            if claude_path.exists():
+                claude_text = claude_path.read_text(encoding="utf-8")
+                if "disabled_by_operator" not in claude_text:
+                    failures.append(
+                        f"{expected['claude_agent_path']}: must declare Gemini disabled_by_operator policy"
+                    )
+    return failures
+
+
 def is_codex_only_parity(expected: dict) -> bool:
     return expected.get("parity_mode") == "codex_only"
 
@@ -647,15 +712,27 @@ def main() -> int:
     args = parser.parse_args()
     expectations = load_expectations()
     failures: list[str] = []
-    if not args.assert_required_fields and not args.assert_runtime_contract and not args.assert_local_main_branch_guard:
-        parser.error("specify at least one assertion flag")
-    if args.assert_required_fields:
+    no_flag_given = (
+        not args.assert_required_fields
+        and not args.assert_runtime_contract
+        and not args.assert_local_main_branch_guard
+    )
+    # Issue #1886 AC4: the bare invocation (`check_codex_agent_config.py`
+    # with no flags) is a documented Verification Command. Default to
+    # running the full assertion suite instead of erroring, so the VC is a
+    # deterministic pass/fail rather than an argparse usage error.
+    run_required_fields = args.assert_required_fields or no_flag_given
+    run_runtime_contract = args.assert_runtime_contract or no_flag_given
+    run_local_main_branch_guard = args.assert_local_main_branch_guard or no_flag_given
+    if run_required_fields:
         failures.extend(assert_required_fields(expectations))
-    if args.assert_runtime_contract:
+    if run_runtime_contract:
         failures.extend(assert_runtime_contract(expectations))
-    if args.assert_local_main_branch_guard:
+    if run_local_main_branch_guard:
         hooks = json.loads(HOOKS_PATH.read_text(encoding="utf-8"))
         failures.extend(assert_local_main_branch_guard_preflight(hooks))
+    if no_flag_given or run_required_fields or run_runtime_contract:
+        failures.extend(validate_agy_builder_invocation(expectations))
     if failures:
         for failure in failures:
             print(f"[FAIL] {failure}")

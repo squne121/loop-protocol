@@ -839,6 +839,146 @@ def classify_claude_events(stdout: str) -> tuple[list[dict], int, int]:
     return spawn_events, self_restart_count, orchestration_count
 
 
+# ---------------------------------------------------------------------------
+# Native spawn-session evidence (Issue #1886 AC7): a genuinely independent,
+# runtime-returned child agent identifier, distinct from the caller-declared
+# ``requested_agent_type`` self-report the previous ``effective_agent_type``
+# assignment relied on. Two separate native sources were empirically located
+# in this repository's own local runtime state (not fabricated, not
+# documented API, discovered by direct inspection of real transcripts):
+#
+# - Claude Code: the ``Agent`` tool_use's ``tool_result`` content embeds a
+#   line ``agentId: <hex>`` for an async sub-agent launch. This is returned
+#   by the Claude Code runtime itself (not caller-supplied). The parent
+#   session id is the top-level ``session_id`` field already present on
+#   every native ``stream-json`` event.
+# - Codex CLI: ``spawn_agent`` (namespace ``multi_agent_v1``)
+#   ``function_call_output`` payloads embed ``{"agent_id": "<uuid>", ...}``.
+#   This is only visible in the on-disk rollout log
+#   (``~/.codex/sessions/**/rollout-*.jsonl``), not in ``codex exec --json``
+#   stdout (see ``_CODEX_COLLAB_ITEM_TYPE`` note above). The parent session
+#   id is the ``thread_id`` from the ``thread.started`` stdout event.
+#
+# Both extractors are best-effort and fail closed to ``None`` on any error
+# (missing file, unexpected shape, permission denied) -- a value that cannot
+# be honestly derived is never guessed.
+# ---------------------------------------------------------------------------
+
+_CLAUDE_AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-fA-F-]+)")
+
+
+def extract_claude_parent_session_id(stdout: str) -> str | None:
+    """Top-level ``session_id`` (or ``sessionId``) from the first native
+    stream-json event that carries one."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for key in ("session_id", "sessionId"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def extract_claude_child_session_id(parent_session_id: str | None, cwd: str) -> str | None:
+    """Best-effort ``agentId`` extraction from the Claude Code project
+    transcript for ``parent_session_id`` (``~/.claude/projects/<cwd-slug>/
+    <session_id>.jsonl``). Returns ``None`` on any lookup failure -- this is
+    read-only, local-filesystem evidence collection, never a guess."""
+    if not parent_session_id:
+        return None
+    try:
+        home = Path.home()
+        projects_dir = home / ".claude" / "projects"
+        if not projects_dir.is_dir():
+            return None
+        for candidate in projects_dir.glob(f"*/{parent_session_id}.jsonl"):
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            match = _CLAUDE_AGENT_ID_RE.search(text)
+            if match:
+                return match.group(1)
+        return None
+    except OSError:
+        return None
+
+
+def extract_codex_parent_session_id(stdout: str) -> str | None:
+    """``thread_id`` from the ``thread.started`` native ``--json`` event."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") == "thread.started":
+            value = payload.get("thread_id")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def extract_codex_child_session_id(parent_session_id: str | None) -> str | None:
+    """Best-effort ``agent_id`` extraction from the on-disk Codex rollout log
+    matching ``parent_session_id`` (searched under
+    ``~/.codex/sessions/**/rollout-*<parent_session_id>*.jsonl``). Returns
+    ``None`` on any lookup failure."""
+    if not parent_session_id:
+        return None
+    try:
+        sessions_dir = Path.home() / ".codex" / "sessions"
+        if not sessions_dir.is_dir():
+            return None
+        matches = list(sessions_dir.glob(f"**/*{parent_session_id}*.jsonl"))
+        for candidate in matches:
+            try:
+                pending_call_ids: set[str] = set()
+                for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    payload = record.get("payload") if isinstance(record, dict) else None
+                    if not isinstance(payload, dict):
+                        continue
+                    if payload.get("type") == "function_call" and payload.get("name") == "spawn_agent":
+                        call_id = payload.get("call_id")
+                        if isinstance(call_id, str):
+                            pending_call_ids.add(call_id)
+                        continue
+                    if payload.get("type") == "function_call_output" and payload.get("call_id") in pending_call_ids:
+                        output = payload.get("output")
+                        if isinstance(output, str):
+                            try:
+                                parsed_output = json.loads(output)
+                            except (json.JSONDecodeError, ValueError):
+                                continue
+                            agent_id = parsed_output.get("agent_id") if isinstance(parsed_output, dict) else None
+                            if isinstance(agent_id, str) and agent_id:
+                                return agent_id
+            except OSError:
+                continue
+        return None
+    except OSError:
+        return None
+
+
 def classify_codex_events(stdout: str) -> tuple[list[dict], int, int]:
     """Classify the already-captured native ``--json`` JSONL event stream for
     Codex CLI. Returns ``(spawn_events, self_restart_event_count,
@@ -1531,6 +1671,22 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["child_spawn_event_count"] = len(spawn_events)
             schema_summary["self_restart_event_count"] = self_restart_count
             schema_summary["orchestration_action_count"] = orchestration_count
+
+            # Issue #1886 AC7: native, runtime-returned spawn session
+            # evidence (see extractors above). ``native_spawn_event_observed``
+            # is strictly ``True`` only when both ids are non-empty and
+            # different -- caller self-report never promotes this to True.
+            if args.runtime == "claude":
+                parent_session_id = extract_claude_parent_session_id(out)
+                child_session_id = extract_claude_child_session_id(parent_session_id, worktree)
+            else:
+                parent_session_id = extract_codex_parent_session_id(out)
+                child_session_id = extract_codex_child_session_id(parent_session_id)
+            schema_summary["parent_session_id"] = parent_session_id
+            schema_summary["child_session_id"] = child_session_id
+            schema_summary["native_spawn_event_observed"] = bool(
+                parent_session_id and child_session_id and parent_session_id != child_session_id
+            )
 
             if capability_decision == "capability_skip":
                 # AC2: a known unknown/unrecognized-option parser diagnostic

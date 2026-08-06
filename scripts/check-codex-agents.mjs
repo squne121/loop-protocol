@@ -119,6 +119,42 @@ function loadReasoningMap() {
 
 const reasoningMap = loadReasoningMap();
 
+// Issue #1886: AGY-only canonical builder invocation contract for the
+// codebase-investigator / web-researcher agent surfaces. Loaded from the
+// same fixture as loadReasoningMap() so the JS/Python checkers and the
+// fixture stay a single source of truth (AC4).
+function loadAgyBuilderProfilesMap() {
+  const contract = JSON.parse(fs.readFileSync(runtimeContractPath, 'utf8'));
+  const entries = Object.entries(contract.required_agents)
+    .filter(([, expected]) => Array.isArray(expected.agy_builder_profiles));
+  return new Map(entries.map(([name, expected]) => [name, {
+    provider: expected.agy_builder_provider,
+    profiles: expected.agy_builder_profiles,
+  }]));
+}
+
+const agyBuilderProfilesMap = loadAgyBuilderProfilesMap();
+
+function extractBuilderInvocationBlock(instructions) {
+  const match = instructions.match(/BUILDER_INVOCATION\n([\s\S]*?)(?:\n\n|\nFAIL_CLOSED|\nNETWORK_LIMITATION|\nKnown limitation|$)/);
+  return match?.[1] ?? '';
+}
+
+function extractBuilderInvocationProvider(instructions) {
+  const block = extractBuilderInvocationBlock(instructions);
+  const match = block.match(/- provider:\s*([a-z_]+)/);
+  return match?.[1] ?? null;
+}
+
+function extractBuilderInvocationProfiles(instructions) {
+  const block = extractBuilderInvocationBlock(instructions);
+  const match = block.match(/- profiles?:\s*(.+)/);
+  if (!match) {
+    return [];
+  }
+  return match[1].split(',').map((entry) => entry.trim()).filter(Boolean);
+}
+
 const READ_ONLY_PROFILE_OVERRIDES = { 'web-researcher': 'loop-protocol-web-research' };
 
 const readOnlyAgents = new Set([
@@ -786,6 +822,26 @@ function validateAgents() {
     }
     if (writeAgents.has(name)) {
       assert(parsed.default_permissions === 'loop-protocol-rtk', `${file}: write-capable agent must use loop-protocol-rtk`, failures);
+    }
+
+    // Issue #1886: codebase-investigator / web-researcher must declare an
+    // AGY-only canonical builder invocation (provider=agy, expected
+    // profiles) and must not hand-write a provider-specific request JSON
+    // literal or claim Gemini-mandatory delegation (Gemini is
+    // disabled_by_operator; direct fallback success is not route success).
+    if (agyBuilderProfilesMap.has(name)) {
+      const expectedBuilder = agyBuilderProfilesMap.get(name);
+      const builderProvider = extractBuilderInvocationProvider(instructions);
+      const builderProfiles = extractBuilderInvocationProfiles(instructions);
+      assert(builderProvider === expectedBuilder.provider, `${file}: BUILDER_INVOCATION provider must be ${expectedBuilder.provider}`, failures);
+      assert(
+        JSON.stringify(builderProfiles) === JSON.stringify(expectedBuilder.profiles),
+        `${file}: BUILDER_INVOCATION profiles must be ${JSON.stringify(expectedBuilder.profiles)}, got ${JSON.stringify(builderProfiles)}`,
+        failures,
+      );
+      assert(!/"provider"\s*:/.test(instructions), `${file}: must not hand-write a provider JSON literal`, failures);
+      assert(!/(必ず\s*)?Gemini\s*(に|へ)?(必ず)?\s*委譲|Gemini mandatory/.test(instructions), `${file}: must not claim Gemini-mandatory delegation`, failures);
+      assert(instructions.includes('disabled_by_operator'), `${file}: must declare Gemini disabled_by_operator policy`, failures);
     }
   }
 

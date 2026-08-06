@@ -179,7 +179,12 @@
       "runtime_followup_route": "gemini-cli-headless-delegation",
       "repo_local_skill_surfaces": [
         ".agents/skills/gemini-cli-headless-delegation/SKILL.md"
-      ]
+      ],
+      "agy_builder_profiles": [
+        "local_asset_research",
+        "github_research"
+      ],
+      "agy_builder_provider": "agy"
     },
     "web-researcher": {
       "path": ".codex/agents/web-researcher.toml",
@@ -190,7 +195,11 @@
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-web-research",
       "runtime_dependency_status": "followup_required",
-      "runtime_followup_route": "grounded_research_or_direct_web"
+      "runtime_followup_route": "grounded_research_or_direct_web",
+      "agy_builder_profiles": [
+        "grounded_research"
+      ],
+      "agy_builder_provider": "agy"
     }
   },
   "required_instruction_tokens": [
