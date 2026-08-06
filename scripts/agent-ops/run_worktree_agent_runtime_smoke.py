@@ -843,13 +843,23 @@ def classify_claude_events(stdout: str) -> tuple[list[dict], int, int]:
 # Native spawn-session evidence (Issue #1886 AC7): a genuinely independent,
 # runtime-returned child agent identifier, distinct from the caller-declared
 # ``requested_agent_type`` self-report the previous ``effective_agent_type``
-# assignment relied on. Two separate native sources were empirically located
-# in this repository's own local runtime state (not fabricated, not
-# documented API, discovered by direct inspection of real transcripts):
+# assignment relied on. Native sources were empirically located in this
+# repository's own local runtime state (not fabricated, not documented API,
+# discovered by direct inspection of real invocations):
 #
-# - Claude Code: the ``Agent`` tool_use's ``tool_result`` content embeds a
-#   line ``agentId: <hex>`` for an async sub-agent launch. This is returned
-#   by the Claude Code runtime itself (not caller-supplied). The parent
+# - Claude Code: the ``Agent``/``Task`` tool_use's ``tool_result`` embeds the
+#   runtime-generated child agent id in TWO places -- (1) a structured
+#   ``tool_use_result.agentId`` field on the ``type: "user"`` stream-json
+#   event that carries the tool_result, and (2) a duplicate human-readable
+#   ``agentId: <hex>`` text line inside that same tool_result's text
+#   content. Both are directly present in the already-captured ``stdout``
+#   stream-json itself -- no persisted transcript file is required (Issue
+#   #1886 AC7 fix-delta, iteration 6: the prior implementation only looked
+#   in the persisted transcript file at ``~/.claude/projects/*/
+#   <parent_session_id>.jsonl``, which is never written for the structured
+#   lane because ``run_structured_claude`` always passes
+#   ``--no-session-persistence`` -- a self-contradiction that made
+#   ``native_spawn_event_observed`` permanently ``False``). The parent
 #   session id is the top-level ``session_id`` field already present on
 #   every native ``stream-json`` event.
 # - Codex CLI: ``spawn_agent`` (namespace ``multi_agent_v1``)
@@ -887,13 +897,96 @@ def extract_claude_parent_session_id(stdout: str) -> str | None:
     return None
 
 
-def extract_claude_child_session_id(parent_session_id: str | None, cwd: str) -> str | None:
-    """Best-effort ``agentId`` extraction from the Claude Code project
-    transcript for ``parent_session_id`` (``~/.claude/projects/<cwd-slug>/
-    <session_id>.jsonl``). Returns ``None`` on any lookup failure -- this is
-    read-only, local-filesystem evidence collection, never a guess."""
+def _extract_claude_child_session_id_from_stream(stdout: str) -> str | None:
+    """Issue #1886 AC7 fix-delta (iteration 6): the previous file-based
+    lookup in ``extract_claude_child_session_id`` globs
+    ``~/.claude/projects/*/<parent_session_id>.jsonl`` -- a *persisted*
+    session transcript file. That file is never written for the structured
+    lane, because ``run_structured_claude`` always passes
+    ``--no-session-persistence`` (a deliberate, documented safety
+    requirement -- see ``references/claude-code.md`` -- that must not be
+    removed just to make this extractor's old lookup path succeed). The
+    file-based lookup was therefore structurally unable to ever return a
+    value, making ``native_spawn_event_observed`` always ``False``
+    regardless of whether a spawn genuinely happened.
+
+    Empirically confirmed (live ``claude -p --output-format stream-json
+    --include-hook-events --no-session-persistence`` run, single ``Task``
+    tool_use) that the runtime-returned child agent id is ALSO present
+    directly in the already-captured stdout stream itself, independent of
+    any persisted transcript file:
+
+    - A ``type: "user"`` event carrying the ``Agent``/``Task`` tool_result
+      has a top-level ``tool_use_result`` object with an ``agentId`` string
+      field -- e.g. ``{"tool_use_result": {"agentId": "a72066e6f732aa768",
+      "agentType": "general-purpose", ...}}``. This is the primary,
+      structured source used below.
+    - The same value is duplicated as human-readable text
+      (``agentId: <hex> (use SendMessage with to: '<hex>', ...)``) inside a
+      ``text`` content block of that same tool_result -- kept here as a
+      fallback for any stream-json shape where ``tool_use_result`` is
+      absent but the text block still carries the line, reusing the
+      existing ``_CLAUDE_AGENT_ID_RE`` pattern.
+
+    Best-effort / read-only against already-captured data: returns ``None``
+    on any parse or shape mismatch, never a guess."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "user":
+            continue
+        tool_use_result = payload.get("tool_use_result")
+        if isinstance(tool_use_result, dict):
+            agent_id = tool_use_result.get("agentId")
+            if isinstance(agent_id, str) and agent_id:
+                return agent_id
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            inner = block.get("content")
+            text_parts: list[str] = []
+            if isinstance(inner, str):
+                text_parts.append(inner)
+            elif isinstance(inner, list):
+                for sub in inner:
+                    if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                        text_parts.append(sub["text"])
+            for text in text_parts:
+                match = _CLAUDE_AGENT_ID_RE.search(text)
+                if match:
+                    return match.group(1)
+    return None
+
+
+def extract_claude_child_session_id(
+    parent_session_id: str | None, cwd: str, stdout: str | None = None
+) -> str | None:
+    """``agentId`` extraction for the Claude Code child sub-agent spawned by
+    this run. Primary source (Issue #1886 AC7 fix-delta, iteration 6): the
+    already-captured ``stdout`` stream-json itself (see
+    ``_extract_claude_child_session_id_from_stream`` for why this is
+    required -- the file-based path below can never succeed while
+    ``--no-session-persistence`` is active). Fallback source: the Claude
+    Code project transcript file for ``parent_session_id``
+    (``~/.claude/projects/<cwd-slug>/<session_id>.jsonl``), kept only in
+    case a future caller invokes this runner without
+    ``--no-session-persistence``. Returns ``None`` on any lookup failure --
+    this is read-only, best-effort evidence collection, never a guess."""
     if not parent_session_id:
         return None
+    if stdout:
+        found = _extract_claude_child_session_id_from_stream(stdout)
+        if found:
+            return found
     try:
         home = Path.home()
         projects_dir = home / ".claude" / "projects"
@@ -1678,7 +1771,7 @@ def main(argv: list[str] | None = None) -> int:
             # different -- caller self-report never promotes this to True.
             if args.runtime == "claude":
                 parent_session_id = extract_claude_parent_session_id(out)
-                child_session_id = extract_claude_child_session_id(parent_session_id, worktree)
+                child_session_id = extract_claude_child_session_id(parent_session_id, worktree, out)
             else:
                 parent_session_id = extract_codex_parent_session_id(out)
                 child_session_id = extract_codex_child_session_id(parent_session_id)
