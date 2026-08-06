@@ -441,6 +441,40 @@ button:focus-visible {
   }
 }
 
+/* Issue #1958 AC4 (PR #2006 review fix_delta iteration 1, blocker 1): at
+ * narrower desktop widths (the tested 980x720 / 800x720 cells,
+ * `tests/e2e/hud-hull-overflow.spec.ts`'s `VIEWPORTS`), the Canvas itself is
+ * narrower, so the fixed 200px-wide bottom-left status card (sized for the
+ * 1280px+ desktop cells) reaches far enough right to intrude into the
+ * Canvas's static center 60%x60% protected zone -- an actual AC4 violation
+ * this Issue's newly-added protected-zone assertion caught (a prior PR
+ * revision claimed AC4 was already covered; it was not). Narrowing the card
+ * and switching its stat-grid to a single column keeps Hull/Kills readable
+ * while pulling the card's right edge back inside the protected zone's left
+ * boundary at these widths. `421px` is the lower bound (exclusive) of this
+ * range -- the `max-width: 420px` breakpoint below owns the even narrower
+ * (375x667) minimum-supported-viewport case with its own layout. */
+@media (min-width: 421px) and (max-width: 1050px) {
+  .combat-hud__status {
+    inline-size: min(130px, 100%);
+    padding: 8px 10px;
+  }
+
+  .combat-hud__status .stat-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+
+  /* Same rationale as `.combat-hud__status` above, mirrored for the
+   * bottom-right edge-control zone (Weapon/Assist): at these narrower
+   * desktop widths its default `min(180px, 100%)` width reaches far enough
+   * left to intrude into the protected zone from the right side. */
+  .combat-hud__edge {
+    inline-size: min(130px, 100%);
+    padding: 8px 10px;
+  }
+}
+
 /* Issue #1958 AC1/AC2: at the supported minimum viewport (375x667, where
  * `.battle-stage__canvas`'s `aspect-ratio: 16 / 9` letterboxes the Canvas to
  * a very short safe-zone box), the edge-control (Weapon/Assist) collapses

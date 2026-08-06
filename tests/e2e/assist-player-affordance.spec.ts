@@ -202,6 +202,15 @@ type EvidenceEntry = {
   logical_arena: { width: number; height: number }
   pointer_mapping?: PointerMappingEvidence[]
   frozen_gameplay?: FrozenGameplayState
+  /**
+   * Which HUD control this evidence entry actually exercised (Issue #1958
+   * AC7 fix_delta): 'assist' for the pre-existing SCENARIOS matrix,
+   * 'pause' for `COLLAPSED_EDGE_SCENARIOS` (375x667, where edge-control is
+   * collapsed and Assist is not visible -- see that array's doc comment).
+   * Undefined is treated as 'assist' for backward compatibility with prior
+   * evidence JSON consumers.
+   */
+  checked_control?: 'assist' | 'pause'
 }
 
 type PointerMappingEvidence = {
@@ -227,6 +236,32 @@ const SCENARIOS: Scenario[] = [
   { viewport: { width: 1920, height: 1080, label: '1920x1080' }, zoom: { factor: 1.25, label: '125%' } },
   { viewport: { width: 1920, height: 1080, label: '1920x1080' }, zoom: { factor: 1.5, label: '150%' } },
   { viewport: { width: 1920, height: 1080, label: '1920x1080' }, zoom: { factor: 2, label: '200%' } },
+  // Issue #1958 AC7 (PR #2006 review fix_delta iteration 1, blocker 2): the
+  // owner-playtest-reported desktop DPR-approximation viewport, added
+  // alongside the pre-existing three. Edge-control (Weapon/Assist) is NOT
+  // collapsed at this width (`src/style.css`'s `@media (max-width: 420px)`
+  // only fires below 420px), so this reuses the same Assist-button-based
+  // evidence flow as the other three viewports.
+  { viewport: { width: 1437, height: 1365, label: '1437x1365' }, zoom: { factor: 1, label: '100%' } },
+  { viewport: { width: 1437, height: 1365, label: '1437x1365' }, zoom: { factor: 1.25, label: '125%' } },
+  { viewport: { width: 1437, height: 1365, label: '1437x1365' }, zoom: { factor: 1.5, label: '150%' } },
+  { viewport: { width: 1437, height: 1365, label: '1437x1365' }, zoom: { factor: 2, label: '200%' } },
+]
+
+// Issue #1958 AC7 (PR #2006 review fix_delta iteration 1, blocker 2): the
+// `Supported minimum viewport` (AC2) 375x667. Unlike the `SCENARIOS` above,
+// edge-control (Weapon/Assist) is intentionally collapsed/hidden at this
+// width by `src/style.css`'s `@media (max-width: 420px)` progressive-
+// disclosure rule (AC1/AC2 semantic state table) -- the Assist button is
+// not visible here, so an Assist-based evidence flow would fail by design,
+// not by regression. This scenario matrix instead exercises the
+// never-collapsing Pause control (AC1: `collapsible: false`), which stays
+// reachable at every supported viewport including the minimum.
+const COLLAPSED_EDGE_SCENARIOS: Scenario[] = [
+  { viewport: { width: 375, height: 667, label: '375x667' }, zoom: { factor: 1, label: '100%' } },
+  { viewport: { width: 375, height: 667, label: '375x667' }, zoom: { factor: 1.25, label: '125%' } },
+  { viewport: { width: 375, height: 667, label: '375x667' }, zoom: { factor: 1.5, label: '150%' } },
+  { viewport: { width: 375, height: 667, label: '375x667' }, zoom: { factor: 2, label: '200%' } },
 ]
 
 const RESPONSIVE_VIEWPORTS = [
@@ -593,7 +628,7 @@ test('assist-player-affordance routes through DOM activation and KeyZ', async ({
 })
 
 // eslint-disable-next-line no-empty-pattern -- Playwright requires the first arg to be a (possibly empty) fixtures destructure.
-test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x1080 and 100%, 125%, 150%, 200%', async ({}, testInfo) => {
+test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x1080, 1437x1365, 375x667 and 100%, 125%, 150%, 200%', async ({}, testInfo) => {
   test.setTimeout(240_000)
 
   const evidence: EvidenceEntry[] = []
@@ -694,6 +729,95 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
           test_run_id: testInfo.testId,
           observed_chrome_tab_zoom: observedZoom,
           screenshot_path: screenshotPath,
+          checked_control: 'assist',
+          ...observed,
+        })
+      }
+    } finally {
+      await zoomCtx.close()
+    }
+  }
+
+  // Issue #1958 AC7 (PR #2006 review fix_delta iteration 1, blocker 2): the
+  // 375x667 minimum supported viewport (AC2). Edge-control (Weapon/Assist)
+  // is intentionally collapsed here, so this exercises the never-collapsing
+  // Pause control instead (see `COLLAPSED_EDGE_SCENARIOS`'s doc comment) --
+  // same artifact capture (viewport, DPR, zoom, userAgent, head SHA) as the
+  // Assist-based scenarios above, individually reviewable per cell.
+  const collapsedEdgeGroups = new Map<string, typeof COLLAPSED_EDGE_SCENARIOS>()
+  for (const scenario of COLLAPSED_EDGE_SCENARIOS) {
+    const key = scenario.viewport.label
+    const group = collapsedEdgeGroups.get(key) ?? []
+    group.push(scenario)
+    collapsedEdgeGroups.set(key, group)
+  }
+
+  for (const [, scenarios] of collapsedEdgeGroups) {
+    const zoomCtx = await launchZoomCapableContext(testInfo.outputDir, {
+      viewport: scenarios[0].viewport,
+    })
+    try {
+      const page = zoomCtx.page
+      await page.goto('/?playtest_evidence=1')
+      await waitForRunningWithCombatActors(page)
+
+      for (const scenario of scenarios) {
+        await zoomCtx.setZoom(scenario.zoom.factor)
+        await page.waitForTimeout(150)
+
+        const pauseButton = page.locator('[data-action="toggle-pause"]')
+
+        await expect(pauseButton).toBeVisible()
+        await expect(pauseButton).toBeEnabled()
+        await expect(pauseButton).toHaveText('Pause')
+        // AC2/AC1: edge-control is collapsed at this viewport -- confirm
+        // that, rather than silently assuming it (a regression here would
+        // mean this scenario stopped exercising its intended collapsed
+        // state and should instead run through the SCENARIOS/Assist path).
+        await expect(page.locator('[data-hud-zone="edge-control"]')).toBeHidden()
+
+        await pauseButton.scrollIntoViewIfNeeded()
+        const buttonBox = await pauseButton.boundingBox()
+        expect(buttonBox).not.toBeNull()
+        expect(buttonBox!.x).toBeGreaterThanOrEqual(0)
+        expect(buttonBox!.y).toBeGreaterThanOrEqual(0)
+        expect(buttonBox!.x + buttonBox!.width).toBeLessThanOrEqual(scenario.viewport.width)
+        expect(buttonBox!.y + buttonBox!.height).toBeLessThanOrEqual(scenario.viewport.height)
+
+        await pauseButton.focus()
+        await expect(pauseButton).toBeFocused()
+
+        const screenshotPath = testInfo.outputPath(
+          `assist-player-affordance-${scenario.viewport.label}-${scenario.zoom.label.replace('%', 'pct')}-pause.png`,
+        )
+        await page.screenshot({
+          path: screenshotPath,
+          fullPage: true,
+        })
+        expect(existsSync(screenshotPath), `screenshot must exist on disk: ${screenshotPath}`).toBe(true)
+
+        const observedZoom = await zoomCtx.getZoom()
+        const observed = await collectEvidence(page)
+        expect(observed.logical_arena).toEqual({ width: 960, height: 540 })
+        expect(
+          Math.abs(
+            observed.canvas_backing_store.width - observed.canvas_css.width * observed.observed_devicePixelRatio,
+          ),
+        ).toBeLessThanOrEqual(1)
+        expect(
+          Math.abs(
+            observed.canvas_backing_store.height - observed.canvas_css.height * observed.observed_devicePixelRatio,
+          ),
+        ).toBeLessThanOrEqual(1)
+        evidence.push({
+          head_sha: headSha,
+          viewport: scenario.viewport.label,
+          browser_zoom: scenario.zoom.label,
+          os_runner: osRunner,
+          test_run_id: testInfo.testId,
+          observed_chrome_tab_zoom: observedZoom,
+          screenshot_path: screenshotPath,
+          checked_control: 'pause',
           ...observed,
         })
       }
