@@ -540,6 +540,37 @@ button:focus-visible {
     display: none;
   }
 
+  /* Issue #1958 AC4 (PR #2006 review fix_delta iteration 4, CI-reproduced
+   * regression): at 375x667 the default `.combat-hud__elapsed` pill
+   * (0.78rem font, 4px vertical padding, ~23px tall) sits with its bottom
+   * edge only ~0.6px above the Canvas center 60%x60% protected zone's top
+   * edge -- a hairline, environment-dependent pass/fail (GitHub Actions'
+   * Chromium renders this ~1px taller than the local dev environment did,
+   * flipping this into a real overlap caught by
+   * `tests/e2e/hud-hull-overflow.spec.ts`'s AC7 test, CI job "e2e").
+   * `elapsed`'s top edge is already pinned to the 16px safe-margin floor
+   * (`HUD_SAFE_MARGIN_PX`) inherited from `.battle-hud-layer`'s own
+   * padding, so there is no room to move it further up -- only shrinking
+   * its own height creates real clearance. Per the AC1 semantic state
+   * table (`COMBAT_HUD_SEMANTIC_STATE_TABLE` in `src/ui/combatHud.ts`),
+   * `elapsed` (`collapsible: 1`) is the LAST fragment to collapse among
+   * the collapsible set (Weapon/Assist `3` collapse first, then Kills
+   * `2`) -- it stays visible at this viewport (Weapon/Assist have already
+   * collapsed via the `display: none` rule directly above, but Kills has
+   * not), so it must be genuinely repositioned/shrunk here rather than
+   * hidden. Same reduced-scale treatment already applied to
+   * `.combat-hud__status`/`.combat-hud__pause` at this breakpoint
+   * (font-size down to ~0.6-0.68rem, minimal padding) -- this keeps the
+   * pill legible while cutting its height by well beyond the ~8.6px this
+   * specific overlap needed, so the fix has real margin (verified via a
+   * local Playwright re-run, see PR body) rather than reproducing the
+   * same near-zero-margin fragility under any future sub-pixel shift. */
+  .combat-hud__elapsed {
+    font-size: 0.6rem;
+    line-height: 1.05;
+    padding: 1px 6px;
+  }
+
   /* Mirrors `.combat-hud__status` into the right free column so Pause never
    * reaches into the protected zone's x-range either, independent of its
    * y position (AC4). */

@@ -713,6 +713,46 @@ VRT 証跡化されることを要求する。owner decision #2
 - **maturity**: 新規 4 件とも `legacy-current`（`running-hud-overlay-legacy-current`
   と同一。§4 の `maturity transition` を満たすまで `frozen` 化しない）。
 
+### `running-hud-overlay-legacy-current-375x667` baseline の再登録（Issue #1958、375x667 の経過時間表示と保護領域の重なりを修正した第4回目の反復対応）
+
+GitHub Actions 実 Chromium 実行（job `e2e`、`tests/e2e/hud-hull-overflow.spec.ts`
+の AC7 `viewport=375x667` テスト）で、`.combat-hud__elapsed`（top-center
+`elapsed` フラグメント）が Canvas 中央 60%x60% protected zone とハイラインで
+重複するリグレッションが検出された（重複量 ~0.6px、local dev 環境の
+Chromium レンダリングでは margin ぎりぎり pass するがCI runner では fail する
+sub-pixel 差異依存の欠陥）。`src/style.css` の `@media (max-width: 420px)`
+ブロックに `.combat-hud__elapsed` の縮小ルール（font-size 0.6rem、line-height
+1.05、padding 1px 6px）を追加し、pill の高さを ~23px から ~12px へ縮小した。
+`elapsed` フラグメントの上端は `.battle-hud-layer` の 16px safe-margin に
+既に固定されているため、これより上へは動かせず、高さを縮めることでのみ
+protected zone との実マージンを確保できる（AC1 の semantic state table で
+`elapsed`（`collapsible: 1`）は Weapon/Assist（`3`）・Kills（`2`）より後に
+collapse する設計のため、375x667 で Weapon/Assist が既に collapse していても
+`elapsed` は非表示化せず、位置調整のみで対応した）。
+
+- **実測クリアランス**（このworktree環境、実 Chromium、head
+  `911d4f1c` 直後の fix commit）: protected zone 上端と elapsed zone 下端の
+  距離 = **約 11.6px**（修正前は overlap ~0.6px）。`tests/e2e/hud-hull-overflow.spec.ts`
+  の AC7 375x667 テストおよび 375x667 dual-fixture テスト（AC1/AC2/AC4/AC6）を
+  実 Chromium で再実行し、両方とも real margin で PASS することを確認した。
+- **影響を受けた baseline PNG**（1件のみ、individual review 済み）:
+  `vrt-running-hud-overlay-375x667.png`（353x199、変更なし。`elapsed` pill が
+  縮小し、それに伴い下段の `status`/`pause` 行がわずかに上へシフトした見た目の
+  差分のみ。`expected`/`actual`/`diff` を個別に目視確認し、意図した CSS 変更
+  以外の差分がないことを確認した）。dominant_ratio=0.3087（旧 0.3054 から
+  微増）、unique_colors=508（旧 524 から微減）——いずれも
+  `SINGLE_COLOR_DOMINANCE_THRESHOLD`（0.9）を大きく下回り、非degenerate。
+  他 3 件の boundary-cell baseline（1366x768 / 1920x1080 /
+  1437x1365-dpr0667）と既存 1280x720 baseline は無変更（`elapsed` の
+  縮小ルールは `@media (max-width: 420px)` スコープのみで、375x667 以外の
+  ビューポートには適用されない）。
+- **generation / verification**: `pnpm run test:vrt`（real comparison,
+  non-update）で該当 PNG を差し替えた上で再実行し、11 tests 中 10 passed /
+  1 skipped（pending-baseline のみ skip）を確認。負の対照
+  （hidden-HUD capture を reject する negative control）・pixel-diversity
+  テストも無回帰で PASS。
+- **maturity**: `legacy-current` のまま変更なし。
+
 ## 4. baseline update policy（更新ポリシー）
 
 ### 自動更新の禁止
