@@ -36,7 +36,14 @@ CANONICAL_PERMISSION_RESOURCES: frozenset[str] = frozenset(
         "mcp",
     }
 )
-ALLOWED_PROFILES: frozenset[str] = frozenset({"no_tools", "local_asset_research", "grounded_research", "proposal_only"})
+# Issue #1920: "github_research" is included so a run-context stamped with
+# tool_profile="github_research" (see agy_permission_policy.PROFILE_ALLOWED_TOOLS,
+# which is empty for this profile) loads successfully instead of failing
+# closed with context_load_failure; any AGY-native tool-call attempt under
+# this profile is still denied by the empty allowed_resources policy below.
+ALLOWED_PROFILES: frozenset[str] = frozenset(
+    {"no_tools", "local_asset_research", "grounded_research", "proposal_only", "github_research"}
+)
 
 # Native hook tool names are not official permission resources.  Unknown
 # dispatchers deny; the map stays deliberately small until live evidence can
