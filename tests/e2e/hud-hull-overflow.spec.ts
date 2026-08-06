@@ -198,15 +198,28 @@ function rectsIntersect(a: Rect, b: Rect): boolean {
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y
 }
 
-/** Asserts `inner` is fully contained within `outer` expanded by `margin` on every side. */
+/**
+ * Asserts `inner` is fully contained within `outer` INSET by `margin` on
+ * every side (Issue #1958 AC3 fix): `inner` must stay at least `margin`
+ * CSS px inside `outer`'s edges, not merely within `outer` expanded
+ * outward by `margin` (the previous, backwards, false-green comparison --
+ * that version allowed `inner` to overflow `outer` by up to `margin` px
+ * and still pass). `epsilon` absorbs sub-pixel rounding only, never the
+ * declared safe-zone margin itself.
+ */
 function assertWithinSafeMargin(inner: Rect, outer: Rect, margin: number, label: string): void {
-  expect(inner.x, `${label}: left edge inside safe margin`).toBeGreaterThanOrEqual(outer.x - margin)
-  expect(inner.y, `${label}: top edge inside safe margin`).toBeGreaterThanOrEqual(outer.y - margin)
+  const epsilon = 1
+  expect(inner.x, `${label}: left edge inside safe margin`).toBeGreaterThanOrEqual(
+    outer.x + margin - epsilon,
+  )
+  expect(inner.y, `${label}: top edge inside safe margin`).toBeGreaterThanOrEqual(
+    outer.y + margin - epsilon,
+  )
   expect(inner.x + inner.width, `${label}: right edge inside safe margin`).toBeLessThanOrEqual(
-    outer.x + outer.width + margin,
+    outer.x + outer.width - margin + epsilon,
   )
   expect(inner.y + inner.height, `${label}: bottom edge inside safe margin`).toBeLessThanOrEqual(
-    outer.y + outer.height + margin,
+    outer.y + outer.height - margin + epsilon,
   )
 }
 
@@ -259,31 +272,85 @@ async function assertHudGeometry(page: Page, label: string): Promise<void> {
   )
 }
 
+/**
+ * Variant of `assertHudGeometry` for the 375x667 minimum supported
+ * viewport (Issue #1958 AC1/AC2): Weapon/Assist (`edge-control`) is
+ * intentionally collapsed/hidden by `src/style.css`'s
+ * `@media (max-width: 420px)` rule (the semantic state table's collapse
+ * priority), so "Assist allies in viewport" is not asserted here. Hull /
+ * critical / Kills / elapsed / Pause -- the never-collapsing fragments --
+ * still must stay within the Canvas safe margin, never overlap the header,
+ * and the HUD must have no internal overflow.
+ */
+async function assertHudGeometryAtCollapsedMinimum(page: Page, label: string): Promise<void> {
+  const hud = page.locator('[data-combat-hud]')
+  const canvas = page.locator('canvas.battle-stage__canvas')
+  const header = page.locator('.battle-stage__header')
+
+  await expect(hud).toBeVisible()
+
+  const hudBox = await hud.boundingBox()
+  const canvasBox = await canvas.boundingBox()
+  const headerBox = await header.boundingBox()
+
+  expect(hudBox, `${label}: combat HUD must have a bounding box`).not.toBeNull()
+  expect(canvasBox, `${label}: canvas must have a bounding box`).not.toBeNull()
+  expect(headerBox, `${label}: header must have a bounding box`).not.toBeNull()
+
+  if (!hudBox || !canvasBox || !headerBox) {
+    return
+  }
+
+  assertWithinSafeMargin(hudBox, canvasBox, HUD_SAFE_MARGIN_PX, `${label} HUD-in-canvas`)
+
+  expect(
+    rectsIntersect(hudBox, headerBox),
+    `${label}: HUD box ${JSON.stringify(hudBox)} must not intersect header box ${JSON.stringify(headerBox)}`,
+  ).toBe(false)
+
+  // AC1, AC2: the never-collapsing fragments stay reachable even when
+  // edge-control is collapsed.
+  await expect(page.getByRole('button', { name: 'Pause' })).toBeInViewport()
+
+  const overflow = await hud.evaluate((el) => ({
+    scrollWidth: el.scrollWidth,
+    clientWidth: el.clientWidth,
+    scrollHeight: el.scrollHeight,
+    clientHeight: el.clientHeight,
+  }))
+  expect(overflow.scrollWidth, `${label}: HUD scrollWidth <= clientWidth`).toBeLessThanOrEqual(
+    overflow.clientWidth,
+  )
+  expect(overflow.scrollHeight, `${label}: HUD scrollHeight <= clientHeight`).toBeLessThanOrEqual(
+    overflow.clientHeight,
+  )
+}
+
 test.describe('hud geometry: combat HUD stays inside the Canvas viewport (AC7)', () => {
   for (const vp of GEOMETRY_VIEWPORTS) {
-    // Issue #1956 fix_delta (iteration 1): a prior fix_delta in this same PR
-    // correctly removed an out-of-scope `@media (max-width: 500px)` CSS rule
-    // from `src/style.css` that used to `scale(0.5)` the combat HUD on mobile
-    // viewports -- combat HUD placement/safe-zone/scaling is explicitly
-    // Out of Scope for Issue #1956 and is owned by Issue #1958. Removing that
-    // CSS makes this 375x667 case fail this safe-margin assertion (the HUD's
-    // bottom edge now exceeds the canvas's safe margin by ~130px, since it no
-    // longer shrinks on mobile). This is not a regression #1956 owns; it is
-    // deferred here rather than silently deleted or made to pass by weakening
-    // `assertWithinSafeMargin`/`assertHudGeometry` (which all other viewport
-    // cases below still rely on for real regression protection). Issue #1958
-    // (combat HUD placement/safe-zone/priority) must either reintroduce a
-    // properly-scoped mobile HUD treatment or otherwise satisfy this
-    // safe-margin assertion before this can be re-enabled.
-    const testFn = vp.label === '375x667' ? test.fixme : test
-    testFn(`viewport=${vp.label}: HUD is within canvas bounds, never overlaps header, Assist+Pause in viewport, no internal overflow`, async ({
+    // Issue #1958 AC2: the combat HUD's placement/safe-zone/priority
+    // redesign (`src/ui/combatHud.ts`'s zoned grid + `src/style.css`'s
+    // `@media (max-width: 420px)` progressive-disclosure collapse of the
+    // edge-control zone) fits the 375x667 minimum supported viewport
+    // (`Supported minimum viewport` = 375x667) within the strict `inner`
+    // safe-margin containment fixed by AC3's `assertWithinSafeMargin`
+    // rewrite. The `test.fixme` deferred by Issue #1956 is now resolved.
+    test(`viewport=${vp.label}: HUD is within canvas bounds, never overlaps header, Assist+Pause in viewport, no internal overflow`, async ({
       page,
     }) => {
       await page.setViewportSize({ width: vp.width, height: vp.height })
       await page.goto('/')
       await page.waitForSelector('[data-combat-hud]', { timeout: 10_000 })
 
-      await assertHudGeometry(page, vp.label)
+      // AC2: at 375x667, Weapon/Assist collapse first (semantic state table
+      // collapse priority) -- Assist allies is not required to stay in
+      // viewport at the minimum supported width, so this asserts a variant
+      // of `assertHudGeometry` without that check.
+      if (vp.label === '375x667') {
+        await assertHudGeometryAtCollapsedMinimum(page, vp.label)
+      } else {
+        await assertHudGeometry(page, vp.label)
+      }
     })
   }
 })

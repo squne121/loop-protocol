@@ -168,6 +168,11 @@ button:focus-visible {
   justify-items: end;
   align-content: start;
   gap: 12px;
+  /* Issue #1958 AC3: this 16px padding on the `inset: 0` box IS the safe-zone
+   * containment mechanism -- everything inside `.battle-hud-layer` is
+   * geometrically guaranteed to stay within 16 CSS px of the Canvas edges,
+   * so `.combat-hud`'s own zones below never need to reproduce this margin
+   * individually. */
   padding: 16px;
   /* Issue #1375 PR #1925 review (P0-2): this layer must not be the primary
    * scroll boundary for the compact combat HUD in the normal desktop
@@ -182,6 +187,8 @@ button:focus-visible {
   overflow-y: auto;
   overscroll-behavior: contain;
 }
+
+
 
 /* Issue #1374 PR #1815 review fix 1: title/load/preparation render as a
  * single centered menu overlay in the screen layer, never the right-aligned
@@ -232,23 +239,89 @@ button:focus-visible {
   max-inline-size: 100%;
 }
 
-/* Combat HUD (Issue #1375, redesigned Issue #1375 PR #1925 review P1-3): the
- * single compact running-only player-facing surface (Hull / Kills / Elapsed /
- * Weapon / Assist / Pause). Kept narrow and self-contained so it never
- * covers the Canvas battle-stage and both Assist allies and Pause stay
- * visible together at 1280x720 (AC7).
+/* Combat HUD (Issue #1375, placement/safe-zone/priority redesign Issue
+ * #1958): the running-only player-facing surface, split into named-grid
+ * zones so priority/placement matches the semantic state table in
+ * `src/ui/combatHud.ts` (`COMBAT_HUD_SEMANTIC_STATE_TABLE`):
+ * - `status` (Hull / critical / Kills): persistent, bottom-left.
+ * - `elapsed`: low-prominence, top-center.
+ * - `edge` (Weapon / Assist): conditional edge control, bottom-right,
+ *   first to collapse under progressive disclosure at very short viewports.
+ * - `pause`: separated from the status cluster, bottom-right, never
+ *   collapses.
  *
- * Deliberately does NOT reuse `.panel` (owner playtest feedback: the combat
- * HUD read as a second independent menu panel floating over gameplay, not a
- * lightweight status readout). Own chrome here is intentionally lighter than
- * `.panel`'s `--shadow` (0 24px 80px) / `blur(16px)` / 22px radius / 20px
- * padding — a slim, edge-anchored status cluster instead of a full card. */
+ * The `.combat-hud` root itself is transparent and `pointer-events: none`
+ * (only interactive `[data-battle-interactive='true']` children opt back in
+ * via the existing `.battle-ui-layer [data-battle-interactive='true']`
+ * rule) — it is a pure layout root spanning the whole
+ * `.battle-hud-layer` safe-zone box; the visible chrome lives on the
+ * per-zone wrapper elements below, each of which is deliberately lighter
+ * than `.panel` (owner playtest feedback: the combat HUD previously read as
+ * a second independent menu panel floating over gameplay, not a
+ * lightweight status readout). */
 .combat-hud {
+  /* Issue #1958: unlike `.legacy-debrief-surface` (a right-aligned single
+   * card that keeps `.battle-hud-layer`'s own `justify-items: end`
+   * placement), `.combat-hud` spans the FULL WIDTH of the safe-zone box
+   * (`justify-self: stretch`) so its zones can place `status` at the true
+   * left edge and `edge`/`pause` at the true right edge -- `status`
+   * (Hull/critical/Kills) bottom-left, `edge` (Weapon/Assist) and `pause`
+   * stacked bottom-right, both directly below the top-center `elapsed`
+   * row.
+   *
+   * Deliberately height: auto (content-sized), NOT stretched to fill
+   * `.battle-hud-layer`'s full height: `.battle-stage__canvas`'s
+   * `aspect-ratio: 16 / 9` box can be taller than the actual browser
+   * viewport at supported desktop sizes (e.g. 1280x720 -- the canvas
+   * itself renders ~720px tall below a ~124px header, exceeding the
+   * 720px-tall browser viewport). A vertically-stretched combat-hud would
+   * anchor `status`/`edge`/`pause` to the true bottom of that
+   * canvas-height box, which can fall below the browser's visible fold
+   * and make Pause/Assist unreachable without scrolling (caught by
+   * `tests/e2e/hud-hull-overflow.spec.ts`'s `toBeInViewport()` checks).
+   * Staying content-sized and anchored to the top of the safe zone (via
+   * `.battle-hud-layer`'s own `align-content: start`) keeps every combat
+   * HUD control within the guaranteed-visible region at every supported
+   * viewport. */
+  justify-self: stretch;
   display: grid;
-  gap: 8px;
-  inline-size: min(220px, calc(100% - 16px));
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto;
+  grid-template-areas:
+    'elapsed elapsed'
+    'status  edge'
+    'status  pause';
+  row-gap: 8px;
+  column-gap: 8px;
+  pointer-events: none;
+}
+
+.combat-hud[hidden] {
+  display: none;
+}
+
+.combat-hud__elapsed {
+  grid-area: elapsed;
+  justify-self: center;
+  align-self: start;
+  margin: 0;
+  /* AC1: low-prominence placement -- smaller, muted, no card chrome. */
+  font: 500 0.78rem/1.2 var(--mono, monospace);
+  color: var(--muted);
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(10, 18, 31, 0.55);
+}
+
+.combat-hud__status {
+  grid-area: status;
+  justify-self: start;
+  align-self: end;
+  display: grid;
+  gap: 6px;
+  inline-size: min(200px, 100%);
   max-inline-size: 100%;
-  padding: 12px 14px;
+  padding: 10px 12px;
   border-radius: 14px;
   border: 1px solid var(--line);
   background: rgba(10, 18, 31, 0.72);
@@ -256,25 +329,86 @@ button:focus-visible {
   box-shadow: 0 8px 24px rgba(1, 8, 18, 0.35);
 }
 
-.combat-hud[hidden] {
-  display: none;
+.combat-hud__edge {
+  grid-area: edge;
+  justify-self: end;
+  align-self: end;
+  display: grid;
+  gap: 6px;
+  justify-items: end;
+  inline-size: min(180px, 100%);
+  max-inline-size: 100%;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(10, 18, 31, 0.72);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 8px 24px rgba(1, 8, 18, 0.35);
 }
 
-.combat-hud .stat-grid {
+.combat-hud__pause {
+  /* Separated from `.combat-hud__status` (the "stat cluster") per the
+   * Issue's Current Validated Scope: own `pause` grid area (own row, own
+   * DOM styling root), directly below `.combat-hud__edge` in the same
+   * bottom-right column -- never a member of the status card and never
+   * sharing a grid cell with `.combat-hud__edge` (a prior revision placed
+   * both in the same cell, which visually overlapped the two). */
+  grid-area: pause;
+  justify-self: end;
+  align-self: end;
+  margin-top: 8px;
+  /* AC6: >= 24x24 CSS px hit target. */
+  min-width: 24px;
+  min-height: 24px;
+  padding: 6px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(10, 18, 31, 0.72);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 8px 24px rgba(1, 8, 18, 0.35);
+}
+
+.combat-hud__status .stat-grid {
   gap: 6px;
 }
 
-.combat-hud .stat-grid div {
-  padding: 8px 10px;
+.combat-hud__status .stat-grid div {
+  padding: 6px 8px;
   border-radius: 12px;
 }
 
-.combat-hud .stat-grid dt {
-  margin-bottom: 4px;
+.combat-hud__status .stat-grid dt {
+  margin-bottom: 2px;
 }
 
-.combat-hud .stat-grid dd {
+.combat-hud__status .stat-grid dd {
   font-size: 1.05rem;
+}
+
+.combat-hud__critical {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font: 700 0.78rem/1.2 var(--mono, monospace);
+  /* AC6: never color-only -- the warning icon + "Hull critical" text carry
+   * the state; the accent-red background is a reinforcing cue only. */
+  color: #ffb4b4;
+}
+
+.combat-hud__critical[hidden] {
+  display: none;
+}
+
+.combat-hud__weapon {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.combat-hud__assist-status {
+  margin: 0;
+  font-size: 0.78rem;
+  text-align: end;
 }
 
 /* P0-2 (owner playtest): on short viewports, shrink internal spacing before
@@ -288,16 +422,64 @@ button:focus-visible {
   }
 
   .combat-hud {
-    gap: 6px;
-    padding: 10px 12px;
+    row-gap: 6px;
+    column-gap: 6px;
   }
 
-  .combat-hud .stat-grid {
+  .combat-hud__status,
+  .combat-hud__edge {
     gap: 4px;
+    padding: 8px 10px;
   }
 
-  .combat-hud .eyebrow {
+  .combat-hud__status .eyebrow {
     margin-bottom: 4px;
+  }
+
+  .combat-hud__pause {
+    margin-top: 36px;
+  }
+}
+
+/* Issue #1958 AC1/AC2: at the supported minimum viewport (375x667, where
+ * `.battle-stage__canvas`'s `aspect-ratio: 16 / 9` letterboxes the Canvas to
+ * a very short safe-zone box), the edge-control (Weapon/Assist) collapses
+ * first per the semantic state table's collapse priority -- Hull/critical,
+ * Kills, elapsed and Pause remain visible and reachable. `max-width: 420px`
+ * targets narrow/portrait viewports specifically (not short-but-wide
+ * desktop windows, which are already handled by the `max-height` rule
+ * above). */
+@media (max-width: 420px) {
+  .combat-hud {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      'elapsed'
+      'status'
+      'pause';
+    row-gap: 4px;
+  }
+
+  .combat-hud__status {
+    justify-self: stretch;
+    inline-size: 100%;
+    padding: 6px 8px;
+  }
+
+  .combat-hud__edge {
+    display: none;
+  }
+
+  .combat-hud__pause {
+    justify-self: end;
+    margin-top: 0;
+  }
+
+  .combat-hud__status .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .combat-hud__status .stat-grid dd {
+    font-size: 0.92rem;
   }
 }
 

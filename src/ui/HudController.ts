@@ -313,6 +313,7 @@ export function createHudController(
   const combatHudElapsed = queryField(combatHudRoot, 'combat-hud-elapsed')
   const combatHudWeapon = queryField(combatHudRoot, 'combat-hud-weapon')
   const combatHudAssistStatus = queryField(combatHudRoot, 'combat-hud-assist-status')
+  const combatHudCritical = queryField(combatHudRoot, 'combat-hud-critical')
   const assistPlayerButton = queryAction(combatHudRoot, 'assist-player')
   const togglePauseButton = queryAction(combatHudRoot, 'toggle-pause')
 
@@ -392,6 +393,14 @@ export function createHudController(
       patchText(combatHudElapsed, previous?.elapsedLabel, combatHudViewModel.elapsedLabel)
       combatHudElapsed.removeAttribute('data-visual-mask')
       patchText(combatHudWeapon, previous?.weaponLabel, combatHudViewModel.weaponLabel)
+
+      // AC1, AC6: critical warning is text/shape/icon driven (never
+      // color-only) and only toggles the ARIA-live paragraph's hidden
+      // attribute (thus only announces) on an actual state transition, not
+      // every frame while already critical.
+      if (previous === null || previous.isCritical !== combatHudViewModel.isCritical) {
+        combatHudCritical.hidden = !combatHudViewModel.isCritical
+      }
 
       assistPlayerButton.disabled = combatHudViewModel.assistDisabled
       // AC6: Assist is the sole live-region field in the combat HUD; Hull /
