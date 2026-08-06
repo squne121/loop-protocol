@@ -203,7 +203,7 @@ wrapper は `context_files` を 1 件以上必須とするため、context フ�
    - wrapper の `failure_reason` と `warnings`
    - `serena_mcp.ok` の真偽値と `recovery` フィールドの内容（存在する場合）
 
-## Result: CODEBASE_INVESTIGATION_RESULT_V1 (SubAgent-owned)
+## Result: CODEBASE_INVESTIGATION_RESULT_V1（結果）(SubAgent-owned)
 
 本 SubAgent は、以下の機械可読契約を報告する。`evidence_refs` には #248 の `REPO_EVIDENCE_REF_V1` を必ず使用し、独自の evidence schema を定義してはならない。
 
@@ -219,11 +219,11 @@ CODEBASE_INVESTIGATION_RESULT_V1:
   failure_reason: <string | null>
 ```
 
-## Fact-check Contract (SubAgent-owned)
+## Fact-check Contract（事実確認契約）(SubAgent-owned)
 
 本 SubAgent は、`anchor_comment` の事実確認（fact-check）のリクエストを受け取り、検証結果を報告する。
 
-### Result: ANCHOR_COMMENT_FACT_CHECK_RESULT_V1
+### Result: ANCHOR_COMMENT_FACT_CHECK_RESULT_V1（結果）
 
 ```yaml
 ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
@@ -245,7 +245,7 @@ ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
 
 `kind: file` の `ref` は `REPO_EVIDENCE_REF_V1` を SSOT とする。
 
-## Evidence Handling Rule
+## Evidence Handling Rule（証跡取り扱いルール）
 
 ### Cross-Link: REPO_EVIDENCE_REF_V1
 
