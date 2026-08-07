@@ -58,11 +58,39 @@ invocation ID、capture path、sidecar schema、duplicate/stale/SHA256 判定を
 
 source-bound eligibility / readiness の受理経路は、`.claude/scripts/check_session_recording_runtime_safety.py`
 （eligibility）と `scripts/session-recording/bootstrap-source-bound-readiness.mjs`（readiness）が
-書き込む固定 private location（既定: `.claude/tmp/session-recording/scope-rollup-{eligibility,readiness}.json`、
-mode `0600`）**のみ**である。hook payload 内の inline object、任意ファイルパス、`artifacts[]` 配列内
-fuzzy-match、`source_bound` / `source_bound_artifacts` キーは、eligibility/readiness の情報源として
+書き込む固定 private location（既定: `tmp/session-recording/scope-rollup-{eligibility,readiness}.json`、
+親ディレクトリ mode `0700`・artifact mode `0600`）**のみ**である。hook payload 内の inline object、任意ファイルパス、
+`artifacts[]` 配列内 fuzzy-match、`source_bound` / `source_bound_artifacts` キーは、eligibility/readiness の情報源として
 一切受理しない（#1527 の初回実装がこの経路を受理していたことが敵対的レビューで確認された不備であり、
 Scope Delta (2) で是正した）。
+
+**#2004（固定 private location の同時移行）**: 既定パスは `.claude/tmp/session-recording/` から
+`tmp/session-recording/`（repo-approved local temporary workspace root、#1995 / #2001）へ、
+readiness producer（`bootstrap-source-bound-readiness.mjs`）・eligibility producer/loader
+（`check_session_recording_runtime_safety.py`）・readiness consumer
+（`capture_scope_rollup_final_response.py`）の 3 ファイルを同一 PR で同時に移行した。旧パスは
+消費されない（暗黙の dual-read fallback は導入しない）。`SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH` /
+`SCOPE_ROLLUP_READINESS_ARTIFACT_PATH` env override は、絶対パスはそのまま使用し、相対パスは
+呼び出し元プロセスの cwd ではなく repo root 基準で解決する（producer/consumer 間で解決結果を一致させる
+ため）。
+
+**artifact 再生成順序（#2004 AC7）**: eligibility / readiness はそれぞれ独立した digest に bind されるため、
+以下の順序で再生成する（順序自体は各 digest チェックが独立しているため機能的に厳密ではないが、運用上の
+既定手順として固定する）。
+
+1. `docs/dev/session-recording-policy.md` を更新した場合 → eligibility artifact の `policy_digest` が
+   stale になる（`eligibility_binding_policy_digest_mismatch`）。`.claude/scripts/check_session_recording_runtime_safety.py`
+   の `emit_scope_rollup_eligibility_artifact()` 経由（または同等の producer 呼び出し）で eligibility を
+   再生成する。
+2. `docs/dev/secret-policy.md` を更新した場合 → 同様に `secret_policy_digest` が stale になり、eligibility
+   の再生成が必要。
+3. `.claude/hooks/capture_scope_rollup_final_response.py`（readiness consumer 自身）を変更した場合 →
+   readiness artifact の `producer_digest` が stale になる（`readiness_binding_producer_digest_mismatch`）。
+   `pnpm bootstrap`（`scripts/session-recording/bootstrap-source-bound-readiness.mjs`）で readiness を
+   再生成する。
+4. 両方を同時に変更した場合は、eligibility を先に再生成してから readiness を再生成する（eligibility が
+   先に fail-closed になる binding chain の順序と合わせる — `_evaluate_source_bound_artifacts()` は
+   eligibility を検証してから readiness を検証する）。
 
 adapter（Node のみ）は producer を起動する前に、両方の固定 location を検証する。missing / invalid /
 stale の場合は producer を一切起動せず、固定 reason code で即時 skip する（cold environment での

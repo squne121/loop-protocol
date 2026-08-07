@@ -61,10 +61,18 @@ READINESS_MAX_BYTES = 8192
 
 
 def _readiness_artifact_path(repo_root: Path) -> Path:
+    """Fixed private location for the scope-rollup readiness artifact.
+
+    Issue #2004: moved from ``.claude/tmp/`` to ``tmp/`` (repo-approved local
+    temporary workspace root, Issue #1995 / #2001) in lockstep with the
+    readiness producer (bootstrap-source-bound-readiness.mjs) and the
+    eligibility producer/loader (check_session_recording_runtime_safety.py).
+    The old default location is never consulted as a fallback.
+    """
     override = os.environ.get("SCOPE_ROLLUP_READINESS_ARTIFACT_PATH")
     if override:
-        return Path(override)
-    return repo_root / ".claude" / "tmp" / "session-recording" / "scope-rollup-readiness.json"
+        return _srrs.resolve_session_recording_artifact_override(override, repo_root)
+    return repo_root / "tmp" / "session-recording" / "scope-rollup-readiness.json"
 
 
 def _load_and_verify_readiness_artifact(

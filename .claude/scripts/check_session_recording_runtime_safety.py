@@ -1319,6 +1319,21 @@ SCOPE_ROLLUP_ELIGIBILITY_KEYS = frozenset(
 )
 
 
+def resolve_session_recording_artifact_override(override: str, repo_root: Path) -> Path:
+    """Resolve an eligibility/readiness artifact-path env override.
+
+    Issue #2004 AC4: an absolute override is used as-is; a relative override
+    is resolved against ``repo_root`` (never the process current working
+    directory), so the readiness producer (Node), the eligibility producer
+    (Python), and the capture consumer (Python) all agree on the same
+    location regardless of which directory they were invoked from.
+    """
+    candidate = Path(override)
+    if candidate.is_absolute():
+        return candidate
+    return (repo_root / candidate).resolve()
+
+
 def scope_rollup_eligibility_artifact_path(repo_root: Path) -> Path:
     """Fixed private location for the scope-rollup eligibility artifact.
 
@@ -1326,11 +1341,18 @@ def scope_rollup_eligibility_artifact_path(repo_root: Path) -> Path:
     taken from a hook payload. The env override exists solely for test
     isolation (same pattern as SCOPE_ROLLUP_CAPTURE_DIR) — it is set by our
     own trusted test harness, never by an external hook caller.
+
+    Issue #2004: the fixed private location moved from ``.claude/tmp/`` to
+    ``tmp/`` (repo-approved local temporary workspace root, Issue #1995 /
+    #2001). This is a same-PR simultaneous cutover with the readiness
+    producer (``scripts/session-recording/bootstrap-source-bound-readiness.mjs``)
+    and the readiness consumer (``.claude/hooks/capture_scope_rollup_final_response.py``)
+    — the old default location is never read as a fallback.
     """
     override = os.environ.get("SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH")
     if override:
-        return Path(override)
-    return repo_root / ".claude" / "tmp" / "session-recording" / "scope-rollup-eligibility.json"
+        return resolve_session_recording_artifact_override(override, repo_root)
+    return repo_root / "tmp" / "session-recording" / "scope-rollup-eligibility.json"
 
 
 def _scope_rollup_policy_digest(repo_root: Path) -> str | None:
@@ -1462,6 +1484,9 @@ def emit_scope_rollup_eligibility_artifact(
 
     path = scope_rollup_eligibility_artifact_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # AC3: force exact 0700 regardless of umask or a pre-existing directory
+    # created with a looser mode by an older version of this script.
+    os.chmod(path.parent, 0o700)
     rendered = (json.dumps(artifact, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
     tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")

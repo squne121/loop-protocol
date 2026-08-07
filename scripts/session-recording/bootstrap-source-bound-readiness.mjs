@@ -25,16 +25,28 @@
 
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, openSync, closeSync, fchmodSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, openSync, closeSync, fchmodSync } from 'node:fs'
+import { dirname, isAbsolute, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..', '..')
 const producerPath = resolve(repoRoot, '.claude', 'hooks', 'capture_scope_rollup_final_response.py')
-const readinessPath = process.env.SCOPE_ROLLUP_READINESS_ARTIFACT_PATH
-  ? resolve(process.env.SCOPE_ROLLUP_READINESS_ARTIFACT_PATH)
-  : resolve(repoRoot, '.claude', 'tmp', 'session-recording', 'scope-rollup-readiness.json')
+// Issue #2004 AC4: an absolute override is used as-is; a relative override
+// is resolved against repoRoot (never process.cwd()), matching the Python
+// eligibility producer/consumer's resolve_session_recording_artifact_override().
+function resolveReadinessOverride(overrideValue, repoRootPath) {
+  if (!overrideValue) return null
+  return isAbsolute(overrideValue) ? resolve(overrideValue) : resolve(repoRootPath, overrideValue)
+}
+
+// Issue #2004: moved from .claude/tmp/ to tmp/ (repo-approved local
+// temporary workspace root, Issue #1995 / #2001) in lockstep with the
+// eligibility producer/loader (check_session_recording_runtime_safety.py)
+// and the readiness consumer (capture_scope_rollup_final_response.py). The
+// old default location is never consulted as a fallback.
+const readinessPath = resolveReadinessOverride(process.env.SCOPE_ROLLUP_READINESS_ARTIFACT_PATH, repoRoot)
+  ?? resolve(repoRoot, 'tmp', 'session-recording', 'scope-rollup-readiness.json')
 
 const READINESS_SCHEMA = 'SESSION_RECORDING_SCOPE_ROLLUP_READINESS_V1'
 
@@ -129,7 +141,11 @@ function main() {
 }
 
 function writeReadinessAtomic(targetPath, payload) {
-  mkdirSync(dirname(targetPath), { recursive: true })
+  const dir = dirname(targetPath)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  // AC3: force exact 0700 regardless of umask or a pre-existing directory
+  // created with a looser mode by an older version of this script.
+  chmodSync(dir, 0o700)
   const tmpPath = `${targetPath}.tmp.${process.pid}`
   const rendered = `${JSON.stringify(payload, null, 2)}\n`
   const fd = openSync(tmpPath, 'wx', 0o600)
