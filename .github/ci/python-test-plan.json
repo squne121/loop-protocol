@@ -5,6 +5,7 @@
     ".claude/agents/tests/",
     ".claude/skills/gemini-cli-headless-delegation/tests/test_model_routing.py",
     ".claude/skills/gemini-cli-headless-delegation/tests/",
+    ".claude/skills/graphify-cli-advisory/tests/",
     ".claude/skills/impl-review-loop/scripts/tests/",
     ".claude/skills/implement-issue/tests/",
     ".claude/skills/open-pr/tests/",
