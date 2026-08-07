@@ -355,7 +355,9 @@ class TestProducerRouteEvidenceValidation:
 
     def test_delegation_result_reads_actual_selected_provider(self, producer, tmp_path):
         (tmp_path / "delegation_result.json").write_text(
-            json.dumps({"ok": True, "selected_provider": "agy", "provider_attempts": [{"provider": "agy", "ok": True}]}),
+            json.dumps(
+                {"ok": True, "selected_provider": "agy", "provider_attempts": [{"provider": "agy", "ok": True}]}
+            ),
             encoding="utf-8",
         )
         provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)

@@ -263,8 +263,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-native-spawn-event", action="store_true")
     parser.add_argument("--assert-zero-gemini-and-fallback-invocations", action="store_true")
     parser.add_argument(
-        "--expected-head-sha", default=None,
-        help="if set, the aggregate close gate additionally requires every artifact's subject.head_sha to equal this value",
+        "--expected-head-sha",
+        default=None,
+        help=(
+            "if set, the aggregate close gate additionally requires every "
+            "artifact's subject.head_sha to equal this value"
+        ),
     )
     return parser
 
