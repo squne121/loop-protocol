@@ -38,6 +38,7 @@ Environment variables (for testability):
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -1319,6 +1320,44 @@ SCOPE_ROLLUP_ELIGIBILITY_KEYS = frozenset(
 )
 
 
+class ArtifactOverridePathError(ValueError):
+    """Raised when an eligibility/readiness artifact-path env override is
+    malformed (NUL byte, or a ``..`` traversal segment)."""
+
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
+def _lexically_normalize_override_segments(raw: str) -> tuple[bool, list[str]]:
+    """Pure string-level (never filesystem-touching) path normalization.
+
+    Issue #2004 P1-3: the previous implementation called ``Path.resolve()``
+    on a relative override, which resolves symlinks against the real
+    filesystem -- something Node's ``path.resolve()`` (used by the sibling
+    readiness producer) never does, and left an absolute override entirely
+    unnormalized (the mirror-image divergence). Both language
+    implementations now do the SAME lexical-only normalization: drop ``.``
+    and empty (double-slash) segments, reject NUL bytes and any ``..``
+    traversal segment outright (a fixed reason_code, never silently
+    collapsed), and never call a filesystem-resolving API. Symlink
+    acceptance/rejection is handled exclusively by
+    ``prepare_private_parent_dir`` / ``validate_private_parent_dir_readonly``
+    below -- never here.
+    """
+    if "\x00" in raw:
+        raise ArtifactOverridePathError("override_path_contains_nul")
+    is_absolute = raw.startswith("/")
+    segments: list[str] = []
+    for part in raw.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ArtifactOverridePathError("override_path_contains_dotdot")
+        segments.append(part)
+    return is_absolute, segments
+
+
 def resolve_session_recording_artifact_override(override: str, repo_root: Path) -> Path:
     """Resolve an eligibility/readiness artifact-path env override.
 
@@ -1327,11 +1366,179 @@ def resolve_session_recording_artifact_override(override: str, repo_root: Path) 
     directory), so the readiness producer (Node), the eligibility producer
     (Python), and the capture consumer (Python) all agree on the same
     location regardless of which directory they were invoked from.
+
+    Issue #2004 P1-3: resolution is purely lexical (string-level join, no
+    filesystem access) so it is byte-for-byte parity with the Node
+    readiness producer's ``resolveReadinessOverride`` -- see
+    ``_lexically_normalize_override_segments`` above.
     """
-    candidate = Path(override)
-    if candidate.is_absolute():
-        return candidate
-    return (repo_root / candidate).resolve()
+    is_absolute, segments = _lexically_normalize_override_segments(override)
+    if is_absolute:
+        return Path("/", *segments)
+    return Path(repo_root, *segments)
+
+
+class PrivateParentDirError(Exception):
+    """Raised when a fixed private artifact's parent directory cannot be
+    safely prepared/trusted (Issue #2004 P1-1)."""
+
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
+def _open_parent_dir_nofollow(parent: Path) -> int:
+    """Open ``parent`` with O_NOFOLLOW, raising ``PrivateParentDirError``
+    (never silently falling through) on any failure. A single fd from this
+    call is reused for every subsequent check (fstat, fchmod) so there is no
+    lstat-then-act TOCTOU window: the fd is pinned to whatever inode was
+    actually opened, not to a pathname that could be swapped afterwards
+    (Issue #2004 P1-1).
+
+    Deliberately does NOT also pass O_DIRECTORY: per POSIX,
+    open(O_DIRECTORY | O_NOFOLLOW) on a symlink is required to fail with
+    ENOTDIR (not ELOOP), which is indistinguishable from "this path
+    component genuinely is not a directory". O_NOFOLLOW alone reliably
+    fails with ELOOP for a symlink regardless of its target type; the
+    caller's separate ``stat.S_ISDIR`` check (against the fd of whatever WAS
+    actually opened) is what verifies "is a directory".
+    """
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        return os.open(parent, flags)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise PrivateParentDirError("parent_is_symlink") from exc
+        raise PrivateParentDirError("parent_unavailable") from exc
+
+
+def prepare_private_parent_dir(path: Path, *, expected_uid: int | None = None) -> None:
+    """Validate and (only if newly created) chmod 0700 the parent directory
+    of a fixed private artifact path.
+
+    Issue #2004 P1-1: the previous implementation did an unconditional
+    ``mkdir(..., exist_ok=True)`` followed by ``chmod(parent, 0o700)`` with
+    no verification at all, so a pre-existing parent that is a symlink (or
+    owned by someone else) would be silently forced to mode 0700 -- e.g. an
+    attacker who pre-creates ``tmp/session-recording -> /some/other/dir``
+    could get an arbitrary EXISTING directory chmod'd by this producer.
+    This helper instead:
+
+    - creates the parent (and any missing ancestors) with mode 0700 ONLY
+      when it does not already exist -- a directory this call itself
+      created is always safe to chmod;
+    - for a pre-existing parent, opens it with ``O_NOFOLLOW`` (rejecting a
+      symlink outright) and verifies -- via the open file descriptor, never
+      the pathname again -- that it is a real directory owned by
+      ``expected_uid`` before repairing its mode to exactly 0700 (a looser
+      mode left by an older version of this script is explicitly repaired
+      by policy, never silently trusted as-is).
+
+    Raises ``PrivateParentDirError`` (reason_code one of
+    ``parent_is_symlink`` / ``parent_not_a_directory`` /
+    ``parent_owner_mismatch`` / ``parent_unavailable``) instead of touching
+    an unsafe parent.
+    """
+    if expected_uid is None:
+        expected_uid = os.getuid()
+
+    parent = path.parent
+    if not parent.exists():
+        parent.mkdir(parents=True, mode=0o700)
+
+    fd = _open_parent_dir_nofollow(parent)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise PrivateParentDirError("parent_not_a_directory")
+        if st.st_uid != expected_uid:
+            raise PrivateParentDirError("parent_owner_mismatch")
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
+_PARENT_REASON_SUFFIX = {
+    "parent_is_symlink": "invalid_parent_symlink",
+    "parent_not_a_directory": "invalid_parent_not_directory",
+    "parent_owner_mismatch": "invalid_parent_owner",
+    "parent_unavailable": "invalid_parent_unavailable",
+}
+
+
+def validate_private_parent_dir_readonly(path: Path, *, expected_uid: int | None = None) -> str | None:
+    """Read-only counterpart of ``prepare_private_parent_dir`` for a
+    consumer that never creates or chmods the parent (Issue #2004 P1-1):
+    verifies the parent directory is a real, non-symlink directory owned by
+    ``expected_uid`` before the caller trusts anything read from inside it.
+
+    Returns ``None`` on success, ``"parent_missing"`` if the parent does not
+    exist (the artifact inside it cannot exist either -- treat as the
+    ordinary "missing" case, not a rejection), or one of the
+    ``PrivateParentDirError`` reason_codes above.
+    """
+    if expected_uid is None:
+        expected_uid = os.getuid()
+
+    # See _open_parent_dir_nofollow()'s docstring: O_DIRECTORY is
+    # deliberately NOT combined with O_NOFOLLOW here either, for the same
+    # POSIX ENOTDIR-vs-ELOOP ambiguity reason.
+    parent = path.parent
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(parent, flags)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            return "parent_is_symlink"
+        return "parent_missing"
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            return "parent_not_a_directory"
+        if st.st_uid != expected_uid:
+            return "parent_owner_mismatch"
+    finally:
+        os.close(fd)
+    return None
+
+
+def open_private_artifact_or_reason(path: Path, *, symlink_reason: str, missing_reason: str):
+    """Open ``path`` with O_NOFOLLOW and fstat the resulting fd in one shot.
+
+    Issue #2004 P1-1: the previous implementation did ``os.lstat(path)``
+    followed later by a SEPARATE ``path.read_bytes()`` -- a TOCTOU window in
+    which an attacker could swap the path for a symlink (or a different
+    file) between the stat and the read. By opening once (O_NOFOLLOW, so a
+    symlink is rejected at open time rather than merely detected after the
+    fact) and reusing that single fd for both ``fstat`` and the subsequent
+    read, every check and the read itself observe the exact same inode.
+
+    Distinguishes symlink vs missing via errno (ELOOP => symlink, anything
+    else => missing) so the eligibility and readiness loaders can each keep
+    their own reason_code taxonomy. Returns ``(fd, stat_result, None)`` on
+    success (caller owns the fd and must close it), or
+    ``(None, None, reason_code)`` on failure.
+    """
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            return None, None, symlink_reason
+        return None, None, missing_reason
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        return None, None, missing_reason
+    return fd, st, None
 
 
 def scope_rollup_eligibility_artifact_path(repo_root: Path) -> Path:
@@ -1483,10 +1690,10 @@ def emit_scope_rollup_eligibility_artifact(
     }
 
     path = scope_rollup_eligibility_artifact_path(repo_root)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # AC3: force exact 0700 regardless of umask or a pre-existing directory
-    # created with a looser mode by an older version of this script.
-    os.chmod(path.parent, 0o700)
+    # Issue #2004 P1-1: validate (and only-if-newly-created chmod) the
+    # parent directory via prepare_private_parent_dir instead of an
+    # unconditional mkdir+chmod -- see that function's docstring.
+    prepare_private_parent_dir(path)
     rendered = (json.dumps(artifact, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
     tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
@@ -1523,26 +1730,40 @@ def load_and_verify_scope_rollup_eligibility_artifact(
     gate — never as a substitute for it.
     """
     path = scope_rollup_eligibility_artifact_path(repo_root)
-    try:
-        st = os.lstat(path)
-    except OSError:
+
+    # Issue #2004 P1-1: validate the parent directory (non-symlink, real
+    # directory, owner match) before trusting anything found inside it. The
+    # consumer never creates or chmods the parent -- read-only check.
+    parent_reason = validate_private_parent_dir_readonly(path)
+    if parent_reason == "parent_missing":
         return None, "eligibility_missing", None
+    if parent_reason is not None:
+        return None, f"eligibility_{_PARENT_REASON_SUFFIX[parent_reason]}", None
 
-    if stat.S_ISLNK(st.st_mode):
-        return None, "eligibility_invalid_symlink", None
-    if not stat.S_ISREG(st.st_mode):
-        return None, "eligibility_invalid_not_regular_file", None
-    if stat.S_IMODE(st.st_mode) != 0o600:
-        return None, "eligibility_invalid_mode", None
-    if hasattr(os, "getuid") and st.st_uid != os.getuid():
-        return None, "eligibility_invalid_owner", None
-    if st.st_size > SCOPE_ROLLUP_ELIGIBILITY_MAX_BYTES:
-        return None, "eligibility_invalid_size", None
+    # Issue #2004 P1-1: open with O_NOFOLLOW and fstat/read the SAME fd
+    # (never a separate lstat-then-read_bytes() pair) to close the TOCTOU
+    # window where the path could be swapped between the stat and the read.
+    fd, st, open_reason = open_private_artifact_or_reason(
+        path, symlink_reason="eligibility_invalid_symlink", missing_reason="eligibility_missing",
+    )
+    if fd is None:
+        return None, open_reason, None
 
     try:
-        raw = path.read_bytes()
-    except OSError:
-        return None, "eligibility_unreadable", None
+        if not stat.S_ISREG(st.st_mode):
+            return None, "eligibility_invalid_not_regular_file", None
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            return None, "eligibility_invalid_mode", None
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            return None, "eligibility_invalid_owner", None
+        if st.st_size > SCOPE_ROLLUP_ELIGIBILITY_MAX_BYTES:
+            return None, "eligibility_invalid_size", None
+        try:
+            raw = os.read(fd, st.st_size)
+        except OSError:
+            return None, "eligibility_unreadable", None
+    finally:
+        os.close(fd)
     digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
     try:

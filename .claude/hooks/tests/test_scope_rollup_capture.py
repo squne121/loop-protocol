@@ -18,6 +18,7 @@ import os
 import stat
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,9 @@ PRODUCER_DIGEST = f"sha256:{hashlib.sha256(PRODUCER_PATH.read_bytes()).hexdigest
 # "now" the test executes at (the producer's hook_received_at check uses the
 # real clock, not a simulated one).
 ELIGIBILITY_GENERATED_AT = "2026-06-15T11:00:00Z"
-ELIGIBILITY_EXPIRES_AT = "2030-01-01T00:00:00Z"
+# Issue #2004 P3: computed relative to real wall-clock "now" (not a fixed
+# calendar date) so this fixture never expires as real time passes.
+ELIGIBILITY_EXPIRES_AT = (datetime.now(timezone.utc) + timedelta(days=3650)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _render_marker(

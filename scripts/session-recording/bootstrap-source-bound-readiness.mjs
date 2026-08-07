@@ -25,20 +25,119 @@
 
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, openSync, closeSync, fchmodSync } from 'node:fs'
-import { dirname, isAbsolute, resolve } from 'node:path'
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs'
+import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const repoRoot = resolve(__dirname, '..', '..')
-const producerPath = resolve(repoRoot, '.claude', 'hooks', 'capture_scope_rollup_final_response.py')
+// scriptRepoRoot is where THIS script and its runtime dependencies actually
+// live (uv.lock, .python-version, the capture producer script) -- it never
+// changes, even under --repo-root below.
+const scriptRepoRoot = resolve(__dirname, '..', '..')
+const producerPath = resolve(scriptRepoRoot, '.claude', 'hooks', 'capture_scope_rollup_final_response.py')
+
+// Issue #2004 P2: an optional `--repo-root <path>` test seam. Production
+// callers never pass it (repoRoot === scriptRepoRoot). It exists so a
+// hermetic isolated-fixture test can invoke the REAL bootstrap producer end
+// to end while binding the readiness artifact's repo_root_realpath (and its
+// own default artifact path) to an isolated tmp_path fixture repo, without
+// mutating the real repo's canonical runtime artifact and without needing a
+// second no-op reimplementation of this script's logic in the test suite.
+// uv sync / interpreter resolution / digest inputs (uv.lock, .python-version,
+// the producer script) always come from scriptRepoRoot -- a fixture repo
+// generally has none of those.
+function parseRepoRootArg(argv) {
+  const idx = argv.indexOf('--repo-root')
+  if (idx === -1) return null
+  const value = argv[idx + 1]
+  if (!value) {
+    fail('--repo-root requires a value')
+  }
+  return resolve(value)
+}
+
+const repoRoot = parseRepoRootArg(process.argv.slice(2)) ?? scriptRepoRoot
+
+class ArtifactOverridePathError extends Error {
+  constructor(reasonCode) {
+    super(reasonCode)
+    this.reasonCode = reasonCode
+  }
+}
+
+// Issue #2004 P1-3: pure string-level (never filesystem-touching) lexical
+// normalization, kept byte-for-byte in parity with the Python eligibility
+// producer/consumer's _lexically_normalize_override_segments(). Node's
+// path.resolve() never resolves symlinks (unlike Python's Path.resolve(),
+// which the sibling Python producer used to call), but it DID silently
+// collapse `..` segments for an absolute override while the Python side
+// left an absolute override completely unnormalized -- the mirror-image
+// divergence this fixes. `..` is now rejected outright (never collapsed)
+// in both languages, and symlink acceptance/rejection is handled
+// exclusively by preparePrivateParentDir() below -- never here.
+function lexicallyNormalizeOverrideSegments(raw) {
+  if (raw.indexOf('\u0000') !== -1) {
+    throw new ArtifactOverridePathError('override_path_contains_nul')
+  }
+  const isAbsolute = raw.startsWith('/')
+  const segments = []
+  for (const part of raw.split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') {
+      throw new ArtifactOverridePathError('override_path_contains_dotdot')
+    }
+    segments.push(part)
+  }
+  return { isAbsolute, segments }
+}
+
 // Issue #2004 AC4: an absolute override is used as-is; a relative override
 // is resolved against repoRoot (never process.cwd()), matching the Python
 // eligibility producer/consumer's resolve_session_recording_artifact_override().
 function resolveReadinessOverride(overrideValue, repoRootPath) {
   if (!overrideValue) return null
-  return isAbsolute(overrideValue) ? resolve(overrideValue) : resolve(repoRootPath, overrideValue)
+  const { isAbsolute, segments } = lexicallyNormalizeOverrideSegments(overrideValue)
+  return isAbsolute ? '/' + segments.join('/') : resolve(repoRootPath, ...segments)
 }
+
+// Issue #2004 P1-3: a lightweight diagnostic-only CLI seam
+// (`--print-resolved-override <override> <repoRoot>`) so a cross-language
+// parity test can invoke JUST resolveReadinessOverride() -- without paying
+// for a full `uv sync` + interpreter-resolution bootstrap run -- and
+// compare its output byte-for-byte against
+// resolve_session_recording_artifact_override() on the Python side. Exits
+// immediately; never reached by production callers.
+function maybePrintResolvedOverrideAndExit() {
+  const argv = process.argv.slice(2)
+  const idx = argv.indexOf('--print-resolved-override')
+  if (idx === -1) return
+  const overrideValue = argv[idx + 1]
+  const repoRootArg = argv[idx + 2]
+  if (!overrideValue || !repoRootArg) {
+    fail('--print-resolved-override requires <override> <repoRoot>')
+    return
+  }
+  try {
+    const resolved = resolveReadinessOverride(overrideValue, repoRootArg)
+    process.stdout.write(`${resolved}\n`)
+    process.exit(0)
+  } catch (err) {
+    process.stdout.write(`ERROR:${err?.reasonCode ?? err?.message ?? err}\n`)
+    process.exit(3)
+  }
+}
+maybePrintResolvedOverrideAndExit()
 
 // Issue #2004: moved from .claude/tmp/ to tmp/ (repo-approved local
 // temporary workspace root, Issue #1995 / #2001) in lockstep with the
@@ -60,7 +159,9 @@ function fail(message) {
 }
 
 function run(cmd, args) {
-  return execFileSync(cmd, args, { cwd: repoRoot, encoding: 'utf8', timeout: 60_000 })
+  // Always runs against scriptRepoRoot (uv.lock / pyproject.toml live
+  // there); a --repo-root fixture generally has no uv project of its own.
+  return execFileSync(cmd, args, { cwd: scriptRepoRoot, encoding: 'utf8', timeout: 60_000 })
 }
 
 function main() {
@@ -104,14 +205,14 @@ function main() {
     return
   }
 
-  // Step 4: digests for binding.
+  // Step 4: digests for binding (always read from scriptRepoRoot; see run()).
   let uvLockDigest = null
-  const uvLockPath = resolve(repoRoot, 'uv.lock')
+  const uvLockPath = resolve(scriptRepoRoot, 'uv.lock')
   if (existsSync(uvLockPath)) {
     uvLockDigest = sha256Hex(readFileSync(uvLockPath))
   }
   let pythonVersionDigest = null
-  const pythonVersionPath = resolve(repoRoot, '.python-version')
+  const pythonVersionPath = resolve(scriptRepoRoot, '.python-version')
   if (existsSync(pythonVersionPath)) {
     pythonVersionDigest = sha256Hex(readFileSync(pythonVersionPath))
   }
@@ -136,16 +237,74 @@ function main() {
     generated_at: new Date().toISOString(),
   }
 
-  writeReadinessAtomic(readinessPath, readiness)
+  try {
+    writeReadinessAtomic(readinessPath, readiness)
+  } catch (err) {
+    fail(`readiness parent directory preparation failed: ${String(err?.message ?? err)}`)
+    return
+  }
   process.stdout.write(`bootstrap-source-bound-readiness: wrote ${readinessPath}\n`)
+}
+
+// Issue #2004 P1-1: validate and (only if newly created) chmod the parent
+// directory of the fixed private readiness artifact, mirroring the Python
+// eligibility producer's prepare_private_parent_dir() (see
+// .claude/scripts/check_session_recording_runtime_safety.py). The previous
+// implementation did an unconditional mkdirSync(..., {recursive: true}) +
+// chmodSync(dir, 0o700) with no verification at all, so a pre-existing
+// parent that is a symlink (or owned by someone else) would be silently
+// forced to mode 0700. This instead:
+//   - creates the parent (and any missing ancestors) with mode 0700 ONLY
+//     when it does not already exist -- a directory this call itself
+//     created is always safe to chmod;
+//   - for a pre-existing parent, opens it with O_NOFOLLOW|O_DIRECTORY
+//     (rejecting a symlink outright, no separate stat-then-open TOCTOU
+//     window) and verifies -- via the open file descriptor, never the
+//     pathname again -- that it is a real directory owned by the current
+//     uid before repairing its mode to exactly 0700 (a looser mode left by
+//     an older version of this script is explicitly repaired by policy,
+//     never silently trusted as-is).
+function preparePrivateParentDir(dir) {
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+  }
+
+  // Deliberately NOT combining O_DIRECTORY with O_NOFOLLOW: per POSIX,
+  // open(O_DIRECTORY|O_NOFOLLOW) on a symlink is required to fail with
+  // ENOTDIR (not ELOOP), which would be indistinguishable from "this path
+  // component genuinely is not a directory". O_NOFOLLOW alone reliably
+  // fails with ELOOP for a symlink regardless of its target type; the
+  // separate fstatSync().isDirectory() check below (which runs against the
+  // fd of whatever WAS actually opened) is what verifies "is a directory".
+  let flags = fsConstants.O_RDONLY
+  if (typeof fsConstants.O_NOFOLLOW === 'number') flags |= fsConstants.O_NOFOLLOW
+
+  let fd
+  try {
+    fd = openSync(dir, flags)
+  } catch (err) {
+    if (err && err.code === 'ELOOP') {
+      throw new Error('parent_is_symlink', { cause: err })
+    }
+    throw new Error('parent_unavailable', { cause: err })
+  }
+  try {
+    const st = fstatSync(fd)
+    if (!st.isDirectory()) {
+      throw new Error('parent_not_a_directory')
+    }
+    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
+      throw new Error('parent_owner_mismatch')
+    }
+    fchmodSync(fd, 0o700)
+  } finally {
+    closeSync(fd)
+  }
 }
 
 function writeReadinessAtomic(targetPath, payload) {
   const dir = dirname(targetPath)
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
-  // AC3: force exact 0700 regardless of umask or a pre-existing directory
-  // created with a looser mode by an older version of this script.
-  chmodSync(dir, 0o700)
+  preparePrivateParentDir(dir)
   const tmpPath = `${targetPath}.tmp.${process.pid}`
   const rendered = `${JSON.stringify(payload, null, 2)}\n`
   const fd = openSync(tmpPath, 'wx', 0o600)

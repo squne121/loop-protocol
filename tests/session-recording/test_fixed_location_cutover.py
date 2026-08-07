@@ -50,7 +50,12 @@ SECRET_POLICY_DIGEST = f"sha256:{hashlib.sha256(_SECRET_POLICY_PATH.read_bytes()
 PRODUCER_DIGEST = f"sha256:{hashlib.sha256(PRODUCER_PATH.read_bytes()).hexdigest()}"
 
 ELIGIBILITY_GENERATED_AT = "2026-06-15T11:00:00Z"
-ELIGIBILITY_EXPIRES_AT = "2030-01-01T00:00:00Z"
+# Issue #2004 P3: computed relative to real wall-clock "now" (rather than a
+# fixed calendar date) so this fixture never expires as real time passes.
+# _load_and_verify_readiness_artifact()/eligibility lifecycle checks compare
+# generated_at/expires_at against real wall-clock hook_received_at, so a
+# hardcoded far-future date would eventually become a real past date.
+ELIGIBILITY_EXPIRES_AT = (datetime.now(timezone.utc) + timedelta(days=3650)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 _PLACEHOLDER_DIGEST_A = "sha256:" + ("0" * 64)
 _PLACEHOLDER_DIGEST_B = "sha256:" + ("1" * 64)
@@ -197,45 +202,41 @@ def _run_producer(
 # ---------------------------------------------------------------------------
 
 
-def test_default_fixed_location_producer_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_fixed_location_producer_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH", raising=False)
     monkeypatch.delenv("SCOPE_ROLLUP_READINESS_ARTIFACT_PATH", raising=False)
 
     eligibility_default = srrs.scope_rollup_eligibility_artifact_path(REPO_ROOT)
     assert eligibility_default == REPO_ROOT / "tmp" / "session-recording" / "scope-rollup-eligibility.json"
 
-    # Readiness default lives in the Node bootstrap script. Run it for real
-    # (Runtime Verification Applicability: immediate) with the override
-    # unset so it exercises its own default-path computation. Back up /
-    # restore any real artifact a concurrent developer session may have
-    # produced at the same default location.
-    readiness_default = REPO_ROOT / "tmp" / "session-recording" / "scope-rollup-readiness.json"
-    backup_bytes = readiness_default.read_bytes() if readiness_default.exists() else None
-    existed_before = readiness_default.exists()
-    try:
-        if readiness_default.exists():
-            readiness_default.unlink()
-        env = dict(os.environ)
-        env.pop("SCOPE_ROLLUP_READINESS_ARTIFACT_PATH", None)
-        result = subprocess.run(
-            ["node", str(BOOTSTRAP_SCRIPT)],
-            text=True,
-            capture_output=True,
-            check=False,
-            cwd=str(REPO_ROOT),
-            env=env,
-            timeout=120,
-        )
-        assert result.returncode == 0, result.stderr
-        assert readiness_default.exists()
-        parsed = json.loads(readiness_default.read_text(encoding="utf-8"))
-        assert parsed["prepared"] is True
-    finally:
-        if backup_bytes is not None:
-            readiness_default.write_bytes(backup_bytes)
-            readiness_default.chmod(0o600)
-        elif not existed_before and readiness_default.exists():
-            readiness_default.unlink()
+    # Readiness default lives in the Node bootstrap script. Issue #2004 P2:
+    # exercise the REAL bootstrap script's default-path computation against
+    # an ISOLATED fake repo via its `--repo-root` test seam, rather than
+    # mutating the live repo's canonical runtime artifact (the previous
+    # implementation here unlinked/backed-up/restored the real
+    # tmp/session-recording/scope-rollup-readiness.json, which raced against
+    # any concurrent developer session using the same default location).
+    # test_hermetic_default_path_producer_consumer_roundtrip below covers
+    # the full producer-consumer round trip in the same isolated fashion.
+    fake_repo_root = tmp_path / "fake-repo-default-path"
+    fake_repo_root.mkdir()
+    env = dict(os.environ)
+    env.pop("SCOPE_ROLLUP_READINESS_ARTIFACT_PATH", None)
+    result = subprocess.run(
+        ["node", str(BOOTSTRAP_SCRIPT), "--repo-root", str(fake_repo_root)],
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=str(REPO_ROOT),
+        env=env,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    readiness_default = fake_repo_root / "tmp" / "session-recording" / "scope-rollup-readiness.json"
+    assert readiness_default.exists()
+    parsed = json.loads(readiness_default.read_text(encoding="utf-8"))
+    assert parsed["prepared"] is True
+    assert parsed["repo_root_realpath"] == str(fake_repo_root.resolve())
 
 
 # ---------------------------------------------------------------------------
@@ -543,3 +544,366 @@ def test_digest_update_regeneration_order(tmp_path: Path, monkeypatch: pytest.Mo
     assert final_record["parser_status"] == "ok"
     assert final_record["provenance"]["eligibility_verification_reason_code"] == "ok"
     assert final_record["provenance"]["readiness_verification_reason_code"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# P1-1 (OWNER REQUEST_CHANGES on PR #2008): parent-directory non-symlink /
+# owner-match hardening for the eligibility producer/loader (pure Python --
+# no Node subprocess, stays in the python-test-core lane).
+# ---------------------------------------------------------------------------
+
+
+def test_eligibility_parent_dir_toctou_hardening(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """reject_symlink_parent / reject_wrong_owner_parent /
+    reject_or_repair_loose_parent_by_explicit_policy /
+    reject_parent_replaced_after_validation -- all four via
+    prepare_private_parent_dir() (the producer side), which used to do an
+    unconditional mkdir(exist_ok=True) + chmod(parent, 0o700) with no
+    verification at all.
+    """
+    monkeypatch.setenv("SRRS_SECRETS_MODE", "none")
+    monkeypatch.setenv("SRRS_GIT_LS_REMOTE_EXIT", "2")
+    monkeypatch.setenv("SRRS_GH_VISIBILITY", "public")
+
+    # -- reject_symlink_parent: a pre-existing symlink parent must be
+    # rejected outright, and the symlink's REAL target must never be
+    # touched (no chmod through the link).
+    real_target = tmp_path / "real-target-dir"
+    real_target.mkdir()
+    os.chmod(real_target, 0o755)
+    symlinked_parent_artifact = tmp_path / "symlinked-parent" / "eligibility.json"
+    os.symlink(real_target, symlinked_parent_artifact.parent)
+    with pytest.raises(srrs.PrivateParentDirError) as excinfo:
+        srrs.prepare_private_parent_dir(symlinked_parent_artifact)
+    assert excinfo.value.reason_code == "parent_is_symlink"
+    assert stat.S_IMODE(os.stat(real_target).st_mode) == 0o755  # untouched
+
+    # -- reject_wrong_owner_parent: simulated via an injected expected_uid
+    # (CI has no second real uid available) -- a real, non-symlink,
+    # currently-existing directory whose owner does not match the caller's
+    # expected uid must be rejected, never chmod'd.
+    owner_mismatch_artifact = tmp_path / "owner-mismatch" / "eligibility.json"
+    owner_mismatch_artifact.parent.mkdir(parents=True)
+    os.chmod(owner_mismatch_artifact.parent, 0o755)
+    with pytest.raises(srrs.PrivateParentDirError) as excinfo:
+        srrs.prepare_private_parent_dir(owner_mismatch_artifact, expected_uid=os.getuid() + 999_999)
+    assert excinfo.value.reason_code == "parent_owner_mismatch"
+    assert stat.S_IMODE(os.stat(owner_mismatch_artifact.parent).st_mode) == 0o755  # untouched
+
+    # -- reject_or_repair_loose_parent_by_explicit_policy: a pre-existing
+    # parent that IS safe (non-symlink, owned by us) but has a looser mode
+    # (left by an older version of this script) is explicitly REPAIRED to
+    # 0700 -- never silently trusted as-is, and never rejected outright
+    # either (that would regress AC3 for every pre-#2004 checkout).
+    loose_mode_artifact = tmp_path / "loose-mode" / "eligibility.json"
+    loose_mode_artifact.parent.mkdir(parents=True)
+    os.chmod(loose_mode_artifact.parent, 0o755)
+    srrs.prepare_private_parent_dir(loose_mode_artifact)
+    assert stat.S_IMODE(os.stat(loose_mode_artifact.parent).st_mode) == 0o700
+
+    # -- reject_parent_replaced_after_validation: a parent that was safe at
+    # the time of an EARLIER call is replaced with a symlink before a LATER
+    # call -- each call independently re-validates via its own single
+    # O_NOFOLLOW open (never trusting state left over from a prior call).
+    replaced_artifact = tmp_path / "replaced" / "eligibility.json"
+    replaced_artifact.parent.mkdir(parents=True)
+    srrs.prepare_private_parent_dir(replaced_artifact)  # first call: safe, succeeds
+    assert stat.S_IMODE(os.stat(replaced_artifact.parent).st_mode) == 0o700
+    replaced_artifact.parent.rmdir()
+    other_real_dir = tmp_path / "replaced-real-elsewhere"
+    other_real_dir.mkdir()
+    os.chmod(other_real_dir, 0o755)
+    os.symlink(other_real_dir, replaced_artifact.parent)
+    with pytest.raises(srrs.PrivateParentDirError) as excinfo:
+        srrs.prepare_private_parent_dir(replaced_artifact)  # second call: now a symlink
+    assert excinfo.value.reason_code == "parent_is_symlink"
+    assert stat.S_IMODE(os.stat(other_real_dir).st_mode) == 0o755  # untouched
+
+
+def test_eligibility_artifact_swapped_between_stat_and_read_is_toctou_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reject_artifact_swapped_between_stat_and_read: open_private_artifact_or_reason()
+    opens with O_NOFOLLOW and fstats/reads the SAME fd -- so even if the
+    pathname is deleted and replaced with a symlink to a completely
+    different file immediately after the open+fstat step, the bytes
+    ultimately read must still be the ORIGINAL file's bytes (the fd is
+    pinned to the original inode; the swapped pathname is never consulted
+    again).
+    """
+    monkeypatch.setenv("SRRS_SECRETS_MODE", "none")
+    monkeypatch.setenv("SRRS_GIT_LS_REMOTE_EXIT", "2")
+    monkeypatch.setenv("SRRS_GH_VISIBILITY", "public")
+
+    eligibility_path = tmp_path / "session-recording" / "scope-rollup-eligibility.json"
+    monkeypatch.setenv("SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH", str(eligibility_path))
+    exit_code, artifact = srrs.emit_scope_rollup_eligibility_artifact(REPO_ROOT)
+    assert exit_code == srrs.EXIT_PASS
+    original_bytes = eligibility_path.read_bytes()
+
+    fd, st, reason = srrs.open_private_artifact_or_reason(
+        eligibility_path, symlink_reason="test_symlink", missing_reason="test_missing",
+    )
+    assert fd is not None, reason
+    try:
+        # Swap the pathname for a symlink to a decoy file AFTER the fd was
+        # already opened (simulating an attacker racing the stat-then-read
+        # window this fix closes).
+        decoy_path = tmp_path / "decoy.json"
+        decoy_path.write_bytes(b'{"decoy": true}')
+        eligibility_path.unlink()
+        os.symlink(decoy_path, eligibility_path)
+
+        raw = os.read(fd, st.st_size)
+    finally:
+        os.close(fd)
+
+    assert raw == original_bytes  # NOT the decoy content
+    assert stat.S_ISREG(st.st_mode)  # the fstat result also describes the original regular file
+
+
+# ---------------------------------------------------------------------------
+# P1-1: the readiness consumer performs the SAME read-only parent-directory
+# validation before trusting anything under it (pure Python -- the consumer
+# itself is a Python script; only the readiness PRODUCER is Node).
+# ---------------------------------------------------------------------------
+
+
+def test_readiness_consumer_rejects_symlink_parent(tmp_path: Path) -> None:
+    eligibility_path = tmp_path / "eligibility-dir" / "scope-rollup-eligibility.json"
+    eligibility_path.parent.mkdir(parents=True, mode=0o700)
+    _write_json_mode_0600(eligibility_path, _default_eligibility())
+
+    real_readiness_dir = tmp_path / "readiness-real-target"
+    real_readiness_dir.mkdir()
+    os.chmod(real_readiness_dir, 0o700)
+    readiness_path = tmp_path / "readiness-symlinked-parent" / "scope-rollup-readiness.json"
+    os.symlink(real_readiness_dir, readiness_path.parent)
+    _write_json_mode_0600(real_readiness_dir / "scope-rollup-readiness.json", _default_readiness())
+
+    message = _render_marker(invocation_id="inv-2004-readiness-symlink-parent")
+    payload = {
+        "hook_event_name": "SubagentStop",
+        "agent_type": "scope-rollup-runner",
+        "last_assistant_message": message,
+        "stop_hook_active": False,
+    }
+    capture_dir = tmp_path / "capture"
+    capture_dir.mkdir()
+    result = _run_producer(
+        payload,
+        capture_dir=capture_dir,
+        eligibility_path=eligibility_path,
+        readiness_path=readiness_path,
+    )
+    assert result.returncode == 0, result.stderr
+    record = _read_capture_record(capture_dir)
+    assert record["parser_status"] == "readiness_invalid_parent_symlink"
+    assert stat.S_IMODE(os.stat(real_readiness_dir).st_mode) == 0o700  # untouched (read-only check)
+
+
+# ---------------------------------------------------------------------------
+# P1-1 (readiness PRODUCER, Node side) + P1-3 (cross-language override
+# parity) + P2 (hermetic default-path E2E). These invoke the real Node
+# bootstrap script, so they run in the node-backed-hook-tests CI lane (see
+# .github/ci/python-test-plan.json deselect + .github/workflows/ci.yml).
+# ---------------------------------------------------------------------------
+
+
+def _print_resolved_override(override: str, repo_root: Path) -> tuple[int, str]:
+    result = subprocess.run(
+        ["node", str(BOOTSTRAP_SCRIPT), "--print-resolved-override", override, str(repo_root)],
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=str(REPO_ROOT),
+        timeout=30,
+    )
+    return result.returncode, result.stdout.strip()
+
+
+def test_cross_language_override_resolution_parity(tmp_path: Path) -> None:
+    """P1-3: Python's resolve_session_recording_artifact_override() and
+    Node's resolveReadinessOverride() must agree byte-for-byte, including
+    for inputs involving a symlinked ancestor directory (never resolved by
+    either side any more -- purely lexical), `..` traversal (rejected by
+    both), and a leaf that does not exist on disk.
+    """
+    repo_root = tmp_path / "parity-repo"
+    repo_root.mkdir()
+    # A symlinked ancestor directory under repo_root: since resolution is
+    # now purely lexical, this must NOT affect the resolved path in either
+    # language (neither calls realpath/fs.realpathSync on it).
+    real_dir = tmp_path / "parity-real-target"
+    real_dir.mkdir()
+    os.symlink(real_dir, repo_root / "linked-ancestor")
+
+    cases: list[str] = [
+        "tmp/session-recording/scope-rollup-eligibility.json",
+        "./tmp/session-recording/scope-rollup-eligibility.json",
+        "linked-ancestor/nested/does-not-exist-yet.json",
+        "/abs/tmp/session-recording/scope-rollup-eligibility.json",
+        "/abs/./tmp/session-recording/scope-rollup-eligibility.json",
+    ]
+    for override in cases:
+        py_resolved = str(srrs.resolve_session_recording_artifact_override(override, repo_root))
+        node_exit, node_resolved = _print_resolved_override(override, repo_root)
+        assert node_exit == 0, f"node side failed for override={override!r}: {node_resolved!r}"
+        assert py_resolved == node_resolved, f"parity mismatch for override={override!r}"
+
+    # `..` traversal: both languages reject outright (never silently
+    # collapsed), regardless of absolute/relative.
+    for dotdot_override in ("../escape/eligibility.json", "/abs/../escape/eligibility.json"):
+        with pytest.raises(srrs.ArtifactOverridePathError) as excinfo:
+            srrs.resolve_session_recording_artifact_override(dotdot_override, repo_root)
+        assert excinfo.value.reason_code == "override_path_contains_dotdot"
+
+        node_exit, node_output = _print_resolved_override(dotdot_override, repo_root)
+        assert node_exit == 3
+        assert node_output == "ERROR:override_path_contains_dotdot"
+
+
+def test_readiness_producer_parent_dir_toctou_hardening(tmp_path: Path) -> None:
+    """P1-1 (Node side): same symlink-rejection / loose-mode-repair
+    contract as the Python eligibility producer, exercised against the real
+    bootstrap-source-bound-readiness.mjs preparePrivateParentDir().
+    """
+    # reject_symlink_parent: real target must never be chmod'd through the
+    # symlink, and the bootstrap run must fail closed (non-zero exit, no
+    # artifact written).
+    real_target = tmp_path / "node-real-target"
+    real_target.mkdir()
+    os.chmod(real_target, 0o755)
+    symlinked_parent = tmp_path / "node-symlinked-parent"
+    os.symlink(real_target, symlinked_parent)
+    readiness_path = symlinked_parent / "scope-rollup-readiness.json"
+    result = _run_bootstrap_readiness(readiness_path)
+    assert result.returncode != 0
+    assert "parent_is_symlink" in result.stderr
+    assert not readiness_path.exists()
+    assert stat.S_IMODE(os.stat(real_target).st_mode) == 0o755  # untouched
+
+    # reject_or_repair_loose_parent_by_explicit_policy: a real, safe,
+    # pre-existing parent with a looser mode is repaired to exactly 0700.
+    loose_parent = tmp_path / "node-loose-mode"
+    loose_parent.mkdir()
+    os.chmod(loose_parent, 0o755)
+    loose_readiness_path = loose_parent / "scope-rollup-readiness.json"
+    result = _run_bootstrap_readiness(loose_readiness_path)
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(os.stat(loose_parent).st_mode) == 0o700
+
+
+def test_hermetic_default_path_producer_consumer_roundtrip(tmp_path: Path) -> None:
+    """P2: a fully isolated (tmp_path fake-repo) default-path E2E -- the
+    real eligibility producer, the real Node readiness producer (via the
+    `--repo-root` test seam), and the real consumer, all invoked WITHOUT any
+    SCOPE_ROLLUP_*_ARTIFACT_PATH override, so the fixture repo's OWN default
+    ``tmp/session-recording/`` path is exercised end to end. The live real
+    repo's canonical runtime artifact is never touched by this test.
+
+    Same fixture also exercises the AC6-style negative controls: old-path-
+    only, single-artifact-missing, and a symlinked default parent -- all
+    without ever needing the real repo's default location.
+    """
+    fake_repo_root = tmp_path / "fake-repo"
+    (fake_repo_root / "docs" / "dev").mkdir(parents=True)
+    (fake_repo_root / "docs" / "dev" / "session-recording-policy.md").write_bytes(_POLICY_PATH.read_bytes())
+    (fake_repo_root / "docs" / "dev" / "secret-policy.md").write_bytes(_SECRET_POLICY_PATH.read_bytes())
+
+    def _emit_eligibility() -> None:
+        old_env = {
+            k: os.environ.get(k)
+            for k in ("SRRS_SECRETS_MODE", "SRRS_GIT_LS_REMOTE_EXIT", "SRRS_GH_VISIBILITY")
+        }
+        os.environ["SRRS_SECRETS_MODE"] = "none"
+        os.environ["SRRS_GIT_LS_REMOTE_EXIT"] = "2"
+        os.environ["SRRS_GH_VISIBILITY"] = "public"
+        try:
+            exit_code, _artifact = srrs.emit_scope_rollup_eligibility_artifact(fake_repo_root)
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        assert exit_code == srrs.EXIT_PASS
+
+    # 1. Real eligibility producer, no override.
+    _emit_eligibility()
+    eligibility_default_path = fake_repo_root / "tmp" / "session-recording" / "scope-rollup-eligibility.json"
+    assert eligibility_default_path.exists()
+
+    # 2. Real Node readiness producer, no override, via --repo-root.
+    result = subprocess.run(
+        ["node", str(BOOTSTRAP_SCRIPT), "--repo-root", str(fake_repo_root)],
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=str(REPO_ROOT),
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    readiness_default_path = fake_repo_root / "tmp" / "session-recording" / "scope-rollup-readiness.json"
+    assert readiness_default_path.exists()
+
+    # 3. Real consumer, no override -> both from the fixture's own default paths.
+    def _run_default_path_consumer(invocation_id: str, capture_dir: Path) -> dict[str, object]:
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        message = _render_marker(invocation_id=invocation_id)
+        payload = {
+            "hook_event_name": "SubagentStop",
+            "agent_type": "scope-rollup-runner",
+            "last_assistant_message": message,
+            "stop_hook_active": False,
+        }
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin"),
+            "SCOPE_ROLLUP_CAPTURE_DIR": str(capture_dir),
+            "SCOPE_ROLLUP_REQUIRE_SOURCE_BOUND_ELIGIBILITY": "1",
+            "SCOPE_ROLLUP_REPO_ROOT": str(fake_repo_root.resolve()),
+        }
+        result = subprocess.run(
+            [sys.executable, str(PRODUCER_PATH)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            check=False,
+            cwd=str(REPO_ROOT),
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        return _read_capture_record(capture_dir)
+
+    record = _run_default_path_consumer("inv-2004-hermetic-ok", tmp_path / "capture-ok")
+    assert record["provenance"]["eligibility_verification_reason_code"] == "ok"
+    assert record["provenance"]["readiness_verification_reason_code"] == "ok"
+    assert record["parser_status"] == "ok"
+
+    # Negative control: readiness missing (renamed away) -> readiness_missing,
+    # eligibility unaffected -> proves neither artifact silently substitutes
+    # for the other.
+    renamed_readiness = readiness_default_path.with_name("scope-rollup-readiness.json.moved")
+    readiness_default_path.rename(renamed_readiness)
+    try:
+        record_missing = _run_default_path_consumer("inv-2004-hermetic-missing-readiness", tmp_path / "capture-missing")
+        assert record_missing["parser_status"] == "readiness_missing"
+    finally:
+        renamed_readiness.rename(readiness_default_path)
+
+    # Negative control: default parent directory (shared by BOTH eligibility
+    # and readiness -- both live directly under tmp/session-recording/)
+    # replaced with a symlink -> fail-closed at the eligibility stage (the
+    # first check performed), real target untouched.
+    real_elsewhere = tmp_path / "hermetic-symlink-target"
+    real_elsewhere.mkdir()
+    os.chmod(real_elsewhere, 0o755)
+    shared_parent = eligibility_default_path.parent
+    assert shared_parent == readiness_default_path.parent
+    eligibility_default_path.unlink()
+    readiness_default_path.unlink()
+    shared_parent.rmdir()
+    os.symlink(real_elsewhere, shared_parent)
+    record_symlink = _run_default_path_consumer("inv-2004-hermetic-symlink-parent", tmp_path / "capture-symlink")
+    assert record_symlink["parser_status"] == "eligibility_invalid_parent_symlink"
+    assert stat.S_IMODE(os.stat(real_elsewhere).st_mode) == 0o755  # untouched

@@ -75,29 +75,54 @@ def _readiness_artifact_path(repo_root: Path) -> Path:
     return repo_root / "tmp" / "session-recording" / "scope-rollup-readiness.json"
 
 
+_READINESS_PARENT_REASON_SUFFIX = {
+    "parent_is_symlink": "invalid_parent_symlink",
+    "parent_not_a_directory": "invalid_parent_not_directory",
+    "parent_owner_mismatch": "invalid_parent_owner",
+    "parent_unavailable": "invalid_parent_unavailable",
+}
+
+
 def _load_and_verify_readiness_artifact(
     repo_root: Path, *, hook_received_at: datetime,
 ) -> tuple[dict[str, Any] | None, str, str | None]:
     path = _readiness_artifact_path(repo_root)
-    try:
-        st = os.lstat(path)
-    except OSError:
+
+    # Issue #2004 P1-1: the consumer never creates or chmods the parent, but
+    # it must still validate it (non-symlink, real directory, owner match)
+    # before trusting anything read from inside it -- same read-only check
+    # the eligibility loader in check_session_recording_runtime_safety.py
+    # performs.
+    parent_reason = _srrs.validate_private_parent_dir_readonly(path)
+    if parent_reason == "parent_missing":
         return None, "readiness_missing", None
-    if stat.S_ISLNK(st.st_mode):
-        return None, "readiness_invalid_symlink", None
-    if not stat.S_ISREG(st.st_mode):
-        return None, "readiness_invalid_not_regular_file", None
-    if stat.S_IMODE(st.st_mode) != 0o600:
-        return None, "readiness_invalid_mode", None
-    if hasattr(os, "getuid") and st.st_uid != os.getuid():
-        return None, "readiness_invalid_owner", None
-    if st.st_size > READINESS_MAX_BYTES:
-        return None, "readiness_invalid_size", None
+    if parent_reason is not None:
+        return None, f"readiness_{_READINESS_PARENT_REASON_SUFFIX[parent_reason]}", None
+
+    # Issue #2004 P1-1: open with O_NOFOLLOW and fstat/read the SAME fd
+    # (never a separate lstat-then-read_bytes() pair) to close the TOCTOU
+    # window where the path could be swapped between the stat and the read.
+    fd, st, open_reason = _srrs.open_private_artifact_or_reason(
+        path, symlink_reason="readiness_invalid_symlink", missing_reason="readiness_missing",
+    )
+    if fd is None:
+        return None, open_reason, None
 
     try:
-        raw = path.read_bytes()
-    except OSError:
-        return None, "readiness_unreadable", None
+        if not stat.S_ISREG(st.st_mode):
+            return None, "readiness_invalid_not_regular_file", None
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            return None, "readiness_invalid_mode", None
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            return None, "readiness_invalid_owner", None
+        if st.st_size > READINESS_MAX_BYTES:
+            return None, "readiness_invalid_size", None
+        try:
+            raw = os.read(fd, st.st_size)
+        except OSError:
+            return None, "readiness_unreadable", None
+    finally:
+        os.close(fd)
     digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
     try:
