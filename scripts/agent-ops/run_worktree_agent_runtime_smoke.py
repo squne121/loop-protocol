@@ -1179,6 +1179,52 @@ def _codex_agent_id_from_spawn_agent_calls(candidate: Path) -> str | None:
         return None
 
 
+def _find_codex_child_session_meta(parent_session_id: str) -> dict | None:
+    """Locate the on-disk Codex rollout log for a spawned child sub-agent
+    thread whose first record (``type: session_meta``) content-links back
+    to ``parent_session_id`` via ``payload.parent_thread_id`` (also
+    duplicated as ``payload.session_id``), and return that ``session_meta``
+    ``payload`` dict.
+
+    Extracted as a shared helper (Issue #1886 P0-2 iteration-N fix_delta,
+    live rollout-log investigation) so both
+    ``extract_codex_child_session_id`` (child session id) and
+    ``extract_codex_child_agent_role`` (identity evidence) read the exact
+    same on-disk ``session_meta`` record instead of independently
+    re-scanning ``~/.codex/sessions`` and risking disagreement if the
+    directory changes between the two reads.
+
+    Returns ``None`` on any lookup failure or when no linked record is
+    found -- read-only, best-effort evidence collection, never a guess."""
+    try:
+        sessions_dir = Path.home() / ".codex" / "sessions"
+        if not sessions_dir.is_dir():
+            return None
+        for candidate in sorted(sessions_dir.glob("**/*.jsonl")):
+            try:
+                first_line = candidate.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+            except OSError:
+                continue
+            if not first_line:
+                continue
+            try:
+                record = json.loads(first_line[0].strip())
+            except (json.JSONDecodeError, ValueError, IndexError):
+                continue
+            if not isinstance(record, dict) or record.get("type") != "session_meta":
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            linked_parent_id = payload.get("parent_thread_id") or payload.get("session_id")
+            if linked_parent_id != parent_session_id:
+                continue
+            return payload
+        return None
+    except OSError:
+        return None
+
+
 def extract_codex_child_session_id(parent_session_id: str | None) -> str | None:
     """``agent_id``/child thread id extraction for the Codex CLI child
     sub-agent spawned by this run.
@@ -1199,10 +1245,11 @@ def extract_codex_child_session_id(parent_session_id: str | None) -> str | None:
     ``payload.parent_thread_id`` (also duplicated as ``payload.session_id``)
     equal to the spawning parent's own ``thread_id`` -- this is genuine,
     content-level linkage recorded by the Codex CLI itself, not an
-    inference. Once such a file is found, its own ``payload.id`` (also
-    embedded in the filename) is returned as the child thread's session id
-    -- direct evidence of a distinct, non-empty child session that differs
-    from ``parent_session_id`` (see ``native_spawn_event_observed``).
+    inference. Once such a file is found (via ``_find_codex_child_session_
+    meta``), its own ``payload.id`` (also embedded in the filename) is
+    returned as the child thread's session id -- direct evidence of a
+    distinct, non-empty child session that differs from
+    ``parent_session_id`` (see ``native_spawn_event_observed``).
 
     Returns ``None`` on any lookup failure -- this is read-only,
     best-effort evidence collection, never a guess."""
@@ -1217,31 +1264,62 @@ def extract_codex_child_session_id(parent_session_id: str | None) -> str | None:
             agent_id = _codex_agent_id_from_spawn_agent_calls(candidate)
             if agent_id:
                 return agent_id
-        for candidate in sorted(sessions_dir.glob("**/*.jsonl")):
-            try:
-                first_line = candidate.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
-            except OSError:
-                continue
-            if not first_line:
-                continue
-            try:
-                record = json.loads(first_line[0].strip())
-            except (json.JSONDecodeError, ValueError, IndexError):
-                continue
-            if not isinstance(record, dict) or record.get("type") != "session_meta":
-                continue
-            payload = record.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            linked_parent_id = payload.get("parent_thread_id") or payload.get("session_id")
-            if linked_parent_id != parent_session_id:
-                continue
-            own_id = payload.get("id")
-            if isinstance(own_id, str) and own_id:
-                return own_id
-        return None
     except OSError:
         return None
+    meta = _find_codex_child_session_meta(parent_session_id)
+    if not meta:
+        return None
+    own_id = meta.get("id")
+    if isinstance(own_id, str) and own_id:
+        return own_id
+    return None
+
+
+def extract_codex_child_agent_role(parent_session_id: str | None) -> str | None:
+    """Runtime-returned custom-agent identity evidence for the Codex CLI
+    child sub-agent spawned by this run (Issue #1886 P0-2 iteration-N
+    fix_delta).
+
+    The PR #2005 adversarial review's P0-2 finding was correct that a bare
+    ``agent_id`` alone never proves *which* custom agent was spawned -- a
+    generic child satisfies the same evidence as a named custom agent. The
+    prior fix_delta (commit 8915af25) therefore fail-closed
+    ``agent_type_identity_verified`` to always ``False`` for Codex,
+    documenting that no stable runtime-returned identity field was found
+    in this repository's own local runtime state.
+
+    Direct investigation of real, live-produced Codex rollout logs under
+    this runner's own structured lane (multiple ``codebase-investigator``
+    and ``web-researcher`` routes, local ``~/.codex/sessions``, Codex CLI
+    0.146.0, 2026-08-06/07) shows this field DOES exist: the spawned
+    child's own rollout log's first record (``type: session_meta``) is
+    written by the Codex CLI itself (not by this runner, not by the
+    spawning parent's prompt text) with an ``agent_role`` field --
+    duplicated under ``source.subagent.thread_spawn.agent_role`` -- that
+    holds exactly the custom agent role/persona name passed to the
+    multi-agent ``spawn_agent`` collaboration tool (e.g.
+    ``"codebase-investigator"``, ``"web-researcher"``). This is genuine,
+    content-level identity evidence independently written to disk by the
+    runtime, not a caller self-report re-echoing ``requested_agent_type``.
+
+    Reuses ``_find_codex_child_session_meta`` -- the exact same on-disk
+    ``session_meta`` record that ``extract_codex_child_session_id``'s
+    content-linked fallback path locates -- so the child session id and
+    its identity evidence are always read from the same record.
+
+    Returns ``None`` -- never a guess -- when no linked child
+    ``session_meta`` record (or no ``agent_role`` field within it) is
+    found; this preserves the fail-closed posture for any Codex CLI
+    version/config where this field is genuinely absent."""
+    if not parent_session_id:
+        return None
+    meta = _find_codex_child_session_meta(parent_session_id)
+    if not meta:
+        return None
+    agent_role = meta.get("agent_role")
+    if isinstance(agent_role, str) and agent_role:
+        return agent_role
+    return None
 
 
 def classify_codex_events(stdout: str) -> tuple[list[dict], int, int]:
@@ -1957,31 +2035,33 @@ def main(argv: list[str] | None = None) -> int:
             #   `agentId` also carries `agentType` (see
             #   `extract_claude_child_agent_type`); identity is verified iff
             #   that observed value equals `requested_agent_type`.
-            # - Codex: no stable, runtime-returned identity field (agent
-            #   role / agent path / custom-agent name) distinguishing a
-            #   requested custom agent from a generic child was found in
-            #   this repository's own local runtime state (see the
-            #   `spawn_agent` / rollout-log notes above -- only a bare
-            #   `agent_id` is available). Absent that evidence, identity is
-            #   fail-closed to `None` (not verified) rather than promoted to
-            #   True on child-id presence alone: `native_spawn_event_
-            #   observed` can therefore never be True for the Codex lane
-            #   until the CLI exposes genuine identity evidence -- a
-            #   documented, honest gap, not a fabricated PASS.
+            # - Codex (Issue #1886 P0-2 iteration-N fix_delta): live
+            #   investigation of real, local `~/.codex/sessions` rollout
+            #   logs (multiple `codebase-investigator` / `web-researcher`
+            #   routes, Codex CLI 0.146.0) found that a spawned child's own
+            #   rollout log DOES carry runtime-returned identity evidence
+            #   after all -- its `session_meta` record's `agent_role` field
+            #   (see `extract_codex_child_agent_role`), written by the Codex
+            #   CLI itself, holds the custom agent role/persona name. This
+            #   supersedes the prior fail-closed-to-always-False posture
+            #   (commit 8915af25): identity is verified iff that observed
+            #   value equals `requested_agent_type`, exactly mirroring the
+            #   Claude lane. If a future Codex CLI version ever stops
+            #   emitting this field, `extract_codex_child_agent_role`
+            #   returns `None` and this still fails closed.
             if args.runtime == "claude":
                 parent_session_id = extract_claude_parent_session_id(out)
                 child_session_id = extract_claude_child_session_id(parent_session_id, worktree, out)
                 child_agent_type_observed = extract_claude_child_agent_type(out)
-                agent_type_identity_verified = (
-                    child_agent_type_observed is not None
-                    and requested_agent_type is not None
-                    and child_agent_type_observed == requested_agent_type
-                )
             else:
                 parent_session_id = extract_codex_parent_session_id(out)
                 child_session_id = extract_codex_child_session_id(parent_session_id)
-                child_agent_type_observed = None
-                agent_type_identity_verified = False
+                child_agent_type_observed = extract_codex_child_agent_role(parent_session_id)
+            agent_type_identity_verified = (
+                child_agent_type_observed is not None
+                and requested_agent_type is not None
+                and child_agent_type_observed == requested_agent_type
+            )
             schema_summary["parent_session_id"] = parent_session_id
             schema_summary["child_session_id"] = child_session_id
             schema_summary["child_agent_type_observed"] = child_agent_type_observed

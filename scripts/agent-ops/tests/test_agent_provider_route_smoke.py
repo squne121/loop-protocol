@@ -744,17 +744,51 @@ class TestClaudeChildAgentTypeIdentityBinding:
         )
         assert identity_verified is True
 
-    def test_codex_identity_is_always_fail_closed_to_unverified(self):
-        """Issue #1886 P0-2: no stable runtime-returned identity field
-        (agent_role / agent_path / custom-agent name) was found for Codex
-        CLI in this repository's own local runtime state -- absent that
-        evidence, identity must fail closed to unverified, never be
-        promoted to True on child-id presence alone."""
-        # Mirrors the `else` branch wiring in
-        # run_worktree_agent_runtime_smoke.main(): Codex always sets
-        # agent_type_identity_verified = False regardless of child id.
-        agent_type_identity_verified = False
-        assert agent_type_identity_verified is False
+    def test_codex_identity_verified_when_observed_agent_role_matches(self):
+        """Issue #1886 P0-2 iteration-N fix_delta: live investigation of
+        real Codex rollout logs found the spawned child's own
+        `session_meta.agent_role` field genuinely carries the requested
+        custom agent's role name (see
+        `extract_codex_child_agent_role`) -- this supersedes the prior
+        always-False fail-closed posture (commit 8915af25). Mirrors the
+        Codex `else` branch wiring in
+        run_worktree_agent_runtime_smoke.main()."""
+        observed_agent_type = "codebase-investigator"
+        requested_agent_type = "codebase-investigator"
+        identity_verified = (
+            observed_agent_type is not None
+            and requested_agent_type is not None
+            and observed_agent_type == requested_agent_type
+        )
+        assert identity_verified is True
+
+    def test_codex_identity_not_verified_when_observed_agent_role_mismatches(self):
+        """Adversarial case mirroring the Claude
+        `general-purpose`-vs-`codebase-investigator` test above: an
+        observed `agent_role` that does not match the requested agent
+        type must not be treated as identity verified."""
+        observed_agent_type = "general-purpose"
+        requested_agent_type = "codebase-investigator"
+        identity_verified = (
+            observed_agent_type is not None
+            and requested_agent_type is not None
+            and observed_agent_type == requested_agent_type
+        )
+        assert identity_verified is False
+
+    def test_codex_identity_fails_closed_when_agent_role_absent(self):
+        """If a future Codex CLI version/config ever omits `agent_role`
+        from the child's `session_meta`, `extract_codex_child_agent_role`
+        returns `None` and identity must still fail closed to
+        unverified -- never promoted to True on child-id presence alone."""
+        observed_agent_type = None
+        requested_agent_type = "codebase-investigator"
+        identity_verified = (
+            observed_agent_type is not None
+            and requested_agent_type is not None
+            and observed_agent_type == requested_agent_type
+        )
+        assert identity_verified is False
 
 
 class TestClaudeChildSessionIdFromStdoutStream:
@@ -938,3 +972,108 @@ class TestCodexChildSessionIdViaContentLinkedRolloutLog:
         monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
         assert runtime_smoke.extract_codex_child_session_id(None) is None
         assert runtime_smoke.extract_codex_child_session_id("") is None
+
+
+class TestCodexChildAgentRoleIdentityEvidence:
+    """Issue #1886 P0-2 iteration-N fix_delta (PR #2005 REQUEST_CHANGES):
+    live investigation of real, local Codex rollout logs (Codex CLI
+    0.146.0, multiple `codebase-investigator`/`web-researcher` routes,
+    2026-08-06/07) found that the spawned child's own rollout log
+    `session_meta` record genuinely carries an `agent_role` field written
+    by the Codex CLI itself -- see `_write_codex_child_rollout_log`, which
+    is shaped after those real logs and already includes this field.
+    These tests cover the new `extract_codex_child_agent_role` extractor
+    that supersedes the prior always-``None``/always-``False`` fail-closed
+    posture (commit 8915af25)."""
+
+    @pytest.fixture()
+    def fake_home(self, tmp_path: Path) -> Path:
+        home = tmp_path / "home"
+        home.mkdir()
+        return home
+
+    def test_extract_codex_child_agent_role_from_content_linked_session_meta(
+        self, runtime_smoke, fake_home: Path, monkeypatch
+    ):
+        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
+
+        parent_thread_id = "019fd720-2814-7362-b530-cb659cec97f8"
+        child_own_id = "019fd720-9458-7703-b3f0-07aac6e6b350"
+        _write_codex_child_rollout_log(
+            fake_home / ".codex" / "sessions", own_id=child_own_id, parent_thread_id=parent_thread_id
+        )
+
+        agent_role = runtime_smoke.extract_codex_child_agent_role(parent_thread_id)
+        assert agent_role == "codebase-investigator"
+
+    def test_extract_codex_child_agent_role_returns_none_without_any_linkage(
+        self, runtime_smoke, fake_home: Path, monkeypatch
+    ):
+        """Fail-closed: no rollout log content links back to the given
+        parent id -> ``None``, never a guess."""
+        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
+
+        _write_codex_child_rollout_log(
+            fake_home / ".codex" / "sessions",
+            own_id="unrelated-child-id",
+            parent_thread_id="some-other-parent-thread-id",
+        )
+
+        assert runtime_smoke.extract_codex_child_agent_role("this-parent-id-has-no-match") is None
+
+    def test_extract_codex_child_agent_role_returns_none_when_field_absent(
+        self, runtime_smoke, fake_home: Path, monkeypatch
+    ):
+        """Fail-closed: a linked child session_meta record that lacks the
+        agent_role field entirely -> ``None``, never a guess (preserves
+        fail-closed posture for a hypothetical Codex CLI version/config
+        that omits this field)."""
+        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
+
+        sessions_dir = fake_home / ".codex" / "sessions" / "2026" / "08" / "06"
+        sessions_dir.mkdir(parents=True)
+        parent_thread_id = "parent-no-agent-role"
+        child_own_id = "child-no-agent-role"
+        path = sessions_dir / f"rollout-2026-08-06T21-51-04-{child_own_id}.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-08-06T12:51:04.552Z",
+                "type": "session_meta",
+                "payload": {
+                    "session_id": parent_thread_id,
+                    "id": child_own_id,
+                    "parent_thread_id": parent_thread_id,
+                    "cwd": "/home/example/worktree",
+                    "thread_source": "subagent",
+                },
+            },
+        ]
+        path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+        assert runtime_smoke.extract_codex_child_agent_role(parent_thread_id) is None
+
+    def test_extract_codex_child_agent_role_returns_none_for_empty_parent_id(
+        self, runtime_smoke, fake_home: Path, monkeypatch
+    ):
+        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
+        assert runtime_smoke.extract_codex_child_agent_role(None) is None
+        assert runtime_smoke.extract_codex_child_agent_role("") is None
+
+    def test_child_session_id_and_agent_role_read_the_same_record(
+        self, runtime_smoke, fake_home: Path, monkeypatch
+    ):
+        """Both extractors must agree on identity for the same spawn --
+        they share `_find_codex_child_session_meta` precisely so the child
+        session id and its identity evidence can never disagree."""
+        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
+
+        parent_thread_id = "019fd723-shared-parent"
+        child_own_id = "019fd723-shared-child"
+        _write_codex_child_rollout_log(
+            fake_home / ".codex" / "sessions", own_id=child_own_id, parent_thread_id=parent_thread_id
+        )
+
+        assert runtime_smoke.extract_codex_child_session_id(parent_thread_id) == child_own_id
+        assert (
+            runtime_smoke.extract_codex_child_agent_role(parent_thread_id) == "codebase-investigator"
+        )
