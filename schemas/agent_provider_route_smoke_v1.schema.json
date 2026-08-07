@@ -25,6 +25,10 @@
       "type": "string",
       "minLength": 1
     },
+    "batch_run_id": {
+      "type": "string",
+      "minLength": 1
+    },
     "generated_at": {
       "type": "string",
       "format": "date-time"
@@ -213,11 +217,19 @@
             "type": "object",
             "properties": {
               "selected_provider": {"const": "agy"},
+              "provider_attempts": {
+                "type": "array",
+                "items": [{"const": "agy"}],
+                "minItems": 1,
+                "maxItems": 1,
+                "additionalItems": false
+              },
               "gemini_invocation_count": {"const": 0},
               "direct_fallback_invocation_count": {"const": 0}
             },
             "required": [
               "selected_provider",
+              "provider_attempts",
               "gemini_invocation_count",
               "direct_fallback_invocation_count"
             ]
@@ -243,9 +255,10 @@
           "route_evidence": {
             "type": "object",
             "properties": {
-              "schema": {"const": "agy_github_research_evidence/v1"}
+              "schema": {"const": "agy_github_research_evidence/v1"},
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
             },
-            "required": ["schema"]
+            "required": ["schema", "sha256"]
           }
         }
       }

@@ -23,7 +23,7 @@ EXECUTION_POLICY
 
 RUNTIME
 - runtime_dependency_status: followup_required
-- runtime_followup_route: grounded_research_or_direct_web
+- runtime_followup_route: agy_grounded_research_only
 
 BUILDER_INVOCATION
 - provider: agy

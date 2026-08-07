@@ -176,7 +176,7 @@ def _copy_fixture_repo(tmp_path: Path) -> Path:
     web_researcher = repo / ".claude/agents/web-researcher.md"
     web_researcher.write_text(
         web_researcher.read_text(encoding="utf-8")
-        + "\n<!-- fixture parity token: grounded_research_or_direct_web -->\n",
+        + "\n<!-- fixture parity token: agy_grounded_research_only -->\n",
         encoding="utf-8",
     )
     issue_author = repo / ".claude/agents/issue-author.md"

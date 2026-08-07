@@ -193,7 +193,7 @@ wrapper は `context_files` を 1 件以上必須とするため、context フ�
 
 1. `setup_check.py --json` を実行して `serena_mcp` フィールドを確認する:
    ```bash
-   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --json
+   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --provider agy --json
    ```
 2. 出力 JSON の `serena_mcp` フィールドを確認する:
    - `serena_mcp.ok: false` の場合: Serena MCP の設定・インストール問題が疑われる。`serena_mcp.recovery` フィールドに従って対処方法を呼び出し元に報告する。

@@ -797,6 +797,68 @@ def load_static_declared_skills(checkout_root: str, agent_type: str) -> list[str
     return [str(s) for s in skills]
 
 
+_CLAUDE_DIRECT_WEB_TOOL_NAMES = {"WebSearch", "WebFetch"}
+_CODEX_DIRECT_WEB_TOKEN_RE = re.compile(r"\b(web_search|browser|fetch_url|http_get|curl)\b", re.IGNORECASE)
+
+
+def count_direct_web_tool_events(runtime: str, stdout: str) -> int:
+    """Issue #1886 P0-1 fix_delta (PR #2005 adversarial review): AC8
+    requires ``direct_fallback_invocation_count`` to reflect an ACTUAL
+    native-event-derived observation, never a permanently hard-coded 0.
+    Claude Code's native ``stream-json`` events unambiguously name direct
+    web tools (``WebSearch`` / ``WebFetch``) as ``tool_use`` blocks, exactly
+    like the existing ``Agent``/``Bash`` classification above -- counted
+    precisely. Codex CLI's ``--json`` event stream does not expose an
+    equally explicit tool-name field for a direct-web equivalent in this
+    repository's own observed runtime state (documented gap, same caveat as
+    ``_CODEX_COLLAB_ITEM_TYPE`` above): a best-effort, deliberately narrow
+    token scan over each event's own text/command fields is used instead,
+    which may under-detect but is never fabricated as a fixed 0."""
+    count = 0
+    if runtime == "claude":
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or payload.get("type") != "assistant":
+                continue
+            message = payload.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                if block.get("name") in _CLAUDE_DIRECT_WEB_TOOL_NAMES:
+                    count += 1
+    else:
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            item = payload.get("item") if isinstance(payload.get("item"), dict) else None
+            if item is None:
+                continue
+            candidate_text = " ".join(
+                str(item.get(field, ""))
+                for field in ("tool", "command", "name")
+                if item.get(field) is not None
+            )
+            if _CODEX_DIRECT_WEB_TOKEN_RE.search(candidate_text):
+                count += 1
+    return count
+
+
 def classify_claude_events(stdout: str) -> tuple[list[dict], int, int]:
     """Classify the already-captured native ``stream-json`` event stream for
     Claude Code. Returns ``(spawn_events, self_restart_event_count,
@@ -962,6 +1024,60 @@ def _extract_claude_child_session_id_from_stream(stdout: str) -> str | None:
                         text_parts.append(sub["text"])
             for text in text_parts:
                 match = _CLAUDE_AGENT_ID_RE.search(text)
+                if match:
+                    return match.group(1)
+    return None
+
+
+_CLAUDE_AGENT_TYPE_RE = re.compile(r'"agentType"\s*:\s*"([a-zA-Z0-9_-]+)"')
+
+
+def extract_claude_child_agent_type(stdout: str) -> str | None:
+    """Issue #1886 P0-2 fix_delta (PR #2005 adversarial review): the prior
+    identity evidence only proved *a* child agent id was returned, never
+    that it was the *requested* custom agent -- a generic ``general-purpose``
+    child satisfied the same evidence as ``codebase-investigator``. This
+    extracts the runtime-returned ``tool_use_result.agentType`` (the same
+    stream-json event that carries ``agentId``, see
+    ``_extract_claude_child_session_id_from_stream``) so callers can bind
+    the spawned child's OBSERVED agent type to the REQUESTED
+    ``--agent-type`` instead of trusting a caller self-report. Falls back to
+    the human-readable ``"agentType": "<name>"`` text fragment if the
+    structured field is absent. Returns ``None`` -- never a guess -- if no
+    agentType evidence is present at all (fail-closed: absent evidence must
+    never be treated as a match)."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "user":
+            continue
+        tool_use_result = payload.get("tool_use_result")
+        if isinstance(tool_use_result, dict):
+            agent_type = tool_use_result.get("agentType")
+            if isinstance(agent_type, str) and agent_type:
+                return agent_type
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            inner = block.get("content")
+            text_parts: list[str] = []
+            if isinstance(inner, str):
+                text_parts.append(inner)
+            elif isinstance(inner, list):
+                for sub in inner:
+                    if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                        text_parts.append(sub["text"])
+            for text in text_parts:
+                match = _CLAUDE_AGENT_TYPE_RE.search(text)
                 if match:
                     return match.group(1)
     return None
@@ -1820,21 +1936,61 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["child_spawn_event_count"] = len(spawn_events)
             schema_summary["self_restart_event_count"] = self_restart_count
             schema_summary["orchestration_action_count"] = orchestration_count
+            schema_summary["direct_web_tool_event_count"] = count_direct_web_tool_events(
+                args.runtime, out
+            )
 
             # Issue #1886 AC7: native, runtime-returned spawn session
             # evidence (see extractors above). ``native_spawn_event_observed``
             # is strictly ``True`` only when both ids are non-empty and
             # different -- caller self-report never promotes this to True.
+            # Issue #1886 P0-2 fix_delta (PR #2005 adversarial review): a
+            # distinct, non-empty parent/child session id pair alone proved
+            # only that SOME child was spawned, never that it was the
+            # REQUESTED custom agent -- a generic `general-purpose` child
+            # satisfied the exact same evidence as `codebase-investigator`.
+            # `native_spawn_event_observed` now additionally requires the
+            # runtime to have returned independent agent-identity evidence
+            # that matches `requested_agent_type`.
+            #
+            # - Claude: the same stream-json tool_use_result that carries
+            #   `agentId` also carries `agentType` (see
+            #   `extract_claude_child_agent_type`); identity is verified iff
+            #   that observed value equals `requested_agent_type`.
+            # - Codex: no stable, runtime-returned identity field (agent
+            #   role / agent path / custom-agent name) distinguishing a
+            #   requested custom agent from a generic child was found in
+            #   this repository's own local runtime state (see the
+            #   `spawn_agent` / rollout-log notes above -- only a bare
+            #   `agent_id` is available). Absent that evidence, identity is
+            #   fail-closed to `None` (not verified) rather than promoted to
+            #   True on child-id presence alone: `native_spawn_event_
+            #   observed` can therefore never be True for the Codex lane
+            #   until the CLI exposes genuine identity evidence -- a
+            #   documented, honest gap, not a fabricated PASS.
             if args.runtime == "claude":
                 parent_session_id = extract_claude_parent_session_id(out)
                 child_session_id = extract_claude_child_session_id(parent_session_id, worktree, out)
+                child_agent_type_observed = extract_claude_child_agent_type(out)
+                agent_type_identity_verified = (
+                    child_agent_type_observed is not None
+                    and requested_agent_type is not None
+                    and child_agent_type_observed == requested_agent_type
+                )
             else:
                 parent_session_id = extract_codex_parent_session_id(out)
                 child_session_id = extract_codex_child_session_id(parent_session_id)
+                child_agent_type_observed = None
+                agent_type_identity_verified = False
             schema_summary["parent_session_id"] = parent_session_id
             schema_summary["child_session_id"] = child_session_id
+            schema_summary["child_agent_type_observed"] = child_agent_type_observed
+            schema_summary["agent_type_identity_verified"] = agent_type_identity_verified
             schema_summary["native_spawn_event_observed"] = bool(
-                parent_session_id and child_session_id and parent_session_id != child_session_id
+                parent_session_id
+                and child_session_id
+                and parent_session_id != child_session_id
+                and agent_type_identity_verified
             )
 
             if capability_decision == "capability_skip":

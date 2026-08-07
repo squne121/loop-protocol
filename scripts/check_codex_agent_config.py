@@ -341,6 +341,9 @@ def validate_agy_builder_invocation(expectations: dict) -> list[str]:
             failures.append(f"{expected['path']}: must not hand-write a provider JSON literal")
         if "disabled_by_operator" not in instructions:
             failures.append(f"{expected['path']}: must declare Gemini disabled_by_operator policy")
+        failures.extend(
+            _forbid_gemini_and_legacy_route_tokens(expected["path"], instructions)
+        )
         if agent_name in {"codebase-investigator", "web-researcher"}:
             claude_path = REPO_ROOT / expected["claude_agent_path"]
             if claude_path.exists():
@@ -349,6 +352,64 @@ def validate_agy_builder_invocation(expectations: dict) -> list[str]:
                     failures.append(
                         f"{expected['claude_agent_path']}: must declare Gemini disabled_by_operator policy"
                     )
+                failures.extend(
+                    _forbid_gemini_and_legacy_route_tokens(
+                        expected["claude_agent_path"], claude_text
+                    )
+                )
+    return failures
+
+
+# Issue #1886 P0-5/P0-6 fix_delta (PR #2005 adversarial review): the prior
+# static checker only inspected the BUILDER_INVOCATION prose block for
+# provider/profile tokens, so an executable Gemini command elsewhere in the
+# same agent definition (e.g. a Serena-triage step calling
+# ``setup_check.py`` without ``--provider agy``, which defaults to and
+# executes real Gemini OAuth/setup smoke) or a stale
+# ``grounded_research_or_direct_web`` legacy route token went undetected.
+# This scans the FULL agent instructions text (not just BUILDER_INVOCATION)
+# for forbidden executable Gemini invocation tokens and the retired legacy
+# route token.
+_FORBIDDEN_GEMINI_INVOCATION_SUBSTRINGS = (
+    "preflight_gemini_headless.py",
+    "provider=auto",
+)
+_LEGACY_ROUTE_TOKEN = "grounded_research_or_direct_web"
+_SETUP_CHECK_LINE_RE = re.compile(r"^.*setup_check\.py.*$", re.MULTILINE)
+_BARE_GEMINI_INVOCATION_RE = re.compile(r"(?<![\w-])gemini\s+(--|['\"])")
+_CODE_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_-]*)\n(.*?)```", re.DOTALL)
+
+
+def _extract_code_fences(text: str) -> str:
+    """Join all fenced (```...```) command blocks. Executable-invocation
+    checks (P0-5) are scoped to fenced blocks only -- prose that documents a
+    *prohibition* (e.g. "preflight_gemini_headless.py は使わない") legitimately
+    names the forbidden token without invoking it, and must not be treated
+    as an executable invocation."""
+    return "\n".join(_CODE_FENCE_RE.findall(text))
+
+
+def _forbid_gemini_and_legacy_route_tokens(path_label: str, text: str) -> list[str]:
+    failures: list[str] = []
+    fenced = _extract_code_fences(text)
+    for line in _SETUP_CHECK_LINE_RE.findall(fenced):
+        if "--provider agy" not in line:
+            failures.append(
+                f"{path_label}: setup_check.py invocation must pass --provider agy"
+                f" (defaults to Gemini otherwise): {line.strip()!r}"
+            )
+    if _BARE_GEMINI_INVOCATION_RE.search(fenced):
+        failures.append(
+            f"{path_label}: must not invoke a binary literally named `gemini`"
+        )
+    for token in _FORBIDDEN_GEMINI_INVOCATION_SUBSTRINGS:
+        if token in fenced:
+            failures.append(f"{path_label}: forbidden Gemini invocation token {token!r} present")
+    if _LEGACY_ROUTE_TOKEN in text:
+        failures.append(
+            f"{path_label}: legacy runtime_followup_route token"
+            f" {_LEGACY_ROUTE_TOKEN!r} is retired and must not be present"
+        )
     return failures
 
 

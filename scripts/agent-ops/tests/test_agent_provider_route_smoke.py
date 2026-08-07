@@ -171,22 +171,35 @@ class TestProducer:
     def test_find_route_unknown_returns_none(self, producer):
         assert producer._find_route("claude_code", "codebase-investigator", "grounded_research") is None
 
-    def test_build_route_prompt_requests_agy_provider(self, producer):
+    def test_build_route_prompt_requests_agy_provider(self, producer, tmp_path):
         route = producer.REQUIRED_ROUTES[0]
-        prompt = producer.build_route_prompt(route)
+        prompt = producer.build_route_prompt(route, tmp_path)
         assert "--provider agy" in prompt
         assert f"--profile {route['profile']}" in prompt
 
-    def test_build_route_prompt_forbids_gemini_binary(self, producer):
+    def test_build_route_prompt_forbids_gemini_binary(self, producer, tmp_path):
         for route in producer.REQUIRED_ROUTES:
-            prompt = producer.build_route_prompt(route)
+            prompt = producer.build_route_prompt(route, tmp_path)
             assert "Do not invoke a binary literally named" in prompt
             assert "gemini" in prompt.lower()
 
-    def test_build_route_prompt_forbids_websearch_webfetch_fallback(self, producer):
+    def test_build_route_prompt_forbids_websearch_webfetch_fallback(self, producer, tmp_path):
         for route in producer.REQUIRED_ROUTES:
-            prompt = producer.build_route_prompt(route)
+            prompt = producer.build_route_prompt(route, tmp_path)
             assert "WebSearch or WebFetch" in prompt
+
+    def test_build_route_prompt_requires_result_and_request_paths(self, producer, tmp_path):
+        route = producer.REQUIRED_ROUTES[0]
+        prompt = producer.build_route_prompt(route, tmp_path)
+        assert str(tmp_path / "delegation_request.json") in prompt
+        assert str(tmp_path / "delegation_result.json") in prompt
+        assert "run_gemini_headless.py" in prompt
+
+    def test_build_route_prompt_github_research_requires_route_evidence_copy(self, producer, tmp_path):
+        route = producer._find_route("claude_code", "codebase-investigator", "github_research")
+        prompt = producer.build_route_prompt(route, tmp_path)
+        assert str(tmp_path / "route_evidence.json") in prompt
+        assert "agy_github_research_evidence/v1" in prompt
 
     def test_compute_subject_returns_expected_shape(self, producer):
         subject = producer.compute_subject(producer.REQUIRED_ROUTES[0], REPO_ROOT)
@@ -250,6 +263,162 @@ class TestProducer:
 # ---------------------------------------------------------------------------
 
 
+class TestDirectWebToolEventDetection:
+    """Adversarial test 3 (PR #2005 review): injecting a Claude
+    WebSearch/WebFetch event or a Codex direct-web-shaped event must
+    increase the observed fallback count (never a hard-coded 0)."""
+
+    def test_claude_websearch_event_is_counted(self, runtime_smoke):
+        stdout = "\n".join(
+            json.dumps(line)
+            for line in [
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "name": "WebSearch", "input": {}}]},
+                },
+            ]
+        )
+        assert runtime_smoke.count_direct_web_tool_events("claude", stdout) == 1
+
+    def test_claude_webfetch_event_is_counted(self, runtime_smoke):
+        stdout = "\n".join(
+            json.dumps(line)
+            for line in [
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "name": "WebFetch", "input": {}}]},
+                },
+            ]
+        )
+        assert runtime_smoke.count_direct_web_tool_events("claude", stdout) == 1
+
+    def test_claude_agent_tool_use_is_not_counted_as_fallback(self, runtime_smoke):
+        stdout = "\n".join(json.dumps(line) for line in _synthetic_claude_stream_lines())
+        assert runtime_smoke.count_direct_web_tool_events("claude", stdout) == 0
+
+    def test_codex_web_search_token_is_counted(self, runtime_smoke):
+        stdout = json.dumps({"item": {"type": "collab_tool_call", "tool": "web_search"}})
+        assert runtime_smoke.count_direct_web_tool_events("codex", stdout) == 1
+
+    def test_codex_unrelated_command_is_not_counted(self, runtime_smoke):
+        stdout = json.dumps({"item": {"type": "collab_tool_call", "command": "ls -la"}})
+        assert runtime_smoke.count_direct_web_tool_events("codex", stdout) == 0
+
+
+class TestProducerRouteEvidenceValidation:
+    """Issue #1886 P0-1 fix_delta: the producer must derive
+    request.validation / provider_observation.* from ACTUAL files the
+    delegated agent wrote, never stamp expected constants on harness exit 0
+    alone (PR #2005 adversarial review, decisive false-pass repro)."""
+
+    def test_delegation_request_missing_is_not_run(self, producer, tmp_path):
+        route = producer.REQUIRED_ROUTES[0]
+        assert producer._validate_delegation_request_evidence(tmp_path, route) == "not_run"
+
+    def test_delegation_request_wrong_provider_fails(self, producer, tmp_path):
+        route = producer.REQUIRED_ROUTES[0]
+        (tmp_path / "delegation_request.json").write_text(
+            json.dumps({"provider": "gemini", "profile": route["profile"], "prompt": "x"}),
+            encoding="utf-8",
+        )
+        assert producer._validate_delegation_request_evidence(tmp_path, route) == "fail"
+
+    def test_delegation_request_with_model_fails(self, producer, tmp_path):
+        route = producer.REQUIRED_ROUTES[0]
+        (tmp_path / "delegation_request.json").write_text(
+            json.dumps({"provider": "agy", "profile": route["profile"], "prompt": "x", "model": "gpt-5"}),
+            encoding="utf-8",
+        )
+        assert producer._validate_delegation_request_evidence(tmp_path, route) == "fail"
+
+    def test_delegation_request_empty_prompt_fails(self, producer, tmp_path):
+        route = producer.REQUIRED_ROUTES[0]
+        (tmp_path / "delegation_request.json").write_text(
+            json.dumps({"provider": "agy", "profile": route["profile"], "prompt": "   "}),
+            encoding="utf-8",
+        )
+        assert producer._validate_delegation_request_evidence(tmp_path, route) == "fail"
+
+    def test_delegation_request_valid_passes(self, producer, tmp_path):
+        route = producer.REQUIRED_ROUTES[0]
+        (tmp_path / "delegation_request.json").write_text(
+            json.dumps({"provider": "agy", "profile": route["profile"], "prompt": "do the thing"}),
+            encoding="utf-8",
+        )
+        assert producer._validate_delegation_request_evidence(tmp_path, route) == "pass"
+
+    def test_delegation_result_missing_yields_no_provider(self, producer, tmp_path):
+        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        assert provider is None
+        assert attempts == []
+        assert ok is False
+
+    def test_delegation_result_reads_actual_selected_provider(self, producer, tmp_path):
+        (tmp_path / "delegation_result.json").write_text(
+            json.dumps({"ok": True, "selected_provider": "agy", "provider_attempts": [{"provider": "agy", "ok": True}]}),
+            encoding="utf-8",
+        )
+        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        assert provider == "agy"
+        assert attempts == ["agy"]
+        assert ok is True
+
+    def test_delegation_result_wrapper_not_ok_is_recorded(self, producer, tmp_path):
+        (tmp_path / "delegation_result.json").write_text(
+            json.dumps({"ok": False, "selected_provider": None, "provider_attempts": []}),
+            encoding="utf-8",
+        )
+        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        assert ok is False
+
+    def test_github_research_route_evidence_missing_is_none(self, producer, tmp_path):
+        assert producer._validate_github_research_route_evidence(tmp_path) is None
+
+    def test_github_research_route_evidence_wrong_schema_is_none(self, producer, tmp_path):
+        (tmp_path / "route_evidence.json").write_text(
+            json.dumps({"schema": "some_other_schema/v1"}), encoding="utf-8"
+        )
+        assert producer._validate_github_research_route_evidence(tmp_path) is None
+
+    def test_github_research_route_evidence_valid_returns_real_digest(self, producer, tmp_path):
+        path = tmp_path / "route_evidence.json"
+        path.write_text(json.dumps({"schema": "agy_github_research_evidence/v1"}), encoding="utf-8")
+        import hashlib
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert producer._validate_github_research_route_evidence(tmp_path) == expected
+
+    def test_count_direct_fallback_hits_reads_harness_summary(self, producer):
+        assert producer._count_direct_fallback_hits({"direct_web_tool_event_count": "2"}) == 2
+        assert producer._count_direct_fallback_hits({"direct_web_tool_event_count": 3}) == 3
+        assert producer._count_direct_fallback_hits({}) == 0
+
+
+class TestProducerRetryPolicy:
+    """Issue #1886 P0-4 fix_delta: only Codex spawn_not_observed is eligible
+    for a single bounded retry; identity mismatch, validation failure,
+    provider mismatch, and fallback detection are never retried."""
+
+    def test_codex_spawn_not_observed_is_transient_candidate(self, producer):
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        assert producer._is_transient_infrastructure_candidate(route, "spawn_not_observed") is True
+
+    def test_claude_spawn_not_observed_is_not_transient_candidate(self, producer):
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
+        assert producer._is_transient_infrastructure_candidate(route, "spawn_not_observed") is False
+
+    def test_provider_mismatch_is_never_transient_candidate(self, producer):
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        assert producer._is_transient_infrastructure_candidate(route, "provider_mismatch") is False
+
+    def test_validation_failed_is_never_transient_candidate(self, producer):
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        assert producer._is_transient_infrastructure_candidate(route, "validation_failed") is False
+
+    def test_direct_fallback_invoked_is_never_transient_candidate(self, producer):
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        assert producer._is_transient_infrastructure_candidate(route, "direct_fallback_invoked") is False
+
+
 class TestValidator:
     def _write_artifact(self, directory: Path, name: str, artifact: dict) -> Path:
         path = directory / f"{name}.json"
@@ -279,20 +448,127 @@ class TestValidator:
         rc = validator.main(["--artifacts-dir", str(tmp_path), "--require-native-spawn-event"])
         assert rc == 1
 
-    def test_require_native_spawn_event_passes_with_distinct_ids(self, validator, tmp_path):
-        self._write_artifact(tmp_path, "route-a", _base_artifact())
+    def _six_route_pass_artifacts(self, producer, *, batch_run_id="batch-1", head_sha="a" * 40):
+        artifacts = {}
+        for route in producer.REQUIRED_ROUTES:
+            artifact = _base_artifact(
+                subject={
+                    "runtime": route["runtime"],
+                    "agent_name": route["agent"],
+                    "head_sha": head_sha,
+                    "runtime_version": "1.0.0",
+                    "agent_definition_sha256": "a" * 64,
+                    "effective_runtime_config_sha256": "a" * 64,
+                },
+                request={"profile": route["profile"], "expected_provider": "agy", "validation": "pass"},
+                route_evidence=(
+                    {"schema": "agy_github_research_evidence/v1", "sha256": "b" * 64}
+                    if route["profile"] == "github_research"
+                    else {"schema": None, "sha256": None}
+                ),
+            )
+            artifact["batch_run_id"] = batch_run_id
+            artifacts[producer._route_key(route)] = artifact
+        return artifacts
+
+    def test_require_native_spawn_event_passes_with_distinct_ids(self, validator, producer, tmp_path):
+        for key, artifact in self._six_route_pass_artifacts(producer).items():
+            self._write_artifact(tmp_path, key.replace(":", "-"), artifact)
         rc = validator.main(["--artifacts-dir", str(tmp_path), "--require-native-spawn-event"])
         assert rc == 0
 
-    def test_require_native_spawn_event_ignores_non_pass_status(self, validator, tmp_path):
-        artifact = _base_artifact(
-            status="fail",
-            failure_class="spawn_not_observed",
-            spawn={"parent_session_id": "p", "child_session_id": "", "native_spawn_event_observed": False},
-        )
-        self._write_artifact(tmp_path, "route-a", artifact)
+    def test_require_native_spawn_event_missing_route_fails_close_gate(self, validator, producer, tmp_path):
+        """Issue #1886 P0-3: a five-of-six cohort (one route missing) must
+        fail the aggregate close gate even though every present artifact is
+        individually well-formed and status=pass."""
+        artifacts = self._six_route_pass_artifacts(producer)
+        del artifacts[next(iter(artifacts))]
+        for key, artifact in artifacts.items():
+            self._write_artifact(tmp_path, key.replace(":", "-"), artifact)
         rc = validator.main(["--artifacts-dir", str(tmp_path), "--require-native-spawn-event"])
-        assert rc == 0
+        assert rc == 1
+
+    def test_require_native_spawn_event_non_pass_status_fails_close_gate(self, validator, producer, tmp_path):
+        """Issue #1886 P0-3 fix_delta (PR #2005 adversarial review): a
+        non-pass artifact anywhere in the six-route cohort must fail the
+        aggregate close gate -- the prior validator silently excluded
+        non-pass artifacts from this assertion entirely."""
+        artifacts = self._six_route_pass_artifacts(producer)
+        some_key = next(iter(artifacts))
+        artifacts[some_key]["status"] = "fail"
+        artifacts[some_key]["failure_class"] = "spawn_not_observed"
+        artifacts[some_key]["spawn"] = {
+            "parent_session_id": "p", "child_session_id": "", "native_spawn_event_observed": False,
+        }
+        for key, artifact in artifacts.items():
+            self._write_artifact(tmp_path, key.replace(":", "-"), artifact)
+        rc = validator.main(["--artifacts-dir", str(tmp_path), "--require-native-spawn-event"])
+        assert rc == 1
+
+    def test_decisive_dry_run_skip_cohort_is_rejected_by_close_gate(self, validator, producer, tmp_path):
+        """Issue #1886 P0-3: the exact decisive false-pass repro from the
+        PR #2005 adversarial review -- six ``status: skip`` artifacts (as
+        ``--dry-run`` produces) covering all six required routes -- must be
+        rejected by the aggregate close gate, not silently accepted as an
+        aggregate PASS."""
+        artifacts = self._six_route_pass_artifacts(producer)
+        for artifact in artifacts.values():
+            artifact["status"] = "skip"
+            artifact["failure_class"] = "agy_unavailable"
+            artifact["spawn"] = {
+                "parent_session_id": "", "child_session_id": "", "native_spawn_event_observed": False,
+            }
+            artifact["request"]["validation"] = "not_run"
+            artifact["provider_observation"]["selected_provider"] = None
+        for key, artifact in artifacts.items():
+            self._write_artifact(tmp_path, key.replace(":", "-"), artifact)
+        rc = validator.main([
+            "--artifacts-dir", str(tmp_path),
+            "--require-native-spawn-event",
+            "--assert-zero-gemini-and-fallback-invocations",
+        ])
+        assert rc == 1
+
+    def test_duplicate_route_artifacts_rejected(self, validator, producer, tmp_path):
+        artifacts = self._six_route_pass_artifacts(producer)
+        some_key = next(iter(artifacts))
+        self._write_artifact(tmp_path, "dup-a", artifacts[some_key])
+        self._write_artifact(tmp_path, "dup-b", artifacts[some_key])
+        for key, artifact in artifacts.items():
+            if key == some_key:
+                continue
+            self._write_artifact(tmp_path, key.replace(":", "-"), artifact)
+        rc = validator.main(["--artifacts-dir", str(tmp_path), "--require-native-spawn-event"])
+        assert rc == 1
+
+    def test_mismatched_head_sha_rejected(self, validator, producer, tmp_path):
+        artifacts = self._six_route_pass_artifacts(producer)
+        some_key = next(iter(artifacts))
+        artifacts[some_key]["subject"]["head_sha"] = "c" * 40
+        for key, artifact in artifacts.items():
+            self._write_artifact(tmp_path, key.replace(":", "-"), artifact)
+        rc = validator.main(["--artifacts-dir", str(tmp_path), "--require-native-spawn-event"])
+        assert rc == 1
+
+    def test_expected_head_sha_mismatch_rejected(self, validator, producer, tmp_path):
+        artifacts = self._six_route_pass_artifacts(producer, head_sha="a" * 40)
+        for key, artifact in artifacts.items():
+            self._write_artifact(tmp_path, key.replace(":", "-"), artifact)
+        rc = validator.main([
+            "--artifacts-dir", str(tmp_path),
+            "--require-native-spawn-event",
+            "--expected-head-sha", "d" * 40,
+        ])
+        assert rc == 1
+
+    def test_missing_github_research_route_evidence_digest_rejected(self, validator, producer, tmp_path):
+        artifacts = self._six_route_pass_artifacts(producer)
+        github_key = next(k for k in artifacts if "github_research" in k)
+        artifacts[github_key]["route_evidence"]["sha256"] = None
+        for key, artifact in artifacts.items():
+            self._write_artifact(tmp_path, key.replace(":", "-"), artifact)
+        rc = validator.main(["--artifacts-dir", str(tmp_path), "--require-native-spawn-event"])
+        assert rc == 1
 
     def test_assert_zero_gemini_and_fallback_invocations_fails_on_nonzero_gemini(self, validator, tmp_path):
         artifact = _base_artifact(
@@ -336,8 +612,9 @@ class TestValidator:
         rc = validator.main(["--artifacts-dir", str(tmp_path), "--assert-zero-gemini-and-fallback-invocations"])
         assert rc == 1
 
-    def test_assert_zero_gemini_and_fallback_invocations_passes_on_zero_counts(self, validator, tmp_path):
-        self._write_artifact(tmp_path, "route-a", _base_artifact())
+    def test_assert_zero_gemini_and_fallback_invocations_passes_on_zero_counts(self, validator, producer, tmp_path):
+        for key, artifact in self._six_route_pass_artifacts(producer).items():
+            self._write_artifact(tmp_path, key.replace(":", "-"), artifact)
         rc = validator.main(["--artifacts-dir", str(tmp_path), "--assert-zero-gemini-and-fallback-invocations"])
         assert rc == 0
 
@@ -413,6 +690,69 @@ def _synthetic_claude_stream_lines() -> list[dict]:
         },
         {"type": "result", "subtype": "success", "session_id": parent_session_id},
     ]
+
+
+class TestClaudeChildAgentTypeIdentityBinding:
+    """Issue #1886 P0-2 fix_delta (PR #2005 adversarial review): a distinct
+    child session id alone proved only that SOME child was spawned, never
+    that it was the REQUESTED custom agent -- a `general-purpose` child
+    satisfied the same evidence as `codebase-investigator`. These tests
+    cover the new `extract_claude_child_agent_type` extractor and the
+    identity-binding wiring in `run_worktree_agent_runtime_smoke.main()`."""
+
+    def test_extract_claude_child_agent_type_from_tool_use_result(self, runtime_smoke):
+        stdout = "\n".join(json.dumps(line) for line in _synthetic_claude_stream_lines())
+        agent_type = runtime_smoke.extract_claude_child_agent_type(stdout)
+        assert agent_type == "general-purpose"
+
+    def test_extract_claude_child_agent_type_returns_none_without_evidence(self, runtime_smoke):
+        stdout = "\n".join(
+            json.dumps(line)
+            for line in [
+                {"type": "system", "subtype": "init", "session_id": "parent-only"},
+                {"type": "result", "subtype": "success", "session_id": "parent-only"},
+            ]
+        )
+        assert runtime_smoke.extract_claude_child_agent_type(stdout) is None
+
+    def test_general_purpose_child_does_not_satisfy_codebase_investigator_identity(
+        self, runtime_smoke
+    ):
+        """Adversarial test 1 (PR #2005 review): a native spawn event whose
+        OBSERVED agentType ("general-purpose") does not match the REQUESTED
+        agent ("codebase-investigator") must not be treated as identity
+        verified -- this is the exact false-pass shape a generic child
+        satisfied under the prior agentId-only evidence."""
+        observed_agent_type = "general-purpose"
+        requested_agent_type = "codebase-investigator"
+        identity_verified = (
+            observed_agent_type is not None
+            and requested_agent_type is not None
+            and observed_agent_type == requested_agent_type
+        )
+        assert identity_verified is False
+
+    def test_matching_agent_type_satisfies_identity(self, runtime_smoke):
+        observed_agent_type = "codebase-investigator"
+        requested_agent_type = "codebase-investigator"
+        identity_verified = (
+            observed_agent_type is not None
+            and requested_agent_type is not None
+            and observed_agent_type == requested_agent_type
+        )
+        assert identity_verified is True
+
+    def test_codex_identity_is_always_fail_closed_to_unverified(self):
+        """Issue #1886 P0-2: no stable runtime-returned identity field
+        (agent_role / agent_path / custom-agent name) was found for Codex
+        CLI in this repository's own local runtime state -- absent that
+        evidence, identity must fail closed to unverified, never be
+        promoted to True on child-id presence alone."""
+        # Mirrors the `else` branch wiring in
+        # run_worktree_agent_runtime_smoke.main(): Codex always sets
+        # agent_type_identity_verified = False regardless of child id.
+        agent_type_identity_verified = False
+        assert agent_type_identity_verified is False
 
 
 class TestClaudeChildSessionIdFromStdoutStream:

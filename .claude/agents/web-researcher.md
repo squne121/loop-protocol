@@ -44,7 +44,7 @@ validator-first で根拠を収集し、未検証の主張を確定しない。
 ## RUNTIME（実行時要件）
 
 runtime_dependency_status: followup_required
-runtime_followup_route: grounded_research_or_direct_web
+runtime_followup_route: agy_grounded_research_only
 
 BUILDER_INVOCATION:
 - provider: agy

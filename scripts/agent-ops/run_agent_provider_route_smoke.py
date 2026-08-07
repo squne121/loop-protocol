@@ -54,6 +54,9 @@ RUNTIME_SMOKE_SCRIPT = Path(__file__).resolve().parent / "run_worktree_agent_run
 BUILD_REQUEST_SCRIPT = (
     ".claude/skills/gemini-cli-headless-delegation/scripts/build_request.py"
 )
+RUN_GEMINI_HEADLESS_SCRIPT = (
+    ".claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py"
+)
 GITHUB_RESEARCH_EVIDENCE_SCHEMA = "agy_github_research_evidence/v1"
 
 SCHEMA = "agent_provider_route_smoke/v1"
@@ -175,9 +178,19 @@ def compute_subject(route: dict[str, str], repo_root: Path) -> dict:
     }
 
 
-def build_route_prompt(route: dict[str, str]) -> str:
+def build_route_prompt(route: dict[str, str], evidence_dir: Path) -> str:
     agent = route["agent"]
     profile = route["profile"]
+    request_path = evidence_dir / "delegation_request.json"
+    result_path = evidence_dir / "delegation_result.json"
+    route_evidence_hint = ""
+    if profile == "github_research":
+        route_evidence_path = evidence_dir / "route_evidence.json"
+        route_evidence_hint = (
+            f" After the call returns, copy the exact `agy_github_research_evidence/v1` "
+            f"artifact JSON you actually received (byte-for-byte, unmodified) to "
+            f"`{route_evidence_path}`."
+        )
     return (
         f"AGENT_PROVIDER_ROUTE_SMOKE probe (Issue #1886). Use the {agent} custom agent "
         f"(profile: {profile}) for the following bounded task, and report exactly which "
@@ -185,10 +198,12 @@ def build_route_prompt(route: dict[str, str]) -> str:
         f"Task: build a delegation_request_v1 via "
         f"`uv run python3 {BUILD_REQUEST_SCRIPT} --provider agy --profile {profile} "
         f"--objective \"agent_provider_route_smoke probe\" --prompt \"Reply with the single "
-        f"word OK and do nothing else.\" --output /tmp/agent-provider-route-smoke-request.json` "
-        f"and then run it via run_gemini_headless.py. Do not invoke a binary literally named "
-        f"`gemini`. Do not use WebSearch or WebFetch as a fallback. If the AGY route fails, "
-        f"report the failure_class and stop -- do not retry with a different provider.\n\n"
+        f"word OK and do nothing else.\" --output {request_path}` "
+        f"and then run it via `uv run python3 {RUN_GEMINI_HEADLESS_SCRIPT} "
+        f"--request-file {request_path} --output-file {result_path}`. "
+        f"Do not invoke a binary literally named `gemini`. Do not use WebSearch or WebFetch "
+        f"as a fallback. If the AGY route fails, report the failure_class and stop -- do not "
+        f"retry with a different provider.{route_evidence_hint}\n\n"
         f"After the delegated call returns (success or failure), reply with exactly one line: "
         f"ROUTE_SMOKE_DONE."
     )
@@ -208,14 +223,21 @@ def _count_gemini_sentinel_hits(marker_path: Path) -> int:
 
 
 def _count_direct_fallback_hits(harness_summary: dict) -> int:
-    """Best-effort direct-fallback (WebSearch/WebFetch) count from the
-    harness's classified spawn_events. The underlying harness only records
-    ``Agent``-tool spawn events today (Issue #1886 extends it for session
-    ids, not for WebSearch/WebFetch classification), so this is currently
-    always 0 unless a future harness revision adds fallback-tool
-    classification -- left as an explicit, documented 0 rather than an
-    unverifiable guess."""
-    del harness_summary
+    """Issue #1886 P0-1 fix_delta (PR #2005 adversarial review): the prior
+    implementation always returned 0, undocumented as anything but a
+    permanent placeholder. ``run_worktree_agent_runtime_smoke.py`` now
+    classifies native WebSearch/WebFetch (Claude) and direct-web-shaped
+    (Codex) tool events into ``direct_web_tool_event_count`` in the same
+    ``summary.md`` this producer already parses generically -- read that
+    real, observed count here instead of a hard-coded 0. Absent the key
+    entirely (an older harness revision), this fails closed to 0 only
+    because the harness cannot have classified anything it doesn't emit at
+    all -- never because a real event was seen and discarded."""
+    value = harness_summary.get("direct_web_tool_event_count")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.lstrip("-").isdigit():
+        return int(value)
     return 0
 
 
@@ -229,7 +251,7 @@ def _parse_harness_summary_md(text: str) -> dict:
     strings for booleans/None), never re-serialized JSON -- this parser only
     needs the small set of string-valued fields this producer consumes
     (``parent_session_id`` / ``child_session_id`` /
-    ``native_spawn_event_observed``)."""
+    ``native_spawn_event_observed`` / ``direct_web_tool_event_count``)."""
     parsed: dict = {}
     for line in text.splitlines():
         match = _HARNESS_SUMMARY_LINE_RE.match(line)
@@ -247,15 +269,106 @@ def _parse_harness_summary_md(text: str) -> dict:
     return parsed
 
 
-def run_route_live(
+def _read_json_file(path: Path) -> object | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _validate_delegation_request_evidence(evidence_dir: Path, route: dict[str, str]) -> str:
+    """Issue #1886 P0-1 fix_delta: read the ACTUAL delegation_request_v1 the
+    agent built (via build_request.py --output) instead of stamping
+    ``"pass"`` on harness exit 0 alone. Returns a value valid against the
+    ``request.validation`` schema enum (``pass`` / ``fail`` / ``not_run``)."""
+    payload = _read_json_file(evidence_dir / "delegation_request.json")
+    if payload is None:
+        return "not_run"
+    if not isinstance(payload, dict):
+        return "fail"
+    if payload.get("provider") != "agy":
+        return "fail"
+    if payload.get("profile") != route["profile"]:
+        return "fail"
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return "fail"
+    if payload.get("model"):
+        return "fail"
+    return "pass"
+
+
+def _observed_provider_attempts(raw_attempts: object) -> list[str]:
+    if not isinstance(raw_attempts, list):
+        return []
+    names: list[str] = []
+    for entry in raw_attempts:
+        if isinstance(entry, str) and entry:
+            names.append(entry)
+        elif isinstance(entry, dict) and isinstance(entry.get("provider"), str) and entry["provider"]:
+            names.append(entry["provider"])
+    return names
+
+
+def _validate_delegation_result_evidence(evidence_dir: Path) -> tuple[str | None, list[str], bool]:
+    """Issue #1886 P0-1 fix_delta: read the ACTUAL run_gemini_headless.py
+    wrapper result (via --output-file) instead of stamping
+    ``selected_provider: "agy"`` / ``provider_attempts: ["agy"]`` on harness
+    exit 0 alone. Returns ``(selected_provider, provider_attempts,
+    wrapper_ok)``; all fail closed to ``None`` / ``[]`` / ``False`` when the
+    result file is missing or malformed -- never guessed."""
+    payload = _read_json_file(evidence_dir / "delegation_result.json")
+    if not isinstance(payload, dict):
+        return None, [], False
+    selected_provider = payload.get("selected_provider")
+    if not isinstance(selected_provider, str) or not selected_provider:
+        selected_provider = None
+    provider_attempts = _observed_provider_attempts(payload.get("provider_attempts"))
+    wrapper_ok = payload.get("ok") is True
+    return selected_provider, provider_attempts, wrapper_ok
+
+
+def _validate_github_research_route_evidence(evidence_dir: Path) -> str | None:
+    """Issue #1886 P0-1 fix_delta: read the ACTUAL agy_github_research_evidence/v1
+    artifact the agent copied out (never a hand-typed schema string), and
+    return the real sha256 digest of that file iff it is well-formed and
+    carries the expected ``schema`` field -- ``None`` (never a guessed
+    digest) on any missing/malformed/wrong-schema evidence."""
+    path = evidence_dir / "route_evidence.json"
+    payload = _read_json_file(path)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema") != GITHUB_RESEARCH_EVIDENCE_SCHEMA:
+        return None
+    return _sha256_file(path)
+
+
+# Issue #1886 P0-4 fix_delta (PR #2005 adversarial review): a bounded,
+# explicitly-classified single retry for genuine infrastructure-timing
+# races (the #1997 class), never a silent re-run of a validation failure,
+# provider mismatch, identity mismatch, or fallback detection. Codex CLI's
+# child-spawn evidence is recovered by bounded polling of an on-disk
+# rollout log (see extract_codex_child_session_id in
+# run_worktree_agent_runtime_smoke.py) -- exactly the kind of disk-timing
+# race a single bounded retry is meant to absorb. Claude's spawn evidence
+# instead comes from the already-captured in-memory stdout stream, so a
+# miss there is never classified as transient (retrying it would silently
+# paper over a genuine identity/spawn failure).
+def _is_transient_infrastructure_candidate(route: dict[str, str], failure_class: str | None) -> bool:
+    return route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed"
+
+
+def _run_route_once(
     route: dict[str, str],
     *,
+    run_id: str,
     repo_root: Path,
     worktree: Path,
     output_root: Path,
     timeout_seconds: int,
 ) -> dict:
-    run_id = str(uuid.uuid4())
+    """A single, non-retried attempt at a live route. See ``run_route_live``
+    for the bounded-retry wrapper around this."""
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     subject = compute_subject(route, repo_root)
     harness_runtime = _RUNTIME_TO_HARNESS[route["runtime"]]
@@ -286,21 +399,25 @@ def run_route_live(
         "failure_class": "other",
     }
 
+    route_key_slug = _route_key(route).replace(":", "-")
+    evidence_dir = output_root / f"{route_key_slug}-{run_id}-evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+
     with tempfile.TemporaryDirectory(prefix="agent-provider-route-smoke-") as tmp_dir_name:
         tmp_dir = Path(tmp_dir_name)
         prompt_file = tmp_dir / "prompt.txt"
-        prompt_file.write_text(build_route_prompt(route), encoding="utf-8")
+        prompt_file.write_text(build_route_prompt(route, evidence_dir), encoding="utf-8")
         sentinel_bin_dir = tmp_dir / "sentinel-bin"
         marker_path = tmp_dir / "gemini-sentinel-hits.jsonl"
         _write_gemini_sentinel(sentinel_bin_dir, marker_path)
-        harness_output_dir = output_root / f"{_route_key(route).replace(':', '-')}-{run_id}"
+        harness_output_dir = output_root / f"{route_key_slug}-{run_id}"
         # run_worktree_agent_runtime_smoke.py's write_evidence() creates this
         # directory itself with exist_ok=False (its own hygiene invariant) --
         # this producer must not pre-create it.
 
-        env = dict(os.environ)
-        env["PATH"] = f"{sentinel_bin_dir}:{env.get('PATH', '')}"
-        env["AGENT_PROVIDER_ROUTE_SMOKE_GEMINI_SENTINEL_MARKER"] = str(marker_path)
+        child_env = dict(os.environ)
+        child_env["PATH"] = f"{sentinel_bin_dir}:{child_env.get('PATH', '')}"
+        child_env["AGENT_PROVIDER_ROUTE_SMOKE_GEMINI_SENTINEL_MARKER"] = str(marker_path)
 
         argv = [
             sys.executable,
@@ -317,7 +434,7 @@ def run_route_live(
         try:
             result = subprocess.run(
                 argv, capture_output=True, text=True, timeout=timeout_seconds + 30,
-                env=env, check=False,
+                env=child_env, check=False,
             )
         except subprocess.TimeoutExpired:
             artifact["failure_class"] = "timeout"
@@ -352,8 +469,19 @@ def run_route_live(
         artifact["provider_observation"]["gemini_invocation_count"] = gemini_hits
         artifact["provider_observation"]["direct_fallback_invocation_count"] = fallback_hits
 
+        request_validation = _validate_delegation_request_evidence(evidence_dir, route)
+        selected_provider, provider_attempts, wrapper_ok = _validate_delegation_result_evidence(
+            evidence_dir
+        )
+        artifact["request"]["validation"] = request_validation
+        artifact["provider_observation"]["selected_provider"] = selected_provider
+        artifact["provider_observation"]["provider_attempts"] = provider_attempts
+
+        route_evidence_sha256 = None
         if route["profile"] == "github_research":
             artifact["route_evidence"]["schema"] = GITHUB_RESEARCH_EVIDENCE_SCHEMA
+            route_evidence_sha256 = _validate_github_research_route_evidence(evidence_dir)
+            artifact["route_evidence"]["sha256"] = route_evidence_sha256
 
         if gemini_hits > 0:
             artifact["status"] = "fail"
@@ -370,14 +498,67 @@ def run_route_live(
         elif not artifact["spawn"]["native_spawn_event_observed"]:
             artifact["status"] = "fail"
             artifact["failure_class"] = "spawn_not_observed"
+        elif request_validation != "pass":
+            artifact["status"] = "fail"
+            artifact["failure_class"] = "validation_failed"
+        elif selected_provider != "agy":
+            artifact["status"] = "fail"
+            artifact["failure_class"] = "provider_mismatch"
+        elif route["profile"] == "github_research" and route_evidence_sha256 is None:
+            artifact["status"] = "fail"
+            artifact["failure_class"] = "route_evidence_schema_mismatch"
+        elif not wrapper_ok:
+            artifact["status"] = "fail"
+            artifact["failure_class"] = "validation_failed"
         else:
             artifact["status"] = "pass"
             artifact["failure_class"] = None
-            artifact["request"]["validation"] = "pass"
-            artifact["provider_observation"]["selected_provider"] = "agy"
-            artifact["provider_observation"]["provider_attempts"] = ["agy"]
 
     return artifact
+
+
+def run_route_live(
+    route: dict[str, str],
+    *,
+    repo_root: Path,
+    worktree: Path,
+    output_root: Path,
+    timeout_seconds: int,
+) -> dict:
+    initial = _run_route_once(
+        route,
+        run_id=str(uuid.uuid4()),
+        repo_root=repo_root,
+        worktree=worktree,
+        output_root=output_root,
+        timeout_seconds=timeout_seconds,
+    )
+    if initial["status"] != "fail" or not _is_transient_infrastructure_candidate(
+        route, initial["failure_class"]
+    ):
+        return initial
+
+    # Issue #1886 P0-4: bounded single retry, ledgered (never a silent
+    # re-run). The FIRST artifact's own run_id/generated_at/etc are
+    # discarded in favor of the retry's own fresh artifact -- only the
+    # retry ledger below (initial_result/initial_failure_class/retry_count/
+    # retry_result/final_route_verdict) survives from the first attempt.
+    retry_artifact = _run_route_once(
+        route,
+        run_id=str(uuid.uuid4()),
+        repo_root=repo_root,
+        worktree=worktree,
+        output_root=output_root,
+        timeout_seconds=timeout_seconds,
+    )
+    retry_artifact["retry"] = {
+        "initial_result": initial["status"],
+        "initial_failure_class": initial["failure_class"],
+        "retry_count": 1,
+        "retry_result": retry_artifact["status"],
+        "final_route_verdict": retry_artifact["status"],
+    }
+    return retry_artifact
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -426,12 +607,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cannot create output directory {output_root}: {exc}", file=sys.stderr)
         return 1
 
+    # Issue #1886 P0-3 fix_delta (PR #2005 adversarial review): every
+    # artifact from a single producer invocation shares this batch_run_id
+    # so validate_agent_provider_route_smoke.py's close-gate can prove all
+    # required routes came from the SAME run (never a mix-and-match of
+    # artifacts from different invocations/heads).
+    batch_run_id = run_id
+
     artifacts: list[dict] = []
     for route in routes:
         if args.dry_run:
             artifact = {
                 "schema": SCHEMA,
                 "run_id": str(uuid.uuid4()),
+                "batch_run_id": batch_run_id,
                 "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "subject": compute_subject(route, repo_root),
                 "spawn": {
@@ -465,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_root=output_root,
                 timeout_seconds=args.timeout_seconds,
             )
+            artifact["batch_run_id"] = batch_run_id
         artifact_path = output_root / f"{_route_key(route).replace(':', '-')}.json"
         artifact_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         artifacts.append(artifact)
