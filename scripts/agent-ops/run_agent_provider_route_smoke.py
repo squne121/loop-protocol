@@ -191,6 +191,18 @@ def build_route_prompt(route: dict[str, str], evidence_dir: Path) -> str:
             f"artifact JSON you actually received (byte-for-byte, unmodified) to "
             f"`{route_evidence_path}`."
         )
+    # Issue #1886 P0-4 fix_delta (PR #2005 REQUEST_CHANGES): build_request.py
+    # --provider agy --profile local_asset_research fails closed
+    # (_validate_local_asset_context_files() in run_gemini_headless.py
+    # requires a non-empty context_files list) unless at least one
+    # --context-file is supplied. The prompt template omitted this flag
+    # entirely, so the real agent invocation could never build a valid
+    # request for this profile. README.md is a real, always-present repo
+    # file, used only to satisfy the "at least one context file" contract
+    # -- never a hand-typed placeholder path.
+    context_file_flag = ""
+    if profile == "local_asset_research":
+        context_file_flag = f" --context-file {REPO_ROOT / 'README.md'}"
     return (
         f"AGENT_PROVIDER_ROUTE_SMOKE probe (Issue #1886). Use the {agent} custom agent "
         f"(profile: {profile}) for the following bounded task, and report exactly which "
@@ -198,7 +210,7 @@ def build_route_prompt(route: dict[str, str], evidence_dir: Path) -> str:
         f"Task: build a delegation_request_v1 via "
         f"`uv run python3 {BUILD_REQUEST_SCRIPT} --provider agy --profile {profile} "
         f"--objective \"agent_provider_route_smoke probe\" --prompt \"Reply with the single "
-        f"word OK and do nothing else.\" --output {request_path}` "
+        f"word OK and do nothing else.\"{context_file_flag} --output {request_path}` "
         f"and then run it via `uv run python3 {RUN_GEMINI_HEADLESS_SCRIPT} "
         f"--request-file {request_path} --output-file {result_path}`. "
         f"Do not invoke a binary literally named `gemini`. Do not use WebSearch or WebFetch "
@@ -281,6 +293,14 @@ def _validate_delegation_request_evidence(evidence_dir: Path, route: dict[str, s
     agent built (via build_request.py --output) instead of stamping
     ``"pass"`` on harness exit 0 alone. Returns a value valid against the
     ``request.validation`` schema enum (``pass`` / ``fail`` / ``not_run``)."""
+    # Issue #1886 P0-1/P0-2 fix_delta (PR #2005 REQUEST_CHANGES): the real
+    # build_request.py --provider agy output key is "tool_profile" (see
+    # _build_agy_request() in
+    # .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py)
+    # -- there is no "profile" key in the actual delegation_request_v1
+    # payload. Reading "profile" made this check fail closed on every real
+    # route (a false-negative that the prior shadow-fixture tests never
+    # caught because they built fixtures with the same wrong key).
     payload = _read_json_file(evidence_dir / "delegation_request.json")
     if payload is None:
         return "not_run"
@@ -288,7 +308,7 @@ def _validate_delegation_request_evidence(evidence_dir: Path, route: dict[str, s
         return "fail"
     if payload.get("provider") != "agy":
         return "fail"
-    if payload.get("profile") != route["profile"]:
+    if payload.get("tool_profile") != route["profile"]:
         return "fail"
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
@@ -317,13 +337,30 @@ def _validate_delegation_result_evidence(evidence_dir: Path) -> tuple[str | None
     exit 0 alone. Returns ``(selected_provider, provider_attempts,
     wrapper_ok)``; all fail closed to ``None`` / ``[]`` / ``False`` when the
     result file is missing or malformed -- never guessed."""
+    # Issue #1886 P0-2/P0-3 fix_delta (PR #2005 REQUEST_CHANGES): a
+    # provider="agy" direct delegation_result/v1 (the only path this route
+    # smoke exercises -- Provider Policy forbids provider="auto") never has
+    # a "selected_provider" key at all: that key is only populated by
+    # _build_delegation_audit_record() for provider="auto" results (see
+    # the comment above its `if "selected_provider" in result` check in
+    # run_gemini_headless.py). The real "which provider actually ran"
+    # signal on a direct-agy result is the top-level "provider" key, always
+    # "agy" ok or not (see the three `_run_agy()` return dicts in
+    # run_gemini_headless.py, all of which set "provider": "agy"). Likewise
+    # "provider_attempts" is auto-dispatch-only; a direct-agy result has no
+    # such list, so it is synthesized here from the single real provider
+    # that was actually invoked -- never from a guessed/expected value.
     payload = _read_json_file(evidence_dir / "delegation_result.json")
     if not isinstance(payload, dict):
         return None, [], False
     selected_provider = payload.get("selected_provider")
     if not isinstance(selected_provider, str) or not selected_provider:
+        selected_provider = payload.get("provider")
+    if not isinstance(selected_provider, str) or not selected_provider:
         selected_provider = None
     provider_attempts = _observed_provider_attempts(payload.get("provider_attempts"))
+    if not provider_attempts and isinstance(payload.get("provider"), str) and payload["provider"]:
+        provider_attempts = [payload["provider"]]
     wrapper_ok = payload.get("ok") is True
     return selected_provider, provider_attempts, wrapper_ok
 

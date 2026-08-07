@@ -201,6 +201,20 @@ class TestProducer:
         assert str(tmp_path / "route_evidence.json") in prompt
         assert "agy_github_research_evidence/v1" in prompt
 
+    def test_build_route_prompt_local_asset_research_includes_context_file(self, producer, tmp_path):
+        """Issue #1886 P0-4 fix_delta (PR #2005 REQUEST_CHANGES): build_request.py
+        --provider agy --profile local_asset_research fails closed without at
+        least one --context-file (see
+        _validate_local_asset_context_files() in run_gemini_headless.py)."""
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
+        prompt = producer.build_route_prompt(route, tmp_path)
+        assert "--context-file" in prompt
+
+    def test_build_route_prompt_github_research_omits_context_file(self, producer, tmp_path):
+        route = producer._find_route("claude_code", "codebase-investigator", "github_research")
+        prompt = producer.build_route_prompt(route, tmp_path)
+        assert "--context-file" not in prompt
+
     def test_compute_subject_returns_expected_shape(self, producer):
         subject = producer.compute_subject(producer.REQUIRED_ROUTES[0], REPO_ROOT)
         assert subject["runtime"] == "claude_code"
@@ -318,7 +332,7 @@ class TestProducerRouteEvidenceValidation:
     def test_delegation_request_wrong_provider_fails(self, producer, tmp_path):
         route = producer.REQUIRED_ROUTES[0]
         (tmp_path / "delegation_request.json").write_text(
-            json.dumps({"provider": "gemini", "profile": route["profile"], "prompt": "x"}),
+            json.dumps({"provider": "gemini", "tool_profile": route["profile"], "prompt": "x"}),
             encoding="utf-8",
         )
         assert producer._validate_delegation_request_evidence(tmp_path, route) == "fail"
@@ -326,7 +340,7 @@ class TestProducerRouteEvidenceValidation:
     def test_delegation_request_with_model_fails(self, producer, tmp_path):
         route = producer.REQUIRED_ROUTES[0]
         (tmp_path / "delegation_request.json").write_text(
-            json.dumps({"provider": "agy", "profile": route["profile"], "prompt": "x", "model": "gpt-5"}),
+            json.dumps({"provider": "agy", "tool_profile": route["profile"], "prompt": "x", "model": "gpt-5"}),
             encoding="utf-8",
         )
         assert producer._validate_delegation_request_evidence(tmp_path, route) == "fail"
@@ -334,18 +348,36 @@ class TestProducerRouteEvidenceValidation:
     def test_delegation_request_empty_prompt_fails(self, producer, tmp_path):
         route = producer.REQUIRED_ROUTES[0]
         (tmp_path / "delegation_request.json").write_text(
-            json.dumps({"provider": "agy", "profile": route["profile"], "prompt": "   "}),
+            json.dumps({"provider": "agy", "tool_profile": route["profile"], "prompt": "   "}),
             encoding="utf-8",
         )
         assert producer._validate_delegation_request_evidence(tmp_path, route) == "fail"
 
     def test_delegation_request_valid_passes(self, producer, tmp_path):
+        """Fixture key MUST be "tool_profile" -- the real key
+        build_request.py --provider agy writes (_build_agy_request() in
+        build_request.py). Using "profile" here would silently pass a
+        fixture that no real build_request.py invocation could ever
+        produce (PR #2005 REQUEST_CHANGES: shadow-fixture regression)."""
+        route = producer.REQUIRED_ROUTES[0]
+        (tmp_path / "delegation_request.json").write_text(
+            json.dumps({"provider": "agy", "tool_profile": route["profile"], "prompt": "do the thing"}),
+            encoding="utf-8",
+        )
+        assert producer._validate_delegation_request_evidence(tmp_path, route) == "pass"
+
+    def test_delegation_request_old_wrong_profile_key_fails(self, producer, tmp_path):
+        """Regression guard (PR #2005 REQUEST_CHANGES P0-1): a payload using
+        the bugged/never-real "profile" key (instead of the real
+        "tool_profile" key) must fail -- it never matches
+        route["profile"] against the actual production field, and this
+        producer must not silently accept it as equivalent."""
         route = producer.REQUIRED_ROUTES[0]
         (tmp_path / "delegation_request.json").write_text(
             json.dumps({"provider": "agy", "profile": route["profile"], "prompt": "do the thing"}),
             encoding="utf-8",
         )
-        assert producer._validate_delegation_request_evidence(tmp_path, route) == "pass"
+        assert producer._validate_delegation_request_evidence(tmp_path, route) == "fail"
 
     def test_delegation_result_missing_yields_no_provider(self, producer, tmp_path):
         provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
@@ -353,7 +385,38 @@ class TestProducerRouteEvidenceValidation:
         assert attempts == []
         assert ok is False
 
-    def test_delegation_result_reads_actual_selected_provider(self, producer, tmp_path):
+    def test_delegation_result_reads_actual_provider_key(self, producer, tmp_path):
+        """A real provider="agy" delegation_result/v1 never has a
+        "selected_provider" or "provider_attempts" key (those are
+        provider="auto"-only fields written by
+        _build_delegation_audit_record() in run_gemini_headless.py); the
+        real single-provider signal is the top-level "provider" key on
+        every _run_agy() return dict. This is the fixture shape a live
+        route smoke run actually produces (PR #2005 REQUEST_CHANGES
+        regression: the prior fixture used the never-real
+        "selected_provider" key and could not have caught this)."""
+        (tmp_path / "delegation_result.json").write_text(
+            json.dumps({"ok": True, "provider": "agy", "tool_profile": "local_asset_research"}),
+            encoding="utf-8",
+        )
+        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        assert provider == "agy"
+        assert attempts == ["agy"]
+        assert ok is True
+
+    def test_delegation_result_wrapper_not_ok_is_recorded(self, producer, tmp_path):
+        (tmp_path / "delegation_result.json").write_text(
+            json.dumps({"ok": False, "provider": "agy", "failure_class": "agy_exit_nonzero"}),
+            encoding="utf-8",
+        )
+        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        assert ok is False
+
+    def test_delegation_result_auto_dispatch_shape_still_supported(self, producer, tmp_path):
+        """provider="auto" results (not currently exercised by this route
+        smoke, which always requests provider="agy" -- but the
+        selected_provider/provider_attempts fields are still a valid
+        result shape this producer must keep reading correctly)."""
         (tmp_path / "delegation_result.json").write_text(
             json.dumps(
                 {"ok": True, "selected_provider": "agy", "provider_attempts": [{"provider": "agy", "ok": True}]}
@@ -364,14 +427,6 @@ class TestProducerRouteEvidenceValidation:
         assert provider == "agy"
         assert attempts == ["agy"]
         assert ok is True
-
-    def test_delegation_result_wrapper_not_ok_is_recorded(self, producer, tmp_path):
-        (tmp_path / "delegation_result.json").write_text(
-            json.dumps({"ok": False, "selected_provider": None, "provider_attempts": []}),
-            encoding="utf-8",
-        )
-        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
-        assert ok is False
 
     def test_github_research_route_evidence_missing_is_none(self, producer, tmp_path):
         assert producer._validate_github_research_route_evidence(tmp_path) is None
