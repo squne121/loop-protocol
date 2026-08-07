@@ -148,7 +148,7 @@ wrapper は `context_files` を 1 件以上必須とするため、context フ�
 
 調査対象が見つからない場合は推測せず「見つからない」と明記する。
 
-## Graphify prefilter（任意）
+## Graphify prefilter（任意の事前絞り込み層）
 
 `local_asset_research` プロファイルの **前段** として、pinned Graphify CLI（`graphifyy==0.9.34`）を使った
 任意の候補絞り込み層を利用してよい。詳細な CLI 手順・subcommand・flag は
@@ -194,7 +194,7 @@ wrapper は `context_files` を 1 件以上必須とするため、context フ�
    - wrapper の `failure_reason` と `warnings`
    - `serena_mcp.ok` の真偽値と `recovery` フィールドの内容（存在する場合）
 
-## Result: CODEBASE_INVESTIGATION_RESULT_V1 (SubAgent-owned)
+## Result（調査結果契約）: CODEBASE_INVESTIGATION_RESULT_V1 (SubAgent-owned)
 
 本 SubAgent は、以下の機械可読契約を報告する。`evidence_refs` には #248 の `REPO_EVIDENCE_REF_V1` を必ず使用し、独自の evidence schema を定義してはならない。
 
@@ -210,11 +210,11 @@ CODEBASE_INVESTIGATION_RESULT_V1:
   failure_reason: <string | null>
 ```
 
-## Fact-check Contract (SubAgent-owned)
+## Fact-check Contract（事実確認契約）(SubAgent-owned)
 
 本 SubAgent は、`anchor_comment` の事実確認（fact-check）のリクエストを受け取り、検証結果を報告する。
 
-### Result: ANCHOR_COMMENT_FACT_CHECK_RESULT_V1
+### Result（事実確認結果）: ANCHOR_COMMENT_FACT_CHECK_RESULT_V1
 
 ```yaml
 ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
@@ -236,7 +236,7 @@ ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
 
 `kind: file` の `ref` は `REPO_EVIDENCE_REF_V1` を SSOT とする。
 
-## Evidence Handling Rule
+## Evidence Handling Rule（証跡取扱いルール）
 
 ### Cross-Link: REPO_EVIDENCE_REF_V1
 
