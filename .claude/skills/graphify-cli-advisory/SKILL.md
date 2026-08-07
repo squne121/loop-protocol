@@ -29,7 +29,7 @@ Gemini + Serena MCP read-only source readback）の **前段** に置く、任�
   で isolated tool env を使う。
 - `graphify --version` の readback を必ず結果に含める。
 
-## Allowlisted subcommand（`_ALLOWED_SUBCOMMANDS`）
+## Allowlisted subcommand（許可された subcommand、`_ALLOWED_SUBCOMMANDS`）
 
 ```
 graphify extract <path> --code-only --out tmp/graphify/<head-sha>/
@@ -45,7 +45,7 @@ MCP server 登録 / `.agents/mcp_config.json` への追加 / git hook / merge dr
 wrapper が起動前に拒否する。** `run_graphify_cli_advisory.py` の `_ALLOWED_SUBCOMMANDS` がこの allowlist の
 唯一の正本であり、`_FORBIDDEN_TOKENS` は防御的な検証・テスト用の参考リストにすぎない。
 
-## clean worktree gate
+## clean worktree gate（未追跡差分がない状態のみ許可する検証ゲート）
 
 Graphify graph の新規作成・利用は **clean worktree の場合だけ** 行う。dirty worktree
 （`git status --porcelain` が非空、またはその判定自体が失敗する場合を含む fail-closed）が検出された場合、
@@ -60,13 +60,13 @@ Graphify 出力は `tmp/graphify/<head-sha>/` 配下（未追跡領域、`docs/d
 場所に生成しない。wrapper は呼び出し元から出力先パスの override を受け付けず、`repo_root` と `head_sha`
 から常に自前で `tmp/graphify/<head-sha>/` を導出する（path escape 対策）。
 
-## query logging
+## query logging（クエリログ制御）
 
 query logging は既定 off。wrapper は `GRAPHIFY_QUERY_LOG_DISABLE=1` を常に設定し、
 `GRAPHIFY_QUERY_LOG_ENABLE` / `GRAPHIFY_QUERY_LOG` が inherited env に存在してもこれらを pop してから
 disable フラグを設定する（enable 系より disable が優先される upstream 仕様に対する防御的多重化）。
 
-## bounded budget
+## bounded budget（出力上限の制御）
 
 `graphify query` 実行時は必ず `--budget` を明示する（既定 500 token）。無制限出力を渡さない。
 
@@ -86,7 +86,7 @@ source confirmation）へ fallback する。Graphify の結果単独では findi
 - `RunnerFn` を injectable にしている（`runner: RunnerFn = _default_runner`）。テストは fake runner を
   注入し、PyPI／ネットワークに一切依存しない決定論的な検証を行う（`tests/test_run_graphify_cli_advisory.py`）。
 
-## Known Limitations
+## Known Limitations（既知の制約）
 
 - exact top-level version pin（`graphifyy==0.9.34`）は transitive dependency（`numpy` / `rapidfuzz` 等）
   全体の lock ではない。tool 専用 lock ファイルや required CI 化は本 skill の scope 外とし、後続判断に
