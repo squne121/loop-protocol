@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { resolveExpectedHeadSha } from './visual-utils'
 
 // ---------------------------------------------------------------------------
 // Real Chrome tab zoom harness (Issue #1956 fix 6)
@@ -356,17 +357,6 @@ async function collectEvidence(
   })
 }
 
-async function resolveHeadSha(): Promise<string> {
-  if (process.env.GITHUB_SHA) {
-    return process.env.GITHUB_SHA
-  }
-  try {
-    const { execSync } = await import('node:child_process')
-    return execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim()
-  } catch {
-    return 'unknown-head-sha'
-  }
-}
 
 /**
  * Relative fractional offset for the "epsilon-inside" corner points below
@@ -574,44 +564,160 @@ function frozenGameplayState(state: LoopE2EState): FrozenGameplayState {
   }
 }
 
-test('assist-player-affordance routes through DOM activation and KeyZ', async ({
+// ---------------------------------------------------------------------------
+// Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 2): real
+// Playwright keyboard-navigation helpers -- never `.focus()` injection.
+// `.focus()` calls the DOM focus() method directly, bypassing the browser's
+// actual Tab-order traversal entirely (a hidden/unreachable element could
+// still be "focused" this way); real `Tab`/`Shift+Tab` key presses exercise
+// the same tab-order pipeline a real keyboard user depends on.
+// ---------------------------------------------------------------------------
+
+/**
+ * Presses real `Tab` (or `Shift+Tab` when `shift` is true) from the CURRENT
+ * focus position until `document.activeElement` matches `locator`'s
+ * element, or `maxPresses` is exceeded (fails the test). Returns the number
+ * of presses actually used, so callers can assert forward/backward DOM
+ * order relationships (e.g. "Assist is reached in fewer presses than
+ * Pause" proves Assist precedes Pause in tab order).
+ */
+async function tabToLocator(
+  page: Page,
+  locator: ReturnType<Page['locator']>,
+  opts: { shift?: boolean; maxPresses?: number; label: string },
+): Promise<number> {
+  const maxPresses = opts.maxPresses ?? 25
+  const key = opts.shift ? 'Shift+Tab' : 'Tab'
+  for (let presses = 1; presses <= maxPresses; presses += 1) {
+    await page.keyboard.press(key)
+    const isFocused = await locator.evaluate((el) => document.activeElement === el).catch(() => false)
+    if (isFocused) {
+      return presses
+    }
+  }
+  throw new Error(`${opts.label}: real ${key} navigation did not reach the target within ${maxPresses} presses`)
+}
+
+/**
+ * A focused element must have a REAL, visible focus indicator (AC5/AC6):
+ * either a non-`none` CSS `outline`/`outlineStyle`, or a `box-shadow`
+ * distinct from the element's own resting-state box-shadow. Also asserts
+ * the element's bounding box is non-empty -- a zero-size focused element
+ * would trivially "have no visible focus ring" by construction.
+ * Deliberately does NOT call `scrollIntoViewIfNeeded()` first (Issue #1958
+ * fix_delta iteration 3, blocker 2): auto-scrolling before reading geometry
+ * would hide a genuine off-screen-focus placement bug instead of catching
+ * it.
+ */
+async function assertFocusIndicatorVisible(
+  locator: ReturnType<Page['locator']>,
+  label: string,
+): Promise<void> {
+  const style = await locator.evaluate((el) => {
+    const computed = getComputedStyle(el)
+    return {
+      outlineStyle: computed.outlineStyle,
+      outlineWidth: computed.outlineWidth,
+      boxShadow: computed.boxShadow,
+    }
+  })
+  const hasOutline = style.outlineStyle !== 'none' && style.outlineWidth !== '0px'
+  const hasBoxShadow = style.boxShadow !== 'none' && style.boxShadow !== ''
+  expect(
+    hasOutline || hasBoxShadow,
+    `${label}: focused control must have a visible focus indicator (outline or box-shadow), got ${JSON.stringify(style)}`,
+  ).toBe(true)
+  const box = await locator.boundingBox()
+  expect(box, `${label}: focused control must have a bounding box`).not.toBeNull()
+  if (box) {
+    expect(box.width, `${label}: focused control must have non-zero width`).toBeGreaterThan(0)
+    expect(box.height, `${label}: focused control must have non-zero height`).toBeGreaterThan(0)
+  }
+}
+
+test('assist-player-affordance routes through a real pointer click and KeyZ', async ({
   page,
 }, testInfo) => {
   await page.setViewportSize({ width: 1280, height: 720 })
-  await page.goto('/?playtest_evidence=1')
+  // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 2): this
+  // interaction test no longer opts into the `?playtest_evidence=1` debug
+  // panel (`src/ui/playtestEvidence.ts`) -- that panel is entirely opt-in
+  // and this test never reads it, so navigating without it removes the
+  // panel's real screen-space overlap with the combat HUD instead of
+  // routing around the overlap with a programmatic `.evaluate(...click())`
+  // bypass. `getByRole(...).click()` below is a genuine Playwright
+  // actionability-checked pointer click (visible/stable/enabled/receives-
+  // events), the same pipeline `tests/e2e/m2-combat-mvp.spec.ts`'s AC5
+  // pointerdown tests exercise for direct Canvas hit-testing.
+  await page.goto('/')
   await waitForRunningWithCombatActors(page)
 
-  const assistButton = page.locator('[data-action="assist-player"]')
+  const assistButton = page.getByRole('button', { name: 'Assist allies' })
   const assistStatus = page.locator('[data-field="combat-hud-assist-status"]')
 
   await expect(assistButton).toBeVisible()
   await expect(assistButton).toBeEnabled()
   await expect(assistStatus).toHaveText('Assist ready.')
 
-  // Scope Delta (Issue #1375): the combat HUD's compact new layout
-  // (`data-combat-hud`, fewer stacked `.panel` sections than the pre-#1375
-  // HUD) sits higher on screen, now underneath the top-right
-  // `?playtest_evidence=1` debug panel's covered region at this viewport
-  // (`click({ force: true })` still hit-tests at the element's real screen
-  // coordinates and would land on that unrelated dev-only overlay instead).
-  // This test validates DOM-click -> command-intent routing, not manual
-  // pointer hit-testing (covered separately by
-  // `tests/e2e/m2-combat-mvp.spec.ts`'s AC5 pointerdown tests), so it
-  // invokes the button's own `click()` method directly instead.
-  await assistButton.evaluate((button) => (button as HTMLButtonElement).click())
+  // Real pointer click (Issue #1958 AC5): genuine actionability-checked
+  // click, not a programmatic `element.click()` DOM method call.
+  //
+  // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 2)
+  // follow-up finding: `commandIntentRuntime.activeIntent` is a
+  // DELIBERATELY short-lived, one-shot transient (`assistPlayerTtlTicks`,
+  // `src/state/GameState.ts` -- 133ms TTL by production default) --
+  // production/gameplay behavior, out of this Issue's Allowed Paths and not
+  // something this test changes. A real Playwright `.click()`'s
+  // actionability wait (visible/stable/receives-events) pushes the actual
+  // event dispatch later than a synthetic same-microtask `.evaluate(...
+  // click())` call, and the observable `assist_player` window empirically
+  // opens ~10-40ms AFTER `.click()` resolves and lasts only ~20-30ms
+  // (measured via a 5ms-interval sampling probe against this exact spec
+  // during investigation) before the buffered intent's TTL lapses and
+  // `activeIntent` permanently reverts to `'none'` -- it is a genuine
+  // one-shot transition, not a value that can be re-observed later. A
+  // `expect.poll` with a 50ms interval can systematically straddle and
+  // miss a ~30ms window that opens at +10ms to +40ms (poll samples land at
+  // ~0ms and ~50ms, both outside the window) -- this is exactly what was
+  // observed empirically (100% reproducible miss with a 50ms interval,
+  // reliably caught with a 10ms interval). A short, dense poll interval is
+  // therefore required to reliably OBSERVE this real (not fabricated)
+  // transient state, not a retry-driven `toPass()` (repeated re-clicks
+  // would each restart their own one-shot window and do not help close a
+  // single-click observation gap).
+  await assistButton.click()
+  // Reads command-intent state AND the rendered status copy in the SAME
+  // `page.evaluate()` round trip (an atomic snapshot of both), rather than
+  // two separate assertions -- the DOM text is a pure render of the same
+  // transient state, so checking it via a second, separately-timed
+  // assertion after the state poll succeeds would reopen the exact same
+  // race window this fix addresses.
   await expect
     .poll(async () => {
-      const state = await getGameState(page)
-      return {
-        activeIntent: state.commandIntent.activeIntent,
-        hasAssignedTarget: state.allies.some((ally) => ally.targetEntityId !== null),
-      }
-    }, { timeout: 5_000, intervals: [50] })
+      const snapshot = await page.evaluate(() => {
+        const hook = (
+          window as Window & {
+            __LOOP_E2E__?: { getState: () => LoopE2EState }
+          }
+        ).__LOOP_E2E__
+        if (!hook) {
+          throw new Error('__LOOP_E2E__ hook not found. Was the app built with VITE_E2E_MODE=true?')
+        }
+        const state = hook.getState()
+        const statusEl = document.querySelector('[data-field="combat-hud-assist-status"]')
+        return {
+          activeIntent: state.commandIntent.activeIntent,
+          hasAssignedTarget: state.allies.some((ally) => ally.targetEntityId !== null),
+          statusText: statusEl?.textContent ?? null,
+        }
+      })
+      return snapshot
+    }, { timeout: 2_000, intervals: [10] })
     .toEqual({
       activeIntent: 'assist_player',
       hasAssignedTarget: true,
+      statusText: 'Allies covering you.',
     })
-  await expect(assistStatus).toHaveText('Allies covering you.')
 
   await page.keyboard.press('KeyZ')
   await expect
@@ -627,12 +733,83 @@ test('assist-player-affordance routes through DOM activation and KeyZ', async ({
   })
 })
 
+test('Assist and Pause are reachable via real Tab/Shift+Tab order, activate on Enter and Space, and keep a visible focus indicator', async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 1280, height: 720 })
+  await page.goto('/')
+  await waitForRunningWithCombatActors(page)
+
+  const assistButton = page.getByRole('button', { name: 'Assist allies' })
+    const pauseButton = page.getByRole('button', { name: 'Pause' })
+    const resumeButton = page.locator('[data-action="resume"]')
+    const assistStatus = page.locator('[data-field="combat-hud-assist-status"]')
+
+    // Start from a known, non-focused baseline (a real pointer click on an
+    // empty area, not a synthetic focus() call).
+    await page.locator('body').click({ position: { x: 1, y: 1 } })
+
+    // Real forward Tab order: Assist must be reached before Pause (matches
+    // the DOM order in `COMBAT_HUD_MARKUP`, `src/ui/combatHud.ts`: the
+    // Assist button precedes the Pause button).
+    const assistPresses = await tabToLocator(page, assistButton, { label: 'Assist allies (forward Tab)' })
+    expect(assistPresses, 'Assist allies must be reachable via real forward Tab navigation').toBeGreaterThan(0)
+    await assertFocusIndicatorVisible(assistButton, 'Assist allies (forward Tab)')
+
+    const pausePresses = await tabToLocator(page, pauseButton, { label: 'Pause (forward Tab, continuing from Assist)' })
+    expect(
+      pausePresses,
+      'Pause must be reached strictly after Assist in forward Tab order (DOM order)',
+    ).toBeGreaterThan(0)
+    await assertFocusIndicatorVisible(pauseButton, 'Pause (forward Tab)')
+
+    // Real backward Shift+Tab order: from Pause, Shift+Tab must reach
+    // Assist again (reverse of the forward order just proven above).
+    const assistBackwardPresses = await tabToLocator(page, assistButton, {
+      shift: true,
+      label: 'Assist allies (backward Shift+Tab from Pause)',
+    })
+    expect(assistBackwardPresses).toBeGreaterThan(0)
+    await assertFocusIndicatorVisible(assistButton, 'Assist allies (backward Shift+Tab)')
+
+    // Enter activates Assist (real keyboard activation on the focused
+    // native <button>, not a programmatic click()).
+    await expect(assistButton).toBeFocused()
+    await page.keyboard.press('Enter')
+    await expect
+      .poll(async () => (await getGameState(page)).commandIntent.activeIntent, { timeout: 5_000, intervals: [50] })
+      .toBe('assist_player')
+    await expect(assistStatus).toHaveText('Allies covering you.')
+
+    // Space activates Pause (real keyboard activation) -- exercised
+    // separately from Enter (AC5 requires both).
+    await tabToLocator(page, pauseButton, { label: 'Pause (forward Tab, for Space activation)' })
+    await expect(pauseButton).toBeFocused()
+    await page.keyboard.press('Space')
+    await expect(resumeButton).toBeVisible()
+    // Pausing makes the combat HUD `inert` (Issue #1376 AC4: it drops out of
+    // the accessibility tree/tab order behind the pause dialog), so an
+    // accessible-name-based `getByRole` query on the (now inert) Pause
+    // button spuriously reports "not found" here -- the same reason
+    // `tests/e2e/hud-hull-overflow.spec.ts`'s 375x667 dual-fixture test uses
+    // the `[data-action]` CSS selector instead of `getByRole` after
+    // pausing.
+    await expect(page.locator('[data-action="toggle-pause"]')).toHaveAttribute('aria-pressed', 'true')
+    await page.keyboard.press('Escape')
+    await expect(resumeButton).toBeHidden()
+
+  await page.screenshot({
+    path: testInfo.outputPath('assist-pause-keyboard-activation.png'),
+    fullPage: true,
+  })
+})
+
 // eslint-disable-next-line no-empty-pattern -- Playwright requires the first arg to be a (possibly empty) fixtures destructure.
 test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x1080, 1437x1365, 375x667 and 100%, 125%, 150%, 200%', async ({}, testInfo) => {
   test.setTimeout(240_000)
 
   const evidence: EvidenceEntry[] = []
-  const headSha = await resolveHeadSha()
+  const headSha = resolveExpectedHeadSha()
   const osRunner = `${os.platform()} ${os.release()} ${os.arch()}`
 
   // Real Chrome tab zoom harness (Issue #1956 fix 6): one persistent
@@ -671,9 +848,12 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
         await expect(assistStatus).toHaveAttribute('aria-live', 'polite')
         await expect(assistStatus).toHaveAttribute('aria-atomic', 'true')
 
-        await assistButton.scrollIntoViewIfNeeded()
-        await assistStatus.scrollIntoViewIfNeeded()
-
+        // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 2):
+        // deliberately no `scrollIntoViewIfNeeded()` before reading
+        // geometry below -- auto-scrolling first would make the
+        // "bounding box is within the viewport" assertions below
+        // near-vacuous (a genuine off-screen placement bug would be
+        // silently scrolled away instead of caught).
         const buttonBox = await assistButton.boundingBox()
         const statusBox = await assistStatus.boundingBox()
         expect(buttonBox).not.toBeNull()
@@ -687,9 +867,27 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
         expect(buttonBox!.y + buttonBox!.height).toBeLessThanOrEqual(scenario.viewport.height)
         expect(statusBox!.y + statusBox!.height).toBeLessThanOrEqual(scenario.viewport.height)
 
-        await assistButton.focus()
+        // Real Tab navigation (Issue #1958 fix_delta iteration 3, blocker 2):
+        // never `.focus()` injection -- click an empty area first to
+        // establish a known, non-focused baseline, then walk real Tab
+        // presses to reach Assist. Deliberately does NOT press Enter/Space
+        // here (unlike the dedicated activation test above): this matrix
+        // reuses the SAME page/game-session across every zoom cell for a
+        // given viewport (see the outer `for (const [, scenarios] of
+        // viewportGroups)` loop), so activating Assist here would leak
+        // command-intent state into the next cell's `assistStatus` check.
+        // Full click/Enter/Space activation semantics are covered once,
+        // deterministically, by the dedicated test above.
+        await page.locator('body').click({ position: { x: 1, y: 1 } })
+        await tabToLocator(page, assistButton, {
+          label: `Assist allies (real Tab, ${scenario.viewport.label} ${scenario.zoom.label})`,
+        })
         await expect(assistButton).toBeFocused()
         await expect(assistStatus).toHaveText('Assist ready.')
+        await assertFocusIndicatorVisible(
+          assistButton,
+          `Assist allies (${scenario.viewport.label} ${scenario.zoom.label})`,
+        )
 
         const screenshotPath = testInfo.outputPath(
           `assist-player-affordance-${scenario.viewport.label}-${scenario.zoom.label.replace('%', 'pct')}.png`,
@@ -776,7 +974,10 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
         // state and should instead run through the SCENARIOS/Assist path).
         await expect(page.locator('[data-hud-zone="edge-control"]')).toBeHidden()
 
-        await pauseButton.scrollIntoViewIfNeeded()
+        // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 2):
+        // deliberately no `scrollIntoViewIfNeeded()` before reading
+        // geometry below -- see the equivalent comment in the Assist
+        // matrix above.
         const buttonBox = await pauseButton.boundingBox()
         expect(buttonBox).not.toBeNull()
         expect(buttonBox!.x).toBeGreaterThanOrEqual(0)
@@ -784,8 +985,19 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
         expect(buttonBox!.x + buttonBox!.width).toBeLessThanOrEqual(scenario.viewport.width)
         expect(buttonBox!.y + buttonBox!.height).toBeLessThanOrEqual(scenario.viewport.height)
 
-        await pauseButton.focus()
+        // Real Tab navigation (Issue #1958 fix_delta iteration 3, blocker 2):
+        // never `.focus()` injection. Deliberately does NOT press
+        // Enter/Space here for the same same-page-reused-across-cells
+        // reason documented in the Assist matrix above (pausing would leak
+        // paused state into the next zoom cell) -- full activation
+        // semantics are covered once, deterministically, by the dedicated
+        // activation test above.
+        await page.locator('body').click({ position: { x: 1, y: 1 } })
+        await tabToLocator(page, pauseButton, {
+          label: `Pause (real Tab, ${scenario.viewport.label} ${scenario.zoom.label})`,
+        })
         await expect(pauseButton).toBeFocused()
+        await assertFocusIndicatorVisible(pauseButton, `Pause (${scenario.viewport.label} ${scenario.zoom.label})`)
 
         const screenshotPath = testInfo.outputPath(
           `assist-player-affordance-${scenario.viewport.label}-${scenario.zoom.label.replace('%', 'pct')}-pause.png`,
@@ -826,6 +1038,13 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
     }
   }
 
+  // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 4): every
+  // recorded evidence entry's head_sha must exactly equal the CI-provided
+  // EXPECTED_PR_HEAD_SHA (never merely "was captured/non-empty").
+  for (const entry of evidence) {
+    expect(entry.head_sha, `evidence head_sha must exactly equal EXPECTED_PR_HEAD_SHA`).toBe(headSha)
+  }
+
   const evidencePath = testInfo.outputPath('assist-player-affordance-evidence.json')
   await writeFile(
     evidencePath,
@@ -844,7 +1063,7 @@ test('assist-player-affordance runtime evidence covers 1280x720, 1366x768, 1920x
 test('responsive canvas preserves the logical arena, frozen combat positions, backing store, and pointer mapping across viewport, DPR, and zoom', async ({}, testInfo) => {
   test.setTimeout(300_000)
   const evidence: Array<EvidenceEntry & { declared_dpr: number }> = []
-  const headSha = await resolveHeadSha()
+  const headSha = resolveExpectedHeadSha()
   const osRunner = `${os.platform()} ${os.release()} ${os.arch()}`
 
   for (const dpr of RESPONSIVE_DPRS) {
@@ -1043,6 +1262,13 @@ test('responsive canvas preserves the logical arena, frozen combat positions, ba
     } finally {
       await zoomCtx.close()
     }
+  }
+
+  // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 4): every
+  // recorded evidence entry's head_sha must exactly equal the CI-provided
+  // EXPECTED_PR_HEAD_SHA.
+  for (const entry of evidence) {
+    expect(entry.head_sha, `evidence head_sha must exactly equal EXPECTED_PR_HEAD_SHA`).toBe(headSha)
   }
 
   await writeFile(

@@ -14,23 +14,22 @@
  *   and app-shell bounding rect stays within viewport bounds (AC2c)
  */
 
-import { execSync } from 'node:child_process'
 import { test, expect, type Page } from '@playwright/test'
+import { resolveExpectedHeadSha } from './visual-utils'
 
 /**
- * Issue #1958 fix_delta iteration 2 item 6 (PR #2006 review, owner decision
- * comment https://github.com/squne121/loop-protocol/issues/1958#issuecomment-5205380696):
- * captures the actual git HEAD SHA at test-run time for evidence recording
- * (item 3's "recorded viewport/DPR/zoom/userAgent/head SHA"). Falls back to
- * `unknown` rather than throwing if `git` is unavailable in the runner
- * (never lets diagnostic capture fail the actual assertion under test).
+ * Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 4): captures
+ * the expected head SHA at test-run time for evidence recording (item 3's
+ * "recorded viewport/DPR/zoom/userAgent/head SHA"). Delegates to
+ * `resolveExpectedHeadSha()` (`tests/e2e/visual-utils.ts`), which requires
+ * the CI-provided `EXPECTED_PR_HEAD_SHA` env var to be a valid 40-hex
+ * commit SHA and THROWS if it is missing/invalid -- an earlier version of
+ * this function silently fell back to the literal string `'unknown'`,
+ * which then passed the evidence assertion below (`not.toBe('')`) despite
+ * recording no real provenance at all.
  */
 function currentHeadSha(): string {
-  try {
-    return execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim()
-  } catch {
-    return 'unknown'
-  }
+  return resolveExpectedHeadSha()
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +279,12 @@ async function assertNoProtectedZoneIntersection(
       continue
     }
     const zoneBox = await zone.boundingBox()
+    // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 3): a null
+    // boundingBox() for a zone that `isVisible()` reported as visible must
+    // FAIL the assertion, never silently `continue` past it -- a visible
+    // element with no box is itself a bug (e.g. zero-size layout), not a
+    // benign "not currently rendered" case.
+    expect(zoneBox, `${label}: HUD zone "${selector}" is visible but boundingBox() is null`).not.toBeNull()
     if (!zoneBox) {
       continue
     }
@@ -322,93 +327,144 @@ async function assertSemanticPlacement(
     `${label}: canvas=${JSON.stringify(canvasBox)} safeZone=${JSON.stringify(safeZone)} ` +
     `fragment=${JSON.stringify(fragmentBox)} margin=${margin} epsilon=${epsilon}`
 
-  // elapsed: top-center-low-prominence -- horizontally centered in the safe
-  // zone, vertically in the top region. Read first: "the Canvas lower
-  // region" for status/pause below is defined RELATIVE to elapsed's row
-  // (matches the semantic table's actual collapse-priority/row ordering:
-  // `'elapsed elapsed' / 'status pause'`), not an absolute canvas-height
-  // midpoint -- `.combat-hud` is deliberately content-sized and anchored to
-  // the TOP of the safe zone at every viewport (never stretched to the
-  // canvas's full height, see the doc comment on `.combat-hud` in
-  // `src/style.css`), so on tall desktop canvases (e.g. 1920x1080,
-  // 1437x1365) the whole compact cluster legitimately sits well above the
-  // canvas's true vertical midpoint while still being correctly "below
-  // elapsed" -- an absolute-midpoint check would be a false positive there.
-  const elapsedZone = page.locator('[data-hud-zone="elapsed"]')
-  const elapsedVisible = await elapsedZone.isVisible()
-  let elapsedBox: Rect | null = null
-  if (elapsedVisible) {
-    elapsedBox = await elapsedZone.boundingBox()
-    if (elapsedBox) {
-      const elapsedCenterX = elapsedBox.x + elapsedBox.width / 2
-      const safeZoneCenterX = safeZone.x + safeZone.width / 2
-      expect(
-        Math.abs(elapsedCenterX - safeZoneCenterX),
-        `${diag(elapsedBox)}: elapsed zone is horizontally centered in the safe zone`,
-      ).toBeLessThanOrEqual(safeZone.width * 0.15 + epsilon)
-      expect(
-        elapsedBox.y,
-        `${diag(elapsedBox)}: elapsed zone is in the Canvas top region (above safe-zone vertical midpoint)`,
-      ).toBeLessThan(safeZone.y + safeZone.height / 2)
+  // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 3): "lower
+  // region" / "top region" are now EXPLICIT normalized thresholds against
+  // the safe zone's height (canvas-normalized, not sibling-relative), not a
+  // same-row/one-pixel-below-elapsed heuristic. Empirically measured across
+  // every GEOMETRY_VIEWPORTS/DPR cell in the current production layout
+  // (`node measure_geometry.cjs` against the real built app, Issue #1958
+  // fix_delta iteration 3 evidence): elapsed's vertical center never exceeds
+  // ~3.6% of the safe-zone height from its top, while status/pause's
+  // vertical center never falls below ~20.5% (1920x1080, the tallest
+  // canvas, where `.combat-hud` legitimately sits closest to the top since
+  // it is content-sized and anchored to the safe zone's top -- see the doc
+  // comment on `.combat-hud` in `src/style.css`). 0.12 / 0.15 keep a
+  // deliberate buffer on both sides of that measured gap so this remains a
+  // real, meaningful separation rather than either an unreachable
+  // majority-of-canvas-height bar or a trivial one-pixel check.
+  const TOP_REGION_MAX_CENTER_Y_FRACTION = 0.12
+  const LOWER_REGION_MIN_CENTER_Y_FRACTION = 0.15
+  // edge-control / pause's right edge anchors flush against the safe zone's
+  // right edge in the current layout (measured fraction 1.0 at every
+  // matrix cell) -- 0.75 ("right quarter") is a real, materially tighter
+  // bound than "past the midpoint" while keeping headroom for legitimate
+  // sub-pixel/rendering drift.
+  const RIGHT_EDGE_REGION_MIN_X_FRACTION = 0.75
+  // status's left edge anchors flush against the safe zone's left edge
+  // (measured fraction 0.0 at every matrix cell); allow a small band for
+  // rendering drift, never "no upper bound at all".
+  const LEFT_EDGE_MAX_X_FRACTION = 0.1
+
+  /**
+   * Requires `locator` to be visible AND have a non-null boundingBox()
+   * (Issue #1958 fix_delta iteration 3, blocker 3: a null box for a visible
+   * element must fail, never be silently skipped), then independently
+   * asserts that box satisfies the 16px inner safe-margin containment
+   * (AC3) against the real Canvas rect -- never the transparent
+   * `[data-combat-hud]` root as a stand-in for an individual fragment.
+   */
+  async function requireVisibleBoxWithinSafeMargin(
+    locator: ReturnType<Page['locator']>,
+    fragmentLabel: string,
+  ): Promise<Rect> {
+    await expect(locator, `${label}: ${fragmentLabel} must be visible`).toBeVisible()
+    const box = await locator.boundingBox()
+    expect(box, `${label}: ${fragmentLabel} is visible but boundingBox() is null`).not.toBeNull()
+    if (!box) {
+      throw new Error(`${label}: ${fragmentLabel} boundingBox() is null`)
     }
+    assertWithinSafeMargin(box, canvasBox, margin, `${label} ${fragmentLabel}-in-canvas`)
+    return box
   }
-  const lowerRegionThreshold = elapsedBox ? elapsedBox.y + elapsedBox.height : safeZone.y
+
+  // elapsed: top-center-low-prominence -- horizontally centered in the safe
+  // zone, vertical center within the Canvas TOP region.
+  const elapsedBox = await requireVisibleBoxWithinSafeMargin(
+    page.locator('[data-hud-zone="elapsed"]'),
+    'elapsed zone',
+  )
+  const elapsedCenterX = elapsedBox.x + elapsedBox.width / 2
+  const elapsedCenterY = elapsedBox.y + elapsedBox.height / 2
+  const safeZoneCenterX = safeZone.x + safeZone.width / 2
+  expect(
+    Math.abs(elapsedCenterX - safeZoneCenterX),
+    `${diag(elapsedBox)}: elapsed zone is horizontally centered in the safe zone`,
+  ).toBeLessThanOrEqual(safeZone.width * 0.15 + epsilon)
+  expect(
+    elapsedCenterY,
+    `${diag(elapsedBox)}: elapsed zone center is in the Canvas TOP region ` +
+      `(<= ${TOP_REGION_MAX_CENTER_Y_FRACTION * 100}% of safe-zone height from its top)`,
+  ).toBeLessThanOrEqual(safeZone.y + safeZone.height * TOP_REGION_MAX_CENTER_Y_FRACTION + epsilon)
 
   // status zone (Hull/critical/Kills): anchors to the Canvas inner-safe LEFT
-  // edge, and to the Canvas LOWER region (below the top-center elapsed row).
-  const statusZone = page.locator('[data-hud-zone="status"]')
-  await expect(statusZone).toBeVisible()
-  const statusBox = await statusZone.boundingBox()
-  expect(statusBox, `${label}: status zone must have a bounding box`).not.toBeNull()
-  if (statusBox) {
-    expect(statusBox.x, `${diag(statusBox)}: status zone left edge anchors the safe-zone left edge`).toBeLessThanOrEqual(
-      safeZone.x + margin + epsilon,
-    )
-    expect(
-      statusBox.y,
-      `${diag(statusBox)}: status zone top edge is in the Canvas lower region (below the top-center elapsed row)`,
-    ).toBeGreaterThanOrEqual(lowerRegionThreshold - epsilon)
+  // edge, and its vertical center is in the Canvas LOWER region.
+  const statusBox = await requireVisibleBoxWithinSafeMargin(page.locator('[data-hud-zone="status"]'), 'status zone')
+  const statusCenterY = statusBox.y + statusBox.height / 2
+  expect(
+    statusBox.x,
+    `${diag(statusBox)}: status zone left edge anchors the safe-zone left edge`,
+  ).toBeGreaterThanOrEqual(safeZone.x - epsilon)
+  expect(
+    statusBox.x,
+    `${diag(statusBox)}: status zone left edge anchors the safe-zone left edge`,
+  ).toBeLessThanOrEqual(safeZone.x + safeZone.width * LEFT_EDGE_MAX_X_FRACTION + epsilon)
+  expect(
+    statusCenterY,
+    `${diag(statusBox)}: status zone center is in the Canvas LOWER region ` +
+      `(>= ${LOWER_REGION_MIN_CENTER_Y_FRACTION * 100}% of safe-zone height from its top)`,
+  ).toBeGreaterThanOrEqual(safeZone.y + safeZone.height * LOWER_REGION_MIN_CENTER_Y_FRACTION - epsilon)
+
+  // critical warning fragment (when shown, AC6): checked independently as
+  // its own visible opaque fragment, in addition to the status card box.
+  const criticalField = page.locator('[data-field="combat-hud-critical"]')
+  if (await criticalField.isVisible()) {
+    await requireVisibleBoxWithinSafeMargin(criticalField, 'critical warning fragment')
   }
 
-  // edge-control (Weapon/Assist): when visible, anchors to an edge region
-  // (right half of the safe zone) -- never the center/left.
-  const edgeZone = page.locator('[data-hud-zone="edge-control"]')
-  const edgeVisible = await edgeZone.isVisible()
+  // edge-control (Weapon/Assist): when visible, anchors NEAR the safe zone's
+  // right edge (right quarter) -- never merely past the midpoint.
+  const edgeVisible = await page.locator('[data-hud-zone="edge-control"]').isVisible()
   expect(edgeVisible, `${label}: edge-control visibility must match the expected collapse state`).toBe(
     opts.edgeControlExpectedVisible,
   )
   if (edgeVisible) {
-    const edgeBox = await edgeZone.boundingBox()
-    if (edgeBox) {
-      expect(
-        edgeBox.x + edgeBox.width,
-        `${diag(edgeBox)}: edge-control zone right edge anchors the safe-zone right edge (its own declared edge region)`,
-      ).toBeGreaterThan(safeZone.x + safeZone.width / 2)
+    const edgeBox = await requireVisibleBoxWithinSafeMargin(
+      page.locator('[data-hud-zone="edge-control"]'),
+      'edge-control zone',
+    )
+    expect(
+      edgeBox.x + edgeBox.width,
+      `${diag(edgeBox)}: edge-control zone right edge is near the safe-zone right edge (right quarter)`,
+    ).toBeGreaterThanOrEqual(safeZone.x + safeZone.width * RIGHT_EDGE_REGION_MIN_X_FRACTION - epsilon)
+
+    // Assist button itself (AC5/AC7): its own bounding box, independently
+    // of the edge-control card that contains it.
+    const assistButton = page.getByRole('button', { name: 'Assist allies' })
+    if (await assistButton.isVisible()) {
+      await requireVisibleBoxWithinSafeMargin(assistButton, 'Assist allies button')
     }
   }
 
-  // pause: separate-pause-control, its own declared edge region (right
-  // side), Canvas lower region (below the top-center elapsed row) -- and
-  // never overlapping the status zone (AC1: "Pause remains a separate
-  // focusable/pointer-operable control").
-  const pauseZone = page.locator('[data-hud-zone="pause"]')
-  await expect(pauseZone).toBeVisible()
-  const pauseBox = await pauseZone.boundingBox()
-  expect(pauseBox, `${label}: pause zone must have a bounding box`).not.toBeNull()
-  if (pauseBox && statusBox) {
-    expect(
-      pauseBox.x + pauseBox.width,
-      `${diag(pauseBox)}: pause zone right edge anchors the safe-zone right edge (its own declared edge region)`,
-    ).toBeGreaterThan(safeZone.x + safeZone.width / 2)
-    expect(
-      pauseBox.y,
-      `${diag(pauseBox)}: pause zone top edge is in the Canvas lower region (below the top-center elapsed row)`,
-    ).toBeGreaterThanOrEqual(lowerRegionThreshold - epsilon)
-    expect(
-      rectsIntersect(pauseBox, statusBox),
-      `${label}: pause zone ${JSON.stringify(pauseBox)} must never overlap the status zone ${JSON.stringify(statusBox)} (separate control, not a status-card member)`,
-    ).toBe(false)
-  }
+  // pause: separate-pause-control, near the safe zone's right edge, its
+  // vertical center is in the Canvas LOWER region, and it never overlaps
+  // the status zone (AC1: "Pause remains a separate focusable/pointer-
+  // operable control").
+  const pauseButton = page.getByRole('button', { name: 'Pause' })
+  const pauseBox = await requireVisibleBoxWithinSafeMargin(pauseButton, 'Pause button')
+  const pauseCenterY = pauseBox.y + pauseBox.height / 2
+  expect(
+    pauseBox.x + pauseBox.width,
+    `${diag(pauseBox)}: pause button right edge is near the safe-zone right edge (right quarter)`,
+  ).toBeGreaterThanOrEqual(safeZone.x + safeZone.width * RIGHT_EDGE_REGION_MIN_X_FRACTION - epsilon)
+  expect(
+    pauseCenterY,
+    `${diag(pauseBox)}: pause button center is in the Canvas LOWER region ` +
+      `(>= ${LOWER_REGION_MIN_CENTER_Y_FRACTION * 100}% of safe-zone height from its top)`,
+  ).toBeGreaterThanOrEqual(safeZone.y + safeZone.height * LOWER_REGION_MIN_CENTER_Y_FRACTION - epsilon)
+  expect(
+    rectsIntersect(pauseBox, statusBox),
+    `${label}: pause zone ${JSON.stringify(pauseBox)} must never overlap the status zone ${JSON.stringify(statusBox)} (separate control, not a status-card member)`,
+  ).toBe(false)
 }
 
 async function assertHudGeometry(page: Page, label: string): Promise<void> {
@@ -430,17 +486,23 @@ async function assertHudGeometry(page: Page, label: string): Promise<void> {
     return
   }
 
-  // HUD is within the Canvas viewport (16px safe margin), not the header
-  // (P0-1: the HUD's containing block is `.battle-stage__viewport`, whose
-  // bounds match the canvas).
-  assertWithinSafeMargin(hudBox, canvasBox, HUD_SAFE_MARGIN_PX, `${label} HUD-in-canvas`)
+  // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 3): the
+  // 16px safe-margin containment is no longer checked against `hudBox` (the
+  // transparent, `pointer-events: none` `[data-combat-hud]` root) here --
+  // that root is EXCLUDED from AC3 by the Issue's own text ("透明な HUD root
+  // 自体は対象外") and spans the whole safe zone by construction, so
+  // checking it proves nothing about any individual fragment.
+  // `assertSemanticPlacement()` below independently checks the 16px
+  // containment for every VISIBLE opaque fragment/interactive control
+  // (elapsed/status/critical/edge-control/Assist/Pause).
 
   // AC4 (Issue #1958): persistent HUD fragments must not intersect the
   // Canvas center 60%x60% static protected zone.
   await assertNoProtectedZoneIntersection(page, canvasBox, label)
 
-  // AC1 (Issue #1958 fix_delta iteration 2 item 1): runtime bounding-box
-  // proof of the semantic state table's declared placement regions.
+  // AC1/AC3 (Issue #1958 fix_delta iteration 3, blocker 3): runtime
+  // bounding-box proof of the semantic state table's declared placement
+  // regions AND the per-fragment 16px safe-margin containment.
   await assertSemanticPlacement(page, canvasBox, label, { edgeControlExpectedVisible: true })
 
   // HUD and header never overlap as rectangles.
@@ -497,14 +559,18 @@ async function assertHudGeometryAtCollapsedMinimum(page: Page, label: string): P
     return
   }
 
-  assertWithinSafeMargin(hudBox, canvasBox, HUD_SAFE_MARGIN_PX, `${label} HUD-in-canvas`)
+  // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 3): see the
+  // equivalent comment in `assertHudGeometry()` above -- the transparent
+  // `[data-combat-hud]` root is excluded from AC3; per-fragment containment
+  // is checked in `assertSemanticPlacement()` below.
 
   // AC4 (Issue #1958): persistent HUD fragments must not intersect the
   // Canvas center 60%x60% static protected zone.
   await assertNoProtectedZoneIntersection(page, canvasBox, label)
 
-  // AC1 (Issue #1958 fix_delta iteration 2 item 1): runtime bounding-box
-  // proof of the semantic state table's declared placement regions.
+  // AC1/AC3 (Issue #1958 fix_delta iteration 3, blocker 3): runtime
+  // bounding-box proof of the semantic state table's declared placement
+  // regions AND the per-fragment 16px safe-margin containment.
   // edge-control (Weapon/Assist) is collapsed at this viewport.
   await assertSemanticPlacement(page, canvasBox, label, { edgeControlExpectedVisible: false })
 
@@ -629,7 +695,13 @@ test.describe('375x667 compact status representation: dual-fixture verification 
       await injectCriticalFixture(page, fixture.critical)
 
       const evidence = await recordCompactFixtureEvidence(page, label)
-      expect(evidence.headSha, `${label}: head SHA must be captured for evidence`).not.toBe('')
+      // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 4):
+      // exact equality against EXPECTED_PR_HEAD_SHA, not merely non-empty --
+      // `currentHeadSha()` now throws on missing/invalid EXPECTED_PR_HEAD_SHA,
+      // so this assertion is a defensive double-check against future drift.
+      expect(evidence.headSha, `${label}: head SHA must exactly equal EXPECTED_PR_HEAD_SHA`).toBe(
+        process.env.EXPECTED_PR_HEAD_SHA,
+      )
 
       const canvas = page.locator('canvas.battle-stage__canvas')
       const canvasBox = await canvas.boundingBox()
@@ -645,13 +717,16 @@ test.describe('375x667 compact status representation: dual-fixture verification 
         return
       }
 
-      // 16px inner containment.
-      assertWithinSafeMargin(hudBox, canvasBox, HUD_SAFE_MARGIN_PX, `${label} HUD-in-canvas`)
+      // Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 3): see
+      // the equivalent comment in `assertHudGeometry()` -- the transparent
+      // `[data-combat-hud]` root is excluded from AC3; per-fragment
+      // containment is checked in `assertSemanticPlacement()` below.
 
       // AC4: protected-zone non-intersection (real assertion, no test.fail()).
       await assertNoProtectedZoneIntersection(page, canvasBox, label)
 
-      // AC1: runtime bounding-box placement proof. edge-control collapsed.
+      // AC1/AC3: runtime bounding-box placement proof AND per-fragment 16px
+      // safe-margin containment. edge-control collapsed.
       await assertSemanticPlacement(page, canvasBox, label, { edgeControlExpectedVisible: false })
 
       // HULL display: the injected value renders inside the status zone.

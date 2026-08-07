@@ -17,6 +17,47 @@ import type { VisualScenarioFixture, VisualScenarioViewportLabel } from '../../s
 export type { VisualScenarioFixture, VisualScenarioViewportLabel }
 
 // ---------------------------------------------------------------------------
+// Expected PR head SHA (Issue #1958 fix_delta iteration 3, blocker 4)
+// ---------------------------------------------------------------------------
+
+const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/
+
+/**
+ * Resolves the actual PR/commit head SHA that runtime evidence must bind to.
+ *
+ * `process.env.GITHUB_SHA` on GitHub Actions `pull_request` events is the
+ * synthetic merge-ref commit ("Merge <head> into <base>"), NOT the real PR
+ * head SHA -- recording it as evidence `head_sha` silently mislabels every
+ * runtime artifact with a commit that never actually ran. A `git rev-parse
+ * HEAD` fallback has the same problem inside the `pull_request` checkout
+ * (detached at the same synthetic merge ref), and a bare `'unknown'` /
+ * `'unknown-head-sha'` fallback lets evidence generation silently succeed
+ * with no real provenance at all.
+ *
+ * The CI workflow (`.github/workflows/ci.yml`'s `e2e` job) instead passes
+ * `EXPECTED_PR_HEAD_SHA` explicitly:
+ * `github.event.pull_request.head.sha || github.sha` -- the real PR head
+ * SHA for `pull_request` events, falling back to `github.sha` (which IS the
+ * real pushed commit, no synthetic-merge issue) for `push` events. This
+ * throws -- never returns a placeholder -- when the env var is missing or
+ * is not a full 40-hex-character commit SHA, so a misconfigured CI
+ * environment fails evidence generation instead of recording bogus
+ * provenance. Local runs must export `EXPECTED_PR_HEAD_SHA` themselves
+ * (e.g. `EXPECTED_PR_HEAD_SHA=$(git rev-parse HEAD)`).
+ */
+export function resolveExpectedHeadSha(): string {
+  const raw = process.env.EXPECTED_PR_HEAD_SHA
+  if (!raw || !FULL_SHA_PATTERN.test(raw)) {
+    throw new Error(
+      `EXPECTED_PR_HEAD_SHA must be set to a full 40-hex-character commit SHA (got: ${JSON.stringify(raw)}). ` +
+        'Set it via the CI workflow (.github/workflows/ci.yml e2e job env) or export it locally ' +
+        '(e.g. EXPECTED_PR_HEAD_SHA=$(git rev-parse HEAD)) before running this spec.',
+    )
+  }
+  return raw
+}
+
+// ---------------------------------------------------------------------------
 // Scenario Support Matrix (Issue #1385 contract)
 // ---------------------------------------------------------------------------
 
