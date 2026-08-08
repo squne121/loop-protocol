@@ -6,9 +6,9 @@
 
 ## 対象リビジョン（tested SHA と historical baseline SHA の両方を明記する）
 
-- historical baseline SHA（PR #2005 merge commit）: `28394e226533cd59cdfc0f55602ac65e389a6600`
-- actual tested SHA（本 research の実行時 `origin/main`）: `9eca2f0074552a3e0687b0c81ee94b62122890a0`
-- Claude Code version: `2.1.225 (Claude Code)`
+- historical baseline SHA（PR #2005 の merge commit。過去の基準点）: `28394e226533cd59cdfc0f55602ac65e389a6600`
+- actual tested SHA（本 research を実際に実行した時点の `origin/main`）: `9eca2f0074552a3e0687b0c81ee94b62122890a0`
+- Claude Code version（実行に用いた runtime の版）: `2.1.225 (Claude Code)`
 
 `28394e22` から `9eca2f00` までの差分は commit `9eca2f00`
 「実装: codebase-investigator に pinned Graphify CLI advisory pilot を追加する (#2010)」の 1 件のみである。
@@ -33,7 +33,7 @@ Graphify CLI advisory 前段（任意・read-only）を持つ定義になって�
 `scripts/agent-ops/run_worktree_agent_runtime_smoke.py`（tested SHA `9eca2f00`）の 3 つの
 extractor は、stdout stream-json の異なるイベント種別・異なる時点の情報を読む。
 
-### `extract_claude_parent_session_id()`（`run_worktree_agent_runtime_smoke.py:942-959`）
+### `extract_claude_parent_session_id()` — 親セッション ID の抽出（`run_worktree_agent_runtime_smoke.py:942-959`）
 
 - 区分: **spawn-time evidence**
 - 読むイベント: stdout stream-json の各行を先頭から走査し、`session_id` または `sessionId`
@@ -43,7 +43,7 @@ extractor は、stdout stream-json の異なるイベント種別・異なる時
   `system/init` より前に確定する、真に spawn 直前の evidence である。
 - 失敗時: `None`（推測しない）。
 
-### `extract_claude_child_agent_type()`（`run_worktree_agent_runtime_smoke.py:1035-1083`）
+### `extract_claude_child_agent_type()` — 子 agent 種別の抽出（`run_worktree_agent_runtime_smoke.py:1035-1083`）
 
 - 区分: **completion-time evidence**
 - 読むイベント: `type: "user"` の event の top-level `tool_use_result.agentType`。
@@ -52,7 +52,7 @@ extractor は、stdout stream-json の異なるイベント種別・異なる時
   （`run_worktree_agent_runtime_smoke.py:1032`）でフォールバックする。
 - 失敗時: `None`（fail-closed。欠落を一致として扱わない）。
 
-### `extract_claude_child_session_id()`（`run_worktree_agent_runtime_smoke.py:1086-1121`）
+### `extract_claude_child_session_id()` — 子セッション ID の抽出（`run_worktree_agent_runtime_smoke.py:1086-1121`）
 
 - 区分: **completion-time evidence**（ただし引数として spawn-time evidence に依存する）
 - 一次ソース: `_extract_claude_child_session_id_from_stream()`
@@ -174,7 +174,7 @@ spawn evidence が有ろうと無かろうと一律 `validation_failed` に落�
 `failure_class` を production と同一順序で複製しつつ、
 それとは独立に raw lifecycle checkpoint から `diagnostic_cause` を算出する。
 
-### `_is_transient_infrastructure_candidate()`（`run_agent_provider_route_smoke.py:394-395`）
+### `_is_transient_infrastructure_candidate()` — bounded retry 対象の判定（`run_agent_provider_route_smoke.py:394-395`）
 
 ```python
 def _is_transient_infrastructure_candidate(route: dict[str, str], failure_class: str | None) -> bool:
@@ -212,23 +212,23 @@ def _is_transient_infrastructure_candidate(route: dict[str, str], failure_class:
 `system/api_retry` を伴う timeout（`runtime_api_retry_timeout`）と、
 それを伴わない completion / tool-result / marker 欠落は明確に区別される。
 
-## lifecycle 12 checkpoint
+## lifecycle の 12 checkpoint 一覧
 
 `reproduction-log.jsonl` の各 record は `lifecycle` に次の 12 個の boolean を持つ。
 単一 boolean に潰さず、trial ID 単位で相関可能な形で独立記録する。
 
-1. `process_started`
-2. `system_init_observed`
-3. `agent_tool_use_observed`
-4. `subagent_start_hook_observed`
-5. `subagent_stop_hook_observed`
-6. `tool_result_observed`
-7. `tool_result_agent_id_observed`
-8. `tool_result_agent_type_observed`
-9. `agent_type_matches_requested`
-10. `terminal_event_observed`
-11. `expected_marker_observed`
-12. `delegation_request_validated`
+1. `process_started` — runtime プロセスが起動したか
+2. `system_init_observed` — `system/init` イベントが観測されたか
+3. `agent_tool_use_observed` — `Agent`/`Task` tool の dispatch が観測されたか
+4. `subagent_start_hook_observed` — `SubagentStart` hook event が観測されたか
+5. `subagent_stop_hook_observed` — `SubagentStop` hook event が観測されたか
+6. `tool_result_observed` — tool_result エンベロープが観測されたか
+7. `tool_result_agent_id_observed` — tool_result に `agentId` が存在したか
+8. `tool_result_agent_type_observed` — tool_result に `agentType` が存在したか
+9. `agent_type_matches_requested` — observed agent type が要求値と一致したか
+10. `terminal_event_observed` — terminal な `result` イベントが観測されたか
+11. `expected_marker_observed` — 期待 marker が出力に現れたか
+12. `delegation_request_validated` — delegation request の検証が通ったか
 
 `agent_type_matches_requested` は runtime が返した observed 値のみを用いる。
 expected agent type の代入や agent 自身の self-report は identity evidence として扱わない。

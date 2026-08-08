@@ -205,9 +205,12 @@ def build_conclusion(records: list[dict], stats: dict, follow_up: str) -> str:
     add("")
     add("## 実行条件")
     add("")
-    add(f"- Claude Code version: {', '.join(versions)}")
-    add(f"- actual tested SHA: {', '.join(shas)}")
-    add("- historical baseline SHA（PR #2005 merge commit）: 28394e226533cd59cdfc0f55602ac65e389a6600")
+    add(f"- 実行に用いた Claude Code version: {', '.join(versions)}")
+    add(f"- 実際に試験した SHA（actual tested SHA）: {', '.join(shas)}")
+    add(
+        "- 過去の基準点（historical baseline SHA、PR #2005 の merge commit）: "
+        "28394e226533cd59cdfc0f55602ac65e389a6600"
+    )
     add(f"- control lane trial 数: {len(lane_records(valid_records(records), 'control'))}（固定）")
     add(f"- production lane trial 数: {len(lane_records(valid_records(records), 'production'))}（固定）")
     add("")
@@ -267,7 +270,7 @@ def build_conclusion(records: list[dict], stats: dict, follow_up: str) -> str:
     add("production schema を増やす必要はない。")
     add("必要なのは分類の追加ではなく、identity evidence の抽出経路の修正である。")
     add("")
-    add("## follow-up implementation issue")
+    add("## 追従実装 Issue（follow-up implementation issue）")
     add("")
     if follow_up == "none":
         add("起票なし。")

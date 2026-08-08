@@ -17,9 +17,9 @@ production_trial_count: 15
 
 ## 実行条件
 
-- Claude Code version: 2.1.225 (Claude Code)
-- actual tested SHA: 9eca2f0074552a3e0687b0c81ee94b62122890a0
-- historical baseline SHA（PR #2005 merge commit）: 28394e226533cd59cdfc0f55602ac65e389a6600
+- 実行に用いた Claude Code version: 2.1.225 (Claude Code)
+- 実際に試験した SHA（actual tested SHA）: 9eca2f0074552a3e0687b0c81ee94b62122890a0
+- 過去の基準点（historical baseline SHA、PR #2005 の merge commit）: 28394e226533cd59cdfc0f55602ac65e389a6600
 - control lane trial 数: 15（固定）
 - production lane trial 数: 15（固定）
 
@@ -78,7 +78,7 @@ repo 側の観測（observability）欠陥である。
 production schema を増やす必要はない。
 必要なのは分類の追加ではなく、identity evidence の抽出経路の修正である。
 
-## follow-up implementation issue
+## 追従実装 Issue（follow-up implementation issue）
 
 #2021 を起票した。
 

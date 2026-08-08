@@ -4,12 +4,12 @@
 `build_summary.py` が生成し、`tests/test_reproduction_summary_contract.py` が
 同じ raw ledger から独立に再計算して一致を検証する。手書きの数値は含まない。
 
-- 総 record 数: 30
-- 有効 trial 数: 30
-- 無効（excluded）trial 数: 0
-- Claude Code version: 2.1.225 (Claude Code)
-- actual tested SHA: 9eca2f0074552a3e0687b0c81ee94b62122890a0
-- historical baseline SHA: 28394e226533cd59cdfc0f55602ac65e389a6600
+- 総 record 数: 30 件
+- 有効 trial 数: 30 件
+- 無効（excluded）trial 数: 0 件
+- 実行に用いた Claude Code version: 2.1.225 (Claude Code)
+- 実際に試験した SHA（actual tested SHA）: 9eca2f0074552a3e0687b0c81ee94b62122890a0
+- 過去の基準点（historical baseline SHA）: 28394e226533cd59cdfc0f55602ac65e389a6600
 
 trial 条件は実行前に `trial-plan.json` として凍結され、その digest を全 record が持つ。
 control lane の `prompt_sha256` は全 trial で同一である。
