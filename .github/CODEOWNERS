@@ -1,0 +1,28 @@
+# CODEOWNERS (Issue #2019)
+#
+# Bootstrap note: this file is newly created by Issue #2019's implementation
+# PR. That PR's own waiver evaluation (if any) and any `require_code_owner_review`
+# enforcement do NOT treat this head-branch-introduced CODEOWNERS as a
+# trusted authorization source for itself -- trusted waiver authority is
+# always derived from the TRUSTED BASE BRANCH's CODEOWNERS content (which,
+# before this PR merges, has none). See
+# scripts/agent-ops/resolve_visual_impact.py::authorized_owners_for_paths()
+# and docs/dev/visual-surfaces.yml's policy section.
+#
+# `require_code_owner_reviews` ruleset/branch-protection enforcement itself
+# is an explicit post-merge ops step (Issue #2019 In Scope G) -- not enabled
+# by this file's mere existence.
+
+# Visual-impact-policy protected surfaces (registry / baselines / resolver /
+# policy evaluator / workflow / CODEOWNERS itself / verdict classifier).
+/docs/dev/visual-surfaces.yml @squne121
+/docs/dev/visual-surfaces.schema.json @squne121
+/docs/dev/visual-impact.schema.json @squne121
+/docs/dev/visual-baseline-registry.md @squne121
+/tests/component/ @squne121
+/tests/e2e/__screenshots__/ @squne121
+/scripts/agent-ops/resolve_visual_impact.py @squne121
+/scripts/agent-ops/resolve_visual_impact.mjs @squne121
+/.github/workflows/ci.yml @squne121
+/.github/CODEOWNERS @squne121
+/.claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py @squne121

@@ -554,6 +554,13 @@ script 正本経由のみで復旧すること（audit trail・idempotency の�
 - **inline `gh` / `jq` / `grep` / `awk` / heredoc 使用禁止**: anchor preflight での inline bash パイプラインは使用しない
 - **スクリプトは配列形式の `git grep` のみ実行**: `eval` 禁止、入力 anchor は `^[A-Za-z0-9._/: #-]+$` で validation 済み
 
+## visual_impact フィールド（canonical schema owner）
+
+Issue 本文が `visual_impact` 関連フィールド（`VISUAL_IMPACT_DECLARATION_V1` 等）に触れる場合、
+単一の canonical schema ファイル [`docs/dev/visual-impact.schema.json`](../../../docs/dev/visual-impact.schema.json)
+を参照する（詳細は [`references/body-authoring.md`](references/body-authoring.md) の該当節）。
+本 SKILL.md では独自にキー集合・enum を再定義しない（Issue #2019 AC26）。
+
 ## Related（関連資料）
 
 - [`references/body-authoring.md`](references/body-authoring.md) — 本文編集の共通参照（schema 定義・VC 作成ガイダンス・Anchor Verification・Blocker 検出）

@@ -1,0 +1,5 @@
+@import './base.css';
+
+.fixture-root {
+  background: url('../media/bg.png');
+}

@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://loop-protocol.internal/schemas/visual-surfaces.schema.json",
+  "title": "VISUAL_SURFACES_REGISTRY_V1",
+  "description": "Issue #2019: docs/dev/visual-surfaces.yml (registry-first canonical SSOT) の JSON Schema。additionalProperties false・enum・required で全域を fail-closed に検証する。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "surfaces"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "global_invalidators": {
+      "type": "array",
+      "description": "変更されると registry 内の全 surface を無条件に affected とみなすパス（repo-root 相対、glob 不可・厳密一致のみ）。",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "default": []
+    },
+    "coverage_roots": {
+      "type": "array",
+      "description": "UI 変更 candidate path を判定する閉域 glob パターン一覧。どの surface の producers にも mapping されない candidate path の変更は unmapped_visual_candidate として fail-closed する。",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "minItems": 1
+    },
+    "surfaces": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["producers", "contracts", "policy"],
+        "properties": {
+          "producers": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["modules"],
+            "properties": {
+              "modules": {
+                "type": "array",
+                "description": "resolve_visual_impact.mjs が TypeScript compiler API の static import graph 解決の起点として使う entry module（repo-root 相対、拡張子付き）。",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true,
+                "minItems": 1
+              },
+              "styles": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true,
+                "default": []
+              },
+              "assets": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true,
+                "default": []
+              },
+              "config": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true,
+                "default": []
+              }
+            }
+          },
+          "contracts": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["runner", "spec", "baseline", "job", "update_command_id", "verify_command_id", "maturity"],
+            "properties": {
+              "runner": {
+                "type": "string",
+                "enum": ["vitest-browser-mode", "playwright-e2e"]
+              },
+              "spec": { "type": "string", "minLength": 1 },
+              "baseline": { "type": "string", "minLength": 1 },
+              "job": { "type": "string", "minLength": 1 },
+              "update_command_id": {
+                "type": "string",
+                "description": "raw シェル文字列ではなく閉域 enum。実 argv は evaluator 側の固定 mapping (COMMAND_ID_MAP) から解決する。",
+                "enum": [
+                  "vitest_component_vrt_update",
+                  "playwright_e2e_vrt_update"
+                ]
+              },
+              "verify_command_id": {
+                "type": "string",
+                "enum": [
+                  "vitest_component_vrt_verify",
+                  "playwright_e2e_vrt_verify"
+                ]
+              },
+              "maturity": {
+                "type": "string",
+                "enum": ["frozen", "provisional", "legacy-current", "pending-baseline", "predicate-only"]
+              }
+            }
+          },
+          "policy": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["disposition_required"],
+            "properties": {
+              "disposition_required": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
