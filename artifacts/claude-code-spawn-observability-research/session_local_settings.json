@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/sed -e 's/^/SPAWN_OBS_HOOK_PAYLOAD /'"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/sed -e 's/^/SPAWN_OBS_HOOK_PAYLOAD /'"
+          }
+        ]
+      }
+    ]
+  }
+}
