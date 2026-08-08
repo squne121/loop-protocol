@@ -164,9 +164,8 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "fixture": {"type": "repo_relative_file", "required": True},
         },
     },
-    # Issue #1498: sibling exact profile — anchor-comment-scoped preflight
-    # run. `preflight.run` above is entirely unmodified by this addition;
-    # this is an independent registry entry, not a generalization of it.
+    # An anchor URL is not an origin assertion.  The unlabelled profile is
+    # intentionally read-only and resolves to generated/unknown provenance.
     "preflight.run.with_anchor": {
         "id": "preflight.run.with_anchor",
         "argv": [
@@ -193,8 +192,62 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         },
     },
-    # #1877: the mutation phase is deliberately a sibling of the read-only
-    # anchor preflight.  Do not add this flag to preflight.run.with_anchor.
+    "preflight.run.with_human_context": {
+        "id": "preflight.run.with_human_context",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_skill_runtime_anchor",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_read_only",
+        "stdin_contract": "none",
+        "stdout_contract": "refinement_preflight_result/v1",
+        "timeout_seconds": 120,
+        "mutation": False,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+        },
+    },
+    "preflight.run.with_agent_report": {
+        "id": "preflight.run.with_agent_report",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+            "--agent-report-comment-url", "{anchor_comment_url}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_skill_runtime_anchor",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_read_only",
+        "stdin_contract": "none",
+        "stdout_contract": "refinement_preflight_result/v1",
+        "timeout_seconds": 120,
+        "mutation": False,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+        },
+    },
+    # The generic mutation profile remains fail-closed because it carries no
+    # origin lane.  Only the human-context profile can reach the consumer.
     "contract_update.run.with_anchor": {
         "id": "contract_update.run.with_anchor",
         "argv": [
@@ -203,6 +256,38 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "--issue-number", "{issue_number}",
             "--repo", "{repo}",
             "--anchor-comment-url", "{anchor_comment_url}",
+            "--consume-contract-patch-plan",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_skill_runtime_contract_update_anchor",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            "artifacts/{active_issue}/issue-metadata/",
+        ],
+        "network_effect": "github_read_only",
+        "stdin_contract": "none",
+        "stdout_contract": "refinement_preflight_result/v1",
+        "timeout_seconds": 120,
+        "mutation": True,
+        "main_control_plane_only": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+        },
+    },
+    "contract_update.run.with_human_context": {
+        "id": "contract_update.run.with_human_context",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
             "--consume-contract-patch-plan",
         ],
         "shell": False,

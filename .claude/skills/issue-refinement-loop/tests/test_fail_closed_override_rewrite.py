@@ -14,7 +14,7 @@ Covers:
 - AC10a: max_rewrite_attempts / no_progress_route in constraints
 - AC10b: no-progress detection routing to human_judgment_required
 - AC11: terminal result fields (checked_body_sha256 etc.)
-- AC12a: Write is in disallowedTools of issue-author.md
+- AC12a: Write is in disallowedTools of issue-creator.md and issue-editor.md
 """
 
 import json
@@ -210,7 +210,7 @@ class TestMissingSectionsBlockReview:
     def test_missing_sections_after_rewrite_keeps_fail_closed_requirement(self):
         """AC5: Even after rewrite attempt, missing sections keep fail_closed=True.
 
-        This simulates a scenario where issue-author didn't fix all sections:
+        This simulates a scenario where issue-editor didn't fix all sections:
         the planner is re-invoked and must still return fail_closed.
         """
         # Body with Acceptance Criteria but still no Outcome
@@ -350,8 +350,8 @@ class TestOverridePolicy:
 class TestPrePostMutationCheckerRouting:
     """AC9b: Tests that verify the 2-stage checker contract is expressed in the output."""
 
-    def test_issue_author_runs_contract_checker(self):
-        """AC4/AC9b: After fail_closed, issue-author must run checker (verified via reference doc)."""
+    def test_issue_editor_runs_contract_checker(self):
+        """AC4/AC9b: After fail_closed, issue-editor must run checker (verified via reference doc)."""
         # Verify the reference document exists and mentions the 2-stage checker
         ref_doc = TESTS_DIR.parent / "references" / "ac-vc-reflection.md"
         assert ref_doc.exists(), f"ac-vc-reflection.md must exist: {ref_doc}"
@@ -367,7 +367,7 @@ class TestPrePostMutationCheckerRouting:
         """AC4/AC9b: rewrite process must include contract checker re-run."""
         ref_doc = TESTS_DIR.parent / "references" / "ac-vc-reflection.md"
         content = ref_doc.read_text(encoding="utf-8")
-        # The reference must mention that checker runs after issue-author rewrite
+        # The reference must mention that checker runs after controlled rewrite.
         assert "checker" in content.lower(), (
             "ac-vc-reflection.md must reference the checker step after rewrite"
         )
@@ -461,8 +461,7 @@ class TestTerminalResultFields:
     def test_terminal_result_fields_documented_in_issue_editor(self):
         """AC11: issue-editor.md documents checked_body_sha256, checker_exit_code, etc.
 
-        Issue #1734: this content moved from issue-author.md (now a deprecated
-        stub) to issue-editor.md, which owns existing-Issue rewrite.
+        issue-editor.md owns existing-Issue rewrite after the #1952 cutover.
         """
         agent_doc = AGENTS_DIR / "issue-editor.md"
         assert agent_doc.exists(), f"issue-editor.md must exist: {agent_doc}"
@@ -482,42 +481,40 @@ class TestTerminalResultFields:
 
 
 # ---------------------------------------------------------------------------
-# AC12a: Write is in disallowedTools of issue-author.md
+# AC12a: Write is in disallowedTools of issue-creator.md / issue-editor.md
 # ---------------------------------------------------------------------------
 
 
-class TestIssueAuthorDisallowedTools:
-    """AC12: issue-author.md must have Write in disallowedTools frontmatter."""
+class TestIssueCreatorEditorDisallowedTools:
+    """AC12: both active Issue roles must have Write in disallowedTools."""
 
-    def test_issue_author_write_is_in_disallowed_tools(self):
-        """AC12a: disallowedTools in issue-author.md includes Write."""
-        agent_doc = AGENTS_DIR / "issue-author.md"
-        assert agent_doc.exists(), f"issue-author.md must exist: {agent_doc}"
-        content = agent_doc.read_text(encoding="utf-8")
+    def test_issue_creator_editor_write_is_in_disallowed_tools(self):
+        """AC12a: active creator/editor frontmatter includes Write."""
+        for agent_name in ("issue-creator", "issue-editor"):
+            agent_doc = AGENTS_DIR / f"{agent_name}.md"
+            assert agent_doc.exists(), f"{agent_name}.md must exist: {agent_doc}"
+            content = agent_doc.read_text(encoding="utf-8")
 
-        # Find the frontmatter section (between --- markers)
-        parts = content.split("---")
-        assert len(parts) >= 3, "issue-author.md must have YAML frontmatter"
-        frontmatter = parts[1]
+            # Find the frontmatter section (between --- markers)
+            parts = content.split("---")
+            assert len(parts) >= 3, f"{agent_name}.md must have YAML frontmatter"
+            frontmatter = parts[1]
 
-        # Check disallowedTools block contains Write
-        in_disallowed = False
-        for line in frontmatter.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("disallowedTools:"):
-                in_disallowed = True
-                continue
-            if in_disallowed:
-                if stripped.startswith("- "):
+            # Check disallowedTools block contains Write.
+            in_disallowed = False
+            found_write = False
+            for line in frontmatter.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("disallowedTools:"):
+                    in_disallowed = True
+                    continue
+                if in_disallowed:
                     if stripped == "- Write":
-                        return  # Found it
-                elif stripped and not stripped.startswith("#"):
-                    break  # End of the list
-
-        # If we get here, Write was not found in disallowedTools
-        assert False, (
-            "Write must be in disallowedTools in issue-author.md frontmatter"
-        )
+                        found_write = True
+                        break
+                    if stripped and not stripped.startswith("-") and not stripped.startswith("#"):
+                        break
+            assert found_write, f"Write must be in disallowedTools in {agent_name}.md frontmatter"
 
 
 # ---------------------------------------------------------------------------

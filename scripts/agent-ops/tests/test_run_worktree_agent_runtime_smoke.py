@@ -259,6 +259,7 @@ exit 0
     assert result.returncode == 0, result.stderr
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "native_event_count: 2" in summary
+    assert "terminal_event_observed: True" in summary
     # Only summary.md is persisted (Issue #1921 P1 evidence-hygiene fix-delta).
     assert sorted(p.name for p in out_dir.iterdir()) == ["summary.md"]
 
@@ -500,6 +501,56 @@ sleep 30
     )
     assert result.returncode == 1
     assert "timed out" in result.stderr
+
+
+def test_given_declared_capability_window_when_fake_claude_hangs_then_exit77(
+    repo_with_worktree, tmp_path
+):
+    """The opt-in policy yields a persisted SKIP, not an outer verifier timeout."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+sleep 30
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--timeout-seconds", "2", "--timeout-is-capability-unavailable",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 77
+    assert result.stderr.startswith("SKIP:")
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "capability_decision: capability_skip_timeout" in summary
+    assert "capability_error_classification: declared_capability_window_exceeded" in summary
+
+
+def test_given_required_unavailable_runtime_field_when_fake_claude_succeeds_then_exit77(
+    repo_with_worktree, tmp_path
+):
+    """Unavailable evidence is a persisted SKIP even when the child completes."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--expect-marker", "MARKER_TOKEN_WT",
+        "--require-observed-runtime-field", "executor",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 77
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "capability_decision: required_runtime_evidence_unavailable" in summary
+    assert "unavailable_required_runtime_observations: ['executor']" in summary
 
 
 def test_given_fake_claude_argv_when_structured_lane_runs_then_max_turns_flag_present(
@@ -1690,7 +1741,7 @@ def test_given_agent_type_flag_and_declared_agent_md_when_structured_run_succeed
     assert result.returncode == 0, result.stderr
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "requested_agent_type: post-merge-cleanup-worker" in summary
-    assert "effective_agent_type: post-merge-cleanup-worker" in summary
+    assert "effective_agent_type: None" in summary
     assert "loaded_skills: ['post-merge-cleanup-executor']" in summary
     assert "loaded_skills_source: static_frontmatter" in summary
 
@@ -1713,7 +1764,7 @@ def test_given_no_agent_type_flag_when_structured_run_succeeds_then_defaults_to_
     assert result.returncode == 0, result.stderr
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "requested_agent_type: unspecified" in summary
-    assert "effective_agent_type: unspecified" in summary
+    assert "effective_agent_type: None" in summary
     assert "loaded_skills: None" in summary
     assert "loaded_skills_source: None" in summary
 

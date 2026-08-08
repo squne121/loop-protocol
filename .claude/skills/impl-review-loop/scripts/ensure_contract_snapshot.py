@@ -1083,6 +1083,14 @@ def ensure_contract_snapshot(
                 expected_fingerprint=go_result["inner"]["expected_contract_fingerprint"],
             )
             if not authority_ok:
+                # A body can undergo ABA (change and then return to the same
+                # bytes) while Issue.updatedAt advances.  The existing go is
+                # no longer authoritative in that case, but auto/dry-run can
+                # still obtain a fresh review/materialization.  Do not reuse
+                # the old go, and do not treat other authority failures as
+                # recoverable.
+                if authority_err == "authority_issue_updated_at_mismatch":
+                    break
                 result["status"] = "stale_or_conflicting_snapshot"
                 result["errors"].append(f"existing_go_authority_postcondition_failed:{authority_err}")
                 return result

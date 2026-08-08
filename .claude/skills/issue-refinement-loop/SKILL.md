@@ -22,7 +22,7 @@ note_ja: 本ファイルは thin entrypoint 契約のメタデータであり、
 
 - `issue_number`（必須）: 改善対象の Issue 番号
 - `max_iterations`（任意、既定 3）: review cycle の上限
-- `anchor_comment_url`（任意）: 人間 Decision や差し戻しコメントを snapshot 固定して扱う対象コメント URL
+- `anchor_comment_url`（任意）: snapshot 固定して扱う対象コメント URL。URL 単独から origin は推定せず、canonical command profile が human context / agent report / unlabeled を明示する。
 
 ## ループ方針 (Loop Policy)
 
@@ -115,26 +115,26 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/run_refinem
   [--anchor-comment-url <URL>]
 ```
 
-root checkout（canonical main root / default branch）から anchor comment を指定して preflight を実行する場合は、上記の直接 wrapper 呼び出しではなく、`preflight.run.with_anchor`（`preflight.run` の sibling exact profile、Issue #1498）を正規の privileged executor 経由で実行する。以下は exact command policy が要求する厳密な token 列（`--locked` を含まない）そのものであり、`uv run --locked` governance policy の対象ではない:
+root checkout（canonical main root / default branch）から anchor comment を指定して preflight を実行する場合は、上記の直接 wrapper 呼び出しではなく、origin lane を明示する正規の privileged executor profile を使う。`preflight.run.with_anchor` は URL だけを扱う unlabeled profile であり、human origin を推定せず fail-closed にする。direct human context は `preflight.run.with_human_context`、agent report は read-only の `preflight.run.with_agent_report` を使う。以下は direct human context 用の厳密な token 列（`--locked` を含まない）そのものであり、`uv run --locked` governance policy の対象ではない:
 
 <!-- policy-example --><!-- 以下は方針の例を示すコメントであり、実行対象のコマンド構文には影響しない -->
 ```bash
 uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
-  --command-id preflight.run.with_anchor \
+  --command-id preflight.run.with_human_context \
   --issue-number <N> \
   --repo <owner/repo> \
   --anchor-comment-url <canonical GitHub issue comment URL>
 ```
 
-`--anchor-comment-url` は `https://github.com/<owner>/<repo>/issues/<N>#issuecomment-<M>` の canonical shape のみを受け付け、`--issue-number` / `--repo` と URL 内の owner/repo/issue 番号が一致しない場合は拒否される（context-binding）。`preflight.run` 自体の argv / placeholders / execution_class はこの sibling profile の追加によって一切変更されない。
+`--anchor-comment-url` は `https://github.com/<owner>/<repo>/issues/<N>#issuecomment-<M>` の canonical shape のみを受け付け、`--issue-number` / `--repo` と URL 内の owner/repo/issue 番号が一致しない場合は拒否される（context-binding）。同一 URL を human / agent の両 lane に渡すこと、または unlabeled URL を human origin として扱うことは fail-closed である。`preflight.run` 自体の argv / placeholders / execution_class はこの sibling profile の追加によって一切変更されない。
 
 #### Step 0g: trusted contract update（main control-planeを実行する親control-plane限定）
 
-`preflight.run.with_anchor` が trusted contract patch plan を得た後だけ、main control-plane は canonical main root / default branch から次の明示phaseを実行できる。preflight entryの `mutation: false` は変更せず、このphase以外に `--consume-contract-patch-plan` を渡してはならない。
+`preflight.run.with_human_context` が trusted contract patch plan を得た後だけ、main control-plane は canonical main root / default branch から次の明示phaseを実行できる。agent report / unlabeled anchor はこの mutation phase に到達できない。preflight entryの `mutation: false` は変更せず、このphase以外に `--consume-contract-patch-plan` を渡してはならない。
 
 ```bash
 uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
-  --command-id contract_update.run.with_anchor \
+  --command-id contract_update.run.with_human_context \
   --issue-number <N> \
   --repo <owner/repo> \
   --anchor-comment-url <canonical GitHub issue comment URL>
