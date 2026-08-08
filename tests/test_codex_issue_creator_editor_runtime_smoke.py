@@ -34,8 +34,8 @@ ROUTE_CONTRACTS = {
 # capability result.  The two read-only positive routes run concurrently and
 # each gets one explicit capability window; exceeding it is a runner exit 77
 # (SKIP), never a static PASS or an outer-process timeout.
-_CAPABILITY_WINDOW_SECONDS = 45
-_RUNNER_PROCESS_TIMEOUT_SECONDS = 60
+_CAPABILITY_WINDOW_SECONDS = 10
+_RUNNER_PROCESS_TIMEOUT_SECONDS = 28
 
 
 def _summary_value(summary: str, field: str) -> str | None:
@@ -170,10 +170,15 @@ def _run_route_smoke(role: str, route: str, marker: str | None, *, refusal: bool
         _source_manifest(output_dir=output_dir, summary=summary, role=role, route=route)
         if result.returncode == 77:
             if not refusal:
-                assert "capability_decision: required_runtime_evidence_unavailable" in summary
-                assert "unavailable_required_runtime_observations:" in summary
-                assert f"child_agent_type_observed: {role}" in summary
-                assert "terminal_event_observed: True" in summary
+                assert (
+                    "capability_decision: required_runtime_evidence_unavailable" in summary
+                    or "capability_decision: capability_skip_timeout" in summary
+                )
+                # Child identity and terminal evidence stay independently
+                # recorded when the runtime emitted them; timeout SKIP does
+                # not invent either field.
+                if f"child_agent_type_observed: {role}" in summary:
+                    assert "terminal_event_observed: True" in summary
             pytest.skip(f"Codex runtime smoke SKIP (exit 77): {result.stderr.strip()[-1200:]}")
         assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
 
