@@ -753,7 +753,41 @@ def test_exact_allowed_path_literals_reject_unsafe_or_negative_tokens():
         assert sda._extract_path_literals_from_text(directive) == []
 
 
+def test_mixed_allowed_path_directive_fails_closed_before_contract_patch_plan():
+    """A safe literal cannot launder an unsafe token into a patch plan."""
+    directive = (
+        "- Allowed Paths に `docs/valid.py` と "
+        "`https://example.test/escape.py` を追加する"
+    )
+    result = _classify(
+        _evidence(
+            directive_markers=["allowed paths"],
+            extracted_directives=[directive],
+            boundary_flags=["expands_allowed_paths"],
+        ),
+        triggered=True,
+    )
+
+    assert sda._extract_path_literals_from_text(directive) == []
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "expands_allowed_paths"
+    assert "contract_patch_plan" not in result
+    assert sda.derive_contract_patch_operations(
+        [_evidence(directive_markers=["allowed paths"], extracted_directives=[directive])]
+    ) == []
+
+
 def test_exact_allowed_path_literals_accept_normalized_repository_relative_literal():
-    assert sda._extract_path_literals_from_text(
-        "- Allowed Paths に `.claude/skills/example.py` を追加する"
-    ) == [".claude/skills/example.py"]
+    directive = "- Allowed Paths に `.claude/skills/example.py` を追加する"
+    assert sda._extract_path_literals_from_text(directive) == [".claude/skills/example.py"]
+    assert sda.derive_contract_patch_operations(
+        [_evidence(directive_markers=["allowed paths"], extracted_directives=[directive])]
+    ) == [
+        {
+            "section": "Allowed Paths",
+            "op": "append",
+            "text": "- `.claude/skills/example.py`",
+            "rationale": "Exact Allowed Paths delta extracted from trusted review comment",
+            "source_evidence_index": 0,
+        }
+    ]

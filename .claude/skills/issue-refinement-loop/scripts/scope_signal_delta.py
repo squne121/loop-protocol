@@ -670,6 +670,12 @@ def _extract_path_literals_from_text(text: str) -> list[str]:
         candidate = match.group("path") or match.group("bare") or ""
         normalized = _normalize_exact_repository_path_literal(candidate)
         if normalized is None:
+            # A mixed directive is not an exact positive scope delta.  In
+            # particular, accepting a safe literal while silently dropping a
+            # URL, absolute path, traversal, or control-byte token would let
+            # the unnormalized directive reach the contract-patch consumer.
+            if _is_unsafe_path_literal(candidate):
+                return []
             continue
         if normalized not in path_literals:
             path_literals.append(normalized)
@@ -715,6 +721,22 @@ def _normalize_exact_repository_path_literal(candidate: str) -> str | None:
     if any(part in {"", ".", ".."} for part in parts):
         return None
     return normalized
+
+
+def _is_unsafe_path_literal(candidate: str) -> bool:
+    """Return whether a rejected token is an unsafe path-like literal.
+
+    Non-path backticked prose does not make a directive unsafe by itself, but
+    a token that can name an external or non-repository target must make the
+    entire Allowed Paths directive ineligible for automatic materialization.
+    """
+    if not isinstance(candidate, str) or not candidate:
+        return False
+    if "\x00" in candidate or "\n" in candidate or "\r" in candidate:
+        return True
+    if "\\" in candidate or "://" in candidate or candidate.startswith("/"):
+        return True
+    return any(part in {"", ".", ".."} for part in candidate.split("/"))
 
 
 def _strip_quoted_fragments(text: str) -> str:
@@ -962,7 +984,7 @@ _MARKER_TO_CONTRACT_SECTION = {
 
 
 def derive_contract_patch_operations(evidence_list: list) -> list:
-    """Derive one section-bound operation for each normalized directive.
+    """Derive section-bound operations from normalized directives.
 
     ``CONTRACT_PATCH_PLAN_V1`` deliberately retains its existing ``append``
     wire grammar.  The consumer below turns these entries into transaction-
@@ -993,6 +1015,22 @@ def derive_contract_patch_operations(evidence_list: list) -> list:
                     (candidate for candidate in markers if candidate in _MARKER_TO_CONTRACT_SECTION),
                     "revised acceptance criteria",
                 )
+            if marker == "allowed paths":
+                # Never append untrusted prose to the authorization-bearing
+                # Allowed Paths section.  A mixed or malformed directive
+                # produces no operation; classification separately routes it
+                # to human escalation before a transaction can be prepared.
+                for path in _extract_path_literals_from_text(text):
+                    operations.append(
+                        {
+                            "section": _MARKER_TO_CONTRACT_SECTION[marker],
+                            "op": "append",
+                            "text": f"- `{path}`",
+                            "rationale": "Exact Allowed Paths delta extracted from trusted review comment",
+                            "source_evidence_index": index,
+                        }
+                    )
+                continue
             operations.append(
                 {
                     "section": _MARKER_TO_CONTRACT_SECTION[marker],
