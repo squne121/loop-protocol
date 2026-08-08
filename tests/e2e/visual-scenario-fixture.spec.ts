@@ -308,3 +308,68 @@ test('GIVEN the running-hud fixture (elapsedTicks: 900, fixedDeltaMs: 16) WHEN t
 
   expect(observed.elapsedLabel).toBe('14.4 s')
 })
+
+
+// ---------------------------------------------------------------------------
+// Issue #1728 AC4: receipt AND a concrete overlay state value (Hull /
+// Resources / Mission status) both reflect the fixture.
+// ---------------------------------------------------------------------------
+
+test('GIVEN the running-hud fixture WHEN the app finishes its first render THEN the receipt AND the combat HUD Hull value both reflect the fixture (AC4)', async ({
+  page,
+}) => {
+  await installVisualScenario(page, RUNNING_FIXTURE)
+  await page.goto('/')
+
+  // AC1: the versioned receipt proves the app's first post-fixture render
+  // pass has actually completed (not merely that some fixture was queued).
+  // Web-first assertion (PR #2023 review fix, P1-1): waits for the receipt
+  // instead of reading it once via a raw page.evaluate() immediately after
+  // page.goto() resolves, which races the app's first requestAnimationFrame.
+  await expect(page.locator('html')).toHaveAttribute(
+    'data-loop-visual-scenario',
+    `v1:${RUNNING_FIXTURE.name}:rendered`,
+  )
+
+  // AC4 requires a concrete overlay state value -- Hull, Resources, or
+  // Mission status -- to also confirm the fixture (not just the receipt)
+  // was reflected. `combat-hud-hull` (Hull) is chosen here because it is
+  // the field actually rendered for a `running`-loopPhase fixture; the
+  // legacy debrief "Mission status" field only renders for
+  // debrief_pending_reward / debrief_reward_claimed phases, which this
+  // fixture does not exercise. `toHaveText()` (PR #2023 review fix, P1-1)
+  // instead of `textContent()` + `toBe()`: a web-first assertion that
+  // retries until the HUD reflects the fixture, rather than a one-shot read.
+  await expect(page.locator('[data-field="combat-hud-hull"]')).toHaveText(
+    `${RUNNING_FIXTURE.player.hp}/${RUNNING_FIXTURE.player.maxHp}`,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Issue #1728 AC2 (PR #2023 review fix, P1-4): with no visual scenario
+// fixture installed, the receipt attribute must never appear -- proven by a
+// behavioral test that reaches the DOM check directly, independent of the
+// screenshot-helper early-reject test above (which never observes the DOM at
+// all).
+// ---------------------------------------------------------------------------
+
+test('GIVEN no visual fixture WHEN the first app render completes THEN no receipt exists (AC2)', async ({
+  page,
+}) => {
+  await page.goto('/')
+
+  // Explicitly wait past the app's own first requestAnimationFrame (two
+  // nested RAF callbacks) before asserting absence -- so this proves the
+  // receipt is never set even after the app has had a chance to render, not
+  // merely that it has not been set YET.
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => resolve())
+        })
+      }),
+  )
+
+  await expect(page.locator('html')).not.toHaveAttribute('data-loop-visual-scenario', /.+/)
+})
