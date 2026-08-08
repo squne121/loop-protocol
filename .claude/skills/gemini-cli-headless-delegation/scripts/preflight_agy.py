@@ -2226,7 +2226,12 @@ def structured_output_capability_status(help_result: dict[str, Any] | None) -> d
     if not isinstance(help_result, dict):
         return _predicate_result("unavailable", reason_code="help_probe_not_run", evidence_source="help")
     exit_code = help_result.get("exit_code")
-    help_text = help_result.get("stdout") or ""
+    # Real `agy --help` output has been observed on both stdout and stderr
+    # depending on version/platform; combine both the same way
+    # `run_preflight()` already does for its own help-text parsing (see the
+    # `help_proc.stdout, help_proc.stderr` join above) rather than trusting
+    # stdout alone.
+    help_text = "\n".join(part for part in [help_result.get("stdout"), help_result.get("stderr")] if part)
     if exit_code != 0 or not help_text.strip():
         return _predicate_result("unavailable", reason_code="agy_help_probe_failed", evidence_source="help")
     if "--output-format" not in help_text:
