@@ -1691,7 +1691,7 @@ def test_given_agent_type_flag_and_declared_agent_md_when_structured_run_succeed
     assert result.returncode == 0, result.stderr
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "requested_agent_type: post-merge-cleanup-worker" in summary
-    assert "effective_agent_type: post-merge-cleanup-worker" in summary
+    assert "effective_agent_type: None" in summary
     assert "loaded_skills: ['post-merge-cleanup-executor']" in summary
     assert "loaded_skills_source: static_frontmatter" in summary
 
@@ -1714,7 +1714,7 @@ def test_given_no_agent_type_flag_when_structured_run_succeeds_then_defaults_to_
     assert result.returncode == 0, result.stderr
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "requested_agent_type: unspecified" in summary
-    assert "effective_agent_type: unspecified" in summary
+    assert "effective_agent_type: None" in summary
     assert "loaded_skills: None" in summary
     assert "loaded_skills_source: None" in summary
 

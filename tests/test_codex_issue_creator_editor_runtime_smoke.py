@@ -7,6 +7,7 @@ identity evidence for the requested custom agent and a clean worktree.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import subprocess
@@ -24,8 +25,8 @@ RUNNER = REPO_ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke
 EVIDENCE_ROOT = REPO_ROOT / "artifacts" / "agent-runtime-smoke"
 
 ROUTE_CONTRACTS = {
-    "issue-creator": ("create-issue", "create_issue_txn.py"),
-    "issue-editor": ("edit-issue", "edit_issue_txn.py"),
+    "issue-creator": "create-issue",
+    "issue-editor": "edit-issue",
 }
 
 
@@ -37,52 +38,66 @@ def _summary_value(summary: str, field: str) -> str | None:
     return None
 
 
-def _source_manifest(
-    *, output_dir: Path, summary: str, role: str, route: str, refusal: bool
-) -> None:
-    """Persist provenance without retaining a prompt or runtime transcript."""
+def _observed(value: str | None, source_event: str | None) -> dict[str, object]:
+    """Represent a runtime field without upgrading declarations to observations."""
+    return {
+        "status": "observed" if value is not None else "unavailable",
+        "value": value,
+        "source_event": source_event if value is not None else None,
+    }
+
+
+def _source_manifest(*, output_dir: Path, summary: str, role: str, route: str) -> None:
+    """Persist declared and runtime-observed provenance without raw transcripts."""
     agent = tomllib.loads(
         (REPO_ROOT / ".codex" / "agents" / f"{role}.toml").read_text(encoding="utf-8")
     )
-    canonical_route, executor = ROUTE_CONTRACTS[role]
+    canonical_route = ROUTE_CONTRACTS[role]
     canonical_skill = REPO_ROOT / ".claude" / "skills" / canonical_route / "SKILL.md"
-    assert route == canonical_route or refusal
+    route_decision = _summary_value(summary, "route_preflight_decision")
+    refusal = route_decision == "refused_before_runtime"
     source_manifest = {
         "summary": {
             "path": "summary.md",
             "sha256": hashlib.sha256((output_dir / "summary.md").read_bytes()).hexdigest(),
         },
-        "runtime_evidence": {
-            "tested_head": _summary_value(summary, "tested_head"),
-            "codex_version": _summary_value(summary, "runtime_version"),
-            "requested_agent_type": _summary_value(summary, "requested_agent_type"),
-            "effective_agent_type": _summary_value(summary, "effective_agent_type"),
-            "terminal_event_observed": _summary_value(summary, "terminal_event_observed"),
-        },
-        "route_contract_sources": {
-            "effective_permission_profile": {
-                "value": agent["default_permissions"],
-                "source": f".codex/agents/{role}.toml",
-                "runtime_observation": "not independently exposed by the Codex structured event stream",
-            },
-            "effective_skill_configuration": {
-                "value": canonical_route,
-                "source": f".agents/skills/{canonical_route}/SKILL.md",
-            },
+        "declared": {
+            "agent_type": role,
+            "permission_profile": agent["default_permissions"],
+            "skill_route": canonical_route,
+            "canonical_skill_path": f".agents/skills/{canonical_route}/SKILL.md",
             "canonical_skill_realpath": str(canonical_skill.resolve().relative_to(REPO_ROOT)),
             "canonical_skill_sha256": hashlib.sha256(canonical_skill.read_bytes()).hexdigest(),
-            "loaded_readback_sha256": hashlib.sha256(canonical_skill.read_bytes()).hexdigest(),
-            "selected_executor": None if refusal else executor,
-            "selected_executor_source": (
-                "not selected: route was refused before mutation"
-                if refusal
-                else f".claude/skills/{canonical_route}/scripts/{executor}"
+            "requested_mutation_route": route,
+        },
+        "observed": {
+            "tested_head": _observed(_summary_value(summary, "tested_head"), "runner_git_rev_parse"),
+            "codex_version": _observed(_summary_value(summary, "runtime_version"), "runtime_version_subprocess"),
+            "child_agent_type": _observed(
+                _summary_value(summary, "child_agent_type_observed"),
+                _summary_value(summary, "child_agent_type_source"),
             ),
-            "requested_route": route,
-            "effective_route": "refused" if refusal else canonical_route,
-            "route_decision": "refused_before_mutation" if refusal else "canonical_route",
-            "mutation_attempted": False,
-            "marker_verified_by_runner": True,
+            "effective_permission_profile": _observed(None, None),
+            "loaded_skill": _observed(None, None),
+            "executor": {
+                "status": "not_invoked" if refusal else "unavailable",
+                "path": None,
+                "invocation_observed": False if refusal else None,
+                "source_event": "runner_agent_route_guard" if refusal else None,
+            },
+            "route_preflight": {
+                "decision": route_decision,
+                "declared_route": _summary_value(summary, "declared_mutation_route"),
+                "source_event": _summary_value(summary, "route_preflight_source"),
+            },
+            "mutation": {
+                "status": "not_attempted_by_runner" if refusal else "unavailable",
+                "attempted": None,
+                "observed_channels": ["runner_agent_route_guard"] if refusal else [],
+            },
+            "terminal_event": _observed(
+                _summary_value(summary, "terminal_event_observed"), "codex_json_event_stream"
+            ),
         },
     }
     (output_dir / "source-manifest.json").write_text(
@@ -92,7 +107,7 @@ def _source_manifest(
     assert sorted(path.name for path in output_dir.iterdir()) == ["source-manifest.json", "summary.md"]
 
 
-def _run_route_smoke(role: str, route: str, marker: str, *, refusal: bool) -> str:
+def _run_route_smoke(role: str, route: str, marker: str | None, *, refusal: bool) -> str:
     if not (REPO_ROOT / ".git").is_file() or not RUNNER.is_file():
         pytest.skip("linked worktree runtime surface is unavailable")
 
@@ -101,18 +116,7 @@ def _run_route_smoke(role: str, route: str, marker: str, *, refusal: bool) -> st
         f"Do not perform the task yourself. "
     )
     if refusal:
-        if route == "unknown":
-            request += (
-                "Request that agent to invoke the unknown mutation route named `unknown`; do not substitute "
-                "a create or edit route. It must refuse before any mutation, shell mutation, or network mutation, "
-                f"then output exactly `{marker}`."
-            )
-        else:
-            wrong_intent = "edit an existing GitHub Issue" if role == "issue-creator" else "create a new GitHub Issue"
-            request += (
-                f"Request that agent to {wrong_intent}. It must refuse before any mutation, shell mutation, "
-                f"or network mutation, then output exactly `{marker}`."
-            )
+        request += "The runner must evaluate the requested mutation route before any runtime is started."
     else:
         request += (
             f"Request that agent to use only its canonical `{route}` Skill, read its SKILL.md, "
@@ -124,8 +128,7 @@ def _run_route_smoke(role: str, route: str, marker: str, *, refusal: bool) -> st
         prompt_file = tmp_path / "prompt.md"
         prompt_file.write_text(request + "\n", encoding="utf-8")
         output_dir = EVIDENCE_ROOT / f"issue-1952-{role}-{route}-{time.time_ns()}"
-        result = subprocess.run(
-            [
+        command = [
                 sys.executable,
                 str(RUNNER),
                 "--runtime", "codex",
@@ -135,9 +138,13 @@ def _run_route_smoke(role: str, route: str, marker: str, *, refusal: bool) -> st
                 "--output-dir", str(output_dir),
                 "--timeout-seconds", "180",
                 "--agent-type", role,
-                "--expect-marker", marker,
                 "--require-clean-postcondition",
-            ],
+                "--requested-mutation-route", route,
+            ]
+        if marker is not None:
+            command.extend(["--expect-marker", marker])
+        result = subprocess.run(
+            command,
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -145,35 +152,55 @@ def _run_route_smoke(role: str, route: str, marker: str, *, refusal: bool) -> st
             check=False,
         )
         summary = (output_dir / "summary.md").read_text(encoding="utf-8")
-        _source_manifest(
-            output_dir=output_dir, summary=summary, role=role, route=route, refusal=refusal
-        )
+        _source_manifest(output_dir=output_dir, summary=summary, role=role, route=route)
         if result.returncode == 77:
             pytest.skip(f"Codex runtime smoke SKIP (exit 77): {result.stderr.strip()[-1200:]}")
         assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+
+    manifest = json.loads((output_dir / "source-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["declared"]["agent_type"] == role
+    assert manifest["declared"]["skill_route"] == ROUTE_CONTRACTS[role]
+    assert manifest["observed"]["effective_permission_profile"] == {
+        "status": "unavailable", "value": None, "source_event": None
+    }
+    assert manifest["observed"]["loaded_skill"] == {
+        "status": "unavailable", "value": None, "source_event": None
+    }
 
     for field in (
         "tested_head",
         "runtime_version",
         "requested_agent_type",
-        "effective_agent_type",
-        "terminal_event_observed",
     ):
         assert _summary_value(summary, field) is not None, f"missing runtime summary field: {field}"
     assert f"requested_agent_type: {role}" in summary
-    assert f"effective_agent_type: {role}" in summary
-    assert f"child_agent_type_observed: {role}" in summary
-    assert "native_spawn_event_observed: True" in summary
+    if refusal:
+        assert "route_preflight_decision: refused_before_runtime" in summary
+        assert "runtime_invocation: not_started_route_preflight_blocked" in summary
+        assert "native_spawn_event_observed: False" in summary
+        assert manifest["observed"]["executor"]["status"] == "not_invoked"
+        assert manifest["observed"]["mutation"] == {
+            "status": "not_attempted_by_runner",
+            "attempted": None,
+            "observed_channels": ["runner_agent_route_guard"],
+        }
+    else:
+        assert f"effective_agent_type: {role}" in summary
+        assert f"child_agent_type_observed: {role}" in summary
+        assert "native_spawn_event_observed: True" in summary
+        assert manifest["observed"]["child_agent_type"] == {
+            "status": "observed",
+            "value": role,
+            "source_event": "codex_session_meta_agent_role",
+        }
+        assert manifest["observed"]["mutation"] == {
+            "status": "unavailable", "attempted": None, "observed_channels": []
+        }
     assert "tested_head:" in summary
     assert "runtime_version:" in summary
-    assert "loaded_skills_source: static_frontmatter" in summary
-    assert "terminal_event_observed: True" in summary
-    if route == "unknown":
-        assert marker == (
-            "RUNTIME_SMOKE_1952_UNKNOWN_REFUSED requested_route=unknown "
-            "effective_route=refused mutation_attempted=false"
-        )
-        assert "expected_markers_missing: []" in summary
+    if not refusal:
+        assert "loaded_skills_source: static_frontmatter" in summary
+        assert "terminal_event_observed: True" in summary
     return summary
 
 
@@ -188,18 +215,17 @@ def test_codex_creator_editor_runtime_evidence(role: str, route: str, marker: st
     _run_route_smoke(role, route, marker, refusal=False)
 
 
-@pytest.mark.parametrize(
-    ("role", "route", "marker"),
-    [
-        ("issue-creator", "edit-issue", "RUNTIME_SMOKE_1952_CREATOR_EDIT_REFUSED"),
-        ("issue-editor", "create-issue", "RUNTIME_SMOKE_1952_EDITOR_CREATE_REFUSED"),
-        (
-            "issue-creator",
-            "unknown",
-            "RUNTIME_SMOKE_1952_UNKNOWN_REFUSED requested_route=unknown "
-            "effective_route=refused mutation_attempted=false",
-        ),
-    ],
-)
-def test_codex_creator_editor_wrong_route_refuses_before_mutation(role: str, route: str, marker: str):
-    _run_route_smoke(role, route, marker, refusal=True)
+def test_codex_creator_editor_wrong_route_refuses_before_mutation():
+    """Refuse distinct wrong routes concurrently through the deterministic preflight."""
+    cases = [
+        ("issue-creator", "edit-issue", None),
+        ("issue-editor", "create-issue", None),
+        ("issue-creator", "unknown", None),
+    ]
+    with ThreadPoolExecutor(max_workers=len(cases)) as executor:
+        futures = [
+            executor.submit(_run_route_smoke, role, route, marker, refusal=True)
+            for role, route, marker in cases
+        ]
+        for future in futures:
+            future.result()

@@ -68,6 +68,15 @@ SCHEMA = "WORKTREE_AGENT_RUNTIME_SMOKE_RESULT_V1"
 # invocation always passes a real ``--agent-type`` value.
 _UNSPECIFIED_AGENT_TYPE = "unspecified"
 
+# A mutation route is deliberately checked by this runner before it starts a
+# runtime.  This is a deterministic control-plane receipt, not an assertion
+# about what a model might choose to say in its final response.  The optional
+# flag keeps the generic smoke runner backward compatible for callers which do
+# not exercise a role-specific mutation route.
+_RUNTIME_FOLLOWUP_ROUTE_RE = re.compile(
+    r"(?m)^\s*-\s*runtime_followup_route:\s*([^\s]+)\s*$"
+)
+
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_SKIP = 77
@@ -1984,6 +1993,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--requested-mutation-route",
+        default=None,
+        help=(
+            "optional role-bound mutation route to preflight before launching "
+            "the runtime; a mismatched route is refused before any runtime "
+            "subprocess is invoked"
+        ),
+    )
+    parser.add_argument(
         "--claude-agent-name",
         default=None,
         help=(
@@ -1999,6 +2017,52 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def preflight_requested_mutation_route(
+    worktree: str, agent_type: str, requested_route: str | None
+) -> dict[str, str | None]:
+    """Return a deterministic receipt for an optional mutation-route request.
+
+    The canonical route is read from the active agent TOML rather than a test
+    fixture or a hard-coded role table.  A refusal is a successful preflight
+    outcome: it intentionally prevents the runtime from starting, so no
+    prompt-only model refusal can be mistaken for an authorization boundary.
+    """
+    receipt: dict[str, str | None] = {
+        "requested_mutation_route": requested_route,
+        "declared_mutation_route": None,
+        "route_preflight_decision": "not_requested",
+        "route_preflight_source": None,
+    }
+    if requested_route is None:
+        return receipt
+    if agent_type == _UNSPECIFIED_AGENT_TYPE:
+        receipt["route_preflight_decision"] = "invalid_agent_type"
+        receipt["route_preflight_source"] = "runner_agent_route_guard"
+        return receipt
+
+    agent_path = Path(worktree) / ".codex" / "agents" / f"{agent_type}.toml"
+    try:
+        text = agent_path.read_text(encoding="utf-8")
+    except OSError:
+        receipt["route_preflight_decision"] = "agent_config_unavailable"
+        receipt["route_preflight_source"] = "runner_agent_route_guard"
+        return receipt
+
+    match = _RUNTIME_FOLLOWUP_ROUTE_RE.search(text)
+    if match is None:
+        receipt["route_preflight_decision"] = "declared_route_unavailable"
+        receipt["route_preflight_source"] = "runner_agent_route_guard"
+        return receipt
+
+    declared_route = match.group(1)
+    receipt["declared_mutation_route"] = declared_route
+    receipt["route_preflight_source"] = "runner_agent_route_guard"
+    receipt["route_preflight_decision"] = (
+        "allow" if requested_route == declared_route else "refused_before_runtime"
+    )
+    return receipt
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2041,6 +2105,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[FAIL] {dir_error}", file=sys.stderr)
         return EXIT_FAIL
 
+    route_preflight = preflight_requested_mutation_route(
+        worktree, args.agent_type, args.requested_mutation_route
+    )
+    route_refused = (
+        args.requested_mutation_route is not None
+        and route_preflight["route_preflight_decision"] != "allow"
+    )
+
     # From this point on, worktree/prompt/output_dir are all confirmed
     # usable, so EVERY controlled exit below -- including the
     # capability/herdr preflight SKIPs -- must emit allowlist-only
@@ -2055,13 +2127,13 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = EXIT_OK
     resolved_runtime_bin: str | None = None
 
-    if args.mode == "interactive":
+    if args.mode == "interactive" and not route_refused:
         skip_reason = preflight_herdr()
         if skip_reason:
             errors.append(skip_reason)
             exit_code = EXIT_SKIP
 
-    if exit_code == EXIT_OK:
+    if exit_code == EXIT_OK and not route_refused:
         # Issue #1960 Design Decision 5 (P1-2 fix-delta): resolve the
         # runtime executable exactly ONCE here via ``shutil.which()``
         # (inside ``preflight_claude_available`` / ``preflight_codex_flags``)
@@ -2087,15 +2159,10 @@ def main(argv: list[str] | None = None) -> int:
     tested_head = _git_rev_parse(worktree, "HEAD")
     runtime_version = capture_runtime_version(resolved_runtime_bin) if resolved_runtime_bin else None
     requested_agent_type = args.agent_type
-    # No independent runtime signal of "which persona was effectively
-    # active" was found beyond what was requested: neither Claude Code's
-    # stream-json ``system``/``result`` events nor Codex's ``--json`` event
-    # types echo back a caller-declared agent/persona name (only Codex's
-    # rollout-only ``spawn_agent`` calls carry an ``agent_type`` -- for a
-    # *sub*-agent spawned *by* this run, not for this run's own identity --
-    # see the ``_CODEX_COLLAB_ITEM_TYPE`` note above). Documented finding:
-    # effective_agent_type is therefore set equal to requested_agent_type.
-    effective_agent_type = requested_agent_type
+    # A requested agent is a declaration, not runtime observation.  The
+    # effective identity remains unavailable until the native child evidence
+    # below supplies one; it must never be filled from the request itself.
+    effective_agent_type = None
     loaded_skills = load_static_declared_skills(worktree, requested_agent_type)
     prompt_sha256 = compute_prompt_sha256(prompt)
 
@@ -2115,6 +2182,7 @@ def main(argv: list[str] | None = None) -> int:
         "loaded_skills": loaded_skills,
         "loaded_skills_source": "static_frontmatter" if loaded_skills is not None else None,
         "prompt_sha256": prompt_sha256,
+        **route_preflight,
     }
     if args.mode == "interactive":
         # Issue #1960 Design Decision 5 (P1-2 fix-delta): the interactive
@@ -2141,7 +2209,18 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        if exit_code != EXIT_OK:
+        if route_refused:
+            # The controlled guard declined the route before launching a
+            # runtime.  Record that limited fact only; do not synthesize a
+            # terminal event, loaded Skill, executor invocation, or mutation
+            # observation from static configuration.
+            schema_summary["runtime_invocation"] = "not_started_route_preflight_blocked"
+            schema_summary["terminal_event_observed"] = None
+            schema_summary["child_agent_type_observed"] = None
+            schema_summary["child_agent_type_source"] = None
+            schema_summary["agent_type_identity_verified"] = False
+            schema_summary["native_spawn_event_observed"] = False
+        elif exit_code != EXIT_OK:
             # A capability/herdr preflight above already decided this run is
             # a controlled SKIP -- do not attempt to launch either lane.
             # Evidence (schema_summary as built so far, including
@@ -2250,6 +2329,7 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["child_agent_type_source"] = child_agent_type_source
             schema_summary["child_spawn_launch_mode"] = child_spawn_launch_mode
             schema_summary["agent_type_identity_verified"] = agent_type_identity_verified
+            schema_summary["effective_agent_type"] = child_agent_type_observed
             schema_summary["native_spawn_event_observed"] = bool(
                 parent_session_id
                 and child_session_id
