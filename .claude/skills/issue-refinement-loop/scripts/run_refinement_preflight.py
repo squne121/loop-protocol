@@ -215,6 +215,17 @@ def _validate_artifact_projection(*, repo_root: Path, issue_number: int, artifac
 # Trusted author associations for ANCHOR_SCOPE_REFRAME_V1
 TRUSTED_ANCHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
+# Canonical machine-generated comments can be authored through the same
+# GitHub principal as a human OWNER. Their marker is provenance, not a
+# presentation-style heuristic: a generated handoff must never become its own
+# next-iteration approval. A root control-plane may materialize an already
+# received interactive human instruction with the explicit compatibility
+# marker below; that marker is distinct from ordinary generated reports.
+_GENERATED_COMMENT_MARKERS = ("LOOP_HANDOFF_RESULT_V1", "CONTROLLED_EXEC_MARKER")
+_DIRECT_INTERACTIVE_HUMAN_MATERIALIZATION_MARKER = (
+    "OWNER_DIRECTIVE_MATERIALIZED_FROM_INTERACTIVE_PROMPT_V1"
+)
+
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
@@ -1925,12 +1936,21 @@ def _build_scope_delta_authority_evidence(
     confidence = classify_directive_confidence(comment_body, markers)
     boundary_flags_map = detect_boundary_flags(comment_body)
     boundary_flag_names = [name for name, value in boundary_flags_map.items() if value]
+    has_generated_marker = any(marker in comment_body for marker in _GENERATED_COMMENT_MARKERS)
+    is_materialized_interactive_human = (
+        _DIRECT_INTERACTIVE_HUMAN_MATERIALIZATION_MARKER in comment_body
+    )
+    source_kind = (
+        "generated_by_agent"
+        if has_generated_marker and not is_materialized_interactive_human
+        else "issue_comment"
+    )
 
     issue_url = f"https://github.com/{repo}/issues/{issue_number}"
 
     return {
         "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
-        "source_kind": "issue_comment",
+        "source_kind": source_kind,
         "source_ref": anchor_url,
         "source_issue_number": issue_number,
         "comment_id": comment_payload.get("id"),

@@ -605,7 +605,8 @@ _BOUNDARY_FLAG_KEYS = (
 
 _BOUNDARY_KEYWORD_PATTERNS = {
     "changes_permission_boundary": re.compile(
-        r"(permission escalat|権限昇格|privilege escalat|grant.*(sudo|root)|sudo access|root access)",
+        r"(permission (?:escalat|boundary|delta)|権限(?:昇格|境界|差分)|"
+        r"privilege escalat|grant.*(sudo|root)|sudo access|root access)",
         re.IGNORECASE,
     ),
     "changes_external_service_boundary": re.compile(
@@ -613,11 +614,16 @@ _BOUNDARY_KEYWORD_PATTERNS = {
         re.IGNORECASE,
     ),
     "destructive_or_non_idempotent_operation": re.compile(
-        r"(destructive|irreversible|non-idempotent|破壊的|force[- ]push|rm -rf|drop table)",
+        r"((?<!non-)destructive|irreversible|(?<!non-)idempotent|破壊的(?!でない)|force[- ]push|rm -rf|drop table)",
         re.IGNORECASE,
     ),
     "requires_issue_split": re.compile(
-        r"(split into (multiple|separate) issues?|別[Ii]ssue.*分割|複数.*[Ii]ssue.*分割|issue.*split)",
+        # A role/component/class split is not an Issue partition. Only text
+        # that unambiguously requires multiple/separate Issues (or explicitly
+        # states an Issue partition) may enter this fail-closed lane.
+        r"(split into (multiple|separate) issues?|"
+        r"(?:multiple|separate) issues?(?:\s*(?:and|/)?\s*PRs?)?|"
+        r"issue partition|別[Ii]ssue.*分割|複数.*[Ii]ssue.*分割)",
         re.IGNORECASE,
     ),
 }
@@ -631,6 +637,12 @@ _DIRECTIVE_SECTION_MARKERS = (
     "allowed paths",
     "allowed paths expansion",
     "verification command",
+    "contract update",
+    "scope delta",
+    "permission boundary",
+    "全面改訂",
+    "分割しない",
+    "1 issue = 1 pr",
 )
 
 _BULLET_LINE_RE = re.compile(r"^\s*[-*]\s+\S.*$", re.MULTILINE)
@@ -1307,6 +1319,39 @@ def _first_true_boundary_reason(boundary_flags: dict):
     return None
 
 
+def _permission_boundary_is_constrained_directive(evidence: dict, boundary_flags: dict) -> bool:
+    """Return whether a permission redesign is explicitly constrained.
+
+    Permission-boundary work remains fail-closed by default. The existing
+    evidence schema intentionally carries only normalized directive text, so
+    this predicate uses that already-extracted text and never requests raw
+    comment bodies or adds a parallel authorization schema. Every safety
+    statement is required; omission is not treated as approval.
+    """
+    if not boundary_flags.get("changes_permission_boundary"):
+        return False
+    if boundary_flags.get("destructive_or_non_idempotent_operation") or boundary_flags.get(
+        "requires_issue_split"
+    ):
+        return False
+
+    text = "\n".join(str(item) for item in (evidence.get("extracted_directives") or [])).lower()
+    required_groups = (
+        ("exact permission delta", "exact delta", "exact に", "正確な権限差分", "exact diff"),
+        ("least privilege", "least-privilege", "最小権限"),
+        ("non-destructive", "非破壊", "not destructive", "破壊的でない"),
+        ("no secret", "no secrets", "secretなし", "secretsなし", "シークレットなし"),
+        ("no paid", "no external paid", "external-paidなし", "外部課金なし", "課金なし"),
+        (
+            "no unrelated privilege widening",
+            "no unrelated widening",
+            "unrelated privilege wideningなし",
+            "無関係な権限拡大なし",
+        ),
+    )
+    return all(any(marker in text for marker in group) for group in required_groups)
+
+
 def _classify_single_evidence(evidence: dict) -> dict:
     source_kind = evidence.get("source_kind")
     author_association = evidence.get("author_association")
@@ -1478,6 +1523,17 @@ def classify_scope_delta_authority(
 
     # category == human_review_directive
     boundary_reason = _first_true_boundary_reason(boundary_flags)
+    if boundary_reason == REASON_CHANGES_PERMISSION_BOUNDARY and _permission_boundary_is_constrained_directive(
+        primary_evidence, boundary_flags
+    ):
+        # A trusted, explicit, least-privilege redesign still requires a
+        # contract update and fresh validation; it never grants implementation
+        # permission at this point.
+        boundary_reason = None
+    elif boundary_reason == REASON_EXPANDS_ALLOWED_PATHS:
+        # Exact path expansion supplied by an explicit trusted directive is a
+        # contract-update concern, not a second human-approval loop.
+        boundary_reason = None
     if boundary_reason is not None:
         # AC18: boundary flags gate even a trusted approval.
         return _build_scope_delta_authority_result(

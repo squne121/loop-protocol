@@ -110,6 +110,34 @@ GitHub API の `author_association` フィールドで判定する。
 
 trusted anchor と判定された場合のみ `scope_delta_decision.status=approved_by_trusted_anchor` を生成する。scope 拡張の自動実装許可は禁止。
 
+### trusted directive の互換経路
+
+`SCOPE_DELTA_AUTHORITY_EVIDENCE_V1` は、既存 `ANCHOR_SCOPE_REFRAME_V1` が無い
+明示 directive も、抽出済みの directive／source URL／comment ID／body hash／source span
+だけを用いて `contract_update_required` に正規化できる。raw comment body を planner
+input に渡さず、新しい authority schema も作らない。
+
+- role / component / class / module / agent の split は Issue partition ではない。
+  `requires_issue_split=true` は複数・別 Issue（必要なら独立 PR）を明示した trusted
+  directive に限る。
+- trusted かつ explicit な exact Allowed Paths delta は contract update の対象であり、
+  それだけで implementation を許可しない。
+- permission-boundary redesign は、exact delta、least privilege、非破壊、secret なし、
+  external paid service なし、無関係な権限拡大なしを **すべて** 明示した場合だけ
+  `contract_update_required` に進む。どれかが欠ける場合、または destructive / Issue
+  partition が混在する場合は human escalation のままにする。
+- contract update 後は contract review、refinement preflight、allowed-path gate、該当する
+  permission/profile validator と runtime evidence を fresh に成功させるまで
+  implementation route を許可しない。
+
+GitHub の `author_association=OWNER`、投稿アカウント、Markdown の見出し数・引用数などは
+origin や authorization を単独で決めない。`LOOP_HANDOFF_RESULT_V1` または
+`CONTROLLED_EXEC_MARKER` を持つ canonical generated comment は `generated_by_agent` として
+human directive candidate から除外する。root control-plane が既に受領した interactive human
+instruction を materialize する場合だけ、明示 provenance marker
+`OWNER_DIRECTIVE_MATERIALIZED_FROM_INTERACTIVE_PROMPT_V1` を付与して通常の generated handoff
+と区別する。この marker は implementation go を与えず、上記 fresh rerun を省略しない。
+
 ### phase ごとの扱い（phase-sensitive semantics）
 
 anchor reframe は refinement loop の phase によって異なる扱いをする。
