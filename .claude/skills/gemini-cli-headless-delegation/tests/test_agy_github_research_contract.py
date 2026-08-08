@@ -200,7 +200,7 @@ def test_ac2_github_research_is_in_permission_policy_allowed_profiles(permission
         "--raw-field=body=probe",
         "-fbody=probe",
         "-XPOST",
-        "--input=/tmp/body.json",
+        "--input=./body.json",
         "-F",
         "--method=DELETE",
     ],
@@ -505,11 +505,23 @@ def test_ac4_never_reuses_undefined_route_smoke_schema():
 
 
 def test_ac5_missing_gh_token_produces_skip_not_pass(tmp_path, monkeypatch):
+    """Issue #2012: GH_TOKEN alone missing is no longer immediately fatal in
+    the orchestrator (credential resolution has moved into the broker
+    subprocess, which can bootstrap a stored `gh` credential). SKIP is still
+    produced -- never PASS -- when the broker subprocess cannot resolve any
+    credential at all (env var absent *and* bootstrap unavailable, simulated
+    here as a broker-subprocess denial of the read-only preflight probe)."""
     e2e = _load("run_agy_github_research_e2e_under_test_skip", "run_agy_github_research_e2e.py")
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.setattr(e2e, "_resolve_agy_binary", lambda: "/usr/bin/agy")
+    monkeypatch.setattr(e2e, "_resolve_gh_binary", lambda: "/usr/bin/gh")
     monkeypatch.setattr(e2e, "_agy_version_and_permission_gate", lambda _bin: (True, None, {}))
+
+    def _deny(*_a, **_k):
+        raise e2e.broker.BrokerDenied("credential_bootstrap_gh_cli_unavailable")
+
+    monkeypatch.setattr(e2e, "_execute_via_broker_subprocess", _deny)
     result = e2e.run_github_research_route(
         {"schema": "delegation_request_v1", "provider": "agy", "tool_profile": "github_research", "prompt": "x"}
     )
@@ -692,11 +704,10 @@ def test_blocker6_preflight_never_probes_readonly_auth_when_gate_fails(monkeypat
     def _boom(*_a, **_k):
         raise AssertionError("must not execute a broker operation when the preflight gate fails")
 
-    monkeypatch.setattr(e2e.broker, "execute_operation", _boom)
-    ok, reason, token = e2e._preflight(gh_token_env="GH_TOKEN")
+    monkeypatch.setattr(e2e, "_execute_via_broker_subprocess", _boom)
+    ok, reason = e2e._preflight(gh_token_env="GH_TOKEN")
     assert ok is False
     assert reason == "agy_version_unverifiable"
-    assert token is None
 
 
 # ---------------------------------------------------------------------------
