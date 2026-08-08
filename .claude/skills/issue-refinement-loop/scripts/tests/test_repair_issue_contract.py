@@ -590,3 +590,136 @@ def test_insert_baseline_expect_fail_for_new_allowed_path():
         )
     ), ins[0]
     assert res["dry_run"] is True, res
+
+
+# ---------------------------------------------------------------------------
+# Issue #2016 iteration-3 (OWNER adversarial review P0-2): candidate body
+# materialization leaf/parent-symlink attack rejection.
+# ---------------------------------------------------------------------------
+
+
+def _import_ric():
+    import sys as _sys
+
+    scripts_dir = Path(__file__).resolve().parents[1]
+    if str(scripts_dir) not in _sys.path:
+        _sys.path.insert(0, str(scripts_dir))
+    import repair_issue_contract as _ric
+
+    return _ric
+
+
+def test_candidate_leaf_symlink_is_rejected_without_target_write(tmp_path):
+    """P0-2: a pre-existing symlink at the candidate leaf path must be
+    rejected WITHOUT writing through it to the symlink target (the actual
+    attack: a plain Path.write_text() would silently overwrite whatever the
+    symlink points at)."""
+    ric = _import_ric()
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do-not-touch", encoding="utf-8")
+
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    leaf = artifact_dir / "repaired_issue_body.md"
+    leaf.symlink_to(victim)
+
+    try:
+        ric.secure_atomic_write_candidate(leaf, "malicious content", root=artifact_dir)
+        raised = False
+    except ric.CandidateWriteSecurityError:
+        raised = True
+
+    assert raised, "expected CandidateWriteSecurityError for a pre-existing leaf symlink"
+    # The victim file must be completely untouched -- proves the write never
+    # followed the symlink.
+    assert victim.read_text(encoding="utf-8") == "do-not-touch"
+    # The symlink itself must still be a symlink (not replaced/removed).
+    assert leaf.is_symlink()
+
+
+def test_candidate_parent_symlink_is_rejected(tmp_path):
+    """P0-2: a symlinked ancestor directory between the candidate leaf and
+    the allowed artifact root must be rejected -- not just a symlinked
+    leaf."""
+    ric = _import_ric()
+
+    real_root = tmp_path / "real_artifacts"
+    real_root.mkdir()
+    outside_target = tmp_path / "outside_dir"
+    outside_target.mkdir()
+
+    # artifact_dir/subdir is actually a symlink pointing OUTSIDE real_root.
+    symlinked_subdir = real_root / "subdir"
+    symlinked_subdir.symlink_to(outside_target)
+
+    leaf = symlinked_subdir / "repaired_issue_body.md"
+
+    try:
+        ric.secure_atomic_write_candidate(leaf, "malicious content", root=real_root)
+        raised = False
+    except ric.CandidateWriteSecurityError:
+        raised = True
+
+    assert raised, "expected CandidateWriteSecurityError for a symlinked ancestor directory"
+    assert not (outside_target / "repaired_issue_body.md").exists()
+
+
+def test_candidate_fifo_leaf_is_rejected(tmp_path):
+    """P0-2 (required test 6): a FIFO at the candidate leaf path must also
+    be rejected (not just symlinks/directories)."""
+    import os as _os
+
+    ric = _import_ric()
+
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    leaf = artifact_dir / "repaired_issue_body.md"
+    _os.mkfifo(leaf)
+
+    try:
+        ric.secure_atomic_write_candidate(leaf, "content", root=artifact_dir)
+        raised = False
+    except ric.CandidateWriteSecurityError:
+        raised = True
+
+    assert raised, "expected CandidateWriteSecurityError for a FIFO leaf"
+
+
+def test_candidate_directory_leaf_is_rejected(tmp_path):
+    """P0-2 (required test 6): a directory at the candidate leaf path
+    (directory substitution) must be rejected."""
+    ric = _import_ric()
+
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    leaf = artifact_dir / "repaired_issue_body.md"
+    leaf.mkdir()
+
+    try:
+        ric.secure_atomic_write_candidate(leaf, "content", root=artifact_dir)
+        raised = False
+    except ric.CandidateWriteSecurityError:
+        raised = True
+
+    assert raised, "expected CandidateWriteSecurityError for a directory leaf"
+    assert leaf.is_dir()
+
+
+def test_secure_atomic_write_candidate_succeeds_for_clean_path(tmp_path):
+    """P0-2 sanity check: the secure writer still works normally (writes,
+    fsyncs, and readback-matches) when there is no attack in play."""
+    ric = _import_ric()
+
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    leaf = artifact_dir / "repaired_issue_body.md"
+
+    ric.secure_atomic_write_candidate(leaf, "clean content", root=artifact_dir)
+
+    assert leaf.read_text(encoding="utf-8") == "clean content"
+    assert not leaf.is_symlink()
+
+    # Idempotent overwrite of an existing regular file must also succeed.
+    ric.secure_atomic_write_candidate(leaf, "clean content v2", root=artifact_dir)
+    assert leaf.read_text(encoding="utf-8") == "clean content v2"

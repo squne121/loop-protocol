@@ -40,7 +40,9 @@ import json
 import os
 import shlex
 import re
+import stat
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -50,6 +52,173 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 SCHEMA = "repair_issue_contract/v1"
+
+# ---------------------------------------------------------------------------
+# repair_action disposition (Issue #2016)
+#
+# `confidence` alone is diagnostic metadata, not an authorization signal
+# (OWNER adversarial review on Issue #2016, P1-4). This module computes a
+# single versioned, closed-enum `repair_action.disposition` from ALL
+# `repairs[]` records so that downstream consumers (run_refinement_preflight.py)
+# never have to re-derive safety semantics from raw repair records.
+# ---------------------------------------------------------------------------
+
+REPAIR_ACTION_SCHEMA_VERSION = "repair_action/v1"
+REPAIR_ACTION_POLICY_VERSION = "deterministic-issue-repair/v1"
+
+DISPOSITION_AUTO_APPLY_SAFE = "auto_apply_safe"
+DISPOSITION_HUMAN_REVIEW_REQUIRED = "human_review_required"
+DISPOSITION_INFORMATIONAL = "informational"
+DISPOSITION_INVALID_PAYLOAD = "invalid_payload"
+
+# Non-mutating diagnostic kinds: original == repaired always, these never
+# affect the aggregate disposition.
+_INFORMATIONAL_REPAIR_KINDS = frozenset({"non_target_fence"})
+
+# Mutating kinds that MAY be auto-applied, but only when the record also
+# carries `confidence: "high"`. Missing confidence on one of these kinds is
+# treated as a missing safety classification (human_review_required), not
+# as an implicit high-confidence grant.
+_SAFE_MUTATING_KINDS_REQUIRE_HIGH_CONFIDENCE = frozenset({
+    "move_inline_baseline_expect_to_preceding_line",
+    "insert_baseline_expect_fail",
+})
+
+# Known mutating kinds that are never auto-safe regardless of confidence
+# (kept distinct from "unknown kind" purely for reason_code specificity).
+_KNOWN_NON_AUTO_SAFE_MUTATING_KINDS = frozenset({
+    "runtime_only_command",
+    "escaped_code_fence",
+})
+
+
+def _ranges_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    a_start, a_end = a
+    b_start, b_end = b
+    return a_start <= b_end and b_start <= a_end
+
+
+def classify_repair_action(
+    original_body_sha256: str,
+    repaired_body_sha256: str,
+    repairs: object,
+) -> dict:
+    """Classify all `repairs[]` records into a single versioned disposition.
+
+    Disposition closed enum:
+      auto_apply_safe        - >=1 known-safe mutating repair with
+                                confidence: high, no unsafe/unknown/mixed/
+                                overlapping records present.
+      human_review_required  - unknown kind, missing safety classification,
+                                a non-auto-safe mutating kind, safe/unsafe
+                                mixed, or overlapping mutating repairs.
+      informational           - no mutating repairs at all (empty repairs[],
+                                or only non-mutating diagnostic records).
+      invalid_payload         - `repairs` is not a list, or contains a
+                                malformed (non-dict / missing "kind") record.
+
+    Design note (P1-4 of the Issue #2016 adversarial review): this function
+    deliberately does NOT use `all(r.get("confidence") == "high" for r in
+    repairs)` because Python's `all()` returns True on an empty iterable,
+    which would misclassify `repairs == []` as safe. The `repairs == []`
+    and malformed-record cases are branched explicitly instead.
+    """
+    if not isinstance(repairs, list):
+        return {
+            "schema_version": REPAIR_ACTION_SCHEMA_VERSION,
+            "policy_version": REPAIR_ACTION_POLICY_VERSION,
+            "disposition": DISPOSITION_INVALID_PAYLOAD,
+            "original_body_sha256": original_body_sha256,
+            "repaired_body_sha256": repaired_body_sha256,
+            "diagnostics_artifact": None,
+            "candidate_body_artifact": None,
+            "repair_kinds": [],
+            "reason_codes": ["repairs_field_not_a_list"],
+        }
+
+    if not repairs:
+        return {
+            "schema_version": REPAIR_ACTION_SCHEMA_VERSION,
+            "policy_version": REPAIR_ACTION_POLICY_VERSION,
+            "disposition": DISPOSITION_INFORMATIONAL,
+            "original_body_sha256": original_body_sha256,
+            "repaired_body_sha256": repaired_body_sha256,
+            "diagnostics_artifact": None,
+            "candidate_body_artifact": None,
+            "repair_kinds": [],
+            "reason_codes": ["no_repairs_detected"],
+        }
+
+    mutating_kinds_seen: list[str] = []
+    has_unsafe = False
+    has_safe_mutating = False
+    unsafe_reason_codes: set[str] = set()
+    mutating_ranges: list[tuple[int, int]] = []
+
+    for record in repairs:
+        if not isinstance(record, dict) or "kind" not in record:
+            has_unsafe = True
+            unsafe_reason_codes.add("malformed_repair_record")
+            continue
+
+        kind = record.get("kind")
+
+        if kind in _INFORMATIONAL_REPAIR_KINDS:
+            continue  # non-mutating diagnostic record; does not affect disposition
+
+        if kind not in mutating_kinds_seen:
+            mutating_kinds_seen.append(kind)
+
+        confidence = record.get("confidence")
+
+        if kind in _SAFE_MUTATING_KINDS_REQUIRE_HIGH_CONFIDENCE and confidence == "high":
+            has_safe_mutating = True
+            start = record.get("line_start")
+            end = record.get("line_end")
+            if isinstance(start, int) and isinstance(end, int):
+                mutating_ranges.append((start, end))
+        elif kind in _SAFE_MUTATING_KINDS_REQUIRE_HIGH_CONFIDENCE:
+            has_unsafe = True
+            unsafe_reason_codes.add("missing_safety_classification")
+        elif kind in _KNOWN_NON_AUTO_SAFE_MUTATING_KINDS:
+            has_unsafe = True
+            unsafe_reason_codes.add("non_auto_safe_repair_kind")
+        else:
+            has_unsafe = True
+            unsafe_reason_codes.add("unknown_repair_kind")
+
+    overlap_found = any(
+        _ranges_overlap(mutating_ranges[i], mutating_ranges[j])
+        for i in range(len(mutating_ranges))
+        for j in range(i + 1, len(mutating_ranges))
+    )
+
+    if has_unsafe:
+        disposition = DISPOSITION_HUMAN_REVIEW_REQUIRED
+        reason_codes = sorted(unsafe_reason_codes)
+    elif overlap_found:
+        disposition = DISPOSITION_HUMAN_REVIEW_REQUIRED
+        reason_codes = ["overlapping_repair"]
+    elif has_safe_mutating:
+        disposition = DISPOSITION_AUTO_APPLY_SAFE
+        reason_codes = ["deterministic_body_author_fix_available"]
+    else:
+        # Only informational (non-mutating) records were present.
+        disposition = DISPOSITION_INFORMATIONAL
+        reason_codes = ["no_mutating_repair_detected"]
+
+    return {
+        "schema_version": REPAIR_ACTION_SCHEMA_VERSION,
+        "policy_version": REPAIR_ACTION_POLICY_VERSION,
+        "disposition": disposition,
+        "original_body_sha256": original_body_sha256,
+        "repaired_body_sha256": repaired_body_sha256,
+        "diagnostics_artifact": None,
+        "candidate_body_artifact": None,
+        "repair_kinds": mutating_kinds_seen,
+        "reason_codes": reason_codes,
+    }
+
 
 # Commands that are in the allowlist and must NOT be deferred/annotated.
 # These are baseline regression gates.
@@ -642,11 +811,121 @@ def repair_body(body: str) -> tuple[str, list[dict]]:
     return body, all_repairs
 
 
+
+# ---------------------------------------------------------------------------
+# Candidate materialization security (Issue #2016 iteration-3 OWNER
+# adversarial review P0-2): the candidate body path is a fixed, predictable
+# location. A plain Path.write_text() there follows a pre-existing symlink
+# and overwrites whatever it points at. These helpers fail closed on:
+#   - a pre-existing symlink / FIFO / device / directory at the leaf path
+#   - a symlinked ancestor directory between the leaf and the caller-supplied
+#     artifact root
+# and only ever materialize the candidate via a securely-created sibling
+# temp file (O_CREAT|O_EXCL|O_NOFOLLOW) that is fsync'd, hash-verified, and
+# then atomically os.replace()'d onto the final leaf path.
+# ---------------------------------------------------------------------------
+
+
+class CandidateWriteSecurityError(Exception):
+    """Raised when the candidate body materialization path fails a
+    fail-closed leaf/ancestor safety check."""
+
+
+def _reject_unsafe_leaf(path: Path) -> None:
+    """Fail-closed leaf check: reject a pre-existing symlink / FIFO /
+    device / directory at `path`. Uses os.lstat (does NOT follow symlinks)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise CandidateWriteSecurityError(f"candidate_leaf_lstat_error:{path}:{exc}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise CandidateWriteSecurityError(f"candidate_leaf_is_symlink:{path}")
+    if stat.S_ISDIR(st.st_mode):
+        raise CandidateWriteSecurityError(f"candidate_leaf_is_directory:{path}")
+    if not stat.S_ISREG(st.st_mode):
+        raise CandidateWriteSecurityError(f"candidate_leaf_not_regular_file:{path}")
+
+
+def _reject_unsafe_parent_chain(path: Path, root: Optional[Path]) -> None:
+    """Reject if any ancestor directory of `path` (up to and including
+    `root`, when given) is itself a symlink, and verify the resolved parent
+    is contained within `root`. Fail-closed: an unresolvable ancestor or an
+    ancestor outside `root` is rejected."""
+    node = path.parent
+    while True:
+        try:
+            st = os.lstat(node)
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(st.st_mode):
+            raise CandidateWriteSecurityError(f"candidate_ancestor_is_symlink:{node}")
+        if root is not None and node.resolve(strict=False) == root.resolve(strict=False):
+            break
+        parent = node.parent
+        if parent == node:
+            break
+        node = parent
+
+    if root is not None:
+        try:
+            resolved_parent = path.parent.resolve(strict=False)
+            resolved_root = root.resolve(strict=False)
+        except Exception as exc:
+            raise CandidateWriteSecurityError(f"candidate_parent_unresolvable:{exc}") from exc
+        if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+            raise CandidateWriteSecurityError(
+                f"candidate_parent_outside_root:{resolved_parent}:not_under:{resolved_root}"
+            )
+
+
+def secure_atomic_write_candidate(path: Path, text: str, *, root: Optional[Path] = None) -> None:
+    """Write `text` to `path` with fail-closed symlink/parent-symlink
+    protection (Issue #2016 iteration-3 P0-2). Never truncates through a
+    pre-existing symlink: creates a securely-named sibling temp file with
+    O_CREAT|O_EXCL|O_NOFOLLOW, fsyncs it, re-checks the leaf immediately
+    before replace (narrowing the TOCTOU window), then atomically
+    os.replace()s it onto the final leaf path."""
+    _reject_unsafe_parent_chain(path, root)
+    _reject_unsafe_leaf(path)
+
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    encoded = text.encode("utf-8")
+
+    tmp_name = f".{path.name}.{os.getpid()}.{int(time.time() * 1000000)}.tmp"
+    tmp_path = directory / tmp_name
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    fd = os.open(str(tmp_path), flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Re-check the leaf immediately before replace: narrows (does not
+        # eliminate) the TOCTOU window between the initial check and the
+        # rename. os.replace() itself is an atomic rename, so once this
+        # check passes the actual swap cannot be intercepted.
+        _reject_unsafe_leaf(path)
+        os.replace(str(tmp_path), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(tmp_path))
+        except OSError:
+            pass
+        raise
+
+
 def run_repair(
     body: str,
     *,
     apply: bool = False,
     out_file: Optional[str] = None,
+    root_dir: Optional[str] = None,
 ) -> dict:
     """Run repair and return the result JSON dict.
 
@@ -654,6 +933,9 @@ def run_repair(
         body:     Issue body text.
         apply:    If True, write repaired body to out_file (or raise if not given).
         out_file: Path to write repaired body when apply=True.
+        root_dir: Optional allowed artifact root for containment verification
+                  (Issue #2016 iteration-3 P0-2). When given, out_file's
+                  parent directory chain must resolve within this root.
     """
     original_sha = _sha256(body)
 
@@ -662,10 +944,18 @@ def run_repair(
     repaired_sha = _sha256(repaired_body)
     changed = original_sha != repaired_sha
 
+    repair_action = classify_repair_action(original_sha, repaired_sha, repairs)
+
     if apply:
         if not out_file:
             raise ValueError("--out-file is required when --apply is set")
-        Path(out_file).write_text(repaired_body, encoding="utf-8")
+        written_path = Path(out_file)
+        artifact_root = Path(root_dir) if root_dir else None
+        secure_atomic_write_candidate(written_path, repaired_body, root=artifact_root)
+        # Readback validation: confirm bytes round-trip before advertising
+        # the artifact path as a canonical candidate_body_artifact.
+        if written_path.read_text(encoding="utf-8") == repaired_body:
+            repair_action["candidate_body_artifact"] = str(written_path.resolve())
 
     return {
         "schema": SCHEMA,
@@ -674,6 +964,7 @@ def run_repair(
         "original_body_sha256": original_sha,
         "repaired_body_sha256": repaired_sha,
         "repairs": repairs,
+        "repair_action": repair_action,
     }
 
 
@@ -700,6 +991,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--out-file",
         default=None,
         help="Output path for repaired body (required when --apply is given)",
+    )
+    parser.add_argument(
+        "--artifact-root",
+        default=None,
+        help=(
+            "Allowed artifact root for candidate materialization containment "
+            "verification (Issue #2016 iteration-3 P0-2). Optional."
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -749,7 +1048,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     try:
-        result = run_repair(body, apply=args.apply, out_file=args.out_file)
+        result = run_repair(body, apply=args.apply, out_file=args.out_file, root_dir=args.artifact_root)
+    except CandidateWriteSecurityError as exc:
+        result = {
+            "schema": SCHEMA,
+            "dry_run": not args.apply,
+            "changed": False,
+            "original_body_sha256": "sha256:",
+            "repaired_body_sha256": "sha256:",
+            "repairs": [],
+            "error": f"candidate_write_security_error: {exc}",
+        }
+        print(json.dumps(result, indent=2))
+        return 1
     except Exception as exc:
         result = {
             "schema": SCHEMA,
