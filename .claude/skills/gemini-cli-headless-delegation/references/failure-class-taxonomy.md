@@ -380,7 +380,7 @@ headless_json fallback が可能なものと不可なものが区別されてい
 | `watchdog` | no | HeartbeatWatchdog によるトリップ |
 | `contract_bypass` | no | `prepared_prompt` なしで `run_acp()` 呼び出し |
 
-### Serena MCP live collector failure classes（local_asset_research route、Issue #2015）
+### Serena MCP live collector failure classes（local_asset_research route の実ライブ収集失敗分類、Issue #2015）
 
 `local_asset_research` route の `_collect_live_serena_read_only_evidence()`
 （`run_gemini_headless.py`）が起こす stage-specific failure。専用の
@@ -407,10 +407,12 @@ retry policy（Issue #2015 AC5）: `startup_timeout` / `request_timeout` の
 は禁止）。他の failure class は retry せず即座に fail-close する。
 
 deadline hierarchy（Issue #2015 AC6、`time.monotonic()` ベース）:
+内側の呼び出しほど短い制限時間を持つよう、次の順で厳密に大きくなる階層関係を維持する。
 `server_tool_timeout`（45s）< `client_request_timeout`（60s）<
 `collector_session_deadline`（120s）< `route_harness_timeout`（180s、
 `scripts/agent-ops/run_agent_provider_route_smoke.py --timeout-seconds`
-既定値）- `cleanup_grace`（10s）。
+既定値）- `cleanup_grace`（10s）。外側の制限が内側の制限より必ず大きいことで、
+タイムアウト発生時に内側から順に安全に打ち切られる。
 
 request ledger（Issue #2015 AC1）: 各 JSON-RPC request は
 `local_asset_retrieval_metadata.request_ledger` に
