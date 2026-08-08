@@ -2189,6 +2189,64 @@ def mcp_capability_status() -> dict[str, Any]:
     }
 
 
+# Issue #2038 AC1/AC4: same-binary structured-output (`--output-format
+# {json,stream-json}`) capability record. `run_gemini_headless.py` must
+# consume this single SSOT rather than independently judging `agy --help`
+# itself (Issue #2038 In Scope) so that a structured-output-unsupported /
+# unavailable / evidence_invalid answer (or unparseable probe result) is
+# classified consistently everywhere and can drive a fail-closed
+# `capability_unavailable` failure_class instead of a silent fallback to
+# stdout best-effort text parsing.
+STRUCTURED_OUTPUT_FORMAT_VALUES: frozenset[str] = frozenset({"json", "stream-json"})
+_STRUCTURED_OUTPUT_VALUE_RE = re.compile(r"\b(json|stream-json)\b")
+
+
+def structured_output_capability_status(help_result: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the `agy_capability_matrix/v1`-shaped capability record for
+    AGY `-p ... --output-format {json,stream-json}` support (Issue #2038).
+
+    *help_result* must be the ``{"exit_code": int | None, "stdout": str,
+    "stderr": str}``-shaped dict produced by running ``agy --help`` against
+    the *exact same* agy binary the caller is about to invoke (same-binary
+    evidence, mirroring `binary_identity_matches()`'s intent elsewhere in
+    this module) -- this function never probes on its own and never mixes
+    evidence from a different binary invocation.
+
+    Per Issue #1941's evidence-priority policy, `help` output is supporting
+    evidence only and never independently confirms `supported` on its own --
+    the flag being present (with a recognized value enumerated nearby) in
+    `--help` text resolves to `inconclusive`, pending an actual
+    `runtime_semantic_observation` (a real, successful `--output-format
+    json`/`stream-json` invocation) that this function does not itself
+    perform. A missing/failed probe resolves to `unavailable`; help text
+    that mentions the flag with no recognized value token resolves to
+    `evidence_invalid` (malformed/unparseable evidence) -- both are
+    fail-closed, non-`supported` outcomes for Issue #2038 AC4's consumer.
+    """
+    if not isinstance(help_result, dict):
+        return _predicate_result("unavailable", reason_code="help_probe_not_run", evidence_source="help")
+    exit_code = help_result.get("exit_code")
+    # Real `agy --help` output has been observed on both stdout and stderr
+    # depending on version/platform; combine both the same way
+    # `run_preflight()` already does for its own help-text parsing (see the
+    # `help_proc.stdout, help_proc.stderr` join above) rather than trusting
+    # stdout alone.
+    help_text = "\n".join(part for part in [help_result.get("stdout"), help_result.get("stderr")] if part)
+    if exit_code != 0 or not help_text.strip():
+        return _predicate_result("unavailable", reason_code="agy_help_probe_failed", evidence_source="help")
+    if "--output-format" not in help_text:
+        return _predicate_result("unsupported", reason_code="flag_absent_from_help", evidence_source="help")
+    if not _STRUCTURED_OUTPUT_VALUE_RE.search(help_text):
+        return _predicate_result(
+            "evidence_invalid", reason_code="flag_present_without_value_enum", evidence_source="help"
+        )
+    return _predicate_result(
+        "inconclusive",
+        reason_code="help_only_evidence_pending_runtime_confirmation",
+        evidence_source="help",
+    )
+
+
 _CAPABILITY_MEMO_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 

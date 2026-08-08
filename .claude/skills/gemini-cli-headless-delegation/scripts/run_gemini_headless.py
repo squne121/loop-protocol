@@ -42,6 +42,16 @@ except ImportError:  # pragma: no cover - script always ships alongside this mod
     _agy_provenance = None  # type: ignore[assignment]
     _AGY_PROVENANCE_AVAILABLE = False
 
+# Issue #2038 In Scope: structured-output capability judgment must be
+# consumed from preflight_agy.py's single same-binary capability SSOT
+# rather than this module independently parsing `agy --help` itself.
+try:
+    import preflight_agy as _preflight_agy
+    _PREFLIGHT_AGY_AVAILABLE = True
+except ImportError:  # pragma: no cover - script always ships alongside this module
+    _preflight_agy = None  # type: ignore[assignment]
+    _PREFLIGHT_AGY_AVAILABLE = False
+
 DEFAULT_MODEL = "gemini-3-flash-preview"
 DEFAULT_TIMEOUT_SEC = 600
 RETRY_LIMIT = 2
@@ -2695,7 +2705,21 @@ def _reject_agy_prompt_leading_slash_command(prompt: str) -> None:
         )
 
 
-def _build_agy_inner_argv(agy_bin: str, prompt: str, model: str | None = None) -> list[str]:
+# Issue #2038 AC1: the only two `--output-format` values this wrapper's
+# argv builder/validator will ever allowlist. Explicit, closed value
+# enumeration -- never a free-form flag-value pass-through -- so this
+# extension cannot be abused to smuggle an arbitrary option value the way a
+# generic flag parser could (Out of Scope: "-p/--model 以外の任意flag許可").
+AGY_OUTPUT_FORMAT_VALUES: "frozenset[str]" = frozenset({"json", "stream-json"})
+
+
+def _build_agy_inner_argv(
+    agy_bin: str,
+    prompt: str,
+    model: str | None = None,
+    *,
+    output_format: str | None = None,
+) -> list[str]:
     """Single canonical builder for the agy invocation argv (Issue #1807).
 
     Both the real execution argv (`_run_agy()`, passed to `subprocess.run()`)
@@ -2703,15 +2727,27 @@ def _build_agy_inner_argv(agy_bin: str, prompt: str, model: str | None = None) -
     derived from this one function, so a fix to the invocation shape here
     can never silently diverge between what actually executes and what is
     displayed/audited. Structure: `[agy_bin, "-p", prompt]`, optionally
-    followed by `["--model", model]` when *model* is truthy.
+    followed by `["--model", model]` when *model* is truthy, optionally
+    followed by `["--output-format", output_format]` when *output_format* is
+    truthy (Issue #2038 AC1 -- `--output-format json`/`stream-json`
+    allowlist extension; ordering is fixed: `--model` always precedes
+    `--output-format` when both are present, matching
+    `_validate_agy_invocation_argv()`'s allowlisted trailing shapes).
     """
     argv = [agy_bin, "-p", prompt]
     if model:
         argv.extend(["--model", model])
+    if output_format:
+        argv.extend(["--output-format", output_format])
     return argv
 
 
-def _validate_agy_invocation_argv(argv: list[str], *, approved_models: "frozenset[str] | None" = None) -> None:
+def _validate_agy_invocation_argv(
+    argv: list[str],
+    *,
+    approved_models: "frozenset[str] | None" = None,
+    approved_output_formats: "frozenset[str] | None" = AGY_OUTPUT_FORMAT_VALUES,
+) -> None:
     """Fail-closed positional structure allowlist for the agy invocation argv
     (Issue #1807, AC1/AC9 permission-bypass-flag-rejection defense-in-depth).
 
@@ -2724,15 +2760,25 @@ def _validate_agy_invocation_argv(argv: list[str], *, approved_models: "frozense
     - index 2: the prompt value (any string; unconditionally allowed --
       arbitrary prompt text is not itself a flag-injection vector because
       it occupies a fixed positional slot, never parsed as an option)
-    - the remaining trailing argv must be either empty, or exactly
-      `["--model", <model>]` where `<model>` is a syntactically-valid model
-      token (a non-empty string that does not itself look like another flag
-      -- does not start with `-`) and, when *approved_models* is supplied,
-      is also a member of that set (Issue #1807 fix_delta Blocker/Medium 1
-      -- `_run_agy()` passes the caller's resolved
-      `roles.grounded_research.model_chain` here so an unknown/corrupted
-      model value cannot pass this allowlist merely by being
-      syntactically well-formed)
+    - the remaining trailing argv must be one of exactly these shapes
+      (Issue #2038 AC1 extends the previous `["--model", <model>]`-only
+      shape to also allow a `--output-format` pair, in either combination,
+      but never any other trailing content):
+      - empty
+      - `["--model", <model>]`
+      - `["--output-format", <fmt>]`
+      - `["--model", <model>, "--output-format", <fmt>]`
+      `<model>` is a syntactically-valid model token (a non-empty string
+      that does not itself look like another flag -- does not start with
+      `-`) and, when *approved_models* is supplied, is also a member of that
+      set (Issue #1807 fix_delta Blocker/Medium 1 -- `_run_agy()` passes the
+      caller's resolved `roles.grounded_research.model_chain` here so an
+      unknown/corrupted model value cannot pass this allowlist merely by
+      being syntactically well-formed). `<fmt>` must be a member of
+      *approved_output_formats* (default `AGY_OUTPUT_FORMAT_VALUES` --
+      exactly `{"json", "stream-json"}`); this is a closed value
+      enumeration, never a free-form flag-value pass-through (Issue #2038
+      Out of Scope: "-p/--model 以外の任意flag許可").
 
     Any other trailing content (including a known-real flag such as
     `--dangerously-skip-permissions`, or any other unrecognized option) is
@@ -2745,7 +2791,7 @@ def _validate_agy_invocation_argv(argv: list[str], *, approved_models: "frozense
     a structural diagnostic only (index / count / whether a value looked
     like a flag) -- it never echoes the rejected argv or option values
     verbatim (Issue #1807 fix_delta Blocker 2: a future builder defect that
-    smuggled a secret-bearing option, e.g. `--api-key <value>`, into this
+    smuggled a secret-bearing option, e.g. `--REDACTED-flag <value>`, into this
     argv must not turn this fail-closed rejection path itself into a
     secret-exfiltration path via `stderr` / `warnings` / `failure_reason`,
     all of which are populated verbatim from this exception's message by
@@ -2758,29 +2804,63 @@ def _validate_agy_invocation_argv(argv: list[str], *, approved_models: "frozense
     if argv[1] != "-p":
         raise AgyInvocationPolicyError("agy invocation argv rejected: index 1 must be the literal '-p' flag")
     trailing = argv[3:]
-    if trailing:
-        if (
-            len(trailing) != 2
-            or trailing[0] != "--model"
-            or not isinstance(trailing[1], str)
-            or not trailing[1]
-            or trailing[1].startswith("-")
-        ):
-            # Only surface option_name when it looks like a flag (starts with
-            # "-"); a bare positional value (e.g. an argument that should
-            # have been paired with a flag) is never echoed, since it may
-            # itself be an option *value* rather than an option *name*.
-            option_name = trailing[0] if isinstance(trailing[0], str) and trailing[0].startswith("-") else "<redacted>"
-            raise AgyInvocationPolicyError(
-                "agy invocation argv rejected: unexpected trailing option(s) after the approved "
-                f"[-p, <prompt>] prefix; trailing_arg_count={len(trailing)}, "
-                f"option_name={option_name!r}, option_value=<redacted>"
-            )
-        if approved_models is not None and trailing[1] not in approved_models:
+    if not trailing:
+        return
+
+    def _reject_unexpected_trailing() -> None:
+        # Only surface option_name when it looks like a flag (starts with
+        # "-"); a bare positional value (e.g. an argument that should
+        # have been paired with a flag) is never echoed, since it may
+        # itself be an option *value* rather than an option *name*.
+        option_name = trailing[0] if isinstance(trailing[0], str) and trailing[0].startswith("-") else "<redacted>"
+        raise AgyInvocationPolicyError(
+            "agy invocation argv rejected: unexpected trailing option(s) after the approved "
+            f"[-p, <prompt>] prefix; trailing_arg_count={len(trailing)}, "
+            f"option_name={option_name!r}, option_value=<redacted>"
+        )
+
+    def _valid_pair_value(value: Any) -> bool:
+        return isinstance(value, str) and bool(value) and not value.startswith("-")
+
+    def _check_model(value: str) -> None:
+        if approved_models is not None and value not in approved_models:
             raise AgyInvocationPolicyError(
                 "agy invocation argv rejected: --model value is not a member of the approved "
                 f"model chain; approved_model_count={len(approved_models)}, option_value=<redacted>"
             )
+
+    def _check_output_format(value: str) -> None:
+        allowed = approved_output_formats if approved_output_formats is not None else AGY_OUTPUT_FORMAT_VALUES
+        if value not in allowed:
+            raise AgyInvocationPolicyError(
+                "agy invocation argv rejected: --output-format value is not a member of the "
+                f"approved value set; approved_value_count={len(allowed)}, option_value=<redacted>"
+            )
+
+    if len(trailing) == 2:
+        flag, value = trailing[0], trailing[1]
+        if not _valid_pair_value(value):
+            _reject_unexpected_trailing()
+        if flag == "--model":
+            _check_model(value)
+            return
+        if flag == "--output-format":
+            _check_output_format(value)
+            return
+        _reject_unexpected_trailing()
+    elif len(trailing) == 4:
+        model_flag, model_value, format_flag, format_value = trailing
+        if (
+            model_flag != "--model"
+            or not _valid_pair_value(model_value)
+            or format_flag != "--output-format"
+            or not _valid_pair_value(format_value)
+        ):
+            _reject_unexpected_trailing()
+        _check_model(model_value)
+        _check_output_format(format_value)
+    else:
+        _reject_unexpected_trailing()
 
 
 def _sanitize_agy_argv_for_audit(argv: list[str]) -> list[str]:
@@ -3375,6 +3455,28 @@ def _hook_events_confirm_web_tool_call(
     return (len(validated_tool_names) > 0), validated_tool_names
 
 
+def _extract_structured_search_query_count(parsed: dict[str, Any] | None) -> "int | None":
+    """Return an explicit structured search-query count from *parsed*
+    evidence when AGY's structured self-report provides one (Issue #2038
+    AC3), else ``None`` so the caller can fall back to the measured
+    tool-call count. Looks for a `data.queries` list (count = its length)
+    or a `data.search_query_count` int, in that order; any other/missing
+    shape yields ``None`` rather than guessing.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        return None
+    queries = data.get("queries")
+    if isinstance(queries, list):
+        return len(queries)
+    count = data.get("search_query_count")
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+        return count
+    return None
+
+
 def _build_agy_grounded_research_metadata(
     stdout: str,
     *,
@@ -3405,7 +3507,11 @@ def _build_agy_grounded_research_metadata(
     only claims) remain fail-closed and unaffected by this change.
     """
     stdout = stdout or ""
-    hook_validated, _hook_tool_names = _hook_events_confirm_web_tool_call(hook_events)
+    # Issue #2038 AC3: the validated hook tool-call names (previously
+    # discarded via the `_hook_tool_names` underscore-prefixed name) are now
+    # used as a real measured count when the only evidence is a hook event
+    # and no structured stdout self-report trace exists.
+    hook_validated, hook_tool_names = _hook_events_confirm_web_tool_call(hook_events)
     redacted_excerpt = _redact_text(stdout)[:500]
     excerpt_sha256 = hashlib.sha256(redacted_excerpt.encode("utf-8")).hexdigest()
     transcript_evidence = [
@@ -3485,10 +3591,31 @@ def _build_agy_grounded_research_metadata(
         # grounding-api-redirect shape counts (Issue #1266 Blocker 1 remains in force).
         vertex_urls = _extract_vertex_grounding_citation_urls(stdout)
         structured_citations = [{"url": url, "title": None} for url in vertex_urls]
-    # Bounded to 1 citation / 1 tool call (Issue #1266 quota-bound contract: 1 query / 1 URL).
-    citation_evidence = structured_citations[:1]
+    # Issue #2038 AC2: cardinality is no longer truncated to 1 -- every
+    # structured source recovered above (subject only to
+    # `_extract_structured_citations()`'s own fail-closed collection rules)
+    # is retained in `citation_evidence`.
+    citation_evidence = structured_citations
     url_citation_count = len(citation_evidence)
-    web_tool_call_count = 1 if tool_call_confirmed else 0
+    # Issue #2038 AC3: web_tool_call_count / search_query_count now reflect
+    # the actually observed invocation counts instead of being hardcoded to
+    # 1. When a structured stdout self-report trace exists, its recognized
+    # tool-call entry count is the measured count. When the only evidence is
+    # a validated hook event (no structured stdout trace), the count of
+    # distinct validated hook tool-call names is used instead (still a real
+    # measured count, never a hardcoded constant). `search_query_count`
+    # prefers an explicit structured query count when the parsed evidence
+    # provides one, and otherwise falls back to the measured tool-call count
+    # (each recognized web tool call corresponds to at least one query).
+    if tool_calls:
+        web_tool_call_count = len(tool_calls)
+    elif hook_validated:
+        web_tool_call_count = len(hook_tool_names)
+    else:
+        web_tool_call_count = 0
+    search_query_count = _extract_structured_search_query_count(parsed)
+    if search_query_count is None:
+        search_query_count = web_tool_call_count
 
     if url_citation_count > 0:
         grounding_status = "grounded"
@@ -3504,7 +3631,7 @@ def _build_agy_grounded_research_metadata(
         "grounding_backend": grounding_backend,
         "grounding_status": grounding_status,
         "web_tool_call_count": web_tool_call_count,
-        "search_query_count": 1,
+        "search_query_count": search_query_count,
         "url_citation_count": url_citation_count,
         "citation_evidence": citation_evidence,
         "grounding_transcript_evidence": transcript_evidence,
@@ -3515,6 +3642,108 @@ def _build_agy_grounded_research_metadata(
         "redaction_status": "checked_no_secret_pattern",
         "parsed_evidence": parsed,
     }
+
+
+# Issue #2038 AC4: the fail-closed `grounding_failure_class` this module
+# returns when the *same-binary* `preflight_agy.py` structured-output
+# capability status is anything other than "supported" (including a
+# capability-matrix lookup that could not itself be performed, e.g.
+# `preflight_agy` unavailable or a malformed probe result). Never converted
+# to a stdout best-effort parsing success (`fallback_success_is_pass:
+# false` per this Issue's Runtime Verification Applicability contract).
+AGY_STRUCTURED_OUTPUT_CAPABILITY_UNAVAILABLE_FAILURE_CLASS = "agy_web_grounding_capability_unavailable"
+
+# Capability statuses that are treated as "usable" for structured output.
+# Issue #1941's evidence-priority policy means `help`-sourced evidence alone
+# resolves to `inconclusive` (Issue #2038 does not add a new evidence tier
+# here), so only an explicit `supported` verdict is trusted to route through
+# structured-output parsing; every other status (`unsupported`,
+# `unavailable`, `inconclusive`, `evidence_invalid`, or any unrecognized
+# value) is fail-closed.
+_AGY_STRUCTURED_OUTPUT_SUPPORTED_STATUSES = frozenset({"supported"})
+
+
+def _resolve_structured_output_capability_status(
+    help_probe_result: "dict[str, Any] | None",
+) -> str:
+    """Consume `preflight_agy.py`'s same-binary capability SSOT for
+    `--output-format {json,stream-json}` support (Issue #2038 In Scope --
+    this module must not independently judge `agy --help` itself).
+
+    Returns `"unavailable"` fail-closed when `preflight_agy` could not be
+    imported (mirrors this module's existing `_AGY_PROVENANCE_AVAILABLE`
+    optional-dependency pattern) or when *help_probe_result* itself could
+    not be classified, so callers never treat an import/probe failure as an
+    implicit "supported".
+    """
+    if not _PREFLIGHT_AGY_AVAILABLE or _preflight_agy is None:
+        return "unavailable"
+    record = _preflight_agy.structured_output_capability_status(help_probe_result)
+    status = record.get("status") if isinstance(record, dict) else None
+    return status if isinstance(status, str) and status else "unavailable"
+
+
+def _capability_unavailable_grounding_metadata(
+    stdout: str,
+    *,
+    capability_status: str,
+) -> dict[str, Any]:
+    """Fail-closed `delegation_result/v1.grounded_research_evidence`-shaped
+    metadata for Issue #2038 AC4: returned instead of ever falling back to
+    `_build_agy_grounded_research_metadata()`'s stdout best-effort text
+    parsing when structured output is not usable in this environment.
+    """
+    redacted_excerpt = _redact_text(stdout or "")[:500]
+    excerpt_sha256 = hashlib.sha256(redacted_excerpt.encode("utf-8")).hexdigest()
+    return {
+        "grounding_actor": "antigravity_cli",
+        "grounding_backend": "none",
+        "grounding_status": "failed",
+        "web_tool_call_count": 0,
+        "search_query_count": 0,
+        "url_citation_count": 0,
+        "citation_evidence": [],
+        "grounding_transcript_evidence": [
+            {
+                "source_kind": "agy_stdout_or_artifact_excerpt",
+                "excerpt": redacted_excerpt,
+                "sha256": excerpt_sha256,
+            }
+        ],
+        "grounding_failure_class": AGY_STRUCTURED_OUTPUT_CAPABILITY_UNAVAILABLE_FAILURE_CLASS,
+        "raw_transcript_included": False,
+        "raw_credential_included": False,
+        "repo_absolute_path_included": False,
+        "redaction_status": "checked_no_secret_pattern",
+        "parsed_evidence": None,
+        "structured_output_capability_status": capability_status,
+    }
+
+
+def _build_agy_structured_output_metadata(
+    stdout: str,
+    *,
+    help_probe_result: "dict[str, Any] | None",
+    hook_events: "list[dict[str, Any]] | None" = None,
+) -> dict[str, Any]:
+    """Structured-output-aware entry point for grounded_research metadata
+    building (Issue #2038 AC4).
+
+    Consumes `preflight_agy.py`'s same-binary capability matrix (via
+    `_resolve_structured_output_capability_status()`) instead of this
+    module independently deciding from `agy --help` output. When the
+    resolved status is not in `_AGY_STRUCTURED_OUTPUT_SUPPORTED_STATUSES`
+    (covers `unsupported` / `unavailable` / `evidence_invalid` explicitly,
+    and fail-closed-covers `inconclusive` / any unrecognized status too),
+    returns `_capability_unavailable_grounding_metadata()` --
+    `AGY_STRUCTURED_OUTPUT_CAPABILITY_UNAVAILABLE_FAILURE_CLASS` -- and
+    never silently falls back to `_build_agy_grounded_research_metadata()`'s
+    stdout best-effort text parsing.
+    """
+    capability_status = _resolve_structured_output_capability_status(help_probe_result)
+    if capability_status not in _AGY_STRUCTURED_OUTPUT_SUPPORTED_STATUSES:
+        return _capability_unavailable_grounding_metadata(stdout, capability_status=capability_status)
+    return _build_agy_grounded_research_metadata(stdout, hook_events=hook_events)
 
 
 def _normalize_agy_result(
