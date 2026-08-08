@@ -1338,6 +1338,13 @@ def _permission_boundary_is_constrained_directive(evidence: dict, boundary_flags
     text = "\n".join(str(item) for item in (evidence.get("extracted_directives") or [])).lower()
     required_groups = (
         ("exact permission delta", "exact delta", "exact に", "正確な権限差分", "exact diff"),
+        (
+            "necessary for the human directive",
+            "necessary for the directive",
+            "required for the directive",
+            "human directive の目的に必要",
+            "指示の目的に必要",
+        ),
         ("least privilege", "least-privilege", "最小権限"),
         ("non-destructive", "非破壊", "not destructive", "破壊的でない"),
         ("no secret", "no secrets", "secretなし", "secretsなし", "シークレットなし"),

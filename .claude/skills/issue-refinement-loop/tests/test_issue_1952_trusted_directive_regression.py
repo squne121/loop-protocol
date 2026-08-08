@@ -53,8 +53,8 @@ def _directive_body(*, materialized: bool = False, permission: bool = False) -> 
     ]
     if permission:
         lines.append(
-            "- exact permission delta を least privilege で採用する。non-destructive、no secrets、"
-            "no paid external service、no unrelated privilege widening を満たす。"
+            "- exact permission delta は human directive の目的に必要であり、least privilege で採用する。"
+            "non-destructive、no secrets、no paid external service、no unrelated privilege widening を満たす。"
         )
     if materialized:
         lines.extend(
@@ -118,6 +118,15 @@ def test_explicit_permission_delta_requires_contract_update_not_implementation()
     assert result["route"]["action"] == "contract_update_required"
     assert result["route"]["implementation_allowed"] is False
     assert result["route"]["next_step"] == "rerun_refinement_after_contract_update"
+
+
+def test_permission_delta_without_human_directive_necessity_escalates():
+    body = _directive_body(permission=True).replace("human directive の目的に必要であり、", "")
+    result = _classify(_evidence(body))
+
+    assert result["boundary_flags"]["changes_permission_boundary"] is True
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "changes_permission_boundary"
 
 
 def test_generated_owner_handoff_is_not_human_directive():
