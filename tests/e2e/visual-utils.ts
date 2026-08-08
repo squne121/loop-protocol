@@ -12,7 +12,7 @@
 
 import { expect, type Locator, type Page } from '@playwright/test'
 import { fileURLToPath } from 'node:url'
-import type { VisualScenarioFixture, VisualScenarioViewportLabel } from '../../src/main'
+import type { LoopE2ESnapshot, VisualScenarioFixture, VisualScenarioViewportLabel } from '../../src/main'
 
 export type { VisualScenarioFixture, VisualScenarioViewportLabel }
 
@@ -233,6 +233,18 @@ const installedScenarios = new WeakMap<Page, VisualScenarioFixture>()
  * `expectDomOverlayScreenshot()` to self-report correctly.
  */
 export async function installVisualScenario(page: Page, fixture: VisualScenarioFixture): Promise<void> {
+  // AC8 (optional, Issue #1728): a second installVisualScenario() call on the
+  // same page would silently overwrite the first fixture binding while the
+  // already-registered page.addInitScript() callback for the FIRST fixture
+  // remains queued -- reject outright rather than let a caller's re-install
+  // mistake silently race two fixtures against the same page.
+  if (installedScenarios.has(page)) {
+    throw new Error(
+      `installVisualScenario(): a scenario ("${installedScenarios.get(page)?.name}") is already ` +
+        `installed on this page. Cannot install "${fixture.name}" on top of it -- use a new page ` +
+        'per scenario instead.',
+    )
+  }
   if (isPendingFixtureScenario(fixture.name)) {
     throw new Error(
       `installVisualScenario(): scenario "${fixture.name}" is pending-fixture (Scenario Support ` +
@@ -346,6 +358,91 @@ export interface DomOverlayScreenshotOptions {
   canvasVisibility?: 'mask' | 'hidden'
 }
 
+// ---------------------------------------------------------------------------
+// Fixture attestation (AC6, Issue #1728)
+// ---------------------------------------------------------------------------
+
+/**
+ * Asserts that the app has actually reflected `installedFixture` before a
+ * caller compares a screenshot (Issue #1728 — OWNER anchor comment
+ * issuecomment-5224476522, merge blocker). Without this, a fixture that was
+ * silently ignored by the app (stale non-E2E-mode bundle, a bug in
+ * `applyVisualScenarioFixture()`, etc.) could still pass a loose screenshot
+ * comparator if the pre-fixture/default UI happens to be close enough to the
+ * expected baseline — this helper makes that failure mode fail loudly and
+ * explicitly instead.
+ *
+ * Verifies two independent things:
+ * 1. The `data-loop-visual-scenario` receipt (`src/main.ts`) equals
+ *    `v1:<installedFixture.name>:rendered` — proof the app's first
+ *    post-fixture render pass has actually completed.
+ * 2. When `window.__LOOP_E2E__.getState()` is available (E2E builds only),
+ *    the live game state's `loopPhase` / `player.hp` / `player.maxHp` /
+ *    `progress.resources` / `progress.weaponPower` / `sortie.status` match
+ *    `installedFixture` — proof the fixture's values were actually applied,
+ *    not just that SOME fixture rendered.
+ *
+ * This is the central enforcement point `expectDomOverlayScreenshot()` and
+ * `expectCanvasVisualCueScreenshot()` both call before comparing a
+ * screenshot, so individual spec files forgetting to assert the receipt
+ * themselves (AC3/AC4) no longer silently loses this guarantee.
+ */
+export async function assertVisualScenarioAttested(
+  page: Page,
+  installedFixture: VisualScenarioFixture,
+): Promise<void> {
+  const expectedReceipt = `v1:${installedFixture.name}:rendered`
+  const actualReceipt = await page.evaluate(
+    () => document.documentElement.dataset.loopVisualScenario,
+  )
+  if (actualReceipt !== expectedReceipt) {
+    throw new Error(
+      'assertVisualScenarioAttested(): expected data-loop-visual-scenario receipt ' +
+        `"${expectedReceipt}" but found ${
+          actualReceipt === undefined ? 'no receipt (attribute unset)' : `"${actualReceipt}"`
+        }. The app may not have applied/rendered scenario "${installedFixture.name}" yet, or ` +
+        'was not built with VITE_E2E_MODE=true.',
+    )
+  }
+
+  const snapshot = await page.evaluate(() => {
+    const e2e = (window as Window & typeof globalThis & { __LOOP_E2E__?: { getState: () => LoopE2ESnapshot } })
+      .__LOOP_E2E__
+    return e2e ? e2e.getState() : null
+  })
+  if (snapshot) {
+    const mismatches: string[] = []
+    if (snapshot.loopPhase !== installedFixture.loopPhase) {
+      mismatches.push(`loopPhase: expected "${installedFixture.loopPhase}", got "${snapshot.loopPhase}"`)
+    }
+    if (snapshot.player.hp !== installedFixture.player.hp) {
+      mismatches.push(`player.hp: expected ${installedFixture.player.hp}, got ${snapshot.player.hp}`)
+    }
+    if (snapshot.player.maxHp !== installedFixture.player.maxHp) {
+      mismatches.push(`player.maxHp: expected ${installedFixture.player.maxHp}, got ${snapshot.player.maxHp}`)
+    }
+    if (snapshot.progress.resources !== installedFixture.progress.resources) {
+      mismatches.push(
+        `progress.resources: expected ${installedFixture.progress.resources}, got ${snapshot.progress.resources}`,
+      )
+    }
+    if (snapshot.progress.weaponPower !== installedFixture.progress.weaponPower) {
+      mismatches.push(
+        `progress.weaponPower: expected ${installedFixture.progress.weaponPower}, got ${snapshot.progress.weaponPower}`,
+      )
+    }
+    if (snapshot.sortie.status !== installedFixture.sortie.status) {
+      mismatches.push(`sortie.status: expected "${installedFixture.sortie.status}", got "${snapshot.sortie.status}"`)
+    }
+    if (mismatches.length > 0) {
+      throw new Error(
+        `assertVisualScenarioAttested(): receipt matched scenario "${installedFixture.name}", but ` +
+          `live state diverges from the fixture: ${mismatches.join('; ')}.`,
+      )
+    }
+  }
+}
+
 /**
  * DOM overlay screenshot helper (AC2, AC5). Defaults reject full-canvas /
  * full-shell bitmap targets via `assertAllowedVisualTarget()` (resolved-DOM
@@ -424,6 +521,11 @@ export async function expectDomOverlayScreenshot(
   }
 
   await assertAllowedVisualTarget(locator)
+
+  // AC6 (Issue #1728): central enforcement -- verifies the app actually
+  // reflected `installed` before this screenshot is compared, independent
+  // of whether the calling spec also asserts the receipt itself.
+  await assertVisualScenarioAttested(page, installed)
 
   const diffToleranceOption =
     options.maxDiffPixels !== undefined
@@ -604,6 +706,11 @@ export async function expectCanvasVisualCueScreenshot(
         'capture root empirically rather than relying on a previous implicit default.',
     )
   }
+
+  // AC6 (Issue #1728): central enforcement -- verifies the app actually
+  // reflected `installed` before this screenshot is compared, independent
+  // of whether the calling spec also asserts the receipt itself.
+  await assertVisualScenarioAttested(page, installed)
 
   await expect(locator).toHaveScreenshot(name, {
     animations: 'disabled',

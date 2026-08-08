@@ -308,3 +308,35 @@ test('GIVEN the running-hud fixture (elapsedTicks: 900, fixedDeltaMs: 16) WHEN t
 
   expect(observed.elapsedLabel).toBe('14.4 s')
 })
+
+
+// ---------------------------------------------------------------------------
+// Issue #1728 AC4: receipt AND a concrete overlay state value (Hull /
+// Resources / Mission status) both reflect the fixture.
+// ---------------------------------------------------------------------------
+
+test('GIVEN the running-hud fixture WHEN the app finishes its first render THEN the receipt AND the combat HUD Hull value both reflect the fixture (AC4)', async ({
+  page,
+}) => {
+  await installVisualScenario(page, RUNNING_FIXTURE)
+  await page.goto('/')
+
+  // AC1: the versioned receipt proves the app's first post-fixture render
+  // pass has actually completed (not merely that some fixture was queued).
+  const receipt = await page.evaluate(
+    () => document.documentElement.dataset.loopVisualScenario,
+  )
+  expect(receipt).toBe(`v1:${RUNNING_FIXTURE.name}:rendered`)
+
+  // AC4 requires a concrete overlay state value -- Hull, Resources, or
+  // Mission status -- to also confirm the fixture (not just the receipt)
+  // was reflected. `combat-hud-hull` (Hull) is chosen here because it is
+  // the field actually rendered for a `running`-loopPhase fixture; the
+  // legacy debrief "Mission status" field only renders for
+  // debrief_pending_reward / debrief_reward_claimed phases, which this
+  // fixture does not exercise.
+  const hullText = await page.locator('[data-field="combat-hud-hull"]').textContent()
+  expect(hullText).toBe(
+    `${RUNNING_FIXTURE.player.hp}/${RUNNING_FIXTURE.player.maxHp}`,
+  )
+})
