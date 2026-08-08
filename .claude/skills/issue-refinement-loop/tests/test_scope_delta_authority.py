@@ -722,3 +722,72 @@ def test_real_producer_evidence_shape_validates_against_schema():
     producer_shaped = _evidence(confidence="explicit")
     del producer_shaped["target_issue_number"]
     jsonschema.validate(instance=producer_shaped, schema=schema)
+
+
+def test_non_idempotent_detection_does_not_invert_safe_and_risky_terms():
+    """P0: explicit non-idempotent work is a hard boundary, not its inverse."""
+    cases = {
+        "non-idempotent operation": True,
+        "non idempotent operation": True,
+        "idempotent operation": False,
+        "non-destructive operation": False,
+        "destructive operation": True,
+        "破壊的 operation": True,
+        "破壊的でない operation": False,
+    }
+    for text, expected in cases.items():
+        assert sda.detect_boundary_flags(text)["destructive_or_non_idempotent_operation"] is expected
+
+
+def test_exact_allowed_path_literals_reject_unsafe_or_negative_tokens():
+    unsafe = (
+        "- allowed paths に `https://example.test/escape.py` を追加する",
+        "- allowed paths に `/etc/passwd` を追加する",
+        "- allowed paths に `docs/../secrets.txt` を追加する",
+        "- allowed paths に `docs\\windows.py` を追加する",
+        "- allowed paths に `docs/valid.py\x00suffix` を追加する",
+        "- do not add `docs/valid.py` to Allowed Paths",
+        "- Allowed Paths に `docs/valid.py` を追加しない",
+    )
+    for directive in unsafe:
+        assert sda._extract_path_literals_from_text(directive) == []
+
+
+def test_mixed_allowed_path_directive_fails_closed_before_contract_patch_plan():
+    """A safe literal cannot launder an unsafe token into a patch plan."""
+    directive = (
+        "- Allowed Paths に `docs/valid.py` と "
+        "`https://example.test/escape.py` を追加する"
+    )
+    result = _classify(
+        _evidence(
+            directive_markers=["allowed paths"],
+            extracted_directives=[directive],
+            boundary_flags=["expands_allowed_paths"],
+        ),
+        triggered=True,
+    )
+
+    assert sda._extract_path_literals_from_text(directive) == []
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "expands_allowed_paths"
+    assert "contract_patch_plan" not in result
+    assert sda.derive_contract_patch_operations(
+        [_evidence(directive_markers=["allowed paths"], extracted_directives=[directive])]
+    ) == []
+
+
+def test_exact_allowed_path_literals_accept_normalized_repository_relative_literal():
+    directive = "- Allowed Paths に `.claude/skills/example.py` を追加する"
+    assert sda._extract_path_literals_from_text(directive) == [".claude/skills/example.py"]
+    assert sda.derive_contract_patch_operations(
+        [_evidence(directive_markers=["allowed paths"], extracted_directives=[directive])]
+    ) == [
+        {
+            "section": "Allowed Paths",
+            "op": "append",
+            "text": "- `.claude/skills/example.py`",
+            "rationale": "Exact Allowed Paths delta extracted from trusted review comment",
+            "source_evidence_index": 0,
+        }
+    ]

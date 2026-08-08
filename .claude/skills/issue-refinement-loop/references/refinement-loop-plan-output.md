@@ -202,7 +202,7 @@
 
 - `required_sections`: Issue 本文に追加しなければならない section
 - `required_contract_keys`: Machine-Readable Contract block に必須の key
-- `rewrite_constraints.freeform_rewrite_forbidden`: `issue-author` は自由記述の全面改稿を受け入れてはいけません
+- `rewrite_constraints.freeform_rewrite_forbidden`: 既存 Issue 更新専用の `issue-editor` は自由記述の全面改稿を受け入れてはいけません
 - `override_policy.allowed_reason_codes`: `human_decision_reframe` が override できる reason code
 - `override_policy.never_override_reason_codes`: 人間指示があっても override できない reason code
 - `max_rewrite_attempts`: loop router が強制する rewrite 上限
@@ -237,8 +237,8 @@ plan 出力の `issue_execution_decision` は `ISSUE_EXECUTION_DECISION_V1`（`s
 
 override 後も rewrite の手順は制約付きで進めます。
 
-1. orchestrator は `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` を `issue-author` に forward する
-2. `issue-author` は不足 section / key の structured repair だけを行う
+1. orchestrator は `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` を `issue-editor` に forward する
+2. `issue-editor` は不足 section / key の structured repair だけを行う
 3. repair 後は contract checker を自動再実行する
 4. post-mutation checker が non-zero の場合は、`max_rewrite_attempts` の範囲で rewrite loop を継続する
 5. 上限超過または no progress の場合は `human_judgment_required` に遷移する

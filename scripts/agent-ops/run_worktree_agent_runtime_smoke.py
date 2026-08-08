@@ -68,6 +68,23 @@ SCHEMA = "WORKTREE_AGENT_RUNTIME_SMOKE_RESULT_V1"
 # invocation always passes a real ``--agent-type`` value.
 _UNSPECIFIED_AGENT_TYPE = "unspecified"
 
+# A mutation route is deliberately checked by this runner before it starts a
+# runtime.  This is a deterministic control-plane receipt, not an assertion
+# about what a model might choose to say in its final response.  The optional
+# flag keeps the generic smoke runner backward compatible for callers which do
+# not exercise a role-specific mutation route.
+_RUNTIME_FOLLOWUP_ROUTE_RE = re.compile(
+    r"(?m)^\s*-\s*runtime_followup_route:\s*([^\s]+)\s*$"
+)
+
+_TRANSACTION_ENTRYPOINTS = {
+    "create-issue": ".claude/skills/create-issue/scripts/create_issue_txn.py",
+    "edit-issue": ".claude/skills/edit-issue/scripts/edit_issue_txn.py",
+}
+_REQUIRED_RUNTIME_OBSERVATION_FIELDS = frozenset(
+    {"effective_permission_profile", "loaded_skill", "executor", "mutation"}
+)
+
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_SKIP = 77
@@ -76,6 +93,7 @@ _MAX_PANE_LINES = 400
 _MAX_LINE_CHARS = 2000
 _MAX_SESSION_LOG_LINES = 200
 _DEFAULT_MAX_TURNS = 30
+_CODEX_CHILD_META_SCAN_SECONDS = 1.0
 
 # Absolute path / long-base64-token redaction (mirrors git_worktree_probe.py).
 _SECRET_LIKE_RE = re.compile(
@@ -139,21 +157,50 @@ def _install_signal_handlers() -> None:
 def _run(argv: list[str], *, cwd: str | None = None, timeout: float,
           input_text: str | None = None, env: dict[str, str] | None = None) -> tuple[int | None, str, str, bool]:
     """Run argv with shell=False. Returns (returncode, stdout, stderr, timed_out)."""
+    proc: subprocess.Popen[str] | None = None
     try:
-        proc = subprocess.run(
+        # A runtime may leave descendants holding the captured pipe FDs after
+        # its direct CLI process times out.  ``subprocess.run`` then waits for
+        # EOF during cleanup and can overrun the caller's verifier budget.
+        # A dedicated process group makes this runner's timeout authoritative:
+        # kill every descendant first, then drain the now-closed pipes.
+        proc = subprocess.Popen(
             argv,
             cwd=cwd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            input=input_text,
             shell=False,
             env=env,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            start_new_session=True,
         )
-        return proc.returncode, proc.stdout, proc.stderr, False
+        stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
+        return proc.returncode, stdout, stderr, False
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            # Do not call ``communicate()`` after a timeout. A descendant
+            # that escaped the process group can retain the pipe FDs, making
+            # communicate wait indefinitely for EOF even though the direct
+            # runtime process was killed. The partial bytes already supplied
+            # by TimeoutExpired are sufficient for a SKIP receipt.
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+        else:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
         if isinstance(stdout, bytes):
             stdout = stdout.decode("utf-8", "replace")
         if isinstance(stderr, bytes):
@@ -1369,16 +1416,20 @@ def _find_codex_child_session_meta(parent_session_id: str) -> dict | None:
         sessions_dir = Path.home() / ".codex" / "sessions"
         if not sessions_dir.is_dir():
             return None
-        for candidate in sorted(sessions_dir.glob("**/*.jsonl")):
+        deadline = time.monotonic() + _CODEX_CHILD_META_SCAN_SECONDS
+        for candidate in sessions_dir.glob("**/*.jsonl"):
+            if time.monotonic() >= deadline:
+                return None
             try:
-                first_line = candidate.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+                with candidate.open(encoding="utf-8", errors="replace") as handle:
+                    first_line = handle.readline()
             except OSError:
                 continue
             if not first_line:
                 continue
             try:
-                record = json.loads(first_line[0].strip())
-            except (json.JSONDecodeError, ValueError, IndexError):
+                record = json.loads(first_line.strip())
+            except (json.JSONDecodeError, ValueError):
                 continue
             if not isinstance(record, dict) or record.get("type") != "session_meta":
                 continue
@@ -1963,9 +2014,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-file", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=180)
+    parser.add_argument(
+        "--timeout-is-capability-unavailable",
+        action="store_true",
+        help=(
+            "classify a structured-lane timeout as capability-unavailable "
+            "(exit 77) instead of a runtime failure. This is opt-in for "
+            "callers whose bounded verification window is itself the "
+            "runtime-capability boundary; the default timeout behavior is "
+            "exit 1."
+        ),
+    )
     parser.add_argument("--max-turns", type=_positive_int, default=_DEFAULT_MAX_TURNS,
                          help="bounded turn count for Claude Code (structured lane only; positive integer)")
     parser.add_argument("--expect-marker", action="append", default=[])
+    parser.add_argument(
+        "--require-observed-runtime-field",
+        action="append",
+        choices=sorted(_REQUIRED_RUNTIME_OBSERVATION_FIELDS),
+        default=[],
+        help=(
+            "require a field to be independently observed in native runtime "
+            "evidence; unavailable required fields cause exit 77/SKIP, never PASS"
+        ),
+    )
     parser.add_argument("--require-clean-postcondition", action="store_true")
     parser.add_argument("--inspect-session-log-metadata", action="store_true")
     parser.add_argument("--require-session-log-metadata", action="store_true")
@@ -1984,6 +2056,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--requested-mutation-route",
+        default=None,
+        help=(
+            "optional role-bound mutation route to preflight before launching "
+            "the runtime; a mismatched route is refused before any runtime "
+            "subprocess is invoked"
+        ),
+    )
+    parser.add_argument(
+        "--require-transaction-entrypoint-preflight",
+        action="store_true",
+        help=(
+            "for a role-bound route request, safely invoke the actual "
+            "transaction entrypoint with deliberately incomplete input and "
+            "require its pre-executor parser refusal before recording a "
+            "route mismatch refusal"
+        ),
+    )
+    parser.add_argument(
         "--claude-agent-name",
         default=None,
         help=(
@@ -1999,6 +2090,87 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def preflight_requested_mutation_route(
+    worktree: str, agent_type: str, requested_route: str | None, *,
+    require_transaction_entrypoint_preflight: bool = False,
+) -> dict[str, object]:
+    """Return a deterministic receipt for an optional mutation-route request.
+
+    The canonical route is read from the active agent TOML rather than a test
+    fixture or a hard-coded role table.  A refusal is a successful preflight
+    outcome: it intentionally prevents the runtime from starting, so no
+    prompt-only model refusal can be mistaken for an authorization boundary.
+    """
+    receipt: dict[str, object] = {
+        "requested_mutation_route": requested_route,
+        "declared_mutation_route": None,
+        "route_preflight_decision": "not_requested",
+        "route_preflight_source": None,
+        "controlled_route_preflight_status": "not_requested",
+        "canonical_transaction_entrypoint": None,
+        "requested_transaction_entrypoint": None,
+        "pre_executor_refusal_observed": False,
+        "executor_invocation_observed": False,
+        "mutation_attempted": None,
+        "mutation_observed_channels": [],
+    }
+    if requested_route is None:
+        return receipt
+    if agent_type == _UNSPECIFIED_AGENT_TYPE:
+        receipt["route_preflight_decision"] = "invalid_agent_type"
+        receipt["route_preflight_source"] = "runner_agent_route_guard"
+        return receipt
+
+    agent_path = Path(worktree) / ".codex" / "agents" / f"{agent_type}.toml"
+    try:
+        text = agent_path.read_text(encoding="utf-8")
+    except OSError:
+        receipt["route_preflight_decision"] = "agent_config_unavailable"
+        receipt["route_preflight_source"] = "runner_agent_route_guard"
+        return receipt
+
+    match = _RUNTIME_FOLLOWUP_ROUTE_RE.search(text)
+    if match is None:
+        receipt["route_preflight_decision"] = "declared_route_unavailable"
+        receipt["route_preflight_source"] = "runner_agent_route_guard"
+        return receipt
+
+    declared_route = match.group(1)
+    receipt["declared_mutation_route"] = declared_route
+    receipt["route_preflight_source"] = "runner_agent_route_guard"
+    receipt["route_preflight_decision"] = (
+        "allow" if requested_route == declared_route else "refused_before_runtime"
+    )
+    if not require_transaction_entrypoint_preflight:
+        return receipt
+
+    declared_entrypoint = _TRANSACTION_ENTRYPOINTS.get(declared_route)
+    requested_entrypoint = _TRANSACTION_ENTRYPOINTS.get(requested_route)
+    receipt["declared_transaction_entrypoint"] = declared_entrypoint
+    receipt["requested_transaction_entrypoint"] = requested_entrypoint
+    if declared_entrypoint is None:
+        receipt["controlled_route_preflight_status"] = "canonical_entrypoint_unavailable"
+        return receipt
+    entrypoint_path = Path(worktree) / declared_entrypoint
+    receipt["canonical_transaction_entrypoint"] = declared_entrypoint
+    if not entrypoint_path.is_file():
+        receipt["controlled_route_preflight_status"] = "canonical_entrypoint_missing"
+        return receipt
+    # Invoke the actual selected transaction entrypoint with deliberately
+    # incomplete input. Both create and edit parsers reject before their
+    # executor/mutation transport can begin (exit 2), giving AC6 a concrete
+    # non-mutating parser receipt rather than treating --help as a decision.
+    rc, _out, _err, timed_out = _run(
+        [sys.executable, str(entrypoint_path)], cwd=worktree, timeout=10.0
+    )
+    if rc != 2 or timed_out:
+        receipt["controlled_route_preflight_status"] = "invalid_transaction_input_not_rejected"
+        return receipt
+    receipt["controlled_route_preflight_status"] = "invalid_transaction_input_rejected_pre_executor"
+    receipt["pre_executor_refusal_observed"] = requested_route != declared_route
+    return receipt
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2041,6 +2213,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[FAIL] {dir_error}", file=sys.stderr)
         return EXIT_FAIL
 
+    route_preflight = preflight_requested_mutation_route(
+        worktree,
+        args.agent_type,
+        args.requested_mutation_route,
+        require_transaction_entrypoint_preflight=args.require_transaction_entrypoint_preflight,
+    )
+    route_refused = (
+        args.requested_mutation_route is not None
+        and route_preflight["route_preflight_decision"] != "allow"
+    )
+
     # From this point on, worktree/prompt/output_dir are all confirmed
     # usable, so EVERY controlled exit below -- including the
     # capability/herdr preflight SKIPs -- must emit allowlist-only
@@ -2054,14 +2237,26 @@ def main(argv: list[str] | None = None) -> int:
     # bottom of this function.
     exit_code = EXIT_OK
     resolved_runtime_bin: str | None = None
+    entrypoint_preflight_failed = (
+        args.require_transaction_entrypoint_preflight
+        and args.requested_mutation_route is not None
+        and route_preflight["controlled_route_preflight_status"]
+        != "invalid_transaction_input_rejected_pre_executor"
+    )
+    if entrypoint_preflight_failed:
+        errors.append(
+            "controlled route preflight unavailable: "
+            f"{route_preflight['controlled_route_preflight_status']}"
+        )
+        exit_code = EXIT_FAIL
 
-    if args.mode == "interactive":
+    if args.mode == "interactive" and not route_refused:
         skip_reason = preflight_herdr()
         if skip_reason:
             errors.append(skip_reason)
             exit_code = EXIT_SKIP
 
-    if exit_code == EXIT_OK:
+    if exit_code == EXIT_OK and not route_refused:
         # Issue #1960 Design Decision 5 (P1-2 fix-delta): resolve the
         # runtime executable exactly ONCE here via ``shutil.which()``
         # (inside ``preflight_claude_available`` / ``preflight_codex_flags``)
@@ -2087,15 +2282,10 @@ def main(argv: list[str] | None = None) -> int:
     tested_head = _git_rev_parse(worktree, "HEAD")
     runtime_version = capture_runtime_version(resolved_runtime_bin) if resolved_runtime_bin else None
     requested_agent_type = args.agent_type
-    # No independent runtime signal of "which persona was effectively
-    # active" was found beyond what was requested: neither Claude Code's
-    # stream-json ``system``/``result`` events nor Codex's ``--json`` event
-    # types echo back a caller-declared agent/persona name (only Codex's
-    # rollout-only ``spawn_agent`` calls carry an ``agent_type`` -- for a
-    # *sub*-agent spawned *by* this run, not for this run's own identity --
-    # see the ``_CODEX_COLLAB_ITEM_TYPE`` note above). Documented finding:
-    # effective_agent_type is therefore set equal to requested_agent_type.
-    effective_agent_type = requested_agent_type
+    # A requested agent is a declaration, not runtime observation.  The
+    # effective identity remains unavailable until the native child evidence
+    # below supplies one; it must never be filled from the request itself.
+    effective_agent_type = None
     loaded_skills = load_static_declared_skills(worktree, requested_agent_type)
     prompt_sha256 = compute_prompt_sha256(prompt)
 
@@ -2115,6 +2305,7 @@ def main(argv: list[str] | None = None) -> int:
         "loaded_skills": loaded_skills,
         "loaded_skills_source": "static_frontmatter" if loaded_skills is not None else None,
         "prompt_sha256": prompt_sha256,
+        **route_preflight,
     }
     if args.mode == "interactive":
         # Issue #1960 Design Decision 5 (P1-2 fix-delta): the interactive
@@ -2141,7 +2332,18 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        if exit_code != EXIT_OK:
+        if route_refused:
+            # The controlled guard declined the route before launching a
+            # runtime.  Record that limited fact only; do not synthesize a
+            # terminal event, loaded Skill, executor invocation, or mutation
+            # observation from static configuration.
+            schema_summary["runtime_invocation"] = "not_started_route_preflight_blocked"
+            schema_summary["terminal_event_observed"] = None
+            schema_summary["child_agent_type_observed"] = None
+            schema_summary["child_agent_type_source"] = None
+            schema_summary["agent_type_identity_verified"] = False
+            schema_summary["native_spawn_event_observed"] = False
+        elif exit_code != EXIT_OK:
             # A capability/herdr preflight above already decided this run is
             # a controlled SKIP -- do not attempt to launch either lane.
             # Evidence (schema_summary as built so far, including
@@ -2172,6 +2374,8 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["process_exit_code"] = rc
             schema_summary["timed_out"] = timed_out
             schema_summary["native_event_count"] = event_count
+            terminal_event_observed = has_terminal_event(args.runtime, out) if event_count > 0 else None
+            schema_summary["terminal_event_observed"] = terminal_event_observed
             schema_summary["capability_decision"] = capability_decision
             schema_summary["capability_error_classification"] = capability_reason
 
@@ -2231,8 +2435,15 @@ def main(argv: list[str] | None = None) -> int:
                 child_spawn_launch_mode = classify_claude_spawn_launch_mode(out)
             else:
                 parent_session_id = extract_codex_parent_session_id(out)
-                child_session_id = extract_codex_child_session_id(parent_session_id)
-                child_agent_type_observed = extract_codex_child_agent_role(parent_session_id)
+                # A timed-out child cannot supply complete identity evidence.
+                # Do not spend the caller's bounded capability window scanning
+                # the global rollout inventory after that terminal condition.
+                child_session_id = (
+                    None if timed_out else extract_codex_child_session_id(parent_session_id)
+                )
+                child_agent_type_observed = (
+                    None if timed_out else extract_codex_child_agent_role(parent_session_id)
+                )
                 child_agent_type_source = (
                     "codex_session_meta_agent_role" if child_agent_type_observed else None
                 )
@@ -2248,6 +2459,7 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["child_agent_type_source"] = child_agent_type_source
             schema_summary["child_spawn_launch_mode"] = child_spawn_launch_mode
             schema_summary["agent_type_identity_verified"] = agent_type_identity_verified
+            schema_summary["effective_agent_type"] = child_agent_type_observed
             schema_summary["native_spawn_event_observed"] = bool(
                 parent_session_id
                 and child_session_id
@@ -2263,8 +2475,16 @@ def main(argv: list[str] | None = None) -> int:
                 errors.append(capability_reason)
                 exit_code = EXIT_SKIP
             elif timed_out:
-                errors.append("structured lane timed out")
-                exit_code = EXIT_FAIL
+                if args.timeout_is_capability_unavailable:
+                    errors.append("structured lane exceeded the declared capability window")
+                    schema_summary["capability_decision"] = "capability_skip_timeout"
+                    schema_summary["capability_error_classification"] = (
+                        "declared_capability_window_exceeded"
+                    )
+                    exit_code = EXIT_SKIP
+                else:
+                    errors.append("structured lane timed out")
+                    exit_code = EXIT_FAIL
             elif rc is None:
                 errors.append(f"structured lane failed to start: {_redact(err[:500])}")
                 exit_code = EXIT_FAIL
@@ -2276,17 +2496,39 @@ def main(argv: list[str] | None = None) -> int:
             elif rc != 0:
                 errors.append(f"structured lane exited non-zero: {rc}: {_redact(err[:500])}")
                 exit_code = EXIT_FAIL
-            elif event_count > 0 and not has_terminal_event(args.runtime, out):
+            elif terminal_event_observed is False:
                 errors.append("no terminal/result event observed in structured output")
                 exit_code = EXIT_FAIL
 
-            if args.expect_marker:
+            # A marker is a success-only assertion.  If the bounded runtime
+            # capability is unavailable (including timeout SKIP), no model
+            # output is available to check and a missing marker must not
+            # overwrite the authoritative exit-77 classification.
+            if args.expect_marker and exit_code == EXIT_OK:
                 combined = out + "\n" + err
                 missing = [m for m in args.expect_marker if m not in combined]
                 schema_summary["expected_markers_missing"] = missing
                 if missing:
                     errors.append(f"expected markers not observed: {missing}")
                     exit_code = EXIT_FAIL
+
+            required_observations = sorted(set(args.require_observed_runtime_field))
+            if required_observations:
+                # These four fields have no independently extractable Codex
+                # event in this runner.  Record that precise capability gap;
+                # declarations or local re-reads must never fill it in.
+                unavailable = required_observations
+                schema_summary["required_runtime_observations"] = required_observations
+                schema_summary["unavailable_required_runtime_observations"] = unavailable
+                if exit_code == EXIT_OK:
+                    errors.append(
+                        "required runtime observations unavailable: " + ", ".join(unavailable)
+                    )
+                    schema_summary["capability_decision"] = "required_runtime_evidence_unavailable"
+                    schema_summary["capability_error_classification"] = (
+                        "native_event_field_unavailable"
+                    )
+                    exit_code = EXIT_SKIP
 
             if args.require_session_log_metadata or args.inspect_session_log_metadata:
                 metadata_count = count_session_log_metadata(out.splitlines())

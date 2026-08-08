@@ -14,18 +14,31 @@
         ".agents/skills/implement-issue/SKILL.md"
       ]
     },
-    "issue-author": {
-      "path": ".codex/agents/issue-author.toml",
-      "claude_agent_path": ".claude/agents/issue-author.md",
+    "issue-creator": {
+      "path": ".codex/agents/issue-creator.toml",
+      "claude_agent_path": ".claude/agents/issue-creator.md",
       "claude_model": "sonnet",
       "claude_permission_mode": "acceptEdits",
       "model": "gpt-5.6-terra",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-rtk",
       "runtime_dependency_status": "codex_skill_required",
-      "runtime_followup_route": "create-issue|edit-issue",
+      "runtime_followup_route": "create-issue",
       "repo_local_skill_surfaces": [
-        ".agents/skills/create-issue/SKILL.md",
+        ".agents/skills/create-issue/SKILL.md"
+      ]
+    },
+    "issue-editor": {
+      "path": ".codex/agents/issue-editor.toml",
+      "claude_agent_path": ".claude/agents/issue-editor.md",
+      "claude_model": "sonnet",
+      "claude_permission_mode": "acceptEdits",
+      "model": "gpt-5.6-terra",
+      "model_reasoning_effort": "medium",
+      "default_permissions": "loop-protocol-rtk",
+      "runtime_dependency_status": "codex_skill_required",
+      "runtime_followup_route": "edit-issue",
+      "repo_local_skill_surfaces": [
         ".agents/skills/edit-issue/SKILL.md"
       ]
     },

@@ -218,7 +218,14 @@ def test_preflight_consumer_executes_controlled_transaction_and_final_readback(t
             ),
             callbacks={
                 "candidate_readiness": _readiness,
-                "fresh_checks": lambda _issue: {"preflight": "pass", "review": "approve", "readiness": "go"},
+                "fresh_checks": lambda _issue: {
+                    "preflight": "pass",
+                    "review": "approve",
+                    "readiness": "go",
+                    "allowed_paths": "pass",
+                    "permission_profile": "pass",
+                    "runtime_evidence": "pass",
+                },
             },
         )
 
@@ -226,7 +233,14 @@ def test_preflight_consumer_executes_controlled_transaction_and_final_readback(t
     assert transaction_inputs[0]["schema"] == "ISSUE_EDIT_TXN_INPUT_V1"
     assert transaction_inputs[0]["expected_previous_body_sha256"].startswith("sha256:")
     assert "## Preconditions\n" + expected_preconditions in state["body"]
-    assert result["fresh_checks"] == {"preflight": "pass", "review": "approve", "readiness": "go"}
+    assert result["fresh_checks"] == {
+        "preflight": "pass",
+        "review": "approve",
+        "readiness": "go",
+        "allowed_paths": "pass",
+        "permission_profile": "pass",
+        "runtime_evidence": "pass",
+    }
 
 
 def test_bounded_contract_update_handoff_retains_only_parent_routing_fields():
@@ -237,7 +251,14 @@ def test_bounded_contract_update_handoff_retains_only_parent_routing_fields():
             "writes": 1,
             "iterations": 1,
             "candidate_body": "must not escape the transaction-local phase",
-            "fresh_checks": {"preflight": "pass", "review": "approve", "readiness": "go"},
+            "fresh_checks": {
+                "preflight": "pass",
+                "review": "approve",
+                "readiness": "go",
+                "allowed_paths": "pass",
+                "permission_profile": "pass",
+                "runtime_evidence": "pass",
+            },
         }
     )
     assert handoff == {
@@ -249,6 +270,20 @@ def test_bounded_contract_update_handoff_retains_only_parent_routing_fields():
         "fresh_review": "approve",
         "fresh_readiness": "go",
     }
+
+
+def test_bounded_contract_update_handoff_fails_closed_when_any_post_update_gate_is_missing():
+    handoff = preflight._bounded_contract_update_handoff(
+        {
+            "status": "applied",
+            "states": {"contract_update": {"status": "applied"}},
+            "writes": 1,
+            "iterations": 0,
+            "fresh_checks": {"preflight": "pass", "review": "approve", "readiness": "go"},
+        }
+    )
+
+    assert handoff["status"] == "failed"
 
 
 def test_live_issue_fetch_requests_updated_at_for_transaction_precondition():
@@ -413,7 +448,15 @@ def test_final_readback_verifies_postconditions_and_restarts_fresh_preflight():
         fetch_current=fetch_current,
         apply_transaction=apply,
         fresh_checks=lambda current: (
-            fresh.append(current["body"]) or {"preflight": "pass", "review": "approve", "readiness": "go"}
+            fresh.append(current["body"])
+            or {
+                "preflight": "pass",
+                "review": "approve",
+                "readiness": "go",
+                "allowed_paths": "pass",
+                "permission_profile": "pass",
+                "runtime_evidence": "pass",
+            }
         ),
     )
     assert result["status"] == "applied" and result["writes"] == 1
