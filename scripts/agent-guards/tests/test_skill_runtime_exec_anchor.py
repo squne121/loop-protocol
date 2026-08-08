@@ -123,6 +123,48 @@ REGISTRY = {
             },
         },
     },
+    "preflight.run.with_human_context": {
+        "id": "preflight.run.with_human_context",
+        "argv": [
+            "uv", "run", "python3",
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}", "--repo", "{repo}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
+        ],
+        "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_anchor",
+        "required_cwd": "canonical_main_root", "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_read_only",
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "anchor_comment_url": {
+                "type": "github_issue_comment_url", "required": True,
+            },
+        },
+    },
+    "preflight.run.with_agent_report": {
+        "id": "preflight.run.with_agent_report",
+        "argv": [
+            "uv", "run", "python3",
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}", "--repo", "{repo}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+            "--agent-report-comment-url", "{anchor_comment_url}",
+        ],
+        "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_anchor",
+        "required_cwd": "canonical_main_root", "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_read_only",
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "anchor_comment_url": {
+                "type": "github_issue_comment_url", "required": True,
+            },
+        },
+    },
 }
 
 
@@ -142,11 +184,19 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--issue-number", required=True)
 parser.add_argument("--repo", required=True)
 parser.add_argument("--anchor-comment-url")
+parser.add_argument("--human-context-comment-url", dest="human_context_comment_urls", action="append", default=[])
+parser.add_argument("--agent-report-comment-url", dest="agent_report_comment_urls", action="append", default=[])
 parser.add_argument("--consume-contract-patch-plan", action="store_true")
 args = parser.parse_args()
 artifact = Path(".claude/artifacts/issue-refinement-loop") / args.issue_number
 artifact.mkdir(parents=True, exist_ok=True)
-payload = {"issue_number": args.issue_number, "repo": args.repo, "anchor_comment_url": args.anchor_comment_url}
+payload = {
+    "issue_number": args.issue_number,
+    "repo": args.repo,
+    "anchor_comment_url": args.anchor_comment_url,
+    "human_context_comment_urls": args.human_context_comment_urls,
+    "agent_report_comment_urls": args.agent_report_comment_urls,
+}
 (artifact / "preflight.json").write_text(json.dumps(payload))
 print(json.dumps({"ok": True, **payload}))
 """,
@@ -335,6 +385,7 @@ REGISTRY = {
             "--issue-number", "{issue_number}",
             "--repo", "{repo}",
             "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
         ],
         "shell": False,
         "cwd_policy": "repo_root",
@@ -357,6 +408,7 @@ REGISTRY = {
             "--issue-number", "{issue_number}",
             "--repo", "{repo}",
             "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
             "--consume-contract-patch-plan",
         ],
         "shell": False,
@@ -435,6 +487,7 @@ def main() -> int:
     parser.add_argument("--issue-number", required=True)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--anchor-comment-url", required=False, default=None)
+    parser.add_argument("--human-context-comment-url", required=False, default=None)
     parser.add_argument("--consume-contract-patch-plan", action="store_true")
     args = parser.parse_args()
     artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number
@@ -545,6 +598,8 @@ def test_executor_reaches_subprocess_and_rejects_anchor_on_preflight_run(tmp_pat
         "issue_number": "1498",
         "repo": "squne121/loop-protocol",
         "anchor_comment_url": _VALID_URL,
+        "human_context_comment_urls": [],
+        "agent_report_comment_urls": [],
     }
     assert json.loads(positive.stdout)["anchor_comment_url"] == _VALID_URL
 
@@ -670,10 +725,13 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
 
     first = _run_executor(
         repo,
-        command_id="contract_update.run.with_anchor",
+        command_id="contract_update.run.with_human_context",
         use_fixture_runtime=True,
     )
-    assert first.returncode == 0, first.stderr
+    # The controlled write reached final readback, but the post-update
+    # contract review detects the deliberately incomplete new AC.  That is a
+    # terminal fail-closed result, never a successful implementation route.
+    assert first.returncode == 2, first.stderr
     request = json.loads((artifact_dir / "controlled_transaction_request.json").read_text())
     assert request["command_id"] == "issue_content.update"
     assert request["payload"]["schema"] == "ISSUE_CONTENT_UPDATE_INPUT_V1"
@@ -685,28 +743,38 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     assert sum(call[:2] == ["issue", "view"] for call in calls) >= 4
     result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     assert result["contract_update"] == {
-        "status": "applied",
+        "status": "failed",
         "writes": 1,
         "iterations": 0,
         "final_readback": "verified",
         "fresh_preflight": "pass",
         # The synthetic directive intentionally introduces a new AC without
-        # its matching verification-command marker.  The important boundary
-        # is that a fresh reviewer receives the post-mutation body, and its
-        # valid independent outcome is propagated rather than suppressed.
+        # its matching verification-command marker.  The failed review must
+        # block the phase rather than remain telemetry on a successful exit.
         "fresh_review": "needs_fix",
         "fresh_readiness": "go",
     }
+    provenance = json.loads((artifact_dir / "refinement_preflight_provenance_v1.json").read_text())
+    assert provenance["runtime_evidence"]["source"]["source_kind"] == "issue_comment"
 
     replay = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        use_fixture_runtime=True,
+    )
+    assert replay.returncode == 2, replay.stderr
+    replay_result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
+    assert replay_result["contract_update"]["status"] == "failed"
+    assert replay_result["contract_update"]["writes"] == 0
+    generic_replay = _run_executor(
         repo,
         command_id="contract_update.run.with_anchor",
         use_fixture_runtime=True,
     )
-    assert replay.returncode == 0, replay.stderr
-    replay_result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
-    assert replay_result["contract_update"]["status"] == "no_change"
-    assert replay_result["contract_update"]["writes"] == 0
+    assert generic_replay.returncode == 2, generic_replay.stderr
+    generic_replay_result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
+    assert generic_replay_result["contract_update"]["status"] == "failed"
+    assert generic_replay_result["contract_update"]["writes"] == 0
     assert not (repo / "artifacts" / "1498" / "issue-metadata").exists() or len(
         list((repo / "artifacts" / "1498" / "issue-metadata").rglob("*.input.json"))
     ) == 1
@@ -722,3 +790,28 @@ def test_contract_update_phase_cannot_be_reached_through_preflight_command(tmp_p
     assert "contract_update" not in payload
     artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
     assert not (artifact_dir / "transaction_invoked.json").exists()
+
+
+def test_anchor_profiles_materialize_only_the_explicit_origin_lane(tmp_path: Path) -> None:
+    """P0: executor preserves the profile-selected lane into the child argv."""
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+
+    generic = _run_executor(repo, command_id="preflight.run.with_anchor")
+    assert generic.returncode == 0, generic.stderr
+    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498" / "preflight.json"
+    generic_payload = json.loads(artifact.read_text())
+    assert generic_payload["human_context_comment_urls"] == []
+    assert generic_payload["agent_report_comment_urls"] == []
+
+    human = _run_executor(repo, command_id="preflight.run.with_human_context")
+    assert human.returncode == 0, human.stderr
+    human_payload = json.loads(artifact.read_text())
+    assert human_payload["human_context_comment_urls"] == [_VALID_URL]
+    assert human_payload["agent_report_comment_urls"] == []
+
+    agent = _run_executor(repo, command_id="preflight.run.with_agent_report")
+    assert agent.returncode == 0, agent.stderr
+    agent_payload = json.loads(artifact.read_text())
+    assert agent_payload["human_context_comment_urls"] == []
+    assert agent_payload["agent_report_comment_urls"] == [_VALID_URL]

@@ -86,6 +86,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -243,6 +244,60 @@ def _validate_artifact_projection(*, repo_root: Path, issue_number: int, artifac
 
 # Trusted author associations for ANCHOR_SCOPE_REFRAME_V1
 TRUSTED_ANCHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+# Trusted lanes for source attribution.
+_HUMAN_CONTEXT_COMMENT_URLS_FIELD = "human_context_comment_urls"
+_AGENT_REPORT_COMMENT_URLS_FIELD = "agent_report_comment_urls"
+
+
+def _normalize_comment_url_set(value: Any) -> set[str] | None:
+    """Return a normalized set of URLs or `None` when malformed.
+
+    Malformed explicit-lane fields are treated as untrusted control-plane
+    input (fail-closed) so they cannot be used to infer a trusted origin.
+    """
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {value}
+    if not isinstance(value, (list, tuple, set)):
+        return None
+    urls: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        urls.add(item)
+    return urls
+
+
+def _resolve_scope_delta_source_kind(
+    anchor_url: str,
+    *,
+    human_context_comment_urls: Any,
+    agent_report_comment_urls: Any,
+) -> str:
+    """Resolve source kind from control-plane explicit lanes only."""
+    human_urls = _normalize_comment_url_set(human_context_comment_urls)
+    agent_urls = _normalize_comment_url_set(agent_report_comment_urls)
+
+    # Any unrecognized or unlabeled lane payload is fail-closed.  An anchor
+    # URL alone is not an origin lane: callers must state whether it is human
+    # context or an agent report.
+    if human_urls is None or agent_urls is None:
+        return "generated_by_agent"
+
+    in_human = anchor_url in human_urls
+    in_agent = anchor_url in agent_urls
+
+    # Fail-closed on duplicate lane identity.
+    if in_human and in_agent:
+        return "generated_by_agent"
+
+    if in_agent:
+        return "generated_by_agent"
+    if in_human:
+        return "issue_comment"
+    return "generated_by_agent"
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -1830,13 +1885,28 @@ def _bounded_contract_update_handoff(consumer_result: dict[str, Any]) -> dict[st
     states = consumer_result.get("states")
     state = states.get("contract_update", {}).get("status") if isinstance(states, dict) else None
     iterations = consumer_result.get("iterations", 0)
-    if raw_status == "applied" and iterations == 1:
-        status = "rebased"
-    else:
-        status = state if state in {"applied", "no_change", "rebased"} else "failed"
     fresh = consumer_result.get("fresh_checks")
     if not isinstance(fresh, dict):
         fresh = {}
+    # A completed transaction is not an implementation authorization.  The
+    # post-update rerun is a six-gate conjunction: missing, warn, or failing
+    # checks must fail the phase even though the controlled write itself
+    # reached final readback successfully.  Do not infer a pass from prose or
+    # an earlier transaction result.
+    post_update_gate_passed = (
+        fresh.get("preflight") == "pass"
+        and fresh.get("review") == "approve"
+        and fresh.get("readiness") == "go"
+        and fresh.get("allowed_paths") == "pass"
+        and fresh.get("permission_profile") == "pass"
+        and fresh.get("runtime_evidence") == "pass"
+    )
+    if raw_status == "applied" and iterations == 1 and post_update_gate_passed:
+        status = "rebased"
+    elif raw_status in {"applied", "no_change"} and post_update_gate_passed:
+        status = state if state in {"applied", "no_change", "rebased"} else "failed"
+    else:
+        status = "failed"
     return {
         "status": status,
         "writes": int(consumer_result.get("writes", 0)) if isinstance(consumer_result.get("writes", 0), int) else 0,
@@ -2145,6 +2215,8 @@ def _build_scope_delta_authority_evidence(
     issue_number: int,
     anchor_url: str,
     captured_at: str,
+    human_context_comment_urls: Any = None,
+    agent_report_comment_urls: Any = None,
     segments_result: "dict | None" = None,
     candidates_result: "dict | None" = None,
 ):
@@ -2206,12 +2278,17 @@ def _build_scope_delta_authority_evidence(
     confidence = classify_directive_confidence(comment_body, markers)
     boundary_flags_map = detect_boundary_flags(comment_body)
     boundary_flag_names = [name for name, value in boundary_flags_map.items() if value]
+    source_kind = _resolve_scope_delta_source_kind(
+        anchor_url,
+        human_context_comment_urls=human_context_comment_urls,
+        agent_report_comment_urls=agent_report_comment_urls,
+    )
 
     issue_url = f"https://github.com/{repo}/issues/{issue_number}"
 
     return {
         "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
-        "source_kind": "issue_comment",
+        "source_kind": source_kind,
         "source_ref": anchor_url,
         "source_issue_number": issue_number,
         "comment_id": comment_payload.get("id"),
@@ -2240,6 +2317,7 @@ def consume_trusted_anchor_contract_patch_plan(
     anchor_body: str,
     contract_patch_plan: dict,
     callbacks: Optional[dict[str, Any]] = None,
+    known_context: Optional[dict[str, Any]] = None,
 ) -> dict:
     """Connect an approved patch plan to the controlled transaction lane.
 
@@ -2371,6 +2449,7 @@ def consume_trusted_anchor_contract_patch_plan(
                 issue_number=issue_number,
                 repo=repo,
                 anchor_comment_urls=[anchor_url],
+                known_context=known_context,
                 consume_contract_patch_plan=False,
             )
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", encoding="utf-8", delete=False) as handle:
@@ -2385,10 +2464,109 @@ def consume_trusted_anchor_contract_patch_plan(
             shell=False,
             timeout=30,
         )
+
+        # Execute the canonical Allowed Paths grammar rather than treating a
+        # successful contract review as a substitute for the path gate.
+        allowed_paths_status = "unavailable"
+        try:
+            import importlib.util
+
+            baseline_path = (
+                _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "baseline_vc_preflight.py"
+            )
+            gate_path = _SCRIPTS_DIR.parent.parent / "pr-review-judge" / "scripts" / "allowed_paths_review_gate.py"
+            baseline_spec = importlib.util.spec_from_file_location("post_update_allowed_paths_baseline", baseline_path)
+            gate_spec = importlib.util.spec_from_file_location("post_update_allowed_paths_gate", gate_path)
+            if (
+                baseline_spec is not None
+                and baseline_spec.loader is not None
+                and gate_spec is not None
+                and gate_spec.loader is not None
+            ):
+                baseline_module = importlib.util.module_from_spec(baseline_spec)
+                gate_module = importlib.util.module_from_spec(gate_spec)
+                baseline_spec.loader.exec_module(baseline_module)
+                gate_spec.loader.exec_module(gate_module)
+                allowed_paths = baseline_module.extract_allowed_paths(current_issue.get("body", ""))
+                normalized_paths = [
+                    gate_module.AllowedPathsMatcher.normalize_allowed_pattern(path) for path in allowed_paths
+                ]
+                if allowed_paths and all(isinstance(path, str) and path for path in normalized_paths):
+                    allowed_paths_status = "pass"
+                else:
+                    allowed_paths_status = "failed"
+        except Exception:
+            allowed_paths_status = "unavailable"
+
+        # Validate the exact privileged command profile selected by the
+        # explicit source lane.  This checks the canonical registry/policy
+        # grammar, not a prose assertion from the directive.
+        permission_profile_status = "unavailable"
+        try:
+            from command_registry import render_command
+
+            policy_path = _find_repo_root() / "scripts" / "agent-guards" / "skill_runtime_command_policy.py"
+            policy_spec = importlib.util.spec_from_file_location("post_update_runtime_policy", policy_path)
+            if policy_spec is not None and policy_spec.loader is not None:
+                policy_module = importlib.util.module_from_spec(policy_spec)
+                policy_spec.loader.exec_module(policy_module)
+                context = known_context if isinstance(known_context, dict) else {}
+                human_urls = _normalize_comment_url_set(context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD))
+                profile = (
+                    "contract_update.run.with_human_context"
+                    if human_urls is not None and anchor_url in human_urls
+                    else "contract_update.run.with_anchor"
+                )
+                # render_command proves the child argv; the policy parses the
+                # matching executor argv, including the required lane flag.
+                render_command(profile, {"issue_number": issue_number, "repo": repo, "anchor_comment_url": anchor_url})
+                executor_argv = [
+                    "uv", "run", "python3", "scripts/agent-guards/skill_runtime_exec.py",
+                    "--command-id", profile, "--issue-number", str(issue_number),
+                    "--repo", repo, "--anchor-comment-url", anchor_url,
+                ]
+                if profile == "contract_update.run.with_human_context":
+                    executor_argv.extend(["--human-context-comment-url", anchor_url])
+                parsed = policy_module.parse_exact_skill_runtime_contract_update_anchor_command(
+                    shlex.join(executor_argv), str(_find_repo_root())
+                )
+                permission_profile_status = "pass" if parsed is not None else "failed"
+        except Exception:
+            permission_profile_status = "unavailable"
+
+        # The rerun must retain the exact source binding in a sidecar emitted
+        # by the fresh preflight.  A missing sidecar or a lane mismatch is a
+        # failed runtime-evidence gate, never an implicit success.
+        runtime_evidence_status = "unavailable"
+        try:
+            provenance_path = (
+                _issue_artifact_dir(_find_repo_root(), issue_number) / "refinement_preflight_provenance_v1.json"
+            )
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            source = provenance.get("runtime_evidence", {}).get("source", {})
+            context = known_context if isinstance(known_context, dict) else {}
+            expected_source_kind = _resolve_scope_delta_source_kind(
+                anchor_url,
+                human_context_comment_urls=context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD),
+                agent_report_comment_urls=context.get(_AGENT_REPORT_COMMENT_URLS_FIELD),
+            )
+            if (
+                source.get("comment_url") == anchor_url
+                and source.get("source_kind") == expected_source_kind
+                and provenance.get("runtime_evidence", {}).get("tested_head_sha")
+            ):
+                runtime_evidence_status = "pass"
+            else:
+                runtime_evidence_status = "failed"
+        except Exception:
+            runtime_evidence_status = "unavailable"
         return {
             "preflight": preflight_result.get("status"),
             "review": "approve" if review.returncode == 0 else "needs_fix" if review.returncode == 1 else "unavailable",
             "readiness": readiness.get("status"),
+            "allowed_paths": allowed_paths_status,
+            "permission_profile": permission_profile_status,
+            "runtime_evidence": runtime_evidence_status,
         }
 
     normalized_anchor = dict(anchor_payload)
@@ -2424,6 +2602,7 @@ def _satisfied_trusted_directive_noop_patch_plan(
     anchor_url: str,
     anchor_payload: dict[str, Any],
     anchor_body: str,
+    known_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any] | None:
     """Reconstruct only a proven-satisfied trusted directive as a no-op.
 
@@ -2461,8 +2640,22 @@ def _satisfied_trusted_directive_noop_patch_plan(
         issue_number=issue_number,
         anchor_url=anchor_url,
         captured_at=_now_iso(),
+        human_context_comment_urls=(
+            known_context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD)
+            if isinstance(known_context, dict)
+            else None
+        ),
+        agent_report_comment_urls=(
+            known_context.get(_AGENT_REPORT_COMMENT_URLS_FIELD)
+            if isinstance(known_context, dict)
+            else None
+        ),
     )
-    if not isinstance(evidence, dict) or evidence.get("confidence") != "explicit":
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("confidence") != "explicit"
+        or evidence.get("source_kind") != "issue_comment"
+    ):
         return None
     if evidence.get("boundary_flags"):
         return None
@@ -2772,6 +2965,16 @@ def run_preflight(
                 issue_number=issue_number,
                 anchor_url=anchor_url,
                 captured_at=now or _now_iso(),
+                human_context_comment_urls=(
+                    known_context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD)
+                    if isinstance(known_context, dict)
+                    else None
+                ),
+                agent_report_comment_urls=(
+                    known_context.get(_AGENT_REPORT_COMMENT_URLS_FIELD)
+                    if isinstance(known_context, dict)
+                    else None
+                ),
                 segments_result=_segments_result,
                 candidates_result=_candidates_result,
             )
@@ -2930,6 +3133,8 @@ def run_preflight(
                 blockers=blockers,
                 stderr=planner_stderr or "",
                 repo_root=repo_root,
+                plan=None,
+                result_next_action="fix_environment",
             )
             write_provenance_artifact(repo_root, issue_number, _prov)
         except Exception:
@@ -2973,6 +3178,7 @@ def run_preflight(
                 anchor_url=anchor_url_for_consumer,
                 anchor_payload=anchor_payload_for_consumer,
                 anchor_body=anchor_body_for_consumer,
+                known_context=known_context,
             )
         if (
             isinstance(patch_plan, dict)
@@ -2989,9 +3195,10 @@ def run_preflight(
                 anchor_body=anchor_body_for_consumer,
                 contract_patch_plan=patch_plan,
                 callbacks=contract_update_callbacks,
+                known_context=known_context,
             )
             contract_update_handoff = _bounded_contract_update_handoff(consumer_result)
-            if consumer_result.get("status") not in {"applied", "no_change"}:
+            if contract_update_handoff.get("status") not in {"applied", "no_change", "rebased"}:
                 blockers.append(BLOCKER_FAIL_CLOSED)
         else:
             # The explicit mutation phase has no safe action without a
@@ -3373,6 +3580,8 @@ def run_preflight(
             blockers=blockers,
             stderr=planner_stderr or "",
             repo_root=repo_root,
+            plan=plan,
+            result_next_action=result.get("next_action", "unavailable"),
         )
         write_provenance_artifact(repo_root, issue_number, _provenance)
     except Exception:
@@ -3602,6 +3811,8 @@ def build_provenance(
     blockers: list,
     stderr: str,
     repo_root: Path,
+    plan: Optional[dict] = None,
+    result_next_action: str = "unavailable",
 ) -> dict:
     """Generate REFINEMENT_PREFLIGHT_PROVENANCE_V1 sidecar artifact.
 
@@ -3619,6 +3830,52 @@ def build_provenance(
     planner_input_text = _canonical_json(planner_input)
     raw_snapshot_text = _canonical_json(raw_snapshot)
     stderr_str = stderr or ""
+    sidecar = (plan or {}).get("scope_signal_guard_decision_v2")
+    authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else {}
+    authority_route = authority.get("route") if isinstance(authority, dict) else {}
+    if not isinstance(authority_route, dict):
+        # A malformed/scalar route must never suppress the provenance sidecar.
+        # Preserve fail-closed semantics by recording no implementation route
+        # rather than treating the scalar as an authorization object.
+        authority_route = {}
+    known_context = planner_input.get("known_context") if isinstance(planner_input, dict) else {}
+    evidence_list = (
+        known_context.get("scope_delta_authority_evidence")
+        if isinstance(known_context, dict)
+        else []
+    )
+    source_evidence = evidence_list[0] if isinstance(evidence_list, list) and evidence_list else {}
+    if not isinstance(source_evidence, dict):
+        source_evidence = {}
+    runtime_evidence = {
+        # The provenance sidecar is intentionally additive to the strict
+        # preflight-result schema. It binds runtime observations but cannot
+        # itself authorize implementation.
+        "tested_head_sha": _git_head_sha(repo_root),
+        "source": {
+            "comment_url": source_evidence.get("comment_url"),
+            "comment_id": source_evidence.get("comment_id"),
+            "body_sha256": source_evidence.get("body_sha256"),
+            "source_kind": source_evidence.get("source_kind"),
+        },
+        "route": {
+            "action": authority_route.get("action"),
+            "implementation_allowed": authority_route.get("implementation_allowed"),
+            "required_rerun": authority_route.get("next_step"),
+        },
+        "terminal_event": {
+            "wrapper_status": wrapper_status,
+            "next_action": result_next_action,
+            "implementation_allowed": authority_route.get("implementation_allowed"),
+        },
+        # The generic preflight cannot claim a #1952-specific profile check
+        # has passed. Consumers must execute that validator at the current
+        # head before implementation; until then this is an explicit deny.
+        "permission_profile_validators": {
+            "status": "required_before_implementation",
+            "passed": False,
+        },
+    }
 
     def _dependency_version(name: str) -> str:
         try:
@@ -3660,6 +3917,7 @@ def build_provenance(
         "raw_snapshot_sha256": _sha256(raw_snapshot_text),
         "stderr_sha256": _sha256(stderr_str),
         "stderr_excerpt": stderr_str[:500],
+        "runtime_evidence": runtime_evidence,
     }
 
 
@@ -3740,6 +3998,20 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--human-context-comment-url",
+        dest="human_context_comment_urls",
+        action="append",
+        default=[],
+        help="Explicit human-context issue-comment URL (repeatable).",
+    )
+    parser.add_argument(
+        "--agent-report-comment-url",
+        dest="agent_report_comment_urls",
+        action="append",
+        default=[],
+        help="Explicit agent-report issue-comment URL (repeatable; never authorizes a rewrite).",
+    )
+    parser.add_argument(
         "--fixture",
         type=Path,
         default=None,
@@ -3791,11 +4063,19 @@ def main(argv: list[str] | None = None) -> None:
         print(_build_compact_stdout(result))
         sys.exit(EXIT_BLOCKED)
 
+    cli_known_context = None
+    if args.human_context_comment_urls or args.agent_report_comment_urls:
+        cli_known_context = {
+            _HUMAN_CONTEXT_COMMENT_URLS_FIELD: args.human_context_comment_urls,
+            _AGENT_REPORT_COMMENT_URLS_FIELD: args.agent_report_comment_urls,
+        }
+
     _, exit_code = run_preflight(
         issue_number=args.issue_number,
         repo=args.repo,
         anchor_comment_urls=args.anchor_comment_urls,
         fixture_path=args.fixture,
+        known_context=cli_known_context,
         consume_contract_patch_plan=args.consume_contract_patch_plan,
     )
     sys.exit(exit_code)
