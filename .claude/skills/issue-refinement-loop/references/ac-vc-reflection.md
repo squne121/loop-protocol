@@ -6,26 +6,26 @@ review 段階で本文品質を評価するとき、baseline 未実装状態と�
 
 ## Reflection Rules (SubAgent-owned)
 
-AC/VC の baseline fail 判定、reflection guard、および rewrite 時の期待動作に関する詳細は、`.claude/agents/issue-author.md` の **AC/VC Reflection & Rewrite Logic (SubAgent-owned)** セクションを参照すること。
+AC/VC の baseline fail 判定、reflection guard、および rewrite 時の期待動作に関する詳細は、既存 Issue を更新する `.claude/agents/issue-editor.md` の **FAIL_CLOSED_REWRITE_CONSTRAINTS_V1 の rewrite payload 契約** セクションを参照すること。`issue-creator` は新規起票専用であり、この rewrite route には使用しない。
 
 orchestrator はこれらの判定ロジックを再実装せず、SubAgent 側の自律的判断に委譲する。
 
 ## Rewrite guard (orchestrator layer)
 
 - `reviewer_feedback_text` は opaque forwarding payload として扱う。
-- anchor comment が絡む場合も、raw snapshot ではなく正規化済み `anchor_comment_feedback` だけを `issue-author` へ渡す。
+- anchor comment が絡む場合も、raw snapshot ではなく正規化済み `anchor_comment_feedback` だけを `issue-editor` へ渡す。
 
 ## FAIL_CLOSED_REWRITE_CONSTRAINTS_V1 Forwarding
 
-`fail_closed.required == true` の場合、orchestrator は `fail_closed.rewrite_constraints`（`FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` スキーマ）を `issue-author` への rewrite 入力に含める必要がある。
+`fail_closed.required == true` の場合、orchestrator は `fail_closed.rewrite_constraints`（`FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` スキーマ）を `issue-editor` への rewrite 入力に含める必要がある。
 
-- `issue-author` は `required_sections` / `required_contract_keys` / `rewrite_constraints` フィールドを受け取り、不足セクション・不足契約キーの補完を優先する
-- `rewrite_constraints.freeform_rewrite_forbidden == true` の場合、`issue-author` は自由文形式の改変を拒否する
+- `issue-editor` は `required_sections` / `required_contract_keys` / `rewrite_constraints` フィールドを受け取り、不足セクション・不足契約キーの補完を優先する
+- `rewrite_constraints.freeform_rewrite_forbidden == true` の場合、`issue-editor` は自由文形式の改変を拒否する
 - `human_decision_reframe` による override が許可されていても、`FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` を無視してよいわけではない
 
 ### Rewrite 後の自動再検証（2 段構成）
 
-`issue-author` による rewrite 完了後に以下の検証を順に実施する:
+`issue-editor` による rewrite 完了後に以下の検証を順に実施する:
 
 1. **pre-mutation dry-run checker**: mutation 前に新本文の静的検証（`check_issue_contract.py` 相当）を dry-run で実施する
 2. **post-mutation fresh checker**: `gh issue edit` 実行後に GitHub から本文を再取得し、静的検証を再実施する

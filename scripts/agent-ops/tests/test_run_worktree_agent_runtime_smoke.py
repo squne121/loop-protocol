@@ -259,6 +259,7 @@ exit 0
     assert result.returncode == 0, result.stderr
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "native_event_count: 2" in summary
+    assert "terminal_event_observed: True" in summary
     # Only summary.md is persisted (Issue #1921 P1 evidence-hygiene fix-delta).
     assert sorted(p.name for p in out_dir.iterdir()) == ["summary.md"]
 

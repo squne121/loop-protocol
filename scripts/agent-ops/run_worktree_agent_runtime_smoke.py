@@ -2172,6 +2172,8 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["process_exit_code"] = rc
             schema_summary["timed_out"] = timed_out
             schema_summary["native_event_count"] = event_count
+            terminal_event_observed = has_terminal_event(args.runtime, out) if event_count > 0 else None
+            schema_summary["terminal_event_observed"] = terminal_event_observed
             schema_summary["capability_decision"] = capability_decision
             schema_summary["capability_error_classification"] = capability_reason
 
@@ -2276,7 +2278,7 @@ def main(argv: list[str] | None = None) -> int:
             elif rc != 0:
                 errors.append(f"structured lane exited non-zero: {rc}: {_redact(err[:500])}")
                 exit_code = EXIT_FAIL
-            elif event_count > 0 and not has_terminal_event(args.runtime, out):
+            elif terminal_event_observed is False:
                 errors.append("no terminal/result event observed in structured output")
                 exit_code = EXIT_FAIL
 
