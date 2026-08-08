@@ -1355,6 +1355,182 @@ jobs:
           fi
           echo "hidden_attachment_upload_proof=ok actual=${actual_files[*]} diff=${diff_files[*]}"
       # --- end negative control ------------------------------------------
+      # --- Mutation negative control (Issue #2014 AC3 / AC8) --------------
+      # Proves the comparator (AC1's calibrated allowedMismatchedPixels cap)
+      # has real detection power by deliberately hiding HULL / Pause /
+      # elapsed ONE AT A TIME (env-gated `test.skipIf` in
+      # tests/component/combat-hud-running.vrt.test.ts) and asserting the
+      # SAME running-scenario toMatchScreenshot() call against the SAME
+      # committed baseline fails with a non-zero mismatch. Each control is a
+      # separate step (continue-on-error) so CI can report a per-target
+      # `expected_failure` result for the evidence manifest below.
+      - name: Run mutation negative control (HULL hidden, expected to mismatch)
+        id: run-mutation-control-hull
+        continue-on-error: true
+        env:
+          VITE_VRT_MUTATION_CONTROL_HULL: "true"
+        run: pnpm exec vitest run --config vitest.visual.config.ts -t "hull_hidden" tests/component/combat-hud-running.vrt.test.ts
+      - name: Run mutation negative control (Pause hidden, expected to mismatch)
+        id: run-mutation-control-pause
+        continue-on-error: true
+        env:
+          VITE_VRT_MUTATION_CONTROL_PAUSE: "true"
+        run: pnpm exec vitest run --config vitest.visual.config.ts -t "pause_hidden" tests/component/combat-hud-running.vrt.test.ts
+      - name: Run mutation negative control (elapsed hidden, expected to mismatch)
+        id: run-mutation-control-elapsed
+        continue-on-error: true
+        env:
+          VITE_VRT_MUTATION_CONTROL_ELAPSED: "true"
+        run: pnpm exec vitest run --config vitest.visual.config.ts -t "elapsed_hidden" tests/component/combat-hud-running.vrt.test.ts
+      - name: Verify all three mutation controls actually mismatched
+        if: ${{ always() }}
+        env:
+          HULL_OUTCOME: ${{ steps.run-mutation-control-hull.outcome }}
+          PAUSE_OUTCOME: ${{ steps.run-mutation-control-pause.outcome }}
+          ELAPSED_OUTCOME: ${{ steps.run-mutation-control-elapsed.outcome }}
+        run: |
+          fail=0
+          for pair in "hull_hidden:${HULL_OUTCOME}" "pause_hidden:${PAUSE_OUTCOME}" "elapsed_hidden:${ELAPSED_OUTCOME}"; do
+            name="${pair%%:*}"
+            outcome="${pair##*:}"
+            if [ "${outcome}" != "failure" ]; then
+              echo "::error::mutation control '${name}' outcome was '${outcome}', expected 'failure' (hiding a critical HUD fragment must always be detected as a mismatch). If it passed or was skipped, the comparator (or the control itself) has no real detection power for this fragment."
+              fail=1
+            else
+              echo "mutation_control ${name}=ok (mismatched as expected)"
+            fi
+          done
+          if [ "${fail}" -eq 1 ]; then
+            exit 1
+          fi
+      # --- end mutation negative control -----------------------------------
+      # --- Runtime evidence: triple-run determinism + evidence manifest
+      # (Issue #2014 AC7 / AC8) --------------------------------------------
+      - name: Capture triple-run render-determinism evidence (fresh browser process x3)
+        id: evidence-triple-run
+        run: pnpm run test:vrt:evidence:triple-run | tee /tmp/vrt-evidence-triple-run.log
+      - name: Measure real mismatched-pixel count (zero-tolerance probe)
+        id: zero-tolerance-probe
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          # Scoped, never-committed override: the ONE real committed
+          # `allowedMismatchedPixels: 48,` call site for
+          # 'combat-hud-running.png' is temporarily tightened to 0 for this
+          # single probe invocation only, then restored immediately after
+          # (checked out fresh via git, never pushed/committed). This keeps
+          # exactly one literal `toMatchScreenshot('combat-hud-running.png',
+          # ...)` call site in the committed source at all times --
+          # `scripts/check-visual-artifact-pipeline.py`'s static validator
+          # fails closed on duplicate/non-literal comparatorOptions call
+          # sites for the same screenshot name otherwise (Issue #2014 AC1
+          # derivation comment in the spec file itself).
+          cp tests/component/combat-hud-running.vrt.test.ts /tmp/combat-hud-running.vrt.test.ts.orig
+          sed -i "0,/allowedMismatchedPixels: 48,/s//allowedMismatchedPixels: 0,/" tests/component/combat-hud-running.vrt.test.ts
+          set +e
+          pnpm exec vitest run --config vitest.visual.config.ts -t "combat-hud-running scenario" tests/component/combat-hud-running.vrt.test.ts 2>&1 | tee /tmp/vrt-zero-tolerance-probe.log
+          probe_status="${PIPESTATUS[0]}"
+          set -e
+          cp /tmp/combat-hud-running.vrt.test.ts.orig tests/component/combat-hud-running.vrt.test.ts
+          exit "${probe_status}"
+      - name: Build VISUAL_BASELINE_REVIEW_EVIDENCE_V1 manifest
+        id: build-evidence-manifest
+        if: ${{ always() }}
+        env:
+          RUN_OUTCOME: ${{ steps.run-component-vrt.outcome }}
+          PROBE_OUTCOME: ${{ steps.zero-tolerance-probe.outcome }}
+          HULL_OUTCOME: ${{ steps.run-mutation-control-hull.outcome }}
+          PAUSE_OUTCOME: ${{ steps.run-mutation-control-pause.outcome }}
+          ELAPSED_OUTCOME: ${{ steps.run-mutation-control-elapsed.outcome }}
+          SCREENSHOTS_ARTIFACT_ID: ${{ steps.upload-component-vrt-screenshots.outputs.artifact-id || '' }}
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version" 2>/dev/null || echo 'unknown')"
+          VITEST_VERSION="$(node -p "require('vitest/package.json').version" 2>/dev/null || echo 'unknown')"
+          BASELINE_SHA256="$(sha256sum tests/component/__screenshots__/combat-hud-running.vrt.test.ts/combat-hud-running-chromium-linux.png | awk '{print $1}')"
+          ACTUAL_1="$(grep -o 'actual_sha256_run_1=.*' /tmp/vrt-evidence-triple-run.log | tail -1 | cut -d= -f2)"
+          ACTUAL_2="$(grep -o 'actual_sha256_run_2=.*' /tmp/vrt-evidence-triple-run.log | tail -1 | cut -d= -f2)"
+          ACTUAL_3="$(grep -o 'actual_sha256_run_3=.*' /tmp/vrt-evidence-triple-run.log | tail -1 | cut -d= -f2)"
+          # AC1/AC8: `zero-tolerance-probe` re-runs the running-scenario
+          # assertion with allowedMismatchedPixels forced to 0. On a real
+          # 0px diff the probe PASSES (mismatched_pixels=0); on any real
+          # diff Vitest's own error text reports the exact count
+          # ("<N> pixels (ratio <r>) differ."), which is parsed verbatim --
+          # never fabricated (Runtime Verification Applicability
+          # fallback_policy).
+          if [ "${PROBE_OUTCOME}" = "success" ]; then
+            MISMATCHED_PIXELS=0
+          else
+            MISMATCHED_PIXELS="$(grep -oP '^\d+(?= pixels \(ratio)' /tmp/vrt-zero-tolerance-probe.log | tail -1)"
+            if [ -z "${MISMATCHED_PIXELS}" ]; then
+              echo "::error::zero-tolerance-probe outcome was '${PROBE_OUTCOME}' but no mismatch-count line was found in its output -- refusing to fabricate a mismatched_pixels value."
+              MISMATCHED_PIXELS="unknown_non_zero"
+            fi
+          fi
+          classify_mutation() {
+            case "$1" in
+              failure) echo "expected_failure" ;;
+              *) echo "NOT_expected_failure ($1)" ;;
+            esac
+          }
+          python3 - "$GITHUB_SHA" "$GITHUB_RUN_ID" "$SCREENSHOTS_ARTIFACT_ID" "$PW_VERSION" "$VITEST_VERSION"             "$BASELINE_SHA256" "$ACTUAL_1" "$ACTUAL_2" "$ACTUAL_3" "$MISMATCHED_PIXELS"             "$(classify_mutation "$HULL_OUTCOME")" "$(classify_mutation "$PAUSE_OUTCOME")" "$(classify_mutation "$ELAPSED_OUTCOME")" <<'PY' > /tmp/visual_baseline_review_evidence_v1.json
+          import json
+          import sys
+
+          (
+              head_sha, run_id, artifact_id, pw_version, vitest_version,
+              baseline_sha256, actual_1, actual_2, actual_3, mismatched_pixels,
+              hull_result, pause_result, elapsed_result,
+          ) = sys.argv[1:14]
+
+          manifest = {
+              "schema": "VISUAL_BASELINE_REVIEW_EVIDENCE_V1",
+              "head_sha": head_sha,
+              "run_id": run_id,
+              "artifact_id": artifact_id,
+              "container_digest": "sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948",
+              "node_version": None,
+              "pnpm_version": "11.7.0",
+              "vitest_version": vitest_version,
+              "playwright_version": pw_version,
+              "chromium_version": None,
+              "viewport": "1280x720",
+              "device_scale_factor": 1,
+              "baseline_sha256": baseline_sha256,
+              "actual_sha256_run_1": actual_1,
+              "actual_sha256_run_2": actual_2,
+              "actual_sha256_run_3": actual_3,
+              "mismatched_pixels": mismatched_pixels,
+              "effective_pixel_limit": 48,
+              "mutation_controls": {
+                  "hull_hidden": hull_result,
+                  "pause_hidden": pause_result,
+                  "elapsed_hidden": elapsed_result,
+              },
+              "expected_actual_diff_review": (
+                  "running/critical baselines regenerated and reviewed in fix_delta "
+                  "iteration 1 (Issue #2014, PR #2024 review comment "
+                  "https://github.com/squne121/loop-protocol/pull/2024#issuecomment-5225055386)"
+              ),
+          }
+          print(json.dumps(manifest, indent=2))
+          PY
+          cat /tmp/visual_baseline_review_evidence_v1.json
+          {
+            echo ""
+            echo "### VISUAL_BASELINE_REVIEW_EVIDENCE_V1 (Issue #2014 AC8)"
+            echo '```json'
+            cat /tmp/visual_baseline_review_evidence_v1.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload VISUAL_BASELINE_REVIEW_EVIDENCE_V1 manifest
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: component-vrt-evidence-manifest
+          path: /tmp/visual_baseline_review_evidence_v1.json
+          if-no-files-found: error
+          retention-days: 30
+      # --- end runtime evidence ---------------------------------------------
       - name: Summarize component VRT evidence
         if: ${{ always() }}
         env:

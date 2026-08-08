@@ -107,7 +107,7 @@ registry は推測ではなく現行テスト実体に基づいて分類する�
 | running-hud-paused | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-paused-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test。Issue #1376 AC12 で active 昇格） | #1380 / #1375 / #1376 / #1377 / #1391 | running HUD の停止状態でも command-rail / right rail / two-column shell / `.battle-stage` 外 controls への依存がないことを明示し、pause dialog（`role="dialog"`、Resume 初期 focus、Canvas/combat HUD inert 化）が描画されること | 色味 / 詳細配置は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。`running-hud-overlay-legacy-current` と同じ capture root・同じ理由で採用。ローカル環境で複数回実測し PASS した） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1377 マージ後） | #1370 / #1375 / #1376 / #1377 / #1380 |
 | result-overlay-timeout | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-result-timeout-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test。Issue #1376 AC12 で active 昇格） | #1380 / #1376 / #1377 / #1392 | result overlay timeout の timeout 時間表現を `durationMs` / `fixedDeltaMs`（`RewardSystem.calculate()` の戻り値経由）から構築し、result dialog（`role="dialog"`、`tabindex="-1"` heading 初期 focus、Return to hangar 厳密1件）が描画されること | 色味 / 詳細配置は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。`running-hud-overlay-legacy-current` と同じ capture root・同じ理由で採用。ローカル環境で複数回実測し PASS した） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1377 マージ後） | #1380 / #1376 / #1377 |
 | final-no-command-rail | screenshot-baseline | pending-baseline | pending: no PNG/test | #1380 / #1370 / #1377 | 最終結果画面が `command rail` 未依存でも意図読取できること。right rail / battle-stage 外依存は frozen 禁止条件 | #1370 / #1377 の影響条件を満たすまで固定化しない | pending: no PNG/test（active PASS claim 保留） | `merged PR SHA` と `artifact URL` / `artifact digest` / `environment fingerprint` が確定した時点で `legacy-current -> frozen` | #1380 / #1370 / #1377 |
-| combat-hud-running (component VRT) | screenshot-baseline | provisional | `tests/component/__screenshots__/combat-hud-running.vrt.test.ts/`（`tests/component/combat-hud-running.vrt.test.ts`。Vitest Browser Mode、Playwright E2E VRT とは別の baseline root） | #1389 / #1380 / #1370 | `createHudController()` の production DOM を `src/style.css` 適用済みで mount し、`[data-combat-hud]` のみを撮影すること（full page / Canvas / legacy result surface / command rail は撮影しない） | 色味 / 詳細配置は UI 再設計まで可変。`combat-hud-running` 以外のシナリオは本 Issue の Out of Scope | `allowedMismatchedPixelRatio: 0.02`（Vitest Browser Mode `toMatchScreenshot()` の comparator。理由: `running-hud`/`running-hud-overlay-legacy-current` と同じ combat HUD 表示だが独立した capture root であり、font-rasterization ノイズに対する余裕として比率指定を採用） | component VRT は non-required/report-only（`component-vrt-report` CI job）のままである限り maturity 遷移条件は適用しない。required gate 化する場合は別 Issue で本行を frozen 遷移条件つきに更新する | #1380（VRT rollout tracker） |
+| combat-hud-running (component VRT) | screenshot-baseline | provisional | `tests/component/__screenshots__/combat-hud-running.vrt.test.ts/`（`tests/component/combat-hud-running.vrt.test.ts`。Vitest Browser Mode、Playwright E2E VRT とは別の baseline root） | #1389 / #1380 / #1370 | `createHudController()` の production DOM を `src/style.css` 適用済みで mount し、`[data-combat-hud]` のみを撮影すること（full page / Canvas / legacy result surface / command rail は撮影しない） | 色味 / 詳細配置は UI 再設計まで可変。`combat-hud-running` 以外のシナリオは本 Issue の Out of Scope | `allowedMismatchedPixelRatio: 0.02` + `allowedMismatchedPixels: 48`（Issue #2014、Vitest Browser Mode `toMatchScreenshot()` は両者を併記した場合、厳しい方を採用する。理由: PR #2024 OWNER REQUEST_CHANGES で、比率単独（1280x212 capture で実効 ~5,427px）は HULL/Pause/elapsed の欠落を 許容してしまうと指摘された。CI ピン留め canonical environment 内で 3 回連続の fresh-run vs 既存 baseline diff を `allowedMismatchedPixels: 0` で実測した結果は 0px（真のノイズ床）。48px は その 0px 床に対する安全マージンであり、同一環境で実測した最小の critical subregion （elapsed ~1,240px²）よりも一桁以上小さい。env-gated mutation negative-control lane が HULL / Pause / elapsed を個別に隠して同じ baseline に対する `toMatchScreenshot()` が実際に mismatch する ことを証明する） | component VRT は non-required/report-only（`component-vrt-report` CI job）のままである限り maturity 遷移条件は適用しない。required gate 化する場合は別 Issue で本行を frozen 遷移条件つきに更新する | #1380（VRT rollout tracker） |
 
 ### pending-baseline / legacy-current の遷移規則
 
@@ -752,6 +752,44 @@ collapse する設計のため、375x667 で Weapon/Assist が既に collapse �
   （hidden-HUD capture を reject する negative control）・pixel-diversity
   テストも無回帰で PASS。
 - **maturity**: `legacy-current` のまま変更なし。
+
+## 3.5 VISUAL_BASELINE_REVIEW_EVIDENCE_V1（Issue #2014）
+
+`combat-hud-running` / `combat-hud-critical`（hp=25/maxHp=100 critical fixture、Issue #2014
+AC4）の baseline レビューに紐づく runtime evidence manifest のスキーマ。`.github/workflows/ci.yml`
+の `component-vrt-report` ジョブが current head SHA に紐づけて生成し、CI artifact
+（`component-vrt-evidence-manifest`）として残す。
+
+```yaml
+VISUAL_BASELINE_REVIEW_EVIDENCE_V1:
+  head_sha: <string>
+  run_id: <string>
+  artifact_id: <string>
+  container_digest: <string>          # CI ピン留め Playwright Docker イメージの digest
+  pnpm_version: <string>
+  vitest_version: <string>
+  playwright_version: <string>
+  viewport: <string>                  # 例: "1280x720"
+  device_scale_factor: <int>
+  baseline_sha256: <string>
+  actual_sha256_run_1: <string>
+  actual_sha256_run_2: <string>
+  actual_sha256_run_3: <string>
+  mismatched_pixels: <int>            # allowedMismatchedPixels:0 の zero-tolerance probe から実測（自己申告ではない）
+  effective_pixel_limit: <int>        # 実運用時の allowedMismatchedPixels（48）
+  mutation_controls:
+    hull_hidden: expected_failure | NOT_expected_failure
+    pause_hidden: expected_failure | NOT_expected_failure
+    elapsed_hidden: expected_failure | NOT_expected_failure
+  expected_actual_diff_review: <string>
+```
+
+`actual_sha256_run_1/2/3` は `pnpm test:vrt:evidence:triple-run`（fresh browser process を 3 回連続
+起動し、各回が保存した実際の capture PNG を SHA-256 で比較する単一コマンド）から得る。
+`mismatched_pixels` はコミット済み baseline file が不変であることの確認ではなく、
+`allowedMismatchedPixels: 0` を強制した zero-tolerance probe の実行結果（PASS なら 0、FAIL なら
+Vitest 自身のエラーメッセージから実測値をパース）から得る、旧 head の自己申告や fabricate された
+値ではない実測 evidence である。
 
 ## 4. baseline update policy（更新ポリシー）
 
