@@ -29,11 +29,18 @@ def _run_route_smoke(role: str, route: str, marker: str, *, refusal: bool) -> st
         f"Do not perform the task yourself. "
     )
     if refusal:
-        wrong_intent = "edit an existing GitHub Issue" if role == "issue-creator" else "create a new GitHub Issue"
-        request += (
-            f"Request that agent to {wrong_intent}. It must refuse before any mutation, shell mutation, "
-            f"or network mutation, then output exactly `{marker}`."
-        )
+        if route == "unknown":
+            request += (
+                "Request that agent to invoke the unknown mutation route named `unknown`; do not substitute "
+                "a create or edit route. It must refuse before any mutation, shell mutation, or network mutation, "
+                f"then output exactly `{marker}`."
+            )
+        else:
+            wrong_intent = "edit an existing GitHub Issue" if role == "issue-creator" else "create a new GitHub Issue"
+            request += (
+                f"Request that agent to {wrong_intent}. It must refuse before any mutation, shell mutation, "
+                f"or network mutation, then output exactly `{marker}`."
+            )
     else:
         request += (
             f"Request that agent to use only its canonical `{route}` Skill, read its SKILL.md, "
@@ -78,6 +85,12 @@ def _run_route_smoke(role: str, route: str, marker: str, *, refusal: bool) -> st
     assert "runtime_version:" in summary
     assert "loaded_skills_source: static_frontmatter" in summary
     assert "terminal" not in summary.lower() or "exit_code: 0" in summary
+    if route == "unknown":
+        assert marker == (
+            "RUNTIME_SMOKE_1952_UNKNOWN_REFUSED requested_route=unknown "
+            "effective_route=refused mutation_attempted=false"
+        )
+        assert "expected_markers_missing: []" in summary
     return summary
 
 
@@ -97,7 +110,12 @@ def test_codex_creator_editor_runtime_evidence(role: str, route: str, marker: st
     [
         ("issue-creator", "edit-issue", "RUNTIME_SMOKE_1952_CREATOR_EDIT_REFUSED"),
         ("issue-editor", "create-issue", "RUNTIME_SMOKE_1952_EDITOR_CREATE_REFUSED"),
-        ("issue-creator", "unknown", "RUNTIME_SMOKE_1952_UNKNOWN_REFUSED"),
+        (
+            "issue-creator",
+            "unknown",
+            "RUNTIME_SMOKE_1952_UNKNOWN_REFUSED requested_route=unknown "
+            "effective_route=refused mutation_attempted=false",
+        ),
     ],
 )
 def test_codex_creator_editor_wrong_route_refuses_before_mutation(role: str, route: str, marker: str):

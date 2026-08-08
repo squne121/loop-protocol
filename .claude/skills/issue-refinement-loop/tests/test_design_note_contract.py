@@ -23,6 +23,16 @@ DESIGN_NOTE = REPO_ROOT / "docs/dev/workflows/issue-refinement-loop-design.md"
 SKILL_MD = REPO_ROOT / ".claude/skills/issue-refinement-loop/SKILL.md"
 LOOP_STATE_REFERENCE = REPO_ROOT / ".claude/skills/issue-refinement-loop/references/loop-state.md"
 
+# Issue #1952 replaces the historical issue-author source with active creator
+# and editor definitions. A design note can retain the former path as history,
+# but drift checks must use the executable topology and never require its stub.
+CANONICAL_SOURCE_REPLACEMENTS = {
+    ".claude/agents/issue-author.md": (
+        ".claude/agents/issue-creator.md",
+        ".claude/agents/issue-editor.md",
+    ),
+}
+
 REQUIRED_CLAIMS = {
     "max_iterations_default": "loop_policy.default_max_iterations",
     "iteration_limit_termination": "needs-fix continuation rule",
@@ -114,6 +124,13 @@ def _extract_canonical_sources(design_note_text: str) -> List[str]:
     assert isinstance(canonical_sources, list), "canonical_sources must be a list"
     assert canonical_sources, "canonical_sources must not be empty"
     return canonical_sources
+
+
+def _active_canonical_sources(canonical_sources: Iterable[str]) -> List[str]:
+    active: List[str] = []
+    for relpath in canonical_sources:
+        active.extend(CANONICAL_SOURCE_REPLACEMENTS.get(relpath, (relpath,)))
+    return active
 
 
 def _assert_claims_consistency(design_note_text: str) -> None:
@@ -215,7 +232,7 @@ def test_design_note_rejects_long_copied_blocks_from_canonical_sources():
     canonical_sources = frontmatter["canonical_sources"]
     assert isinstance(canonical_sources, Iterable)
 
-    for relpath in canonical_sources:
+    for relpath in _active_canonical_sources(canonical_sources):
         source_path = REPO_ROOT / relpath
         assert source_path.exists(), f"canonical source missing: {relpath}"
         copied_blocks = _find_long_copied_windows(
