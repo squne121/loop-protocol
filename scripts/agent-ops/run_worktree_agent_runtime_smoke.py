@@ -77,6 +77,14 @@ _RUNTIME_FOLLOWUP_ROUTE_RE = re.compile(
     r"(?m)^\s*-\s*runtime_followup_route:\s*([^\s]+)\s*$"
 )
 
+_TRANSACTION_ENTRYPOINTS = {
+    "create-issue": ".claude/skills/create-issue/scripts/create_issue_txn.py",
+    "edit-issue": ".claude/skills/edit-issue/scripts/edit_issue_txn.py",
+}
+_REQUIRED_RUNTIME_OBSERVATION_FIELDS = frozenset(
+    {"effective_permission_profile", "loaded_skill", "executor", "mutation"}
+)
+
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_SKIP = 77
@@ -1986,6 +1994,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-turns", type=_positive_int, default=_DEFAULT_MAX_TURNS,
                          help="bounded turn count for Claude Code (structured lane only; positive integer)")
     parser.add_argument("--expect-marker", action="append", default=[])
+    parser.add_argument(
+        "--require-observed-runtime-field",
+        action="append",
+        choices=sorted(_REQUIRED_RUNTIME_OBSERVATION_FIELDS),
+        default=[],
+        help=(
+            "require a field to be independently observed in native runtime "
+            "evidence; unavailable required fields cause exit 77/SKIP, never PASS"
+        ),
+    )
     parser.add_argument("--require-clean-postcondition", action="store_true")
     parser.add_argument("--inspect-session-log-metadata", action="store_true")
     parser.add_argument("--require-session-log-metadata", action="store_true")
@@ -2013,6 +2031,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--require-transaction-entrypoint-preflight",
+        action="store_true",
+        help=(
+            "for a role-bound route request, safely invoke the actual "
+            "transaction entrypoint with deliberately incomplete input and "
+            "require its pre-executor parser refusal before recording a "
+            "route mismatch refusal"
+        ),
+    )
+    parser.add_argument(
         "--claude-agent-name",
         default=None,
         help=(
@@ -2031,8 +2059,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def preflight_requested_mutation_route(
-    worktree: str, agent_type: str, requested_route: str | None
-) -> dict[str, str | None]:
+    worktree: str, agent_type: str, requested_route: str | None, *,
+    require_transaction_entrypoint_preflight: bool = False,
+) -> dict[str, object]:
     """Return a deterministic receipt for an optional mutation-route request.
 
     The canonical route is read from the active agent TOML rather than a test
@@ -2040,11 +2069,18 @@ def preflight_requested_mutation_route(
     outcome: it intentionally prevents the runtime from starting, so no
     prompt-only model refusal can be mistaken for an authorization boundary.
     """
-    receipt: dict[str, str | None] = {
+    receipt: dict[str, object] = {
         "requested_mutation_route": requested_route,
         "declared_mutation_route": None,
         "route_preflight_decision": "not_requested",
         "route_preflight_source": None,
+        "controlled_route_preflight_status": "not_requested",
+        "canonical_transaction_entrypoint": None,
+        "requested_transaction_entrypoint": None,
+        "pre_executor_refusal_observed": False,
+        "executor_invocation_observed": False,
+        "mutation_attempted": None,
+        "mutation_observed_channels": [],
     }
     if requested_route is None:
         return receipt
@@ -2073,6 +2109,33 @@ def preflight_requested_mutation_route(
     receipt["route_preflight_decision"] = (
         "allow" if requested_route == declared_route else "refused_before_runtime"
     )
+    if not require_transaction_entrypoint_preflight:
+        return receipt
+
+    declared_entrypoint = _TRANSACTION_ENTRYPOINTS.get(declared_route)
+    requested_entrypoint = _TRANSACTION_ENTRYPOINTS.get(requested_route)
+    receipt["declared_transaction_entrypoint"] = declared_entrypoint
+    receipt["requested_transaction_entrypoint"] = requested_entrypoint
+    if declared_entrypoint is None:
+        receipt["controlled_route_preflight_status"] = "canonical_entrypoint_unavailable"
+        return receipt
+    entrypoint_path = Path(worktree) / declared_entrypoint
+    receipt["canonical_transaction_entrypoint"] = declared_entrypoint
+    if not entrypoint_path.is_file():
+        receipt["controlled_route_preflight_status"] = "canonical_entrypoint_missing"
+        return receipt
+    # Invoke the actual selected transaction entrypoint with deliberately
+    # incomplete input. Both create and edit parsers reject before their
+    # executor/mutation transport can begin (exit 2), giving AC6 a concrete
+    # non-mutating parser receipt rather than treating --help as a decision.
+    rc, _out, _err, timed_out = _run(
+        [sys.executable, str(entrypoint_path)], cwd=worktree, timeout=10.0
+    )
+    if rc != 2 or timed_out:
+        receipt["controlled_route_preflight_status"] = "invalid_transaction_input_not_rejected"
+        return receipt
+    receipt["controlled_route_preflight_status"] = "invalid_transaction_input_rejected_pre_executor"
+    receipt["pre_executor_refusal_observed"] = requested_route != declared_route
     return receipt
 
 
@@ -2117,7 +2180,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_FAIL
 
     route_preflight = preflight_requested_mutation_route(
-        worktree, args.agent_type, args.requested_mutation_route
+        worktree,
+        args.agent_type,
+        args.requested_mutation_route,
+        require_transaction_entrypoint_preflight=args.require_transaction_entrypoint_preflight,
     )
     route_refused = (
         args.requested_mutation_route is not None
@@ -2137,6 +2203,18 @@ def main(argv: list[str] | None = None) -> int:
     # bottom of this function.
     exit_code = EXIT_OK
     resolved_runtime_bin: str | None = None
+    entrypoint_preflight_failed = (
+        args.require_transaction_entrypoint_preflight
+        and args.requested_mutation_route is not None
+        and route_preflight["controlled_route_preflight_status"]
+        != "invalid_transaction_input_rejected_pre_executor"
+    )
+    if entrypoint_preflight_failed:
+        errors.append(
+            "controlled route preflight unavailable: "
+            f"{route_preflight['controlled_route_preflight_status']}"
+        )
+        exit_code = EXIT_FAIL
 
     if args.mode == "interactive" and not route_refused:
         skip_reason = preflight_herdr()
@@ -2388,6 +2466,24 @@ def main(argv: list[str] | None = None) -> int:
                 if missing:
                     errors.append(f"expected markers not observed: {missing}")
                     exit_code = EXIT_FAIL
+
+            required_observations = sorted(set(args.require_observed_runtime_field))
+            if required_observations:
+                # These four fields have no independently extractable Codex
+                # event in this runner.  Record that precise capability gap;
+                # declarations or local re-reads must never fill it in.
+                unavailable = required_observations
+                schema_summary["required_runtime_observations"] = required_observations
+                schema_summary["unavailable_required_runtime_observations"] = unavailable
+                if exit_code == EXIT_OK:
+                    errors.append(
+                        "required runtime observations unavailable: " + ", ".join(unavailable)
+                    )
+                    schema_summary["capability_decision"] = "required_runtime_evidence_unavailable"
+                    schema_summary["capability_error_classification"] = (
+                        "native_event_field_unavailable"
+                    )
+                    exit_code = EXIT_SKIP
 
             if args.require_session_log_metadata or args.inspect_session_log_metadata:
                 metadata_count = count_session_log_metadata(out.splitlines())

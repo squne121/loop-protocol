@@ -146,10 +146,16 @@ def _run_route_smoke(role: str, route: str, marker: str | None, *, refusal: bool
                 "--output-dir", str(output_dir),
                 "--timeout-seconds", str(_CAPABILITY_WINDOW_SECONDS),
                 "--timeout-is-capability-unavailable",
+                "--require-observed-runtime-field", "effective_permission_profile",
+                "--require-observed-runtime-field", "loaded_skill",
+                "--require-observed-runtime-field", "executor",
+                "--require-observed-runtime-field", "mutation",
                 "--agent-type", role,
                 "--require-clean-postcondition",
                 "--requested-mutation-route", route,
             ]
+        if refusal:
+            command.append("--require-transaction-entrypoint-preflight")
         if marker is not None:
             command.extend(["--expect-marker", marker])
         result = subprocess.run(
@@ -163,6 +169,11 @@ def _run_route_smoke(role: str, route: str, marker: str | None, *, refusal: bool
         summary = (output_dir / "summary.md").read_text(encoding="utf-8")
         _source_manifest(output_dir=output_dir, summary=summary, role=role, route=route)
         if result.returncode == 77:
+            if not refusal:
+                assert "capability_decision: required_runtime_evidence_unavailable" in summary
+                assert "unavailable_required_runtime_observations:" in summary
+                assert f"child_agent_type_observed: {role}" in summary
+                assert "terminal_event_observed: True" in summary
             pytest.skip(f"Codex runtime smoke SKIP (exit 77): {result.stderr.strip()[-1200:]}")
         assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
 
@@ -185,6 +196,12 @@ def _run_route_smoke(role: str, route: str, marker: str | None, *, refusal: bool
     assert f"requested_agent_type: {role}" in summary
     if refusal:
         assert "route_preflight_decision: refused_before_runtime" in summary
+        assert "controlled_route_preflight_status: invalid_transaction_input_rejected_pre_executor" in summary
+        assert "canonical_transaction_entrypoint: .claude/skills/" in summary
+        assert "pre_executor_refusal_observed: True" in summary
+        assert "executor_invocation_observed: False" in summary
+        assert "mutation_attempted: None" in summary
+        assert "mutation_observed_channels: []" in summary
         assert "runtime_invocation: not_started_route_preflight_blocked" in summary
         assert "native_spawn_event_observed: False" in summary
         assert manifest["observed"]["executor"]["status"] == "not_invoked"

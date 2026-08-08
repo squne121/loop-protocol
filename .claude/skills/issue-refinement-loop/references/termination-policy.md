@@ -21,7 +21,7 @@
 | `false` | — | 通常通り iteration カウント（semantic iteration として処理） |
 | `true` だが body_sha256 が前回と同一（`no_change`） | 同一 | 同一 lane に戻さない。通常 iteration カウントとして処理（無限ループ防止） |
 
-**重要**: orchestrator は C4/C9 の具体修復知識を持たない。`contract_hygiene_repair_applied: true` フラグのみで routing を判断する。修復の詳細は `edit-issue` skill および `issue-author` SubAgent の責務。
+**重要**: orchestrator は C4/C9 の具体修復知識を持たない。`contract_hygiene_repair_applied: true` フラグのみで routing を判断する。修復の詳細は `edit-issue` skill および `issue-editor` SubAgent の責務。
 
 ## Handoff State（引き渡し状態）: `refinement_approved_gate_pending` / `implementation_ready`
 
@@ -368,7 +368,7 @@ checker exit 1（needs-fix）はインフラ障害でなく正常系として ro
 
    | `route` | orchestrator のアクション |
    |---|---|
-   | `continue_rewrite` | issue-author に rewrite を委譲（Step 4 継続）。次反復へ |
+   | `continue_rewrite` | issue-editor に rewrite を委譲（Step 4 継続）。次反復へ |
    | `proceed_to_review` | rewrite ループを抜けて Review / handoff 判定へ進む |
    | `human_judgment_required` | `termination_reason: human_escalation` で停止。`reason_code`（`max_attempts_exceeded` / `body_hash_unchanged` / `missing_contract_no_progress`）を終了コメントに添付 |
 

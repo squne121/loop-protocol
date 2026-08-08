@@ -529,6 +529,30 @@ sleep 30
     assert "capability_error_classification: declared_capability_window_exceeded" in summary
 
 
+def test_given_required_unavailable_runtime_field_when_fake_claude_succeeds_then_exit77(
+    repo_with_worktree, tmp_path
+):
+    """Unavailable evidence is a persisted SKIP even when the child completes."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--expect-marker", "MARKER_TOKEN_WT",
+        "--require-observed-runtime-field", "executor",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 77
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "capability_decision: required_runtime_evidence_unavailable" in summary
+    assert "unavailable_required_runtime_observations: ['executor']" in summary
+
+
 def test_given_fake_claude_argv_when_structured_lane_runs_then_max_turns_flag_present(
     repo_with_worktree, tmp_path
 ):

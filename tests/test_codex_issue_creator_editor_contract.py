@@ -13,6 +13,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENTS_DIR = REPO_ROOT / ".codex" / "agents"
 ROOT_SKILL_SURFACE = REPO_ROOT / ".agents" / "skills"
 CANONICAL_SKILLS = REPO_ROOT / ".claude" / "skills"
+ACTIVE_CALLER_PATHS = (
+    ".claude/skills/create-issue/references/body-authoring.md",
+    ".claude/skills/issue-refinement-loop/references/scope-signal-guard.md",
+    ".claude/skills/issue-refinement-loop/references/termination-policy.md",
+    ".claude/skills/issue-refinement-loop/schemas/contract_patch_plan_v1.schema.json",
+)
 
 
 def _load_agent(name: str) -> dict:
@@ -81,3 +87,12 @@ def test_creator_editor_controlled_executor_chains():
     assert "existing Issue の更新 intent は mutation 前に拒否する" in _instructions("issue-creator")
     assert "new Issue creation intent は mutation 前に拒否する" in _instructions("issue-editor")
 
+
+def test_active_caller_inventory_has_no_legacy_issue_author_reference():
+    """AC2: active caller/owner surfaces select creator or editor explicitly."""
+    legacy_hits = {
+        relative: (REPO_ROOT / relative).read_text(encoding="utf-8")
+        for relative in ACTIVE_CALLER_PATHS
+        if "issue-author" in (REPO_ROOT / relative).read_text(encoding="utf-8")
+    }
+    assert legacy_hits == {}
