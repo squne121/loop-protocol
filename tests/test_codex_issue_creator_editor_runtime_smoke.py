@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import importlib.util
 import json
 import subprocess
 import sys
@@ -36,6 +37,48 @@ ROUTE_CONTRACTS = {
 # (SKIP), never a static PASS or an outer-process timeout.
 _CAPABILITY_WINDOW_SECONDS = 10
 _RUNNER_PROCESS_TIMEOUT_SECONDS = 28
+
+
+def _load_runner_module():
+    spec = importlib.util.spec_from_file_location("worktree_agent_runtime_smoke", RUNNER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _runner_accepts_current_worktree() -> bool:
+    """Whether this pytest checkout is eligible for a spawned runtime smoke.
+
+    The runner intentionally accepts only linked worktrees below the canonical
+    repository's ``.claude/worktrees/`` root.  A detached pre-merge verifier
+    under ``tmp/`` is not a runtime-capable surface, so AC5 must SKIP rather
+    than mistake its identity refusal for a missing receipt or static PASS.
+    """
+    module = _load_runner_module()
+    try:
+        module.verify_worktree_identity(str(REPO_ROOT), module._default_repo_root())
+    except module.IdentityError:
+        return False
+    return True
+
+
+def _assert_pre_executor_refusal(role: str, route: str) -> None:
+    """Check AC6's actual controlled preflight without launching a runtime."""
+    module = _load_runner_module()
+    receipt = module.preflight_requested_mutation_route(
+        str(REPO_ROOT),
+        role,
+        route,
+        require_transaction_entrypoint_preflight=True,
+    )
+    assert receipt["route_preflight_decision"] == "refused_before_runtime"
+    assert receipt["controlled_route_preflight_status"] == (
+        "invalid_transaction_input_rejected_pre_executor"
+    )
+    assert receipt["pre_executor_refusal_observed"] is True
+    assert receipt["executor_invocation_observed"] is False
+    assert receipt["mutation_attempted"] is None
 
 
 def _summary_value(summary: str, field: str) -> str | None:
@@ -116,7 +159,7 @@ def _source_manifest(*, output_dir: Path, summary: str, role: str, route: str) -
 
 
 def _run_route_smoke(role: str, route: str, marker: str | None, *, refusal: bool) -> str:
-    if not (REPO_ROOT / ".git").is_file() or not RUNNER.is_file():
+    if not RUNNER.is_file() or not _runner_accepts_current_worktree():
         pytest.skip("linked worktree runtime surface is unavailable")
 
     request = (
@@ -166,7 +209,12 @@ def _run_route_smoke(role: str, route: str, marker: str | None, *, refusal: bool
             timeout=_RUNNER_PROCESS_TIMEOUT_SECONDS,
             check=False,
         )
-        summary = (output_dir / "summary.md").read_text(encoding="utf-8")
+        summary_path = output_dir / "summary.md"
+        assert summary_path.is_file(), (
+            "runtime smoke exited without its deterministic receipt: "
+            f"exit={result.returncode}; stderr={result.stderr[-1200:]}"
+        )
+        summary = summary_path.read_text(encoding="utf-8")
         _source_manifest(output_dir=output_dir, summary=summary, role=role, route=route)
         if result.returncode == 77:
             if not refusal:
@@ -257,6 +305,13 @@ def test_codex_creator_editor_wrong_route_refuses_before_mutation():
         ("issue-editor", "create-issue", None),
         ("issue-creator", "unknown", None),
     ]
+    if not _runner_accepts_current_worktree():
+        # AC6 remains a PASS in detached pre-merge verification: it exercises
+        # the same controlled transaction preflight and never upgrades an
+        # unavailable spawned runtime to a positive runtime result.
+        for role, route, _marker in cases:
+            _assert_pre_executor_refusal(role, route)
+        return
     with ThreadPoolExecutor(max_workers=len(cases)) as executor:
         futures = [
             executor.submit(_run_route_smoke, role, route, marker, refusal=True)
