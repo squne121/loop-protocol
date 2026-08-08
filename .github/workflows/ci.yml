@@ -1462,6 +1462,13 @@ jobs:
           PAUSE_OUTCOME: ${{ steps.run-mutation-control-pause.outcome }}
           ELAPSED_OUTCOME: ${{ steps.run-mutation-control-elapsed.outcome }}
           SCREENSHOTS_ARTIFACT_ID: ${{ steps.upload-component-vrt-screenshots.outputs.artifact-id || '' }}
+          # Issue #2014 fix_delta iteration 4: for pull_request-triggered
+          # runs, the built-in $GITHUB_SHA is the ephemeral merge-preview
+          # commit (a synthetic merge of the PR head into base), not the
+          # actual PR head commit -- so AC8's manifest.head_sha must be
+          # bound to this instead, matching the pattern already used
+          # elsewhere in this file (e.g. line 104).
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           PW_VERSION="$(node -p "require('@playwright/test/package.json').version" 2>/dev/null || echo 'unknown')"
           VITEST_VERSION="$(node -p "require('vitest/package.json').version" 2>/dev/null || echo 'unknown')"
@@ -1496,7 +1503,7 @@ jobs:
               *) echo "NOT_expected_failure ($1)" ;;
             esac
           }
-          python3 - "$GITHUB_SHA" "$GITHUB_RUN_ID" "$SCREENSHOTS_ARTIFACT_ID" "$PW_VERSION" "$VITEST_VERSION"             "$BASELINE_SHA256" "$ACTUAL_1" "$ACTUAL_2" "$ACTUAL_3" "$MISMATCHED_PIXELS"             "$(classify_mutation "$HULL_OUTCOME")" "$(classify_mutation "$PAUSE_OUTCOME")" "$(classify_mutation "$ELAPSED_OUTCOME")" <<'PY' > /tmp/visual_baseline_review_evidence_v1.json
+          python3 - "$GH_HEAD_SHA" "$GITHUB_RUN_ID" "$SCREENSHOTS_ARTIFACT_ID" "$PW_VERSION" "$VITEST_VERSION"             "$BASELINE_SHA256" "$ACTUAL_1" "$ACTUAL_2" "$ACTUAL_3" "$MISMATCHED_PIXELS"             "$(classify_mutation "$HULL_OUTCOME")" "$(classify_mutation "$PAUSE_OUTCOME")" "$(classify_mutation "$ELAPSED_OUTCOME")" <<'PY' > /tmp/visual_baseline_review_evidence_v1.json
           import json
           import sys
 
