@@ -18,6 +18,7 @@ import os
 import stat
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,9 @@ PRODUCER_DIGEST = f"sha256:{hashlib.sha256(PRODUCER_PATH.read_bytes()).hexdigest
 # "now" the test executes at (the producer's hook_received_at check uses the
 # real clock, not a simulated one).
 ELIGIBILITY_GENERATED_AT = "2026-06-15T11:00:00Z"
-ELIGIBILITY_EXPIRES_AT = "2030-01-01T00:00:00Z"
+# Issue #2004 P3: computed relative to real wall-clock "now" (not a fixed
+# calendar date) so this fixture never expires as real time passes.
+ELIGIBILITY_EXPIRES_AT = (datetime.now(timezone.utc) + timedelta(days=3650)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _render_marker(
@@ -555,3 +558,215 @@ def test_claude_coordinator_raw_payload_still_captures_without_regression(tmp_pa
     # ungated path: provenance digests are absent (no fixed-location gate
     # was consulted at all for this caller).
     assert record["provenance"]["eligibility_artifact_digest"] is None
+
+# ---------------------------------------------------------------------------
+# Issue #2004 In Scope: producer-consumer round trip against the new default
+# tmp/session-recording/ location (no test-harness path overrides), plus
+# negative controls (old path only / readiness only / eligibility only) each
+# proving fail-closed behavior. These are distinct from the tests above,
+# which always pin eligibility_path/readiness_path via
+# SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH / SCOPE_ROLLUP_READINESS_ARTIFACT_PATH
+# through _run_producer_gated(); the tests below exercise the real default
+# path computation (scope_rollup_eligibility_artifact_path() /
+# _readiness_artifact_path()) with those overrides left unset.
+# ---------------------------------------------------------------------------
+
+
+def _new_default_eligibility_path(repo_root: Path) -> Path:
+    return repo_root / "tmp" / "session-recording" / "scope-rollup-eligibility.json"
+
+
+def _new_default_readiness_path(repo_root: Path) -> Path:
+    return repo_root / "tmp" / "session-recording" / "scope-rollup-readiness.json"
+
+
+def _legacy_eligibility_path(repo_root: Path) -> Path:
+    return repo_root / ".claude" / "tmp" / "session-recording" / "scope-rollup-eligibility.json"
+
+
+def _legacy_readiness_path(repo_root: Path) -> Path:
+    return repo_root / ".claude" / "tmp" / "session-recording" / "scope-rollup-readiness.json"
+
+
+def _seed_policy_docs(repo_root: Path) -> None:
+    """Seed docs/dev/session-recording-policy.md and secret-policy.md under a
+    fake repo root so eligibility_binding_policy_digest_mismatch /
+    eligibility_binding_secret_policy_digest_mismatch (recomputed live from
+    those files at verification time) do not spuriously fire — the fake repo
+    root gets byte-identical copies of the real policy files this test
+    process is already running against."""
+    (repo_root / "docs" / "dev").mkdir(parents=True, exist_ok=True)
+    (repo_root / "docs" / "dev" / "session-recording-policy.md").write_bytes(_POLICY_PATH.read_bytes())
+    (repo_root / "docs" / "dev" / "secret-policy.md").write_bytes(_SECRET_POLICY_PATH.read_bytes())
+
+
+def _run_producer_default_paths(
+    payload: dict[str, object],
+    capture_dir: Path,
+    *,
+    fake_repo_root: Path,
+) -> subprocess.CompletedProcess[str]:
+    """Invoke the producer with SCOPE_ROLLUP_REPO_ROOT pointed at
+    fake_repo_root and neither SCOPE_ROLLUP_ELIGIBILITY_ARTIFACT_PATH nor
+    SCOPE_ROLLUP_READINESS_ARTIFACT_PATH set, so the producer resolves the
+    real (non-overridden) default fixed-location paths under fake_repo_root
+    instead of the test-harness override paths used elsewhere in this file.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin"),
+        "SCOPE_ROLLUP_CAPTURE_DIR": str(capture_dir),
+        "SCOPE_ROLLUP_REQUIRE_SOURCE_BOUND_ELIGIBILITY": "1",
+        "SCOPE_ROLLUP_REPO_ROOT": str(fake_repo_root.resolve()),
+    }
+    return subprocess.run(
+        [sys.executable, str(PRODUCER_PATH)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=str(REPO_ROOT),
+        env=env,
+    )
+
+
+def test_default_fixed_location_round_trip_new_path(tmp_path: Path) -> None:
+    """Issue #2004 In Scope: producer-consumer round trip against the new
+    default tmp/session-recording/ location, proving the eligibility loader
+    (check_session_recording_runtime_safety.scope_rollup_eligibility_artifact_path)
+    and the readiness consumer (capture_scope_rollup_final_response._readiness_artifact_path)
+    agree on the same real default path when neither artifact-path env
+    override is set."""
+    fake_repo_root = tmp_path / "fake-repo"
+    fake_repo_root.mkdir()
+    _seed_policy_docs(fake_repo_root)
+    capture_dir = tmp_path / "capture"
+    capture_dir.mkdir()
+
+    eligibility_path = _new_default_eligibility_path(fake_repo_root)
+    readiness_path = _new_default_readiness_path(fake_repo_root)
+    eligibility_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_json_mode_0600(
+        eligibility_path,
+        _default_eligibility(tmp_path, repo_root_realpath=str(fake_repo_root.resolve())),
+    )
+    _write_json_mode_0600(
+        readiness_path,
+        _default_readiness(repo_root_realpath=str(fake_repo_root.resolve())),
+    )
+
+    message = _render_marker(invocation_id="inv-2004-roundtrip")
+    payload = {
+        "hook_event_name": "SubagentStop",
+        "agent_type": "scope-rollup-runner",
+        "last_assistant_message": message,
+        "stop_hook_active": False,
+    }
+    result = _run_producer_default_paths(payload, capture_dir, fake_repo_root=fake_repo_root)
+    assert result.returncode == 0, result.stderr
+    _, record = _single_capture_record(capture_dir)
+    assert record["capture_status"] == "captured"
+    assert record["parser_status"] == "ok"
+    provenance = record["provenance"]
+    assert provenance["eligibility_verification_reason_code"] == "ok"
+    assert provenance["readiness_verification_reason_code"] == "ok"
+
+
+def test_negative_control_legacy_path_only_is_not_consumed(tmp_path: Path) -> None:
+    """Issue #2004 In Scope negative control: artifacts existing ONLY at the
+    old default location (.claude/tmp/session-recording/) are never read as
+    a fallback — the fixed missing reason is returned exactly as if nothing
+    existed at all (no implicit dual-read)."""
+    fake_repo_root = tmp_path / "fake-repo"
+    fake_repo_root.mkdir()
+    _seed_policy_docs(fake_repo_root)
+    capture_dir = tmp_path / "capture"
+    capture_dir.mkdir()
+
+    legacy_eligibility_path = _legacy_eligibility_path(fake_repo_root)
+    legacy_readiness_path = _legacy_readiness_path(fake_repo_root)
+    legacy_eligibility_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_json_mode_0600(
+        legacy_eligibility_path,
+        _default_eligibility(tmp_path, repo_root_realpath=str(fake_repo_root.resolve())),
+    )
+    _write_json_mode_0600(
+        legacy_readiness_path,
+        _default_readiness(repo_root_realpath=str(fake_repo_root.resolve())),
+    )
+
+    message = _render_marker(invocation_id="inv-2004-legacy-only")
+    payload = {
+        "hook_event_name": "SubagentStop",
+        "agent_type": "scope-rollup-runner",
+        "last_assistant_message": message,
+        "stop_hook_active": False,
+    }
+    result = _run_producer_default_paths(payload, capture_dir, fake_repo_root=fake_repo_root)
+    assert result.returncode == 0, result.stderr
+    _, record = _single_capture_record(capture_dir)
+    assert record["capture_status"] == "parser_rejected"
+    assert record["parser_status"] == "eligibility_missing"
+    assert not any(capture_dir.glob("scope_rollup_*.txt"))
+
+
+def test_negative_control_readiness_only_present_is_eligibility_missing(tmp_path: Path) -> None:
+    """Issue #2004 In Scope negative control: readiness present at the new
+    default location but eligibility entirely absent must fail-closed as
+    eligibility_missing (readiness alone is never sufficient)."""
+    fake_repo_root = tmp_path / "fake-repo"
+    fake_repo_root.mkdir()
+    capture_dir = tmp_path / "capture"
+    capture_dir.mkdir()
+
+    readiness_path = _new_default_readiness_path(fake_repo_root)
+    readiness_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_json_mode_0600(
+        readiness_path,
+        _default_readiness(repo_root_realpath=str(fake_repo_root.resolve())),
+    )
+    # eligibility intentionally not written at all.
+
+    message = _render_marker(invocation_id="inv-2004-ready-only")
+    payload = {
+        "hook_event_name": "SubagentStop",
+        "agent_type": "scope-rollup-runner",
+        "last_assistant_message": message,
+        "stop_hook_active": False,
+    }
+    result = _run_producer_default_paths(payload, capture_dir, fake_repo_root=fake_repo_root)
+    assert result.returncode == 0, result.stderr
+    _, record = _single_capture_record(capture_dir)
+    assert record["capture_status"] == "parser_rejected"
+    assert record["parser_status"] == "eligibility_missing"
+
+
+def test_negative_control_eligibility_only_present_is_readiness_missing(tmp_path: Path) -> None:
+    """Issue #2004 In Scope negative control: eligibility present at the new
+    default location but readiness entirely absent must fail-closed as
+    readiness_missing (eligibility alone is never sufficient)."""
+    fake_repo_root = tmp_path / "fake-repo"
+    fake_repo_root.mkdir()
+    _seed_policy_docs(fake_repo_root)
+    capture_dir = tmp_path / "capture"
+    capture_dir.mkdir()
+
+    eligibility_path = _new_default_eligibility_path(fake_repo_root)
+    eligibility_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_json_mode_0600(
+        eligibility_path,
+        _default_eligibility(tmp_path, repo_root_realpath=str(fake_repo_root.resolve())),
+    )
+    # readiness intentionally not written at all.
+
+    message = _render_marker(invocation_id="inv-2004-elig-only")
+    payload = {
+        "hook_event_name": "SubagentStop",
+        "agent_type": "scope-rollup-runner",
+        "last_assistant_message": message,
+        "stop_hook_active": False,
+    }
+    result = _run_producer_default_paths(payload, capture_dir, fake_repo_root=fake_repo_root)
+    assert result.returncode == 0, result.stderr
+    _, record = _single_capture_record(capture_dir)
+    assert record["capture_status"] == "parser_rejected"
+    assert record["parser_status"] == "readiness_missing"

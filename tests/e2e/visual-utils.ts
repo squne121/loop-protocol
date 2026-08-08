@@ -17,6 +17,47 @@ import type { VisualScenarioFixture, VisualScenarioViewportLabel } from '../../s
 export type { VisualScenarioFixture, VisualScenarioViewportLabel }
 
 // ---------------------------------------------------------------------------
+// Expected PR head SHA (Issue #1958 fix_delta iteration 3, blocker 4)
+// ---------------------------------------------------------------------------
+
+const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/
+
+/**
+ * Resolves the actual PR/commit head SHA that runtime evidence must bind to.
+ *
+ * `process.env.GITHUB_SHA` on GitHub Actions `pull_request` events is the
+ * synthetic merge-ref commit ("Merge <head> into <base>"), NOT the real PR
+ * head SHA -- recording it as evidence `head_sha` silently mislabels every
+ * runtime artifact with a commit that never actually ran. A `git rev-parse
+ * HEAD` fallback has the same problem inside the `pull_request` checkout
+ * (detached at the same synthetic merge ref), and a bare `'unknown'` /
+ * `'unknown-head-sha'` fallback lets evidence generation silently succeed
+ * with no real provenance at all.
+ *
+ * The CI workflow (`.github/workflows/ci.yml`'s `e2e` job) instead passes
+ * `EXPECTED_PR_HEAD_SHA` explicitly:
+ * `github.event.pull_request.head.sha || github.sha` -- the real PR head
+ * SHA for `pull_request` events, falling back to `github.sha` (which IS the
+ * real pushed commit, no synthetic-merge issue) for `push` events. This
+ * throws -- never returns a placeholder -- when the env var is missing or
+ * is not a full 40-hex-character commit SHA, so a misconfigured CI
+ * environment fails evidence generation instead of recording bogus
+ * provenance. Local runs must export `EXPECTED_PR_HEAD_SHA` themselves
+ * (e.g. `EXPECTED_PR_HEAD_SHA=$(git rev-parse HEAD)`).
+ */
+export function resolveExpectedHeadSha(): string {
+  const raw = process.env.EXPECTED_PR_HEAD_SHA
+  if (!raw || !FULL_SHA_PATTERN.test(raw)) {
+    throw new Error(
+      `EXPECTED_PR_HEAD_SHA must be set to a full 40-hex-character commit SHA (got: ${JSON.stringify(raw)}). ` +
+        'Set it via the CI workflow (.github/workflows/ci.yml e2e job env) or export it locally ' +
+        '(e.g. EXPECTED_PR_HEAD_SHA=$(git rev-parse HEAD)) before running this spec.',
+    )
+  }
+  return raw
+}
+
+// ---------------------------------------------------------------------------
 // Scenario Support Matrix (Issue #1385 contract)
 // ---------------------------------------------------------------------------
 
@@ -111,6 +152,18 @@ export const VISUAL_BASELINE_REGISTRY_IDS = [
   // same id for two unrelated baselines (different test file, different
   // capture root, different tolerance) would make the registry ambiguous.
   'running-hud-overlay-legacy-current',
+  // Issue #1958 AC8 (owner decision #2): representative boundary-cell VRT
+  // baselines for the SAME `[data-battle-ui-root]` capture root /
+  // `running-hud` fixture as `running-hud-overlay-legacy-current` above, at
+  // the four documented desktop/low-DPR/minimum-mobile boundary viewports
+  // `tests/e2e/hud-hull-overflow.spec.ts`'s geometry assertions already
+  // exercise behaviorally. Distinct ids (not the same id reused four times)
+  // because each is an independent baseline PNG / registry row per
+  // docs/dev/visual-baseline-registry.md's one-row-per-baseline convention.
+  'running-hud-overlay-legacy-current-1366x768',
+  'running-hud-overlay-legacy-current-1920x1080',
+  'running-hud-overlay-legacy-current-1437x1365-dpr0667',
+  'running-hud-overlay-legacy-current-375x667',
 ] as const
 
 export type VisualBaselineRegistryId = (typeof VISUAL_BASELINE_REGISTRY_IDS)[number]
@@ -144,6 +197,13 @@ export const VISUAL_BASELINE_REGISTRY_MATURITY: Readonly<
   'result-overlay-timeout': 'legacy-current',
   'final-no-command-rail': 'pending-baseline',
   'running-hud-overlay-legacy-current': 'legacy-current',
+  // Issue #1958 AC8: boundary-cell captures share the SAME maturity as the
+  // base 1280x720 `running-hud-overlay-legacy-current` baseline (identical
+  // capture root / fixture / tolerance, only the viewport differs).
+  'running-hud-overlay-legacy-current-1366x768': 'legacy-current',
+  'running-hud-overlay-legacy-current-1920x1080': 'legacy-current',
+  'running-hud-overlay-legacy-current-1437x1365-dpr0667': 'legacy-current',
+  'running-hud-overlay-legacy-current-375x667': 'legacy-current',
 }
 
 // ---------------------------------------------------------------------------

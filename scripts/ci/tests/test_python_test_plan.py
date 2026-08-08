@@ -192,6 +192,20 @@ def test_real_plan_serial_lane_has_debounce():
         # per the plan's deselect list; see python-test-plan.json notes.
         "--deselect=tests/test_hook_boundaries_doc.py::TestNodeWrapperIdentity::test_node_hook_handler_id_resolved",
         "--deselect=tests/test_hook_boundaries_doc.py::TestTelemetryHooksClassification::test_telemetry_hooks_classified",
+        # Issue #2004 P1-2 (PR #2008 OWNER REQUEST_CHANGES): 8 nodeids in
+        # tests/session-recording/test_fixed_location_cutover.py spawn a
+        # real `node` child process and were previously running inside
+        # python-test-core (a Node-free-by-contract job), violating the
+        # Issue #1760 invariant. Deselected here and executed in the
+        # node-backed-hook-tests job instead.
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_default_fixed_location_producer_paths",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_new_private_directory_and_artifact_mode",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_env_override_repo_root_normalized",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_source_bound_default_path_roundtrip",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_digest_update_regeneration_order",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_cross_language_override_resolution_parity",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_readiness_producer_parent_dir_toctou_hardening",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_hermetic_default_path_producer_consumer_roundtrip",
     ]
     par = mod.run_argv(plan, mode="parallel")
     assert not any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)

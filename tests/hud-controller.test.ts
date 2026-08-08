@@ -24,7 +24,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createHudController, getUpgradeStatusCopy } from '../src/ui/HudController'
-import { buildCombatHudViewModel, getCombatHudAssistStatusCopy } from '../src/ui/combatHud'
+import {
+  buildCombatHudViewModel,
+  getCombatHudAssistStatusCopy,
+  isCombatHudHullCritical,
+  COMBAT_HUD_SEMANTIC_STATE_TABLE,
+  COMBAT_HUD_CRITICAL_HULL_RATIO,
+} from '../src/ui/combatHud'
 import {
   createPhaseScreenController,
   getVisiblePhaseScreen,
@@ -532,6 +538,81 @@ describe('combatHud.ts: buildCombatHudViewModel / getCombatHudAssistStatusCopy (
 
   it('GIVEN non-running phase WHEN getCombatHudAssistStatusCopy is called THEN it reports available during sortie', () => {
     expect(getCombatHudAssistStatusCopy(createState('preparation'))).toBe('Assist is available during sortie.')
+  })
+
+  // -------------------------------------------------------------------
+  // Issue #1958 AC1: semantic state table + critical hull threshold
+  // -------------------------------------------------------------------
+
+  it('GIVEN hull ratio above the critical threshold WHEN buildCombatHudViewModel is called THEN isCritical is false', () => {
+    const state = createState('running')
+    state.player.hp = 26
+    state.player.maxHp = 100
+
+    expect(buildCombatHudViewModel(state, false, 16).isCritical).toBe(false)
+  })
+
+  it('GIVEN hull ratio exactly at the critical threshold WHEN buildCombatHudViewModel is called THEN isCritical is true (boundary)', () => {
+    const state = createState('running')
+    state.player.hp = 25
+    state.player.maxHp = 100
+
+    expect(buildCombatHudViewModel(state, false, 16).isCritical).toBe(true)
+  })
+
+  it('GIVEN hull ratio below the critical threshold WHEN buildCombatHudViewModel is called THEN isCritical is true', () => {
+    const state = createState('running')
+    state.player.hp = 1
+    state.player.maxHp = 100
+
+    expect(buildCombatHudViewModel(state, false, 16).isCritical).toBe(true)
+  })
+
+  it('GIVEN maxHp <= 0 (malformed state) WHEN isCombatHudHullCritical is called THEN it fails closed to false, not a division-by-zero NaN/Infinity', () => {
+    expect(isCombatHudHullCritical(0, 0)).toBe(false)
+    expect(isCombatHudHullCritical(5, 0)).toBe(false)
+    expect(isCombatHudHullCritical(5, -1)).toBe(false)
+  })
+
+  it('GIVEN the fixed critical hull ratio constant WHEN isCombatHudHullCritical is called at the boundary THEN it matches COMBAT_HUD_CRITICAL_HULL_RATIO exactly', () => {
+    const maxHp = 40
+    const boundaryHp = maxHp * COMBAT_HUD_CRITICAL_HULL_RATIO
+    expect(isCombatHudHullCritical(boundaryHp, maxHp)).toBe(true)
+    expect(isCombatHudHullCritical(boundaryHp + 1, maxHp)).toBe(false)
+  })
+
+  it('GIVEN the AC1 semantic state table WHEN inspected THEN every combat HUD fragment id is present exactly once with a placement and collapse priority', () => {
+    const ids = COMBAT_HUD_SEMANTIC_STATE_TABLE.map((entry) => entry.id)
+    const expectedIds = ['hull', 'critical', 'kills', 'elapsed', 'weapon', 'assist', 'pause']
+
+    for (const id of expectedIds) {
+      expect(ids.filter((entryId) => entryId === id)).toHaveLength(1)
+    }
+    expect(ids).toHaveLength(expectedIds.length)
+  })
+
+  it('GIVEN the AC1 semantic state table WHEN inspected THEN hull/critical/pause never collapse (persistent safety-critical surfaces)', () => {
+    const neverCollapse = ['hull', 'critical', 'pause']
+    for (const id of neverCollapse) {
+      const entry = COMBAT_HUD_SEMANTIC_STATE_TABLE.find((e) => e.id === id)
+      expect(entry?.collapsible).toBe(false)
+    }
+  })
+
+  it('GIVEN the AC1 semantic state table WHEN inspected THEN weapon and assist (edge-control) collapse before elapsed/kills', () => {
+    const weapon = COMBAT_HUD_SEMANTIC_STATE_TABLE.find((e) => e.id === 'weapon')
+    const assist = COMBAT_HUD_SEMANTIC_STATE_TABLE.find((e) => e.id === 'assist')
+    const elapsed = COMBAT_HUD_SEMANTIC_STATE_TABLE.find((e) => e.id === 'elapsed')
+    const kills = COMBAT_HUD_SEMANTIC_STATE_TABLE.find((e) => e.id === 'kills')
+
+    expect(typeof weapon?.collapsible).toBe('number')
+    expect(typeof assist?.collapsible).toBe('number')
+    expect(typeof elapsed?.collapsible).toBe('number')
+    expect(typeof kills?.collapsible).toBe('number')
+
+    // Higher number = collapses first (lower priority).
+    expect((weapon?.collapsible as number)).toBeGreaterThan(elapsed?.collapsible as number)
+    expect((assist?.collapsible as number)).toBeGreaterThan(kills?.collapsible as number)
   })
 })
 
