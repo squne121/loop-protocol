@@ -135,7 +135,7 @@ grounded route が `status: ok` でも、以下のいずれかに該当する場
 
 `grounded_research`（provider=agy）が失敗した場合、`failure_class`（`auth_error` / `capability_unavailable` / `grounding_failure` / `query_error`）と evidence を呼び出し元へ報告して停止する。Gemini へ切り替えることも、WebSearch / WebFetch による direct fallback を試みることもしない（`fallback_success_is_pass: false`）。Gemini 利用不能を `human_judgment_required` の理由にしない。
 
-### citation_evidence materialization（Issue #2038: provider boundary）
+### 出典証拠（citation_evidence）の実体化手順（Issue #2038: provider boundary の境界整理）
 
 `evidence[].ref` / `citation_count` は `run_gemini_headless.py` の `delegation_result/v1.grounded_research_evidence.sources[]`（provider boundary）から materialize する。この `sources[]` は Issue #2038 により `[:1]` 切り詰めが撤廃されており、複数 source が存在する場合は cardinality を保持したまま返る（1 citation にまとめない）。`web_tool_call_count` / `search_query_count` も同様に実測値を反映する（固定値 1 ではない）。
 
