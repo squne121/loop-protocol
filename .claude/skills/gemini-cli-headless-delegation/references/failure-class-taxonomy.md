@@ -380,6 +380,49 @@ headless_json fallback が可能なものと不可なものが区別されてい
 | `watchdog` | no | HeartbeatWatchdog によるトリップ |
 | `contract_bypass` | no | `prepared_prompt` なしで `run_acp()` 呼び出し |
 
+### Serena MCP live collector failure classes（local_asset_research route の実ライブ収集失敗分類、Issue #2015）
+
+`local_asset_research` route の `_collect_live_serena_read_only_evidence()`
+（`run_gemini_headless.py`）が起こす stage-specific failure。専用の
+`SerenaCollectorError` サブクラスとして送出され、`failure_class` 属性を
+持つ。呼び出し元は失敗時に `delegation_result/v1.local_asset_retrieval_metadata`
+の `stage_failure_class` へこの値を記録する（top-level
+`failure_class` は既存 `local_asset_research live_serena_mcp_failed`
+のまま固定 -- #277 が横断的に taxonomy を統合するまでの互換性維持）。
+
+| `failure_class` | 意味 | retryable | `manifest_drift_failed` |
+|---|---|---|---|
+| `startup_timeout` | `initialize` / `tools/list` によるプロトコルネゴシエーションが session deadline 内に応答しなかった | yes（fresh process で最大1回） | false |
+| `request_timeout` | `tools/call`（`find_file` / `search_for_pattern` / `get_symbols_overview`）が session deadline 内に応答しなかった | yes（fresh process で最大1回） | false |
+| `process_exit` | Serena MCP subprocess が応答前に終了した | no | false |
+| `protocol_error` | stdout に JSON-RPC として parse できない行が出現した（stderr との混線ではなく、stdout 自体のプロトコル違反） | no | false |
+| `jsonrpc_error` | サーバーが JSON-RPC `error` オブジェクトを返した | no | false |
+| `manifest_drift` | `tools/list` が checked-in manifest（`read_only_allowlist` / `known_tools`）と一致しない。この class のみ `manifest_drift_failed: true` を設定する | no | **true** |
+| `redaction_failure` | tool 結果に credential-like な文字列が検出された | no | false |
+| `cleanup_failure` | subprocess（またはその descendant）の termination 後の reap に失敗した | no | false |
+
+retry policy（Issue #2015 AC5）: `startup_timeout` / `request_timeout` の
+みが対象。fresh process で最大1回まで retry し、`initial_result` を破棄
+せず `initial_failure_class` として記録する（silent retry・無制限 retry
+は禁止）。他の failure class は retry せず即座に fail-close する。
+
+deadline hierarchy（Issue #2015 AC6、`time.monotonic()` ベース）:
+内側の呼び出しほど短い制限時間を持つよう、次の順で厳密に大きくなる階層関係を維持する。
+`server_tool_timeout`（45s）< `client_request_timeout`（60s）<
+`collector_session_deadline`（120s）< `route_harness_timeout`（180s、
+`scripts/agent-ops/run_agent_provider_route_smoke.py --timeout-seconds`
+既定値）- `cleanup_grace`（10s）。外側の制限が内側の制限より必ず大きいことで、
+タイムアウト発生時に内側から順に安全に打ち切られる。
+
+request ledger（Issue #2015 AC1）: 各 JSON-RPC request は
+`local_asset_retrieval_metadata.request_ledger` に
+`request_id` / `method` / `tool_name` / `arguments_sha256` /
+`started_at_monotonic` / `elapsed_sec` / `response_received` / `error`
+を持つエントリとして記録される。`request_id` の発行順は
+`initialize`=1 → `tools/list`=2 → `find_file`=3 →
+`search_for_pattern`=4 → `get_symbols_overview`=5（`notifications/initialized`
+は notification のため id を消費しない）。
+
 ---
 
 ## result JSON フィールド仕様（AC2 対応）
