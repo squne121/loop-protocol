@@ -753,7 +753,7 @@ collapse する設計のため、375x667 で Weapon/Assist が既に collapse �
   テストも無回帰で PASS。
 - **maturity**: `legacy-current` のまま変更なし。
 
-## 3.5 VISUAL_BASELINE_REVIEW_EVIDENCE_V1（Issue #2014）
+## 3.5 VISUAL_BASELINE_REVIEW_EVIDENCE_V1 スキーマ（Issue #2014）
 
 `combat-hud-running` / `combat-hud-critical`（hp=25/maxHp=100 critical fixture、Issue #2014
 AC4）の baseline レビューに紐づく runtime evidence manifest のスキーマ。`.github/workflows/ci.yml`
