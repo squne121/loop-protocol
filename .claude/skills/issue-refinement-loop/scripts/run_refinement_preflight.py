@@ -3287,6 +3287,11 @@ def build_provenance(
     sidecar = (plan or {}).get("scope_signal_guard_decision_v2")
     authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else {}
     authority_route = authority.get("route") if isinstance(authority, dict) else {}
+    if not isinstance(authority_route, dict):
+        # A malformed/scalar route must never suppress the provenance sidecar.
+        # Preserve fail-closed semantics by recording no implementation route
+        # rather than treating the scalar as an authorization object.
+        authority_route = {}
     known_context = planner_input.get("known_context") if isinstance(planner_input, dict) else {}
     evidence_list = (
         known_context.get("scope_delta_authority_evidence")
@@ -3294,6 +3299,8 @@ def build_provenance(
         else []
     )
     source_evidence = evidence_list[0] if isinstance(evidence_list, list) and evidence_list else {}
+    if not isinstance(source_evidence, dict):
+        source_evidence = {}
     runtime_evidence = {
         # The provenance sidecar is intentionally additive to the strict
         # preflight-result schema. It binds runtime observations but cannot

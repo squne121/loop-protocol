@@ -654,3 +654,54 @@ $ true
         "status": "required_before_implementation",
         "passed": False,
     }
+
+
+def test_scalar_authority_route_still_writes_runtime_provenance_sidecar():
+    issue_number = 9951952
+    artifact_dir = SKILL_ROOT.parent.parent / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    planner_input = {
+        "known_context": {
+            "scope_delta_authority_evidence": [
+                {
+                    "comment_url": URL,
+                    "comment_id": 5224799872,
+                    "body_sha256": "sha256:source",
+                    "source_kind": "issue_comment",
+                }
+            ]
+        }
+    }
+    try:
+        provenance = preflight.build_provenance(
+            repo=REPO,
+            issue_number=issue_number,
+            anchor_comment_url=URL,
+            planner_input=planner_input,
+            raw_snapshot={},
+            wrapper_exit_code=0,
+            wrapper_status="pass",
+            blockers=[],
+            stderr="",
+            repo_root=SKILL_ROOT.parent.parent,
+            plan={"scope_signal_guard_decision_v2": {"scope_delta_authority": {"route": "human_escalation"}}},
+            result_next_action="proceed",
+        )
+        sidecar_path = Path(preflight.write_provenance_artifact(SKILL_ROOT.parent.parent, issue_number, provenance))
+        readback = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    finally:
+        if artifact_dir.exists():
+            shutil.rmtree(artifact_dir)
+
+    runtime_evidence = readback["runtime_evidence"]
+    assert runtime_evidence["source"]["comment_url"] == URL
+    assert runtime_evidence["route"] == {
+        "action": None,
+        "implementation_allowed": None,
+        "required_rerun": None,
+    }
+    assert runtime_evidence["terminal_event"] == {
+        "wrapper_status": "pass",
+        "next_action": "proceed",
+        "implementation_allowed": None,
+    }
+    assert runtime_evidence["permission_profile_validators"]["passed"] is False
