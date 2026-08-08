@@ -1,0 +1,267 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://loop-protocol.local/schemas/agent_provider_route_smoke_v1.schema.json",
+  "title": "agent_provider_route_smoke/v1",
+  "description": "Live runtime-verification artifact for a single (runtime, agent, profile) required route (Issue #1886). Records that the Claude Code / Codex CLI custom agent (codebase-investigator / web-researcher) was spawned via a native spawn event and dispatched the AGY-only canonical builder invocation (build_request.py --provider agy --profile <profile> --prompt <non-empty>) with Gemini invocation count and direct fallback invocation count both actually observed as 0. This schema is distinct from agy_github_research_evidence/v1 (Issue #1920), which it references (never reimplements) via route_evidence for the github_research profile.",
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "generated_at",
+    "subject",
+    "spawn",
+    "request",
+    "provider_observation",
+    "route_evidence",
+    "status",
+    "failure_class"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "agent_provider_route_smoke/v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "batch_run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "subject": {
+      "type": "object",
+      "required": [
+        "runtime",
+        "agent_name",
+        "head_sha",
+        "runtime_version",
+        "agent_definition_sha256",
+        "effective_runtime_config_sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "enum": ["claude_code", "codex_cli"]
+        },
+        "agent_name": {
+          "type": "string",
+          "enum": ["codebase-investigator", "web-researcher"]
+        },
+        "head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "runtime_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "agent_definition_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "effective_runtime_config_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "spawn": {
+      "type": "object",
+      "required": [
+        "parent_session_id",
+        "child_session_id",
+        "native_spawn_event_observed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "parent_session_id": {
+          "type": "string"
+        },
+        "child_session_id": {
+          "type": "string"
+        },
+        "native_spawn_event_observed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "required": ["profile", "expected_provider", "validation"],
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["local_asset_research", "github_research", "grounded_research"]
+        },
+        "expected_provider": {
+          "const": "agy"
+        },
+        "validation": {
+          "type": "string",
+          "enum": ["pass", "fail", "not_run"]
+        }
+      }
+    },
+    "provider_observation": {
+      "type": "object",
+      "required": [
+        "selected_provider",
+        "provider_attempts",
+        "gemini_invocation_count",
+        "direct_fallback_invocation_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "selected_provider": {
+          "type": ["string", "null"]
+        },
+        "provider_attempts": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "gemini_invocation_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "direct_fallback_invocation_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "route_evidence": {
+      "type": "object",
+      "required": ["schema", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": ["string", "null"]
+        },
+        "sha256": {
+          "type": ["string", "null"],
+          "pattern": "^([0-9a-f]{64})?$"
+        }
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pass", "fail", "skip"]
+    },
+    "failure_class": {
+      "type": ["string", "null"],
+      "enum": [
+        null,
+        "agy_unavailable",
+        "spawn_not_observed",
+        "gemini_invoked",
+        "direct_fallback_invoked",
+        "validation_failed",
+        "provider_mismatch",
+        "route_evidence_schema_mismatch",
+        "transient_infrastructure",
+        "timeout",
+        "other"
+      ]
+    },
+    "retry": {
+      "type": "object",
+      "required": [
+        "initial_result",
+        "initial_failure_class",
+        "retry_count",
+        "retry_result",
+        "final_route_verdict"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "initial_result": {"type": ["string", "null"]},
+        "initial_failure_class": {"type": ["string", "null"]},
+        "retry_count": {"type": "integer", "minimum": 0, "maximum": 1},
+        "retry_result": {"type": ["string", "null"]},
+        "final_route_verdict": {"type": ["string", "null"]}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "pass"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "spawn": {
+            "type": "object",
+            "properties": {
+              "native_spawn_event_observed": {"const": true},
+              "parent_session_id": {"type": "string", "minLength": 1},
+              "child_session_id": {"type": "string", "minLength": 1}
+            },
+            "required": ["native_spawn_event_observed", "parent_session_id", "child_session_id"]
+          },
+          "request": {
+            "type": "object",
+            "properties": {
+              "validation": {"const": "pass"}
+            },
+            "required": ["validation"]
+          },
+          "provider_observation": {
+            "type": "object",
+            "properties": {
+              "selected_provider": {"const": "agy"},
+              "provider_attempts": {
+                "type": "array",
+                "items": [{"const": "agy"}],
+                "minItems": 1,
+                "maxItems": 1,
+                "additionalItems": false
+              },
+              "gemini_invocation_count": {"const": 0},
+              "direct_fallback_invocation_count": {"const": 0}
+            },
+            "required": [
+              "selected_provider",
+              "provider_attempts",
+              "gemini_invocation_count",
+              "direct_fallback_invocation_count"
+            ]
+          },
+          "failure_class": {"const": null}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "request": {
+            "type": "object",
+            "properties": {"profile": {"const": "github_research"}},
+            "required": ["profile"]
+          },
+          "status": {"const": "pass"}
+        },
+        "required": ["request", "status"]
+      },
+      "then": {
+        "properties": {
+          "route_evidence": {
+            "type": "object",
+            "properties": {
+              "schema": {"const": "agy_github_research_evidence/v1"},
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            },
+            "required": ["schema", "sha256"]
+          }
+        }
+      }
+    }
+  ]
+}

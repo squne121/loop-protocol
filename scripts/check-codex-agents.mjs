@@ -119,6 +119,87 @@ function loadReasoningMap() {
 
 const reasoningMap = loadReasoningMap();
 
+// Issue #1886: AGY-only canonical builder invocation contract for the
+// codebase-investigator / web-researcher agent surfaces. Loaded from the
+// same fixture as loadReasoningMap() so the JS/Python checkers and the
+// fixture stay a single source of truth (AC4).
+function loadAgyBuilderProfilesMap() {
+  const contract = JSON.parse(fs.readFileSync(runtimeContractPath, 'utf8'));
+  const entries = Object.entries(contract.required_agents)
+    .filter(([, expected]) => Array.isArray(expected.agy_builder_profiles));
+  return new Map(entries.map(([name, expected]) => [name, {
+    provider: expected.agy_builder_provider,
+    profiles: expected.agy_builder_profiles,
+    claude_agent_path: expected.claude_agent_path ?? null,
+    runtime_followup_route: expected.runtime_followup_route ?? null,
+  }]));
+}
+
+const agyBuilderProfilesMap = loadAgyBuilderProfilesMap();
+
+// Issue #1886 P0-5/P0-6 fix_delta (PR #2005 adversarial review): the prior
+// static checker only inspected the BUILDER_INVOCATION prose block for
+// provider/profile tokens, so an executable Gemini command elsewhere in the
+// same agent definition (e.g. a Serena-triage step calling
+// ``setup_check.py`` without ``--provider agy``, which defaults to and
+// executes real Gemini OAuth/setup smoke) or a stale
+// ``grounded_research_or_direct_web`` legacy route token went undetected.
+// This scans the FULL agent instructions text (not just BUILDER_INVOCATION)
+// for forbidden executable Gemini invocation tokens and the retired legacy
+// route token.
+const FORBIDDEN_GEMINI_INVOCATION_SUBSTRINGS = ['preflight_gemini_headless.py', 'provider=auto'];
+const LEGACY_ROUTE_TOKEN = 'grounded_research_or_direct_web';
+const BARE_GEMINI_INVOCATION_RE = /(?<![\w-])gemini\s+(--|['"])/;
+const CODE_FENCE_RE = /```(?:[a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
+
+// Executable-invocation checks (P0-5) are scoped to fenced (```...```) blocks
+// only -- prose that documents a *prohibition* (e.g. "preflight_gemini_
+// headless.py は使わない") legitimately names the forbidden token without
+// invoking it, and must not be treated as an executable invocation.
+function extractCodeFences(text) {
+  const blocks = [];
+  let match;
+  CODE_FENCE_RE.lastIndex = 0;
+  while ((match = CODE_FENCE_RE.exec(text)) !== null) {
+    blocks.push(match[1]);
+  }
+  return blocks.join('\n');
+}
+
+function forbidGeminiAndLegacyRouteTokens(fileLabel, text, failures) {
+  const fenced = extractCodeFences(text);
+  for (const line of fenced.split('\n')) {
+    if (line.includes('setup_check.py') && !line.includes('--provider agy')) {
+      assert(false, `${fileLabel}: setup_check.py invocation must pass --provider agy (defaults to Gemini otherwise): ${line.trim()}`, failures);
+    }
+  }
+  assert(!BARE_GEMINI_INVOCATION_RE.test(fenced), `${fileLabel}: must not invoke a binary literally named \`gemini\``, failures);
+  for (const token of FORBIDDEN_GEMINI_INVOCATION_SUBSTRINGS) {
+    assert(!fenced.includes(token), `${fileLabel}: forbidden Gemini invocation token ${token} present`, failures);
+  }
+  assert(!text.includes(LEGACY_ROUTE_TOKEN), `${fileLabel}: legacy runtime_followup_route token ${LEGACY_ROUTE_TOKEN} is retired and must not be present`, failures);
+}
+
+function extractBuilderInvocationBlock(instructions) {
+  const match = instructions.match(/BUILDER_INVOCATION\n([\s\S]*?)(?:\n\n|\nFAIL_CLOSED|\nNETWORK_LIMITATION|\nKnown limitation|$)/);
+  return match?.[1] ?? '';
+}
+
+function extractBuilderInvocationProvider(instructions) {
+  const block = extractBuilderInvocationBlock(instructions);
+  const match = block.match(/- provider:\s*([a-z_]+)/);
+  return match?.[1] ?? null;
+}
+
+function extractBuilderInvocationProfiles(instructions) {
+  const block = extractBuilderInvocationBlock(instructions);
+  const match = block.match(/- profiles?:\s*(.+)/);
+  if (!match) {
+    return [];
+  }
+  return match[1].split(',').map((entry) => entry.trim()).filter(Boolean);
+}
+
 const READ_ONLY_PROFILE_OVERRIDES = { 'web-researcher': 'loop-protocol-web-research' };
 
 const readOnlyAgents = new Set([
@@ -786,6 +867,39 @@ function validateAgents() {
     }
     if (writeAgents.has(name)) {
       assert(parsed.default_permissions === 'loop-protocol-rtk', `${file}: write-capable agent must use loop-protocol-rtk`, failures);
+    }
+
+    // Issue #1886: codebase-investigator / web-researcher must declare an
+    // AGY-only canonical builder invocation (provider=agy, expected
+    // profiles) and must not hand-write a provider-specific request JSON
+    // literal or claim Gemini-mandatory delegation (Gemini is
+    // disabled_by_operator; direct fallback success is not route success).
+    if (agyBuilderProfilesMap.has(name)) {
+      const expectedBuilder = agyBuilderProfilesMap.get(name);
+      const builderProvider = extractBuilderInvocationProvider(instructions);
+      const builderProfiles = extractBuilderInvocationProfiles(instructions);
+      assert(builderProvider === expectedBuilder.provider, `${file}: BUILDER_INVOCATION provider must be ${expectedBuilder.provider}`, failures);
+      assert(
+        JSON.stringify(builderProfiles) === JSON.stringify(expectedBuilder.profiles),
+        `${file}: BUILDER_INVOCATION profiles must be ${JSON.stringify(expectedBuilder.profiles)}, got ${JSON.stringify(builderProfiles)}`,
+        failures,
+      );
+      assert(!/"provider"\s*:/.test(instructions), `${file}: must not hand-write a provider JSON literal`, failures);
+      assert(!/(必ず\s*)?Gemini\s*(に|へ)?(必ず)?\s*委譲|Gemini mandatory/.test(instructions), `${file}: must not claim Gemini-mandatory delegation`, failures);
+      assert(instructions.includes('disabled_by_operator'), `${file}: must declare Gemini disabled_by_operator policy`, failures);
+      if (expectedBuilder.runtime_followup_route) {
+        assert(
+          runtimeFollowupRoute === expectedBuilder.runtime_followup_route,
+          `${file}: runtime_followup_route must be ${expectedBuilder.runtime_followup_route}, got ${runtimeFollowupRoute}`,
+          failures,
+        );
+      }
+      forbidGeminiAndLegacyRouteTokens(file, instructions, failures);
+      const claudeAgentPath = expected.claude_agent_path ? path.join(repoRoot, expected.claude_agent_path) : null;
+      if (claudeAgentPath && fs.existsSync(claudeAgentPath)) {
+        const claudeText = readText(claudeAgentPath);
+        forbidGeminiAndLegacyRouteTokens(expected.claude_agent_path, claudeText, failures);
+      }
     }
   }
 
