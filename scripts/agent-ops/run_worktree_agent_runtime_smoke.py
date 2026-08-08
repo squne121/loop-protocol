@@ -797,6 +797,68 @@ def load_static_declared_skills(checkout_root: str, agent_type: str) -> list[str
     return [str(s) for s in skills]
 
 
+_CLAUDE_DIRECT_WEB_TOOL_NAMES = {"WebSearch", "WebFetch"}
+_CODEX_DIRECT_WEB_TOKEN_RE = re.compile(r"\b(web_search|browser|fetch_url|http_get|curl)\b", re.IGNORECASE)
+
+
+def count_direct_web_tool_events(runtime: str, stdout: str) -> int:
+    """Issue #1886 P0-1 fix_delta (PR #2005 adversarial review): AC8
+    requires ``direct_fallback_invocation_count`` to reflect an ACTUAL
+    native-event-derived observation, never a permanently hard-coded 0.
+    Claude Code's native ``stream-json`` events unambiguously name direct
+    web tools (``WebSearch`` / ``WebFetch``) as ``tool_use`` blocks, exactly
+    like the existing ``Agent``/``Bash`` classification above -- counted
+    precisely. Codex CLI's ``--json`` event stream does not expose an
+    equally explicit tool-name field for a direct-web equivalent in this
+    repository's own observed runtime state (documented gap, same caveat as
+    ``_CODEX_COLLAB_ITEM_TYPE`` above): a best-effort, deliberately narrow
+    token scan over each event's own text/command fields is used instead,
+    which may under-detect but is never fabricated as a fixed 0."""
+    count = 0
+    if runtime == "claude":
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or payload.get("type") != "assistant":
+                continue
+            message = payload.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                if block.get("name") in _CLAUDE_DIRECT_WEB_TOOL_NAMES:
+                    count += 1
+    else:
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            item = payload.get("item") if isinstance(payload.get("item"), dict) else None
+            if item is None:
+                continue
+            candidate_text = " ".join(
+                str(item.get(field, ""))
+                for field in ("tool", "command", "name")
+                if item.get(field) is not None
+            )
+            if _CODEX_DIRECT_WEB_TOKEN_RE.search(candidate_text):
+                count += 1
+    return count
+
+
 def classify_claude_events(stdout: str) -> tuple[list[dict], int, int]:
     """Classify the already-captured native ``stream-json`` event stream for
     Claude Code. Returns ``(spawn_events, self_restart_event_count,
@@ -837,6 +899,427 @@ def classify_claude_events(stdout: str) -> tuple[list[dict], int, int]:
             if _ORCHESTRATION_ACTION_COMMAND_RE.search(command):
                 orchestration_count += 1
     return spawn_events, self_restart_count, orchestration_count
+
+
+# ---------------------------------------------------------------------------
+# Native spawn-session evidence (Issue #1886 AC7): a genuinely independent,
+# runtime-returned child agent identifier, distinct from the caller-declared
+# ``requested_agent_type`` self-report the previous ``effective_agent_type``
+# assignment relied on. Native sources were empirically located in this
+# repository's own local runtime state (not fabricated, not documented API,
+# discovered by direct inspection of real invocations):
+#
+# - Claude Code: the ``Agent``/``Task`` tool_use's ``tool_result`` embeds the
+#   runtime-generated child agent id in TWO places -- (1) a structured
+#   ``tool_use_result.agentId`` field on the ``type: "user"`` stream-json
+#   event that carries the tool_result, and (2) a duplicate human-readable
+#   ``agentId: <hex>`` text line inside that same tool_result's text
+#   content. Both are directly present in the already-captured ``stdout``
+#   stream-json itself -- no persisted transcript file is required (Issue
+#   #1886 AC7 fix-delta, iteration 6: the prior implementation only looked
+#   in the persisted transcript file at ``~/.claude/projects/*/
+#   <parent_session_id>.jsonl``, which is never written for the structured
+#   lane because ``run_structured_claude`` always passes
+#   ``--no-session-persistence`` -- a self-contradiction that made
+#   ``native_spawn_event_observed`` permanently ``False``). The parent
+#   session id is the top-level ``session_id`` field already present on
+#   every native ``stream-json`` event.
+# - Codex CLI: ``spawn_agent`` (namespace ``multi_agent_v1``)
+#   ``function_call_output`` payloads embed ``{"agent_id": "<uuid>", ...}``.
+#   This is only visible in the on-disk rollout log
+#   (``~/.codex/sessions/**/rollout-*.jsonl``), not in ``codex exec --json``
+#   stdout (see ``_CODEX_COLLAB_ITEM_TYPE`` note above). The parent session
+#   id is the ``thread_id`` from the ``thread.started`` stdout event.
+#
+# Both extractors are best-effort and fail closed to ``None`` on any error
+# (missing file, unexpected shape, permission denied) -- a value that cannot
+# be honestly derived is never guessed.
+# ---------------------------------------------------------------------------
+
+_CLAUDE_AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-fA-F-]+)")
+
+
+def extract_claude_parent_session_id(stdout: str) -> str | None:
+    """Top-level ``session_id`` (or ``sessionId``) from the first native
+    stream-json event that carries one."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for key in ("session_id", "sessionId"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _extract_claude_child_session_id_from_stream(stdout: str) -> str | None:
+    """Issue #1886 AC7 fix-delta (iteration 6): the previous file-based
+    lookup in ``extract_claude_child_session_id`` globs
+    ``~/.claude/projects/*/<parent_session_id>.jsonl`` -- a *persisted*
+    session transcript file. That file is never written for the structured
+    lane, because ``run_structured_claude`` always passes
+    ``--no-session-persistence`` (a deliberate, documented safety
+    requirement -- see ``references/claude-code.md`` -- that must not be
+    removed just to make this extractor's old lookup path succeed). The
+    file-based lookup was therefore structurally unable to ever return a
+    value, making ``native_spawn_event_observed`` always ``False``
+    regardless of whether a spawn genuinely happened.
+
+    Empirically confirmed (live ``claude -p --output-format stream-json
+    --include-hook-events --no-session-persistence`` run, single ``Task``
+    tool_use) that the runtime-returned child agent id is ALSO present
+    directly in the already-captured stdout stream itself, independent of
+    any persisted transcript file:
+
+    - A ``type: "user"`` event carrying the ``Agent``/``Task`` tool_result
+      has a top-level ``tool_use_result`` object with an ``agentId`` string
+      field -- e.g. ``{"tool_use_result": {"agentId": "a72066e6f732aa768",
+      "agentType": "general-purpose", ...}}``. This is the primary,
+      structured source used below.
+    - The same value is duplicated as human-readable text
+      (``agentId: <hex> (use SendMessage with to: '<hex>', ...)``) inside a
+      ``text`` content block of that same tool_result -- kept here as a
+      fallback for any stream-json shape where ``tool_use_result`` is
+      absent but the text block still carries the line, reusing the
+      existing ``_CLAUDE_AGENT_ID_RE`` pattern.
+
+    Best-effort / read-only against already-captured data: returns ``None``
+    on any parse or shape mismatch, never a guess."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "user":
+            continue
+        tool_use_result = payload.get("tool_use_result")
+        if isinstance(tool_use_result, dict):
+            agent_id = tool_use_result.get("agentId")
+            if isinstance(agent_id, str) and agent_id:
+                return agent_id
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            inner = block.get("content")
+            text_parts: list[str] = []
+            if isinstance(inner, str):
+                text_parts.append(inner)
+            elif isinstance(inner, list):
+                for sub in inner:
+                    if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                        text_parts.append(sub["text"])
+            for text in text_parts:
+                match = _CLAUDE_AGENT_ID_RE.search(text)
+                if match:
+                    return match.group(1)
+    return None
+
+
+_CLAUDE_AGENT_TYPE_RE = re.compile(r'"agentType"\s*:\s*"([a-zA-Z0-9_-]+)"')
+
+
+def extract_claude_child_agent_type(stdout: str) -> str | None:
+    """Issue #1886 P0-2 fix_delta (PR #2005 adversarial review): the prior
+    identity evidence only proved *a* child agent id was returned, never
+    that it was the *requested* custom agent -- a generic ``general-purpose``
+    child satisfied the same evidence as ``codebase-investigator``. This
+    extracts the runtime-returned ``tool_use_result.agentType`` (the same
+    stream-json event that carries ``agentId``, see
+    ``_extract_claude_child_session_id_from_stream``) so callers can bind
+    the spawned child's OBSERVED agent type to the REQUESTED
+    ``--agent-type`` instead of trusting a caller self-report. Falls back to
+    the human-readable ``"agentType": "<name>"`` text fragment if the
+    structured field is absent. Returns ``None`` -- never a guess -- if no
+    agentType evidence is present at all (fail-closed: absent evidence must
+    never be treated as a match)."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "user":
+            continue
+        tool_use_result = payload.get("tool_use_result")
+        if isinstance(tool_use_result, dict):
+            agent_type = tool_use_result.get("agentType")
+            if isinstance(agent_type, str) and agent_type:
+                return agent_type
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            inner = block.get("content")
+            text_parts: list[str] = []
+            if isinstance(inner, str):
+                text_parts.append(inner)
+            elif isinstance(inner, list):
+                for sub in inner:
+                    if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                        text_parts.append(sub["text"])
+            for text in text_parts:
+                match = _CLAUDE_AGENT_TYPE_RE.search(text)
+                if match:
+                    return match.group(1)
+    return None
+
+
+def extract_claude_child_session_id(
+    parent_session_id: str | None, cwd: str, stdout: str | None = None
+) -> str | None:
+    """``agentId`` extraction for the Claude Code child sub-agent spawned by
+    this run. Primary source (Issue #1886 AC7 fix-delta, iteration 6): the
+    already-captured ``stdout`` stream-json itself (see
+    ``_extract_claude_child_session_id_from_stream`` for why this is
+    required -- the file-based path below can never succeed while
+    ``--no-session-persistence`` is active). Fallback source: the Claude
+    Code project transcript file for ``parent_session_id``
+    (``~/.claude/projects/<cwd-slug>/<session_id>.jsonl``), kept only in
+    case a future caller invokes this runner without
+    ``--no-session-persistence``. Returns ``None`` on any lookup failure --
+    this is read-only, best-effort evidence collection, never a guess."""
+    if not parent_session_id:
+        return None
+    if stdout:
+        found = _extract_claude_child_session_id_from_stream(stdout)
+        if found:
+            return found
+    try:
+        home = Path.home()
+        projects_dir = home / ".claude" / "projects"
+        if not projects_dir.is_dir():
+            return None
+        for candidate in projects_dir.glob(f"*/{parent_session_id}.jsonl"):
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            match = _CLAUDE_AGENT_ID_RE.search(text)
+            if match:
+                return match.group(1)
+        return None
+    except OSError:
+        return None
+
+
+def extract_codex_parent_session_id(stdout: str) -> str | None:
+    """``thread_id`` from the ``thread.started`` native ``--json`` event."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") == "thread.started":
+            value = payload.get("thread_id")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _codex_agent_id_from_spawn_agent_calls(candidate: Path) -> str | None:
+    """Parse ``spawn_agent`` ``function_call``/``function_call_output`` pairs
+    out of a single Codex rollout log file and return the resulting
+    ``agent_id``, if any. Extracted as a helper so both the primary
+    (filename-substring) and fallback (content-linked) lookup strategies in
+    ``extract_codex_child_session_id`` can reuse the same parsing logic."""
+    try:
+        pending_call_ids: set[str] = set()
+        for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            payload = record.get("payload") if isinstance(record, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "function_call" and payload.get("name") == "spawn_agent":
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    pending_call_ids.add(call_id)
+                continue
+            if payload.get("type") == "function_call_output" and payload.get("call_id") in pending_call_ids:
+                output = payload.get("output")
+                if isinstance(output, str):
+                    try:
+                        parsed_output = json.loads(output)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    agent_id = parsed_output.get("agent_id") if isinstance(parsed_output, dict) else None
+                    if isinstance(agent_id, str) and agent_id:
+                        return agent_id
+        return None
+    except OSError:
+        return None
+
+
+def _find_codex_child_session_meta(parent_session_id: str) -> dict | None:
+    """Locate the on-disk Codex rollout log for a spawned child sub-agent
+    thread whose first record (``type: session_meta``) content-links back
+    to ``parent_session_id`` via ``payload.parent_thread_id`` (also
+    duplicated as ``payload.session_id``), and return that ``session_meta``
+    ``payload`` dict.
+
+    Extracted as a shared helper (Issue #1886 P0-2 iteration-N fix_delta,
+    live rollout-log investigation) so both
+    ``extract_codex_child_session_id`` (child session id) and
+    ``extract_codex_child_agent_role`` (identity evidence) read the exact
+    same on-disk ``session_meta`` record instead of independently
+    re-scanning ``~/.codex/sessions`` and risking disagreement if the
+    directory changes between the two reads.
+
+    Returns ``None`` on any lookup failure or when no linked record is
+    found -- read-only, best-effort evidence collection, never a guess."""
+    try:
+        sessions_dir = Path.home() / ".codex" / "sessions"
+        if not sessions_dir.is_dir():
+            return None
+        for candidate in sorted(sessions_dir.glob("**/*.jsonl")):
+            try:
+                first_line = candidate.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+            except OSError:
+                continue
+            if not first_line:
+                continue
+            try:
+                record = json.loads(first_line[0].strip())
+            except (json.JSONDecodeError, ValueError, IndexError):
+                continue
+            if not isinstance(record, dict) or record.get("type") != "session_meta":
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            linked_parent_id = payload.get("parent_thread_id") or payload.get("session_id")
+            if linked_parent_id != parent_session_id:
+                continue
+            return payload
+        return None
+    except OSError:
+        return None
+
+
+def extract_codex_child_session_id(parent_session_id: str | None) -> str | None:
+    """``agent_id``/child thread id extraction for the Codex CLI child
+    sub-agent spawned by this run.
+
+    Primary source (unchanged): the on-disk Codex rollout log whose
+    *filename* contains ``parent_session_id``, parsed for
+    ``spawn_agent`` ``function_call``/``function_call_output`` pairs. This
+    only ever matches when the parent thread's own rollout log is itself
+    persisted to disk under that id.
+
+    Fallback source (Issue #1886 AC7 fix-delta, iteration 7): this runner
+    invokes ``codex exec --ephemeral`` (see ``run_structured_codex``), which
+    -- analogous to Claude Code's ``--no-session-persistence`` -- suppresses
+    persistence of the *parent* thread's own rollout log. No file's
+    filename will ever contain ``parent_session_id`` in that case. However,
+    a spawned child sub-agent thread's *own* rollout log is still written
+    to disk, and its first record (``type: session_meta``) carries a
+    ``payload.parent_thread_id`` (also duplicated as ``payload.session_id``)
+    equal to the spawning parent's own ``thread_id`` -- this is genuine,
+    content-level linkage recorded by the Codex CLI itself, not an
+    inference. Once such a file is found (via ``_find_codex_child_session_
+    meta``), its own ``payload.id`` (also embedded in the filename) is
+    returned as the child thread's session id -- direct evidence of a
+    distinct, non-empty child session that differs from
+    ``parent_session_id`` (see ``native_spawn_event_observed``).
+
+    Returns ``None`` on any lookup failure -- this is read-only,
+    best-effort evidence collection, never a guess."""
+    if not parent_session_id:
+        return None
+    try:
+        sessions_dir = Path.home() / ".codex" / "sessions"
+        if not sessions_dir.is_dir():
+            return None
+        matches = list(sessions_dir.glob(f"**/*{parent_session_id}*.jsonl"))
+        for candidate in matches:
+            agent_id = _codex_agent_id_from_spawn_agent_calls(candidate)
+            if agent_id:
+                return agent_id
+    except OSError:
+        return None
+    meta = _find_codex_child_session_meta(parent_session_id)
+    if not meta:
+        return None
+    own_id = meta.get("id")
+    if isinstance(own_id, str) and own_id:
+        return own_id
+    return None
+
+
+def extract_codex_child_agent_role(parent_session_id: str | None) -> str | None:
+    """Runtime-returned custom-agent identity evidence for the Codex CLI
+    child sub-agent spawned by this run (Issue #1886 P0-2 iteration-N
+    fix_delta).
+
+    The PR #2005 adversarial review's P0-2 finding was correct that a bare
+    ``agent_id`` alone never proves *which* custom agent was spawned -- a
+    generic child satisfies the same evidence as a named custom agent. The
+    prior fix_delta (commit 8915af25) therefore fail-closed
+    ``agent_type_identity_verified`` to always ``False`` for Codex,
+    documenting that no stable runtime-returned identity field was found
+    in this repository's own local runtime state.
+
+    Direct investigation of real, live-produced Codex rollout logs under
+    this runner's own structured lane (multiple ``codebase-investigator``
+    and ``web-researcher`` routes, local ``~/.codex/sessions``, Codex CLI
+    0.146.0, 2026-08-06/07) shows this field DOES exist: the spawned
+    child's own rollout log's first record (``type: session_meta``) is
+    written by the Codex CLI itself (not by this runner, not by the
+    spawning parent's prompt text) with an ``agent_role`` field --
+    duplicated under ``source.subagent.thread_spawn.agent_role`` -- that
+    holds exactly the custom agent role/persona name passed to the
+    multi-agent ``spawn_agent`` collaboration tool (e.g.
+    ``"codebase-investigator"``, ``"web-researcher"``). This is genuine,
+    content-level identity evidence independently written to disk by the
+    runtime, not a caller self-report re-echoing ``requested_agent_type``.
+
+    Reuses ``_find_codex_child_session_meta`` -- the exact same on-disk
+    ``session_meta`` record that ``extract_codex_child_session_id``'s
+    content-linked fallback path locates -- so the child session id and
+    its identity evidence are always read from the same record.
+
+    Returns ``None`` -- never a guess -- when no linked child
+    ``session_meta`` record (or no ``agent_role`` field within it) is
+    found; this preserves the fail-closed posture for any Codex CLI
+    version/config where this field is genuinely absent."""
+    if not parent_session_id:
+        return None
+    meta = _find_codex_child_session_meta(parent_session_id)
+    if not meta:
+        return None
+    agent_role = meta.get("agent_role")
+    if isinstance(agent_role, str) and agent_role:
+        return agent_role
+    return None
 
 
 def classify_codex_events(stdout: str) -> tuple[list[dict], int, int]:
@@ -1531,6 +2014,64 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["child_spawn_event_count"] = len(spawn_events)
             schema_summary["self_restart_event_count"] = self_restart_count
             schema_summary["orchestration_action_count"] = orchestration_count
+            schema_summary["direct_web_tool_event_count"] = count_direct_web_tool_events(
+                args.runtime, out
+            )
+
+            # Issue #1886 AC7: native, runtime-returned spawn session
+            # evidence (see extractors above). ``native_spawn_event_observed``
+            # is strictly ``True`` only when both ids are non-empty and
+            # different -- caller self-report never promotes this to True.
+            # Issue #1886 P0-2 fix_delta (PR #2005 adversarial review): a
+            # distinct, non-empty parent/child session id pair alone proved
+            # only that SOME child was spawned, never that it was the
+            # REQUESTED custom agent -- a generic `general-purpose` child
+            # satisfied the exact same evidence as `codebase-investigator`.
+            # `native_spawn_event_observed` now additionally requires the
+            # runtime to have returned independent agent-identity evidence
+            # that matches `requested_agent_type`.
+            #
+            # - Claude: the same stream-json tool_use_result that carries
+            #   `agentId` also carries `agentType` (see
+            #   `extract_claude_child_agent_type`); identity is verified iff
+            #   that observed value equals `requested_agent_type`.
+            # - Codex (Issue #1886 P0-2 iteration-N fix_delta): live
+            #   investigation of real, local `~/.codex/sessions` rollout
+            #   logs (multiple `codebase-investigator` / `web-researcher`
+            #   routes, Codex CLI 0.146.0) found that a spawned child's own
+            #   rollout log DOES carry runtime-returned identity evidence
+            #   after all -- its `session_meta` record's `agent_role` field
+            #   (see `extract_codex_child_agent_role`), written by the Codex
+            #   CLI itself, holds the custom agent role/persona name. This
+            #   supersedes the prior fail-closed-to-always-False posture
+            #   (commit 8915af25): identity is verified iff that observed
+            #   value equals `requested_agent_type`, exactly mirroring the
+            #   Claude lane. If a future Codex CLI version ever stops
+            #   emitting this field, `extract_codex_child_agent_role`
+            #   returns `None` and this still fails closed.
+            if args.runtime == "claude":
+                parent_session_id = extract_claude_parent_session_id(out)
+                child_session_id = extract_claude_child_session_id(parent_session_id, worktree, out)
+                child_agent_type_observed = extract_claude_child_agent_type(out)
+            else:
+                parent_session_id = extract_codex_parent_session_id(out)
+                child_session_id = extract_codex_child_session_id(parent_session_id)
+                child_agent_type_observed = extract_codex_child_agent_role(parent_session_id)
+            agent_type_identity_verified = (
+                child_agent_type_observed is not None
+                and requested_agent_type is not None
+                and child_agent_type_observed == requested_agent_type
+            )
+            schema_summary["parent_session_id"] = parent_session_id
+            schema_summary["child_session_id"] = child_session_id
+            schema_summary["child_agent_type_observed"] = child_agent_type_observed
+            schema_summary["agent_type_identity_verified"] = agent_type_identity_verified
+            schema_summary["native_spawn_event_observed"] = bool(
+                parent_session_id
+                and child_session_id
+                and parent_session_id != child_session_id
+                and agent_type_identity_verified
+            )
 
             if capability_decision == "capability_skip":
                 # AC2: a known unknown/unrecognized-option parser diagnostic

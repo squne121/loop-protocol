@@ -112,17 +112,40 @@ class TestWebResearcherAgent:
                 f"web-researcher.md の disallowedTools に {tool} が含まれていない"
             )
 
-    def test_antigravity_note_present(self):
+    def test_agy_provider_declared(self):
+        """Issue #1886: grounded_research route must declare provider=agy
+        (superseding the pre-#1920 "Antigravity 対応を仮定しない" conservative
+        note, which is now stale — agy support for grounded_research is
+        implemented and documented in provider-mapping.md)."""
         text = _read(WEB_RESEARCHER_MD)
-        assert "Antigravity" in text, (
-            "web-researcher.md に Antigravity CLI 互換性ノートが含まれていない"
+        assert "provider: agy" in text or "--provider agy" in text, (
+            "web-researcher.md に provider=agy の canonical builder invocation が"
+            " 明記されていない"
         )
 
-    def test_antigravity_note_is_conservative(self):
+    def test_grounded_research_profile_declared(self):
         text = _read(WEB_RESEARCHER_MD)
-        assert "仮定しない" in text or "未対応" in text, (
-            "web-researcher.md の Antigravity ノートが楽観的すぎる。"
-            "grounded_research の agy 対応が未確認であることを明記すること。"
+        assert "grounded_research" in text, (
+            "web-researcher.md に grounded_research profile が明記されていない"
+        )
+
+    def test_direct_fallback_not_treated_as_pass(self):
+        text = _read(WEB_RESEARCHER_MD)
+        assert "direct fallback" in text.lower() or "direct_fallback" in text, (
+            "web-researcher.md に direct fallback の扱いが明記されていない"
+        )
+        assert "WebSearch / WebFetch による direct fallback は行わない" in text or (
+            "direct_fallback" in text and "disabled" in text
+        ), (
+            "web-researcher.md が direct fallback の成功を route 成功として扱わない"
+            " ことを明記していない"
+        )
+
+    def test_gemini_disabled_by_operator_declared(self):
+        text = _read(WEB_RESEARCHER_MD)
+        assert "disabled_by_operator" in text, (
+            "web-researcher.md に Gemini の disabled_by_operator ポリシーが"
+            " 明記されていない"
         )
 
     def test_gemini_api_key_wording_weakened(self):
