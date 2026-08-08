@@ -2,12 +2,13 @@ import type { GameState } from '../state'
 import { formatCombatNumber } from '../render/renderUtils'
 
 /**
- * Combat HUD (Issue #1375): the compact, running-only player-facing surface
- * rendered inside `data-combat-hud` (`src/ui/HudController.ts` owns DOM
- * creation and phase routing; this module owns the DOM markup fragment and
- * the view model formatter — the single translation boundary between raw
- * `GameState` and the six combat HUD fields: Hull, Kills, Elapsed, Weapon
- * readiness, Assist allies, Pause).
+ * Combat HUD (Issue #1375, placement/safe-zone/priority redesign Issue
+ * #1958): the compact, running-only player-facing surface rendered inside
+ * `data-combat-hud` (`src/ui/HudController.ts` owns DOM creation and phase
+ * routing; this module owns the DOM markup fragment and the view model
+ * formatter — the single translation boundary between raw `GameState` and
+ * the combat HUD fields: Hull/critical, Kills, Elapsed, Weapon readiness,
+ * Assist allies, Pause).
  *
  * Deliberately excludes: Mission phase/status/outcome, Pilot updates, raw
  * telemetry, Collect payout, Return to hangar, Prepare next sortie (AC2) —
@@ -19,12 +20,116 @@ import { formatCombatNumber } from '../render/renderUtils'
 export type CombatHudWeaponState = 'ready' | 'recharging'
 
 /**
- * View model for the combat HUD (AC4, AC6). `elapsedLabel` is derived from
- * `elapsedTicks * activeFixedDeltaMs` (never `/ 60`, wall-clock, or rAF
- * time) so the running timer is deterministic under E2E/VRT fixtures.
+ * Hull ratio at/below which the persistent status cluster shows the
+ * critical warning (AC6: text/shape/icon, never color-only). 0.25 chosen so
+ * "critical" reliably triggers before the terminal 1-HP display floor
+ * introduced by `formatCombatNumber`'s Math.ceil policy (Issue #788),
+ * regardless of `maxHp`.
+ */
+export const COMBAT_HUD_CRITICAL_HULL_RATIO = 0.25
+
+// ---------------------------------------------------------------------------
+// AC1: Semantic state table — display condition / placement / collapse
+// priority / copy for every combat HUD fragment. Fixed here as the single
+// source of truth so tests (`tests/hud-controller.test.ts`) and the
+// implementation (`buildCombatHudViewModel` / `COMBAT_HUD_MARKUP` below)
+// cannot silently drift apart. `priority` is the *collapse order*: higher
+// numbers collapse first (lowest priority) when vertical space is short
+// (`docs/dev/visual-baseline-registry.md` progressive-disclosure policy
+// referenced by the Issue's Current Validated Scope). HULL/critical and
+// Pause never collapse (`collapsible: false`) — they are the persistent
+// safety-critical surfaces.
+// ---------------------------------------------------------------------------
+
+export type CombatHudFragmentId =
+  | 'hull'
+  | 'critical'
+  | 'elapsed'
+  | 'kills'
+  | 'weapon'
+  | 'assist'
+  | 'pause'
+
+export interface CombatHudSemanticStateEntry {
+  /** Stable fragment identity, matches `data-field`/`data-action` suffixes below. */
+  id: CombatHudFragmentId
+  /** Human-readable display condition (when the fragment is shown at all). */
+  displayCondition: string
+  /** Safe-zone placement region (Current Validated Scope). */
+  placement: 'bottom-left-status' | 'top-center-low-prominence' | 'edge-control' | 'separate-pause-control'
+  /** Collapse order under progressive disclosure; `false` = never collapses. */
+  collapsible: number | false
+  /** Player-facing copy contract (never raw internal state, AC6). */
+  copy: string
+}
+
+/**
+ * AC1 fixed semantic state table. Order matches collapse priority intent
+ * (persistent-first); `collapsible` numeric values are the actual collapse
+ * order consumed by the `@media`/breakpoint rules in `src/style.css`
+ * (`--combat-hud-collapse-1` etc.) — weapon/assist collapse before
+ * elapsed/kills, and hull/critical/pause never collapse.
+ */
+export const COMBAT_HUD_SEMANTIC_STATE_TABLE: readonly CombatHudSemanticStateEntry[] = [
+  {
+    id: 'hull',
+    displayCondition: 'always while running',
+    placement: 'bottom-left-status',
+    collapsible: false,
+    copy: '<current>/<max> Hull',
+  },
+  {
+    id: 'critical',
+    displayCondition: `hull ratio <= ${COMBAT_HUD_CRITICAL_HULL_RATIO} while running`,
+    placement: 'bottom-left-status',
+    collapsible: false,
+    copy: 'Hull critical',
+  },
+  {
+    id: 'kills',
+    displayCondition: 'always while running',
+    placement: 'bottom-left-status',
+    collapsible: 2,
+    copy: '<count> Kills',
+  },
+  {
+    id: 'elapsed',
+    displayCondition: 'always while running',
+    placement: 'top-center-low-prominence',
+    collapsible: 1,
+    copy: '<seconds> s',
+  },
+  {
+    id: 'weapon',
+    displayCondition: 'always while running',
+    placement: 'edge-control',
+    collapsible: 3,
+    copy: 'Ready | Recharging',
+  },
+  {
+    id: 'assist',
+    displayCondition: 'always while running (button disabled outside running)',
+    placement: 'edge-control',
+    collapsible: 3,
+    copy: 'Assist allies / Assist ready. / Assist signal sent. / Allies covering you. / No target to assist. / No ally available. / Assist is available during sortie.',
+  },
+  {
+    id: 'pause',
+    displayCondition: 'always while running',
+    placement: 'separate-pause-control',
+    collapsible: false,
+    copy: 'Pause',
+  },
+]
+
+/**
+ * View model for the combat HUD (AC1, AC4, AC6). `elapsedLabel` is derived
+ * from `elapsedTicks * activeFixedDeltaMs` (never `/ 60`, wall-clock, or
+ * rAF time) so the running timer is deterministic under E2E/VRT fixtures.
  */
 export interface CombatHudViewModel {
   hullLabel: string
+  isCritical: boolean
   kills: number
   elapsedLabel: string
   weaponState: CombatHudWeaponState
@@ -74,7 +179,20 @@ export function formatCombatHudElapsedLabel(elapsedTicks: number, activeFixedDel
 }
 
 /**
- * Builds the combat HUD view model (AC2, AC4, AC6). Pure function of
+ * Derives whether the persistent status cluster should show the critical
+ * warning (AC6: text/shape/icon-driven, never color-only). Guards
+ * `maxHp <= 0` fail-closed to `false` (never critical for a malformed
+ * state) rather than dividing by zero.
+ */
+export function isCombatHudHullCritical(hp: number, maxHp: number): boolean {
+  if (!(maxHp > 0)) {
+    return false
+  }
+  return hp / maxHp <= COMBAT_HUD_CRITICAL_HULL_RATIO
+}
+
+/**
+ * Builds the combat HUD view model (AC1, AC2, AC4, AC6). Pure function of
  * `state` + `isPaused` + `activeFixedDeltaMs` — never mutates `GameState`
  * (`src/ui` is read-only over `src/state`, per `src/ui/CLAUDE.md`).
  */
@@ -92,6 +210,7 @@ export function buildCombatHudViewModel(
 
   return {
     hullLabel: `${formatCombatNumber(state.player.hp)}/${formatCombatNumber(state.player.maxHp)}`,
+    isCritical: isCombatHudHullCritical(state.player.hp, state.player.maxHp),
     kills,
     elapsedLabel: formatCombatHudElapsedLabel(state.sortie.elapsedTicks, activeFixedDeltaMs),
     weaponState,
@@ -107,34 +226,58 @@ export function buildCombatHudViewModel(
 }
 
 /**
- * The combat HUD DOM fragment (AC1, AC2, AC3, AC6). Consumed by
+ * The combat HUD DOM fragment (AC1, AC2, AC3, AC4, AC5, AC6). Consumed by
  * `HudController.ts`'s `createHudController()`, which composes it alongside
  * the legacy result/debrief surface and owns phase routing / visibility.
+ *
+ * Placement/safe-zone (Issue #1958 Current Validated Scope): the root is a
+ * transparent, `pointer-events: none` grid spanning the whole
+ * `.battle-hud-layer` safe-zone box (`src/style.css` gives that box the
+ * 16 CSS px inner containment margin, AC3). Its named grid areas place:
+ * - `data-hud-zone="status"` (Hull/critical/Kills): persistent, bottom-left.
+ * - `data-hud-zone="elapsed"`: low-prominence, top-center.
+ * - `data-hud-zone="edge-control"` (Weapon/Assist): conditional, bottom-right,
+ *   first to collapse under progressive disclosure (AC1 semantic table).
+ * - `data-hud-zone="pause"`: separated from the status cluster, bottom-right,
+ *   never collapses (AC5/AC6 keyboard/pointer affordance stays reachable).
  */
 export const COMBAT_HUD_MARKUP = `
   <section class="combat-hud" data-combat-hud hidden inert>
-    <p class="eyebrow">Combat</p>
-    <dl class="stat-grid">
-      <div><dt>Hull</dt><dd data-field="combat-hud-hull"></dd></div>
-      <div><dt>Kills</dt><dd data-field="combat-hud-kills"></dd></div>
-      <div><dt>Elapsed</dt><dd data-field="combat-hud-elapsed"></dd></div>
-      <div><dt>Weapon</dt><dd data-field="combat-hud-weapon"></dd></div>
-    </dl>
-    <button
-      type="button"
-      data-action="assist-player"
-      data-battle-interactive="true"
-      aria-label="Assist allies"
-    >Assist allies</button>
     <p
-      class="status-copy"
-      data-field="combat-hud-assist-status"
-      role="status"
-      aria-live="polite"
-      aria-atomic="true"
+      class="combat-hud__elapsed"
+      data-hud-zone="elapsed"
+      data-field="combat-hud-elapsed"
     ></p>
+    <div class="combat-hud__status" data-hud-zone="status">
+      <p class="eyebrow">Combat</p>
+      <dl class="stat-grid">
+        <div><dt>Hull</dt><dd data-field="combat-hud-hull"></dd></div>
+        <div class="combat-hud__kills-row"><dt>Kills</dt><dd data-field="combat-hud-kills"></dd></div>
+      </dl>
+      <p class="combat-hud__critical" data-field="combat-hud-critical" role="status" aria-live="polite" hidden>
+        <span aria-hidden="true">&#9888;</span> Hull critical
+      </p>
+    </div>
+    <div class="combat-hud__edge" data-hud-zone="edge-control">
+      <p class="combat-hud__weapon" data-field="combat-hud-weapon"></p>
+      <button
+        type="button"
+        data-action="assist-player"
+        data-battle-interactive="true"
+        aria-label="Assist allies"
+      >Assist allies</button>
+      <p
+        class="status-copy combat-hud__assist-status"
+        data-field="combat-hud-assist-status"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      ></p>
+    </div>
     <button
       type="button"
+      class="combat-hud__pause"
+      data-hud-zone="pause"
       data-action="toggle-pause"
       data-battle-interactive="true"
       aria-pressed="false"

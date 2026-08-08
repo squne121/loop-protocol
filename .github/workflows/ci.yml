@@ -566,6 +566,14 @@ jobs:
         shell: bash
     env:
       PLAYWRIGHT_VERSION: "1.60.0"
+      # Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 4): the
+      # real PR head SHA for pull_request events (never the synthetic
+      # "Merge <head> into <base>" ref that process.env.GITHUB_SHA resolves
+      # to on pull_request events); falls back to github.sha for push events
+      # (the actual pushed commit -- no synthetic-merge issue there).
+      # tests/e2e/visual-utils.ts's resolveExpectedHeadSha() requires this to
+      # be a valid 40-hex commit SHA and throws otherwise.
+      EXPECTED_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     container:
       image: mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948
       options: --ipc=host
@@ -1007,7 +1015,87 @@ jobs:
                   "digest_env": "TEST_RESULTS_DIGEST",
                   "retention_days": 30,
               },
-         
+              # Issue #1958 AC8 (owner decision #2): representative
+              # boundary-cell VRT baselines. Each `test.describe()` block in
+              # tests/e2e/visual-overlay.spec.ts overrides the run-wide
+              # playwright.config.ts default viewport (and, for the
+              # 1437x1365 cell, deviceScaleFactor) via `test.use()` --
+              # scripts/check-visual-artifact-pipeline.py's
+              # `_resolve_viewport_context()` re-derives these per-capture
+              # (not from the single run-wide config default) and
+              # cross-validates every field below against that derivation.
+              {
+                  "capture_id": "visual-overlay.spec.ts::vrt-running-hud-overlay-1366x768.png",
+                  "spec_file": "tests/e2e/visual-overlay.spec.ts",
+                  "screenshot_name": "vrt-running-hud-overlay-1366x768.png",
+                  "registry_id": "running-hud-overlay-legacy-current-1366x768",
+                  "directory": "tests/e2e/__screenshots__/visual-overlay.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1366x768",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "100",
+                  "style_path": True,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  "capture_id": "visual-overlay.spec.ts::vrt-running-hud-overlay-1920x1080.png",
+                  "spec_file": "tests/e2e/visual-overlay.spec.ts",
+                  "screenshot_name": "vrt-running-hud-overlay-1920x1080.png",
+                  "registry_id": "running-hud-overlay-legacy-current-1920x1080",
+                  "directory": "tests/e2e/__screenshots__/visual-overlay.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1920x1080",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "100",
+                  "style_path": True,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  # Low-DPR owner-playtest boundary. deviceScaleFactor 0.667
+                  # (not the Desktop Chrome default 1) via test.use().
+                  "capture_id": "visual-overlay.spec.ts::vrt-running-hud-overlay-1437x1365-dpr0667.png",
+                  "spec_file": "tests/e2e/visual-overlay.spec.ts",
+                  "screenshot_name": "vrt-running-hud-overlay-1437x1365-dpr0667.png",
+                  "registry_id": "running-hud-overlay-legacy-current-1437x1365-dpr0667",
+                  "directory": "tests/e2e/__screenshots__/visual-overlay.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1437x1365",
+                  "device_scale_factor": 0.667,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "100",
+                  "style_path": True,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  # Minimum supported viewport boundary.
+                  "capture_id": "visual-overlay.spec.ts::vrt-running-hud-overlay-375x667.png",
+                  "spec_file": "tests/e2e/visual-overlay.spec.ts",
+                  "screenshot_name": "vrt-running-hud-overlay-375x667.png",
+                  "registry_id": "running-hud-overlay-legacy-current-375x667",
+                  "directory": "tests/e2e/__screenshots__/visual-overlay.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "375x667",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "100",
+                  "style_path": True,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+
               {
                   "capture_id": "phase-screens.spec.ts::title-menu.png",
                   "spec_file": "tests/e2e/phase-screens.spec.ts",
@@ -2119,6 +2207,36 @@ jobs:
           printf '{"step_id":"node_test_debounce_ac4","phase_id":"node_test_debounce","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
+      - name: pytest_session_recording_fixed_location_cutover (timed)
+        # Issue #2004 P1-2 (PR #2008 OWNER REQUEST_CHANGES): these 8 nodeids
+        # in tests/session-recording/test_fixed_location_cutover.py spawn a
+        # real `node` child process (the readiness bootstrap producer,
+        # directly or via its `--repo-root` / `--print-resolved-override`
+        # test seams) and were previously running inside python-test-core
+        # (a Node-free-by-contract job, Issue #1760), which violates that
+        # job's Python-only invariant. Moved here alongside the sibling
+        # tests/session_recording/codex/ node-backed lanes. The remaining
+        # pure-Python nodeids in the same file stay in python-test-core (see
+        # .github/ci/python-test-plan.json deselect +
+        # secondary_coverage.dedicated_lanes).
+        run: |
+          _t0=$(date +%s%3N)
+          set +e
+          uv run --locked pytest -q \
+            tests/session-recording/test_fixed_location_cutover.py::test_default_fixed_location_producer_paths \
+            tests/session-recording/test_fixed_location_cutover.py::test_new_private_directory_and_artifact_mode \
+            tests/session-recording/test_fixed_location_cutover.py::test_env_override_repo_root_normalized \
+            tests/session-recording/test_fixed_location_cutover.py::test_source_bound_default_path_roundtrip \
+            tests/session-recording/test_fixed_location_cutover.py::test_digest_update_regeneration_order \
+            tests/session-recording/test_fixed_location_cutover.py::test_cross_language_override_resolution_parity \
+            tests/session-recording/test_fixed_location_cutover.py::test_readiness_producer_parent_dir_toctou_hardening \
+            tests/session-recording/test_fixed_location_cutover.py::test_hermetic_default_path_producer_consumer_roundtrip \
+            -p no:xdist
+          _s=$?
+          set -e
+          printf '{"step_id":"pytest_session_recording_fixed_location_cutover","phase_id":"pytest_session_recording_fixed_location_cutover","status":%d,"elapsed_ms":%d}\n' \
+            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
+          exit $_s
       - name: Generate node-backed hook selection artifact
         run: |
           mkdir -p ci_test_selection_artifacts
@@ -2127,6 +2245,14 @@ jobs:
             .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths \
             tests/session_recording/codex/test_hook_adapter.py \
             tests/session_recording/codex/test_initial_branch_create_lane.py \
+            tests/session-recording/test_fixed_location_cutover.py::test_default_fixed_location_producer_paths \
+            tests/session-recording/test_fixed_location_cutover.py::test_new_private_directory_and_artifact_mode \
+            tests/session-recording/test_fixed_location_cutover.py::test_env_override_repo_root_normalized \
+            tests/session-recording/test_fixed_location_cutover.py::test_source_bound_default_path_roundtrip \
+            tests/session-recording/test_fixed_location_cutover.py::test_digest_update_regeneration_order \
+            tests/session-recording/test_fixed_location_cutover.py::test_cross_language_override_resolution_parity \
+            tests/session-recording/test_fixed_location_cutover.py::test_readiness_producer_parent_dir_toctou_hardening \
+            tests/session-recording/test_fixed_location_cutover.py::test_hermetic_default_path_producer_consumer_roundtrip \
             > ci_test_selection_artifacts/node_backed_hook_tests_collect_only.txt
           uv run --locked pytest --collect-only -q \
             .claude/hooks/tests/ \
@@ -2158,6 +2284,14 @@ jobs:
                   ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
                   "tests/session_recording/codex/test_hook_adapter.py",
                   "tests/session_recording/codex/test_initial_branch_create_lane.py",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_default_fixed_location_producer_paths",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_new_private_directory_and_artifact_mode",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_env_override_repo_root_normalized",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_source_bound_default_path_roundtrip",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_digest_update_regeneration_order",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_cross_language_override_resolution_parity",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_readiness_producer_parent_dir_toctou_hardening",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_hermetic_default_path_producer_consumer_roundtrip",
               ],
               plan=".github/ci/python-test-plan.json",
               pr_head_sha="${{ github.event.pull_request.head.sha || github.sha }}",
@@ -2191,9 +2325,16 @@ jobs:
           # directory, same real codex-hook-adapter.mjs node subprocess
           # harness) so it is also treated as session_recording, not as a
           # "fixed hook wrapper" nodeid.
+          # Issue #2004 P1-2 (PR #2008 review): the 8 node-backed nodeids in
+          # tests/session-recording/test_fixed_location_cutover.py (a
+          # DIFFERENT directory -- tests/session-recording/, hyphenated --
+          # from the tests/session_recording/codex/ lane above) join the
+          # same "not a fixed hook wrapper nodeid" classification for the
+          # same reason: they spawn a real node child process.
           session_recording_prefixes = (
               "tests/session_recording/codex/test_hook_adapter.py",
               "tests/session_recording/codex/test_initial_branch_create_lane.py",
+              "tests/session-recording/test_fixed_location_cutover.py",
           )
           artifact_dir = pathlib.Path("ci_test_selection_artifacts")
           python_lines = [
