@@ -30,6 +30,7 @@
       "enum": [
         "pass",
         "warn",
+        "needs_fix",
         "blocked",
         "environment_failure"
       ],
@@ -287,7 +288,12 @@
       "properties": {
         "status": {
           "type": "string",
-          "enum": ["applied", "no_change", "rebased", "failed"]
+          "enum": [
+            "applied",
+            "no_change",
+            "rebased",
+            "failed"
+          ]
         },
         "writes": {
           "type": "integer",
@@ -301,11 +307,20 @@
         },
         "final_readback": {
           "type": "string",
-          "enum": ["verified", "failed"]
+          "enum": [
+            "verified",
+            "failed"
+          ]
         },
-        "fresh_preflight": {"type": "string"},
-        "fresh_review": {"type": "string"},
-        "fresh_readiness": {"type": "string"}
+        "fresh_preflight": {
+          "type": "string"
+        },
+        "fresh_review": {
+          "type": "string"
+        },
+        "fresh_readiness": {
+          "type": "string"
+        }
       }
     },
     "artifacts": {
@@ -345,6 +360,71 @@
           "description": "SHA256 of canonical JSON of result core fields (excl. artifacts, hashes)."
         }
       }
+    },
+    "repair_action": {
+      "type": "object",
+      "description": "Versioned repair_action disposition projection (Issue #2016). Present only when status == needs_fix (disposition: auto_apply_safe). Mirrors the producer repair_action contract (repair_issue_contract_result_v1.schema.json) with wrapper-owned diagnostics_artifact / candidate_body_artifact paths filled in.",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "policy_version",
+        "disposition",
+        "original_body_sha256",
+        "repaired_body_sha256",
+        "diagnostics_artifact",
+        "candidate_body_artifact",
+        "repair_kinds",
+        "reason_codes"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "repair_action/v1"
+        },
+        "policy_version": {
+          "type": "string",
+          "const": "deterministic-issue-repair/v1"
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "auto_apply_safe",
+            "human_review_required",
+            "informational",
+            "invalid_payload"
+          ]
+        },
+        "original_body_sha256": {
+          "type": "string"
+        },
+        "repaired_body_sha256": {
+          "type": "string"
+        },
+        "diagnostics_artifact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "candidate_body_artifact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repair_kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
     }
   },
   "allOf": [
@@ -366,6 +446,44 @@
           "required_contract_keys",
           "rewrite_constraints"
         ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "needs_fix"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "repair_action"
+        ],
+        "properties": {
+          "repair_action": {
+            "type": "object",
+            "required": [
+              "disposition",
+              "diagnostics_artifact",
+              "candidate_body_artifact"
+            ],
+            "properties": {
+              "disposition": {
+                "const": "auto_apply_safe"
+              },
+              "diagnostics_artifact": {
+                "type": "string"
+              },
+              "candidate_body_artifact": {
+                "type": "string"
+              }
+            }
+          }
+        }
       }
     }
   ]
