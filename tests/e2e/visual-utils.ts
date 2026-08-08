@@ -12,7 +12,7 @@
 
 import { expect, type Locator, type Page } from '@playwright/test'
 import { fileURLToPath } from 'node:url'
-import type { VisualScenarioFixture, VisualScenarioViewportLabel } from '../../src/main'
+import type { LoopE2ESnapshot, VisualScenarioFixture, VisualScenarioViewportLabel } from '../../src/main'
 
 export type { VisualScenarioFixture, VisualScenarioViewportLabel }
 
@@ -233,6 +233,18 @@ const installedScenarios = new WeakMap<Page, VisualScenarioFixture>()
  * `expectDomOverlayScreenshot()` to self-report correctly.
  */
 export async function installVisualScenario(page: Page, fixture: VisualScenarioFixture): Promise<void> {
+  // AC8 (optional, Issue #1728): a second installVisualScenario() call on the
+  // same page would silently overwrite the first fixture binding while the
+  // already-registered page.addInitScript() callback for the FIRST fixture
+  // remains queued -- reject outright rather than let a caller's re-install
+  // mistake silently race two fixtures against the same page.
+  if (installedScenarios.has(page)) {
+    throw new Error(
+      `installVisualScenario(): a scenario ("${installedScenarios.get(page)?.name}") is already ` +
+        `installed on this page. Cannot install "${fixture.name}" on top of it -- use a new page ` +
+        'per scenario instead.',
+    )
+  }
   if (isPendingFixtureScenario(fixture.name)) {
     throw new Error(
       `installVisualScenario(): scenario "${fixture.name}" is pending-fixture (Scenario Support ` +
@@ -346,6 +358,177 @@ export interface DomOverlayScreenshotOptions {
   canvasVisibility?: 'mask' | 'hidden'
 }
 
+// ---------------------------------------------------------------------------
+// Fixture attestation (AC6, Issue #1728)
+// ---------------------------------------------------------------------------
+
+/**
+ * `[data-phase-screen="pause"]` (`src/ui/phaseScreens.ts`) — the pause dialog
+ * panel `assertVisualScenarioAttested()` checks the visibility of below
+ * (Issue #1728 PR #2023 review fix, P1-2).
+ */
+const PAUSE_SCREEN_SELECTOR = '[data-phase-screen="pause"]'
+
+/**
+ * `canvas.battle-stage__canvas` (`src/main.ts`) — the battle-stage Canvas
+ * element `assertVisualScenarioAttested()` checks the `inert`/`aria-hidden`
+ * pair of below (Issue #1728 PR #2023 review fix, P1-2). Matches the same
+ * inert/aria-hidden pair `src/main.ts`'s `frame()` maintains (AC4, Issue
+ * #1376).
+ */
+const BATTLE_STAGE_CANVAS_SELECTOR = 'canvas.battle-stage__canvas'
+
+/**
+ * State projection `assertVisualScenarioAttested()` compares against a
+ * fixture's expected values (Issue #1728 PR #2023 review fix, P1-2). `hook`
+ * distinguishes "hook missing" (fail-closed) from "hook present but state
+ * diverges" so a single `expect.poll().toEqual()` failure reports which
+ * failure mode occurred.
+ */
+interface VisualScenarioStateProjection {
+  hook: 'present' | 'missing'
+  loopPhase: LoopE2ESnapshot['loopPhase'] | null
+  hp: number | null
+  maxHp: number | null
+  resources: number | null
+  weaponPower: number | null
+  sortieStatus: LoopE2ESnapshot['sortie']['status'] | null
+  elapsedTicks: number | null
+  result: LoopE2ESnapshot['sortie']['result'] | null
+}
+
+/**
+ * Asserts that the app has actually reflected `installedFixture` before a
+ * caller compares a screenshot (Issue #1728 — OWNER anchor comment
+ * issuecomment-5224476522, merge blocker; PR #2023 review fix
+ * issuecomment-5225056963, P1-1/P1-2). Without this, a fixture that was
+ * silently ignored by the app (stale non-E2E-mode bundle, a bug in
+ * `applyVisualScenarioFixture()`, etc.) could still pass a loose screenshot
+ * comparator if the pre-fixture/default UI happens to be close enough to the
+ * expected baseline — this helper makes that failure mode fail loudly and
+ * explicitly instead.
+ *
+ * Verifies four independent things, all via Playwright web-first assertions
+ * (`toHaveAttribute()` / `expect.poll()` / `toBeVisible()` / `toBeHidden()`)
+ * so this helper WAITS for the app's first post-fixture RAF render pass
+ * instead of reading the DOM/state exactly once immediately after
+ * `page.goto()` resolves — `page.goto()`'s default `load` completion
+ * condition does not guarantee the app's own first `requestAnimationFrame`
+ * (and therefore the receipt/state below) has run yet, so a one-shot read is
+ * race-prone (P1-1):
+ *
+ * 1. The `data-loop-visual-scenario` receipt (`src/main.ts`) equals
+ *    `v1:<installedFixture.name>:rendered` — proof the app's first
+ *    post-fixture render pass has actually completed.
+ * 2. `window.__LOOP_E2E__.getState()`'s `loopPhase` / `player.hp` /
+ *    `player.maxHp` / `progress.resources` / `progress.weaponPower` /
+ *    `sortie.status` / `sortie.elapsedTicks` / `sortie.result` all match
+ *    `installedFixture` — proof the fixture's values were actually applied,
+ *    not just that SOME fixture rendered. Unlike the receipt check above,
+ *    this reads JS state via `page.evaluate()` (not a DOM locator), so it
+ *    uses `expect.poll()` rather than a locator assertion. FAILS CLOSED
+ *    (P1-2) when the hook is missing instead of silently skipping this half
+ *    of the attestation — a receipt without a live `__LOOP_E2E__` hook is
+ *    itself a fixture-application failure signal, not a "nothing to check
+ *    here" signal.
+ * 3. `sortie.elapsedTicks` matches exactly (the visual scenario freezes the
+ *    simulation, so this is stable) and `sortie.result` is `'timeout'` when
+ *    `installedFixture.sortie.status === 'timeout'`, `null` otherwise.
+ * 4. `installedFixture.paused` matches the pause dialog
+ *    (`[data-phase-screen="pause"]`) visibility AND the battle-stage
+ *    Canvas's `inert`/`aria-hidden` state (`src/main.ts`'s `frame()`).
+ *
+ * This is the central enforcement point `expectDomOverlayScreenshot()` and
+ * `expectCanvasVisualCueScreenshot()` both call before comparing a
+ * screenshot, so individual spec files forgetting to assert the receipt
+ * themselves (AC3/AC4) no longer silently loses this guarantee.
+ */
+export async function assertVisualScenarioAttested(
+  page: Page,
+  installedFixture: VisualScenarioFixture,
+): Promise<void> {
+  const expectedReceipt = `v1:${installedFixture.name}:rendered`
+
+  // P1-1: web-first assertion -- retries until the app's first post-fixture
+  // RAF render pass sets the receipt, instead of reading it once via a raw
+  // page.evaluate() immediately after page.goto() resolves.
+  await expect(page.locator('html')).toHaveAttribute('data-loop-visual-scenario', expectedReceipt)
+
+  const expectedProjection: VisualScenarioStateProjection = {
+    hook: 'present',
+    loopPhase: installedFixture.loopPhase,
+    hp: installedFixture.player.hp,
+    maxHp: installedFixture.player.maxHp,
+    resources: installedFixture.progress.resources,
+    weaponPower: installedFixture.progress.weaponPower,
+    sortieStatus: installedFixture.sortie.status,
+    elapsedTicks: installedFixture.sortie.elapsedTicks,
+    result: installedFixture.sortie.status === 'timeout' ? 'timeout' : null,
+  }
+
+  // P1-2: expect.poll() -- this reads JS state via page.evaluate(), not a DOM
+  // locator, so it needs Playwright's polling assertion (not
+  // toHaveAttribute()) to retry until the state hook reflects the fixture.
+  // Fails closed: a missing __LOOP_E2E__ hook is reported as `hook: 'missing'`
+  // (never silently skipped), which mismatches expectedProjection's
+  // `hook: 'present'` and fails the assertion with a clear diff.
+  await expect
+    .poll(
+      () =>
+        page.evaluate((): VisualScenarioStateProjection => {
+          const e2e = (
+            window as Window & typeof globalThis & { __LOOP_E2E__?: { getState: () => LoopE2ESnapshot } }
+          ).__LOOP_E2E__
+          if (!e2e) {
+            return {
+              hook: 'missing',
+              loopPhase: null,
+              hp: null,
+              maxHp: null,
+              resources: null,
+              weaponPower: null,
+              sortieStatus: null,
+              elapsedTicks: null,
+              result: null,
+            }
+          }
+          const snapshot = e2e.getState()
+          return {
+            hook: 'present',
+            loopPhase: snapshot.loopPhase,
+            hp: snapshot.player.hp,
+            maxHp: snapshot.player.maxHp,
+            resources: snapshot.progress.resources,
+            weaponPower: snapshot.progress.weaponPower,
+            sortieStatus: snapshot.sortie.status,
+            elapsedTicks: snapshot.sortie.elapsedTicks,
+            result: snapshot.sortie.result,
+          }
+        }),
+      {
+        message:
+          'assertVisualScenarioAttested(): receipt matched scenario ' +
+          `"${installedFixture.name}", but window.__LOOP_E2E__ state (or the hook itself) never ` +
+          'converged to the expected projection.',
+      },
+    )
+    .toEqual(expectedProjection)
+
+  // P1-2: paused fixtures show the pause dialog and render the Canvas inert
+  // (src/main.ts's frame(), AC4 Issue #1376); non-paused fixtures must show
+  // neither.
+  const pauseScreen = page.locator(PAUSE_SCREEN_SELECTOR)
+  const canvas = page.locator(BATTLE_STAGE_CANVAS_SELECTOR)
+  if (installedFixture.paused) {
+    await expect(pauseScreen).toBeVisible()
+    await expect(canvas).toHaveAttribute('inert', '')
+    await expect(canvas).toHaveAttribute('aria-hidden', 'true')
+  } else {
+    await expect(pauseScreen).toBeHidden()
+    await expect(canvas).not.toHaveAttribute('inert', '')
+  }
+}
+
 /**
  * DOM overlay screenshot helper (AC2, AC5). Defaults reject full-canvas /
  * full-shell bitmap targets via `assertAllowedVisualTarget()` (resolved-DOM
@@ -424,6 +607,11 @@ export async function expectDomOverlayScreenshot(
   }
 
   await assertAllowedVisualTarget(locator)
+
+  // AC6 (Issue #1728): central enforcement -- verifies the app actually
+  // reflected `installed` before this screenshot is compared, independent
+  // of whether the calling spec also asserts the receipt itself.
+  await assertVisualScenarioAttested(page, installed)
 
   const diffToleranceOption =
     options.maxDiffPixels !== undefined
@@ -604,6 +792,11 @@ export async function expectCanvasVisualCueScreenshot(
         'capture root empirically rather than relying on a previous implicit default.',
     )
   }
+
+  // AC6 (Issue #1728): central enforcement -- verifies the app actually
+  // reflected `installed` before this screenshot is compared, independent
+  // of whether the calling spec also asserts the receipt itself.
+  await assertVisualScenarioAttested(page, installed)
 
   await expect(locator).toHaveScreenshot(name, {
     animations: 'disabled',
