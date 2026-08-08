@@ -69,52 +69,87 @@ def rgh():
 def test_preflight_skip_when_agy_missing(e2e, monkeypatch):
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.setattr(e2e, "_resolve_agy_binary", lambda: None)
-    ok, reason, token = e2e._preflight(gh_token_env="GH_TOKEN")
+    ok, reason = e2e._preflight(gh_token_env="GH_TOKEN")
     assert ok is False
     assert reason == "agy_cli_unavailable"
-    assert token is None
 
 
-def test_preflight_skip_when_gh_token_missing(e2e, monkeypatch):
+def test_preflight_never_reads_gh_token_env_itself(e2e, monkeypatch):
+    """Issue #2012 Outcome 1: the orchestrator process never reads
+    GH_TOKEN/GITHUB_TOKEN itself -- `_preflight()` must not call
+    `os.environ.get("GH_TOKEN", ...)` (patched to explode if it does) and
+    must instead observe broker-subprocess success/failure only."""
     monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GH_HOST", raising=False)
+    monkeypatch.delenv("GH_REPO", raising=False)
     monkeypatch.setattr(e2e, "_resolve_agy_binary", lambda: "/usr/bin/agy")
-    ok, reason, _token = e2e._preflight(gh_token_env="GH_TOKEN")
-    assert ok is False
-    assert reason == "gh_token_unavailable"
+    monkeypatch.setattr(e2e, "_resolve_gh_binary", lambda: "/usr/bin/gh")
+
+    real_environ_get = e2e.os.environ.get
+
+    def _guarded_get(key, *args, **kwargs):
+        if key in ("GH_TOKEN", "GITHUB_TOKEN"):
+            raise AssertionError(f"_preflight() must never read {key} itself")
+        return real_environ_get(key, *args, **kwargs)
+
+    monkeypatch.setattr(e2e.os.environ, "get", _guarded_get)
+    monkeypatch.setattr(
+        e2e,
+        "_execute_via_broker_subprocess",
+        lambda *_a, **_k: {"schema": e2e.broker.SCHEMA_COMMAND_RESULT, "exit_code": 0},
+    )
+    ok, reason = e2e._preflight(gh_token_env="GH_TOKEN")
+    assert ok is True
+    assert reason is None
 
 
 def test_preflight_skip_when_host_repo_binding_mismatch(e2e, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "fake")
     monkeypatch.setenv("GH_HOST", "example.com")
     monkeypatch.setattr(e2e, "_resolve_agy_binary", lambda: "/usr/bin/agy")
-    ok, reason, _token = e2e._preflight(gh_token_env="GH_TOKEN")
+    ok, reason = e2e._preflight(gh_token_env="GH_TOKEN")
     assert ok is False
     assert reason == "gh_host_repo_binding_mismatch"
 
 
 def test_preflight_skip_when_gh_binary_missing(e2e, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "fake")
     monkeypatch.delenv("GH_HOST", raising=False)
     monkeypatch.delenv("GH_REPO", raising=False)
     monkeypatch.setattr(e2e, "_resolve_agy_binary", lambda: "/usr/bin/agy")
     monkeypatch.setattr(e2e, "_resolve_gh_binary", lambda: None)
-    ok, reason, _token = e2e._preflight(gh_token_env="GH_TOKEN")
+    ok, reason = e2e._preflight(gh_token_env="GH_TOKEN")
     assert ok is False
     assert reason == "gh_cli_unavailable"
 
 
 def test_preflight_skip_when_readonly_auth_probe_fails(e2e, monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "fake")
     monkeypatch.delenv("GH_HOST", raising=False)
     monkeypatch.delenv("GH_REPO", raising=False)
     monkeypatch.setattr(e2e, "_resolve_agy_binary", lambda: "/usr/bin/agy")
     monkeypatch.setattr(e2e, "_resolve_gh_binary", lambda: "/usr/bin/gh")
     monkeypatch.setattr(
-        e2e.broker,
-        "execute_operation",
-        lambda *_a, **_k: {"exit_code": 1, "redacted_output_digest": "sha256:x"},
+        e2e,
+        "_execute_via_broker_subprocess",
+        lambda *_a, **_k: {"schema": e2e.broker.SCHEMA_COMMAND_RESULT, "exit_code": 1},
     )
-    ok, reason, _token = e2e._preflight(gh_token_env="GH_TOKEN")
+    ok, reason = e2e._preflight(gh_token_env="GH_TOKEN")
+    assert ok is False
+    assert reason == "gh_readonly_auth_unverifiable"
+
+
+def test_preflight_skip_when_broker_subprocess_denies_credential(e2e, monkeypatch):
+    """When the broker subprocess itself cannot resolve any credential
+    (GH_TOKEN absent and `gh auth token` bootstrap unavailable), it raises
+    BrokerDenied -- `_preflight()` maps that to a SKIP, never a crash."""
+    monkeypatch.delenv("GH_HOST", raising=False)
+    monkeypatch.delenv("GH_REPO", raising=False)
+    monkeypatch.setattr(e2e, "_resolve_agy_binary", lambda: "/usr/bin/agy")
+    monkeypatch.setattr(e2e, "_resolve_gh_binary", lambda: "/usr/bin/gh")
+
+    def _deny(*_a, **_k):
+        raise e2e.broker.BrokerDenied("credential_bootstrap_empty_token")
+
+    monkeypatch.setattr(e2e, "_execute_via_broker_subprocess", _deny)
+    ok, reason = e2e._preflight(gh_token_env="GH_TOKEN")
     assert ok is False
     assert reason == "gh_readonly_auth_unverifiable"
 
@@ -193,7 +228,7 @@ def test_genuine_multi_turn_positive_run_is_adaptive_and_iteration_ge_2(e2e, mon
         record.setdefault("duration_ms", 5)
         return record
 
-    monkeypatch.setattr(e2e.broker, "execute_operation", _fake_execute)
+    monkeypatch.setattr(e2e, "_execute_via_broker_subprocess", _fake_execute)
 
     turns = iter(
         [
@@ -232,7 +267,7 @@ def test_agy_selecting_a_denied_operation_never_executes_it(e2e, monkeypatch):
         record["argv"] = ["repo", "view"]
         return record
 
-    monkeypatch.setattr(e2e.broker, "execute_operation", _fake_execute)
+    monkeypatch.setattr(e2e, "_execute_via_broker_subprocess", _fake_execute)
 
     turns = iter(
         [
@@ -246,7 +281,7 @@ def test_agy_selecting_a_denied_operation_never_executes_it(e2e, monkeypatch):
         {"schema": "delegation_request_v1", "provider": "agy", "tool_profile": "github_research", "prompt": "x"}
     )
     # Only the preflight `repo view` probe may have executed -- the
-    # AGY-chosen `close_issue` must never reach broker.execute_operation().
+    # AGY-chosen `close_issue` must never reach the broker subprocess.
     assert all(op != "close_issue" for op, _params in execute_calls)
     assert result["ok"] is False
 
@@ -296,8 +331,8 @@ def test_run_delegation_dispatches_github_research_to_e2e_module(rgh, monkeypatc
 def test_blocker4_immediate_stop_with_zero_executed_commands_is_not_pass(e2e, monkeypatch):
     _standard_setup(e2e, monkeypatch)
     monkeypatch.setattr(
-        e2e.broker,
-        "execute_operation",
+        e2e,
+        "_execute_via_broker_subprocess",
         lambda *_a, **_k: {"exit_code": 0, "redacted_output_digest": "sha256:preflight"},
     )
     monkeypatch.setattr(e2e, "_run_agy_turn", lambda **_kwargs: ('{"action": "stop", "summary": "nothing done"}', ""))
@@ -313,8 +348,8 @@ def test_blocker4_immediate_stop_with_zero_executed_commands_is_not_pass(e2e, mo
 def test_blocker4_all_turns_denied_is_not_pass(e2e, monkeypatch):
     _standard_setup(e2e, monkeypatch)
     monkeypatch.setattr(
-        e2e.broker,
-        "execute_operation",
+        e2e,
+        "_execute_via_broker_subprocess",
         lambda *_a, **_k: {"exit_code": 0, "redacted_output_digest": "sha256:preflight"},
     )
     denied_turn = '{"action": "next", "operation": "close_issue", "params": {"number": 1}}'
@@ -332,8 +367,8 @@ def test_blocker4_all_turns_denied_is_not_pass(e2e, monkeypatch):
 def test_blocker4_all_turns_unparseable_is_not_pass(e2e, monkeypatch):
     _standard_setup(e2e, monkeypatch)
     monkeypatch.setattr(
-        e2e.broker,
-        "execute_operation",
+        e2e,
+        "_execute_via_broker_subprocess",
         lambda *_a, **_k: {"exit_code": 0, "redacted_output_digest": "sha256:preflight"},
     )
     monkeypatch.setattr(e2e, "_run_agy_turn", lambda **_kwargs: ("garbage not json", ""))
@@ -366,7 +401,7 @@ def test_blocker4_gh_exit_1_never_counts_toward_positive_run(e2e, monkeypatch):
             "argv": ["issue", "view", "999999999"],
         }
 
-    monkeypatch.setattr(e2e.broker, "execute_operation", _fake_execute)
+    monkeypatch.setattr(e2e, "_execute_via_broker_subprocess", _fake_execute)
     turns = iter(
         [
             ('{"action": "next", "operation": "get_issue", "params": {"number": 999999999}}', ""),
@@ -405,7 +440,7 @@ def test_blocker4_command_timeout_or_output_limit_is_not_pass(e2e, monkeypatch):
             "argv": ["issue", "view", "1"],
         }
 
-    monkeypatch.setattr(e2e.broker, "execute_operation", _fake_execute)
+    monkeypatch.setattr(e2e, "_execute_via_broker_subprocess", _fake_execute)
     turns = iter([('{"action": "next", "operation": "get_issue", "params": {"number": 1}}', "")])
     monkeypatch.setattr(e2e, "_run_agy_turn", lambda **_kwargs: next(turns))
 
@@ -419,8 +454,8 @@ def test_blocker4_command_timeout_or_output_limit_is_not_pass(e2e, monkeypatch):
 def test_blocker4_agy_exit_nonzero_is_route_failure_not_pass(e2e, monkeypatch):
     _standard_setup(e2e, monkeypatch)
     monkeypatch.setattr(
-        e2e.broker,
-        "execute_operation",
+        e2e,
+        "_execute_via_broker_subprocess",
         lambda *_a, **_k: {"exit_code": 0, "redacted_output_digest": "sha256:preflight"},
     )
     monkeypatch.setattr(e2e, "_run_agy_turn", lambda **_kwargs: ("", "agy_exit_nonzero"))
@@ -437,8 +472,8 @@ def test_blocker4_positive_run_exit_code_is_never_hardcoded_zero_on_failure(e2e,
     outcome (Issue #1920 PR #2000 REQUEST_CHANGES Blocker 4)."""
     _standard_setup(e2e, monkeypatch)
     monkeypatch.setattr(
-        e2e.broker,
-        "execute_operation",
+        e2e,
+        "_execute_via_broker_subprocess",
         lambda *_a, **_k: {"exit_code": 0, "redacted_output_digest": "sha256:preflight"},
     )
     monkeypatch.setattr(e2e, "_run_agy_turn", lambda **_kwargs: ("garbage not json", ""))

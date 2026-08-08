@@ -32,6 +32,7 @@ import json
 import os
 import re
 import selectors
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -50,6 +51,19 @@ DEFAULT_STDOUT_CAP_BYTES = 65536
 DEFAULT_STDERR_CAP_BYTES = 16384
 MAX_RECORDS_PER_COMMAND = 100
 DEFAULT_LIMIT = 30
+
+# Credential bootstrap (Issue #2012): resolving a stored `gh` credential via
+# `gh auth token --hostname <host>` when no GH_TOKEN/GITHUB_TOKEN env var is
+# already present in this broker (sub)process's own startup environment.
+# This is a *fail-closed* classification -- every branch below returns a
+# structured reason string and never the token value itself.
+GH_AUTH_TOKEN_BOOTSTRAP_TIMEOUT_SECONDS = 15.0
+
+REASON_CREDENTIAL_BOOTSTRAP_GH_CLI_UNAVAILABLE = "credential_bootstrap_gh_cli_unavailable"
+REASON_CREDENTIAL_BOOTSTRAP_TIMEOUT = "credential_bootstrap_timeout"
+REASON_CREDENTIAL_BOOTSTRAP_NONZERO_EXIT = "credential_bootstrap_nonzero_exit"
+REASON_CREDENTIAL_BOOTSTRAP_EMPTY_TOKEN = "credential_bootstrap_empty_token"
+REASON_CREDENTIAL_BOOTSTRAP_MALFORMED_OUTPUT = "credential_bootstrap_malformed_output"
 
 _READ_CHUNK_BYTES = 65536
 _GRACE_KILL_SECONDS = 3.0
@@ -380,6 +394,94 @@ def _isolated_gh_config_dir(tmp_root: Path) -> Path:
     return config_dir
 
 
+def _looks_like_malformed_token_output(raw: str) -> bool:
+    """A genuine `gh auth token` success prints exactly one bare token line.
+
+    Anything else (empty, multi-line, embedded whitespace/control chars) is
+    treated as malformed rather than guessed-at or partially used.
+    """
+    if not raw:
+        return True
+    if "\n" in raw or "\r" in raw:
+        return True
+    if any(ch.isspace() for ch in raw):
+        return True
+    return False
+
+
+def bootstrap_gh_token(
+    *,
+    host: str = DEFAULT_HOST,
+    gh_bin: str = "gh",
+    timeout_seconds: float = GH_AUTH_TOKEN_BOOTSTRAP_TIMEOUT_SECONDS,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve a stored `gh` credential for *host* via `gh auth token`.
+
+    Runs entirely inside this broker process/subprocess. Uses the *ambient*
+    `gh` credential store (this call's own inherited environment, e.g. the
+    real `GH_CONFIG_DIR` / `~/.config/gh` populated by a prior
+    `gh auth login`) because that is where the stored credential actually
+    lives -- this is deliberately never the isolated, fresh `GH_CONFIG_DIR`
+    used afterwards to execute the research `gh` command itself (Issue
+    #2012 In Scope: isolation invariant preserved after bootstrap).
+
+    Returns `(token, failure_reason)`; exactly one of the two is not `None`.
+    The resolved token (if any) is returned only as an in-memory value --
+    never printed, logged, or included in any diagnostic/error output, even
+    on failure. `--hostname` is always passed explicitly (never omitted, and
+    never taken from an AGY- or caller-controlled param) so credential
+    resolution is deterministically pinned to *host*.
+    """
+    resolved_bin = shutil.which(gh_bin) or gh_bin
+    argv = [resolved_bin, "auth", "token", "--hostname", host]
+    try:
+        completed = subprocess.run(
+            argv,
+            env=dict(env) if env is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            shell=False,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return None, REASON_CREDENTIAL_BOOTSTRAP_GH_CLI_UNAVAILABLE
+    except subprocess.TimeoutExpired:
+        return None, REASON_CREDENTIAL_BOOTSTRAP_TIMEOUT
+
+    if completed.returncode != 0:
+        return None, REASON_CREDENTIAL_BOOTSTRAP_NONZERO_EXIT
+
+    raw = (completed.stdout or "").strip("\n")
+    if not raw or not raw.strip():
+        return None, REASON_CREDENTIAL_BOOTSTRAP_EMPTY_TOKEN
+    if _looks_like_malformed_token_output(raw):
+        return None, REASON_CREDENTIAL_BOOTSTRAP_MALFORMED_OUTPUT
+    return raw, None
+
+
+def resolve_gh_token(
+    *,
+    gh_token_env: str = "GH_TOKEN",
+    host: str = DEFAULT_HOST,
+    gh_bin: str = "gh",
+) -> tuple[str | None, str | None, bool]:
+    """Resolve the token this broker (sub)process will use for one operation.
+
+    Priority: an explicit `GH_TOKEN`/`GITHUB_TOKEN`-style env var already
+    present in *this process's own* startup environment wins (no bootstrap
+    performed). Otherwise, `bootstrap_gh_token()` resolves a stored
+    credential internally. Returns `(token, failure_reason, bootstrap_used)`.
+    """
+    env_token = os.environ.get(gh_token_env)
+    if env_token:
+        return env_token, None, False
+    token, failure_reason = bootstrap_gh_token(host=host, gh_bin=gh_bin)
+    return token, failure_reason, True
+
+
 def _redact(text: str) -> tuple[str, bool]:
     redacted_text, count = _TOKEN_SHAPE_RE.subn(_REDACTED_MARKER, text)
     return redacted_text, count > 0
@@ -631,10 +733,14 @@ def _cli_argv() -> argparse.ArgumentParser:
     execute_parser.add_argument("operation", help="Broker operation id, e.g. get_issue")
     execute_parser.add_argument("--params-json", default="{}", help="JSON object of operation params.")
     execute_parser.add_argument(
-        "--gh-token-env", default="GH_TOKEN", help="Env var holding the token (default GH_TOKEN)."
+        "--gh-token-env",
+        default="GH_TOKEN",
+        help="Env var holding the token, checked first (default GH_TOKEN). If unset, this "
+        "process bootstraps a stored `gh` credential internally via `gh auth token`.",
     )
     execute_parser.add_argument("--host", default=DEFAULT_HOST)
     execute_parser.add_argument("--repo", default=DEFAULT_REPO)
+    execute_parser.add_argument("--gh-bin", default="gh", help="`gh` executable to use (default gh).")
     execute_parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_COMMAND_TIMEOUT_SECONDS)
 
     return parser
@@ -661,15 +767,27 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.allowed else 2
 
     if args.mode == "execute":
-        gh_token = os.environ.get(args.gh_token_env)
+        gh_token, bootstrap_failure_reason, bootstrap_used = resolve_gh_token(
+            gh_token_env=args.gh_token_env, host=args.host, gh_bin=args.gh_bin
+        )
         if not gh_token:
-            print(json.dumps({"ok": False, "reason": "gh_token_env_missing"}, sort_keys=True))
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "reason": bootstrap_failure_reason or "gh_token_env_missing",
+                        "bootstrap_used": bootstrap_used,
+                    },
+                    sort_keys=True,
+                )
+            )
             return 5
         try:
             record = execute_operation(
                 args.operation,
                 params,
                 gh_token=gh_token,
+                gh_bin=args.gh_bin,
                 host=args.host,
                 repo=args.repo,
                 timeout_seconds=args.timeout_seconds,

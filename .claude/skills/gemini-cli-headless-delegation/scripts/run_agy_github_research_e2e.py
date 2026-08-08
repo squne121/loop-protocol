@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
-"""AGY-driven, bounded, read-only `github_research` route (Issue #1920).
+"""AGY-driven, bounded, read-only `github_research` route (Issue #1920, #2012).
 
 Orchestrates up to `limits.max_iterations` rounds of: prompt AGY (provider=agy,
 tool_profile=github_research) for exactly one next *operation* decision (a
 broker-owned operation id + params, never a raw `gh` argv or `gh api`
 endpoint) or a stop signal, validate that decision against
 `run_agy_github_research_broker.validate_operation()` *before* executing
-anything, execute it via `run_agy_github_research_broker.execute_operation()`
-(the only component holding `GH_TOKEN`), and feed the (redacted, bounded,
-sanitized) result back into the next round's prompt.
+anything, execute it as a real, independent OS subprocess via
+`run_agy_github_research_broker.py execute` (this orchestrator process never
+imports and calls `broker.execute_operation()` in-process, and never reads
+GH_TOKEN/GITHUB_TOKEN itself), and feed the (redacted, bounded, sanitized)
+result back into the next round's prompt.
+
+The broker subprocess is the only component that ever resolves/holds a real
+GitHub token: either an explicit `GH_TOKEN`/`GITHUB_TOKEN` already present in
+its own startup environment, or -- if absent -- a stored `gh` credential it
+bootstraps internally via `gh auth token --hostname github.com` (Issue #2012;
+see `run_agy_github_research_broker.bootstrap_gh_token()` /
+`resolve_gh_token()`). The parent/orchestrator process and IPC channel never
+carry the token value (Issue #2012 Outcome 1/4).
 
 AGY's `github_research` tool_profile has an empty
 `agy_permission_policy.PROFILE_ALLOWED_TOOLS` entry, so AGY has no native
@@ -19,11 +29,11 @@ This keeps `GH_TOKEN` fully out of the AGY subprocess's environment.
 Writes an `agy_github_research_evidence/v1` artifact
 (`schemas/agy_github_research_evidence_v1.schema.json`) to
 `.claude/artifacts/agent-provider-route/<run-id>/`. SKIP (exit 77) is
-returned whenever a precondition (agy CLI, GH_TOKEN, read-only auth,
-GH_HOST/GH_REPO, AGY version/permission-boundary preflight) is unavailable
-or unverifiable -- SKIP is never PASS, and Gemini / direct fallback / a
-single fixed-evidence injection are never treated as a successful run of
-this route (Issue #1920 In Scope / Out of Scope).
+returned whenever a precondition (agy CLI, broker-subprocess credential
+resolution, read-only auth, GH_HOST/GH_REPO, AGY version/permission-boundary
+preflight) is unavailable or unverifiable -- SKIP is never PASS, and Gemini /
+direct fallback / a single fixed-evidence injection are never treated as a
+successful run of this route (Issue #1920 In Scope / Out of Scope).
 
 `status: "pass"` is an explicit state machine (Issue #1920 PR #2000
 REQUEST_CHANGES Blocker 4), never a `"fail" if <failure> else "pass"`
@@ -79,6 +89,17 @@ LIMITS: dict[str, Any] = {
 }
 
 _ARTIFACT_ROOT = Path(".claude/artifacts/agent-provider-route")
+
+# Issue #2012: the broker is invoked as a real, independent OS subprocess
+# (its own `execute` CLI subcommand) -- this process (the orchestrator)
+# never imports `broker.execute_operation` and calls it in-process, and
+# never reads GH_TOKEN/GITHUB_TOKEN itself. Credential resolution happens
+# entirely inside the broker subprocess (env passthrough via ordinary OS
+# process-env inheritance, or the broker's own internal `gh auth token`
+# bootstrap); only the broker's redacted, bounded JSON result crosses back
+# over stdout.
+_BROKER_SCRIPT_PATH = Path(__file__).resolve().parent / "run_agy_github_research_broker.py"
+_BROKER_SUBPROCESS_GRACE_SECONDS = 5.0
 
 # Env vars that must never reach a subprocess spawned purely to probe the AGY
 # binary's identity (version/digest) -- probing must happen with the same
@@ -270,45 +291,121 @@ def _agy_version_and_permission_gate(agy_bin: str) -> tuple[bool, str | None, di
     return True, None, {"version_result": version_result, "binary_digest": binary_digest}
 
 
-def _preflight(*, gh_token_env: str) -> tuple[bool, str | None, str | None]:
-    """Return (ok, skip_reason, gh_token).
+def _execute_via_broker_subprocess(
+    operation: str,
+    params: Mapping[str, Any],
+    *,
+    gh_bin: str,
+    gh_token_env: str = "GH_TOKEN",
+    timeout_seconds: float,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    """Execute one broker operation as a real, independent OS subprocess.
+
+    Spawns `run_agy_github_research_broker.py execute <operation> ...` as a
+    genuine child process (never an in-process `broker.execute_operation()`
+    call). This (parent) process never reads GH_TOKEN/GITHUB_TOKEN itself and
+    never forwards a token value via argv/stdin: the broker subprocess is
+    spawned with the default (inherited) environment -- if this process's own
+    ambient OS environment happens to already carry `GH_TOKEN`, ordinary
+    subprocess env inheritance passes it through without this code ever
+    reading/holding it as a Python value; otherwise the broker subprocess
+    resolves a stored credential entirely on its own (Issue #2012).
+
+    Raises `broker.BrokerDenied` (never a raw token, only a redacted reason
+    string) on any pre-execution deny, credential-unavailable, malformed
+    subprocess output, or subprocess-level timeout.
+    """
+    effective_timeout = float(timeout_seconds)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise broker.BrokerDenied("route_deadline_exceeded")
+        effective_timeout = min(effective_timeout, remaining)
+
+    argv = [
+        sys.executable,
+        str(_BROKER_SCRIPT_PATH),
+        "execute",
+        operation,
+        "--params-json",
+        json.dumps(dict(params), sort_keys=True),
+        "--gh-token-env",
+        gh_token_env,
+        "--host",
+        REPO_HOST,
+        "--repo",
+        REPO_SLUG,
+        "--gh-bin",
+        gh_bin,
+        "--timeout-seconds",
+        str(effective_timeout),
+    ]
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=effective_timeout + _BROKER_SUBPROCESS_GRACE_SECONDS,
+            shell=False,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise broker.BrokerDenied("broker_subprocess_timeout") from exc
+
+    stdout_text = (completed.stdout or "").strip()
+    try:
+        record = json.loads(stdout_text) if stdout_text else {}
+    except json.JSONDecodeError as exc:
+        raise broker.BrokerDenied("broker_subprocess_malformed_output") from exc
+    if not isinstance(record, dict) or record.get("schema") != broker.SCHEMA_COMMAND_RESULT:
+        reason = record.get("reason") if isinstance(record, dict) else None
+        raise broker.BrokerDenied(reason or "broker_subprocess_denied")
+    return record
+
+
+def _preflight(*, gh_token_env: str = "GH_TOKEN") -> tuple[bool, str | None]:
+    """Return (ok, skip_reason).
 
     Fail-closed: SKIP unless the `agy` CLI is resolvable, its version and
-    permission-boundary capability gate both pass, `GH_TOKEN` is explicitly
-    present in the runtime environment, and GH_HOST/GH_REPO are the fixed
-    repository-bound values this route always uses.
+    permission-boundary capability gate both pass, GH_HOST/GH_REPO are the
+    fixed repository-bound values this route always uses, and the broker
+    subprocess can complete a single harmless read-only probe operation
+    (`get_repo`). This process never reads GH_TOKEN/GITHUB_TOKEN itself --
+    credential availability is observed only indirectly, through whether the
+    broker subprocess (which owns credential resolution) succeeds (Issue
+    #2012 Outcome 1).
     """
     agy_bin = _resolve_agy_binary()
     if not agy_bin:
-        return False, "agy_cli_unavailable", None
+        return False, "agy_cli_unavailable"
 
     gate_ok, gate_reason, _gate_detail = _agy_version_and_permission_gate(agy_bin)
     if not gate_ok:
-        return False, gate_reason, None
-
-    gh_token = os.environ.get(gh_token_env)
-    if not gh_token:
-        return False, "gh_token_unavailable", None
+        return False, gate_reason
 
     host = os.environ.get("GH_HOST", REPO_HOST)
     repo = os.environ.get("GH_REPO", REPO_SLUG)
     if host != REPO_HOST or repo != REPO_SLUG:
-        return False, "gh_host_repo_binding_mismatch", None
+        return False, "gh_host_repo_binding_mismatch"
 
     gh_bin = _resolve_gh_binary()
     if not gh_bin:
-        return False, "gh_cli_unavailable", None
+        return False, "gh_cli_unavailable"
 
     # Read-only auth reachability check: a single allowlisted, harmless
     # broker-executed operation (does not count against max_iterations).
     try:
-        probe = broker.execute_operation("get_repo", {}, gh_token=gh_token, gh_bin=gh_bin, timeout_seconds=15)
+        probe = _execute_via_broker_subprocess(
+            "get_repo", {}, gh_bin=gh_bin, gh_token_env=gh_token_env, timeout_seconds=15
+        )
     except broker.BrokerDenied:
-        return False, "gh_readonly_auth_unverifiable", None
+        return False, "gh_readonly_auth_unverifiable"
     if probe.get("exit_code") != 0:
-        return False, "gh_readonly_auth_unverifiable", None
+        return False, "gh_readonly_auth_unverifiable"
 
-    return True, None, gh_token
+    return True, None
 
 
 def _isolated_agy_env(agy_bin: str) -> tuple[dict[str, str], list[str], Any]:
@@ -507,7 +604,7 @@ def run_github_research_route(
     route_deadline = started_at + LIMITS["total_route_timeout_seconds"]
 
     negative_probes = _run_negative_probes()
-    ok_preflight, skip_reason, gh_token = _preflight(gh_token_env=gh_token_env)
+    ok_preflight, skip_reason = _preflight(gh_token_env=gh_token_env)
 
     base_result: dict[str, Any] = {
         "schema": "delegation_result/v1",
@@ -557,7 +654,11 @@ def run_github_research_route(
                     "summary": f"SKIP: {skip_reason}",
                     "primary_artifact_type": "agy_github_research_evidence_v1",
                     "primary_artifact": str(artifact_path),
-                    "next_action": "Provide agy CLI + repository-bound read-only GH_TOKEN, then rerun.",
+                    "next_action": (
+                        "Provide the agy CLI, and either a repository-bound read-only "
+                        "GH_TOKEN or an authenticated `gh auth login` stored credential "
+                        "for github.com, then rerun."
+                    ),
                 },
                 "stderr": f"github_research_skip: {skip_reason}",
                 "failure_reason": f"github_research_skip: {skip_reason}",
@@ -649,14 +750,12 @@ def run_github_research_route(
         if index > 0:
             adaptive_observed = True
         try:
-            command_result = broker.execute_operation(
+            command_result = _execute_via_broker_subprocess(
                 operation,
                 params,
-                gh_token=gh_token,  # type: ignore[arg-type]
                 gh_bin=gh_bin_for_digest or "gh",
+                gh_token_env=gh_token_env,
                 timeout_seconds=LIMITS["command_timeout_seconds"],
-                stdout_cap_bytes=LIMITS["stdout_bytes_per_command"],
-                stderr_cap_bytes=LIMITS["stderr_bytes_per_command"],
                 deadline=route_deadline,
             )
         except broker.BrokerDenied as exc:
