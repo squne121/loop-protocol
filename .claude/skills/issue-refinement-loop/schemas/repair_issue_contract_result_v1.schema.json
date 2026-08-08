@@ -61,7 +61,8 @@
               "unknown"
             ]
           }
-        }
+        },
+        "additionalProperties": false
       }
     },
     "repair_action": {
@@ -177,5 +178,6 @@
         "error"
       ]
     }
-  ]
+  ],
+  "additionalProperties": false
 }

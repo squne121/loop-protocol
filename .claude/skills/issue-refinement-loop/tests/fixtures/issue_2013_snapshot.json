@@ -1,0 +1,14 @@
+{
+  "schema_version": "issue_2013_snapshot_fixture/v1",
+  "source_issue_number": 899,
+  "citation_discrepancy_note": "Issue #2016's own Machine-Readable Contract / In Scope / Acceptance Criteria (AC7, VC test name test_issue_2013_safe_repair_does_not_silent_pass_or_human_escalate) cite this fixture as reproducing 'Issue #2013'. A live `gh issue view 2013` on this repo (squne121/loop-protocol) returns an UNRELATED research issue ('Claude Code custom SubAgent spawn observability 非決定性を診断する', see PR #2022 / commit cba013ef), not anything about baseline-expect / Allowed Paths VC repair. The actual matching originating specification for the insert_baseline_expect_fail symptom this fixture reproduces (a Verification Command targeting a NEW Allowed Path with no preceding '# baseline-expect:' annotation) is Issue #899 ('baseline_vc_preflight.py に --strict フラグを追加し annotation 欠落 VC を強制 needs_fix にする', CLOSED) -- see repair_issue_contract.py's own '(Issue #899)' comments on _repair_insert_baseline_expect() / Pass 2.5. This fixture is therefore sourced from Issue #899's actual specification (the real behavioral origin), not from a live Issue #2013 snapshot, since Issue #2013 does not describe this symptom at all. This citation discrepancy in Issue #2016's own contract is flagged back to root/main for a human decision on whether to correct the Issue body (out of this worker's Allowed Paths) -- the test function name itself is left unchanged because it is fixed by Issue #2016's own canonical Verification Commands section (AC7).",
+  "captured_body_sha256": "sha256:8a5641c90c38962f0e73a141b77c5e205c11e7aaedd05437fa360dbcfcd8126b",
+  "expected_repair_kinds": [
+    "insert_baseline_expect_fail"
+  ],
+  "issue": {
+    "number": 899,
+    "title": "実装: baseline_vc_preflight.py に --strict フラグを追加し annotation 欠落 VC を強制 needs_fix にする",
+    "body": "## Machine-Readable Contract\n\n```yaml\ncontract_schema_version: v1\nissue_kind: implementation\nparent_issue: \"none\"\n```\n\n## Parent Issue\n\nなし（単独改善）\n\n## Parent Goal Ref\n\n- Goal: none (standalone fixture)\n- Desired Destination: none (standalone fixture)\n\n## Current Validated Scope\n\n- docs/dev/issue-899-baseline-expect-regression.md を追加する\n\n## Remaining Parent Gaps\n\nなし\n\n## Required Skills\n\n- なし\n\n## Outcome\n\nAdd docs/dev/issue-899-baseline-expect-regression.md documenting the\nbaseline_vc_preflight.py --strict flag's annotation-missing VC handling.\n\n## In Scope\n\n- docs/dev/issue-899-baseline-expect-regression.md\n\n## Out of Scope\n\n- Everything else.\n\n## Acceptance Criteria\n\n- [ ] AC1: doc file exists.\n\n## Verification Commands\n\n```bash\n$ test -f docs/dev/issue-899-baseline-expect-regression.md\n```\n\n## Allowed Paths\n\n- `docs/dev/issue-899-baseline-expect-regression.md`\n\n## Stop Conditions\n\n- none\n"
+  }
+}

@@ -40,7 +40,9 @@ import json
 import os
 import shlex
 import re
+import stat
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -809,11 +811,121 @@ def repair_body(body: str) -> tuple[str, list[dict]]:
     return body, all_repairs
 
 
+
+# ---------------------------------------------------------------------------
+# Candidate materialization security (Issue #2016 iteration-3 OWNER
+# adversarial review P0-2): the candidate body path is a fixed, predictable
+# location. A plain Path.write_text() there follows a pre-existing symlink
+# and overwrites whatever it points at. These helpers fail closed on:
+#   - a pre-existing symlink / FIFO / device / directory at the leaf path
+#   - a symlinked ancestor directory between the leaf and the caller-supplied
+#     artifact root
+# and only ever materialize the candidate via a securely-created sibling
+# temp file (O_CREAT|O_EXCL|O_NOFOLLOW) that is fsync'd, hash-verified, and
+# then atomically os.replace()'d onto the final leaf path.
+# ---------------------------------------------------------------------------
+
+
+class CandidateWriteSecurityError(Exception):
+    """Raised when the candidate body materialization path fails a
+    fail-closed leaf/ancestor safety check."""
+
+
+def _reject_unsafe_leaf(path: Path) -> None:
+    """Fail-closed leaf check: reject a pre-existing symlink / FIFO /
+    device / directory at `path`. Uses os.lstat (does NOT follow symlinks)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise CandidateWriteSecurityError(f"candidate_leaf_lstat_error:{path}:{exc}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise CandidateWriteSecurityError(f"candidate_leaf_is_symlink:{path}")
+    if stat.S_ISDIR(st.st_mode):
+        raise CandidateWriteSecurityError(f"candidate_leaf_is_directory:{path}")
+    if not stat.S_ISREG(st.st_mode):
+        raise CandidateWriteSecurityError(f"candidate_leaf_not_regular_file:{path}")
+
+
+def _reject_unsafe_parent_chain(path: Path, root: Optional[Path]) -> None:
+    """Reject if any ancestor directory of `path` (up to and including
+    `root`, when given) is itself a symlink, and verify the resolved parent
+    is contained within `root`. Fail-closed: an unresolvable ancestor or an
+    ancestor outside `root` is rejected."""
+    node = path.parent
+    while True:
+        try:
+            st = os.lstat(node)
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(st.st_mode):
+            raise CandidateWriteSecurityError(f"candidate_ancestor_is_symlink:{node}")
+        if root is not None and node.resolve(strict=False) == root.resolve(strict=False):
+            break
+        parent = node.parent
+        if parent == node:
+            break
+        node = parent
+
+    if root is not None:
+        try:
+            resolved_parent = path.parent.resolve(strict=False)
+            resolved_root = root.resolve(strict=False)
+        except Exception as exc:
+            raise CandidateWriteSecurityError(f"candidate_parent_unresolvable:{exc}") from exc
+        if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+            raise CandidateWriteSecurityError(
+                f"candidate_parent_outside_root:{resolved_parent}:not_under:{resolved_root}"
+            )
+
+
+def secure_atomic_write_candidate(path: Path, text: str, *, root: Optional[Path] = None) -> None:
+    """Write `text` to `path` with fail-closed symlink/parent-symlink
+    protection (Issue #2016 iteration-3 P0-2). Never truncates through a
+    pre-existing symlink: creates a securely-named sibling temp file with
+    O_CREAT|O_EXCL|O_NOFOLLOW, fsyncs it, re-checks the leaf immediately
+    before replace (narrowing the TOCTOU window), then atomically
+    os.replace()s it onto the final leaf path."""
+    _reject_unsafe_parent_chain(path, root)
+    _reject_unsafe_leaf(path)
+
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    encoded = text.encode("utf-8")
+
+    tmp_name = f".{path.name}.{os.getpid()}.{int(time.time() * 1000000)}.tmp"
+    tmp_path = directory / tmp_name
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    fd = os.open(str(tmp_path), flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Re-check the leaf immediately before replace: narrows (does not
+        # eliminate) the TOCTOU window between the initial check and the
+        # rename. os.replace() itself is an atomic rename, so once this
+        # check passes the actual swap cannot be intercepted.
+        _reject_unsafe_leaf(path)
+        os.replace(str(tmp_path), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(tmp_path))
+        except OSError:
+            pass
+        raise
+
+
 def run_repair(
     body: str,
     *,
     apply: bool = False,
     out_file: Optional[str] = None,
+    root_dir: Optional[str] = None,
 ) -> dict:
     """Run repair and return the result JSON dict.
 
@@ -821,6 +933,9 @@ def run_repair(
         body:     Issue body text.
         apply:    If True, write repaired body to out_file (or raise if not given).
         out_file: Path to write repaired body when apply=True.
+        root_dir: Optional allowed artifact root for containment verification
+                  (Issue #2016 iteration-3 P0-2). When given, out_file's
+                  parent directory chain must resolve within this root.
     """
     original_sha = _sha256(body)
 
@@ -835,7 +950,8 @@ def run_repair(
         if not out_file:
             raise ValueError("--out-file is required when --apply is set")
         written_path = Path(out_file)
-        written_path.write_text(repaired_body, encoding="utf-8")
+        artifact_root = Path(root_dir) if root_dir else None
+        secure_atomic_write_candidate(written_path, repaired_body, root=artifact_root)
         # Readback validation: confirm bytes round-trip before advertising
         # the artifact path as a canonical candidate_body_artifact.
         if written_path.read_text(encoding="utf-8") == repaired_body:
@@ -875,6 +991,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--out-file",
         default=None,
         help="Output path for repaired body (required when --apply is given)",
+    )
+    parser.add_argument(
+        "--artifact-root",
+        default=None,
+        help=(
+            "Allowed artifact root for candidate materialization containment "
+            "verification (Issue #2016 iteration-3 P0-2). Optional."
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -924,7 +1048,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     try:
-        result = run_repair(body, apply=args.apply, out_file=args.out_file)
+        result = run_repair(body, apply=args.apply, out_file=args.out_file, root_dir=args.artifact_root)
+    except CandidateWriteSecurityError as exc:
+        result = {
+            "schema": SCHEMA,
+            "dry_run": not args.apply,
+            "changed": False,
+            "original_body_sha256": "sha256:",
+            "repaired_body_sha256": "sha256:",
+            "repairs": [],
+            "error": f"candidate_write_security_error: {exc}",
+        }
+        print(json.dumps(result, indent=2))
+        return 1
     except Exception as exc:
         result = {
             "schema": SCHEMA,

@@ -151,7 +151,7 @@ wrapper の出力フィールドを確認する:
 - `COMMANDS_JSON:` — full command spec objects（canonical machine-consumable、空の場合は省略）
 - `COMMANDS_DISPLAY:` — human-readable display（display_only=true、空の場合は省略）
 - `BLOCKERS:` — ブロッカーコード一覧（空の場合は省略）
-- `ARTIFACT:` — 書き込まれた artifact の key: path 一覧（空の場合は省略）
+- `ARTIFACT:` — 書き込まれた artifact の key: path 一覧（空の場合は省略）。`STATUS: needs_fix` の場合は `repair_diagnostics` / `repair_candidate_body` も含まれる（Issue #2016 iteration-3 P1-1。`repair_action.diagnostics_artifact` / `.candidate_body_artifact` と同一パスを canonical artifact map からも参照可能にする）
 - `REPAIR_ACTION:` — versioned `repair_action` disposition（Issue #2016。`STATUS: needs_fix` の場合のみ出力される。`disposition: auto_apply_safe` と diagnostics/candidate body artifact パス・original/repaired SHA を含む）
 
 **`STATUS: needs_fix` / `NEXT_ACTION: apply_deterministic_repair`（Issue #2016）:**

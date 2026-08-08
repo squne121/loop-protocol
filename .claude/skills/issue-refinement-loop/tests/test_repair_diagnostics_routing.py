@@ -495,6 +495,14 @@ def test_repair_action_projected_in_result_schema_and_compact_stdout(tmp_path):
     assert diagnostics_artifact in stdout
     assert candidate_body_artifact in stdout
 
+    # Issue #2016 iteration-3 P1-1 (OWNER adversarial review): AC6 requires
+    # referenceability from ALL THREE of the result schema, the artifact
+    # map, and compact stdout -- not just the nested repair_action block.
+    assert result["artifacts"]["repair_diagnostics"] == diagnostics_artifact
+    assert result["artifacts"]["repair_candidate_body"] == candidate_body_artifact
+    assert Path(result["artifacts"]["repair_diagnostics"]).is_file()
+    assert Path(result["artifacts"]["repair_candidate_body"]).is_file()
+
 
 # ---------------------------------------------------------------------------
 # AC7: Issue #2013 end-to-end regression fixture
@@ -517,3 +525,372 @@ def test_issue_2013_safe_repair_does_not_silent_pass_or_human_escalate(tmp_path)
 
     assert result["repair_action"]["disposition"] == "auto_apply_safe"
     assert Path(result["repair_action"]["candidate_body_artifact"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #2016 iteration-3 P1-1: repair diagnostics + candidate body must be
+# referenceable from the canonical artifact map (not just repair_action).
+# ---------------------------------------------------------------------------
+
+
+def test_repair_artifacts_are_present_in_canonical_artifact_map(tmp_path):
+    """P1-1 (OWNER adversarial review, required minimum test): a needs_fix
+    result's canonical `artifacts` map (not just the nested `repair_action`
+    block) must carry `repair_diagnostics` and `repair_candidate_body`
+    entries, pointing at real, existing, readable files."""
+    result, _ = _run_wrapper_preflight(ISSUE_2013_BODY, 90650, tmp_path)
+
+    assert result["status"] == "needs_fix", result
+    artifacts = result["artifacts"]
+    assert "repair_diagnostics" in artifacts, artifacts
+    assert "repair_candidate_body" in artifacts, artifacts
+
+    diagnostics_path = Path(artifacts["repair_diagnostics"])
+    candidate_path = Path(artifacts["repair_candidate_body"])
+    assert diagnostics_path.is_file()
+    assert candidate_path.is_file()
+
+    # Must equal the nested repair_action's own artifact paths (single
+    # source of truth, not a second independently-computed path).
+    assert artifacts["repair_diagnostics"] == result["repair_action"]["diagnostics_artifact"]
+    assert artifacts["repair_candidate_body"] == result["repair_action"]["candidate_body_artifact"]
+
+    # Schema must accept these two extra artifact keys.
+    schema_errors = wrapper._validate_result_artifact(result)
+    assert schema_errors == [], schema_errors
+
+
+# ---------------------------------------------------------------------------
+# Issue #2016 iteration-3 (OWNER adversarial review P0-1): the producer's
+# self-reported repair_action must be schema-validated AND cross-checked
+# against classify_repair_action() recomputed from the raw repairs[] --
+# never trusted as-is.
+# ---------------------------------------------------------------------------
+
+_VALID_REPAIR_ACTION_BASE = {
+    "schema_version": "repair_action/v1",
+    "policy_version": "deterministic-issue-repair/v1",
+    "disposition": "informational",
+    "original_body_sha256": "sha256:aaaa",
+    "repaired_body_sha256": "sha256:aaaa",
+    "diagnostics_artifact": None,
+    "candidate_body_artifact": None,
+    "repair_kinds": [],
+    "reason_codes": ["no_repairs_detected"],
+}
+
+
+def test_repair_same_version_schema_violation_is_environment_failure():
+    """P0-1: `{"schema": "repair_issue_contract/v1", "changed": false,
+    "repairs": "not-an-array"}` must NOT pass through as a no-op repair --
+    the schema type violation (repairs must be an array) is caught."""
+    parsed = {
+        "schema": "repair_issue_contract/v1",
+        "dry_run": True,
+        "changed": False,
+        "original_body_sha256": "sha256:aaaa",
+        "repaired_body_sha256": "sha256:aaaa",
+        "repairs": "not-an-array",
+        "repair_action": dict(_VALID_REPAIR_ACTION_BASE),
+    }
+    error = wrapper._validate_repair_result_schema_and_semantics(parsed)
+    assert error is not None
+    assert "schema_invalid" in error or "not_a_list" in error
+
+
+def test_repair_action_missing_version_is_not_defaulted():
+    """P0-1(2): a missing/unknown repair_action.schema_version or
+    .policy_version must be treated as environment_failure -- NEVER
+    silently defaulted/backfilled by the wrapper."""
+    action_missing_schema_version = dict(_VALID_REPAIR_ACTION_BASE)
+    del action_missing_schema_version["schema_version"]
+    parsed = {
+        "schema": "repair_issue_contract/v1",
+        "dry_run": True,
+        "changed": False,
+        "original_body_sha256": "sha256:aaaa",
+        "repaired_body_sha256": "sha256:aaaa",
+        "repairs": [],
+        "repair_action": action_missing_schema_version,
+    }
+    error = wrapper._validate_repair_result_schema_and_semantics(parsed)
+    assert error is not None
+
+    action_unknown_policy_version = dict(_VALID_REPAIR_ACTION_BASE)
+    action_unknown_policy_version["policy_version"] = "some-unknown-policy/v99"
+    parsed2 = dict(parsed, repair_action=action_unknown_policy_version)
+    error2 = wrapper._validate_repair_result_schema_and_semantics(parsed2)
+    # Rejected either by the schema's const check on policy_version, or by
+    # this validator's own explicit check -- either way it must NOT be
+    # silently defaulted/backfilled and passed through as valid.
+    assert error2 is not None
+    assert "policy_version" in error2 or "deterministic-issue-repair" in error2
+
+
+def test_repair_action_nested_hash_mismatch_is_rejected():
+    """P0-1(4): a mismatch between the top-level result SHA and the nested
+    repair_action SHA must be rejected -- the two must agree."""
+    mismatched_action = dict(_VALID_REPAIR_ACTION_BASE)
+    mismatched_action["original_body_sha256"] = "sha256:different"
+    parsed = {
+        "schema": "repair_issue_contract/v1",
+        "dry_run": True,
+        "changed": False,
+        "original_body_sha256": "sha256:aaaa",
+        "repaired_body_sha256": "sha256:aaaa",
+        "repairs": [],
+        "repair_action": mismatched_action,
+    }
+    error = wrapper._validate_repair_result_schema_and_semantics(parsed)
+    assert error is not None
+    assert "hash_mismatch" in error or "sha_mismatch" in error
+
+
+def test_repair_action_does_not_disagree_with_recomputed_classification():
+    """P0-1(3): the wrapper applies classify_repair_action() to the raw
+    repairs[] the producer returned and requires it to EXACTLY match the
+    producer's self-reported repair_action -- a producer that lies about
+    disposition (e.g. downgrading a real auto_apply_safe repair to
+    'informational' to slip past review, or the reverse) is rejected."""
+    safe_repairs = [
+        {
+            "kind": "insert_baseline_expect_fail",
+            "line_start": 1,
+            "line_end": 1,
+            "reason": "x",
+            "original": "a",
+            "repaired": "b",
+            "confidence": "high",
+        }
+    ]
+    recomputed = ric.classify_repair_action("sha256:aaaa", "sha256:bbbb", safe_repairs)
+    assert recomputed["disposition"] == "auto_apply_safe"
+
+    lying_action = dict(recomputed)
+    lying_action["disposition"] = "informational"  # producer lies, downgrading severity
+    parsed = {
+        "schema": "repair_issue_contract/v1",
+        "dry_run": True,
+        "changed": True,
+        "original_body_sha256": "sha256:aaaa",
+        "repaired_body_sha256": "sha256:bbbb",
+        "repairs": safe_repairs,
+        "repair_action": lying_action,
+    }
+    error = wrapper._validate_repair_result_schema_and_semantics(parsed)
+    assert error is not None
+    assert "disposition_mismatch" in error
+
+
+def test_run_repair_subprocess_semantic_validation_wired_end_to_end(tmp_path):
+    """P0-1: _run_repair_subprocess() (the actual subprocess call site used
+    by both _invoke_repair and _materialize_auto_apply_candidate) rejects a
+    schema-valid-looking but semantically-lying payload instead of trusting
+    it, by mocking subprocess.run to return a hostile producer payload."""
+    lying_repair_action = dict(_VALID_REPAIR_ACTION_BASE)
+    lying_repair_action["disposition"] = "auto_apply_safe"  # no repairs justify this
+    hostile_stdout = json.dumps(
+        {
+            "schema": "repair_issue_contract/v1",
+            "dry_run": True,
+            "changed": False,
+            "original_body_sha256": "sha256:aaaa",
+            "repaired_body_sha256": "sha256:aaaa",
+            "repairs": [],
+            "repair_action": lying_repair_action,
+        }
+    )
+
+    class _FakeProc:
+        returncode = 0
+        stdout = hostile_stdout
+        stderr = ""
+
+    # _run_repair_subprocess() imports subprocess locally as `_sp`; patch the
+    # actual `subprocess` module object it binds to (same module object).
+    import subprocess as _subprocess
+
+    with mock.patch.object(_subprocess, "run", return_value=_FakeProc()):
+        parsed, error = wrapper._run_repair_subprocess([], "some body")
+
+    assert parsed is None
+    assert error is not None
+    assert "semantic_validation_failed" in error
+
+
+# ---------------------------------------------------------------------------
+# Issue #2016 iteration-3 P1-2: result_core_sha256 binds the machine-
+# actionable repair decision.
+# ---------------------------------------------------------------------------
+
+
+def test_result_core_hash_binds_stable_repair_action_fields(tmp_path):
+    """P1-2: two otherwise-identical needs_fix results whose repair_action
+    differs ONLY in a machine-actionable field (here: reason_codes) must
+    produce DIFFERENT result_core_sha256 values -- proving that field is
+    bound into the integrity hash and cannot be silently altered."""
+
+    # Use the REAL producer output for ISSUE_2013_BODY as the base (so SHAs
+    # match what the un-mocked --apply reinvocation inside
+    # _materialize_auto_apply_candidate() will independently recompute for
+    # the same body -- only _invoke_repair (the dry-run step) is mocked
+    # here, the apply/candidate-materialization step runs for real).
+    genuine = ric.run_repair(ISSUE_2013_BODY)
+    assert genuine["repair_action"]["disposition"] == "auto_apply_safe", genuine
+
+    def _repair_result_with_reason_codes(reason_codes):
+        result = json.loads(json.dumps(genuine))
+        result["repair_action"]["reason_codes"] = reason_codes
+        return result
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    result_a, _ = _run_wrapper_preflight(
+        ISSUE_2013_BODY, 90700, dir_a,
+        invoke_repair=_repair_result_with_reason_codes(["deterministic_body_author_fix_available"]),
+    )
+
+    result_b, _ = _run_wrapper_preflight(
+        ISSUE_2013_BODY, 90701, dir_b,
+        invoke_repair=_repair_result_with_reason_codes(["a_completely_different_reason_code"]),
+    )
+
+    assert result_a["status"] == "needs_fix", result_a
+    assert result_b["status"] == "needs_fix", result_b
+    assert result_a["hashes"]["result_core_sha256"] != result_b["hashes"]["result_core_sha256"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2016 iteration-3 P1-3: a repair subprocess failure must dominate a
+# later planner failure (compound failure precedence).
+# ---------------------------------------------------------------------------
+
+
+def test_repair_failure_dominates_planner_invalid_input(tmp_path):
+    """P1-3: when the repair subprocess itself fails (invalid JSON / any
+    subprocess-level error) AND the planner separately fails with exit 2
+    (invalid input), the repair failure must dominate: STATUS:
+    environment_failure, not STATUS: blocked (which would silently drop the
+    repair failure)."""
+    fixture = {
+        "schema_version": "refinement_preflight_input/v1",
+        "issue_number": 90800,
+        "repo": "testowner/testrepo",
+        "now": "2026-01-01T00:00:00+00:00",
+        "issue": {"number": 90800, "title": "Test Issue", "body": CLEAN_BODY_NO_REPAIRS, "labels": []},
+        "comments": [],
+        "anchor_comment_urls": [],
+    }
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    repair_error_result = {
+        "schema": "repair_issue_contract/v1",
+        "changed": False,
+        "repairs": [],
+        "error": "repair_subprocess_invalid_json:Expecting value",
+    }
+
+    with (
+        mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(wrapper, "_invoke_repair", return_value=repair_error_result),
+        mock.patch.object(wrapper, "_invoke_planner", return_value=(None, 2, "planner: invalid input", "")),
+    ):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=90800,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[],
+            fixture_path=fixture_path,
+        )
+
+    assert result["status"] == "environment_failure", (
+        f"repair failure must dominate planner failure, got status={result['status']!r} "
+        f"blockers={result.get('blockers')!r}"
+    )
+    assert exit_code == wrapper.EXIT_ENVIRONMENT_FAILURE
+    assert wrapper.BLOCKER_REPAIR_ENVIRONMENT_FAILURE in result["blockers"]
+    # The canonical reason code for the repair failure must survive in the
+    # result, not just the generic BLOCKER_REPAIR_ENVIRONMENT_FAILURE code.
+    assert any("repair_invocation_error" in b for b in result["blockers"]), result["blockers"]
+    # The planner-side blocker must ALSO still be present (compound failure,
+    # neither is silently dropped).
+    assert wrapper.BLOCKER_PLANNER_INVALID_INPUT in result["blockers"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2016 iteration-3 P2-1: authentic Issue #2013 snapshot fixture,
+# hash-bound and run through a REAL planner subprocess (not a mock).
+# ---------------------------------------------------------------------------
+
+_ISSUE_2013_FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "issue_2013_snapshot.json"
+
+
+def test_issue_2013_snapshot_fixture_is_hash_bound():
+    """P2-1: the stored Issue #2013 fixture snapshot is immutable and
+    hash-bound -- its recorded body_sha256 metadata must match the actual
+    sha256 of the stored body, and its recorded expected repair kind must
+    match what repair_issue_contract.py actually classifies for that exact
+    body (proving the fixture is not a hand-waved minimal string
+    disconnected from a real captured snapshot)."""
+    import hashlib
+
+    fixture = json.loads(_ISSUE_2013_FIXTURE_PATH.read_text(encoding="utf-8"))
+    # P2-1 finding (flagged back to root/main -- see citation_discrepancy_note):
+    # Issue #2016's own contract cites this fixture as reproducing "Issue
+    # #2013", but the LIVE Issue #2013 in this repo is an unrelated research
+    # issue (SubAgent spawn observability). The actual matching originating
+    # specification is Issue #899. This assertion checks the fixture is
+    # internally consistent and honestly documents the discrepancy, rather
+    # than asserting the (incorrect) citation.
+    assert isinstance(fixture["source_issue_number"], int)
+    assert fixture["citation_discrepancy_note"], "fixture must document the #2013 vs #899 citation discrepancy"
+    assert "#899" in fixture["citation_discrepancy_note"]
+    assert "#2013" in fixture["citation_discrepancy_note"]
+    body = fixture["issue"]["body"]
+    actual_sha = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert actual_sha == fixture["captured_body_sha256"], (
+        f"fixture body has drifted from its recorded hash: {actual_sha} != {fixture['captured_body_sha256']}"
+    )
+
+    repair_result = ric.run_repair(body)
+    observed_kinds = sorted(repair_result["repair_action"]["repair_kinds"])
+    assert observed_kinds == sorted(fixture["expected_repair_kinds"]), (
+        f"observed {observed_kinds} != fixture-recorded {fixture['expected_repair_kinds']}"
+    )
+
+
+def test_issue_2013_fixture_runs_through_real_planner_subprocess(tmp_path):
+    """P2-1(3): run the Issue #2013 fixture end-to-end through the REAL
+    plan_refinement_loop.py subprocess (not MOCK_PLAN_PASS), proving the
+    needs_fix routing holds against actual planner semantics rather than a
+    mock that always passes."""
+    fixture_data = json.loads(_ISSUE_2013_FIXTURE_PATH.read_text(encoding="utf-8"))
+    body = fixture_data["issue"]["body"]
+
+    fixture = {
+        "schema_version": "refinement_preflight_input/v1",
+        "issue_number": 2013,
+        "repo": "testowner/testrepo",
+        "now": "2026-01-01T00:00:00+00:00",
+        "issue": {"number": 2013, "title": fixture_data["issue"]["title"], "body": body, "labels": []},
+        "comments": [],
+        "anchor_comment_urls": [],
+    }
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2013,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[],
+            fixture_path=fixture_path,
+        )
+
+    assert result["status"] == "needs_fix", result
+    assert result["next_action"] == "apply_deterministic_repair"
+    assert exit_code == wrapper.EXIT_NEEDS_FIX
+    assert result["repair_action"]["disposition"] == "auto_apply_safe"

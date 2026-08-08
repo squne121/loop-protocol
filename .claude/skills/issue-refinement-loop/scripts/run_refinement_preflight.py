@@ -1153,6 +1153,94 @@ def _ensure_scope_signal_delta_input(
     return merged
 
 
+def _validate_repair_result_schema_and_semantics(parsed: dict) -> Optional[str]:
+    """Issue #2016 iteration-3 OWNER adversarial review, P0-1: validate a
+    producer (`repair_issue_contract.py`) result against
+    `repair_issue_contract_result_v1.schema.json` AND recompute
+    `classify_repair_action()` from the raw `repairs[]` to cross-check the
+    producer's self-reported `repair_action`. Returns None when the payload
+    is fully valid (schema + cross-checks), else a fail-closed reason
+    string. Applies to BOTH dry-run and --apply invocations.
+
+    Fail-closed on:
+      - schema violation (including additionalProperties: false)
+      - missing/unknown `repair_action.schema_version` / `.policy_version`
+        (never defaulted/backfilled -- Issue #2016 iteration-3 P0-1(2))
+      - top-level SHA vs nested `repair_action` SHA mismatch (P0-1(4))
+      - `changed` boolean disagreeing with SHA identity
+      - `dry_run: true` with a non-null `candidate_body_artifact`
+      - malformed `line_start`/`line_end` ranges
+      - producer's self-reported `repair_action.disposition` /
+        `.repair_kinds` disagreeing with `classify_repair_action()`
+        recomputed from the raw `repairs[]` (P0-1(3))
+    """
+    schema = _load_schema("repair_issue_contract_result_v1.schema.json")
+    if schema is None:
+        return "repair_result_schema_unavailable"
+    valid, errors = _validate_with_schema(parsed, schema)
+    if not valid:
+        return f"repair_result_schema_invalid:{errors[0] if errors else 'unknown'}"
+
+    # anyOf(schema+error) payloads (CLI-level failure) have no repair_action
+    # to cross-check; the caller already treats a present `error` key as an
+    # environment_failure condition upstream of this validator.
+    if parsed.get("error"):
+        return None
+
+    repair_action = parsed.get("repair_action")
+    if not isinstance(repair_action, dict):
+        return "repair_result_missing_repair_action"
+
+    if repair_action.get("schema_version") != "repair_action/v1":
+        return f"repair_action_schema_version_missing_or_unknown:{repair_action.get('schema_version')!r}"
+    if repair_action.get("policy_version") != "deterministic-issue-repair/v1":
+        return f"repair_action_policy_version_missing_or_unknown:{repair_action.get('policy_version')!r}"
+
+    original_sha = parsed.get("original_body_sha256")
+    repaired_sha = parsed.get("repaired_body_sha256")
+
+    if repair_action.get("original_body_sha256") != original_sha:
+        return "repair_action_nested_original_sha_mismatch"
+    if repair_action.get("repaired_body_sha256") != repaired_sha:
+        return "repair_action_nested_repaired_sha_mismatch"
+
+    changed = parsed.get("changed")
+    if changed is False and original_sha != repaired_sha:
+        return "repair_changed_false_but_sha_mismatch"
+    if changed is True and original_sha == repaired_sha:
+        return "repair_changed_true_but_sha_identical"
+
+    dry_run = parsed.get("dry_run")
+    if dry_run is True and repair_action.get("candidate_body_artifact") is not None:
+        return "repair_dry_run_but_candidate_artifact_present"
+
+    repairs = parsed.get("repairs")
+    if not isinstance(repairs, list):
+        return "repair_repairs_field_not_a_list"
+
+    for record in repairs:
+        if not isinstance(record, dict):
+            continue
+        start = record.get("line_start")
+        end = record.get("line_end")
+        if isinstance(start, int) and isinstance(end, int):
+            if start < 1 or end < 1 or start > end:
+                return f"repair_record_invalid_line_range:{start}:{end}"
+
+    if classify_repair_action is None:
+        return "repair_action_classifier_unavailable"
+    recomputed = classify_repair_action(original_sha, repaired_sha, repairs)
+    if recomputed.get("disposition") != repair_action.get("disposition"):
+        return (
+            f"repair_action_disposition_mismatch:producer={repair_action.get('disposition')!r}"
+            f":recomputed={recomputed.get('disposition')!r}"
+        )
+    if sorted(recomputed.get("repair_kinds", [])) != sorted(repair_action.get("repair_kinds", []) or []):
+        return "repair_action_repair_kinds_mismatch"
+
+    return None
+
+
 def _run_repair_subprocess(argv_extra: list[str], body: str) -> tuple[Optional[dict], Optional[str]]:
     """
     Run repair_issue_contract.py as a subprocess with `argv_extra` appended
@@ -1210,6 +1298,15 @@ def _run_repair_subprocess(argv_extra: list[str], body: str) -> tuple[Optional[d
 
     if parsed.get("error"):
         return None, f"repair_subprocess_payload_error:{parsed.get('error')}"
+
+    # Issue #2016 iteration-3 P0-1: validate schema + cross-check
+    # classify_repair_action() BEFORE trusting the producer's self-reported
+    # repair_action. A schema violation or a disposition/repair_kinds
+    # mismatch is treated identically to a subprocess-level failure
+    # (fail-closed -> environment_failure upstream).
+    semantic_error = _validate_repair_result_schema_and_semantics(parsed)
+    if semantic_error is not None:
+        return None, f"repair_subprocess_semantic_validation_failed:{semantic_error}"
 
     return parsed, None
 
@@ -1427,6 +1524,27 @@ def _write_artifacts(
         "planner_input": str(planner_input_path),
         "refinement_preflight_result_v1": str(result_path),
     }
+    # Issue #2016 iteration-3 P1-1: needs_fix results additionally carry
+    # `repair_diagnostics` / `repair_candidate_body` in artifacts. These are
+    # written earlier in the flow (repair_diagnostics.json /
+    # repaired_issue_body.md), so this validates presence + the expected
+    # fixed on-disk path rather than re-writing them, and fails closed on
+    # any unrecognized extra key or path drift.
+    result_artifacts = result.get("artifacts")
+    allowed_extra_artifact_keys = {
+        "repair_diagnostics": artifact_dir / "repair_diagnostics.json",
+        "repair_candidate_body": artifact_dir / "repaired_issue_body.md",
+    }
+    if isinstance(result_artifacts, dict):
+        for key in set(result_artifacts.keys()) - set(artifacts.keys()):
+            expected_path = allowed_extra_artifact_keys.get(key)
+            if expected_path is None:
+                raise ValueError(f"final_result_artifact_projection_mismatch: unexpected_key {key}")
+            if result_artifacts.get(key) != str(expected_path):
+                raise ValueError(f"final_result_artifact_projection_mismatch: path_drift {key}")
+            if not expected_path.is_file():
+                raise ValueError(f"final_result_artifact_projection_missing_file: {key}")
+            artifacts[key] = result_artifacts[key]
     if result.get("artifacts") != artifacts:
         raise ValueError("final_result_artifact_projection_mismatch")
     schema_errors = _validate_result_artifact(result)
@@ -1502,7 +1620,7 @@ def _materialize_auto_apply_candidate(
     candidate_path = artifact_dir / "repaired_issue_body.md"
 
     parsed, error = _run_repair_subprocess(
-        ["--apply", "--out-file", str(candidate_path)], body
+        ["--apply", "--out-file", str(candidate_path), "--artifact-root", str(artifact_dir)], body
     )
     if error is not None:
         return None, f"repair_apply_{error}"
@@ -2712,6 +2830,25 @@ def run_preflight(
     # repair_result is included in the preflight output as repair_diagnostics (BLOCKER 1 fix).
     _repair_result = _invoke_repair(issue.get("body", "") or "")
 
+    # Issue #2016 iteration-3 P1-3 (OWNER adversarial review): a repair
+    # subprocess-level failure must dominate a *later* planner failure.
+    # Established precedence (see _apply_exit_code_mapping docstring):
+    #   environment_failure > blocked > needs_fix > warn > pass
+    # Evaluated here -- before the planner is invoked at all -- so a
+    # compound failure (repair subprocess broken AND planner exit 2) is
+    # recorded as environment_failure via BLOCKER_REPAIR_ENVIRONMENT_FAILURE
+    # (an env_blocker in _apply_exit_code_mapping) rather than surfacing
+    # only as a planner-only blocked/human_judgment_required result that
+    # silently drops the repair failure. The block below (after the planner
+    # invocation) re-derives the same reason for the non-early-return path
+    # and is a no-op here when this already fired.
+    _repair_invocation_error_early = (
+        _repair_result.get("error") if isinstance(_repair_result, dict) else "repair_result_not_object"
+    )
+    if _repair_invocation_error_early and BLOCKER_REPAIR_ENVIRONMENT_FAILURE not in blockers:
+        blockers.append(BLOCKER_REPAIR_ENVIRONMENT_FAILURE)
+        blockers.append(f"repair_invocation_error:{_repair_invocation_error_early}")
+
     # --- #1891 AC6: heavy mutation gate ---
     # Only evaluated when the caller (main thread / orchestrator) has stated
     # an intended mutation_category in known_context; this never fires for
@@ -3042,7 +3179,8 @@ def run_preflight(
         repair_environment_failure_reason = "repair_action_invalid_payload"
 
     if repair_environment_failure_reason is not None:
-        blockers.append(BLOCKER_REPAIR_ENVIRONMENT_FAILURE)
+        if BLOCKER_REPAIR_ENVIRONMENT_FAILURE not in blockers:
+            blockers.append(BLOCKER_REPAIR_ENVIRONMENT_FAILURE)
     elif (
         _repair_changed is True
         and isinstance(_repair_action_raw, dict)
@@ -3131,6 +3269,23 @@ def run_preflight(
     }
     if contract_update_handoff is not None:
         result_core_for_hash["contract_update"] = contract_update_handoff
+    # Issue #2016 iteration-3 P1-2 (OWNER adversarial review): result_core_sha256
+    # previously excluded repair_action.schema_version/.policy_version/.disposition/
+    # body SHAs/repair_kinds/reason_codes, so those machine-actionable fields could
+    # be silently altered without changing the result's integrity hash. Bind a
+    # stable, environment-independent projection of them here (explicitly
+    # excluding the absolute diagnostics_artifact/candidate_body_artifact paths,
+    # which are environment-dependent).
+    if isinstance(repair_action_projection, dict):
+        result_core_for_hash["repair_action_core"] = {
+            "schema_version": repair_action_projection.get("schema_version"),
+            "policy_version": repair_action_projection.get("policy_version"),
+            "disposition": repair_action_projection.get("disposition"),
+            "original_body_sha256": repair_action_projection.get("original_body_sha256"),
+            "repaired_body_sha256": repair_action_projection.get("repaired_body_sha256"),
+            "repair_kinds": sorted(repair_action_projection.get("repair_kinds", []) or []),
+            "reason_codes": sorted(repair_action_projection.get("reason_codes", []) or []),
+        }
     result_core_text = json.dumps(result_core_for_hash, sort_keys=True, ensure_ascii=False, allow_nan=False)
 
     hashes = {
@@ -3145,6 +3300,18 @@ def run_preflight(
         "planner_input": str(artifact_dir / "planner_input.json"),
         "refinement_preflight_result_v1": str(artifact_dir / "refinement_preflight_result_v1.json"),
     }
+    # Issue #2016 iteration-3 P1-1: AC6 requires repair diagnostics and the
+    # candidate body to be referenceable from ALL THREE of the result
+    # schema, the artifact map, and compact stdout. repair_action already
+    # carries diagnostics_artifact/candidate_body_artifact; this mirrors
+    # those same paths into the canonical artifacts map so consumers that
+    # only read `artifacts` (not the nested repair_action block) can still
+    # discover them.
+    if status == "needs_fix" and isinstance(repair_action_projection, dict):
+        if repair_action_projection.get("diagnostics_artifact"):
+            artifacts["repair_diagnostics"] = repair_action_projection["diagnostics_artifact"]
+        if repair_action_projection.get("candidate_body_artifact"):
+            artifacts["repair_candidate_body"] = repair_action_projection["candidate_body_artifact"]
     result = _build_result(
         status=status,
         issue_number=issue_number,

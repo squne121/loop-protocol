@@ -339,6 +339,14 @@
         "refinement_preflight_result_v1": {
           "type": "string",
           "description": "Path to refinement_preflight_result_v1.json"
+        },
+        "repair_diagnostics": {
+          "type": "string",
+          "description": "Path to repair_diagnostics.json (Issue #2016 iteration-3 P1-1; present when status: needs_fix)."
+        },
+        "repair_candidate_body": {
+          "type": "string",
+          "description": "Path to repaired_issue_body.md, the auto_apply_safe candidate body (Issue #2016 iteration-3 P1-1; present when status: needs_fix)."
         }
       }
     },
@@ -357,7 +365,7 @@
         },
         "result_core_sha256": {
           "type": "string",
-          "description": "SHA256 of canonical JSON of result core fields (excl. artifacts, hashes)."
+          "description": "SHA256 of canonical JSON of result core fields (excl. artifacts, hashes). When status: needs_fix, also binds a stable environment-independent projection of repair_action (schema_version, policy_version, disposition, original/repaired body SHA, repair_kinds, reason_codes -- excluding absolute artifact paths) under result_core.repair_action_core (Issue #2016 iteration-3 P1-2)."
         }
       }
     },
@@ -461,7 +469,8 @@
       },
       "then": {
         "required": [
-          "repair_action"
+          "repair_action",
+          "artifacts"
         ],
         "properties": {
           "repair_action": {
@@ -479,6 +488,21 @@
                 "type": "string"
               },
               "candidate_body_artifact": {
+                "type": "string"
+              }
+            }
+          },
+          "artifacts": {
+            "type": "object",
+            "required": [
+              "repair_diagnostics",
+              "repair_candidate_body"
+            ],
+            "properties": {
+              "repair_diagnostics": {
+                "type": "string"
+              },
+              "repair_candidate_body": {
                 "type": "string"
               }
             }
