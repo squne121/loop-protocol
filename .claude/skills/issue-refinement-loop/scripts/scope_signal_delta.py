@@ -691,6 +691,14 @@ _DIRECTIVE_SECTION_MARKERS = (
 )
 
 _BULLET_LINE_RE = re.compile(r"^\s*[-*]\s+\S.*$", re.MULTILINE)
+_CONCRETE_PERMISSION_DELTA_RE = re.compile(
+    r"(?:permission[ _-]?(?:delta|profile)|permissions?[ _-]?profile|権限(?:差分|プロファイル))"
+    r"\s*[:=]?\s*(?P<before>[^\n→]{1,120}?)\s*(?:->|→)\s*(?P<after>[^\n]{1,120})",
+    re.IGNORECASE,
+)
+_CONCRETE_REPOSITORY_PATH_RE = re.compile(
+    r"`(?P<path>(?!/)(?!.*(?:^|/)\.\.(?:/|$))[^`\s]+/[^`\s]+)`"
+)
 
 _ISSUE_COMMENT_URL_RE = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)"
@@ -1427,7 +1435,20 @@ def _permission_boundary_is_constrained_directive(evidence: dict, boundary_flags
     directives = evidence.get("extracted_directives") or []
     for directive in directives:
         candidate = _strip_quoted_fragments(str(directive))
-        if _contains_all_permission_constraints(candidate):
+        if not _contains_all_permission_constraints(candidate):
+            continue
+        # A stock claim of an "exact permission delta" is insufficient.
+        # The normalized directive must carry an actual before→after value
+        # and an exact repository-relative target path. The controlled
+        # transaction and fresh validators verify that the proposed delta is
+        # still current before any implementation route is considered.
+        delta = _CONCRETE_PERMISSION_DELTA_RE.search(candidate)
+        if (
+            delta is not None
+            and delta.group("before").strip()
+            and delta.group("after").strip()
+            and _CONCRETE_REPOSITORY_PATH_RE.search(str(directive))
+        ):
             return True
     return False
 

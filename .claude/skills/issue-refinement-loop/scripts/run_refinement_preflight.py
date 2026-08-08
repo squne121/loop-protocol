@@ -2701,6 +2701,8 @@ def run_preflight(
                 blockers=blockers,
                 stderr=planner_stderr or "",
                 repo_root=repo_root,
+                plan=None,
+                result_next_action="fix_environment",
             )
             write_provenance_artifact(repo_root, issue_number, _prov)
         except Exception:
@@ -3032,6 +3034,8 @@ def run_preflight(
             blockers=blockers,
             stderr=planner_stderr or "",
             repo_root=repo_root,
+            plan=plan,
+            result_next_action=result.get("next_action", "unavailable"),
         )
         write_provenance_artifact(repo_root, issue_number, _provenance)
     except Exception:
@@ -3261,6 +3265,8 @@ def build_provenance(
     blockers: list,
     stderr: str,
     repo_root: Path,
+    plan: Optional[dict] = None,
+    result_next_action: str = "unavailable",
 ) -> dict:
     """Generate REFINEMENT_PREFLIGHT_PROVENANCE_V1 sidecar artifact.
 
@@ -3278,6 +3284,45 @@ def build_provenance(
     planner_input_text = _canonical_json(planner_input)
     raw_snapshot_text = _canonical_json(raw_snapshot)
     stderr_str = stderr or ""
+    sidecar = (plan or {}).get("scope_signal_guard_decision_v2")
+    authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else {}
+    authority_route = authority.get("route") if isinstance(authority, dict) else {}
+    known_context = planner_input.get("known_context") if isinstance(planner_input, dict) else {}
+    evidence_list = (
+        known_context.get("scope_delta_authority_evidence")
+        if isinstance(known_context, dict)
+        else []
+    )
+    source_evidence = evidence_list[0] if isinstance(evidence_list, list) and evidence_list else {}
+    runtime_evidence = {
+        # The provenance sidecar is intentionally additive to the strict
+        # preflight-result schema. It binds runtime observations but cannot
+        # itself authorize implementation.
+        "tested_head_sha": _git_head_sha(repo_root),
+        "source": {
+            "comment_url": source_evidence.get("comment_url"),
+            "comment_id": source_evidence.get("comment_id"),
+            "body_sha256": source_evidence.get("body_sha256"),
+            "source_kind": source_evidence.get("source_kind"),
+        },
+        "route": {
+            "action": authority_route.get("action"),
+            "implementation_allowed": authority_route.get("implementation_allowed"),
+            "required_rerun": authority_route.get("next_step"),
+        },
+        "terminal_event": {
+            "wrapper_status": wrapper_status,
+            "next_action": result_next_action,
+            "implementation_allowed": authority_route.get("implementation_allowed"),
+        },
+        # The generic preflight cannot claim a #1952-specific profile check
+        # has passed. Consumers must execute that validator at the current
+        # head before implementation; until then this is an explicit deny.
+        "permission_profile_validators": {
+            "status": "required_before_implementation",
+            "passed": False,
+        },
+    }
 
     def _dependency_version(name: str) -> str:
         try:
@@ -3319,6 +3364,7 @@ def build_provenance(
         "raw_snapshot_sha256": _sha256(raw_snapshot_text),
         "stderr_sha256": _sha256(stderr_str),
         "stderr_excerpt": stderr_str[:500],
+        "runtime_evidence": runtime_evidence,
     }
 
 

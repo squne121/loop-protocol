@@ -136,7 +136,8 @@ def test_explicit_permission_delta_requires_contract_update_not_implementation()
             "role split であり 1 Issue = 1 PR のままにする。",
             "- contract update で current main から導出した exact Allowed Paths `docs/test.md` を採用し、"
             "required rerun を実行する。",
-            "- exact permission delta は human directive の目的に必要であり、least privilege で採用する。"
+            "- exact permission delta: read-only -> workspace-write for `.codex/agents/issue-creator.toml` は "
+            "human directive の目的に必要であり、least privilege で採用する。"
             "non-destructive、no secrets、no paid external service、no unrelated privilege widening を満たす。",
         ]
     )
@@ -147,6 +148,21 @@ def test_explicit_permission_delta_requires_contract_update_not_implementation()
     assert result["route"]["action"] == "contract_update_required"
     assert result["route"]["implementation_allowed"] is False
     assert result["route"]["next_step"] == "rerun_refinement_after_contract_update"
+
+
+def test_permission_delta_stock_phrase_without_concrete_before_after_path_escalates():
+    body = "\n".join(
+        [
+            "- exact permission delta は human directive の目的に必要であり、least privilege で採用する。"
+            "non-destructive、no secrets、no paid external service、no unrelated privilege widening を満たす。",
+            "- allowed paths `docs/test.md` を追加する。",
+        ]
+    )
+    result = _classify(_evidence(body))
+
+    assert result["boundary_flags"]["changes_permission_boundary"] is True
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "changes_permission_boundary"
 
 
 def test_permission_delta_without_human_directive_necessity_escalates():
@@ -333,7 +349,7 @@ def test_permission_exception_rechecks_vague_allowed_paths_boundary():
     assert result["boundary_flags"]["changes_permission_boundary"] is True
     assert result["boundary_flags"]["expands_allowed_paths"] is True
     assert result["route"]["action"] == "human_escalation"
-    assert result["route"]["reason_code"] == "expands_allowed_paths"
+    assert result["route"]["reason_code"] == "changes_permission_boundary"
 
 
 def test_direct_interactive_human_materialization_remains_distinct_from_generated_handoff():
@@ -548,7 +564,8 @@ $ true
         "anchor_comments": [
             {
                 **_payload(),
-                "body": _directive_body(materialized=True),
+                "body": _directive_body(materialized=True)
+                + "\n- allowed paths `docs/test.md` を追加する。",
                 "issue_url": f"https://api.github.com/repos/{REPO}/issues/{ISSUE}",
                 "created_at": "2026-08-08T00:00:00Z",
                 "updated_at": "2026-08-08T00:00:00Z",
@@ -572,6 +589,9 @@ $ true
         planner_input = json.loads(
             Path(result["artifacts"]["planner_input"]).read_text(encoding="utf-8")
         )
+        provenance = json.loads(
+            (artifact_dir / "refinement_preflight_provenance_v1.json").read_text(encoding="utf-8")
+        )
     finally:
         if artifact_dir.exists():
             shutil.rmtree(artifact_dir)
@@ -579,3 +599,21 @@ $ true
     authority = planner_input["known_context"]["scope_delta_authority_evidence"][0]
     assert authority["source_kind"] == "issue_comment"
     assert result["next_action"] != "implementation"
+    runtime_evidence = provenance["runtime_evidence"]
+    assert runtime_evidence["tested_head_sha"] == preflight._git_head_sha(SKILL_ROOT.parent.parent)
+    assert runtime_evidence["source"] == {
+        "comment_url": URL,
+        "comment_id": 5224799872,
+        "body_sha256": authority["body_sha256"],
+        "source_kind": "issue_comment",
+    }
+    assert runtime_evidence["route"] == {
+        "action": "contract_update_required",
+        "implementation_allowed": False,
+        "required_rerun": "rerun_refinement_after_contract_update",
+    }
+    assert runtime_evidence["terminal_event"]["implementation_allowed"] is False
+    assert runtime_evidence["permission_profile_validators"] == {
+        "status": "required_before_implementation",
+        "passed": False,
+    }
