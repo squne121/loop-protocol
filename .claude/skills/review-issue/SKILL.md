@@ -93,6 +93,12 @@ REVIEW_ISSUE_RESULT_V1:
 - `needs-fix` + `invoked_as_loop: true` の場合は `diff_proposal` だけ返し、本文更新を呼び出し元に委ねる
 - 人間の明示的承認なく本文を書き換えない
 
+## visual_impact フィールド（canonical schema owner）
+
+レビュー対象 Issue 本文が `visual_impact` 関連フィールド（`VISUAL_IMPACT_DECLARATION_V1` 等）に触れる場合、
+単一の canonical schema ファイル [`docs/dev/visual-impact.schema.json`](../../../docs/dev/visual-impact.schema.json)
+を参照する。本 SKILL.md では独自にキー集合・enum を再定義しない（Issue #2019 AC26）。
+
 ## Related（関連ファイル）
 
 - `.claude/skills/review-issue/scripts/check_issue_contract.py` — 決定論的判定エンジン（C1〜C12 の SSOT）

@@ -58,6 +58,17 @@ rg -l "<schema-id-or-key>" .
 - migration_or_followup: #N or `N/A`
 - reason:
 
+## Visual Impact Declaration
+
+> UI（DOM/CSS）変更を含む PR は `VISUAL_IMPACT_DECLARATION_V1` を1個のみ、fenced ```yaml block として記載してください（Issue #2019）。
+> UI 変更を含まない PR は該当ブロックを省略できます（`visual-impact-policy` job は対象 surface が無ければ何もしません）。
+> このブロックは untrusted な自己申告として扱われ、CI が独立に生成する `VISUAL_IMPACT_DECISION_V1` のみが merge-ready 判定の正本です。
+
+```yaml
+schema: VISUAL_IMPACT_DECLARATION_V1
+surfaces: []
+```
+
 ## Safety Claim Matrix
 
 > このセクションは安全境界・権限・サンドボックス・transport・auth・MCP・native tools・approvalMode・runtime verification・workflow gate に触れる PR で必須です。

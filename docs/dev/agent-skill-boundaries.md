@@ -155,6 +155,16 @@ SubAgent（役割）── Skill（作業手順）
 共通参照: [`create-issue/references/body-authoring.md`](../../.claude/skills/create-issue/references/body-authoring.md)
 （VC 作成ガイダンス・Anchor Verification・Machine-Readable Contract block guidance 等。`edit-issue` / `issue-creator` / `issue-editor` も参照する）
 
+### visual_impact schema owner（Issue #2019）
+
+`create-issue` / `edit-issue` / `issue-contract-review` / `review-issue` の4スキルが扱う `visual_impact`
+関連フィールド（`VISUAL_IMPACT_DECLARATION_V1` / `VISUAL_IMPACT_DECISION_V1`）の canonical schema owner は
+単一ファイル [`docs/dev/visual-impact.schema.json`](../visual-impact.schema.json) である。4スキルはこの
+ファイルへの参照として同一フィールドを共有し、SKILL.md 側で重複定義しない。visual surface の registry
+（producers/contracts/policy）の canonical SSOT は [`docs/dev/visual-surfaces.yml`](../visual-surfaces.yml)
+（[`docs/dev/visual-surfaces.schema.json`](../visual-surfaces.schema.json) で検証）であり、
+`docs/dev/visual-baseline-registry.md` はその generated projection として扱う。
+
 ## 実装系
 
 | SubAgent | 役割 | 使う Skill |

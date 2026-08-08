@@ -59,6 +59,9 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     ("ci", "agy-causal-claim-drift-gate"): "required",
     # ci-verdict-summary aggregator (evidence producer)
     ("ci", "ci-verdict-summary"): "evidence",
+    # Issue #2019: visual-impact-policy is a required CI check enforcing
+    # VRT disposition on UI-changing PRs.
+    ("ci", "visual-impact-policy"): "required",
     # Issue #1389: component-vrt-report is a non-required, report-only CI job
     # (Vitest Browser Mode component VRT). Without an explicit entry it falls
     # through to "unknown" -> determine_check_verdict() would treat it as
@@ -91,6 +94,9 @@ REQUIRED_CHECKS: set[tuple[str, str]] = {
     ("ci", "node-backed-hook-tests"),
     ("ci", "actionlint"),
     ("ci", "agy-causal-claim-drift-gate"),
+    # Issue #2019 AC19: visual-impact-policy must be present with
+    # conclusion=success for merge-ready.
+    ("ci", "visual-impact-policy"),
 }
 
 OVERALL_STATUS_ENUM = [
@@ -548,6 +554,13 @@ def filter_check_runs_by_workflow_run(
     return matched
 
 
+# Issue #2019 In Scope F: verify the GitHub Actions App source, not merely
+# the check name/head_sha. A CheckRun row created by any other GitHub App
+# (or a user token) must never be accepted as evidence, even if its name
+# matches a required check exactly (spoofed-name defense).
+TRUSTED_CHECK_RUN_APP_SLUGS: frozenset[str] = frozenset({"github-actions"})
+
+
 def check_runs_api_to_raw_checks(
     payload: Any,
     *,
@@ -560,6 +573,11 @@ def check_runs_api_to_raw_checks(
     used to produce merge-ready evidence. The REST endpoint is commit-scoped;
     each retained row is additionally bound to this Actions run via its URL
     (see ``filter_check_runs_by_workflow_run``).
+
+    Rows whose ``app.slug`` is not in ``TRUSTED_CHECK_RUN_APP_SLUGS`` (Issue
+    #2019 In Scope F: wrong GitHub App source) are silently dropped -- they
+    never count as evidence for the check name they claim, which for a
+    required check surfaces as missing evidence (blocking) downstream.
     """
     matched = filter_check_runs_by_workflow_run(payload, workflow_run_id=workflow_run_id)
 
@@ -580,6 +598,9 @@ def check_runs_api_to_raw_checks(
         # This job creates its own CheckRun while generating the artifact;
         # it is not an upstream input and would necessarily be in progress.
         if name == "ci-verdict-summary":
+            continue
+        app_slug = (row.get("app") or {}).get("slug")
+        if app_slug not in TRUSTED_CHECK_RUN_APP_SLUGS:
             continue
         raw_checks.append(
             {

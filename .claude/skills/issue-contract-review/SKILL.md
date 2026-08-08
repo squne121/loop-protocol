@@ -219,6 +219,12 @@ GitHub milestone metadata（`description` 等）の forbidden phrase の有無�
 - `references/ac-verifiability.md`: AC/VC 検証可能性の詳細。
 - `references/output-schema.md`: `CONTRACT_REVIEW_RESULT_V1` フィールド定義。
 
+## visual_impact フィールド（canonical schema owner）
+
+対象 Issue 本文が `visual_impact` 関連フィールド（`VISUAL_IMPACT_DECLARATION_V1` 等）に触れる場合、
+単一の canonical schema ファイル [`docs/dev/visual-impact.schema.json`](../../../docs/dev/visual-impact.schema.json)
+を参照する。本 SKILL.md では独自にキー集合・enum を再定義しない（Issue #2019 AC26）。
+
 ## Related（関連ファイル）
 
 以下を参照する:

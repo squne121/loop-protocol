@@ -13,6 +13,23 @@
 - #359 — 本 hardening Issue
 - #360 — SubAgent 側 PreToolUse push destination guard hook (OPEN, 補完策)
 
+## 既知の drift（Issue #2019 で確認・記録のみ）
+
+2026-08-08 時点の live 確認で、本書の記述（5 required checks: `typecheck`/`lint`/`test`/`build`/
+`python-test`）と実際の設定に以下の drift があることが判明した。本 Issue はこの drift を
+**記述の更新のみ**で解消する（live API mutation は行わない。ruleset/branch protection の実 API
+mutation は別途 post-merge ops step で扱う）。
+
+- **Classic branch protection**（`/branches/main/protection`）の `required_status_checks.contexts` は
+  実際には **6 件**（`typecheck`/`lint`/`test`/`build`/`python-test`/`validate-generated-artifact`）で、
+  本書の記述（5 件、`validate-generated-artifact` 欠落）と乖離している。
+- **Ruleset**（id `16796903`）の `required_status_checks` は本書の記述通り **5 件**
+  （`validate-generated-artifact` を含まない）であり、両層間でも drift がある。
+- `visual-impact-policy`（本 Issue で追加した新規 required check）は、両層のどちらにもまだ
+  registered されていない。required 化・GitHub Actions source pin・`require_code_owner_reviews`
+  有効化は、本 Issue の実装 PR には含めず、マージ後の明示 ops step として別途実行する
+  （Issue #2019 In Scope G）。
+
 ## 採用構成（多層防御）
 
 GitHub Ruleset を一次保護とし、Branch protection rule を二次保護として併用する。両者の rule は集約され、より厳しい方が適用される（[About rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets)）。

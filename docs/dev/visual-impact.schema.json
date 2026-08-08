@@ -1,0 +1,156 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://loop-protocol.internal/schemas/visual-impact.schema.json",
+  "title": "VISUAL_IMPACT canonical schema (Issue #2019)",
+  "description": "VISUAL_IMPACT_DECLARATION_V1（untrusted, PR body 由来の自己申告）と VISUAL_IMPACT_DECISION_V1（trusted, CI が独立生成）の単一 canonical schema。create-issue / edit-issue / issue-contract-review / review-issue の4スキルはこのファイルへの参照として同一 visual_impact フィールドを共有し、各 SKILL.md で重複定義しない。",
+  "$defs": {
+    "surface_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "docs/dev/visual-surfaces.yml の surfaces キー（例: combat-hud-running）。"
+    },
+    "disposition": {
+      "type": "string",
+      "enum": ["verified_unchanged", "baseline_changed", "waived"]
+    },
+    "waiver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "tracking_issue", "expiry"],
+      "properties": {
+        "reason": { "type": "string", "minLength": 1 },
+        "tracking_issue": {
+          "type": "string",
+          "pattern": "^#[0-9]+$"
+        },
+        "expiry": {
+          "type": "string",
+          "format": "date"
+        }
+      }
+    },
+    "declaration_surface_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surface_id", "disposition"],
+      "properties": {
+        "surface_id": { "$ref": "#/$defs/surface_id" },
+        "disposition": { "$ref": "#/$defs/disposition" },
+        "waiver": { "$ref": "#/$defs/waiver" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "disposition": { "const": "waived" } },
+            "required": ["disposition"]
+          },
+          "then": { "required": ["waiver"] }
+        }
+      ]
+    },
+    "VISUAL_IMPACT_DECLARATION_V1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "surfaces"],
+      "properties": {
+        "schema": { "const": "VISUAL_IMPACT_DECLARATION_V1" },
+        "surfaces": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/declaration_surface_entry" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "changed_path_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "path"],
+      "properties": {
+        "status": { "type": "string", "enum": ["added", "modified", "removed", "renamed"] },
+        "path": { "type": "string", "minLength": 1 },
+        "old_path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "baseline_unchanged": { "type": "boolean" },
+        "canonical_verify_success": { "type": "boolean" },
+        "evidence_manifest_digest": { "type": "string", "minLength": 1 },
+        "expected_actual_diff_available": { "type": "boolean" },
+        "authorized_owner": { "type": "string", "minLength": 1 }
+      }
+    },
+    "decision_surface_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surface_id", "contract_id", "disposition", "evidence"],
+      "properties": {
+        "surface_id": { "$ref": "#/$defs/surface_id" },
+        "contract_id": { "type": "string", "minLength": 1 },
+        "disposition": { "$ref": "#/$defs/disposition" },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      }
+    },
+    "VISUAL_IMPACT_DECISION_V1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "repository",
+        "pull_request_number",
+        "base_sha",
+        "head_sha",
+        "base_registry_blob_sha",
+        "head_registry_blob_sha",
+        "pr_body_sha256",
+        "changed_paths_digest",
+        "resolver_version",
+        "policy_version",
+        "affected_surfaces",
+        "component_vrt_report_check_run_id",
+        "github_actions_app_identity",
+        "artifact_id",
+        "artifact_digest"
+      ],
+      "properties": {
+        "schema": { "const": "VISUAL_IMPACT_DECISION_V1" },
+        "repository": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
+        "pull_request_number": { "type": "integer", "minimum": 1 },
+        "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "head_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "base_registry_blob_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "head_registry_blob_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "pr_body_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "changed_paths_digest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["algorithm", "digest", "entries"],
+          "properties": {
+            "algorithm": { "const": "sha256" },
+            "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "entries": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/changed_path_entry" }
+            }
+          }
+        },
+        "resolver_version": { "type": "string", "minLength": 1 },
+        "policy_version": { "type": "string", "minLength": 1 },
+        "affected_surfaces": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/decision_surface_entry" }
+        },
+        "component_vrt_report_check_run_id": { "type": ["string", "null"] },
+        "github_actions_app_identity": { "type": "string", "minLength": 1 },
+        "artifact_id": { "type": ["string", "null"] },
+        "artifact_digest": { "type": ["string", "null"] }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/VISUAL_IMPACT_DECLARATION_V1" },
+    { "$ref": "#/$defs/VISUAL_IMPACT_DECISION_V1" }
+  ]
+}

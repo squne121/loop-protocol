@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   workflow_dispatch:
     inputs:
       python_test_bench:
@@ -1252,6 +1253,11 @@ jobs:
     container:
       image: mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948
       options: --ipc=host
+    # Issue #2019 AC18: job outputs exposing the evidence manifest artifact
+    # id/digest for the `visual-impact-policy` job (`needs`d below).
+    outputs:
+      vrt_evidence_artifact_id: ${{ steps.vrt-evidence-artifact-digest.outputs.artifact_id }}
+      vrt_evidence_artifact_digest: ${{ steps.vrt-evidence-artifact-digest.outputs.artifact_digest }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1554,6 +1560,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload VISUAL_BASELINE_REVIEW_EVIDENCE_V1 manifest
+        id: upload-evidence-manifest
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
@@ -1562,6 +1569,21 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       # --- end runtime evidence ---------------------------------------------
+      # Issue #2019 AC18: expose the evidence manifest artifact id/digest as
+      # a job output (not merely the artifact filename) so
+      # `visual-impact-policy` can bind VISUAL_IMPACT_DECISION_V1 to the
+      # exact artifact this run produced.
+      - name: Emit vrt_evidence_artifact_digest job output
+        id: vrt-evidence-artifact-digest
+        if: ${{ always() }}
+        env:
+          VRT_EVIDENCE_ARTIFACT_ID: ${{ steps.upload-evidence-manifest.outputs.artifact-id || '' }}
+          VRT_EVIDENCE_ARTIFACT_DIGEST: ${{ steps.upload-evidence-manifest.outputs.artifact-digest || '' }}
+        run: |
+          echo "artifact_id=${VRT_EVIDENCE_ARTIFACT_ID}" >> "$GITHUB_OUTPUT"
+          echo "artifact_digest=${VRT_EVIDENCE_ARTIFACT_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "vrt_evidence_artifact_digest=${VRT_EVIDENCE_ARTIFACT_DIGEST}"
+
       - name: Summarize component VRT evidence
         if: ${{ always() }}
         env:
@@ -1620,6 +1642,137 @@ jobs:
             echo "- fixture outcome: $(classify_outcome "${NEGATIVE_CONTROL_OUTCOME}") (expected: failure — the fixture is a deliberate, controlled mismatch)"
             echo "- round-trip verification: $(classify_outcome "${NEGATIVE_CONTROL_PROOF_OUTCOME}") (proves the uploaded artifact ZIP actually contains *-actual-*.png / *-diff-*.png)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  visual-impact-policy:
+    # Issue #2019: required CI check enforcing VRT disposition on
+    # UI-changing PRs (In Scope B/C/F). `needs: [component-vrt-report]` +
+    # `if: always()` ensure this job evaluates component-vrt-report's
+    # conclusion/artifact even when that job itself fails or is cancelled
+    # (component-vrt-report success alone must never gate whether this job
+    # runs).
+    needs: [component-vrt-report]
+    if: always()
+    runs-on: ubuntu-latest
+    # Issue #2019 AC21: minimal read-only permissions for the APIs used
+    # below (CheckRun lookup, artifact download, PR metadata). No write
+    # permission is ever granted to this job.
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/setup-node-pnpm
+      - uses: ./.github/actions/setup-python-uv
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Resolve base/head SHAs and registry blob SHAs
+        id: shas
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          if [ -n "${BASE_SHA}" ] && git cat-file -e "${BASE_SHA}" 2>/dev/null; then
+            echo "base_sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+            BASE_REGISTRY_BLOB_SHA="$(git rev-parse "${BASE_SHA}:docs/dev/visual-surfaces.yml" 2>/dev/null || echo '0000000000000000000000000000000000000000')"
+          else
+            # push / workflow_dispatch (no PR base) -- diff against HEAD
+            # itself, which yields an empty changed-path set (no-op run).
+            echo "base_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            BASE_REGISTRY_BLOB_SHA="0000000000000000000000000000000000000000"
+          fi
+          HEAD_REGISTRY_BLOB_SHA="$(git rev-parse HEAD:docs/dev/visual-surfaces.yml 2>/dev/null || echo '0000000000000000000000000000000000000000')"
+          echo "base_registry_blob_sha=${BASE_REGISTRY_BLOB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "head_registry_blob_sha=${HEAD_REGISTRY_BLOB_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Compute changed paths
+        id: changed-paths
+        env:
+          BASE_SHA: ${{ steps.shas.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
+        run: |
+          if git cat-file -e "${BASE_SHA}" 2>/dev/null; then
+            git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" > changed_paths.txt
+          else
+            : > changed_paths.txt
+          fi
+          cat changed_paths.txt
+      - name: Write PR body to file (untrusted input -- never shell-expanded)
+        env:
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+        run: printf '%s' "$PR_BODY" > pr_body.md
+      - name: Write trusted base-branch CODEOWNERS
+        env:
+          BASE_SHA: ${{ steps.shas.outputs.base_sha }}
+        run: |
+          git show "${BASE_SHA}:.github/CODEOWNERS" > base_codeowners.txt 2>/dev/null || : > base_codeowners.txt
+      - name: Download component-vrt-evidence-manifest artifact (same run)
+        id: download-evidence-manifest
+        if: ${{ needs.component-vrt-report.outputs.vrt_evidence_artifact_id != '' }}
+        uses: actions/download-artifact@v6
+        with:
+          name: component-vrt-evidence-manifest
+          path: evidence-manifest-download
+      - name: Resolve component-vrt-report CheckRun id for current head
+        id: component-vrt-check-run
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" > check_runs.json || echo '{"check_runs":[]}' > check_runs.json
+          CHECK_RUN_ID="$(python3 -c "import json;d=json.load(open('check_runs.json'));runs=[c for c in d.get('check_runs',[]) if c.get('name')=='component-vrt-report'];print(runs[0]['id'] if runs else '')")"
+          echo "check_run_id=${CHECK_RUN_ID}" >> "$GITHUB_OUTPUT"
+      - name: Run visual-impact-policy check
+        id: policy-check
+        env:
+          HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
+          BASE_SHA: ${{ steps.shas.outputs.base_sha }}
+          BASE_REGISTRY_BLOB_SHA: ${{ steps.shas.outputs.base_registry_blob_sha }}
+          HEAD_REGISTRY_BLOB_SHA: ${{ steps.shas.outputs.head_registry_blob_sha }}
+          PR_ACTOR: ${{ github.event.pull_request.user.login || '' }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          # Issue #2019 AC18: the evidence manifest artifact id/digest come
+          # from component-vrt-report's job output (not the artifact
+          # filename) -- see that job's `outputs:` block above.
+          VRT_ARTIFACT_ID: ${{ needs.component-vrt-report.outputs.vrt_evidence_artifact_id || '' }}
+          VRT_ARTIFACT_DIGEST: ${{ needs.component-vrt-report.outputs.vrt_evidence_artifact_digest || '' }}
+          COMPONENT_VRT_CHECK_RUN_ID: ${{ steps.component-vrt-check-run.outputs.check_run_id || '' }}
+        run: |
+          set +o pipefail
+          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+            --mode policy-check \
+            --changed-paths-file changed_paths.txt \
+            --pr-body-file pr_body.md \
+            --evidence-manifest-file evidence-manifest-download/visual_baseline_review_evidence_v1.json \
+            --codeowners-file base_codeowners.txt \
+            --actor "${PR_ACTOR}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --pr-number "${PR_NUMBER}" \
+            --base-sha "${BASE_SHA}" \
+            --head-sha "${HEAD_SHA}" \
+            --base-registry-blob-sha "${BASE_REGISTRY_BLOB_SHA}" \
+            --head-registry-blob-sha "${HEAD_REGISTRY_BLOB_SHA}" \
+            --component-vrt-check-run-id "${COMPONENT_VRT_CHECK_RUN_ID}" \
+            --github-actions-app-identity "github-actions[bot]" \
+            --artifact-id "${VRT_ARTIFACT_ID}" \
+            --artifact-digest "${VRT_ARTIFACT_DIGEST}" \
+            --decision-output visual_impact_decision_v1.json \
+            | tee policy_check_output.json
+      - name: Upload VISUAL_IMPACT_DECISION_V1 artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: visual-impact-decision-v1
+          path: visual_impact_decision_v1.json
+          if-no-files-found: warn
+          retention-days: 30
 
   python-test-core:
     runs-on: ubuntu-latest
@@ -2832,7 +2985,7 @@ jobs:
   ci-verdict-summary:
     runs-on: ubuntu-latest
     if: ${{ !cancelled() && github.event.inputs.python_test_bench != 'true' }}
-    needs: [typecheck, lint, test, build, e2e, python-test-core, codex-execpolicy, python-test, node-backed-hook-tests, actionlint, agy-causal-claim-drift-gate]
+    needs: [typecheck, lint, test, build, e2e, python-test-core, codex-execpolicy, python-test, node-backed-hook-tests, actionlint, agy-causal-claim-drift-gate, visual-impact-policy]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
