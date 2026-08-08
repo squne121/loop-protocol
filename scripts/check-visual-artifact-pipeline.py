@@ -586,6 +586,118 @@ def resolve_capture_directory(test_dir: str, snapshot_path_template: str, spec_f
     return directory
 
 
+# ---------------------------------------------------------------------------
+# Per-capture viewport / deviceScaleFactor override support (Issue #1958 AC8,
+# owner decision #2). `playwright.config.ts` declares exactly one run-wide
+# default viewport/project, but individual capture call sites can be scoped
+# under a `test.describe(..., () => { test.use({ viewport: {...} }); ... })`
+# block that overrides it for every capture textually inside that block
+# (Playwright's own `test.use()` semantics). The run-wide default from
+# `parse_playwright_snapshot_config()` remains the correct fingerprint for
+# any capture NOT inside such a block — this is a targeted, scope-aware
+# extension, not a suite-level fingerprint replacement (PR #1813 review fix,
+# P1 Blocker 2's "no suite-level fingerprint" constraint still holds: each
+# capture's viewport/deviceScaleFactor is independently re-derived from its
+# own position in the spec source, not copied from a single shared value).
+# ---------------------------------------------------------------------------
+
+_DESCRIBE_CALL_RE = re.compile(r"\btest\.describe\(")
+_TEST_USE_CALL_RE = re.compile(r"\btest\.use\(")
+
+
+def _find_describe_scopes(masked_text: str) -> list[tuple[int, int]]:
+    """Return [(body_start, body_end)] for every `test.describe(..., () =>
+    { ... })` arrow-function body in the file (interior, excluding the
+    braces themselves), using the same balanced-brace/paren scanners as the
+    rest of this module so a brace/paren inside a string/comment cannot
+    desynchronise scope boundaries."""
+    scopes: list[tuple[int, int]] = []
+    for m in _DESCRIBE_CALL_RE.finditer(masked_text):
+        try:
+            call_end = _find_balanced_call(masked_text, m.end() - 1)
+        except ValueError:
+            continue
+        segment = masked_text[m.end() : call_end]
+        arrow_match = re.search(r"=>\s*\{", segment)
+        if not arrow_match:
+            continue
+        brace_open = m.end() + arrow_match.end() - 1
+        try:
+            brace_close = _find_balanced_brace(masked_text, brace_open)
+        except ValueError:
+            continue
+        scopes.append((brace_open + 1, brace_close - 1))
+    return scopes
+
+
+def _find_test_use_overrides(masked_text: str, original_text: str) -> list[dict]:
+    """Return every `test.use({ ... })` call site's position and any
+    `viewport` / `deviceScaleFactor` it declares, in file order."""
+    overrides: list[dict] = []
+    for m in _TEST_USE_CALL_RE.finditer(masked_text):
+        open_idx = m.end() - 1
+        try:
+            call_end = _find_balanced_call(masked_text, open_idx)
+        except ValueError:
+            continue
+        inner = original_text[open_idx + 1 : call_end - 1]
+        vp_m = re.search(r"viewport:\s*\{\s*width:\s*(\d+)\s*,\s*height:\s*(\d+)\s*\}", inner)
+        dsf_m = re.search(r"deviceScaleFactor:\s*(\d+(?:\.\d+)?)", inner)
+        overrides.append(
+            {
+                "position": m.start(),
+                "viewport": f"{vp_m.group(1)}x{vp_m.group(2)}" if vp_m else None,
+                "device_scale_factor": float(dsf_m.group(1)) if dsf_m else None,
+            }
+        )
+    return overrides
+
+
+def _resolve_viewport_context(
+    scopes: list[tuple[int, int]],
+    overrides: list[dict],
+    capture_pos: int,
+    default_viewport: object,
+    default_device_scale_factor: object,
+) -> tuple[object, object]:
+    """Resolve the effective viewport/deviceScaleFactor for a capture call
+    site at `capture_pos`, by finding its innermost enclosing
+    `test.describe()` scope and applying any `test.use()` override declared
+    directly in that scope (not a sibling/nested scope) before `capture_pos`.
+    Falls back to the run-wide `playwright.config.ts` default when no
+    enclosing scope declares an override."""
+    containing = [s for s in scopes if s[0] <= capture_pos < s[1]]
+    if containing:
+        containing.sort(key=lambda s: s[1] - s[0])
+        scope_start, scope_end = containing[0]
+    else:
+        scope_start, scope_end = 0, capture_pos + 1
+
+    # Overrides that live in a strictly-nested CHILD scope of the chosen
+    # scope must not leak into it (sibling `test.describe()` blocks, e.g.
+    # the AC8 boundary-cell loop's four independent describe blocks).
+    child_scopes = [
+        s for s in scopes if scope_start < s[0] and s[1] <= scope_end and s != (scope_start, scope_end)
+    ]
+
+    def _in_child_scope(pos: int) -> bool:
+        return any(cs <= pos < ce for cs, ce in child_scopes)
+
+    viewport = default_viewport
+    device_scale_factor = default_device_scale_factor
+    for override in overrides:
+        pos = override["position"]
+        if not (scope_start <= pos < capture_pos):
+            continue
+        if _in_child_scope(pos):
+            continue
+        if override["viewport"] is not None:
+            viewport = override["viewport"]
+        if override["device_scale_factor"] is not None:
+            device_scale_factor = override["device_scale_factor"]
+    return viewport, device_scale_factor
+
+
 def extract_derived_active_captures(
     e2e_dir: Path,
     pw_snapshot_config: dict[str, object],
@@ -617,11 +729,14 @@ def extract_derived_active_captures(
     if not e2e_dir.is_dir():
         return captures, [f"e2e spec directory not found: {e2e_dir}"]
 
+    # `viewport` / `device_scale_factor` are deliberately NOT in this dict
+    # (Issue #1958 AC8): they are resolved per capture call site below via
+    # `_resolve_viewport_context()`, since a `test.describe()` scope's
+    # `test.use({ viewport: {...} })` can override the run-wide
+    # `playwright.config.ts` default for captures textually inside it.
     common_fields = {
         "browser": browser,
         "project": project,
-        "viewport": viewport,
-        "device_scale_factor": device_scale_factor,
         "artifact_scope": REQUIRED_ARTIFACT_SCOPE,
         "digest_env": REQUIRED_DIGEST_ENV,
         "retention_days": REQUIRED_RETENTION_DAYS,
@@ -640,6 +755,8 @@ def extract_derived_active_captures(
         text = spec_path.read_text(encoding="utf-8")
         masked = _mask_ts_noise(text)
         spec_filename = spec_path.name
+        describe_scopes = _find_describe_scopes(masked)
+        use_overrides = _find_test_use_overrides(masked, text)
 
         # 1. Registry-helper call sites (expectDomOverlayScreenshot / expectCanvasVisualCueScreenshot).
         for helper_name in REGISTRY_HELPER_CALLS:
@@ -675,6 +792,9 @@ def extract_derived_active_captures(
                 for e in cmp_errors:
                     errors.append(f"{spec_path}::{screenshot_name}: {e}")
                 path_template_override = _parse_path_template_override(options_blob)
+                capture_viewport, capture_dsf = _resolve_viewport_context(
+                    describe_scopes, use_overrides, m.start(), viewport, device_scale_factor
+                )
                 captures.append(
                     {
                         "capture_id": f"{spec_filename}::{screenshot_name}",
@@ -689,6 +809,8 @@ def extract_derived_active_captures(
                         "comparator_value": comparator_value,
                         # Both helpers apply the shared freeze CSS via stylePath.
                         "style_path": True,
+                        "viewport": capture_viewport,
+                        "device_scale_factor": capture_dsf,
                         **common_fields,
                     }
                 )
@@ -737,6 +859,9 @@ def extract_derived_active_captures(
                 errors.append(f"{spec_path}::{screenshot_name}: {e}")
             path_template_override = _parse_path_template_override(options_blob)
             registry_id = registry_filename_to_id.get(screenshot_name)
+            capture_viewport, capture_dsf = _resolve_viewport_context(
+                describe_scopes, use_overrides, m.start(), viewport, device_scale_factor
+            )
             captures.append(
                 {
                     "capture_id": f"{spec_filename}::{screenshot_name}",
@@ -748,6 +873,8 @@ def extract_derived_active_captures(
                     "comparator_kind": comparator_kind,
                     "comparator_value": comparator_value,
                     "style_path": "stylePath" in options_blob,
+                    "viewport": capture_viewport,
+                    "device_scale_factor": capture_dsf,
                     **common_fields,
                 }
             )

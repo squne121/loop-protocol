@@ -566,6 +566,14 @@ jobs:
         shell: bash
     env:
       PLAYWRIGHT_VERSION: "1.60.0"
+      # Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 4): the
+      # real PR head SHA for pull_request events (never the synthetic
+      # "Merge <head> into <base>" ref that process.env.GITHUB_SHA resolves
+      # to on pull_request events); falls back to github.sha for push events
+      # (the actual pushed commit -- no synthetic-merge issue there).
+      # tests/e2e/visual-utils.ts's resolveExpectedHeadSha() requires this to
+      # be a valid 40-hex commit SHA and throws otherwise.
+      EXPECTED_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     container:
       image: mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948
       options: --ipc=host
@@ -1007,7 +1015,87 @@ jobs:
                   "digest_env": "TEST_RESULTS_DIGEST",
                   "retention_days": 30,
               },
-         
+              # Issue #1958 AC8 (owner decision #2): representative
+              # boundary-cell VRT baselines. Each `test.describe()` block in
+              # tests/e2e/visual-overlay.spec.ts overrides the run-wide
+              # playwright.config.ts default viewport (and, for the
+              # 1437x1365 cell, deviceScaleFactor) via `test.use()` --
+              # scripts/check-visual-artifact-pipeline.py's
+              # `_resolve_viewport_context()` re-derives these per-capture
+              # (not from the single run-wide config default) and
+              # cross-validates every field below against that derivation.
+              {
+                  "capture_id": "visual-overlay.spec.ts::vrt-running-hud-overlay-1366x768.png",
+                  "spec_file": "tests/e2e/visual-overlay.spec.ts",
+                  "screenshot_name": "vrt-running-hud-overlay-1366x768.png",
+                  "registry_id": "running-hud-overlay-legacy-current-1366x768",
+                  "directory": "tests/e2e/__screenshots__/visual-overlay.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1366x768",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "100",
+                  "style_path": True,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  "capture_id": "visual-overlay.spec.ts::vrt-running-hud-overlay-1920x1080.png",
+                  "spec_file": "tests/e2e/visual-overlay.spec.ts",
+                  "screenshot_name": "vrt-running-hud-overlay-1920x1080.png",
+                  "registry_id": "running-hud-overlay-legacy-current-1920x1080",
+                  "directory": "tests/e2e/__screenshots__/visual-overlay.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1920x1080",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "100",
+                  "style_path": True,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  # Low-DPR owner-playtest boundary. deviceScaleFactor 0.667
+                  # (not the Desktop Chrome default 1) via test.use().
+                  "capture_id": "visual-overlay.spec.ts::vrt-running-hud-overlay-1437x1365-dpr0667.png",
+                  "spec_file": "tests/e2e/visual-overlay.spec.ts",
+                  "screenshot_name": "vrt-running-hud-overlay-1437x1365-dpr0667.png",
+                  "registry_id": "running-hud-overlay-legacy-current-1437x1365-dpr0667",
+                  "directory": "tests/e2e/__screenshots__/visual-overlay.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "1437x1365",
+                  "device_scale_factor": 0.667,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "100",
+                  "style_path": True,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+              {
+                  # Minimum supported viewport boundary.
+                  "capture_id": "visual-overlay.spec.ts::vrt-running-hud-overlay-375x667.png",
+                  "spec_file": "tests/e2e/visual-overlay.spec.ts",
+                  "screenshot_name": "vrt-running-hud-overlay-375x667.png",
+                  "registry_id": "running-hud-overlay-legacy-current-375x667",
+                  "directory": "tests/e2e/__screenshots__/visual-overlay.spec.ts/",
+                  "browser": "chromium",
+                  "project": "chromium",
+                  "viewport": "375x667",
+                  "device_scale_factor": 1,
+                  "comparator_kind": "maxDiffPixels",
+                  "comparator_value": "100",
+                  "style_path": True,
+                  "artifact_scope": "job",
+                  "digest_env": "TEST_RESULTS_DIGEST",
+                  "retention_days": 30,
+              },
+
               {
                   "capture_id": "phase-screens.spec.ts::title-menu.png",
                   "spec_file": "tests/e2e/phase-screens.spec.ts",
