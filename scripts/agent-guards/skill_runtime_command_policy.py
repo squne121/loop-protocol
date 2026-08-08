@@ -822,6 +822,8 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "{repo}",
         "--anchor-comment-url",
         "{anchor_comment_url}",
+        "--human-context-comment-url",
+        "{anchor_comment_url}",
     ],
     "contract_update.run.with_anchor": [
         "uv",
@@ -833,6 +835,8 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "--repo",
         "{repo}",
         "--anchor-comment-url",
+        "{anchor_comment_url}",
+        "--human-context-comment-url",
         "{anchor_comment_url}",
         "--consume-contract-patch-plan",
     ],

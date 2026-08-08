@@ -110,6 +110,7 @@ REGISTRY = {
             ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
             "--issue-number", "{issue_number}", "--repo", "{repo}",
             "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
         ],
         "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_anchor",
         "required_cwd": "canonical_main_root", "required_branch": "default_branch",
@@ -142,6 +143,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--issue-number", required=True)
 parser.add_argument("--repo", required=True)
 parser.add_argument("--anchor-comment-url")
+parser.add_argument("--human-context-comment-url")
 parser.add_argument("--consume-contract-patch-plan", action="store_true")
 args = parser.parse_args()
 artifact = Path(".claude/artifacts/issue-refinement-loop") / args.issue_number
@@ -335,6 +337,7 @@ REGISTRY = {
             "--issue-number", "{issue_number}",
             "--repo", "{repo}",
             "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
         ],
         "shell": False,
         "cwd_policy": "repo_root",
@@ -357,6 +360,7 @@ REGISTRY = {
             "--issue-number", "{issue_number}",
             "--repo", "{repo}",
             "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
             "--consume-contract-patch-plan",
         ],
         "shell": False,
@@ -434,7 +438,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--issue-number", required=True)
     parser.add_argument("--repo", required=True)
-    parser.add_argument("--anchor-comment-url", required=False, default=None)
+parser.add_argument("--anchor-comment-url", required=False, default=None)
+parser.add_argument("--human-context-comment-url", required=False, default=None)
     parser.add_argument("--consume-contract-patch-plan", action="store_true")
     args = parser.parse_args()
     artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number

@@ -77,6 +77,7 @@ def test_registry_sibling_profile_preserves_preflight_run():
         "--issue-number", "{issue_number}",
         "--repo", "{repo}",
         "--anchor-comment-url", "{anchor_comment_url}",
+        "--human-context-comment-url", "{anchor_comment_url}",
     ]
     assert anchor_entry["placeholders"]["anchor_comment_url"] == {
         "type": "github_issue_comment_url",
@@ -109,7 +110,8 @@ def test_registry_contract_update_phase_is_explicit_and_preflight_remains_read_o
         "uv", "run", "python3",
         ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
         "--issue-number", "1877", "--repo", "squne121/loop-protocol",
-        "--anchor-comment-url", url, "--consume-contract-patch-plan",
+        "--anchor-comment-url", url, "--human-context-comment-url", url,
+        "--consume-contract-patch-plan",
     ]
 
 
@@ -127,6 +129,7 @@ def test_registry_sibling_profile_renders_argv():
         "--issue-number", "1492",
         "--repo", "squne121/loop-protocol",
         "--anchor-comment-url", url,
+        "--human-context-comment-url", url,
     ]
 
 
