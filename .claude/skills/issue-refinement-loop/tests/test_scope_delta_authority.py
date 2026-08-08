@@ -737,3 +737,23 @@ def test_non_idempotent_detection_does_not_invert_safe_and_risky_terms():
     }
     for text, expected in cases.items():
         assert sda.detect_boundary_flags(text)["destructive_or_non_idempotent_operation"] is expected
+
+
+def test_exact_allowed_path_literals_reject_unsafe_or_negative_tokens():
+    unsafe = (
+        "- allowed paths に `https://example.test/escape.py` を追加する",
+        "- allowed paths に `/etc/passwd` を追加する",
+        "- allowed paths に `docs/../secrets.txt` を追加する",
+        "- allowed paths に `docs\\windows.py` を追加する",
+        "- allowed paths に `docs/valid.py\x00suffix` を追加する",
+        "- do not add `docs/valid.py` to Allowed Paths",
+        "- Allowed Paths に `docs/valid.py` を追加しない",
+    )
+    for directive in unsafe:
+        assert sda._extract_path_literals_from_text(directive) == []
+
+
+def test_exact_allowed_path_literals_accept_normalized_repository_relative_literal():
+    assert sda._extract_path_literals_from_text(
+        "- Allowed Paths に `.claude/skills/example.py` を追加する"
+    ) == [".claude/skills/example.py"]

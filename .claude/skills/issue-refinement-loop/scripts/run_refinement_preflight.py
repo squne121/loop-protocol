@@ -68,6 +68,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1607,13 +1608,17 @@ def _bounded_contract_update_handoff(consumer_result: dict[str, Any]) -> dict[st
     if not isinstance(fresh, dict):
         fresh = {}
     # A completed transaction is not an implementation authorization.  The
-    # post-update rerun is a conjunctive gate: missing, warn, or failing
+    # post-update rerun is a six-gate conjunction: missing, warn, or failing
     # checks must fail the phase even though the controlled write itself
-    # reached final readback successfully.
+    # reached final readback successfully.  Do not infer a pass from prose or
+    # an earlier transaction result.
     post_update_gate_passed = (
         fresh.get("preflight") == "pass"
         and fresh.get("review") == "approve"
         and fresh.get("readiness") == "go"
+        and fresh.get("allowed_paths") == "pass"
+        and fresh.get("permission_profile") == "pass"
+        and fresh.get("runtime_evidence") == "pass"
     )
     if raw_status == "applied" and iterations == 1 and post_update_gate_passed:
         status = "rebased"
@@ -2178,10 +2183,109 @@ def consume_trusted_anchor_contract_patch_plan(
             shell=False,
             timeout=30,
         )
+
+        # Execute the canonical Allowed Paths grammar rather than treating a
+        # successful contract review as a substitute for the path gate.
+        allowed_paths_status = "unavailable"
+        try:
+            import importlib.util
+
+            baseline_path = (
+                _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "baseline_vc_preflight.py"
+            )
+            gate_path = _SCRIPTS_DIR.parent.parent / "pr-review-judge" / "scripts" / "allowed_paths_review_gate.py"
+            baseline_spec = importlib.util.spec_from_file_location("post_update_allowed_paths_baseline", baseline_path)
+            gate_spec = importlib.util.spec_from_file_location("post_update_allowed_paths_gate", gate_path)
+            if (
+                baseline_spec is not None
+                and baseline_spec.loader is not None
+                and gate_spec is not None
+                and gate_spec.loader is not None
+            ):
+                baseline_module = importlib.util.module_from_spec(baseline_spec)
+                gate_module = importlib.util.module_from_spec(gate_spec)
+                baseline_spec.loader.exec_module(baseline_module)
+                gate_spec.loader.exec_module(gate_module)
+                allowed_paths = baseline_module.extract_allowed_paths(current_issue.get("body", ""))
+                normalized_paths = [
+                    gate_module.AllowedPathsMatcher.normalize_allowed_pattern(path) for path in allowed_paths
+                ]
+                if allowed_paths and all(isinstance(path, str) and path for path in normalized_paths):
+                    allowed_paths_status = "pass"
+                else:
+                    allowed_paths_status = "failed"
+        except Exception:
+            allowed_paths_status = "unavailable"
+
+        # Validate the exact privileged command profile selected by the
+        # explicit source lane.  This checks the canonical registry/policy
+        # grammar, not a prose assertion from the directive.
+        permission_profile_status = "unavailable"
+        try:
+            from command_registry import render_command
+
+            policy_path = _find_repo_root() / "scripts" / "agent-guards" / "skill_runtime_command_policy.py"
+            policy_spec = importlib.util.spec_from_file_location("post_update_runtime_policy", policy_path)
+            if policy_spec is not None and policy_spec.loader is not None:
+                policy_module = importlib.util.module_from_spec(policy_spec)
+                policy_spec.loader.exec_module(policy_module)
+                context = known_context if isinstance(known_context, dict) else {}
+                human_urls = _normalize_comment_url_set(context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD))
+                profile = (
+                    "contract_update.run.with_human_context"
+                    if human_urls is not None and anchor_url in human_urls
+                    else "contract_update.run.with_anchor"
+                )
+                # render_command proves the child argv; the policy parses the
+                # matching executor argv, including the required lane flag.
+                render_command(profile, {"issue_number": issue_number, "repo": repo, "anchor_comment_url": anchor_url})
+                executor_argv = [
+                    "uv", "run", "python3", "scripts/agent-guards/skill_runtime_exec.py",
+                    "--command-id", profile, "--issue-number", str(issue_number),
+                    "--repo", repo, "--anchor-comment-url", anchor_url,
+                ]
+                if profile == "contract_update.run.with_human_context":
+                    executor_argv.extend(["--human-context-comment-url", anchor_url])
+                parsed = policy_module.parse_exact_skill_runtime_contract_update_anchor_command(
+                    shlex.join(executor_argv), str(_find_repo_root())
+                )
+                permission_profile_status = "pass" if parsed is not None else "failed"
+        except Exception:
+            permission_profile_status = "unavailable"
+
+        # The rerun must retain the exact source binding in a sidecar emitted
+        # by the fresh preflight.  A missing sidecar or a lane mismatch is a
+        # failed runtime-evidence gate, never an implicit success.
+        runtime_evidence_status = "unavailable"
+        try:
+            provenance_path = (
+                _issue_artifact_dir(_find_repo_root(), issue_number) / "refinement_preflight_provenance_v1.json"
+            )
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            source = provenance.get("runtime_evidence", {}).get("source", {})
+            context = known_context if isinstance(known_context, dict) else {}
+            expected_source_kind = _resolve_scope_delta_source_kind(
+                anchor_url,
+                human_context_comment_urls=context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD),
+                agent_report_comment_urls=context.get(_AGENT_REPORT_COMMENT_URLS_FIELD),
+            )
+            if (
+                source.get("comment_url") == anchor_url
+                and source.get("source_kind") == expected_source_kind
+                and provenance.get("runtime_evidence", {}).get("tested_head_sha")
+            ):
+                runtime_evidence_status = "pass"
+            else:
+                runtime_evidence_status = "failed"
+        except Exception:
+            runtime_evidence_status = "unavailable"
         return {
             "preflight": preflight_result.get("status"),
             "review": "approve" if review.returncode == 0 else "needs_fix" if review.returncode == 1 else "unavailable",
             "readiness": readiness.get("status"),
+            "allowed_paths": allowed_paths_status,
+            "permission_profile": permission_profile_status,
+            "runtime_evidence": runtime_evidence_status,
         }
 
     normalized_anchor = dict(anchor_payload)

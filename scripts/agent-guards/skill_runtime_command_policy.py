@@ -567,7 +567,7 @@ def _parse_exact_skill_runtime_anchor_command(
         return None
     if not tokens:
         return None
-    if len(tokens) != 12:
+    if len(tokens) < 12:
         return None
     if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
         return None
@@ -594,6 +594,21 @@ def _parse_exact_skill_runtime_anchor_command(
     repo = tokens[9]
     anchor_comment_url = tokens[11]
     if command_id not in expected_command_ids:
+        return None
+
+    # The command-id is the canonical, caller-selected origin lane.  Keep it
+    # in the exact argv grammar so a human/agent lane cannot be silently
+    # dropped between the registry and the executor.  Generic anchor profiles
+    # intentionally have no origin-lane flag.
+    lane_flag = {
+        "preflight.run.with_human_context": "--human-context-comment-url",
+        "preflight.run.with_agent_report": "--agent-report-comment-url",
+        "contract_update.run.with_human_context": "--human-context-comment-url",
+    }.get(command_id)
+    expected_length = 14 if lane_flag else 12
+    if len(tokens) != expected_length:
+        return None
+    if lane_flag and (tokens[12] != lane_flag or tokens[13] != anchor_comment_url):
         return None
     if not issue_number.isdigit() or int(issue_number) <= 0:
         return None

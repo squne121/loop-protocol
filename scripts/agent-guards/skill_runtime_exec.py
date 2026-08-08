@@ -1544,6 +1544,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.repo,
                 "--anchor-comment-url",
                 args.anchor_comment_url,
+                *(
+                    ["--human-context-comment-url", args.anchor_comment_url]
+                    if args.command_id in {"preflight.run.with_human_context", "contract_update.run.with_human_context"}
+                    else ["--agent-report-comment-url", args.anchor_comment_url]
+                    if args.command_id == "preflight.run.with_agent_report"
+                    else []
+                ),
             ]
         )
         exact_anchor_command = (

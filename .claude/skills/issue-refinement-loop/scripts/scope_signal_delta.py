@@ -656,16 +656,65 @@ _NON_QUOTED_GROUP = (
 
 
 def _extract_path_literals_from_text(text: str) -> list[str]:
-    """Extract canonical path-like literals from markdown-like text."""
+    """Extract only safe repository-relative Allowed Paths literals.
+
+    A directive may mention a path while denying it (or quote an unsafe URL),
+    but neither is an exact positive scope delta.  Keep this parser narrower
+    than the general path-token extractor because its output can lift the
+    Allowed Paths boundary from human escalation to contract-update-only.
+    """
+    if _allowed_paths_expansion_is_negated(text):
+        return []
     path_literals: list[str] = []
     for match in PATH_TOKEN_RE.finditer(text or ""):
         candidate = match.group("path") or match.group("bare") or ""
-        normalized = _normalize_path(candidate)
-        if not normalized or "/" not in normalized:
+        normalized = _normalize_exact_repository_path_literal(candidate)
+        if normalized is None:
             continue
         if normalized not in path_literals:
             path_literals.append(normalized)
     return path_literals
+
+
+def _allowed_paths_expansion_is_negated(text: str) -> bool:
+    """Reject directives that explicitly deny the candidate expansion."""
+    return bool(
+        re.search(
+            r"(?:do\s+not|don't|never|must\s+not|禁止|追加しない|拡張しない|含めない).{0,120}"
+            r"(?:allowed\s+paths?|allowed\s+path|許可(?:された)?パス)",
+            text or "",
+            re.IGNORECASE,
+        )
+        or re.search(
+            r"(?:allowed\s+paths?|allowed\s+path|許可(?:された)?パス).{0,120}"
+            r"(?:追加しない|拡張しない|含めない|禁止)",
+            text or "",
+            re.IGNORECASE,
+        )
+    )
+
+
+def _normalize_exact_repository_path_literal(candidate: str) -> str | None:
+    """Return one normalized repository-relative literal or ``None``.
+
+    The existing general token grammar intentionally also sees URLs and other
+    prose-adjacent values.  Those must not become authorization-bearing exact
+    path deltas.  Only forward-slash repository-relative literals without
+    traversal/control bytes are eligible.
+    """
+    if not isinstance(candidate, str) or not candidate:
+        return None
+    if "\x00" in candidate or "\n" in candidate or "\r" in candidate:
+        return None
+    if "\\" in candidate or "://" in candidate or candidate.startswith("/"):
+        return None
+    normalized = _normalize_path(candidate)
+    if not normalized or "/" not in normalized or normalized.startswith("/"):
+        return None
+    parts = normalized.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return None
+    return normalized
 
 
 def _strip_quoted_fragments(text: str) -> str:
