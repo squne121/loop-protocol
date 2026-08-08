@@ -6,8 +6,10 @@ requiring the agy CLI to be installed in the test environment.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
+import sys
 import types
 from pathlib import Path
 from typing import Any
@@ -1220,3 +1222,104 @@ def test_issue_1777_ac6_grounded_research_evidence_gate_applies_regardless_of_mo
             no_model_result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
     assert no_model_result["ok"] is False
     assert no_model_result["failure_class"] == "agy_web_grounding_tool_call_missing"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2015 AC2: hermetic transport-level test using a fake stdio MCP
+# server that emits a large stderr burst before replying, verifying the
+# collector completes without stalling and stdout JSON-RPC is never
+# corrupted by merged stderr.
+# ---------------------------------------------------------------------------
+
+_FAKE_SERENA_STDERR_BACKPRESSURE_SERVER_SOURCE = '''
+import json
+import sys
+
+
+def _send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+
+def _read():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+
+def main():
+    tools = ["find_file", "search_for_pattern", "get_symbols_overview"]
+    while True:
+        msg = _read()
+        if msg is None:
+            return
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "notifications/initialized":
+            continue
+        if method == "initialize":
+            _send({"jsonrpc": "2.0", "id": mid, "result": {}})
+        elif method == "tools/list":
+            _send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [{"name": t} for t in tools]}})
+        elif method == "tools/call":
+            params = msg.get("params", {}) or {}
+            name = params.get("name")
+            # Simulate a repo-wide search_for_pattern dumping a large
+            # amount of Serena-side logging to stderr before it can reply
+            # on stdout -- this is the self-induced stall scenario from the
+            # Issue #2015 background section.
+            chunk = "serena-stderr-log-line " * 200
+            for _ in range(500):
+                sys.stderr.write(chunk + "\\n")
+            sys.stderr.flush()
+            _send({"jsonrpc": "2.0", "id": mid, "result": {"echo": name}})
+        else:
+            _send({"jsonrpc": "2.0", "id": mid, "result": {}})
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def test_ac2_serena_collector_survives_stderr_backpressure_fake_mcp_server(tmp_path) -> None:
+    """AC2: a fake MCP server that writes a large stderr burst before every
+    tools/call response must not cause the collector to time out. stderr is
+    bounded/redacted and must never corrupt the stdout JSON-RPC stream."""
+    server_path = tmp_path / "fake_serena_stderr_backpressure_server.py"
+    server_path.write_text(_FAKE_SERENA_STDERR_BACKPRESSURE_SERVER_SOURCE, encoding="utf-8")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    context_file = repo_root / "context.md"
+    context_file.write_text("local_asset_research content", encoding="utf-8")
+
+    def _fake_load_serena_from_mcp_config(root, mcp_config_path=None):
+        return {"command": sys.executable, "args": [str(server_path)]}
+
+    manifest = {
+        "pinned_ref": "deadbeef00000000",
+        "read_only_allowlist": ["find_file", "search_for_pattern", "get_symbols_overview"],
+        "known_tools": ["find_file", "search_for_pattern", "get_symbols_overview"],
+    }
+
+    with patch.object(rgh, "_load_serena_from_mcp_config", _fake_load_serena_from_mcp_config), patch.object(
+        rgh, "SERENA_COLLECTOR_SESSION_DEADLINE_SEC", 20.0
+    ), patch.object(rgh, "SERENA_CLIENT_REQUEST_TIMEOUT_SEC", 10.0), patch.object(
+        rgh, "SERENA_SERVER_TOOL_TIMEOUT_SEC", 8.0
+    ):
+        documents, metadata = rgh._collect_live_serena_read_only_evidence([context_file], repo_root, manifest)
+
+    assert len(documents) == 3
+    assert metadata["manifest_drift_failed"] is False
+    assert metadata["stderr_byte_count"] > 0
+    # Bounded: even though the fake server wrote well over 1MB per call
+    # across three tools/call round-trips, the retained tail never exceeds
+    # the configured ring buffer cap.
+    assert metadata["stderr_byte_count"] <= rgh.SERENA_STDERR_RING_BUFFER_MAX_BYTES
+    for doc in documents:
+        content = json.loads(doc["content"])
+        # stdout JSON-RPC content must be intact -- no interleaved stderr
+        # log lines leaking into the tool result snippet.
+        assert "serena-stderr-log-line" not in content["content_snippet"]
