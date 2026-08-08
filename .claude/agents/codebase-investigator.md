@@ -169,6 +169,19 @@ wrapper は `context_files` を 1 件以上必須とするため、context フ�
 
 調査対象が見つからない場合は推測せず「見つからない」と明記する。
 
+## Graphify prefilter（任意の事前絞り込み層）
+
+`local_asset_research` プロファイルの **前段** として、pinned Graphify CLI（`graphifyy==0.9.34`）を使った
+任意の候補絞り込み層を利用してよい。詳細な CLI 手順・subcommand・flag は
+`.claude/skills/graphify-cli-advisory/SKILL.md` を参照する（本ファイルには埋め込まない）。適用条件は以下の
+5 点のみ:
+
+1. Graphify prefilter は **任意** 実行であり、必須経路ではない。
+2. **clean worktree の場合のみ** 実行する（dirty worktree では利用しない）。
+3. Graphify で候補を絞り込んだ後も、既存の Gemini local_asset_research と Serena source confirmation を必ず実行する（最終確認経路として省略しない）。
+4. Graphify 起動・実行が失敗した場合は既存の調査経路（Gemini local_asset_research）へ fallback し、調査全体を停止させない。
+5. Graphify 単独で finding を確定しない。Graphify の stdout・node ID・community ID・confidence label は候補情報にすぎず、`CODEBASE_INVESTIGATION_RESULT_V1` に載せる最終報告は必ず Gemini/Serena の source confirmation を経由する。
+
 ## 例外: 委譲不可時の fail-close
 
 `gemini-cli-headless-delegation` wrapper が `ok: false` を返した場合や、preflight（`preflight_agy.py`）が `ok: false`（trusted workspace 未成立、OAuth credential 不足、`gh` CLI / `uv` の不在 等）を返した場合は、本 SubAgent は **自力での代替調査（Read / Bash / 推測）を行わず** fail-close する。呼び出し元に以下を報告して停止:

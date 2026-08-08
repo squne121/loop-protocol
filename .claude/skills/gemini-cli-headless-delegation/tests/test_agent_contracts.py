@@ -176,6 +176,32 @@ class TestCodebaseInvestigatorAgent:
             "「既定経路では必須ではない」程度に弱めること。"
         )
 
+    def test_graphify_prefilter_is_optional(self):
+        """Graphify prefilter is documented as optional (Issue #2009 AC1)."""
+        ci = AGENTS_DIR / "codebase-investigator.md"
+        text = _read(ci)
+        assert "Graphify" in text, "codebase-investigator.md に Graphify prefilter の言及がない"
+        assert re.search(r"Graphify prefilter は\s*\*\*任意\*\*\s*実行", text), (
+            "Graphify prefilter が任意実行であることが明記されていない"
+        )
+
+    def test_graphify_prefilter_always_falls_back_to_existing_route(self):
+        """Graphify prefilter still requires existing Gemini/Serena confirmation (Issue #2009 AC2)."""
+        ci = AGENTS_DIR / "codebase-investigator.md"
+        text = _read(ci)
+        assert "既存の Gemini local_asset_research と Serena source confirmation を必ず実行" in text
+
+    def test_graphify_prefilter_does_not_embed_cli_details(self):
+        """codebase-investigator.md must not embed Graphify CLI subcommand/flag details (Issue #2009 In Scope)."""
+        ci = AGENTS_DIR / "codebase-investigator.md"
+        text = _read(ci)
+        forbidden_cli_tokens = ["--code-only", "--budget", "graphify extract", "graphify query"]
+        hits = [tok for tok in forbidden_cli_tokens if tok in text]
+        assert not hits, (
+            f"codebase-investigator.md に Graphify CLI の詳細手順 {hits} が埋め込まれている。"
+            " 詳細は graphify-cli-advisory/SKILL.md に委ねること。"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 全 agent 共通: CLI 引数の契約ドリフト検査
