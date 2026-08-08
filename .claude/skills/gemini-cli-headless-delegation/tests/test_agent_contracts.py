@@ -189,7 +189,7 @@ class TestCodebaseInvestigatorAgent:
         """Graphify prefilter still requires existing Gemini/Serena confirmation (Issue #2009 AC2)."""
         ci = AGENTS_DIR / "codebase-investigator.md"
         text = _read(ci)
-        assert "既存の Gemini local_asset_research と Serena source confirmation を必ず実行" in text
+        assert "既存の AGY local_asset_research" in text and "Serena source confirmation を必ず実行" in text
 
     def test_graphify_prefilter_does_not_embed_cli_details(self):
         """codebase-investigator.md must not embed Graphify CLI subcommand/flag details (Issue #2009 In Scope)."""
