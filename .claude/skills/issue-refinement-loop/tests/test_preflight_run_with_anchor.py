@@ -77,7 +77,6 @@ def test_registry_sibling_profile_preserves_preflight_run():
         "--issue-number", "{issue_number}",
         "--repo", "{repo}",
         "--anchor-comment-url", "{anchor_comment_url}",
-        "--human-context-comment-url", "{anchor_comment_url}",
     ]
     assert anchor_entry["placeholders"]["anchor_comment_url"] == {
         "type": "github_issue_comment_url",
@@ -87,7 +86,7 @@ def test_registry_sibling_profile_preserves_preflight_run():
 
 def test_registry_contract_update_phase_is_explicit_and_preflight_remains_read_only():
     """#1877 AC3: the mutation consumer is a distinct registry command."""
-    entry = reg.REGISTRY["contract_update.run.with_anchor"]
+    entry = reg.REGISTRY["contract_update.run.with_human_context"]
     assert reg.REGISTRY["preflight.run.with_anchor"]["mutation"] is False
     assert "--consume-contract-patch-plan" not in reg.REGISTRY["preflight.run.with_anchor"]["argv"]
     assert entry["mutation"] is True
@@ -104,7 +103,7 @@ def test_registry_contract_update_phase_is_explicit_and_preflight_remains_read_o
 
     url = "https://github.com/squne121/loop-protocol/issues/1877#issuecomment-5143816923"
     assert reg.render_command(
-        "contract_update.run.with_anchor",
+        "contract_update.run.with_human_context",
         {"issue_number": 1877, "repo": "squne121/loop-protocol", "anchor_comment_url": url},
     ) == [
         "uv", "run", "python3",
@@ -129,8 +128,22 @@ def test_registry_sibling_profile_renders_argv():
         "--issue-number", "1492",
         "--repo", "squne121/loop-protocol",
         "--anchor-comment-url", url,
-        "--human-context-comment-url", url,
     ]
+
+
+def test_registry_explicit_origin_profiles_do_not_infer_human_provenance():
+    """P0: caller-selected lane, not anchor presence, determines origin."""
+    url = "https://github.com/squne121/loop-protocol/issues/1492#issuecomment-4959671503"
+    values = {"issue_number": 1492, "repo": "squne121/loop-protocol", "anchor_comment_url": url}
+
+    generic = reg.render_command("preflight.run.with_anchor", values)
+    human = reg.render_command("preflight.run.with_human_context", values)
+    agent = reg.render_command("preflight.run.with_agent_report", values)
+
+    assert "--human-context-comment-url" not in generic
+    assert human[-2:] == ["--human-context-comment-url", url]
+    assert agent[-2:] == ["--agent-report-comment-url", url]
+    assert "contract_update.run.with_agent_report" not in reg.REGISTRY
 
 
 def test_registry_sibling_profile_missing_anchor_raises():

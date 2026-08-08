@@ -412,7 +412,7 @@ def _is_symlink_path(path: Path) -> bool:
 
 def _allowed_artifact_roots(project_root: str, issue_number: str, command_id: str = "") -> tuple[Path, ...]:
     roots = [Path(project_root) / ".claude" / "artifacts" / "issue-refinement-loop" / issue_number]
-    if command_id == "contract_update.run.with_anchor":
+    if command_id in {"contract_update.run.with_anchor", "contract_update.run.with_human_context"}:
         # The existing edit-issue transaction writes its request metadata
         # under this exact Issue-scoped directory.  Do not grant the phase a
         # broader artifacts root or a second Issue's metadata directory.
@@ -594,7 +594,7 @@ def _snapshot_repo_paths(
             allowed_parent_dirs.add(parent)
             if parent == root:
                 break
-    if command_id == "contract_update.run.with_anchor":
+    if command_id in {"contract_update.run.with_anchor", "contract_update.run.with_human_context"}:
         # The existing edit-issue transaction uses the repository-approved
         # transaction-local ``tmp/`` workspace for its candidate and input
         # files, and deletes those files before returning.  Ignore only the
@@ -1479,8 +1479,15 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_stale_runtime_failure(args.issue_number, stale_entries)
 
     is_fixture_command = args.command_id == "preflight.run.fixture"
-    is_anchor_command = args.command_id == "preflight.run.with_anchor"
-    is_contract_update_command = args.command_id == "contract_update.run.with_anchor"
+    is_anchor_command = args.command_id in {
+        "preflight.run.with_anchor",
+        "preflight.run.with_human_context",
+        "preflight.run.with_agent_report",
+    }
+    is_contract_update_command = args.command_id in {
+        "contract_update.run.with_anchor",
+        "contract_update.run.with_human_context",
+    }
     if is_fixture_command:
         if not args.fixture:
             print("skill_runtime_exec: --fixture required for preflight.run.fixture", file=sys.stderr)
@@ -1556,7 +1563,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.anchor_comment_url:
             print(
                 "skill_runtime_exec: --anchor-comment-url is only allowed for "
-                "preflight.run.with_anchor",
+                "an anchor-bound preflight profile",
                 file=sys.stderr,
             )
             return 2

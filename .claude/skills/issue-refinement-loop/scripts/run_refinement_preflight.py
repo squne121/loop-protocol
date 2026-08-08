@@ -1603,13 +1603,24 @@ def _bounded_contract_update_handoff(consumer_result: dict[str, Any]) -> dict[st
     states = consumer_result.get("states")
     state = states.get("contract_update", {}).get("status") if isinstance(states, dict) else None
     iterations = consumer_result.get("iterations", 0)
-    if raw_status == "applied" and iterations == 1:
-        status = "rebased"
-    else:
-        status = state if state in {"applied", "no_change", "rebased"} else "failed"
     fresh = consumer_result.get("fresh_checks")
     if not isinstance(fresh, dict):
         fresh = {}
+    # A completed transaction is not an implementation authorization.  The
+    # post-update rerun is a conjunctive gate: missing, warn, or failing
+    # checks must fail the phase even though the controlled write itself
+    # reached final readback successfully.
+    post_update_gate_passed = (
+        fresh.get("preflight") == "pass"
+        and fresh.get("review") == "approve"
+        and fresh.get("readiness") == "go"
+    )
+    if raw_status == "applied" and iterations == 1 and post_update_gate_passed:
+        status = "rebased"
+    elif raw_status in {"applied", "no_change"} and post_update_gate_passed:
+        status = state if state in {"applied", "no_change", "rebased"} else "failed"
+    else:
+        status = "failed"
     return {
         "status": status,
         "writes": int(consumer_result.get("writes", 0)) if isinstance(consumer_result.get("writes", 0), int) else 0,
@@ -2020,6 +2031,7 @@ def consume_trusted_anchor_contract_patch_plan(
     anchor_body: str,
     contract_patch_plan: dict,
     callbacks: Optional[dict[str, Any]] = None,
+    known_context: Optional[dict[str, Any]] = None,
 ) -> dict:
     """Connect an approved patch plan to the controlled transaction lane.
 
@@ -2151,6 +2163,7 @@ def consume_trusted_anchor_contract_patch_plan(
                 issue_number=issue_number,
                 repo=repo,
                 anchor_comment_urls=[anchor_url],
+                known_context=known_context,
                 consume_contract_patch_plan=False,
             )
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", encoding="utf-8", delete=False) as handle:
@@ -2204,6 +2217,7 @@ def _satisfied_trusted_directive_noop_patch_plan(
     anchor_url: str,
     anchor_payload: dict[str, Any],
     anchor_body: str,
+    known_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any] | None:
     """Reconstruct only a proven-satisfied trusted directive as a no-op.
 
@@ -2241,8 +2255,22 @@ def _satisfied_trusted_directive_noop_patch_plan(
         issue_number=issue_number,
         anchor_url=anchor_url,
         captured_at=_now_iso(),
+        human_context_comment_urls=(
+            known_context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD)
+            if isinstance(known_context, dict)
+            else None
+        ),
+        agent_report_comment_urls=(
+            known_context.get(_AGENT_REPORT_COMMENT_URLS_FIELD)
+            if isinstance(known_context, dict)
+            else None
+        ),
     )
-    if not isinstance(evidence, dict) or evidence.get("confidence") != "explicit":
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("confidence") != "explicit"
+        or evidence.get("source_kind") != "issue_comment"
+    ):
         return None
     if evidence.get("boundary_flags"):
         return None
@@ -2746,6 +2774,7 @@ def run_preflight(
                 anchor_url=anchor_url_for_consumer,
                 anchor_payload=anchor_payload_for_consumer,
                 anchor_body=anchor_body_for_consumer,
+                known_context=known_context,
             )
         if (
             isinstance(patch_plan, dict)
@@ -2762,9 +2791,10 @@ def run_preflight(
                 anchor_body=anchor_body_for_consumer,
                 contract_patch_plan=patch_plan,
                 callbacks=contract_update_callbacks,
+                known_context=known_context,
             )
             contract_update_handoff = _bounded_contract_update_handoff(consumer_result)
-            if consumer_result.get("status") not in {"applied", "no_change"}:
+            if contract_update_handoff.get("status") not in {"applied", "no_change", "rebased"}:
                 blockers.append(BLOCKER_FAIL_CLOSED)
         else:
             # The explicit mutation phase has no safe action without a

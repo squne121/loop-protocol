@@ -722,3 +722,18 @@ def test_real_producer_evidence_shape_validates_against_schema():
     producer_shaped = _evidence(confidence="explicit")
     del producer_shaped["target_issue_number"]
     jsonschema.validate(instance=producer_shaped, schema=schema)
+
+
+def test_non_idempotent_detection_does_not_invert_safe_and_risky_terms():
+    """P0: explicit non-idempotent work is a hard boundary, not its inverse."""
+    cases = {
+        "non-idempotent operation": True,
+        "non idempotent operation": True,
+        "idempotent operation": False,
+        "non-destructive operation": False,
+        "destructive operation": True,
+        "破壊的 operation": True,
+        "破壊的でない operation": False,
+    }
+    for text, expected in cases.items():
+        assert sda.detect_boundary_flags(text)["destructive_or_non_idempotent_operation"] is expected

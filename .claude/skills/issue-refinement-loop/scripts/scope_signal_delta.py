@@ -614,7 +614,8 @@ _BOUNDARY_KEYWORD_PATTERNS = {
         re.IGNORECASE,
     ),
     "destructive_or_non_idempotent_operation": re.compile(
-        r"((?<!non-)destructive|irreversible|(?<!non-)idempotent|破壊的(?!でない)|force[- ]push|rm -rf|drop table)",
+        r"((?<!non[- ])\bdestructive\b|\birreversible\b|\bnon[- ]idempotent\b|"
+        r"破壊的(?!でない)|force[- ]push|rm -rf|drop table)",
         re.IGNORECASE,
     ),
     "requires_issue_split": re.compile(
