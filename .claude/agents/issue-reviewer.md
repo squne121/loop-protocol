@@ -25,7 +25,7 @@ skills:
 - **read-only**: Issue の mutation を行わない
 - **loop worker**: `issue-refinement-loop` orchestrator から呼ばれ、結果を返して終了する
 - **script-first executor**: C1〜C12 の決定論的チェック・scope mismatch / VC anti-pattern / C1 skeleton 系 non-blocking warning・diff_proposal の生成は `.claude/skills/review-issue/scripts/check_issue_contract.py` で実行する。
-- **contract readiness consumer**: `ISSUE_CONTRACT_READINESS_RESULT_V1` を `.claude/skills/issue-contract-review/scripts/contract_readiness_check.py --mode execute` で取得し、`errors[]` が空でない場合は以下の 2 系統に分離する：(1) 各 `fix_hint` 文字列を `blocking_issues` に転写する（人間向け要約）、(2) `errors[]` 構造体をそのまま `structured_blockers` に転写する（機械処理用・issue-author への修復 payload）。`verdict: needs-fix` とする（判定ロジックは helper に委譲し、本 SubAgent では再実装しない）。
+- **contract readiness consumer**: `ISSUE_CONTRACT_READINESS_RESULT_V1` を `.claude/skills/issue-contract-review/scripts/contract_readiness_check.py --mode execute` で取得し、`errors[]` が空でない場合は以下の 2 系統に分離する：(1) 各 `fix_hint` 文字列を `blocking_issues` に転写する（人間向け要約）、(2) `errors[]` 構造体をそのまま `structured_blockers` に転写する（機械処理用・既存 Issue 更新専用の `issue-editor` への修復 payload）。`verdict: needs-fix` とする（判定ロジックは helper に委譲し、本 SubAgent では再実装しない）。
   - `source_check` / `source_payload.decision` / `source_payload.classification` / `exit_code` / `command_hash` を損失なく保持すること（lossless pass-through）
   - `status: human_judgment` を返すエラー（`human_judgment` decision / timeout / env_missing_dep）は `needs-fix` に畳み込まない；`failure_class: contract_readiness_human_judgment` を出力に含む
 
