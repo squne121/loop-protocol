@@ -58,7 +58,8 @@
     "tests/test_summarize_agent_transcript.py",
     "tests/agent_ops/",
     "tests/session-recording/",
-    "tests/test_hook_boundaries_doc.py"
+    "tests/test_hook_boundaries_doc.py",
+    "artifacts/claude-code-spawn-observability-research/tests/"
   ],
   "ignore": [
     ".claude/hooks/tests/test_secret_boundary_contract.py"
