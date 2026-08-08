@@ -2523,8 +2523,16 @@ def test_serena_manifest_drift_failed_only_true_for_manifest_drift(tmp_path, mon
 
     def run(mode: str, deadline_override: float | None = None):
         monkeypatch.setattr(module, "SERENA_COLLECTOR_SESSION_DEADLINE_SEC", deadline_override or 20.0)
-        monkeypatch.setattr(module, "SERENA_CLIENT_REQUEST_TIMEOUT_SEC", min(deadline_override or 20.0, 0.5) if deadline_override else 10.0)
-        monkeypatch.setattr(module, "SERENA_SERVER_TOOL_TIMEOUT_SEC", min(deadline_override or 20.0, 0.5) if deadline_override else 8.0)
+        monkeypatch.setattr(
+            module,
+            "SERENA_CLIENT_REQUEST_TIMEOUT_SEC",
+            min(deadline_override or 20.0, 0.5) if deadline_override else 10.0,
+        )
+        monkeypatch.setattr(
+            module,
+            "SERENA_SERVER_TOOL_TIMEOUT_SEC",
+            min(deadline_override or 20.0, 0.5) if deadline_override else 8.0,
+        )
         _patch_fake_serena_launch(module, monkeypatch, server_path, mode)
         try:
             module._collect_live_serena_read_only_evidence([context_file], repo_root, manifest)
@@ -2565,7 +2573,12 @@ def test_serena_retry_bounded_single_retry_for_timeout_classes_only(tmp_path, mo
     the failure envelope always records initial_failure_class."""
     module = load_module()
     monkeypatch.setattr(module, "_validate_local_asset_research_settings", lambda: [])
-    monkeypatch.setattr(module, "_run_agy", lambda prompt, timeout_sec=module.DEFAULT_TIMEOUT_SEC: __import__("subprocess").CompletedProcess(args=["agy"], returncode=0, stdout="LOOP_AGY_SMOKE_OK", stderr=""))
+    def _fake_run_agy(prompt, timeout_sec=module.DEFAULT_TIMEOUT_SEC):
+        return __import__("subprocess").CompletedProcess(
+            args=["agy"], returncode=0, stdout="LOOP_AGY_SMOKE_OK", stderr=""
+        )
+
+    monkeypatch.setattr(module, "_run_agy", _fake_run_agy)
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     context_file = repo_root / "context.md"
@@ -2732,7 +2745,6 @@ def test_serena_cleanup_reaps_grandchild_process_group(tmp_path, monkeypatch):
     child."""
     module = load_module()
     import os
-    import signal
     import subprocess as _subprocess
     import sys as _sys
     import time as _time
