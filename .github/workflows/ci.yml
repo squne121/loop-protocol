@@ -1382,6 +1382,25 @@ jobs:
         env:
           VITE_VRT_MUTATION_CONTROL_ELAPSED: "true"
         run: pnpm exec vitest run --config vitest.visual.config.ts -t "elapsed_hidden" tests/component/combat-hud-running.vrt.test.ts
+      # fix_delta iteration 2 (Issue #2014, independent test-runner
+      # verification, CI run
+      # https://github.com/squne121/loop-protocol/actions/runs/31247039563):
+      # the mutation-control test bodies use `await expect(<promise>).rejects.toThrow()`
+      # (tests/component/combat-hud-running.vrt.test.ts) so that a
+      # genuinely-detected mismatch makes the GUARDED assertion's rejection
+      # the EXPECTED outcome -- the vitest TEST itself PASSES (GH Actions
+      # step outcome 'success') when the comparator correctly detects the
+      # hidden fragment. This step previously required outcome == 'failure'
+      # to mean "detected", which is backwards: it demanded the guard test
+      # itself fail even when detection worked correctly, so a genuinely
+      # working mutation lane was always reported as broken. Confirmed via
+      # direct re-run in the CI-pinned canonical Docker environment
+      # (mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948):
+      # each guarded test genuinely catches a real toMatchScreenshot()
+      # rejection (hull_hidden 178px, pause_hidden 371px, elapsed_hidden
+      # 95px -- all >> the 48px cap) and the outer `.rejects.toThrow()`
+      # assertion PASSES on that real rejection, so the correct expectation
+      # is GH Actions step outcome == 'success'.
       - name: Verify all three mutation controls actually mismatched
         if: ${{ always() }}
         env:
@@ -1393,8 +1412,8 @@ jobs:
           for pair in "hull_hidden:${HULL_OUTCOME}" "pause_hidden:${PAUSE_OUTCOME}" "elapsed_hidden:${ELAPSED_OUTCOME}"; do
             name="${pair%%:*}"
             outcome="${pair##*:}"
-            if [ "${outcome}" != "failure" ]; then
-              echo "::error::mutation control '${name}' outcome was '${outcome}', expected 'failure' (hiding a critical HUD fragment must always be detected as a mismatch). If it passed or was skipped, the comparator (or the control itself) has no real detection power for this fragment."
+            if [ "${outcome}" != "success" ]; then
+              echo "::error::mutation control '${name}' outcome was '${outcome}', expected 'success' (the guarded assertion \`await expect(<toMatchScreenshot() call>).rejects.toThrow()\` must itself PASS when hiding a critical HUD fragment is correctly detected as a mismatch). If it failed or was skipped, the comparator (or the control itself) has no real detection power for this fragment."
               fail=1
             else
               echo "mutation_control ${name}=ok (mismatched as expected)"
@@ -1466,9 +1485,14 @@ jobs:
               MISMATCHED_PIXELS="unknown_non_zero"
             fi
           fi
+          # fix_delta iteration 2 (Issue #2014): the guarded mutation-control
+          # assertion (`.rejects.toThrow()`) PASSES the vitest test (GH
+          # Actions step outcome 'success') when a real mismatch was
+          # genuinely detected -- see the "Verify all three mutation
+          # controls actually mismatched" step comment above.
           classify_mutation() {
             case "$1" in
-              failure) echo "expected_failure" ;;
+              success) echo "expected_failure" ;;
               *) echo "NOT_expected_failure ($1)" ;;
             esac
           }
