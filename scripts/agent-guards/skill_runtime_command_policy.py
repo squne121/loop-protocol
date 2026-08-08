@@ -98,7 +98,35 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
             ],
             "network_effect": "github_read_only",
         },
+        "preflight.run.with_human_context": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "github_read_only",
+        },
+        "preflight.run.with_agent_report": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "github_read_only",
+        },
         "contract_update.run.with_anchor": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+                "artifacts/{active_issue}/issue-metadata/",
+            ],
+            "network_effect": "github_read_only",
+        },
+        "contract_update.run.with_human_context": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR,
             "required_cwd": "canonical_main_root",
             "required_branch": "default_branch",
@@ -112,7 +140,15 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
 }
 
 ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset(
-    {"preflight.run", "preflight.run.fixture", "preflight.run.with_anchor", "contract_update.run.with_anchor"}
+    {
+        "preflight.run",
+        "preflight.run.fixture",
+        "preflight.run.with_anchor",
+        "preflight.run.with_human_context",
+        "preflight.run.with_agent_report",
+        "contract_update.run.with_anchor",
+        "contract_update.run.with_human_context",
+    }
 )
 _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
     "preflight.run": {
@@ -142,7 +178,35 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
             ".claude/artifacts/issue-refinement-loop/{active_issue}/",
         ],
     },
+    "preflight.run.with_human_context": {
+        "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR,
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "github_read_only",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        ],
+    },
+    "preflight.run.with_agent_report": {
+        "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR,
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "github_read_only",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        ],
+    },
     "contract_update.run.with_anchor": {
+        "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR,
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "github_read_only",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            "artifacts/{active_issue}/issue-metadata/",
+        ],
+    },
+    "contract_update.run.with_human_context": {
         "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR,
         "required_cwd": "canonical_main_root",
         "required_branch": "default_branch",
@@ -483,7 +547,7 @@ def is_exact_skill_runtime_fixture_executor_command(
 
 
 def _parse_exact_skill_runtime_anchor_command(
-    command: str, expected_command_id: str, project_root: str | None = None
+    command: str, expected_command_ids: frozenset[str], project_root: str | None = None
 ) -> ExactSkillRuntimeCommand | None:
     """Exact-match parser for the `preflight.run.with_anchor` command class
     (Issue #1498).
@@ -503,7 +567,7 @@ def _parse_exact_skill_runtime_anchor_command(
         return None
     if not tokens:
         return None
-    if len(tokens) != 12:
+    if len(tokens) < 12:
         return None
     if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
         return None
@@ -529,7 +593,22 @@ def _parse_exact_skill_runtime_anchor_command(
     issue_number = tokens[7]
     repo = tokens[9]
     anchor_comment_url = tokens[11]
-    if command_id != expected_command_id:
+    if command_id not in expected_command_ids:
+        return None
+
+    # The command-id is the canonical, caller-selected origin lane.  Keep it
+    # in the exact argv grammar so a human/agent lane cannot be silently
+    # dropped between the registry and the executor.  Generic anchor profiles
+    # intentionally have no origin-lane flag.
+    lane_flag = {
+        "preflight.run.with_human_context": "--human-context-comment-url",
+        "preflight.run.with_agent_report": "--agent-report-comment-url",
+        "contract_update.run.with_human_context": "--human-context-comment-url",
+    }.get(command_id)
+    expected_length = 14 if lane_flag else 12
+    if len(tokens) != expected_length:
+        return None
+    if lane_flag and (tokens[12] != lane_flag or tokens[13] != anchor_comment_url):
         return None
     if not issue_number.isdigit() or int(issue_number) <= 0:
         return None
@@ -560,7 +639,15 @@ def parse_exact_skill_runtime_anchor_command(
     command: str, project_root: str | None = None
 ) -> ExactSkillRuntimeCommand | None:
     return _parse_exact_skill_runtime_anchor_command(
-        command, "preflight.run.with_anchor", project_root
+        command,
+        frozenset(
+            {
+                "preflight.run.with_anchor",
+                "preflight.run.with_human_context",
+                "preflight.run.with_agent_report",
+            }
+        ),
+        project_root,
     )
 
 
@@ -568,7 +655,14 @@ def parse_exact_skill_runtime_contract_update_anchor_command(
     command: str, project_root: str | None = None
 ) -> ExactSkillRuntimeCommand | None:
     return _parse_exact_skill_runtime_anchor_command(
-        command, "contract_update.run.with_anchor", project_root
+        command,
+        frozenset(
+            {
+                "contract_update.run.with_anchor",
+                "contract_update.run.with_human_context",
+            }
+        ),
+        project_root,
     )
 
 
@@ -823,6 +917,34 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "--anchor-comment-url",
         "{anchor_comment_url}",
     ],
+    "preflight.run.with_human_context": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--anchor-comment-url",
+        "{anchor_comment_url}",
+        "--human-context-comment-url",
+        "{anchor_comment_url}",
+    ],
+    "preflight.run.with_agent_report": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--anchor-comment-url",
+        "{anchor_comment_url}",
+        "--agent-report-comment-url",
+        "{anchor_comment_url}",
+    ],
     "contract_update.run.with_anchor": [
         "uv",
         "run",
@@ -833,6 +955,21 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "--repo",
         "{repo}",
         "--anchor-comment-url",
+        "{anchor_comment_url}",
+        "--consume-contract-patch-plan",
+    ],
+    "contract_update.run.with_human_context": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--anchor-comment-url",
+        "{anchor_comment_url}",
+        "--human-context-comment-url",
         "{anchor_comment_url}",
         "--consume-contract-patch-plan",
     ],
@@ -853,7 +990,22 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "repo": {"type": "owner_repo", "required": True},
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
     },
+    "preflight.run.with_human_context": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+    },
+    "preflight.run.with_agent_report": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+    },
     "contract_update.run.with_anchor": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+    },
+    "contract_update.run.with_human_context": {
         "issue_number": {"type": "positive_int", "required": True},
         "repo": {"type": "owner_repo", "required": True},
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
@@ -876,7 +1028,7 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
     if entry.get("network_effect") != policy["network_effect"]:
         raise ValueError("network_effect_mismatch")
     expected_write_roots = [".claude/artifacts/issue-refinement-loop/{active_issue}/"]
-    if command_id == "contract_update.run.with_anchor":
+    if command_id in {"contract_update.run.with_anchor", "contract_update.run.with_human_context"}:
         expected_write_roots.append("artifacts/{active_issue}/issue-metadata/")
     if entry.get("allowed_write_roots") != expected_write_roots:
         raise ValueError("allowed_write_roots_mismatch")

@@ -107,8 +107,43 @@ GitHub API の `author_association` フィールドで判定する。
 - comment body が quoted markdown（blockquote `>`）内に埋め込まれている
 - fenced-code block 内の marker がさらに別の fenced-code や blockquote に入れ子になっている
   - **注意**: top-level の `\`\`\`yaml` ブロックが canonical format。blockquote の後の fence や、非 YAML fenced block は fail-closed。
+- `Allowed Paths` 拡張が `expand / add / necessary` などの文言のみで具体 path リテラルを
+  含まない場合は fail-closed（human escalation）とする。
 
 trusted anchor と判定された場合のみ `scope_delta_decision.status=approved_by_trusted_anchor` を生成する。scope 拡張の自動実装許可は禁止。
+
+### trusted directive の互換経路
+
+`SCOPE_DELTA_AUTHORITY_EVIDENCE_V1` は、既存 `ANCHOR_SCOPE_REFRAME_V1` が無い
+明示 directive も、抽出済みの directive／source URL／comment ID／body hash／source span
+だけを用いて `contract_update_required` に正規化できる。raw comment body を planner
+input に渡さず、新しい authority schema も作らない。
+
+- role / component / class / module / agent の split は Issue partition ではない。
+  `requires_issue_split=true` は複数・別 Issue（必要なら独立 PR）を明示した trusted
+  directive に限る。
+- trusted かつ explicit な exact Allowed Paths delta は contract update の対象であり、
+  それだけで implementation を許可しない。
+- permission-boundary redesign は、同一 directive 行（single bullet）で
+  exact delta、least privilege、非破壊、secret なし、external paid service なし、
+  無関係な権限拡大なしを **すべて** 明示した場合のみ `contract_update_required`
+  を許容する。別 bullet の分割混在、引用内の語句、否定表現
+  (`least privilege ではない` / `no secret なし not guaranteed` / `possible paid service`) は
+  escalation のままにする。
+- 権限 redesign が external service / destructive / issue partition と同居する場合は
+  当該境界を優先し、人手承認（human escalation）に留める。
+- contract update 後は contract review、refinement preflight、allowed-path gate、該当する
+  permission/profile validator と runtime evidence を fresh に成功させるまで
+  implementation route を許可しない。
+
+GitHub の `author_association=OWNER`、投稿アカウント、Markdown の見出し数・引用数などは
+origin や authorization を単独で決めない。`source_kind` は `human_context_comment_urls` /
+`agent_report_comment_urls` の明示 lane からのみ導出し、本文の `LOOP_HANDOFF_RESULT_V1` / `CONTROLLED_EXEC_MARKER`
+のみで `generated_by_agent` とみなしてはならない。lane に無い anchor、または両 lane に重複する URL は
+fail-closed で generated として扱う。root control-plane が既に受領した interactive human
+instruction を materialize する場合だけ、明示 provenance marker
+`OWNER_DIRECTIVE_MATERIALIZED_FROM_INTERACTIVE_PROMPT_V1` を付与して通常の generated handoff と区別する。
+marker 自体は実装 go を与えず、上記 fresh rerun を省略しない。
 
 ### phase ごとの扱い（phase-sensitive semantics）
 
@@ -477,7 +512,7 @@ contract_patch_plan_v1:
 `forbidden` は常に `direct_github_write` と `implementation_phase_transition` の 2 値を含む。
 本 plan の生成コードパスから Issue 本文への実際の書き込みや実装フェーズへの遷移を実行することはできない
 （`build_contract_patch_plan_v1()` は dict を返すのみで、`gh` 呼び出しを一切含まない）。
-実際の適用は既存の `issue-author` / `edit-issue` skill 経由でのみ行う。
+実際の適用は既存 Issue 更新専用の `issue-editor` / `edit-issue` skill 経由でのみ行う。
 
 ### decide_next_loop_action.py の非破壊分岐（AC20）
 

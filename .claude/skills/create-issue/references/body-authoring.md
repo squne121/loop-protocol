@@ -1,7 +1,7 @@
 # Issue Body Authoring Reference
 
 Issue 本文の生成・更新に関する共通参照ガイドライン。
-`create-issue` skill（新規起票）と `issue-author` SubAgent（既存 Issue 更新）が共通参照する。
+`create-issue` skill（新規起票）と `issue-editor` SubAgent（既存 Issue 更新）が共通参照する。
 
 > 旧 `issue-body-authoring` skill を本ドキュメントに統合した（独立 skill である必要がなく、共有参照は references/ に置くのが skill ベストプラクティス）。
 
@@ -55,9 +55,9 @@ prompt 注記による SubAgent 委譲・運用ルール追加は次点オプシ
 
 ワークフロー不具合を起票する follow-up Issue（post-merge-cleanup / issue-refinement-loop から自動抽出されるもの）に適用する。単純なバグ fix や軽微な改善 Issue では本ステップ 3 の明示比較を省略してよい。
 
-## Issue-Author Repair Contract by Blocker Category（Blocker 種別ごとの修復契約）
+## Issue-Editor Repair Contract by Blocker Category（Blocker 種別ごとの修復契約）
 
-`issue-author` が `REVIEW_ISSUE_RESULT_V1.structured_blockers` を受け取ったとき、`category` フィールドに応じて以下の修復手順を適用する。
+`issue-editor` が `REVIEW_ISSUE_RESULT_V1.structured_blockers` を受け取ったとき、`category` フィールドに応じて以下の修復手順を適用する。
 
 ### compound_command_disallowed
 
@@ -625,4 +625,4 @@ Issue 本文の `## Required Design References` は、本 Issue の実装が前�
 ## 関連
 
 - `.claude/skills/create-issue/SKILL.md` — 新規起票でこの参照を使う
-- `.claude/agents/issue-author.md` — 既存 Issue 更新でこの参照を使う
+- `.claude/agents/issue-editor.md` — 既存 Issue 更新でこの参照を使う

@@ -605,22 +605,145 @@ _BOUNDARY_FLAG_KEYS = (
 
 _BOUNDARY_KEYWORD_PATTERNS = {
     "changes_permission_boundary": re.compile(
-        r"(permission escalat|権限昇格|privilege escalat|grant.*(sudo|root)|sudo access|root access)",
+        r"(permission (?:escalat|boundary|delta)|権限(?:昇格|境界|差分)|"
+        r"privilege escalat|grant.*(sudo|root)|sudo access|root access)",
         re.IGNORECASE,
     ),
     "changes_external_service_boundary": re.compile(
-        r"(external service|外部サービス|third[- ]party api|external api|call.*external)",
+        r"((?<!no paid )external service|外部サービス|third[- ]party api|external api|call.*external)",
         re.IGNORECASE,
     ),
     "destructive_or_non_idempotent_operation": re.compile(
-        r"(destructive|irreversible|non-idempotent|破壊的|force[- ]push|rm -rf|drop table)",
+        r"((?<!non[- ])\bdestructive\b|\birreversible\b|\bnon[- ]idempotent\b|"
+        r"破壊的(?!でない)|force[- ]push|rm -rf|drop table)",
         re.IGNORECASE,
     ),
     "requires_issue_split": re.compile(
-        r"(split into (multiple|separate) issues?|別[Ii]ssue.*分割|複数.*[Ii]ssue.*分割|issue.*split)",
+        # A role/component/class split is not an Issue partition. Only text
+        # that unambiguously requires multiple/separate Issues (or explicitly
+        # states an Issue partition) may enter this fail-closed lane.
+        r"(split into (multiple|separate) issues?|"
+        r"(?:multiple|separate) issues?(?:\s*(?:and|/)?\s*PRs?)?|"
+        r"issue partition|別[Ii]ssue.*分割|複数.*[Ii]ssue.*分割)",
         re.IGNORECASE,
     ),
 }
+
+_ALLOWED_PATHS_EXPANSION_PHRASE_RE = re.compile(
+    r"(add|adding|added|expand|expanded|拡張|追加|必要|necessary).{0,30}"
+    r"(allowed paths?|allowed path|許可(?:された)?パス)",
+    re.IGNORECASE,
+)
+
+_ALLOWED_PATHS_DIRECTIVE_RE = re.compile(
+    r"(allowed paths|allowed path|許可(?:された)?パス)",
+    re.IGNORECASE,
+)
+
+_DIRECTIVE_NEGATION_PATTERNS = (
+    re.compile(r"least privilege.{0,25}(?:ではない|not)", re.IGNORECASE),
+    re.compile(r"least privilege.{0,25}not(?:\s+necessary|[\s-]needed)", re.IGNORECASE),
+    re.compile(r"no secrets?.{0,20}not(?:\s+guaranteed|確約され)", re.IGNORECASE),
+    re.compile(r"possible\s+(?:service|paid service|external service)", re.IGNORECASE),
+    re.compile(r"not\s+(?:guaranteed|assured|guarantee)", re.IGNORECASE),
+)
+
+_NON_QUOTED_GROUP = (
+    r"`[^`]*`",
+    r'"[^"]*"',
+    r"'[^']*'",
+)
+
+
+def _extract_path_literals_from_text(text: str) -> list[str]:
+    """Extract only safe repository-relative Allowed Paths literals.
+
+    A directive may mention a path while denying it (or quote an unsafe URL),
+    but neither is an exact positive scope delta.  Keep this parser narrower
+    than the general path-token extractor because its output can lift the
+    Allowed Paths boundary from human escalation to contract-update-only.
+    """
+    if _allowed_paths_expansion_is_negated(text):
+        return []
+    path_literals: list[str] = []
+    for match in PATH_TOKEN_RE.finditer(text or ""):
+        candidate = match.group("path") or match.group("bare") or ""
+        normalized = _normalize_exact_repository_path_literal(candidate)
+        if normalized is None:
+            # A mixed directive is not an exact positive scope delta.  In
+            # particular, accepting a safe literal while silently dropping a
+            # URL, absolute path, traversal, or control-byte token would let
+            # the unnormalized directive reach the contract-patch consumer.
+            if _is_unsafe_path_literal(candidate):
+                return []
+            continue
+        if normalized not in path_literals:
+            path_literals.append(normalized)
+    return path_literals
+
+
+def _allowed_paths_expansion_is_negated(text: str) -> bool:
+    """Reject directives that explicitly deny the candidate expansion."""
+    return bool(
+        re.search(
+            r"(?:do\s+not|don't|never|must\s+not|禁止|追加しない|拡張しない|含めない).{0,120}"
+            r"(?:allowed\s+paths?|allowed\s+path|許可(?:された)?パス)",
+            text or "",
+            re.IGNORECASE,
+        )
+        or re.search(
+            r"(?:allowed\s+paths?|allowed\s+path|許可(?:された)?パス).{0,120}"
+            r"(?:追加しない|拡張しない|含めない|禁止)",
+            text or "",
+            re.IGNORECASE,
+        )
+    )
+
+
+def _normalize_exact_repository_path_literal(candidate: str) -> str | None:
+    """Return one normalized repository-relative literal or ``None``.
+
+    The existing general token grammar intentionally also sees URLs and other
+    prose-adjacent values.  Those must not become authorization-bearing exact
+    path deltas.  Only forward-slash repository-relative literals without
+    traversal/control bytes are eligible.
+    """
+    if not isinstance(candidate, str) or not candidate:
+        return None
+    if "\x00" in candidate or "\n" in candidate or "\r" in candidate:
+        return None
+    if "\\" in candidate or "://" in candidate or candidate.startswith("/"):
+        return None
+    normalized = _normalize_path(candidate)
+    if not normalized or "/" not in normalized or normalized.startswith("/"):
+        return None
+    parts = normalized.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return None
+    return normalized
+
+
+def _is_unsafe_path_literal(candidate: str) -> bool:
+    """Return whether a rejected token is an unsafe path-like literal.
+
+    Non-path backticked prose does not make a directive unsafe by itself, but
+    a token that can name an external or non-repository target must make the
+    entire Allowed Paths directive ineligible for automatic materialization.
+    """
+    if not isinstance(candidate, str) or not candidate:
+        return False
+    if "\x00" in candidate or "\n" in candidate or "\r" in candidate:
+        return True
+    if "\\" in candidate or "://" in candidate or candidate.startswith("/"):
+        return True
+    return any(part in {"", ".", ".."} for part in candidate.split("/"))
+
+
+def _strip_quoted_fragments(text: str) -> str:
+    stripped = text
+    for pattern in _NON_QUOTED_GROUP:
+        stripped = re.sub(pattern, " ", stripped)
+    return stripped
 
 _DIRECTIVE_SECTION_MARKERS = (
     "revised acceptance criteria",
@@ -631,9 +754,29 @@ _DIRECTIVE_SECTION_MARKERS = (
     "allowed paths",
     "allowed paths expansion",
     "verification command",
+    "contract update",
+    "scope delta",
+    "permission boundary",
+    "全面改訂",
+    "分割しない",
+    "1 issue = 1 pr",
 )
 
 _BULLET_LINE_RE = re.compile(r"^\s*[-*]\s+\S.*$", re.MULTILINE)
+_CONCRETE_PERMISSION_DELTA_RE = re.compile(
+    r"(?:permission[ _-]?(?:delta|profile)|permissions?[ _-]?profile|権限(?:差分|プロファイル))"
+    r"\s*[:=]?\s*(?P<before>[^\n→]{1,120}?)\s*(?:->|→)\s*(?P<after>[^\n]{1,120})",
+    re.IGNORECASE,
+)
+_CONCRETE_REPOSITORY_PATH_RE = re.compile(
+    r"`(?P<path>(?!/)(?!.*(?:^|/)\.\.(?:/|$))[^`\s]+/[^`\s]+)`"
+)
+_UNRELATED_PERMISSION_WIDENING_RE = re.compile(
+    r"(?<!no )unrelated(?: privilege)? widening|"
+    r"(?<!no )unrelated privilege widening|"
+    r"無関係な権限拡大(?!なし)",
+    re.IGNORECASE,
+)
 
 _ISSUE_COMMENT_URL_RE = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)"
@@ -652,8 +795,24 @@ def detect_boundary_flags(text: "str | None", *, expands_allowed_paths: bool = F
     """
     haystack = text or ""
     flags = {name: bool(pattern.search(haystack)) for name, pattern in _BOUNDARY_KEYWORD_PATTERNS.items()}
-    flags["expands_allowed_paths"] = bool(expands_allowed_paths)
+    flags["expands_allowed_paths"] = bool(
+        expands_allowed_paths
+        or _ALLOWED_PATHS_EXPANSION_PHRASE_RE.search(haystack)
+        or _ALLOWED_PATHS_DIRECTIVE_RE.search(haystack)
+    )
     return {key: flags.get(key, False) for key in _BOUNDARY_FLAG_KEYS}
+
+
+def _has_explicit_exact_allowed_path_expansion(evidence: dict) -> bool:
+    directives = evidence.get("extracted_directives") or []
+    for item in directives:
+        if not isinstance(item, str):
+            continue
+        if not _ALLOWED_PATHS_DIRECTIVE_RE.search(item):
+            continue
+        if _extract_path_literals_from_text(item):
+            return True
+    return False
 
 
 def extract_directive_markers(text: "str | None") -> list:
@@ -825,7 +984,7 @@ _MARKER_TO_CONTRACT_SECTION = {
 
 
 def derive_contract_patch_operations(evidence_list: list) -> list:
-    """Derive one section-bound operation for each normalized directive.
+    """Derive section-bound operations from normalized directives.
 
     ``CONTRACT_PATCH_PLAN_V1`` deliberately retains its existing ``append``
     wire grammar.  The consumer below turns these entries into transaction-
@@ -856,6 +1015,22 @@ def derive_contract_patch_operations(evidence_list: list) -> list:
                     (candidate for candidate in markers if candidate in _MARKER_TO_CONTRACT_SECTION),
                     "revised acceptance criteria",
                 )
+            if marker == "allowed paths":
+                # Never append untrusted prose to the authorization-bearing
+                # Allowed Paths section.  A mixed or malformed directive
+                # produces no operation; classification separately routes it
+                # to human escalation before a transaction can be prepared.
+                for path in _extract_path_literals_from_text(text):
+                    operations.append(
+                        {
+                            "section": _MARKER_TO_CONTRACT_SECTION[marker],
+                            "op": "append",
+                            "text": f"- `{path}`",
+                            "rationale": "Exact Allowed Paths delta extracted from trusted review comment",
+                            "source_evidence_index": index,
+                        }
+                    )
+                continue
             operations.append(
                 {
                     "section": _MARKER_TO_CONTRACT_SECTION[marker],
@@ -1293,17 +1468,108 @@ def _build_scope_delta_authority_result(
 
 _BOUNDARY_REASON_PRIORITY = (
     ("destructive_or_non_idempotent_operation", REASON_DESTRUCTIVE_OR_NON_IDEMPOTENT_OPERATION),
-    ("changes_permission_boundary", REASON_CHANGES_PERMISSION_BOUNDARY),
     ("changes_external_service_boundary", REASON_CHANGES_EXTERNAL_SERVICE_BOUNDARY),
-    ("expands_allowed_paths", REASON_EXPANDS_ALLOWED_PATHS),
     ("requires_issue_split", REASON_REQUIRES_ISSUE_SPLIT),
+    ("changes_permission_boundary", REASON_CHANGES_PERMISSION_BOUNDARY),
+    ("expands_allowed_paths", REASON_EXPANDS_ALLOWED_PATHS),
 )
 
 
-def _first_true_boundary_reason(boundary_flags: dict):
+def _is_negated_permission_text(text: str) -> bool:
+    lowered = (text or "").lower()
+    for pattern in _DIRECTIVE_NEGATION_PATTERNS:
+        if pattern.search(lowered):
+            return True
+    return False
+
+
+def _contains_all_permission_constraints(text: str) -> bool:
+    lowered = (text or "").lower()
+    if _is_negated_permission_text(lowered):
+        return False
+    required_groups = (
+        ("exact permission delta", "exact delta", "exact に", "正確な権限差分", "exact diff"),
+        (
+            "necessary for the human directive",
+            "necessary for the directive",
+            "required for the directive",
+            "human directive の目的に必要",
+            "指示の目的に必要",
+        ),
+        ("least privilege", "least-privilege", "最小権限"),
+        ("non-destructive", "非破壊", "not destructive", "破壊的でない"),
+        ("no secret", "no secrets", "secretなし", "secretsなし", "シークレットなし"),
+        ("no paid", "no external paid", "external-paidなし", "外部課金なし", "課金なし"),
+        (
+            "no unrelated privilege widening",
+            "no unrelated widening",
+            "unrelated privilege wideningなし",
+            "無関係な権限拡大なし",
+        ),
+    )
+    return all(any(marker in lowered for marker in group) for group in required_groups)
+
+
+def _permission_boundary_is_constrained_directive(evidence: dict, boundary_flags: dict) -> bool:
+    """Return whether a permission redesign is explicitly constrained.
+
+    Permission-boundary work remains fail-closed by default. The existing
+    evidence schema intentionally carries only normalized directive text, so
+    this predicate uses that already-extracted text and never requests raw
+    comment bodies or adds a parallel authorization schema. Every safety
+    statement is required; omission is not treated as approval.
+    """
+    if not boundary_flags.get("changes_permission_boundary"):
+        return False
+    if boundary_flags.get("destructive_or_non_idempotent_operation") or boundary_flags.get(
+        "requires_issue_split"
+    ) or boundary_flags.get("changes_external_service_boundary"):
+        return False
+
+    directives = evidence.get("extracted_directives") or []
+    concrete_deltas: list[tuple[str, str, str]] = []
+    for directive in directives:
+        candidate = _strip_quoted_fragments(str(directive))
+        if not _contains_all_permission_constraints(candidate):
+            continue
+        if _UNRELATED_PERMISSION_WIDENING_RE.search(candidate):
+            return False
+        # A stock claim of an "exact permission delta" is insufficient.
+        # The normalized directive must carry an actual before→after value
+        # and an exact repository-relative target path. The controlled
+        # transaction and fresh validators verify that the proposed delta is
+        # still current before any implementation route is considered.
+        for delta in _CONCRETE_PERMISSION_DELTA_RE.finditer(candidate):
+            path = _CONCRETE_REPOSITORY_PATH_RE.search(str(directive))
+            if path is None or not delta.group("before").strip() or not delta.group("after").strip():
+                continue
+            concrete_deltas.append(
+                (delta.group("before").strip(), delta.group("after").strip(), path.group("path"))
+            )
+
+    # A trusted directive may name exactly one verified permission delta. A
+    # second (including contradictory) delta requires a human resolution;
+    # choosing one would be an inference across authorization boundaries.
+    return len(concrete_deltas) == 1
+
+
+def _first_blocking_boundary_reason(boundary_flags: dict, evidence: dict):
+    """Return the first boundary that has not earned its narrow exception.
+
+    Every true flag is evaluated independently.  Clearing a constrained
+    permission redesign must never hide an external, destructive, split, or
+    vague Allowed Paths boundary that appears later in the priority order.
+    """
     for key, reason in _BOUNDARY_REASON_PRIORITY:
-        if boundary_flags.get(key):
-            return reason
+        if not boundary_flags.get(key):
+            continue
+        if key == "changes_permission_boundary" and _permission_boundary_is_constrained_directive(
+            evidence, boundary_flags
+        ):
+            continue
+        if key == "expands_allowed_paths" and _has_explicit_exact_allowed_path_expansion(evidence):
+            continue
+        return reason
     return None
 
 
@@ -1477,7 +1743,7 @@ def classify_scope_delta_authority(
         )
 
     # category == human_review_directive
-    boundary_reason = _first_true_boundary_reason(boundary_flags)
+    boundary_reason = _first_blocking_boundary_reason(boundary_flags, primary_evidence)
     if boundary_reason is not None:
         # AC18: boundary flags gate even a trusted approval.
         return _build_scope_delta_authority_result(

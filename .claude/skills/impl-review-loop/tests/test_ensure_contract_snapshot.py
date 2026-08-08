@@ -1938,6 +1938,69 @@ class TestExistingGoBaseBindingFreshness:
 class TestFinalAuthorityPostcondition:
     """P1: no path may expose an ``ok`` snapshot after authority drift."""
 
+    def test_existing_go_timestamp_authority_drift_restarts_materialization(self):
+        """ABA-shaped timestamp drift must not reuse existing_go."""
+        parser_mod = _mock_parser_mod(comments=[_GO_COMMENT], go_comment=_GO_COMMENT)
+        snapshots = [
+            (_SAMPLE_BODY, "2026-06-13T08:00:00Z", None),
+            (_SAMPLE_BODY, "2026-06-13T08:00:00Z", None),
+            (_SAMPLE_BODY, "2026-06-13T09:00:00Z", None),
+        ]
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                side_effect=snapshots,
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "verify_snapshot_authority_postcondition",
+                    wraps=_real_verify_snapshot_authority_postcondition,
+                ):
+                    with patch.object(
+                        _ecs_mod,
+                        "run_contract_review_once",
+                        return_value=(_make_review_result("go"), None),
+                    ) as review:
+                        result = ensure_contract_snapshot(
+                            issue_number=_ISSUE_NUMBER,
+                            repo=_REPO,
+                            mode="dry-run",
+                        )
+
+        assert result["status"] == "dry_run_would_post"
+        assert result["source"] == "materialized_go"
+        assert result["contract_snapshot_url"] is None
+        review.assert_called_once()
+
+    def test_existing_go_timestamp_authority_drift_is_fail_closed_in_check_only(self):
+        """check-only never converts timestamp drift into existing_go reuse."""
+        parser_mod = _mock_parser_mod(comments=[_GO_COMMENT], go_comment=_GO_COMMENT)
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "verify_snapshot_authority_postcondition",
+                    return_value=(False, "authority_issue_updated_at_mismatch"),
+                ):
+                    with patch.object(_ecs_mod, "run_contract_review_once") as review:
+                        result = ensure_contract_snapshot(
+                            issue_number=_ISSUE_NUMBER,
+                            repo=_REPO,
+                            mode="check-only",
+                        )
+
+        assert result["status"] == "human_judgment"
+        assert result["source"] == "readiness_blocked"
+        assert result["contract_snapshot_url"] is None
+        review.assert_not_called()
+
     def test_existing_go_base_moves_during_final_readback_returns_stale(self):
         parser_mod = _mock_parser_mod(comments=[_GO_COMMENT], go_comment=_GO_COMMENT)
         with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
