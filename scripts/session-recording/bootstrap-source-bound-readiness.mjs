@@ -255,27 +255,30 @@ function main() {
 // parent that is a symlink (or owned by someone else) would be silently
 // forced to mode 0700. This instead:
 //   - creates the parent (and any missing ancestors) with mode 0700 ONLY
-//     when it does not already exist -- a directory this call itself
-//     created is always safe to chmod;
-//   - for a pre-existing parent, opens it with O_NOFOLLOW|O_DIRECTORY
-//     (rejecting a symlink outright, no separate stat-then-open TOCTOU
-//     window) and verifies -- via the open file descriptor, never the
-//     pathname again -- that it is a real directory owned by the current
-//     uid before repairing its mode to exactly 0700 (a looser mode left by
-//     an older version of this script is explicitly repaired by policy,
-//     never silently trusted as-is).
+//     when it does not already exist; the resulting path is then opened
+//     and validated through the fd before fchmodSync(), the same as the
+//     pre-existing-parent case below;
+//   - for a pre-existing parent, opens it with O_RDONLY (adding
+//     O_NOFOLLOW when the runtime exposes fs.constants.O_NOFOLLOW) and
+//     verifies -- via the open file descriptor, never the pathname
+//     again, using fstatSync() -- that it is a real directory and, when
+//     process.getuid() is available, that its uid matches the current
+//     uid, before repairing its mode to exactly 0700 (a
+//     looser mode left by an older version of this script is explicitly
+//     repaired by policy, never silently trusted as-is).
 function preparePrivateParentDir(dir) {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 })
   }
 
-  // Deliberately NOT combining O_DIRECTORY with O_NOFOLLOW: per POSIX,
-  // open(O_DIRECTORY|O_NOFOLLOW) on a symlink is required to fail with
-  // ENOTDIR (not ELOOP), which would be indistinguishable from "this path
-  // component genuinely is not a directory". O_NOFOLLOW alone reliably
-  // fails with ELOOP for a symlink regardless of its target type; the
-  // separate fstatSync().isDirectory() check below (which runs against the
-  // fd of whatever WAS actually opened) is what verifies "is a directory".
+  // Deliberately NOT combining O_DIRECTORY with O_NOFOLLOW here; this
+  // function does not rely on any specific errno precedence between them.
+  // O_NOFOLLOW is added to flags only when the runtime exposes
+  // fs.constants.O_NOFOLLOW, and only rejects a symlink at the trailing
+  // (basename) path component -- it does not affect earlier path
+  // components. Whether the opened path is actually a directory is
+  // verified separately below via fstatSync().isDirectory() against the
+  // fd of whatever was actually opened, not via the open() flags alone.
   let flags = fsConstants.O_RDONLY
   if (typeof fsConstants.O_NOFOLLOW === 'number') flags |= fsConstants.O_NOFOLLOW
 
