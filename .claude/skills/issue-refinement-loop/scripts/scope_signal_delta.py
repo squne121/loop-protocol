@@ -610,7 +610,7 @@ _BOUNDARY_KEYWORD_PATTERNS = {
         re.IGNORECASE,
     ),
     "changes_external_service_boundary": re.compile(
-        r"(external service|外部サービス|third[- ]party api|external api|call.*external)",
+        r"((?<!no paid )external service|外部サービス|third[- ]party api|external api|call.*external)",
         re.IGNORECASE,
     ),
     "destructive_or_non_idempotent_operation": re.compile(
@@ -627,6 +627,51 @@ _BOUNDARY_KEYWORD_PATTERNS = {
         re.IGNORECASE,
     ),
 }
+
+_ALLOWED_PATHS_EXPANSION_PHRASE_RE = re.compile(
+    r"(add|adding|added|expand|expanded|拡張|追加|必要|necessary).{0,30}"
+    r"(allowed paths?|allowed path|許可(?:された)?パス)",
+    re.IGNORECASE,
+)
+
+_ALLOWED_PATHS_DIRECTIVE_RE = re.compile(
+    r"(allowed paths|allowed path|許可(?:された)?パス)",
+    re.IGNORECASE,
+)
+
+_DIRECTIVE_NEGATION_PATTERNS = (
+    re.compile(r"least privilege.{0,25}(?:ではない|not)", re.IGNORECASE),
+    re.compile(r"least privilege.{0,25}not(?:\s+necessary|[\s-]needed)", re.IGNORECASE),
+    re.compile(r"no secrets?.{0,20}not(?:\s+guaranteed|確約され)", re.IGNORECASE),
+    re.compile(r"possible\s+(?:service|paid service|external service)", re.IGNORECASE),
+    re.compile(r"not\s+(?:guaranteed|assured|guarantee)", re.IGNORECASE),
+)
+
+_NON_QUOTED_GROUP = (
+    r"`[^`]*`",
+    r'"[^"]*"',
+    r"'[^']*'",
+)
+
+
+def _extract_path_literals_from_text(text: str) -> list[str]:
+    """Extract canonical path-like literals from markdown-like text."""
+    path_literals: list[str] = []
+    for match in PATH_TOKEN_RE.finditer(text or ""):
+        candidate = match.group("path") or match.group("bare") or ""
+        normalized = _normalize_path(candidate)
+        if not normalized or "/" not in normalized:
+            continue
+        if normalized not in path_literals:
+            path_literals.append(normalized)
+    return path_literals
+
+
+def _strip_quoted_fragments(text: str) -> str:
+    stripped = text
+    for pattern in _NON_QUOTED_GROUP:
+        stripped = re.sub(pattern, " ", stripped)
+    return stripped
 
 _DIRECTIVE_SECTION_MARKERS = (
     "revised acceptance criteria",
@@ -664,8 +709,24 @@ def detect_boundary_flags(text: "str | None", *, expands_allowed_paths: bool = F
     """
     haystack = text or ""
     flags = {name: bool(pattern.search(haystack)) for name, pattern in _BOUNDARY_KEYWORD_PATTERNS.items()}
-    flags["expands_allowed_paths"] = bool(expands_allowed_paths)
+    flags["expands_allowed_paths"] = bool(
+        expands_allowed_paths
+        or _ALLOWED_PATHS_EXPANSION_PHRASE_RE.search(haystack)
+        or _ALLOWED_PATHS_DIRECTIVE_RE.search(haystack)
+    )
     return {key: flags.get(key, False) for key in _BOUNDARY_FLAG_KEYS}
+
+
+def _has_explicit_exact_allowed_path_expansion(evidence: dict) -> bool:
+    directives = evidence.get("extracted_directives") or []
+    for item in directives:
+        if not isinstance(item, str):
+            continue
+        if not _ALLOWED_PATHS_DIRECTIVE_RE.search(item):
+            continue
+        if _extract_path_literals_from_text(item):
+            return True
+    return False
 
 
 def extract_directive_markers(text: "str | None") -> list:
@@ -1305,37 +1366,25 @@ def _build_scope_delta_authority_result(
 
 _BOUNDARY_REASON_PRIORITY = (
     ("destructive_or_non_idempotent_operation", REASON_DESTRUCTIVE_OR_NON_IDEMPOTENT_OPERATION),
-    ("changes_permission_boundary", REASON_CHANGES_PERMISSION_BOUNDARY),
     ("changes_external_service_boundary", REASON_CHANGES_EXTERNAL_SERVICE_BOUNDARY),
-    ("expands_allowed_paths", REASON_EXPANDS_ALLOWED_PATHS),
     ("requires_issue_split", REASON_REQUIRES_ISSUE_SPLIT),
+    ("changes_permission_boundary", REASON_CHANGES_PERMISSION_BOUNDARY),
+    ("expands_allowed_paths", REASON_EXPANDS_ALLOWED_PATHS),
 )
 
 
-def _first_true_boundary_reason(boundary_flags: dict):
-    for key, reason in _BOUNDARY_REASON_PRIORITY:
-        if boundary_flags.get(key):
-            return reason
-    return None
+def _is_negated_permission_text(text: str) -> bool:
+    lowered = (text or "").lower()
+    for pattern in _DIRECTIVE_NEGATION_PATTERNS:
+        if pattern.search(lowered):
+            return True
+    return False
 
 
-def _permission_boundary_is_constrained_directive(evidence: dict, boundary_flags: dict) -> bool:
-    """Return whether a permission redesign is explicitly constrained.
-
-    Permission-boundary work remains fail-closed by default. The existing
-    evidence schema intentionally carries only normalized directive text, so
-    this predicate uses that already-extracted text and never requests raw
-    comment bodies or adds a parallel authorization schema. Every safety
-    statement is required; omission is not treated as approval.
-    """
-    if not boundary_flags.get("changes_permission_boundary"):
+def _contains_all_permission_constraints(text: str) -> bool:
+    lowered = (text or "").lower()
+    if _is_negated_permission_text(lowered):
         return False
-    if boundary_flags.get("destructive_or_non_idempotent_operation") or boundary_flags.get(
-        "requires_issue_split"
-    ):
-        return False
-
-    text = "\n".join(str(item) for item in (evidence.get("extracted_directives") or [])).lower()
     required_groups = (
         ("exact permission delta", "exact delta", "exact に", "正確な権限差分", "exact diff"),
         (
@@ -1356,7 +1405,51 @@ def _permission_boundary_is_constrained_directive(evidence: dict, boundary_flags
             "無関係な権限拡大なし",
         ),
     )
-    return all(any(marker in text for marker in group) for group in required_groups)
+    return all(any(marker in lowered for marker in group) for group in required_groups)
+
+
+def _permission_boundary_is_constrained_directive(evidence: dict, boundary_flags: dict) -> bool:
+    """Return whether a permission redesign is explicitly constrained.
+
+    Permission-boundary work remains fail-closed by default. The existing
+    evidence schema intentionally carries only normalized directive text, so
+    this predicate uses that already-extracted text and never requests raw
+    comment bodies or adds a parallel authorization schema. Every safety
+    statement is required; omission is not treated as approval.
+    """
+    if not boundary_flags.get("changes_permission_boundary"):
+        return False
+    if boundary_flags.get("destructive_or_non_idempotent_operation") or boundary_flags.get(
+        "requires_issue_split"
+    ) or boundary_flags.get("changes_external_service_boundary"):
+        return False
+
+    directives = evidence.get("extracted_directives") or []
+    for directive in directives:
+        candidate = _strip_quoted_fragments(str(directive))
+        if _contains_all_permission_constraints(candidate):
+            return True
+    return False
+
+
+def _first_blocking_boundary_reason(boundary_flags: dict, evidence: dict):
+    """Return the first boundary that has not earned its narrow exception.
+
+    Every true flag is evaluated independently.  Clearing a constrained
+    permission redesign must never hide an external, destructive, split, or
+    vague Allowed Paths boundary that appears later in the priority order.
+    """
+    for key, reason in _BOUNDARY_REASON_PRIORITY:
+        if not boundary_flags.get(key):
+            continue
+        if key == "changes_permission_boundary" and _permission_boundary_is_constrained_directive(
+            evidence, boundary_flags
+        ):
+            continue
+        if key == "expands_allowed_paths" and _has_explicit_exact_allowed_path_expansion(evidence):
+            continue
+        return reason
+    return None
 
 
 def _classify_single_evidence(evidence: dict) -> dict:
@@ -1529,18 +1622,7 @@ def classify_scope_delta_authority(
         )
 
     # category == human_review_directive
-    boundary_reason = _first_true_boundary_reason(boundary_flags)
-    if boundary_reason == REASON_CHANGES_PERMISSION_BOUNDARY and _permission_boundary_is_constrained_directive(
-        primary_evidence, boundary_flags
-    ):
-        # A trusted, explicit, least-privilege redesign still requires a
-        # contract update and fresh validation; it never grants implementation
-        # permission at this point.
-        boundary_reason = None
-    elif boundary_reason == REASON_EXPANDS_ALLOWED_PATHS:
-        # Exact path expansion supplied by an explicit trusted directive is a
-        # contract-update concern, not a second human-approval loop.
-        boundary_reason = None
+    boundary_reason = _first_blocking_boundary_reason(boundary_flags, primary_evidence)
     if boundary_reason is not None:
         # AC18: boundary flags gate even a trusted approval.
         return _build_scope_delta_authority_result(

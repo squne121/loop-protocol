@@ -215,16 +215,59 @@ def _validate_artifact_projection(*, repo_root: Path, issue_number: int, artifac
 # Trusted author associations for ANCHOR_SCOPE_REFRAME_V1
 TRUSTED_ANCHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
-# Canonical machine-generated comments can be authored through the same
-# GitHub principal as a human OWNER. Their marker is provenance, not a
-# presentation-style heuristic: a generated handoff must never become its own
-# next-iteration approval. A root control-plane may materialize an already
-# received interactive human instruction with the explicit compatibility
-# marker below; that marker is distinct from ordinary generated reports.
-_GENERATED_COMMENT_MARKERS = ("LOOP_HANDOFF_RESULT_V1", "CONTROLLED_EXEC_MARKER")
-_DIRECT_INTERACTIVE_HUMAN_MATERIALIZATION_MARKER = (
-    "OWNER_DIRECTIVE_MATERIALIZED_FROM_INTERACTIVE_PROMPT_V1"
-)
+# Trusted lanes for source attribution.
+_HUMAN_CONTEXT_COMMENT_URLS_FIELD = "human_context_comment_urls"
+_AGENT_REPORT_COMMENT_URLS_FIELD = "agent_report_comment_urls"
+
+
+def _normalize_comment_url_set(value: Any) -> set[str] | None:
+    """Return a normalized set of URLs or `None` when malformed.
+
+    Malformed explicit-lane fields are treated as untrusted control-plane
+    input (fail-closed) so they cannot be used to infer a trusted origin.
+    """
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {value}
+    if not isinstance(value, (list, tuple, set)):
+        return None
+    urls: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        urls.add(item)
+    return urls
+
+
+def _resolve_scope_delta_source_kind(
+    anchor_url: str,
+    *,
+    human_context_comment_urls: Any,
+    agent_report_comment_urls: Any,
+) -> str:
+    """Resolve source kind from control-plane explicit lanes only."""
+    human_urls = _normalize_comment_url_set(human_context_comment_urls)
+    agent_urls = _normalize_comment_url_set(agent_report_comment_urls)
+
+    # Any unrecognized or unlabeled lane payload is fail-closed.  An anchor
+    # URL alone is not an origin lane: callers must state whether it is human
+    # context or an agent report.
+    if human_urls is None or agent_urls is None:
+        return "generated_by_agent"
+
+    in_human = anchor_url in human_urls
+    in_agent = anchor_url in agent_urls
+
+    # Fail-closed on duplicate lane identity.
+    if in_human and in_agent:
+        return "generated_by_agent"
+
+    if in_agent:
+        return "generated_by_agent"
+    if in_human:
+        return "issue_comment"
+    return "generated_by_agent"
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -1875,6 +1918,8 @@ def _build_scope_delta_authority_evidence(
     issue_number: int,
     anchor_url: str,
     captured_at: str,
+    human_context_comment_urls: Any = None,
+    agent_report_comment_urls: Any = None,
     segments_result: "dict | None" = None,
     candidates_result: "dict | None" = None,
 ):
@@ -1936,14 +1981,10 @@ def _build_scope_delta_authority_evidence(
     confidence = classify_directive_confidence(comment_body, markers)
     boundary_flags_map = detect_boundary_flags(comment_body)
     boundary_flag_names = [name for name, value in boundary_flags_map.items() if value]
-    has_generated_marker = any(marker in comment_body for marker in _GENERATED_COMMENT_MARKERS)
-    is_materialized_interactive_human = (
-        _DIRECT_INTERACTIVE_HUMAN_MATERIALIZATION_MARKER in comment_body
-    )
-    source_kind = (
-        "generated_by_agent"
-        if has_generated_marker and not is_materialized_interactive_human
-        else "issue_comment"
+    source_kind = _resolve_scope_delta_source_kind(
+        anchor_url,
+        human_context_comment_urls=human_context_comment_urls,
+        agent_report_comment_urls=agent_report_comment_urls,
     )
 
     issue_url = f"https://github.com/{repo}/issues/{issue_number}"
@@ -2511,6 +2552,16 @@ def run_preflight(
                 issue_number=issue_number,
                 anchor_url=anchor_url,
                 captured_at=now or _now_iso(),
+                human_context_comment_urls=(
+                    known_context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD)
+                    if isinstance(known_context, dict)
+                    else None
+                ),
+                agent_report_comment_urls=(
+                    known_context.get(_AGENT_REPORT_COMMENT_URLS_FIELD)
+                    if isinstance(known_context, dict)
+                    else None
+                ),
                 segments_result=_segments_result,
                 candidates_result=_candidates_result,
             )
@@ -3348,6 +3399,20 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--human-context-comment-url",
+        dest="human_context_comment_urls",
+        action="append",
+        default=[],
+        help="Explicit human-context issue-comment URL (repeatable).",
+    )
+    parser.add_argument(
+        "--agent-report-comment-url",
+        dest="agent_report_comment_urls",
+        action="append",
+        default=[],
+        help="Explicit agent-report issue-comment URL (repeatable; never authorizes a rewrite).",
+    )
+    parser.add_argument(
         "--fixture",
         type=Path,
         default=None,
@@ -3399,11 +3464,19 @@ def main(argv: list[str] | None = None) -> None:
         print(_build_compact_stdout(result))
         sys.exit(EXIT_BLOCKED)
 
+    cli_known_context = None
+    if args.human_context_comment_urls or args.agent_report_comment_urls:
+        cli_known_context = {
+            _HUMAN_CONTEXT_COMMENT_URLS_FIELD: args.human_context_comment_urls,
+            _AGENT_REPORT_COMMENT_URLS_FIELD: args.agent_report_comment_urls,
+        }
+
     _, exit_code = run_preflight(
         issue_number=args.issue_number,
         repo=args.repo,
         anchor_comment_urls=args.anchor_comment_urls,
         fixture_path=args.fixture,
+        known_context=cli_known_context,
         consume_contract_patch_plan=args.consume_contract_patch_plan,
     )
     sys.exit(exit_code)

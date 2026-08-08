@@ -107,6 +107,8 @@ GitHub API の `author_association` フィールドで判定する。
 - comment body が quoted markdown（blockquote `>`）内に埋め込まれている
 - fenced-code block 内の marker がさらに別の fenced-code や blockquote に入れ子になっている
   - **注意**: top-level の `\`\`\`yaml` ブロックが canonical format。blockquote の後の fence や、非 YAML fenced block は fail-closed。
+- `Allowed Paths` 拡張が `expand / add / necessary` などの文言のみで具体 path リテラルを
+  含まない場合は fail-closed（human escalation）とする。
 
 trusted anchor と判定された場合のみ `scope_delta_decision.status=approved_by_trusted_anchor` を生成する。scope 拡張の自動実装許可は禁止。
 
@@ -122,21 +124,26 @@ input に渡さず、新しい authority schema も作らない。
   directive に限る。
 - trusted かつ explicit な exact Allowed Paths delta は contract update の対象であり、
   それだけで implementation を許可しない。
-- permission-boundary redesign は、exact delta、least privilege、非破壊、secret なし、
-  external paid service なし、無関係な権限拡大なしを **すべて** 明示した場合だけ
-  `contract_update_required` に進む。どれかが欠ける場合、または destructive / Issue
-  partition が混在する場合は human escalation のままにする。
+- permission-boundary redesign は、同一 directive 行（single bullet）で
+  exact delta、least privilege、非破壊、secret なし、external paid service なし、
+  無関係な権限拡大なしを **すべて** 明示した場合のみ `contract_update_required`
+  を許容する。別 bullet の分割混在、引用内の語句、否定表現
+  (`least privilege ではない` / `no secret なし not guaranteed` / `possible paid service`) は
+  escalation のままにする。
+- 権限 redesign が external service / destructive / issue partition と同居する場合は
+  当該境界を優先し、人手承認（human escalation）に留める。
 - contract update 後は contract review、refinement preflight、allowed-path gate、該当する
   permission/profile validator と runtime evidence を fresh に成功させるまで
   implementation route を許可しない。
 
 GitHub の `author_association=OWNER`、投稿アカウント、Markdown の見出し数・引用数などは
-origin や authorization を単独で決めない。`LOOP_HANDOFF_RESULT_V1` または
-`CONTROLLED_EXEC_MARKER` を持つ canonical generated comment は `generated_by_agent` として
-human directive candidate から除外する。root control-plane が既に受領した interactive human
+origin や authorization を単独で決めない。`source_kind` は `human_context_comment_urls` /
+`agent_report_comment_urls` の明示 lane からのみ導出し、本文の `LOOP_HANDOFF_RESULT_V1` / `CONTROLLED_EXEC_MARKER`
+のみで `generated_by_agent` とみなしてはならない。lane に無い anchor、または両 lane に重複する URL は
+fail-closed で generated として扱う。root control-plane が既に受領した interactive human
 instruction を materialize する場合だけ、明示 provenance marker
-`OWNER_DIRECTIVE_MATERIALIZED_FROM_INTERACTIVE_PROMPT_V1` を付与して通常の generated handoff
-と区別する。この marker は implementation go を与えず、上記 fresh rerun を省略しない。
+`OWNER_DIRECTIVE_MATERIALIZED_FROM_INTERACTIVE_PROMPT_V1` を付与して通常の generated handoff と区別する。
+marker 自体は実装 go を与えず、上記 fresh rerun を省略しない。
 
 ### phase ごとの扱い（phase-sensitive semantics）
 

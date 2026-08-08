@@ -68,14 +68,30 @@ def _directive_body(*, materialized: bool = False, permission: bool = False) -> 
     return "\n".join(lines)
 
 
-def _evidence(body: str, *, url: str = URL, payload: dict | None = None) -> dict:
+def _evidence(
+    body: str,
+    *,
+    url: str = URL,
+    payload: dict | None = None,
+    human_context_comment_urls: list[str] | None = None,
+    agent_report_comment_urls: list[str] | None = None,
+) -> dict:
+    if human_context_comment_urls is None and agent_report_comment_urls is None:
+        human_context_comment_urls = [url]
+    comment_payload = dict(payload or _payload())
+    if human_context_comment_urls is not None:
+        comment_payload["human_context_comment_urls"] = human_context_comment_urls
+    if agent_report_comment_urls is not None:
+        comment_payload["agent_report_comment_urls"] = agent_report_comment_urls
     evidence = preflight._build_scope_delta_authority_evidence(
-        comment_payload=payload or _payload(),
+        comment_payload=comment_payload,
         comment_body=body,
         repo=REPO,
         issue_number=ISSUE,
         anchor_url=url,
         captured_at="2026-08-08T00:00:00Z",
+        human_context_comment_urls=human_context_comment_urls,
+        agent_report_comment_urls=agent_report_comment_urls,
     )
     assert evidence is not None
     return evidence
@@ -96,9 +112,10 @@ def test_owner_prose_directive_without_anchor_payload_routes_contract_update():
 
     assert result["authority_category"] == "human_review_directive"
     assert result["directive"]["confidence"] == "explicit"
-    assert result["route"]["action"] == "contract_update_required"
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "expands_allowed_paths"
     assert result["route"]["implementation_allowed"] is False
-    assert result["contract_patch_plan"]["source_evidence"][0]["source_comment_id"] == 5224799872
+    assert result["provenance"]["source_ref"] == URL
 
 
 def test_role_split_same_issue_is_not_issue_partition():
@@ -107,14 +124,26 @@ def test_role_split_same_issue_is_not_issue_partition():
 
     assert flags["requires_issue_split"] is False
     assert result["boundary_flags"]["requires_issue_split"] is False
-    assert result["route"]["action"] == "contract_update_required"
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "expands_allowed_paths"
 
 
 def test_explicit_permission_delta_requires_contract_update_not_implementation():
-    body = _directive_body(permission=True)
+    body = "\n".join(
+        [
+            "# #1952 の scope delta",
+            "- #1952 は分割しない。issue-author を issue-creator / issue-editor へ split するのは "
+            "role split であり 1 Issue = 1 PR のままにする。",
+            "- contract update で current main から導出した exact Allowed Paths `docs/test.md` を採用し、"
+            "required rerun を実行する。",
+            "- exact permission delta は human directive の目的に必要であり、least privilege で採用する。"
+            "non-destructive、no secrets、no paid external service、no unrelated privilege widening を満たす。",
+        ]
+    )
     result = _classify(_evidence(body))
 
     assert result["boundary_flags"]["changes_permission_boundary"] is True
+    assert result["route"]["reason_code"] == "explicit_human_contract_directive"
     assert result["route"]["action"] == "contract_update_required"
     assert result["route"]["implementation_allowed"] is False
     assert result["route"]["next_step"] == "rerun_refinement_after_contract_update"
@@ -129,6 +158,70 @@ def test_permission_delta_without_human_directive_necessity_escalates():
     assert result["route"]["reason_code"] == "changes_permission_boundary"
 
 
+def test_cross_bullet_permission_constraint_conjunction_is_not_sufficient():
+    body = "\n".join(
+        [
+            "- exact permission delta は human directive の目的に必要であり、least privilege で採用する。",
+            "- non-destructive、no secrets、no paid external service、no unrelated privilege widening を満たす。",
+        ]
+    )
+    result = _classify(_evidence(body))
+
+    assert result["boundary_flags"]["changes_permission_boundary"] is True
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "changes_permission_boundary"
+
+
+def test_quoted_or_negated_permission_templates_do_not_satisfy_constraints():
+    body = "\n".join(
+        [
+            "- exact permission delta は human directive の目的に必要であり、least privilege で採用する。",
+            "- \"least privilege ではない\" を明記する。",
+            "- non-destructive、no secrets、no paid external service、no unrelated privilege widening を満たす。",
+        ]
+    )
+    result = _classify(_evidence(body))
+
+    assert result["boundary_flags"]["changes_permission_boundary"] is True
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "changes_permission_boundary"
+
+
+def test_permission_boundary_preserves_external_or_destructive_route_priority():
+    body = "\n".join(
+        [
+            "- exact permission delta は human directive の目的に必要であり、least privilege で採用する。"
+            "non-destructive、no secrets、no paid external service、no unrelated privilege widening、"
+            "call external service、force-push。",
+        ]
+    )
+    result = _classify(_evidence(body))
+
+    assert result["boundary_flags"]["changes_permission_boundary"] is True
+    assert result["boundary_flags"]["changes_external_service_boundary"] is True
+    assert result["boundary_flags"]["destructive_or_non_idempotent_operation"] is True
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "destructive_or_non_idempotent_operation"
+
+
+def test_vague_expands_allowed_paths_requires_human_escalation():
+    body = "- allowed paths を expand する"
+    result = _classify(_evidence(body))
+
+    assert result["boundary_flags"]["expands_allowed_paths"] is True
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "expands_allowed_paths"
+
+
+def test_exact_allowed_path_literals_stay_contract_update_only():
+    body = "- allowed paths を必要に応じて追加する: `docs/test.md`"
+    result = _classify(_evidence(body))
+
+    assert result["boundary_flags"]["expands_allowed_paths"] is True
+    assert result["route"]["action"] == "contract_update_required"
+    assert result["route"]["implementation_allowed"] is False
+
+
 def test_generated_owner_handoff_is_not_human_directive():
     body = "\n".join(
         [
@@ -139,7 +232,12 @@ def test_generated_owner_handoff_is_not_human_directive():
     )
     handoff_url = f"https://github.com/{REPO}/issues/{ISSUE}#issuecomment-5224719577"
     result = _classify(
-        _evidence(body, url=handoff_url, payload=_payload(comment_id=5224719577))
+        _evidence(
+            body,
+            url=handoff_url,
+            payload=_payload(comment_id=5224719577),
+            agent_report_comment_urls=[handoff_url],
+        )
     )
 
     assert result["provenance"]["source_kind"] == "generated_by_agent"
@@ -147,15 +245,109 @@ def test_generated_owner_handoff_is_not_human_directive():
     assert result["route"]["action"] == "human_escalation"
 
 
+def test_generated_owner_handoff_with_explicit_agent_lane_becomes_generated_by_agent():
+    body = "\n".join(
+        [
+            "LOOP_HANDOFF_RESULT_V1",
+            "- contract update: please revise allowed paths",
+            "<!-- CONTROLLED_EXEC_MARKER:fixture -->",
+        ]
+    )
+    handoff_url = f"https://github.com/{REPO}/issues/{ISSUE}#issuecomment-5224719577"
+    result = _classify(
+        _evidence(
+            body,
+            url=handoff_url,
+            payload=_payload(comment_id=5224719577),
+            agent_report_comment_urls=[handoff_url],
+        )
+    )
+
+    assert result["provenance"]["source_kind"] == "generated_by_agent"
+    assert result["authority_category"] == "ai_inferred"
+    assert result["route"]["action"] == "human_escalation"
+
+
+def test_quoted_and_fenced_markers_do_not_invoke_body_based_source_derivation():
+    body = "\n".join(
+        [
+            "```",
+            "LOOP_HANDOFF_RESULT_V1",
+            "<!-- CONTROLLED_EXEC_MARKER:fixture -->",
+            "```",
+            "> - least privilege ではない",
+            "- contract update: please revise allowed paths",
+        ]
+    )
+    result = _classify(_evidence(body, url=URL))
+
+    assert result["provenance"]["source_kind"] == "issue_comment"
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "expands_allowed_paths"
+
+
+def test_lanes_must_not_overlap_between_human_and_agent_contexts():
+    body = _directive_body(permission=True)
+    handoff_url = f"https://github.com/{REPO}/issues/{ISSUE}#issuecomment-1111111111"
+    result = _classify(
+        _evidence(
+            body,
+            url=handoff_url,
+            payload=_payload(comment_id=1111111111),
+            human_context_comment_urls=[handoff_url],
+            agent_report_comment_urls=[handoff_url],
+        )
+    )
+
+    assert result["authority_category"] == "ai_inferred"
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "ai_inferred_scope_delta"
+
+
+def test_unlabeled_anchor_is_fail_closed_even_when_its_body_looks_human():
+    evidence = preflight._build_scope_delta_authority_evidence(
+        comment_payload=_payload(),
+        comment_body=_directive_body(permission=True),
+        repo=REPO,
+        issue_number=ISSUE,
+        anchor_url=URL,
+        captured_at="2026-08-08T00:00:00Z",
+    )
+    assert evidence is not None
+    result = _classify(evidence)
+
+    assert result["provenance"]["source_kind"] == "generated_by_agent"
+    assert result["route"]["action"] == "human_escalation"
+
+
+def test_permission_exception_rechecks_vague_allowed_paths_boundary():
+    body = "\n".join(
+        [
+            "- exact permission delta は human directive の目的に必要であり、least privilege で採用する。"
+            "non-destructive、no secrets、no paid external service、no unrelated privilege widening を満たす。",
+            "- allowed paths を必要に応じて追加する。",
+        ]
+    )
+    result = _classify(_evidence(body))
+
+    assert result["boundary_flags"]["changes_permission_boundary"] is True
+    assert result["boundary_flags"]["expands_allowed_paths"] is True
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "expands_allowed_paths"
+
+
 def test_direct_interactive_human_materialization_remains_distinct_from_generated_handoff():
     evidence = _evidence(_directive_body(materialized=True))
 
     assert evidence["source_kind"] == "issue_comment"
-    assert _classify(evidence)["route"]["action"] == "contract_update_required"
+    assert _classify(evidence)["route"]["action"] == "human_escalation"
+    assert _classify(evidence)["route"]["reason_code"] == "expands_allowed_paths"
 
 
 def test_derived_patch_detects_source_and_body_staleness():
-    result = _classify(_evidence(_directive_body()))
+    body = "- allowed paths を必要に応じて追加する: `docs/test.md`"
+    evidence = _evidence(body)
+    result = _classify(evidence)
     plan = result["contract_patch_plan"]
     source_entry = plan["source_evidence"][0]
 
@@ -177,7 +369,7 @@ def test_derived_patch_detects_source_and_body_staleness():
 
 
 def test_contract_update_rerun_is_required_before_implementation_route():
-    evidence = _evidence(_directive_body())
+    evidence = _evidence("- allowed paths を必要に応じて追加する: `docs/test.md`")
     body = """## Machine-Readable Contract
 
 ```yaml
@@ -349,6 +541,10 @@ $ true
         "issue": {"number": ISSUE, "title": "test", "body": body, "labels": []},
         "comments": [],
         "anchor_comment_urls": [URL],
+        "known_context": {
+            "human_context_comment_urls": [URL],
+            "agent_report_comment_urls": [],
+        },
         "anchor_comments": [
             {
                 **_payload(),
