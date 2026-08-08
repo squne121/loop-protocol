@@ -92,7 +92,7 @@ def build_retry_policy(records: list[dict], stats: dict) -> str:
     add("")
     add("## 機械可読な判定")
     add("")
-    add("```")
+    add("```yaml")
     add(f"retry_policy_verdict: {verdict}")
     add(f"current_design_consistent_with_observation: {consistent}")
     for lane in LANES:
@@ -193,7 +193,7 @@ def build_conclusion(records: list[dict], stats: dict, follow_up: str) -> str:
     add("")
     add("## 機械可読な判定")
     add("")
-    add("```")
+    add("```yaml")
     add(f"conclusion_category: {category}")
     add("bounded_single_retry_applicable: no")
     add("additional_failure_class_subdivision_required: no")

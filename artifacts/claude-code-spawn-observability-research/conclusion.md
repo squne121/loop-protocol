@@ -5,7 +5,7 @@
 
 ## 機械可読な判定
 
-```
+```yaml
 conclusion_category: repo_observability_defect
 bounded_single_retry_applicable: no
 additional_failure_class_subdivision_required: no

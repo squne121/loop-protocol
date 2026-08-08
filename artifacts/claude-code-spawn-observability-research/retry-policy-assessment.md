@@ -7,7 +7,7 @@
 
 ## 機械可読な判定
 
-```
+```yaml
 retry_policy_verdict: keep_excluded
 current_design_consistent_with_observation: yes
 control_spawn_not_observed_count: 11
