@@ -48,7 +48,7 @@ GitHub Ruleset を一次保護とし、Branch protection rule を二次保護と
   - `pull_request`: PR 経由必須 / `required_review_thread_resolution: true` / `dismiss_stale_reviews_on_push: true`
   - `required_status_checks`: `typecheck`, `lint`, `test`, `build`, `python-test` を `strict_required_status_checks_policy: true` で必須化
 
-### 二次: Branch protection rule (`/branches/main/protection`)
+### 二次防御: Branch protection rule (`/branches/main/protection`)
 
 - `required_status_checks.contexts`: `typecheck`, `lint`, `test`, `build`, `python-test`（`strict: true`）
 - `required_status_checks.checks[].app_id`: 全て `15368`（GitHub Actions app）。check source は GitHub Actions に固定されており、外部 PAT / 第三者 GitHub App による status 詐称は受け付けない（Blocker 3 対応）
@@ -72,7 +72,7 @@ GitHub Ruleset を一次保護とし、Branch protection rule を二次保護と
 
 いずれも別 Issue で議論し、本書とは独立して更新する。
 
-### Required status checks の source pinning（Blocker 3 対応）
+### Required status checks の source（発行元）pinning 方針（Blocker 3 対応）
 
 - Ruleset 側 `required_status_checks[].context` は status check 名のみ指定（context のみ）
 - Branch protection 側 `required_status_checks.checks[]` で 5 contexts すべてを `app_id: 15368`（GitHub Actions app）に固定
@@ -109,7 +109,7 @@ gh api repos/squne121/loop-protocol/branches/main/protection/required_pull_reque
 
 ### 2026-05-24 取得 raw snapshot（Blocker 1 対応・監査正本）
 
-**Ruleset `16796903`** — `gh api .../rulesets/16796903 --jq '{id, name, target, enforcement, bypass_actors, current_user_can_bypass, conditions, rules}'`
+**Ruleset `16796903`（取得コマンド）** — `gh api .../rulesets/16796903 --jq '{id, name, target, enforcement, bypass_actors, current_user_can_bypass, conditions, rules}'`
 
 ```json
 {
@@ -189,7 +189,7 @@ gh api repos/squne121/loop-protocol/branches/main/protection/required_pull_reque
 }
 ```
 
-**bypass_pull_request_allowances** — `gh api .../required_pull_request_reviews --jq '.bypass_pull_request_allowances // "field_absent"'`
+**bypass_pull_request_allowances（取得コマンド）** — `gh api .../required_pull_request_reviews --jq '.bypass_pull_request_allowances // "field_absent"'`
 
 ```
 field_absent

@@ -155,7 +155,7 @@ SubAgent（役割）── Skill（作業手順）
 共通参照: [`create-issue/references/body-authoring.md`](../../.claude/skills/create-issue/references/body-authoring.md)
 （VC 作成ガイダンス・Anchor Verification・Machine-Readable Contract block guidance 等。`edit-issue` / `issue-creator` / `issue-editor` も参照する）
 
-### visual_impact schema owner（Issue #2019）
+### visual_impact schema owner（Issue #2019 スキーマ所有者）
 
 `create-issue` / `edit-issue` / `issue-contract-review` / `review-issue` の4スキルが扱う `visual_impact`
 関連フィールド（`VISUAL_IMPACT_DECLARATION_V1` / `VISUAL_IMPACT_DECISION_V1`）の canonical schema owner は

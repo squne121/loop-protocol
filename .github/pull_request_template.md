@@ -8,6 +8,7 @@
 - [ ] `pnpm lint`
 - [ ] `pnpm test`
 - [ ] `pnpm build`
+- 上記コマンドをすべてローカルで実行し、成功したことを確認してからチェックしてください
 
 ## Schema Change Applicability
 
@@ -48,7 +49,7 @@ rg -l "<schema-id-or-key>" .
 |---|---|---|
 | （rg で列挙したファイル） | 更新済み / 不要（理由） / 未対応 |  |
 
-### Compatibility Decision
+### Compatibility Decision（互換性判定）
 
 > schema 変更の互換性を明示してください。`not_schema_change` の場合は各フィールドに `N/A` と記載してください。
 
@@ -57,8 +58,9 @@ rg -l "<schema-id-or-key>" .
 - migration_required: `yes` | `no` | `N/A`
 - migration_or_followup: #N or `N/A`
 - reason:
+- 上記の各フィールドを漏れなく記載してください
 
-## Visual Impact Declaration
+## Visual Impact Declaration（視覚影響申告）
 
 > UI（DOM/CSS）変更を含む PR は `VISUAL_IMPACT_DECLARATION_V1` を1個のみ、fenced ```yaml block として記載してください（Issue #2019）。
 > UI 変更を含まない PR は該当ブロックを省略できます（`visual-impact-policy` job は対象 surface が無ければ何もしません）。
@@ -90,3 +92,4 @@ surfaces: []
 - Related issue:
 - MVP scope:
 - AI / NotebookLM usage:
+- 備考: 関連 Issue・MVP スコープ・AI 利用状況を記載してください

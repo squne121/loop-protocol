@@ -1681,14 +1681,20 @@ jobs:
           echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
           if [ -n "${BASE_SHA}" ] && git cat-file -e "${BASE_SHA}" 2>/dev/null; then
             echo "base_sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
-            BASE_REGISTRY_BLOB_SHA="$(git rev-parse "${BASE_SHA}:docs/dev/visual-surfaces.yml" 2>/dev/null || echo '0000000000000000000000000000000000000000')"
+            # `git rev-parse --verify --quiet` (not plain `git rev-parse`) is
+            # required here: without `--verify`, an unresolved `<rev>:<path>`
+            # arg makes git rev-parse ALSO echo the raw arg back to stdout
+            # (pathspec disambiguation fallback) before exiting non-zero,
+            # which corrupts the `||` fallback value with an extra bare line
+            # and breaks $GITHUB_OUTPUT parsing (##[error]Invalid format).
+            BASE_REGISTRY_BLOB_SHA="$(git rev-parse --verify --quiet "${BASE_SHA}:docs/dev/visual-surfaces.yml" 2>/dev/null || echo '0000000000000000000000000000000000000000')"
           else
             # push / workflow_dispatch (no PR base) -- diff against HEAD
             # itself, which yields an empty changed-path set (no-op run).
             echo "base_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
             BASE_REGISTRY_BLOB_SHA="0000000000000000000000000000000000000000"
           fi
-          HEAD_REGISTRY_BLOB_SHA="$(git rev-parse HEAD:docs/dev/visual-surfaces.yml 2>/dev/null || echo '0000000000000000000000000000000000000000')"
+          HEAD_REGISTRY_BLOB_SHA="$(git rev-parse --verify --quiet HEAD:docs/dev/visual-surfaces.yml 2>/dev/null || echo '0000000000000000000000000000000000000000')"
           echo "base_registry_blob_sha=${BASE_REGISTRY_BLOB_SHA}" >> "$GITHUB_OUTPUT"
           echo "head_registry_blob_sha=${HEAD_REGISTRY_BLOB_SHA}" >> "$GITHUB_OUTPUT"
       - name: Compute changed paths
@@ -1727,7 +1733,12 @@ jobs:
           HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
         run: |
           gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" > check_runs.json || echo '{"check_runs":[]}' > check_runs.json
-          CHECK_RUN_ID="$(python3 -c "import json;d=json.load(open('check_runs.json'));runs=[c for c in d.get('check_runs',[]) if c.get('name')=='component-vrt-report'];print(runs[0]['id'] if runs else '')")"
+          # jq (not a bare `python3 -c` command substitution) is used here so
+          # this step stays outside the governed Python invocation policy
+          # (#1193) scope entirely -- `python3 -c "..."` inside `$(...)` was
+          # rejected as unsupported_shell_grammar by
+          # scripts/ci/check_python_invocation_policy.py --strict.
+          CHECK_RUN_ID="$(jq -r '(.check_runs // []) | map(select(.name == "component-vrt-report")) | (.[0].id // "") | tostring' check_runs.json)"
           echo "check_run_id=${CHECK_RUN_ID}" >> "$GITHUB_OUTPUT"
       - name: Run visual-impact-policy check
         id: policy-check
