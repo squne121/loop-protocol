@@ -482,3 +482,124 @@ def test_blocker4_positive_run_exit_code_is_never_hardcoded_zero_on_failure(e2e,
     )
     evidence = json.loads(Path(result["result_surface"]["primary_artifact"]).read_text())
     assert evidence["close_evidence"]["positive_run"]["exit_code"] is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2036 AC4 fix_delta: credential/transport/protocol failures mid-route
+# are never conflated with a harmless per-turn policy deny -- even if AGY
+# later issues a normal STOP, the overall route must never silently promote
+# to `status: pass`.
+# ---------------------------------------------------------------------------
+
+
+def _mid_route_broker_failure_regression(e2e, monkeypatch, *, exc: Exception):
+    """Shared regression shape: preflight success -> operation 1 exit 0 ->
+    operation 2 hits *exc* mid-route -> AGY issues a normal stop next turn
+    -> assert final status is `fail`, not `pass`."""
+    _standard_setup(e2e, monkeypatch)
+    call_count = {"n": 0}
+
+    def _fake_execute(operation, params, **_kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Preflight `get_repo` probe.
+            return {"exit_code": 0, "redacted_output_digest": "sha256:preflight"}
+        if call_count["n"] == 2:
+            # Operation 1: a genuine successful command.
+            return {
+                "exit_code": 0,
+                "redacted_output_digest": "sha256:op1",
+                "redacted_stdout_sample": "op1 evidence",
+                "redacted_stderr_sample": "",
+                "truncated": False,
+                "timed_out": False,
+                "output_limit_exceeded": False,
+                "duration_ms": 5,
+                "argv": e2e.broker.build_argv(operation, params) if operation != "get_repo" else ["repo", "view"],
+            }
+        # Operation 2: the mid-route broker-side failure under test.
+        raise exc
+
+    monkeypatch.setattr(e2e, "_execute_via_broker_subprocess", _fake_execute)
+
+    turns = iter(
+        [
+            ('{"action": "next", "operation": "get_issue", "params": {"number": 1920}}', ""),
+            ('{"action": "next", "operation": "get_pr", "params": {"number": 1998}}', ""),
+            ('{"action": "stop", "summary": "AGY issued a normal stop after the mid-route failure."}', ""),
+        ]
+    )
+    monkeypatch.setattr(e2e, "_run_agy_turn", lambda **_kwargs: next(turns))
+
+    result = e2e.run_github_research_route(
+        {"schema": "delegation_request_v1", "provider": "agy", "tool_profile": "github_research", "prompt": "x"}
+    )
+    assert result["ok"] is False
+    evidence = json.loads(Path(result["result_surface"]["primary_artifact"]).read_text())
+    assert evidence["status"] == "fail"
+    assert evidence["status"] != "pass"
+    return result, evidence
+
+
+def test_ac4_regression_credential_unavailable_mid_route_never_promotes_to_pass(e2e, monkeypatch):
+    exc = e2e.broker.BrokerCredentialUnavailable("credential_bootstrap_nonzero_exit")
+    result, _evidence = _mid_route_broker_failure_regression(e2e, monkeypatch, exc=exc)
+    assert "credential_unavailable" in (result["failure_class"] or "")
+
+
+def test_ac4_regression_broker_subprocess_timeout_mid_route_never_promotes_to_pass(e2e, monkeypatch):
+    exc = e2e.broker.BrokerTransportTimeout("broker_subprocess_timeout")
+    result, _evidence = _mid_route_broker_failure_regression(e2e, monkeypatch, exc=exc)
+    assert "broker_transport_timeout" in (result["failure_class"] or "")
+
+
+def test_ac4_regression_broker_subprocess_malformed_output_mid_route_never_promotes_to_pass(e2e, monkeypatch):
+    exc = e2e.broker.BrokerProtocolError("broker_subprocess_malformed_output")
+    result, _evidence = _mid_route_broker_failure_regression(e2e, monkeypatch, exc=exc)
+    assert "broker_protocol_error" in (result["failure_class"] or "")
+
+
+def test_ac4_policy_denied_mid_route_still_a_harmless_deny_and_can_reach_pass(e2e, monkeypatch):
+    """Control case for the AC4 regressions above: a genuine pre-execution
+    policy deny (the base `BrokerDenied` class, `failure_class ==
+    "policy_denied"`) is still treated as a harmless per-turn deny that
+    lets the route continue toward a genuine PASS -- proving the fix
+    distinguishes policy denials from credential/transport/protocol
+    failures rather than fail-closing on every `BrokerDenied`."""
+    _standard_setup(e2e, monkeypatch)
+    call_count = {"n": 0}
+
+    def _fake_execute(operation, params, **_kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return {"exit_code": 0, "redacted_output_digest": "sha256:preflight"}
+        if call_count["n"] == 2:
+            return {
+                "exit_code": 0,
+                "redacted_output_digest": "sha256:op1",
+                "redacted_stdout_sample": "op1 evidence",
+                "redacted_stderr_sample": "",
+                "truncated": False,
+                "timed_out": False,
+                "output_limit_exceeded": False,
+                "duration_ms": 5,
+                "argv": e2e.broker.build_argv(operation, params) if operation != "get_repo" else ["repo", "view"],
+            }
+        raise e2e.broker.BrokerDenied("mutation_operation_denied")
+
+    monkeypatch.setattr(e2e, "_execute_via_broker_subprocess", _fake_execute)
+    turns = iter(
+        [
+            ('{"action": "next", "operation": "get_issue", "params": {"number": 1920}}', ""),
+            ('{"action": "next", "operation": "get_pr", "params": {"number": 1998}}', ""),
+            ('{"action": "stop", "summary": "done"}', ""),
+        ]
+    )
+    monkeypatch.setattr(e2e, "_run_agy_turn", lambda **_kwargs: next(turns))
+
+    result = e2e.run_github_research_route(
+        {"schema": "delegation_request_v1", "provider": "agy", "tool_profile": "github_research", "prompt": "x"}
+    )
+    assert result["ok"] is True
+    evidence = json.loads(Path(result["result_surface"]["primary_artifact"]).read_text())
+    assert evidence["status"] == "pass"

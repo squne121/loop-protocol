@@ -101,6 +101,19 @@ _ARTIFACT_ROOT = Path(".claude/artifacts/agent-provider-route")
 _BROKER_SCRIPT_PATH = Path(__file__).resolve().parent / "run_agy_github_research_broker.py"
 _BROKER_SUBPROCESS_GRACE_SECONDS = 5.0
 
+# P0-3 (Issue #2036 fix_delta): the parent's own wait-timeout for the broker
+# subprocess must always exceed the broker's own unified internal deadline
+# (credential bootstrap + research command + the broker's own cleanup
+# budget) plus this process-spawn/IPC overhead grace -- never just the
+# research command's own timeout + a small constant, which could expire
+# before the broker had a fair chance to finish bootstrap and clean up its
+# own descendants.
+_PARENT_BROKER_WAIT_FIXED_OVERHEAD_SECONDS = (
+    broker.GH_AUTH_TOKEN_BOOTSTRAP_TIMEOUT_SECONDS
+    + broker.BROKER_CLEANUP_BUDGET_SECONDS
+    + _BROKER_SUBPROCESS_GRACE_SECONDS
+)
+
 # Env vars that must never reach a subprocess spawned purely to probe the AGY
 # binary's identity (version/digest) -- probing must happen with the same
 # scrubbed environment class used for the isolated AGY workspace, never the
@@ -291,6 +304,26 @@ def _agy_version_and_permission_gate(agy_bin: str) -> tuple[bool, str | None, di
     return True, None, {"version_result": version_result, "binary_digest": binary_digest}
 
 
+def _scrubbed_broker_subprocess_env() -> dict[str, str]:
+    """Env for spawning the broker subprocess itself (Issue #2036 AC2 fix).
+
+    Reuses the same minimal-allowlist / sensitive-var-strip pattern as
+    `_scrubbed_probe_env()`: an explicit, minimal env (`PATH`, `HOME`,
+    `LANG`/`LC_ALL`/`TERM`) with `GH_TOKEN`/`GITHUB_TOKEN`/enterprise
+    variants always stripped, regardless of whether this (parent) process's
+    own ambient OS environment happens to carry any of them. Previously this
+    call site passed no explicit `env=` kwarg at all, which meant `env=None`
+    -> full OS-default inheritance of this process's *entire* ambient
+    environment into the broker subprocess -- an operator's shell-level
+    `GH_TOKEN` leaked straight through regardless of what this module's own
+    Python code did with `os.environ.get()`. The broker subprocess's own
+    credential bootstrap (an explicit `GH_TOKEN`/`GITHUB_TOKEN` set
+    specifically for it, or its own internal `gh auth token` stored-
+    credential fallback, which uses `HOME`) is unaffected by this scrub.
+    """
+    return _scrubbed_probe_env()
+
+
 def _execute_via_broker_subprocess(
     operation: str,
     params: Mapping[str, Any],
@@ -306,21 +339,26 @@ def _execute_via_broker_subprocess(
     genuine child process (never an in-process `broker.execute_operation()`
     call). This (parent) process never reads GH_TOKEN/GITHUB_TOKEN itself and
     never forwards a token value via argv/stdin: the broker subprocess is
-    spawned with the default (inherited) environment -- if this process's own
-    ambient OS environment happens to already carry `GH_TOKEN`, ordinary
-    subprocess env inheritance passes it through without this code ever
-    reading/holding it as a Python value; otherwise the broker subprocess
-    resolves a stored credential entirely on its own (Issue #2012).
+    spawned with an explicit, scrubbed, minimal environment
+    (`_scrubbed_broker_subprocess_env()`) that never carries this process's
+    own ambient `GH_TOKEN`/`GITHUB_TOKEN` -- the broker subprocess resolves
+    its own credential entirely on its own, either via an explicit token env
+    var provisioned specifically for it or via its own internal
+    `gh auth token` stored-credential fallback (Issue #2012, #2036 AC2).
 
-    Raises `broker.BrokerDenied` (never a raw token, only a redacted reason
-    string) on any pre-execution deny, credential-unavailable, malformed
-    subprocess output, or subprocess-level timeout.
+    Raises a `broker.BrokerDenied` subclass (never a raw token, only a
+    redacted reason string), classified via
+    `broker.classify_broker_failure_reason()` (Issue #2036 AC4 fix_delta):
+    only a genuine pre-execution policy deny is the base `BrokerDenied`
+    class; credential-unavailable, subprocess-transport-timeout, malformed-
+    output, and any other unrecognized failure are distinct subclasses so
+    the route loop never conflates them with a harmless per-turn deny.
     """
     effective_timeout = float(timeout_seconds)
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise broker.BrokerDenied("route_deadline_exceeded")
+            raise broker.BrokerInternalError("route_deadline_exceeded")
         effective_timeout = min(effective_timeout, remaining)
 
     argv = [
@@ -341,28 +379,68 @@ def _execute_via_broker_subprocess(
         "--timeout-seconds",
         str(effective_timeout),
     ]
-    try:
-        completed = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=effective_timeout + _BROKER_SUBPROCESS_GRACE_SECONDS,
-            shell=False,
-            check=False,
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise broker.BrokerDenied("broker_subprocess_timeout") from exc
+    # P0-3 (Issue #2036 fix_delta): the parent's wait-timeout must always
+    # exceed the broker's own unified internal deadline (bootstrap + command
+    # + the broker's own cleanup budget), not just `effective_timeout` plus
+    # a small fixed grace -- otherwise the parent could give up and only
+    # kill the broker's direct pid before the broker had a fair chance to
+    # reap its own downstream `gh` child (which runs in its own session and
+    # is therefore outside the broker's own process group).
+    parent_wait_timeout = effective_timeout + _PARENT_BROKER_WAIT_FIXED_OVERHEAD_SECONDS
 
-    stdout_text = (completed.stdout or "").strip()
+    # Popen-based (not `subprocess.run(..., timeout=...)`) so that on a
+    # genuine parent-side timeout this process can terminate the *entire*
+    # broker session (`start_new_session=True` makes the broker its own
+    # process-group leader) -- the broker's own SIGTERM handler
+    # (`install_termination_cleanup_handler()`) is then responsible for
+    # cascading that termination to its own currently-running downstream
+    # child's process group.
+    proc = subprocess.Popen(
+        argv,
+        env=_scrubbed_broker_subprocess_env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=False,
+        start_new_session=True,
+    )
+    try:
+        stdout_text, _stderr_text = proc.communicate(timeout=parent_wait_timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_broker_process_group(proc)
+        raise broker.BrokerTransportTimeout("broker_subprocess_timeout") from exc
+
+    stdout_text = (stdout_text or "").strip()
     try:
         record = json.loads(stdout_text) if stdout_text else {}
     except json.JSONDecodeError as exc:
-        raise broker.BrokerDenied("broker_subprocess_malformed_output") from exc
+        raise broker.BrokerProtocolError("broker_subprocess_malformed_output") from exc
     if not isinstance(record, dict) or record.get("schema") != broker.SCHEMA_COMMAND_RESULT:
-        reason = record.get("reason") if isinstance(record, dict) else None
-        raise broker.BrokerDenied(reason or "broker_subprocess_denied")
+        reason = record.get("reason") if isinstance(record, dict) else "broker_subprocess_denied"
+        exc_cls = broker.broker_denied_exception_for_reason(reason)
+        raise exc_cls(reason)
     return record
+
+
+def _terminate_broker_process_group(proc: subprocess.Popen) -> None:
+    """Kill *proc*'s entire process group on a genuine parent-side timeout.
+
+    TERM-then-KILL, giving the broker's own SIGTERM handler a bounded grace
+    window to cascade termination to its own downstream child first (Issue
+    #2036 P0-3). Never leaves the pipes unread/undrained (best-effort).
+    """
+    broker._kill_process_group(proc.pid, force=False)
+    try:
+        proc.communicate(timeout=_BROKER_SUBPROCESS_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    broker._kill_process_group(proc.pid, force=True)
+    try:
+        proc.communicate(timeout=_BROKER_SUBPROCESS_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+        pass
 
 
 def _preflight(*, gh_token_env: str = "GH_TOKEN") -> tuple[bool, str | None]:
@@ -759,18 +837,28 @@ def run_github_research_route(
                 deadline=route_deadline,
             )
         except broker.BrokerDenied as exc:
+            reason = str(exc)
+            failure_class = getattr(exc, "failure_class", broker.FAILURE_CLASS_POLICY_DENIED)
             iterations.append(
                 {
                     "index": index,
                     "command_requested": {"argv": argv_for_evidence},
                     "decision": "deny",
-                    "reason": str(exc),
+                    "reason": reason,
                     "exit_code": None,
                     "redacted_output_digest": None,
                     "truncated": False,
                     "duration_ms": None,
                 }
             )
+            if failure_class != broker.FAILURE_CLASS_POLICY_DENIED:
+                # Issue #2036 AC4 fix_delta: credential-unavailable, broker-
+                # subprocess-transport-timeout, malformed-output, and any
+                # other unrecognized broker-side failure are never treated
+                # as a harmless per-turn policy deny -- they force the
+                # overall route to a non-"pass" final status even if AGY
+                # later issues a normal STOP.
+                route_failure_class = route_failure_class or f"github_research_broker_{failure_class}"
             continue
 
         executed_count += 1

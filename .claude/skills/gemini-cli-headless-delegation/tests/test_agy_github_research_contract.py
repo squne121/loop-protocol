@@ -200,7 +200,7 @@ def test_ac2_github_research_is_in_permission_policy_allowed_profiles(permission
         "--raw-field=body=probe",
         "-fbody=probe",
         "-XPOST",
-        "--input=/tmp/body.json",
+        "--input=./body.json",
         "-F",
         "--method=DELETE",
     ],

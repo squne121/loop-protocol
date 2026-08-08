@@ -59,11 +59,95 @@ DEFAULT_LIMIT = 30
 # structured reason string and never the token value itself.
 GH_AUTH_TOKEN_BOOTSTRAP_TIMEOUT_SECONDS = 15.0
 
+# P0-3 (Issue #2036 fix_delta): a single, unified wall-clock deadline for the
+# broker CLI's `execute` mode covers credential bootstrap + the research
+# command itself + this process's own descendant-cleanup budget. The E2E
+# parent's own wait-timeout for this subprocess (see
+# `run_agy_github_research_e2e._execute_via_broker_subprocess`) is always
+# derived from (and kept strictly greater than) this same budget so the
+# parent never gives up before the broker has had a fair chance to reap its
+# own children.
+BROKER_CLEANUP_BUDGET_SECONDS = 10.0
+
 REASON_CREDENTIAL_BOOTSTRAP_GH_CLI_UNAVAILABLE = "credential_bootstrap_gh_cli_unavailable"
 REASON_CREDENTIAL_BOOTSTRAP_TIMEOUT = "credential_bootstrap_timeout"
 REASON_CREDENTIAL_BOOTSTRAP_NONZERO_EXIT = "credential_bootstrap_nonzero_exit"
 REASON_CREDENTIAL_BOOTSTRAP_EMPTY_TOKEN = "credential_bootstrap_empty_token"
 REASON_CREDENTIAL_BOOTSTRAP_MALFORMED_OUTPUT = "credential_bootstrap_malformed_output"
+
+# Failure classification (Issue #2036 AC4 fix_delta): credential/timeout/
+# protocol/internal failures are never conflated with a genuine policy-level
+# deny. Only `policy_denied` may be treated as a harmless per-turn deny that
+# lets the route continue; every other class must force the overall route to
+# a non-"pass" final status.
+FAILURE_CLASS_POLICY_DENIED = "policy_denied"
+FAILURE_CLASS_CREDENTIAL_UNAVAILABLE = "credential_unavailable"
+FAILURE_CLASS_BROKER_TRANSPORT_TIMEOUT = "broker_transport_timeout"
+FAILURE_CLASS_BROKER_PROTOCOL_ERROR = "broker_protocol_error"
+FAILURE_CLASS_BROKER_INTERNAL_ERROR = "broker_internal_error"
+
+_CREDENTIAL_UNAVAILABLE_REASONS: frozenset[str] = frozenset(
+    {
+        REASON_CREDENTIAL_BOOTSTRAP_GH_CLI_UNAVAILABLE,
+        REASON_CREDENTIAL_BOOTSTRAP_TIMEOUT,
+        REASON_CREDENTIAL_BOOTSTRAP_NONZERO_EXIT,
+        REASON_CREDENTIAL_BOOTSTRAP_EMPTY_TOKEN,
+        REASON_CREDENTIAL_BOOTSTRAP_MALFORMED_OUTPUT,
+        "gh_token_env_missing",
+    }
+)
+
+# Reasons produced by `validate_operation()` (fixed strings and stable
+# prefixes) -- these, and only these, classify as a harmless policy-level
+# deny. Everything not recognized here is fail-closed classified as
+# `broker_internal_error` rather than silently treated as a harmless deny.
+_POLICY_DENIED_REASONS: frozenset[str] = frozenset(
+    {
+        "empty_or_malformed_operation",
+        "params_must_be_object",
+        "params_keys_must_be_strings",
+        "compound_shell_token_denied",
+        "credential_display_denied",
+        "alternate_host_denied",
+        "cross_repository_denied",
+        "mutation_operation_denied",
+        "unknown_operation_denied",
+        "param_must_be_int",
+        "param_out_of_range",
+        "limit_exceeds_max_records_per_command",
+        "invalid_state_value",
+        "param_must_be_nonempty_string",
+        "param_looks_like_flag_injection",
+        "param_contains_disallowed_characters",
+    }
+)
+_POLICY_DENIED_REASON_PREFIXES: tuple[str, ...] = (
+    "unexpected_param:",
+    "missing_param:",
+    "no_validator_for_param:",
+)
+
+
+def classify_broker_failure_reason(reason: str) -> str:
+    """Map a broker denial/failure *reason* string to a failure class.
+
+    Fail-closed: any reason not explicitly recognized as either a
+    credential-unavailable reason or a genuine pre-execution policy deny is
+    classified as `broker_internal_error` (never silently treated as a
+    harmless `policy_denied`).
+    """
+    if not isinstance(reason, str) or not reason:
+        return FAILURE_CLASS_BROKER_INTERNAL_ERROR
+    if reason in _CREDENTIAL_UNAVAILABLE_REASONS:
+        return FAILURE_CLASS_CREDENTIAL_UNAVAILABLE
+    if reason in _POLICY_DENIED_REASONS or reason.startswith(_POLICY_DENIED_REASON_PREFIXES):
+        return FAILURE_CLASS_POLICY_DENIED
+    return FAILURE_CLASS_BROKER_INTERNAL_ERROR
+
+
+CREDENTIAL_SOURCE_GH_TOKEN_ENV = "gh_token_env"
+CREDENTIAL_SOURCE_GITHUB_TOKEN_ENV = "github_token_env"
+CREDENTIAL_SOURCE_STORED_CREDENTIAL = "stored_credential"
 
 _READ_CHUNK_BYTES = 65536
 _GRACE_KILL_SECONDS = 3.0
@@ -122,7 +206,52 @@ _SAFE_STRING_RE = re.compile(r"^[A-Za-z0-9 ._:/#@+]{1,200}$")
 
 
 class BrokerDenied(Exception):
-    """Raised for a pre-execution deny; never spawns a subprocess."""
+    """Raised for a pre-execution deny; never spawns a subprocess.
+
+    Base class for every broker-side denial/failure the E2E orchestrator can
+    observe. `failure_class` classifies the denial (Issue #2036 AC4
+    fix_delta): only the base class's default `policy_denied` may be treated
+    as a harmless per-turn deny; every subclass below represents a failure
+    that must force the overall route to a non-"pass" final status.
+    """
+
+    failure_class: str = FAILURE_CLASS_POLICY_DENIED
+
+
+class BrokerCredentialUnavailable(BrokerDenied):
+    """Credential bootstrap could not resolve any usable token."""
+
+    failure_class = FAILURE_CLASS_CREDENTIAL_UNAVAILABLE
+
+
+class BrokerTransportTimeout(BrokerDenied):
+    """The broker subprocess itself did not complete within its wait budget."""
+
+    failure_class = FAILURE_CLASS_BROKER_TRANSPORT_TIMEOUT
+
+
+class BrokerProtocolError(BrokerDenied):
+    """The broker subprocess's stdout was not a well-formed IPC result."""
+
+    failure_class = FAILURE_CLASS_BROKER_PROTOCOL_ERROR
+
+
+class BrokerInternalError(BrokerDenied):
+    """An unrecognized/unclassified broker-side failure (fail-closed)."""
+
+    failure_class = FAILURE_CLASS_BROKER_INTERNAL_ERROR
+
+
+def broker_denied_exception_for_reason(reason: str) -> type["BrokerDenied"]:
+    """Return the `BrokerDenied` subclass matching *reason*'s failure class."""
+    failure_class = classify_broker_failure_reason(reason)
+    return {
+        FAILURE_CLASS_POLICY_DENIED: BrokerDenied,
+        FAILURE_CLASS_CREDENTIAL_UNAVAILABLE: BrokerCredentialUnavailable,
+        FAILURE_CLASS_BROKER_TRANSPORT_TIMEOUT: BrokerTransportTimeout,
+        FAILURE_CLASS_BROKER_PROTOCOL_ERROR: BrokerProtocolError,
+        FAILURE_CLASS_BROKER_INTERNAL_ERROR: BrokerInternalError,
+    }[failure_class]
 
 
 class BrokerInvariantError(Exception):
@@ -435,26 +564,27 @@ def bootstrap_gh_token(
     """
     resolved_bin = shutil.which(gh_bin) or gh_bin
     argv = [resolved_bin, "auth", "token", "--hostname", host]
+    # P0-3 (Issue #2036 fix_delta): bounded streaming capture, not an
+    # unbounded `capture_output=True` buffer -- a malicious/broken `GH_BIN`
+    # must never be able to exhaust memory here either (the same discipline
+    # already applied to the research command via `_run_streaming_bounded`).
     try:
-        completed = subprocess.run(
+        stdout_bytes, _stderr_bytes, exit_code, timed_out, _output_limit_exceeded = _run_streaming_bounded(
             argv,
             env=dict(env) if env is not None else None,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            shell=False,
-            check=False,
-            stdin=subprocess.DEVNULL,
+            cwd=None,
+            timeout_seconds=timeout_seconds,
+            stdout_cap_bytes=4096,
+            stderr_cap_bytes=4096,
         )
     except FileNotFoundError:
         return None, REASON_CREDENTIAL_BOOTSTRAP_GH_CLI_UNAVAILABLE
-    except subprocess.TimeoutExpired:
+    if timed_out:
         return None, REASON_CREDENTIAL_BOOTSTRAP_TIMEOUT
-
-    if completed.returncode != 0:
+    if exit_code != 0:
         return None, REASON_CREDENTIAL_BOOTSTRAP_NONZERO_EXIT
 
-    raw = (completed.stdout or "").strip("\n")
+    raw = stdout_bytes.decode("utf-8", errors="replace").strip("\n")
     if not raw or not raw.strip():
         return None, REASON_CREDENTIAL_BOOTSTRAP_EMPTY_TOKEN
     if _looks_like_malformed_token_output(raw):
@@ -465,21 +595,42 @@ def bootstrap_gh_token(
 def resolve_gh_token(
     *,
     gh_token_env: str = "GH_TOKEN",
+    github_token_env: str = "GITHUB_TOKEN",
     host: str = DEFAULT_HOST,
     gh_bin: str = "gh",
-) -> tuple[str | None, str | None, bool]:
+) -> tuple[str | None, str | None, bool, str | None]:
     """Resolve the token this broker (sub)process will use for one operation.
 
-    Priority: an explicit `GH_TOKEN`/`GITHUB_TOKEN`-style env var already
-    present in *this process's own* startup environment wins (no bootstrap
-    performed). Otherwise, `bootstrap_gh_token()` resolves a stored
-    credential internally. Returns `(token, failure_reason, bootstrap_used)`.
+    Fixed precedence (Issue #2036 P1-1 fix_delta -- corrects a provenance
+    bug where a `GITHUB_TOKEN`-only environment silently fell through to
+    `bootstrap_gh_token()`, whose `gh auth token` invocation itself resolves
+    `GITHUB_TOKEN` internally, mislabeling a `github_token_env` credential
+    as a `stored_credential` bootstrap):
+
+    1. *gh_token_env* (default `GH_TOKEN`) present in this process's own
+       startup environment -> used directly, `credential_source="gh_token_env"`.
+    2. Else *github_token_env* (default `GITHUB_TOKEN`) present -> used
+       directly, `credential_source="github_token_env"`.
+    3. Else `bootstrap_gh_token()` resolves a stored credential via
+       `gh auth token --hostname <host>`, invoked with *both* env vars
+       explicitly stripped from its own child environment so it can never
+       silently pick up either and be mislabeled,
+       `credential_source="stored_credential"`.
+
+    Returns `(token, failure_reason, bootstrap_used, credential_source)`.
+    `credential_source` is `None` only when `token` is also `None`.
     """
     env_token = os.environ.get(gh_token_env)
     if env_token:
-        return env_token, None, False
-    token, failure_reason = bootstrap_gh_token(host=host, gh_bin=gh_bin)
-    return token, failure_reason, True
+        return env_token, None, False, CREDENTIAL_SOURCE_GH_TOKEN_ENV
+    if gh_token_env != github_token_env:
+        github_env_token = os.environ.get(github_token_env)
+        if github_env_token:
+            return github_env_token, None, False, CREDENTIAL_SOURCE_GITHUB_TOKEN_ENV
+    stripped_env = {key: value for key, value in os.environ.items() if key not in (gh_token_env, github_token_env)}
+    token, failure_reason = bootstrap_gh_token(host=host, gh_bin=gh_bin, env=stripped_env)
+    credential_source = CREDENTIAL_SOURCE_STORED_CREDENTIAL if token else None
+    return token, failure_reason, True, credential_source
 
 
 def _redact(text: str) -> tuple[str, bool]:
@@ -529,10 +680,42 @@ def _kill_process_group(pid: int, *, force: bool = False) -> None:
         return
 
 
+# P0-3 (Issue #2036 fix_delta): the pid of the currently-running downstream
+# `gh` child (if any), tracked so a SIGTERM delivered to *this* broker
+# process by its own parent (the E2E orchestrator, on a parent-side timeout)
+# can still reap this child's own process group even though the child was
+# started in its own session (`start_new_session=True`) and is therefore
+# outside the broker's own pgid.
+_ACTIVE_CHILD_PID: int | None = None
+
+
+def _handle_broker_sigterm(signum: int, frame: object) -> None:  # noqa: ARG001
+    """SIGTERM handler installed for the broker's `execute` CLI mode.
+
+    Guarantees TERM-then-KILL of any currently-running downstream child's
+    process group before this process itself exits, so a parent-side
+    timeout can never leave an orphaned, token-bearing `gh` process behind.
+    """
+    pid = _ACTIVE_CHILD_PID
+    if pid is not None:
+        _kill_process_group(pid, force=False)
+        time.sleep(min(_GRACE_KILL_SECONDS, 1.0))
+        _kill_process_group(pid, force=True)
+    raise SystemExit(143)
+
+
+def install_termination_cleanup_handler() -> None:
+    """Install the SIGTERM handler above (called once from `main()`)."""
+    try:
+        signal.signal(signal.SIGTERM, _handle_broker_sigterm)
+    except (ValueError, OSError):  # pragma: no cover - defensive (non-main thread)
+        pass
+
+
 def _run_streaming_bounded(
     command: list[str],
     *,
-    env: dict[str, str],
+    env: dict[str, str] | None,
     cwd: str | None,
     timeout_seconds: float,
     stdout_cap_bytes: int,
@@ -546,6 +729,7 @@ def _run_streaming_bounded(
     buffered into memory before truncation (Issue #1920 PR #2000
     REQUEST_CHANGES Blocker 5).
     """
+    global _ACTIVE_CHILD_PID
     proc = subprocess.Popen(
         command,
         env=env,
@@ -556,6 +740,25 @@ def _run_streaming_bounded(
         shell=False,
         start_new_session=True,
     )
+    _ACTIVE_CHILD_PID = proc.pid
+    try:
+        return _drain_streaming_bounded_process(
+            proc,
+            timeout_seconds=timeout_seconds,
+            stdout_cap_bytes=stdout_cap_bytes,
+            stderr_cap_bytes=stderr_cap_bytes,
+        )
+    finally:
+        _ACTIVE_CHILD_PID = None
+
+
+def _drain_streaming_bounded_process(
+    proc: subprocess.Popen,
+    *,
+    timeout_seconds: float,
+    stdout_cap_bytes: int,
+    stderr_cap_bytes: int,
+) -> tuple[bytes, bytes, int | None, bool, bool]:
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
     stdout_len = 0
@@ -679,7 +882,11 @@ def execute_operation(
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise BrokerDenied("route_deadline_exceeded")
+            # Not a policy-level deny -- a scheduling/budget exhaustion is
+            # classified `broker_internal_error` (Issue #2036 AC4
+            # fix_delta) so it is never silently treated as a harmless
+            # per-turn deny by the E2E route loop.
+            raise BrokerInternalError("route_deadline_exceeded")
         effective_timeout = min(effective_timeout, remaining)
 
     start = time.monotonic()
@@ -767,7 +974,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.allowed else 2
 
     if args.mode == "execute":
-        gh_token, bootstrap_failure_reason, bootstrap_used = resolve_gh_token(
+        # P0-3 (Issue #2036 fix_delta): install the SIGTERM cleanup handler
+        # before any child is spawned, and compute a single unified deadline
+        # covering credential bootstrap + the research command + this
+        # process's own cleanup budget. The E2E parent's own wait-timeout
+        # for this subprocess is always derived from (and kept strictly
+        # greater than) this same budget.
+        install_termination_cleanup_handler()
+        broker_start = time.monotonic()
+        unified_deadline = (
+            broker_start
+            + GH_AUTH_TOKEN_BOOTSTRAP_TIMEOUT_SECONDS
+            + args.timeout_seconds
+            + BROKER_CLEANUP_BUDGET_SECONDS
+        )
+
+        gh_token, bootstrap_failure_reason, bootstrap_used, credential_source = resolve_gh_token(
             gh_token_env=args.gh_token_env, host=args.host, gh_bin=args.gh_bin
         )
         if not gh_token:
@@ -791,10 +1013,18 @@ def main(argv: list[str] | None = None) -> int:
                 host=args.host,
                 repo=args.repo,
                 timeout_seconds=args.timeout_seconds,
+                deadline=unified_deadline,
             )
         except BrokerDenied as exc:
             print(json.dumps({"ok": False, "reason": str(exc)}, sort_keys=True))
             return 2
+        # `credential_source` is an internal, non-secret provenance field
+        # (Issue #2036 P1-1 fix_delta) -- it is never part of the public
+        # `agy_github_research_evidence/v1` artifact schema; it is only
+        # threaded through this broker-subprocess IPC result so the E2E
+        # caller can observe it for its own diagnostics without ever
+        # widening that public schema's surface.
+        record["credential_source"] = credential_source
         print(json.dumps(record, sort_keys=True))
         if record.get("timed_out"):
             return 5

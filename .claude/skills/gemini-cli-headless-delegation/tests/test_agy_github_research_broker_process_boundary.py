@@ -15,6 +15,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -53,36 +54,34 @@ def _write_fake_gh(tmp_path: Path) -> Path:
 
 def test_ac1_broker_is_invoked_as_real_subprocess(e2e, monkeypatch):
     """AC1: `run_agy_github_research_e2e.py` invokes the broker as a real OS
-    subprocess -- `subprocess.run` is called with argv containing the broker
-    script path and the `execute` subcommand -- and never calls
+    subprocess -- `subprocess.Popen` is called with argv containing the
+    broker script path and the `execute` subcommand -- and never calls
     `broker.execute_operation()` in-process."""
     captured: dict[str, object] = {}
 
-    class _FakeCompleted:
-        def __init__(self, stdout: str) -> None:
-            self.stdout = stdout
-            self.stderr = ""
-            self.returncode = 0
+    class _FakePopen:
+        def __init__(self, argv, **kwargs) -> None:
+            captured["argv"] = list(argv)
+            captured["kwargs"] = kwargs
+            self.pid = 999999
 
-    def _fake_run(argv, **kwargs):
-        captured["argv"] = list(argv)
-        captured["kwargs"] = kwargs
-        record = {
-            "schema": e2e.broker.SCHEMA_COMMAND_RESULT,
-            "operation": "get_repo",
-            "argv": ["repo", "view", "github.com/squne121/loop-protocol"],
-            "exit_code": 0,
-            "timed_out": False,
-            "duration_ms": 5,
-            "truncated": False,
-            "output_limit_exceeded": False,
-            "redacted_stdout_sample": "fake gh output",
-            "redacted_stderr_sample": "",
-            "redacted_output_digest": "sha256:fake",
-        }
-        return _FakeCompleted(json.dumps(record, sort_keys=True))
+        def communicate(self, timeout=None):  # noqa: ARG002
+            record = {
+                "schema": e2e.broker.SCHEMA_COMMAND_RESULT,
+                "operation": "get_repo",
+                "argv": ["repo", "view", "github.com/squne121/loop-protocol"],
+                "exit_code": 0,
+                "timed_out": False,
+                "duration_ms": 5,
+                "truncated": False,
+                "output_limit_exceeded": False,
+                "redacted_stdout_sample": "fake gh output",
+                "redacted_stderr_sample": "",
+                "redacted_output_digest": "sha256:fake",
+            }
+            return json.dumps(record, sort_keys=True), ""
 
-    monkeypatch.setattr(e2e.subprocess, "run", _fake_run)
+    monkeypatch.setattr(e2e.subprocess, "Popen", _FakePopen)
 
     def _boom(*_a, **_k):
         raise AssertionError("broker.execute_operation() must never be called in-process by the E2E orchestrator")
@@ -98,9 +97,13 @@ def test_ac1_broker_is_invoked_as_real_subprocess(e2e, monkeypatch):
     assert str(e2e._BROKER_SCRIPT_PATH) in argv
     assert "execute" in argv
     assert "get_repo" in argv
-    # Real subprocess API (Popen/run), never a bare shell string.
+    # Real subprocess API (Popen), never a bare shell string.
     assert isinstance(argv[0], str) and argv[0] == sys.executable
     assert captured["kwargs"].get("shell", False) is False
+    # Started in its own session/process group so a parent-side timeout can
+    # terminate the whole broker session, not merely its direct pid (Issue
+    # #2036 P0-3).
+    assert captured["kwargs"].get("start_new_session") is True
 
 
 def test_ac1_negative_probe_validation_never_spawns_a_subprocess(e2e, monkeypatch):
@@ -111,7 +114,7 @@ def test_ac1_negative_probe_validation_never_spawns_a_subprocess(e2e, monkeypatc
     def _boom(*_a, **_k):
         raise AssertionError("validate_operation() must never spawn a subprocess")
 
-    monkeypatch.setattr(e2e.subprocess, "run", _boom)
+    monkeypatch.setattr(e2e.subprocess, "Popen", _boom)
     probes = e2e._run_negative_probes()
     assert probes
     assert all(probe["denied_pre_execution"] is True for probe in probes)
@@ -125,42 +128,81 @@ def test_ac2_parent_process_never_receives_or_forwards_raw_token(e2e, monkeypatc
     must never carry the raw token value. (Ordinary OS process-env
     inheritance, which the parent code never reads/touches, is a distinct,
     accepted pass-through -- this test asserts on the parent's *own* explicit
-    values only.)"""
+    values only.)
+
+    Issue #2036 AC2 fix_delta: this is a genuine falsification of OS-level
+    env-inheritance, not merely an assertion on a mocked call's `env=`
+    kwarg. A sentinel token is planted in *this test process's own* ambient
+    environment (simulating an operator's shell-level `GH_TOKEN`), a real
+    `gh auth token` subprocess boundary is crossed for real, and the fake
+    `gh` binary self-reports (never the sentinel value itself, only a
+    bounded PRESENT/ABSENT diagnostic) whether it observed a `GH_TOKEN` key
+    at all in its own runtime environment -- proving the broker subprocess
+    (and, transitively, its own credential-bootstrap child) never inherited
+    the parent's ambient secret."""
     sentinel_token = "SENTINEL-FAKE-GH-TOKEN-0123456789abcdef"  # noqa: S105 - test fixture, not a real secret
     monkeypatch.setenv("GH_TOKEN", sentinel_token)
-    fake_gh = _write_fake_gh(tmp_path)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    env_report_log = tmp_path / "env-report.log"
+    fake_gh = tmp_path / "env-reporting-gh"
+    fake_gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        f"log_path = {str(env_report_log)!r}\n"
+        "presence = 'PRESENT' if 'GH_TOKEN' in os.environ else 'ABSENT'\n"
+        "with open(log_path, 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(' '.join(sys.argv[1:3]) + ':' + presence + chr(10))\n"
+        "if len(sys.argv) >= 3 and sys.argv[1] == 'auth' and sys.argv[2] == 'token':\n"
+        "    print('bootstrapped-non-sentinel-token-0123456789abcdef')\n"
+        "    sys.exit(0)\n"
+        "print('fake gh research output')\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
 
     captured: dict[str, object] = {}
-    real_run = subprocess.run
+    real_popen = subprocess.Popen
 
-    def _spy_run(argv, **kwargs):
-        captured["argv"] = list(argv)
-        captured["env_kwarg"] = kwargs.get("env")
-        captured["stdin"] = kwargs.get("stdin")
-        completed = real_run(argv, **kwargs)
-        captured["stdout"] = completed.stdout
-        captured["stderr"] = completed.stderr
-        return completed
+    class _SpyPopen(real_popen):
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = list(argv)
+            captured["env_kwarg"] = kwargs.get("env")
+            captured["stdin"] = kwargs.get("stdin")
+            super().__init__(argv, **kwargs)
 
-    monkeypatch.setattr(e2e.subprocess, "run", _spy_run)
+    monkeypatch.setattr(e2e.subprocess, "Popen", _SpyPopen)
 
     result = e2e._execute_via_broker_subprocess("get_repo", {}, gh_bin=str(fake_gh), timeout_seconds=10)
 
     # The broker's own redacted result crossed back over stdout -- but never
-    # contains the raw token.
+    # contains the raw sentinel token (a *different*, non-sentinel
+    # bootstrapped token is legitimately provisioned to the research `gh`
+    # call itself -- that is expected and is not what this test asserts
+    # against).
     assert sentinel_token not in json.dumps(result)
 
     # The parent's own explicit subprocess-spawn surface never carries the
-    # raw token: argv, explicit `env=` kwarg (there is none -- default
-    # inheritance is used instead of the parent reading/forwarding it
-    # itself), and stdin.
+    # raw sentinel token: argv, the explicit scrubbed `env=` kwarg it now
+    # always passes, and stdin.
     argv = captured["argv"]
     assert isinstance(argv, list)
     assert all(sentinel_token not in str(item) for item in argv)
-    assert captured["env_kwarg"] is None
+    env_kwarg = captured["env_kwarg"]
+    assert env_kwarg is not None
+    assert "GH_TOKEN" not in env_kwarg
+    assert "GITHUB_TOKEN" not in env_kwarg
     assert captured["stdin"] is subprocess.DEVNULL
-    assert sentinel_token not in str(captured.get("stdout", ""))
-    assert sentinel_token not in str(captured.get("stderr", ""))
+
+    # The falsifying proof: the credential-bootstrap child (`gh auth token`)
+    # never observed a `GH_TOKEN` key in its own runtime environment at all
+    # -- not merely a different value -- confirming true non-inheritance
+    # across the parent -> broker subprocess boundary.
+    report_lines = env_report_log.read_text().splitlines()
+    bootstrap_lines = [line for line in report_lines if line.startswith("auth token:")]
+    assert bootstrap_lines, "expected the fake gh's credential-bootstrap branch to have run"
+    assert all(line == "auth token:ABSENT" for line in bootstrap_lines)
 
 
 def test_ac2_preflight_never_reads_gh_token_itself(e2e, monkeypatch):
@@ -187,3 +229,79 @@ def test_ac2_preflight_never_reads_gh_token_itself(e2e, monkeypatch):
     ok, reason = e2e._preflight(gh_token_env="GH_TOKEN")
     assert ok is True
     assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2036 P0-3: on a genuine parent-side timeout, the entire broker
+# session -- including a downstream child spawned in its *own* separate
+# session/process group (as the real broker's research `gh` invocation is,
+# via `start_new_session=True`) -- must be reaped, never left orphaned.
+# ---------------------------------------------------------------------------
+
+
+def test_p0_3_parent_side_timeout_reaps_entire_broker_session_including_detached_child(e2e, monkeypatch, tmp_path):
+    """Real-process test (no mocked `Popen`/`communicate`): a stand-in
+    "broker" process is spawned exactly the way `_execute_via_broker_subprocess`
+    spawns the real broker (`start_new_session=True`, no stdout ever
+    written so the parent's `communicate(timeout=...)` genuinely expires).
+    It implements the same downstream-cleanup *contract* the real broker's
+    `install_termination_cleanup_handler()` / `_handle_broker_sigterm()`
+    implement: it spawns its own child (representing the research `gh`
+    process) in a *separate* session via `start_new_session=True`, records
+    that child's pid, and installs a SIGTERM handler that kills that
+    child's own process group before exiting. This isolates and proves the
+    parent's own timeout-kill logic (`_terminate_broker_process_group`)
+    correctly reaches the stand-in broker via `killpg`, and that -- given a
+    broker that honors the cleanup contract -- zero descendants remain
+    after cleanup, verified via `/proc` (not a self-report)."""
+    child_pid_marker = tmp_path / "child-pid-marker"
+    stand_in_broker = tmp_path / "stand_in_broker.py"
+    stand_in_broker.write_text(
+        "import os, signal, subprocess, sys, time\n"
+        "child = subprocess.Popen(\n"
+        "    ['sleep', '300'],\n"
+        "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+        "    start_new_session=True,\n"
+        ")\n"
+        f"with open({str(child_pid_marker)!r}, 'w', encoding='utf-8') as fh:\n"
+        "    fh.write(str(child.pid))\n"
+        "\n"
+        "def _cascade_sigterm(signum, frame):\n"
+        "    try:\n"
+        "        pgid = os.getpgid(child.pid)\n"
+        "        os.killpg(pgid, signal.SIGTERM)\n"
+        "        time.sleep(0.2)\n"
+        "        os.killpg(pgid, signal.SIGKILL)\n"
+        "    except ProcessLookupError:\n"
+        "        pass\n"
+        "    raise SystemExit(143)\n"
+        "\n"
+        "signal.signal(signal.SIGTERM, _cascade_sigterm)\n"
+        "time.sleep(300)\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(e2e, "_BROKER_SCRIPT_PATH", stand_in_broker)
+    # Force the parent's own wait budget to be tiny so this test completes
+    # quickly -- the stand-in broker never writes to stdout, so
+    # `proc.communicate(timeout=...)` always genuinely expires.
+    monkeypatch.setattr(e2e, "_PARENT_BROKER_WAIT_FIXED_OVERHEAD_SECONDS", 0.2)
+
+    with pytest.raises(e2e.broker.BrokerTransportTimeout):
+        e2e._execute_via_broker_subprocess("get_repo", {}, gh_bin="gh", timeout_seconds=0.3)
+
+    assert child_pid_marker.exists(), "expected the stand-in broker to have recorded its child's pid"
+    child_pid = int(child_pid_marker.read_text().strip())
+
+    # Bounded poll: the child (spawned in its own separate session) must no
+    # longer exist -- proving the parent's timeout-kill reached the entire
+    # broker session (not merely the broker's own direct pid) and the
+    # broker's own SIGTERM handler cascaded to its detached child.
+    deadline = time.monotonic() + 5.0
+    still_alive = True
+    while time.monotonic() < deadline:
+        if not Path(f"/proc/{child_pid}").exists():
+            still_alive = False
+            break
+        time.sleep(0.1)
+    assert not still_alive, f"child pid {child_pid} (in its own session) survived the parent-side timeout cleanup"
