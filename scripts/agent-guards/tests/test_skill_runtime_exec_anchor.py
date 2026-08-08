@@ -438,8 +438,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--issue-number", required=True)
     parser.add_argument("--repo", required=True)
-parser.add_argument("--anchor-comment-url", required=False, default=None)
-parser.add_argument("--human-context-comment-url", required=False, default=None)
+    parser.add_argument("--anchor-comment-url", required=False, default=None)
+    parser.add_argument("--human-context-comment-url", required=False, default=None)
     parser.add_argument("--consume-contract-patch-plan", action="store_true")
     args = parser.parse_args()
     artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number
