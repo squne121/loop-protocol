@@ -1155,6 +1155,11 @@ function applyVisualScenarioFixture(fixture: VisualScenarioFixture): void {
 // loopPhase/sortie/player/progress/telemetry state (Issue #1385 review,
 // additional指摘6).
 let visualScenarioActive = false
+// AC1/AC2 (Issue #1728): the fixture's `name`, captured when the fixture is
+// applied below, so the post-first-render attestation marker (see `frame()`)
+// can encode which fixture was honored without re-reading
+// `window.__LOOP_VISUAL_SCENARIO__`.
+let visualScenarioFixtureName: string | undefined = undefined
 
 if (import.meta.env.VITE_E2E_MODE === 'true') {
   const e2eScenarioFlag = window as Window & { __LOOP_VISUAL_SCENARIO__?: unknown }
@@ -1178,6 +1183,7 @@ if (import.meta.env.VITE_E2E_MODE === 'true') {
     }
     const fixture = parseVisualScenarioFixture(e2eScenarioFlag.__LOOP_VISUAL_SCENARIO__)
     visualScenarioActive = true
+    visualScenarioFixtureName = fixture.name
     applyVisualScenarioFixture(fixture)
   }
 }
@@ -1265,6 +1271,11 @@ let previousFrameTime = performance.now()
  */
 let previousCanvasPausedInert: boolean | undefined
 
+// AC1/AC2 (Issue #1728): tracks whether the test-only DOM attestation
+// marker has already been emitted for the app's first completed render
+// pass, so it is set exactly once (not re-churned every frame).
+let visualScenarioAttestationEmitted = false
+
 function frame(now: number): void {
   if (!hud || !renderer) {
     return
@@ -1313,6 +1324,27 @@ function frame(now: number): void {
   hud.render(state, productPause.isPaused, activeFixedDeltaMs)
   phaseScreens?.render(state, productPause.isPaused, buildUpgradeView())
   renderer.render(state)
+
+  // AC1/AC2 (Issue #1728): test-only DOM attestation marker. Guarded by
+  // `import.meta.env.VITE_E2E_MODE === 'true'` so this entire branch --
+  // including the `loopVisualScenario` / `v1:...:rendered` string literals
+  // below -- is tree-shaken out of production builds (AC7; matches the
+  // existing "tree-shaken in production builds" contract documented above
+  // for `__LOOP_VISUAL_SCENARIO__`). Emitted once, after this first
+  // completed render pass following fixture detection/application (or its
+  // absence) above, so tests can assert the app has actually finished
+  // reflecting fixture state (or the lack of one) before comparing
+  // screenshots.
+  if (import.meta.env.VITE_E2E_MODE === 'true' && !visualScenarioAttestationEmitted) {
+    if (visualScenarioActive && visualScenarioFixtureName !== undefined) {
+      document.documentElement.dataset.loopVisualScenario =
+        `v1:${visualScenarioFixtureName}:rendered`
+    } else {
+      delete document.documentElement.dataset.loopVisualScenario
+    }
+    visualScenarioAttestationEmitted = true
+  }
+
   window.requestAnimationFrame(frame)
 }
 

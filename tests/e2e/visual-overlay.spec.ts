@@ -127,6 +127,17 @@ test('GIVEN the running-hud active-fixture-only scenario WHEN the DOM overlay ro
   await installVisualScenario(page, RUNNING_HUD_FIXTURE)
   await page.goto('/')
 
+  // AC3 (Issue #1728): explicit receipt assertion before the screenshot
+  // comparison below -- proves the app actually finished applying/rendering
+  // RUNNING_HUD_FIXTURE (not just that SOME UI happened to render close
+  // enough to the baseline). `expectDomOverlayScreenshot()` also enforces
+  // this centrally (AC6), but this call makes the guarantee explicit at the
+  // call site too.
+  await expect(page.locator('html')).toHaveAttribute(
+    'data-loop-visual-scenario',
+    `v1:${RUNNING_HUD_FIXTURE.name}:rendered`,
+  )
+
   const overlayRoot = page.locator('[data-battle-ui-root]')
   // registryId + explicit maxDiffPixels (Issue #1386 PR #1721 review fix, P1
   // Blocker 1 / Blocker 2): `running-hud-overlay-legacy-current` is a
