@@ -512,7 +512,7 @@ contract_patch_plan_v1:
 `forbidden` は常に `direct_github_write` と `implementation_phase_transition` の 2 値を含む。
 本 plan の生成コードパスから Issue 本文への実際の書き込みや実装フェーズへの遷移を実行することはできない
 （`build_contract_patch_plan_v1()` は dict を返すのみで、`gh` 呼び出しを一切含まない）。
-実際の適用は既存の `issue-author` / `edit-issue` skill 経由でのみ行う。
+実際の適用は既存 Issue 更新専用の `issue-editor` / `edit-issue` skill 経由でのみ行う。
 
 ### decide_next_loop_action.py の非破壊分岐（AC20）
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CONTRACT_PATCH_PLAN_V1",
-  "description": "Generation-only plan describing how an Issue contract (In Scope / Out of Scope / Acceptance Criteria / Stop Conditions / Verification Commands) should be patched from an explicit human-review directive (#1323). direct_github_write is never performed from this schema's producer -- application happens via issue-author / edit-issue skill.",
+  "description": "Generation-only plan describing how an Issue contract (In Scope / Out of Scope / Acceptance Criteria / Stop Conditions / Verification Commands) should be patched from an explicit human-review directive (#1323). direct_github_write is never performed from this schema's producer -- application happens via issue-editor / edit-issue skill.",
   "type": "object",
   "required": [
     "schema_version",

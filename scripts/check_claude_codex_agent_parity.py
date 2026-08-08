@@ -26,8 +26,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPECTATION_PATH = REPO_ROOT / "tests/fixtures/codex-agent-config/expected-runtime-contract.json"
 CODEX_CONFIG_PATH = REPO_ROOT / ".codex/config.toml"
 
-# Agents in scope for parity check (issue-reviewer and issue-author)
-PARITY_AGENTS = {"issue-reviewer", "issue-author", "scope-rollup-runner"}
+# Agents in scope for parity check (issue-reviewer and the split Issue roles)
+PARITY_AGENTS = {"issue-reviewer", "issue-creator", "issue-editor", "scope-rollup-runner"}
 CODEX_ONLY_ALLOWED_AGENTS = {"spark-skim", "spark-worker", "spark-deep"}
 CODEX_ONLY_PARITY_REASON = "manual_codex_spark_agent"
 CODEX_ONLY_MODEL = "gpt-5.3-codex-spark"

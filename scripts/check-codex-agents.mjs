@@ -66,7 +66,8 @@ const CODEX_BIN = process.env.CODEX_BIN ?? 'codex';
 const requiredAgentNames = [
   'codebase-investigator',
   'implementation-worker',
-  'issue-author',
+  'issue-creator',
+  'issue-editor',
   'issue-reviewer',
   'post-merge-cleanup-worker',
   'pr-reviewer-lite',
@@ -94,8 +95,8 @@ function loadReasoningMap() {
     throw new Error(`runtime contract is malformed: ${runtimeContractPath}`);
   }
   const entries = Object.entries(contract.required_agents);
-  if (entries.length !== 14) {
-    throw new Error(`runtime contract must declare exactly 14 agents: ${runtimeContractPath}`);
+  if (entries.length !== 15) {
+    throw new Error(`runtime contract must declare exactly 15 agents: ${runtimeContractPath}`);
   }
   for (const [name, expected] of entries) {
     for (const field of ['path', 'model', 'model_reasoning_effort', 'default_permissions']) {
@@ -215,7 +216,8 @@ const readOnlyAgents = new Set([
 
 const writeAgents = new Set([
   'implementation-worker',
-  'issue-author',
+  'issue-creator',
+  'issue-editor',
   'post-merge-cleanup-worker',
   'review-issue',
   'spark-deep',

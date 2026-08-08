@@ -60,9 +60,10 @@ entries:
       - ".claude/skills/issue-contract-review/SKILL.md"
       - ".claude/skills/implement-issue/SKILL.md"
     producer:
-      owner: "issue-author"
+      owner: "issue-creator + issue-editor"
       paths:
-        - ".claude/skills/issue-author/"
+        - ".claude/skills/create-issue/"
+        - ".claude/skills/edit-issue/"
     consumers:
       - id: "issue-contract-review"
         paths:
@@ -410,11 +411,13 @@ entries:
     format: github_issue_body
     source_kind: github_issue_body
     definition_paths:
-      - ".claude/skills/issue-author/SKILL.md"
+      - ".claude/skills/create-issue/SKILL.md"
+      - ".claude/skills/edit-issue/SKILL.md"
     producer:
-      owner: "issue-author"
+      owner: "issue-creator + issue-editor"
       paths:
-        - ".claude/skills/issue-author/"
+        - ".claude/skills/create-issue/"
+        - ".claude/skills/edit-issue/"
     consumers:
       - id: "issue-contract-review"
         paths:
@@ -458,9 +461,10 @@ entries:
     definition_paths:
       - "docs/dev/runtime-verification-policy.md"
     producer:
-      owner: "issue-author"
+      owner: "issue-creator + issue-editor"
       paths:
-        - ".claude/skills/issue-author/"
+        - ".claude/skills/create-issue/"
+        - ".claude/skills/edit-issue/"
         - "docs/dev/runtime-verification-policy.md"
     consumers:
       - id: "implement-issue"
