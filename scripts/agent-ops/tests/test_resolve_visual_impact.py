@@ -31,7 +31,29 @@ REGISTRY_PATH = REPO_ROOT / "docs" / "dev" / "visual-surfaces.yml"
 SCHEMA_PATH = REPO_ROOT / "docs" / "dev" / "visual-surfaces.schema.json"
 MJS_PATH = REPO_ROOT / "scripts" / "agent-ops" / "resolve_visual_impact.mjs"
 
-pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node is required for resolve_visual_impact.mjs")
+
+def _mjs_dependencies_available() -> bool:
+    """`node` alone is not sufficient: resolve_visual_impact.mjs resolves the
+    ``typescript`` package via Node ESM module resolution rooted at
+    REPO_ROOT. The `python-test-core` CI lane is intentionally Python-only
+    (no `pnpm install`; see docs/dev/test-lane-policy.md / #1760), so
+    ``node_modules/typescript`` is absent there and a plain `node` presence
+    check would let the subprocess hard-crash with ERR_MODULE_NOT_FOUND
+    instead of cleanly skipping. AC4/AC5 behavior is still exercised end to
+    end (real resolve_visual_impact.py + resolve_visual_impact.mjs
+    subprocess, not a reimplementation) by the Vitest suite under
+    tests/agent-ops/resolve-visual-impact-*.test.ts, which runs in the
+    `test` job where `pnpm install` has already populated node_modules.
+    """
+    if shutil.which("node") is None:
+        return False
+    return (REPO_ROOT / "node_modules" / "typescript").is_dir()
+
+
+pytestmark = pytest.mark.skipif(
+    not _mjs_dependencies_available(),
+    reason="node + node_modules/typescript is required for resolve_visual_impact.mjs",
+)
 
 
 def test_ac4_combat_hud_module_change_flags_combat_hud_running():
