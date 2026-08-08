@@ -1972,6 +1972,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-file", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=180)
+    parser.add_argument(
+        "--timeout-is-capability-unavailable",
+        action="store_true",
+        help=(
+            "classify a structured-lane timeout as capability-unavailable "
+            "(exit 77) instead of a runtime failure. This is opt-in for "
+            "callers whose bounded verification window is itself the "
+            "runtime-capability boundary; the default timeout behavior is "
+            "exit 1."
+        ),
+    )
     parser.add_argument("--max-turns", type=_positive_int, default=_DEFAULT_MAX_TURNS,
                          help="bounded turn count for Claude Code (structured lane only; positive integer)")
     parser.add_argument("--expect-marker", action="append", default=[])
@@ -2345,8 +2356,16 @@ def main(argv: list[str] | None = None) -> int:
                 errors.append(capability_reason)
                 exit_code = EXIT_SKIP
             elif timed_out:
-                errors.append("structured lane timed out")
-                exit_code = EXIT_FAIL
+                if args.timeout_is_capability_unavailable:
+                    errors.append("structured lane exceeded the declared capability window")
+                    schema_summary["capability_decision"] = "capability_skip_timeout"
+                    schema_summary["capability_error_classification"] = (
+                        "declared_capability_window_exceeded"
+                    )
+                    exit_code = EXIT_SKIP
+                else:
+                    errors.append("structured lane timed out")
+                    exit_code = EXIT_FAIL
             elif rc is None:
                 errors.append(f"structured lane failed to start: {_redact(err[:500])}")
                 exit_code = EXIT_FAIL

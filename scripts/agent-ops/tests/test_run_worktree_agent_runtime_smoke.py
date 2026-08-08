@@ -503,6 +503,32 @@ sleep 30
     assert "timed out" in result.stderr
 
 
+def test_given_declared_capability_window_when_fake_claude_hangs_then_exit77(
+    repo_with_worktree, tmp_path
+):
+    """The opt-in policy yields a persisted SKIP, not an outer verifier timeout."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+sleep 30
+""")
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--timeout-seconds", "2", "--timeout-is-capability-unavailable",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 77
+    assert result.stderr.startswith("SKIP:")
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "capability_decision: capability_skip_timeout" in summary
+    assert "capability_error_classification: declared_capability_window_exceeded" in summary
+
+
 def test_given_fake_claude_argv_when_structured_lane_runs_then_max_turns_flag_present(
     repo_with_worktree, tmp_path
 ):
