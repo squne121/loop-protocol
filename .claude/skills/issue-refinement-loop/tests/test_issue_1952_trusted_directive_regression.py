@@ -108,14 +108,19 @@ def _classify(evidence: dict) -> dict:
 
 
 def test_owner_prose_directive_without_anchor_payload_routes_contract_update():
-    result = _classify(_evidence(_directive_body()))
+    body = _directive_body() + "\n- allowed paths `docs/test.md` を追加する。"
+    result = _classify(_evidence(body))
 
     assert result["authority_category"] == "human_review_directive"
     assert result["directive"]["confidence"] == "explicit"
-    assert result["route"]["action"] == "human_escalation"
-    assert result["route"]["reason_code"] == "expands_allowed_paths"
+    assert result["route"]["action"] == "contract_update_required"
+    assert result["route"]["reason_code"] == "explicit_human_contract_directive"
     assert result["route"]["implementation_allowed"] is False
     assert result["provenance"]["source_ref"] == URL
+    source = result["contract_patch_plan"]["source_evidence"][0]
+    assert source["source_ref"] == URL
+    assert source["source_comment_id"] == 5224799872
+    assert source["source_body_sha256"] == _evidence(body)["body_sha256"]
 
 
 def test_role_split_same_issue_is_not_issue_partition():
@@ -161,6 +166,38 @@ def test_permission_delta_stock_phrase_without_concrete_before_after_path_escala
     result = _classify(_evidence(body))
 
     assert result["boundary_flags"]["changes_permission_boundary"] is True
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "changes_permission_boundary"
+
+
+def test_multiple_permission_deltas_fail_closed_without_selecting_one():
+    body = "\n".join(
+        [
+            "- exact permission delta: read-only -> workspace-write for `.codex/agents/issue-creator.toml` は "
+            "human directive の目的に必要であり、least privilege で採用する。"
+            "non-destructive、no secrets、no paid external service、no unrelated privilege widening を満たす。"
+            "permission delta: workspace-write -> unrestricted-write for `.codex/agents/issue-editor.toml`。",
+            "- allowed paths `docs/test.md` を追加する。",
+        ]
+    )
+    result = _classify(_evidence(body))
+
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "changes_permission_boundary"
+
+
+def test_unrelated_permission_widening_fails_closed_despite_stock_denial():
+    body = "\n".join(
+        [
+            "- exact permission delta: read-only -> workspace-write for `.codex/agents/issue-creator.toml` は "
+            "human directive の目的に必要であり、least privilege で採用する。"
+            "non-destructive、no secrets、no paid external service、no unrelated privilege widening を満たす。"
+            "unrelated privilege widening: workspace-write -> unrestricted-write for `.codex/agents/unrelated.toml`。",
+            "- allowed paths `docs/test.md` を追加する。",
+        ]
+    )
+    result = _classify(_evidence(body))
+
     assert result["route"]["action"] == "human_escalation"
     assert result["route"]["reason_code"] == "changes_permission_boundary"
 

@@ -699,6 +699,12 @@ _CONCRETE_PERMISSION_DELTA_RE = re.compile(
 _CONCRETE_REPOSITORY_PATH_RE = re.compile(
     r"`(?P<path>(?!/)(?!.*(?:^|/)\.\.(?:/|$))[^`\s]+/[^`\s]+)`"
 )
+_UNRELATED_PERMISSION_WIDENING_RE = re.compile(
+    r"(?<!no )unrelated(?: privilege)? widening|"
+    r"(?<!no )unrelated privilege widening|"
+    r"無関係な権限拡大(?!なし)",
+    re.IGNORECASE,
+)
 
 _ISSUE_COMMENT_URL_RE = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)"
@@ -1433,24 +1439,30 @@ def _permission_boundary_is_constrained_directive(evidence: dict, boundary_flags
         return False
 
     directives = evidence.get("extracted_directives") or []
+    concrete_deltas: list[tuple[str, str, str]] = []
     for directive in directives:
         candidate = _strip_quoted_fragments(str(directive))
         if not _contains_all_permission_constraints(candidate):
             continue
+        if _UNRELATED_PERMISSION_WIDENING_RE.search(candidate):
+            return False
         # A stock claim of an "exact permission delta" is insufficient.
         # The normalized directive must carry an actual before→after value
         # and an exact repository-relative target path. The controlled
         # transaction and fresh validators verify that the proposed delta is
         # still current before any implementation route is considered.
-        delta = _CONCRETE_PERMISSION_DELTA_RE.search(candidate)
-        if (
-            delta is not None
-            and delta.group("before").strip()
-            and delta.group("after").strip()
-            and _CONCRETE_REPOSITORY_PATH_RE.search(str(directive))
-        ):
-            return True
-    return False
+        for delta in _CONCRETE_PERMISSION_DELTA_RE.finditer(candidate):
+            path = _CONCRETE_REPOSITORY_PATH_RE.search(str(directive))
+            if path is None or not delta.group("before").strip() or not delta.group("after").strip():
+                continue
+            concrete_deltas.append(
+                (delta.group("before").strip(), delta.group("after").strip(), path.group("path"))
+            )
+
+    # A trusted directive may name exactly one verified permission delta. A
+    # second (including contradictory) delta requires a human resolution;
+    # choosing one would be an inference across authorization boundaries.
+    return len(concrete_deltas) == 1
 
 
 def _first_blocking_boundary_reason(boundary_flags: dict, evidence: dict):
