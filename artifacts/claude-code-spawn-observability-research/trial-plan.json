@@ -1,0 +1,338 @@
+{
+  "schema": "spawn_observability_trial_plan/v1",
+  "issue": 2013,
+  "control_trial_count": 15,
+  "production_trial_count": 15,
+  "lifecycle_checkpoints": [
+    "process_started",
+    "system_init_observed",
+    "agent_tool_use_observed",
+    "subagent_start_hook_observed",
+    "subagent_stop_hook_observed",
+    "tool_result_observed",
+    "tool_result_agent_id_observed",
+    "tool_result_agent_type_observed",
+    "agent_type_matches_requested",
+    "terminal_event_observed",
+    "expected_marker_observed",
+    "delegation_request_validated"
+  ],
+  "diagnostic_causes": [
+    "spawn_not_attempted",
+    "subagent_start_not_observed",
+    "subagent_completion_timeout",
+    "tool_result_identity_not_observed",
+    "agent_type_mismatch",
+    "runtime_api_retry_timeout",
+    "runtime_nonzero",
+    "terminal_event_missing",
+    "marker_not_observed",
+    "request_validation_failed",
+    "delegation_wrapper_failed",
+    "downstream_route_failed"
+  ],
+  "trials": [
+    {
+      "trial_id": "control-01",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-02",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-03",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-04",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-05",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-06",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-07",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-08",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-09",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-10",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-11",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-12",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-13",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-14",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "control-15",
+      "lane": "control",
+      "runtime": "claude_code",
+      "agent": "spawn-probe",
+      "profile": null,
+      "timeout_seconds": 300,
+      "max_turns": 6,
+      "expected_marker": "CONTROL_PROBE_DONE"
+    },
+    {
+      "trial_id": "production-01",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "codebase-investigator",
+      "profile": "local_asset_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-02",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "codebase-investigator",
+      "profile": "github_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-03",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "web-researcher",
+      "profile": "grounded_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-04",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "codebase-investigator",
+      "profile": "local_asset_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-05",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "codebase-investigator",
+      "profile": "github_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-06",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "web-researcher",
+      "profile": "grounded_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-07",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "codebase-investigator",
+      "profile": "local_asset_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-08",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "codebase-investigator",
+      "profile": "github_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-09",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "web-researcher",
+      "profile": "grounded_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-10",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "codebase-investigator",
+      "profile": "local_asset_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-11",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "codebase-investigator",
+      "profile": "github_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-12",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "web-researcher",
+      "profile": "grounded_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-13",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "codebase-investigator",
+      "profile": "local_asset_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-14",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "codebase-investigator",
+      "profile": "github_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    },
+    {
+      "trial_id": "production-15",
+      "lane": "production",
+      "runtime": "claude_code",
+      "agent": "web-researcher",
+      "profile": "grounded_research",
+      "timeout_seconds": 600,
+      "max_turns": 30,
+      "expected_marker": "ROUTE_SMOKE_DONE"
+    }
+  ],
+  "trial_plan_sha256": "87a3f3c8e0ed89a929d7a28ea5bfe6a52759c57e5d9c02982be0af3389fdd534",
+  "frozen_at": "2026-08-08T05:10:33Z"
+}
