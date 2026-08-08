@@ -255,13 +255,15 @@ function main() {
 // parent that is a symlink (or owned by someone else) would be silently
 // forced to mode 0700. This instead:
 //   - creates the parent (and any missing ancestors) with mode 0700 ONLY
-//     when it does not already exist -- a directory this call itself
-//     created is always safe to chmod;
+//     when it does not already exist; the resulting path is then opened
+//     and validated through the fd before fchmodSync(), the same as the
+//     pre-existing-parent case below;
 //   - for a pre-existing parent, opens it with O_RDONLY (adding
 //     O_NOFOLLOW when the runtime exposes fs.constants.O_NOFOLLOW) and
 //     verifies -- via the open file descriptor, never the pathname
-//     again, using fstatSync() -- that it is a real directory owned by
-//     the current uid before repairing its mode to exactly 0700 (a
+//     again, using fstatSync() -- that it is a real directory and, when
+//     process.getuid() is available, that its uid matches the current
+//     uid, before repairing its mode to exactly 0700 (a
 //     looser mode left by an older version of this script is explicitly
 //     repaired by policy, never silently trusted as-is).
 function preparePrivateParentDir(dir) {
