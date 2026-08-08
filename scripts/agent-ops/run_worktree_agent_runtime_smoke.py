@@ -1031,8 +1031,168 @@ def _extract_claude_child_session_id_from_stream(stdout: str) -> str | None:
 
 _CLAUDE_AGENT_TYPE_RE = re.compile(r'"agentType"\s*:\s*"([a-zA-Z0-9_-]+)"')
 
+# Issue #2021 (evidence: Issue #2013 research artifact
+# ``artifacts/claude-code-spawn-observability-research/``): the ``Agent`` tool
+# returns TWO tool_use_result envelope shapes, non-deterministically.
+#
+# - synchronous completion: ``{"status": "completed", "agentId": ..,
+#   "agentType": .., "content": .., ...}``
+# - asynchronous launch:    ``{"isAsync": true, "status": "async_launched",
+#   "agentId": .., "description": .., "resolvedModel": .., "outputFile": ..}``
+#
+# The async-launch shape carries ``agentId`` but NO ``agentType``. Because
+# ``native_spawn_event_observed`` requires an observed agent type that matches
+# the requested one, a genuinely-spawned, fully-observable child was being
+# reported as ``spawn_not_observed`` purely because of the envelope shape --
+# 20 of 30 live trials in the #2013 research, with zero timeouts and zero
+# ``system/api_retry`` events (i.e. deterministic, never a transient race).
+#
+# The runtime does supply the missing evidence on a second channel: the
+# ``SubagentStart``/``SubagentStop`` hook lifecycle events surfaced by
+# ``--include-hook-events``. Across all 30 trials the hook-channel ``agent_id``
+# matched ``tool_use_result.agentId`` exactly, and the hook-channel agent type
+# always matched the requested agent. Two sub-sources exist in-stream:
+#
+# - ``hook_name``: the runtime labels a per-agent hook invocation
+#   ``"<HookEvent>:<agent_type>"`` (observed on ``SubagentStart``).
+# - the official hook stdin payload (``agent_id``/``agent_type``/
+#   ``agent_transcript_path``/``stop_reason``), which appears in the event's
+#   ``stdout``/``output`` field whenever the configured hook echoes it back.
+#
+# The tool_use_result channel keeps strict precedence: the hook channel is a
+# fallback, never a replacement. Hooks are deliberately NOT made the sole
+# ground truth -- upstream https://github.com/anthropics/claude-code/issues/27755
+# reports (as a community bug report, "Closed as not planned", not an official
+# contract) that these hooks can fail to fire. Absent BOTH channels this still
+# fails closed to ``None``; a value that cannot be honestly observed is never
+# guessed, and the caller's requested agent type is never substituted.
+
+_CLAUDE_HOOK_LIFECYCLE_EVENTS = ("SubagentStart", "SubagentStop")
+
+# Evidence provenance labels for ``child_agent_type_source`` (Issue #2021 AC6).
+AGENT_TYPE_SOURCE_TOOL_RESULT = "tool_use_result"
+AGENT_TYPE_SOURCE_HOOK_PAYLOAD = "hook_payload"
+AGENT_TYPE_SOURCE_HOOK_NAME = "hook_name"
+
+# ``child_spawn_launch_mode`` values (Issue #2021 AC7).
+SPAWN_LAUNCH_MODE_ASYNC = "async_launched"
+SPAWN_LAUNCH_MODE_COMPLETED = "completed"
+SPAWN_LAUNCH_MODE_UNKNOWN = None
+
+
+def _iter_claude_stream_events(stdout: str):
+    """Yield each stream-json line that parses to a JSON object."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            yield payload
+
+
+def _parse_embedded_json_object(text: str) -> dict | None:
+    """Best-effort parse of a JSON object embedded in hook stdout.
+
+    A hook that echoes its stdin payload may prefix it (Claude Code treats
+    non-JSON-leading hook stdout as plain text, so loggers commonly add one).
+    Only an exact object parse is accepted -- never a regex-scraped value."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    candidate = text[start:].strip()
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def extract_claude_hook_agent_identity(stdout: str) -> dict:
+    """Runtime-returned child identity from the hook lifecycle channel.
+
+    Returns ``{"agent_id", "agent_type", "source"}``; every value is ``None``
+    when the corresponding evidence is absent (Issue #2021). ``source`` is
+    ``hook_payload`` when the official payload was recovered, ``hook_name``
+    when only the ``"<HookEvent>:<agent_type>"`` label was available."""
+    result: dict = {"agent_id": None, "agent_type": None, "source": None}
+    hook_name_agent_type: str | None = None
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "system":
+            continue
+        hook_event = payload.get("hook_event")
+        if hook_event not in _CLAUDE_HOOK_LIFECYCLE_EVENTS:
+            continue
+        hook_name = payload.get("hook_name")
+        if isinstance(hook_name, str) and hook_name.startswith(f"{hook_event}:"):
+            suffix = hook_name.split(":", 1)[1].strip()
+            if suffix and hook_name_agent_type is None:
+                hook_name_agent_type = suffix
+        for key in ("stdout", "output"):
+            text = payload.get(key)
+            if not isinstance(text, str) or not text.strip():
+                continue
+            parsed = _parse_embedded_json_object(text)
+            if parsed is None:
+                continue
+            agent_id = parsed.get("agent_id")
+            agent_type = parsed.get("agent_type")
+            if isinstance(agent_id, str) and agent_id and result["agent_id"] is None:
+                result["agent_id"] = agent_id
+            if isinstance(agent_type, str) and agent_type and result["agent_type"] is None:
+                result["agent_type"] = agent_type
+                result["source"] = AGENT_TYPE_SOURCE_HOOK_PAYLOAD
+    if result["agent_type"] is None and hook_name_agent_type is not None:
+        result["agent_type"] = hook_name_agent_type
+        result["source"] = AGENT_TYPE_SOURCE_HOOK_NAME
+    return result
+
+
+def classify_claude_spawn_launch_mode(stdout: str) -> str | None:
+    """How the ``Agent`` tool reported the child launch (Issue #2021 AC7).
+
+    ``async_launched`` / ``completed`` come from the runtime's own
+    ``tool_use_result.status`` (with ``isAsync`` as a corroborating signal);
+    ``None`` when no Agent tool_result envelope is present at all."""
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "user":
+            continue
+        tool_use_result = payload.get("tool_use_result")
+        if not isinstance(tool_use_result, dict):
+            continue
+        status = tool_use_result.get("status")
+        if status == SPAWN_LAUNCH_MODE_ASYNC or tool_use_result.get("isAsync") is True:
+            return SPAWN_LAUNCH_MODE_ASYNC
+        if status == SPAWN_LAUNCH_MODE_COMPLETED:
+            return SPAWN_LAUNCH_MODE_COMPLETED
+    return SPAWN_LAUNCH_MODE_UNKNOWN
+
+
+def extract_claude_child_agent_type_with_source(stdout: str) -> tuple[str | None, str | None]:
+    """``(agent_type, source)`` -- the agent type together with the provenance
+    of the channel it was actually observed on. Both are ``None`` when no
+    channel supplied evidence (fail-closed)."""
+    from_tool_result = _extract_claude_child_agent_type_from_tool_result(stdout)
+    if from_tool_result is not None:
+        return from_tool_result, AGENT_TYPE_SOURCE_TOOL_RESULT
+    hook_identity = extract_claude_hook_agent_identity(stdout)
+    if hook_identity["agent_type"] is not None:
+        return hook_identity["agent_type"], hook_identity["source"]
+    return None, None
+
 
 def extract_claude_child_agent_type(stdout: str) -> str | None:
+    """Runtime-returned child agent type, preferring the ``tool_use_result``
+    channel and falling back to the hook lifecycle channel (Issue #2021).
+    Returns ``None`` -- never a guess -- when neither channel has evidence."""
+    agent_type, _source = extract_claude_child_agent_type_with_source(stdout)
+    return agent_type
+
+
+def _extract_claude_child_agent_type_from_tool_result(stdout: str) -> str | None:
     """Issue #1886 P0-2 fix_delta (PR #2005 adversarial review): the prior
     identity evidence only proved *a* child agent id was returned, never
     that it was the *requested* custom agent -- a generic ``general-purpose``
@@ -1096,13 +1256,22 @@ def extract_claude_child_session_id(
     (``~/.claude/projects/<cwd-slug>/<session_id>.jsonl``), kept only in
     case a future caller invokes this runner without
     ``--no-session-persistence``. Returns ``None`` on any lookup failure --
-    this is read-only, best-effort evidence collection, never a guess."""
-    if not parent_session_id:
-        return None
+    this is read-only, best-effort evidence collection, never a guess.
+
+    Issue #2021: the stdout search is no longer gated on ``parent_session_id``.
+    Previously a missing/unparsed parent id returned ``None`` immediately,
+    without ever consulting ``stdout`` -- so spawn-time evidence being absent
+    silently destroyed completion-time evidence that was sitting right there in
+    the already-captured stream (recorded as a known defect in the Issue #2013
+    research artifact's ``code-analysis.md``). The parent id is still required
+    for the *file-based* fallback below, which globs a transcript path built
+    from it; that guard now sits where it is actually needed."""
     if stdout:
         found = _extract_claude_child_session_id_from_stream(stdout)
         if found:
             return found
+    if not parent_session_id:
+        return None
     try:
         home = Path.home()
         projects_dir = home / ".claude" / "projects"
@@ -2052,11 +2221,22 @@ def main(argv: list[str] | None = None) -> int:
             if args.runtime == "claude":
                 parent_session_id = extract_claude_parent_session_id(out)
                 child_session_id = extract_claude_child_session_id(parent_session_id, worktree, out)
-                child_agent_type_observed = extract_claude_child_agent_type(out)
+                # Issue #2021: record WHICH runtime channel supplied the agent
+                # type, and how the Agent tool reported the launch, so a future
+                # reader can tell "no evidence at all" apart from "evidence on
+                # the hook channel only" without re-parsing the raw stream.
+                child_agent_type_observed, child_agent_type_source = (
+                    extract_claude_child_agent_type_with_source(out)
+                )
+                child_spawn_launch_mode = classify_claude_spawn_launch_mode(out)
             else:
                 parent_session_id = extract_codex_parent_session_id(out)
                 child_session_id = extract_codex_child_session_id(parent_session_id)
                 child_agent_type_observed = extract_codex_child_agent_role(parent_session_id)
+                child_agent_type_source = (
+                    "codex_session_meta_agent_role" if child_agent_type_observed else None
+                )
+                child_spawn_launch_mode = SPAWN_LAUNCH_MODE_UNKNOWN
             agent_type_identity_verified = (
                 child_agent_type_observed is not None
                 and requested_agent_type is not None
@@ -2065,6 +2245,8 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["parent_session_id"] = parent_session_id
             schema_summary["child_session_id"] = child_session_id
             schema_summary["child_agent_type_observed"] = child_agent_type_observed
+            schema_summary["child_agent_type_source"] = child_agent_type_source
+            schema_summary["child_spawn_launch_mode"] = child_spawn_launch_mode
             schema_summary["agent_type_identity_verified"] = agent_type_identity_verified
             schema_summary["native_spawn_event_observed"] = bool(
                 parent_session_id
