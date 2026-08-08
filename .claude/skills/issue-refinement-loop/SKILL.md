@@ -145,13 +145,17 @@ uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
 wrapper の出力フィールドを確認する:
 
 **canonical stdout フィールド（機械可読）:**
-- `STATUS: pass | warn | blocked | environment_failure` — 常に出力される
-- `NEXT_ACTION: proceed | proceed_with_notes | human_judgment_required | fix_environment` — 常に出力される
+- `STATUS: pass | warn | needs_fix | blocked | environment_failure` — 常に出力される
+- `NEXT_ACTION: proceed | proceed_with_notes | apply_deterministic_repair | human_judgment_required | fix_environment` — 常に出力される
 - `MUST_READ:` — 読むべきパス一覧（空の場合は省略）
 - `COMMANDS_JSON:` — full command spec objects（canonical machine-consumable、空の場合は省略）
 - `COMMANDS_DISPLAY:` — human-readable display（display_only=true、空の場合は省略）
 - `BLOCKERS:` — ブロッカーコード一覧（空の場合は省略）
-- `ARTIFACT:` — 書き込まれた artifact の key: path 一覧（空の場合は省略）
+- `ARTIFACT:` — 書き込まれた artifact の key: path 一覧（空の場合は省略）。`STATUS: needs_fix` の場合は `repair_diagnostics` / `repair_candidate_body` も含まれる（Issue #2016 iteration-3 P1-1。`repair_action.diagnostics_artifact` / `.candidate_body_artifact` と同一パスを canonical artifact map からも参照可能にする）
+- `REPAIR_ACTION:` — versioned `repair_action` disposition（Issue #2016。`STATUS: needs_fix` の場合のみ出力される。`disposition: auto_apply_safe` と diagnostics/candidate body artifact パス・original/repaired SHA を含む）
+
+**`STATUS: needs_fix` / `NEXT_ACTION: apply_deterministic_repair`（Issue #2016）:**
+`repair_issue_contract.py` が既知の safe な deterministic repair（disposition: `auto_apply_safe`）を1件以上検出した場合、`run_refinement_preflight.py` は generic blocker を追加せず `STATUS: needs_fix` / `NEXT_ACTION: apply_deterministic_repair` を返す。この orchestrator（issue-refinement-loop）は現時点では `apply_deterministic_repair` の auto-apply consumer を持たない。したがって `NEXT_ACTION: apply_deterministic_repair` を受信した場合は、Issue 本文への実際の auto-mutation は行わず、`STATUS: blocked` と同様に human 判断待ちの informational route として扱う（`ARTIFACT:` の `repair_action.diagnostics_artifact` / `repair_action.candidate_body_artifact` を人間が参照できるようにするだけで、`decide_next_loop_action.py` 等の rewrite loop router のロジック自体はこの Issue では変更しない）。実際の auto-mutation（controlled `issue-editor` transaction・stale hash guard・GitHub readback・fresh preflight 再実行）は別 Issue で扱う。
 
 **非 canonical / 抑制フィールド:**
 - `SUMMARY` — 人間向け prose、オーケストレーターは consume しない
