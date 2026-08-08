@@ -1016,7 +1016,10 @@ def test_extract_derived_vitest_component_captures_against_real_repo_spec_files(
     captures, errors = mod.extract_derived_vitest_component_captures(component_dir, _REAL_VITEST_CONFIG)
     assert errors == []
     capture_ids = {c["capture_id"] for c in captures}
-    assert capture_ids == {"combat-hud-running.vrt.test.ts::combat-hud-running.png"}
+    assert capture_ids == {
+        "combat-hud-running.vrt.test.ts::combat-hud-running.png",
+        "combat-hud-running.vrt.test.ts::combat-hud-critical.png",
+    }
     assert mod.validate_vitest_component_captures(captures) == []
 
 
