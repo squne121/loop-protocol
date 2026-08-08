@@ -198,7 +198,8 @@ class TestIssueRefinementOpsReviewMustRead:
         spec = PLAN_REGISTRY["issue-refinement-ops-review"]
         required_agents = [
             ".claude/agents/issue-reviewer.md",
-            ".claude/agents/issue-author.md",
+            ".claude/agents/issue-creator.md",
+            ".claude/agents/issue-editor.md",
         ]
         for agent in required_agents:
             assert agent in spec.must_read, f"Missing required agent: {agent}"
@@ -542,7 +543,8 @@ class TestIssueRefinementOpsReviewSecurity:
     def test_security_codex_agents_toml_classified_as_codex_agent_definition(self):
         """GIVEN a .codex/agents/*.toml path WHEN classified THEN codex_agent_definition,
         not generic codex_config (MAJOR 1)."""
-        assert classify_path_kind(".codex/agents/issue-author.toml") == "codex_agent_definition"
+        assert classify_path_kind(".codex/agents/issue-creator.toml") == "codex_agent_definition"
+        assert classify_path_kind(".codex/agents/issue-editor.toml") == "codex_agent_definition"
         assert classify_path_kind(".claude/agents/issue-reviewer.md") == "claude_agent_definition"
         # Non-agent codex config still classifies as codex_config.
         assert classify_path_kind(".codex/config.toml") == "codex_config"

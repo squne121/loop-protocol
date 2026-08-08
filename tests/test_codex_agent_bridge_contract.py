@@ -136,7 +136,7 @@ def test_scope_rollup_runner_parity_excludes_permission_profile_but_checks_contr
 
 def test_parity_treats_codex_delegation_prose_as_advisory(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
-    agent_path = repo / ".codex/agents/issue-author.toml"
+    agent_path = repo / ".codex/agents/issue-creator.toml"
     agent_path.write_text(
         agent_path.read_text(encoding="utf-8").replace(
             "Known limitation",
@@ -177,12 +177,6 @@ def _copy_fixture_repo(tmp_path: Path) -> Path:
     web_researcher.write_text(
         web_researcher.read_text(encoding="utf-8")
         + "\n<!-- fixture parity token: agy_grounded_research_only -->\n",
-        encoding="utf-8",
-    )
-    issue_author = repo / ".claude/agents/issue-author.md"
-    issue_author.write_text(
-        issue_author.read_text(encoding="utf-8")
-        + "\n## 出力契約（ISSUE_AUTHOR_RESULT_COMPACT_V1）\n\nfixture parity marker.\n",
         encoding="utf-8",
     )
     subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
@@ -241,11 +235,11 @@ def test_python_cli_detects_wrong_root_skill_target_via_subprocess(tmp_path: Pat
 
 def test_python_cli_detects_route_surface_mismatch_via_subprocess(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
-    agent_toml = repo / ".codex/agents/issue-author.toml"
+    agent_toml = repo / ".codex/agents/issue-creator.toml"
     agent_toml.write_text(
         agent_toml.read_text(encoding="utf-8").replace(
-            "runtime_followup_route: create-issue|edit-issue",
             "runtime_followup_route: create-issue",
+            "runtime_followup_route: edit-issue",
         ),
         encoding="utf-8",
     )
@@ -253,7 +247,7 @@ def test_python_cli_detects_route_surface_mismatch_via_subprocess(tmp_path: Path
     result = _run_python_validator(repo, runtime_contract=True)
 
     assert result.returncode == 1
-    assert "runtime_followup_route expected 'create-issue|edit-issue' got 'create-issue'" in result.stdout
+    assert "runtime_followup_route expected 'create-issue' got 'edit-issue'" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -333,7 +327,7 @@ def test_python_cli_detects_active_pretool_hook_via_subprocess(tmp_path: Path):
 
 def test_python_cli_detects_parity_failure_via_subprocess(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
-    (repo / ".claude/agents/issue-author.md").unlink()
+    (repo / ".claude/agents/issue-creator.md").unlink()
 
     result = subprocess.run(
         [sys.executable, "scripts/check_claude_codex_agent_parity.py", "--strict"],
@@ -351,7 +345,7 @@ def test_js_cli_passes_on_fixture_repo(tmp_path: Path):
     repo = _copy_fixture_repo(tmp_path)
     result = _run_js_validator(repo)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "ok 14 agents validated" in result.stdout
+    assert "ok 15 agents validated" in result.stdout
 
 
 def test_js_cli_detects_regular_directory_skill_surface_via_subprocess(tmp_path: Path):
