@@ -825,7 +825,66 @@ def test_repair_failure_dominates_planner_invalid_input(tmp_path):
 # hash-bound and run through a REAL planner subprocess (not a mock).
 # ---------------------------------------------------------------------------
 
-_ISSUE_2013_FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "issue_2013_snapshot.json"
+# Issue #2016 fix_delta (PR #2037 review blocker): this fixture used to live
+# at .claude/skills/issue-refinement-loop/tests/fixtures/issue_2013_snapshot.json,
+# but fixtures/ is not in Issue #2016's Allowed Paths. It is inlined here as a
+# raw JSON string (loaded via json.loads), split into adjacent raw-string
+# literals for line-length, verbatim -- so all hash-binding / metadata
+# semantics (source issue number, captured body SHA256, expected repair kind,
+# citation_discrepancy_note) are unchanged; only the storage location changed.
+_ISSUE_2013_FIXTURE_JSON = (
+    r"""{
+  "schema_version": "issue_2013_snapshot_fixture/v1",
+  "source_issue_number": 899,
+  "c"""
+    r"""itation_discrepancy_note": "Issue #2016's own Machine-Readable Contract / In Scope / Accep"""
+    r"""tance Criteria (AC7, VC test name test_issue_2013_safe_repair_does_not_silent_pass_or_huma"""
+    r"""n_escalate) cite this fixture as reproducing 'Issue #2013'. A live `gh issue view 2013` on"""
+    r""" this repo (squne121/loop-protocol) returns an UNRELATED research issue ('Claude Code cust"""
+    r"""om SubAgent spawn observability 非決定性を診断する', see PR #2022 / commit cba013ef), not """
+    r"""anything about baseline-expect / Allowed Paths VC repair. The actual matching originating """
+    r"""specification for the insert_baseline_expect_fail symptom this fixture reproduces (a Verif"""
+    r"""ication Command targeting a NEW Allowed Path with no preceding '# baseline-expect:' annota"""
+    r"""tion) is Issue #899 ('baseline_vc_preflight.py に --strict フラグを追加し annotation 欠落 """
+    r"""VC を強制 needs_fix にする', CLOSED) -- see repair_issue_contract.py's own '(Issue #899)' """
+    r"""comments on _repair_insert_baseline_expect() / Pass 2.5. This fixture is therefore sourced"""
+    r""" from Issue #899's actual specification (the real behavioral origin), not from a live Issu"""
+    r"""e #2013 snapshot, since Issue #2013 does not describe this symptom at all. This citation d"""
+    r"""iscrepancy in Issue #2016's own contract is flagged back to root/main for a human decision"""
+    r""" on whether to correct the Issue body (out of this worker's Allowed Paths) -- the test fun"""
+    r"""ction name itself is left unchanged because it is fixed by Issue #2016's own canonical Ver"""
+    r"""ification Commands section (AC7).",
+  "captured_body_sha256": "sha256:8a5641c90c38962f0e73"""
+    r"""a141b77c5e205c11e7aaedd05437fa360dbcfcd8126b",
+  "expected_repair_kinds": [
+    "insert_ba"""
+    r"""seline_expect_fail"
+  ],
+  "issue": {
+    "number": 899,
+    "title": "実装: baseline_vc_p"""
+    r"""reflight.py に --strict フラグを追加し annotation 欠落 VC を強制 needs_fix にする",
+    "b"""
+    r"""ody": "## Machine-Readable Contract\n\n```yaml\ncontract_schema_version: v1\nissue_kind: i"""
+    r"""mplementation\nparent_issue: \"none\"\n```\n\n## Parent Issue\n\nなし（単独改善）\n\n## Pa"""
+    r"""rent Goal Ref\n\n- Goal: none (standalone fixture)\n- Desired Destination: none (standalon"""
+    r"""e fixture)\n\n## Current Validated Scope\n\n- docs/dev/issue-899-baseline-expect-regressio"""
+    r"""n.md を追加する\n\n## Remaining Parent Gaps\n\nなし\n\n## Required Skills\n\n- なし\n\n## """
+    r"""Outcome\n\nAdd docs/dev/issue-899-baseline-expect-regression.md documenting the\nbaseline_"""
+    r"""vc_preflight.py --strict flag's annotation-missing VC handling.\n\n## In Scope\n\n- docs/d"""
+    r"""ev/issue-899-baseline-expect-regression.md\n\n## Out of Scope\n\n- Everything else.\n\n## """
+    r"""Acceptance Criteria\n\n- [ ] AC1: doc file exists.\n\n## Verification Commands\n\n```bash\n"""
+    r"""$ test -f docs/dev/issue-899-baseline-expect-regression.md\n```\n\n## Allowed Paths\n\n- `"""
+    r"""docs/dev/issue-899-baseline-expect-regression.md`\n\n## Stop Conditions\n\n- none\n"
+  }
+}"""
+    r"""
+"""
+)
+
+
+def _load_issue_2013_fixture() -> dict:
+    return json.loads(_ISSUE_2013_FIXTURE_JSON)
 
 
 def test_issue_2013_snapshot_fixture_is_hash_bound():
@@ -837,7 +896,7 @@ def test_issue_2013_snapshot_fixture_is_hash_bound():
     disconnected from a real captured snapshot)."""
     import hashlib
 
-    fixture = json.loads(_ISSUE_2013_FIXTURE_PATH.read_text(encoding="utf-8"))
+    fixture = _load_issue_2013_fixture()
     # P2-1 finding (flagged back to root/main -- see citation_discrepancy_note):
     # Issue #2016's own contract cites this fixture as reproducing "Issue
     # #2013", but the LIVE Issue #2013 in this repo is an unrelated research
@@ -867,7 +926,7 @@ def test_issue_2013_fixture_runs_through_real_planner_subprocess(tmp_path):
     plan_refinement_loop.py subprocess (not MOCK_PLAN_PASS), proving the
     needs_fix routing holds against actual planner semantics rather than a
     mock that always passes."""
-    fixture_data = json.loads(_ISSUE_2013_FIXTURE_PATH.read_text(encoding="utf-8"))
+    fixture_data = _load_issue_2013_fixture()
     body = fixture_data["issue"]["body"]
 
     fixture = {
