@@ -32,6 +32,7 @@
     "test:vrt:update:e2e": "VITE_E2E_MODE=true pnpm build && LOOP_VRT_LANE=true playwright test tests/e2e/visual-overlay.spec.ts --update-snapshots=all",
     "test:vrt:component": "vitest run --config vitest.visual.config.ts",
     "test:vrt:update:component": "vitest run --config vitest.visual.config.ts --update",
+    "test:vrt:evidence:triple-run": "rm -rf tests/component/.vrt-evidence && for i in 1 2 3; do VITE_VRT_EVIDENCE_CAPTURE=true VITE_VRT_EVIDENCE_RUN_ID=$i pnpm exec vitest run --config vitest.visual.config.ts tests/component/combat-hud-running.vrt.test.ts || exit 1; done && node -e \"const {createHash}=require('node:crypto');const fs=require('node:fs');const hashes=[1,2,3].map((i)=>createHash('sha256').update(fs.readFileSync('tests/component/.vrt-evidence/run-'+i+'/combat-hud-running-actual.png')).digest('hex'));console.log('actual_sha256_run_1='+hashes[0]);console.log('actual_sha256_run_2='+hashes[1]);console.log('actual_sha256_run_3='+hashes[2]);if(new Set(hashes).size!==1){console.error('MISMATCH: triple-run actual PNG sha256 differs across fresh processes');process.exit(1)}console.log('triple_run_stability=ok (3/3 identical sha256, fresh browser process each run)')\"",
     "playwright:install": "playwright install",
     "playwright:install:ci": "playwright install --with-deps chromium",
     "policy:check:secret": "uv run --locked python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md",
