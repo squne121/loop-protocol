@@ -55,6 +55,23 @@ COMMAND_ID_MAP: dict[str, list[str]] = {
     "playwright_e2e_vrt_verify": ["pnpm", "run", "test:vrt:e2e"],
 }
 
+# PR #2045 OWNER fix_delta P0-4/P0-6: paths whose own content constitutes the
+# visual-impact evaluator/policy itself. A change to any of these must never
+# be silently no-impact -- it invalidates the trustworthiness of every other
+# affected-surface determination in the same diff, so it is treated as a
+# meta policy change that affects ALL registered surfaces (same shape as a
+# `global_invalidator` hit, but independent of registry content so a
+# candidate PR cannot remove itself from this set).
+META_POLICY_PATHS: frozenset[str] = frozenset(
+    {
+        "docs/dev/visual-surfaces.yml",
+        "docs/dev/visual-surfaces.schema.json",
+        "scripts/agent-ops/resolve_visual_impact.py",
+        "scripts/agent-ops/resolve_visual_impact.mjs",
+        ".github/workflows/ci.yml",
+    }
+)
+
 
 class RegistryError(Exception):
     pass
@@ -77,6 +94,12 @@ class ResolveResult:
     unknown_impact: list[dict[str, Any]] = field(default_factory=list)
     unmapped_visual_candidates: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # PR #2045 OWNER fix_delta P0-2: the caller-side policy evaluator
+    # previously re-parsed/re-validated the registry from the working tree
+    # instead of reusing the already-validated head registry this resolve()
+    # call produced. `head_doc` lets `_run_policy_check` reuse the single
+    # validated document (never a second, unvalidated `yaml.safe_load`).
+    head_doc: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -124,12 +147,37 @@ def validate_registry(doc: dict[str, Any], schema_path: Path) -> None:
         raise RegistryError("; ".join(messages))
 
 
+def _yaml_safe_load_no_duplicate_keys(text: str, error_cls: type[Exception]) -> Any:
+    """Generic duplicate-top-level/nested-key-rejecting YAML loader (PR
+    #2045 OWNER fix_delta P0-2: "duplicate key は全て非ゼロ終了にする").
+    Shared by both registry loading and declaration parsing so a
+    silently-shadowed duplicate `surfaces:` key (or duplicate surface_id
+    key inside it) is never resolved by "last write wins"."""
+
+    class _UniqueKeyLoader(yaml.SafeLoader):
+        pass
+
+    def _construct_mapping(loader: yaml.SafeLoader, node: yaml.Node, deep: bool = False) -> dict:
+        seen: set[Any] = set()
+        for key_node, _ in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise error_cls(f"duplicate key in YAML mapping: {key!r}")
+            seen.add(key)
+        return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+    _UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
+    return yaml.load(text, Loader=_UniqueKeyLoader)
+
+
 def load_and_validate_registry(
     registry_path: Path, schema_path: Path, git_ref: str | None, repo_root: Path
 ) -> dict[str, Any]:
     text = load_registry_text(registry_path, git_ref, repo_root)
     try:
-        doc = yaml.safe_load(text) or {}
+        doc = _yaml_safe_load_no_duplicate_keys(text, RegistryError) or {}
+    except RegistryError:
+        raise
     except yaml.YAMLError as exc:
         raise RegistryError(f"invalid YAML: {exc}") from exc
     if not isinstance(doc, dict):
@@ -144,6 +192,22 @@ def collect_producer_paths(surface_def: dict[str, Any]) -> set[str]:
     for key in ("modules", "styles", "assets", "config"):
         for p in producers.get(key, []) or []:
             paths.add(p)
+    return paths
+
+
+def collect_contract_paths(surface_def: dict[str, Any]) -> set[str]:
+    """PR #2045 OWNER fix_delta P0-4: a surface's registered baseline PNG or
+    VRT spec file changing (with NO producer-module change) must also mark
+    that surface as affected -- these are the VC contract for the surface
+    and are never covered by `coverage_roots` (which is producer-source
+    scoped), so without this a baseline-only or spec-only edit bypassed
+    disposition entirely."""
+    contracts = surface_def.get("contracts", {}) or {}
+    paths: set[str] = set()
+    for key in ("baseline", "spec"):
+        value = contracts.get(key)
+        if value:
+            paths.add(value)
     return paths
 
 
@@ -181,7 +245,19 @@ def build_mjs_request(repo_root: Path, surfaces: dict[str, Any]) -> dict[str, An
     return {"repo_root": str(repo_root), "surfaces": request_surfaces}
 
 
+MJS_RESULT_SCHEMA_NAME = "RESOLVE_VISUAL_IMPACT_MJS_RESULT_V1"
+# Must track `RESOLVER_VERSION` in scripts/agent-ops/resolve_visual_impact.mjs.
+MJS_EXPECTED_RESOLVER_VERSION = "1"
+
+
 def run_mjs(mjs_path: Path, request: dict[str, Any], node_bin: str = "node") -> dict[str, Any]:
+    """PR #2045 OWNER fix_delta P0-2: a non-zero mjs exit code must always be
+    surfaced as a resolver error, even when stdout happens to parse as valid
+    JSON (the mjs script sets `process.exitCode = 1` on per-surface
+    exceptions/invalid input while still emitting a best-effort JSON body).
+    Silently trusting the JSON body regardless of exit code let a crashed
+    resolver invocation degrade to an empty/partial `surfaces` map that was
+    then treated as "fully resolved, no impact"."""
     proc = subprocess.run(
         [node_bin, str(mjs_path)],
         input=json.dumps(request),
@@ -190,11 +266,35 @@ def run_mjs(mjs_path: Path, request: dict[str, Any], node_bin: str = "node") -> 
         check=False,
     )
     if not proc.stdout.strip():
-        raise RegistryError(f"resolve_visual_impact.mjs produced no output (stderr: {proc.stderr})")
+        raise RegistryError(
+            f"resolve_visual_impact.mjs produced no output (exit {proc.returncode}, stderr: {proc.stderr})"
+        )
     try:
-        return json.loads(proc.stdout)
+        result = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         raise RegistryError(f"resolve_visual_impact.mjs produced invalid JSON: {exc}\n{proc.stdout}") from exc
+
+    if result.get("schema") != MJS_RESULT_SCHEMA_NAME:
+        raise RegistryError(f"resolve_visual_impact.mjs produced unexpected schema: {result.get('schema')!r}")
+    if result.get("resolver_version") != MJS_EXPECTED_RESOLVER_VERSION:
+        raise RegistryError(
+            f"resolve_visual_impact.mjs resolver_version mismatch: "
+            f"expected {MJS_EXPECTED_RESOLVER_VERSION!r}, got {result.get('resolver_version')!r}"
+        )
+
+    request_surface_ids = set((request.get("surfaces") or {}).keys())
+    result_surface_ids = set((result.get("surfaces") or {}).keys())
+    if result_surface_ids != request_surface_ids:
+        raise RegistryError(
+            "resolve_visual_impact.mjs surface key set mismatch: "
+            f"requested={sorted(request_surface_ids)} returned={sorted(result_surface_ids)}"
+        )
+
+    if proc.returncode != 0:
+        mjs_errors = result.get("errors") or [f"mjs exited {proc.returncode} with no explicit errors[] entry"]
+        raise RegistryError(f"resolve_visual_impact.mjs exited {proc.returncode}: {mjs_errors}")
+
+    return result
 
 
 def match_coverage_roots(changed_path: str, coverage_roots: list[str]) -> bool:
@@ -225,12 +325,20 @@ def resolve(
     except RegistryError as exc:
         result.errors.append(f"head registry invalid: {exc}")
         return result
+    result.head_doc = head_doc
 
     base_doc: dict[str, Any] = head_doc
     if base_ref is not None:
         try:
             base_doc = load_and_validate_registry(registry_path, schema_path, base_ref, repo_root)
         except RegistryError as exc:
+            # PR #2045 OWNER fix_delta P0-2: this is a genuinely invalid base
+            # registry (not the "base predates the registry entirely"
+            # bootstrap case -- `load_registry_text` already substitutes a
+            # synthetic empty-but-valid registry for a missing file, which
+            # never raises here). Record it as a resolver error so the
+            # caller fails closed instead of silently continuing on a
+            # fabricated empty base.
             result.errors.append(f"base registry invalid: {exc}")
             base_doc = {"schema_version": 1, "surfaces": {}}
 
@@ -242,23 +350,42 @@ def resolve(
         if surface_id not in union_surfaces:
             union_surfaces[surface_id] = base_def
 
-    global_invalidators = set(head_doc.get("global_invalidators", []) or [])
-    coverage_roots = head_doc.get("coverage_roots", []) or []
+    # PR #2045 OWNER fix_delta P0-3: union global_invalidators/coverage_roots
+    # too, not just surface entries -- a head-side diff that *narrows* these
+    # (removes an invalidator, shrinks a coverage root) must not silently
+    # lose the base-side coverage.
+    global_invalidators = set(head_doc.get("global_invalidators", []) or []) | set(
+        base_doc.get("global_invalidators", []) or []
+    )
+    coverage_roots = list(
+        dict.fromkeys((head_doc.get("coverage_roots", []) or []) + (base_doc.get("coverage_roots", []) or []))
+    )
 
     changed_set = set(changed_paths)
 
     affected_surface_ids: dict[str, str] = {}
 
+    # 0. Meta policy paths: a change to the evaluator/registry/schema/CI
+    # wiring itself invalidates every other affected-surface determination
+    # in the same diff (PR #2045 OWNER fix_delta P0-4/P0-6).
+    if changed_set & META_POLICY_PATHS:
+        for surface_id in union_surfaces:
+            affected_surface_ids.setdefault(surface_id, "meta_policy_change")
+
     # 1. Global invalidators: any hit affects ALL surfaces.
     if changed_set & global_invalidators:
         for surface_id in union_surfaces:
-            affected_surface_ids[surface_id] = "global_invalidator"
+            affected_surface_ids.setdefault(surface_id, "global_invalidator")
 
-    # 2. Direct producer path match (styles/assets/config listed verbatim).
+    # 2. Direct producer path match (styles/assets/config listed verbatim),
+    # plus each surface's own contract paths (baseline PNG / VRT spec) --
+    # PR #2045 OWNER fix_delta P0-4: a baseline-only or spec-only edit must
+    # also mark its surface affected (these are outside `coverage_roots`).
     for surface_id, surface_def in union_surfaces.items():
         if surface_id in affected_surface_ids:
             continue
-        if collect_producer_paths(surface_def) & changed_set:
+        direct_paths = collect_producer_paths(surface_def) | collect_contract_paths(surface_def)
+        if direct_paths & changed_set:
             affected_surface_ids[surface_id] = "direct_producer"
 
     # 3. Registry-union mapping deletion (base had it, head dropped it).
@@ -299,6 +426,7 @@ def resolve(
     all_producer_paths: set[str] = set(global_invalidators)
     for surface_def in union_surfaces.values():
         all_producer_paths |= collect_producer_paths(surface_def)
+        all_producer_paths |= collect_contract_paths(surface_def)
     for surface_result in mjs_result.get("surfaces", {}).values():
         all_producer_paths |= set(surface_result.get("reachable_files", []))
 
@@ -627,8 +755,28 @@ def build_evidence_from_manifest(
     head_matches = manifest.get("head_sha") == head_sha
     contract_matches = contract_job == "component-vrt-report"
     surface_matches = surface_id in {"combat-hud-running", "combat-hud-critical"}
+    # PR #2045 OWNER fix_delta P0-5: `mismatched_pixels` in the live
+    # artifact is a JSON *string* (the manifest-building workflow step
+    # passes it through a bash env var into `sys.argv`, never casting it
+    # back to int). A bare `mismatched == 0` comparison is therefore always
+    # False for the manifest's string "0", which made `verify_success`
+    # permanently False regardless of the real VRT outcome. Coerce
+    # defensively here (never trust the producer's declared type) and treat
+    # anything that does not parse as an integer as a non-zero mismatch
+    # (fail-closed).
     mismatched = manifest.get("mismatched_pixels")
-    verify_success = mismatched == 0
+    if isinstance(mismatched, bool):
+        mismatched_int: int | None = None
+    elif isinstance(mismatched, int):
+        mismatched_int = mismatched
+    elif isinstance(mismatched, str):
+        try:
+            mismatched_int = int(mismatched.strip())
+        except ValueError:
+            mismatched_int = None
+    else:
+        mismatched_int = None
+    verify_success = mismatched_int == 0
     artifact_id = manifest.get("artifact_id")
     return EvidenceObservation(
         baseline_diff_present=False,  # caller overrides from real changed_paths
@@ -640,6 +788,39 @@ def build_evidence_from_manifest(
         expected_actual_diff_available=True,
         evidence_manifest_digest=str(artifact_id) if artifact_id else None,
     )
+
+
+def _evidence_payload_for_decision(
+    disposition: str,
+    ok: bool,
+    reason: str,
+    evidence: "EvidenceObservation | None",
+    actor_handle: str | None,
+) -> dict[str, Any]:
+    """PR #2045 OWNER fix_delta P1-2: build a decision `evidence` payload
+    that structurally matches the canonical `evidence` $def in
+    docs/dev/visual-impact.schema.json (additionalProperties: false,
+    fields: baseline_unchanged / canonical_verify_success /
+    evidence_manifest_digest / expected_actual_diff_available /
+    authorized_owner). The previous `{"ok": bool, "reason": str}` shape did
+    not validate against that schema at all -- nothing ever caught this
+    because the decision artifact was never schema-validated before
+    upload."""
+    payload: dict[str, Any] = {}
+    if disposition == "waived":
+        if ok and actor_handle:
+            payload["authorized_owner"] = actor_handle
+        return payload
+    if evidence is None:
+        return payload
+    payload["baseline_unchanged"] = not evidence.baseline_diff_present
+    payload["canonical_verify_success"] = bool(
+        evidence.canonical_verify_success or evidence.canonical_update_then_verify_success
+    )
+    payload["expected_actual_diff_available"] = bool(evidence.expected_actual_diff_available)
+    if evidence.evidence_manifest_digest:
+        payload["evidence_manifest_digest"] = evidence.evidence_manifest_digest
+    return payload
 
 
 def evaluate_pr_policy(
@@ -654,18 +835,36 @@ def evaluate_pr_policy(
     authorized_owners: set[str],
     today: date,
     tracking_issue_checker: Any = None,
+    codeowners_rules: list[tuple[str, list[str]]] | None = None,
 ) -> dict[str, Any]:
     """Evaluate every affected surface's disposition. Never passes on
     declaration self-report alone (AC12); unmapped/unknown_impact always
-    fail closed (AC8)."""
+    fail closed (AC8).
+
+    PR #2045 OWNER fix_delta P0-2: `resolve_result.errors` (resolver/schema
+    internal failures -- invalid base registry, mjs crash/schema mismatch,
+    etc.) are now themselves policy failures; they were previously silently
+    swallowed, letting a broken resolver run degrade to "no affected
+    surfaces found" -> unconditional PASS.
+
+    PR #2045 OWNER fix_delta P1-3: when `codeowners_rules` is supplied,
+    waiver authority is scoped to the SPECIFIC surface's own contract paths
+    (baseline/spec) rather than the union of every registered surface's
+    contract paths, so an owner authorized for surface A cannot waive a
+    regression on unrelated surface B.
+    """
     surfaces = registry_doc.get("surfaces", {}) or {}
     failures: list[str] = []
     surface_results: list[dict[str, Any]] = []
 
+    if resolve_result.errors:
+        failures.append(f"resolver_error: {resolve_result.errors}")
     if resolve_result.unmapped_visual_candidates:
         failures.append(f"unmapped_visual_candidate: {resolve_result.unmapped_visual_candidates}")
     if resolve_result.unknown_impact:
         failures.append(f"unknown_impact: {resolve_result.unknown_impact}")
+
+    actor_handle = actor if actor.startswith("@") else f"@{actor}" if actor else None
 
     for entry in resolve_result.affected_surfaces:
         surface_id = entry["surface_id"]
@@ -681,13 +880,18 @@ def evaluate_pr_policy(
         baseline_path = surface_def.get("contracts", {}).get("baseline")
         baseline_diff_present = baseline_path in changed_paths
 
+        evidence_for_decision: EvidenceObservation | None = None
         if disposition == "waived":
             waiver = decl_entry.get("waiver", {}) or {}
             tracking_open = tracking_issue_checker(waiver.get("tracking_issue")) if tracking_issue_checker else None
+            surface_authorized_owners = authorized_owners
+            if codeowners_rules is not None:
+                surface_contract_paths = sorted(collect_contract_paths(surface_def))
+                surface_authorized_owners = authorized_owners_for_paths(codeowners_rules, surface_contract_paths)
             evaluation = evaluate_waiver(
                 actor=actor,
                 waiver=waiver,
-                authorized_owners=authorized_owners,
+                authorized_owners=surface_authorized_owners,
                 today=today,
                 tracking_issue_exists_and_open=tracking_open,
             )
@@ -695,6 +899,7 @@ def evaluate_pr_policy(
         else:
             evidence = build_evidence_from_manifest(evidence_manifest, head_sha, surface_id, contract_job)
             evidence.baseline_diff_present = baseline_diff_present
+            evidence_for_decision = evidence
             if disposition == "verified_unchanged":
                 ok, reason = evaluate_verified_unchanged(evidence)
             elif disposition == "baseline_changed":
@@ -702,7 +907,18 @@ def evaluate_pr_policy(
             else:
                 ok, reason = False, "unknown_disposition"
 
-        surface_results.append({"surface_id": surface_id, "disposition": disposition, "ok": ok, "reason": reason})
+        evidence_payload = _evidence_payload_for_decision(
+            disposition, ok, reason, evidence_for_decision, actor_handle
+        )
+        surface_results.append(
+            {
+                "surface_id": surface_id,
+                "disposition": disposition,
+                "ok": ok,
+                "reason": reason,
+                "evidence": evidence_payload,
+            }
+        )
         if not ok:
             failures.append(f"{surface_id}: {disposition} failed ({reason})")
 
@@ -721,6 +937,40 @@ def _read_changed_paths(args: argparse.Namespace) -> list[str]:
     return list(args.changed_path or [])
 
 
+def _read_changed_path_entries(args: argparse.Namespace) -> list[dict[str, str]]:
+    """PR #2045 OWNER fix_delta P0-4: prefer a typed
+    (status/path[/old_path]) changed-path record set over the flat
+    path-only list -- the flat list previously forced every entry to
+    `status: "modified"`, losing rename/add/remove semantics in the
+    VISUAL_IMPACT_DECISION_V1 changed_paths_digest."""
+    typed_file = getattr(args, "changed_paths_typed_file", None)
+    if typed_file and Path(typed_file).exists():
+        data = json.loads(Path(typed_file).read_text(encoding="utf-8"))
+        entries: list[dict[str, str]] = []
+        for item in data:
+            entry = {"status": item["status"], "path": item["path"]}
+            if item.get("old_path"):
+                entry["old_path"] = item["old_path"]
+            entries.append(entry)
+        return entries
+    return [{"status": "modified", "path": p} for p in _read_changed_paths(args)]
+
+
+def _flat_paths_for_resolve(entries: list[dict[str, str]]) -> list[str]:
+    """Union of `path` and (when present) `old_path` -- PR #2045 OWNER
+    fix_delta P0-4: a rename that moves a producer file out of/into a
+    surface's registered producer set must be evaluated on BOTH sides."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for entry in entries:
+        for key in ("path", "old_path"):
+            value = entry.get(key)
+            if value and value not in seen:
+                seen.add(value)
+                out.append(value)
+    return out
+
+
 def _build_decision_surface_entry(result_entry: dict[str, Any], registry_doc: dict[str, Any]) -> dict[str, Any]:
     surface_id = result_entry["surface_id"]
     contracts = registry_doc.get("surfaces", {}).get(surface_id, {}).get("contracts", {})
@@ -729,11 +979,61 @@ def _build_decision_surface_entry(result_entry: dict[str, Any], registry_doc: di
         "surface_id": surface_id,
         "contract_id": f"{surface_id}:{runner}",
         "disposition": result_entry["disposition"],
-        "evidence": {"ok": result_entry["ok"], "reason": result_entry["reason"]},
+        "evidence": result_entry.get("evidence", {}),
     }
 
 
-def _run_policy_check(args: argparse.Namespace, changed_paths: list[str]) -> int:
+def _check_tracking_issue_open(tracking_issue: str, repository: str | None) -> bool | None:
+    """PR #2045 OWNER fix_delta P1-3: actually verify the waiver's tracking
+    issue is open (previously always `None` -> `tracking_issue_state_unverified`,
+    which fails closed but never let a genuinely valid waiver pass). Any
+    subprocess/parse failure returns None (fail-closed unverified), never a
+    fabricated True."""
+    if not tracking_issue or not repository:
+        return None
+    issue_ref = tracking_issue.lstrip("#").strip()
+    if not issue_ref.isdigit():
+        return None
+    try:
+        proc = subprocess.run(
+            ["gh", "issue", "view", issue_ref, "--repo", repository, "--json", "state"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    state = data.get("state")
+    if not isinstance(state, str):
+        return None
+    return state.upper() == "OPEN"
+
+
+def _validate_decision_schema(decision: dict[str, Any], visual_impact_schema_path: Path) -> list[str]:
+    """PR #2045 OWNER fix_delta P1-2: validate the built decision artifact
+    against its own canonical schema BEFORE upload -- previously nothing
+    ever checked that the `evidence` sub-object we emitted actually matched
+    the schema's closed `evidence` $def."""
+    try:
+        schema_doc = json.loads(visual_impact_schema_path.read_text(encoding="utf-8"))
+        sub_schema = {"$defs": schema_doc["$defs"], **schema_doc["$defs"]["VISUAL_IMPACT_DECISION_V1"]}
+        jsonschema.validate(decision, sub_schema)
+    except jsonschema.ValidationError as exc:
+        return [f"decision_schema_invalid: {exc.message}"]
+    except (OSError, KeyError, json.JSONDecodeError) as exc:
+        return [f"decision_schema_validation_error: {exc}"]
+    return []
+
+
+def _run_policy_check(args: argparse.Namespace, changed_path_entries: list[dict[str, str]]) -> int:
+    changed_paths = _flat_paths_for_resolve(changed_path_entries)
     result = resolve(
         changed_paths=changed_paths,
         registry_path=args.registry,
@@ -744,7 +1044,11 @@ def _run_policy_check(args: argparse.Namespace, changed_paths: list[str]) -> int
         head_ref=args.head_ref,
         node_bin=args.node_bin,
     )
-    registry_doc = yaml.safe_load(args.registry.read_text(encoding="utf-8"))
+    # PR #2045 OWNER fix_delta P0-2: reuse the single already-validated head
+    # registry document `resolve()` produced instead of re-parsing the
+    # working-tree file a second time (unvalidated, and potentially
+    # divergent from whichever ref `--head-ref` pointed at).
+    registry_doc: dict[str, Any] = result.head_doc if result.head_doc is not None else {}
 
     declaration_doc: dict[str, Any] | None = None
     declaration_error: str | None = None
@@ -763,12 +1067,15 @@ def _run_policy_check(args: argparse.Namespace, changed_paths: list[str]) -> int
         evidence_manifest = json.loads(Path(args.evidence_manifest_file).read_text(encoding="utf-8"))
 
     authorized_owners: set[str] = set()
+    codeowners_rules: list[tuple[str, list[str]]] | None = None
     if args.codeowners_file and Path(args.codeowners_file).exists():
-        rules = parse_codeowners(Path(args.codeowners_file).read_text(encoding="utf-8"))
+        codeowners_rules = parse_codeowners(Path(args.codeowners_file).read_text(encoding="utf-8"))
         # Waiver authority is derived from ownership of the surface's VRT
         # CONTRACT (baseline + spec), not the production UI source files --
         # "who is authorized to accept a visual regression" is a review
-        # ownership question, not a code ownership question.
+        # ownership question, not a code ownership question. This flat union
+        # is kept only as a legacy fallback; `evaluate_pr_policy` now scopes
+        # per-surface via `codeowners_rules` (P1-3).
         contract_paths = sorted(
             {
                 path
@@ -777,7 +1084,10 @@ def _run_policy_check(args: argparse.Namespace, changed_paths: list[str]) -> int
                 if path
             }
         )
-        authorized_owners = authorized_owners_for_paths(rules, contract_paths)
+        authorized_owners = authorized_owners_for_paths(codeowners_rules, contract_paths)
+
+    def _tracking_issue_checker(tracking_issue: str) -> bool | None:
+        return _check_tracking_issue_open(tracking_issue, args.repository)
 
     if declaration_error is not None:
         policy_result = {"ok": False, "surface_results": [], "failures": [declaration_error]}
@@ -792,7 +1102,8 @@ def _run_policy_check(args: argparse.Namespace, changed_paths: list[str]) -> int
             actor=args.actor or "",
             authorized_owners=authorized_owners,
             today=date.today(),
-            tracking_issue_checker=None,
+            tracking_issue_checker=_tracking_issue_checker,
+            codeowners_rules=codeowners_rules,
         )
 
     decision = build_decision(
@@ -807,7 +1118,7 @@ def _run_policy_check(args: argparse.Namespace, changed_paths: list[str]) -> int
             if args.pr_body_file and Path(args.pr_body_file).exists()
             else ""
         ),
-        changed_path_entries=[{"status": "modified", "path": p} for p in changed_paths],
+        changed_path_entries=changed_path_entries,
         affected_surfaces=[_build_decision_surface_entry(r, registry_doc) for r in policy_result["surface_results"]],
         component_vrt_report_check_run_id=args.component_vrt_check_run_id,
         github_actions_app_identity=args.github_actions_app_identity or "unknown",
@@ -815,17 +1126,24 @@ def _run_policy_check(args: argparse.Namespace, changed_paths: list[str]) -> int
         artifact_digest=args.artifact_digest,
     )
 
+    schema_errors = _validate_decision_schema(decision, args.visual_impact_schema)
+    ok = policy_result["ok"] and not schema_errors
+    failures = list(policy_result["failures"]) + schema_errors
+
     output = {
         "schema": "VISUAL_IMPACT_POLICY_CHECK_RESULT_V1",
-        "ok": policy_result["ok"],
-        "failures": policy_result["failures"],
+        "ok": ok,
+        "failures": failures,
         "resolve_result": result.to_dict(),
         "decision": decision,
     }
     print(json.dumps(output, indent=2))
-    if args.decision_output:
+    # PR #2045 OWNER fix_delta P1-2: never write a schema-invalid decision
+    # artifact -- upload-artifact's `if-no-files-found: error` (P0-1) then
+    # correctly fails the job instead of silently shipping a broken one.
+    if args.decision_output and not schema_errors:
         Path(args.decision_output).write_text(json.dumps(decision, indent=2), encoding="utf-8")
-    return 0 if policy_result["ok"] else 1
+    return 0 if ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -838,6 +1156,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--changed-path", action="append", default=[])
     parser.add_argument("--changed-paths-file", type=str, default=None)
+    parser.add_argument(
+        "--changed-paths-typed-file",
+        type=str,
+        default=None,
+        help=(
+            "JSON array of {status,path[,old_path]} records (git diff "
+            "--name-status -z --find-renames output, parsed). Preferred "
+            "over --changed-paths-file for --mode policy-check: preserves "
+            "rename/add/remove status for the decision digest (PR #2045 "
+            "OWNER fix_delta P0-4)."
+        ),
+    )
     parser.add_argument("--base-ref", type=str, default=None)
     parser.add_argument("--head-ref", type=str, default=None)
     parser.add_argument("--node-bin", type=str, default="node")
@@ -858,10 +1188,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--decision-output", type=str, default=None)
     args = parser.parse_args(argv)
 
-    changed_paths = _read_changed_paths(args)
-
     if args.mode == "policy-check":
-        return _run_policy_check(args, changed_paths)
+        return _run_policy_check(args, _read_changed_path_entries(args))
+
+    changed_paths = _read_changed_paths(args)
 
     result = resolve(
         changed_paths=changed_paths,

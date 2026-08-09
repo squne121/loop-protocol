@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 import jsonschema
@@ -127,3 +128,96 @@ def test_base_sha_and_head_sha_must_be_full_length_hex(decision_schema):
     bad["head_sha"] = "not-a-sha"
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(bad, decision_schema)
+
+
+def test_pr2045_evaluate_pr_policy_evidence_payload_validates_against_schema(decision_schema):
+    """PR #2045 OWNER fix_delta P1-2: `evaluate_pr_policy`'s per-surface
+    `evidence` payload (as embedded via `_build_decision_surface_entry` /
+    `build_decision`) must itself validate against the schema's closed
+    `evidence` $def (additionalProperties: false). The previous
+    `{"ok": bool, "reason": str}` shape never did."""
+    resolve_result = rvi.ResolveResult(
+        changed_paths=["src/ui/combatHud.ts"],
+        affected_surfaces=[{"surface_id": "combat-hud-running", "reason": "direct_producer"}],
+    )
+    baseline_path = (
+        "tests/component/__screenshots__/combat-hud-running.vrt.test.ts/"
+        "combat-hud-running-chromium-linux.png"
+    )
+    registry_doc = {
+        "surfaces": {
+            "combat-hud-running": {
+                "contracts": {
+                    "runner": "vitest-browser-mode",
+                    "job": "component-vrt-report",
+                    "baseline": baseline_path,
+                },
+                "policy": {"disposition_required": True},
+            }
+        }
+    }
+    declaration_doc = {"surfaces": [{"surface_id": "combat-hud-running", "disposition": "verified_unchanged"}]}
+    evidence_manifest = {
+        "head_sha": "b" * 40,
+        "mismatched_pixels": 0,
+        "artifact_id": "987",
+    }
+    policy_result = rvi.evaluate_pr_policy(
+        resolve_result=resolve_result,
+        declaration_doc=declaration_doc,
+        registry_doc=registry_doc,
+        evidence_manifest=evidence_manifest,
+        head_sha="b" * 40,
+        changed_paths=["src/ui/combatHud.ts"],
+        actor="squne121",
+        authorized_owners=set(),
+        today=date(2026, 8, 9),
+    )
+    assert policy_result["ok"] is True
+    decision = rvi.build_decision(
+        repository="squne121/loop-protocol",
+        pull_request_number=2045,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        base_registry_blob_sha="c" * 40,
+        head_registry_blob_sha="d" * 40,
+        pr_body="",
+        changed_path_entries=[{"status": "modified", "path": "src/ui/combatHud.ts"}],
+        affected_surfaces=[
+            rvi._build_decision_surface_entry(r, registry_doc) for r in policy_result["surface_results"]
+        ],
+        component_vrt_report_check_run_id="1",
+        github_actions_app_identity="github-actions[bot]",
+        artifact_id="987",
+        artifact_digest="sha256:" + "e" * 64,
+    )
+    jsonschema.validate(decision, decision_schema)
+    evidence = decision["affected_surfaces"][0]["evidence"]
+    assert "ok" not in evidence
+    assert "reason" not in evidence
+    assert evidence["baseline_unchanged"] is True
+    assert evidence["canonical_verify_success"] is True
+
+
+def test_pr2045_mismatched_pixels_as_json_string_zero_still_passes():
+    """PR #2045 OWNER fix_delta P0-5: the live evidence manifest artifact
+    emits `mismatched_pixels` as a JSON string "0" (bash env var ->
+    sys.argv, never cast back to int). This must NOT make
+    `canonical_verify_success` permanently False."""
+    evidence = rvi.build_evidence_from_manifest(
+        manifest={"head_sha": "b" * 40, "mismatched_pixels": "0", "artifact_id": "1"},
+        head_sha="b" * 40,
+        surface_id="combat-hud-running",
+        contract_job="component-vrt-report",
+    )
+    assert evidence.canonical_verify_success is True
+
+
+def test_pr2045_mismatched_pixels_non_numeric_string_fails_closed():
+    evidence = rvi.build_evidence_from_manifest(
+        manifest={"head_sha": "b" * 40, "mismatched_pixels": "unknown_non_zero", "artifact_id": "1"},
+        head_sha="b" * 40,
+        surface_id="combat-hud-running",
+        contract_job="component-vrt-report",
+    )
+    assert evidence.canonical_verify_success is False

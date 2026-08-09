@@ -1536,7 +1536,18 @@ jobs:
               "actual_sha256_run_1": actual_1,
               "actual_sha256_run_2": actual_2,
               "actual_sha256_run_3": actual_3,
-              "mismatched_pixels": mismatched_pixels,
+              # PR #2045 OWNER fix_delta P0-5: this value crosses a bash env
+              # var -> sys.argv boundary and was previously written into the
+              # JSON manifest as a raw *string* (e.g. `"0"`), while
+              # resolve_visual_impact.py's consumer compared it with `== 0`
+              # (int) -- always False, so `canonical_verify_success` was
+              # permanently False regardless of the real VRT outcome. Emit
+              # the true JSON type: an int when it parses as one, otherwise
+              # keep the original fail-closed sentinel string verbatim (the
+              # consumer treats any non-integer as a non-zero mismatch).
+              "mismatched_pixels": (
+                  int(mismatched_pixels) if mismatched_pixels.lstrip("-").isdigit() else mismatched_pixels
+              ),
               "effective_pixel_limit": 48,
               "mutation_controls": {
                   "hull_hidden": hull_result,
@@ -1703,11 +1714,52 @@ jobs:
           BASE_SHA: ${{ steps.shas.outputs.base_sha }}
           HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
         run: |
+          set -o pipefail
+          # PR #2045 OWNER fix_delta P0-4: `--name-status -z --find-renames`
+          # (not plain `--name-only`) so renames/adds/removes keep their real
+          # status instead of everything being forced to "modified" -- the
+          # Python step below converts this into the typed
+          # {"status","path","old_path"?} record set the policy check
+          # consumes for both resolution (old+new path union) and the
+          # VISUAL_IMPACT_DECISION_V1 changed_paths_digest.
           if git cat-file -e "${BASE_SHA}" 2>/dev/null; then
-            git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" > changed_paths.txt
+            git diff --name-status -z --find-renames "${BASE_SHA}" "${HEAD_SHA}" > changed_paths_name_status.nul
           else
-            : > changed_paths.txt
+            : > changed_paths_name_status.nul
           fi
+          python3 - <<'PY'
+          import json
+
+          with open("changed_paths_name_status.nul", "rb") as fh:
+              raw = fh.read()
+          fields = [f.decode("utf-8") for f in raw.split(b"\x00") if f != b""]
+
+          entries = []
+          flat = []
+          i = 0
+          while i < len(fields):
+              token = fields[i]
+              status = token[0] if token else ""
+              if status in ("R", "C"):
+                  old_path = fields[i + 1]
+                  new_path = fields[i + 2]
+                  entries.append({"status": "renamed", "path": new_path, "old_path": old_path})
+                  flat.extend([old_path, new_path])
+                  i += 3
+              else:
+                  path = fields[i + 1]
+                  kind = {"A": "added", "D": "removed"}.get(status, "modified")
+                  entries.append({"status": kind, "path": path})
+                  flat.append(path)
+                  i += 2
+
+          with open("changed_paths_typed.json", "w", encoding="utf-8") as fh:
+              json.dump(entries, fh)
+          with open("changed_paths.txt", "w", encoding="utf-8") as fh:
+              fh.write("\n".join(sorted(set(flat))))
+
+          print(json.dumps(entries, indent=2))
+          PY
           cat changed_paths.txt
       - name: Write PR body to file (untrusted input -- never shell-expanded)
         env:
@@ -1742,6 +1794,11 @@ jobs:
           echo "check_run_id=${CHECK_RUN_ID}" >> "$GITHUB_OUTPUT"
       - name: Run visual-impact-policy check
         id: policy-check
+        # PR #2045 OWNER fix_delta P1-5: VISUAL_IMPACT_DECISION_V1 requires
+        # `pull_request_number >= 1` (see docs/dev/visual-impact.schema.json)
+        # -- a push/workflow_dispatch run has no PR to gate, so it is
+        # skipped rather than emitting a schema-invalid decision.
+        if: ${{ github.event_name == 'pull_request' }}
         env:
           HEAD_SHA: ${{ steps.shas.outputs.head_sha }}
           BASE_SHA: ${{ steps.shas.outputs.base_sha }}
@@ -1756,9 +1813,17 @@ jobs:
           VRT_ARTIFACT_DIGEST: ${{ needs.component-vrt-report.outputs.vrt_evidence_artifact_digest || '' }}
           COMPONENT_VRT_CHECK_RUN_ID: ${{ steps.component-vrt-check-run.outputs.check_run_id || '' }}
         run: |
-          set +o pipefail
+          # PR #2045 OWNER fix_delta P0-1: `set +o pipefail` here made the
+          # `| tee` pipeline's exit status always be `tee`'s (0), so a
+          # non-zero evaluator exit was silently discarded and the step
+          # (and therefore the required `visual-impact-policy` check)
+          # PASSED regardless of the actual policy result. `set -o
+          # pipefail` makes the pipeline exit non-zero whenever the
+          # evaluator itself does.
+          set -o pipefail
           uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
             --mode policy-check \
+            --changed-paths-typed-file changed_paths_typed.json \
             --changed-paths-file changed_paths.txt \
             --pr-body-file pr_body.md \
             --evidence-manifest-file evidence-manifest-download/visual_baseline_review_evidence_v1.json \
@@ -1768,6 +1833,8 @@ jobs:
             --pr-number "${PR_NUMBER}" \
             --base-sha "${BASE_SHA}" \
             --head-sha "${HEAD_SHA}" \
+            --base-ref "${BASE_SHA}" \
+            --head-ref "${HEAD_SHA}" \
             --base-registry-blob-sha "${BASE_REGISTRY_BLOB_SHA}" \
             --head-registry-blob-sha "${HEAD_REGISTRY_BLOB_SHA}" \
             --component-vrt-check-run-id "${COMPONENT_VRT_CHECK_RUN_ID}" \
@@ -1777,12 +1844,17 @@ jobs:
             --decision-output visual_impact_decision_v1.json \
             | tee policy_check_output.json
       - name: Upload VISUAL_IMPACT_DECISION_V1 artifact
-        if: ${{ always() }}
+        if: ${{ always() && github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@v6
         with:
           name: visual-impact-decision-v1
           path: visual_impact_decision_v1.json
-          if-no-files-found: warn
+          # PR #2045 OWNER fix_delta P0-1: `warn` let a policy-check failure
+          # (which now, with `--decision-output` withheld on schema-invalid
+          # decisions -- see resolve_visual_impact.py
+          # _validate_decision_schema -- may leave no file on disk at all)
+          # silently succeed this step instead of failing the job.
+          if-no-files-found: error
           retention-days: 30
 
   python-test-core:
