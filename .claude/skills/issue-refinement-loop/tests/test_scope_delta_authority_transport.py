@@ -410,6 +410,109 @@ def test_outside_artifact_root_router_receipt_path_is_rejected(tmp_path):
     assert receipt["mutation_applied"] is False
 
 
+def test_router_and_consumer_reject_wrong_repo_manifest():
+    """#2053 P1 fix-delta (iteration 2, OWNER PR review): a manifest whose
+    own `repo` field does not match the caller-expected repo must be
+    rejected by BOTH the router (generate_router_receipt) and the
+    controlled consumer (consume_authority_transport) -- same-issue-number,
+    cross-repo spoofing must never pass through unnoticed (this is the same
+    boundary PR #1332 previously added for evidence classification).
+    """
+    import decide_next_loop_action as router
+    import run_refinement_preflight as preflight
+
+    invocation_id = "wrong-repo-1"
+    manifest = {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1",
+        "invocation_id": invocation_id,
+        "issue_number": 2053,
+        "repo": "attacker/loop-protocol-fork",
+        "git_head_sha": "deadbeef",
+        "generated_at": "2026-08-09T00:00:00Z",
+        "canonicalization_id": "loop-protocol-json-c14n-v1",
+        "source_comment_id": 1,
+        "source_comment_url": None,
+        "source_issue_body_sha256": None,
+        "source_kind": "issue_comment",
+        "payload": {"a": 1},
+    }
+    manifest_path = Path("/tmp") / f"wrong_repo_manifest_{invocation_id}.json"
+    manifest["payload_sha256"] = preflight._sha256(preflight._canonical_json(manifest["payload"]))
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    router_receipt = router.generate_router_receipt(
+        transport_manifest_path=str(manifest_path),
+        issue_number=2053,
+        invocation_id=invocation_id,
+        git_head_sha="deadbeef",
+        authority_expected=True,
+        repo=REPO,
+        repo_root=None,
+    )
+    assert router_receipt["status"] == "environment_failure"
+    assert router_receipt["reason_code"] == "wrong_repo"
+
+    manifest_path.unlink()
+
+
+def test_consumer_rejects_wrong_repo_manifest(tmp_path):
+    """#2053 P1 fix-delta: the controlled consumer independently checks
+    manifest["repo"] == repo, not just issue_number/git_head/invocation_id.
+    """
+    import run_refinement_preflight as preflight
+
+    issue_number = 2053
+    invocation_id = "wrong-repo-consumer-1"
+    git_head_sha = "deadbeef"
+    invocation_dir = _issue_artifact_dir(issue_number, invocation_id)
+    invocation_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1",
+        "invocation_id": invocation_id,
+        "issue_number": issue_number,
+        "repo": "attacker/loop-protocol-fork",
+        "git_head_sha": git_head_sha,
+        "generated_at": "2026-08-09T00:00:00Z",
+        "canonicalization_id": "loop-protocol-json-c14n-v1",
+        "source_comment_id": 1,
+        "source_comment_url": None,
+        "source_issue_body_sha256": None,
+        "source_kind": "issue_comment",
+        "payload": {"a": 1},
+    }
+    manifest["payload_sha256"] = preflight._sha256(preflight._canonical_json(manifest["payload"]))
+    manifest_path = invocation_dir / "scope_delta_authority_transport_v1.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    router_receipt = {
+        "schema_version": "SCOPE_DELTA_ROUTER_RECEIPT_V1",
+        "invocation_id": invocation_id,
+        "issue_number": issue_number,
+        "git_head_sha": git_head_sha,
+        "generated_at": "2026-08-09T00:00:01Z",
+        "transport_manifest_path": str(manifest_path),
+        "transport_payload_sha256": manifest["payload_sha256"],
+        "recomputed_payload_sha256": manifest["payload_sha256"],
+        "status": "ok",
+        "reason_code": None,
+    }
+    router_receipt_path = invocation_dir / "scope_delta_router_receipt_v1.json"
+    router_receipt_path.write_text(json.dumps(router_receipt), encoding="utf-8")
+
+    receipt = preflight.consume_authority_transport(
+        router_receipt_path=str(router_receipt_path),
+        issue_number=issue_number,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=REPO_ROOT,
+    )
+    assert receipt["status"] == "environment_failure"
+    assert receipt["reason_code"] == "wrong_repo"
+    assert receipt["mutation_applied"] is False
+
+
 def test_stale_previous_invocation_sidecar_is_never_reused(tmp_path):
     """GIVEN a consumption receipt already exists for an invocation_id
     WHEN the consumer is invoked again for the same invocation_id

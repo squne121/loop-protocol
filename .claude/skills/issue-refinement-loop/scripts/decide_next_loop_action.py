@@ -166,6 +166,7 @@ def generate_router_receipt(
     invocation_id: "str | None",
     git_head_sha: "str | None",
     authority_expected: bool,
+    repo: "str | None" = None,
     repo_root: "Path | None" = None,
 ) -> "dict | None":
     """#2053 AC7/AC8: router-side verification of a SCOPE_DELTA_AUTHORITY_TRANSPORT_V1
@@ -225,6 +226,13 @@ def generate_router_receipt(
         return _fail("wrong_git_head")
     if invocation_id is not None and manifest.get("invocation_id") != invocation_id:
         return _fail("wrong_invocation_id")
+    # #2053 P1 fix-delta (iteration 2, OWNER PR review): the router
+    # previously accepted no `repo` argument at all, so a wrong-repo
+    # manifest (same issue number, different repo) would pass through
+    # unnoticed. Only enforced when the caller supplies an expected repo,
+    # mirroring the issue_number/git_head_sha/invocation_id checks above.
+    if repo is not None and manifest.get("repo") != repo:
+        return _fail("wrong_repo")
 
     recomputed = _sha256(_canonical_json(manifest.get("payload")))
     base["recomputed_payload_sha256"] = recomputed
@@ -555,6 +563,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="#2053: GitHub Issue number, used to verify a SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest.",
     )
     parser.add_argument(
+        "--repo",
+        metavar="OWNER/NAME",
+        default=None,
+        help="#2053 P1 fix-delta: owner/repo cross-checked against the manifest's own `repo` field "
+        "(prevents same-issue-number/cross-repo spoofing).",
+    )
+    parser.add_argument(
         "--authority-transport-path",
         metavar="PATH",
         default=None,
@@ -662,6 +677,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         invocation_id=args.invocation_id,
         git_head_sha=args.git_head_sha,
         authority_expected=args.authority_expected,
+        repo=args.repo,
         repo_root=_find_repo_root_for_receipt(),
     )
     if router_receipt is not None and router_receipt.get("status") == STATUS_ENVIRONMENT_FAILURE:

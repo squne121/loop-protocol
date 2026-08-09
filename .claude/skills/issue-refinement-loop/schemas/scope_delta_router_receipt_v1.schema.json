@@ -20,19 +20,52 @@
       "type": "string",
       "const": "SCOPE_DELTA_ROUTER_RECEIPT_V1"
     },
-    "invocation_id": { "type": "string", "minLength": 1 },
-    "issue_number": { "type": "integer", "minimum": 1 },
-    "git_head_sha": { "type": "string", "minLength": 1 },
-    "generated_at": { "type": "string", "format": "date-time" },
-    "transport_manifest_path": { "type": ["string", "null"] },
-    "transport_payload_sha256": { "type": ["string", "null"] },
-    "recomputed_payload_sha256": { "type": ["string", "null"] },
+    "invocation_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "issue_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "git_head_sha": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "transport_manifest_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "transport_payload_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recomputed_payload_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "status": {
       "type": "string",
-      "enum": ["ok", "environment_failure"]
+      "enum": [
+        "ok",
+        "environment_failure"
+      ]
     },
     "reason_code": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "enum": [
         "missing_file",
         "malformed_json",
@@ -41,6 +74,7 @@
         "wrong_git_head",
         "wrong_invocation_id",
         "write_failure",
+        "wrong_repo",
         null
       ]
     }

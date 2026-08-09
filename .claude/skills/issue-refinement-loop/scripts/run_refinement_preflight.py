@@ -607,6 +607,13 @@ def consume_authority_transport(
         return _receipt(status="environment_failure", reason_code="wrong_git_head")
     if manifest.get("invocation_id") != invocation_id:
         return _receipt(status="environment_failure", reason_code="wrong_invocation_id")
+    # #2053 P1 fix-delta (iteration 2, OWNER PR review): PR #1332 previously
+    # added expected_repo binding specifically to prevent same-issue-number/
+    # cross-repo spoofing; that boundary was missing here. The consumer
+    # must independently verify the manifest's own `repo` field, not just
+    # the issue_number, against the caller-supplied expected repo.
+    if manifest.get("repo") != repo:
+        return _receipt(status="environment_failure", reason_code="wrong_repo")
 
     recomputed = _sha256(_canonical_json(manifest.get("payload")))
     manifest_payload_sha256 = manifest.get("payload_sha256")
