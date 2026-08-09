@@ -23,22 +23,61 @@
       "type": "string",
       "const": "SCOPE_DELTA_CONSUMPTION_RECEIPT_V1"
     },
-    "invocation_id": { "type": "string", "minLength": 1 },
-    "issue_number": { "type": "integer", "minimum": 1 },
-    "git_head_sha": { "type": "string", "minLength": 1 },
-    "generated_at": { "type": "string", "format": "date-time" },
-    "router_receipt_path": { "type": ["string", "null"] },
-    "transport_payload_sha256": { "type": ["string", "null"] },
-    "consumed_payload_sha256": { "type": ["string", "null"] },
-    "mutation_applied": { "type": "boolean" },
-    "readback_verified": { "type": "boolean" },
-    "fresh_rerun_performed": { "type": "boolean" },
+    "invocation_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "issue_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "git_head_sha": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "router_receipt_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "transport_payload_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "consumed_payload_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mutation_applied": {
+      "type": "boolean"
+    },
+    "readback_verified": {
+      "type": "boolean"
+    },
+    "fresh_rerun_performed": {
+      "type": "boolean"
+    },
     "status": {
       "type": "string",
-      "enum": ["ok", "environment_failure"]
+      "enum": [
+        "ok",
+        "environment_failure"
+      ]
     },
     "reason_code": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "enum": [
         "missing_file",
         "malformed_json",
@@ -49,6 +88,8 @@
         "stale_previous_invocation",
         "write_failure",
         "router_receipt_not_ok",
+        "fresh_rerun_route_drift",
+        "fresh_rerun_error",
         null
       ]
     }

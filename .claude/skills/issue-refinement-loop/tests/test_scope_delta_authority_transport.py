@@ -258,6 +258,96 @@ def test_digest_or_invocation_mismatch_blocks_before_router(tmp_path):
     assert receipt["reason_code"] == "digest_mismatch"
 
 
+def test_fresh_rerun_drift_fails_closed_not_silently_ok(tmp_path):
+    """#2053 P0 fix-delta (iteration 2, OWNER PR review): the consumer's
+    "fresh rerun" (re-running classify_scope_delta_authority() against the
+    consumed payload) must be a real gate, not best-effort telemetry that
+    is discarded. GIVEN a manifest whose payload no longer reclassifies to
+    contract_update_required (here: missing source_issue_body_sha256, so
+    the fresh classification fails closed to human_escalation) THEN the
+    consumption receipt is environment_failure/fresh_rerun_route_drift with
+    fresh_rerun_performed=False -- never status: ok.
+    """
+    import run_refinement_preflight as preflight
+
+    issue_number = 2053
+    invocation_id = "fresh-rerun-drift-1"
+    repo_root = REPO_ROOT
+    git_head_sha = "deadbeef"
+    invocation_dir = _issue_artifact_dir(issue_number, invocation_id)
+    invocation_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1",
+        "invocation_id": invocation_id,
+        "issue_number": issue_number,
+        "repo": REPO,
+        "git_head_sha": git_head_sha,
+        "generated_at": "2026-08-09T00:00:00Z",
+        "canonicalization_id": "loop-protocol-json-c14n-v1",
+        "source_comment_id": 1,
+        "source_comment_url": f"https://github.com/{REPO}/issues/2053#issuecomment-1",
+        # No source_issue_body_sha256 -- the fresh classification of an
+        # "explicit" human directive fails closed to human_escalation
+        # without a base issue body digest to bind a patch plan to.
+        "source_issue_body_sha256": None,
+        "source_kind": "issue_comment",
+        "payload": {
+            "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
+            "source_kind": "issue_comment",
+            "source_ref": f"https://github.com/{REPO}/issues/2053#issuecomment-1",
+            "source_issue_number": issue_number,
+            "comment_id": 1,
+            "comment_url": f"https://github.com/{REPO}/issues/2053#issuecomment-1",
+            "issue_url": f"https://github.com/{REPO}/issues/2053",
+            "body_sha256": None,
+            "author_login": "owner",
+            "author_type": "User",
+            "author_association": "OWNER",
+            "captured_at": "2026-08-09T00:00:00Z",
+            "directive_markers": ["revised acceptance criteria"],
+            "extracted_directives": ["AC1: do X"],
+            "ambiguity_flags": [],
+            "boundary_flags": [],
+            "confidence": "explicit",
+        },
+    }
+    manifest["payload_sha256"] = preflight._sha256(preflight._canonical_json(manifest["payload"]))
+    manifest_path = invocation_dir / "scope_delta_authority_transport_v1.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    router_receipt = {
+        "schema_version": "SCOPE_DELTA_ROUTER_RECEIPT_V1",
+        "invocation_id": invocation_id,
+        "issue_number": issue_number,
+        "git_head_sha": git_head_sha,
+        "generated_at": "2026-08-09T00:00:01Z",
+        "transport_manifest_path": str(manifest_path),
+        "transport_payload_sha256": manifest["payload_sha256"],
+        "recomputed_payload_sha256": manifest["payload_sha256"],
+        "status": "ok",
+        "reason_code": None,
+    }
+    router_receipt_path = invocation_dir / "scope_delta_router_receipt_v1.json"
+    router_receipt_path.write_text(json.dumps(router_receipt), encoding="utf-8")
+
+    receipt = preflight.consume_authority_transport(
+        router_receipt_path=str(router_receipt_path),
+        issue_number=issue_number,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=repo_root,
+    )
+    assert receipt["status"] == "environment_failure"
+    assert receipt["reason_code"] == "fresh_rerun_route_drift"
+    assert receipt["fresh_rerun_performed"] is False
+    # The bounded local mutation (consumed payload write) still happened --
+    # the gate is on the *receipt status*, not on suppressing the mutation
+    # after the fact.
+    assert receipt["mutation_applied"] is True
+
+
 def test_stale_previous_invocation_sidecar_is_never_reused(tmp_path):
     """GIVEN a consumption receipt already exists for an invocation_id
     WHEN the consumer is invoked again for the same invocation_id

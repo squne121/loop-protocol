@@ -582,19 +582,48 @@ def consume_authority_transport(
 
     # --- fresh rerun: re-run classification against the consumed payload to
     # reconfirm the route is unchanged (no silent drift between transport
-    # and consumption).
+    # and consumption). #2053 P0 fix-delta (iteration 2): this is a real
+    # gate, not best-effort telemetry -- an exception, or a route that has
+    # drifted away from contract_update_required (e.g. human_escalation),
+    # fails the consumption closed instead of silently reporting
+    # fresh_rerun_performed=true with status: ok.
     fresh_rerun_performed = False
+    fresh_rerun_route_action = None
+    fresh_rerun_error = None
     try:
-        from scope_signal_delta import classify_scope_delta_authority
+        from scope_signal_delta import (
+            SCOPE_DELTA_AUTHORITY_ROUTE_CONTRACT_UPDATE_REQUIRED,
+            classify_scope_delta_authority,
+        )
 
-        classify_scope_delta_authority(
+        fresh_result = classify_scope_delta_authority(
             manifest.get("payload"),
             target_issue_number=issue_number,
             expected_repo=repo,
+            base_issue_body_sha256=manifest.get("source_issue_body_sha256"),
         )
-        fresh_rerun_performed = True
-    except Exception:  # noqa: BLE001 - fresh rerun is best-effort telemetry
+        fresh_rerun_route_action = (
+            fresh_result.get("route", {}).get("action")
+            if isinstance(fresh_result, dict)
+            else None
+        )
+        fresh_rerun_performed = (
+            fresh_rerun_route_action == SCOPE_DELTA_AUTHORITY_ROUTE_CONTRACT_UPDATE_REQUIRED
+        )
+    except Exception as exc:  # noqa: BLE001 - captured as a fail-closed reason, not swallowed
         fresh_rerun_performed = False
+        fresh_rerun_error = f"{type(exc).__name__}:{exc}"
+
+    if not fresh_rerun_performed:
+        return _receipt(
+            status="environment_failure",
+            reason_code="fresh_rerun_route_drift" if fresh_rerun_error is None else "fresh_rerun_error",
+            transport_payload_sha256=manifest_payload_sha256,
+            consumed_payload_sha256=recomputed,
+            mutation_applied=mutation_applied,
+            readback_verified=readback_verified,
+            fresh_rerun_performed=False,
+        )
 
     final_receipt = _receipt(
         status="ok",
