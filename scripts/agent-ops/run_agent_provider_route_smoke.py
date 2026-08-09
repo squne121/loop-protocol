@@ -45,6 +45,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,18 @@ RUN_GEMINI_HEADLESS_SCRIPT = (
 GITHUB_RESEARCH_EVIDENCE_SCHEMA = "agy_github_research_evidence/v1"
 
 SCHEMA = "agent_provider_route_smoke/v1"
+
+# Issue #2015 AC11 (OWNER Scope Reframe 2026-08-09): the new child
+# spawn/completion diagnostic fields are recorded in a SEPARATE companion
+# file, never merged into the ``agent_provider_route_smoke/v1`` artifact
+# itself. ``schemas/agent_provider_route_smoke_v1.schema.json`` is
+# ``additionalProperties: false`` at every object level, and ``schemas/``
+# is NOT part of this Issue's Allowed Paths (nor the OWNER scope-delta
+# path list) -- widening that closed schema's contract is out of scope for
+# this change. Keeping the diagnostics in an independent, unvalidated
+# companion artifact avoids both silently breaking the closed schema and
+# reaching outside the authorized Allowed Paths.
+DIAGNOSTICS_SCHEMA = "agent_provider_route_smoke_diagnostics/v1"
 
 REQUIRED_ROUTES: list[dict[str, str]] = [
     {"runtime": "claude_code", "agent": "codebase-investigator", "profile": "local_asset_research"},
@@ -395,6 +408,34 @@ def _is_transient_infrastructure_candidate(route: dict[str, str], failure_class:
     return route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed"
 
 
+# Issue #2015 AC11 (OWNER Scope Reframe 2026-08-09): bounded, non-busy
+# polling interval for durable artifact materialization after the harness
+# subprocess has already exited. Never indefinite -- always bounded by the
+# route's own single absolute deadline (see ``run_route_live``).
+_ARTIFACT_MATERIALIZATION_POLL_INTERVAL_SEC = 0.5
+
+
+def _poll_for_file(
+    path: Path,
+    deadline: float,
+    *,
+    interval: float = _ARTIFACT_MATERIALIZATION_POLL_INTERVAL_SEC,
+) -> float:
+    """Bounded poll (never a busy loop -- ``time.sleep(interval)`` between
+    checks) for ``path`` to exist, up to the shared route-level ``deadline``
+    (an absolute ``time.monotonic()`` value). Returns the elapsed seconds
+    actually spent waiting (0.0 if the file was already present)."""
+    started = time.monotonic()
+    if path.is_file():
+        return 0.0
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        time.sleep(min(interval, max(0.0, remaining)))
+        if path.is_file():
+            return time.monotonic() - started
+    return time.monotonic() - started
+
+
 def _run_route_once(
     route: dict[str, str],
     *,
@@ -402,10 +443,24 @@ def _run_route_once(
     repo_root: Path,
     worktree: Path,
     output_root: Path,
-    timeout_seconds: int,
-) -> dict:
+    deadline: float,
+) -> tuple[dict, dict]:
     """A single, non-retried attempt at a live route. See ``run_route_live``
-    for the bounded-retry wrapper around this."""
+    for the bounded-retry wrapper around this.
+
+    ``deadline`` is a single, ROUTE-LEVEL absolute ``time.monotonic()``
+    value shared across the initial attempt and any retry (Issue #2015
+    AC11/P1: the prior implementation gave the retry its own fresh
+    ``timeout_seconds`` budget, independent of how much of the route's
+    overall time allowance the initial attempt had already consumed --
+    exactly the deadline-hierarchy violation already fixed for
+    ``run_gemini_headless.py`` in an earlier iteration of this Issue).
+
+    Returns ``(artifact, diagnostics)``: ``artifact`` is validated against
+    the closed ``agent_provider_route_smoke_v1`` schema (unchanged shape);
+    ``diagnostics`` carries the new AC11 spawn/completion fields in a
+    companion, schema-unvalidated dict (see ``DIAGNOSTICS_SCHEMA``
+    comment above)."""
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     subject = compute_subject(route, repo_root)
     harness_runtime = _RUNTIME_TO_HARNESS[route["runtime"]]
@@ -435,6 +490,22 @@ def _run_route_once(
         "status": "fail",
         "failure_class": "other",
     }
+    diagnostics: dict = {
+        "schema": DIAGNOSTICS_SCHEMA,
+        "child_spawn_observed": False,
+        "child_spawn_source": None,
+        "child_launch_mode": None,
+        "child_completion_observed": False,
+        "child_completion_source": None,
+        "child_terminal_status": None,
+        "child_agent_id": None,
+        "child_agent_type": None,
+        "spawn_elapsed_sec": None,
+        "completion_elapsed_sec": None,
+        "evidence_materialized_elapsed_sec": 0.0,
+        "harness_exit": None,
+        "secondary_failures": [],
+    }
 
     route_key_slug = _route_key(route).replace(":", "-")
     evidence_dir = output_root / f"{route_key_slug}-{run_id}-evidence"
@@ -456,6 +527,11 @@ def _run_route_once(
         child_env["PATH"] = f"{sentinel_bin_dir}:{child_env.get('PATH', '')}"
         child_env["AGENT_PROVIDER_ROUTE_SMOKE_GEMINI_SENTINEL_MARKER"] = str(marker_path)
 
+        # Remaining budget derived from the SHARED route deadline, never a
+        # fresh full timeout per attempt.
+        remaining = max(5.0, deadline - time.monotonic())
+        harness_timeout_seconds = max(1, int(remaining))
+
         argv = [
             sys.executable,
             str(RUNTIME_SMOKE_SCRIPT),
@@ -464,26 +540,30 @@ def _run_route_once(
             "--worktree", str(worktree),
             "--prompt-file", str(prompt_file),
             "--output-dir", str(harness_output_dir),
-            "--timeout-seconds", str(timeout_seconds),
+            "--timeout-seconds", str(harness_timeout_seconds),
             "--agent-type", route["agent"],
             "--expect-marker", "ROUTE_SMOKE_DONE",
         ]
         try:
             result = subprocess.run(
-                argv, capture_output=True, text=True, timeout=timeout_seconds + 30,
+                argv, capture_output=True, text=True, timeout=remaining + 30,
                 env=child_env, check=False,
             )
         except subprocess.TimeoutExpired:
             artifact["failure_class"] = "timeout"
             artifact["status"] = "fail"
-            return artifact
+            return artifact, diagnostics
         except OSError as exc:
             artifact["failure_class"] = "other"
             artifact["status"] = "fail"
             artifact["_producer_error"] = str(exc)
-            return artifact
+            diagnostics["secondary_failures"].append(
+                {"kind": "producer_oserror", "detail": str(exc)}
+            )
+            return artifact, diagnostics
 
         harness_exit = result.returncode
+        diagnostics["harness_exit"] = harness_exit
         # run_worktree_agent_runtime_smoke.py deliberately persists only
         # ``summary.md`` (Issue #1921 P1 evidence-hygiene fix-delta; its own
         # tests assert an exact one-file allowlist per output directory), so
@@ -506,19 +586,81 @@ def _run_route_once(
         artifact["provider_observation"]["gemini_invocation_count"] = gemini_hits
         artifact["provider_observation"]["direct_fallback_invocation_count"] = fallback_hits
 
+        # Issue #2015 AC11: spawn/completion diagnostics, read verbatim from
+        # the harness's own summary.md (see run_worktree_agent_runtime_smoke.py
+        # ``classify_claude_child_completion`` / codex approximation) --
+        # never re-derived here.
+        diagnostics["child_spawn_observed"] = bool(harness_summary.get("child_spawn_observed"))
+        diagnostics["child_spawn_source"] = harness_summary.get("child_spawn_source")
+        diagnostics["child_launch_mode"] = harness_summary.get("child_launch_mode")
+        diagnostics["child_completion_observed"] = bool(
+            harness_summary.get("child_completion_observed")
+        )
+        diagnostics["child_completion_source"] = harness_summary.get("child_completion_source")
+        diagnostics["child_terminal_status"] = harness_summary.get("child_terminal_status")
+        diagnostics["child_agent_id"] = harness_summary.get("child_agent_id")
+        diagnostics["child_agent_type"] = harness_summary.get("child_agent_type_observed")
+        diagnostics["spawn_elapsed_sec"] = harness_summary.get("spawn_elapsed_sec")
+        diagnostics["completion_elapsed_sec"] = harness_summary.get("completion_elapsed_sec")
+
         request_validation = _validate_delegation_request_evidence(evidence_dir, route)
         selected_provider, provider_attempts, wrapper_ok = _validate_delegation_result_evidence(
             evidence_dir
         )
+
+        # Issue #2015 AC11: a genuinely-completed child (per the harness's
+        # own SubagentStop/tool_use_result-completed evidence) may still
+        # race this producer's read of ``delegation_result.json`` -- the
+        # child's own Write tool call returning is not guaranteed to be
+        # immediately visible to a SEPARATE reading process. Bounded poll
+        # (never indefinite, never past the shared route deadline) before
+        # concluding the artifact was never materialized at all.
+        if diagnostics["child_completion_observed"] and not wrapper_ok:
+            elapsed = _poll_for_file(evidence_dir / "delegation_result.json", deadline)
+            diagnostics["evidence_materialized_elapsed_sec"] = elapsed
+            if elapsed > 0.0:
+                selected_provider, provider_attempts, wrapper_ok = (
+                    _validate_delegation_result_evidence(evidence_dir)
+                )
+
         artifact["request"]["validation"] = request_validation
         artifact["provider_observation"]["selected_provider"] = selected_provider
         artifact["provider_observation"]["provider_attempts"] = provider_attempts
+
+        # Issue #2015 AC11: distinguishable from an ordinary validation
+        # failure in the diagnostics companion file (the closed artifact
+        # schema's ``failure_class`` enum is not widened -- see
+        # DIAGNOSTICS_SCHEMA comment): a child that genuinely completed but
+        # whose result artifact never materialized even after the bounded
+        # poll above. Recorded regardless of which HIGHER-priority
+        # failure_class branch below ultimately wins, so this detail is
+        # never lost just because e.g. provider_mismatch also fired.
+        if diagnostics["child_completion_observed"] and not wrapper_ok:
+            diagnostics["secondary_failures"].append(
+                {"kind": "child_completed_but_artifact_not_materialized"}
+            )
 
         route_evidence_sha256 = None
         if route["profile"] == "github_research":
             artifact["route_evidence"]["schema"] = GITHUB_RESEARCH_EVIDENCE_SCHEMA
             route_evidence_sha256 = _validate_github_research_route_evidence(evidence_dir)
             artifact["route_evidence"]["sha256"] = route_evidence_sha256
+
+        # Issue #2015 AC11: a non-zero harness exit must still be
+        # classified (never silently discarded as "no evidence") -- record
+        # it as a secondary failure even when the branch below assigns a
+        # primary failure_class from a HIGHER-priority signal (gemini
+        # invocation / fallback), so genuine spawn evidence observed
+        # alongside a nonzero exit is preserved rather than lost.
+        if harness_exit not in (0, 77) and (
+            diagnostics["child_spawn_observed"] or artifact["spawn"]["native_spawn_event_observed"]
+        ):
+            diagnostics["secondary_failures"].append(
+                {
+                    "kind": "nonzero_harness_exit_with_spawn_evidence",
+                    "harness_exit": harness_exit,
+                }
+            )
 
         if gemini_hits > 0:
             artifact["status"] = "fail"
@@ -551,7 +693,7 @@ def _run_route_once(
             artifact["status"] = "pass"
             artifact["failure_class"] = None
 
-    return artifact
+    return artifact, diagnostics
 
 
 def run_route_live(
@@ -561,32 +703,50 @@ def run_route_live(
     worktree: Path,
     output_root: Path,
     timeout_seconds: int,
-) -> dict:
-    initial = _run_route_once(
+) -> tuple[dict, dict]:
+    # Issue #2015 AC11: ONE absolute deadline for the whole route, shared by
+    # the initial attempt and any bounded retry -- never a fresh
+    # ``timeout_seconds`` budget per attempt.
+    route_deadline = time.monotonic() + timeout_seconds
+    attempts: list[dict] = []
+
+    initial, initial_diagnostics = _run_route_once(
         route,
         run_id=str(uuid.uuid4()),
         repo_root=repo_root,
         worktree=worktree,
         output_root=output_root,
-        timeout_seconds=timeout_seconds,
+        deadline=route_deadline,
+    )
+    attempts.append(
+        {"attempt": 1, "status": initial["status"], "failure_class": initial["failure_class"]}
     )
     if initial["status"] != "fail" or not _is_transient_infrastructure_candidate(
         route, initial["failure_class"]
     ):
-        return initial
+        initial_diagnostics["attempts"] = attempts
+        initial_diagnostics["route_deadline_sec"] = timeout_seconds
+        return initial, initial_diagnostics
 
     # Issue #1886 P0-4: bounded single retry, ledgered (never a silent
     # re-run). The FIRST artifact's own run_id/generated_at/etc are
     # discarded in favor of the retry's own fresh artifact -- only the
     # retry ledger below (initial_result/initial_failure_class/retry_count/
     # retry_result/final_route_verdict) survives from the first attempt.
-    retry_artifact = _run_route_once(
+    retry_artifact, retry_diagnostics = _run_route_once(
         route,
         run_id=str(uuid.uuid4()),
         repo_root=repo_root,
         worktree=worktree,
         output_root=output_root,
-        timeout_seconds=timeout_seconds,
+        deadline=route_deadline,
+    )
+    attempts.append(
+        {
+            "attempt": 2,
+            "status": retry_artifact["status"],
+            "failure_class": retry_artifact["failure_class"],
+        }
     )
     retry_artifact["retry"] = {
         "initial_result": initial["status"],
@@ -595,7 +755,12 @@ def run_route_live(
         "retry_result": retry_artifact["status"],
         "final_route_verdict": retry_artifact["status"],
     }
-    return retry_artifact
+    retry_diagnostics["attempts"] = attempts
+    retry_diagnostics["route_deadline_sec"] = timeout_seconds
+    retry_diagnostics["secondary_failures"] = (
+        initial_diagnostics.get("secondary_failures", []) + retry_diagnostics.get("secondary_failures", [])
+    )
+    return retry_artifact, retry_diagnostics
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -611,6 +776,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="write only subject/request metadata, never spawn a live runtime (hermetic testing)",
+    )
+    parser.add_argument(
+        "--require-route-pass", action="store_true",
+        help=(
+            "Issue #2015 AC10/AC11: make this producer's own exit code "
+            "reflect route-artifact semantic status (every produced route "
+            "artifact's status must be 'pass'), not merely 'the producer "
+            "subprocess ran without crashing'. A producer-completed-without-"
+            "crashing run whose route(s) actually FAILED still exits nonzero "
+            "when this flag is set."
+        ),
     )
     return parser
 
@@ -683,8 +859,26 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "skip",
                 "failure_class": "agy_unavailable",
             }
+            diagnostics = {
+                "schema": DIAGNOSTICS_SCHEMA,
+                "child_spawn_observed": False,
+                "child_spawn_source": None,
+                "child_launch_mode": None,
+                "child_completion_observed": False,
+                "child_completion_source": None,
+                "child_terminal_status": None,
+                "child_agent_id": None,
+                "child_agent_type": None,
+                "spawn_elapsed_sec": None,
+                "completion_elapsed_sec": None,
+                "evidence_materialized_elapsed_sec": 0.0,
+                "harness_exit": None,
+                "attempts": [],
+                "secondary_failures": [],
+                "route_deadline_sec": None,
+            }
         else:
-            artifact = run_route_live(
+            artifact, diagnostics = run_route_live(
                 route,
                 repo_root=repo_root,
                 worktree=worktree,
@@ -694,6 +888,10 @@ def main(argv: list[str] | None = None) -> int:
             artifact["batch_run_id"] = batch_run_id
         artifact_path = output_root / f"{_route_key(route).replace(':', '-')}.json"
         artifact_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        diagnostics_path = output_root / f"{_route_key(route).replace(':', '-')}-diagnostics.json"
+        diagnostics_path.write_text(
+            json.dumps(diagnostics, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
         artifacts.append(artifact)
         print(f"[{artifact['status']}] {_route_key(route)} -> {artifact_path}")
 
@@ -704,6 +902,15 @@ def main(argv: list[str] | None = None) -> int:
         "statuses": {_route_key(r): a["status"] for r, a in zip(routes, artifacts)},
     }
     (output_root / "index.json").write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    if args.require_route_pass:
+        non_pass = [_route_key(r) for r, a in zip(routes, artifacts) if a["status"] != "pass"]
+        if non_pass:
+            print(
+                "[require-route-pass] non-pass route(s): " + ", ".join(non_pass),
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

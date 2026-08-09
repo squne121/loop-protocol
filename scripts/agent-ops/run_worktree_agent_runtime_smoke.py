@@ -1218,6 +1218,157 @@ def classify_claude_spawn_launch_mode(stdout: str) -> str | None:
     return SPAWN_LAUNCH_MODE_UNKNOWN
 
 
+# ---------------------------------------------------------------------------
+# Spawn/completion separation (Issue #2015 AC11, OWNER Scope Reframe
+# 2026-08-09): the fields above (``native_spawn_event_observed`` /
+# ``classify_claude_spawn_launch_mode``) prove only that a child WAS
+# launched, never that it reached a terminal state. Both
+# ``extract_claude_hook_agent_identity`` and the ``tool_use_result``
+# channel conflate ``SubagentStart`` and ``SubagentStop`` (or
+# ``async_launched``/``completed``) into a single "identity observed"
+# signal -- a lone ``SubagentStart`` with no matching ``SubagentStop`` was
+# previously indistinguishable from a genuinely completed child. This is a
+# real correctness gap, not merely a naming one: it is the exact scenario
+# AC11 requires a hermetic regression test for ("SubagentStart present but
+# SubagentStop missing (must not falsely report completion)").
+#
+# Root cause note (see PR #2044 root-cause report): this harness's
+# structured lane (``_run`` -> ``proc.communicate(timeout=...)``) blocks
+# until the underlying ``claude -p`` / ``codex exec`` PROCESS itself exits.
+# Once that process has exited, there is no live process left to "poll" for
+# a future event -- a terminal event that has not appeared anywhere in the
+# already-captured stdout by the time the process exits can never appear
+# later from this process's own stdout. The correct fix is therefore NOT a
+# busy/blocking wait on a dead process; it is (a) separating the two
+# distinct signals that already exist in the captured stream so a
+# spawn-only observation is never silently promoted to "completed", and (b)
+# a bounded filesystem poll for durable artifact materialization performed
+# by the caller (``run_agent_provider_route_smoke.py``) AFTER this process
+# has exited, tolerating a short flush lag between a child's own terminal
+# hook firing and its side-effect (e.g. ``delegation_result.json``)
+# becoming visible on disk to a separate reading process.
+# ---------------------------------------------------------------------------
+
+CHILD_COMPLETION_SOURCE_HOOK_STOP = "hook_subagent_stop"
+CHILD_COMPLETION_SOURCE_TOOL_RESULT = "tool_use_result_status_completed"
+
+CHILD_TERMINAL_STATUS_COMPLETED = "completed"
+CHILD_TERMINAL_STATUS_ASYNC_NO_STOP = "async_launched_no_stop_observed"
+CHILD_TERMINAL_STATUS_UNKNOWN = None
+
+
+def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
+    """Every ``SubagentStart``/``SubagentStop`` hook event observed in the
+    already-captured stdout, IN ORDER, each kept as its own record (never
+    merged across event kinds -- the prior ``extract_claude_hook_agent_
+    identity`` folded both event kinds into one result, which is exactly
+    the conflation this function exists to undo).
+
+    Each entry: ``{"hook_event": "SubagentStart"|"SubagentStop",
+    "agent_id": str|None, "agent_type": str|None}``. Best-effort / fail
+    closed to ``None`` fields on any parse mismatch -- never a guess."""
+    events: list[dict] = []
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "system":
+            continue
+        hook_event = payload.get("hook_event")
+        if hook_event not in _CLAUDE_HOOK_LIFECYCLE_EVENTS:
+            continue
+        entry: dict = {"hook_event": hook_event, "agent_id": None, "agent_type": None}
+        hook_name = payload.get("hook_name")
+        if isinstance(hook_name, str) and hook_name.startswith(f"{hook_event}:"):
+            suffix = hook_name.split(":", 1)[1].strip()
+            if suffix:
+                entry["agent_type"] = suffix
+        for key in ("stdout", "output"):
+            text = payload.get(key)
+            if not isinstance(text, str) or not text.strip():
+                continue
+            parsed = _parse_embedded_json_object(text)
+            if parsed is None:
+                continue
+            agent_id = parsed.get("agent_id")
+            agent_type = parsed.get("agent_type")
+            if isinstance(agent_id, str) and agent_id:
+                entry["agent_id"] = agent_id
+            if isinstance(agent_type, str) and agent_type:
+                entry["agent_type"] = agent_type
+        events.append(entry)
+    return events
+
+
+def classify_claude_child_completion(stdout: str, spawn_agent_id: str | None) -> dict:
+    """Whether the child actually reached a terminal state, kept strictly
+    separate from spawn evidence (Issue #2015 AC11).
+
+    Two independent completion channels, checked in priority order:
+
+    1. ``tool_use_result.status == "completed"`` on the SAME Agent tool
+       result envelope that carried the (matching) ``agentId`` -- the
+       synchronous-completion shape.
+    2. A ``SubagentStop`` hook lifecycle event whose ``agent_id`` matches
+       ``spawn_agent_id`` exactly.
+
+    Returns ``{"observed": bool, "source": str|None, "terminal_status":
+    str|None}``. When ``spawn_agent_id`` is ``None`` (spawn itself was
+    never observed), completion is never asserted -- a value that cannot be
+    honestly bound to the spawned child's own identity is never guessed. A
+    ``SubagentStart`` with no matching ``SubagentStop`` (or an
+    ``agent_id`` mismatch between the two) fails closed to
+    ``observed: False`` -- this is the exact AC11 regression scenario."""
+    result = {"observed": False, "source": None, "terminal_status": None}
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "user":
+            continue
+        tool_use_result = payload.get("tool_use_result")
+        if not isinstance(tool_use_result, dict):
+            continue
+        agent_id = tool_use_result.get("agentId")
+        if (
+            tool_use_result.get("status") == SPAWN_LAUNCH_MODE_COMPLETED
+            and isinstance(agent_id, str)
+            and agent_id
+            and spawn_agent_id
+            and agent_id == spawn_agent_id
+        ):
+            result["observed"] = True
+            result["source"] = CHILD_COMPLETION_SOURCE_TOOL_RESULT
+            result["terminal_status"] = CHILD_TERMINAL_STATUS_COMPLETED
+            return result
+    if not spawn_agent_id:
+        return result
+    for event in extract_claude_hook_lifecycle_events(stdout):
+        if event["hook_event"] != "SubagentStop":
+            continue
+        if event["agent_id"] == spawn_agent_id:
+            result["observed"] = True
+            result["source"] = CHILD_COMPLETION_SOURCE_HOOK_STOP
+            result["terminal_status"] = CHILD_TERMINAL_STATUS_COMPLETED
+            return result
+    return result
+
+
+def classify_claude_child_spawn_agent_id(stdout: str) -> tuple[str | None, str | None]:
+    """``(agent_id, source)`` for the spawned child, independent of the
+    agent-TYPE identity binding above -- ``native_spawn_event_observed``
+    additionally requires a matching agent type, which this function does
+    not check, so it can supply a genuine child identity even when type
+    identity is unverified (used to bind completion evidence to the
+    correct spawn in ``classify_claude_child_completion``)."""
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "user":
+            continue
+        tool_use_result = payload.get("tool_use_result")
+        if isinstance(tool_use_result, dict):
+            agent_id = tool_use_result.get("agentId")
+            if isinstance(agent_id, str) and agent_id:
+                return agent_id, "tool_use_result"
+    for event in extract_claude_hook_lifecycle_events(stdout):
+        if event["hook_event"] == "SubagentStart" and event["agent_id"]:
+            return event["agent_id"], "hook_subagent_start"
+    return None, None
+
+
 def extract_claude_child_agent_type_with_source(stdout: str) -> tuple[str | None, str | None]:
     """``(agent_type, source)`` -- the agent type together with the provenance
     of the channel it was actually observed on. Both are ``None`` when no
@@ -2343,6 +2494,15 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["child_agent_type_source"] = None
             schema_summary["agent_type_identity_verified"] = False
             schema_summary["native_spawn_event_observed"] = False
+            schema_summary["child_spawn_observed"] = False
+            schema_summary["child_spawn_source"] = None
+            schema_summary["child_launch_mode"] = None
+            schema_summary["child_completion_observed"] = False
+            schema_summary["child_completion_source"] = None
+            schema_summary["child_terminal_status"] = None
+            schema_summary["child_agent_id"] = None
+            schema_summary["spawn_elapsed_sec"] = None
+            schema_summary["completion_elapsed_sec"] = None
         elif exit_code != EXIT_OK:
             # A capability/herdr preflight above already decided this run is
             # a controlled SKIP -- do not attempt to launch either lane.
@@ -2466,6 +2626,82 @@ def main(argv: list[str] | None = None) -> int:
                 and parent_session_id != child_session_id
                 and agent_type_identity_verified
             )
+
+            # Issue #2015 AC11 (OWNER Scope Reframe 2026-08-09): spawn
+            # observation and completion observation as two SEPARATE,
+            # explicitly-recorded signals -- see the module docstring above
+            # ``classify_claude_child_completion`` for the root-cause
+            # rationale (a dead process cannot be polled for a future
+            # event; the fix is to stop conflating the two signals that are
+            # already present in the captured stream, plus a bounded
+            # filesystem poll performed by the caller after this process
+            # exits).
+            if args.runtime == "claude":
+                child_agent_id, child_spawn_source = classify_claude_child_spawn_agent_id(out)
+                child_spawn_observed = child_agent_id is not None
+                completion = classify_claude_child_completion(out, child_agent_id)
+                child_completion_observed = completion["observed"]
+                child_completion_source = completion["source"]
+                if completion["observed"]:
+                    child_terminal_status = CHILD_TERMINAL_STATUS_COMPLETED
+                elif child_spawn_launch_mode == SPAWN_LAUNCH_MODE_ASYNC:
+                    child_terminal_status = CHILD_TERMINAL_STATUS_ASYNC_NO_STOP
+                else:
+                    child_terminal_status = CHILD_TERMINAL_STATUS_UNKNOWN
+                # Not derivable from the structured lane's captured stdout:
+                # neither the ``tool_use_result`` envelope nor the hook
+                # lifecycle events in this repository's own observed event
+                # shapes carry a wall-clock timestamp field for these
+                # specific event kinds. Left ``None`` (never fabricated)
+                # rather than approximated from this call's own outer
+                # elapsed time, which would misrepresent per-child timing.
+                spawn_elapsed_sec = None
+                completion_elapsed_sec = None
+            else:
+                # Issue #2015 AC11 documented limitation: Codex CLI's
+                # ``codex exec --json`` stdout (this harness only reads
+                # stdout, never the on-disk rollout log for live timing) has
+                # no per-child terminal-event equivalent to Claude's
+                # ``SubagentStop`` hook currently identified in this
+                # repository's own runtime research. ``child_session_id``
+                # (recovered from the child's own rollout log, see
+                # ``extract_codex_child_session_id``) is the best available
+                # spawn evidence; completion is approximated as "the overall
+                # session reached ITS OWN terminal event AND a child rollout
+                # was recovered" -- this is a parent-level, not a genuine
+                # child-level, terminal signal, and is intentionally NOT
+                # promoted to the same confidence as the Claude hook-based
+                # signal. A dedicated Codex-specific child terminal marker is
+                # a known follow-up research gap (see PR #2044 root-cause
+                # report), not silently faked here.
+                child_agent_id = child_session_id
+                child_spawn_source = (
+                    "codex_rollout_log_spawn_agent_call" if child_session_id else None
+                )
+                child_spawn_observed = child_session_id is not None
+                child_completion_observed = bool(child_session_id and terminal_event_observed)
+                child_completion_source = (
+                    "approximate_parent_terminal_event_plus_rollout_spawn"
+                    if child_completion_observed
+                    else None
+                )
+                if child_completion_observed:
+                    child_terminal_status = CHILD_TERMINAL_STATUS_COMPLETED
+                elif child_spawn_observed:
+                    child_terminal_status = CHILD_TERMINAL_STATUS_ASYNC_NO_STOP
+                else:
+                    child_terminal_status = CHILD_TERMINAL_STATUS_UNKNOWN
+                spawn_elapsed_sec = None
+                completion_elapsed_sec = None
+            schema_summary["child_spawn_observed"] = child_spawn_observed
+            schema_summary["child_spawn_source"] = child_spawn_source
+            schema_summary["child_launch_mode"] = child_spawn_launch_mode
+            schema_summary["child_completion_observed"] = child_completion_observed
+            schema_summary["child_completion_source"] = child_completion_source
+            schema_summary["child_terminal_status"] = child_terminal_status
+            schema_summary["child_agent_id"] = child_agent_id
+            schema_summary["spawn_elapsed_sec"] = spawn_elapsed_sec
+            schema_summary["completion_elapsed_sec"] = completion_elapsed_sec
 
             if capability_decision == "capability_skip":
                 # AC2: a known unknown/unrecognized-option parser diagnostic

@@ -242,7 +242,10 @@ class TestProducer:
         ])
         assert rc == 0
         artifact_paths = sorted(tmp_path.glob("*.json"))
-        artifact_paths = [p for p in artifact_paths if p.name != "index.json"]
+        artifact_paths = [
+            p for p in artifact_paths
+            if p.name != "index.json" and not p.name.endswith("-diagnostics.json")
+        ]
         assert len(artifact_paths) == 6
         for path in artifact_paths:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -257,7 +260,10 @@ class TestProducer:
             "--dry-run", "--output-dir", str(tmp_path), "--repo-root", str(REPO_ROOT),
         ])
         assert rc == 0
-        artifact_paths = [p for p in tmp_path.glob("*.json") if p.name != "index.json"]
+        artifact_paths = [
+            p for p in tmp_path.glob("*.json")
+            if p.name != "index.json" and not p.name.endswith("-diagnostics.json")
+        ]
         assert len(artifact_paths) == 1
 
     def test_unknown_route_returns_nonzero(self, producer, tmp_path, capsys):
