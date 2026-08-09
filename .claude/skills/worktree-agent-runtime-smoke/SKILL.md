@@ -37,6 +37,9 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 - `--expect-marker <literal>`（repeatable、任意）
 - `--require-clean-postcondition`（任意）
 - `--inspect-session-log-metadata` / `--require-session-log-metadata`（任意。既定では session log を読まない）
+- `--agent-type <persona 名>`（任意。static declaration。CLI へ forward しない）
+- `--claude-agent-name <persona 名>`（任意。claude runtime + structured mode 限定。実際に `--agent <name>` として CLI へ forward し、main-session identity（`main_agent_identity`）・candidate Agent definition binding（`agent_definition`）・Skill evidence（`skill_evidence`）の evidence source になる。Issue #2046）
+- `--hermetic-agent-definition`（任意。`--claude-agent-name` 併用必須。project-discovery の `--agent <name>` lookup ではなく、candidate Agent 定義から決定論的に生成した session-local `--agents` JSON payload（tools は Read のみ固定）と session-local `--settings`（mutation-capable tool を deny）で起動する hermetic no-mutation lane。Issue #2046）
 
 `--transport` と `--keep-pane` は存在しない（PR #1921 human OWNER fix-delta）。structured lane は
 常に direct subprocess、interactive lane は常に isolated named herdr session であり、
@@ -84,6 +87,36 @@ named session を新規生成し、その session 内だけで agent lifecycle �
 終了時に session そのものを stop／delete し、`herdr session list --json` で消失を
 確認する（確認できない場合は fail-closed で exit 1）。詳細は `references/herdr.md` を参照。
 
+## Main-Session Agent Identity Evidence（Issue #2046）
+
+`--claude-agent-name` を指定した claude runtime + structured mode の run は、
+以下の 5 種類の evidence を `summary.md` に追加で記録する（`references/claude-code.md`
+の該当節を参照）:
+
+- `main_agent_identity`: `requested`（runner argv 由来）と `observed`（`SessionStart`
+  hook 由来）の分離、`matched`。hook 欠落・不一致は `matched: false` として記録し、
+  model の自己申告テキストでは絶対に埋めない
+- `agent_definition`: `intended_repo_path` / `intended_sha256`。project-discovery lane
+  （既定）は `status: unavailable`（effective source を独立確認できないため）。
+  `--hermetic-agent-definition` 指定時は hermetic lane（`binding_mode: hermetic`）となり
+  `hermetic_payload_sha256` / `hermetic_agent_name` も記録される
+- `skill_evidence`: `declaration`（static frontmatter）／`preload`（常に `unavailable`
+  — preload を直接確認する native event channel が存在しないため、`observed` と
+  偽装しない）／`canonical_read`（`issue-creator`→`create-issue/SKILL.md`、
+  `issue-editor`→`edit-issue/SKILL.md` の Read tool_use/tool_result ペアからのみ
+  `observed` になる。marker 文字列や self-report では絶対に `observed` にならない）
+- `mutation_boundary`: `--hermetic-agent-definition` 指定時のみ記録。session-local
+  settings digest・実効 argv（redact 済み）・mutation-capable tool_use event（`Edit`
+  / `MultiEdit` / `Write` / `NotebookEdit` / `Bash` / `Agent`）の件数。1 件でも
+  観測されれば run 全体が FAIL（exit 1）
+- `settings_provenance`: 実効 settings の source（`session_local_generated` /
+  `project_default`）と digest
+
+`production_settings_lane` フィールドは常に記録され、hermetic mutation_boundary
+evidence が #1881（pr-reviewer persona の production settings lane）の permission
+claim へ昇格しないことを明示する。#1881 未完了時点ではこの hermetic evidence を
+production permission の根拠にしない。
+
 ## 手順
 
 1. **worktree identity を確認する**（root checkout・別 repository・cwd mismatch を実行前に拒否する。runner が自動で検証する）
@@ -114,7 +147,7 @@ named session を新規生成し、その session 内だけで agent lifecycle �
   `herdr session list --json` での消失確認が取れない場合は exit 1 とする（`--keep-pane` 相当の
   opt-out は存在しない）
 - SIGINT／SIGTERM を含む全ての終了経路で isolated session cleanup を実行する
-- 新しい schema、digest、receipt、publisher、state store、semantic verdict classifier を追加しない
+- 新しい schema、digest、receipt、publisher、state store、semantic verdict classifier を追加しない（Issue #2046 で `main_agent_identity` / `agent_definition` / `skill_evidence` / `mutation_boundary` / `settings_provenance` の 5 フィールドが Issue 契約に基づき追加済み — この制約は Issue 契約に基づかない追加の schema/digest/receipt 拡張を禁じるものであり、既存の Issue 契約で明示的に要求された追加を遡って禁止するものではない）
 
 ## Reference Map（参照資料の一覧）
 

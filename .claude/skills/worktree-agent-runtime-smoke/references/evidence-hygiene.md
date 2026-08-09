@@ -16,6 +16,23 @@ session-log metadata の raw dump（`session-log-metadata.txt`）は保存しな
 （PR #1921 human OWNER fix-delta: 先行 PR #1864 で pane transcript にアカウント情報等が
 残留した実績があるため、summary.md への allowlist-only 集約へ縮小した）。
 
+## Main-session agent identity evidence の status enum（Issue #2046）
+
+`main_agent_identity` / `agent_definition` / `skill_evidence` / `mutation_boundary` /
+`settings_provenance` の各 status フィールドは、必ず以下 4 値のいずれかを取る:
+
+- `declared`: static な自己構成事実（frontmatter 宣言、この runner 自身が決定論的に
+  生成した session-local payload など）。runtime observation ではない
+- `observed`: native stream-json event（hook payload、tool_use/tool_result ペア）から
+  直接観測した事実
+- `derived_from_observed`: 他の observed evidence から間接的に導出した事実
+- `unavailable`: 上記いずれも成立しない場合。値を推測・捏造しない
+
+`skill_evidence.preload` は常に `unavailable`（Skill preload を直接確認する native
+event channel が存在しないため）。これを `observed` に昇格させることは禁止 — declared
+な事実（`skill_evidence.declaration`）や observed な事実（`skill_evidence.canonical_read`）
+を preload の代わりに使わない。
+
 ## `summary.md` に保存可能な証跡
 
 - runtime 名と version
@@ -32,6 +49,19 @@ session-log metadata の raw dump（`session-log-metadata.txt`）は保存しな
 - filesystem／Git postcondition（事後条件）の差分一覧
 - isolated session cleanup の試行有無・消失確認可否
 - session-log metadata の allowlist キー該当件数（値そのものは含まない）
+
+## Main-session agent identity evidence として保存可能な追加証跡（Issue #2046）
+
+- main-session の requested/observed agent identity（persona 名のみ。生の hook payload
+  本体は含まない）
+- candidate Agent definition の repo-relative path・sha256 digest（hermetic lane では
+  生成 payload の digest も）
+- Skill declaration/canonical Read の status・normalized path・sha256 digest・
+  tool_use_id（Read tool の input/tool_result 本体テキストは含まない）
+- mutation-capable tool_use event の tool 名件数・一覧（command 本体・prompt 本体は
+  含まない）
+- 実効 argv（redaction 済み。絶対パス・長い base64-like token は `<redacted>`）
+- settings source・digest（settings 本体の内容は含まない）
 
 ## 既定で保存しないもの
 
