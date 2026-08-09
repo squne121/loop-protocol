@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import builtins
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -47,6 +48,17 @@ is_go_base_binding_current = _ecs_mod.is_go_base_binding_current
 _real_verify_snapshot_authority_postcondition = (
     _ecs_mod.verify_snapshot_authority_postcondition
 )
+
+_PARSER_PATH = (
+    _HERE.parent.parent / "issue-contract-review" / "scripts"
+    / "contract_review_result_parser.py"
+)
+_parser_spec = importlib.util.spec_from_file_location(
+    "contract_review_result_parser_for_snapshot_tests", _PARSER_PATH
+)
+assert _parser_spec is not None and _parser_spec.loader is not None
+_parser_mod = importlib.util.module_from_spec(_parser_spec)
+_parser_spec.loader.exec_module(_parser_mod)  # type: ignore[union-attr]
 
 # Use post_status constants (B4)
 POST_STATUS_POSTED = _ecs_mod.POST_STATUS_POSTED
@@ -2941,3 +2953,80 @@ CONTRACT_REVIEW_RESULT_V1:
         assert latest_trusted is not None
         assert latest_trusted["status"] == "blocked"
         assert _parser_mod.find_latest_go(parsed, trusted_only=True) is None
+
+
+class TestProducerParserEscapedAdvisoryRoundTrip:
+    """Issue #2056: JSON-in-YAML must not expose JSON escapes to YAML."""
+
+    def _comment_body(self) -> tuple[str, dict, list, dict]:
+        fingerprint = {
+            "issue_number": _ISSUE_NUMBER,
+            "contract_source_kind": "issue_comment",
+            "contract_source_id": "1001",
+            "contract_body_sha256": _SAMPLE_BODY_SHA256,
+            "allowed_paths_normalized_sha256": "b" * 64,
+            "base_ref": "main",
+            "base_sha_at_snapshot": "c" * 40,
+        }
+        classifications = [{
+            "ac": "AC10",
+            "stdout_head": [r"\^[[2K" + "x" * 16_190],
+        }]
+        declared_path_overlap = {
+            "advisory": True,
+            "note": "y" * 2_771,
+        }
+        review_result = {
+            "checks": {
+                "readiness": "go",
+                "blockers": "pass",
+                "product_spec": "pass",
+                "product_spec_check": {"decision": "pass"},
+                "vc_preflight": "pass",
+                "declared_path_overlap": declared_path_overlap,
+            },
+            "vc_preflight_classifications": classifications,
+        }
+        body = _ecs_mod._build_contract_review_comment(
+            issue_number=_ISSUE_NUMBER,
+            repo=_REPO,
+            review_result=review_result,
+            idempotency_marker="<!-- marker -->",
+            body_sha256=_SAMPLE_BODY_SHA256,
+            expected_contract_fingerprint=fingerprint,
+        )
+        return body, fingerprint, classifications, declared_path_overlap
+
+    def test_given_large_escaped_advisory_when_produced_then_json_is_yaml_quoted(self):
+        body, _fingerprint, _classifications, _overlap = self._comment_body()
+
+        assert "      classifications: '" in body
+        assert "    declared_path_overlap: '" in body
+        assert "  expected_contract_fingerprint: '" in body
+
+    def test_given_large_escaped_advisory_when_pyyaml_parses_then_types_round_trip(self):
+        body, fingerprint, classifications, overlap = self._comment_body()
+        block = _parser_mod._extract_yaml_blocks(body)[0]
+
+        parsed = _parser_mod._parse_simple_yaml_block(block)
+        inner = parsed["CONTRACT_REVIEW_RESULT_V1"]
+        assert inner["expected_contract_fingerprint"] == fingerprint
+        assert inner["checks"]["vc_preflight"]["classifications"] == classifications
+        assert inner["checks"]["declared_path_overlap"] == overlap
+
+    def test_given_large_escaped_advisory_when_fallback_parses_then_types_round_trip(self, monkeypatch):
+        body, fingerprint, classifications, overlap = self._comment_body()
+        block = _parser_mod._extract_yaml_blocks(body)[0]
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        parsed = _parser_mod._parse_simple_yaml_block(block)
+        inner = parsed["CONTRACT_REVIEW_RESULT_V1"]
+        assert inner["expected_contract_fingerprint"] == fingerprint
+        assert inner["checks"]["vc_preflight"]["classifications"] == classifications
+        assert inner["checks"]["declared_path_overlap"] == overlap
