@@ -552,7 +552,16 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
     # Read only. Both are omitted for every pre-existing (non-hermetic)
     # caller, so their argv is unchanged.
     if hermetic_agents_file:
-        argv += ["--agents", hermetic_agents_file]
+        # Claude Code --agents expects an inline JSON object literal (per
+        # `claude --help`), not a file path -- unlike --settings, which
+        # documents "file-or-json" and accepts either. Passing a bare path
+        # here causes the CLI to silently fail to register the custom
+        # agent, so --agent <name> then reports "not found" (Issue #2046
+        # PR #2047 review finding, confirmed against installed Claude Code
+        # 2.1.226 --help output).
+        with open(hermetic_agents_file, encoding="utf-8") as f:
+            hermetic_agents_json = f.read()
+        argv += ["--agents", hermetic_agents_json]
     if hermetic_settings_file:
         argv += ["--settings", hermetic_settings_file]
     return _run(argv, cwd=worktree, timeout=timeout_seconds, input_text=prompt)
@@ -1651,18 +1660,25 @@ def extract_claude_session_start_identity(stdout: str) -> dict:
     hook -- rather than ``SubagentStart``/``SubagentStop`` (a spawned
     child's lifecycle). Returns ``{"agent_type", "source"}``; both ``None``
     when no SessionStart evidence is present (fail-closed, never a guess)."""
+    # Issue #2046 PR #2047 review finding: unlike SubagentStart (where the
+    # ``hook_name`` suffix genuinely encodes the spawned subagent_type),
+    # SessionStart's ``hook_name`` suffix is the session *source* -- one of
+    # ``startup``/``resume``/``clear``/``compact`` (confirmed against a real
+    # ``claude --agent issue-creator ...`` invocation, which emitted
+    # ``hook_name: "SessionStart:startup"`` regardless of the requested
+    # persona). Treating that suffix as the observed agent_type would be a
+    # confidently-wrong ``status: observed`` false positive -- exactly the
+    # failure mode AC1 exists to prevent. The only legitimate signal is a
+    # SessionStart hook script that echoes ``agent_type`` as embedded JSON on
+    # its own stdout/output; no such hook is registered in this repo's
+    # ``.claude/settings.json`` today, so ``observed`` stays honestly
+    # ``unavailable`` rather than a fabricated match.
     result: dict = {"agent_type": None, "source": None}
-    hook_name_agent_type: str | None = None
     for payload in _iter_claude_stream_events(stdout):
         if payload.get("type") != "system":
             continue
         if payload.get("hook_event") != _CLAUDE_SESSION_START_HOOK_EVENT:
             continue
-        hook_name = payload.get("hook_name")
-        if isinstance(hook_name, str) and hook_name.startswith(f"{_CLAUDE_SESSION_START_HOOK_EVENT}:"):
-            suffix = hook_name.split(":", 1)[1].strip()
-            if suffix and hook_name_agent_type is None:
-                hook_name_agent_type = suffix
         for key in ("stdout", "output"):
             text = payload.get(key)
             if not isinstance(text, str) or not text.strip():
@@ -1674,9 +1690,6 @@ def extract_claude_session_start_identity(stdout: str) -> dict:
             if isinstance(agent_type, str) and agent_type and result["agent_type"] is None:
                 result["agent_type"] = agent_type
                 result["source"] = AGENT_TYPE_SOURCE_HOOK_PAYLOAD
-    if result["agent_type"] is None and hook_name_agent_type is not None:
-        result["agent_type"] = hook_name_agent_type
-        result["source"] = AGENT_TYPE_SOURCE_HOOK_NAME
     return result
 
 
