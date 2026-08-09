@@ -184,6 +184,66 @@ class TestArtifactMaterializationBoundedPoll:
         assert "child_completed_but_artifact_not_materialized" in kinds
 
 
+class TestMaterializationRaceIsRetriedRegardlessOfWhichFailureClassItProduces:
+    """Issue #2015 P1 fix (control-plane live re-run + live repro, head
+    ffad6201, 2026-08-09): a genuine artifact-materialization race
+    (``child_completed_but_artifact_not_materialized``) does not always
+    surface as ``failure_class: validation_failed`` -- when
+    ``delegation_request.json`` (an INDEPENDENT, unaffected-by-this-race
+    file) is present and well-formed, the SAME missing-result-file
+    condition instead falls through the classification priority chain to
+    ``selected_provider != "agy"`` (``None`` because there was never a
+    result file to read) and is misclassified as ``provider_mismatch`` --
+    a failure_class the retry-eligibility check was previously NOT scoped
+    to, so this genuine infrastructure race got zero retry chance. Live-
+    reproduced on this exact head/route (3rd of 3 consecutive live
+    ``codex_cli``/``local_asset_research`` attempts): a trial with
+    ``child_completion_observed: true``,
+    ``evidence_materialized_elapsed_sec: 85.4`` (full poll exhausted, no
+    result file ever appeared), ``request.validation: "pass"``, and
+    ``failure_class: "provider_mismatch"`` with only a single (non-
+    retried) attempt recorded."""
+
+    def test_provider_mismatch_from_missing_result_file_is_retry_eligible(
+        self, producer, tmp_path, monkeypatch
+    ):
+        clock = _FakeClock(step=1.0)
+        monkeypatch.setattr(producer.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(producer.time, "sleep", clock.sleep)
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        monkeypatch.setattr(
+            producer.subprocess,
+            "run",
+            _fake_harness_run(
+                harness_summary={
+                    "native_spawn_event_observed": True,
+                    "parent_session_id": "parent-1",
+                    "child_session_id": "child-1",
+                    "child_spawn_observed": True,
+                    "child_completion_observed": True,
+                    "child_completion_source": "hook_subagent_stop",
+                },
+                # Only the request evidence materializes -- the result
+                # file never appears, exactly the live-reproduced race.
+                evidence_files={"delegation_request.json": _PASS_REQUEST_JSON},
+            ),
+        )
+        artifact, diagnostics = producer.run_route_live(
+            route, repo_root=REPO_ROOT, worktree=REPO_ROOT,
+            output_root=tmp_path, timeout_seconds=60,
+        )
+        assert artifact["status"] == "fail"
+        assert artifact["failure_class"] == "provider_mismatch"
+        kinds = [f["kind"] for f in diagnostics["secondary_failures"]]
+        assert "child_completed_but_artifact_not_materialized" in kinds
+        # The prior bug: this exact combination never retried (a single
+        # attempt only). Fixed: the retry-eligibility check now keys off
+        # the secondary failure regardless of failure_class, so a genuine
+        # second live attempt is given.
+        assert len(diagnostics["attempts"]) == 2
+        assert diagnostics["route_deadline_sec"] == 60
+
+
 class TestMaterializedButFailedResultIsNeverTreatedAsARace:
     """Issue #2015 P1 fix (control-plane live re-run + live repro on head
     66baca32, 2026-08-09): a ``delegation_result.json`` that is ALREADY

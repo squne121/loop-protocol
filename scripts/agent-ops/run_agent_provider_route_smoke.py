@@ -501,7 +501,47 @@ def _is_transient_infrastructure_candidate(
 ) -> bool:
     if route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed":
         return True
-    if failure_class == "validation_failed" and diagnostics is not None:
+    # Issue #2015 P1 fix (control-plane live re-run + live repro, head
+    # ffad6201, 2026-08-09): the artifact-materialization race this
+    # secondary failure flags (the child genuinely completed per the
+    # harness's own completion signal, but ``delegation_result.json``
+    # never appeared even after the full bounded poll) does NOT always
+    # surface as ``failure_class: validation_failed`` -- that is only true
+    # when ``request_validation`` (an INDEPENDENT check of the SEPARATE
+    # ``delegation_request.json`` file, unaffected by this exact race)
+    # also happens to be something other than "pass". When
+    # ``request_validation`` is "pass", the very same missing-result-file
+    # condition instead falls through the classification priority chain in
+    # ``_run_route_once`` to ``selected_provider != "agy"`` --
+    # ``selected_provider`` is ``None`` because there was never a file to
+    # read, not because a genuinely-read result disagreed with the
+    # expected provider -- and is misclassified as ``provider_mismatch``
+    # (or, for a github_research route, ``route_evidence_schema_mismatch``
+    # via the same missing-file ``route_evidence_sha256 is None`` branch).
+    # These are DIFFERENT failure_class labels than the one this retry-
+    # eligibility check was previously scoped to, so a genuine
+    # infrastructure race got zero retry chance purely because of
+    # incidental check ordering downstream of the missing result file.
+    # Live-reproduced on this exact head/route (3rd of 3 consecutive live
+    # ``codex_cli``/``local_asset_research`` attempts): a trial with
+    # ``child_completion_observed: true``,
+    # ``evidence_materialized_elapsed_sec: 85.4`` (the full bounded poll
+    # was exhausted; ``delegation_result.json`` never appeared),
+    # ``request.validation: "pass"``, ending in
+    # ``failure_class: "provider_mismatch"`` with only a single
+    # (non-retried) attempt recorded in the diagnostics ledger.
+    #
+    # Deliberately NOT extended to ``gemini_invoked`` /
+    # ``direct_fallback_invoked`` -- those are independent, deterministic
+    # policy-violation signals (a literal forbidden-binary sentinel hit,
+    # recorded during the SAME already-completed subprocess run) that take
+    # priority over this marker in ``_run_route_once`` regardless of
+    # ``delegation_result.json`` state; retrying a genuine policy
+    # violation would not resolve it and would only burn route budget.
+    _MISSING_RESULT_FILE_FAILURE_CLASSES = frozenset(
+        {"validation_failed", "provider_mismatch", "route_evidence_schema_mismatch"}
+    )
+    if failure_class in _MISSING_RESULT_FILE_FAILURE_CLASSES and diagnostics is not None:
         secondary_failures = diagnostics.get("secondary_failures") or []
         if any(
             isinstance(entry, dict)

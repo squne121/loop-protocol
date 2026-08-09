@@ -535,11 +535,26 @@ class TestProducerRetryPolicy:
             is True
         )
 
-    def test_child_completed_marker_never_promotes_a_different_failure_class(self, producer):
-        """The diagnostic-marker path is scoped to ``validation_failed``
-        only -- it must never make an unrelated failure_class (e.g.
-        ``provider_mismatch``, ``gemini_invoked``) transient just because
-        the marker happens to be present in secondary_failures."""
+    def test_child_completed_marker_never_promotes_a_deterministic_policy_violation(
+        self, producer
+    ):
+        """Issue #2015 P1 fix (control-plane live re-run + live repro, head
+        ffad6201, 2026-08-09): the diagnostic marker's retry-eligibility
+        was originally scoped to ``validation_failed`` only, on the (since
+        live-disproven) assumption that ``provider_mismatch`` could not
+        also stem from the same missing-result-file race -- a live
+        ``codex_cli``/``local_asset_research`` repro on this head showed
+        the identical ``child_completed_but_artifact_not_materialized``
+        condition surfacing as ``failure_class: provider_mismatch``
+        instead (see ``_is_transient_infrastructure_candidate``'s own
+        docstring/comment for the exact reproduced diagnostics). It is
+        therefore now retry-eligible. What must still NEVER be promoted is
+        a deterministic, independent policy-violation signal such as
+        ``gemini_invoked`` (a literal forbidden-binary sentinel hit,
+        recorded during the SAME already-completed subprocess run,
+        unrelated to and always checked ahead of
+        ``delegation_result.json`` state) -- retrying that would not
+        resolve it and would only burn route budget."""
         route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         diagnostics = {
             "secondary_failures": [
@@ -548,7 +563,7 @@ class TestProducerRetryPolicy:
         }
         assert (
             producer._is_transient_infrastructure_candidate(route, "provider_mismatch", diagnostics)
-            is False
+            is True
         )
         assert (
             producer._is_transient_infrastructure_candidate(route, "gemini_invoked", diagnostics)
