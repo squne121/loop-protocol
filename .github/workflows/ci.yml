@@ -1262,6 +1262,13 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      # Issue #2019 P0-5 (V2 manifest): this job's "Build ... manifest" step
+      # now invokes `uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py`
+      # (the governed Python invocation policy, #1193) instead of a bare
+      # inline `python3 - <<'PY'` heredoc -- `uv` is not preinstalled in the
+      # Playwright container image this job runs in, so it must be set up
+      # explicitly here (unlike jobs that run directly on `ubuntu-latest`).
+      - uses: ./.github/actions/setup-python-uv
       - name: Enable pnpm via corepack
         run: |
           corepack enable pnpm
