@@ -184,6 +184,65 @@ class TestArtifactMaterializationBoundedPoll:
         assert "child_completed_but_artifact_not_materialized" in kinds
 
 
+class TestMaterializedButFailedResultIsNeverTreatedAsARace:
+    """Issue #2015 P1 fix (control-plane live re-run + live repro on head
+    66baca32, 2026-08-09): a ``delegation_result.json`` that is ALREADY
+    present on disk (never required any poll wait) but whose own ``ok``
+    field is ``false`` must never be classified as
+    ``child_completed_but_artifact_not_materialized`` -- that classification
+    is reserved for a genuine filesystem-visibility race (the file was not
+    yet there), never for a fully-materialized, honestly-reported failure
+    result. Conflating the two previously made a genuine, non-transient
+    failure retry-eligible, and the retry reproduced the identical failure,
+    burning the entire route budget (observed live: 300.03s,
+    validation_failed, retrieval_status=None on BOTH attempts)."""
+
+    def test_immediately_present_ok_false_result_is_not_a_materialization_race(
+        self, producer, tmp_path, monkeypatch
+    ):
+        clock = _FakeClock(step=1.0)
+        monkeypatch.setattr(producer.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(producer.time, "sleep", clock.sleep)
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        monkeypatch.setattr(
+            producer.subprocess,
+            "run",
+            _fake_harness_run(
+                harness_summary={
+                    "native_spawn_event_observed": True,
+                    "parent_session_id": "parent-1",
+                    "child_session_id": "child-1",
+                    "child_spawn_observed": True,
+                    "child_completion_observed": True,
+                    "child_completion_source": "hook_subagent_stop",
+                },
+                evidence_files={
+                    "delegation_request.json": _PASS_REQUEST_JSON,
+                    "delegation_result.json": (
+                        '{"ok": false, "provider": "agy", '
+                        '"failure_class": "github_research_incomplete"}'
+                    ),
+                },
+            ),
+        )
+        artifact, diagnostics = producer.run_route_live(
+            route, repo_root=REPO_ROOT, worktree=REPO_ROOT,
+            output_root=tmp_path, timeout_seconds=60,
+        )
+        # The result WAS materialized (present from the very first check,
+        # never required a poll wait) -- only its content-level "ok" is
+        # false, which is an ordinary, non-transient validation failure.
+        assert diagnostics["evidence_materialized_elapsed_sec"] == 0.0
+        kinds = [f["kind"] for f in diagnostics["secondary_failures"]]
+        assert "child_completed_but_artifact_not_materialized" not in kinds
+        assert artifact["status"] == "fail"
+        assert artifact["failure_class"] == "validation_failed"
+        # Never retried -- a single attempt only, not the bounded-retry pair.
+        assert diagnostics["attempts"] == [
+            {"attempt": 1, "status": "fail", "failure_class": "validation_failed"}
+        ]
+
+
 class TestRouteLevelSharedDeadline:
     def test_retry_gets_a_shrunk_remaining_budget_not_a_fresh_full_timeout(
         self, producer, tmp_path, monkeypatch

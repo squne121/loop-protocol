@@ -683,10 +683,39 @@ def _run_route_once(
         # immediately visible to a SEPARATE reading process. Bounded poll
         # (never indefinite, never past the shared route deadline) before
         # concluding the artifact was never materialized at all.
-        if diagnostics["child_completion_observed"] and not wrapper_ok:
-            elapsed = _poll_for_file(evidence_dir / "delegation_result.json", deadline)
+        #
+        # Issue #2015 P1 fix (control-plane live re-run + live repro on head
+        # 66baca32, 2026-08-09): the PRIOR check here keyed off ``not
+        # wrapper_ok`` -- conflating two semantically different signals:
+        # (a) the artifact FILE genuinely not yet visible on disk (a real
+        # filesystem-visibility race, worth a bounded poll + retry), and
+        # (b) the artifact file ALREADY present with a fully-materialized
+        # ``ok: false`` payload (a genuine, non-transient failure -- e.g.
+        # a github_research route whose AGY turn loop honestly reports
+        # ``failure_class: github_research_incomplete`` because this smoke
+        # probe's own deliberately-trivial "Reply with the single word OK"
+        # prompt gives it nothing to execute). Both were previously tagged
+        # identically as ``child_completed_but_artifact_not_materialized``,
+        # so a genuine, already-written failure result was retried as if it
+        # were a materialization race -- the retry attempt reproduces the
+        # exact same deterministic-ish failure, burning the ENTIRE
+        # remaining route budget for nothing (observed live: 300.03s,
+        # validation_failed, retrieval_status=None on BOTH attempts;
+        # reproduced live on this same head via two concurrent
+        # ``codex_cli`` route-smoke invocations, evidence retained under
+        # this Issue's own scratch artifacts). ``artifact_materialized``
+        # now tracks FILE PRESENCE only, independent of ``wrapper_ok``'s
+        # content-level ``ok`` value -- only a genuinely absent file is
+        # polled/retried below; an already-materialized ``ok: false``
+        # result is classified as an ordinary (non-transient) validation
+        # failure further down, exactly as before.
+        result_path = evidence_dir / "delegation_result.json"
+        artifact_materialized = result_path.is_file()
+        if diagnostics["child_completion_observed"] and not artifact_materialized:
+            elapsed = _poll_for_file(result_path, deadline)
             diagnostics["evidence_materialized_elapsed_sec"] = elapsed
-            if elapsed > 0.0:
+            artifact_materialized = result_path.is_file()
+            if artifact_materialized:
                 selected_provider, provider_attempts, wrapper_ok = (
                     _validate_delegation_result_evidence(evidence_dir)
                 )
@@ -703,7 +732,14 @@ def _run_route_once(
         # poll above. Recorded regardless of which HIGHER-priority
         # failure_class branch below ultimately wins, so this detail is
         # never lost just because e.g. provider_mismatch also fired.
-        if diagnostics["child_completion_observed"] and not wrapper_ok:
+        #
+        # Issue #2015 P1 fix: keyed off ``artifact_materialized`` (file
+        # presence), never ``wrapper_ok`` (content-level success) -- see the
+        # comment above. A materialized ``ok: false`` result still fails
+        # (via the ``not wrapper_ok`` branch further below) but is never
+        # mislabeled -- and therefore never retried -- as a materialization
+        # race.
+        if diagnostics["child_completion_observed"] and not artifact_materialized:
             diagnostics["secondary_failures"].append(
                 {"kind": "child_completed_but_artifact_not_materialized"}
             )
