@@ -51,6 +51,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -561,7 +562,10 @@ _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON = json.dumps({
 
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            max_turns: int, claude_bin: str = "claude",
-                           claude_agent_name: str | None = None) -> tuple[int | None, str, str, bool]:
+                           claude_agent_name: str | None = None,
+                           hermetic_agents_file: str | None = None,
+                           hermetic_settings_file: str | None = None,
+                           ) -> tuple[int | None, str, str, bool]:
     argv = [
         claude_bin,
         "-p",
@@ -580,6 +584,27 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
     # default, so every pre-existing caller's argv is unchanged.
     if claude_agent_name:
         argv += ["--agent", claude_agent_name]
+    # Issue #2046 AC2/AC5: purely additive, opt-in hermetic no-mutation lane.
+    # ``hermetic_agents_file`` points at a session-local JSON file (built
+    # deterministically from the candidate Agent definition's own source
+    # sha256, see ``resolve_agent_definition``) supplying the session-local
+    # persona named by ``claude_agent_name`` above; ``hermetic_settings_file``
+    # points at a session-local settings JSON restricting the tool surface to
+    # Read only. Both are omitted for every pre-existing (non-hermetic)
+    # caller, so their argv is unchanged.
+    if hermetic_agents_file:
+        # Claude Code --agents expects an inline JSON object literal (per
+        # `claude --help`), not a file path -- unlike --settings, which
+        # documents "file-or-json" and accepts either. Passing a bare path
+        # here causes the CLI to silently fail to register the custom
+        # agent, so --agent <name> then reports "not found" (Issue #2046
+        # PR #2047 review finding, confirmed against installed Claude Code
+        # 2.1.226 --help output).
+        with open(hermetic_agents_file, encoding="utf-8") as f:
+            hermetic_agents_json = f.read()
+        argv += ["--agents", hermetic_agents_json]
+    if hermetic_settings_file:
+        argv += ["--settings", hermetic_settings_file]
     return _run(argv, cwd=worktree, timeout=timeout_seconds, input_text=prompt)
 
 
@@ -648,6 +673,14 @@ _CLAUDE_FIXED_ARGV_FLAGS = (
     "--output-format",
     "--include-hook-events",
     "--no-session-persistence",
+    # Issue #2046 AC2/AC5: the hermetic no-mutation lane's session-local
+    # `--agents` / `--settings` payload flags. Adding them here means an
+    # unrecognized-option rejection naming either flag is classified as a
+    # capability SKIP (exit 77), never a generic runtime FAIL -- a real
+    # Claude Code version that does not support these flags degrades to
+    # SKIP, exactly like the pre-existing fixed-argv flags above.
+    "--agents",
+    "--settings",
 )
 
 # Anchored to look like an actual CLI parser error line -- ``error:``
@@ -1774,6 +1807,427 @@ def classify_codex_events(stdout: str) -> tuple[list[dict], int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Main-session agent identity / definition binding / Skill evidence /
+# canonical Read receipt / mutation boundary / settings provenance
+# (Issue #2046 -- continues Issue #1978's research gap: #2021/#2025/#2027
+# implemented SPAWNED child-agent identity evidence; the MAIN session that
+# launched itself had no equivalent evidence channel until now).
+# ---------------------------------------------------------------------------
+
+# Every new evidence sub-field's "status" is drawn from exactly this set
+# (Issue #2046 AC9): a declared static fact, a directly runtime-observed
+# fact, a fact derived from other observed evidence (never itself directly
+# observed), or unavailable. Never a fabricated/guessed value.
+EVIDENCE_STATUS_DECLARED = "declared"
+EVIDENCE_STATUS_OBSERVED = "observed"
+EVIDENCE_STATUS_DERIVED = "derived_from_observed"
+EVIDENCE_STATUS_UNAVAILABLE = "unavailable"
+
+_CLAUDE_SESSION_START_HOOK_EVENT = "SessionStart"
+
+# The canonical Skill body each in-scope persona is expected to Read (Issue
+# #2046 AC4, Outcome). Scoped narrowly to the two personas this Issue's
+# Outcome names; any other ``--claude-agent-name`` has no canonical target
+# and ``canonical_read`` stays ``unavailable`` (fail-closed, never guessed).
+_PERSONA_CANONICAL_SKILL_PATH = {
+    "issue-creator": ".claude/skills/create-issue/SKILL.md",
+    "issue-editor": ".claude/skills/edit-issue/SKILL.md",
+}
+
+# Tool names capable of mutating repository/filesystem state or spawning a
+# nested agent (Issue #2046 AC5). Deliberately excludes Read/Glob/Grep/
+# WebFetch/WebSearch -- observing ANY of these tool_use blocks during a
+# hermetic no-mutation lane run is FAIL, never a warning.
+_MUTATION_CAPABLE_CLAUDE_TOOL_NAMES = frozenset(
+    {"Edit", "MultiEdit", "Write", "NotebookEdit", "Bash", "Agent"}
+)
+
+
+def extract_claude_session_start_identity(stdout: str) -> dict:
+    """Runtime-observed main-session identity from the ``SessionStart`` hook
+    lifecycle channel (Issue #2046 AC1). Mirrors
+    ``extract_claude_hook_agent_identity``'s two sub-channels (the official
+    hook stdin payload, and the ``"<HookEvent>:<agent_type>"`` hook_name
+    label) but scoped to ``SessionStart`` -- the MAIN session's own startup
+    hook -- rather than ``SubagentStart``/``SubagentStop`` (a spawned
+    child's lifecycle). Returns ``{"agent_type", "source"}``; both ``None``
+    when no SessionStart evidence is present (fail-closed, never a guess)."""
+    # Issue #2046 PR #2047 review finding: unlike SubagentStart (where the
+    # ``hook_name`` suffix genuinely encodes the spawned subagent_type),
+    # SessionStart's ``hook_name`` suffix is the session *source* -- one of
+    # ``startup``/``resume``/``clear``/``compact`` (confirmed against a real
+    # ``claude --agent issue-creator ...`` invocation, which emitted
+    # ``hook_name: "SessionStart:startup"`` regardless of the requested
+    # persona). Treating that suffix as the observed agent_type would be a
+    # confidently-wrong ``status: observed`` false positive -- exactly the
+    # failure mode AC1 exists to prevent. The only legitimate signal is a
+    # SessionStart hook script that echoes ``agent_type`` as embedded JSON on
+    # its own stdout/output; no such hook is registered in this repo's
+    # ``.claude/settings.json`` today, so ``observed`` stays honestly
+    # ``unavailable`` rather than a fabricated match.
+    result: dict = {"agent_type": None, "source": None}
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "system":
+            continue
+        if payload.get("hook_event") != _CLAUDE_SESSION_START_HOOK_EVENT:
+            continue
+        for key in ("stdout", "output"):
+            text = payload.get(key)
+            if not isinstance(text, str) or not text.strip():
+                continue
+            parsed = _parse_embedded_json_object(text)
+            if parsed is None:
+                continue
+            agent_type = parsed.get("agent_type")
+            if isinstance(agent_type, str) and agent_type and result["agent_type"] is None:
+                result["agent_type"] = agent_type
+                result["source"] = AGENT_TYPE_SOURCE_HOOK_PAYLOAD
+    return result
+
+
+def build_main_agent_identity(requested_agent_name: str | None, stdout: str | None) -> dict:
+    """Issue #2046 AC1: ``main_agent_identity.requested`` / ``.observed`` /
+    ``.matched``, evidence-separated so a model self-report can never fill
+    ``observed``. ``requested`` is derived purely from runner argv
+    (``--claude-agent-name``, never the CLI's own text output); ``observed``
+    is derived purely from the ``SessionStart`` hook channel. A missing hook,
+    a missing ``agent_type``, or a mismatch is recorded honestly -- never
+    silently promoted to ``matched: true``."""
+    requested = {"agent_name": requested_agent_name, "source": "runner_argv"}
+    if requested_agent_name is None:
+        return {
+            "requested": requested,
+            "observed": {"agent_type": None, "source": None, "status": EVIDENCE_STATUS_UNAVAILABLE},
+            "matched": False,
+            "status": EVIDENCE_STATUS_UNAVAILABLE,
+        }
+    observed_identity = (
+        extract_claude_session_start_identity(stdout)
+        if stdout is not None
+        else {"agent_type": None, "source": None}
+    )
+    observed_status = (
+        EVIDENCE_STATUS_OBSERVED if observed_identity["agent_type"] is not None else EVIDENCE_STATUS_UNAVAILABLE
+    )
+    matched = (
+        observed_status == EVIDENCE_STATUS_OBSERVED
+        and observed_identity["agent_type"] == requested_agent_name
+    )
+    return {
+        "requested": requested,
+        "observed": {**observed_identity, "status": observed_status},
+        "matched": matched,
+        "status": observed_status,
+    }
+
+
+def compute_hermetic_agents_payload(
+    worktree: str, agent_name: str, source_sha256: str
+) -> tuple[dict | None, str | None]:
+    """Deterministically build a session-local ``--agents`` payload from the
+    candidate Agent definition's static frontmatter (Issue #2046 AC2). The
+    generated agent's own name embeds the source file's sha256 prefix, so a
+    changed candidate definition never collides with a stale session-local
+    name from a previous run against the same persona. Returns ``(payload,
+    session_local_agent_name)`` or ``(None, None)`` when the frontmatter
+    cannot be parsed."""
+    agent_md = Path(worktree) / ".claude" / "agents" / f"{agent_name}.md"
+    try:
+        text = agent_md.read_text(encoding="utf-8")
+    except OSError:
+        return None, None
+    if not text.startswith("---\n"):
+        return None, None
+    _, _, remainder = text.partition("---\n")
+    frontmatter_text, sep, body = remainder.partition("\n---\n")
+    if not sep:
+        return None, None
+    try:
+        frontmatter = yaml.safe_load(frontmatter_text)
+    except yaml.YAMLError:
+        return None, None
+    if not isinstance(frontmatter, dict):
+        return None, None
+    description = frontmatter.get("description")
+    session_local_name = f"{agent_name}-hermetic-{source_sha256[:12]}"
+    payload = {
+        session_local_name: {
+            "description": description if isinstance(description, str) else agent_name,
+            "prompt": body.strip(),
+            # Hermetic no-mutation lane (AC5): tools are deliberately fixed
+            # to Read only, regardless of what the candidate definition's
+            # own `tools:` frontmatter declares -- this lane exists to
+            # bound the mutation surface for evidence collection, not to
+            # reproduce production permissions (see AC10/`production_
+            # settings_lane`: that remains #1881's scope).
+            "tools": ["Read"],
+        }
+    }
+    return payload, session_local_name
+
+
+def resolve_agent_definition(
+    worktree: str, agent_name: str | None, hermetic: bool
+) -> tuple[dict, dict | None, str | None]:
+    """Issue #2046 AC2. Returns ``(agent_definition_summary,
+    hermetic_agents_payload_or_None, hermetic_session_local_agent_name_or_None)``."""
+    if not agent_name:
+        return (
+            {
+                "intended_repo_path": None,
+                "intended_sha256": None,
+                "binding_mode": None,
+                "status": EVIDENCE_STATUS_UNAVAILABLE,
+            },
+            None,
+            None,
+        )
+    repo_rel_path = f".claude/agents/{agent_name}.md"
+    agent_md = Path(worktree) / repo_rel_path
+    try:
+        source_sha256 = hashlib.sha256(agent_md.read_bytes()).hexdigest()
+    except OSError:
+        source_sha256 = None
+
+    if not hermetic:
+        return (
+            {
+                "intended_repo_path": repo_rel_path if source_sha256 is not None else None,
+                "intended_sha256": source_sha256,
+                "binding_mode": "project_discovery",
+                # Claude Code's project-discovery `--agent <name>` lookup
+                # resolves `.claude/agents/<name>.md` internally; this
+                # runner has no channel to independently confirm exactly
+                # which on-disk version it actually loaded, so the
+                # *effective* source stays unavailable even though the
+                # *intended* source (this worktree's own file) is recorded
+                # above.
+                "status": EVIDENCE_STATUS_UNAVAILABLE,
+            },
+            None,
+            None,
+        )
+
+    if source_sha256 is None:
+        return (
+            {
+                "intended_repo_path": None,
+                "intended_sha256": None,
+                "binding_mode": "hermetic",
+                "status": EVIDENCE_STATUS_UNAVAILABLE,
+            },
+            None,
+            None,
+        )
+    payload, session_local_name = compute_hermetic_agents_payload(worktree, agent_name, source_sha256)
+    if payload is None:
+        return (
+            {
+                "intended_repo_path": repo_rel_path,
+                "intended_sha256": source_sha256,
+                "binding_mode": "hermetic",
+                "status": EVIDENCE_STATUS_UNAVAILABLE,
+            },
+            None,
+            None,
+        )
+    payload_digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return (
+        {
+            "intended_repo_path": repo_rel_path,
+            "intended_sha256": source_sha256,
+            "binding_mode": "hermetic",
+            "hermetic_payload_sha256": payload_digest,
+            "hermetic_agent_name": session_local_name,
+            # This payload is deterministically constructed by this runner
+            # itself (not observed from a runtime channel) -- a declared
+            # fact, exactly like the static frontmatter declaration below.
+            "status": EVIDENCE_STATUS_DECLARED,
+        },
+        payload,
+        session_local_name,
+    )
+
+
+def extract_claude_canonical_read_receipt(
+    stdout: str, worktree: str, expected_rel_path: str | None
+) -> dict:
+    """Issue #2046 AC4: independent, tool_use/tool_result-grounded evidence
+    that the persona's canonical Skill body was actually Read via the Read
+    tool -- never a marker string, never a self-report. Requires ALL of: a
+    normalized repo-relative path that matches ``expected_rel_path``
+    exactly, a matching ``tool_use_id`` between the Read ``tool_use`` and
+    its ``tool_result``, and a non-error ``tool_result``. A path outside
+    the expected target, a failed Read result, or an unmatched
+    ``tool_use_id`` all fail closed to ``unavailable`` -- never ``observed``."""
+    receipt: dict = {
+        "expected_repo_relative_path": expected_rel_path,
+        "expected_sha256": None,
+        "observed_repo_relative_path": None,
+        "tool_name": None,
+        "tool_use_id": None,
+        "read_result_status": None,
+        "status": EVIDENCE_STATUS_UNAVAILABLE,
+    }
+    if not expected_rel_path:
+        return receipt
+    expected_path = Path(worktree) / expected_rel_path
+    try:
+        receipt["expected_sha256"] = hashlib.sha256(expected_path.read_bytes()).hexdigest()
+    except OSError:
+        return receipt
+
+    pending_read_tool_use_ids: dict[str, str] = {}
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") == "assistant":
+            message = payload.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use" or block.get("name") != "Read":
+                    continue
+                tool_input = block.get("input")
+                raw_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+                if not isinstance(raw_path, str) or not raw_path:
+                    continue
+                candidate_abs = raw_path if os.path.isabs(raw_path) else os.path.join(worktree, raw_path)
+                try:
+                    normalized = os.path.relpath(os.path.realpath(candidate_abs), os.path.realpath(worktree))
+                except ValueError:
+                    continue
+                tool_use_id = block.get("id")
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    pending_read_tool_use_ids[tool_use_id] = normalized
+        elif payload.get("type") == "user":
+            message = payload.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if not isinstance(tool_use_id, str) or tool_use_id not in pending_read_tool_use_ids:
+                    continue
+                normalized_path = pending_read_tool_use_ids[tool_use_id]
+                if normalized_path != expected_rel_path:
+                    continue
+                is_error = bool(block.get("is_error"))
+                receipt["observed_repo_relative_path"] = normalized_path
+                receipt["tool_name"] = "Read"
+                receipt["tool_use_id"] = tool_use_id
+                receipt["read_result_status"] = "error" if is_error else "success"
+                if not is_error:
+                    receipt["status"] = EVIDENCE_STATUS_OBSERVED
+                    return receipt
+    return receipt
+
+
+def build_skill_evidence(agent_name: str | None, worktree: str, stdout: str | None) -> dict:
+    """Issue #2046 AC3: declaration/preload/canonical_read kept as three
+    strictly separate sub-objects, each with its own honest ``status`` --
+    a declared frontmatter fact must never be presented as an observed
+    runtime fact, and vice versa."""
+    declared_skills = load_static_declared_skills(worktree, agent_name) if agent_name else None
+    declaration = {
+        "skills": declared_skills,
+        "source": "agent_frontmatter",
+        "status": EVIDENCE_STATUS_DECLARED if declared_skills is not None else EVIDENCE_STATUS_UNAVAILABLE,
+    }
+    # No native stream-json event independently confirms Skill *preload*
+    # (as opposed to an explicit Read tool_use) in this repository's own
+    # observed runtime state -- Claude Code has no documented preload-
+    # confirmation event. This is left honestly `unavailable` rather than
+    # disguised as `observed` (AC3: "preload が observed と偽装されていない").
+    preload = {"status": EVIDENCE_STATUS_UNAVAILABLE, "source": None}
+    expected_rel_path = _PERSONA_CANONICAL_SKILL_PATH.get(agent_name or "")
+    canonical_read = extract_claude_canonical_read_receipt(stdout or "", worktree, expected_rel_path)
+    return {"declaration": declaration, "preload": preload, "canonical_read": canonical_read}
+
+
+def count_mutation_capable_tool_events(stdout: str) -> list[dict]:
+    """Issue #2046 AC5: enumerate every mutation-capable ``tool_use`` block
+    observed in the native stream. Any non-empty result is FAIL for a
+    hermetic no-mutation lane run -- never a warning."""
+    events: list[dict] = []
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "assistant":
+            continue
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name")
+            if name in _MUTATION_CAPABLE_CLAUDE_TOOL_NAMES:
+                events.append({"tool": name})
+    return events
+
+
+def build_mutation_boundary(
+    hermetic: bool, settings_digest: str | None, effective_argv: list[str] | None, stdout: str | None,
+) -> dict:
+    """Issue #2046 AC5. Only populated for a hermetic no-mutation lane run
+    (``hermetic=True``); a non-hermetic run has no session-local settings
+    boundary to report and stays honestly ``unavailable``."""
+    if not hermetic:
+        return {
+            "settings_source": None,
+            "settings_digest_sha256": None,
+            "effective_argv": None,
+            "mutation_capable_tool_events": [],
+            "mutation_capable_tool_event_count": None,
+            "status": EVIDENCE_STATUS_UNAVAILABLE,
+        }
+    events = count_mutation_capable_tool_events(stdout or "")
+    return {
+        "settings_source": "session_local_generated",
+        "settings_digest_sha256": settings_digest,
+        "effective_argv": [_redact(a) for a in effective_argv] if effective_argv else None,
+        "mutation_capable_tool_events": events,
+        "mutation_capable_tool_event_count": len(events),
+        "status": EVIDENCE_STATUS_OBSERVED if stdout is not None else EVIDENCE_STATUS_UNAVAILABLE,
+    }
+
+
+def build_hermetic_settings_payload() -> dict:
+    """Issue #2046 AC5: session-local settings restricting the tool surface
+    to Read only, independent of (and never mutating) any project-level
+    ``.claude/settings.json``. Deliberately narrow and fixed -- not
+    configurable per caller -- because this lane's entire purpose is to
+    bound the mutation surface for evidence collection."""
+    return {
+        "permissions": {
+            "allow": ["Read(*)"],
+            "deny": ["Edit(*)", "MultiEdit(*)", "Write(*)", "NotebookEdit(*)", "Bash(*)", "Agent(*)"],
+        }
+    }
+
+
+def build_settings_provenance(worktree: str, hermetic: bool, settings_digest: str | None) -> dict:
+    """Issue #2046 Outcome item (6): settings provenance, separated from
+    ``mutation_boundary`` so a caller can inspect "which settings source was
+    effective" without conflating it with the mutation-event evidence."""
+    if hermetic:
+        return {
+            "source": "session_local_generated",
+            "digest_sha256": settings_digest,
+            "status": EVIDENCE_STATUS_DECLARED if settings_digest else EVIDENCE_STATUS_UNAVAILABLE,
+        }
+    settings_path = Path(worktree) / ".claude" / "settings.json"
+    try:
+        digest = hashlib.sha256(settings_path.read_bytes()).hexdigest()
+    except OSError:
+        return {"source": "project_default", "digest_sha256": None, "status": EVIDENCE_STATUS_UNAVAILABLE}
+    return {"source": "project_default", "digest_sha256": digest, "status": EVIDENCE_STATUS_DECLARED}
+
+
+# ---------------------------------------------------------------------------
 # Interactive herdr lane — isolated named session (Issue #1921 P0-1..P0-4)
 # ---------------------------------------------------------------------------
 
@@ -2281,6 +2735,21 @@ def build_parser() -> argparse.ArgumentParser:
             "unchanged."
         ),
     )
+    parser.add_argument(
+        "--hermetic-agent-definition",
+        action="store_true",
+        help=(
+            "Issue #2046 AC2/AC5: opt-in hermetic no-mutation lane. Requires "
+            "--claude-agent-name (claude runtime + structured mode only). "
+            "Instead of the project-discovery `--agent <name>` lookup, "
+            "generates a session-local `--agents` JSON payload (deterministic "
+            "digest of the candidate Agent definition) with tools fixed to "
+            "Read only, plus a session-local `--settings` file denying every "
+            "mutation-capable tool, and records both digests plus the "
+            "observed mutation_capable_tool_event_count in evidence. Omitted "
+            "by default, so every pre-existing caller's argv is unchanged."
+        ),
+    )
     return parser
 
 
@@ -2481,6 +2950,38 @@ def main(argv: list[str] | None = None) -> int:
     loaded_skills = load_static_declared_skills(worktree, requested_agent_type)
     prompt_sha256 = compute_prompt_sha256(prompt)
 
+    # Issue #2046: main-session agent identity / definition binding / Skill
+    # evidence / mutation boundary / settings provenance. Scoped to the
+    # claude runtime + the caller-supplied --claude-agent-name persona
+    # binding (the same flag Issue #1734 fix_delta 3 introduced) -- a run
+    # with no --claude-agent-name has nothing to bind identity to and every
+    # new field below stays honestly unavailable/not-requested.
+    hermetic_requested = bool(args.hermetic_agent_definition) and args.claude_agent_name is not None
+    agent_definition, hermetic_agents_payload, hermetic_agent_name = resolve_agent_definition(
+        worktree, args.claude_agent_name, hermetic_requested
+    )
+    hermetic_active = hermetic_requested and hermetic_agents_payload is not None
+    hermetic_settings_payload = build_hermetic_settings_payload() if hermetic_active else None
+    hermetic_settings_digest = (
+        hashlib.sha256(
+            json.dumps(hermetic_settings_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if hermetic_settings_payload is not None
+        else None
+    )
+    hermetic_tmp_dir: str | None = None
+    hermetic_agents_file: str | None = None
+    hermetic_settings_file: str | None = None
+    if hermetic_active:
+        # A system-temp directory (never inside the worktree), so writing
+        # these session-local files never perturbs the worktree's own
+        # postcondition fingerprint and is always cleaned up below.
+        hermetic_tmp_dir = tempfile.mkdtemp(prefix="worktree-agent-runtime-smoke-hermetic-")
+        hermetic_agents_file = str(Path(hermetic_tmp_dir) / "agents.json")
+        hermetic_settings_file = str(Path(hermetic_tmp_dir) / "settings.json")
+        Path(hermetic_agents_file).write_text(json.dumps(hermetic_agents_payload), encoding="utf-8")
+        Path(hermetic_settings_file).write_text(json.dumps(hermetic_settings_payload), encoding="utf-8")
+
     schema_summary: dict = {
         "schema": SCHEMA,
         "run_id": run_id,
@@ -2497,6 +2998,27 @@ def main(argv: list[str] | None = None) -> int:
         "loaded_skills": loaded_skills,
         "loaded_skills_source": "static_frontmatter" if loaded_skills is not None else None,
         "prompt_sha256": prompt_sha256,
+        "agent_definition": agent_definition,
+        # main_agent_identity / skill_evidence / mutation_boundary are
+        # placeholders here (no stdout captured yet); overwritten below with
+        # real evidence once the structured claude invocation completes.
+        "main_agent_identity": build_main_agent_identity(args.claude_agent_name, None),
+        "skill_evidence": build_skill_evidence(args.claude_agent_name, worktree, None),
+        "mutation_boundary": build_mutation_boundary(hermetic_active, hermetic_settings_digest, None, None),
+        "settings_provenance": build_settings_provenance(worktree, hermetic_active, hermetic_settings_digest),
+        # Issue #2046 AC10: #1881 (production settings lane, pr-reviewer
+        # persona safe Read/mutation-deny boundary) remains separately OPEN.
+        # This hermetic no-mutation lane's mutation_boundary/settings_
+        # provenance evidence is a session-local receipt only and must never
+        # be promoted to a production settings/permission claim until #1881
+        # merges.
+        "production_settings_lane": (
+            "deferred_to_#1881: hermetic mutation_boundary/settings_provenance "
+            "evidence in this run is not a production_settings_lane result and "
+            "must not be promoted to a production settings/permission claim "
+            "until #1881 (pr-reviewer persona safe Read/mutation-deny boundary) "
+            "merges"
+        ),
         **route_preflight,
     }
     if args.mode == "interactive":
@@ -2554,13 +3076,34 @@ def main(argv: list[str] | None = None) -> int:
             pass
         elif args.mode == "structured":
             if args.runtime == "claude":
+                effective_claude_agent_name = (
+                    hermetic_agent_name if hermetic_active else args.claude_agent_name
+                )
+                claude_invocation_argv_for_evidence = [
+                    resolved_runtime_bin or "claude", "-p", "--output-format", "stream-json",
+                    "--include-hook-events", "--no-session-persistence",
+                    "--max-turns", str(args.max_turns), "--verbose",
+                ]
+                if effective_claude_agent_name:
+                    claude_invocation_argv_for_evidence += ["--agent", effective_claude_agent_name]
+                if hermetic_active:
+                    claude_invocation_argv_for_evidence += ["--agents", hermetic_agents_file or ""]
+                    claude_invocation_argv_for_evidence += ["--settings", hermetic_settings_file or ""]
                 rc, out, err, timed_out = run_structured_claude(
                     worktree, prompt, float(args.timeout_seconds), args.max_turns,
                     claude_bin=resolved_runtime_bin,
-                    claude_agent_name=args.claude_agent_name,
+                    claude_agent_name=effective_claude_agent_name,
+                    hermetic_agents_file=hermetic_agents_file if hermetic_active else None,
+                    hermetic_settings_file=hermetic_settings_file if hermetic_active else None,
                 )
                 capability_decision, capability_reason = classify_claude_structured_outcome(
                     rc, out, err, timed_out
+                )
+                # Issue #2046: real evidence now that stdout is captured.
+                schema_summary["main_agent_identity"] = build_main_agent_identity(args.claude_agent_name, out)
+                schema_summary["skill_evidence"] = build_skill_evidence(args.claude_agent_name, worktree, out)
+                schema_summary["mutation_boundary"] = build_mutation_boundary(
+                    hermetic_active, hermetic_settings_digest, claude_invocation_argv_for_evidence, out
                 )
             else:
                 rc, out, err, timed_out = run_structured_codex(
@@ -2814,6 +3357,21 @@ def main(argv: list[str] | None = None) -> int:
                     errors.append("session-log metadata required but unavailable")
                     exit_code = EXIT_SKIP if exit_code == EXIT_OK else exit_code
 
+            if args.runtime == "claude" and hermetic_active:
+                # Issue #2046 AC5: fail-closed, unconditionally -- a
+                # hermetic no-mutation lane observing ANY mutation-capable
+                # tool_use event overrides even an otherwise-SKIP/OK
+                # classification. A mutation attempt is strictly worse than
+                # a capability gap and must never be silently absorbed by
+                # one.
+                mutation_event_count = schema_summary["mutation_boundary"]["mutation_capable_tool_event_count"]
+                if mutation_event_count:
+                    errors.append(
+                        "hermetic no-mutation lane observed mutation-capable tool "
+                        f"event(s): {schema_summary['mutation_boundary']['mutation_capable_tool_events']}"
+                    )
+                    exit_code = EXIT_FAIL
+
         else:  # interactive
             evidence = {
                 "session_name": None,
@@ -2891,6 +3449,9 @@ def main(argv: list[str] | None = None) -> int:
     except _TerminateRequested as exc:
         errors.append(f"runner terminated: {exc}")
         exit_code = EXIT_FAIL
+    finally:
+        if hermetic_tmp_dir is not None:
+            shutil.rmtree(hermetic_tmp_dir, ignore_errors=True)
 
     schema_summary["errors"] = errors
     schema_summary["exit_code"] = exit_code
