@@ -154,14 +154,19 @@ def test_registry_producer_router_consumer_bind_same_digest(tmp_path):
     loop_state_path.write_text(json.dumps({"iteration": 0, "max_iterations": 3}), encoding="utf-8")
     loop_state_relpath = loop_state_path.relative_to(REPO_ROOT)
 
+    # Issue #2053 P0 fix-delta (iteration 2): authority transport routing
+    # is wired directly into the canonical "decide.run" command (not a
+    # sibling ID) -- decide_next_loop_action.py's actual production
+    # invocation path carries the manifest.
     route = _run_registry_command(
-        "decide.run.with_authority_transport",
+        "decide.run",
         {
             "loop_state_file": str(loop_state_relpath),
             "verdict": "needs-fix",
             "max_iterations": 3,
             "issue_number": 2053,
             "authority_transport_manifest_path": manifest_path,
+            "authority_expected": True,
             "invocation_id": invocation_id,
             "git_head_sha": git_head_sha,
         },
