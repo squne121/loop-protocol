@@ -58,6 +58,7 @@ immediately regardless of test outcome.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import re
 import subprocess
@@ -106,6 +107,15 @@ _EXPECTED_FINGERPRINT_KEYS = {
     "base_sha_at_snapshot",
 }
 
+_DISPOSABLE_ISSUE_BODY = (
+    "Disposable live-test Issue created by "
+    "test_ensure_contract_snapshot_fingerprint_patch.py (Issue #1562 "
+    "AC1/AC3 runtime verification). Safe to ignore; closed automatically "
+    "by the test's cleanup step regardless of outcome.\n\n"
+    "## Allowed Paths\n\n"
+    "- README.md\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Live-environment preflight + disposable Issue helpers
@@ -140,21 +150,13 @@ def _create_disposable_issue(title: str) -> Optional[int]:
     ensure_contract_snapshot's pre-POST canonicalization gate). Returns the
     issue number, or None on failure.
     """
-    body = (
-        "Disposable live-test Issue created by "
-        "test_ensure_contract_snapshot_fingerprint_patch.py (Issue #1562 "
-        "AC1/AC3 runtime verification). Safe to ignore; closed automatically "
-        "by the test's cleanup step regardless of outcome.\n\n"
-        "## Allowed Paths\n\n"
-        "- README.md\n"
-    )
     try:
         result = subprocess.run(
             [
                 "gh", "issue", "create",
                 "--repo", _REPO,
                 "--title", title,
-                "--body", body,
+                "--body", _DISPOSABLE_ISSUE_BODY,
             ],
             capture_output=True,
             text=True,
@@ -225,6 +227,9 @@ def _make_review_result_for_live_test() -> dict:
     TestFingerprintMaterializeEndToEnd coverage in
     test_ensure_contract_snapshot.py.
     """
+    body_sha256 = "sha256:" + hashlib.sha256(
+        _DISPOSABLE_ISSUE_BODY.encode("utf-8")
+    ).hexdigest()
     return {
         "schema": "CONTRACT_REVIEW_ONCE_RESULT_V1",
         "status": "go",
@@ -240,6 +245,11 @@ def _make_review_result_for_live_test() -> dict:
                 "triggers": {},
                 "conditions": {},
                 "blocked_reasons": [],
+                "body_sha256": body_sha256,
+                "source_provenance": {
+                    "source_type": "github_issue_body",
+                    "body_file": None,
+                },
             },
             "vc_preflight": "pass",
         },

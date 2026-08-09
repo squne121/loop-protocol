@@ -149,28 +149,60 @@ def _json_flow_collection_depth(value: str) -> int:
     return maximum
 
 
+def _parse_bounded_strict_json_collection(value: str) -> Any:
+    """Parse one producer-designated JSON collection without weakening bounds."""
+    if len(value) > _MAX_JSON_FLOW_COLLECTION_CHARS:
+        raise SimpleYamlParseError("json_flow_collection_too_large")
+    if _json_flow_collection_depth(value) > _MAX_JSON_FLOW_COLLECTION_DEPTH:
+        raise SimpleYamlParseError("json_flow_collection_too_deep")
+    try:
+        return json.loads(
+            value,
+            parse_constant=_reject_nonstandard_json_constant,
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except SimpleYamlParseError:
+        raise
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise SimpleYamlParseError("invalid_json_flow_collection") from exc
+
+
 def _parse_fallback_scalar(value: str) -> Any:
     """Parse bounded, strict JSON flow collections in an otherwise scalar fallback."""
     if value.startswith(("{", "[")):
-        if len(value) > _MAX_JSON_FLOW_COLLECTION_CHARS:
-            raise SimpleYamlParseError("json_flow_collection_too_large")
-        if _json_flow_collection_depth(value) > _MAX_JSON_FLOW_COLLECTION_DEPTH:
-            raise SimpleYamlParseError("json_flow_collection_too_deep")
-        try:
-            return json.loads(
-                value,
-                parse_constant=_reject_nonstandard_json_constant,
-                object_pairs_hook=_reject_duplicate_json_keys,
-            )
-        except SimpleYamlParseError:
-            raise
-        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
-            raise SimpleYamlParseError("invalid_json_flow_collection") from exc
+        return _parse_bounded_strict_json_collection(value)
     if (value.startswith('"') and value.endswith('"')) or (
         value.startswith("'") and value.endswith("'")
     ):
-        return value[1:-1]
+        # YAML single-quoted scalars encode apostrophes by doubling them.
+        return value[1:-1].replace("''", "'") if value.startswith("'") else value[1:-1]
     return value
+
+
+def _decode_producer_json_scalars(block: dict[str, Any]) -> dict[str, Any]:
+    """Restore producer JSON transported inside YAML single-quoted scalars.
+
+    Only the producer's fixed complex fields are decoded.  The same strict
+    JSON parser and size/depth caps are used for both PyYAML and fallback
+    paths, so quoting does not create a permissive YAML or JSON path.
+    """
+    inner = block.get(_CONTRACT_REVIEW_MARKER)
+    if not isinstance(inner, dict):
+        return block
+
+    def decode(mapping: dict[str, Any], key: str) -> None:
+        value = mapping.get(key)
+        if isinstance(value, str) and value.startswith(("{", "[")):
+            mapping[key] = _parse_bounded_strict_json_collection(value)
+
+    checks = inner.get("checks")
+    if not isinstance(checks, dict):
+        return block
+    decode(checks, "declared_path_overlap")
+    vc_preflight = checks.get("vc_preflight")
+    if isinstance(vc_preflight, dict):
+        decode(vc_preflight, "classifications")
+    return block
 
 
 def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
@@ -188,7 +220,7 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
         import yaml  # noqa: F401 — available in project venv (PyYAML)
         parsed = yaml.safe_load(block)
         if isinstance(parsed, dict):
-            return parsed
+            return _decode_producer_json_scalars(parsed)
         return {}
     except Exception:
         pass
@@ -260,7 +292,7 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
             sub_value = match.group(2).strip()
             vc_preflight[sub_key] = _parse_fallback_scalar(sub_value) if sub_value else None
 
-    return result
+    return _decode_producer_json_scalars(result)
 
 
 # ---------------------------------------------------------------------------
