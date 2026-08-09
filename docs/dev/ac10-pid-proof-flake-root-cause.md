@@ -1,10 +1,7 @@
----
-title: "AC10 pid_proof flake — root cause (Issue #2073)"
-status: resolved
-related_issue: 2073
----
+# `test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_proof` flake — root cause（Issue #2073）
 
-# `test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_proof` flake — root cause
+**状態:** 解決済み（serial lane 分離により対応済み）
+**関連 Issue:** #2073
 
 ## 症状
 
@@ -14,7 +11,7 @@ related_issue: 2073
 `.claude/artifacts/issue-refinement-loop/1439/pid_proof_planner.json` が存在しない）で
 断続的に fail する。ローカル単体実行・ローカル `-n 4` 実行では毎回成功し再現しない。
 
-## Root Cause
+## 根本原因（Root Cause）
 
 このテストは以下の 3 段の real subprocess chain を駆動する:
 
