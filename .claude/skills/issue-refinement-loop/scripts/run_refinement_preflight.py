@@ -3512,9 +3512,14 @@ def run_preflight(
             # validated decision is bound to THIS anchor/body -- the
             # consumer boundary re-validates the same binding independently.
             #
-            # PR #2057 OWNER review P0-1 (partially addressed; see PR
-            # description / final report "Known limitations"): this
-            # synthesis is gated on `_classify_scope_delta_decision()`
+            # PR #2057 OWNER review P0-1 (fully resolved via
+            # `patch_plan_producer_available`, iteration 4 blocker 3 -- see
+            # `consume_trusted_anchor_contract_patch_plan()` above and
+            # `test_producer_unavailable_reaches_invalid_disposition_via_
+            # production_consumer` / `test_producer_available_default_true_
+            # preserves_full_rewrite_required` in
+            # `test_preflight_run_with_anchor.py`): this synthesis is
+            # additionally gated on `_classify_scope_delta_decision()`
             # returning `"valid"`, which requires the STRUCTURED
             # `ANCHOR_SCOPE_REFRAME_V1` payload (`_classify_anchor_scope_
             # reframe()`, a schema-validating, anchor-URL/hash-bound parser
