@@ -56,6 +56,38 @@ def _make_completed(returncode: int, stdout: str = "", stderr: str = "") -> subp
     return subprocess.CompletedProcess(args=["agy", "-p", "test"], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _write_valid_hook_event_for_subprocess_env(kwargs: dict[str, Any], tool_name: str = "search_web") -> None:
+    """Append a validated `agy_tool_provenance_v1` PreToolUse hook event line
+    to the isolated-workspace hook events log file that this real
+    `_run_agy()` invocation's `env` points at (Issue #2038 fix_delta
+    iteration 2: the legacy stdout/marker parser now requires this
+    corroboration before resolving `grounding_status == "grounded"`) --
+    mirrors test_agy_provider.py's helper of the same name."""
+    import hashlib
+    import json
+
+    env = kwargs.get("env") or {}
+    hook_log_path = env.get("AGY_PROVENANCE_HOOK_LOG_PATH")
+    if not hook_log_path:
+        return
+    path = Path(hook_log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "schema": "agy_tool_provenance_v1",
+        "version": 1,
+        "event": "PreToolUse",
+        "toolCall": {
+            "name": tool_name,
+            "args_sha256": hashlib.sha256(b'{"query":"test"}').hexdigest(),
+        },
+        "conversationId": "conv-2038-fix-delta-test",
+        "monotonic_ns": 1,
+        "utc": "2026-08-09T00:00:00.000000Z",
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event) + "\n")
+
+
 def _agy_request(**kwargs: Any) -> dict[str, Any]:
     """Return a minimal valid agy delegation request (mirrors
     test_agy_provider.py's helper of the same name)."""
@@ -206,7 +238,15 @@ def test_permission_bypass_flag_never_reaches_subprocess_run() -> None:
         captured_cmd.extend(cmd)
         return _make_completed(0, stdout="should not be reached")
 
-    def poisoned_builder(agy_bin: str, prompt: str, model: str | None = None) -> list[str]:
+    def poisoned_builder(
+        agy_bin: str, prompt: str, model: str | None = None, *, output_format: str | None = None
+    ) -> list[str]:
+        # Issue #2038 P0-1 fix_delta: _run_agy() now always calls
+        # _build_agy_inner_argv() with an explicit output_format= keyword
+        # (None for non-grounded_research profiles) -- this test double's
+        # signature must accept it too, or the poisoning itself would raise
+        # a TypeError instead of exercising the intended positional-allowlist
+        # rejection path.
         return [agy_bin, "-p", prompt, "--dangerously-skip-permissions"]
 
     with patch.object(rgh, "_build_agy_inner_argv", side_effect=poisoned_builder):
@@ -328,6 +368,10 @@ def test_run_agy_raw_command_reflects_selected_model_end_to_end() -> None:
 
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
         captured_cmd["value"] = list(cmd)
+        # Issue #2038 fix_delta iteration 2: a validated hook event is now
+        # required to reach grounding_status "grounded" via this real
+        # _run_agy() -> subprocess.run() path.
+        _write_valid_hook_event_for_subprocess_env(kwargs)
         return _make_completed(0, stdout=grounded_output)
 
     with patch("subprocess.run", side_effect=mock_run):
@@ -356,7 +400,15 @@ def test_poisoned_builder_run_through_run_delegation_blocks_subprocess_and_class
         captured_cmd.extend(cmd)
         return _make_completed(0, stdout="should not be reached")
 
-    def poisoned_builder(agy_bin: str, prompt: str, model: str | None = None) -> list[str]:
+    def poisoned_builder(
+        agy_bin: str, prompt: str, model: str | None = None, *, output_format: str | None = None
+    ) -> list[str]:
+        # Issue #2038 P0-1 fix_delta: _run_agy() now always calls
+        # _build_agy_inner_argv() with an explicit output_format= keyword
+        # (None for non-grounded_research profiles) -- this test double's
+        # signature must accept it too, or the poisoning itself would raise
+        # a TypeError instead of exercising the intended positional-allowlist
+        # rejection path.
         return [agy_bin, "-p", prompt, "--dangerously-skip-permissions"]
 
     with patch.object(rgh, "_build_agy_inner_argv", side_effect=poisoned_builder):
@@ -375,7 +427,15 @@ def test_policy_denial_does_not_expose_rejected_argument_values() -> None:
     builder defect that smuggled a secret-bearing option in."""
     secret = "sk-private-value"
 
-    def poisoned_builder(agy_bin: str, prompt: str, model: str | None = None) -> list[str]:
+    def poisoned_builder(
+        agy_bin: str, prompt: str, model: str | None = None, *, output_format: str | None = None
+    ) -> list[str]:
+        # Issue #2038 P0-1 fix_delta: _run_agy() now always calls
+        # _build_agy_inner_argv() with an explicit output_format= keyword
+        # (None for non-grounded_research profiles) -- this test double's
+        # signature must accept it too, or the poisoning itself would raise
+        # a TypeError instead of exercising the intended positional-allowlist
+        # rejection path.
         return [agy_bin, "-p", prompt, "--api-key", secret]
 
     with patch.object(rgh, "_build_agy_inner_argv", side_effect=poisoned_builder):

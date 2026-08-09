@@ -44,6 +44,63 @@ def _make_completed(returncode: int, stdout: str = "", stderr: str = "") -> subp
     return subprocess.CompletedProcess(args=["agy", "-p", "test"], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _valid_hook_event(tool_name: str = "search_web") -> dict[str, Any]:
+    """A validated `agy_tool_provenance_v1` PreToolUse hook event fixture
+    (Issue #2038 fix_delta iteration 2): the legacy stdout/marker parser now
+    requires this corroboration before resolving `grounding_status ==
+    "grounded"` -- mirrors test_agy_provenance_grounding_wiring.py's
+    `_valid_hook_event()` fixture shape."""
+    import hashlib
+
+    return {
+        "schema": "agy_tool_provenance_v1",
+        "version": 1,
+        "event": "PreToolUse",
+        "toolCall": {
+            "name": tool_name,
+            "args_sha256": hashlib.sha256(b'{"query":"test"}').hexdigest(),
+        },
+        "conversationId": "conv-2038-fix-delta-test",
+        "monotonic_ns": 1,
+        "utc": "2026-08-09T00:00:00.000000Z",
+    }
+
+
+def _write_valid_hook_event_for_subprocess_env(kwargs: dict[str, Any], tool_name: str = "search_web") -> None:
+    """Append a validated `agy_tool_provenance_v1` PreToolUse hook event line
+    to the isolated-workspace hook events log file that this real
+    `_run_agy()` invocation's `env` points at (Issue #2038 fix_delta
+    iteration 2). Used by `mock_run(cmd, **kwargs)` closures that patch
+    `subprocess.run` (rather than `_run_agy` itself) so the real
+    hook-loading code path (`agy_tool_provenance.load_hook_events()`) sees
+    genuine corroboration -- mirroring what a real PreToolUse wrapper
+    script would append."""
+    import hashlib
+    import json
+    from pathlib import Path
+
+    env = kwargs.get("env") or {}
+    hook_log_path = env.get("AGY_PROVENANCE_HOOK_LOG_PATH")
+    if not hook_log_path:
+        return
+    path = Path(hook_log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "schema": "agy_tool_provenance_v1",
+        "version": 1,
+        "event": "PreToolUse",
+        "toolCall": {
+            "name": tool_name,
+            "args_sha256": hashlib.sha256(b'{"query":"test"}').hexdigest(),
+        },
+        "conversationId": "conv-2038-fix-delta-test",
+        "monotonic_ns": 1,
+        "utc": "2026-08-09T00:00:00.000000Z",
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event) + "\n")
+
+
 def _agy_request(**kwargs: Any) -> dict[str, Any]:
     """Return a minimal valid agy delegation request."""
     base = {
@@ -170,7 +227,9 @@ def test_ac7_agy_grounded_research_supported() -> None:
 
     Success requires a machine-verifiable `tool_calls` trace with a recognized web tool
     name (e.g. `web_search`) in addition to a structured citation — a bare URL string is
-    not sufficient (Issue #1266 Blocker 1).
+    not sufficient (Issue #1266 Blocker 1). Issue #2038 fix_delta iteration 2: it also
+    requires a validated `agy_tool_provenance_v1` hook event corroborating the tool call
+    -- the stdout self-report JSON alone is never sufficient on its own (OWNER gate 4).
     """
     captured_timeout: dict[str, int | None] = {"value": None}
     grounded_output = (
@@ -181,7 +240,10 @@ def test_ac7_agy_grounded_research_supported() -> None:
 
     def _run_agy(prompt: str, timeout_sec: int = rgh.DEFAULT_TIMEOUT_SEC) -> subprocess.CompletedProcess:
         captured_timeout["value"] = timeout_sec
-        return _make_completed(0, stdout=grounded_output)
+        completed = _make_completed(0, stdout=grounded_output)
+        completed.agy_provenance_hook_events = [_valid_hook_event()]  # type: ignore[attr-defined]
+        completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
+        return completed
 
     with patch.object(rgh, "_run_agy", side_effect=_run_agy):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
@@ -216,14 +278,18 @@ def test_agy_grounded_research_forbids_gemini_google_search() -> None:
     tool constructed anywhere in run_gemini_headless.py; the only grounding
     surface for provider=agy is agy's own native WebSearch via ``_run_agy``.
     """
-    # Includes a machine-verifiable tool_calls trace (Issue #1266 Blocker 1) so this AC4 test's
-    # ok=True assertion reflects a genuine grounded result, not a bare URL scan.
+    # Includes a machine-verifiable tool_calls trace (Issue #1266 Blocker 1) AND a
+    # corroborating validated hook event (Issue #2038 fix_delta iteration 2) so this
+    # AC4 test's ok=True assertion reflects a genuine grounded result, not a bare URL
+    # scan or an unverified model self-report.
     grounded_output = (
         "Response from AGY.\n"
         '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
         '"tool_calls":[{"name":"web_search"}]}'
     )
     completed = _make_completed(0, stdout=grounded_output)
+    completed.agy_provenance_hook_events = [_valid_hook_event()]  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
     with patch.object(rgh, "_run_agy", return_value=completed) as mock_agy, patch.object(
         rgh,
         "_run_gemini",
@@ -1059,6 +1125,10 @@ def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation
 
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
         captured_cmd["value"] = list(cmd)
+        # Issue #2038 fix_delta iteration 2: a validated hook event is now
+        # required to reach grounding_status "grounded" via this real
+        # _run_agy() -> subprocess.run() path.
+        _write_valid_hook_event_for_subprocess_env(kwargs)
         return _make_completed(0, stdout=grounded_output)
 
     with patch("subprocess.run", side_effect=mock_run):
@@ -1134,6 +1204,10 @@ def test_issue_1777_ac3_grounded_research_model_optional_account_default(monkeyp
 
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
         captured_cmd["value"] = list(cmd)
+        # Issue #2038 fix_delta iteration 2: a validated hook event is now
+        # required to reach grounding_status "grounded" via this real
+        # _run_agy() -> subprocess.run() path.
+        _write_valid_hook_event_for_subprocess_env(kwargs)
         return _make_completed(0, stdout=grounded_output)
 
     assert rgh.resolve_agy_grounded_research_model() is None
@@ -1183,6 +1257,10 @@ def test_issue_1777_ac5_grounded_research_retry_uses_fresh_session() -> None:
         call_number = len(captured_cmds)
         if call_number < 2:
             return _make_completed(0, stdout="I searched and found nothing relevant.")
+        # Issue #2038 fix_delta iteration 2: a validated hook event is now
+        # required to reach grounding_status "grounded" via this real
+        # _run_agy() -> subprocess.run() path.
+        _write_valid_hook_event_for_subprocess_env(kwargs)
         return _make_completed(0, stdout=grounded_output)
 
     with patch("subprocess.run", side_effect=mock_run):
