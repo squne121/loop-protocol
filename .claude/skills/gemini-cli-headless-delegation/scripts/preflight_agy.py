@@ -2189,6 +2189,518 @@ def mcp_capability_status() -> dict[str, Any]:
     }
 
 
+# Issue #2038 AC1/AC4: same-binary structured-output (`--output-format
+# {json,stream-json}`) capability record. `run_gemini_headless.py` must
+# consume this single SSOT rather than independently judging `agy --help`
+# itself (Issue #2038 In Scope) so that a structured-output-unsupported /
+# unavailable / evidence_invalid answer (or unparseable probe result) is
+# classified consistently everywhere and can drive a fail-closed
+# `capability_unavailable` failure_class instead of a silent fallback to
+# stdout best-effort text parsing.
+STRUCTURED_OUTPUT_FORMAT_VALUES: frozenset[str] = frozenset({"json", "stream-json"})
+_STRUCTURED_OUTPUT_VALUE_RE = re.compile(r"\b(json|stream-json)\b")
+
+
+# --- Strict `stream-json` NDJSON state-machine parser (Issue #2038 P0-3 ---
+# fix_delta). The prior grounded_research parsing route accepted ad hoc
+# custom markers (`AGY_GROUNDED_RESEARCH:` / `AGY_WEBSEARCH:` /
+# `grounded_research:` / `grounding:`) or a raw stdout URL scan as
+# "structured" evidence, with no validation against the official Antigravity
+# CLI `stream-json` NDJSON event vocabulary (`init` / `step_update` /
+# terminal `result`, where `tool_info` is an object attached to each
+# `step_update` event rather than an independent event type). This parser is
+# the single source of truth for the structured route: it enforces
+# exactly-one `init` (first line), zero-or-more `step_update`, exactly-one
+# terminal `result` (must be last line), one JSON object per non-empty line,
+# and rejects malformed/truncated/duplicate-terminal input, unrecognized
+# top-level event types, and citation sources that are not correlated to a
+# canonical web tool call's `tool_info.output`. It is intentionally at least
+# as strict as the legacy Vertex-grounding-limited citation regex fallback
+# (`_VERTEX_GROUNDING_CITATION_RE` equivalent in run_gemini_headless.py) --
+# never more permissive -- and it never accepts the legacy custom markers or
+# an arbitrary stdout URL scan as evidence.
+#
+# `docs/dev/agy-cli-contract-20260701.md` (this repo's "Required Design
+# Reference" for the AGY CLI contract) is evidenced against AGY v1.0.14 and
+# only documents `-p`/`--print`/`--prompt`; it does not evidence the
+# `stream-json` event vocabulary for v1.1.11, so the exact `step_type`
+# enumeration below is a defensive, forward-compatible allowlist rather than
+# a claim of authoritative upstream documentation (Issue #2038 P2 gap --
+# tracked for a follow-up evidence-refresh, not Out of Scope for this fix).
+# Because that authoritative vocabulary is not yet evidenced, unrecognized
+# `step_type` values are recorded (`unknown_step_types`) but are NOT a hard
+# parse failure on their own -- only the closed, load-bearing invariants
+# (top-level `type` enum, init/result cardinality and ordering, one-JSON-
+# object-per-line, and the citation-acceptance correlation chain) are
+# enforced as hard failures.
+_STREAM_JSON_MAX_LINE_BYTES = 1_000_000
+_STREAM_JSON_MAX_EVENTS = 2000
+_STREAM_JSON_MAX_NESTING_DEPTH = 24
+_STREAM_JSON_EVENT_TYPES: frozenset[str] = frozenset({"init", "step_update", "result"})
+_STREAM_JSON_KNOWN_STEP_TYPES: frozenset[str] = frozenset(
+    {"tool_call", "tool_result", "text", "thought", "plan", "status"}
+)
+_STREAM_JSON_URL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+_STREAM_JSON_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_STREAM_JSON_MAX_URL_LENGTH = 2048
+
+
+def _json_nesting_depth(value: Any, _current: int = 0) -> int:
+    """Return the maximum nesting depth of *value* (dict/list containers).
+
+    Bounded recursion: stops descending once past
+    `_STREAM_JSON_MAX_NESTING_DEPTH` + a small margin, since the caller only
+    needs to know whether the bound was exceeded, not the exact depth of a
+    pathological/adversarial payload.
+    """
+    if _current > _STREAM_JSON_MAX_NESTING_DEPTH + 4:
+        return _current
+    if isinstance(value, dict):
+        if not value:
+            return _current + 1
+        return max(_json_nesting_depth(v, _current + 1) for v in value.values())
+    if isinstance(value, list):
+        if not value:
+            return _current + 1
+        return max(_json_nesting_depth(v, _current + 1) for v in value)
+    return _current
+
+
+def _validate_stream_json_source_url(url: Any) -> str | None:
+    """Return a normalized URL string iff *url* passes bounded validation
+    (Issue #2038 P0-3): http/https scheme only, no control characters, no
+    userinfo (`user:pass@host`) component, and a bounded length. Returns
+    `None` (rejected) otherwise. This is at least as strict as the existing
+    Vertex-grounding-limited citation regex fallback -- never more
+    permissive -- and is applied in addition to (not instead of) this
+    parser's tool-call/event correlation requirement.
+    """
+    if not isinstance(url, str):
+        return None
+    candidate = url.strip()
+    if not candidate or len(candidate) > _STREAM_JSON_MAX_URL_LENGTH:
+        return None
+    if _STREAM_JSON_CONTROL_CHAR_RE.search(candidate):
+        return None
+    if not _STREAM_JSON_URL_SCHEME_RE.match(candidate):
+        return None
+    after_scheme = candidate.split("://", 1)[1] if "://" in candidate else candidate
+    host_part = after_scheme.split("/", 1)[0]
+    if "@" in host_part:
+        return None
+    return candidate
+
+
+def parse_agy_stream_json_stream(stdout: str) -> dict[str, Any]:
+    """Strict NDJSON state-machine parser for the official Antigravity CLI
+    `stream-json` event vocabulary (Issue #2038 P0-3 fix_delta).
+
+    Returns a dict shaped:
+    ``{"status": "valid" | "invalid", "reason_code": str, "event_count": int,
+    "init_count": int, "step_update_count": int, "result_count": int,
+    "unknown_step_types": list[str], "tool_call_records": list[dict],
+    "source_records": list[dict], "terminal_result": dict | None}``.
+
+    Hard-fail invariants (any violation -> `status: "invalid"`, stream
+    treated as untrusted evidence, never partially accepted):
+      - stdout is non-empty and every non-empty line is exactly one JSON
+        object (malformed/truncated NDJSON is rejected, never best-effort
+        recovered).
+      - every line's byte length is <= `_STREAM_JSON_MAX_LINE_BYTES` and its
+        parsed JSON nesting depth is <= `_STREAM_JSON_MAX_NESTING_DEPTH`
+        (adversarial-payload bounds).
+      - total event count is <= `_STREAM_JSON_MAX_EVENTS`.
+      - every event's top-level `type` is a member of the closed
+        `_STREAM_JSON_EVENT_TYPES` enum -- an unrecognized event type is a
+        hard failure (fail-closed, never silently skipped).
+      - the first event is `init` and appears exactly once anywhere in the
+        stream (a duplicate `init` is rejected even if the first event is
+        also `init`).
+      - the last event is `result` and `result` appears exactly once
+        anywhere in the stream (both a missing terminal and a duplicate
+        terminal are rejected).
+      - every event strictly between the first and last is `step_update`
+        (an unexpected event type in that position, e.g. a second `init` or
+        a non-terminal `result`, is rejected).
+
+    Citation acceptance (only once `status == "valid"`): a `step_update`
+    event's `tool_info` (an object attached to that event, not an
+    independent event type) is only consulted for source records when its
+    `tool_info.name`/`tool_info.tool` is a member of
+    `RECOGNIZED_WEB_TOOL_NAMES` (step/tool-call correlation); candidate
+    source records are read from `tool_info.output.sources` /
+    `.citations` / `.results` (list) or a bare `tool_info.output` list, and
+    each candidate's `url` must pass `_validate_stream_json_source_url()`.
+    Never accepts the legacy custom markers, plain-text prose, or an
+    arbitrary stdout URL scan -- this parser is the ONLY evidence source for
+    the structured route.
+    """
+    result: dict[str, Any] = {
+        "status": "invalid",
+        "reason_code": None,
+        "event_count": 0,
+        "init_count": 0,
+        "step_update_count": 0,
+        "result_count": 0,
+        "unknown_step_types": [],
+        "tool_call_records": [],
+        "source_records": [],
+        "terminal_result": None,
+    }
+    if not isinstance(stdout, str) or not stdout.strip():
+        result["reason_code"] = "empty_stream"
+        return result
+
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    if not lines:
+        result["reason_code"] = "empty_stream"
+        return result
+    if len(lines) > _STREAM_JSON_MAX_EVENTS:
+        result["reason_code"] = "event_count_exceeds_bound"
+        return result
+
+    events: list[dict[str, Any]] = []
+    for index, raw_line in enumerate(lines):
+        if len(raw_line.encode("utf-8", errors="ignore")) > _STREAM_JSON_MAX_LINE_BYTES:
+            result["reason_code"] = f"line_{index}_exceeds_byte_bound"
+            return result
+        try:
+            parsed_line = json.loads(raw_line)
+        except json.JSONDecodeError:
+            result["reason_code"] = f"line_{index}_not_valid_json"
+            return result
+        if not isinstance(parsed_line, dict):
+            result["reason_code"] = f"line_{index}_not_a_json_object"
+            return result
+        if _json_nesting_depth(parsed_line) > _STREAM_JSON_MAX_NESTING_DEPTH:
+            result["reason_code"] = f"line_{index}_nesting_depth_exceeds_bound"
+            return result
+        event_type = parsed_line.get("type")
+        if not isinstance(event_type, str) or event_type not in _STREAM_JSON_EVENT_TYPES:
+            result["reason_code"] = f"line_{index}_unknown_event_type"
+            return result
+        events.append(parsed_line)
+
+    result["event_count"] = len(events)
+
+    if events[0].get("type") != "init":
+        result["reason_code"] = "first_event_not_init"
+        return result
+    if events[-1].get("type") != "result":
+        result["reason_code"] = "terminal_event_not_result_or_missing"
+        return result
+
+    init_count = sum(1 for event in events if event.get("type") == "init")
+    result_count = sum(1 for event in events if event.get("type") == "result")
+    if init_count != 1:
+        result["reason_code"] = "init_count_not_exactly_one"
+        return result
+    if result_count != 1:
+        result["reason_code"] = "result_count_not_exactly_one"
+        return result
+
+    tool_call_records: list[dict[str, Any]] = []
+    source_records: list[dict[str, Any]] = []
+    unknown_step_types: list[str] = []
+    seen_urls: set[str] = set()
+
+    for index, event in enumerate(events[1:-1], start=1):
+        if event.get("type") != "step_update":
+            result["reason_code"] = f"line_{index}_unexpected_event_between_init_and_result"
+            return result
+        step_type = event.get("step_type")
+        if step_type is not None and (not isinstance(step_type, str) or not step_type.strip()):
+            result["reason_code"] = f"line_{index}_malformed_step_type"
+            return result
+        if isinstance(step_type, str) and step_type not in _STREAM_JSON_KNOWN_STEP_TYPES:
+            unknown_step_types.append(step_type)
+
+        tool_info = event.get("tool_info")
+        if tool_info is None:
+            continue
+        if not isinstance(tool_info, dict):
+            result["reason_code"] = f"line_{index}_tool_info_not_an_object"
+            return result
+
+        tool_name_raw = tool_info.get("name") or tool_info.get("tool")
+        tool_name = tool_name_raw.strip().lower() if isinstance(tool_name_raw, str) else None
+        recognized_web_tool = bool(tool_name) and tool_name in RECOGNIZED_WEB_TOOL_NAMES
+        record: dict[str, Any] = {
+            "step_index": index,
+            "step_type": step_type,
+            "tool_name": tool_name,
+            "recognized_web_tool": recognized_web_tool,
+            "source_record_count": 0,
+        }
+
+        if recognized_web_tool:
+            output = tool_info.get("output")
+            candidate_entries: list[Any] = []
+            if isinstance(output, dict):
+                for key in ("sources", "citations", "results"):
+                    entries = output.get(key)
+                    if isinstance(entries, list):
+                        candidate_entries.extend(entries)
+            elif isinstance(output, list):
+                candidate_entries.extend(output)
+            for entry in candidate_entries:
+                if not isinstance(entry, dict):
+                    continue
+                normalized_url = _validate_stream_json_source_url(entry.get("url"))
+                if normalized_url is None or normalized_url in seen_urls:
+                    continue
+                seen_urls.add(normalized_url)
+                record["source_record_count"] += 1
+                source_records.append(
+                    {
+                        "url": normalized_url,
+                        "title": entry.get("title") if isinstance(entry.get("title"), str) else None,
+                        "tool_name": tool_name,
+                        "step_index": index,
+                    }
+                )
+        tool_call_records.append(record)
+
+    result["status"] = "valid"
+    result["reason_code"] = "valid_init_step_result_stream"
+    result["init_count"] = init_count
+    result["step_update_count"] = len(events) - 2
+    result["result_count"] = result_count
+    result["unknown_step_types"] = unknown_step_types
+    result["tool_call_records"] = tool_call_records
+    result["source_records"] = source_records
+    result["terminal_result"] = events[-1]
+    return result
+
+
+def structured_output_capability_status(
+    help_result: dict[str, Any] | None,
+    semantic_probe_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the `agy_capability_matrix/v1`-shaped capability record for
+    AGY `-p ... --output-format {json,stream-json}` support (Issue #2038,
+    P0-2 fix_delta: two-stage same-binary determination).
+
+    *help_result* must be the ``{"exit_code": int | None, "stdout": str,
+    "stderr": str, "binary_identity": dict | None}``-shaped dict produced by
+    running ``agy --help`` against the *exact same* agy binary the caller is
+    about to invoke (same-binary evidence, mirroring
+    `binary_identity_matches()`'s intent elsewhere in this module) -- this
+    function never probes on its own and never mixes evidence from a
+    different binary invocation. `binary_identity` is optional for
+    backward compatibility with Stage-1-only callers.
+
+    Stage 1 (`--help`, always cheap/parser-level): establishes candidate
+    feature *existence* only. Per Issue #1941's evidence-priority policy,
+    `help` output alone never independently confirms `supported` -- the
+    flag being present (with a recognized value enumerated nearby) in
+    `--help` text resolves to, at best, `inconclusive` when
+    *semantic_probe_result* is not supplied.
+
+    Stage 2 (*semantic_probe_result*, optional): a bounded, real
+    `--output-format stream-json` invocation against the SAME binary,
+    typically produced by `_run_structured_output_semantic_probe()`. Only
+    promotes to `supported` when: (a) its `binary_identity` (when present on
+    both records) matches *help_result*'s (same realpath + SHA-256 --
+    identity drift between the two probes is `evidence_invalid`, never
+    silently ignored); (b) the probe did not time out; (c) no auth/quota/
+    permission/cost-gate refusal signal is present in its combined
+    stdout+stderr (`unavailable`, not `evidence_invalid` -- this is an
+    environment/credential condition, not a malformed-stream condition);
+    (d) its exit code is 0; and (e) its stdout parses as a `status: "valid"`
+    stream via `parse_agy_stream_json_stream()` (a malformed/truncated
+    stream or a missing terminal `result` is `evidence_invalid`, separate
+    from the `unavailable` auth/quota/cost-gate case).
+    """
+    if not isinstance(help_result, dict):
+        return _predicate_result("unavailable", reason_code="help_probe_not_run", evidence_source="help")
+    exit_code = help_result.get("exit_code")
+    # Real `agy --help` output has been observed on both stdout and stderr
+    # depending on version/platform; combine both the same way
+    # `run_preflight()` already does for its own help-text parsing (see the
+    # `help_proc.stdout, help_proc.stderr` join above) rather than trusting
+    # stdout alone.
+    help_text = "\n".join(part for part in [help_result.get("stdout"), help_result.get("stderr")] if part)
+    if exit_code != 0 or not help_text.strip():
+        return _predicate_result("unavailable", reason_code="agy_help_probe_failed", evidence_source="help")
+    if "--output-format" not in help_text:
+        return _predicate_result("unsupported", reason_code="flag_absent_from_help", evidence_source="help")
+    if not _STRUCTURED_OUTPUT_VALUE_RE.search(help_text):
+        return _predicate_result(
+            "evidence_invalid", reason_code="flag_present_without_value_enum", evidence_source="help"
+        )
+
+    # Stage 1 passed: candidate feature existence established from `--help`
+    # evidence only (Issue #2038 P0-2 fix_delta). This alone never resolves
+    # to `supported` -- promotion requires Stage 2.
+    if semantic_probe_result is None:
+        return _predicate_result(
+            "inconclusive",
+            reason_code="help_only_evidence_pending_runtime_confirmation",
+            evidence_source="help",
+        )
+    if not isinstance(semantic_probe_result, dict):
+        return _predicate_result(
+            "inconclusive",
+            reason_code="semantic_probe_result_malformed",
+            evidence_source="help",
+        )
+
+    help_identity = help_result.get("binary_identity")
+    probe_identity = semantic_probe_result.get("binary_identity")
+    if (
+        isinstance(help_identity, dict)
+        and isinstance(probe_identity, dict)
+        and not binary_identity_matches(help_identity, probe_identity)
+    ):
+        return _predicate_result(
+            "evidence_invalid",
+            reason_code="binary_identity_drift_between_help_and_semantic_probe",
+            evidence_source="runtime_semantic_observation",
+        )
+
+    if semantic_probe_result.get("timed_out"):
+        return _predicate_result(
+            "inconclusive",
+            reason_code="semantic_probe_timed_out",
+            evidence_source="runtime_semantic_observation",
+        )
+
+    probe_stdout = semantic_probe_result.get("stdout") or ""
+    probe_stderr = semantic_probe_result.get("stderr") or ""
+    combined = "\n".join([probe_stdout, probe_stderr])
+    if _QUOTA_EXHAUSTED_RE.search(combined) or _HTTP_429_RE.search(combined):
+        return _predicate_result(
+            "unavailable",
+            reason_code="semantic_probe_quota_or_rate_limited",
+            evidence_source="runtime_semantic_observation",
+        )
+    auth_signal = _classify_auth_signal(combined)
+    if auth_signal:
+        return _predicate_result(
+            "unavailable",
+            reason_code=f"semantic_probe_auth_signal:{auth_signal}",
+            evidence_source="runtime_semantic_observation",
+        )
+    if semantic_probe_result.get("exit_code") != 0:
+        return _predicate_result(
+            "unavailable",
+            reason_code="semantic_probe_exit_nonzero",
+            evidence_source="runtime_semantic_observation",
+        )
+
+    parser_verdict = semantic_probe_result.get("parser_verdict")
+    if not isinstance(parser_verdict, dict):
+        parser_verdict = parse_agy_stream_json_stream(probe_stdout)
+    if parser_verdict.get("status") != "valid":
+        return _predicate_result(
+            "evidence_invalid",
+            reason_code=f"semantic_probe_stream_invalid:{parser_verdict.get('reason_code')}",
+            evidence_source="runtime_semantic_observation",
+        )
+
+    return _predicate_result(
+        "supported",
+        reason_code="semantic_probe_valid_init_step_result_stream_observed",
+        evidence_source="runtime_semantic_observation",
+    )
+
+
+def _run_structured_output_semantic_probe(agy_bin: str) -> dict[str, Any]:
+    """Bounded, same-binary Stage-2 semantic probe for `--output-format
+    stream-json` support (Issue #2038 P0-2 fix_delta).
+
+    Runs `agy -p <SMOKE_PROMPT> --output-format stream-json` against
+    *agy_bin* inside an isolated temp cwd/HOME (mirrors
+    `_run_leading_slash_literal_probe()`'s isolation pattern) and validates
+    the resulting stdout via `parse_agy_stream_json_stream()`. This is a
+    real, model-backed call; callers are responsible for the
+    `_runtime_probe_cost_confirmed()` cost-confirmation gate -- this
+    function always actually invokes the subprocess when called.
+    """
+    argv = [agy_bin, "-p", SMOKE_PROMPT, "--output-format", "stream-json"]
+    probe: dict[str, Any] = {
+        "argv": argv,
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "binary_identity": compute_binary_identity(agy_bin),
+        "parser_verdict": None,
+    }
+    with tempfile.TemporaryDirectory(prefix="agy-preflight-structured-") as temp_dir:
+        temp_root = Path(temp_dir)
+        isolated_home = temp_root / "isolated-home"
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        isolated_cwd = temp_root / "cwd"
+        isolated_cwd.mkdir(parents=True, exist_ok=True)
+        try:
+            proc = _run(
+                argv,
+                cwd=isolated_cwd,
+                timeout=SMOKE_TIMEOUT_SECONDS,
+                env=_isolated_probe_env(isolated_home),
+            )
+            probe["exit_code"] = proc.returncode
+            probe["stdout"] = proc.stdout or ""
+            probe["stderr"] = proc.stderr or ""
+        except subprocess.TimeoutExpired:
+            probe["timed_out"] = True
+        except FileNotFoundError:
+            probe["exit_code"] = None
+    probe["parser_verdict"] = parse_agy_stream_json_stream(probe["stdout"])
+    return probe
+
+
+_STRUCTURED_OUTPUT_CAPABILITY_MEMO_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+
+def get_or_compute_structured_output_capability(agy_bin: str) -> dict[str, Any]:
+    """Same-binary, two-stage structured-output capability resolution,
+    memoized per-binary-identity for this process's lifetime (Issue #2038
+    P0-2 fix_delta).
+
+    Stage 1 (`agy --help`) always runs (cheap, parser-level only, no real
+    generation call). Stage 2 (`_run_structured_output_semantic_probe()`, a
+    real model-backed call) only runs when the caller has opted into real
+    runtime-probe cost via `AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST=1`
+    (`_runtime_probe_cost_confirmed()`, mirroring
+    `_run_leading_slash_literal_probe()`'s existing cost-confirmation gate)
+    AND Stage 1 evidence establishes candidate feature existence (`status ==
+    "inconclusive"`) -- otherwise Stage 1's own evidence ceiling is returned
+    without spending a real model-backed call on a binary that has already
+    fail-closed at Stage 1 (`unsupported`/`unavailable`/`evidence_invalid`).
+    """
+    binary_identity = compute_binary_identity(agy_bin)
+    identity_key = _identity_key_tuple(binary_identity)
+    if identity_key in _STRUCTURED_OUTPUT_CAPABILITY_MEMO_CACHE:
+        return _STRUCTURED_OUTPUT_CAPABILITY_MEMO_CACHE[identity_key]
+
+    try:
+        help_proc = _run_help(agy_bin)
+        help_result: dict[str, Any] | None = {
+            "exit_code": help_proc.returncode,
+            "stdout": help_proc.stdout or "",
+            "stderr": help_proc.stderr or "",
+            "binary_identity": binary_identity,
+        }
+    except subprocess.TimeoutExpired:
+        help_result = {"exit_code": None, "stdout": "", "stderr": "", "binary_identity": binary_identity}
+    except FileNotFoundError:
+        record = _predicate_result("unavailable", reason_code="agy_binary_not_found", evidence_source="help")
+        _STRUCTURED_OUTPUT_CAPABILITY_MEMO_CACHE[identity_key] = record
+        return record
+
+    stage1 = structured_output_capability_status(help_result)
+    semantic_probe_result: dict[str, Any] | None = None
+    if stage1["status"] == "inconclusive" and _runtime_probe_cost_confirmed():
+        semantic_probe_result = _run_structured_output_semantic_probe(agy_bin)
+
+    record = structured_output_capability_status(help_result, semantic_probe_result=semantic_probe_result)
+    _STRUCTURED_OUTPUT_CAPABILITY_MEMO_CACHE[identity_key] = record
+    return record
+
+
 _CAPABILITY_MEMO_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
