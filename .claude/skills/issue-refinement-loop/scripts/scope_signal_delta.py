@@ -1309,6 +1309,7 @@ def run_trusted_anchor_iteration_zero(
     scope_delta_status: str = "approved_by_trusted_anchor",
     previous_empty_operations_fingerprints: "list | None" = None,
     posted_scope_reframe_comment_fingerprints: "list | None" = None,
+    already_reflected_in_body: bool = False,
 ) -> dict:
     """Execute the bounded, callback-based trusted-anchor path.
 
@@ -1333,6 +1334,14 @@ def run_trusted_anchor_iteration_zero(
     `contract_update.status` artifact enum (applied/no_change/rebased/failed)
     is unaffected; callers must additionally branch on
     `result["rewrite_route"]["route"]`.
+
+    `already_reflected_in_body` (#2048 Scope Delta): when the caller has
+    independently proven that every entry of `allowed_path_deltas` is already
+    present in the CURRENT issue body (the `proven_no_change` disposition --
+    as opposed to `full_rewrite_required`), pass `True` to suppress the
+    `rewrite_route` annotation entirely. This keeps a genuinely satisfied
+    scope reframe on the ordinary `no_change` no-op path instead of routing a
+    caller to `issue_editor_required` for a delta that requires no edit.
     """
     normalized = normalize_trusted_anchor_iteration_zero(
         repo=repo, issue_number=issue_number, anchor=anchor, source_body=anchor_body
@@ -1359,6 +1368,7 @@ def run_trusted_anchor_iteration_zero(
             if (
                 not operations
                 and allowed_path_deltas
+                and not already_reflected_in_body
                 and decide_scope_reframe_contract_route is not None
                 and SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1 is not None
             ):
