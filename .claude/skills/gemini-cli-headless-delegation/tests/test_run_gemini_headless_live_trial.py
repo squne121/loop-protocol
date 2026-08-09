@@ -283,6 +283,15 @@ def _run_full_route_trial(runtime: str, output_dir: Path) -> dict[str, Any]:
     ``evidence_record_count``).
     """
     started = time.monotonic()
+    # Issue #2015 P1 fix (control-plane live re-run, 2026-08-09): the smoke
+    # harness's own route-level deadline was widened from 180s to 300s (see
+    # run_agent_provider_route_smoke.py's DEFAULT_ROUTE_HARNESS_TIMEOUT_SEC /
+    # INITIAL_ATTEMPT_MAX_BUDGET_FRACTION comments) -- 180s did not leave a
+    # genuine bounded retry a meaningful chance once the initial attempt's
+    # own bounded artifact-materialization poll legitimately consumed
+    # essentially the whole prior budget. This test's own outer subprocess
+    # timeout is kept comfortably above the harness's own 300s deadline plus
+    # process-teardown/cleanup headroom.
     producer_proc = subprocess.run(
         [
             sys.executable,
@@ -291,12 +300,12 @@ def _run_full_route_trial(runtime: str, output_dir: Path) -> dict[str, Any]:
             "--agent", "codebase-investigator",
             "--profile", "local_asset_research",
             "--output-dir", str(output_dir),
-            "--timeout-seconds", "180",
+            "--timeout-seconds", "300",
         ],
         cwd=str(_REPO_ROOT),
         capture_output=True,
         text=True,
-        timeout=200,
+        timeout=340,
     )
     elapsed_sec = time.monotonic() - started
 

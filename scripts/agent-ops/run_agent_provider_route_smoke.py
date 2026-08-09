@@ -764,6 +764,43 @@ def _run_route_once(
     return artifact, diagnostics
 
 
+# Issue #2015 P1 fix (control-plane live re-run on head f3d5033, 2026-08-09):
+# a genuine full-route trial showed 4/6 failures pegged near the ~180s outer
+# deadline EVEN WITH the bounded retry active (elapsed_sec 179.2-185.4,
+# retry_status still failing). Root cause: ``_run_route_once``'s own bounded
+# artifact-materialization poll (``_poll_for_file``, and the outer harness
+# subprocess's own ``--timeout-seconds`` budget) legitimately runs right up
+# to whatever deadline it is handed before concluding a genuine
+# ``child_completed_but_artifact_not_materialized`` race -- so a
+# retry-ELIGIBLE first attempt can, by design, consume essentially the
+# ENTIRE route-level deadline, leaving the retry attempt near-zero remaining
+# budget. A retry with ~0s left can never possibly succeed, defeating the
+# whole point of AC11's retry.
+#
+# Fix: reserve a guaranteed minimum time slice for the retry by capping the
+# FIRST attempt's own deadline to at most this fraction of the total route
+# budget. A non-retryable failure (or a genuine pass) returns immediately
+# after classification and never actually needs the reserved slice, so
+# nothing is "wasted" for the common non-retry case.
+#
+# Fraction choice grounded in this Issue's own live timing evidence: the two
+# genuinely-passing claude_code trials on this same head took 54.8s and
+# 92.3s. Splitting alone at the PRIOR 180s total budget was not sufficient
+# (92s initial-need + 92s retry-need alone exceeds 180s), so the total route
+# budget is also widened to DEFAULT_ROUTE_HARNESS_TIMEOUT_SEC (below). At
+# 300s total with a 60/40 split, the (capped) initial attempt gets up to
+# 180s and the retry gets at least 120s in the worst case where the initial
+# attempt consumes its entire capped allotment -- both comfortably above the
+# 92.3s worst-observed genuine-completion time.
+INITIAL_ATTEMPT_MAX_BUDGET_FRACTION = 0.6
+
+# Issue #2015 P1 fix: widened from the prior 180s default -- see
+# INITIAL_ATTEMPT_MAX_BUDGET_FRACTION comment above for the reasoning (180s
+# cannot fit "one full genuine attempt (up to ~92s) + a meaningful retry
+# attempt (also up to ~92s)" with any split).
+DEFAULT_ROUTE_HARNESS_TIMEOUT_SEC = 300
+
+
 def run_route_live(
     route: dict[str, str],
     *,
@@ -775,7 +812,18 @@ def run_route_live(
     # Issue #2015 AC11: ONE absolute deadline for the whole route, shared by
     # the initial attempt and any bounded retry -- never a fresh
     # ``timeout_seconds`` budget per attempt.
-    route_deadline = time.monotonic() + timeout_seconds
+    route_start = time.monotonic()
+    route_deadline = route_start + timeout_seconds
+
+    # Issue #2015 P1 fix: cap the initial attempt's own deadline so a
+    # retry-eligible failure always leaves the retry a real, non-negligible
+    # chance (see INITIAL_ATTEMPT_MAX_BUDGET_FRACTION comment above). The
+    # retry itself (below) still uses the full, un-capped ``route_deadline``
+    # -- it simply naturally receives whatever remains.
+    initial_deadline = min(
+        route_deadline,
+        route_start + (timeout_seconds * INITIAL_ATTEMPT_MAX_BUDGET_FRACTION),
+    )
     attempts: list[dict] = []
 
     initial, initial_diagnostics = _run_route_once(
@@ -784,7 +832,7 @@ def run_route_live(
         repo_root=repo_root,
         worktree=worktree,
         output_root=output_root,
-        deadline=route_deadline,
+        deadline=initial_deadline,
     )
     attempts.append(
         {"attempt": 1, "status": initial["status"], "failure_class": initial["failure_class"]}
@@ -840,7 +888,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worktree", default=str(REPO_ROOT))
     parser.add_argument("--repo-root", default=str(REPO_ROOT))
     parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--timeout-seconds", type=int, default=180)
+    parser.add_argument(
+        "--timeout-seconds", type=int, default=DEFAULT_ROUTE_HARNESS_TIMEOUT_SEC,
+    )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="write only subject/request metadata, never spawn a live runtime (hermetic testing)",

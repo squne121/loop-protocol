@@ -409,10 +409,22 @@ retry policy（Issue #2015 AC5）: `startup_timeout` / `request_timeout` の
 deadline hierarchy（Issue #2015 AC6、`time.monotonic()` ベース）:
 内側の呼び出しほど短い制限時間を持つよう、次の順で厳密に大きくなる階層関係を維持する。
 `server_tool_timeout`（45s）< `client_request_timeout`（60s）<
-`collector_session_deadline`（120s）< `route_harness_timeout`（180s、
+`collector_session_deadline`（120s）< `route_harness_timeout`（300s、
 `scripts/agent-ops/run_agent_provider_route_smoke.py --timeout-seconds`
 既定値）- `cleanup_grace`（10s）。外側の制限が内側の制限より必ず大きいことで、
 タイムアウト発生時に内側から順に安全に打ち切られる。
+
+`route_harness_timeout` は Issue #2015 P1 fix（control-plane による live 再実行、
+2026-08-09）で 180s から 300s へ拡大された。180s では「初回の genuine な完了
+（同一 head での実測最大 92.3s）」と「意味のある bounded retry（同じく最大
+92.3s 相当）」の両方を賄うだけの余地がなく、初回試行が
+`child_completed_but_artifact_not_materialized`（artifact 未生成の genuine
+race）で fail した際、その bounded poll がほぼ全予算を使い切ってしまい retry
+に実質ゼロの残余予算しか残らない構造的欠陥があった。`run_agent_provider_route_
+smoke.py` の `run_route_live()` は追加で、初回試行自身の deadline を
+`INITIAL_ATTEMPT_MAX_BUDGET_FRACTION`（60%）に cap し、retry に必ず一定の
+残余予算（この 300s 予算では最悪ケースで少なくとも 120s）を確保するよう
+budget-splitting を実装している。
 
 request ledger（Issue #2015 AC1）: 各 JSON-RPC request は
 `local_asset_retrieval_metadata.request_ledger` に

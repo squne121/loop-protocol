@@ -65,14 +65,24 @@ RETRY_LIMIT = 2
 # server_tool_timeout < client_request_timeout < collector_session_deadline <
 # route_harness_timeout - cleanup_grace. route_harness_timeout is owned by
 # the external smoke harness (scripts/agent-ops/run_agent_provider_route_smoke.py
-# --timeout-seconds, default 180) and cleanup_grace reserves headroom after
-# the collector session deadline elapses for process reap to complete.
+# --timeout-seconds) and cleanup_grace reserves headroom after the collector
+# session deadline elapses for process reap to complete.
+#
+# Issue #2015 P1 fix (control-plane live re-run, 2026-08-09): the smoke
+# harness's own default was widened from 180 to 300 -- a genuine full-route
+# trial showed 180s could not fit BOTH "one full genuine attempt (observed
+# up to 92.3s on this same head)" AND "a meaningful bounded retry attempt
+# (also up to ~92.3s)" -- see run_agent_provider_route_smoke.py's
+# INITIAL_ATTEMPT_MAX_BUDGET_FRACTION / DEFAULT_ROUTE_HARNESS_TIMEOUT_SEC
+# comments for the full reasoning and evidence. This constant is kept in
+# sync with that default purely for documentation/invariant purposes -- it
+# is never read by the external smoke harness itself.
 # ---------------------------------------------------------------------------
 
 SERENA_SERVER_TOOL_TIMEOUT_SEC = 45.0
 SERENA_CLIENT_REQUEST_TIMEOUT_SEC = 60.0
 SERENA_COLLECTOR_SESSION_DEADLINE_SEC = 120.0
-SERENA_ROUTE_HARNESS_TIMEOUT_SEC = 180.0
+SERENA_ROUTE_HARNESS_TIMEOUT_SEC = 300.0
 SERENA_CLEANUP_GRACE_SEC = 10.0
 assert (
     SERENA_SERVER_TOOL_TIMEOUT_SEC

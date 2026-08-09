@@ -191,10 +191,22 @@ class TestRouteLevelSharedDeadline:
         """Issue #2015 AC11/P1: the retry attempt must NOT receive a fresh,
         independent ``timeout_seconds`` budget -- it must receive the
         REMAINING budget of the single route-level absolute deadline shared
-        with the initial attempt. Simulated via a fake clock that advances
-        by a large step on every ``time.monotonic()`` call (standing in for
-        "the initial attempt consumed most of the route's time budget")."""
-        clock = _FakeClock(step=40.0)  # each check "costs" 40s of the 60s budget
+        with the initial attempt (proven here by the retry's own harness
+        ``--timeout-seconds`` staying strictly below the full
+        ``timeout_seconds`` requested, even though a fresh/independent
+        budget would equal it exactly).
+
+        Issue #2015 P1 fix (control-plane live re-run, 2026-08-09): a
+        SEPARATE invariant -- that the initial attempt's own deadline is
+        capped below the full route budget so a retry always gets a
+        guaranteed minimum slice -- is covered by
+        ``test_initial_attempt_is_capped_below_the_full_route_budget``
+        below. The two attempts' relative sizes are NOT compared here: an
+        initial attempt that fails fast (as in this fixture) naturally
+        leaves the retry MORE of the shared budget than the initial
+        attempt's own (deliberately capped) allotment -- that is correct,
+        intended behavior of the fix, not a regression."""
+        clock = _FakeClock(step=25.0)
         monkeypatch.setattr(producer.time, "monotonic", clock.monotonic)
         monkeypatch.setattr(producer.time, "sleep", clock.sleep)
         route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
@@ -215,13 +227,57 @@ class TestRouteLevelSharedDeadline:
         monkeypatch.setattr(producer.subprocess, "run", _run)
         producer.run_route_live(
             route, repo_root=REPO_ROOT, worktree=REPO_ROOT,
-            output_root=tmp_path, timeout_seconds=60,
+            output_root=tmp_path, timeout_seconds=120,
         )
         assert len(seen_timeouts) == 2, "expected exactly one bounded retry"
         first, second = int(seen_timeouts[0]), int(seen_timeouts[1])
-        assert second < first, (
+        assert second < 120, (
             "retry must receive a SHRUNK remaining budget from the shared "
             "route deadline, never a fresh full timeout_seconds"
+        )
+        assert first < 120 and second != first
+
+    def test_initial_attempt_is_capped_below_the_full_route_budget(
+        self, producer, tmp_path, monkeypatch
+    ):
+        """Issue #2015 P1 fix: the initial attempt must never be handed the
+        entire route-level budget -- it must be capped to at most
+        ``INITIAL_ATTEMPT_MAX_BUDGET_FRACTION`` of ``timeout_seconds``, so a
+        retry-eligible failure always leaves the retry a real, non-negligible
+        chance (never a near-zero remaining budget)."""
+        clock = _FakeClock(step=0.1)
+        monkeypatch.setattr(producer.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(producer.time, "sleep", clock.sleep)
+        route = producer.REQUIRED_ROUTES[0]
+        seen_timeouts: list[str] = []
+        real_fake = _fake_harness_run(
+            harness_summary={
+                "native_spawn_event_observed": True,
+                "parent_session_id": "parent-1",
+                "child_session_id": "child-1",
+            },
+            evidence_files={
+                "delegation_request.json": _PASS_REQUEST_JSON,
+                "delegation_result.json": _PASS_RESULT_JSON,
+            },
+        )
+
+        def _run(argv, **kwargs):  # noqa: ANN001
+            if len(argv) > 1 and str(argv[1]).endswith("run_worktree_agent_runtime_smoke.py"):
+                seen_timeouts.append(_argv_value(argv, "--timeout-seconds"))
+            return real_fake(argv, **kwargs)
+
+        monkeypatch.setattr(producer.subprocess, "run", _run)
+        artifact, _diagnostics = producer.run_route_live(
+            route, repo_root=REPO_ROOT, worktree=REPO_ROOT,
+            output_root=tmp_path, timeout_seconds=100,
+        )
+        assert artifact["status"] == "pass"
+        assert len(seen_timeouts) == 1, "a genuine pass must never trigger a retry"
+        first = int(seen_timeouts[0])
+        assert first <= int(100 * producer.INITIAL_ATTEMPT_MAX_BUDGET_FRACTION) + 1, (
+            "initial attempt must be capped below the full route budget "
+            "to guarantee the retry a real remaining slice"
         )
 
     def test_attempts_ledger_records_both_attempts(self, producer, tmp_path, monkeypatch):
