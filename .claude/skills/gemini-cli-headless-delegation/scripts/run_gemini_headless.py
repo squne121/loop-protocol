@@ -2332,7 +2332,7 @@ def _collect_live_serena_read_only_evidence(
         stderr=subprocess.PIPE,
         text=True,
         shell=False,
-        env=_minimal_agy_env(),
+        env=_minimal_serena_env(),
         bufsize=1,
         start_new_session=True,
     )
@@ -3127,21 +3127,46 @@ def _minimal_agy_env() -> dict[str, str]:
 
     Only allowlisted environment variables are propagated.
     AGY_BIN override is supported for hermetic test injection.
+
+    Issue #2015 (CI env-leak regression fix, 2026-08-09 OWNER scope
+    reframe): ``UV_CACHE_DIR`` is intentionally NOT part of this allowlist.
+    It previously leaked in here as a P1 fix meant only for Serena
+    cold/warm cache control in live-trial tests, but this function is the
+    *general* least-privilege AGY subprocess env and must not carry it.
+    Callers that need a controlled ``UV_CACHE_DIR`` (Serena MCP subprocess
+    launch, live-trial cold/warm slots) must use `_minimal_serena_env()`
+    instead.
     """
-    # UV_CACHE_DIR (Issue #2015 P1 fix, OWNER REQUEST_CHANGES on PR
-    # #2044): propagated so live-trial tests can force a genuinely cold
-    # `uvx`-resolved dependency cache for their fixed "cold trial" slots
-    # rather than merely running the first N invocations against whatever
-    # cache happens to already exist on the host.
     allowlist = (
         "PATH", "HOME", "LANG", "LC_ALL", "TERM",
-        "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "UV_CACHE_DIR",
+        "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
     )
     env: dict[str, str] = {}
     for key in allowlist:
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
+    return env
+
+
+def _minimal_serena_env() -> dict[str, str]:
+    """Return a minimal environment dict for Serena MCP subprocess launch.
+
+    Issue #2015 (CI env-leak regression fix): this is `_minimal_agy_env()`
+    plus an explicit, per-call ``UV_CACHE_DIR`` (when present in the
+    caller's real environment). Serena is launched via ``uvx``/``uv tool``
+    and live-trial tests rely on being able to force a genuinely cold or
+    warm ``uvx``-resolved dependency cache per trial slot by setting
+    ``UV_CACHE_DIR`` in the *calling* process's environment before
+    invoking the collector -- that value must reach the Serena subprocess,
+    but must not leak into the general AGY subprocess env allowlist
+    (`_minimal_agy_env()`), which is asserted to exclude it
+    (`test_ac13_minimal_agy_env_allowlist`).
+    """
+    env = _minimal_agy_env()
+    uv_cache_dir = os.environ.get("UV_CACHE_DIR")
+    if uv_cache_dir is not None:
+        env["UV_CACHE_DIR"] = uv_cache_dir
     return env
 
 
