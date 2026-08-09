@@ -1034,11 +1034,38 @@ def _build_serena_launch_command(serena: Mapping[str, Any], tool_timeout_sec: fl
     checked-in config already specifies ``--tool-timeout`` (e.g. a future
     config update), that explicit value is left untouched rather than
     being duplicated or overridden.
+
+    Issue #2015 P1 fix (control-plane live re-run + live repro, 2026-08-09,
+    head 69389317): live-reproduced a genuine `local_asset_research
+    live_serena_mcp_failed` / `stage_failure_class: process_exit` failure
+    (Serena's own stdout closing before the very first `initialize`
+    response, subprocess returncode 2, elapsed ~0.02s -- far too fast to be
+    a genuine startup timeout) under a `codex_cli`-delegated child. Serena's
+    own config template's `web_dashboard: true` default starts an HTTP
+    listener bound to a FIXED `127.0.0.1:24282` (Serena's own upstream docs
+    for ``gui_log_window`` explicitly acknowledge this exact class of
+    problem: "the various entities starting the Serena server or agent do
+    so in mysterious ways, often starting multiple instances of the process
+    without shutting down previous instances"). This host runs multiple
+    concurrent live trials/sessions that can each launch their own Serena
+    MCP subprocess around the same time; a second instance's dashboard
+    `bind()` on an already-occupied port is a plausible immediate-crash
+    cause consistent with the observed near-instant `returncode=2`. This
+    collector never uses the dashboard (it only ever exchanges JSON-RPC
+    over stdio) -- `--enable-web-dashboard False` removes the fixed-port
+    listener entirely for this launch path, independent of the user-local
+    `~/.serena/serena_config.yml` default (out of this Issue's Allowed
+    Paths). If the checked-in config already specifies
+    ``--enable-web-dashboard`` explicitly (e.g. a future config update),
+    that explicit value is left untouched rather than being duplicated or
+    overridden.
     """
     command = str(serena["command"])
     args = [str(arg) for arg in serena["args"]]
     if "--tool-timeout" not in args:
         args = [*args, "--tool-timeout", str(int(tool_timeout_sec))]
+    if "--enable-web-dashboard" not in args:
+        args = [*args, "--enable-web-dashboard", "False"]
     return [command, *args]
 
 

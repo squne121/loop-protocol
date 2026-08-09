@@ -2301,10 +2301,17 @@ def main():
     # run_gemini_headless.py). This fake server uses bare positional argv
     # (not argparse) for the test-only mode/tools/marker triple, so strip
     # that pair out first rather than mis-parsing it as a positional value.
+    #
+    # Issue #2015 P1 fix (control-plane live re-run + live repro,
+    # 2026-08-09, head 69389317): the real wrapper also now appends an
+    # explicit "--enable-web-dashboard False" pair (see the same
+    # _build_serena_launch_command) -- strip that pair out the same way,
+    # for the same reason.
     argv = list(sys.argv[1:])
-    if "--tool-timeout" in argv:
-        idx = argv.index("--tool-timeout")
-        del argv[idx : idx + 2]
+    for flag in ("--tool-timeout", "--enable-web-dashboard"):
+        if flag in argv:
+            idx = argv.index(flag)
+            del argv[idx : idx + 2]
 
     mode = argv[0] if len(argv) > 0 else "normal"
     tools = (argv[1] if len(argv) > 1 else "find_file,search_for_pattern,get_symbols_overview").split(",")
@@ -2757,6 +2764,52 @@ def test_serena_launch_command_wires_tool_timeout_to_subprocess(tmp_path, monkey
     assert command_with_override.count("--tool-timeout") == 1
     idx2 = command_with_override.index("--tool-timeout")
     assert command_with_override[idx2 + 1] == "99"
+
+
+def test_serena_launch_command_disables_web_dashboard(tmp_path, monkeypatch):
+    """Issue #2015 P1 fix (control-plane live re-run + live repro,
+    2026-08-09, head 69389317): live-reproduced a genuine
+    `local_asset_research live_serena_mcp_failed` /
+    `stage_failure_class: process_exit` failure (Serena's own subprocess
+    exiting with returncode 2 within ~0.02s of launch, before ever
+    responding to `initialize`) under a `codex_cli`-delegated child on a
+    host that runs multiple concurrent Serena MCP launches. Serena's own
+    config template defaults `web_dashboard: true`, binding a FIXED
+    `127.0.0.1:24282` HTTP listener this collector never uses (it only
+    ever exchanges JSON-RPC over stdio) -- a second concurrently-launched
+    instance's dashboard `bind()` on an already-occupied port is a
+    plausible immediate-crash cause consistent with the observed
+    near-instant `returncode=2`. `_build_serena_launch_command()` must
+    append an explicit `--enable-web-dashboard False` override to the
+    checked-in `.agents/mcp_config.json` args (without requiring any
+    change to that config file), and must never duplicate/override an
+    explicit `--enable-web-dashboard` already present in the checked-in
+    config."""
+    module = load_module()
+    serena_config = {
+        "command": "uvx",
+        "args": [
+            "--from", "git+https://github.com/oraios/serena@deadbeef00000000",
+            "serena", "start-mcp-server", "--project-from-cwd",
+        ],
+    }
+    command = module._build_serena_launch_command(serena_config, module.SERENA_SERVER_TOOL_TIMEOUT_SEC)
+    assert "--enable-web-dashboard" in command
+    idx = command.index("--enable-web-dashboard")
+    assert command[idx + 1] == "False"
+
+    # An explicit --enable-web-dashboard already present in the checked-in
+    # config is left untouched (never duplicated / overridden).
+    serena_config_with_override = {
+        "command": "uvx",
+        "args": [*serena_config["args"], "--enable-web-dashboard", "True"],
+    }
+    command_with_override = module._build_serena_launch_command(
+        serena_config_with_override, module.SERENA_SERVER_TOOL_TIMEOUT_SEC
+    )
+    assert command_with_override.count("--enable-web-dashboard") == 1
+    idx2 = command_with_override.index("--enable-web-dashboard")
+    assert command_with_override[idx2 + 1] == "True"
 
 
 def test_serena_cleanup_failure_on_success_path_is_fail_closed(tmp_path, monkeypatch):

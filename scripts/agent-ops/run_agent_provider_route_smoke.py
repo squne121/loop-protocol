@@ -239,10 +239,46 @@ def build_route_prompt(route: dict[str, str], evidence_dir: Path) -> str:
         # branch, without changing the literal composed commands the
         # child must still run verbatim.
         target_path_hint = f" target_path: {REPO_ROOT / 'README.md'}."
+    # Issue #2015 P1 fix (control-plane live re-run + live repro, 2026-08-09,
+    # head 69389317): live-reproduced the `validation_failed` /
+    # `retrieval_status: None` / 300s-exhaustion signature via direct,
+    # non-harness `claude -p --agent codebase-investigator` invocations of
+    # this exact prompt (both sequentially and concurrently) -- 100%
+    # consistent mechanism across every reproduced failure, captured with
+    # full raw stream-json transcripts: the delegated child's FIRST action
+    # is an unprompted, unnecessary `mkdir -p <evidence_dir>` (the harness
+    # already creates `evidence_dir` via `evidence_dir.mkdir(parents=True,
+    # exist_ok=True)` in `_run_route_once` BEFORE the child is ever spawned
+    # -- the child never needs to create it). Because `evidence_dir` lives
+    # under `.claude/artifacts/...`, Claude Code's own built-in "sensitive
+    # file" protection hard-denies that `mkdir` (this is independent of the
+    # `codebase-investigator` agent's own `permissionMode: dontAsk`, and of
+    # this repository's committed `.claude/settings.json` deny list -- ask/
+    # dontAsk govern the "ask" permission tier, not this lower, non-
+    # configurable product boundary). The child then silently substitutes
+    # ad hoc `/tmp/...` paths for BOTH `build_request.py --output` and
+    # `run_gemini_headless.py --output-file` instead of the exact paths in
+    # this prompt -- the AGY route itself genuinely succeeds end-to-end
+    # (`retrieval_status: succeeded` on the child's own inspection), but
+    # `evidence_dir/delegation_result.json` is never written, so this
+    # producer's own bounded `_poll_for_file` legitimately exhausts the
+    # entire remaining route deadline waiting for a file that will never
+    # appear. The instruction below removes the ambiguity that invites the
+    # unnecessary `mkdir` and forbids the path substitution outright.
+    no_mkdir_hint = (
+        " The output directory (containing both `delegation_request.json` and "
+        "`delegation_result.json`) already exists -- it was created before you "
+        "were invoked. Do not run `mkdir` or any other directory-creation "
+        "command for it or any ancestor of it, and do not substitute any other "
+        "output path (e.g. under `/tmp`) for `--output` or `--output-file` for "
+        "any reason, even if an earlier command in this task is denied or "
+        "fails for an unrelated reason -- always use the exact paths given "
+        "below verbatim."
+    )
     return (
         f"AGENT_PROVIDER_ROUTE_SMOKE probe (Issue #1886). Use the {agent} custom agent "
         f"(profile: {profile}) for the following bounded task, and report exactly which "
-        f"provider you dispatched to.{target_path_hint}\n\n"
+        f"provider you dispatched to.{target_path_hint}{no_mkdir_hint}\n\n"
         f"Task: build a delegation_request_v1 via "
         f"`uv run python3 {BUILD_REQUEST_SCRIPT} --provider agy --profile {profile} "
         f"--objective \"agent_provider_route_smoke probe\" --prompt \"Reply with the single "
