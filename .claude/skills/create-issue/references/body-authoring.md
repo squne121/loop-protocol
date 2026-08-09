@@ -600,6 +600,19 @@ gh issue list --search "<関連語>" --state open --json number,title,url
 
 `create_issue_txn.py --blocked-by` で blocker を指定して起票する（コマンド詳細は `create-issue/SKILL.md` の Blocker / Blocked-by 設定手順を参照）。
 
+## visual_impact フィールド（canonical schema owner, Issue #2019）
+
+`create-issue` / `edit-issue` / `issue-contract-review` / `review-issue` の4スキルが Issue 本文で扱いうる
+`visual_impact` 関連フィールド（`VISUAL_IMPACT_DECLARATION_V1` 等）は、単一の canonical schema ファイル
+[`docs/dev/visual-impact.schema.json`](../../../../docs/dev/visual-impact.schema.json) への参照として共有する。
+4 スキルのいずれも、このフィールドのキー集合・enum を独自に再定義しない（重複定義禁止）。
+
+- `docs/dev/visual-impact.schema.json` の `$defs.VISUAL_IMPACT_DECLARATION_V1` が Issue/PR body 上で人間または
+  PR author が記載する untrusted declaration の正本スキーマ
+- `docs/dev/visual-impact.schema.json` の `$defs.VISUAL_IMPACT_DECISION_V1` が CI が独立生成する trusted decision
+  の正本スキーマ（Issue/PR 本文執筆時には直接扱わない）
+- registry 側の正本は `docs/dev/visual-surfaces.yml`（`docs/dev/visual-surfaces.schema.json` で検証）
+
 ## Required Design References Authoring Guidance（Required Design References セクションの執筆ガイダンス・設計文書参照ガイド）
 
 Issue 本文の `## Required Design References` は、本 Issue の実装が前提とする **設計ドキュメント（SSOT）への repo 相対パス参照** を列挙するセクションである。

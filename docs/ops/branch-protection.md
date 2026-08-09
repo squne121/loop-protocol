@@ -13,6 +13,23 @@
 - #359 — 本 hardening Issue
 - #360 — SubAgent 側 PreToolUse push destination guard hook (OPEN, 補完策)
 
+## 既知の drift（Issue #2019 で確認・記録のみ）
+
+2026-08-08 時点の live 確認で、本書の記述（5 required checks: `typecheck`/`lint`/`test`/`build`/
+`python-test`）と実際の設定に以下の drift があることが判明した。本 Issue はこの drift を
+**記述の更新のみ**で解消する（live API mutation は行わない。ruleset/branch protection の実 API
+mutation は別途 post-merge ops step で扱う）。
+
+- **Classic branch protection**（`/branches/main/protection`）の `required_status_checks.contexts` は
+  実際には **6 件**（`typecheck`/`lint`/`test`/`build`/`python-test`/`validate-generated-artifact`）で、
+  本書の記述（5 件、`validate-generated-artifact` 欠落）と乖離している。
+- **Ruleset**（id `16796903`）の `required_status_checks` は本書の記述通り **5 件**
+  （`validate-generated-artifact` を含まない）であり、両層間でも drift がある。
+- `visual-impact-policy`（本 Issue で追加した新規 required check）は、両層のどちらにもまだ
+  registered されていない。required 化・GitHub Actions source pin・`require_code_owner_reviews`
+  有効化は、本 Issue の実装 PR には含めず、マージ後の明示 ops step として別途実行する
+  （Issue #2019 In Scope G）。
+
 ## 採用構成（多層防御）
 
 GitHub Ruleset を一次保護とし、Branch protection rule を二次保護として併用する。両者の rule は集約され、より厳しい方が適用される（[About rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets)）。
@@ -31,7 +48,7 @@ GitHub Ruleset を一次保護とし、Branch protection rule を二次保護と
   - `pull_request`: PR 経由必須 / `required_review_thread_resolution: true` / `dismiss_stale_reviews_on_push: true`
   - `required_status_checks`: `typecheck`, `lint`, `test`, `build`, `python-test` を `strict_required_status_checks_policy: true` で必須化
 
-### 二次: Branch protection rule (`/branches/main/protection`)
+### 二次防御: Branch protection rule (`/branches/main/protection`)
 
 - `required_status_checks.contexts`: `typecheck`, `lint`, `test`, `build`, `python-test`（`strict: true`）
 - `required_status_checks.checks[].app_id`: 全て `15368`（GitHub Actions app）。check source は GitHub Actions に固定されており、外部 PAT / 第三者 GitHub App による status 詐称は受け付けない（Blocker 3 対応）
@@ -55,7 +72,7 @@ GitHub Ruleset を一次保護とし、Branch protection rule を二次保護と
 
 いずれも別 Issue で議論し、本書とは独立して更新する。
 
-### Required status checks の source pinning（Blocker 3 対応）
+### Required status checks の source（発行元）pinning 方針（Blocker 3 対応）
 
 - Ruleset 側 `required_status_checks[].context` は status check 名のみ指定（context のみ）
 - Branch protection 側 `required_status_checks.checks[]` で 5 contexts すべてを `app_id: 15368`（GitHub Actions app）に固定
@@ -92,7 +109,7 @@ gh api repos/squne121/loop-protocol/branches/main/protection/required_pull_reque
 
 ### 2026-05-24 取得 raw snapshot（Blocker 1 対応・監査正本）
 
-**Ruleset `16796903`** — `gh api .../rulesets/16796903 --jq '{id, name, target, enforcement, bypass_actors, current_user_can_bypass, conditions, rules}'`
+**Ruleset `16796903`（取得コマンド）** — `gh api .../rulesets/16796903 --jq '{id, name, target, enforcement, bypass_actors, current_user_can_bypass, conditions, rules}'`
 
 ```json
 {
@@ -172,7 +189,7 @@ gh api repos/squne121/loop-protocol/branches/main/protection/required_pull_reque
 }
 ```
 
-**bypass_pull_request_allowances** — `gh api .../required_pull_request_reviews --jq '.bypass_pull_request_allowances // "field_absent"'`
+**bypass_pull_request_allowances（取得コマンド）** — `gh api .../required_pull_request_reviews --jq '.bypass_pull_request_allowances // "field_absent"'`
 
 ```
 field_absent
