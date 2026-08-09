@@ -1,0 +1,79 @@
+# VISUAL_SURFACES_REGISTRY_V1 (Issue #2019)
+#
+# registry-first canonical SSOT for visual-surface dependency mapping.
+# docs/dev/visual-baseline-registry.md は本 registry の generated
+# projection（または parity validator による内容一致保証対象）であり、
+# baseline の運用ポリシー本文の正本はそちらに残るが、surface と
+# producers/contracts の構造化マッピングの正本は本ファイルである。
+#
+# Validated against docs/dev/visual-surfaces.schema.json
+# (scripts/agent-ops/tests/test_visual_surfaces_schema.py).
+#
+# update_command_id / verify_command_id は raw シェル文字列ではなく閉域
+# enum。実 argv は .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py
+# ではなく scripts/agent-ops/resolve_visual_impact.py の COMMAND_ID_MAP
+# （evaluator 側の固定 mapping）から解決する。unknown id は schema
+# failure として fail-closed になる。
+
+schema_version: 1
+
+# 変更されると registry 内の全 surface を無条件に affected とみなす
+# グローバル invalidator。per-surface の import graph 解決では
+# 安全に境界づけられない共有 CSS / bundler 設定のみを列挙する。
+global_invalidators:
+  - src/style.css
+  - vite.config.ts
+  - tsconfig.json
+
+# UI 変更 candidate path の閉域判定 glob。producers/global_invalidators の
+# いずれにも mapping されないこのパターン配下の変更は
+# unmapped_visual_candidate として fail-closed する（no-impact PASS 禁止）。
+coverage_roots:
+  - "src/ui/**"
+  - "src/render/**"
+  - "src/style.css"
+
+surfaces:
+  combat-hud-running:
+    producers:
+      modules:
+        - src/ui/HudController.ts
+        - src/ui/combatHud.ts
+      styles: []
+      assets: []
+      config: []
+    contracts:
+      runner: vitest-browser-mode
+      spec: tests/component/combat-hud-running.vrt.test.ts
+      baseline: tests/component/__screenshots__/combat-hud-running.vrt.test.ts/combat-hud-running-chromium-linux.png
+      job: component-vrt-report
+      update_command_id: vitest_component_vrt_update
+      verify_command_id: vitest_component_vrt_verify
+      maturity: provisional
+    policy:
+      disposition_required: true
+
+  # Issue #2014 AC4 の critical fixture（hp=25/maxHp=100）。
+  # docs/dev/visual-baseline-registry.md §3.5 の
+  # VISUAL_BASELINE_REVIEW_EVIDENCE_V1 にのみ言及があり独立 registry row を
+  # 持たなかったが、本 Issue で独立 entry として登録する。baseline PNG は
+  # 既に tests/component/__screenshots__/combat-hud-running.vrt.test.ts/
+  # 配下に実在する（combat-hud-critical-chromium-linux.png）。
+  combat-hud-critical:
+    producers:
+      modules:
+        - src/ui/HudController.ts
+        - src/ui/combatHud.ts
+      styles: []
+      assets: []
+      config: []
+    contracts:
+      runner: vitest-browser-mode
+      spec: tests/component/combat-hud-running.vrt.test.ts
+      baseline: tests/component/__screenshots__/combat-hud-running.vrt.test.ts/combat-hud-critical-chromium-linux.png
+      job: component-vrt-report
+      update_command_id: vitest_component_vrt_update
+      verify_command_id: vitest_component_vrt_verify
+      maturity: provisional
+    policy:
+      disposition_required: true

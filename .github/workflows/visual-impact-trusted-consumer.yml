@@ -1,0 +1,193 @@
+name: visual-impact-policy-trusted-consumer
+
+# Issue #2019 In Scope I (P0-6 trust boundary, Scope Delta 2026-08-09):
+#
+# The `pull_request`-triggered `visual-impact-policy` job in `ci.yml` has a
+# structural trust-boundary gap that base-locking the EVALUATOR CODE alone
+# cannot close: the job's own DEFINITION (trigger, permissions, step list)
+# is always resolved from the candidate PR head's own `ci.yml`, so a
+# candidate PR can neuter the job itself (delete the materialize step,
+# force `exit 0`, weaken the schema, etc.) regardless of what the
+# evaluator source it calls contains.
+#
+# This workflow closes that gap using a GitHub Actions guarantee that a
+# `pull_request`-triggered job cannot replicate: for a `workflow_run`
+# trigger, GitHub always resolves the TRIGGERED workflow's own file
+# (trigger/permissions/jobs/steps -- this entire file) from the
+# base/default branch, never from the candidate PR head, independent of
+# what the candidate PR changes in its own copy of this same path. This
+# job therefore never checks out, and never executes, the candidate PR
+# head's code (no `actions/checkout` step references a PR head ref; no
+# step runs PR-head scripts, local composite actions, `package.json`
+# scripts, or dependency code -- AC30/AC36). It treats the `visual-impact-policy`
+# producer job's `VISUAL_IMPACT_DECISION_V1` decision artifact and
+# `component-vrt-evidence-manifest` evidence artifact as fully UNTRUSTED
+# input (schema validation, size limits, `manifest_sha256`/digest
+# verification, head_sha/PR-number/repository binding -- AC31/AC32/AC34)
+# and rejects stale `workflow_run` events whose `head_sha` no longer
+# matches the PR's current live head (AC35). Its own judgement is
+# published as a dedicated `visual-impact-policy-trusted` CheckRun bound
+# to the candidate PR's exact current head SHA -- a different check name
+# than the producer's `visual-impact-policy` (AC37) -- so a candidate PR
+# that forces the producer job to report success cannot force THIS job's
+# independently-computed verdict to change (AC33).
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: visual-impact-trusted-consumer-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  visual-impact-policy-trusted:
+    # Only `pull_request`-triggered `ci` runs produce a
+    # `visual-impact-decision-v1` artifact at all (the producer's
+    # `policy-check` step is itself gated on
+    # `github.event_name == 'pull_request'`); push/workflow_dispatch/
+    # merge_group-triggered `ci` runs are ignored here.
+    if: ${{ github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ubuntu-latest
+    # Minimal permissions: `actions: read` to list/download the producer
+    # run's artifacts, `checks: write` to publish the dedicated
+    # `visual-impact-policy-trusted` CheckRun. No other write scope is
+    # granted, and this is the ONLY job in this file.
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+    steps:
+      # AC30/AC36: no `ref:` is given here. For a `workflow_run`-triggered
+      # job, `actions/checkout` without an explicit `ref:` resolves to the
+      # SHA that triggered THIS workflow's own run -- i.e. the base/default
+      # branch commit this workflow file itself lives at -- never the
+      # candidate PR head. This step (and this job as a whole) never
+      # checks out, nor executes, the candidate PR head's own copy of
+      # `resolve_visual_impact.py` / `visual-impact.schema.json` / any
+      # `package.json` script.
+      - name: Checkout base/default branch (never the candidate PR head)
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-python-uv
+
+      - name: Resolve candidate PR number, workflow_run head_sha, and live PR head
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq '.pull_requests[0].number // empty')"
+          if [ -z "${PR_NUMBER}" ]; then
+            # `workflow_run.pull_requests[]` is only populated for
+            # same-repo (non-fork) PRs; fall back to the
+            # commits-associated-PRs API so a same-repo PR is still found
+            # even when the run payload omitted it.
+            PR_NUMBER="$(gh api "repos/${REPO}/commits/${RUN_HEAD_SHA}/pulls" --jq '[.[] | select(.state=="open")][0].number // empty')"
+          fi
+          if [ -z "${PR_NUMBER}" ]; then
+            echo "::warning::no open PR associated with workflow_run head_sha ${RUN_HEAD_SHA}; nothing to verify"
+            echo "pr_number=" >> "$GITHUB_OUTPUT"
+            echo "live_head_sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LIVE_HEAD_SHA="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "live_head_sha=${LIVE_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Download producer artifacts (untrusted input)
+        id: download
+        if: ${{ steps.pr.outputs.pr_number != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/decision artifacts/evidence
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" > run_artifacts.json
+          DECISION_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="visual-impact-decision-v1")][0].id // empty' run_artifacts.json)"
+          EVIDENCE_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="component-vrt-evidence-manifest")][0].id // empty' run_artifacts.json)"
+          if [ -n "${DECISION_ARTIFACT_ID}" ]; then
+            gh api "repos/${REPO}/actions/artifacts/${DECISION_ARTIFACT_ID}/zip" --output decision.zip
+            unzip -o -q decision.zip -d artifacts/decision
+          fi
+          if [ -n "${EVIDENCE_ARTIFACT_ID}" ]; then
+            gh api "repos/${REPO}/actions/artifacts/${EVIDENCE_ARTIFACT_ID}/zip" --output evidence.zip
+            unzip -o -q evidence.zip -d artifacts/evidence
+          fi
+
+      - name: Independently re-verify producer artifacts (base-locked evaluator)
+        id: verify
+        if: ${{ steps.pr.outputs.pr_number != '' }}
+        env:
+          EXPECTED_HEAD_SHA: ${{ steps.pr.outputs.live_head_sha }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          set +e
+          DECISION_FILE="artifacts/decision/visual_impact_decision_v1.json"
+          EVIDENCE_FILE="artifacts/evidence/visual_baseline_review_evidence_v2.json"
+          [ -f "${DECISION_FILE}" ] || DECISION_FILE=""
+          [ -f "${EVIDENCE_FILE}" ] || EVIDENCE_FILE=""
+          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+            --mode verify-trusted-artifact \
+            --visual-impact-schema docs/dev/visual-impact.schema.json \
+            --decision-file "${DECISION_FILE}" \
+            --evidence-manifest-file "${EVIDENCE_FILE}" \
+            --expected-head-sha "${EXPECTED_HEAD_SHA}" \
+            --expected-repository "${EXPECTED_REPOSITORY}" \
+            --expected-pr-number "${EXPECTED_PR_NUMBER}" \
+            --verdict-output verdict.json
+          echo "verify_exit_code=$?" >> "$GITHUB_OUTPUT"
+          cat verdict.json || true
+
+      - name: Publish visual-impact-policy-trusted CheckRun bound to candidate PR head
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          LIVE_HEAD_SHA: ${{ steps.pr.outputs.live_head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          VERIFY_EXIT_CODE: ${{ steps.verify.outputs.verify_exit_code || '' }}
+        run: |
+          set -euo pipefail
+          # AC37: bind to the candidate PR's exact CURRENT (freshly
+          # re-fetched) head SHA, never a stale workflow_run head_sha, so a
+          # stale run can never publish a green CheckRun on the live head.
+          # If no open PR could even be resolved, fall back to the
+          # workflow_run's own head_sha so the failure is still visible.
+          BIND_SHA="${LIVE_HEAD_SHA:-${RUN_HEAD_SHA}}"
+          CONCLUSION="failure"
+          SUMMARY="visual-impact-policy-trusted: could not resolve an open PR for this workflow_run (head_sha ${RUN_HEAD_SHA})."
+          if [ -n "${PR_NUMBER}" ]; then
+            if [ "${RUN_HEAD_SHA}" != "${LIVE_HEAD_SHA}" ]; then
+              # AC35: stale workflow_run -- the candidate PR head has moved
+              # on since this producer run started. Reject rather than
+              # publish a verdict for a head that is no longer current.
+              CONCLUSION="failure"
+              SUMMARY="visual-impact-policy-trusted: stale workflow_run (head_sha ${RUN_HEAD_SHA}) does not match current PR #${PR_NUMBER} head (${LIVE_HEAD_SHA}); rejected."
+            elif [ "${VERIFY_EXIT_CODE}" = "0" ]; then
+              CONCLUSION="success"
+              SUMMARY="visual-impact-policy-trusted: producer VISUAL_IMPACT_DECISION_V1 artifact and evidence manifest independently re-verified for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
+            else
+              CONCLUSION="failure"
+              SUMMARY="visual-impact-policy-trusted: producer artifact failed independent re-verification for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA} (see verdict.json in this run's logs)."
+            fi
+          fi
+          gh api "repos/${REPO}/check-runs" \
+            -f name="visual-impact-policy-trusted" \
+            -f head_sha="${BIND_SHA}" \
+            -f status="completed" \
+            -f conclusion="${CONCLUSION}" \
+            -f "output[title]=visual-impact-policy-trusted" \
+            -f "output[summary]=${SUMMARY}"
