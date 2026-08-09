@@ -49,6 +49,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RUNTIME_SMOKE_SCRIPT = Path(__file__).resolve().parent / "run_worktree_agent_runtime_smoke.py"
@@ -426,8 +427,53 @@ def _validate_github_research_route_evidence(evidence_dir: Path) -> str | None:
 # instead comes from the already-captured in-memory stdout stream, so a
 # miss there is never classified as transient (retrying it would silently
 # paper over a genuine identity/spawn failure).
-def _is_transient_infrastructure_candidate(route: dict[str, str], failure_class: str | None) -> bool:
-    return route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed"
+#
+# Issue #2015 AC14 root-cause finding (live reproduction, 2026-08-09, both
+# by control-plane and independently by an implementation-worker delegation
+# on head 505d3528): a SEPARATE genuine infrastructure-timing race, distinct
+# from the codex_cli spawn-evidence-disk-timing race above. A live full-route
+# trial can show every positive completion signal this producer independently
+# observes -- ``native_spawn_event_observed: true``, ``child_spawn_observed:
+# true``, ``child_completion_observed: true`` (via the harness's own
+# ``hook_subagent_stop`` channel, i.e. the delegated child's own SubagentStop
+# hook genuinely fired) -- and still never materialize
+# ``delegation_request.json`` even after the FULL bounded
+# ``_poll_for_file`` wait against the shared route deadline (observed:
+# ``evidence_materialized_elapsed_sec`` consuming the entire remaining
+# budget, e.g. 111s of a 150s route deadline). This is Claude Code's own
+# async ``Task`` tool dispatch (``child_launch_mode: async_launched`` was
+# observed on BOTH a genuinely-passing trial, where the file was already
+# present with zero polling, and a genuinely-failing trial, where it never
+# appeared) racing against the parent ``-p`` session's own turn completion --
+# a runtime behavior neither this producer nor
+# ``run_worktree_agent_runtime_smoke.py`` can force synchronous (out of this
+# Issue's control; not a bug in the child's own Bash tool calls, since the
+# SAME prompt/agent/profile combination passes cleanly on other invocations
+# against the identical head). It is diagnosed here (never silently
+# discarded -- see the ``child_completed_but_artifact_not_materialized``
+# secondary-failure classification in ``_run_route_once``) exactly like the
+# codex_cli disk-timing race above: bounded, single-retry-eligible, ledgered,
+# never a silent re-run of a genuine validation defect. Restricted to this
+# EXACT diagnostic signature (genuine completion observed, artifact never
+# materialized even after the bounded poll) so an unrelated
+# ``validation_failed`` cause (a real request/response schema defect) is
+# never silently retried.
+def _is_transient_infrastructure_candidate(
+    route: dict[str, str],
+    failure_class: str | None,
+    diagnostics: Mapping[str, Any] | None = None,
+) -> bool:
+    if route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed":
+        return True
+    if failure_class == "validation_failed" and diagnostics is not None:
+        secondary_failures = diagnostics.get("secondary_failures") or []
+        if any(
+            isinstance(entry, dict)
+            and entry.get("kind") == "child_completed_but_artifact_not_materialized"
+            for entry in secondary_failures
+        ):
+            return True
+    return False
 
 
 # Issue #2015 AC11 (OWNER Scope Reframe 2026-08-09): bounded, non-busy
@@ -744,7 +790,7 @@ def run_route_live(
         {"attempt": 1, "status": initial["status"], "failure_class": initial["failure_class"]}
     )
     if initial["status"] != "fail" or not _is_transient_infrastructure_candidate(
-        route, initial["failure_class"]
+        route, initial["failure_class"], initial_diagnostics
     ):
         initial_diagnostics["attempts"] = attempts
         initial_diagnostics["route_deadline_sec"] = timeout_seconds

@@ -481,6 +481,80 @@ class TestProducerRetryPolicy:
         route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
         assert producer._is_transient_infrastructure_candidate(route, "direct_fallback_invoked") is False
 
+    def test_validation_failed_without_materialization_diagnostics_is_not_transient(self, producer):
+        """A ``validation_failed`` cause with no diagnostics (or diagnostics
+        that never recorded the artifact-materialization race) must remain
+        non-transient -- only adding the new Issue #2015 AC14 diagnostic
+        signature below is allowed to change that."""
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        assert producer._is_transient_infrastructure_candidate(route, "validation_failed", None) is False
+        assert (
+            producer._is_transient_infrastructure_candidate(
+                route, "validation_failed", {"secondary_failures": []}
+            )
+            is False
+        )
+        assert (
+            producer._is_transient_infrastructure_candidate(
+                route,
+                "validation_failed",
+                {"secondary_failures": [{"kind": "nonzero_harness_exit_with_spawn_evidence"}]},
+            )
+            is False
+        )
+
+    def test_claude_child_completed_artifact_not_materialized_is_transient_candidate(self, producer):
+        """Issue #2015 AC14 root-cause finding (live reproduction on head
+        505d3528): a genuinely-completed child (SubagentStop hook fired)
+        whose delegation artifact never materializes even after the bounded
+        poll is a genuine async-Task-dispatch infrastructure-timing race,
+        not a validation defect -- eligible for the same bounded single
+        retry as the codex_cli spawn-evidence disk-timing race, on EITHER
+        runtime (reproduced live on claude_code; the underlying async
+        dispatch race is not runtime-specific)."""
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "child_completed_but_artifact_not_materialized"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
+            is True
+        )
+
+    def test_codex_child_completed_artifact_not_materialized_is_transient_candidate(self, producer):
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "child_completed_but_artifact_not_materialized"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
+            is True
+        )
+
+    def test_child_completed_marker_never_promotes_a_different_failure_class(self, producer):
+        """The diagnostic-marker path is scoped to ``validation_failed``
+        only -- it must never make an unrelated failure_class (e.g.
+        ``provider_mismatch``, ``gemini_invoked``) transient just because
+        the marker happens to be present in secondary_failures."""
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "child_completed_but_artifact_not_materialized"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "provider_mismatch", diagnostics)
+            is False
+        )
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "gemini_invoked", diagnostics)
+            is False
+        )
+
 
 class TestValidator:
     def _write_artifact(self, directory: Path, name: str, artifact: dict) -> Path:
