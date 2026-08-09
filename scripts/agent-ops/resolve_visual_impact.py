@@ -118,10 +118,20 @@ class ResolveResult:
 # ---------------------------------------------------------------------------
 
 
-def load_registry_text(registry_path: Path, git_ref: str | None, repo_root: Path) -> str:
-    """Load registry YAML text either from the working tree or a git ref."""
+BOOTSTRAP_EMPTY_REGISTRY_TEXT = "schema_version: 1\nsurfaces: {}\n"
+
+
+def load_registry_text(registry_path: Path, git_ref: str | None, repo_root: Path) -> tuple[str, bool]:
+    """Load registry YAML text either from the working tree or a git ref.
+    Returns `(text, existed_at_ref)` -- PR #2045 OWNER fix_delta P0-2:
+    `existed_at_ref` lets the caller distinguish the legitimate "this ref
+    predates the registry entirely" bootstrap case (a synthetic empty
+    document that must NOT be schema-validated -- the schema legitimately
+    requires a non-empty `surfaces` map, which no genuinely-missing file
+    can ever satisfy) from a genuinely broken/invalid registry that DID
+    exist at this ref."""
     if git_ref is None:
-        return registry_path.read_text(encoding="utf-8")
+        return registry_path.read_text(encoding="utf-8"), True
     rel = registry_path.relative_to(repo_root).as_posix()
     proc = subprocess.run(
         ["git", "show", f"{git_ref}:{rel}"],
@@ -134,8 +144,8 @@ def load_registry_text(registry_path: Path, git_ref: str | None, repo_root: Path
         # Registry did not exist at this ref (e.g. base ref predates this
         # Issue) -- treat as an empty registry rather than failing closed on
         # git plumbing noise; downstream union logic tolerates an empty map.
-        return "schema_version: 1\nsurfaces: {}\n"
-    return proc.stdout
+        return BOOTSTRAP_EMPTY_REGISTRY_TEXT, False
+    return proc.stdout, True
 
 
 def validate_registry(doc: dict[str, Any], schema_path: Path) -> None:
@@ -173,7 +183,16 @@ def _yaml_safe_load_no_duplicate_keys(text: str, error_cls: type[Exception]) -> 
 def load_and_validate_registry(
     registry_path: Path, schema_path: Path, git_ref: str | None, repo_root: Path
 ) -> dict[str, Any]:
-    text = load_registry_text(registry_path, git_ref, repo_root)
+    text, existed_at_ref = load_registry_text(registry_path, git_ref, repo_root)
+    if not existed_at_ref:
+        # Bootstrap case (PR #2045 OWNER fix_delta P0-2): this ref predates
+        # the registry file entirely. The synthetic empty document is
+        # intentionally schema-invalid (`surfaces` must be non-empty) and
+        # must never be run through `validate_registry` -- doing so turned
+        # every legitimate bootstrap union (e.g. this very Issue's own PR,
+        # whose base branch has no registry yet) into a fabricated
+        # `RegistryError`.
+        return {"schema_version": 1, "surfaces": {}}
     try:
         doc = _yaml_safe_load_no_duplicate_keys(text, RegistryError) or {}
     except RegistryError:

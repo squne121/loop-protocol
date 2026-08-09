@@ -248,6 +248,51 @@ def test_pr2045_spec_only_change_marks_surface_affected():
     assert "combat-hud-critical" in affected_ids
 
 
+def test_pr2045_bootstrap_base_ref_predating_registry_is_not_a_resolver_error():
+    """PR #2045 OWNER fix_delta P0-2/P0-3: enabling `--base-ref`/`--head-ref`
+    in production (this PR's own CI wiring fix) exposed a real bug: a base
+    ref that predates the registry file entirely (this Issue's own PR,
+    whose base branch commit -- before merge -- has no
+    docs/dev/visual-surfaces.yml) synthesizes an empty registry doc that was
+    then incorrectly run through schema validation (which requires
+    `surfaces` to be non-empty) and raised `RegistryError`, poisoning every
+    resolve() call with a spurious `base registry invalid` failure. The
+    legitimate bootstrap case must never schema-fail."""
+    import subprocess
+
+    # A commit before this Issue's registry file existed.
+    pre_registry_sha = subprocess.run(
+        ["git", "log", "--format=%H", "--", "docs/dev/visual-surfaces.yml"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip().splitlines()[-1]
+    pre_registry_parent = subprocess.run(
+        ["git", "rev-parse", f"{pre_registry_sha}~1"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if pre_registry_parent.returncode != 0:
+        pytest.skip("no ancestor commit predating docs/dev/visual-surfaces.yml available locally")
+    base_ref = pre_registry_parent.stdout.strip()
+
+    result = rvi.resolve(
+        changed_paths=["src/ui/combatHud.ts"],
+        registry_path=REGISTRY_PATH,
+        schema_path=SCHEMA_PATH,
+        mjs_path=MJS_PATH,
+        repo_root=REPO_ROOT,
+        base_ref=base_ref,
+        head_ref=None,
+    )
+    assert not any("base registry invalid" in e for e in result.errors), result.errors
+    affected_ids = {entry["surface_id"] for entry in result.affected_surfaces}
+    assert "combat-hud-running" in affected_ids
+
+
 def test_pr2045_resolve_result_carries_validated_head_doc():
     """PR #2045 OWNER fix_delta P0-2: resolve() exposes the single validated
     head registry document so callers (e.g. _run_policy_check) never
