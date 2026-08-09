@@ -128,6 +128,78 @@ def test_controlled_rewrite_consumes_exactly_generated_authority():
     assert consumed["payload_sha256"] == manifest["payload_sha256"]
 
 
+def test_termination_telemetry_records_generated_received_consumed_by_relpath_and_sha256():
+    """#2053 AC10 P0 fix-delta (iteration 2, OWNER PR review): the
+    consumption receipt (the canonical termination point of the producer ->
+    router -> consumer chain) must record the generated (producer
+    manifest), received (router receipt), and consumed (consumed payload)
+    artifacts by *relative path + independently recomputed sha256* -- not
+    merely non-reuse of a stale sidecar (which is a necessary but
+    insufficient AC10 property already covered by
+    test_stale_previous_invocation_sidecar_is_never_reused in
+    test_scope_delta_authority_transport.py).
+    """
+    import hashlib
+
+    invocation_id = "e2e-termination-telemetry-1"
+    git_head_sha = "1234567890abcdef1234567890abcdef12345678"
+    evidence = _evidence(comment_id=99)
+
+    produced, error = preflight.generate_authority_transport_manifest(
+        evidence=evidence,
+        issue_number=ISSUE_NUMBER,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=REPO_ROOT,
+    )
+    assert error is None, error
+    manifest_path = Path(produced["manifest_path"])
+
+    router_receipt = router.generate_router_receipt(
+        transport_manifest_path=produced["manifest_path"],
+        issue_number=ISSUE_NUMBER,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        authority_expected=True,
+        repo_root=REPO_ROOT,
+    )
+    assert router_receipt["status"] == "ok"
+    router_receipt_path = _artifact_dir(invocation_id) / "scope_delta_router_receipt_v1.json"
+
+    consumption_receipt = preflight.consume_authority_transport(
+        router_receipt_path=str(router_receipt_path),
+        issue_number=ISSUE_NUMBER,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=REPO_ROOT,
+    )
+    assert consumption_receipt["status"] == "ok"
+
+    consumed_path = _artifact_dir(invocation_id) / "consumed_authority_payload_v1.json"
+
+    def _sha256_of(path: Path) -> str:
+        return hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+
+    generated_artifact = consumption_receipt["generated_artifact"]
+    received_artifact = consumption_receipt["received_artifact"]
+    consumed_artifact = consumption_receipt["consumed_artifact"]
+
+    assert generated_artifact == {
+        "relative_path": str(manifest_path.relative_to(REPO_ROOT)),
+        "sha256": _sha256_of(manifest_path),
+    }
+    assert received_artifact == {
+        "relative_path": str(router_receipt_path.relative_to(REPO_ROOT)),
+        "sha256": _sha256_of(router_receipt_path),
+    }
+    assert consumed_artifact == {
+        "relative_path": str(consumed_path.relative_to(REPO_ROOT)),
+        "sha256": _sha256_of(consumed_path),
+    }
+
+
 def test_consumer_never_accepts_a_router_receipt_pointing_at_a_different_manifest_payload(tmp_path):
     """GIVEN a router receipt whose transport_payload_sha256 does not match
     the manifest it points to (simulated tamper between router and

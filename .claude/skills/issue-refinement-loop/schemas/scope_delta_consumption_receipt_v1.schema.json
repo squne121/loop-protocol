@@ -96,6 +96,72 @@
         "path_confinement_not_regular_file",
         null
       ]
+    },
+    "generated_artifact": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "sha256"
+      ],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "description": "#2053 AC10: termination telemetry -- relative path + sha256 of the generated artifact, independently confirmed to exist on disk (never a fixed mutable sidecar)."
+    },
+    "received_artifact": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "sha256"
+      ],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "description": "#2053 AC10: termination telemetry -- relative path + sha256 of the received artifact, independently confirmed to exist on disk (never a fixed mutable sidecar)."
+    },
+    "consumed_artifact": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "sha256"
+      ],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "description": "#2053 AC10: termination telemetry -- relative path + sha256 of the consumed artifact, independently confirmed to exist on disk (never a fixed mutable sidecar)."
     }
   }
 }

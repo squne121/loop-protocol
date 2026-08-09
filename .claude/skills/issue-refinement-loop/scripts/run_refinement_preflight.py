@@ -492,6 +492,31 @@ def consume_authority_transport(
     invocation_id -- the "exactly once" guard for AC9's "一回だけ mutation").
     """
 
+    # #2053 AC10 P0 fix-delta (iteration 2): termination telemetry recording
+    # generated/received/consumed artifacts by *relative path + sha256*,
+    # not depending on any fixed mutable sidecar. Populated progressively as
+    # each artifact is independently confirmed to exist on disk; every
+    # _receipt() call (success or fail-closed) carries whatever subset was
+    # confirmed by that point.
+    _artifacts_seen: dict = {
+        "generated_artifact": None,
+        "received_artifact": None,
+        "consumed_artifact": None,
+    }
+
+    def _artifact_ref(path: "Path | None") -> "dict | None":
+        if path is None or not path.exists():
+            return None
+        try:
+            relative_path = str(path.relative_to(repo_root))
+        except ValueError:
+            relative_path = str(path)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        return {"relative_path": relative_path, "sha256": _sha256(text)}
+
     def _receipt(
         *,
         status: str,
@@ -514,6 +539,9 @@ def consume_authority_transport(
             "mutation_applied": mutation_applied,
             "readback_verified": readback_verified,
             "fresh_rerun_performed": fresh_rerun_performed,
+            "generated_artifact": _artifacts_seen["generated_artifact"],
+            "received_artifact": _artifacts_seen["received_artifact"],
+            "consumed_artifact": _artifacts_seen["consumed_artifact"],
             "status": status,
             "reason_code": reason_code,
         }
@@ -533,6 +561,7 @@ def consume_authority_transport(
         return _receipt(status="environment_failure", reason_code=confinement_error)
     if not receipt_path.exists():
         return _receipt(status="environment_failure", reason_code="missing_file")
+    _artifacts_seen["received_artifact"] = _artifact_ref(receipt_path)
 
     try:
         router_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -562,6 +591,7 @@ def consume_authority_transport(
         return _receipt(status="environment_failure", reason_code=confinement_error)
     if not manifest_path.exists():
         return _receipt(status="environment_failure", reason_code="missing_file")
+    _artifacts_seen["generated_artifact"] = _artifact_ref(manifest_path)
 
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -615,6 +645,7 @@ def consume_authority_transport(
     readback_verified = (
         isinstance(readback, dict) and readback.get("payload_sha256") == manifest_payload_sha256
     )
+    _artifacts_seen["consumed_artifact"] = _artifact_ref(consumed_path)
 
     # --- fresh rerun: re-run classification against the consumed payload to
     # reconfirm the route is unchanged (no silent drift between transport
