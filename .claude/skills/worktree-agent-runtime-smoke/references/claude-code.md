@@ -78,6 +78,46 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示の
 `agent_prompt_stalled` 節を参照）。runner はこれを検知した場合のみ
 `send-keys enter` による 1 回限りの回復を行う。
 
+## メインセッション Agent Identity・定義束縛・Skill 証跡（main_agent_identity / agent_definition / skill_evidence, Issue #2046）
+
+`--claude-agent-name <persona>` を指定した structured lane 起動は、`--agent <persona>`
+を実際の `claude` 起動 argv へ挿入するのに加えて、以下 2 チャネルを観測する:
+
+- `SessionStart` hook lifecycle event（`--include-hook-events` が既に有効化している
+  チャネル）から、main session 自身が実際にどの `agent_type` で起動したかを取得する
+  （`extract_claude_session_start_identity`）。`SubagentStart`/`SubagentStop`（spawned
+  child 向け、Issue #2021）とは別チャネル
+- `Read` tool_use とそれに対応する `tool_use_id` 一致の `tool_result` から、persona ごとの
+  canonical Skill body（`issue-creator`→`.claude/skills/create-issue/SKILL.md`、
+  `issue-editor`→`.claude/skills/edit-issue/SKILL.md`）が実際に読まれたかを取得する
+  （`extract_claude_canonical_read_receipt`）。path 不一致・`tool_use_id` 不一致・
+  `is_error: true` の tool_result はすべて `unavailable` として fail-closed になる
+
+### 非mutation hermetic レーン（変更を一切行わない検証経路、`--hermetic-agent-definition`）
+
+`--claude-agent-name` と併用すると、project-discovery の `--agent <name>` lookup の
+代わりに以下を起動する:
+
+```bash
+claude -p \
+  --output-format stream-json --include-hook-events --no-session-persistence \
+  --max-turns "$MAX_TURNS" --verbose \
+  --agent "<persona>-hermetic-<source-sha256[:12]>" \
+  --agents "$HERMETIC_AGENTS_JSON_FILE" \
+  --settings "$HERMETIC_SETTINGS_JSON_FILE"
+```
+
+- `$HERMETIC_AGENTS_JSON_FILE` は candidate Agent 定義の static frontmatter から
+  決定論的に生成した session-local JSON（`tools: ["Read"]` 固定）。system temp
+  directory に書き、run 終了後に必ず削除する（worktree postcondition に影響しない）
+- `$HERMETIC_SETTINGS_JSON_FILE` は `Edit`/`MultiEdit`/`Write`/`NotebookEdit`/`Bash`/
+  `Agent` を deny する session-local settings
+- `--agents` / `--settings` は `_CLAUDE_FIXED_ARGV_FLAGS` に登録済みのため、実行中の
+  Claude Code バージョンがどちらかを認識しない場合は capability SKIP（exit 77）になる
+  （crash や汎用 FAIL に落ちない）
+- `Edit`/`MultiEdit`/`Write`/`NotebookEdit`/`Bash`/`Agent` の tool_use event が 1 件でも
+  観測されれば run 全体が FAIL（exit 1）。deny 設定の有効性を model の自己申告に依存しない
+
 ## 観測できる主な evidence
 
 - structured lane: `type: system/init`、`type: result`、hook lifecycle event の件数を確認できる
