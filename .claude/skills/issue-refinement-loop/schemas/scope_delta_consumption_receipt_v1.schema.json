@@ -90,6 +90,10 @@
         "router_receipt_not_ok",
         "fresh_rerun_route_drift",
         "fresh_rerun_error",
+        "path_confinement_symlink_rejected",
+        "path_confinement_resolve_failed",
+        "path_confinement_outside_artifact_root",
+        "path_confinement_not_regular_file",
         null
       ]
     }

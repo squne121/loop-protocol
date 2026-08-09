@@ -348,6 +348,68 @@ def test_fresh_rerun_drift_fails_closed_not_silently_ok(tmp_path):
     assert receipt["mutation_applied"] is True
 
 
+def test_symlinked_router_receipt_path_is_rejected(tmp_path):
+    """#2053 P1 fix-delta (iteration 2, OWNER PR review): a router_receipt_path
+    that is a symlink (even one that resolves to a legitimate on-disk
+    router receipt) must be rejected before it is ever opened -- artifact
+    paths are confined to the .claude/artifacts/ root and must be regular
+    files, not symlinks.
+    """
+    import run_refinement_preflight as preflight
+
+    issue_number = 2053
+    invocation_id = "symlink-defense-1"
+    repo_root = REPO_ROOT
+    invocation_dir = _issue_artifact_dir(issue_number, invocation_id)
+    invocation_dir.mkdir(parents=True, exist_ok=True)
+
+    real_receipt_path = invocation_dir / "real_receipt.json"
+    real_receipt_path.write_text(
+        json.dumps({"schema_version": "SCOPE_DELTA_ROUTER_RECEIPT_V1", "status": "ok"}),
+        encoding="utf-8",
+    )
+    symlink_path = invocation_dir / "scope_delta_router_receipt_v1.json"
+    symlink_path.symlink_to(real_receipt_path)
+
+    receipt = preflight.consume_authority_transport(
+        router_receipt_path=str(symlink_path),
+        issue_number=issue_number,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha="deadbeef",
+        repo_root=repo_root,
+    )
+    assert receipt["status"] == "environment_failure"
+    assert receipt["reason_code"] == "path_confinement_symlink_rejected"
+    assert receipt["mutation_applied"] is False
+
+
+def test_outside_artifact_root_router_receipt_path_is_rejected(tmp_path):
+    """#2053 P1 fix-delta: a router_receipt_path outside .claude/artifacts/
+    (e.g. an attacker-influenceable string pointing elsewhere on disk) is
+    rejected by path confinement rather than being opened.
+    """
+    import run_refinement_preflight as preflight
+
+    outside_path = tmp_path / "not_confined_receipt.json"
+    outside_path.write_text(
+        json.dumps({"schema_version": "SCOPE_DELTA_ROUTER_RECEIPT_V1", "status": "ok"}),
+        encoding="utf-8",
+    )
+
+    receipt = preflight.consume_authority_transport(
+        router_receipt_path=str(outside_path),
+        issue_number=2053,
+        repo=REPO,
+        invocation_id="outside-root-1",
+        git_head_sha="deadbeef",
+        repo_root=REPO_ROOT,
+    )
+    assert receipt["status"] == "environment_failure"
+    assert receipt["reason_code"] == "path_confinement_outside_artifact_root"
+    assert receipt["mutation_applied"] is False
+
+
 def test_stale_previous_invocation_sidecar_is_never_reused(tmp_path):
     """GIVEN a consumption receipt already exists for an invocation_id
     WHEN the consumer is invoked again for the same invocation_id

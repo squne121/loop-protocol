@@ -161,7 +161,11 @@ def test_consumer_never_accepts_a_router_receipt_pointing_at_a_different_manifes
         "status": "ok",
         "reason_code": None,
     }
-    receipt_path = tmp_path / "tampered_router_receipt.json"
+    # #2053 P1 fix-delta: the tampered receipt must live under the confined
+    # artifact root (consume_authority_transport() now rejects any path
+    # outside .claude/artifacts/ before opening it).
+    receipt_path = _artifact_dir(invocation_id) / "tampered_router_receipt.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
     receipt_path.write_text(json.dumps(tampered_receipt), encoding="utf-8")
 
     consumption_receipt = preflight.consume_authority_transport(

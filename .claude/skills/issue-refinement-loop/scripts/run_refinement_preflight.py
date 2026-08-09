@@ -348,6 +348,36 @@ def _authority_transport_dir(repo_root: Path, issue_number: int, invocation_id: 
     )
 
 
+def _confine_artifact_path(path: "Path | None", repo_root: Path) -> "tuple[Path | None, str | None]":
+    """#2053 P1 fix-delta: resolve `path` and confine it under
+    <repo_root>/.claude/artifacts/, rejecting symlinks and non-regular
+    files, before it is ever opened for reading. Router receipts and
+    transport manifests are attacker-influenceable strings (they arrive as
+    CLI arguments / receipt fields) -- without this check a
+    symlink or a path outside the artifact root could be substituted.
+
+    Returns (resolved_path, None) on success, or (None, reason_code) on any
+    violation (fail-closed, never silently proceeds with an unconfined
+    path).
+    """
+    if path is None:
+        return None, "missing_file"
+    artifact_root = (repo_root / ".claude" / "artifacts").resolve()
+    if path.is_symlink():
+        return None, "path_confinement_symlink_rejected"
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        return None, "path_confinement_resolve_failed"
+    try:
+        resolved.relative_to(artifact_root)
+    except ValueError:
+        return None, "path_confinement_outside_artifact_root"
+    if resolved.exists() and not resolved.is_file():
+        return None, "path_confinement_not_regular_file"
+    return resolved, None
+
+
 def _atomic_write_json_with_readback(path: Path, data: dict) -> tuple[bool, "dict | None", "str | None"]:
     """flush -> fsync -> os.replace, then read back and independently
     recompute the canonical digest to verify the bytes on disk match what
@@ -498,7 +528,10 @@ def consume_authority_transport(
         return _receipt(status="environment_failure", reason_code="stale_previous_invocation")
 
     receipt_path = Path(router_receipt_path) if router_receipt_path else None
-    if receipt_path is None or not receipt_path.exists():
+    receipt_path, confinement_error = _confine_artifact_path(receipt_path, repo_root)
+    if confinement_error is not None:
+        return _receipt(status="environment_failure", reason_code=confinement_error)
+    if not receipt_path.exists():
         return _receipt(status="environment_failure", reason_code="missing_file")
 
     try:
@@ -524,7 +557,10 @@ def consume_authority_transport(
 
     manifest_path_str = router_receipt.get("transport_manifest_path")
     manifest_path = Path(manifest_path_str) if manifest_path_str else None
-    if manifest_path is None or not manifest_path.exists():
+    manifest_path, confinement_error = _confine_artifact_path(manifest_path, repo_root)
+    if confinement_error is not None:
+        return _receipt(status="environment_failure", reason_code=confinement_error)
+    if not manifest_path.exists():
         return _receipt(status="environment_failure", reason_code="missing_file")
 
     try:

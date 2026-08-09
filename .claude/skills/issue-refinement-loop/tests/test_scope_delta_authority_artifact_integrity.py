@@ -173,7 +173,13 @@ def test_malformed_json_router_environment_failure(tmp_path):
 
 
 def test_malformed_json_consumer_environment_failure(tmp_path):
-    bad = tmp_path / "bad_receipt.json"
+    # #2053 P1 fix-delta: the bad receipt must live under the confined
+    # artifact root -- consume_authority_transport() now rejects any path
+    # outside .claude/artifacts/ before it is ever opened, so a tmp_path
+    # fixture here would (correctly) fail with path_confinement_* instead
+    # of exercising the malformed_json fault this test targets.
+    bad = _artifact_dir("fault-malformed-consumer") / "bad_receipt.json"
+    bad.parent.mkdir(parents=True, exist_ok=True)
     bad.write_text("not json at all", encoding="utf-8")
     receipt = preflight.consume_authority_transport(
         router_receipt_path=str(bad),
