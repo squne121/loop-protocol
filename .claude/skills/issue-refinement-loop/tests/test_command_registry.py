@@ -396,3 +396,56 @@ class TestRegistryEntrySpecs:
     def test_all_timeout_positive(self):
         for cmd_id, entry in reg.REGISTRY.items():
             assert entry["timeout_seconds"] > 0, f"{cmd_id} timeout must be > 0"
+
+
+# ---------------------------------------------------------------------------
+# #2053 P0 fix-delta (iteration 3, OWNER PR review): the router
+# ("decide.run") and producer/consumer ("authority_transport.produce" /
+# "authority_transport.consume") command_registry.py entries must actually
+# be recognized by the privileged skill_runtime_command_policy.py runtime
+# policy -- not merely declared in the registry.
+# ---------------------------------------------------------------------------
+
+_AGENT_GUARDS_DIR = Path(__file__).resolve().parent.parent.parent.parent.parent / "scripts" / "agent-guards"
+
+
+def _load_skill_runtime_command_policy():
+    sys.path.insert(0, str(_AGENT_GUARDS_DIR))
+    import skill_runtime_command_policy as policy  # noqa: PLC0415
+
+    return policy
+
+
+class TestAuthorityTransportCommandIdsRegisteredInRuntimePolicy:
+    """#2053 P0 fix-delta (iteration 3): decide.run / authority_transport.produce
+    / authority_transport.consume must be in skill_runtime_command_policy.py's
+    eligible_command_ids, with execution_class matching command_registry.py's
+    own declared execution_class for each entry exactly."""
+
+    @pytest.mark.parametrize(
+        "command_id",
+        ["decide.run", "authority_transport.produce", "authority_transport.consume"],
+    )
+    def test_command_id_registered(self, command_id):
+        policy = _load_skill_runtime_command_policy()
+        eligible = policy.SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]
+        assert command_id in eligible, (
+            f"{command_id} is declared in command_registry.py but missing from "
+            "skill_runtime_command_policy.py's eligible_command_ids -- the "
+            "privileged runtime policy cannot recognize it."
+        )
+
+    @pytest.mark.parametrize(
+        "command_id",
+        ["decide.run", "authority_transport.produce", "authority_transport.consume"],
+    )
+    def test_execution_class_matches_registry(self, command_id):
+        policy = _load_skill_runtime_command_policy()
+        eligible = policy.SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]
+        registry_entry = reg.REGISTRY[command_id]
+        policy_entry = eligible[command_id]
+        assert policy_entry["execution_class"] == registry_entry["execution_class"], (
+            f"{command_id}: skill_runtime_command_policy.py execution_class "
+            f"{policy_entry['execution_class']!r} does not match "
+            f"command_registry.py execution_class {registry_entry['execution_class']!r}"
+        )

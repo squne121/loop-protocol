@@ -254,3 +254,138 @@ def test_consumer_never_accepts_a_router_receipt_pointing_at_a_different_manifes
 
     consumed_path = _artifact_dir(invocation_id) / "consumed_authority_payload_v1.json"
     assert not consumed_path.exists()
+
+
+def test_consume_authority_transport_delegates_mutation_to_real_contract_patch_plan_consumer():
+    """#2053 P0 fix-delta (iteration 3, OWNER PR review): when a
+    CONTRACT_PATCH_PLAN_V1 and anchor_context are supplied, the consumer's
+    mutation is delegated to the real, existing controlled-mutation lane
+    (consume_trusted_anchor_contract_patch_plan) -- not merely the local
+    consumed_authority_payload_v1.json artifact write. Proven with a spy
+    fresh_checks callback: it is only reachable from inside
+    run_trusted_anchor_iteration_zero(), so it being called proves the real
+    lane was genuinely invoked, not just declared.
+    """
+    invocation_id = "e2e-real-mutation-lane-1"
+    git_head_sha = "abc123def456abc123def456abc123def456abc"
+    evidence = _evidence(comment_id=555)
+
+    produced, error = preflight.generate_authority_transport_manifest(
+        evidence=evidence,
+        issue_number=ISSUE_NUMBER,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=REPO_ROOT,
+    )
+    assert error is None, error
+
+    router_receipt = router.generate_router_receipt(
+        transport_manifest_path=produced["manifest_path"],
+        issue_number=ISSUE_NUMBER,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        authority_expected=True,
+        repo_root=REPO_ROOT,
+    )
+    assert router_receipt["status"] == "ok"
+    router_receipt_path = _artifact_dir(invocation_id) / "scope_delta_router_receipt_v1.json"
+
+    fresh_checks_calls = []
+
+    def _fresh_checks(current_issue):
+        fresh_checks_calls.append(current_issue)
+        return {
+            "preflight": "pass",
+            "review": "approve",
+            "readiness": "go",
+            "allowed_paths": "pass",
+            "permission_profile": "pass",
+            "runtime_evidence": "pass",
+        }
+
+    anchor_comment_id = 555
+    anchor_url = f"https://github.com/{REPO}/issues/{ISSUE_NUMBER}#issuecomment-{anchor_comment_id}"
+    anchor_body = "trusted directive body"
+    anchor_payload = {"id": anchor_comment_id, "author_association": "OWNER"}
+    issue = {"body": "## Acceptance Criteria\n- [ ] AC1: existing\n"}
+
+    consumption_receipt = preflight.consume_authority_transport(
+        router_receipt_path=str(router_receipt_path),
+        issue_number=ISSUE_NUMBER,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=REPO_ROOT,
+        contract_patch_plan={"operations": []},
+        anchor_context={
+            "issue": issue,
+            "anchor_url": anchor_url,
+            "anchor_payload": anchor_payload,
+            "anchor_body": anchor_body,
+            "callbacks": {"fresh_checks": _fresh_checks},
+        },
+    )
+
+    assert len(fresh_checks_calls) == 1
+    assert consumption_receipt["mutation_lane"] == "contract_patch_plan_consumer"
+    assert consumption_receipt["contract_update_status"] == "no_change"
+    assert consumption_receipt["mutation_applied"] is True
+    assert consumption_receipt["status"] == "ok"
+
+
+def test_consume_authority_transport_contract_patch_plan_consumer_failure_fails_closed():
+    """GIVEN a contract_patch_plan/anchor_context that the real
+    controlled-mutation lane rejects (untrusted author association)
+    WHEN consume_authority_transport() delegates to it
+    THEN the consumption fails closed -- it never falls back to treating
+    the bounded local artifact write as a successful mutation.
+    """
+    invocation_id = "e2e-real-mutation-lane-failure-1"
+    git_head_sha = "abc123def456abc123def456abc123def456abc"
+    evidence = _evidence(comment_id=556)
+
+    produced, error = preflight.generate_authority_transport_manifest(
+        evidence=evidence,
+        issue_number=ISSUE_NUMBER,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=REPO_ROOT,
+    )
+    assert error is None, error
+
+    router_receipt = router.generate_router_receipt(
+        transport_manifest_path=produced["manifest_path"],
+        issue_number=ISSUE_NUMBER,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        authority_expected=True,
+        repo_root=REPO_ROOT,
+    )
+    assert router_receipt["status"] == "ok"
+    router_receipt_path = _artifact_dir(invocation_id) / "scope_delta_router_receipt_v1.json"
+
+    anchor_comment_id = 556
+    anchor_url = f"https://github.com/{REPO}/issues/{ISSUE_NUMBER}#issuecomment-{anchor_comment_id}"
+    anchor_payload = {"id": anchor_comment_id, "author_association": "NONE"}  # untrusted
+
+    consumption_receipt = preflight.consume_authority_transport(
+        router_receipt_path=str(router_receipt_path),
+        issue_number=ISSUE_NUMBER,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=REPO_ROOT,
+        contract_patch_plan={"operations": []},
+        anchor_context={
+            "issue": {"body": "body"},
+            "anchor_url": anchor_url,
+            "anchor_payload": anchor_payload,
+            "anchor_body": "body",
+        },
+    )
+    assert consumption_receipt["status"] == "environment_failure"
+    assert consumption_receipt["reason_code"] == "contract_patch_plan_consumer_failed"
+    assert consumption_receipt["mutation_applied"] is False
+    assert consumption_receipt["mutation_lane"] == "contract_patch_plan_consumer"

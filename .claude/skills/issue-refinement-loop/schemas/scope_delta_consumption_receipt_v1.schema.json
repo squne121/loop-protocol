@@ -15,7 +15,9 @@
     "mutation_applied",
     "readback_verified",
     "fresh_rerun_performed",
-    "status"
+    "status",
+    "mutation_lane",
+    "contract_update_status"
   ],
   "additionalProperties": false,
   "properties": {
@@ -94,6 +96,10 @@
         "path_confinement_resolve_failed",
         "path_confinement_outside_artifact_root",
         "path_confinement_not_regular_file",
+        "wrong_repo",
+        "schema_invalid",
+        "contract_patch_plan_consumer_error",
+        "contract_patch_plan_consumer_failed",
         null
       ]
     },
@@ -162,6 +168,21 @@
         }
       },
       "description": "#2053 AC10: termination telemetry -- relative path + sha256 of the consumed artifact, independently confirmed to exist on disk (never a fixed mutable sidecar)."
+    },
+    "mutation_lane": {
+      "type": "string",
+      "enum": [
+        "artifact_only",
+        "contract_patch_plan_consumer"
+      ],
+      "description": "#2053 P0 fix-delta (iteration 3): which mutation lane produced mutation_applied -- `artifact_only` (bounded local consumed_authority_payload_v1.json write only) or `contract_patch_plan_consumer` (delegated to the real consume_trusted_anchor_contract_patch_plan() -> edit_issue_txn.py lane)."
+    },
+    "contract_update_status": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "#2053 P0 fix-delta (iteration 3): the _bounded_contract_update_handoff() status (`applied` / `no_change` / `rebased` / `failed`) from the real controlled-mutation lane when mutation_lane is `contract_patch_plan_consumer`; an exception type:message string on unexpected consumer error; null when mutation_lane is `artifact_only`."
     }
   }
 }

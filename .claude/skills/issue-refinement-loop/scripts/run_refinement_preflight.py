@@ -335,6 +335,21 @@ AUTHORITY_TRANSPORT_SCHEMA_VERSION = "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1"
 CONSUMPTION_RECEIPT_SCHEMA_VERSION = "SCOPE_DELTA_CONSUMPTION_RECEIPT_V1"
 CANONICALIZATION_ID = "loop-protocol-json-c14n-v1"
 
+# #2053 P0 fix-delta (iteration 3, OWNER PR review): the controlled
+# consumer's "mutation" step can operate in one of two lanes, always
+# recorded on the consumption receipt so a reader never has to infer which
+# happened from side effects alone:
+#   - MUTATION_LANE_ARTIFACT_ONLY: no CONTRACT_PATCH_PLAN_V1 was supplied --
+#     the consumer's bounded write is the local `consumed_authority_payload_v1
+#     .json` audit artifact only (the pre-#2053-iteration-3 behavior).
+#   - MUTATION_LANE_CONTRACT_PATCH_PLAN_CONSUMER: a CONTRACT_PATCH_PLAN_V1 and
+#     anchor_context were supplied -- the mutation is delegated to the real,
+#     existing controlled-mutation lane (consume_trusted_anchor_contract_
+#     patch_plan() -> edit_issue_txn.py), and `mutation_applied` reflects that
+#     lane's actual outcome, not merely the local artifact write succeeding.
+MUTATION_LANE_ARTIFACT_ONLY = "artifact_only"
+MUTATION_LANE_CONTRACT_PATCH_PLAN_CONSUMER = "contract_patch_plan_consumer"
+
 
 def _authority_transport_dir(repo_root: Path, issue_number: int, invocation_id: str) -> Path:
     return (
@@ -462,6 +477,15 @@ def generate_authority_transport_manifest(
         "payload": payload,
         "payload_sha256": payload_sha256,
     }
+    # #2053 P1 fix-delta (iteration 3, OWNER PR review): actually enforce
+    # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 via _validate_with_schema() before
+    # ever persisting it, not merely constructing the dict by hand above.
+    schema = _load_schema("scope_delta_authority_transport_v1.schema.json")
+    if schema is not None:
+        valid, errors = _validate_with_schema(manifest, schema)
+        if not valid:
+            return None, f"schema_invalid:{errors[:1]}"
+
     manifest_dir = _authority_transport_dir(repo_root, issue_number, invocation_id)
     manifest_path = manifest_dir / "scope_delta_authority_transport_v1.json"
     # #2053 P1 fix-delta (iteration 2, OWNER PR review): true immutability,
@@ -485,6 +509,8 @@ def consume_authority_transport(
     invocation_id: str,
     git_head_sha: str,
     repo_root: Path,
+    contract_patch_plan: "dict | None" = None,
+    anchor_context: "dict | None" = None,
 ) -> dict:
     """#2053 AC9: controlled consumer. Reads a SCOPE_DELTA_ROUTER_RECEIPT_V1,
     independently re-verifies the transport manifest it references, applies
@@ -497,6 +523,21 @@ def consume_authority_transport(
     wrong_issue, wrong_git_head, wrong_invocation_id, router_receipt_not_ok,
     stale_previous_invocation (a consumption receipt already exists for this
     invocation_id -- the "exactly once" guard for AC9's "一回だけ mutation").
+
+    #2053 P0 fix-delta (iteration 3, OWNER PR review): when `contract_patch_plan`
+    (a CONTRACT_PATCH_PLAN_V1 dict) and `anchor_context` (a dict with
+    `issue`, `anchor_url`, `anchor_payload`, `anchor_body`, and optionally
+    `callbacks` / `known_context`) are both supplied, the mutation step is
+    delegated to the existing, real controlled-mutation lane --
+    `consume_trusted_anchor_contract_patch_plan()` (which, via its default
+    callbacks, drives `edit_issue_txn.py`) -- instead of merely writing the
+    local `consumed_authority_payload_v1.json` audit artifact. The receipt's
+    `mutation_applied` claim reflects that lane's real, independently
+    projected outcome (`_bounded_contract_update_handoff()`), never just the
+    local artifact write succeeding. When `contract_patch_plan` /
+    `anchor_context` are omitted (the default), behavior is unchanged from
+    before this fix-delta: the bounded local artifact write is the mutation.
+    Either way, `mutation_lane` on the receipt records which happened.
     """
 
     # #2053 AC10 P0 fix-delta (iteration 2): termination telemetry recording
@@ -533,8 +574,10 @@ def consume_authority_transport(
         mutation_applied: bool = False,
         readback_verified: bool = False,
         fresh_rerun_performed: bool = False,
+        mutation_lane: str = MUTATION_LANE_ARTIFACT_ONLY,
+        contract_update_status: "str | None" = None,
     ) -> dict:
-        return {
+        receipt = {
             "schema_version": CONSUMPTION_RECEIPT_SCHEMA_VERSION,
             "invocation_id": invocation_id,
             "issue_number": issue_number,
@@ -551,7 +594,25 @@ def consume_authority_transport(
             "consumed_artifact": _artifacts_seen["consumed_artifact"],
             "status": status,
             "reason_code": reason_code,
+            "mutation_lane": mutation_lane,
+            "contract_update_status": contract_update_status,
         }
+        if status == "ok":
+            # #2053 P1 fix-delta (iteration 3, OWNER PR review): actually
+            # enforce SCOPE_DELTA_CONSUMPTION_RECEIPT_V1 via
+            # _validate_with_schema() (required/additionalProperties:false),
+            # not merely a manual field-by-field construction above. An "ok"
+            # receipt that fails schema validation is downgraded to a
+            # fail-closed environment_failure -- schema conformance is a real
+            # gate, not advisory.
+            schema = _load_schema("scope_delta_consumption_receipt_v1.schema.json")
+            if schema is not None:
+                valid, errors = _validate_with_schema(receipt, schema)
+                if not valid:
+                    receipt = dict(receipt)
+                    receipt["status"] = "environment_failure"
+                    receipt["reason_code"] = "schema_invalid"
+        return receipt
 
     invocation_dir = _authority_transport_dir(repo_root, issue_number, invocation_id)
     consumption_receipt_path = invocation_dir / "scope_delta_consumption_receipt_v1.json"
@@ -635,11 +696,13 @@ def consume_authority_transport(
         )
 
     # --- mutation (once): write the consumed payload under the same
-    # invocation-scoped directory. This is the bounded, idempotency-guarded
-    # write this consumer is authorized to perform; it does not call
-    # edit_issue_txn.py / mutate the live Issue (out of this file's Allowed
-    # Paths reach) -- CONTRACT_PATCH_PLAN_V1 application remains the
-    # existing --consume-contract-patch-plan lane's responsibility.
+    # invocation-scoped directory. This bounded, idempotency-guarded local
+    # write is always performed as the audit/readback record -- it is the
+    # ONLY mutation performed when no contract_patch_plan is supplied
+    # (MUTATION_LANE_ARTIFACT_ONLY). When a contract_patch_plan IS supplied
+    # (below), it remains the readback record for the transported payload,
+    # but the load-bearing mutation is delegated to the real controlled
+    # consumer lane instead.
     consumed_path = invocation_dir / "consumed_authority_payload_v1.json"
     # #2053 P1 fix-delta (iteration 2, OWNER PR review): bind the
     # transaction/idempotency state BEFORE mutation, not just via
@@ -667,6 +730,57 @@ def consume_authority_transport(
         isinstance(readback, dict) and readback.get("payload_sha256") == manifest_payload_sha256
     )
     _artifacts_seen["consumed_artifact"] = _artifact_ref(consumed_path)
+
+    # --- #2053 P0 fix-delta (iteration 3): real controlled-mutation lane.
+    # When the caller supplies a CONTRACT_PATCH_PLAN_V1 and the anchor
+    # context it applies to, delegate the actual mutation authorization to
+    # the existing, real consumer (consume_trusted_anchor_contract_patch_plan
+    # -> edit_issue_txn.py) instead of treating the local artifact write
+    # above as sufficient. `mutation_applied` is overwritten by that lane's
+    # real, independently-projected outcome.
+    mutation_lane = MUTATION_LANE_ARTIFACT_ONLY
+    contract_update_status: "str | None" = None
+    if isinstance(contract_patch_plan, dict) and isinstance(anchor_context, dict):
+        required_context_keys = ("issue", "anchor_url", "anchor_payload", "anchor_body")
+        if all(key in anchor_context for key in required_context_keys):
+            mutation_lane = MUTATION_LANE_CONTRACT_PATCH_PLAN_CONSUMER
+            try:
+                raw_consumer_result = consume_trusted_anchor_contract_patch_plan(
+                    repo=repo,
+                    issue_number=issue_number,
+                    issue=anchor_context["issue"],
+                    anchor_url=anchor_context["anchor_url"],
+                    anchor_payload=anchor_context["anchor_payload"],
+                    anchor_body=anchor_context["anchor_body"],
+                    contract_patch_plan=contract_patch_plan,
+                    callbacks=anchor_context.get("callbacks"),
+                    known_context=anchor_context.get("known_context"),
+                )
+            except Exception as exc:  # noqa: BLE001 - captured as a fail-closed reason
+                return _receipt(
+                    status="environment_failure",
+                    reason_code="contract_patch_plan_consumer_error",
+                    transport_payload_sha256=manifest_payload_sha256,
+                    consumed_payload_sha256=recomputed,
+                    mutation_applied=False,
+                    readback_verified=readback_verified,
+                    mutation_lane=mutation_lane,
+                    contract_update_status=f"{type(exc).__name__}:{exc}",
+                )
+            handoff = _bounded_contract_update_handoff(raw_consumer_result)
+            contract_update_status = handoff.get("status")
+            mutation_applied = contract_update_status in {"applied", "no_change", "rebased"}
+            if not mutation_applied:
+                return _receipt(
+                    status="environment_failure",
+                    reason_code="contract_patch_plan_consumer_failed",
+                    transport_payload_sha256=manifest_payload_sha256,
+                    consumed_payload_sha256=recomputed,
+                    mutation_applied=False,
+                    readback_verified=readback_verified,
+                    mutation_lane=mutation_lane,
+                    contract_update_status=contract_update_status,
+                )
 
     # --- fresh rerun: re-run classification against the consumed payload to
     # reconfirm the route is unchanged (no silent drift between transport
@@ -711,6 +825,8 @@ def consume_authority_transport(
             mutation_applied=mutation_applied,
             readback_verified=readback_verified,
             fresh_rerun_performed=False,
+            mutation_lane=mutation_lane,
+            contract_update_status=contract_update_status,
         )
 
     final_receipt = _receipt(
@@ -721,18 +837,23 @@ def consume_authority_transport(
         mutation_applied=mutation_applied,
         readback_verified=readback_verified,
         fresh_rerun_performed=fresh_rerun_performed,
+        mutation_lane=mutation_lane,
+        contract_update_status=contract_update_status,
     )
-    ok, _readback2, error2 = _atomic_write_json_with_readback(consumption_receipt_path, final_receipt)
-    if not ok:
-        final_receipt = _receipt(
-            status="environment_failure",
-            reason_code="write_failure",
-            transport_payload_sha256=manifest_payload_sha256,
-            consumed_payload_sha256=recomputed,
-            mutation_applied=mutation_applied,
-            readback_verified=readback_verified,
-            fresh_rerun_performed=fresh_rerun_performed,
-        )
+    if final_receipt["status"] == "ok":
+        ok, _readback2, error2 = _atomic_write_json_with_readback(consumption_receipt_path, final_receipt)
+        if not ok:
+            final_receipt = _receipt(
+                status="environment_failure",
+                reason_code="write_failure",
+                transport_payload_sha256=manifest_payload_sha256,
+                consumed_payload_sha256=recomputed,
+                mutation_applied=mutation_applied,
+                readback_verified=readback_verified,
+                fresh_rerun_performed=fresh_rerun_performed,
+                mutation_lane=mutation_lane,
+                contract_update_status=contract_update_status,
+            )
     return final_receipt
 
 
@@ -1147,6 +1268,36 @@ def _classify_anchor_scope_reframe(
         return {
             "status": "fail_closed",
             "reason": f"wrong_issue_number: expected {issue_number}, got {target.get('issue_number')!r}",
+            "implementation_go": False,
+            "anchor_author_association": author_assoc,
+            "anchor_comment_url": anchor_url,
+            "anchor_comment_hash": anchor_hash,
+            "allowed_path_deltas": [],
+            "required_rerun": [],
+        }
+
+    # #2053 P2 fix-delta (iteration 3, OWNER PR review): a structured
+    # ANCHOR_SCOPE_REFRAME_V1 anchor whose source generation/body revision
+    # no longer matches current state is genuinely STALE -- distinct from
+    # schema_invalid (never well-formed) or wrong_issue_number/wrong_repo
+    # (well-formed but aimed elsewhere). GitHub comment metadata carries
+    # `created_at`/`updated_at`; when both are present and differ, the
+    # comment body actually consumed above (`anchor_body`) no longer
+    # represents the original, unedited revision the payload was authored
+    # against -- treat it as stale rather than silently trusting an edited
+    # comment's current text as if it were the original approval.
+    created_at = comment_payload.get("created_at")
+    updated_at = comment_payload.get("updated_at")
+    if (
+        isinstance(created_at, str)
+        and isinstance(updated_at, str)
+        and created_at
+        and updated_at
+        and created_at != updated_at
+    ):
+        return {
+            "status": "fail_closed",
+            "reason": f"stale: comment edited after creation (created_at={created_at!r}, updated_at={updated_at!r})",
             "implementation_go": False,
             "anchor_author_association": author_assoc,
             "anchor_comment_url": anchor_url,
@@ -2637,10 +2788,12 @@ def _structured_anchor_payload_present_but_invalid(scope_delta_decision: "dict |
 
     `_classify_anchor_scope_reframe()` reason strings for a payload that WAS
     parsed but rejected are: "schema_invalid: ...", "wrong_repo: ...",
-    "wrong_issue_number: ...". "no_anchor_scope_reframe_v1_payload" (no
-    payload found) and "untrusted_author_association: ..." (author trust,
-    independent of payload presence) are NOT included -- an untrusted
-    author's freeform text is already fail-closed downstream by
+    "wrong_issue_number: ...", "stale: ..." (#2053 P2 fix-delta iteration 3
+    -- the comment's own `created_at`/`updated_at` no longer match, i.e. it
+    was edited after the original approval). "no_anchor_scope_reframe_v1_payload"
+    (no payload found) and "untrusted_author_association: ..." (author
+    trust, independent of payload presence) are NOT included -- an
+    untrusted author's freeform text is already fail-closed downstream by
     classify_scope_delta_authority()'s own author-association check.
     """
     if not isinstance(scope_delta_decision, dict):
@@ -2648,7 +2801,7 @@ def _structured_anchor_payload_present_but_invalid(scope_delta_decision: "dict |
     if scope_delta_decision.get("status") != "fail_closed":
         return False
     reason = scope_delta_decision.get("reason") or ""
-    return reason.startswith(("schema_invalid:", "wrong_repo:", "wrong_issue_number:"))
+    return reason.startswith(("schema_invalid:", "wrong_repo:", "wrong_issue_number:", "stale:"))
 
 
 def _build_scope_delta_authority_evidence(
@@ -4506,6 +4659,27 @@ def main(argv: list[str] | None = None) -> None:
         "SCOPE_DELTA_CONSUMPTION_RECEIPT_V1. Requires --issue-number, --repo, --invocation-id, "
         "--git-head-sha.",
     )
+    parser.add_argument(
+        "--contract-patch-plan-file",
+        type=Path,
+        default=None,
+        metavar="CONTRACT_PATCH_PLAN_JSON_PATH",
+        help="#2053 P0 fix-delta (iteration 3): only meaningful with "
+        "--consume-authority-transport. Path to a CONTRACT_PATCH_PLAN_V1 JSON file; when "
+        "supplied together with --anchor-context-file, the consumer's mutation is delegated "
+        "to the real controlled-mutation lane (consume_trusted_anchor_contract_patch_plan -> "
+        "edit_issue_txn.py) instead of only writing the local audit artifact.",
+    )
+    parser.add_argument(
+        "--anchor-context-file",
+        type=Path,
+        default=None,
+        metavar="ANCHOR_CONTEXT_JSON_PATH",
+        help="#2053 P0 fix-delta (iteration 3): only meaningful with "
+        "--consume-authority-transport and --contract-patch-plan-file. Path to a JSON file "
+        "with keys `issue`, `anchor_url`, `anchor_payload`, `anchor_body` "
+        "(and optionally `known_context`).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -4538,6 +4712,21 @@ def main(argv: list[str] | None = None) -> None:
     if args.consume_authority_transport is not None:
         _repo_root = _find_repo_root()
         git_head_sha = args.git_head_sha or _git_head_sha(_repo_root)
+        contract_patch_plan_arg = None
+        anchor_context_arg = None
+        if args.contract_patch_plan_file is not None and args.anchor_context_file is not None:
+            try:
+                contract_patch_plan_arg = json.loads(
+                    args.contract_patch_plan_file.read_text(encoding="utf-8")
+                )
+                anchor_context_arg = json.loads(args.anchor_context_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                print(
+                    json.dumps(
+                        {"status": "environment_failure", "reason_code": "malformed_json", "error": str(exc)}
+                    )
+                )
+                sys.exit(EXIT_ENVIRONMENT_FAILURE)
         receipt = consume_authority_transport(
             router_receipt_path=args.consume_authority_transport,
             issue_number=args.issue_number,
@@ -4545,6 +4734,8 @@ def main(argv: list[str] | None = None) -> None:
             invocation_id=args.invocation_id or "",
             git_head_sha=git_head_sha,
             repo_root=_repo_root,
+            contract_patch_plan=contract_patch_plan_arg,
+            anchor_context=anchor_context_arg,
         )
         print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
         sys.exit(0 if receipt.get("status") == "ok" else EXIT_ENVIRONMENT_FAILURE)

@@ -45,6 +45,13 @@ def _comment_payload(author_association="OWNER"):
     }
 
 
+def _comment_payload_with_timestamps(*, created_at, updated_at, author_association="OWNER"):
+    payload = _comment_payload(author_association=author_association)
+    payload["created_at"] = created_at
+    payload["updated_at"] = updated_at
+    return payload
+
+
 def _anchor_url(comment_id=1):
     return f"https://github.com/{TARGET_REPO}/issues/{TARGET_ISSUE}#issuecomment-{comment_id}"
 
@@ -138,3 +145,75 @@ def test_untrusted_author_association_does_not_trigger_downgrade_guard():
     # THEN the downgrade guard does not classify this as a
     # present-but-invalid structured payload case.
     assert _structured_anchor_payload_present_but_invalid(decision) is False
+
+
+def test_stale_structured_anchor_edited_after_creation_does_not_downgrade_to_freeform():
+    """#2053 P2 fix-delta (iteration 3, OWNER PR review): a structured
+    ANCHOR_SCOPE_REFRAME_V1 anchor whose source generation/body revision no
+    longer matches current state (the comment was edited after it was
+    posted -- created_at != updated_at) is genuinely STALE, not merely
+    invalid or wrong-target. It must fail closed with a "stale:" reason and
+    must not be reinterpreted as a legitimate freeform directive from the
+    same (edited) comment body.
+    """
+    valid_yaml_block = (
+        "```yaml\n"
+        "schema_version: ANCHOR_SCOPE_REFRAME_V1\n"
+        "target:\n"
+        f"  repo: {TARGET_REPO}\n"
+        f"  issue_number: {TARGET_ISSUE}\n"
+        "decision: approve_scope_delta\n"
+        "allowed_path_deltas:\n"
+        "  - some/path.txt\n"
+        "rationale: stale test\n"
+        "required_rerun:\n"
+        "  - refinement_preflight\n"
+        "```\n"
+    )
+    decision = _classify_anchor_scope_reframe(
+        comment_payload=_comment_payload_with_timestamps(
+            created_at="2026-08-01T00:00:00Z",
+            updated_at="2026-08-05T00:00:00Z",
+        ),
+        anchor_body=valid_yaml_block,
+        repo=TARGET_REPO,
+        issue_number=TARGET_ISSUE,
+        anchor_url=_anchor_url(),
+    )
+    assert decision["status"] == "fail_closed"
+    assert decision["reason"].startswith("stale:")
+
+    # THEN the downgrade guard fires -- staleness is not "no payload".
+    assert _structured_anchor_payload_present_but_invalid(decision) is True
+
+
+def test_unedited_structured_anchor_with_matching_timestamps_is_not_stale():
+    """GIVEN the same valid structured anchor, but with created_at ==
+    updated_at (never edited)
+    THEN the stale check does not fire -- the anchor is approved normally.
+    """
+    valid_yaml_block = (
+        "```yaml\n"
+        "schema_version: ANCHOR_SCOPE_REFRAME_V1\n"
+        "target:\n"
+        f"  repo: {TARGET_REPO}\n"
+        f"  issue_number: {TARGET_ISSUE}\n"
+        "decision: approve_scope_delta\n"
+        "allowed_path_deltas:\n"
+        "  - some/path.txt\n"
+        "rationale: unedited test\n"
+        "required_rerun:\n"
+        "  - refinement_preflight\n"
+        "```\n"
+    )
+    decision = _classify_anchor_scope_reframe(
+        comment_payload=_comment_payload_with_timestamps(
+            created_at="2026-08-01T00:00:00Z",
+            updated_at="2026-08-01T00:00:00Z",
+        ),
+        anchor_body=valid_yaml_block,
+        repo=TARGET_REPO,
+        issue_number=TARGET_ISSUE,
+        anchor_url=_anchor_url(),
+    )
+    assert decision["status"] == "approved_by_trusted_anchor"

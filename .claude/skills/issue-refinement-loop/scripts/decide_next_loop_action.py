@@ -65,6 +65,45 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+# #2053 P1 fix-delta (iteration 3, OWNER PR review): actually enforce
+# SCOPE_DELTA_ROUTER_RECEIPT_V1 via _validate_with_schema() in the router,
+# not just the manual field-by-field construction in generate_router_receipt().
+try:
+    import jsonschema as _jsonschema
+
+    _JSONSCHEMA_AVAILABLE = True
+except ImportError:  # pragma: no cover - jsonschema is a declared dependency
+    _JSONSCHEMA_AVAILABLE = False
+
+_SCHEMAS_DIR = Path(__file__).resolve().parent.parent / "schemas"
+
+
+def _load_router_schema(schema_filename: str) -> "dict | None":
+    schema_path = _SCHEMAS_DIR / schema_filename
+    if not schema_path.exists():
+        return None
+    try:
+        return json.loads(schema_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _validate_router_receipt_with_schema(data: dict, schema: dict) -> tuple[bool, list[str]]:
+    if not _JSONSCHEMA_AVAILABLE:
+        return True, []
+    try:
+        validator_cls = _jsonschema.validators.validator_for(schema)
+        validator_cls.check_schema(schema)
+        validator = validator_cls(schema, format_checker=validator_cls.FORMAT_CHECKER)
+        errors = sorted(validator.iter_errors(data), key=lambda exc: list(exc.path))
+        if errors:
+            return False, [f"schema_validation_error: {errors[0].message}"]
+        return True, []
+    except _jsonschema.ValidationError as exc:
+        return False, [f"schema_validation_error: {exc.message}"]
+    except Exception as exc:
+        return False, [f"schema_validation_unexpected: {exc}"]
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -242,6 +281,12 @@ def generate_router_receipt(
     receipt = dict(base)
     receipt["status"] = "ok"
     receipt["reason_code"] = None
+
+    receipt_schema = _load_router_schema("scope_delta_router_receipt_v1.schema.json")
+    if receipt_schema is not None:
+        valid, _schema_errors = _validate_router_receipt_with_schema(receipt, receipt_schema)
+        if not valid:
+            return _fail("schema_invalid")
 
     if repo_root is not None and isinstance(issue_number, int) and invocation_id:
         receipt_dir = (

@@ -75,6 +75,7 @@
         "wrong_invocation_id",
         "write_failure",
         "wrong_repo",
+        "schema_invalid",
         null
       ]
     }
