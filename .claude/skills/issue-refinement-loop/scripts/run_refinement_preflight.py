@@ -2524,6 +2524,7 @@ def consume_trusted_anchor_contract_patch_plan(
     contract_patch_plan: dict,
     callbacks: Optional[dict[str, Any]] = None,
     known_context: Optional[dict[str, Any]] = None,
+    patch_plan_producer_available: bool = True,
 ) -> dict:
     """Connect an approved patch plan to the controlled transaction lane.
 
@@ -2853,6 +2854,7 @@ def consume_trusted_anchor_contract_patch_plan(
                 "approved_by_trusted_anchor" if _validated_allowed_path_deltas else None
             ),
             reflected_checker=_reflected_checker,
+            patch_plan_producer_available=patch_plan_producer_available,
         )
     finally:
         for path in temporary_paths:
@@ -3439,6 +3441,31 @@ def run_preflight(
         sidecar = plan.get("scope_signal_guard_decision_v2")
         authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else None
         patch_plan = authority.get("contract_patch_plan") if isinstance(authority, dict) else None
+        # PR #2057 OWNER review (iteration 4, blocker 3 / P0-1 residual):
+        # `authority` (the freeform SCOPE_DELTA_AUTHORITY_EVIDENCE_V1
+        # producer's `classify_scope_delta_authority()` result) is `None`
+        # in two distinct cases that must NOT be conflated: (a) the
+        # freeform evidence builder (`_build_scope_delta_authority_
+        # evidence()`, invoked earlier in this same `run_preflight()` call
+        # for this same anchor comment) itself failed -- structural anchor
+        # URL mismatch or a `scope_signal_delta` parser/import failure --
+        # even though the STRUCTURED `ANCHOR_SCOPE_REFRAME_V1` parser
+        # succeeded (this branch only runs once that structured parser has
+        # already validated a non-empty `allowed_path_deltas`); or (b) the
+        # evidence builder succeeded and `classify_scope_delta_authority()`
+        # ran to completion but reached an ordinary business decision that
+        # is not `contract_update_required` (e.g. `human_escalation` for a
+        # purely-structured, non-freeform-directive anchor comment -- the
+        # common, legitimate case this branch was originally written for).
+        # `known_context["scope_delta_authority_evidence"]` is only set
+        # when the evidence builder succeeded (see the `_kc[...] = [...]`
+        # assignment above in this function), so its presence distinguishes
+        # (a) -- genuine "patch-plan producer unavailable", fail closed to
+        # `invalid` -- from (b), left untouched (`True`).
+        _patch_plan_producer_available = (
+            isinstance(known_context, dict)
+            and "scope_delta_authority_evidence" in known_context
+        )
         if (
             not isinstance(patch_plan, dict)
             and anchor_payload_for_consumer is not None
@@ -3526,6 +3553,7 @@ def run_preflight(
                 contract_patch_plan=patch_plan,
                 callbacks=contract_update_callbacks,
                 known_context=known_context,
+                patch_plan_producer_available=_patch_plan_producer_available,
             )
             contract_update_handoff = _bounded_contract_update_handoff(consumer_result)
             _rewrite_route = (

@@ -767,6 +767,140 @@ def test_negative_6b_anchor_body_hash_drift_fails_closed():
 
 
 # ---------------------------------------------------------------------------
+# PR #2057 OWNER REQUEST_CHANGES (iteration 4, blocker 3 / P0-1 residual):
+# `patch_plan_producer_available` -- the classify_scope_reframe_disposition()
+# kwarg that marks "the freeform SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 producer
+# could not produce a schema-valid patch plan for this evidence" -- must be
+# reachable from the REAL production consumer
+# consume_trusted_anchor_contract_patch_plan() (not only exercised as a pure
+# decide_rewrite_route.classify_scope_reframe_disposition() unit call).
+# ---------------------------------------------------------------------------
+
+
+def test_producer_unavailable_reaches_invalid_disposition_via_production_consumer():
+    """Blocker 3: patch_plan_producer_available=False, threaded through the
+    real consume_trusted_anchor_contract_patch_plan() ->
+    run_trusted_anchor_iteration_zero() call chain, must classify an
+    otherwise-approved empty-operations scope reframe as `invalid`
+    (REASON_INVALID_PATCH_PLAN_PRODUCER_UNAVAILABLE) instead of silently
+    accepting the synthesized empty-operations plan as
+    `full_rewrite_required`. No mutation is ever attempted."""
+    issue_body = _e2e_issue_body(allowed_paths_includes_delta=False)
+    anchor_comment = _e2e_anchor_comment()
+    patch_plan = {"operations": []}
+    known_context = {
+        "scope_delta_decision": _e2e_approved_scope_delta_decision(anchor_body=anchor_comment["body"])
+    }
+    kwargs, calls, _ = _e2e_consumer_kwargs(
+        patch_plan=patch_plan, known_context=known_context, issue_body=issue_body
+    )
+    result = _e2e_preflight.consume_trusted_anchor_contract_patch_plan(
+        **kwargs, patch_plan_producer_available=False
+    )
+
+    assert result["status"] == "invalid"
+    assert result["disposition"]["disposition"] == "invalid"
+    assert result["disposition"]["reason_code"] == "invalid_patch_plan_producer_unavailable"
+    assert "rewrite_route" not in result
+    assert calls["apply_transaction"] == 0
+    assert result.get("writes", 0) == 0
+
+
+def test_producer_available_default_true_preserves_full_rewrite_required():
+    """Contrast case: the SAME inputs as the previous test, but with
+    `patch_plan_producer_available` left at its default (`True`), must
+    still reach `full_rewrite_required` -- proving the new kwarg is a
+    strictly additive fail-closed gate, never a behavior change for the
+    pre-existing positive fixture."""
+    issue_body = _e2e_issue_body(allowed_paths_includes_delta=False)
+    anchor_comment = _e2e_anchor_comment()
+    patch_plan = {"operations": []}
+    known_context = {
+        "scope_delta_decision": _e2e_approved_scope_delta_decision(anchor_body=anchor_comment["body"])
+    }
+    kwargs, calls, _ = _e2e_consumer_kwargs(
+        patch_plan=patch_plan, known_context=known_context, issue_body=issue_body
+    )
+    result = _e2e_preflight.consume_trusted_anchor_contract_patch_plan(**kwargs)
+
+    assert result["status"] == "no_change"
+    assert result["rewrite_route"]["disposition"] == "full_rewrite_required"
+    assert calls["apply_transaction"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PR #2057 OWNER REQUEST_CHANGES (Warning, not blocker): explicit anchor /
+# Issue-body TOCTOU regression coverage -- fetch_current() (the FRESH
+# re-read performed immediately before disposition classification) returns
+# a value that differs from the pre-fetch snapshot the caller classified
+# the structured ANCHOR_SCOPE_REFRAME_V1 decision against.
+# ---------------------------------------------------------------------------
+
+
+def test_toctou_anchor_edited_between_classification_and_fresh_fetch_fails_closed():
+    """Anchor TOCTOU: the anchor comment used to classify
+    `scope_delta_decision` differs (body edited -- a different
+    `source_body_sha256`) from what `fetch_current()` returns at the moment
+    of disposition classification. Must fail closed to
+    `anchor_identity_or_trust_changed`, never silently proceed as if the
+    pre-fetch anchor were still current."""
+    issue_body = _e2e_issue_body(allowed_paths_includes_delta=False)
+    anchor_comment = _e2e_anchor_comment()
+    patch_plan = {"operations": []}
+    known_context = {
+        "scope_delta_decision": _e2e_approved_scope_delta_decision(anchor_body=anchor_comment["body"])
+    }
+    kwargs, calls, _ = _e2e_consumer_kwargs(
+        patch_plan=patch_plan, known_context=known_context, issue_body=issue_body
+    )
+    edited_anchor_body = anchor_comment["body"] + "\nedited-after-classification\n"
+
+    def _drifted_fetch_current():
+        edited_anchor = dict(anchor_comment, html_url=_E2E_URL, body=edited_anchor_body)
+        return {"body": issue_body, "updatedAt": "2026-08-09T00:00:00Z"}, edited_anchor
+
+    kwargs["callbacks"]["fetch_current"] = _drifted_fetch_current
+    result = _e2e_preflight.consume_trusted_anchor_contract_patch_plan(**kwargs)
+
+    assert result["status"] == "blocked"
+    assert result.get("failure") == "anchor_identity_or_trust_changed"
+    assert "rewrite_route" not in result
+    assert calls["apply_transaction"] == 0
+
+
+def test_toctou_issue_body_already_reflects_delta_at_fresh_fetch_becomes_proven_no_change():
+    """Issue-body TOCTOU: the pre-fetch `issue` snapshot does NOT yet
+    reflect the approved `allowed_path_deltas`, but a concurrent write
+    landed the delta before `fetch_current()` re-reads the Issue body.
+    The FRESH body (never the pre-fetch snapshot) must be reclassified as
+    `proven_no_change`, not `full_rewrite_required` -- avoiding a redundant
+    issue-editor handoff for a change that has already taken effect."""
+    issue_body = _e2e_issue_body(allowed_paths_includes_delta=False)
+    fresh_issue_body = _e2e_issue_body(allowed_paths_includes_delta=True)
+    anchor_comment = _e2e_anchor_comment()
+    patch_plan = {"operations": []}
+    known_context = {
+        "scope_delta_decision": _e2e_approved_scope_delta_decision(anchor_body=anchor_comment["body"])
+    }
+    kwargs, calls, _ = _e2e_consumer_kwargs(
+        patch_plan=patch_plan, known_context=known_context, issue_body=issue_body
+    )
+
+    def _reflects_delta_fetch_current():
+        return (
+            {"body": fresh_issue_body, "updatedAt": "2026-08-09T00:00:01Z"},
+            dict(anchor_comment, html_url=_E2E_URL),
+        )
+
+    kwargs["callbacks"]["fetch_current"] = _reflects_delta_fetch_current
+    result = _e2e_preflight.consume_trusted_anchor_contract_patch_plan(**kwargs)
+
+    assert result["status"] == "no_change"
+    assert "rewrite_route" not in result
+    assert calls["apply_transaction"] == 0
+
+
+# ---------------------------------------------------------------------------
 # PR #2057 OWNER REQUEST_CHANGES (P1-5): tri-state Allowed Paths reflected
 # check -- false-positive resistance regression coverage for
 # `_check_scope_reframe_deltas_reflected()` (formerly `_scope_reframe_

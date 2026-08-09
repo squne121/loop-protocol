@@ -1318,6 +1318,7 @@ def run_trusted_anchor_iteration_zero(
     scope_delta_status: "str | None" = None,
     previous_empty_operations_fingerprints: "list | None" = None,
     reflected_checker=None,
+    patch_plan_producer_available: bool = True,
 ) -> dict:
     """Execute the bounded, callback-based trusted-anchor path.
 
@@ -1360,6 +1361,21 @@ def run_trusted_anchor_iteration_zero(
     non-empty: PR #2057 OWNER review P2 flagged that a caller passing deltas
     but forgetting the status argument would previously be silently treated
     as an approved reframe.
+
+    `patch_plan_producer_available` (PR #2057 OWNER review, iteration 4
+    blocker 3): threaded straight into
+    `decide_rewrite_route.classify_scope_reframe_disposition()`'s own
+    kwarg of the same name. `False` means the freeform
+    `SCOPE_DELTA_AUTHORITY_EVIDENCE_V1` producer (`classify_scope_delta_
+    authority()`) ran and explicitly could NOT produce an automated patch
+    plan for this evidence (`route.action == "human_escalation"`) --
+    distinct from "no freeform evidence was ever supplied" (default
+    `True`). The caller (`run_refinement_preflight.consume_trusted_anchor_
+    contract_patch_plan()`) computes this from the freeform authority
+    sidecar BEFORE synthesizing an empty-operations patch plan from the
+    structured `ANCHOR_SCOPE_REFRAME_V1` evidence alone, so a producer that
+    declined to act is never silently reclassified as a legitimate
+    `full_rewrite_required`.
     """
     normalized = normalize_trusted_anchor_iteration_zero(
         repo=repo, issue_number=issue_number, anchor=anchor, source_body=anchor_body
@@ -1420,6 +1436,7 @@ def run_trusted_anchor_iteration_zero(
                     anchor_comment_url=anchor.get("html_url") or anchor.get("comment_url"),
                     issue_body_sha256=_sha256(fresh_body),
                     previous_empty_operations_fingerprints=previous_empty_operations_fingerprints,
+                    patch_plan_producer_available=patch_plan_producer_available,
                 )
                 result = {
                     "status": "invalid" if decision.disposition == "invalid" else "no_change",
