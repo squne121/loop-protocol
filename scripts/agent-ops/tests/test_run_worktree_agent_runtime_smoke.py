@@ -72,6 +72,19 @@ def repo_with_worktree_and_script(tmp_path: Path) -> tuple[Path, Path]:
     return _build_repo_with_worktree(tmp_path, include_runner_script=True)
 
 
+@pytest.fixture()
+def candidate_worktree_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    """Issue #2046 AC8: an explicit, disposable repo + linked worktree
+    fixture name, used in place of a fixed reference to any single
+    historical Issue's worktree (e.g. the now-superseded
+    ``.claude/worktrees/issue-1734-...`` hardcoded in
+    ``.claude/agents/tests/test_issue_editor_runtime_smoke.py`` before this
+    Issue). An alias over ``_build_repo_with_worktree`` -- same hermetic
+    tmp_path-backed repo/worktree construction already used throughout this
+    file, given a name that documents the AC8 intent explicitly."""
+    return _build_repo_with_worktree(tmp_path)
+
+
 def _write_fake_exe(path: Path, script_body: str) -> None:
     path.write_text(f"#!/usr/bin/env bash\n{script_body}\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -1969,3 +1982,50 @@ def test_given_prompt_text_when_compute_prompt_sha256_then_matches_stdlib_hashli
 
     text = "hello world\n"
     assert module.compute_prompt_sha256(text) == hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Issue #2046 AC8: candidate_worktree_fixture wiring smoke (main_agent_identity
+# / agent_definition are present in evidence even for a caller that does not
+# request the hermetic lane -- they must honestly report unavailable, never
+# be absent from the schema).
+# ---------------------------------------------------------------------------
+
+
+def test_given_candidate_worktree_fixture_when_non_hermetic_run_then_new_evidence_fields_present(
+    candidate_worktree_fixture, tmp_path
+):
+    repo, worktree = candidate_worktree_fixture
+    # Written directly on disk under the worktree (not committed): the new
+    # evidence functions read static Agent/Skill files from the working
+    # tree, not from a specific git ref, so no commit is required here.
+    agents_dir = worktree / ".claude" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / "issue-creator.md").write_text(
+        "---\nname: issue-creator\ndescription: fixture\nskills:\n  - create-issue\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--agent-type", "issue-creator", "--claude-agent-name", "issue-creator",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "main_agent_identity" in summary
+    assert "agent_definition" in summary
+    assert "skill_evidence" in summary
+    assert "mutation_boundary" in summary
+    assert "settings_provenance" in summary
+    assert "production_settings_lane" in summary
+    # Non-hermetic project-discovery binding: status stays unavailable, but
+    # the field itself is never omitted from the schema.
+    assert "'binding_mode': 'project_discovery'" in summary
