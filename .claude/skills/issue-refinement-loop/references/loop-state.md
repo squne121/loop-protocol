@@ -172,3 +172,28 @@ follow-up Issue として拾うこと。
 
 `LOOP_STATE_V1.scope_signal_guard`（`triggered` / `excluded_by_anchor_reframe` / `reason_code`）の
 既存 3 フィールドの意味・値はこのサイドカーの有無に関わらず変更しない。
+
+## scope_delta_decision.rewrite_route（#2048 サイドカー）
+
+`REFINEMENT_LOOP_PLAN_V1.decisions.scope_delta_decision` は `additionalProperties: true`
+（`schemas/refinement_loop_plan_v1.json`）であり、`LOOP_STATE_V1` 本体のフィールド集合を
+拡張しない opt-in サイドカーとして `rewrite_route` を持つことがある。
+
+`known_context.scope_delta_decision.operations`（orchestrator が
+`derive_contract_patch_operations()` で導出した `CONTRACT_PATCH_PLAN_V1.operations[]`）が
+planner 入力に渡されたときのみ計算される。`plan_refinement_loop.py` が
+`decide_rewrite_route.decide_scope_reframe_contract_route()` を呼び出し、結果を
+`scope_delta_decision.rewrite_route` として echo する:
+
+| field | meaning |
+|---|---|
+| `route` | `contract_update`（通常）または `issue_editor_required`（承認済み scope reframe + empty operations[]） |
+| `reason_code` | `issue_editor_required` の場合 `approved_scope_requires_full_contract_rewrite` |
+| `empty_operations_fingerprint` | anchor comment URL + issue body SHA256 から導出される安定 fingerprint |
+| `no_progress_retry_suppressed` | 同一 fingerprint の再実行で no-progress `contract_update` を再発行しないための signal |
+| `duplicate_comment` / `should_post_comment` | 同一 fingerprint の scope-reframe comment を重複投稿しないための signal |
+| `rewrite_router_implementation_allowed` | （任意）`known_context.rewrite_readback_status` が渡された場合のみ、`route_after_rewrite.compute_implementation_allowed()` の結果を collision を避けて別名で echo したもの。`scope_signal_delta.SCOPE_DELTA_AUTHORITY_V1` の `route.implementation_allowed`（trusted anchor directive 自体の implementation 許可）とは別概念であり、混同しないこと。 |
+
+同じ判定は `scope_signal_delta.run_trusted_anchor_iteration_zero()`（実際に mutation を試みる
+production 経路）でも `result["rewrite_route"]` として付与され、両者は同じ
+`decide_scope_reframe_contract_route()` を呼び出すので一致する。

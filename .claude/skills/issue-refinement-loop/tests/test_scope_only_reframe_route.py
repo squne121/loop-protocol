@@ -29,7 +29,10 @@ from decide_rewrite_route import (  # noqa: E402
     SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1,
     decide_scope_reframe_contract_route,
 )
-from scope_signal_delta import derive_contract_patch_operations  # noqa: E402
+from scope_signal_delta import (  # noqa: E402
+    derive_contract_patch_operations,
+    run_trusted_anchor_iteration_zero,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -115,3 +118,140 @@ def test_scope_only_reframe_replay_suppresses_no_progress_retry_and_duplicate_co
     assert replay_result.no_progress_retry_suppressed is True
     assert replay_result.duplicate_comment is True
     assert replay_result.should_post_comment is False
+
+
+# ---------------------------------------------------------------------------
+# Production wiring regression: run_trusted_anchor_iteration_zero (the actual
+# call path invoked by run_refinement_preflight.py's contract_update.run.with_anchor
+# lane) must reach decide_scope_reframe_contract_route() when an approved
+# trusted-anchor scope reframe derives an empty operations[] -- not just the
+# standalone unit tests above (Issue #2048 PR review blocker: "no production
+# caller invokes decide_scope_reframe_contract_route()").
+# ---------------------------------------------------------------------------
+
+_ITERATION_ZERO_REPO = "squne121/loop-protocol"
+_ITERATION_ZERO_ISSUE = 2048
+_ITERATION_ZERO_ANCHOR_URL = (
+    f"https://github.com/{_ITERATION_ZERO_REPO}/issues/{_ITERATION_ZERO_ISSUE}"
+    "#issuecomment-2048099"
+)
+_ITERATION_ZERO_ANCHOR_BODY = (
+    "Allowed Paths を拡張する（対象パスは issue-editor が本文全体を再構成して確定する）"
+)
+_ITERATION_ZERO_PRE_BODY = "## Outcome\n\n既存の本文。\n"
+
+
+def _iteration_zero_anchor() -> dict:
+    import hashlib
+
+    return {
+        "id": 2048099,
+        "html_url": _ITERATION_ZERO_ANCHOR_URL,
+        "author_association": "OWNER",
+        "source_body_sha256": "sha256:"
+        + hashlib.sha256(_ITERATION_ZERO_ANCHOR_BODY.encode("utf-8")).hexdigest(),
+    }
+
+
+def _iteration_zero_readiness(_body: str) -> dict:
+    return {
+        "status": "go",
+        "body_sha256": "sha256:candidate",
+        "source_checks": [],
+        "errors": [],
+        "readiness_result_ref": "fixture",
+    }
+
+
+def _iteration_zero_fetch_current(body: str, anchor: dict):
+    return lambda: ({"body": body, "updatedAt": "2026-08-09T00:00:00Z"}, anchor)
+
+
+def test_run_trusted_anchor_iteration_zero_surfaces_issue_editor_required_route():
+    """Production wiring: run_trusted_anchor_iteration_zero (called by
+    run_refinement_preflight.py's contract_update.run.with_anchor lane) must
+    itself invoke decide_scope_reframe_contract_route() and annotate the
+    no_change result with rewrite_route.route == issue_editor_required when
+    the approved scope reframe's operations[] is empty -- callers must not
+    treat this as an ordinary no-op replay."""
+    anchor = _iteration_zero_anchor()
+    result = run_trusted_anchor_iteration_zero(
+        repo=_ITERATION_ZERO_REPO,
+        issue_number=_ITERATION_ZERO_ISSUE,
+        issue={"body": _ITERATION_ZERO_PRE_BODY},
+        anchor=anchor,
+        anchor_body=_ITERATION_ZERO_ANCHOR_BODY,
+        patch_plan={"operations": []},
+        candidate_readiness=_iteration_zero_readiness,
+        fetch_current=_iteration_zero_fetch_current(_ITERATION_ZERO_PRE_BODY, anchor),
+        allowed_path_deltas=["- `docs/product/features/scope-only-reframe.md`"],
+    )
+
+    assert result["status"] == "no_change"
+    assert "rewrite_route" in result
+    assert result["rewrite_route"]["route"] == ROUTE_ISSUE_EDITOR_REQUIRED
+    assert (
+        result["rewrite_route"]["reason_code"]
+        == REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE
+    )
+    assert result["rewrite_route"]["should_post_comment"] is True
+
+
+def test_run_trusted_anchor_iteration_zero_replay_suppresses_via_production_path():
+    """AC2/AC3 through the production call path: replaying the same
+    empty-operations scope reframe (fingerprints already recorded) must
+    surface no_progress_retry_suppressed/duplicate_comment=True so the
+    orchestrator does not re-issue a no-progress contract_update or repost
+    the scope-reframe comment."""
+    anchor = _iteration_zero_anchor()
+    first = run_trusted_anchor_iteration_zero(
+        repo=_ITERATION_ZERO_REPO,
+        issue_number=_ITERATION_ZERO_ISSUE,
+        issue={"body": _ITERATION_ZERO_PRE_BODY},
+        anchor=anchor,
+        anchor_body=_ITERATION_ZERO_ANCHOR_BODY,
+        patch_plan={"operations": []},
+        candidate_readiness=_iteration_zero_readiness,
+        fetch_current=_iteration_zero_fetch_current(_ITERATION_ZERO_PRE_BODY, anchor),
+        allowed_path_deltas=["- `docs/product/features/scope-only-reframe.md`"],
+    )
+    fingerprint = first["rewrite_route"]["empty_operations_fingerprint"]
+
+    replay = run_trusted_anchor_iteration_zero(
+        repo=_ITERATION_ZERO_REPO,
+        issue_number=_ITERATION_ZERO_ISSUE,
+        issue={"body": _ITERATION_ZERO_PRE_BODY},
+        anchor=anchor,
+        anchor_body=_ITERATION_ZERO_ANCHOR_BODY,
+        patch_plan={"operations": []},
+        candidate_readiness=_iteration_zero_readiness,
+        fetch_current=_iteration_zero_fetch_current(_ITERATION_ZERO_PRE_BODY, anchor),
+        allowed_path_deltas=["- `docs/product/features/scope-only-reframe.md`"],
+        previous_empty_operations_fingerprints=[fingerprint],
+        posted_scope_reframe_comment_fingerprints=[fingerprint],
+    )
+
+    assert replay["rewrite_route"]["route"] == ROUTE_ISSUE_EDITOR_REQUIRED
+    assert replay["rewrite_route"]["no_progress_retry_suppressed"] is True
+    assert replay["rewrite_route"]["duplicate_comment"] is True
+    assert replay["rewrite_route"]["should_post_comment"] is False
+
+
+def test_run_trusted_anchor_iteration_zero_without_allowed_path_deltas_is_unaffected():
+    """Backward compatibility: callers that do not pass allowed_path_deltas
+    (the pre-#2048 call shape) never get a rewrite_route key, preserving
+    byte-identical no_change results for #1877/#1835 callers."""
+    anchor = _iteration_zero_anchor()
+    result = run_trusted_anchor_iteration_zero(
+        repo=_ITERATION_ZERO_REPO,
+        issue_number=_ITERATION_ZERO_ISSUE,
+        issue={"body": _ITERATION_ZERO_PRE_BODY},
+        anchor=anchor,
+        anchor_body=_ITERATION_ZERO_ANCHOR_BODY,
+        patch_plan={"operations": []},
+        candidate_readiness=_iteration_zero_readiness,
+        fetch_current=_iteration_zero_fetch_current(_ITERATION_ZERO_PRE_BODY, anchor),
+    )
+
+    assert result["status"] == "no_change"
+    assert "rewrite_route" not in result

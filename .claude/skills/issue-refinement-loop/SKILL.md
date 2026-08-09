@@ -297,6 +297,8 @@ exit_code_3:
 
 rewrite ループの反復ごとに、checker 実行後に `scripts/decide_rewrite_route.py` を呼び出して `max_rewrite_attempts` 超過・body hash 変化なし・missing set 単調減少なしを runtime で強制し、`route`（`continue_rewrite` / `proceed_to_review` / `human_judgment_required`）に従って routing する。invocation 手順・state 永続化・`human_judgment_required` 連動は `references/termination-policy.md` の「Rewrite Loop Runtime Router（#664）」セクションを SSOT とする。orchestrator は attempt 数や no-progress を prose で再判定しない。
 
+**#2048 regression（承認済み scope reframe が empty operations[] のケース）**: 承認済み trusted anchor scope reframe（`scope_delta_status: approved_by_trusted_anchor` かつ `allowed_path_deltas` 非空）から派生した `CONTRACT_PATCH_PLAN_V1.operations[]` が空の場合、`decide_rewrite_route.py` の `decide_scope_reframe_contract_route()` が `contract_update` ではなく `issue_editor_required`（reason_code: `approved_scope_requires_full_contract_rewrite`）へ route する。この判定は 2 箇所の production 経路から呼び出される: (1) `scope_signal_delta.run_trusted_anchor_iteration_zero()`（`run_refinement_preflight.py` の `contract_update.run.with_anchor` レーンが実際に mutation を試みる箇所。`no_change` 結果に `rewrite_route` サイドカーとして付与される）、(2) `plan_refinement_loop.py`（`known_context.scope_delta_decision.operations` が渡された場合に限り、同じ判定を `decisions.scope_delta_decision.rewrite_route` として echo する opt-in 経路）。同一 anchor / body SHA の empty-operations fingerprint による no-progress `contract_update` 再試行防止と scope-reframe comment 重複投稿防止も同じ判定結果内（`no_progress_retry_suppressed` / `duplicate_comment` / `should_post_comment`）に含まれる。
+
 ### Step 4.5: 子Issue/follow-up の実体化 (Materialization)
 
 delivery-rollup parent の child materialization gate と、approve 後の follow-up 起票候補は `references/follow-up-materialization.md` を参照する。dedupe は title ではなく `dedupe_key` で行う。

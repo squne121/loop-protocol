@@ -20,6 +20,24 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
+# #2048 regression follow-up (#1877/PR #1884): decide_scope_reframe_contract_route()
+# lives in the sibling decide_rewrite_route.py module and is consumed here so an
+# approved trusted-anchor scope reframe whose derived operations[] is empty is
+# routed to issue_editor_required from the actual production call path
+# (run_trusted_anchor_iteration_zero(), invoked by run_refinement_preflight.py's
+# contract_update.run.with_anchor lane) instead of only existing as an
+# unreferenced unit-tested function.
+try:
+    from decide_rewrite_route import (
+        SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1,
+        decide_scope_reframe_contract_route,
+        ROUTE_ISSUE_EDITOR_REQUIRED,
+    )
+except ImportError:  # pragma: no cover - sibling module should always be importable
+    SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1 = None
+    decide_scope_reframe_contract_route = None
+    ROUTE_ISSUE_EDITOR_REQUIRED = "issue_editor_required"
+
 SCHEMA_VERSION = "scope_signal_delta/v1"
 
 REASON_NEW_IN_SCOPE = "new_in_scope_area"
@@ -1287,6 +1305,10 @@ def run_trusted_anchor_iteration_zero(
     fetch_current,
     apply_transaction=None,
     fresh_checks=None,
+    allowed_path_deltas: "list | None" = None,
+    scope_delta_status: str = "approved_by_trusted_anchor",
+    previous_empty_operations_fingerprints: "list | None" = None,
+    posted_scope_reframe_comment_fingerprints: "list | None" = None,
 ) -> dict:
     """Execute the bounded, callback-based trusted-anchor path.
 
@@ -1294,6 +1316,23 @@ def run_trusted_anchor_iteration_zero(
     body drift is rebased once; trust/anchor changes and postcondition failure
     are fail-closed.  This function neither creates durable state nor writes
     directly to GitHub.
+
+    #2048: `allowed_path_deltas` / `scope_delta_status` /
+    `previous_empty_operations_fingerprints` /
+    `posted_scope_reframe_comment_fingerprints` are optional and default to a
+    no-op (empty history, no allowed_path_deltas) so existing callers that do
+    not pass them keep the pre-#2048 "no_change" behavior byte-for-byte. When
+    a caller DOES pass a non-empty `allowed_path_deltas` (signalling this is
+    an approved Allowed Paths scope reframe, not an ordinary contract-key
+    patch) and `patch_plan["operations"]` is empty, the "no_change" result is
+    additionally annotated with a `rewrite_route` sub-object computed by
+    `decide_scope_reframe_contract_route()` so callers can distinguish a real
+    no-op replay from a full-body-rewrite requirement (route:
+    issue_editor_required) without re-issuing a no-progress contract_update.
+    `status` itself is left as "no_change" (not overwritten) so the existing
+    `contract_update.status` artifact enum (applied/no_change/rebased/failed)
+    is unaffected; callers must additionally branch on
+    `result["rewrite_route"]["route"]`.
     """
     normalized = normalize_trusted_anchor_iteration_zero(
         repo=repo, issue_number=issue_number, anchor=anchor, source_body=anchor_body
@@ -1303,9 +1342,10 @@ def run_trusted_anchor_iteration_zero(
     current = dict(issue)
     rebases = 0
     while True:
+        operations = patch_plan.get("operations", [])
         candidate = build_section_aware_candidate_body(
             body=current.get("body", ""),
-            operations=patch_plan.get("operations", []),
+            operations=operations,
             source_identity=normalized["source_identity"],
         )
         if not candidate["changed"]:
@@ -1316,6 +1356,28 @@ def run_trusted_anchor_iteration_zero(
                 "iterations": 0,
                 **candidate,
             }
+            if (
+                not operations
+                and allowed_path_deltas
+                and decide_scope_reframe_contract_route is not None
+                and SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1 is not None
+            ):
+                reframe_state = SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1(
+                    scope_delta_status=scope_delta_status,
+                    allowed_path_deltas=list(allowed_path_deltas),
+                    operations=list(operations),
+                    anchor_comment_url=anchor.get("html_url") or anchor.get("comment_url"),
+                    issue_body_sha256=_sha256(current.get("body", "")),
+                    previous_empty_operations_fingerprints=list(
+                        previous_empty_operations_fingerprints or []
+                    ),
+                    posted_scope_reframe_comment_fingerprints=list(
+                        posted_scope_reframe_comment_fingerprints or []
+                    ),
+                )
+                result["rewrite_route"] = decide_scope_reframe_contract_route(
+                    reframe_state
+                ).to_dict()
             if fresh_checks is not None:
                 result["fresh_checks"] = fresh_checks(current)
             return result

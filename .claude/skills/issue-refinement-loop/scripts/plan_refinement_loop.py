@@ -50,6 +50,44 @@ except ImportError:  # pragma: no cover - subprocess/CLI fallback path
     delta_extract_sections = None
     delta_iter_section_lines = None
 
+# #2048 regression follow-up (#1877/PR #1884): wire the rewrite loop's
+# scope-reframe / empty-operations router into the planner's own output so
+# an approved trusted-anchor scope reframe with an empty derived
+# operations[] is echoed here consistently with
+# scope_signal_delta.run_trusted_anchor_iteration_zero()'s production
+# annotation (see `_compute_scope_reframe_rewrite_route` below). This is
+# opt-in: it only activates when the caller supplies
+# `known_context.scope_delta_decision.operations`, so existing fixtures that
+# never set that key keep a byte-identical `decisions.scope_delta_decision`
+# echo.
+try:
+    from decide_rewrite_route import (
+        SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1,
+        decide_scope_reframe_contract_route,
+    )
+except ImportError:  # pragma: no cover - subprocess/CLI fallback path
+    SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1 = None
+    decide_scope_reframe_contract_route = None
+
+# #2048 AC4 naming-collision note: route_after_rewrite.py's
+# RouteResult.implementation_allowed (gated on post-mutation body/title
+# readback + a fresh review/preflight run) is a DIFFERENT field from
+# scope_signal_delta.SCOPE_DELTA_AUTHORITY_V1's nested
+# `route.implementation_allowed` (whether a trusted-anchor directive itself
+# authorizes implementation). To keep that distinction explicit at the one
+# place this planner echoes rewrite-router state, we import
+# route_after_rewrite.compute_implementation_allowed under a
+# collision-avoiding alias and expose its result (when the caller supplies
+# the readback signals) as `rewrite_router_implementation_allowed` — never
+# as a bare `implementation_allowed` key that could be confused with the
+# scope_delta_authority field.
+try:
+    from route_after_rewrite import (
+        compute_implementation_allowed as _rewrite_router_compute_implementation_allowed,
+    )
+except ImportError:  # pragma: no cover - subprocess/CLI fallback path
+    _rewrite_router_compute_implementation_allowed = None
+
 
 @dataclass(frozen=True)
 class SourceLine:
@@ -1643,6 +1681,76 @@ def _validate_scope_delta_approval(
     return base
 
 
+def _compute_scope_reframe_rewrite_route(known_context: "dict | None") -> "dict | None":
+    """#2048: echo the rewrite-loop scope-reframe/empty-operations router
+    decision alongside `decisions.scope_delta_decision`.
+
+    This is opt-in and purely additive: it only runs when
+    `known_context["scope_delta_decision"]["operations"]` is present (a
+    CONTRACT_PATCH_PLAN_V1 operations[] list the caller derived for this
+    approved trusted-anchor scope reframe). Callers that never set that key
+    (every pre-#2048 fixture) get `None` back and the planner's
+    `scope_delta_decision` echo is unchanged.
+
+    When `operations` is empty for an approved_by_trusted_anchor decision
+    with non-empty `allowed_path_deltas`, this calls
+    `decide_scope_reframe_contract_route()` (the same function
+    `scope_signal_delta.run_trusted_anchor_iteration_zero()` now calls on
+    the live mutation path) so the planner's echoed decision and the actual
+    contract-update executor agree on issue_editor_required instead of
+    silently retrying contract_update (#1877 regression).
+
+    Also folds in the AC4 rewrite-router `implementation_allowed` gate under
+    the collision-avoiding key `rewrite_router_implementation_allowed` when
+    the caller supplies `known_context["rewrite_readback_status"]` (body/title
+    readback + fresh review/preflight confirmation flags) -- see the
+    naming-collision note at the top of this module.
+    """
+    if decide_scope_reframe_contract_route is None or SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1 is None:
+        return None
+    if not isinstance(known_context, dict):
+        return None
+    decision = known_context.get("scope_delta_decision")
+    if not isinstance(decision, dict):
+        return None
+    operations = decision.get("operations")
+    if operations is None:
+        # Caller did not supply a derived operations[] -- nothing to route.
+        return None
+    if not isinstance(operations, list):
+        operations = []
+
+    state = SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1(
+        scope_delta_status=decision.get("status") or "",
+        allowed_path_deltas=list(decision.get("allowed_path_deltas") or []),
+        operations=list(operations),
+        anchor_comment_url=decision.get("anchor_comment_url"),
+        issue_body_sha256=known_context.get("issue_body_sha256"),
+        previous_empty_operations_fingerprints=list(
+            known_context.get("previous_empty_operations_fingerprints") or []
+        ),
+        posted_scope_reframe_comment_fingerprints=list(
+            known_context.get("posted_scope_reframe_comment_fingerprints") or []
+        ),
+    )
+    result = decide_scope_reframe_contract_route(state).to_dict()
+
+    readback = known_context.get("rewrite_readback_status")
+    if isinstance(readback, dict) and _rewrite_router_compute_implementation_allowed is not None:
+        result["rewrite_router_implementation_allowed"] = (
+            _rewrite_router_compute_implementation_allowed(
+                route=result.get("route"),
+                body_readback_confirmed=bool(readback.get("body_readback_confirmed")),
+                title_readback_confirmed=bool(readback.get("title_readback_confirmed")),
+                fresh_review_preflight_completed=bool(
+                    readback.get("fresh_review_preflight_completed")
+                ),
+            )
+        )
+
+    return result
+
+
 def _project_scope_delta_decision_to_approval(known_context: "dict | None") -> dict:
     """Blocker 1 (#1294 review): adapter from the production anchor approval path.
 
@@ -2534,6 +2642,19 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 ),
             }
 
+        # #2048: echo the scope-reframe/empty-operations rewrite route
+        # alongside scope_delta_decision (opt-in — see
+        # _compute_scope_reframe_rewrite_route docstring). `additionalProperties:
+        # true` on decisions.scope_delta_decision (schemas/refinement_loop_plan_v1.json)
+        # permits this extra key without a schema change.
+        _scope_delta_decision_echo = known_context.get("scope_delta_decision") if known_context else None
+        _scope_reframe_rewrite_route = _compute_scope_reframe_rewrite_route(known_context)
+        if isinstance(_scope_delta_decision_echo, dict) and _scope_reframe_rewrite_route is not None:
+            _scope_delta_decision_echo = {
+                **_scope_delta_decision_echo,
+                "rewrite_route": _scope_reframe_rewrite_route,
+            }
+
         # Build output
         plan = {
             "schema_version": SCHEMA_VERSION,
@@ -2566,7 +2687,7 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                     "excluded_by_anchor_reframe": scope_signal_reason == SCOPE_SIGNAL_REASON_ANCHOR_REFRAME,
                     "evidence_spans": scope_signal_evidence,
                 },
-                "scope_delta_decision": known_context.get("scope_delta_decision") if known_context else None,
+                "scope_delta_decision": _scope_delta_decision_echo,
                 "delivery_rollup": {
                     "applicable": bool(unmaterialized_slots),
                     "unmaterialized_slots": unmaterialized_slots,
