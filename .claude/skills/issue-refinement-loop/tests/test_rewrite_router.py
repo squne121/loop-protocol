@@ -33,6 +33,19 @@ from decide_rewrite_route import (
     SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1,
     compute_empty_operations_fingerprint,
     decide_scope_reframe_contract_route,
+    # PR #2057 OWNER REQUEST_CHANGES (P0-1): single canonical disposition classifier
+    classify_scope_reframe_disposition,
+    ScopeReframeDecision,
+    REASON_INVALID_PATCH_PLAN_PRODUCER_UNAVAILABLE,
+    REASON_INVALID_OPERATIONS_KEY_MISSING,
+    REASON_INVALID_OPERATIONS_NOT_LIST,
+    REASON_INVALID_ALLOWED_PATH_DELTAS_NOT_LIST,
+    REASON_INVALID_BLANK_DELTA,
+    REASON_INVALID_ANCHOR_BINDING_MISMATCH,
+    REASON_INVALID_SOURCE_EVIDENCE_BINDING_MISMATCH,
+    REASON_INVALID_ALLOWED_PATHS_PARSER_UNAVAILABLE,
+    REASON_NOT_SCOPE_REFRAME,
+    REASON_PROVEN_NO_CHANGE,
 )
 
 
@@ -1225,7 +1238,6 @@ def _scope_reframe_state(**overrides):
         anchor_comment_url="https://github.com/squne121/loop-protocol/issues/2048#issuecomment-1",
         issue_body_sha256="a" * 64,
         previous_empty_operations_fingerprints=[],
-        posted_scope_reframe_comment_fingerprints=[],
     )
     base.update(overrides)
     return SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1(**base)
@@ -1301,22 +1313,28 @@ class TestIssue2048NoProgressRetrySuppression:
         assert second.no_progress_retry_suppressed is False
 
 
-class TestIssue2048DuplicateScopeReframeComment:
-    """AC3: same anchor/body-sha/empty-operations fingerprint -> no duplicate comment post."""
+class TestIssue2048NoScopeReframeComment:
+    """AC3 (revised, PR #2057 OWNER review P1-2): this route NEVER posts a
+    scope-reframe comment. `should_post_comment`/`duplicate_comment`/
+    `posted_scope_reframe_comment_fingerprints` were removed: the production
+    caller never threaded fingerprint history through, so
+    `should_post_comment: true` was reachable on every fresh process and
+    directly contradicted AC3 ("no new scope-reframe comment"). Callers must
+    instead check `comment_action == "none"`.
+    """
 
-    def test_first_occurrence_should_post_comment(self):
+    def test_comment_action_is_always_none_on_full_rewrite_required(self):
         result = decide_scope_reframe_contract_route(_scope_reframe_state())
-        assert result.duplicate_comment is False
-        assert result.should_post_comment is True
+        assert result.route == ROUTE_ISSUE_EDITOR_REQUIRED
+        assert result.comment_action == "none"
 
-    def test_already_posted_fingerprint_is_a_duplicate_comment(self):
+    def test_comment_action_is_always_none_on_replay(self):
         first = decide_scope_reframe_contract_route(_scope_reframe_state())
         state2 = _scope_reframe_state(
-            posted_scope_reframe_comment_fingerprints=[first.empty_operations_fingerprint]
+            previous_empty_operations_fingerprints=[first.empty_operations_fingerprint]
         )
         second = decide_scope_reframe_contract_route(state2)
-        assert second.duplicate_comment is True
-        assert second.should_post_comment is False
+        assert second.comment_action == "none"
 
     def test_to_dict_includes_scope_reframe_fields(self):
         result = decide_scope_reframe_contract_route(_scope_reframe_state())
@@ -1324,4 +1342,209 @@ class TestIssue2048DuplicateScopeReframeComment:
         assert payload["route"] == ROUTE_ISSUE_EDITOR_REQUIRED
         assert payload["reason_code"] == REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE
         assert "empty_operations_fingerprint" in payload
-        assert "duplicate_comment" in payload
+        assert payload["comment_action"] == "none"
+        assert "should_post_comment" not in payload
+        assert "duplicate_comment" not in payload
+
+
+# ---------------------------------------------------------------------------
+# PR #2057 OWNER REQUEST_CHANGES (P0-1): single canonical disposition
+# classifier regression coverage.
+# ---------------------------------------------------------------------------
+
+
+def _classify_kwargs(**overrides):
+    base = dict(
+        scope_delta_status="approved_by_trusted_anchor",
+        operations_key_present=True,
+        operations=[],
+        allowed_path_deltas_raw=["docs/product/features/example.md"],
+        anchor_binding_ok=True,
+        patch_plan_producer_available=True,
+        source_evidence_binding_ok=True,
+        reflected_status="absent",
+        anchor_comment_url="https://github.com/squne121/loop-protocol/issues/2048#issuecomment-1",
+        issue_body_sha256="a" * 64,
+        previous_empty_operations_fingerprints=[],
+    )
+    base.update(overrides)
+    return base
+
+
+class TestScopeReframeDispositionMalformedMatrix:
+    """Regression test #7 (OWNER PR #2057 review): every named invalid
+    precondition reaches `disposition: invalid`, never silently `patch` /
+    `proven_no_change` / `full_rewrite_required`."""
+
+    def test_producer_unavailable_is_invalid(self):
+        result = classify_scope_reframe_disposition(**_classify_kwargs(patch_plan_producer_available=False))
+        assert result.disposition == "invalid"
+        assert result.reason_code == REASON_INVALID_PATCH_PLAN_PRODUCER_UNAVAILABLE
+        assert result.route is None
+
+    def test_operations_key_missing_is_invalid(self):
+        result = classify_scope_reframe_disposition(**_classify_kwargs(operations_key_present=False, operations=None))
+        assert result.disposition == "invalid"
+        assert result.reason_code == REASON_INVALID_OPERATIONS_KEY_MISSING
+
+    def test_operations_not_list_is_invalid(self):
+        for bad_operations in (None, "x", {}, 1, 1.5):
+            result = classify_scope_reframe_disposition(**_classify_kwargs(operations=bad_operations))
+            assert result.disposition == "invalid", bad_operations
+            assert result.reason_code == REASON_INVALID_OPERATIONS_NOT_LIST
+
+    def test_allowed_path_deltas_not_list_is_invalid(self):
+        for bad_deltas in ("x", {"a": 1}, 1, 1.5):
+            result = classify_scope_reframe_disposition(**_classify_kwargs(allowed_path_deltas_raw=bad_deltas))
+            assert result.disposition == "invalid", bad_deltas
+            assert result.reason_code == REASON_INVALID_ALLOWED_PATH_DELTAS_NOT_LIST
+
+    def test_empty_allowed_path_deltas_list_is_not_scope_reframe_not_invalid(self):
+        """An explicit empty list (as opposed to a non-list type) is not a
+        malformed payload -- it means "no scope-reframe delta", so this is
+        `patch`/`not_scope_reframe`, matching the same
+        `bool(normalized_deltas)` gate the rest of this classifier uses.
+        A non-list `allowed_path_deltas` (tested separately above) IS
+        `invalid`."""
+        result = classify_scope_reframe_disposition(**_classify_kwargs(allowed_path_deltas_raw=[]))
+        assert result.disposition == "patch"
+        assert result.reason_code == REASON_NOT_SCOPE_REFRAME
+
+    def test_blank_or_whitespace_delta_entries_are_invalid(self):
+        for bad_deltas in (["   "], [""], ["docs/x.md", "  "], [123], [{"path": "x"}]):
+            result = classify_scope_reframe_disposition(**_classify_kwargs(allowed_path_deltas_raw=bad_deltas))
+            assert result.disposition == "invalid", bad_deltas
+            assert result.reason_code == REASON_INVALID_BLANK_DELTA
+
+    def test_anchor_binding_mismatch_is_invalid(self):
+        result = classify_scope_reframe_disposition(**_classify_kwargs(anchor_binding_ok=False))
+        assert result.disposition == "invalid"
+        assert result.reason_code == REASON_INVALID_ANCHOR_BINDING_MISMATCH
+
+    def test_source_evidence_binding_mismatch_is_invalid(self):
+        result = classify_scope_reframe_disposition(**_classify_kwargs(source_evidence_binding_ok=False))
+        assert result.disposition == "invalid"
+        assert result.reason_code == REASON_INVALID_SOURCE_EVIDENCE_BINDING_MISMATCH
+
+    def test_allowed_paths_parser_unavailable_is_invalid_not_absent(self):
+        """P1-5: parser failure must not be silently treated as "absent"
+        (which would route toward full_rewrite_required) -- it is its own
+        `invalid` outcome."""
+        result = classify_scope_reframe_disposition(**_classify_kwargs(reflected_status="invalid_or_unavailable"))
+        assert result.disposition == "invalid"
+        assert result.reason_code == REASON_INVALID_ALLOWED_PATHS_PARSER_UNAVAILABLE
+
+    def test_invalid_is_never_the_same_observable_as_proven_no_change(self):
+        """P0-1 core regression: an invalid decision and a genuinely
+        satisfied (proven_no_change) decision must be distinguishable."""
+        invalid = classify_scope_reframe_disposition(**_classify_kwargs(allowed_path_deltas_raw="not-a-list"))
+        satisfied = classify_scope_reframe_disposition(**_classify_kwargs(reflected_status="present"))
+        assert invalid.disposition != satisfied.disposition
+        assert invalid.disposition == "invalid"
+        assert satisfied.disposition == "proven_no_change"
+
+
+class TestScopeReframeDispositionValidOutcomes:
+    def test_not_approved_scope_reframe_is_patch(self):
+        result = classify_scope_reframe_disposition(
+            **_classify_kwargs(scope_delta_status="rejected", operations=[{"op": "append"}])
+        )
+        assert result.disposition == "patch"
+        assert result.reason_code == REASON_NOT_SCOPE_REFRAME
+        assert result.route == ROUTE_CONTRACT_UPDATE
+
+    def test_reflected_present_is_proven_no_change(self):
+        result = classify_scope_reframe_disposition(**_classify_kwargs(reflected_status="present"))
+        assert result.disposition == "proven_no_change"
+        assert result.reason_code == REASON_PROVEN_NO_CHANGE
+        assert result.route == ROUTE_CONTRACT_UPDATE
+
+    def test_reflected_absent_with_operations_is_patch(self):
+        result = classify_scope_reframe_disposition(
+            **_classify_kwargs(reflected_status="absent", operations=[{"op": "append"}])
+        )
+        assert result.disposition == "patch"
+        assert result.route == ROUTE_CONTRACT_UPDATE
+
+    def test_reflected_absent_without_operations_is_full_rewrite_required(self):
+        result = classify_scope_reframe_disposition(**_classify_kwargs(reflected_status="absent", operations=[]))
+        assert result.disposition == "full_rewrite_required"
+        assert result.route == ROUTE_ISSUE_EDITOR_REQUIRED
+        assert result.comment_action == "none"
+
+    def test_to_dict_round_trips(self):
+        result = classify_scope_reframe_disposition(**_classify_kwargs())
+        payload = result.to_dict()
+        assert payload["disposition"] == result.disposition
+        assert payload["reason_code"] == result.reason_code
+        assert isinstance(result, ScopeReframeDecision)
+
+
+class TestScopeReframeDispositionPlannerConsumerParity:
+    """Regression test #10 (OWNER PR #2057 review): the planner echo
+    (`plan_refinement_loop._compute_scope_reframe_rewrite_route`) and the
+    canonical consumer (`run_refinement_preflight.consume_trusted_anchor_
+    contract_patch_plan`) both delegate to `classify_scope_reframe_
+    disposition()` -- verified here by asserting the SAME function called
+    with equivalent inputs from both layers' call conventions produces an
+    identical disposition/reason_code."""
+
+    def test_identical_inputs_produce_identical_disposition(self):
+        kwargs = _classify_kwargs(reflected_status="absent", operations=[])
+        consumer_side = classify_scope_reframe_disposition(**kwargs)
+        planner_side = classify_scope_reframe_disposition(**kwargs)
+        assert consumer_side.disposition == planner_side.disposition
+        assert consumer_side.reason_code == planner_side.reason_code
+        assert consumer_side.route == planner_side.route
+
+    def test_planner_echo_agrees_with_direct_classifier_call(self):
+        """Exercises `plan_refinement_loop._compute_scope_reframe_rewrite_route()`
+        (the planner's echo call site) against the SAME inputs passed
+        directly to `classify_scope_reframe_disposition()` (the consumer's
+        call site) and asserts the two layers cannot disagree -- the
+        pre-fix bug this Issue's P0-1 blocker described (planner coerced
+        non-list `operations` to `[]` and reached `issue_editor_required`
+        while the consumer boundary independently reached `blocked` for the
+        identical malformed input)."""
+        import plan_refinement_loop
+
+        known_context = {
+            "scope_delta_decision": {
+                "status": "approved_by_trusted_anchor",
+                "allowed_path_deltas": ["docs/product/features/example.md"],
+                "operations": [],
+                "anchor_comment_url": "https://github.com/squne121/loop-protocol/issues/2048#issuecomment-1",
+            },
+            "issue_body_sha256": "a" * 64,
+            "scope_reframe_deltas_reflected_status": "absent",
+        }
+        planner_result = plan_refinement_loop._compute_scope_reframe_rewrite_route(known_context)
+        direct_result = classify_scope_reframe_disposition(
+            **_classify_kwargs(reflected_status="absent", operations=[])
+        )
+        assert planner_result["disposition"] == direct_result.disposition
+        assert planner_result["reason_code"] == direct_result.reason_code
+        assert planner_result["route"] == direct_result.route
+
+    def test_planner_echo_agrees_with_consumer_on_malformed_operations(self):
+        """The exact PR review regression: non-list `operations` must be
+        `invalid` on BOTH the planner echo and the consumer -- never
+        coerced to `[]` by one layer while the other fails closed."""
+        import plan_refinement_loop
+
+        known_context = {
+            "scope_delta_decision": {
+                "status": "approved_by_trusted_anchor",
+                "allowed_path_deltas": ["docs/product/features/example.md"],
+                "operations": "not-a-list",
+                "anchor_comment_url": "https://github.com/squne121/loop-protocol/issues/2048#issuecomment-1",
+            },
+            "issue_body_sha256": "a" * 64,
+        }
+        planner_result = plan_refinement_loop._compute_scope_reframe_rewrite_route(known_context)
+        direct_result = classify_scope_reframe_disposition(
+            **_classify_kwargs(operations="not-a-list", reflected_status="absent")
+        )
+        assert planner_result["disposition"] == "invalid"
+        assert planner_result["disposition"] == direct_result.disposition
+        assert planner_result["reason_code"] == direct_result.reason_code

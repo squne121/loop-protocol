@@ -98,10 +98,10 @@ def test_scope_only_reframe_replay_suppresses_no_progress_retry_and_duplicate_co
     )
     first_result = decide_scope_reframe_contract_route(first_state)
     assert first_result.no_progress_retry_suppressed is False
-    assert first_result.should_post_comment is True
+    assert first_result.comment_action == "none"
 
-    # Simulate the loop persisting the fingerprint after (a) recording the
-    # no-progress occurrence and (b) posting the scope-reframe comment once.
+    # Simulate the loop persisting the fingerprint after recording the
+    # no-progress occurrence.
     replay_state = SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1(
         scope_delta_status="approved_by_trusted_anchor",
         allowed_path_deltas=["- `docs/product/features/scope-only-reframe.md`"],
@@ -109,15 +109,13 @@ def test_scope_only_reframe_replay_suppresses_no_progress_retry_and_duplicate_co
         anchor_comment_url=SCOPE_ONLY_REFRAME_ANCHOR_URL,
         issue_body_sha256=SCOPE_ONLY_REFRAME_BODY_SHA256,
         previous_empty_operations_fingerprints=[first_result.empty_operations_fingerprint],
-        posted_scope_reframe_comment_fingerprints=[first_result.empty_operations_fingerprint],
     )
     replay_result = decide_scope_reframe_contract_route(replay_state)
 
     assert replay_result.route == ROUTE_ISSUE_EDITOR_REQUIRED
     assert replay_result.route != ROUTE_CONTRACT_UPDATE
     assert replay_result.no_progress_retry_suppressed is True
-    assert replay_result.duplicate_comment is True
-    assert replay_result.should_post_comment is False
+    assert replay_result.comment_action == "none"
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +183,8 @@ def test_run_trusted_anchor_iteration_zero_surfaces_issue_editor_required_route(
         candidate_readiness=_iteration_zero_readiness,
         fetch_current=_iteration_zero_fetch_current(_ITERATION_ZERO_PRE_BODY, anchor),
         allowed_path_deltas=["- `docs/product/features/scope-only-reframe.md`"],
+        scope_delta_status="approved_by_trusted_anchor",
+        reflected_checker=lambda _body: "absent",
     )
 
     assert result["status"] == "no_change"
@@ -194,7 +194,7 @@ def test_run_trusted_anchor_iteration_zero_surfaces_issue_editor_required_route(
         result["rewrite_route"]["reason_code"]
         == REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE
     )
-    assert result["rewrite_route"]["should_post_comment"] is True
+    assert result["rewrite_route"]["comment_action"] == "none"
 
 
 def test_run_trusted_anchor_iteration_zero_replay_suppresses_via_production_path():
@@ -214,6 +214,8 @@ def test_run_trusted_anchor_iteration_zero_replay_suppresses_via_production_path
         candidate_readiness=_iteration_zero_readiness,
         fetch_current=_iteration_zero_fetch_current(_ITERATION_ZERO_PRE_BODY, anchor),
         allowed_path_deltas=["- `docs/product/features/scope-only-reframe.md`"],
+        scope_delta_status="approved_by_trusted_anchor",
+        reflected_checker=lambda _body: "absent",
     )
     fingerprint = first["rewrite_route"]["empty_operations_fingerprint"]
 
@@ -227,14 +229,14 @@ def test_run_trusted_anchor_iteration_zero_replay_suppresses_via_production_path
         candidate_readiness=_iteration_zero_readiness,
         fetch_current=_iteration_zero_fetch_current(_ITERATION_ZERO_PRE_BODY, anchor),
         allowed_path_deltas=["- `docs/product/features/scope-only-reframe.md`"],
+        scope_delta_status="approved_by_trusted_anchor",
+        reflected_checker=lambda _body: "absent",
         previous_empty_operations_fingerprints=[fingerprint],
-        posted_scope_reframe_comment_fingerprints=[fingerprint],
     )
 
     assert replay["rewrite_route"]["route"] == ROUTE_ISSUE_EDITOR_REQUIRED
     assert replay["rewrite_route"]["no_progress_retry_suppressed"] is True
-    assert replay["rewrite_route"]["duplicate_comment"] is True
-    assert replay["rewrite_route"]["should_post_comment"] is False
+    assert replay["rewrite_route"]["comment_action"] == "none"
 
 
 def test_run_trusted_anchor_iteration_zero_without_allowed_path_deltas_is_unaffected():

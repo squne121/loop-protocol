@@ -663,8 +663,14 @@ def test_negative_4_malformed_operations_type_fails_closed_without_coercion():
 
 
 def test_negative_5_malformed_allowed_path_deltas_fails_closed():
-    """Regression #5: allowed_path_deltas is empty/malformed -- fails closed
-    to the ordinary no_change path, never escalated."""
+    """Regression #5: an explicit EMPTY allowed_path_deltas list is not a
+    scope-reframe signal at all (consistent with
+    `classify_scope_reframe_disposition()`'s own
+    `bool(normalized_deltas)` gate) -- fails closed to the ordinary
+    no_change path, never escalated to issue_editor_required, and never
+    silently promoted to `full_rewrite_required`. See
+    `test_negative_5b_non_list_allowed_path_deltas_is_invalid` for the
+    genuinely malformed (non-list) case, which IS `invalid`."""
     issue_body = _e2e_issue_body(allowed_paths_includes_delta=False)
     anchor_comment = _e2e_anchor_comment()
     patch_plan = {"operations": []}
@@ -684,10 +690,37 @@ def test_negative_5_malformed_allowed_path_deltas_fails_closed():
     assert calls["apply_transaction"] == 0
 
 
+def test_negative_5b_non_list_allowed_path_deltas_is_invalid():
+    """Regression #5 (PR #2057 OWNER review P0-1): a NON-LIST
+    allowed_path_deltas (genuinely malformed, distinct from an explicit
+    empty list) is a DISTINCT `invalid` disposition/status -- never
+    silently collapsed into the same `no_change` observable as a
+    genuinely satisfied `proven_no_change`."""
+    issue_body = _e2e_issue_body(allowed_paths_includes_delta=False)
+    anchor_comment = _e2e_anchor_comment()
+    patch_plan = {"operations": []}
+    known_context = {
+        "scope_delta_decision": {
+            **_e2e_approved_scope_delta_decision(anchor_body=anchor_comment["body"]),
+            "allowed_path_deltas": "not-a-list",
+        }
+    }
+    kwargs, calls, _ = _e2e_consumer_kwargs(
+        patch_plan=patch_plan, known_context=known_context, issue_body=issue_body
+    )
+    result = _e2e_preflight.consume_trusted_anchor_contract_patch_plan(**kwargs)
+
+    assert result["status"] == "invalid"
+    assert result["disposition"]["disposition"] == "invalid"
+    assert "rewrite_route" not in result
+    assert calls["apply_transaction"] == 0
+
+
 def test_negative_6_anchor_identity_binding_drift_fails_closed():
-    """Regression #6: scope_delta_decision.anchor_comment_url does not match
-    THIS consumer call's anchor_url (a stale/different decision) -- fails
-    closed, never escalated, write 0."""
+    """Regression #6 (revised, PR #2057 OWNER review P0-1):
+    scope_delta_decision.anchor_comment_url does not match THIS consumer
+    call's anchor_url (a stale/different decision) -- a distinct `invalid`
+    outcome, never silently the same as an ordinary no-op."""
     issue_body = _e2e_issue_body(allowed_paths_includes_delta=False)
     anchor_comment = _e2e_anchor_comment()
     patch_plan = {"operations": []}
@@ -702,14 +735,17 @@ def test_negative_6_anchor_identity_binding_drift_fails_closed():
     )
     result = _e2e_preflight.consume_trusted_anchor_contract_patch_plan(**kwargs)
 
-    assert result["status"] == "no_change"
+    assert result["status"] == "invalid"
+    assert result["disposition"]["disposition"] == "invalid"
     assert "rewrite_route" not in result
     assert calls["apply_transaction"] == 0
 
 
 def test_negative_6b_anchor_body_hash_drift_fails_closed():
-    """Regression #6 (body hash variant): scope_delta_decision.anchor_comment_hash
-    does not match sha256(this call's anchor_body) -- fails closed."""
+    """Regression #6 (body hash variant, revised): scope_delta_decision.
+    anchor_comment_hash does not match sha256(this call's anchor_body) --
+    a distinct `invalid` outcome (TOCTOU-adjacent: the anchor was edited
+    after the decision was computed)."""
     issue_body = _e2e_issue_body(allowed_paths_includes_delta=False)
     anchor_comment = _e2e_anchor_comment()
     patch_plan = {"operations": []}
@@ -724,6 +760,90 @@ def test_negative_6b_anchor_body_hash_drift_fails_closed():
     )
     result = _e2e_preflight.consume_trusted_anchor_contract_patch_plan(**kwargs)
 
-    assert result["status"] == "no_change"
+    assert result["status"] == "invalid"
+    assert result["disposition"]["disposition"] == "invalid"
     assert "rewrite_route" not in result
     assert calls["apply_transaction"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PR #2057 OWNER REQUEST_CHANGES (P1-5): tri-state Allowed Paths reflected
+# check -- false-positive resistance regression coverage for
+# `_check_scope_reframe_deltas_reflected()` (formerly `_scope_reframe_
+# deltas_already_reflected()`, which had a `normalized_delta in
+# current_body` whole-body substring fallback that this function removes).
+# ---------------------------------------------------------------------------
+
+
+def _reflected_issue_body(allowed_paths_lines: list[str], *, extra_sections: str = "") -> str:
+    return (
+        "## Machine-Readable Contract\n\n"
+        "```yaml\ncontract_schema_version: v1\nissue_kind: implementation\n"
+        "parent_issue: none\ngoal_ref: test\nchange_kind: workflow\n```\n\n"
+        "## Outcome\n\n" + extra_sections + "\n\n"
+        "## Allowed Paths\n\n" + "\n".join(allowed_paths_lines) + "\n\n"
+        "## Stop Conditions\n\n- none\n"
+    )
+
+
+class TestScopeReframeDeltasReflectedFalsePositiveResistance:
+    def test_delta_only_in_outcome_prose_is_absent_not_present(self):
+        """A delta literal appearing only in `## Outcome` prose (not the
+        canonical `## Allowed Paths` section) must NOT be treated as
+        reflected."""
+        body = _reflected_issue_body(
+            ["- docs/product/features/existing.md"],
+            extra_sections="この Issue は docs/product/features/scope-only-reframe.md を扱う。",
+        )
+        status = _e2e_preflight._check_scope_reframe_deltas_reflected(
+            current_body=body,
+            allowed_path_deltas=["docs/product/features/scope-only-reframe.md"],
+        )
+        assert status == "absent"
+
+    def test_delta_only_in_fenced_code_is_absent_not_present(self):
+        body = _reflected_issue_body(
+            ["- docs/product/features/existing.md"],
+            extra_sections="```text\ndocs/product/features/scope-only-reframe.md\n```",
+        )
+        status = _e2e_preflight._check_scope_reframe_deltas_reflected(
+            current_body=body,
+            allowed_path_deltas=["docs/product/features/scope-only-reframe.md"],
+        )
+        assert status == "absent"
+
+    def test_delta_as_prefix_of_a_longer_unrelated_path_is_absent(self):
+        """`docs/foo` must not be matched by `docs/foobar` appearing in the
+        Allowed Paths section."""
+        body = _reflected_issue_body(["- docs/foobar.md"])
+        status = _e2e_preflight._check_scope_reframe_deltas_reflected(
+            current_body=body, allowed_path_deltas=["docs/foo.md"]
+        )
+        assert status == "absent"
+
+    def test_delta_exactly_present_in_allowed_paths_section_is_present(self):
+        body = _reflected_issue_body(
+            ["- docs/product/features/existing.md", "- docs/product/features/scope-only-reframe.md"]
+        )
+        status = _e2e_preflight._check_scope_reframe_deltas_reflected(
+            current_body=body,
+            allowed_path_deltas=["docs/product/features/scope-only-reframe.md"],
+        )
+        assert status == "present"
+
+    def test_whitespace_only_delta_entry_is_absent_never_present(self):
+        """A whitespace-only delta normalizes to an empty string; it must
+        never match (the pre-fix bug: an empty string is a substring of
+        every body, so this always "matched")."""
+        body = _reflected_issue_body(["- docs/product/features/existing.md"])
+        status = _e2e_preflight._check_scope_reframe_deltas_reflected(
+            current_body=body, allowed_path_deltas=["   "]
+        )
+        assert status == "absent"
+
+    def test_empty_deltas_list_is_invalid_or_unavailable(self):
+        body = _reflected_issue_body(["- docs/product/features/existing.md"])
+        status = _e2e_preflight._check_scope_reframe_deltas_reflected(
+            current_body=body, allowed_path_deltas=[]
+        )
+        assert status == "invalid_or_unavailable"
