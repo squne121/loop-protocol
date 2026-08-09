@@ -438,7 +438,7 @@ def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, 
 
     captured_prompt: dict[str, str] = {}
 
-    def _fake_live_evidence(context_paths, root, manifest):
+    def _fake_live_evidence(context_paths, root, manifest, *, deadline_monotonic=None):
         evidence_records = [
             {
                 "tool_name": "find_file",

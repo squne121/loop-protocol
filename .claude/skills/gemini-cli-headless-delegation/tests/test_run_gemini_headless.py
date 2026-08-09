@@ -2295,9 +2295,20 @@ def _read():
 def main():
     import os
 
-    mode = sys.argv[1] if len(sys.argv) > 1 else "normal"
-    tools = (sys.argv[2] if len(sys.argv) > 2 else "find_file,search_for_pattern,get_symbols_overview").split(",")
-    marker = sys.argv[3] if len(sys.argv) > 3 else None
+    # Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044): the real
+    # wrapper now appends an explicit "--tool-timeout N" pair to the
+    # launch args (see _build_serena_launch_command in
+    # run_gemini_headless.py). This fake server uses bare positional argv
+    # (not argparse) for the test-only mode/tools/marker triple, so strip
+    # that pair out first rather than mis-parsing it as a positional value.
+    argv = list(sys.argv[1:])
+    if "--tool-timeout" in argv:
+        idx = argv.index("--tool-timeout")
+        del argv[idx : idx + 2]
+
+    mode = argv[0] if len(argv) > 0 else "normal"
+    tools = (argv[1] if len(argv) > 1 else "find_file,search_for_pattern,get_symbols_overview").split(",")
+    marker = argv[2] if len(argv) > 2 else None
 
     if mode == "exit_early":
         sys.exit(3)
@@ -2639,6 +2650,13 @@ def test_serena_retry_bounded_single_retry_for_timeout_classes_only(tmp_path, mo
     monkeypatch.setattr(module, "SERENA_COLLECTOR_SESSION_DEADLINE_SEC", 0.6)
     monkeypatch.setattr(module, "SERENA_CLIENT_REQUEST_TIMEOUT_SEC", 0.4)
     monkeypatch.setattr(module, "SERENA_SERVER_TOOL_TIMEOUT_SEC", 0.4)
+    # Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044): the retry
+    # min-remaining-budget reserve must be scaled down along with the
+    # (deliberately shrunk, for test speed) session deadline above --
+    # otherwise the real 15s production reserve would always exceed this
+    # test's entire 0.6s budget and the retry this test exercises would
+    # never be attempted.
+    monkeypatch.setattr(module, "SERENA_RETRY_MIN_REMAINING_BUDGET_SEC", 0.0)
     _patch_fake_serena_launch(module, monkeypatch, server_path, "hang_startup")
     result = module.run_delegation(request, request_path=repo_root / "request.json")
     assert result["ok"] is False
@@ -2647,6 +2665,162 @@ def test_serena_retry_bounded_single_retry_for_timeout_classes_only(tmp_path, mo
     assert metadata["retry_succeeded"] is False
     assert metadata["initial_failure_class"] == "startup_timeout"
     assert metadata["stage_failure_class"] == "startup_timeout"
+
+
+def test_serena_retry_skipped_when_route_deadline_nearly_exhausted(tmp_path, monkeypatch):
+    """Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044): the retry
+    budget is shared with the first attempt via a single route-level
+    deadline -- when the first attempt already consumed the deadline down
+    to (or below) SERENA_RETRY_MIN_REMAINING_BUDGET_SEC, no retry is
+    attempted at all, and the surfaced failure/attempts array reflects
+    exactly one attempt (never a retry that could not possibly complete
+    honestly within the remaining route budget)."""
+    module = load_module()
+    monkeypatch.setattr(module, "_validate_local_asset_research_settings", lambda: [])
+
+    def _fake_run_agy(prompt, timeout_sec=module.DEFAULT_TIMEOUT_SEC):
+        return __import__("subprocess").CompletedProcess(
+            args=["agy"], returncode=0, stdout="LOOP_AGY_SMOKE_OK", stderr=""
+        )
+
+    monkeypatch.setattr(module, "_run_agy", _fake_run_agy)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    context_file = repo_root / "context.md"
+    context_file.write_text("local_asset_research content", encoding="utf-8")
+    monkeypatch.setattr(module, "_repo_root", lambda: repo_root)
+    server_path = _write_fake_serena_server(tmp_path)
+    manifest = _fake_serena_manifest()
+    monkeypatch.setattr(module, "load_serena_tool_manifest", lambda root: manifest)
+
+    request = {
+        "schema": "delegation_request_v1",
+        "tool_profile": "local_asset_research",
+        "provider": "agy",
+        "prompt": "Summarize local asset evidence.",
+        "objective": "Investigate local repository evidence",
+        "instructions": ["Summarize"],
+        "output_sections": ["response"],
+        "context_files": ["context.md"],
+    }
+
+    # The whole route-level deadline (0.3s) is (deliberately, for test
+    # speed) smaller than the real production
+    # SERENA_RETRY_MIN_REMAINING_BUDGET_SEC reserve (kept at its real
+    # value here -- this is the one test that specifically exercises the
+    # reserve gate itself), so after the first attempt fails at/after the
+    # deadline there is never enough remaining budget for a genuine retry.
+    monkeypatch.setattr(module, "SERENA_COLLECTOR_SESSION_DEADLINE_SEC", 0.3)
+    monkeypatch.setattr(module, "SERENA_CLIENT_REQUEST_TIMEOUT_SEC", 0.2)
+    monkeypatch.setattr(module, "SERENA_SERVER_TOOL_TIMEOUT_SEC", 0.1)
+    _patch_fake_serena_launch(module, monkeypatch, server_path, "hang_startup")
+    result = module.run_delegation(request, request_path=repo_root / "request.json")
+    assert result["ok"] is False
+    metadata = result["local_asset_retrieval_metadata"]
+    assert metadata["retry_attempted"] is False
+    assert metadata["initial_failure_class"] == "startup_timeout"
+    assert len(metadata["attempts"]) == 1
+    assert metadata["attempts"][0]["outcome"] == "failed"
+    assert metadata["attempts"][0]["failure_class"] == "startup_timeout"
+
+
+def test_serena_launch_command_wires_tool_timeout_to_subprocess(tmp_path, monkeypatch):
+    """Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044): the server
+    timeout hierarchy assert must bind the launched Serena subprocess, not
+    just this wrapper's own recv() loop -- _build_serena_launch_command()
+    must append an explicit --tool-timeout override derived from
+    SERENA_SERVER_TOOL_TIMEOUT_SEC to the checked-in .agents/mcp_config.json
+    args (without requiring any change to that config file)."""
+    module = load_module()
+    serena_config = {
+        "command": "uvx",
+        "args": [
+            "--from", "git+https://github.com/oraios/serena@deadbeef00000000",
+            "serena", "start-mcp-server", "--project-from-cwd",
+        ],
+    }
+    command = module._build_serena_launch_command(serena_config, module.SERENA_SERVER_TOOL_TIMEOUT_SEC)
+    assert command[0] == "uvx"
+    assert "--tool-timeout" in command
+    idx = command.index("--tool-timeout")
+    assert command[idx + 1] == str(int(module.SERENA_SERVER_TOOL_TIMEOUT_SEC))
+
+    # An explicit --tool-timeout already present in the checked-in config is
+    # left untouched (never duplicated / overridden).
+    serena_config_with_override = {
+        "command": "uvx",
+        "args": [*serena_config["args"], "--tool-timeout", "99"],
+    }
+    command_with_override = module._build_serena_launch_command(
+        serena_config_with_override, module.SERENA_SERVER_TOOL_TIMEOUT_SEC
+    )
+    assert command_with_override.count("--tool-timeout") == 1
+    idx2 = command_with_override.index("--tool-timeout")
+    assert command_with_override[idx2 + 1] == "99"
+
+
+def test_serena_cleanup_failure_on_success_path_is_fail_closed(tmp_path, monkeypatch):
+    """Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044):
+    SerenaCleanupFailureError must be genuinely reachable -- an incomplete
+    cleanup on the success path (no primary failure to protect) must raise,
+    never merely warnings.warn() while still returning a "successful"
+    result to the caller."""
+    module = load_module()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    context_file = repo_root / "context.md"
+    context_file.write_text("local_asset_research content", encoding="utf-8")
+    server_path = _write_fake_serena_server(tmp_path)
+    manifest = _fake_serena_manifest()
+    _patch_fake_serena_launch(module, monkeypatch, server_path, "normal")
+
+    def _fake_cleanup_always_fails(process, pgid):
+        return {
+            "terminate_signal_sent": True,
+            "kill_signal_sent": True,
+            "reaped": True,
+            "group_terminated": False,
+            "error": "simulated surviving process group",
+        }
+
+    monkeypatch.setattr(module, "_terminate_and_reap_serena_process", _fake_cleanup_always_fails)
+
+    with pytest.raises(module.SerenaCleanupFailureError):
+        module._collect_live_serena_read_only_evidence([context_file], repo_root, manifest)
+
+
+def test_serena_cleanup_failure_never_masks_primary_failure(tmp_path, monkeypatch):
+    """Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044): a cleanup
+    failure that occurs while a primary collector failure is already
+    propagating must be attached as secondary metadata on the primary
+    exception, never raised in its place (which would mask the real
+    failure class the caller needs to see)."""
+    module = load_module()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    context_file = repo_root / "context.md"
+    context_file.write_text("local_asset_research content", encoding="utf-8")
+    server_path = _write_fake_serena_server(tmp_path)
+    manifest = _fake_serena_manifest()
+    monkeypatch.setattr(module, "SERENA_COLLECTOR_SESSION_DEADLINE_SEC", 0.4)
+    monkeypatch.setattr(module, "SERENA_CLIENT_REQUEST_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(module, "SERENA_SERVER_TOOL_TIMEOUT_SEC", 0.2)
+    _patch_fake_serena_launch(module, monkeypatch, server_path, "hang_startup")
+
+    def _fake_cleanup_always_fails(process, pgid):
+        return {
+            "terminate_signal_sent": True,
+            "kill_signal_sent": True,
+            "reaped": True,
+            "group_terminated": False,
+            "error": "simulated surviving process group",
+        }
+
+    monkeypatch.setattr(module, "_terminate_and_reap_serena_process", _fake_cleanup_always_fails)
+
+    with pytest.raises(module.SerenaStartupTimeoutError) as excinfo:
+        module._collect_live_serena_read_only_evidence([context_file], repo_root, manifest)
+    assert excinfo.value.cleanup_failure["error"] == "simulated surviving process group"
 
 
 def test_serena_monotonic_deadline_hierarchy_is_enforced(tmp_path, monkeypatch):
@@ -2731,7 +2905,7 @@ def test_serena_cleanup_sigkill_fallback_when_sigterm_ignored(tmp_path, monkeypa
     )
     proc.stdout.readline()  # wait for "ready" so SIGTERM lands after handler install
 
-    report = module._terminate_and_reap_serena_process(proc)
+    report = module._terminate_and_reap_serena_process(proc, proc.pid)
 
     assert report["terminate_signal_sent"] is True
     assert report["kill_signal_sent"] is True
@@ -2784,7 +2958,7 @@ def test_serena_cleanup_reaps_grandchild_process_group(tmp_path, monkeypatch):
         _time.sleep(0.05)
     assert marker.exists(), "grandchild did not start in time"
 
-    report = module._terminate_and_reap_serena_process(proc)
+    report = module._terminate_and_reap_serena_process(proc, proc.pid)
     assert report["reaped"] is True
 
     # The direct child's process group should now be empty: sending signal
