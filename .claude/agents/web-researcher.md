@@ -139,7 +139,7 @@ grounded route が `status: ok` でも、以下のいずれかに該当する場
 
 `evidence[].ref` / `citation_count` は `run_gemini_headless.py` の `delegation_result/v1.grounded_research_evidence.sources[]`（provider boundary）から materialize する。この `sources[]` は Issue #2038 により `[:1]` 切り詰めが撤廃されており、複数 source が存在する場合は cardinality を保持したまま返る（1 citation にまとめない）。`web_tool_call_count` / `search_query_count` も同様に実測値を反映する（固定値 1 ではない）。
 
-`claims[].evidence[]` への source-claim の 1:1 対応付けは、実態が one-to-many/many-to-many であるため本 SubAgent の決定的な materialization 手順としては未確立（別 follow-up Issue、Issue #2038 の `Remaining Parent Gaps` 参照）。本 SubAgent は `sources[]` の各エントリを `claims[]` へベストエフォートで割り当ててよいが、この割り当てを厳密な 1:1 の正本として扱わない。
+`claims[].evidence[]` への source-claim の対応付けは、実態が one-to-many/many-to-many であり、決定論的な claim-source mapping は未解決の問題であるため（Issue #2042 で追跡中）、本 SubAgent は best-effort な割り当てを行わない。`sources[]` は `claim_evidence: []`（空）のまま `status: unresolved` として保持し、`claims[].evidence[]` への割り当ては Issue #2042 が決定論的な materialization 手順を確立するまで行わない（false grounding のリスクを避けるため、「とりあえず割り当てる」ことを許容しない）。
 
 ## Result: WEB_RESEARCH_RESULT_V1 (SubAgent-owned / 結果契約)
 

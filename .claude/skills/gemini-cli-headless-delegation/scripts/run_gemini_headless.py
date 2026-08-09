@@ -3012,6 +3012,20 @@ def _run_agy(
     tool_profile = _AGY_TOOL_PROFILE_CTX.get()
     selected_model: str | None = None
     approved_models: "frozenset[str] | None" = None
+    # Issue #2038 P0-1/P0-2 fix_delta: resolved only for grounded_research --
+    # see `_resolve_run_agy_structured_output_capability_record()`. Attached
+    # to the returned `CompletedProcess` below (both the isolated-workspace
+    # and plain-env branches) so `_normalize_agy_result()` can route this
+    # exact invocation's grounded_research metadata through the structured
+    # NDJSON parser (`_build_agy_structured_stream_json_grounded_research_metadata()`)
+    # instead of the legacy stdout best-effort text parser whenever this
+    # invocation actually attached `--output-format stream-json` --
+    # deliberately NEVER when it did not, so a same-binary capability status
+    # that is not (yet) confirmed `supported` never regresses grounded_research
+    # into an always-fail-closed no-op (this module still always performs the
+    # real agy subprocess call; only the metadata-parsing route changes).
+    structured_output_capability_record: "dict[str, Any] | None" = None
+    output_format: str | None = None
     if tool_profile == GROUNDED_RESEARCH_PROFILE:
         # Issue #1777: capability-driven routing. Model selection is optional
         # -- resolve_agy_grounded_research_model() returns None (no --model
@@ -3028,6 +3042,9 @@ def _run_agy(
         # well-formed.
         _approved_model_chain, _ = resolve_model_chain({"role": AGY_GROUNDED_RESEARCH_ROLE})
         approved_models = frozenset(_approved_model_chain)
+        structured_output_capability_record = _resolve_run_agy_structured_output_capability_record(agy_bin)
+        if structured_output_capability_record.get("status") in _AGY_STRUCTURED_OUTPUT_SUPPORTED_STATUSES:
+            output_format = "stream-json"
     # Issue #1807: build the real execution argv from the single canonical
     # `_build_agy_inner_argv()` builder (shared with the audit-display
     # `_build_agy_raw_command()`), then validate it against the positional
@@ -3043,7 +3060,14 @@ def _run_agy(
     # chance to be classified as anything other than the wrapper's own
     # fail-closed policy rejection.
     _reject_agy_prompt_leading_slash_command(prompt)
-    command = _build_agy_inner_argv(agy_bin, prompt, selected_model)
+    # Issue #2038 P0-1 fix_delta: `output_format` is only ever non-None here
+    # when `tool_profile == GROUNDED_RESEARCH_PROFILE` AND the same-binary
+    # two-stage capability probe above resolved to `supported` -- this is
+    # the ONLY production call site that can ever attach
+    # `--output-format stream-json` to the real invocation argv (Issue #2038
+    # AC1 unit tests exercise the builder/validator directly; this wiring is
+    # what makes that reachable from `_run_agy()` itself).
+    command = _build_agy_inner_argv(agy_bin, prompt, selected_model, output_format=output_format)
     _validate_agy_invocation_argv(command, approved_models=approved_models)
     # Issue #1807 fix_delta Blocker 1: only once validation has actually
     # succeeded is the sanitized form of *this exact* argv (including any
@@ -3132,6 +3156,12 @@ def _run_agy(
             # unaffected by these attributes (Issue #1708 AC12 regression guard).
             completed.agy_provenance_hook_events = hook_events  # type: ignore[attr-defined]
             completed.agy_provenance_hook_load_error = hook_load_error  # type: ignore[attr-defined]
+            # Issue #2038 P0-1 fix_delta: carries the resolved same-binary
+            # structured-output capability record + whether THIS invocation
+            # actually attached `--output-format` through to
+            # `_normalize_agy_result()` (see that function's routing logic).
+            completed.agy_structured_output_capability_record = structured_output_capability_record  # type: ignore[attr-defined]
+            completed.agy_structured_output_used = output_format is not None  # type: ignore[attr-defined]
             return completed
         finally:
             shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
@@ -3190,6 +3220,10 @@ def _run_agy(
         # unaffected by these attributes (Issue #1708 AC12 regression guard).
         completed.agy_provenance_hook_events = hook_events  # type: ignore[attr-defined]
         completed.agy_provenance_hook_load_error = hook_load_error  # type: ignore[attr-defined]
+        # Issue #2038 P0-1 fix_delta: see the isolated-workspace branch above
+        # for the same wiring rationale.
+        completed.agy_structured_output_capability_record = structured_output_capability_record  # type: ignore[attr-defined]
+        completed.agy_structured_output_used = output_format is not None  # type: ignore[attr-defined]
         return completed
 
 
@@ -3665,10 +3699,17 @@ _AGY_STRUCTURED_OUTPUT_SUPPORTED_STATUSES = frozenset({"supported"})
 
 def _resolve_structured_output_capability_status(
     help_probe_result: "dict[str, Any] | None",
+    *,
+    semantic_probe_result: "dict[str, Any] | None" = None,
 ) -> str:
     """Consume `preflight_agy.py`'s same-binary capability SSOT for
     `--output-format {json,stream-json}` support (Issue #2038 In Scope --
     this module must not independently judge `agy --help` itself).
+
+    *semantic_probe_result* is Issue #2038 P0-2 fix_delta's Stage-2 evidence
+    (optional, `None` preserves the original Stage-1-only call shape for
+    existing callers/tests) -- forwarded verbatim to
+    `preflight_agy.structured_output_capability_status()`.
 
     Returns `"unavailable"` fail-closed when `preflight_agy` could not be
     imported (mirrors this module's existing `_AGY_PROVENANCE_AVAILABLE`
@@ -3678,9 +3719,37 @@ def _resolve_structured_output_capability_status(
     """
     if not _PREFLIGHT_AGY_AVAILABLE or _preflight_agy is None:
         return "unavailable"
-    record = _preflight_agy.structured_output_capability_status(help_probe_result)
+    record = _preflight_agy.structured_output_capability_status(
+        help_probe_result, semantic_probe_result=semantic_probe_result
+    )
     status = record.get("status") if isinstance(record, dict) else None
     return status if isinstance(status, str) and status else "unavailable"
+
+
+def _resolve_run_agy_structured_output_capability_record(agy_bin: str) -> dict[str, Any]:
+    """Resolve the same-binary, two-stage structured-output capability
+    record for the upcoming grounded_research `_run_agy()` invocation
+    (Issue #2038 P0-1/P0-2 fix_delta).
+
+    Delegates entirely to `preflight_agy.py`'s memoized capability SSOT
+    (`get_or_compute_structured_output_capability()`) -- this module never
+    independently runs `agy --help` / a semantic probe or judges capability
+    itself. Returns a fail-closed `{"status": "unavailable", ...}` record
+    when `preflight_agy` is not importable or returns a malformed record, so
+    callers never treat an import/probe failure as an implicit "supported".
+    """
+    _fail_closed_record = {
+        "status": "unavailable",
+        "reason_code": "preflight_agy_not_importable",
+        "evidence_source": "help",
+        "detail": None,
+    }
+    if not _PREFLIGHT_AGY_AVAILABLE or _preflight_agy is None:
+        return _fail_closed_record
+    record = _preflight_agy.get_or_compute_structured_output_capability(agy_bin)
+    if not isinstance(record, dict) or not isinstance(record.get("status"), str) or not record.get("status"):
+        return dict(_fail_closed_record, reason_code="capability_record_malformed")
+    return record
 
 
 def _capability_unavailable_grounding_metadata(
@@ -3720,11 +3789,185 @@ def _capability_unavailable_grounding_metadata(
     }
 
 
+def _build_agy_structured_stream_json_grounded_research_metadata(
+    stdout: str,
+    *,
+    hook_events: "list[dict[str, Any]] | None" = None,
+) -> dict[str, Any]:
+    """Structured-output-aware grounded_research metadata builder for the
+    `--output-format stream-json` route (Issue #2038 P0-3 fix_delta).
+
+    Unlike `_build_agy_grounded_research_metadata()` (the legacy text/
+    marker-based parser retained for the non-structured route -- see
+    `_normalize_agy_result()`'s routing logic), this function NEVER accepts
+    the legacy custom markers (`AGY_GROUNDED_RESEARCH:` / `AGY_WEBSEARCH:` /
+    `grounded_research:` / `grounding:`), plain-text prose, or an arbitrary
+    stdout URL scan as grounding evidence. It parses stdout exclusively
+    through `preflight_agy.parse_agy_stream_json_stream()`'s strict NDJSON
+    state machine and only accepts a citation when it satisfies: a
+    validated stream event + a canonical web tool (step/tool-call
+    correlation) + a source record found inside that step's
+    `tool_info.output` + URL validation/normalization -- all enforced by
+    the parser itself.
+    """
+    stdout = stdout or ""
+    hook_validated, hook_tool_names = _hook_events_confirm_web_tool_call(hook_events)
+    redacted_excerpt = _redact_text(stdout)[:500]
+    excerpt_sha256 = hashlib.sha256(redacted_excerpt.encode("utf-8")).hexdigest()
+    transcript_evidence = [
+        {
+            "source_kind": "agy_stdout_or_artifact_excerpt",
+            "excerpt": redacted_excerpt,
+            "sha256": excerpt_sha256,
+        }
+    ]
+
+    def _fail_closed(
+        *,
+        grounding_status: str,
+        grounding_backend: str,
+        grounding_failure_class: str,
+        redaction_status: str = "checked_no_secret_pattern",
+        raw_credential_included: bool = False,
+        repo_absolute_path_included: bool = False,
+        parsed_evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "grounding_actor": "antigravity_cli",
+            "grounding_backend": grounding_backend,
+            "grounding_status": grounding_status,
+            "web_tool_call_count": 0,
+            "search_query_count": 0,
+            "url_citation_count": 0,
+            "citation_evidence": [],
+            "grounding_transcript_evidence": transcript_evidence,
+            "grounding_failure_class": grounding_failure_class,
+            "raw_transcript_included": False,
+            "raw_credential_included": raw_credential_included,
+            "repo_absolute_path_included": repo_absolute_path_included,
+            "redaction_status": redaction_status,
+            "parsed_evidence": parsed_evidence,
+        }
+
+    violations = _scan_redaction_violations(stdout)
+    if violations:
+        return _fail_closed(
+            grounding_status="failed",
+            grounding_backend="none",
+            grounding_failure_class="agy_web_grounding_redaction_failed",
+            redaction_status="redaction_failed",
+            raw_credential_included="credential_like_pattern_detected" in violations,
+            repo_absolute_path_included=any(
+                v in violations for v in ("repo_absolute_path_detected", "home_absolute_path_detected")
+            ),
+        )
+
+    if _QUOTA_EXHAUSTED_RE.search(stdout):
+        return _fail_closed(
+            grounding_status="failed",
+            grounding_backend="none",
+            grounding_failure_class="agy_web_grounding_quota_exhausted",
+        )
+
+    if not _PREFLIGHT_AGY_AVAILABLE or _preflight_agy is None:
+        # Issue #2038 P0-3: the strict NDJSON parser lives in preflight_agy.py
+        # (single source of truth shared with the capability probe); if it
+        # cannot be imported, this route can never be evidence-based and
+        # must never silently degrade to the legacy text parser.
+        return _fail_closed(
+            grounding_status="failed",
+            grounding_backend="none",
+            grounding_failure_class=AGY_STRUCTURED_OUTPUT_CAPABILITY_UNAVAILABLE_FAILURE_CLASS,
+        )
+
+    stream_parse = _preflight_agy.parse_agy_stream_json_stream(stdout)
+    if stream_parse.get("status") != "valid":
+        return _fail_closed(
+            grounding_status="attempted_no_web_tool_call",
+            grounding_backend="none",
+            grounding_failure_class="agy_web_grounding_stream_json_malformed",
+            parsed_evidence={
+                "stream_json_reason_code": stream_parse.get("reason_code"),
+                "stream_json_event_count": stream_parse.get("event_count"),
+            },
+        )
+
+    tool_call_records = stream_parse.get("tool_call_records") or []
+    recognized_tool_calls = [record for record in tool_call_records if record.get("recognized_web_tool")]
+    tool_call_confirmed = bool(recognized_tool_calls) or hook_validated
+
+    if not tool_call_confirmed:
+        return _fail_closed(
+            grounding_status="attempted_no_web_tool_call",
+            grounding_backend="none",
+            grounding_failure_class="agy_web_grounding_tool_call_missing",
+            parsed_evidence={
+                "stream_json_event_count": stream_parse.get("event_count"),
+                "stream_json_step_update_count": stream_parse.get("step_update_count"),
+            },
+        )
+
+    source_records = stream_parse.get("source_records") or []
+    citation_evidence = [{"url": record["url"], "title": record.get("title")} for record in source_records]
+    url_citation_count = len(citation_evidence)
+    web_tool_call_count = len(recognized_tool_calls) if recognized_tool_calls else len(hook_tool_names)
+    search_query_count = web_tool_call_count
+
+    if url_citation_count > 0:
+        grounding_status = "grounded"
+        grounding_backend = "agy_native_websearch_structured"
+        grounding_failure_class = None
+    else:
+        grounding_status = "attempted_no_citations"
+        grounding_backend = "agy_native_websearch_structured"
+        grounding_failure_class = "agy_web_grounding_no_citations"
+
+    return {
+        "grounding_actor": "antigravity_cli",
+        "grounding_backend": grounding_backend,
+        "grounding_status": grounding_status,
+        "web_tool_call_count": web_tool_call_count,
+        "search_query_count": search_query_count,
+        "url_citation_count": url_citation_count,
+        "citation_evidence": citation_evidence,
+        "grounding_transcript_evidence": transcript_evidence,
+        "grounding_failure_class": grounding_failure_class,
+        "raw_transcript_included": False,
+        "raw_credential_included": False,
+        "repo_absolute_path_included": False,
+        "redaction_status": "checked_no_secret_pattern",
+        "parsed_evidence": {
+            "stream_json_event_count": stream_parse.get("event_count"),
+            "stream_json_step_update_count": stream_parse.get("step_update_count"),
+            "stream_json_unknown_step_types": stream_parse.get("unknown_step_types"),
+        },
+    }
+
+
+def _build_agy_structured_output_metadata_from_status(
+    stdout: str,
+    *,
+    capability_status: str,
+    hook_events: "list[dict[str, Any]] | None" = None,
+) -> dict[str, Any]:
+    """Route grounded_research metadata building to the strict structured
+    NDJSON parser or the fail-closed capability_unavailable path, given an
+    already-resolved *capability_status* string (Issue #2038 P0-1 fix_delta
+    -- the leaner entry point `_normalize_agy_result()` uses, since it
+    already has the capability record `_run_agy()` resolved rather than raw
+    probe dicts).
+    """
+    if capability_status not in _AGY_STRUCTURED_OUTPUT_SUPPORTED_STATUSES:
+        return _capability_unavailable_grounding_metadata(stdout, capability_status=capability_status)
+    return _build_agy_structured_stream_json_grounded_research_metadata(stdout, hook_events=hook_events)
+
+
 def _build_agy_structured_output_metadata(
     stdout: str,
     *,
     help_probe_result: "dict[str, Any] | None",
     hook_events: "list[dict[str, Any]] | None" = None,
+    semantic_probe_result: "dict[str, Any] | None" = None,
 ) -> dict[str, Any]:
     """Structured-output-aware entry point for grounded_research metadata
     building (Issue #2038 AC4).
@@ -3738,12 +3981,17 @@ def _build_agy_structured_output_metadata(
     returns `_capability_unavailable_grounding_metadata()` --
     `AGY_STRUCTURED_OUTPUT_CAPABILITY_UNAVAILABLE_FAILURE_CLASS` -- and
     never silently falls back to `_build_agy_grounded_research_metadata()`'s
-    stdout best-effort text parsing.
+    stdout best-effort text parsing. When the status IS `supported`, uses
+    the strict NDJSON parser (Issue #2038 P0-3 fix_delta) --
+    `_build_agy_structured_stream_json_grounded_research_metadata()` --
+    rather than the legacy text/marker parser.
     """
-    capability_status = _resolve_structured_output_capability_status(help_probe_result)
-    if capability_status not in _AGY_STRUCTURED_OUTPUT_SUPPORTED_STATUSES:
-        return _capability_unavailable_grounding_metadata(stdout, capability_status=capability_status)
-    return _build_agy_grounded_research_metadata(stdout, hook_events=hook_events)
+    capability_status = _resolve_structured_output_capability_status(
+        help_probe_result, semantic_probe_result=semantic_probe_result
+    )
+    return _build_agy_structured_output_metadata_from_status(
+        stdout, capability_status=capability_status, hook_events=hook_events
+    )
 
 
 def _normalize_agy_result(
@@ -3884,14 +4132,39 @@ def _normalize_agy_result(
             "transcript_sha256": transcript_sha256,
         }
 
-    grounded_research_evidence = (
-        _build_agy_grounded_research_metadata(
-            completed.stdout or "",
-            hook_events=agy_provenance_hook_events,
-        )
-        if tool_profile == GROUNDED_RESEARCH_PROFILE
-        else None
-    )
+    grounded_research_evidence: dict[str, Any] | None = None
+    if tool_profile == GROUNDED_RESEARCH_PROFILE:
+        # Issue #2038 P0-1 fix_delta: route through the strict structured
+        # NDJSON parser (`_build_agy_structured_stream_json_grounded_research_metadata()`,
+        # which internally fail-closes to `capability_unavailable` per AC4)
+        # ONLY when THIS exact invocation actually attached
+        # `--output-format stream-json` (`completed.agy_structured_output_used`,
+        # set by `_run_agy()` above). Every other case -- direct/mocked
+        # `CompletedProcess` callers that never went through `_run_agy()`
+        # (`agy_structured_output_used` attribute absent), and real
+        # `_run_agy()` invocations where the same-binary capability probe did
+        # not resolve to `supported` -- uses the legacy stdout best-effort
+        # text parser exactly as before this fix (Issue #1768/#1266
+        # regression-proof: this module never becomes unconditionally
+        # fail-closed for grounded_research merely because structured output
+        # capability has not been confirmed for the current environment).
+        if bool(getattr(completed, "agy_structured_output_used", False)):
+            capability_record = getattr(completed, "agy_structured_output_capability_record", None)
+            capability_status = (
+                capability_record.get("status")
+                if isinstance(capability_record, dict) and isinstance(capability_record.get("status"), str)
+                else "unavailable"
+            )
+            grounded_research_evidence = _build_agy_structured_output_metadata_from_status(
+                completed.stdout or "",
+                capability_status=capability_status,
+                hook_events=agy_provenance_hook_events,
+            )
+        else:
+            grounded_research_evidence = _build_agy_grounded_research_metadata(
+                completed.stdout or "",
+                hook_events=agy_provenance_hook_events,
+            )
 
     top_level_ok = True
     top_level_failure_class: str | None = None

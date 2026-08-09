@@ -9,9 +9,11 @@ importlib-based module load, no real `agy` binary required.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import types
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -286,3 +288,432 @@ def test_structured_output_capability_unavailable_when_preflight_agy_not_importa
     monkeypatch.setattr(rgh, "_preflight_agy", None)
     status = rgh._resolve_structured_output_capability_status({"exit_code": 0, "stdout": "x", "stderr": ""})
     assert status == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# fix_delta P0-1/P0-2/P0-3 (OWNER REQUEST_CHANGES, PR #2043, 2026-08-08):
+# route-level production wiring tests -- _run_agy() through
+# _normalize_agy_result(), not just the direct builder/metadata unit tests
+# above. See run_gemini_headless.py's _run_agy()/_normalize_agy_result()
+# docstrings for the exact routing contract these tests pin down.
+# ---------------------------------------------------------------------------
+
+
+def _make_stream_json_stdout(url: str = "https://example.com/a") -> str:
+    return "\n".join(
+        [
+            '{"type": "init"}',
+            '{"type": "step_update", "step_type": "tool_call", "tool_info": '
+            '{"name": "web_search", "output": {"sources": [{"url": "%s", "title": "A"}]}}}' % url,
+            '{"type": "result", "status": "success"}',
+        ]
+    )
+
+
+def _supported_capability_record() -> dict[str, Any]:
+    return {
+        "status": "supported",
+        "reason_code": "semantic_probe_valid_init_step_result_stream_observed",
+        "evidence_source": "runtime_semantic_observation",
+        "detail": None,
+    }
+
+
+def _unsupported_capability_record() -> dict[str, Any]:
+    return {
+        "status": "unsupported",
+        "reason_code": "flag_absent_from_help",
+        "evidence_source": "help",
+        "detail": None,
+    }
+
+
+# (a) grounded_research + supported -> real argv contains --output-format stream-json.
+def test_run_agy_supported_capability_attaches_output_format_to_real_argv() -> None:
+    """fix_delta P0-1(a): when the same-binary capability resolver reports
+    "supported", _run_agy() attaches --output-format stream-json to the
+    REAL subprocess.run() argv (not just the direct builder/validator unit
+    tests above -- this is the previously-unreachable production wiring)."""
+    captured: dict[str, Any] = {"argv": None}
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured["argv"] = list(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=_make_stream_json_stdout(), stderr="")
+
+    token = rgh._AGY_TOOL_PROFILE_CTX.set("grounded_research")
+    try:
+        with patch.object(
+            rgh, "_resolve_run_agy_structured_output_capability_record", return_value=_supported_capability_record()
+        ):
+            with patch("subprocess.run", side_effect=mock_run):
+                completed = rgh._run_agy("test prompt", 30)
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(token)
+
+    assert captured["argv"] is not None
+    assert "--output-format" in captured["argv"]
+    fmt_index = captured["argv"].index("--output-format")
+    assert captured["argv"][fmt_index + 1] == "stream-json"
+    assert completed.agy_structured_output_used is True  # type: ignore[attr-defined]
+    assert completed.agy_structured_output_capability_record["status"] == "supported"  # type: ignore[attr-defined]
+
+
+def test_run_agy_supported_capability_end_to_end_uses_structured_parser() -> None:
+    """fix_delta P0-1/P0-3: end-to-end through run_delegation(), a
+    "supported" capability + a valid stream-json response is parsed by the
+    strict NDJSON parser (grounding_backend distinguishes the structured
+    route from the legacy text-marker route)."""
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=_make_stream_json_stdout(), stderr="")
+
+    with patch.object(
+        rgh, "_resolve_run_agy_structured_output_capability_record", return_value=_supported_capability_record()
+    ):
+        with patch("subprocess.run", side_effect=mock_run):
+            result = rgh.run_delegation(
+                {
+                    "schema": "delegation_request_v1",
+                    "tool_profile": "grounded_research",
+                    "provider": "agy",
+                    "prompt": "Search for something",
+                    "objective": "Test structured route end-to-end wiring",
+                    "instructions": ["Search", "Cite sources"],
+                    "output_sections": ["response"],
+                    "context_files": [],
+                }
+            )
+
+    assert result["ok"] is True
+    evidence = result["grounded_research_evidence"]
+    assert evidence["grounding_backend"] == "agy_native_websearch_structured"
+    assert evidence["grounding_status"] == "grounded"
+    assert evidence["url_citation_count"] == 1
+    assert evidence["citation_evidence"][0]["url"] == "https://example.com/a"
+
+
+# (b) grounded_research + non-supported -> real argv never contains
+# --output-format, and grounded_research_evidence is built via the
+# UNCHANGED legacy text/marker parser (never capability_unavailable) --
+# preserving pre-existing protected regression tests
+# (test_agy_provider.py::test_ac7_agy_grounded_research_supported,
+# test_agy_invocation_argv_allowlist.py's real-_run_agy() tests) that rely
+# on grounded_research remaining functional via the legacy route whenever
+# structured output capability is not confirmed "supported" for the current
+# environment (Issue #2038 AC4's capability_unavailable fail-closed path is
+# reachable specifically via the structured route -- see
+# test_structured_output_capability_unavailable_returns_fail_closed above
+# and the malformed-stream regression test below -- not by making
+# grounded_research universally non-functional by default).
+def test_run_agy_non_supported_capability_argv_never_gets_output_format() -> None:
+    """fix_delta P0-1(b) (adapted -- see module docstring note below for
+    rationale): a "unsupported" capability status means the real argv is
+    built exactly as before this fix_delta (no --output-format flag)."""
+    captured: dict[str, Any] = {"argv": None}
+    grounded_output = (
+        "Response from AGY.\n"
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
+        '"tool_calls":[{"name":"web_search"}]}'
+    )
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured["argv"] = list(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=grounded_output, stderr="")
+
+    token = rgh._AGY_TOOL_PROFILE_CTX.set("grounded_research")
+    try:
+        with patch.object(
+            rgh,
+            "_resolve_run_agy_structured_output_capability_record",
+            return_value=_unsupported_capability_record(),
+        ):
+            with patch("subprocess.run", side_effect=mock_run):
+                completed = rgh._run_agy("test prompt", 30)
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(token)
+
+    assert captured["argv"] is not None
+    assert "--output-format" not in captured["argv"]
+    assert completed.agy_structured_output_used is False  # type: ignore[attr-defined]
+
+
+def test_run_agy_non_supported_capability_end_to_end_legacy_semantics_regression_proof() -> None:
+    """fix_delta P0-1(b) (adapted): end-to-end through run_delegation(),
+    grounded_research + non-supported capability still resolves via the
+    UNCHANGED legacy text-marker parser -- exactly the same evidence shape
+    test_agy_provider.py::test_ac7_agy_grounded_research_supported already
+    pins down -- proving this fix_delta did not regress the common (no
+    same-binary structured-output confirmation available) case into an
+    always-fail-closed capability_unavailable no-op."""
+    grounded_output = (
+        "Response from AGY.\n"
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
+        '"tool_calls":[{"name":"web_search"}]}'
+    )
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=grounded_output, stderr="")
+
+    with patch.object(
+        rgh,
+        "_resolve_run_agy_structured_output_capability_record",
+        return_value=_unsupported_capability_record(),
+    ):
+        with patch("subprocess.run", side_effect=mock_run):
+            result = rgh.run_delegation(
+                {
+                    "schema": "delegation_request_v1",
+                    "tool_profile": "grounded_research",
+                    "provider": "agy",
+                    "prompt": "Search for something",
+                    "objective": "Test legacy route regression-proofing",
+                    "instructions": ["Search", "Cite sources"],
+                    "output_sections": ["response"],
+                    "context_files": [],
+                }
+            )
+
+    assert result["ok"] is True
+    evidence = result["grounded_research_evidence"]
+    assert evidence["grounding_backend"] == "agy_native_websearch"
+    assert evidence["grounding_status"] == "grounded"
+    assert evidence["url_citation_count"] == 1
+
+
+# (c) all other profiles -> unchanged legacy text argv/stdout semantics.
+def test_run_agy_non_grounded_research_profile_never_resolves_capability() -> None:
+    """fix_delta P0-1(c): a non-grounded_research profile (e.g. no_tools)
+    never calls the structured-output capability resolver at all -- proving
+    the new wiring is scoped exactly to grounded_research and cannot affect
+    any other profile's argv/stdout semantics."""
+    completed_stub = subprocess.CompletedProcess(args=["agy", "-p", "x"], returncode=0, stdout="ok", stderr="")
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        return completed_stub
+
+    token = rgh._AGY_TOOL_PROFILE_CTX.set("no_tools")
+    try:
+        with patch.object(
+            rgh,
+            "_resolve_run_agy_structured_output_capability_record",
+            side_effect=AssertionError("capability resolver must not be called for non-grounded_research profiles"),
+        ):
+            with patch("subprocess.run", side_effect=mock_run):
+                completed = rgh._run_agy("test prompt", 30)
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(token)
+
+    assert completed.agy_structured_output_used is False  # type: ignore[attr-defined]
+    assert completed.agy_structured_output_capability_record is None  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# P0-3: strict stream-json NDJSON state-machine parser (preflight_agy.py).
+# ---------------------------------------------------------------------------
+
+
+def test_parse_agy_stream_json_stream_accepts_valid_init_step_result() -> None:
+    """A well-formed init -> step_update (with a recognized web tool's
+    tool_info.output.sources) -> terminal result stream parses as valid and
+    yields exactly one validated, URL-checked source record."""
+    verdict = preflight_agy.parse_agy_stream_json_stream(_make_stream_json_stdout())
+    assert verdict["status"] == "valid"
+    assert verdict["init_count"] == 1
+    assert verdict["result_count"] == 1
+    assert len(verdict["source_records"]) == 1
+    assert verdict["source_records"][0]["url"] == "https://example.com/a"
+
+
+def test_parse_agy_stream_json_stream_rejects_missing_terminal_result() -> None:
+    """A stream with no terminal result event (truncated mid-stream) is
+    rejected, not partially accepted."""
+    stream = '{"type": "init"}\n{"type": "step_update", "step_type": "text"}'
+    verdict = preflight_agy.parse_agy_stream_json_stream(stream)
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "terminal_event_not_result_or_missing"
+
+
+def test_parse_agy_stream_json_stream_rejects_duplicate_terminal_result() -> None:
+    """Two `result` events in the same stream is rejected (duplicate
+    terminal), even though the last event IS type "result"."""
+    stream = '\n'.join(['{"type": "init"}', '{"type": "result"}', '{"type": "result"}'])
+    verdict = preflight_agy.parse_agy_stream_json_stream(stream)
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "result_count_not_exactly_one"
+
+
+def test_parse_agy_stream_json_stream_rejects_unknown_event_type() -> None:
+    """An event whose top-level `type` is not in the closed
+    {init, step_update, result} enum is rejected (fail-closed, never
+    silently skipped)."""
+    stream = '\n'.join(['{"type": "init"}', '{"type": "unknown_future_event"}', '{"type": "result"}'])
+    verdict = preflight_agy.parse_agy_stream_json_stream(stream)
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "line_1_unknown_event_type"
+
+
+def test_parse_agy_stream_json_stream_rejects_malformed_json_line() -> None:
+    """A truncated/malformed NDJSON line is rejected, never best-effort
+    recovered."""
+    stream = '{"type": "init"}\n{"type": "step_update", truncated'
+    verdict = preflight_agy.parse_agy_stream_json_stream(stream)
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "line_1_not_valid_json"
+
+
+def test_parse_agy_stream_json_stream_never_accepts_legacy_marker_text() -> None:
+    """The legacy `AGY_GROUNDED_RESEARCH:` custom-marker text (accepted by
+    the old text/marker parser) is NOT valid stream-json NDJSON and is
+    rejected outright by the strict parser (fix_delta P0-3: the structured
+    route never falls back to the legacy marker format)."""
+    legacy_marker_stdout = (
+        "AGY_GROUNDED_RESEARCH:"
+        '{"tool_calls": [{"name": "web_search"}], "sources": [{"url": "https://example.com/a"}]}'
+    )
+    verdict = preflight_agy.parse_agy_stream_json_stream(legacy_marker_stdout)
+    assert verdict["status"] == "invalid"
+
+
+def test_parse_agy_stream_json_stream_rejects_unrecognized_tool_source() -> None:
+    """A step_update whose tool_info.name is NOT a recognized canonical web
+    tool never contributes a source record, even if its tool_info.output
+    contains a well-formed url (step/tool-call correlation requirement)."""
+    stream = "\n".join(
+        [
+            '{"type": "init"}',
+            '{"type": "step_update", "step_type": "tool_call", "tool_info": '
+            '{"name": "run_shell_command", "output": {"sources": [{"url": "https://example.com/a"}]}}}',
+            '{"type": "result"}',
+        ]
+    )
+    verdict = preflight_agy.parse_agy_stream_json_stream(stream)
+    assert verdict["status"] == "valid"
+    assert verdict["source_records"] == []
+
+
+def test_parse_agy_stream_json_stream_rejects_generic_userinfo_url() -> None:
+    """A source URL containing a userinfo component (user:pass@host) is
+    rejected by URL validation even when tool/step correlation is
+    otherwise satisfied."""
+    stream = _make_stream_json_stdout(url="https://user:pass@example.com/a")
+    verdict = preflight_agy.parse_agy_stream_json_stream(stream)
+    assert verdict["status"] == "valid"
+    assert verdict["source_records"] == []
+
+
+# fix_delta P0-1/P0-3: _normalize_agy_result() structured-route wiring
+# (direct, hermetic -- no _run_agy() needed).
+def test_normalize_agy_result_structured_route_valid_stream_grounded() -> None:
+    """When agy_structured_output_used=True (this exact invocation attached
+    --output-format), _normalize_agy_result() uses the strict NDJSON parser
+    -- proving the AC4/P0-3 wiring is reachable through the full
+    completed -> normalize pipeline, not just the direct builder call."""
+    completed = subprocess.CompletedProcess(
+        args=["agy", "-p", "x", "--output-format", "stream-json"],
+        returncode=0,
+        stdout=_make_stream_json_stdout(),
+        stderr="",
+    )
+    completed.agy_structured_output_used = True  # type: ignore[attr-defined]
+    completed.agy_structured_output_capability_record = _supported_capability_record()  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_events = []  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
+
+    result = rgh._normalize_agy_result(completed, tool_profile="grounded_research", requested_model=None)
+    evidence = result["grounded_research_evidence"]
+    assert evidence["grounding_backend"] == "agy_native_websearch_structured"
+    assert evidence["grounding_status"] == "grounded"
+    assert result["ok"] is True
+
+
+def test_normalize_agy_result_structured_route_malformed_stream_fail_closed() -> None:
+    """When agy_structured_output_used=True but the real agy stdout is not
+    a valid stream-json NDJSON stream (e.g. plain prose despite the flag
+    having been attached), the structured route fail-closes to
+    agy_web_grounding_stream_json_malformed -- never silently falls back to
+    the legacy text/marker parser on the SAME invocation."""
+    completed = subprocess.CompletedProcess(
+        args=["agy", "-p", "x", "--output-format", "stream-json"],
+        returncode=0,
+        stdout="I searched the web and found a great answer!",
+        stderr="",
+    )
+    completed.agy_structured_output_used = True  # type: ignore[attr-defined]
+    completed.agy_structured_output_capability_record = _supported_capability_record()  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_events = []  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
+
+    result = rgh._normalize_agy_result(completed, tool_profile="grounded_research", requested_model=None)
+    evidence = result["grounded_research_evidence"]
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_stream_json_malformed"
+    assert result["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# P0-2: two-stage same-binary capability determination
+# (preflight_agy.get_or_compute_structured_output_capability()).
+# ---------------------------------------------------------------------------
+
+
+def test_get_or_compute_structured_output_capability_stage1_only_stays_inconclusive_without_cost_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST=1, Stage 2 (a real,
+    model-backed semantic probe) never runs even when Stage 1 (--help)
+    evidence establishes candidate feature existence -- "supported" remains
+    genuinely unreachable without an explicit runtime-probe cost opt-in
+    (mirrors the existing leading_slash_is_literal probe's cost gate)."""
+    monkeypatch.delenv("AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST", raising=False)
+
+    def fake_run_help(agy_bin: str) -> Any:
+        class _Proc:
+            returncode = 0
+            stdout = "usage: agy [--output-format {json,stream-json}]"
+            stderr = ""
+
+        return _Proc()
+
+    def fail_if_semantic_probe_called(agy_bin: str) -> dict[str, Any]:
+        raise AssertionError("semantic probe must not run without cost confirmation")
+
+    monkeypatch.setattr(preflight_agy, "_run_help", fake_run_help)
+    monkeypatch.setattr(preflight_agy, "_run_structured_output_semantic_probe", fail_if_semantic_probe_called)
+    preflight_agy._STRUCTURED_OUTPUT_CAPABILITY_MEMO_CACHE.clear()
+
+    record = preflight_agy.get_or_compute_structured_output_capability("fake-agy-bin-stage1-only")
+    assert record["status"] == "inconclusive"
+
+
+def test_get_or_compute_structured_output_capability_promotes_to_supported_with_cost_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With cost confirmation set AND a valid Stage-2 semantic probe stream
+    from the SAME binary, capability resolution promotes to "supported"."""
+    monkeypatch.setenv("AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST", "1")
+
+    def fake_run_help(agy_bin: str) -> Any:
+        class _Proc:
+            returncode = 0
+            stdout = "usage: agy [--output-format {json,stream-json}]"
+            stderr = ""
+
+        return _Proc()
+
+    def fake_semantic_probe(agy_bin: str) -> dict[str, Any]:
+        stdout = _make_stream_json_stdout()
+        return {
+            "argv": [agy_bin, "-p", "x", "--output-format", "stream-json"],
+            "exit_code": 0,
+            "stdout": stdout,
+            "stderr": "",
+            "timed_out": False,
+            "binary_identity": preflight_agy.compute_binary_identity(agy_bin),
+            "parser_verdict": preflight_agy.parse_agy_stream_json_stream(stdout),
+        }
+
+    monkeypatch.setattr(preflight_agy, "_run_help", fake_run_help)
+    monkeypatch.setattr(preflight_agy, "_run_structured_output_semantic_probe", fake_semantic_probe)
+    preflight_agy._STRUCTURED_OUTPUT_CAPABILITY_MEMO_CACHE.clear()
+
+    record = preflight_agy.get_or_compute_structured_output_capability("fake-agy-bin-stage2-supported")
+    assert record["status"] == "supported"

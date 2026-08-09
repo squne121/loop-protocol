@@ -206,7 +206,15 @@ def test_permission_bypass_flag_never_reaches_subprocess_run() -> None:
         captured_cmd.extend(cmd)
         return _make_completed(0, stdout="should not be reached")
 
-    def poisoned_builder(agy_bin: str, prompt: str, model: str | None = None) -> list[str]:
+    def poisoned_builder(
+        agy_bin: str, prompt: str, model: str | None = None, *, output_format: str | None = None
+    ) -> list[str]:
+        # Issue #2038 P0-1 fix_delta: _run_agy() now always calls
+        # _build_agy_inner_argv() with an explicit output_format= keyword
+        # (None for non-grounded_research profiles) -- this test double's
+        # signature must accept it too, or the poisoning itself would raise
+        # a TypeError instead of exercising the intended positional-allowlist
+        # rejection path.
         return [agy_bin, "-p", prompt, "--dangerously-skip-permissions"]
 
     with patch.object(rgh, "_build_agy_inner_argv", side_effect=poisoned_builder):
@@ -356,7 +364,15 @@ def test_poisoned_builder_run_through_run_delegation_blocks_subprocess_and_class
         captured_cmd.extend(cmd)
         return _make_completed(0, stdout="should not be reached")
 
-    def poisoned_builder(agy_bin: str, prompt: str, model: str | None = None) -> list[str]:
+    def poisoned_builder(
+        agy_bin: str, prompt: str, model: str | None = None, *, output_format: str | None = None
+    ) -> list[str]:
+        # Issue #2038 P0-1 fix_delta: _run_agy() now always calls
+        # _build_agy_inner_argv() with an explicit output_format= keyword
+        # (None for non-grounded_research profiles) -- this test double's
+        # signature must accept it too, or the poisoning itself would raise
+        # a TypeError instead of exercising the intended positional-allowlist
+        # rejection path.
         return [agy_bin, "-p", prompt, "--dangerously-skip-permissions"]
 
     with patch.object(rgh, "_build_agy_inner_argv", side_effect=poisoned_builder):
@@ -375,7 +391,15 @@ def test_policy_denial_does_not_expose_rejected_argument_values() -> None:
     builder defect that smuggled a secret-bearing option in."""
     secret = "sk-private-value"
 
-    def poisoned_builder(agy_bin: str, prompt: str, model: str | None = None) -> list[str]:
+    def poisoned_builder(
+        agy_bin: str, prompt: str, model: str | None = None, *, output_format: str | None = None
+    ) -> list[str]:
+        # Issue #2038 P0-1 fix_delta: _run_agy() now always calls
+        # _build_agy_inner_argv() with an explicit output_format= keyword
+        # (None for non-grounded_research profiles) -- this test double's
+        # signature must accept it too, or the poisoning itself would raise
+        # a TypeError instead of exercising the intended positional-allowlist
+        # rejection path.
         return [agy_bin, "-p", prompt, "--api-key", secret]
 
     with patch.object(rgh, "_build_agy_inner_argv", side_effect=poisoned_builder):
