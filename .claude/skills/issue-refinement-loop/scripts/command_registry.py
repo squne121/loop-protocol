@@ -382,6 +382,108 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "max_iterations": {"type": "positive_int", "required": False},
         },
     },
+    # Issue #2053 AC7: sibling of decide.run that additionally routes an
+    # authority transport manifest through the router before the ordinary
+    # verdict/iteration decision. `authority_transport_manifest_path` is
+    # optional -- omitting it (and --authority-expected) preserves decide.run's
+    # exact unmodified behavior.
+    "decide.run.with_authority_transport": {
+        "id": "decide.run.with_authority_transport",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/decide_next_loop_action.py",
+            "--loop-state-file", "{loop_state_file}",
+            "--review-result-verdict", "{verdict}",
+            "--max-iterations", "{max_iterations}",
+            "--issue-number", "{issue_number}",
+            "--authority-transport-path", "{authority_transport_manifest_path}",
+            "--authority-expected",
+            "--invocation-id", "{invocation_id}",
+            "--git-head-sha", "{git_head_sha}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_router_authority_transport",
+        "stdin_contract": "none",
+        "stdout_contract": "decide_next_loop_action/v1",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "placeholders": {
+            "loop_state_file": {"type": "repo_relative_file", "required": True},
+            "verdict": {"type": "verdict", "required": True},
+            "max_iterations": {"type": "positive_int", "required": False},
+            "issue_number": {"type": "positive_int", "required": True},
+            "authority_transport_manifest_path": {"type": "path", "required": True},
+            "invocation_id": {"type": "string", "required": True},
+            "git_head_sha": {"type": "string", "required": True},
+        },
+    },
+    # Issue #2053 AC1/AC7: producer role -- generates and immutably persists
+    # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 from a SCOPE_DELTA_AUTHORITY_EVIDENCE_V1
+    # fixture file (bypasses the gh CLI, same test-fixture pattern as
+    # preflight.run.fixture).
+    "authority_transport.produce": {
+        "id": "authority_transport.produce",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--invocation-id", "{invocation_id}",
+            "--git-head-sha", "{git_head_sha}",
+            "--produce-authority-transport", "{evidence_fixture_path}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_authority_transport_producer",
+        "required_cwd": "canonical_main_root",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{issue_number}/authority-transport/{invocation_id}/"],
+        "network_effect": "local_only",
+        "stdin_contract": "none",
+        "stdout_contract": "scope_delta_authority_transport_producer_result/v1",
+        "timeout_seconds": 60,
+        "mutation": False,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "invocation_id": {"type": "string", "required": True},
+            "git_head_sha": {"type": "string", "required": True},
+            "evidence_fixture_path": {"type": "path", "required": True},
+        },
+    },
+    # Issue #2053 AC9: controlled consumer role -- verifies a
+    # SCOPE_DELTA_ROUTER_RECEIPT_V1, mutates (writes the consumed payload)
+    # exactly once, reads back, performs a fresh rerun, and emits
+    # SCOPE_DELTA_CONSUMPTION_RECEIPT_V1.
+    "authority_transport.consume": {
+        "id": "authority_transport.consume",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--invocation-id", "{invocation_id}",
+            "--git-head-sha", "{git_head_sha}",
+            "--consume-authority-transport", "{router_receipt_path}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_authority_transport_consumer",
+        "required_cwd": "canonical_main_root",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{issue_number}/authority-transport/{invocation_id}/"],
+        "network_effect": "local_only",
+        "stdin_contract": "none",
+        "stdout_contract": "scope_delta_consumption_receipt/v1",
+        "timeout_seconds": 60,
+        "mutation": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "invocation_id": {"type": "string", "required": True},
+            "git_head_sha": {"type": "string", "required": True},
+            "router_receipt_path": {"type": "path", "required": True},
+        },
+    },
     "gh.issue.view": {
         "id": "gh.issue.view",
         "argv": [

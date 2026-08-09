@@ -317,6 +317,308 @@ def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
+# ---------------------------------------------------------------------------
+# #2053: SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 producer / consumer.
+#
+# producer (this file, generate_authority_transport_manifest) -> router
+# (decide_next_loop_action.py generate_router_receipt, via command_registry
+# "decide.run") -> consumer (this file, consume_authority_transport).
+#
+# All three stages bind the same canonical payload digest
+# (CANONICALIZATION_ID = "loop-protocol-json-c14n-v1", i.e. _canonical_json
+# above: sorted keys, compact separators, UTF-8, no NaN/Infinity) and write
+# their artifacts to an *immutable per-invocation directory* so a stale
+# previous-invocation artifact can never be silently reused (AC10).
+# ---------------------------------------------------------------------------
+
+AUTHORITY_TRANSPORT_SCHEMA_VERSION = "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1"
+CONSUMPTION_RECEIPT_SCHEMA_VERSION = "SCOPE_DELTA_CONSUMPTION_RECEIPT_V1"
+CANONICALIZATION_ID = "loop-protocol-json-c14n-v1"
+
+
+def _authority_transport_dir(repo_root: Path, issue_number: int, invocation_id: str) -> Path:
+    return (
+        repo_root
+        / ".claude"
+        / "artifacts"
+        / "issue-refinement-loop"
+        / str(issue_number)
+        / "authority-transport"
+        / invocation_id
+    )
+
+
+def _atomic_write_json_with_readback(path: Path, data: dict) -> tuple[bool, "dict | None", "str | None"]:
+    """flush -> fsync -> os.replace, then read back and independently
+    recompute the canonical digest to verify the bytes on disk match what
+    was intended (#2053 AC10). Returns (ok, readback_data, error_reason).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".{path.name}.tmp-{os.getpid()}"
+    text = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False, sort_keys=True)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        return False, None, f"write_failure:{type(exc).__name__}:{exc}"
+
+    try:
+        readback_text = path.read_text(encoding="utf-8")
+        readback_data = json.loads(readback_text)
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, None, f"write_failure:{type(exc).__name__}:{exc}"
+
+    if _sha256(_canonical_json(readback_data)) != _sha256(_canonical_json(data)):
+        return False, readback_data, "write_failure:readback_digest_mismatch"
+
+    return True, readback_data, None
+
+
+def generate_authority_transport_manifest(
+    *,
+    evidence: Any,
+    issue_number: int,
+    repo: str,
+    invocation_id: str,
+    git_head_sha: str,
+    repo_root: Path,
+    generated_at: "str | None" = None,
+) -> tuple["dict | None", "str | None"]:
+    """#2053 AC1/AC7/AC10: build + immutably persist a
+    SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest for `evidence` (a
+    SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 dict, or a list of them).
+
+    Returns (result, error). `result` is
+    {"manifest": <dict>, "manifest_path": <str>} on success, None on
+    failure (`error` explains why -- e.g. "no_evidence" or a write_failure
+    reason from _atomic_write_json_with_readback).
+
+    Writing under an invocation-scoped directory
+    (authority-transport/<invocation_id>/) is what makes AC10's
+    "stale previous-invocation artifact is never reused" true by
+    construction: a caller must mint a fresh invocation_id to get a fresh
+    manifest path; there is no shared mutable sidecar to go stale.
+    """
+    if evidence is None or (isinstance(evidence, list) and not evidence):
+        return None, "no_evidence"
+
+    payload = evidence
+    payload_sha256 = _sha256(_canonical_json(payload))
+    source = (
+        evidence[0]
+        if isinstance(evidence, list) and evidence
+        else (evidence if isinstance(evidence, dict) else {})
+    )
+    manifest = {
+        "schema_version": AUTHORITY_TRANSPORT_SCHEMA_VERSION,
+        "invocation_id": invocation_id,
+        "issue_number": issue_number,
+        "repo": repo,
+        "git_head_sha": git_head_sha,
+        "generated_at": generated_at or _now_iso(),
+        "canonicalization_id": CANONICALIZATION_ID,
+        "source_comment_id": source.get("comment_id"),
+        "source_comment_url": source.get("comment_url"),
+        "source_issue_body_sha256": source.get("body_sha256"),
+        "source_kind": source.get("source_kind") or "generated_by_agent",
+        "payload": payload,
+        "payload_sha256": payload_sha256,
+    }
+    manifest_dir = _authority_transport_dir(repo_root, issue_number, invocation_id)
+    manifest_path = manifest_dir / "scope_delta_authority_transport_v1.json"
+    ok, _readback, error = _atomic_write_json_with_readback(manifest_path, manifest)
+    if not ok:
+        return None, error
+    return {"manifest": manifest, "manifest_path": str(manifest_path)}, None
+
+
+def consume_authority_transport(
+    *,
+    router_receipt_path: str,
+    issue_number: int,
+    repo: str,
+    invocation_id: str,
+    git_head_sha: str,
+    repo_root: Path,
+) -> dict:
+    """#2053 AC9: controlled consumer. Reads a SCOPE_DELTA_ROUTER_RECEIPT_V1,
+    independently re-verifies the transport manifest it references, applies
+    at most one mutation (a deterministic, idempotency-guarded write under
+    the same invocation-scoped directory), performs a readback, and a
+    lightweight "fresh rerun" (re-running classify_scope_delta_authority()
+    against the consumed payload to reconfirm the route is unchanged).
+
+    Fail-closed for: missing_file, malformed_json, digest_mismatch,
+    wrong_issue, wrong_git_head, wrong_invocation_id, router_receipt_not_ok,
+    stale_previous_invocation (a consumption receipt already exists for this
+    invocation_id -- the "exactly once" guard for AC9's "一回だけ mutation").
+    """
+
+    def _receipt(
+        *,
+        status: str,
+        reason_code: "str | None",
+        transport_payload_sha256: "str | None" = None,
+        consumed_payload_sha256: "str | None" = None,
+        mutation_applied: bool = False,
+        readback_verified: bool = False,
+        fresh_rerun_performed: bool = False,
+    ) -> dict:
+        return {
+            "schema_version": CONSUMPTION_RECEIPT_SCHEMA_VERSION,
+            "invocation_id": invocation_id,
+            "issue_number": issue_number,
+            "git_head_sha": git_head_sha,
+            "generated_at": _now_iso(),
+            "router_receipt_path": router_receipt_path,
+            "transport_payload_sha256": transport_payload_sha256,
+            "consumed_payload_sha256": consumed_payload_sha256,
+            "mutation_applied": mutation_applied,
+            "readback_verified": readback_verified,
+            "fresh_rerun_performed": fresh_rerun_performed,
+            "status": status,
+            "reason_code": reason_code,
+        }
+
+    invocation_dir = _authority_transport_dir(repo_root, issue_number, invocation_id)
+    consumption_receipt_path = invocation_dir / "scope_delta_consumption_receipt_v1.json"
+
+    # AC10 / AC9 "exactly once": a consumption receipt already present for
+    # this invocation_id means this invocation was already consumed -- never
+    # mutate a second time from the same (possibly stale) transport.
+    if consumption_receipt_path.exists():
+        return _receipt(status="environment_failure", reason_code="stale_previous_invocation")
+
+    receipt_path = Path(router_receipt_path) if router_receipt_path else None
+    if receipt_path is None or not receipt_path.exists():
+        return _receipt(status="environment_failure", reason_code="missing_file")
+
+    try:
+        router_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _receipt(status="environment_failure", reason_code="malformed_json")
+
+    if (
+        not isinstance(router_receipt, dict)
+        or router_receipt.get("schema_version") != "SCOPE_DELTA_ROUTER_RECEIPT_V1"
+    ):
+        return _receipt(status="environment_failure", reason_code="malformed_json")
+
+    if router_receipt.get("status") != "ok":
+        return _receipt(status="environment_failure", reason_code="router_receipt_not_ok")
+
+    if router_receipt.get("issue_number") != issue_number:
+        return _receipt(status="environment_failure", reason_code="wrong_issue")
+    if router_receipt.get("git_head_sha") != git_head_sha:
+        return _receipt(status="environment_failure", reason_code="wrong_git_head")
+    if router_receipt.get("invocation_id") != invocation_id:
+        return _receipt(status="environment_failure", reason_code="wrong_invocation_id")
+
+    manifest_path_str = router_receipt.get("transport_manifest_path")
+    manifest_path = Path(manifest_path_str) if manifest_path_str else None
+    if manifest_path is None or not manifest_path.exists():
+        return _receipt(status="environment_failure", reason_code="missing_file")
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _receipt(status="environment_failure", reason_code="malformed_json")
+
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != AUTHORITY_TRANSPORT_SCHEMA_VERSION:
+        return _receipt(status="environment_failure", reason_code="malformed_json")
+
+    if manifest.get("issue_number") != issue_number:
+        return _receipt(status="environment_failure", reason_code="wrong_issue")
+    if manifest.get("git_head_sha") != git_head_sha:
+        return _receipt(status="environment_failure", reason_code="wrong_git_head")
+    if manifest.get("invocation_id") != invocation_id:
+        return _receipt(status="environment_failure", reason_code="wrong_invocation_id")
+
+    recomputed = _sha256(_canonical_json(manifest.get("payload")))
+    manifest_payload_sha256 = manifest.get("payload_sha256")
+    if recomputed != manifest_payload_sha256 or manifest_payload_sha256 != router_receipt.get(
+        "transport_payload_sha256"
+    ):
+        return _receipt(
+            status="environment_failure",
+            reason_code="digest_mismatch",
+            transport_payload_sha256=manifest_payload_sha256,
+            consumed_payload_sha256=recomputed,
+        )
+
+    # --- mutation (once): write the consumed payload under the same
+    # invocation-scoped directory. This is the bounded, idempotency-guarded
+    # write this consumer is authorized to perform; it does not call
+    # edit_issue_txn.py / mutate the live Issue (out of this file's Allowed
+    # Paths reach) -- CONTRACT_PATCH_PLAN_V1 application remains the
+    # existing --consume-contract-patch-plan lane's responsibility.
+    consumed_path = invocation_dir / "consumed_authority_payload_v1.json"
+    consumed_record = {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1_CONSUMED",
+        "invocation_id": invocation_id,
+        "issue_number": issue_number,
+        "payload": manifest.get("payload"),
+        "payload_sha256": manifest_payload_sha256,
+    }
+    ok, readback, error = _atomic_write_json_with_readback(consumed_path, consumed_record)
+    if not ok:
+        return _receipt(
+            status="environment_failure",
+            reason_code="write_failure",
+            transport_payload_sha256=manifest_payload_sha256,
+        )
+    mutation_applied = True
+    readback_verified = (
+        isinstance(readback, dict) and readback.get("payload_sha256") == manifest_payload_sha256
+    )
+
+    # --- fresh rerun: re-run classification against the consumed payload to
+    # reconfirm the route is unchanged (no silent drift between transport
+    # and consumption).
+    fresh_rerun_performed = False
+    try:
+        from scope_signal_delta import classify_scope_delta_authority
+
+        classify_scope_delta_authority(
+            manifest.get("payload"),
+            target_issue_number=issue_number,
+            expected_repo=repo,
+        )
+        fresh_rerun_performed = True
+    except Exception:  # noqa: BLE001 - fresh rerun is best-effort telemetry
+        fresh_rerun_performed = False
+
+    final_receipt = _receipt(
+        status="ok",
+        reason_code=None,
+        transport_payload_sha256=manifest_payload_sha256,
+        consumed_payload_sha256=recomputed,
+        mutation_applied=mutation_applied,
+        readback_verified=readback_verified,
+        fresh_rerun_performed=fresh_rerun_performed,
+    )
+    ok, _readback2, error2 = _atomic_write_json_with_readback(consumption_receipt_path, final_receipt)
+    if not ok:
+        final_receipt = _receipt(
+            status="environment_failure",
+            reason_code="write_failure",
+            transport_payload_sha256=manifest_payload_sha256,
+            consumed_payload_sha256=recomputed,
+            mutation_applied=mutation_applied,
+            readback_verified=readback_verified,
+            fresh_rerun_performed=fresh_rerun_performed,
+        )
+    return final_receipt
+
+
 def _as_string_list(
     value: Any,
     field_name: str,
@@ -2207,6 +2509,31 @@ def _apply_multi_turn_candidate_route(
     return scope_delta_decision
 
 
+def _structured_anchor_payload_present_but_invalid(scope_delta_decision: "dict | None") -> bool:
+    """#2053 AC2: distinguish "no ANCHOR_SCOPE_REFRAME_V1 payload at all"
+    (legitimate freeform lane, e.g. Issue #1270) from "a structured payload
+    WAS present but is invalid/stale/wrong-target". Only the latter must
+    forbid downgrading to freeform authority evidence built from the same
+    comment body -- accepting the same untrusted-shape text as freeform
+    directive would let an attacker/mistake dodge structured schema
+    validation simply by making the payload fail it.
+
+    `_classify_anchor_scope_reframe()` reason strings for a payload that WAS
+    parsed but rejected are: "schema_invalid: ...", "wrong_repo: ...",
+    "wrong_issue_number: ...". "no_anchor_scope_reframe_v1_payload" (no
+    payload found) and "untrusted_author_association: ..." (author trust,
+    independent of payload presence) are NOT included -- an untrusted
+    author's freeform text is already fail-closed downstream by
+    classify_scope_delta_authority()'s own author-association check.
+    """
+    if not isinstance(scope_delta_decision, dict):
+        return False
+    if scope_delta_decision.get("status") != "fail_closed":
+        return False
+    reason = scope_delta_decision.get("reason") or ""
+    return reason.startswith(("schema_invalid:", "wrong_repo:", "wrong_issue_number:"))
+
+
 def _build_scope_delta_authority_evidence(
     *,
     comment_payload: dict,
@@ -2958,26 +3285,35 @@ def run_preflight(
             # above, so explicit human-review directives in freeform review
             # comments -- e.g. Issue #1270 -- are not dropped just because
             # they carry no machine-formatted reframe marker.)
-            _scope_delta_authority_evidence = _build_scope_delta_authority_evidence(
-                comment_payload=comment_payload,
-                comment_body=anchor_comment_state["snapshot"],
-                repo=repo,
-                issue_number=issue_number,
-                anchor_url=anchor_url,
-                captured_at=now or _now_iso(),
-                human_context_comment_urls=(
-                    known_context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD)
-                    if isinstance(known_context, dict)
-                    else None
-                ),
-                agent_report_comment_urls=(
-                    known_context.get(_AGENT_REPORT_COMMENT_URLS_FIELD)
-                    if isinstance(known_context, dict)
-                    else None
-                ),
-                segments_result=_segments_result,
-                candidates_result=_candidates_result,
-            )
+            # #2053 AC2: a structured ANCHOR_SCOPE_REFRAME_V1 payload that
+            # WAS present but invalid/stale/wrong-target must never be
+            # reinterpreted as freeform authority evidence from the same
+            # comment body -- that would be a downgrade fallback around
+            # structured schema validation. "No structured payload at all"
+            # remains the legitimate freeform lane (unchanged).
+            if _structured_anchor_payload_present_but_invalid(scope_delta_decision):
+                _scope_delta_authority_evidence = None
+            else:
+                _scope_delta_authority_evidence = _build_scope_delta_authority_evidence(
+                    comment_payload=comment_payload,
+                    comment_body=anchor_comment_state["snapshot"],
+                    repo=repo,
+                    issue_number=issue_number,
+                    anchor_url=anchor_url,
+                    captured_at=now or _now_iso(),
+                    human_context_comment_urls=(
+                        known_context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD)
+                        if isinstance(known_context, dict)
+                        else None
+                    ),
+                    agent_report_comment_urls=(
+                        known_context.get(_AGENT_REPORT_COMMENT_URLS_FIELD)
+                        if isinstance(known_context, dict)
+                        else None
+                    ),
+                    segments_result=_segments_result,
+                    candidates_result=_candidates_result,
+                )
             if _scope_delta_authority_evidence is not None:
                 _kc["scope_delta_authority_evidence"] = [_scope_delta_authority_evidence]
 
@@ -4022,8 +4358,79 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Execute a trusted CONTRACT_PATCH_PLAN_V1 through edit_issue_txn.py.",
     )
+    parser.add_argument(
+        "--invocation-id",
+        default=None,
+        metavar="ID",
+        help="#2053: invocation identifier bound into SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 / receipts.",
+    )
+    parser.add_argument(
+        "--git-head-sha",
+        default=None,
+        metavar="SHA",
+        help="#2053: git HEAD sha bound into SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 / receipts "
+        "(defaults to the live repo HEAD when omitted).",
+    )
+    parser.add_argument(
+        "--produce-authority-transport",
+        type=Path,
+        default=None,
+        metavar="EVIDENCE_JSON_PATH",
+        help="#2053 AC1/AC7: read a SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 (or list) JSON file and emit "
+        "an immutable SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest (producer role). Requires "
+        "--issue-number, --repo, --invocation-id.",
+    )
+    parser.add_argument(
+        "--consume-authority-transport",
+        default=None,
+        metavar="ROUTER_RECEIPT_PATH",
+        help="#2053 AC9: read a SCOPE_DELTA_ROUTER_RECEIPT_V1 and perform the controlled consumer "
+        "role (verify digest, mutate once, readback, fresh rerun), emitting "
+        "SCOPE_DELTA_CONSUMPTION_RECEIPT_V1. Requires --issue-number, --repo, --invocation-id, "
+        "--git-head-sha.",
+    )
 
     args = parser.parse_args(argv)
+
+    # #2053: producer / consumer dedicated CLI modes -- bypass the full
+    # gh-backed preflight pipeline entirely (parallel sibling entries, same
+    # pattern as --fixture; see command_registry.py "authority_transport.produce"
+    # / "authority_transport.consume").
+    if args.produce_authority_transport is not None:
+        _repo_root = _find_repo_root()
+        try:
+            evidence_payload = json.loads(args.produce_authority_transport.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(json.dumps({"status": "environment_failure", "reason_code": "malformed_json", "error": str(exc)}))
+            sys.exit(EXIT_ENVIRONMENT_FAILURE)
+        git_head_sha = args.git_head_sha or _git_head_sha(_repo_root)
+        result, error = generate_authority_transport_manifest(
+            evidence=evidence_payload,
+            issue_number=args.issue_number,
+            repo=args.repo,
+            invocation_id=args.invocation_id or "",
+            git_head_sha=git_head_sha,
+            repo_root=_repo_root,
+        )
+        if result is None:
+            print(json.dumps({"status": "environment_failure", "reason_code": "write_failure", "error": error}))
+            sys.exit(EXIT_ENVIRONMENT_FAILURE)
+        print(json.dumps({"status": "ok", **result}, ensure_ascii=False, indent=2, sort_keys=True))
+        sys.exit(0)
+
+    if args.consume_authority_transport is not None:
+        _repo_root = _find_repo_root()
+        git_head_sha = args.git_head_sha or _git_head_sha(_repo_root)
+        receipt = consume_authority_transport(
+            router_receipt_path=args.consume_authority_transport,
+            issue_number=args.issue_number,
+            repo=args.repo,
+            invocation_id=args.invocation_id or "",
+            git_head_sha=git_head_sha,
+            repo_root=_repo_root,
+        )
+        print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
+        sys.exit(0 if receipt.get("status") == "ok" else EXIT_ENVIRONMENT_FAILURE)
 
     # --- argparse input validation (blocked / exit 2 on contract violation) ---
     input_errors: list[str] = []

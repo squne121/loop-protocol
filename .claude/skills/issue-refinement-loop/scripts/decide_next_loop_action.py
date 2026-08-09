@@ -58,7 +58,9 @@ routing above and are NOT part of the #1873 simplification scope.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -92,13 +94,184 @@ EXIT_PASS = 0
 EXIT_WARN = 1
 EXIT_HUMAN_ESCALATION = 2
 EXIT_INCONSISTENT_STATE = 3
+EXIT_ENVIRONMENT_FAILURE = 4
 
 DEFAULT_MAX_ITERATIONS = 3
+
+# #2053 AC7/AC8: router (`decide.run`) authority transport verification.
+# STATUS_ENVIRONMENT_FAILURE is distinct from STATUS_INCONSISTENT_STATE --
+# it means the *transport* between producer and router is untrustworthy
+# (missing/malformed/digest-mismatch/source-mismatch sidecar), not that the
+# loop state itself is corrupt. It never silently downgrades to a legacy
+# route when authority_expected=true (AC8).
+STATUS_ENVIRONMENT_FAILURE = "environment_failure"
+ROUTER_RECEIPT_SCHEMA_VERSION = "SCOPE_DELTA_ROUTER_RECEIPT_V1"
+CANONICALIZATION_ID = "loop-protocol-json-c14n-v1"
 
 
 # ---------------------------------------------------------------------------
 # Minimal structural validation
 # ---------------------------------------------------------------------------
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _canonical_json(obj: Any) -> str:
+    """`loop-protocol-json-c14n-v1`: sorted keys, compact separators, UTF-8,
+    no NaN/Infinity. Producer (run_refinement_preflight.py) and router
+    (this script) must hash identical bytes for digest binding to be
+    meaningful (#2053).
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def _atomic_write_json_with_readback(path: Path, data: dict) -> tuple[bool, str | None]:
+    """flush -> fsync -> os.replace, then read back and verify the digest
+    (#2053 AC10 pattern, shared with run_refinement_preflight.py's producer
+    / consumer telemetry writers). Returns (ok, error_reason).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".{path.name}.tmp-{os.getpid()}"
+    text = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False, sort_keys=True)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        return False, f"write_failure:{type(exc).__name__}:{exc}"
+
+    try:
+        readback = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"write_failure:{type(exc).__name__}:{exc}"
+
+    if _sha256(_canonical_json(readback)) != _sha256(_canonical_json(data)):
+        return False, "write_failure:readback_digest_mismatch"
+    return True, None
+
+
+def generate_router_receipt(
+    *,
+    transport_manifest_path: "str | None",
+    issue_number: "int | None",
+    invocation_id: "str | None",
+    git_head_sha: "str | None",
+    authority_expected: bool,
+    repo_root: "Path | None" = None,
+) -> "dict | None":
+    """#2053 AC7/AC8: router-side verification of a SCOPE_DELTA_AUTHORITY_TRANSPORT_V1
+    manifest, producing an immutable SCOPE_DELTA_ROUTER_RECEIPT_V1.
+
+    Returns None when `authority_expected` is False AND no manifest path was
+    supplied -- the ordinary route with no authority transport in play,
+    unaffected by this check (not a fail-closed condition).
+
+    When `authority_expected` is True, any of missing/malformed/digest
+    mismatch/source (issue/git-head/invocation) mismatch is reported with
+    `status: "environment_failure"` -- it is never silently downgraded to a
+    legacy route (AC8).
+    """
+    if not authority_expected and not transport_manifest_path:
+        return None
+
+    generated_at_source = _generate_router_receipt_now_iso()
+    base = {
+        "schema_version": ROUTER_RECEIPT_SCHEMA_VERSION,
+        "invocation_id": invocation_id or "unknown",
+        "issue_number": issue_number if isinstance(issue_number, int) else 0,
+        "git_head_sha": git_head_sha or "unknown",
+        "generated_at": generated_at_source,
+        "transport_manifest_path": transport_manifest_path,
+        "transport_payload_sha256": None,
+        "recomputed_payload_sha256": None,
+    }
+
+    def _fail(reason_code: str) -> dict:
+        receipt = dict(base)
+        receipt["status"] = "environment_failure"
+        receipt["reason_code"] = reason_code
+        return receipt
+
+    if not transport_manifest_path:
+        return _fail("missing_file")
+
+    manifest_path = Path(transport_manifest_path)
+    if not manifest_path.exists():
+        return _fail("missing_file")
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _fail("malformed_json")
+
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1":
+        return _fail("malformed_json")
+
+    manifest_payload_sha256 = manifest.get("payload_sha256")
+    base["transport_payload_sha256"] = manifest_payload_sha256
+
+    if issue_number is not None and manifest.get("issue_number") != issue_number:
+        return _fail("wrong_issue")
+    if git_head_sha is not None and manifest.get("git_head_sha") != git_head_sha:
+        return _fail("wrong_git_head")
+    if invocation_id is not None and manifest.get("invocation_id") != invocation_id:
+        return _fail("wrong_invocation_id")
+
+    recomputed = _sha256(_canonical_json(manifest.get("payload")))
+    base["recomputed_payload_sha256"] = recomputed
+    if recomputed != manifest_payload_sha256:
+        return _fail("digest_mismatch")
+
+    receipt = dict(base)
+    receipt["status"] = "ok"
+    receipt["reason_code"] = None
+
+    if repo_root is not None and isinstance(issue_number, int) and invocation_id:
+        receipt_dir = (
+            repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+            / "authority-transport" / invocation_id
+        )
+        receipt_path = receipt_dir / "scope_delta_router_receipt_v1.json"
+        ok, error = _atomic_write_json_with_readback(receipt_path, receipt)
+        if not ok:
+            failed = dict(base)
+            failed["status"] = "environment_failure"
+            failed["reason_code"] = "write_failure"
+            return failed
+
+    return receipt
+
+
+def _find_repo_root_for_receipt() -> "Path | None":
+    """Best-effort .git root walk-up for writing the router receipt
+    artifact. Returns None (receipt not persisted to disk, verification
+    logic unaffected) if no .git root is found -- callers in tests may run
+    from a tmp_path fixture directory tree.
+    """
+    current = Path(__file__).resolve().parent
+    for _ in range(10):
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+def _generate_router_receipt_now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 def validate_loop_state(data: Any) -> tuple[bool, str]:
@@ -374,6 +547,37 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Inline SCOPE_SIGNAL_GUARD_DECISION_V2 JSON string (alternative to the file form).",
     )
+    parser.add_argument(
+        "--issue-number",
+        type=int,
+        default=None,
+        metavar="N",
+        help="#2053: GitHub Issue number, used to verify a SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest.",
+    )
+    parser.add_argument(
+        "--authority-transport-path",
+        metavar="PATH",
+        default=None,
+        help="#2053: path to a SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest produced by run_refinement_preflight.py.",
+    )
+    parser.add_argument(
+        "--authority-expected",
+        action="store_true",
+        help="#2053 AC8: when set, a missing/malformed/digest-mismatch/source-mismatch authority "
+        "transport manifest is fail-closed to environment_failure instead of being silently skipped.",
+    )
+    parser.add_argument(
+        "--invocation-id",
+        metavar="ID",
+        default=None,
+        help="#2053: invocation identifier bound into the SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest.",
+    )
+    parser.add_argument(
+        "--git-head-sha",
+        metavar="SHA",
+        default=None,
+        help="#2053: current git HEAD sha, cross-checked against the manifest's git_head_sha.",
+    )
     return parser.parse_args(argv)
 
 
@@ -447,6 +651,24 @@ def _load_loop_state(args: argparse.Namespace) -> tuple[Optional[dict[str, Any]]
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+
+    # #2053 AC7/AC8: verify authority transport BEFORE loop-state loading --
+    # this is a distinct producer/router transport-trust check, not a
+    # loop-state consistency check, and must never be masked by (or masked
+    # as) inconsistent_state.
+    router_receipt = generate_router_receipt(
+        transport_manifest_path=args.authority_transport_path,
+        issue_number=args.issue_number,
+        invocation_id=args.invocation_id,
+        git_head_sha=args.git_head_sha,
+        authority_expected=args.authority_expected,
+        repo_root=_find_repo_root_for_receipt(),
+    )
+    if router_receipt is not None and router_receipt.get("status") == STATUS_ENVIRONMENT_FAILURE:
+        print(f"STATUS: {STATUS_ENVIRONMENT_FAILURE}")
+        print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
+        print(f"BLOCKERS: authority_transport_environment_failure:{router_receipt.get('reason_code')}")
+        sys.exit(EXIT_ENVIRONMENT_FAILURE)
 
     # Load loop state
     loop_state, load_error = _load_loop_state(args)
