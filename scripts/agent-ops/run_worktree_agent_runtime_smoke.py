@@ -519,6 +519,46 @@ def read_prompt(prompt_file: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Issue #2015 P1 fix (OWNER review #2044, full-route trial finding #2): a
+# genuinely-spawned, genuinely-completed child was observed reporting
+# ``failure_class: spawn_not_observed`` (contradicting its own
+# ``retrieval_status: succeeded`` / non-empty evidence) on the async-launch
+# ``tool_use_result`` envelope shape (``isAsync: true``, no ``agentType``
+# field -- see the AC7/#2021 comment block above). ``native_spawn_event_
+# observed`` is DESIGNED to fall back to the ``SubagentStart``/
+# ``SubagentStop`` hook lifecycle channel (surfaced by
+# ``--include-hook-events``) whenever that primary channel lacks
+# ``agentType`` -- but this repository's own committed
+# ``.claude/settings.json`` (NOT in this Issue's Allowed Paths) registers a
+# ``SubagentStop`` hook and NO ``SubagentStart`` hook, and even that
+# ``SubagentStop`` hook (``session_manifest_coordinator.sh``) does not echo
+# its own stdin payload back to stdout -- so the fallback channel the
+# extractors were written to consume could structurally never fire in this
+# repository's real configuration, regardless of whether a spawn genuinely
+# happened.
+#
+# Confirmed live (2026-08-09, ad hoc probe outside this repo's tracked
+# worktree, both with and without a pre-existing project-level
+# ``SubagentStop`` hook of the same event): Claude Code's ``--settings
+# <file-or-json>`` flag ADDITIVELY layers extra hooks on top of the
+# project's own committed ``.claude/settings.json`` (both a project-level
+# hook and this scoped one run for the same event -- neither is replaced),
+# and ``cat`` (a POSIX-standard command, no custom script needed) echoes
+# the hook's own stdin JSON payload (``agent_id`` / ``agent_type``)
+# verbatim to stdout, exactly the shape ``extract_claude_hook_agent_
+# identity`` / ``extract_claude_hook_lifecycle_events`` /
+# ``classify_claude_child_completion`` already parse. This is a
+# process-local, this-invocation-only settings overlay -- it never
+# modifies the committed ``.claude/settings.json`` (out of Allowed Paths)
+# and never disables any hook already configured there.
+_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON = json.dumps({
+    "hooks": {
+        "SubagentStart": [{"hooks": [{"type": "command", "command": "cat"}]}],
+        "SubagentStop": [{"hooks": [{"type": "command", "command": "cat"}]}],
+    }
+})
+
+
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            max_turns: int, claude_bin: str = "claude",
                            claude_agent_name: str | None = None) -> tuple[int | None, str, str, bool]:
@@ -530,6 +570,7 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
         "--no-session-persistence",
         "--max-turns", str(max_turns),
         "--verbose",
+        "--settings", _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON,
     ]
     # Issue #1734 fix_delta 3 (AC7): purely additive, opt-in persona binding.
     # When ``claude_agent_name`` is provided, insert ``--agent <name>`` so the

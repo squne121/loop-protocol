@@ -417,7 +417,29 @@ def test_ac8_local_asset_research_full_route_fixed_live_trial_plan() -> None:
         pytest.skip("validate_agent_provider_route_smoke.py validator not present in this checkout")
 
     all_results: list[dict[str, Any]] = []
-    with tempfile.TemporaryDirectory(prefix="local-asset-research-live-trial-") as tmp_dir_name:
+    # Issue #2015 P1 fix (OWNER review #2044, full-route trial finding #3):
+    # a live full-route trial reproduced genuine spawn+completion evidence
+    # (both channels fired) yet the delegated child's evidence directory
+    # stayed completely empty -- the child's own Bash tool calls (building
+    # and running the delegation request) never actually executed. Direct
+    # reproduction traced this to the evidence directory living under the
+    # SYSTEM temp dir (``tempfile.TemporaryDirectory()`` with no ``dir=``,
+    # i.e. typically ``/tmp/...`` on Linux) -- OUTSIDE the worktree Claude
+    # Code treats as this session's allowed working directory, which its
+    # own Bash tool boundary can refuse to write into regardless of the
+    # ``codebase-investigator`` agent's own ``permissionMode: dontAsk``.
+    # Placing the trial's temp directory INSIDE the repo (under the same
+    # ``.claude/artifacts/`` tree ``run_agent_provider_route_smoke.py``
+    # itself already defaults its own output directory to -- see
+    # ``ARTIFACTS_ROOT`` in ``validate_agent_provider_route_smoke.py``)
+    # keeps every absolute path this trial hands the delegated child
+    # inside the worktree boundary. ``artifacts/`` is already `.gitignore`d
+    # at any depth, so this leaves no untracked residue.
+    _live_trial_tmp_root = _REPO_ROOT / ".claude" / "artifacts" / "agent-provider-route-live-trial-tmp"
+    _live_trial_tmp_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="local-asset-research-live-trial-", dir=str(_live_trial_tmp_root)
+    ) as tmp_dir_name:
         tmp_dir = Path(tmp_dir_name)
         for runtime in FULL_ROUTE_RUNTIMES:
             for trial_index in range(FULL_ROUTE_TRIALS_PER_RUNTIME):

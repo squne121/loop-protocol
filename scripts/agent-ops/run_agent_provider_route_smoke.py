@@ -214,12 +214,34 @@ def build_route_prompt(route: dict[str, str], evidence_dir: Path) -> str:
     # file, used only to satisfy the "at least one context file" contract
     # -- never a hand-typed placeholder path.
     context_file_flag = ""
+    target_path_hint = ""
     if profile == "local_asset_research":
         context_file_flag = f" --context-file {REPO_ROOT / 'README.md'}"
+        # Issue #2015 P1 fix (OWNER review #2044, full-route trial finding
+        # #3): a live full-route trial with genuine spawn+completion
+        # evidence (both the tool_use_result channel and the SubagentStop
+        # hook fired) still left the evidence directory completely empty --
+        # neither delegation_request.json nor delegation_result.json was
+        # ever written. The primary root cause (see the ``dir=`` fix in
+        # ``test_run_gemini_headless_live_trial.py``) turned out to be an
+        # evidence directory placed outside the worktree's own Bash
+        # write-boundary, not this prompt -- but the ``codebase-
+        # investigator`` custom agent's OWN documented input contract
+        # (``.claude/agents/codebase-investigator.md``, out of this
+        # Issue's Allowed Paths) separately requires either
+        # ``target_path``/``target_symbol`` or ``keywords``/
+        # ``issue_body``, and this probe's prompt supplied neither.
+        # Supplying an explicit ``target_path`` here (the same real,
+        # always-present ``README.md`` already used for
+        # ``--context-file``) is a harmless, defense-in-depth hint that
+        # satisfies the child's own local-investigation input-contract
+        # branch, without changing the literal composed commands the
+        # child must still run verbatim.
+        target_path_hint = f" target_path: {REPO_ROOT / 'README.md'}."
     return (
         f"AGENT_PROVIDER_ROUTE_SMOKE probe (Issue #1886). Use the {agent} custom agent "
         f"(profile: {profile}) for the following bounded task, and report exactly which "
-        f"provider you dispatched to.\n\n"
+        f"provider you dispatched to.{target_path_hint}\n\n"
         f"Task: build a delegation_request_v1 via "
         f"`uv run python3 {BUILD_REQUEST_SCRIPT} --provider agy --profile {profile} "
         f"--objective \"agent_provider_route_smoke probe\" --prompt \"Reply with the single "
@@ -888,7 +910,23 @@ def main(argv: list[str] | None = None) -> int:
             artifact["batch_run_id"] = batch_run_id
         artifact_path = output_root / f"{_route_key(route).replace(':', '-')}.json"
         artifact_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        diagnostics_path = output_root / f"{_route_key(route).replace(':', '-')}-diagnostics.json"
+        # Issue #2015 P1 fix (OWNER review #2044): the canonical, unmodified
+        # validate_agent_provider_route_smoke.py discovers every top-level
+        # ``*.json`` file in the artifacts directory (excluding only
+        # ``index.json``) and validates each against the closed
+        # ``agent_provider_route_smoke/v1`` schema (which requires
+        # ``run_id``). Writing the diagnostics companion file directly into
+        # ``output_root`` therefore made the validator reject it as a
+        # malformed route artifact -- turning even genuinely-passing trials
+        # into a reported validator failure. The diagnostics file is an
+        # unvalidated debug sidecar (``DIAGNOSTICS_SCHEMA`` above), not a
+        # route-result artifact, so it is written into a nested
+        # ``diagnostics/`` subdirectory: the validator's discovery glob
+        # (``directory.glob("*.json")``) is non-recursive and never
+        # descends into it.
+        diagnostics_dir = output_root / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        diagnostics_path = diagnostics_dir / f"{_route_key(route).replace(':', '-')}-diagnostics.json"
         diagnostics_path.write_text(
             json.dumps(diagnostics, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
