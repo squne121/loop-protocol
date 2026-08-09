@@ -723,15 +723,14 @@ class TestAuthorityTransportPrivilegedExecutorRealSubprocessDispatch:
     def test_privileged_executor_rejects_command_id_today(self, command_id):
         skill_root = Path(__file__).resolve().parent.parent
         repo_root = skill_root.parent.parent.parent
-        current_branch = subprocess.run(
-            ["git", "branch", "--show-current"],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        assert current_branch, "expected a real checked-out branch for this worktree"
 
+        # No LOOP_DEFAULT_BRANCH / LOOP_ISSUE_NUMBER overrides are needed:
+        # skill_runtime_command_policy.py's parse_exact_skill_runtime_command()
+        # rejects these three command_ids purely on execution_class mismatch,
+        # entirely BEFORE any cwd/branch/active-issue-worktree check runs --
+        # so this rejection is reached identically whether this repo checkout
+        # is on a real branch (local dev worktree) or in detached HEAD (CI's
+        # pull_request merge-ref checkout).
         result = subprocess.run(
             [
                 sys.executable,
@@ -741,11 +740,6 @@ class TestAuthorityTransportPrivilegedExecutorRealSubprocessDispatch:
                 "--repo", "squne121/loop-protocol",
             ],
             cwd=str(repo_root),
-            env={
-                **__import__("os").environ,
-                "LOOP_DEFAULT_BRANCH": current_branch,
-                "LOOP_ISSUE_NUMBER": "2053",
-            },
             capture_output=True,
             text=True,
             timeout=30,
