@@ -19,6 +19,14 @@ baseline PNG は「正解画像」ではなく **人間が承認した視覚仕�
 > 個別の描画仕様変更や baseline PNG 自体の再生成（#747 の責務）・auto-update pipeline 構築
 > （#681 で意図的に out of scope）は扱わない。
 
+> **SSOT 方針（Issue #2019）**: surface と producers/contracts の構造化マッピングの canonical
+> SSOT は [`docs/dev/visual-surfaces.yml`](visual-surfaces.yml)（`docs/dev/visual-surfaces.schema.json`
+> で検証される registry-first canonical SSOT）である。本ファイル（`visual-baseline-registry.md`）は
+> その **generated projection または required parity validator で内容一致を保証されるドキュメント**
+> として扱う（現時点では手動同期。自動 projection 生成・parity validator の追加は別 Issue の
+> follow-up とする）。個別 baseline の運用ポリシー本文・更新チェックリスト・§3.5 の
+> `VISUAL_BASELINE_REVIEW_EVIDENCE_V1` スキーマ解説の正本は引き続き本ファイルに残る。
+
 ## 1. 前提（現行テスト実体）
 
 registry は推測ではなく現行テスト実体に基づいて分類する。確認済みの実体は以下のとおり。

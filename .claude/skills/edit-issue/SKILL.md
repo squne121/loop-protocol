@@ -142,6 +142,12 @@ helper は以下の固定順序で進む。
 `docs/dev/agent-skill-boundaries.md` の `ISSUE_EDIT_TXN_RESULT_V1` を返す。
 helper stdout は最後の 1 JSON object のみとし、old/new issue body や child stdout/stderr を含めない。
 
+## visual_impact フィールド（canonical schema owner）
+
+編集対象 Issue 本文が `visual_impact` 関連フィールド（`VISUAL_IMPACT_DECLARATION_V1` 等）に触れる場合、
+単一の canonical schema ファイル [`docs/dev/visual-impact.schema.json`](../../../docs/dev/visual-impact.schema.json)
+を参照する。本 SKILL.md では独自にキー集合・enum を再定義しない（Issue #2019 AC26）。
+
 ## ガードレール
 
 - existing issue body/comment mutation の本番経路は `edit_issue_txn.py` 経由に限定する

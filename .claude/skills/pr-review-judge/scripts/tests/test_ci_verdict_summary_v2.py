@@ -203,6 +203,7 @@ class TestAC10EnumExhaustiveness:
             make_check("node-backed-hook-tests", conclusion="success"),
             make_check("actionlint", conclusion="success"),
             make_check("agy-causal-claim-drift-gate", conclusion="success"),
+            make_check("visual-impact-policy", conclusion="success"),
         ]
         artifact = build(v2, checks)
         assert artifact["overall_status"] == "merge_ready"
@@ -471,6 +472,7 @@ class TestB3NoRequiredEvidence:
             make_check("node-backed-hook-tests", conclusion="success"),
             make_check("actionlint", conclusion="success"),
             make_check("agy-causal-claim-drift-gate", conclusion="success"),
+            make_check("visual-impact-policy", conclusion="success"),
         ]
         artifact = build(v2, checks)
         assert artifact["overall_status"] == "merge_ready"
@@ -602,7 +604,9 @@ class TestB1B2NeedsResultSynthetic:
 class TestP0RealCheckRunApiEvidence:
     """P0: merge-ready evidence must originate from CheckRun API rows."""
 
-    def _api_row(self, name: str, *, head_sha: str = EXPECTED_SHA, run_id: int = 123) -> dict:
+    def _api_row(
+        self, name: str, *, head_sha: str = EXPECTED_SHA, run_id: int = 123, app_slug: str = "github-actions"
+    ) -> dict:
         return {
             "id": len(name) + 1000,
             "name": name,
@@ -610,6 +614,7 @@ class TestP0RealCheckRunApiEvidence:
             "conclusion": "success",
             "head_sha": head_sha,
             "details_url": f"https://github.com/owner/repo/actions/runs/{run_id}/job/1",
+            "app": {"slug": app_slug},
         }
 
     def test_actual_check_runs_are_bound_to_current_workflow_and_head(self, v2):
@@ -617,6 +622,7 @@ class TestP0RealCheckRunApiEvidence:
             "typecheck", "lint", "test", "build", "e2e",
             "python-test-core", "codex-execpolicy", "python-test",
             "node-backed-hook-tests", "actionlint", "agy-causal-claim-drift-gate",
+            "visual-impact-policy",
         ]
         raw_checks = v2.check_runs_api_to_raw_checks(
             {"check_runs": [self._api_row(name) for name in names]}, workflow_run_id=123
@@ -826,6 +832,7 @@ class TestP0_1AllRealCiJobsClassified:
                 "conclusion": "success",
                 "head_sha": EXPECTED_SHA,
                 "details_url": f"https://github.com/owner/repo/actions/runs/{run_id}/job/1",
+                "app": {"slug": "github-actions"},
             }
 
         raw_checks = v2.check_runs_api_to_raw_checks(
