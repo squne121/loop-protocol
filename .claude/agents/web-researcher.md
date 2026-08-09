@@ -135,6 +135,12 @@ grounded route が `status: ok` でも、以下のいずれかに該当する場
 
 `grounded_research`（provider=agy）が失敗した場合、`failure_class`（`auth_error` / `capability_unavailable` / `grounding_failure` / `query_error`）と evidence を呼び出し元へ報告して停止する。Gemini へ切り替えることも、WebSearch / WebFetch による direct fallback を試みることもしない（`fallback_success_is_pass: false`）。Gemini 利用不能を `human_judgment_required` の理由にしない。
 
+### 出典証拠（citation_evidence）の実体化手順（Issue #2038: provider boundary の境界整理）
+
+`evidence[].ref` / `citation_count` は `run_gemini_headless.py` の `delegation_result/v1.grounded_research_evidence.sources[]`（provider boundary）から materialize する。この `sources[]` は Issue #2038 により `[:1]` 切り詰めが撤廃されており、複数 source が存在する場合は cardinality を保持したまま返る（1 citation にまとめない）。`web_tool_call_count` / `search_query_count` も同様に実測値を反映する（固定値 1 ではない）。
+
+`claims[].evidence[]` への source-claim の対応付けは、実態が one-to-many/many-to-many であり、決定論的な claim-source mapping は未解決の問題であるため（Issue #2042 で追跡中）、本 SubAgent は best-effort な割り当てを行わない。`sources[]` は `claim_evidence: []`（空）のまま `status: unresolved` として保持し、`claims[].evidence[]` への割り当ては Issue #2042 が決定論的な materialization 手順を確立するまで行わない（false grounding のリスクを避けるため、「とりあえず割り当てる」ことを許容しない）。
+
 ## Result: WEB_RESEARCH_RESULT_V1 (SubAgent-owned / 結果契約)
 
 本 SubAgent は試行プロセスを `attempts` に集約し、以下の機械可読契約を返す。orchestrator は判定を再評価せず、本 schema の top-level fields のみで routing する。
