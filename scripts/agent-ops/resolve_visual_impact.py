@@ -327,6 +327,42 @@ def match_coverage_roots(changed_path: str, coverage_roots: list[str]) -> bool:
     return False
 
 
+# PR #2045 OWNER fix_delta P1-4: this parser previously existed ONLY as an
+# inline Python heredoc embedded in `.github/workflows/ci.yml`'s "Compute
+# changed paths" step -- untestable as production code (a test could only
+# ever reproduce the SAME logic in a synthetic fixture, never actually
+# exercise the real producer). Extracted here as an importable function; the
+# CI step below now calls it via `--mode changed-paths` instead of
+# re-implementing it inline.
+def parse_git_diff_name_status_z(raw: bytes) -> tuple[list[dict[str, str]], list[str]]:
+    """Parse `git diff --name-status -z --find-renames` NUL-delimited output
+    into (typed_entries, flat_paths). `flat_paths` is the union of every
+    `path` and (for renames) `old_path`, matching `_flat_paths_for_resolve`'s
+    semantics exactly."""
+    fields = [f.decode("utf-8") for f in raw.split(b"\x00") if f != b""]
+
+    entries: list[dict[str, str]] = []
+    flat: list[str] = []
+    i = 0
+    while i < len(fields):
+        token = fields[i]
+        status = token[0] if token else ""
+        if status in ("R", "C"):
+            old_path = fields[i + 1]
+            new_path = fields[i + 2]
+            entries.append({"status": "renamed", "path": new_path, "old_path": old_path})
+            flat.extend([old_path, new_path])
+            i += 3
+        else:
+            path = fields[i + 1]
+            kind = {"A": "added", "D": "removed"}.get(status, "modified")
+            entries.append({"status": kind, "path": path})
+            flat.append(path)
+            i += 2
+
+    return entries, sorted(set(flat))
+
+
 def resolve(
     changed_paths: list[str],
     registry_path: Path = DEFAULT_REGISTRY_PATH,
@@ -533,6 +569,18 @@ def parse_declaration(pr_body: str, schema_path: Path = DEFAULT_VISUAL_IMPACT_SC
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# PR #2045 OWNER fix_delta P0-5 (V2 manifest): a per-surface "contract
+# digest" binds an evidence manifest record to the EXACT registered contract
+# (runner/spec/baseline/job/update+verify command ids) it was produced
+# against -- never a bare surface_id string match, which cannot detect a
+# registry contract change made concurrently with (or after) evidence
+# generation.
+def compute_contract_digest(surface_def: dict[str, Any]) -> str:
+    contracts = surface_def.get("contracts", {}) or {}
+    canonical = json.dumps(contracts, sort_keys=True, separators=(",", ":"))
+    return sha256_hex(canonical.encode("utf-8"))
 
 
 def build_changed_paths_digest(entries: list[dict[str, str]]) -> dict[str, Any]:
@@ -809,6 +857,173 @@ def build_evidence_from_manifest(
     )
 
 
+# ---------------------------------------------------------------------------
+# VISUAL_BASELINE_REVIEW_EVIDENCE_V2 -- per-surface evidence manifest
+# (PR #2045 OWNER fix_delta P0-5 second-round REQUEST_CHANGES).
+#
+# Replaces the single flat V1 manifest (one record for the whole
+# component-vrt-report job) with one record PER registered surface, each
+# self-binding to its own contract, CheckRun provenance, artifact ids, and a
+# per-record `manifest_sha256` tamper-evidence digest.
+# ---------------------------------------------------------------------------
+
+EVIDENCE_MANIFEST_V2_SCHEMA = "VISUAL_BASELINE_REVIEW_EVIDENCE_V2"
+
+# The field set below is the canonical shape of one V2 record (Issue #2019 /
+# PR #2045 OWNER REQUEST_CHANGES). `manifest_sha256` is NEVER included in the
+# digest input -- it is the digest of every OTHER field.
+_MANIFEST_V2_RECORD_FIELDS: tuple[str, ...] = (
+    "surface_id",
+    "contract_digest",
+    "head_sha",
+    "workflow_run_id",
+    "check_run_id",
+    "check_suite_id",
+    "github_app_id",
+    "github_app_slug",
+    "check_conclusion",
+    "baseline_path",
+    "baseline_sha256",
+    "actual_sha256",
+    "mismatched_pixels",
+    "verify_command_id",
+    "verify_succeeded",
+    "update_command_id",
+    "update_executed",
+    "update_succeeded",
+    "expected_artifact_id",
+    "actual_artifact_id",
+    "diff_artifact_id",
+)
+
+
+def _evidence_record_digest(record_without_digest: dict[str, Any]) -> str:
+    canonical = json.dumps(record_without_digest, sort_keys=True, separators=(",", ":"))
+    return sha256_hex(canonical.encode("utf-8"))
+
+
+def build_evidence_manifest_v2_record(**fields: Any) -> dict[str, Any]:
+    """Build one VISUAL_BASELINE_REVIEW_EVIDENCE_V2 surface record. Unknown
+    kwargs are rejected (closed field set); missing kwargs default to
+    `None`/`False` per field semantics so a caller can never silently omit a
+    binding field."""
+    unknown = set(fields) - set(_MANIFEST_V2_RECORD_FIELDS)
+    if unknown:
+        raise ValueError(f"build_evidence_manifest_v2_record: unknown field(s) {sorted(unknown)}")
+    record = {name: fields.get(name) for name in _MANIFEST_V2_RECORD_FIELDS}
+    record["manifest_sha256"] = _evidence_record_digest(record)
+    return record
+
+
+def verify_evidence_manifest_v2_record_digest(record: dict[str, Any]) -> bool:
+    """Recompute `manifest_sha256` over the record's own OTHER fields and
+    compare -- catches a tampered/corrupted record (fail-closed: any record
+    that does not self-verify is never trusted, regardless of what its
+    individual fields claim)."""
+    claimed = record.get("manifest_sha256")
+    if not claimed:
+        return False
+    body = {name: record.get(name) for name in _MANIFEST_V2_RECORD_FIELDS}
+    return _evidence_record_digest(body) == claimed
+
+
+def find_evidence_manifest_v2_record(manifest: dict[str, Any] | None, surface_id: str) -> dict[str, Any] | None:
+    if not manifest or manifest.get("schema") != EVIDENCE_MANIFEST_V2_SCHEMA:
+        return None
+    for record in manifest.get("surfaces", []) or []:
+        if isinstance(record, dict) and record.get("surface_id") == surface_id:
+            return record
+    return None
+
+
+def _coerce_mismatched_pixels(mismatched: Any) -> int | None:
+    """Never trust the producer's declared type (PR #2045 OWNER fix_delta
+    P0-5): coerce defensively and treat anything that does not parse as an
+    integer as a non-zero mismatch (fail-closed)."""
+    if isinstance(mismatched, bool):
+        return None
+    if isinstance(mismatched, int):
+        return mismatched
+    if isinstance(mismatched, str):
+        try:
+            return int(mismatched.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def build_evidence_from_manifest_v2(
+    manifest: dict[str, Any] | None,
+    *,
+    surface_id: str,
+    head_sha: str,
+    expected_contract_digest: str,
+    trusted_check_run_id: str | None,
+    trusted_check_suite_id: str | None,
+    trusted_github_app_id: str | None,
+    trusted_github_app_slug: str | None,
+    trusted_check_conclusion: str | None,
+) -> "EvidenceObservation":
+    """Derive a trusted EvidenceObservation from a
+    VISUAL_BASELINE_REVIEW_EVIDENCE_V2 manifest's per-surface record.
+
+    CheckRun provenance (check_run_id/check_suite_id/github_app_id/
+    github_app_slug/check_conclusion) is NEVER read back from the record
+    itself -- the component-vrt-report job that produces the manifest cannot
+    know its own CheckRun id while it is still running, so those manifest
+    fields are always producer-side `None`. The only trustworthy source is
+    the CALLER's independently-fetched CheckRun API lookup (performed by the
+    `visual-impact-policy` job AFTER component-vrt-report concludes),
+    threaded through here as the `trusted_*` parameters. This mirrors the
+    existing "never trust the producer's declared type" principle already
+    applied to `mismatched_pixels` (V1 fix_delta P0-5)."""
+    record = find_evidence_manifest_v2_record(manifest, surface_id)
+    if record is None:
+        return EvidenceObservation(
+            baseline_diff_present=False,
+            canonical_verify_success=False,
+            evidence_manifest_surface_matches=False,
+            evidence_manifest_contract_matches=False,
+            evidence_manifest_head_matches=False,
+        )
+    if not verify_evidence_manifest_v2_record_digest(record):
+        # Tampered / corrupted record -- fail closed rather than trusting any
+        # individual field of an unverifiable record.
+        return EvidenceObservation(
+            baseline_diff_present=False,
+            canonical_verify_success=False,
+            evidence_manifest_surface_matches=False,
+            evidence_manifest_contract_matches=False,
+            evidence_manifest_head_matches=False,
+        )
+
+    surface_matches = record.get("surface_id") == surface_id
+    contract_matches = bool(expected_contract_digest) and record.get("contract_digest") == expected_contract_digest
+    head_matches = record.get("head_sha") == head_sha
+
+    checkrun_bound = bool(trusted_check_run_id) and trusted_check_conclusion == "success"
+
+    mismatched_int = _coerce_mismatched_pixels(record.get("mismatched_pixels"))
+    verify_succeeded = bool(record.get("verify_succeeded")) and mismatched_int == 0
+    update_then_verify_succeeded = (
+        bool(record.get("update_executed")) and bool(record.get("update_succeeded")) and verify_succeeded
+    )
+    diff_available = bool(
+        record.get("expected_artifact_id") and record.get("actual_artifact_id") and record.get("diff_artifact_id")
+    )
+
+    return EvidenceObservation(
+        baseline_diff_present=False,  # caller overrides from real changed_paths
+        canonical_verify_success=verify_succeeded and checkrun_bound,
+        evidence_manifest_surface_matches=surface_matches,
+        evidence_manifest_contract_matches=contract_matches,
+        evidence_manifest_head_matches=head_matches,
+        canonical_update_then_verify_success=update_then_verify_succeeded and checkrun_bound,
+        expected_actual_diff_available=diff_available,
+        evidence_manifest_digest=record.get("manifest_sha256"),
+    )
+
+
 def _evidence_payload_for_decision(
     disposition: str,
     ok: bool,
@@ -855,6 +1070,11 @@ def evaluate_pr_policy(
     today: date,
     tracking_issue_checker: Any = None,
     codeowners_rules: list[tuple[str, list[str]]] | None = None,
+    trusted_check_run_id: str | None = None,
+    trusted_check_suite_id: str | None = None,
+    trusted_github_app_id: str | None = None,
+    trusted_github_app_slug: str | None = None,
+    trusted_check_conclusion: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate every affected surface's disposition. Never passes on
     declaration self-report alone (AC12); unmapped/unknown_impact always
@@ -895,7 +1115,10 @@ def evaluate_pr_policy(
             failures.append(f"{surface_id}: missing VISUAL_IMPACT_DECLARATION_V1 entry")
             continue
         disposition = decl_entry["disposition"]
-        contract_job = surface_def.get("contracts", {}).get("job")
+        # PR #2045 OWNER fix_delta P0-5 (V2 manifest): `contract_job` is no
+        # longer read here -- contract binding now goes through
+        # `compute_contract_digest(surface_def)` (the full contracts dict),
+        # never a bare job-name string match.
         baseline_path = surface_def.get("contracts", {}).get("baseline")
         baseline_diff_present = baseline_path in changed_paths
 
@@ -916,7 +1139,22 @@ def evaluate_pr_policy(
             )
             ok, reason = evaluation.ok, evaluation.reason
         else:
-            evidence = build_evidence_from_manifest(evidence_manifest, head_sha, surface_id, contract_job)
+            # PR #2045 OWNER fix_delta P0-5 (V2 manifest): bind against the
+            # per-surface record's OWN contract digest (never a bare
+            # surface_id string match) and never trust the record's
+            # self-reported CheckRun fields -- those come from the caller's
+            # independently-fetched CheckRun API lookup instead.
+            evidence = build_evidence_from_manifest_v2(
+                evidence_manifest,
+                surface_id=surface_id,
+                head_sha=head_sha,
+                expected_contract_digest=compute_contract_digest(surface_def),
+                trusted_check_run_id=trusted_check_run_id,
+                trusted_check_suite_id=trusted_check_suite_id,
+                trusted_github_app_id=trusted_github_app_id,
+                trusted_github_app_slug=trusted_github_app_slug,
+                trusted_check_conclusion=trusted_check_conclusion,
+            )
             evidence.baseline_diff_present = baseline_diff_present
             evidence_for_decision = evidence
             if disposition == "verified_unchanged":
@@ -926,9 +1164,7 @@ def evaluate_pr_policy(
             else:
                 ok, reason = False, "unknown_disposition"
 
-        evidence_payload = _evidence_payload_for_decision(
-            disposition, ok, reason, evidence_for_decision, actor_handle
-        )
+        evidence_payload = _evidence_payload_for_decision(disposition, ok, reason, evidence_for_decision, actor_handle)
         surface_results.append(
             {
                 "surface_id": surface_id,
@@ -1123,6 +1359,11 @@ def _run_policy_check(args: argparse.Namespace, changed_path_entries: list[dict[
             today=date.today(),
             tracking_issue_checker=_tracking_issue_checker,
             codeowners_rules=codeowners_rules,
+            trusted_check_run_id=args.component_vrt_check_run_id,
+            trusted_check_suite_id=args.component_vrt_check_suite_id,
+            trusted_github_app_id=args.component_vrt_app_id,
+            trusted_github_app_slug=args.component_vrt_app_slug,
+            trusted_check_conclusion=args.component_vrt_check_conclusion,
         )
 
     decision = build_decision(
@@ -1165,9 +1406,94 @@ def _run_policy_check(args: argparse.Namespace, changed_path_entries: list[dict[
     return 0 if ok else 1
 
 
+def _run_build_evidence_manifest(args: argparse.Namespace) -> int:
+    """PR #2045 OWNER fix_delta P0-5 (V2 manifest): build one
+    VISUAL_BASELINE_REVIEW_EVIDENCE_V2 record per registered surface from
+    real per-surface inputs (`--surface-inputs-file`, produced by the CI job
+    from actual VRT run outputs -- never fabricated). `baseline_sha256` is
+    ALWAYS computed here from the on-disk baseline file (never trusted from
+    the caller), matching this module's existing "compute, never trust a
+    self-reported hash" pattern."""
+    registry_doc = load_and_validate_registry(args.registry, args.schema, None, args.repo_root)
+    surfaces = registry_doc.get("surfaces", {}) or {}
+    inputs = json.loads(Path(args.surface_inputs_file).read_text(encoding="utf-8"))
+
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for item in inputs:
+        surface_id = item.get("surface_id")
+        surface_def = surfaces.get(surface_id)
+        if surface_def is None:
+            errors.append(f"unknown surface_id in --surface-inputs-file: {surface_id!r}")
+            continue
+        contracts = surface_def.get("contracts", {}) or {}
+        baseline_path = contracts.get("baseline")
+        baseline_sha256: str | None = None
+        if baseline_path:
+            baseline_abs = args.repo_root / baseline_path
+            if baseline_abs.exists():
+                baseline_sha256 = sha256_hex(baseline_abs.read_bytes())
+            else:
+                errors.append(f"{surface_id}: registered baseline path missing on disk: {baseline_path}")
+        else:
+            errors.append(f"{surface_id}: registry entry has no contracts.baseline")
+
+        mismatched_raw = item.get("mismatched_pixels")
+        mismatched_coerced = _coerce_mismatched_pixels(mismatched_raw)
+        mismatched_pixels: Any = mismatched_coerced if mismatched_coerced is not None else mismatched_raw
+
+        record = build_evidence_manifest_v2_record(
+            surface_id=surface_id,
+            contract_digest=compute_contract_digest(surface_def),
+            head_sha=item.get("head_sha"),
+            workflow_run_id=item.get("workflow_run_id"),
+            # CheckRun binding fields are always populated by the CONSUMER
+            # (visual-impact-policy job's independently-fetched CheckRun API
+            # lookup), never by this producer step -- see
+            # build_evidence_from_manifest_v2()'s docstring.
+            check_run_id=None,
+            check_suite_id=None,
+            github_app_id=None,
+            github_app_slug=None,
+            check_conclusion=None,
+            baseline_path=baseline_path,
+            baseline_sha256=baseline_sha256,
+            actual_sha256=item.get("actual_sha256"),
+            mismatched_pixels=mismatched_pixels,
+            verify_command_id=contracts.get("verify_command_id"),
+            verify_succeeded=bool(item.get("verify_succeeded")),
+            update_command_id=contracts.get("update_command_id"),
+            update_executed=bool(item.get("update_executed")),
+            update_succeeded=bool(item.get("update_succeeded")),
+            expected_artifact_id=item.get("expected_artifact_id"),
+            actual_artifact_id=item.get("actual_artifact_id"),
+            diff_artifact_id=item.get("diff_artifact_id"),
+        )
+        records.append(record)
+
+    manifest = {"schema": EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": records}
+    print(json.dumps(manifest, indent=2))
+    if args.manifest_output:
+        Path(args.manifest_output).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return 0 if not errors else 1
+
+
+def _run_changed_paths(args: argparse.Namespace) -> int:
+    raw = Path(args.name_status_file).read_bytes() if args.name_status_file else b""
+    entries, flat = parse_git_diff_name_status_z(raw)
+    if args.typed_output:
+        Path(args.typed_output).write_text(json.dumps(entries), encoding="utf-8")
+    if args.flat_output:
+        Path(args.flat_output).write_text("\n".join(flat), encoding="utf-8")
+    print(json.dumps(entries, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Resolve VISUAL_IMPACT affected surfaces for a changed-path set.")
-    parser.add_argument("--mode", choices=["resolve", "policy-check"], default="resolve")
+    parser.add_argument(
+        "--mode", choices=["resolve", "policy-check", "build-evidence-manifest", "changed-paths"], default="resolve"
+    )
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY_PATH)
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA_PATH)
     parser.add_argument("--visual-impact-schema", type=Path, default=DEFAULT_VISUAL_IMPACT_SCHEMA_PATH)
@@ -1201,14 +1527,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-registry-blob-sha", type=str, default=None)
     parser.add_argument("--head-registry-blob-sha", type=str, default=None)
     parser.add_argument("--component-vrt-check-run-id", type=str, default=None)
+    # PR #2045 OWNER fix_delta P0-5 (V2 manifest): trusted CheckRun binding
+    # fields -- ALWAYS sourced from the caller's own independently-fetched
+    # CheckRun API lookup (never from the evidence manifest's own
+    # self-reported fields, which the producer job cannot even know yet).
+    parser.add_argument("--component-vrt-check-suite-id", type=str, default=None)
+    parser.add_argument("--component-vrt-app-id", type=str, default=None)
+    parser.add_argument("--component-vrt-app-slug", type=str, default=None)
+    parser.add_argument("--component-vrt-check-conclusion", type=str, default=None)
     parser.add_argument("--github-actions-app-identity", type=str, default=None)
     parser.add_argument("--artifact-id", type=str, default=None)
     parser.add_argument("--artifact-digest", type=str, default=None)
     parser.add_argument("--decision-output", type=str, default=None)
+    # PR #2045 OWNER fix_delta P0-5 (V2 manifest): `build-evidence-manifest`
+    # mode is invoked by the `component-vrt-report` CI job to produce the
+    # VISUAL_BASELINE_REVIEW_EVIDENCE_V2 artifact from real per-surface VRT
+    # run inputs (never fabricated in raw shell/bash-embedded Python).
+    parser.add_argument("--surface-inputs-file", type=str, default=None)
+    parser.add_argument("--manifest-output", type=str, default=None)
+    # PR #2045 OWNER fix_delta P1-4: `changed-paths` mode -- parses real
+    # `git diff --name-status -z --find-renames` output (never re-implemented
+    # inline in ci.yml).
+    parser.add_argument("--name-status-file", type=str, default=None)
+    parser.add_argument("--typed-output", type=str, default=None)
+    parser.add_argument("--flat-output", type=str, default=None)
     args = parser.parse_args(argv)
 
     if args.mode == "policy-check":
         return _run_policy_check(args, _read_changed_path_entries(args))
+
+    if args.mode == "build-evidence-manifest":
+        return _run_build_evidence_manifest(args)
+
+    if args.mode == "changed-paths":
+        return _run_changed_paths(args)
 
     changed_paths = _read_changed_paths(args)
 

@@ -22,10 +22,19 @@
 //     resolution / unresolvable static relative imports.
 //
 // tsconfig paths/baseUrl, Vite resolve.alias, package.json imports/exports
-// are currently unused by this repository (verified: tsconfig.json has no
-// `paths`/`baseUrl`, vite.config.ts has no `resolve.alias`). This resolver
-// intentionally does NOT claim to fully solve them today; only the
-// relative-specifier resolution path below is implemented and exercised.
+// are NOT resolved by this module's bare-import walk (only the
+// relative-specifier resolution path below is implemented/exercised). PR
+// #2045 OWNER fix_delta P1-1: rather than silently treating a bare import
+// as `external` (out of scope, no impact) whenever one of these settings IS
+// configured, `detectUnsupportedResolutionSettings()` below scans
+// tsconfig.json / vite.config.* / package.json for them and, if present,
+// pushes a resolver-fatal entry into `errors[]` -- which
+// resolve_visual_impact.py's `resolve()` already surfaces as a
+// `resolve_result.errors` entry, and `evaluate_pr_policy()` already fails
+// closed on any non-empty `errors` list (never a silent no-impact PASS).
+// This repository does not configure any of these settings today, so the
+// guard is currently inert; it exists to catch the day one of them is
+// introduced.
 
 import ts from 'typescript'
 import { readFileSync, existsSync, statSync } from 'node:fs'
@@ -165,7 +174,14 @@ class Resolver {
     let text
     try {
       text = readFileSync(fileAbs, 'utf8')
-    } catch {
+    } catch (err) {
+      // PR #2045 OWNER fix_delta P1-1: a CSS @import/url() read failure
+      // (permission error, race with a concurrent delete, etc.) previously
+      // vanished silently -- any `@import`/`url()` targets reachable only
+      // through this file were then never walked, which could hide a real
+      // affected-surface producer. Fail closed via the existing
+      // unknown_impact plumbing instead.
+      this.addUnknown(fileAbs, 'css_read_failure', `${fileAbs}: ${String(err)}`)
       return
     }
     const dir = path.dirname(fileAbs)
@@ -197,7 +213,11 @@ class Resolver {
     let text
     try {
       text = readFileSync(fileAbs, 'utf8')
-    } catch {
+    } catch (err) {
+      // PR #2045 OWNER fix_delta P1-1: same fail-closed treatment as the CSS
+      // read-failure fix above -- a module read failure must never silently
+      // truncate the import graph walk.
+      this.addUnknown(fileAbs, 'module_read_failure', `${fileAbs}: ${String(err)}`)
       return
     }
     const sourceFile = ts.createSourceFile(fileAbs, text, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TSX)
@@ -281,6 +301,78 @@ class Resolver {
   }
 }
 
+/** PR #2045 OWNER fix_delta P1-1: detect tsconfig `paths`/`baseUrl`, Vite
+ * `resolve.alias`, and package.json `imports`/`exports` -- none of which
+ * this module's bare-import resolution understands. A repository that
+ * configures any of these could have bare specifiers silently resolve to a
+ * different file than this walker assumes (or not resolve at all), which
+ * would make the affected-surface determination wrong without ever
+ * reporting an error. Returns a list of human-readable problem strings
+ * (empty when nothing unsupported is configured). This never EXECUTES
+ * tsconfig.json / vite.config.* / package.json -- text/JSON parsing only. */
+function detectUnsupportedResolutionSettings(repoRoot) {
+  const problems = []
+
+  const tsconfigPath = path.join(repoRoot, 'tsconfig.json')
+  if (existsSync(tsconfigPath)) {
+    try {
+      const raw = readFileSync(tsconfigPath, 'utf8')
+      const parsed = ts.parseConfigFileTextToJson(tsconfigPath, raw)
+      if (parsed.error) {
+        problems.push(
+          `tsconfig.json failed to parse (${ts.flattenDiagnosticMessageText(parsed.error.messageText, ' ')}) -- refusing to assume no paths/baseUrl are configured`,
+        )
+      } else {
+        const compilerOptions = (parsed.config && parsed.config.compilerOptions) || {}
+        if (compilerOptions.paths && Object.keys(compilerOptions.paths).length > 0) {
+          problems.push('tsconfig.json compilerOptions.paths is configured but not supported by this bare-import resolver')
+        }
+        if (typeof compilerOptions.baseUrl === 'string' && compilerOptions.baseUrl !== '') {
+          problems.push('tsconfig.json compilerOptions.baseUrl is configured but not supported by this bare-import resolver')
+        }
+      }
+    } catch (err) {
+      problems.push(`tsconfig.json read/parse failure: ${String(err)}`)
+    }
+  }
+
+  for (const candidate of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts']) {
+    const viteConfigPath = path.join(repoRoot, candidate)
+    if (!existsSync(viteConfigPath)) continue
+    let viteText
+    try {
+      viteText = readFileSync(viteConfigPath, 'utf8')
+    } catch (err) {
+      problems.push(`${candidate} read failure: ${String(err)}`)
+      continue
+    }
+    // Conservative text scan only (never executes the config module): a
+    // false positive here is fail-closed (acceptable -- Runtime
+    // Verification Applicability fallback_policy), a false negative would
+    // defeat the entire point of this guard.
+    if (/\bresolve\s*:\s*\{[^}]*\balias\s*:/s.test(viteText) || /\balias\s*:\s*(\{|\[)/.test(viteText)) {
+      problems.push(`${candidate} appears to configure resolve.alias, which is not supported by this bare-import resolver`)
+    }
+  }
+
+  const packageJsonPath = path.join(repoRoot, 'package.json')
+  if (existsSync(packageJsonPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'))
+      if (pkg.imports && typeof pkg.imports === 'object' && Object.keys(pkg.imports).length > 0) {
+        problems.push('package.json "imports" subpath mapping is configured but not supported by this bare-import resolver')
+      }
+      if (pkg.exports && typeof pkg.exports === 'object' && Object.keys(pkg.exports).length > 0) {
+        problems.push('package.json "exports" is configured but not supported by this bare-import resolver')
+      }
+    } catch (err) {
+      problems.push(`package.json read/parse failure: ${String(err)}`)
+    }
+  }
+
+  return problems
+}
+
 async function main() {
   const raw = await readStdin()
   let request
@@ -301,6 +393,10 @@ async function main() {
   const surfaces = request.surfaces || {}
   const output = {}
   const errors = []
+
+  for (const problem of detectUnsupportedResolutionSettings(repoRoot)) {
+    errors.push(`unsupported_resolution_setting: ${problem}`)
+  }
 
   for (const [surfaceId, def] of Object.entries(surfaces)) {
     const entries = [

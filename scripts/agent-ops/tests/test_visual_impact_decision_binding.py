@@ -131,37 +131,56 @@ def test_base_sha_and_head_sha_must_be_full_length_hex(decision_schema):
 
 
 def test_pr2045_evaluate_pr_policy_evidence_payload_validates_against_schema(decision_schema):
-    """PR #2045 OWNER fix_delta P1-2: `evaluate_pr_policy`'s per-surface
-    `evidence` payload (as embedded via `_build_decision_surface_entry` /
-    `build_decision`) must itself validate against the schema's closed
-    `evidence` $def (additionalProperties: false). The previous
-    `{"ok": bool, "reason": str}` shape never did."""
+    """PR #2045 OWNER fix_delta P1-2 / P0-5 (V2 manifest): `evaluate_pr_policy`'s
+    per-surface `evidence` payload (as embedded via
+    `_build_decision_surface_entry` / `build_decision`) must itself validate
+    against the schema's closed `evidence` $def (additionalProperties:
+    false). Uses a real VISUAL_BASELINE_REVIEW_EVIDENCE_V2 manifest built via
+    `build_evidence_manifest_v2_record` (never a hand-rolled dict) and
+    trusted CheckRun binding params (never sourced from the manifest's own
+    self-report)."""
     resolve_result = rvi.ResolveResult(
         changed_paths=["src/ui/combatHud.ts"],
         affected_surfaces=[{"surface_id": "combat-hud-running", "reason": "direct_producer"}],
     )
     baseline_path = (
-        "tests/component/__screenshots__/combat-hud-running.vrt.test.ts/"
-        "combat-hud-running-chromium-linux.png"
+        "tests/component/__screenshots__/combat-hud-running.vrt.test.ts/combat-hud-running-chromium-linux.png"
     )
+    contracts = {
+        "runner": "vitest-browser-mode",
+        "job": "component-vrt-report",
+        "baseline": baseline_path,
+        "update_command_id": "vitest_component_vrt_update",
+        "verify_command_id": "vitest_component_vrt_verify",
+    }
     registry_doc = {
         "surfaces": {
             "combat-hud-running": {
-                "contracts": {
-                    "runner": "vitest-browser-mode",
-                    "job": "component-vrt-report",
-                    "baseline": baseline_path,
-                },
+                "contracts": contracts,
                 "policy": {"disposition_required": True},
             }
         }
     }
     declaration_doc = {"surfaces": [{"surface_id": "combat-hud-running", "disposition": "verified_unchanged"}]}
-    evidence_manifest = {
-        "head_sha": "b" * 40,
-        "mismatched_pixels": 0,
-        "artifact_id": "987",
-    }
+    record = rvi.build_evidence_manifest_v2_record(
+        surface_id="combat-hud-running",
+        contract_digest=rvi.compute_contract_digest(registry_doc["surfaces"]["combat-hud-running"]),
+        head_sha="b" * 40,
+        workflow_run_id="111",
+        baseline_path=baseline_path,
+        baseline_sha256="f" * 64,
+        actual_sha256="f" * 64,
+        mismatched_pixels=0,
+        verify_command_id="vitest_component_vrt_verify",
+        verify_succeeded=True,
+        update_command_id="vitest_component_vrt_update",
+        update_executed=False,
+        update_succeeded=False,
+        expected_artifact_id="1",
+        actual_artifact_id="2",
+        diff_artifact_id="3",
+    )
+    evidence_manifest = {"schema": rvi.EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": [record]}
     policy_result = rvi.evaluate_pr_policy(
         resolve_result=resolve_result,
         declaration_doc=declaration_doc,
@@ -172,6 +191,8 @@ def test_pr2045_evaluate_pr_policy_evidence_payload_validates_against_schema(dec
         actor="squne121",
         authorized_owners=set(),
         today=date(2026, 8, 9),
+        trusted_check_run_id="123",
+        trusted_check_conclusion="success",
     )
     assert policy_result["ok"] is True
     decision = rvi.build_decision(

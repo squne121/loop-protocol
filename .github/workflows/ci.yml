@@ -1458,125 +1458,137 @@ jobs:
           set -e
           cp /tmp/combat-hud-running.vrt.test.ts.orig tests/component/combat-hud-running.vrt.test.ts
           exit "${probe_status}"
-      - name: Build VISUAL_BASELINE_REVIEW_EVIDENCE_V1 manifest
+      - name: Build VISUAL_BASELINE_REVIEW_EVIDENCE_V2 manifest
+        # PR #2045 OWNER fix_delta P0-5 second-round REQUEST_CHANGES:
+        # per-surface V2 manifest (one record per registered surface,
+        # self-binding to its own contract digest + tamper-evidence digest)
+        # replaces the single flat V1 record for the whole job. Record
+        # construction (including baseline_sha256, which is ALWAYS computed
+        # from the on-disk baseline -- never trusted from this shell step) is
+        # delegated to `resolve_visual_impact.py --mode
+        # build-evidence-manifest`, never re-implemented ad hoc here.
         id: build-evidence-manifest
         if: ${{ always() }}
         env:
           RUN_OUTCOME: ${{ steps.run-component-vrt.outcome }}
           PROBE_OUTCOME: ${{ steps.zero-tolerance-probe.outcome }}
-          HULL_OUTCOME: ${{ steps.run-mutation-control-hull.outcome }}
-          PAUSE_OUTCOME: ${{ steps.run-mutation-control-pause.outcome }}
-          ELAPSED_OUTCOME: ${{ steps.run-mutation-control-elapsed.outcome }}
           SCREENSHOTS_ARTIFACT_ID: ${{ steps.upload-component-vrt-screenshots.outputs.artifact-id || '' }}
           # Issue #2014 fix_delta iteration 4: for pull_request-triggered
           # runs, the built-in $GITHUB_SHA is the ephemeral merge-preview
           # commit (a synthetic merge of the PR head into base), not the
-          # actual PR head commit -- so AC8's manifest.head_sha must be
-          # bound to this instead, matching the pattern already used
-          # elsewhere in this file (e.g. line 104).
+          # actual PR head commit -- so the manifest's head_sha must be bound
+          # to this instead, matching the pattern already used elsewhere in
+          # this file (e.g. line 104).
           GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          PW_VERSION="$(node -p "require('@playwright/test/package.json').version" 2>/dev/null || echo 'unknown')"
-          VITEST_VERSION="$(node -p "require('vitest/package.json').version" 2>/dev/null || echo 'unknown')"
-          BASELINE_SHA256="$(sha256sum tests/component/__screenshots__/combat-hud-running.vrt.test.ts/combat-hud-running-chromium-linux.png | awk '{print $1}')"
+          set -o pipefail
           ACTUAL_1="$(grep -o 'actual_sha256_run_1=.*' /tmp/vrt-evidence-triple-run.log | tail -1 | cut -d= -f2)"
           ACTUAL_2="$(grep -o 'actual_sha256_run_2=.*' /tmp/vrt-evidence-triple-run.log | tail -1 | cut -d= -f2)"
           ACTUAL_3="$(grep -o 'actual_sha256_run_3=.*' /tmp/vrt-evidence-triple-run.log | tail -1 | cut -d= -f2)"
-          # AC1/AC8: `zero-tolerance-probe` re-runs the running-scenario
-          # assertion with allowedMismatchedPixels forced to 0. On a real
-          # 0px diff the probe PASSES (mismatched_pixels=0); on any real
-          # diff Vitest's own error text reports the exact count
+          if [ "${ACTUAL_1}" != "${ACTUAL_2}" ] || [ "${ACTUAL_2}" != "${ACTUAL_3}" ]; then
+            echo "::error::triple-run actual PNG sha256 differs across runs (${ACTUAL_1} / ${ACTUAL_2} / ${ACTUAL_3}) -- refusing to build an evidence manifest on non-deterministic render output."
+            exit 1
+          fi
+          # AC1/AC8 (Issue #2014): `zero-tolerance-probe` re-runs the
+          # running-scenario assertion with allowedMismatchedPixels forced to
+          # 0. On a real 0px diff the probe PASSES (mismatched_pixels=0); on
+          # any real diff Vitest's own error text reports the exact count
           # ("<N> pixels (ratio <r>) differ."), which is parsed verbatim --
           # never fabricated (Runtime Verification Applicability
           # fallback_policy).
           if [ "${PROBE_OUTCOME}" = "success" ]; then
-            MISMATCHED_PIXELS=0
+            RUNNING_MISMATCHED=0
+            RUNNING_VERIFY_SUCCEEDED=true
           else
-            MISMATCHED_PIXELS="$(grep -oP '^\d+(?= pixels \(ratio)' /tmp/vrt-zero-tolerance-probe.log | tail -1)"
-            if [ -z "${MISMATCHED_PIXELS}" ]; then
+            RUNNING_MISMATCHED="$(grep -oP '^\d+(?= pixels \(ratio)' /tmp/vrt-zero-tolerance-probe.log | tail -1)"
+            if [ -z "${RUNNING_MISMATCHED}" ]; then
               echo "::error::zero-tolerance-probe outcome was '${PROBE_OUTCOME}' but no mismatch-count line was found in its output -- refusing to fabricate a mismatched_pixels value."
-              MISMATCHED_PIXELS="unknown_non_zero"
+              RUNNING_MISMATCHED="unknown_non_zero"
             fi
+            RUNNING_VERIFY_SUCCEEDED=false
           fi
-          # fix_delta iteration 2 (Issue #2014): the guarded mutation-control
-          # assertion (`.rejects.toThrow()`) PASSES the vitest test (GH
-          # Actions step outcome 'success') when a real mismatch was
-          # genuinely detected -- see the "Verify all three mutation
-          # controls actually mismatched" step comment above.
-          classify_mutation() {
-            case "$1" in
-              success) echo "expected_failure" ;;
-              *) echo "NOT_expected_failure ($1)" ;;
-            esac
-          }
-          python3 - "$GH_HEAD_SHA" "$GITHUB_RUN_ID" "$SCREENSHOTS_ARTIFACT_ID" "$PW_VERSION" "$VITEST_VERSION"             "$BASELINE_SHA256" "$ACTUAL_1" "$ACTUAL_2" "$ACTUAL_3" "$MISMATCHED_PIXELS"             "$(classify_mutation "$HULL_OUTCOME")" "$(classify_mutation "$PAUSE_OUTCOME")" "$(classify_mutation "$ELAPSED_OUTCOME")" <<'PY' > /tmp/visual_baseline_review_evidence_v1.json
+          # combat-hud-critical has no independent zero-tolerance probe today
+          # (only combat-hud-running is triple-run/probed above) -- its
+          # verified status is derived from the whole-file component-vrt run
+          # outcome (both scenarios live in the same spec file and both
+          # `toMatchScreenshot()` calls must pass for RUN_OUTCOME=success).
+          # On failure, never guess WHICH scenario mismatched or by how much
+          # -- fail-closed sentinel string, same "never fabricate" policy as
+          # the running-scenario probe above.
+          if [ "${RUN_OUTCOME}" = "success" ]; then
+            CRITICAL_MISMATCHED=0
+            CRITICAL_VERIFY_SUCCEEDED=true
+          else
+            CRITICAL_MISMATCHED="unknown_non_zero"
+            CRITICAL_VERIFY_SUCCEEDED=false
+          fi
+
+          python3 - "$GH_HEAD_SHA" "$GITHUB_RUN_ID" "$ACTUAL_1" "$RUNNING_MISMATCHED" "$RUNNING_VERIFY_SUCCEEDED" "$CRITICAL_MISMATCHED" "$CRITICAL_VERIFY_SUCCEEDED" "$SCREENSHOTS_ARTIFACT_ID" <<'PY' > surface_inputs.json
           import json
           import sys
 
           (
-              head_sha, run_id, artifact_id, pw_version, vitest_version,
-              baseline_sha256, actual_1, actual_2, actual_3, mismatched_pixels,
-              hull_result, pause_result, elapsed_result,
-          ) = sys.argv[1:14]
+              head_sha, run_id, running_actual_sha256, running_mismatched, running_verify_succeeded,
+              critical_mismatched, critical_verify_succeeded, screenshots_artifact_id,
+          ) = sys.argv[1:9]
 
-          manifest = {
-              "schema": "VISUAL_BASELINE_REVIEW_EVIDENCE_V1",
-              "head_sha": head_sha,
-              "run_id": run_id,
-              "artifact_id": artifact_id,
-              "container_digest": "sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948",
-              "node_version": None,
-              "pnpm_version": "11.7.0",
-              "vitest_version": vitest_version,
-              "playwright_version": pw_version,
-              "chromium_version": None,
-              "viewport": "1280x720",
-              "device_scale_factor": 1,
-              "baseline_sha256": baseline_sha256,
-              "actual_sha256_run_1": actual_1,
-              "actual_sha256_run_2": actual_2,
-              "actual_sha256_run_3": actual_3,
-              # PR #2045 OWNER fix_delta P0-5: this value crosses a bash env
-              # var -> sys.argv boundary and was previously written into the
-              # JSON manifest as a raw *string* (e.g. `"0"`), while
-              # resolve_visual_impact.py's consumer compared it with `== 0`
-              # (int) -- always False, so `canonical_verify_success` was
-              # permanently False regardless of the real VRT outcome. Emit
-              # the true JSON type: an int when it parses as one, otherwise
-              # keep the original fail-closed sentinel string verbatim (the
-              # consumer treats any non-integer as a non-zero mismatch).
-              "mismatched_pixels": (
-                  int(mismatched_pixels) if mismatched_pixels.lstrip("-").isdigit() else mismatched_pixels
-              ),
-              "effective_pixel_limit": 48,
-              "mutation_controls": {
-                  "hull_hidden": hull_result,
-                  "pause_hidden": pause_result,
-                  "elapsed_hidden": elapsed_result,
+          def to_bool(value):
+              return value == "true"
+
+          def to_mismatched(value):
+              return int(value) if value.lstrip("-").isdigit() else value
+
+          records = [
+              {
+                  "surface_id": "combat-hud-running",
+                  "head_sha": head_sha,
+                  "workflow_run_id": run_id,
+                  "actual_sha256": running_actual_sha256,
+                  "mismatched_pixels": to_mismatched(running_mismatched),
+                  "verify_succeeded": to_bool(running_verify_succeeded),
+                  "update_executed": False,
+                  "update_succeeded": False,
+                  "expected_artifact_id": screenshots_artifact_id,
+                  "actual_artifact_id": screenshots_artifact_id,
+                  "diff_artifact_id": screenshots_artifact_id,
               },
-              "expected_actual_diff_review": (
-                  "running/critical baselines regenerated and reviewed in fix_delta "
-                  "iteration 1 (Issue #2014, PR #2024 review comment "
-                  "https://github.com/squne121/loop-protocol/pull/2024#issuecomment-5225055386)"
-              ),
-          }
-          print(json.dumps(manifest, indent=2))
+              {
+                  "surface_id": "combat-hud-critical",
+                  "head_sha": head_sha,
+                  "workflow_run_id": run_id,
+                  # No independent zero-tolerance probe exists for this
+                  # surface today -- never fabricate a per-run actual PNG
+                  # hash it did not itself produce.
+                  "actual_sha256": None,
+                  "mismatched_pixels": to_mismatched(critical_mismatched),
+                  "verify_succeeded": to_bool(critical_verify_succeeded),
+                  "update_executed": False,
+                  "update_succeeded": False,
+                  "expected_artifact_id": screenshots_artifact_id,
+                  "actual_artifact_id": screenshots_artifact_id,
+                  "diff_artifact_id": screenshots_artifact_id,
+              },
+          ]
+          json.dump(records, sys.stdout, indent=2)
           PY
-          cat /tmp/visual_baseline_review_evidence_v1.json
+          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+            --mode build-evidence-manifest \
+            --surface-inputs-file surface_inputs.json \
+            --manifest-output /tmp/visual_baseline_review_evidence_v2.json
           {
             echo ""
-            echo "### VISUAL_BASELINE_REVIEW_EVIDENCE_V1 (Issue #2014 AC8)"
+            echo "### VISUAL_BASELINE_REVIEW_EVIDENCE_V2 (Issue #2019 P0-5)"
             echo '```json'
-            cat /tmp/visual_baseline_review_evidence_v1.json
+            cat /tmp/visual_baseline_review_evidence_v2.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload VISUAL_BASELINE_REVIEW_EVIDENCE_V1 manifest
+      - name: Upload VISUAL_BASELINE_REVIEW_EVIDENCE_V2 manifest
         id: upload-evidence-manifest
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
           name: component-vrt-evidence-manifest
-          path: /tmp/visual_baseline_review_evidence_v1.json
+          path: /tmp/visual_baseline_review_evidence_v2.json
           if-no-files-found: error
           retention-days: 30
       # --- end runtime evidence ---------------------------------------------
@@ -1708,6 +1720,71 @@ jobs:
           HEAD_REGISTRY_BLOB_SHA="$(git rev-parse --verify --quiet HEAD:docs/dev/visual-surfaces.yml 2>/dev/null || echo '0000000000000000000000000000000000000000')"
           echo "base_registry_blob_sha=${BASE_REGISTRY_BLOB_SHA}" >> "$GITHUB_OUTPUT"
           echo "head_registry_blob_sha=${HEAD_REGISTRY_BLOB_SHA}" >> "$GITHUB_OUTPUT"
+      # Issue #2019 P0-6 (OWNER REQUEST_CHANGES, PR #2045): trust-boundary
+      # hardening. A full untrusted/trusted 2-phase split (a
+      # `pull_request_target`-triggered second workflow, base-branch
+      # workflow definition, PR-head code never executed in the trusted
+      # phase) is NOT implemented here -- GitHub Actions `on:` triggers are
+      # workflow-file-scoped, not job-scoped, so a `pull_request_target` job
+      # cannot coexist with this file's `pull_request` jobs inside the SAME
+      # `ci.yml`. That split necessarily requires a SECOND workflow file,
+      # which is outside this Issue's confirmed Allowed Paths (only
+      # `.github/workflows/ci.yml` is confirmed) and `pull_request_target`
+      # is itself a high-risk permission surface (base-repo secrets/context
+      # access) that should get explicit human/branch-protection review
+      # rather than being introduced silently by an implementation worker.
+      #
+      # Mitigation implemented instead, entirely within this job: the
+      # EVALUATOR CODE ITSELF (resolve_visual_impact.py /
+      # resolve_visual_impact.mjs / the two visual-impact JSON schemas) is
+      # materialized from the BASE branch (`git show <base_sha>:<path>`),
+      # never the PR head's own copy, before being executed below. A
+      # candidate PR can therefore no longer neuter its own evaluator (e.g.
+      # deleting the meta_policy_change fail-closed branch, weakening schema
+      # `required`/`additionalProperties`, etc.) -- the code path that
+      # judges the PR is always pinned to whatever was already committed to
+      # the base branch at merge-base time, independent of what the PR
+      # itself changes in the same files. This does NOT eliminate PR-head
+      # code execution entirely (component-vrt-report still runs head's
+      # Vitest/Playwright code to render screenshots -- that is inherent to
+      # visual regression testing and carries no write/secret access), but
+      # it DOES remove the PR head's ability to control the pass/fail LOGIC
+      # of the required merge-gate check.
+      #
+      # Bootstrap exception: if a file does not exist at the base SHA yet
+      # (e.g. THIS PR is the one introducing it), the head-checked-out copy
+      # is used as a logged fallback -- there is no earlier trusted version
+      # to fall back to. `trusted_evaluator_bootstrap.log` records every
+      # fallback so this is never silently indistinguishable from a
+      # genuinely base-pinned run.
+      - name: Materialize base-branch-locked visual-impact evaluator (Issue #2019 P0-6)
+        id: trusted-evaluator
+        env:
+          BASE_SHA: ${{ steps.shas.outputs.base_sha }}
+        run: |
+          set -e
+          mkdir -p trusted_evaluator/scripts/agent-ops trusted_evaluator/docs/dev
+          : > trusted_evaluator_bootstrap.log
+          for rel in             scripts/agent-ops/resolve_visual_impact.py             scripts/agent-ops/resolve_visual_impact.mjs             docs/dev/visual-surfaces.schema.json             docs/dev/visual-impact.schema.json
+          do
+            if git show "${BASE_SHA}:${rel}" > "trusted_evaluator/${rel}" 2>/dev/null; then
+              echo "base_pinned=${rel}"
+            else
+              cp "${rel}" "trusted_evaluator/${rel}"
+              echo "bootstrap_fallback_used_for=${rel} (does not exist at base_sha=${BASE_SHA} yet -- using head copy)" | tee -a trusted_evaluator_bootstrap.log
+            fi
+          done
+          {
+            echo ""
+            echo "### Trust boundary hardening (Issue #2019 P0-6)"
+            echo "- evaluator materialized from base_sha: \`${BASE_SHA}\`"
+            if [ -s trusted_evaluator_bootstrap.log ]; then
+              echo "- bootstrap fallback (base predates these files, head copy used instead):"
+              sed 's/^/  - /' trusted_evaluator_bootstrap.log
+            else
+              echo "- fully base-pinned: no bootstrap fallback used"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Compute changed paths
         id: changed-paths
         env:
@@ -1718,48 +1795,28 @@ jobs:
           # PR #2045 OWNER fix_delta P0-4: `--name-status -z --find-renames`
           # (not plain `--name-only`) so renames/adds/removes keep their real
           # status instead of everything being forced to "modified" -- the
-          # Python step below converts this into the typed
-          # {"status","path","old_path"?} record set the policy check
+          # typed {"status","path","old_path"?} record set the policy check
           # consumes for both resolution (old+new path union) and the
           # VISUAL_IMPACT_DECISION_V1 changed_paths_digest.
+          #
+          # PR #2045 OWNER fix_delta P1-4 / P0-6: parsing is delegated to
+          # `resolve_visual_impact.py --mode changed-paths`
+          # (parse_git_diff_name_status_z) -- never re-implemented inline
+          # here -- and, per the same P0-6 trust-boundary rationale as the
+          # policy-check step below, the BASE-BRANCH-LOCKED copy
+          # (trusted_evaluator/) is used so a malicious PR head cannot alter
+          # its own rename-classification logic to hide a meta-policy-file
+          # change from `resolve()`'s meta_policy_change detection.
           if git cat-file -e "${BASE_SHA}" 2>/dev/null; then
             git diff --name-status -z --find-renames "${BASE_SHA}" "${HEAD_SHA}" > changed_paths_name_status.nul
           else
             : > changed_paths_name_status.nul
           fi
-          python3 - <<'PY'
-          import json
-
-          with open("changed_paths_name_status.nul", "rb") as fh:
-              raw = fh.read()
-          fields = [f.decode("utf-8") for f in raw.split(b"\x00") if f != b""]
-
-          entries = []
-          flat = []
-          i = 0
-          while i < len(fields):
-              token = fields[i]
-              status = token[0] if token else ""
-              if status in ("R", "C"):
-                  old_path = fields[i + 1]
-                  new_path = fields[i + 2]
-                  entries.append({"status": "renamed", "path": new_path, "old_path": old_path})
-                  flat.extend([old_path, new_path])
-                  i += 3
-              else:
-                  path = fields[i + 1]
-                  kind = {"A": "added", "D": "removed"}.get(status, "modified")
-                  entries.append({"status": kind, "path": path})
-                  flat.append(path)
-                  i += 2
-
-          with open("changed_paths_typed.json", "w", encoding="utf-8") as fh:
-              json.dump(entries, fh)
-          with open("changed_paths.txt", "w", encoding="utf-8") as fh:
-              fh.write("\n".join(sorted(set(flat))))
-
-          print(json.dumps(entries, indent=2))
-          PY
+          uv run --locked python3 trusted_evaluator/scripts/agent-ops/resolve_visual_impact.py \
+            --mode changed-paths \
+            --name-status-file changed_paths_name_status.nul \
+            --typed-output changed_paths_typed.json \
+            --flat-output changed_paths.txt
           cat changed_paths.txt
       - name: Write PR body to file (untrusted input -- never shell-expanded)
         env:
@@ -1777,6 +1834,13 @@ jobs:
         with:
           name: component-vrt-evidence-manifest
           path: evidence-manifest-download
+      # PR #2045 OWNER fix_delta P0-5 second-round REQUEST_CHANGES: the
+      # downloaded manifest is UNTRUSTED input at this point (produced by a
+      # job that ran PR-head code) -- schema/digest/surface+contract binding
+      # is independently re-verified by resolve_visual_impact.py itself
+      # (build_evidence_from_manifest_v2 / verify_evidence_manifest_v2_record_digest)
+      # in the "Run visual-impact-policy check" step below, never trusted
+      # verbatim.
       - name: Resolve component-vrt-report CheckRun id for current head
         id: component-vrt-check-run
         if: ${{ always() }}
@@ -1790,8 +1854,30 @@ jobs:
           # (#1193) scope entirely -- `python3 -c "..."` inside `$(...)` was
           # rejected as unsupported_shell_grammar by
           # scripts/ci/check_python_invocation_policy.py --strict.
-          CHECK_RUN_ID="$(jq -r '(.check_runs // []) | map(select(.name == "component-vrt-report")) | (.[0].id // "") | tostring' check_runs.json)"
-          echo "check_run_id=${CHECK_RUN_ID}" >> "$GITHUB_OUTPUT"
+          #
+          # PR #2045 OWNER fix_delta P0-5 second-round REQUEST_CHANGES:
+          # filter on check_name AND status=="completed" AND
+          # app.slug=="github-actions" (never name alone), then pick the
+          # MOST RECENTLY COMPLETED match (never an arbitrary "first row of
+          # the same name" -- a rerun can leave multiple check runs with the
+          # identical name for the same head SHA).
+          MATCHED="$(jq -c '(.check_runs // [])
+            | map(select(.name == "component-vrt-report" and .status == "completed" and .app.slug == "github-actions"))
+            | sort_by(.completed_at)
+            | reverse
+            | (.[0] // {})' check_runs.json)"
+          CHECK_RUN_ID="$(echo "${MATCHED}" | jq -r '(.id // "") | tostring')"
+          CHECK_SUITE_ID="$(echo "${MATCHED}" | jq -r '(.check_suite.id // "") | tostring')"
+          APP_ID="$(echo "${MATCHED}" | jq -r '(.app.id // "") | tostring')"
+          APP_SLUG="$(echo "${MATCHED}" | jq -r '(.app.slug // "")')"
+          CHECK_CONCLUSION="$(echo "${MATCHED}" | jq -r '(.conclusion // "")')"
+          {
+            echo "check_run_id=${CHECK_RUN_ID}"
+            echo "check_suite_id=${CHECK_SUITE_ID}"
+            echo "app_id=${APP_ID}"
+            echo "app_slug=${APP_SLUG}"
+            echo "check_conclusion=${CHECK_CONCLUSION}"
+          } >> "$GITHUB_OUTPUT"
       - name: Run visual-impact-policy check
         id: policy-check
         # PR #2045 OWNER fix_delta P1-5: VISUAL_IMPACT_DECISION_V1 requires
@@ -1812,6 +1898,10 @@ jobs:
           VRT_ARTIFACT_ID: ${{ needs.component-vrt-report.outputs.vrt_evidence_artifact_id || '' }}
           VRT_ARTIFACT_DIGEST: ${{ needs.component-vrt-report.outputs.vrt_evidence_artifact_digest || '' }}
           COMPONENT_VRT_CHECK_RUN_ID: ${{ steps.component-vrt-check-run.outputs.check_run_id || '' }}
+          COMPONENT_VRT_CHECK_SUITE_ID: ${{ steps.component-vrt-check-run.outputs.check_suite_id || '' }}
+          COMPONENT_VRT_APP_ID: ${{ steps.component-vrt-check-run.outputs.app_id || '' }}
+          COMPONENT_VRT_APP_SLUG: ${{ steps.component-vrt-check-run.outputs.app_slug || '' }}
+          COMPONENT_VRT_CHECK_CONCLUSION: ${{ steps.component-vrt-check-run.outputs.check_conclusion || '' }}
         run: |
           # PR #2045 OWNER fix_delta P0-1: `set +o pipefail` here made the
           # `| tee` pipeline's exit status always be `tee`'s (0), so a
@@ -1821,12 +1911,27 @@ jobs:
           # pipefail` makes the pipeline exit non-zero whenever the
           # evaluator itself does.
           set -o pipefail
-          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+          # Issue #2019 P0-6: run the BASE-BRANCH-LOCKED copy of the
+          # evaluator (materialized above), never the PR head's own
+          # `scripts/agent-ops/resolve_visual_impact.py` -- see the
+          # "Materialize base-branch-locked visual-impact evaluator" step
+          # comment above for the full trust-boundary rationale. `--schema`
+          # / `--visual-impact-schema` / `--mjs` are likewise base-pinned;
+          # `--registry` stays pointed at the real (head-checked-out)
+          # working-tree path because the evaluator itself resolves registry
+          # CONTENT via `--head-ref`/`--base-ref` (`git show <ref>:<path>`),
+          # never the raw working-tree file, for both base and head.
+          uv run --locked python3 trusted_evaluator/scripts/agent-ops/resolve_visual_impact.py \
             --mode policy-check \
+            --registry docs/dev/visual-surfaces.yml \
+            --schema trusted_evaluator/docs/dev/visual-surfaces.schema.json \
+            --visual-impact-schema trusted_evaluator/docs/dev/visual-impact.schema.json \
+            --mjs trusted_evaluator/scripts/agent-ops/resolve_visual_impact.mjs \
+            --repo-root . \
             --changed-paths-typed-file changed_paths_typed.json \
             --changed-paths-file changed_paths.txt \
             --pr-body-file pr_body.md \
-            --evidence-manifest-file evidence-manifest-download/visual_baseline_review_evidence_v1.json \
+            --evidence-manifest-file evidence-manifest-download/visual_baseline_review_evidence_v2.json \
             --codeowners-file base_codeowners.txt \
             --actor "${PR_ACTOR}" \
             --repository "${GITHUB_REPOSITORY}" \
@@ -1838,6 +1943,10 @@ jobs:
             --base-registry-blob-sha "${BASE_REGISTRY_BLOB_SHA}" \
             --head-registry-blob-sha "${HEAD_REGISTRY_BLOB_SHA}" \
             --component-vrt-check-run-id "${COMPONENT_VRT_CHECK_RUN_ID}" \
+            --component-vrt-check-suite-id "${COMPONENT_VRT_CHECK_SUITE_ID}" \
+            --component-vrt-app-id "${COMPONENT_VRT_APP_ID}" \
+            --component-vrt-app-slug "${COMPONENT_VRT_APP_SLUG}" \
+            --component-vrt-check-conclusion "${COMPONENT_VRT_CHECK_CONCLUSION}" \
             --github-actions-app-identity "github-actions[bot]" \
             --artifact-id "${VRT_ARTIFACT_ID}" \
             --artifact-digest "${VRT_ARTIFACT_DIGEST}" \
