@@ -69,6 +69,7 @@ META_POLICY_PATHS: frozenset[str] = frozenset(
         "scripts/agent-ops/resolve_visual_impact.py",
         "scripts/agent-ops/resolve_visual_impact.mjs",
         ".github/workflows/ci.yml",
+        ".github/workflows/visual-impact-trusted-consumer.yml",
     }
 )
 
@@ -1287,6 +1288,148 @@ def _validate_decision_schema(decision: dict[str, Any], visual_impact_schema_pat
     return []
 
 
+# --- Issue #2019 AC30-AC37 (P0-6 trust boundary): trusted consumer -------
+# `verify_trusted_artifact()` below is invoked ONLY by the separate
+# `workflow_run`-triggered `.github/workflows/visual-impact-trusted-consumer.yml`
+# job (via this module's `--mode verify-trusted-artifact` CLI entry point).
+# That workflow's own definition is always resolved from the base/default
+# branch -- a GitHub Actions `workflow_run` trigger property that a
+# candidate PR head cannot influence -- and it never checks out or executes
+# the candidate PR head's code. This function therefore treats every byte
+# of the producer's `visual-impact-decision-v1` artifact and the
+# `component-vrt-evidence-manifest` artifact as fully UNTRUSTED input
+# produced by a run whose job definition/steps a candidate PR CAN alter
+# (e.g. forcing `exit 0`, deleting the materialize step, weakening schema
+# checks): it independently re-derives trust from schema/digest/identity
+# checks alone, never from the producer job's own reported conclusion.
+
+TRUSTED_ARTIFACT_MAX_DECISION_BYTES = 1_000_000
+TRUSTED_ARTIFACT_MAX_EVIDENCE_MANIFEST_BYTES = 5_000_000
+
+
+@dataclass
+class TrustedArtifactVerdict:
+    ok: bool
+    reason_codes: list[str] = field(default_factory=list)
+    decision: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "VISUAL_IMPACT_TRUSTED_CONSUMER_VERDICT_V1",
+            "ok": self.ok,
+            "reason_codes": self.reason_codes,
+        }
+
+
+def verify_trusted_artifact(
+    *,
+    decision_raw: bytes | None,
+    evidence_manifest_raw: bytes | None,
+    visual_impact_schema_path: Path,
+    expected_head_sha: str,
+    expected_repository: str,
+    expected_pr_number: int,
+    max_decision_bytes: int = TRUSTED_ARTIFACT_MAX_DECISION_BYTES,
+    max_evidence_manifest_bytes: int = TRUSTED_ARTIFACT_MAX_EVIDENCE_MANIFEST_BYTES,
+) -> TrustedArtifactVerdict:
+    """AC31-AC35: independently re-verify a producer-authored
+    VISUAL_IMPACT_DECISION_V1 artifact (and its referenced evidence
+    manifest) as untrusted input. Every failure path is fail-closed --
+    missing/oversized/malformed/mismatched/tampered input never yields
+    `ok=True`, regardless of what the producer job itself reported."""
+    if decision_raw is None:
+        return TrustedArtifactVerdict(False, ["missing_decision_artifact"], None)
+    if len(decision_raw) > max_decision_bytes:
+        return TrustedArtifactVerdict(False, ["decision_artifact_too_large"], None)
+    try:
+        decision = json.loads(decision_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return TrustedArtifactVerdict(False, [f"decision_not_json:{exc}"], None)
+    if not isinstance(decision, dict):
+        return TrustedArtifactVerdict(False, ["decision_not_object"], None)
+
+    schema_errors = _validate_decision_schema(decision, visual_impact_schema_path)
+    if schema_errors:
+        return TrustedArtifactVerdict(False, schema_errors, decision)
+
+    reasons: list[str] = []
+    if decision.get("head_sha") != expected_head_sha:
+        reasons.append("head_sha_mismatch")
+    if decision.get("repository") != expected_repository:
+        reasons.append("repository_mismatch")
+    if decision.get("pull_request_number") != expected_pr_number:
+        reasons.append("pull_request_number_mismatch")
+
+    if evidence_manifest_raw is None:
+        # No evidence manifest artifact could be retrieved at all -- any
+        # affected surface whose decision entry claims an
+        # `evidence_manifest_digest` cannot be corroborated, so fail-closed
+        # for those surfaces rather than silently accepting the decision's
+        # self-report as sufficient (this is what catches a candidate PR
+        # deleting the base-locked evaluator's materialize step, or the
+        # producer job's evidence-manifest upload step, entirely).
+        for surface in decision.get("affected_surfaces", []) or []:
+            evidence = surface.get("evidence") or {}
+            if evidence.get("evidence_manifest_digest"):
+                reasons.append(f"evidence_manifest_missing:{surface.get('surface_id')}")
+    else:
+        if len(evidence_manifest_raw) > max_evidence_manifest_bytes:
+            reasons.append("evidence_manifest_too_large")
+        else:
+            manifest: dict[str, Any] | None
+            try:
+                manifest = json.loads(evidence_manifest_raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                manifest = None
+                reasons.append(f"evidence_manifest_not_json:{exc}")
+            if manifest is not None:
+                if not isinstance(manifest, dict) or manifest.get("schema") != EVIDENCE_MANIFEST_V2_SCHEMA:
+                    reasons.append("evidence_manifest_schema_invalid")
+                for surface in decision.get("affected_surfaces", []) or []:
+                    evidence = surface.get("evidence") or {}
+                    digest_claim = evidence.get("evidence_manifest_digest")
+                    if not digest_claim:
+                        continue
+                    record = find_evidence_manifest_v2_record(manifest, surface.get("surface_id"))
+                    if record is None:
+                        reasons.append(f"evidence_manifest_record_missing:{surface.get('surface_id')}")
+                        continue
+                    if not verify_evidence_manifest_v2_record_digest(record):
+                        reasons.append(f"evidence_manifest_digest_tamper:{surface.get('surface_id')}")
+                        continue
+                    if record.get("manifest_sha256") != digest_claim:
+                        reasons.append(f"evidence_manifest_digest_mismatch:{surface.get('surface_id')}")
+
+    return TrustedArtifactVerdict(ok=not reasons, reason_codes=reasons, decision=decision)
+
+
+def _run_verify_trusted_artifact(args: argparse.Namespace) -> int:
+    decision_raw: bytes | None = None
+    if args.decision_file:
+        decision_path = Path(args.decision_file)
+        if decision_path.exists():
+            decision_raw = decision_path.read_bytes()
+    evidence_manifest_raw: bytes | None = None
+    if args.evidence_manifest_file:
+        manifest_path = Path(args.evidence_manifest_file)
+        if manifest_path.exists():
+            evidence_manifest_raw = manifest_path.read_bytes()
+
+    verdict = verify_trusted_artifact(
+        decision_raw=decision_raw,
+        evidence_manifest_raw=evidence_manifest_raw,
+        visual_impact_schema_path=args.visual_impact_schema,
+        expected_head_sha=args.expected_head_sha or "",
+        expected_repository=args.expected_repository or "",
+        expected_pr_number=args.expected_pr_number or 0,
+    )
+    output = verdict.to_dict()
+    print(json.dumps(output, indent=2))
+    if args.verdict_output:
+        Path(args.verdict_output).write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+    return 0 if verdict.ok else 1
+
+
 def _run_policy_check(args: argparse.Namespace, changed_path_entries: list[dict[str, str]]) -> int:
     changed_paths = _flat_paths_for_resolve(changed_path_entries)
     result = resolve(
@@ -1492,7 +1635,15 @@ def _run_changed_paths(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Resolve VISUAL_IMPACT affected surfaces for a changed-path set.")
     parser.add_argument(
-        "--mode", choices=["resolve", "policy-check", "build-evidence-manifest", "changed-paths"], default="resolve"
+        "--mode",
+        choices=[
+            "resolve",
+            "policy-check",
+            "build-evidence-manifest",
+            "changed-paths",
+            "verify-trusted-artifact",
+        ],
+        default="resolve",
     )
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY_PATH)
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA_PATH)
@@ -1539,6 +1690,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--artifact-id", type=str, default=None)
     parser.add_argument("--artifact-digest", type=str, default=None)
     parser.add_argument("--decision-output", type=str, default=None)
+    # Issue #2019 AC30-AC37: `--mode verify-trusted-artifact` CLI surface,
+    # invoked by the `workflow_run`-triggered trusted consumer workflow.
+    parser.add_argument("--decision-file", type=str, default=None)
+    parser.add_argument("--expected-head-sha", type=str, default=None)
+    parser.add_argument("--expected-repository", type=str, default=None)
+    parser.add_argument("--expected-pr-number", type=int, default=None)
+    parser.add_argument("--verdict-output", type=str, default=None)
     # PR #2045 OWNER fix_delta P0-5 (V2 manifest): `build-evidence-manifest`
     # mode is invoked by the `component-vrt-report` CI job to produce the
     # VISUAL_BASELINE_REVIEW_EVIDENCE_V2 artifact from real per-surface VRT
@@ -1561,6 +1719,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mode == "changed-paths":
         return _run_changed_paths(args)
+
+    if args.mode == "verify-trusted-artifact":
+        return _run_verify_trusted_artifact(args)
 
     changed_paths = _read_changed_paths(args)
 
