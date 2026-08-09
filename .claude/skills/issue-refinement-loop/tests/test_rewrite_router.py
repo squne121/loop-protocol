@@ -26,6 +26,13 @@ from decide_rewrite_route import (
     REASON_CODE_CHECKER_PASSED,
     REASON_CODE_CHECKER_FAILED,
     REASON_CODE_FINGERPRINT_DUPLICATE,
+    # #2048 regression: approved scope reframe / empty operations[] router
+    ROUTE_CONTRACT_UPDATE,
+    ROUTE_ISSUE_EDITOR_REQUIRED,
+    REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE,
+    SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1,
+    compute_empty_operations_fingerprint,
+    decide_scope_reframe_contract_route,
 )
 
 
@@ -1200,3 +1207,121 @@ class TestAC10FormatOnlyRepairBudget:
         d = result.to_dict()
         assert "last_mutation_kind" in d
         assert d["last_mutation_kind"] == "format_only_repair"
+
+
+
+
+# ---------------------------------------------------------------------------
+# #2048 regression: approved scope reframe with empty operations[] router
+# (follow-up to #1877/PR #1884)
+# ---------------------------------------------------------------------------
+
+
+def _scope_reframe_state(**overrides):
+    base = dict(
+        scope_delta_status="approved_by_trusted_anchor",
+        allowed_path_deltas=["- `docs/product/features/example.md`"],
+        operations=[],
+        anchor_comment_url="https://github.com/squne121/loop-protocol/issues/2048#issuecomment-1",
+        issue_body_sha256="a" * 64,
+        previous_empty_operations_fingerprints=[],
+        posted_scope_reframe_comment_fingerprints=[],
+    )
+    base.update(overrides)
+    return SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1(**base)
+
+
+class TestIssue2048ApprovedScopeReframeEmptyOperations:
+    """AC1: approved scope reframe + operations[] empty -> issue_editor_required."""
+
+    def test_approved_scope_reframe_empty_operations_routes_to_issue_editor_required(self):
+        state = _scope_reframe_state()
+        result = decide_scope_reframe_contract_route(state)
+        assert result.route == ROUTE_ISSUE_EDITOR_REQUIRED
+        assert result.route != ROUTE_CONTRACT_UPDATE
+        assert result.reason_code == REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE
+
+    def test_approved_scope_reframe_with_operations_routes_to_contract_update(self):
+        """Non-empty operations[] preserves the existing #1877 contract_update path."""
+        state = _scope_reframe_state(
+            operations=[{"section": "Allowed Paths", "op": "append", "text": "- `x`"}]
+        )
+        result = decide_scope_reframe_contract_route(state)
+        assert result.route == ROUTE_CONTRACT_UPDATE
+        assert result.reason_code is None
+
+    def test_not_approved_by_trusted_anchor_routes_to_contract_update(self):
+        state = _scope_reframe_state(scope_delta_status="rejected", operations=[])
+        result = decide_scope_reframe_contract_route(state)
+        assert result.route == ROUTE_CONTRACT_UPDATE
+
+    def test_empty_allowed_path_deltas_routes_to_contract_update(self):
+        state = _scope_reframe_state(allowed_path_deltas=[], operations=[])
+        result = decide_scope_reframe_contract_route(state)
+        assert result.route == ROUTE_CONTRACT_UPDATE
+
+
+class TestIssue2048NoProgressRetrySuppression:
+    """AC2: same anchor/body-sha/empty-operations fingerprint -> no repeated contract_update retry."""
+
+    def test_fingerprint_is_deterministic_for_same_anchor_and_body_sha(self):
+        state1 = _scope_reframe_state()
+        state2 = _scope_reframe_state()
+        r1 = decide_scope_reframe_contract_route(state1)
+        r2 = decide_scope_reframe_contract_route(state2)
+        assert r1.empty_operations_fingerprint == r2.empty_operations_fingerprint
+        assert r1.empty_operations_fingerprint == compute_empty_operations_fingerprint(
+            state1.anchor_comment_url, state1.issue_body_sha256
+        )
+
+    def test_first_occurrence_is_not_a_no_progress_retry(self):
+        state = _scope_reframe_state(previous_empty_operations_fingerprints=[])
+        result = decide_scope_reframe_contract_route(state)
+        assert result.no_progress_retry_suppressed is False
+
+    def test_repeated_fingerprint_is_suppressed_as_no_progress_retry(self):
+        first = decide_scope_reframe_contract_route(_scope_reframe_state())
+        state2 = _scope_reframe_state(
+            previous_empty_operations_fingerprints=[first.empty_operations_fingerprint]
+        )
+        second = decide_scope_reframe_contract_route(state2)
+        # Still routes to issue_editor_required, never re-attempts contract_update.
+        assert second.route == ROUTE_ISSUE_EDITOR_REQUIRED
+        assert second.route != ROUTE_CONTRACT_UPDATE
+        assert second.no_progress_retry_suppressed is True
+
+    def test_body_change_invalidates_prior_no_progress_suppression(self):
+        first = decide_scope_reframe_contract_route(_scope_reframe_state())
+        state2 = _scope_reframe_state(
+            issue_body_sha256="b" * 64,
+            previous_empty_operations_fingerprints=[first.empty_operations_fingerprint],
+        )
+        second = decide_scope_reframe_contract_route(state2)
+        assert second.empty_operations_fingerprint != first.empty_operations_fingerprint
+        assert second.no_progress_retry_suppressed is False
+
+
+class TestIssue2048DuplicateScopeReframeComment:
+    """AC3: same anchor/body-sha/empty-operations fingerprint -> no duplicate comment post."""
+
+    def test_first_occurrence_should_post_comment(self):
+        result = decide_scope_reframe_contract_route(_scope_reframe_state())
+        assert result.duplicate_comment is False
+        assert result.should_post_comment is True
+
+    def test_already_posted_fingerprint_is_a_duplicate_comment(self):
+        first = decide_scope_reframe_contract_route(_scope_reframe_state())
+        state2 = _scope_reframe_state(
+            posted_scope_reframe_comment_fingerprints=[first.empty_operations_fingerprint]
+        )
+        second = decide_scope_reframe_contract_route(state2)
+        assert second.duplicate_comment is True
+        assert second.should_post_comment is False
+
+    def test_to_dict_includes_scope_reframe_fields(self):
+        result = decide_scope_reframe_contract_route(_scope_reframe_state())
+        payload = result.to_dict()
+        assert payload["route"] == ROUTE_ISSUE_EDITOR_REQUIRED
+        assert payload["reason_code"] == REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE
+        assert "empty_operations_fingerprint" in payload
+        assert "duplicate_comment" in payload

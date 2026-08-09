@@ -43,6 +43,13 @@ ROUTE_CONTINUE_REWRITE = "continue_rewrite"
 ROUTE_PROCEED_TO_REVIEW = "proceed_to_review"
 ROUTE_HUMAN_JUDGMENT_REQUIRED = "human_judgment_required"
 ROUTE_CATEGORY_WIDE_REMEDIATION = "category_wide_remediation"
+# #2048 regression: routes for the approved-scope-reframe / empty-operations
+# router (decide_scope_reframe_contract_route below). ROUTE_CONTRACT_UPDATE
+# is the normal outcome (operations[] is non-empty, a section-bound patch
+# plan can be built). ROUTE_ISSUE_EDITOR_REQUIRED is the full-body-rewrite
+# fallback used when operations[] is empty despite an approved scope reframe.
+ROUTE_CONTRACT_UPDATE = "contract_update"
+ROUTE_ISSUE_EDITOR_REQUIRED = "issue_editor_required"
 
 # Reason codes
 REASON_CODE_MAX_ATTEMPTS_EXCEEDED = "max_attempts_exceeded"
@@ -56,6 +63,14 @@ REASON_CODE_REPEATED_FIX_CATEGORY_REMEDIATION = (
 )
 REASON_CODE_FIX_CATEGORY_UNDECIDABLE = "fix_category_undecidable"
 REASON_CODE_FINGERPRINT_DUPLICATE = "rewrite_request_fingerprint_duplicate"
+# #2048 regression (follow-up to #1877/PR #1884): an approved scope reframe
+# (approved_by_trusted_anchor + non-empty allowed_path_deltas) whose derived
+# operations[] is empty requires a full contract/body rewrite; routing this
+# case to contract_update would produce a no-progress retry loop because
+# there is no section-bound patch to apply.
+REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE = (
+    "approved_scope_requires_full_contract_rewrite"
+)
 REASON_CODE_NULL = None
 
 
@@ -651,6 +666,196 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
     rewrite_request_fingerprint=state.rewrite_request_fingerprint,
     last_mutation_kind=state.last_mutation_kind,
     budget_debit=state.budget_debit
+    )
+
+
+# ---------------------------------------------------------------------------
+# #2048 regression: approved scope reframe with empty operations[] router
+# ---------------------------------------------------------------------------
+#
+# Follow-up to #1877/PR #1884 (trusted anchor patch plan consumer). When a
+# scope reframe has been approved by a trusted anchor
+# (scope_delta_status == "approved_by_trusted_anchor") AND carries a
+# non-empty allowed_path_deltas, but the derived CONTRACT_PATCH_PLAN_V1
+# operations[] is empty (no section-bound append operation could be
+# derived -- a full body rewrite is required instead), routing to
+# contract_update would keep re-issuing a no-progress patch-plan mutation
+# against the same Issue body / anchor comment. This router instead routes
+# to issue_editor_required (reason_code:
+# approved_scope_requires_full_contract_rewrite) so the full-body-rewrite
+# path (issue-editor skill) is used, and de-dupes both the no-progress
+# contract_update retry (AC2) and the scope-reframe comment post (AC3) via
+# a stable empty_operations_fingerprint.
+
+
+@dataclass
+class SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1:
+    """
+    Input state for decide_scope_reframe_contract_route().
+
+    Fields:
+        scope_delta_status: Status string from SCOPE_DELTA_AUTHORITY_V1 /
+            scope_signal_guard_decision_v2 (e.g. "approved_by_trusted_anchor").
+
+        allowed_path_deltas: The Allowed Paths delta list attached to the
+            approved scope reframe. Non-empty means the reframe expanded /
+            constrained the Allowed Paths in a way that requires a contract
+            update route (as opposed to a no-op replay).
+
+        operations: The CONTRACT_PATCH_PLAN_V1 operations[] list derived by
+            scope_signal_delta.derive_contract_patch_operations(). Empty
+            means no section-bound append operation could be derived and a
+            full body rewrite is required.
+
+        anchor_comment_url: The trusted anchor comment URL that approved the
+            scope reframe. Part of the no-progress / duplicate-comment
+            fingerprint identity.
+
+        issue_body_sha256: SHA256 of the current Issue body. Part of the
+            fingerprint identity so a fresh body edit invalidates prior
+            no-progress / duplicate-comment suppression.
+
+        previous_empty_operations_fingerprints: History of
+            empty_operations_fingerprint values already observed for this
+            anchor/body-sha combination (AC2 no-progress retry detection).
+
+        posted_scope_reframe_comment_fingerprints: History of
+            empty_operations_fingerprint values for which a scope-reframe
+            comment has already been posted to the Issue (AC3 duplicate
+            comment prevention).
+    """
+
+    scope_delta_status: str
+    allowed_path_deltas: list = field(default_factory=list)
+    operations: list = field(default_factory=list)
+    anchor_comment_url: Optional[str] = None
+    issue_body_sha256: Optional[str] = None
+    previous_empty_operations_fingerprints: list = field(default_factory=list)
+    posted_scope_reframe_comment_fingerprints: list = field(default_factory=list)
+
+
+@dataclass
+class ScopeReframeRouteResult:
+    """Terminal result from decide_scope_reframe_contract_route()."""
+
+    route: str
+    reason_code: Optional[str]
+    empty_operations_fingerprint: Optional[str]
+    # AC2: True when this exact fingerprint has already been seen -- callers
+    # MUST NOT re-issue a no-progress contract_update command in this case.
+    no_progress_retry_suppressed: bool
+    # AC3: True when a scope-reframe comment with this fingerprint has
+    # already been posted -- callers MUST NOT post a duplicate_comment.
+    duplicate_comment: bool
+    # Convenience echo: False whenever duplicate_comment is True.
+    should_post_comment: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "scope_reframe_route_result/v1",
+            "route": self.route,
+            "reason_code": self.reason_code,
+            "empty_operations_fingerprint": self.empty_operations_fingerprint,
+            "no_progress_retry_suppressed": self.no_progress_retry_suppressed,
+            "duplicate_comment": self.duplicate_comment,
+            "should_post_comment": self.should_post_comment,
+        }
+
+
+_APPROVED_SCOPE_REFRAME_STATUS = "approved_by_trusted_anchor"
+
+
+def compute_empty_operations_fingerprint(
+    anchor_comment_url: Optional[str],
+    issue_body_sha256: Optional[str],
+) -> str:
+    """
+    AC2: Deterministic fingerprint identifying a specific
+    (anchor_comment_url, issue_body_sha256) empty-operations occurrence.
+
+    Two invocations with the same anchor comment and the same Issue body
+    SHA256 always produce the same fingerprint, so a re-run of the loop
+    against an unchanged Issue body/anchor can be recognized as a
+    no-progress retry (AC2) and its scope-reframe comment recognized as a
+    duplicate (AC3) rather than posted again.
+    """
+    payload = json.dumps(
+        {
+            "anchor_comment_url": anchor_comment_url,
+            "issue_body_sha256": issue_body_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    import hashlib
+
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def decide_scope_reframe_contract_route(
+    state: SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1,
+) -> ScopeReframeRouteResult:
+    """
+    AC1: route an approved scope reframe with empty operations[] to
+    issue_editor_required instead of contract_update.
+
+    An approved scope reframe is defined as
+    scope_delta_status == "approved_by_trusted_anchor" AND a non-empty
+    allowed_path_deltas. When operations[] is also empty (no section-bound
+    patch plan could be derived), a full body rewrite is required and this
+    function returns ROUTE_ISSUE_EDITOR_REQUIRED with reason_code
+    approved_scope_requires_full_contract_rewrite (AC1).
+
+    AC2: the returned empty_operations_fingerprint is stable for a given
+    (anchor_comment_url, issue_body_sha256) pair. When that fingerprint is
+    already present in previous_empty_operations_fingerprints,
+    no_progress_retry_suppressed is True -- callers must NOT re-issue a
+    no-progress contract_update command for this occurrence.
+
+    AC3: when that same fingerprint is already present in
+    posted_scope_reframe_comment_fingerprints, duplicate_comment is True and
+    should_post_comment is False -- callers must NOT post the same
+    scope-reframe comment again.
+
+    In every other case (not an approved scope reframe, or operations[] is
+    non-empty), this function returns ROUTE_CONTRACT_UPDATE with
+    reason_code None -- the normal section-bound patch-plan path is
+    unaffected (#1877's existing implementation is preserved).
+    """
+    is_approved_scope_reframe = (
+        state.scope_delta_status == _APPROVED_SCOPE_REFRAME_STATUS
+        and bool(state.allowed_path_deltas)
+    )
+    empty_operations = not state.operations
+
+    if not (is_approved_scope_reframe and empty_operations):
+        return ScopeReframeRouteResult(
+            route=ROUTE_CONTRACT_UPDATE,
+            reason_code=None,
+            empty_operations_fingerprint=None,
+            no_progress_retry_suppressed=False,
+            duplicate_comment=False,
+            should_post_comment=False,
+        )
+
+    empty_operations_fingerprint = compute_empty_operations_fingerprint(
+        state.anchor_comment_url, state.issue_body_sha256
+    )
+    no_progress_retry_suppressed = (
+        empty_operations_fingerprint in state.previous_empty_operations_fingerprints
+    )
+    duplicate_comment = (
+        empty_operations_fingerprint in state.posted_scope_reframe_comment_fingerprints
+    )
+
+    return ScopeReframeRouteResult(
+        route=ROUTE_ISSUE_EDITOR_REQUIRED,
+        reason_code=REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE,
+        empty_operations_fingerprint=empty_operations_fingerprint,
+        no_progress_retry_suppressed=no_progress_retry_suppressed,
+        duplicate_comment=duplicate_comment,
+        should_post_comment=not duplicate_comment,
     )
 
 
