@@ -3527,8 +3527,15 @@ def _build_agy_grounded_research_metadata(
        only and is never treated as a WebSearch tool-call execution proof on its own —
        see Issue #1266 Blocker 1).
     4. Tool-call trace present but no citation -> agy_web_grounding_no_citations.
-    5. Tool-call trace + citation -> grounded (bounded to 1 citation / 1 tool call per the
-       1 query / 1 URL quota contract).
+    5. Citation evidence recovered but NOT corroborated by a validated
+       `agy_tool_provenance_v1` hook event (stdout self-report / custom
+       marker JSON alone) -> agy_web_grounding_hook_corroboration_missing
+       (Issue #2038 fix_delta iteration 2: model-generated `tool_calls` /
+       `sources` JSON is never, on its own, sufficient evidence of a real
+       tool execution -- see OWNER gate 4).
+    6. Citation evidence + a validated hook event corroborating the tool
+       call -> grounded (every recovered source is retained; Issue #2038
+       AC2 removed the earlier 1-citation truncation).
 
     Issue #1768: a *validated* `agy_tool_provenance_v1` hook event (see
     `_hook_events_confirm_web_tool_call()`) is now an authoritative, additional source of
@@ -3539,6 +3546,12 @@ def _build_agy_grounded_research_metadata(
     `attempted_no_web_tool_call` even though the tool call genuinely happened and a
     validated hook event proved it. Hallucination cases (no validated hook event, stdout-
     only claims) remain fail-closed and unaffected by this change.
+
+    Issue #2038 fix_delta (iteration 2): a validated hook event is required
+    to reach `grounding_status == "grounded"` in this legacy path -- stdout
+    self-report tool-call/citation JSON contributes to `tool_call_confirmed`
+    (item 3 above) and to citation *extraction*, but by itself can never
+    resolve to "grounded" (see the `hook_validated` gate below).
     """
     stdout = stdout or ""
     # Issue #2038 AC3: the validated hook tool-call names (previously
@@ -3651,10 +3664,37 @@ def _build_agy_grounded_research_metadata(
     if search_query_count is None:
         search_query_count = web_tool_call_count
 
-    if url_citation_count > 0:
+    if url_citation_count > 0 and hook_validated:
         grounding_status = "grounded"
         grounding_backend = "agy_native_websearch"
         grounding_failure_class = None
+    elif url_citation_count > 0:
+        # Issue #2038 fix_delta (iteration 2, P0
+        # ac4_unenforced_in_default_production_path): citation evidence
+        # recovered ONLY from AGY's own stdout self-report (a
+        # model-generated `tool_calls`/`sources` JSON blob, or a legacy
+        # custom marker) is never, on its own, sufficient to resolve
+        # grounding_status "grounded" -- that is exactly the
+        # false-grounding anti-pattern the OWNER's gate 4 ("custom marker
+        # や model-generated tool_calls / sources だけでは grounded に
+        # ならない") and this Issue's AC4 target. A validated
+        # `agy_tool_provenance_v1` hook event (`hook_validated`, see
+        # `_hook_events_confirm_web_tool_call()`) is now the REQUIRED
+        # corroboration this legacy path also enforces before trusting any
+        # marker/JSON-derived citation claim -- mirroring the existing
+        # hook-event-is-authoritative design already proven for the
+        # vertex-URL citation route (see
+        # `test_validated_hook_event_with_real_grounding_citation_url_is_grounded`).
+        # `_fail_closed()` always zeroes citation_evidence /
+        # url_citation_count / web_tool_call_count, so the unverified
+        # self-reported citation never leaks through as trusted evidence
+        # (AC5's fail-closed citation trust policy is not weakened).
+        return _fail_closed(
+            grounding_status="attempted_unverified_self_report",
+            grounding_backend="none",
+            grounding_failure_class="agy_web_grounding_hook_corroboration_missing",
+            parsed_evidence=parsed or None,
+        )
     else:
         grounding_status = "attempted_no_citations"
         grounding_backend = "agy_native_websearch"

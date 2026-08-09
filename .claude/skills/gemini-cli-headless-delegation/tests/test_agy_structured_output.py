@@ -109,6 +109,40 @@ def _hook_events_none() -> list[dict[str, Any]]:
     return []
 
 
+def _valid_hook_event(tool_name: str = "search_web") -> dict[str, Any]:
+    """A validated `agy_tool_provenance_v1` PreToolUse hook event fixture
+    (Issue #2038 fix_delta iteration 2): the legacy stdout/marker parser now
+    requires this corroboration before resolving `grounding_status ==
+    "grounded"` -- mirrors `test_agy_provenance_grounding_wiring.py`'s
+    `_valid_hook_event()` fixture shape."""
+    import hashlib
+
+    return {
+        "schema": "agy_tool_provenance_v1",
+        "version": 1,
+        "event": "PreToolUse",
+        "toolCall": {
+            "name": tool_name,
+            "args_sha256": hashlib.sha256(b'{"query":"test"}').hexdigest(),
+        },
+        "stepIdx": 1,
+        "conversationId": "conv-2038-fix-delta-test",
+        "transcript_path_ref": "sha256:" + hashlib.sha256(b"/redacted/transcript.jsonl").hexdigest(),
+        "transcript_sha256": hashlib.sha256(b"transcript-body").hexdigest(),
+        "parent_run_id": "",
+        "subtask_id": "",
+        "attempt_id": "",
+        "provider": "agy",
+        "tool_profile": "grounded_research",
+        "monotonic_ns": 1,
+        "utc": "2026-08-09T00:00:00.000000Z",
+    }
+
+
+def _valid_hook_events(tool_name: str = "search_web") -> list[dict[str, Any]]:
+    return [_valid_hook_event(tool_name=tool_name)]
+
+
 def test_citation_evidence_cardinality_not_truncated_to_one() -> None:
     """GIVEN structured AGY stdout evidence with 3 distinct sources and a recognized tool-call trace
     WHEN _build_agy_grounded_research_metadata() builds grounding metadata
@@ -123,7 +157,7 @@ def test_citation_evidence_cardinality_not_truncated_to_one() -> None:
         '{"url": "https://example.com/c", "title": "C"}'
         "]}"
     )
-    result = rgh._build_agy_grounded_research_metadata(stdout, hook_events=_hook_events_none())
+    result = rgh._build_agy_grounded_research_metadata(stdout, hook_events=_valid_hook_events())
     assert result["grounding_status"] == "grounded"
     assert result["url_citation_count"] == 3
     assert len(result["citation_evidence"]) == 3
@@ -137,7 +171,7 @@ def test_citation_evidence_single_source_still_grounded() -> None:
     THEN url_citation_count is 1 and grounding_status is "grounded" (no regression from the AC2 change).
     """
     stdout = 'AGY_GROUNDED_RESEARCH:{"tool_calls": [{"name": "web_search"}], "sources": [{"url": "https://example.com/only"}]}'
-    result = rgh._build_agy_grounded_research_metadata(stdout, hook_events=_hook_events_none())
+    result = rgh._build_agy_grounded_research_metadata(stdout, hook_events=_valid_hook_events())
     assert result["url_citation_count"] == 1
     assert result["grounding_status"] == "grounded"
 
@@ -159,7 +193,7 @@ def test_tool_call_count_reflects_actual_invocations() -> None:
         '{"name": "read_url"}, {"name": "web_search"}], '
         '"sources": [{"url": "https://example.com/a"}]}'
     )
-    result = rgh._build_agy_grounded_research_metadata(stdout, hook_events=_hook_events_none())
+    result = rgh._build_agy_grounded_research_metadata(stdout, hook_events=_valid_hook_events())
     assert result["web_tool_call_count"] == 4
     assert result["search_query_count"] == 4
 
@@ -176,7 +210,7 @@ def test_search_query_count_uses_explicit_structured_queries_when_present() -> N
         '"queries": ["first query", "second query"], '
         '"sources": [{"url": "https://example.com/a"}]}'
     )
-    result = rgh._build_agy_grounded_research_metadata(stdout, hook_events=_hook_events_none())
+    result = rgh._build_agy_grounded_research_metadata(stdout, hook_events=_valid_hook_events())
     assert result["web_tool_call_count"] == 1
     assert result["search_query_count"] == 2
 
@@ -188,7 +222,7 @@ def test_tool_call_count_single_call_is_not_a_hardcoded_constant() -> None:
     now that the value is measured rather than hardcoded (regression guard for AC3).
     """
     stdout = 'AGY_GROUNDED_RESEARCH:{"tool_calls": [{"name": "web_search"}], "sources": [{"url": "https://example.com/a"}]}'
-    result = rgh._build_agy_grounded_research_metadata(stdout, hook_events=_hook_events_none())
+    result = rgh._build_agy_grounded_research_metadata(stdout, hook_events=_valid_hook_events())
     assert result["web_tool_call_count"] == 1
     assert result["search_query_count"] == 1
 
@@ -404,7 +438,12 @@ def test_run_agy_supported_capability_end_to_end_uses_structured_parser() -> Non
 # reachable specifically via the structured route -- see
 # test_structured_output_capability_unavailable_returns_fail_closed above
 # and the malformed-stream regression test below -- not by making
-# grounded_research universally non-functional by default).
+# grounded_research universally non-functional by default). fix_delta
+# iteration 2: "functional via the legacy route" now also requires a
+# validated `agy_tool_provenance_v1` hook event to actually reach
+# grounding_status "grounded" -- see
+# test_run_agy_non_supported_capability_end_to_end_legacy_semantics_regression_proof
+# and its companion _grounded_with_hook_corroboration test below.
 def test_run_agy_non_supported_capability_argv_never_gets_output_format() -> None:
     """fix_delta P0-1(b) (adapted -- see module docstring note below for
     rationale): a "unsupported" capability status means the real argv is
@@ -438,13 +477,24 @@ def test_run_agy_non_supported_capability_argv_never_gets_output_format() -> Non
 
 
 def test_run_agy_non_supported_capability_end_to_end_legacy_semantics_regression_proof() -> None:
-    """fix_delta P0-1(b) (adapted): end-to-end through run_delegation(),
-    grounded_research + non-supported capability still resolves via the
-    UNCHANGED legacy text-marker parser -- exactly the same evidence shape
-    test_agy_provider.py::test_ac7_agy_grounded_research_supported already
-    pins down -- proving this fix_delta did not regress the common (no
-    same-binary structured-output confirmation available) case into an
-    always-fail-closed capability_unavailable no-op."""
+    """fix_delta P0 iteration 2 (ac4_unenforced_in_default_production_path):
+    end-to-end through run_delegation(), grounded_research + non-supported
+    capability (the realistic DEFAULT production configuration -- no
+    AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST opt-in, current AGY resolves to
+    "inconclusive" not "supported") routes through the legacy text/marker
+    parser exactly as before -- but a bare model-generated `tool_calls` /
+    `sources` JSON blob in stdout, with NO corroborating validated
+    `agy_tool_provenance_v1` hook event, must now resolve fail-closed
+    instead of "grounded". This is the exact false-grounding anti-pattern
+    the pr-reviewer flagged (this test previously asserted the UNSAFE
+    "grounded" outcome for this same fixture -- see git history) and OWNER
+    gate 4 ("custom marker や model-generated tool_calls / sources だけでは
+    grounded にならない") targets. The route stays reachable and functional
+    (`ok is False` here is a genuine fail-closed *evidence* verdict, not a
+    hard error) -- see the companion
+    test_run_agy_non_supported_capability_end_to_end_legacy_semantics_grounded_with_hook_corroboration
+    below for proof that real, hook-corroborated grounding still works via
+    this same legacy route."""
     grounded_output = (
         "Response from AGY.\n"
         '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
@@ -473,11 +523,46 @@ def test_run_agy_non_supported_capability_end_to_end_legacy_semantics_regression
                 }
             )
 
-    assert result["ok"] is True
+    evidence = result["grounded_research_evidence"]
+    # fix_delta iteration 2: model-generated stdout JSON alone (no hook
+    # corroboration -- this end-to-end flow's mocked subprocess never wrote
+    # a real hook_events.jsonl) must never resolve to "grounded".
+    assert evidence["grounding_status"] != "grounded"
+    assert evidence["grounding_failure_class"] == "agy_web_grounding_hook_corroboration_missing"
+    assert evidence["url_citation_count"] == 0
+    assert evidence["citation_evidence"] == []
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_web_grounding_hook_corroboration_missing"
+
+
+def test_run_agy_non_supported_capability_end_to_end_legacy_semantics_grounded_with_hook_corroboration() -> None:
+    """Companion to the regression-proof test above: the SAME legacy stdout
+    self-report evidence, when corroborated by a validated
+    `agy_tool_provenance_v1` hook event, still resolves to "grounded" via
+    the unchanged legacy backend/route -- proving fix_delta iteration 2 did
+    not regress grounded_research into an always-fail-closed no-op for the
+    common non-supported-capability case; it only closes the
+    hook-corroboration gap."""
+    grounded_output = (
+        "Response from AGY.\n"
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
+        '"tool_calls":[{"name":"web_search"}]}'
+    )
+    completed = subprocess.CompletedProcess(
+        args=["agy", "-p", "x"], returncode=0, stdout=grounded_output, stderr=""
+    )
+    completed.agy_structured_output_used = False  # type: ignore[attr-defined]
+    completed.agy_structured_output_capability_record = _unsupported_capability_record()  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_events = _valid_hook_events()  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
+
+    result = rgh._normalize_agy_result(completed, tool_profile="grounded_research", requested_model=None)
+
     evidence = result["grounded_research_evidence"]
     assert evidence["grounding_backend"] == "agy_native_websearch"
     assert evidence["grounding_status"] == "grounded"
     assert evidence["url_citation_count"] == 1
+    assert result["ok"] is True
 
 
 # (c) all other profiles -> unchanged legacy text argv/stdout semantics.

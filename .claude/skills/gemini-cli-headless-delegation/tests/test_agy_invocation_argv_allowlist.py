@@ -56,6 +56,38 @@ def _make_completed(returncode: int, stdout: str = "", stderr: str = "") -> subp
     return subprocess.CompletedProcess(args=["agy", "-p", "test"], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _write_valid_hook_event_for_subprocess_env(kwargs: dict[str, Any], tool_name: str = "search_web") -> None:
+    """Append a validated `agy_tool_provenance_v1` PreToolUse hook event line
+    to the isolated-workspace hook events log file that this real
+    `_run_agy()` invocation's `env` points at (Issue #2038 fix_delta
+    iteration 2: the legacy stdout/marker parser now requires this
+    corroboration before resolving `grounding_status == "grounded"`) --
+    mirrors test_agy_provider.py's helper of the same name."""
+    import hashlib
+    import json
+
+    env = kwargs.get("env") or {}
+    hook_log_path = env.get("AGY_PROVENANCE_HOOK_LOG_PATH")
+    if not hook_log_path:
+        return
+    path = Path(hook_log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "schema": "agy_tool_provenance_v1",
+        "version": 1,
+        "event": "PreToolUse",
+        "toolCall": {
+            "name": tool_name,
+            "args_sha256": hashlib.sha256(b'{"query":"test"}').hexdigest(),
+        },
+        "conversationId": "conv-2038-fix-delta-test",
+        "monotonic_ns": 1,
+        "utc": "2026-08-09T00:00:00.000000Z",
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event) + "\n")
+
+
 def _agy_request(**kwargs: Any) -> dict[str, Any]:
     """Return a minimal valid agy delegation request (mirrors
     test_agy_provider.py's helper of the same name)."""
@@ -336,6 +368,10 @@ def test_run_agy_raw_command_reflects_selected_model_end_to_end() -> None:
 
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
         captured_cmd["value"] = list(cmd)
+        # Issue #2038 fix_delta iteration 2: a validated hook event is now
+        # required to reach grounding_status "grounded" via this real
+        # _run_agy() -> subprocess.run() path.
+        _write_valid_hook_event_for_subprocess_env(kwargs)
         return _make_completed(0, stdout=grounded_output)
 
     with patch("subprocess.run", side_effect=mock_run):
