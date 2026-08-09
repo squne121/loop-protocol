@@ -15,7 +15,7 @@
 
 このテストは以下の 3 段の real subprocess chain を駆動する:
 
-```
+```text
 test (_run_real_executor)
   -> skill_runtime_exec.py --command-id preflight.run.fixture   (outer subprocess)
        -> uv run python3 run_refinement_preflight.py ...        (preflight subprocess)
