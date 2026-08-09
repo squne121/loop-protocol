@@ -464,6 +464,13 @@ def generate_authority_transport_manifest(
     }
     manifest_dir = _authority_transport_dir(repo_root, issue_number, invocation_id)
     manifest_path = manifest_dir / "scope_delta_authority_transport_v1.json"
+    # #2053 P1 fix-delta (iteration 2, OWNER PR review): true immutability,
+    # not just os.replace() pathing -- re-running the producer with the SAME
+    # invocation_id must refuse to overwrite the artifact it already wrote,
+    # rather than silently replacing it. A caller must mint a fresh
+    # invocation_id to get a fresh manifest.
+    if manifest_path.exists():
+        return None, "manifest_already_exists"
     ok, _readback, error = _atomic_write_json_with_readback(manifest_path, manifest)
     if not ok:
         return None, error
@@ -634,6 +641,13 @@ def consume_authority_transport(
     # Paths reach) -- CONTRACT_PATCH_PLAN_V1 application remains the
     # existing --consume-contract-patch-plan lane's responsibility.
     consumed_path = invocation_dir / "consumed_authority_payload_v1.json"
+    # #2053 P1 fix-delta (iteration 2, OWNER PR review): bind the
+    # transaction/idempotency state BEFORE mutation, not just via
+    # post-mutation receipt presence -- a leftover consumed-payload artifact
+    # from a crashed prior run of this SAME invocation_id (receipt never
+    # published) must never be silently overwritten/re-applied.
+    if consumed_path.exists():
+        return _receipt(status="environment_failure", reason_code="stale_previous_invocation")
     consumed_record = {
         "schema_version": "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1_CONSUMED",
         "invocation_id": invocation_id,

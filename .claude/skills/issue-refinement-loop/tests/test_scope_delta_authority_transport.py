@@ -513,6 +513,111 @@ def test_consumer_rejects_wrong_repo_manifest(tmp_path):
     assert receipt["mutation_applied"] is False
 
 
+def test_producer_refuses_to_overwrite_existing_manifest_same_invocation_id(tmp_path):
+    """#2053 P1 fix-delta (iteration 2, OWNER PR review): true immutability
+    -- re-running the producer with the SAME invocation_id must refuse to
+    overwrite the manifest it already wrote (per-invocation-directory
+    naming alone is not immutability; os.replace() would happily replace an
+    existing destination).
+    """
+    import run_refinement_preflight as preflight
+
+    fixture_path = _evidence_fixture(tmp_path, comment_id=101)
+    evidence = json.loads(fixture_path.read_text(encoding="utf-8"))
+    invocation_id = "producer-immutability-1"
+
+    first, error = preflight.generate_authority_transport_manifest(
+        evidence=evidence,
+        issue_number=2053,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha="cafebabe",
+        repo_root=REPO_ROOT,
+    )
+    assert error is None
+    assert first is not None
+
+    second, error2 = preflight.generate_authority_transport_manifest(
+        evidence=evidence,
+        issue_number=2053,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha="cafebabe",
+        repo_root=REPO_ROOT,
+    )
+    assert second is None
+    assert error2 == "manifest_already_exists"
+
+
+def test_consumer_refuses_to_re_mutate_leftover_consumed_payload_without_receipt(tmp_path):
+    """#2053 P1 fix-delta (iteration 2, OWNER PR review): idempotency state
+    must be bound BEFORE mutation, not just via post-mutation receipt
+    presence. GIVEN a consumed_authority_payload_v1.json already exists for
+    this invocation_id (simulating a crash between the mutation write and
+    the receipt publish) but NO consumption receipt exists yet, THEN the
+    consumer refuses to re-mutate rather than silently re-applying.
+    """
+    import run_refinement_preflight as preflight
+
+    issue_number = 2053
+    invocation_id = "consumer-bind-before-mutation-1"
+    git_head_sha = "deadbeef"
+    invocation_dir = _issue_artifact_dir(issue_number, invocation_id)
+    invocation_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1",
+        "invocation_id": invocation_id,
+        "issue_number": issue_number,
+        "repo": REPO,
+        "git_head_sha": git_head_sha,
+        "generated_at": "2026-08-09T00:00:00Z",
+        "canonicalization_id": "loop-protocol-json-c14n-v1",
+        "source_comment_id": 1,
+        "source_comment_url": None,
+        "source_issue_body_sha256": "sha256:deadbeef",
+        "source_kind": "issue_comment",
+        "payload": {"a": 1},
+    }
+    manifest["payload_sha256"] = preflight._sha256(preflight._canonical_json(manifest["payload"]))
+    manifest_path = invocation_dir / "scope_delta_authority_transport_v1.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    router_receipt = {
+        "schema_version": "SCOPE_DELTA_ROUTER_RECEIPT_V1",
+        "invocation_id": invocation_id,
+        "issue_number": issue_number,
+        "git_head_sha": git_head_sha,
+        "generated_at": "2026-08-09T00:00:01Z",
+        "transport_manifest_path": str(manifest_path),
+        "transport_payload_sha256": manifest["payload_sha256"],
+        "recomputed_payload_sha256": manifest["payload_sha256"],
+        "status": "ok",
+        "reason_code": None,
+    }
+    router_receipt_path = invocation_dir / "scope_delta_router_receipt_v1.json"
+    router_receipt_path.write_text(json.dumps(router_receipt), encoding="utf-8")
+
+    # Simulate a crash: the mutation write happened, but the receipt was
+    # never published.
+    (invocation_dir / "consumed_authority_payload_v1.json").write_text(
+        json.dumps({"schema_version": "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1_CONSUMED"}),
+        encoding="utf-8",
+    )
+
+    receipt = preflight.consume_authority_transport(
+        router_receipt_path=str(router_receipt_path),
+        issue_number=issue_number,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=REPO_ROOT,
+    )
+    assert receipt["status"] == "environment_failure"
+    assert receipt["reason_code"] == "stale_previous_invocation"
+    assert receipt["mutation_applied"] is False
+
+
 def test_stale_previous_invocation_sidecar_is_never_reused(tmp_path):
     """GIVEN a consumption receipt already exists for an invocation_id
     WHEN the consumer is invoked again for the same invocation_id
