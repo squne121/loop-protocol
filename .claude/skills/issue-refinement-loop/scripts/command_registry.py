@@ -441,6 +441,29 @@ REGISTRY: dict[str, dict[str, Any]] = {
     # SCOPE_DELTA_ROUTER_RECEIPT_V1, mutates (writes the consumed payload)
     # exactly once, reads back, performs a fresh rerun, and emits
     # SCOPE_DELTA_CONSUMPTION_RECEIPT_V1.
+    #
+    # Fresh review blocker P0-A fix: `--contract-patch-plan-file` /
+    # `--anchor-context-file` are canonical optional placeholders so a
+    # registry-rendered argv can actually carry a CONTRACT_PATCH_PLAN_V1 +
+    # anchor context all the way to `run_refinement_preflight.py`'s
+    # `--consume-authority-transport` CLI branch, which (only when both
+    # files are supplied) delegates the mutation step to the real
+    # controlled-mutation lane (`consume_trusted_anchor_contract_patch_plan()`
+    # -> `edit_issue_txn.py`) instead of merely writing the local audit
+    # artifact. Without these two placeholders the registry entry could
+    # never render an argv that reaches that lane at all -- callers were
+    # structurally confined to the local-artifact-only path regardless of
+    # what the Python-level function signature supports.
+    #
+    # `network_effect` fix: this command is `mutation: True` and, when the
+    # two optional files above are supplied, its default (non-fixture)
+    # execution path genuinely performs a real GitHub issue mutation via
+    # `edit_issue_txn.py`'s `gh` subprocess calls -- it is not confined to
+    # local-only filesystem effects in that shape. `github_mutation`
+    # reflects that; the previous `local_only` classification was accurate
+    # only for the local-artifact-only shape (no patch plan / anchor
+    # context supplied) and was therefore a misclassification for the
+    # general command_id.
     "authority_transport.consume": {
         "id": "authority_transport.consume",
         "argv": [
@@ -451,6 +474,8 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "--invocation-id", "{invocation_id}",
             "--git-head-sha", "{git_head_sha}",
             "--consume-authority-transport", "{router_receipt_path}",
+            "--contract-patch-plan-file", "{contract_patch_plan_file}",
+            "--anchor-context-file", "{anchor_context_file}",
         ],
         "shell": False,
         "cwd_policy": "repo_root",
@@ -459,7 +484,7 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "allowed_write_roots": [
             ".claude/artifacts/issue-refinement-loop/{issue_number}/authority-transport/{invocation_id}/"
         ],
-        "network_effect": "local_only",
+        "network_effect": "github_mutation",
         "stdin_contract": "none",
         "stdout_contract": "scope_delta_consumption_receipt/v1",
         "timeout_seconds": 60,
@@ -470,6 +495,8 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "invocation_id": {"type": "string", "required": True},
             "git_head_sha": {"type": "string", "required": True},
             "router_receipt_path": {"type": "path", "required": True},
+            "contract_patch_plan_file": {"type": "path", "required": False, "optional_flag_pair": True},
+            "anchor_context_file": {"type": "path", "required": False, "optional_flag_pair": True},
         },
     },
     "gh.issue.view": {

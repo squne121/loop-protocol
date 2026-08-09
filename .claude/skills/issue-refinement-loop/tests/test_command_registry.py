@@ -449,3 +449,314 @@ class TestAuthorityTransportCommandIdsRegisteredInRuntimePolicy:
             f"{policy_entry['execution_class']!r} does not match "
             f"command_registry.py execution_class {registry_entry['execution_class']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fresh review blocker P0-A: authority_transport.consume must carry
+# --contract-patch-plan-file / --anchor-context-file, and its network_effect
+# must reflect the real GitHub mutation the delegated lane performs.
+# ---------------------------------------------------------------------------
+
+
+class TestAuthorityTransportConsumeContractPatchPlanPlaceholders:
+    """Fresh review blocker P0-A: without these two placeholders,
+    render_command("authority_transport.consume", ...) could never produce
+    an argv carrying a CONTRACT_PATCH_PLAN_V1 / anchor context to
+    run_refinement_preflight.py's --consume-authority-transport CLI branch,
+    so the real controlled-mutation lane (consume_trusted_anchor_contract_patch_plan
+    -> edit_issue_txn.py) was structurally unreachable via the registry.
+    """
+
+    _BASE_PARAMS = {
+        "issue_number": 2053,
+        "repo": "squne121/loop-protocol",
+        "invocation_id": "p0a-test-1",
+        "git_head_sha": "abc123def456abc123def456abc123def456abc",
+        "router_receipt_path": "/tmp/router_receipt.json",
+    }
+
+    def test_placeholders_declared(self):
+        entry = reg.REGISTRY["authority_transport.consume"]
+        assert "contract_patch_plan_file" in entry["placeholders"]
+        assert "anchor_context_file" in entry["placeholders"]
+
+    def test_render_without_files_is_byte_identical_to_pre_p0a_shape(self):
+        """Omitting the two optional files renders the exact same argv as
+        before this fix -- existing callers are unaffected."""
+        argv = reg.render_command("authority_transport.consume", self._BASE_PARAMS)
+        assert "--contract-patch-plan-file" not in argv
+        assert "--anchor-context-file" not in argv
+        assert argv == [
+            "uv", "run", "python3",
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            "--issue-number", "2053",
+            "--repo", "squne121/loop-protocol",
+            "--invocation-id", "p0a-test-1",
+            "--git-head-sha", "abc123def456abc123def456abc123def456abc",
+            "--consume-authority-transport", "/tmp/router_receipt.json",
+        ]
+
+    def test_render_with_files_carries_both_flags(self):
+        """Supplying both files renders an argv that genuinely carries them
+        through to run_refinement_preflight.py's CLI."""
+        params = {
+            **self._BASE_PARAMS,
+            "contract_patch_plan_file": "/tmp/patch_plan.json",
+            "anchor_context_file": "/tmp/anchor_context.json",
+        }
+        argv = reg.render_command("authority_transport.consume", params)
+        assert "--contract-patch-plan-file" in argv
+        assert "/tmp/patch_plan.json" in argv
+        assert "--anchor-context-file" in argv
+        assert "/tmp/anchor_context.json" in argv
+        # Flags must be adjacent to their values (canonical argv shape, no
+        # shell join / reordering).
+        cp_idx = argv.index("--contract-patch-plan-file")
+        assert argv[cp_idx + 1] == "/tmp/patch_plan.json"
+        ac_idx = argv.index("--anchor-context-file")
+        assert argv[ac_idx + 1] == "/tmp/anchor_context.json"
+
+    def test_network_effect_is_github_mutation_not_local_only(self):
+        """Fresh review blocker P0-A: this command's default execution path
+        (when contract_patch_plan_file/anchor_context_file are supplied)
+        performs a real GitHub issue mutation via edit_issue_txn.py's gh
+        subprocess calls -- it must not be misclassified as local_only."""
+        entry = reg.REGISTRY["authority_transport.consume"]
+        assert entry["network_effect"] == "github_mutation"
+
+    def test_network_effect_matches_runtime_policy(self):
+        """command_registry.py and skill_runtime_command_policy.py must
+        declare the identical network_effect for this command_id (mirrors
+        the existing execution_class parity check)."""
+        policy = _load_skill_runtime_command_policy()
+        eligible = policy.SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]
+        registry_entry = reg.REGISTRY["authority_transport.consume"]
+        policy_entry = eligible["authority_transport.consume"]
+        assert policy_entry["network_effect"] == registry_entry["network_effect"]
+
+
+class TestAuthorityTransportConsumeRealSubprocessReachesRealLane:
+    """Fresh review blocker P0-A: prove -- with a REAL subprocess invocation
+    of run_refinement_preflight.py using registry-rendered argv (not a
+    direct in-process Python function call) -- that
+    --contract-patch-plan-file / --anchor-context-file genuinely reach
+    consume_trusted_anchor_contract_patch_plan()'s real (non-fixture,
+    non-injectable-via-CLI) code path.
+
+    A nonexistent issue number is used so the real path fails closed at the
+    first genuine `gh issue view` read (proving the real, non-fixture lane
+    was reached -- `callbacks` cannot be carried through a JSON file, so a
+    CLI invocation can never inject a fixture callback) before any mutation
+    could occur. This never performs a GitHub mutation.
+    """
+
+    def test_real_subprocess_reaches_real_contract_patch_plan_consumer_lane(self, tmp_path):
+        import shutil as _shutil
+
+        skill_root = Path(__file__).resolve().parent.parent
+        repo_root = skill_root.parent.parent.parent
+        scripts_dir = skill_root / "scripts"
+        sys.path.insert(0, str(scripts_dir))
+        import run_refinement_preflight as preflight  # noqa: PLC0415
+        import decide_next_loop_action as router  # noqa: PLC0415
+
+        repo = "squne121/loop-protocol"
+        # Guaranteed not to exist -- the real fetch_current() must fail
+        # closed with a read (never write) gh call before any mutation
+        # could be attempted.
+        issue_number = 999999999
+        invocation_id = "p0a-real-subprocess-1"
+        git_head_sha = "abc123def456abc123def456abc123def456abc"
+
+        artifact_dir = (
+            repo_root / ".claude" / "artifacts" / "issue-refinement-loop"
+            / str(issue_number) / "authority-transport" / invocation_id
+        )
+        try:
+            evidence = {
+                "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
+                "source_kind": "issue_comment",
+                "source_ref": f"https://github.com/{repo}/issues/{issue_number}#issuecomment-1",
+                "source_issue_number": issue_number,
+                "comment_id": 1,
+                "comment_url": f"https://github.com/{repo}/issues/{issue_number}#issuecomment-1",
+                "issue_url": f"https://github.com/{repo}/issues/{issue_number}",
+                "body_sha256": "sha256:p0a",
+                "author_login": "owner",
+                "author_type": "User",
+                "author_association": "OWNER",
+                "captured_at": "2026-08-09T00:00:00Z",
+                "directive_markers": ["revised acceptance criteria"],
+                "extracted_directives": ["AC1: p0a directive"],
+                "ambiguity_flags": [],
+                "boundary_flags": [],
+                "confidence": "explicit",
+            }
+            produced, error = preflight.generate_authority_transport_manifest(
+                evidence=evidence,
+                issue_number=issue_number,
+                repo=repo,
+                invocation_id=invocation_id,
+                git_head_sha=git_head_sha,
+                repo_root=repo_root,
+            )
+            assert error is None, error
+
+            router_receipt = router.generate_router_receipt(
+                transport_manifest_path=produced["manifest_path"],
+                issue_number=issue_number,
+                invocation_id=invocation_id,
+                git_head_sha=git_head_sha,
+                authority_expected=True,
+                repo_root=repo_root,
+            )
+            assert router_receipt["status"] == "ok"
+            router_receipt_path = artifact_dir / "scope_delta_router_receipt_v1.json"
+            assert router_receipt_path.exists()
+
+            patch_plan_file = tmp_path / "contract_patch_plan.json"
+            patch_plan_file.write_text(json.dumps({"operations": []}), encoding="utf-8")
+            anchor_context_file = tmp_path / "anchor_context.json"
+            anchor_context_file.write_text(
+                json.dumps(
+                    {
+                        "issue": {"body": "## Acceptance Criteria\n- [ ] AC1: existing\n"},
+                        "anchor_url": f"https://github.com/{repo}/issues/{issue_number}#issuecomment-1",
+                        "anchor_payload": {"id": 1, "author_association": "OWNER"},
+                        "anchor_body": "trusted directive body",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            argv = reg.render_command(
+                "authority_transport.consume",
+                {
+                    "issue_number": issue_number,
+                    "repo": repo,
+                    "invocation_id": invocation_id,
+                    "git_head_sha": git_head_sha,
+                    "router_receipt_path": str(router_receipt_path),
+                    "contract_patch_plan_file": str(patch_plan_file),
+                    "anchor_context_file": str(anchor_context_file),
+                },
+            )
+            assert "--contract-patch-plan-file" in argv
+            assert "--anchor-context-file" in argv
+
+            result = subprocess.run(
+                argv,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            receipt = json.loads(result.stdout)
+            # The real (non-fixture) fetch_current() must have been reached
+            # and failed closed on the nonexistent issue -- proving the
+            # registry-rendered argv genuinely carried both files all the
+            # way to consume_trusted_anchor_contract_patch_plan(), which a
+            # CLI invocation can never bypass via injected callbacks.
+            assert receipt["status"] == "environment_failure"
+            assert receipt["mutation_lane"] == "contract_patch_plan_consumer"
+            assert receipt["mutation_applied"] is False
+            assert "issue_readback_failed" in receipt.get("reason_code", "") or (
+                receipt.get("reason_code") == "contract_patch_plan_consumer_failed"
+            )
+        finally:
+            if artifact_dir.parent.exists():
+                _shutil.rmtree(artifact_dir.parent.parent, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Fresh review blocker P0-B: decide.run / authority_transport.produce /
+# authority_transport.consume must actually pass through
+# skill_runtime_exec.py's privileged executor as a REAL subprocess -- not
+# merely dict-membership / execution_class string parity in
+# skill_runtime_command_policy.py.
+# ---------------------------------------------------------------------------
+
+
+class TestAuthorityTransportPrivilegedExecutorRealSubprocessDispatch:
+    """Fresh review blocker P0-B.
+
+    This is a REAL subprocess invocation of
+    scripts/agent-guards/skill_runtime_exec.py -- the actual privileged
+    executor binary, run against this worktree's own real production code
+    (LOOP_DEFAULT_BRANCH / LOOP_ISSUE_NUMBER env overrides bind it to this
+    worktree's own branch/issue so the canonical-root and active-issue-
+    worktree checks pass against a real git worktree, with no synthetic
+    fixture repo required).
+
+    FINDING (documented, not silently worked around): skill_runtime_exec.py
+    main()'s command dispatch has exactly three shapes -- fixture,
+    anchor/contract_update, and the plain 10-token preflight.run shape.
+    skill_runtime_command_policy.py's parse_exact_skill_runtime_command()
+    only accepts the plain 10-token shape when the command_id's declared
+    execution_class equals SKILL_RUNTIME_EXECUTION_CLASS (preflight.run's
+    class) -- decide.run / authority_transport.produce /
+    authority_transport.consume declare distinct execution classes, so this
+    parser -- by explicit design (see its own docstring) -- rejects them
+    unconditionally. main() also never builds the additional render_params
+    (loop_state_file, verdict, invocation_id, git_head_sha,
+    router_receipt_path, evidence_fixture_path, contract_patch_plan_file,
+    anchor_context_file) these three command_ids' registry entries require.
+
+    These three command_ids are therefore NOT reachable through the
+    privileged executor's real subprocess dispatch today, despite being
+    declared "eligible" in skill_runtime_command_policy.py and registered in
+    command_registry.py. Wiring real dispatch support requires changes to
+    scripts/agent-guards/skill_runtime_exec.py (a new command-shape branch
+    and render_params derivation), which is outside Issue #2053's Allowed
+    Paths -- this is recorded as a Stop Condition scope delta for a
+    follow-up Issue, not silently patched here.
+
+    This test pins the CURRENT (real, subprocess-verified) rejection so a
+    future PR that actually wires dispatch support has a concrete
+    regression signal to update.
+    """
+
+    @pytest.mark.parametrize(
+        "command_id",
+        ["decide.run", "authority_transport.produce", "authority_transport.consume"],
+    )
+    def test_privileged_executor_rejects_command_id_today(self, command_id):
+        skill_root = Path(__file__).resolve().parent.parent
+        repo_root = skill_root.parent.parent.parent
+        current_branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert current_branch, "expected a real checked-out branch for this worktree"
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(repo_root / "scripts" / "agent-guards" / "skill_runtime_exec.py"),
+                "--command-id", command_id,
+                "--issue-number", "2053",
+                "--repo", "squne121/loop-protocol",
+            ],
+            cwd=str(repo_root),
+            env={
+                **__import__("os").environ,
+                "LOOP_DEFAULT_BRANCH": current_branch,
+                "LOOP_ISSUE_NUMBER": "2053",
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 2, (
+            f"{command_id}: expected the privileged executor's real subprocess "
+            f"to reject with exit 2 ('exact command class rejected') today -- "
+            f"got exit {result.returncode}, stdout={result.stdout!r}, "
+            f"stderr={result.stderr!r}. If this now succeeds, the P0-B Stop "
+            f"Condition scope delta has been resolved and this pinned "
+            f"regression test must be updated to assert real dispatch success."
+        )
+        assert "exact command class rejected" in result.stderr
+

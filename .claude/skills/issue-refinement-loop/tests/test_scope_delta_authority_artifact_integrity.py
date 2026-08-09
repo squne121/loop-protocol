@@ -290,3 +290,49 @@ def test_stale_previous_invocation_consumer_environment_failure():
     assert receipt["status"] == "environment_failure"
     assert receipt["reason_code"] == "stale_previous_invocation"
     assert receipt["mutation_applied"] is False
+
+
+# --- concurrent producer (P1-C) -------------------------------------------
+
+
+def test_concurrent_producers_never_overwrite_each_others_manifest():
+    """Fresh review blocker P1-C: the producer's prior immutability guard was
+    `manifest_path.exists()` (check) THEN `_atomic_write_json_with_readback`
+    (act via os.replace()) -- a TOCTOU race. Simulating the exact race
+    window (two concurrent writers that have BOTH already passed the
+    `exists()` pre-check and are now racing inside the atomic writer for the
+    SAME destination path with DIFFERENT payloads), at most one write must
+    succeed and the loser must fail closed (write_failure:already_exists) --
+    the winner's on-disk bytes must never be silently overwritten by the
+    loser's `os.replace()`.
+    """
+    invocation_id = "fault-concurrent-producer-1"
+    manifest_path = _artifact_dir(invocation_id) / "scope_delta_authority_transport_v1.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    first_data = {"schema_version": "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1", "writer": "first"}
+    second_data = {"schema_version": "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1", "writer": "second"}
+
+    first_ok, _first_readback, first_error = preflight._atomic_write_json_with_readback(
+        manifest_path, first_data
+    )
+    second_ok, _second_readback, second_error = preflight._atomic_write_json_with_readback(
+        manifest_path, second_data
+    )
+
+    outcomes = [(first_ok, first_error), (second_ok, second_error)]
+    successes = [ok for ok, _err in outcomes if ok]
+    failures = [err for ok, err in outcomes if not ok]
+
+    assert len(successes) == 1, (
+        f"exactly one of the two concurrent writers must win -- got {outcomes}"
+    )
+    assert len(failures) == 1
+    assert failures[0] == "write_failure:already_exists"
+
+    on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
+    winning_writer = "first" if first_ok else "second"
+    assert on_disk["writer"] == winning_writer, (
+        "the loser's os.replace() must never silently overwrite the "
+        "winner's already-published bytes"
+    )

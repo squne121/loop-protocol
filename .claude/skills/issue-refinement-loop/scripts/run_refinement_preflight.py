@@ -394,26 +394,46 @@ def _confine_artifact_path(path: "Path | None", repo_root: Path) -> "tuple[Path 
 
 
 def _atomic_write_json_with_readback(path: Path, data: dict) -> tuple[bool, "dict | None", "str | None"]:
-    """flush -> fsync -> os.replace, then read back and independently
+    """flush -> fsync -> exclusive-create, then read back and independently
     recompute the canonical digest to verify the bytes on disk match what
     was intended (#2053 AC10). Returns (ok, readback_data, error_reason).
+
+    Fresh review blocker P1-C: every caller of this helper writes a
+    single-invocation, exactly-once, "immutable" artifact guarded by its own
+    prior `path.exists()` check (the producer's manifest, the consumer's
+    consumed-payload record, and the consumer's consumption receipt). A
+    plain `exists()`-check-then-`os.replace()` is a TOCTOU race: two
+    concurrent writers for the SAME path can both pass the `exists()` check
+    before either writes, and `os.replace()` unconditionally overwrites --
+    whichever writer's `os.replace()` runs last silently wins, defeating the
+    "immutable, exactly once" guarantee these callers rely on. This uses
+    `os.link()` for the final publish step instead: `os.link()` atomically
+    fails with `FileExistsError` if the destination already exists (a
+    kernel-level exclusive-create guarantee, not a check-then-act race), so
+    at most one concurrent writer for the same path can ever "win" -- the
+    loser fails closed with `write_failure:already_exists` and writes
+    nothing to `path`.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.parent / f".{path.name}.tmp-{os.getpid()}"
+    tmp_path = path.parent / f".{path.name}.tmp-{os.getpid()}-{id(data)}"
     text = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False, sort_keys=True)
     try:
         with open(tmp_path, "w", encoding="utf-8") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
+        try:
+            os.link(tmp_path, path)
+        except FileExistsError:
+            return False, None, "write_failure:already_exists"
     except OSError as exc:
+        return False, None, f"write_failure:{type(exc).__name__}:{exc}"
+    finally:
         try:
             if tmp_path.exists():
                 tmp_path.unlink()
         except OSError:
             pass
-        return False, None, f"write_failure:{type(exc).__name__}:{exc}"
 
     try:
         readback_text = path.read_text(encoding="utf-8")
@@ -480,11 +500,16 @@ def generate_authority_transport_manifest(
     # #2053 P1 fix-delta (iteration 3, OWNER PR review): actually enforce
     # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 via _validate_with_schema() before
     # ever persisting it, not merely constructing the dict by hand above.
+    # Fresh review blocker P1-A: schema enforcement is a real safety claim
+    # for this mutation lane -- a missing/malformed schema file must fail
+    # closed (schema_unavailable), never silently skip validation and
+    # proceed to persist an unvalidated manifest.
     schema = _load_schema("scope_delta_authority_transport_v1.schema.json")
-    if schema is not None:
-        valid, errors = _validate_with_schema(manifest, schema)
-        if not valid:
-            return None, f"schema_invalid:{errors[:1]}"
+    if schema is None:
+        return None, "schema_unavailable:scope_delta_authority_transport_v1.schema.json"
+    valid, errors = _validate_with_schema(manifest, schema)
+    if not valid:
+        return None, f"schema_invalid:{errors[:1]}"
 
     manifest_dir = _authority_transport_dir(repo_root, issue_number, invocation_id)
     manifest_path = manifest_dir / "scope_delta_authority_transport_v1.json"
@@ -606,7 +631,11 @@ def consume_authority_transport(
             # fail-closed environment_failure -- schema conformance is a real
             # gate, not advisory.
             schema = _load_schema("scope_delta_consumption_receipt_v1.schema.json")
-            if schema is not None:
+            if schema is None:
+                receipt = dict(receipt)
+                receipt["status"] = "environment_failure"
+                receipt["reason_code"] = "schema_unavailable"
+            else:
                 valid, errors = _validate_with_schema(receipt, schema)
                 if not valid:
                     receipt = dict(receipt)
@@ -949,10 +978,16 @@ def _validate_with_schema(data: dict, schema: dict) -> tuple[bool, list[str]]:
     Validate data against schema using jsonschema.
 
     Returns (is_valid, error_messages).
-    If jsonschema not available, skips validation (returns True, []).
+
+    Fresh review blocker P1-A: schema enforcement is a real safety claim for
+    the authority-transport mutation lanes (generate_authority_transport_manifest
+    / consume_authority_transport's "ok" receipt gate). If jsonschema is
+    unavailable, this fails CLOSED (returns False with reason code
+    "schema_validator_unavailable") -- it must never be silently converted
+    to a passing validation.
     """
     if not _JSONSCHEMA_AVAILABLE:
-        return True, []
+        return False, ["schema_validator_unavailable: jsonschema library not importable"]
     try:
         validator_cls = _jsonschema.validators.validator_for(schema)
         validator_cls.check_schema(schema)

@@ -185,6 +185,13 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
         # payload, or delegates to the real contract_patch_plan consumer
         # lane) exactly once, reads back, and emits
         # SCOPE_DELTA_CONSUMPTION_RECEIPT_V1.
+        #
+        # Fresh review blocker P0-A fix: `network_effect` is `github_mutation`
+        # (mirrored from the registry entry), not `local_only` -- when the
+        # command_registry.py `--contract-patch-plan-file` /
+        # `--anchor-context-file` placeholders are supplied, this command's
+        # default execution path genuinely performs a real GitHub issue
+        # mutation via `edit_issue_txn.py`'s `gh` subprocess calls.
         "authority_transport.consume": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_CONSUMER,
             "required_cwd": "canonical_main_root",
@@ -192,7 +199,7 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
             "allowed_write_roots": [
                 ".claude/artifacts/issue-refinement-loop/{active_issue}/",
             ],
-            "network_effect": "local_only",
+            "network_effect": "github_mutation",
         },
     },
 }

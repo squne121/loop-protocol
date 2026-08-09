@@ -647,3 +647,240 @@ def test_stale_previous_invocation_sidecar_is_never_reused(tmp_path):
     assert receipt["status"] == "environment_failure"
     assert receipt["reason_code"] == "stale_previous_invocation"
     assert receipt["mutation_applied"] is False
+
+
+# ---------------------------------------------------------------------------
+# Fresh review blocker P1-A: schema enforcement is a safety claim for the
+# authority-transport mutation lanes -- jsonschema import failure / schema
+# file missing / schema malformed / validation exception must all fail
+# CLOSED, never be silently converted to a passing validation.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_with_schema_fails_closed_when_jsonschema_unavailable(monkeypatch):
+    """GIVEN jsonschema is not importable
+    WHEN _validate_with_schema() is called
+    THEN it returns (False, [...schema_validator_unavailable...]) -- never
+    (True, []).
+    """
+    import run_refinement_preflight as preflight
+
+    monkeypatch.setattr(preflight, "_JSONSCHEMA_AVAILABLE", False)
+    valid, errors = preflight._validate_with_schema({"a": 1}, {"type": "object"})
+    assert valid is False
+    assert errors
+    assert "schema_validator_unavailable" in errors[0]
+
+
+def test_producer_fails_closed_when_jsonschema_unavailable(tmp_path, monkeypatch):
+    """GIVEN jsonschema is not importable
+    WHEN generate_authority_transport_manifest() runs
+    THEN it fails closed (returns None, error) and writes no manifest --
+    never silently skips schema enforcement and persists an unvalidated
+    manifest.
+    """
+    import run_refinement_preflight as preflight
+
+    monkeypatch.setattr(preflight, "_JSONSCHEMA_AVAILABLE", False)
+    issue_number = 2053
+    invocation_id = "p1a-jsonschema-unavailable-producer-1"
+    evidence = {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
+        "source_kind": "issue_comment",
+        "source_ref": f"https://github.com/{REPO}/issues/2053#issuecomment-1",
+        "source_issue_number": 2053,
+        "comment_id": 1,
+        "comment_url": f"https://github.com/{REPO}/issues/2053#issuecomment-1",
+        "issue_url": f"https://github.com/{REPO}/issues/2053",
+        "body_sha256": "sha256:deadbeef",
+        "author_login": "owner",
+        "author_type": "User",
+        "author_association": "OWNER",
+        "captured_at": "2026-08-09T00:00:00Z",
+        "directive_markers": ["revised acceptance criteria"],
+        "extracted_directives": ["AC1: do X"],
+        "ambiguity_flags": [],
+        "boundary_flags": [],
+        "confidence": "explicit",
+    }
+    result, error = preflight.generate_authority_transport_manifest(
+        evidence=evidence,
+        issue_number=issue_number,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha="deadbeef",
+        repo_root=REPO_ROOT,
+    )
+    assert result is None
+    assert error is not None and "schema_validator_unavailable" in error
+    manifest_path = (
+        _issue_artifact_dir(issue_number, invocation_id) / "scope_delta_authority_transport_v1.json"
+    )
+    assert not manifest_path.exists()
+
+
+def test_producer_fails_closed_when_schema_file_missing(tmp_path, monkeypatch):
+    """GIVEN the schema file cannot be loaded (missing / malformed on disk)
+    WHEN generate_authority_transport_manifest() runs
+    THEN it fails closed (schema_unavailable) rather than silently skipping
+    validation and persisting an unvalidated manifest.
+    """
+    import run_refinement_preflight as preflight
+
+    monkeypatch.setattr(preflight, "_load_schema", lambda _name: None)
+    issue_number = 2053
+    invocation_id = "p1a-schema-missing-producer-1"
+    evidence = {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
+        "source_kind": "issue_comment",
+        "source_ref": f"https://github.com/{REPO}/issues/2053#issuecomment-1",
+        "source_issue_number": 2053,
+        "comment_id": 1,
+        "comment_url": f"https://github.com/{REPO}/issues/2053#issuecomment-1",
+        "issue_url": f"https://github.com/{REPO}/issues/2053",
+        "body_sha256": "sha256:deadbeef",
+        "author_login": "owner",
+        "author_type": "User",
+        "author_association": "OWNER",
+        "captured_at": "2026-08-09T00:00:00Z",
+        "directive_markers": ["revised acceptance criteria"],
+        "extracted_directives": ["AC1: do X"],
+        "ambiguity_flags": [],
+        "boundary_flags": [],
+        "confidence": "explicit",
+    }
+    result, error = preflight.generate_authority_transport_manifest(
+        evidence=evidence,
+        issue_number=issue_number,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha="deadbeef",
+        repo_root=REPO_ROOT,
+    )
+    assert result is None
+    assert error == "schema_unavailable:scope_delta_authority_transport_v1.schema.json"
+    manifest_path = (
+        _issue_artifact_dir(issue_number, invocation_id) / "scope_delta_authority_transport_v1.json"
+    )
+    assert not manifest_path.exists()
+
+
+def test_validate_with_schema_fails_closed_on_malformed_schema(monkeypatch):
+    """GIVEN a schema that is itself invalid (fails check_schema())
+    WHEN _validate_with_schema() validates data against it
+    THEN it returns (False, [...]) -- the exception path fails closed, it
+    never silently treats an unvalidatable schema as a pass.
+    """
+    import run_refinement_preflight as preflight
+
+    malformed_schema = {"type": "definitely-not-a-real-json-schema-type"}
+    valid, errors = preflight._validate_with_schema({"a": 1}, malformed_schema)
+    assert valid is False
+    assert errors
+
+
+def test_validate_with_schema_fails_closed_on_validation_exception(monkeypatch):
+    """GIVEN the validator raises an unexpected exception mid-validation
+    WHEN _validate_with_schema() runs
+    THEN it returns (False, [...]) -- never propagates the exception as an
+    unhandled crash, and never converts it to a silent pass.
+    """
+    import run_refinement_preflight as preflight
+
+    class _ExplodingValidatorCls:
+        FORMAT_CHECKER = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @classmethod
+        def check_schema(cls, _schema):
+            return None
+
+        def iter_errors(self, _data):
+            raise RuntimeError("simulated validator crash")
+
+    monkeypatch.setattr(
+        preflight._jsonschema.validators, "validator_for", lambda _schema: _ExplodingValidatorCls
+    )
+    valid, errors = preflight._validate_with_schema({"a": 1}, {"type": "object"})
+    assert valid is False
+    assert errors
+    assert "schema_validation_unexpected" in errors[0]
+
+
+def test_consumer_ok_receipt_fails_closed_when_schema_file_missing(tmp_path, monkeypatch):
+    """GIVEN a consumption that would otherwise succeed (status: ok)
+    WHEN the SCOPE_DELTA_CONSUMPTION_RECEIPT_V1 schema file cannot be loaded
+    THEN the receipt is downgraded to environment_failure /
+    schema_unavailable -- never silently published as "ok" without schema
+    enforcement.
+    """
+    import run_refinement_preflight as preflight
+    import decide_next_loop_action as router
+
+    issue_number = 2053
+    invocation_id = "p1a-schema-missing-consumer-1"
+    git_head_sha = "0123456789abcdef0123456789abcdef01234567"
+
+    evidence = {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
+        "source_kind": "issue_comment",
+        "source_ref": f"https://github.com/{REPO}/issues/2053#issuecomment-9",
+        "source_issue_number": 2053,
+        "comment_id": 9,
+        "comment_url": f"https://github.com/{REPO}/issues/2053#issuecomment-9",
+        "issue_url": f"https://github.com/{REPO}/issues/2053",
+        "body_sha256": "sha256:deadbeef",
+        "author_login": "owner",
+        "author_type": "User",
+        "author_association": "OWNER",
+        "captured_at": "2026-08-09T00:00:00Z",
+        "directive_markers": ["revised acceptance criteria"],
+        "extracted_directives": ["AC1: p1a schema missing"],
+        "ambiguity_flags": [],
+        "boundary_flags": [],
+        "confidence": "explicit",
+    }
+    produced, error = preflight.generate_authority_transport_manifest(
+        evidence=evidence,
+        issue_number=issue_number,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=REPO_ROOT,
+    )
+    assert error is None, error
+
+    router_receipt = router.generate_router_receipt(
+        transport_manifest_path=produced["manifest_path"],
+        issue_number=issue_number,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        authority_expected=True,
+        repo_root=REPO_ROOT,
+    )
+    assert router_receipt["status"] == "ok"
+    router_receipt_path = _issue_artifact_dir(issue_number, invocation_id) / "scope_delta_router_receipt_v1.json"
+
+    real_load_schema = preflight._load_schema
+
+    def _fake_load_schema(name):
+        if name == "scope_delta_consumption_receipt_v1.schema.json":
+            return None
+        return real_load_schema(name)
+
+    monkeypatch.setattr(preflight, "_load_schema", _fake_load_schema)
+
+    receipt = preflight.consume_authority_transport(
+        router_receipt_path=str(router_receipt_path),
+        issue_number=issue_number,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=REPO_ROOT,
+    )
+    assert receipt["mutation_applied"] is True
+    assert receipt["status"] == "environment_failure"
+    assert receipt["reason_code"] == "schema_unavailable"
+
