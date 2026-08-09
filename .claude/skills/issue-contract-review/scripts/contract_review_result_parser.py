@@ -195,11 +195,9 @@ def _decode_producer_json_scalars(block: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, str) and value.startswith(("{", "[")):
             mapping[key] = _parse_bounded_strict_json_collection(value)
 
-    decode(inner, "expected_contract_fingerprint")
     checks = inner.get("checks")
     if not isinstance(checks, dict):
         return block
-    decode(checks, "product_spec_check")
     decode(checks, "declared_path_overlap")
     vc_preflight = checks.get("vc_preflight")
     if isinstance(vc_preflight, dict):

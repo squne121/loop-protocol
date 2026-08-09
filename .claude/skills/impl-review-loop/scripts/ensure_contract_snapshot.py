@@ -1565,8 +1565,8 @@ CONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:
     product_spec_check = checks.get("product_spec_check")
     if not isinstance(product_spec_check, dict):
         product_spec_check = {}
-    # JSON flow values are transported as YAML single-quoted scalars.  A
-    # direct JSON flow value puts JSON string escapes in YAML's double-quoted
+    # Advisory JSON flow values are transported as YAML single-quoted scalars.
+    # A direct JSON flow value puts JSON string escapes in YAML's double-quoted
     # string grammar, where an untrusted advisory value such as ``\^[[2K``
     # can make PyYAML reject the whole authoritative comment.  The consumer
     # decodes these designated fields with its existing bounded strict-JSON
@@ -1575,7 +1575,9 @@ CONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         return "'" + encoded.replace("'", "''") + "'"
 
-    product_spec_check_json = json_yaml_scalar(product_spec_check)
+    product_spec_check_json = json.dumps(
+        product_spec_check, ensure_ascii=False, separators=(",", ":")
+    )
     vc_preflight_check = checks.get("vc_preflight", "pass") or "pass"
     vc_preflight_classifications = review_result.get(
         "vc_preflight_classifications", []
@@ -1597,7 +1599,12 @@ CONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:
         declared_path_overlap = {}
     declared_path_overlap_json = json_yaml_scalar(declared_path_overlap)
 
-    fingerprint_json = json_yaml_scalar(expected_contract_fingerprint)
+    # The fixed fingerprint schema has no advisory free-text. Keep its
+    # established strict JSON flow representation so the authority-binding
+    # readback contract remains byte-addressable by existing consumers.
+    fingerprint_json = json.dumps(
+        expected_contract_fingerprint, ensure_ascii=False, separators=(",", ":")
+    )
     fingerprint_yaml = f"\n  expected_contract_fingerprint: {fingerprint_json}"
 
     return f"""{idempotency_marker}

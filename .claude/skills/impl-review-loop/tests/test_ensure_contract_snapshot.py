@@ -3002,7 +3002,7 @@ class TestProducerParserEscapedAdvisoryRoundTrip:
 
         assert "      classifications: '" in body
         assert "    declared_path_overlap: '" in body
-        assert "  expected_contract_fingerprint: '" in body
+        assert "  expected_contract_fingerprint: {" in body
 
     def test_given_large_escaped_advisory_when_pyyaml_parses_then_types_round_trip(self):
         body, fingerprint, classifications, overlap = self._comment_body()
