@@ -16,7 +16,7 @@ session-log metadata の raw dump（`session-log-metadata.txt`）は保存しな
 （PR #1921 human OWNER fix-delta: 先行 PR #1864 で pane transcript にアカウント情報等が
 残留した実績があるため、summary.md への allowlist-only 集約へ縮小した）。
 
-## Main-session agent identity evidence の status enum（Issue #2046）
+## Main-session agent identity evidence の status enum（識別子証跡の状態列挙、Issue #2046）
 
 `main_agent_identity` / `agent_definition` / `skill_evidence` / `mutation_boundary` /
 `settings_provenance` の各 status フィールドは、必ず以下 4 値のいずれかを取る:

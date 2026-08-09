@@ -87,7 +87,7 @@ named session を新規生成し、その session 内だけで agent lifecycle �
 終了時に session そのものを stop／delete し、`herdr session list --json` で消失を
 確認する（確認できない場合は fail-closed で exit 1）。詳細は `references/herdr.md` を参照。
 
-## Main-Session Agent Identity Evidence（Issue #2046）
+## Main-Session Agent Identity Evidence（メインセッション Agent Identity 証跡、Issue #2046）
 
 `--claude-agent-name` を指定した claude runtime + structured mode の run は、
 以下の 5 種類の evidence を `summary.md` に追加で記録する（`references/claude-code.md`

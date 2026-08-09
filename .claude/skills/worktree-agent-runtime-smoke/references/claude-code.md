@@ -78,7 +78,7 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示の
 `agent_prompt_stalled` 節を参照）。runner はこれを検知した場合のみ
 `send-keys enter` による 1 回限りの回復を行う。
 
-## Main-session agent identity / definition binding / Skill evidence（Issue #2046）
+## メインセッション Agent Identity・定義束縛・Skill 証跡（main_agent_identity / agent_definition / skill_evidence, Issue #2046）
 
 `--claude-agent-name <persona>` を指定した structured lane 起動は、`--agent <persona>`
 を実際の `claude` 起動 argv へ挿入するのに加えて、以下 2 チャネルを観測する:
@@ -93,7 +93,7 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示の
   （`extract_claude_canonical_read_receipt`）。path 不一致・`tool_use_id` 不一致・
   `is_error: true` の tool_result はすべて `unavailable` として fail-closed になる
 
-### Hermetic no-mutation lane（`--hermetic-agent-definition`）
+### 非mutation hermetic レーン（変更を一切行わない検証経路、`--hermetic-agent-definition`）
 
 `--claude-agent-name` と併用すると、project-discovery の `--agent <name>` lookup の
 代わりに以下を起動する:
