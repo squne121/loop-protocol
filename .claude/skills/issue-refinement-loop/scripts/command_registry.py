@@ -437,7 +437,9 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "cwd_policy": "repo_root",
         "execution_class": "exact_authority_transport_producer",
         "required_cwd": "canonical_main_root",
-        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{issue_number}/authority-transport/{invocation_id}/"],
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{issue_number}/authority-transport/{invocation_id}/"
+        ],
         "network_effect": "local_only",
         "stdin_contract": "none",
         "stdout_contract": "scope_delta_authority_transport_producer_result/v1",
@@ -470,7 +472,9 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "cwd_policy": "repo_root",
         "execution_class": "exact_authority_transport_consumer",
         "required_cwd": "canonical_main_root",
-        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{issue_number}/authority-transport/{invocation_id}/"],
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{issue_number}/authority-transport/{invocation_id}/"
+        ],
         "network_effect": "local_only",
         "stdin_contract": "none",
         "stdout_contract": "scope_delta_consumption_receipt/v1",
