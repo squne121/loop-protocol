@@ -386,10 +386,13 @@ class TestProducerRouteEvidenceValidation:
         assert producer._validate_delegation_request_evidence(tmp_path, route) == "fail"
 
     def test_delegation_result_missing_yields_no_provider(self, producer, tmp_path):
-        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        provider, attempts, ok, agy_failure_class = producer._validate_delegation_result_evidence(
+            tmp_path
+        )
         assert provider is None
         assert attempts == []
         assert ok is False
+        assert agy_failure_class is None
 
     def test_delegation_result_reads_actual_provider_key(self, producer, tmp_path):
         """A real provider="agy" delegation_result/v1 never has a
@@ -405,18 +408,24 @@ class TestProducerRouteEvidenceValidation:
             json.dumps({"ok": True, "provider": "agy", "tool_profile": "local_asset_research"}),
             encoding="utf-8",
         )
-        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        provider, attempts, ok, agy_failure_class = producer._validate_delegation_result_evidence(
+            tmp_path
+        )
         assert provider == "agy"
         assert attempts == ["agy"]
         assert ok is True
+        assert agy_failure_class is None
 
     def test_delegation_result_wrapper_not_ok_is_recorded(self, producer, tmp_path):
         (tmp_path / "delegation_result.json").write_text(
             json.dumps({"ok": False, "provider": "agy", "failure_class": "agy_exit_nonzero"}),
             encoding="utf-8",
         )
-        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        provider, attempts, ok, agy_failure_class = producer._validate_delegation_result_evidence(
+            tmp_path
+        )
         assert ok is False
+        assert agy_failure_class == "agy_exit_nonzero"
 
     def test_delegation_result_auto_dispatch_shape_still_supported(self, producer, tmp_path):
         """provider="auto" results (not currently exercised by this route
@@ -429,10 +438,13 @@ class TestProducerRouteEvidenceValidation:
             ),
             encoding="utf-8",
         )
-        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        provider, attempts, ok, agy_failure_class = producer._validate_delegation_result_evidence(
+            tmp_path
+        )
         assert provider == "agy"
         assert attempts == ["agy"]
         assert ok is True
+        assert agy_failure_class is None
 
     def test_github_research_route_evidence_missing_is_none(self, producer, tmp_path):
         assert producer._validate_github_research_route_evidence(tmp_path) is None
@@ -533,6 +545,68 @@ class TestProducerRetryPolicy:
         assert (
             producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
             is True
+        )
+
+    def test_agy_rate_limited_is_transient_candidate(self, producer):
+        """Issue #2015 root-cause finding (live re-run, 2026-08-09, head
+        948759e8): a genuinely-completed, genuinely-spawned codex_cli
+        trial can still fail ``validation_failed`` because the
+        materialized ``delegation_result.json`` itself reports
+        ``ok: false`` with ``failure_class: agy_rate_limited`` -- a
+        real AGY-side ``RESOURCE_EXHAUSTED`` (HTTP 429) quota/rate-limit
+        error observed under concurrent multi-session host load, AFTER a
+        genuinely successful Serena MCP retrieval
+        (``local_asset_retrieval_metadata.retrieval_status: "succeeded"``).
+        ``references/failure-class-taxonomy.md``'s AGY provider failure
+        class table already documents ``agy_rate_limited`` as
+        retryable="yes"; this is retry-eligible at this route-smoke layer
+        too, for either runtime."""
+        for runtime in ("codex_cli", "claude_code"):
+            route = producer._find_route(runtime, "codebase-investigator", "local_asset_research")
+            diagnostics = {
+                "secondary_failures": [
+                    {"kind": "agy_transient_quota_failure", "agy_failure_class": "agy_rate_limited"},
+                ],
+            }
+            assert (
+                producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
+                is True
+            )
+
+    def test_agy_capacity_exhausted_is_transient_candidate(self, producer):
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "agy_transient_quota_failure", "agy_failure_class": "agy_capacity_exhausted"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
+            is True
+        )
+
+    def test_agy_transient_quota_marker_never_promotes_non_validation_failed_classes(
+        self, producer
+    ):
+        """The new ``agy_transient_quota_failure`` secondary-failure marker
+        is scoped identically to the pre-existing materialization-race
+        marker: it only ever promotes ``failure_class: validation_failed``,
+        never an unrelated deterministic signal such as ``gemini_invoked``
+        (checked, and always wins, ahead of ``delegation_result.json``
+        state in ``_run_route_once``)."""
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "agy_transient_quota_failure", "agy_failure_class": "agy_rate_limited"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "gemini_invoked", diagnostics)
+            is False
+        )
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "provider_mismatch", diagnostics)
+            is False
         )
 
     def test_child_completed_marker_never_promotes_a_deterministic_policy_violation(

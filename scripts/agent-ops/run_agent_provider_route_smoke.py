@@ -402,13 +402,29 @@ def _observed_provider_attempts(raw_attempts: object) -> list[str]:
     return names
 
 
-def _validate_delegation_result_evidence(evidence_dir: Path) -> tuple[str | None, list[str], bool]:
+def _validate_delegation_result_evidence(
+    evidence_dir: Path,
+) -> tuple[str | None, list[str], bool, str | None]:
     """Issue #1886 P0-1 fix_delta: read the ACTUAL run_gemini_headless.py
     wrapper result (via --output-file) instead of stamping
     ``selected_provider: "agy"`` / ``provider_attempts: ["agy"]`` on harness
     exit 0 alone. Returns ``(selected_provider, provider_attempts,
-    wrapper_ok)``; all fail closed to ``None`` / ``[]`` / ``False`` when the
-    result file is missing or malformed -- never guessed."""
+    wrapper_ok, agy_failure_class)``; all fail closed to ``None`` / ``[]`` /
+    ``False`` / ``None`` when the result file is missing or malformed --
+    never guessed.
+
+    Issue #2015 (control-plane live re-run, 2026-08-09): ``agy_failure_class``
+    is the raw ``delegation_result.json["failure_class"]`` value on a
+    materialized ``ok: false`` result -- e.g. ``agy_rate_limited`` from a
+    genuine AGY-side ``RESOURCE_EXHAUSTED`` quota/rate-limit error, live-
+    observed on this host under concurrent multi-session load. It exists so
+    the caller can distinguish this known-transient signal (see
+    ``references/failure-class-taxonomy.md``'s AGY provider failure class
+    table, where ``agy_rate_limited`` / ``agy_capacity_exhausted`` /
+    ``agy_web_grounding_quota_exhausted`` are all documented
+    retryable="yes") from an ordinary, deterministic ``ok: false`` content
+    failure (e.g. ``github_research_incomplete``) that must NOT be retried
+    (see the P1 fix comment above this function's callers)."""
     # Issue #1886 P0-2/P0-3 fix_delta (PR #2005 REQUEST_CHANGES): a
     # provider="agy" direct delegation_result/v1 (the only path this route
     # smoke exercises -- Provider Policy forbids provider="auto") never has
@@ -424,7 +440,7 @@ def _validate_delegation_result_evidence(evidence_dir: Path) -> tuple[str | None
     # that was actually invoked -- never from a guessed/expected value.
     payload = _read_json_file(evidence_dir / "delegation_result.json")
     if not isinstance(payload, dict):
-        return None, [], False
+        return None, [], False, None
     selected_provider = payload.get("selected_provider")
     if not isinstance(selected_provider, str) or not selected_provider:
         selected_provider = payload.get("provider")
@@ -434,7 +450,10 @@ def _validate_delegation_result_evidence(evidence_dir: Path) -> tuple[str | None
     if not provider_attempts and isinstance(payload.get("provider"), str) and payload["provider"]:
         provider_attempts = [payload["provider"]]
     wrapper_ok = payload.get("ok") is True
-    return selected_provider, provider_attempts, wrapper_ok
+    agy_failure_class = payload.get("failure_class")
+    if not isinstance(agy_failure_class, str) or not agy_failure_class:
+        agy_failure_class = None
+    return selected_provider, provider_attempts, wrapper_ok, agy_failure_class
 
 
 def _validate_github_research_route_evidence(evidence_dir: Path) -> str | None:
@@ -494,6 +513,19 @@ def _validate_github_research_route_evidence(evidence_dir: Path) -> str | None:
 # materialized even after the bounded poll) so an unrelated
 # ``validation_failed`` cause (a real request/response schema defect) is
 # never silently retried.
+# Issue #2015 (control-plane live re-run, 2026-08-09): mirrors
+# ``references/failure-class-taxonomy.md``'s AGY provider failure class
+# table's retryable="yes" set exactly -- ``agy_auth_required`` /
+# ``agy_permission_denied`` / ``agy_not_found`` / ``agy_timeout`` /
+# ``agy_exit_nonzero`` / ``agy_empty_stdout`` / ``agy_output_missing`` /
+# ``agy_unexpected_error`` (all retryable="no" there) are deliberately
+# excluded -- a genuine auth/permission/missing-binary/unclassified failure
+# retrying would not resolve it and would only burn route budget.
+_AGY_TRANSIENT_QUOTA_FAILURE_CLASSES = frozenset(
+    {"agy_rate_limited", "agy_capacity_exhausted", "agy_web_grounding_quota_exhausted"}
+)
+
+
 def _is_transient_infrastructure_candidate(
     route: dict[str, str],
     failure_class: str | None,
@@ -501,6 +533,13 @@ def _is_transient_infrastructure_candidate(
 ) -> bool:
     if route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed":
         return True
+    if failure_class == "validation_failed" and diagnostics is not None:
+        secondary_failures = diagnostics.get("secondary_failures") or []
+        if any(
+            isinstance(entry, dict) and entry.get("kind") == "agy_transient_quota_failure"
+            for entry in secondary_failures
+        ):
+            return True
     # Issue #2015 P1 fix (control-plane live re-run + live repro, head
     # ffad6201, 2026-08-09): the artifact-materialization race this
     # secondary failure flags (the child genuinely completed per the
@@ -748,8 +787,8 @@ def _run_route_once(
         diagnostics["completion_elapsed_sec"] = harness_summary.get("completion_elapsed_sec")
 
         request_validation = _validate_delegation_request_evidence(evidence_dir, route)
-        selected_provider, provider_attempts, wrapper_ok = _validate_delegation_result_evidence(
-            evidence_dir
+        selected_provider, provider_attempts, wrapper_ok, agy_failure_class = (
+            _validate_delegation_result_evidence(evidence_dir)
         )
 
         # Issue #2015 AC11: a genuinely-completed child (per the harness's
@@ -792,7 +831,7 @@ def _run_route_once(
             diagnostics["evidence_materialized_elapsed_sec"] = elapsed
             artifact_materialized = result_path.is_file()
             if artifact_materialized:
-                selected_provider, provider_attempts, wrapper_ok = (
+                selected_provider, provider_attempts, wrapper_ok, agy_failure_class = (
                     _validate_delegation_result_evidence(evidence_dir)
                 )
 
@@ -818,6 +857,33 @@ def _run_route_once(
         if diagnostics["child_completion_observed"] and not artifact_materialized:
             diagnostics["secondary_failures"].append(
                 {"kind": "child_completed_but_artifact_not_materialized"}
+            )
+
+        # Issue #2015 (control-plane live re-run, 2026-08-09, head 948759e8):
+        # live codex_cli/local_asset_research trials reproduced a
+        # materialized ``ok: false`` ``delegation_result.json`` whose
+        # ``failure_class`` was ``agy_rate_limited`` -- a genuine AGY-side
+        # ``RESOURCE_EXHAUSTED`` (HTTP 429) quota/rate-limit error under
+        # concurrent multi-session host load, AFTER a genuinely successful
+        # Serena MCP retrieval (``local_asset_retrieval_metadata
+        # .retrieval_status: "succeeded"``, non-zero
+        # ``evidence_record_count``) -- i.e. the actual delegated work
+        # completed; only AGY's own subsequent model-completion call was
+        # rate-limited. ``references/failure-class-taxonomy.md``'s AGY
+        # provider failure class table already documents
+        # ``agy_rate_limited`` / ``agy_capacity_exhausted`` /
+        # ``agy_web_grounding_quota_exhausted`` as retryable="yes" (for
+        # provider-fallback purposes); this is the same transient-quota
+        # signal, so it is tagged here as an additional, narrowly-scoped
+        # retry-eligible secondary failure at THIS route-smoke layer too
+        # -- distinct from (and never conflated with) an ordinary
+        # deterministic content failure (e.g.
+        # ``github_research_incomplete``), which is deliberately excluded
+        # by the explicit allow-list below (see
+        # ``_is_transient_infrastructure_candidate``).
+        if not wrapper_ok and agy_failure_class in _AGY_TRANSIENT_QUOTA_FAILURE_CLASSES:
+            diagnostics["secondary_failures"].append(
+                {"kind": "agy_transient_quota_failure", "agy_failure_class": agy_failure_class}
             )
 
         route_evidence_sha256 = None
