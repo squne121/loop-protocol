@@ -112,18 +112,20 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          mkdir -p artifacts/decision artifacts/evidence
-          gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" > run_artifacts.json
-          DECISION_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="visual-impact-decision-v1")][0].id // empty' run_artifacts.json)"
-          EVIDENCE_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="component-vrt-evidence-manifest")][0].id // empty' run_artifacts.json)"
+          ARTIFACT_ROOT="$(mktemp -d "${RUNNER_TEMP}/visual-impact-trusted-${RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
+          mkdir -p "${ARTIFACT_ROOT}/decision" "${ARTIFACT_ROOT}/evidence"
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" > "${ARTIFACT_ROOT}/run_artifacts.json"
+          DECISION_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="visual-impact-decision-v1")][0].id // empty' "${ARTIFACT_ROOT}/run_artifacts.json")"
+          EVIDENCE_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="component-vrt-evidence-manifest")][0].id // empty' "${ARTIFACT_ROOT}/run_artifacts.json")"
           if [ -n "${DECISION_ARTIFACT_ID}" ]; then
-            gh api "repos/${REPO}/actions/artifacts/${DECISION_ARTIFACT_ID}/zip" > decision.zip
-            unzip -o -q decision.zip -d artifacts/decision
+            gh api "repos/${REPO}/actions/artifacts/${DECISION_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/decision.zip"
+            unzip -o -q "${ARTIFACT_ROOT}/decision.zip" -d "${ARTIFACT_ROOT}/decision"
           fi
           if [ -n "${EVIDENCE_ARTIFACT_ID}" ]; then
-            gh api "repos/${REPO}/actions/artifacts/${EVIDENCE_ARTIFACT_ID}/zip" > evidence.zip
-            unzip -o -q evidence.zip -d artifacts/evidence
+            gh api "repos/${REPO}/actions/artifacts/${EVIDENCE_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/evidence.zip"
+            unzip -o -q "${ARTIFACT_ROOT}/evidence.zip" -d "${ARTIFACT_ROOT}/evidence"
           fi
+          echo "artifact_root=${ARTIFACT_ROOT}" >> "$GITHUB_OUTPUT"
 
       - name: Independently re-verify producer artifacts (base-locked evaluator)
         id: verify
@@ -132,10 +134,11 @@ jobs:
           EXPECTED_HEAD_SHA: ${{ steps.pr.outputs.live_head_sha }}
           EXPECTED_REPOSITORY: ${{ github.repository }}
           EXPECTED_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          ARTIFACT_ROOT: ${{ steps.download.outputs.artifact_root }}
         run: |
           set +e
-          DECISION_FILE="artifacts/decision/visual_impact_decision_v1.json"
-          EVIDENCE_FILE="artifacts/evidence/visual_baseline_review_evidence_v2.json"
+          DECISION_FILE="${ARTIFACT_ROOT}/decision/visual_impact_decision_v1.json"
+          EVIDENCE_FILE="${ARTIFACT_ROOT}/evidence/visual_baseline_review_evidence_v2.json"
           [ -f "${DECISION_FILE}" ] || DECISION_FILE=""
           [ -f "${EVIDENCE_FILE}" ] || EVIDENCE_FILE=""
           uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
