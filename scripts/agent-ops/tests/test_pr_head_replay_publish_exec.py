@@ -48,7 +48,8 @@ class OfflineLiveRunner:
             head = self.reported_head
             if self.pr_reads >= 3 and self.post_mode == "new":
                 head = _git(self.bare, "rev-parse", "refs/heads/target")
-            return subprocess.CompletedProcess(command, 0, json.dumps({"headRefName": "target", "headRefOid": head}), "")
+            payload = {"headRefName": "target", "headRefOid": head}
+            return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
         return subprocess.run(command, **kwargs, capture_output=True, text=True, check=False)
 
 

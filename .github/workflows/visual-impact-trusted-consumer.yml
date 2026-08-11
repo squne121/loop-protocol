@@ -115,8 +115,8 @@ jobs:
           ARTIFACT_ROOT="$(mktemp -d "${RUNNER_TEMP}/visual-impact-trusted-${RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
           mkdir -p "${ARTIFACT_ROOT}/decision" "${ARTIFACT_ROOT}/evidence"
           gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" > "${ARTIFACT_ROOT}/run_artifacts.json"
-          DECISION_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="visual-impact-decision-v1")][0].id // empty' "${ARTIFACT_ROOT}/run_artifacts.json)"
-          EVIDENCE_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="component-vrt-evidence-manifest")][0].id // empty' "${ARTIFACT_ROOT}/run_artifacts.json)"
+          DECISION_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="visual-impact-decision-v1")][0].id // empty' "${ARTIFACT_ROOT}/run_artifacts.json")"
+          EVIDENCE_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="component-vrt-evidence-manifest")][0].id // empty' "${ARTIFACT_ROOT}/run_artifacts.json")"
           if [ -n "${DECISION_ARTIFACT_ID}" ]; then
             gh api "repos/${REPO}/actions/artifacts/${DECISION_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/decision.zip"
             unzip -o -q "${ARTIFACT_ROOT}/decision.zip" -d "${ARTIFACT_ROOT}/decision"

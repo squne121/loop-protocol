@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
-import sys
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -196,7 +195,12 @@ def execute(
         return _result("blocked", errors=["source_range_empty"], **input_fields)
     disallowed = sorted(path for path in source_paths if not _path_allowed(path, allowed_paths))
     if disallowed:
-        return _result("blocked", errors=["source_range_contains_disallowed_path"], disallowed_paths=disallowed, **input_fields)
+        return _result(
+            "blocked",
+            errors=["source_range_contains_disallowed_path"],
+            disallowed_paths=disallowed,
+            **input_fields,
+        )
 
     worktree = root / ".claude" / "worktrees" / f"pr-head-replay-{issue_number}-{pr_number}-{uuid.uuid4().hex}"
     cleanup_error: str | None = None
@@ -205,11 +209,17 @@ def execute(
     try:
         created = runner(["git", "worktree", "add", "--detach", str(worktree), expected_remote_pr_head], cwd=root)
         if created.returncode:
-            return _result("failed", errors=[f"temporary_worktree_create_failed:{_error_code(created)}"], **input_fields)
+            return _result(
+                "failed", errors=[f"temporary_worktree_create_failed:{_error_code(created)}"], **input_fields
+            )
         binary_diff = runner(["git", "diff", "--binary", source_base, source_head], cwd=root)
         if binary_diff.returncode:
             return _result("failed", errors=[f"binary_diff_failed:{_error_code(binary_diff)}"], **input_fields)
-        applied = runner(["git", "apply", "--index", "--whitespace=nowarn", "-"], cwd=worktree, input=binary_diff.stdout)
+        applied = runner(
+            ["git", "apply", "--index", "--whitespace=nowarn", "-"],
+            cwd=worktree,
+            input=binary_diff.stdout,
+        )
         if applied.returncode:
             return _result("failed", errors=[f"binary_apply_failed:{_error_code(applied)}"], **input_fields)
         staged = runner(["git", "diff", "--cached", "--name-status", "-z", "-M"], cwd=worktree)
@@ -236,18 +246,43 @@ def execute(
         if error or pre_push_pr is None or not _pr_matches(
             pre_push_pr, expected_head=expected_remote_pr_head, target_branch=target_branch
         ):
-            return _result("blocked", errors=[error or "pr_changed_before_publish"], new_commit_sha=new_commit, **input_fields)
+            return _result(
+                "blocked",
+                errors=[error or "pr_changed_before_publish"],
+                new_commit_sha=new_commit,
+                **input_fields,
+            )
         remote = runner(["git", "ls-remote", "origin", f"refs/heads/{target_branch}"], cwd=root)
         remote_head = remote.stdout.split()[0] if remote.returncode == 0 and remote.stdout.split() else None
         if remote_head != expected_remote_pr_head:
-            return _result("blocked", errors=["remote_target_changed_before_publish"], new_commit_sha=new_commit, **input_fields)
+            return _result(
+                "blocked",
+                errors=["remote_target_changed_before_publish"],
+                new_commit_sha=new_commit,
+                **input_fields,
+            )
         pushed_proc = runner(["git", "push", "origin", f"{new_commit}:refs/heads/{target_branch}"], cwd=worktree)
         if pushed_proc.returncode:
-            return _result("failed", errors=[f"publish_push_failed:{_error_code(pushed_proc)}"], new_commit_sha=new_commit, **input_fields)
+            return _result(
+                "failed",
+                errors=[f"publish_push_failed:{_error_code(pushed_proc)}"],
+                new_commit_sha=new_commit,
+                **input_fields,
+            )
         pushed = True
         post_push_pr, error = _read_pr(runner, root, repo, pr_number)
-        if error or post_push_pr is None or post_push_pr.get("headRefName") != target_branch or post_push_pr.get("headRefOid") != new_commit:
-            return _result("failed", errors=[error or "post_publish_pr_readback_mismatch"], new_commit_sha=new_commit, **input_fields)
+        if (
+            error
+            or post_push_pr is None
+            or post_push_pr.get("headRefName") != target_branch
+            or post_push_pr.get("headRefOid") != new_commit
+        ):
+            return _result(
+                "failed",
+                errors=[error or "post_publish_pr_readback_mismatch"],
+                new_commit_sha=new_commit,
+                **input_fields,
+            )
         return _result("ok", errors=[], pushed=True, new_commit_sha=new_commit, **input_fields)
     finally:
         if worktree.exists():
