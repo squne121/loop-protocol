@@ -3248,9 +3248,9 @@ def _classify_rtk_git_merge_default_branch(
 # containment-checked against the resolved active issue worktree.
 CONTROLLED_GIT_CHANGE_EXEC_SCRIPT = "scripts/agent-guards/controlled_git_change_exec.py"
 _CGCE_METACHAR_RE = re.compile(r"[;&|<>$`\n\r\0\\(){}*?\[\]!~]")
-_CGCE_SINGLE_VALUE_FLAGS = frozenset({"--cwd", "--snapshot-json", "--message", "--expected-head"})
+_CGCE_SINGLE_VALUE_FLAGS = frozenset({"--cwd", "--materialize-request", "--message", "--expected-head", "--expected-old"})
 _CGCE_REPEATABLE_VALUE_FLAGS = frozenset({"--path"})
-_CGCE_REQUIRED_FLAGS = frozenset({"--cwd", "--snapshot-json", "--message", "--expected-head"})
+_CGCE_REQUIRED_FLAGS = frozenset({"--cwd", "--materialize-request", "--message", "--expected-head", "--expected-old"})
 
 
 @dataclass(frozen=True)
@@ -3258,10 +3258,11 @@ class ControlledGitChangeExecCommand:
     """Parsed exact `controlled_git_change_exec.py` CLI invocation (AC14)."""
 
     cwd: str
-    snapshot_json: str
+    materialize_request: str
     paths: tuple[str, ...]
     message: str
     expected_head: str
+    expected_old: str
 
 
 def parse_controlled_git_change_exec_command(
@@ -3339,10 +3340,11 @@ def parse_controlled_git_change_exec_command(
 
     return ControlledGitChangeExecCommand(
         cwd=values["--cwd"][0],
-        snapshot_json=values["--snapshot-json"][0],
+        materialize_request=values["--materialize-request"][0],
         paths=paths,
         message=values["--message"][0],
         expected_head=values["--expected-head"][0],
+        expected_old=values["--expected-old"][0],
     )
 
 

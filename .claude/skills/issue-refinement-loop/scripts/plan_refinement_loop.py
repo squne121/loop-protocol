@@ -31,6 +31,30 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+_IMPL_MAIN_DRIFT_SCRIPTS = Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts"
+if str(_IMPL_MAIN_DRIFT_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_IMPL_MAIN_DRIFT_SCRIPTS))
+try:
+    from route_loop_verdict_v2 import classify_main_drift
+except ImportError:  # pragma: no cover
+    classify_main_drift = None
+
+
+def classify_refinement_evidence_epoch(context: dict[str, Any]) -> dict[str, Any]:
+    """Classify evidence only; refinement retains Issue/snapshot mutation."""
+    if classify_main_drift is None:
+        return {"route": "hard_stop", "reason_code": "main_drift_policy_import_failed"}
+    try:
+        result = classify_main_drift(current_base_sha=context["current_base_sha"], evidence_base_sha=context["evidence_base_sha"],
+            allowed_paths_snapshot_base_sha=context["allowed_paths_snapshot_base_sha"], allowed_paths=context["allowed_paths"],
+            latest_main_net_diff=context.get("latest_main_net_diff", ()), expected_head_sha=context["expected_head_sha"],
+            observed_head_sha=context["observed_head_sha"], expected_old_sha=context["expected_old_sha"], observed_old_sha=context["observed_old_sha"],
+            semantic_ambiguity=bool(context.get("semantic_ambiguity", False)), owner="refinement")
+    except (KeyError, TypeError):
+        return {"route": "hard_stop", "reason_code": "main_drift_context_invalid"}
+    return {"route": result.route, "reason_code": result.reason_code, "evidence_epoch": dict(result.evidence_epoch or {}),
+        "reverify": dict(result.reverify), "reusable_evidence": dict(result.reusable_evidence), "mutation_owner": "refinement"}
+
 try:
     import yaml as _yaml_module
     _YAML_AVAILABLE = True

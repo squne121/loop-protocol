@@ -468,6 +468,16 @@ def _current_head(cwd: str) -> Optional[str]:
     return head or None
 
 
+def _current_ref(cwd: str, ref: str) -> Optional[str]:
+    """Read the remote-tracking base first, with fixture-safe local fallback."""
+    candidates = (f"refs/remotes/origin/{ref}", ref)
+    for candidate in candidates:
+        result = _run_git(["rev-parse", "--verify", f"{candidate}^{{commit}}"], cwd)
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    return None
+
+
 def _git_toplevel(cwd: str) -> Optional[str]:
     result = _run_git(["rev-parse", "--show-toplevel"], cwd)
     if result.returncode != 0:
@@ -722,6 +732,7 @@ def execute_controlled_change(
     requested_pathspecs: List[str],
     commit_message: str,
     expected_head: str,
+    expected_old: Optional[str] = None,
     current_issue_body_sha256: Optional[str] = None,
     current_comments_digest_sha256: Optional[str] = None,
     current_allowed_paths_sha256: Optional[str] = None,
@@ -753,6 +764,8 @@ def execute_controlled_change(
         return _denied("commit_message_required")
     if not expected_head:
         return _denied("expected_head_required")
+    if expected_old is not None and expected_old != snapshot.base_sha:
+        return _denied("expected_old_snapshot_mismatch")
 
     # 2. Repository / worktree / branch / HEAD binding.
     repo_root = _git_toplevel(cwd)
@@ -793,6 +806,8 @@ def execute_controlled_change(
     local_head = _current_head(cwd)
     if local_head != expected_head:
         return _denied("head_race_detected")
+    if expected_old is not None and _current_ref(cwd, snapshot.base_ref) != expected_old:
+        return _denied("expected_old_cas_mismatch")
 
     # 3. Requested pathspecs must be literal (no magic, no directories).
     if not requested_pathspecs:
@@ -927,6 +942,9 @@ def execute_controlled_change(
     if _current_head(cwd) != expected_head:
         _unstage(cwd, requested_pathspecs)
         return _denied("head_race_detected_before_commit")
+    if expected_old is not None and _current_ref(cwd, snapshot.base_ref) != expected_old:
+        _unstage(cwd, requested_pathspecs)
+        return _denied("expected_old_cas_mismatch_before_commit")
 
     # 11. `git commit --only` restricts the commit to exactly the given
     # pathspecs -- pre-existing unrelated staged content is never swept in.
@@ -991,6 +1009,10 @@ def execute_controlled_change(
         )
         _unstage(cwd, requested_pathspecs)
         return _denied("post_commit_audit_violation_rolled_back")
+    if expected_old is not None and _current_ref(cwd, snapshot.base_ref) != expected_old:
+        subprocess.run(["git", "reset", "--soft", "HEAD~1"], cwd=cwd, capture_output=True, text=True, timeout=30, env=_sanitized_git_env(), check=False)
+        _unstage(cwd, requested_pathspecs)
+        return _denied("postcondition_expected_old_readback_mismatch_rolled_back")
 
     return ControlledChangeResult(
         status="committed",
@@ -1413,6 +1435,7 @@ def _build_cli_parser():
     parser.add_argument("--message", default=None, help="commit message")
     parser.add_argument("--message-file", default=None, help="path to a file containing the commit message")
     parser.add_argument("--expected-head", required=True, help="expected local HEAD SHA (race guard, required)")
+    parser.add_argument("--expected-old", default=None, help="expected current base SHA (CAS guard)")
     parser.add_argument(
         "--merge-continue",
         action="store_true",
@@ -1486,6 +1509,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
         requested_pathspecs=args.paths,
         commit_message=commit_message,
         expected_head=args.expected_head,
+        expected_old=args.expected_old,
     )
     print(json.dumps(result.to_dict()))
     return 0 if result.status == "committed" else 1
