@@ -297,7 +297,15 @@ LOOP_HANDOFF_RESULT_V1:
     body_sha256: string
   metadata:
     title_prefix_ready: bool
-    phase_label_ready: bool
+  label_sync_observation:
+    # #2084: presentation_sync — non-authoritative telemetry only. GitHub
+    # Issue labels are presentation-only metadata (SSOT: docs/dev/workflow.md,
+    # docs/dev/github-ops.md) and MUST NOT participate in impl_ready /
+    # status / routing_action authority. This block records the
+    # best-effort presentation sync outcome for observability only.
+    kind: presentation_sync
+    result: applied | noop | failed
+    detail: string
   auto_fixes:
     result: auto_fixed | human_judgment_required | blocked
     required:
@@ -396,12 +404,11 @@ checker exit 1（needs-fix）はインフラ障害でなく正常系として ro
 1. `contract_review.gate_result == fresh_go` — 最新の `CONTRACT_REVIEW_RESULT_V1.status == "go"` が存在し、現 Issue body hash に対して fresh
 2. `contract_review.status == go` が後続の `request_changes` / `blocked` により無効化されていない
 3. `metadata.title_prefix_ready == true` または `auto_fixes.required` に `metadata_hygiene` / `template_hygiene` の `result: applied` エントリが存在する
-4. `metadata.phase_label_ready == true` または同上の auto-fix applied エントリが存在する
-5. `auto_fixes.required` が空（または全 applied 済み）かつ `auto_fixes.skipped` が空
-6. `blockers` が空
-7. `routing_action == run_impl_review_loop`
+4. `auto_fixes.required` が空（または全 applied 済み）かつ `auto_fixes.skipped` が空
+5. `blockers` が空
+6. `routing_action == run_impl_review_loop`
 
-**Title prefix / phase label 不在のみを理由に `impl_ready` を拒否してはならない** — implementation-worker (repair mode) が auto-fix evidence を添付していれば `impl_ready` は許可される。
+**Title prefix 不在のみを理由に `impl_ready` を拒否してはならない** — implementation-worker (repair mode) が auto-fix evidence を添付していれば `impl_ready` は許可される。`phase/implementation` label（および他の presentation label）の有無は `impl_ready` 判定条件から除外する（#2084）。`label_sync_observation`（presentation_sync）の `result`（`applied | noop | failed`）を変えても `status` / `routing_action` / `implementation_allowed` は変化しない。`auto_fixes.required` に triage label 遷移（`triage-required` remove、`phase/implementation` / `agent/implementer` add）を追加してはならない — それらは `label_sync_observation` として readiness decision 後に best-effort で実行される非authoritative な presentation sync である。
 
 `auto_fixes.required` / `auto_fixes.skipped` の各エントリは `kind` / `executor` / `result` / `evidence`（`before` / `after` / `comment_url`）を含む。`result: skipped` または `evidence` 欠如 → `impl_ready` 禁止。
 
@@ -414,7 +421,7 @@ checker exit 1（needs-fix）はインフラ障害でなく正常系として ro
 | `request_changes` / `blocked` が `go` を後続で無効化 | `blocked` | `blocked` |
 | scope / goal / AC に semantic change が検出された | `human_judgment_required` | `ask_human` |
 | `blockers` に 1 件以上 | `blocked` | `blocked` |
-| fixer unavailable かつ title/label 不在 | `human_judgment_required` | `ask_human` |
+| fixer unavailable かつ title prefix 不在 | `human_judgment_required` | `ask_human` |
 | `auto_fixes.skipped` に 1 件以上 | `human_judgment_required` | `ask_human` |
 
 ### `human_judgment_required` 停止条件
@@ -428,7 +435,7 @@ scope / goal / AC への semantic change が検出されたとき、`issue-refin
 | kind | 委譲先 | 委譲条件 |
 |---|---|---|
 | `template_hygiene` | implementation-worker (repair mode) | 既定テンプレートセクション欠落 |
-| `metadata_hygiene` | implementation-worker (repair mode) | title prefix / phase label 不在 |
+| `metadata_hygiene` | implementation-worker (repair mode) | title prefix 不在（phase label は presentation_sync として別扱い、#2084） |
 | `known_marker_fix` | implementation-worker (repair mode) | 既知の壊れた marker 形式を検出 |
 | `stale_state_label_cleanup` | implementation-worker (repair mode) | stale `state/blocked` / `state/queued` を検出 |
 | `contract_snapshot_materialization` | implementation-worker (repair mode) | contract snapshot comment 未作成 |

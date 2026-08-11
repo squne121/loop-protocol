@@ -27,6 +27,8 @@ from skill_runtime_command_policy import (
     command_allows_root_no_worktree,
     current_branch,
     is_exact_skill_runtime_anchor_executor_command,
+    is_exact_skill_runtime_authority_transport_consume_executor_command,
+    is_exact_skill_runtime_authority_transport_produce_executor_command,
     is_exact_skill_runtime_contract_update_anchor_executor_command,
     is_exact_skill_runtime_decide_executor_command,
     is_exact_skill_runtime_executor_command,
@@ -1905,6 +1907,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--loop-state-file", required=False, default=None)
     parser.add_argument("--review-result-verdict", required=False, default=None)
     parser.add_argument("--max-iterations", required=False, default=None)
+    # #2086 AC9/AC10: authority_transport.produce / authority_transport.consume.
+    parser.add_argument("--invocation-id", required=False, default=None)
+    parser.add_argument("--git-head-sha", required=False, default=None)
+    parser.add_argument("--evidence-fixture-path", required=False, default=None)
+    parser.add_argument("--router-receipt-path", required=False, default=None)
+    parser.add_argument("--contract-patch-plan-file", required=False, default=None)
+    parser.add_argument("--anchor-context-file", required=False, default=None)
     args = parser.parse_args(argv)
 
     project_root = resolve_project_root()
@@ -1923,6 +1932,23 @@ def main(argv: list[str] | None = None) -> int:
         "contract_update.run.with_human_context",
     }
     is_decide_command = args.command_id == "decide.run"
+    is_produce_command = args.command_id == "authority_transport.produce"
+    is_consume_command = args.command_id == "authority_transport.consume"
+    if not (is_produce_command or is_consume_command) and (
+        args.invocation_id
+        or args.git_head_sha
+        or args.evidence_fixture_path
+        or args.router_receipt_path
+        or args.contract_patch_plan_file
+        or args.anchor_context_file
+    ):
+        print(
+            "skill_runtime_exec: --invocation-id/--git-head-sha/--evidence-fixture-path/"
+            "--router-receipt-path/--contract-patch-plan-file/--anchor-context-file are "
+            "only allowed for authority_transport.produce/authority_transport.consume",
+            file=sys.stderr,
+        )
+        return 2
     if is_fixture_command:
         if not args.fixture:
             print("skill_runtime_exec: --fixture required for preflight.run.fixture", file=sys.stderr)
@@ -2050,6 +2076,101 @@ def main(argv: list[str] | None = None) -> int:
         if not is_exact_skill_runtime_decide_executor_command(command_text, project_root, project_root):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
+    elif is_produce_command:
+        if args.fixture or args.anchor_comment_url or args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: only --invocation-id/--git-head-sha/"
+                "--evidence-fixture-path are allowed for authority_transport.produce",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.invocation_id or not args.git_head_sha or not args.evidence_fixture_path:
+            print(
+                "skill_runtime_exec: --invocation-id, --git-head-sha, and "
+                "--evidence-fixture-path are required for authority_transport.produce",
+                file=sys.stderr,
+            )
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--invocation-id",
+                args.invocation_id,
+                "--git-head-sha",
+                args.git_head_sha,
+                "--produce-authority-transport",
+                args.evidence_fixture_path,
+            ]
+        )
+        if not is_exact_skill_runtime_authority_transport_produce_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    elif is_consume_command:
+        if args.fixture or args.anchor_comment_url or args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: only --invocation-id/--git-head-sha/"
+                "--router-receipt-path/--contract-patch-plan-file/--anchor-context-file "
+                "are allowed for authority_transport.consume",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.invocation_id or not args.git_head_sha or not args.router_receipt_path:
+            print(
+                "skill_runtime_exec: --invocation-id, --git-head-sha, and "
+                "--router-receipt-path are required for authority_transport.consume",
+                file=sys.stderr,
+            )
+            return 2
+        if bool(args.contract_patch_plan_file) != bool(args.anchor_context_file):
+            print(
+                "skill_runtime_exec: --contract-patch-plan-file and "
+                "--anchor-context-file must be supplied together or not at all "
+                "for authority_transport.consume",
+                file=sys.stderr,
+            )
+            return 2
+        consume_tail = [
+            "uv",
+            "run",
+            "python3",
+            SKILL_RUNTIME_EXEC_REL,
+            "--command-id",
+            args.command_id,
+            "--issue-number",
+            str(args.issue_number),
+            "--repo",
+            args.repo,
+            "--invocation-id",
+            args.invocation_id,
+            "--git-head-sha",
+            args.git_head_sha,
+            "--consume-authority-transport",
+            args.router_receipt_path,
+        ]
+        if args.contract_patch_plan_file and args.anchor_context_file:
+            consume_tail += [
+                "--contract-patch-plan-file",
+                args.contract_patch_plan_file,
+                "--anchor-context-file",
+                args.anchor_context_file,
+            ]
+        command_text = " ".join(consume_tail)
+        if not is_exact_skill_runtime_authority_transport_consume_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
     else:
         if args.fixture:
             print("skill_runtime_exec: --fixture is only allowed for preflight.run.fixture", file=sys.stderr)
@@ -2150,6 +2271,29 @@ def main(argv: list[str] | None = None) -> int:
             "verdict": args.review_result_verdict,
             "max_iterations": args.max_iterations or "3",
         }
+    elif is_produce_command:
+        # #2086 AC9/AC10: producer role -- issue_number/repo are NOT seeded
+        # here (unlike the generic `else` branch below) because
+        # `authority_transport.produce`'s own render_params below already
+        # supplies them alongside its own required placeholders.
+        render_params = {
+            "issue_number": args.issue_number,
+            "repo": args.repo,
+            "invocation_id": args.invocation_id,
+            "git_head_sha": args.git_head_sha,
+            "evidence_fixture_path": args.evidence_fixture_path,
+        }
+    elif is_consume_command:
+        render_params = {
+            "issue_number": args.issue_number,
+            "repo": args.repo,
+            "invocation_id": args.invocation_id,
+            "git_head_sha": args.git_head_sha,
+            "router_receipt_path": args.router_receipt_path,
+        }
+        if args.contract_patch_plan_file and args.anchor_context_file:
+            render_params["contract_patch_plan_file"] = args.contract_patch_plan_file
+            render_params["anchor_context_file"] = args.anchor_context_file
     else:
         render_params = {"issue_number": args.issue_number, "repo": args.repo}
         if is_fixture_command:

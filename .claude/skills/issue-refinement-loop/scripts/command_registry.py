@@ -361,14 +361,27 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "mutation": False,
         "placeholders": {},
     },
-    # #2086 AC10: `execution_class` / `required_cwd` / `required_branch` /
-    # `allowed_write_roots` / `network_effect` must mirror the eligibility
-    # invariants declared in skill_runtime_command_policy.py's
+    # #2086 AC10 (iteration 2, post-#2053/#2068 merge): `decide.run`'s argv
+    # was extended by #2053 (now merged to main) to optionally carry the
+    # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 router role (issue_number/repo/
+    # authority_transport_manifest_path/authority_expected/invocation_id/
+    # git_head_sha are all optional_flag_pair / bool_flag placeholders, so a
+    # caller that omits them gets byte-identical argv to the pre-#2053
+    # loop_state_file/verdict/max_iterations-only shape). `execution_class`
+    # / `required_cwd` / `required_branch` / `allowed_write_roots` /
+    # `network_effect` must mirror the eligibility invariants declared in
+    # skill_runtime_command_policy.py's
     # `SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]["decide.run"]`
-    # and `_ROOT_NO_WORKTREE_POLICY_INVARIANTS["decide.run"]` exactly, or
-    # `validate_registry_entry()` rejects this entry before dispatch
-    # (registry/policy declaration without a real dispatch path is exactly
-    # the false-green pattern this Issue closes).
+    # exactly, or `validate_registry_entry()` rejects this entry before
+    # dispatch (registry/policy declaration without a real dispatch path is
+    # exactly the false-green pattern this Issue closes). `allowed_write_roots`
+    # is the same `.claude/artifacts/issue-refinement-loop/{active_issue}/`
+    # root used by every other eligible command_id -- decide_next_loop_action.py
+    # genuinely writes a SCOPE_DELTA_ROUTER_RECEIPT_V1 under
+    # `.claude/artifacts/issue-refinement-loop/{issue_number}/authority-transport/
+    # {invocation_id}/` (a subpath of that root) whenever both --issue-number
+    # and --invocation-id are supplied, so `allowed_write_roots: []` (this
+    # Issue's iteration-1 declaration, written before #2053 merged) was stale.
     "decide.run": {
         "id": "decide.run",
         "argv": [
@@ -377,13 +390,19 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "--loop-state-file", "{loop_state_file}",
             "--review-result-verdict", "{verdict}",
             "--max-iterations", "{max_iterations}",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--authority-transport-path", "{authority_transport_manifest_path}",
+            "{authority_expected}",
+            "--invocation-id", "{invocation_id}",
+            "--git-head-sha", "{git_head_sha}",
         ],
         "shell": False,
         "cwd_policy": "repo_root",
-        "execution_class": "exact_skill_runtime_decide",
+        "execution_class": "exact_router_authority_transport",
         "required_cwd": "canonical_main_root",
         "required_branch": "default_branch",
-        "allowed_write_roots": [],
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
         "network_effect": "local_only",
         "stdin_contract": "none",
         "stdout_contract": "decide_next_loop_action/v1",
@@ -392,7 +411,94 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "placeholders": {
             "loop_state_file": {"type": "repo_relative_file", "required": True},
             "verdict": {"type": "verdict", "required": True},
-            "max_iterations": {"type": "positive_int", "required": False},
+            "max_iterations": {"type": "positive_int", "required": False, "optional_flag_pair": True},
+            "issue_number": {"type": "positive_int", "required": False, "optional_flag_pair": True},
+            "repo": {"type": "owner_repo", "required": False, "optional_flag_pair": True},
+            "authority_transport_manifest_path": {"type": "path", "required": False, "optional_flag_pair": True},
+            "authority_expected": {"type": "bool_flag", "flag_literal": "--authority-expected"},
+            "invocation_id": {"type": "string", "required": False, "optional_flag_pair": True},
+            "git_head_sha": {"type": "string", "required": False, "optional_flag_pair": True},
+        },
+    },
+    # #2086 AC10 / AC9 (iteration 2): producer role of the #2053/#2068
+    # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 chain (command_registry.py entry
+    # itself is unchanged from #2068's merge -- reused verbatim per AC9,
+    # except `required_branch` was missing from #2068's registry entry even
+    # though skill_runtime_command_policy.py's eligible_command_ids already
+    # declared it, which made `validate_registry_entry()` reject this entry
+    # unconditionally with `required_branch_mismatch` before this fix, and
+    # `allowed_write_roots` is normalized to the same
+    # `.claude/artifacts/issue-refinement-loop/{active_issue}/` root every
+    # other eligible command_id (including skill_runtime_command_policy.py's
+    # own already-merged eligible_command_ids declaration for this exact
+    # command_id) uses, instead of the narrower authority-transport-specific
+    # literal that was never cross-validated against policy.py before this
+    # Issue's AC10 wiring made `validate_registry_entry()` actually check it).
+    "authority_transport.produce": {
+        "id": "authority_transport.produce",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--invocation-id", "{invocation_id}",
+            "--git-head-sha", "{git_head_sha}",
+            "--produce-authority-transport", "{evidence_fixture_path}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_authority_transport_producer",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "local_only",
+        "stdin_contract": "none",
+        "stdout_contract": "scope_delta_authority_transport_producer_result/v1",
+        "timeout_seconds": 60,
+        "mutation": False,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "invocation_id": {"type": "string", "required": True},
+            "git_head_sha": {"type": "string", "required": True},
+            "evidence_fixture_path": {"type": "path", "required": True},
+        },
+    },
+    # #2086 AC10 / AC9 (iteration 2): controlled consumer role of the
+    # #2053/#2068 chain. Same `required_branch` fix and `allowed_write_roots`
+    # normalization as `authority_transport.produce` above.
+    "authority_transport.consume": {
+        "id": "authority_transport.consume",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--invocation-id", "{invocation_id}",
+            "--git-head-sha", "{git_head_sha}",
+            "--consume-authority-transport", "{router_receipt_path}",
+            "--contract-patch-plan-file", "{contract_patch_plan_file}",
+            "--anchor-context-file", "{anchor_context_file}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_authority_transport_consumer",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_mutation",
+        "stdin_contract": "none",
+        "stdout_contract": "scope_delta_consumption_receipt/v1",
+        "timeout_seconds": 60,
+        "mutation": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "invocation_id": {"type": "string", "required": True},
+            "git_head_sha": {"type": "string", "required": True},
+            "router_receipt_path": {"type": "path", "required": True},
+            "contract_patch_plan_file": {"type": "path", "required": False, "optional_flag_pair": True},
+            "anchor_context_file": {"type": "path", "required": False, "optional_flag_pair": True},
         },
     },
     "gh.issue.view": {

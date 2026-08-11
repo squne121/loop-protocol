@@ -44,16 +44,31 @@ SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE = "exact_skill_runtime_fixture"
 SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR = "exact_skill_runtime_anchor"
 SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR = "exact_skill_runtime_contract_update_anchor"
 
-# #2086 AC10: sibling exact profile for the `decide.run` command class
-# (`decide_next_loop_action.py`). `decide.run` was already declared in
-# `command_registry.py` (render_command/argv/placeholders), but had no
-# matching eligible_command_ids entry here, so it could never actually be
-# dispatched through skill_runtime_exec.py -- a registry/policy-declaration-
-# only false-green. This adds the missing exact-match parser/eligibility
-# entry; `preflight.run` / anchor / fixture profiles above are entirely
-# unmodified by this addition.
-SKILL_RUNTIME_EXECUTION_CLASS_DECIDE = "exact_skill_runtime_decide"
+# #2086 AC10 (iteration 2, post-#2053/#2068 merge): sibling exact profiles
+# for the `decide.run` / `authority_transport.produce` /
+# `authority_transport.consume` command classes. `decide.run`'s
+# eligible_command_ids entry was added in iteration 1 of this Issue, but
+# `authority_transport.produce` / `authority_transport.consume` had no
+# matching entry at all, and none of the three had a real *dispatch path*
+# through `skill_runtime_exec.py`'s privileged executor (confirmed by
+# #2053/PR #2068's own pinned regression test
+# `TestAuthorityTransportPrivilegedExecutorRealSubprocessDispatch::
+# test_privileged_executor_rejects_command_id_today`, whose docstring
+# records this exact gap as an explicit Stop Condition scope delta for a
+# follow-up Issue) -- a registry/policy-declaration-only false-green this
+# Issue closes. `SKILL_RUNTIME_EXECUTION_CLASS_DECIDE`'s value is updated
+# from iteration 1's placeholder `"exact_skill_runtime_decide"` to
+# `"exact_router_authority_transport"` to match #2053/PR #2068's own
+# now-merged `command_registry.py` declaration for `decide.run` exactly
+# (the constant *name* is kept unchanged so existing references, including
+# `scripts/agent-guards/tests/test_skill_runtime_policy_anchor.py`, do not
+# need to change). `preflight.run` / anchor / fixture / contract_update
+# profiles above are entirely unmodified by this addition.
+SKILL_RUNTIME_EXECUTION_CLASS_DECIDE = "exact_router_authority_transport"
+SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_PRODUCER = "exact_authority_transport_producer"
+SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_CONSUMER = "exact_authority_transport_consumer"
 _DECIDE_VERDICT_VALUES = frozenset({"approve", "request_changes", "needs-fix"})
+
 
 # Canonical GitHub issue comment URL shape used both for the registry
 # placeholder type (`.claude/skills/issue-refinement-loop/scripts/
@@ -147,17 +162,57 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
             ],
             "network_effect": "github_read_only",
         },
-        # #2086 AC10: decide_next_loop_action.py is a read-only, non-mutating
-        # router (mutation: False in command_registry.py) that only reads an
-        # already-materialized loop state file and echoes a routing
-        # decision to stdout. It has no active-issue artifact write root of
-        # its own.
+        # #2086 AC10 (iteration 2): registers the router role of the
+        # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 chain (command_registry.py
+        # "decide.run") so the privileged runtime policy actually recognizes
+        # it, and so its real-subprocess dispatch through
+        # skill_runtime_exec.py is reachable. decide_next_loop_action.py
+        # genuinely writes a SCOPE_DELTA_ROUTER_RECEIPT_V1 under the active
+        # issue's artifact root when --issue-number/--invocation-id are
+        # supplied, so `allowed_write_roots` matches every other eligible
+        # command_id's `.claude/artifacts/issue-refinement-loop/{active_issue}/`
+        # root (iteration 1's `[]` predated #2053's merge and was stale).
         "decide.run": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_DECIDE,
             "required_cwd": "canonical_main_root",
             "required_branch": "default_branch",
-            "allowed_write_roots": [],
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
             "network_effect": "local_only",
+        },
+        # #2086 AC10 / AC9 (iteration 2): producer role of the #2053/#2068
+        # chain (command_registry.py "authority_transport.produce") --
+        # generates and immutably persists a
+        # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest from a fixture file,
+        # bypassing the gh CLI entirely (network_effect: local_only, mirrored
+        # from the registry entry).
+        "authority_transport.produce": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_PRODUCER,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "local_only",
+        },
+        # #2086 AC10 / AC9 (iteration 2): controlled consumer role
+        # (command_registry.py "authority_transport.consume") -- verifies a
+        # SCOPE_DELTA_ROUTER_RECEIPT_V1, mutates exactly once, reads back, and
+        # emits SCOPE_DELTA_CONSUMPTION_RECEIPT_V1. `network_effect` is
+        # `github_mutation` (mirrored from the registry entry): when the
+        # optional `--contract-patch-plan-file`/`--anchor-context-file`
+        # placeholders are supplied, this command's default execution path
+        # genuinely performs a real GitHub issue mutation via
+        # `edit_issue_txn.py`'s `gh` subprocess calls.
+        "authority_transport.consume": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_CONSUMER,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "github_mutation",
         },
     },
 }
@@ -245,7 +300,9 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
         "required_cwd": "canonical_main_root",
         "required_branch": "default_branch",
         "network_effect": "local_only",
-        "allowed_write_roots": [],
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        ],
     },
 }
 
@@ -261,6 +318,13 @@ class ExactSkillRuntimeCommand:
     loop_state_file: str = ""
     verdict: str = ""
     max_iterations: str = ""
+    # #2086 AC10 (iteration 2): authority_transport.produce/consume fields.
+    invocation_id: str = ""
+    git_head_sha: str = ""
+    evidence_fixture_path: str = ""
+    router_receipt_path: str = ""
+    contract_patch_plan_file: str = ""
+    anchor_context_file: str = ""
 
 
 def command_allows_root_no_worktree(parsed: ExactSkillRuntimeCommand) -> bool:
@@ -687,6 +751,256 @@ def is_exact_skill_runtime_decide_executor_command(
     if repo_slug != parsed.repo:
         return False
     return command_allows_root_no_worktree(parsed)
+
+
+_GIT_HEAD_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_INVOCATION_ID_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def parse_exact_skill_runtime_authority_transport_produce_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact-match parser for the `authority_transport.produce` command class
+    (#2086 AC9/AC10, #2053/PR #2068 producer role).
+
+    Mirrors `parse_exact_skill_runtime_command` token-for-token, with four
+    additional trailing flag/value pairs (`--invocation-id <id>
+    --git-head-sha <sha> --produce-authority-transport <repo-relative-path>`).
+    All four placeholders are `required: True` in command_registry.py's
+    `authority_transport.produce` entry, so this is a single fixed-length
+    (16-token) shape -- there is no optional-segment ambiguity to resolve,
+    unlike `decide.run`. This is a separate, independent function --
+    production `preflight.run` / fixture / anchor / decide parsers above are
+    entirely unmodified by this addition.
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    if len(tokens) != 16:
+        return None
+    if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    expected_flags = [
+        "--command-id",
+        "--issue-number",
+        "--repo",
+        "--invocation-id",
+        "--git-head-sha",
+        "--produce-authority-transport",
+    ]
+    expected_positions = [4, 6, 8, 10, 12, 14]
+    for flag, pos in zip(expected_flags, expected_positions):
+        if tokens[pos] != flag:
+            return None
+    if any(
+        tok.startswith("--command-id=")
+        or tok.startswith("--issue-number=")
+        or tok.startswith("--repo=")
+        or tok.startswith("--invocation-id=")
+        or tok.startswith("--git-head-sha=")
+        or tok.startswith("--produce-authority-transport=")
+        for tok in tokens
+    ):
+        return None
+    command_id = tokens[5]
+    issue_number = tokens[7]
+    repo = tokens[9]
+    invocation_id = tokens[11]
+    git_head_sha = tokens[13]
+    evidence_fixture_path = tokens[15]
+    if command_id != "authority_transport.produce":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0:
+        return None
+    if repo != TRUSTED_REPO_SLUG:
+        return None
+    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+        return None
+    if not _INVOCATION_ID_TOKEN_RE.match(invocation_id):
+        return None
+    if not _GIT_HEAD_SHA_RE.match(git_head_sha):
+        return None
+    if not _is_safe_repo_relative_fixture_path(evidence_fixture_path, root):
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        evidence_fixture_path=evidence_fixture_path,
+    )
+
+
+def is_exact_skill_runtime_authority_transport_produce_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """Same trusted-repo / default-branch / canonical-root / active-issue
+    safety boundary as `is_exact_skill_runtime_executor_command`, applied to
+    the `authority_transport.produce` command class (#2086 AC9/AC10).
+    `authority_transport.produce` is bound to the issue's own active
+    worktree -- unlike `decide.run`, it is not root-no-worktree eligible."""
+    parsed = parse_exact_skill_runtime_authority_transport_produce_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    default_branch = resolve_default_branch(project_root, deadline)
+    if not branch or branch != default_branch:
+        return False
+    repo_slug = resolve_repo_slug(project_root, deadline)
+    if repo_slug != parsed.repo:
+        return False
+    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
+    if active_issue != parsed.issue_number or entry is None:
+        return False
+    return True
+
+
+def _parse_exact_skill_runtime_authority_transport_consume_tail(
+    tokens: list[str], root: str
+) -> ExactSkillRuntimeCommand | None:
+    """Shared tail-parsing for both `authority_transport.consume` shapes
+    (minimal 5-required-placeholder shape, and the with-patch-plan 7-placeholder
+    shape). `--contract-patch-plan-file` / `--anchor-context-file` are
+    `optional_flag_pair` in command_registry.py's `authority_transport.consume`
+    entry and, per `run_refinement_preflight.py`'s own argparse help text, are
+    only meaningful when supplied together -- so this parser accepts exactly
+    16 tokens (neither optional pair) or exactly 20 tokens (both optional
+    pairs present); any other length, or exactly one of the two pairs
+    present, is rejected."""
+    if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    expected_flags = [
+        "--command-id",
+        "--issue-number",
+        "--repo",
+        "--invocation-id",
+        "--git-head-sha",
+        "--consume-authority-transport",
+    ]
+    expected_positions = [4, 6, 8, 10, 12, 14]
+    for flag, pos in zip(expected_flags, expected_positions):
+        if tokens[pos] != flag:
+            return None
+    if len(tokens) == 20:
+        if tokens[16] != "--contract-patch-plan-file" or tokens[18] != "--anchor-context-file":
+            return None
+    elif len(tokens) != 16:
+        return None
+    equals_guard_flags = (
+        "--command-id=",
+        "--issue-number=",
+        "--repo=",
+        "--invocation-id=",
+        "--git-head-sha=",
+        "--consume-authority-transport=",
+        "--contract-patch-plan-file=",
+        "--anchor-context-file=",
+    )
+    if any(tok.startswith(prefix) for prefix in equals_guard_flags for tok in tokens):
+        return None
+    command_id = tokens[5]
+    issue_number = tokens[7]
+    repo = tokens[9]
+    invocation_id = tokens[11]
+    git_head_sha = tokens[13]
+    router_receipt_path = tokens[15]
+    contract_patch_plan_file = tokens[17] if len(tokens) == 20 else ""
+    anchor_context_file = tokens[19] if len(tokens) == 20 else ""
+    if command_id != "authority_transport.consume":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0:
+        return None
+    if repo != TRUSTED_REPO_SLUG:
+        return None
+    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+        return None
+    if not _INVOCATION_ID_TOKEN_RE.match(invocation_id):
+        return None
+    if not _GIT_HEAD_SHA_RE.match(git_head_sha):
+        return None
+    if not _is_safe_repo_relative_fixture_path(router_receipt_path, root):
+        return None
+    if contract_patch_plan_file and not _is_safe_repo_relative_fixture_path(contract_patch_plan_file, root):
+        return None
+    if anchor_context_file and not _is_safe_repo_relative_fixture_path(anchor_context_file, root):
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        router_receipt_path=router_receipt_path,
+        contract_patch_plan_file=contract_patch_plan_file,
+        anchor_context_file=anchor_context_file,
+    )
+
+
+def parse_exact_skill_runtime_authority_transport_consume_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact-match parser for the `authority_transport.consume` command class
+    (#2086 AC9/AC10, #2053/PR #2068 controlled consumer role). This is a
+    separate, independent function -- production `preflight.run` / fixture /
+    anchor / decide / produce parsers above are entirely unmodified by this
+    addition."""
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    return _parse_exact_skill_runtime_authority_transport_consume_tail(tokens, root)
+
+
+def is_exact_skill_runtime_authority_transport_consume_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """Same trusted-repo / default-branch / canonical-root / active-issue
+    safety boundary as `is_exact_skill_runtime_executor_command`, applied to
+    the `authority_transport.consume` command class (#2086 AC9/AC10)."""
+    parsed = parse_exact_skill_runtime_authority_transport_consume_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    default_branch = resolve_default_branch(project_root, deadline)
+    if not branch or branch != default_branch:
+        return False
+    repo_slug = resolve_repo_slug(project_root, deadline)
+    if repo_slug != parsed.repo:
+        return False
+    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
+    if active_issue != parsed.issue_number or entry is None:
+        return False
+    return True
+
+
 
 
 def _parse_exact_skill_runtime_anchor_command(
@@ -1116,7 +1430,10 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "{anchor_comment_url}",
         "--consume-contract-patch-plan",
     ],
-    # #2086 AC10
+    # #2086 AC10 (iteration 2): full argv template including #2053's
+    # authority-transport extension (all six trailing placeholders are
+    # optional_flag_pair/bool_flag in command_registry.py, matched here
+    # verbatim for parity with `validate_registry_entry()`).
     "decide.run": [
         "uv",
         "run",
@@ -1128,9 +1445,57 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "{verdict}",
         "--max-iterations",
         "{max_iterations}",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--authority-transport-path",
+        "{authority_transport_manifest_path}",
+        "{authority_expected}",
+        "--invocation-id",
+        "{invocation_id}",
+        "--git-head-sha",
+        "{git_head_sha}",
+    ],
+    # #2086 AC9/AC10 (iteration 2)
+    "authority_transport.produce": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--invocation-id",
+        "{invocation_id}",
+        "--git-head-sha",
+        "{git_head_sha}",
+        "--produce-authority-transport",
+        "{evidence_fixture_path}",
+    ],
+    # #2086 AC9/AC10 (iteration 2)
+    "authority_transport.consume": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--invocation-id",
+        "{invocation_id}",
+        "--git-head-sha",
+        "{git_head_sha}",
+        "--consume-authority-transport",
+        "{router_receipt_path}",
+        "--contract-patch-plan-file",
+        "{contract_patch_plan_file}",
+        "--anchor-context-file",
+        "{anchor_context_file}",
     ],
 }
-
 _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
     "preflight.run": {
         "issue_number": {"type": "positive_int", "required": True},
@@ -1166,11 +1531,35 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "repo": {"type": "owner_repo", "required": True},
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
     },
-    # #2086 AC10
+    # #2086 AC10 (iteration 2)
     "decide.run": {
         "loop_state_file": {"type": "repo_relative_file", "required": True},
         "verdict": {"type": "verdict", "required": True},
-        "max_iterations": {"type": "positive_int", "required": False},
+        "max_iterations": {"type": "positive_int", "required": False, "optional_flag_pair": True},
+        "issue_number": {"type": "positive_int", "required": False, "optional_flag_pair": True},
+        "repo": {"type": "owner_repo", "required": False, "optional_flag_pair": True},
+        "authority_transport_manifest_path": {"type": "path", "required": False, "optional_flag_pair": True},
+        "authority_expected": {"type": "bool_flag", "flag_literal": "--authority-expected"},
+        "invocation_id": {"type": "string", "required": False, "optional_flag_pair": True},
+        "git_head_sha": {"type": "string", "required": False, "optional_flag_pair": True},
+    },
+    # #2086 AC9/AC10 (iteration 2)
+    "authority_transport.produce": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "invocation_id": {"type": "string", "required": True},
+        "git_head_sha": {"type": "string", "required": True},
+        "evidence_fixture_path": {"type": "path", "required": True},
+    },
+    # #2086 AC9/AC10 (iteration 2)
+    "authority_transport.consume": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "invocation_id": {"type": "string", "required": True},
+        "git_head_sha": {"type": "string", "required": True},
+        "router_receipt_path": {"type": "path", "required": True},
+        "contract_patch_plan_file": {"type": "path", "required": False, "optional_flag_pair": True},
+        "anchor_context_file": {"type": "path", "required": False, "optional_flag_pair": True},
     },
 }
 
@@ -1192,13 +1581,13 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
     expected_write_roots = [".claude/artifacts/issue-refinement-loop/{active_issue}/"]
     if command_id in {"contract_update.run.with_anchor", "contract_update.run.with_human_context"}:
         expected_write_roots.append("artifacts/{active_issue}/issue-metadata/")
-    # #2086 AC10: `decide.run` (decide_next_loop_action.py) is a read-only,
-    # non-mutating router (mutation: False) with no active-issue artifact
-    # write root of its own -- it is not bound to a single issue's
-    # `.claude/artifacts/issue-refinement-loop/{active_issue}/` directory
-    # the way every other eligible command_id is.
-    if command_id == "decide.run":
-        expected_write_roots = []
+    # #2086 AC10 (iteration 2): `decide.run` / `authority_transport.produce` /
+    # `authority_transport.consume` all now use the same
+    # `.claude/artifacts/issue-refinement-loop/{active_issue}/` write root as
+    # every other eligible command_id (matching this module's own
+    # eligible_command_ids declarations, which were already merged from
+    # #2053/PR #2068 before this Issue's AC10 wiring made this function
+    # actually check them) -- no per-command-id exception is needed.
     if entry.get("allowed_write_roots") != expected_write_roots:
         raise ValueError("allowed_write_roots_mismatch")
     argv = entry.get("argv")
@@ -1217,5 +1606,5 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
     }
     if argv_placeholders != declared_placeholders:
         raise ValueError("argv_placeholder_contract_mismatch")
-    if command_id != "decide.run" and "{active_issue}" not in "".join(expected_write_roots):
+    if "{active_issue}" not in "".join(expected_write_roots):
         raise ValueError("active_issue_placeholder_missing")
