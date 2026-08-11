@@ -96,7 +96,7 @@ web_research 結果に含まれる `critical_claims` の未解決 claim は huma
 
 ### Step 0: 前提条件 (Preconditions)
 
-1. Issue 本文と必要コメントを取得し、`state/needs-human` / `state/done` の hard stop を確認する。
+1. Issue 本文と必要コメントを取得する。`state/needs-human` / `state/done` は presentation-only / non-authoritative metadata（#2084）であり、それら label の単独付与だけで hard stop としない。停止には別 authority — OWNER の明示指示、または `human_judgment_required`（scope-signal-guard 等の別 authority）— が必要である。`state/done` の代替として GitHub native Issue `closed` state（`gh issue view --json state`）を参照する。
 2. `anchor_comment_url` がある場合は snapshot を固定し、対象 Issue 所属を検証する。
 3. scope rollup preflight を mutation-free で実行し、`LOOP_STATE.scope_rollup_decision` を記録する。
 4. Product/Spec routing signal を検知し、`LOOP_STATE.product_spec_context` を更新する。
