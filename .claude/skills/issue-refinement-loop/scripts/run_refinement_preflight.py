@@ -1387,14 +1387,80 @@ def _invoke_repair(body: str) -> dict:
     return parsed
 
 
-def _invoke_planner(planner_input: dict) -> tuple[dict | None, int, str, str]:
+def _write_planner_spawn_attempt_marker(
+    repo_root: Optional[Path], issue_number: Optional[int], *, script_missing: bool
+) -> None:
+    """Issue #2073 P1-4 (OWNER review): record a pre-spawn diagnostic stage
+    *before* the planner subprocess.run() call is issued, so a future
+    reproduction of the `pid_proof_planner.json` flake can distinguish "the
+    planner subprocess.run() call site was never reached" from "the call was
+    made but the child never got far enough to write its own proof". This is
+    intentionally the smallest possible monotonic stage marker (not a general
+    telemetry system) and is best-effort: a failure to write it must never
+    change `_invoke_planner`'s own control flow or return value.
+    """
+    if repo_root is None or issue_number is None:
+        return
+    try:
+        marker_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        (marker_dir / "planner_spawn_attempt_v1.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "PLANNER_SPAWN_ATTEMPT_V1",
+                    "stage": "pre_subprocess_run",
+                    "script_missing_precheck": script_missing,
+                    "pid": os.getpid(),
+                    "recorded_at": _now_iso(),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _invoke_planner(
+    planner_input: dict,
+    *,
+    repo_root: Optional[Path] = None,
+    issue_number: Optional[int] = None,
+) -> tuple[dict | None, int, str, str]:
     """
     Invoke plan_refinement_loop.py via subprocess.run([sys.executable, ...], shell=False).
 
     Returns (plan_dict, exit_code, stderr_text, raw_stdout).
     plan_dict is None on JSON parse failure.
+
+    `repo_root` / `issue_number` are optional and, when supplied, are used
+    only to write the best-effort `planner_spawn_attempt_v1.json` pre-spawn
+    diagnostic marker (Issue #2073 P1-4); they never affect the planner
+    invocation itself.
     """
     input_json = json.dumps(planner_input, ensure_ascii=False, allow_nan=False)
+
+    # Issue #2073 P1-2 (OWNER review): the previous implementation relied on
+    # subprocess.run() raising FileNotFoundError to detect a missing planner
+    # script, but that exception is only raised when the *executable*
+    # (argv[0], i.e. sys.executable) itself cannot be found -- not when a
+    # present interpreter is asked to run a missing *script* (argv[1]). In
+    # that case the interpreter itself starts, prints its own "can't open
+    # file" message to stderr, and exits with its own nonzero code (commonly
+    # 2), which previously fell through to the generic JSONDecodeError path
+    # below and was misclassified identically to an "invalid input / schema
+    # error" (exit 2) planner failure. Detecting the missing script
+    # explicitly, before ever spawning a process, makes this failure mode
+    # deterministic and reuses the same (exit 3, "planner script not
+    # found: ...") shape the `except FileNotFoundError` branch below already
+    # produces for the (much rarer) missing-executable case, so downstream
+    # classification (`classify_planner_failure`) sees a consistent
+    # "not found" signal in `stderr` regardless of which of the two ways the
+    # script turned out to be missing.
+    script_missing = not PLANNER_SCRIPT.is_file()
+    _write_planner_spawn_attempt_marker(repo_root, issue_number, script_missing=script_missing)
+    if script_missing:
+        return None, 3, f"planner script not found: {PLANNER_SCRIPT}", ""
 
     try:
         proc = subprocess.run(
@@ -3368,7 +3434,9 @@ def run_preflight(
     # collisions instead of always defaulting to 'selected'.
     _scope_rollup_plan = _load_scope_rollup_artifact(repo_root, issue_number)
     planner_input_dict = _join_scope_rollup_into_planner_input(planner_input_dict, _scope_rollup_plan)
-    plan, planner_exit_code, planner_stderr, planner_stdout_raw = _invoke_planner(planner_input_dict)
+    plan, planner_exit_code, planner_stderr, planner_stdout_raw = _invoke_planner(
+        planner_input_dict, repo_root=repo_root, issue_number=issue_number
+    )
 
     if plan is None:
         # Planner invocation failed

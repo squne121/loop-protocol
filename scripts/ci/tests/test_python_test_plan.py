@@ -183,6 +183,21 @@ def test_real_plan_serial_lane_has_debounce():
     canonical source Issue #2073 AC1's Verification Command checks; when the
     AC10 root cause is identified, update this marker (and Issue #2073 AC1's
     text/VC) together rather than leaving a stale "unresolved" claim here.
+
+    Issue #2073 follow-up (this revision): two OWNER-review blockers against
+    the diagnostic apparatus itself were fixed without changing this marker
+    -- (1) `run_refinement_preflight.py`'s `_invoke_planner()` previously
+    misclassified a missing `plan_refinement_loop.py` as an
+    `anchor_or_input_blocked` (exit 2) planner failure instead of the
+    intended `wrapper_environment_failure` (exit 3, "not found"), because a
+    present `sys.executable` failing to open a missing script argument does
+    not raise a Python `FileNotFoundError`; it now performs an explicit
+    pre-spawn `PLANNER_SCRIPT.is_file()` check instead of relying on that
+    exception. (2) `_invoke_planner()` now writes a best-effort
+    `planner_spawn_attempt_v1.json` marker as its own first action, giving a
+    stronger (though still best-effort) signal for whether its call site was
+    ever reached the next time AC10 reproduces in CI. Root cause is still
+    unconfirmed; this marker intentionally stays "unresolved" until it is.
     """
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
