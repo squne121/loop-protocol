@@ -356,9 +356,19 @@ def test_run_agy_grounded_research_passes_approved_model_chain() -> None:
 
 
 def test_run_agy_raw_command_reflects_selected_model_end_to_end() -> None:
-    """Medium 2 (1): the real execution argv (with --model) and the sanitized
-    `raw_command` published for audit are derived from the same validated
-    argv -- Blocker 1 end-to-end, through `_run_agy()` -> `run_delegation()`."""
+    """Medium 2 (1): the real execution argv and the sanitized `raw_command`
+    published for audit are derived from the same validated argv -- Blocker 1
+    end-to-end, through `_run_agy()` -> `run_delegation()`.
+
+    Issue #2069 fix_delta: `roles.grounded_research.model_chain` is now
+    intentionally empty (AGY account_default delegation, replacing the
+    former hardcoded `claude-sonnet-4-6` forcing), so no `--model` flag is
+    ever built into the real execution argv for this profile any more. The
+    Blocker 1 guarantee this test exists to cover -- that `raw_command` is
+    derived from the *same* validated argv actually executed, never a
+    separately-reconstructed placeholder -- still holds and is asserted here
+    via the absence of `--model` being consistent across both.
+    """
     captured_cmd: dict[str, Any] = {"value": None}
     grounded_output = (
         "Response from AGY.\n"
@@ -380,13 +390,16 @@ def test_run_agy_raw_command_reflects_selected_model_end_to_end() -> None:
     assert result["ok"] is True
     exec_cmd = captured_cmd["value"]
     assert exec_cmd is not None
-    assert "--model" in exec_cmd
-    model_index = exec_cmd.index("--model")
-    expected_model = exec_cmd[model_index + 1]
+    # grounded_research's model_chain is empty by design (Issue #2069) --
+    # no --model flag is forced into the real subprocess argv (AGY resolves
+    # account_default on its own).
+    assert "--model" not in exec_cmd
 
-    # The published raw_command must include the SAME --model value that was
-    # actually executed -- not a placeholder reconstruction that dropped it.
-    assert result["raw_command"] == ["agy", "-p", "<prompt>", "--model", expected_model]
+    # The published raw_command must reflect the SAME argv shape that was
+    # actually executed -- still no --model here either, not a placeholder
+    # reconstruction that adds one back in.
+    assert result["raw_command"] == ["agy", "-p", "<prompt>"]
+    assert "--model" not in result["raw_command"]
 
 
 def test_poisoned_builder_run_through_run_delegation_blocks_subprocess_and_classifies() -> None:

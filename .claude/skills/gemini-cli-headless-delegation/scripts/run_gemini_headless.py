@@ -430,6 +430,16 @@ def resolve_model_chain(
             return [], f"unknown_role: {role!r} is not defined in model_routing; valid roles: {sorted(roles)}"
         chain = roles[role].get("model_chain", [])
         if not chain:
+            if role == AGY_GROUNDED_RESEARCH_ROLE:
+                # Issue #2069 grounded_research_empty_chain_exception: an
+                # empty model_chain for grounded_research is an intentional
+                # configuration (AGY account_default delegation -- see the
+                # matching exception in load_model_routing() above), not a
+                # resolution error. Callers (e.g. resolve_agy_grounded_research_model())
+                # already treat an empty chain as "no --model flag"; this
+                # keeps resolve_model_chain() consistent for that same role
+                # instead of surfacing a spurious empty_chain error.
+                return [], None
             return [], f"empty_chain: roles[{role!r}].model_chain is empty"
         return list(chain), None
 
