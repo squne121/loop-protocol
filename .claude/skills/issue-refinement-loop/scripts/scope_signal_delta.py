@@ -790,6 +790,41 @@ _DIRECTIVE_SECTION_MARKERS = (
 )
 
 _BULLET_LINE_RE = re.compile(r"^\s*[-*]\s+\S.*$", re.MULTILINE)
+
+# #2086 AC1 P1 fix_delta: a bullet line's mere PRESENCE is not itself
+# evidence of a scope-expansion directive (an observation note, a TODO
+# item, or a pasted failure-log line can be a bullet too). This pattern
+# requires the bullet's own CONTENT to carry an imperative
+# directive-request verb -- Japanese te-kudasai / beki-da forms, or a
+# common English imperative -- distinct from origin-lane assertion (which
+# `operator_asserted_human_context` already carries independently).
+_SEMANTIC_DIRECTIVE_VERB_RE = re.compile(
+    r"(?:"
+    r"して(?:ください|下さい|欲しい|ほしい)|"
+    r"する(?:必要がある|べきです|べきだ|こと)|"
+    r"を(?:修正|直|追加|拡張|対応|実装|変更|適用|統一|削除|除去)(?:して|する)|"
+    r"\bfix(?:es|ed)?\b|\bupdate[sd]?\b|\badd(?:s|ed)?\b|\baddress(?:es|ed)?\b|"
+    r"\bextend(?:s|ed)?\b|\bapply\b|\bapplied\b|\bchange[sd]?\b|\bmodify\b|"
+    r"\bmodified\b|\brefactor\b|\bimplement(?:s|ed)?\b|\bremove[sd]?\b|"
+    r"\bcorrect(?:s|ed)?\b|\bresolve[sd]?\b|\badjust(?:s|ed)?\b|\bmust\b|\bshould\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _has_semantic_directive_bullet(text: "str | None") -> bool:
+    """#2086 AC1 P1 fix_delta: does any bullet-list line in `text` carry an
+    imperative directive-request verb (see `_SEMANTIC_DIRECTIVE_VERB_RE`)?
+    Used only by the operator-selected human-context, no-known-marker
+    branch of `classify_directive_confidence()` -- semantic content
+    detection is kept separate from origin-lane assertion so that an
+    observation/TODO/failure-log bullet list is never conflated with an
+    actual scope-expansion directive just because the comment arrived on
+    the trusted human-context lane."""
+    for item in extract_directive_items(text):
+        if _SEMANTIC_DIRECTIVE_VERB_RE.search(item):
+            return True
+    return False
 _CONCRETE_PERMISSION_DELTA_RE = re.compile(
     r"(?:permission[ _-]?(?:delta|profile)|permissions?[ _-]?profile|権限(?:差分|プロファイル))"
     r"\s*[:=]?\s*(?P<before>[^\n→]{1,120}?)\s*(?:->|→)\s*(?P<after>[^\n]{1,120})",
@@ -890,7 +925,13 @@ def classify_directive_confidence(
     marker_list = markers if markers is not None else extract_directive_markers(text)
     has_bullets = bool(_BULLET_LINE_RE.search(text or ""))
     if not marker_list:
-        if operator_asserted_human_context and has_bullets:
+        # #2086 AC1 P1 fix_delta: origin-lane assertion
+        # (`operator_asserted_human_context`) and semantic-directive
+        # detection (`_has_semantic_directive_bullet`) are separate
+        # concerns -- ANY bullet existing in a human-context comment is not
+        # itself sufficient; the bullet content must actually carry an
+        # imperative directive-request verb.
+        if operator_asserted_human_context and _has_semantic_directive_bullet(text):
             return DIRECTIVE_CONFIDENCE_EXPLICIT
         return DIRECTIVE_CONFIDENCE_INFERRED
     if has_bullets:
@@ -1740,12 +1781,25 @@ def _has_investigation_derived_allowed_path_literals(
     """
     if not isinstance(investigation_derived_path_literals, list):
         return False
+    if not investigation_derived_path_literals:
+        return False
+    # #2086 AC4 P0 fix_delta: this was previously an `any()` check -- a
+    # SINGLE syntactically-valid entry anywhere in the list cleared the
+    # boundary even if the list also contained an unsafe/malformed token
+    # (e.g. `["docs/dev/workflow.md", "../../escape.py"]`). That is an
+    # authority-laundering risk the moment a caller actually wires this
+    # parameter through (see run_refinement_preflight.py / #2086 AC3): a
+    # single genuine investigation result mixed with ONE attacker- or
+    # bug-supplied unsafe token would still clear `expands_allowed_paths`.
+    # Fail-closed on mixed input: EVERY entry must be a safe, non-empty
+    # string that normalizes to an exact repository-relative path literal,
+    # or the entire set is untrusted and the boundary is NOT cleared.
     for item in investigation_derived_path_literals:
         if not isinstance(item, str):
-            continue
-        if _normalize_exact_repository_path_literal(item) is not None:
-            return True
-    return False
+            return False
+        if _normalize_exact_repository_path_literal(item) is None:
+            return False
+    return True
 
 
 def _first_blocking_boundary_reason(

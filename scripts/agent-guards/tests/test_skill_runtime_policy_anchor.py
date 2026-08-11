@@ -213,15 +213,24 @@ def _make_repo(tmp_path: Path) -> Path:
 
 
 def _install_decide_run_fixture(repo_root: Path) -> None:
-    """Install the real (unmodified) privileged executor + policy module,
-    plus a minimal stub `command_registry.py` / `decide_next_loop_action.py`
-    pair -- the same "only the domain script is stubbed" convention already
-    used by `_install_skill_runtime_exec_fixture` in
-    `test_skill_runtime_exec_anchor.py` for `preflight.run.with_anchor`.
+    """Install the REAL (unmodified) privileged executor, policy module,
+    `command_registry.py`, and `decide_next_loop_action.py` from the current
+    repo -- #2086 AC10 P0 fix: this fixture previously stubbed out both
+    `command_registry.py` (with hand-added `execution_class` etc. metadata
+    the real registry entry was missing) AND `decide_next_loop_action.py`
+    itself (replaced by a fake script that only echoed
+    `STATUS: reached_real_subprocess`), which meant this test could never
+    detect a `validate_registry_entry()` rejection of the real `decide.run`
+    entry or any real behavior of the real router. Only
+    `scripts/agent-ops/worktree_catalog.py` remains a minimal local stub
+    (it depends on live worktree enumeration that is out of scope for this
+    exact-command-dispatch contract test).
     """
     for rel in (
         "scripts/agent-guards/skill_runtime_exec.py",
         "scripts/agent-guards/skill_runtime_command_policy.py",
+        ".claude/skills/issue-refinement-loop/scripts/command_registry.py",
+        ".claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py",
     ):
         _write_text(repo_root / rel, (REPO_ROOT / rel).read_text())
 
@@ -240,64 +249,6 @@ def list_worktrees(project_root: str, deadline=None):
 
 def select_issue_worktree(catalog, issue_number, root_realpath):
     return None
-""",
-    )
-    _write_text(
-        repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "command_registry.py",
-        """from __future__ import annotations
-
-REGISTRY = {
-    "decide.run": {
-        "id": "decide.run",
-        "argv": [
-            "uv", "run", "python3",
-            ".claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py",
-            "--loop-state-file", "{loop_state_file}",
-            "--review-result-verdict", "{verdict}",
-            "--max-iterations", "{max_iterations}",
-        ],
-        "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_decide",
-        "required_cwd": "canonical_main_root", "required_branch": "default_branch",
-        "allowed_write_roots": [],
-        "network_effect": "local_only",
-        "placeholders": {
-            "loop_state_file": {"type": "repo_relative_file", "required": True},
-            "verdict": {"type": "verdict", "required": True},
-            "max_iterations": {"type": "positive_int", "required": False},
-        },
-    },
-}
-
-
-def render_command(command_id: str, values: dict[str, object]) -> list[str]:
-    return [str(values[token[1:-1]]) if token.startswith("{") else token for token in REGISTRY[command_id]["argv"]]
-""",
-    )
-    _write_text(
-        repo_root
-        / ".claude"
-        / "skills"
-        / "issue-refinement-loop"
-        / "scripts"
-        / "decide_next_loop_action.py",
-        """from __future__ import annotations
-import argparse
-import json
-from pathlib import Path
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--loop-state-file", required=True)
-parser.add_argument("--review-result-verdict", required=True)
-parser.add_argument("--max-iterations", type=int, required=True)
-args = parser.parse_args()
-state = json.loads(Path(args.loop_state_file).read_text())
-print(json.dumps({
-    "STATUS": "reached_real_subprocess",
-    "loop_state_file": args.loop_state_file,
-    "verdict": args.review_result_verdict,
-    "max_iterations": args.max_iterations,
-    "iteration": state.get("iteration"),
-}))
 """,
     )
     loop_state_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / "2086"
@@ -348,19 +299,30 @@ def _run_decide_executor(
 
 
 def test_decide_run_reaches_real_subprocess(tmp_path: Path) -> None:
-    """AC10: decide.run must reach the real `decide_next_loop_action.py`
-    subprocess through the unmodified production executor/policy dispatch
-    path, not just be declared in the registry."""
+    """AC10: decide.run must reach the REAL `decide_next_loop_action.py`
+    subprocess (unmodified, copied verbatim from the current repo) through
+    the unmodified production executor/policy dispatch path AND the REAL
+    `command_registry.py` `decide.run` entry -- not a stub replacement of
+    either. If the real registry entry is missing
+    `execution_class`/`required_cwd`/`required_branch`/`allowed_write_roots`
+    (the #2086 AC10 P0 false-green this test previously hid), this test
+    fails at `validate_registry_entry()` before any subprocess is spawned.
+
+    With loop_state {iteration: 0, max_iterations: 3} and
+    review-result-verdict=needs-fix, the real router's bounded #1873 verdict
+    routing (decide_next_action Priority 5) resolves to
+    `STATUS: pass` / `NEXT_ACTION: continue_to_step_4`, exit code 0 —
+    asserted against the router's real `STATUS:`/`NEXT_ACTION:` stdout
+    contract (`_format_output`), not a fabricated JSON payload."""
     repo = _make_repo(tmp_path)
     _install_decide_run_fixture(repo)
 
     result = _run_decide_executor(repo)
     assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
-    assert payload["STATUS"] == "reached_real_subprocess"
-    assert payload["verdict"] == "needs-fix"
-    assert payload["max_iterations"] == 3
-    assert payload["iteration"] == 0
+    stdout_lines = result.stdout.strip().splitlines()
+    assert "STATUS: pass" in stdout_lines, result.stdout
+    assert "NEXT_ACTION: continue_to_step_4" in stdout_lines, result.stdout
+    assert not any(line.startswith("BLOCKERS:") for line in stdout_lines), result.stdout
 
 
 def test_decide_run_rejects_missing_loop_state_file(tmp_path: Path) -> None:
@@ -427,54 +389,11 @@ def test_fixture_flag_is_rejected_for_decide_run(tmp_path: Path) -> None:
 def test_decide_run_only_flags_rejected_for_preflight_run(tmp_path: Path) -> None:
     """`--loop-state-file`/`--review-result-verdict`/`--max-iterations` are
     decide.run-only; a plain command_id must reject them before dispatch
-    (lane isolation, AC6-adjacent)."""
+    (lane isolation, AC6-adjacent). Uses the REAL `command_registry.py`
+    (installed by `_install_decide_run_fixture`), which already declares
+    `preflight.run` -- no hand-injected registry mutation needed."""
     repo = _make_repo(tmp_path)
     _install_decide_run_fixture(repo)
-    (
-        repo
-        / ".claude"
-        / "skills"
-        / "issue-refinement-loop"
-        / "scripts"
-        / "command_registry.py"
-    ).write_text(
-        (
-            repo
-            / ".claude"
-            / "skills"
-            / "issue-refinement-loop"
-            / "scripts"
-            / "command_registry.py"
-        )
-        .read_text()
-        .replace(
-            'REGISTRY = {\n    "decide.run"',
-            (
-                'REGISTRY = {\n'
-                '    "preflight.run": {\n'
-                '        "id": "preflight.run",\n'
-                '        "argv": [\n'
-                '            "uv", "run", "python3",\n'
-                '            ".claude/skills/issue-refinement-loop/scripts/'
-                'run_refinement_preflight.py",\n'
-                '            "--issue-number", "{issue_number}", "--repo", "{repo}",\n'
-                '        ],\n'
-                '        "shell": False, "cwd_policy": "repo_root",\n'
-                '        "execution_class": "exact_skill_runtime",\n'
-                '        "required_cwd": "canonical_main_root",\n'
-                '        "required_branch": "default_branch",\n'
-                '        "allowed_write_roots": '
-                '[".claude/artifacts/issue-refinement-loop/{active_issue}/"],\n'
-                '        "network_effect": "github_read_only",\n'
-                '        "placeholders": {\n'
-                '            "issue_number": {"type": "positive_int", "required": True},\n'
-                '            "repo": {"type": "owner_repo", "required": True},\n'
-                '        },\n'
-                '    },\n'
-                '    "decide.run"'
-            ),
-        )
-    )
 
     result = subprocess.run(
         [

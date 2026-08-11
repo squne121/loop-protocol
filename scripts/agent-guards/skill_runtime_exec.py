@@ -2134,15 +2134,28 @@ def main(argv: list[str] | None = None) -> int:
     render_command = getattr(module, "render_command", None)
     if not callable(render_command):
         raise RuntimeError("render_command_missing")
-    render_params: dict[str, object] = {"issue_number": args.issue_number, "repo": args.repo}
-    if is_fixture_command:
-        render_params["fixture"] = args.fixture
-    if is_anchor_command or is_contract_update_command:
-        render_params["anchor_comment_url"] = args.anchor_comment_url
+    # #2086 AC10 P0: `decide.run`'s registry entry declares only
+    # loop_state_file/verdict/max_iterations placeholders (it has no
+    # `{issue_number}`/`{repo}` tokens in its argv template -- unlike every
+    # other command_id here). render_command() fail-closed-rejects any
+    # extra params not in the entry's declared `placeholders`, so
+    # unconditionally seeding `issue_number`/`repo` into render_params
+    # made every real decide.run dispatch raise `ValueError` before ever
+    # reaching a subprocess. This was masked by the previous test's stub
+    # `render_command()`, which silently ignored undeclared params instead
+    # of validating them (see test_decide_run_reaches_real_subprocess).
     if is_decide_command:
-        render_params["loop_state_file"] = args.loop_state_file
-        render_params["verdict"] = args.review_result_verdict
-        render_params["max_iterations"] = args.max_iterations or "3"
+        render_params: dict[str, object] = {
+            "loop_state_file": args.loop_state_file,
+            "verdict": args.review_result_verdict,
+            "max_iterations": args.max_iterations or "3",
+        }
+    else:
+        render_params = {"issue_number": args.issue_number, "repo": args.repo}
+        if is_fixture_command:
+            render_params["fixture"] = args.fixture
+        if is_anchor_command or is_contract_update_command:
+            render_params["anchor_comment_url"] = args.anchor_comment_url
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
 

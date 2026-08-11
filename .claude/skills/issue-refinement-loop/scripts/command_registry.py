@@ -361,6 +361,14 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "mutation": False,
         "placeholders": {},
     },
+    # #2086 AC10: `execution_class` / `required_cwd` / `required_branch` /
+    # `allowed_write_roots` / `network_effect` must mirror the eligibility
+    # invariants declared in skill_runtime_command_policy.py's
+    # `SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]["decide.run"]`
+    # and `_ROOT_NO_WORKTREE_POLICY_INVARIANTS["decide.run"]` exactly, or
+    # `validate_registry_entry()` rejects this entry before dispatch
+    # (registry/policy declaration without a real dispatch path is exactly
+    # the false-green pattern this Issue closes).
     "decide.run": {
         "id": "decide.run",
         "argv": [
@@ -372,6 +380,11 @@ REGISTRY: dict[str, dict[str, Any]] = {
         ],
         "shell": False,
         "cwd_policy": "repo_root",
+        "execution_class": "exact_skill_runtime_decide",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [],
+        "network_effect": "local_only",
         "stdin_contract": "none",
         "stdout_contract": "decide_next_loop_action/v1",
         "timeout_seconds": 30,

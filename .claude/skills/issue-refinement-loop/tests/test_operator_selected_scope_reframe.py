@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -125,6 +127,39 @@ def test_classify_directive_confidence_does_not_require_known_marker_on_operator
             _WORKFLOW_WIDE_FREEFORM_BODY, markers, operator_asserted_human_context=True
         )
         == sda.DIRECTIVE_CONFIDENCE_EXPLICIT
+    )
+
+
+# #2086 AC1 P1 fix_delta: a bullet list that is NOT an actual
+# scope-expansion directive (observation notes / failure-log lines) must
+# not be classified as `explicit` on the operator-selected human-context
+# lane just because it has bullets.
+_NON_DIRECTIVE_BULLET_BODY = "\n".join(
+    [
+        "調査中に issue-refinement-loop で以下の状況を確認しました。",
+        "- 現在のログには AssertionError が記録されている。",
+        "- 直近の実行時刻は 2026-08-10 だった。",
+        "- 関連する PR 番号は #2084 だった。",
+    ]
+)
+
+
+def test_non_directive_bullet_list_is_not_explicit_on_operator_lane_ac1():
+    """AC1 P1 fix_delta: origin-lane assertion (operator-selected
+    human-context) must not be conflated with semantic-directive detection.
+    An observation/failure-log bullet list has no known section marker AND
+    no imperative directive-request verb in any bullet -- it must stay
+    `inferred`, not `explicit`, even on the trusted human-context lane."""
+    markers = sda.extract_directive_markers(_NON_DIRECTIVE_BULLET_BODY)
+    assert markers == [], "fixture must not accidentally contain a known marker"
+    assert sda._BULLET_LINE_RE.search(_NON_DIRECTIVE_BULLET_BODY), "fixture must contain bullets"
+    assert sda._has_semantic_directive_bullet(_NON_DIRECTIVE_BULLET_BODY) is False
+
+    assert (
+        sda.classify_directive_confidence(
+            _NON_DIRECTIVE_BULLET_BODY, markers, operator_asserted_human_context=True
+        )
+        == sda.DIRECTIVE_CONFIDENCE_INFERRED
     )
 
 
@@ -236,6 +271,28 @@ def test_investigation_derived_path_literals_do_not_clear_destructive_boundary_a
     assert result["route"]["reason_code"] == "destructive_or_non_idempotent_operation"
 
 
+def test_investigation_derived_path_literals_mixed_valid_and_unsafe_stays_fail_closed_ac4():
+    """#2086 AC4 P0 fix_delta: a MIXED list containing both a safe literal
+    and an unsafe/traversal token must NOT clear the boundary -- one safe
+    entry must never launder the whole list. Regression for the `any()`
+    authority-laundering risk in `_has_investigation_derived_allowed_path_
+    literals()` (previously only unsafe-only lists were tested)."""
+    evidence = _evidence(_VAGUE_ALLOWED_PATHS_BODY)
+    assert sda._has_investigation_derived_allowed_path_literals(
+        ["docs/dev/workflow.md", "../../escape.py"]
+    ) is False
+    assert sda._has_investigation_derived_allowed_path_literals(
+        ["/etc/passwd", ".claude/skills/impl-review-loop/SKILL.md"]
+    ) is False
+
+    result = _classify(
+        evidence,
+        investigation_derived_path_literals=["docs/dev/workflow.md", "../../escape.py"],
+    )
+    assert result["route"]["action"] == "human_escalation"
+    assert result["route"]["reason_code"] == "expands_allowed_paths"
+
+
 def test_investigation_derived_path_literals_reject_unsafe_tokens():
     """An unsafe/absolute/traversal literal supplied via
     investigation_derived_path_literals must not clear the boundary either
@@ -296,6 +353,140 @@ def test_unlabeled_lane_never_gets_operator_relaxation_ac6():
         investigation_derived_path_literals=[".claude/skills/impl-review-loop/SKILL.md"],
     )
     assert result["route"]["action"] == "human_escalation"
+
+
+# ---------------------------------------------------------------------------
+# #2086 AC3 P0 fix_delta: `investigation_derived_path_literals` must be
+# reachable from the REAL canonical `preflight.run.with_human_context`
+# entrypoint (`run_refinement_preflight.run_preflight()`, which the registry
+# command dispatches to via `skill_runtime_exec.py`), not merely from a
+# direct hand-injected call to `classify_scope_delta_authority()`. This
+# exercises the full production chain: `run_preflight()` ->
+# `_build_scope_delta_authority_evidence()` -> real
+# `plan_refinement_loop.py` subprocess (`_invoke_planner()`, the same
+# `subprocess.run([sys.executable, PLANNER_SCRIPT], ...)` call production
+# uses) -> `classify_scope_delta_authority()` -> the persisted
+# `refinement_preflight_provenance_v1.json` artifact's
+# `runtime_evidence.route.action`.
+# ---------------------------------------------------------------------------
+
+_E2E_2086_ARTIFACT_DIR = SKILL_ROOT.parent.parent / "artifacts" / "issue-refinement-loop" / str(ISSUE)
+
+_E2E_2086_ISSUE_BODY = (
+    "## Machine-Readable Contract\n\n"
+    "```yaml\n"
+    "contract_schema_version: v1\n"
+    "issue_kind: implementation\n"
+    "parent_issue: none\n"
+    "goal_ref: test\n"
+    "change_kind: workflow\n"
+    "```\n\n"
+    "## Parent Issue\n\nnone\n\n"
+    "## Parent Goal Ref\n\ntest\n\n"
+    "## Current Validated Scope\n\n- test\n\n"
+    "## Remaining Parent Gaps\n\nnone\n\n"
+    "## Outcome\n\ntest\n\n"
+    "## In Scope\n\n- test\n\n"
+    "## Out of Scope\n\n- none\n\n"
+    "## Acceptance Criteria\n\n- [ ] AC1: test\n\n"
+    "## Verification Commands\n\n```bash\n$ true\n```\n\n"
+    "## Allowed Paths\n\n- docs/dev/workflow.md\n\n"
+    "## Stop Conditions\n\n- none\n\n"
+    "## Required Skills\n\n- none\n"
+)
+
+
+
+def _e2e_2086_anchor_comment(body: str) -> dict:
+    return {
+        "id": 5249734344,
+        "body": body,
+        "issue_url": f"https://api.github.com/repos/{REPO}/issues/{ISSUE}",
+        "created_at": "2026-08-11T00:00:00Z",
+        "updated_at": "2026-08-11T00:00:00Z",
+        "html_url": URL,
+        "url": f"https://api.github.com/repos/{REPO}/issues/comments/5249734344",
+        "user": {"login": "squne121", "type": "User"},
+        "author_association": "OWNER",
+    }
+
+
+def _e2e_2086_run_preflight(*, known_context: dict, run_id: str, tmp_path):
+    fixture = {
+        "schema_version": "refinement_preflight_input/v1",
+        "issue_number": ISSUE,
+        "repo": REPO,
+        "now": "2026-08-11T00:00:00Z",
+        "issue": {"number": ISSUE, "title": "test", "body": _E2E_2086_ISSUE_BODY, "labels": []},
+        "comments": [],
+        "anchor_comment_urls": [URL],
+        "anchor_comments": [_e2e_2086_anchor_comment(_VAGUE_ALLOWED_PATHS_BODY)],
+    }
+    fixture_path = tmp_path / f"preflight_2086_{run_id}.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    try:
+        result, exit_code = preflight.run_preflight(
+            issue_number=ISSUE,
+            repo=REPO,
+            anchor_comment_urls=[URL],
+            fixture_path=fixture_path,
+            known_context=known_context,
+        )
+        prov_path = _E2E_2086_ARTIFACT_DIR / "refinement_preflight_provenance_v1.json"
+        assert prov_path.exists(), "provenance artifact must be written by the real run_preflight() success path"
+        provenance = json.loads(prov_path.read_text(encoding="utf-8"))
+    finally:
+        if _E2E_2086_ARTIFACT_DIR.exists():
+            shutil.rmtree(_E2E_2086_ARTIFACT_DIR)
+    return result, exit_code, provenance
+
+
+def test_investigation_derived_path_literals_reach_contract_update_via_real_preflight_entrypoint_ac3(tmp_path):
+    """AC3 (runtime-verification): the caller-supplied
+    `investigation_derived_path_literals` must actually flow end-to-end
+    through the real `preflight.run.with_human_context` production chain --
+    `run_preflight()` -> real `plan_refinement_loop.py` subprocess ->
+    `classify_scope_delta_authority()` -- and be visible in the persisted
+    `refinement_preflight_provenance_v1.json` artifact's
+    `runtime_evidence.route.action`. Prior to the #2086 AC3 P0 fix_delta,
+    `plan_refinement_loop.py`'s two `classify_scope_delta_authority()` call
+    sites never forwarded this field, so this always resolved to
+    `human_escalation` regardless of what a caller supplied."""
+    _result, _exit_code, provenance = _e2e_2086_run_preflight(
+        known_context={
+            "human_context_comment_urls": [URL],
+            "agent_report_comment_urls": [],
+            "investigation_derived_path_literals": [
+                "docs/dev/workflow.md",
+                ".claude/skills/impl-review-loop/SKILL.md",
+                ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+                ".claude/skills/implement-issue/SKILL.md",
+            ],
+        },
+        run_id="with_literals",
+        tmp_path=tmp_path,
+    )
+    route = provenance["runtime_evidence"]["route"]
+    assert route["action"] == "contract_update_required", provenance
+    assert route["implementation_allowed"] is False, provenance
+
+
+def test_investigation_derived_path_literals_absent_still_escalates_via_real_preflight_entrypoint_ac3(tmp_path):
+    """Negative control for the AC3 wiring test above: the SAME real
+    `run_preflight()` entrypoint, with an identical directive but no
+    `investigation_derived_path_literals`, must still resolve to
+    `human_escalation` -- proving the positive test above is exercising
+    real wiring, not a boundary that always clears."""
+    _result, _exit_code, provenance = _e2e_2086_run_preflight(
+        known_context={
+            "human_context_comment_urls": [URL],
+            "agent_report_comment_urls": [],
+        },
+        run_id="without_literals",
+        tmp_path=tmp_path,
+    )
+    route = provenance["runtime_evidence"]["route"]
+    assert route["action"] == "human_escalation", provenance
 
 
 def test_untrusted_author_association_never_gets_operator_relaxation_ac5():
