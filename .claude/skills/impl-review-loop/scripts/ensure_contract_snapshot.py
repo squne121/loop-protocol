@@ -114,7 +114,20 @@ from evaluate_product_spec_gate import evaluate_product_spec_payload  # noqa: E4
 
 _DEFAULT_REPO = "squne121/loop-protocol"
 _DEFAULT_TIMEOUT = 30
-_VC_TIMEOUT = 180
+# Outer deadline for the bounded contract-review materializer subprocess.
+# Per-command VC timeout/default semantics remain owned by
+# run_contract_review_once.py and are intentionally not passed through here.
+_VC_TIMEOUT = 360
+_MAX_CLASSIFICATIONS_TRANSPORT_CHARS = 16_000
+_CLASSIFICATIONS_TRANSPORT_SCHEMA = "vc_preflight_classifications_transport/v1"
+_CLASSIFICATIONS_TRANSPORT_OMIT_KEYS = frozenset(
+    {
+        "stdout_head",
+        "stderr_head",
+        "runner_env_delta",
+        "pnpm_gate_evidence",
+    }
+)
 
 # Idempotency marker template
 _IDEMPOTENCY_MARKER_TEMPLATE = (
@@ -397,12 +410,7 @@ def has_vc_preflight_classifications(go_result: object) -> bool:
     if not isinstance(vc_preflight, dict):
         return False
     classifications = vc_preflight.get("classifications")
-    if isinstance(classifications, list):
-        return True
-    return (
-        isinstance(classifications, str)
-        and vc_preflight.get("decision") == "pass"
-    )
+    return isinstance(classifications, list)
 
 
 def is_go_current(go_result: object, expected_body_sha256: str) -> bool:
@@ -424,6 +432,43 @@ def is_go_current(go_result: object, expected_body_sha256: str) -> bool:
             body_sha256=expected_body_sha256,
         ).get("routing_action") == "continue"
     )
+
+
+def compact_vc_preflight_classifications(
+    classifications: list[Any],
+) -> tuple[list[Any], dict[str, Any]]:
+    """Bound snapshot transport while retaining a strict classifications list.
+
+    The complete producer payload is bound by digest and count.  If it cannot
+    fit in the parser's bounded JSON transport, only verbose execution output
+    is omitted; classification records and every non-verbose consumer field
+    remain unchanged.  A compacted list that still exceeds the hard cap is
+    rejected rather than converted to an opaque scalar or truncated further.
+    """
+    original_json = json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
+    metadata: dict[str, Any] = {
+        "schema": _CLASSIFICATIONS_TRANSPORT_SCHEMA,
+        "classification_count": len(classifications),
+        "original_payload_sha256": sha256_of(original_json),
+        "compact": False,
+        "truncated": False,
+    }
+    if len(original_json) <= _MAX_CLASSIFICATIONS_TRANSPORT_CHARS:
+        return classifications, metadata
+
+    compacted: list[Any] = []
+    for item in classifications:
+        if not isinstance(item, dict):
+            raise ValueError("vc_preflight_classifications_non_object_cannot_compact")
+        compacted.append(
+            {key: value for key, value in item.items() if key not in _CLASSIFICATIONS_TRANSPORT_OMIT_KEYS}
+        )
+    compacted_json = json.dumps(compacted, ensure_ascii=False, separators=(",", ":"))
+    if len(compacted_json) > _MAX_CLASSIFICATIONS_TRANSPORT_CHARS:
+        raise ValueError("vc_preflight_classifications_compact_payload_too_large")
+    metadata["compact"] = True
+    metadata["truncated"] = True
+    return compacted, metadata
 
 
 def is_go_base_binding_current(
@@ -1590,7 +1635,14 @@ CONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:
     )
     if not isinstance(vc_preflight_classifications, list):
         vc_preflight_classifications = []
+    (
+        vc_preflight_classifications,
+        classifications_transport,
+    ) = compact_vc_preflight_classifications(vc_preflight_classifications)
     classifications_json = json_yaml_scalar(vc_preflight_classifications)
+    classifications_transport_json = json.dumps(
+        classifications_transport, ensure_ascii=False, separators=(",", ":")
+    )
 
     # P0-2 (#1794 PR review): declared_path_overlap (Issue #1680, advisory
     # only) was being dropped when building the authoritative
@@ -1632,6 +1684,7 @@ CONTRACT_REVIEW_RESULT_V1:
     vc_preflight:
       decision: {vc_preflight_check}
       classifications: {classifications_json}
+      classifications_transport: {classifications_transport_json}
     declared_path_overlap: {declared_path_overlap_json}
   source: ensure_contract_snapshot_auto{fingerprint_yaml}
 ```

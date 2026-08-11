@@ -194,15 +194,6 @@ def test_validator_receives_final_body_with_closes_reference(monkeypatch: pytest
         Path(body_path).unlink(missing_ok=True)
 
 
-def test_link_kind_help_exposes_auto_and_refs(capsys: pytest.CaptureFixture[str]):
-    """Caller can discover the explicit Refs override from CLI help."""
-    with pytest.raises(SystemExit) as exc_info:
-        open_pr.parse_args(["--help"])
-
-    assert exc_info.value.code == 0
-    assert "--link-kind {auto,Refs}" in capsys.readouterr().out
-
-
 def test_default_open_issue_link_kind_remains_closes(monkeypatch: pytest.MonkeyPatch):
     """The auto default keeps the existing OPEN issue Closes behavior."""
     body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
@@ -313,10 +304,10 @@ def test_default_closed_issue_link_kind_remains_refs(monkeypatch: pytest.MonkeyP
         Path(body_path).unlink(missing_ok=True)
 
 
-def test_explicit_refs_for_open_issue_preserves_refs_and_runs_preflights(
+def test_existing_refs_for_open_issue_are_preserved_and_run_preflights(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Explicit Refs wins for an OPEN issue without bypassing the PR gates."""
+    """An existing Refs link wins for an OPEN issue without bypassing PR gates."""
     body_path = write_temp_body(load_fixture("valid_not_schema_change.md") + "\n\nRefs #330\n")
     observed = {"body": "", "lines": [], "idempotency_calls": 0, "canonical_calls": 0}
     try:
@@ -370,7 +361,6 @@ def test_explicit_refs_for_open_issue_preserves_refs_and_runs_preflights(
                 "--linked-issue", "330",
                 "--publish", "yes",
                 "--pr-body-file", body_path,
-                "--link-kind", "Refs",
             ]
         )
 

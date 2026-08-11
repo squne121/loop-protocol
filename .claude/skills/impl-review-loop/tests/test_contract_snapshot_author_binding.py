@@ -18,6 +18,8 @@ import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 _HERE = Path(__file__).resolve().parent
 _SCRIPTS_DIR = _HERE.parent / "scripts"
 _ICR_SCRIPTS_DIR = _HERE.parents[1] / "issue-contract-review" / "scripts"
@@ -362,52 +364,53 @@ def test_given_oversized_advisory_overlap_when_parsing_then_fingerprint_ready_go
     assert _parser_mod.find_latest_authoritative_go(parsed) is parsed[0]
 
 
-def test_given_oversized_vc_preflight_classifications_when_parsing_then_decision_survives():
-    """Oversized classification diagnostics do not invalidate a valid snapshot."""
+@pytest.mark.parametrize(
+    ("classifications", "case"),
+    [
+        ("[", "malformed_json"),
+        (
+            json.dumps([{"ac": "AC10", "payload": "x" * _parser_mod._MAX_JSON_FLOW_COLLECTION_CHARS}]),
+            "oversized",
+        ),
+        (
+            "[" * (_parser_mod._MAX_JSON_FLOW_COLLECTION_DEPTH + 1)
+            + "]" * (_parser_mod._MAX_JSON_FLOW_COLLECTION_DEPTH + 1),
+            "excessive_depth",
+        ),
+        ('[{"ac":"AC1","ac":"AC2"}]', "duplicate_key"),
+        ("[NaN]", "nonstandard_constant"),
+    ],
+)
+def test_given_invalid_vc_preflight_classifications_when_parsing_then_snapshot_is_not_candidate(
+    classifications: str, case: str
+):
+    """Required VC evidence is strict JSON list data in every parser path."""
+    assert case
     comment = _trusted_go_comment()
-    oversized_classifications = json.dumps(
-        [
-            {
-                "ac": "AC10",
-                "decision": "go",
-                "payload": "x" * _parser_mod._MAX_JSON_FLOW_COLLECTION_CHARS,
-            }
-        ]
-    )
     comment["body"] = comment["body"].replace(
         "```\n",
         "  checks:\n"
         "    vc_preflight:\n"
         "      decision: pass\n"
-        f"      classifications: '{oversized_classifications}'\n"
+        f"      classifications: '{classifications}'\n"
         "```\n",
     )
 
-    def assert_snapshot_is_usable(parsed):
-        assert len(parsed) == 1
-        vc_preflight = parsed[0]["inner"]["checks"]["vc_preflight"]
-        assert vc_preflight["decision"] == "pass"
-        assert vc_preflight["classifications"] == oversized_classifications
-        assert parsed[0]["is_fingerprint_ready"] is True
-        assert _parser_mod.find_latest_authoritative_go(parsed) is parsed[0]
-
-    assert_snapshot_is_usable(
-        _parser_mod.parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL)
-    )
+    assert _parser_mod.parse_contract_review_results(
+        [comment], expected_issue_url=_ISSUE_URL
+    ) == []
 
     fallback_comment, _ = _fallback_authority_fixture()
     fallback_comment["body"], count = re.subn(
         r"(?m)^      classifications: .*$",
-        f"      classifications: '{oversized_classifications}'",
+        f"      classifications: '{classifications}'",
         fallback_comment["body"],
     )
     assert count == 1
     with patch("builtins.__import__", side_effect=_reject_yaml_import):
-        assert_snapshot_is_usable(
-            _parser_mod.parse_contract_review_results(
-                [fallback_comment], expected_issue_url=_ISSUE_URL
-            )
-        )
+        assert _parser_mod.parse_contract_review_results(
+            [fallback_comment], expected_issue_url=_ISSUE_URL
+        ) == []
 
 
 def test_authority_postcondition_rejects_malformed_actual_comment_fingerprints():

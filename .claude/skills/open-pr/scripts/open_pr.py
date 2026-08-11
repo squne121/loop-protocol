@@ -71,12 +71,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--repo", help="owner/repo (省略時は git remote から取得)")
     p.add_argument("--dry-run", action="store_true", help="gh pr create を実行しない")
     p.add_argument(
-        "--link-kind",
-        choices=("auto", "Refs"),
-        default="auto",
-        help="Issue link kind。auto（既定）は Issue state に従い、Refs は caller の明示指定を保持する。",
-    )
-    p.add_argument(
         "--changed-paths",
         nargs="*",
         default=None,
@@ -222,9 +216,18 @@ def find_existing_pr(repo: str, branch: str) -> dict | None:
 def apply_linked_issue_reference(body: str, issue_number: int, link_kind: str) -> str:
     pattern = re.compile(rf"(Closes|Refs|Fixes|Resolves)\s+#{issue_number}\b", re.IGNORECASE)
     if pattern.search(body):
-        return pattern.sub(f"{link_kind} #{issue_number}", body, count=1)
+        return body
     sep = "\n\n" if not body.endswith("\n") else "\n"
     return body + sep + f"{link_kind} #{issue_number}\n"
+
+
+def resolve_linked_issue_reference_kind(
+    body: str, issue_number: int, default_link_kind: str
+) -> str:
+    """Report the caller's existing link kind, or the state-derived default."""
+    pattern = re.compile(rf"(Closes|Refs|Fixes|Resolves)\s+#{issue_number}\b", re.IGNORECASE)
+    match = pattern.search(body)
+    return match.group(1) if match else default_link_kind
 
 
 def resolve_changed_paths(provided_paths: list[str] | None = None) -> list[str] | None:
@@ -559,10 +562,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_BLOCKED
 
-    # `Refs` is an explicit caller override for OPEN issues.  Keep resolving
-    # the linked Issue state first so the existing state/readback hard gate
-    # remains active for every invocation.
-    link_kind = "Refs" if args.link_kind == "Refs" else ("Closes" if state == "OPEN" else "Refs")
+    # Keep resolving the linked Issue state first so the existing state/readback
+    # hard gate remains active. A caller-provided reference is preserved exactly;
+    # state-derived linkage is appended only when the body has none.
+    default_link_kind = "Closes" if state == "OPEN" else "Refs"
+    link_kind = resolve_linked_issue_reference_kind(
+        original_body, args.linked_issue, default_link_kind
+    )
     final_body = apply_linked_issue_reference(original_body, args.linked_issue, link_kind)
 
     changed_paths = resolve_changed_paths(args.changed_paths)
