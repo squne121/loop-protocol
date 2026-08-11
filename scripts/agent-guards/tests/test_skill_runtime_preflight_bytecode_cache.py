@@ -743,6 +743,46 @@ def _run_real_executor(
     )
 
 
+def test_ac10_resolve_trusted_executable_preserves_venv_identity_for_python3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Root cause regression (Issue #2073): `_resolve_trusted_executable("python3", ...)`
+    must return `sys.executable` itself (venv-identity-preserving) rather than its
+    fully resolved realpath. Returning the realpath strips venv identity whenever
+    `sys.executable` is a symlink into a bare toolchain interpreter with no project
+    dependencies of its own (as happens under `uv python install`-managed CI
+    interpreters), which made `uv run <realpath> ...` child subprocesses unable to
+    import project dependencies (observed as `jsonschema library not importable`
+    fail-closed in `run_refinement_preflight.py`, which short-circuits before the
+    planner is ever invoked -- explaining the missing `pid_proof_planner.json`)."""
+    trusted_dir = tmp_path / "trusted_bin"
+    trusted_dir.mkdir()
+    real_interpreter = trusted_dir / "python3.12"
+    real_interpreter.write_text("#!/bin/sh\n")
+    real_interpreter.chmod(0o755)
+
+    venv_dir = tmp_path / "project" / ".venv" / "bin"
+    venv_dir.mkdir(parents=True)
+    venv_python = venv_dir / "python3"
+    venv_python.symlink_to(real_interpreter)
+
+    monkeypatch.setattr(real_exec.sys, "executable", str(venv_python))
+    monkeypatch.setattr(
+        real_exec,
+        "_safe_path_entries",
+        lambda: [str(trusted_dir)],
+    )
+
+    project_root = str(tmp_path / "project")
+    resolved = real_exec._resolve_trusted_executable("python3", project_root)
+
+    assert resolved == str(venv_python), (
+        "expected the venv-identity path to be returned unresolved, not the "
+        f"realpath; got {resolved!r}"
+    )
+    assert resolved != os.path.realpath(str(venv_python))
+
+
 def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_proof(
     tmp_path: Path,
 ) -> None:

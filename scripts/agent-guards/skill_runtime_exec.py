@@ -716,10 +716,22 @@ def _trusted_uv_toolcache_dirs() -> list[str]:
 
 
 def _resolve_trusted_executable(name: str, project_root: str) -> str:
+    """Resolve `name` to a trust-validated executable path.
+
+    For "python3", the trust boundary is validated against the fully
+    resolved (symlink-following) target, but the *returned* path preserves
+    venv identity (`sys.executable` itself, unresolved) instead of the
+    realpath. Returning the realpath here previously caused `uv run
+    <realpath>` to lose association with the project venv whenever
+    `sys.executable` was a symlink into a bare interpreter (e.g. a
+    `uv python install`-managed toolchain with no project dependencies of
+    its own), which made child subprocesses unable to import project
+    dependencies (Issue #2073 root cause: jsonschema unimportable in CI).
+    """
     safe_entries = _safe_path_entries()
     safe_path = os.pathsep.join(safe_entries)
     if name == "python3":
-        resolved = os.path.realpath(sys.executable)
+        resolved = sys.executable
     else:
         resolved = shutil.which(name, path=safe_path)
     if not resolved:
@@ -733,7 +745,7 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     runtime_dir = os.path.realpath(str(Path(sys.executable).resolve().parent))
     if real_parent not in allowed_dirs and real_parent != runtime_dir:
         raise RuntimeError(f"{name}_outside_trusted_path")
-    return real
+    return resolved if name == "python3" else real
 
 
 def _sanitize_env(project_root: str) -> dict[str, str]:
