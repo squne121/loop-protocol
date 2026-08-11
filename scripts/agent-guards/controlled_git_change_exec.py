@@ -469,7 +469,26 @@ def _current_head(cwd: str) -> Optional[str]:
 
 
 def _current_ref(cwd: str, ref: str) -> Optional[str]:
-    """Read the remote-tracking base first, with fixture-safe local fallback."""
+    """Read the remote-tracking base first, with fixture-safe local fallback.
+
+    Issue #2102 P0-F: a local ``refs/remotes/origin/<ref>`` tracking ref is
+    only as fresh as the last fetch. ``snapshot.base_sha`` (compared against
+    this value as the CAS ``expected_old``) is read live from the GitHub
+    REST API by ``materialize_issue_scope_snapshot.py::_live_default_branch()``
+    on a separate code path, with no synchronization guarantee between the
+    two. When an 'origin' remote is configured, this function fetches the
+    remote ref first (bounded timeout) so the tracking ref reflects the live
+    remote at CAS-check time, and fails closed (returns None, which never
+    equals a real ``expected_old`` SHA) if that fetch fails. If no 'origin'
+    remote is configured (isolated test fixtures using only local refs), the
+    previous local-fallback behavior is retained unchanged.
+    """
+    remote_list = _run_git(["remote"], cwd)
+    has_origin = remote_list.returncode == 0 and "origin" in remote_list.stdout.split()
+    if has_origin:
+        fetched = _run_git(["fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{ref}"], cwd, timeout=20)
+        if fetched.returncode != 0:
+            return None
     candidates = (f"refs/remotes/origin/{ref}", ref)
     for candidate in candidates:
         result = _run_git(["rev-parse", "--verify", f"{candidate}^{{commit}}"], cwd)

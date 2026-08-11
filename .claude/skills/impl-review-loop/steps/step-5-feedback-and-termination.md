@@ -12,12 +12,36 @@ reviewer_verdict（`verdict`/`reviewed_head_sha`/`blockers`/`warnings`）と liv
 |---|---|
 | `approved` | `termination_reason: approved` を立て、終了処理へ |
 | `route_to_update_branch` | 合成された `update_branch` action を worker に委譲し、検証・PR review を再実行（終了しない） |
+| `route_scope_clean_reconciliation`（#2102） | main drift による base-bound evidence の選択的失効を実行してから Step 5 を resume する（終了しない。手順は下記「main drift scope-clean reconciliation の resume 手順」参照） |
 | `route_stale_head_rereview` | 現在 head で PR review を再実行（終了しない） |
 | `continue_loop` | LOOP_STATE.iteration += 1、Step 1 に戻る（blockers を fix_delta として渡す） |
 | `route_human_escalation` | `termination_reason: human_escalation` を立て、即停止（`HUMAN_REVIEW_REQUIRED` verdict、または max iteration 到達・secret/protected-path gate 等の実 hard gate の場合のみ） |
 | `conflict_hard_stop` | CONFLICTING PR Escalation Runbook 発動（actual conflict のみ。#1860 Owner Decision の唯一の hard stop） |
 | `fail_closed`（`mergeability_unknown` / `merge_state_status_*_not_conflict_defer_to_ci_evaluator`） | warning として記録し、bounded retry または次サイクルでの current-head CI / branch-protection 再評価に委ねる（human escalation にはしない） |
 | `fail_closed`（`LOOP_STATE.iteration >= LOOP_STATE.max_iterations`） | `termination_reason: max_iterations` を立て、fail-close で人間判断 |
+| `fail_closed`（`concurrent_base_churn_budget_exhausted`） | `evidence_epoch.drift_rebind_attempts` が上限（既定 2、#2039/#1023 の bounded no-progress budget と同じ考え方）を超過。drift 起因の再試行を打ち切り `termination_reason: human_escalation` ではなく機械的な fail-closed 停止として人間判断を仰ぐ（#2102） |
+
+### main drift scope-clean reconciliation の resume 手順（#2102）
+
+`route: route_scope_clean_reconciliation` は Step 5 を終了させず、`decision.selected_action`
+（`kind: scope_clean_reconciliation`、`evidence_epoch`、`reusable_evidence`）を使って以下を実行してから
+同一サイクル内で Step 5 を再実行（resume）する:
+
+1. `decision.rerun_required`（`snapshot`/`ci`/`review`）で `true` になっている証跡だけを再取得する。
+   `reusable_evidence` が `null` になっているキーは再利用禁止（stale の同一 URL / SHA を使い回さない）。
+2. `snapshot: true` の場合、issue-refinement-loop 側の contract-snapshot producer を
+   `decision.selected_action.evidence_epoch.base_sha`（= current base）に束縛して再生成し、
+   新しい trusted source（comment/artifact）の ID を取得する。
+3. `ci: true` の場合、current head に対する required CI の再実行状態を再取得する（stale run の
+   `GITHUB_SHA` を re-check の代わりに使わない）。
+4. `review: true` の場合、Step 4（pr-review-judge）を current head に対して再実行し、新しい
+   `reviewer_verdict` を取得する。
+5. 上記が揃ったら、`live_mergeability.main_drift.evidence_base_sha` を
+   `decision.selected_action.evidence_epoch.base_sha` に更新した上で Step 5 を再実行する。
+   `evidence_epoch.implementation_iteration_delta` は `0` なので、この resume は
+   `LOOP_STATE.iteration` を消費しない。
+6. `evidence_epoch.drift_rebind_attempts` を 1 加算して LOOP_STATE 側に永続化する。上限超過時は
+   `fail_closed`（`concurrent_base_churn_budget_exhausted`）に遷移する（上表参照）。
 
 > **注意**: `verdict: APPROVE` 単独では `termination_reason: approved` に到達しない。
 > `route_loop_verdict_v2()` が live mergeability（`CLEAN`/`HAS_HOOKS` かつ `MERGEABLE`）を確認し、
@@ -471,7 +495,7 @@ LOOP_STATE:
   max_iterations: <上限>
   last_step: judgment
   termination_reason: approved | max_iterations | human_escalation
-  last_route: approved | continue_loop | route_to_update_branch | route_stale_head_rereview | route_human_escalation | conflict_hard_stop | fail_closed | null
+  last_route: approved | continue_loop | route_to_update_branch | route_scope_clean_reconciliation | route_stale_head_rereview | route_human_escalation | conflict_hard_stop | fail_closed | null
   unresolved_blockers: []
   scope_rollup_decision: <ISSUE_SCOPE_ROLLUP_DECISION_V2、advisory>
 ```

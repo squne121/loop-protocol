@@ -549,6 +549,37 @@ Claude Code／Codex CLI の runtime smoke（linked worktree 内での fresh sess
 経由しない。runner は起動・観測・証跡収集だけを所有し、Codex CLI 側の
 sandbox／permission profile（本文書の Root Default Permission Profile）は変更しない。
 
+## main drift 選択的再束縛の証跡契約（Issue #2102）
+
+main が並行に前進した場合、issue-refinement-loop / impl-review-loop は base-bound evidence
+（Contract Snapshot、CI、review）を stale と分類し、current main に束縛した evidence epoch へ
+選択的に再束縛・再検証する。この契約の正本は各スクリプトの型定義であり、本節は
+producer/consumer の対応関係を確認するための参照である。
+
+- `.claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py::classify_main_drift()` /
+  `build_step5_live_mergeability()`: implementation loop 側の side-effect-free 判定ロジック（pure
+  function、git/gh を呼ばない）。`route_scope_clean_reconciliation` の resume 手順は
+  `.claude/skills/impl-review-loop/steps/step-5-feedback-and-termination.md` の終了条件マトリクスを
+  正本とする。
+- `.claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py::
+  _refinement_main_drift_decision()` / `classify_refinement_evidence_epoch()`: refinement loop 側の
+  同等ロジックを consume する。**入力 `known_context["main_drift"]` の producer は
+  `plan_refinement_loop.py` 自身ではない**（この planner は read-only で git/GitHub I/O を行わない）。
+  この script を起動する orchestrator（issue-refinement-loop control-plane の該当 Step）が、
+  `materialize_issue_scope_snapshot.py::_live_default_branch()` と同じ live readback 経路で
+  `current_base_sha` 等を取得し、stdin の `REFINEMENT_LOOP_PLANNER_INPUT_V1.known_context.main_drift`
+  として渡す必要がある。producer 契約の詳細フィールド一覧は
+  `plan_refinement_loop.py` の `_refinement_main_drift_decision()` 直前のコメントブロックを正本とする。
+  この echo は診断用（advisory）であり、`known_context.scope_delta_decision` と同様
+  canonical な mutation-phase routing 権限を持たない。
+- `scripts/agent-guards/controlled_git_change_exec.py::_current_ref()`: CAS baseline を live
+  `git fetch origin <ref>` で確認してから比較する（stale local tracking ref を authority にしない）。
+- `scripts/agent-ops/pr_head_replay_publish_exec.py::execute()`: `current_base_branch` /
+  `expected_current_base_sha` を指定すると、live current-base readback、`git merge-tree
+  --write-tree` による deterministic conflict 判定、`current_base_sha..candidate_head` の
+  `candidate_final_net_diff` に対する Allowed Paths 再判定を追加で行う（main drift
+  reconciliation 経路。未指定時は従来の source-range replay のみの挙動を維持する）。
+
 ## Cross References（相互参照）
 
 - GitHub 操作の共通規約: [github-ops.md](github-ops.md)

@@ -74,10 +74,70 @@ def classify_refinement_evidence_epoch(context: dict[str, Any]) -> dict[str, Any
     }
 
 
+# ---------------------------------------------------------------------------
+# known_context["main_drift"] production contract (Issue #2102 fix_delta,
+# P0-C: the previous revision left this key's producer undocumented, making
+# classify_refinement_evidence_epoch() / _refinement_main_drift_decision()
+# unreachable in production).
+#
+# This planner is read-only and performs no git/GitHub I/O itself (see the
+# module docstring). known_context.main_drift is therefore never
+# self-populated -- it MUST be constructed by the orchestrator step that
+# invokes this script (the issue-refinement-loop control-plane step that
+# runs BEFORE issuing REFINEMENT_LOOP_PLANNER_INPUT_V1 to stdin), using the
+# same live-readback boundary already established for
+# known_context.scope_delta_decision (see the "唯一の production 呼び出し元"
+# / "診断用の echo であり canonical な mutation-phase routing は...consumer
+# 境界が担う" pattern in issue-refinement-loop/SKILL.md's Step 4 scope-reframe
+# section): this planner's `decisions.main_drift_evidence_epoch` output is an
+# ADVISORY diagnostic echo, not canonical mutation-phase routing authority.
+# The actual rebind/reverify mutation (fresh contract-snapshot
+# materialization, stale-evidence invalidation) is performed by the
+# refinement-loop consumer boundary that reads this echo, not by this
+# planner.
+#
+# Before invoking this script, the orchestrator must populate
+# known_context["main_drift"] as a dict with the following keys (all 40-hex
+# SHAs unless noted):
+#   current_base_sha                 live default-branch HEAD, read the same
+#                                     way materialize_issue_scope_snapshot.py
+#                                     ::_live_default_branch() reads it (a
+#                                     GitHub REST call, not a local ref).
+#   evidence_base_sha                base SHA the existing Contract Snapshot
+#                                     / scope snapshot is bound to.
+#   allowed_paths_snapshot_base_sha  base SHA the current Allowed Paths
+#                                     snapshot is bound to.
+#   allowed_paths                    list[str], from the live Issue body.
+#   latest_main_net_diff             list[str], `git diff --name-only
+#                                     evidence_base_sha current_base_sha`
+#                                     (main-drift-touched paths; this is
+#                                     DISTINCT from a final post-reconciliation
+#                                     net diff, which is the refinement/impl
+#                                     mutation consumer's responsibility, not
+#                                     this planner's).
+#   expected_old_sha / observed_old_sha   CAS pair for whatever ref this
+#                                     evidence rebind will ultimately mutate.
+#   semantic_ambiguity (optional)    bool; SHOULD be derived from an actual
+#                                     `git merge-tree --write-tree` conflict
+#                                     check by the orchestrator, not asserted
+#                                     freehand (see route_loop_verdict_v2.py /
+#                                     pr_head_replay_publish_exec.py for the
+#                                     canonical deterministic oracle used on
+#                                     the implementation-loop side).
+# If known_context.main_drift is omitted, this planner emits no
+# main_drift_evidence_epoch decision (the pre-#2102 behavior is preserved
+# for callers that do not yet supply main-drift facts).
+# ---------------------------------------------------------------------------
+
+
 def _refinement_main_drift_decision(
     known_context: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Project optional live main-drift facts into the planner's SSOT output."""
+    """Project optional live main-drift facts into the planner's SSOT output.
+
+    See the known_context["main_drift"] production contract comment above
+    this function for who populates this key and when.
+    """
     if not known_context or "main_drift" not in known_context:
         return None
     context = known_context["main_drift"]

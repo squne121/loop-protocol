@@ -42,9 +42,17 @@ def _live(
         "mergeable": "MERGEABLE",
         "merge_state_status": merge_state_status,
     }
-    if main_drift is not None:
-        value["main_drift"] = main_drift
+    value["main_drift"] = _fresh_drift() if main_drift is None else main_drift
     return value
+
+
+def _live_without_main_drift(merge_state_status: str) -> dict[str, object]:
+    """main_drift remains an optional key on the public routing boundary."""
+    return {
+        "head_sha": SHA_A,
+        "mergeable": "MERGEABLE",
+        "merge_state_status": merge_state_status,
+    }
 
 
 def _drift(**extra: object) -> dict[str, object]:
@@ -59,6 +67,12 @@ def _drift(**extra: object) -> dict[str, object]:
         "expected_old_sha": SHA_B,
         "observed_old_sha": SHA_B,
     }
+    value.update(extra)
+    return value
+
+
+def _fresh_drift(**extra: object) -> dict[str, object]:
+    value = _drift(evidence_base_sha=SHA_B)
     value.update(extra)
     return value
 
@@ -138,6 +152,42 @@ def test_given_normal_step5_when_documented_then_live_main_drift_facts_are_built
         assert key in body
 
 
+def test_given_missing_main_drift_when_approve_then_pre_2102_routing_is_preserved():
+    """main_drift is an optional key (Design Invariant: the public
+    two-input routing boundary is stable). Callers that omit it entirely
+    keep the pre-#2102 CLEAN/MERGEABLE -> approved behavior; only a
+    PRESENT-but-malformed main_drift payload fails closed."""
+    decision = route_loop_verdict_v2(_verdict(), _live_without_main_drift("CLEAN"))
+
+    assert decision.route == "approved"
+
+
+@pytest.mark.parametrize(
+    "main_drift, reason_code",
+    [
+        ({"current_base_sha": SHA_B}, "main_drift_context_invalid"),
+        (_fresh_drift(allowed_paths="not-a-path-list"), "main_drift_context_invalid"),
+    ],
+)
+def test_given_invalid_step5_main_drift_facts_when_approve_then_router_fails_closed(
+    main_drift: dict[str, object],
+    reason_code: str,
+):
+    live_mergeability = {
+        "head_sha": SHA_A,
+        "mergeable": "MERGEABLE",
+        "merge_state_status": "CLEAN",
+        "main_drift": main_drift,
+    }
+
+    decision = route_loop_verdict_v2(_verdict(), live_mergeability)
+
+    assert decision.route == ROUTE_FAIL_CLOSED
+    assert decision.fail_closed is True
+    assert decision.reason_code == reason_code
+    assert decision.route != "approved"
+
+
 def test_given_semantic_ambiguity_when_routed_then_it_stops_without_action():
     decision = route_loop_verdict_v2(
         _verdict(),
@@ -146,3 +196,41 @@ def test_given_semantic_ambiguity_when_routed_then_it_stops_without_action():
 
     assert decision.route == ROUTE_FAIL_CLOSED
     assert decision.selected_action is None
+
+
+
+def test_given_drift_rebind_attempts_below_budget_when_routed_then_epoch_carries_next_attempt_count():
+    decision = route_loop_verdict_v2(
+        _verdict(),
+        _live("BEHIND", _drift(drift_rebind_attempts=1)),
+    )
+
+    assert decision.route == ROUTE_SCOPE_CLEAN_RECONCILIATION
+    assert decision.selected_action["evidence_epoch"]["drift_rebind_attempts"] == 2
+    assert decision.selected_action["evidence_epoch"]["max_drift_rebind_attempts"] == 2
+
+
+def test_given_drift_rebind_attempts_at_budget_when_routed_then_fail_closed_not_human_escalation():
+    """Issue #2102 P0-B: bounded outer drift-rebind budget, independent of
+    LOOP_STATE.iteration / implementation_iteration_delta. A churning main
+    must not livelock the loop, but exhausting the bound is a deterministic
+    machine stop, not a semantic-judgment human_escalation route."""
+    decision = route_loop_verdict_v2(
+        _verdict(),
+        _live("BEHIND", _drift(drift_rebind_attempts=2)),
+    )
+
+    assert decision.route == ROUTE_FAIL_CLOSED
+    assert decision.fail_closed is True
+    assert decision.reason_code == "concurrent_base_churn_budget_exhausted"
+    assert decision.route != "route_human_escalation"
+
+
+def test_given_negative_drift_rebind_attempts_when_routed_then_context_invalid():
+    decision = route_loop_verdict_v2(
+        _verdict(),
+        _live("BEHIND", _drift(drift_rebind_attempts=-1)),
+    )
+
+    assert decision.route == ROUTE_FAIL_CLOSED
+    assert decision.reason_code == "main_drift_context_invalid"

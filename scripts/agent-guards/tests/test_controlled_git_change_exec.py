@@ -1424,3 +1424,105 @@ def test_cli_requires_expected_old_before_materialization(tmp_path: Path):
             ]
         )
     assert exc.value.code == 2
+
+
+def test_current_ref_fetches_live_origin_instead_of_trusting_stale_tracking_ref(tmp_path: Path):
+    """Issue #2102 P0-F: _current_ref() must not treat a stale local
+    refs/remotes/origin/<ref> as authoritative. It fetches the live remote
+    ref first and fails closed if that fetch fails.
+    """
+    import controlled_git_change_exec as controlled_module
+
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_sha = _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"{base_sha}:refs/heads/main"], cwd=repo, check=True)
+    subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=repo, check=True)
+
+    # Confirm the local tracking ref currently agrees with base_sha (this is
+    # the value a stale-tracking-ref bug would keep returning forever).
+    assert controlled_module._current_ref(str(repo), "main") == base_sha
+
+    # Advance the remote (simulating main drift from another actor) via a
+    # second clone, WITHOUT running `git fetch` again in `repo`.
+    other_clone = tmp_path / "other_clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(other_clone)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=other_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=other_clone, check=True)
+    subprocess.run(["git", "checkout", "-q", "-B", "main", "origin/main"], cwd=other_clone, check=True)
+    (other_clone / "DRIFT.md").write_text("drift\n")
+    subprocess.run(["git", "add", "DRIFT.md"], cwd=other_clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "main drift"], cwd=other_clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=other_clone, check=True)
+    live_main_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=other_clone, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert live_main_sha != base_sha
+
+    # Without the #2102 fix, this would still return the stale base_sha
+    # because `repo`'s local refs/remotes/origin/main tracking ref was never
+    # refreshed. With the fix, _current_ref() fetches live and returns the
+    # drifted SHA.
+    assert controlled_module._current_ref(str(repo), "main") == live_main_sha
+
+
+def test_current_ref_fails_closed_when_origin_fetch_fails(tmp_path: Path):
+    """Issue #2102 P0-F: an unreachable 'origin' must fail closed (None),
+    never silently fall back to a possibly-stale local tracking ref."""
+    import controlled_git_change_exec as controlled_module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    unreachable = tmp_path / "does-not-exist.git"
+    subprocess.run(["git", "remote", "add", "origin", str(unreachable)], cwd=repo, check=True)
+
+    assert controlled_module._current_ref(str(repo), "main") is None
+
+
+def test_execute_controlled_change_denies_when_origin_has_drifted_past_expected_old(tmp_path: Path):
+    """End-to-end (Issue #2102 P0-F): a live origin drift must be caught as
+    expected_old_cas_mismatch even though the caller-provided expected_old
+    matches the OLD (pre-drift) base -- because the CAS check reads a
+    freshly fetched live ref, not a stale local tracking ref."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_sha = _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"{base_sha}:refs/heads/main"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "topic"], cwd=repo, check=True)
+
+    other_clone = tmp_path / "other_clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(other_clone)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=other_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=other_clone, check=True)
+    subprocess.run(["git", "checkout", "-q", "-B", "main", "origin/main"], cwd=other_clone, check=True)
+    (other_clone / "DRIFT.md").write_text("drift\n")
+    subprocess.run(["git", "add", "DRIFT.md"], cwd=other_clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "main drift"], cwd=other_clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=other_clone, check=True)
+
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "a.py").write_text("x\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: x",
+        expected_head=_head(repo),
+    )
+    assert result.status == "denied"
+    assert result.reason_code == "expected_old_cas_mismatch"
