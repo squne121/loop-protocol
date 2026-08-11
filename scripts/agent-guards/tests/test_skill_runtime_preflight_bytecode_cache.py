@@ -775,7 +775,46 @@ def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_pro
 
     artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / str(_FIXTURE_ISSUE_NUMBER)
     preflight_proof = json.loads((artifact_dir / "pid_proof_preflight.json").read_text(encoding="utf-8"))
-    planner_proof = json.loads((artifact_dir / "pid_proof_planner.json").read_text(encoding="utf-8"))
+    planner_proof_path = artifact_dir / "pid_proof_planner.json"
+    if not planner_proof_path.exists():
+        # Diagnostic-only (Issue #2073): the executor's own outcome (exit
+        # code / stdout / stderr) is the only evidence available when the
+        # planner subprocess never reaches the pid-proof harness splice
+        # point, so surface it directly instead of a bare FileNotFoundError.
+        #
+        # P1-2 (Issue #2073 PR #2080 OWNER review): run_refinement_preflight.py
+        # writes a `planner_failure_classification_v1.json` sidecar (via
+        # `classify_planner_failure()`) whenever `_invoke_planner()` returns
+        # `plan is None` -- i.e. whenever preflight's own `main()` actually
+        # reached the `_invoke_planner()` call site. Surface this sidecar's
+        # presence/content (or its absence) directly in the failure message:
+        # its absence is itself diagnostic evidence that the failure path
+        # in `run_refinement_preflight.py`'s `main()` never reached the
+        # `plan is None` failure-classification branch at all (i.e. never
+        # reached `_invoke_planner()`, consistent with failure-space
+        # candidates (a)/(c)/(d)/(e)/(f) discussed in Issue #2073's investigation
+        # history), whereas its presence
+        # narrows the failure to inside `_invoke_planner()` itself.
+        classification_path = artifact_dir / "planner_failure_classification_v1.json"
+        if classification_path.exists():
+            classification_diag = (
+                "planner_failure_classification_v1.json present: "
+                f"{classification_path.read_text(encoding='utf-8')!r}"
+            )
+        else:
+            classification_diag = (
+                "planner_failure_classification_v1.json absent -- "
+                "run_refinement_preflight.py's main() never reached the "
+                "`plan is None` failure-classification branch (i.e. never "
+                "reached _invoke_planner()'s return path)"
+            )
+        pytest.fail(
+            "pid_proof_planner.json missing; executor "
+            f"returncode={result.returncode!r} "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}; "
+            f"{classification_diag}"
+        )
+    planner_proof = json.loads(planner_proof_path.read_text(encoding="utf-8"))
     proof = {"preflight": preflight_proof, "planner": planner_proof}
 
     # Real, distinct process identities for every level of the chain.
@@ -797,6 +836,65 @@ def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_pro
 
     assert list(repo.rglob("*.pyc")) == []
     assert [p for p in repo.rglob("__pycache__") if p.is_dir()] == []
+
+
+def test_ac10_diagnostic_negative_control_missing_planner_script_surfaces_classification_sidecar(
+    tmp_path: Path,
+) -> None:
+    """P2-1 (Issue #2073 PR #2080 OWNER review): the AC10 test above added a
+    `if not planner_proof_path.exists(): pytest.fail(...)` diagnostic branch
+    (Issue #2073 P1-2) that had no dedicated coverage of its own. This test
+    fault-injects a genuinely missing planner script -- deleting
+    `plan_refinement_loop.py` after installing the AC10 fixture, so the real
+    preflight's `_invoke_planner()` subprocess.run() call raises
+    `FileNotFoundError` and returns `(None, 3, "planner script not found: ...",
+    "")` before the planner subprocess (and therefore its pid-proof harness
+    splice point, Issue #2073 candidate (e)) can ever run -- and asserts that:
+
+    1. `pid_proof_planner.json` is genuinely never written (the fault
+       injection reaches the intended code path, not some other failure).
+    2. `run_refinement_preflight.py`'s `plan is None` failure-classification
+       branch *is* reached (unlike the still-open AC10 flake, where whether
+       this branch is reached is exactly the open question) and writes a
+       non-empty `planner_failure_classification_v1.json` sidecar, i.e. the
+       diagnostic added in Issue #2073 P1-2 surfaces real, non-stub content
+       for this negative-control failure mode.
+    3. The executor itself never emits `SKILL_RUNTIME_FAIL` and returns an
+       exit code within the same accepted range as AC10 (the missing-planner
+       failure is folded into the existing `environment_failure` (exit 3)
+       mapping, exercised via `classify_planner_failure`'s real production
+       code path rather than a mock).
+    """
+    repo = _make_repo(tmp_path)
+    _install_real_preflight_fixture_with_pid_proof(repo)
+
+    planner_script = (
+        repo / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "plan_refinement_loop.py"
+    )
+    assert planner_script.exists(), "fixture setup invariant: planner script must exist before fault injection"
+    planner_script.unlink()
+
+    result = _run_real_executor(repo, "preflight_fixture_input.json")
+    assert "SKILL_RUNTIME_FAIL" not in result.stderr, (result.stdout, result.stderr)
+    assert result.returncode in (0, 1, 2, 3), (result.stdout, result.stderr)
+
+    artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / str(_FIXTURE_ISSUE_NUMBER)
+    planner_proof_path = artifact_dir / "pid_proof_planner.json"
+    assert not planner_proof_path.exists(), (
+        "fault injection invariant violated: planner pid-proof was written "
+        "even though the planner script was deleted"
+    )
+
+    classification_path = artifact_dir / "planner_failure_classification_v1.json"
+    assert classification_path.exists(), (
+        "expected run_refinement_preflight.py's plan-is-None "
+        "failure-classification branch (which calls classify_planner_failure() "
+        "and writes this sidecar) to be reached even though the planner "
+        f"script itself is missing; executor result={result!r}"
+    )
+    classification = json.loads(classification_path.read_text(encoding="utf-8"))
+    assert isinstance(classification, dict)
+    assert classification, "classification sidecar must carry real diagnostic content, not an empty stub"
 
 
 @pytest.mark.parametrize(
