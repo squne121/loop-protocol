@@ -222,9 +222,9 @@ def test_real_plan_serial_lane_has_debounce():
     Actions run 31471899002, jobs 93716843920 and 93718596811, both
     `conclusion: success`).
 
-    Issue #2073 follow-up (prior revision, kept for history): two
-    OWNER-review blockers against the diagnostic apparatus itself were
-    fixed before the root cause above was found -- (1)
+    Issue #2073 follow-up (prior revisions, kept for history): three
+    OWNER/human-review blockers against the diagnostic apparatus itself
+    were fixed before/alongside the root cause above being found -- (1)
     `run_refinement_preflight.py`'s `_invoke_planner()` previously
     misclassified a missing `plan_refinement_loop.py` as an
     `anchor_or_input_blocked` (exit 2) planner failure instead of the
@@ -232,10 +232,17 @@ def test_real_plan_serial_lane_has_debounce():
     present `sys.executable` failing to open a missing script argument does
     not raise a Python `FileNotFoundError`; it now performs an explicit
     pre-spawn `PLANNER_SCRIPT.is_file()` check instead of relying on that
-    exception. (2) `_invoke_planner()` now writes a best-effort
-    `planner_spawn_attempt_v1.json` marker as its own first action. Neither
-    fix was the load-bearing fix for the confirmed root cause above, but
-    both remain valid diagnostic-apparatus corrections.
+    exception. (2) `_invoke_planner()` writes a best-effort
+    `planner_spawn_attempt_v1.json` marker as its literal first statement
+    (human-review P2-1: it originally ran after `json.dumps(planner_input,
+    ...)`, so a serialization failure could raise before the marker was
+    ever written -- moved ahead of that call so the marker's "was this
+    function ever entered" evidence no longer depends on serialization
+    succeeding first). (3) this file was removed from `parallel_exclude`
+    (human-review P2-2) once the confirmed root cause was established to be
+    parallelism-independent. None of these three fixes was itself the
+    load-bearing fix for the confirmed root cause above, but all three
+    remain valid diagnostic-apparatus / lane-scope corrections.
     """
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
@@ -246,13 +253,11 @@ def test_real_plan_serial_lane_has_debounce():
         "tests/codex/test_scope_rollup_runner_agent_config.py",
         ".claude/skills/issue-contract-review/scripts/tests/test_baseline_vc_preflight.py",
         # Issue #2073: scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py
-        # was added to parallel_exclude as a historical mitigation for an
-        # unresolved AC10 flake (its AC10 real-executor-chain test hit a
-        # FileNotFoundError for pid_proof_planner.json under full CI parallel
-        # load); the original fixed-timeout / xdist-CPU-saturation causal
-        # claim has been retracted and root cause remains unconfirmed, see
-        # Issue #2073.
-        "scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py",
+        # was formerly in parallel_exclude as a historical mitigation for a
+        # hypothesized xdist-CPU-saturation flake. Root cause is now
+        # confirmed (see AC10_ROOT_CAUSE_STATUS above) to be unrelated to
+        # parallelism, so the file has been removed from this serial lane
+        # list (Issue #2073 human-review P2-2).
         "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",

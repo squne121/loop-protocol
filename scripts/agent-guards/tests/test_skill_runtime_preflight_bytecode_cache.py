@@ -783,6 +783,84 @@ def test_ac10_resolve_trusted_executable_preserves_venv_identity_for_python3(
     assert resolved != os.path.realpath(str(venv_python))
 
 
+def test_ac10_resolve_trusted_executable_is_not_cached_across_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TOCTOU-scope regression (Issue #2073 human-review P1-2): `_resolve_trusted_executable`
+    performs no memoization -- its trust validation (via the fully resolved realpath) is
+    recomputed on every call from the live filesystem, so a symlink retargeted to a
+    disallowed location (here: inside `project_root`, the one check that is actually
+    load-bearing for `name == "python3"` -- see the `outside_trusted_path` tautology note
+    in `_resolve_trusted_executable`'s docstring) between two calls is rejected on the very
+    next call, rather than a stale "it validated last time" result being reused. This is
+    the property that bounds the check/use race window to the handful of statements between
+    this function returning and the caller (`_resolve_child_argv`) immediately spawning the
+    child process."""
+    trusted_dir = tmp_path / "trusted_bin"
+    trusted_dir.mkdir()
+    real_interpreter = trusted_dir / "python3.12"
+    real_interpreter.write_text("#!/bin/sh\n")
+    real_interpreter.chmod(0o755)
+
+    project_dir = tmp_path / "project"
+    venv_dir = project_dir / ".venv" / "bin"
+    venv_dir.mkdir(parents=True)
+    venv_python = venv_dir / "python3"
+    venv_python.symlink_to(real_interpreter)
+
+    # An in-project-root "interpreter" the symlink will be retargeted to,
+    # simulating a swap landing inside the check/use window.
+    planted_interpreter = project_dir / "planted_python3"
+    planted_interpreter.write_text("#!/bin/sh\n")
+    planted_interpreter.chmod(0o755)
+
+    monkeypatch.setattr(real_exec.sys, "executable", str(venv_python))
+    monkeypatch.setattr(real_exec, "_safe_path_entries", lambda: [str(trusted_dir)])
+
+    project_root = str(project_dir)
+
+    # First call: symlink points at a trusted target outside project_root --
+    # must succeed and must not memoize the result.
+    resolved = real_exec._resolve_trusted_executable("python3", project_root)
+    assert resolved == str(venv_python)
+
+    # Retarget the symlink to a location inside project_root.
+    venv_python.unlink()
+    venv_python.symlink_to(planted_interpreter)
+
+    with pytest.raises(RuntimeError, match="python3_inside_project_root"):
+        real_exec._resolve_trusted_executable("python3", project_root)
+
+
+def test_ac10_resolve_trusted_executable_python3_child_actually_imports_project_deps() -> None:
+    """Behavioral regression (Issue #2073 human-review P2-3): the real invariant this fix
+    protects is not "the return value is a particular string shape" but "a child process
+    spawned via the returned path runs inside the project's own venv and can import project
+    dependencies" -- exercised here against the actual, unmocked `sys.executable` and the
+    real project `.venv` (not a fake `#!/bin/sh` stub), the same way `uv run` invokes it in
+    production. This complements (not replaces) the structural symlink test above, which
+    covers the trust-boundary/venv-identity contract in isolation without needing a real
+    interpreter."""
+    resolved = real_exec._resolve_trusted_executable("python3", str(REPO_ROOT))
+    assert resolved == sys.executable
+
+    result = subprocess.run(
+        ["uv", "run", "--locked", resolved, "-c", "import sys, jsonschema; print(sys.prefix)"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"child process could not import project dependency jsonschema via the "
+        f"trust-resolved python3 path; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stdout.strip() == sys.prefix, (
+        "child process sys.prefix did not match the parent's venv sys.prefix -- "
+        "the resolved path did not preserve venv identity"
+    )
+
+
 def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_proof(
     tmp_path: Path,
 ) -> None:

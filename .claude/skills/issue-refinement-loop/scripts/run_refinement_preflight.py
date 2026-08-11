@@ -1436,8 +1436,17 @@ def _invoke_planner(
     `repo_root` / `issue_number` are optional and, when supplied, are used
     only to write the best-effort `planner_spawn_attempt_v1.json` pre-spawn
     diagnostic marker (Issue #2073 P1-4); they never affect the planner
-    invocation itself.
+    invocation itself. The marker write is this function's literal first
+    statement (Issue #2073 human-review P2-1: it previously ran after
+    `json.dumps(planner_input, ...)`, so a `planner_input` serialization
+    failure -- e.g. non-JSON-serializable content, or a NaN/Infinity value
+    rejected by `allow_nan=False` -- would raise before the marker was ever
+    written, reproducing the exact "absence of evidence is not evidence of
+    absence" gap this marker exists to close).
     """
+    script_missing = not PLANNER_SCRIPT.is_file()
+    _write_planner_spawn_attempt_marker(repo_root, issue_number, script_missing=script_missing)
+
     input_json = json.dumps(planner_input, ensure_ascii=False, allow_nan=False)
 
     # Issue #2073 P1-2 (OWNER review): the previous implementation relied on
@@ -1457,8 +1466,6 @@ def _invoke_planner(
     # classification (`classify_planner_failure`) sees a consistent
     # "not found" signal in `stderr` regardless of which of the two ways the
     # script turned out to be missing.
-    script_missing = not PLANNER_SCRIPT.is_file()
-    _write_planner_spawn_attempt_marker(repo_root, issue_number, script_missing=script_missing)
     if script_missing:
         return None, 3, f"planner script not found: {PLANNER_SCRIPT}", ""
 
