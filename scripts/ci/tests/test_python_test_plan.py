@@ -176,17 +176,56 @@ def test_real_plan_serial_lane_has_debounce():
     debounce test itself must NOT be excluded.
     scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py
     was added to parallel_exclude (Issue #2073) as a historical mitigation
-    for an unresolved AC10 flake; the original fixed-timeout /
-    xdist-CPU-saturation causal claim has been retracted, see Issue #2073.
+    for what was originally believed to be an xdist-CPU-saturation flake;
+    serial-lane isolation alone did not stop the failure (it recurred 3x in
+    serial-lane CI on PR #2068), which is consistent with the confirmed root
+    cause below being unrelated to test parallelism. This entry is now kept
+    for CI runtime-shape stability rather than as an active flake mitigation.
 
-    AC10_ROOT_CAUSE_STATUS: unresolved (Issue #2073). This marker is the
-    canonical source Issue #2073 AC1's Verification Command checks; when the
-    AC10 root cause is identified, update this marker (and Issue #2073 AC1's
-    text/VC) together rather than leaving a stale "unresolved" claim here.
+    AC10_ROOT_CAUSE_STATUS: resolved (Issue #2073).
 
-    Issue #2073 follow-up (this revision): two OWNER-review blockers against
-    the diagnostic apparatus itself were fixed without changing this marker
-    -- (1) `run_refinement_preflight.py`'s `_invoke_planner()` previously
+    Root cause: `scripts/agent-guards/skill_runtime_exec.py`'s
+    `_resolve_trusted_executable("python3", project_root)` returned
+    `os.path.realpath(sys.executable)` for substitution into the rendered
+    `uv run python3 run_refinement_preflight.py ...` child argv. On the
+    GitHub-hosted runner, the project's `.venv/bin/python3` is a symlink
+    into a bare `uv python install`-managed toolchain interpreter that has
+    no project dependencies of its own (jsonschema etc. are installed only
+    into `.venv/lib/python3.12/site-packages` by `uv sync`).
+    `os.path.realpath()` followed that symlink through to the bare
+    toolchain interpreter, and `uv run <that-realpath> ...` does not
+    associate with the project venv -- so the spawned
+    `run_refinement_preflight.py` child process could not `import
+    jsonschema`. PR #2068's commit `28d8f334` changed
+    `_validate_with_schema()` to fail closed
+    (`schema_validator_unavailable: jsonschema library not importable`)
+    instead of silently skipping validation when jsonschema is
+    unimportable, which made preflight's `main()` short-circuit to
+    `STATUS: blocked` before ever invoking the planner subprocess -- so the
+    planner's PID-proof harness never ran and `pid_proof_planner.json` was
+    never written. Confirmed by: (a) exact historical CI evidence -- all 4
+    reproductions on PR #2068 are git-ancestry descendants of `28d8f334`,
+    with the two post-diagnostic-wrapper runs showing the byte-identical
+    `schema_validator_unavailable: jsonschema library not importable`
+    error, and a green negative control (no `28d8f334` ancestor) exists
+    immediately prior; (b) independent local reproduction of the mechanism
+    using a genuinely bare `uv python install`-managed interpreter
+    (`uv run <bare-toolchain-realpath> -c "import jsonschema"` raises
+    `ModuleNotFoundError`, while `uv run <venv-path> -c "import
+    jsonschema"` succeeds); (c) counterfactual fix verified locally --
+    `_resolve_trusted_executable` now returns `sys.executable` itself
+    (preserving venv identity) rather than its realpath, while still
+    validating the realpath against the trust boundary (not inside
+    project_root, within allowed_dirs/runtime_dir), and this restores
+    `jsonschema` importability in the child process; (d) two consecutive
+    green `python-test-core` CI runs on the fix's final head (GitHub
+    Actions run 31471899002, jobs 93716843920 and 93718596811, both
+    `conclusion: success`).
+
+    Issue #2073 follow-up (prior revision, kept for history): two
+    OWNER-review blockers against the diagnostic apparatus itself were
+    fixed before the root cause above was found -- (1)
+    `run_refinement_preflight.py`'s `_invoke_planner()` previously
     misclassified a missing `plan_refinement_loop.py` as an
     `anchor_or_input_blocked` (exit 2) planner failure instead of the
     intended `wrapper_environment_failure` (exit 3, "not found"), because a
@@ -194,10 +233,9 @@ def test_real_plan_serial_lane_has_debounce():
     not raise a Python `FileNotFoundError`; it now performs an explicit
     pre-spawn `PLANNER_SCRIPT.is_file()` check instead of relying on that
     exception. (2) `_invoke_planner()` now writes a best-effort
-    `planner_spawn_attempt_v1.json` marker as its own first action, giving a
-    stronger (though still best-effort) signal for whether its call site was
-    ever reached the next time AC10 reproduces in CI. Root cause is still
-    unconfirmed; this marker intentionally stays "unresolved" until it is.
+    `planner_spawn_attempt_v1.json` marker as its own first action. Neither
+    fix was the load-bearing fix for the confirmed root cause above, but
+    both remain valid diagnostic-apparatus corrections.
     """
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
