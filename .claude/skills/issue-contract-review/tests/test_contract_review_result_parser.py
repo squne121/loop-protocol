@@ -471,6 +471,27 @@ class TestParseContractReviewResults:
         assert isinstance(results[0]["inner"]["expected_contract_fingerprint"], str)
         assert results[0]["is_fingerprint_ready"] is False
 
+    def test_nested_json_string_fingerprint_stays_non_authoritative_with_pyyaml(self):
+        """GIVEN a noncanonical JSON string WHEN PyYAML parses THEN it stays scalar."""
+        fingerprint = dict(_VALID_FINGERPRINT)
+        comment = _make_go_comment(comment_id=1001)
+        comment["body"] = comment["body"].replace(
+            f"  issue_url: {_ISSUE_URL}",
+            "\n".join(
+                [
+                    f"  issue_url: {_ISSUE_URL}",
+                    f"  body_sha256: {fingerprint['contract_body_sha256']}",
+                    "  expected_contract_fingerprint: " + json.dumps(json.dumps(fingerprint)),
+                ]
+            ),
+        )
+
+        results = parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL)
+
+        assert len(results) == 1
+        assert isinstance(results[0]["inner"]["expected_contract_fingerprint"], str)
+        assert results[0]["is_fingerprint_ready"] is False
+
     def test_parses_go_comment(self):
         comments = [_make_go_comment()]
         results = parse_contract_review_results(comments, expected_issue_url=_ISSUE_URL)

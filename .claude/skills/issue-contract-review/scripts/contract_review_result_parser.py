@@ -200,7 +200,6 @@ def _decode_producer_json_scalars(block: dict[str, Any], raw_block: str) -> dict
         if isinstance(value, str) and value.startswith(("{", "[")):
             mapping[key] = _parse_bounded_strict_json_collection(value)
 
-    decode(inner, "expected_contract_fingerprint")
     checks = inner.get("checks")
     # The producer's fingerprint transport is a single-quoted JSON mapping.
     # Do not recursively decode a JSON string transported through a different
