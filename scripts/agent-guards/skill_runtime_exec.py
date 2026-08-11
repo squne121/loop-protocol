@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1451,11 +1452,384 @@ def _emit_ledger_transient_residue_failure(issue_number: int, stale_paths: list[
     return 2
 
 
-def _emit_timeout_failure(issue_number: int, timeout_seconds: object) -> int:
+# ---------------------------------------------------------------------------
+# Issue #2075: Popen-based outer-child supervisor.
+#
+# The previous implementation used `subprocess.run(child_argv, ...,
+# timeout=timeout_seconds)` and reacted to `subprocess.TimeoutExpired` after
+# the fact. That pattern cannot deliver a process-group cleanup guarantee:
+# CPython's `subprocess.run()` already `kill()`s and `wait()`s its own direct
+# child *before* re-raising `TimeoutExpired`, so by the time the `except`
+# block runs there is no safe PID/PGID left for `os.killpg(...)` to act on
+# (see the OWNER review on Issue #2075, and
+# https://docs.python.org/3.12/library/subprocess.html).
+#
+# This module instead launches the child with `subprocess.Popen(...,
+# start_new_session=True)` so the caller holds the child's PID/PGID from the
+# moment it starts, and owns the full timeout + cleanup lifecycle:
+#
+#   execution timeout -> SIGTERM -> bounded grace -> SIGKILL
+#     -> process-group absence verification -> direct-child (leader) reap
+#
+# Guarantee scope (Issue #2075 Outcome / OWNER review, narrowed from the
+# original "reap the whole process tree" framing): only descendants that
+# remain inside the executor-created process group (the common case for
+# ordinary fork/exec descendants that never call `setsid()`/`setpgid()`
+# themselves) are covered. A descendant that moves itself to a different
+# session/process group is out of scope -- confirming its absence would
+# require a subreaper/cgroup-level mechanism this module does not implement.
+#
+# `start_new_session` / `os.killpg` / `os.setsid` are POSIX-only. On a
+# platform lacking them, this module falls back to direct-child-only
+# termination and never reports `cleanup_status=confirmed_absent` (AC8):
+# absence of a POSIX guarantee is reported as `unconfirmed`, not silently
+# upgraded to a false "success".
+# ---------------------------------------------------------------------------
+
+_POSIX_PROCESS_GROUP_SUPPORTED = (
+    os.name == "posix"
+    and hasattr(os, "killpg")
+    and hasattr(os, "setsid")
+    and hasattr(os, "getpgid")
+)
+
+# Two independently bounded budgets govern outer-child supervision (Issue
+# #2075 P1-4 OWNER review contract):
+#
+#   1. `timeout_seconds` (caller-supplied, per registry entry) bounds only
+#      the *execution* wait -- i.e. `proc.communicate(timeout=...)` below.
+#   2. `_CLEANUP_GRACE_SECONDS` is a separate, freshly-started budget for
+#      the *entire* SIGTERM -> process-group-liveness poll -> SIGKILL ->
+#      absence verification -> leader reap -> pipe close sequence, begun
+#      only once the execution deadline has already been exceeded (or an
+#      exception unwinds past a successful `Popen()`). It is never stacked
+#      on top of the execution deadline, and no cleanup step below is ever
+#      given a further, separate ad-hoc timeout on top of it -- every
+#      cleanup step is bounded by `remaining(cleanup_deadline)`.
+_CLEANUP_GRACE_SECONDS = 5.0
+# Portion of `_CLEANUP_GRACE_SECONDS` allotted to waiting for SIGTERM to take
+# effect before escalating to SIGKILL. Must stay smaller than
+# `_CLEANUP_GRACE_SECONDS` so the escalation + absence-verification + reap
+# steps that follow always retain some of the shared cleanup budget, instead
+# of a SIGTERM-ignoring child silently consuming the entire cleanup deadline
+# and leaving no time to ever send SIGKILL.
+_TERM_GRACE_SECONDS = 2.0
+_GROUP_POLL_INTERVAL_SECONDS = 0.02
+
+CLEANUP_SCOPE_PROCESS_GROUP = "process_group"
+CLEANUP_STATUS_CONFIRMED_ABSENT = "confirmed_absent"
+CLEANUP_STATUS_UNCONFIRMED = "unconfirmed"
+CLEANUP_STATUS_NOT_STARTED = "not_started"
+TERMINATION_TERM = "term"
+TERMINATION_TERM_THEN_KILL = "term_then_kill"
+TERMINATION_NOT_NEEDED = "not_needed"
+
+
+class _ChildSupervisionResult:
+    """Outcome of `_run_child_with_supervision()` (Issue #2075)."""
+
+    __slots__ = (
+        "timed_out",
+        "returncode",
+        "stdout",
+        "stderr",
+        "cleanup_scope",
+        "cleanup_status",
+        "termination",
+        "leader_reaped",
+        "pid",
+    )
+
+    def __init__(
+        self,
+        *,
+        timed_out: bool,
+        returncode: int | None,
+        stdout: str,
+        stderr: str,
+        cleanup_scope: str,
+        cleanup_status: str,
+        termination: str,
+        leader_reaped: bool,
+        pid: int | None = None,
+    ) -> None:
+        self.timed_out = timed_out
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.cleanup_scope = cleanup_scope
+        self.cleanup_status = cleanup_status
+        self.termination = termination
+        self.leader_reaped = leader_reaped
+        # `pid` is an introspection aid (not part of the closed telemetry
+        # enum emitted by `_emit_timeout_failure()`) that lets a caller /
+        # test independently confirm the direct child was actually reaped.
+        self.pid = pid
+
+
+def _remaining(deadline: float) -> float:
+    """Return the non-negative seconds remaining until `deadline`."""
+    return max(0.0, deadline - time.monotonic())
+
+
+def _verify_process_group_absent(pgid: int) -> bool:
+    """Return True only when `killpg(pgid, 0)` proves the group is gone
+    (`ProcessLookupError`). Every other outcome -- the group is still alive,
+    a `PermissionError`, or any other `OSError` -- must NOT be treated as
+    confirmed absence (Issue #2075 AC6/AC9 fail-closed contract: cleanup
+    success is never inferred from signal dispatch alone)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _poll_group_absent_until(proc: subprocess.Popen, pgid: int, deadline: float) -> bool:
+    """Poll `_verify_process_group_absent(pgid)` until it is True or
+    `deadline` elapses. Returns True iff absence was confirmed within the
+    deadline.
+
+    The escalation/absence decision itself is driven entirely by
+    *process-group* liveness (`killpg(pgid, 0)`), never by leader
+    (direct-child) liveness (Issue #2075 P1-1 OWNER review): a leader that
+    exits early while a SIGTERM-ignoring descendant survives in the same
+    process group must never suppress the SIGKILL escalation that follows.
+
+    Each iteration also opportunistically calls `proc.poll()` (a
+    non-blocking `waitpid()`) purely as a side effect so a leader that has
+    already died does not linger as an unreaped zombie -- an unreaped
+    zombie's PID slot still answers `kill(pid, 0)` successfully, which
+    would otherwise make `killpg()` report the group as still alive even
+    though every process in it has actually exited. This reap is
+    incidental cleanup, not a liveness signal: it never gates the
+    SIGTERM -> SIGKILL escalation decision above."""
+    while True:
+        proc.poll()
+        if _verify_process_group_absent(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+
+
+def _bounded_reap_leader(proc: subprocess.Popen, deadline: float) -> bool:
+    """Best-effort `proc.wait()` bounded by `deadline`. Returns True iff the
+    direct child leader was reaped (no zombie left behind)."""
+    try:
+        proc.wait(timeout=_remaining(deadline))
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _bounded_close_pipes(proc: subprocess.Popen) -> None:
+    """Best-effort close of the leader's stdout/stderr pipes so a
+    descendant that still holds the write end open can never block this
+    process from returning (Issue #2075 AC7: no partial output is ever
+    surfaced on timeout regardless of how/when this closes)."""
+    for stream in (proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _stage_cleanup(
+    proc: subprocess.Popen,
+    pgid: int | None,
+    *,
+    posix_supervised: bool,
+) -> tuple[str, str, str, bool]:
+    """Run the full staged cleanup state machine -- SIGTERM, process-group
+    liveness poll, SIGKILL escalation, absence verification, leader reap,
+    pipe close -- under a single, freshly-started `cleanup_deadline`
+    (`_CLEANUP_GRACE_SECONDS`) that is independent of whatever execution
+    deadline just elapsed (Issue #2075 P1-4). Every step below is bounded
+    by `remaining(cleanup_deadline)`; no step gets its own separate,
+    unbounded-relative-to-the-caller ad-hoc timeout.
+
+    Used from both the `TimeoutExpired` path and the `except BaseException`
+    unwind path in `_run_child_with_supervision()` so that every exit path
+    that follows a successful `Popen()` drives the process group through
+    this exact same state machine (Issue #2075 P1-3).
+
+    Returns `(cleanup_scope, cleanup_status, termination, leader_reaped)`.
+    """
+    cleanup_deadline = time.monotonic() + _CLEANUP_GRACE_SECONDS
+    term_deadline = min(cleanup_deadline, time.monotonic() + _TERM_GRACE_SECONDS)
+
+    group_supervised = posix_supervised and pgid is not None
+
+    if group_supervised:
+        termination = TERMINATION_NOT_NEEDED
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            termination = TERMINATION_TERM
+        except ProcessLookupError:
+            termination = TERMINATION_NOT_NEEDED
+        except OSError:
+            termination = TERMINATION_TERM
+
+        # P1-1: the SIGTERM -> SIGKILL escalation decision is driven by
+        # *process-group* liveness, not leader liveness -- a leader that
+        # exits (on its own, or from the SIGTERM) while a SIGTERM-ignoring
+        # descendant survives in the same group must not suppress SIGKILL.
+        group_absent = _poll_group_absent_until(proc, pgid, term_deadline)
+        if not group_absent and time.monotonic() < cleanup_deadline:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+                termination = TERMINATION_TERM_THEN_KILL
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+            group_absent = _poll_group_absent_until(proc, pgid, cleanup_deadline)
+
+        # AC6: absence is only ever reported `confirmed_absent` while
+        # cleanup budget remains; deadline exhaustion is never silently
+        # promoted to a confirmed success.
+        if time.monotonic() >= cleanup_deadline:
+            cleanup_status = CLEANUP_STATUS_UNCONFIRMED
+        else:
+            cleanup_status = (
+                CLEANUP_STATUS_CONFIRMED_ABSENT if group_absent else CLEANUP_STATUS_UNCONFIRMED
+            )
+    else:
+        # AC8: no `killpg`/`setsid` on this platform (or no pgid to
+        # supervise) -- best-effort terminate the direct child only, and
+        # never claim process-group absence was confirmed. There is no
+        # POSIX guarantee here to confirm (P2-1: a failed pgid lookup must
+        # never be promoted to `confirmed_absent` either).
+        termination = TERMINATION_TERM
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        if not _bounded_reap_leader(proc, term_deadline):
+            termination = TERMINATION_TERM_THEN_KILL
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        cleanup_status = CLEANUP_STATUS_UNCONFIRMED
+
+    leader_reaped = _bounded_reap_leader(proc, cleanup_deadline)
+    _bounded_close_pipes(proc)
+
+    return CLEANUP_SCOPE_PROCESS_GROUP, cleanup_status, termination, leader_reaped
+
+
+def _run_child_with_supervision(
+    child_argv: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout_seconds: float | int | None,
+) -> _ChildSupervisionResult:
+    """Launch `child_argv` under direct caller supervision.
+
+    Normal-success semantics (stdout/stderr/returncode) are unchanged from
+    the previous `subprocess.run(capture_output=True, text=True)` behavior
+    (AC4): the execution wait itself is delegated to
+    `proc.communicate(timeout=timeout_seconds)`, which preserves
+    `subprocess.run()`'s own timeout/pipe-EOF/decode-error semantics
+    exactly (Issue #2075 P1-2) -- including that a leader which exits while
+    a descendant still holds the stdout/stderr pipe open keeps this call
+    blocked (and, on timeout, still times out) rather than being mistaken
+    for success, and that a `UnicodeDecodeError` from malformed child output
+    propagates to the caller instead of being swallowed.
+
+    On timeout (or any other exception unwinding past a successful
+    `Popen()`, including `KeyboardInterrupt`), the process group is driven
+    through `_stage_cleanup()`'s bounded state machine before returning /
+    re-raising (Issue #2075 P1-3). On timeout, no partial stdout/stderr is
+    ever surfaced (AC7) -- only cleanup telemetry is returned.
+    """
+    posix_supervised = _POSIX_PROCESS_GROUP_SUPPORTED
+
+    popen_kwargs: dict[str, object] = dict(
+        cwd=cwd,
+        env=env,
+        shell=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if posix_supervised:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(child_argv, **popen_kwargs)  # type: ignore[arg-type]
+    # P2-1: capture the process-group id at launch time, as `proc.pid`
+    # itself -- not via a later `os.getpgid()` lookup. `start_new_session`
+    # makes the leader its own session/group leader, so `proc.pid` *is* the
+    # pgid from the instant `Popen()` returns; there is no window in which a
+    # delayed `getpgid()` call could race, and a lookup failure can never be
+    # (mis)promoted to `confirmed_absent` because this code path never
+    # performs that lookup at all.
+    pgid: int | None = proc.pid if posix_supervised else None
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        cleanup_scope, cleanup_status, termination, leader_reaped = _stage_cleanup(
+            proc, pgid, posix_supervised=posix_supervised
+        )
+        return _ChildSupervisionResult(
+            timed_out=True,
+            returncode=None,
+            stdout="",
+            stderr="",
+            cleanup_scope=cleanup_scope,
+            cleanup_status=cleanup_status,
+            termination=termination,
+            leader_reaped=leader_reaped,
+            pid=proc.pid,
+        )
+    except BaseException:
+        # P1-3: any other exception after a successful Popen() -- including
+        # KeyboardInterrupt -- must still drive the process group through
+        # the same bounded cleanup state machine before propagating, or a
+        # detached process group (start_new_session=True) can outlive this
+        # process entirely.
+        _stage_cleanup(proc, pgid, posix_supervised=posix_supervised)
+        raise
+    else:
+        return _ChildSupervisionResult(
+            timed_out=False,
+            returncode=proc.returncode,
+            stdout=stdout or "",
+            stderr=stderr or "",
+            cleanup_scope=CLEANUP_SCOPE_PROCESS_GROUP,
+            cleanup_status=CLEANUP_STATUS_NOT_STARTED,
+            termination=TERMINATION_NOT_NEEDED,
+            leader_reaped=True,
+            pid=proc.pid,
+        )
+
+
+
+def _emit_timeout_failure(
+    issue_number: int,
+    timeout_seconds: object,
+    *,
+    cleanup_scope: str = CLEANUP_SCOPE_PROCESS_GROUP,
+    cleanup_status: str = CLEANUP_STATUS_NOT_STARTED,
+    termination: str = TERMINATION_NOT_NEEDED,
+    leader_reaped: bool = False,
+) -> int:
     print(
         "SKILL_RUNTIME_FAIL: "
         f"reason_code=child_process_timeout target_issue={issue_number} "
         f"timeout_seconds={timeout_seconds} "
+        f"cleanup_scope={cleanup_scope} "
+        f"cleanup_status={cleanup_status} "
+        f"termination={termination} "
+        f"leader_reaped={'true' if leader_reaped else 'false'} "
         "recovery=investigate_child_process_hang_or_increase_registry_timeout",
         file=sys.stderr,
     )
@@ -1643,19 +2017,22 @@ def main(argv: list[str] | None = None) -> int:
     child_argv = _resolve_child_argv(child_argv)
 
     timeout_seconds = entry.get("timeout_seconds")
-    try:
-        result = subprocess.run(
-            child_argv,
-            cwd=project_root,
-            env=_sanitize_env(project_root),
-            capture_output=True,
-            text=True,
-            shell=False,
-            check=False,
-            timeout=timeout_seconds,
+    supervision = _run_child_with_supervision(
+        child_argv,
+        cwd=project_root,
+        env=_sanitize_env(project_root),
+        timeout_seconds=timeout_seconds,
+    )
+    if supervision.timed_out:
+        return _emit_timeout_failure(
+            args.issue_number,
+            timeout_seconds,
+            cleanup_scope=supervision.cleanup_scope,
+            cleanup_status=supervision.cleanup_status,
+            termination=supervision.termination,
+            leader_reaped=supervision.leader_reaped,
         )
-    except subprocess.TimeoutExpired:
-        return _emit_timeout_failure(args.issue_number, timeout_seconds)
+    result = supervision
 
     # Issue #1502 AC3: wait a bounded window for the writer's own `.lock` /
     # `.tmp` transient protocol entries to vanish before evaluating the
