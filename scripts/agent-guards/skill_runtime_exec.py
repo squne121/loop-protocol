@@ -2077,7 +2077,13 @@ def main(argv: list[str] | None = None) -> int:
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
     elif is_produce_command:
-        if args.fixture or args.anchor_comment_url or args.loop_state_file or args.review_result_verdict or args.max_iterations:
+        if (
+            args.fixture
+            or args.anchor_comment_url
+            or args.loop_state_file
+            or args.review_result_verdict
+            or args.max_iterations
+        ):
             print(
                 "skill_runtime_exec: only --invocation-id/--git-head-sha/"
                 "--evidence-fixture-path are allowed for authority_transport.produce",
@@ -2117,7 +2123,13 @@ def main(argv: list[str] | None = None) -> int:
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
     elif is_consume_command:
-        if args.fixture or args.anchor_comment_url or args.loop_state_file or args.review_result_verdict or args.max_iterations:
+        if (
+            args.fixture
+            or args.anchor_comment_url
+            or args.loop_state_file
+            or args.review_result_verdict
+            or args.max_iterations
+        ):
             print(
                 "skill_runtime_exec: only --invocation-id/--git-head-sha/"
                 "--router-receipt-path/--contract-patch-plan-file/--anchor-context-file "

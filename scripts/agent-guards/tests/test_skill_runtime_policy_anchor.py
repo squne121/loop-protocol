@@ -549,7 +549,9 @@ def test_authority_transport_consume_reaches_real_subprocess(tmp_path: Path) -> 
             "--repo", "squne121/loop-protocol",
             "--invocation-id", "test-invocation-1",
             "--git-head-sha", "0123456789abcdef0123456789abcdef01234567",
-            "--router-receipt-path", ".claude/artifacts/issue-refinement-loop/2086/authority-transport/test-invocation-1/nonexistent_receipt.json",
+            "--router-receipt-path",
+            ".claude/artifacts/issue-refinement-loop/2086/authority-transport/"
+            "test-invocation-1/nonexistent_receipt.json",
         ],
     )
     assert "exact command class rejected" not in result.stderr, result.stderr
