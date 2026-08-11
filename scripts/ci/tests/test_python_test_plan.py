@@ -175,8 +175,14 @@ def test_real_plan_serial_lane_has_debounce():
     timeout under 4-way xdist CPU saturation on the GitHub-hosted runner. The
     debounce test itself must NOT be excluded.
     scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py
-    was added to parallel_exclude (Issue #2073) for the same reason (real
-    subprocess-chain timeout under xdist CPU saturation).
+    was added to parallel_exclude (Issue #2073) as a historical mitigation
+    for an unresolved AC10 flake; the original fixed-timeout /
+    xdist-CPU-saturation causal claim has been retracted, see Issue #2073.
+
+    AC10_ROOT_CAUSE_STATUS: unresolved (Issue #2073). This marker is the
+    canonical source Issue #2073 AC1's Verification Command checks; when the
+    AC10 root cause is identified, update this marker (and Issue #2073 AC1's
+    text/VC) together rather than leaving a stale "unresolved" claim here.
     """
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
@@ -187,11 +193,12 @@ def test_real_plan_serial_lane_has_debounce():
         "tests/codex/test_scope_rollup_runner_agent_config.py",
         ".claude/skills/issue-contract-review/scripts/tests/test_baseline_vc_preflight.py",
         # Issue #2073: scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py
-        # was added to parallel_exclude because its AC10 real-executor-chain test
-        # (skill_runtime_exec.py -> uv run python3 run_refinement_preflight.py ->
-        # plan_refinement_loop.py) has the same class of fixed-timeout /
-        # xdist-CPU-saturation flake as test_baseline_vc_preflight.py above; see
-        # docs/dev/ac10-pid-proof-flake-root-cause.md.
+        # was added to parallel_exclude as a historical mitigation for an
+        # unresolved AC10 flake (its AC10 real-executor-chain test hit a
+        # FileNotFoundError for pid_proof_planner.json under full CI parallel
+        # load); the original fixed-timeout / xdist-CPU-saturation causal
+        # claim has been retracted and root cause remains unconfirmed, see
+        # Issue #2073.
         "scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py",
         "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
