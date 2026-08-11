@@ -45,7 +45,13 @@ roles:
 
 **バリデーション規則**（違反時は `ValueError` で fail-closed → `reason_code: routing_config_invalid`）:
 - `default_chain` は非空リスト
-- 各 role の `model_chain` は非空リスト
+- 各 role の `model_chain` は非空リスト。**例外**: `grounded_research` role
+  のみ empty chain (`[]`) を合法として許可する（識別子:
+  `grounded_research_empty_chain_exception`、Issue #2069）。empty chain の
+  場合、`resolve_agy_grounded_research_model()` は候補を持たず `None` を
+  返し、AGY 呼び出しの実行 argv に `--model` フラグは付与されない
+  （account_default に選択権を委ねる）。他の role は引き続き非空リストを
+  要求する。
 - 不正な YAML は `yaml.YAMLError` → `ValueError` に変換
 - YAML ファイルのトップレベルが mapping でない場合は `ValueError`
 

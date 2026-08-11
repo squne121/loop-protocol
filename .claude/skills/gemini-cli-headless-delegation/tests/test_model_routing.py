@@ -161,6 +161,48 @@ roles:
 
 
 # ---------------------------------------------------------------------------
+# Issue #2069 AC6/AC7: grounded_research_empty_chain_exception -- module-level
+# (not TestLoadModelRouting methods) so the AC6/AC7 rg baseline-fail
+# node-id-free existence check (`^def test_...`) matches.
+# ---------------------------------------------------------------------------
+
+
+def test_grounded_research_empty_chain_allowed(tmp_path):
+    """Issue #2069 AC6: grounded_research is the sole role permitted an
+    empty model_chain (grounded_research_empty_chain_exception) -- an
+    empty chain must not raise, and resolve_agy_grounded_research_model()
+    must resolve it to None (AGY account_default, no --model flag)."""
+    m = load_module()
+    yaml_content = """
+roles:
+  grounded_research:
+    model_chain: []
+"""
+    config_file = tmp_path / "model_routing.yaml"
+    config_file.write_text(yaml_content, encoding="utf-8")
+
+    routing = m.load_model_routing(config_path=config_file)
+    assert routing["roles"]["grounded_research"]["model_chain"] == []
+    assert m.resolve_agy_grounded_research_model(routing) is None
+
+
+def test_non_grounded_research_empty_chain_rejected(tmp_path):
+    """Issue #2069 AC7: roles other than grounded_research must continue
+    to reject an empty model_chain with ValueError."""
+    m = load_module()
+    yaml_content = """
+roles:
+  web_research:
+    model_chain: []
+"""
+    config_file = tmp_path / "model_routing.yaml"
+    config_file.write_text(yaml_content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-empty list"):
+        m.load_model_routing(config_path=config_file)
+
+
+# ---------------------------------------------------------------------------
 # run_delegation: model downgrade tests
 # ---------------------------------------------------------------------------
 

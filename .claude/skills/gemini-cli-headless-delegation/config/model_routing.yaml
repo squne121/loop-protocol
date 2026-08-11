@@ -56,9 +56,18 @@ roles:
   # grounding matrix experiment (#1777) found prompt construction, not
   # model selection, to be the dominant reliability factor -- see
   # references/agy-headless-tool-use-investigation.md.
+  #
+  # Issue #2069: この empty chain (`[]`) は、上記 #1777 の実験知見
+  # （`account_default` が `claude-sonnet-4-6` を上回る成功率だった）と
+  # 整合しない旧来の `claude-sonnet-4-6` 固定設定を廃止するための意図的な
+  # 変更である。固定モデルを列挙すると wrapper が Antigravity CLI の
+  # 「Claude and GPT Models」共有クォータ枠を毎回消費してしまうため、
+  # ここでは Claude 強制を外し、AGY 自身の account_default に選択権を返す。
+  # `load_model_routing()` はこの role に限り empty chain を合法として
+  # 許可する（識別子: `grounded_research_empty_chain_exception`）。他の
+  # role は引き続き non-empty list を要求する。
   grounded_research:
-    model_chain:
-      - claude-sonnet-4-6
+    model_chain: []
 
 # provider_auto_policy_v1 (Issue #1270)
 #
