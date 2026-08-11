@@ -995,29 +995,49 @@ def test_ac12_persisted_provenance_artifact_contains_full_v2_proof(tmp_path: Pat
 def test_ac13_child_subprocess_timeout_applies_registry_timeout_and_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC13: `skill_runtime_exec.py`'s own `subprocess.run` of the
-    registry-declared child command must apply the registry's
-    `timeout_seconds` and convert a `subprocess.TimeoutExpired` into a
-    fail-closed reason code, instead of hanging indefinitely or silently
-    ignoring the timeout."""
+    """AC13: `skill_runtime_exec.py`'s outer child supervisor
+    (`_run_child_with_supervision()`, Issue #2075) must apply the registry's
+    `timeout_seconds` to the child it launches and convert a supervised
+    timeout into a fail-closed reason code, instead of hanging indefinitely
+    or silently ignoring the timeout.
+
+    Issue #2075 replaced the previous `subprocess.run(...,
+    timeout=timeout_seconds)` + `except TimeoutExpired` pattern with an
+    explicit `Popen`-based supervisor owned by this module (see
+    `scripts/agent-guards/tests/test_skill_runtime_exec_process_tree_cleanup.py`
+    for the dedicated real-subprocess staged-escalation/cleanup-telemetry
+    coverage of that supervisor). This test keeps verifying its original
+    narrow contract -- the registry's declared `timeout_seconds` reaches the
+    child-launch call, and a supervised timeout fails closed with exit code
+    2 -- against the new call site.
+    """
     repo = _make_repo(tmp_path)
     _install_real_preflight_fixture(repo)
 
     captured: dict[str, object] = {}
-    real_subprocess_run = subprocess.run
+    real_supervision = real_exec._run_child_with_supervision
 
-    def _selective_raising_run(argv, **kwargs):
-        if isinstance(argv, list) and any(
-            isinstance(tok, str) and tok.endswith("run_refinement_preflight.py") for tok in argv
+    def _selective_timing_out_supervision(child_argv, **kwargs):
+        if isinstance(child_argv, list) and any(
+            isinstance(tok, str) and tok.endswith("run_refinement_preflight.py") for tok in child_argv
         ):
-            captured["argv"] = argv
-            captured["timeout"] = kwargs.get("timeout")
-            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
-        return real_subprocess_run(argv, **kwargs)
+            captured["argv"] = child_argv
+            captured["timeout_seconds"] = kwargs.get("timeout_seconds")
+            return real_exec._ChildSupervisionResult(
+                timed_out=True,
+                returncode=None,
+                stdout="",
+                stderr="",
+                cleanup_scope=real_exec.CLEANUP_SCOPE_PROCESS_GROUP,
+                cleanup_status=real_exec.CLEANUP_STATUS_CONFIRMED_ABSENT,
+                termination=real_exec.TERMINATION_TERM,
+                leader_reaped=True,
+            )
+        return real_supervision(child_argv, **kwargs)
 
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(repo))
     monkeypatch.chdir(repo)
-    monkeypatch.setattr(real_exec.subprocess, "run", _selective_raising_run)
+    monkeypatch.setattr(real_exec, "_run_child_with_supervision", _selective_timing_out_supervision)
 
     exit_code = real_exec.main(
         [
@@ -1033,4 +1053,4 @@ def test_ac13_child_subprocess_timeout_applies_registry_timeout_and_fails_closed
     )
 
     assert exit_code == 2
-    assert captured.get("timeout") == 120, captured  # registry's declared timeout_seconds
+    assert captured.get("timeout_seconds") == 120, captured  # registry's declared timeout_seconds
