@@ -3,7 +3,8 @@
 
 The executor deliberately has no merge, rebase, reset, or force-push path.
 It reproduces one reviewed source range in an executor-owned detached worktree,
-then performs one guarded SHA refspec push after two independent head checks.
+then performs one expected-old SHA lease guarded refspec push after two
+independent head checks.
 """
 
 from __future__ import annotations
@@ -261,8 +262,36 @@ def execute(
                 new_commit_sha=new_commit,
                 **input_fields,
             )
-        pushed_proc = runner(["git", "push", "origin", f"{new_commit}:refs/heads/{target_branch}"], cwd=worktree)
+        # Bind the preflight observation to the ref update itself. The
+        # ordinary fast-forward check is not a substitute for this CAS guard:
+        # another fast-forward update can occur after ``ls-remote`` and before
+        # this push. This replay is a child of expected_remote_pr_head, so the
+        # lease never broadens the executor into a raw force-push path.
+        expected_old_lease = f"refs/heads/{target_branch}:{expected_remote_pr_head}"
+        pushed_proc = runner(
+            [
+                "git",
+                "push",
+                f"--force-with-lease={expected_old_lease}",
+                "origin",
+                f"{new_commit}:refs/heads/{target_branch}",
+            ],
+            cwd=worktree,
+        )
         if pushed_proc.returncode:
+            changed_remote = runner(["git", "ls-remote", "origin", f"refs/heads/{target_branch}"], cwd=root)
+            changed_remote_head = (
+                changed_remote.stdout.split()[0]
+                if changed_remote.returncode == 0 and changed_remote.stdout.split()
+                else None
+            )
+            if changed_remote_head != expected_remote_pr_head:
+                return _result(
+                    "blocked",
+                    errors=["remote_target_changed_during_publish"],
+                    new_commit_sha=new_commit,
+                    **input_fields,
+                )
             return _result(
                 "failed",
                 errors=[f"publish_push_failed:{_error_code(pushed_proc)}"],

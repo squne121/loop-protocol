@@ -32,12 +32,25 @@ def _commit(repo: Path, path: str, content: str, message: str) -> str:
 
 
 class OfflineLiveRunner:
-    def __init__(self, *, bare: Path, reported_head: str, issue_body: str, post_mode: str = "new") -> None:
+    def __init__(
+        self,
+        *,
+        bare: Path,
+        reported_head: str,
+        issue_body: str,
+        post_mode: str = "new",
+        race_repo: Path | None = None,
+        race_head: str | None = None,
+    ) -> None:
         self.bare = bare
         self.reported_head = reported_head
         self.issue_body = issue_body
         self.post_mode = post_mode
         self.pr_reads = 0
+        self.race_repo = race_repo
+        self.race_head = race_head
+        self.raced = False
+        self.publish_argv: list[str] | None = None
 
     def __call__(self, argv, **kwargs):  # noqa: ANN001
         command = list(argv)
@@ -50,6 +63,17 @@ class OfflineLiveRunner:
                 head = _git(self.bare, "rev-parse", "refs/heads/target")
             payload = {"headRefName": "target", "headRefOid": head}
             return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+        if command[:2] == ["git", "push"]:
+            self.publish_argv = command
+            if not self.raced and self.race_repo is not None and self.race_head is not None:
+                self.raced = True
+                subprocess.run(
+                    ["git", "push", "origin", f"{self.race_head}:refs/heads/target"],
+                    cwd=self.race_repo,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
         return subprocess.run(command, **kwargs, capture_output=True, text=True, check=False)
 
 
@@ -84,6 +108,7 @@ def _execute(
     expected: str | None = None,
     reported_head: str | None = None,
     post_mode: str = "new",
+    race_head: str | None = None,
 ):
     expected = expected or _git(bare, "rev-parse", "refs/heads/target")
     runner = OfflineLiveRunner(
@@ -91,8 +116,10 @@ def _execute(
         reported_head=reported_head or _git(bare, "rev-parse", "refs/heads/target"),
         issue_body=body,
         post_mode=post_mode,
+        race_repo=repo if race_head else None,
+        race_head=race_head,
     )
-    return _MODULE.execute(
+    result = _MODULE.execute(
         repo="owner/repo",
         issue_number=2040,
         pr_number=2081,
@@ -103,12 +130,13 @@ def _execute(
         project_root=repo,
         runner=runner,
     )["PR_HEAD_REPLAY_PUBLISH_RESULT_V1"]
+    return result, runner
 
 
 def test_given_approved_range_when_replayed_then_pushes_one_new_commit(replay_repo):
     repo, bare, base = replay_repo
     head = _commit(repo, "allowed.txt", "source\n", "approved source")
-    result = _execute(repo, bare, base, head, _body("allowed.txt"))
+    result, _ = _execute(repo, bare, base, head, _body("allowed.txt"))
     assert result["status"] == "ok"
     assert result["pushed"] is True
     assert _git(bare, "rev-parse", "refs/heads/target") == result["new_commit_sha"]
@@ -119,7 +147,7 @@ def test_given_stale_pr_head_when_checked_then_never_pushes(replay_repo):
     repo, bare, base = replay_repo
     head = _commit(repo, "allowed.txt", "source\n", "approved source")
     original = _git(bare, "rev-parse", "refs/heads/target")
-    result = _execute(
+    result, _ = _execute(
         repo, bare, base, head, _body("allowed.txt"), expected="f" * 40, reported_head=original
     )
     assert result["status"] == "blocked"
@@ -131,7 +159,7 @@ def test_given_disallowed_source_path_when_checked_then_never_pushes(replay_repo
     repo, bare, base = replay_repo
     head = _commit(repo, "forbidden.txt", "source\n", "disallowed source")
     original = _git(bare, "rev-parse", "refs/heads/target")
-    result = _execute(repo, bare, base, head, _body("allowed.txt"))
+    result, _ = _execute(repo, bare, base, head, _body("allowed.txt"))
     assert result["status"] == "blocked"
     assert result["errors"] == ["source_range_contains_disallowed_path"]
     assert _git(bare, "rev-parse", "refs/heads/target") == original
@@ -145,7 +173,7 @@ def test_given_non_ancestor_source_base_when_checked_then_never_pushes(replay_re
     unrelated = _commit(repo, "other.txt", "unrelated\n", "unrelated")
     _git(repo, "checkout", "master")
     original = _git(bare, "rev-parse", "refs/heads/target")
-    result = _execute(repo, bare, unrelated, head, _body("allowed.txt"))
+    result, _ = _execute(repo, bare, unrelated, head, _body("allowed.txt"))
     assert result["status"] == "blocked"
     assert result["errors"] == ["source_base_not_ancestor"]
     assert _git(bare, "rev-parse", "refs/heads/target") == original
@@ -154,7 +182,22 @@ def test_given_non_ancestor_source_base_when_checked_then_never_pushes(replay_re
 def test_given_post_publish_readback_mismatch_when_pushed_then_reports_failure(replay_repo):
     repo, bare, base = replay_repo
     head = _commit(repo, "allowed.txt", "source\n", "approved source")
-    result = _execute(repo, bare, base, head, _body("allowed.txt"), post_mode="stale")
+    result, _ = _execute(repo, bare, base, head, _body("allowed.txt"), post_mode="stale")
     assert result["status"] == "failed"
     assert result["errors"] == ["post_publish_pr_readback_mismatch"]
     assert _git(bare, "rev-parse", "refs/heads/target") == result["new_commit_sha"]
+
+
+def test_given_target_moves_after_preflight_when_publishing_then_lease_rejects_without_overwrite(replay_repo):
+    repo, bare, base = replay_repo
+    head = _commit(repo, "allowed.txt", "source\n", "approved source")
+    competing_head = _commit(repo, "allowed.txt", "competing\n", "competing branch movement")
+
+    result, runner = _execute(repo, bare, base, head, _body("allowed.txt"), race_head=competing_head)
+
+    assert result["status"] == "blocked"
+    assert result["pushed"] is False
+    assert result["errors"] == ["remote_target_changed_during_publish"]
+    assert _git(bare, "rev-parse", "refs/heads/target") == competing_head
+    assert runner.publish_argv is not None
+    assert f"--force-with-lease=refs/heads/target:{base}" in runner.publish_argv
