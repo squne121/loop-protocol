@@ -775,7 +775,18 @@ def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_pro
 
     artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / str(_FIXTURE_ISSUE_NUMBER)
     preflight_proof = json.loads((artifact_dir / "pid_proof_preflight.json").read_text(encoding="utf-8"))
-    planner_proof = json.loads((artifact_dir / "pid_proof_planner.json").read_text(encoding="utf-8"))
+    planner_proof_path = artifact_dir / "pid_proof_planner.json"
+    if not planner_proof_path.exists():
+        # Diagnostic-only (Issue #2073): the executor's own outcome (exit
+        # code / stdout / stderr) is the only evidence available when the
+        # planner subprocess never reaches the pid-proof harness splice
+        # point, so surface it directly instead of a bare FileNotFoundError.
+        pytest.fail(
+            "pid_proof_planner.json missing; executor "
+            f"returncode={result.returncode!r} "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+    planner_proof = json.loads(planner_proof_path.read_text(encoding="utf-8"))
     proof = {"preflight": preflight_proof, "planner": planner_proof}
 
     # Real, distinct process identities for every level of the chain.

@@ -1,6 +1,6 @@
 # `test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_proof` flake — root cause（Issue #2073）
 
-**状態:** 解決済み（serial lane 分離により対応済み）
+**状態:** 緩和済み・未解消（serial lane 分離により再現頻度は低下したが、根本原因は未解消。詳細は下記「2026-08 再検証（PR #2068 CI）」参照）
 **関連 Issue:** #2073
 
 ## 症状
@@ -91,5 +91,69 @@ nodeid-level（`--deselect` 等による個別テスト単位）の serial routi
 別スコープと位置づける。したがって対象テストを含むファイル全体（AC1-AC9/
 AC11-AC13 も含む。既存 precedent と同じ制約）が serial lane に移動する。
 
+**注意（2026-08 訂正）:** 上記の serial lane 分離は、CI フル並列負荷という
+外部要因が原因であるという当時の仮説に基づく **緩和策** であり、根本原因を
+特定・修正した恒久解決ではない。下記「2026-08 再検証」節が示すとおり、
+inner `PLANNER_TIMEOUT`（60秒）仮説は実測により事実上棄却されており、
+serial lane 分離後も同一テストが CI で再現している。したがってこの節は
+「試みた緩和策の記録」として残すが、これのみで解決済みとは扱わない。
+
 これによりテスト自体・実装側コードは変更せず、CI のフル並列負荷という
-外部要因から独立した安定実行を確保する。
+外部要因から独立した安定実行を確保する（**ただし後述のとおり、この分離後も
+再現が報告されており、根本原因は未解消**）。
+
+## 2026-08 再検証（PR #2068 CI）— inner timeout 仮説の事実上の棄却
+
+PR #2068 の CI 再検証で、上記「解消方針」節の serial lane 分離が根本解決に
+なっていなかったことが判明した。serial lane 分離後も
+`test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_proof`
+が 3 回連続で再現した。
+
+CI job API で実測したところ、**失敗時のテスト実行時間は 0.26 秒**だった
+（`pytest` の `slowest 25 durations` 出力より）。これは本文書が唯一の
+未確証仮説として挙げていた「inner `PLANNER_TIMEOUT`（60秒）による
+planner subprocess の timeout」という仮説と完全に矛盾する。
+`PLANNER_TIMEOUT = 60` による `subprocess.TimeoutExpired` が原因であれば、
+テストは最低でも 60 秒程度かかるはずだが、実測は 0.26 秒であり、
+timeout 経路が発生した可能性は事実上排除される。
+
+したがって、本文書が挙げていた 2 つの timeout 仮説（outer / inner）は
+**いずれも証拠と矛盾する**ことが確認され、根本原因は依然として未特定である。
+
+### 新しい観測
+
+`_splice_pid_proof_harness()`
+（`scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py`
+664-699行目）を確認すると、証跡書き込みハーネスは planner スクリプトの
+`if __name__ == "__main__":` ブロックの先頭（`main()` 呼び出しより前）に
+挿入されており、planner プロセスが起動しさえすれば瞬時に証跡が書かれる
+設計になっている。
+
+一方、preflight 側の証跡（`pid_proof_preflight.json`）は正常に書き込まれて
+いる（テストは先にこのファイルを読んでおり、そこでは失敗していない）。
+これは preflight プロセス自体は正常に起動・実行され、`_invoke_planner()`
+の呼び出しまで到達していることを意味する。
+
+以上から、失敗の実体は次のいずれかである可能性が高い:
+
+- planner subprocess 自体が起動していない（`_invoke_planner()` 内部の
+  `subprocess.run()` 呼び出し前に何らかの early return / 例外分岐がある）
+- planner subprocess は起動したが、ハーネスの harness コードが実行される
+  前に即座に終了している（0.26 秒という短時間の失敗と整合する）
+
+この 2 つの可能性のいずれであるかは未確定であり、確定させるには
+`_invoke_planner()` 呼び出し直前・直後の状態と planner subprocess 自身の
+`returncode` / `stdout` / `stderr` を独立に観測できる診断情報が必要である
+（本 Issue の Scope 2「テストへの診断情報追加」を参照）。
+
+### 現時点のステータス
+
+- inner `PLANNER_TIMEOUT`（60秒）仮説: **実測（0.26秒での失敗）により事実上棄却**
+- outer timeout（`timeout_seconds: 120`）仮説: 既存文書のとおり `SKILL_RUNTIME_FAIL`
+  が観測されないため引き続き除外
+- 根本原因: **未解消**。serial lane 分離は再現頻度を下げる緩和策として機能して
+  いるが、CI フル並列負荷が唯一の要因ではないことが今回の再検証で判明した
+  （serial lane 分離後の再現）。
+- 次のアクション: 本 Issue で追加する診断情報（executor の `returncode` /
+  `stdout` / `stderr`）を用いた次回の再現時に、planner subprocess が
+  起動したかどうかを直接確認する。
