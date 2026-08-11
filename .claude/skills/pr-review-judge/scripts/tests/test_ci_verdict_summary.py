@@ -28,6 +28,7 @@ from ci_verdict_summary import (
     EXIT_PENDING,
     EXIT_STALE,
     HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES,
+    STATUS_CHECK_ROLLUP_QUERY,
     classify_check,
     classify_gh_error,
     compute_overall_status,
@@ -51,7 +52,7 @@ EXPECTED_SHA = HEAD_SHA
 STATUS_CHECK_ROLLUP_GOLDEN = {
     "data": {"repository": {"pullRequest": {"commits": {"nodes": [{"commit": {
         "oid": HEAD_SHA,
-        "statusCheckRollup": {"contexts": {"pageInfo": {"hasNextPage": False}, "nodes": [
+        "statusCheckRollup": {"id": "golden-rollup", "contexts": {"pageInfo": {"hasNextPage": False}, "nodes": [
             {
                 "__typename": "CheckRun", "databaseId": 86953783527,
                 "name": "PR Body Japanese Check", "status": "COMPLETED",
@@ -126,6 +127,7 @@ def status_check_rollup_response(
                             "commit": {
                                 "oid": head_sha,
                                 "statusCheckRollup": {
+                                    "id": "fixture-rollup",
                                     "contexts": {"pageInfo": {"hasNextPage": False}, "nodes": nodes},
                                 },
                             },
@@ -942,6 +944,364 @@ class TestGhError:
         for err in out["errors"]:
             assert "kind" in err
             assert "detail" in err
+
+
+# ---------------------------------------------------------------------------
+# Issue #2088: statusCheckRollup cursor pagination
+# ---------------------------------------------------------------------------
+
+class TestStatusCheckRollupPagination:
+    """GIVEN paginated GraphQL contexts WHEN fetched THEN all pages stay fail-closed."""
+
+    @staticmethod
+    def _page(
+        nodes: list[dict],
+        *,
+        has_next_page: bool,
+        end_cursor: Optional[str],
+        commit_oid: str = HEAD_SHA,
+        rollup_id: str = "rollup-1",
+    ) -> dict:
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "commits": {
+                            "nodes": [{
+                                "commit": {
+                                "oid": commit_oid,
+                                "statusCheckRollup": {
+                                    "id": rollup_id,
+                                        "contexts": {
+                                            "pageInfo": {
+                                                "hasNextPage": has_next_page,
+                                                "endCursor": end_cursor,
+                                            },
+                                            "nodes": nodes,
+                                        },
+                                    },
+                                },
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+    @staticmethod
+    def _check_run(
+        run_id: int,
+        name: str,
+        *,
+        status: str = "COMPLETED",
+        conclusion: Optional[str] = "SUCCESS",
+        suite_commit_oid: str = HEAD_SHA,
+    ) -> dict:
+        return {
+            "__typename": "CheckRun",
+            "databaseId": run_id,
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+            "startedAt": "2026-08-11T00:00:00Z",
+            "completedAt": "2026-08-11T00:00:01Z",
+            "detailsUrl": f"https://github.com/owner/repo/actions/runs/{run_id}",
+            "checkSuite": {
+                "commit": {"oid": suite_commit_oid},
+                "workflowRun": {"event": "pull_request", "workflow": {"name": "CI"}},
+            },
+        }
+
+    def test_query_declares_cursor_and_page_info_end_cursor(self):
+        """GIVEN the collector query WHEN inspected THEN pagination fields are requested."""
+        assert "$cursor: String" in STATUS_CHECK_ROLLUP_QUERY
+        assert "after: $cursor" in STATUS_CHECK_ROLLUP_QUERY
+        assert "pageInfo { hasNextPage endCursor }" in STATUS_CHECK_ROLLUP_QUERY
+        assert "statusCheckRollup {\n              id" in STATUS_CHECK_ROLLUP_QUERY
+
+    def test_fetch_checks_aggregates_two_pages_and_preserves_provenance(self):
+        """GIVEN two context pages WHEN fetched THEN both CheckRuns use existing normalization."""
+        pages = [
+            self._page([self._check_run(101, "lint")], has_next_page=True, end_cursor="cursor-1"),
+            self._page([self._check_run(102, "test")], has_next_page=False, end_cursor=None),
+        ]
+        graphql_calls: list[list[str]] = []
+
+        def mock_fn(args: list[str]):
+            if "api" in args and "graphql" in args:
+                graphql_calls.append(args)
+                payload = pages[len(graphql_calls) - 1]
+                return True, payload, json.dumps(payload)
+            return False, None, "unexpected gh call"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            checks, error = fetch_checks(2088, "owner/repo")
+
+        assert error is None
+        assert checks is not None
+        assert [check["runId"] for check in checks] == [101, 102]
+        assert [check["headSha"] for check in checks] == [HEAD_SHA, HEAD_SHA]
+        assert [check["workflow"] for check in checks] == ["CI", "CI"]
+        assert [check["event"] for check in checks] == ["pull_request", "pull_request"]
+        assert not any(arg.startswith("cursor=") for arg in graphql_calls[0])
+        assert "-f" in graphql_calls[1]
+        assert "cursor=cursor-1" in graphql_calls[1]
+
+    @pytest.mark.parametrize(
+        ("second_commit_oid", "second_rollup_id"),
+        [
+            ("different-commit", "rollup-1"),
+            (HEAD_SHA, "different-rollup"),
+        ],
+    )
+    def test_cross_page_root_drift_is_gh_error(
+        self,
+        second_commit_oid: str,
+        second_rollup_id: str,
+    ):
+        """GIVEN page roots drift WHEN fetched THEN partial checks are rejected."""
+        pages = [
+            self._page([], has_next_page=True, end_cursor="cursor-1"),
+            self._page(
+                [],
+                has_next_page=False,
+                end_cursor=None,
+                commit_oid=second_commit_oid,
+                rollup_id=second_rollup_id,
+            ),
+        ]
+        graphql_calls = 0
+
+        def mock_fn(args: list[str]):
+            nonlocal graphql_calls
+            if "api" in args and "graphql" in args:
+                payload = pages[graphql_calls]
+                graphql_calls += 1
+                return True, payload, json.dumps(payload)
+            return False, None, "unexpected gh call"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            checks, error = fetch_checks(2088, "owner/repo")
+
+        assert checks is None
+        assert error is not None
+        assert error["kind"] == "json_parse_error"
+
+    def test_repeated_cursor_is_gh_error(self):
+        """GIVEN a repeated opaque cursor WHEN fetched THEN traversal stops fail-closed."""
+        pages = [
+            self._page([], has_next_page=True, end_cursor="cursor-1"),
+            self._page([], has_next_page=True, end_cursor="cursor-1"),
+        ]
+        graphql_calls = 0
+
+        def mock_fn(args: list[str]):
+            nonlocal graphql_calls
+            if "api" in args and "graphql" in args:
+                payload = pages[graphql_calls]
+                graphql_calls += 1
+                return True, payload, json.dumps(payload)
+            return False, None, "unexpected gh call"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn):
+            checks, error = fetch_checks(2088, "owner/repo")
+
+        assert checks is None
+        assert error is not None
+        assert error["kind"] == "json_parse_error"
+
+    @pytest.mark.parametrize(
+        ("status", "conclusion", "suite_commit_oid", "expected_exit", "expected_status"),
+        [
+            ("COMPLETED", "FAILURE", HEAD_SHA, EXIT_FAILED, "failed"),
+            ("IN_PROGRESS", "SUCCESS", HEAD_SHA, EXIT_PENDING, "pending_or_queued"),
+            ("COMPLETED", "SUCCESS", STALE_SHA, EXIT_STALE, "stale_head_sha"),
+        ],
+    )
+    def test_101st_check_cannot_be_omitted_or_promoted_to_all_pass(
+        self,
+        status: str,
+        conclusion: str,
+        suite_commit_oid: str,
+        expected_exit: int,
+        expected_status: str,
+    ):
+        """GIVEN 100 passing checks and a bad 101st WHEN summarized THEN it is not all-pass."""
+        first_page = self._page(
+            [self._check_run(index, f"check-{index}") for index in range(1, 101)],
+            has_next_page=True,
+            end_cursor="opaque-cursor-100",
+        )
+        second_page = self._page(
+            [
+                self._check_run(
+                    101,
+                    "check-101",
+                    status=status,
+                    conclusion=conclusion,
+                    suite_commit_oid=suite_commit_oid,
+                ),
+            ],
+            has_next_page=False,
+            end_cursor=None,
+        )
+        graphql_calls = 0
+
+        def mock_fn(args: list[str]):
+            nonlocal graphql_calls
+            if "pr" in args and "view" in args and "headRefOid" in args:
+                return True, {"headRefOid": HEAD_SHA}, "{}"
+            if "api" in args and "graphql" in args:
+                payload = [first_page, second_page][graphql_calls]
+                graphql_calls += 1
+                return True, payload, json.dumps(payload)
+            return False, None, "unexpected gh call"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn), patch(
+            "sys.argv",
+            ["ci_verdict_summary.py", "--pr", "2088", "--repo", "owner/repo", "--expected-head-sha", HEAD_SHA],
+        ):
+            import io
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                exit_code = main()
+
+        out = json.loads(buf.getvalue())
+        assert exit_code == expected_exit
+        assert out["status"] == expected_status
+        assert out["status"] != "all_pass"
+        assert len(out["checks"]) == 101
+
+    @pytest.mark.parametrize("end_cursor", [None, ""])
+    def test_missing_or_invalid_cursor_is_gh_error(self, end_cursor: Optional[str]):
+        """GIVEN a next page without a valid cursor WHEN summarized THEN exit 40."""
+        payload = self._page([], has_next_page=True, end_cursor=end_cursor)
+
+        def mock_fn(args: list[str]):
+            if "pr" in args and "view" in args and "headRefOid" in args:
+                return True, {"headRefOid": HEAD_SHA}, "{}"
+            if "api" in args and "graphql" in args:
+                return True, payload, json.dumps(payload)
+            return False, None, "unexpected gh call"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn), patch(
+            "sys.argv",
+            ["ci_verdict_summary.py", "--pr", "2088", "--repo", "owner/repo", "--expected-head-sha", HEAD_SHA],
+        ):
+            import io
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                exit_code = main()
+        assert exit_code == EXIT_GH_ERROR
+        assert json.loads(buf.getvalue())["status"] == "gh_error"
+
+    def test_second_page_graphql_error_is_gh_error(self):
+        """GIVEN page two API failure WHEN summarized THEN exit 40 without partial checks."""
+        first_page = self._page([], has_next_page=True, end_cursor="cursor-1")
+        graphql_calls = 0
+
+        def mock_fn(args: list[str]):
+            nonlocal graphql_calls
+            if "pr" in args and "view" in args and "headRefOid" in args:
+                return True, {"headRefOid": HEAD_SHA}, "{}"
+            if "api" in args and "graphql" in args:
+                graphql_calls += 1
+                if graphql_calls == 1:
+                    return True, first_page, json.dumps(first_page)
+                return False, None, "403 permission denied"
+            return False, None, "unexpected gh call"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn), patch(
+            "sys.argv",
+            ["ci_verdict_summary.py", "--pr", "2088", "--repo", "owner/repo", "--expected-head-sha", HEAD_SHA],
+        ):
+            import io
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                exit_code = main()
+        out = json.loads(buf.getvalue())
+        assert exit_code == EXIT_GH_ERROR
+        assert out["status"] == "gh_error"
+        assert out["checks"] == []
+        assert out["errors"][0]["kind"] == "permission_denied"
+
+    def test_response_shape_error_is_gh_error(self):
+        """GIVEN malformed page info WHEN summarized THEN exit 40 remains fail-closed."""
+        payload = self._page([], has_next_page=False, end_cursor=None)
+        commit = payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+        contexts = commit["statusCheckRollup"]["contexts"]
+        contexts["pageInfo"] = {"hasNextPage": "false"}
+
+        def mock_fn(args: list[str]):
+            if "pr" in args and "view" in args and "headRefOid" in args:
+                return True, {"headRefOid": HEAD_SHA}, "{}"
+            if "api" in args and "graphql" in args:
+                return True, payload, json.dumps(payload)
+            return False, None, "unexpected gh call"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn), patch(
+            "sys.argv",
+            ["ci_verdict_summary.py", "--pr", "2088", "--repo", "owner/repo", "--expected-head-sha", HEAD_SHA],
+        ):
+            import io
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                exit_code = main()
+        assert exit_code == EXIT_GH_ERROR
+        assert json.loads(buf.getvalue())["status"] == "gh_error"
+
+    @pytest.mark.parametrize(
+        ("nested_field", "invalid_value"),
+        [
+            ("checkSuite", ["not-an-object"]),
+            ("workflowRun", "not-an-object"),
+            ("workflow", ["not-an-object"]),
+            ("commit", "not-an-object"),
+        ],
+    )
+    def test_non_mapping_check_run_provenance_is_fail_closed(
+        self,
+        nested_field: str,
+        invalid_value: object,
+    ):
+        """GIVEN malformed CheckRun provenance WHEN summarized THEN exit 40."""
+        check_run = self._check_run(101, "lint")
+        suite = check_run["checkSuite"]
+        if nested_field == "checkSuite":
+            check_run["checkSuite"] = invalid_value
+        elif nested_field == "workflowRun":
+            suite["workflowRun"] = invalid_value
+        elif nested_field == "workflow":
+            suite["workflowRun"]["workflow"] = invalid_value
+        else:
+            suite["commit"] = invalid_value
+        payload = self._page([check_run], has_next_page=False, end_cursor=None)
+
+        def mock_fn(args: list[str]):
+            if "pr" in args and "view" in args and "headRefOid" in args:
+                return True, {"headRefOid": HEAD_SHA}, "{}"
+            if "api" in args and "graphql" in args:
+                return True, payload, json.dumps(payload)
+            return False, None, "unexpected gh call"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn), patch(
+            "sys.argv",
+            ["ci_verdict_summary.py", "--pr", "2088", "--repo", "owner/repo", "--expected-head-sha", HEAD_SHA],
+        ):
+            import io
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                exit_code = main()
+        out = json.loads(buf.getvalue())
+        assert exit_code == EXIT_GH_ERROR
+        assert out["status"] == "gh_error"
+        assert out["checks"] == []
+        assert out["errors"][0]["kind"] == "json_parse_error"
 
 
 # ---------------------------------------------------------------------------
