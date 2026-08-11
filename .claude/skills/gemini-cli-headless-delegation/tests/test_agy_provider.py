@@ -1046,27 +1046,37 @@ def test_agy_empty_stdout_warning_matches_failure_class_when_ci_unset(monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# Issue #1749 (superseded by Issue #1777): grounded_research forces
-# --model claude-sonnet-4-6 so agy -p actually calls
-# search_web/read_url_content instead of hallucinating a "searched" answer
-# with the default model.
+# Issue #1749 (superseded by Issue #1777, further narrowed by Issue #2069):
+# grounded_research forces --model claude-sonnet-4-6 so agy -p actually
+# calls search_web/read_url_content instead of hallucinating a "searched"
+# answer with the default model.
 #
 # Issue #1777 ran a controlled grounding matrix experiment and found the
 # model-selection causal claim was NOT supported (prompt construction was
 # the dominant factor, not model selection); the exact-model-hardcode
 # AGY_GROUNDED_RESEARCH_MODEL constant was replaced by capability-driven
 # routing (resolve_agy_grounded_research_model(), config/model_routing.yaml
-# roles.grounded_research.model_chain). The tests below (AC7) are replaced
-# to verify the new capability contract instead of the exact
-# `claude-sonnet-4-6` string.
+# roles.grounded_research.model_chain).
+#
+# Issue #2069: the #1777 experiment's own finding (account_default
+# outperformed the claude-sonnet-4-6 candidate) was still not reflected in
+# the config -- roles.grounded_research.model_chain stayed hardcoded to
+# ["claude-sonnet-4-6"], unilaterally consuming the Antigravity CLI shared
+# "Claude and GPT Models" quota on every grounded_research call. The chain
+# is now the empty default (`[]`, grounded_research_empty_chain_exception in
+# load_model_routing()), so the default route omits --model entirely and
+# defers model selection to AGY's own account_default. The test below is
+# updated accordingly; see also test_grounded_research_default_route_no_model_flag.
 # ---------------------------------------------------------------------------
 
 
 def test_issue_1749_grounded_research_uses_capability_driven_model_candidate() -> None:
-    """AC7 (replaces the old exact-string test): grounded_research's agy -p
-    invocation includes --model with a candidate resolved from
-    config/model_routing.yaml roles.grounded_research.model_chain, not a
-    hardcoded constant."""
+    """AC7 (replaces the old exact-string test; updated by Issue #2069):
+    grounded_research's agy -p invocation resolves --model from
+    config/model_routing.yaml roles.grounded_research.model_chain via
+    capability-driven routing, not a hardcoded constant. With the current
+    default (empty) chain, resolution correctly omits --model altogether
+    (AGY account_default) rather than forcing a candidate."""
     captured_cmd: dict[str, Any] = {"value": None}
 
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
@@ -1082,12 +1092,35 @@ def test_issue_1749_grounded_research_uses_capability_driven_model_candidate() -
 
     cmd = captured_cmd["value"]
     assert cmd is not None
-    assert "--model" in cmd
-    model_index = cmd.index("--model")
-    expected_chain, error = rgh.resolve_model_chain({"role": "grounded_research"})
-    assert error is None
-    assert cmd[model_index + 1] == expected_chain[0]
+    expected_chain, _error = rgh.resolve_model_chain({"role": "grounded_research"})
+    assert expected_chain == []
+    assert "--model" not in cmd
     assert not hasattr(rgh, "AGY_GROUNDED_RESEARCH_MODEL")
+
+
+def test_grounded_research_default_route_no_model_flag() -> None:
+    """Issue #2069 AC8: on the default route (config/model_routing.yaml's
+    roles.grounded_research.model_chain == []), resolve_agy_grounded_research_model()
+    returns None, and the real agy invocation argv built by _run_agy() does
+    not include a --model flag at all -- AGY account_default is used."""
+    assert rgh.resolve_agy_grounded_research_model() is None
+
+    captured_cmd: dict[str, Any] = {"value": None}
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured_cmd["value"] = list(cmd)
+        return _make_completed(0, stdout="ok")
+
+    token = rgh._AGY_TOOL_PROFILE_CTX.set("grounded_research")
+    try:
+        with patch("subprocess.run", side_effect=mock_run):
+            rgh._run_agy("test prompt", 30)
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(token)
+
+    cmd = captured_cmd["value"]
+    assert cmd is not None
+    assert "--model" not in cmd
 
 
 def test_issue_1749_non_grounded_research_profile_omits_model_flag() -> None:
@@ -1111,11 +1144,13 @@ def test_issue_1749_non_grounded_research_profile_omits_model_flag() -> None:
 
 
 def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation() -> None:
-    """AC3/AC4 (pre-#1777): run_delegation(tool_profile=grounded_research) drives
-    _run_agy with the resolved --model flag actually present in the real
-    subprocess.run argv (not just unit-level on _run_agy), proving the flag
-    reaches the real invocation path used in production, with a grounded
-    tool_calls trace still recognized correctly."""
+    """AC3/AC4 (pre-#1777; updated by Issue #2069): run_delegation(tool_profile=
+    grounded_research) drives _run_agy() through the real subprocess.run() argv
+    path with a grounded tool_calls trace correctly recognized. With the
+    current default (empty) roles.grounded_research.model_chain, the real
+    invocation correctly omits --model (AGY account_default) rather than
+    forcing a candidate -- see test_grounded_research_default_route_no_model_flag
+    for the focused unit-level assertion."""
     captured_cmd: dict[str, Any] = {"value": None}
     grounded_output = (
         "Response from AGY.\n"
@@ -1137,11 +1172,9 @@ def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation
     assert result["ok"] is True
     cmd = captured_cmd["value"]
     assert cmd is not None
-    assert "--model" in cmd
-    model_index = cmd.index("--model")
-    expected_chain, error = rgh.resolve_model_chain({"role": "grounded_research"})
-    assert error is None
-    assert cmd[model_index + 1] == expected_chain[0]
+    expected_chain, _error = rgh.resolve_model_chain({"role": "grounded_research"})
+    assert expected_chain == []
+    assert "--model" not in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -1152,13 +1185,17 @@ def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation
 
 def test_issue_1777_ac1_model_routing_yaml_defines_grounded_research_role() -> None:
     """AC1: grounded_research model candidates are loaded from
-    model_routing.yaml's roles section (not a Python constant)."""
+    model_routing.yaml's roles section (not a Python constant). Updated by
+    Issue #2069: the default chain is now the empty list
+    (grounded_research_empty_chain_exception), so resolve_agy_grounded_research_model()
+    correctly resolves to None (AGY account_default) rather than chain[0]."""
     routing = rgh.load_model_routing()
     assert "grounded_research" in routing["roles"]
     chain = routing["roles"]["grounded_research"]["model_chain"]
-    assert isinstance(chain, list) and len(chain) >= 1
+    assert isinstance(chain, list)
     assert all(isinstance(entry, str) and entry.strip() for entry in chain)
-    assert rgh.resolve_agy_grounded_research_model() == chain[0]
+    assert chain == []
+    assert rgh.resolve_agy_grounded_research_model() is None
 
 
 def test_issue_1777_ac2_grounded_research_prompt_contains_explicit_search_instruction() -> None:
