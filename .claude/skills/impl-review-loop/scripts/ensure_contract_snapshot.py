@@ -394,8 +394,14 @@ def has_vc_preflight_classifications(go_result: object) -> bool:
     if not isinstance(checks, dict):
         return False
     vc_preflight = checks.get("vc_preflight")
-    return isinstance(vc_preflight, dict) and isinstance(
-        vc_preflight.get("classifications"), list
+    if not isinstance(vc_preflight, dict):
+        return False
+    classifications = vc_preflight.get("classifications")
+    if isinstance(classifications, list):
+        return True
+    return (
+        isinstance(classifications, str)
+        and vc_preflight.get("decision") == "pass"
     )
 
 

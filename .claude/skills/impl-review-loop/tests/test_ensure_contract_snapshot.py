@@ -746,6 +746,45 @@ class TestFreshGoSnapshots:
         assert not is_go_current(go_result, _SAMPLE_BODY_SHA256)
 
 
+class TestVcPreflightClassificationsCompleteness:
+    """Consumer acceptance of parsed baseline VC classifications is fail-closed."""
+
+    @staticmethod
+    def _go_result(vc_preflight: object) -> dict:
+        inner = _fresh_inner(_SAMPLE_BODY_SHA256)
+        inner["checks"]["vc_preflight"] = vc_preflight
+        return {"status": "go", "inner": inner}
+
+    def test_given_raw_classifications_scalar_and_pass_decision_when_current_then_accepts(self):
+        raw_classifications = json.dumps(
+            {"ac": "AC10", "stdout_head": ["x" * 16_190]}
+        )
+        go_result = self._go_result(
+            {
+                "decision": "pass",
+                "classifications": raw_classifications,
+            }
+        )
+
+        assert is_go_current(go_result, _SAMPLE_BODY_SHA256)
+
+    @pytest.mark.parametrize(
+        ("vc_preflight", "case"),
+        [
+            ({"classifications": "raw"}, "decision_missing"),
+            ({"decision": "fail", "classifications": "raw"}, "decision_non_pass"),
+            ({"decision": "pass", "classifications": {"ac": "AC1"}}, "mapping"),
+            ({"decision": "pass", "classifications": 1}, "integer"),
+            ({"decision": "pass", "classifications": None}, "null"),
+        ],
+    )
+    def test_given_non_list_classifications_without_explicit_pass_when_current_then_rejects(
+        self, vc_preflight: object, case: str
+    ):
+        assert case
+        assert not is_go_current(self._go_result(vc_preflight), _SAMPLE_BODY_SHA256)
+
+
 class TestContractReviewComment:
     """Materialized snapshots retain VC baseline classifications for consumers."""
 

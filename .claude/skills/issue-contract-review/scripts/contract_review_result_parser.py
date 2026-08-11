@@ -195,13 +195,25 @@ def _decode_producer_json_scalars(block: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, str) and value.startswith(("{", "[")):
             mapping[key] = _parse_bounded_strict_json_collection(value)
 
+    decode(inner, "expected_contract_fingerprint")
     checks = inner.get("checks")
     if not isinstance(checks, dict):
         return block
-    decode(checks, "declared_path_overlap")
+    try:
+        decode(checks, "declared_path_overlap")
+    except SimpleYamlParseError:
+        # Overlap is advisory only. Keep its raw scalar so malformed or
+        # oversized producer telemetry cannot invalidate source-bound fields.
+        pass
     vc_preflight = checks.get("vc_preflight")
     if isinstance(vc_preflight, dict):
-        decode(vc_preflight, "classifications")
+        try:
+            decode(vc_preflight, "classifications")
+        except SimpleYamlParseError:
+            # The scalar decision remains independently consumable. Keep only
+            # this oversized or malformed diagnostic payload raw instead of
+            # discarding its source-bound contract result.
+            pass
     return block
 
 
@@ -290,7 +302,16 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
                 continue
             sub_key = match.group(1).strip()
             sub_value = match.group(2).strip()
-            vc_preflight[sub_key] = _parse_fallback_scalar(sub_value) if sub_value else None
+            try:
+                vc_preflight[sub_key] = (
+                    _parse_fallback_scalar(sub_value) if sub_value else None
+                )
+            except SimpleYamlParseError:
+                if sub_key != "classifications":
+                    raise
+                # Keep this producer diagnostic scalar raw; all other nested
+                # values retain the bounded strict-JSON requirement.
+                vc_preflight[sub_key] = sub_value
 
     return _decode_producer_json_scalars(result)
 

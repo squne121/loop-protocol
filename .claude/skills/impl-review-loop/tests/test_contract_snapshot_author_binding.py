@@ -187,7 +187,7 @@ def _reject_yaml_import(name, *args, **kwargs):
 
 _ORIGINAL_IMPORT = builtins.__import__
 _FINGERPRINT_FLOW_LINE_RE = re.compile(
-    r"(?m)^(  expected_contract_fingerprint: )(\{.*\})$"
+    r"(?m)^(  expected_contract_fingerprint: ).*$"
 )
 
 
@@ -335,6 +335,81 @@ def test_authority_postcondition_accepts_json_flow_fingerprint_via_fallback_pars
     assert reason is None
 
 
+def test_given_oversized_advisory_overlap_when_parsing_then_fingerprint_ready_go_survives():
+    """Oversized advisory overlap は source-bound fingerprint の候補性を壊さない。"""
+    comment = _trusted_go_comment()
+    oversized_overlap = json.dumps(
+        {
+            "schema": "declared_path_overlap/v1",
+            "advisory": True,
+            "payload": "x" * _parser_mod._MAX_JSON_FLOW_COLLECTION_CHARS,
+        }
+    )
+    comment["body"] = comment["body"].replace(
+        "```\n",
+        "  checks:\n"
+        f"    declared_path_overlap: '{oversized_overlap}'\n"
+        "```\n",
+    )
+
+    parsed = _parser_mod.parse_contract_review_results(
+        [comment], expected_issue_url=_ISSUE_URL
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0]["inner"]["checks"]["declared_path_overlap"] == oversized_overlap
+    assert parsed[0]["is_fingerprint_ready"] is True
+    assert _parser_mod.find_latest_authoritative_go(parsed) is parsed[0]
+
+
+def test_given_oversized_vc_preflight_classifications_when_parsing_then_decision_survives():
+    """Oversized classification diagnostics do not invalidate a valid snapshot."""
+    comment = _trusted_go_comment()
+    oversized_classifications = json.dumps(
+        [
+            {
+                "ac": "AC10",
+                "decision": "go",
+                "payload": "x" * _parser_mod._MAX_JSON_FLOW_COLLECTION_CHARS,
+            }
+        ]
+    )
+    comment["body"] = comment["body"].replace(
+        "```\n",
+        "  checks:\n"
+        "    vc_preflight:\n"
+        "      decision: pass\n"
+        f"      classifications: '{oversized_classifications}'\n"
+        "```\n",
+    )
+
+    def assert_snapshot_is_usable(parsed):
+        assert len(parsed) == 1
+        vc_preflight = parsed[0]["inner"]["checks"]["vc_preflight"]
+        assert vc_preflight["decision"] == "pass"
+        assert vc_preflight["classifications"] == oversized_classifications
+        assert parsed[0]["is_fingerprint_ready"] is True
+        assert _parser_mod.find_latest_authoritative_go(parsed) is parsed[0]
+
+    assert_snapshot_is_usable(
+        _parser_mod.parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL)
+    )
+
+    fallback_comment, _ = _fallback_authority_fixture()
+    fallback_comment["body"], count = re.subn(
+        r"(?m)^      classifications: .*$",
+        f"      classifications: '{oversized_classifications}'",
+        fallback_comment["body"],
+    )
+    assert count == 1
+    with patch("builtins.__import__", side_effect=_reject_yaml_import):
+        assert_snapshot_is_usable(
+            _parser_mod.parse_contract_review_results(
+                [fallback_comment], expected_issue_url=_ISSUE_URL
+            )
+        )
+
+
 def test_authority_postcondition_rejects_malformed_actual_comment_fingerprints():
     """Actual emitted comment bodies with wrong fingerprint shape fail closed."""
     comment, fingerprint = _fallback_authority_fixture()
@@ -378,10 +453,18 @@ def test_authority_postcondition_rejects_malformed_actual_comment_fingerprints()
         {**fingerprint, "unexpected": "value"},
         json.dumps(fingerprint),
     ]
-    for malformed_fingerprint in malformed_fingerprints:
+    malformed_reasons = [
+        "authority_comment_fingerprint_mismatch",
+        "authority_comment_fingerprint_mismatch",
+        "authority_comment_fingerprint_mismatch",
+        "authority_comment_not_current_go",
+    ]
+    for malformed_fingerprint, expected_reason in zip(
+        malformed_fingerprints, malformed_reasons
+    ):
         assert verify(_with_comment_fingerprint(comment, malformed_fingerprint)) == (
             False,
-            "authority_comment_fingerprint_mismatch",
+            expected_reason,
         )
 
 
