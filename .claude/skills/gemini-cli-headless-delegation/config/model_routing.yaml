@@ -60,9 +60,14 @@ roles:
   # Issue #2069: この empty chain (`[]`) は、上記 #1777 の実験知見
   # （`account_default` が `claude-sonnet-4-6` を上回る成功率だった）と
   # 整合しない旧来の `claude-sonnet-4-6` 固定設定を廃止するための意図的な
-  # 変更である。固定モデルを列挙すると wrapper が Antigravity CLI の
-  # 「Claude and GPT Models」共有クォータ枠を毎回消費してしまうため、
-  # ここでは Claude 強制を外し、AGY 自身の account_default に選択権を返す。
+  # 変更である。固定モデルを列挙すると wrapper 側で常に Antigravity CLI の
+  # 「Claude and GPT Models」共有クォータ枠を指定することになっていたため、
+  # ここでは Claude 強制を外し、AGY 自身の account_default（＝ AGY が
+  # persist/default で保持している直近の `/model` 選択）に選択権を返す。
+  # ただし実際にどのモデル・クォータ枠が消費されるかは AGY 側の
+  # persisted/default `/model` 選択に依存し、wrapper 側からは制御・保証
+  # できない（Gemini pool への分散を確約するものではない。Issue #2069
+  # Out of Scope 参照）。
   # `load_model_routing()` はこの role に限り empty chain を合法として
   # 許可する（識別子: `grounded_research_empty_chain_exception`）。他の
   # role は引き続き non-empty list を要求する。

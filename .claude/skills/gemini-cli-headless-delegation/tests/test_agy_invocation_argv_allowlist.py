@@ -344,7 +344,12 @@ def test_run_agy_grounded_research_passes_approved_model_chain() -> None:
     finally:
         rgh._AGY_TOOL_PROFILE_CTX.reset(token)
 
-    expected_chain, error = rgh.resolve_model_chain({"role": "grounded_research"})
+    # Issue #2097 review Finding 1 [P0]: the grounded_research empty-chain
+    # exception in resolve_model_chain() is scoped to provider == "agy" --
+    # this AGY-profile caller must pass "provider": "agy" to get the
+    # exception (empty chain, no error), matching how
+    # resolve_agy_grounded_research_model() itself calls resolve_model_chain().
+    expected_chain, error = rgh.resolve_model_chain({"role": "grounded_research", "provider": "agy"})
     assert error is None
     assert captured["approved_models"] == frozenset(expected_chain)
 
@@ -400,6 +405,60 @@ def test_run_agy_raw_command_reflects_selected_model_end_to_end() -> None:
     # reconstruction that adds one back in.
     assert result["raw_command"] == ["agy", "-p", "<prompt>"]
     assert "--model" not in result["raw_command"]
+
+
+def test_run_agy_raw_command_reflects_selected_model_end_to_end_non_empty_chain() -> None:
+    """Issue #2097 review Finding 4 [P1]: companion positive-path E2E test
+    for the sibling above. Issue #2069 made `roles.grounded_research`'s
+    default `model_chain` empty (account_default), which is what the
+    sibling test now covers -- but that emptied out the original #1807/#1816
+    defense-in-depth coverage for the *non-empty* chain case: a `--model`
+    flag actually reaching the real execution argv, and the sanitized
+    `raw_command` published for audit reflecting the SAME selected model
+    (Blocker 1). This test restores that coverage by injecting a non-empty
+    `grounded_research` model_chain via a `load_model_routing()` monkeypatch
+    (the module-level indirection `resolve_model_chain()` calls when no
+    explicit `routing` dict is supplied), independent of the #2069 default.
+    """
+    injected_model = "injected-test-model-v1"
+    fake_routing = {
+        "default_chain": rgh.DEFAULT_MODEL_ROUTING["default_chain"],
+        "roles": {
+            **rgh.DEFAULT_MODEL_ROUTING["roles"],
+            "grounded_research": {"model_chain": [injected_model]},
+        },
+    }
+
+    captured_cmd: dict[str, Any] = {"value": None}
+    grounded_output = (
+        "Response from AGY.\n"
+        '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
+        '"tool_calls":[{"name":"web_search"}]}'
+    )
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured_cmd["value"] = list(cmd)
+        _write_valid_hook_event_for_subprocess_env(kwargs)
+        return _make_completed(0, stdout=grounded_output)
+
+    with patch.object(rgh, "load_model_routing", return_value=fake_routing):
+        with patch("subprocess.run", side_effect=mock_run):
+            result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
+
+    assert result["ok"] is True
+    exec_cmd = captured_cmd["value"]
+    assert exec_cmd is not None
+    # The injected non-empty model_chain must actually reach the real
+    # subprocess argv as --model <injected_model>.
+    assert "--model" in exec_cmd
+    assert exec_cmd[exec_cmd.index("--model") + 1] == injected_model
+
+    # The published raw_command must reflect the SAME selected model that
+    # was actually executed -- not a placeholder, not a different model,
+    # and not omitted (Blocker 1 defense-in-depth intent, #1807/#1816).
+    assert "--model" in result["raw_command"]
+    assert result["raw_command"][result["raw_command"].index("--model") + 1] == injected_model
+    assert exec_cmd[exec_cmd.index("--model") + 1] == result["raw_command"][result["raw_command"].index("--model") + 1]
 
 
 def test_poisoned_builder_run_through_run_delegation_blocks_subprocess_and_classifies() -> None:

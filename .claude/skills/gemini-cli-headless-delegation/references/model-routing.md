@@ -50,8 +50,12 @@ roles:
   `grounded_research_empty_chain_exception`、Issue #2069）。empty chain の
   場合、`resolve_agy_grounded_research_model()` は候補を持たず `None` を
   返し、AGY 呼び出しの実行 argv に `--model` フラグは付与されない
-  （account_default に選択権を委ねる）。他の role は引き続き非空リストを
-  要求する。
+  （wrapper 側の固定モデル指定を外し、AGY 自身の persisted/default
+  `/model` 選択に選択権を委ねる）。他の role は引き続き非空リストを
+  要求する。**注意**: これは wrapper 側の固定 model pin を除去するだけの
+  変更であり、実際にどのモデル・どのクォータ枠が消費されるかは AGY の
+  persisted/default `/model` 選択に依存する。Gemini pool 側への分散を
+  確約・保証するものではない（Issue #2069 Out of Scope）。
 - 不正な YAML は `yaml.YAMLError` → `ValueError` に変換
 - YAML ファイルのトップレベルが mapping でない場合は `ValueError`
 

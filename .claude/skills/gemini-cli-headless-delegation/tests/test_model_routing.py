@@ -159,6 +159,40 @@ roles:
         routing = m.load_model_routing(config_path=config_file)
         assert routing["default_chain"] == m.DEFAULT_MODEL_ROUTING["default_chain"]
 
+    def test_pyyaml_unavailable_grounded_research_stays_empty_chain(self, tmp_path):
+        """Issue #2069 review Finding 3 [P1]: PyYAML-unavailable negative
+        control. Simulates `_YAML_AVAILABLE = False` (matching the module's
+        own `try: import yaml ... except ImportError: _YAML_AVAILABLE =
+        False` guard at import time) and asserts that
+        DEFAULT_MODEL_ROUTING["grounded_research"]["model_chain"] -- the
+        pure-Python fallback used when a YAML override config file exists
+        but cannot be parsed -- is still `[]`. Claude must NOT reappear via
+        any YAML-unavailable fallback path; the empty-chain
+        `grounded_research_empty_chain_exception` behavior (AGY
+        account_default delegation) must hold even without PyYAML."""
+        m = load_module()
+        # Sanity check the fallback constant itself, independent of the
+        # _YAML_AVAILABLE patch below -- this is the value load_model_routing()
+        # returns unchanged when PyYAML is unavailable.
+        assert m.DEFAULT_MODEL_ROUTING["roles"]["grounded_research"]["model_chain"] == []
+
+        config_file = tmp_path / "model_routing.yaml"
+        # A YAML override file that -- if it *were* parsed -- would reinstate
+        # a non-empty grounded_research model_chain (i.e. Claude
+        # "reappearing"). It must be ignored entirely when PyYAML is
+        # unavailable.
+        config_file.write_text(
+            "roles:\n  grounded_research:\n    model_chain:\n      - claude-sonnet-4-6\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(m, "_YAML_AVAILABLE", False):
+            with pytest.warns(RuntimeWarning, match="PyYAML is not installed"):
+                routing = m.load_model_routing(config_path=config_file)
+
+        assert routing["roles"]["grounded_research"]["model_chain"] == []
+        assert m.resolve_agy_grounded_research_model(routing) is None
+
 
 # ---------------------------------------------------------------------------
 # Issue #2069 AC6/AC7: grounded_research_empty_chain_exception -- module-level
