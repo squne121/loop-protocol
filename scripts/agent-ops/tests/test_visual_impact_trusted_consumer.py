@@ -461,3 +461,29 @@ def test_job_permissions_are_minimal(workflow_doc: dict):
         for scope, level in permissions.items():
             if scope != "checks":
                 assert level == "read", f"unexpected write permission granted: {scope}={level}"
+
+
+def test_trusted_fetch_uses_checkout_managed_credentials(workflow_doc: dict):
+    """AC1/AC5: use checkout's supported authenticated Git path, never echo a token."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    checkout = next(step for step in steps if step.get("uses", "").startswith("actions/checkout"))
+    trusted = next(step for step in steps if step.get("id") == "trusted")
+
+    assert checkout.get("with", {}).get("persist-credentials") is True
+    assert trusted.get("continue-on-error") is True
+    assert "git fetch --no-tags --depth=1 origin" in trusted["run"]
+    assert "http.extraheader" not in trusted["run"]
+    assert "GH_TOKEN" not in trusted["run"]
+
+
+def test_checkrun_distinguishes_trusted_input_failure_from_artifact_rejection(workflow_doc: dict):
+    """AC4: a skipped verifier is never reported as an artifact semantic rejection."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    verify = next(step for step in steps if step.get("id") == "verify")
+    publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
+
+    assert "steps.trusted.outcome == 'success'" in verify["if"]
+    assert "TRUSTED_OUTCOME" in publish["env"]
+    assert "trusted_input_derivation_failed" in publish["run"]
+    assert "verifier_not_run" in publish["run"]
+    assert "producer_artifact_verification_rejected" in publish["run"]
