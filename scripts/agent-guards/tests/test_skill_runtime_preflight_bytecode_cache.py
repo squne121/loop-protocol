@@ -792,8 +792,8 @@ def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_pro
         # in `run_refinement_preflight.py`'s `main()` never reached the
         # `plan is None` failure-classification branch at all (i.e. never
         # reached `_invoke_planner()`, consistent with failure-space
-        # candidates (a)/(c)/(d)/(e)/(f) documented in
-        # docs/dev/ac10-pid-proof-flake-root-cause.md), whereas its presence
+        # candidates (a)/(c)/(d)/(e)/(f) discussed in Issue #2073's investigation
+        # history), whereas its presence
         # narrows the failure to inside `_invoke_planner()` itself.
         classification_path = artifact_dir / "planner_failure_classification_v1.json"
         if classification_path.exists():
