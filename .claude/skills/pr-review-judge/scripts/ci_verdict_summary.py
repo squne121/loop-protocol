@@ -274,9 +274,34 @@ def fetch_checks(pr_number: int, repo: str) -> tuple[Optional[list], Optional[di
             }
         if run.get("__typename") != "CheckRun":
             continue
-        suite = run.get("checkSuite") or {}
-        workflow_run = suite.get("workflowRun") or {}
-        workflow = workflow_run.get("workflow") or {}
+        suite_raw = run.get("checkSuite")
+        if suite_raw is not None and not isinstance(suite_raw, dict):
+            return None, {
+                "kind": "json_parse_error",
+                "detail": "statusCheckRollup shape: CheckRun checkSuite must be an object or null",
+            }
+        suite = suite_raw or {}
+        workflow_run_raw = suite.get("workflowRun")
+        if workflow_run_raw is not None and not isinstance(workflow_run_raw, dict):
+            return None, {
+                "kind": "json_parse_error",
+                "detail": "statusCheckRollup shape: CheckRun workflowRun must be an object or null",
+            }
+        workflow_run = workflow_run_raw or {}
+        workflow_raw = workflow_run.get("workflow")
+        if workflow_raw is not None and not isinstance(workflow_raw, dict):
+            return None, {
+                "kind": "json_parse_error",
+                "detail": "statusCheckRollup shape: CheckRun workflow must be an object or null",
+            }
+        workflow = workflow_raw or {}
+        commit_raw = suite.get("commit")
+        if commit_raw is not None and not isinstance(commit_raw, dict):
+            return None, {
+                "kind": "json_parse_error",
+                "detail": "statusCheckRollup shape: CheckRun commit must be an object or null",
+            }
+        suite_commit = commit_raw or {}
         checks.append({
             "name": run.get("name") or "unknown",
             "bucket": _conclusion_bucket(run.get("conclusion"), run.get("status")),
@@ -287,11 +312,11 @@ def fetch_checks(pr_number: int, repo: str) -> tuple[Optional[list], Optional[di
             "startedAt": run.get("startedAt"),
             "completedAt": run.get("completedAt"),
             "runId": run.get("databaseId"),
-            "headSha": (suite.get("commit") or {}).get("oid"),
+            "headSha": suite_commit.get("oid"),
             "run_detail_complete": all(
                 run.get(field) is not None
                 for field in ("databaseId", "status", "conclusion", "startedAt", "completedAt")
-            ) and bool((suite.get("commit") or {}).get("oid")),
+            ) and bool(suite_commit.get("oid")),
         })
     return checks, None
 

@@ -1110,6 +1110,55 @@ class TestStatusCheckRollupPagination:
         assert exit_code == EXIT_GH_ERROR
         assert json.loads(buf.getvalue())["status"] == "gh_error"
 
+    @pytest.mark.parametrize(
+        ("nested_field", "invalid_value"),
+        [
+            ("checkSuite", ["not-an-object"]),
+            ("workflowRun", "not-an-object"),
+            ("workflow", ["not-an-object"]),
+            ("commit", "not-an-object"),
+        ],
+    )
+    def test_non_mapping_check_run_provenance_is_fail_closed(
+        self,
+        nested_field: str,
+        invalid_value: object,
+    ):
+        """GIVEN malformed CheckRun provenance WHEN summarized THEN exit 40."""
+        check_run = self._check_run(101, "lint")
+        suite = check_run["checkSuite"]
+        if nested_field == "checkSuite":
+            check_run["checkSuite"] = invalid_value
+        elif nested_field == "workflowRun":
+            suite["workflowRun"] = invalid_value
+        elif nested_field == "workflow":
+            suite["workflowRun"]["workflow"] = invalid_value
+        else:
+            suite["commit"] = invalid_value
+        payload = self._page([check_run], has_next_page=False, end_cursor=None)
+
+        def mock_fn(args: list[str]):
+            if "pr" in args and "view" in args and "headRefOid" in args:
+                return True, {"headRefOid": HEAD_SHA}, "{}"
+            if "api" in args and "graphql" in args:
+                return True, payload, json.dumps(payload)
+            return False, None, "unexpected gh call"
+
+        with patch("ci_verdict_summary.run_gh", side_effect=mock_fn), patch(
+            "sys.argv",
+            ["ci_verdict_summary.py", "--pr", "2088", "--repo", "owner/repo", "--expected-head-sha", HEAD_SHA],
+        ):
+            import io
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                exit_code = main()
+        out = json.loads(buf.getvalue())
+        assert exit_code == EXIT_GH_ERROR
+        assert out["status"] == "gh_error"
+        assert out["checks"] == []
+        assert out["errors"][0]["kind"] == "json_parse_error"
+
 
 # ---------------------------------------------------------------------------
 # B2: pass check の head_sha 補完テスト
