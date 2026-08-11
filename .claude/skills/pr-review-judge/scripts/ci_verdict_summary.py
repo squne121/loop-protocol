@@ -164,7 +164,7 @@ def fetch_head_sha(pr_number: int, repo: str) -> tuple[Optional[str], Optional[d
 
 
 STATUS_CHECK_ROLLUP_QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       commits(last: 1) {
@@ -172,8 +172,9 @@ query($owner: String!, $name: String!, $number: Int!) {
           commit {
             oid
             statusCheckRollup {
-              contexts(first: 100) {
-                pageInfo { hasNextPage }
+              id
+              contexts(first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
                 nodes {
                   __typename
                   ... on CheckRun {
@@ -219,39 +220,110 @@ def _conclusion_bucket(conclusion: Optional[str], status: Optional[str]) -> Opti
 
 
 def fetch_checks(pr_number: int, repo: str) -> tuple[Optional[list], Optional[dict]]:
-    """GraphQL statusCheckRollup から未集約の CheckRun provenance を一括取得する。"""
+    """GraphQL statusCheckRollup の全 page から CheckRun provenance を取得する。"""
     try:
         owner, name = repo.split("/", 1)
     except ValueError:
         return None, {"kind": "json_parse_error", "detail": f"invalid repo: {repo}"}
 
-    ok, data, raw = run_gh([
-        "api", "graphql",
-        "-f", f"query={STATUS_CHECK_ROLLUP_QUERY}",
-        "-F", f"owner={owner}",
-        "-F", f"name={name}",
-        "-F", f"number={pr_number}",
-    ])
-    if not ok or data is None:
-        return None, {"kind": classify_gh_error(raw), "detail": raw[:512]}
-
+    raw_runs: list[dict] = []
+    cursor: Optional[str] = None
+    seen_cursors: set[str] = set()
+    root_commit_oid: Optional[str] = None
+    rollup_id: Optional[str] = None
     try:
-        commits = data["data"]["repository"]["pullRequest"]["commits"]["nodes"]
-        commit = commits[-1]["commit"]
-        contexts = commit["statusCheckRollup"]["contexts"]
-        if contexts["pageInfo"]["hasNextPage"]:
-            raise ValueError("statusCheckRollup exceeds 100 contexts")
-        raw_runs = contexts["nodes"]
+        while True:
+            gh_args = [
+                "api", "graphql",
+                "-f", f"query={STATUS_CHECK_ROLLUP_QUERY}",
+                "-F", f"owner={owner}",
+                "-F", f"name={name}",
+                "-F", f"number={pr_number}",
+            ]
+            if cursor is not None:
+                # GraphQL cursor は opaque String。最初の request では変数自体を
+                # 省略し、次 page 以降だけ raw-field で文字列のまま渡す。
+                gh_args.extend(["-f", f"cursor={cursor}"])
+            ok, data, raw = run_gh(gh_args)
+            if not ok or data is None:
+                return None, {"kind": classify_gh_error(raw), "detail": raw[:512]}
+
+            commits = data["data"]["repository"]["pullRequest"]["commits"]["nodes"]
+            commit = commits[-1]["commit"]
+            page_commit_oid = commit["oid"]
+            rollup = commit["statusCheckRollup"]
+            if not isinstance(page_commit_oid, str) or not page_commit_oid:
+                raise ValueError("statusCheckRollup commit.oid missing or invalid")
+            if not isinstance(rollup, dict):
+                raise ValueError("statusCheckRollup root must be an object")
+            page_rollup_id = rollup["id"]
+            if not isinstance(page_rollup_id, str) or not page_rollup_id:
+                raise ValueError("statusCheckRollup id missing or invalid")
+            if root_commit_oid is None:
+                root_commit_oid = page_commit_oid
+                rollup_id = page_rollup_id
+            elif page_commit_oid != root_commit_oid or page_rollup_id != rollup_id:
+                raise ValueError("statusCheckRollup root changed during pagination")
+
+            contexts = rollup["contexts"]
+            page_info = contexts["pageInfo"]
+            has_next_page = page_info["hasNextPage"]
+            page_runs = contexts["nodes"]
+            if not isinstance(has_next_page, bool):
+                raise ValueError("statusCheckRollup pageInfo.hasNextPage must be boolean")
+            if not isinstance(page_runs, list):
+                raise ValueError("statusCheckRollup contexts.nodes must be a list")
+            raw_runs.extend(page_runs)
+            if not has_next_page:
+                break
+
+            next_cursor = page_info["endCursor"]
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise ValueError("statusCheckRollup pageInfo.endCursor missing or invalid")
+            if next_cursor in seen_cursors:
+                raise ValueError("statusCheckRollup pageInfo.endCursor repeated")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         return None, {"kind": "json_parse_error", "detail": f"statusCheckRollup shape: {exc}"}
 
     checks: list[dict] = []
     for run in raw_runs:
+        if not isinstance(run, dict):
+            return None, {
+                "kind": "json_parse_error",
+                "detail": "statusCheckRollup shape: context node must be an object",
+            }
         if run.get("__typename") != "CheckRun":
             continue
-        suite = run.get("checkSuite") or {}
-        workflow_run = suite.get("workflowRun") or {}
-        workflow = workflow_run.get("workflow") or {}
+        suite_raw = run.get("checkSuite")
+        if suite_raw is not None and not isinstance(suite_raw, dict):
+            return None, {
+                "kind": "json_parse_error",
+                "detail": "statusCheckRollup shape: CheckRun checkSuite must be an object or null",
+            }
+        suite = suite_raw or {}
+        workflow_run_raw = suite.get("workflowRun")
+        if workflow_run_raw is not None and not isinstance(workflow_run_raw, dict):
+            return None, {
+                "kind": "json_parse_error",
+                "detail": "statusCheckRollup shape: CheckRun workflowRun must be an object or null",
+            }
+        workflow_run = workflow_run_raw or {}
+        workflow_raw = workflow_run.get("workflow")
+        if workflow_raw is not None and not isinstance(workflow_raw, dict):
+            return None, {
+                "kind": "json_parse_error",
+                "detail": "statusCheckRollup shape: CheckRun workflow must be an object or null",
+            }
+        workflow = workflow_raw or {}
+        commit_raw = suite.get("commit")
+        if commit_raw is not None and not isinstance(commit_raw, dict):
+            return None, {
+                "kind": "json_parse_error",
+                "detail": "statusCheckRollup shape: CheckRun commit must be an object or null",
+            }
+        suite_commit = commit_raw or {}
         checks.append({
             "name": run.get("name") or "unknown",
             "bucket": _conclusion_bucket(run.get("conclusion"), run.get("status")),
@@ -262,11 +334,11 @@ def fetch_checks(pr_number: int, repo: str) -> tuple[Optional[list], Optional[di
             "startedAt": run.get("startedAt"),
             "completedAt": run.get("completedAt"),
             "runId": run.get("databaseId"),
-            "headSha": (suite.get("commit") or {}).get("oid"),
+            "headSha": suite_commit.get("oid"),
             "run_detail_complete": all(
                 run.get(field) is not None
                 for field in ("databaseId", "status", "conclusion", "startedAt", "completedAt")
-            ) and bool((suite.get("commit") or {}).get("oid")),
+            ) and bool(suite_commit.get("oid")),
         })
     return checks, None
 

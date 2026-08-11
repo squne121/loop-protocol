@@ -22,9 +22,17 @@ gh issue view <番号> --json title,body,labels,comments
 
 ### 2) 開発フロー適合性チェック
 
-`State Label`、template 準拠、`Allowed Paths`、`Verification Commands`、Stop Conditions（implementation の場合）を確認する。
+template 準拠、`Allowed Paths`、`Verification Commands`、Stop Conditions（implementation の場合）を確認する。
 
-- `state/needs-human` がある場合のみ BLOCKED（他の state ラベルは判定に直接使用しない）
+GitHub Issue label（`state/needs-human` を含む全 label）は presentation-only の
+non-authoritative metadata であり、`CONTRACT_REVIEW_RESULT_V1.status`（go/blocked/human_judgment）
+の算出には一切使わない（#2084 OWNER directive）。readiness authority は Issue native
+open/closed state、Machine-Readable Contract、GitHub native dependency close 状態、
+explicit operator/OWNER directive、review/test/CI 結果である（#2084 Outcome の
+Readiness Plane 定義を参照）。label を `checks.state_label` として observational
+telemetry に残す場合も、それは presentation 用の観測情報に限定し `status` の判定に
+寄与させない。
+
 - Allowed Paths/VC が空のままなら BLOCKED
 - Stop Conditions は implementation のみ必須
 
@@ -149,7 +157,8 @@ OPEN Issue 重複そのものの再判定は行わない。重複判定は `issu
 `checks` には少なくとも以下を含める。
 
 - `template_compliance`（テンプレ準拠）
-- `state_label`（状態ラベル）
+- `state_label`（状態ラベル。observational telemetry のみ。`status` の go/blocked/human_judgment
+  判定には寄与させない。#2084）
 - `allowed_paths_present`（許可パスの有無）
 - `vc_present`（検証コマンドの有無）
 - `stop_conditions_complete`（停止条件の充足）

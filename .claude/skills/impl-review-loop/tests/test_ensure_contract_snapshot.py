@@ -131,6 +131,19 @@ _SAMPLE_BODY = "## Test Issue Body\nSome content here.\n\n## Allowed Paths\n- tr
 _SAMPLE_BODY_SHA256 = sha256_of(_SAMPLE_BODY)
 _SAMPLE_UPDATED_AT = "2026-06-13T08:00:00Z"
 
+
+def test_contract_review_materializer_uses_bounded_outer_deadline_only():
+    """The publisher deadline must not change run_contract_review_once CLI semantics."""
+    subprocess_result = MagicMock(stdout='{"status": "go"}')
+    with patch.object(_ecs_mod.subprocess, "run", return_value=subprocess_result) as run:
+        result, error = _ecs_mod.run_contract_review_once(_ISSUE_NUMBER, _REPO)
+
+    assert error is None
+    assert result == {"status": "go"}
+    command = run.call_args.args[0]
+    assert run.call_args.kwargs["timeout"] == 360
+    assert "--timeout" not in command
+
 _GO_COMMENT = {
     "id": 1001,
     "html_url": f"{_ISSUE_URL}#issuecomment-1001",
@@ -744,6 +757,45 @@ class TestFreshGoSnapshots:
         assert go_result is not None
         assert is_go_fresh(go_result, _SAMPLE_BODY_SHA256)
         assert not is_go_current(go_result, _SAMPLE_BODY_SHA256)
+
+
+class TestVcPreflightClassificationsCompleteness:
+    """Consumer acceptance of parsed baseline VC classifications is fail-closed."""
+
+    @staticmethod
+    def _go_result(vc_preflight: object) -> dict:
+        inner = _fresh_inner(_SAMPLE_BODY_SHA256)
+        inner["checks"]["vc_preflight"] = vc_preflight
+        return {"status": "go", "inner": inner}
+
+    def test_given_raw_classifications_scalar_and_pass_decision_when_current_then_rejects(self):
+        raw_classifications = json.dumps(
+            {"ac": "AC10", "stdout_head": ["x" * 16_190]}
+        )
+        go_result = self._go_result(
+            {
+                "decision": "pass",
+                "classifications": raw_classifications,
+            }
+        )
+
+        assert not is_go_current(go_result, _SAMPLE_BODY_SHA256)
+
+    @pytest.mark.parametrize(
+        ("vc_preflight", "case"),
+        [
+            ({"classifications": "raw"}, "decision_missing"),
+            ({"decision": "fail", "classifications": "raw"}, "decision_non_pass"),
+            ({"decision": "pass", "classifications": {"ac": "AC1"}}, "mapping"),
+            ({"decision": "pass", "classifications": 1}, "integer"),
+            ({"decision": "pass", "classifications": None}, "null"),
+        ],
+    )
+    def test_given_non_list_classifications_without_explicit_pass_when_current_then_rejects(
+        self, vc_preflight: object, case: str
+    ):
+        assert case
+        assert not is_go_current(self._go_result(vc_preflight), _SAMPLE_BODY_SHA256)
 
 
 class TestContractReviewComment:
@@ -2970,7 +3022,7 @@ class TestProducerParserEscapedAdvisoryRoundTrip:
         }
         classifications = [{
             "ac": "AC10",
-            "stdout_head": [r"\^[[2K" + "x" * 16_190],
+            "stdout_head": [r"\^[[2K" + "x" * _parser_mod._MAX_JSON_FLOW_COLLECTION_CHARS],
         }]
         declared_path_overlap = {
             "advisory": True,
@@ -3004,18 +3056,27 @@ class TestProducerParserEscapedAdvisoryRoundTrip:
         assert "    declared_path_overlap: '" in body
         assert "  expected_contract_fingerprint: {" in body
 
-    def test_given_large_escaped_advisory_when_pyyaml_parses_then_types_round_trip(self):
-        body, fingerprint, classifications, overlap = self._comment_body()
+    def test_given_oversized_classifications_when_produced_then_snapshot_uses_bounded_strict_list(self):
+        body, _fingerprint, classifications, _overlap = self._comment_body()
         block = _parser_mod._extract_yaml_blocks(body)[0]
 
         parsed = _parser_mod._parse_simple_yaml_block(block)
-        inner = parsed["CONTRACT_REVIEW_RESULT_V1"]
-        assert inner["expected_contract_fingerprint"] == fingerprint
-        assert inner["checks"]["vc_preflight"]["classifications"] == classifications
-        assert inner["checks"]["declared_path_overlap"] == overlap
+        vc_preflight = parsed["CONTRACT_REVIEW_RESULT_V1"]["checks"]["vc_preflight"]
+        assert isinstance(vc_preflight["classifications"], list)
+        assert vc_preflight["classifications"][0]["ac"] == classifications[0]["ac"]
+        assert "stdout_head" not in vc_preflight["classifications"][0]
+        assert vc_preflight["classifications_transport"] == {
+            "schema": "vc_preflight_classifications_transport/v1",
+            "classification_count": 1,
+            "original_payload_sha256": _ecs_mod.sha256_of(
+                json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
+            ),
+            "compact": True,
+            "truncated": True,
+        }
 
-    def test_given_large_escaped_advisory_when_fallback_parses_then_types_round_trip(self, monkeypatch):
-        body, fingerprint, classifications, overlap = self._comment_body()
+    def test_given_oversized_classifications_when_fallback_parses_then_snapshot_keeps_strict_list(self, monkeypatch):
+        body, _fingerprint, classifications, _overlap = self._comment_body()
         block = _parser_mod._extract_yaml_blocks(body)[0]
         original_import = builtins.__import__
 
@@ -3026,7 +3087,7 @@ class TestProducerParserEscapedAdvisoryRoundTrip:
 
         monkeypatch.setattr(builtins, "__import__", reject_yaml)
         parsed = _parser_mod._parse_simple_yaml_block(block)
-        inner = parsed["CONTRACT_REVIEW_RESULT_V1"]
-        assert inner["expected_contract_fingerprint"] == fingerprint
-        assert inner["checks"]["vc_preflight"]["classifications"] == classifications
-        assert inner["checks"]["declared_path_overlap"] == overlap
+        vc_preflight = parsed["CONTRACT_REVIEW_RESULT_V1"]["checks"]["vc_preflight"]
+        assert isinstance(vc_preflight["classifications"], list)
+        assert vc_preflight["classifications"][0]["ac"] == classifications[0]["ac"]
+        assert vc_preflight["classifications_transport"]["compact"] is True

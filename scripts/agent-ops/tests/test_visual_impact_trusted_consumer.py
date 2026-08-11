@@ -93,7 +93,13 @@ def _sample_decision(*, head_sha: str = EXPECTED_HEAD_SHA, evidence_manifest_dig
     )
 
 
-def _verify(decision: dict | None, manifest: dict | None, *, expected_head_sha: str = EXPECTED_HEAD_SHA):
+def _verify(
+    decision: dict | None,
+    manifest: dict | None,
+    *,
+    expected_head_sha: str = EXPECTED_HEAD_SHA,
+    trusted_rederivation: "rvi.TrustedRederivation | None" = None,
+):
     decision_raw = None if decision is None else json.dumps(decision).encode("utf-8")
     manifest_raw = None if manifest is None else json.dumps(manifest).encode("utf-8")
     return rvi.verify_trusted_artifact(
@@ -103,6 +109,7 @@ def _verify(decision: dict | None, manifest: dict | None, *, expected_head_sha: 
         expected_head_sha=expected_head_sha,
         expected_repository=EXPECTED_REPOSITORY,
         expected_pr_number=EXPECTED_PR_NUMBER,
+        trusted_rederivation=trusted_rederivation,
     )
 
 
@@ -236,6 +243,155 @@ def test_malformed_json_rejected():
     )
     assert verdict.ok is False
     assert any(code.startswith("decision_not_json") for code in verdict.reason_codes)
+
+
+# --- Issue #2091 AC1-AC5: trusted-side re-derivation adversarial fixtures ---
+
+
+def _registry_doc(*, producer_paths: list[str], coverage_roots: list[str] | None = None) -> dict:
+    return {
+        "surfaces": {SURFACE_ID: {"producers": {"modules": producer_paths}}},
+        "coverage_roots": coverage_roots or [],
+    }
+
+
+def _forged_decision(*, changed_path_entries: list[dict], affected_surfaces: list[dict]) -> dict:
+    """A decision shaped exactly like Forgery 1 in Issue #2090/#2091:
+    `component_vrt_report_check_run_id`/`artifact_id`/`artifact_digest` all
+    `null`, no evidence trail at all -- the producer claims "nothing to
+    verify"."""
+    return rvi.build_decision(
+        repository=EXPECTED_REPOSITORY,
+        pull_request_number=EXPECTED_PR_NUMBER,
+        base_sha="a" * 40,
+        head_sha=EXPECTED_HEAD_SHA,
+        base_registry_blob_sha="c" * 40,
+        head_registry_blob_sha="d" * 40,
+        pr_body="dummy",
+        changed_path_entries=changed_path_entries,
+        affected_surfaces=affected_surfaces,
+        component_vrt_report_check_run_id=None,
+        github_actions_app_identity="github-actions[bot]",
+        artifact_id=None,
+        artifact_digest=None,
+    )
+
+
+def test_affected_surfaces_empty_forgery_rejected():
+    """Forgery 1: producer self-reports `affected_surfaces: []` even though
+    a changed path is a REAL registered producer for a surface. Trusted-side
+    re-derivation (base/head registry + independently-obtained changed
+    paths) must catch this regardless of the empty evidence trail."""
+    changed_entries = [{"status": "modified", "path": "src/ui/combatHud.ts"}]
+    registry_doc = _registry_doc(producer_paths=["src/ui/combatHud.ts"])
+    decision = _forged_decision(changed_path_entries=changed_entries, affected_surfaces=[])
+    trusted = rvi.TrustedRederivation(
+        changed_path_entries=changed_entries,
+        base_registry_doc=registry_doc,
+        head_registry_doc=registry_doc,
+    )
+    verdict = _verify(decision, manifest=None, trusted_rederivation=trusted)
+    assert verdict.ok is False
+    assert any(code.startswith("affected_surfaces_undercount") for code in verdict.reason_codes)
+
+
+def test_evidence_empty_coherent_forgery_rejected():
+    """Forgery 2: the producer's `affected_surfaces` surface_id is the
+    CORRECT one, but its `evidence` object is an empty `{}` -- no digest
+    claim at all. Must be rejected even with no `trusted_rederivation`
+    supplied (pure schema/logic check, AC3)."""
+    manifest = _sample_manifest()
+    decision = _sample_decision(evidence_manifest_digest=None)
+    assert decision["affected_surfaces"][0]["evidence"] == {}
+    verdict = _verify(decision, manifest)
+    assert verdict.ok is False
+    assert any(code.startswith("evidence_digest_claim_missing") for code in verdict.reason_codes)
+
+
+def test_missing_ref_object_fail_closed():
+    """AC4: a ref whose commit object was never fetched locally (shallow
+    checkout) must raise `MissingRefObjectError` -- never silently degrade
+    to a synthetic empty registry the way a genuinely-missing FILE does."""
+    all_zero_sha = "0" * 40
+    with pytest.raises(rvi.MissingRefObjectError):
+        rvi.load_registry_text(
+            REPO_ROOT / "docs" / "dev" / "visual-surfaces.yml",
+            all_zero_sha,
+            REPO_ROOT,
+        )
+
+
+def test_missing_ref_object_never_silently_empty_registry_in_resolve():
+    """AC4 integration: `resolve()` must fail closed (record an error, never
+    silently proceed with an empty head registry) when `head_ref` names a
+    commit object that cannot be resolved locally."""
+    result = rvi.resolve(changed_paths=["docs/dev/visual-surfaces.yml"], head_ref="0" * 40)
+    assert any("head registry invalid" in e for e in result.errors)
+    assert result.affected_surfaces == []
+
+
+def test_no_visual_impact_empty_surfaces_pass():
+    """AC5 regression: a genuinely no-visual-impact PR (changed paths match
+    no producer/contract/global-invalidator/coverage-root) legitimately
+    reports `affected_surfaces: []` and PASSES -- trusted-side re-derivation
+    must never turn a real empty set into a false rejection."""
+    changed_entries = [{"status": "modified", "path": "docs/README.md"}]
+    registry_doc = _registry_doc(producer_paths=["src/ui/combatHud.ts"], coverage_roots=["src/ui/**"])
+    decision = _forged_decision(changed_path_entries=changed_entries, affected_surfaces=[])
+    trusted = rvi.TrustedRederivation(
+        changed_path_entries=changed_entries,
+        base_registry_doc=registry_doc,
+        head_registry_doc=registry_doc,
+    )
+    verdict = _verify(decision, manifest=None, trusted_rederivation=trusted)
+    assert verdict.ok is True
+    assert verdict.reason_codes == []
+
+
+def test_stale_base_rejected():
+    """A `base_sha` in the decision that no longer matches the PR's actual
+    LIVE base (independently fetched by the trusted consumer) is rejected
+    -- distinct from the existing stale-HEAD check."""
+    manifest = _sample_manifest()
+    digest = manifest["surfaces"][0]["manifest_sha256"]
+    decision = _sample_decision(evidence_manifest_digest=digest)  # decision["base_sha"] == "a" * 40
+    trusted = rvi.TrustedRederivation(expected_base_sha="f" * 40)
+    verdict = _verify(decision, manifest, trusted_rederivation=trusted)
+    assert verdict.ok is False
+    assert "base_sha_mismatch" in verdict.reason_codes
+
+
+def test_incomplete_changed_paths_rejected():
+    """An incomplete changed-path set (e.g. a paginated files API hit its
+    page-size cap, or a >3000-file PR) can never be trusted to prove the
+    producer's `affected_surfaces` claim -- fail closed unconditionally."""
+    manifest = _sample_manifest()
+    digest = manifest["surfaces"][0]["manifest_sha256"]
+    decision = _sample_decision(evidence_manifest_digest=digest)
+    trusted = rvi.TrustedRederivation(changed_paths_complete=False)
+    verdict = _verify(decision, manifest, trusted_rederivation=trusted)
+    assert verdict.ok is False
+    assert "changed_paths_incomplete_unknown" in verdict.reason_codes
+
+
+def test_policy_version_mismatch_rejected():
+    manifest = _sample_manifest()
+    digest = manifest["surfaces"][0]["manifest_sha256"]
+    decision = _sample_decision(evidence_manifest_digest=digest)
+    decision["policy_version"] = "999"
+    verdict = _verify(decision, manifest)
+    assert verdict.ok is False
+    assert "policy_version_mismatch" in verdict.reason_codes
+
+
+def test_registry_mapping_deletion_detected_by_trusted_minimum():
+    """AC1: a head-side registry that silently drops a producer mapping
+    present in base is still caught by `resolve_trusted_minimum()` even
+    though the producer's own head registry no longer lists it."""
+    base_doc = _registry_doc(producer_paths=["src/ui/combatHud.ts"])
+    head_doc = _registry_doc(producer_paths=[])  # mapping deleted head-side
+    affected, _unmapped = rvi.resolve_trusted_minimum(["src/ui/combatHud.ts"], base_doc, head_doc)
+    assert affected.get(SURFACE_ID) in {"mapping_deleted", "direct_producer"}
 
 
 # --- AC30/AC36: static workflow-definition verification ---------------------
