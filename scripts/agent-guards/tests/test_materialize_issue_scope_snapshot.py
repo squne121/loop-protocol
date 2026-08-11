@@ -63,16 +63,24 @@ def _go_comment_body(
         f'  body_sha256: "{body_sha}"',
     ]
     if fingerprint:
-        lines += [
-            "  expected_contract_fingerprint:",
-            "    issue_number: 1629",
-            "    contract_source_kind: issue_comment",
-            f'    contract_source_id: "{_COMMENT_ID}"',
-            f'    contract_body_sha256: "{body_sha}"',
-            f'    allowed_paths_normalized_sha256: "{allowed_paths_hash or _allowed_paths_hash()}"',
-            f'    base_ref: "{base_ref}"',
-            f'    base_sha_at_snapshot: "{base_sha}"',
-        ]
+        fingerprint_json = json.dumps(
+            {
+                "issue_number": 1629,
+                "contract_source_kind": "issue_comment",
+                "contract_source_id": str(_COMMENT_ID),
+                "contract_body_sha256": body_sha,
+                "allowed_paths_normalized_sha256": allowed_paths_hash
+                or _allowed_paths_hash(),
+                "base_ref": base_ref,
+                "base_sha_at_snapshot": base_sha,
+            },
+            separators=(",", ":"),
+        )
+        lines.append(
+            "  expected_contract_fingerprint: '"
+            + fingerprint_json.replace("'", "''")
+            + "'"
+        )
     return "```yaml\n" + "\n".join(lines) + "\n```\n"
 
 

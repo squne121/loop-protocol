@@ -179,9 +179,24 @@ def _parse_fallback_scalar(value: str) -> Any:
     return value
 
 
-def _is_single_quoted_producer_json_scalar(raw_block: str, key: str) -> bool:
-    """Return whether a producer JSON scalar uses its canonical YAML transport."""
-    return re.search(rf"(?m)^  {re.escape(key)}:\s*'", raw_block) is not None
+def _canonical_single_quoted_json_scalar(raw_block: str, key: str) -> Optional[str]:
+    """Return one canonical YAML single-quoted JSON scalar, else ``None``.
+
+    The raw YAML syntax is part of the authority boundary.  PyYAML turns a
+    flow mapping and a single-quoted scalar into indistinguishable Python
+    mappings after decoding, so the canonical scalar must be identified
+    before its JSON payload is considered.  YAML represents an apostrophe in
+    a single-quoted scalar as ``''``; convert that escape only after matching
+    the complete, one-line scalar form.
+    """
+    scalar_re = re.compile(
+        rf"^  {re.escape(key)}:[ \t]*'(?P<payload>(?:[^'\r\n]|'')*)'[ \t]*$",
+        re.MULTILINE,
+    )
+    matches = list(scalar_re.finditer(raw_block))
+    if len(matches) != 1:
+        return None
+    return matches[0].group("payload").replace("''", "'")
 
 
 def _decode_producer_json_scalars(block: dict[str, Any], raw_block: str) -> dict[str, Any]:
@@ -202,10 +217,22 @@ def _decode_producer_json_scalars(block: dict[str, Any], raw_block: str) -> dict
 
     checks = inner.get("checks")
     # The producer's fingerprint transport is a single-quoted JSON mapping.
-    # Do not recursively decode a JSON string transported through a different
-    # YAML scalar form: it is not a mapping and must remain non-authoritative.
-    if _is_single_quoted_producer_json_scalar(raw_block, "expected_contract_fingerprint"):
-        decode(inner, "expected_contract_fingerprint")
+    # A YAML flow or nested mapping has the same Python type after PyYAML
+    # parsing, so provenance must be checked against the raw transport before
+    # it can reach an authority consumer.  Reject instead of merely leaving a
+    # noncanonical value non-ready: legacy/provisional GO records may omit the
+    # field, but a supplied noncanonical fingerprint must not be surfaced as a
+    # candidate with ambiguous authority semantics.
+    if "expected_contract_fingerprint" in inner:
+        raw_fingerprint = _canonical_single_quoted_json_scalar(
+            raw_block, "expected_contract_fingerprint"
+        )
+        if raw_fingerprint is None:
+            raise SimpleYamlParseError("noncanonical_contract_fingerprint_transport")
+        fingerprint = _parse_bounded_strict_json_collection(raw_fingerprint)
+        if not isinstance(fingerprint, dict):
+            raise SimpleYamlParseError("expected_contract_fingerprint_must_be_mapping")
+        inner["expected_contract_fingerprint"] = fingerprint
     if not isinstance(checks, dict):
         return block
     try:
@@ -589,13 +616,33 @@ def parse_contract_review_results(
 
     Results are ordered by created_at ascending (comment_id ascending).
     """
+    results, _telemetry = parse_contract_review_results_with_telemetry(
+        comments, expected_issue_url
+    )
+    return results
+
+
+def parse_contract_review_results_with_telemetry(
+    comments: list[dict],
+    expected_issue_url: Optional[str] = None,
+) -> tuple[list[dict], dict[str, int]]:
+    """Parse canonical results and report non-authoritative block telemetry.
+
+    Consumers that need invalid/ambiguous-block diagnostics must use this
+    helper instead of independently decoding YAML.  The returned result
+    records retain the same authority and fingerprint semantics as
+    :func:`parse_contract_review_results`.
+    """
     results: list[dict] = []
+    invalid_contract_blocks_count = 0
+    ambiguous_contract_blocks_count = 0
 
     for comment in comments:
         body = comment.get("body", "") or ""
         if _CONTRACT_REVIEW_MARKER not in body:
             continue
 
+        valid_blocks: list[dict] = []
         blocks = _extract_yaml_blocks(body)
         for raw_block in blocks:
             # Only consider blocks that contain the marker
@@ -606,6 +653,7 @@ def parse_contract_review_results(
             except SimpleYamlParseError:
                 # A malformed JSON flow collection is never downgraded to a
                 # scalar candidate for an authoritative contract result.
+                invalid_contract_blocks_count += 1
                 continue
             if _is_valid_contract_review_result(parsed, expected_issue_url):
                 inner = parsed[_CONTRACT_REVIEW_MARKER]
@@ -615,7 +663,7 @@ def parse_contract_review_results(
                 author_association = comment.get("author_association")
                 author_id = comment.get("author_id")
                 author_type = comment.get("author_type")
-                results.append(
+                valid_blocks.append(
                     {
                         "comment_id": comment.get("id"),
                         "html_url": comment.get("html_url", ""),
@@ -640,10 +688,23 @@ def parse_contract_review_results(
                         ),
                     }
                 )
-                # Only take first valid block per comment
-                break
+            else:
+                invalid_contract_blocks_count += 1
 
-    return results
+        if len(valid_blocks) > 1:
+            ambiguous_contract_blocks_count += 1
+        if valid_blocks:
+            # Only take the first valid block per comment, preserving the
+            # pre-existing consumer contract while surfacing ambiguity.
+            results.append(valid_blocks[0])
+
+    results.sort(
+        key=lambda item: (str(item.get("created_at") or ""), int(item.get("comment_id") or 0))
+    )
+    return results, {
+        "invalid_contract_blocks_count": invalid_contract_blocks_count,
+        "ambiguous_contract_blocks_count": ambiguous_contract_blocks_count,
+    }
 
 
 def filter_authoritative_results(results: list[dict]) -> list[dict]:

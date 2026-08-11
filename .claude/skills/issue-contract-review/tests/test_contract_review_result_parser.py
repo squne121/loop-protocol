@@ -152,7 +152,9 @@ class TestSimpleYamlParser:
         assert inner["status"] == "go"
         assert inner["generated_by"] == "issue-contract-review"
 
-    def test_fallback_preserves_inline_json_object_as_dict(self, monkeypatch):
+    @pytest.mark.parametrize("transport", ["flow", "nested"])
+    def test_fallback_rejects_noncanonical_fingerprint_mapping(self, monkeypatch, transport):
+        """GIVEN a flow/nested fingerprint WHEN fallback parses THEN it fails closed."""
         original_import = builtins.__import__
 
         def reject_yaml(name, *args, **kwargs):
@@ -177,13 +179,16 @@ class TestSimpleYamlParser:
             "  generated_by: issue-contract-review\n"
             f"  issue_url: {_ISSUE_URL}\n"
             f"  body_sha256: {fingerprint['contract_body_sha256']}\n"
-            f"  expected_contract_fingerprint: {json.dumps(fingerprint)}\n"
         )
+        if transport == "flow":
+            block += f"  expected_contract_fingerprint: {json.dumps(fingerprint)}\n"
+        else:
+            block += "  expected_contract_fingerprint:\n" + "\n".join(
+                f"    {key}: {value}" for key, value in fingerprint.items()
+            ) + "\n"
 
-        result = _parse_simple_yaml_block(block)
-        inner = result["CONTRACT_REVIEW_RESULT_V1"]
-        assert inner["expected_contract_fingerprint"] == fingerprint
-        assert isinstance(inner["expected_contract_fingerprint"], dict)
+        with pytest.raises(SimpleYamlParseError, match="noncanonical_contract_fingerprint_transport"):
+            _parse_simple_yaml_block(block)
 
     def test_fallback_preserves_issue_1153_fingerprint_shape(self, monkeypatch):
         original_import = builtins.__import__
@@ -211,7 +216,9 @@ class TestSimpleYamlParser:
             "  generated_by: issue-contract-review\n"
             "  issue_url: https://github.com/squne121/loop-protocol/issues/1153\n"
             f"  body_sha256: {body_sha256}\n"
-            f"  expected_contract_fingerprint: {json.dumps(fingerprint)}\n"
+            "  expected_contract_fingerprint: '"
+            + json.dumps(fingerprint)
+            + "'\n"
         )
 
         result = _parse_simple_yaml_block(block)
@@ -440,6 +447,74 @@ class TestParseContractReviewResults:
             f"  issue_url: {_ISSUE_URL}\n  expected_contract_fingerprint: '{{bad}}'",
         )
 
+        assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
+
+    @pytest.mark.parametrize("transport", ["flow", "nested"])
+    def test_noncanonical_fingerprint_mapping_is_rejected_with_pyyaml(self, transport):
+        """GIVEN a flow/nested mapping WHEN PyYAML parses THEN it cannot become authority."""
+        fingerprint = dict(_VALID_FINGERPRINT)
+        comment = _make_go_comment(comment_id=1001)
+        if transport == "flow":
+            fingerprint_yaml = f"  expected_contract_fingerprint: {json.dumps(fingerprint)}"
+        else:
+            fingerprint_yaml = "  expected_contract_fingerprint:\n" + "\n".join(
+                f"    {key}: {value}" for key, value in fingerprint.items()
+            )
+        comment["body"] = comment["body"].replace(
+            f"  issue_url: {_ISSUE_URL}",
+            "\n".join(
+                [
+                    f"  issue_url: {_ISSUE_URL}",
+                    f"  body_sha256: {fingerprint['contract_body_sha256']}",
+                    fingerprint_yaml,
+                ]
+            ),
+        )
+
+        assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
+
+    @pytest.mark.parametrize(
+        "transport",
+        [
+            lambda fingerprint: json.dumps(fingerprint),
+            lambda fingerprint: json.dumps(json.dumps(fingerprint)),
+            lambda _fingerprint: "plain-scalar",
+            lambda _fingerprint: "'{bad}'",
+            lambda fingerprint: "'" + json.dumps(json.dumps(fingerprint)) + "'",
+            lambda _fingerprint: "'[]'",
+            lambda _fingerprint: "'NaN'",
+            lambda _fingerprint: "'{\"issue_number\":1,\"issue_number\":2}'",
+            lambda _fingerprint: "'" + "[" * 33 + "]" * 33 + "'",
+            lambda _fingerprint: "'{\"payload\":\"" + "x" * 16_384 + "\"}'",
+        ],
+    )
+    def test_noncanonical_or_invalid_fingerprint_is_rejected_with_parser_parity(
+        self, monkeypatch, transport
+    ):
+        """GIVEN hostile fingerprint transport WHEN either parser runs THEN it fails closed."""
+        fingerprint = dict(_VALID_FINGERPRINT)
+        comment = _make_go_comment(comment_id=1001)
+        comment["body"] = comment["body"].replace(
+            f"  issue_url: {_ISSUE_URL}",
+            "\n".join(
+                [
+                    f"  issue_url: {_ISSUE_URL}",
+                    f"  body_sha256: {fingerprint['contract_body_sha256']}",
+                    "  expected_contract_fingerprint: " + transport(fingerprint),
+                ]
+            ),
+        )
+
+        assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
+
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
         assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
 
     def test_nested_json_string_fingerprint_is_rejected_in_fallback(self, monkeypatch):
