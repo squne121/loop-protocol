@@ -617,6 +617,7 @@ REASON_DESTRUCTIVE_OR_NON_IDEMPOTENT_OPERATION = "destructive_or_non_idempotent_
 REASON_AI_INFERRED_SCOPE_DELTA = "ai_inferred_scope_delta"
 REASON_UNTRUSTED_AUTHOR_ASSOCIATION = "untrusted_author_association"
 REASON_MISSING_BASE_ISSUE_BODY_SHA256 = "missing_base_issue_body_sha256"
+REASON_CROSS_TARGET_DIRECT_MUTATION = "cross_target_direct_mutation"
 
 NEXT_STEP_RERUN_REFINEMENT_AFTER_CONTRACT_UPDATE = "rerun_refinement_after_contract_update"
 
@@ -1774,7 +1775,113 @@ def _has_conflicting_directives(evidence_list: list) -> bool:
     return any(candidate != first for candidate in directive_sets[1:])
 
 
+def _parsed_issue_number_for_cross_target(evidence: dict, expected_repo) -> "int | None":
+    """#2053 AC6: resolve the issue number a comment-shaped evidence entry
+    structurally targets, restricted to issue_comment/pull_request_review
+    kinds (the only kinds that carry a comment_url). Returns None when the
+    evidence is not comment-shaped, the URL does not parse, or (when
+    expected_repo is provided) the URL points at a different repository --
+    those cases are handled by the existing same-target validation path,
+    not by cross-target detection.
+    """
+    if evidence.get("source_kind") not in ("issue_comment", "pull_request_review"):
+        return None
+    parsed = parse_issue_comment_url(evidence.get("comment_url"))
+    if parsed is None:
+        return None
+    if expected_repo:
+        expected_parts = expected_repo.lower().split("/", 1)
+        if [parsed["owner"].lower(), parsed["repo"].lower()] != expected_parts:
+            return None
+    return parsed["issue_number"]
+
+
+def _build_cross_target_follow_up_candidate(evidence: dict, target_issue_number: "int | None") -> dict:
+    """#2053 AC6: a non-mutating, informational candidate. mutation_authority
+    is always False -- a follow-up candidate never grants Issue mutation
+    authority on the cross-referenced target; it requires that target
+    Issue's own trusted directive to become actionable.
+    """
+    return {
+        "target_issue_number": target_issue_number,
+        "source_kind": evidence.get("source_kind"),
+        "comment_url": evidence.get("comment_url"),
+        "mutation_authority": False,
+        "note": "cross_target_directive_observed_requires_own_trusted_directive_on_target_issue",
+    }
+
+
 def classify_scope_delta_authority(
+    evidence,
+    *,
+    triggered: bool = True,
+    target_issue_number=None,
+    base_issue_body_sha256=None,
+    expected_repo=None,
+) -> dict:
+    """#2053 AC6 public wrapper: partitions `evidence` into same-target and
+    cross-target (a different Issue than `target_issue_number`) before
+    delegating to `_classify_scope_delta_authority_core`.
+
+    A cross-target comment attempting a directive (non-empty
+    directive_markers/extracted_directives) is NEVER treated as mutation
+    authority for `target_issue_number` -- `cross_target_direct_mutation`
+    is always rejected (AC6). It is instead surfaced as a non-mutating
+    `follow_up_candidates` entry so it is not silently dropped, matching
+    AC5's fail-closed cross-issue behavior while adding AC6's explicit type
+    separation from `primary_target_exact_delta`.
+    """
+    if evidence is None:
+        raw_list = []
+    elif isinstance(evidence, dict):
+        raw_list = [evidence]
+    elif isinstance(evidence, list):
+        raw_list = [item for item in evidence if isinstance(item, dict)]
+    else:
+        raw_list = []
+
+    cross_target_follow_ups: list = []
+    same_target_list: list = []
+    if target_issue_number is not None and triggered:
+        for item in raw_list:
+            parsed_issue = _parsed_issue_number_for_cross_target(item, expected_repo)
+            if parsed_issue is not None and parsed_issue != target_issue_number:
+                if item.get("extracted_directives") or item.get("directive_markers"):
+                    cross_target_follow_ups.append(
+                        _build_cross_target_follow_up_candidate(item, parsed_issue)
+                    )
+                continue
+            same_target_list.append(item)
+    else:
+        same_target_list = raw_list
+
+    filtered_evidence = same_target_list if raw_list else evidence
+
+    result = _classify_scope_delta_authority_core(
+        filtered_evidence,
+        triggered=triggered,
+        target_issue_number=target_issue_number,
+        base_issue_body_sha256=base_issue_body_sha256,
+        expected_repo=expected_repo,
+    )
+
+    if cross_target_follow_ups:
+        result = dict(result)
+        result["follow_up_candidates"] = cross_target_follow_ups
+        result["route"] = dict(result["route"])
+        if not same_target_list:
+            # Pure cross-target attempt: no same-target evidence survived,
+            # so the only signal is the rejected cross-target mutation.
+            result["route"]["reason_code"] = REASON_CROSS_TARGET_DIRECT_MUTATION
+            result["route"]["target_binding"] = "cross_target_direct_mutation"
+            result["route"]["implementation_allowed"] = False
+        elif result["route"].get("action") == SCOPE_DELTA_AUTHORITY_ROUTE_CONTRACT_UPDATE_REQUIRED:
+            result["route"]["target_binding"] = "primary_target_exact_delta"
+
+    return result
+
+
+def _classify_scope_delta_authority_core(
     evidence,
     *,
     triggered: bool = True,
