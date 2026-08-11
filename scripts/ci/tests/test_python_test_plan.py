@@ -178,6 +178,11 @@ def test_real_plan_serial_lane_has_debounce():
     was added to parallel_exclude (Issue #2073) as a historical mitigation
     for an unresolved AC10 flake; the original fixed-timeout /
     xdist-CPU-saturation causal claim has been retracted, see Issue #2073.
+
+    AC10_ROOT_CAUSE_STATUS: unresolved (Issue #2073). This marker is the
+    canonical source Issue #2073 AC1's Verification Command checks; when the
+    AC10 root cause is identified, update this marker (and Issue #2073 AC1's
+    text/VC) together rather than leaving a stale "unresolved" claim here.
     """
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
