@@ -39,8 +39,6 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 
 _HERE = Path(__file__).resolve().parent
 _SCRIPTS_DIR = _HERE.parent / "scripts"
