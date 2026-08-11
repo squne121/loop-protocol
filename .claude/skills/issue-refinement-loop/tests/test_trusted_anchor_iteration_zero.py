@@ -263,6 +263,7 @@ def test_bounded_contract_update_handoff_retains_only_parent_routing_fields():
     )
     assert handoff == {
         "status": "rebased",
+        "disposition": "patch",
         "writes": 1,
         "iterations": 1,
         "final_readback": "verified",

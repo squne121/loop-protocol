@@ -30,7 +30,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 # ---------------------------------------------------------------------------
 # LOOP_REWRITE_ROUTER_STATE_V1 schema constants
@@ -43,6 +43,13 @@ ROUTE_CONTINUE_REWRITE = "continue_rewrite"
 ROUTE_PROCEED_TO_REVIEW = "proceed_to_review"
 ROUTE_HUMAN_JUDGMENT_REQUIRED = "human_judgment_required"
 ROUTE_CATEGORY_WIDE_REMEDIATION = "category_wide_remediation"
+# #2048 regression: routes for the approved-scope-reframe / empty-operations
+# router (decide_scope_reframe_contract_route below). ROUTE_CONTRACT_UPDATE
+# is the normal outcome (operations[] is non-empty, a section-bound patch
+# plan can be built). ROUTE_ISSUE_EDITOR_REQUIRED is the full-body-rewrite
+# fallback used when operations[] is empty despite an approved scope reframe.
+ROUTE_CONTRACT_UPDATE = "contract_update"
+ROUTE_ISSUE_EDITOR_REQUIRED = "issue_editor_required"
 
 # Reason codes
 REASON_CODE_MAX_ATTEMPTS_EXCEEDED = "max_attempts_exceeded"
@@ -56,6 +63,14 @@ REASON_CODE_REPEATED_FIX_CATEGORY_REMEDIATION = (
 )
 REASON_CODE_FIX_CATEGORY_UNDECIDABLE = "fix_category_undecidable"
 REASON_CODE_FINGERPRINT_DUPLICATE = "rewrite_request_fingerprint_duplicate"
+# #2048 regression (follow-up to #1877/PR #1884): an approved scope reframe
+# (approved_by_trusted_anchor + non-empty allowed_path_deltas) whose derived
+# operations[] is empty requires a full contract/body rewrite; routing this
+# case to contract_update would produce a no-progress retry loop because
+# there is no section-bound patch to apply.
+REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE = (
+    "approved_scope_requires_full_contract_rewrite"
+)
 REASON_CODE_NULL = None
 
 
@@ -652,6 +667,372 @@ def decide_rewrite_route(state: LOOP_REWRITE_ROUTER_STATE_V1) -> RouteResult:
     last_mutation_kind=state.last_mutation_kind,
     budget_debit=state.budget_debit
     )
+
+
+# ---------------------------------------------------------------------------
+# #2048 regression: approved scope reframe with empty operations[] router
+# ---------------------------------------------------------------------------
+#
+# Follow-up to #1877/PR #1884 (trusted anchor patch plan consumer). When a
+# scope reframe has been approved by a trusted anchor
+# (scope_delta_status == "approved_by_trusted_anchor") AND carries a
+# non-empty allowed_path_deltas, but the derived CONTRACT_PATCH_PLAN_V1
+# operations[] is empty (no section-bound append operation could be
+# derived -- a full body rewrite is required instead), routing to
+# contract_update would keep re-issuing a no-progress patch-plan mutation
+# against the same Issue body / anchor comment. This router instead routes
+# to issue_editor_required (reason_code:
+# approved_scope_requires_full_contract_rewrite) so the full-body-rewrite
+# path (issue-editor skill) is used, and de-dupes both the no-progress
+# contract_update retry (AC2) and the scope-reframe comment post (AC3) via
+# a stable empty_operations_fingerprint.
+
+
+@dataclass
+class SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1:
+    """
+    Input state for decide_scope_reframe_contract_route().
+
+    Fields:
+        scope_delta_status: Status string from SCOPE_DELTA_AUTHORITY_V1 /
+            scope_signal_guard_decision_v2 (e.g. "approved_by_trusted_anchor").
+
+        allowed_path_deltas: The Allowed Paths delta list attached to the
+            approved scope reframe. Non-empty means the reframe expanded /
+            constrained the Allowed Paths in a way that requires a contract
+            update route (as opposed to a no-op replay).
+
+        operations: The CONTRACT_PATCH_PLAN_V1 operations[] list derived by
+            scope_signal_delta.derive_contract_patch_operations(). Empty
+            means no section-bound append operation could be derived and a
+            full body rewrite is required.
+
+        anchor_comment_url: The trusted anchor comment URL that approved the
+            scope reframe. Part of the no-progress / duplicate-comment
+            fingerprint identity.
+
+        issue_body_sha256: SHA256 of the current Issue body. Part of the
+            fingerprint identity so a fresh body edit invalidates prior
+            no-progress suppression.
+
+        previous_empty_operations_fingerprints: History of
+            empty_operations_fingerprint values already observed for this
+            anchor/body-sha combination (AC2 no-progress retry detection).
+
+    Note (PR #2057 OWNER review P1-2): this route never posts a
+    scope-reframe comment (`comment_action` on the result is always
+    "none"), so there is no comment-fingerprint history field here.
+    """
+
+    scope_delta_status: str
+    allowed_path_deltas: list = field(default_factory=list)
+    operations: list = field(default_factory=list)
+    anchor_comment_url: Optional[str] = None
+    issue_body_sha256: Optional[str] = None
+    previous_empty_operations_fingerprints: list = field(default_factory=list)
+
+
+@dataclass
+class ScopeReframeRouteResult:
+    """Terminal result from decide_scope_reframe_contract_route()."""
+
+    route: str
+    reason_code: Optional[str]
+    empty_operations_fingerprint: Optional[str]
+    # AC2: True when this exact fingerprint has already been seen -- callers
+    # MUST NOT re-issue a no-progress contract_update command in this case.
+    no_progress_retry_suppressed: bool
+    # P1-2 (PR #2057 OWNER review): this transition never posts a
+    # scope-reframe comment to the Issue.  A prior `should_post_comment` /
+    # `duplicate_comment` pair depended on fingerprint history the
+    # production caller never threaded through
+    # (`posted_scope_reframe_comment_fingerprints` was test-only), so
+    # `should_post_comment: true` was reachable on a fresh process and
+    # contradicted AC3 ("no new scope-reframe comment"). `comment_action` is
+    # unconditionally "none" -- callers MUST NOT post a comment for this
+    # route. If replay-safe comment suppression is needed in the future, it
+    # must be re-added backed by persisted transaction-identity state (see
+    # Issue #2048 PR #2057 review), not an in-memory optional list.
+    comment_action: str = "none"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "scope_reframe_route_result/v1",
+            "route": self.route,
+            "reason_code": self.reason_code,
+            "empty_operations_fingerprint": self.empty_operations_fingerprint,
+            "no_progress_retry_suppressed": self.no_progress_retry_suppressed,
+            "comment_action": self.comment_action,
+        }
+
+
+_APPROVED_SCOPE_REFRAME_STATUS = "approved_by_trusted_anchor"
+
+
+def compute_empty_operations_fingerprint(
+    anchor_comment_url: Optional[str],
+    issue_body_sha256: Optional[str],
+) -> str:
+    """
+    AC2: Deterministic fingerprint identifying a specific
+    (anchor_comment_url, issue_body_sha256) empty-operations occurrence.
+
+    Two invocations with the same anchor comment and the same Issue body
+    SHA256 always produce the same fingerprint, so a re-run of the loop
+    against an unchanged Issue body/anchor can be recognized as a
+    no-progress retry (AC2) and its scope-reframe comment recognized as a
+    duplicate (AC3) rather than posted again.
+    """
+    payload = json.dumps(
+        {
+            "anchor_comment_url": anchor_comment_url,
+            "issue_body_sha256": issue_body_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    import hashlib
+
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def decide_scope_reframe_contract_route(
+    state: SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1,
+) -> ScopeReframeRouteResult:
+    """
+    AC1: route an approved scope reframe with empty operations[] to
+    issue_editor_required instead of contract_update.
+
+    An approved scope reframe is defined as
+    scope_delta_status == "approved_by_trusted_anchor" AND a non-empty
+    allowed_path_deltas. When operations[] is also empty (no section-bound
+    patch plan could be derived), a full body rewrite is required and this
+    function returns ROUTE_ISSUE_EDITOR_REQUIRED with reason_code
+    approved_scope_requires_full_contract_rewrite (AC1).
+
+    AC2: the returned empty_operations_fingerprint is stable for a given
+    (anchor_comment_url, issue_body_sha256) pair. When that fingerprint is
+    already present in previous_empty_operations_fingerprints,
+    no_progress_retry_suppressed is True -- callers must NOT re-issue a
+    no-progress contract_update command for this occurrence.
+
+    AC3 (revised, PR #2057 OWNER review P1-2): this route never posts a
+    scope-reframe comment. `comment_action` is always "none" on the returned
+    result -- see `ScopeReframeRouteResult.comment_action` docstring.
+
+    In every other case (not an approved scope reframe, or operations[] is
+    non-empty), this function returns ROUTE_CONTRACT_UPDATE with
+    reason_code None -- the normal section-bound patch-plan path is
+    unaffected (#1877's existing implementation is preserved).
+    """
+    is_approved_scope_reframe = (
+        state.scope_delta_status == _APPROVED_SCOPE_REFRAME_STATUS
+        and bool(state.allowed_path_deltas)
+    )
+    empty_operations = not state.operations
+
+    if not (is_approved_scope_reframe and empty_operations):
+        return ScopeReframeRouteResult(
+            route=ROUTE_CONTRACT_UPDATE,
+            reason_code=None,
+            empty_operations_fingerprint=None,
+            no_progress_retry_suppressed=False,
+        )
+
+    empty_operations_fingerprint = compute_empty_operations_fingerprint(
+        state.anchor_comment_url, state.issue_body_sha256
+    )
+    no_progress_retry_suppressed = (
+        empty_operations_fingerprint in state.previous_empty_operations_fingerprints
+    )
+
+    return ScopeReframeRouteResult(
+        route=ROUTE_ISSUE_EDITOR_REQUIRED,
+        reason_code=REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE,
+        empty_operations_fingerprint=empty_operations_fingerprint,
+        no_progress_retry_suppressed=no_progress_retry_suppressed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR #2057 OWNER REQUEST_CHANGES (P0-1): single canonical scope-reframe
+# disposition classifier.
+#
+# Before this, `invalid` input (malformed operations/allowed_path_deltas,
+# anchor binding mismatch, parser/import failure, an unavailable patch-plan
+# producer) had no distinct observable outcome: it silently collapsed into
+# either `blocked` (consumer) or ordinary `no_change` (via
+# `_extract_validated_scope_delta_deltas()` returning `None` on ANY failure,
+# valid or invalid alike), and the planner echo coerced a non-list
+# `operations` to `[]` instead of failing closed. This function is now the
+# ONLY place that decides `patch` / `proven_no_change` / `full_rewrite_
+# required` / `invalid`; both the trusted-anchor consumer
+# (`run_refinement_preflight.consume_trusted_anchor_contract_patch_plan`)
+# and the read-only planner echo
+# (`plan_refinement_loop._compute_scope_reframe_rewrite_route`) call this
+# SAME function on the SAME inputs so they cannot disagree (regression test:
+# planner/consumer parity).
+# ---------------------------------------------------------------------------
+
+Disposition = Literal["patch", "proven_no_change", "full_rewrite_required", "invalid"]
+
+REASON_INVALID_PATCH_PLAN_PRODUCER_UNAVAILABLE = "invalid_patch_plan_producer_unavailable"
+REASON_INVALID_OPERATIONS_KEY_MISSING = "invalid_operations_key_missing"
+REASON_INVALID_OPERATIONS_NOT_LIST = "invalid_operations_not_list"
+REASON_INVALID_ALLOWED_PATH_DELTAS_NOT_LIST = "invalid_allowed_path_deltas_not_list"
+REASON_INVALID_BLANK_DELTA = "invalid_blank_delta_entry"
+REASON_INVALID_ANCHOR_BINDING_MISMATCH = "invalid_anchor_binding_mismatch"
+REASON_INVALID_SOURCE_EVIDENCE_BINDING_MISMATCH = "invalid_source_evidence_binding_mismatch"
+REASON_INVALID_ALLOWED_PATHS_PARSER_UNAVAILABLE = "invalid_allowed_paths_parser_unavailable"
+REASON_NOT_SCOPE_REFRAME = "not_scope_reframe"
+REASON_PROVEN_NO_CHANGE = "scope_reframe_deltas_already_reflected"
+REASON_PATCH_OPERATIONS_DERIVED = "scope_reframe_operations_derived"
+
+
+@dataclass(frozen=True)
+class ScopeReframeDecision:
+    """Terminal, transaction-local classification result.
+
+    `route`/`empty_operations_fingerprint`/`no_progress_retry_suppressed`/
+    `comment_action` are only meaningful for `disposition in
+    {"patch", "full_rewrite_required"}` derived from an approved scope
+    reframe; they are `None`/defaults for `proven_no_change` (no route
+    decision needed -- nothing to write) and `invalid` (fail closed, no
+    route at all -- `route` is always `None` for `invalid`).
+    """
+
+    disposition: Disposition
+    reason_code: str
+    route: Optional[str] = None
+    empty_operations_fingerprint: Optional[str] = None
+    no_progress_retry_suppressed: bool = False
+    comment_action: str = "none"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "scope_reframe_decision/v1",
+            "disposition": self.disposition,
+            "reason_code": self.reason_code,
+            "route": self.route,
+            "empty_operations_fingerprint": self.empty_operations_fingerprint,
+            "no_progress_retry_suppressed": self.no_progress_retry_suppressed,
+            "comment_action": self.comment_action,
+        }
+
+
+def classify_scope_reframe_disposition(
+    *,
+    scope_delta_status: Optional[str],
+    operations_key_present: bool,
+    operations: Any,
+    allowed_path_deltas_raw: Any,
+    anchor_binding_ok: bool = True,
+    patch_plan_producer_available: bool = True,
+    source_evidence_binding_ok: bool = True,
+    reflected_status: str = "invalid_or_unavailable",
+    anchor_comment_url: Optional[str] = None,
+    issue_body_sha256: Optional[str] = None,
+    previous_empty_operations_fingerprints: Optional[list] = None,
+) -> ScopeReframeDecision:
+    """Single canonical pure-function scope-reframe disposition classifier.
+
+    Args (all caller-supplied facts; this function does no I/O and performs
+    no re-classification of already-computed evidence):
+        scope_delta_status: raw status string from the scope-delta decision
+            (e.g. `SCOPE_DELTA_AUTHORITY_EVIDENCE_V1.route` /
+            `scope_signal_guard_decision_v2`), or `None`/absent.
+        operations_key_present: True iff the patch-plan-like object the
+            caller is classifying actually HAS an `operations` key (as
+            opposed to a caller synthesizing `[]` because no plan exists at
+            all -- callers MUST NOT set this True for a synthesized-from-
+            absence value).
+        operations: the raw `operations` value (must be a `list` to be
+            valid; anything else, including `None`, is `invalid`).
+        allowed_path_deltas_raw: the raw (unvalidated)
+            `allowed_path_deltas` value. `None` means "no scope-reframe
+            delta at all" (ordinary patch-plan consumer, not a scope
+            reframe). A non-`list` non-`None` value is `invalid`. Any
+            blank/whitespace-only string entry is `invalid`.
+        anchor_binding_ok: False when the anchor URL/hash/trust binding the
+            caller independently verified does NOT match this transaction
+            (anchor drift / TOCTOU) -> `invalid`.
+        patch_plan_producer_available: False when the patch-plan producer
+            (parser/import) failed or is unavailable -> `invalid`. This is
+            the ONLY channel through which "no patch plan could be
+            produced" reaches this function; it must never be inferred by
+            synthesizing `operations=[]` from an absent plan.
+        source_evidence_binding_ok: False when the source evidence bound to
+            the plan does not match the anchor/body this transaction is
+            classifying -> `invalid`.
+        reflected_status: `"present"` | `"absent"` | `"invalid_or_unavailable"`
+            -- the tri-state Allowed Paths postcondition result (see
+            `run_refinement_preflight._check_scope_reframe_deltas_reflected`).
+            `"invalid_or_unavailable"` (parser failure, or not yet computed)
+            is `invalid`, never silently treated as `"absent"`.
+
+    Returns a frozen `ScopeReframeDecision`. `invalid` is reachable ONLY
+    through explicit, named preconditions above -- never as a fallback for
+    an unrecognized combination (any input this function does not
+    explicitly classify as `invalid`, `proven_no_change`, or
+    `full_rewrite_required` is `patch`, matching the pre-#2048 no-op-safe
+    default of leaving the ordinary section-bound patch-plan path
+    untouched).
+    """
+    if not patch_plan_producer_available:
+        return ScopeReframeDecision("invalid", REASON_INVALID_PATCH_PLAN_PRODUCER_UNAVAILABLE)
+    if not operations_key_present:
+        return ScopeReframeDecision("invalid", REASON_INVALID_OPERATIONS_KEY_MISSING)
+    if not isinstance(operations, list):
+        return ScopeReframeDecision("invalid", REASON_INVALID_OPERATIONS_NOT_LIST)
+    if allowed_path_deltas_raw is not None and not isinstance(allowed_path_deltas_raw, list):
+        return ScopeReframeDecision("invalid", REASON_INVALID_ALLOWED_PATH_DELTAS_NOT_LIST)
+
+    normalized_deltas: list[str] = []
+    if isinstance(allowed_path_deltas_raw, list):
+        for item in allowed_path_deltas_raw:
+            if not isinstance(item, str) or not item.strip():
+                return ScopeReframeDecision("invalid", REASON_INVALID_BLANK_DELTA)
+            normalized_deltas.append(item)
+
+    if not anchor_binding_ok:
+        return ScopeReframeDecision("invalid", REASON_INVALID_ANCHOR_BINDING_MISMATCH)
+    if not source_evidence_binding_ok:
+        return ScopeReframeDecision("invalid", REASON_INVALID_SOURCE_EVIDENCE_BINDING_MISMATCH)
+
+    is_approved_scope_reframe = (
+        scope_delta_status == _APPROVED_SCOPE_REFRAME_STATUS and bool(normalized_deltas)
+    )
+    if not is_approved_scope_reframe:
+        return ScopeReframeDecision("patch", REASON_NOT_SCOPE_REFRAME, route=ROUTE_CONTRACT_UPDATE)
+
+    if reflected_status == "invalid_or_unavailable":
+        return ScopeReframeDecision("invalid", REASON_INVALID_ALLOWED_PATHS_PARSER_UNAVAILABLE)
+    if reflected_status == "present":
+        return ScopeReframeDecision("proven_no_change", REASON_PROVEN_NO_CHANGE, route=ROUTE_CONTRACT_UPDATE)
+
+    # reflected_status == "absent": delegate the operations-empty / fingerprint
+    # / no-progress-retry math to decide_scope_reframe_contract_route() so
+    # there is exactly one implementation of that logic.
+    route_state = SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1(
+        scope_delta_status=scope_delta_status or "",
+        allowed_path_deltas=normalized_deltas,
+        operations=list(operations),
+        anchor_comment_url=anchor_comment_url,
+        issue_body_sha256=issue_body_sha256,
+        previous_empty_operations_fingerprints=list(previous_empty_operations_fingerprints or []),
+    )
+    route_result = decide_scope_reframe_contract_route(route_state)
+    if route_result.route == ROUTE_ISSUE_EDITOR_REQUIRED:
+        return ScopeReframeDecision(
+            "full_rewrite_required",
+            route_result.reason_code or REASON_CODE_APPROVED_SCOPE_REQUIRES_FULL_CONTRACT_REWRITE,
+            route=ROUTE_ISSUE_EDITOR_REQUIRED,
+            empty_operations_fingerprint=route_result.empty_operations_fingerprint,
+            no_progress_retry_suppressed=route_result.no_progress_retry_suppressed,
+            comment_action=route_result.comment_action,
+        )
+    return ScopeReframeDecision("patch", REASON_PATCH_OPERATIONS_DERIVED, route=ROUTE_CONTRACT_UPDATE)
 
 
 # ---------------------------------------------------------------------------

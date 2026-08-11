@@ -64,6 +64,7 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 from decide_rewrite_route import (  # noqa: E402
     LOOP_REWRITE_ROUTER_STATE_V1,
     SCHEMA_VERSION,
+    ROUTE_PROCEED_TO_REVIEW,
     load_rewrite_router_state,
     save_rewrite_router_state,
     validate_state_dict,
@@ -110,6 +111,44 @@ _STATE_ALLOWLIST = frozenset({
 def _sha256_of_body(body: str) -> str:
     """Compute sha256 hex digest of the issue body text (UTF-8 encoded)."""
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# #2048 AC4: implementation_allowed gate
+# ---------------------------------------------------------------------------
+#
+# After a rewrite mutation is applied (contract_update / issue_editor_required
+# style body or title change), implementation must stay blocked until BOTH:
+#   1. the mutated Issue body AND title have been read back from GitHub and
+#      confirmed to match what was intended to be written (readback), and
+#   2. a FRESH review/preflight run has completed against that readback
+#      snapshot (a stale pre-mutation review/preflight result must not be
+#      reused to unlock implementation).
+# This is fail-closed: any missing/false confirmation keeps
+# implementation_allowed False, and route != proceed_to_review always keeps
+# it False regardless of readback state.
+
+
+def compute_implementation_allowed(
+    *,
+    route: "str | None",
+    body_readback_confirmed: bool,
+    title_readback_confirmed: bool,
+    fresh_review_preflight_completed: bool,
+) -> bool:
+    """
+    AC4: implementation_allowed stays False until body/title readback is
+    confirmed against the mutated Issue AND a fresh review/preflight has
+    completed. Fail-closed: missing confirmation, a non-proceed_to_review
+    route, or an unconfirmed readback/preflight all keep this False.
+    """
+    if route != ROUTE_PROCEED_TO_REVIEW:
+        return False
+    return bool(
+        body_readback_confirmed
+        and title_readback_confirmed
+        and fresh_review_preflight_completed
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +556,24 @@ def main(argv: list[str] | None = None) -> None:
         help="AC10: Kind of mutation applied (semantic_rewrite/format_only_repair/no_change). "
              "format_only_repair does not consume budget (budget_debit=0).",
     )
+    parser.add_argument(
+        "--body-readback-confirmed",
+        action="store_true",
+        help="AC4: 直近の mutation 後に body を再取得(readback)し期待値と一致したことを確認済み。"
+             "未指定時は False（fail-closed）。",
+    )
+    parser.add_argument(
+        "--title-readback-confirmed",
+        action="store_true",
+        help="AC4: 直近の mutation 後に title を再取得(readback)し期待値と一致したことを確認済み。"
+             "未指定時は False（fail-closed）。",
+    )
+    parser.add_argument(
+        "--fresh-review-preflight-completed",
+        action="store_true",
+        help="AC4: readback 後の body/title に対して fresh review/preflight が完了済み。"
+             "未指定時は False（fail-closed）。",
+    )
     args = parser.parse_args(argv)
 
     if args.issue and not args.repo:
@@ -626,7 +683,16 @@ def main(argv: list[str] | None = None) -> None:
     )
     save_rewrite_router_state(state_obj, args.state_path)
 
-    # Step 10: Emit RouteResult JSON to stdout
+    # Step 10: AC4 — compute implementation_allowed (fail-closed until
+    # body/title readback + fresh review/preflight are confirmed complete).
+    route_result["implementation_allowed"] = compute_implementation_allowed(
+        route=route_result.get("route"),
+        body_readback_confirmed=args.body_readback_confirmed,
+        title_readback_confirmed=args.title_readback_confirmed,
+        fresh_review_preflight_completed=args.fresh_review_preflight_completed,
+    )
+
+    # Step 11: Emit RouteResult JSON to stdout
     print(json.dumps(route_result, ensure_ascii=False, indent=2))
     sys.exit(0)
 

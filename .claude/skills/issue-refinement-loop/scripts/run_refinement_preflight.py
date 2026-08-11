@@ -1880,6 +1880,23 @@ def _bounded_contract_update_handoff(consumer_result: dict[str, Any]) -> dict[st
     This intentionally retains only the phase outcome needed by the parent
     orchestrator.  Source bodies, candidate bodies, operation identities, and
     transaction payloads remain local to the controlled phase.
+
+    PR #2057 OWNER REQUEST_CHANGES revision (P0-2 / P1-3): the returned dict
+    now carries an explicit ``disposition`` (patch / proven_no_change /
+    full_rewrite_required / invalid, echoing the single canonical
+    classifier) alongside ``status``, and TWO status values that used to
+    collapse into an existing enum member now have their own outcome:
+
+    - An `invalid` disposition (malformed/binding-mismatched scope-delta
+      decision) is `status: failed` with `disposition: invalid` -- distinct
+      from an ordinary `no_change`/`proven_no_change` outcome, which it
+      previously matched byte-for-byte.
+    - A `full_rewrite_required` disposition (approved scope reframe, empty
+      operations[], not yet reflected) is `status: handoff_required` --
+      NOT `failed`. No write was ever attempted (`writes` stays 0); this is
+      a legitimate control transfer to issue-editor, not a mutation
+      failure. `final_readback` is `not_applicable` (nothing was written,
+      so there is nothing to read back -- never a synthesized `verified`).
     """
     raw_status = consumer_result.get("status")
     states = consumer_result.get("states")
@@ -1888,6 +1905,42 @@ def _bounded_contract_update_handoff(consumer_result: dict[str, Any]) -> dict[st
     fresh = consumer_result.get("fresh_checks")
     if not isinstance(fresh, dict):
         fresh = {}
+    rewrite_route = consumer_result.get("rewrite_route")
+    disposition_sidecar = consumer_result.get("disposition")
+
+    if raw_status == "invalid" or (
+        isinstance(disposition_sidecar, dict) and disposition_sidecar.get("disposition") == "invalid"
+    ):
+        reason_code = (
+            disposition_sidecar.get("reason_code")
+            if isinstance(disposition_sidecar, dict)
+            else "invalid_scope_delta_decision"
+        )
+        return {
+            "status": "failed",
+            "disposition": "invalid",
+            "writes": 0,
+            "iterations": int(iterations) if isinstance(iterations, int) else 0,
+            "final_readback": "not_applicable",
+            "fresh_preflight": "unavailable",
+            "fresh_review": "unavailable",
+            "fresh_readiness": "unavailable",
+            "reason_code": reason_code,
+        }
+
+    if isinstance(rewrite_route, dict) and rewrite_route.get("route") == "issue_editor_required":
+        return {
+            "status": "handoff_required",
+            "disposition": "full_rewrite_required",
+            "writes": 0,
+            "iterations": 0,
+            "final_readback": "not_applicable",
+            "fresh_preflight": str(fresh.get("preflight", "unavailable")),
+            "fresh_review": str(fresh.get("review", "unavailable")),
+            "fresh_readiness": str(fresh.get("readiness", "unavailable")),
+            "reason_code": rewrite_route.get("reason_code"),
+        }
+
     # A completed transaction is not an implementation authorization.  The
     # post-update rerun is a six-gate conjunction: missing, warn, or failing
     # checks must fail the phase even though the controlled write itself
@@ -1907,8 +1960,10 @@ def _bounded_contract_update_handoff(consumer_result: dict[str, Any]) -> dict[st
         status = state if state in {"applied", "no_change", "rebased"} else "failed"
     else:
         status = "failed"
+    disposition = "patch" if raw_status == "applied" else ("proven_no_change" if raw_status == "no_change" else None)
     return {
         "status": status,
+        "disposition": disposition,
         "writes": int(consumer_result.get("writes", 0)) if isinstance(consumer_result.get("writes", 0), int) else 0,
         "iterations": int(iterations) if isinstance(iterations, int) else 0,
         "final_readback": "verified" if raw_status in {"applied", "no_change"} else "failed",
@@ -2307,6 +2362,157 @@ def _build_scope_delta_authority_evidence(
     }
 
 
+# ---------------------------------------------------------------------------
+# #2048 Scope Delta: consumer-boundary scope-reframe disposition helpers
+# ---------------------------------------------------------------------------
+
+
+def _classify_scope_delta_decision(
+    *,
+    known_context: Optional[dict[str, Any]],
+    anchor_url: str,
+    anchor_body: str,
+) -> "tuple[str, list[str] | None]":
+    """Classify `known_context["scope_delta_decision"]` into a tri-state.
+
+    Returns ``(kind, deltas)`` where ``kind`` is one of:
+
+    - ``"absent"``: no scope-reframe decision was supplied at all (this is
+      an ordinary, non-scope-reframe patch-plan consumer call --
+      `deltas` is `None`).
+    - ``"invalid"``: a decision IS present but fails validation or binding
+      (malformed `allowed_path_deltas` type/blank entries, or an
+      anchor URL/hash mismatch against THIS consumer call's anchor/body).
+      PR #2057 OWNER review P0-1: this is a DISTINCT outcome from
+      ``"absent"`` -- the pre-fix implementation collapsed both into the
+      same ``None`` return, so an invalid decision was silently treated as
+      an ordinary no-op (`proven_no_change`-equivalent) instead of
+      `invalid`.
+    - ``"valid"``: `deltas` is the validated non-empty ``list[str]``, bound
+      to this anchor URL and anchor body hash.
+    """
+    if not isinstance(known_context, dict):
+        return "absent", None
+    decision = known_context.get("scope_delta_decision")
+    if not isinstance(decision, dict):
+        return "absent", None
+    if decision.get("status") != "approved_by_trusted_anchor":
+        return "absent", None
+    deltas = decision.get("allowed_path_deltas")
+    if deltas is None:
+        return "absent", None
+    if not isinstance(deltas, list):
+        return "invalid", None
+    if not deltas:
+        # An explicit empty list is not a scope-reframe signal at all
+        # (consistent with `classify_scope_reframe_disposition()`'s own
+        # `is_approved_scope_reframe = ... and bool(normalized_deltas)`
+        # gate) -- "absent", not "invalid". Only a non-list type or a
+        # blank/whitespace entry WITHIN a non-empty list is `invalid`.
+        return "absent", None
+    if not all(isinstance(item, str) and item.strip() for item in deltas):
+        return "invalid", None
+    if decision.get("anchor_comment_url") != anchor_url:
+        return "invalid", None
+    if decision.get("anchor_comment_hash") != _sha256(anchor_body):
+        return "invalid", None
+    return "valid", list(deltas)
+
+
+def _extract_validated_scope_delta_deltas(
+    *,
+    known_context: Optional[dict[str, Any]],
+    anchor_url: str,
+    anchor_body: str,
+) -> "list[str] | None":
+    """Back-compat wrapper: returns the validated deltas, or `None` for
+    both `"absent"` and `"invalid"` (callers that only need existence, not
+    the distinction, e.g. the run_preflight() empty-patch-plan-synthesis
+    gate). See `_classify_scope_delta_decision()` for the tri-state form
+    that `consume_trusted_anchor_contract_patch_plan()` uses to distinguish
+    `invalid` from an ordinary absent decision.
+    """
+    _, deltas = _classify_scope_delta_decision(
+        known_context=known_context, anchor_url=anchor_url, anchor_body=anchor_body
+    )
+    return deltas
+
+
+def _normalize_scope_reframe_delta_literal(raw: str) -> str:
+    """Strip bullet/backtick decoration from an `allowed_path_deltas` entry.
+
+    `ANCHOR_SCOPE_REFRAME_V1.allowed_path_deltas` entries are free-form
+    strings (see `anchor_scope_reframe_v1.schema.json`); in practice trusted
+    anchors write them as Markdown bullet items (e.g.
+    ``"- `docs/x.md`"``). This normalizes to a bare path/pattern comparable
+    against `baseline_vc_preflight.extract_allowed_paths()` output.
+    """
+    text = raw.strip()
+    for prefix in ("- ", "* ", "+ "):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    return text.strip("`").strip()
+
+
+def _check_scope_reframe_deltas_reflected(
+    *,
+    current_body: str,
+    allowed_path_deltas: list[str],
+) -> str:
+    """#2048 / PR #2057 OWNER review P1-5: tri-state Allowed Paths
+    postcondition check.
+
+    Returns one of:
+      - ``"present"``: every `allowed_path_deltas` entry is present in the
+        canonical `## Allowed Paths` section's EXACT normalized set (real
+        `proven_no_change` disposition).
+      - ``"absent"``: the canonical parser loaded successfully but at least
+        one delta entry is not in the exact set (real
+        `full_rewrite_required` candidate, pending the empty-operations
+        classifier).
+      - ``"invalid_or_unavailable"``: the canonical parser could not be
+        loaded/executed, OR `allowed_path_deltas` is empty. Never silently
+        treated as "absent" -- the caller's classifier maps this to
+        `invalid`, since "the rewrite may already be reflected but we could
+        not check" must never authorize a full-body-rewrite handoff, nor a
+        false proven-satisfied no-op.
+
+    The previous implementation additionally accepted
+    ``normalized_delta in current_body`` (a whole-body substring fallback)
+    whenever the delta was not found in the canonical Allowed Paths section.
+    That fallback is REMOVED: it could match a delta literal that only
+    appears in `## Outcome`, `## Notes`, a fenced code block, prose, or as a
+    substring of an unrelated longer path, misclassifying `full_rewrite_
+    required` as `proven_no_change`. Only the canonical section's exact
+    normalized set is used.
+    """
+    if not allowed_path_deltas:
+        return "invalid_or_unavailable"
+    try:
+        import importlib.util
+
+        baseline_path = (
+            _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "baseline_vc_preflight.py"
+        )
+        baseline_spec = importlib.util.spec_from_file_location(
+            "scope_reframe_allowed_paths_baseline", baseline_path
+        )
+        if baseline_spec is None or baseline_spec.loader is None:
+            return "invalid_or_unavailable"
+        baseline_module = importlib.util.module_from_spec(baseline_spec)
+        baseline_spec.loader.exec_module(baseline_module)
+        existing = set(baseline_module.extract_allowed_paths(current_body) or [])
+    except Exception:
+        return "invalid_or_unavailable"
+    normalized_existing = {_normalize_scope_reframe_delta_literal(path) for path in existing}
+    for delta in allowed_path_deltas:
+        normalized_delta = _normalize_scope_reframe_delta_literal(delta)
+        if not normalized_delta or normalized_delta not in normalized_existing:
+            return "absent"
+    return "present"
+
+
 def consume_trusted_anchor_contract_patch_plan(
     *,
     repo: str,
@@ -2318,6 +2524,7 @@ def consume_trusted_anchor_contract_patch_plan(
     contract_patch_plan: dict,
     callbacks: Optional[dict[str, Any]] = None,
     known_context: Optional[dict[str, Any]] = None,
+    patch_plan_producer_available: bool = True,
 ) -> dict:
     """Connect an approved patch plan to the controlled transaction lane.
 
@@ -2331,6 +2538,64 @@ def consume_trusted_anchor_contract_patch_plan(
 
     callbacks = callbacks or {}
     temporary_paths: list[Path] = []
+
+    # #2048 Scope Delta: `contract_patch_plan["operations"]` must be a real
+    # list. A malformed type (not a list) is never coerced to `[]` -- that
+    # would silently treat an invalid/untyped payload as an ordinary no-op
+    # replay. Fail closed instead: no rewrite_route classification, no
+    # mutation attempt.
+    _raw_operations = contract_patch_plan.get("operations", [])
+    if not isinstance(_raw_operations, list):
+        return {
+            "status": "blocked",
+            "failure": "contract_patch_plan_operations_not_list",
+            "writes": 0,
+            "iterations": 0,
+        }
+
+    # #2048 Scope Delta: join the trusted structured scope-reframe
+    # classification (`known_context["scope_delta_decision"]`, produced by
+    # `_classify_anchor_scope_reframe()` further up the call chain) to this
+    # consumer boundary. This is the ONLY production call site that invokes
+    # `run_trusted_anchor_iteration_zero()`'s `allowed_path_deltas` /
+    # `scope_delta_status` kwargs -- without this join, an approved scope
+    # reframe with empty `operations[]` could never reach the classifier
+    # from `contract_update.run.with_*` (the #2048 PR review blocker across
+    # iteration 1/2/3). PR #2057 OWNER review P0-1: `_classify_scope_delta_
+    # decision()` returns a tri-state (absent/invalid/valid) so a decision
+    # that IS present but binding-mismatched is `invalid`, never silently
+    # treated the same as "no scope reframe at all".
+    _decision_kind, _validated_allowed_path_deltas = _classify_scope_delta_decision(
+        known_context=known_context,
+        anchor_url=anchor_url,
+        anchor_body=anchor_body,
+    )
+    if _decision_kind == "invalid":
+        return {
+            "status": "invalid",
+            "disposition": {
+                "schema_version": "scope_reframe_decision/v1",
+                "disposition": "invalid",
+                "reason_code": "invalid_scope_delta_decision_binding",
+            },
+            "writes": 0,
+            "iterations": 0,
+        }
+    # PR #2057 OWNER review P1-4/P1-5: the Allowed-Paths-reflected tri-state
+    # is intentionally NOT computed here against `issue["body"]` (the
+    # pre-fetch snapshot passed into this function). It is computed by
+    # `run_trusted_anchor_iteration_zero()` itself, against a FRESH
+    # `fetch_current()` re-read, immediately before it decides between
+    # `proven_no_change` and `full_rewrite_required` -- closing the TOCTOU
+    # window where the Issue body could have been edited (by a concurrent
+    # issue-editor write reflecting the very delta this call is
+    # classifying) between this consumer being invoked and the disposition
+    # being decided.
+    def _reflected_checker(fresh_body: str) -> str:
+        return _check_scope_reframe_deltas_reflected(
+            current_body=fresh_body,
+            allowed_path_deltas=_validated_allowed_path_deltas or [],
+        )
 
     def fetch_current() -> tuple[dict, dict]:
         injected = callbacks.get("fetch_current")
@@ -2584,6 +2849,12 @@ def consume_trusted_anchor_contract_patch_plan(
             fetch_current=fetch_current,
             apply_transaction=apply_transaction,
             fresh_checks=fresh_checks,
+            allowed_path_deltas=_validated_allowed_path_deltas,
+            scope_delta_status=(
+                "approved_by_trusted_anchor" if _validated_allowed_path_deltas else None
+            ),
+            reflected_checker=_reflected_checker,
+            patch_plan_producer_available=patch_plan_producer_available,
         )
     finally:
         for path in temporary_paths:
@@ -2718,6 +2989,12 @@ def run_preflight(
     anchor_body_for_consumer: Optional[str] = None
     anchor_url_for_consumer: Optional[str] = None
     contract_update_handoff: Optional[dict[str, Any]] = None
+    # #2048 Scope Delta: True when the trusted-anchor consumer detected a
+    # full_rewrite_required disposition (approved scope reframe, empty
+    # operations[], not yet reflected in the current body). Overrides
+    # next_action to issue_editor_required and keeps this transition out of
+    # the ordinary contract-update success/failure blocker path.
+    contract_update_route_issue_editor_required: bool = False
 
     # --- Load data (fixture or live gh) ---
     if fixture_path is not None:
@@ -3164,6 +3441,31 @@ def run_preflight(
         sidecar = plan.get("scope_signal_guard_decision_v2")
         authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else None
         patch_plan = authority.get("contract_patch_plan") if isinstance(authority, dict) else None
+        # PR #2057 OWNER review (iteration 4, blocker 3 / P0-1 residual):
+        # `authority` (the freeform SCOPE_DELTA_AUTHORITY_EVIDENCE_V1
+        # producer's `classify_scope_delta_authority()` result) is `None`
+        # in two distinct cases that must NOT be conflated: (a) the
+        # freeform evidence builder (`_build_scope_delta_authority_
+        # evidence()`, invoked earlier in this same `run_preflight()` call
+        # for this same anchor comment) itself failed -- structural anchor
+        # URL mismatch or a `scope_signal_delta` parser/import failure --
+        # even though the STRUCTURED `ANCHOR_SCOPE_REFRAME_V1` parser
+        # succeeded (this branch only runs once that structured parser has
+        # already validated a non-empty `allowed_path_deltas`); or (b) the
+        # evidence builder succeeded and `classify_scope_delta_authority()`
+        # ran to completion but reached an ordinary business decision that
+        # is not `contract_update_required` (e.g. `human_escalation` for a
+        # purely-structured, non-freeform-directive anchor comment -- the
+        # common, legitimate case this branch was originally written for).
+        # `known_context["scope_delta_authority_evidence"]` is only set
+        # when the evidence builder succeeded (see the `_kc[...] = [...]`
+        # assignment above in this function), so its presence distinguishes
+        # (a) -- genuine "patch-plan producer unavailable", fail closed to
+        # `invalid` -- from (b), left untouched (`True`).
+        _patch_plan_producer_available = (
+            isinstance(known_context, dict)
+            and "scope_delta_authority_evidence" in known_context
+        )
         if (
             not isinstance(patch_plan, dict)
             and anchor_payload_for_consumer is not None
@@ -3181,6 +3483,66 @@ def run_preflight(
                 known_context=known_context,
             )
         if (
+            not isinstance(patch_plan, dict)
+            and anchor_payload_for_consumer is not None
+            and anchor_body_for_consumer is not None
+            and anchor_url_for_consumer is not None
+            and _extract_validated_scope_delta_deltas(
+                known_context=known_context,
+                anchor_url=anchor_url_for_consumer,
+                anchor_body=anchor_body_for_consumer,
+            )
+        ):
+            # #2048 Scope Delta: an approved trusted-anchor scope reframe
+            # (structured ANCHOR_SCOPE_REFRAME_V1, non-empty
+            # allowed_path_deltas) has no operations[] producer of its own --
+            # the freeform scope_delta_authority classifier only emits a
+            # contract_patch_plan when it can extract an exact "allowed
+            # paths" literal (an ambiguous/no-literal directive fails closed
+            # to human_escalation instead), and the noop-satisfied fallback
+            # above requires a non-empty, already-applied operations[].
+            # Without this synthesis an approved scope reframe whose deltas
+            # cannot be expressed as a section-bound append would never reach
+            # the consumer at all (patch_plan stays None and the mutation
+            # phase falls into the unconditional "no safe action" failure
+            # branch below) -- the exact #2048 PR review regression this
+            # Issue's Scope Delta targets. Synthesize a schema-valid,
+            # EMPTY-operations CONTRACT_PATCH_PLAN_V1 (never a new field, an
+            # ordinary instance of the existing schema) only when the
+            # validated decision is bound to THIS anchor/body -- the
+            # consumer boundary re-validates the same binding independently.
+            #
+            # PR #2057 OWNER review P0-1 (fully resolved via
+            # `patch_plan_producer_available`, iteration 4 blocker 3 -- see
+            # `consume_trusted_anchor_contract_patch_plan()` above and
+            # `test_producer_unavailable_reaches_invalid_disposition_via_
+            # production_consumer` / `test_producer_available_default_true_
+            # preserves_full_rewrite_required` in
+            # `test_preflight_run_with_anchor.py`): this synthesis is
+            # additionally gated on `_classify_scope_delta_decision()`
+            # returning `"valid"`, which requires the STRUCTURED
+            # `ANCHOR_SCOPE_REFRAME_V1` payload (`_classify_anchor_scope_
+            # reframe()`, a schema-validating, anchor-URL/hash-bound parser
+            # distinct from the FREEFORM `SCOPE_DELTA_AUTHORITY_EVIDENCE_V1`
+            # classifier that separately produces `contract_patch_plan` /
+            # `human_escalation`) to have explicitly parsed and validated
+            # `status: approve_scope_delta`. `operations: []` here reflects
+            # that the structured reframe payload carries no operations
+            # concept by construction (it conveys `allowed_path_deltas`
+            # only) -- it is NOT synthesized merely because "no patch plan
+            # exists"; a `contract_patch_plan_operations_not_list` /
+            # `invalid_operations_key_missing` classification is never
+            # reachable through this branch specifically because
+            # `operations` is always populated here.
+            from scope_signal_delta import build_contract_patch_plan_v1
+
+            patch_plan = build_contract_patch_plan_v1(
+                target_issue_number=issue_number,
+                base_issue_body_sha256=_sha256(issue.get("body", "")),
+                source_evidence=[],
+                operations=[],
+            )
+        if (
             isinstance(patch_plan, dict)
             and anchor_payload_for_consumer is not None
             and anchor_body_for_consumer is not None
@@ -3196,9 +3558,27 @@ def run_preflight(
                 contract_patch_plan=patch_plan,
                 callbacks=contract_update_callbacks,
                 known_context=known_context,
+                patch_plan_producer_available=_patch_plan_producer_available,
             )
             contract_update_handoff = _bounded_contract_update_handoff(consumer_result)
-            if contract_update_handoff.get("status") not in {"applied", "no_change", "rebased"}:
+            _rewrite_route = (
+                consumer_result.get("rewrite_route") if isinstance(consumer_result, dict) else None
+            )
+            contract_update_route_issue_editor_required = (
+                isinstance(_rewrite_route, dict) and _rewrite_route.get("route") == "issue_editor_required"
+            )
+            if contract_update_route_issue_editor_required:
+                # PR #2057 OWNER review P0-2/P1-3: a full_rewrite_required
+                # disposition is a legitimate routing outcome, not a failed
+                # mutation attempt -- no write was ever attempted
+                # (operations[] was empty). `_bounded_contract_update_
+                # handoff()` already projects this as the distinct
+                # `status: handoff_required` (never `failed`, never
+                # `no_change`); this branch intentionally does NOT overwrite
+                # it and does NOT append BLOCKER_FAIL_CLOSED -- the dedicated
+                # next_action override below carries the signal instead.
+                pass
+            elif contract_update_handoff.get("status") not in {"applied", "no_change", "rebased"}:
                 blockers.append(BLOCKER_FAIL_CLOSED)
         else:
             # The explicit mutation phase has no safe action without a
@@ -3451,6 +3831,19 @@ def run_preflight(
         next_action = "human_judgment_required"
     else:
         next_action = "fix_environment"
+
+    # #2048 Scope Delta: an approved trusted-anchor scope reframe whose
+    # operations[] is empty AND is not yet reflected in the current body
+    # (full_rewrite_required) is routed to issue_editor_required regardless
+    # of the ordinary status-derived next_action above. This is the ONLY
+    # code path that projects `consume_trusted_anchor_contract_patch_plan()`'s
+    # `rewrite_route` all the way to the wrapper's stdout / result artifact
+    # `next_action` -- the previous #2048 iterations computed
+    # `decide_scope_reframe_contract_route()` but never reached this
+    # projection because the classification was unreachable from this
+    # consumer boundary (see `_extract_validated_scope_delta_deltas()`).
+    if contract_update_route_issue_editor_required:
+        next_action = "issue_editor_required"
 
     # --- Compute hashes for byte-stability (after all blockers finalized) ---
     snapshot_text = json.dumps(raw_snapshot, sort_keys=True, ensure_ascii=False, allow_nan=False)
