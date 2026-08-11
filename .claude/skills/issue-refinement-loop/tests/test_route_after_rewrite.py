@@ -69,9 +69,13 @@ from route_after_rewrite import (  # noqa: E402
     _sha256_of_body,
     _build_state_dict,
     _STATE_ALLOWLIST,
+    compute_implementation_allowed,
 )
 from decide_rewrite_route import (  # noqa: E402
     LOOP_REWRITE_ROUTER_STATE_V1,
+    ROUTE_PROCEED_TO_REVIEW,
+    ROUTE_CONTINUE_REWRITE,
+    ROUTE_HUMAN_JUDGMENT_REQUIRED,
     load_rewrite_router_state,
     validate_state_dict,
 )
@@ -614,6 +618,132 @@ class TestRouteAfterRewrireCli:
             f"returncode={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
         )
 
+
+
+# ---------------------------------------------------------------------------
+# #2048 AC4: implementation_allowed stays False until body/title readback
+# and a fresh review/preflight have completed (follow-up to #1877/PR #1884)
+# ---------------------------------------------------------------------------
+
+
+class TestIssue2048ImplementationAllowedReadbackGate:
+    def test_proceed_to_review_with_all_confirmations_allows_implementation(self):
+        allowed = compute_implementation_allowed(
+            route=ROUTE_PROCEED_TO_REVIEW,
+            body_readback_confirmed=True,
+            title_readback_confirmed=True,
+            fresh_review_preflight_completed=True,
+        )
+        assert allowed is True
+
+    def test_proceed_to_review_without_body_readback_blocks_implementation(self):
+        allowed = compute_implementation_allowed(
+            route=ROUTE_PROCEED_TO_REVIEW,
+            body_readback_confirmed=False,
+            title_readback_confirmed=True,
+            fresh_review_preflight_completed=True,
+        )
+        assert allowed is False
+
+    def test_proceed_to_review_without_title_readback_blocks_implementation(self):
+        allowed = compute_implementation_allowed(
+            route=ROUTE_PROCEED_TO_REVIEW,
+            body_readback_confirmed=True,
+            title_readback_confirmed=False,
+            fresh_review_preflight_completed=True,
+        )
+        assert allowed is False
+
+    def test_proceed_to_review_without_fresh_preflight_blocks_implementation(self):
+        allowed = compute_implementation_allowed(
+            route=ROUTE_PROCEED_TO_REVIEW,
+            body_readback_confirmed=True,
+            title_readback_confirmed=True,
+            fresh_review_preflight_completed=False,
+        )
+        assert allowed is False
+
+    def test_non_proceed_route_blocks_implementation_even_with_all_confirmations(self):
+        for route in (ROUTE_CONTINUE_REWRITE, ROUTE_HUMAN_JUDGMENT_REQUIRED, None):
+            allowed = compute_implementation_allowed(
+                route=route,
+                body_readback_confirmed=True,
+                title_readback_confirmed=True,
+                fresh_review_preflight_completed=True,
+            )
+            assert allowed is False, f"route={route} must not allow implementation"
+
+    def test_cli_default_keeps_implementation_allowed_false(self, tmp_path):
+        """AC4: without the readback/preflight flags, the CLI must default to
+        implementation_allowed: false (fail-closed) even on proceed_to_review."""
+        pass_fixture = _REVIEW_ISSUE_FIXTURES / "pass_issue.md"
+        if not pass_fixture.exists():
+            pytest.skip("pass_issue.md fixture not found")
+
+        artifact = tmp_path / "artifact.json"
+        artifact.write_text(
+            json.dumps(
+                {
+                    "schema_version": "refinement_preflight_result/v1",
+                    "required_sections": [],
+                    "required_contract_keys": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        state_path = str(tmp_path / "state.json")
+        proc = subprocess.run(
+            [
+                sys.executable, str(_WRAPPER_SCRIPT),
+                "--file", str(pass_fixture),
+                "--state-path", state_path,
+                "--max-rewrite-attempts", "3",
+                "--artifact-path", str(artifact),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        route_result = json.loads(proc.stdout)
+        assert route_result.get("route") == "proceed_to_review"
+        assert route_result.get("implementation_allowed") is False
+
+    def test_cli_all_flags_set_allows_implementation_on_proceed_to_review(self, tmp_path):
+        """AC4: explicit readback/preflight confirmation flags unlock implementation_allowed."""
+        pass_fixture = _REVIEW_ISSUE_FIXTURES / "pass_issue.md"
+        if not pass_fixture.exists():
+            pytest.skip("pass_issue.md fixture not found")
+
+        artifact = tmp_path / "artifact.json"
+        artifact.write_text(
+            json.dumps(
+                {
+                    "schema_version": "refinement_preflight_result/v1",
+                    "required_sections": [],
+                    "required_contract_keys": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        state_path = str(tmp_path / "state.json")
+        proc = subprocess.run(
+            [
+                sys.executable, str(_WRAPPER_SCRIPT),
+                "--file", str(pass_fixture),
+                "--state-path", state_path,
+                "--max-rewrite-attempts", "3",
+                "--artifact-path", str(artifact),
+                "--body-readback-confirmed",
+                "--title-readback-confirmed",
+                "--fresh-review-preflight-completed",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        route_result = json.loads(proc.stdout)
+        assert route_result.get("route") == "proceed_to_review"
+        assert route_result.get("implementation_allowed") is True
 
 
 # ---------------------------------------------------------------------------

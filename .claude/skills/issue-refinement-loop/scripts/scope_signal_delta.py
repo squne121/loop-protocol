@@ -20,6 +20,33 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
+# #2048 regression follow-up (#1877/PR #1884): decide_scope_reframe_contract_route()
+# lives in the sibling decide_rewrite_route.py module and is consumed here so an
+# approved trusted-anchor scope reframe whose derived operations[] is empty is
+# routed to issue_editor_required from the actual production call path
+# (run_trusted_anchor_iteration_zero(), invoked by run_refinement_preflight.py's
+# contract_update.run.with_anchor lane) instead of only existing as an
+# unreferenced unit-tested function.
+try:
+    from decide_rewrite_route import (
+        SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1,
+        decide_scope_reframe_contract_route,
+        classify_scope_reframe_disposition,
+        ROUTE_ISSUE_EDITOR_REQUIRED,
+    )
+    _SCOPE_REFRAME_ROUTER_IMPORT_FAILED = False
+except ImportError:  # pragma: no cover - sibling module should always be importable
+    SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1 = None
+    decide_scope_reframe_contract_route = None
+    classify_scope_reframe_disposition = None
+    ROUTE_ISSUE_EDITOR_REQUIRED = "issue_editor_required"
+    # PR #2057 OWNER review P2: a safety-critical routing dependency import
+    # failure must surface as `environment_failure`, never as an ordinary
+    # no-change/no-op continuation. `run_trusted_anchor_iteration_zero()`
+    # checks this flag and fails closed instead of silently omitting the
+    # `rewrite_route` annotation.
+    _SCOPE_REFRAME_ROUTER_IMPORT_FAILED = True
+
 SCHEMA_VERSION = "scope_signal_delta/v1"
 
 REASON_NEW_IN_SCOPE = "new_in_scope_area"
@@ -1287,6 +1314,11 @@ def run_trusted_anchor_iteration_zero(
     fetch_current,
     apply_transaction=None,
     fresh_checks=None,
+    allowed_path_deltas: "list | None" = None,
+    scope_delta_status: "str | None" = None,
+    previous_empty_operations_fingerprints: "list | None" = None,
+    reflected_checker=None,
+    patch_plan_producer_available: bool = True,
 ) -> dict:
     """Execute the bounded, callback-based trusted-anchor path.
 
@@ -1294,21 +1326,132 @@ def run_trusted_anchor_iteration_zero(
     body drift is rebased once; trust/anchor changes and postcondition failure
     are fail-closed.  This function neither creates durable state nor writes
     directly to GitHub.
+
+    #2048 / PR #2057 OWNER REQUEST_CHANGES revision: `allowed_path_deltas` /
+    `scope_delta_status` / `previous_empty_operations_fingerprints` /
+    `reflected_checker` are optional and default to a no-op (no
+    `allowed_path_deltas`) so existing callers that do not pass them keep the
+    pre-#2048 "no_change" behavior byte-for-byte.
+
+    When a caller DOES pass a non-empty `allowed_path_deltas` (signalling
+    this is an approved Allowed Paths scope reframe, not an ordinary
+    contract-key patch) and the candidate body is unchanged (no section-bound
+    write would occur), this function:
+
+    1. Calls `fetch_current()` FIRST -- P0-2/P1-4 fix: a stale pre-fetch
+       classification could not detect a concurrent anchor edit/trust
+       revocation or an Issue body already carrying the approved delta (the
+       write path already does this before `apply_transaction`; the no-op
+       path previously did not, so `fresh_checks` ran against
+       pre-mutation/pre-reread state and issue-editor mutation authority
+       could be handed off on stale evidence).
+    2. Re-validates anchor identity/trust against the FRESH anchor.
+    3. Computes the Allowed-Paths-reflected tri-state via `reflected_checker`
+       against the FRESH body (never the pre-fetch `issue` argument).
+    4. Calls the single canonical
+       `decide_rewrite_route.classify_scope_reframe_disposition()` and
+       annotates the result with `rewrite_route` (disposition
+       `full_rewrite_required`) or `disposition` (disposition `invalid`).
+       `proven_no_change`/`patch` leave the result as an ordinary `no_change`
+       no-op (no annotation) -- callers branch on the annotation's presence,
+       never construct one themselves.
+
+    `scope_delta_status` is REQUIRED (no longer defaults to
+    `"approved_by_trusted_anchor"`) whenever `allowed_path_deltas` is
+    non-empty: PR #2057 OWNER review P2 flagged that a caller passing deltas
+    but forgetting the status argument would previously be silently treated
+    as an approved reframe.
+
+    `patch_plan_producer_available` (PR #2057 OWNER review, iteration 4
+    blocker 3): threaded straight into
+    `decide_rewrite_route.classify_scope_reframe_disposition()`'s own
+    kwarg of the same name. `False` means the freeform
+    `SCOPE_DELTA_AUTHORITY_EVIDENCE_V1` producer (`classify_scope_delta_
+    authority()`) ran and explicitly could NOT produce an automated patch
+    plan for this evidence (`route.action == "human_escalation"`) --
+    distinct from "no freeform evidence was ever supplied" (default
+    `True`). The caller (`run_refinement_preflight.consume_trusted_anchor_
+    contract_patch_plan()`) computes this from the freeform authority
+    sidecar BEFORE synthesizing an empty-operations patch plan from the
+    structured `ANCHOR_SCOPE_REFRAME_V1` evidence alone, so a producer that
+    declined to act is never silently reclassified as a legitimate
+    `full_rewrite_required`.
     """
     normalized = normalize_trusted_anchor_iteration_zero(
         repo=repo, issue_number=issue_number, anchor=anchor, source_body=anchor_body
     )
     if not normalized["accepted"]:
         return {"status": "blocked", **normalized, "writes": 0, "iterations": 0}
+    if allowed_path_deltas and scope_delta_status is None:
+        return {
+            "status": "blocked",
+            "failure": "scope_delta_status_required_when_allowed_path_deltas_present",
+            "writes": 0,
+            "iterations": 0,
+        }
     current = dict(issue)
     rebases = 0
     while True:
+        operations = patch_plan.get("operations", [])
         candidate = build_section_aware_candidate_body(
             body=current.get("body", ""),
-            operations=patch_plan.get("operations", []),
+            operations=operations,
             source_identity=normalized["source_identity"],
         )
         if not candidate["changed"]:
+            if allowed_path_deltas:
+                if _SCOPE_REFRAME_ROUTER_IMPORT_FAILED or classify_scope_reframe_disposition is None:
+                    return {
+                        "status": "environment_failure",
+                        "failure": "scope_reframe_router_import_failed",
+                        "writes": 0,
+                        "iterations": 0,
+                    }
+                fresh_issue, fresh_anchor = fetch_current()
+                fresh_anchor_body = fresh_anchor.get("body", anchor_body)
+                fresh_normalized = normalize_trusted_anchor_iteration_zero(
+                    repo=repo, issue_number=issue_number, anchor=fresh_anchor, source_body=fresh_anchor_body
+                )
+                if (
+                    not fresh_normalized["accepted"]
+                    or fresh_normalized["source_identity"] != normalized["source_identity"]
+                ):
+                    return {
+                        "status": "blocked",
+                        "states": _iteration_zero_states(directive_acceptance="rejected", contract_update="failed"),
+                        "failure": "anchor_identity_or_trust_changed",
+                        "writes": 0,
+                        "iterations": 0,
+                    }
+                fresh_body = fresh_issue.get("body", "")
+                reflected_status = (
+                    reflected_checker(fresh_body) if reflected_checker is not None else "invalid_or_unavailable"
+                )
+                decision = classify_scope_reframe_disposition(
+                    scope_delta_status=scope_delta_status,
+                    operations_key_present=True,
+                    operations=list(operations),
+                    allowed_path_deltas_raw=list(allowed_path_deltas),
+                    reflected_status=reflected_status,
+                    anchor_comment_url=anchor.get("html_url") or anchor.get("comment_url"),
+                    issue_body_sha256=_sha256(fresh_body),
+                    previous_empty_operations_fingerprints=previous_empty_operations_fingerprints,
+                    patch_plan_producer_available=patch_plan_producer_available,
+                )
+                result = {
+                    "status": "invalid" if decision.disposition == "invalid" else "no_change",
+                    "states": _iteration_zero_states(contract_update="no_change"),
+                    "writes": 0,
+                    "iterations": 0,
+                    **candidate,
+                }
+                if decision.disposition == "full_rewrite_required":
+                    result["rewrite_route"] = decision.to_dict()
+                elif decision.disposition == "invalid":
+                    result["disposition"] = decision.to_dict()
+                if fresh_checks is not None:
+                    result["fresh_checks"] = fresh_checks(fresh_issue)
+                return result
             result = {
                 "status": "no_change",
                 "states": _iteration_zero_states(contract_update="no_change"),
