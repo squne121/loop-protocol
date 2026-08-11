@@ -1,6 +1,6 @@
 # `test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_proof` flake — root cause（Issue #2073）
 
-**状態:** 緩和済み・未解消（serial lane 分離により再現頻度は低下したが、根本原因は未解消。詳細は下記「2026-08 再検証（PR #2068 CI）」参照）
+**状態:** 緩和策適用済み・根本原因未解消（serial lane 分離を一時期の 2 回 green という実績はあるが、その後 3 回連続で再発しており、failure rate が統計的に低下したとまでは言えない。mitigation retained, effectiveness not established。詳細は下記「2026-08 再検証（PR #2068 CI）」参照）
 **関連 Issue:** #2073
 
 ## 症状
@@ -131,29 +131,53 @@ timeout 経路が発生した可能性は事実上排除される。
 
 一方、preflight 側の証跡（`pid_proof_preflight.json`）は正常に書き込まれて
 いる（テストは先にこのファイルを読んでおり、そこでは失敗していない）。
-これは preflight プロセス自体は正常に起動・実行され、`_invoke_planner()`
-の呼び出しまで到達していることを意味する。
 
-以上から、失敗の実体は次のいずれかである可能性が高い:
+**訂正（P1-1）:** `_splice_pid_proof_harness()`
+（`scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py`
+664-700行目）は、preflight・planner **両方**のスクリプトについて、元の
+`if __name__ == "__main__": main()` を「harness コード（証跡保存）→
+`main()` 呼び出し」の順に書き換える。つまり証跡は `main()` が呼ばれる
+**前**に保存される。したがって `pid_proof_preflight.json` が存在する
+ことは「preflight プロセスが Python の module top-level を通過し
+entry guard に到達した」ことだけを証明しており、preflight の `main()`
+の argument parsing・fixture load・validation・repair・planner-input
+assembly・`_invoke_planner()` への到達のいずれも証明しない。上記の
+「preflight プロセス自体は正常に起動・実行され `_invoke_planner()` の
+呼び出しまで到達している」という記述は誤りであり、ここに訂正する。
 
-- planner subprocess 自体が起動していない（`_invoke_planner()` 内部の
+以上から、失敗の実体は次のいずれかである可能性が高い（少なくとも以下を
+候補として含む）:
+
+- (a) planner を起動できない（`_invoke_planner()` 内部の
   `subprocess.run()` 呼び出し前に何らかの early return / 例外分岐がある）
-- planner subprocess は起動したが、ハーネスの harness コードが実行される
-  前に即座に終了している（0.26 秒という短時間の失敗と整合する）
+- (b) planner が harness コード実行前に終了している（0.26 秒という
+  短時間の失敗と整合する）
+- (c) preflight `main()` 内で、planner invocation より前の処理
+  （argument parsing・fixture load・validation・repair・
+  planner-input assembly 等）で `_invoke_planner()` に到達する前に
+  終了している
+- (d) planner invocation の入力準備（`_join_scope_rollup_into_planner_input`
+  等）で例外が発生している
+- (e) planner subprocess の spawn 自体が失敗している（`subprocess.run()`
+  が `OSError` 等を送出する経路）
+- (f) planner の module top-level import で failure が起きている
+  （harness splice 前の import 文で例外）
 
-この 2 つの可能性のいずれであるかは未確定であり、確定させるには
-`_invoke_planner()` 呼び出し直前・直後の状態と planner subprocess 自身の
-`returncode` / `stdout` / `stderr` を独立に観測できる診断情報が必要である
-（本 Issue の Scope 2「テストへの診断情報追加」を参照）。
+これらのいずれであるかは未確定であり、確定させるには `_invoke_planner()`
+呼び出し直前・直後の状態と planner subprocess 自身の `returncode` /
+`stdout` / `stderr` を独立に観測できる診断情報が必要である（本 Issue の
+Scope 2「テストへの診断情報追加」を参照）。
 
 ### 現時点のステータス
 
 - inner `PLANNER_TIMEOUT`（60秒）仮説: **実測（0.26秒での失敗）により事実上棄却**
 - outer timeout（`timeout_seconds: 120`）仮説: 既存文書のとおり `SKILL_RUNTIME_FAIL`
   が観測されないため引き続き除外
-- 根本原因: **未解消**。serial lane 分離は再現頻度を下げる緩和策として機能して
-  いるが、CI フル並列負荷が唯一の要因ではないことが今回の再検証で判明した
-  （serial lane 分離後の再現）。
+- 根本原因: **未解消**。serial lane 分離は一時期 2 回連続 green だった
+  実績はあるが、その後 3 回連続で再発しており、この分離が再現頻度を
+  統計的に下げているとまでは言えない（mitigation retained, effectiveness
+  not established）。CI フル並列負荷が唯一の要因ではないことが今回の
+  再検証で判明した（serial lane 分離後の再現）。
 - 次のアクション: 本 Issue で追加する診断情報（executor の `returncode` /
   `stdout` / `stderr`）を用いた次回の再現時に、planner subprocess が
   起動したかどうかを直接確認する。
