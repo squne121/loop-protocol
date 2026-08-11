@@ -188,6 +188,9 @@ jobs:
       - name: Independently re-verify producer artifacts (base-locked evaluator)
         id: verify
         if: ${{ steps.pr.outputs.pr_number != '' && steps.trusted.outcome == 'success' }}
+        # Keep publishing after a semantic rejection. `outcome` remains
+        # `failure` while continuation lets the publisher classify that result.
+        continue-on-error: true
         env:
           EXPECTED_HEAD_SHA: ${{ steps.pr.outputs.live_head_sha }}
           EXPECTED_BASE_SHA: ${{ steps.trusted.outputs.live_base_sha }}
@@ -195,7 +198,7 @@ jobs:
           EXPECTED_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           ARTIFACT_ROOT: ${{ steps.download.outputs.artifact_root }}
         run: |
-          set +e
+          set -euo pipefail
           DECISION_FILE="${ARTIFACT_ROOT}/decision/visual_impact_decision_v1.json"
           EVIDENCE_FILE="${ARTIFACT_ROOT}/evidence/visual_baseline_review_evidence_v2.json"
           [ -f "${DECISION_FILE}" ] || DECISION_FILE=""
@@ -221,8 +224,7 @@ jobs:
             --changed-paths-typed-file artifacts/trusted/changed_paths_typed.json \
             "${EXTRA_ARGS[@]}" \
             --verdict-output verdict.json
-          echo "verify_exit_code=$?" >> "$GITHUB_OUTPUT"
-          cat verdict.json || true
+          cat verdict.json
 
       - name: Publish visual-impact-policy-trusted CheckRun bound to candidate PR head
         if: ${{ always() }}
@@ -234,7 +236,6 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           TRUSTED_OUTCOME: ${{ steps.trusted.outcome }}
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
-          VERIFY_EXIT_CODE: ${{ steps.verify.outputs.verify_exit_code || '' }}
         run: |
           set -euo pipefail
           # AC37: bind to the candidate PR's exact CURRENT (freshly
@@ -255,15 +256,17 @@ jobs:
             elif [ "${TRUSTED_OUTCOME}" != "success" ]; then
               CONCLUSION="failure"
               SUMMARY="visual-impact-policy-trusted: trusted_input_derivation_failed; verifier_not_run for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
-            elif [ "${VERIFY_EXIT_CODE}" = "0" ]; then
+            elif [ "${VERIFY_OUTCOME}" = "success" ]; then
               CONCLUSION="success"
               SUMMARY="visual-impact-policy-trusted: producer VISUAL_IMPACT_DECISION_V1 artifact and evidence manifest independently re-verified for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
-            elif [ "${VERIFY_OUTCOME}" != "success" ] || [ -z "${VERIFY_EXIT_CODE}" ]; then
-              CONCLUSION="failure"
-              SUMMARY="visual-impact-policy-trusted: verifier_not_run after trusted input derivation for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
-            else
+            elif [ "${VERIFY_OUTCOME}" = "failure" ]; then
               CONCLUSION="failure"
               SUMMARY="visual-impact-policy-trusted: producer_artifact_verification_rejected for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
+            else
+              # `skipped`, `cancelled`, or an absent outcome has no semantic
+              # verifier result and is not an artifact rejection.
+              CONCLUSION="failure"
+              SUMMARY="visual-impact-policy-trusted: verifier_not_run after trusted input derivation for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
             fi
           fi
           gh api "repos/${REPO}/check-runs" \

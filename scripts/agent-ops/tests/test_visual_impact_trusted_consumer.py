@@ -476,14 +476,39 @@ def test_trusted_fetch_uses_checkout_managed_credentials(workflow_doc: dict):
     assert "GH_TOKEN" not in trusted["run"]
 
 
-def test_checkrun_distinguishes_trusted_input_failure_from_artifact_rejection(workflow_doc: dict):
-    """AC4: a skipped verifier is never reported as an artifact semantic rejection."""
+def test_trusted_failure_blocks_verifier_using_pre_continue_on_error_outcome(workflow_doc: dict):
+    """GIVEN trusted derivation fails, WHEN continuation is enabled, THEN verifier stays skipped."""
     steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
     verify = next(step for step in steps if step.get("id") == "verify")
     publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
 
     assert "steps.trusted.outcome == 'success'" in verify["if"]
+    assert "steps.trusted.conclusion" not in verify["if"]
     assert "TRUSTED_OUTCOME" in publish["env"]
+    assert publish["env"]["TRUSTED_OUTCOME"] == "${{ steps.trusted.outcome }}"
+
+
+def test_verifier_failure_is_artifact_rejection_not_verifier_not_run(workflow_doc: dict):
+    """GIVEN verifier ran and failed, WHEN publishing, THEN reject the producer artifact."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    verify = next(step for step in steps if step.get("id") == "verify")
+    publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
+
+    assert verify.get("continue-on-error") is True
+    assert "VERIFY_EXIT_CODE" not in publish["env"]
+    assert publish["env"]["VERIFY_OUTCOME"] == "${{ steps.verify.outcome }}"
+    assert 'elif [ "${VERIFY_OUTCOME}" = "failure" ]; then' in publish["run"]
     assert "trusted_input_derivation_failed" in publish["run"]
-    assert "verifier_not_run" in publish["run"]
     assert "producer_artifact_verification_rejected" in publish["run"]
+
+
+def test_skipped_or_cancelled_verifier_is_not_artifact_rejection(workflow_doc: dict):
+    """GIVEN verifier has no outcome, WHEN publishing, THEN report verifier_not_run."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
+    run = publish["run"]
+
+    failure_branch = run.index('elif [ "${VERIFY_OUTCOME}" = "failure" ]; then')
+    rejection_summary = run.index("producer_artifact_verification_rejected")
+    no_run_summary = run.index("verifier_not_run after trusted input derivation")
+    assert failure_branch < rejection_summary < no_run_summary
