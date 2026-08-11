@@ -71,6 +71,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--repo", help="owner/repo (省略時は git remote から取得)")
     p.add_argument("--dry-run", action="store_true", help="gh pr create を実行しない")
     p.add_argument(
+        "--link-kind",
+        choices=("auto", "Refs"),
+        default="auto",
+        help="Issue link kind。auto（既定）は Issue state に従い、Refs は caller の明示指定を保持する。",
+    )
+    p.add_argument(
         "--changed-paths",
         nargs="*",
         default=None,
@@ -553,7 +559,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_BLOCKED
 
-    link_kind = "Closes" if state == "OPEN" else "Refs"
+    # `Refs` is an explicit caller override for OPEN issues.  Keep resolving
+    # the linked Issue state first so the existing state/readback hard gate
+    # remains active for every invocation.
+    link_kind = "Refs" if args.link_kind == "Refs" else ("Closes" if state == "OPEN" else "Refs")
     final_body = apply_linked_issue_reference(original_body, args.linked_issue, link_kind)
 
     changed_paths = resolve_changed_paths(args.changed_paths)

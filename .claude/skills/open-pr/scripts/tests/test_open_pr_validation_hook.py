@@ -194,6 +194,196 @@ def test_validator_receives_final_body_with_closes_reference(monkeypatch: pytest
         Path(body_path).unlink(missing_ok=True)
 
 
+def test_link_kind_help_exposes_auto_and_refs(capsys: pytest.CaptureFixture[str]):
+    """Caller can discover the explicit Refs override from CLI help."""
+    with pytest.raises(SystemExit) as exc_info:
+        open_pr.parse_args(["--help"])
+
+    assert exc_info.value.code == 0
+    assert "--link-kind {auto,Refs}" in capsys.readouterr().out
+
+
+def test_default_open_issue_link_kind_remains_closes(monkeypatch: pytest.MonkeyPatch):
+    """The auto default keeps the existing OPEN issue Closes behavior."""
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
+    observed = {"body": "", "lines": []}
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-link-kind")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+
+        def fake_validator(body, changed_paths, linked_issue):
+            observed["body"] = body
+            return {"status": "pass", "errors": []}
+
+        monkeypatch.setattr(open_pr, "_run_pr_body_validator", fake_validator)
+        monkeypatch.setattr(
+            open_pr,
+            "_run_japanese_content_validator",
+            lambda body_text, threshold=0.1: {
+                "status": "pass",
+                "failed_blocks": 0,
+                "aggregate_ratio": 0.5,
+                "threshold": 0.1,
+                "body_sha256": "",
+                "stderr": "",
+            },
+        )
+        monkeypatch.setattr(
+            open_pr,
+            "find_existing_pr",
+            lambda repo, branch: {"number": 999, "url": "https://example.com/pr/999"},
+        )
+        monkeypatch.setattr(
+            "builtins.print",
+            lambda *args, **kwargs: observed["lines"].append(
+                kwargs.get("sep", " ").join(str(arg) for arg in args)
+            ),
+        )
+
+        rc = open_pr.main(
+            [
+                "--pr-title", "feat: test",
+                "--linked-issue", "330",
+                "--publish", "yes",
+                "--pr-body-file", body_path,
+            ]
+        )
+
+        assert rc == 0
+        assert "Closes #330" in observed["body"]
+        assert "LINK_KIND=Closes" in observed["lines"]
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
+def test_default_closed_issue_link_kind_remains_refs(monkeypatch: pytest.MonkeyPatch):
+    """The auto default keeps the existing CLOSED issue Refs behavior."""
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
+    observed = {"body": "", "lines": []}
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-link-kind")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "CLOSED")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+
+        def fake_validator(body, changed_paths, linked_issue):
+            observed["body"] = body
+            return {"status": "pass", "errors": []}
+
+        monkeypatch.setattr(open_pr, "_run_pr_body_validator", fake_validator)
+        monkeypatch.setattr(
+            open_pr,
+            "_run_japanese_content_validator",
+            lambda body_text, threshold=0.1: {
+                "status": "pass",
+                "failed_blocks": 0,
+                "aggregate_ratio": 0.5,
+                "threshold": 0.1,
+                "body_sha256": "",
+                "stderr": "",
+            },
+        )
+        monkeypatch.setattr(
+            open_pr,
+            "find_existing_pr",
+            lambda repo, branch: {"number": 999, "url": "https://example.com/pr/999"},
+        )
+        monkeypatch.setattr(
+            "builtins.print",
+            lambda *args, **kwargs: observed["lines"].append(
+                kwargs.get("sep", " ").join(str(arg) for arg in args)
+            ),
+        )
+
+        rc = open_pr.main(
+            [
+                "--pr-title", "feat: test",
+                "--linked-issue", "330",
+                "--publish", "yes",
+                "--pr-body-file", body_path,
+            ]
+        )
+
+        assert rc == 0
+        assert "Refs #330" in observed["body"]
+        assert "LINK_KIND=Refs" in observed["lines"]
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
+def test_explicit_refs_for_open_issue_preserves_refs_and_runs_preflights(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Explicit Refs wins for an OPEN issue without bypassing the PR gates."""
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md") + "\n\nRefs #330\n")
+    observed = {"body": "", "lines": [], "idempotency_calls": 0, "canonical_calls": 0}
+    try:
+        monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+        monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-link-kind")
+        monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+        monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+
+        def fake_validator(body, changed_paths, linked_issue):
+            observed["body"] = body
+            return {"status": "pass", "errors": []}
+
+        def fake_find_existing(repo, branch):
+            observed["idempotency_calls"] += 1
+            return None
+
+        def fake_canonical(repo):
+            observed["canonical_calls"] += 1
+            return repo
+
+        monkeypatch.setattr(open_pr, "_run_pr_body_validator", fake_validator)
+        monkeypatch.setattr(
+            open_pr,
+            "_run_japanese_content_validator",
+            lambda body_text, threshold=0.1: {
+                "status": "pass",
+                "failed_blocks": 0,
+                "aggregate_ratio": 0.5,
+                "threshold": 0.1,
+                "body_sha256": "",
+                "stderr": "",
+            },
+        )
+        monkeypatch.setattr(open_pr, "find_existing_pr", fake_find_existing)
+        monkeypatch.setattr(open_pr, "resolve_canonical_repository", fake_canonical)
+        monkeypatch.setattr(
+            open_pr,
+            "create_pr",
+            lambda repo, title, body_file, branch, draft: "https://example.com/pull/999",
+        )
+        monkeypatch.setattr(
+            "builtins.print",
+            lambda *args, **kwargs: observed["lines"].append(
+                kwargs.get("sep", " ").join(str(arg) for arg in args)
+            ),
+        )
+
+        rc = open_pr.main(
+            [
+                "--pr-title", "feat: test",
+                "--linked-issue", "330",
+                "--publish", "yes",
+                "--pr-body-file", body_path,
+                "--link-kind", "Refs",
+            ]
+        )
+
+        assert rc == 0
+        assert "Refs #330" in observed["body"]
+        assert "Closes #330" not in observed["body"]
+        assert observed["idempotency_calls"] == 1
+        assert observed["canonical_calls"] == 1
+        assert "LINK_KIND=Refs" in observed["lines"]
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+
+
 def test_changed_paths_unavailable(monkeypatch: pytest.MonkeyPatch):
     body_path = write_temp_body(load_fixture("valid_not_schema_change.md"))
     try:
