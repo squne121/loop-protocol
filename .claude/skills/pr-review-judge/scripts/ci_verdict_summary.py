@@ -172,6 +172,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           commit {
             oid
             statusCheckRollup {
+              id
               contexts(first: 100, after: $cursor) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
@@ -228,22 +229,43 @@ def fetch_checks(pr_number: int, repo: str) -> tuple[Optional[list], Optional[di
     raw_runs: list[dict] = []
     cursor: Optional[str] = None
     seen_cursors: set[str] = set()
+    root_commit_oid: Optional[str] = None
+    rollup_id: Optional[str] = None
     try:
         while True:
-            ok, data, raw = run_gh([
+            gh_args = [
                 "api", "graphql",
                 "-f", f"query={STATUS_CHECK_ROLLUP_QUERY}",
                 "-F", f"owner={owner}",
                 "-F", f"name={name}",
                 "-F", f"number={pr_number}",
-                "-F", f"cursor={cursor if cursor is not None else 'null'}",
-            ])
+            ]
+            if cursor is not None:
+                # GraphQL cursor は opaque String。最初の request では変数自体を
+                # 省略し、次 page 以降だけ raw-field で文字列のまま渡す。
+                gh_args.extend(["-f", f"cursor={cursor}"])
+            ok, data, raw = run_gh(gh_args)
             if not ok or data is None:
                 return None, {"kind": classify_gh_error(raw), "detail": raw[:512]}
 
             commits = data["data"]["repository"]["pullRequest"]["commits"]["nodes"]
             commit = commits[-1]["commit"]
-            contexts = commit["statusCheckRollup"]["contexts"]
+            page_commit_oid = commit["oid"]
+            rollup = commit["statusCheckRollup"]
+            if not isinstance(page_commit_oid, str) or not page_commit_oid:
+                raise ValueError("statusCheckRollup commit.oid missing or invalid")
+            if not isinstance(rollup, dict):
+                raise ValueError("statusCheckRollup root must be an object")
+            page_rollup_id = rollup["id"]
+            if not isinstance(page_rollup_id, str) or not page_rollup_id:
+                raise ValueError("statusCheckRollup id missing or invalid")
+            if root_commit_oid is None:
+                root_commit_oid = page_commit_oid
+                rollup_id = page_rollup_id
+            elif page_commit_oid != root_commit_oid or page_rollup_id != rollup_id:
+                raise ValueError("statusCheckRollup root changed during pagination")
+
+            contexts = rollup["contexts"]
             page_info = contexts["pageInfo"]
             has_next_page = page_info["hasNextPage"]
             page_runs = contexts["nodes"]
