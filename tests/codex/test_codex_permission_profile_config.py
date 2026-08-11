@@ -69,9 +69,28 @@ def _fixture_repo(tmp_path: Path) -> Path:
     `.claude/worktrees` is excluded specifically (it can recursively contain
     other checkouts of this same repo) while the rest of `.claude` (skill
     canonical bodies referenced by `.agents/skills/*`) is kept.
+
+    `.claude/artifacts` is also excluded as a fixture-local measure: it mixes
+    runtime-written volatile artifacts (e.g. files continuously rewritten by
+    `.claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py`
+    under `.claude/artifacts/issue-refinement-loop/<issue>/`) with
+    repository-committed historical/evidence assets (e.g.
+    `.claude/artifacts/context-mode/profile-scope-definition.json`). Excluding
+    it here avoids `shutil.copytree()` races against concurrent writers during
+    CI's parallel test execution; it is not a statement that `.claude/artifacts`
+    is repository-wide disposable.
     """
     dest = tmp_path / "repo"
-    exclude_relpaths = {".git", "node_modules", "dist", "coverage", "artifacts", "public", ".claude/worktrees"}
+    exclude_relpaths = {
+        ".git",
+        "node_modules",
+        "dist",
+        "coverage",
+        "artifacts",
+        "public",
+        ".claude/worktrees",
+        ".claude/artifacts",
+    }
 
     def ignore(dirpath: str, names: list[str]) -> list[str]:
         rel = os.path.relpath(dirpath, REPO_ROOT)

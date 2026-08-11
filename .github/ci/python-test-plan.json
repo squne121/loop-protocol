@@ -31,6 +31,7 @@
     "scripts/agent-ops/tests/",
     "tests/codex/test_codex_hook_surface_guard.py",
     "tests/codex/test_codex_permission_profile_config.py",
+    "tests/codex/test_fixture_repo_artifact_exclusion.py",
     "tests/codex/test_web_research_domain_allowlist.py",
     "tests/codex/test_execpolicy_matrix.py",
     "tests/codex/test_cleanup_exec_branch_only.py",
