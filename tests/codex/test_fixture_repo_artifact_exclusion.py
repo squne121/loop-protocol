@@ -50,3 +50,21 @@ def test_fixture_repo_excludes_claude_artifacts(tmp_path: Path) -> None:
         f"expected {copied_claude_dir} to exist (only .claude/artifacts and "
         ".claude/worktrees should be excluded, not all of .claude)"
     )
+
+    # AND a real, stable file elsewhere under `.claude` (a skill canonical
+    # body) was actually copied -- not merely an empty `.claude` directory
+    # left behind by a broken exclusion implementation that drops everything
+    # under `.claude` instead of just `.claude/artifacts`.
+    copied_skill_script = (
+        dest
+        / ".claude"
+        / "skills"
+        / "issue-refinement-loop"
+        / "scripts"
+        / "run_refinement_preflight.py"
+    )
+    assert copied_skill_script.is_file(), (
+        f"expected {copied_skill_script} to be copied as part of the "
+        "fixture repo, confirming .claude contents other than "
+        ".claude/artifacts are preserved"
+    )
