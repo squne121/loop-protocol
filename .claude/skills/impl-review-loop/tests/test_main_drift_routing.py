@@ -27,12 +27,18 @@ def _verdict() -> dict[str, object]:
     }
 
 
-def _live(merge_state_status: str) -> dict[str, str]:
-    return {
+def _live(
+    merge_state_status: str,
+    main_drift: dict[str, object] | None = None,
+) -> dict[str, object]:
+    value: dict[str, object] = {
         "head_sha": SHA_A,
         "mergeable": "MERGEABLE",
         "merge_state_status": merge_state_status,
     }
+    if main_drift is not None:
+        value["main_drift"] = main_drift
+    return value
 
 
 def _drift(**extra: object) -> dict[str, object]:
@@ -52,7 +58,7 @@ def _drift(**extra: object) -> dict[str, object]:
 
 
 def test_given_scope_clean_drift_when_routed_then_reconciliation_reverifies_without_spending_iteration():
-    decision = route_loop_verdict_v2(_verdict(), _live("BEHIND"), _drift())
+    decision = route_loop_verdict_v2(_verdict(), _live("BEHIND", _drift()))
 
     assert decision.route == ROUTE_SCOPE_CLEAN_RECONCILIATION
     assert decision.rerun_required == {"snapshot": True, "ci": True, "review": True}
@@ -62,8 +68,7 @@ def test_given_scope_clean_drift_when_routed_then_reconciliation_reverifies_with
 def test_given_eligible_behind_drift_when_routed_then_fast_path_avoids_reconciliation():
     decision = route_loop_verdict_v2(
         _verdict(),
-        _live("BEHIND"),
-        _drift(behind_fast_path_eligible=True),
+        _live("BEHIND", _drift(behind_fast_path_eligible=True)),
     )
 
     assert decision.route == "route_to_update_branch"
@@ -76,8 +81,7 @@ def test_given_scope_clean_drift_in_any_nonbehind_state_when_routed_then_old_evi
 ):
     decision = route_loop_verdict_v2(
         _verdict(),
-        _live(merge_state_status),
-        _drift(behind_fast_path_eligible=True),
+        _live(merge_state_status, _drift(behind_fast_path_eligible=True)),
     )
 
     assert decision.route == ROUTE_SCOPE_CLEAN_RECONCILIATION
@@ -93,8 +97,7 @@ def test_given_scope_clean_drift_in_any_nonbehind_state_when_routed_then_old_evi
 def test_given_semantic_ambiguity_when_routed_then_it_stops_without_action():
     decision = route_loop_verdict_v2(
         _verdict(),
-        _live("CLEAN"),
-        _drift(semantic_ambiguity=True),
+        _live("CLEAN", _drift(semantic_ambiguity=True)),
     )
 
     assert decision.route == ROUTE_FAIL_CLOSED

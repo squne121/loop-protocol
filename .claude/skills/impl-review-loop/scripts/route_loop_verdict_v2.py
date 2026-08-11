@@ -401,7 +401,6 @@ def _reconciliation_decision(drift: MainDriftDecision) -> RouteDecision:
 def route_loop_verdict_v2(
     reviewer_verdict: Mapping[str, Any],
     live_mergeability: Mapping[str, Any],
-    main_drift: Mapping[str, Any] | None = None,
 ) -> RouteDecision:
     """Deterministic, side-effect-free routing for impl-review-loop Step 5.
 
@@ -412,7 +411,9 @@ def route_loop_verdict_v2(
         {verdict, reviewed_head_sha, blockers, warnings}.
     live_mergeability:
         Live GitHub PR state fetched by the caller:
-        {head_sha, mergeable, merge_state_status}.
+        {head_sha, mergeable, merge_state_status}.  When current-main facts
+        are available, the caller adds them under ``main_drift`` so the
+        public two-input routing boundary remains stable.
 
     Returns
     -------
@@ -471,7 +472,10 @@ def route_loop_verdict_v2(
     # reviewer verdict or merge-state dispatch can reuse it.  A real Git
     # conflict remains the higher-priority terminal route above.
     drift_strategy: str | None = None
+    main_drift = live_mergeability.get("main_drift")
     if main_drift is not None:
+        if not isinstance(main_drift, Mapping):
+            return _fail("main_drift_context_invalid", "main drift context is incomplete")
         drift = _classify_implementation_main_drift(
             main_drift,
             reviewed_head_sha=reviewed_head_sha,
