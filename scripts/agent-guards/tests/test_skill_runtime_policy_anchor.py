@@ -558,3 +558,289 @@ def test_authority_transport_consume_reaches_real_subprocess(tmp_path: Path) -> 
     payload = json.loads(result.stdout)
     assert payload["status"] == "environment_failure", payload
     assert payload["reason_code"] == "missing_file", payload
+
+
+# ---------------------------------------------------------------------------
+# #2086 P0 fix_delta (iteration 3, OWNER REQUEST_CHANGES Blocker 1): the
+# `--investigation-evidence-transport-path` flag added to
+# `preflight.run.with_human_context` (Blocker 1/2) must be real-subprocess
+# dispatchable through the SAME unmodified production
+# `skill_runtime_exec.py` -> `skill_runtime_command_policy.py` ->
+# `command_registry.py` -> `run_refinement_preflight.py` chain proven above
+# for `authority_transport.produce`/`consume` -- not merely declared in the
+# registry. This mints a REAL manifest via `authority_transport.produce`
+# (the same real-subprocess dispatch proven by the test immediately above),
+# then feeds its path into `preflight.run.with_human_context` and asserts
+# the executor's OWN pre-dispatch exact-match parser accepts the new
+# two-token suffix (`is_exact_skill_runtime_anchor_executor_command` /
+# `_parse_exact_skill_runtime_anchor_command`) and reaches the real
+# `run_refinement_preflight.py` subprocess (no live `gh` credentials are
+# faked here, so the real subprocess's own `gh` failure path is what proves
+# genuine dispatch occurred -- the same "real subprocess owns the failure,
+# not the privileged executor's pre-dispatch rejection" pattern the
+# `authority_transport.consume` test above already established for AC10).
+# ---------------------------------------------------------------------------
+
+
+def test_investigation_evidence_transport_path_reaches_real_subprocess_ac3(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    _install_authority_transport_fixture(repo)
+
+    evidence_fixture = repo / "investigation_evidence.json"
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/2086#issuecomment-1"
+    evidence_fixture.write_text(
+        json.dumps(
+            [
+                {
+                    "comment_id": 1,
+                    "comment_url": anchor_url,
+                    "body_sha256": "0" * 64,
+                    "source_kind": "generated_by_agent",
+                    "path_literals": ["docs/dev/workflow.md"],
+                }
+            ]
+        )
+    )
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    produce_result = _run_authority_transport_executor(
+        repo,
+        [
+            "--command-id", "authority_transport.produce",
+            "--issue-number", "2086",
+            "--repo", "squne121/loop-protocol",
+            "--invocation-id", "test-ac3-invocation",
+            "--git-head-sha", head_sha,
+            "--evidence-fixture-path", "investigation_evidence.json",
+        ],
+    )
+    assert "exact command class rejected" not in produce_result.stderr, produce_result.stderr
+    assert produce_result.returncode == 0, (produce_result.returncode, produce_result.stdout, produce_result.stderr)
+    manifest_path_abs = json.loads(produce_result.stdout)["manifest_path"]
+    manifest_path = str(Path(manifest_path_abs).relative_to(repo))
+
+    preflight_result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id", "preflight.run.with_human_context",
+            "--issue-number", "2086",
+            "--repo", "squne121/loop-protocol",
+            "--anchor-comment-url", anchor_url,
+            "--investigation-evidence-transport-path", manifest_path,
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CLAUDE_PROJECT_DIR": str(repo), "LOOP_ISSUE_NUMBER": "2086"},
+        check=False,
+    )
+    assert "exact command class rejected" not in preflight_result.stderr, preflight_result.stderr
+    # The real run_refinement_preflight.py subprocess owns whatever happens
+    # next (live `gh` is not faked in this fixture) -- what this test proves
+    # is that the new flag reaches that real subprocess at all, matching the
+    # exact same "not rejected pre-dispatch" bar already established for
+    # authority_transport.produce/consume above.
+    assert preflight_result.stdout.strip() != "", (
+        preflight_result.returncode, preflight_result.stdout, preflight_result.stderr
+    )
+
+
+def test_investigation_evidence_transport_path_rejected_for_agent_report_lane_ac6(tmp_path: Path) -> None:
+    """#2086 AC6: `--investigation-evidence-transport-path` must never be
+    accepted for the `with_agent_report` lane -- it is exclusively a
+    `preflight.run.with_human_context` extension."""
+    repo = _make_repo(tmp_path)
+    _install_authority_transport_fixture(repo)
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/2086#issuecomment-1"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id", "preflight.run.with_agent_report",
+            "--issue-number", "2086",
+            "--repo", "squne121/loop-protocol",
+            "--anchor-comment-url", anchor_url,
+            "--investigation-evidence-transport-path", "some/manifest.json",
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CLAUDE_PROJECT_DIR": str(repo), "LOOP_ISSUE_NUMBER": "2086"},
+        check=False,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "only allowed for preflight.run.with_human_context" in result.stderr, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# #2086 P0 fix_delta (iteration 3, OWNER REQUEST_CHANGES Blocker 3): the
+# privileged `decide.run` router must be able to dispatch #2053's canonical
+# authority-transport verification ("Mode B") through the SAME unmodified
+# production chain the AC10 produce/consume tests above already proved for
+# the individual producer/consumer roles. This chains all THREE real
+# subprocess steps -- authority_transport.produce -> Mode B decide.run
+# (consuming the produced manifest as its sidecar) -> authority_transport.
+# consume -- entirely through `skill_runtime_exec.py`, not through
+# `command_registry.render_command()` called directly (already proven to
+# work by `test_command_registry.py`, outside this Issue's Allowed Paths).
+# ---------------------------------------------------------------------------
+
+
+def _install_decide_run_authority_e2e_fixture(repo_root: Path) -> None:
+    import shutil
+
+    for rel in (
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "scripts/agent-guards/skill_runtime_command_policy.py",
+        ".claude/skills/issue-refinement-loop/scripts/command_registry.py",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        ".claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py",
+    ):
+        _write_text(repo_root / rel, (REPO_ROOT / rel).read_text())
+
+    _write_text(
+        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
+        """from __future__ import annotations
+
+class Deadline:
+    def subprocess_timeout(self, seconds: float) -> float:
+        return seconds
+
+
+def list_worktrees(project_root: str, deadline=None):
+    return []
+
+
+def select_issue_worktree(catalog, issue_number, root_realpath):
+    return {"issue_number": issue_number, "path": root_realpath}
+""",
+    )
+    schemas_src = REPO_ROOT / ".claude" / "skills" / "issue-refinement-loop" / "schemas"
+    schemas_dst = repo_root / ".claude" / "skills" / "issue-refinement-loop" / "schemas"
+    schemas_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(schemas_src, schemas_dst)
+
+    loop_state_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / "2086"
+    loop_state_dir.mkdir(parents=True, exist_ok=True)
+    (loop_state_dir / "loop_state.json").write_text(
+        json.dumps({"iteration": 0, "max_iterations": 3})
+    )
+    worktree_dir = repo_root / ".claude" / "worktrees" / "issue-2086-decide-authority-e2e-fixture"
+    worktree_dir.mkdir(parents=True, exist_ok=True)
+    _git("add", "-A", cwd=repo_root)
+    _git("commit", "-q", "-m", "install decide.run authority e2e fixture", cwd=repo_root)
+
+
+def test_decide_run_mode_b_authority_chain_reaches_real_subprocess_ac10(tmp_path: Path) -> None:
+    """AC10 (Blocker 3): produce -> Mode B decide.run -> consume, all three
+    real-subprocess-dispatched through the unmodified privileged executor.
+    A digest-verified, current-HEAD-bound manifest makes the router's
+    `generate_router_receipt()` resolve `status: ok` -- proving Mode B
+    genuinely reaches and exercises the real authority-transport
+    verification, not merely a pre-dispatch acceptance."""
+    repo = _make_repo(tmp_path)
+    _install_decide_run_authority_e2e_fixture(repo)
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo), "LOOP_ISSUE_NUMBER": "2086"}
+
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    evidence_fixture = repo / "evidence.json"
+    evidence_fixture.write_text(json.dumps({"source_kind": "generated_by_agent"}))
+
+    produce_argv = [
+        sys.executable,
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "--command-id", "authority_transport.produce",
+        "--issue-number", "2086",
+        "--repo", "squne121/loop-protocol",
+        "--invocation-id", "test-mode-b-e2e",
+        "--git-head-sha", head_sha,
+        "--evidence-fixture-path", "evidence.json",
+    ]
+    produce_result = subprocess.run(
+        produce_argv, cwd=str(repo), capture_output=True, text=True, env=env, check=False,
+    )
+    assert "exact command class rejected" not in produce_result.stderr, produce_result.stderr
+    assert produce_result.returncode == 0, (produce_result.returncode, produce_result.stdout, produce_result.stderr)
+    manifest_path_abs = json.loads(produce_result.stdout)["manifest_path"]
+    manifest_path = str(Path(manifest_path_abs).relative_to(repo))
+
+    decide_argv = [
+        sys.executable,
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "--command-id", "decide.run",
+        "--issue-number", "2086",
+        "--repo", "squne121/loop-protocol",
+        "--loop-state-file", ".claude/artifacts/issue-refinement-loop/2086/loop_state.json",
+        "--review-result-verdict", "needs-fix",
+        "--max-iterations", "3",
+        "--authority-transport-path", manifest_path,
+        "--authority-expected",
+        "--invocation-id", "test-mode-b-e2e",
+        "--git-head-sha", head_sha,
+    ]
+    decide_result = subprocess.run(
+        decide_argv, cwd=str(repo), capture_output=True, text=True, env=env, check=False,
+    )
+    assert "exact command class rejected" not in decide_result.stderr, decide_result.stderr
+    assert decide_result.returncode == 0, (decide_result.returncode, decide_result.stdout, decide_result.stderr)
+    decide_lines = decide_result.stdout.strip().splitlines()
+    assert "STATUS: pass" in decide_lines, decide_result.stdout
+    assert not any(
+        line.startswith("BLOCKERS: authority_transport_environment_failure") for line in decide_lines
+    ), decide_result.stdout
+
+    consume_argv = [
+        sys.executable,
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "--command-id", "authority_transport.consume",
+        "--issue-number", "2086",
+        "--repo", "squne121/loop-protocol",
+        "--invocation-id", "test-mode-b-e2e",
+        "--git-head-sha", head_sha,
+        "--router-receipt-path",
+        ".claude/artifacts/issue-refinement-loop/2086/authority-transport/"
+        "test-mode-b-e2e/nonexistent_receipt.json",
+    ]
+    consume_result = subprocess.run(
+        consume_argv, cwd=str(repo), capture_output=True, text=True, env=env, check=False,
+    )
+    assert "exact command class rejected" not in consume_result.stderr, consume_result.stderr
+    consume_payload = json.loads(consume_result.stdout)
+    assert consume_payload["status"] == "environment_failure", consume_payload
+    assert consume_payload["reason_code"] == "missing_file", consume_payload
+
+
+def test_decide_run_mode_b_rejects_partial_authority_fields(tmp_path: Path) -> None:
+    """#2086 Blocker 3: Mode B's authority sub-fields are all-or-none --
+    supplying only some of them must be rejected before any subprocess is
+    spawned, never silently degrade to Mode A or partially dispatch."""
+    repo = _make_repo(tmp_path)
+    _install_decide_run_authority_e2e_fixture(repo)
+
+    partial_argv = [
+        sys.executable,
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "--command-id", "decide.run",
+        "--issue-number", "2086",
+        "--repo", "squne121/loop-protocol",
+        "--loop-state-file", ".claude/artifacts/issue-refinement-loop/2086/loop_state.json",
+        "--review-result-verdict", "needs-fix",
+        "--invocation-id", "test-mode-b-partial",
+    ]
+    result = subprocess.run(
+        partial_argv,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CLAUDE_PROJECT_DIR": str(repo), "LOOP_ISSUE_NUMBER": "2086"},
+        check=False,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "all-or-none" in result.stderr, result.stderr

@@ -813,6 +813,33 @@ _SEMANTIC_DIRECTIVE_VERB_RE = re.compile(
 )
 
 
+# #2086 P1 fix_delta (iteration 3, OWNER REQUEST_CHANGES Blocker 4):
+# `_SEMANTIC_DIRECTIVE_VERB_RE` is a lexical match -- it fires on a bare verb
+# token anywhere in a bullet, with no regard for negation or tense/aspect.
+# That means a PAST-TENSE STATUS statement ("This was fixed yesterday.") or
+# a NEGATED imperative ("We should not expand Allowed Paths.") would also be
+# promoted to `explicit`, even though neither is actually instructing a
+# scope expansion. This is the authority classifier's entry point (Design
+# Invariant #2: semantic authority must come from a genuine human
+# directive), so it must stay narrow. `_NEGATION_OR_STATUS_MARKER_RE` is
+# checked in a bounded window around each verb match; a hit anywhere in that
+# window (negation marker before/after the verb, or a perfect/passive-status
+# auxiliary before it) suppresses that match without disqualifying other,
+# unrelated verb matches later in the same bullet.
+_NEGATION_OR_STATUS_MARKER_RE = re.compile(
+    r"(?:"
+    r"\bnot\b|\bnever\b|n't\b|\bno\b|\bdon't\b|\bdo not\b|"
+    r"\bdoesn't\b|\bdoes not\b|\bwon't\b|\bwill not\b|"
+    r"\bwas\b|\bwere\b|\bhas been\b|\bhave been\b|\bhad been\b|"
+    r"\balready\b|\bpreviously\b|\byesterday\b|"
+    r"不要|しない|する必要はない|しなくてよい|しなくていい|"
+    r"済み|済んだ|済んでいる|完了済み|修正済み|対応済み|"
+    r"すでに|既に|昨日|先日"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _has_semantic_directive_bullet(text: "str | None") -> bool:
     """#2086 AC1 P1 fix_delta: does any bullet-list line in `text` carry an
     imperative directive-request verb (see `_SEMANTIC_DIRECTIVE_VERB_RE`)?
@@ -821,9 +848,20 @@ def _has_semantic_directive_bullet(text: "str | None") -> bool:
     detection is kept separate from origin-lane assertion so that an
     observation/TODO/failure-log bullet list is never conflated with an
     actual scope-expansion directive just because the comment arrived on
-    the trusted human-context lane."""
+    the trusted human-context lane.
+
+    #2086 P1 fix_delta (iteration 3, Blocker 4): a verb match is only
+    accepted as a genuine imperative/obligation directive when no negation
+    or past-tense/perfect-status marker is present in a bounded window
+    around it (`_NEGATION_OR_STATUS_MARKER_RE`) -- see that constant's
+    docstring for the failure modes this closes (negated imperative,
+    past-tense status report).
+    """
     for item in extract_directive_items(text):
-        if _SEMANTIC_DIRECTIVE_VERB_RE.search(item):
+        for match in _SEMANTIC_DIRECTIVE_VERB_RE.finditer(item):
+            window = item[max(0, match.start() - 25) : min(len(item), match.end() + 20)]
+            if _NEGATION_OR_STATUS_MARKER_RE.search(window):
+                continue
             return True
     return False
 _CONCRETE_PERMISSION_DELTA_RE = re.compile(

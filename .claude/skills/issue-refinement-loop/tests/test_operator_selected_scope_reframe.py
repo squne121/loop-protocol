@@ -411,7 +411,13 @@ def _e2e_2086_anchor_comment(body: str) -> dict:
     }
 
 
-def _e2e_2086_run_preflight(*, known_context: dict, run_id: str, tmp_path):
+def _e2e_2086_run_preflight(
+    *,
+    known_context: dict,
+    run_id: str,
+    tmp_path,
+    investigation_evidence_transport_path=None,
+):
     fixture = {
         "schema_version": "refinement_preflight_input/v1",
         "issue_number": ISSUE,
@@ -431,6 +437,7 @@ def _e2e_2086_run_preflight(*, known_context: dict, run_id: str, tmp_path):
             anchor_comment_urls=[URL],
             fixture_path=fixture_path,
             known_context=known_context,
+            investigation_evidence_transport_path=investigation_evidence_transport_path,
         )
         prov_path = _E2E_2086_ARTIFACT_DIR / "refinement_preflight_provenance_v1.json"
         assert prov_path.exists(), "provenance artifact must be written by the real run_preflight() success path"
@@ -441,31 +448,97 @@ def _e2e_2086_run_preflight(*, known_context: dict, run_id: str, tmp_path):
     return result, exit_code, provenance
 
 
+# ---------------------------------------------------------------------------
+# #2086 P0 fix_delta (iteration 3, OWNER REQUEST_CHANGES Blocker 1/Blocker 2):
+# the PRIOR version of this test hand-injected
+# `known_context["investigation_derived_path_literals"]` directly into a
+# Python API call to `run_preflight()` -- there was no CLI flag, no
+# producer, and no registry field carrying this value through the REAL
+# `skill_runtime_exec.py` -> registry-rendered argv -> subprocess chain, so
+# the positive route only ever proved the hand-injected shortcut worked, not
+# production wiring. This rewrite mints a REAL, digest-bound
+# SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest via the actual #2053 producer
+# (`preflight.generate_authority_transport_manifest`, the identical function
+# `--produce-authority-transport` / the `authority_transport.produce`
+# command_id dispatch to -- see
+# `scripts/agent-guards/tests/test_skill_runtime_policy_anchor.py::
+# test_authority_transport_produce_reaches_real_subprocess` for the
+# companion real-subprocess-dispatch proof of that producer, and
+# `test_investigation_evidence_transport_path_reaches_real_subprocess_ac3`
+# in the same file for the real-subprocess proof of the NEW
+# `preflight.run.with_human_context --investigation-evidence-transport-path`
+# flag added by this fix_delta), then drives `run_preflight()`'s new
+# `investigation_evidence_transport_path` parameter -- the SAME parameter
+# `main()`'s new `--investigation-evidence-transport-path` CLI flag
+# populates -- through `_validate_investigation_evidence_transport()`
+# (Blocker 2's typed, cryptographically bound evidence loader) exactly as
+# production does. `known_context` here NEVER carries
+# `investigation_derived_path_literals` directly.
+# ---------------------------------------------------------------------------
+
+
+def _mint_investigation_evidence_transport_manifest(*, invocation_id: str, path_literals: list) -> Path:
+    repo_root = preflight._find_repo_root()
+    git_head_sha = preflight._git_head_sha(repo_root)
+    payload = [
+        {
+            "comment_id": 5249734344,
+            "comment_url": URL,
+            "body_sha256": preflight._sha256(_E2E_2086_ISSUE_BODY),
+            "source_kind": "generated_by_agent",
+            "path_literals": path_literals,
+        }
+    ]
+    result, error = preflight.generate_authority_transport_manifest(
+        evidence=payload,
+        issue_number=ISSUE,
+        repo=REPO,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=repo_root,
+    )
+    assert result is not None, error
+    return Path(result["manifest_path"])
+
+
+def _cleanup_investigation_evidence_transport_manifest(invocation_id: str) -> None:
+    repo_root = preflight._find_repo_root()
+    manifest_dir = preflight._authority_transport_dir(repo_root, ISSUE, invocation_id)
+    if manifest_dir.exists():
+        shutil.rmtree(manifest_dir)
+
+
 def test_investigation_derived_path_literals_reach_contract_update_via_real_preflight_entrypoint_ac3(tmp_path):
-    """AC3 (runtime-verification): the caller-supplied
-    `investigation_derived_path_literals` must actually flow end-to-end
-    through the real `preflight.run.with_human_context` production chain --
-    `run_preflight()` -> real `plan_refinement_loop.py` subprocess ->
-    `classify_scope_delta_authority()` -- and be visible in the persisted
-    `refinement_preflight_provenance_v1.json` artifact's
-    `runtime_evidence.route.action`. Prior to the #2086 AC3 P0 fix_delta,
-    `plan_refinement_loop.py`'s two `classify_scope_delta_authority()` call
-    sites never forwarded this field, so this always resolved to
-    `human_escalation` regardless of what a caller supplied."""
-    _result, _exit_code, provenance = _e2e_2086_run_preflight(
-        known_context={
-            "human_context_comment_urls": [URL],
-            "agent_report_comment_urls": [],
-            "investigation_derived_path_literals": [
+    """AC3 (runtime-verification): a REAL, digest-bound
+    SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest (minted by the actual #2053
+    producer, never hand-injected known_context) must flow end-to-end
+    through `run_preflight()`'s `investigation_evidence_transport_path`
+    parameter -> `_validate_investigation_evidence_transport()` -> real
+    `plan_refinement_loop.py` subprocess -> `classify_scope_delta_authority()`
+    -- and be visible in the persisted `refinement_preflight_provenance_v1.json`
+    artifact's `runtime_evidence.route.action`."""
+    invocation_id = "test-ac3-fixdelta-positive"
+    try:
+        manifest_path = _mint_investigation_evidence_transport_manifest(
+            invocation_id=invocation_id,
+            path_literals=[
                 "docs/dev/workflow.md",
                 ".claude/skills/impl-review-loop/SKILL.md",
                 ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
                 ".claude/skills/implement-issue/SKILL.md",
             ],
-        },
-        run_id="with_literals",
-        tmp_path=tmp_path,
-    )
+        )
+        _result, _exit_code, provenance = _e2e_2086_run_preflight(
+            known_context={
+                "human_context_comment_urls": [URL],
+                "agent_report_comment_urls": [],
+            },
+            run_id="with_bound_transport",
+            tmp_path=tmp_path,
+            investigation_evidence_transport_path=manifest_path,
+        )
+    finally:
+        _cleanup_investigation_evidence_transport_manifest(invocation_id)
     route = provenance["runtime_evidence"]["route"]
     assert route["action"] == "contract_update_required", provenance
     assert route["implementation_allowed"] is False, provenance
@@ -474,7 +547,7 @@ def test_investigation_derived_path_literals_reach_contract_update_via_real_pref
 def test_investigation_derived_path_literals_absent_still_escalates_via_real_preflight_entrypoint_ac3(tmp_path):
     """Negative control for the AC3 wiring test above: the SAME real
     `run_preflight()` entrypoint, with an identical directive but no
-    `investigation_derived_path_literals`, must still resolve to
+    `investigation_evidence_transport_path`, must still resolve to
     `human_escalation` -- proving the positive test above is exercising
     real wiring, not a boundary that always clears."""
     _result, _exit_code, provenance = _e2e_2086_run_preflight(
@@ -489,6 +562,79 @@ def test_investigation_derived_path_literals_absent_still_escalates_via_real_pre
     assert route["action"] == "human_escalation", provenance
 
 
+def test_investigation_evidence_transport_wrong_anchor_binding_fails_closed_ac4(tmp_path):
+    """#2086 Blocker 2: a manifest minted for a DIFFERENT anchor comment URL
+    must never clear the boundary for this invocation -- the binding check
+    (`source_comment_url == anchor_url`) must reject it, not silently trust
+    a caller-supplied `list[str]`-shaped payload just because its outer
+    schema/digest is internally self-consistent."""
+    invocation_id = "test-ac4-fixdelta-wrong-anchor"
+    repo_root = preflight._find_repo_root()
+    git_head_sha = preflight._git_head_sha(repo_root)
+    other_url = f"https://github.com/{REPO}/issues/{ISSUE}#issuecomment-9999999999"
+    payload = [
+        {
+            "comment_id": 9999999999,
+            "comment_url": other_url,
+            "body_sha256": preflight._sha256(_E2E_2086_ISSUE_BODY),
+            "source_kind": "generated_by_agent",
+            "path_literals": ["docs/dev/workflow.md"],
+        }
+    ]
+    try:
+        result, error = preflight.generate_authority_transport_manifest(
+            evidence=payload,
+            issue_number=ISSUE,
+            repo=REPO,
+            invocation_id=invocation_id,
+            git_head_sha=git_head_sha,
+            repo_root=repo_root,
+        )
+        assert result is not None, error
+        manifest_path = Path(result["manifest_path"])
+        _result, _exit_code, provenance = _e2e_2086_run_preflight(
+            known_context={
+                "human_context_comment_urls": [URL],
+                "agent_report_comment_urls": [],
+            },
+            run_id="wrong_anchor_binding",
+            tmp_path=tmp_path,
+            investigation_evidence_transport_path=manifest_path,
+        )
+    finally:
+        _cleanup_investigation_evidence_transport_manifest(invocation_id)
+    route = provenance["runtime_evidence"]["route"]
+    assert route["action"] == "human_escalation", provenance
+
+
+def test_investigation_evidence_transport_tampered_digest_fails_closed_ac4(tmp_path):
+    """#2086 Blocker 2: a manifest whose `payload_sha256` no longer matches
+    its (tampered-after-mint) `payload` must never clear the boundary --
+    content-digest binding, not just outer schema validity."""
+    invocation_id = "test-ac4-fixdelta-tampered-digest"
+    try:
+        manifest_path = _mint_investigation_evidence_transport_manifest(
+            invocation_id=invocation_id,
+            path_literals=["docs/dev/workflow.md"],
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["payload"][0]["path_literals"].append(".claude/skills/implement-issue/SKILL.md")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        _result, _exit_code, provenance = _e2e_2086_run_preflight(
+            known_context={
+                "human_context_comment_urls": [URL],
+                "agent_report_comment_urls": [],
+            },
+            run_id="tampered_digest",
+            tmp_path=tmp_path,
+            investigation_evidence_transport_path=manifest_path,
+        )
+    finally:
+        _cleanup_investigation_evidence_transport_manifest(invocation_id)
+    route = provenance["runtime_evidence"]["route"]
+    assert route["action"] == "human_escalation", provenance
+
+
 def test_untrusted_author_association_never_gets_operator_relaxation_ac5():
     evidence = _evidence(_WORKFLOW_WIDE_FREEFORM_BODY, payload=_payload(association="CONTRIBUTOR"))
     assert evidence["source_kind"] == "issue_comment"
@@ -497,3 +643,85 @@ def test_untrusted_author_association_never_gets_operator_relaxation_ac5():
     assert result["authority_category"] == "ai_inferred"
     assert result["route"]["action"] == "human_escalation"
     assert result["route"]["reason_code"] == "untrusted_author_association"
+
+
+# ---------------------------------------------------------------------------
+# #2086 P1 fix_delta (iteration 3, OWNER REQUEST_CHANGES Blocker 4):
+# `_SEMANTIC_DIRECTIVE_VERB_RE` / `_has_semantic_directive_bullet` is a
+# lexical match and must not promote past-tense status statements or
+# negated imperatives to `explicit` scope-expansion directives, even on the
+# trusted operator-selected human-context lane.
+# ---------------------------------------------------------------------------
+
+_PAST_TENSE_STATUS_BODY = "\n".join(
+    [
+        "現在の issue-refinement-loop の状況を共有します。",
+        "- この不具合は昨日すでに修正済みです。",
+        "- ログを確認したところ、関連する処理は先日対応済みでした。",
+    ]
+)
+
+_NEGATED_IMPERATIVE_BODY = "\n".join(
+    [
+        "issue-refinement-loop の scope について方針を共有します。",
+        "- We should not widen the file scope for this Issue.",
+        "- Do not fix the unrelated logging module in this PR.",
+    ]
+)
+
+_GENUINE_POSITIVE_IMPERATIVE_BODY = "\n".join(
+    [
+        "issue-refinement-loop に既知の不具合があります。",
+        "- Please fix the anchor classification bug in scope_signal_delta.py.",
+        "- 関連する build_intake_capsule のロジックも修正してください。",
+    ]
+)
+
+
+def test_past_tense_status_bullet_is_not_explicit_directive_ac1_blocker4():
+    """A past-tense/perfect-status bullet ("already fixed yesterday") must
+    NOT be promoted to `explicit` just because it sits on the trusted
+    operator-selected human-context lane -- it is a status report, not an
+    instruction."""
+    assert sda._BULLET_LINE_RE.search(_PAST_TENSE_STATUS_BODY)
+    assert sda._has_semantic_directive_bullet(_PAST_TENSE_STATUS_BODY) is False
+    markers = sda.extract_directive_markers(_PAST_TENSE_STATUS_BODY)
+    assert markers == []
+    assert (
+        sda.classify_directive_confidence(
+            _PAST_TENSE_STATUS_BODY, markers, operator_asserted_human_context=True
+        )
+        == sda.DIRECTIVE_CONFIDENCE_INFERRED
+    )
+
+
+def test_negated_imperative_bullet_is_not_explicit_directive_ac1_blocker4():
+    """A negated imperative ("should not expand", "do not fix") must NOT be
+    promoted to `explicit` -- it explicitly instructs the OPPOSITE of a
+    scope-expansion directive."""
+    assert sda._BULLET_LINE_RE.search(_NEGATED_IMPERATIVE_BODY)
+    assert sda._has_semantic_directive_bullet(_NEGATED_IMPERATIVE_BODY) is False
+    markers = sda.extract_directive_markers(_NEGATED_IMPERATIVE_BODY)
+    assert markers == []
+    assert (
+        sda.classify_directive_confidence(
+            _NEGATED_IMPERATIVE_BODY, markers, operator_asserted_human_context=True
+        )
+        == sda.DIRECTIVE_CONFIDENCE_INFERRED
+    )
+
+
+def test_genuine_positive_imperative_bullet_still_explicit_ac1_blocker4():
+    """Regression control: the narrowing in Blocker 4 must not break the
+    existing genuine positive-imperative case (English "Please fix" +
+    Japanese "してください")."""
+    assert sda._has_semantic_directive_bullet(_GENUINE_POSITIVE_IMPERATIVE_BODY) is True
+    markers = sda.extract_directive_markers(_GENUINE_POSITIVE_IMPERATIVE_BODY)
+    assert markers == []
+    assert (
+        sda.classify_directive_confidence(
+            _GENUINE_POSITIVE_IMPERATIVE_BODY, markers, operator_asserted_human_context=True
+        )
+        == sda.DIRECTIVE_CONFIDENCE_EXPLICIT
+    )
+

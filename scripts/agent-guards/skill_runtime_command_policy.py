@@ -757,6 +757,140 @@ _GIT_HEAD_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _INVOCATION_ID_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
+def parse_exact_skill_runtime_decide_authority_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact-match parser for `decide.run`'s "Mode B" -- #2053's canonical
+    authority-transport verification (`generate_router_receipt()`)
+    dispatched ALONGSIDE the ordinary loop-state decision (#2086 P0
+    fix_delta Blocker 3).
+
+    Mirrors `parse_exact_skill_runtime_decide_command` (Mode A, 16 tokens)
+    token-for-token, with a FIXED further seven-token suffix:
+    `--authority-transport-path <repo-relative-path> --authority-expected
+    --invocation-id <id> --git-head-sha <sha>` (23 tokens total). All four
+    authority sub-fields (transport path / the bare `--authority-expected`
+    flag / invocation id / git head sha) are required together in this
+    grammar -- there is no shorter/partial variant; a caller that wants only
+    Mode A uses `parse_exact_skill_runtime_decide_command` instead. This is
+    a single, narrow, exact-match extension -- not a generic "any registry
+    field" passthrough (the discipline already applied to Mode A and to
+    `authority_transport.produce`/`consume` above, and explicitly required
+    by this Issue's Blocker 3).
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    if len(tokens) != 23:
+        return None
+    if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    expected_flags = [
+        "--command-id",
+        "--issue-number",
+        "--repo",
+        "--loop-state-file",
+        "--review-result-verdict",
+        "--max-iterations",
+        "--authority-transport-path",
+        "--authority-expected",
+        "--invocation-id",
+        "--git-head-sha",
+    ]
+    expected_positions = [4, 6, 8, 10, 12, 14, 16, 18, 19, 21]
+    for flag, pos in zip(expected_flags, expected_positions):
+        if tokens[pos] != flag:
+            return None
+    if any(
+        tok.startswith("--command-id=")
+        or tok.startswith("--issue-number=")
+        or tok.startswith("--repo=")
+        or tok.startswith("--loop-state-file=")
+        or tok.startswith("--review-result-verdict=")
+        or tok.startswith("--max-iterations=")
+        or tok.startswith("--authority-transport-path=")
+        or tok.startswith("--authority-expected=")
+        or tok.startswith("--invocation-id=")
+        or tok.startswith("--git-head-sha=")
+        for tok in tokens
+    ):
+        return None
+    command_id = tokens[5]
+    issue_number = tokens[7]
+    repo = tokens[9]
+    loop_state_file = tokens[11]
+    verdict = tokens[13]
+    max_iterations = tokens[15]
+    authority_transport_manifest_path = tokens[17]
+    invocation_id = tokens[20]
+    git_head_sha = tokens[22]
+    if command_id != "decide.run":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0:
+        return None
+    if repo != TRUSTED_REPO_SLUG:
+        return None
+    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+        return None
+    if not _is_safe_repo_relative_fixture_path(loop_state_file, root):
+        return None
+    if verdict not in _DECIDE_VERDICT_VALUES:
+        return None
+    if not max_iterations.isdigit() or int(max_iterations) <= 0:
+        return None
+    if not _is_safe_repo_relative_fixture_path(authority_transport_manifest_path, root):
+        return None
+    if not _INVOCATION_ID_TOKEN_RE.match(invocation_id):
+        return None
+    if not _GIT_HEAD_SHA_RE.match(git_head_sha):
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        loop_state_file=loop_state_file,
+        verdict=verdict,
+        max_iterations=max_iterations,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+    )
+
+
+def is_exact_skill_runtime_decide_authority_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """Same trusted-repo / default-branch / canonical-root safety boundary
+    as `is_exact_skill_runtime_decide_executor_command`, applied to
+    `decide.run`'s Mode B (#2086 P0 fix_delta Blocker 3). Mode B remains
+    root-no-worktree eligible -- it is still the same read-only router,
+    merely also verifying an authority transport manifest."""
+    parsed = parse_exact_skill_runtime_decide_authority_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    default_branch = resolve_default_branch(project_root, deadline)
+    if not branch or branch != default_branch:
+        return False
+    repo_slug = resolve_repo_slug(project_root, deadline)
+    if repo_slug != parsed.repo:
+        return False
+    return command_allows_root_no_worktree(parsed)
+
+
 def parse_exact_skill_runtime_authority_transport_produce_command(
     command: str, project_root: str | None = None
 ) -> ExactSkillRuntimeCommand | None:
@@ -1062,8 +1196,27 @@ def _parse_exact_skill_runtime_anchor_command(
         "preflight.run.with_agent_report": "--agent-report-comment-url",
         "contract_update.run.with_human_context": "--human-context-comment-url",
     }.get(command_id)
-    expected_length = 14 if lane_flag else 12
-    if len(tokens) != expected_length:
+    base_expected_length = 14 if lane_flag else 12
+    # #2086 P0 fix_delta (Blocker 1/2): `preflight.run.with_human_context`
+    # ONLY may optionally carry a further, exact two-token
+    # `--investigation-evidence-transport-path <repo-relative-path>` suffix
+    # (a bound SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest path -- see
+    # `run_refinement_preflight._validate_investigation_evidence_transport`).
+    # No other command_id in this parser's grammar may carry it -- this is a
+    # single, narrow, exact-match extension, not a generic passthrough.
+    investigation_evidence_transport_path: "str | None" = None
+    allows_investigation_transport = command_id == "preflight.run.with_human_context"
+    if len(tokens) == base_expected_length:
+        pass
+    elif (
+        allows_investigation_transport
+        and len(tokens) == base_expected_length + 2
+        and tokens[base_expected_length] == "--investigation-evidence-transport-path"
+    ):
+        investigation_evidence_transport_path = tokens[base_expected_length + 1]
+        if not _is_safe_repo_relative_fixture_path(investigation_evidence_transport_path, root):
+            return None
+    else:
         return None
     if lane_flag and (tokens[12] != lane_flag or tokens[13] != anchor_comment_url):
         return None
@@ -1387,6 +1540,13 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "{anchor_comment_url}",
         "--human-context-comment-url",
         "{anchor_comment_url}",
+        # #2086 P0 fix_delta (Blocker 1/2): optional trailing pair, dropped
+        # by render_command()'s `optional_flag_pair` mechanism when absent
+        # -- matched here verbatim for parity with
+        # `_parse_exact_skill_runtime_anchor_command()`'s own optional
+        # two-token suffix handling for this command_id only.
+        "--investigation-evidence-transport-path",
+        "{investigation_evidence_transport_path}",
     ],
     "preflight.run.with_agent_report": [
         "uv",
@@ -1515,6 +1675,10 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "issue_number": {"type": "positive_int", "required": True},
         "repo": {"type": "owner_repo", "required": True},
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+        # #2086 P0 fix_delta (Blocker 1/2)
+        "investigation_evidence_transport_path": {
+            "type": "path", "required": False, "optional_flag_pair": True,
+        },
     },
     "preflight.run.with_agent_report": {
         "issue_number": {"type": "positive_int", "required": True},

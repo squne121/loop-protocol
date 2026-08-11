@@ -131,6 +131,7 @@ REGISTRY = {
             "--issue-number", "{issue_number}", "--repo", "{repo}",
             "--anchor-comment-url", "{anchor_comment_url}",
             "--human-context-comment-url", "{anchor_comment_url}",
+            "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
         ],
         "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_anchor",
         "required_cwd": "canonical_main_root", "required_branch": "default_branch",
@@ -141,6 +142,9 @@ REGISTRY = {
             "repo": {"type": "owner_repo", "required": True},
             "anchor_comment_url": {
                 "type": "github_issue_comment_url", "required": True,
+            },
+            "investigation_evidence_transport_path": {
+                "type": "path", "required": False, "optional_flag_pair": True,
             },
         },
     },
@@ -169,7 +173,29 @@ REGISTRY = {
 
 
 def render_command(command_id: str, values: dict[str, object]) -> list[str]:
-    return [str(values[token[1:-1]]) if token.startswith("{") else token for token in REGISTRY[command_id]["argv"]]
+    # #2086 P0 fix_delta (Blocker 1/2): mirror production render_command()'s
+    # optional_flag_pair mechanism -- an optional placeholder token whose
+    # value was not supplied (and the flag literal token immediately before
+    # it) is dropped entirely, instead of KeyError-ing.
+    placeholders = REGISTRY[command_id].get("placeholders", {})
+    argv = REGISTRY[command_id]["argv"]
+    rendered: list[str] = []
+    idx = 0
+    while idx < len(argv):
+        token = argv[idx]
+        if token.startswith("{") and token.endswith("}"):
+            name = token[1:-1]
+            spec = placeholders.get(name, {})
+            if name not in values and spec.get("optional_flag_pair"):
+                if rendered and idx > 0 and not (argv[idx - 1].startswith("{")):
+                    rendered.pop()
+                idx += 1
+                continue
+            rendered.append(str(values[name]))
+        else:
+            rendered.append(token)
+        idx += 1
+    return rendered
 """,
     )
     _write_text(
@@ -187,6 +213,7 @@ parser.add_argument("--anchor-comment-url")
 parser.add_argument("--human-context-comment-url", dest="human_context_comment_urls", action="append", default=[])
 parser.add_argument("--agent-report-comment-url", dest="agent_report_comment_urls", action="append", default=[])
 parser.add_argument("--consume-contract-patch-plan", action="store_true")
+parser.add_argument("--investigation-evidence-transport-path", default=None)
 args = parser.parse_args()
 artifact = Path(".claude/artifacts/issue-refinement-loop") / args.issue_number
 artifact.mkdir(parents=True, exist_ok=True)
