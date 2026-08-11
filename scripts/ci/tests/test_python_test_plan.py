@@ -174,6 +174,9 @@ def test_real_plan_serial_lane_has_debounce():
     test_issue_393_snapshot_fixture_processed's real subprocess call hit its 90s
     timeout under 4-way xdist CPU saturation on the GitHub-hosted runner. The
     debounce test itself must NOT be excluded.
+    scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py
+    was added to parallel_exclude (Issue #2073) for the same reason (real
+    subprocess-chain timeout under xdist CPU saturation).
     """
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
@@ -183,6 +186,13 @@ def test_real_plan_serial_lane_has_debounce():
         "scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py",
         "tests/codex/test_scope_rollup_runner_agent_config.py",
         ".claude/skills/issue-contract-review/scripts/tests/test_baseline_vc_preflight.py",
+        # Issue #2073: scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py
+        # was added to parallel_exclude because its AC10 real-executor-chain test
+        # (skill_runtime_exec.py -> uv run python3 run_refinement_preflight.py ->
+        # plan_refinement_loop.py) has the same class of fixed-timeout /
+        # xdist-CPU-saturation flake as test_baseline_vc_preflight.py above; see
+        # docs/dev/ac10-pid-proof-flake-root-cause.md.
+        "scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py",
         "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
