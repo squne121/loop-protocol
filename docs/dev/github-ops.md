@@ -256,7 +256,7 @@ implementation overlap preflight が `human_review_required` に倒れ続ける�
   write-root 外 tracked changes 確認、`GH_TOKEN`/`GITHUB_TOKEN` の環境除去、mutation 直前の
   attempt marker 記録は PR #1667 レビュー fix_delta で追加された安全策である。
 
-## 既存 Issue の native parent／blockedBy／blocking 同期（`issue_relationship.update`、Issue #1883）
+## 既存の Issue に対して native な parent・blockedBy・blocking の関係性を同期する仕組み（`issue_relationship.update`、Issue #1883）
 
 `edit-issue` transaction（`edit_issue_txn.py`）が既存 Issue を更新する際、本文の
 `parent_issue`／`Part of`／`Depends on #N` を書き換えても GitHub native
