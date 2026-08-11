@@ -1087,7 +1087,9 @@ class TestStatusCheckRollupPagination:
     def test_response_shape_error_is_gh_error(self):
         """GIVEN malformed page info WHEN summarized THEN exit 40 remains fail-closed."""
         payload = self._page([], has_next_page=False, end_cursor=None)
-        payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["pageInfo"] = {"hasNextPage": "false"}
+        commit = payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+        contexts = commit["statusCheckRollup"]["contexts"]
+        contexts["pageInfo"] = {"hasNextPage": "false"}
 
         def mock_fn(args: list[str]):
             if "pr" in args and "view" in args and "headRefOid" in args:
