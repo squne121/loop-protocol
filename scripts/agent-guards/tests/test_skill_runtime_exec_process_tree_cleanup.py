@@ -400,3 +400,275 @@ def test_cleanup_status_telemetry_enum(capsys: pytest.CaptureFixture[str]) -> No
         real_exec.TERMINATION_TERM_THEN_KILL,
         real_exec.TERMINATION_NOT_NEEDED,
     } == {"term", "term_then_kill", "not_needed"}
+
+
+# ---------------------------------------------------------------------------
+# P1-1 / P2-2(1): leader exits on SIGTERM, descendant ignores SIGTERM --
+# escalation must be driven by process-group liveness, not leader liveness.
+# ---------------------------------------------------------------------------
+
+
+def _term_compliant_leader_with_term_ignoring_grandchild_argv(
+    marker_path: Path, seconds: float
+) -> list[str]:
+    """A leader that uses the default SIGTERM disposition (exits promptly on
+    SIGTERM) but forks a grandchild that explicitly ignores SIGTERM and
+    outlives it in the same process group."""
+    code = (
+        "import os, time\n"
+        f"pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    import signal\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"    time.sleep({seconds})\n"
+        "    os._exit(0)\n"
+        "else:\n"
+        f"    with open({str(marker_path)!r}, 'w') as fh:\n"
+        "        fh.write(str(pid))\n"
+        f"    time.sleep({seconds})\n"
+    )
+    return [PY, "-c", code]
+
+
+def test_leader_exits_but_term_ignoring_descendant_still_escalated_to_kill(
+    tmp_path: Path,
+) -> None:
+    """GIVEN a leader that dies promptly from SIGTERM (default disposition)
+    but a descendant in the same process group that ignores SIGTERM and
+    keeps running
+    WHEN the global deadline is exceeded
+    THEN escalation to SIGKILL still happens (the leader's early exit must
+    never be mistaken for the whole group being gone), and the group's
+    absence is independently confirmed via `killpg(pgid, 0)` afterward
+    (Issue #2075 P1-1)."""
+    marker = tmp_path / "descendant_pid"
+    result = real_exec._run_child_with_supervision(
+        _term_compliant_leader_with_term_ignoring_grandchild_argv(marker, 30.0),
+        cwd=str(REPO_ROOT),
+        env=dict(os.environ),
+        timeout_seconds=0.3,
+    )
+
+    try:
+        assert result.timed_out is True
+        assert result.termination == real_exec.TERMINATION_TERM_THEN_KILL
+        assert result.cleanup_status == real_exec.CLEANUP_STATUS_CONFIRMED_ABSENT
+        assert result.leader_reaped is True
+        assert marker.exists()
+
+        # Independent re-verification, outside of the result telemetry: the
+        # recorded pgid (== leader pid, Issue #2075 P2-1) must now raise
+        # ProcessLookupError on `killpg(pgid, 0)`.
+        with pytest.raises(ProcessLookupError):
+            os.killpg(result.pid, 0)
+    finally:
+        _reap_stray(result.pid)
+
+
+# ---------------------------------------------------------------------------
+# P1-2 / P2-2(2): leader exits normally, descendant still holds the
+# stdout/stderr pipe open -- must still time out, not silently succeed.
+# ---------------------------------------------------------------------------
+
+
+def _leader_exits_descendant_holds_pipes_argv(seconds: float) -> list[str]:
+    """A leader that forks a grandchild inheriting its stdout/stderr write
+    ends, then exits immediately itself while the grandchild keeps those
+    pipes open and sleeps."""
+    code = (
+        "import os, sys, time\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        f"    time.sleep({seconds})\n"
+        "    os._exit(0)\n"
+        "else:\n"
+        "    os._exit(0)\n"
+    )
+    return [PY, "-c", code]
+
+
+def test_leader_exit_with_descendant_holding_pipes_still_times_out() -> None:
+    """GIVEN a leader that exits immediately but a descendant inherits and
+    keeps the stdout/stderr pipe write ends open past the execution deadline
+    WHEN the supervisor runs it
+    THEN the call still times out -- exactly like the pre-#2075
+    `subprocess.run(..., timeout=...)` behavior, which blocks on pipe EOF,
+    not on leader exit -- instead of being misreported as a normal success
+    (Issue #2075 P1-2, direct AC4-regression reproduction)."""
+    result = real_exec._run_child_with_supervision(
+        _leader_exits_descendant_holds_pipes_argv(30.0),
+        cwd=str(REPO_ROOT),
+        env=dict(os.environ),
+        timeout_seconds=0.3,
+    )
+
+    try:
+        assert result.timed_out is True, (
+            "leader exiting early must not be mistaken for overall success "
+            "while a descendant still holds the pipe open (P1-2 regression)"
+        )
+    finally:
+        _reap_stray(result.pid)
+
+
+# ---------------------------------------------------------------------------
+# P1-3 / P2-2(4): an exception unwinding past a successful Popen() must
+# still drive cleanup before propagating.
+# ---------------------------------------------------------------------------
+
+
+def test_exception_after_popen_still_cleans_up_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GIVEN `communicate()` raising an injected exception (standing in for
+    e.g. `KeyboardInterrupt`) after a real child process has been launched
+    WHEN `_run_child_with_supervision()` unwinds
+    THEN the injected exception still propagates to the caller AND the
+    process group has been driven through the bounded cleanup state machine
+    (no leaked process group) before it does (Issue #2075 P1-3)."""
+
+    class _InjectedFailure(Exception):
+        pass
+
+    call_count = {"n": 0}
+
+    def _boom_communicate(self, *args, **kwargs):
+        call_count["n"] += 1
+        raise _InjectedFailure("simulated KeyboardInterrupt-like unwind")
+
+    monkeypatch.setattr(real_exec.subprocess.Popen, "communicate", _boom_communicate)
+
+    captured_pid: dict[str, int | None] = {"pid": None}
+    real_popen = real_exec.subprocess.Popen
+
+    def _spy_popen(argv, **kwargs):
+        proc = real_popen(argv, **kwargs)
+        captured_pid["pid"] = proc.pid
+        return proc
+
+    monkeypatch.setattr(real_exec.subprocess, "Popen", _spy_popen)
+
+    with pytest.raises(_InjectedFailure):
+        real_exec._run_child_with_supervision(
+            _sleeper_argv(30.0),
+            cwd=str(REPO_ROOT),
+            env=dict(os.environ),
+            timeout_seconds=10,
+        )
+
+    try:
+        assert call_count["n"] == 1
+        pid = captured_pid["pid"]
+        assert pid is not None
+        # The child must have actually been terminated and reaped, not left
+        # running as an orphaned process group.
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pid, 0)
+    finally:
+        _reap_stray(captured_pid["pid"])
+
+
+# ---------------------------------------------------------------------------
+# P2-1: a failed pgid lookup must never be promoted to `confirmed_absent`,
+# and `os.getpgid()` must never be used for the initial pgid capture.
+# ---------------------------------------------------------------------------
+
+
+def test_pgid_captured_from_proc_pid_without_getpgid_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GIVEN the outer-child supervisor launching a real child
+    WHEN it captures the process-group id to supervise
+    THEN it never calls `os.getpgid()` to do so -- `proc.pid` is used
+    directly as the pgid, since `start_new_session=True` already guarantees
+    the leader is its own group leader from the moment `Popen()` returns
+    (Issue #2075 P2-1)."""
+
+    def _forbidden_getpgid(*_args, **_kwargs):
+        raise AssertionError(
+            "os.getpgid() must not be used for pgid capture (Issue #2075 P2-1)"
+        )
+
+    monkeypatch.setattr(real_exec.os, "getpgid", _forbidden_getpgid)
+
+    result = real_exec._run_child_with_supervision(
+        _sleeper_argv(30.0),
+        cwd=str(REPO_ROOT),
+        env=dict(os.environ),
+        timeout_seconds=0.2,
+    )
+
+    try:
+        assert result.timed_out is True
+        assert result.cleanup_status == real_exec.CLEANUP_STATUS_CONFIRMED_ABSENT
+    finally:
+        _reap_stray(result.pid)
+
+
+def test_group_absence_check_permission_error_not_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GIVEN `killpg(pgid, 0)` raising a non-`ProcessLookupError` `OSError`
+    (e.g. `PermissionError`) for the entire cleanup window
+    WHEN the supervisor evaluates absence
+    THEN `cleanup_status` is `unconfirmed`, never `confirmed_absent` --
+    signal-dispatch failure of any kind other than `ProcessLookupError` must
+    never be promoted to a confirmed success (Issue #2075 P2-1 / AC6/AC9
+    fail-closed contract)."""
+    real_killpg = real_exec.os.killpg
+
+    def _flaky_killpg(pgid, sig):
+        if sig == 0:
+            raise PermissionError("simulated permission failure")
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(real_exec.os, "killpg", _flaky_killpg)
+
+    result = real_exec._run_child_with_supervision(
+        _sleeper_argv(30.0),
+        cwd=str(REPO_ROOT),
+        env=dict(os.environ),
+        timeout_seconds=0.2,
+    )
+
+    try:
+        assert result.timed_out is True
+        assert result.cleanup_status == real_exec.CLEANUP_STATUS_UNCONFIRMED
+    finally:
+        if result.pid is not None:
+            try:
+                real_killpg(result.pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+        _reap_stray(result.pid)
+
+
+# ---------------------------------------------------------------------------
+# P2-2(7): malformed child output must raise `UnicodeDecodeError`, matching
+# the pre-#2075 `subprocess.run(text=True)` decode-error semantics.
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_child_output_raises_unicode_decode_error() -> None:
+    """GIVEN a child that writes an invalid UTF-8 byte sequence to stdout
+    WHEN the supervisor captures its output via `communicate()`
+    THEN a `UnicodeDecodeError` propagates to the caller -- exactly as the
+    pre-#2075 `subprocess.run(text=True)` call would have raised -- instead
+    of being silently swallowed, and the child is still fully reaped
+    despite the exception (Issue #2075 P1-2)."""
+    code = "import os, sys; os.write(sys.stdout.fileno(), b'\\xff\\xfe\\x00bad')"
+
+    with pytest.raises(UnicodeDecodeError):
+        real_exec._run_child_with_supervision(
+            [PY, "-c", code],
+            cwd=str(REPO_ROOT),
+            env=dict(os.environ),
+            timeout_seconds=10,
+        )
+
+    # `_run_child_with_supervision()`'s `except BaseException` handler
+    # already drives the child through `_stage_cleanup()` before
+    # re-raising, so no explicit reap is needed here -- this assertion is
+    # itself the independent re-verification that nothing leaked.
