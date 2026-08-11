@@ -300,7 +300,12 @@ def _collect_issue_metadata(
     title_prefix_ok = title.startswith("実装:") or title.startswith("implement:")
     phase_label_ok = "phase/implementation" in label_names
     issue_state_open = str(payload.get("state") or "").lower() == "open"
-    ready_status = "pass" if all([title_prefix_ok, phase_label_ok, issue_state_open]) else "failed"
+    # #2084: label presence is presentation-only metadata and MUST NOT
+    # participate in readiness authority. `phase_label_ok` is retained below
+    # only as an observational field (`ready_tuple.phase_label_present`);
+    # `ready_status` (consumed by `_next_action_route`) is derived solely
+    # from non-label evidence (title prefix + native issue open state).
+    ready_status = "pass" if all([title_prefix_ok, issue_state_open]) else "failed"
 
     return {
         "title": title,

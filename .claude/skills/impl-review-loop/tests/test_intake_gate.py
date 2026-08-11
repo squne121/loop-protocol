@@ -130,7 +130,9 @@ def test_ac2_priority_ordering_request_changes_last():
 
 
 # ---------------------------------------------------------------------------
-# AC3: metadata_not_ready for missing title prefix or phase/implementation label
+# AC3: metadata_not_ready for missing title prefix
+# #2084: phase/implementation label is presentation-only / non-authoritative
+# metadata and MUST NOT be a metadata_not_ready readiness condition.
 # ---------------------------------------------------------------------------
 
 
@@ -145,11 +147,27 @@ def test_ac3_metadata_not_ready_covers_title_prefix():
     )
 
 
-def test_ac3_metadata_not_ready_covers_phase_implementation_label():
-    """AC3: metadata_not_ready subreason covers missing phase/implementation label."""
+def test_ac3_metadata_not_ready_excludes_phase_implementation_label():
+    """#2084: metadata_not_ready subreason must NOT require phase/implementation label.
+
+    Labels are presentation-only / non-authoritative (SSOT: docs/dev/workflow.md,
+    docs/dev/github-ops.md). The metadata_not_ready condition list (the bullet
+    section immediately following the subreason heading) must not require the
+    label to be present.
+    """
     body = _read(PREPARATION_MD)
-    assert "phase/implementation" in body, (
-        "preparation.md must reference phase/implementation label in metadata_not_ready"
+    idx = body.find("#### 1. `metadata_not_ready`")
+    assert idx != -1, "metadata_not_ready section header not found"
+    # Isolate the condition-list portion of the section (up to the next code
+    # fence's closing, before any presentation-only clarification note).
+    section = body[idx : idx + 500]
+    condition_list_end = section.find("```bash")
+    condition_list = section[:condition_list_end] if condition_list_end != -1 else section
+    assert "phase/implementation" not in condition_list, (
+        "metadata_not_ready condition list must not require phase/implementation label"
+    )
+    assert "presentation-only" in body or "presentation_only" in body, (
+        "preparation.md must document the presentation-only status of phase/implementation label"
     )
 
 

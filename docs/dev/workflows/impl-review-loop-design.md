@@ -64,7 +64,7 @@ summary_budget: "<= 1200 chars"
 | 呼び出しトリガー | `/impl-review-loop <N>` / 「Issue ◯◯ をループで実装して」 |
 | 必須入力 | `issue_number` |
 | 任意入力 | `contract_snapshot_url`（省略時は preparation で自動取得）、`max_iterations`（既定 3） |
-| 前提条件 | `issue-contract-review` が `status: go` を返していること、`state/needs-human` 非存在 |
+| 前提条件 | `issue-contract-review` が `status: go` を返していること |
 | 完了条件 | `LOOP_VERDICT: APPROVE`（PR は人間がマージ判断） |
 
 ### 着手条件の設計根拠
@@ -73,6 +73,13 @@ summary_budget: "<= 1200 chars"
 - DoR（Definition of Ready）準拠確認・VC preflight・dependency close・human escalation 非該当がすべて `issue-contract-review` で検証済み
 - 二重確認による手順冗長化を防ぐため、impl-review-loop 側では contract 内容を再判定しない
 - 正本: `docs/dev/workflow.md` の `## Issue contract を作業計画の正本として扱う条件`
+
+GitHub Issue label（`state/needs-human` を含む全 label）は presentation-only の
+non-authoritative metadata であり、着手条件（前提条件）には含めない（#2084 OWNER
+directive）。readiness authority は `CONTRACT_REVIEW_RESULT_V1.status`（Issue native
+open/closed state・Machine-Readable Contract・GitHub native dependency close 状態・
+explicit operator/OWNER directive・review/test/CI 結果に基づく）のみであり、label が
+readiness を左右することはない。
 
 ## Workflow Topology（ワークフロー構成）
 
@@ -217,7 +224,6 @@ orchestrator は data-plane 操作を直接行わない。
 
 | Failure Mode | 検出タイミング | 停止条件 | Recovery アクション |
 |---|---|---|---|
-| `state/needs-human` 存在 | Preparation | Hard stop | ラベル除去まで待機 |
 | `contract_snapshot` 取得失敗 | Preparation | Hard stop | `issue-contract-review` 再実行 |
 | `product_spec_preflight: stop_human` | Preparation / Step 1 前 | Hard stop | 人間が product spec を確認 |
 | `product_spec_preflight: refresh_contract_snapshot` | Preparation | loop stop | `issue-contract-review` 再実行 |
@@ -240,7 +246,7 @@ orchestrator は data-plane 操作を直接行わない。
 
 | Class | 条件 | 期待する人間アクション |
 |---|---|---|
-| A: 即時停止 | `state/needs-human` / contract 未取得 | contract 整備後に再実行 |
+| A: 即時停止 | contract 未取得（label は判定に用いない、#2084） | contract 整備後に再実行 |
 | B: product_spec stop | `product_spec_preflight: stop_human` | product spec 確認 |
 | C: max_iterations | iteration 上限到達 | 実装内容確認・root cause 調査 |
 | D: human_review_required | SubAgent からの escalation | PR / Issue の内容確認 |
