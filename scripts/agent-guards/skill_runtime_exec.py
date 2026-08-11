@@ -717,10 +717,66 @@ def _trusted_uv_toolcache_dirs() -> list[str]:
 
 
 def _resolve_trusted_executable(name: str, project_root: str) -> str:
+    """Resolve `name` to a trust-validated executable path.
+
+    For "python3", the trust boundary is validated against the fully
+    resolved (symlink-following) target, but the *returned* path preserves
+    venv identity (`sys.executable` itself, unresolved) instead of the
+    realpath. Returning the realpath here previously caused `uv run
+    <realpath>` to lose association with the project venv whenever
+    `sys.executable` was a symlink into a bare interpreter (e.g. a
+    `uv python install`-managed toolchain with no project dependencies of
+    its own), which made child subprocesses unable to import project
+    dependencies (Issue #2073 root cause: jsonschema unimportable in CI).
+
+    Check/use window (Issue #2073 human-review P1-2): returning the
+    unresolved `sys.executable` path instead of its realpath means the
+    string validated here (via `real`, below) and the string ultimately
+    invoked by the caller are not byte-identical -- if something rewrote
+    the `.venv/bin/python3` symlink between this call returning and the
+    caller spawning the child process, the caller would exec whatever the
+    symlink points to *at spawn time*, not the target validated here. This
+    is a real TOCTOU window in the classic sense (CWE-367), but it cannot
+    be closed by executing through an already-opened file descriptor
+    (e.g. `/proc/self/fd/N` or `fexecve`) the way this module's other
+    symlink-race guards do for *file reads*: CPython's own venv detection
+    (`pyvenv.cfg` discovery, which determines `sys.prefix` and therefore
+    which `site-packages` a spawned interpreter uses) walks *upward from
+    the directory of the path it was invoked with*, so the invoked path
+    string itself must remain `.../.venv/bin/python3` at exec time for the
+    child to see the project's dependencies -- executing via a captured fd
+    (which has no adjacent `pyvenv.cfg`) would silently reproduce the exact
+    bug this function exists to fix. Given that, this function's only
+    caller (`_resolve_child_argv`) re-resolves and re-validates on every
+    single invocation immediately before the child is spawned (no caching,
+    no reuse of a previously-resolved value across calls -- see
+    `test_ac10_resolve_trusted_executable_is_not_cached_across_calls` in
+    `tests/test_skill_runtime_preflight_bytecode_cache.py`), which bounds
+    the window to the handful of Python statements between this function
+    returning and `subprocess`/`Popen` being invoked, with no filesystem or
+    network I/O in between. An attacker who can rewrite `.venv/bin/python3`
+    inside that window already has write access to the repository working
+    tree the executor itself operates in, which is a strictly stronger
+    position than this check defends against elsewhere in this module.
+
+    Pre-existing (not introduced by this fix) characteristic of the trust
+    check itself, found while writing the regression test above: for
+    `name == "python3"`, `runtime_dir` below is computed from `sys.executable`
+    -- the exact same value being validated -- so `real_parent == runtime_dir`
+    holds tautologically regardless of what the symlink resolves to, and the
+    `{name}_outside_trusted_path` branch can never fire for `python3` (it is
+    a real, load-bearing check only for `name == "uv"`, where `resolved` is
+    independently looked up via `shutil.which`). The only check that
+    actually constrains where `python3` may resolve is `{name}_inside_project_root`,
+    below. This was true before this fix too (the pre-fix code computed
+    `real`/`real_parent`/`runtime_dir` identically, all derived from
+    `sys.executable`); this fix does not change which check is effective,
+    only which string is returned once that check passes.
+    """
     safe_entries = _safe_path_entries()
     safe_path = os.pathsep.join(safe_entries)
     if name == "python3":
-        resolved = os.path.realpath(sys.executable)
+        resolved = sys.executable
     else:
         resolved = shutil.which(name, path=safe_path)
     if not resolved:
@@ -734,7 +790,7 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     runtime_dir = os.path.realpath(str(Path(sys.executable).resolve().parent))
     if real_parent not in allowed_dirs and real_parent != runtime_dir:
         raise RuntimeError(f"{name}_outside_trusted_path")
-    return real
+    return resolved if name == "python3" else real
 
 
 def _sanitize_env(project_root: str) -> dict[str, str]:

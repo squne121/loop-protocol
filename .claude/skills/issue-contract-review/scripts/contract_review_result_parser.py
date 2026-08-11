@@ -200,6 +200,7 @@ def _decode_producer_json_scalars(block: dict[str, Any], raw_block: str) -> dict
         if isinstance(value, str) and value.startswith(("{", "[")):
             mapping[key] = _parse_bounded_strict_json_collection(value)
 
+    decode(inner, "expected_contract_fingerprint")
     checks = inner.get("checks")
     # The producer's fingerprint transport is a single-quoted JSON mapping.
     # Do not recursively decode a JSON string transported through a different
@@ -208,10 +209,17 @@ def _decode_producer_json_scalars(block: dict[str, Any], raw_block: str) -> dict
         decode(inner, "expected_contract_fingerprint")
     if not isinstance(checks, dict):
         return block
-    decode(checks, "declared_path_overlap")
+    try:
+        decode(checks, "declared_path_overlap")
+    except SimpleYamlParseError:
+        # Overlap is advisory only. Keep its raw scalar so malformed or
+        # oversized producer telemetry cannot invalidate source-bound fields.
+        pass
     vc_preflight = checks.get("vc_preflight")
     if isinstance(vc_preflight, dict):
         decode(vc_preflight, "classifications")
+        if not isinstance(vc_preflight.get("classifications"), list):
+            raise SimpleYamlParseError("vc_preflight_classifications_must_be_list")
     return block
 
 
@@ -300,7 +308,9 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
                 continue
             sub_key = match.group(1).strip()
             sub_value = match.group(2).strip()
-            vc_preflight[sub_key] = _parse_fallback_scalar(sub_value) if sub_value else None
+            vc_preflight[sub_key] = (
+                _parse_fallback_scalar(sub_value) if sub_value else None
+            )
 
     return _decode_producer_json_scalars(result, block)
 

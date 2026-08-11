@@ -743,6 +743,124 @@ def _run_real_executor(
     )
 
 
+def test_ac10_resolve_trusted_executable_preserves_venv_identity_for_python3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Root cause regression (Issue #2073): `_resolve_trusted_executable("python3", ...)`
+    must return `sys.executable` itself (venv-identity-preserving) rather than its
+    fully resolved realpath. Returning the realpath strips venv identity whenever
+    `sys.executable` is a symlink into a bare toolchain interpreter with no project
+    dependencies of its own (as happens under `uv python install`-managed CI
+    interpreters), which made `uv run <realpath> ...` child subprocesses unable to
+    import project dependencies (observed as `jsonschema library not importable`
+    fail-closed in `run_refinement_preflight.py`, which short-circuits before the
+    planner is ever invoked -- explaining the missing `pid_proof_planner.json`)."""
+    trusted_dir = tmp_path / "trusted_bin"
+    trusted_dir.mkdir()
+    real_interpreter = trusted_dir / "python3.12"
+    real_interpreter.write_text("#!/bin/sh\n")
+    real_interpreter.chmod(0o755)
+
+    venv_dir = tmp_path / "project" / ".venv" / "bin"
+    venv_dir.mkdir(parents=True)
+    venv_python = venv_dir / "python3"
+    venv_python.symlink_to(real_interpreter)
+
+    monkeypatch.setattr(real_exec.sys, "executable", str(venv_python))
+    monkeypatch.setattr(
+        real_exec,
+        "_safe_path_entries",
+        lambda: [str(trusted_dir)],
+    )
+
+    project_root = str(tmp_path / "project")
+    resolved = real_exec._resolve_trusted_executable("python3", project_root)
+
+    assert resolved == str(venv_python), (
+        "expected the venv-identity path to be returned unresolved, not the "
+        f"realpath; got {resolved!r}"
+    )
+    assert resolved != os.path.realpath(str(venv_python))
+
+
+def test_ac10_resolve_trusted_executable_is_not_cached_across_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TOCTOU-scope regression (Issue #2073 human-review P1-2): `_resolve_trusted_executable`
+    performs no memoization -- its trust validation (via the fully resolved realpath) is
+    recomputed on every call from the live filesystem, so a symlink retargeted to a
+    disallowed location (here: inside `project_root`, the one check that is actually
+    load-bearing for `name == "python3"` -- see the `outside_trusted_path` tautology note
+    in `_resolve_trusted_executable`'s docstring) between two calls is rejected on the very
+    next call, rather than a stale "it validated last time" result being reused. This is
+    the property that bounds the check/use race window to the handful of statements between
+    this function returning and the caller (`_resolve_child_argv`) immediately spawning the
+    child process."""
+    trusted_dir = tmp_path / "trusted_bin"
+    trusted_dir.mkdir()
+    real_interpreter = trusted_dir / "python3.12"
+    real_interpreter.write_text("#!/bin/sh\n")
+    real_interpreter.chmod(0o755)
+
+    project_dir = tmp_path / "project"
+    venv_dir = project_dir / ".venv" / "bin"
+    venv_dir.mkdir(parents=True)
+    venv_python = venv_dir / "python3"
+    venv_python.symlink_to(real_interpreter)
+
+    # An in-project-root "interpreter" the symlink will be retargeted to,
+    # simulating a swap landing inside the check/use window.
+    planted_interpreter = project_dir / "planted_python3"
+    planted_interpreter.write_text("#!/bin/sh\n")
+    planted_interpreter.chmod(0o755)
+
+    monkeypatch.setattr(real_exec.sys, "executable", str(venv_python))
+    monkeypatch.setattr(real_exec, "_safe_path_entries", lambda: [str(trusted_dir)])
+
+    project_root = str(project_dir)
+
+    # First call: symlink points at a trusted target outside project_root --
+    # must succeed and must not memoize the result.
+    resolved = real_exec._resolve_trusted_executable("python3", project_root)
+    assert resolved == str(venv_python)
+
+    # Retarget the symlink to a location inside project_root.
+    venv_python.unlink()
+    venv_python.symlink_to(planted_interpreter)
+
+    with pytest.raises(RuntimeError, match="python3_inside_project_root"):
+        real_exec._resolve_trusted_executable("python3", project_root)
+
+
+def test_ac10_resolve_trusted_executable_python3_child_actually_imports_project_deps() -> None:
+    """Behavioral regression (Issue #2073 human-review P2-3): the real invariant this fix
+    protects is not "the return value is a particular string shape" but "a child process
+    spawned via the returned path runs inside the project's own venv and can import project
+    dependencies" -- exercised here against the actual, unmocked `sys.executable` and the
+    real project `.venv` (not a fake `#!/bin/sh` stub), the same way `uv run` invokes it in
+    production. This complements (not replaces) the structural symlink test above, which
+    covers the trust-boundary/venv-identity contract in isolation without needing a real
+    interpreter."""
+    resolved = real_exec._resolve_trusted_executable("python3", str(REPO_ROOT))
+    assert resolved == sys.executable
+
+    result = subprocess.run(
+        ["uv", "run", "--locked", resolved, "-c", "import sys, jsonschema; print(sys.prefix)"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"child process could not import project dependency jsonschema via the "
+        f"trust-resolved python3 path; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.stdout.strip() == sys.prefix, (
+        "child process sys.prefix did not match the parent's venv sys.prefix -- "
+        "the resolved path did not preserve venv identity"
+    )
+
+
 def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_proof(
     tmp_path: Path,
 ) -> None:
@@ -786,15 +904,27 @@ def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_pro
         # writes a `planner_failure_classification_v1.json` sidecar (via
         # `classify_planner_failure()`) whenever `_invoke_planner()` returns
         # `plan is None` -- i.e. whenever preflight's own `main()` actually
-        # reached the `_invoke_planner()` call site. Surface this sidecar's
-        # presence/content (or its absence) directly in the failure message:
-        # its absence is itself diagnostic evidence that the failure path
-        # in `run_refinement_preflight.py`'s `main()` never reached the
-        # `plan is None` failure-classification branch at all (i.e. never
-        # reached `_invoke_planner()`, consistent with failure-space
-        # candidates (a)/(c)/(d)/(e)/(f) discussed in Issue #2073's investigation
-        # history), whereas its presence
-        # narrows the failure to inside `_invoke_planner()` itself.
+        # reached the `_invoke_planner()` call site.
+        #
+        # **Correction (Issue #2073 OWNER review, P1-3)**: the sidecar write
+        # itself is best-effort (`except Exception: pass` around the write in
+        # `run_preflight()`), so the sidecar's *absence* is NOT valid
+        # standalone evidence that `_invoke_planner()` was never reached --
+        # `_invoke_planner()` could have been reached and returned `plan is
+        # None`, with only the sidecar *write* subsequently failing silently.
+        # The sidecar's *presence*, by contrast, remains strong positive
+        # evidence that the classification branch ran.
+        #
+        # Issue #2073 P1-4 adds a second, stronger signal for the "was
+        # `_invoke_planner()` ever entered" question: `_invoke_planner()`
+        # itself now writes a `planner_spawn_attempt_v1.json` marker as its
+        # own first action (before doing anything else, including the
+        # missing-script pre-check), also via a best-effort write, but at a
+        # point with much less code between "call site reached" and "marker
+        # written" than the classification sidecar has. Surface both
+        # sidecars' presence/content (or absence) directly in the failure
+        # message rather than asserting a one-directional implication from
+        # either one alone.
         classification_path = artifact_dir / "planner_failure_classification_v1.json"
         if classification_path.exists():
             classification_diag = (
@@ -803,16 +933,31 @@ def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_pro
             )
         else:
             classification_diag = (
-                "planner_failure_classification_v1.json absent -- "
-                "run_refinement_preflight.py's main() never reached the "
-                "`plan is None` failure-classification branch (i.e. never "
-                "reached _invoke_planner()'s return path)"
+                "planner_failure_classification_v1.json absent -- consistent "
+                "with (but not conclusive proof of) run_refinement_preflight.py's "
+                "main() never reaching the `plan is None` failure-classification "
+                "branch; the sidecar write is itself best-effort "
+                "(except Exception: pass), so this could also mean the branch "
+                "was reached and only its own artifact write failed"
+            )
+        spawn_attempt_path = artifact_dir / "planner_spawn_attempt_v1.json"
+        if spawn_attempt_path.exists():
+            spawn_attempt_diag = (
+                "planner_spawn_attempt_v1.json present: "
+                f"{spawn_attempt_path.read_text(encoding='utf-8')!r}"
+            )
+        else:
+            spawn_attempt_diag = (
+                "planner_spawn_attempt_v1.json absent -- _invoke_planner() "
+                "was very likely never entered (this marker is written as "
+                "_invoke_planner()'s own first action), though this is still "
+                "best-effort and not an absolute guarantee"
             )
         pytest.fail(
             "pid_proof_planner.json missing; executor "
             f"returncode={result.returncode!r} "
             f"stdout={result.stdout!r} stderr={result.stderr!r}; "
-            f"{classification_diag}"
+            f"{classification_diag}; {spawn_attempt_diag}"
         )
     planner_proof = json.loads(planner_proof_path.read_text(encoding="utf-8"))
     proof = {"preflight": preflight_proof, "planner": planner_proof}
@@ -841,25 +986,51 @@ def test_ac10_real_executor_chain_drives_real_preflight_and_planner_with_pid_pro
 def test_ac10_diagnostic_negative_control_missing_planner_script_surfaces_classification_sidecar(
     tmp_path: Path,
 ) -> None:
-    """P2-1 (Issue #2073 PR #2080 OWNER review): the AC10 test above added a
-    `if not planner_proof_path.exists(): pytest.fail(...)` diagnostic branch
-    (Issue #2073 P1-2) that had no dedicated coverage of its own. This test
-    fault-injects a genuinely missing planner script -- deleting
-    `plan_refinement_loop.py` after installing the AC10 fixture, so the real
-    preflight's `_invoke_planner()` subprocess.run() call raises
-    `FileNotFoundError` and returns `(None, 3, "planner script not found: ...",
-    "")` before the planner subprocess (and therefore its pid-proof harness
-    splice point, Issue #2073 candidate (e)) can ever run -- and asserts that:
+    """P2-1 / P1-2 (Issue #2073 PR #2080 OWNER review, corrected in #2073
+    follow-up): the AC10 test above added a `if not planner_proof_path.exists():
+    pytest.fail(...)` diagnostic branch (Issue #2073 P1-2) that had no
+    dedicated coverage of its own. This test fault-injects a genuinely
+    missing planner script -- deleting `plan_refinement_loop.py` after
+    installing the AC10 fixture.
+
+    **Correction (Issue #2073 OWNER review, subprocess semantics)**: the
+    original version of this docstring claimed the real preflight's
+    `_invoke_planner()` `subprocess.run()` call itself raises
+    `FileNotFoundError` in this scenario. That claim was wrong: the first
+    argv element is `sys.executable`, which still exists, so
+    `subprocess.run()` spawns the interpreter successfully; it is the
+    *interpreter* that then fails to open the missing script path and exits
+    with its own nonzero code (stdout empty), which is a completely
+    different code path (and, before the accompanying `_invoke_planner()`
+    fix, a completely different, semantically wrong `exit_code`/category)
+    than the `except FileNotFoundError:` handler this docstring described.
+    `_invoke_planner()` now performs an explicit `PLANNER_SCRIPT.is_file()`
+    pre-check *before* ever spawning a subprocess, so the missing-script case
+    is detected deterministically and reuses the same
+    `(None, 3, "planner script not found: ...", "")` shape the (much rarer)
+    missing-*executable* `except FileNotFoundError:` branch already produced,
+    without ever depending on this test's own particular fault-injection
+    site (`sys.executable` vs. `PLANNER_SCRIPT`) matching a real
+    `FileNotFoundError` exception.
+
+    This test asserts that:
 
     1. `pid_proof_planner.json` is genuinely never written (the fault
        injection reaches the intended code path, not some other failure).
     2. `run_refinement_preflight.py`'s `plan is None` failure-classification
        branch *is* reached (unlike the still-open AC10 flake, where whether
        this branch is reached is exactly the open question) and writes a
-       non-empty `planner_failure_classification_v1.json` sidecar, i.e. the
-       diagnostic added in Issue #2073 P1-2 surfaces real, non-stub content
-       for this negative-control failure mode.
-    3. The executor itself never emits `SKILL_RUNTIME_FAIL` and returns an
+       non-empty `planner_failure_classification_v1.json` sidecar with
+       `exit_code == 3` and `category == "wrapper_environment_failure"` --
+       not just "some" content (the previous version of this test only
+       asserted the sidecar was truthy, which would have silently accepted
+       the pre-fix `exit_code == 2` / `anchor_or_input_blocked`
+       misclassification too).
+    3. The new pre-spawn `planner_spawn_attempt_v1.json` diagnostic marker
+       (Issue #2073 P1-4) is written with `script_missing_precheck: true`,
+       confirming the pre-check path (not the subprocess-spawn path) is what
+       actually detected the missing script in this scenario.
+    4. The executor itself never emits `SKILL_RUNTIME_FAIL` and returns an
        exit code within the same accepted range as AC10 (the missing-planner
        failure is folded into the existing `environment_failure` (exit 3)
        mapping, exercised via `classify_planner_failure`'s real production
@@ -895,6 +1066,17 @@ def test_ac10_diagnostic_negative_control_missing_planner_script_surfaces_classi
     classification = json.loads(classification_path.read_text(encoding="utf-8"))
     assert isinstance(classification, dict)
     assert classification, "classification sidecar must carry real diagnostic content, not an empty stub"
+    assert classification.get("exit_code") == 3, classification
+    assert classification.get("category") == "wrapper_environment_failure", classification
+    assert "not found" in classification.get("stderr_excerpt", ""), classification
+
+    spawn_attempt_path = artifact_dir / "planner_spawn_attempt_v1.json"
+    assert spawn_attempt_path.exists(), (
+        "expected the pre-spawn diagnostic marker (Issue #2073 P1-4) to be "
+        f"written before the missing-script pre-check short-circuits; executor result={result!r}"
+    )
+    spawn_attempt = json.loads(spawn_attempt_path.read_text(encoding="utf-8"))
+    assert spawn_attempt.get("script_missing_precheck") is True, spawn_attempt
 
 
 @pytest.mark.parametrize(
