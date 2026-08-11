@@ -70,7 +70,7 @@ jobs:
       # `resolve_visual_impact.py` / `visual-impact.schema.json` / any
       # `package.json` script.
       - name: Checkout base/default branch (never the candidate PR head)
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           # actions/checkout keeps its GitHub token in RUNNER_TEMP and
           # removes it during post-job cleanup. This is the supported Git
