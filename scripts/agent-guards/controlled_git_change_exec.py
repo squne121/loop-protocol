@@ -764,7 +764,9 @@ def execute_controlled_change(
         return _denied("commit_message_required")
     if not expected_head:
         return _denied("expected_head_required")
-    if expected_old is not None and expected_old != snapshot.base_sha:
+    if not expected_old:
+        return _denied("expected_old_required")
+    if expected_old != snapshot.base_sha:
         return _denied("expected_old_snapshot_mismatch")
 
     # 2. Repository / worktree / branch / HEAD binding.
@@ -806,7 +808,7 @@ def execute_controlled_change(
     local_head = _current_head(cwd)
     if local_head != expected_head:
         return _denied("head_race_detected")
-    if expected_old is not None and _current_ref(cwd, snapshot.base_ref) != expected_old:
+    if _current_ref(cwd, snapshot.base_ref) != expected_old:
         return _denied("expected_old_cas_mismatch")
 
     # 3. Requested pathspecs must be literal (no magic, no directories).
@@ -942,7 +944,7 @@ def execute_controlled_change(
     if _current_head(cwd) != expected_head:
         _unstage(cwd, requested_pathspecs)
         return _denied("head_race_detected_before_commit")
-    if expected_old is not None and _current_ref(cwd, snapshot.base_ref) != expected_old:
+    if _current_ref(cwd, snapshot.base_ref) != expected_old:
         _unstage(cwd, requested_pathspecs)
         return _denied("expected_old_cas_mismatch_before_commit")
 
@@ -1009,8 +1011,16 @@ def execute_controlled_change(
         )
         _unstage(cwd, requested_pathspecs)
         return _denied("post_commit_audit_violation_rolled_back")
-    if expected_old is not None and _current_ref(cwd, snapshot.base_ref) != expected_old:
-        subprocess.run(["git", "reset", "--soft", "HEAD~1"], cwd=cwd, capture_output=True, text=True, timeout=30, env=_sanitized_git_env(), check=False)
+    if _current_ref(cwd, snapshot.base_ref) != expected_old:
+        subprocess.run(
+            ["git", "reset", "--soft", "HEAD~1"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_sanitized_git_env(),
+            check=False,
+        )
         _unstage(cwd, requested_pathspecs)
         return _denied("postcondition_expected_old_readback_mismatch_rolled_back")
 
@@ -1031,6 +1041,7 @@ def execute_controlled_merge_continue(
     requested_pathspecs: List[str],
     commit_message: str,
     expected_head: str,
+    expected_old: Optional[str] = None,
     current_issue_body_sha256: Optional[str] = None,
     current_comments_digest_sha256: Optional[str] = None,
     current_allowed_paths_sha256: Optional[str] = None,
@@ -1060,6 +1071,10 @@ def execute_controlled_merge_continue(
         return _denied("commit_message_required")
     if not expected_head:
         return _denied("expected_head_required")
+    if not expected_old:
+        return _denied("expected_old_required")
+    if expected_old != snapshot.base_sha:
+        return _denied("expected_old_snapshot_mismatch")
 
     repo_root = _git_toplevel(cwd)
     if repo_root is None:
@@ -1090,6 +1105,8 @@ def execute_controlled_merge_continue(
         return _denied("branch_binding_mismatch")
     if _current_head(cwd) != expected_head:
         return _denied("head_race_detected")
+    if _current_ref(cwd, snapshot.base_ref) != expected_old:
+        return _denied("expected_old_cas_mismatch")
     if not requested_pathspecs:
         return _denied("no_pathspecs_requested")
 
@@ -1141,6 +1158,8 @@ def execute_controlled_merge_continue(
         return _denied("merge_unresolved_after_staging")
     if _current_head(cwd) != expected_head:
         return _denied("head_race_detected_before_commit")
+    if _current_ref(cwd, snapshot.base_ref) != expected_old:
+        return _denied("expected_old_cas_mismatch_before_commit")
 
     index_ok, index_raw = _diff_index_raw(cwd, snapshot.base_sha)
     if not index_ok:
@@ -1435,7 +1454,11 @@ def _build_cli_parser():
     parser.add_argument("--message", default=None, help="commit message")
     parser.add_argument("--message-file", default=None, help="path to a file containing the commit message")
     parser.add_argument("--expected-head", required=True, help="expected local HEAD SHA (race guard, required)")
-    parser.add_argument("--expected-old", default=None, help="expected current base SHA (CAS guard)")
+    parser.add_argument(
+        "--expected-old",
+        required=True,
+        help="expected current base SHA (mandatory CAS guard)",
+    )
     parser.add_argument(
         "--merge-continue",
         action="store_true",

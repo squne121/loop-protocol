@@ -132,34 +132,66 @@ class MainDriftDecision:
 
 
 def classify_main_drift(
-    *, current_base_sha: str, evidence_base_sha: str, allowed_paths_snapshot_base_sha: str,
-    allowed_paths: Iterable[str], latest_main_net_diff: Iterable[str], expected_head_sha: str,
-    observed_head_sha: str, expected_old_sha: str, observed_old_sha: str,
-    semantic_ambiguity: bool = False, behind_fast_path_eligible: bool = False,
+    *,
+    current_base_sha: str,
+    evidence_base_sha: str,
+    allowed_paths_snapshot_base_sha: str,
+    allowed_paths: Iterable[str],
+    latest_main_net_diff: Iterable[str],
+    expected_head_sha: str,
+    observed_head_sha: str,
+    expected_old_sha: str,
+    observed_old_sha: str,
+    semantic_ambiguity: bool = False,
+    behind_fast_path_eligible: bool = False,
     owner: str = "implementation",
 ) -> MainDriftDecision:
     """Classify base-bound evidence freshness without performing mutation."""
-    values = (current_base_sha, evidence_base_sha, allowed_paths_snapshot_base_sha,
-              expected_head_sha, observed_head_sha, expected_old_sha, observed_old_sha)
-    if any(not isinstance(value, str) or not _MAIN_DRIFT_SHA.fullmatch(value) for value in values):
+    values = (
+        current_base_sha,
+        evidence_base_sha,
+        allowed_paths_snapshot_base_sha,
+        expected_head_sha,
+        observed_head_sha,
+        expected_old_sha,
+        observed_old_sha,
+    )
+    if any(
+        not isinstance(value, str) or not _MAIN_DRIFT_SHA.fullmatch(value)
+        for value in values
+    ):
         return MainDriftDecision("hard_stop", "base_sha_fingerprint_mismatch", None, {}, {})
     if expected_head_sha != observed_head_sha:
         return MainDriftDecision("hard_stop", "expected_head_cas_mismatch", None, {}, {})
     if expected_old_sha != observed_old_sha:
         return MainDriftDecision("hard_stop", "expected_old_cas_mismatch", None, {}, {})
     if current_base_sha == evidence_base_sha:
-        return MainDriftDecision("fresh", None, {"base_sha": current_base_sha, "epoch": 0, "owner": owner},
-                                 {"snapshot": False, "ci": False, "review": False},
-                                 {"snapshot": "current", "ci": "current", "review": "current"})
+        return MainDriftDecision(
+            "fresh",
+            None,
+            {"base_sha": current_base_sha, "epoch": 0, "owner": owner},
+            {"snapshot": False, "ci": False, "review": False},
+            {"snapshot": "current", "ci": "current", "review": "current"},
+        )
     if allowed_paths_snapshot_base_sha != current_base_sha:
         return MainDriftDecision("hard_stop", "stale_allowed_paths_snapshot", None, {}, {})
     if semantic_ambiguity:
         return MainDriftDecision("hard_stop", "semantic_ambiguity", None, {}, {})
-    if any(not any(path == allowed or (allowed.endswith("/") and path.startswith(allowed)) for allowed in allowed_paths)
-           for path in set(latest_main_net_diff)):
+    if any(
+        not any(
+            path == allowed or (allowed.endswith("/") and path.startswith(allowed))
+            for allowed in allowed_paths
+        )
+        for path in set(latest_main_net_diff)
+    ):
         return MainDriftDecision("hard_stop", "allowed_paths_conflict", None, {}, {})
     common = {
-        "evidence_epoch": {"base_sha": current_base_sha, "epoch": 1, "owner": owner, "implementation_iteration_delta": 0},
+        "evidence_epoch": {
+            "base_sha": current_base_sha,
+            "epoch": 1,
+            "owner": owner,
+            "implementation_iteration_delta": 0,
+        },
         "reverify": {"snapshot": True, "ci": True, "review": True},
         "reusable_evidence": {"snapshot": None, "ci": None, "review": None},
     }
@@ -313,6 +345,55 @@ def _is_behind(merge_state_status: Any) -> bool:
     return merge_state_status == "BEHIND"
 
 
+def _classify_implementation_main_drift(
+    main_drift: Mapping[str, Any],
+    *,
+    reviewed_head_sha: str,
+    live_head_sha: str,
+    merge_state_status: str,
+) -> MainDriftDecision | None:
+    """Map caller-supplied live facts into the shared pure policy.
+
+    This is deliberately independent of approval / CI state.  A stale
+    base-bound snapshot, CI result, or review may not survive merely because
+    GitHub currently reports CLEAN, HAS_HOOKS, BLOCKED, or another state.
+    """
+    try:
+        return classify_main_drift(
+            current_base_sha=main_drift["current_base_sha"],
+            evidence_base_sha=main_drift["evidence_base_sha"],
+            allowed_paths_snapshot_base_sha=main_drift[
+                "allowed_paths_snapshot_base_sha"
+            ],
+            allowed_paths=main_drift["allowed_paths"],
+            latest_main_net_diff=main_drift["latest_main_net_diff"],
+            expected_head_sha=reviewed_head_sha,
+            observed_head_sha=live_head_sha,
+            expected_old_sha=main_drift["expected_old_sha"],
+            observed_old_sha=main_drift["observed_old_sha"],
+            semantic_ambiguity=bool(main_drift.get("semantic_ambiguity", False)),
+            behind_fast_path_eligible=(
+                _is_behind(merge_state_status)
+                and bool(main_drift.get("behind_fast_path_eligible", False))
+            ),
+        )
+    except (KeyError, TypeError):
+        return None
+
+
+def _reconciliation_decision(drift: MainDriftDecision) -> RouteDecision:
+    return _decision(
+        ROUTE_SCOPE_CLEAN_RECONCILIATION,
+        reason_code=drift.reason_code,
+        selected_action={
+            "kind": "scope_clean_reconciliation",
+            "evidence_epoch": dict(drift.evidence_epoch or {}),
+            "reusable_evidence": dict(drift.reusable_evidence),
+        },
+        rerun_required=drift.reverify,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -385,6 +466,30 @@ def route_loop_verdict_v2(
     if merge_state_status == "DIRTY":
         return _conflict("conflict_merge_state_status_DIRTY")
 
+    # Main drift is an implementation-loop transition, rather than a BEHIND
+    # special case.  Rebind/invalidate stale base-bound evidence before any
+    # reviewer verdict or merge-state dispatch can reuse it.  A real Git
+    # conflict remains the higher-priority terminal route above.
+    drift_strategy: str | None = None
+    if main_drift is not None:
+        drift = _classify_implementation_main_drift(
+            main_drift,
+            reviewed_head_sha=reviewed_head_sha,
+            live_head_sha=live_head_sha,
+            merge_state_status=merge_state_status,
+        )
+        if drift is None:
+            return _fail("main_drift_context_invalid", "main drift context is incomplete")
+        if drift.route == "hard_stop":
+            return _fail(
+                drift.reason_code or "main_drift_hard_stop",
+                "main drift reconciliation is unsafe",
+            )
+        if drift.route == "scope_clean_reconciliation":
+            return _reconciliation_decision(drift)
+        if drift.route == "behind_fast_path":
+            drift_strategy = "behind_fast_path"
+
     # ------------------------------------------------------------------
     # Priority 3: reviewer verdict dispatch.
     # ------------------------------------------------------------------
@@ -435,23 +540,6 @@ def route_loop_verdict_v2(
     # state per #1873.
     # ------------------------------------------------------------------
     if _is_behind(merge_state_status):
-        if main_drift is not None:
-            try:
-                drift = classify_main_drift(
-                    current_base_sha=main_drift["current_base_sha"], evidence_base_sha=main_drift["evidence_base_sha"],
-                    allowed_paths_snapshot_base_sha=main_drift["allowed_paths_snapshot_base_sha"], allowed_paths=main_drift["allowed_paths"],
-                    latest_main_net_diff=main_drift["latest_main_net_diff"], expected_head_sha=reviewed_head_sha,
-                    observed_head_sha=live_head_sha, expected_old_sha=main_drift["expected_old_sha"],
-                    observed_old_sha=main_drift["observed_old_sha"], semantic_ambiguity=bool(main_drift.get("semantic_ambiguity", False)),
-                    behind_fast_path_eligible=bool(main_drift.get("behind_fast_path_eligible", False)),
-                )
-            except (KeyError, TypeError):
-                return _fail("main_drift_context_invalid", "main drift context is incomplete")
-            if drift.route == "hard_stop":
-                return _fail(drift.reason_code or "main_drift_hard_stop", "main drift reconciliation is unsafe")
-            if drift.route == "scope_clean_reconciliation":
-                return _decision(ROUTE_SCOPE_CLEAN_RECONCILIATION, reason_code=drift.reason_code,
-                    selected_action={"kind": "scope_clean_reconciliation", "evidence_epoch": dict(drift.evidence_epoch or {})}, rerun_required=drift.reverify)
         action = {
             "kind": "update_branch",
             "executor": _UPDATE_BRANCH_EXECUTOR,
@@ -459,8 +547,8 @@ def route_loop_verdict_v2(
             "mechanical": True,
             "expected_head_sha": reviewed_head_sha,
         }
-        if main_drift is not None:
-            action["main_drift_strategy"] = "behind_fast_path"
+        if drift_strategy is not None:
+            action["main_drift_strategy"] = drift_strategy
         return _decision(
             ROUTE_TO_UPDATE_BRANCH,
             selected_action=action,

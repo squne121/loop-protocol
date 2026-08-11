@@ -31,7 +31,9 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-_IMPL_MAIN_DRIFT_SCRIPTS = Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts"
+_IMPL_MAIN_DRIFT_SCRIPTS = (
+    Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts"
+)
 if str(_IMPL_MAIN_DRIFT_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_IMPL_MAIN_DRIFT_SCRIPTS))
 try:
@@ -45,15 +47,43 @@ def classify_refinement_evidence_epoch(context: dict[str, Any]) -> dict[str, Any
     if classify_main_drift is None:
         return {"route": "hard_stop", "reason_code": "main_drift_policy_import_failed"}
     try:
-        result = classify_main_drift(current_base_sha=context["current_base_sha"], evidence_base_sha=context["evidence_base_sha"],
-            allowed_paths_snapshot_base_sha=context["allowed_paths_snapshot_base_sha"], allowed_paths=context["allowed_paths"],
-            latest_main_net_diff=context.get("latest_main_net_diff", ()), expected_head_sha=context["expected_head_sha"],
-            observed_head_sha=context["observed_head_sha"], expected_old_sha=context["expected_old_sha"], observed_old_sha=context["observed_old_sha"],
-            semantic_ambiguity=bool(context.get("semantic_ambiguity", False)), owner="refinement")
+        result = classify_main_drift(
+            current_base_sha=context["current_base_sha"],
+            evidence_base_sha=context["evidence_base_sha"],
+            allowed_paths_snapshot_base_sha=context[
+                "allowed_paths_snapshot_base_sha"
+            ],
+            allowed_paths=context["allowed_paths"],
+            latest_main_net_diff=context.get("latest_main_net_diff", ()),
+            expected_head_sha=context["expected_head_sha"],
+            observed_head_sha=context["observed_head_sha"],
+            expected_old_sha=context["expected_old_sha"],
+            observed_old_sha=context["observed_old_sha"],
+            semantic_ambiguity=bool(context.get("semantic_ambiguity", False)),
+            owner="refinement",
+        )
     except (KeyError, TypeError):
         return {"route": "hard_stop", "reason_code": "main_drift_context_invalid"}
-    return {"route": result.route, "reason_code": result.reason_code, "evidence_epoch": dict(result.evidence_epoch or {}),
-        "reverify": dict(result.reverify), "reusable_evidence": dict(result.reusable_evidence), "mutation_owner": "refinement"}
+    return {
+        "route": result.route,
+        "reason_code": result.reason_code,
+        "evidence_epoch": dict(result.evidence_epoch or {}),
+        "reverify": dict(result.reverify),
+        "reusable_evidence": dict(result.reusable_evidence),
+        "mutation_owner": "refinement",
+    }
+
+
+def _refinement_main_drift_decision(
+    known_context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Project optional live main-drift facts into the planner's SSOT output."""
+    if not known_context or "main_drift" not in known_context:
+        return None
+    context = known_context["main_drift"]
+    if not isinstance(context, dict):
+        return {"route": "hard_stop", "reason_code": "main_drift_context_invalid"}
+    return classify_refinement_evidence_epoch(context)
 
 try:
     import yaml as _yaml_module
@@ -2405,6 +2435,11 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         else:
             generated_at = datetime.now(timezone.utc).isoformat()
 
+        # The planner is the refinement loop's production decision source.
+        # If the caller supplies live main-drift facts, emit this decision
+        # before any consumer can reuse base-bound snapshot/CI/review data.
+        refinement_main_drift = _refinement_main_drift_decision(known_context)
+
         # Check for malformations
         fail_closed_reasons = []
         # Track missing sections and contract keys for FAIL_CLOSED_REWRITE_CONSTRAINTS_V1
@@ -2756,6 +2791,15 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 "human_message": "",
             },
         }
+
+        if refinement_main_drift is not None:
+            plan["decisions"]["main_drift_evidence_epoch"] = refinement_main_drift
+            if refinement_main_drift["route"] == "hard_stop":
+                plan["fail_closed"] = {
+                    "required": True,
+                    "reason_codes": [refinement_main_drift["reason_code"]],
+                    "human_message": "main drift evidence cannot be safely rebound",
+                }
 
         if scope_signal_guard_decision_v2 is not None:
             plan["scope_signal_guard_decision_v2"] = scope_signal_guard_decision_v2

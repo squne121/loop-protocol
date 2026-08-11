@@ -3248,7 +3248,9 @@ def _classify_rtk_git_merge_default_branch(
 # containment-checked against the resolved active issue worktree.
 CONTROLLED_GIT_CHANGE_EXEC_SCRIPT = "scripts/agent-guards/controlled_git_change_exec.py"
 _CGCE_METACHAR_RE = re.compile(r"[;&|<>$`\n\r\0\\(){}*?\[\]!~]")
-_CGCE_SINGLE_VALUE_FLAGS = frozenset({"--cwd", "--materialize-request", "--message", "--expected-head", "--expected-old"})
+_CGCE_SINGLE_VALUE_FLAGS = frozenset(
+    {"--cwd", "--materialize-request", "--message", "--expected-head", "--expected-old"}
+)
 _CGCE_REPEATABLE_VALUE_FLAGS = frozenset({"--path"})
 _CGCE_REQUIRED_FLAGS = frozenset({"--cwd", "--materialize-request", "--message", "--expected-head", "--expected-old"})
 

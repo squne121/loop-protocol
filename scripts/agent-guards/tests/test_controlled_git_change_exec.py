@@ -28,11 +28,18 @@ from controlled_git_change_exec import (  # noqa: E402
     build_issue_scope_snapshot,
     compute_allowed_paths_sha256,
     compute_comments_digest_sha256,
-    execute_controlled_change,
+    execute_controlled_change as _execute_controlled_change,
     execute_controlled_merge_continue,
     resolve_authority,
 )
 from git_mutation_command_policy import classify_agent_lane_add_commit  # noqa: E402
+
+
+def execute_controlled_change(*args, **kwargs):
+    """Use the production API with the now-mandatory CAS value by default."""
+    snapshot = kwargs["snapshot"]
+    kwargs.setdefault("expected_old", snapshot.base_sha)
+    return _execute_controlled_change(*args, **kwargs)
 
 
 def _init_repo(repo: Path) -> str:
@@ -55,13 +62,23 @@ def _head(repo: Path) -> str:
     ).stdout.strip()
 
 
+def _main_head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def _build_snapshot(
     repo: Path,
     *,
     allowed_paths,
     issue_number: int = 1611,
     issue_body: str = "## Outcome\nsomething\n",
-    base_sha: str = "a" * 40,
+    base_sha: str | None = None,
     target_branch: str = "topic",
     authority_mode: str = AUTHORITY_NEW_ONLY,
     comment_bodies=("",),
@@ -77,7 +94,7 @@ def _build_snapshot(
         comment_bodies=comment_bodies,
         allowed_paths=allowed_paths,
         base_ref="main",
-        base_sha=base_sha,
+        base_sha=base_sha or _main_head(repo),
         branch_ref=f"refs/heads/{target_branch}",
         worktree_path=str(repo),
         authority_mode=authority_mode,
@@ -282,6 +299,7 @@ def test_merge_continue_resolves_root_skill_file_directory_conflict(tmp_path: Pa
         requested_pathspecs=[".agents/skills"],
         commit_message="merge: resolve root skill surface conflict",
         expected_head=topic_head,
+        expected_old=main_head,
     )
 
     assert result.status == "committed"
@@ -318,6 +336,7 @@ def test_merge_continue_rejects_unresolved_or_out_of_scope_path(tmp_path: Path):
         requested_pathspecs=[".agents/skills"],
         commit_message="merge: reject scope escape",
         expected_head=topic_head,
+        expected_old=main_head,
     )
 
     assert result.status == "denied"
@@ -336,6 +355,7 @@ def test_merge_continue_requires_existing_unmerged_merge(tmp_path: Path):
         requested_pathspecs=["README.md"],
         commit_message="merge: reject clean repository",
         expected_head=_head(repo),
+        expected_old=snapshot.base_sha,
     )
 
     assert result.status == "denied"
@@ -801,11 +821,11 @@ def test_env_sanitization_applied_to_stage_and_commit_calls(tmp_path: Path, monk
     # subprocess calls against; it is not meant to also break the test's
     # own unrelated setup helpers.
     expected_head = _head(repo)
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
 
     _poison_git_env(monkeypatch, tmp_path)
     calls = _spy_on_subprocess_run(monkeypatch)
 
-    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
     result = execute_controlled_change(
         cwd=str(repo),
         snapshot=snapshot,
@@ -842,11 +862,11 @@ def test_env_sanitization_applied_to_unstage_call(tmp_path: Path, monkeypatch):
     _init_repo(repo)
     (repo / "outside.py").write_text("x = 1\n")
     expected_head = _head(repo)
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
 
     _poison_git_env(monkeypatch, tmp_path)
     calls = _spy_on_subprocess_run(monkeypatch)
 
-    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
     result = execute_controlled_change(
         cwd=str(repo),
         snapshot=snapshot,
@@ -922,6 +942,77 @@ def test_env_sanitization_applied_to_rollback_call(tmp_path: Path, monkeypatch):
 
 
 # ─── AC8 ──────────────────────────────────────────────────────────────────
+
+
+def test_expected_old_is_mandatory_and_precommit_cas_mismatch_is_denied(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import controlled_git_change_exec as module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "a.py").write_text("x\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+
+    missing = _execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: missing expected old",
+        expected_head=_head(repo),
+    )
+    assert missing.reason_code == "expected_old_required"
+
+    monkeypatch.setattr(module, "_current_ref", lambda *_args: "f" * 40)
+    mismatch = _execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: precommit cas mismatch",
+        expected_head=_head(repo),
+        expected_old=snapshot.base_sha,
+    )
+    assert mismatch.reason_code == "expected_old_cas_mismatch"
+    assert _staged_name_only(repo) == ""
+
+
+def test_expected_old_postcondition_mismatch_rolls_back_commit(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import controlled_git_change_exec as module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "a.py").write_text("x\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    head_before = _head(repo)
+    calls = 0
+
+    def _drifting_ref(*_args):
+        nonlocal calls
+        calls += 1
+        return snapshot.base_sha if calls < 3 else "f" * 40
+
+    monkeypatch.setattr(module, "_current_ref", _drifting_ref)
+    result = _execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: postcondition cas mismatch",
+        expected_head=head_before,
+        expected_old=snapshot.base_sha,
+    )
+    assert result.reason_code == "postcondition_expected_old_readback_mismatch_rolled_back"
+    assert _head(repo) == head_before
+    assert _staged_name_only(repo) == ""
 
 
 def test_stale_snapshot_comment_drift_and_head_race_denies(tmp_path: Path):
@@ -1062,7 +1153,7 @@ def test_shared_matcher_used_by_staging_commit_review():
 def test_legacy_env_and_new_snapshot_not_simultaneous_authority(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"], base_sha="a" * 40)
 
     combos = [
         (AUTHORITY_OLD_ONLY, "legacy paths here", None, AUTHORITY_SOURCE_LEGACY_ENV),
@@ -1220,6 +1311,8 @@ def test_snapshot_json_flag_always_denied(tmp_path: Path):
                 "feat: x",
                 "--expected-head",
                 _head(repo),
+                "--expected-old",
+                _main_head(repo),
             ]
         )
     assert rc == 1
@@ -1247,6 +1340,8 @@ def test_materialize_request_required_when_snapshot_json_absent(tmp_path: Path):
                 "feat: x",
                 "--expected-head",
                 _head(repo),
+                "--expected-old",
+                _main_head(repo),
             ]
         )
     assert rc == 1
@@ -1301,7 +1396,31 @@ def test_materialize_request_drives_commit_via_live_snapshot(tmp_path: Path, mon
                 "feat: add new file",
                 "--expected-head",
                 _head(repo),
+                "--expected-old",
+                live_snapshot.base_sha,
             ]
         )
     assert rc == 0
     assert '"status": "committed"' in buf.getvalue()
+
+
+def test_cli_requires_expected_old_before_materialization(tmp_path: Path):
+    import pytest
+    import controlled_git_change_exec as controlled_module
+
+    with pytest.raises(SystemExit) as exc:
+        controlled_module._main(
+            [
+                "--cwd",
+                str(tmp_path),
+                "--materialize-request",
+                "request.json",
+                "--path",
+                "README.md",
+                "--message",
+                "feat: missing expected old",
+                "--expected-head",
+                "a" * 40,
+            ]
+        )
+    assert exc.value.code == 2
