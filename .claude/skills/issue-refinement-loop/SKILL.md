@@ -199,6 +199,34 @@ isolation agent は `skill_runtime_exec.py`（exact executor）を自ら実行�
 
 既存の Step 0f 直接実行 bash block（`run_refinement_preflight.py` を直接呼ぶ例）は、orchestrator 自身が canonical main root もしくは canonically-named issue worktree から直接実行する場合に限定される。isolation worktree agent からは直接実行しない — isolation agent への委譲時は必ず上記の parent-owned preflight 方針に従い、parent が実行した結果のみを渡す。
 
+#### Step 0f 補足: main のずれを検知した際の証拠エポック known_context.main_drift の生成契約（Issue #2102 の修正差分・第2反復）
+
+`plan_refinement_loop.py` は read-only であり、git/GitHub I/O を一切行わない（`_refinement_main_drift_decision()` / `classify_refinement_evidence_epoch()` は `known_context["main_drift"]` が渡された場合のみ動作する opt-in 経路）。このキーは **orchestrator（issue-refinement-loop control-plane）自身が Step 0f の `run_refinement_preflight.py` 呼び出し直前に構築しなければならない（MUST）**。既存の `known_context.scope_delta_decision` echo と同じ位置付け（診断用の advisory echo であり、canonical な mutation-phase routing 権限は持たない）で扱う。
+
+control-plane は以下を同一 decision cycle 内で fresh に取得し、`known_context["main_drift"]` として組み立てる:
+
+```yaml
+main_drift:
+  current_base_sha: <live default branch HEAD。materialize_issue_scope_snapshot.py の
+                      _live_default_branch() と同じ GitHub REST 経由の読み取り方法を使う
+                      （ローカル ref のキャッシュ値を使わない）>
+  evidence_base_sha: <直近の Contract Snapshot / scope snapshot が束縛されている base SHA>
+  allowed_paths_snapshot_base_sha: <現行 Allowed Paths snapshot が束縛されている base SHA>
+  allowed_paths: <live Issue 本文の Allowed Paths（現在の生リスト）>
+  latest_main_net_diff: <`git diff --name-only evidence_base_sha current_base_sha` の結果。
+                          最終的な post-reconciliation net diff とは別物であり、
+                          その計算は refinement/impl 側 mutation consumer の責務>
+  expected_old_sha: <この evidence rebind が最終的に mutate する ref の CAS 期待値>
+  observed_old_sha: <同一 decision cycle 内で再読した同じ ref の現在値>
+  semantic_ambiguity: <bool。`git merge-tree --write-tree <expected_old_sha> <current_base_sha>` の
+                        終了コード（非 0 = conflict）から算出する。caller が推測で true/false を
+                        書いてはならない>
+```
+
+`known_context["main_drift"]` を省略した場合、planner は `main_drift_evidence_epoch` decision を一切出力しない（#2102 以前の挙動を保持）。
+
+**実配線の現状（正直な開示）**: 本 fix_delta（iteration 2）の時点で、上記の構築処理を実際に呼び出す production Python コードパス（`run_refinement_preflight.py` から `known_context["main_drift"]` を自動組み立てる関数）はまだ存在しない。`run_refinement_preflight.py` は Allowed Paths 内（`.claude/skills/issue-refinement-loop/scripts/`）だが、live GitHub REST 呼び出し・git diff・`git merge-tree` を安全に組み込む実装は本 Issue のテスト境界（`test_main_drift_evidence_epoch.py` は planner 関数を直接呼ぶ単体テストのみで、orchestrator 統合テストを要求しない）を超える追加実装であり、既存 preflight フローの回帰リスクを伴う。したがって本節はこの MUST 手順を **control-plane が Step 0f 実行前に人手（または将来の自動化コミット）で満たすべき契約** として明記するに留める。この契約の production wiring 自体は follow-up として別途扱う必要がある。
+
 ### Step 1: 事前調査 (Investigation)
 
 `REFINEMENT_LOOP_PLAN_V1.decisions.investigation_policy.required == true` の場合のみ `codebase-investigator` を起動する。返却される構造化結果を受け取り、`final_classification` の確定責務は main thread が保持する。SubAgent は mutation してはいけない。

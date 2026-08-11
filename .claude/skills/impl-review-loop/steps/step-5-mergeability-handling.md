@@ -66,6 +66,24 @@ main_drift_facts:
 一致を確認する。必須 key が欠けたら drift なしと推定せず fail-closed とする。control-plane は
 raw snapshot / 過去 CI / 過去 review URL をこの facts の代替にしてはならない。
 
+### `semantic_ambiguity` は control-plane が実 git 検査で算出する（Issue #2102 fix_delta iteration 2）
+
+`route_loop_verdict_v2.py` 自身は subprocess を呼ばない設計制約を保つ（router を純粋な決定論的関数として保つため）。したがって `semantic_ambiguity` は router 内部で算出されず、**呼び出し元（この Step 5 手順を実行する control-plane）が `main_drift_facts` を組み立てる前に実 git 検査を実行して算出しなければならない（MUST）**。caller が推測や固定値 `false` を渡すことは禁止する。
+
+`scripts/agent-ops/pr_head_replay_publish_exec.py::_merge_tree_conflicts()` が採用している decision と同じ oracle を、worktree／index を汚さない read-only 呼び出しとして使う:
+
+```bash
+# expected_old_sha は main_drift_facts.expected_old_sha、current_base_sha は同 facts の current_base_sha
+git merge-tree --write-tree "$EXPECTED_OLD_SHA" "$CURRENT_BASE_SHA"
+MERGE_TREE_EXIT=$?
+# 非 0 終了 = 実 conflict あり -> semantic_ambiguity: true
+# 0 終了      = clean merge   -> semantic_ambiguity: false
+```
+
+この呼び出しは `git merge-tree --write-tree` の 2-ref 形式であり、作業ツリー・index を変更しない。control-plane はこの exit code をそのまま `main_drift_facts.semantic_ambiguity` へ写し、上書きしない。
+
+**適用範囲の明示（Safety Claim の正確化）**: この検査は `pr_head_replay_publish_exec.py` の opt-in `main_drift_reconciliation` 経路だけでなく、この Step 5 BEHIND fast path を含む **通常の main drift routing 全体で MUST** とする。ただし本 fix_delta（iteration 2）時点では、上記 bash 呼び出しを実際に実行し `main_drift_facts.semantic_ambiguity` へ機械的に配線する production コードパス（`route_loop_verdict_v2.py` の呼び出し元）はまだ存在せず、この節は control-plane が Step 5 実行のたびに満たすべき手順契約として明記するに留まる。この production wiring は本 PR のテスト境界（`route_loop_verdict_v2.py` は caller-supplied boolean をそのまま消費する既存契約を変更しない）を超えるため、別途 follow-up として扱う必要がある。
+
 ```python
 from route_loop_verdict_v2 import build_step5_live_mergeability, route_loop_verdict_v2
 
