@@ -196,6 +196,7 @@ def _decode_producer_json_scalars(block: dict[str, Any]) -> dict[str, Any]:
             mapping[key] = _parse_bounded_strict_json_collection(value)
 
     checks = inner.get("checks")
+    decode(inner, "expected_contract_fingerprint")
     if not isinstance(checks, dict):
         return block
     decode(checks, "declared_path_overlap")

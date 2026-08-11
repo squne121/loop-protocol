@@ -2642,7 +2642,10 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 # path so cross-repo spoofed evidence fails closed here too.
                 scope_signal_guard_decision_v2["scope_delta_authority"] = classify_scope_delta_authority(
                     known_context.get("scope_delta_authority_evidence"),
-                    triggered=_raw_triggered,
+                    # A no-op delta must not suppress the separate freeform
+                    # authority lane: the classifier validates its evidence
+                    # and remains fail-closed for untrusted or ambiguous input.
+                    triggered=bool(_raw_triggered or known_context.get("scope_delta_authority_evidence")),
                     target_issue_number=issue_number,
                     base_issue_body_sha256=issue_body_sha256,
                     expected_repo=_expected_repo_for_issue(issue, known_context),

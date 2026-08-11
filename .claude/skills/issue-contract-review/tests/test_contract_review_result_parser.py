@@ -410,6 +410,38 @@ class TestValidation:
 class TestParseContractReviewResults:
     """Tests for the main parsing function."""
 
+    def test_quoted_json_fingerprint_is_decoded_to_a_ready_mapping(self):
+        """GIVEN producer-quoted fingerprint JSON WHEN parsed THEN it is source-bound."""
+        fingerprint = dict(_VALID_FINGERPRINT)
+        comment = _make_go_comment(comment_id=1001)
+        comment["body"] = comment["body"].replace(
+            f"  issue_url: {_ISSUE_URL}",
+            "\n".join(
+                [
+                    f"  issue_url: {_ISSUE_URL}",
+                    f"  body_sha256: {fingerprint['contract_body_sha256']}",
+                    "  expected_contract_fingerprint: '"
+                    + json.dumps(fingerprint)
+                    + "'",
+                ]
+            ),
+        )
+
+        results = parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL)
+
+        assert results[0]["inner"]["expected_contract_fingerprint"] == fingerprint
+        assert results[0]["is_fingerprint_ready"] is True
+
+    def test_malformed_quoted_json_fingerprint_is_rejected(self):
+        """GIVEN malformed producer JSON WHEN parsed THEN no authority is accepted."""
+        comment = _make_go_comment(comment_id=1001)
+        comment["body"] = comment["body"].replace(
+            f"  issue_url: {_ISSUE_URL}",
+            f"  issue_url: {_ISSUE_URL}\n  expected_contract_fingerprint: '{{bad}}'",
+        )
+
+        assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
+
     def test_parses_go_comment(self):
         comments = [_make_go_comment()]
         results = parse_contract_review_results(comments, expected_issue_url=_ISSUE_URL)
