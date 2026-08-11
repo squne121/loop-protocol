@@ -208,6 +208,9 @@ _VC_PREFLIGHT_TIMEOUT = (
     + _VC_PREFLIGHT_OVERHEAD_SECONDS
 )
 _DEFAULT_TIMEOUT = 30
+# readiness_check は Issue の全 Verification Commands を実行しうるため、
+# 他の短時間 subprocess 用の _DEFAULT_TIMEOUT とは別に余裕を持たせる。
+_DEFAULT_READINESS_TIMEOUT_SECONDS = 90
 
 # Issue #1338 AC9: named constant for the --max-workers value explicitly
 # passed to baseline_vc_preflight.py. Bounded parallel execution there is
@@ -477,6 +480,7 @@ def run_once(
     evidence_mode: str = "baseline",
     cwd: str | None = None,
     reviewed_head_sha: str | None = None,
+    readiness_timeout_seconds: int = _DEFAULT_READINESS_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """
     Run issue-contract-review checks once for the given issue.
@@ -610,10 +614,16 @@ def run_once(
             body_snapshot_path,
         ]
 
-        readiness_json, readiness_rc, readiness_err = _run_script(readiness_cmd)
+        readiness_json, readiness_rc, readiness_err = _run_script(
+            readiness_cmd,
+            timeout=readiness_timeout_seconds,
+        )
 
         if readiness_err:
-            result["errors"].append(f"readiness_check_error: {readiness_err}")
+            result["errors"].append(
+                "readiness_check_error: "
+                f"{readiness_err} (readiness_timeout_seconds={readiness_timeout_seconds})"
+            )
             result["status"] = "runtime_error"
             return result
 
@@ -982,6 +992,12 @@ def _run_declared_path_overlap_check(issue_number: int, repo: str) -> dict[str, 
 
 
 def main() -> int:
+    def positive_int(value: str) -> int:
+        parsed = int(value)
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("must be a positive integer")
+        return parsed
+
     parser = argparse.ArgumentParser(
         description=(
             "run_contract_review_once: run issue-contract-review checks once, "
@@ -1016,6 +1032,15 @@ def main() -> int:
         default=False,
         help="Skip existing go comment check",
     )
+    parser.add_argument(
+        "--readiness-timeout-seconds",
+        type=positive_int,
+        default=_DEFAULT_READINESS_TIMEOUT_SECONDS,
+        help=(
+            "Timeout in seconds for contract_readiness_check.py only "
+            f"(default: {_DEFAULT_READINESS_TIMEOUT_SECONDS})"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1027,6 +1052,7 @@ def main() -> int:
         evidence_mode=args.evidence_mode,
         cwd=args.cwd,
         reviewed_head_sha=args.reviewed_head_sha,
+        readiness_timeout_seconds=args.readiness_timeout_seconds,
     )
 
     print(json.dumps(result))
