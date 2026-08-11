@@ -134,21 +134,21 @@ hook の未発火を報告する community bug report（"Closed as not planned"�
 
 ## (b) `_run_route_once()` の失敗判定の実際の評価順序
 
-`scripts/agent-ops/run_agent_provider_route_smoke.py:523-552`（tested SHA `9eca2f00`）を
+`scripts/agent-ops/run_agent_provider_route_smoke.py:911-940`（tested SHA `f1adbdc9`）を
 current code から再構成した評価順序は次のとおり。
 
 | 順 | 条件 | ソース行 | `status` | `failure_class` |
 | --- | --- | --- | --- | --- |
-| 1 | `gemini_hits > 0` | `run_agent_provider_route_smoke.py:523` | `fail` | `gemini_invoked` |
-| 2 | `fallback_hits > 0` | `run_agent_provider_route_smoke.py:526` | `fail` | `direct_fallback_invoked` |
-| 3 | `harness_exit == 77` | `run_agent_provider_route_smoke.py:529` | `skip` | `agy_unavailable` |
-| 4 | `harness_exit != 0` | `run_agent_provider_route_smoke.py:532` | `fail` | `validation_failed` |
-| 5 | `not native_spawn_event_observed` | `run_agent_provider_route_smoke.py:535` | `fail` | `spawn_not_observed` |
-| 6 | `request_validation != "pass"` | `run_agent_provider_route_smoke.py:538` | `fail` | `validation_failed` |
-| 7 | `selected_provider != "agy"` | `run_agent_provider_route_smoke.py:541` | `fail` | `provider_mismatch` |
-| 8 | `profile == "github_research" and route_evidence_sha256 is None` | `run_agent_provider_route_smoke.py:544` | `fail` | `route_evidence_schema_mismatch` |
-| 9 | `not wrapper_ok` | `run_agent_provider_route_smoke.py:547` | `fail` | `validation_failed` |
-| 10 | 上記いずれにも該当しない | `run_agent_provider_route_smoke.py:550` | `pass` | `None` |
+| 1 | `gemini_hits > 0` | `run_agent_provider_route_smoke.py:911` | `fail` | `gemini_invoked` |
+| 2 | `fallback_hits > 0` | `run_agent_provider_route_smoke.py:914` | `fail` | `direct_fallback_invoked` |
+| 3 | `harness_exit == 77` | `run_agent_provider_route_smoke.py:917` | `skip` | `agy_unavailable` |
+| 4 | `harness_exit != 0` | `run_agent_provider_route_smoke.py:920` | `fail` | `validation_failed` |
+| 5 | `not native_spawn_event_observed` | `run_agent_provider_route_smoke.py:923` | `fail` | `spawn_not_observed` |
+| 6 | `request_validation != "pass"` | `run_agent_provider_route_smoke.py:926` | `fail` | `validation_failed` |
+| 7 | `selected_provider != "agy"` | `run_agent_provider_route_smoke.py:929` | `fail` | `provider_mismatch` |
+| 8 | `profile == "github_research" and route_evidence_sha256 is None` | `run_agent_provider_route_smoke.py:932` | `fail` | `route_evidence_schema_mismatch` |
+| 9 | `not wrapper_ok` | `run_agent_provider_route_smoke.py:935` | `fail` | `validation_failed` |
+| 10 | 上記いずれにも該当しない | `run_agent_provider_route_smoke.py:938` | `pass` | `None` |
 
 ### Issue 本文の記載との drift（current code を正とする）
 
@@ -174,14 +174,21 @@ spawn evidence が有ろうと無かろうと一律 `validation_failed` に落�
 `failure_class` を production と同一順序で複製しつつ、
 それとは独立に raw lifecycle checkpoint から `diagnostic_cause` を算出する。
 
-### `_is_transient_infrastructure_candidate()` — bounded retry 対象の判定（`run_agent_provider_route_smoke.py:394-395`）
+### `_is_transient_infrastructure_candidate()` — bounded retry 対象の判定（`run_agent_provider_route_smoke.py:529-534`）
 
 ```python
-def _is_transient_infrastructure_candidate(route: dict[str, str], failure_class: str | None) -> bool:
-    return route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed"
+def _is_transient_infrastructure_candidate(
+    route: dict[str, str],
+    failure_class: str | None,
+    diagnostics: Mapping[str, Any] | None = None,
+) -> bool:
+    if route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed":
+        return True
 ```
 
-`claude_code` + `spawn_not_observed` は明示的に bounded single retry の対象外である。
+（後続の #2015 P1 追加分岐は `diagnostics["secondary_failures"]` の
+`agy_transient_quota_failure` エントリを bounded retry 対象へ拡張するが、
+`claude_code` + `spawn_not_observed` は依然として明示的に bounded single retry の対象外である。）
 既存テスト `test_claude_spawn_not_observed_is_not_transient_candidate`
 （`scripts/agent-ops/tests/test_agent_provider_route_smoke.py`）がこの契約を固定している。
 評価結果は `retry-policy-assessment.md` に記録する。
