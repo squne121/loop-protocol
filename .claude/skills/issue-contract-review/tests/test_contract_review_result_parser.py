@@ -442,8 +442,8 @@ class TestParseContractReviewResults:
 
         assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
 
-    def test_nested_json_string_fingerprint_stays_non_authoritative_in_fallback(self, monkeypatch):
-        """GIVEN a JSON string WHEN fallback parses THEN it is not decoded as a mapping."""
+    def test_nested_json_string_fingerprint_is_rejected_in_fallback(self, monkeypatch):
+        """GIVEN a double-encoded fingerprint WHEN fallback parses THEN it is rejected."""
         original_import = builtins.__import__
 
         def reject_yaml(name, *args, **kwargs):
@@ -467,12 +467,10 @@ class TestParseContractReviewResults:
 
         results = parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL)
 
-        assert len(results) == 1
-        assert isinstance(results[0]["inner"]["expected_contract_fingerprint"], str)
-        assert results[0]["is_fingerprint_ready"] is False
+        assert results == []
 
-    def test_nested_json_string_fingerprint_stays_non_authoritative_with_pyyaml(self):
-        """GIVEN a noncanonical JSON string WHEN PyYAML parses THEN it stays scalar."""
+    def test_nested_json_string_fingerprint_is_rejected_with_pyyaml(self):
+        """GIVEN a double-encoded fingerprint WHEN PyYAML parses THEN it is rejected."""
         fingerprint = dict(_VALID_FINGERPRINT)
         comment = _make_go_comment(comment_id=1001)
         comment["body"] = comment["body"].replace(
@@ -488,9 +486,7 @@ class TestParseContractReviewResults:
 
         results = parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL)
 
-        assert len(results) == 1
-        assert isinstance(results[0]["inner"]["expected_contract_fingerprint"], str)
-        assert results[0]["is_fingerprint_ready"] is False
+        assert results == []
 
     def test_parses_go_comment(self):
         comments = [_make_go_comment()]

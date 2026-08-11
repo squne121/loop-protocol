@@ -550,6 +550,18 @@ def _is_valid_contract_review_result(
     if expected_issue_url and issue_url != expected_issue_url:
         return False
 
+    # A fingerprint is optional for legacy/provisional GO records, but when
+    # supplied it must already be a mapping.  In particular, a double-encoded
+    # JSON scalar is neither the producer's canonical single-quoted JSON
+    # transport nor a usable flow mapping.  Do not surface it as a GO result:
+    # downstream authority checks distinguish an absent current GO candidate
+    # from a candidate whose mapping merely differs from the expected value.
+    if (
+        "expected_contract_fingerprint" in inner
+        and not isinstance(inner["expected_contract_fingerprint"], dict)
+    ):
+        return False
+
     return True
 
 
