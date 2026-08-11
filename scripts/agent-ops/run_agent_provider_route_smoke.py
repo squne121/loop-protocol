@@ -45,9 +45,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RUNTIME_SMOKE_SCRIPT = Path(__file__).resolve().parent / "run_worktree_agent_runtime_smoke.py"
@@ -60,6 +62,18 @@ RUN_GEMINI_HEADLESS_SCRIPT = (
 GITHUB_RESEARCH_EVIDENCE_SCHEMA = "agy_github_research_evidence/v1"
 
 SCHEMA = "agent_provider_route_smoke/v1"
+
+# Issue #2015 AC11 (OWNER Scope Reframe 2026-08-09): the new child
+# spawn/completion diagnostic fields are recorded in a SEPARATE companion
+# file, never merged into the ``agent_provider_route_smoke/v1`` artifact
+# itself. ``schemas/agent_provider_route_smoke_v1.schema.json`` is
+# ``additionalProperties: false`` at every object level, and ``schemas/``
+# is NOT part of this Issue's Allowed Paths (nor the OWNER scope-delta
+# path list) -- widening that closed schema's contract is out of scope for
+# this change. Keeping the diagnostics in an independent, unvalidated
+# companion artifact avoids both silently breaking the closed schema and
+# reaching outside the authorized Allowed Paths.
+DIAGNOSTICS_SCHEMA = "agent_provider_route_smoke_diagnostics/v1"
 
 REQUIRED_ROUTES: list[dict[str, str]] = [
     {"runtime": "claude_code", "agent": "codebase-investigator", "profile": "local_asset_research"},
@@ -201,12 +215,70 @@ def build_route_prompt(route: dict[str, str], evidence_dir: Path) -> str:
     # file, used only to satisfy the "at least one context file" contract
     # -- never a hand-typed placeholder path.
     context_file_flag = ""
+    target_path_hint = ""
     if profile == "local_asset_research":
         context_file_flag = f" --context-file {REPO_ROOT / 'README.md'}"
+        # Issue #2015 P1 fix (OWNER review #2044, full-route trial finding
+        # #3): a live full-route trial with genuine spawn+completion
+        # evidence (both the tool_use_result channel and the SubagentStop
+        # hook fired) still left the evidence directory completely empty --
+        # neither delegation_request.json nor delegation_result.json was
+        # ever written. The primary root cause (see the ``dir=`` fix in
+        # ``test_run_gemini_headless_live_trial.py``) turned out to be an
+        # evidence directory placed outside the worktree's own Bash
+        # write-boundary, not this prompt -- but the ``codebase-
+        # investigator`` custom agent's OWN documented input contract
+        # (``.claude/agents/codebase-investigator.md``, out of this
+        # Issue's Allowed Paths) separately requires either
+        # ``target_path``/``target_symbol`` or ``keywords``/
+        # ``issue_body``, and this probe's prompt supplied neither.
+        # Supplying an explicit ``target_path`` here (the same real,
+        # always-present ``README.md`` already used for
+        # ``--context-file``) is a harmless, defense-in-depth hint that
+        # satisfies the child's own local-investigation input-contract
+        # branch, without changing the literal composed commands the
+        # child must still run verbatim.
+        target_path_hint = f" target_path: {REPO_ROOT / 'README.md'}."
+    # Issue #2015 P1 fix (control-plane live re-run + live repro, 2026-08-09,
+    # head 69389317): live-reproduced the `validation_failed` /
+    # `retrieval_status: None` / 300s-exhaustion signature via direct,
+    # non-harness `claude -p --agent codebase-investigator` invocations of
+    # this exact prompt (both sequentially and concurrently) -- 100%
+    # consistent mechanism across every reproduced failure, captured with
+    # full raw stream-json transcripts: the delegated child's FIRST action
+    # is an unprompted, unnecessary `mkdir -p <evidence_dir>` (the harness
+    # already creates `evidence_dir` via `evidence_dir.mkdir(parents=True,
+    # exist_ok=True)` in `_run_route_once` BEFORE the child is ever spawned
+    # -- the child never needs to create it). Because `evidence_dir` lives
+    # under `.claude/artifacts/...`, Claude Code's own built-in "sensitive
+    # file" protection hard-denies that `mkdir` (this is independent of the
+    # `codebase-investigator` agent's own `permissionMode: dontAsk`, and of
+    # this repository's committed `.claude/settings.json` deny list -- ask/
+    # dontAsk govern the "ask" permission tier, not this lower, non-
+    # configurable product boundary). The child then silently substitutes
+    # ad hoc `/tmp/...` paths for BOTH `build_request.py --output` and
+    # `run_gemini_headless.py --output-file` instead of the exact paths in
+    # this prompt -- the AGY route itself genuinely succeeds end-to-end
+    # (`retrieval_status: succeeded` on the child's own inspection), but
+    # `evidence_dir/delegation_result.json` is never written, so this
+    # producer's own bounded `_poll_for_file` legitimately exhausts the
+    # entire remaining route deadline waiting for a file that will never
+    # appear. The instruction below removes the ambiguity that invites the
+    # unnecessary `mkdir` and forbids the path substitution outright.
+    no_mkdir_hint = (
+        " The output directory (containing both `delegation_request.json` and "
+        "`delegation_result.json`) already exists -- it was created before you "
+        "were invoked. Do not run `mkdir` or any other directory-creation "
+        "command for it or any ancestor of it, and do not substitute any other "
+        "output path (e.g. under `/tmp`) for `--output` or `--output-file` for "
+        "any reason, even if an earlier command in this task is denied or "
+        "fails for an unrelated reason -- always use the exact paths given "
+        "below verbatim."
+    )
     return (
         f"AGENT_PROVIDER_ROUTE_SMOKE probe (Issue #1886). Use the {agent} custom agent "
         f"(profile: {profile}) for the following bounded task, and report exactly which "
-        f"provider you dispatched to.\n\n"
+        f"provider you dispatched to.{target_path_hint}{no_mkdir_hint}\n\n"
         f"Task: build a delegation_request_v1 via "
         f"`uv run python3 {BUILD_REQUEST_SCRIPT} --provider agy --profile {profile} "
         f"--objective \"agent_provider_route_smoke probe\" --prompt \"Reply with the single "
@@ -330,13 +402,29 @@ def _observed_provider_attempts(raw_attempts: object) -> list[str]:
     return names
 
 
-def _validate_delegation_result_evidence(evidence_dir: Path) -> tuple[str | None, list[str], bool]:
+def _validate_delegation_result_evidence(
+    evidence_dir: Path,
+) -> tuple[str | None, list[str], bool, str | None]:
     """Issue #1886 P0-1 fix_delta: read the ACTUAL run_gemini_headless.py
     wrapper result (via --output-file) instead of stamping
     ``selected_provider: "agy"`` / ``provider_attempts: ["agy"]`` on harness
     exit 0 alone. Returns ``(selected_provider, provider_attempts,
-    wrapper_ok)``; all fail closed to ``None`` / ``[]`` / ``False`` when the
-    result file is missing or malformed -- never guessed."""
+    wrapper_ok, agy_failure_class)``; all fail closed to ``None`` / ``[]`` /
+    ``False`` / ``None`` when the result file is missing or malformed --
+    never guessed.
+
+    Issue #2015 (control-plane live re-run, 2026-08-09): ``agy_failure_class``
+    is the raw ``delegation_result.json["failure_class"]`` value on a
+    materialized ``ok: false`` result -- e.g. ``agy_rate_limited`` from a
+    genuine AGY-side ``RESOURCE_EXHAUSTED`` quota/rate-limit error, live-
+    observed on this host under concurrent multi-session load. It exists so
+    the caller can distinguish this known-transient signal (see
+    ``references/failure-class-taxonomy.md``'s AGY provider failure class
+    table, where ``agy_rate_limited`` / ``agy_capacity_exhausted`` /
+    ``agy_web_grounding_quota_exhausted`` are all documented
+    retryable="yes") from an ordinary, deterministic ``ok: false`` content
+    failure (e.g. ``github_research_incomplete``) that must NOT be retried
+    (see the P1 fix comment above this function's callers)."""
     # Issue #1886 P0-2/P0-3 fix_delta (PR #2005 REQUEST_CHANGES): a
     # provider="agy" direct delegation_result/v1 (the only path this route
     # smoke exercises -- Provider Policy forbids provider="auto") never has
@@ -352,7 +440,7 @@ def _validate_delegation_result_evidence(evidence_dir: Path) -> tuple[str | None
     # that was actually invoked -- never from a guessed/expected value.
     payload = _read_json_file(evidence_dir / "delegation_result.json")
     if not isinstance(payload, dict):
-        return None, [], False
+        return None, [], False, None
     selected_provider = payload.get("selected_provider")
     if not isinstance(selected_provider, str) or not selected_provider:
         selected_provider = payload.get("provider")
@@ -362,7 +450,10 @@ def _validate_delegation_result_evidence(evidence_dir: Path) -> tuple[str | None
     if not provider_attempts and isinstance(payload.get("provider"), str) and payload["provider"]:
         provider_attempts = [payload["provider"]]
     wrapper_ok = payload.get("ok") is True
-    return selected_provider, provider_attempts, wrapper_ok
+    agy_failure_class = payload.get("failure_class")
+    if not isinstance(agy_failure_class, str) or not agy_failure_class:
+        agy_failure_class = None
+    return selected_provider, provider_attempts, wrapper_ok, agy_failure_class
 
 
 def _validate_github_research_route_evidence(evidence_dir: Path) -> str | None:
@@ -391,8 +482,141 @@ def _validate_github_research_route_evidence(evidence_dir: Path) -> str | None:
 # instead comes from the already-captured in-memory stdout stream, so a
 # miss there is never classified as transient (retrying it would silently
 # paper over a genuine identity/spawn failure).
-def _is_transient_infrastructure_candidate(route: dict[str, str], failure_class: str | None) -> bool:
-    return route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed"
+#
+# Issue #2015 AC14 root-cause finding (live reproduction, 2026-08-09, both
+# by control-plane and independently by an implementation-worker delegation
+# on head 505d3528): a SEPARATE genuine infrastructure-timing race, distinct
+# from the codex_cli spawn-evidence-disk-timing race above. A live full-route
+# trial can show every positive completion signal this producer independently
+# observes -- ``native_spawn_event_observed: true``, ``child_spawn_observed:
+# true``, ``child_completion_observed: true`` (via the harness's own
+# ``hook_subagent_stop`` channel, i.e. the delegated child's own SubagentStop
+# hook genuinely fired) -- and still never materialize
+# ``delegation_request.json`` even after the FULL bounded
+# ``_poll_for_file`` wait against the shared route deadline (observed:
+# ``evidence_materialized_elapsed_sec`` consuming the entire remaining
+# budget, e.g. 111s of a 150s route deadline). This is Claude Code's own
+# async ``Task`` tool dispatch (``child_launch_mode: async_launched`` was
+# observed on BOTH a genuinely-passing trial, where the file was already
+# present with zero polling, and a genuinely-failing trial, where it never
+# appeared) racing against the parent ``-p`` session's own turn completion --
+# a runtime behavior neither this producer nor
+# ``run_worktree_agent_runtime_smoke.py`` can force synchronous (out of this
+# Issue's control; not a bug in the child's own Bash tool calls, since the
+# SAME prompt/agent/profile combination passes cleanly on other invocations
+# against the identical head). It is diagnosed here (never silently
+# discarded -- see the ``child_completed_but_artifact_not_materialized``
+# secondary-failure classification in ``_run_route_once``) exactly like the
+# codex_cli disk-timing race above: bounded, single-retry-eligible, ledgered,
+# never a silent re-run of a genuine validation defect. Restricted to this
+# EXACT diagnostic signature (genuine completion observed, artifact never
+# materialized even after the bounded poll) so an unrelated
+# ``validation_failed`` cause (a real request/response schema defect) is
+# never silently retried.
+# Issue #2015 (control-plane live re-run, 2026-08-09): mirrors
+# ``references/failure-class-taxonomy.md``'s AGY provider failure class
+# table's retryable="yes" set exactly -- ``agy_auth_required`` /
+# ``agy_permission_denied`` / ``agy_not_found`` / ``agy_timeout`` /
+# ``agy_exit_nonzero`` / ``agy_empty_stdout`` / ``agy_output_missing`` /
+# ``agy_unexpected_error`` (all retryable="no" there) are deliberately
+# excluded -- a genuine auth/permission/missing-binary/unclassified failure
+# retrying would not resolve it and would only burn route budget.
+_AGY_TRANSIENT_QUOTA_FAILURE_CLASSES = frozenset(
+    {"agy_rate_limited", "agy_capacity_exhausted", "agy_web_grounding_quota_exhausted"}
+)
+
+
+def _is_transient_infrastructure_candidate(
+    route: dict[str, str],
+    failure_class: str | None,
+    diagnostics: Mapping[str, Any] | None = None,
+) -> bool:
+    if route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed":
+        return True
+    if failure_class == "validation_failed" and diagnostics is not None:
+        secondary_failures = diagnostics.get("secondary_failures") or []
+        if any(
+            isinstance(entry, dict) and entry.get("kind") == "agy_transient_quota_failure"
+            for entry in secondary_failures
+        ):
+            return True
+    # Issue #2015 P1 fix (control-plane live re-run + live repro, head
+    # ffad6201, 2026-08-09): the artifact-materialization race this
+    # secondary failure flags (the child genuinely completed per the
+    # harness's own completion signal, but ``delegation_result.json``
+    # never appeared even after the full bounded poll) does NOT always
+    # surface as ``failure_class: validation_failed`` -- that is only true
+    # when ``request_validation`` (an INDEPENDENT check of the SEPARATE
+    # ``delegation_request.json`` file, unaffected by this exact race)
+    # also happens to be something other than "pass". When
+    # ``request_validation`` is "pass", the very same missing-result-file
+    # condition instead falls through the classification priority chain in
+    # ``_run_route_once`` to ``selected_provider != "agy"`` --
+    # ``selected_provider`` is ``None`` because there was never a file to
+    # read, not because a genuinely-read result disagreed with the
+    # expected provider -- and is misclassified as ``provider_mismatch``
+    # (or, for a github_research route, ``route_evidence_schema_mismatch``
+    # via the same missing-file ``route_evidence_sha256 is None`` branch).
+    # These are DIFFERENT failure_class labels than the one this retry-
+    # eligibility check was previously scoped to, so a genuine
+    # infrastructure race got zero retry chance purely because of
+    # incidental check ordering downstream of the missing result file.
+    # Live-reproduced on this exact head/route (3rd of 3 consecutive live
+    # ``codex_cli``/``local_asset_research`` attempts): a trial with
+    # ``child_completion_observed: true``,
+    # ``evidence_materialized_elapsed_sec: 85.4`` (the full bounded poll
+    # was exhausted; ``delegation_result.json`` never appeared),
+    # ``request.validation: "pass"``, ending in
+    # ``failure_class: "provider_mismatch"`` with only a single
+    # (non-retried) attempt recorded in the diagnostics ledger.
+    #
+    # Deliberately NOT extended to ``gemini_invoked`` /
+    # ``direct_fallback_invoked`` -- those are independent, deterministic
+    # policy-violation signals (a literal forbidden-binary sentinel hit,
+    # recorded during the SAME already-completed subprocess run) that take
+    # priority over this marker in ``_run_route_once`` regardless of
+    # ``delegation_result.json`` state; retrying a genuine policy
+    # violation would not resolve it and would only burn route budget.
+    _MISSING_RESULT_FILE_FAILURE_CLASSES = frozenset(
+        {"validation_failed", "provider_mismatch", "route_evidence_schema_mismatch"}
+    )
+    if failure_class in _MISSING_RESULT_FILE_FAILURE_CLASSES and diagnostics is not None:
+        secondary_failures = diagnostics.get("secondary_failures") or []
+        if any(
+            isinstance(entry, dict)
+            and entry.get("kind") == "child_completed_but_artifact_not_materialized"
+            for entry in secondary_failures
+        ):
+            return True
+    return False
+
+
+# Issue #2015 AC11 (OWNER Scope Reframe 2026-08-09): bounded, non-busy
+# polling interval for durable artifact materialization after the harness
+# subprocess has already exited. Never indefinite -- always bounded by the
+# route's own single absolute deadline (see ``run_route_live``).
+_ARTIFACT_MATERIALIZATION_POLL_INTERVAL_SEC = 0.5
+
+
+def _poll_for_file(
+    path: Path,
+    deadline: float,
+    *,
+    interval: float = _ARTIFACT_MATERIALIZATION_POLL_INTERVAL_SEC,
+) -> float:
+    """Bounded poll (never a busy loop -- ``time.sleep(interval)`` between
+    checks) for ``path`` to exist, up to the shared route-level ``deadline``
+    (an absolute ``time.monotonic()`` value). Returns the elapsed seconds
+    actually spent waiting (0.0 if the file was already present)."""
+    started = time.monotonic()
+    if path.is_file():
+        return 0.0
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        time.sleep(min(interval, max(0.0, remaining)))
+        if path.is_file():
+            return time.monotonic() - started
+    return time.monotonic() - started
 
 
 def _run_route_once(
@@ -402,10 +626,24 @@ def _run_route_once(
     repo_root: Path,
     worktree: Path,
     output_root: Path,
-    timeout_seconds: int,
-) -> dict:
+    deadline: float,
+) -> tuple[dict, dict]:
     """A single, non-retried attempt at a live route. See ``run_route_live``
-    for the bounded-retry wrapper around this."""
+    for the bounded-retry wrapper around this.
+
+    ``deadline`` is a single, ROUTE-LEVEL absolute ``time.monotonic()``
+    value shared across the initial attempt and any retry (Issue #2015
+    AC11/P1: the prior implementation gave the retry its own fresh
+    ``timeout_seconds`` budget, independent of how much of the route's
+    overall time allowance the initial attempt had already consumed --
+    exactly the deadline-hierarchy violation already fixed for
+    ``run_gemini_headless.py`` in an earlier iteration of this Issue).
+
+    Returns ``(artifact, diagnostics)``: ``artifact`` is validated against
+    the closed ``agent_provider_route_smoke_v1`` schema (unchanged shape);
+    ``diagnostics`` carries the new AC11 spawn/completion fields in a
+    companion, schema-unvalidated dict (see ``DIAGNOSTICS_SCHEMA``
+    comment above)."""
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     subject = compute_subject(route, repo_root)
     harness_runtime = _RUNTIME_TO_HARNESS[route["runtime"]]
@@ -435,6 +673,22 @@ def _run_route_once(
         "status": "fail",
         "failure_class": "other",
     }
+    diagnostics: dict = {
+        "schema": DIAGNOSTICS_SCHEMA,
+        "child_spawn_observed": False,
+        "child_spawn_source": None,
+        "child_launch_mode": None,
+        "child_completion_observed": False,
+        "child_completion_source": None,
+        "child_terminal_status": None,
+        "child_agent_id": None,
+        "child_agent_type": None,
+        "spawn_elapsed_sec": None,
+        "completion_elapsed_sec": None,
+        "evidence_materialized_elapsed_sec": 0.0,
+        "harness_exit": None,
+        "secondary_failures": [],
+    }
 
     route_key_slug = _route_key(route).replace(":", "-")
     evidence_dir = output_root / f"{route_key_slug}-{run_id}-evidence"
@@ -456,6 +710,11 @@ def _run_route_once(
         child_env["PATH"] = f"{sentinel_bin_dir}:{child_env.get('PATH', '')}"
         child_env["AGENT_PROVIDER_ROUTE_SMOKE_GEMINI_SENTINEL_MARKER"] = str(marker_path)
 
+        # Remaining budget derived from the SHARED route deadline, never a
+        # fresh full timeout per attempt.
+        remaining = max(5.0, deadline - time.monotonic())
+        harness_timeout_seconds = max(1, int(remaining))
+
         argv = [
             sys.executable,
             str(RUNTIME_SMOKE_SCRIPT),
@@ -464,26 +723,30 @@ def _run_route_once(
             "--worktree", str(worktree),
             "--prompt-file", str(prompt_file),
             "--output-dir", str(harness_output_dir),
-            "--timeout-seconds", str(timeout_seconds),
+            "--timeout-seconds", str(harness_timeout_seconds),
             "--agent-type", route["agent"],
             "--expect-marker", "ROUTE_SMOKE_DONE",
         ]
         try:
             result = subprocess.run(
-                argv, capture_output=True, text=True, timeout=timeout_seconds + 30,
+                argv, capture_output=True, text=True, timeout=remaining + 30,
                 env=child_env, check=False,
             )
         except subprocess.TimeoutExpired:
             artifact["failure_class"] = "timeout"
             artifact["status"] = "fail"
-            return artifact
+            return artifact, diagnostics
         except OSError as exc:
             artifact["failure_class"] = "other"
             artifact["status"] = "fail"
             artifact["_producer_error"] = str(exc)
-            return artifact
+            diagnostics["secondary_failures"].append(
+                {"kind": "producer_oserror", "detail": str(exc)}
+            )
+            return artifact, diagnostics
 
         harness_exit = result.returncode
+        diagnostics["harness_exit"] = harness_exit
         # run_worktree_agent_runtime_smoke.py deliberately persists only
         # ``summary.md`` (Issue #1921 P1 evidence-hygiene fix-delta; its own
         # tests assert an exact one-file allowlist per output directory), so
@@ -506,19 +769,144 @@ def _run_route_once(
         artifact["provider_observation"]["gemini_invocation_count"] = gemini_hits
         artifact["provider_observation"]["direct_fallback_invocation_count"] = fallback_hits
 
-        request_validation = _validate_delegation_request_evidence(evidence_dir, route)
-        selected_provider, provider_attempts, wrapper_ok = _validate_delegation_result_evidence(
-            evidence_dir
+        # Issue #2015 AC11: spawn/completion diagnostics, read verbatim from
+        # the harness's own summary.md (see run_worktree_agent_runtime_smoke.py
+        # ``classify_claude_child_completion`` / codex approximation) --
+        # never re-derived here.
+        diagnostics["child_spawn_observed"] = bool(harness_summary.get("child_spawn_observed"))
+        diagnostics["child_spawn_source"] = harness_summary.get("child_spawn_source")
+        diagnostics["child_launch_mode"] = harness_summary.get("child_launch_mode")
+        diagnostics["child_completion_observed"] = bool(
+            harness_summary.get("child_completion_observed")
         )
+        diagnostics["child_completion_source"] = harness_summary.get("child_completion_source")
+        diagnostics["child_terminal_status"] = harness_summary.get("child_terminal_status")
+        diagnostics["child_agent_id"] = harness_summary.get("child_agent_id")
+        diagnostics["child_agent_type"] = harness_summary.get("child_agent_type_observed")
+        diagnostics["spawn_elapsed_sec"] = harness_summary.get("spawn_elapsed_sec")
+        diagnostics["completion_elapsed_sec"] = harness_summary.get("completion_elapsed_sec")
+
+        request_validation = _validate_delegation_request_evidence(evidence_dir, route)
+        selected_provider, provider_attempts, wrapper_ok, agy_failure_class = (
+            _validate_delegation_result_evidence(evidence_dir)
+        )
+
+        # Issue #2015 AC11: a genuinely-completed child (per the harness's
+        # own SubagentStop/tool_use_result-completed evidence) may still
+        # race this producer's read of ``delegation_result.json`` -- the
+        # child's own Write tool call returning is not guaranteed to be
+        # immediately visible to a SEPARATE reading process. Bounded poll
+        # (never indefinite, never past the shared route deadline) before
+        # concluding the artifact was never materialized at all.
+        #
+        # Issue #2015 P1 fix (control-plane live re-run + live repro on head
+        # 66baca32, 2026-08-09): the PRIOR check here keyed off ``not
+        # wrapper_ok`` -- conflating two semantically different signals:
+        # (a) the artifact FILE genuinely not yet visible on disk (a real
+        # filesystem-visibility race, worth a bounded poll + retry), and
+        # (b) the artifact file ALREADY present with a fully-materialized
+        # ``ok: false`` payload (a genuine, non-transient failure -- e.g.
+        # a github_research route whose AGY turn loop honestly reports
+        # ``failure_class: github_research_incomplete`` because this smoke
+        # probe's own deliberately-trivial "Reply with the single word OK"
+        # prompt gives it nothing to execute). Both were previously tagged
+        # identically as ``child_completed_but_artifact_not_materialized``,
+        # so a genuine, already-written failure result was retried as if it
+        # were a materialization race -- the retry attempt reproduces the
+        # exact same deterministic-ish failure, burning the ENTIRE
+        # remaining route budget for nothing (observed live: 300.03s,
+        # validation_failed, retrieval_status=None on BOTH attempts;
+        # reproduced live on this same head via two concurrent
+        # ``codex_cli`` route-smoke invocations, evidence retained under
+        # this Issue's own scratch artifacts). ``artifact_materialized``
+        # now tracks FILE PRESENCE only, independent of ``wrapper_ok``'s
+        # content-level ``ok`` value -- only a genuinely absent file is
+        # polled/retried below; an already-materialized ``ok: false``
+        # result is classified as an ordinary (non-transient) validation
+        # failure further down, exactly as before.
+        result_path = evidence_dir / "delegation_result.json"
+        artifact_materialized = result_path.is_file()
+        if diagnostics["child_completion_observed"] and not artifact_materialized:
+            elapsed = _poll_for_file(result_path, deadline)
+            diagnostics["evidence_materialized_elapsed_sec"] = elapsed
+            artifact_materialized = result_path.is_file()
+            if artifact_materialized:
+                selected_provider, provider_attempts, wrapper_ok, agy_failure_class = (
+                    _validate_delegation_result_evidence(evidence_dir)
+                )
+
         artifact["request"]["validation"] = request_validation
         artifact["provider_observation"]["selected_provider"] = selected_provider
         artifact["provider_observation"]["provider_attempts"] = provider_attempts
+
+        # Issue #2015 AC11: distinguishable from an ordinary validation
+        # failure in the diagnostics companion file (the closed artifact
+        # schema's ``failure_class`` enum is not widened -- see
+        # DIAGNOSTICS_SCHEMA comment): a child that genuinely completed but
+        # whose result artifact never materialized even after the bounded
+        # poll above. Recorded regardless of which HIGHER-priority
+        # failure_class branch below ultimately wins, so this detail is
+        # never lost just because e.g. provider_mismatch also fired.
+        #
+        # Issue #2015 P1 fix: keyed off ``artifact_materialized`` (file
+        # presence), never ``wrapper_ok`` (content-level success) -- see the
+        # comment above. A materialized ``ok: false`` result still fails
+        # (via the ``not wrapper_ok`` branch further below) but is never
+        # mislabeled -- and therefore never retried -- as a materialization
+        # race.
+        if diagnostics["child_completion_observed"] and not artifact_materialized:
+            diagnostics["secondary_failures"].append(
+                {"kind": "child_completed_but_artifact_not_materialized"}
+            )
+
+        # Issue #2015 (control-plane live re-run, 2026-08-09, head 948759e8):
+        # live codex_cli/local_asset_research trials reproduced a
+        # materialized ``ok: false`` ``delegation_result.json`` whose
+        # ``failure_class`` was ``agy_rate_limited`` -- a genuine AGY-side
+        # ``RESOURCE_EXHAUSTED`` (HTTP 429) quota/rate-limit error under
+        # concurrent multi-session host load, AFTER a genuinely successful
+        # Serena MCP retrieval (``local_asset_retrieval_metadata
+        # .retrieval_status: "succeeded"``, non-zero
+        # ``evidence_record_count``) -- i.e. the actual delegated work
+        # completed; only AGY's own subsequent model-completion call was
+        # rate-limited. ``references/failure-class-taxonomy.md``'s AGY
+        # provider failure class table already documents
+        # ``agy_rate_limited`` / ``agy_capacity_exhausted`` /
+        # ``agy_web_grounding_quota_exhausted`` as retryable="yes" (for
+        # provider-fallback purposes); this is the same transient-quota
+        # signal, so it is tagged here as an additional, narrowly-scoped
+        # retry-eligible secondary failure at THIS route-smoke layer too
+        # -- distinct from (and never conflated with) an ordinary
+        # deterministic content failure (e.g.
+        # ``github_research_incomplete``), which is deliberately excluded
+        # by the explicit allow-list below (see
+        # ``_is_transient_infrastructure_candidate``).
+        if not wrapper_ok and agy_failure_class in _AGY_TRANSIENT_QUOTA_FAILURE_CLASSES:
+            diagnostics["secondary_failures"].append(
+                {"kind": "agy_transient_quota_failure", "agy_failure_class": agy_failure_class}
+            )
 
         route_evidence_sha256 = None
         if route["profile"] == "github_research":
             artifact["route_evidence"]["schema"] = GITHUB_RESEARCH_EVIDENCE_SCHEMA
             route_evidence_sha256 = _validate_github_research_route_evidence(evidence_dir)
             artifact["route_evidence"]["sha256"] = route_evidence_sha256
+
+        # Issue #2015 AC11: a non-zero harness exit must still be
+        # classified (never silently discarded as "no evidence") -- record
+        # it as a secondary failure even when the branch below assigns a
+        # primary failure_class from a HIGHER-priority signal (gemini
+        # invocation / fallback), so genuine spawn evidence observed
+        # alongside a nonzero exit is preserved rather than lost.
+        if harness_exit not in (0, 77) and (
+            diagnostics["child_spawn_observed"] or artifact["spawn"]["native_spawn_event_observed"]
+        ):
+            diagnostics["secondary_failures"].append(
+                {
+                    "kind": "nonzero_harness_exit_with_spawn_evidence",
+                    "harness_exit": harness_exit,
+                }
+            )
 
         if gemini_hits > 0:
             artifact["status"] = "fail"
@@ -551,7 +939,44 @@ def _run_route_once(
             artifact["status"] = "pass"
             artifact["failure_class"] = None
 
-    return artifact
+    return artifact, diagnostics
+
+
+# Issue #2015 P1 fix (control-plane live re-run on head f3d5033, 2026-08-09):
+# a genuine full-route trial showed 4/6 failures pegged near the ~180s outer
+# deadline EVEN WITH the bounded retry active (elapsed_sec 179.2-185.4,
+# retry_status still failing). Root cause: ``_run_route_once``'s own bounded
+# artifact-materialization poll (``_poll_for_file``, and the outer harness
+# subprocess's own ``--timeout-seconds`` budget) legitimately runs right up
+# to whatever deadline it is handed before concluding a genuine
+# ``child_completed_but_artifact_not_materialized`` race -- so a
+# retry-ELIGIBLE first attempt can, by design, consume essentially the
+# ENTIRE route-level deadline, leaving the retry attempt near-zero remaining
+# budget. A retry with ~0s left can never possibly succeed, defeating the
+# whole point of AC11's retry.
+#
+# Fix: reserve a guaranteed minimum time slice for the retry by capping the
+# FIRST attempt's own deadline to at most this fraction of the total route
+# budget. A non-retryable failure (or a genuine pass) returns immediately
+# after classification and never actually needs the reserved slice, so
+# nothing is "wasted" for the common non-retry case.
+#
+# Fraction choice grounded in this Issue's own live timing evidence: the two
+# genuinely-passing claude_code trials on this same head took 54.8s and
+# 92.3s. Splitting alone at the PRIOR 180s total budget was not sufficient
+# (92s initial-need + 92s retry-need alone exceeds 180s), so the total route
+# budget is also widened to DEFAULT_ROUTE_HARNESS_TIMEOUT_SEC (below). At
+# 300s total with a 60/40 split, the (capped) initial attempt gets up to
+# 180s and the retry gets at least 120s in the worst case where the initial
+# attempt consumes its entire capped allotment -- both comfortably above the
+# 92.3s worst-observed genuine-completion time.
+INITIAL_ATTEMPT_MAX_BUDGET_FRACTION = 0.6
+
+# Issue #2015 P1 fix: widened from the prior 180s default -- see
+# INITIAL_ATTEMPT_MAX_BUDGET_FRACTION comment above for the reasoning (180s
+# cannot fit "one full genuine attempt (up to ~92s) + a meaningful retry
+# attempt (also up to ~92s)" with any split).
+DEFAULT_ROUTE_HARNESS_TIMEOUT_SEC = 300
 
 
 def run_route_live(
@@ -561,32 +986,61 @@ def run_route_live(
     worktree: Path,
     output_root: Path,
     timeout_seconds: int,
-) -> dict:
-    initial = _run_route_once(
+) -> tuple[dict, dict]:
+    # Issue #2015 AC11: ONE absolute deadline for the whole route, shared by
+    # the initial attempt and any bounded retry -- never a fresh
+    # ``timeout_seconds`` budget per attempt.
+    route_start = time.monotonic()
+    route_deadline = route_start + timeout_seconds
+
+    # Issue #2015 P1 fix: cap the initial attempt's own deadline so a
+    # retry-eligible failure always leaves the retry a real, non-negligible
+    # chance (see INITIAL_ATTEMPT_MAX_BUDGET_FRACTION comment above). The
+    # retry itself (below) still uses the full, un-capped ``route_deadline``
+    # -- it simply naturally receives whatever remains.
+    initial_deadline = min(
+        route_deadline,
+        route_start + (timeout_seconds * INITIAL_ATTEMPT_MAX_BUDGET_FRACTION),
+    )
+    attempts: list[dict] = []
+
+    initial, initial_diagnostics = _run_route_once(
         route,
         run_id=str(uuid.uuid4()),
         repo_root=repo_root,
         worktree=worktree,
         output_root=output_root,
-        timeout_seconds=timeout_seconds,
+        deadline=initial_deadline,
+    )
+    attempts.append(
+        {"attempt": 1, "status": initial["status"], "failure_class": initial["failure_class"]}
     )
     if initial["status"] != "fail" or not _is_transient_infrastructure_candidate(
-        route, initial["failure_class"]
+        route, initial["failure_class"], initial_diagnostics
     ):
-        return initial
+        initial_diagnostics["attempts"] = attempts
+        initial_diagnostics["route_deadline_sec"] = timeout_seconds
+        return initial, initial_diagnostics
 
     # Issue #1886 P0-4: bounded single retry, ledgered (never a silent
     # re-run). The FIRST artifact's own run_id/generated_at/etc are
     # discarded in favor of the retry's own fresh artifact -- only the
     # retry ledger below (initial_result/initial_failure_class/retry_count/
     # retry_result/final_route_verdict) survives from the first attempt.
-    retry_artifact = _run_route_once(
+    retry_artifact, retry_diagnostics = _run_route_once(
         route,
         run_id=str(uuid.uuid4()),
         repo_root=repo_root,
         worktree=worktree,
         output_root=output_root,
-        timeout_seconds=timeout_seconds,
+        deadline=route_deadline,
+    )
+    attempts.append(
+        {
+            "attempt": 2,
+            "status": retry_artifact["status"],
+            "failure_class": retry_artifact["failure_class"],
+        }
     )
     retry_artifact["retry"] = {
         "initial_result": initial["status"],
@@ -595,7 +1049,12 @@ def run_route_live(
         "retry_result": retry_artifact["status"],
         "final_route_verdict": retry_artifact["status"],
     }
-    return retry_artifact
+    retry_diagnostics["attempts"] = attempts
+    retry_diagnostics["route_deadline_sec"] = timeout_seconds
+    retry_diagnostics["secondary_failures"] = (
+        initial_diagnostics.get("secondary_failures", []) + retry_diagnostics.get("secondary_failures", [])
+    )
+    return retry_artifact, retry_diagnostics
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -607,10 +1066,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worktree", default=str(REPO_ROOT))
     parser.add_argument("--repo-root", default=str(REPO_ROOT))
     parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--timeout-seconds", type=int, default=180)
+    parser.add_argument(
+        "--timeout-seconds", type=int, default=DEFAULT_ROUTE_HARNESS_TIMEOUT_SEC,
+    )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="write only subject/request metadata, never spawn a live runtime (hermetic testing)",
+    )
+    parser.add_argument(
+        "--require-route-pass", action="store_true",
+        help=(
+            "Issue #2015 AC10/AC11: make this producer's own exit code "
+            "reflect route-artifact semantic status (every produced route "
+            "artifact's status must be 'pass'), not merely 'the producer "
+            "subprocess ran without crashing'. A producer-completed-without-"
+            "crashing run whose route(s) actually FAILED still exits nonzero "
+            "when this flag is set."
+        ),
     )
     return parser
 
@@ -683,8 +1155,26 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "skip",
                 "failure_class": "agy_unavailable",
             }
+            diagnostics = {
+                "schema": DIAGNOSTICS_SCHEMA,
+                "child_spawn_observed": False,
+                "child_spawn_source": None,
+                "child_launch_mode": None,
+                "child_completion_observed": False,
+                "child_completion_source": None,
+                "child_terminal_status": None,
+                "child_agent_id": None,
+                "child_agent_type": None,
+                "spawn_elapsed_sec": None,
+                "completion_elapsed_sec": None,
+                "evidence_materialized_elapsed_sec": 0.0,
+                "harness_exit": None,
+                "attempts": [],
+                "secondary_failures": [],
+                "route_deadline_sec": None,
+            }
         else:
-            artifact = run_route_live(
+            artifact, diagnostics = run_route_live(
                 route,
                 repo_root=repo_root,
                 worktree=worktree,
@@ -694,6 +1184,26 @@ def main(argv: list[str] | None = None) -> int:
             artifact["batch_run_id"] = batch_run_id
         artifact_path = output_root / f"{_route_key(route).replace(':', '-')}.json"
         artifact_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        # Issue #2015 P1 fix (OWNER review #2044): the canonical, unmodified
+        # validate_agent_provider_route_smoke.py discovers every top-level
+        # ``*.json`` file in the artifacts directory (excluding only
+        # ``index.json``) and validates each against the closed
+        # ``agent_provider_route_smoke/v1`` schema (which requires
+        # ``run_id``). Writing the diagnostics companion file directly into
+        # ``output_root`` therefore made the validator reject it as a
+        # malformed route artifact -- turning even genuinely-passing trials
+        # into a reported validator failure. The diagnostics file is an
+        # unvalidated debug sidecar (``DIAGNOSTICS_SCHEMA`` above), not a
+        # route-result artifact, so it is written into a nested
+        # ``diagnostics/`` subdirectory: the validator's discovery glob
+        # (``directory.glob("*.json")``) is non-recursive and never
+        # descends into it.
+        diagnostics_dir = output_root / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        diagnostics_path = diagnostics_dir / f"{_route_key(route).replace(':', '-')}-diagnostics.json"
+        diagnostics_path.write_text(
+            json.dumps(diagnostics, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
         artifacts.append(artifact)
         print(f"[{artifact['status']}] {_route_key(route)} -> {artifact_path}")
 
@@ -704,6 +1214,15 @@ def main(argv: list[str] | None = None) -> int:
         "statuses": {_route_key(r): a["status"] for r, a in zip(routes, artifacts)},
     }
     (output_root / "index.json").write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    if args.require_route_pass:
+        non_pass = [_route_key(r) for r, a in zip(routes, artifacts) if a["status"] != "pass"]
+        if non_pass:
+            print(
+                "[require-route-pass] non-pass route(s): " + ", ".join(non_pass),
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

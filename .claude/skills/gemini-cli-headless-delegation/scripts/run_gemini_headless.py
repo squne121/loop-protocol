@@ -10,9 +10,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import warnings
@@ -55,6 +57,139 @@ except ImportError:  # pragma: no cover - script always ships alongside this mod
 DEFAULT_MODEL = "gemini-3-flash-preview"
 DEFAULT_TIMEOUT_SEC = 600
 RETRY_LIMIT = 2
+
+# ---------------------------------------------------------------------------
+# Issue #2015: Serena MCP live collector timeout hierarchy (monotonic clock
+# based) and stage-specific failure classification.
+#
+# server_tool_timeout < client_request_timeout < collector_session_deadline <
+# route_harness_timeout - cleanup_grace. route_harness_timeout is owned by
+# the external smoke harness (scripts/agent-ops/run_agent_provider_route_smoke.py
+# --timeout-seconds) and cleanup_grace reserves headroom after the collector
+# session deadline elapses for process reap to complete.
+#
+# Issue #2015 P1 fix (control-plane live re-run, 2026-08-09): the smoke
+# harness's own default was widened from 180 to 300 -- a genuine full-route
+# trial showed 180s could not fit BOTH "one full genuine attempt (observed
+# up to 92.3s on this same head)" AND "a meaningful bounded retry attempt
+# (also up to ~92.3s)" -- see run_agent_provider_route_smoke.py's
+# INITIAL_ATTEMPT_MAX_BUDGET_FRACTION / DEFAULT_ROUTE_HARNESS_TIMEOUT_SEC
+# comments for the full reasoning and evidence. This constant is kept in
+# sync with that default purely for documentation/invariant purposes -- it
+# is never read by the external smoke harness itself.
+# ---------------------------------------------------------------------------
+
+SERENA_SERVER_TOOL_TIMEOUT_SEC = 45.0
+SERENA_CLIENT_REQUEST_TIMEOUT_SEC = 60.0
+SERENA_COLLECTOR_SESSION_DEADLINE_SEC = 120.0
+SERENA_ROUTE_HARNESS_TIMEOUT_SEC = 300.0
+SERENA_CLEANUP_GRACE_SEC = 10.0
+assert (
+    SERENA_SERVER_TOOL_TIMEOUT_SEC
+    < SERENA_CLIENT_REQUEST_TIMEOUT_SEC
+    < SERENA_COLLECTOR_SESSION_DEADLINE_SEC
+    < SERENA_ROUTE_HARNESS_TIMEOUT_SEC - SERENA_CLEANUP_GRACE_SEC
+), "Serena MCP collector timeout hierarchy invariant violated (Issue #2015 AC6)"
+
+# Issue #2015 P1 fix (OWNER REQUEST_CHANGES, PR #2044 review
+# https://github.com/squne121/loop-protocol/pull/2044#issuecomment-5229719867):
+# SERENA_COLLECTOR_SESSION_DEADLINE_SEC is a *route-level* budget shared by
+# every attempt of a single route (first attempt + at most one retry), not
+# a fresh per-attempt budget. A retry is only started when the remaining
+# route budget leaves this much headroom for the retry itself plus the
+# downstream cleanup/response-building work that must still happen after
+# the collector returns -- otherwise the retry is skipped and the first
+# attempt's failure is surfaced as-is (never a silent unlimited-total-time
+# retry that could blow the outer route_harness_timeout).
+SERENA_RETRY_MIN_REMAINING_BUDGET_SEC = SERENA_CLEANUP_GRACE_SEC + 5.0
+
+# Bounded ring buffer cap for the drained Serena MCP subprocess stderr
+# (Issue #2015 AC2 -- stderr must never be read synchronously on the hot
+# path that also reads stdout, to avoid the self-induced pipe-backpressure
+# stall documented in the Issue #2015 background section).
+SERENA_STDERR_RING_BUFFER_MAX_BYTES = 65536
+
+
+class SerenaCollectorError(RuntimeError):
+    """Base class for stage-specific Serena MCP live collector failures
+    (Issue #2015 AC4). Subclasses set ``failure_class`` / ``retryable``.
+    """
+
+    failure_class: str = "unknown_serena_failure"
+    retryable: bool = False
+
+
+class SerenaStartupTimeoutError(SerenaCollectorError):
+    """``initialize`` / ``tools/list`` protocol negotiation did not respond
+    within the session deadline. Retryable: a fresh process may succeed."""
+
+    failure_class = "startup_timeout"
+    retryable = True
+
+
+class SerenaRequestTimeoutError(SerenaCollectorError):
+    """A ``tools/call`` request did not respond within the session
+    deadline. Retryable: a fresh process may succeed."""
+
+    failure_class = "request_timeout"
+    retryable = True
+
+
+class SerenaProcessExitError(SerenaCollectorError):
+    """The Serena MCP subprocess exited before returning a response."""
+
+    failure_class = "process_exit"
+    retryable = False
+
+
+class SerenaProtocolError(SerenaCollectorError):
+    """The subprocess emitted output that violates the JSON-RPC framing
+    contract (e.g. non-JSON stdout lines that never resolve to a valid
+    response for the outstanding request)."""
+
+    failure_class = "protocol_error"
+    retryable = False
+
+
+class SerenaJsonRpcError(SerenaCollectorError):
+    """The server returned a JSON-RPC ``error`` object for a request."""
+
+    failure_class = "jsonrpc_error"
+    retryable = False
+
+
+class SerenaManifestDriftError(SerenaCollectorError):
+    """``tools/list`` disagrees with the checked-in Serena tool manifest
+    (missing required read-only tools, or the live tool set differs from
+    ``known_tools``). This is the only failure class that sets
+    ``manifest_drift_failed: true`` (Issue #2015 AC4)."""
+
+    failure_class = "manifest_drift"
+    retryable = False
+
+
+class SerenaRedactionFailureError(SerenaCollectorError):
+    """A tool result appears to contain credential-like material and was
+    rejected before being surfaced as evidence."""
+
+    failure_class = "redaction_failure"
+    retryable = False
+
+
+class SerenaCleanupFailureError(SerenaCollectorError):
+    """The subprocess (or a descendant) could not be reaped after
+    termination was attempted."""
+
+    failure_class = "cleanup_failure"
+    retryable = False
+
+
+# failure_class values for which a single, fresh-process retry is permitted
+# (Issue #2015 AC5). No other failure class is retried.
+SERENA_RETRYABLE_FAILURE_CLASSES = frozenset(
+    cls.failure_class
+    for cls in (SerenaStartupTimeoutError, SerenaRequestTimeoutError)
+)
 
 # ---------------------------------------------------------------------------
 # Model routing
@@ -875,6 +1010,63 @@ def _load_serena_from_mcp_config(repo_root: Path, mcp_config_path: Path | None =
     if not isinstance(serena, Mapping):
         raise ValueError(f"{config_path} must contain mcpServers.serena")
     return serena
+
+
+def _build_serena_launch_command(serena: Mapping[str, Any], tool_timeout_sec: float) -> list[str]:
+    """Build the Serena MCP subprocess launch command actually passed to
+    ``subprocess.Popen`` (Issue #2015 P1 fix, OWNER REQUEST_CHANGES on PR
+    #2044).
+
+    The checked-in ``.agents/mcp_config.json`` (outside this Issue's
+    Allowed Paths) launches the pinned Serena ``start-mcp-server`` without
+    a ``--tool-timeout`` argument, and Serena's own config template
+    defaults ``tool_timeout`` to 240s -- far above
+    ``SERENA_SERVER_TOOL_TIMEOUT_SEC`` (45s), which was previously only
+    enforced on this wrapper's own ``recv()`` loop, never on the launched
+    server itself. Without this, the module-level timeout-hierarchy
+    ``assert`` above compares constants that are disconnected from the
+    actual server configuration.
+
+    This function makes ``SERENA_SERVER_TOOL_TIMEOUT_SEC`` bind the
+    launched subprocess directly by appending an explicit
+    ``--tool-timeout`` CLI override to the args read from the checked-in
+    config, without modifying ``.agents/mcp_config.json`` itself. If the
+    checked-in config already specifies ``--tool-timeout`` (e.g. a future
+    config update), that explicit value is left untouched rather than
+    being duplicated or overridden.
+
+    Issue #2015 P1 fix (control-plane live re-run + live repro, 2026-08-09,
+    head 69389317): live-reproduced a genuine `local_asset_research
+    live_serena_mcp_failed` / `stage_failure_class: process_exit` failure
+    (Serena's own stdout closing before the very first `initialize`
+    response, subprocess returncode 2, elapsed ~0.02s -- far too fast to be
+    a genuine startup timeout) under a `codex_cli`-delegated child. Serena's
+    own config template's `web_dashboard: true` default starts an HTTP
+    listener bound to a FIXED `127.0.0.1:24282` (Serena's own upstream docs
+    for ``gui_log_window`` explicitly acknowledge this exact class of
+    problem: "the various entities starting the Serena server or agent do
+    so in mysterious ways, often starting multiple instances of the process
+    without shutting down previous instances"). This host runs multiple
+    concurrent live trials/sessions that can each launch their own Serena
+    MCP subprocess around the same time; a second instance's dashboard
+    `bind()` on an already-occupied port is a plausible immediate-crash
+    cause consistent with the observed near-instant `returncode=2`. This
+    collector never uses the dashboard (it only ever exchanges JSON-RPC
+    over stdio) -- `--enable-web-dashboard False` removes the fixed-port
+    listener entirely for this launch path, independent of the user-local
+    `~/.serena/serena_config.yml` default (out of this Issue's Allowed
+    Paths). If the checked-in config already specifies
+    ``--enable-web-dashboard`` explicitly (e.g. a future config update),
+    that explicit value is left untouched rather than being duplicated or
+    overridden.
+    """
+    command = str(serena["command"])
+    args = [str(arg) for arg in serena["args"]]
+    if "--tool-timeout" not in args:
+        args = [*args, "--tool-timeout", str(int(tool_timeout_sec))]
+    if "--enable-web-dashboard" not in args:
+        args = [*args, "--enable-web-dashboard", "False"]
+    return [command, *args]
 
 
 def _validate_serena_settings_against_manifest(settings: Mapping[str, Any], manifest: Mapping[str, Any]) -> list[str]:
@@ -2007,16 +2199,178 @@ def _collect_serena_read_only_evidence(
     return documents
 
 
+def _drain_serena_stderr(
+    stream: Any,
+    buffer: bytearray,
+    lock: threading.Lock,
+    stop_event: threading.Event,
+    max_bytes: int = SERENA_STDERR_RING_BUFFER_MAX_BYTES,
+) -> None:
+    """Continuously drain a Serena MCP subprocess's stderr on a dedicated
+    thread into a bounded ring buffer (Issue #2015 AC2).
+
+    stdout and stderr are never merged, and stderr is never read
+    synchronously on the code path that also waits on stdout -- reading
+    stderr only after stdout is exhausted (the prior behaviour) can block
+    the child on an OS pipe-buffer write before it emits its stdout
+    JSON-RPC response, producing a self-induced stall.
+    """
+    try:
+        while True:
+            line = stream.readline()
+            if not line:
+                break
+            encoded = line.encode("utf-8", errors="replace")
+            with lock:
+                buffer.extend(encoded)
+                overflow = len(buffer) - max_bytes
+                if overflow > 0:
+                    del buffer[:overflow]
+    except (ValueError, OSError):
+        # Stream closed during process teardown -- expected, not an error.
+        pass
+    finally:
+        stop_event.set()
+
+
+def _wait_until_process_group_gone(pgid: int, timeout_sec: float) -> bool:
+    """Poll ``os.killpg(pgid, 0)`` until the process group is gone or
+    ``timeout_sec`` elapses. Returns True iff the group is confirmed gone.
+
+    Signalling a lone direct child (``Popen.terminate()``) never reaches
+    descendant processes on POSIX -- ``start_new_session=True`` only makes
+    the direct child a new process-group leader, it does not propagate
+    signals. The *group* (not the direct child's ``poll()`` state) is the
+    only thing that tells us whether a descendant (e.g. a Serena
+    language-server child) is still alive (Issue #2015 P1 fix, OWNER
+    REQUEST_CHANGES on PR #2044).
+    """
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def _terminate_and_reap_serena_process(process: subprocess.Popen, pgid: int) -> dict[str, Any]:
+    """Terminate the Serena MCP subprocess **and its full process group**
+    and reap the direct child deterministically (Issue #2015 AC7, P1 fix
+    per OWNER REQUEST_CHANGES on PR #2044).
+
+    ``pgid`` must be the process group id captured by the caller
+    immediately after ``Popen(..., start_new_session=True)`` returned
+    (which equals ``process.pid`` at launch time, since the direct child is
+    its own session/group leader) -- calling ``os.getpgid(process.pid)``
+    *after* the direct child may already have been reaped raises
+    ``ProcessLookupError`` and silently skips group signalling entirely,
+    which is exactly how a descendant (grandchild) process could survive
+    cleanup while ``_terminate_and_reap_serena_process`` reported success.
+
+    Order:
+      1. Close stdin (best-effort graceful-shutdown signal).
+      2. SIGTERM the direct child; bounded wait for it to exit.
+      3. Regardless of whether the direct child has already exited, probe
+         the *process group* (not ``process.poll()``) -- a lone SIGTERM to
+         the direct child does not reach descendants, so the group can
+         still be alive even when the direct child is already reaped.
+      4. If the group is still alive: SIGTERM the group, bounded wait,
+         then (if still alive) SIGKILL the group, bounded wait again.
+      5. Reap the direct child unconditionally so a zombie never lingers.
+      6. Re-probe the group; an unresolved surviving group is reported as
+         a genuine cleanup failure, never silently swallowed.
+    """
+    report: dict[str, Any] = {
+        "terminate_signal_sent": False,
+        "kill_signal_sent": False,
+        "reaped": False,
+        "group_terminated": False,
+        "error": None,
+    }
+    try:
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+        if process.poll() is None:
+            process.terminate()
+            report["terminate_signal_sent"] = True
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+        group_gone = _wait_until_process_group_gone(pgid, 0.0)
+        if not group_gone:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                group_gone = True
+            except (PermissionError, OSError) as exc:
+                report["error"] = f"failed to SIGTERM process group {pgid}: {exc}"
+            if not group_gone:
+                group_gone = _wait_until_process_group_gone(pgid, 5.0)
+        if not group_gone:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+                report["kill_signal_sent"] = True
+            except ProcessLookupError:
+                group_gone = True
+            except (PermissionError, OSError) as exc:
+                report["error"] = f"failed to SIGKILL process group {pgid}: {exc}"
+            if not group_gone:
+                group_gone = _wait_until_process_group_gone(pgid, 5.0)
+
+        try:
+            process.wait(timeout=5)
+            report["reaped"] = True
+        except subprocess.TimeoutExpired:
+            report["reaped"] = process.poll() is not None
+
+        report["group_terminated"] = group_gone
+        if not group_gone:
+            report["error"] = (
+                report["error"]
+                or f"serena MCP process group {pgid} still alive after SIGTERM/SIGKILL"
+            )
+    except Exception as exc:  # pragma: no cover - defensive, never masks caller
+        report["error"] = str(exc)
+    return report
+
+
 def _collect_live_serena_read_only_evidence(
     context_paths: list[Path],
     repo_root: Path,
     manifest: Mapping[str, Any],
+    *,
+    deadline_monotonic: float | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    """Launch pinned Serena MCP over stdio and build evidence from tools/call responses."""
+    """Launch pinned Serena MCP over stdio and build evidence from tools/call responses.
+
+    Issue #2015: each request is recorded in a machine-readable request
+    ledger, stderr is drained on a dedicated thread (never synchronously on
+    the stdout hot path), the recv() deadline is monotonic-clock based
+    within a bounded session deadline, ``search_for_pattern`` is scoped to
+    the context file's neighbourhood (never an implicit repo-wide search),
+    and failures are raised as stage-specific ``SerenaCollectorError``
+    subclasses so the caller can apply a bounded, class-specific retry
+    policy.
+    """
     import select
 
     serena = _load_serena_from_mcp_config(repo_root)
-    command = [str(serena["command"]), *[str(arg) for arg in serena["args"]]]
+    command = _build_serena_launch_command(serena, SERENA_SERVER_TOOL_TIMEOUT_SEC)
+    assert "--tool-timeout" in command, (
+        "Serena MCP launch command must carry an explicit --tool-timeout "
+        "override (Issue #2015 AC6 P1 fix) -- server_tool_timeout hierarchy "
+        "must bind the launched subprocess, not just this wrapper's own "
+        "recv() loop"
+    )
     process = subprocess.Popen(
         command,
         cwd=str(repo_root),
@@ -2025,48 +2379,127 @@ def _collect_live_serena_read_only_evidence(
         stderr=subprocess.PIPE,
         text=True,
         shell=False,
-        env=_minimal_agy_env(),
+        env=_minimal_serena_env(),
         bufsize=1,
+        start_new_session=True,
     )
+    # Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044): captured
+    # immediately at launch, since start_new_session=True makes the direct
+    # child its own process-group leader -- os.getpgid(process.pid) called
+    # later (after the child may already have been reaped) would raise
+    # ProcessLookupError and silently skip process-group cleanup.
+    pgid = process.pid
+
+    stderr_buffer = bytearray()
+    stderr_lock = threading.Lock()
+    stderr_stop = threading.Event()
+    stderr_thread: threading.Thread | None = None
+    if process.stderr is not None:
+        stderr_thread = threading.Thread(
+            target=_drain_serena_stderr,
+            args=(process.stderr, stderr_buffer, stderr_lock, stderr_stop),
+            daemon=True,
+        )
+        stderr_thread.start()
+
     next_id = 1
     manifest_id = _serena_manifest_id(manifest)
+    request_ledger: list[dict[str, Any]] = []
+    session_start = time.monotonic()
+    # Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044): when the
+    # caller supplies a route-level deadline (shared across a first attempt
+    # and its retry), honor it verbatim instead of granting this call a
+    # fresh SERENA_COLLECTOR_SESSION_DEADLINE_SEC of its own -- otherwise a
+    # first-attempt-timeout-then-retry pair can consume up to 2x the
+    # collector session budget in aggregate.
+    session_deadline = (
+        deadline_monotonic
+        if deadline_monotonic is not None
+        else session_start + SERENA_COLLECTOR_SESSION_DEADLINE_SEC
+    )
+
+    def remaining_session_budget() -> float:
+        return max(0.0, session_deadline - time.monotonic())
 
     def send(payload: Mapping[str, Any]) -> None:
         assert process.stdin is not None
         process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
         process.stdin.flush()
 
-    def recv(expected_id: int, timeout_sec: float = 180.0) -> Mapping[str, Any]:
+    def recv(
+        expected_id: int,
+        *,
+        timeout_sec: float,
+        timeout_error_cls: type[SerenaCollectorError],
+    ) -> Mapping[str, Any]:
         assert process.stdout is not None
-        import time
-
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
+        bounded_timeout = min(timeout_sec, remaining_session_budget())
+        deadline = time.monotonic() + max(bounded_timeout, 0.0)
+        while time.monotonic() < deadline:
             ready, _, _ = select.select([process.stdout], [], [], 0.2)
             if not ready:
                 if process.poll() is not None:
-                    raise RuntimeError("serena MCP server exited before response")
+                    raise SerenaProcessExitError(
+                        f"serena MCP server exited before response id {expected_id} "
+                        f"(returncode={process.returncode})"
+                    )
                 continue
             line = process.stdout.readline()
             if not line:
+                if process.poll() is not None:
+                    raise SerenaProcessExitError(
+                        f"serena MCP server stdout closed before response id {expected_id} "
+                        f"(returncode={process.returncode})"
+                    )
                 continue
             try:
                 message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                raise SerenaProtocolError(
+                    f"serena MCP emitted a non-JSON-RPC stdout line while awaiting id {expected_id}: {exc}"
+                ) from exc
             if message.get("id") == expected_id:
                 return message
-        raise TimeoutError(f"timed out waiting for Serena MCP response id {expected_id}")
+        raise timeout_error_cls(f"timed out waiting for Serena MCP response id {expected_id}")
 
-    def request(method: str, params: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+    def request(
+        method: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        tool_name: str | None = None,
+        timeout_sec: float,
+        timeout_error_cls: type[SerenaCollectorError],
+    ) -> Mapping[str, Any]:
         nonlocal next_id
         request_id = next_id
         next_id += 1
-        send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
-        response = recv(request_id)
-        if response.get("error"):
-            raise RuntimeError(f"Serena MCP {method} failed: {response['error']}")
-        return response
+        arguments = dict(params or {})
+        started = time.monotonic()
+        ledger_entry: dict[str, Any] = {
+            "request_id": request_id,
+            "method": method,
+            "tool_name": tool_name,
+            "arguments_sha256": _sha256_stable_json(arguments),
+            "started_at_monotonic": round(started - session_start, 6),
+            "elapsed_sec": None,
+            "response_received": False,
+            "error": None,
+        }
+        request_ledger.append(ledger_entry)
+        try:
+            send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": arguments})
+            response = recv(request_id, timeout_sec=timeout_sec, timeout_error_cls=timeout_error_cls)
+            ledger_entry["elapsed_sec"] = round(time.monotonic() - started, 6)
+            ledger_entry["response_received"] = True
+            if response.get("error"):
+                ledger_entry["error"] = str(response["error"])
+                raise SerenaJsonRpcError(f"Serena MCP {method} failed: {response['error']}")
+            return response
+        except SerenaCollectorError as exc:
+            ledger_entry["elapsed_sec"] = round(time.monotonic() - started, 6)
+            if ledger_entry["error"] is None:
+                ledger_entry["error"] = str(exc)
+            raise
 
     try:
         request(
@@ -2076,20 +2509,28 @@ def _collect_live_serena_read_only_evidence(
                 "capabilities": {},
                 "clientInfo": {"name": "loop-protocol-wrapper", "version": "1"},
             },
+            timeout_sec=SERENA_CLIENT_REQUEST_TIMEOUT_SEC,
+            timeout_error_cls=SerenaStartupTimeoutError,
         )
         send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
-        tools_response = request("tools/list")
+        tools_response = request(
+            "tools/list",
+            timeout_sec=SERENA_CLIENT_REQUEST_TIMEOUT_SEC,
+            timeout_error_cls=SerenaStartupTimeoutError,
+        )
         tools = ((tools_response.get("result") or {}).get("tools") or [])
         tools_seen = {tool.get("name") for tool in tools if isinstance(tool, Mapping)}
         tools_seen_names = sorted(str(name) for name in tools_seen if isinstance(name, str))
         missing = sorted(set(manifest["read_only_allowlist"]) - tools_seen)
         if missing:
-            raise RuntimeError(f"Serena tools/list missing required tools: {', '.join(missing)}")
+            raise SerenaManifestDriftError(
+                f"Serena tools/list missing required tools: {', '.join(missing)}"
+            )
         manifest_known = set(manifest.get("known_tools") or [])
         if tools_seen != manifest_known:
             missing_from_manifest = sorted(tools_seen - manifest_known)
             stale_manifest_tools = sorted(manifest_known - tools_seen)
-            raise RuntimeError(
+            raise SerenaManifestDriftError(
                 "Serena tools/list manifest drift: "
                 f"missing_from_manifest={missing_from_manifest}; "
                 f"stale_manifest_tools={stale_manifest_tools}"
@@ -2097,18 +2538,31 @@ def _collect_live_serena_read_only_evidence(
 
         selectors = [path.relative_to(repo_root).as_posix() for path in context_paths]
         primary_path = selectors[0] if selectors else "."
+        primary_parent = str(Path(primary_path).parent)
+        # Issue #2015 AC3: when the context file's directory resolves to
+        # the repository root ("."), scoping search_for_pattern to "."
+        # makes Serena search the *entire* repository rather than the
+        # context file's neighbourhood. Narrow to the context file
+        # itself in that case instead of an implicit repo-wide search.
+        search_scope = primary_path if primary_parent == "." else primary_parent
         calls: list[tuple[str, dict[str, Any], str]] = [
             ("find_file", {"relative_path": ".", "file_mask": Path(primary_path).name}, primary_path),
             (
                 "search_for_pattern",
-                {"relative_path": str(Path(primary_path).parent), "substring_pattern": "local_asset_research"},
+                {"relative_path": search_scope, "substring_pattern": "local_asset_research"},
                 primary_path,
             ),
             ("get_symbols_overview", {"relative_path": primary_path}, primary_path),
         ]
         documents: list[dict[str, str]] = []
         for index, (tool_name, arguments, repo_relative_path) in enumerate(calls, start=1):
-            response = request("tools/call", {"name": tool_name, "arguments": arguments})
+            response = request(
+                "tools/call",
+                {"name": tool_name, "arguments": arguments},
+                tool_name=tool_name,
+                timeout_sec=SERENA_SERVER_TOOL_TIMEOUT_SEC,
+                timeout_error_cls=SerenaRequestTimeoutError,
+            )
             result = response.get("result")
             result_text = json.dumps(result, ensure_ascii=False, sort_keys=True)
             snippet = _truncate_summary(result_text, 4000)
@@ -2125,29 +2579,122 @@ def _collect_live_serena_read_only_evidence(
                 "source_kind": "serena_mcp_read_only_evidence",
             }
             if _contains_credential(result_text):
-                raise ValueError(f"Serena MCP {tool_name} result appears to contain credential-like material")
+                raise SerenaRedactionFailureError(
+                    f"Serena MCP {tool_name} result appears to contain credential-like material"
+                )
             documents.append({
                 "path": f"{repo_relative_path}#{tool_name}-{index}",
                 "content": json.dumps(evidence, ensure_ascii=False, sort_keys=True),
             })
-        serena_metadata = {
-            "retrieval_mode": "live_serena_mcp",
-            "serena_manifest_id": manifest_id,
-            "serena_pinned_ref": manifest.get("pinned_ref"),
-            "read_only_allowlist_sha256": _sha256_stable_json(list(manifest.get("read_only_allowlist", []))),
-            "dangerous_denylist_sha256": _sha256_stable_json(list(manifest.get("dangerous_denylist", []))),
-            "live_tools_list_sha256": _sha256_stable_json(tools_seen_names),
-            "manifest_drift_failed": False,
-            "context_files_count": len(context_paths),
-            "evidence_record_count": len(documents),
+    except SerenaCollectorError as exc:
+        stderr_stop.set()
+        with stderr_lock:
+            stderr_tail = bytes(stderr_buffer)
+        exc.request_ledger = request_ledger  # type: ignore[attr-defined]
+        exc.stderr_byte_count = len(stderr_tail)  # type: ignore[attr-defined]
+        exc.stderr_sha256 = hashlib.sha256(stderr_tail).hexdigest()  # type: ignore[attr-defined]
+        exc.manifest_drift_failed = isinstance(exc, SerenaManifestDriftError)  # type: ignore[attr-defined]
+        cleanup_report = _terminate_and_reap_serena_process(process, pgid)
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=2)
+        # Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044): a cleanup
+        # failure that occurs while a primary collector failure is already
+        # propagating must never be masked by raising a *different*
+        # exception from here -- attach it as machine-readable secondary
+        # failure metadata on the exception actually being raised instead.
+        exc.cleanup_report = cleanup_report  # type: ignore[attr-defined]
+        if cleanup_report.get("error"):
+            exc.cleanup_failure = cleanup_report  # type: ignore[attr-defined]
+        raise
+
+    stderr_stop.set()
+    with stderr_lock:
+        stderr_tail = bytes(stderr_buffer)
+    cleanup_report = _terminate_and_reap_serena_process(process, pgid)
+    if stderr_thread is not None:
+        stderr_thread.join(timeout=2)
+    if cleanup_report.get("error"):
+        # Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044): on the
+        # success path there is no primary failure to protect from being
+        # masked -- an incomplete cleanup (e.g. a surviving grandchild
+        # process) must fail closed rather than being reported only via
+        # warnings.warn() while the caller still receives a "successful"
+        # result. SerenaCleanupFailureError.failure_class == "cleanup_failure"
+        # is now genuinely reachable (Issue #2015 AC7).
+        raise SerenaCleanupFailureError(
+            f"Serena MCP subprocess cleanup incomplete: {cleanup_report['error']}"
+        )
+    serena_metadata = {
+        "retrieval_mode": "live_serena_mcp",
+        "serena_manifest_id": manifest_id,
+        "serena_pinned_ref": manifest.get("pinned_ref"),
+        "read_only_allowlist_sha256": _sha256_stable_json(list(manifest.get("read_only_allowlist", []))),
+        "dangerous_denylist_sha256": _sha256_stable_json(list(manifest.get("dangerous_denylist", []))),
+        "live_tools_list_sha256": _sha256_stable_json(tools_seen_names),
+        "manifest_drift_failed": False,
+        "context_files_count": len(context_paths),
+        "evidence_record_count": len(documents),
+        "request_ledger": request_ledger,
+        "stderr_byte_count": len(stderr_tail),
+        "stderr_sha256": hashlib.sha256(stderr_tail).hexdigest(),
+        "stderr_tail_redacted": _redact_text(stderr_tail.decode("utf-8", errors="replace")[-2000:]),
+        "effective_launch_command": command,
+        "cleanup_report": cleanup_report,
+    }
+    return documents, serena_metadata
+
+
+def _extract_serena_attempt_ledger_metadata(result: Any) -> dict[str, Any]:
+    """Best-effort extraction of the request ledger / stderr digest /
+    cleanup report from a successful ``_collect_live_serena_read_only_evidence``
+    return value, for building a per-attempt audit record (Issue #2015 P1
+    fix, OWNER REQUEST_CHANGES on PR #2044). Falls back to empty/None for
+    result shapes that do not carry this metadata (e.g. legacy test-double
+    dict envelopes) -- never fabricated."""
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], Mapping):
+        raw = result[1]
+        return {
+            "request_ledger": raw.get("request_ledger", []),
+            "stderr_sha256": raw.get("stderr_sha256"),
+            "cleanup": raw.get("cleanup_report"),
         }
-        return documents, serena_metadata
-    finally:
-        try:
-            process.terminate()
-            process.wait(timeout=5)
-        except Exception:
-            process.kill()
+    return {"request_ledger": [], "stderr_sha256": None, "cleanup": None}
+
+
+def _build_serena_attempt_record(
+    attempt_number: int,
+    started_monotonic: float,
+    *,
+    exc: "SerenaCollectorError | None" = None,
+    result: Any = None,
+) -> dict[str, Any]:
+    """Build one element of ``local_asset_retrieval_metadata.attempts[]``
+    (Issue #2015 P1 fix, OWNER REQUEST_CHANGES on PR #2044) -- a full,
+    machine-readable audit record per attempt (request ledger, elapsed
+    time, stderr digest, cleanup outcome, failure class) so a retry never
+    silently discards the initial attempt's evidence. Adds a nested field
+    under the existing ``local_asset_retrieval_metadata`` envelope --
+    the top-level delegation_result/v1 schema is unchanged (Issue #277
+    responsibility boundary)."""
+    elapsed_sec = round(time.monotonic() - started_monotonic, 6)
+    if exc is not None:
+        return {
+            "attempt": attempt_number,
+            "outcome": "failed",
+            "failure_class": getattr(exc, "failure_class", None),
+            "elapsed_sec": elapsed_sec,
+            "request_ledger": getattr(exc, "request_ledger", []),
+            "stderr_sha256": getattr(exc, "stderr_sha256", None),
+            "cleanup": getattr(exc, "cleanup_report", None),
+        }
+    ledger_metadata = _extract_serena_attempt_ledger_metadata(result)
+    return {
+        "attempt": attempt_number,
+        "outcome": "succeeded",
+        "failure_class": None,
+        "elapsed_sec": elapsed_sec,
+        **ledger_metadata,
+    }
 
 
 def _coerce_live_serena_retrieval_result(
@@ -2627,13 +3174,46 @@ def _minimal_agy_env() -> dict[str, str]:
 
     Only allowlisted environment variables are propagated.
     AGY_BIN override is supported for hermetic test injection.
+
+    Issue #2015 (CI env-leak regression fix, 2026-08-09 OWNER scope
+    reframe): ``UV_CACHE_DIR`` is intentionally NOT part of this allowlist.
+    It previously leaked in here as a P1 fix meant only for Serena
+    cold/warm cache control in live-trial tests, but this function is the
+    *general* least-privilege AGY subprocess env and must not carry it.
+    Callers that need a controlled ``UV_CACHE_DIR`` (Serena MCP subprocess
+    launch, live-trial cold/warm slots) must use `_minimal_serena_env()`
+    instead.
     """
-    allowlist = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME")
+    allowlist = (
+        "PATH", "HOME", "LANG", "LC_ALL", "TERM",
+        "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+    )
     env: dict[str, str] = {}
     for key in allowlist:
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
+    return env
+
+
+def _minimal_serena_env() -> dict[str, str]:
+    """Return a minimal environment dict for Serena MCP subprocess launch.
+
+    Issue #2015 (CI env-leak regression fix): this is `_minimal_agy_env()`
+    plus an explicit, per-call ``UV_CACHE_DIR`` (when present in the
+    caller's real environment). Serena is launched via ``uvx``/``uv tool``
+    and live-trial tests rely on being able to force a genuinely cold or
+    warm ``uvx``-resolved dependency cache per trial slot by setting
+    ``UV_CACHE_DIR`` in the *calling* process's environment before
+    invoking the collector -- that value must reach the Serena subprocess,
+    but must not leak into the general AGY subprocess env allowlist
+    (`_minimal_agy_env()`), which is asserted to exclude it
+    (`test_ac13_minimal_agy_env_allowlist`).
+    """
+    env = _minimal_agy_env()
+    uv_cache_dir = os.environ.get("UV_CACHE_DIR")
+    if uv_cache_dir is not None:
+        env["UV_CACHE_DIR"] = uv_cache_dir
     return env
 
 
@@ -5591,10 +6171,68 @@ def _run_delegation_core(
                     repo_root,
                 )
                 manifest = load_serena_tool_manifest(repo_root)
+                retry_attempted = False
+                retry_succeeded = False
+                initial_failure_class: str | None = None
+                attempts: list[dict[str, Any]] = []
+                # Issue #2015 P1 fix (OWNER REQUEST_CHANGES on PR #2044): a
+                # single absolute monotonic deadline is generated once for
+                # the whole route (not per collector call) -- the collector
+                # session deadline is a route-level budget shared by a
+                # first attempt and its retry, never a fresh budget per
+                # attempt (which previously allowed 1st(120s) + 2nd(120s)
+                # to together exceed the outer route_harness_timeout).
+                route_deadline_monotonic = time.monotonic() + SERENA_COLLECTOR_SESSION_DEADLINE_SEC
                 try:
-                    local_asset_result = _collect_live_serena_read_only_evidence(
-                        context_paths, repo_root, manifest
-                    )
+                    attempt_started = time.monotonic()
+                    try:
+                        local_asset_result = _collect_live_serena_read_only_evidence(
+                            context_paths, repo_root, manifest,
+                            deadline_monotonic=route_deadline_monotonic,
+                        )
+                    except SerenaCollectorError as first_exc:
+                        initial_failure_class = first_exc.failure_class
+                        attempts.append(_build_serena_attempt_record(1, attempt_started, exc=first_exc))
+                        remaining_budget = route_deadline_monotonic - time.monotonic()
+                        # Issue #2015 AC5: only the transient timeout classes
+                        # get a bounded, single, fresh-process retry -- and
+                        # only when enough route budget remains for the
+                        # retry to have a genuine chance to complete while
+                        # still leaving the downstream/cleanup reserve
+                        # intact (Issue #2015 P1 fix). All other
+                        # stage-specific failures (manifest drift, protocol
+                        # error, jsonrpc error, redaction failure, process
+                        # exit, cleanup failure) fail closed on the first
+                        # attempt -- retrying them cannot change the outcome
+                        # and silent/unlimited retry is forbidden.
+                        if (
+                            first_exc.failure_class in SERENA_RETRYABLE_FAILURE_CLASSES
+                            and remaining_budget > SERENA_RETRY_MIN_REMAINING_BUDGET_SEC
+                        ):
+                            retry_attempted = True
+                            retry_started = time.monotonic()
+                            try:
+                                local_asset_result = _collect_live_serena_read_only_evidence(
+                                    context_paths, repo_root, manifest,
+                                    deadline_monotonic=route_deadline_monotonic,
+                                )
+                                retry_succeeded = True
+                                attempts.append(
+                                    _build_serena_attempt_record(2, retry_started, result=local_asset_result)
+                                )
+                            except SerenaCollectorError as second_exc:
+                                attempts.append(_build_serena_attempt_record(2, retry_started, exc=second_exc))
+                                second_exc.initial_failure_class = initial_failure_class  # type: ignore[attr-defined]
+                                second_exc.retry_attempted = True  # type: ignore[attr-defined]
+                                second_exc.attempts = attempts  # type: ignore[attr-defined]
+                                raise
+                        else:
+                            first_exc.attempts = attempts  # type: ignore[attr-defined]
+                            raise
+                    else:
+                        attempts.append(
+                            _build_serena_attempt_record(1, attempt_started, result=local_asset_result)
+                        )
                     evidence_documents, local_asset_retrieval_metadata = _coerce_live_serena_retrieval_result(
                         local_asset_result,
                         context_paths=context_paths,
@@ -5605,9 +6243,18 @@ def _run_delegation_core(
                             "retrieval_status": "succeeded",
                             "context_files_count": len(context_paths),
                             "failure_class": None,
+                            "retry_attempted": retry_attempted,
+                            "retry_succeeded": retry_succeeded,
+                            "initial_failure_class": initial_failure_class,
+                            "attempts": attempts,
                         }
                 except Exception as exc:
                     manifest_id = _serena_manifest_id(manifest)
+                    stage_failure_class = getattr(exc, "failure_class", None)
+                    manifest_drift_failed = bool(getattr(exc, "manifest_drift_failed", False))
+                    exc_request_ledger = getattr(exc, "request_ledger", [])
+                    exc_initial_failure_class = getattr(exc, "initial_failure_class", None) or stage_failure_class
+                    exc_retry_attempted = bool(getattr(exc, "retry_attempted", retry_attempted))
                     return {
                         "schema": "delegation_result/v1",
                         "transport": "agy",
@@ -5647,10 +6294,22 @@ def _run_delegation_core(
                                 list(manifest.get("dangerous_denylist", []))
                             ),
                             "live_tools_list_sha256": None,
-                            "manifest_drift_failed": True,
+                            # Issue #2015 AC4: only an actual tools/list
+                            # manifest mismatch sets this True. Every other
+                            # failure class (timeout, process exit, protocol
+                            # error, jsonrpc error, redaction failure,
+                            # cleanup failure) leaves it False.
+                            "manifest_drift_failed": manifest_drift_failed,
                             "context_files_count": len(context_paths),
                             "evidence_record_count": 0,
                             "failure_class": "local_asset_research live_serena_mcp_failed",
+                            "stage_failure_class": stage_failure_class,
+                            "initial_failure_class": exc_initial_failure_class,
+                            "retry_attempted": exc_retry_attempted,
+                            "retry_succeeded": False,
+                            "request_ledger": exc_request_ledger,
+                            "attempts": getattr(exc, "attempts", []),
+                            "cleanup_failure": getattr(exc, "cleanup_failure", None),
                         },
                     }
             prompt_text = _build_local_asset_prompt(
