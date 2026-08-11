@@ -28,6 +28,7 @@ from skill_runtime_command_policy import (
     current_branch,
     is_exact_skill_runtime_anchor_executor_command,
     is_exact_skill_runtime_contract_update_anchor_executor_command,
+    is_exact_skill_runtime_decide_executor_command,
     is_exact_skill_runtime_executor_command,
     is_exact_skill_runtime_fixture_executor_command,
     load_registry_entry,
@@ -1901,6 +1902,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--fixture", required=False, default=None)
     parser.add_argument("--anchor-comment-url", required=False, default=None)
+    parser.add_argument("--loop-state-file", required=False, default=None)
+    parser.add_argument("--review-result-verdict", required=False, default=None)
+    parser.add_argument("--max-iterations", required=False, default=None)
     args = parser.parse_args(argv)
 
     project_root = resolve_project_root()
@@ -1918,6 +1922,7 @@ def main(argv: list[str] | None = None) -> int:
         "contract_update.run.with_anchor",
         "contract_update.run.with_human_context",
     }
+    is_decide_command = args.command_id == "decide.run"
     if is_fixture_command:
         if not args.fixture:
             print("skill_runtime_exec: --fixture required for preflight.run.fixture", file=sys.stderr)
@@ -1925,6 +1930,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.anchor_comment_url:
             print(
                 "skill_runtime_exec: --anchor-comment-url is not allowed for preflight.run.fixture",
+                file=sys.stderr,
+            )
+            return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: --loop-state-file/--review-result-verdict/"
+                "--max-iterations are not allowed for preflight.run.fixture",
                 file=sys.stderr,
             )
             return 2
@@ -1957,6 +1969,13 @@ def main(argv: list[str] | None = None) -> int:
         if not args.anchor_comment_url:
             print(
                 "skill_runtime_exec: --anchor-comment-url required for anchor runtime commands",
+                file=sys.stderr,
+            )
+            return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: --loop-state-file/--review-result-verdict/"
+                "--max-iterations are not allowed for anchor runtime commands",
                 file=sys.stderr,
             )
             return 2
@@ -1993,6 +2012,44 @@ def main(argv: list[str] | None = None) -> int:
         if not exact_anchor_command:
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
+    elif is_decide_command:
+        if args.fixture or args.anchor_comment_url:
+            print(
+                "skill_runtime_exec: --fixture/--anchor-comment-url are not allowed for decide.run",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.loop_state_file or not args.review_result_verdict:
+            print(
+                "skill_runtime_exec: --loop-state-file and --review-result-verdict "
+                "are required for decide.run",
+                file=sys.stderr,
+            )
+            return 2
+        max_iterations = args.max_iterations or "3"
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--loop-state-file",
+                args.loop_state_file,
+                "--review-result-verdict",
+                args.review_result_verdict,
+                "--max-iterations",
+                max_iterations,
+            ]
+        )
+        if not is_exact_skill_runtime_decide_executor_command(command_text, project_root, project_root):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
     else:
         if args.fixture:
             print("skill_runtime_exec: --fixture is only allowed for preflight.run.fixture", file=sys.stderr)
@@ -2001,6 +2058,13 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "skill_runtime_exec: --anchor-comment-url is only allowed for "
                 "an anchor-bound preflight profile",
+                file=sys.stderr,
+            )
+            return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: --loop-state-file/--review-result-verdict/"
+                "--max-iterations are only allowed for decide.run",
                 file=sys.stderr,
             )
             return 2
@@ -2047,9 +2111,15 @@ def main(argv: list[str] | None = None) -> int:
     if not registry_path.is_file():
         raise RuntimeError("registry_missing")
 
+    # #2086 AC10: decide.run dispatches decide_next_loop_action.py, not
+    # run_refinement_preflight.py -- the pre-existing integrity/symlink
+    # check below must validate the script the command_id actually reaches,
+    # otherwise decide.run could never pass this check even though it never
+    # touches run_refinement_preflight.py.
     script_path = (
         Path(project_root) / ".claude" / "skills" / "issue-refinement-loop"
-        / "scripts" / "run_refinement_preflight.py"
+        / "scripts"
+        / ("decide_next_loop_action.py" if is_decide_command else "run_refinement_preflight.py")
     )
     if script_path.is_symlink() or not script_path.is_file():
         raise RuntimeError("preflight_script_invalid")
@@ -2069,6 +2139,10 @@ def main(argv: list[str] | None = None) -> int:
         render_params["fixture"] = args.fixture
     if is_anchor_command or is_contract_update_command:
         render_params["anchor_comment_url"] = args.anchor_comment_url
+    if is_decide_command:
+        render_params["loop_state_file"] = args.loop_state_file
+        render_params["verdict"] = args.review_result_verdict
+        render_params["max_iterations"] = args.max_iterations or "3"
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
 

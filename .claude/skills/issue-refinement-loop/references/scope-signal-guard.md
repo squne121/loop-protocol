@@ -119,6 +119,17 @@ trusted anchor と判定された場合のみ `scope_delta_decision.status=appro
 だけを用いて `contract_update_required` に正規化できる。raw comment body を planner
 input に渡さず、新しい authority schema も作らない。
 
+**#2086**: `classify_directive_confidence()` は operator-selected human-context lane
+（`source_kind: issue_comment`、`operator_asserted_human_context=True`）の bullet-list
+directive を、既知の `_DIRECTIVE_SECTION_MARKERS` 見出しが無くても `explicit` として扱う。
+さらに `classify_scope_delta_authority()` の `investigation_derived_path_literals`
+キーワード引数（`SCOPE_DELTA_AUTHORITY_EVIDENCE_V1` schema には含めない別引数）は、
+同じ trusted operator lane に限り `expands_allowed_paths` boundary を安全な
+read-only investigation 由来の exact literal で解除できる。詳細は
+`references/anchor-comment-handling.md` の「Operator-Selected Human-Context 継続と
+Accepted Trust Model」を参照。destructive / permission / external-service /
+issue-split の各 boundary はこの緩和の対象外のまま。
+
 - role / component / class / module / agent の split は Issue partition ではない。
   `requires_issue_split=true` は複数・別 Issue（必要なら独立 PR）を明示した trusted
   directive に限る。

@@ -2403,13 +2403,24 @@ def _build_scope_delta_authority_evidence(
 
     markers = extract_directive_markers(comment_body)
     directives = extract_directive_items(comment_body)
-    confidence = classify_directive_confidence(comment_body, markers)
     boundary_flags_map = detect_boundary_flags(comment_body)
     boundary_flag_names = [name for name, value in boundary_flags_map.items() if value]
+    # #2086 AC1/AC3/AC6: source_kind must be resolved before confidence is
+    # classified so that the operator-selected human-context lane (the only
+    # lane where `source_kind == "issue_comment"`, see
+    # `_resolve_scope_delta_source_kind()`) can relax the "known marker
+    # heading required" rule for freeform directives. `with_agent_report` /
+    # unlabeled anchors always resolve to `generated_by_agent` here and never
+    # reach this relaxation.
     source_kind = _resolve_scope_delta_source_kind(
         anchor_url,
         human_context_comment_urls=human_context_comment_urls,
         agent_report_comment_urls=agent_report_comment_urls,
+    )
+    confidence = classify_directive_confidence(
+        comment_body,
+        markers,
+        operator_asserted_human_context=(source_kind == "issue_comment"),
     )
 
     issue_url = f"https://github.com/{repo}/issues/{issue_number}"

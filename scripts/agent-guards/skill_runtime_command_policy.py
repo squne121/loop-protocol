@@ -44,6 +44,17 @@ SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE = "exact_skill_runtime_fixture"
 SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR = "exact_skill_runtime_anchor"
 SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR = "exact_skill_runtime_contract_update_anchor"
 
+# #2086 AC10: sibling exact profile for the `decide.run` command class
+# (`decide_next_loop_action.py`). `decide.run` was already declared in
+# `command_registry.py` (render_command/argv/placeholders), but had no
+# matching eligible_command_ids entry here, so it could never actually be
+# dispatched through skill_runtime_exec.py -- a registry/policy-declaration-
+# only false-green. This adds the missing exact-match parser/eligibility
+# entry; `preflight.run` / anchor / fixture profiles above are entirely
+# unmodified by this addition.
+SKILL_RUNTIME_EXECUTION_CLASS_DECIDE = "exact_skill_runtime_decide"
+_DECIDE_VERDICT_VALUES = frozenset({"approve", "request_changes", "needs-fix"})
+
 # Canonical GitHub issue comment URL shape used both for the registry
 # placeholder type (`.claude/skills/issue-refinement-loop/scripts/
 # command_registry.py`) and for this module's own context-binding check.
@@ -136,6 +147,18 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
             ],
             "network_effect": "github_read_only",
         },
+        # #2086 AC10: decide_next_loop_action.py is a read-only, non-mutating
+        # router (mutation: False in command_registry.py) that only reads an
+        # already-materialized loop state file and echoes a routing
+        # decision to stdout. It has no active-issue artifact write root of
+        # its own.
+        "decide.run": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_DECIDE,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [],
+            "network_effect": "local_only",
+        },
     },
 }
 
@@ -148,6 +171,7 @@ ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset(
         "preflight.run.with_agent_report",
         "contract_update.run.with_anchor",
         "contract_update.run.with_human_context",
+        "decide.run",
     }
 )
 _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
@@ -216,6 +240,13 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
             "artifacts/{active_issue}/issue-metadata/",
         ],
     },
+    "decide.run": {
+        "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_DECIDE,
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "local_only",
+        "allowed_write_roots": [],
+    },
 }
 
 
@@ -227,6 +258,9 @@ class ExactSkillRuntimeCommand:
     argv: tuple[str, ...]
     fixture: str = ""
     anchor_comment_url: str = ""
+    loop_state_file: str = ""
+    verdict: str = ""
+    max_iterations: str = ""
 
 
 def command_allows_root_no_worktree(parsed: ExactSkillRuntimeCommand) -> bool:
@@ -544,6 +578,115 @@ def is_exact_skill_runtime_fixture_executor_command(
     if active_issue != parsed.issue_number or entry is None:
         return False
     return True
+
+
+def parse_exact_skill_runtime_decide_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact-match parser for the `decide.run` command class (#2086 AC10).
+
+    Mirrors `parse_exact_skill_runtime_command` token-for-token, with three
+    additional trailing flag/value pairs (`--loop-state-file <path>
+    --review-result-verdict <verdict> --max-iterations <n>`). This is a
+    separate, independent function -- production `preflight.run` / fixture /
+    anchor parsers above are entirely unmodified by this addition. Unlike
+    `--fixture` (test-only), `--loop-state-file` is exercised by the real
+    production `decide.run` invocation, so the same repo-relative /
+    traversal / symlink-escape safety check (`_is_safe_repo_relative_fixture_path`)
+    is applied here for real writes-adjacent path handling, not just tests.
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    if len(tokens) != 16:
+        return None
+    if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    expected_flags = [
+        "--command-id",
+        "--issue-number",
+        "--repo",
+        "--loop-state-file",
+        "--review-result-verdict",
+        "--max-iterations",
+    ]
+    expected_positions = [4, 6, 8, 10, 12, 14]
+    for flag, pos in zip(expected_flags, expected_positions):
+        if tokens[pos] != flag:
+            return None
+    if any(
+        tok.startswith("--command-id=")
+        or tok.startswith("--issue-number=")
+        or tok.startswith("--repo=")
+        or tok.startswith("--loop-state-file=")
+        or tok.startswith("--review-result-verdict=")
+        or tok.startswith("--max-iterations=")
+        for tok in tokens
+    ):
+        return None
+    command_id = tokens[5]
+    issue_number = tokens[7]
+    repo = tokens[9]
+    loop_state_file = tokens[11]
+    verdict = tokens[13]
+    max_iterations = tokens[15]
+    if command_id != "decide.run":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0:
+        return None
+    if repo != TRUSTED_REPO_SLUG:
+        return None
+    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+        return None
+    if not _is_safe_repo_relative_fixture_path(loop_state_file, root):
+        return None
+    if verdict not in _DECIDE_VERDICT_VALUES:
+        return None
+    if not max_iterations.isdigit() or int(max_iterations) <= 0:
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        loop_state_file=loop_state_file,
+        verdict=verdict,
+        max_iterations=max_iterations,
+    )
+
+
+def is_exact_skill_runtime_decide_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """Same trusted-repo / default-branch / canonical-root safety boundary as
+    `is_exact_skill_runtime_executor_command`, applied to the `decide.run`
+    command class (#2086 AC10). `decide.run` is always root-no-worktree
+    eligible (it is a read-only router, not bound to a single active
+    issue's artifact directory)."""
+    parsed = parse_exact_skill_runtime_decide_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    default_branch = resolve_default_branch(project_root, deadline)
+    if not branch or branch != default_branch:
+        return False
+    repo_slug = resolve_repo_slug(project_root, deadline)
+    if repo_slug != parsed.repo:
+        return False
+    return command_allows_root_no_worktree(parsed)
 
 
 def _parse_exact_skill_runtime_anchor_command(
@@ -973,6 +1116,19 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "{anchor_comment_url}",
         "--consume-contract-patch-plan",
     ],
+    # #2086 AC10
+    "decide.run": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py",
+        "--loop-state-file",
+        "{loop_state_file}",
+        "--review-result-verdict",
+        "{verdict}",
+        "--max-iterations",
+        "{max_iterations}",
+    ],
 }
 
 _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
@@ -1010,6 +1166,12 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "repo": {"type": "owner_repo", "required": True},
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
     },
+    # #2086 AC10
+    "decide.run": {
+        "loop_state_file": {"type": "repo_relative_file", "required": True},
+        "verdict": {"type": "verdict", "required": True},
+        "max_iterations": {"type": "positive_int", "required": False},
+    },
 }
 
 
@@ -1030,6 +1192,13 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
     expected_write_roots = [".claude/artifacts/issue-refinement-loop/{active_issue}/"]
     if command_id in {"contract_update.run.with_anchor", "contract_update.run.with_human_context"}:
         expected_write_roots.append("artifacts/{active_issue}/issue-metadata/")
+    # #2086 AC10: `decide.run` (decide_next_loop_action.py) is a read-only,
+    # non-mutating router (mutation: False) with no active-issue artifact
+    # write root of its own -- it is not bound to a single issue's
+    # `.claude/artifacts/issue-refinement-loop/{active_issue}/` directory
+    # the way every other eligible command_id is.
+    if command_id == "decide.run":
+        expected_write_roots = []
     if entry.get("allowed_write_roots") != expected_write_roots:
         raise ValueError("allowed_write_roots_mismatch")
     argv = entry.get("argv")
@@ -1048,5 +1217,5 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
     }
     if argv_placeholders != declared_placeholders:
         raise ValueError("argv_placeholder_contract_mismatch")
-    if "{active_issue}" not in "".join(expected_write_roots):
+    if command_id != "decide.run" and "{active_issue}" not in "".join(expected_write_roots):
         raise ValueError("active_issue_placeholder_missing")

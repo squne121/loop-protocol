@@ -166,6 +166,19 @@ raw トリガー名自体も cause ではない）。summary 本文には常に�
 - scope change signal が新規追加された場合
 - required external research が critical claim を unresolved のまま残した場合
 
+### #2086: trusted operator-selected directive による scope expansion は単独では停止理由にしない
+
+上記「scope change signal が新規追加された場合」は、`scope_signal_guard_decision_v2.
+scope_delta_authority.route.action == "contract_update_required"`（`with_human_context`
+lane の trusted OWNER/MEMBER/COLLABORATOR directive、`references/anchor-comment-handling.md`
+の「Operator-Selected Human-Context 継続」参照）が成立するケースには適用しない。
+`decide_next_loop_action.py` はこのケースを `NEXT_ACTION: proceed_with_contract_update`
+として優先的に処理し（`scope_signal_guard` hard stop より高優先）、
+`termination_reason` を変更しない（loop は継続する）。停止理由として `scope change signal`
+が残るのは、evidence が untrusted / ambiguous / conflicting、または destructive・
+permission・external-service・issue-split boundary を伴う場合など、
+`classify_scope_delta_authority()` が `human_escalation` を返すケースに限られる。
+
 ## Must not（禁止事項）
 
 - `approve` 以外を success 扱いして silently finish しない

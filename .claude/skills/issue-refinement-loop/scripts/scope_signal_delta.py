@@ -860,17 +860,40 @@ def extract_directive_items(text: "str | None") -> list:
     return items
 
 
-def classify_directive_confidence(text: "str | None", markers: "list | None" = None) -> str:
+def classify_directive_confidence(
+    text: "str | None",
+    markers: "list | None" = None,
+    *,
+    operator_asserted_human_context: bool = False,
+) -> str:
     """Deterministic confidence classification for a single review comment.
 
     - no directive markers found -> inferred (the AI would have to infer intent)
     - markers found + at least one bullet-list line -> explicit
     - markers found but no structured bullet list -> ambiguous
+
+    #2086 AC1/AC3: an ``operator_asserted_human_context`` directive (the
+    comment URL was passed on the ``preflight.run.with_human_context`` /
+    ``contract_update.run.with_human_context`` lane -- never inferred from
+    comment metadata, see Design Invariant #1) that has at least one
+    structured bullet-list line is treated as ``explicit`` even when it does
+    not contain one of the fixed ``_DIRECTIVE_SECTION_MARKERS`` section
+    headings. A hand-written ``ANCHOR_SCOPE_REFRAME_V1`` payload or a
+    "Revised Acceptance Criteria" heading is not required for a trusted,
+    operator-selected human-context directive to be recognized as an
+    explicit scope-mutation directive -- only the ``with_agent_report`` /
+    unlabeled lanes remain excluded from this relaxation (AC6, gated
+    entirely by the caller-supplied ``operator_asserted_human_context`` flag,
+    which is only ever ``True`` for the human-context lane -- see
+    ``_resolve_scope_delta_source_kind()`` in ``run_refinement_preflight.py``).
     """
     marker_list = markers if markers is not None else extract_directive_markers(text)
+    has_bullets = bool(_BULLET_LINE_RE.search(text or ""))
     if not marker_list:
+        if operator_asserted_human_context and has_bullets:
+            return DIRECTIVE_CONFIDENCE_EXPLICIT
         return DIRECTIVE_CONFIDENCE_INFERRED
-    if _BULLET_LINE_RE.search(text or ""):
+    if has_bullets:
         return DIRECTIVE_CONFIDENCE_EXPLICIT
     return DIRECTIVE_CONFIDENCE_AMBIGUOUS
 
@@ -1696,12 +1719,61 @@ def _permission_boundary_is_constrained_directive(evidence: dict, boundary_flags
     return len(concrete_deltas) == 1
 
 
-def _first_blocking_boundary_reason(boundary_flags: dict, evidence: dict):
+def _has_investigation_derived_allowed_path_literals(
+    investigation_derived_path_literals: "list | None",
+) -> bool:
+    """#2086 AC3/AC4: agent read-only investigation may supply exact
+    Allowed Paths literals for a trusted operator-selected human-context
+    directive that names architecture/workflow-level scope expansion in
+    semantic prose without an exact backtick path literal in the directive
+    text itself (Design Invariant #2: the human states *what* must change,
+    the agent derives *which exact repo paths* implement that change from
+    current-main evidence).
+
+    This is deliberately a **caller-supplied, out-of-evidence** argument
+    (never embedded into ``SCOPE_DELTA_AUTHORITY_EVIDENCE_V1``, whose schema
+    is out of this Issue's Allowed Paths and stays ``additionalProperties:
+    false``). The caller (``run_refinement_preflight.py`` / the
+    ``codebase-investigator`` SubAgent-backed orchestrator step) is
+    responsible for only ever populating this from read-only repository
+    inventory, never from the raw comment body itself.
+    """
+    if not isinstance(investigation_derived_path_literals, list):
+        return False
+    for item in investigation_derived_path_literals:
+        if not isinstance(item, str):
+            continue
+        if _normalize_exact_repository_path_literal(item) is not None:
+            return True
+    return False
+
+
+def _first_blocking_boundary_reason(
+    boundary_flags: dict,
+    evidence: dict,
+    *,
+    operator_asserted_human_context: bool = False,
+    investigation_derived_path_literals: "list | None" = None,
+):
     """Return the first boundary that has not earned its narrow exception.
 
     Every true flag is evaluated independently.  Clearing a constrained
     permission redesign must never hide an external, destructive, split, or
     vague Allowed Paths boundary that appears later in the priority order.
+
+    #2086 AC3/AC4: for the operator-selected human-context lane only
+    (``operator_asserted_human_context=True``, gated upstream by
+    ``classify_scope_delta_authority()`` on ``authority_category ==
+    "human_review_directive"`` -- i.e. a trusted OWNER/MEMBER/COLLABORATOR
+    on the ``with_human_context`` lane), a safe
+    ``investigation_derived_path_literals`` entry clears the
+    ``expands_allowed_paths`` boundary the same way an exact backtick
+    literal already extracted from the directive text does. This does not
+    relax the destructive / permission / external-service / issue-split
+    boundaries, and it does not relax the existing #1952 "mixed literal"
+    fail-closed behavior for directive text that itself contains an unsafe
+    or malformed backtick token (``_has_explicit_exact_allowed_path_expansion``
+    is still tried first and is unaffected by this addition).
     """
     for key, reason in _BOUNDARY_REASON_PRIORITY:
         if not boundary_flags.get(key):
@@ -1710,7 +1782,15 @@ def _first_blocking_boundary_reason(boundary_flags: dict, evidence: dict):
             evidence, boundary_flags
         ):
             continue
-        if key == "expands_allowed_paths" and _has_explicit_exact_allowed_path_expansion(evidence):
+        if key == "expands_allowed_paths" and (
+            _has_explicit_exact_allowed_path_expansion(evidence)
+            or (
+                operator_asserted_human_context
+                and _has_investigation_derived_allowed_path_literals(
+                    investigation_derived_path_literals
+                )
+            )
+        ):
             continue
         return reason
     return None
@@ -1781,6 +1861,7 @@ def classify_scope_delta_authority(
     target_issue_number=None,
     base_issue_body_sha256=None,
     expected_repo=None,
+    investigation_derived_path_literals=None,
 ) -> dict:
     """AC1-AC19: classify scope_delta_authority for a scope signal delta.
 
@@ -1794,6 +1875,15 @@ def classify_scope_delta_authority(
     URL from a *different* repository is fail-closed rejected (AC16
     hardening). When omitted, issue_comment evidence is fail-closed rejected
     by the URL validator (repo cross-check cannot be skipped silently).
+
+    `investigation_derived_path_literals` (#2086 AC3/AC4): an optional list
+    of repository-relative path strings derived by *read-only* agent
+    investigation (never from the raw comment body). It is only ever
+    consulted for the operator-selected human-context lane (evidence whose
+    `authority_category` resolves to `human_review_directive`) to clear the
+    `expands_allowed_paths` boundary when the directive itself names
+    architecture/workflow-level scope expansion in prose without an exact
+    backtick literal (see `_has_investigation_derived_allowed_path_literals`).
     """
     if not triggered:
         return _build_scope_delta_authority_result(
@@ -1886,7 +1976,12 @@ def classify_scope_delta_authority(
         )
 
     # category == human_review_directive
-    boundary_reason = _first_blocking_boundary_reason(boundary_flags, primary_evidence)
+    boundary_reason = _first_blocking_boundary_reason(
+        boundary_flags,
+        primary_evidence,
+        operator_asserted_human_context=True,
+        investigation_derived_path_literals=investigation_derived_path_literals,
+    )
     if boundary_reason is not None:
         # AC18: boundary flags gate even a trusted approval.
         return _build_scope_delta_authority_result(
