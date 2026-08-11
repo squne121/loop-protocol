@@ -361,6 +361,13 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "mutation": False,
         "placeholders": {},
     },
+    # Issue #2053 P0 fix-delta (iteration 2, OWNER PR review): authority
+    # transport routing is wired directly into the canonical `decide.run`
+    # command -- there is no sibling ID. All authority-transport
+    # placeholders are optional (`optional_flag_pair` / `bool_flag`); when
+    # omitted, render_command() drops both the flag literal and its value
+    # token entirely, so callers that do not pass them get byte-identical
+    # argv to decide.run's original (pre-#2053) shape.
     "decide.run": {
         "id": "decide.run",
         "argv": [
@@ -369,9 +376,16 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "--loop-state-file", "{loop_state_file}",
             "--review-result-verdict", "{verdict}",
             "--max-iterations", "{max_iterations}",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--authority-transport-path", "{authority_transport_manifest_path}",
+            "{authority_expected}",
+            "--invocation-id", "{invocation_id}",
+            "--git-head-sha", "{git_head_sha}",
         ],
         "shell": False,
         "cwd_policy": "repo_root",
+        "execution_class": "exact_router_authority_transport",
         "stdin_contract": "none",
         "stdout_contract": "decide_next_loop_action/v1",
         "timeout_seconds": 30,
@@ -379,7 +393,110 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "placeholders": {
             "loop_state_file": {"type": "repo_relative_file", "required": True},
             "verdict": {"type": "verdict", "required": True},
-            "max_iterations": {"type": "positive_int", "required": False},
+            "max_iterations": {"type": "positive_int", "required": False, "optional_flag_pair": True},
+            "issue_number": {"type": "positive_int", "required": False, "optional_flag_pair": True},
+            "repo": {"type": "owner_repo", "required": False, "optional_flag_pair": True},
+            "authority_transport_manifest_path": {"type": "path", "required": False, "optional_flag_pair": True},
+            "authority_expected": {"type": "bool_flag", "flag_literal": "--authority-expected"},
+            "invocation_id": {"type": "string", "required": False, "optional_flag_pair": True},
+            "git_head_sha": {"type": "string", "required": False, "optional_flag_pair": True},
+        },
+    },
+    # Issue #2053 AC1/AC7: producer role -- generates and immutably persists
+    # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 from a SCOPE_DELTA_AUTHORITY_EVIDENCE_V1
+    # fixture file (bypasses the gh CLI, same test-fixture pattern as
+    # preflight.run.fixture).
+    "authority_transport.produce": {
+        "id": "authority_transport.produce",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--invocation-id", "{invocation_id}",
+            "--git-head-sha", "{git_head_sha}",
+            "--produce-authority-transport", "{evidence_fixture_path}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_authority_transport_producer",
+        "required_cwd": "canonical_main_root",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{issue_number}/authority-transport/{invocation_id}/"
+        ],
+        "network_effect": "local_only",
+        "stdin_contract": "none",
+        "stdout_contract": "scope_delta_authority_transport_producer_result/v1",
+        "timeout_seconds": 60,
+        "mutation": False,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "invocation_id": {"type": "string", "required": True},
+            "git_head_sha": {"type": "string", "required": True},
+            "evidence_fixture_path": {"type": "path", "required": True},
+        },
+    },
+    # Issue #2053 AC9: controlled consumer role -- verifies a
+    # SCOPE_DELTA_ROUTER_RECEIPT_V1, mutates (writes the consumed payload)
+    # exactly once, reads back, performs a fresh rerun, and emits
+    # SCOPE_DELTA_CONSUMPTION_RECEIPT_V1.
+    #
+    # Fresh review blocker P0-A fix: `--contract-patch-plan-file` /
+    # `--anchor-context-file` are canonical optional placeholders so a
+    # registry-rendered argv can actually carry a CONTRACT_PATCH_PLAN_V1 +
+    # anchor context all the way to `run_refinement_preflight.py`'s
+    # `--consume-authority-transport` CLI branch, which (only when both
+    # files are supplied) delegates the mutation step to the real
+    # controlled-mutation lane (`consume_trusted_anchor_contract_patch_plan()`
+    # -> `edit_issue_txn.py`) instead of merely writing the local audit
+    # artifact. Without these two placeholders the registry entry could
+    # never render an argv that reaches that lane at all -- callers were
+    # structurally confined to the local-artifact-only path regardless of
+    # what the Python-level function signature supports.
+    #
+    # `network_effect` fix: this command is `mutation: True` and, when the
+    # two optional files above are supplied, its default (non-fixture)
+    # execution path genuinely performs a real GitHub issue mutation via
+    # `edit_issue_txn.py`'s `gh` subprocess calls -- it is not confined to
+    # local-only filesystem effects in that shape. `github_mutation`
+    # reflects that; the previous `local_only` classification was accurate
+    # only for the local-artifact-only shape (no patch plan / anchor
+    # context supplied) and was therefore a misclassification for the
+    # general command_id.
+    "authority_transport.consume": {
+        "id": "authority_transport.consume",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--invocation-id", "{invocation_id}",
+            "--git-head-sha", "{git_head_sha}",
+            "--consume-authority-transport", "{router_receipt_path}",
+            "--contract-patch-plan-file", "{contract_patch_plan_file}",
+            "--anchor-context-file", "{anchor_context_file}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_authority_transport_consumer",
+        "required_cwd": "canonical_main_root",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{issue_number}/authority-transport/{invocation_id}/"
+        ],
+        "network_effect": "github_mutation",
+        "stdin_contract": "none",
+        "stdout_contract": "scope_delta_consumption_receipt/v1",
+        "timeout_seconds": 60,
+        "mutation": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "invocation_id": {"type": "string", "required": True},
+            "git_head_sha": {"type": "string", "required": True},
+            "router_receipt_path": {"type": "path", "required": True},
+            "contract_patch_plan_file": {"type": "path", "required": False, "optional_flag_pair": True},
+            "anchor_context_file": {"type": "path", "required": False, "optional_flag_pair": True},
         },
     },
     "gh.issue.view": {
@@ -666,6 +783,16 @@ def _validate_placeholder_value(name: str, value: Any, spec: dict) -> None:
                 f"Placeholder '{name}': expected string, got {type(value).__name__}"
             )
 
+    elif ph_type == "bool_flag":
+        # Issue #2053 P0 fix-delta: a self-contained conditional bare flag
+        # (no value token). Only bool is accepted; the flag is emitted
+        # verbatim (spec["flag_literal"]) when the value is truthy, and
+        # omitted entirely (no token at all) when falsy/absent.
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"Placeholder '{name}': expected bool for bool_flag, got {type(value).__name__}"
+            )
+
 
 def render_command(command_id: str, params: dict[str, Any]) -> list[str]:
     """Render a registry command by substituting placeholders.
@@ -704,19 +831,58 @@ def render_command(command_id: str, params: dict[str, Any]) -> list[str]:
             )
 
     # Substitute into argv template
-    # Supports both:
+    # Supports:
     #   - Whole-token placeholders: "{name}" -> str(value)
     #   - Partial-token placeholders: "prefix/{name}/suffix" -> "prefix/value/suffix"
+    #   - Issue #2053 P0 fix-delta: optional whole-token placeholders that
+    #     are entirely omitted (flag literal + value token, or a
+    #     self-contained bool_flag token) when the caller does not supply
+    #     them, so a single command_id (e.g. decide.run) can carry optional
+    #     authority-transport routing without a parallel sibling ID.
+    argv_tokens = entry["argv"]
     rendered: list[str] = []
-    for token in entry["argv"]:
-        if "{" in token and "}" in token:
-            # Replace all placeholders in the token (supports partial substitution)
-            result_token = token
-            for ph_name, value in params.items():
-                result_token = result_token.replace(f"{{{ph_name}}}", str(value))
-            rendered.append(result_token)
-        else:
-            rendered.append(token)
+    idx = 0
+    while idx < len(argv_tokens):
+        token = argv_tokens[idx]
+        is_whole_placeholder = (
+            token.startswith("{") and token.endswith("}") and token.count("{") == 1
+        )
+        if is_whole_placeholder:
+            ph_name = token[1:-1]
+            spec = placeholders.get(ph_name, {})
+            provided = ph_name in params
+            if spec.get("type") == "bool_flag":
+                if provided and params[ph_name]:
+                    flag_literal = spec.get("flag_literal")
+                    if not flag_literal:
+                        raise ValueError(
+                            f"bool_flag placeholder '{ph_name}' missing 'flag_literal' spec"
+                        )
+                    rendered.append(flag_literal)
+                idx += 1
+                continue
+            if (
+                not provided
+                and spec.get("optional_flag_pair", False)
+                and not spec.get("required", False)
+            ):
+                # Drop this value token, and drop the immediately preceding
+                # rendered token too if the *template* token right before
+                # this one is a bare (non-placeholder) flag literal -- i.e.
+                # this is a "--flag {value}" pair, so both go together.
+                if idx > 0:
+                    prev_template_tok = argv_tokens[idx - 1]
+                    if not (prev_template_tok.startswith("{") and prev_template_tok.endswith("}")):
+                        if rendered and rendered[-1] == prev_template_tok:
+                            rendered.pop()
+                idx += 1
+                continue
+        # Replace all placeholders in the token (supports partial substitution)
+        result_token = token
+        for ph_name2, value2 in params.items():
+            result_token = result_token.replace(f"{{{ph_name2}}}", str(value2))
+        rendered.append(result_token)
+        idx += 1
 
     # Verify no unresolved placeholders remain in required positions (Blocker 7)
     for token in rendered:

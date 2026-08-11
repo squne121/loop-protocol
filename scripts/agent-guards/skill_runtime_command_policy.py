@@ -44,6 +44,19 @@ SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE = "exact_skill_runtime_fixture"
 SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR = "exact_skill_runtime_anchor"
 SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR = "exact_skill_runtime_contract_update_anchor"
 
+# Issue #2053 P0 fix-delta (iteration 3, OWNER PR review): the
+# command_registry.py "decide.run" / "authority_transport.produce" /
+# "authority_transport.consume" entries (producer/router/consumer of the
+# SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 chain) were declared in the registry
+# but never registered in this module's eligible_command_ids -- so the
+# privileged runtime policy could not actually recognize them. These
+# execution_class constants mirror command_registry.py's own
+# `execution_class` value for each entry exactly (single source of truth
+# for the literal string, not a generalization of any existing class).
+SKILL_RUNTIME_EXECUTION_CLASS_ROUTER_AUTHORITY_TRANSPORT = "exact_router_authority_transport"
+SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_PRODUCER = "exact_authority_transport_producer"
+SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_CONSUMER = "exact_authority_transport_consumer"
+
 # Canonical GitHub issue comment URL shape used both for the registry
 # placeholder type (`.claude/skills/issue-refinement-loop/scripts/
 # command_registry.py`) and for this module's own context-binding check.
@@ -135,6 +148,58 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
                 "artifacts/{active_issue}/issue-metadata/",
             ],
             "network_effect": "github_read_only",
+        },
+        # Issue #2053 P0 fix-delta (iteration 3, OWNER PR review): registers
+        # the router role of the SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 chain
+        # (command_registry.py "decide.run") so the privileged runtime policy
+        # actually recognizes it. decide.run itself never performs GitHub
+        # mutation (mutation: False in command_registry.py) -- its only
+        # filesystem effect is the router receipt it writes under the same
+        # invocation-scoped authority-transport directory.
+        "decide.run": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ROUTER_AUTHORITY_TRANSPORT,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "local_only",
+        },
+        # Issue #2053 AC1/AC7: producer role (command_registry.py
+        # "authority_transport.produce") -- generates and immutably persists
+        # a SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest from a fixture file,
+        # bypassing the gh CLI entirely (network_effect: local_only, mirrored
+        # from the registry entry).
+        "authority_transport.produce": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_PRODUCER,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "local_only",
+        },
+        # Issue #2053 AC9: controlled consumer role (command_registry.py
+        # "authority_transport.consume") -- verifies a
+        # SCOPE_DELTA_ROUTER_RECEIPT_V1, mutates (writes the consumed
+        # payload, or delegates to the real contract_patch_plan consumer
+        # lane) exactly once, reads back, and emits
+        # SCOPE_DELTA_CONSUMPTION_RECEIPT_V1.
+        #
+        # Fresh review blocker P0-A fix: `network_effect` is `github_mutation`
+        # (mirrored from the registry entry), not `local_only` -- when the
+        # command_registry.py `--contract-patch-plan-file` /
+        # `--anchor-context-file` placeholders are supplied, this command's
+        # default execution path genuinely performs a real GitHub issue
+        # mutation via `edit_issue_txn.py`'s `gh` subprocess calls.
+        "authority_transport.consume": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_CONSUMER,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "github_mutation",
         },
     },
 }
