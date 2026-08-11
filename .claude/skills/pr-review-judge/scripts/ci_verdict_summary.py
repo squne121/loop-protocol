@@ -164,7 +164,7 @@ def fetch_head_sha(pr_number: int, repo: str) -> tuple[Optional[str], Optional[d
 
 
 STATUS_CHECK_ROLLUP_QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       commits(last: 1) {
@@ -172,8 +172,8 @@ query($owner: String!, $name: String!, $number: Int!) {
           commit {
             oid
             statusCheckRollup {
-              contexts(first: 100) {
-                pageInfo { hasNextPage }
+              contexts(first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
                 nodes {
                   __typename
                   ... on CheckRun {
@@ -219,34 +219,59 @@ def _conclusion_bucket(conclusion: Optional[str], status: Optional[str]) -> Opti
 
 
 def fetch_checks(pr_number: int, repo: str) -> tuple[Optional[list], Optional[dict]]:
-    """GraphQL statusCheckRollup から未集約の CheckRun provenance を一括取得する。"""
+    """GraphQL statusCheckRollup の全 page から CheckRun provenance を取得する。"""
     try:
         owner, name = repo.split("/", 1)
     except ValueError:
         return None, {"kind": "json_parse_error", "detail": f"invalid repo: {repo}"}
 
-    ok, data, raw = run_gh([
-        "api", "graphql",
-        "-f", f"query={STATUS_CHECK_ROLLUP_QUERY}",
-        "-F", f"owner={owner}",
-        "-F", f"name={name}",
-        "-F", f"number={pr_number}",
-    ])
-    if not ok or data is None:
-        return None, {"kind": classify_gh_error(raw), "detail": raw[:512]}
-
+    raw_runs: list[dict] = []
+    cursor: Optional[str] = None
+    seen_cursors: set[str] = set()
     try:
-        commits = data["data"]["repository"]["pullRequest"]["commits"]["nodes"]
-        commit = commits[-1]["commit"]
-        contexts = commit["statusCheckRollup"]["contexts"]
-        if contexts["pageInfo"]["hasNextPage"]:
-            raise ValueError("statusCheckRollup exceeds 100 contexts")
-        raw_runs = contexts["nodes"]
+        while True:
+            ok, data, raw = run_gh([
+                "api", "graphql",
+                "-f", f"query={STATUS_CHECK_ROLLUP_QUERY}",
+                "-F", f"owner={owner}",
+                "-F", f"name={name}",
+                "-F", f"number={pr_number}",
+                "-F", f"cursor={cursor if cursor is not None else 'null'}",
+            ])
+            if not ok or data is None:
+                return None, {"kind": classify_gh_error(raw), "detail": raw[:512]}
+
+            commits = data["data"]["repository"]["pullRequest"]["commits"]["nodes"]
+            commit = commits[-1]["commit"]
+            contexts = commit["statusCheckRollup"]["contexts"]
+            page_info = contexts["pageInfo"]
+            has_next_page = page_info["hasNextPage"]
+            page_runs = contexts["nodes"]
+            if not isinstance(has_next_page, bool):
+                raise ValueError("statusCheckRollup pageInfo.hasNextPage must be boolean")
+            if not isinstance(page_runs, list):
+                raise ValueError("statusCheckRollup contexts.nodes must be a list")
+            raw_runs.extend(page_runs)
+            if not has_next_page:
+                break
+
+            next_cursor = page_info["endCursor"]
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise ValueError("statusCheckRollup pageInfo.endCursor missing or invalid")
+            if next_cursor in seen_cursors:
+                raise ValueError("statusCheckRollup pageInfo.endCursor repeated")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         return None, {"kind": "json_parse_error", "detail": f"statusCheckRollup shape: {exc}"}
 
     checks: list[dict] = []
     for run in raw_runs:
+        if not isinstance(run, dict):
+            return None, {
+                "kind": "json_parse_error",
+                "detail": "statusCheckRollup shape: context node must be an object",
+            }
         if run.get("__typename") != "CheckRun":
             continue
         suite = run.get("checkSuite") or {}
