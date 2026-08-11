@@ -1998,6 +1998,7 @@ def classify_scope_delta_authority(
         target_issue_number=target_issue_number,
         base_issue_body_sha256=base_issue_body_sha256,
         expected_repo=expected_repo,
+        investigation_derived_path_literals=investigation_derived_path_literals,
     )
 
     if cross_target_follow_ups:
@@ -2023,6 +2024,7 @@ def _classify_scope_delta_authority_core(
     target_issue_number=None,
     base_issue_body_sha256=None,
     expected_repo=None,
+    investigation_derived_path_literals=None,
 ) -> dict:
     """AC1-AC19: classify scope_delta_authority for a scope signal delta.
 

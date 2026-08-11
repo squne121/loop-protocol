@@ -418,3 +418,141 @@ def test_decide_run_only_flags_rejected_for_preflight_run(tmp_path: Path) -> Non
     )
     assert result.returncode == 2, result.stderr
     assert "only allowed for decide.run" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# #2086 AC9/AC10 (iteration 2): authority_transport.produce/consume real
+# subprocess dispatch. Companion to `_install_decide_run_fixture` above --
+# these two commands dispatch to `run_refinement_preflight.py`, not
+# `decide_next_loop_action.py`, so this installs that script plus the real
+# `.claude/skills/issue-refinement-loop/schemas/` directory it loads
+# (`generate_authority_transport_manifest`/`consume_authority_transport`
+# both fail-closed on a missing schema file, so a fixture without it could
+# never demonstrate a genuine `status: ok` real-subprocess round trip).
+# ---------------------------------------------------------------------------
+
+
+def _install_authority_transport_fixture(repo_root: Path) -> None:
+    import shutil
+
+    for rel in (
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "scripts/agent-guards/skill_runtime_command_policy.py",
+        ".claude/skills/issue-refinement-loop/scripts/command_registry.py",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+    ):
+        _write_text(repo_root / rel, (REPO_ROOT / rel).read_text())
+
+    _write_text(
+        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
+        """from __future__ import annotations
+
+class Deadline:
+    def subprocess_timeout(self, seconds: float) -> float:
+        return seconds
+
+
+def list_worktrees(project_root: str, deadline=None):
+    return []
+
+
+def select_issue_worktree(catalog, issue_number, root_realpath):
+    # #2086 AC9/AC10: authority_transport.produce/consume are NOT
+    # root-no-worktree eligible (unlike decide.run above), so the executor's
+    # active-issue-worktree check requires a non-None entry here for the
+    # fixture's own LOOP_ISSUE_NUMBER=2086 to resolve.
+    return {"issue_number": issue_number, "path": root_realpath}
+""",
+    )
+    schemas_src = REPO_ROOT / ".claude" / "skills" / "issue-refinement-loop" / "schemas"
+    schemas_dst = repo_root / ".claude" / "skills" / "issue-refinement-loop" / "schemas"
+    schemas_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(schemas_src, schemas_dst)
+
+    worktree_dir = repo_root / ".claude" / "worktrees" / "issue-2086-authority-transport-fixture"
+    worktree_dir.mkdir(parents=True, exist_ok=True)
+    _git("add", "-A", cwd=repo_root)
+    _git("commit", "-q", "-m", "install authority_transport fixture", cwd=repo_root)
+
+
+def _run_authority_transport_executor(repo: Path, extra_argv: list[str]) -> subprocess.CompletedProcess[str]:
+    argv = [
+        sys.executable,
+        "scripts/agent-guards/skill_runtime_exec.py",
+        *extra_argv,
+    ]
+    return subprocess.run(
+        argv,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "CLAUDE_PROJECT_DIR": str(repo),
+            "LOOP_ISSUE_NUMBER": "2086",
+        },
+        check=False,
+    )
+
+
+def test_authority_transport_produce_reaches_real_subprocess(tmp_path: Path) -> None:
+    """AC9/AC10: `authority_transport.produce` must reach the REAL
+    `run_refinement_preflight.py --produce-authority-transport` subprocess
+    (unmodified, copied verbatim from the current repo) through the real
+    executor/policy dispatch path AND the real `command_registry.py`
+    `authority_transport.produce` entry. Before this Issue's wiring, this
+    command_id was rejected unconditionally with
+    'exact command class rejected' before any subprocess was spawned
+    (`TestAuthorityTransportPrivilegedExecutorRealSubprocessDispatch` in
+    `.claude/skills/issue-refinement-loop/tests/test_command_registry.py`,
+    outside this Issue's Allowed Paths, pinned that prior rejection)."""
+    repo = _make_repo(tmp_path)
+    _install_authority_transport_fixture(repo)
+
+    evidence_fixture = repo / "evidence.json"
+    evidence_fixture.write_text(json.dumps({"source_kind": "generated_by_agent"}))
+
+    result = _run_authority_transport_executor(
+        repo,
+        [
+            "--command-id", "authority_transport.produce",
+            "--issue-number", "2086",
+            "--repo", "squne121/loop-protocol",
+            "--invocation-id", "test-invocation-1",
+            "--git-head-sha", "0123456789abcdef0123456789abcdef01234567",
+            "--evidence-fixture-path", "evidence.json",
+        ],
+    )
+    assert "exact command class rejected" not in result.stderr, result.stderr
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok", payload
+    assert payload["manifest"]["invocation_id"] == "test-invocation-1"
+
+
+def test_authority_transport_consume_reaches_real_subprocess(tmp_path: Path) -> None:
+    """AC9/AC10: `authority_transport.consume` must reach the REAL
+    `run_refinement_preflight.py --consume-authority-transport` subprocess.
+    A nonexistent router receipt path is intentionally supplied -- the real
+    script's own fail-closed `missing_file` handling (not this Issue's
+    concern) proves real dispatch occurred, distinguishing this from the
+    privileged executor's own pre-dispatch 'exact command class rejected'
+    rejection."""
+    repo = _make_repo(tmp_path)
+    _install_authority_transport_fixture(repo)
+
+    result = _run_authority_transport_executor(
+        repo,
+        [
+            "--command-id", "authority_transport.consume",
+            "--issue-number", "2086",
+            "--repo", "squne121/loop-protocol",
+            "--invocation-id", "test-invocation-1",
+            "--git-head-sha", "0123456789abcdef0123456789abcdef01234567",
+            "--router-receipt-path", ".claude/artifacts/issue-refinement-loop/2086/authority-transport/test-invocation-1/nonexistent_receipt.json",
+        ],
+    )
+    assert "exact command class rejected" not in result.stderr, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "environment_failure", payload
+    assert payload["reason_code"] == "missing_file", payload

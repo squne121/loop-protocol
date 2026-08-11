@@ -785,6 +785,16 @@ def _validate_placeholder_value(name: str, value: Any, spec: dict) -> None:
                 f"Placeholder '{name}': expected string, got {type(value).__name__}"
             )
 
+    elif ph_type == "bool_flag":
+        # Issue #2053 P0 fix-delta: a self-contained conditional bare flag
+        # (no value token). Only bool is accepted; the flag is emitted
+        # verbatim (spec["flag_literal"]) when the value is truthy, and
+        # omitted entirely (no token at all) when falsy/absent.
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"Placeholder '{name}': expected bool for bool_flag, got {type(value).__name__}"
+            )
+
 
 def render_command(command_id: str, params: dict[str, Any]) -> list[str]:
     """Render a registry command by substituting placeholders.
@@ -823,19 +833,58 @@ def render_command(command_id: str, params: dict[str, Any]) -> list[str]:
             )
 
     # Substitute into argv template
-    # Supports both:
+    # Supports:
     #   - Whole-token placeholders: "{name}" -> str(value)
     #   - Partial-token placeholders: "prefix/{name}/suffix" -> "prefix/value/suffix"
+    #   - Issue #2053 P0 fix-delta: optional whole-token placeholders that
+    #     are entirely omitted (flag literal + value token, or a
+    #     self-contained bool_flag token) when the caller does not supply
+    #     them, so a single command_id (e.g. decide.run) can carry optional
+    #     authority-transport routing without a parallel sibling ID.
+    argv_tokens = entry["argv"]
     rendered: list[str] = []
-    for token in entry["argv"]:
-        if "{" in token and "}" in token:
-            # Replace all placeholders in the token (supports partial substitution)
-            result_token = token
-            for ph_name, value in params.items():
-                result_token = result_token.replace(f"{{{ph_name}}}", str(value))
-            rendered.append(result_token)
-        else:
-            rendered.append(token)
+    idx = 0
+    while idx < len(argv_tokens):
+        token = argv_tokens[idx]
+        is_whole_placeholder = (
+            token.startswith("{") and token.endswith("}") and token.count("{") == 1
+        )
+        if is_whole_placeholder:
+            ph_name = token[1:-1]
+            spec = placeholders.get(ph_name, {})
+            provided = ph_name in params
+            if spec.get("type") == "bool_flag":
+                if provided and params[ph_name]:
+                    flag_literal = spec.get("flag_literal")
+                    if not flag_literal:
+                        raise ValueError(
+                            f"bool_flag placeholder '{ph_name}' missing 'flag_literal' spec"
+                        )
+                    rendered.append(flag_literal)
+                idx += 1
+                continue
+            if (
+                not provided
+                and spec.get("optional_flag_pair", False)
+                and not spec.get("required", False)
+            ):
+                # Drop this value token, and drop the immediately preceding
+                # rendered token too if the *template* token right before
+                # this one is a bare (non-placeholder) flag literal -- i.e.
+                # this is a "--flag {value}" pair, so both go together.
+                if idx > 0:
+                    prev_template_tok = argv_tokens[idx - 1]
+                    if not (prev_template_tok.startswith("{") and prev_template_tok.endswith("}")):
+                        if rendered and rendered[-1] == prev_template_tok:
+                            rendered.pop()
+                idx += 1
+                continue
+        # Replace all placeholders in the token (supports partial substitution)
+        result_token = token
+        for ph_name2, value2 in params.items():
+            result_token = result_token.replace(f"{{{ph_name2}}}", str(value2))
+        rendered.append(result_token)
+        idx += 1
 
     # Verify no unresolved placeholders remain in required positions (Blocker 7)
     for token in rendered:
