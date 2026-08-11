@@ -127,6 +127,23 @@ def classify_refinement_evidence_epoch(context: dict[str, Any]) -> dict[str, Any
 # If known_context.main_drift is omitted, this planner emits no
 # main_drift_evidence_epoch decision (the pre-#2102 behavior is preserved
 # for callers that do not yet supply main-drift facts).
+#
+# Current production-wiring status (honest disclosure, fix_delta iteration
+# 3): as of this revision, no production Python code path actually calls
+# run_refinement_preflight.py's orchestrator step to assemble
+# known_context["main_drift"] and pass it into this planner. The above
+# contract therefore documents a MUST requirement that the control-plane
+# has not yet implemented as automated wiring -- known_context.main_drift
+# remains dead code in production today (this file emits no
+# main_drift_evidence_epoch decision on any live invocation). Wiring the
+# orchestrator step described above (live GitHub REST readback, git diff,
+# and a git merge-tree --write-tree conflict check for semantic_ambiguity)
+# is tracked as follow-up work outside this Issue's bounded scope; the
+# `semantic_ambiguity` derivation the contract requires here mirrors the
+# same deterministic oracle already implemented in
+# pr_head_replay_publish_exec.py::_merge_tree_conflicts() on the
+# implementation-loop side (exit code from `git merge-tree --write-tree`,
+# non-zero == conflict), not a caller-asserted boolean.
 # ---------------------------------------------------------------------------
 
 
