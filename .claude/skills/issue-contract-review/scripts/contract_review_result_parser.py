@@ -179,7 +179,12 @@ def _parse_fallback_scalar(value: str) -> Any:
     return value
 
 
-def _decode_producer_json_scalars(block: dict[str, Any]) -> dict[str, Any]:
+def _is_single_quoted_producer_json_scalar(raw_block: str, key: str) -> bool:
+    """Return whether a producer JSON scalar uses its canonical YAML transport."""
+    return re.search(rf"(?m)^  {re.escape(key)}:\s*'", raw_block) is not None
+
+
+def _decode_producer_json_scalars(block: dict[str, Any], raw_block: str) -> dict[str, Any]:
     """Restore producer JSON transported inside YAML single-quoted scalars.
 
     Only the producer's fixed complex fields are decoded.  The same strict
@@ -196,7 +201,11 @@ def _decode_producer_json_scalars(block: dict[str, Any]) -> dict[str, Any]:
             mapping[key] = _parse_bounded_strict_json_collection(value)
 
     checks = inner.get("checks")
-    decode(inner, "expected_contract_fingerprint")
+    # The producer's fingerprint transport is a single-quoted JSON mapping.
+    # Do not recursively decode a JSON string transported through a different
+    # YAML scalar form: it is not a mapping and must remain non-authoritative.
+    if _is_single_quoted_producer_json_scalar(raw_block, "expected_contract_fingerprint"):
+        decode(inner, "expected_contract_fingerprint")
     if not isinstance(checks, dict):
         return block
     decode(checks, "declared_path_overlap")
@@ -221,7 +230,7 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
         import yaml  # noqa: F401 — available in project venv (PyYAML)
         parsed = yaml.safe_load(block)
         if isinstance(parsed, dict):
-            return _decode_producer_json_scalars(parsed)
+            return _decode_producer_json_scalars(parsed, block)
         return {}
     except Exception:
         pass
@@ -293,7 +302,7 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
             sub_value = match.group(2).strip()
             vc_preflight[sub_key] = _parse_fallback_scalar(sub_value) if sub_value else None
 
-    return _decode_producer_json_scalars(result)
+    return _decode_producer_json_scalars(result, block)
 
 
 # ---------------------------------------------------------------------------
