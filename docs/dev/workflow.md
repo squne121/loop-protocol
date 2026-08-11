@@ -199,7 +199,7 @@ implementation_consumer_ready_contract:
 ```
 
 - `impl-review-loop` / `implement-issue` / `issue-contract-review` はこの contract を正本として着手可否を判定する
-- **SSOT 原則（#2084）: GitHub Issue labels は presentation-only（人間の認知・分類・検索補助）であり、AI の readiness・quality・implementation permission・handoff・stop condition の authority にしてはならない。** `required_routing_labels` / `hard_stop_labels` のような label-based gate は本 contract に含めない。readiness authority は本 contract に列挙された non-label evidence（title prefix、GitHub native dependency close 状態、`CONTRACT_REVIEW_RESULT_V1 status: go`、GitHub native issue open/closed state）のみで再定義される。
+- **SSOT 原則（#2084）: GitHub Issue labels は presentation-only（人間の認知・分類・検索補助）であり、AI の readiness・quality・implementation permission・handoff・stop condition の authority にしてはならない。** routing 可否や停止条件を label 名そのもので表現するスキーマキー（label-based gate）は本 contract に含めない。readiness authority は本 contract に列挙された non-label evidence（title prefix、GitHub native dependency close 状態、`CONTRACT_REVIEW_RESULT_V1 status: go`、GitHub native issue open/closed state）のみで再定義される。
 - `triage-required` / `phase/implementation` / `agent/implementer` 等の label mutation は、readiness decision 後にのみ実行される best-effort presentation sync（telemetry-only。`applied | noop | failed`）として扱う。mutation の失敗は readiness failure にしない。
 
 #### Triage profile（triage プロファイル）
