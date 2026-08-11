@@ -744,6 +744,7 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     assert result["contract_update"] == {
         "status": "failed",
+        "disposition": "patch",
         "writes": 1,
         "iterations": 0,
         "final_readback": "verified",
@@ -815,3 +816,129 @@ def test_anchor_profiles_materialize_only_the_explicit_origin_lane(tmp_path: Pat
     agent_payload = json.loads(artifact.read_text())
     assert agent_payload["human_context_comment_urls"] == []
     assert agent_payload["agent_report_comment_urls"] == [_VALID_URL]
+
+
+# ---------------------------------------------------------------------------
+# PR #2057 OWNER REQUEST_CHANGES (P0-3): true process-boundary E2E for the
+# #2048 approved-scope-reframe / empty-operations `full_rewrite_required`
+# disposition, reusing `_install_real_contract_update_fixture()` (the SAME
+# harness `test_contract_update_phase_reaches_fake_transaction_and_fresh_
+# handoff` above already established for PR #1884/#1877). This exercises:
+#
+#   registry (command_registry.REGISTRY["contract_update.run.with_anchor"])
+#   -> skill_runtime_command_policy.py (privileged command parsing)
+#   -> skill_runtime_exec.py (real subprocess boundary)
+#   -> run_refinement_preflight.py (REAL production wrapper, not a fixture
+#      stub -- run_preflight() -> consume_trusted_anchor_contract_patch_plan()
+#      -> scope_signal_delta.run_trusted_anchor_iteration_zero() ->
+#      decide_rewrite_route.classify_scope_reframe_disposition())
+#   -> fake `gh` (subprocess.run monkeypatch; only GitHub I/O is faked)
+#   -> refinement_preflight_result_v1.json artifact + NEXT_ACTION stdout
+#
+# unlike the in-process dynamic-import tests in
+# test_preflight_run_with_anchor.py, this crosses a real subprocess boundary
+# (skill_runtime_exec.py spawns `uv run --locked python3 run_refinement_
+# preflight.py` as a genuinely separate process).
+# ---------------------------------------------------------------------------
+
+
+def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_real_subprocess(
+    tmp_path: Path,
+) -> None:
+    """AC1/AC6/P0-3: an approved trusted-anchor ANCHOR_SCOPE_REFRAME_V1 scope
+    reframe (not yet reflected in the Issue's Allowed Paths section) reaches
+    `contract_update.status == "handoff_required"` /
+    `disposition == "full_rewrite_required"` through the REAL registry ->
+    policy -> privileged executor subprocess -> production
+    `run_refinement_preflight.py` -> production `scope_signal_delta.py`
+    classifier chain, with ZERO writes and ZERO mutation-executor
+    invocations (full-rewrite handoff, not a mutation attempt)."""
+    repo = _make_repo(tmp_path)
+    _install_real_contract_update_fixture(repo)
+    (repo / "tmp").mkdir()
+    artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    anchor_body = (
+        "```yaml\n"
+        "schema_version: ANCHOR_SCOPE_REFRAME_V1\n"
+        "target:\n  repo: squne121/loop-protocol\n  issue_number: 1498\n"
+        "decision: approve_scope_delta\n"
+        'allowed_path_deltas: ["docs/product/features/scope-only-reframe.md"]\n'
+        'rationale: "process-boundary E2E fixture (PR #2057 OWNER review P0-3)"\n'
+        'required_rerun: ["contract_review"]\n'
+        "```\n"
+    )
+    anchor = {
+        "id": 1,
+        "body": anchor_body,
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-09T00:00:00Z",
+        "updated_at": "2026-08-09T00:00:00Z",
+    }
+    pre_body = (
+        "## Machine-Readable Contract\n\n"
+        "```yaml\ncontract_schema_version: v1\nissue_kind: implementation\n"
+        "parent_issue: none\ngoal_ref: test\nchange_kind: workflow\n```\n\n"
+        "## Parent Issue\n\nnone\n\n## Parent Goal Ref\n\ntest\n\n"
+        "## Current Validated Scope\n\n- test\n\n## Remaining Parent Gaps\n\nnone\n\n"
+        "## Outcome\n\ntest\n\n## In Scope\n\n- test\n\n## Out of Scope\n\n- none\n\n"
+        "## Acceptance Criteria\n\n- [ ] AC1: test\n\n"
+        "## Verification Commands\n\n```bash\n$ true\n```\n\n"
+        "## Allowed Paths\n\n- docs/product/features/existing.md\n\n"
+        "## Stop Conditions\n\n- none\n\n## Required Skills\n\n- none\n"
+    )
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-09T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
+
+    result = _run_executor(
+        repo,
+        command_id="contract_update.run.with_anchor",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+    )
+
+    assert "NEXT_ACTION: issue_editor_required" in result.stdout, result.stdout + result.stderr
+    payload = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
+    assert payload["next_action"] == "issue_editor_required"
+    assert payload["contract_update"]["status"] == "handoff_required"
+    assert payload["contract_update"]["disposition"] == "full_rewrite_required"
+    assert payload["contract_update"]["writes"] == 0
+    assert payload["contract_update"]["final_readback"] == "not_applicable"
+    # No mutation executor invocation of any kind: the write-path helper
+    # (controlled_skill_mutation_exec.py, this fixture's fake external
+    # controlled-executor boundary) is never reached for a disposition that
+    # attempted zero writes.
+    assert not (artifact_dir / "controlled_transaction_request.json").exists()
+
+    # Replaying the identical transition through a second real subprocess
+    # invocation is still side-effect free and deterministic (regression #2
+    # / #8 "side-effect 0" + "restart replay").
+    replay = _run_executor(
+        repo,
+        command_id="contract_update.run.with_anchor",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+    )
+    assert "NEXT_ACTION: issue_editor_required" in replay.stdout, replay.stdout + replay.stderr
+    replay_payload = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
+    assert replay_payload["contract_update"]["status"] == "handoff_required"
+    assert replay_payload["contract_update"]["writes"] == 0
+    assert not (artifact_dir / "controlled_transaction_request.json").exists()

@@ -292,8 +292,23 @@
             "applied",
             "no_change",
             "rebased",
-            "failed"
+            "failed",
+            "handoff_required"
           ]
+        },
+        "disposition": {
+          "description": "PR #2057 OWNER review P1-3: echoes the single canonical scope-reframe classifier's disposition (decide_rewrite_route.classify_scope_reframe_disposition). null when the mutation attempt predates that classification (pre-#2048 non-scope-reframe callers).",
+          "enum": [
+            "patch",
+            "proven_no_change",
+            "full_rewrite_required",
+            "invalid",
+            null
+          ]
+        },
+        "reason_code": {
+          "description": "Present only for disposition full_rewrite_required / invalid; the classifier's reason_code.",
+          "type": "string"
         },
         "writes": {
           "type": "integer",
@@ -309,7 +324,8 @@
           "type": "string",
           "enum": [
             "verified",
-            "failed"
+            "failed",
+            "not_applicable"
           ]
         },
         "fresh_preflight": {
