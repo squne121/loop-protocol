@@ -61,6 +61,13 @@ def test_applied_removes_triage_and_adds_phase_and_agent_labels():
             (0, _labels_view_stdout(["triage-required", "enhancement"]), ""),
             (0, "", ""),  # remove-label
             (0, "", ""),  # add-label
+            (
+                0,
+                _labels_view_stdout(
+                    ["enhancement", "phase/implementation", "agent/implementer"]
+                ),
+                "",
+            ),  # readback
         ]
     )
     result = mod.apply_triage_label_transition(
@@ -74,6 +81,7 @@ def test_applied_removes_triage_and_adds_phase_and_agent_labels():
     assert set(result["added"]) == {"phase/implementation", "agent/implementer"}
     assert result["unrelated_labels_preserved"] == ["enhancement"]
     assert result["errors"] == []
+    assert len(runner.calls) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +125,7 @@ def test_idempotent_second_run_after_applied_is_noop():
             (0, _labels_view_stdout(["triage-required"]), ""),
             (0, "", ""),
             (0, "", ""),
+            (0, _labels_view_stdout(["phase/implementation", "agent/implementer"]), ""),
         ]
     )
     first = mod.apply_triage_label_transition(
@@ -164,6 +173,15 @@ def test_network_failure_during_mutation_is_warning_not_exception():
             (0, _labels_view_stdout(["triage-required"]), ""),
             (1, "", "connection reset by peer"),  # remove-label network failure
             (0, "", ""),  # add-label succeeds
+            # readback: remove failed so triage-required is still present;
+            # add succeeded so phase/agent are present.
+            (
+                0,
+                _labels_view_stdout(
+                    ["triage-required", "phase/implementation", "agent/implementer"]
+                ),
+                "",
+            ),
         ]
     )
     result = mod.apply_triage_label_transition(
@@ -185,6 +203,8 @@ def test_api_failure_does_not_raise():
             (0, _labels_view_stdout(["triage-required"]), ""),
             (1, "", "500 Internal Server Error"),
             (1, "", "500 Internal Server Error"),
+            # readback: nothing changed since both mutation calls failed.
+            (0, _labels_view_stdout(["triage-required"]), ""),
         ]
     )
     result = mod.apply_triage_label_transition(
@@ -209,6 +229,13 @@ def test_unrelated_labels_are_preserved_in_report():
             (0, _labels_view_stdout(["triage-required", "bug", "priority/p1"]), ""),
             (0, "", ""),
             (0, "", ""),
+            (
+                0,
+                _labels_view_stdout(
+                    ["bug", "priority/p1", "phase/implementation", "agent/implementer"]
+                ),
+                "",
+            ),
         ]
     )
     result = mod.apply_triage_label_transition(
@@ -236,6 +263,7 @@ def test_result_schema_does_not_contain_readiness_authority_fields():
             (0, _labels_view_stdout(["triage-required"]), ""),
             (0, "", ""),
             (0, "", ""),
+            (0, _labels_view_stdout(["phase/implementation", "agent/implementer"]), ""),
         ]
     )
     result = mod.apply_triage_label_transition(
@@ -270,3 +298,151 @@ def test_readiness_simulation_unaffected_by_label_sync_result_permutation():
     }
     values = list(outcomes.values())
     assert all(v == values[0] for v in values)
+
+
+# ---------------------------------------------------------------------------
+# #2084 Scope Delta (PR #2092 comment #5251894253, AC13): bounded subprocess
+# timeout — TimeoutExpired must degrade to `result: failed` + warning
+# telemetry, exit 0, never raise.
+# ---------------------------------------------------------------------------
+
+
+def test_default_run_converts_timeout_expired_to_warning_tuple():
+    """GIVEN gh issue view hangs beyond the bounded timeout
+    WHEN _default_run() executes it
+    THEN subprocess.TimeoutExpired is caught and converted into a
+    (rc, stdout, stderr) tuple instead of propagating as an exception
+    """
+    import subprocess as _subprocess
+    from unittest.mock import patch
+
+    def _raise_timeout(*args, **kwargs):
+        raise _subprocess.TimeoutExpired(cmd=["gh", "issue", "view"], timeout=30)
+
+    with patch.object(mod.subprocess, "run", side_effect=_raise_timeout):
+        rc, stdout, stderr = mod._default_run(["gh", "issue", "view", "1"])
+
+    assert rc != 0
+    assert stdout == ""
+    assert "timeout_expired" in stderr
+
+
+def test_default_run_passes_bounded_timeout_to_subprocess_run():
+    """GIVEN the default run helper
+    WHEN it invokes subprocess.run
+    THEN it always sets a bounded `timeout` kwarg (no unbounded blocking)
+    """
+    from unittest.mock import MagicMock, patch
+
+    fake_result = MagicMock(returncode=0, stdout="{}", stderr="")
+    with patch.object(mod.subprocess, "run", return_value=fake_result) as mock_run:
+        mod._default_run(["gh", "issue", "view", "1"])
+
+    _, kwargs = mock_run.call_args
+    assert "timeout" in kwargs
+    assert isinstance(kwargs["timeout"], (int, float))
+    assert kwargs["timeout"] > 0
+
+
+def test_apply_triage_label_transition_surfaces_timeout_as_failed_with_warning():
+    """GIVEN gh issue view times out during the initial fetch
+    WHEN apply_triage_label_transition runs with a run_fn simulating a
+    timeout-derived (rc, stdout, stderr) tuple
+    THEN it returns result: failed with a warning mentioning the timeout,
+    and does not raise (exit-0-equivalent contract preserved end-to-end)
+    """
+
+    def _timeout_run_fn(argv: list[str]) -> tuple[int, str, str]:
+        return 124, "", "timeout_expired: command exceeded 30s: gh issue view 9"
+
+    result = mod.apply_triage_label_transition(
+        repo="squne121/loop-protocol", issue_number=9, run_fn=_timeout_run_fn
+    )
+    assert result["result"] == "failed"
+    assert any("timeout_expired" in w for w in result["warnings"])
+    assert result["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# #2084 Scope Delta (PR #2092 comment #5251894253, AC13): read → delta →
+# mutation → readback. `applied` must only be reported when the requested
+# delta is confirmed present in a post-mutation re-fetch of labels.
+# ---------------------------------------------------------------------------
+
+
+def test_readback_confirms_applied_result_reflects_post_mutation_state():
+    """GIVEN gh issue edit calls both report success (rc=0)
+    WHEN the post-mutation readback shows the requested delta materialized
+    THEN result is applied and unrelated_labels_preserved is derived from
+    the readback (not the pre-mutation) label snapshot
+    """
+    runner = _ScriptedRunner(
+        [
+            (0, _labels_view_stdout(["triage-required", "docs"]), ""),  # pre-mutation fetch
+            (0, "", ""),  # remove-label rc=0
+            (0, "", ""),  # add-label rc=0
+            (
+                0,
+                _labels_view_stdout(["docs", "phase/implementation", "agent/implementer"]),
+                "",
+            ),  # readback confirms delta applied
+        ]
+    )
+    result = mod.apply_triage_label_transition(
+        repo="squne121/loop-protocol", issue_number=10, run_fn=runner
+    )
+    assert result["result"] == "applied"
+    assert result["removed"] == ["triage-required"]
+    assert set(result["added"]) == {"phase/implementation", "agent/implementer"}
+    assert result["unrelated_labels_preserved"] == ["docs"]
+
+
+def test_readback_reports_failed_when_gh_edit_lied_about_success():
+    """GIVEN gh issue edit --remove-label reports rc=0 (apparent success)
+    WHEN the post-mutation readback shows the label was NOT actually
+    removed (e.g. eventual-consistency lag or a silently-rejected edit)
+    THEN result is failed, not applied — readback is authoritative over the
+    mutation call's own exit code
+    """
+    runner = _ScriptedRunner(
+        [
+            (0, _labels_view_stdout(["triage-required"]), ""),  # pre-mutation fetch
+            (0, "", ""),  # remove-label reports rc=0
+            (
+                0,
+                _labels_view_stdout(["triage-required"]),
+                "",
+            ),  # readback: triage-required is still present despite rc=0
+        ]
+    )
+    result = mod.apply_triage_label_transition(
+        repo="squne121/loop-protocol",
+        issue_number=11,
+        remove_labels=["triage-required"],
+        add_labels=[],
+        run_fn=runner,
+    )
+    assert result["result"] == "failed"
+    assert result["removed"] == []
+
+
+def test_readback_failure_itself_is_reported_as_failed_with_warning():
+    """GIVEN the post-mutation readback call itself fails (e.g. gh outage
+    right after a successful mutation)
+    WHEN apply_triage_label_transition runs
+    THEN result is failed with a readback_failed warning, and it does not
+    raise
+    """
+    runner = _ScriptedRunner(
+        [
+            (0, _labels_view_stdout(["triage-required"]), ""),  # pre-mutation fetch
+            (0, "", ""),  # remove-label rc=0
+            (0, "", ""),  # add-label rc=0
+            (1, "", "HTTP 503: Service Unavailable"),  # readback fails
+        ]
+    )
+    result = mod.apply_triage_label_transition(
+        repo="squne121/loop-protocol", issue_number=12, run_fn=runner
+    )
+    assert result["result"] == "failed"
+    assert any("readback_failed" in w for w in result["warnings"])

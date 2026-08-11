@@ -31,16 +31,35 @@ _SCHEMA_VERSION = 1
 DEFAULT_REMOVE_LABELS = ["triage-required"]
 DEFAULT_ADD_LABELS = ["phase/implementation", "agent/implementer"]
 
+# #2084 Scope Delta (PR #2092 comment #5251894253, AC13): bounded timeout for
+# every subprocess invocation issued by this best-effort presentation-sync
+# script, so a hung `gh` call can never block the caller indefinitely.
+DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 30
+
 RunFn = Callable[[list[str]], tuple[int, str, str]]
 
 
-def _default_run(cmd: list[str]) -> tuple[int, str, str]:
-    result = subprocess.run(
-        cmd,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def _default_run(
+    cmd: list[str], timeout_seconds: int = DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
+) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        # #2084 AC13: a timeout must never propagate as an uncaught
+        # exception — it is surfaced through the same (rc, stdout, stderr)
+        # contract as any other gh CLI failure, which the caller already
+        # converts into `result: failed` + warning telemetry with exit 0.
+        return (
+            124,
+            "",
+            f"timeout_expired: command exceeded {timeout_seconds}s: {' '.join(cmd)}",
+        )
     return result.returncode, result.stdout, result.stderr
 
 
@@ -129,9 +148,6 @@ def apply_triage_label_transition(
             "errors": errors,
         }
 
-    applied_removed: list[str] = []
-    applied_added: list[str] = []
-
     if to_remove:
         argv = [
             gh_bin,
@@ -146,8 +162,6 @@ def apply_triage_label_transition(
         rc, _stdout, stderr = run_fn(argv)
         if rc != 0:
             warnings.append(f"remove_label_failed: {stderr.strip()}")
-        else:
-            applied_removed = to_remove
 
     if to_add:
         argv = [
@@ -163,8 +177,39 @@ def apply_triage_label_transition(
         rc, _stdout, stderr = run_fn(argv)
         if rc != 0:
             warnings.append(f"add_label_failed: {stderr.strip()}")
-        else:
-            applied_added = to_add
+
+    # #2084 Scope Delta (PR #2092 comment #5251894253, AC13): read → delta →
+    # mutation → READBACK. Do not infer `applied` from the gh CLI exit code
+    # of the mutation calls alone — re-fetch the actual label state and
+    # confirm the requested delta materialized before reporting `applied`.
+    readback_labels, readback_error = _fetch_current_labels(repo, issue_number, gh_bin, run_fn)
+    if readback_error is not None:
+        warnings.append(f"readback_failed: {readback_error}")
+        return {
+            "schema": _SCHEMA_NAME,
+            "schema_version": _SCHEMA_VERSION,
+            "repo": repo,
+            "issue_number": issue_number,
+            "result": "failed",
+            "removed": [],
+            "added": [],
+            # Readback unavailable — fall back to the pre-mutation snapshot
+            # as a best-effort (non-authoritative) approximation; the
+            # `failed` result already signals that post-mutation state is
+            # unconfirmed.
+            "unrelated_labels_preserved": unrelated_labels_preserved,
+            "warnings": warnings,
+            "errors": errors,
+        }
+
+    assert readback_labels is not None
+    readback_set = set(readback_labels)
+
+    applied_removed = [name for name in to_remove if name not in readback_set]
+    applied_added = [name for name in to_add if name in readback_set]
+    unrelated_labels_preserved = sorted(
+        name for name in readback_set if name not in set(remove_labels) and name not in set(add_labels)
+    )
 
     expected_mutations = len(to_remove) + len(to_add)
     applied_mutations = len(applied_removed) + len(applied_added)
