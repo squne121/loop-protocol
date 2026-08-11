@@ -207,13 +207,9 @@ def _decode_producer_json_scalars(block: dict[str, Any]) -> dict[str, Any]:
         pass
     vc_preflight = checks.get("vc_preflight")
     if isinstance(vc_preflight, dict):
-        try:
-            decode(vc_preflight, "classifications")
-        except SimpleYamlParseError:
-            # The scalar decision remains independently consumable. Keep only
-            # this oversized or malformed diagnostic payload raw instead of
-            # discarding its source-bound contract result.
-            pass
+        decode(vc_preflight, "classifications")
+        if not isinstance(vc_preflight.get("classifications"), list):
+            raise SimpleYamlParseError("vc_preflight_classifications_must_be_list")
     return block
 
 
@@ -302,16 +298,9 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
                 continue
             sub_key = match.group(1).strip()
             sub_value = match.group(2).strip()
-            try:
-                vc_preflight[sub_key] = (
-                    _parse_fallback_scalar(sub_value) if sub_value else None
-                )
-            except SimpleYamlParseError:
-                if sub_key != "classifications":
-                    raise
-                # Keep this producer diagnostic scalar raw; all other nested
-                # values retain the bounded strict-JSON requirement.
-                vc_preflight[sub_key] = sub_value
+            vc_preflight[sub_key] = (
+                _parse_fallback_scalar(sub_value) if sub_value else None
+            )
 
     return _decode_producer_json_scalars(result)
 
