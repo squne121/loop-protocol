@@ -309,11 +309,13 @@ if __name__ == "__main__":
         next((repo_root / ".venv").glob("lib/python*/site-packages")) / "sitecustomize.py",
         """# Fixture-only external GitHub boundary for subprocess tests.
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
 _real_run = subprocess.run
+_real_popen_init = subprocess.Popen.__init__
 
 
 def _fake_gh(args, *positional, **kwargs):
@@ -347,7 +349,21 @@ def _fake_gh(args, *positional, **kwargs):
         return subprocess.CompletedProcess(args, 2, "", "unexpected fake gh argv")
     return subprocess.CompletedProcess(args, 0, json.dumps(payload) + "\\n", "")
 
+
+def _fake_popen_init(self, args, *positional, **kwargs):
+    # Issue #2075: skill_runtime_exec.py's outer-child supervisor launches
+    # its child via subprocess.Popen (not subprocess.run). Mirror the same
+    # PYTHONPATH propagation _fake_gh() applies to `uv` subprocess.run calls
+    # so a nested `uv run python3 run_refinement_preflight.py` launched via
+    # Popen still inherits this fixture's sitecustomize.py boundary.
+    if isinstance(args, (list, tuple)) and args and Path(str(args[0])).name == "uv":
+        child_env = dict(kwargs.get("env") or os.environ)
+        child_env["PYTHONPATH"] = str(Path(__file__).parent)
+        kwargs["env"] = child_env
+    return _real_popen_init(self, args, *positional, **kwargs)
+
 subprocess.run = _fake_gh
+subprocess.Popen.__init__ = _fake_popen_init
 """,
     )
     return
