@@ -200,6 +200,51 @@ def classify_main_drift(
     return MainDriftDecision("scope_clean_reconciliation", "main_drift_scope_clean", **common)
 
 
+_STEP5_MAIN_DRIFT_FACTS = (
+    "current_base_sha",
+    "evidence_base_sha",
+    "allowed_paths_snapshot_base_sha",
+    "allowed_paths",
+    "latest_main_net_diff",
+    "expected_old_sha",
+    "observed_old_sha",
+)
+
+
+def build_step5_live_mergeability(
+    live_pr: Mapping[str, Any],
+    main_drift_facts: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the only Step 5 production input shape for main-drift routing.
+
+    The control-plane fetches ``live_pr`` and constructs
+    ``main_drift_facts`` from the same decision cycle.  It must not omit
+    these facts because the merge state is not ``BEHIND``: CLEAN and
+    HAS_HOOKS would otherwise permit stale evidence to reach ``approved``.
+    Missing facts are rejected instead of silently treating the decision as
+    non-drift.
+    """
+    if not isinstance(live_pr, Mapping):
+        raise ValueError("live_pr must be a mapping")
+    if not isinstance(main_drift_facts, Mapping):
+        raise ValueError("main_drift_facts must be a mapping")
+
+    missing = [key for key in _STEP5_MAIN_DRIFT_FACTS if key not in main_drift_facts]
+    if missing:
+        raise ValueError(f"main_drift_facts missing required keys: {', '.join(missing)}")
+
+    result = {
+        "head_sha": live_pr.get("head_sha"),
+        "mergeable": live_pr.get("mergeable"),
+        "merge_state_status": live_pr.get("merge_state_status"),
+        "main_drift": dict(main_drift_facts),
+    }
+    error = _validate_live_mergeability(result)
+    if error:
+        raise ValueError(error)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Output schema
 # ---------------------------------------------------------------------------

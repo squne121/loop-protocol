@@ -10,12 +10,18 @@ sys.path.insert(0, str(SCRIPTS))
 from route_loop_verdict_v2 import (  # noqa: E402
     ROUTE_FAIL_CLOSED,
     ROUTE_SCOPE_CLEAN_RECONCILIATION,
+    build_step5_live_mergeability,
     route_loop_verdict_v2,
 )
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
+STEP5_MERGEABILITY = (
+    Path(__file__).resolve().parents[1]
+    / "steps"
+    / "step-5-mergeability-handling.md"
+)
 
 
 def _verdict() -> dict[str, object]:
@@ -92,6 +98,44 @@ def test_given_scope_clean_drift_in_any_nonbehind_state_when_routed_then_old_evi
     }
     assert decision.selected_action["evidence_epoch"]["base_sha"] == SHA_B
     assert decision.selected_action["evidence_epoch"]["implementation_iteration_delta"] == 0
+
+
+@pytest.mark.parametrize("merge_state_status", ["CLEAN", "HAS_HOOKS", "BLOCKED", "DRAFT", "UNSTABLE"])
+def test_given_step5_control_plane_live_facts_when_stale_evidence_exists_then_nonbehind_state_cannot_bypass_rebind(
+    merge_state_status: str,
+):
+    """Step 5 の production input 経路は stale evidence を必ず router に渡す。"""
+    live_mergeability = build_step5_live_mergeability(
+        _live(merge_state_status),
+        _drift(behind_fast_path_eligible=True),
+    )
+
+    decision = route_loop_verdict_v2(_verdict(), live_mergeability)
+
+    assert decision.route == ROUTE_SCOPE_CLEAN_RECONCILIATION
+    assert decision.route != "approved"
+    assert decision.selected_action["reusable_evidence"] == {
+        "snapshot": None,
+        "ci": None,
+        "review": None,
+    }
+    assert decision.rerun_required == {"snapshot": True, "ci": True, "review": True}
+
+
+def test_given_normal_step5_when_documented_then_live_main_drift_facts_are_built_before_routing():
+    body = STEP5_MERGEABILITY.read_text(encoding="utf-8")
+
+    assert "毎回の通常 production routing 前" in body
+    assert "build_step5_live_mergeability(" in body
+    for key in (
+        "current_base_sha",
+        "evidence_base_sha",
+        "allowed_paths_snapshot_base_sha",
+        "latest_main_net_diff",
+        "expected_old_sha",
+        "observed_old_sha",
+    ):
+        assert key in body
 
 
 def test_given_semantic_ambiguity_when_routed_then_it_stops_without_action():

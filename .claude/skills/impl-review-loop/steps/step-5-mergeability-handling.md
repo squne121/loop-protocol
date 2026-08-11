@@ -40,6 +40,49 @@ mergeable: MERGEABLE | CONFLICTING | UNKNOWN
 merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN | DRAFT | HAS_HOOKS
 ```
 
+## main drift の live facts を必ず注入する
+
+Step 5 control-plane は、**毎回の通常 production routing 前**に live main-drift facts を
+作成し、`build_step5_live_mergeability()` 経由で router に渡す。`BEHIND` だけの
+補助情報ではない。`CLEAN`、`HAS_HOOKS`、`BLOCKED`、`DRAFT`、`UNSTABLE` のいずれでも、
+base-bound evidence が stale なら scope-clean reconciliation を先に選ばなければならない。
+
+同一 decision cycle で、次を fresh source から取得する:
+
+```yaml
+main_drift_facts:
+  current_base_sha: <live PR baseRefOid または live main HEAD>
+  evidence_base_sha: <LOOP_STATE の evidence epoch base SHA>
+  allowed_paths_snapshot_base_sha: <scope snapshot に記録された base SHA>
+  allowed_paths: <live linked Issue 本文の Allowed Paths>
+  latest_main_net_diff: <evidence_base_sha..current_base_sha の read-only net diff>
+  expected_old_sha: <reconciliation 前に保存した old ref>
+  observed_old_sha: <同じ decision cycle で再読した old ref>
+  semantic_ambiguity: false
+  behind_fast_path_eligible: <merge_state_status == BEHIND のときだけ評価>
+```
+
+`current_base_sha == evidence_base_sha` の場合も、同じ shape を渡して evidence epoch の
+一致を確認する。必須 key が欠けたら drift なしと推定せず fail-closed とする。control-plane は
+raw snapshot / 過去 CI / 過去 review URL をこの facts の代替にしてはならない。
+
+```python
+from route_loop_verdict_v2 import build_step5_live_mergeability, route_loop_verdict_v2
+
+live_mergeability = build_step5_live_mergeability(
+    {
+        "head_sha": live_pr["headRefOid"],
+        "mergeable": live_pr["mergeable"],
+        "merge_state_status": live_pr["mergeStateStatus"],
+    },
+    main_drift_facts,
+)
+decision = route_loop_verdict_v2(reviewer_verdict, live_mergeability)
+```
+
+この注入は reviewer verdict dispatch より前に router が評価する。実 conflict
+（`CONFLICTING` / `DIRTY`）だけは従来どおり最優先 hard stop とする。
+
 > **`mergeable` と `merge_state_status` の分離（#1869 fix_delta P0-1）**: `mergeable` の有効値は
 > `CONFLICTING` / `MERGEABLE` / `UNKNOWN`。`merge_state_status` の有効値は `BEHIND` / `BLOCKED` /
 > `CLEAN` / `DIRTY` / `DRAFT` / `HAS_HOOKS` / `UNKNOWN` / `UNSTABLE`。`merge_state_status ==
