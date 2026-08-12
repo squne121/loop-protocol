@@ -40,6 +40,92 @@ mergeable: MERGEABLE | CONFLICTING | UNKNOWN
 merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN | DRAFT | HAS_HOOKS
 ```
 
+## main drift の live facts を必ず注入する
+
+Step 5 control-plane は、**毎回の通常 production routing 前**に live main-drift facts を
+作成し、`build_step5_live_mergeability()` 経由で router に渡す。`BEHIND` だけの
+補助情報ではない。`CLEAN`、`HAS_HOOKS`、`BLOCKED`、`DRAFT`、`UNSTABLE` のいずれでも、
+base-bound evidence が stale なら scope-clean reconciliation を先に選ばなければならない。
+
+同一 decision cycle で、次を fresh source から取得する:
+
+```yaml
+main_drift_facts:
+  current_base_sha: <live PR baseRefOid または live main HEAD>
+  evidence_base_sha: <LOOP_STATE の evidence epoch base SHA>
+  allowed_paths_snapshot_base_sha: <scope snapshot に記録された base SHA>
+  allowed_paths: <live linked Issue 本文の Allowed Paths>
+  latest_main_net_diff: <evidence_base_sha..current_base_sha の read-only net diff>
+  expected_old_sha: <reconciliation 前に保存した old ref>
+  observed_old_sha: <同じ decision cycle で再読した old ref>
+  semantic_ambiguity: false
+  behind_fast_path_eligible: <merge_state_status == BEHIND のときだけ評価>
+```
+
+`current_base_sha == evidence_base_sha` の場合も、同じ shape を渡して evidence epoch の
+一致を確認する。必須 key が欠けたら drift なしと推定せず fail-closed とする。control-plane は
+raw snapshot / 過去 CI / 過去 review URL をこの facts の代替にしてはならない。
+
+### `semantic_ambiguity` は control-plane が実 git 検査で算出する（Issue #2102 fix_delta iteration 2）
+
+`route_loop_verdict_v2.py` 自身は subprocess を呼ばない設計制約を保つ（router を純粋な決定論的関数として保つため）。したがって `semantic_ambiguity` は router 内部で算出されず、**呼び出し元（この Step 5 手順を実行する control-plane）が `main_drift_facts` を組み立てる前に実 git 検査を実行して算出しなければならない（MUST）**。caller が推測や固定値 `false` を渡すことは禁止する。
+
+`scripts/agent-ops/pr_head_replay_publish_exec.py::_merge_tree_conflicts()` が採用している decision と同じ oracle を、worktree／index を汚さない read-only 呼び出しとして使う:
+
+```bash
+# expected_old_sha は main_drift_facts.expected_old_sha、current_base_sha は同 facts の current_base_sha
+git merge-tree --write-tree "$EXPECTED_OLD_SHA" "$CURRENT_BASE_SHA"
+MERGE_TREE_EXIT=$?
+# 非 0 終了 = 実 conflict あり -> semantic_ambiguity: true
+# 0 終了      = clean merge   -> semantic_ambiguity: false
+```
+
+この呼び出しは `git merge-tree --write-tree` の 2-ref 形式であり、作業ツリー・index を変更しない。control-plane はこの exit code をそのまま `main_drift_facts.semantic_ambiguity` へ写し、上書きしない。
+
+**適用範囲の明示（Safety Claim の正確化）**: この検査は `pr_head_replay_publish_exec.py` の opt-in `main_drift_reconciliation` 経路だけでなく、この Step 5 BEHIND fast path を含む **通常の main drift routing 全体で MUST** とする。
+
+**production wiring の現況（Issue #2102 fix_delta iteration 5, Blocker B 解消）**: 上記 bash 呼び出しを手動で実行し `main_drift_facts.semantic_ambiguity` を組み立てる従来手順に加えて、`route_loop_verdict_v2.py` は `route_loop_verdict_v2_resolve_semantic_ambiguity(reviewer_verdict, live_mergeability, cwd=...)` という薄い convenience wrapper を公開する。この wrapper は `main_drift["semantic_ambiguity"]` が明示的に渡されていない場合にのみ、Allowed Paths の姉妹 exact file である `scripts/agent-ops/pr_head_replay_publish_exec.py::compute_semantic_ambiguity()`（`_merge_tree_conflicts()` の public export、同じ `git merge-tree --write-tree` oracle）を呼び出して補完してから `route_loop_verdict_v2()` 本体へ委譲する。`route_loop_verdict_v2()` 自体は module docstring の Design Invariant どおり subprocess を呼ばない pure 関数のまま変更していない -- purity の緩和はこの wrapper 1 箇所に限定する（Issue #2102 の contract が許容する option (a)）。control-plane はどちらの経路（手動 bash 配線、または wrapper 呼び出し）を使ってもよいが、`semantic_ambiguity` を caller が推測・固定値で渡すことは引き続き禁止する。
+
+```python
+from route_loop_verdict_v2 import build_step5_live_mergeability, route_loop_verdict_v2
+
+live_mergeability = build_step5_live_mergeability(
+    {
+        "head_sha": live_pr["headRefOid"],
+        "mergeable": live_pr["mergeable"],
+        "merge_state_status": live_pr["mergeStateStatus"],
+    },
+    main_drift_facts,
+)
+decision = route_loop_verdict_v2(reviewer_verdict, live_mergeability)
+```
+
+`main_drift_facts["semantic_ambiguity"]` を control-plane がまだ算出していない場合は、
+`route_loop_verdict_v2()` の代わりに `route_loop_verdict_v2_resolve_semantic_ambiguity()`
+を呼んで実 git oracle による補完を委譲できる:
+
+```python
+from route_loop_verdict_v2 import (
+    build_step5_live_mergeability,
+    route_loop_verdict_v2_resolve_semantic_ambiguity,
+)
+
+live_mergeability = build_step5_live_mergeability(
+    {
+        "head_sha": live_pr["headRefOid"],
+        "mergeable": live_pr["mergeable"],
+        "merge_state_status": live_pr["mergeStateStatus"],
+    },
+    {k: v for k, v in main_drift_facts.items() if k != "semantic_ambiguity"},
+)
+decision = route_loop_verdict_v2_resolve_semantic_ambiguity(
+    reviewer_verdict, live_mergeability, cwd=repo_root
+)
+```
+
+この注入は reviewer verdict dispatch より前に router が評価する。実 conflict
+（`CONFLICTING` / `DIRTY`）だけは従来どおり最優先 hard stop とする。
+
 > **`mergeable` と `merge_state_status` の分離（#1869 fix_delta P0-1）**: `mergeable` の有効値は
 > `CONFLICTING` / `MERGEABLE` / `UNKNOWN`。`merge_state_status` の有効値は `BEHIND` / `BLOCKED` /
 > `CLEAN` / `DIRTY` / `DRAFT` / `HAS_HOOKS` / `UNKNOWN` / `UNSTABLE`。`merge_state_status ==

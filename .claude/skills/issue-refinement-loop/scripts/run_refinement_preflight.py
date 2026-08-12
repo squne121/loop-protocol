@@ -144,6 +144,23 @@ try:
 except ImportError:  # pragma: no cover - defensive fallback
     classify_repair_action = None
 
+_IMPL_MAIN_DRIFT_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts"
+if str(_IMPL_MAIN_DRIFT_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_IMPL_MAIN_DRIFT_SCRIPTS_DIR))
+try:
+    # Issue #2102 fix_delta (iteration 5, Blocker A): mirrors
+    # plan_refinement_loop.py's own best-effort import of the same symbol.
+    # This wrapper must not populate known_context["main_drift"] (a bounded
+    # live git fetch/diff/merge-tree probe) when the planner it feeds cannot
+    # even import the classifier that consumes that key -- a harness that
+    # only provisions this skill's own scripts/ directory (not its
+    # impl-review-loop sibling) would otherwise pay the live-readback cost
+    # only to have plan_refinement_loop.py hard_stop with
+    # main_drift_policy_import_failed regardless of the readback's content.
+    from route_loop_verdict_v2 import classify_main_drift as _main_drift_classifier_probe
+except ImportError:  # pragma: no cover - defensive fallback
+    _main_drift_classifier_probe = None
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -3807,6 +3824,7 @@ def run_preflight(
     consume_contract_patch_plan: bool = False,
     contract_update_callbacks: Optional[dict[str, Any]] = None,
     investigation_evidence_transport_path: "Optional[Path]" = None,
+    enable_main_drift_live_readback: bool = False,
 ) -> tuple[dict, int]:
     """
     Main preflight logic.
@@ -4231,6 +4249,34 @@ def run_preflight(
         issue_number=issue_number,
         repo=repo,
     )
+    # Issue #2102 fix_delta (iteration 4, Blocker 4): populate
+    # known_context["main_drift"] from a live git readback (see
+    # `build_live_main_drift_known_context()` above) so
+    # `plan_refinement_loop.py`'s `_refinement_main_drift_decision()` is
+    # actually reachable in production, not just from hand-injected test
+    # `known_context`. Gated behind `enable_main_drift_live_readback`
+    # (default False, opt-in) rather than unconditional in every live-mode
+    # call: many existing callers configure a real `origin` remote URL in
+    # environments with no network access to it (or, worse, one that IS
+    # reachable but unrelated to the local repo state under test), and an
+    # unconditional live `git fetch` there would be a silent, surprising
+    # side effect on every ordinary preflight invocation. Fixture-mode
+    # invocations (`fixture_path is not None`) never run this regardless
+    # of the flag; an explicitly-supplied `known_context["main_drift"]`
+    # (fixture or caller override) is never overwritten.
+    if (
+        enable_main_drift_live_readback
+        and fixture_path is None
+        and _main_drift_classifier_probe is not None
+        and not (known_context and "main_drift" in known_context)
+    ):
+        _live_main_drift = build_live_main_drift_known_context(
+            repo_root=repo_root,
+            issue_body=issue.get("body", "") or "",
+        )
+        if _live_main_drift is not None:
+            known_context = dict(known_context) if known_context else {}
+            known_context["main_drift"] = _live_main_drift
     planner_input_dict = _build_planner_input(
         issue,
         comments,
@@ -4884,6 +4930,159 @@ def _git_head_sha(repo_root: Path) -> str:
         return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# known_context["main_drift"] live production producer (Issue #2102
+# fix_delta, iteration 4, Blocker 4). This is the orchestrator step the
+# `known_context["main_drift"] production contract` comment in
+# `plan_refinement_loop.py` documents as missing wiring: it performs the
+# live git readback (bounded `git fetch` / `rev-parse` / `diff` / `merge-tree
+# --write-tree`) and builds the dict that function's docstring requires,
+# then `run_preflight()` below merges it into `known_context` before
+# `plan_refinement_loop.py` is invoked. Every subprocess call is bounded and
+# fails closed to `None` (never a fabricated/partial dict) on any timeout,
+# non-zero exit, or missing origin remote.
+# ---------------------------------------------------------------------------
+
+
+def _run_git_readonly_bounded(argv: list, cwd: Path, timeout: int = 20):
+    """Bounded, fail-closed `git` readback helper (returns None on any
+    timeout/launch failure instead of raising -- callers must treat `None`
+    as "cannot confirm", never as a stand-in for a real result)."""
+    try:
+        return subprocess.run(
+            ["git", *argv],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            shell=False,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _extract_allowed_paths_from_issue_body(body: str) -> list:
+    """Parse the canonical `## Allowed Paths` bullet list the same shape
+    `pr_head_replay_publish_exec.py::_allowed_paths()` already parses on the
+    implementation-loop side (kept independently here since this module has
+    no import boundary into `scripts/agent-ops/`)."""
+    marker = "## Allowed Paths"
+    if marker not in body:
+        return []
+    section = body.split(marker, 1)[1].split("\n## ", 1)[0]
+    paths = []
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        candidate = stripped[1:].strip().strip("`")
+        if candidate:
+            paths.append(candidate)
+    return paths
+
+
+def build_live_main_drift_known_context(
+    *,
+    repo_root: Path,
+    issue_body: str,
+    base_ref: str = "main",
+    evidence_base_sha: Optional[str] = None,
+    allowed_paths_snapshot_base_sha: Optional[str] = None,
+    expected_head_sha: Optional[str] = None,
+    observed_head_sha: Optional[str] = None,
+    expected_old_sha: Optional[str] = None,
+    observed_old_sha: Optional[str] = None,
+) -> Optional[dict]:
+    """Build `known_context["main_drift"]` from a live git readback (Issue
+    #2102 fix_delta iteration 4, Blocker 4; CAS-pair defaults corrected in
+    fix_delta iteration 5, Blocker A). See the production contract comment
+    above `_refinement_main_drift_decision()` in `plan_refinement_loop.py`
+    for the exact key contract this satisfies, and
+    `route_loop_verdict_v2.classify_main_drift()` for the consumer that
+    validates every key below is present and well-formed.
+
+    Fails closed to `None` (never a dict built from partial/stale evidence)
+    if the live `origin/<base_ref>` readback, or (when the evidence epoch
+    actually differs from the live base) the `git diff` / `git merge-tree
+    --write-tree` probes, cannot be completed within their bounded
+    timeouts. Callers MUST treat a `None` return as "no main_drift evidence
+    available this cycle" -- never as "no drift detected".
+
+    `expected_head_sha`/`observed_head_sha` and `expected_old_sha`/
+    `observed_old_sha` are CAS guards `classify_main_drift()` uses to
+    reject a *concurrent* mutation of whatever ref this evidence rebind
+    will ultimately touch -- they are a distinct concern from the
+    `current_base_sha` vs `evidence_base_sha` drift comparison performed
+    below. This producer has no independent prior-known state to CAS
+    against (it is a read-only diagnostic epoch classification, not the
+    mutation itself), so every pair defaults to the SAME just-read live
+    value unless a caller supplies an explicit prior expectation to guard
+    against a race. Defaulting `expected_old_sha` to `evidence_base_sha`
+    while `observed_old_sha` defaulted to `current_base_sha` (the
+    pre-fix_delta-5 behavior) made these two CAS pairs mismatch on every
+    genuine drift, which caused `classify_main_drift()` to hard_stop with
+    `expected_old_cas_mismatch` on all drifted input -- silently defeating
+    AC1's scope-clean reconciliation route before it could ever be
+    reached in production.
+    """
+    fetched = _run_git_readonly_bounded(
+        ["fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{base_ref}"], repo_root, timeout=20
+    )
+    if fetched is None or fetched.returncode != 0:
+        return None
+    current = _run_git_readonly_bounded(["rev-parse", f"origin/{base_ref}"], repo_root, timeout=10)
+    if current is None or current.returncode != 0:
+        return None
+    current_base_sha = current.stdout.strip()
+    if not current_base_sha:
+        return None
+
+    resolved_evidence_base_sha = evidence_base_sha or current_base_sha
+    resolved_allowed_paths_snapshot_base_sha = allowed_paths_snapshot_base_sha or resolved_evidence_base_sha
+    resolved_expected_head_sha = expected_head_sha or current_base_sha
+    resolved_observed_head_sha = observed_head_sha or resolved_expected_head_sha
+    resolved_expected_old_sha = expected_old_sha or current_base_sha
+    resolved_observed_old_sha = observed_old_sha or resolved_expected_old_sha
+
+    allowed_paths = _extract_allowed_paths_from_issue_body(issue_body)
+
+    latest_main_net_diff: list = []
+    semantic_ambiguity = False
+    if resolved_evidence_base_sha != current_base_sha:
+        diff = _run_git_readonly_bounded(
+            ["diff", "--name-only", resolved_evidence_base_sha, current_base_sha], repo_root, timeout=20
+        )
+        if diff is None or diff.returncode != 0:
+            return None
+        latest_main_net_diff = [line for line in diff.stdout.splitlines() if line]
+
+        # Deterministic real-conflict oracle (mirrors
+        # `pr_head_replay_publish_exec.py::_merge_tree_conflicts()` on the
+        # implementation-loop side, Issue #2102 P1-C): a nonzero exit from
+        # the two-ref `git merge-tree --write-tree` form means the merge
+        # produced conflicts. This is never a caller-asserted boolean.
+        merge_probe = _run_git_readonly_bounded(
+            ["merge-tree", "--write-tree", resolved_evidence_base_sha, current_base_sha], repo_root, timeout=20
+        )
+        if merge_probe is None:
+            return None
+        semantic_ambiguity = merge_probe.returncode != 0
+
+    return {
+        "current_base_sha": current_base_sha,
+        "evidence_base_sha": resolved_evidence_base_sha,
+        "allowed_paths_snapshot_base_sha": resolved_allowed_paths_snapshot_base_sha,
+        "allowed_paths": allowed_paths,
+        "latest_main_net_diff": latest_main_net_diff,
+        "expected_head_sha": resolved_expected_head_sha,
+        "observed_head_sha": resolved_observed_head_sha,
+        "expected_old_sha": resolved_expected_old_sha,
+        "observed_old_sha": resolved_observed_old_sha,
+        "semantic_ambiguity": semantic_ambiguity,
+    }
+
+
 def _git_blob_sha(file_path: Path, repo_root: Path) -> str:
     """Return git blob SHA of a file or 'unknown' on failure."""
     try:
@@ -5294,6 +5493,28 @@ def main(argv: list[str] | None = None) -> None:
         help="Execute a trusted CONTRACT_PATCH_PLAN_V1 through edit_issue_txn.py.",
     )
     parser.add_argument(
+        "--disable-main-drift-live-readback",
+        dest="enable_main_drift_live_readback",
+        action="store_false",
+        default=True,
+        help="Issue #2102 fix_delta (iteration 5, Blocker A): the CLI/registry "
+        "production entrypoint (command_registry.py's 'preflight.run' family, which "
+        "never renders this flag) now performs the bounded live git readback "
+        "(fetch/diff/merge-tree against 'origin') to populate known_context['main_drift'] "
+        "before invoking the planner BY DEFAULT -- opt-out via this flag, not opt-in. "
+        "The prior opt-in default (Blocker 4, iteration 4) never actually enabled this "
+        "in production because no registered command_registry.py entry rendered the "
+        "old --enable-main-drift-live-readback flag, leaving the producer dead code; "
+        "see build_live_main_drift_known_context()'s docstring for the CAS-pair-default "
+        "correctness fix (iteration 5) that made this safe to flip. Only the CLI/main() "
+        "entrypoint's default changed -- run_preflight()'s own Python-level keyword "
+        "default is unchanged (False) so every other in-process caller (e.g. "
+        "_apply_contract_patch_plan_v1()'s fresh_checks() post-mutation reverification "
+        "helper, which does not have every skill's sibling scripts/ directory on "
+        "sys.path in every test harness) keeps its pre-existing behavior unless it "
+        "explicitly opts in.",
+    )
+    parser.add_argument(
         "--investigation-evidence-transport-path",
         type=Path,
         default=None,
@@ -5470,6 +5691,7 @@ def main(argv: list[str] | None = None) -> None:
         known_context=cli_known_context,
         consume_contract_patch_plan=args.consume_contract_patch_plan,
         investigation_evidence_transport_path=args.investigation_evidence_transport_path,
+        enable_main_drift_live_readback=args.enable_main_drift_live_readback,
     )
     sys.exit(exit_code)
 
