@@ -460,3 +460,83 @@ def test_cmd_produce_cleans_up_intermediate_files_and_persists_canonical_artifac
     assert "compact_result" in out
     assert "body_file" not in out
 
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #2054 PR #2142 owner REQUEST_CHANGES P0-2: classify_child_stdout()
+# wire<->artifact cross-check. A grammatically valid but tampered wire
+# (ARTIFACT/ARTIFACT_SHA256 unchanged, VERDICT/BLOCKERS/NEXT_ACTION rewritten)
+# must be classified integrity_failure, not silently accepted.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_child_stdout_with_artifact_context_accepts_genuine_relay(tmp_path):
+    import reviewer_transport as _transport
+
+    relative, digest = _transport.write_semantic_artifact(
+        artifact_root=tmp_path, issue_number=2049, repo="squne121/loop-protocol",
+        invocation_id="classify-genuine", attempt=1, reviewed_body_sha256="sha256:" + "a" * 64,
+        semantic_result={"verdict": "approve", "blocking_issues": []},
+    )
+    wire = _transport.build_compact_v2(
+        verdict="approve", summary="contract ready", blockers=0,
+        reviewed_body_sha256="sha256:" + "a" * 64, attempt_id="classify-genuine",
+        artifact_relative=relative, artifact_sha256=digest,
+    ).decode("utf-8")
+    result = _PIPELINE.classify_child_stdout(
+        wire, issue_number=2049, artifact_root=tmp_path, repo="squne121/loop-protocol",
+        expected_body_sha256="sha256:" + "a" * 64,
+    )
+    assert result == {"classification": "ok", "code": None, "retryable": False}
+
+
+def test_classify_child_stdout_with_artifact_context_rejects_tampered_relay(tmp_path):
+    import reviewer_transport as _transport
+
+    relative, digest = _transport.write_semantic_artifact(
+        artifact_root=tmp_path, issue_number=2049, repo="squne121/loop-protocol",
+        invocation_id="classify-tampered", attempt=1, reviewed_body_sha256="sha256:" + "b" * 64,
+        semantic_result={"verdict": "needs-fix", "blocking_issues": [{"code": "C1"}]},
+    )
+    # ARTIFACT / ARTIFACT_SHA256 point at the real, hash-verifiable artifact
+    # above, but VERDICT/BLOCKERS/NEXT_ACTION are self-consistently rewritten
+    # to disagree with that artifact's actual semantic_result.
+    tampered_wire = _transport.build_compact_v2(
+        verdict="approve", summary="contract ready", blockers=0,
+        reviewed_body_sha256="sha256:" + "b" * 64, attempt_id="classify-tampered",
+        artifact_relative=relative, artifact_sha256=digest,
+    ).decode("utf-8")
+    result = _PIPELINE.classify_child_stdout(
+        tampered_wire, issue_number=2049, artifact_root=tmp_path, repo="squne121/loop-protocol",
+        expected_body_sha256="sha256:" + "b" * 64,
+    )
+    assert result["classification"] == "integrity_failure"
+    assert result["retryable"] is False
+
+
+def test_retry_once_on_transport_failure_never_retries_integrity_failure(tmp_path):
+    import reviewer_transport as _transport
+
+    relative, digest = _transport.write_semantic_artifact(
+        artifact_root=tmp_path, issue_number=2049, repo="squne121/loop-protocol",
+        invocation_id="retry-tampered", attempt=1, reviewed_body_sha256="sha256:" + "c" * 64,
+        semantic_result={"verdict": "needs-fix", "blocking_issues": [{"code": "C1"}]},
+    )
+    tampered_wire = _transport.build_compact_v2(
+        verdict="approve", summary="contract ready", blockers=0,
+        reviewed_body_sha256="sha256:" + "c" * 64, attempt_id="retry-tampered",
+        artifact_relative=relative, artifact_sha256=digest,
+    ).decode("utf-8")
+    calls = {"n": 0}
+
+    def invoke_child():
+        calls["n"] += 1
+        return tampered_wire
+
+    result = _PIPELINE.retry_once_on_transport_failure(
+        invoke_child, issue_number=2049, artifact_root=tmp_path, repo="squne121/loop-protocol",
+        expected_body_sha256="sha256:" + "c" * 64,
+    )
+    assert calls["n"] == 1, "integrity_failure must not be retried (a misbehaving relay will not self-heal)"
+    assert result["status"] == "integrity_failure"

@@ -111,6 +111,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -392,7 +393,14 @@ def persist_to_canonical_artifact_directory(
 # ---------------------------------------------------------------------------
 
 
-def classify_child_stdout(raw_text: str, *, issue_number: int | None = None) -> dict[str, Any]:
+def classify_child_stdout(
+    raw_text: str,
+    *,
+    issue_number: int | None = None,
+    artifact_root: Path | None = None,
+    repo: str | None = None,
+    expected_body_sha256: str | None = None,
+) -> dict[str, Any]:
     """Classify the child `issue-reviewer` agent's raw stdout text via the
     SAME canonical validator (`validate_review_compact_output.validate_review_compact_output()`)
     the orchestrator's Step 2 routing table uses -- NOT a separately
@@ -411,21 +419,87 @@ def classify_child_stdout(raw_text: str, *, issue_number: int | None = None) -> 
     consecutive `reviewer_transport_failure` of either kind is a repeated
     failure and stops with `reviewer_transport_failure` (Issue #2049 AC6)
     -- it is never silently treated as an approve.
+
+    Issue #2054 PR #2142 owner REQUEST_CHANGES P0-2: when `artifact_root` /
+    `repo` / `expected_body_sha256` are supplied (the orchestrator's Step 2
+    always supplies them for the loop path), a grammatically valid wire is
+    NOT trusted on its own. The parent independently re-verifies the exact
+    artifact bytes the wire's `ARTIFACT`/`ARTIFACT_SHA256` fields reference
+    (`reviewer_transport.verify_artifact()`) and re-derives the canonical
+    wire purely from that verified artifact's `semantic_result`
+    (`reviewer_transport.verify_wire_matches_artifact()`), so a relay that
+    kept `ARTIFACT`/`ARTIFACT_SHA256` pointing at a legitimate,
+    hash-verified artifact while self-consistently rewriting
+    `VERDICT`/`BLOCKERS`/`NEXT_ACTION` is classified `integrity_failure`,
+    not silently trusted. `integrity_failure` is a DIFFERENT classification
+    than `reviewer_transport_failure` (AC4): it is not retried by
+    `retry_once_on_transport_failure()` the same way a transport-level empty
+    /malformed failure is, because the FAILURE is not "the child produced no
+    usable output" but "the child's output does not match parent-verified
+    ground truth" -- retrying the same compromised/misbehaving relay is not
+    expected to self-heal the mismatch.
     """
     result = _canonical_validate_review_compact_output(raw_text, issue_number=issue_number)
-    if result["validation_status"] == "valid":
-        return {"classification": "ok", "code": None, "retryable": False}
+    if result["validation_status"] != "valid":
+        violations = result.get("violations") or []
+        is_empty_input = any(v.get("code") == "empty_input" for v in violations)
+        return {
+            "classification": "reviewer_transport_failure",
+            "code": "empty_input" if is_empty_input else "malformed_output",
+            "retryable": True,
+        }
 
-    violations = result.get("violations") or []
-    is_empty_input = any(v.get("code") == "empty_input" for v in violations)
-    return {
-        "classification": "reviewer_transport_failure",
-        "code": "empty_input" if is_empty_input else "malformed_output",
-        "retryable": True,
-    }
+    if artifact_root is not None and repo is not None and expected_body_sha256 is not None:
+        fields = result.get("normalized_payload") or {}
+        artifact_ref = fields.get("ARTIFACT", "")
+        artifact_prefix = "compact_review_result_v2="
+        if not artifact_ref.startswith(artifact_prefix):
+            return {"classification": "integrity_failure", "code": "artifact_reference_invalid", "retryable": False}
+        artifact_relative = artifact_ref[len(artifact_prefix) :]
+        parts = artifact_relative.split("/")
+        invocation_id = parts[1] if len(parts) > 1 else ""
+        try:
+            attempt = int(parts[2].removeprefix("attempt-")) if len(parts) > 2 else 0
+        except ValueError:
+            attempt = 0
+        verified = _reviewer_transport.verify_artifact(
+            artifact_root=artifact_root,
+            artifact_relative=artifact_relative,
+            expected_repo=repo,
+            expected_issue=issue_number or 0,
+            expected_body_sha256=expected_body_sha256,
+            expected_invocation_id=invocation_id,
+            expected_attempt=attempt,
+            expected_sha256=fields.get("ARTIFACT_SHA256", ""),
+        )
+        if verified["status"] != "valid":
+            return {
+                "classification": "integrity_failure",
+                "code": verified.get("reason_code", "artifact_integrity_failure"),
+                "retryable": False,
+            }
+        cross = _reviewer_transport.verify_wire_matches_artifact(
+            wire=raw_text, verified_artifact=verified, artifact_relative=artifact_relative,
+            artifact_sha256=fields.get("ARTIFACT_SHA256", ""),
+        )
+        if cross["status"] != "valid":
+            return {
+                "classification": "integrity_failure",
+                "code": cross.get("reason_code", "wire_artifact_semantic_mismatch"),
+                "retryable": False,
+            }
+
+    return {"classification": "ok", "code": None, "retryable": False}
 
 
-def retry_once_on_transport_failure(invoke_child, *, issue_number: int | None = None):
+def retry_once_on_transport_failure(
+    invoke_child,
+    *,
+    issue_number: int | None = None,
+    artifact_root: Path | None = None,
+    repo: str | None = None,
+    expected_body_sha256: str | None = None,
+):
     """Call `invoke_child()` (returns raw stdout text); if the FIRST call is
     classified `reviewer_transport_failure` (empty OR malformed, via the
     canonical validator -- see `classify_child_stdout`), retry
@@ -433,20 +507,56 @@ def retry_once_on_transport_failure(invoke_child, *, issue_number: int | None = 
     `reviewer_transport_failure`, this is a repeated failure: stop and
     report `reviewer_transport_failure` (Issue #2049 AC6) rather than
     retrying unboundedly or silently downgrading to an unrelated verdict.
+
+    Issue #2054 PR #2142 owner REQUEST_CHANGES P0-1/P0-2: this function
+    delegates its retryable/non-retryable classification vocabulary to
+    `classify_child_stdout()` (in turn delegating to `reviewer_transport.py`,
+    the V2 contract SSOT) rather than reimplementing a second policy.
+    `integrity_failure` (wire<->artifact binding mismatch, distinct from a
+    transport-level empty/malformed failure -- Issue #2054 AC4) is NEVER
+    retried and NEVER silently accepted as `status: ok`: retrying the same
+    misbehaving/compromised relay is not expected to self-heal a semantic
+    mismatch against parent-verified artifact ground truth.
     """
     first = invoke_child()
-    classification = classify_child_stdout(first, issue_number=issue_number)
-    if classification["classification"] != "reviewer_transport_failure":
+    classification = classify_child_stdout(
+        first,
+        issue_number=issue_number,
+        artifact_root=artifact_root,
+        repo=repo,
+        expected_body_sha256=expected_body_sha256,
+    )
+    if classification["classification"] == "ok":
         return {"raw_text": first, "attempts": 1, "final_classification": classification, "status": "ok"}
+    if classification["classification"] == "integrity_failure":
+        return {
+            "raw_text": first,
+            "attempts": 1,
+            "final_classification": classification,
+            "status": "integrity_failure",
+        }
 
     second = invoke_child()
-    retry_classification = classify_child_stdout(second, issue_number=issue_number)
-    if retry_classification["classification"] != "reviewer_transport_failure":
+    retry_classification = classify_child_stdout(
+        second,
+        issue_number=issue_number,
+        artifact_root=artifact_root,
+        repo=repo,
+        expected_body_sha256=expected_body_sha256,
+    )
+    if retry_classification["classification"] == "ok":
         return {
             "raw_text": second,
             "attempts": 2,
             "final_classification": retry_classification,
             "status": "ok",
+        }
+    if retry_classification["classification"] == "integrity_failure":
+        return {
+            "raw_text": second,
+            "attempts": 2,
+            "final_classification": retry_classification,
+            "status": "integrity_failure",
         }
 
     return {
@@ -737,6 +847,74 @@ def produce_compact_result(
     }
 
 
+def run_checker_pipeline_once(
+    *, body_file: str, issue_number: int, body_sha256: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Run check_issue_contract -> contract_readiness_check -> merge_readiness
+    exactly once against an already-fetched, already-pinned body file.
+
+    Extracted from the former inline body of `_cmd_produce()` (Issue #2054
+    PR #2142 owner REQUEST_CHANGES P0-1) so it can be invoked both in-process
+    (by `_cmd_run_checker_attempt()`, when this module is spawned as a
+    subprocess child by `reviewer_transport.run_reviewer_transport()`) and
+    directly by tests.  All intermediate JSON files live in a private
+    temporary directory removed on return.
+    """
+    scratch_dir = Path(tempfile.mkdtemp(prefix="root_review_pipeline_attempt_"))
+    try:
+        review_result, _review_rc, review_err = run_check_issue_contract(body_file)
+        readiness_result, _readiness_rc, readiness_err = run_contract_readiness_check(body_file)
+        if review_result is None or readiness_result is None:
+            return None, review_err or readiness_err
+
+        review_result_file = str(scratch_dir / "review_result.json")
+        readiness_result_file = str(scratch_dir / "readiness_result.json")
+        merged_output_file = str(scratch_dir / "merged_review_result.json")
+        Path(review_result_file).write_text(json.dumps(review_result), encoding="utf-8")
+        Path(readiness_result_file).write_text(json.dumps(readiness_result), encoding="utf-8")
+
+        merged, _merge_rc, merge_err = run_merge_readiness(
+            review_result_file=review_result_file,
+            readiness_result_file=readiness_result_file,
+            readiness_artifact_path=readiness_result_file,
+            iteration_id=f"root_review_pipeline_{issue_number}",
+            output_file=merged_output_file,
+        )
+        if merged is None:
+            return None, merge_err
+
+        merged["body_sha256"] = body_sha256
+        return merged, None
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def _cmd_run_checker_attempt(args: argparse.Namespace) -> int:
+    """[internal] Single reviewer-transport "attempt" child: run the
+    deterministic checker pipeline once against an already-pinned body file
+    and print the merged `REVIEW_ISSUE_RESULT_V1` JSON to stdout.
+
+    This subcommand exists SPECIFICALLY to be spawned by
+    `reviewer_transport.run_reviewer_transport()` as its child process
+    (Issue #2054 PR #2142 owner REQUEST_CHANGES P0-1): the parent transport
+    owns attempt manifests, the closed retry matrix, process-group reaping,
+    and artifact-binding for whatever it spawns, so the checker pipeline
+    invocation gets that real production wiring instead of being invoked
+    ad hoc, unretried, untelemetered by `_cmd_produce()` directly. It is not
+    part of the human-facing CLI surface (not documented in the module
+    docstring's subcommand list) and MUST NOT be invoked by anything other
+    than `_cmd_produce()` via `run_reviewer_transport()`.
+    """
+    merged, error_code = run_checker_pipeline_once(
+        body_file=args.body_file, issue_number=args.issue_number, body_sha256=args.body_sha256
+    )
+    if merged is None:
+        print(json.dumps({"error_code": error_code}), file=sys.stderr)
+        return 2
+    print(json.dumps(merged))
+    return 0
+
+
 def _cmd_produce(args: argparse.Namespace) -> int:
     body, body_sha256, error_code = fetch_and_pin_live_body(args.issue_number, args.repo)
     if body is None:
@@ -752,68 +930,119 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # PR #2135 human REQUEST_CHANGES iteration-3 P2-6: all invocation-private
-    # intermediate files (pinned body, review/readiness/merged JSON) live
-    # inside a `TemporaryDirectory()` scoped to this single `produce` call and
-    # are removed automatically on exit (success or error) -- unlike the
-    # prior `NamedTemporaryFile(delete=False)` + no-cleanup design, which left
-    # at least 4 files under `tmp/` after every successful run.
     tmp_root = _REPO_ROOT / "tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=str(tmp_root), prefix="root_review_pipeline_") as scratch_dir:
         body_file = write_pinned_body_tempfile(body, dir=scratch_dir)
-        review_result, review_rc, review_err = run_check_issue_contract(body_file)
-        readiness_result, readiness_rc, readiness_err = run_contract_readiness_check(body_file)
 
-        if review_result is None or readiness_result is None:
-            print(
-                json.dumps(
-                    {
-                        "schema": SCHEMA,
-                        "schema_version": SCHEMA_VERSION,
-                        "status": "input_or_runtime_error",
-                        "error_code": review_err or readiness_err,
-                    }
-                )
-            )
-            return 2
-
-        review_result_file = body_file + ".review_result.json"
-        readiness_result_file = body_file + ".readiness_result.json"
-        merged_output_file = body_file + ".merged_review_result.json"
-        Path(review_result_file).write_text(json.dumps(review_result), encoding="utf-8")
-        Path(readiness_result_file).write_text(json.dumps(readiness_result), encoding="utf-8")
-
-        merged, merge_rc, merge_err = run_merge_readiness(
-            review_result_file=review_result_file,
-            readiness_result_file=readiness_result_file,
-            readiness_artifact_path=readiness_result_file,
-            iteration_id=f"root_review_pipeline_{args.issue_number}",
-            output_file=merged_output_file,
+        # Issue #2054 PR #2142 owner REQUEST_CHANGES P0-1: production wiring
+        # through `reviewer_transport.run_reviewer_transport()` -- real
+        # attempt manifests, the closed retry matrix, process-group
+        # reaping, and artifact-binding/wire cross-checks now govern the
+        # checker-pipeline invocation itself. `backend="deterministic"`:
+        # this specific reviewer step is a deterministic checker chain with
+        # no session-resume concept of its own, but it is spawned, retried,
+        # and artifact-bound through the SAME transport machinery a real
+        # Claude/Codex backend attempt uses (see
+        # `reviewer_transport.build_backend_command()`).
+        base_argv = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "run-checker-attempt",
+            "--body-file",
+            body_file,
+            "--issue-number",
+            str(args.issue_number),
+            "--body-sha256",
+            body_sha256,
+        ]
+        artifact_root = _REPO_ROOT / _CANONICAL_ARTIFACT_DIR
+        transport_result = _reviewer_transport.run_reviewer_transport(
+            base_argv=base_argv,
+            command_id="root_review_pipeline.checker_attempt",
+            argv_template_id="root_review_pipeline.checker_attempt/v1",
+            backend="deterministic",
+            issue_number=args.issue_number,
+            repo=args.repo,
+            reviewed_body_sha256=body_sha256,
+            artifact_root=artifact_root,
         )
-        if merged is None:
+        if transport_result["transport_status"] != "ok":
             print(
                 json.dumps(
                     {
                         "schema": SCHEMA,
                         "schema_version": SCHEMA_VERSION,
                         "status": "input_or_runtime_error",
-                        "error_code": merge_err,
+                        "error_code": "reviewer_transport_environment_failure",
+                        "transport_invocation_id": transport_result["invocation_id"],
                     }
                 )
             )
             return 2
 
-        merged["body_sha256"] = body_sha256
+        last_attempt = transport_result["attempts"][-1]
+        compact_fields = last_attempt["compact"]
+        artifact_prefix = "compact_review_result_v2="
+        artifact_relative = compact_fields["ARTIFACT"][len(artifact_prefix) :]
+
+        # Re-verify (dir-fd-anchored, no-follow, single-read) the artifact
+        # `run_reviewer_transport()` already validated internally, so this
+        # module never trusts the child's `compact` fields without an
+        # independent artifact-bytes readback of its own.
+        verified = _reviewer_transport.verify_artifact(
+            artifact_root=artifact_root,
+            artifact_relative=artifact_relative,
+            expected_repo=args.repo,
+            expected_issue=args.issue_number,
+            expected_body_sha256=body_sha256,
+            expected_invocation_id=transport_result["invocation_id"],
+            expected_attempt=last_attempt["attempt"],
+            expected_sha256=compact_fields["ARTIFACT_SHA256"],
+        )
+        if verified["status"] != "valid":
+            print(
+                json.dumps(
+                    {
+                        "schema": SCHEMA,
+                        "schema_version": SCHEMA_VERSION,
+                        "status": "input_or_runtime_error",
+                        "error_code": "artifact_readback_failed",
+                    }
+                )
+            )
+            return 2
+
+        # Issue #2054 PR #2142 owner REQUEST_CHANGES P0-3: the artifact's
+        # `semantic_result` IS the full merged `REVIEW_ISSUE_RESULT_V1`
+        # (`run_checker_pipeline_once()`'s return value, printed verbatim by
+        # `_cmd_run_checker_attempt()` and persisted losslessly by
+        # `reviewer_transport.write_semantic_artifact()` -- not a
+        # `{"verdict":..., "blocking_issues":...}` projection), so
+        # `findings[]` / `checker_evidence` / `structured_blockers` /
+        # producer schema version all survive in the canonical V2 artifact.
+        merged = verified["payload"]["semantic_result"]
+
         artifact_path = persist_to_canonical_artifact_directory(args.issue_number, merged)
 
-        # P0-1: this call is now the SOLE producer of the compact envelope,
-        # end-to-end (fetch -> pin -> checker -> readiness -> merge ->
-        # compact generation + persist). Its `stdout_lines` are handed to the
-        # read-only `issue-reviewer` child as an explicit, already-produced,
-        # read-only input; the child relays them verbatim and never invokes
-        # `compact_review_result.py` itself.
-        compact_result = produce_compact_result(args.issue_number, merged)
+        wire = _reviewer_transport.build_compact_v2(
+            verdict=compact_fields["VERDICT"],
+            summary=compact_fields["SUMMARY"],
+            blockers=int(compact_fields["BLOCKERS"]),
+            reviewed_body_sha256=compact_fields["REVIEWED_BODY_SHA256"],
+            attempt_id=compact_fields["ATTEMPT_ID"],
+            artifact_relative=artifact_relative,
+            artifact_sha256=compact_fields["ARTIFACT_SHA256"],
+            must_read=compact_fields["MUST_READ"],
+        )
+        compact_result = {
+            "stdout_lines": wire.decode("utf-8").rstrip("\n").split("\n"),
+            "artifact_path": str(artifact_root / artifact_relative),
+            "verdict": compact_fields["VERDICT"],
+            "next_action": compact_fields["NEXT_ACTION"],
+            "reviewed_body_sha256": compact_fields["REVIEWED_BODY_SHA256"],
+            "attempt_id": compact_fields["ATTEMPT_ID"],
+        }
 
         print(
             json.dumps(
@@ -837,7 +1066,14 @@ def _cmd_classify_child_stdout(args: argparse.Namespace) -> int:
         raw_text = Path(args.input_file).read_text(encoding="utf-8")
     else:
         raw_text = sys.stdin.read()
-    result = classify_child_stdout(raw_text, issue_number=args.issue_number)
+    artifact_root = Path(args.artifact_root) if args.artifact_root else None
+    result = classify_child_stdout(
+        raw_text,
+        issue_number=args.issue_number,
+        artifact_root=artifact_root,
+        repo=args.repo,
+        expected_body_sha256=args.expected_body_sha256,
+    )
     print(json.dumps(result))
     return 0 if result["classification"] == "ok" else 1
 
@@ -879,9 +1115,23 @@ def main(argv: list[str] | None = None) -> int:
     p_produce.add_argument("--repo", default="squne121/loop-protocol")
     p_produce.set_defaults(func=_cmd_produce)
 
+    p_attempt = sub.add_parser(
+        "run-checker-attempt",
+        help="[internal] single reviewer_transport attempt child; not part of the human-facing CLI surface",
+    )
+    p_attempt.add_argument("--body-file", required=True)
+    p_attempt.add_argument("--issue-number", type=int, required=True)
+    p_attempt.add_argument("--body-sha256", required=True)
+    p_attempt.set_defaults(func=_cmd_run_checker_attempt)
+
     p_classify = sub.add_parser("classify-child-stdout", help="Classify child agent raw stdout")
     p_classify.add_argument("--input-file")
     p_classify.add_argument("--issue-number", type=int, default=None)
+    p_classify.add_argument(
+        "--artifact-root", default=None, help="Enables wire<->artifact cross-check (Issue #2054 AC4/P0-2) when set"
+    )
+    p_classify.add_argument("--repo", default=None)
+    p_classify.add_argument("--expected-body-sha256", default=None)
     p_classify.set_defaults(func=_cmd_classify_child_stdout)
 
     p_readback = sub.add_parser("readback", help="Readback a persisted compact artifact")

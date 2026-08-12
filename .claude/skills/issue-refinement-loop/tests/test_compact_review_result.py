@@ -14,7 +14,7 @@ SHA = "sha256:" + "e" * 64
 
 def test_given_semantic_approve_when_parent_runs_then_v2_compact_and_artifact_are_bound(tmp_path: Path):
     result = transport.run_reviewer_transport(
-        command=[sys.executable, "-c", "import json; print(json.dumps({'verdict':'approve','blocking_issues':[]}))"],
+        base_argv=[sys.executable, "-c", "import json; print(json.dumps({'verdict':'approve','blocking_issues':[]}))"],
         command_id="issue-reviewer.run", argv_template_id="issue-reviewer.run/v2",
         backend="fixture", issue_number=2054, repo="squne121/loop-protocol",
         reviewed_body_sha256=SHA, artifact_root=tmp_path, invocation_id="compact-parent",

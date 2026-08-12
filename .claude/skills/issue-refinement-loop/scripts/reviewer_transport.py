@@ -8,6 +8,22 @@ only after the same raw artifact bytes have passed all binding checks.
 
 This module is the V2 contract owner.  Callers must not reimplement its
 grammar, artifact layout, or retry policy.
+
+PR #2142 owner REQUEST_CHANGES (P0-1/P0-2/P1-1/P1-2/P1-3): this revision adds
+(a) ``build_backend_command()``, a single backend command adapter that
+materializes same-session/fresh-session resume identity into real argv per
+attempt (the child command is no longer identical across retries), (b)
+``project_compact_v2_from_artifact()`` / ``verify_wire_matches_artifact()``,
+which re-derive the canonical wire from a verified artifact's
+``semantic_result`` so a caller can prove a (possibly separately relayed)
+wire string still reflects that artifact -- hash/schema/repo/issue/body/
+invocation/attempt binding on the artifact bytes alone does not prove this,
+(c) a hard post-wait total-deadline check (late-result rejection), (d) a
+bounded reader-thread join with an escaped-grandchild fault path, (e) an
+exact ``os.open in os.supports_dir_fd`` capability gate, and (f) a
+dir-fd-anchored, component-wise no-follow *write* path shared by every
+producer so a symlinked intermediate directory cannot be silently followed
+on create either.
 """
 
 from __future__ import annotations
@@ -38,6 +54,9 @@ TOTAL_DEADLINE_SECONDS = 240
 STDOUT_CAP = 65_536
 STDERR_CAP = 262_144
 ARTIFACT_MAX_BYTES = 1_048_576
+READER_JOIN_GRACE_SECONDS = 5
+REAP_CONFIRM_ATTEMPTS = 5
+REAP_CONFIRM_INTERVAL_SECONDS = 0.2
 _SHA = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ATTEMPT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
@@ -103,27 +122,131 @@ def attempt_relative_dir(issue_number: int, invocation_id: str, attempt: int) ->
     return str(Path(artifact_relative_path(issue_number, invocation_id, attempt)).parent)
 
 
-def _atomic_create(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    fd = os.open(path, flags, 0o600)
+# ---------------------------------------------------------------------------
+# Secure, dir-fd-anchored no-follow open (shared capability gate)
+# ---------------------------------------------------------------------------
+
+
+def _has_secure_open_capability() -> bool:
+    """Exact capability gate (PR #2142 owner REQUEST_CHANGES P1-2).
+
+    ``os.supports_dir_fd`` is a *set of functions* that accept the ``dir_fd``
+    keyword on this platform, not a bool.  The previous ``not
+    os.supports_dir_fd`` check only tested truthiness of that set, so it
+    passed as long as *any* function supported ``dir_fd`` -- not
+    specifically ``os.open`` (the function this module actually calls with
+    ``dir_fd=``).  Python's own documentation defines membership testing as
+    ``os.open in os.supports_dir_fd``.
+    """
+    return (
+        hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "open")
+        and os.open in os.supports_dir_fd
+        and hasattr(os, "mkdir")
+        and os.mkdir in os.supports_dir_fd
+    )
+
+
+def _open_no_follow(root: Path, relative: str) -> tuple[int, int]:
+    """Open root and each path component by FD; returns (root_fd, leaf_fd)."""
+    if not _has_secure_open_capability():
+        raise OSError("unsupported_secure_open_capability")
+    parts = _relative_parts(relative)
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    current = root_fd
     try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
+        for component in parts[:-1]:
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            if current != root_fd:
+                os.close(current)
+            current = next_fd
+        leaf_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current)
+        if current != root_fd:
+            os.close(current)
+        return root_fd, leaf_fd
     except BaseException:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        if current != root_fd:
+            os.close(current)
+        os.close(root_fd)
         raise
 
 
-def _artifact_file(root: Path, relative: str) -> Path:
-    # Lexical validation plus parent-created components.  Consumption uses
-    # dir-fd traversal below and never trusts this Path for security.
-    return root.joinpath(*_relative_parts(relative))
+def _mkdir_no_follow(root: Path, relative_dir: str) -> None:
+    """Create every intermediate directory component of ``relative_dir``
+    under ``root`` via dir-fd-anchored, component-wise no-follow open/mkdir
+    (PR #2142 owner REQUEST_CHANGES P1-3): a producer using plain
+    ``Path.mkdir(parents=True)`` + a separate ``os.open()`` on the combined
+    path would silently follow a pre-existing symlink placed at any
+    intermediate component -- the exact resolve/open split AC6 forbids on
+    the consumer side, which previously had no producer-side counterpart.
+    Existing components are opened (not re-created); a component that
+    exists but is not a real directory (e.g. a symlink) is rejected.
+    """
+    if not _has_secure_open_capability():
+        raise OSError("unsupported_secure_open_capability")
+    # `root` itself is a trusted, caller-controlled anchor (not attacker
+    # influenced the way relative path components can be) -- e.g. the
+    # canonical `.claude/artifacts/issue-refinement-loop` base. Ensuring it
+    # exists is a plain mkdir; the dir-fd-anchored no-follow treatment below
+    # applies to every component *under* it, which is the actual boundary
+    # this function defends.
+    root.mkdir(parents=True, exist_ok=True)
+    if not relative_dir or relative_dir == ".":
+        return
+    parts = Path(relative_dir).parts
+    if not parts or any(part in ("..",) for part in parts):
+        raise ValueError("artifact_path_not_relative")
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    current = root_fd
+    try:
+        for component in parts:
+            try:
+                os.mkdir(component, 0o700, dir_fd=current)
+            except FileExistsError:
+                pass
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            if current != root_fd:
+                os.close(current)
+            current = next_fd
+    finally:
+        if current != root_fd:
+            os.close(current)
+        os.close(root_fd)
+
+
+def _atomic_create(root: Path, relative: str, content: bytes) -> Path:
+    """Create ``root/relative`` exactly once (``O_CREAT|O_EXCL``), anchored
+    via dir-fd component-wise no-follow traversal from ``root`` for both the
+    intermediate directories and the leaf file (PR #2142 owner
+    REQUEST_CHANGES P1-3). No unsafe fallback: platforms without the exact
+    ``os.open in os.supports_dir_fd`` capability fail closed.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    parts = _relative_parts(relative)
+    parent_relative = str(Path(*parts[:-1])) if len(parts) > 1 else ""
+    _mkdir_no_follow(root, parent_relative)
+    parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        current = parent_fd
+        for component in parts[:-1]:
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            if current != parent_fd:
+                os.close(current)
+            current = next_fd
+        leaf_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        leaf_fd = os.open(parts[-1], leaf_flags, 0o600, dir_fd=current)
+        try:
+            with os.fdopen(leaf_fd, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            if current != parent_fd:
+                os.close(current)
+    finally:
+        os.close(parent_fd)
+    return root.joinpath(*parts)
 
 
 def _bounded_reader(stream: Any, cap: int, bucket: dict[str, Any]) -> None:
@@ -151,6 +274,32 @@ def _redact_bytes(raw: bytes) -> str:
     return "<redacted:%d-bytes>" % len(raw)
 
 
+def _confirm_process_group_reaped(pgid: int) -> bool:
+    """Best-effort confirmation that no process remains in ``pgid`` (PR
+    #2142 owner REQUEST_CHANGES P1-1): ``descendants_reaped`` must reflect an
+    observation, not merely ``timed_out``.  Reaps any zombie children of
+    *this* process in ``pgid`` via ``os.waitpid(-pgid, WNOHANG)`` so an
+    escaped grandchild that re-parented to init is not falsely counted as
+    reaped, then probes liveness with signal 0.
+    """
+    for _ in range(REAP_CONFIRM_ATTEMPTS):
+        try:
+            while True:
+                reaped_pid, _status = os.waitpid(-pgid, os.WNOHANG)
+                if reaped_pid == 0:
+                    break
+        except ChildProcessError:
+            pass
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(REAP_CONFIRM_INTERVAL_SECONDS)
+    return False
+
+
 def _make_manifest(
     *,
     issue_number: int,
@@ -175,9 +324,7 @@ def _make_manifest(
 
 
 def _write_json_once(root: Path, relative: str, value: dict[str, Any]) -> Path:
-    path = _artifact_file(root, relative)
-    _atomic_create(path, canonical_json_bytes(value))
-    return path
+    return _atomic_create(root, relative, canonical_json_bytes(value))
 
 
 @dataclass(frozen=True)
@@ -202,6 +349,45 @@ def retry_matrix(*, backend: str, initial_session_id: str | None, attempt: int, 
     if attempt == 1 and initial_session_id:
         return RetryIntent("same_session_resume", initial_session_id)
     return RetryIntent("fresh_session_replacement", None)
+
+
+# ---------------------------------------------------------------------------
+# Backend command adapter (PR #2142 owner REQUEST_CHANGES P0-1)
+# ---------------------------------------------------------------------------
+
+_KNOWN_BACKENDS = frozenset({"claude", "codex", "deterministic", "fixture"})
+
+
+def build_backend_command(*, backend: str, base_argv: list[str], session_id: str | None) -> list[str]:
+    """Materialize backend-specific same-session/fresh-session resume
+    identity into real argv for one attempt.
+
+    This is the single place a backend command adapter lives; callers (in
+    particular ``run_reviewer_transport()``) must call this once per
+    attempt with the attempt's *current* ``session_id`` -- not reuse a
+    single ``command`` value across retries -- so the resume/replacement
+    intent ``retry_matrix()`` decides is actually reflected in what gets
+    executed.
+
+    - ``claude``: same-session resume passes ``--resume <session_id>``;
+      fresh-session replacement omits it (a new agent ID is assigned by the
+      launched process, not synthesized here).
+    - ``codex``: same-session resume passes ``resume <session_id>``
+      (matching ``codex exec resume <id>`` CLI convention); fresh-session
+      replacement omits it.
+    - ``deterministic``: no session concept (idempotent checker pipeline);
+      argv is returned unchanged regardless of ``session_id``.
+    - ``fixture``: test-only passthrough, unchanged.
+    """
+    if backend not in _KNOWN_BACKENDS:
+        raise ValueError(f"unknown_backend:{backend}")
+    if not base_argv:
+        raise ValueError("empty_base_argv")
+    if backend == "claude":
+        return [*base_argv, "--resume", session_id] if session_id else list(base_argv)
+    if backend == "codex":
+        return [*base_argv, "resume", session_id] if session_id else list(base_argv)
+    return list(base_argv)
 
 
 def build_compact_v2(
@@ -311,31 +497,6 @@ def validate_compact_v2(
     return result
 
 
-def _open_no_follow(root: Path, relative: str) -> tuple[int, int]:
-    """Open root and each path component by FD; returns (root_fd, leaf_fd)."""
-    required = ("O_NOFOLLOW", "O_DIRECTORY")
-    if not hasattr(os, "open") or any(not hasattr(os, name) for name in required) or not os.supports_dir_fd:
-        raise OSError("unsupported_secure_open_capability")
-    parts = _relative_parts(relative)
-    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    current = root_fd
-    try:
-        for component in parts[:-1]:
-            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
-            if current != root_fd:
-                os.close(current)
-            current = next_fd
-        leaf_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current)
-        if current != root_fd:
-            os.close(current)
-        return root_fd, leaf_fd
-    except BaseException:
-        if current != root_fd:
-            os.close(current)
-        os.close(root_fd)
-        raise
-
-
 def secure_read_json(
     *, artifact_root: Path, artifact_relative: str, max_bytes: int = ARTIFACT_MAX_BYTES
 ) -> dict[str, Any]:
@@ -369,7 +530,7 @@ def secure_read_json(
             raise ValueError("raw_byte_oversize")
         payload = strict_json_loads(raw)
         return {"status": "valid", "raw_bytes": raw, "sha256": sha256_prefixed(raw), "payload": payload}
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, NotImplementedError, json.JSONDecodeError) as exc:
         return {"status": "integrity_failure", "reason_code": str(exc)}
 
 
@@ -416,6 +577,15 @@ def write_semantic_artifact(
     reviewed_body_sha256: str,
     semantic_result: dict[str, Any],
 ) -> tuple[str, str]:
+    """Persist the full semantic review result losslessly (PR #2142 owner
+    REQUEST_CHANGES P0-3): ``semantic_result`` MUST be the complete
+    ``REVIEW_ISSUE_RESULT_V1``-shaped payload (``findings[]`` /
+    ``checker_evidence`` / ``structured_blockers`` / etc., not merely
+    ``{"verdict": ..., "blocking_issues": ...}``), so a rewrite lane can
+    recover full provenance from the verified V2 artifact alone. This
+    function itself is schema-agnostic; it is the caller's responsibility
+    to pass the full payload.
+    """
     relative = artifact_relative_path(issue_number, invocation_id, attempt)
     payload = {
         "schema": ARTIFACT_SCHEMA,
@@ -427,8 +597,90 @@ def write_semantic_artifact(
         "semantic_result": semantic_result,
     }
     raw = canonical_json_bytes(payload)
-    _atomic_create(_artifact_file(artifact_root, relative), raw)
+    _atomic_create(artifact_root, relative, raw)
     return relative, sha256_prefixed(raw)
+
+
+# ---------------------------------------------------------------------------
+# Wire <-> artifact semantic cross-binding (PR #2142 owner REQUEST_CHANGES P0-2)
+# ---------------------------------------------------------------------------
+
+
+def _semantic_verdict_and_count(semantic_result: Any) -> tuple[str, int]:
+    if not isinstance(semantic_result, dict):
+        raise ValueError("semantic_result_missing")
+    verdict = semantic_result.get("verdict")
+    blocking_issues = semantic_result.get("blocking_issues")
+    if verdict not in {"approve", "needs-fix"} or not isinstance(blocking_issues, list):
+        raise ValueError("semantic_result_invalid")
+    count = len(blocking_issues)
+    if (verdict == "approve" and count != 0) or (verdict == "needs-fix" and count == 0):
+        raise ValueError("semantic_result_cross_field_invalid")
+    return verdict, count
+
+
+def project_compact_v2_from_artifact(
+    payload: dict[str, Any], *, attempt_id: str, artifact_relative: str, artifact_sha256: str
+) -> bytes:
+    """Re-derive the canonical V2 wire *purely* from a verified artifact's
+    ``semantic_result`` (never from a separately relayed wire string), so a
+    caller can prove that wire still reflects the artifact's actual verdict.
+    """
+    verdict, count = _semantic_verdict_and_count(payload.get("semantic_result"))
+    reviewed_body_sha256 = payload.get("reviewed_body_sha256")
+    if not isinstance(reviewed_body_sha256, str):
+        raise ValueError("reviewed_body_sha256_missing")
+    summary = "contract ready" if verdict == "approve" else f"{count} blocker(s)"
+    return build_compact_v2(
+        verdict=verdict,
+        summary=summary,
+        blockers=count,
+        reviewed_body_sha256=reviewed_body_sha256,
+        attempt_id=attempt_id,
+        artifact_relative=artifact_relative,
+        artifact_sha256=artifact_sha256,
+    )
+
+
+def verify_wire_matches_artifact(
+    *,
+    wire: bytes | str,
+    verified_artifact: dict[str, Any],
+    artifact_relative: str,
+    artifact_sha256: str,
+) -> dict[str, Any]:
+    """Cross-check a compact V2 wire against the SAME verified artifact's
+    ``semantic_result`` (PR #2142 owner REQUEST_CHANGES P0-2).
+
+    ``verify_artifact()`` alone (hash/schema/repository/issue/body-SHA/
+    invocation/attempt binding on the artifact bytes) does not prove that a
+    *separately relayed* wire string (e.g. an agent's stdout, forwarded by
+    an orchestrator without re-deriving it from the artifact) still reflects
+    that artifact's verdict/blocker count: a relay could keep
+    ``ARTIFACT``/``ARTIFACT_SHA256`` pointing at a legitimate,
+    hash-verified artifact while self-consistently rewriting
+    ``VERDICT``/``BLOCKERS``/``NEXT_ACTION`` to something the artifact does
+    not actually contain. This function closes that gap by re-deriving the
+    canonical wire from the artifact and comparing byte-for-byte against
+    the wire under test, treating the artifact (not the wire) as ground
+    truth.
+    """
+    payload = verified_artifact.get("payload")
+    if not isinstance(payload, dict):
+        return {"status": "integrity_failure", "reason_code": "artifact_payload_missing"}
+    invocation_id = payload.get("invocation_id")
+    if not isinstance(invocation_id, str):
+        return {"status": "integrity_failure", "reason_code": "artifact_invocation_id_missing"}
+    try:
+        expected_wire = project_compact_v2_from_artifact(
+            payload, attempt_id=invocation_id, artifact_relative=artifact_relative, artifact_sha256=artifact_sha256
+        )
+    except ValueError as exc:
+        return {"status": "integrity_failure", "reason_code": f"artifact_projection_failed:{exc}"}
+    actual = wire if isinstance(wire, bytes) else wire.encode("utf-8")
+    if actual != expected_wire:
+        return {"status": "integrity_failure", "reason_code": "wire_artifact_semantic_mismatch"}
+    return {"status": "valid"}
 
 
 def _attempt_result(**kwargs: Any) -> dict[str, Any]:
@@ -437,7 +689,7 @@ def _attempt_result(**kwargs: Any) -> dict[str, Any]:
 
 def run_reviewer_transport(
     *,
-    command: list[str],
+    base_argv: list[str],
     command_id: str,
     argv_template_id: str,
     backend: str,
@@ -450,8 +702,17 @@ def run_reviewer_transport(
     per_attempt_deadline: int = PER_ATTEMPT_DEADLINE_SECONDS,
     total_deadline: int = TOTAL_DEADLINE_SECONDS,
 ) -> dict[str, Any]:
-    """Run a reviewer child with process-group reaping and closed retries."""
-    if not command or issue_number <= 0 or not _SHA.match(reviewed_body_sha256):
+    """Run a reviewer child with process-group reaping and closed retries.
+
+    ``base_argv`` is the backend-invariant portion of the command; the
+    actual per-attempt command is rebuilt every attempt via
+    ``build_backend_command()`` using that attempt's *current*
+    ``active_session`` (PR #2142 owner REQUEST_CHANGES P0-1), so the
+    resume/replacement identity ``retry_matrix()`` decides is actually
+    reflected in the spawned argv instead of reusing one fixed ``command``
+    across every attempt.
+    """
+    if not base_argv or issue_number <= 0 or not _SHA.match(reviewed_body_sha256):
         raise ValueError("invalid_transport_request")
     invocation_id = invocation_id or generate_invocation_id()
     started = time.monotonic()
@@ -462,6 +723,7 @@ def run_reviewer_transport(
         if time.monotonic() - started >= total_deadline:
             break
         intent = retry_intent_kind
+        command = build_backend_command(backend=backend, base_argv=base_argv, session_id=active_session)
         manifest_relative = attempt_relative_dir(issue_number, invocation_id, attempt) + "/attempt_manifest.json"
         _write_json_once(
             artifact_root,
@@ -489,7 +751,7 @@ def run_reviewer_transport(
             "exit_code": None,
             "signal": None,
             "timeout": False,
-            "descendants_reaped": False,
+            "descendants_reaped": None,
             "stdout_length": 0,
             "stdout_sha256": None,
             "stderr_length": 0,
@@ -525,9 +787,19 @@ def run_reviewer_transport(
         common.update(pid=process.pid, process_group=process.pid)
         stdout: dict[str, Any] = {}
         stderr: dict[str, Any] = {}
+        # PR #2142 owner REQUEST_CHANGES P1-1: daemon=True so an escaped
+        # grandchild that keeps the inherited stdout/stderr pipe write-end
+        # open cannot force this function to block past the bounded join
+        # below -- Python cannot safely cancel a thread blocked in a
+        # blocking `read()` syscall (closing the fd from another thread
+        # while a read is in flight is platform-dependent and unreliable,
+        # not a real cancellation), so a daemon thread that is still alive
+        # after its grace period is simply left running in the background
+        # (its target bucket stays unpopulated) while this function
+        # proceeds and classifies the attempt from whatever was captured.
         threads = [
-            threading.Thread(target=_bounded_reader, args=(process.stdout, STDOUT_CAP, stdout)),
-            threading.Thread(target=_bounded_reader, args=(process.stderr, STDERR_CAP, stderr)),
+            threading.Thread(target=_bounded_reader, args=(process.stdout, STDOUT_CAP, stdout), daemon=True),
+            threading.Thread(target=_bounded_reader, args=(process.stderr, STDERR_CAP, stderr), daemon=True),
         ]
         [thread.start() for thread in threads]
         timed_out = False
@@ -535,6 +807,17 @@ def run_reviewer_transport(
             process.wait(timeout=min(per_attempt_deadline, max(1, total_deadline - (time.monotonic() - started))))
         except subprocess.TimeoutExpired:
             timed_out = True
+        # PR #2142 owner REQUEST_CHANGES P1-1: a hard total-deadline check
+        # AFTER wait() returns, independent of whether wait() itself timed
+        # out.  Without this, `max(1, total_deadline - elapsed)` could grant
+        # up to ~1 extra second past `total_deadline`, and a result that
+        # only becomes available past the deadline was previously accepted
+        # with no re-check (late-result rejection was not actually
+        # enforced).
+        if not timed_out and time.monotonic() - started > total_deadline:
+            timed_out = True
+        reaped: bool | None = None
+        if timed_out:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -546,11 +829,26 @@ def run_reviewer_transport(
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                process.wait()
-        [thread.join() for thread in threads]
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+            reaped = _confirm_process_group_reaped(process.pid)
+        # PR #2142 owner REQUEST_CHANGES P1-1: bounded join.  An escaped
+        # grandchild (one that called setsid() and left the process group
+        # `killpg()` targets) can hold the inherited stdout/stderr pipe FD
+        # open even after the direct child has exited, so an unbounded
+        # `thread.join()` can block forever on that FD's EOF.  A join
+        # timeout, plus a subsequent stream close to unblock a still-live
+        # reader thread, keeps this bounded.
+        reader_timed_out = False
+        for thread in threads:
+            thread.join(timeout=READER_JOIN_GRACE_SECONDS)
+            if thread.is_alive():
+                reader_timed_out = True
         common.update(
             timeout=timed_out,
-            descendants_reaped=timed_out,
+            descendants_reaped=reaped,
             exit_code=process.returncode,
             signal=(-process.returncode if process.returncode and process.returncode < 0 else None),
             stdout_length=stdout.get("length", 0),
@@ -563,7 +861,8 @@ def run_reviewer_transport(
             stderr_suffix=_redact_bytes(stderr.get("suffix", b"")),
         )
         if timed_out:
-            result = _attempt_result(**common, failure_phase="execution", reason_code="timeout")
+            reason_code = "timeout" if not reader_timed_out else "capture_failure"
+            result = _attempt_result(**common, failure_phase="execution", reason_code=reason_code)
         elif process.returncode != 0:
             result = _attempt_result(
                 **common, failure_phase="execution", reason_code=("signal" if common["signal"] else "nonzero_exit")
@@ -577,13 +876,7 @@ def run_reviewer_transport(
             # compact wire or artifact: this parent is the V2 producer.
             try:
                 semantic = strict_json_loads(stdout.get("prefix", b""))
-                verdict = semantic.get("verdict") if isinstance(semantic, dict) else None
-                blockers = semantic.get("blocking_issues", []) if isinstance(semantic, dict) else []
-                if verdict not in {"approve", "needs-fix"} or not isinstance(blockers, list):
-                    raise ValueError("semantic_result_invalid")
-                count = len(blockers)
-                if (verdict == "approve" and count != 0) or (verdict == "needs-fix" and count == 0):
-                    raise ValueError("semantic_result_cross_field_invalid")
+                verdict, count = _semantic_verdict_and_count(semantic)
                 relative, digest = write_semantic_artifact(
                     artifact_root=artifact_root,
                     issue_number=issue_number,
@@ -626,15 +919,33 @@ def run_reviewer_transport(
                         artifact_validation=verified,
                     )
                 else:
-                    result = {
-                        "schema": ATTEMPT_SCHEMA,
-                        "transport_status": "ok",
-                        "semantic_verdict": verdict,
-                        **common,
-                        "failure_phase": None,
-                        "reason_code": None,
-                        "compact": fields,
-                    }
+                    # PR #2142 owner REQUEST_CHANGES P0-2: even though this
+                    # code path derives `wire` and `verified` from the SAME
+                    # local `semantic`/`verdict`/`count`, self-check the
+                    # projection here too so any future refactor that lets
+                    # them diverge fails closed instead of silently
+                    # regressing the binding this function exists to
+                    # provide.
+                    cross = verify_wire_matches_artifact(
+                        wire=wire, verified_artifact=verified, artifact_relative=relative, artifact_sha256=digest
+                    )
+                    if cross["status"] != "valid":
+                        result = _attempt_result(
+                            **common,
+                            failure_phase="artifact_validation",
+                            reason_code="integrity_failure",
+                            artifact_validation=cross,
+                        )
+                    else:
+                        result = {
+                            "schema": ATTEMPT_SCHEMA,
+                            "transport_status": "ok",
+                            "semantic_verdict": verdict,
+                            **common,
+                            "failure_phase": None,
+                            "reason_code": None,
+                            "compact": fields,
+                        }
             except (ValueError, OSError, json.JSONDecodeError) as exc:
                 result = _attempt_result(
                     **common,

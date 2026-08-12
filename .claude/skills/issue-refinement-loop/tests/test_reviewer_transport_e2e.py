@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 SCRIPTS = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -14,9 +17,9 @@ import reviewer_transport as transport  # noqa: E402
 SHA = "sha256:" + "d" * 64
 
 
-def _run(tmp_path: Path, program: str, *, session_id: str | None = "same-session") -> dict:
+def _run(tmp_path: Path, program: str, *, session_id: str | None = "same-session", total_deadline: int = 5) -> dict:
     return transport.run_reviewer_transport(
-        command=[sys.executable, "-c", program],
+        base_argv=[sys.executable, "-c", program],
         command_id="issue-reviewer.run",
         argv_template_id="issue-reviewer.run/v2",
         backend="fixture",
@@ -27,7 +30,7 @@ def _run(tmp_path: Path, program: str, *, session_id: str | None = "same-session
         invocation_id="transport-e2e",
         session_id=session_id,
         per_attempt_deadline=1,
-        total_deadline=5,
+        total_deadline=total_deadline,
     )
 
 
@@ -66,7 +69,7 @@ def test_given_retry_matrix_when_retried_then_same_then_fresh_session_intent_is_
 
 def test_given_spawn_failure_when_parent_cannot_start_child_then_every_attempt_has_immutable_receipt(tmp_path: Path):
     result = transport.run_reviewer_transport(
-        command=[str(tmp_path / "missing-reviewer")],
+        base_argv=[str(tmp_path / "missing-reviewer")],
         command_id="issue-reviewer.run",
         argv_template_id="issue-reviewer.run/v2",
         backend="fixture",
@@ -119,10 +122,236 @@ def test_given_signal_or_timeout_when_parent_reaps_process_group_then_failure_st
     assert {attempt["reason_code"] for attempt in signalled["attempts"]} == {"signal"}
     timed_out = _run(tmp_path / "timeout", "import time; time.sleep(5)")
     assert {attempt["reason_code"] for attempt in timed_out["attempts"]} == {"timeout"}
-    assert all(attempt["descendants_reaped"] for attempt in timed_out["attempts"])
+    assert all(attempt["descendants_reaped"] is True for attempt in timed_out["attempts"])
 
 
 def test_given_resume_fixture_when_backend_adapter_is_called_then_native_canary_is_not_claimed(tmp_path: Path):
     result = _run(tmp_path, "import sys; sys.exit(4)")
     assert result["attempts"][1]["session_id"] == "same-session"
     assert result["attempts"][2]["session_id"] != "same-session"
+
+
+# ---------------------------------------------------------------------------
+# PR #2142 owner REQUEST_CHANGES P0-1: backend command adapter materializes
+# same-session/fresh-session resume identity into real argv.
+# ---------------------------------------------------------------------------
+
+
+def test_given_claude_backend_when_session_present_then_resume_flag_is_materialized():
+    resumed = transport.build_backend_command(backend="claude", base_argv=["claude", "review"], session_id="agent-123")
+    assert resumed == ["claude", "review", "--resume", "agent-123"]
+    fresh = transport.build_backend_command(backend="claude", base_argv=["claude", "review"], session_id=None)
+    assert fresh == ["claude", "review"]
+
+
+def test_given_codex_backend_when_session_present_then_resume_subcommand_is_materialized():
+    resumed = transport.build_backend_command(backend="codex", base_argv=["codex", "exec"], session_id="thread-9")
+    assert resumed == ["codex", "exec", "resume", "thread-9"]
+    fresh = transport.build_backend_command(backend="codex", base_argv=["codex", "exec"], session_id=None)
+    assert fresh == ["codex", "exec"]
+
+
+def test_given_unknown_backend_when_command_built_then_rejected():
+    with pytest.raises(ValueError):
+        transport.build_backend_command(backend="unknown-backend", base_argv=["x"], session_id=None)
+
+
+# ---------------------------------------------------------------------------
+# PR #2142 owner REQUEST_CHANGES P0-2: wire <-> artifact semantic cross-binding.
+# A self-consistent but tampered wire (ARTIFACT/ARTIFACT_SHA256 unchanged,
+# VERDICT/BLOCKERS/NEXT_ACTION rewritten) must be detected.
+# ---------------------------------------------------------------------------
+
+
+def test_given_tampered_wire_when_cross_checked_against_artifact_then_mismatch_detected(tmp_path: Path):
+    relative, digest = transport.write_semantic_artifact(
+        artifact_root=tmp_path,
+        issue_number=2054,
+        repo="squne121/loop-protocol",
+        invocation_id="tamper-check",
+        attempt=1,
+        reviewed_body_sha256=SHA,
+        semantic_result={"verdict": "needs-fix", "blocking_issues": [{"code": "x"}]},
+    )
+    verified = transport.verify_artifact(
+        artifact_root=tmp_path,
+        artifact_relative=relative,
+        expected_repo="squne121/loop-protocol",
+        expected_issue=2054,
+        expected_body_sha256=SHA,
+        expected_invocation_id="tamper-check",
+        expected_attempt=1,
+        expected_sha256=digest,
+    )
+    assert verified["status"] == "valid"
+
+    # Self-consistent V2 grammar, ARTIFACT/ARTIFACT_SHA256 unchanged, but
+    # VERDICT/BLOCKERS/NEXT_ACTION rewritten to disagree with the artifact's
+    # actual semantic_result. `validate_compact_v2()` alone accepts this
+    # (it only checks wire-internal consistency); the cross-check must not.
+    tampered_wire = transport.build_compact_v2(
+        verdict="approve",
+        summary="contract ready",
+        blockers=0,
+        reviewed_body_sha256=SHA,
+        attempt_id="tamper-check",
+        artifact_relative=relative,
+        artifact_sha256=digest,
+    )
+    assert transport.validate_compact_v2(tampered_wire, issue_number=2054)["validation_status"] == "valid"
+
+    cross = transport.verify_wire_matches_artifact(
+        wire=tampered_wire, verified_artifact=verified, artifact_relative=relative, artifact_sha256=digest
+    )
+    assert cross["status"] == "integrity_failure"
+    assert cross["reason_code"] == "wire_artifact_semantic_mismatch"
+
+    genuine_wire = transport.project_compact_v2_from_artifact(
+        verified["payload"], attempt_id="tamper-check", artifact_relative=relative, artifact_sha256=digest
+    )
+    genuine_cross = transport.verify_wire_matches_artifact(
+        wire=genuine_wire, verified_artifact=verified, artifact_relative=relative, artifact_sha256=digest
+    )
+    assert genuine_cross["status"] == "valid"
+
+
+def test_given_lossless_semantic_result_when_persisted_then_full_review_fields_survive(tmp_path: Path):
+    full_review = {
+        "verdict": "needs-fix",
+        "blocking_issues": [{"code": "C1"}],
+        "findings": [{"finding_kind": "checker_gap", "evidence": "x"}],
+        "checker_evidence": [{"source_check": "check_issue_contract.py"}],
+        "structured_blockers": [{"code": "C1", "blocking": True}],
+        "body_sha256": SHA,
+        "schema_version": "review_issue_result/v1",
+    }
+    relative, digest = transport.write_semantic_artifact(
+        artifact_root=tmp_path,
+        issue_number=2054,
+        repo="squne121/loop-protocol",
+        invocation_id="lossless-check",
+        attempt=1,
+        reviewed_body_sha256=SHA,
+        semantic_result=full_review,
+    )
+    verified = transport.verify_artifact(
+        artifact_root=tmp_path,
+        artifact_relative=relative,
+        expected_repo="squne121/loop-protocol",
+        expected_issue=2054,
+        expected_body_sha256=SHA,
+        expected_invocation_id="lossless-check",
+        expected_attempt=1,
+        expected_sha256=digest,
+    )
+    assert verified["status"] == "valid"
+    assert verified["payload"]["semantic_result"] == full_review
+    assert verified["payload"]["semantic_result"]["findings"] == full_review["findings"]
+    assert verified["payload"]["semantic_result"]["checker_evidence"] == full_review["checker_evidence"]
+
+
+# ---------------------------------------------------------------------------
+# PR #2142 owner REQUEST_CHANGES P1-1: escaped grandchild must not hang the
+# bounded reader thread join indefinitely.
+# ---------------------------------------------------------------------------
+
+
+def test_given_escaped_grandchild_holding_stdout_when_timeout_then_join_is_bounded(tmp_path: Path):
+    program = (
+        "import os, sys, time\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    os.setsid()\n"
+        "    time.sleep(60)\n"
+        "    sys.exit(0)\n"
+        "time.sleep(60)\n"
+    )
+    started = time.monotonic()
+    result = transport.run_reviewer_transport(
+        base_argv=[sys.executable, "-c", program],
+        command_id="issue-reviewer.run",
+        argv_template_id="issue-reviewer.run/v2",
+        backend="fixture",
+        issue_number=2054,
+        repo="squne121/loop-protocol",
+        reviewed_body_sha256=SHA,
+        artifact_root=tmp_path,
+        invocation_id="escaped-grandchild",
+        session_id="same-session",
+        per_attempt_deadline=1,
+        total_deadline=2,
+    )
+    elapsed = time.monotonic() - started
+    assert result["transport_status"] == "environment_failure"
+    # Bounded: must not block for anywhere near the grandchild's own 60s
+    # sleep just because it still holds the inherited stdout/stderr pipe
+    # open after the direct child (in the killed process group) has exited.
+    assert elapsed < 30
+
+
+# ---------------------------------------------------------------------------
+# PR #2142 owner REQUEST_CHANGES P1-2: exact `os.open in os.supports_dir_fd`
+# capability gate (not blanket `os.supports_dir_fd` truthiness).
+# ---------------------------------------------------------------------------
+
+
+def test_given_unsupported_dir_fd_capability_when_writing_then_fails_closed(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(os, "supports_dir_fd", frozenset())
+    with pytest.raises(OSError):
+        transport.write_semantic_artifact(
+            artifact_root=tmp_path,
+            issue_number=2054,
+            repo="squne121/loop-protocol",
+            invocation_id="unsupported-cap-write",
+            attempt=1,
+            reviewed_body_sha256=SHA,
+            semantic_result={"verdict": "approve", "blocking_issues": []},
+        )
+
+
+def test_given_unsupported_dir_fd_capability_when_reading_then_integrity_failure(tmp_path: Path, monkeypatch):
+    relative, _digest = transport.write_semantic_artifact(
+        artifact_root=tmp_path,
+        issue_number=2054,
+        repo="squne121/loop-protocol",
+        invocation_id="unsupported-cap-read",
+        attempt=1,
+        reviewed_body_sha256=SHA,
+        semantic_result={"verdict": "approve", "blocking_issues": []},
+    )
+    monkeypatch.setattr(os, "supports_dir_fd", frozenset())
+    result = transport.secure_read_json(artifact_root=tmp_path, artifact_relative=relative)
+    assert result["status"] == "integrity_failure"
+    assert result["reason_code"] == "unsupported_secure_open_capability"
+
+
+def test_given_dir_fd_set_missing_os_open_when_gated_then_rejected_even_if_nonempty(monkeypatch):
+    """The set must be checked for `os.open` membership specifically, not
+    merely truthiness (PR #2142 owner REQUEST_CHANGES P1-2)."""
+    monkeypatch.setattr(os, "supports_dir_fd", frozenset({os.stat}))
+    assert transport._has_secure_open_capability() is False
+
+
+# ---------------------------------------------------------------------------
+# PR #2142 owner REQUEST_CHANGES P1-3: producer-side write path must also
+# reject a pre-existing symlink at an intermediate directory component.
+# ---------------------------------------------------------------------------
+
+
+def test_given_symlinked_intermediate_directory_when_producer_writes_then_no_follow_rejects(tmp_path: Path):
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlink unavailable")
+    real_target = tmp_path / "real_target"
+    real_target.mkdir()
+    (tmp_path / "2054").symlink_to(real_target)
+    with pytest.raises(OSError):
+        transport.write_semantic_artifact(
+            artifact_root=tmp_path,
+            issue_number=2054,
+            repo="squne121/loop-protocol",
+            invocation_id="symlink-producer",
+            attempt=1,
+            reviewed_body_sha256=SHA,
+            semantic_result={"verdict": "approve", "blocking_issues": []},
+        )
+    assert not any(real_target.rglob("*")), "no artifact must leak through the symlinked component"
