@@ -351,7 +351,7 @@ substitution・`${{ }}` 認識のうえ分割）、全 simple command を分類�
 geometry matrix、`assist-player-affordance.spec.ts` 内で単一 test case として
 約 3.2 分を占めていた）を専用 spec/provider job へ物理分離した。
 
-### exclusive lane selector: `LOOP_E2E_LANE`
+### 排他的 lane selector: `LOOP_E2E_LANE`
 
 `playwright.config.ts` は `LOOP_E2E_LANE` 環境変数で 3 値の排他的 enum
 （`core` / `responsive` / `preview-namespace`）を解決する。未指定時は

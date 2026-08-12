@@ -127,3 +127,39 @@ def test_lane_selector_enum_rejects_invalid_multi_lane_combination():
     unknown = _list({"LOOP_E2E_LANE": "bogus-lane"})
     assert unknown.returncode != 0, "LOOP_E2E_LANE=bogus-lane (unknown) must be rejected fail-closed"
     assert "LOOP_E2E_LANE" in unknown.stderr
+
+    # AC8/AC14 fix_delta (PR #2137 review, iteration 1): `e2e-core` owns
+    # preview-namespace-exactly-once, so `LOOP_E2E_LANE=core` combined with
+    # `LOOP_E2E_PREVIEW_NAMESPACE_LANE=true` is a LEGITIMATE combination
+    # (the e2e-core CI job runs both the standard core suite and, in a
+    # later step, the dedicated preview-namespace spec under the same
+    # job-level LOOP_E2E_LANE=core env var) and must NOT be rejected.
+    # The preview-namespace spec itself requires LOOP_EXPECTED_STORAGE_KEY to
+    # be set at module scope (unrelated to the LOOP_E2E_LANE selector under
+    # test here) -- provide a valid non-production value so a --list
+    # collection failure there can never be misread as a lane-selector
+    # rejection.
+    core_with_preview_namespace_flag = _list(
+        {
+            "LOOP_E2E_LANE": "core",
+            "LOOP_E2E_PREVIEW_NAMESPACE_LANE": "true",
+            "LOOP_EXPECTED_STORAGE_KEY": "loop-protocol.preview.pr-0.mvp.save",
+        }
+    )
+    assert core_with_preview_namespace_flag.returncode == 0, (
+        "LOOP_E2E_LANE=core + LOOP_E2E_PREVIEW_NAMESPACE_LANE=true must be "
+        f"accepted (e2e-core owns preview-namespace-exactly-once): "
+        f"{core_with_preview_namespace_flag.stderr}"
+    )
+
+    # `responsive` has its own dedicated, mutually exclusive spec selection,
+    # so combining it with the preview-namespace flag remains a genuine,
+    # fail-closed-rejected inconsistency.
+    responsive_with_preview_namespace_flag = _list(
+        {"LOOP_E2E_LANE": "responsive", "LOOP_E2E_PREVIEW_NAMESPACE_LANE": "true"}
+    )
+    assert responsive_with_preview_namespace_flag.returncode != 0, (
+        "LOOP_E2E_LANE=responsive + LOOP_E2E_PREVIEW_NAMESPACE_LANE=true "
+        "must be rejected fail-closed"
+    )
+    assert "LOOP_E2E_LANE" in responsive_with_preview_namespace_flag.stderr

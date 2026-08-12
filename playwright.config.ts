@@ -114,9 +114,17 @@ if (process.env.LOOP_E2E_LANE !== undefined) {
       'LOOP_E2E_LANE=preview-namespace requires LOOP_E2E_PREVIEW_NAMESPACE_LANE=true (lane selector inconsistency)',
     )
   }
-  if (E2E_LANE !== 'preview-namespace' && PREVIEW_NAMESPACE_LANE) {
+  // `e2e-core` owns preview-namespace-exactly-once (Issue #2119 AC8), so the
+  // `core` + `LOOP_E2E_PREVIEW_NAMESPACE_LANE=true` combination is a
+  // legitimate, expected pairing (the e2e-core CI job runs the standard
+  // core suite AND, in a later step, the dedicated preview-namespace spec
+  // with the same job-level `LOOP_E2E_LANE=core` env var still set) and
+  // must NOT be rejected. Only `responsive` (which has its own dedicated,
+  // mutually exclusive spec selection) combined with the preview-namespace
+  // flag is a genuine inconsistency.
+  if (E2E_LANE === 'responsive' && PREVIEW_NAMESPACE_LANE) {
     throw new Error(
-      `LOOP_E2E_PREVIEW_NAMESPACE_LANE=true requires LOOP_E2E_LANE=preview-namespace, got "${E2E_LANE}" (lane selector inconsistency)`,
+      `LOOP_E2E_PREVIEW_NAMESPACE_LANE=true is incompatible with LOOP_E2E_LANE=responsive (lane selector inconsistency)`,
     )
   }
   if (E2E_LANE === 'responsive' && VRT_LANE) {
