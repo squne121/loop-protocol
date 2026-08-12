@@ -1,4 +1,5 @@
 """Real subprocess fault-injection coverage for the reviewer transport."""
+
 from __future__ import annotations
 
 import json
@@ -15,10 +16,18 @@ SHA = "sha256:" + "d" * 64
 
 def _run(tmp_path: Path, program: str, *, session_id: str | None = "same-session") -> dict:
     return transport.run_reviewer_transport(
-        command=[sys.executable, "-c", program], command_id="issue-reviewer.run",
-        argv_template_id="issue-reviewer.run/v2", backend="fixture", issue_number=2054,
-        repo="squne121/loop-protocol", reviewed_body_sha256=SHA, artifact_root=tmp_path,
-        invocation_id="transport-e2e", session_id=session_id, per_attempt_deadline=1, total_deadline=5,
+        command=[sys.executable, "-c", program],
+        command_id="issue-reviewer.run",
+        argv_template_id="issue-reviewer.run/v2",
+        backend="fixture",
+        issue_number=2054,
+        repo="squne121/loop-protocol",
+        reviewed_body_sha256=SHA,
+        artifact_root=tmp_path,
+        invocation_id="transport-e2e",
+        session_id=session_id,
+        per_attempt_deadline=1,
+        total_deadline=5,
     )
 
 
@@ -43,20 +52,31 @@ def test_given_retry_matrix_when_retried_then_same_then_fresh_session_intent_is_
     assert result["attempts"][1]["session_id"] == "same-session"
     assert result["attempts"][2]["session_id"] not in {None, "same-session"}
     manifests = [
-        json.loads((tmp_path / "2054" / "transport-e2e" / f"attempt-{number:03d}" / "attempt_manifest.json").read_text())
+        json.loads(
+            (tmp_path / "2054" / "transport-e2e" / f"attempt-{number:03d}" / "attempt_manifest.json").read_text()
+        )
         for number in range(1, 4)
     ]
     assert [manifest["retry_intent"] for manifest in manifests] == [
-        "initial", "same_session_resume", "fresh_session_replacement",
+        "initial",
+        "same_session_resume",
+        "fresh_session_replacement",
     ]
 
 
 def test_given_spawn_failure_when_parent_cannot_start_child_then_every_attempt_has_immutable_receipt(tmp_path: Path):
     result = transport.run_reviewer_transport(
-        command=[str(tmp_path / "missing-reviewer")], command_id="issue-reviewer.run",
-        argv_template_id="issue-reviewer.run/v2", backend="fixture", issue_number=2054,
-        repo="squne121/loop-protocol", reviewed_body_sha256=SHA, artifact_root=tmp_path,
-        invocation_id="spawn-failure", session_id="same-session", per_attempt_deadline=1,
+        command=[str(tmp_path / "missing-reviewer")],
+        command_id="issue-reviewer.run",
+        argv_template_id="issue-reviewer.run/v2",
+        backend="fixture",
+        issue_number=2054,
+        repo="squne121/loop-protocol",
+        reviewed_body_sha256=SHA,
+        artifact_root=tmp_path,
+        invocation_id="spawn-failure",
+        session_id="same-session",
+        per_attempt_deadline=1,
         total_deadline=5,
     )
     assert result["transport_status"] == "environment_failure"
