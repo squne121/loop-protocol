@@ -298,7 +298,7 @@ class TestAnchorApprovalRouting:
         [{}, None, [], ""],
         ids=["empty_dict", "none", "empty_list", "empty_string"],
     )
-    def test_given_present_but_falsy_scope_delta_authority_evidence_when_raw_delta_has_no_signal_then_route_does_not_fall_to_not_triggered(
+    def test_falsy_evidence_presence_still_triggers_authority_lane(
         self, planner_module, falsy_evidence
     ):
         """PR #2083 review fix (P1-2) regression: evidence *presence* (not its
