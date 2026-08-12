@@ -133,6 +133,75 @@ planner が受け取るのは normalized decision / hash / provenance のみと�
 
 詳細な shape は `references/scope-signal-guard.md` の「scope_delta_authority_evidence_v1（正規化済み evidence, AC14）」を参照する。
 
+## Operator-Selected Human-Context 継続と Accepted Trust Model（#2086）
+
+### origin lane は operator が宣言する（Accepted Trust Model）
+
+`preflight.run.with_human_context` / `contract_update.run.with_human_context` の origin は、
+GitHub comment metadata（`author_association` を含む）から推定するのではなく、
+呼び出し側（main control-plane）が runtime invocation でどの lane（`with_human_context` /
+`with_agent_report` / unlabeled `with_anchor`）を選んだかによって決まる
+（`run_refinement_preflight.py::_resolve_scope_delta_source_kind()`）。
+
+- `author_association: OWNER/MEMBER/COLLABORATOR` は principal trust の補助情報であり、
+  「この comment を物理的に人間が書いた」ことの証明ではない（個人開発の repo では同一
+  principal が人間のブラウザ操作にも agent の GitHub mutation にも使われ得る）。
+- docs / telemetry はこの assertion を `verified_human` と表現しない。表現は常に
+  `operator_asserted_human_context`（またはそれと同義の operator-assertion 表現）を使う。
+- `with_human_context` lane に投入された URL のみが `scope_delta_authority` 判定で
+  `source_kind: issue_comment` に解決される。`with_agent_report` / unlabeled の同一 URL は
+  常に `source_kind: generated_by_agent` に解決され、scope mutation authority を得ない
+  （`_resolve_scope_delta_source_kind()`。AC6）。
+
+### 構造化 payload なしの freeform scope expansion（AC1/AC3）
+
+`scope_signal_delta.classify_directive_confidence()` は、`operator_asserted_human_context=True`
+（= `source_kind: issue_comment`、つまり `with_human_context` lane 経由）かつ箇条書き
+（bullet-list）directive を含む freeform コメントを、既知の `_DIRECTIVE_SECTION_MARKERS`
+セクション見出し（「Revised Acceptance Criteria」等）が無くても `confidence: explicit` として
+扱う。人間に手書き `ANCHOR_SCOPE_REFRAME_V1` payload や既知の見出しを要求しない
+（#2084 comment #5249734344 の failure profile — 構造化 payload が無いことだけを理由に
+`no_anchor_scope_reframe_v1_payload` / `human_judgment_required` へ落ちる欠陥の是正）。
+
+### read-only investigation による exact path 導出（AC3/AC4）
+
+freeform directive が architecture/workflow-level の scope 拡張を意味論的に要求しているが、
+comment 本文に exact backtick path literal を含まない場合、`classify_scope_delta_authority()`
+の `investigation_derived_path_literals` キーワード引数（caller-supplied、
+`SCOPE_DELTA_AUTHORITY_EVIDENCE_V1` の schema には含めない — schema は本 Issue の
+Allowed Paths 外のため変更しない）に、`codebase-investigator`（read-only）が current-main
+から導出した exact repository-relative path を渡すことで、`expands_allowed_paths` boundary
+を trusted operator lane に限り解除できる
+（`scope_signal_delta._has_investigation_derived_allowed_path_literals()`）。
+
+- 適用対象は `authority_category == "human_review_directive"`（trusted OWNER/MEMBER/COLLABORATOR
+  かつ `with_human_context` lane）のみ。`with_agent_report` / unlabeled / untrusted author の
+  evidence では一切参照されない（AC6/AC5 は緩和されない）。
+  `destructive_or_non_idempotent_operation` / `changes_permission_boundary` /
+  `changes_external_service_boundary` / `requires_issue_split` の各 boundary はこの緩和の対象外
+  であり、従来どおり fail-closed のまま維持される。
+- comment 本文が既に exact backtick literal（安全なもの）を含む場合は従来どおり
+  `_has_explicit_exact_allowed_path_expansion()` が優先され、この投資調査由来の緩和は使われない。
+- comment 本文の backtick literal が unsafe/malformed（Issue #1952 の "mixed literal" fail-closed
+  regression）な場合、その literal を investigation-derived path で「洗浄」することはできない
+  （`investigation_derived_path_literals` はあくまで comment 側に literal が全く無いケース専用）。
+
+### section-bound patch が作れない場合（AC7）
+
+`classify_scope_delta_authority()` の `contract_patch_plan.operations` は既知 marker が無い
+freeform directive では常に空になる（`derive_contract_patch_operations()` は
+`directive_markers` が空の evidence をスキップする）。この場合の消費側の振る舞いは既存の
+`NEXT_ACTION: issue_editor_required`（`SKILL.md` の「`NEXT_ACTION: issue_editor_required`」節）
+であり、新しい termination lane を追加しない。scope expansion だけを理由に termination report
+を出してはならない。
+
+### fresh gate は変わらない（AC4/AC11）
+
+上記のいずれの経路でも `route.action == "contract_update_required"` の `implementation_allowed`
+は常に `false` である。contract rewrite が完了しても、fresh body readback → fresh
+`preflight.run` → fresh review → fresh readiness が全て成功するまで実装は許可されない
+（既存の post-update gate と同一）。
+
 ## anchor_context.py — 複数ターン分節・候補抽出・取得完全性（#1891）
 
 `anchor_context.py`（`scripts/anchor_context.py`）は、`run_refinement_preflight.py` が生成した既存 snapshot artifact（`anchor_comment.snapshot`）のみを唯一の入力とする pure analyzer である。独自の GitHub API 呼び出しは持たない。
