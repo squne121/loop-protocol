@@ -34,15 +34,35 @@ def _transport_reason(web_research: Any) -> str | None:
         return "web_research_result_missing_or_malformed"
 
     status = web_research.get("status")
+    failure_class = web_research.get("failure_class")
+    verification_route = web_research.get("verification_route")
+    claims = web_research.get("claims")
+    unresolved_risks = web_research.get("unresolved_risks")
+    if verification_route not in {"grounded_research", "none"}:
+        return "web_research_result_missing_or_malformed"
+    if not isinstance(claims, list) or not isinstance(unresolved_risks, list):
+        return "web_research_result_missing_or_malformed"
     if status == "ok":
+        if failure_class is not None:
+            return "web_research_result_missing_or_malformed"
         return None
     if status not in {"failed", "inconclusive", "insufficient_context"}:
         return "web_research_result_missing_or_malformed"
 
-    failure_class = web_research.get("failure_class")
     if isinstance(failure_class, str) and failure_class:
         return f"external_evidence_unavailable:{failure_class}"
-    return f"external_evidence_unavailable:{status}"
+    if failure_class is None:
+        return f"external_evidence_unavailable:{status}"
+    return "web_research_result_missing_or_malformed"
+
+
+def _is_incomplete_claimed_success(web_research: Any, reason: str | None) -> bool:
+    """Reject a malformed `ok` result instead of downgrading its missing evidence."""
+    return (
+        isinstance(web_research, dict)
+        and web_research.get("status") == "ok"
+        and reason == "web_research_result_missing_or_malformed"
+    )
 
 
 def _validate_repository_decision(value: Any) -> tuple[str, str | None]:
@@ -62,6 +82,8 @@ def _validate_repository_decision(value: Any) -> tuple[str, str | None]:
 def _validate_claim_roles(value: Any) -> list[str]:
     if not isinstance(value, list):
         raise ValueError("critical_external_claims must be an array")
+    if not value:
+        raise ValueError("critical_external_claims must not be empty")
     roles: list[str] = []
     for claim in value:
         if not isinstance(claim, dict):
@@ -100,7 +122,8 @@ def route_web_research_result(input_data: dict[str, Any]) -> dict[str, Any]:
     except ValueError as exc:
         return _invalid_input_result(str(exc))
 
-    unavailable_reason = _transport_reason(input_data.get("web_research"))
+    web_research = input_data.get("web_research")
+    unavailable_reason = _transport_reason(web_research)
     if unavailable_reason is None:
         return {
             "schema": SCHEMA,
@@ -111,6 +134,9 @@ def route_web_research_result(input_data: dict[str, Any]) -> dict[str, Any]:
             "reason_codes": [],
             "unresolved_risks": [],
         }
+
+    if _is_incomplete_claimed_success(web_research, unavailable_reason):
+        return _invalid_input_result(unavailable_reason)
 
     repository_independent = repository_status == REPOSITORY_DECISION_DETERMINED
     all_non_dispositive = all(role == ROLE_NON_DISPOSITIVE for role in roles)

@@ -35,6 +35,10 @@ disposition が repository-owned evidence だけで決定済みかを
 `determined` は空でない `disposition` を必要とする。これは external claim の
 真偽を推測するための代替ではない。
 
+`critical_external_claims` は空にできず、planner が出力した各 claim に role が
+必要である。空配列や role 欠落は「すべて non-dispositive」と解釈せず、入力契約
+不成立として fail-closed にする。
+
 `critical_external_claims[].role` は decision dependency を表す。
 
 - `dispositive`: claim が Outcome / disposition / In Scope / AC / VC / safety
@@ -48,8 +52,13 @@ requested disposition を独立に決定することを明示的に確認した�
 
 ## Routing rules（ルーティング規則）
 
-- `status: ok` → Step 2 へ進む（`verification_route` の値は informational であり
-  routing の gate 条件にしない）
+- `status: ok` は `failure_class: null`、非空の `verification_route`、`claims`、
+  `unresolved_risks` を含む完全な consumer result の場合だけ Step 2 へ進む。
+  `verification_route` の具体的な値（`grounded_research` / `native_web` /
+  producer 側が将来追加する未知の成功 route）は informational であり、
+  allowlist による厳密照合の gate 条件にしない。`status: ok` でもこれらの
+  フィールドが欠ける結果は、成功証拠として採用せず
+  `environment_failure` / `human_judgment_required` にする。
 - `failed` / `inconclusive` / `insufficient_context`、grounding/citation/provider
   provenance が materialize できない結果、空・malformed result は、semantic
   disagreement ではなく evidence acquisition の `transport_status:
