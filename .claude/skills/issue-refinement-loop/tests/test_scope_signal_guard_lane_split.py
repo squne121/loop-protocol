@@ -271,7 +271,7 @@ class TestAnchorApprovalRouting:
             "comment_id": 5248407236,
             "comment_url": "https://github.com/squne121/loop-protocol/issues/2055#issuecomment-5248407236",
             "issue_url": "https://github.com/squne121/loop-protocol/issues/2055",
-            "body_sha256": "sha256:trusted-directive",
+            "body_sha256": "sha256:" + "c" * 64,
             "author_login": "squne121",
             "author_type": "User",
             "author_association": "OWNER",
@@ -292,6 +292,31 @@ class TestAnchorApprovalRouting:
         }
         assert authority["route"]["action"] == "contract_update_required"
         assert authority["contract_patch_plan"]["schema_version"] == "CONTRACT_PATCH_PLAN_V1"
+
+    @pytest.mark.parametrize(
+        "falsy_evidence",
+        [{}, None, [], ""],
+        ids=["empty_dict", "none", "empty_list", "empty_string"],
+    )
+    def test_given_present_but_falsy_scope_delta_authority_evidence_when_raw_delta_has_no_signal_then_route_does_not_fall_to_not_triggered(
+        self, planner_module, falsy_evidence
+    ):
+        """PR #2083 review fix (P1-2) regression: evidence *presence* (not its
+        value truthiness) must trigger the scope_delta_authority lane. Before
+        the fix, `triggered=bool(_raw_triggered or known_context.get(...))`
+        collapsed to False for a present-but-falsy evidence payload combined
+        with a no-op raw delta, letting classify_scope_delta_authority land on
+        route.action == "not_triggered" (fail-open) instead of validating
+        (and rejecting) the malformed evidence.
+        """
+        input_data = _base_input(2055, _delta_input("- `docs/foo.md`", "- `docs/foo.md`"))
+        input_data["known_context"]["scope_delta_authority_evidence"] = falsy_evidence
+
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+
+        assert exit_code == 0
+        authority = plan["scope_signal_guard_decision_v2"]["scope_delta_authority"]
+        assert authority["route"]["action"] != "not_triggered"
 
 
 class TestScopeDeltaDecisionAdapter:

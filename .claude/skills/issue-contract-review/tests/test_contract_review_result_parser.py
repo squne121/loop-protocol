@@ -658,6 +658,115 @@ class TestParseContractReviewResults:
         assert [result["comment_id"] for result in results] == [1002]
         assert results[0]["is_trusted_author"] is True
 
+    def test_sibling_decoy_fingerprint_key_is_not_authoritative(self, monkeypatch):
+        """PR #2083 review fix (P1-1): a same-named key on an unrelated sibling
+        top-level mapping must never be mistaken for
+        CONTRACT_REVIEW_RESULT_V1.expected_contract_fingerprint. The
+        canonical scalar must be bound to the exact node path, not merely
+        present anywhere in the raw YAML block."""
+        fingerprint = dict(_VALID_FINGERPRINT)
+        decoy_payload = json.dumps(fingerprint)
+        body = (
+            "```yaml\n"
+            "DECOY:\n"
+            f"  expected_contract_fingerprint: '{decoy_payload}'\n"
+            "CONTRACT_REVIEW_RESULT_V1:\n"
+            "  status: go\n"
+            '  generated_at: "2026-06-13T08:00:00Z"\n'
+            "  generated_by: issue-contract-review\n"
+            f"  issue_url: {_ISSUE_URL}\n"
+            f"  body_sha256: {fingerprint['contract_body_sha256']}\n"
+            "  expected_contract_fingerprint: " + json.dumps(fingerprint) + "\n"
+            "```\n"
+        )
+        comment = {
+            "id": 1001,
+            "html_url": f"{_ISSUE_URL}#issuecomment-1001",
+            "created_at": "2026-06-13T08:00:00Z",
+            "body": body,
+        }
+
+        assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
+
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
+
+    def test_block_scalar_decoy_text_is_not_authoritative(self, monkeypatch):
+        """PR #2083 review fix (P1-1): a coincidental 2-space canonical-looking
+        line inside an unrelated block scalar's literal text must not be
+        mistaken for CONTRACT_REVIEW_RESULT_V1.expected_contract_fingerprint."""
+        fingerprint = dict(_VALID_FINGERPRINT)
+        decoy_payload = json.dumps(fingerprint)
+        body = (
+            "```yaml\n"
+            "notes: |\n"
+            f"  expected_contract_fingerprint: '{decoy_payload}'\n"
+            "CONTRACT_REVIEW_RESULT_V1:\n"
+            "  status: go\n"
+            '  generated_at: "2026-06-13T08:00:00Z"\n'
+            "  generated_by: issue-contract-review\n"
+            f"  issue_url: {_ISSUE_URL}\n"
+            f"  body_sha256: {fingerprint['contract_body_sha256']}\n"
+            "  expected_contract_fingerprint: " + json.dumps(fingerprint) + "\n"
+            "```\n"
+        )
+        comment = {
+            "id": 1001,
+            "html_url": f"{_ISSUE_URL}#issuecomment-1001",
+            "created_at": "2026-06-13T08:00:00Z",
+            "body": body,
+        }
+
+        assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
+
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
+
+    def test_duplicate_fingerprint_key_is_not_authoritative(self, monkeypatch):
+        """PR #2083 review fix (P1-1): a duplicated
+        expected_contract_fingerprint key under CONTRACT_REVIEW_RESULT_V1
+        makes the authoritative value ambiguous and must fail closed for
+        both the PyYAML compose() path and the fallback state machine."""
+        fingerprint = dict(_VALID_FINGERPRINT)
+        canonical_scalar = "  expected_contract_fingerprint: '" + json.dumps(fingerprint) + "'\n"
+        comment = _make_go_comment(comment_id=1001)
+        comment["body"] = comment["body"].replace(
+            f"  issue_url: {_ISSUE_URL}",
+            "\n".join(
+                [
+                    f"  issue_url: {_ISSUE_URL}",
+                    f"  body_sha256: {fingerprint['contract_body_sha256']}",
+                ]
+            ),
+        )
+        comment["body"] = comment["body"].replace("```\n", canonical_scalar + canonical_scalar + "```\n", 1)
+
+        assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
+
+        original_import = builtins.__import__
+
+        def reject_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_yaml)
+        assert parse_contract_review_results([comment], expected_issue_url=_ISSUE_URL) == []
+
     def test_human_judgment_status_not_valid(self):
         """
         Comments with status: human_judgment are NOT valid CONTRACT_REVIEW_RESULT_V1.

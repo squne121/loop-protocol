@@ -2645,7 +2645,16 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                     # A no-op delta must not suppress the separate freeform
                     # authority lane: the classifier validates its evidence
                     # and remains fail-closed for untrusted or ambiguous input.
-                    triggered=bool(_raw_triggered or known_context.get("scope_delta_authority_evidence")),
+                    # PR #2083 review fix (P1-2): the outer `if` above already
+                    # confirmed "scope_delta_authority_evidence" in known_context,
+                    # i.e. evidence *presence*, not its value truthiness, is what
+                    # triggers this lane. Gating on `known_context.get(...)`'s
+                    # truthiness made a present-but-falsy evidence payload
+                    # ({}, [], "", None) combined with a no-op raw delta silently
+                    # fall to triggered=False -> not_triggered/implementation_allowed
+                    # (fail-open), diverging from the iteration-zero branch below,
+                    # which always uses triggered=True once presence is confirmed.
+                    triggered=True,
                     target_issue_number=issue_number,
                     base_issue_body_sha256=issue_body_sha256,
                     expected_repo=_expected_repo_for_issue(issue, known_context),
