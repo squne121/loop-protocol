@@ -696,23 +696,24 @@ def _ac3_fixture(anchor_url: str) -> dict:
             "html_url": anchor_url,
             "url": f"https://api.github.com/repos/{REPO}/issues/comments/5249734344",
         }],
-        "known_context": {"human_context_comment_urls": [anchor_url], "agent_report_comment_urls": []},
     }
 
 
 def test_fixture_human_context_real_subprocess_reaches_contract_update_required_ac3(tmp_path: Path):
     """AC3/AC4: real local assets reach the unique positive route without gh.
 
-    A temporary HOME contains a canary in the executor's already-trusted
-    `$HOME/.local/bin` location.  It is not placed on PATH and production
-    executable trust is untouched; any accidental gh invocation writes the
-    sentinel and makes this test fail.
+    A temporary HOME contains a canary in the executor-effective PATH first
+    entry.  The fixture itself contains no ``known_context`` injection; the
+    real child must derive human authority from its CLI URL.  Production
+    executable trust remains untouched; any accidental gh invocation writes
+    the sentinel and makes this test fail.
     """
     repo = _ac3_real_asset_repo(tmp_path)
-    fixture_rel = "fixtures/ac3.json"
-    evidence_rel = "fixtures/evidence.json"
+    artifact_rel = f".claude/artifacts/issue-refinement-loop/{ISSUE}"
+    fixture_rel = f"{artifact_rel}/fixtures/ac3.json"
+    evidence_rel = f"{artifact_rel}/evidence.json"
     anchor_url = URL
-    (repo / "fixtures").mkdir()
+    (repo / artifact_rel / "fixtures").mkdir(parents=True)
     (repo / fixture_rel).write_text(json.dumps(_ac3_fixture(anchor_url)), encoding="utf-8")
     (repo / evidence_rel).write_text(json.dumps([{
         "comment_id": 5249734344, "comment_url": anchor_url,
@@ -720,6 +721,7 @@ def test_fixture_human_context_real_subprocess_reaches_contract_update_required_
         "source_kind": "generated_by_agent",
         "path_literals": ["docs/dev/workflow.md", ".claude/skills/impl-review-loop/SKILL.md"],
     }]), encoding="utf-8")
+    assert "known_context" not in _ac3_fixture(anchor_url)
     home = tmp_path / "empty-home"
     canary = home / ".local" / "bin" / "gh"
     sentinel = tmp_path / "gh-invoked"
@@ -740,6 +742,20 @@ def test_fixture_human_context_real_subprocess_reaches_contract_update_required_
         "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(tmp_path),
     })
     (home / "empty-gh-config").mkdir(parents=True)
+    env_probe = subprocess.run(
+        [
+                sys.executable,
+                "-c",
+                "import json,sys;sys.path.insert(0,'scripts/agent-guards');"
+                "import skill_runtime_exec as e;"
+                "print(json.dumps(e._sanitize_env('.', 'preflight.run.fixture.with_human_context')))"
+        ],
+        cwd=repo, env=env, check=True, capture_output=True, text=True, timeout=30,
+    )
+    effective_env = json.loads(env_probe.stdout)
+    assert effective_env["PATH"].split(os.pathsep)[0] == str(canary.parent)
+    assert shutil.which("gh", path=effective_env["PATH"]) == str(canary)
+    assert effective_env["GH_CONFIG_DIR"] == str(home / "empty-gh-config")
     subprocess.run(
         [str(canary.parent / "uv"), "run", "python3", "--version"],
         cwd=repo, env=env, check=True, capture_output=True, text=True, timeout=120,
@@ -771,6 +787,10 @@ def test_fixture_human_context_real_subprocess_reaches_contract_update_required_
     route = provenance["runtime_evidence"]["route"]
     assert route["action"] == "contract_update_required", provenance
     assert route["implementation_allowed"] is False, provenance
+    planner_input = json.loads((
+        repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE) / "planner_input.json"
+    ).read_text(encoding="utf-8"))
+    assert planner_input["known_context"]["human_context_comment_urls"] == [anchor_url]
     assert not sentinel.exists(), "fixture success must not hide a gh invocation"
 
 
@@ -778,9 +798,10 @@ def test_fixture_human_context_sibling_rejects_cross_lane_and_binding_inputs_bef
     """AC5: sibling admission never broadens production or unlabelled lanes."""
     repo = _ac3_real_asset_repo(tmp_path)
     anchor_url = URL
-    fixture_rel = "fixtures/ac3.json"
-    transport_rel = "fixtures/transport.json"
-    (repo / "fixtures").mkdir()
+    artifact_rel = f".claude/artifacts/issue-refinement-loop/{ISSUE}"
+    fixture_rel = f"{artifact_rel}/fixtures/ac3.json"
+    transport_rel = f"{artifact_rel}/transport.json"
+    (repo / artifact_rel / "fixtures").mkdir(parents=True)
     (repo / fixture_rel).write_text("{}", encoding="utf-8")
     (repo / transport_rel).write_text("{}", encoding="utf-8")
     home = tmp_path / "empty-home"
@@ -807,6 +828,20 @@ def test_fixture_human_context_sibling_rejects_cross_lane_and_binding_inputs_bef
         [*base[:7], "other/repo", *base[8:]],
         [*base[:5], "2085", *base[6:]],
         [token for token in base if token != "--anchor-comment-url" and token != anchor_url],
+        [*base, "--fixture", fixture_rel],
+        [
+            *base[:8], "--fixture", fixture_rel, "--repo", REPO,
+            *base[10:],
+        ],
+        [
+            "--fixture=" + fixture_rel if token == "--fixture" else token
+            for token in base
+        ],
+        [
+            "--command-id=" + _AC3_COMMAND_ID if token == "--command-id" else token
+            for token in base
+        ],
+        [token for token in base if token != transport_rel],
         [
             sys.executable, "scripts/agent-guards/skill_runtime_exec.py",
             "--command-id", "preflight.run.with_human_context", "--issue-number", str(ISSUE),
@@ -822,16 +857,20 @@ def test_fixture_human_context_sibling_rejects_cross_lane_and_binding_inputs_bef
     for argv in rejected:
         result = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=True, timeout=30, check=False)
         assert result.returncode == 2, (argv, result.stdout, result.stderr)
-    assert not (repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE)).exists()
+    assert not (
+        repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE)
+        / "refinement_preflight_result_v1.json"
+    ).exists()
 
 
 def test_fixture_human_context_sibling_fails_closed_on_transport_anchor_mismatch(tmp_path: Path):
     """AC5: a valid-shape transport for another anchor cannot clear scope."""
     repo = _ac3_real_asset_repo(tmp_path)
-    fixture_rel = "fixtures/ac3.json"
+    artifact_rel = f".claude/artifacts/issue-refinement-loop/{ISSUE}"
+    fixture_rel = f"{artifact_rel}/fixtures/ac3.json"
     anchor_url = URL
     wrong_anchor = f"https://github.com/{REPO}/issues/{ISSUE}#issuecomment-9999999999"
-    (repo / "fixtures").mkdir()
+    (repo / artifact_rel / "fixtures").mkdir(parents=True)
     (repo / fixture_rel).write_text(json.dumps(_ac3_fixture(anchor_url)), encoding="utf-8")
     head_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True

@@ -798,7 +798,7 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     return resolved if name == "python3" else real
 
 
-def _sanitize_env(project_root: str) -> dict[str, str]:
+def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
     allowed_keys = {
         "GH_HOST",
         "GH_TOKEN",
@@ -816,6 +816,11 @@ def _sanitize_env(project_root: str) -> dict[str, str]:
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",
     }
+    # Only the closed offline fixture sibling may receive its isolated gh
+    # configuration directory.  Production command environments retain their
+    # existing allowlist and PATH/trusted-executable behavior.
+    if command_id == "preflight.run.fixture.with_human_context":
+        allowed_keys.add("GH_CONFIG_DIR")
     env = {
         key: value
         for key, value in os.environ.items()
@@ -1898,6 +1903,7 @@ def _emit_timeout_failure(
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         description="Privileged exact skill runtime executor", allow_abbrev=False
     )
@@ -1929,7 +1935,21 @@ def main(argv: list[str] | None = None) -> int:
     # reachable through this executor before this fix_delta).
     parser.add_argument("--authority-transport-path", required=False, default=None)
     parser.add_argument("--authority-expected", action="store_true", default=False)
-    args = parser.parse_args(argv)
+    # Argparse accepts duplicate options and keeps the final value.  Reject
+    # the raw outer grammar first so a malformed invocation can never be
+    # normalized into a valid child command.
+    sibling_id = "preflight.run.fixture.with_human_context"
+    if sibling_id in raw_argv or f"--command-id={sibling_id}" in raw_argv:
+        raw_command = " ".join(
+            ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL, *raw_argv]
+        )
+        if not is_exact_skill_runtime_anchor_fixture_executor_command(
+            raw_command, resolve_project_root(), resolve_project_root()
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+
+    args = parser.parse_args(raw_argv)
 
     project_root = resolve_project_root()
     stale_entries = _normalize_and_validate_runtime_env(project_root)
@@ -1978,10 +1998,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     if is_fixture_human_context_command:
-        if not args.fixture or not args.anchor_comment_url or not args.investigation_evidence_transport_path:
+        if not args.fixture or not args.anchor_comment_url:
             print(
-                "skill_runtime_exec: --fixture, --anchor-comment-url, and "
-                "--investigation-evidence-transport-path are required for "
+                "skill_runtime_exec: --fixture and --anchor-comment-url are required for "
                 "preflight.run.fixture.with_human_context",
                 file=sys.stderr,
             )
@@ -1989,17 +2008,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.loop_state_file or args.review_result_verdict or args.max_iterations:
             print("skill_runtime_exec: loop flags are not allowed for fixture human context", file=sys.stderr)
             return 2
-        command_text = " ".join(
-            [
-                "uv", "run", "python3", SKILL_RUNTIME_EXEC_REL,
-                "--command-id", args.command_id,
-                "--issue-number", str(args.issue_number),
-                "--repo", args.repo,
-                "--fixture", args.fixture,
-                "--anchor-comment-url", args.anchor_comment_url,
-                "--investigation-evidence-transport-path", args.investigation_evidence_transport_path,
-            ]
-        )
+        command_tokens = [
+            "uv", "run", "python3", SKILL_RUNTIME_EXEC_REL,
+            "--command-id", args.command_id,
+            "--issue-number", str(args.issue_number),
+            "--repo", args.repo,
+            "--fixture", args.fixture,
+            "--anchor-comment-url", args.anchor_comment_url,
+        ]
+        if args.investigation_evidence_transport_path:
+            command_tokens.extend([
+                "--investigation-evidence-transport-path",
+                args.investigation_evidence_transport_path,
+            ])
+        command_text = " ".join(command_tokens)
         if not is_exact_skill_runtime_anchor_fixture_executor_command(
             command_text, project_root, project_root
         ):
@@ -2453,7 +2475,7 @@ def main(argv: list[str] | None = None) -> int:
     supervision = _run_child_with_supervision(
         child_argv,
         cwd=project_root,
-        env=_sanitize_env(project_root),
+        env=_sanitize_env(project_root, args.command_id),
         timeout_seconds=timeout_seconds,
     )
     if supervision.timed_out:

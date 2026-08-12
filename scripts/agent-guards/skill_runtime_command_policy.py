@@ -571,6 +571,28 @@ def _is_safe_repo_relative_fixture_path(fixture: str, root: str) -> bool:
     return common == root
 
 
+def _is_safe_issue_artifact_path(path: str, root: str, issue_number: str) -> bool:
+    """Require #2136 sibling inputs to stay under their bound artifact root.
+
+    This intentionally supplements, rather than changes, the generic fixture
+    profile's repository-relative confinement.  Both the target issue number
+    and every symlink-resolved component are bound before a child can start.
+    """
+    if not _is_safe_repo_relative_fixture_path(path, root):
+        return False
+    prefix = f".claude/artifacts/issue-refinement-loop/{issue_number}/"
+    if not path.replace("\\", "/").startswith(prefix):
+        return False
+    artifact_root = os.path.realpath(os.path.join(root, prefix))
+    try:
+        if os.path.commonpath([root, artifact_root]) != root:
+            return False
+        resolved = os.path.realpath(os.path.join(root, path))
+        return os.path.commonpath([artifact_root, resolved]) == artifact_root
+    except ValueError:
+        return False
+
+
 def parse_exact_skill_runtime_fixture_command(
     command: str, project_root: str | None = None
 ) -> ExactSkillRuntimeCommand | None:
@@ -679,16 +701,16 @@ def parse_exact_skill_runtime_anchor_fixture_command(
         tokens = shlex.split(command, posix=True)
     except ValueError:
         return None
-    expected_flags = [
-        "--command-id", "--issue-number", "--repo", "--fixture",
-        "--anchor-comment-url", "--investigation-evidence-transport-path",
-    ]
-    expected_positions = [4, 6, 8, 10, 12, 14]
-    if len(tokens) != 16 or tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+    required_flags = ["--command-id", "--issue-number", "--repo", "--fixture", "--anchor-comment-url"]
+    required_positions = [4, 6, 8, 10, 12]
+    if len(tokens) not in {14, 16} or tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
         return None
-    if any(tokens[pos] != flag for flag, pos in zip(expected_flags, expected_positions)):
+    if any(tokens[pos] != flag for flag, pos in zip(required_flags, required_positions)):
         return None
-    if any(token.startswith(f"{flag}=") for token in tokens for flag in expected_flags):
+    if len(tokens) == 16 and tokens[14] != "--investigation-evidence-transport-path":
+        return None
+    all_flags = [*required_flags, "--investigation-evidence-transport-path"]
+    if any(token.startswith(f"{flag}=") for token in tokens for flag in all_flags):
         return None
     if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
         return None
@@ -697,16 +719,17 @@ def parse_exact_skill_runtime_anchor_fixture_command(
     ):
         return None
     command_id, issue_number, repo = tokens[5], tokens[7], tokens[9]
-    fixture, anchor_comment_url, transport_path = tokens[11], tokens[13], tokens[15]
+    fixture, anchor_comment_url = tokens[11], tokens[13]
+    transport_path = tokens[15] if len(tokens) == 16 else None
     if command_id != "preflight.run.fixture.with_human_context":
         return None
     if not issue_number.isdigit() or int(issue_number) <= 0 or repo != TRUSTED_REPO_SLUG:
         return None
     if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
         return None
-    if not _is_safe_repo_relative_fixture_path(fixture, root):
+    if not _is_safe_issue_artifact_path(fixture, root, issue_number):
         return None
-    if not _is_safe_repo_relative_fixture_path(transport_path, root):
+    if transport_path is not None and not _is_safe_issue_artifact_path(transport_path, root, issue_number):
         return None
     match = _GH_ISSUE_COMMENT_URL_RE.fullmatch(anchor_comment_url)
     if match is None or f"{match.group('owner')}/{match.group('repo')}" != repo:
@@ -1776,7 +1799,7 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "fixture": {"type": "repo_relative_file", "required": True},
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         "investigation_evidence_transport_path": {
-            "type": "repo_relative_file", "required": True,
+            "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
         },
     },
     "preflight.run.with_anchor": {

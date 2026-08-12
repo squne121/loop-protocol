@@ -196,7 +196,13 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "repo": {"type": "owner_repo", "required": True},
             "fixture": {"type": "repo_relative_file", "required": True},
             "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
-            "investigation_evidence_transport_path": {"type": "repo_relative_file", "required": True},
+            # The transport is a closed optional flag/value pair.  The
+            # test-only sibling must retain both the transport-present and
+            # transport-absent command grammars; policy/executor reject every
+            # partial, duplicate, reordered, equals, or unknown variant.
+            "investigation_evidence_transport_path": {
+                "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
+            },
         },
     },
     # An anchor URL is not an origin assertion.  The unlabelled profile is

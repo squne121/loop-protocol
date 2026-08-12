@@ -39,7 +39,7 @@ def _valid_fixture_human_context_command() -> str:
         "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
         "--command-id preflight.run.fixture.with_human_context "
         "--issue-number 2084 --repo squne121/loop-protocol "
-        "--fixture fixtures/ac3.json "
+        "--fixture .claude/artifacts/issue-refinement-loop/2084/fixtures/ac3.json "
         "--anchor-comment-url https://github.com/squne121/loop-protocol/issues/2084#issuecomment-5249734344 "
         "--investigation-evidence-transport-path "
         ".claude/artifacts/issue-refinement-loop/2084/authority-transport/ac3/authority_transport_v1.json"
@@ -56,28 +56,52 @@ def test_fixture_human_context_sibling_has_exact_local_only_policy() -> None:
 
 def test_fixture_human_context_exact_parser_rejects_security_matrix() -> None:
     valid = _valid_fixture_human_context_command()
+    fixture_path = ".claude/artifacts/issue-refinement-loop/2084/fixtures/ac3.json"
+    wrong_fixture_path = ".claude/artifacts/issue-refinement-loop/2085/fixtures/ac3.json"
     assert policy.parse_exact_skill_runtime_anchor_fixture_command(valid, str(REPO_ROOT)) is not None
     malformed = (
-        valid.replace("fixtures/ac3.json", "/tmp/ac3.json"),
-        valid.replace("fixtures/ac3.json", "../ac3.json"),
-        valid.replace("fixtures/ac3.json", "-fixture.json"),
-        valid.replace("fixtures/ac3.json", "fixture\n.json"),
-        valid.replace("--fixture fixtures/ac3.json ", ""),
+        valid.replace(fixture_path, "/tmp/ac3.json"),
+        valid.replace(fixture_path, "../ac3.json"),
+        valid.replace(fixture_path, "-fixture.json"),
+        valid.replace(fixture_path, "fixture\n.json"),
+        valid.replace(fixture_path, wrong_fixture_path),
+        valid.replace(f"--fixture {fixture_path} ", ""),
         valid.replace(
-            "--fixture fixtures/ac3.json",
-            "--fixture fixtures/ac3.json --fixture fixtures/again.json",
+            f"--fixture {fixture_path}",
+            f"--fixture {fixture_path} --fixture {fixture_path}",
         ),
         valid.replace(
-            "--fixture fixtures/ac3.json --anchor-comment-url",
-            "--anchor-comment-url --fixture fixtures/ac3.json",
+            f"--fixture {fixture_path} --anchor-comment-url",
+            f"--anchor-comment-url --fixture {fixture_path}",
         ),
-        valid.replace("--fixture fixtures/ac3.json", "--fixture=fixtures/ac3.json"),
+        valid.replace(f"--fixture {fixture_path}", f"--fixture={fixture_path}"),
         valid + " --unknown extra",
         valid.replace("squne121/loop-protocol", "other/repo", 1),
         valid.replace("--issue-number 2084", "--issue-number 2085"),
     )
     for command in malformed:
         assert policy.parse_exact_skill_runtime_anchor_fixture_command(command, str(REPO_ROOT)) is None
+    assert policy.parse_exact_skill_runtime_anchor_fixture_command(
+        valid.replace(
+            " --investigation-evidence-transport-path "
+            ".claude/artifacts/issue-refinement-loop/2084/authority-transport/ac3/authority_transport_v1.json",
+            "",
+        ),
+        str(REPO_ROOT),
+    ) is not None
+
+
+def test_fixture_human_context_parser_rejects_symlink_escape(tmp_path: Path) -> None:
+    issue_root = tmp_path / ".claude/artifacts/issue-refinement-loop/2084"
+    issue_root.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    (issue_root / "fixture.json").symlink_to(outside)
+    command = _valid_fixture_human_context_command().replace(
+        ".claude/artifacts/issue-refinement-loop/2084/fixtures/ac3.json",
+        ".claude/artifacts/issue-refinement-loop/2084/fixture.json",
+    )
+    assert policy.parse_exact_skill_runtime_anchor_fixture_command(command, str(tmp_path)) is None
 
 
 # ---------------------------------------------------------------------------

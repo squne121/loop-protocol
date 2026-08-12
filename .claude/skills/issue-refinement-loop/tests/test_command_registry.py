@@ -324,16 +324,29 @@ class TestRegistryEntrySpecs:
         assert reg.render_command(command_id, {
             "issue_number": 2084,
             "repo": "squne121/loop-protocol",
-            "fixture": "fixtures/ac3.json",
+            "fixture": ".claude/artifacts/issue-refinement-loop/2084/fixtures/ac3.json",
             "anchor_comment_url": "https://github.com/squne121/loop-protocol/issues/2084#issuecomment-1",
-            "investigation_evidence_transport_path": "fixtures/transport.json",
+            "investigation_evidence_transport_path": ".claude/artifacts/issue-refinement-loop/2084/transport.json",
         })[-6:] == [
             "--anchor-comment-url",
             "https://github.com/squne121/loop-protocol/issues/2084#issuecomment-1",
             "--human-context-comment-url",
             "https://github.com/squne121/loop-protocol/issues/2084#issuecomment-1",
             "--investigation-evidence-transport-path",
-            "fixtures/transport.json",
+            ".claude/artifacts/issue-refinement-loop/2084/transport.json",
+        ]
+        assert reg.render_command(command_id, {
+            "issue_number": 2084,
+            "repo": "squne121/loop-protocol",
+            "fixture": ".claude/artifacts/issue-refinement-loop/2084/fixtures/ac3.json",
+            "anchor_comment_url": "https://github.com/squne121/loop-protocol/issues/2084#issuecomment-1",
+        })[-6:] == [
+            "--fixture",
+            ".claude/artifacts/issue-refinement-loop/2084/fixtures/ac3.json",
+            "--anchor-comment-url",
+            "https://github.com/squne121/loop-protocol/issues/2084#issuecomment-1",
+            "--human-context-comment-url",
+            "https://github.com/squne121/loop-protocol/issues/2084#issuecomment-1",
         ]
 
     def test_pnpm_typecheck_entry(self):
