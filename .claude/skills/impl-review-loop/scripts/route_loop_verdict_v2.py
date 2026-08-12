@@ -740,3 +740,81 @@ def route_loop_verdict_v2(
         f"mergeable={mergeable}, merge_state_status={merge_state_status} did not "
         f"match any known routing branch.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2102 fix_delta iteration 5, Blocker B: caller-side convenience
+# wrapper for the git-conflict-detection oracle.
+# ---------------------------------------------------------------------------
+#
+# route_loop_verdict_v2() above stays pure / side-effect-free (module
+# docstring Design Invariant: no gh, git, network, or subprocess calls at
+# module load or function call). It therefore continues to accept
+# main_drift["semantic_ambiguity"] as a caller-supplied boolean when
+# present, exactly as before this Issue.
+#
+# scripts/agent-ops/pr_head_replay_publish_exec.py is the implementation
+# loop's existing subprocess-capable Allowed Paths exact file: this wrapper
+# imports its compute_semantic_ambiguity() (a thin public export of the same
+# git merge-tree --write-tree oracle _merge_tree_conflicts() already uses for
+# the publish executor's own conflict check) rather than adding a new file
+# or granting route_loop_verdict_v2.py subprocess authority of its own.
+#
+# This is option (a) from the Issue #2102 fix_delta iteration 5 contract:
+# the router's own pure API is unchanged; a sibling function in the same
+# Allowed Paths exact file supplies the missing fact for callers that did
+# not already resolve it deterministically upstream (e.g. via
+# build_step5_live_mergeability(), which still accepts a caller-supplied
+# main_drift["semantic_ambiguity"] when the caller already computed it).
+def route_loop_verdict_v2_resolve_semantic_ambiguity(
+    reviewer_verdict: Mapping[str, Any],
+    live_mergeability: Mapping[str, Any],
+    *,
+    cwd: Any,
+) -> RouteDecision:
+    """Resolve main_drift["semantic_ambiguity"] via the real Git
+    merge-tree oracle before dispatching to the pure route_loop_verdict_v2().
+
+    If ``live_mergeability["main_drift"]`` is absent, malformed, or already
+    carries an explicit ``semantic_ambiguity`` boolean, this delegates to
+    ``route_loop_verdict_v2()`` unchanged (byte-identical routing to a
+    direct call). Only when main_drift is a well-formed mapping supplying
+    ``current_base_sha``/``evidence_base_sha`` but omitting
+    ``semantic_ambiguity`` does this wrapper perform the one Git subprocess
+    call (``git merge-tree --write-tree``, via
+    pr_head_replay_publish_exec.compute_semantic_ambiguity()) needed to fill
+    it in deterministically, never accepting a caller-asserted boolean as a
+    substitute.
+    """
+    main_drift = live_mergeability.get("main_drift") if isinstance(live_mergeability, Mapping) else None
+    if (
+        isinstance(main_drift, Mapping)
+        and "semantic_ambiguity" not in main_drift
+        and isinstance(main_drift.get("current_base_sha"), str)
+        and isinstance(main_drift.get("evidence_base_sha"), str)
+        and main_drift["current_base_sha"] != main_drift["evidence_base_sha"]
+    ):
+        import sys as _sys_for_semantic_ambiguity_import
+        from pathlib import Path as _Path_for_semantic_ambiguity_import
+
+        _agent_ops_dir = _Path_for_semantic_ambiguity_import(__file__).resolve().parents[4] / "scripts" / "agent-ops"
+        if str(_agent_ops_dir) not in _sys_for_semantic_ambiguity_import.path:
+            _sys_for_semantic_ambiguity_import.path.insert(0, str(_agent_ops_dir))
+        try:
+            from pr_head_replay_publish_exec import compute_semantic_ambiguity as _compute_semantic_ambiguity
+        except ImportError:
+            _compute_semantic_ambiguity = None
+
+        if _compute_semantic_ambiguity is not None:
+            resolved_ambiguity = _compute_semantic_ambiguity(
+                main_drift["evidence_base_sha"],
+                main_drift["current_base_sha"],
+                cwd=cwd,
+            )
+            live_mergeability = dict(live_mergeability)
+            live_mergeability["main_drift"] = {
+                **main_drift,
+                "semantic_ambiguity": bool(resolved_ambiguity),
+            }
+
+    return route_loop_verdict_v2(reviewer_verdict, live_mergeability)

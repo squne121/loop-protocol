@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,7 +13,10 @@ from route_loop_verdict_v2 import (  # noqa: E402
     ROUTE_SCOPE_CLEAN_RECONCILIATION,
     build_step5_live_mergeability,
     route_loop_verdict_v2,
+    route_loop_verdict_v2_resolve_semantic_ambiguity,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
@@ -234,3 +238,121 @@ def test_given_negative_drift_rebind_attempts_when_routed_then_context_invalid()
 
     assert decision.route == ROUTE_FAIL_CLOSED
     assert decision.reason_code == "main_drift_context_invalid"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2102 fix_delta iteration 5, Blocker B: real-subprocess integration
+# tests proving route_loop_verdict_v2_resolve_semantic_ambiguity() actually
+# invokes scripts/agent-ops/pr_head_replay_publish_exec.py's git merge-tree
+# oracle -- never a caller-asserted boolean -- end-to-end in a real git repo.
+# ---------------------------------------------------------------------------
+
+def _git(args: list[str], cwd: Path) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _init_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init", "-q"], repo)
+    _git(["config", "user.email", "t@example.com"], repo)
+    _git(["config", "user.name", "T"], repo)
+    (repo / "f.txt").write_text("base\n")
+    _git(["add", "."], repo)
+    _git(["commit", "-q", "-m", "base"], repo)
+    return repo
+
+
+def _rev_parse(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_given_real_conflicting_git_state_when_wrapper_resolves_ambiguity_then_it_hard_stops(tmp_path):
+    """A genuine two-sided edit of the SAME file (real git merge-tree
+    conflict, not an asserted flag) must resolve semantic_ambiguity=True via
+    the real oracle and hard_stop -- proving route_loop_verdict_v2.py's
+    convenience wrapper actually reaches
+    pr_head_replay_publish_exec.compute_semantic_ambiguity() in production,
+    not merely at unit-test granularity."""
+    repo = _init_repo(tmp_path)
+    original_branch = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    _git(["checkout", "-q", "-b", "branch-edit"], repo)
+    (repo / "f.txt").write_text("branch edit\n")
+    _git(["add", "f.txt"], repo)
+    _git(["commit", "-q", "-m", "branch edit"], repo)
+    candidate_sha = _rev_parse(repo)
+
+    _git(["checkout", "-q", original_branch], repo)
+    (repo / "f.txt").write_text("main edit\n")
+    _git(["add", "f.txt"], repo)
+    _git(["commit", "-q", "-m", "main edit"], repo)
+    current_sha = _rev_parse(repo)
+
+    live_mergeability = _live(
+        "CLEAN",
+        _drift(
+            current_base_sha=current_sha,
+            evidence_base_sha=candidate_sha,
+            allowed_paths_snapshot_base_sha=current_sha,
+            latest_main_net_diff=["f.txt"],
+            allowed_paths=["f.txt"],
+            expected_old_sha=current_sha,
+            observed_old_sha=current_sha,
+        ),
+    )
+    decision = route_loop_verdict_v2_resolve_semantic_ambiguity(_verdict(), live_mergeability, cwd=repo)
+
+    assert decision.route == ROUTE_FAIL_CLOSED
+    assert decision.reason_code == "semantic_ambiguity"
+    assert decision.selected_action is None
+
+
+def test_given_real_nonconflicting_git_state_when_wrapper_resolves_ambiguity_then_reconciliation_proceeds(tmp_path):
+    """A genuine non-conflicting net-new commit must resolve
+    semantic_ambiguity=False via the real oracle and route to scope-clean
+    reconciliation instead of hard-stopping."""
+    repo = _init_repo(tmp_path)
+    evidence_sha = _rev_parse(repo)
+
+    (repo / "other.txt").write_text("net-new\n")
+    _git(["add", "other.txt"], repo)
+    _git(["commit", "-q", "-m", "advance"], repo)
+    current_sha = _rev_parse(repo)
+
+    live_mergeability = _live(
+        "CLEAN",
+        _drift(
+            current_base_sha=current_sha,
+            evidence_base_sha=evidence_sha,
+            allowed_paths_snapshot_base_sha=current_sha,
+            latest_main_net_diff=["other.txt"],
+            allowed_paths=["other.txt", "f.txt"],
+            expected_old_sha=current_sha,
+            observed_old_sha=current_sha,
+        ),
+    )
+    decision = route_loop_verdict_v2_resolve_semantic_ambiguity(_verdict(), live_mergeability, cwd=repo)
+
+    assert decision.route == ROUTE_SCOPE_CLEAN_RECONCILIATION
+    assert decision.reason_code == "main_drift_scope_clean"
+
+
+def test_given_explicit_semantic_ambiguity_when_wrapper_called_then_no_subprocess_needed(tmp_path):
+    """When the caller already supplied semantic_ambiguity explicitly, the
+    wrapper must not perform any additional git probe -- it delegates
+    byte-identically to route_loop_verdict_v2(). A nonexistent cwd path
+    proves no subprocess was attempted."""
+    nonexistent_cwd = tmp_path / "does-not-exist"
+
+    direct = route_loop_verdict_v2(_verdict(), _live("BEHIND", _drift(semantic_ambiguity=False)))
+    wrapped = route_loop_verdict_v2_resolve_semantic_ambiguity(
+        _verdict(), _live("BEHIND", _drift(semantic_ambiguity=False)), cwd=nonexistent_cwd
+    )
+
+    assert wrapped.route == direct.route
+    assert wrapped.selected_action == direct.selected_action

@@ -579,6 +579,16 @@ producer/consumer の対応関係を確認するための参照である。
   --write-tree` による deterministic conflict 判定、`current_base_sha..candidate_head` の
   `candidate_final_net_diff` に対する Allowed Paths 再判定を追加で行う（main drift
   reconciliation 経路。未指定時は従来の source-range replay のみの挙動を維持する）。
+- `scripts/agent-ops/pr_head_replay_publish_exec.py::compute_semantic_ambiguity()`
+  （Issue #2102 fix_delta iteration 5, Blocker B）: `_merge_tree_conflicts()` の public
+  export。`.claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py` の
+  `route_loop_verdict_v2_resolve_semantic_ambiguity()` wrapper がこれを import し、
+  `main_drift["semantic_ambiguity"]` が未指定のときだけ呼び出して `route_loop_verdict_v2()`
+  （引き続き subprocess を呼ばない pure 関数）へ委譲する。両ファイルとも Issue #2102 の
+  Allowed Paths exact file であり、新規ファイル追加なしでこの production import 経路を実現する。
+  ただし `execute()`（publish 実行部分）自体の production caller は本 Issue の Allowed Paths
+  内に自然な統合点が確認できず、pre-existing gap のまま残っている（Blocker C；後続 Issue の
+  対象）。
 
 ## Cross References（相互参照）
 

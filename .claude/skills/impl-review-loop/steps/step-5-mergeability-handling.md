@@ -82,7 +82,9 @@ MERGE_TREE_EXIT=$?
 
 この呼び出しは `git merge-tree --write-tree` の 2-ref 形式であり、作業ツリー・index を変更しない。control-plane はこの exit code をそのまま `main_drift_facts.semantic_ambiguity` へ写し、上書きしない。
 
-**適用範囲の明示（Safety Claim の正確化）**: この検査は `pr_head_replay_publish_exec.py` の opt-in `main_drift_reconciliation` 経路だけでなく、この Step 5 BEHIND fast path を含む **通常の main drift routing 全体で MUST** とする。ただし本 fix_delta（iteration 2）時点では、上記 bash 呼び出しを実際に実行し `main_drift_facts.semantic_ambiguity` へ機械的に配線する production コードパス（`route_loop_verdict_v2.py` の呼び出し元）はまだ存在せず、この節は control-plane が Step 5 実行のたびに満たすべき手順契約として明記するに留まる。この production wiring は本 PR のテスト境界（`route_loop_verdict_v2.py` は caller-supplied boolean をそのまま消費する既存契約を変更しない）を超えるため、別途 follow-up として扱う必要がある。
+**適用範囲の明示（Safety Claim の正確化）**: この検査は `pr_head_replay_publish_exec.py` の opt-in `main_drift_reconciliation` 経路だけでなく、この Step 5 BEHIND fast path を含む **通常の main drift routing 全体で MUST** とする。
+
+**production wiring の現況（Issue #2102 fix_delta iteration 5, Blocker B 解消）**: 上記 bash 呼び出しを手動で実行し `main_drift_facts.semantic_ambiguity` を組み立てる従来手順に加えて、`route_loop_verdict_v2.py` は `route_loop_verdict_v2_resolve_semantic_ambiguity(reviewer_verdict, live_mergeability, cwd=...)` という薄い convenience wrapper を公開する。この wrapper は `main_drift["semantic_ambiguity"]` が明示的に渡されていない場合にのみ、Allowed Paths の姉妹 exact file である `scripts/agent-ops/pr_head_replay_publish_exec.py::compute_semantic_ambiguity()`（`_merge_tree_conflicts()` の public export、同じ `git merge-tree --write-tree` oracle）を呼び出して補完してから `route_loop_verdict_v2()` 本体へ委譲する。`route_loop_verdict_v2()` 自体は module docstring の Design Invariant どおり subprocess を呼ばない pure 関数のまま変更していない -- purity の緩和はこの wrapper 1 箇所に限定する（Issue #2102 の contract が許容する option (a)）。control-plane はどちらの経路（手動 bash 配線、または wrapper 呼び出し）を使ってもよいが、`semantic_ambiguity` を caller が推測・固定値で渡すことは引き続き禁止する。
 
 ```python
 from route_loop_verdict_v2 import build_step5_live_mergeability, route_loop_verdict_v2
@@ -96,6 +98,29 @@ live_mergeability = build_step5_live_mergeability(
     main_drift_facts,
 )
 decision = route_loop_verdict_v2(reviewer_verdict, live_mergeability)
+```
+
+`main_drift_facts["semantic_ambiguity"]` を control-plane がまだ算出していない場合は、
+`route_loop_verdict_v2()` の代わりに `route_loop_verdict_v2_resolve_semantic_ambiguity()`
+を呼んで実 git oracle による補完を委譲できる:
+
+```python
+from route_loop_verdict_v2 import (
+    build_step5_live_mergeability,
+    route_loop_verdict_v2_resolve_semantic_ambiguity,
+)
+
+live_mergeability = build_step5_live_mergeability(
+    {
+        "head_sha": live_pr["headRefOid"],
+        "mergeable": live_pr["mergeable"],
+        "merge_state_status": live_pr["mergeStateStatus"],
+    },
+    {k: v for k, v in main_drift_facts.items() if k != "semantic_ambiguity"},
+)
+decision = route_loop_verdict_v2_resolve_semantic_ambiguity(
+    reviewer_verdict, live_mergeability, cwd=repo_root
+)
 ```
 
 この注入は reviewer verdict dispatch より前に router が評価する。実 conflict

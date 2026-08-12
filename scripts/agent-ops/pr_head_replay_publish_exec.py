@@ -156,6 +156,27 @@ def _merge_tree_conflicts(runner: Runner, root: Path, base_sha: str, candidate_s
     return proc.returncode != 0
 
 
+def compute_semantic_ambiguity(
+    base_sha: str,
+    candidate_sha: str,
+    *,
+    cwd: Path,
+    runner: Runner = _run,
+) -> bool:
+    """Public export of the deterministic real-conflict oracle (Issue #2102
+    fix_delta iteration 5, Blocker B).
+
+    ``route_loop_verdict_v2.py`` (a pure, side-effect-free module by design;
+    see its module docstring) has no subprocess authority of its own, so it
+    cannot compute ``semantic_ambiguity`` itself. This is the exact-file
+    Allowed Paths counterpart that CAN: it wraps ``_merge_tree_conflicts()``
+    (unchanged) as a stable public entry point a caller-side wrapper in
+    ``route_loop_verdict_v2.py`` imports, rather than duplicating the
+    ``git merge-tree --write-tree`` probe.
+    """
+    return _merge_tree_conflicts(runner, cwd, base_sha, candidate_sha)
+
+
 def execute(
     *,
     repo: str,
