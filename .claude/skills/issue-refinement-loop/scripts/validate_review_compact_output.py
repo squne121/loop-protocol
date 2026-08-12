@@ -582,7 +582,7 @@ def validate_review_compact_output(
             "validation_status": "invalid",
             "envelope_kind": "unknown",
             "normalized_payload": None,
-            "violations": [_violation("empty_input")],
+            "violations": [_violation("empty_input", classification="reviewer_transport_failure")],
             "next_action": "human_judgment_required",
             "artifact_path_policy": {"status": "not_applicable", "path": None},
         }

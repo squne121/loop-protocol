@@ -2649,6 +2649,18 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                     target_issue_number=issue_number,
                     base_issue_body_sha256=issue_body_sha256,
                     expected_repo=_expected_repo_for_issue(issue, known_context),
+                    # #2086 AC3: forward the caller's read-only-investigation
+                    # exact-path inventory (run_refinement_preflight.py /
+                    # codebase-investigator-backed orchestrator step) through
+                    # known_context so a trusted operator-selected
+                    # architecture/workflow-level directive without an exact
+                    # backtick path literal can still clear the
+                    # expands_allowed_paths boundary. Absent from
+                    # known_context in the ordinary case (None is a no-op for
+                    # classify_scope_delta_authority).
+                    investigation_derived_path_literals=known_context.get(
+                        "investigation_derived_path_literals"
+                    ),
                 )
         elif classify_scope_delta_authority is not None and known_context and (
             "scope_delta_authority_evidence" in known_context
@@ -2671,6 +2683,11 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                     target_issue_number=issue_number,
                     base_issue_body_sha256=issue_body_sha256,
                     expected_repo=_expected_repo_for_issue(issue, known_context),
+                    # #2086 AC3: see the iteration-N call site above for why
+                    # this is forwarded through known_context.
+                    investigation_derived_path_literals=known_context.get(
+                        "investigation_derived_path_literals"
+                    ),
                 ),
             }
 

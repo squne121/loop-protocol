@@ -217,7 +217,13 @@ web-researcher が critical claim にエビデンスを示せず、ハルシネ�
 
 ### Step 2: レビュー (Review)
 
-`issue-reviewer` SubAgent が `review-issue` を実行し、`ISSUE_REVIEW_RESULT_COMPACT_V1` を返す。
+**producer I/O は root-owned、compact envelope 生成も含め単一 producer（Issue #2049、PR #2135 human REQUEST_CHANGES iteration-3 P0-1）**: live body fetch・body SHA 固定・`check_issue_contract` / `contract_readiness_check` / merge_readiness の実行・`ISSUE_REVIEW_RESULT_COMPACT_V1` compact envelope の生成・full artifact / compact artifact の canonical artifact directory への保存は、すべて orchestrator（main thread）が
+`.claude/skills/issue-refinement-loop/scripts/run_root_review_pipeline.py produce --issue-number <N> --repo <owner/repo>`
+（`root_review_pipeline.produce`, command_registry.py 登録済み）を実行して行う。`produce` の JSON 出力には `compact_result.stdout_lines`（既に render・永続化済みの `ISSUE_REVIEW_RESULT_COMPACT_V1` 9 行）が含まれる。`issue-reviewer` SubAgent（`.codex/agents/issue-reviewer.toml`, `default_permissions: loop-protocol-readonly`）は orchestrator からこの `compact_result.stdout_lines` を明示的な read-only input として受け取り、そのまま自身の最終出力として relay するだけで、`compact_review_result.py` を含む一切のスクリプトを自ら実行しない（body fetch・temp file・artifact 保存などの producer I/O を一切行わない）。
+
+これは Issue #2049 の当初実装（root-owned pipeline は checker/readiness/merge artifact のみを persist し、compact envelope 生成は child agent に残されていた）に対する iteration-3 の修正であり、child agent が `compact_review_result.py` を実行すれば read-only 契約違反（同スクリプトの CLI は stdout 出力の直前に success artifact を必ず生成する）、実行しなければ従来の OUTPUT_CONTRACT 違反、という矛盾を閉じる。ステップ単位の所有権表は `.claude/skills/review-issue/SKILL.md` の「Producer I/O ownership」節を参照する。
+
+**child stdout が 0 byte または malformed（非空だが不正）のときの扱い（AC4/AC5/AC6、PR #2135 iteration-3 P0-2）**: orchestrator は `issue-reviewer` の raw stdout が 0 byte のまま返った場合でも、必ず `validate_review_compact_output.py` を呼ぶ（呼ばずに再試行やスキップをしない）。バリデータは `empty_input` violation に `classification: reviewer_transport_failure` を付与する。この classification を受けた場合、orchestrator は root producer（`issue-reviewer` SubAgent 呼び出し）を一度だけ再実行する。再実行後も `empty_input` / `reviewer_transport_failure` のままであれば、それ以上再試行せず `NEXT_ACTION: human_judgment_required` として Step 5 (human_escalation) へ倒す（`run_root_review_pipeline.retry_once_on_transport_failure()` が同じ一度だけ再試行のセマンティクスを実装する。この関数の `classify_child_stdout()` は `validate_review_compact_output.validate_review_compact_output()` を直接呼ぶ単一の実行経路であり、非空だが malformed な stdout も同じ `reviewer_transport_failure` として一度だけ再試行される — 別の簡易 classifier を持たない）。
 
 消費側契約 (consumer contract): `ISSUE_REVIEW_RESULT_COMPACT_V1`（正本 (SSOT): `.claude/skills/issue-refinement-loop/scripts/compact_review_result.py`）
 
@@ -298,6 +304,8 @@ exit_code_3:
 
 - `STATUS: ok` / `BODY_HASH: <sha256>` → 更新成功、`NEXT_ACTION: proceed` で Step 2 に戻る
 - `STATUS: no_change` → 変更なし、`NEXT_ACTION: proceed` で Step 2 に戻る
+
+**final review gate（Issue #2049 AC10）**: `STATUS: ok` / `BODY_HASH` readback により本文更新が確認できた場合にのみ Step 2 の "final review"（この body revision に対する terminal VERDICT を決める review pass）を実行する。readback が未確認、または `run_root_review_pipeline.py readback` が `verdict_identity: false` を返す（persisted artifact が regular file でない / symlink である / strict JSON でない / `body_sha256` が一致しない / `verdict` が一致しない、のいずれか）間は final review を実行しない。`run_root_review_pipeline.py gate-final-review --artifact-path <path> --expected-body-sha256 <sha> --expected-verdict <verdict> --remote-update-ok` が `final_review_allowed: true` を返した場合にのみ次段階（Step 4.5）へ進める。
 - `STATUS: failed` → 修正失敗、`NEXT_ACTION: human_judgment_required`、Step 5 human_escalation へ
 - `partial_failure` は廃止。issue-editor は `ok` / `no_change` / `failed` の 3 値のみを返す。
 - full mutation result は `ARTIFACT:` パスから取得する（main context には返らない）
@@ -307,6 +315,8 @@ rewrite ループの反復ごとに、checker 実行後に `scripts/decide_rewri
 **#2048 regression（承認済み scope reframe が empty operations[] のケース、Scope Delta で production reachability を修正）**: 承認済み trusted anchor scope reframe（`scope_delta_status: approved_by_trusted_anchor` かつ `allowed_path_deltas` 非空）から派生した `CONTRACT_PATCH_PLAN_V1.operations[]` が空の場合、`decide_rewrite_route.py` の `decide_scope_reframe_contract_route()` が `contract_update` ではなく `issue_editor_required`（reason_code: `approved_scope_requires_full_contract_rewrite`）へ route する。
 
 唯一の production 呼び出し元は `run_refinement_preflight.py::consume_trusted_anchor_contract_patch_plan()`（`contract_update.run.with_human_context` の `--consume-contract-patch-plan` 実行がこの関数を呼ぶ）である。この consumer 境界が `known_context["scope_delta_decision"]`（`_classify_anchor_scope_reframe()` が生成する trusted anchor 分類結果）を fail-closed に再検証（型・binding・anchor 一致）した上で `allowed_path_deltas` を抽出し、`scope_signal_delta.run_trusted_anchor_iteration_zero()` の `allowed_path_deltas` / `already_reflected_in_body` 引数へ実際に渡す。`operations[]` の producer が存在しない場合（freeform directive に exact path literal がなく `classify_scope_delta_authority()` が human_escalation へ倒れる場合等）は、`consume_trusted_anchor_contract_patch_plan()` の呼び出し元が empty-operations の `CONTRACT_PATCH_PLAN_V1` を合成し consumer へ渡す。
+
+**#2086 AC3**: `expands_allowed_paths` boundary が理由で `human_escalation` に倒れた operator-selected human-context directive（trusted OWNER/MEMBER/COLLABORATOR、`with_human_context` lane）に対しては、mutation を行わない前に `codebase-investigator` SubAgent（read-only）へ委譲し、directive が意味論的に指す exact repository-relative path を current main から導出する。導出できた場合は `classify_scope_delta_authority()` の `investigation_derived_path_literals` キーワード引数へ渡して再判定する（`references/anchor-comment-handling.md` の「Operator-Selected Human-Context 継続」参照）。導出できない場合、または導出結果でも `contract_patch_plan.operations` が空のままの場合は、上記の `NEXT_ACTION: issue_editor_required` full-rewrite lane へ進む。人間へ手書き `ANCHOR_SCOPE_REFRAME_V1` の再入力を要求してはならない。
 
 empty operations は無条件に `issue_editor_required` を意味しない。承認済み `allowed_path_deltas` が現在の Issue 本文の `## Allowed Paths` セクションに既に全て反映済みの場合は `proven_no_change`（通常の `no_change` no-op、rewrite_route は付与されない）として扱われる。型不正（`operations` が list でない等）や binding 不一致（`anchor_comment_url` / `anchor_comment_hash` が今回の呼び出しと一致しない）は fail-closed に `None` 扱いとなり、同様に `issue_editor_required` へは昇格しない。
 
