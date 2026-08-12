@@ -3529,6 +3529,44 @@ jobs:
           path: ci_verdict_summary_v2_binding_artifacts/
           if-no-files-found: error
           retention-days: 30
+      - name: Generate ci_verdict_summary_v2 artifact
+        # P0: needs.result is synthetic and carries neither a CheckRun id nor
+        # a per-check head SHA. Read commit-scoped GitHub CheckRun evidence
+        # for this exact workflow run before generating a merge-ready artifact.
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${PR_HEAD_SHA}/check-runs?per_page=100" \
+            > ci_verdict_summary_v2_check_runs.json
+          test -s ci_verdict_summary_v2_check_runs.json
+          mkdir -p ci_verdict_summary_v2_artifacts
+          uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
+            --expected-head-sha "$PR_HEAD_SHA" \
+            --pr-head-sha "$PR_HEAD_SHA" \
+            --repository "${{ github.repository }}" \
+            --workflow-run-id "${{ github.run_id }}" \
+            --workflow-run-attempt "${{ github.run_attempt }}" \
+            --event-name "${{ github.event_name }}" \
+            --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
+            --artifact-id "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-id }}" \
+            --artifact-url "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-url }}" \
+            --artifact-digest "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-digest }}" \
+            --artifact-name "ci-verdict-summary-v2-binding-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --artifact-workflow-run-id "${{ github.run_id }}" \
+            --artifact-workflow-run-attempt "${{ github.run_attempt }}" \
+            --output ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
+      - name: Upload ci-verdict-summary-v2 artifact
+        id: upload-ci-verdict-summary-v2
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-verdict-summary-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci_verdict_summary_v2_artifacts/
+          if-no-files-found: error
+          retention-days: 30
       # Issue #2119 AC9(b) (PR #2137 human review issuecomment-5273090534 P0
       # fix): gate-ready latency is the wall-clock time from workflow-run
       # start until the required stable `e2e` aggregate check itself
@@ -3605,44 +3643,6 @@ jobs:
         with:
           name: ci-runtime-baseline-e2e-gate-ready-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/ci_runtime_baseline_v1_e2e.json
-          if-no-files-found: error
-          retention-days: 30
-      - name: Generate ci_verdict_summary_v2 artifact
-        # P0: needs.result is synthetic and carries neither a CheckRun id nor
-        # a per-check head SHA. Read commit-scoped GitHub CheckRun evidence
-        # for this exact workflow run before generating a merge-ready artifact.
-        env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
-          gh api \
-            "repos/${GITHUB_REPOSITORY}/commits/${PR_HEAD_SHA}/check-runs?per_page=100" \
-            > ci_verdict_summary_v2_check_runs.json
-          test -s ci_verdict_summary_v2_check_runs.json
-          mkdir -p ci_verdict_summary_v2_artifacts
-          uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
-            --expected-head-sha "$PR_HEAD_SHA" \
-            --pr-head-sha "$PR_HEAD_SHA" \
-            --repository "${{ github.repository }}" \
-            --workflow-run-id "${{ github.run_id }}" \
-            --workflow-run-attempt "${{ github.run_attempt }}" \
-            --event-name "${{ github.event_name }}" \
-            --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
-            --artifact-id "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-id }}" \
-            --artifact-url "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-url }}" \
-            --artifact-digest "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-digest }}" \
-            --artifact-name "ci-verdict-summary-v2-binding-${{ github.run_id }}-${{ github.run_attempt }}" \
-            --artifact-workflow-run-id "${{ github.run_id }}" \
-            --artifact-workflow-run-attempt "${{ github.run_attempt }}" \
-            --output ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
-      - name: Upload ci-verdict-summary-v2 artifact
-        id: upload-ci-verdict-summary-v2
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: ci-verdict-summary-v2-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci_verdict_summary_v2_artifacts/
           if-no-files-found: error
           retention-days: 30
       - name: Download codex-execpolicy sentinel artifact (AC9)
