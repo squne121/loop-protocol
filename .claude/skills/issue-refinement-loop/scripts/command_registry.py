@@ -657,8 +657,16 @@ REGISTRY: dict[str, dict[str, Any]] = {
     # review step. Fetches + pins the live Issue body exactly once, runs
     # check_issue_contract.py / contract_readiness_check.py / merge_readiness,
     # and persists the merged review result to the canonical artifact
-    # directory. The read-only `issue-reviewer` custom agent
-    # (.codex/agents/issue-reviewer.toml) never performs this I/O itself.
+    # directory. PR #2135 human REQUEST_CHANGES iteration-3 P0-1: this
+    # command is now ALSO the sole producer of the ISSUE_REVIEW_RESULT_COMPACT_V1
+    # compact envelope (see `produce_compact_result()` /
+    # `compact_result.stdout_lines` in the stdout JSON) -- the read-only
+    # `issue-reviewer` custom agent (.codex/agents/issue-reviewer.toml) never
+    # invokes compact_review_result.py or performs any producer I/O itself;
+    # it only relays `compact_result.stdout_lines` verbatim. This is a
+    # deliberate, narrow exception to #1875's minimal-harness direction
+    # (see run_root_review_pipeline.py's module docstring "Architecture
+    # delta relative to #1875" for the full rationale/consumer inventory).
     "root_review_pipeline.produce": {
         "id": "root_review_pipeline.produce",
         "argv": [
