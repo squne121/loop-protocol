@@ -164,6 +164,41 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "fixture": {"type": "repo_relative_file", "required": True},
         },
     },
+    # Issue #2136: test-only sibling profile for the real offline E2E.  It
+    # deliberately combines the fixture and human-context contracts without
+    # widening either production profile.
+    "preflight.run.fixture.with_human_context": {
+        "id": "preflight.run.fixture.with_human_context",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--fixture", "{fixture}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
+            "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_skill_runtime_anchor_fixture",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "local_only",
+        "stdin_contract": "none",
+        "stdout_contract": "refinement_preflight_result/v1",
+        "timeout_seconds": 120,
+        "mutation": False,
+        "test_only": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "fixture": {"type": "repo_relative_file", "required": True},
+            "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+            "investigation_evidence_transport_path": {"type": "repo_relative_file", "required": True},
+        },
+    },
     # An anchor URL is not an origin assertion.  The unlabelled profile is
     # intentionally read-only and resolves to generated/unknown provenance.
     "preflight.run.with_anchor": {

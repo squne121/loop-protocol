@@ -27,6 +27,7 @@ from skill_runtime_command_policy import (
     command_allows_root_no_worktree,
     current_branch,
     is_exact_skill_runtime_anchor_executor_command,
+    is_exact_skill_runtime_anchor_fixture_executor_command,
     is_exact_skill_runtime_authority_transport_consume_executor_command,
     is_exact_skill_runtime_authority_transport_produce_executor_command,
     is_exact_skill_runtime_contract_update_anchor_executor_command,
@@ -1936,6 +1937,9 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_stale_runtime_failure(args.issue_number, stale_entries)
 
     is_fixture_command = args.command_id == "preflight.run.fixture"
+    is_fixture_human_context_command = (
+        args.command_id == "preflight.run.fixture.with_human_context"
+    )
     is_anchor_command = args.command_id in {
         "preflight.run.with_anchor",
         "preflight.run.with_human_context",
@@ -1973,7 +1977,35 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if is_fixture_command:
+    if is_fixture_human_context_command:
+        if not args.fixture or not args.anchor_comment_url or not args.investigation_evidence_transport_path:
+            print(
+                "skill_runtime_exec: --fixture, --anchor-comment-url, and "
+                "--investigation-evidence-transport-path are required for "
+                "preflight.run.fixture.with_human_context",
+                file=sys.stderr,
+            )
+            return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print("skill_runtime_exec: loop flags are not allowed for fixture human context", file=sys.stderr)
+            return 2
+        command_text = " ".join(
+            [
+                "uv", "run", "python3", SKILL_RUNTIME_EXEC_REL,
+                "--command-id", args.command_id,
+                "--issue-number", str(args.issue_number),
+                "--repo", args.repo,
+                "--fixture", args.fixture,
+                "--anchor-comment-url", args.anchor_comment_url,
+                "--investigation-evidence-transport-path", args.investigation_evidence_transport_path,
+            ]
+        )
+        if not is_exact_skill_runtime_anchor_fixture_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    elif is_fixture_command:
         if not args.fixture:
             print("skill_runtime_exec: --fixture required for preflight.run.fixture", file=sys.stderr)
             return 2
@@ -2406,9 +2438,9 @@ def main(argv: list[str] | None = None) -> int:
             render_params["anchor_context_file"] = args.anchor_context_file
     else:
         render_params = {"issue_number": args.issue_number, "repo": args.repo}
-        if is_fixture_command:
+        if is_fixture_command or is_fixture_human_context_command:
             render_params["fixture"] = args.fixture
-        if is_anchor_command or is_contract_update_command:
+        if is_anchor_command or is_contract_update_command or is_fixture_human_context_command:
             render_params["anchor_comment_url"] = args.anchor_comment_url
             if args.investigation_evidence_transport_path:
                 render_params["investigation_evidence_transport_path"] = (

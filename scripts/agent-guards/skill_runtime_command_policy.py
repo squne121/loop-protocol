@@ -36,6 +36,7 @@ _PLACEHOLDER_RE = re.compile(r"^\{[A-Za-z0-9_]+\}$")
 _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE = "exact_skill_runtime_fixture"
+SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR_FIXTURE = "exact_skill_runtime_anchor_fixture"
 
 # Issue #1498: sibling exact profile for anchor-comment-scoped preflight runs.
 # `preflight.run` itself (argv / placeholders / execution_class / timeout) is
@@ -105,6 +106,15 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
         # default branch / canonical root safety boundary applies.
         "preflight.run.fixture": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "local_only",
+        },
+        "preflight.run.fixture.with_human_context": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR_FIXTURE,
             "required_cwd": "canonical_main_root",
             "required_branch": "default_branch",
             "allowed_write_roots": [
@@ -221,6 +231,7 @@ ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset(
     {
         "preflight.run",
         "preflight.run.fixture",
+        "preflight.run.fixture.with_human_context",
         "preflight.run.with_anchor",
         "preflight.run.with_human_context",
         "preflight.run.with_agent_report",
@@ -241,6 +252,15 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
     },
     "preflight.run.fixture": {
         "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE,
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "local_only",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        ],
+    },
+    "preflight.run.fixture.with_human_context": {
+        "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR_FIXTURE,
         "required_cwd": "canonical_main_root",
         "required_branch": "default_branch",
         "network_effect": "local_only",
@@ -642,6 +662,80 @@ def is_exact_skill_runtime_fixture_executor_command(
     if active_issue != parsed.issue_number or entry is None:
         return False
     return True
+
+
+def parse_exact_skill_runtime_anchor_fixture_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact parser for #2136's test-only fixture + human-context sibling.
+
+    This is intentionally separate from both the fixture and anchor parsers:
+    production profiles cannot acquire either field by this test-only route.
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    expected_flags = [
+        "--command-id", "--issue-number", "--repo", "--fixture",
+        "--anchor-comment-url", "--investigation-evidence-transport-path",
+    ]
+    expected_positions = [4, 6, 8, 10, 12, 14]
+    if len(tokens) != 16 or tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if any(tokens[pos] != flag for flag, pos in zip(expected_flags, expected_positions)):
+        return None
+    if any(token.startswith(f"{flag}=") for token in tokens for flag in expected_flags):
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    if os.path.realpath(os.path.join(root, tokens[3])) != os.path.realpath(
+        os.path.join(root, SKILL_RUNTIME_EXEC_REL)
+    ):
+        return None
+    command_id, issue_number, repo = tokens[5], tokens[7], tokens[9]
+    fixture, anchor_comment_url, transport_path = tokens[11], tokens[13], tokens[15]
+    if command_id != "preflight.run.fixture.with_human_context":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0 or repo != TRUSTED_REPO_SLUG:
+        return None
+    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+        return None
+    if not _is_safe_repo_relative_fixture_path(fixture, root):
+        return None
+    if not _is_safe_repo_relative_fixture_path(transport_path, root):
+        return None
+    match = _GH_ISSUE_COMMENT_URL_RE.fullmatch(anchor_comment_url)
+    if match is None or f"{match.group('owner')}/{match.group('repo')}" != repo:
+        return None
+    if match.group("issue") != issue_number:
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        fixture=fixture,
+        anchor_comment_url=anchor_comment_url,
+    )
+
+
+def is_exact_skill_runtime_anchor_fixture_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    parsed = parse_exact_skill_runtime_anchor_fixture_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    if current_branch(project_root, deadline) != resolve_default_branch(project_root, deadline):
+        return False
+    if resolve_repo_slug(project_root, deadline) != parsed.repo:
+        return False
+    return command_allows_root_no_worktree(parsed)
 
 
 def parse_exact_skill_runtime_decide_command(
@@ -1515,6 +1609,16 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "--fixture",
         "{fixture}",
     ],
+    "preflight.run.fixture.with_human_context": [
+        "uv", "run", "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number", "{issue_number}",
+        "--repo", "{repo}",
+        "--fixture", "{fixture}",
+        "--anchor-comment-url", "{anchor_comment_url}",
+        "--human-context-comment-url", "{anchor_comment_url}",
+        "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
+    ],
     "preflight.run.with_anchor": [
         "uv",
         "run",
@@ -1665,6 +1769,15 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "issue_number": {"type": "positive_int", "required": True},
         "repo": {"type": "owner_repo", "required": True},
         "fixture": {"type": "repo_relative_file", "required": True},
+    },
+    "preflight.run.fixture.with_human_context": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "fixture": {"type": "repo_relative_file", "required": True},
+        "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+        "investigation_evidence_transport_path": {
+            "type": "repo_relative_file", "required": True,
+        },
     },
     "preflight.run.with_anchor": {
         "issue_number": {"type": "positive_int", "required": True},

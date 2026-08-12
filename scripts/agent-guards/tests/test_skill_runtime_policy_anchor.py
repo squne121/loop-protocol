@@ -34,6 +34,52 @@ sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-guards"))
 import skill_runtime_command_policy as policy  # noqa: E402
 
 
+def _valid_fixture_human_context_command() -> str:
+    return (
+        "uv run python3 scripts/agent-guards/skill_runtime_exec.py "
+        "--command-id preflight.run.fixture.with_human_context "
+        "--issue-number 2084 --repo squne121/loop-protocol "
+        "--fixture fixtures/ac3.json "
+        "--anchor-comment-url https://github.com/squne121/loop-protocol/issues/2084#issuecomment-5249734344 "
+        "--investigation-evidence-transport-path "
+        ".claude/artifacts/issue-refinement-loop/2084/authority-transport/ac3/authority_transport_v1.json"
+    )
+
+
+def test_fixture_human_context_sibling_has_exact_local_only_policy() -> None:
+    command_id = _valid_fixture_human_context_command().split()[5]
+    entry = policy.SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"][command_id]
+    assert entry["execution_class"] == policy.SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR_FIXTURE
+    assert entry["network_effect"] == "local_only"
+    assert _valid_fixture_human_context_command().split()[5] in policy.ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS
+
+
+def test_fixture_human_context_exact_parser_rejects_security_matrix() -> None:
+    valid = _valid_fixture_human_context_command()
+    assert policy.parse_exact_skill_runtime_anchor_fixture_command(valid, str(REPO_ROOT)) is not None
+    malformed = (
+        valid.replace("fixtures/ac3.json", "/tmp/ac3.json"),
+        valid.replace("fixtures/ac3.json", "../ac3.json"),
+        valid.replace("fixtures/ac3.json", "-fixture.json"),
+        valid.replace("fixtures/ac3.json", "fixture\n.json"),
+        valid.replace("--fixture fixtures/ac3.json ", ""),
+        valid.replace(
+            "--fixture fixtures/ac3.json",
+            "--fixture fixtures/ac3.json --fixture fixtures/again.json",
+        ),
+        valid.replace(
+            "--fixture fixtures/ac3.json --anchor-comment-url",
+            "--anchor-comment-url --fixture fixtures/ac3.json",
+        ),
+        valid.replace("--fixture fixtures/ac3.json", "--fixture=fixtures/ac3.json"),
+        valid + " --unknown extra",
+        valid.replace("squne121/loop-protocol", "other/repo", 1),
+        valid.replace("--issue-number 2084", "--issue-number 2085"),
+    )
+    for command in malformed:
+        assert policy.parse_exact_skill_runtime_anchor_fixture_command(command, str(REPO_ROOT)) is None
+
+
 # ---------------------------------------------------------------------------
 # Pure unit tests: parse_exact_skill_runtime_decide_command malformed-shape
 # matrix (AC10). None of these should ever require a subprocess.

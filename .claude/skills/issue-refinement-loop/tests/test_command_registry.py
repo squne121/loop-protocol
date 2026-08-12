@@ -313,6 +313,29 @@ class TestRegistryEntrySpecs:
     def test_uv_pytest_entry(self):
         self._assert_entry_complete("uv.pytest")
 
+    def test_fixture_human_context_sibling_has_fixed_exact_argv(self):
+        command_id = "preflight.run.fixture.with_human_context"
+        self._assert_entry_complete(command_id)
+        entry = reg.REGISTRY[command_id]
+        assert entry["test_only"] is True
+        assert entry["mutation"] is False
+        assert entry["network_effect"] == "local_only"
+        assert entry["execution_class"] == "exact_skill_runtime_anchor_fixture"
+        assert reg.render_command(command_id, {
+            "issue_number": 2084,
+            "repo": "squne121/loop-protocol",
+            "fixture": "fixtures/ac3.json",
+            "anchor_comment_url": "https://github.com/squne121/loop-protocol/issues/2084#issuecomment-1",
+            "investigation_evidence_transport_path": "fixtures/transport.json",
+        })[-6:] == [
+            "--anchor-comment-url",
+            "https://github.com/squne121/loop-protocol/issues/2084#issuecomment-1",
+            "--human-context-comment-url",
+            "https://github.com/squne121/loop-protocol/issues/2084#issuecomment-1",
+            "--investigation-evidence-transport-path",
+            "fixtures/transport.json",
+        ]
+
     def test_pnpm_typecheck_entry(self):
         self._assert_entry_complete("pnpm.typecheck")
 
