@@ -9,6 +9,7 @@ Covers AC1, AC2, AC3, AC5, AC6, AC8.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -669,88 +670,234 @@ class TestAuthorityTransportConsumeRealSubprocessReachesRealLane:
 
 
 # ---------------------------------------------------------------------------
-# Fresh review blocker P0-B: decide.run / authority_transport.produce /
-# authority_transport.consume must actually pass through
-# skill_runtime_exec.py's privileged executor as a REAL subprocess -- not
-# merely dict-membership / execution_class string parity in
-# skill_runtime_command_policy.py.
+# Fresh review blocker P0-B (now resolved by #2086/PR #2096): decide.run /
+# authority_transport.produce / authority_transport.consume must actually
+# pass through skill_runtime_exec.py's privileged executor as a REAL
+# subprocess -- not merely dict-membership / execution_class string parity
+# in skill_runtime_command_policy.py.
 # ---------------------------------------------------------------------------
 
 
+def _crpd_git(*args: str, cwd: Path) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+
+
+def _crpd_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+def _crpd_make_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _crpd_git("init", "-q", "-b", "main", cwd=repo)
+    _crpd_git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
+    (repo / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\n")
+    (repo / "README.md").write_text("seed\n")
+    _crpd_git("add", "README.md", ".gitignore", cwd=repo)
+    _crpd_git("commit", "-q", "-m", "seed", cwd=repo)
+    return repo
+
+
+def _crpd_install_dispatch_fixture(repo_root: Path) -> None:
+    """Install the REAL (unmodified) privileged executor, policy module,
+    command_registry.py, decide_next_loop_action.py, and
+    run_refinement_preflight.py -- covering every command_id this class
+    dispatches (decide.run / authority_transport.produce /
+    authority_transport.consume), mirroring
+    scripts/agent-guards/tests/test_skill_runtime_policy_anchor.py's
+    `_install_decide_run_fixture` / `_install_authority_transport_fixture`
+    (the #2086/PR #2096 real-dispatch wiring's own regression coverage).
+    Only `scripts/agent-ops/worktree_catalog.py` remains a minimal local
+    stub -- it depends on live worktree enumeration that is out of scope
+    for this exact-command-dispatch contract test.
+    """
+    import shutil
+
+    repo_module_root = Path(__file__).resolve().parents[4]
+
+    for rel in (
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "scripts/agent-guards/skill_runtime_command_policy.py",
+        ".claude/skills/issue-refinement-loop/scripts/command_registry.py",
+        ".claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+    ):
+        _crpd_write_text(repo_root / rel, (repo_module_root / rel).read_text())
+
+    schemas_src = repo_module_root / ".claude" / "skills" / "issue-refinement-loop" / "schemas"
+    schemas_dst = repo_root / ".claude" / "skills" / "issue-refinement-loop" / "schemas"
+    schemas_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(schemas_src, schemas_dst)
+
+    _crpd_write_text(
+        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
+        """from __future__ import annotations
+
+
+class Deadline:
+    def subprocess_timeout(self, seconds: float) -> float:
+        return seconds
+
+
+def list_worktrees(project_root: str, deadline=None):
+    return []
+
+
+def select_issue_worktree(catalog, issue_number, root_realpath):
+    return {"issue_number": issue_number, "path": root_realpath}
+""",
+    )
+
+    loop_state_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / "2086"
+    loop_state_dir.mkdir(parents=True, exist_ok=True)
+    (loop_state_dir / "loop_state.json").write_text(
+        json.dumps({"iteration": 0, "max_iterations": 3})
+    )
+
+    _crpd_git("add", "-A", cwd=repo_root)
+    _crpd_git("commit", "-q", "-m", "install dispatch fixture", cwd=repo_root)
+
+
+def _crpd_run_executor(repo: Path, extra_argv: list[str]) -> subprocess.CompletedProcess[str]:
+    argv = [
+        sys.executable,
+        "scripts/agent-guards/skill_runtime_exec.py",
+        *extra_argv,
+    ]
+    return subprocess.run(
+        argv,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "CLAUDE_PROJECT_DIR": str(repo),
+            "LOOP_ISSUE_NUMBER": "2086",
+        },
+        timeout=60,
+        check=False,
+    )
+
+
 class TestAuthorityTransportPrivilegedExecutorRealSubprocessDispatch:
-    """Fresh review blocker P0-B.
+    """Fresh review blocker P0-B -- now resolved by #2086/PR #2096.
 
     This is a REAL subprocess invocation of
     scripts/agent-guards/skill_runtime_exec.py -- the actual privileged
-    executor binary, run against this worktree's own real production code
-    (LOOP_DEFAULT_BRANCH / LOOP_ISSUE_NUMBER env overrides bind it to this
-    worktree's own branch/issue so the canonical-root and active-issue-
-    worktree checks pass against a real git worktree, with no synthetic
-    fixture repo required).
+    executor binary, run against an isolated fixture git repo seeded with
+    the REAL (unmodified, copied verbatim from this repo) executor, policy
+    module, command_registry.py, decide_next_loop_action.py, and
+    run_refinement_preflight.py (mirroring
+    scripts/agent-guards/tests/test_skill_runtime_policy_anchor.py's own
+    fixture convention).
 
-    FINDING (documented, not silently worked around): skill_runtime_exec.py
-    main()'s command dispatch has exactly three shapes -- fixture,
-    anchor/contract_update, and the plain 10-token preflight.run shape.
+    PRIOR FINDING (documented in the git history of this file, resolved by
+    #2086/PR #2096): skill_runtime_exec.py main()'s command dispatch used to
+    have exactly three shapes -- fixture, anchor/contract_update, and the
+    plain 10-token preflight.run shape -- and
     skill_runtime_command_policy.py's parse_exact_skill_runtime_command()
-    only accepts the plain 10-token shape when the command_id's declared
-    execution_class equals SKILL_RUNTIME_EXECUTION_CLASS (preflight.run's
-    class) -- decide.run / authority_transport.produce /
-    authority_transport.consume declare distinct execution classes, so this
-    parser -- by explicit design (see its own docstring) -- rejects them
-    unconditionally. main() also never builds the additional render_params
-    (loop_state_file, verdict, invocation_id, git_head_sha,
-    router_receipt_path, evidence_fixture_path, contract_patch_plan_file,
-    anchor_context_file) these three command_ids' registry entries require.
+    rejected decide.run / authority_transport.produce /
+    authority_transport.consume unconditionally with exit 2 ('exact command
+    class rejected'), because those three command_ids declare distinct
+    execution classes main() never branched on.
 
-    These three command_ids are therefore NOT reachable through the
-    privileged executor's real subprocess dispatch today, despite being
-    declared "eligible" in skill_runtime_command_policy.py and registered in
-    command_registry.py. Wiring real dispatch support requires changes to
-    scripts/agent-guards/skill_runtime_exec.py (a new command-shape branch
-    and render_params derivation), which is outside Issue #2053's Allowed
-    Paths -- this is recorded as a Stop Condition scope delta for a
-    follow-up Issue, not silently patched here.
-
-    This test pins the CURRENT (real, subprocess-verified) rejection so a
-    future PR that actually wires dispatch support has a concrete
-    regression signal to update.
+    #2086/PR #2096 wired a dedicated command-shape branch and render_params
+    derivation for all three command_ids in
+    scripts/agent-guards/skill_runtime_exec.py, and added the matching
+    exact-match parsers (`is_exact_skill_runtime_decide_executor_command`,
+    `is_exact_skill_runtime_authority_transport_produce_executor_command`,
+    `is_exact_skill_runtime_authority_transport_consume_executor_command`)
+    in skill_runtime_command_policy.py. This test now pins the CURRENT
+    (real, subprocess-verified) dispatch success for all three command_ids
+    -- decide.run reaches decide_next_loop_action.py's real
+    `STATUS:`/`NEXT_ACTION:` stdout contract, authority_transport.produce
+    reaches run_refinement_preflight.py's real
+    `--produce-authority-transport` manifest generation (`status: ok`), and
+    authority_transport.consume reaches run_refinement_preflight.py's real
+    `--consume-authority-transport` fail-closed handling for a nonexistent
+    router receipt (`status: environment_failure`,
+    `reason_code: missing_file`) -- proving genuine dispatch rather than a
+    pre-dispatch rejection.
     """
 
-    @pytest.mark.parametrize(
-        "command_id",
-        ["decide.run", "authority_transport.produce", "authority_transport.consume"],
-    )
-    def test_privileged_executor_rejects_command_id_today(self, command_id):
-        skill_root = Path(__file__).resolve().parent.parent
-        repo_root = skill_root.parent.parent.parent
+    def test_decide_run_dispatches_to_real_subprocess(self, tmp_path):
+        repo = _crpd_make_repo(tmp_path)
+        _crpd_install_dispatch_fixture(repo)
 
-        # No LOOP_DEFAULT_BRANCH / LOOP_ISSUE_NUMBER overrides are needed:
-        # skill_runtime_command_policy.py's parse_exact_skill_runtime_command()
-        # rejects these three command_ids purely on execution_class mismatch,
-        # entirely BEFORE any cwd/branch/active-issue-worktree check runs --
-        # so this rejection is reached identically whether this repo checkout
-        # is on a real branch (local dev worktree) or in detached HEAD (CI's
-        # pull_request merge-ref checkout).
-        result = subprocess.run(
+        result = _crpd_run_executor(
+            repo,
             [
-                sys.executable,
-                str(repo_root / "scripts" / "agent-guards" / "skill_runtime_exec.py"),
-                "--command-id", command_id,
-                "--issue-number", "2053",
+                "--command-id", "decide.run",
+                "--issue-number", "2086",
                 "--repo", "squne121/loop-protocol",
+                "--loop-state-file",
+                ".claude/artifacts/issue-refinement-loop/2086/loop_state.json",
+                "--review-result-verdict", "needs-fix",
+                "--max-iterations", "3",
             ],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            timeout=30,
         )
-        assert result.returncode == 2, (
-            f"{command_id}: expected the privileged executor's real subprocess "
-            f"to reject with exit 2 ('exact command class rejected') today -- "
-            f"got exit {result.returncode}, stdout={result.stdout!r}, "
-            f"stderr={result.stderr!r}. If this now succeeds, the P0-B Stop "
-            f"Condition scope delta has been resolved and this pinned "
-            f"regression test must be updated to assert real dispatch success."
-        )
-        assert "exact command class rejected" in result.stderr
+        assert "exact command class rejected" not in result.stderr, result.stderr
+        assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+        stdout_lines = result.stdout.strip().splitlines()
+        assert "STATUS: pass" in stdout_lines, result.stdout
+        assert "NEXT_ACTION: continue_to_step_4" in stdout_lines, result.stdout
 
+    def test_authority_transport_produce_dispatches_to_real_subprocess(self, tmp_path):
+        repo = _crpd_make_repo(tmp_path)
+        _crpd_install_dispatch_fixture(repo)
+
+        evidence_fixture = repo / "evidence.json"
+        evidence_fixture.write_text(json.dumps({"source_kind": "generated_by_agent"}))
+
+        result = _crpd_run_executor(
+            repo,
+            [
+                "--command-id", "authority_transport.produce",
+                "--issue-number", "2086",
+                "--repo", "squne121/loop-protocol",
+                "--invocation-id", "test-invocation-1",
+                "--git-head-sha", "0123456789abcdef0123456789abcdef01234567",
+                "--evidence-fixture-path", "evidence.json",
+            ],
+        )
+        assert "exact command class rejected" not in result.stderr, result.stderr
+        assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+        payload = json.loads(result.stdout)
+        assert payload["status"] == "ok", payload
+        assert payload["manifest"]["invocation_id"] == "test-invocation-1"
+
+    def test_authority_transport_consume_dispatches_to_real_subprocess(self, tmp_path):
+        repo = _crpd_make_repo(tmp_path)
+        _crpd_install_dispatch_fixture(repo)
+
+        result = _crpd_run_executor(
+            repo,
+            [
+                "--command-id", "authority_transport.consume",
+                "--issue-number", "2086",
+                "--repo", "squne121/loop-protocol",
+                "--invocation-id", "test-invocation-1",
+                "--git-head-sha", "0123456789abcdef0123456789abcdef01234567",
+                "--router-receipt-path",
+                ".claude/artifacts/issue-refinement-loop/2086/authority-transport/"
+                "test-invocation-1/nonexistent_receipt.json",
+            ],
+        )
+        assert "exact command class rejected" not in result.stderr, result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["status"] == "environment_failure", payload
+        assert payload["reason_code"] == "missing_file", payload

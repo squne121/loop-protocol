@@ -526,6 +526,131 @@ def generate_authority_transport_manifest(
     return {"manifest": manifest, "manifest_path": str(manifest_path)}, None
 
 
+# #2086 P0 fix_delta (iteration 3, OWNER REQUEST_CHANGES Blocker 1/Blocker 2):
+# `investigation_derived_path_literals` (scope_signal_delta.py) was
+# previously a schema-external, caller-supplied `list[str]` with no
+# cryptographic binding to anything -- the gate only checked syntactic
+# safety of each literal, never who/what/when generated the list. That is
+# exactly the "human approved a high-level goal" -> "human approved
+# whatever exact paths the agent derived" authority-laundering risk a prior
+# #2086 OWNER review flagged. This makes the evidence a TYPED, BOUND
+# artifact instead of a raw list: it MUST be minted as a
+# SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest via the EXISTING #2053
+# producer (`generate_authority_transport_manifest()` above / the
+# `authority_transport.produce` command_id, already real-subprocess
+# dispatchable through `skill_runtime_exec.py` since this Issue's
+# iteration-2 fix_delta), with `payload` shaped as a single-element list
+# containing one dict: `{"comment_id", "comment_url", "body_sha256",
+# "source_kind": "generated_by_agent", "path_literals": [...]}`. AC9
+# forbids a NEW provenance schema/ledger/sidecar family -- this reuses the
+# existing schema/producer/immutable-per-invocation-directory machinery
+# verbatim; only the *payload contents* (an investigation-derived path
+# inventory instead of raw comment evidence) differ, which the manifest's
+# existing `payload: type ["object", "array"]` / `source_kind:
+# "generated_by_agent"` already accommodate without a schema edit.
+def _validate_investigation_evidence_transport(
+    path: "Path | str | None",
+    *,
+    repo_root: Path,
+    issue_number: int,
+    repo: str,
+    anchor_url: "str | None",
+    base_issue_body_sha256: str,
+    git_head_sha: str,
+) -> "tuple[list | None, str | None]":
+    """Load + cryptographically bind a read-only-investigation exact-path
+    inventory before it is ever allowed to clear the `expands_allowed_paths`
+    boundary for the operator-selected human-context lane
+    (`scope_signal_delta._has_investigation_derived_allowed_path_literals`).
+
+    Binding checked (fail-closed on ANY mismatch -- consistent with the
+    existing #1952 mixed-literal all-or-nothing lock, a failed binding NEVER
+    partially clears the boundary, it simply makes
+    `investigation_derived_path_literals` absent for this invocation):
+      - `path` is confined under `.claude/artifacts/` (no traversal/symlink,
+        reuses `_confine_artifact_path()`)
+      - `schema_version == SCOPE_DELTA_AUTHORITY_TRANSPORT_V1`, and the
+        manifest validates against the existing (unmodified)
+        `scope_delta_authority_transport_v1.schema.json`
+      - `issue_number` / `repo` match this invocation's own issue/repo
+      - `source_comment_url` matches the SAME human-context anchor comment
+        URL this preflight invocation is processing (prevents binding an
+        inventory derived for one directive to a different one)
+      - `source_issue_body_sha256` matches the CURRENT live issue body
+        (prevents stale-body inventory reuse after the body changed)
+      - `git_head_sha` matches the current live repo HEAD (prevents
+        cross-checkout / stale-commit replay)
+      - `payload_sha256 == sha256(canonical_json(payload))` (content digest
+        binding -- the payload cannot be swapped after the manifest was
+        minted)
+      - `payload` is `[{"comment_url": ..., "body_sha256": ...,
+        "source_kind": "generated_by_agent", "path_literals": [str, ...]}]`
+        and `path_literals` is a non-empty list of strings
+
+    The *authorization* decision itself (is this literal set genuinely
+    same-goal / bounded / a safe composition for THIS directive) is made
+    once, here, by this root control-plane loader -- after binding
+    validates -- never implicitly granted by the mere existence of a
+    `list[str]` argument (the pre-fix_delta design).
+
+    Returns (validated_path_literals, None) on success, or
+    (None, reason_code) on any failure.
+    """
+    if not path:
+        return None, "missing_transport_path"
+    resolved, confinement_reason = _confine_artifact_path(Path(path), repo_root)
+    if confinement_reason is not None:
+        return None, confinement_reason
+    if resolved is None or not resolved.exists():
+        return None, "transport_file_missing"
+    try:
+        manifest = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"transport_malformed_json:{type(exc).__name__}"
+    if not isinstance(manifest, dict):
+        return None, "transport_not_object"
+    if manifest.get("schema_version") != AUTHORITY_TRANSPORT_SCHEMA_VERSION:
+        return None, "transport_schema_version_mismatch"
+    schema = _load_schema("scope_delta_authority_transport_v1.schema.json")
+    if schema is None:
+        return None, "schema_unavailable:scope_delta_authority_transport_v1.schema.json"
+    valid, errors = _validate_with_schema(manifest, schema)
+    if not valid:
+        return None, f"transport_schema_invalid:{errors[:1]}"
+    if manifest.get("issue_number") != issue_number:
+        return None, "transport_issue_number_mismatch"
+    manifest_repo = manifest.get("repo")
+    if not isinstance(manifest_repo, str) or manifest_repo.lower() != repo.lower():
+        return None, "transport_repo_mismatch"
+    if not anchor_url or manifest.get("source_comment_url") != anchor_url:
+        return None, "transport_anchor_url_mismatch"
+    if manifest.get("source_issue_body_sha256") != base_issue_body_sha256:
+        return None, "transport_issue_body_sha256_mismatch"
+    if manifest.get("git_head_sha") != git_head_sha:
+        return None, "transport_git_head_sha_mismatch"
+    if manifest.get("source_kind") != "generated_by_agent":
+        return None, "transport_source_kind_mismatch"
+    payload = manifest.get("payload")
+    if _sha256(_canonical_json(payload)) != manifest.get("payload_sha256"):
+        return None, "transport_payload_digest_mismatch"
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        return None, "transport_payload_shape_invalid"
+    entry = payload[0]
+    if entry.get("comment_url") != anchor_url:
+        return None, "transport_payload_comment_url_mismatch"
+    if entry.get("body_sha256") != base_issue_body_sha256:
+        return None, "transport_payload_body_sha256_mismatch"
+    if entry.get("source_kind") != "generated_by_agent":
+        return None, "transport_payload_source_kind_mismatch"
+    literals = entry.get("path_literals")
+    if not isinstance(literals, list) or not literals:
+        return None, "transport_payload_literals_missing"
+    for item in literals:
+        if not isinstance(item, str):
+            return None, "transport_payload_entry_not_string"
+    return literals, None
+
+
 def consume_authority_transport(
     *,
     router_receipt_path: str,
@@ -3035,13 +3160,24 @@ def _build_scope_delta_authority_evidence(
 
     markers = extract_directive_markers(comment_body)
     directives = extract_directive_items(comment_body)
-    confidence = classify_directive_confidence(comment_body, markers)
     boundary_flags_map = detect_boundary_flags(comment_body)
     boundary_flag_names = [name for name, value in boundary_flags_map.items() if value]
+    # #2086 AC1/AC3/AC6: source_kind must be resolved before confidence is
+    # classified so that the operator-selected human-context lane (the only
+    # lane where `source_kind == "issue_comment"`, see
+    # `_resolve_scope_delta_source_kind()`) can relax the "known marker
+    # heading required" rule for freeform directives. `with_agent_report` /
+    # unlabeled anchors always resolve to `generated_by_agent` here and never
+    # reach this relaxation.
     source_kind = _resolve_scope_delta_source_kind(
         anchor_url,
         human_context_comment_urls=human_context_comment_urls,
         agent_report_comment_urls=agent_report_comment_urls,
+    )
+    confidence = classify_directive_confidence(
+        comment_body,
+        markers,
+        operator_asserted_human_context=(source_kind == "issue_comment"),
     )
 
     issue_url = f"https://github.com/{repo}/issues/{issue_number}"
@@ -3670,6 +3806,7 @@ def run_preflight(
     now: Optional[str] = None,
     consume_contract_patch_plan: bool = False,
     contract_update_callbacks: Optional[dict[str, Any]] = None,
+    investigation_evidence_transport_path: "Optional[Path]" = None,
 ) -> tuple[dict, int]:
     """
     Main preflight logic.
@@ -4059,6 +4196,31 @@ def run_preflight(
         # inside known_context where the planner never reads it.
         if _heavy_mutation_gate.get("fail_closed") is True:
             blockers.append(BLOCKER_HEAVY_MUTATION_FAIL_CLOSED)
+
+    # #2086 P0 fix_delta (iteration 3, Blocker 1): the ONLY real production
+    # entrypoint through which `investigation_derived_path_literals` may
+    # reach the planner is this validated, bound transport manifest -- see
+    # `_validate_investigation_evidence_transport()`. A caller that hand-sets
+    # `known_context["investigation_derived_path_literals"]` directly (the
+    # pre-fix_delta test-only shortcut) is no longer what the CANONICAL CLI
+    # -> `skill_runtime_exec.py` -> registry-rendered argv -> this subprocess
+    # chain does; `main()` only ever threads this manifest path through, and
+    # this is where it is validated and merged into known_context.
+    if investigation_evidence_transport_path is not None:
+        _validated_literals, _transport_reason = _validate_investigation_evidence_transport(
+            investigation_evidence_transport_path,
+            repo_root=repo_root,
+            issue_number=issue_number,
+            repo=repo,
+            anchor_url=anchor_url_for_consumer,
+            base_issue_body_sha256=_sha256(issue.get("body", "") or ""),
+            git_head_sha=_git_head_sha(repo_root),
+        )
+        if _validated_literals is not None:
+            known_context = dict(known_context) if known_context else {}
+            known_context["investigation_derived_path_literals"] = _validated_literals
+        else:
+            blockers.append(f"investigation_evidence_transport_rejected:{_transport_reason}")
 
     # --- Invoke planner ---
     known_context = _ensure_scope_signal_delta_input(
@@ -5132,6 +5294,18 @@ def main(argv: list[str] | None = None) -> None:
         help="Execute a trusted CONTRACT_PATCH_PLAN_V1 through edit_issue_txn.py.",
     )
     parser.add_argument(
+        "--investigation-evidence-transport-path",
+        type=Path,
+        default=None,
+        metavar="MANIFEST_JSON_PATH",
+        help="#2086 P0 fix_delta (Blocker 1/2): path to a "
+        "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest (minted via "
+        "--produce-authority-transport / the authority_transport.produce "
+        "command_id) carrying a bound, digest-verified read-only-investigation "
+        "exact-path inventory. Only ever consulted for the operator-selected "
+        "human-context lane; see _validate_investigation_evidence_transport().",
+    )
+    parser.add_argument(
         "--invocation-id",
         default=None,
         metavar="ID",
@@ -5295,6 +5469,7 @@ def main(argv: list[str] | None = None) -> None:
         fixture_path=args.fixture,
         known_context=cli_known_context,
         consume_contract_patch_plan=args.consume_contract_patch_plan,
+        investigation_evidence_transport_path=args.investigation_evidence_transport_path,
     )
     sys.exit(exit_code)
 
