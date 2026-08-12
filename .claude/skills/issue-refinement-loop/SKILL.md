@@ -217,7 +217,11 @@ web-researcher が critical claim にエビデンスを示せず、ハルシネ�
 
 ### Step 2: レビュー (Review)
 
-`issue-reviewer` SubAgent が `review-issue` を実行し、`ISSUE_REVIEW_RESULT_COMPACT_V1` を返す。
+**producer I/O は root-owned（Issue #2049）**: live body fetch・body SHA 固定・`check_issue_contract` / `contract_readiness_check` / merge_readiness の実行・full artifact の canonical artifact directory への保存は、すべて orchestrator（main thread）が
+`.claude/skills/issue-refinement-loop/scripts/run_root_review_pipeline.py produce --issue-number <N> --repo <owner/repo>`
+（`root_review_pipeline.produce`, command_registry.py 登録済み）を実行して行う。`issue-reviewer` SubAgent（`.codex/agents/issue-reviewer.toml`, `default_permissions: loop-protocol-readonly`）はこの root-owned producer が既に fetch・pin・checker 実行を終えた merged review result を読み、`review-issue` を実行して `ISSUE_REVIEW_RESULT_COMPACT_V1` を advisory に返すのみで、body fetch・temp file・artifact 保存などの producer I/O を一切行わない。
+
+**child stdout が 0 byte のときの扱い（AC4/AC5/AC6）**: orchestrator は `issue-reviewer` の raw stdout が 0 byte のまま返った場合でも、必ず `validate_review_compact_output.py` を呼ぶ（呼ばずに再試行やスキップをしない）。バリデータは `empty_input` violation に `classification: reviewer_transport_failure` を付与する。この classification を受けた場合、orchestrator は root producer（`issue-reviewer` SubAgent 呼び出し）を一度だけ再実行する。再実行後も `empty_input` / `reviewer_transport_failure` のままであれば、それ以上再試行せず `NEXT_ACTION: human_judgment_required` として Step 5 (human_escalation) へ倒す（`run_root_review_pipeline.retry_once_on_transport_failure()` が同じ一度だけ再試行のセマンティクスを実装する）。
 
 消費側契約 (consumer contract): `ISSUE_REVIEW_RESULT_COMPACT_V1`（正本 (SSOT): `.claude/skills/issue-refinement-loop/scripts/compact_review_result.py`）
 
@@ -298,6 +302,8 @@ exit_code_3:
 
 - `STATUS: ok` / `BODY_HASH: <sha256>` → 更新成功、`NEXT_ACTION: proceed` で Step 2 に戻る
 - `STATUS: no_change` → 変更なし、`NEXT_ACTION: proceed` で Step 2 に戻る
+
+**final review gate（Issue #2049 AC10）**: `STATUS: ok` / `BODY_HASH` readback により本文更新が確認できた場合にのみ Step 2 の "final review"（この body revision に対する terminal VERDICT を決める review pass）を実行する。readback が未確認、または `run_root_review_pipeline.py readback` が `verdict_identity: false` を返す（persisted artifact が regular file でない / symlink である / strict JSON でない / `body_sha256` が一致しない / `verdict` が一致しない、のいずれか）間は final review を実行しない。`run_root_review_pipeline.py gate-final-review --artifact-path <path> --expected-body-sha256 <sha> --expected-verdict <verdict> --remote-update-ok` が `final_review_allowed: true` を返した場合にのみ次段階（Step 4.5）へ進める。
 - `STATUS: failed` → 修正失敗、`NEXT_ACTION: human_judgment_required`、Step 5 human_escalation へ
 - `partial_failure` は廃止。issue-editor は `ok` / `no_change` / `failed` の 3 値のみを返す。
 - full mutation result は `ARTIFACT:` パスから取得する（main context には返らない）
