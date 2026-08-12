@@ -28,11 +28,18 @@ from controlled_git_change_exec import (  # noqa: E402
     build_issue_scope_snapshot,
     compute_allowed_paths_sha256,
     compute_comments_digest_sha256,
-    execute_controlled_change,
+    execute_controlled_change as _execute_controlled_change,
     execute_controlled_merge_continue,
     resolve_authority,
 )
 from git_mutation_command_policy import classify_agent_lane_add_commit  # noqa: E402
+
+
+def execute_controlled_change(*args, **kwargs):
+    """Use the production API with the now-mandatory CAS value by default."""
+    snapshot = kwargs["snapshot"]
+    kwargs.setdefault("expected_old", snapshot.base_sha)
+    return _execute_controlled_change(*args, **kwargs)
 
 
 def _init_repo(repo: Path) -> str:
@@ -55,13 +62,23 @@ def _head(repo: Path) -> str:
     ).stdout.strip()
 
 
+def _main_head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def _build_snapshot(
     repo: Path,
     *,
     allowed_paths,
     issue_number: int = 1611,
     issue_body: str = "## Outcome\nsomething\n",
-    base_sha: str = "a" * 40,
+    base_sha: str | None = None,
     target_branch: str = "topic",
     authority_mode: str = AUTHORITY_NEW_ONLY,
     comment_bodies=("",),
@@ -77,7 +94,7 @@ def _build_snapshot(
         comment_bodies=comment_bodies,
         allowed_paths=allowed_paths,
         base_ref="main",
-        base_sha=base_sha,
+        base_sha=base_sha or _main_head(repo),
         branch_ref=f"refs/heads/{target_branch}",
         worktree_path=str(repo),
         authority_mode=authority_mode,
@@ -282,6 +299,7 @@ def test_merge_continue_resolves_root_skill_file_directory_conflict(tmp_path: Pa
         requested_pathspecs=[".agents/skills"],
         commit_message="merge: resolve root skill surface conflict",
         expected_head=topic_head,
+        expected_old=main_head,
     )
 
     assert result.status == "committed"
@@ -318,6 +336,7 @@ def test_merge_continue_rejects_unresolved_or_out_of_scope_path(tmp_path: Path):
         requested_pathspecs=[".agents/skills"],
         commit_message="merge: reject scope escape",
         expected_head=topic_head,
+        expected_old=main_head,
     )
 
     assert result.status == "denied"
@@ -336,6 +355,7 @@ def test_merge_continue_requires_existing_unmerged_merge(tmp_path: Path):
         requested_pathspecs=["README.md"],
         commit_message="merge: reject clean repository",
         expected_head=_head(repo),
+        expected_old=snapshot.base_sha,
     )
 
     assert result.status == "denied"
@@ -801,11 +821,11 @@ def test_env_sanitization_applied_to_stage_and_commit_calls(tmp_path: Path, monk
     # subprocess calls against; it is not meant to also break the test's
     # own unrelated setup helpers.
     expected_head = _head(repo)
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
 
     _poison_git_env(monkeypatch, tmp_path)
     calls = _spy_on_subprocess_run(monkeypatch)
 
-    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
     result = execute_controlled_change(
         cwd=str(repo),
         snapshot=snapshot,
@@ -842,11 +862,11 @@ def test_env_sanitization_applied_to_unstage_call(tmp_path: Path, monkeypatch):
     _init_repo(repo)
     (repo / "outside.py").write_text("x = 1\n")
     expected_head = _head(repo)
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
 
     _poison_git_env(monkeypatch, tmp_path)
     calls = _spy_on_subprocess_run(monkeypatch)
 
-    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
     result = execute_controlled_change(
         cwd=str(repo),
         snapshot=snapshot,
@@ -922,6 +942,77 @@ def test_env_sanitization_applied_to_rollback_call(tmp_path: Path, monkeypatch):
 
 
 # ─── AC8 ──────────────────────────────────────────────────────────────────
+
+
+def test_expected_old_is_mandatory_and_precommit_cas_mismatch_is_denied(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import controlled_git_change_exec as module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "a.py").write_text("x\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+
+    missing = _execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: missing expected old",
+        expected_head=_head(repo),
+    )
+    assert missing.reason_code == "expected_old_required"
+
+    monkeypatch.setattr(module, "_current_ref", lambda *_args: "f" * 40)
+    mismatch = _execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: precommit cas mismatch",
+        expected_head=_head(repo),
+        expected_old=snapshot.base_sha,
+    )
+    assert mismatch.reason_code == "expected_old_cas_mismatch"
+    assert _staged_name_only(repo) == ""
+
+
+def test_expected_old_postcondition_mismatch_rolls_back_commit(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import controlled_git_change_exec as module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "a.py").write_text("x\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    head_before = _head(repo)
+    calls = 0
+
+    def _drifting_ref(*_args):
+        nonlocal calls
+        calls += 1
+        return snapshot.base_sha if calls < 3 else "f" * 40
+
+    monkeypatch.setattr(module, "_current_ref", _drifting_ref)
+    result = _execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: postcondition cas mismatch",
+        expected_head=head_before,
+        expected_old=snapshot.base_sha,
+    )
+    assert result.reason_code == "postcondition_expected_old_readback_mismatch_rolled_back"
+    assert _head(repo) == head_before
+    assert _staged_name_only(repo) == ""
 
 
 def test_stale_snapshot_comment_drift_and_head_race_denies(tmp_path: Path):
@@ -1062,7 +1153,7 @@ def test_shared_matcher_used_by_staging_commit_review():
 def test_legacy_env_and_new_snapshot_not_simultaneous_authority(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"], base_sha="a" * 40)
 
     combos = [
         (AUTHORITY_OLD_ONLY, "legacy paths here", None, AUTHORITY_SOURCE_LEGACY_ENV),
@@ -1220,6 +1311,8 @@ def test_snapshot_json_flag_always_denied(tmp_path: Path):
                 "feat: x",
                 "--expected-head",
                 _head(repo),
+                "--expected-old",
+                _main_head(repo),
             ]
         )
     assert rc == 1
@@ -1247,6 +1340,8 @@ def test_materialize_request_required_when_snapshot_json_absent(tmp_path: Path):
                 "feat: x",
                 "--expected-head",
                 _head(repo),
+                "--expected-old",
+                _main_head(repo),
             ]
         )
     assert rc == 1
@@ -1301,7 +1396,371 @@ def test_materialize_request_drives_commit_via_live_snapshot(tmp_path: Path, mon
                 "feat: add new file",
                 "--expected-head",
                 _head(repo),
+                "--expected-old",
+                live_snapshot.base_sha,
             ]
         )
     assert rc == 0
     assert '"status": "committed"' in buf.getvalue()
+
+
+def test_cli_requires_expected_old_before_materialization(tmp_path: Path):
+    import pytest
+    import controlled_git_change_exec as controlled_module
+
+    with pytest.raises(SystemExit) as exc:
+        controlled_module._main(
+            [
+                "--cwd",
+                str(tmp_path),
+                "--materialize-request",
+                "request.json",
+                "--path",
+                "README.md",
+                "--message",
+                "feat: missing expected old",
+                "--expected-head",
+                "a" * 40,
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_current_ref_fetches_live_origin_instead_of_trusting_stale_tracking_ref(tmp_path: Path):
+    """Issue #2102 P0-F: _current_ref() must not treat a stale local
+    refs/remotes/origin/<ref> as authoritative. It fetches the live remote
+    ref first and fails closed if that fetch fails.
+    """
+    import controlled_git_change_exec as controlled_module
+
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_sha = _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"{base_sha}:refs/heads/main"], cwd=repo, check=True)
+    subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=repo, check=True)
+
+    # Confirm the local tracking ref currently agrees with base_sha (this is
+    # the value a stale-tracking-ref bug would keep returning forever).
+    assert controlled_module._current_ref(str(repo), "main") == base_sha
+
+    # Advance the remote (simulating main drift from another actor) via a
+    # second clone, WITHOUT running `git fetch` again in `repo`.
+    other_clone = tmp_path / "other_clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(other_clone)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=other_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=other_clone, check=True)
+    subprocess.run(["git", "checkout", "-q", "-B", "main", "origin/main"], cwd=other_clone, check=True)
+    (other_clone / "DRIFT.md").write_text("drift\n")
+    subprocess.run(["git", "add", "DRIFT.md"], cwd=other_clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "main drift"], cwd=other_clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=other_clone, check=True)
+    live_main_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=other_clone, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert live_main_sha != base_sha
+
+    # Without the #2102 fix, this would still return the stale base_sha
+    # because `repo`'s local refs/remotes/origin/main tracking ref was never
+    # refreshed. With the fix, _current_ref() fetches live and returns the
+    # drifted SHA.
+    assert controlled_module._current_ref(str(repo), "main") == live_main_sha
+
+
+def test_current_ref_fails_closed_when_origin_fetch_fails(tmp_path: Path):
+    """Issue #2102 P0-F: an unreachable 'origin' must fail closed (None),
+    never silently fall back to a possibly-stale local tracking ref."""
+    import controlled_git_change_exec as controlled_module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    unreachable = tmp_path / "does-not-exist.git"
+    subprocess.run(["git", "remote", "add", "origin", str(unreachable)], cwd=repo, check=True)
+
+    assert controlled_module._current_ref(str(repo), "main") is None
+
+
+def test_execute_controlled_change_denies_when_origin_has_drifted_past_expected_old(tmp_path: Path):
+    """End-to-end (Issue #2102 P0-F): a live origin drift must be caught as
+    expected_old_cas_mismatch even though the caller-provided expected_old
+    matches the OLD (pre-drift) base -- because the CAS check reads a
+    freshly fetched live ref, not a stale local tracking ref."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_sha = _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"{base_sha}:refs/heads/main"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "topic"], cwd=repo, check=True)
+
+    other_clone = tmp_path / "other_clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(other_clone)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=other_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=other_clone, check=True)
+    subprocess.run(["git", "checkout", "-q", "-B", "main", "origin/main"], cwd=other_clone, check=True)
+    (other_clone / "DRIFT.md").write_text("drift\n")
+    subprocess.run(["git", "add", "DRIFT.md"], cwd=other_clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "main drift"], cwd=other_clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=other_clone, check=True)
+
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "a.py").write_text("x\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/a.py"],
+        commit_message="feat: x",
+        expected_head=_head(repo),
+    )
+    assert result.status == "denied"
+    assert result.reason_code == "expected_old_cas_mismatch"
+
+
+# ─── Issue #2102 fix_delta iteration 4: transaction-safety regressions
+# (Blockers 1-3: _current_ref timeout, merge-continue post-commit CAS
+# recheck, post-commit rollback result verification) ───────────────────────
+
+
+def _init_repo_with_origin(tmp_path: Path):
+    """A real bare `origin` + a real clone -- never a hand-injected SHA."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_sha = _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "topic"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "topic"], cwd=repo, check=True)
+    return repo, bare, base_sha
+
+
+def _make_flaky_run(monkeypatch, *, timeout_on: str = "fetch", timeout_after: int = 1):
+    """Patch the global `subprocess.run` so the Nth call whose argv contains
+    `timeout_on` raises a real `subprocess.TimeoutExpired`; every other call
+    is delegated unchanged to the real `subprocess.run`. Returns the call
+    counter dict for assertions."""
+    real_run = subprocess.run
+    counters = {"n": 0}
+
+    def _flaky(args, *a, **kw):
+        if isinstance(args, list) and timeout_on in args:
+            counters["n"] += 1
+            if counters["n"] >= timeout_after:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=20)
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr("subprocess.run", _flaky)
+    return counters
+
+
+def test_current_ref_fetch_timeout_fails_closed(tmp_path: Path, monkeypatch):
+    """Blocker 1: a `subprocess.TimeoutExpired` from the bounded `git
+    fetch` inside `_current_ref()` must be caught and fail closed to
+    `None`, never propagate and crash the caller."""
+    import controlled_git_change_exec as module
+
+    repo, _bare, _base_sha = _init_repo_with_origin(tmp_path)
+    _make_flaky_run(monkeypatch, timeout_on="fetch", timeout_after=1)
+
+    assert module._current_ref(str(repo), "main") is None
+
+
+def test_expected_old_timeout_before_commit_denies_with_no_commit_produced(tmp_path: Path, monkeypatch):
+    """Regression: timeout before commit -> no commit produced, deterministic
+    fail-closed denial (the very first `_current_ref` call, at the pre-stage
+    HEAD/base binding check, times out)."""
+    repo, _bare, _base_sha = _init_repo_with_origin(tmp_path)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "new_file.py").write_text("x = 1\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    head_before = _head(repo)
+
+    _make_flaky_run(monkeypatch, timeout_on="fetch", timeout_after=1)
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/new_file.py"],
+        commit_message="feat: new file",
+        expected_head=head_before,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "expected_old_cas_mismatch"
+    assert _head(repo) == head_before
+    assert _staged_name_only(repo) == ""
+    assert "new file" not in _log(repo)
+
+
+def test_post_commit_expected_old_readback_timeout_rolls_back(tmp_path: Path, monkeypatch):
+    """Regression: timeout during the post-commit expected-old readback ->
+    the just-made commit is rolled back via `git reset --soft HEAD~1` and
+    HEAD returns to the pre-commit SHA. The pre-stage and pre-commit
+    `_current_ref` calls (1st and 2nd `fetch`) must still succeed so the
+    commit actually happens; only the 3rd (post-commit) call times out."""
+    repo, _bare, _base_sha = _init_repo_with_origin(tmp_path)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "new_file.py").write_text("x = 1\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    head_before = _head(repo)
+
+    _make_flaky_run(monkeypatch, timeout_on="fetch", timeout_after=3)
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/new_file.py"],
+        commit_message="feat: new file",
+        expected_head=head_before,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "postcondition_expected_old_readback_mismatch_rolled_back"
+    assert _head(repo) == head_before
+    assert _staged_name_only(repo) == ""
+    assert "new file" not in _log(repo)
+
+
+def test_rollback_itself_failing_reports_manual_intervention_required(tmp_path: Path, monkeypatch):
+    """Regression: if `git reset --soft HEAD~1` itself fails/times out, the
+    executor MUST NOT report a false 'rolled back' reason_code -- it must
+    report `rollback_failed_manual_intervention_required` instead."""
+    repo, _bare, _base_sha = _init_repo_with_origin(tmp_path)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "new_file.py").write_text("x = 1\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    head_before = _head(repo)
+
+    real_run = subprocess.run
+    fetch_counter = {"n": 0}
+
+    def _flaky(args, *a, **kw):
+        if isinstance(args, list):
+            if "fetch" in args:
+                fetch_counter["n"] += 1
+                if fetch_counter["n"] >= 3:
+                    raise subprocess.TimeoutExpired(cmd=args, timeout=20)
+            if "reset" in args and "--soft" in args:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=30)
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr("subprocess.run", _flaky)
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/new_file.py"],
+        commit_message="feat: new file",
+        expected_head=head_before,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "rollback_failed_manual_intervention_required"
+
+
+def test_merge_continue_remote_drift_after_commit_rolls_back(tmp_path: Path, monkeypatch):
+    """Blocker 2 regression: a concurrent agent pushes a real, unrelated
+    commit to the shared `origin/main` in the window right as our merge
+    commit lands locally. The new post-commit CAS recheck in
+    `execute_controlled_merge_continue()` must detect this real drift and
+    roll back, leaving HEAD at the pre-commit (topic) SHA."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    topic_head, main_head = _start_root_skill_file_directory_merge(repo)
+    # The repo is now mid-merge on `topic` (unresolved conflict) -- do NOT
+    # `git checkout` away from it. Pushing an explicit `<sha>:refs/heads/<ref>`
+    # refspec transfers objects and updates the remote ref without touching
+    # the current branch/working tree/index.
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"{main_head}:refs/heads/main"], cwd=repo, check=True)
+
+    concurrent_clone = tmp_path / "concurrent_clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(concurrent_clone)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=concurrent_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=concurrent_clone, check=True)
+    subprocess.run(["git", "checkout", "-q", "-B", "main", "origin/main"], cwd=concurrent_clone, check=True)
+    (concurrent_clone / "CONCURRENT.md").write_text("concurrent change\n")
+    subprocess.run(["git", "add", "CONCURRENT.md"], cwd=concurrent_clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "concurrent main advance"], cwd=concurrent_clone, check=True)
+
+    snapshot = _build_snapshot(repo, allowed_paths=[".agents/skills"], base_sha=main_head)
+
+    real_run = subprocess.run
+
+    def _flaky(args, *a, **kw):
+        if isinstance(args, list) and args[:3] == ["git", "commit", "-m"]:
+            # Simulate: right as our merge commit is about to land locally,
+            # a concurrent agent's real commit lands on the shared remote.
+            real_run(["git", "push", "-q", "origin", "main"], cwd=str(concurrent_clone), check=True)
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr("subprocess.run", _flaky)
+
+    result = execute_controlled_merge_continue(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=[".agents/skills"],
+        commit_message="merge: resolve root skill surface conflict",
+        expected_head=topic_head,
+        expected_old=main_head,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "postcondition_expected_old_readback_mismatch_rolled_back"
+    assert _head(repo) == topic_head
+
+
+def test_merge_continue_timeout_after_commit_leaves_no_unvalidated_commit(tmp_path: Path, monkeypatch):
+    """Blocker 2 regression: a bounded `git fetch` timeout hitting exactly
+    the NEW post-commit CAS recheck in `execute_controlled_merge_continue()`
+    must roll back the just-made merge commit -- no unvalidated commit is
+    ever left on HEAD."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    topic_head, main_head = _start_root_skill_file_directory_merge(repo)
+    # As above: do not checkout away from the in-progress merge on `topic`.
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"{main_head}:refs/heads/main"], cwd=repo, check=True)
+
+    snapshot = _build_snapshot(repo, allowed_paths=[".agents/skills"], base_sha=main_head)
+
+    # Two `_current_ref` / fetch calls happen before the commit (the
+    # pre-stage and pre-commit CAS re-checks); only the 3rd (the new
+    # post-commit recheck) must time out.
+    _make_flaky_run(monkeypatch, timeout_on="fetch", timeout_after=3)
+
+    result = execute_controlled_merge_continue(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=[".agents/skills"],
+        commit_message="merge: resolve root skill surface conflict",
+        expected_head=topic_head,
+        expected_old=main_head,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "postcondition_expected_old_readback_mismatch_rolled_back"
+    assert _head(repo) == topic_head

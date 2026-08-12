@@ -155,7 +155,7 @@ prefix_rule(
     decision = "allow",
     justification = "Issue #1611: the controlled stage/commit executor is the single authorized in-process path for agent-driven git add/commit; its own runtime checks (repository/worktree/branch/HEAD binding, Allowed Paths, protected paths, audit-then-rollback) are the actual enforcement, not this static allow.",
     match = [
-        "uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --cwd .claude/worktrees/issue-1611-x --snapshot-json .claude/tmp/issue-1611-scope-snapshot.json --path scripts/agent-guards/example.py --message \"feat: example\" --expected-head 0000000000000000000000000000000000000000",
+        "uv run --locked python3 scripts/agent-guards/controlled_git_change_exec.py --cwd .claude/worktrees/issue-1611-x --materialize-request tmp/issue-1611-request.json --path scripts/agent-guards/example.py --message \"feat: example\" --expected-head 0000000000000000000000000000000000000000 --expected-old 0000000000000000000000000000000000000000",
     ],
 )
 
@@ -163,7 +163,7 @@ prefix_rule(
 # from argv[0] (Rust `execpolicy` crate: only `prefix_rule`/`network_rule`
 # exist; pattern elements are literal strings or literal alternation lists --
 # there is no wildcard, no substring/startswith matching, and no argv-length
-# or "exact shape" modifier). Because `--cwd`/`--snapshot-json` carry a
+# or "exact shape" modifier). Because `--cwd`/`--materialize-request` carry a
 # dynamic worktree path that cannot be known when this file is authored, this
 # static allow rule can only anchor on the fixed `uv run --locked python3
 # <script>` prefix -- it cannot, by construction, distinguish a well-formed
