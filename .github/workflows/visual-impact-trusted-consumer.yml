@@ -166,24 +166,37 @@ jobs:
 
           gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""' > artifacts/trusted/pr_body.txt
 
+          # Issue #2099 AC6: no `|| true` fail-open here -- `set -euo
+          # pipefail` above makes a genuine `git diff` plumbing failure
+          # abort this step (and this step's `continue-on-error: true`
+          # already keeps the publish step reachable to report it as
+          # `trusted_input_derivation_failed`, never a silently-empty
+          # changed-path set).
           git diff --name-status -z --find-renames "${LIVE_BASE_SHA}" "${LIVE_HEAD_SHA}" \
-            > artifacts/trusted/name_status.nul || true
+            > artifacts/trusted/name_status.nul
           uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
             --mode changed-paths \
             --name-status-file artifacts/trusted/name_status.nul \
             --typed-output artifacts/trusted/changed_paths_typed.json > /dev/null
 
+          # Issue #2099 AC7: `--mode resolve-trusted-registry-blob`
+          # distinguishes "registry does not exist at this ref" (normal,
+          # exit 0, no output file) from any OTHER git plumbing failure
+          # (exit 1, fail-closed via `set -euo pipefail` above) -- see
+          # `read_git_blob_at_ref()` in resolve_visual_impact.py.
           REGISTRY_PATH="docs/dev/visual-surfaces.yml"
-          if git show "${LIVE_BASE_SHA}:${REGISTRY_PATH}" > artifacts/trusted/base_registry.yml 2>/dev/null; then
-            git rev-parse "${LIVE_BASE_SHA}:${REGISTRY_PATH}" > artifacts/trusted/base_registry_blob_sha.txt
-          else
-            rm -f artifacts/trusted/base_registry.yml artifacts/trusted/base_registry_blob_sha.txt
-          fi
-          if git show "${LIVE_HEAD_SHA}:${REGISTRY_PATH}" > artifacts/trusted/head_registry.yml 2>/dev/null; then
-            git rev-parse "${LIVE_HEAD_SHA}:${REGISTRY_PATH}" > artifacts/trusted/head_registry_blob_sha.txt
-          else
-            rm -f artifacts/trusted/head_registry.yml artifacts/trusted/head_registry_blob_sha.txt
-          fi
+          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+            --mode resolve-trusted-registry-blob \
+            --ref "${LIVE_BASE_SHA}" \
+            --path "${REGISTRY_PATH}" \
+            --output-file artifacts/trusted/base_registry.yml \
+            --blob-sha-output-file artifacts/trusted/base_registry_blob_sha.txt
+          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+            --mode resolve-trusted-registry-blob \
+            --ref "${LIVE_HEAD_SHA}" \
+            --path "${REGISTRY_PATH}" \
+            --output-file artifacts/trusted/head_registry.yml \
+            --blob-sha-output-file artifacts/trusted/head_registry_blob_sha.txt
 
       - name: Independently re-verify producer artifacts (base-locked evaluator)
         id: verify
@@ -222,6 +235,7 @@ jobs:
             --expected-pr-number "${EXPECTED_PR_NUMBER}" \
             --pr-body-file artifacts/trusted/pr_body.txt \
             --changed-paths-typed-file artifacts/trusted/changed_paths_typed.json \
+            --trusted-candidate-tree-ref "${EXPECTED_HEAD_SHA}" \
             "${EXTRA_ARGS[@]}" \
             --verdict-output verdict.json
           cat verdict.json
