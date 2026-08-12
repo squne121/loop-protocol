@@ -21,9 +21,9 @@ hook (see `hooks.md` bundled with the installed Antigravity CLI, and
   It always answers ``{"decision": "allow"}`` on stdout so the underlying tool call
   is not blocked -- this hook is provenance-only, not a permission gate (permission
   gating is out of scope; see Issue #1705).
-- ``evaluate_websearch_provenance()`` is the authoritative success judge: it ignores
-  stdout self-report content entirely for the `grounding_backend` /
-  `web_tool_call_count` decision and requires a *validated*, *run-matched*
+- ``evaluate_websearch_provenance()`` is a provider-telemetry diagnostic: it ignores
+  stdout self-report content for the `grounding_backend` /
+  `web_tool_call_count` observation and reports a *validated*, *run-matched*
   ``agy_tool_provenance_v1`` hook event whose ``toolCall.name`` is one of the
   canonical web tool names (``search_web``, ``read_url_content``).
 
@@ -593,15 +593,15 @@ def evaluate_websearch_provenance(
     stdout_self_report: dict[str, Any] | None = None,
     hook_load_error: str | None = None,
 ) -> dict[str, Any]:
-    """Authoritative provenance-based WebSearch success judgment.
+    """Provider-provenance diagnostic for WebSearch observations.
 
     ``stdout_self_report`` (AGY's stdout `tool_calls`/marker JSON, if any) is carried
     through purely as a non-authoritative, informational field -- it is NEVER used to
     set ``grounding_backend`` or ``web_tool_call_count`` on its own (Issue #1708 AC3 /
     AC8). Only validated, run-matched, canonical-tool-name hook events count.
 
-    ``hook_load_error`` being non-None (workspace hook write failure or event-log parse
-    failure) forces a fail-closed result regardless of any other input (Issue #1708 AC9).
+    ``hook_load_error`` is reported as a diagnostic failure. Consumers must not use it
+    as a claim-evidence or overall web-research success/failure gate.
     """
     result: dict[str, Any] = {
         "schema": "agy_websearch_provenance_evaluation/v1",

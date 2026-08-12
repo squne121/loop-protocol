@@ -176,7 +176,7 @@ def _copy_fixture_repo(tmp_path: Path) -> Path:
     web_researcher = repo / ".claude/agents/web-researcher.md"
     web_researcher.write_text(
         web_researcher.read_text(encoding="utf-8")
-        + "\n<!-- fixture parity token: agy_grounded_research_only -->\n",
+        + "\n<!-- fixture parity token: agy_grounded_research_with_native_web_fallback -->\n",
         encoding="utf-8",
     )
     subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)

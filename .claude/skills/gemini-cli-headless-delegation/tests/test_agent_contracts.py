@@ -103,13 +103,16 @@ class TestWebResearcherAgent:
             "web-researcher.md に preflight ステップが含まれていない"
         )
 
-    def test_disallowed_tools_includes_webfetch_websearch(self):
+    def test_native_web_tools_are_available_for_fallback(self):
         text = _read(WEB_RESEARCHER_MD)
         fm = _frontmatter(text)
         assert len(fm) > 0, "フロントマターが見つからない"
         for tool in ("WebFetch", "WebSearch"):
-            assert tool in fm, (
-                f"web-researcher.md の disallowedTools に {tool} が含まれていない"
+            assert f"  - {tool}" in fm, (
+                f"web-researcher.md の tools に {tool} が含まれていない"
+            )
+            assert f"  - {tool} #" not in fm, (
+                f"web-researcher.md が {tool} を disallowedTools で禁止している"
             )
 
     def test_agy_provider_declared(self):
@@ -129,17 +132,36 @@ class TestWebResearcherAgent:
             "web-researcher.md に grounded_research profile が明記されていない"
         )
 
-    def test_direct_fallback_not_treated_as_pass(self):
+    def test_agy_first_native_web_fallback_is_truthful(self):
         text = _read(WEB_RESEARCHER_MD)
-        assert "direct fallback" in text.lower() or "direct_fallback" in text, (
-            "web-researcher.md に direct fallback の扱いが明記されていない"
+        assert "primary_route: agy_grounded_research" in text, (
+            "web-researcher.md が AGY-first を明記していない"
         )
-        assert "WebSearch / WebFetch による direct fallback は行わない" in text or (
-            "direct_fallback" in text and "disabled" in text
-        ), (
-            "web-researcher.md が direct fallback の成功を route 成功として扱わない"
-            " ことを明記していない"
+        assert "fallback_route: native_web" in text, (
+            "web-researcher.md が native Web fallback を明記していない"
         )
+        assert "verification_route: native_web" in text, (
+            "native fallback の route honesty が明記されていない"
+        )
+        assert "AGY success と偽装" in text, (
+            "native fallback を AGY success と偽装しない契約がない"
+        )
+
+    def test_provider_telemetry_is_not_a_quality_gate(self):
+        text = _read(WEB_RESEARCHER_MD)
+        assert "observability / diagnostics only" in text
+        assert "zero は failure" in text
+        assert "`web_tool_call_count == 0`" in text
+
+    def test_required_fallback_cases_are_described(self):
+        text = _read(WEB_RESEARCHER_MD)
+        for failure in (
+            "auth/capability/query/grounding failure",
+            "citation materialization failure",
+            "citation extraction failure",
+            "provider provenance trace 不足",
+        ):
+            assert failure in text
 
     def test_gemini_disabled_by_operator_declared(self):
         text = _read(WEB_RESEARCHER_MD)
@@ -551,4 +573,3 @@ class TestReferencesDocsRuntimeDrift:
             "usage-contract.md が provider=auto の result field を条件付き field として"
             " 明記していない"
         )
-

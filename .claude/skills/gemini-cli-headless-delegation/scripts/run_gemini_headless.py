@@ -4234,17 +4234,6 @@ def _build_agy_grounded_research_metadata(
         )
 
     parsed = _extract_grounded_research_output(stdout)
-    tool_calls = _extract_recognized_tool_calls(parsed)
-    tool_call_confirmed = bool(tool_calls) or hook_validated
-
-    if not tool_call_confirmed:
-        return _fail_closed(
-            grounding_status="attempted_no_web_tool_call",
-            grounding_backend="none",
-            grounding_failure_class="agy_web_grounding_tool_call_missing",
-            parsed_evidence=parsed or None,
-        )
-
     structured_citations = _extract_structured_citations(parsed)
     if not structured_citations and hook_validated:
         # Issue #1768: when the tool-call evidence comes from a validated hook event
@@ -4255,6 +4244,11 @@ def _build_agy_grounded_research_metadata(
         # grounding-api-redirect shape counts (Issue #1266 Blocker 1 remains in force).
         vertex_urls = _extract_vertex_grounding_citation_urls(stdout)
         structured_citations = [{"url": url, "title": None} for url in vertex_urls]
+    if not structured_citations:
+        # The caller must still validate URL content against each claim.  Keep
+        # parseable final-result URLs available for that evidence-quality
+        # step; a missing provider trace is not a reason to erase them.
+        structured_citations = [{"url": url, "title": None} for url in _extract_urls(stdout)]
     # Issue #2038 AC2: cardinality is no longer truncated to 1 -- every
     # structured source recovered above (subject only to
     # `_extract_structured_citations()`'s own fail-closed collection rules)
@@ -4271,6 +4265,8 @@ def _build_agy_grounded_research_metadata(
     # prefers an explicit structured query count when the parsed evidence
     # provides one, and otherwise falls back to the measured tool-call count
     # (each recognized web tool call corresponds to at least one query).
+    tool_calls = _extract_recognized_tool_calls(parsed)
+    tool_call_confirmed = bool(tool_calls) or hook_validated
     if tool_calls:
         web_tool_call_count = len(tool_calls)
     elif hook_validated:
@@ -4281,37 +4277,17 @@ def _build_agy_grounded_research_metadata(
     if search_query_count is None:
         search_query_count = web_tool_call_count
 
-    if url_citation_count > 0 and hook_validated:
+    if url_citation_count > 0:
+        # Provider telemetry is diagnostic only.  These URLs are candidate
+        # citations, not a claim-level verdict; web-researcher validates their
+        # source content before reporting `supported`.
         grounding_status = "grounded"
-        grounding_backend = "agy_native_websearch"
+        grounding_backend = "agy_native_websearch" if hook_validated else "agy_final_result"
         grounding_failure_class = None
-    elif url_citation_count > 0:
-        # Issue #2038 fix_delta (iteration 2, P0
-        # ac4_unenforced_in_default_production_path): citation evidence
-        # recovered ONLY from AGY's own stdout self-report (a
-        # model-generated `tool_calls`/`sources` JSON blob, or a legacy
-        # custom marker) is never, on its own, sufficient to resolve
-        # grounding_status "grounded" -- that is exactly the
-        # false-grounding anti-pattern the OWNER's gate 4 ("custom marker
-        # や model-generated tool_calls / sources だけでは grounded に
-        # ならない") and this Issue's AC4 target. A validated
-        # `agy_tool_provenance_v1` hook event (`hook_validated`, see
-        # `_hook_events_confirm_web_tool_call()`) is now the REQUIRED
-        # corroboration this legacy path also enforces before trusting any
-        # marker/JSON-derived citation claim -- mirroring the existing
-        # hook-event-is-authoritative design already proven for the
-        # vertex-URL citation route (see
-        # `test_validated_hook_event_with_real_grounding_citation_url_is_grounded`).
-        # `_fail_closed()` always zeroes citation_evidence /
-        # url_citation_count / web_tool_call_count, so the unverified
-        # self-reported citation never leaks through as trusted evidence
-        # (AC5's fail-closed citation trust policy is not weakened).
-        return _fail_closed(
-            grounding_status="attempted_unverified_self_report",
-            grounding_backend="none",
-            grounding_failure_class="agy_web_grounding_hook_corroboration_missing",
-            parsed_evidence=parsed or None,
-        )
+    elif not tool_call_confirmed:
+        grounding_status = "attempted_no_web_tool_call"
+        grounding_backend = "none"
+        grounding_failure_class = "agy_web_grounding_tool_call_missing"
     else:
         grounding_status = "attempted_no_citations"
         grounding_backend = "agy_native_websearch"
@@ -4552,18 +4528,6 @@ def _build_agy_structured_stream_json_grounded_research_metadata(
     tool_call_records = stream_parse.get("tool_call_records") or []
     recognized_tool_calls = [record for record in tool_call_records if record.get("recognized_web_tool")]
     tool_call_confirmed = bool(recognized_tool_calls) or hook_validated
-
-    if not tool_call_confirmed:
-        return _fail_closed(
-            grounding_status="attempted_no_web_tool_call",
-            grounding_backend="none",
-            grounding_failure_class="agy_web_grounding_tool_call_missing",
-            parsed_evidence={
-                "stream_json_event_count": stream_parse.get("event_count"),
-                "stream_json_step_update_count": stream_parse.get("step_update_count"),
-            },
-        )
-
     source_records = stream_parse.get("source_records") or []
     citation_evidence = [{"url": record["url"], "title": record.get("title")} for record in source_records]
     url_citation_count = len(citation_evidence)
@@ -4574,6 +4538,10 @@ def _build_agy_structured_stream_json_grounded_research_metadata(
         grounding_status = "grounded"
         grounding_backend = "agy_native_websearch_structured"
         grounding_failure_class = None
+    elif not tool_call_confirmed:
+        grounding_status = "attempted_no_web_tool_call"
+        grounding_backend = "none"
+        grounding_failure_class = "agy_web_grounding_tool_call_missing"
     else:
         grounding_status = "attempted_no_citations"
         grounding_backend = "agy_native_websearch_structured"

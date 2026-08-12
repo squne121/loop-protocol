@@ -447,11 +447,8 @@ def test_grounded_research_probe_success(monkeypatch, tmp_path):
     assert check["tool_calls_verified"] is True
 
 
-def test_grounded_research_probe_fails_when_url_only_no_tool_call_trace(monkeypatch, tmp_path):
-    """A bare URL string with no structured tool_calls trace is fail-closed with
-    grounding_failure_class agy_web_grounding_tool_call_missing (Issue #1266 Blocker 1,
-    reopened in preflight_agy.py: URL presence alone must never be treated as a
-    web tool-call execution proof)."""
+def test_grounded_research_probe_keeps_url_only_result_for_quality_check(monkeypatch, tmp_path):
+    """A parseable URL may proceed even when provider telemetry is absent."""
     module = load_module()
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
 
@@ -475,14 +472,14 @@ def test_grounded_research_probe_fails_when_url_only_no_tool_call_trace(monkeypa
 
     result = module.run_preflight(grounded_research=True)
 
-    assert result["ok"] is False
-    assert result["failure_class"] == "agy_web_grounding_tool_call_missing"
+    assert result["ok"] is True
+    assert result["failure_class"] is None
     check = result["grounded_research"]["check"]
-    assert check["ok"] is False
-    assert check["failure_class"] == "agy_web_grounding_tool_call_missing"
+    assert check["ok"] is True
+    assert check["failure_class"] is None
     assert check["web_tool_call_count"] == 0
     assert check["tool_calls_verified"] is False
-    # A bare URL is still surfaced as weak/unverified evidence for audit purposes only.
+    # The caller must verify the URL/source content before supporting a claim.
     assert check["evidence_urls"] == ["https://example.com/one"]
 
 

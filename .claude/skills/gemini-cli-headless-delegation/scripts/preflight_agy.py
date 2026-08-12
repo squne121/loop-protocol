@@ -1138,13 +1138,9 @@ def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
     This smoke intentionally favors a lightweight query and records evidence
     samples so caller can verify that web search output can be produced.
 
-    Success requires a machine-verifiable structured `tool_calls` trace naming a
-    recognized web tool (see RECOGNIZED_WEB_TOOL_NAMES). A bare URL string appearing in
-    stdout without this structured trace is weak evidence only and is never treated as
-    proof of a WebSearch tool-call execution; `web_tool_call_count` is never inferred
-    from a URL count alone (Issue #1266 Blocker 1 — this preflight smoke path had not
-    been migrated to the same fail-closed contract already applied to
-    run_gemini_headless.py).
+    The tool-call fields are diagnostics only. A parseable citation URL is
+    sufficient for this attempt to proceed to the caller's source-content
+    quality check; it is not proof that a provider WebSearch tool executed.
     """
     argv = [agy_bin, "-p", GROUNDING_PROBE_PROMPT]
     result: dict[str, Any] = {
@@ -1199,15 +1195,6 @@ def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
             elif not urls:
                 result["failure_reason"] = "agy_grounded_research no_evidence_urls_found"
                 result["failure_class"] = "agy_grounded_research_no_evidence"
-            elif not tool_calls:
-                # Issue #1266 Blocker 1: a bare URL string is never treated as proof of a
-                # WebSearch tool-call execution without a machine-verifiable structured
-                # tool_calls trace naming a recognized web tool.
-                result["web_tool_call_count"] = 0
-                result["failure_reason"] = (
-                    "agy_grounded_research no machine-verifiable web tool-call trace found"
-                )
-                result["failure_class"] = "agy_web_grounding_tool_call_missing"
             else:
                 result["ok"] = True
         except subprocess.TimeoutExpired:
