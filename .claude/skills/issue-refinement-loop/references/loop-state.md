@@ -54,7 +54,7 @@ planner（`plan_refinement_loop.py`）と review（`issue-reviewer` SubAgent）�
 | `scope_signal_guard` | `REFINEMENT_LOOP_PLAN_V1.decisions.scope_signal_guard` |
 | `delivery_rollup` | `REFINEMENT_LOOP_PLAN_V1.decisions.delivery_rollup` |
 | `follow_up_materialization` | `REFINEMENT_LOOP_PLAN_V1.decisions.follow_up_materialization` |
-| `last_verdict` | `ISSUE_REVIEW_RESULT_COMPACT_V1.VERDICT` |
+| `last_verdict` | parent-verified `ISSUE_REVIEW_RESULT_COMPACT_V2.VERDICT` |
 | `blockers_history` | orchestrator が iteration ごとに追記する blocker 要約リスト |
 | `termination_reason` | loop 終了まで `null`（`decide_next_loop_action.py` の判定を受けて orchestrator が設定） |
 
@@ -154,13 +154,9 @@ Exit codes:
 
 優先順位: `inconsistent_state (3)` > `human_escalation (2)` > `warn (1)` > `pass (0)`。
 
-**TODO（follow-up scope）**: `compact_review_result.py` の compact stdout は
-`REVIEWED_BODY_SHA256`（reviewer が実際にレビューした live Issue body の sha256、
-`ISSUE_REVIEW_RESULT_COMPACT_V1` の 9 番目のフィールド）を出力するようになった
-（#1873）。`decide_next_loop_action.py` は現時点でこの値を stale reviewed-body
-検出には使っていない — 大掛かりな新しい state machine を追加せず、既存の
-`--loop-state-file` / `last_verdict` 比較ロジックに軽く配線する形で、将来の
-follow-up Issue として拾うこと。
+`REVIEWED_BODY_SHA256` は V2 の parent-owned field である。parent は単一の live
+Issue API response から得た UTF-8・正規化なしの body bytes hash を expected value
+として artifact binding に使用し、reviewer 自己申告値を authority にしない。
 
 ## scope_signal_guard_decision_v2（#1090 サイドカー）
 

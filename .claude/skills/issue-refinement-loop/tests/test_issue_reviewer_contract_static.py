@@ -115,21 +115,23 @@ OUTPUT_CONTRACT
 
 FIXTURES_DIR = ROOT / ".claude" / "skills" / "issue-refinement-loop" / "fixtures"
 
-_APPROVE_STDOUT = "\n".join(
-    [
-        "STATUS: ok",
-        "VERDICT: approve",
-        "SUMMARY: contract ready",
-        "BLOCKERS: 0",
-        "NEXT_ACTION: proceed",
-        "MUST_READ: ",
-        "REVIEWED_BODY_SHA256: sha256:" + "a" * 64,
-        "EVIDENCE: .claude/artifacts/issue-refinement-loop/2049/"
-        "compact_review_result_20260101T000000Z.json",
-        "ARTIFACT: compact_review_result_v1=.claude/artifacts/issue-refinement-loop/2049/"
-        "compact_review_result_20260101T000000Z.json",
-    ]
-) + "\n"
+SCRIPTS_DIR = ROOT / ".claude" / "skills" / "issue-refinement-loop" / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+import reviewer_transport as _transport  # noqa: E402
+
+# Issue #2054 AC5: the V1 envelope (`EVIDENCE` field, `compact_review_result_v1=`
+# prefix) is retired; classify_child_stdout() now classifies against the V2
+# grammar exclusively (SSOT: reviewer_transport.py).
+_APPROVE_STDOUT = _transport.build_compact_v2(
+    verdict="approve",
+    summary="contract ready",
+    blockers=0,
+    reviewed_body_sha256="sha256:" + "a" * 64,
+    attempt_id="fixture-attempt-2049",
+    artifact_relative="2049/fixture-attempt-2049/attempt-001/compact_review_result_v2.json",
+    artifact_sha256="sha256:" + "b" * 64,
+).decode("utf-8")
 
 
 def test_classify_child_stdout_empty_input_is_reviewer_transport_failure_and_retryable():
@@ -448,7 +450,10 @@ def test_cmd_produce_cleans_up_intermediate_files_and_persists_canonical_artifac
     artifacts_dir = tmp_path / ".claude" / "artifacts" / "issue-refinement-loop" / "2049"
     persisted = sorted(p.name for p in artifacts_dir.glob("*"))
     assert any(name.startswith("root_review_pipeline_") for name in persisted)
-    assert any(name.startswith("compact_review_result_") for name in persisted)
+    assert any((artifacts_dir / name).is_dir() for name in persisted), (
+        "expected an invocation-id subdirectory holding the persisted "
+        f"ISSUE_REVIEW_RESULT_COMPACT_V2 artifact, found: {persisted}"
+    )
 
     out = _json.loads(capsys.readouterr().out)
     assert out["status"] == "ok"

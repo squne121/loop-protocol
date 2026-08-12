@@ -115,24 +115,24 @@ class TestReviewCompactValidateRegistryEntry:
     def test_registry_entry_invoked_as_subprocess(self):
         """GIVEN render_command('review_compact.validate', {'issue_number': N})
         WHEN the rendered argv is invoked as a real subprocess with a valid
-        approve envelope on stdin THEN exit code 0 and stdout is a single
-        REVIEW_COMPACT_VALIDATION_RESULT_V1 JSON object (Issue #1507 AC22)."""
+        V2 approve envelope on stdin THEN exit code 0 and stdout is a single
+        REVIEW_COMPACT_VALIDATION_RESULT_V1 JSON object (Issue #2054 AC5/AC8:
+        the registered CLI validates ISSUE_REVIEW_RESULT_COMPACT_V2 only)."""
+        import reviewer_transport as transport
+
         argv = reg.render_command("review_compact.validate", {"issue_number": 1507})
-        stdin_text = (
-            "STATUS: ok\n"
-            "VERDICT: approve\n"
-            "SUMMARY: contract ready\n"
-            "BLOCKERS: 0\n"
-            "NEXT_ACTION: proceed\n"
-            "MUST_READ: \n"
-            "REVIEWED_BODY_SHA256: sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
-            "EVIDENCE: .claude/artifacts/issue-refinement-loop/1507/compact_review_result_20260714T113303Z.json\n"
-            "ARTIFACT: compact_review_result_v1="
-            ".claude/artifacts/issue-refinement-loop/1507/compact_review_result_20260714T113303Z.json"
+        stdin_bytes = transport.build_compact_v2(
+            verdict="approve",
+            summary="contract ready",
+            blockers=0,
+            reviewed_body_sha256="sha256:" + "1" * 64,
+            attempt_id="registry-entry-attempt",
+            artifact_relative="1507/registry-entry-attempt/attempt-001/compact_review_result_v2.json",
+            artifact_sha256="sha256:" + "2" * 64,
         )
         proc = subprocess.run(
             argv,
-            input=stdin_text.encode("utf-8"),
+            input=stdin_bytes,
             capture_output=True,
             timeout=30,
         )
@@ -144,23 +144,23 @@ class TestReviewCompactValidateRegistryEntry:
     def test_registry_entry_invoked_as_subprocess_rejects_mismatched_issue_number(self):
         """GIVEN render_command bound to a different --issue-number than the
         ARTIFACT's issue segment WHEN invoked as a real subprocess THEN
-        exit code 1 and validation_status invalid (AC15/AC22 parity)."""
+        exit code 1 and validation_status invalid (Issue #2054 AC5/AC8 parity
+        with the retired V1 AC15/AC22 behavior)."""
+        import reviewer_transport as transport
+
         argv = reg.render_command("review_compact.validate", {"issue_number": 9999})
-        stdin_text = (
-            "STATUS: ok\n"
-            "VERDICT: approve\n"
-            "SUMMARY: contract ready\n"
-            "BLOCKERS: 0\n"
-            "NEXT_ACTION: proceed\n"
-            "MUST_READ: \n"
-            "REVIEWED_BODY_SHA256: sha256:1111111111111111111111111111111111111111111111111111111111111111\n"
-            "EVIDENCE: .claude/artifacts/issue-refinement-loop/1507/compact_review_result_20260714T113303Z.json\n"
-            "ARTIFACT: compact_review_result_v1="
-            ".claude/artifacts/issue-refinement-loop/1507/compact_review_result_20260714T113303Z.json"
+        stdin_bytes = transport.build_compact_v2(
+            verdict="approve",
+            summary="contract ready",
+            blockers=0,
+            reviewed_body_sha256="sha256:" + "1" * 64,
+            attempt_id="registry-entry-attempt",
+            artifact_relative="1507/registry-entry-attempt/attempt-001/compact_review_result_v2.json",
+            artifact_sha256="sha256:" + "2" * 64,
         )
         proc = subprocess.run(
             argv,
-            input=stdin_text.encode("utf-8"),
+            input=stdin_bytes,
             capture_output=True,
             timeout=30,
         )
