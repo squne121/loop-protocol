@@ -476,9 +476,9 @@ def test_run_agy_non_supported_capability_argv_never_gets_output_format() -> Non
     assert completed.agy_structured_output_used is False  # type: ignore[attr-defined]
 
 
-def test_run_agy_legacy_citations_without_provenance_are_available_for_quality_check() -> None:
-    """Provider provenance is diagnostic only: parseable citations remain
-    available for the caller's source-content quality check."""
+def test_run_agy_legacy_citations_without_provenance_are_candidates_for_native_quality_check() -> None:
+    """Parseable URLs survive as candidates, but cannot become a successful
+    grounded result before source-content verification."""
     grounded_output = (
         "Response from AGY.\n"
         '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
@@ -508,16 +508,16 @@ def test_run_agy_legacy_citations_without_provenance_are_available_for_quality_c
             )
 
     evidence = result["grounded_research_evidence"]
-    assert evidence["grounding_status"] == "grounded"
+    assert evidence["grounding_status"] == "citation_candidates_unverified"
     assert evidence["grounding_backend"] == "agy_final_result"
-    assert evidence["grounding_failure_class"] is None
+    assert evidence["grounding_failure_class"] == "agy_evidence_quality_unverified"
     assert evidence["url_citation_count"] == 1
     assert evidence["citation_evidence"] == [{"url": "https://example.com", "title": "example"}]
-    assert result["ok"] is True
-    assert result["failure_class"] is None
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_evidence_quality_unverified"
 
 
-def test_valid_citation_with_zero_tool_count_is_not_a_failure_gate() -> None:
+def test_valid_citation_with_zero_tool_count_is_not_a_tool_gate() -> None:
     stdout = 'AGY_GROUNDED_RESEARCH:{"sources": [{"url": "https://example.com/primary"}]}'
 
     evidence = rgh._build_agy_grounded_research_metadata(stdout)
@@ -525,8 +525,8 @@ def test_valid_citation_with_zero_tool_count_is_not_a_failure_gate() -> None:
     assert evidence["web_tool_call_count"] == 0
     assert evidence["search_query_count"] == 0
     assert evidence["url_citation_count"] == 1
-    assert evidence["grounding_status"] == "grounded"
-    assert evidence["grounding_failure_class"] is None
+    assert evidence["grounding_status"] == "citation_candidates_unverified"
+    assert evidence["grounding_failure_class"] == "agy_evidence_quality_unverified"
 
 
 def test_run_agy_non_supported_capability_end_to_end_legacy_semantics_grounded_with_hook_corroboration() -> None:

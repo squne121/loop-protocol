@@ -447,8 +447,9 @@ def test_grounded_research_probe_success(monkeypatch, tmp_path):
     assert check["tool_calls_verified"] is True
 
 
-def test_grounded_research_probe_keeps_url_only_result_for_quality_check(monkeypatch, tmp_path):
-    """A parseable URL may proceed even when provider telemetry is absent."""
+def test_grounded_research_probe_keeps_url_only_candidate_for_quality_check(monkeypatch, tmp_path):
+    """A parseable URL is retained, but source-content verification remains
+    required and the AGY attempt itself is not successful."""
     module = load_module()
     monkeypatch.setattr(module, "_repo_root", lambda: tmp_path)  # type: ignore[call-arg]
 
@@ -472,11 +473,11 @@ def test_grounded_research_probe_keeps_url_only_result_for_quality_check(monkeyp
 
     result = module.run_preflight(grounded_research=True)
 
-    assert result["ok"] is True
-    assert result["failure_class"] is None
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_evidence_quality_unverified"
     check = result["grounded_research"]["check"]
-    assert check["ok"] is True
-    assert check["failure_class"] is None
+    assert check["ok"] is False
+    assert check["failure_class"] == "agy_evidence_quality_unverified"
     assert check["web_tool_call_count"] == 0
     assert check["tool_calls_verified"] is False
     # The caller must verify the URL/source content before supporting a claim.

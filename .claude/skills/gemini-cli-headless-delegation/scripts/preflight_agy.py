@@ -1139,8 +1139,9 @@ def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
     samples so caller can verify that web search output can be produced.
 
     The tool-call fields are diagnostics only. A parseable citation URL is
-    sufficient for this attempt to proceed to the caller's source-content
-    quality check; it is not proof that a provider WebSearch tool executed.
+    retained as a candidate for the caller's source-content quality check;
+    it is neither proof of provider WebSearch nor a successful evidence
+    verdict by itself.
     """
     argv = [agy_bin, "-p", GROUNDING_PROBE_PROMPT]
     result: dict[str, Any] = {
@@ -1195,6 +1196,9 @@ def _run_grounded_research_smoke(agy_bin: str) -> dict[str, Any]:
             elif not urls:
                 result["failure_reason"] = "agy_grounded_research no_evidence_urls_found"
                 result["failure_class"] = "agy_grounded_research_no_evidence"
+            elif not result["tool_calls_verified"]:
+                result["failure_reason"] = "agy_grounded_research_source_content_unverified"
+                result["failure_class"] = "agy_evidence_quality_unverified"
             else:
                 result["ok"] = True
         except subprocess.TimeoutExpired:

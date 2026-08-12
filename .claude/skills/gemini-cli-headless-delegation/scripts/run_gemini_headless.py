@@ -4277,13 +4277,22 @@ def _build_agy_grounded_research_metadata(
     if search_query_count is None:
         search_query_count = web_tool_call_count
 
-    if url_citation_count > 0:
-        # Provider telemetry is diagnostic only.  These URLs are candidate
-        # citations, not a claim-level verdict; web-researcher validates their
-        # source content before reporting `supported`.
+    if url_citation_count > 0 and hook_validated:
+        # Tool telemetry is diagnostic rather than a quality gate. A
+        # validated hook merely identifies this as an AGY attempt with
+        # candidate sources; web-researcher still validates source content
+        # before it reports a claim as supported.
         grounding_status = "grounded"
-        grounding_backend = "agy_native_websearch" if hook_validated else "agy_final_result"
+        grounding_backend = "agy_native_websearch"
         grounding_failure_class = None
+    elif url_citation_count > 0:
+        # Preserve parseable final-result URLs for native source-content
+        # verification, but do not promote a model self-report to grounded
+        # success. This is an evidence-quality fallback reason, not a
+        # tool-count/provenance quality gate.
+        grounding_status = "citation_candidates_unverified"
+        grounding_backend = "agy_final_result"
+        grounding_failure_class = "agy_evidence_quality_unverified"
     elif not tool_call_confirmed:
         grounding_status = "attempted_no_web_tool_call"
         grounding_backend = "none"
