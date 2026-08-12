@@ -14,7 +14,25 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
 - `issue_number`（必須）
 - `invoked_as_loop`（任意、bool）: `issue-refinement-loop` から呼ばれた場合 `true`、人間直起動なら `false`
 
-## Procedure（手順）
+## Producer I/O ownership（producer I/O 所有権の分離、Issue #2049）
+
+`issue-refinement-loop` の `issue-reviewer` custom agent（`.codex/agents/issue-reviewer.toml`, `default_permissions: loop-protocol-readonly`）経由で本 skill が起動される場合、以下の手順（body fetch・temp file・checker 実行・artifact 保存・compact envelope 生成/永続化）は read-only な `issue-reviewer` agent 自身ではなく、`.claude/skills/issue-refinement-loop/scripts/run_root_review_pipeline.py`（root-owned pipeline）が orchestrator（main thread）側で実行する。`issue-reviewer` agent は root-owned pipeline が既に生成・永続化した compact envelope（`ISSUE_REVIEW_RESULT_COMPACT_V1` の stdout 行）を relay するだけであり、`compact_review_result.py` を含む一切のスクリプトを自ら実行しない（PR #2135 human REQUEST_CHANGES iteration-3 P0-1: 従来の narrative な説明だけでは「どの Procedure ステップを child が skip するか」が未規定で、実行可能な handoff contract が無いという指摘を受けて、下記の表で明示する）。
+
+**invoked_as_loop による Procedure ステップの所有権表（executable handoff contract）**:
+
+| Step | 内容 | `invoked_as_loop: true`（`issue-reviewer` 経由） | `invoked_as_loop: false`（人間直起動） |
+|---|---|---|---|
+| 1 | `gh issue view` で本文取得 | orchestrator（main thread）が `root_review_pipeline.produce` 経由で実行。`issue-reviewer` agent は実行しない | main thread がそのまま実行 |
+| 2 | 一時ファイル保存・checker 3 コマンド実行 | 同上（`run_root_review_pipeline.py`, `produce` サブコマンド内部。invocation-private `TemporaryDirectory` を使い呼び出し完了時に自動削除） | main thread がそのまま実行（一時ファイルの cleanup 責務は呼び出し元） |
+| 2.5 | compact envelope（`ISSUE_REVIEW_RESULT_COMPACT_V1`）の生成・`compact_review_result._atomic_write()` による永続化 | orchestrator が `produce` の戻り値 `compact_result.stdout_lines` として取得（root-owned、単一 producer）。`issue-reviewer` agent はこの stdout_lines を **read-only input** として受け取り、そのまま自身の最終出力として relay するだけで、`compact_review_result.py` を自ら実行しない | main thread が `compact_review_result.py` を通常どおり実行（write-enabled、read-only 制約は適用されない） |
+| 3 | checker JSON を `REVIEW_ISSUE_RESULT_V1` に整形 | Step 2 の一部として root-owned pipeline が実行済み（`merged_review_result`） | main thread がそのまま実行 |
+| 4-5 | diff_proposal 提示・本文書き戻し判定 | orchestrator（`issue-refinement-loop`）が VERDICT を元に判定。`issue-reviewer` agent 自身は判定しない | main thread がそのまま実行 |
+
+`issue-reviewer` agent の INPUT_CONTRACT（`invoked_as_loop: true` の場合）は、root-owned pipeline の `produce` コマンド出力に含まれる `compact_result.stdout_lines`（9 行の `ISSUE_REVIEW_RESULT_COMPACT_V1`、既に `compact_review_result.compact_review_result()` の純粋関数で render 済み）を明示フィールドとして受け取ることである。この agent は値を再計算・再フォーマットせず、そのまま relay する。
+
+人間が本 skill を直接起動する場合（`invoked_as_loop: false`）は、以下の Procedure（Step 1-5）を main thread がそのまま実行する（read-only 制約は適用されない）。
+
+## Procedure（`invoked_as_loop: false` — 人間直起動時、または root-owned pipeline 自体の実装時の手順）
 
 1. `gh issue view <番号> --json title,body,labels` で本文を取得する。
 2. 本文を一時ファイルに保存し、以下のスクリプトを**決定論的に**順に実行する（LLM は JSON を整形・転送するだけで、合成ロジック自体を実行しない。Issue #1791 review remediation, Critical #1）:
