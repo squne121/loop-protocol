@@ -70,7 +70,9 @@ ROLE
 - read-only reviewer.
 
 OUTPUT_CONTRACT
-- full structured data は .claude/artifacts/issue-refinement-loop/<N>/ 配下に artifact として保存し、findings[] を保持する。
+- full structured data は
+  .claude/artifacts/issue-refinement-loop/<N>/ 配下に
+  artifact として保存し、findings[] を保持する。
 """
 '''
     violations = _PIPELINE.check_agent_is_read_only_advisory(fixture)
