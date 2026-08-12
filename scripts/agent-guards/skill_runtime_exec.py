@@ -27,7 +27,11 @@ from skill_runtime_command_policy import (
     command_allows_root_no_worktree,
     current_branch,
     is_exact_skill_runtime_anchor_executor_command,
+    is_exact_skill_runtime_authority_transport_consume_executor_command,
+    is_exact_skill_runtime_authority_transport_produce_executor_command,
     is_exact_skill_runtime_contract_update_anchor_executor_command,
+    is_exact_skill_runtime_decide_authority_executor_command,
+    is_exact_skill_runtime_decide_executor_command,
     is_exact_skill_runtime_executor_command,
     is_exact_skill_runtime_fixture_executor_command,
     load_registry_entry,
@@ -1901,6 +1905,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--fixture", required=False, default=None)
     parser.add_argument("--anchor-comment-url", required=False, default=None)
+    parser.add_argument("--loop-state-file", required=False, default=None)
+    parser.add_argument("--review-result-verdict", required=False, default=None)
+    parser.add_argument("--max-iterations", required=False, default=None)
+    # #2086 AC9/AC10: authority_transport.produce / authority_transport.consume.
+    parser.add_argument("--invocation-id", required=False, default=None)
+    parser.add_argument("--git-head-sha", required=False, default=None)
+    parser.add_argument("--evidence-fixture-path", required=False, default=None)
+    parser.add_argument("--router-receipt-path", required=False, default=None)
+    parser.add_argument("--contract-patch-plan-file", required=False, default=None)
+    parser.add_argument("--anchor-context-file", required=False, default=None)
+    # #2086 P0 fix_delta (Blocker 1/2): only ever meaningful for
+    # preflight.run.with_human_context (the operator-selected human-context
+    # lane) -- see skill_runtime_command_policy._parse_exact_skill_runtime_anchor_command.
+    parser.add_argument("--investigation-evidence-transport-path", required=False, default=None)
+    # #2086 P0 fix_delta (Blocker 3): decide.run "Mode B" -- the privileged
+    # router additionally dispatching #2053's canonical authority-transport
+    # verification (generate_router_receipt()) alongside its ordinary
+    # loop-state decision, mirroring decide_next_loop_action.py's own
+    # --authority-transport-path/--authority-expected CLI flags (added by PR
+    # #2068, declared in command_registry.py's decide.run entry, but never
+    # reachable through this executor before this fix_delta).
+    parser.add_argument("--authority-transport-path", required=False, default=None)
+    parser.add_argument("--authority-expected", action="store_true", default=False)
     args = parser.parse_args(argv)
 
     project_root = resolve_project_root()
@@ -1918,6 +1945,34 @@ def main(argv: list[str] | None = None) -> int:
         "contract_update.run.with_anchor",
         "contract_update.run.with_human_context",
     }
+    is_decide_command = args.command_id == "decide.run"
+    is_produce_command = args.command_id == "authority_transport.produce"
+    is_consume_command = args.command_id == "authority_transport.consume"
+    # #2086 P0 fix_delta (Blocker 3): decide.run may ALSO carry
+    # --invocation-id/--git-head-sha (bound into its Mode B authority-check
+    # sub-fields), in addition to authority_transport.produce/consume.
+    if not (is_produce_command or is_consume_command or is_decide_command) and (
+        args.invocation_id
+        or args.git_head_sha
+        or args.evidence_fixture_path
+        or args.router_receipt_path
+        or args.contract_patch_plan_file
+        or args.anchor_context_file
+    ):
+        print(
+            "skill_runtime_exec: --invocation-id/--git-head-sha/--evidence-fixture-path/"
+            "--router-receipt-path/--contract-patch-plan-file/--anchor-context-file are "
+            "only allowed for authority_transport.produce/authority_transport.consume/decide.run",
+            file=sys.stderr,
+        )
+        return 2
+    if not is_decide_command and (args.authority_transport_path or args.authority_expected):
+        print(
+            "skill_runtime_exec: --authority-transport-path/--authority-expected are "
+            "only allowed for decide.run",
+            file=sys.stderr,
+        )
+        return 2
     if is_fixture_command:
         if not args.fixture:
             print("skill_runtime_exec: --fixture required for preflight.run.fixture", file=sys.stderr)
@@ -1925,6 +1980,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.anchor_comment_url:
             print(
                 "skill_runtime_exec: --anchor-comment-url is not allowed for preflight.run.fixture",
+                file=sys.stderr,
+            )
+            return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: --loop-state-file/--review-result-verdict/"
+                "--max-iterations are not allowed for preflight.run.fixture",
                 file=sys.stderr,
             )
             return 2
@@ -1960,6 +2022,20 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: --loop-state-file/--review-result-verdict/"
+                "--max-iterations are not allowed for anchor runtime commands",
+                file=sys.stderr,
+            )
+            return 2
+        if args.investigation_evidence_transport_path and args.command_id != "preflight.run.with_human_context":
+            print(
+                "skill_runtime_exec: --investigation-evidence-transport-path is only "
+                "allowed for preflight.run.with_human_context",
+                file=sys.stderr,
+            )
+            return 2
         command_text = " ".join(
             [
                 "uv",
@@ -1981,6 +2057,11 @@ def main(argv: list[str] | None = None) -> int:
                     if args.command_id == "preflight.run.with_agent_report"
                     else []
                 ),
+                *(
+                    ["--investigation-evidence-transport-path", args.investigation_evidence_transport_path]
+                    if args.investigation_evidence_transport_path
+                    else []
+                ),
             ]
         )
         exact_anchor_command = (
@@ -1993,6 +2074,199 @@ def main(argv: list[str] | None = None) -> int:
         if not exact_anchor_command:
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
+    elif is_decide_command:
+        if args.fixture or args.anchor_comment_url:
+            print(
+                "skill_runtime_exec: --fixture/--anchor-comment-url are not allowed for decide.run",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.loop_state_file or not args.review_result_verdict:
+            print(
+                "skill_runtime_exec: --loop-state-file and --review-result-verdict "
+                "are required for decide.run",
+                file=sys.stderr,
+            )
+            return 2
+        # #2086 P0 fix_delta (Blocker 3): decide.run "Mode B" -- authority
+        # sub-fields must be supplied all-or-none (fail-closed on any
+        # partial/mixed set), never a generic passthrough of individual
+        # optional registry fields. `--authority-expected` is included in
+        # this all-or-none set (not treated as independently optional) so a
+        # Mode B invocation is always unambiguous about whether a missing/
+        # malformed manifest should fail closed.
+        _decide_authority_fields = (
+            args.invocation_id,
+            args.git_head_sha,
+            args.authority_transport_path,
+        )
+        _decide_authority_present = any(_decide_authority_fields) or args.authority_expected
+        _decide_authority_complete = all(_decide_authority_fields) and args.authority_expected
+        is_decide_authority_mode = False
+        if _decide_authority_present:
+            if not _decide_authority_complete:
+                print(
+                    "skill_runtime_exec: decide.run Mode B requires "
+                    "--invocation-id, --git-head-sha, --authority-transport-path, "
+                    "and --authority-expected all together (all-or-none)",
+                    file=sys.stderr,
+                )
+                return 2
+            is_decide_authority_mode = True
+        max_iterations = args.max_iterations or "3"
+        command_tokens = [
+            "uv",
+            "run",
+            "python3",
+            SKILL_RUNTIME_EXEC_REL,
+            "--command-id",
+            args.command_id,
+            "--issue-number",
+            str(args.issue_number),
+            "--repo",
+            args.repo,
+            "--loop-state-file",
+            args.loop_state_file,
+            "--review-result-verdict",
+            args.review_result_verdict,
+            "--max-iterations",
+            max_iterations,
+        ]
+        if is_decide_authority_mode:
+            # These represent skill_runtime_exec.py's OWN new CLI flags on
+            # the OUTER invocation (matched by the exact parser below) --
+            # not a second --issue-number/--repo pair. The existing
+            # --issue-number/--repo already parsed above are the ones
+            # forwarded to decide_next_loop_action.py's own authority
+            # sub-fields via render_params below.
+            command_tokens += [
+                "--authority-transport-path",
+                args.authority_transport_path,
+                "--authority-expected",
+                "--invocation-id",
+                args.invocation_id,
+                "--git-head-sha",
+                args.git_head_sha,
+            ]
+        command_text = " ".join(command_tokens)
+        if is_decide_authority_mode:
+            exact_decide_command = is_exact_skill_runtime_decide_authority_executor_command(
+                command_text, project_root, project_root
+            )
+        else:
+            exact_decide_command = is_exact_skill_runtime_decide_executor_command(
+                command_text, project_root, project_root
+            )
+        if not exact_decide_command:
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    elif is_produce_command:
+        if (
+            args.fixture
+            or args.anchor_comment_url
+            or args.loop_state_file
+            or args.review_result_verdict
+            or args.max_iterations
+        ):
+            print(
+                "skill_runtime_exec: only --invocation-id/--git-head-sha/"
+                "--evidence-fixture-path are allowed for authority_transport.produce",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.invocation_id or not args.git_head_sha or not args.evidence_fixture_path:
+            print(
+                "skill_runtime_exec: --invocation-id, --git-head-sha, and "
+                "--evidence-fixture-path are required for authority_transport.produce",
+                file=sys.stderr,
+            )
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--invocation-id",
+                args.invocation_id,
+                "--git-head-sha",
+                args.git_head_sha,
+                "--produce-authority-transport",
+                args.evidence_fixture_path,
+            ]
+        )
+        if not is_exact_skill_runtime_authority_transport_produce_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    elif is_consume_command:
+        if (
+            args.fixture
+            or args.anchor_comment_url
+            or args.loop_state_file
+            or args.review_result_verdict
+            or args.max_iterations
+        ):
+            print(
+                "skill_runtime_exec: only --invocation-id/--git-head-sha/"
+                "--router-receipt-path/--contract-patch-plan-file/--anchor-context-file "
+                "are allowed for authority_transport.consume",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.invocation_id or not args.git_head_sha or not args.router_receipt_path:
+            print(
+                "skill_runtime_exec: --invocation-id, --git-head-sha, and "
+                "--router-receipt-path are required for authority_transport.consume",
+                file=sys.stderr,
+            )
+            return 2
+        if bool(args.contract_patch_plan_file) != bool(args.anchor_context_file):
+            print(
+                "skill_runtime_exec: --contract-patch-plan-file and "
+                "--anchor-context-file must be supplied together or not at all "
+                "for authority_transport.consume",
+                file=sys.stderr,
+            )
+            return 2
+        consume_tail = [
+            "uv",
+            "run",
+            "python3",
+            SKILL_RUNTIME_EXEC_REL,
+            "--command-id",
+            args.command_id,
+            "--issue-number",
+            str(args.issue_number),
+            "--repo",
+            args.repo,
+            "--invocation-id",
+            args.invocation_id,
+            "--git-head-sha",
+            args.git_head_sha,
+            "--consume-authority-transport",
+            args.router_receipt_path,
+        ]
+        if args.contract_patch_plan_file and args.anchor_context_file:
+            consume_tail += [
+                "--contract-patch-plan-file",
+                args.contract_patch_plan_file,
+                "--anchor-context-file",
+                args.anchor_context_file,
+            ]
+        command_text = " ".join(consume_tail)
+        if not is_exact_skill_runtime_authority_transport_consume_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
     else:
         if args.fixture:
             print("skill_runtime_exec: --fixture is only allowed for preflight.run.fixture", file=sys.stderr)
@@ -2001,6 +2275,13 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "skill_runtime_exec: --anchor-comment-url is only allowed for "
                 "an anchor-bound preflight profile",
+                file=sys.stderr,
+            )
+            return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: --loop-state-file/--review-result-verdict/"
+                "--max-iterations are only allowed for decide.run",
                 file=sys.stderr,
             )
             return 2
@@ -2047,9 +2328,15 @@ def main(argv: list[str] | None = None) -> int:
     if not registry_path.is_file():
         raise RuntimeError("registry_missing")
 
+    # #2086 AC10: decide.run dispatches decide_next_loop_action.py, not
+    # run_refinement_preflight.py -- the pre-existing integrity/symlink
+    # check below must validate the script the command_id actually reaches,
+    # otherwise decide.run could never pass this check even though it never
+    # touches run_refinement_preflight.py.
     script_path = (
         Path(project_root) / ".claude" / "skills" / "issue-refinement-loop"
-        / "scripts" / "run_refinement_preflight.py"
+        / "scripts"
+        / ("decide_next_loop_action.py" if is_decide_command else "run_refinement_preflight.py")
     )
     if script_path.is_symlink() or not script_path.is_file():
         raise RuntimeError("preflight_script_invalid")
@@ -2064,11 +2351,69 @@ def main(argv: list[str] | None = None) -> int:
     render_command = getattr(module, "render_command", None)
     if not callable(render_command):
         raise RuntimeError("render_command_missing")
-    render_params: dict[str, object] = {"issue_number": args.issue_number, "repo": args.repo}
-    if is_fixture_command:
-        render_params["fixture"] = args.fixture
-    if is_anchor_command or is_contract_update_command:
-        render_params["anchor_comment_url"] = args.anchor_comment_url
+    # #2086 AC10 P0: `decide.run`'s registry entry declares only
+    # loop_state_file/verdict/max_iterations placeholders (it has no
+    # `{issue_number}`/`{repo}` tokens in its argv template -- unlike every
+    # other command_id here). render_command() fail-closed-rejects any
+    # extra params not in the entry's declared `placeholders`, so
+    # unconditionally seeding `issue_number`/`repo` into render_params
+    # made every real decide.run dispatch raise `ValueError` before ever
+    # reaching a subprocess. This was masked by the previous test's stub
+    # `render_command()`, which silently ignored undeclared params instead
+    # of validating them (see test_decide_run_reaches_real_subprocess).
+    if is_decide_command:
+        render_params: dict[str, object] = {
+            "loop_state_file": args.loop_state_file,
+            "verdict": args.review_result_verdict,
+            "max_iterations": args.max_iterations or "3",
+        }
+        # #2086 P0 fix_delta (Blocker 3): Mode B -- forward the authority
+        # sub-fields to decide_next_loop_action.py's own
+        # --issue-number/--repo/--authority-transport-path/
+        # --authority-expected/--invocation-id/--git-head-sha flags
+        # (command_registry.py decide.run entry, PR #2068). Only populated
+        # when the pre-dispatch all-or-none check above accepted a
+        # complete Mode B field set.
+        if is_decide_authority_mode:
+            render_params["issue_number"] = args.issue_number
+            render_params["repo"] = args.repo
+            render_params["authority_transport_manifest_path"] = args.authority_transport_path
+            render_params["authority_expected"] = True
+            render_params["invocation_id"] = args.invocation_id
+            render_params["git_head_sha"] = args.git_head_sha
+    elif is_produce_command:
+        # #2086 AC9/AC10: producer role -- issue_number/repo are NOT seeded
+        # here (unlike the generic `else` branch below) because
+        # `authority_transport.produce`'s own render_params below already
+        # supplies them alongside its own required placeholders.
+        render_params = {
+            "issue_number": args.issue_number,
+            "repo": args.repo,
+            "invocation_id": args.invocation_id,
+            "git_head_sha": args.git_head_sha,
+            "evidence_fixture_path": args.evidence_fixture_path,
+        }
+    elif is_consume_command:
+        render_params = {
+            "issue_number": args.issue_number,
+            "repo": args.repo,
+            "invocation_id": args.invocation_id,
+            "git_head_sha": args.git_head_sha,
+            "router_receipt_path": args.router_receipt_path,
+        }
+        if args.contract_patch_plan_file and args.anchor_context_file:
+            render_params["contract_patch_plan_file"] = args.contract_patch_plan_file
+            render_params["anchor_context_file"] = args.anchor_context_file
+    else:
+        render_params = {"issue_number": args.issue_number, "repo": args.repo}
+        if is_fixture_command:
+            render_params["fixture"] = args.fixture
+        if is_anchor_command or is_contract_update_command:
+            render_params["anchor_comment_url"] = args.anchor_comment_url
+            if args.investigation_evidence_transport_path:
+                render_params["investigation_evidence_transport_path"] = (
+                    args.investigation_evidence_transport_path
+                )
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
 
