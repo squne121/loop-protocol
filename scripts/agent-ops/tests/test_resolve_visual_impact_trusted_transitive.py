@@ -54,11 +54,13 @@ def git_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _commit_files(repo: Path, files: dict[str, str]) -> str:
+def _commit_files(repo: Path, files: dict[str, str], *, delete: list[str] | None = None) -> str:
     for rel_path, content in files.items():
         target = repo / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+    for rel_path in delete or []:
+        (repo / rel_path).unlink()
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "test commit")
     return _git(repo, "rev-parse", "HEAD").stdout.strip()
@@ -442,3 +444,252 @@ def test_typescript_bootstrap_policy_avoids_node_dependency_in_trusted_workflow(
     for fragment in ("pnpm ", "npm ", "npx "):
         assert fragment not in text, f"trusted workflow must never invoke {fragment!r} (AC8)"
     assert "resolve_visual_impact.py" in text
+
+
+# --- PR #2144 review fix_delta (iteration 2, human REQUEST_CHANGES) -------
+# P1-1: CSS transitive asset deletion bypass; P1-2: bare (non `./`-prefixed)
+# CSS `url()`/`@import` targets silently ignored; P1-3: unbounded git
+# subprocess calls inside the trusted graph walk; P1-4: `git ls-tree`
+# plumbing failures misclassified as resource-bound-exceeded.
+
+
+def test_css_url_deleted_asset_is_unresolvable_not_silently_dropped(git_repo: Path) -> None:
+    """P1-1: a candidate PR that DELETES a previously-reachable CSS `url()`
+    asset (base: entry.ts -> ./styles/theme.css -> url('./bg.png'); head:
+    bg.png deleted) must never let the walker silently drop the dangling
+    reference -- the target is reported as `unresolvable_static_import`
+    (fail-closed), never omitted from `unknown_impact` entirely."""
+    _commit_files(
+        git_repo,
+        {
+            "src/entry.ts": "import './styles/theme.css'\n",
+            "src/styles/theme.css": "body { background: url('./bg.png'); }\n",
+            "src/styles/bg.png": "binarydata",
+        },
+    )
+    head_sha = _commit_files(git_repo, {}, delete=["src/styles/bg.png"])
+    entries, errors = rvi.git_ls_tree(git_repo, head_sha, max_entries=10_000)
+    assert errors == []
+    reachable, unknown = rvi.resolve_trusted_transitive_graph(["src/entry.ts"], entries, git_repo)
+    assert "src/styles/theme.css" in reachable
+    assert "src/styles/bg.png" not in reachable
+    assert any(
+        u["kind"] == "unresolvable_static_import" and u["detail"] == "./bg.png" for u in unknown
+    ), unknown
+
+
+def test_end_to_end_adversarial_forged_empty_affected_surfaces_css_asset_deletion(git_repo: Path) -> None:
+    """P1-1 end-to-end (human review's suggested regression): base commit
+    has a reachable CSS asset; the candidate PR head deletes only that
+    asset (never touching entry.ts/theme.css); a producer decision that
+    self-reports `affected_surfaces: []` for this PR must still be
+    rejected by `verify_trusted_artifact()`'s FINAL verdict, even though
+    the deleted asset itself is outside `coverage_roots` and was never a
+    direct producer path."""
+    _commit_files(
+        git_repo,
+        {
+            "src/entry.ts": "import './styles/theme.css'\n",
+            "src/styles/theme.css": "body { background: url('./bg.png'); }\n",
+            "src/styles/bg.png": "binarydata",
+        },
+    )
+    head_sha = _commit_files(git_repo, {}, delete=["src/styles/bg.png"])
+    registry_doc = _registry_doc(producer_paths=["src/entry.ts"])
+    changed_entries = [{"status": "removed", "path": "src/styles/bg.png"}]
+    decision = _decision(head_sha=head_sha, changed_path_entries=changed_entries, affected_surfaces=[])
+    trusted = rvi.TrustedRederivation(
+        changed_path_entries=changed_entries,
+        base_registry_doc=registry_doc,
+        head_registry_doc=registry_doc,
+        candidate_head_ref=head_sha,
+        repo_root=git_repo,
+    )
+    verdict = _verify(head_sha=head_sha, decision=decision, trusted_rederivation=trusted)
+    assert verdict.ok is False
+    assert any(
+        code.startswith("affected_surfaces_undercount") for code in verdict.reason_codes
+    ), verdict.reason_codes
+
+
+def test_css_url_bare_relative_specifier_is_resolved(git_repo: Path) -> None:
+    """P1-2: `url('bg.png')` (no `./` prefix) is a valid CSS relative URL
+    per spec -- it must be routed through the confined resolver and marked
+    reachable, never silently vanish because the JS/TS bare-specifier
+    classifier (`_trusted_is_relative_specifier()`) would treat it as an
+    external package import."""
+    head_sha = _commit_files(
+        git_repo,
+        {
+            "src/entry.ts": "import './styles/theme.css'\n",
+            "src/styles/theme.css": "body { background: url('bg.png'); }\n",
+            "src/styles/bg.png": "binarydata",
+        },
+    )
+    entries, _errors = rvi.git_ls_tree(git_repo, head_sha, max_entries=10_000)
+    reachable, unknown = rvi.resolve_trusted_transitive_graph(["src/entry.ts"], entries, git_repo)
+    assert "src/styles/bg.png" in reachable
+    assert unknown == []
+
+
+def test_css_import_bare_relative_specifier_is_resolved(git_repo: Path) -> None:
+    """P1-2: `@import 'partial.css'` (no `./` prefix) is likewise a valid
+    CSS relative URL and must be walked through the confined resolver."""
+    head_sha = _commit_files(
+        git_repo,
+        {
+            "src/entry.ts": "import './styles/main.css'\n",
+            "src/styles/main.css": "@import 'partial.css';\n",
+            "src/styles/partial.css": "body { color: red; }\n",
+        },
+    )
+    entries, _errors = rvi.git_ls_tree(git_repo, head_sha, max_entries=10_000)
+    reachable, unknown = rvi.resolve_trusted_transitive_graph(["src/entry.ts"], entries, git_repo)
+    assert "src/styles/partial.css" in reachable
+    assert unknown == []
+
+
+def test_css_import_bare_deleted_target_is_unresolvable(git_repo: Path) -> None:
+    """P1-1 + P1-2 combined: a bare `@import 'partial.css'` whose target is
+    deleted at head must be reported `unresolvable_static_import`, never
+    silently dropped for either reason (bare specifier AND missing file)."""
+    _commit_files(
+        git_repo,
+        {
+            "src/entry.ts": "import './styles/main.css'\n",
+            "src/styles/main.css": "@import 'partial.css';\n",
+            "src/styles/partial.css": "body { color: red; }\n",
+        },
+    )
+    head_sha = _commit_files(git_repo, {}, delete=["src/styles/partial.css"])
+    entries, _errors = rvi.git_ls_tree(git_repo, head_sha, max_entries=10_000)
+    reachable, unknown = rvi.resolve_trusted_transitive_graph(["src/entry.ts"], entries, git_repo)
+    assert "src/styles/partial.css" not in reachable
+    assert any(
+        u["kind"] == "unresolvable_static_import" and u["detail"] == "./partial.css" for u in unknown
+    ), unknown
+
+
+def test_css_url_external_http_and_data_specifiers_remain_ignored(git_repo: Path) -> None:
+    """P1-2 negative control: `_trusted_is_css_relative_specifier()` must
+    still correctly classify genuinely EXTERNAL CSS URLs (`data:`,
+    `http://`, `https://`) as non-local, never routing them through the
+    confined (local repo tree) resolver."""
+    head_sha = _commit_files(
+        git_repo,
+        {
+            "src/entry.ts": "import './styles/theme.css'\n",
+            "src/styles/theme.css": (
+                "@import url('https://fonts.example.com/font.css');\n"
+                "body { background: url('data:image/png;base64,AAAA'); }\n"
+                "div { background: url('http://cdn.example.com/x.png'); }\n"
+            ),
+        },
+    )
+    entries, _errors = rvi.git_ls_tree(git_repo, head_sha, max_entries=10_000)
+    reachable, unknown = rvi.resolve_trusted_transitive_graph(["src/entry.ts"], entries, git_repo)
+    assert reachable == {"src/entry.ts", "src/styles/theme.css"}
+    assert unknown == []
+
+
+def test_git_ls_tree_plumbing_error_is_distinct_from_resource_bound(git_repo: Path) -> None:
+    """P1-4: an unresolvable `ref` passed to `git_ls_tree()` (a genuine git
+    plumbing failure, not a missing file and not resource exhaustion) must
+    be reported with the `git_plumbing_error:` prefix, never
+    `resource_bound_exceeded:`."""
+    _commit_files(git_repo, {"src/entry.ts": "export const x = 1\n"})
+    bogus_ref = "0" * 40
+    entries, errors = rvi.git_ls_tree(git_repo, bogus_ref, max_entries=10_000)
+    assert entries == {}
+    assert len(errors) == 1
+    assert errors[0].startswith("git_plumbing_error:ls_tree:")
+
+
+def test_resolve_trusted_minimum_raises_distinct_plumbing_error(git_repo: Path) -> None:
+    """P1-4: `resolve_trusted_minimum()` must raise
+    `TrustedGitPlumbingError` (a type DISTINCT from
+    `TrustedTransitiveResourceBoundExceeded`) for a genuine `git ls-tree`
+    plumbing failure -- never conflate the two failure classes at the
+    exception-type level, since the caller (`verify_trusted_artifact()`)
+    branches on exception type to pick the reason-code prefix."""
+    _commit_files(git_repo, {"src/entry.ts": "export const x = 1\n"})
+    registry_doc = _registry_doc(producer_paths=["src/entry.ts"])
+    bogus_ref = "0" * 40
+    with pytest.raises(rvi.TrustedGitPlumbingError):
+        rvi.resolve_trusted_minimum(
+            ["src/entry.ts"], registry_doc, registry_doc, candidate_head_ref=bogus_ref, repo_root=git_repo
+        )
+
+
+def test_git_plumbing_error_fails_closed_in_verify_trusted_artifact_distinct_reason(git_repo: Path) -> None:
+    """P1-4 integration: a genuine git plumbing failure while walking the
+    candidate head's graph propagates as an unconditional `ok=False`
+    verdict from `verify_trusted_artifact()`, tagged with the DISTINCT
+    `trusted_transitive_git_plumbing_error` reason code -- never the
+    `trusted_transitive_resource_bound_exceeded` code (AC7: the two
+    failure classes must stay distinguishable all the way to the final
+    verdict)."""
+    head_sha = _commit_files(git_repo, {"src/entry.ts": "export const x = 1\n"})
+    registry_doc = _registry_doc(producer_paths=["src/entry.ts"])
+    changed_entries = [{"status": "modified", "path": "docs/README.md"}]
+    # PR #2144 review fix_delta P1-4: candidate_head_ref intentionally set
+    # to an unfetched commit-ish to trigger a genuine `git ls-tree`
+    # plumbing failure (distinct from the missing-registry / resource-
+    # exhaustion cases exercised elsewhere in this file).
+    decision = _decision(head_sha=head_sha, changed_path_entries=changed_entries, affected_surfaces=[])
+    bogus_head_ref = "0" * 40
+    trusted = rvi.TrustedRederivation(
+        changed_path_entries=changed_entries,
+        base_registry_doc=registry_doc,
+        head_registry_doc=registry_doc,
+        candidate_head_ref=bogus_head_ref,
+        repo_root=git_repo,
+    )
+    verdict = _verify(head_sha=head_sha, decision=decision, trusted_rederivation=trusted)
+    assert verdict.ok is False
+    assert any(
+        code.startswith("trusted_transitive_git_plumbing_error") for code in verdict.reason_codes
+    ), verdict.reason_codes
+    assert not any(
+        code.startswith("trusted_transitive_resource_bound_exceeded") for code in verdict.reason_codes
+    ), verdict.reason_codes
+
+
+def test_git_subprocess_stall_is_terminated_by_timeout(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """P1-3: a genuinely STALLED `git cat-file blob` subprocess (a real
+    external process that sleeps well past the wall-clock deadline, not a
+    mocked clock and not a pre-expired deadline check before `visit()` is
+    even called) is actually terminated by the per-subprocess `timeout=`
+    argument -- the walk must fail closed via
+    `TrustedTransitiveResourceBoundExceeded` in well under the fake
+    process's sleep duration."""
+    import os
+    import shutil
+
+    real_git = shutil.which("git")
+    assert real_git is not None
+    head_sha = _commit_files(git_repo, {"src/entry.ts": "export const x = 1\n"})
+    entries, _errors = rvi.git_ls_tree(git_repo, head_sha, max_entries=10_000)
+
+    fake_bin_dir = tmp_path / "fake_bin"
+    fake_bin_dir.mkdir()
+    fake_git = fake_bin_dir / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'if [ "$3" = "cat-file" ] && [ "$4" = "blob" ]; then\n'
+        "  sleep 30\n"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    deadline = time.monotonic() + 0.5
+    walker = rvi.TrustedGraphWalker(entries, git_repo, deadline)
+    start = time.monotonic()
+    with pytest.raises(rvi.TrustedTransitiveResourceBoundExceeded):
+        walker.visit("src/entry.ts", 0)
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0, f"subprocess timeout did not actually bound the stall (elapsed={elapsed}s)"

@@ -1474,7 +1474,9 @@ _GIT_MISSING_PATH_PATTERNS = (
 )
 
 
-def read_git_blob_at_ref(repo_root: Path, ref: str, path: str) -> tuple[GitReadOutcome, bytes | None, str]:
+def read_git_blob_at_ref(
+    repo_root: Path, ref: str, path: str, *, timeout_seconds: float | None = None
+) -> tuple[GitReadOutcome, bytes | None, str]:
     """Issue #2099 AC7: read `<path>` as it exists at commit `<ref>` via
     `git show <ref>:<path>`, classifying the result into the three-way
     `GitReadOutcome` above instead of collapsing "file missing" and "git
@@ -1488,23 +1490,43 @@ def read_git_blob_at_ref(repo_root: Path, ref: str, path: str) -> tuple[GitReadO
     way) -- so `ref` resolvability is checked FIRST and independently via
     `git cat-file -e <ref>^{commit}`, before ever inspecting the `git show`
     stderr text for path-missing classification. Returns
-    `(outcome, content_or_None, diagnostic_message)`."""
-    ref_check = subprocess.run(
-        ["git", "-C", str(repo_root), "cat-file", "-e", f"{ref}^{{commit}}"],
-        capture_output=True,
-        check=False,
-    )
+    `(outcome, content_or_None, diagnostic_message)`. `timeout_seconds`
+    (PR #2144 review fix_delta P1-3) bounds each subprocess call -- a
+    stalled `git cat-file -e`/`git show` is classified as `PLUMBING_ERROR`
+    (a genuine git failure), never an unbounded hang."""
+    effective_timeout = timeout_seconds if timeout_seconds is not None else TRUSTED_TRANSITIVE_MAX_WALL_SECONDS
+    try:
+        ref_check = subprocess.run(
+            ["git", "-C", str(repo_root), "cat-file", "-e", f"{ref}^{{commit}}"],
+            capture_output=True,
+            check=False,
+            timeout=effective_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            GitReadOutcome.PLUMBING_ERROR,
+            None,
+            f"git cat-file -e timed out after {effective_timeout}s resolving ref {ref!r}",
+        )
     if ref_check.returncode != 0:
         return (
             GitReadOutcome.PLUMBING_ERROR,
             None,
             f"ref not resolvable as a commit object: {ref_check.stderr.decode('utf-8', 'replace')}",
         )
-    proc = subprocess.run(
-        ["git", "-C", str(repo_root), "show", f"{ref}:{path}"],
-        capture_output=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{ref}:{path}"],
+            capture_output=True,
+            check=False,
+            timeout=effective_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            GitReadOutcome.PLUMBING_ERROR,
+            None,
+            f"git show timed out after {effective_timeout}s reading {path!r} at {ref!r}",
+        )
     if proc.returncode == 0:
         return GitReadOutcome.OK, proc.stdout, ""
     stderr_text = proc.stderr.decode("utf-8", "replace")
@@ -1527,6 +1549,19 @@ class TrustedTransitiveResourceBoundExceeded(RegistryError):
     partial result) when a per-file byte / total byte / file count /
     import-hop depth / wall-clock bound is exceeded while walking the
     candidate head's static import graph."""
+
+
+class TrustedGitPlumbingError(RegistryError):
+    """Issue #2099 AC7 (PR #2144 review fix_delta P1-4): raised when a `git
+    ls-tree` / `git cat-file blob` call in the trusted transitive graph
+    walk fails for a GENUINE git plumbing reason (network hiccup, shallow
+    fetch never fetched the object, corrupted object, unresolvable ref) --
+    deliberately a DIFFERENT exception type from
+    `TrustedTransitiveResourceBoundExceeded`, so `verify_trusted_artifact()`
+    can report `trusted_transitive_git_plumbing_error:*` as a distinct
+    reason code, never conflated with a resource-bound violation (Issue
+    #2099 AC7 requires "missing / resource exhaustion / git plumbing
+    failure" to stay distinct)."""
 
 
 TRUSTED_TRANSITIVE_MAX_FILES = 4000
@@ -1553,17 +1588,38 @@ _TRUSTED_CSS_IMPORT_RE = re.compile(r"""@import\s+(?:url\()?['"]([^'"]+)['"]\)?"
 _TRUSTED_CSS_URL_RE = re.compile(r"""url\(\s*(['"]?)([^'")]+)\1\s*\)""")
 
 
-def git_ls_tree(repo_root: Path, ref: str, *, max_entries: int) -> tuple[dict[str, GitTreeEntry], list[str]]:
+def _git_subprocess_timeout(deadline: float) -> float:
+    """Issue #2099 AC4 (PR #2144 review fix_delta P1-3): every `git`
+    subprocess.run() call inside the trusted transitive graph walk is
+    bounded by a REMAINING-time timeout derived from one shared absolute
+    wall-clock `deadline`, so a single stalled `git` process can never
+    block past `TRUSTED_TRANSITIVE_MAX_WALL_SECONDS` regardless of how many
+    subprocess calls preceded it -- `_check_bounds()`'s own deadline check
+    only fires when control RETURNS to Python between subprocess calls, so
+    it alone cannot bound a single stalled call."""
+    return max(0.001, deadline - time.monotonic())
+
+
+def git_ls_tree(
+    repo_root: Path, ref: str, *, max_entries: int, timeout_seconds: float = TRUSTED_TRANSITIVE_MAX_WALL_SECONDS
+) -> tuple[dict[str, GitTreeEntry], list[str]]:
     """Issue #2099 AC1/AC4: enumerate every path/blob-sha/size/mode at
     commit `ref` in ONE `git ls-tree -r -z -l` call (metadata only -- no
     blob content is read here). Bounded by `max_entries` (AC4 file-count
     resource bound); a plumbing failure (e.g. `ref` was never fetched
-    locally) is reported as an error, never a silently-empty tree."""
-    proc = subprocess.run(
-        ["git", "-C", str(repo_root), "ls-tree", "-r", "-z", "-l", ref],
-        capture_output=True,
-        check=False,
-    )
+    locally) is reported as an error, never a silently-empty tree.
+    `timeout_seconds` (PR #2144 review fix_delta P1-3) bounds the
+    subprocess call itself -- a stalled `git ls-tree` is converted into a
+    `resource_bound_exceeded:wall_time` error, never an unbounded hang."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-tree", "-r", "-z", "-l", ref],
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return {}, ["resource_bound_exceeded:wall_time:ls_tree"]
     if proc.returncode != 0:
         return {}, [f"git_plumbing_error:ls_tree:{proc.stderr.decode('utf-8', 'replace')}"]
     entries: dict[str, GitTreeEntry] = {}
@@ -1593,6 +1649,29 @@ def _trusted_is_absolute_specifier(spec: str) -> bool:
 
 def _trusted_is_virtual_specifier(spec: str) -> bool:
     return bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:", spec)) and not spec.startswith("node:")
+
+
+def _trusted_is_css_relative_specifier(spec: str) -> bool:
+    """Issue #2099 AC2 (PR #2144 review fix_delta P1-2): CSS `url()` /
+    `@import` relative-URL classification is DELIBERATELY different from
+    the JS/TS module-specifier classification above
+    (`_trusted_is_relative_specifier()`, which only accepts an explicit
+    `./`/`../` prefix -- correct for JS/TS, where a bare specifier means a
+    `node_modules` package). Per the CSS spec, a bare `bg.png` or
+    `theme.css` (no `./` prefix) IS a valid relative URL resolved against
+    the containing stylesheet -- treating it as an external/bare import
+    (as the JS classifier would) causes it to silently vanish from the
+    graph instead of being resolved or explicitly rejected. Returns `True`
+    for any path-like target that is not a scheme-qualified URL (`data:`,
+    `http:`, `https:`, or any other `scheme:` virtual specifier) and not
+    root-absolute (`/...`, handled separately as `absolute_specifier_rejected`)."""
+    if spec.startswith(("data:", "http://", "https://")):
+        return False
+    if _trusted_is_absolute_specifier(spec):
+        return False
+    if _trusted_is_virtual_specifier(spec):
+        return False
+    return True
 
 
 def _trusted_resolve_relative_path(containing_path: str, spec: str) -> str | None:
@@ -1677,13 +1756,20 @@ class TrustedGraphWalker:
         cached = self._blob_cache.get(entry.blob_sha)
         if cached is not None:
             return cached
-        proc = subprocess.run(
-            ["git", "-C", str(self.repo_root), "cat-file", "blob", entry.blob_sha],
-            capture_output=True,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(self.repo_root), "cat-file", "blob", entry.blob_sha],
+                capture_output=True,
+                check=False,
+                timeout=_git_subprocess_timeout(self.deadline),
+            )
+        except subprocess.TimeoutExpired as exc:
+            # PR #2144 review fix_delta P1-3: a stalled `git cat-file blob`
+            # is a wall-clock resource-bound violation, never an unbounded
+            # hang past `TRUSTED_TRANSITIVE_MAX_WALL_SECONDS`.
+            raise TrustedTransitiveResourceBoundExceeded(f"wall_time:cat_file:{path}") from exc
         if proc.returncode != 0:
-            raise RegistryError(f"git_plumbing_error:cat_file:{path}:{proc.stderr.decode('utf-8', 'replace')}")
+            raise TrustedGitPlumbingError(f"cat_file:{path}:{proc.stderr.decode('utf-8', 'replace')}")
         self._blob_cache[entry.blob_sha] = proc.stdout
         return proc.stdout
 
@@ -1812,19 +1898,33 @@ class TrustedGraphWalker:
                 )
 
     def _visit_css_text(self, path: str, text: str, depth: int) -> None:
+        # PR #2144 review fix_delta P1-1/P1-2: CSS `@import`/`url()`
+        # targets are routed through `_trusted_is_css_relative_specifier()`
+        # (bare `theme.css`/`bg.png`, not just `./`-prefixed, is a valid
+        # CSS relative URL -- P1-2) and normalized to a `./`-prefixed spec
+        # before reaching the shared confined resolver / `_dispatch_specifier()`
+        # (which otherwise treats a bare specifier as an external
+        # bare/package import, the JS/TS semantics). A target that fails to
+        # resolve at the candidate head (e.g. a previously-reachable CSS
+        # asset that this PR deletes) is reported as `unresolvable_static_import`
+        # -- fail-closed, never silently dropped from the graph (P1-1).
         for m in _TRUSTED_CSS_IMPORT_RE.finditer(text):
             spec = m.group(1)
-            if _trusted_is_relative_specifier(spec):
-                self._dispatch_specifier(path, spec, depth)
+            if _trusted_is_css_relative_specifier(spec):
+                normalized = spec if _trusted_is_relative_specifier(spec) else f"./{spec}"
+                self._dispatch_specifier(path, normalized, depth)
             elif _trusted_is_absolute_specifier(spec):
                 self.unknown_impact.append({"file": path, "kind": "absolute_specifier_rejected", "detail": spec})
+            # else: data:/http(s):/other scheme-qualified @import target --
+            # external, not a local impact source.
         for m in _TRUSTED_CSS_URL_RE.finditer(text):
             spec = m.group(2)
             if spec.startswith(("data:", "http://", "https://", "#")):
                 continue
             spec = spec.split("#")[0].split("?")[0]
-            if _trusted_is_relative_specifier(spec):
-                resolved = _trusted_resolve_relative_path(path, spec)
+            if _trusted_is_css_relative_specifier(spec):
+                normalized = spec if _trusted_is_relative_specifier(spec) else f"./{spec}"
+                resolved = _trusted_resolve_relative_path(path, normalized)
                 if resolved is None:
                     self.unknown_impact.append({"file": path, "kind": "path_escape_rejected", "detail": spec})
                     continue
@@ -1834,6 +1934,8 @@ class TrustedGraphWalker:
                     continue
                 if entry is not None:
                     self._mark_asset(resolved)
+                else:
+                    self.unknown_impact.append({"file": path, "kind": "unresolvable_static_import", "detail": spec})
             elif _trusted_is_absolute_specifier(spec):
                 self.unknown_impact.append({"file": path, "kind": "absolute_specifier_rejected", "detail": spec})
 
@@ -1844,14 +1946,23 @@ def resolve_trusted_transitive_graph(
     repo_root: Path,
     *,
     max_wall_seconds: float = TRUSTED_TRANSITIVE_MAX_WALL_SECONDS,
+    deadline: float | None = None,
 ) -> tuple[set[str], list[dict[str, str]]]:
     """Issue #2099 AC1/AC2: walk the static import graph reachable from
     `entry_paths` (a surface's registered producer modules/styles/assets)
     at the candidate head represented by `entries`, entirely via Git object
     reads. Raises `TrustedTransitiveResourceBoundExceeded` (AC4, fail
-    closed) rather than returning a silently-truncated partial graph."""
-    deadline = time.monotonic() + max_wall_seconds
-    walker = TrustedGraphWalker(entries, repo_root, deadline)
+    closed) rather than returning a silently-truncated partial graph.
+
+    `deadline` (PR #2144 review fix_delta P1-3), when supplied, is an
+    ALREADY-COMPUTED absolute `time.monotonic()` deadline shared across
+    the entire verification (e.g. across every registered surface's walk
+    in `resolve_trusted_minimum()`) -- this prevents the resource budget
+    from silently resetting per-surface. When omitted (e.g. direct-call
+    unit tests), a fresh deadline is computed from `max_wall_seconds`,
+    matching the prior single-call behaviour."""
+    effective_deadline = deadline if deadline is not None else time.monotonic() + max_wall_seconds
+    walker = TrustedGraphWalker(entries, repo_root, effective_deadline)
     for entry_path in entry_paths:
         joined = posixpath.normpath(entry_path)
         if joined == ".." or joined.startswith("../") or joined.startswith("/"):
@@ -1948,15 +2059,37 @@ def resolve_trusted_minimum(
 
     if candidate_head_ref is not None:
         root = repo_root if repo_root is not None else REPO_ROOT
-        entries, ls_tree_errors = git_ls_tree(root, candidate_head_ref, max_entries=TRUSTED_TRANSITIVE_MAX_FILES)
+        # PR #2144 review fix_delta P1-3: ONE absolute deadline shared
+        # across `git_ls_tree()` and every surface's subsequent graph walk
+        # below -- never a fresh per-surface deadline (which would let the
+        # resource budget silently reset/amplify across many registered
+        # surfaces).
+        transitive_deadline = time.monotonic() + TRUSTED_TRANSITIVE_MAX_WALL_SECONDS
+        entries, ls_tree_errors = git_ls_tree(
+            root,
+            candidate_head_ref,
+            max_entries=TRUSTED_TRANSITIVE_MAX_FILES,
+            timeout_seconds=_git_subprocess_timeout(transitive_deadline),
+        )
         if ls_tree_errors:
-            raise TrustedTransitiveResourceBoundExceeded(";".join(ls_tree_errors))
+            # PR #2144 review fix_delta P1-4: a genuine git plumbing
+            # failure (`git_plumbing_error:ls_tree:...`) must never be
+            # conflated with a resource-bound violation
+            # (`resource_bound_exceeded:...`) -- Issue #2099 AC7 requires
+            # "missing / resource exhaustion / git plumbing failure" to
+            # stay distinct all the way to the final verdict's reason code.
+            joined_errors = ";".join(ls_tree_errors)
+            if any(err.startswith("resource_bound_exceeded:") for err in ls_tree_errors):
+                raise TrustedTransitiveResourceBoundExceeded(joined_errors)
+            raise TrustedGitPlumbingError(f"ls_tree:{joined_errors}")
         request = build_mjs_request(root, union_surfaces)
         for surface_id, surface_entries in request["surfaces"].items():
             entry_paths: list[str] = []
             for key in ("modules", "styles", "assets", "config"):
                 entry_paths.extend(surface_entries.get(key, []) or [])
-            reachable, unknown = resolve_trusted_transitive_graph(entry_paths, entries, root)
+            reachable, unknown = resolve_trusted_transitive_graph(
+                entry_paths, entries, root, deadline=transitive_deadline
+            )
             all_producer_paths |= reachable
             if reachable & changed_set and surface_id not in affected_surface_ids:
                 affected_surface_ids[surface_id] = "producer_reachable_transitive"
@@ -2079,6 +2212,15 @@ def verify_trusted_artifact(
                     # closed unconditionally, same as every other reason
                     # code in this function.
                     reasons.append(f"trusted_transitive_resource_bound_exceeded:{exc}")
+                    trusted_affected, trusted_unmapped = {}, []
+                except TrustedGitPlumbingError as exc:
+                    # PR #2144 review fix_delta P1-4: a genuine git
+                    # plumbing failure (ls-tree/cat-file) is a DISTINCT
+                    # trust-signal failure from a resource-bound violation
+                    # (Issue #2099 AC7) -- still fails closed
+                    # unconditionally, but with its own stable reason code
+                    # so the two failure classes are never conflated.
+                    reasons.append(f"trusted_transitive_git_plumbing_error:{exc}")
                     trusted_affected, trusted_unmapped = {}, []
                 claimed_surface_ids = {
                     s.get("surface_id")
