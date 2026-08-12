@@ -658,7 +658,9 @@ $ true
 
 def test_scalar_authority_route_still_writes_runtime_provenance_sidecar():
     issue_number = 9951952
-    artifact_dir = SKILL_ROOT.parent.parent / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    artifact_dir = (
+        SKILL_ROOT.parent.parent.parent / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    )
     planner_input = {
         "known_context": {
             "scope_delta_authority_evidence": [
@@ -682,11 +684,13 @@ def test_scalar_authority_route_still_writes_runtime_provenance_sidecar():
             wrapper_status="pass",
             blockers=[],
             stderr="",
-            repo_root=SKILL_ROOT.parent.parent,
+            repo_root=SKILL_ROOT.parent.parent.parent,
             plan={"scope_signal_guard_decision_v2": {"scope_delta_authority": {"route": "human_escalation"}}},
             result_next_action="proceed",
         )
-        sidecar_path = Path(preflight.write_provenance_artifact(SKILL_ROOT.parent.parent, issue_number, provenance))
+        sidecar_path = Path(
+            preflight.write_provenance_artifact(SKILL_ROOT.parent.parent.parent, issue_number, provenance)
+        )
         readback = json.loads(sidecar_path.read_text(encoding="utf-8"))
     finally:
         if artifact_dir.exists():
