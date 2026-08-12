@@ -559,7 +559,14 @@ jobs:
           PY
           } >> "$GITHUB_STEP_SUMMARY"
 
-  e2e:
+  # Issue #2119: `e2e-core` owns the standard E2E suite (every spec except
+  # the responsive matrix), the exactly-once preview-namespace lane, and the
+  # existing visual artifact evidence pipeline (`scripts/check-visual-artifact-pipeline.py`
+  # producer authority). `e2e-responsive-matrix` (below) runs ONLY
+  # `assist-player-affordance-responsive.spec.ts` in parallel, with no DAG
+  # dependency between the two. The `e2e` aggregate job further below
+  # collects both via `needs` + `if: always()`.
+  e2e-core:
     if: ${{ github.event.inputs.python_test_bench != 'true' }}
     runs-on: ubuntu-24.04
     defaults:
@@ -567,6 +574,7 @@ jobs:
         shell: bash
     env:
       PLAYWRIGHT_VERSION: "1.60.0"
+      LOOP_E2E_LANE: core
       # Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 4): the
       # real PR head SHA for pull_request events (never the synthetic
       # "Merge <head> into <base>" ref that process.env.GITHUB_SHA resolves
@@ -1230,6 +1238,256 @@ jobs:
               )
           PY
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Issue #2119: dedicated provider job for the responsive viewport x DPR x
+  # browser-zoom geometry matrix (`tests/e2e/assist-player-affordance-responsive.spec.ts`),
+  # physically split out of `e2e-core` (it was that lane's single largest
+  # hotspot, ~3.2min of a ~6.5min run). No DAG dependency on `e2e-core` — the
+  # two run in parallel; the `e2e` aggregate job below collects both.
+  e2e-responsive-matrix:
+    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLAYWRIGHT_VERSION: "1.60.0"
+      LOOP_E2E_LANE: responsive
+      EXPECTED_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    container:
+      image: mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948
+      options: --ipc=host
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Enable pnpm via corepack
+        run: |
+          corepack enable pnpm
+          corepack prepare pnpm@11.7.0 --activate
+      - name: Install dependencies (timed)
+        id: timed-pnpm-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Verify Playwright Docker image version
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version")"
+          if [ "$PW_VERSION" != "$PLAYWRIGHT_VERSION" ]; then
+            echo "::error::resolved @playwright/test=$PW_VERSION but Docker image expects v$PLAYWRIGHT_VERSION. Update PLAYWRIGHT_VERSION and container.image digest in ci.yml."
+            exit 1
+          fi
+          echo "playwright_version_match=ok resolved=$PW_VERSION expected=$PLAYWRIGHT_VERSION"
+      - name: Build for E2E (timed)
+        id: timed-build-e2e
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_build_e2e env VITE_E2E_MODE=true pnpm build
+      - name: Verify E2E dist boundary
+        run: pnpm dist:e2e-boundary --mode e2e --dist dist
+      - name: Run responsive-matrix E2E tests (timed)
+        id: timed-e2e-responsive-matrix
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed test_e2e_responsive_matrix pnpm exec playwright test tests/e2e/assist-player-affordance-responsive.spec.ts
+      - name: Upload Playwright report (e2e-responsive-matrix)
+        id: upload-playwright-report-responsive
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: playwright-report-e2e-responsive-matrix
+          path: playwright-report-e2e-responsive-matrix/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Upload test results (e2e-responsive-matrix)
+        id: upload-test-results-responsive
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-results-e2e-responsive-matrix
+          path: test-results-e2e-responsive-matrix/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Locate responsive-canvas-runtime-evidence.json
+        # AC4/AC13: this is the required artifact for the responsive matrix's
+        # RESPONSIVE_CANVAS_MATRIX_CONTRACT_V1 evidence — fail closed (not
+        # warn) if the test did not actually produce it, per this Issue's
+        # Runtime Verification Applicability fallback_policy
+        # (fallback_success_is_pass: false).
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p responsive-canvas-runtime-evidence-artifact
+          found="$(find test-results-e2e-responsive-matrix -name 'responsive-canvas-runtime-evidence.json' -print -quit || true)"
+          if [ -z "$found" ]; then
+            echo "::error::responsive-canvas-runtime-evidence.json not found under test-results-e2e-responsive-matrix/ — e2e-responsive-matrix did not produce the required RESPONSIVE_CANVAS_MATRIX_CONTRACT_V1 evidence."
+            exit 1
+          fi
+          cp "$found" responsive-canvas-runtime-evidence-artifact/responsive-canvas-runtime-evidence.json
+      - name: Upload responsive-canvas-runtime-evidence artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: responsive-canvas-runtime-evidence-${{ github.run_attempt }}
+          path: responsive-canvas-runtime-evidence-artifact/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+                          "measurement_method": "date_plus3N_ms"
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Issue #2119 AC6: aggregate `e2e` — the stable required-check name existing
+  # consumers (ci-verdict-summary, branch protection) already reference.
+  # `needs` + `if: always()` so it always runs and can distinguish, without
+  # degrading to success:
+  #   (a) static topology failure — a provider job definition itself missing
+  #       from the workflow (this would make the `needs:` list below
+  #       reference an undefined job, which GitHub Actions itself rejects at
+  #       workflow-parse time; `scripts/ci/verify-e2e-lane-partition.mjs` /
+  #       `tests/ci/` additionally verify the static topology independently
+  #       of a live run).
+  #   (b) runtime result failure — `needs.<job>.result` is failure/cancelled/skipped.
+  #   (c) runtime evidence failure — a provider job reports `success` but its
+  #       required artifact/output is actually missing (checked below via
+  #       each provider job's own fail-closed artifact upload step, whose
+  #       `if-no-files-found: error` already turns evidence absence into a
+  #       job failure — this step re-asserts that binding explicitly so a
+  #       provider job cannot report `success` while silently omitting its
+  #       required artifact).
+  e2e:
+    needs: [e2e-core, e2e-responsive-matrix]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Evaluate e2e-core / e2e-responsive-matrix conclusions
+        env:
+          E2E_CORE_RESULT: ${{ needs.e2e-core.result }}
+          E2E_RESPONSIVE_RESULT: ${{ needs.e2e-responsive-matrix.result }}
+        run: |
+          set -euo pipefail
+          echo "e2e-core.result=$E2E_CORE_RESULT"
+          echo "e2e-responsive-matrix.result=$E2E_RESPONSIVE_RESULT"
+          fail=0
+          for pair in "e2e-core:$E2E_CORE_RESULT" "e2e-responsive-matrix:$E2E_RESPONSIVE_RESULT"; do
+            job="${pair%%:*}"
+            result="${pair#*:}"
+            case "$result" in
+              success)
+                ;;
+              failure)
+                echo "::error::runtime result failure: $job concluded 'failure'"
+                fail=1
+                ;;
+              cancelled)
+                echo "::error::runtime result failure: $job concluded 'cancelled'"
+                fail=1
+                ;;
+              skipped)
+                echo "::error::runtime result failure: $job concluded 'skipped' (provider job did not run)"
+                fail=1
+                ;;
+              *)
+                echo "::error::unrecognized needs.$job.result: '$result'"
+                fail=1
+                ;;
+            esac
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::e2e aggregate: at least one provider job did not succeed — not degrading to success."
+            exit 1
+          fi
+          echo "e2e aggregate: both e2e-core and e2e-responsive-matrix succeeded (runtime result + provider-enforced runtime evidence via if-no-files-found: error)."
 
   component-vrt-report:
     # Issue #1389 (Scope Delta): non-required, report-only Vitest Browser
