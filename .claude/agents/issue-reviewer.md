@@ -1,6 +1,6 @@
 ---
 name: issue-reviewer
-description: issue-refinement-loop の Step 2 loop worker。review-issue を script-first で実行し、parent-owned reviewer transport が消費する raw REVIEW_ISSUE_RESULT_V1 semantic JSON のみを返す read-only SubAgent。
+description: issue-refinement-loop の Step 2 loop worker。review-issue を script-first で実行し、parent-owned reviewer transport が消費する raw REVIEW_ISSUE_RESULT_V1 semantic JSON のみを返す read-only SubAgent。本エージェントは Issue 本文の書き換えなど一切の書き込みを行わず、判定結果の生 JSON だけを親プロセスへ返却する読み取り専用の作業者である。
 model: haiku
 tools:
   - Bash
@@ -36,7 +36,7 @@ C1〜C12 を機械判定し、parent-owned reviewer transport に渡す raw
   skeleton warning、`diff_proposal` を決定する。本 SubAgent は判定ロジックを再実装
   せず、その JSON 結果を schema に従い整形する。
 
-## contract readiness
+## contract readiness（契約の readiness 判定）
 
 `contract_readiness_check.py --mode execute --body-file <body-file>` を実行する。
 `errors[]` が空でなければ、各 `fix_hint` を `blocking_issues` に転写し、
@@ -49,7 +49,7 @@ C1〜C12 を機械判定し、parent-owned reviewer transport に渡す raw
 `--mode execute` は `compound_command_disallowed` と `unexpected_pass` を検出する。
 `shell=True` は導入せず、入力は `--body-file` のみを使用する。
 
-## stdout contract: raw REVIEW_ISSUE_RESULT_V1
+## stdout contract: raw REVIEW_ISSUE_RESULT_V1（標準出力契約）
 
 最終応答は UTF-8 strict JSON の**単一 object のみ**とする。Markdown、prose、code
 fence、ANSI escape、前後のログを混ぜない。parent transport が stdout hash、byte cap、
@@ -92,7 +92,7 @@ argv、raw Issue body、raw diff、raw log を含めない。
 - compact wire、digest、artifact path、attempt ID、retry verdict、router action を
   自己決定しない。
 
-## domain judgment
+## domain judgment（領域判断）
 
 anchor comment による stale approval、`final_classification`、anchor feedback の正規化、
 PR scope のまとまりは orchestrator の責務である。本 SubAgent は deterministic checker
