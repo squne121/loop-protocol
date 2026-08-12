@@ -78,6 +78,16 @@ class RegistryError(Exception):
     pass
 
 
+class MissingRefObjectError(RegistryError):
+    """Issue #2091 AC4: raised when a git ref's commit object itself cannot
+    be resolved locally (e.g. a shallow checkout that never fetched that
+    commit). This is NEVER the same condition as "the registry file does
+    not exist at this ref" (a legitimate bootstrap case) -- conflating the
+    two let a shallow-checkout trusted-consumer job silently degrade a
+    genuinely-unknown ref into a synthetic empty registry. Callers MUST
+    fail closed on this (never substitute a synthetic empty registry)."""
+
+
 class DeclarationError(Exception):
     """Raised when a VISUAL_IMPACT_DECLARATION_V1 fails to parse/validate
     (Issue #2019 AC9/AC10). Never raised for trusted decision generation."""
@@ -133,6 +143,26 @@ def load_registry_text(registry_path: Path, git_ref: str | None, repo_root: Path
     exist at this ref."""
     if git_ref is None:
         return registry_path.read_text(encoding="utf-8"), True
+    # Issue #2091 AC4: first confirm the ref's COMMIT OBJECT is present
+    # locally at all. A shallow/partial checkout (e.g. the trusted-consumer
+    # workflow's default `actions/checkout` depth) can have a ref string
+    # that names a commit whose object was simply never fetched -- `git
+    # show <ref>:<path>` returns the SAME non-zero exit code for that case
+    # as for "the ref exists but the file genuinely doesn't", so the two
+    # must be distinguished BEFORE inspecting the path-lookup result.
+    ref_check = subprocess.run(
+        ["git", "cat-file", "-e", f"{git_ref}^{{commit}}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ref_check.returncode != 0:
+        raise MissingRefObjectError(
+            f"commit object for ref {git_ref!r} not found locally (e.g. shallow "
+            "checkout never fetched it) -- refusing to treat this as a "
+            "legitimate missing-registry bootstrap case"
+        )
     rel = registry_path.relative_to(repo_root).as_posix()
     proc = subprocess.run(
         ["git", "show", f"{git_ref}:{rel}"],
@@ -142,7 +172,8 @@ def load_registry_text(registry_path: Path, git_ref: str | None, repo_root: Path
         check=False,
     )
     if proc.returncode != 0:
-        # Registry did not exist at this ref (e.g. base ref predates this
+        # The commit object DOES exist (checked above); the registry file
+        # genuinely did not exist at this ref (e.g. base ref predates this
         # Issue) -- treat as an empty registry rather than failing closed on
         # git plumbing noise; downstream union logic tolerates an empty map.
         return BOOTSTRAP_EMPTY_REGISTRY_TEXT, False
@@ -1321,6 +1352,103 @@ class TrustedArtifactVerdict:
         }
 
 
+@dataclass
+class TrustedRederivation:
+    """Issue #2091 AC1: bundles every input the trusted consumer workflow
+    independently re-obtained/re-computed itself (NEVER copied from the
+    producer's decision artifact), so `verify_trusted_artifact()` can cross
+    check the producer's self-reported decision fields against them.
+    Any field left `None` (or `changed_path_entries=None`) means the caller
+    could not independently obtain that value -- the corresponding cross
+    check is skipped for that field, never treated as an automatic pass.
+    `changed_paths_complete=False` means the caller's changed-path set is
+    KNOWN to be incomplete (e.g. it hit a paginated API's page-size cap) --
+    this always fails closed regardless of digest matching, because an
+    incomplete set can never prove the producer's `affected_surfaces`
+    self-report is safe to trust."""
+
+    expected_base_sha: str | None = None
+    pr_body_raw: bytes | None = None
+    changed_path_entries: list[dict[str, str]] | None = None
+    changed_paths_complete: bool = True
+    expected_base_registry_blob_sha: str | None = None
+    expected_head_registry_blob_sha: str | None = None
+    base_registry_doc: dict[str, Any] | None = None
+    head_registry_doc: dict[str, Any] | None = None
+
+
+def resolve_trusted_minimum(
+    changed_paths: list[str],
+    base_doc: dict[str, Any],
+    head_doc: dict[str, Any],
+) -> tuple[dict[str, str], list[str]]:
+    """Issue #2091 AC1/AC2: a COARSE, independently-computable subset of
+    `resolve()`'s affected-surface logic that the trusted-consumer workflow
+    can run WITHOUT executing any candidate-PR-head code (no TS-compiler
+    transitive import-graph walk via `resolve_visual_impact.mjs`/Node --
+    that step alone would require reading/parsing PR-head source files,
+    which this trust boundary intentionally never does).
+
+    Reuses steps 0/1/2/3/5 of `resolve()` verbatim (meta policy paths /
+    global invalidators / direct producer+contract paths / registry-union
+    mapping deletion / coverage-root boundary) against TRUSTED-side
+    (base_sha/head_sha) registries and a TRUSTED-side changed-path set.
+    Deliberately omits step 4 (mjs transitive reachability) -- a path only
+    reachable via transitive import (never a direct producer/contract path,
+    never under any `coverage_roots` pattern) is NOT caught by this coarse
+    check; this is a scoped, documented limitation (see Issue #2091 Notes
+    for Reviewer / PR follow-up), not a silent gap.
+
+    Returns `(affected_surface_ids, unmapped_visual_candidates)` -- same
+    shapes as the corresponding parts of `ResolveResult`."""
+    union_surfaces: dict[str, Any] = dict(head_doc.get("surfaces", {}) or {})
+    for surface_id, base_def in (base_doc.get("surfaces", {}) or {}).items():
+        if surface_id not in union_surfaces:
+            union_surfaces[surface_id] = base_def
+
+    global_invalidators = set(head_doc.get("global_invalidators", []) or []) | set(
+        base_doc.get("global_invalidators", []) or []
+    )
+    coverage_roots = list(
+        dict.fromkeys((head_doc.get("coverage_roots", []) or []) + (base_doc.get("coverage_roots", []) or []))
+    )
+
+    changed_set = set(changed_paths)
+    affected_surface_ids: dict[str, str] = {}
+
+    if changed_set & META_POLICY_PATHS:
+        for surface_id in union_surfaces:
+            affected_surface_ids.setdefault(surface_id, "meta_policy_change")
+
+    if changed_set & global_invalidators:
+        for surface_id in union_surfaces:
+            affected_surface_ids.setdefault(surface_id, "global_invalidator")
+
+    for surface_id, surface_def in union_surfaces.items():
+        if surface_id in affected_surface_ids:
+            continue
+        direct_paths = collect_producer_paths(surface_def) | collect_contract_paths(surface_def)
+        if direct_paths & changed_set:
+            affected_surface_ids[surface_id] = "direct_producer"
+
+    for surface_id in diff_producer_mappings(base_doc, head_doc):
+        affected_surface_ids.setdefault(surface_id, "mapping_deleted")
+
+    all_producer_paths: set[str] = set(global_invalidators)
+    for surface_def in union_surfaces.values():
+        all_producer_paths |= collect_producer_paths(surface_def)
+        all_producer_paths |= collect_contract_paths(surface_def)
+
+    unmapped_visual_candidates: list[str] = []
+    for changed_path in changed_paths:
+        if changed_path in all_producer_paths:
+            continue
+        if match_coverage_roots(changed_path, coverage_roots):
+            unmapped_visual_candidates.append(changed_path)
+
+    return affected_surface_ids, unmapped_visual_candidates
+
+
 def verify_trusted_artifact(
     *,
     decision_raw: bytes | None,
@@ -1331,6 +1459,7 @@ def verify_trusted_artifact(
     expected_pr_number: int,
     max_decision_bytes: int = TRUSTED_ARTIFACT_MAX_DECISION_BYTES,
     max_evidence_manifest_bytes: int = TRUSTED_ARTIFACT_MAX_EVIDENCE_MANIFEST_BYTES,
+    trusted_rederivation: TrustedRederivation | None = None,
 ) -> TrustedArtifactVerdict:
     """AC31-AC35: independently re-verify a producer-authored
     VISUAL_IMPACT_DECISION_V1 artifact (and its referenced evidence
@@ -1359,6 +1488,76 @@ def verify_trusted_artifact(
         reasons.append("repository_mismatch")
     if decision.get("pull_request_number") != expected_pr_number:
         reasons.append("pull_request_number_mismatch")
+    if decision.get("policy_version") != POLICY_VERSION:
+        # Issue #2091 AC1: cross-checked against THIS base-locked module's
+        # own constant -- never a caller-supplied/producer-supplied value --
+        # so a candidate PR cannot smuggle a stale/forged policy_version
+        # through a producer job it controls.
+        reasons.append("policy_version_mismatch")
+
+    # Issue #2091 AC3: `evidence: {}` coherent forgery -- a surface whose
+    # disposition requires real evidence (anything other than `waived`)
+    # but whose `evidence` object carries no `evidence_manifest_digest`
+    # claim at all is rejected outright, independent of whether the
+    # `surface_id` itself happens to be correct. A legitimate `ok=True`
+    # verified_unchanged/baseline_changed surface always has a digest here
+    # (see `_evidence_payload_for_decision`/`build_evidence_from_manifest_v2`
+    # -- `manifest_sha256` is unconditionally computed for every real
+    # manifest record), so this can never reject a genuine PASS.
+    for surface in decision.get("affected_surfaces", []) or []:
+        if not isinstance(surface, dict):
+            continue
+        if surface.get("disposition") == "waived":
+            continue
+        evidence = surface.get("evidence") or {}
+        if not evidence.get("evidence_manifest_digest"):
+            reasons.append(f"evidence_digest_claim_missing:{surface.get('surface_id')}")
+
+    if trusted_rederivation is not None:
+        tr = trusted_rederivation
+        if tr.expected_base_sha is not None and decision.get("base_sha") != tr.expected_base_sha:
+            reasons.append("base_sha_mismatch")
+        if tr.pr_body_raw is not None:
+            expected_pr_body_sha256 = sha256_hex(tr.pr_body_raw)
+            if decision.get("pr_body_sha256") != expected_pr_body_sha256:
+                reasons.append("pr_body_digest_mismatch")
+        if tr.expected_base_registry_blob_sha is not None:
+            if decision.get("base_registry_blob_sha") != tr.expected_base_registry_blob_sha:
+                reasons.append("base_registry_blob_sha_mismatch")
+        if tr.expected_head_registry_blob_sha is not None:
+            if decision.get("head_registry_blob_sha") != tr.expected_head_registry_blob_sha:
+                reasons.append("head_registry_blob_sha_mismatch")
+        if not tr.changed_paths_complete:
+            # Issue #2091 In Scope: an incomplete changed-path set (e.g. a
+            # paginated API page-size cap was hit) can never be trusted to
+            # prove the producer's `affected_surfaces` claim is safe --
+            # fail closed regardless of what else matches.
+            reasons.append("changed_paths_incomplete_unknown")
+        elif tr.changed_path_entries is not None:
+            expected_digest = build_changed_paths_digest(tr.changed_path_entries)["digest"]
+            actual_digest = (decision.get("changed_paths_digest") or {}).get("digest")
+            if actual_digest != expected_digest:
+                reasons.append("changed_paths_digest_mismatch")
+            if tr.base_registry_doc is not None and tr.head_registry_doc is not None:
+                trusted_changed_paths = _flat_paths_for_resolve(tr.changed_path_entries)
+                trusted_affected, trusted_unmapped = resolve_trusted_minimum(
+                    trusted_changed_paths, tr.base_registry_doc, tr.head_registry_doc
+                )
+                claimed_surface_ids = {
+                    s.get("surface_id")
+                    for s in (decision.get("affected_surfaces") or [])
+                    if isinstance(s, dict)
+                }
+                # Issue #2091 AC2: this is what actually rejects a forged
+                # `affected_surfaces: []` (or any other undercounted claim)
+                # -- independent of the producer's own evidence/artifact
+                # self-report, and independent of `evidence_manifest_raw`
+                # having been retrievable at all.
+                for surface_id in trusted_affected:
+                    if surface_id not in claimed_surface_ids:
+                        reasons.append(f"affected_surfaces_undercount:{surface_id}")
+                for path in trusted_unmapped:
+                    reasons.append(f"unmapped_visual_candidate_undetected:{path}")
 
     if evidence_manifest_raw is None:
         # No evidence manifest artifact could be retrieved at all -- any
@@ -1403,6 +1602,64 @@ def verify_trusted_artifact(
     return TrustedArtifactVerdict(ok=not reasons, reason_codes=reasons, decision=decision)
 
 
+def _build_trusted_rederivation_from_args(args: argparse.Namespace) -> tuple[TrustedRederivation, list[str]]:
+    """Issue #2091 AC1: assemble a `TrustedRederivation` from CLI-supplied
+    file paths -- every value here MUST come from data the trusted-consumer
+    workflow independently fetched itself (never the producer artifact).
+    Returns `(trusted_rederivation, load_errors)`; a non-empty
+    `load_errors` means a trusted-side input the caller claimed to supply
+    could not actually be loaded/validated -- the caller must treat this as
+    an unconditional fail-closed verdict (never silently degrade to
+    "field not supplied")."""
+    load_errors: list[str] = []
+
+    pr_body_raw: bytes | None = None
+    if args.pr_body_file and Path(args.pr_body_file).exists():
+        pr_body_raw = Path(args.pr_body_file).read_bytes()
+
+    changed_path_entries: list[dict[str, str]] | None = None
+    if args.changed_paths_typed_file and Path(args.changed_paths_typed_file).exists():
+        raw_entries = json.loads(Path(args.changed_paths_typed_file).read_text(encoding="utf-8"))
+        changed_path_entries = []
+        for item in raw_entries:
+            entry = {"status": item["status"], "path": item["path"]}
+            if item.get("old_path"):
+                entry["old_path"] = item["old_path"]
+            changed_path_entries.append(entry)
+
+    base_registry_doc: dict[str, Any] | None = None
+    if args.trusted_base_registry_file and Path(args.trusted_base_registry_file).exists():
+        try:
+            text = Path(args.trusted_base_registry_file).read_text(encoding="utf-8")
+            base_registry_doc = _yaml_safe_load_no_duplicate_keys(text, RegistryError) or {"surfaces": {}}
+            validate_registry(base_registry_doc, args.schema)
+        except (RegistryError, yaml.YAMLError) as exc:
+            load_errors.append(f"trusted_base_registry_invalid:{exc}")
+            base_registry_doc = None
+
+    head_registry_doc: dict[str, Any] | None = None
+    if args.trusted_head_registry_file and Path(args.trusted_head_registry_file).exists():
+        try:
+            text = Path(args.trusted_head_registry_file).read_text(encoding="utf-8")
+            head_registry_doc = _yaml_safe_load_no_duplicate_keys(text, RegistryError) or {"surfaces": {}}
+            validate_registry(head_registry_doc, args.schema)
+        except (RegistryError, yaml.YAMLError) as exc:
+            load_errors.append(f"trusted_head_registry_invalid:{exc}")
+            head_registry_doc = None
+
+    trusted_rederivation = TrustedRederivation(
+        expected_base_sha=args.expected_base_sha,
+        pr_body_raw=pr_body_raw,
+        changed_path_entries=changed_path_entries,
+        changed_paths_complete=not args.changed_paths_incomplete,
+        expected_base_registry_blob_sha=args.expected_base_registry_blob_sha,
+        expected_head_registry_blob_sha=args.expected_head_registry_blob_sha,
+        base_registry_doc=base_registry_doc,
+        head_registry_doc=head_registry_doc,
+    )
+    return trusted_rederivation, load_errors
+
+
 def _run_verify_trusted_artifact(args: argparse.Namespace) -> int:
     decision_raw: bytes | None = None
     if args.decision_file:
@@ -1415,6 +1672,8 @@ def _run_verify_trusted_artifact(args: argparse.Namespace) -> int:
         if manifest_path.exists():
             evidence_manifest_raw = manifest_path.read_bytes()
 
+    trusted_rederivation, load_errors = _build_trusted_rederivation_from_args(args)
+
     verdict = verify_trusted_artifact(
         decision_raw=decision_raw,
         evidence_manifest_raw=evidence_manifest_raw,
@@ -1422,7 +1681,14 @@ def _run_verify_trusted_artifact(args: argparse.Namespace) -> int:
         expected_head_sha=args.expected_head_sha or "",
         expected_repository=args.expected_repository or "",
         expected_pr_number=args.expected_pr_number or 0,
+        trusted_rederivation=trusted_rederivation,
     )
+    if load_errors:
+        # A caller-claimed trusted-side input failed to load/validate --
+        # never silently proceed as if it had simply not been supplied.
+        verdict = TrustedArtifactVerdict(
+            ok=False, reason_codes=[*verdict.reason_codes, *load_errors], decision=verdict.decision
+        )
     output = verdict.to_dict()
     print(json.dumps(output, indent=2))
     if args.verdict_output:
@@ -1697,6 +1963,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-repository", type=str, default=None)
     parser.add_argument("--expected-pr-number", type=int, default=None)
     parser.add_argument("--verdict-output", type=str, default=None)
+    # Issue #2091 AC1: trusted-side re-derivation inputs for
+    # `--mode verify-trusted-artifact` -- every one of these MUST be
+    # independently fetched/computed by the caller workflow (never copied
+    # from the producer artifact). All are optional; omitting one skips
+    # only that specific cross check (never an automatic pass).
+    parser.add_argument("--expected-base-sha", type=str, default=None)
+    parser.add_argument("--expected-base-registry-blob-sha", type=str, default=None)
+    parser.add_argument("--expected-head-registry-blob-sha", type=str, default=None)
+    parser.add_argument("--trusted-base-registry-file", type=str, default=None)
+    parser.add_argument("--trusted-head-registry-file", type=str, default=None)
+    parser.add_argument(
+        "--changed-paths-incomplete",
+        action="store_true",
+        default=False,
+        help=(
+            "Set when the caller's --changed-paths-typed-file is KNOWN to be "
+            "an incomplete changed-path set (e.g. a paginated API page-size "
+            "cap was hit). Forces the verdict fail-closed."
+        ),
+    )
     # PR #2045 OWNER fix_delta P0-5 (V2 manifest): `build-evidence-manifest`
     # mode is invoked by the `component-vrt-report` CI job to produce the
     # VISUAL_BASELINE_REVIEW_EVIDENCE_V2 artifact from real per-surface VRT

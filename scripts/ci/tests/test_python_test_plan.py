@@ -174,6 +174,75 @@ def test_real_plan_serial_lane_has_debounce():
     test_issue_393_snapshot_fixture_processed's real subprocess call hit its 90s
     timeout under 4-way xdist CPU saturation on the GitHub-hosted runner. The
     debounce test itself must NOT be excluded.
+    scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py
+    was added to parallel_exclude (Issue #2073) as a historical mitigation
+    for what was originally believed to be an xdist-CPU-saturation flake;
+    serial-lane isolation alone did not stop the failure (it recurred 3x in
+    serial-lane CI on PR #2068), which is consistent with the confirmed root
+    cause below being unrelated to test parallelism. This entry is now kept
+    for CI runtime-shape stability rather than as an active flake mitigation.
+
+    AC10_ROOT_CAUSE_STATUS: resolved (Issue #2073).
+
+    Root cause: `scripts/agent-guards/skill_runtime_exec.py`'s
+    `_resolve_trusted_executable("python3", project_root)` returned
+    `os.path.realpath(sys.executable)` for substitution into the rendered
+    `uv run python3 run_refinement_preflight.py ...` child argv. On the
+    GitHub-hosted runner, the project's `.venv/bin/python3` is a symlink
+    into a bare `uv python install`-managed toolchain interpreter that has
+    no project dependencies of its own (jsonschema etc. are installed only
+    into `.venv/lib/python3.12/site-packages` by `uv sync`).
+    `os.path.realpath()` followed that symlink through to the bare
+    toolchain interpreter, and `uv run <that-realpath> ...` does not
+    associate with the project venv -- so the spawned
+    `run_refinement_preflight.py` child process could not `import
+    jsonschema`. PR #2068's commit `28d8f334` changed
+    `_validate_with_schema()` to fail closed
+    (`schema_validator_unavailable: jsonschema library not importable`)
+    instead of silently skipping validation when jsonschema is
+    unimportable, which made preflight's `main()` short-circuit to
+    `STATUS: blocked` before ever invoking the planner subprocess -- so the
+    planner's PID-proof harness never ran and `pid_proof_planner.json` was
+    never written. Confirmed by: (a) exact historical CI evidence -- all 4
+    reproductions on PR #2068 are git-ancestry descendants of `28d8f334`,
+    with the two post-diagnostic-wrapper runs showing the byte-identical
+    `schema_validator_unavailable: jsonschema library not importable`
+    error, and a green negative control (no `28d8f334` ancestor) exists
+    immediately prior; (b) independent local reproduction of the mechanism
+    using a genuinely bare `uv python install`-managed interpreter
+    (`uv run <bare-toolchain-realpath> -c "import jsonschema"` raises
+    `ModuleNotFoundError`, while `uv run <venv-path> -c "import
+    jsonschema"` succeeds); (c) counterfactual fix verified locally --
+    `_resolve_trusted_executable` now returns `sys.executable` itself
+    (preserving venv identity) rather than its realpath, while still
+    validating the realpath against the trust boundary (not inside
+    project_root, within allowed_dirs/runtime_dir), and this restores
+    `jsonschema` importability in the child process; (d) two consecutive
+    green `python-test-core` CI runs on the fix's final head (GitHub
+    Actions run 31471899002, jobs 93716843920 and 93718596811, both
+    `conclusion: success`).
+
+    Issue #2073 follow-up (prior revisions, kept for history): three
+    OWNER/human-review blockers against the diagnostic apparatus itself
+    were fixed before/alongside the root cause above being found -- (1)
+    `run_refinement_preflight.py`'s `_invoke_planner()` previously
+    misclassified a missing `plan_refinement_loop.py` as an
+    `anchor_or_input_blocked` (exit 2) planner failure instead of the
+    intended `wrapper_environment_failure` (exit 3, "not found"), because a
+    present `sys.executable` failing to open a missing script argument does
+    not raise a Python `FileNotFoundError`; it now performs an explicit
+    pre-spawn `PLANNER_SCRIPT.is_file()` check instead of relying on that
+    exception. (2) `_invoke_planner()` writes a best-effort
+    `planner_spawn_attempt_v1.json` marker as its literal first statement
+    (human-review P2-1: it originally ran after `json.dumps(planner_input,
+    ...)`, so a serialization failure could raise before the marker was
+    ever written -- moved ahead of that call so the marker's "was this
+    function ever entered" evidence no longer depends on serialization
+    succeeding first). (3) this file was removed from `parallel_exclude`
+    (human-review P2-2) once the confirmed root cause was established to be
+    parallelism-independent. None of these three fixes was itself the
+    load-bearing fix for the confirmed root cause above, but all three
+    remain valid diagnostic-apparatus / lane-scope corrections.
     """
     plan = mod.load_plan(_PLAN_PATH)
     lane = mod.serial_lane_argv(plan)
@@ -183,6 +252,12 @@ def test_real_plan_serial_lane_has_debounce():
         "scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py",
         "tests/codex/test_scope_rollup_runner_agent_config.py",
         ".claude/skills/issue-contract-review/scripts/tests/test_baseline_vc_preflight.py",
+        # Issue #2073: scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py
+        # was formerly in parallel_exclude as a historical mitigation for a
+        # hypothesized xdist-CPU-saturation flake. Root cause is now
+        # confirmed (see AC10_ROOT_CAUSE_STATUS above) to be unrelated to
+        # parallelism, so the file has been removed from this serial lane
+        # list (Issue #2073 human-review P2-2).
         "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
         "--deselect=.claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",

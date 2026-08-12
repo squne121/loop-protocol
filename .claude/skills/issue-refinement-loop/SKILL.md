@@ -96,7 +96,7 @@ web_research 結果に含まれる `critical_claims` の未解決 claim は huma
 
 ### Step 0: 前提条件 (Preconditions)
 
-1. Issue 本文と必要コメントを取得し、`state/needs-human` / `state/done` の hard stop を確認する。
+1. Issue 本文と必要コメントを取得する。`state/needs-human` / `state/done` は presentation-only / non-authoritative metadata（#2084）であり、それら label の単独付与だけで hard stop としない。停止には別 authority — OWNER の明示指示、または `human_judgment_required`（scope-signal-guard 等の別 authority）— が必要である。`state/done` の代替として GitHub native Issue `closed` state（`gh issue view --json state`）を参照する。
 2. `anchor_comment_url` がある場合は snapshot を固定し、対象 Issue 所属を検証する。
 3. scope rollup preflight を mutation-free で実行し、`LOOP_STATE.scope_rollup_decision` を記録する。
 4. Product/Spec routing signal を検知し、`LOOP_STATE.product_spec_context` を更新する。
@@ -146,13 +146,20 @@ wrapper の出力フィールドを確認する:
 
 **canonical stdout フィールド（機械可読）:**
 - `STATUS: pass | warn | needs_fix | blocked | environment_failure` — 常に出力される
-- `NEXT_ACTION: proceed | proceed_with_notes | apply_deterministic_repair | human_judgment_required | fix_environment` — 常に出力される
+- `NEXT_ACTION: proceed | proceed_with_notes | apply_deterministic_repair | human_judgment_required | fix_environment | issue_editor_required` — 常に出力される（`issue_editor_required` は `--consume-contract-patch-plan` 経路限定。下記「`NEXT_ACTION: issue_editor_required` 受信時」参照）
 - `MUST_READ:` — 読むべきパス一覧（空の場合は省略）
 - `COMMANDS_JSON:` — full command spec objects（canonical machine-consumable、空の場合は省略）
 - `COMMANDS_DISPLAY:` — human-readable display（display_only=true、空の場合は省略）
 - `BLOCKERS:` — ブロッカーコード一覧（空の場合は省略）
 - `ARTIFACT:` — 書き込まれた artifact の key: path 一覧（空の場合は省略）。`STATUS: needs_fix` の場合は `repair_diagnostics` / `repair_candidate_body` も含まれる（Issue #2016 iteration-3 P1-1。`repair_action.diagnostics_artifact` / `.candidate_body_artifact` と同一パスを canonical artifact map からも参照可能にする）
 - `REPAIR_ACTION:` — versioned `repair_action` disposition（Issue #2016。`STATUS: needs_fix` の場合のみ出力される。`disposition: auto_apply_safe` と diagnostics/candidate body artifact パス・original/repaired SHA を含む）
+
+**`NEXT_ACTION: issue_editor_required`（Issue #2048 Scope Delta）:**
+`contract_update.run.with_human_context` 経由の `--consume-contract-patch-plan` 実行が `full_rewrite_required` disposition を検出した場合（承認済み trusted anchor scope reframe に非空の `allowed_path_deltas` があるが、派生 `CONTRACT_PATCH_PLAN_V1.operations[]` が空で section-bound patch を materialize できない場合）に返る。このとき:
+- `contract_update.run.with_human_context` を再実行しない（no-progress な同一 mutation の再試行は禁止）
+- scope-reframe comment を再投稿しない（trusted anchor は既に Issue 上に存在するため新規 comment は不要）
+- 既存の `issue-editor` / `edit-issue` controlled transaction route（Step 4 相当）へ handoff し、Issue 本文の完全な rewrite を行う
+- handoff 後の mutation が完了しても、body/title readback・fresh `preflight.run` 再実行・fresh Step 2 review・fresh readiness が全て完了するまで implementation を許可しない（`_bounded_contract_update_handoff()` の既存 post-update gate と同じ 6-gate 基準を満たすまで `NEXT_ACTION: proceed` 相当の implementation authorization に進まない）
 
 **`STATUS: needs_fix` / `NEXT_ACTION: apply_deterministic_repair`（Issue #2016）:**
 `repair_issue_contract.py` が既知の safe な deterministic repair（disposition: `auto_apply_safe`）を1件以上検出した場合、`run_refinement_preflight.py` は generic blocker を追加せず `STATUS: needs_fix` / `NEXT_ACTION: apply_deterministic_repair` を返す。この orchestrator（issue-refinement-loop）は現時点では `apply_deterministic_repair` の auto-apply consumer を持たない。したがって `NEXT_ACTION: apply_deterministic_repair` を受信した場合は、Issue 本文への実際の auto-mutation は行わず、`STATUS: blocked` と同様に human 判断待ちの informational route として扱う（`ARTIFACT:` の `repair_action.diagnostics_artifact` / `repair_action.candidate_body_artifact` を人間が参照できるようにするだけで、`decide_next_loop_action.py` 等の rewrite loop router のロジック自体はこの Issue では変更しない）。実際の auto-mutation（controlled `issue-editor` transaction・stale hash guard・GitHub readback・fresh preflight 再実行）は別 Issue で扱う。
@@ -296,6 +303,18 @@ exit_code_3:
 - full mutation result は `ARTIFACT:` パスから取得する（main context には返らない）
 
 rewrite ループの反復ごとに、checker 実行後に `scripts/decide_rewrite_route.py` を呼び出して `max_rewrite_attempts` 超過・body hash 変化なし・missing set 単調減少なしを runtime で強制し、`route`（`continue_rewrite` / `proceed_to_review` / `human_judgment_required`）に従って routing する。invocation 手順・state 永続化・`human_judgment_required` 連動は `references/termination-policy.md` の「Rewrite Loop Runtime Router（#664）」セクションを SSOT とする。orchestrator は attempt 数や no-progress を prose で再判定しない。
+
+**#2048 regression（承認済み scope reframe が empty operations[] のケース、Scope Delta で production reachability を修正）**: 承認済み trusted anchor scope reframe（`scope_delta_status: approved_by_trusted_anchor` かつ `allowed_path_deltas` 非空）から派生した `CONTRACT_PATCH_PLAN_V1.operations[]` が空の場合、`decide_rewrite_route.py` の `decide_scope_reframe_contract_route()` が `contract_update` ではなく `issue_editor_required`（reason_code: `approved_scope_requires_full_contract_rewrite`）へ route する。
+
+唯一の production 呼び出し元は `run_refinement_preflight.py::consume_trusted_anchor_contract_patch_plan()`（`contract_update.run.with_human_context` の `--consume-contract-patch-plan` 実行がこの関数を呼ぶ）である。この consumer 境界が `known_context["scope_delta_decision"]`（`_classify_anchor_scope_reframe()` が生成する trusted anchor 分類結果）を fail-closed に再検証（型・binding・anchor 一致）した上で `allowed_path_deltas` を抽出し、`scope_signal_delta.run_trusted_anchor_iteration_zero()` の `allowed_path_deltas` / `already_reflected_in_body` 引数へ実際に渡す。`operations[]` の producer が存在しない場合（freeform directive に exact path literal がなく `classify_scope_delta_authority()` が human_escalation へ倒れる場合等）は、`consume_trusted_anchor_contract_patch_plan()` の呼び出し元が empty-operations の `CONTRACT_PATCH_PLAN_V1` を合成し consumer へ渡す。
+
+**#2086 AC3**: `expands_allowed_paths` boundary が理由で `human_escalation` に倒れた operator-selected human-context directive（trusted OWNER/MEMBER/COLLABORATOR、`with_human_context` lane）に対しては、mutation を行わない前に `codebase-investigator` SubAgent（read-only）へ委譲し、directive が意味論的に指す exact repository-relative path を current main から導出する。導出できた場合は `classify_scope_delta_authority()` の `investigation_derived_path_literals` キーワード引数へ渡して再判定する（`references/anchor-comment-handling.md` の「Operator-Selected Human-Context 継続」参照）。導出できない場合、または導出結果でも `contract_patch_plan.operations` が空のままの場合は、上記の `NEXT_ACTION: issue_editor_required` full-rewrite lane へ進む。人間へ手書き `ANCHOR_SCOPE_REFRAME_V1` の再入力を要求してはならない。
+
+empty operations は無条件に `issue_editor_required` を意味しない。承認済み `allowed_path_deltas` が現在の Issue 本文の `## Allowed Paths` セクションに既に全て反映済みの場合は `proven_no_change`（通常の `no_change` no-op、rewrite_route は付与されない）として扱われる。型不正（`operations` が list でない等）や binding 不一致（`anchor_comment_url` / `anchor_comment_hash` が今回の呼び出しと一致しない）は fail-closed に `None` 扱いとなり、同様に `issue_editor_required` へは昇格しない。
+
+`plan_refinement_loop.py` 側にも同じ判定を `decisions.scope_delta_decision.rewrite_route` として echo する opt-in 経路（`known_context.scope_delta_decision.operations` が渡された場合限定）があるが、これは診断用の echo であり canonical な mutation-phase routing は上記 consumer 境界が担う。
+
+`full_rewrite_required` が検出された場合、`run_refinement_preflight.py` の wrapper は通常の `STATUS` 由来 `NEXT_ACTION` 判定を上書きし `NEXT_ACTION: issue_editor_required` を stdout・result artifact の両方に反映する（`contract_update.status` は既存の `applied`/`no_change`/`rebased`/`failed` 4 値のみを使い、`no_change` を full-rewrite-required の意味に流用しない）。この受信後の orchestrator 手順は Step 0g の「`NEXT_ACTION: issue_editor_required` 受信時」を参照する。
 
 ### Step 4.5: 子Issue/follow-up の実体化 (Materialization)
 

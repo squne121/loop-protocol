@@ -20,6 +20,33 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
+# #2048 regression follow-up (#1877/PR #1884): decide_scope_reframe_contract_route()
+# lives in the sibling decide_rewrite_route.py module and is consumed here so an
+# approved trusted-anchor scope reframe whose derived operations[] is empty is
+# routed to issue_editor_required from the actual production call path
+# (run_trusted_anchor_iteration_zero(), invoked by run_refinement_preflight.py's
+# contract_update.run.with_anchor lane) instead of only existing as an
+# unreferenced unit-tested function.
+try:
+    from decide_rewrite_route import (
+        SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1,
+        decide_scope_reframe_contract_route,
+        classify_scope_reframe_disposition,
+        ROUTE_ISSUE_EDITOR_REQUIRED,
+    )
+    _SCOPE_REFRAME_ROUTER_IMPORT_FAILED = False
+except ImportError:  # pragma: no cover - sibling module should always be importable
+    SCOPE_REFRAME_CONTRACT_ROUTE_STATE_V1 = None
+    decide_scope_reframe_contract_route = None
+    classify_scope_reframe_disposition = None
+    ROUTE_ISSUE_EDITOR_REQUIRED = "issue_editor_required"
+    # PR #2057 OWNER review P2: a safety-critical routing dependency import
+    # failure must surface as `environment_failure`, never as an ordinary
+    # no-change/no-op continuation. `run_trusted_anchor_iteration_zero()`
+    # checks this flag and fails closed instead of silently omitting the
+    # `rewrite_route` annotation.
+    _SCOPE_REFRAME_ROUTER_IMPORT_FAILED = True
+
 SCHEMA_VERSION = "scope_signal_delta/v1"
 
 REASON_NEW_IN_SCOPE = "new_in_scope_area"
@@ -590,6 +617,7 @@ REASON_DESTRUCTIVE_OR_NON_IDEMPOTENT_OPERATION = "destructive_or_non_idempotent_
 REASON_AI_INFERRED_SCOPE_DELTA = "ai_inferred_scope_delta"
 REASON_UNTRUSTED_AUTHOR_ASSOCIATION = "untrusted_author_association"
 REASON_MISSING_BASE_ISSUE_BODY_SHA256 = "missing_base_issue_body_sha256"
+REASON_CROSS_TARGET_DIRECT_MUTATION = "cross_target_direct_mutation"
 
 NEXT_STEP_RERUN_REFINEMENT_AFTER_CONTRACT_UPDATE = "rerun_refinement_after_contract_update"
 
@@ -763,6 +791,79 @@ _DIRECTIVE_SECTION_MARKERS = (
 )
 
 _BULLET_LINE_RE = re.compile(r"^\s*[-*]\s+\S.*$", re.MULTILINE)
+
+# #2086 AC1 P1 fix_delta: a bullet line's mere PRESENCE is not itself
+# evidence of a scope-expansion directive (an observation note, a TODO
+# item, or a pasted failure-log line can be a bullet too). This pattern
+# requires the bullet's own CONTENT to carry an imperative
+# directive-request verb -- Japanese te-kudasai / beki-da forms, or a
+# common English imperative -- distinct from origin-lane assertion (which
+# `operator_asserted_human_context` already carries independently).
+_SEMANTIC_DIRECTIVE_VERB_RE = re.compile(
+    r"(?:"
+    r"して(?:ください|下さい|欲しい|ほしい)|"
+    r"する(?:必要がある|べきです|べきだ|こと)|"
+    r"を(?:修正|直|追加|拡張|対応|実装|変更|適用|統一|削除|除去)(?:して|する)|"
+    r"\bfix(?:es|ed)?\b|\bupdate[sd]?\b|\badd(?:s|ed)?\b|\baddress(?:es|ed)?\b|"
+    r"\bextend(?:s|ed)?\b|\bapply\b|\bapplied\b|\bchange[sd]?\b|\bmodify\b|"
+    r"\bmodified\b|\brefactor\b|\bimplement(?:s|ed)?\b|\bremove[sd]?\b|"
+    r"\bcorrect(?:s|ed)?\b|\bresolve[sd]?\b|\badjust(?:s|ed)?\b|\bmust\b|\bshould\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+# #2086 P1 fix_delta (iteration 3, OWNER REQUEST_CHANGES Blocker 4):
+# `_SEMANTIC_DIRECTIVE_VERB_RE` is a lexical match -- it fires on a bare verb
+# token anywhere in a bullet, with no regard for negation or tense/aspect.
+# That means a PAST-TENSE STATUS statement ("This was fixed yesterday.") or
+# a NEGATED imperative ("We should not expand Allowed Paths.") would also be
+# promoted to `explicit`, even though neither is actually instructing a
+# scope expansion. This is the authority classifier's entry point (Design
+# Invariant #2: semantic authority must come from a genuine human
+# directive), so it must stay narrow. `_NEGATION_OR_STATUS_MARKER_RE` is
+# checked in a bounded window around each verb match; a hit anywhere in that
+# window (negation marker before/after the verb, or a perfect/passive-status
+# auxiliary before it) suppresses that match without disqualifying other,
+# unrelated verb matches later in the same bullet.
+_NEGATION_OR_STATUS_MARKER_RE = re.compile(
+    r"(?:"
+    r"\bnot\b|\bnever\b|n't\b|\bno\b|\bdon't\b|\bdo not\b|"
+    r"\bdoesn't\b|\bdoes not\b|\bwon't\b|\bwill not\b|"
+    r"\bwas\b|\bwere\b|\bhas been\b|\bhave been\b|\bhad been\b|"
+    r"\balready\b|\bpreviously\b|\byesterday\b|"
+    r"不要|しない|する必要はない|しなくてよい|しなくていい|"
+    r"済み|済んだ|済んでいる|完了済み|修正済み|対応済み|"
+    r"すでに|既に|昨日|先日"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _has_semantic_directive_bullet(text: "str | None") -> bool:
+    """#2086 AC1 P1 fix_delta: does any bullet-list line in `text` carry an
+    imperative directive-request verb (see `_SEMANTIC_DIRECTIVE_VERB_RE`)?
+    Used only by the operator-selected human-context, no-known-marker
+    branch of `classify_directive_confidence()` -- semantic content
+    detection is kept separate from origin-lane assertion so that an
+    observation/TODO/failure-log bullet list is never conflated with an
+    actual scope-expansion directive just because the comment arrived on
+    the trusted human-context lane.
+
+    #2086 P1 fix_delta (iteration 3, Blocker 4): a verb match is only
+    accepted as a genuine imperative/obligation directive when no negation
+    or past-tense/perfect-status marker is present in a bounded window
+    around it (`_NEGATION_OR_STATUS_MARKER_RE`) -- see that constant's
+    docstring for the failure modes this closes (negated imperative,
+    past-tense status report).
+    """
+    for item in extract_directive_items(text):
+        for match in _SEMANTIC_DIRECTIVE_VERB_RE.finditer(item):
+            window = item[max(0, match.start() - 25) : min(len(item), match.end() + 20)]
+            if _NEGATION_OR_STATUS_MARKER_RE.search(window):
+                continue
+            return True
+    return False
 _CONCRETE_PERMISSION_DELTA_RE = re.compile(
     r"(?:permission[ _-]?(?:delta|profile)|permissions?[ _-]?profile|権限(?:差分|プロファイル))"
     r"\s*[:=]?\s*(?P<before>[^\n→]{1,120}?)\s*(?:->|→)\s*(?P<after>[^\n]{1,120})",
@@ -833,17 +934,46 @@ def extract_directive_items(text: "str | None") -> list:
     return items
 
 
-def classify_directive_confidence(text: "str | None", markers: "list | None" = None) -> str:
+def classify_directive_confidence(
+    text: "str | None",
+    markers: "list | None" = None,
+    *,
+    operator_asserted_human_context: bool = False,
+) -> str:
     """Deterministic confidence classification for a single review comment.
 
     - no directive markers found -> inferred (the AI would have to infer intent)
     - markers found + at least one bullet-list line -> explicit
     - markers found but no structured bullet list -> ambiguous
+
+    #2086 AC1/AC3: an ``operator_asserted_human_context`` directive (the
+    comment URL was passed on the ``preflight.run.with_human_context`` /
+    ``contract_update.run.with_human_context`` lane -- never inferred from
+    comment metadata, see Design Invariant #1) that has at least one
+    structured bullet-list line is treated as ``explicit`` even when it does
+    not contain one of the fixed ``_DIRECTIVE_SECTION_MARKERS`` section
+    headings. A hand-written ``ANCHOR_SCOPE_REFRAME_V1`` payload or a
+    "Revised Acceptance Criteria" heading is not required for a trusted,
+    operator-selected human-context directive to be recognized as an
+    explicit scope-mutation directive -- only the ``with_agent_report`` /
+    unlabeled lanes remain excluded from this relaxation (AC6, gated
+    entirely by the caller-supplied ``operator_asserted_human_context`` flag,
+    which is only ever ``True`` for the human-context lane -- see
+    ``_resolve_scope_delta_source_kind()`` in ``run_refinement_preflight.py``).
     """
     marker_list = markers if markers is not None else extract_directive_markers(text)
+    has_bullets = bool(_BULLET_LINE_RE.search(text or ""))
     if not marker_list:
+        # #2086 AC1 P1 fix_delta: origin-lane assertion
+        # (`operator_asserted_human_context`) and semantic-directive
+        # detection (`_has_semantic_directive_bullet`) are separate
+        # concerns -- ANY bullet existing in a human-context comment is not
+        # itself sufficient; the bullet content must actually carry an
+        # imperative directive-request verb.
+        if operator_asserted_human_context and _has_semantic_directive_bullet(text):
+            return DIRECTIVE_CONFIDENCE_EXPLICIT
         return DIRECTIVE_CONFIDENCE_INFERRED
-    if _BULLET_LINE_RE.search(text or ""):
+    if has_bullets:
         return DIRECTIVE_CONFIDENCE_EXPLICIT
     return DIRECTIVE_CONFIDENCE_AMBIGUOUS
 
@@ -1287,6 +1417,11 @@ def run_trusted_anchor_iteration_zero(
     fetch_current,
     apply_transaction=None,
     fresh_checks=None,
+    allowed_path_deltas: "list | None" = None,
+    scope_delta_status: "str | None" = None,
+    previous_empty_operations_fingerprints: "list | None" = None,
+    reflected_checker=None,
+    patch_plan_producer_available: bool = True,
 ) -> dict:
     """Execute the bounded, callback-based trusted-anchor path.
 
@@ -1294,21 +1429,132 @@ def run_trusted_anchor_iteration_zero(
     body drift is rebased once; trust/anchor changes and postcondition failure
     are fail-closed.  This function neither creates durable state nor writes
     directly to GitHub.
+
+    #2048 / PR #2057 OWNER REQUEST_CHANGES revision: `allowed_path_deltas` /
+    `scope_delta_status` / `previous_empty_operations_fingerprints` /
+    `reflected_checker` are optional and default to a no-op (no
+    `allowed_path_deltas`) so existing callers that do not pass them keep the
+    pre-#2048 "no_change" behavior byte-for-byte.
+
+    When a caller DOES pass a non-empty `allowed_path_deltas` (signalling
+    this is an approved Allowed Paths scope reframe, not an ordinary
+    contract-key patch) and the candidate body is unchanged (no section-bound
+    write would occur), this function:
+
+    1. Calls `fetch_current()` FIRST -- P0-2/P1-4 fix: a stale pre-fetch
+       classification could not detect a concurrent anchor edit/trust
+       revocation or an Issue body already carrying the approved delta (the
+       write path already does this before `apply_transaction`; the no-op
+       path previously did not, so `fresh_checks` ran against
+       pre-mutation/pre-reread state and issue-editor mutation authority
+       could be handed off on stale evidence).
+    2. Re-validates anchor identity/trust against the FRESH anchor.
+    3. Computes the Allowed-Paths-reflected tri-state via `reflected_checker`
+       against the FRESH body (never the pre-fetch `issue` argument).
+    4. Calls the single canonical
+       `decide_rewrite_route.classify_scope_reframe_disposition()` and
+       annotates the result with `rewrite_route` (disposition
+       `full_rewrite_required`) or `disposition` (disposition `invalid`).
+       `proven_no_change`/`patch` leave the result as an ordinary `no_change`
+       no-op (no annotation) -- callers branch on the annotation's presence,
+       never construct one themselves.
+
+    `scope_delta_status` is REQUIRED (no longer defaults to
+    `"approved_by_trusted_anchor"`) whenever `allowed_path_deltas` is
+    non-empty: PR #2057 OWNER review P2 flagged that a caller passing deltas
+    but forgetting the status argument would previously be silently treated
+    as an approved reframe.
+
+    `patch_plan_producer_available` (PR #2057 OWNER review, iteration 4
+    blocker 3): threaded straight into
+    `decide_rewrite_route.classify_scope_reframe_disposition()`'s own
+    kwarg of the same name. `False` means the freeform
+    `SCOPE_DELTA_AUTHORITY_EVIDENCE_V1` producer (`classify_scope_delta_
+    authority()`) ran and explicitly could NOT produce an automated patch
+    plan for this evidence (`route.action == "human_escalation"`) --
+    distinct from "no freeform evidence was ever supplied" (default
+    `True`). The caller (`run_refinement_preflight.consume_trusted_anchor_
+    contract_patch_plan()`) computes this from the freeform authority
+    sidecar BEFORE synthesizing an empty-operations patch plan from the
+    structured `ANCHOR_SCOPE_REFRAME_V1` evidence alone, so a producer that
+    declined to act is never silently reclassified as a legitimate
+    `full_rewrite_required`.
     """
     normalized = normalize_trusted_anchor_iteration_zero(
         repo=repo, issue_number=issue_number, anchor=anchor, source_body=anchor_body
     )
     if not normalized["accepted"]:
         return {"status": "blocked", **normalized, "writes": 0, "iterations": 0}
+    if allowed_path_deltas and scope_delta_status is None:
+        return {
+            "status": "blocked",
+            "failure": "scope_delta_status_required_when_allowed_path_deltas_present",
+            "writes": 0,
+            "iterations": 0,
+        }
     current = dict(issue)
     rebases = 0
     while True:
+        operations = patch_plan.get("operations", [])
         candidate = build_section_aware_candidate_body(
             body=current.get("body", ""),
-            operations=patch_plan.get("operations", []),
+            operations=operations,
             source_identity=normalized["source_identity"],
         )
         if not candidate["changed"]:
+            if allowed_path_deltas:
+                if _SCOPE_REFRAME_ROUTER_IMPORT_FAILED or classify_scope_reframe_disposition is None:
+                    return {
+                        "status": "environment_failure",
+                        "failure": "scope_reframe_router_import_failed",
+                        "writes": 0,
+                        "iterations": 0,
+                    }
+                fresh_issue, fresh_anchor = fetch_current()
+                fresh_anchor_body = fresh_anchor.get("body", anchor_body)
+                fresh_normalized = normalize_trusted_anchor_iteration_zero(
+                    repo=repo, issue_number=issue_number, anchor=fresh_anchor, source_body=fresh_anchor_body
+                )
+                if (
+                    not fresh_normalized["accepted"]
+                    or fresh_normalized["source_identity"] != normalized["source_identity"]
+                ):
+                    return {
+                        "status": "blocked",
+                        "states": _iteration_zero_states(directive_acceptance="rejected", contract_update="failed"),
+                        "failure": "anchor_identity_or_trust_changed",
+                        "writes": 0,
+                        "iterations": 0,
+                    }
+                fresh_body = fresh_issue.get("body", "")
+                reflected_status = (
+                    reflected_checker(fresh_body) if reflected_checker is not None else "invalid_or_unavailable"
+                )
+                decision = classify_scope_reframe_disposition(
+                    scope_delta_status=scope_delta_status,
+                    operations_key_present=True,
+                    operations=list(operations),
+                    allowed_path_deltas_raw=list(allowed_path_deltas),
+                    reflected_status=reflected_status,
+                    anchor_comment_url=anchor.get("html_url") or anchor.get("comment_url"),
+                    issue_body_sha256=_sha256(fresh_body),
+                    previous_empty_operations_fingerprints=previous_empty_operations_fingerprints,
+                    patch_plan_producer_available=patch_plan_producer_available,
+                )
+                result = {
+                    "status": "invalid" if decision.disposition == "invalid" else "no_change",
+                    "states": _iteration_zero_states(contract_update="no_change"),
+                    "writes": 0,
+                    "iterations": 0,
+                    **candidate,
+                }
+                if decision.disposition == "full_rewrite_required":
+                    result["rewrite_route"] = decision.to_dict()
+                elif decision.disposition == "invalid":
+                    result["disposition"] = decision.to_dict()
+                if fresh_checks is not None:
+                    result["fresh_checks"] = fresh_checks(fresh_issue)
+                return result
             result = {
                 "status": "no_change",
                 "states": _iteration_zero_states(contract_update="no_change"),
@@ -1553,12 +1799,74 @@ def _permission_boundary_is_constrained_directive(evidence: dict, boundary_flags
     return len(concrete_deltas) == 1
 
 
-def _first_blocking_boundary_reason(boundary_flags: dict, evidence: dict):
+def _has_investigation_derived_allowed_path_literals(
+    investigation_derived_path_literals: "list | None",
+) -> bool:
+    """#2086 AC3/AC4: agent read-only investigation may supply exact
+    Allowed Paths literals for a trusted operator-selected human-context
+    directive that names architecture/workflow-level scope expansion in
+    semantic prose without an exact backtick path literal in the directive
+    text itself (Design Invariant #2: the human states *what* must change,
+    the agent derives *which exact repo paths* implement that change from
+    current-main evidence).
+
+    This is deliberately a **caller-supplied, out-of-evidence** argument
+    (never embedded into ``SCOPE_DELTA_AUTHORITY_EVIDENCE_V1``, whose schema
+    is out of this Issue's Allowed Paths and stays ``additionalProperties:
+    false``). The caller (``run_refinement_preflight.py`` / the
+    ``codebase-investigator`` SubAgent-backed orchestrator step) is
+    responsible for only ever populating this from read-only repository
+    inventory, never from the raw comment body itself.
+    """
+    if not isinstance(investigation_derived_path_literals, list):
+        return False
+    if not investigation_derived_path_literals:
+        return False
+    # #2086 AC4 P0 fix_delta: this was previously an `any()` check -- a
+    # SINGLE syntactically-valid entry anywhere in the list cleared the
+    # boundary even if the list also contained an unsafe/malformed token
+    # (e.g. `["docs/dev/workflow.md", "../../escape.py"]`). That is an
+    # authority-laundering risk the moment a caller actually wires this
+    # parameter through (see run_refinement_preflight.py / #2086 AC3): a
+    # single genuine investigation result mixed with ONE attacker- or
+    # bug-supplied unsafe token would still clear `expands_allowed_paths`.
+    # Fail-closed on mixed input: EVERY entry must be a safe, non-empty
+    # string that normalizes to an exact repository-relative path literal,
+    # or the entire set is untrusted and the boundary is NOT cleared.
+    for item in investigation_derived_path_literals:
+        if not isinstance(item, str):
+            return False
+        if _normalize_exact_repository_path_literal(item) is None:
+            return False
+    return True
+
+
+def _first_blocking_boundary_reason(
+    boundary_flags: dict,
+    evidence: dict,
+    *,
+    operator_asserted_human_context: bool = False,
+    investigation_derived_path_literals: "list | None" = None,
+):
     """Return the first boundary that has not earned its narrow exception.
 
     Every true flag is evaluated independently.  Clearing a constrained
     permission redesign must never hide an external, destructive, split, or
     vague Allowed Paths boundary that appears later in the priority order.
+
+    #2086 AC3/AC4: for the operator-selected human-context lane only
+    (``operator_asserted_human_context=True``, gated upstream by
+    ``classify_scope_delta_authority()`` on ``authority_category ==
+    "human_review_directive"`` -- i.e. a trusted OWNER/MEMBER/COLLABORATOR
+    on the ``with_human_context`` lane), a safe
+    ``investigation_derived_path_literals`` entry clears the
+    ``expands_allowed_paths`` boundary the same way an exact backtick
+    literal already extracted from the directive text does. This does not
+    relax the destructive / permission / external-service / issue-split
+    boundaries, and it does not relax the existing #1952 "mixed literal"
+    fail-closed behavior for directive text that itself contains an unsafe
+    or malformed backtick token (``_has_explicit_exact_allowed_path_expansion``
+    is still tried first and is unaffected by this addition).
     """
     for key, reason in _BOUNDARY_REASON_PRIORITY:
         if not boundary_flags.get(key):
@@ -1567,7 +1875,15 @@ def _first_blocking_boundary_reason(boundary_flags: dict, evidence: dict):
             evidence, boundary_flags
         ):
             continue
-        if key == "expands_allowed_paths" and _has_explicit_exact_allowed_path_expansion(evidence):
+        if key == "expands_allowed_paths" and (
+            _has_explicit_exact_allowed_path_expansion(evidence)
+            or (
+                operator_asserted_human_context
+                and _has_investigation_derived_allowed_path_literals(
+                    investigation_derived_path_literals
+                )
+            )
+        ):
             continue
         return reason
     return None
@@ -1631,6 +1947,42 @@ def _has_conflicting_directives(evidence_list: list) -> bool:
     return any(candidate != first for candidate in directive_sets[1:])
 
 
+def _parsed_issue_number_for_cross_target(evidence: dict, expected_repo) -> "int | None":
+    """#2053 AC6: resolve the issue number a comment-shaped evidence entry
+    structurally targets, restricted to issue_comment/pull_request_review
+    kinds (the only kinds that carry a comment_url). Returns None when the
+    evidence is not comment-shaped, the URL does not parse, or (when
+    expected_repo is provided) the URL points at a different repository --
+    those cases are handled by the existing same-target validation path,
+    not by cross-target detection.
+    """
+    if evidence.get("source_kind") not in ("issue_comment", "pull_request_review"):
+        return None
+    parsed = parse_issue_comment_url(evidence.get("comment_url"))
+    if parsed is None:
+        return None
+    if expected_repo:
+        expected_parts = expected_repo.lower().split("/", 1)
+        if [parsed["owner"].lower(), parsed["repo"].lower()] != expected_parts:
+            return None
+    return parsed["issue_number"]
+
+
+def _build_cross_target_follow_up_candidate(evidence: dict, target_issue_number: "int | None") -> dict:
+    """#2053 AC6: a non-mutating, informational candidate. mutation_authority
+    is always False -- a follow-up candidate never grants Issue mutation
+    authority on the cross-referenced target; it requires that target
+    Issue's own trusted directive to become actionable.
+    """
+    return {
+        "target_issue_number": target_issue_number,
+        "source_kind": evidence.get("source_kind"),
+        "comment_url": evidence.get("comment_url"),
+        "mutation_authority": False,
+        "note": "cross_target_directive_observed_requires_own_trusted_directive_on_target_issue",
+    }
+
+
 def classify_scope_delta_authority(
     evidence,
     *,
@@ -1638,6 +1990,79 @@ def classify_scope_delta_authority(
     target_issue_number=None,
     base_issue_body_sha256=None,
     expected_repo=None,
+    investigation_derived_path_literals=None,
+) -> dict:
+    """#2053 AC6 public wrapper: partitions `evidence` into same-target and
+    cross-target (a different Issue than `target_issue_number`) before
+    delegating to `_classify_scope_delta_authority_core`.
+
+    A cross-target comment attempting a directive (non-empty
+    directive_markers/extracted_directives) is NEVER treated as mutation
+    authority for `target_issue_number` -- `cross_target_direct_mutation`
+    is always rejected (AC6). It is instead surfaced as a non-mutating
+    `follow_up_candidates` entry so it is not silently dropped, matching
+    AC5's fail-closed cross-issue behavior while adding AC6's explicit type
+    separation from `primary_target_exact_delta`.
+    """
+    if evidence is None:
+        raw_list = []
+    elif isinstance(evidence, dict):
+        raw_list = [evidence]
+    elif isinstance(evidence, list):
+        raw_list = [item for item in evidence if isinstance(item, dict)]
+    else:
+        raw_list = []
+
+    cross_target_follow_ups: list = []
+    same_target_list: list = []
+    if target_issue_number is not None and triggered:
+        for item in raw_list:
+            parsed_issue = _parsed_issue_number_for_cross_target(item, expected_repo)
+            if parsed_issue is not None and parsed_issue != target_issue_number:
+                if item.get("extracted_directives") or item.get("directive_markers"):
+                    cross_target_follow_ups.append(
+                        _build_cross_target_follow_up_candidate(item, parsed_issue)
+                    )
+                continue
+            same_target_list.append(item)
+    else:
+        same_target_list = raw_list
+
+    filtered_evidence = same_target_list if raw_list else evidence
+
+    result = _classify_scope_delta_authority_core(
+        filtered_evidence,
+        triggered=triggered,
+        target_issue_number=target_issue_number,
+        base_issue_body_sha256=base_issue_body_sha256,
+        expected_repo=expected_repo,
+        investigation_derived_path_literals=investigation_derived_path_literals,
+    )
+
+    if cross_target_follow_ups:
+        result = dict(result)
+        result["follow_up_candidates"] = cross_target_follow_ups
+        result["route"] = dict(result["route"])
+        if not same_target_list:
+            # Pure cross-target attempt: no same-target evidence survived,
+            # so the only signal is the rejected cross-target mutation.
+            result["route"]["reason_code"] = REASON_CROSS_TARGET_DIRECT_MUTATION
+            result["route"]["target_binding"] = "cross_target_direct_mutation"
+            result["route"]["implementation_allowed"] = False
+        elif result["route"].get("action") == SCOPE_DELTA_AUTHORITY_ROUTE_CONTRACT_UPDATE_REQUIRED:
+            result["route"]["target_binding"] = "primary_target_exact_delta"
+
+    return result
+
+
+def _classify_scope_delta_authority_core(
+    evidence,
+    *,
+    triggered: bool = True,
+    target_issue_number=None,
+    base_issue_body_sha256=None,
+    expected_repo=None,
+    investigation_derived_path_literals=None,
 ) -> dict:
     """AC1-AC19: classify scope_delta_authority for a scope signal delta.
 
@@ -1651,6 +2076,15 @@ def classify_scope_delta_authority(
     URL from a *different* repository is fail-closed rejected (AC16
     hardening). When omitted, issue_comment evidence is fail-closed rejected
     by the URL validator (repo cross-check cannot be skipped silently).
+
+    `investigation_derived_path_literals` (#2086 AC3/AC4): an optional list
+    of repository-relative path strings derived by *read-only* agent
+    investigation (never from the raw comment body). It is only ever
+    consulted for the operator-selected human-context lane (evidence whose
+    `authority_category` resolves to `human_review_directive`) to clear the
+    `expands_allowed_paths` boundary when the directive itself names
+    architecture/workflow-level scope expansion in prose without an exact
+    backtick literal (see `_has_investigation_derived_allowed_path_literals`).
     """
     if not triggered:
         return _build_scope_delta_authority_result(
@@ -1743,7 +2177,12 @@ def classify_scope_delta_authority(
         )
 
     # category == human_review_directive
-    boundary_reason = _first_blocking_boundary_reason(boundary_flags, primary_evidence)
+    boundary_reason = _first_blocking_boundary_reason(
+        boundary_flags,
+        primary_evidence,
+        operator_asserted_human_context=True,
+        investigation_derived_path_literals=investigation_derived_path_literals,
+    )
     if boundary_reason is not None:
         # AC18: boundary flags gate even a trusted approval.
         return _build_scope_delta_authority_result(

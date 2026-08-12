@@ -203,6 +203,21 @@ triage セッション（人間または AI エージェント）
 
 `state/ready` ラベルを追加しても「ready かどうか」を判断するには結局 blocker / dependency の close 状態を確認する必要がある。ラベルはその確認結果の複製にすぎず、二重管理によるズレ（ラベルは ready だが blocker が open のまま等）を招く。したがって `state/ready` は採用しない。着手可否は blocker / dependency の close 状態を直接参照することで判断する。
 
+### GitHub Issue labels の presentation-only SSOT 原則（全ラベル種別への一般化, #2084）
+
+上記の `state/blocked` / `state/queued` に関する「補助・派生表示」原則を、全ラベル種別（`phase/implementation` / `state/needs-human` / `state/done` / `triage-required` / `agent/implementer` を含む）へ一般化する。
+
+**GitHub Issue labels は presentation-only / non-authoritative metadata である。** labels は人間の認知・分類・検索補助に限定され、AI の readiness・quality・implementation permission・handoff・stop condition の authority にしてはならない（OWNER directive、#2084 comment #5249582962 / #5249734344）。
+
+#### Readiness Plane（readiness の authority）と Presentation Plane（label の位置づけ）の分離
+
+- **Readiness Plane（readiness authority）**: GitHub native issue open/closed state、Machine-Readable Contract、GitHub native dependency（`Depends on #N` fallback 含む）close 状態、explicit operator/OWNER directive、`CONTRACT_REVIEW_RESULT_V1` / review / test / CI 結果。
+- **Presentation Plane（label の位置づけ）**: GitHub labels は人間の認知・分類・検索補助に限定する。label mutation の失敗は warning/telemetry にはできるが、readiness failure にしてはならない。
+
+#### 不変条件
+
+`label_sync.result`（`applied | noop | failed`）の値を変えても `status` / `routing_action` / `implementation_allowed` が変化してはならない。`triage-required` remove、`phase/implementation` / `agent/implementer` add 等の label mutation は、readiness decision 後にのみ実行される best-effort presentation sync として扱う。
+
 ### blocker / dependency の本文表現規約
 
 Issue 本文で依存関係を表現する場合は、以下の優先順位に従う。
@@ -241,7 +256,7 @@ implementation overlap preflight が `human_review_required` に倒れ続ける�
   write-root 外 tracked changes 確認、`GH_TOKEN`/`GITHUB_TOKEN` の環境除去、mutation 直前の
   attempt marker 記録は PR #1667 レビュー fix_delta で追加された安全策である。
 
-## 既存 Issue の native parent／blockedBy／blocking 同期（`issue_relationship.update`、Issue #1883）
+## 既存の Issue に対して native な parent・blockedBy・blocking の関係性を同期する仕組み（`issue_relationship.update`、Issue #1883）
 
 `edit-issue` transaction（`edit_issue_txn.py`）が既存 Issue を更新する際、本文の
 `parent_issue`／`Part of`／`Depends on #N` を書き換えても GitHub native

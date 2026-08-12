@@ -6,8 +6,10 @@ requiring the agy CLI to be installed in the test environment.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
+import sys
 import types
 from pathlib import Path
 from typing import Any
@@ -502,7 +504,7 @@ def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, 
 
     captured_prompt: dict[str, str] = {}
 
-    def _fake_live_evidence(context_paths, root, manifest):
+    def _fake_live_evidence(context_paths, root, manifest, *, deadline_monotonic=None):
         evidence_records = [
             {
                 "tool_name": "find_file",
@@ -1044,27 +1046,37 @@ def test_agy_empty_stdout_warning_matches_failure_class_when_ci_unset(monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# Issue #1749 (superseded by Issue #1777): grounded_research forces
-# --model claude-sonnet-4-6 so agy -p actually calls
-# search_web/read_url_content instead of hallucinating a "searched" answer
-# with the default model.
+# Issue #1749 (superseded by Issue #1777, further narrowed by Issue #2069):
+# grounded_research forces --model claude-sonnet-4-6 so agy -p actually
+# calls search_web/read_url_content instead of hallucinating a "searched"
+# answer with the default model.
 #
 # Issue #1777 ran a controlled grounding matrix experiment and found the
 # model-selection causal claim was NOT supported (prompt construction was
 # the dominant factor, not model selection); the exact-model-hardcode
 # AGY_GROUNDED_RESEARCH_MODEL constant was replaced by capability-driven
 # routing (resolve_agy_grounded_research_model(), config/model_routing.yaml
-# roles.grounded_research.model_chain). The tests below (AC7) are replaced
-# to verify the new capability contract instead of the exact
-# `claude-sonnet-4-6` string.
+# roles.grounded_research.model_chain).
+#
+# Issue #2069: the #1777 experiment's own finding (account_default
+# outperformed the claude-sonnet-4-6 candidate) was still not reflected in
+# the config -- roles.grounded_research.model_chain stayed hardcoded to
+# ["claude-sonnet-4-6"], unilaterally consuming the Antigravity CLI shared
+# "Claude and GPT Models" quota on every grounded_research call. The chain
+# is now the empty default (`[]`, grounded_research_empty_chain_exception in
+# load_model_routing()), so the default route omits --model entirely and
+# defers model selection to AGY's own account_default. The test below is
+# updated accordingly; see also test_grounded_research_default_route_no_model_flag.
 # ---------------------------------------------------------------------------
 
 
 def test_issue_1749_grounded_research_uses_capability_driven_model_candidate() -> None:
-    """AC7 (replaces the old exact-string test): grounded_research's agy -p
-    invocation includes --model with a candidate resolved from
-    config/model_routing.yaml roles.grounded_research.model_chain, not a
-    hardcoded constant."""
+    """AC7 (replaces the old exact-string test; updated by Issue #2069):
+    grounded_research's agy -p invocation resolves --model from
+    config/model_routing.yaml roles.grounded_research.model_chain via
+    capability-driven routing, not a hardcoded constant. With the current
+    default (empty) chain, resolution correctly omits --model altogether
+    (AGY account_default) rather than forcing a candidate."""
     captured_cmd: dict[str, Any] = {"value": None}
 
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
@@ -1080,12 +1092,35 @@ def test_issue_1749_grounded_research_uses_capability_driven_model_candidate() -
 
     cmd = captured_cmd["value"]
     assert cmd is not None
-    assert "--model" in cmd
-    model_index = cmd.index("--model")
-    expected_chain, error = rgh.resolve_model_chain({"role": "grounded_research"})
-    assert error is None
-    assert cmd[model_index + 1] == expected_chain[0]
+    expected_chain, _error = rgh.resolve_model_chain({"role": "grounded_research"})
+    assert expected_chain == []
+    assert "--model" not in cmd
     assert not hasattr(rgh, "AGY_GROUNDED_RESEARCH_MODEL")
+
+
+def test_grounded_research_default_route_no_model_flag() -> None:
+    """Issue #2069 AC8: on the default route (config/model_routing.yaml's
+    roles.grounded_research.model_chain == []), resolve_agy_grounded_research_model()
+    returns None, and the real agy invocation argv built by _run_agy() does
+    not include a --model flag at all -- AGY account_default is used."""
+    assert rgh.resolve_agy_grounded_research_model() is None
+
+    captured_cmd: dict[str, Any] = {"value": None}
+
+    def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        captured_cmd["value"] = list(cmd)
+        return _make_completed(0, stdout="ok")
+
+    token = rgh._AGY_TOOL_PROFILE_CTX.set("grounded_research")
+    try:
+        with patch("subprocess.run", side_effect=mock_run):
+            rgh._run_agy("test prompt", 30)
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(token)
+
+    cmd = captured_cmd["value"]
+    assert cmd is not None
+    assert "--model" not in cmd
 
 
 def test_issue_1749_non_grounded_research_profile_omits_model_flag() -> None:
@@ -1109,11 +1144,13 @@ def test_issue_1749_non_grounded_research_profile_omits_model_flag() -> None:
 
 
 def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation() -> None:
-    """AC3/AC4 (pre-#1777): run_delegation(tool_profile=grounded_research) drives
-    _run_agy with the resolved --model flag actually present in the real
-    subprocess.run argv (not just unit-level on _run_agy), proving the flag
-    reaches the real invocation path used in production, with a grounded
-    tool_calls trace still recognized correctly."""
+    """AC3/AC4 (pre-#1777; updated by Issue #2069): run_delegation(tool_profile=
+    grounded_research) drives _run_agy() through the real subprocess.run() argv
+    path with a grounded tool_calls trace correctly recognized. With the
+    current default (empty) roles.grounded_research.model_chain, the real
+    invocation correctly omits --model (AGY account_default) rather than
+    forcing a candidate -- see test_grounded_research_default_route_no_model_flag
+    for the focused unit-level assertion."""
     captured_cmd: dict[str, Any] = {"value": None}
     grounded_output = (
         "Response from AGY.\n"
@@ -1135,11 +1172,9 @@ def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation
     assert result["ok"] is True
     cmd = captured_cmd["value"]
     assert cmd is not None
-    assert "--model" in cmd
-    model_index = cmd.index("--model")
-    expected_chain, error = rgh.resolve_model_chain({"role": "grounded_research"})
-    assert error is None
-    assert cmd[model_index + 1] == expected_chain[0]
+    expected_chain, _error = rgh.resolve_model_chain({"role": "grounded_research"})
+    assert expected_chain == []
+    assert "--model" not in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -1150,13 +1185,17 @@ def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation
 
 def test_issue_1777_ac1_model_routing_yaml_defines_grounded_research_role() -> None:
     """AC1: grounded_research model candidates are loaded from
-    model_routing.yaml's roles section (not a Python constant)."""
+    model_routing.yaml's roles section (not a Python constant). Updated by
+    Issue #2069: the default chain is now the empty list
+    (grounded_research_empty_chain_exception), so resolve_agy_grounded_research_model()
+    correctly resolves to None (AGY account_default) rather than chain[0]."""
     routing = rgh.load_model_routing()
     assert "grounded_research" in routing["roles"]
     chain = routing["roles"]["grounded_research"]["model_chain"]
-    assert isinstance(chain, list) and len(chain) >= 1
+    assert isinstance(chain, list)
     assert all(isinstance(entry, str) and entry.strip() for entry in chain)
-    assert rgh.resolve_agy_grounded_research_model() == chain[0]
+    assert chain == []
+    assert rgh.resolve_agy_grounded_research_model() is None
 
 
 def test_issue_1777_ac2_grounded_research_prompt_contains_explicit_search_instruction() -> None:
@@ -1298,3 +1337,104 @@ def test_issue_1777_ac6_grounded_research_evidence_gate_applies_regardless_of_mo
             no_model_result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
     assert no_model_result["ok"] is False
     assert no_model_result["failure_class"] == "agy_web_grounding_tool_call_missing"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2015 AC2: hermetic transport-level test using a fake stdio MCP
+# server that emits a large stderr burst before replying, verifying the
+# collector completes without stalling and stdout JSON-RPC is never
+# corrupted by merged stderr.
+# ---------------------------------------------------------------------------
+
+_FAKE_SERENA_STDERR_BACKPRESSURE_SERVER_SOURCE = '''
+import json
+import sys
+
+
+def _send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+
+def _read():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+
+def main():
+    tools = ["find_file", "search_for_pattern", "get_symbols_overview"]
+    while True:
+        msg = _read()
+        if msg is None:
+            return
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "notifications/initialized":
+            continue
+        if method == "initialize":
+            _send({"jsonrpc": "2.0", "id": mid, "result": {}})
+        elif method == "tools/list":
+            _send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [{"name": t} for t in tools]}})
+        elif method == "tools/call":
+            params = msg.get("params", {}) or {}
+            name = params.get("name")
+            # Simulate a repo-wide search_for_pattern dumping a large
+            # amount of Serena-side logging to stderr before it can reply
+            # on stdout -- this is the self-induced stall scenario from the
+            # Issue #2015 background section.
+            chunk = "serena-stderr-log-line " * 200
+            for _ in range(500):
+                sys.stderr.write(chunk + "\\n")
+            sys.stderr.flush()
+            _send({"jsonrpc": "2.0", "id": mid, "result": {"echo": name}})
+        else:
+            _send({"jsonrpc": "2.0", "id": mid, "result": {}})
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def test_ac2_serena_collector_survives_stderr_backpressure_fake_mcp_server(tmp_path) -> None:
+    """AC2: a fake MCP server that writes a large stderr burst before every
+    tools/call response must not cause the collector to time out. stderr is
+    bounded/redacted and must never corrupt the stdout JSON-RPC stream."""
+    server_path = tmp_path / "fake_serena_stderr_backpressure_server.py"
+    server_path.write_text(_FAKE_SERENA_STDERR_BACKPRESSURE_SERVER_SOURCE, encoding="utf-8")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    context_file = repo_root / "context.md"
+    context_file.write_text("local_asset_research content", encoding="utf-8")
+
+    def _fake_load_serena_from_mcp_config(root, mcp_config_path=None):
+        return {"command": sys.executable, "args": [str(server_path)]}
+
+    manifest = {
+        "pinned_ref": "deadbeef00000000",
+        "read_only_allowlist": ["find_file", "search_for_pattern", "get_symbols_overview"],
+        "known_tools": ["find_file", "search_for_pattern", "get_symbols_overview"],
+    }
+
+    with patch.object(rgh, "_load_serena_from_mcp_config", _fake_load_serena_from_mcp_config), patch.object(
+        rgh, "SERENA_COLLECTOR_SESSION_DEADLINE_SEC", 20.0
+    ), patch.object(rgh, "SERENA_CLIENT_REQUEST_TIMEOUT_SEC", 10.0), patch.object(
+        rgh, "SERENA_SERVER_TOOL_TIMEOUT_SEC", 8.0
+    ):
+        documents, metadata = rgh._collect_live_serena_read_only_evidence([context_file], repo_root, manifest)
+
+    assert len(documents) == 3
+    assert metadata["manifest_drift_failed"] is False
+    assert metadata["stderr_byte_count"] > 0
+    # Bounded: even though the fake server wrote well over 1MB per call
+    # across three tools/call round-trips, the retained tail never exceeds
+    # the configured ring buffer cap.
+    assert metadata["stderr_byte_count"] <= rgh.SERENA_STDERR_RING_BUFFER_MAX_BYTES
+    for doc in documents:
+        content = json.loads(doc["content"])
+        # stdout JSON-RPC content must be intact -- no interleaved stderr
+        # log lines leaking into the tool result snippet.
+        assert "serena-stderr-log-line" not in content["content_snippet"]

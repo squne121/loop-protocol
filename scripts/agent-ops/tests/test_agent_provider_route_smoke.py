@@ -242,7 +242,10 @@ class TestProducer:
         ])
         assert rc == 0
         artifact_paths = sorted(tmp_path.glob("*.json"))
-        artifact_paths = [p for p in artifact_paths if p.name != "index.json"]
+        artifact_paths = [
+            p for p in artifact_paths
+            if p.name != "index.json" and not p.name.endswith("-diagnostics.json")
+        ]
         assert len(artifact_paths) == 6
         for path in artifact_paths:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -257,7 +260,10 @@ class TestProducer:
             "--dry-run", "--output-dir", str(tmp_path), "--repo-root", str(REPO_ROOT),
         ])
         assert rc == 0
-        artifact_paths = [p for p in tmp_path.glob("*.json") if p.name != "index.json"]
+        artifact_paths = [
+            p for p in tmp_path.glob("*.json")
+            if p.name != "index.json" and not p.name.endswith("-diagnostics.json")
+        ]
         assert len(artifact_paths) == 1
 
     def test_unknown_route_returns_nonzero(self, producer, tmp_path, capsys):
@@ -380,10 +386,13 @@ class TestProducerRouteEvidenceValidation:
         assert producer._validate_delegation_request_evidence(tmp_path, route) == "fail"
 
     def test_delegation_result_missing_yields_no_provider(self, producer, tmp_path):
-        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        provider, attempts, ok, agy_failure_class = producer._validate_delegation_result_evidence(
+            tmp_path
+        )
         assert provider is None
         assert attempts == []
         assert ok is False
+        assert agy_failure_class is None
 
     def test_delegation_result_reads_actual_provider_key(self, producer, tmp_path):
         """A real provider="agy" delegation_result/v1 never has a
@@ -399,18 +408,24 @@ class TestProducerRouteEvidenceValidation:
             json.dumps({"ok": True, "provider": "agy", "tool_profile": "local_asset_research"}),
             encoding="utf-8",
         )
-        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        provider, attempts, ok, agy_failure_class = producer._validate_delegation_result_evidence(
+            tmp_path
+        )
         assert provider == "agy"
         assert attempts == ["agy"]
         assert ok is True
+        assert agy_failure_class is None
 
     def test_delegation_result_wrapper_not_ok_is_recorded(self, producer, tmp_path):
         (tmp_path / "delegation_result.json").write_text(
             json.dumps({"ok": False, "provider": "agy", "failure_class": "agy_exit_nonzero"}),
             encoding="utf-8",
         )
-        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        provider, attempts, ok, agy_failure_class = producer._validate_delegation_result_evidence(
+            tmp_path
+        )
         assert ok is False
+        assert agy_failure_class == "agy_exit_nonzero"
 
     def test_delegation_result_auto_dispatch_shape_still_supported(self, producer, tmp_path):
         """provider="auto" results (not currently exercised by this route
@@ -423,10 +438,13 @@ class TestProducerRouteEvidenceValidation:
             ),
             encoding="utf-8",
         )
-        provider, attempts, ok = producer._validate_delegation_result_evidence(tmp_path)
+        provider, attempts, ok, agy_failure_class = producer._validate_delegation_result_evidence(
+            tmp_path
+        )
         assert provider == "agy"
         assert attempts == ["agy"]
         assert ok is True
+        assert agy_failure_class is None
 
     def test_github_research_route_evidence_missing_is_none(self, producer, tmp_path):
         assert producer._validate_github_research_route_evidence(tmp_path) is None
@@ -474,6 +492,157 @@ class TestProducerRetryPolicy:
     def test_direct_fallback_invoked_is_never_transient_candidate(self, producer):
         route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
         assert producer._is_transient_infrastructure_candidate(route, "direct_fallback_invoked") is False
+
+    def test_validation_failed_without_materialization_diagnostics_is_not_transient(self, producer):
+        """A ``validation_failed`` cause with no diagnostics (or diagnostics
+        that never recorded the artifact-materialization race) must remain
+        non-transient -- only adding the new Issue #2015 AC14 diagnostic
+        signature below is allowed to change that."""
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        assert producer._is_transient_infrastructure_candidate(route, "validation_failed", None) is False
+        assert (
+            producer._is_transient_infrastructure_candidate(
+                route, "validation_failed", {"secondary_failures": []}
+            )
+            is False
+        )
+        assert (
+            producer._is_transient_infrastructure_candidate(
+                route,
+                "validation_failed",
+                {"secondary_failures": [{"kind": "nonzero_harness_exit_with_spawn_evidence"}]},
+            )
+            is False
+        )
+
+    def test_claude_child_completed_artifact_not_materialized_is_transient_candidate(self, producer):
+        """Issue #2015 AC14 root-cause finding (live reproduction on head
+        505d3528): a genuinely-completed child (SubagentStop hook fired)
+        whose delegation artifact never materializes even after the bounded
+        poll is a genuine async-Task-dispatch infrastructure-timing race,
+        not a validation defect -- eligible for the same bounded single
+        retry as the codex_cli spawn-evidence disk-timing race, on EITHER
+        runtime (reproduced live on claude_code; the underlying async
+        dispatch race is not runtime-specific)."""
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "child_completed_but_artifact_not_materialized"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
+            is True
+        )
+
+    def test_codex_child_completed_artifact_not_materialized_is_transient_candidate(self, producer):
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "child_completed_but_artifact_not_materialized"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
+            is True
+        )
+
+    def test_agy_rate_limited_is_transient_candidate(self, producer):
+        """Issue #2015 root-cause finding (live re-run, 2026-08-09, head
+        948759e8): a genuinely-completed, genuinely-spawned codex_cli
+        trial can still fail ``validation_failed`` because the
+        materialized ``delegation_result.json`` itself reports
+        ``ok: false`` with ``failure_class: agy_rate_limited`` -- a
+        real AGY-side ``RESOURCE_EXHAUSTED`` (HTTP 429) quota/rate-limit
+        error observed under concurrent multi-session host load, AFTER a
+        genuinely successful Serena MCP retrieval
+        (``local_asset_retrieval_metadata.retrieval_status: "succeeded"``).
+        ``references/failure-class-taxonomy.md``'s AGY provider failure
+        class table already documents ``agy_rate_limited`` as
+        retryable="yes"; this is retry-eligible at this route-smoke layer
+        too, for either runtime."""
+        for runtime in ("codex_cli", "claude_code"):
+            route = producer._find_route(runtime, "codebase-investigator", "local_asset_research")
+            diagnostics = {
+                "secondary_failures": [
+                    {"kind": "agy_transient_quota_failure", "agy_failure_class": "agy_rate_limited"},
+                ],
+            }
+            assert (
+                producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
+                is True
+            )
+
+    def test_agy_capacity_exhausted_is_transient_candidate(self, producer):
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "agy_transient_quota_failure", "agy_failure_class": "agy_capacity_exhausted"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
+            is True
+        )
+
+    def test_agy_transient_quota_marker_never_promotes_non_validation_failed_classes(
+        self, producer
+    ):
+        """The new ``agy_transient_quota_failure`` secondary-failure marker
+        is scoped identically to the pre-existing materialization-race
+        marker: it only ever promotes ``failure_class: validation_failed``,
+        never an unrelated deterministic signal such as ``gemini_invoked``
+        (checked, and always wins, ahead of ``delegation_result.json``
+        state in ``_run_route_once``)."""
+        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "agy_transient_quota_failure", "agy_failure_class": "agy_rate_limited"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "gemini_invoked", diagnostics)
+            is False
+        )
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "provider_mismatch", diagnostics)
+            is False
+        )
+
+    def test_child_completed_marker_never_promotes_a_deterministic_policy_violation(
+        self, producer
+    ):
+        """Issue #2015 P1 fix (control-plane live re-run + live repro, head
+        ffad6201, 2026-08-09): the diagnostic marker's retry-eligibility
+        was originally scoped to ``validation_failed`` only, on the (since
+        live-disproven) assumption that ``provider_mismatch`` could not
+        also stem from the same missing-result-file race -- a live
+        ``codex_cli``/``local_asset_research`` repro on this head showed
+        the identical ``child_completed_but_artifact_not_materialized``
+        condition surfacing as ``failure_class: provider_mismatch``
+        instead (see ``_is_transient_infrastructure_candidate``'s own
+        docstring/comment for the exact reproduced diagnostics). It is
+        therefore now retry-eligible. What must still NEVER be promoted is
+        a deterministic, independent policy-violation signal such as
+        ``gemini_invoked`` (a literal forbidden-binary sentinel hit,
+        recorded during the SAME already-completed subprocess run,
+        unrelated to and always checked ahead of
+        ``delegation_result.json`` state) -- retrying that would not
+        resolve it and would only burn route budget."""
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "child_completed_but_artifact_not_materialized"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "provider_mismatch", diagnostics)
+            is True
+        )
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "gemini_invoked", diagnostics)
+            is False
+        )
 
 
 class TestValidator:

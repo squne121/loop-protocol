@@ -82,15 +82,15 @@ CONCLUSION_CATEGORIES = (
 # entry is (step_number, source_line, failure_class, a substring that must
 # genuinely appear on that line of the real production source file).
 PRODUCTION_FAILURE_LADDER = (
-    (1, 523, "gemini_invoked", "gemini_hits > 0"),
-    (2, 526, "direct_fallback_invoked", "fallback_hits > 0"),
-    (3, 529, "agy_unavailable", "harness_exit == 77"),
-    (4, 532, "validation_failed", "harness_exit != 0"),
-    (5, 535, "spawn_not_observed", "native_spawn_event_observed"),
-    (6, 538, "validation_failed", "request_validation"),
-    (7, 541, "provider_mismatch", "selected_provider"),
-    (8, 544, "route_evidence_schema_mismatch", "route_evidence_sha256"),
-    (9, 547, "validation_failed", "wrapper_ok"),
+    (1, 911, "gemini_invoked", "gemini_hits > 0"),
+    (2, 914, "direct_fallback_invoked", "fallback_hits > 0"),
+    (3, 917, "agy_unavailable", "harness_exit == 77"),
+    (4, 920, "validation_failed", "harness_exit != 0"),
+    (5, 923, "spawn_not_observed", "native_spawn_event_observed"),
+    (6, 926, "validation_failed", "request_validation"),
+    (7, 929, "provider_mismatch", "selected_provider"),
+    (8, 932, "route_evidence_schema_mismatch", "route_evidence_sha256"),
+    (9, 935, "validation_failed", "wrapper_ok"),
 )
 
 EXTRACTORS = (

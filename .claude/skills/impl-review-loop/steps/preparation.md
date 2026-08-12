@@ -105,17 +105,18 @@ INTAKE_GATE_RESULT_V1:
 
 #### 1. `metadata_not_ready`（最高優先）
 
-Issue の routing metadata が `impl-review-loop` の前提を満たさない場合。以下のいずれかが欠落:
+Issue の routing metadata が `impl-review-loop` の前提を満たさない場合。以下が欠落:
 
 - **title prefix** が `実装:` または `implement:` で始まっていない
-- **`phase/implementation` label** が付与されていない
 
 ```bash
 gh issue view <issue_number> --json title,labels \
   --jq '{title: .title, labels: [.labels[].name]}'
 ```
 
-どちらか一方でも欠落していれば `intake_gate_failed: metadata_not_ready` で停止。
+title prefix が欠落していれば `intake_gate_failed: metadata_not_ready` で停止。
+
+`phase/implementation` label は presentation-only / non-authoritative metadata（#2084）であり、`metadata_not_ready` の判定条件には含めない。label の欠落・付与漏れは readiness gate の停止理由にしない。GitHub Issue labels の readiness authority からの分離原則は `docs/dev/workflow.md` の `implementation_consumer_ready_contract` および `docs/dev/github-ops.md` の SSOT セクションを参照する。
 
 #### 2. `stale_contract_review`（陳腐化した契約レビュー）
 

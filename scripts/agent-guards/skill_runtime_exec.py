@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -26,7 +27,11 @@ from skill_runtime_command_policy import (
     command_allows_root_no_worktree,
     current_branch,
     is_exact_skill_runtime_anchor_executor_command,
+    is_exact_skill_runtime_authority_transport_consume_executor_command,
+    is_exact_skill_runtime_authority_transport_produce_executor_command,
     is_exact_skill_runtime_contract_update_anchor_executor_command,
+    is_exact_skill_runtime_decide_authority_executor_command,
+    is_exact_skill_runtime_decide_executor_command,
     is_exact_skill_runtime_executor_command,
     is_exact_skill_runtime_fixture_executor_command,
     load_registry_entry,
@@ -716,10 +721,66 @@ def _trusted_uv_toolcache_dirs() -> list[str]:
 
 
 def _resolve_trusted_executable(name: str, project_root: str) -> str:
+    """Resolve `name` to a trust-validated executable path.
+
+    For "python3", the trust boundary is validated against the fully
+    resolved (symlink-following) target, but the *returned* path preserves
+    venv identity (`sys.executable` itself, unresolved) instead of the
+    realpath. Returning the realpath here previously caused `uv run
+    <realpath>` to lose association with the project venv whenever
+    `sys.executable` was a symlink into a bare interpreter (e.g. a
+    `uv python install`-managed toolchain with no project dependencies of
+    its own), which made child subprocesses unable to import project
+    dependencies (Issue #2073 root cause: jsonschema unimportable in CI).
+
+    Check/use window (Issue #2073 human-review P1-2): returning the
+    unresolved `sys.executable` path instead of its realpath means the
+    string validated here (via `real`, below) and the string ultimately
+    invoked by the caller are not byte-identical -- if something rewrote
+    the `.venv/bin/python3` symlink between this call returning and the
+    caller spawning the child process, the caller would exec whatever the
+    symlink points to *at spawn time*, not the target validated here. This
+    is a real TOCTOU window in the classic sense (CWE-367), but it cannot
+    be closed by executing through an already-opened file descriptor
+    (e.g. `/proc/self/fd/N` or `fexecve`) the way this module's other
+    symlink-race guards do for *file reads*: CPython's own venv detection
+    (`pyvenv.cfg` discovery, which determines `sys.prefix` and therefore
+    which `site-packages` a spawned interpreter uses) walks *upward from
+    the directory of the path it was invoked with*, so the invoked path
+    string itself must remain `.../.venv/bin/python3` at exec time for the
+    child to see the project's dependencies -- executing via a captured fd
+    (which has no adjacent `pyvenv.cfg`) would silently reproduce the exact
+    bug this function exists to fix. Given that, this function's only
+    caller (`_resolve_child_argv`) re-resolves and re-validates on every
+    single invocation immediately before the child is spawned (no caching,
+    no reuse of a previously-resolved value across calls -- see
+    `test_ac10_resolve_trusted_executable_is_not_cached_across_calls` in
+    `tests/test_skill_runtime_preflight_bytecode_cache.py`), which bounds
+    the window to the handful of Python statements between this function
+    returning and `subprocess`/`Popen` being invoked, with no filesystem or
+    network I/O in between. An attacker who can rewrite `.venv/bin/python3`
+    inside that window already has write access to the repository working
+    tree the executor itself operates in, which is a strictly stronger
+    position than this check defends against elsewhere in this module.
+
+    Pre-existing (not introduced by this fix) characteristic of the trust
+    check itself, found while writing the regression test above: for
+    `name == "python3"`, `runtime_dir` below is computed from `sys.executable`
+    -- the exact same value being validated -- so `real_parent == runtime_dir`
+    holds tautologically regardless of what the symlink resolves to, and the
+    `{name}_outside_trusted_path` branch can never fire for `python3` (it is
+    a real, load-bearing check only for `name == "uv"`, where `resolved` is
+    independently looked up via `shutil.which`). The only check that
+    actually constrains where `python3` may resolve is `{name}_inside_project_root`,
+    below. This was true before this fix too (the pre-fix code computed
+    `real`/`real_parent`/`runtime_dir` identically, all derived from
+    `sys.executable`); this fix does not change which check is effective,
+    only which string is returned once that check passes.
+    """
     safe_entries = _safe_path_entries()
     safe_path = os.pathsep.join(safe_entries)
     if name == "python3":
-        resolved = os.path.realpath(sys.executable)
+        resolved = sys.executable
     else:
         resolved = shutil.which(name, path=safe_path)
     if not resolved:
@@ -733,7 +794,7 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     runtime_dir = os.path.realpath(str(Path(sys.executable).resolve().parent))
     if real_parent not in allowed_dirs and real_parent != runtime_dir:
         raise RuntimeError(f"{name}_outside_trusted_path")
-    return real
+    return resolved if name == "python3" else real
 
 
 def _sanitize_env(project_root: str) -> dict[str, str]:
@@ -1451,11 +1512,384 @@ def _emit_ledger_transient_residue_failure(issue_number: int, stale_paths: list[
     return 2
 
 
-def _emit_timeout_failure(issue_number: int, timeout_seconds: object) -> int:
+# ---------------------------------------------------------------------------
+# Issue #2075: Popen-based outer-child supervisor.
+#
+# The previous implementation used `subprocess.run(child_argv, ...,
+# timeout=timeout_seconds)` and reacted to `subprocess.TimeoutExpired` after
+# the fact. That pattern cannot deliver a process-group cleanup guarantee:
+# CPython's `subprocess.run()` already `kill()`s and `wait()`s its own direct
+# child *before* re-raising `TimeoutExpired`, so by the time the `except`
+# block runs there is no safe PID/PGID left for `os.killpg(...)` to act on
+# (see the OWNER review on Issue #2075, and
+# https://docs.python.org/3.12/library/subprocess.html).
+#
+# This module instead launches the child with `subprocess.Popen(...,
+# start_new_session=True)` so the caller holds the child's PID/PGID from the
+# moment it starts, and owns the full timeout + cleanup lifecycle:
+#
+#   execution timeout -> SIGTERM -> bounded grace -> SIGKILL
+#     -> process-group absence verification -> direct-child (leader) reap
+#
+# Guarantee scope (Issue #2075 Outcome / OWNER review, narrowed from the
+# original "reap the whole process tree" framing): only descendants that
+# remain inside the executor-created process group (the common case for
+# ordinary fork/exec descendants that never call `setsid()`/`setpgid()`
+# themselves) are covered. A descendant that moves itself to a different
+# session/process group is out of scope -- confirming its absence would
+# require a subreaper/cgroup-level mechanism this module does not implement.
+#
+# `start_new_session` / `os.killpg` / `os.setsid` are POSIX-only. On a
+# platform lacking them, this module falls back to direct-child-only
+# termination and never reports `cleanup_status=confirmed_absent` (AC8):
+# absence of a POSIX guarantee is reported as `unconfirmed`, not silently
+# upgraded to a false "success".
+# ---------------------------------------------------------------------------
+
+_POSIX_PROCESS_GROUP_SUPPORTED = (
+    os.name == "posix"
+    and hasattr(os, "killpg")
+    and hasattr(os, "setsid")
+    and hasattr(os, "getpgid")
+)
+
+# Two independently bounded budgets govern outer-child supervision (Issue
+# #2075 P1-4 OWNER review contract):
+#
+#   1. `timeout_seconds` (caller-supplied, per registry entry) bounds only
+#      the *execution* wait -- i.e. `proc.communicate(timeout=...)` below.
+#   2. `_CLEANUP_GRACE_SECONDS` is a separate, freshly-started budget for
+#      the *entire* SIGTERM -> process-group-liveness poll -> SIGKILL ->
+#      absence verification -> leader reap -> pipe close sequence, begun
+#      only once the execution deadline has already been exceeded (or an
+#      exception unwinds past a successful `Popen()`). It is never stacked
+#      on top of the execution deadline, and no cleanup step below is ever
+#      given a further, separate ad-hoc timeout on top of it -- every
+#      cleanup step is bounded by `remaining(cleanup_deadline)`.
+_CLEANUP_GRACE_SECONDS = 5.0
+# Portion of `_CLEANUP_GRACE_SECONDS` allotted to waiting for SIGTERM to take
+# effect before escalating to SIGKILL. Must stay smaller than
+# `_CLEANUP_GRACE_SECONDS` so the escalation + absence-verification + reap
+# steps that follow always retain some of the shared cleanup budget, instead
+# of a SIGTERM-ignoring child silently consuming the entire cleanup deadline
+# and leaving no time to ever send SIGKILL.
+_TERM_GRACE_SECONDS = 2.0
+_GROUP_POLL_INTERVAL_SECONDS = 0.02
+
+CLEANUP_SCOPE_PROCESS_GROUP = "process_group"
+CLEANUP_STATUS_CONFIRMED_ABSENT = "confirmed_absent"
+CLEANUP_STATUS_UNCONFIRMED = "unconfirmed"
+CLEANUP_STATUS_NOT_STARTED = "not_started"
+TERMINATION_TERM = "term"
+TERMINATION_TERM_THEN_KILL = "term_then_kill"
+TERMINATION_NOT_NEEDED = "not_needed"
+
+
+class _ChildSupervisionResult:
+    """Outcome of `_run_child_with_supervision()` (Issue #2075)."""
+
+    __slots__ = (
+        "timed_out",
+        "returncode",
+        "stdout",
+        "stderr",
+        "cleanup_scope",
+        "cleanup_status",
+        "termination",
+        "leader_reaped",
+        "pid",
+    )
+
+    def __init__(
+        self,
+        *,
+        timed_out: bool,
+        returncode: int | None,
+        stdout: str,
+        stderr: str,
+        cleanup_scope: str,
+        cleanup_status: str,
+        termination: str,
+        leader_reaped: bool,
+        pid: int | None = None,
+    ) -> None:
+        self.timed_out = timed_out
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.cleanup_scope = cleanup_scope
+        self.cleanup_status = cleanup_status
+        self.termination = termination
+        self.leader_reaped = leader_reaped
+        # `pid` is an introspection aid (not part of the closed telemetry
+        # enum emitted by `_emit_timeout_failure()`) that lets a caller /
+        # test independently confirm the direct child was actually reaped.
+        self.pid = pid
+
+
+def _remaining(deadline: float) -> float:
+    """Return the non-negative seconds remaining until `deadline`."""
+    return max(0.0, deadline - time.monotonic())
+
+
+def _verify_process_group_absent(pgid: int) -> bool:
+    """Return True only when `killpg(pgid, 0)` proves the group is gone
+    (`ProcessLookupError`). Every other outcome -- the group is still alive,
+    a `PermissionError`, or any other `OSError` -- must NOT be treated as
+    confirmed absence (Issue #2075 AC6/AC9 fail-closed contract: cleanup
+    success is never inferred from signal dispatch alone)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _poll_group_absent_until(proc: subprocess.Popen, pgid: int, deadline: float) -> bool:
+    """Poll `_verify_process_group_absent(pgid)` until it is True or
+    `deadline` elapses. Returns True iff absence was confirmed within the
+    deadline.
+
+    The escalation/absence decision itself is driven entirely by
+    *process-group* liveness (`killpg(pgid, 0)`), never by leader
+    (direct-child) liveness (Issue #2075 P1-1 OWNER review): a leader that
+    exits early while a SIGTERM-ignoring descendant survives in the same
+    process group must never suppress the SIGKILL escalation that follows.
+
+    Each iteration also opportunistically calls `proc.poll()` (a
+    non-blocking `waitpid()`) purely as a side effect so a leader that has
+    already died does not linger as an unreaped zombie -- an unreaped
+    zombie's PID slot still answers `kill(pid, 0)` successfully, which
+    would otherwise make `killpg()` report the group as still alive even
+    though every process in it has actually exited. This reap is
+    incidental cleanup, not a liveness signal: it never gates the
+    SIGTERM -> SIGKILL escalation decision above."""
+    while True:
+        proc.poll()
+        if _verify_process_group_absent(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+
+
+def _bounded_reap_leader(proc: subprocess.Popen, deadline: float) -> bool:
+    """Best-effort `proc.wait()` bounded by `deadline`. Returns True iff the
+    direct child leader was reaped (no zombie left behind)."""
+    try:
+        proc.wait(timeout=_remaining(deadline))
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _bounded_close_pipes(proc: subprocess.Popen) -> None:
+    """Best-effort close of the leader's stdout/stderr pipes so a
+    descendant that still holds the write end open can never block this
+    process from returning (Issue #2075 AC7: no partial output is ever
+    surfaced on timeout regardless of how/when this closes)."""
+    for stream in (proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _stage_cleanup(
+    proc: subprocess.Popen,
+    pgid: int | None,
+    *,
+    posix_supervised: bool,
+) -> tuple[str, str, str, bool]:
+    """Run the full staged cleanup state machine -- SIGTERM, process-group
+    liveness poll, SIGKILL escalation, absence verification, leader reap,
+    pipe close -- under a single, freshly-started `cleanup_deadline`
+    (`_CLEANUP_GRACE_SECONDS`) that is independent of whatever execution
+    deadline just elapsed (Issue #2075 P1-4). Every step below is bounded
+    by `remaining(cleanup_deadline)`; no step gets its own separate,
+    unbounded-relative-to-the-caller ad-hoc timeout.
+
+    Used from both the `TimeoutExpired` path and the `except BaseException`
+    unwind path in `_run_child_with_supervision()` so that every exit path
+    that follows a successful `Popen()` drives the process group through
+    this exact same state machine (Issue #2075 P1-3).
+
+    Returns `(cleanup_scope, cleanup_status, termination, leader_reaped)`.
+    """
+    cleanup_deadline = time.monotonic() + _CLEANUP_GRACE_SECONDS
+    term_deadline = min(cleanup_deadline, time.monotonic() + _TERM_GRACE_SECONDS)
+
+    group_supervised = posix_supervised and pgid is not None
+
+    if group_supervised:
+        termination = TERMINATION_NOT_NEEDED
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            termination = TERMINATION_TERM
+        except ProcessLookupError:
+            termination = TERMINATION_NOT_NEEDED
+        except OSError:
+            termination = TERMINATION_TERM
+
+        # P1-1: the SIGTERM -> SIGKILL escalation decision is driven by
+        # *process-group* liveness, not leader liveness -- a leader that
+        # exits (on its own, or from the SIGTERM) while a SIGTERM-ignoring
+        # descendant survives in the same group must not suppress SIGKILL.
+        group_absent = _poll_group_absent_until(proc, pgid, term_deadline)
+        if not group_absent and time.monotonic() < cleanup_deadline:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+                termination = TERMINATION_TERM_THEN_KILL
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+            group_absent = _poll_group_absent_until(proc, pgid, cleanup_deadline)
+
+        # AC6: absence is only ever reported `confirmed_absent` while
+        # cleanup budget remains; deadline exhaustion is never silently
+        # promoted to a confirmed success.
+        if time.monotonic() >= cleanup_deadline:
+            cleanup_status = CLEANUP_STATUS_UNCONFIRMED
+        else:
+            cleanup_status = (
+                CLEANUP_STATUS_CONFIRMED_ABSENT if group_absent else CLEANUP_STATUS_UNCONFIRMED
+            )
+    else:
+        # AC8: no `killpg`/`setsid` on this platform (or no pgid to
+        # supervise) -- best-effort terminate the direct child only, and
+        # never claim process-group absence was confirmed. There is no
+        # POSIX guarantee here to confirm (P2-1: a failed pgid lookup must
+        # never be promoted to `confirmed_absent` either).
+        termination = TERMINATION_TERM
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        if not _bounded_reap_leader(proc, term_deadline):
+            termination = TERMINATION_TERM_THEN_KILL
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        cleanup_status = CLEANUP_STATUS_UNCONFIRMED
+
+    leader_reaped = _bounded_reap_leader(proc, cleanup_deadline)
+    _bounded_close_pipes(proc)
+
+    return CLEANUP_SCOPE_PROCESS_GROUP, cleanup_status, termination, leader_reaped
+
+
+def _run_child_with_supervision(
+    child_argv: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout_seconds: float | int | None,
+) -> _ChildSupervisionResult:
+    """Launch `child_argv` under direct caller supervision.
+
+    Normal-success semantics (stdout/stderr/returncode) are unchanged from
+    the previous `subprocess.run(capture_output=True, text=True)` behavior
+    (AC4): the execution wait itself is delegated to
+    `proc.communicate(timeout=timeout_seconds)`, which preserves
+    `subprocess.run()`'s own timeout/pipe-EOF/decode-error semantics
+    exactly (Issue #2075 P1-2) -- including that a leader which exits while
+    a descendant still holds the stdout/stderr pipe open keeps this call
+    blocked (and, on timeout, still times out) rather than being mistaken
+    for success, and that a `UnicodeDecodeError` from malformed child output
+    propagates to the caller instead of being swallowed.
+
+    On timeout (or any other exception unwinding past a successful
+    `Popen()`, including `KeyboardInterrupt`), the process group is driven
+    through `_stage_cleanup()`'s bounded state machine before returning /
+    re-raising (Issue #2075 P1-3). On timeout, no partial stdout/stderr is
+    ever surfaced (AC7) -- only cleanup telemetry is returned.
+    """
+    posix_supervised = _POSIX_PROCESS_GROUP_SUPPORTED
+
+    popen_kwargs: dict[str, object] = dict(
+        cwd=cwd,
+        env=env,
+        shell=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if posix_supervised:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(child_argv, **popen_kwargs)  # type: ignore[arg-type]
+    # P2-1: capture the process-group id at launch time, as `proc.pid`
+    # itself -- not via a later `os.getpgid()` lookup. `start_new_session`
+    # makes the leader its own session/group leader, so `proc.pid` *is* the
+    # pgid from the instant `Popen()` returns; there is no window in which a
+    # delayed `getpgid()` call could race, and a lookup failure can never be
+    # (mis)promoted to `confirmed_absent` because this code path never
+    # performs that lookup at all.
+    pgid: int | None = proc.pid if posix_supervised else None
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        cleanup_scope, cleanup_status, termination, leader_reaped = _stage_cleanup(
+            proc, pgid, posix_supervised=posix_supervised
+        )
+        return _ChildSupervisionResult(
+            timed_out=True,
+            returncode=None,
+            stdout="",
+            stderr="",
+            cleanup_scope=cleanup_scope,
+            cleanup_status=cleanup_status,
+            termination=termination,
+            leader_reaped=leader_reaped,
+            pid=proc.pid,
+        )
+    except BaseException:
+        # P1-3: any other exception after a successful Popen() -- including
+        # KeyboardInterrupt -- must still drive the process group through
+        # the same bounded cleanup state machine before propagating, or a
+        # detached process group (start_new_session=True) can outlive this
+        # process entirely.
+        _stage_cleanup(proc, pgid, posix_supervised=posix_supervised)
+        raise
+    else:
+        return _ChildSupervisionResult(
+            timed_out=False,
+            returncode=proc.returncode,
+            stdout=stdout or "",
+            stderr=stderr or "",
+            cleanup_scope=CLEANUP_SCOPE_PROCESS_GROUP,
+            cleanup_status=CLEANUP_STATUS_NOT_STARTED,
+            termination=TERMINATION_NOT_NEEDED,
+            leader_reaped=True,
+            pid=proc.pid,
+        )
+
+
+
+def _emit_timeout_failure(
+    issue_number: int,
+    timeout_seconds: object,
+    *,
+    cleanup_scope: str = CLEANUP_SCOPE_PROCESS_GROUP,
+    cleanup_status: str = CLEANUP_STATUS_NOT_STARTED,
+    termination: str = TERMINATION_NOT_NEEDED,
+    leader_reaped: bool = False,
+) -> int:
     print(
         "SKILL_RUNTIME_FAIL: "
         f"reason_code=child_process_timeout target_issue={issue_number} "
         f"timeout_seconds={timeout_seconds} "
+        f"cleanup_scope={cleanup_scope} "
+        f"cleanup_status={cleanup_status} "
+        f"termination={termination} "
+        f"leader_reaped={'true' if leader_reaped else 'false'} "
         "recovery=investigate_child_process_hang_or_increase_registry_timeout",
         file=sys.stderr,
     )
@@ -1471,6 +1905,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--fixture", required=False, default=None)
     parser.add_argument("--anchor-comment-url", required=False, default=None)
+    parser.add_argument("--loop-state-file", required=False, default=None)
+    parser.add_argument("--review-result-verdict", required=False, default=None)
+    parser.add_argument("--max-iterations", required=False, default=None)
+    # #2086 AC9/AC10: authority_transport.produce / authority_transport.consume.
+    parser.add_argument("--invocation-id", required=False, default=None)
+    parser.add_argument("--git-head-sha", required=False, default=None)
+    parser.add_argument("--evidence-fixture-path", required=False, default=None)
+    parser.add_argument("--router-receipt-path", required=False, default=None)
+    parser.add_argument("--contract-patch-plan-file", required=False, default=None)
+    parser.add_argument("--anchor-context-file", required=False, default=None)
+    # #2086 P0 fix_delta (Blocker 1/2): only ever meaningful for
+    # preflight.run.with_human_context (the operator-selected human-context
+    # lane) -- see skill_runtime_command_policy._parse_exact_skill_runtime_anchor_command.
+    parser.add_argument("--investigation-evidence-transport-path", required=False, default=None)
+    # #2086 P0 fix_delta (Blocker 3): decide.run "Mode B" -- the privileged
+    # router additionally dispatching #2053's canonical authority-transport
+    # verification (generate_router_receipt()) alongside its ordinary
+    # loop-state decision, mirroring decide_next_loop_action.py's own
+    # --authority-transport-path/--authority-expected CLI flags (added by PR
+    # #2068, declared in command_registry.py's decide.run entry, but never
+    # reachable through this executor before this fix_delta).
+    parser.add_argument("--authority-transport-path", required=False, default=None)
+    parser.add_argument("--authority-expected", action="store_true", default=False)
     args = parser.parse_args(argv)
 
     project_root = resolve_project_root()
@@ -1488,6 +1945,34 @@ def main(argv: list[str] | None = None) -> int:
         "contract_update.run.with_anchor",
         "contract_update.run.with_human_context",
     }
+    is_decide_command = args.command_id == "decide.run"
+    is_produce_command = args.command_id == "authority_transport.produce"
+    is_consume_command = args.command_id == "authority_transport.consume"
+    # #2086 P0 fix_delta (Blocker 3): decide.run may ALSO carry
+    # --invocation-id/--git-head-sha (bound into its Mode B authority-check
+    # sub-fields), in addition to authority_transport.produce/consume.
+    if not (is_produce_command or is_consume_command or is_decide_command) and (
+        args.invocation_id
+        or args.git_head_sha
+        or args.evidence_fixture_path
+        or args.router_receipt_path
+        or args.contract_patch_plan_file
+        or args.anchor_context_file
+    ):
+        print(
+            "skill_runtime_exec: --invocation-id/--git-head-sha/--evidence-fixture-path/"
+            "--router-receipt-path/--contract-patch-plan-file/--anchor-context-file are "
+            "only allowed for authority_transport.produce/authority_transport.consume/decide.run",
+            file=sys.stderr,
+        )
+        return 2
+    if not is_decide_command and (args.authority_transport_path or args.authority_expected):
+        print(
+            "skill_runtime_exec: --authority-transport-path/--authority-expected are "
+            "only allowed for decide.run",
+            file=sys.stderr,
+        )
+        return 2
     if is_fixture_command:
         if not args.fixture:
             print("skill_runtime_exec: --fixture required for preflight.run.fixture", file=sys.stderr)
@@ -1495,6 +1980,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.anchor_comment_url:
             print(
                 "skill_runtime_exec: --anchor-comment-url is not allowed for preflight.run.fixture",
+                file=sys.stderr,
+            )
+            return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: --loop-state-file/--review-result-verdict/"
+                "--max-iterations are not allowed for preflight.run.fixture",
                 file=sys.stderr,
             )
             return 2
@@ -1530,6 +2022,20 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: --loop-state-file/--review-result-verdict/"
+                "--max-iterations are not allowed for anchor runtime commands",
+                file=sys.stderr,
+            )
+            return 2
+        if args.investigation_evidence_transport_path and args.command_id != "preflight.run.with_human_context":
+            print(
+                "skill_runtime_exec: --investigation-evidence-transport-path is only "
+                "allowed for preflight.run.with_human_context",
+                file=sys.stderr,
+            )
+            return 2
         command_text = " ".join(
             [
                 "uv",
@@ -1551,6 +2057,11 @@ def main(argv: list[str] | None = None) -> int:
                     if args.command_id == "preflight.run.with_agent_report"
                     else []
                 ),
+                *(
+                    ["--investigation-evidence-transport-path", args.investigation_evidence_transport_path]
+                    if args.investigation_evidence_transport_path
+                    else []
+                ),
             ]
         )
         exact_anchor_command = (
@@ -1563,6 +2074,199 @@ def main(argv: list[str] | None = None) -> int:
         if not exact_anchor_command:
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
+    elif is_decide_command:
+        if args.fixture or args.anchor_comment_url:
+            print(
+                "skill_runtime_exec: --fixture/--anchor-comment-url are not allowed for decide.run",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.loop_state_file or not args.review_result_verdict:
+            print(
+                "skill_runtime_exec: --loop-state-file and --review-result-verdict "
+                "are required for decide.run",
+                file=sys.stderr,
+            )
+            return 2
+        # #2086 P0 fix_delta (Blocker 3): decide.run "Mode B" -- authority
+        # sub-fields must be supplied all-or-none (fail-closed on any
+        # partial/mixed set), never a generic passthrough of individual
+        # optional registry fields. `--authority-expected` is included in
+        # this all-or-none set (not treated as independently optional) so a
+        # Mode B invocation is always unambiguous about whether a missing/
+        # malformed manifest should fail closed.
+        _decide_authority_fields = (
+            args.invocation_id,
+            args.git_head_sha,
+            args.authority_transport_path,
+        )
+        _decide_authority_present = any(_decide_authority_fields) or args.authority_expected
+        _decide_authority_complete = all(_decide_authority_fields) and args.authority_expected
+        is_decide_authority_mode = False
+        if _decide_authority_present:
+            if not _decide_authority_complete:
+                print(
+                    "skill_runtime_exec: decide.run Mode B requires "
+                    "--invocation-id, --git-head-sha, --authority-transport-path, "
+                    "and --authority-expected all together (all-or-none)",
+                    file=sys.stderr,
+                )
+                return 2
+            is_decide_authority_mode = True
+        max_iterations = args.max_iterations or "3"
+        command_tokens = [
+            "uv",
+            "run",
+            "python3",
+            SKILL_RUNTIME_EXEC_REL,
+            "--command-id",
+            args.command_id,
+            "--issue-number",
+            str(args.issue_number),
+            "--repo",
+            args.repo,
+            "--loop-state-file",
+            args.loop_state_file,
+            "--review-result-verdict",
+            args.review_result_verdict,
+            "--max-iterations",
+            max_iterations,
+        ]
+        if is_decide_authority_mode:
+            # These represent skill_runtime_exec.py's OWN new CLI flags on
+            # the OUTER invocation (matched by the exact parser below) --
+            # not a second --issue-number/--repo pair. The existing
+            # --issue-number/--repo already parsed above are the ones
+            # forwarded to decide_next_loop_action.py's own authority
+            # sub-fields via render_params below.
+            command_tokens += [
+                "--authority-transport-path",
+                args.authority_transport_path,
+                "--authority-expected",
+                "--invocation-id",
+                args.invocation_id,
+                "--git-head-sha",
+                args.git_head_sha,
+            ]
+        command_text = " ".join(command_tokens)
+        if is_decide_authority_mode:
+            exact_decide_command = is_exact_skill_runtime_decide_authority_executor_command(
+                command_text, project_root, project_root
+            )
+        else:
+            exact_decide_command = is_exact_skill_runtime_decide_executor_command(
+                command_text, project_root, project_root
+            )
+        if not exact_decide_command:
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    elif is_produce_command:
+        if (
+            args.fixture
+            or args.anchor_comment_url
+            or args.loop_state_file
+            or args.review_result_verdict
+            or args.max_iterations
+        ):
+            print(
+                "skill_runtime_exec: only --invocation-id/--git-head-sha/"
+                "--evidence-fixture-path are allowed for authority_transport.produce",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.invocation_id or not args.git_head_sha or not args.evidence_fixture_path:
+            print(
+                "skill_runtime_exec: --invocation-id, --git-head-sha, and "
+                "--evidence-fixture-path are required for authority_transport.produce",
+                file=sys.stderr,
+            )
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--invocation-id",
+                args.invocation_id,
+                "--git-head-sha",
+                args.git_head_sha,
+                "--produce-authority-transport",
+                args.evidence_fixture_path,
+            ]
+        )
+        if not is_exact_skill_runtime_authority_transport_produce_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    elif is_consume_command:
+        if (
+            args.fixture
+            or args.anchor_comment_url
+            or args.loop_state_file
+            or args.review_result_verdict
+            or args.max_iterations
+        ):
+            print(
+                "skill_runtime_exec: only --invocation-id/--git-head-sha/"
+                "--router-receipt-path/--contract-patch-plan-file/--anchor-context-file "
+                "are allowed for authority_transport.consume",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.invocation_id or not args.git_head_sha or not args.router_receipt_path:
+            print(
+                "skill_runtime_exec: --invocation-id, --git-head-sha, and "
+                "--router-receipt-path are required for authority_transport.consume",
+                file=sys.stderr,
+            )
+            return 2
+        if bool(args.contract_patch_plan_file) != bool(args.anchor_context_file):
+            print(
+                "skill_runtime_exec: --contract-patch-plan-file and "
+                "--anchor-context-file must be supplied together or not at all "
+                "for authority_transport.consume",
+                file=sys.stderr,
+            )
+            return 2
+        consume_tail = [
+            "uv",
+            "run",
+            "python3",
+            SKILL_RUNTIME_EXEC_REL,
+            "--command-id",
+            args.command_id,
+            "--issue-number",
+            str(args.issue_number),
+            "--repo",
+            args.repo,
+            "--invocation-id",
+            args.invocation_id,
+            "--git-head-sha",
+            args.git_head_sha,
+            "--consume-authority-transport",
+            args.router_receipt_path,
+        ]
+        if args.contract_patch_plan_file and args.anchor_context_file:
+            consume_tail += [
+                "--contract-patch-plan-file",
+                args.contract_patch_plan_file,
+                "--anchor-context-file",
+                args.anchor_context_file,
+            ]
+        command_text = " ".join(consume_tail)
+        if not is_exact_skill_runtime_authority_transport_consume_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
     else:
         if args.fixture:
             print("skill_runtime_exec: --fixture is only allowed for preflight.run.fixture", file=sys.stderr)
@@ -1571,6 +2275,13 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "skill_runtime_exec: --anchor-comment-url is only allowed for "
                 "an anchor-bound preflight profile",
+                file=sys.stderr,
+            )
+            return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print(
+                "skill_runtime_exec: --loop-state-file/--review-result-verdict/"
+                "--max-iterations are only allowed for decide.run",
                 file=sys.stderr,
             )
             return 2
@@ -1617,9 +2328,15 @@ def main(argv: list[str] | None = None) -> int:
     if not registry_path.is_file():
         raise RuntimeError("registry_missing")
 
+    # #2086 AC10: decide.run dispatches decide_next_loop_action.py, not
+    # run_refinement_preflight.py -- the pre-existing integrity/symlink
+    # check below must validate the script the command_id actually reaches,
+    # otherwise decide.run could never pass this check even though it never
+    # touches run_refinement_preflight.py.
     script_path = (
         Path(project_root) / ".claude" / "skills" / "issue-refinement-loop"
-        / "scripts" / "run_refinement_preflight.py"
+        / "scripts"
+        / ("decide_next_loop_action.py" if is_decide_command else "run_refinement_preflight.py")
     )
     if script_path.is_symlink() or not script_path.is_file():
         raise RuntimeError("preflight_script_invalid")
@@ -1634,28 +2351,89 @@ def main(argv: list[str] | None = None) -> int:
     render_command = getattr(module, "render_command", None)
     if not callable(render_command):
         raise RuntimeError("render_command_missing")
-    render_params: dict[str, object] = {"issue_number": args.issue_number, "repo": args.repo}
-    if is_fixture_command:
-        render_params["fixture"] = args.fixture
-    if is_anchor_command or is_contract_update_command:
-        render_params["anchor_comment_url"] = args.anchor_comment_url
+    # #2086 AC10 P0: `decide.run`'s registry entry declares only
+    # loop_state_file/verdict/max_iterations placeholders (it has no
+    # `{issue_number}`/`{repo}` tokens in its argv template -- unlike every
+    # other command_id here). render_command() fail-closed-rejects any
+    # extra params not in the entry's declared `placeholders`, so
+    # unconditionally seeding `issue_number`/`repo` into render_params
+    # made every real decide.run dispatch raise `ValueError` before ever
+    # reaching a subprocess. This was masked by the previous test's stub
+    # `render_command()`, which silently ignored undeclared params instead
+    # of validating them (see test_decide_run_reaches_real_subprocess).
+    if is_decide_command:
+        render_params: dict[str, object] = {
+            "loop_state_file": args.loop_state_file,
+            "verdict": args.review_result_verdict,
+            "max_iterations": args.max_iterations or "3",
+        }
+        # #2086 P0 fix_delta (Blocker 3): Mode B -- forward the authority
+        # sub-fields to decide_next_loop_action.py's own
+        # --issue-number/--repo/--authority-transport-path/
+        # --authority-expected/--invocation-id/--git-head-sha flags
+        # (command_registry.py decide.run entry, PR #2068). Only populated
+        # when the pre-dispatch all-or-none check above accepted a
+        # complete Mode B field set.
+        if is_decide_authority_mode:
+            render_params["issue_number"] = args.issue_number
+            render_params["repo"] = args.repo
+            render_params["authority_transport_manifest_path"] = args.authority_transport_path
+            render_params["authority_expected"] = True
+            render_params["invocation_id"] = args.invocation_id
+            render_params["git_head_sha"] = args.git_head_sha
+    elif is_produce_command:
+        # #2086 AC9/AC10: producer role -- issue_number/repo are NOT seeded
+        # here (unlike the generic `else` branch below) because
+        # `authority_transport.produce`'s own render_params below already
+        # supplies them alongside its own required placeholders.
+        render_params = {
+            "issue_number": args.issue_number,
+            "repo": args.repo,
+            "invocation_id": args.invocation_id,
+            "git_head_sha": args.git_head_sha,
+            "evidence_fixture_path": args.evidence_fixture_path,
+        }
+    elif is_consume_command:
+        render_params = {
+            "issue_number": args.issue_number,
+            "repo": args.repo,
+            "invocation_id": args.invocation_id,
+            "git_head_sha": args.git_head_sha,
+            "router_receipt_path": args.router_receipt_path,
+        }
+        if args.contract_patch_plan_file and args.anchor_context_file:
+            render_params["contract_patch_plan_file"] = args.contract_patch_plan_file
+            render_params["anchor_context_file"] = args.anchor_context_file
+    else:
+        render_params = {"issue_number": args.issue_number, "repo": args.repo}
+        if is_fixture_command:
+            render_params["fixture"] = args.fixture
+        if is_anchor_command or is_contract_update_command:
+            render_params["anchor_comment_url"] = args.anchor_comment_url
+            if args.investigation_evidence_transport_path:
+                render_params["investigation_evidence_transport_path"] = (
+                    args.investigation_evidence_transport_path
+                )
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
 
     timeout_seconds = entry.get("timeout_seconds")
-    try:
-        result = subprocess.run(
-            child_argv,
-            cwd=project_root,
-            env=_sanitize_env(project_root),
-            capture_output=True,
-            text=True,
-            shell=False,
-            check=False,
-            timeout=timeout_seconds,
+    supervision = _run_child_with_supervision(
+        child_argv,
+        cwd=project_root,
+        env=_sanitize_env(project_root),
+        timeout_seconds=timeout_seconds,
+    )
+    if supervision.timed_out:
+        return _emit_timeout_failure(
+            args.issue_number,
+            timeout_seconds,
+            cleanup_scope=supervision.cleanup_scope,
+            cleanup_status=supervision.cleanup_status,
+            termination=supervision.termination,
+            leader_reaped=supervision.leader_reaped,
         )
-    except subprocess.TimeoutExpired:
-        return _emit_timeout_failure(args.issue_number, timeout_seconds)
+    result = supervision
 
     # Issue #1502 AC3: wait a bounded window for the writer's own `.lock` /
     # `.tmp` transient protocol entries to vanish before evaluating the

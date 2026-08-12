@@ -94,7 +94,7 @@ _REPO = "squne121/loop-protocol"
 _GH_TIMEOUT = 30
 
 _FINGERPRINT_LINE_RE = re.compile(
-    r"expected_contract_fingerprint:\s*(\{.*\})\s*$", re.MULTILINE
+    r"expected_contract_fingerprint:\s*(.+?)\s*$", re.MULTILINE
 )
 
 _EXPECTED_FINGERPRINT_KEYS = {
@@ -212,7 +212,10 @@ def _extract_fingerprint_from_comment_body(body: str) -> Optional[dict]:
     if not match:
         return None
     try:
-        return json.loads(match.group(1))
+        raw = match.group(1)
+        if raw.startswith("'") and raw.endswith("'"):
+            raw = raw[1:-1]
+        return json.loads(raw)
     except json.JSONDecodeError:
         return None
 

@@ -34,7 +34,7 @@ gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title,body,labels,comments
 - `## Stop Conditions`
 - 最新コメントに `## Contract Snapshot` があり、それと本文が整合している
 
-consumer ready contract（title `実装:` または `implement:`、routing label `phase/implementation`、dependency all closed）が揃っているかを確認する。legacy state label の有無や `state/needs-human` の付与だけを理由に停止してはならない。最新 `CONTRACT_REVIEW_RESULT_V1 status` は任意の telemetry として記録するのみで、`go` 以外（missing/stale/invalid を含む）でも実装を停止しない（#1860 Owner Decision）。live Issue 本文・Allowed Paths・実テストが正本である。
+consumer ready contract（title `実装:` または `implement:`、dependency all closed）が揃っているかを確認する。`phase/implementation` label は routing/classification 用の非authoritative な参照であり（presentation-only metadata、#2084）、readiness gate の必須条件ではない。legacy state label（`state/needs-human` 含む）の有無だけを理由に停止してはならない。最新 `CONTRACT_REVIEW_RESULT_V1 status` は任意の telemetry として記録するのみで、`go` 以外（missing/stale/invalid を含む）でも実装を停止しない（#1860 Owner Decision）。live Issue 本文・Allowed Paths・実テストが正本である。
 
 peer OPEN Issue の overlap preflight（旧 Step 2 の候補収集レイヤー
 production 呼び出し）は #1679 により production path から完全に撤去された

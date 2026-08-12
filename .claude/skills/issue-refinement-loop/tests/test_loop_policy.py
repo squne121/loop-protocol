@@ -96,10 +96,14 @@ def test_loop_escalation_requires_blocker_summary():
 
 
 def test_hard_stop_state_needs_human():
-    """AC6: state/needs-human は hard stop として従来通り停止する"""
+    """AC6 / #2084: state/needs-human label 単独では hard stop としない。
+    停止には別 authority（OWNER 明示指示・human_judgment_required）が必要である
+    旨が SKILL.md に明記されていることを検証する。"""
     text = SKILL_MD.read_text()
     assert "state/needs-human" in text, \
-        "state/needs-human hard stop must still be present in SKILL.md"
+        "state/needs-human reference must still be present in SKILL.md"
+    assert "human_judgment_required" in text or "OWNER" in text, \
+        "SKILL.md must document that a separate authority is required to hard-stop"
 
 
 def test_hard_stop_scope_change():
@@ -168,9 +172,13 @@ def test_human_escalation_termination_result_schema_documented():
 
 # B5: AC6 hard stop テスト
 def test_hard_stop_state_done():
-    """AC6: state/done は hard stop として SKILL.md に明記されていること"""
+    """AC6 / #2084: state/done label 単独では hard stop としない。
+    GitHub native Issue closed state を代替として参照する旨が SKILL.md に
+    明記されていることを検証する。"""
     text = SKILL_MD.read_text()
     assert "state/done" in text
+    assert "closed" in text.lower(), \
+        "SKILL.md must reference native Issue closed state as the state/done substitute"
 
 
 def test_hard_stop_fail_closed_contract_malformation():
