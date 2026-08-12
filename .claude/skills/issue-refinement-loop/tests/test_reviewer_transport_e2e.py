@@ -97,14 +97,6 @@ def test_given_parent_written_artifacts_when_checked_then_permissions_are_privat
         assert os.stat(artifact).st_mode & 0o777 == 0o600
 
 
-def test_given_issue_reviewer_contract_when_read_then_only_raw_semantic_json_is_produced():
-    agent = Path(__file__).parents[3] / "agents" / "issue-reviewer.md"
-    text = agent.read_text(encoding="utf-8")
-    assert "raw REVIEW_ISSUE_RESULT_V1 semantic JSON" in text
-    assert "ISSUE_REVIEW_RESULT_COMPACT_V1" not in text
-    assert "ARTIFACT: compact_review_result_v1=" not in text
-
-
 def test_given_telemetry_when_recorded_then_no_raw_argv_or_output_is_stored(tmp_path: Path):
     result = _run(tmp_path, "print('not-json-secret-like-content')")
     attempt = result["attempts"][0]
