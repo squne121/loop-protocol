@@ -1526,3 +1526,241 @@ def test_execute_controlled_change_denies_when_origin_has_drifted_past_expected_
     )
     assert result.status == "denied"
     assert result.reason_code == "expected_old_cas_mismatch"
+
+
+# ─── Issue #2102 fix_delta iteration 4: transaction-safety regressions
+# (Blockers 1-3: _current_ref timeout, merge-continue post-commit CAS
+# recheck, post-commit rollback result verification) ───────────────────────
+
+
+def _init_repo_with_origin(tmp_path: Path):
+    """A real bare `origin` + a real clone -- never a hand-injected SHA."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_sha = _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "topic"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "topic"], cwd=repo, check=True)
+    return repo, bare, base_sha
+
+
+def _make_flaky_run(monkeypatch, *, timeout_on: str = "fetch", timeout_after: int = 1):
+    """Patch the global `subprocess.run` so the Nth call whose argv contains
+    `timeout_on` raises a real `subprocess.TimeoutExpired`; every other call
+    is delegated unchanged to the real `subprocess.run`. Returns the call
+    counter dict for assertions."""
+    real_run = subprocess.run
+    counters = {"n": 0}
+
+    def _flaky(args, *a, **kw):
+        if isinstance(args, list) and timeout_on in args:
+            counters["n"] += 1
+            if counters["n"] >= timeout_after:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=20)
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr("subprocess.run", _flaky)
+    return counters
+
+
+def test_current_ref_fetch_timeout_fails_closed(tmp_path: Path, monkeypatch):
+    """Blocker 1: a `subprocess.TimeoutExpired` from the bounded `git
+    fetch` inside `_current_ref()` must be caught and fail closed to
+    `None`, never propagate and crash the caller."""
+    import controlled_git_change_exec as module
+
+    repo, _bare, _base_sha = _init_repo_with_origin(tmp_path)
+    _make_flaky_run(monkeypatch, timeout_on="fetch", timeout_after=1)
+
+    assert module._current_ref(str(repo), "main") is None
+
+
+def test_expected_old_timeout_before_commit_denies_with_no_commit_produced(tmp_path: Path, monkeypatch):
+    """Regression: timeout before commit -> no commit produced, deterministic
+    fail-closed denial (the very first `_current_ref` call, at the pre-stage
+    HEAD/base binding check, times out)."""
+    repo, _bare, _base_sha = _init_repo_with_origin(tmp_path)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "new_file.py").write_text("x = 1\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    head_before = _head(repo)
+
+    _make_flaky_run(monkeypatch, timeout_on="fetch", timeout_after=1)
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/new_file.py"],
+        commit_message="feat: new file",
+        expected_head=head_before,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "expected_old_cas_mismatch"
+    assert _head(repo) == head_before
+    assert _staged_name_only(repo) == ""
+    assert "new file" not in _log(repo)
+
+
+def test_post_commit_expected_old_readback_timeout_rolls_back(tmp_path: Path, monkeypatch):
+    """Regression: timeout during the post-commit expected-old readback ->
+    the just-made commit is rolled back via `git reset --soft HEAD~1` and
+    HEAD returns to the pre-commit SHA. The pre-stage and pre-commit
+    `_current_ref` calls (1st and 2nd `fetch`) must still succeed so the
+    commit actually happens; only the 3rd (post-commit) call times out."""
+    repo, _bare, _base_sha = _init_repo_with_origin(tmp_path)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "new_file.py").write_text("x = 1\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    head_before = _head(repo)
+
+    _make_flaky_run(monkeypatch, timeout_on="fetch", timeout_after=3)
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/new_file.py"],
+        commit_message="feat: new file",
+        expected_head=head_before,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "postcondition_expected_old_readback_mismatch_rolled_back"
+    assert _head(repo) == head_before
+    assert _staged_name_only(repo) == ""
+    assert "new file" not in _log(repo)
+
+
+def test_rollback_itself_failing_reports_manual_intervention_required(tmp_path: Path, monkeypatch):
+    """Regression: if `git reset --soft HEAD~1` itself fails/times out, the
+    executor MUST NOT report a false 'rolled back' reason_code -- it must
+    report `rollback_failed_manual_intervention_required` instead."""
+    repo, _bare, _base_sha = _init_repo_with_origin(tmp_path)
+    guards = repo / "scripts" / "agent-guards"
+    guards.mkdir(parents=True)
+    (guards / "new_file.py").write_text("x = 1\n")
+    snapshot = _build_snapshot(repo, allowed_paths=["scripts/agent-guards/**"])
+    head_before = _head(repo)
+
+    real_run = subprocess.run
+    fetch_counter = {"n": 0}
+
+    def _flaky(args, *a, **kw):
+        if isinstance(args, list):
+            if "fetch" in args:
+                fetch_counter["n"] += 1
+                if fetch_counter["n"] >= 3:
+                    raise subprocess.TimeoutExpired(cmd=args, timeout=20)
+            if "reset" in args and "--soft" in args:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=30)
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr("subprocess.run", _flaky)
+
+    result = execute_controlled_change(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=["scripts/agent-guards/new_file.py"],
+        commit_message="feat: new file",
+        expected_head=head_before,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "rollback_failed_manual_intervention_required"
+
+
+def test_merge_continue_remote_drift_after_commit_rolls_back(tmp_path: Path, monkeypatch):
+    """Blocker 2 regression: a concurrent agent pushes a real, unrelated
+    commit to the shared `origin/main` in the window right as our merge
+    commit lands locally. The new post-commit CAS recheck in
+    `execute_controlled_merge_continue()` must detect this real drift and
+    roll back, leaving HEAD at the pre-commit (topic) SHA."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    topic_head, main_head = _start_root_skill_file_directory_merge(repo)
+    # The repo is now mid-merge on `topic` (unresolved conflict) -- do NOT
+    # `git checkout` away from it. Pushing an explicit `<sha>:refs/heads/<ref>`
+    # refspec transfers objects and updates the remote ref without touching
+    # the current branch/working tree/index.
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"{main_head}:refs/heads/main"], cwd=repo, check=True)
+
+    concurrent_clone = tmp_path / "concurrent_clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(concurrent_clone)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=concurrent_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=concurrent_clone, check=True)
+    subprocess.run(["git", "checkout", "-q", "-B", "main", "origin/main"], cwd=concurrent_clone, check=True)
+    (concurrent_clone / "CONCURRENT.md").write_text("concurrent change\n")
+    subprocess.run(["git", "add", "CONCURRENT.md"], cwd=concurrent_clone, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "concurrent main advance"], cwd=concurrent_clone, check=True)
+
+    snapshot = _build_snapshot(repo, allowed_paths=[".agents/skills"], base_sha=main_head)
+
+    real_run = subprocess.run
+
+    def _flaky(args, *a, **kw):
+        if isinstance(args, list) and args[:3] == ["git", "commit", "-m"]:
+            # Simulate: right as our merge commit is about to land locally,
+            # a concurrent agent's real commit lands on the shared remote.
+            real_run(["git", "push", "-q", "origin", "main"], cwd=str(concurrent_clone), check=True)
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr("subprocess.run", _flaky)
+
+    result = execute_controlled_merge_continue(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=[".agents/skills"],
+        commit_message="merge: resolve root skill surface conflict",
+        expected_head=topic_head,
+        expected_old=main_head,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "postcondition_expected_old_readback_mismatch_rolled_back"
+    assert _head(repo) == topic_head
+
+
+def test_merge_continue_timeout_after_commit_leaves_no_unvalidated_commit(tmp_path: Path, monkeypatch):
+    """Blocker 2 regression: a bounded `git fetch` timeout hitting exactly
+    the NEW post-commit CAS recheck in `execute_controlled_merge_continue()`
+    must roll back the just-made merge commit -- no unvalidated commit is
+    ever left on HEAD."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    topic_head, main_head = _start_root_skill_file_directory_merge(repo)
+    # As above: do not checkout away from the in-progress merge on `topic`.
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"{main_head}:refs/heads/main"], cwd=repo, check=True)
+
+    snapshot = _build_snapshot(repo, allowed_paths=[".agents/skills"], base_sha=main_head)
+
+    # Two `_current_ref` / fetch calls happen before the commit (the
+    # pre-stage and pre-commit CAS re-checks); only the 3rd (the new
+    # post-commit recheck) must time out.
+    _make_flaky_run(monkeypatch, timeout_on="fetch", timeout_after=3)
+
+    result = execute_controlled_merge_continue(
+        cwd=str(repo),
+        snapshot=snapshot,
+        requested_pathspecs=[".agents/skills"],
+        commit_message="merge: resolve root skill surface conflict",
+        expected_head=topic_head,
+        expected_old=main_head,
+    )
+
+    assert result.status == "denied"
+    assert result.reason_code == "postcondition_expected_old_readback_mismatch_rolled_back"
+    assert _head(repo) == topic_head

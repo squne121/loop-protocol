@@ -483,18 +483,31 @@ def _current_ref(cwd: str, ref: str) -> Optional[str]:
     remote is configured (isolated test fixtures using only local refs), the
     previous local-fallback behavior is retained unchanged.
     """
-    remote_list = _run_git(["remote"], cwd)
-    has_origin = remote_list.returncode == 0 and "origin" in remote_list.stdout.split()
-    if has_origin:
-        fetched = _run_git(["fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{ref}"], cwd, timeout=20)
-        if fetched.returncode != 0:
-            return None
-    candidates = (f"refs/remotes/origin/{ref}", ref)
-    for candidate in candidates:
-        result = _run_git(["rev-parse", "--verify", f"{candidate}^{{commit}}"], cwd)
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-    return None
+    # Issue #2102 fix_delta (iteration 4, Blocker 1): the `git fetch` call
+    # below is bounded by `timeout=20`, which means `subprocess.run` can
+    # raise `subprocess.TimeoutExpired` -- previously uncaught here, so a
+    # slow/hung network fetch would crash the whole controlled-executor
+    # invocation instead of failing closed like every other CAS check in
+    # this module. `OSError` (e.g. the `git` binary itself becomes
+    # unavailable mid-call) is guarded for the same reason. Both fail
+    # closed to the existing `None` sentinel, which can never equal a real
+    # `expected_old` SHA, so callers deny exactly as they already do for
+    # any other `_current_ref` failure mode.
+    try:
+        remote_list = _run_git(["remote"], cwd)
+        has_origin = remote_list.returncode == 0 and "origin" in remote_list.stdout.split()
+        if has_origin:
+            fetched = _run_git(["fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{ref}"], cwd, timeout=20)
+            if fetched.returncode != 0:
+                return None
+        candidates = (f"refs/remotes/origin/{ref}", ref)
+        for candidate in candidates:
+            result = _run_git(["rev-parse", "--verify", f"{candidate}^{{commit}}"], cwd)
+            if result.returncode == 0:
+                return result.stdout.strip() or None
+        return None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
 
 
 def _git_toplevel(cwd: str) -> Optional[str]:
@@ -724,6 +737,43 @@ def _contains_bounded_root_skill_directory_replacement(
         delta_records=root_and_children,
         allowed_paths=allowed_paths,
     )
+
+
+_ROLLBACK_SUCCEEDED = "rolled_back"
+_ROLLBACK_FAILED = "rollback_failed_manual_intervention_required"
+
+
+def _rollback_last_commit(cwd: str) -> str:
+    """Attempt `git reset --soft HEAD~1` and report whether it actually
+    succeeded (Issue #2102 fix_delta iteration 4, Blocker 3).
+
+    Every post-commit safety check in this module rolls back the just-made
+    commit the same way; previously each call site fired the
+    `subprocess.run(...)` and unconditionally treated it as having
+    succeeded (never inspecting `returncode`, never catching
+    `subprocess.TimeoutExpired`). That meant a failed or hung rollback
+    could still be reported to the caller as
+    `post_commit_audit_violation_rolled_back` -- a FALSE denial reason
+    that claims the repository was returned to a safe pre-commit state
+    when the unaudited/unvalidated commit may still be sitting on HEAD.
+    This helper is the single place that performs the reset and
+    classifies the outcome; callers MUST branch on the returned status
+    and MUST NOT report a "rolled back" reason_code unless this returns
+    `_ROLLBACK_SUCCEEDED`.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "reset", "--soft", "HEAD~1"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_sanitized_git_env(),
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return _ROLLBACK_FAILED
+    return _ROLLBACK_SUCCEEDED if result.returncode == 0 else _ROLLBACK_FAILED
 
 
 def _unstage(cwd: str, pathspecs: List[str]) -> None:
@@ -1019,28 +1069,16 @@ def execute_controlled_change(
                         break
 
     if post_commit_violation:
-        subprocess.run(
-            ["git", "reset", "--soft", "HEAD~1"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=_sanitized_git_env(),
-            check=False,
-        )
+        rollback_status = _rollback_last_commit(cwd)
         _unstage(cwd, requested_pathspecs)
+        if rollback_status != _ROLLBACK_SUCCEEDED:
+            return _denied(_ROLLBACK_FAILED)
         return _denied("post_commit_audit_violation_rolled_back")
     if _current_ref(cwd, snapshot.base_ref) != expected_old:
-        subprocess.run(
-            ["git", "reset", "--soft", "HEAD~1"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=_sanitized_git_env(),
-            check=False,
-        )
+        rollback_status = _rollback_last_commit(cwd)
         _unstage(cwd, requested_pathspecs)
+        if rollback_status != _ROLLBACK_SUCCEEDED:
+            return _denied(_ROLLBACK_FAILED)
         return _denied("postcondition_expected_old_readback_mismatch_rolled_back")
 
     return ControlledChangeResult(
@@ -1218,6 +1256,21 @@ def execute_controlled_merge_continue(
         return _denied("commit_sha_unavailable")
     if _merge_head_is_present(cwd) or _has_unmerged_index(cwd):
         return _denied("merge_continue_postcondition_failed")
+
+    # Issue #2102 fix_delta (iteration 4, Blocker 2): `execute_controlled_change`
+    # re-checks `snapshot.base_ref` immediately after commit and rolls back
+    # on any drift (a remote push landing in the stage-to-commit window).
+    # This merge-continue lane previously had no equivalent check -- a
+    # concurrent remote base-ref change during the merge-commit call would
+    # go undetected and the merge commit would be reported as authorized
+    # against a base that had already moved. Apply the same post-commit CAS
+    # recheck + rollback pattern here.
+    if _current_ref(cwd, snapshot.base_ref) != expected_old:
+        rollback_status = _rollback_last_commit(cwd)
+        _unstage(cwd, staging_pathspecs)
+        if rollback_status != _ROLLBACK_SUCCEEDED:
+            return _denied(_ROLLBACK_FAILED)
+        return _denied("postcondition_expected_old_readback_mismatch_rolled_back")
 
     range_ok, range_raw = _diff_range_raw(cwd, snapshot.base_sha, commit_sha)
     if not range_ok:
