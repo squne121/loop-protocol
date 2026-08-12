@@ -14,7 +14,7 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
 - `issue_number`（必須）
 - `invoked_as_loop`（任意、bool）: `issue-refinement-loop` から呼ばれた場合 `true`、人間直起動なら `false`
 
-## Producer I/O ownership（Issue #2049）
+## Producer I/O ownership（producer I/O 所有権の分離、Issue #2049）
 
 `issue-refinement-loop` の `issue-reviewer` custom agent（`.codex/agents/issue-reviewer.toml`, `default_permissions: loop-protocol-readonly`）経由で本 skill が起動される場合、以下の手順（body fetch・temp file・checker 実行・artifact 保存）は read-only な `issue-reviewer` agent 自身ではなく、`.claude/skills/issue-refinement-loop/scripts/run_root_review_pipeline.py`（root-owned pipeline）が orchestrator（main thread）側で実行する。`issue-reviewer` agent は root-owned pipeline が既に fetch・pin・checker 実行を終えた merged review result を読み、advisory な `ISSUE_REVIEW_RESULT_COMPACT_V1` を返すだけである。人間が本 skill を直接起動する場合（`invoked_as_loop: false`）は、以下の手順を main thread がそのまま実行する（read-only 制約は適用されない）。
 
