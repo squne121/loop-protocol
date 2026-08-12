@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -136,9 +138,6 @@ def test_given_stale_scope_snapshot_when_refinement_plans_then_it_fails_closed()
 # the prior iteration's contract comment is now actually reachable.
 # ---------------------------------------------------------------------------
 
-import json
-import subprocess
-
 PREFLIGHT_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run_refinement_preflight.py"
 PREFLIGHT_SPEC = importlib.util.spec_from_file_location("run_refinement_preflight_main_drift", PREFLIGHT_SCRIPT)
 assert PREFLIGHT_SPEC and PREFLIGHT_SPEC.loader
@@ -207,9 +206,9 @@ def test_given_real_conflicting_git_state_when_producer_reads_live_then_semantic
     conflicting edits to the SAME file -- the merge-tree probe must report
     `semantic_ambiguity=True` from real conflict detection, not a flag."""
     repo = _init_real_repo_with_origin(tmp_path)
-    evidence_sha = subprocess.run(
+    subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
-    ).stdout.strip()
+    )
 
     _git(["checkout", "-q", "-b", "conflicting-branch"], repo)
     (repo / "docs" / "dev" / "workflow.md").write_text("branch edit\n")
