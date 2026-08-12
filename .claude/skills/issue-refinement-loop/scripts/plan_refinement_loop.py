@@ -271,6 +271,14 @@ WEB_RESEARCH_REASON_CLI_API_BEHAVIOR = "current_cli_api_auth_or_migration_behavi
 WEB_RESEARCH_REASON_NO_CLAIM = "no_critical_external_claim"
 WEB_RESEARCH_REASON_UNKNOWN_SCHEMA = "unknown_input_schema"
 
+# External claim role is intentionally a small decision-dependency marker,
+# not a second evidence ledger.  The planner has only Issue text at this
+# point, so it defaults to fail-closed ``dispositive``.  A later consumer may
+# use ``non_dispositive`` only when the codebase investigation has established
+# that repository evidence independently determines the requested decision.
+EXTERNAL_CLAIM_ROLE_DISPOSITIVE = "dispositive"
+EXTERNAL_CLAIM_ROLE_NON_DISPOSITIVE = "non_dispositive"
+
 SCOPE_SIGNAL_REASON_NEW_IN_SCOPE = "new_in_scope_area"
 SCOPE_SIGNAL_REASON_NEW_PATH_LAYER = "new_allowed_path_layer"
 SCOPE_SIGNAL_REASON_NEW_UNVERIFIABLE_AC = "new_unverifiable_ac"
@@ -1151,6 +1159,7 @@ def _extract_critical_external_claims(
                             "claim": claim,
                             "affects": _infer_affects_section(section_name),
                             "source_hint": None,
+                            "role": EXTERNAL_CLAIM_ROLE_DISPOSITIVE,
                         }
                     )
 
@@ -1164,12 +1173,19 @@ def _extract_critical_external_claims(
                 for keyword in HUMAN_WEB_VERIFICATION_KEYWORDS:
                     if keyword in comment_body.lower():
                         # Found human request for web verification in comments
-                        claim_text = comment_body[:100].strip() if comment_body else "Human requested web verification"
+                        claim_text = (
+                            comment_body[:100].strip()
+                            if comment_body
+                            else "Human requested web verification"
+                        )
                         claims.append(
                             {
                                 "claim": claim_text,
                                 "affects": "VC",
-                                "source_hint": f"comment_{comment_id}" if comment_id else "comment",
+                                "source_hint": (
+                                    f"comment_{comment_id}" if comment_id else "comment"
+                                ),
+                                "role": EXTERNAL_CLAIM_ROLE_DISPOSITIVE,
                             }
                         )
                         break  # Only add once per comment

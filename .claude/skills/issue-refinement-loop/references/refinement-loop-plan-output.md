@@ -110,11 +110,15 @@
 
 - `required`: 外部仕様の検証が必要なら `true`
 - `reason_code`: なぜ外部調査が必要かを表す理由コード
-- `critical_external_claims`: 外部システムに関する主張を抽出した一覧
+- `critical_external_claims`: 外部システムに関する主張を抽出した一覧。各 object は
+  `{claim, affects, source_hint, role}` を持ち、`role` は `dispositive` または
+  `non_dispositive`。planner は fail-closed の既定値 `dispositive` を出力し、Step 1
+  の repository investigation が requested disposition を独立に決定した場合のみ、
+  consumer が `non_dispositive` として join できる。
 - `evidence_spans`: 根拠位置
 - `confidence`: `deterministic` または `unknown`
 
-`SKILL.md` ではこの値を `LOOP_STATE.web_research_policy` に反映し、`required == true` のときに Step 1b (`web-researcher`) を起動します。
+`SKILL.md` ではこの値を `LOOP_STATE.web_research_policy` に反映し、`required == true` のときに Step 1b (`web-researcher`) を起動します。Step 1 の repository decision と Step 1b result の合流は `web_research.route` consumer が行い、transport failure を semantic verdict と混同しません。
 
 ### `scope_signal_guard`
 

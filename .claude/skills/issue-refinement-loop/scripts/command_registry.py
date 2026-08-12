@@ -371,6 +371,23 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "mutation": False,
         "placeholders": {},
     },
+    "web_research.route": {
+        "id": "web_research.route",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/route_web_research_result.py",
+            "--input-file", "{routing_input_file}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "none",
+        "stdout_contract": "web_research_routing_result/v1",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "placeholders": {
+            "routing_input_file": {"type": "repo_relative_file", "required": True},
+        },
+    },
     # #2086 AC10 (iteration 2, post-#2053/#2068 merge): `decide.run`'s argv
     # was extended by #2053 (now merged to main) to optionally carry the
     # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 router role (issue_number/repo/

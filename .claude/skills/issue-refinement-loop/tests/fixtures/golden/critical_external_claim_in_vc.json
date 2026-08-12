@@ -29,26 +29,31 @@
         {
           "affects": "VC",
           "claim": "# Verify against official API documentation: https://api.example.com/docs",
+          "role": "dispositive",
           "source_hint": null
         },
         {
           "affects": "InScope",
           "claim": "- Analysis of current official API specification",
+          "role": "dispositive",
           "source_hint": null
         },
         {
           "affects": "InScope",
           "claim": "- Validation of auth migration behavior",
+          "role": "dispositive",
           "source_hint": null
         },
         {
           "affects": "VC",
           "claim": "Additional requirement: Verify current CLI authentication flow matches the official spec documentation.",
+          "role": "dispositive",
           "source_hint": null
         },
         {
           "affects": "Outcome",
           "claim": "Need to verify official CLI API behavior and authentication flow against published documentation.",
+          "role": "dispositive",
           "source_hint": null
         }
       ],
