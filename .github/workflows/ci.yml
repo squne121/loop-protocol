@@ -2128,9 +2128,21 @@ jobs:
             --flat-output changed_paths.txt
           cat changed_paths.txt
       - name: Write PR body to file (untrusted input -- never shell-expanded)
+        # PR #2137 human review issuecomment-5273090534 P1 fix: the prior
+        # `github.event.pull_request.body` reads a snapshot FROZEN at
+        # webhook-dispatch time for whatever event triggered this run (e.g.
+        # a `push`/`synchronize`), which can genuinely differ from the PR
+        # body `visual-impact-trusted-consumer.yml`'s independently-derived
+        # trusted step later re-fetches live via `gh api pulls/{num}`
+        # (confirmed via `pr_body_digest_mismatch` even with zero
+        # intervening body edits). Fetch the SAME live REST endpoint here,
+        # at actual producer-job execution time, so both sides bind to a
+        # freshly-read body instead of two different snapshots.
         env:
-          PR_BODY: ${{ github.event.pull_request.body || '' }}
-        run: printf '%s' "$PR_BODY" > pr_body.md
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""' > pr_body.md
       - name: Write trusted base-branch CODEOWNERS
         env:
           BASE_SHA: ${{ steps.shas.outputs.base_sha }}
