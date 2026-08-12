@@ -31,6 +31,137 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+_IMPL_MAIN_DRIFT_SCRIPTS = (
+    Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts"
+)
+if str(_IMPL_MAIN_DRIFT_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_IMPL_MAIN_DRIFT_SCRIPTS))
+try:
+    from route_loop_verdict_v2 import classify_main_drift
+except ImportError:  # pragma: no cover
+    classify_main_drift = None
+
+
+def classify_refinement_evidence_epoch(context: dict[str, Any]) -> dict[str, Any]:
+    """Classify evidence only; refinement retains Issue/snapshot mutation."""
+    if classify_main_drift is None:
+        return {"route": "hard_stop", "reason_code": "main_drift_policy_import_failed"}
+    try:
+        result = classify_main_drift(
+            current_base_sha=context["current_base_sha"],
+            evidence_base_sha=context["evidence_base_sha"],
+            allowed_paths_snapshot_base_sha=context[
+                "allowed_paths_snapshot_base_sha"
+            ],
+            allowed_paths=context["allowed_paths"],
+            latest_main_net_diff=context.get("latest_main_net_diff", ()),
+            expected_head_sha=context["expected_head_sha"],
+            observed_head_sha=context["observed_head_sha"],
+            expected_old_sha=context["expected_old_sha"],
+            observed_old_sha=context["observed_old_sha"],
+            semantic_ambiguity=bool(context.get("semantic_ambiguity", False)),
+            owner="refinement",
+        )
+    except (KeyError, TypeError):
+        return {"route": "hard_stop", "reason_code": "main_drift_context_invalid"}
+    return {
+        "route": result.route,
+        "reason_code": result.reason_code,
+        "evidence_epoch": dict(result.evidence_epoch or {}),
+        "reverify": dict(result.reverify),
+        "reusable_evidence": dict(result.reusable_evidence),
+        "mutation_owner": "refinement",
+    }
+
+
+# ---------------------------------------------------------------------------
+# known_context["main_drift"] production contract (Issue #2102 fix_delta,
+# P0-C: the previous revision left this key's producer undocumented, making
+# classify_refinement_evidence_epoch() / _refinement_main_drift_decision()
+# unreachable in production).
+#
+# This planner is read-only and performs no git/GitHub I/O itself (see the
+# module docstring). known_context.main_drift is therefore never
+# self-populated -- it MUST be constructed by the orchestrator step that
+# invokes this script (the issue-refinement-loop control-plane step that
+# runs BEFORE issuing REFINEMENT_LOOP_PLANNER_INPUT_V1 to stdin), using the
+# same live-readback boundary already established for
+# known_context.scope_delta_decision (see the "唯一の production 呼び出し元"
+# / "診断用の echo であり canonical な mutation-phase routing は...consumer
+# 境界が担う" pattern in issue-refinement-loop/SKILL.md's Step 4 scope-reframe
+# section): this planner's `decisions.main_drift_evidence_epoch` output is an
+# ADVISORY diagnostic echo, not canonical mutation-phase routing authority.
+# The actual rebind/reverify mutation (fresh contract-snapshot
+# materialization, stale-evidence invalidation) is performed by the
+# refinement-loop consumer boundary that reads this echo, not by this
+# planner.
+#
+# Before invoking this script, the orchestrator must populate
+# known_context["main_drift"] as a dict with the following keys (all 40-hex
+# SHAs unless noted):
+#   current_base_sha                 live default-branch HEAD, read the same
+#                                     way materialize_issue_scope_snapshot.py
+#                                     ::_live_default_branch() reads it (a
+#                                     GitHub REST call, not a local ref).
+#   evidence_base_sha                base SHA the existing Contract Snapshot
+#                                     / scope snapshot is bound to.
+#   allowed_paths_snapshot_base_sha  base SHA the current Allowed Paths
+#                                     snapshot is bound to.
+#   allowed_paths                    list[str], from the live Issue body.
+#   latest_main_net_diff             list[str], `git diff --name-only
+#                                     evidence_base_sha current_base_sha`
+#                                     (main-drift-touched paths; this is
+#                                     DISTINCT from a final post-reconciliation
+#                                     net diff, which is the refinement/impl
+#                                     mutation consumer's responsibility, not
+#                                     this planner's).
+#   expected_old_sha / observed_old_sha   CAS pair for whatever ref this
+#                                     evidence rebind will ultimately mutate.
+#   semantic_ambiguity (optional)    bool; SHOULD be derived from an actual
+#                                     `git merge-tree --write-tree` conflict
+#                                     check by the orchestrator, not asserted
+#                                     freehand (see route_loop_verdict_v2.py /
+#                                     pr_head_replay_publish_exec.py for the
+#                                     canonical deterministic oracle used on
+#                                     the implementation-loop side).
+# If known_context.main_drift is omitted, this planner emits no
+# main_drift_evidence_epoch decision (the pre-#2102 behavior is preserved
+# for callers that do not yet supply main-drift facts).
+#
+# Current production-wiring status (honest disclosure, fix_delta iteration
+# 3): as of this revision, no production Python code path actually calls
+# run_refinement_preflight.py's orchestrator step to assemble
+# known_context["main_drift"] and pass it into this planner. The above
+# contract therefore documents a MUST requirement that the control-plane
+# has not yet implemented as automated wiring -- known_context.main_drift
+# remains dead code in production today (this file emits no
+# main_drift_evidence_epoch decision on any live invocation). Wiring the
+# orchestrator step described above (live GitHub REST readback, git diff,
+# and a git merge-tree --write-tree conflict check for semantic_ambiguity)
+# is tracked as follow-up work outside this Issue's bounded scope; the
+# `semantic_ambiguity` derivation the contract requires here mirrors the
+# same deterministic oracle already implemented in
+# pr_head_replay_publish_exec.py::_merge_tree_conflicts() on the
+# implementation-loop side (exit code from `git merge-tree --write-tree`,
+# non-zero == conflict), not a caller-asserted boolean.
+# ---------------------------------------------------------------------------
+
+
+def _refinement_main_drift_decision(
+    known_context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Project optional live main-drift facts into the planner's SSOT output.
+
+    See the known_context["main_drift"] production contract comment above
+    this function for who populates this key and when.
+    """
+    if not known_context or "main_drift" not in known_context:
+        return None
+    context = known_context["main_drift"]
+    if not isinstance(context, dict):
+        return {"route": "hard_stop", "reason_code": "main_drift_context_invalid"}
+    return classify_refinement_evidence_epoch(context)
+
 try:
     import yaml as _yaml_module
     _YAML_AVAILABLE = True
@@ -2381,6 +2512,11 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         else:
             generated_at = datetime.now(timezone.utc).isoformat()
 
+        # The planner is the refinement loop's production decision source.
+        # If the caller supplies live main-drift facts, emit this decision
+        # before any consumer can reuse base-bound snapshot/CI/review data.
+        refinement_main_drift = _refinement_main_drift_decision(known_context)
+
         # Check for malformations
         fail_closed_reasons = []
         # Track missing sections and contract keys for FAIL_CLOSED_REWRITE_CONSTRAINTS_V1
@@ -2749,6 +2885,15 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 "human_message": "",
             },
         }
+
+        if refinement_main_drift is not None:
+            plan["decisions"]["main_drift_evidence_epoch"] = refinement_main_drift
+            if refinement_main_drift["route"] == "hard_stop":
+                plan["fail_closed"] = {
+                    "required": True,
+                    "reason_codes": [refinement_main_drift["reason_code"]],
+                    "human_message": "main drift evidence cannot be safely rebound",
+                }
 
         if scope_signal_guard_decision_v2 is not None:
             plan["scope_signal_guard_decision_v2"] = scope_signal_guard_decision_v2
