@@ -6,20 +6,25 @@
  * into `e2e-core` (LOOP_E2E_LANE=core) and `e2e-responsive-matrix`
  * (LOOP_E2E_LANE=responsive) is a lossless, disjoint partition:
  *
- *   AC1: union(core, responsive) canonical logical IDs == the frozen
- *        baseline captured at split time (tests/ci/fixtures/e2e_lane_partition_baseline_v1.json).
+ *   AC1: union(core, responsive) canonical logical IDs, after applying the
+ *        explicit relocation map, == the frozen baseline captured
+ *        independently from the pre-split base SHA
+ *        (tests/ci/fixtures/e2e_lane_partition_baseline_v1.json).
  *   AC2: intersection(core, responsive) canonical logical IDs == empty.
  *
  * "Canonical logical ID" (Issue #2119 AC1 wording): a unique identifier
  * machine-derived from the file path + describe/test title hierarchy that
  * Playwright's own JSON reporter emits (`playwright test --list
- * --reporter=json`). This script deliberately uses the TITLE HIERARCHY ONLY
- * (excluding the leaf spec file name) as the equality key: the entire point
- * of this Issue is to physically relocate the responsive matrix test into
- * its own spec file, which necessarily changes the file-path component of
- * any file-qualified id — matching on title hierarchy alone is what
- * actually proves "no test silently dropped, duplicated, or renamed by the
- * split", which is the real intent behind AC1/AC2.
+ * --reporter=json`). This script uses the FULL FILE-QUALIFIED id
+ * (`<file>::<title hierarchy>`), not title-hierarchy-only (PR #2137 human
+ * review issuecomment-5273090534 P1 fix: title-only equality could not
+ * distinguish same-named tests living in different spec files). Physically
+ * relocating a test intentionally changes its file-qualified id, which is
+ * why `tests/ci/fixtures/e2e_lane_partition_relocation_map_v1.json` exists:
+ * only the SPECIFIC old-id -> new-id pairs listed there are treated as
+ * identity-preserved renames when reconciling against the baseline; every
+ * other id must match exactly, so drops/duplicates/same-title-different-
+ * file collisions are still detected.
  *
  * Exit code: 0 = pass, 1 = contract violation, 2 = usage/collection error.
  */
@@ -38,6 +43,13 @@ const BASELINE_PATH = path.join(
   'ci',
   'fixtures',
   'e2e_lane_partition_baseline_v1.json',
+)
+const RELOCATION_MAP_PATH = path.join(
+  REPO_ROOT,
+  'tests',
+  'ci',
+  'fixtures',
+  'e2e_lane_partition_relocation_map_v1.json',
 )
 
 function listLane(lane) {
@@ -61,23 +73,45 @@ function listLane(lane) {
   return JSON.parse(stdout)
 }
 
-function canonicalTitleIds(doc) {
+function canonicalFileQualifiedIds(doc) {
   const ids = []
-  function walk(suite, prefix) {
-    for (const s of suite.suites ?? []) walk(s, [...prefix, s.title])
-    for (const spec of suite.specs ?? []) ids.push([...prefix, spec.title].join(' > '))
+  function walk(suite, prefix, file) {
+    for (const s of suite.suites ?? []) walk(s, [...prefix, s.title], file)
+    for (const spec of suite.specs ?? []) {
+      ids.push(`${spec.file ?? file}::` + [...prefix, spec.title].join(' > '))
+    }
   }
-  for (const top of doc.suites ?? []) walk(top, [])
+  for (const top of doc.suites ?? []) walk(top, [], top.file)
   return ids
+}
+
+function loadRelocationMap() {
+  if (!existsSync(RELOCATION_MAP_PATH)) {
+    return []
+  }
+  const doc = JSON.parse(readFileSync(RELOCATION_MAP_PATH, 'utf8'))
+  return doc.relocations ?? []
+}
+
+/** Applies the explicit old-id -> new-id relocation map to a set of
+ * file-qualified ids: any id present in the set that equals a relocation's
+ * `new_id` is rewritten to that relocation's `old_id` before comparison
+ * against the pre-split baseline. Unmapped ids are left untouched, so this
+ * cannot mask a drop/duplicate/collision for any test not explicitly
+ * listed as an intentional relocation. */
+function applyRelocationMap(ids, relocations) {
+  const newToOld = new Map(relocations.map((r) => [r.new_id, r.old_id]))
+  return ids.map((id) => newToOld.get(id) ?? id)
 }
 
 export function computePartitionResult() {
   const coreDoc = listLane('core')
   const responsiveDoc = listLane('responsive')
-  const coreIds = canonicalTitleIds(coreDoc)
-  const responsiveIds = canonicalTitleIds(responsiveDoc)
+  const coreIds = canonicalFileQualifiedIds(coreDoc)
+  const responsiveIds = canonicalFileQualifiedIds(responsiveDoc)
   const coreSet = new Set(coreIds)
   const responsiveSet = new Set(responsiveIds)
+  const relocations = loadRelocationMap()
 
   const failures = []
 
@@ -96,7 +130,12 @@ export function computePartitionResult() {
 
   const unionSet = new Set([...coreSet, ...responsiveSet])
 
-  // AC1: union must equal the frozen baseline.
+  // AC1: union (after applying the explicit relocation map, so
+  // intentionally-moved tests are not counted as dropped+added) must equal
+  // the frozen pre-split baseline.
+  const reconciledUnionIds = applyRelocationMap([...unionSet], relocations)
+  const reconciledUnionSet = new Set(reconciledUnionIds)
+
   let baselineIds = []
   if (existsSync(BASELINE_PATH)) {
     const baseline = JSON.parse(readFileSync(BASELINE_PATH, 'utf8'))
@@ -105,8 +144,8 @@ export function computePartitionResult() {
     failures.push(`missing baseline fixture: ${BASELINE_PATH}`)
   }
   const baselineSet = new Set(baselineIds)
-  const missingFromUnion = [...baselineSet].filter((id) => !unionSet.has(id))
-  const extraInUnion = [...unionSet].filter((id) => !baselineSet.has(id))
+  const missingFromUnion = [...baselineSet].filter((id) => !reconciledUnionSet.has(id))
+  const extraInUnion = [...reconciledUnionSet].filter((id) => !baselineSet.has(id))
   if (missingFromUnion.length > 0) {
     failures.push(`missing from e2e-core + e2e-responsive-matrix union: ${JSON.stringify(missingFromUnion)}`)
   }

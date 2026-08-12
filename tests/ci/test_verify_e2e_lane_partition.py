@@ -167,13 +167,55 @@ def test_preview_namespace_lane_runs_exactly_once_with_no_isolation_regression()
         "e2e-responsive-matrix must not run/duplicate the preview-namespace lane"
     )
 
-    # "Exactly once" at the step level: only one preview-namespace test
-    # invocation step in e2e-core.
-    invocation_steps = [
-        s
-        for s in jobs["e2e-core"].get("steps", [])
-        if isinstance(s, dict) and "test:e2e:preview-namespace" in str(s.get("run", ""))
-    ]
-    assert len(invocation_steps) <= 1, (
-        f"preview-namespace lane must run exactly once in e2e-core, found {len(invocation_steps)} invocation steps"
+    # "Exactly once" (PR #2137 human review issuecomment-5273090534 P2 fix):
+    # the prior `<= 1` assertion did not fail if the invocation step were
+    # removed entirely (zero invocations). AC8 requires EXACTLY one real
+    # invocation step in e2e-core, and NONE in e2e-responsive-matrix -- both
+    # identified by their `run:` field (an execution marker), not by raw
+    # substring occurrence across the job's full steps text (which would
+    # also match unrelated comments/metadata referencing the same string).
+    def _invocation_steps(job: dict) -> list[dict]:
+        return [
+            s
+            for s in job.get("steps", [])
+            if isinstance(s, dict) and "test:e2e:preview-namespace" in str(s.get("run", ""))
+        ]
+
+    core_invocation_steps = _invocation_steps(jobs["e2e-core"])
+    responsive_invocation_steps = _invocation_steps(jobs["e2e-responsive-matrix"])
+
+    assert len(core_invocation_steps) == 1, (
+        f"preview-namespace lane must run exactly once in e2e-core, found "
+        f"{len(core_invocation_steps)} invocation steps"
+    )
+    assert len(responsive_invocation_steps) == 0, (
+        f"preview-namespace lane must not run in e2e-responsive-matrix, found "
+        f"{len(responsive_invocation_steps)} invocation steps"
+    )
+
+    # Confirm the single e2e-core invocation step will actually EXECUTE (not
+    # just be present in the workflow text): it must have a non-empty `run:`
+    # command containing the real pnpm invocation, a distinct step `id`
+    # (the execution/timing marker `timed-e2e-preview-namespace` this step
+    # writes to `measurements.jsonl` under, cross-checked at runtime by the
+    # ci_runtime_baseline_v1 pipeline), and must not be unconditionally
+    # skipped via an `if:` guard that always evaluates false.
+    invocation_step = core_invocation_steps[0]
+    run_command = str(invocation_step.get("run", ""))
+    assert "pnpm run test:e2e:preview-namespace" in run_command, (
+        f"preview-namespace invocation step must actually invoke the pnpm script, got run={run_command!r}"
+    )
+    assert invocation_step.get("id"), (
+        "preview-namespace invocation step must declare a stable `id` (execution marker)"
+    )
+
+    def _is_unconditional_skip(condition: object) -> bool:
+        if condition is None:
+            return False
+        normalized = str(condition).strip().lower()
+        return normalized in ("false", "${{ false }}")
+
+    assert not _is_unconditional_skip(invocation_step.get("if")), (
+        f"preview-namespace invocation step must not be unconditionally skipped: "
+        f"if={invocation_step.get('if')!r}"
     )
