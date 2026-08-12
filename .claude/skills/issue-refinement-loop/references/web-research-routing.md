@@ -1,23 +1,23 @@
-# 外部調査の経路
+# Web Research Routing（外部調査のルーティング）
 
-## 起動条件（Trigger）
+## Trigger（起動条件）
 
 `REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy.required == true` のときだけ `web-researcher` を起動する。条件外は `skip_reason: no_critical_external_claim` を記録してスキップする。
 
-## 結果の利用境界
+## Consumer boundary（消費側境界）
 
 `WEB_RESEARCH_RESULT_V1` の詳細定義、および AGY-first / native Web fallback / evidence quality gate 判定は、`.claude/agents/web-researcher.md` を SSOT とする。
 
-orchestrator は `WEB_RESEARCH_RESULT_V1` の詳細（attempt log や query mutation 等）を再実装せず、以下の consumer field だけを読んで routing を行う。
+オーケストレーターは `WEB_RESEARCH_RESULT_V1` の詳細（attempt log や query mutation 等）を再実装せず、以下の consumer field だけを読んでルーティングを行う。
 
 consumer が読む結果フィールド（以下は routing のための既存フィールド）:
-- `status`
-- `failure_class`
-- `verification_route`
-- `retry_count`
-- `fallback_used`
-- `critical_external_claims`
-- `unresolved_risks`
+- `status`（状態）
+- `failure_class`（失敗分類）
+- `verification_route`（検証経路）
+- `retry_count`（再試行回数）
+- `fallback_used`（代替経路の利用有無）
+- `critical_external_claims`（外部 claim）
+- `unresolved_risks`（未解決リスク）
 
 ## 経路の判断規則（producer route の扱い）
 
@@ -46,7 +46,7 @@ planner は `dispositive` を安全な既定値として出力する。main thre
 `non_dispositive` を渡せるのは、current repository state、実 diff、実 test 等が
 requested disposition を独立に決定することを明示的に確認した場合だけである。
 
-## Routing rules
+## Routing rules（ルーティング規則）
 
 - `status: ok` → Step 2 へ進む（`verification_route` の値は informational であり
   routing の gate 条件にしない）
@@ -70,6 +70,6 @@ preflight の `STATUS: environment_failure` とは異なり、external provider 
 
 `web_tool_call_count`、`search_query_count`、provider hook/provenance trace は consumer routing の入力ではない。これらの欠落または zero だけで `inconclusive` / `failed` / human escalation にしてはならない。native fallback は web-researcher 内で完結させ、両 route で critical claim evidence を得られなかった結果だけを escalation に渡す。
 
-## 保存禁止（Must not store）
+## Must not store（保存禁止）
 
 retry / fallback / attempt log の内部状態を orchestrator 側（LOOP_STATE）に保存してはならない。これらは SubAgent 側で完結させる。
