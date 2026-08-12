@@ -89,9 +89,12 @@ routing-critical フィールド（`scope_rollup_decision`、`scope_signal_guard
 `follow_up_materialization`、`superseded_decision`）の定義は `references/loop-state.md` が SSOT。
 orchestrator はこれらのフィールドを直接 prose 再判定しない。
 
-主要な consumer フィールドの例: `web_research:` (web-researcher 実行状態)。
-未解決 external claim は、その decision dependency が `dispositive` で repository
-evidence が disposition を独立に決定できない場合だけ human_escalation 候補になる。
+主要な consumer フィールドの例: `web_research:` (web-researcher 実行状態) と
+`critical_claims`（planner の `critical_external_claims` を join 時だけ参照する互換名）。
+これは新しい永続 ledger ではなく、current planner result に束縛された consumer input
+である。未解決 external claim は、その decision dependency が `dispositive` で
+repository evidence が disposition を独立に決定できない場合だけ human_escalation
+候補になる。
 
 ## 手順 (Procedure)
 
@@ -208,7 +211,7 @@ anchor comment の fact-check 契約、`ANCHOR_COMMENT_CONTEXT_V1`、`ANCHOR_COM
 
 ### Step 1b: 外部Web調査 (Web Research)
 
-`REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy.required == true` の場合のみ `web-researcher` を起動する。orchestrator は `WEB_RESEARCH_RESULT_V1` を opaque に扱い、consumer field だけを `LOOP_STATE.web_research` へ反映する。retry / fallback / raw grounding state は保持しない。
+`REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy.required == true` の場合のみ `web-researcher` を起動する。外部 claim のハルシネーションまたは repository evidence だけでは解消できないエビデンス不足を切り分けるため、orchestrator は `WEB_RESEARCH_RESULT_V1` を opaque に扱い、consumer field だけを `LOOP_STATE.web_research` へ反映する。retry / fallback / raw grounding state は保持しない。
 
 Step 1（codebase-investigator）と Step 1b（web-researcher）は、両方が required の場合に並列実行できる。ただし両 SubAgent の結果を Step 2 前に合流させること。
 
