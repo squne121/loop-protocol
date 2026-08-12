@@ -169,6 +169,27 @@ def test_empty_claim_roles_are_fail_closed_even_with_repository_disposition():
     assert result["reason_codes"] == ["critical_external_claims must not be empty"]
 
 
+def test_missing_claim_role_is_fail_closed_even_with_repository_disposition():
+    """A claim without an explicit decision dependency cannot proceed on defaults."""
+    input_data = _input(
+        repository_status="determined",
+        disposition="close_not_planned",
+        role="non_dispositive",
+        web_research=_web_result(),
+    )
+    claim = input_data["critical_external_claims"][0]
+    del claim["role"]
+
+    result = route_web_research_result(input_data)
+
+    assert result["transport_status"] == TRANSPORT_STATUS_ENVIRONMENT_FAILURE
+    assert result["semantic_verdict"] is None
+    assert result["next_action"] == NEXT_ACTION_HUMAN_JUDGMENT_REQUIRED
+    assert result["reason_codes"] == [
+        "critical_external_claim role must be dispositive or non_dispositive"
+    ]
+
+
 def test_documentation_declares_disposition_aware_transport_routing():
     """AC6: the skill and reference keep the non-global-blocker contract visible."""
     routing_reference = (SKILL_ROOT / "references" / "web-research-routing.md").read_text(
