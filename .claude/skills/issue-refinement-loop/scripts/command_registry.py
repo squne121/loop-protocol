@@ -653,6 +653,40 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "issue_number": {"type": "positive_int", "required": True},
         },
     },
+    # Issue #2049: root-owned producer I/O for the issue-refinement-loop
+    # review step. Fetches + pins the live Issue body exactly once, runs
+    # check_issue_contract.py / contract_readiness_check.py / merge_readiness,
+    # and persists the merged review result to the canonical artifact
+    # directory. PR #2135 human REQUEST_CHANGES iteration-3 P0-1: this
+    # command is now ALSO the sole producer of the ISSUE_REVIEW_RESULT_COMPACT_V1
+    # compact envelope (see `produce_compact_result()` /
+    # `compact_result.stdout_lines` in the stdout JSON) -- the read-only
+    # `issue-reviewer` custom agent (.codex/agents/issue-reviewer.toml) never
+    # invokes compact_review_result.py or performs any producer I/O itself;
+    # it only relays `compact_result.stdout_lines` verbatim. This is a
+    # deliberate, narrow exception to #1875's minimal-harness direction
+    # (see run_root_review_pipeline.py's module docstring "Architecture
+    # delta relative to #1875" for the full rationale/consumer inventory).
+    "root_review_pipeline.produce": {
+        "id": "root_review_pipeline.produce",
+        "argv": [
+            "uv", "run", "--locked", "python3",
+            f"{_SKILL_PREFIX}/run_root_review_pipeline.py",
+            "produce",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "none",
+        "stdout_contract": "root_review_pipeline_result/v1",
+        "timeout_seconds": 90,
+        "mutation": False,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------

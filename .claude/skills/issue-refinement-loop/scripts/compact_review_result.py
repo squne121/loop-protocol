@@ -16,6 +16,21 @@ stdout format (machine-readable compact lines):
   ARTIFACT: compact_review_result_v1=<path>
 
 exit codes: 0=ok, 1=warn, 2=verdict_missing / validation_error
+
+Callers (PR #2135 human REQUEST_CHANGES iteration-3 P0-1): this module's CLI
+(`main()`) writes a success artifact via `_atomic_write()` BEFORE emitting
+compact stdout, so it may only be invoked by a producer that legitimately
+performs write I/O. Within `issue-refinement-loop`'s loop-invoked review step
+(`invoked_as_loop: true`), the ONLY caller of this CLI (or, equivalently, the
+pure `compact_review_result()` function + `_atomic_write()`) is
+`.claude/skills/issue-refinement-loop/scripts/run_root_review_pipeline.py`'s
+`produce_compact_result()` -- the root-owned pipeline. The read-only
+`issue-reviewer` custom agent (`.codex/agents/issue-reviewer.toml`,
+`default_permissions: loop-protocol-readonly`) NEVER invokes this module; it
+only relays the root-owned pipeline's already-rendered stdout lines verbatim.
+A human directly invoking `review-issue` (`invoked_as_loop: false`) is
+unaffected and continues to call this CLI directly (no read-only
+constraint applies).
 """
 
 from __future__ import annotations
