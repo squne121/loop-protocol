@@ -666,10 +666,15 @@ def _ac3_real_asset_repo(tmp_path: Path) -> Path:
         cwd=repo, check=True, capture_output=True, text=True,
     )
     subprocess.run(["git", "add", "--all"], cwd=repo, check=True, capture_output=True, text=True)
-    subprocess.run(
-        ["git", "-c", "user.name=ac3", "-c", "user.email=ac3@example.invalid", "commit", "-m", "AC3 real assets"],
+    pending = subprocess.run(
+        ["git", "status", "--porcelain"],
         cwd=repo, check=True, capture_output=True, text=True,
     )
+    if pending.stdout:
+        subprocess.run(
+            ["git", "-c", "user.name=ac3", "-c", "user.email=ac3@example.invalid", "commit", "-m", "AC3 real assets"],
+            cwd=repo, check=True, capture_output=True, text=True,
+        )
     return repo
 
 
