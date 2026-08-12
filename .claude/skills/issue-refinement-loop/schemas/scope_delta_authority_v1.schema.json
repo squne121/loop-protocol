@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SCOPE_DELTA_AUTHORITY_V1",
-  "description": "Additive classification of scope delta authority (who/what authorized a scope change) attached to scope_signal_guard_decision_v2 (#1090) by #1323. Supersedes #1008/#1011.",
+  "description": "Additive classification of scope delta authority (who/what authorized a scope change) attached to scope_signal_guard_decision_v2 (#1090) by #1323. Supersedes #1008/#1011. #2053 AC6: cross_target_direct_mutation is separated from primary_target_exact_delta + non_mutating follow_up_candidates.",
   "type": "object",
   "required": ["schema_version", "authority_category", "provenance", "directive", "boundary_flags", "route"],
   "additionalProperties": false,
@@ -32,6 +32,7 @@
             "parent_issue",
             "related_issue",
             "generated_by_agent",
+            "direct_interactive_human_instruction",
             null
           ]
         },
@@ -98,6 +99,7 @@
             "destructive_or_non_idempotent_operation",
             "ai_inferred_scope_delta",
             "untrusted_author_association",
+            "cross_target_direct_mutation",
             null
           ]
         },
@@ -105,11 +107,42 @@
         "next_step": {
           "type": ["string", "null"],
           "enum": ["rerun_refinement_after_contract_update", null]
+        },
+        "target_binding": {
+          "type": ["string", "null"],
+          "enum": ["primary_target_exact_delta", "cross_target_direct_mutation", null]
         }
       }
     },
     "contract_patch_plan": {
       "$ref": "contract_patch_plan_v1.schema.json"
+    },
+    "follow_up_candidates": {
+      "description": "#2053 AC6: non-mutating candidates derived from evidence that targets an issue other than the primary target. These never carry mutation_authority and are informational only -- they require a separate follow-up Issue's own trusted directive to become actionable.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["target_issue_number", "source_kind", "mutation_authority"],
+        "additionalProperties": false,
+        "properties": {
+          "target_issue_number": { "type": ["integer", "null"] },
+          "source_kind": {
+            "type": ["string", "null"],
+            "enum": [
+              "issue_comment",
+              "pull_request_review",
+              "parent_issue",
+              "related_issue",
+              "generated_by_agent",
+              "direct_interactive_human_instruction",
+              null
+            ]
+          },
+          "comment_url": { "type": ["string", "null"] },
+          "mutation_authority": { "type": "boolean", "const": false },
+          "note": { "type": ["string", "null"] }
+        }
+      }
     }
   }
 }

@@ -208,7 +208,11 @@ DEFAULT_MODEL_ROUTING: dict[str, Any] = {
         # provider="agy" tool_profile="grounded_research" via
         # resolve_agy_grounded_research_model() -- unrelated to the
         # gemini-model roles above.
-        "grounded_research": {"model_chain": ["claude-sonnet-4-6"]},
+        # Issue #2069: empty chain -- Claude 強制を外し、AGY account_default
+        # (#1777 実験知見と整合) に選択権を返す。load_model_routing() の
+        # grounded_research_empty_chain_exception が this role に限りこれを合法
+        # として許可する。
+        "grounded_research": {"model_chain": []},
     },
 }
 
@@ -363,7 +367,17 @@ def load_model_routing(config_path: Path | None = None) -> dict[str, Any]:
         if not isinstance(role_cfg, dict):
             raise ValueError(f"model_routing roles[{role_name!r}] must be a mapping")
         chain = role_cfg.get("model_chain")
-        if not isinstance(chain, list) or len(chain) == 0:
+        if not isinstance(chain, list):
+            raise ValueError(f"model_routing roles[{role_name!r}].model_chain must be a list")
+        # grounded_research_empty_chain_exception (Issue #2069): grounded_research
+        # is the only role allowed an empty model_chain. An empty chain means
+        # resolve_agy_grounded_research_model() falls back to no `--model` flag
+        # at all (AGY account_default) -- a valid, intentional resolution path,
+        # not a configuration error. This removes the wrapper's former Claude
+        # 強制 (hardcoded claude-sonnet-4-6) that was unilaterally consuming the
+        # Antigravity CLI shared "Claude and GPT Models" quota. All other roles
+        # must still resolve to at least one candidate.
+        if len(chain) == 0 and role_name != AGY_GROUNDED_RESEARCH_ROLE:
             raise ValueError(f"model_routing roles[{role_name!r}].model_chain must be a non-empty list")
         for entry in chain:
             if not isinstance(entry, str) or not entry.strip():
@@ -416,6 +430,27 @@ def resolve_model_chain(
             return [], f"unknown_role: {role!r} is not defined in model_routing; valid roles: {sorted(roles)}"
         chain = roles[role].get("model_chain", [])
         if not chain:
+            if role == AGY_GROUNDED_RESEARCH_ROLE and request.get("provider") == "agy":
+                # Issue #2069 grounded_research_empty_chain_exception: an
+                # empty model_chain for grounded_research is an intentional
+                # configuration (AGY account_default delegation -- see the
+                # matching exception in load_model_routing() above), not a
+                # resolution error. Callers (e.g. resolve_agy_grounded_research_model())
+                # already treat an empty chain as "no --model flag"; this
+                # keeps resolve_model_chain() consistent for that same role
+                # instead of surfacing a spurious empty_chain error.
+                #
+                # This exception is scoped to provider == "agy" (Issue #2097
+                # review Finding 1 [P0]): resolve_model_chain() is a shared,
+                # provider-agnostic resolver also called from the generic
+                # run_delegation() path for provider="gemini" requests. A
+                # request with role="grounded_research" but a different
+                # provider must still surface the standard empty_chain error
+                # below -- returning ([], None) unconditionally would let a
+                # provider="gemini" caller silently proceed with an empty
+                # model_chain and crash later on
+                # `assert last_completed is not None`.
+                return [], None
             return [], f"empty_chain: roles[{role!r}].model_chain is empty"
         return list(chain), None
 
@@ -471,7 +506,9 @@ def resolve_agy_grounded_research_model(routing: dict[str, Any] | None = None) -
     grounded_research is optional by design (Issue #1777 Outcome); it is
     never a hard requirement for the call to proceed.
     """
-    chain, _error = resolve_model_chain({"role": AGY_GROUNDED_RESEARCH_ROLE}, routing)
+    chain, _error = resolve_model_chain(
+        {"role": AGY_GROUNDED_RESEARCH_ROLE, "provider": "agy"}, routing
+    )
     for candidate in chain:
         if _agy_model_is_available(candidate):
             return candidate
