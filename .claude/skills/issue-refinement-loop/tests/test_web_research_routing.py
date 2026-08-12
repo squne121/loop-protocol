@@ -12,6 +12,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from route_web_research_result import (  # noqa: E402
     NEXT_ACTION_HUMAN_JUDGMENT_REQUIRED,
+    NEXT_ACTION_PROCEED,
     NEXT_ACTION_PROCEED_WITH_NOTES,
     TRANSPORT_STATUS_ENVIRONMENT_FAILURE,
     route_web_research_result,
@@ -49,6 +50,33 @@ def _web_result(**overrides: object) -> dict[str, object]:
         "failure_class": "query_error",
         "verification_route": "grounded_research",
         "claims": [],
+        "unresolved_risks": [],
+    }
+    result.update(overrides)
+    return result
+
+
+def _successful_web_result(**overrides: object) -> dict[str, object]:
+    result: dict[str, object] = {
+        "status": "ok",
+        "failure_class": None,
+        "verification_route": "grounded_research",
+        "claims": [
+            {
+                "claim_id": "hook-semantics",
+                "text": "historical/current CLI hook semantics",
+                "type": "external_spec",
+                "critical": True,
+                "verdict": "supported",
+                "evidence": [
+                    {
+                        "kind": "web",
+                        "ref": "https://example.invalid/hook-semantics",
+                        "summary": "Grounded external evidence was materialized.",
+                    }
+                ],
+            }
+        ],
         "unresolved_risks": [],
     }
     result.update(overrides)
@@ -149,6 +177,51 @@ def test_incomplete_ok_result_is_fail_closed_transport_failure():
     assert result["semantic_verdict"] is None
     assert result["next_action"] == NEXT_ACTION_HUMAN_JUDGMENT_REQUIRED
     assert result["reason_codes"] == ["web_research_result_missing_or_malformed"]
+
+
+def test_complete_ok_result_requires_matching_materialized_claim_evidence():
+    result = route_web_research_result(
+        _input(
+            repository_status="determined",
+            disposition="close_not_planned",
+            role="non_dispositive",
+            web_research=_successful_web_result(),
+        )
+    )
+
+    assert result["transport_status"] == "ok"
+    assert result["semantic_verdict"] is None
+    assert result["next_action"] == NEXT_ACTION_PROCEED
+
+
+def test_ok_result_with_empty_claims_is_fail_closed_transport_failure():
+    result = route_web_research_result(
+        _input(
+            repository_status="determined",
+            disposition="close_not_planned",
+            role="non_dispositive",
+            web_research=_successful_web_result(claims=[]),
+        )
+    )
+
+    assert result["transport_status"] == TRANSPORT_STATUS_ENVIRONMENT_FAILURE
+    assert result["semantic_verdict"] is None
+    assert result["next_action"] == NEXT_ACTION_HUMAN_JUDGMENT_REQUIRED
+
+
+def test_ok_result_with_invalid_claim_is_fail_closed_transport_failure():
+    result = route_web_research_result(
+        _input(
+            repository_status="determined",
+            disposition="close_not_planned",
+            role="non_dispositive",
+            web_research=_successful_web_result(claims=[{}]),
+        )
+    )
+
+    assert result["transport_status"] == TRANSPORT_STATUS_ENVIRONMENT_FAILURE
+    assert result["semantic_verdict"] is None
+    assert result["next_action"] == NEXT_ACTION_HUMAN_JUDGMENT_REQUIRED
 
 
 def test_empty_claim_roles_are_fail_closed_even_with_repository_disposition():

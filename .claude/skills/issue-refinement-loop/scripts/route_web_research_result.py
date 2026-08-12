@@ -28,7 +28,43 @@ TRANSPORT_STATUS_OK = "ok"
 TRANSPORT_STATUS_ENVIRONMENT_FAILURE = "environment_failure"
 
 
-def _transport_reason(web_research: Any) -> str | None:
+def _claims_cover_requested_evidence(
+    claims: list[Any], required_claim_texts: set[str]
+) -> bool:
+    """Require an `ok` result to materialize usable evidence for every request."""
+    covered_claim_texts: set[str] = set()
+    for claim in claims:
+        if not isinstance(claim, dict):
+            return False
+        text = claim.get("text")
+        evidence = claim.get("evidence")
+        if (
+            not isinstance(claim.get("claim_id"), str)
+            or not claim["claim_id"]
+            or not isinstance(text, str)
+            or not text
+            or claim.get("type") != "external_spec"
+            or claim.get("critical") is not True
+            or claim.get("verdict") not in {"supported", "contradicted"}
+            or not isinstance(evidence, list)
+            or not evidence
+        ):
+            return False
+        for item in evidence:
+            if (
+                not isinstance(item, dict)
+                or item.get("kind") != "web"
+                or not isinstance(item.get("ref"), str)
+                or not item["ref"]
+                or not isinstance(item.get("summary"), str)
+                or not item["summary"]
+            ):
+                return False
+        covered_claim_texts.add(text)
+    return required_claim_texts.issubset(covered_claim_texts)
+
+
+def _transport_reason(web_research: Any, required_claim_texts: set[str]) -> str | None:
     """Normalize an unavailable web result without naming it a semantic verdict."""
     if not isinstance(web_research, dict):
         return "web_research_result_missing_or_malformed"
@@ -43,7 +79,11 @@ def _transport_reason(web_research: Any) -> str | None:
     if not isinstance(claims, list) or not isinstance(unresolved_risks, list):
         return "web_research_result_missing_or_malformed"
     if status == "ok":
-        if failure_class is not None:
+        if (
+            failure_class is not None
+            or verification_route != "grounded_research"
+            or not _claims_cover_requested_evidence(claims, required_claim_texts)
+        ):
             return "web_research_result_missing_or_malformed"
         return None
     if status not in {"failed", "inconclusive", "insufficient_context"}:
@@ -79,20 +119,25 @@ def _validate_repository_decision(value: Any) -> tuple[str, str | None]:
     raise ValueError("repository_decision must be determined or inconclusive")
 
 
-def _validate_claim_roles(value: Any) -> list[str]:
+def _validate_claim_roles(value: Any) -> tuple[list[str], set[str]]:
     if not isinstance(value, list):
         raise ValueError("critical_external_claims must be an array")
     if not value:
         raise ValueError("critical_external_claims must not be empty")
     roles: list[str] = []
+    claim_texts: set[str] = set()
     for claim in value:
         if not isinstance(claim, dict):
             raise ValueError("critical_external_claims entries must be objects")
         role = claim.get("role")
         if role not in {ROLE_DISPOSITIVE, ROLE_NON_DISPOSITIVE}:
             raise ValueError("critical_external_claim role must be dispositive or non_dispositive")
+        text = claim.get("claim")
+        if not isinstance(text, str) or not text:
+            raise ValueError("critical_external_claim requires claim text")
         roles.append(role)
-    return roles
+        claim_texts.add(text)
+    return roles, claim_texts
 
 
 def _invalid_input_result(reason: str) -> dict[str, Any]:
@@ -118,12 +163,12 @@ def route_web_research_result(input_data: dict[str, Any]) -> dict[str, Any]:
         repository_status, repository_disposition = _validate_repository_decision(
             input_data.get("repository_decision")
         )
-        roles = _validate_claim_roles(input_data.get("critical_external_claims"))
+        roles, claim_texts = _validate_claim_roles(input_data.get("critical_external_claims"))
     except ValueError as exc:
         return _invalid_input_result(str(exc))
 
     web_research = input_data.get("web_research")
-    unavailable_reason = _transport_reason(web_research)
+    unavailable_reason = _transport_reason(web_research, claim_texts)
     if unavailable_reason is None:
         return {
             "schema": SCHEMA,

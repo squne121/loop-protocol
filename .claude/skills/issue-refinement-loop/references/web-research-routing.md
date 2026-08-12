@@ -52,12 +52,14 @@ requested disposition を独立に決定することを明示的に確認した�
 
 ## Routing rules（ルーティング規則）
 
-- `status: ok` は `failure_class: null`、非空の `verification_route`、`claims`、
-  `unresolved_risks` を含む完全な consumer result の場合だけ Step 2 へ進む。
+- `status: ok` は `failure_class: null`、非空の `verification_route`、
+  `unresolved_risks`、および planner の各 critical claim に対応する非空の
+  `claims[].evidence` を含む完全な consumer result の場合だけ Step 2 へ進む。
   `verification_route` の具体的な値（`grounded_research` / `native_web` /
   producer 側が将来追加する未知の成功 route）は informational であり、
-  allowlist による厳密照合の gate 条件にしない。`status: ok` でもこれらの
-  フィールドが欠ける結果は、成功証拠として採用せず
+  allowlist による厳密照合の gate 条件にしない — 検証するのは非空であることのみ。
+  `status: ok` でも `verification_route` が欠落・空、または
+  空・不正・対応しない claim/evidence を含む結果は、成功証拠として採用せず
   `environment_failure` / `human_judgment_required` にする。
 - `failed` / `inconclusive` / `insufficient_context`、grounding/citation/provider
   provenance が materialize できない結果、空・malformed result は、semantic
