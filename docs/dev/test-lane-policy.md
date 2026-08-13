@@ -344,3 +344,47 @@ substitution・`${{ }}` 認識のうえ分割）、全 simple command を分類�
   `uv run --locked python -c` / `uv run --locked python -` は lockfile 下で依存解決されるため許可する。
 - Markdown では shell 言語（` ```bash ` / ` ```sh ` / 無タグ等）の fenced block のみを
   shell として走査し、` ```yaml ` / ` ```json ` / ` ```markdown ` 等のデータ/prose block は対象外とする。
+
+## E2E lane 分割: e2e-core / e2e-responsive-matrix（#2119）
+
+`integration` レーンの E2E hotspot（responsive viewport x DPR x browser-zoom
+geometry matrix、`assist-player-affordance.spec.ts` 内で単一 test case として
+約 3.2 分を占めていた）を専用 spec/provider job へ物理分離した。
+
+### 排他的 lane selector: `LOOP_E2E_LANE`
+
+`playwright.config.ts` は `LOOP_E2E_LANE` 環境変数で 3 値の排他的 enum
+（`core` / `responsive` / `preview-namespace`）を解決する。未指定時は
+`core`。カンマ区切りの複数値・未知の値は config 評価時に例外を投げ
+fail-closed で拒否する（`preview-namespace` 自体の意味論は既存の
+`LOOP_E2E_PREVIEW_NAMESPACE_LANE` フラグのまま変更しない — `LOOP_E2E_LANE`
+はこのフラグとの整合性チェックのみ追加する）。
+
+| provider job | `LOOP_E2E_LANE` | 実行対象 |
+|---|---|---|
+| `e2e-core` | `core`（既定） | `assist-player-affordance-responsive.spec.ts` と preview-namespace 専用 spec を除く全 spec。preview-namespace lane 実行（exactly once）、既存 visual artifact evidence pipeline の owner。 |
+| `e2e-responsive-matrix` | `responsive` | `assist-player-affordance-responsive.spec.ts` のみ。`RESPONSIVE_CANVAS_MATRIX_CONTRACT_V1`（viewport x DPR x zoom tuple の完全一致・重複ゼロ・pointer-mapping/frozen-state evidence 必須）を実行。 |
+
+両 job は DAG 上で相互依存せず並列開始する。既存 required check 名 `e2e`
+は `needs: [e2e-core, e2e-responsive-matrix]` + `if: always()` の集約
+job として残り、(a) static topology failure（provider job 定義欠落）、
+(b) runtime result failure（`needs.<job>.result` が
+failure/cancelled/skipped）、(c) runtime evidence failure（成功したが
+必須 artifact が欠落）を区別し、いずれも success へ縮退しない。
+
+visual artifact producer authority は `e2e-core` に一元化されている
+（`scripts/check-visual-artifact-pipeline.py` の
+`VISUAL_ARTIFACT_PRODUCER_JOB` 定数）。集約 `e2e` job は provider
+artifact の再 upload/再 download を行わない（`check-visual-artifact-pipeline.py`
+がこれを構造的に拒否する）。
+
+### 検証
+
+`scripts/ci/verify-e2e-lane-partition.mjs` が Playwright の実
+`--list --reporter=json` collection を both lane で実行し、canonical
+logical ID（describe/test title 階層。ファイルパスは split で意図的に
+変わるため id 化から除外）の union が `tests/ci/fixtures/e2e_lane_partition_baseline_v1.json`
+（split 時点で採取した frozen baseline）と完全一致し、intersection が
+空であることを検証する。`tests/ci/` 配下の pytest がこのスクリプトと
+ci.yml の静的構造（DAG・aggregate job の 3-mode 分岐・artifact 命名・
+lane selector enum）を検証する。

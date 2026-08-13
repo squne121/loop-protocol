@@ -1,0 +1,52 @@
+{
+  "schema": "RESPONSIVE_CANVAS_MATRIX_CONTRACT_V1",
+  "schema_version": 1,
+  "description": "Frozen expected viewport x DPR x zoom tuple set for Issue #2119 AC4, authored independently of tests/e2e/assist-player-affordance-responsive.spec.ts's own source arrays. tests/ci/test_playwright_lane_contract.py compares the spec's literal RESPONSIVE_VIEWPORTS / RESPONSIVE_DPRS / RESPONSIVE_ZOOMS array VALUES against this fixture (not just element counts), and, when a real responsive-canvas-runtime-evidence.json CI artifact is available under .claude/artifacts/, also compares its observed tuple set against this fixture for exact equality (missing/extra = failure, duplicates = failure) -- PR #2137 human review issuecomment-5273090534 P1 fix: the prior test only asserted array element counts (4x4x4=64) and self-verified against the spec file's own source text.",
+  "expected_viewports": [
+    {
+      "width": 1280,
+      "height": 720,
+      "label": "1280x720"
+    },
+    {
+      "width": 1366,
+      "height": 768,
+      "label": "1366x768"
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "label": "1920x1080"
+    },
+    {
+      "width": 1437,
+      "height": 1365,
+      "label": "1437x1365"
+    }
+  ],
+  "expected_device_scale_factors": [
+    1,
+    1.25,
+    2,
+    0.667
+  ],
+  "expected_zooms": [
+    {
+      "factor": 1,
+      "label": "100%"
+    },
+    {
+      "factor": 1.25,
+      "label": "125%"
+    },
+    {
+      "factor": 1.5,
+      "label": "150%"
+    },
+    {
+      "factor": 2,
+      "label": "200%"
+    }
+  ],
+  "expected_cell_count": 64
+}

@@ -77,13 +77,71 @@ const NESTED_BASE_PATH = normalizeBasePathForE2E(process.env.VITE_BASE_PATH)
 const PREVIEW_ORIGIN = 'http://127.0.0.1:4173'
 const PREVIEW_BASE_URL = PREVIEW_NAMESPACE_LANE ? `${PREVIEW_ORIGIN}${NESTED_BASE_PATH}` : PREVIEW_ORIGIN
 
+// ---------------------------------------------------------------------------
+// Exclusive E2E lane selector (Issue #2119 AC14): `LOOP_E2E_LANE` partitions
+// the standard E2E suite into `core` (everything except the responsive
+// matrix and the dedicated preview-namespace spec) and `responsive` (ONLY
+// `assist-player-affordance-responsive.spec.ts`). `preview-namespace` is
+// recognized as a third enum member for a complete, exclusive contract, but
+// its OWN test-selection semantics remain governed by the pre-existing
+// `LOOP_E2E_PREVIEW_NAMESPACE_LANE` boolean (Out of Scope: this Issue does
+// not change the preview-namespace lane's production-like build/storage
+// isolation contract) -- `LOOP_E2E_LANE` only adds a fail-closed consistency
+// check against that legacy flag so the two selectors can never silently
+// disagree. Unknown values and comma-separated multi-lane values are
+// REJECTED (fail-closed), not silently defaulted.
+// ---------------------------------------------------------------------------
+const RESPONSIVE_MATRIX_SPEC = '**/assist-player-affordance-responsive.spec.ts'
+const VALID_E2E_LANES = ['core', 'responsive', 'preview-namespace'] as const
+type E2ELane = (typeof VALID_E2E_LANES)[number]
+
+function resolveE2ELane(raw: string | undefined): E2ELane {
+  if (raw === undefined || raw === '') return 'core'
+  if (raw.includes(',') || !(VALID_E2E_LANES as readonly string[]).includes(raw)) {
+    throw new Error(
+      `LOOP_E2E_LANE must be exactly one of ${VALID_E2E_LANES.join('|')} `
+        + `(fail-closed on multi-lane or unknown lane values), got: "${raw}"`,
+    )
+  }
+  return raw as E2ELane
+}
+
+const E2E_LANE = resolveE2ELane(process.env.LOOP_E2E_LANE)
+
+if (process.env.LOOP_E2E_LANE !== undefined) {
+  if (E2E_LANE === 'preview-namespace' && !PREVIEW_NAMESPACE_LANE) {
+    throw new Error(
+      'LOOP_E2E_LANE=preview-namespace requires LOOP_E2E_PREVIEW_NAMESPACE_LANE=true (lane selector inconsistency)',
+    )
+  }
+  // `e2e-core` owns preview-namespace-exactly-once (Issue #2119 AC8), so the
+  // `core` + `LOOP_E2E_PREVIEW_NAMESPACE_LANE=true` combination is a
+  // legitimate, expected pairing (the e2e-core CI job runs the standard
+  // core suite AND, in a later step, the dedicated preview-namespace spec
+  // with the same job-level `LOOP_E2E_LANE=core` env var still set) and
+  // must NOT be rejected. Only `responsive` (which has its own dedicated,
+  // mutually exclusive spec selection) combined with the preview-namespace
+  // flag is a genuine inconsistency.
+  if (E2E_LANE === 'responsive' && PREVIEW_NAMESPACE_LANE) {
+    throw new Error(
+      `LOOP_E2E_PREVIEW_NAMESPACE_LANE=true is incompatible with LOOP_E2E_LANE=responsive (lane selector inconsistency)`,
+    )
+  }
+  if (E2E_LANE === 'responsive' && VRT_LANE) {
+    throw new Error('LOOP_E2E_LANE=responsive is incompatible with LOOP_VRT_LANE=true')
+  }
+}
+
 export default defineConfig({
   testDir: './tests/e2e',
-  // Dedicated lane: ONLY the preview-namespace spec. Standard lane: every
-  // other spec, with the preview-namespace spec excluded (never both).
+  // Exclusive lane contract (Issue #2119 AC14): exactly one of
+  // preview-namespace / responsive / core selects tests at a time, never a
+  // combination.
   ...(PREVIEW_NAMESPACE_LANE
     ? { testMatch: [PREVIEW_NAMESPACE_SPEC] }
-    : { testIgnore: [PREVIEW_NAMESPACE_SPEC] }),
+    : E2E_LANE === 'responsive'
+      ? { testMatch: [RESPONSIVE_MATRIX_SPEC] }
+      : { testIgnore: [PREVIEW_NAMESPACE_SPEC, RESPONSIVE_MATRIX_SPEC] }),
   /* Run tests in files in parallel */
   fullyParallel: false,
   /* Fail the build on CI if you accidentally left test.only in the source code. */
@@ -103,7 +161,14 @@ export default defineConfig({
    * id/name contract for the `playwright-report/` path (PR #1517 review
    * fix). */
   reporter: [
-    ['html', { open: 'never', outputFolder: PREVIEW_NAMESPACE_LANE ? 'playwright-report-preview-namespace' : 'playwright-report' }],
+    ['html', {
+      open: 'never',
+      outputFolder: PREVIEW_NAMESPACE_LANE
+        ? 'playwright-report-preview-namespace'
+        : E2E_LANE === 'responsive'
+          ? 'playwright-report-e2e-responsive-matrix'
+          : 'playwright-report',
+    }],
     ['list'],
   ],
   use: {
@@ -126,7 +191,11 @@ export default defineConfig({
   /* Lane-specific outputDir (Issue #1387 / PR #1813 review fix, P1 Blocker
    * 3, see file header) — the preview-namespace lane must never overwrite
    * the standard lane's `test-results/` VRT evidence directory. */
-  outputDir: PREVIEW_NAMESPACE_LANE ? 'test-results-preview-namespace' : 'test-results',
+  outputDir: PREVIEW_NAMESPACE_LANE
+    ? 'test-results-preview-namespace'
+    : E2E_LANE === 'responsive'
+      ? 'test-results-e2e-responsive-matrix'
+      : 'test-results',
 
   projects: [
     {

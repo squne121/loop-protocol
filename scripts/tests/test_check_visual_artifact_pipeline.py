@@ -557,9 +557,17 @@ def test_resolve_capture_directory(template, test_dir, spec_filename, expected):
 # test even if the literal directory names it uses happen to change.
 # ---------------------------------------------------------------------------
 def _parse_output_dir_by_lane(pw_config_text: str) -> tuple[str, str]:
+    # Issue #2119: outputDir is now a 3-way nested ternary
+    # (preview-namespace / responsive / core) instead of the original 2-way
+    # ternary — this regex matches both shapes (DOTALL: the ternary spans
+    # multiple lines) and always returns (preview_dir, standard/core_dir),
+    # ignoring the (optional) responsive branch in between, which is exactly
+    # what both callers below need.
     m = re.search(
-        r"outputDir:\s*PREVIEW_NAMESPACE_LANE\s*\?\s*'([^']+)'\s*:\s*'([^']+)'",
+        r"outputDir:\s*PREVIEW_NAMESPACE_LANE\s*\?\s*'([^']+)'"
+        r"\s*:\s*(?:[A-Za-z0-9_]+\s*===\s*'[^']+'\s*\?\s*'[^']+'\s*:\s*)?'([^']+)'",
         pw_config_text,
+        re.DOTALL,
     )
     assert m, "playwright.config.ts must declare a lane-specific outputDir (Issue #1387 P1 Blocker 3)"
     return m.group(1), m.group(2)
