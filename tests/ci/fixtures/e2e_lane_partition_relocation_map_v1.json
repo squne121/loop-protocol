@@ -1,0 +1,11 @@
+{
+  "schema": "E2E_LANE_PARTITION_RELOCATION_MAP_V1",
+  "description": "Explicit old-path -> new-path relocation map for the specific tests intentionally physically moved by Issue #2119's e2e-core / e2e-responsive-matrix lane split. scripts/ci/verify-e2e-lane-partition.mjs treats an id pair listed here as identity-preserved (a rename, not a drop+add) when reconciling the current e2e-core + e2e-responsive-matrix union against the frozen pre-split baseline (tests/ci/fixtures/e2e_lane_partition_baseline_v1.json). Every other id must match exactly (full file-qualified id, not title-only) -- this map intentionally does NOT weaken identity for any test outside this explicit list, so drops/duplicates/same-title-different-file collisions elsewhere are still detected (PR #2137 human review issuecomment-5273090534 P1 fix).",
+  "relocations": [
+    {
+      "old_id": "assist-player-affordance.spec.ts::responsive canvas preserves the logical arena, frozen combat positions, backing store, and pointer mapping across viewport, DPR, and zoom",
+      "new_id": "assist-player-affordance-responsive.spec.ts::responsive canvas preserves the logical arena, frozen combat positions, backing store, and pointer mapping across viewport, DPR, and zoom",
+      "reason": "Issue #2119: physically split out of assist-player-affordance.spec.ts into its own dedicated e2e-responsive-matrix provider spec; title text unchanged."
+    }
+  ]
+}
