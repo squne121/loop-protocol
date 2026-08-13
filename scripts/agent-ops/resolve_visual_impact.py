@@ -5,12 +5,24 @@ Orchestration + policy layer:
 
 1. Registry (docs/dev/visual-surfaces.yml) load/validate/diff and
    TypeScript-compiler-API-backed affected-surface resolution (delegates the
-   actual static import-graph walk to resolve_visual_impact.mjs -- this
-   module never re-implements TypeScript/Vite import semantics with regex).
+   actual static import-graph walk to resolve_visual_impact.mjs -- the
+   CANDIDATE/producer-side resolve() path here never re-implements
+   TypeScript/Vite import semantics with regex).
 2. VISUAL_IMPACT_DECLARATION_V1 parsing (untrusted PR body input).
 3. VISUAL_IMPACT_DECISION_V1 generation (trusted CI observation) and
    disposition evaluation (verified_unchanged / baseline_changed / waived),
    including trusted-base-branch CODEOWNERS-derived waiver authority.
+4. Issue #2099: a SEPARATE, narrower, base-locked TRUSTED-side static
+   import resolver (`resolve_trusted_transitive_graph()` /
+   `TrustedGraphWalker`) that IS a deliberate regex-based
+   specifier-extraction walker -- unlike (1) above, it never invokes the
+   TypeScript compiler API or Node, and never checks out/materializes
+   candidate PR head content to disk; it reads candidate head file
+   content exclusively via `git ls-tree`/`git cat-file` object reads. This
+   is intentional (Issue #2099 In Scope: "base-locked existing
+   static-import resolver semantics", not "TypeScript compiler import
+   graph") and does not contradict (1)'s "never re-implements ... with
+   regex" note, which describes only the candidate-side `resolve()` path.
 
 Both the registry/resolver Allowed Path (`resolve_visual_impact.py`) and the
 policy-evaluator responsibility described in Issue #2019's In Scope B/C are
@@ -25,11 +37,14 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import posixpath
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -301,7 +316,21 @@ MJS_RESULT_SCHEMA_NAME = "RESOLVE_VISUAL_IMPACT_MJS_RESULT_V1"
 MJS_EXPECTED_RESOLVER_VERSION = "1"
 
 
-def run_mjs(mjs_path: Path, request: dict[str, Any], node_bin: str = "node") -> dict[str, Any]:
+# Issue #2099 AC4 (Current Validated Scope): `run_mjs()` previously had no
+# wall-clock upper bound on the Node subprocess it spawns -- a candidate PR
+# whose source triggers pathological TS-compiler-API behaviour (or simply
+# hangs) could block the calling CI job indefinitely. Bounded and always
+# surfaced as a resolver error (fail-closed), never silently treated as "no
+# impact".
+MJS_SUBPROCESS_TIMEOUT_SECONDS = 60
+
+
+def run_mjs(
+    mjs_path: Path,
+    request: dict[str, Any],
+    node_bin: str = "node",
+    timeout_seconds: float = MJS_SUBPROCESS_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     """PR #2045 OWNER fix_delta P0-2: a non-zero mjs exit code must always be
     surfaced as a resolver error, even when stdout happens to parse as valid
     JSON (the mjs script sets `process.exitCode = 1` on per-surface
@@ -309,13 +338,21 @@ def run_mjs(mjs_path: Path, request: dict[str, Any], node_bin: str = "node") -> 
     Silently trusting the JSON body regardless of exit code let a crashed
     resolver invocation degrade to an empty/partial `surfaces` map that was
     then treated as "fully resolved, no impact"."""
-    proc = subprocess.run(
-        [node_bin, str(mjs_path)],
-        input=json.dumps(request),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [node_bin, str(mjs_path)],
+            input=json.dumps(request),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Issue #2099 AC4: a wall-clock bound violation is a resolver error,
+        # never a silent partial/empty result.
+        raise RegistryError(
+            f"resolve_visual_impact.mjs exceeded wall-clock timeout ({timeout_seconds}s): {exc}"
+        ) from exc
     if not proc.stdout.strip():
         raise RegistryError(
             f"resolve_visual_impact.mjs produced no output (exit {proc.returncode}, stderr: {proc.stderr})"
@@ -1375,32 +1412,613 @@ class TrustedRederivation:
     expected_head_registry_blob_sha: str | None = None
     base_registry_doc: dict[str, Any] | None = None
     head_registry_doc: dict[str, Any] | None = None
+    # Issue #2099 AC1: the candidate PR's live head SHA, as a Git commit
+    # object the caller has ALREADY fetched (`git fetch --depth=1 origin
+    # <sha>`) -- never a working-tree checkout. When set,
+    # `resolve_trusted_minimum()` additionally walks the TS/CSS static
+    # import graph reachable from each surface's registered producer entry
+    # points via `git ls-tree`/`git cat-file` object reads only (see
+    # `resolve_trusted_transitive_graph()` below). `None` means the caller
+    # could not supply this (e.g. unit tests with no real git objects, or a
+    # workflow invocation predating this capability) -- the coarse 5-signal
+    # check still runs; this is a scoped, non-fatal omission of the
+    # transitive-only detection, matching `resolve_trusted_minimum()`'s
+    # existing "omits step 4" docstring contract for the non-git-backed path.
+    candidate_head_ref: str | None = None
+    # Issue #2099: the local Git repository to run `git ls-tree`/`git
+    # cat-file`/`git show` against for the above. Test-only override --
+    # production callers always leave this `None` (defaults to this
+    # module's own `REPO_ROOT`, i.e. the checked-out base branch that
+    # already has `candidate_head_ref` fetched as an object).
+    repo_root: Path | None = None
+
+
+# --- Issue #2099 AC1/AC2 (trusted-side TS import graph transitive --------
+# reachability): a base-locked, read-only static import resolver that walks
+# the import/export/CSS-@import/CSS-url()/`new URL(...)` graph of the
+# CANDIDATE PR head using ONLY `git ls-tree`/`git cat-file` object reads
+# against a commit the caller already fetched with `git fetch --depth=1`.
+# It NEVER checks out, materializes to disk, or executes a single byte of
+# candidate PR head code -- every byte read is parsed as inert text (regex
+# specifier extraction only, never `eval`/`import()`/`require()`/any
+# interpreter). This is deliberately NOT the TypeScript-compiler-API-backed
+# resolver in `resolve_visual_impact.mjs` (that resolver requires a Node
+# `typescript` package install and, more importantly, is only ever invoked
+# by the untrusted PRODUCER job against an already-checked-out working
+# tree) -- this is a narrower, independently-implemented "base-locked
+# existing static-import resolver" (Issue #2099 In Scope) that intentionally
+# does not understand tsconfig `paths`/`baseUrl`, Vite `resolve.alias`, or
+# package.json `imports`/`exports` (same documented limitation as the
+# producer-side resolver).
+
+
+class GitReadOutcome(str, Enum):
+    """Issue #2099 AC7: `git show <ref>:<path>` / `git cat-file` failure
+    taxonomy. `MISSING` is the normal "this path does not exist at this
+    ref" case (fail-open is safe: nothing to read). `PLUMBING_ERROR` is any
+    OTHER git failure (network, shallow-fetch missing object, corrupted
+    object, malformed ref) and must never be treated the same as `MISSING`
+    -- doing so previously let a genuine plumbing failure silently degrade
+    to "file doesn't exist" (`.github/workflows/visual-impact-trusted-consumer.yml`
+    pre-#2099 `git show ... 2>/dev/null || rm -f ...` pattern)."""
+
+    OK = "ok"
+    MISSING = "missing"
+    PLUMBING_ERROR = "plumbing_error"
+
+
+_GIT_MISSING_PATH_PATTERNS = (
+    "does not exist in",
+    "exists on disk, but not in",
+    "Invalid object name",
+)
+
+
+def read_git_blob_at_ref(
+    repo_root: Path, ref: str, path: str, *, timeout_seconds: float | None = None
+) -> tuple[GitReadOutcome, bytes | None, str]:
+    """Issue #2099 AC7: read `<path>` as it exists at commit `<ref>` via
+    `git show <ref>:<path>`, classifying the result into the three-way
+    `GitReadOutcome` above instead of collapsing "file missing" and "git
+    plumbing failure" into a single branch.
+
+    `git show <ref>:<path>`'s own stderr text for an UNRESOLVABLE `ref`
+    (never fetched, malformed, or otherwise not a valid object) can be
+    indistinguishable from its "path missing at this (valid) ref" message
+    when `path` happens to already exist in the caller's own working tree
+    (git substitutes a "exists on disk, but not in '<ref>'" message either
+    way) -- so `ref` resolvability is checked FIRST and independently via
+    `git cat-file -e <ref>^{commit}`, before ever inspecting the `git show`
+    stderr text for path-missing classification. Returns
+    `(outcome, content_or_None, diagnostic_message)`. `timeout_seconds`
+    (PR #2144 review fix_delta P1-3) bounds each subprocess call -- a
+    stalled `git cat-file -e`/`git show` is classified as `PLUMBING_ERROR`
+    (a genuine git failure), never an unbounded hang."""
+    effective_timeout = timeout_seconds if timeout_seconds is not None else TRUSTED_TRANSITIVE_MAX_WALL_SECONDS
+    try:
+        ref_check = subprocess.run(
+            ["git", "-C", str(repo_root), "cat-file", "-e", f"{ref}^{{commit}}"],
+            capture_output=True,
+            check=False,
+            timeout=effective_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            GitReadOutcome.PLUMBING_ERROR,
+            None,
+            f"git cat-file -e timed out after {effective_timeout}s resolving ref {ref!r}",
+        )
+    if ref_check.returncode != 0:
+        return (
+            GitReadOutcome.PLUMBING_ERROR,
+            None,
+            f"ref not resolvable as a commit object: {ref_check.stderr.decode('utf-8', 'replace')}",
+        )
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{ref}:{path}"],
+            capture_output=True,
+            check=False,
+            timeout=effective_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            GitReadOutcome.PLUMBING_ERROR,
+            None,
+            f"git show timed out after {effective_timeout}s reading {path!r} at {ref!r}",
+        )
+    if proc.returncode == 0:
+        return GitReadOutcome.OK, proc.stdout, ""
+    stderr_text = proc.stderr.decode("utf-8", "replace")
+    if any(pattern in stderr_text for pattern in _GIT_MISSING_PATH_PATTERNS):
+        return GitReadOutcome.MISSING, None, stderr_text
+    return GitReadOutcome.PLUMBING_ERROR, None, stderr_text
+
+
+@dataclass
+class GitTreeEntry:
+    mode: str
+    obj_type: str
+    blob_sha: str
+    size: int
+    path: str
+
+
+class TrustedTransitiveResourceBoundExceeded(RegistryError):
+    """Issue #2099 AC4: raised (never silently swallowed into a truncated
+    partial result) when a per-file byte / total byte / file count /
+    import-hop depth / wall-clock bound is exceeded while walking the
+    candidate head's static import graph."""
+
+
+class TrustedGitPlumbingError(RegistryError):
+    """Issue #2099 AC7 (PR #2144 review fix_delta P1-4): raised when a `git
+    ls-tree` / `git cat-file blob` call in the trusted transitive graph
+    walk fails for a GENUINE git plumbing reason (network hiccup, shallow
+    fetch never fetched the object, corrupted object, unresolvable ref) --
+    deliberately a DIFFERENT exception type from
+    `TrustedTransitiveResourceBoundExceeded`, so `verify_trusted_artifact()`
+    can report `trusted_transitive_git_plumbing_error:*` as a distinct
+    reason code, never conflated with a resource-bound violation (Issue
+    #2099 AC7 requires "missing / resource exhaustion / git plumbing
+    failure" to stay distinct)."""
+
+
+TRUSTED_TRANSITIVE_MAX_FILES = 4000
+TRUSTED_TRANSITIVE_MAX_FILE_BYTES = 2_000_000
+TRUSTED_TRANSITIVE_MAX_TOTAL_BYTES = 40_000_000
+TRUSTED_TRANSITIVE_MAX_GRAPH_DEPTH = 40
+TRUSTED_TRANSITIVE_MAX_WALL_SECONDS = 20.0
+
+TRUSTED_TRANSITIVE_ASSET_EXTENSIONS = frozenset(
+    {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".mp3", ".wav",
+    }
+)
+TRUSTED_TRANSITIVE_CANDIDATE_EXTENSIONS = ["", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs"]
+TRUSTED_TRANSITIVE_INDEX_SUFFIXES = ["/index.ts", "/index.tsx"]
+
+_TRUSTED_FROM_SPEC_RE = re.compile(r"""from\s+['"]([^'"]+)['"]""")
+_TRUSTED_BARE_IMPORT_RE = re.compile(r"""^\s*import\s+['"]([^'"]+)['"]""", re.MULTILINE)
+_TRUSTED_DYNAMIC_IMPORT_RE = re.compile(r"""\bimport\s*\(\s*([^)]*?)\s*\)""")
+_TRUSTED_STRING_LITERAL_RE = re.compile(r"""^['"]([^'"]+)['"]$""")
+_TRUSTED_IMPORT_META_GLOB_RE = re.compile(r"""import\.meta\.glob\s*\(""")
+_TRUSTED_NEW_URL_RE = re.compile(r"""new\s+URL\s*\(\s*['"]([^'"]+)['"]\s*,[^)]*import\.meta\.url[^)]*\)""")
+_TRUSTED_CSS_IMPORT_RE = re.compile(r"""@import\s+(?:url\()?['"]([^'"]+)['"]\)?""")
+_TRUSTED_CSS_URL_RE = re.compile(r"""url\(\s*(['"]?)([^'")]+)\1\s*\)""")
+
+
+def _git_subprocess_timeout(deadline: float) -> float:
+    """Issue #2099 AC4 (PR #2144 review fix_delta P1-3): every `git`
+    subprocess.run() call inside the trusted transitive graph walk is
+    bounded by a REMAINING-time timeout derived from one shared absolute
+    wall-clock `deadline`, so a single stalled `git` process can never
+    block past `TRUSTED_TRANSITIVE_MAX_WALL_SECONDS` regardless of how many
+    subprocess calls preceded it -- `_check_bounds()`'s own deadline check
+    only fires when control RETURNS to Python between subprocess calls, so
+    it alone cannot bound a single stalled call."""
+    return max(0.001, deadline - time.monotonic())
+
+
+def git_ls_tree(
+    repo_root: Path, ref: str, *, max_entries: int, timeout_seconds: float = TRUSTED_TRANSITIVE_MAX_WALL_SECONDS
+) -> tuple[dict[str, GitTreeEntry], list[str]]:
+    """Issue #2099 AC1/AC4: enumerate every path/blob-sha/size/mode at
+    commit `ref` in ONE `git ls-tree -r -z -l` call (metadata only -- no
+    blob content is read here). Bounded by `max_entries` (AC4 file-count
+    resource bound); a plumbing failure (e.g. `ref` was never fetched
+    locally) is reported as an error, never a silently-empty tree.
+    `timeout_seconds` (PR #2144 review fix_delta P1-3) bounds the
+    subprocess call itself -- a stalled `git ls-tree` is converted into a
+    `resource_bound_exceeded:wall_time` error, never an unbounded hang."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-tree", "-r", "-z", "-l", ref],
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return {}, ["resource_bound_exceeded:wall_time:ls_tree"]
+    if proc.returncode != 0:
+        return {}, [f"git_plumbing_error:ls_tree:{proc.stderr.decode('utf-8', 'replace')}"]
+    entries: dict[str, GitTreeEntry] = {}
+    for raw in proc.stdout.split(b"\x00"):
+        if not raw:
+            continue
+        text_line = raw.decode("utf-8", "replace")
+        meta, _, path = text_line.partition("	")
+        parts = meta.split()
+        if len(parts) != 4:
+            continue
+        mode, obj_type, blob_sha, size_str = parts
+        size = 0 if size_str == "-" else int(size_str)
+        entries[path] = GitTreeEntry(mode=mode, obj_type=obj_type, blob_sha=blob_sha, size=size, path=path)
+        if len(entries) > max_entries:
+            return {}, ["resource_bound_exceeded:file_count"]
+    return entries, []
+
+
+def _trusted_is_relative_specifier(spec: str) -> bool:
+    return spec.startswith("./") or spec.startswith("../")
+
+
+def _trusted_is_absolute_specifier(spec: str) -> bool:
+    return spec.startswith("/")
+
+
+def _trusted_is_virtual_specifier(spec: str) -> bool:
+    return bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:", spec)) and not spec.startswith("node:")
+
+
+def _trusted_is_css_relative_specifier(spec: str) -> bool:
+    """Issue #2099 AC2 (PR #2144 review fix_delta P1-2): CSS `url()` /
+    `@import` relative-URL classification is DELIBERATELY different from
+    the JS/TS module-specifier classification above
+    (`_trusted_is_relative_specifier()`, which only accepts an explicit
+    `./`/`../` prefix -- correct for JS/TS, where a bare specifier means a
+    `node_modules` package). Per the CSS spec, a bare `bg.png` or
+    `theme.css` (no `./` prefix) IS a valid relative URL resolved against
+    the containing stylesheet -- treating it as an external/bare import
+    (as the JS classifier would) causes it to silently vanish from the
+    graph instead of being resolved or explicitly rejected. Returns `True`
+    for any path-like target that is not a scheme-qualified URL (`data:`,
+    `http:`, `https:`, or any other `scheme:` virtual specifier) and not
+    root-absolute (`/...`, handled separately as `absolute_specifier_rejected`)."""
+    if spec.startswith(("data:", "http://", "https://")):
+        return False
+    if _trusted_is_absolute_specifier(spec):
+        return False
+    if _trusted_is_virtual_specifier(spec):
+        return False
+    return True
+
+
+def _trusted_resolve_relative_path(containing_path: str, spec: str) -> str | None:
+    """Issue #2099 AC2/AC3: POSIX-join + normalize; returns `None` (reject)
+    when the result would escape the repo root (`..` traversal) or is
+    absolute -- this is the single confinement chokepoint every specifier
+    kind below (module import/export, CSS `@import`/`url()`, `new URL(...)`)
+    is routed through."""
+    containing_dir = posixpath.dirname(containing_path)
+    joined = posixpath.normpath(posixpath.join(containing_dir, spec))
+    if joined == ".." or joined.startswith("../") or joined.startswith("/"):
+        return None
+    return joined
+
+
+def _trusted_resolve_file_candidate(entries: dict[str, GitTreeEntry], no_ext_path: str) -> str | None:
+    for ext in TRUSTED_TRANSITIVE_CANDIDATE_EXTENSIONS:
+        candidate = no_ext_path + ext
+        entry = entries.get(candidate)
+        if entry is not None and entry.obj_type == "blob" and entry.mode != "120000":
+            return candidate
+    for suffix in TRUSTED_TRANSITIVE_INDEX_SUFFIXES:
+        candidate = no_ext_path + suffix
+        entry = entries.get(candidate)
+        if entry is not None and entry.obj_type == "blob" and entry.mode != "120000":
+            return candidate
+    return None
+
+
+def _trusted_find_symlink_conflict(entries: dict[str, GitTreeEntry], no_ext_path: str) -> str | None:
+    """Issue #2099 AC3: when extension/index probing (above) finds no
+    regular-file candidate, check whether a symlink entry (git mode
+    `120000`) exists under one of the SAME candidate names -- so a
+    specifier that would otherwise silently fall through to
+    `unresolvable_static_import` is instead correctly reported as
+    `symlink_entry_rejected` (never silently followed, never conflated with
+    "the file just doesn't exist")."""
+    for ext in TRUSTED_TRANSITIVE_CANDIDATE_EXTENSIONS:
+        candidate = no_ext_path + ext
+        entry = entries.get(candidate)
+        if entry is not None and entry.mode == "120000":
+            return candidate
+    for suffix in TRUSTED_TRANSITIVE_INDEX_SUFFIXES:
+        candidate = no_ext_path + suffix
+        entry = entries.get(candidate)
+        if entry is not None and entry.mode == "120000":
+            return candidate
+    return None
+
+
+class TrustedGraphWalker:
+    """Issue #2099 AC1/AC2/AC4: BFS-style walker over the candidate head's
+    static import graph, backed entirely by `entries` (a `git ls-tree`
+    metadata map) and on-demand `git cat-file blob <sha>` content reads.
+    Every specifier is routed through `_trusted_resolve_relative_path()`
+    (single confined resolver, AC2) and every resource bound raises
+    `TrustedTransitiveResourceBoundExceeded` (fail-closed, AC4) instead of
+    silently truncating the walk."""
+
+    def __init__(self, entries: dict[str, GitTreeEntry], repo_root: Path, deadline: float) -> None:
+        self.entries = entries
+        self.repo_root = repo_root
+        self.deadline = deadline
+        self.visited: set[str] = set()
+        self.reachable: set[str] = set()
+        self.unknown_impact: list[dict[str, str]] = []
+        self.total_bytes = 0
+        self._blob_cache: dict[str, bytes] = {}
+
+    def _check_bounds(self) -> None:
+        if time.monotonic() > self.deadline:
+            raise TrustedTransitiveResourceBoundExceeded("wall_time")
+        if len(self.visited) > TRUSTED_TRANSITIVE_MAX_FILES:
+            raise TrustedTransitiveResourceBoundExceeded("file_count")
+
+    def _read_blob(self, path: str, entry: GitTreeEntry) -> bytes:
+        if entry.size > TRUSTED_TRANSITIVE_MAX_FILE_BYTES:
+            raise TrustedTransitiveResourceBoundExceeded("per_file_bytes")
+        self.total_bytes += entry.size
+        if self.total_bytes > TRUSTED_TRANSITIVE_MAX_TOTAL_BYTES:
+            raise TrustedTransitiveResourceBoundExceeded("total_bytes")
+        cached = self._blob_cache.get(entry.blob_sha)
+        if cached is not None:
+            return cached
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(self.repo_root), "cat-file", "blob", entry.blob_sha],
+                capture_output=True,
+                check=False,
+                timeout=_git_subprocess_timeout(self.deadline),
+            )
+        except subprocess.TimeoutExpired as exc:
+            # PR #2144 review fix_delta P1-3: a stalled `git cat-file blob`
+            # is a wall-clock resource-bound violation, never an unbounded
+            # hang past `TRUSTED_TRANSITIVE_MAX_WALL_SECONDS`.
+            raise TrustedTransitiveResourceBoundExceeded(f"wall_time:cat_file:{path}") from exc
+        if proc.returncode != 0:
+            raise TrustedGitPlumbingError(f"cat_file:{path}:{proc.stderr.decode('utf-8', 'replace')}")
+        self._blob_cache[entry.blob_sha] = proc.stdout
+        return proc.stdout
+
+    def _mark_asset(self, path: str) -> None:
+        self.visited.add(path)
+        self.reachable.add(path)
+
+    def visit(self, path: str, depth: int) -> None:
+        self._check_bounds()
+        if depth > TRUSTED_TRANSITIVE_MAX_GRAPH_DEPTH:
+            raise TrustedTransitiveResourceBoundExceeded("max_graph_depth")
+        if path in self.visited:
+            return
+        self.visited.add(path)
+        self.reachable.add(path)
+        entry = self.entries.get(path)
+        if entry is None or entry.mode == "120000":
+            return
+        raw = self._read_blob(path, entry)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            self.unknown_impact.append({"file": path, "kind": "binary_or_non_utf8", "detail": path})
+            return
+        ext = posixpath.splitext(path)[1].lower()
+        if ext == ".css":
+            self._visit_css_text(path, text, depth)
+        else:
+            self._visit_module_text(path, text, depth)
+
+    def _dispatch_specifier(self, containing_path: str, spec: str, depth: int) -> None:
+        base = spec
+        suffix: str | None = None
+        if base.endswith("?url"):
+            base, suffix = base[:-4], "url"
+        elif base.endswith("?raw"):
+            base, suffix = base[:-4], "raw"
+
+        if _trusted_is_virtual_specifier(base):
+            self.unknown_impact.append({"file": containing_path, "kind": "virtual_module", "detail": spec})
+            return
+        if _trusted_is_absolute_specifier(base):
+            # Issue #2099 AC2/AC3: unlike `resolve_visual_impact.mjs`'s
+            # `isRelativeSpecifier()`, a leading `/` is NEVER treated as
+            # relative here -- reject outright rather than resolve it.
+            self.unknown_impact.append({"file": containing_path, "kind": "absolute_specifier_rejected", "detail": spec})
+            return
+        if not _trusted_is_relative_specifier(base):
+            return  # bare/package import (node_modules) -- external, not an impact source.
+
+        resolved_no_ext = _trusted_resolve_relative_path(containing_path, base)
+        if resolved_no_ext is None:
+            self.unknown_impact.append({"file": containing_path, "kind": "path_escape_rejected", "detail": spec})
+            return
+
+        target_entry = self.entries.get(resolved_no_ext)
+        if target_entry is not None and target_entry.mode == "120000":
+            self.unknown_impact.append({"file": containing_path, "kind": "symlink_entry_rejected", "detail": spec})
+            return
+
+        ext = posixpath.splitext(base)[1].lower()
+
+        if suffix:
+            candidate = resolved_no_ext if resolved_no_ext in self.entries else _trusted_resolve_file_candidate(
+                self.entries, resolved_no_ext
+            )
+            if candidate is None:
+                self.unknown_impact.append(
+                    {"file": containing_path, "kind": "unresolvable_static_import", "detail": spec}
+                )
+                return
+            self._mark_asset(candidate)
+            return
+
+        if ext == ".css":
+            entry = self.entries.get(resolved_no_ext)
+            if entry is not None and entry.mode != "120000":
+                self.visit(resolved_no_ext, depth + 1)
+            else:
+                self.unknown_impact.append(
+                    {"file": containing_path, "kind": "unresolvable_static_import", "detail": spec}
+                )
+            return
+
+        if ext in TRUSTED_TRANSITIVE_ASSET_EXTENSIONS:
+            entry = self.entries.get(resolved_no_ext)
+            if entry is not None and entry.mode != "120000":
+                self._mark_asset(resolved_no_ext)
+            else:
+                self.unknown_impact.append(
+                    {"file": containing_path, "kind": "unresolvable_static_import", "detail": spec}
+                )
+            return
+
+        candidate = _trusted_resolve_file_candidate(self.entries, resolved_no_ext)
+        if candidate is None:
+            symlink_conflict = _trusted_find_symlink_conflict(self.entries, resolved_no_ext)
+            if symlink_conflict is not None:
+                self.unknown_impact.append(
+                    {"file": containing_path, "kind": "symlink_entry_rejected", "detail": spec}
+                )
+            else:
+                self.unknown_impact.append(
+                    {"file": containing_path, "kind": "unresolvable_static_import", "detail": spec}
+                )
+            return
+        self.visit(candidate, depth + 1)
+
+    def _visit_module_text(self, path: str, text: str, depth: int) -> None:
+        for m in _TRUSTED_FROM_SPEC_RE.finditer(text):
+            self._dispatch_specifier(path, m.group(1), depth)
+        for m in _TRUSTED_BARE_IMPORT_RE.finditer(text):
+            self._dispatch_specifier(path, m.group(1), depth)
+        for m in _TRUSTED_NEW_URL_RE.finditer(text):
+            self._dispatch_specifier(path, m.group(1), depth)
+        for _m in _TRUSTED_IMPORT_META_GLOB_RE.finditer(text):
+            self.unknown_impact.append({"file": path, "kind": "import_meta_glob", "detail": path})
+        for m in _TRUSTED_DYNAMIC_IMPORT_RE.finditer(text):
+            arg = m.group(1).strip()
+            literal_match = _TRUSTED_STRING_LITERAL_RE.match(arg)
+            if literal_match:
+                self._dispatch_specifier(path, literal_match.group(1), depth)
+            else:
+                self.unknown_impact.append(
+                    {"file": path, "kind": "dynamic_variable_import", "detail": arg or "import(...)"}
+                )
+
+    def _visit_css_text(self, path: str, text: str, depth: int) -> None:
+        # PR #2144 review fix_delta P1-1/P1-2: CSS `@import`/`url()`
+        # targets are routed through `_trusted_is_css_relative_specifier()`
+        # (bare `theme.css`/`bg.png`, not just `./`-prefixed, is a valid
+        # CSS relative URL -- P1-2) and normalized to a `./`-prefixed spec
+        # before reaching the shared confined resolver / `_dispatch_specifier()`
+        # (which otherwise treats a bare specifier as an external
+        # bare/package import, the JS/TS semantics). A target that fails to
+        # resolve at the candidate head (e.g. a previously-reachable CSS
+        # asset that this PR deletes) is reported as `unresolvable_static_import`
+        # -- fail-closed, never silently dropped from the graph (P1-1).
+        for m in _TRUSTED_CSS_IMPORT_RE.finditer(text):
+            spec = m.group(1)
+            if _trusted_is_css_relative_specifier(spec):
+                normalized = spec if _trusted_is_relative_specifier(spec) else f"./{spec}"
+                self._dispatch_specifier(path, normalized, depth)
+            elif _trusted_is_absolute_specifier(spec):
+                self.unknown_impact.append({"file": path, "kind": "absolute_specifier_rejected", "detail": spec})
+            # else: data:/http(s):/other scheme-qualified @import target --
+            # external, not a local impact source.
+        for m in _TRUSTED_CSS_URL_RE.finditer(text):
+            spec = m.group(2)
+            if spec.startswith(("data:", "http://", "https://", "#")):
+                continue
+            spec = spec.split("#")[0].split("?")[0]
+            if _trusted_is_css_relative_specifier(spec):
+                normalized = spec if _trusted_is_relative_specifier(spec) else f"./{spec}"
+                resolved = _trusted_resolve_relative_path(path, normalized)
+                if resolved is None:
+                    self.unknown_impact.append({"file": path, "kind": "path_escape_rejected", "detail": spec})
+                    continue
+                entry = self.entries.get(resolved)
+                if entry is not None and entry.mode == "120000":
+                    self.unknown_impact.append({"file": path, "kind": "symlink_entry_rejected", "detail": spec})
+                    continue
+                if entry is not None:
+                    self._mark_asset(resolved)
+                else:
+                    self.unknown_impact.append({"file": path, "kind": "unresolvable_static_import", "detail": spec})
+            elif _trusted_is_absolute_specifier(spec):
+                self.unknown_impact.append({"file": path, "kind": "absolute_specifier_rejected", "detail": spec})
+
+
+def resolve_trusted_transitive_graph(
+    entry_paths: list[str],
+    entries: dict[str, GitTreeEntry],
+    repo_root: Path,
+    *,
+    max_wall_seconds: float = TRUSTED_TRANSITIVE_MAX_WALL_SECONDS,
+    deadline: float | None = None,
+) -> tuple[set[str], list[dict[str, str]]]:
+    """Issue #2099 AC1/AC2: walk the static import graph reachable from
+    `entry_paths` (a surface's registered producer modules/styles/assets)
+    at the candidate head represented by `entries`, entirely via Git object
+    reads. Raises `TrustedTransitiveResourceBoundExceeded` (AC4, fail
+    closed) rather than returning a silently-truncated partial graph.
+
+    `deadline` (PR #2144 review fix_delta P1-3), when supplied, is an
+    ALREADY-COMPUTED absolute `time.monotonic()` deadline shared across
+    the entire verification (e.g. across every registered surface's walk
+    in `resolve_trusted_minimum()`) -- this prevents the resource budget
+    from silently resetting per-surface. When omitted (e.g. direct-call
+    unit tests), a fresh deadline is computed from `max_wall_seconds`,
+    matching the prior single-call behaviour."""
+    effective_deadline = deadline if deadline is not None else time.monotonic() + max_wall_seconds
+    walker = TrustedGraphWalker(entries, repo_root, effective_deadline)
+    for entry_path in entry_paths:
+        joined = posixpath.normpath(entry_path)
+        if joined == ".." or joined.startswith("../") or joined.startswith("/"):
+            walker.unknown_impact.append({"file": entry_path, "kind": "path_escape_rejected", "detail": entry_path})
+            continue
+        entry = entries.get(joined)
+        if entry is None:
+            continue  # not present at candidate head -- nothing to walk.
+        if entry.mode == "120000":
+            walker.unknown_impact.append({"file": joined, "kind": "symlink_entry_rejected", "detail": joined})
+            continue
+        walker.visit(joined, 0)
+    return walker.reachable, walker.unknown_impact
 
 
 def resolve_trusted_minimum(
     changed_paths: list[str],
     base_doc: dict[str, Any],
     head_doc: dict[str, Any],
+    *,
+    candidate_head_ref: str | None = None,
+    repo_root: Path | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Issue #2091 AC1/AC2: a COARSE, independently-computable subset of
-    `resolve()`'s affected-surface logic that the trusted-consumer workflow
-    can run WITHOUT executing any candidate-PR-head code (no TS-compiler
-    transitive import-graph walk via `resolve_visual_impact.mjs`/Node --
-    that step alone would require reading/parsing PR-head source files,
-    which this trust boundary intentionally never does).
+    """Issue #2091 AC1/AC2 + Issue #2099 AC1: an independently-computable
+    subset of `resolve()`'s affected-surface logic that the trusted-consumer
+    workflow can run WITHOUT checking out or executing any candidate-PR-head
+    code.
 
     Reuses steps 0/1/2/3/5 of `resolve()` verbatim (meta policy paths /
     global invalidators / direct producer+contract paths / registry-union
     mapping deletion / coverage-root boundary) against TRUSTED-side
     (base_sha/head_sha) registries and a TRUSTED-side changed-path set.
-    Deliberately omits step 4 (mjs transitive reachability) -- a path only
-    reachable via transitive import (never a direct producer/contract path,
-    never under any `coverage_roots` pattern) is NOT caught by this coarse
-    check; this is a scoped, documented limitation (see Issue #2091 Notes
-    for Reviewer / PR follow-up), not a silent gap.
+
+    When `candidate_head_ref` is supplied (a candidate PR head commit the
+    caller has ALREADY fetched as a Git object via `git fetch --depth=1`,
+    never checked out to a working tree), this additionally runs a step 4:
+    a base-locked, read-only static-import-graph walk
+    (`resolve_trusted_transitive_graph()`) over that fetched commit's Git
+    objects (`git ls-tree`/`git cat-file` reads only -- never TypeScript's
+    own compiler API, never `resolve_visual_impact.mjs`/Node, and never any
+    disk materialization of candidate PR head content). This is
+    deliberately a DIFFERENT, narrower resolver than the TS-compiler-API
+    one in `resolve_visual_impact.mjs` (see that walker's module docstring)
+    -- a "base-locked existing static-import resolver", not a TypeScript
+    compiler import graph (Issue #2099 In Scope). When `candidate_head_ref`
+    is `None` (e.g. unit tests with no real git objects, or a caller that
+    predates this capability), step 4 is skipped entirely -- a scoped,
+    documented omission, never a silent gap in the CALLER's overall
+    fail-closed posture, because `verify_trusted_artifact()` still requires
+    every OTHER signal to pass.
 
     Returns `(affected_surface_ids, unmapped_visual_candidates)` -- same
-    shapes as the corresponding parts of `ResolveResult`."""
+    shapes as the corresponding parts of `ResolveResult`. Raises
+    `TrustedTransitiveResourceBoundExceeded` (Issue #2099 AC4) if step 4 is
+    active and exceeds a resource bound -- the caller must treat this as an
+    unconditional fail-closed verdict, never a silent partial result."""
     union_surfaces: dict[str, Any] = dict(head_doc.get("surfaces", {}) or {})
     for surface_id, base_def in (base_doc.get("surfaces", {}) or {}).items():
         if surface_id not in union_surfaces:
@@ -1438,6 +2056,45 @@ def resolve_trusted_minimum(
     for surface_def in union_surfaces.values():
         all_producer_paths |= collect_producer_paths(surface_def)
         all_producer_paths |= collect_contract_paths(surface_def)
+
+    if candidate_head_ref is not None:
+        root = repo_root if repo_root is not None else REPO_ROOT
+        # PR #2144 review fix_delta P1-3: ONE absolute deadline shared
+        # across `git_ls_tree()` and every surface's subsequent graph walk
+        # below -- never a fresh per-surface deadline (which would let the
+        # resource budget silently reset/amplify across many registered
+        # surfaces).
+        transitive_deadline = time.monotonic() + TRUSTED_TRANSITIVE_MAX_WALL_SECONDS
+        entries, ls_tree_errors = git_ls_tree(
+            root,
+            candidate_head_ref,
+            max_entries=TRUSTED_TRANSITIVE_MAX_FILES,
+            timeout_seconds=_git_subprocess_timeout(transitive_deadline),
+        )
+        if ls_tree_errors:
+            # PR #2144 review fix_delta P1-4: a genuine git plumbing
+            # failure (`git_plumbing_error:ls_tree:...`) must never be
+            # conflated with a resource-bound violation
+            # (`resource_bound_exceeded:...`) -- Issue #2099 AC7 requires
+            # "missing / resource exhaustion / git plumbing failure" to
+            # stay distinct all the way to the final verdict's reason code.
+            joined_errors = ";".join(ls_tree_errors)
+            if any(err.startswith("resource_bound_exceeded:") for err in ls_tree_errors):
+                raise TrustedTransitiveResourceBoundExceeded(joined_errors)
+            raise TrustedGitPlumbingError(f"ls_tree:{joined_errors}")
+        request = build_mjs_request(root, union_surfaces)
+        for surface_id, surface_entries in request["surfaces"].items():
+            entry_paths: list[str] = []
+            for key in ("modules", "styles", "assets", "config"):
+                entry_paths.extend(surface_entries.get(key, []) or [])
+            reachable, unknown = resolve_trusted_transitive_graph(
+                entry_paths, entries, root, deadline=transitive_deadline
+            )
+            all_producer_paths |= reachable
+            if reachable & changed_set and surface_id not in affected_surface_ids:
+                affected_surface_ids[surface_id] = "producer_reachable_transitive"
+            if unknown and surface_id not in affected_surface_ids:
+                affected_surface_ids[surface_id] = "trusted_transitive_unknown_impact"
 
     unmapped_visual_candidates: list[str] = []
     for changed_path in changed_paths:
@@ -1540,9 +2197,31 @@ def verify_trusted_artifact(
                 reasons.append("changed_paths_digest_mismatch")
             if tr.base_registry_doc is not None and tr.head_registry_doc is not None:
                 trusted_changed_paths = _flat_paths_for_resolve(tr.changed_path_entries)
-                trusted_affected, trusted_unmapped = resolve_trusted_minimum(
-                    trusted_changed_paths, tr.base_registry_doc, tr.head_registry_doc
-                )
+                try:
+                    trusted_affected, trusted_unmapped = resolve_trusted_minimum(
+                        trusted_changed_paths,
+                        tr.base_registry_doc,
+                        tr.head_registry_doc,
+                        candidate_head_ref=tr.candidate_head_ref,
+                        repo_root=tr.repo_root,
+                    )
+                except TrustedTransitiveResourceBoundExceeded as exc:
+                    # Issue #2099 AC4: a resource bound violation while
+                    # walking the candidate head's static import graph is a
+                    # trust-signal failure, never a silent skip -- fail
+                    # closed unconditionally, same as every other reason
+                    # code in this function.
+                    reasons.append(f"trusted_transitive_resource_bound_exceeded:{exc}")
+                    trusted_affected, trusted_unmapped = {}, []
+                except TrustedGitPlumbingError as exc:
+                    # PR #2144 review fix_delta P1-4: a genuine git
+                    # plumbing failure (ls-tree/cat-file) is a DISTINCT
+                    # trust-signal failure from a resource-bound violation
+                    # (Issue #2099 AC7) -- still fails closed
+                    # unconditionally, but with its own stable reason code
+                    # so the two failure classes are never conflated.
+                    reasons.append(f"trusted_transitive_git_plumbing_error:{exc}")
+                    trusted_affected, trusted_unmapped = {}, []
                 claimed_surface_ids = {
                     s.get("surface_id")
                     for s in (decision.get("affected_surfaces") or [])
@@ -1656,6 +2335,10 @@ def _build_trusted_rederivation_from_args(args: argparse.Namespace) -> tuple[Tru
         expected_head_registry_blob_sha=args.expected_head_registry_blob_sha,
         base_registry_doc=base_registry_doc,
         head_registry_doc=head_registry_doc,
+        # Issue #2099 AC1: optional -- only set when the caller has already
+        # `git fetch --depth=1`'d this exact commit as a Git object (never a
+        # working-tree checkout of it).
+        candidate_head_ref=args.trusted_candidate_tree_ref,
     )
     return trusted_rederivation, load_errors
 
@@ -1898,6 +2581,42 @@ def _run_changed_paths(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_resolve_trusted_registry_blob(args: argparse.Namespace) -> int:
+    """Issue #2099 AC7: `--mode resolve-trusted-registry-blob` -- read
+    `--path` at `--ref` via `read_git_blob_at_ref()`'s three-way
+    `GitReadOutcome` classification (never collapsing "file missing" and
+    "git plumbing failure" into one branch, unlike the workflow's former
+    inline `git show ... 2>/dev/null || rm -f ...`)."""
+    if not args.ref or not args.path or not args.output_file:
+        print("resolve-trusted-registry-blob requires --ref, --path, --output-file", file=sys.stderr)
+        return 1
+    outcome, content, message = read_git_blob_at_ref(REPO_ROOT, args.ref, args.path)
+    if outcome == GitReadOutcome.PLUMBING_ERROR:
+        print(f"git_plumbing_error: resolving {args.path} at {args.ref}: {message}", file=sys.stderr)
+        return 1
+    if outcome == GitReadOutcome.MISSING:
+        # Normal case: the registry does not exist at this ref. Remove any
+        # stale output from a previous invocation and succeed.
+        Path(args.output_file).unlink(missing_ok=True)
+        if args.blob_sha_output_file:
+            Path(args.blob_sha_output_file).unlink(missing_ok=True)
+        return 0
+    assert content is not None
+    Path(args.output_file).write_bytes(content)
+    if args.blob_sha_output_file:
+        rev_parse = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", f"{args.ref}:{args.path}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if rev_parse.returncode != 0:
+            print(f"git_plumbing_error: rev-parse {args.ref}:{args.path}: {rev_parse.stderr}", file=sys.stderr)
+            return 1
+        Path(args.blob_sha_output_file).write_text(rev_parse.stdout.strip() + "\n", encoding="utf-8")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Resolve VISUAL_IMPACT affected surfaces for a changed-path set.")
     parser.add_argument(
@@ -1908,6 +2627,7 @@ def main(argv: list[str] | None = None) -> int:
             "build-evidence-manifest",
             "changed-paths",
             "verify-trusted-artifact",
+            "resolve-trusted-registry-blob",
         ],
         default="resolve",
     )
@@ -1983,6 +2703,20 @@ def main(argv: list[str] | None = None) -> int:
             "cap was hit). Forces the verdict fail-closed."
         ),
     )
+    # Issue #2099 AC1: the candidate PR head commit SHA, as a Git object the
+    # caller has ALREADY fetched (`git fetch --depth=1 origin <sha>`) --
+    # never a working-tree checkout. Enables `resolve_trusted_minimum()`'s
+    # additional git-object-backed transitive import-graph step.
+    parser.add_argument("--trusted-candidate-tree-ref", type=str, default=None)
+    # Issue #2099 AC7: `--mode resolve-trusted-registry-blob` reads
+    # `--path` as it exists at `--ref` via `read_git_blob_at_ref()`,
+    # replacing the workflow's former inline
+    # `git show ... 2>/dev/null || rm -f ...` pattern (which could not
+    # distinguish "path missing" from "git plumbing failure").
+    parser.add_argument("--ref", type=str, default=None)
+    parser.add_argument("--path", type=str, default=None)
+    parser.add_argument("--output-file", type=str, default=None)
+    parser.add_argument("--blob-sha-output-file", type=str, default=None)
     # PR #2045 OWNER fix_delta P0-5 (V2 manifest): `build-evidence-manifest`
     # mode is invoked by the `component-vrt-report` CI job to produce the
     # VISUAL_BASELINE_REVIEW_EVIDENCE_V2 artifact from real per-surface VRT
@@ -2008,6 +2742,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mode == "verify-trusted-artifact":
         return _run_verify_trusted_artifact(args)
+
+    if args.mode == "resolve-trusted-registry-blob":
+        return _run_resolve_trusted_registry_blob(args)
 
     changed_paths = _read_changed_paths(args)
 
