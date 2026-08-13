@@ -90,51 +90,32 @@ def _minimal_valid_review_result() -> dict:
 
 
 def test_review_compact_schema_mismatch_emits_failure_artifact(tmp_path):
-    """AC1/AC2: compact_review_result.py emits canonical failure envelope on schema mismatch."""
-    # Input missing required schema fields (schema mismatch)
-    invalid_input = json.dumps({
-        "verdict": "approve",
-        # Missing: schema, schema_version, status, body_sha256, etc.
-    })
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop"
+    """Issue #2054 AC5: compact_review_result.py's CLI is retired (V1
+    producer removed; ISSUE_REVIEW_RESULT_COMPACT_V2 has no downgrade
+    fallback). Any invocation -- valid or invalid input -- always fails
+    closed (exit 2), performs no artifact I/O, and never leaks its input
+    verbatim to stdout."""
+    valid_input = json.dumps(_minimal_valid_review_result())
+    artifact_dir = tmp_path / "artifacts"
     result = subprocess.run(
         [
             sys.executable, str(COMPACT_REVIEW_SCRIPT),
             "--artifact-dir", str(artifact_dir),
-            "--repo-root", str(repo_root),
             "--issue-number", "1165",
         ],
-        input=invalid_input,
+        input=valid_input,
         capture_output=True,
         text=True,
     )
-    assert result.returncode != 0, (
-        f"Schema mismatch should exit non-zero. stdout={result.stdout!r}"
-    )
-    _assert_failure_envelope(result.stdout)
-    # REASON_CODE must be schema_mismatch
-    assert "REASON_CODE: schema_mismatch" in result.stdout, (
-        f"REASON_CODE must be schema_mismatch. stdout={result.stdout!r}"
-    )
-    # Failure artifact uses a validator-safe repo-relative wire reference.
-    assert ".claude/artifacts/issue-refinement-loop/1165/" in result.stdout, (
-        f"ARTIFACT path must include issue number /1165/. stdout={result.stdout!r}"
-    )
-    # Failure artifact file must exist
-    artifact_ref = [
-        line for line in result.stdout.splitlines()
-        if line.startswith("ARTIFACT: producer_failure_v1=")
-    ]
-    assert len(artifact_ref) == 1, f"Expected exactly one ARTIFACT line. stdout={result.stdout!r}"
-    artifact_path_str = artifact_ref[0].split("=", 1)[1]
-    artifact_path = repo_root / artifact_path_str
-    assert artifact_path.exists(), f"Failure artifact file not found: {artifact_path}"
+    assert result.returncode == 2, f"retired CLI must always fail closed. stderr={result.stderr!r}"
+    assert result.stdout == ""
+    assert "retired" in result.stderr.lower()
+    assert not artifact_dir.exists(), "retired CLI must perform no artifact I/O"
 
 
 def test_review_compact_invalid_verdict_emits_failure_artifact(tmp_path):
-    """AC2: compact_review_result.py emits canonical failure envelope for invalid verdict."""
+    """Issue #2054 AC5: retired CLI fails closed identically for an invalid
+    verdict input -- no schema_mismatch envelope is produced anymore."""
     invalid_input = json.dumps({
         "schema": "REVIEW_ISSUE_RESULT_V1",
         "schema_version": "1",
@@ -162,9 +143,9 @@ def test_review_compact_invalid_verdict_emits_failure_artifact(tmp_path):
         capture_output=True,
         text=True,
     )
-    assert result.returncode != 0
-    _assert_failure_envelope(result.stdout)
-    assert "REASON_CODE: schema_mismatch" in result.stdout
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert not artifact_dir.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -173,10 +154,8 @@ def test_review_compact_invalid_verdict_emits_failure_artifact(tmp_path):
 
 
 def test_review_compact_noncanonical_relative_artifact_dir_fails_closed(tmp_path):
-    """A no-root producer invocation rejects an arbitrary relative destination."""
-    # This was formerly accepted to induce a synthetic output-budget failure.
-    # It instead fixed a producer/validator split-brain by allowing a wire
-    # reference outside the validator's canonical lexical namespace.
+    """Issue #2054 AC5: retired CLI fails closed identically regardless of
+    the (now-ignored) --artifact-dir value; no artifact is ever written."""
     long_artifact_dir = (
         Path("x" * 200)
         / ("y" * 200)
@@ -184,7 +163,6 @@ def test_review_compact_noncanonical_relative_artifact_dir_fails_closed(tmp_path
         / ("w" * 200)
         / ("v" * 200)
     )
-    # Valid input proves rejection happens at the producer path boundary.
     valid_input = json.dumps(_minimal_valid_review_result())
 
     result = subprocess.run(
@@ -198,32 +176,12 @@ def test_review_compact_noncanonical_relative_artifact_dir_fails_closed(tmp_path
         text=True,
         cwd=tmp_path,
     )
-    assert result.returncode != 0, (
-        f"Noncanonical path should exit non-zero. stdout={result.stdout!r}"
+    assert result.returncode == 2, (
+        f"Retired CLI should always fail closed. stdout={result.stdout!r}"
     )
-    _assert_failure_envelope(result.stdout)
-    assert "REASON_CODE: schema_mismatch" in result.stdout, (
-        f"REASON_CODE must be schema_mismatch. stdout={result.stdout!r}"
-    )
-    # The original verbose output must never be emitted as a validator-invalid
-    # success envelope.
-    assert "VERDICT:" not in result.stdout, (
-        "Original verbose output must not appear in budget-violated stdout"
-    )
-    assert "SUMMARY:" not in result.stdout, (
-        "Original verbose output must not appear in budget-violated stdout"
-    )
-    # The failure artifact stays in the canonical subtree, not under the
-    # attacker-controlled relative destination.
-    artifact_ref = [
-        line for line in result.stdout.splitlines()
-        if line.startswith("ARTIFACT: producer_failure_v1=")
-    ]
-    assert len(artifact_ref) == 1
-    artifact_path = tmp_path / artifact_ref[0].split("=", 1)[1]
-    assert artifact_path.exists(), f"Failure artifact not found: {artifact_path}"
-    artifact_data = json.loads(artifact_path.read_text(encoding="utf-8"))
-    assert artifact_data.get("reason_code") == "schema_mismatch"
+    assert result.stdout == ""
+    assert "VERDICT:" not in result.stdout
+    assert "SUMMARY:" not in result.stdout
     assert not (tmp_path / long_artifact_dir).exists()
 
 
@@ -486,18 +444,16 @@ def test_termination_bypass_fixture_call_count_zero(tmp_path):
 
 
 def test_failure_stdout_never_contains_raw_issue_body_or_comment(tmp_path):
-    """AC1: failure stdout never contains raw issue body or raw comment content."""
+    """Issue #2054 AC5/AC11: the retired CLI never echoes stdin content --
+    it never even reads it (fails closed before any input is consumed)."""
     RAW_BODY_SENTINEL = "THIS_IS_RAW_ISSUE_BODY_CONTENT_DO_NOT_EMIT_12345"
     RAW_COMMENT_SENTINEL = "THIS_IS_RAW_COMMENT_CONTENT_DO_NOT_EMIT_67890"
 
-    # Input contains raw body/comment content but fails early validation
-    # Use invalid_status to trigger ValueError (not jsonschema, which can be verbose)
     invalid_input_with_raw = json.dumps({
         "verdict": "invalid_verdict_that_should_not_appear_in_stdout",
         "status": "ok",
         "raw_body": RAW_BODY_SENTINEL,
         "raw_comment": RAW_COMMENT_SENTINEL,
-        # invalid_verdict → ValueError before jsonschema runs
     })
     artifact_dir = tmp_path / "artifacts"
     result = subprocess.run(
@@ -510,36 +466,20 @@ def test_failure_stdout_never_contains_raw_issue_body_or_comment(tmp_path):
         capture_output=True,
         text=True,
     )
-    assert result.returncode != 0, "Input with schema mismatch should fail"
-    # Raw content must NOT appear in stdout
-    assert RAW_BODY_SENTINEL not in result.stdout, (
-        "Raw issue body must not appear in stdout on failure"
-    )
-    assert RAW_COMMENT_SENTINEL not in result.stdout, (
-        "Raw comment must not appear in stdout on failure"
-    )
-    # Verify this is actually a failure envelope (not empty)
-    assert "STATUS: failed" in result.stdout
-
-
-# ---------------------------------------------------------------------------
-# AC7: canonical artifact path reference in tests
-# ---------------------------------------------------------------------------
+    assert result.returncode == 2
+    combined = result.stdout + result.stderr
+    assert RAW_BODY_SENTINEL not in combined
+    assert RAW_COMMENT_SENTINEL not in combined
+    assert result.stdout == ""
 
 
 def test_canonical_artifact_path_in_failure_artifact(tmp_path):
-    """AC7: failure wire references stay repo-relative and path-safe.
-
-    The actual artifact is under repo_root, while stdout carries only the
-    validator-accepted canonical relative reference.
-    """
+    """Issue #2054 AC5/AC7: the retired CLI writes no artifact anywhere --
+    no wire reference, canonical or otherwise, is ever emitted."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    expected_wire_dir = ".claude/artifacts/issue-refinement-loop/1165/"
+    invalid_input = json.dumps({"verdict": "not_valid"})
 
-    invalid_input = json.dumps({"verdict": "not_valid"})  # invalid verdict → ValueError
-
-    # Positive: --repo-root provided → canonical filesystem path, relative wire path
     result = subprocess.run(
         [
             sys.executable, str(COMPACT_REVIEW_SCRIPT),
@@ -550,18 +490,10 @@ def test_canonical_artifact_path_in_failure_artifact(tmp_path):
         capture_output=True,
         text=True,
     )
-    assert result.returncode != 0, f"Invalid input should fail. stdout={result.stdout!r}"
-    assert expected_wire_dir in result.stdout
-    assert str(repo_root) not in result.stdout
-    wire_ref = next(
-        line.split("=", 1)[1]
-        for line in result.stdout.splitlines()
-        if line.startswith("ARTIFACT: producer_failure_v1=")
-    )
-    assert (repo_root / wire_ref).exists()
+    assert result.returncode == 2, f"stdout={result.stdout!r}"
+    assert result.stdout == ""
+    assert not any(repo_root.rglob("*")), "retired CLI must perform no artifact I/O"
 
-    # Negative: --repo-root omitted + absolute --artifact-dir → fail closed
-    # with a canonical failure artifact rooted at the current working tree.
     arbitrary_dir = tmp_path / "arbitrary"
     result2 = subprocess.run(
         [
@@ -574,7 +506,6 @@ def test_canonical_artifact_path_in_failure_artifact(tmp_path):
         text=True,
         cwd=tmp_path,
     )
-    assert result2.returncode != 0, f"Invalid input should fail. stdout={result2.stdout!r}"
-    assert expected_wire_dir in result2.stdout
-    assert str(repo_root) not in result2.stdout
-    assert str(arbitrary_dir) not in result2.stdout
+    assert result2.returncode == 2, f"stdout={result2.stdout!r}"
+    assert result2.stdout == ""
+    assert not arbitrary_dir.exists()
