@@ -194,6 +194,54 @@ def test_complete_ok_result_requires_matching_materialized_claim_evidence():
     assert result["next_action"] == NEXT_ACTION_PROCEED
 
 
+def test_ok_result_with_native_web_verification_route_is_accepted():
+    """Producer-added successful routes (e.g. native_web) are not allowlist-rejected."""
+    result = route_web_research_result(
+        _input(
+            repository_status="determined",
+            disposition="close_not_planned",
+            role="non_dispositive",
+            web_research=_successful_web_result(verification_route="native_web"),
+        )
+    )
+
+    assert result["transport_status"] == "ok"
+    assert result["semantic_verdict"] is None
+    assert result["next_action"] == NEXT_ACTION_PROCEED
+
+
+def test_ok_result_with_unknown_future_verification_route_is_accepted():
+    """The consumer does not re-implement/re-enumerate the producer's route enum."""
+    result = route_web_research_result(
+        _input(
+            repository_status="determined",
+            disposition="close_not_planned",
+            role="non_dispositive",
+            web_research=_successful_web_result(verification_route="some_future_provider_route"),
+        )
+    )
+
+    assert result["transport_status"] == "ok"
+    assert result["semantic_verdict"] is None
+    assert result["next_action"] == NEXT_ACTION_PROCEED
+
+
+def test_ok_result_with_empty_verification_route_is_fail_closed_transport_failure():
+    """An `ok` status still requires the producer to have named some route."""
+    result = route_web_research_result(
+        _input(
+            repository_status="determined",
+            disposition="close_not_planned",
+            role="non_dispositive",
+            web_research=_successful_web_result(verification_route=""),
+        )
+    )
+
+    assert result["transport_status"] == TRANSPORT_STATUS_ENVIRONMENT_FAILURE
+    assert result["semantic_verdict"] is None
+    assert result["next_action"] == NEXT_ACTION_HUMAN_JUDGMENT_REQUIRED
+
+
 def test_ok_result_with_empty_claims_is_fail_closed_transport_failure():
     result = route_web_research_result(
         _input(

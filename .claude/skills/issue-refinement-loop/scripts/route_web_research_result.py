@@ -74,14 +74,17 @@ def _transport_reason(web_research: Any, required_claim_texts: set[str]) -> str 
     verification_route = web_research.get("verification_route")
     claims = web_research.get("claims")
     unresolved_risks = web_research.get("unresolved_risks")
-    if verification_route not in {"grounded_research", "none"}:
+    # The consumer does not allowlist-check the producer's route selection
+    # (`grounded_research`, `native_web`, or any future successful route the
+    # web-researcher adds). It only requires transport to have named some
+    # non-empty route; the specific value is informational to this consumer.
+    if not isinstance(verification_route, str) or not verification_route:
         return "web_research_result_missing_or_malformed"
     if not isinstance(claims, list) or not isinstance(unresolved_risks, list):
         return "web_research_result_missing_or_malformed"
     if status == "ok":
         if (
             failure_class is not None
-            or verification_route != "grounded_research"
             or not _claims_cover_requested_evidence(claims, required_claim_texts)
         ):
             return "web_research_result_missing_or_malformed"
