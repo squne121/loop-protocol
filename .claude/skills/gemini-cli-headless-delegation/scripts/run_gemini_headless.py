@@ -4235,6 +4235,7 @@ def _build_agy_grounded_research_metadata(
 
     parsed = _extract_grounded_research_output(stdout)
     structured_citations = _extract_structured_citations(parsed)
+    citations_have_structured_source = bool(structured_citations)
     if not structured_citations and hook_validated:
         # Issue #1768: when the tool-call evidence comes from a validated hook event
         # rather than a stdout self-report structured trace, also accept a real Google
@@ -4244,6 +4245,7 @@ def _build_agy_grounded_research_metadata(
         # grounding-api-redirect shape counts (Issue #1266 Blocker 1 remains in force).
         vertex_urls = _extract_vertex_grounding_citation_urls(stdout)
         structured_citations = [{"url": url, "title": None} for url in vertex_urls]
+        citations_have_structured_source = bool(structured_citations)
     if not structured_citations:
         # The caller must still validate URL content against each claim.  Keep
         # parseable final-result URLs available for that evidence-quality
@@ -4277,7 +4279,7 @@ def _build_agy_grounded_research_metadata(
     if search_query_count is None:
         search_query_count = web_tool_call_count
 
-    if url_citation_count > 0 and hook_validated:
+    if url_citation_count > 0 and citations_have_structured_source and hook_validated:
         # Tool telemetry is diagnostic rather than a quality gate. A
         # validated hook merely identifies this as an AGY attempt with
         # candidate sources; web-researcher still validates source content

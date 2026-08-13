@@ -34,6 +34,10 @@ BUILDER_INVOCATION
 - fallback_route: native_web
 - gemini_state: disabled_by_operator
 
+ROUTE_OWNERSHIP
+- `run_gemini_headless.py` の `delegation_result/v1` と `grounded_research_evidence` は AGY attempt の入力であり、`WEB_RESEARCH_RESULT_V1` の最終成功判定ではない。
+- この custom agent 自身が current runtime の native Web capability を直接使い、AGY evidence quality が不足するとき fallback を完結する。AGY adapter の `ok`、hook、counter、provenance は最終 route を決めない。
+
 EVIDENCE_QUALITY
 - success authority は critical claim ごとの verdict、具体的 citation URL、claim を支える summary、source authority である。
 - authoritative claim は official upstream documentation/repository を優先する。
@@ -45,9 +49,10 @@ EVIDENCE_QUALITY
 FAIL_CLOSED
 - evidence が無い claim を supported にしない。provider telemetry の欠落だけでは fail-closed にせず、native fallback を試行する。
 
-NETWORK_LIMITATION
+NETWORK_ENFORCEMENT_BOUNDARY
 - `loop-protocol-web-research` permission profile は filesystem read-only を維持する。GitHub Issue/PR/comment/review/label/state mutation は root/main thread へ差し戻す。
-- native model-side web search と local subprocess network access は別の capability である。effective native Web availability は current runtime/version で確認する。
+- local subprocess の `exec_command` proxy egress と model-hosted `web__run` は別経路であり、native model-side Web availability は current runtime/version で独立に確認する。
+- `network.domains` は local subprocess egress の allowlist であって、agent が利用できる全 outbound route を覆う comprehensive security boundary として扱わない。`network.mode = "full"` も domain allowlist を bypass / 無効化するものではない。
 
 Known limitation
 - hooks と permission profiles は fail-closed local guardrail であり provider-side Web execution の証明ではない。provider provenance の欠落だけで、一次資料の source-content evidence を捨てない。

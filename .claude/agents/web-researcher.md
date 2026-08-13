@@ -51,10 +51,25 @@ Gemini CLI は `disabled_by_operator` のため起動しない。旧 `preflight_
 
 1. AGY canonical builder invocation を一度試行する。
    事前に `setup_check.py --provider agy --json` と `preflight_agy.py` で AGY attempt の readiness を確認してよい。
+   builder が request file を返した場合は、既存 wrapper を次の request/output file contract で実行する。
+   ```bash
+   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
+     --request-file <builder が作成した request file> \
+     --output-file <invocation-private output file>
+   ```
 2. AGY が一次資料 citation と claim を支える内容を返した場合、その evidence を評価する。
 3. 以下のいずれかなら停止せず、利用可能な native Web route で同じ critical claim を検証する: auth/capability/query/grounding failure、citation materialization failure、citation extraction failure、provider provenance trace 不足、`web_tool_call_count == 0`、または AGY evidence quality 不足。
 4. Claude runtime では利用可能な `WebSearch` と `WebFetch` を fallback に使ってよい。Codex runtime 固有の native tool 名はここで仮定しない。
 5. AGY 由来 URL を provider trace 不足だけで捨てない。ただし無条件に信頼せず、native fetch/search で URL と source content を再検証する。
+
+### Route ownership
+
+`run_gemini_headless.py` の `delegation_result/v1` と
+`grounded_research_evidence` は **AGY attempt の入力**であり、
+`WEB_RESEARCH_RESULT_V1` の成功判定ではない。AGY adapter の `ok`、hook、counter、
+provenance はこの SubAgent の最終 `status` / `verification_route` を決めない。
+この SubAgent 自身が上記の手順で AGY evidence の source content を評価し、必要なら
+ここで許可された native Web tool を直接起動して fallback を完結させる。
 
 ## 根拠品質ゲート（Evidence Quality Gate）
 
