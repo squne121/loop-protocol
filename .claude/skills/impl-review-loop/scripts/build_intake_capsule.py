@@ -196,37 +196,6 @@ def _extract_yaml_blocks(body: str) -> list[str]:
     return [match.group(1) for match in _FENCED_YAML_RE.finditer(body)]
 
 
-def _is_trusted_snapshot_author(
-    author: Any,
-    author_association: Any,
-    author_id: Any = None,
-    author_type: Any = None,
-) -> bool:
-    """#1475: delegate to the shared trust policy (single source of truth)."""
-    module = _load_module(_CRP_PATH, "contract_review_result_parser_for_intake_capsule")
-    return bool(
-        module.is_trusted_snapshot_author(
-            author,
-            author_association,
-            author_id=author_id,
-            author_type=author_type,
-        )
-    )
-
-
-def _is_fingerprint_ready(
-    inner: dict[str, Any],
-    comment_id: Any,
-    issue_number: int | None,
-) -> bool:
-    """#1537: delegate to the shared fingerprint-readiness policy (single
-    source of truth) -- same rule contract_review_result_parser.py and
-    ensure_contract_snapshot.py use for the same expected_contract_fingerprint
-    schema."""
-    module = _load_module(_CRP_PATH, "contract_review_result_parser_for_intake_capsule")
-    return bool(module.is_fingerprint_ready_go(inner, comment_id, issue_number))
-
-
 def _live_allowed_paths_hash(body: str) -> str | None:
     """Compute the reviewer-compatible hash from the live Issue body."""
     baseline = _load_module(_BASELINE_PREFLIGHT_PATH, "baseline_allowed_paths_for_intake")
@@ -253,19 +222,6 @@ _ISSUE_NUMBER_FROM_URL_RE = re.compile(r"/issues/(\d+)\Z")
 def _issue_number_from_url(issue_url: str) -> int | None:
     m = _ISSUE_NUMBER_FROM_URL_RE.search(issue_url or "")
     return int(m.group(1)) if m else None
-
-
-def _is_valid_contract_review_result(block: dict[str, Any], expected_issue_url: str) -> bool:
-    inner = block.get(_CONTRACT_REVIEW_MARKER)
-    if not isinstance(inner, dict):
-        return False
-    if inner.get("status") not in {"go", "blocked"}:
-        return False
-    if inner.get("generated_by") != "issue-contract-review":
-        return False
-    if not inner.get("generated_at"):
-        return False
-    return inner.get("issue_url") == expected_issue_url
 
 
 def _collect_issue_metadata(
@@ -364,10 +320,11 @@ def _collect_issue_comments(
 def _validate_agent_report_schema(body: str) -> tuple["str | None", str, list[str]]:
     """PR #1973 (OWNER REQUEST_CHANGES, P1-3): validate that ``body`` carries
     EXACTLY ONE top-level fenced block whose parsed top-level dict key is a
-    member of ``_ALLOWED_AGENT_REPORT_SCHEMA_IDS``. Reuses the EXISTING
-    ``_extract_yaml_blocks()`` / ``_parse_simple_yaml_block()`` helpers
-    already used by ``_parse_contract_results()`` in this file -- no new
-    extractor is added.
+    member of ``_ALLOWED_AGENT_REPORT_SCHEMA_IDS``.  It uses the local
+    ``_extract_yaml_blocks()`` / ``_parse_simple_yaml_block()`` helpers only
+    for agent-report schema validation.  Contract snapshots use the shared
+    contract-review parser below, so this local parser cannot decode or
+    authorize their fingerprint transport.
 
     Fail-closed (``validated_schema_id=None``, ``validation_status="fail_closed"``)
     when: zero blocks, more than one block, unparseable, or
@@ -462,68 +419,16 @@ def _parse_contract_results(
     expected_issue_url: str,
     issue_number: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    if issue_number is None:
-        issue_number = _issue_number_from_url(expected_issue_url)
-    results: list[dict[str, Any]] = []
-    invalid_contract_blocks_count = 0
-    ambiguous_contract_blocks_count = 0
+    """Consume the shared parser; retain its invalid-block telemetry.
 
-    for comment in comments:
-        body = str(comment.get("body") or "")
-        if _CONTRACT_REVIEW_MARKER not in body:
-            continue
-
-        valid_blocks: list[dict[str, Any]] = []
-        matched_blocks = 0
-        for raw_block in _extract_yaml_blocks(body):
-            if _CONTRACT_REVIEW_MARKER not in raw_block:
-                continue
-            matched_blocks += 1
-            parsed = _parse_simple_yaml_block(raw_block)
-            if _is_valid_contract_review_result(parsed, expected_issue_url):
-                inner = parsed[_CONTRACT_REVIEW_MARKER]
-                author = comment.get("author")
-                author_association = comment.get("author_association")
-                author_id = comment.get("author_id")
-                author_type = comment.get("author_type")
-                valid_blocks.append(
-                    {
-                        "comment_id": comment.get("id"),
-                        "html_url": comment.get("html_url", ""),
-                        "created_at": comment.get("created_at", ""),
-                        "updated_at": comment.get("updated_at", ""),
-                        "status": inner.get("status"),
-                        "inner": inner,
-                        "author": author,
-                        "author_association": author_association,
-                        "author_id": author_id,
-                        "author_type": author_type,
-                        "is_trusted_author": _is_trusted_snapshot_author(
-                            author,
-                            author_association,
-                            author_id=author_id,
-                            author_type=author_type,
-                        ),
-                        "is_fingerprint_ready": _is_fingerprint_ready(
-                            inner,
-                            comment.get("id"),
-                            issue_number,
-                        ),
-                    }
-                )
-            else:
-                invalid_contract_blocks_count += 1
-
-        if len(valid_blocks) > 1:
-            ambiguous_contract_blocks_count += 1
-        if valid_blocks:
-            results.append(valid_blocks[0])
-
-    results.sort(key=lambda item: (str(item.get("created_at") or ""), int(item.get("comment_id") or 0)))
-    return results, {
-        "invalid_contract_blocks_count": invalid_contract_blocks_count,
-        "ambiguous_contract_blocks_count": ambiguous_contract_blocks_count,
-    }
+    ``issue_number`` remains in this local API for compatibility with existing
+    callers.  Fingerprint source binding is derived by the shared parser from
+    ``expected_issue_url`` so this consumer never reimplements decoding or
+    readiness validation.
+    """
+    del issue_number
+    module = _load_module(_CRP_PATH, "contract_review_result_parser_for_intake_capsule")
+    return module.parse_contract_review_results_with_telemetry(comments, expected_issue_url)
 
 
 def _find_latest_result(
