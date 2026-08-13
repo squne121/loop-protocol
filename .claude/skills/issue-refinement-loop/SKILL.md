@@ -229,10 +229,9 @@ unresolved risk を記録するが、それだけで Step 5 に進めない。di
 未解決、または repository decision が inconclusive の場合だけ
 `human_judgment_required` として Step 5 へ進む。web-researcher の retry/fallback、
 grounding trace、citation/provider provenance をこの consumer が再実装・保存しては
-ならない。consumer は `verification_route` が producer 側で追加された未知の成功
-route（例: `native_web`）であることを理由に reject してはならない — `status: ok`
-かつ `verification_route` が非空であれば transport/grounding は成功したとみなし、
-個々の route 文字列は informational として扱う。
+ならない。consumer は `verification_route` の個々の値（`native_web` 等の producer 追加
+route を含む）を re-validate せず、`status: ok` かつ `verification_route` が非空なら
+transport/grounding 成功と扱う（詳細は `references/web-research-routing.md`）。
 
 詳細は `references/web-research-routing.md` を参照する。
 
