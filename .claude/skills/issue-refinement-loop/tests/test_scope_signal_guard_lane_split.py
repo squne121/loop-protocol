@@ -258,6 +258,66 @@ class TestAnchorApprovalRouting:
         assert approval["missing_approval_field"] is False
         assert approval["suggested_contract_patch"] is None
 
+    def test_given_trusted_freeform_directive_when_raw_delta_has_no_signal_then_contract_update_is_required(
+        self, planner_module
+    ):
+        """A scope-preserving OWNER directive must not be hidden by a no-op delta."""
+        input_data = _base_input(2055, _delta_input("- `docs/foo.md`", "- `docs/foo.md`"))
+        input_data["known_context"]["scope_delta_authority_evidence"] = {
+            "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
+            "source_kind": "issue_comment",
+            "source_ref": "https://github.com/squne121/loop-protocol/issues/2055#issuecomment-5248407236",
+            "source_issue_number": 2055,
+            "comment_id": 5248407236,
+            "comment_url": "https://github.com/squne121/loop-protocol/issues/2055#issuecomment-5248407236",
+            "issue_url": "https://github.com/squne121/loop-protocol/issues/2055",
+            "body_sha256": "sha256:" + "c" * 64,
+            "author_login": "squne121",
+            "author_type": "User",
+            "author_association": "OWNER",
+            "captured_at": "2026-08-11T02:44:09Z",
+            "directive_markers": ["revised acceptance criteria"],
+            "extracted_directives": ["AC1: preserve the approved scope while updating the contract."],
+            "ambiguity_flags": [],
+            "boundary_flags": [],
+        }
+
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+
+        assert exit_code == 0
+        authority = plan["scope_signal_guard_decision_v2"]["scope_delta_authority"]
+        assert plan["scope_signal_guard_decision_v2"]["raw_signal"] == {
+            "triggered": False,
+            "reason_code": "no_scope_signal",
+        }
+        assert authority["route"]["action"] == "contract_update_required"
+        assert authority["contract_patch_plan"]["schema_version"] == "CONTRACT_PATCH_PLAN_V1"
+
+    @pytest.mark.parametrize(
+        "falsy_evidence",
+        [{}, None, [], ""],
+        ids=["empty_dict", "none", "empty_list", "empty_string"],
+    )
+    def test_falsy_evidence_presence_still_triggers_authority_lane(
+        self, planner_module, falsy_evidence
+    ):
+        """PR #2083 review fix (P1-2) regression: evidence *presence* (not its
+        value truthiness) must trigger the scope_delta_authority lane. Before
+        the fix, `triggered=bool(_raw_triggered or known_context.get(...))`
+        collapsed to False for a present-but-falsy evidence payload combined
+        with a no-op raw delta, letting classify_scope_delta_authority land on
+        route.action == "not_triggered" (fail-open) instead of validating
+        (and rejecting) the malformed evidence.
+        """
+        input_data = _base_input(2055, _delta_input("- `docs/foo.md`", "- `docs/foo.md`"))
+        input_data["known_context"]["scope_delta_authority_evidence"] = falsy_evidence
+
+        plan, exit_code = planner_module.plan_refinement_loop(input_data)
+
+        assert exit_code == 0
+        authority = plan["scope_signal_guard_decision_v2"]["scope_delta_authority"]
+        assert authority["route"]["action"] != "not_triggered"
+
 
 class TestScopeDeltaDecisionAdapter:
     """PR #1294 review Blocker 1: production preflight path (scope_delta_decision)
