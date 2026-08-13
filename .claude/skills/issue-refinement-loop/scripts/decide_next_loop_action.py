@@ -576,6 +576,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reviewer-transport-result-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "#2054 parent-owned REVIEWER_TRANSPORT_RESULT_V1. A transport "
+            "failure is routed as environment_failure; only an ok result may "
+            "supply semantic_verdict."
+        ),
+    )
+    parser.add_argument(
         "--max-iterations",
         type=int,
         default=None,
@@ -709,6 +719,28 @@ def _load_loop_state(args: argparse.Namespace) -> tuple[Optional[dict[str, Any]]
     return data, ""
 
 
+def _load_reviewer_transport_result(path_value: str | None) -> tuple[Optional[dict[str, Any]], str]:
+    """Load the parent result without accepting child compact/V1 fallback."""
+    if path_value is None:
+        return None, ""
+    try:
+        with open(path_value, "rb") as stream:
+            from reviewer_transport import strict_json_loads
+
+            data = strict_json_loads(stream.read())
+    except (OSError, ValueError, ImportError) as exc:
+        return None, f"reviewer_transport_result_invalid:{type(exc).__name__}"
+    if not isinstance(data, dict) or data.get("schema") != "REVIEWER_TRANSPORT_RESULT_V1":
+        return None, "reviewer_transport_result_invalid:schema"
+    status = data.get("transport_status")
+    verdict = data.get("semantic_verdict")
+    if status == STATUS_ENVIRONMENT_FAILURE and verdict is None:
+        return data, ""
+    if status == "ok" and verdict in {"approve", "needs-fix"}:
+        return data, ""
+    return None, "reviewer_transport_result_invalid:status_or_verdict"
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
@@ -731,6 +763,20 @@ def main(argv: Optional[list[str]] = None) -> None:
         print(f"BLOCKERS: authority_transport_environment_failure:{router_receipt.get('reason_code')}")
         sys.exit(EXIT_ENVIRONMENT_FAILURE)
 
+    transport_result, transport_error = _load_reviewer_transport_result(
+        args.reviewer_transport_result_file
+    )
+    if transport_error:
+        print(f"STATUS: {STATUS_ENVIRONMENT_FAILURE}")
+        print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
+        print(f"BLOCKERS: {transport_error}")
+        sys.exit(EXIT_ENVIRONMENT_FAILURE)
+    if transport_result is not None and transport_result["transport_status"] == STATUS_ENVIRONMENT_FAILURE:
+        print(f"STATUS: {STATUS_ENVIRONMENT_FAILURE}")
+        print(f"NEXT_ACTION: {ACTION_HUMAN_ESCALATION}")
+        print("BLOCKERS: reviewer_transport_environment_failure")
+        sys.exit(EXIT_ENVIRONMENT_FAILURE)
+
     # Load loop state
     loop_state, load_error = _load_loop_state(args)
     if load_error or loop_state is None:
@@ -749,7 +795,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(EXIT_INCONSISTENT_STATE)
 
     # Parse CLI verdict (may be absent / "null" / "")
-    raw_verdict = args.review_result_verdict
+    raw_verdict = (
+        transport_result["semantic_verdict"]
+        if transport_result is not None
+        else args.review_result_verdict
+    )
     if raw_verdict in (None, "null", ""):
         cli_verdict: Optional[str] = None
     else:
