@@ -21,7 +21,7 @@ consumer が読む結果フィールド（以下は routing のための既存�
 
 ## 経路の判断規則
 
-- `status: ok`（`verification_route: agy_grounded_research` または `native_web`）→ Step 2 へ進む
+- `status: ok`（`verification_route: grounded_research` または `native_web`）→ Step 2 へ進む
 - `status: insufficient_context` かつ `critical_external_claims` に unresolved あり → human escalation
 - `status: inconclusive` かつ `critical_external_claims` が inconclusive → human escalation
 - `status: failed` かつ `critical_external_claims` あり → human escalation

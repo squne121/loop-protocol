@@ -53,6 +53,7 @@ NETWORK_ENFORCEMENT_BOUNDARY
 - `loop-protocol-web-research` permission profile は filesystem read-only を維持する。GitHub Issue/PR/comment/review/label/state mutation は root/main thread へ差し戻す。
 - local subprocess の `exec_command` proxy egress と model-hosted `web__run` は別経路であり、native model-side Web availability は current runtime/version で独立に確認する。
 - `network.domains` は local subprocess egress の allowlist であって、agent が利用できる全 outbound route を覆う comprehensive security boundary として扱わない。`network.mode = "full"` も domain allowlist を bypass / 無効化するものではない。
+- native `verification_route: native_web` の実体は Codex CLI の `web_search` tool（top-level `web_search = "live" | "indexed" | "cached" | "disabled"` config key で制御。旧 `[features].web_search` は deprecated）である。`.codex/config.toml` はこの key を明示 override していないため、CLI の既定動作（disabled ではない）に従う。fresh な外部取得を要する critical claim では、必要に応じて `-c web_search="live"` を明示指定する運用を検討する（実行時の effective mode を証跡に記録すること）。
 
 Known limitation
 - hooks と permission profiles は fail-closed local guardrail であり provider-side Web execution の証明ではない。provider provenance の欠落だけで、一次資料の source-content evidence を捨てない。

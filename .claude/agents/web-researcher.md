@@ -91,10 +91,10 @@ WEB_RESEARCH_RESULT_V1:
   schema_version: 1
   status: ok | inconclusive | failed | insufficient_context
   failure_class: null | auth_error | capability_unavailable | query_error | grounding_failure
-  verification_route: agy_grounded_research | native_web | none
+  verification_route: grounded_research | native_web | none
   attempts:
     - attempt: <int>
-      route: agy_grounded_research | native_web
+      route: grounded_research | native_web
       status: ok | inconclusive | failed
       failure_class: null | auth_error | capability_unavailable | query_error | grounding_failure
       claim_ids: []
