@@ -116,8 +116,9 @@ def _trusted_go_comment(comment_id: int = 5001) -> dict:
     comment["body"] = comment["body"].replace(
         "  body_sha256: \"" + _SAMPLE_BODY_SHA256 + "\"\n",
         "  body_sha256: \"" + _SAMPLE_BODY_SHA256 + "\"\n"
-        "  expected_contract_fingerprint:\n"
-        + "".join(f"    {key}: {value!r}\n" for key, value in fingerprint.items()),
+        "  expected_contract_fingerprint: '"
+        + json.dumps(fingerprint, separators=(",", ":")).replace("'", "''")
+        + "'\n",
     )
     return comment
 
@@ -188,7 +189,7 @@ def _reject_yaml_import(name, *args, **kwargs):
 
 
 _ORIGINAL_IMPORT = builtins.__import__
-_FINGERPRINT_FLOW_LINE_RE = re.compile(
+_FINGERPRINT_SCALAR_LINE_RE = re.compile(
     r"(?m)^(  expected_contract_fingerprint: ).*$"
 )
 
@@ -196,8 +197,11 @@ _FINGERPRINT_FLOW_LINE_RE = re.compile(
 def _with_comment_fingerprint(comment: dict, fingerprint: object) -> dict:
     """Return the same authoritative comment with its emitted JSON value replaced."""
     updated = dict(comment)
-    updated["body"], count = _FINGERPRINT_FLOW_LINE_RE.subn(
-        lambda match: match.group(1) + json.dumps(fingerprint),
+    updated["body"], count = _FINGERPRINT_SCALAR_LINE_RE.subn(
+        lambda match: match.group(1)
+        + "'"
+        + json.dumps(fingerprint, separators=(",", ":")).replace("'", "''")
+        + "'",
         str(comment["body"]),
     )
     assert count == 1
@@ -304,8 +308,8 @@ def test_controlled_publisher_comment_id_binding_is_required():
     assert matched_result["contract_snapshot_url"] is not None
 
 
-def test_authority_postcondition_accepts_json_flow_fingerprint_via_fallback_parser():
-    """The real comparator accepts the producer's JSON flow mapping without PyYAML."""
+def test_authority_postcondition_accepts_canonical_fingerprint_via_fallback_parser():
+    """The real comparator accepts the producer's canonical scalar without PyYAML."""
     comment, fingerprint = _fallback_authority_fixture()
     expected_comment_body_sha256 = _ecs_mod.sha256_of(comment["body"])
 

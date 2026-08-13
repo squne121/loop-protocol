@@ -179,12 +179,93 @@ def _parse_fallback_scalar(value: str) -> Any:
     return value
 
 
-def _decode_producer_json_scalars(block: dict[str, Any]) -> dict[str, Any]:
+_SINGLE_QUOTED_SCALAR_WHOLE_RE = re.compile(r"^'(?P<payload>(?:[^'\r\n]|'')*)'$")
+
+_EXPECTED_CONTRACT_FINGERPRINT_KEY = "expected_contract_fingerprint"
+
+
+def _single_quoted_scalar_payload(value: str) -> Optional[str]:
+    """Decode ``value`` iff it is exactly one single-quoted YAML scalar
+    occupying the whole value position, else return ``None``.
+
+    YAML represents an apostrophe in a single-quoted scalar as ``''``;
+    convert that escape only after matching the complete, one-line scalar
+    form so a partial/embedded match can never be mistaken for canonical
+    transport.
+    """
+    match = _SINGLE_QUOTED_SCALAR_WHOLE_RE.match(value.strip())
+    if match is None:
+        return None
+    return match.group("payload").replace("''", "'")
+
+
+def _compose_canonical_fingerprint_scalar(composed: Any) -> Optional[str]:
+    """Resolve the exact-node-path canonical fingerprint scalar via PyYAML compose().
+
+    Unlike a regex over the whole raw YAML block, this walks the composed
+    node tree to the exact node path
+    ``CONTRACT_REVIEW_RESULT_V1.expected_contract_fingerprint`` so that a
+    same-named key elsewhere in the document (a sibling top-level key, text
+    inside a block scalar, etc.) can never be mistaken for the authoritative
+    field. Returns ``None`` when the field is absent or not a single-quoted
+    scalar at that exact path. Raises ``SimpleYamlParseError`` when the key
+    (or the ``CONTRACT_REVIEW_RESULT_V1`` marker itself) is duplicated in the
+    document, since duplicate keys make the authoritative value ambiguous.
+    """
+    import yaml  # noqa: F401 -- available in project venv (PyYAML)
+
+    if composed is None or not isinstance(composed, yaml.MappingNode):
+        return None
+
+    marker_value_node = None
+    marker_count = 0
+    for key_node, value_node in composed.value:
+        if isinstance(key_node, yaml.ScalarNode) and key_node.value == _CONTRACT_REVIEW_MARKER:
+            marker_count += 1
+            marker_value_node = value_node
+    if marker_count == 0:
+        return None
+    if marker_count > 1:
+        raise SimpleYamlParseError("duplicate_contract_review_result_marker_key")
+    if not isinstance(marker_value_node, yaml.MappingNode):
+        return None
+
+    fingerprint_node = None
+    fingerprint_count = 0
+    for key_node, value_node in marker_value_node.value:
+        if (
+            isinstance(key_node, yaml.ScalarNode)
+            and key_node.value == _EXPECTED_CONTRACT_FINGERPRINT_KEY
+        ):
+            fingerprint_count += 1
+            fingerprint_node = value_node
+    if fingerprint_count == 0:
+        return None
+    if fingerprint_count > 1:
+        raise SimpleYamlParseError("duplicate_contract_fingerprint_key")
+    if not isinstance(fingerprint_node, yaml.ScalarNode) or fingerprint_node.style != "'":
+        raise SimpleYamlParseError("noncanonical_contract_fingerprint_transport")
+    # yaml.compose() already resolves scalar escapes (including the ``''``
+    # apostrophe escape), so fingerprint_node.value is the decoded payload.
+    return fingerprint_node.value
+
+
+def _decode_producer_json_scalars(
+    block: dict[str, Any],
+    *,
+    fingerprint_scalar_resolver: Any,
+) -> dict[str, Any]:
     """Restore producer JSON transported inside YAML single-quoted scalars.
 
     Only the producer's fixed complex fields are decoded.  The same strict
     JSON parser and size/depth caps are used for both PyYAML and fallback
     paths, so quoting does not create a permissive YAML or JSON path.
+
+    ``fingerprint_scalar_resolver`` is a zero-argument callable, bound by the
+    caller to the exact node path ``CONTRACT_REVIEW_RESULT_V1.
+    expected_contract_fingerprint`` (via PyYAML compose() or the fallback
+    state machine), that returns the canonical single-quoted scalar text or
+    ``None``, and may raise ``SimpleYamlParseError`` for duplicate keys.
     """
     inner = block.get(_CONTRACT_REVIEW_MARKER)
     if not isinstance(inner, dict):
@@ -195,8 +276,22 @@ def _decode_producer_json_scalars(block: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, str) and value.startswith(("{", "[")):
             mapping[key] = _parse_bounded_strict_json_collection(value)
 
-    decode(inner, "expected_contract_fingerprint")
     checks = inner.get("checks")
+    # The producer's fingerprint transport is a single-quoted JSON mapping.
+    # A YAML flow or nested mapping has the same Python type after PyYAML
+    # parsing, so provenance must be checked against the raw transport before
+    # it can reach an authority consumer.  Reject instead of merely leaving a
+    # noncanonical value non-ready: legacy/provisional GO records may omit the
+    # field, but a supplied noncanonical fingerprint must not be surfaced as a
+    # candidate with ambiguous authority semantics.
+    if _EXPECTED_CONTRACT_FINGERPRINT_KEY in inner:
+        raw_fingerprint = fingerprint_scalar_resolver()
+        if raw_fingerprint is None:
+            raise SimpleYamlParseError("noncanonical_contract_fingerprint_transport")
+        fingerprint = _parse_bounded_strict_json_collection(raw_fingerprint)
+        if not isinstance(fingerprint, dict):
+            raise SimpleYamlParseError("expected_contract_fingerprint_must_be_mapping")
+        inner[_EXPECTED_CONTRACT_FINGERPRINT_KEY] = fingerprint
     if not isinstance(checks, dict):
         return block
     try:
@@ -228,7 +323,16 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
         import yaml  # noqa: F401 — available in project venv (PyYAML)
         parsed = yaml.safe_load(block)
         if isinstance(parsed, dict):
-            return _decode_producer_json_scalars(parsed)
+            try:
+                composed = yaml.compose(block)
+            except Exception:
+                composed = None
+            return _decode_producer_json_scalars(
+                parsed,
+                fingerprint_scalar_resolver=lambda: _compose_canonical_fingerprint_scalar(
+                    composed
+                ),
+            )
         return {}
     except Exception:
         pass
@@ -238,6 +342,14 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
     current_key: Optional[str] = None
     inside_checks = False
     current_checks_mapping: Optional[str] = None
+    # Track the raw (pre-_parse_fallback_scalar) text of
+    # CONTRACT_REVIEW_RESULT_V1.expected_contract_fingerprint at its exact
+    # structural position (current_key == marker, indent == 2) so the
+    # canonical-scalar check below is bound to that node path instead of a
+    # whole-block regex scan, matching the PyYAML compose() path.
+    fingerprint_raw: Optional[str] = None
+    fingerprint_seen = False
+    fingerprint_duplicate = False
 
     for line in block.splitlines():
         stripped = line.rstrip()
@@ -262,6 +374,14 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
             if not isinstance(result.get(current_key), dict):
                 result[current_key] = {}
             inside_checks = current_key == _CONTRACT_REVIEW_MARKER and sub_key == "checks" and not sub_value
+            if (
+                current_key == _CONTRACT_REVIEW_MARKER
+                and sub_key == _EXPECTED_CONTRACT_FINGERPRINT_KEY
+            ):
+                if fingerprint_seen:
+                    fingerprint_duplicate = True
+                fingerprint_seen = True
+                fingerprint_raw = sub_value
             result[current_key][sub_key] = (
                 {} if inside_checks else _parse_fallback_scalar(sub_value) if sub_value else None
             )
@@ -302,7 +422,16 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
                 _parse_fallback_scalar(sub_value) if sub_value else None
             )
 
-    return _decode_producer_json_scalars(result)
+    def _fallback_fingerprint_resolver() -> Optional[str]:
+        if fingerprint_duplicate:
+            raise SimpleYamlParseError("duplicate_contract_fingerprint_key")
+        if not fingerprint_seen or fingerprint_raw is None:
+            return None
+        return _single_quoted_scalar_payload(fingerprint_raw)
+
+    return _decode_producer_json_scalars(
+        result, fingerprint_scalar_resolver=_fallback_fingerprint_resolver
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +670,18 @@ def _is_valid_contract_review_result(
     if expected_issue_url and issue_url != expected_issue_url:
         return False
 
+    # A fingerprint is optional for legacy/provisional GO records, but when
+    # supplied it must already be a mapping.  In particular, a double-encoded
+    # JSON scalar is neither the producer's canonical single-quoted JSON
+    # transport nor a usable flow mapping.  Do not surface it as a GO result:
+    # downstream authority checks distinguish an absent current GO candidate
+    # from a candidate whose mapping merely differs from the expected value.
+    if (
+        "expected_contract_fingerprint" in inner
+        and not isinstance(inner["expected_contract_fingerprint"], dict)
+    ):
+        return False
+
     return True
 
 
@@ -568,13 +709,33 @@ def parse_contract_review_results(
 
     Results are ordered by created_at ascending (comment_id ascending).
     """
+    results, _telemetry = parse_contract_review_results_with_telemetry(
+        comments, expected_issue_url
+    )
+    return results
+
+
+def parse_contract_review_results_with_telemetry(
+    comments: list[dict],
+    expected_issue_url: Optional[str] = None,
+) -> tuple[list[dict], dict[str, int]]:
+    """Parse canonical results and report non-authoritative block telemetry.
+
+    Consumers that need invalid/ambiguous-block diagnostics must use this
+    helper instead of independently decoding YAML.  The returned result
+    records retain the same authority and fingerprint semantics as
+    :func:`parse_contract_review_results`.
+    """
     results: list[dict] = []
+    invalid_contract_blocks_count = 0
+    ambiguous_contract_blocks_count = 0
 
     for comment in comments:
         body = comment.get("body", "") or ""
         if _CONTRACT_REVIEW_MARKER not in body:
             continue
 
+        valid_blocks: list[dict] = []
         blocks = _extract_yaml_blocks(body)
         for raw_block in blocks:
             # Only consider blocks that contain the marker
@@ -585,6 +746,7 @@ def parse_contract_review_results(
             except SimpleYamlParseError:
                 # A malformed JSON flow collection is never downgraded to a
                 # scalar candidate for an authoritative contract result.
+                invalid_contract_blocks_count += 1
                 continue
             if _is_valid_contract_review_result(parsed, expected_issue_url):
                 inner = parsed[_CONTRACT_REVIEW_MARKER]
@@ -594,7 +756,7 @@ def parse_contract_review_results(
                 author_association = comment.get("author_association")
                 author_id = comment.get("author_id")
                 author_type = comment.get("author_type")
-                results.append(
+                valid_blocks.append(
                     {
                         "comment_id": comment.get("id"),
                         "html_url": comment.get("html_url", ""),
@@ -619,10 +781,23 @@ def parse_contract_review_results(
                         ),
                     }
                 )
-                # Only take first valid block per comment
-                break
+            else:
+                invalid_contract_blocks_count += 1
 
-    return results
+        if len(valid_blocks) > 1:
+            ambiguous_contract_blocks_count += 1
+        if valid_blocks:
+            # Only take the first valid block per comment, preserving the
+            # pre-existing consumer contract while surfacing ambiguity.
+            results.append(valid_blocks[0])
+
+    results.sort(
+        key=lambda item: (str(item.get("created_at") or ""), int(item.get("comment_id") or 0))
+    )
+    return results, {
+        "invalid_contract_blocks_count": invalid_contract_blocks_count,
+        "ambiguous_contract_blocks_count": ambiguous_contract_blocks_count,
+    }
 
 
 def filter_authoritative_results(results: list[dict]) -> list[dict]:

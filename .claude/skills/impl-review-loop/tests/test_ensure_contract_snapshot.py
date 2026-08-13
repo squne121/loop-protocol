@@ -2309,7 +2309,7 @@ CONTRACT_REVIEW_RESULT_V1:
   generated_by: issue-contract-review
   issue_url: {_AB_ISSUE_URL}
   body_sha256: "{_AB_SAMPLE_BODY_SHA256}"
-  expected_contract_fingerprint: {json.dumps(fingerprint)}
+  expected_contract_fingerprint: '{json.dumps(fingerprint, separators=(",", ":"))}'
 ```
 """,
     }
@@ -3054,7 +3054,7 @@ class TestProducerParserEscapedAdvisoryRoundTrip:
 
         assert "      classifications: '" in body
         assert "    declared_path_overlap: '" in body
-        assert "  expected_contract_fingerprint: {" in body
+        assert "  expected_contract_fingerprint: '{" in body
 
     def test_given_oversized_classifications_when_produced_then_snapshot_uses_bounded_strict_list(self):
         body, _fingerprint, classifications, _overlap = self._comment_body()
