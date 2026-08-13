@@ -211,7 +211,7 @@ anchor comment の fact-check 契約、`ANCHOR_COMMENT_CONTEXT_V1`、`ANCHOR_COM
 
 Step 1（codebase-investigator）と Step 1b（web-researcher）は、両方が required の場合に並列実行できる。ただし両 SubAgent の結果を Step 2 前に合流させること。
 
-web-researcher が critical claim にエビデンスを示せず、ハルシネーション疑いと判定した場合は `human_escalation` に倒す（Step 5）。
+web-researcher は AGY-first / native Web fallback を内部で完結する。critical claim に一次資料エビデンスを示せず、両 route でも検証不能またはハルシネーション疑いと判定した場合だけ `human_escalation` に倒す（Step 5）。provider telemetry / provenance trace の不足だけを escalation 理由にしてはならない。
 
 詳細は `references/web-research-routing.md` を参照する。
 

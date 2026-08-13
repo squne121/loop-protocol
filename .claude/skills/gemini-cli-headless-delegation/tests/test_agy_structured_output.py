@@ -476,25 +476,9 @@ def test_run_agy_non_supported_capability_argv_never_gets_output_format() -> Non
     assert completed.agy_structured_output_used is False  # type: ignore[attr-defined]
 
 
-def test_run_agy_non_supported_capability_end_to_end_legacy_semantics_regression_proof() -> None:
-    """fix_delta P0 iteration 2 (ac4_unenforced_in_default_production_path):
-    end-to-end through run_delegation(), grounded_research + non-supported
-    capability (the realistic DEFAULT production configuration -- no
-    AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST opt-in, current AGY resolves to
-    "inconclusive" not "supported") routes through the legacy text/marker
-    parser exactly as before -- but a bare model-generated `tool_calls` /
-    `sources` JSON blob in stdout, with NO corroborating validated
-    `agy_tool_provenance_v1` hook event, must now resolve fail-closed
-    instead of "grounded". This is the exact false-grounding anti-pattern
-    the pr-reviewer flagged (this test previously asserted the UNSAFE
-    "grounded" outcome for this same fixture -- see git history) and OWNER
-    gate 4 ("custom marker や model-generated tool_calls / sources だけでは
-    grounded にならない") targets. The route stays reachable and functional
-    (`ok is False` here is a genuine fail-closed *evidence* verdict, not a
-    hard error) -- see the companion
-    test_run_agy_non_supported_capability_end_to_end_legacy_semantics_grounded_with_hook_corroboration
-    below for proof that real, hook-corroborated grounding still works via
-    this same legacy route."""
+def test_run_agy_legacy_citations_without_provenance_are_candidates_for_native_quality_check() -> None:
+    """Parseable URLs survive as candidates, but cannot become a successful
+    grounded result before source-content verification."""
     grounded_output = (
         "Response from AGY.\n"
         '{"grounding":{"queries":["AGY WebSearch"],"sources":[{"url":"https://example.com","title":"example"}]},'
@@ -524,15 +508,25 @@ def test_run_agy_non_supported_capability_end_to_end_legacy_semantics_regression
             )
 
     evidence = result["grounded_research_evidence"]
-    # fix_delta iteration 2: model-generated stdout JSON alone (no hook
-    # corroboration -- this end-to-end flow's mocked subprocess never wrote
-    # a real hook_events.jsonl) must never resolve to "grounded".
-    assert evidence["grounding_status"] != "grounded"
-    assert evidence["grounding_failure_class"] == "agy_web_grounding_hook_corroboration_missing"
-    assert evidence["url_citation_count"] == 0
-    assert evidence["citation_evidence"] == []
+    assert evidence["grounding_status"] == "citation_candidates_unverified"
+    assert evidence["grounding_backend"] == "agy_final_result"
+    assert evidence["grounding_failure_class"] == "agy_evidence_quality_unverified"
+    assert evidence["url_citation_count"] == 1
+    assert evidence["citation_evidence"] == [{"url": "https://example.com", "title": "example"}]
     assert result["ok"] is False
-    assert result["failure_class"] == "agy_web_grounding_hook_corroboration_missing"
+    assert result["failure_class"] == "agy_evidence_quality_unverified"
+
+
+def test_valid_citation_with_zero_tool_count_is_not_a_tool_gate() -> None:
+    stdout = 'AGY_GROUNDED_RESEARCH:{"sources": [{"url": "https://example.com/primary"}]}'
+
+    evidence = rgh._build_agy_grounded_research_metadata(stdout)
+
+    assert evidence["web_tool_call_count"] == 0
+    assert evidence["search_query_count"] == 0
+    assert evidence["url_citation_count"] == 1
+    assert evidence["grounding_status"] == "citation_candidates_unverified"
+    assert evidence["grounding_failure_class"] == "agy_evidence_quality_unverified"
 
 
 def test_run_agy_non_supported_capability_end_to_end_legacy_semantics_grounded_with_hook_corroboration() -> None:

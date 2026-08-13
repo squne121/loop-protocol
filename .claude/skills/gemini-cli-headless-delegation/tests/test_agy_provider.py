@@ -336,22 +336,25 @@ def test_agy_grounded_research_no_web_tool_call_fail_closed() -> None:
     assert result["failure_class"] == "agy_web_grounding_tool_call_missing"
 
 
-def test_agy_grounded_research_url_without_tool_trace_fail_closed() -> None:
-    """A bare URL string in stdout without a machine-verifiable tool-call trace must NOT be
-    treated as a WebSearch execution proof (Issue #1266 Blocker 1)."""
+def test_agy_grounded_research_url_without_tool_trace_is_candidate_for_native_check() -> None:
+    """A URL without provider telemetry remains a candidate, not a grounded success.
+
+    The web-researcher must evaluate its source content or use native Web fallback;
+    `web_tool_call_count == 0` does not erase the URL or become the verdict gate.
+    """
     result = rgh._normalize_agy_result(
         _make_completed(0, stdout="Here is a helpful link: https://example.com/article"),
         tool_profile="grounded_research",
         requested_model=None,
     )
     evidence = result["grounded_research_evidence"]
-    assert evidence["grounding_backend"] == "none"
-    assert evidence["grounding_status"] == "attempted_no_web_tool_call"
-    assert evidence["grounding_failure_class"] == "agy_web_grounding_tool_call_missing"
+    assert evidence["grounding_backend"] == "agy_final_result"
+    assert evidence["grounding_status"] == "citation_candidates_unverified"
+    assert evidence["grounding_failure_class"] == "agy_evidence_quality_unverified"
     assert evidence["web_tool_call_count"] == 0
-    assert evidence["url_citation_count"] == 0
+    assert evidence["url_citation_count"] == 1
     assert result["ok"] is False
-    assert result["failure_class"] == "agy_web_grounding_tool_call_missing"
+    assert result["failure_class"] == "agy_evidence_quality_unverified"
 
 
 def test_agy_grounded_research_prompt_echo_url_not_counted_as_citation() -> None:

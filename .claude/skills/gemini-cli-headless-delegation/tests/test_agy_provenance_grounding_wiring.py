@@ -138,9 +138,9 @@ def test_validated_hook_event_with_real_grounding_citation_url_is_grounded() -> 
     assert result["ok"] is True
 
 
-def test_generic_url_without_vertex_grounding_pattern_not_counted_as_citation() -> None:
-    """A validated hook event confirms the tool call, but a *generic* (non-vertexaisearch)
-    URL in stdout must still not count as citation evidence (Issue #1266 Blocker 1)."""
+def test_generic_url_without_vertex_grounding_pattern_is_candidate_not_grounded() -> None:
+    """A generic URL remains available for source-content verification, but neither
+    provider hook nor tool telemetry may promote it to grounded success."""
     completed = _make_completed(0, stdout="Sunny. See https://example.com/weather for details.")
     completed.agy_provenance_hook_events = [_valid_hook_event()]  # type: ignore[attr-defined]
     completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
@@ -151,8 +151,10 @@ def test_generic_url_without_vertex_grounding_pattern_not_counted_as_citation() 
         requested_model=None,
     )
     evidence = result["grounded_research_evidence"]
-    assert evidence["grounding_status"] == "attempted_no_citations"
-    assert evidence["url_citation_count"] == 0
+    assert evidence["grounding_status"] == "citation_candidates_unverified"
+    assert evidence["grounding_backend"] == "agy_final_result"
+    assert evidence["grounding_failure_class"] == "agy_evidence_quality_unverified"
+    assert evidence["url_citation_count"] == 1
 
 
 # ---------------------------------------------------------------------------
