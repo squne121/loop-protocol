@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import builtins
 from pathlib import Path
 from unittest.mock import patch
 
@@ -330,16 +331,18 @@ def test_malformed_ndjson_sets_parse_warning():
 def _fingerprint_yaml_block(
     comment_id: int = 1, body_sha256: str | None = None, paths_hash: str | None = None
 ) -> str:
-    return f"""
-  expected_contract_fingerprint:
-    issue_number: 958
-    contract_source_kind: issue_comment
-    contract_source_id: "{comment_id}"
-    contract_body_sha256: "{body_sha256 or 'sha256:' + 'a' * 64}"
-    allowed_paths_normalized_sha256: "{paths_hash or 'b' * 64}"
-    base_ref: main
-    base_sha_at_snapshot: "{'c' * 40}"
-"""
+    fingerprint = {
+        "issue_number": 958,
+        "contract_source_kind": "issue_comment",
+        "contract_source_id": str(comment_id),
+        "contract_body_sha256": body_sha256 or "sha256:" + "a" * 64,
+        "allowed_paths_normalized_sha256": paths_hash or "b" * 64,
+        "base_ref": "main",
+        "base_sha_at_snapshot": "c" * 40,
+    }
+    return "\n  expected_contract_fingerprint: '" + json.dumps(
+        fingerprint, separators=(",", ":")
+    ).replace("'", "''") + "'\n"
 
 
 def test_ac3_go_with_fingerprint_routes_to_proceed():
@@ -372,6 +375,101 @@ CONTRACT_REVIEW_RESULT_V1:
     assert exit_code == 0
     assert capsule["contract_snapshot"]["normalized_status"] == "go"
     assert capsule["next_action"]["route"] == "proceed_to_step_1"
+
+
+def test_ac3_canonical_fingerprint_reaches_consumer_via_forced_fallback(monkeypatch):
+    """GIVEN canonical producer output WHEN PyYAML is unavailable THEN intake accepts it."""
+    comment_id = 42
+    issue_body = "## Machine-Readable Contract\n\nstatus: full-body\n\n## Allowed Paths\n- tracked.txt\n"
+    body_sha256 = mod._sha256(issue_body)
+    paths_hash = mod._live_allowed_paths_hash(issue_body)
+    go_body = f"""
+```yaml
+CONTRACT_REVIEW_RESULT_V1:
+  status: go
+  generated_at: "2026-06-19T00:01:00Z"
+  generated_by: issue-contract-review
+  issue_url: https://github.com/squne121/loop-protocol/issues/958
+  body_sha256: "{body_sha256}"{_fingerprint_yaml_block(comment_id, body_sha256, paths_hash)}```
+"""
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "", ""),
+            (0, _comment_ndjson(go_body, comment_id=comment_id), ""),
+        ]
+    )
+    original_import = builtins.__import__
+
+    def reject_yaml(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError("forced fallback")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_yaml)
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, artifact, exit_code = mod.build_intake_capsule(958, "squne121/loop-protocol", None)
+
+    assert exit_code == 0
+    assert capsule["contract_snapshot"]["normalized_status"] == "go"
+    assert artifact["source_integrity"]["parse_warnings"]["invalid_contract_blocks_count"] == 0
+
+
+def test_ac4_noncanonical_flow_fingerprint_is_rejected_by_intake_with_parser_parity(monkeypatch):
+    """GIVEN a flow mapping WHEN either parser runs THEN intake keeps it non-authoritative."""
+    issue_body = "## Machine-Readable Contract\n\nstatus: full-body\n\n## Allowed Paths\n- tracked.txt\n"
+    body_sha256 = mod._sha256(issue_body)
+    fingerprint = {
+        "issue_number": 958,
+        "contract_source_kind": "issue_comment",
+        "contract_source_id": "42",
+        "contract_body_sha256": body_sha256,
+        "allowed_paths_normalized_sha256": mod._live_allowed_paths_hash(issue_body),
+        "base_ref": "main",
+        "base_sha_at_snapshot": "c" * 40,
+    }
+    go_body = f"""
+```yaml
+CONTRACT_REVIEW_RESULT_V1:
+  status: go
+  generated_at: "2026-06-19T00:01:00Z"
+  generated_by: issue-contract-review
+  issue_url: https://github.com/squne121/loop-protocol/issues/958
+  body_sha256: "{body_sha256}"
+  expected_contract_fingerprint: {json.dumps(fingerprint, separators=(",", ":"))}
+```
+"""
+
+    original_import = builtins.__import__
+
+    for force_fallback in (False, True):
+        run_cmd = _run_command_side_effect_factory(
+            [
+                (0, _issue_view_json(), ""),
+                (0, "abc\n", ""),
+                (0, "main\n", ""),
+                (0, "", ""),
+                (0, _comment_ndjson(go_body, comment_id=42), ""),
+            ]
+        )
+
+        def maybe_reject_yaml(name, *args, **kwargs):
+            if force_fallback and name == "yaml":
+                raise ImportError("forced fallback")
+            return original_import(name, *args, **kwargs)
+
+        with monkeypatch.context() as nested_patch:
+            nested_patch.setattr(builtins, "__import__", maybe_reject_yaml)
+            with patch.object(mod, "_run_command", side_effect=run_cmd):
+                capsule, artifact, exit_code = mod.build_intake_capsule(
+                    958, "squne121/loop-protocol", None
+                )
+
+        assert exit_code == 0
+        assert capsule["contract_snapshot"]["normalized_status"] == "missing_go"
+        assert artifact["source_integrity"]["parse_warnings"]["invalid_contract_blocks_count"] == 1
 
 
 def test_ac3_go_without_fingerprint_routes_to_missing_go_and_proceeds_advisory():
