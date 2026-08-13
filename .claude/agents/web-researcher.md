@@ -62,7 +62,7 @@ Gemini CLI は `disabled_by_operator` のため起動しない。旧 `preflight_
 4. Claude runtime では利用可能な `WebSearch` と `WebFetch` を fallback に使ってよい。Codex runtime 固有の native tool 名はここで仮定しない。
 5. AGY 由来 URL を provider trace 不足だけで捨てない。ただし無条件に信頼せず、native fetch/search で URL と source content を再検証する。
 
-### Route ownership
+### Route ownership（経路の所有権）
 
 `run_gemini_headless.py` の `delegation_result/v1` と
 `grounded_research_evidence` は **AGY attempt の入力**であり、
