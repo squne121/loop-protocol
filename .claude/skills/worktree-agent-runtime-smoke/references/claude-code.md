@@ -118,6 +118,27 @@ claude -p \
 - `Edit`/`MultiEdit`/`Write`/`NotebookEdit`/`Bash`/`Agent` の tool_use event が 1 件でも
   観測されれば run 全体が FAIL（exit 1）。deny 設定の有効性を model の自己申告に依存しない
 
+## `--claude-bin` による launcher 選択（Issue #2174）
+
+`--claude-bin <absolute path>` は `--runtime claude` 限定のオプション入力であり、
+claude 互換の実行ファイル（例: `scripts/claude-gpt/launch.sh` のような
+claude-gpt launcher）の絶対パスを明示的に指定できる。
+
+- **structured lane**: `preflight_claude_available()` が `shutil.which("claude")`
+  による PATH 解決を行わず、`--claude-bin` の絶対パスをそのまま実行ファイルと
+  して使用する（存在確認・実行可能性確認は行うが、PATH lookup は一切行わない）。
+  以降の version capture・固定 argv 実行はすべてこの絶対パスに対して行われる。
+- **interactive herdr lane**: herdr 自体は `--kind claude` の実行ファイルを
+  常に自分自身の PATH lookup で解決し、明示的な binary path を受け付ける
+  flag を持たない。そのため runner は isolated session 専用の一時ディレクトリを
+  作成し、その中に `claude` という名前で `--claude-bin` の絶対パスへの
+  symlink を置いた上で、そのディレクトリを isolated session の環境変数
+  `PATH` の先頭に追加してから `herdr workspace create` / `herdr agent start`
+  を実行する。isolated session 終了時（cleanup の一部として）にこの一時
+  ディレクトリを削除する。
+- `--claude-bin` 未指定時（既定の `None`）は、structured lane・interactive
+  lane のいずれも既存の `shutil.which("claude")` PATH 解決から一切変更されない。
+
 ## 観測できる主な evidence
 
 - structured lane: `type: system/init`、`type: result`、hook lifecycle event の件数を確認できる

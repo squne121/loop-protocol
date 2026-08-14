@@ -443,9 +443,20 @@ def diff_fingerprints(before: dict | None, after: dict | None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def preflight_claude_available() -> tuple[str | None, str | None]:
+def preflight_claude_available(
+    claude_bin_override: str | None = None,
+) -> tuple[str | None, str | None]:
     """Resolve the ``claude`` executable exactly once and return
     ``(resolved_executable, skip_reason)``.
+
+    Issue #2174 (AC1): when ``claude_bin_override`` is a non-empty absolute
+    path (the ``--claude-bin`` CLI flag), it is used directly as the
+    resolved executable -- ``shutil.which("claude")`` PATH resolution is
+    bypassed entirely. This lets a caller pin a specific launcher (e.g. a
+    ``claude-gpt`` bootstrap wrapper) instead of whatever ``claude`` happens
+    to resolve to on ``PATH``. When ``claude_bin_override`` is ``None`` (the
+    default), behavior is byte-for-byte unchanged from before this flag
+    existed (AC6).
 
     Issue #1960: capability (which flags a given Claude Code version
     accepts) is no longer decided from ``claude --help`` text. The CLI
@@ -469,6 +480,11 @@ def preflight_claude_available() -> tuple[str | None, str | None]:
     being used for version-capture vs. execution if PATH/shims/symlinks
     change mid-run.
     """
+    if claude_bin_override:
+        resolved_override = os.path.realpath(claude_bin_override)
+        if not os.path.isfile(resolved_override) or not os.access(resolved_override, os.X_OK):
+            return None, f"--claude-bin path is not an executable file: {claude_bin_override}"
+        return resolved_override, None
     exe = shutil.which("claude")
     if exe is None:
         return None, "required command not found: claude"
@@ -2392,10 +2408,24 @@ def run_interactive_herdr_isolated(
     evidence: dict,
     *,
     herdr_bin: str = "herdr",
+    claude_bin_override: str | None = None,
 ) -> list[str]:
     """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
     in place (so cleanup/session identity survive even if this raises) and
-    returns the bounded, redacted pane output lines."""
+    returns the bounded, redacted pane output lines.
+
+    Issue #2174 (AC1): when ``runtime == "claude"`` and ``claude_bin_override``
+    is a non-empty absolute path, ``herdr agent start --kind claude`` is made
+    to resolve that exact binary instead of whatever ``claude`` happens to be
+    on the ambient ``PATH``. ``herdr`` itself has no flag to accept an
+    explicit binary path for ``--kind`` (it always re-resolves the runtime
+    name via its own PATH lookup -- see ``references/claude-code.md``), so
+    this is done by prepending a session-local temporary directory
+    containing a single ``claude`` symlink (pointing at
+    ``claude_bin_override``) to ``PATH`` in the isolated session's own
+    environment, before ``herdr workspace create`` / ``herdr agent start``
+    run. Omitted by default (``claude_bin_override=None``), leaving every
+    pre-existing caller's isolated-session ``PATH`` unchanged (AC6)."""
     session_name = new_isolated_session_name(herdr_bin)
     evidence["session_name"] = session_name
 
@@ -2403,6 +2433,7 @@ def run_interactive_herdr_isolated(
     evidence["agent_name"] = agent_name
     pane_output_lines: list[str] = []
     session_proc: subprocess.Popen | None = None
+    claude_bin_shim_dir: str | None = None
     try:
         # Actually create the isolated session (not merely set an env var and
         # hope) and block until its independent existence is confirmed via
@@ -2423,6 +2454,20 @@ def run_interactive_herdr_isolated(
         isolated_env["HERDR_SESSION"] = session_name
         if socket_path:
             isolated_env["HERDR_SOCKET_PATH"] = socket_path
+
+        if runtime == "claude" and claude_bin_override:
+            resolved_claude_bin_override = os.path.realpath(claude_bin_override)
+            if not os.path.isfile(resolved_claude_bin_override) or not os.access(
+                resolved_claude_bin_override, os.X_OK
+            ):
+                raise HerdrLaneError(
+                    "--claude-bin path is not an executable file: "
+                    f"{claude_bin_override}"
+                )
+            claude_bin_shim_dir = tempfile.mkdtemp(prefix="worktree-agent-runtime-smoke-claude-bin-")
+            os.symlink(resolved_claude_bin_override, str(Path(claude_bin_shim_dir) / "claude"))
+            existing_path = isolated_env.get("PATH", os.defpath)
+            isolated_env["PATH"] = claude_bin_shim_dir + os.pathsep + existing_path
 
         rc, out, err, timed_out = _run(
             [herdr_bin, "workspace", "create", "--cwd", worktree, "--no-focus"],
@@ -2600,6 +2645,8 @@ def run_interactive_herdr_isolated(
                 session_proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 session_proc.kill()
+        if claude_bin_shim_dir is not None:
+            shutil.rmtree(claude_bin_shim_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2652,6 +2699,17 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _absolute_path(value: str) -> str:
+    """argparse ``type`` for ``--claude-bin`` (Issue #2174 AC1): only accepts
+    absolute paths, rejecting relative paths as an argument error (argparse
+    ``error()`` -> exit code 2)."""
+    if not os.path.isabs(value):
+        raise argparse.ArgumentTypeError(
+            f"--claude-bin must be an absolute path, got: {value!r}"
+        )
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="worktree-agent-runtime-smoke runner")
     parser.add_argument("--runtime", choices=["claude", "codex"], required=True)
@@ -2673,6 +2731,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-turns", type=_positive_int, default=_DEFAULT_MAX_TURNS,
                          help="bounded turn count for Claude Code (structured lane only; positive integer)")
+    parser.add_argument(
+        "--claude-bin",
+        type=_absolute_path,
+        default=None,
+        help=(
+            "Issue #2174 (AC1): optional absolute path to a claude-compatible "
+            "executable (e.g. a claude-gpt launcher). Applies only to "
+            "--runtime claude. When provided, this fixed absolute path is "
+            "used directly as the claude executable for the structured lane "
+            "(bypassing shutil.which('claude') PATH resolution) and, for "
+            "the interactive herdr lane, via a session-local PATH override "
+            "so 'herdr agent start --kind claude' resolves this exact "
+            "binary instead of whatever 'claude' is on the ambient PATH. "
+            "Omitted by default (None), so every pre-existing caller's "
+            "shutil.which('claude') PATH resolution is unchanged."
+        ),
+    )
     parser.add_argument("--expect-marker", action="append", default=[])
     parser.add_argument(
         "--require-observed-runtime-field",
@@ -2928,7 +3003,7 @@ def main(argv: list[str] | None = None) -> int:
         # fixed-argv invocation result (classify_claude_structured_outcome),
         # never from ``claude --help`` text (AC1/AC5).
         if args.runtime == "claude":
-            resolved_runtime_bin, skip_reason = preflight_claude_available()
+            resolved_runtime_bin, skip_reason = preflight_claude_available(args.claude_bin)
         else:
             resolved_runtime_bin, skip_reason = preflight_codex_flags()
         if skip_reason:
@@ -3032,6 +3107,13 @@ def main(argv: list[str] | None = None) -> int:
         # not independently confirmed for this lane -- an honest,
         # documented constraint rather than a silently omitted guarantee.
         schema_summary["resolved_executable_binding_note"] = (
+            "interactive lane launches via `herdr agent start --kind "
+            "claude`; --claude-bin was supplied, so a session-local PATH "
+            "override (a `claude` name symlinked to the --claude-bin "
+            "absolute path) was prepended to the isolated herdr session's "
+            "environment before `herdr agent start`, so herdr's own PATH "
+            "lookup resolves to this explicit binary (Issue #2174)."
+        ) if (args.runtime == "claude" and args.claude_bin) else (
             "interactive lane launches via `herdr agent start --kind "
             "<runtime>`, which re-resolves the binary via herdr's own PATH "
             "lookup; resolved_executable above (from this runner's own "
@@ -3387,6 +3469,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
+                    claude_bin_override=args.claude_bin if args.runtime == "claude" else None,
                 )
 
                 if evidence.get("final_state") == "blocked":
