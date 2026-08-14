@@ -97,7 +97,7 @@ validator（`validate_ci_reliability_assessment_v1.py`）は `run_attempt == 1` 
 
 Playwright logical test の最終 attempt が `skipped` の場合も、`playwright_flaky_test_rate` / `playwright_terminal_failure_rate` の両方の分母から除外する（実行されなかったテストとして扱う）。
 
-## Playwright expected outcome semantics（expected_status）
+## Playwright expected outcome semantics（Playwright の期待結果セマンティクス、expected_status）
 
 `PlaywrightTestAttempt.expected_status`（任意項目、`status` と同じ enum）は Playwright 自身の `expectedStatus`（`test.fail()` 等で変化する）を表す。省略時は `"passed"` を既定値として扱う（既存 producer の後方互換性を維持）。
 
