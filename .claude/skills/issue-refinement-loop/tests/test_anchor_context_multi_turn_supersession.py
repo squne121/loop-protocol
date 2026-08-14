@@ -50,6 +50,15 @@ import run_refinement_preflight as preflight  # noqa: E402
 
 _apply_multi_turn_candidate_route = preflight._apply_multi_turn_candidate_route
 _classify_heavy_mutation_gate = preflight._classify_heavy_mutation_gate
+_classify_anchor_scope_reframe = preflight._classify_anchor_scope_reframe
+
+_REPO_2156 = "squne121/loop-protocol"
+_ISSUE_2156 = 2156
+_URL_2156 = f"https://github.com/{_REPO_2156}/issues/{_ISSUE_2156}#issuecomment-999001"
+
+
+def _payload_2156(association: str) -> dict:
+    return {"author_association": association}
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +525,178 @@ def test_multi_turn_route_missing_inputs_is_noop():
     baseline_decision = {"status": "approved_by_trusted_anchor"}
     routed = _apply_multi_turn_candidate_route(baseline_decision, None, None)
     assert routed == baseline_decision
+
+
+# ---------------------------------------------------------------------------
+# #2156 AC5/AC6/AC8: producer (`_classify_anchor_scope_reframe`) -> consumer
+# (`_apply_multi_turn_candidate_route`) integration -- exercises the REAL
+# classifier return value (not a hand-built fixture dict) end to end.
+# ---------------------------------------------------------------------------
+
+
+def test_producer_consumer_chain_classify_to_route_to_approval():
+    """AC8: `_classify_anchor_scope_reframe()`'s actual return value, fed
+    through `_apply_multi_turn_candidate_route()`, covers the four AC5/AC6/AC3
+    scenarios:
+
+    1. trusted OWNER, single-turn, genuine absence
+    2. trusted OWNER, multi-turn, genuine absence, integrity confirmed
+       (advisory upgrade)
+    3. trusted OWNER, multi-turn, genuine absence, integrity unconfirmed
+       (stays blocking)
+    4. trusted OWNER, present-but-wrong-schema-version fence (stays
+       fail_closed, never not_applicable)
+    """
+    # --- Scenario 1: single-turn genuine absence ---
+    single_turn_decision = _classify_anchor_scope_reframe(
+        comment_payload=_payload_2156("OWNER"),
+        anchor_body=FIXTURE_UNMARKED_REGION,
+        repo=_REPO_2156,
+        issue_number=_ISSUE_2156,
+        anchor_url=_URL_2156,
+    )
+    assert single_turn_decision["status"] == "not_applicable"
+    assert single_turn_decision["reason"] == "no_anchor_scope_reframe_v1_payload"
+
+    single_turn_segments = ac.segment_body(FIXTURE_UNMARKED_REGION)
+    single_turn_candidates = ac.extract_candidates(FIXTURE_UNMARKED_REGION)
+    single_turn_routed = _apply_multi_turn_candidate_route(
+        single_turn_decision,
+        single_turn_segments,
+        single_turn_candidates,
+        integrity_predicates=_FULL_INTEGRITY_PREDICATES,
+    )
+    # Single-turn: the multi-turn route is a no-op (fewer than 2 marked
+    # segments), so the not_applicable classification passes through
+    # unchanged.
+    assert single_turn_routed == single_turn_decision
+    assert single_turn_routed["status"] == "not_applicable"
+
+    # --- Scenario 2: multi-turn genuine absence, integrity confirmed ---
+    multi_turn_decision = _classify_anchor_scope_reframe(
+        comment_payload=_payload_2156("OWNER"),
+        anchor_body=FIXTURE_869_LINES,
+        repo=_REPO_2156,
+        issue_number=_ISSUE_2156,
+        anchor_url=_URL_2156,
+    )
+    assert multi_turn_decision["status"] == "not_applicable"
+    assert multi_turn_decision["reason"] == "no_anchor_scope_reframe_v1_payload"
+
+    multi_turn_segments = ac.segment_body(FIXTURE_869_LINES)
+    multi_turn_candidates = ac.extract_candidates(FIXTURE_869_LINES)
+
+    confirmed_routed = _apply_multi_turn_candidate_route(
+        multi_turn_decision,
+        multi_turn_segments,
+        multi_turn_candidates,
+        integrity_predicates=_FULL_INTEGRITY_PREDICATES,
+    )
+    assert confirmed_routed["status"] == "warn"
+    assert confirmed_routed["reason"] == "multi_turn_anchor_context_trusted_owner_advisory"
+    assert confirmed_routed["implementation_go"] is False
+
+    # --- Scenario 3: multi-turn genuine absence, integrity unconfirmed ---
+    unconfirmed_predicates = dict(_FULL_INTEGRITY_PREDICATES)
+    unconfirmed_predicates["source_ranges_covered"] = False
+    unconfirmed_routed = _apply_multi_turn_candidate_route(
+        multi_turn_decision,
+        multi_turn_segments,
+        multi_turn_candidates,
+        integrity_predicates=unconfirmed_predicates,
+    )
+    assert unconfirmed_routed["status"] == "fail_closed"
+    assert unconfirmed_routed["status"] != "not_applicable"
+    assert unconfirmed_routed["implementation_go"] is False
+
+    # --- Scenario 4: present-but-wrong-schema-version fence stays fail_closed ---
+    wrong_schema_body = "```yaml\nschema_version: WRONG_SCHEMA_V1\n```\n"
+    wrong_schema_decision = _classify_anchor_scope_reframe(
+        comment_payload=_payload_2156("OWNER"),
+        anchor_body=wrong_schema_body,
+        repo=_REPO_2156,
+        issue_number=_ISSUE_2156,
+        anchor_url=_URL_2156,
+    )
+    assert wrong_schema_decision["status"] == "fail_closed"
+    assert wrong_schema_decision["status"] != "not_applicable"
+    assert wrong_schema_decision["reason"].startswith("schema_invalid:")
+
+    wrong_schema_segments = ac.segment_body(wrong_schema_body)
+    wrong_schema_candidates = ac.extract_candidates(wrong_schema_body)
+    wrong_schema_routed = _apply_multi_turn_candidate_route(
+        wrong_schema_decision,
+        wrong_schema_segments,
+        wrong_schema_candidates,
+        integrity_predicates=_FULL_INTEGRITY_PREDICATES,
+    )
+    # Not a multi-turn transcript (single segment), so passes through
+    # unchanged, still fail_closed / schema_invalid.
+    assert wrong_schema_routed == wrong_schema_decision
+    assert wrong_schema_routed["status"] == "fail_closed"
+
+
+def test_genuine_absence_integrity_confirmed_advisory_upgrade_via_classifier():
+    """AC5: the classifier's real not_applicable return value, routed through
+    a genuine multi-turn transcript with full retrieval integrity confirmed,
+    is upgraded to the trusted-owner advisory `warn` status."""
+    decision = _classify_anchor_scope_reframe(
+        comment_payload=_payload_2156("OWNER"),
+        anchor_body=FIXTURE_869_LINES,
+        repo=_REPO_2156,
+        issue_number=_ISSUE_2156,
+        anchor_url=_URL_2156,
+    )
+    assert decision["status"] == "not_applicable"
+
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+    routed = _apply_multi_turn_candidate_route(
+        decision,
+        segments_result,
+        candidates_result,
+        integrity_predicates=_FULL_INTEGRITY_PREDICATES,
+    )
+    assert routed["status"] == "warn"
+    assert routed["reason"] == "multi_turn_anchor_context_trusted_owner_advisory"
+    assert routed["implementation_go"] is False
+    assert "latest_owner_turn" in routed
+
+
+def test_genuine_absence_integrity_unconfirmed_stays_blocking_via_classifier():
+    """AC6: the classifier's real not_applicable return value, routed through
+    a genuine multi-turn transcript with retrieval integrity NOT confirmed,
+    must stay blocking (`fail_closed`, `implementation_go: false`) rather
+    than silently remaining `not_applicable` (non-blocking)."""
+    decision = _classify_anchor_scope_reframe(
+        comment_payload=_payload_2156("OWNER"),
+        anchor_body=FIXTURE_869_LINES,
+        repo=_REPO_2156,
+        issue_number=_ISSUE_2156,
+        anchor_url=_URL_2156,
+    )
+    assert decision["status"] == "not_applicable"
+
+    segments_result = ac.segment_body(FIXTURE_869_LINES)
+    candidates_result = ac.extract_candidates(FIXTURE_869_LINES)
+
+    for missing_key in ("source_fetch_complete", "source_hash_verified", "source_ranges_covered"):
+        predicates = dict(_FULL_INTEGRITY_PREDICATES)
+        predicates[missing_key] = False
+        routed = _apply_multi_turn_candidate_route(
+            decision,
+            segments_result,
+            candidates_result,
+            integrity_predicates=predicates,
+        )
+        assert routed["status"] == "fail_closed", (missing_key, routed)
+        assert routed["status"] != "not_applicable"
+        assert routed["implementation_go"] is False
+
+    routed_no_predicates = _apply_multi_turn_candidate_route(
+        decision, segments_result, candidates_result
+    )
+    assert routed_no_predicates["status"] == "fail_closed"
 
 
 # ---------------------------------------------------------------------------

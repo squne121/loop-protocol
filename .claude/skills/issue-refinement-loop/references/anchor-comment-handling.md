@@ -133,6 +133,15 @@ planner が受け取るのは normalized decision / hash / provenance のみと�
 
 詳細な shape は `references/scope-signal-guard.md` の「scope_delta_authority_evidence_v1（正規化済み evidence, AC14）」を参照する。
 
+### `_classify_anchor_scope_reframe()` の genuine absence / present-but-invalid tri-state（#2156）
+
+`_classify_anchor_scope_reframe()` が ```yaml fenced block を解析できなかった場合、以下の 2 つを区別する:
+
+- **genuine absence**（本文に ```yaml fence 自体が存在しない）: `status: not_applicable`、`reason: no_anchor_scope_reframe_v1_payload` を返す。trusted author の freeform コメントとして `_build_scope_delta_authority_evidence()` の freeform lane（上記）が継続利用できる正規の経路であり、hard stop しない。
+- **present-but-invalid**（```yaml fence は存在するが YAML 構文エラー、または `schema_version` が `ANCHOR_SCOPE_REFRAME_V1` と一致しない。blockquote 埋め込みの fence を含む）: `status: fail_closed`、`reason: schema_invalid: ...` を返し、既存の invalid-payload 系 fail-closed 挙動（`_structured_anchor_payload_present_but_invalid()` が `True` を返し freeform evidence へのフォールバックを禁止する）を維持する。
+
+この区別は `_anchor_scope_reframe_fence_present()` が行う。genuine absence と present-but-invalid の判定は fence の存在有無のみで行い、fence の内容が valid かどうかには依存しない。
+
 ## Operator-Selected Human-Context 継続と Accepted Trust Model（#2086）
 
 ### origin lane は operator が宣言する（Accepted Trust Model）
@@ -217,7 +226,7 @@ freeform directive では常に空になる（`derive_contract_patch_operations(
 
 分岐は anchor comment の投稿者が trusted OWNER（`anchor_author_association == "OWNER"`）かどうかで変わる:
 
-- **trusted OWNER の場合（advisory route）**: `status` を `warn` にし、`reason: multi_turn_anchor_context_trusted_owner_advisory` を設定する。最後の owner-speaker セグメントの `index` / `start_line` / `end_line` は `latest_owner_turn` として **chronology metadata のみ**を記録する。`latest_owner_turn` は `technical_recommendation`（repository facts・diff・test・外部仕様から control-plane が決定する推奨内容）にも `mutation_authorization`（明示的な owner 承認）にも昇格させない。multi-turn であること自体は hard block の理由にならないが、`implementation_go` は `false` のままであり、単独で実装 go を意味しない。
+- **trusted OWNER の場合（advisory route）**: `status` を `warn` にし、`reason: multi_turn_anchor_context_trusted_owner_advisory` を設定する。最後の owner-speaker セグメントの `index` / `start_line` / `end_line` は `latest_owner_turn` として **chronology metadata のみ**を記録する。`latest_owner_turn` は `technical_recommendation`（repository facts・diff・test・外部仕様から control-plane が決定する推奨内容）にも `mutation_authorization`（明示的な owner 承認）にも昇格させない。multi-turn であること自体は hard block の理由にならないが、`implementation_go` は `false` のままであり、単独で実装 go を意味しない。この advisory upgrade は `reason: no_anchor_scope_reframe_v1_payload` の場合に、upstream `status` が `fail_closed` / `not_applicable`（#2156 AC2 以降の genuine absence の既定値）のいずれであっても、取得完全性（source fetch complete / hash verified / source ranges covered）が全て確認できたときにのみ発火する。取得完全性が確認できない場合、upstream `status` が `not_applicable`（非 blocking）であっても `status: fail_closed`（blocking、`implementation_go: false`）へ強制され、`not_applicable` のまま残ることはない（#2156 AC6 — 非 blocking への意味的降格を防ぐ）。
 - **trusted OWNER 以外の場合（hard block を維持）**: 従来通り `status: fail_closed`、`reason: multi_turn_anchor_context_requires_human_judgment` を設定し、blockers へ `ANCHOR_MULTI_TURN_FAIL_CLOSED` を伝搬する。untrusted author、取得不完全、hash 不一致、source range 欠落の fail-closed 不変条件はこの advisory route の対象外であり、緩和されない。
 
 **chronology ≠ semantic relation ≠ technical recommendation ≠ mutation authorization** という 4 軸の分離が本節の前提である。最後の owner turn という chronology の事実だけで、残り 3 軸（そのターンが持つ意味関係・技術推奨・mutation authorization）を決定してはならない。

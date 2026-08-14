@@ -331,9 +331,8 @@ legacy projection と v2 は同一の delta 計算結果を共有し、二重計
 `known_context.scope_delta_decision` を、planner が v2 `scope_delta_approval` に投影する（adapter）。
 
 - `status: approved_by_trusted_anchor`（`implementation_go: false` かつ信頼済み author）は `status: approved` に投影する
-- `reason: no_anchor_scope_reframe_v1_payload` は marker 未検出として `status: missing_marker` に投影する（AC3 lane）
-- `status: not_applicable` は reframe 未試行として `status: missing` に投影する
-- その他の `fail_closed`（信頼できない author、repo / issue 不一致、schema 不正）は `status: invalid_scope_delta_approval` に投影する
+- `reason: no_anchor_scope_reframe_v1_payload` は marker 未検出として `status: missing_marker` に投影する（AC3 lane）。#2156 AC2 以降、この reason を持つ upstream `status` は `not_applicable`（genuine absence、trusted author の anchor comment 自体は存在する）である。`status: not_applicable` を理由に `comment_url` / `body_sha256` / `author_association` / `required_rerun` の evidence を落として bare `missing` に投影してはならない（#2156 AC7 — 投影先の `status` は `missing_marker` のまま、evidence フィールドのみ `scope_delta_decision` から populate する）
+- その他の `fail_closed`（信頼できない author、repo / issue 不一致、schema 不正、present-but-invalid な ANCHOR_SCOPE_REFRAME_V1 fence）は `status: invalid_scope_delta_approval` に投影する
 
 投影フィールド: `comment_url ← anchor_comment_url` / `body_sha256 ← anchor_comment_hash` /
 `author_association ← anchor_author_association` / `required_rerun ← required_rerun`。

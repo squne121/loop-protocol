@@ -725,3 +725,68 @@ def test_genuine_positive_imperative_bullet_still_explicit_ac1_blocker4():
         == sda.DIRECTIVE_CONFIDENCE_EXPLICIT
     )
 
+
+# ---------------------------------------------------------------------------
+# #2156 AC7: `_project_scope_delta_decision_to_approval()` (plan_refinement_loop.py)
+# must not drop trusted-author anchor comment evidence for the genuine-absence
+# (`status: not_applicable`) case.
+# ---------------------------------------------------------------------------
+
+import importlib.util as _importlib_util  # noqa: E402
+
+_PLAN_SCRIPTS_DIR = SKILL_ROOT / "scripts"
+
+
+def _load_plan_refinement_loop_module():
+    if "scope_signal_delta" not in sys.modules:
+        _spec_sd = _importlib_util.spec_from_file_location(
+            "scope_signal_delta", _PLAN_SCRIPTS_DIR / "scope_signal_delta.py"
+        )
+        assert _spec_sd is not None and _spec_sd.loader is not None
+        _module_sd = _importlib_util.module_from_spec(_spec_sd)
+        sys.modules["scope_signal_delta"] = _module_sd
+        _spec_sd.loader.exec_module(_module_sd)
+
+    _spec = _importlib_util.spec_from_file_location(
+        "plan_refinement_loop_2156", _PLAN_SCRIPTS_DIR / "plan_refinement_loop.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    _module = _importlib_util.module_from_spec(_spec)
+    sys.modules["plan_refinement_loop_2156"] = _module
+    _spec.loader.exec_module(_module)
+    return _module
+
+
+def test_not_applicable_genuine_absence_preserves_anchor_evidence():
+    """AC7: when `scope_delta_decision.status == "not_applicable"` (the
+    genuine-absence case, #2156 AC2), `_project_scope_delta_decision_to_approval()`
+    must still populate the trusted author's anchor comment evidence fields
+    (`comment_url` / `body_sha256` / `author_association` / `required_rerun`)
+    from `scope_delta_decision` rather than leaving them at the
+    `_base_approval_result()` defaults. The final `approval["status"]` stays
+    `missing_marker` (unchanged from the pre-#2156 `fail_closed` +
+    `no_anchor_scope_reframe_v1_payload` projection)."""
+    planner = _load_plan_refinement_loop_module()
+
+    scope_delta_decision = preflight._classify_anchor_scope_reframe(
+        comment_payload=_payload(association="OWNER"),
+        anchor_body="Just a plain review comment without any reframe marker.",
+        repo=REPO,
+        issue_number=ISSUE,
+        anchor_url=URL,
+    )
+    assert scope_delta_decision["status"] == "not_applicable"
+    assert scope_delta_decision["reason"] == "no_anchor_scope_reframe_v1_payload"
+
+    known_context = {"scope_delta_decision": scope_delta_decision}
+    approval = planner._project_scope_delta_decision_to_approval(known_context)
+
+    assert approval["status"] == "missing_marker"
+    assert approval["present"] is True
+    assert approval["comment_url"] == scope_delta_decision["anchor_comment_url"]
+    assert approval["body_sha256"] == scope_delta_decision["anchor_comment_hash"]
+    assert approval["author_association"] == scope_delta_decision["anchor_author_association"]
+    assert approval["comment_url"], "comment_url evidence must not be dropped"
+    assert approval["body_sha256"], "body_sha256 evidence must not be dropped"
+    assert approval["author_association"] == "OWNER"
+

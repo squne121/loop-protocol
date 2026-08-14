@@ -1356,6 +1356,27 @@ def _parse_anchor_scope_reframe_body(comment_body: str) -> "dict | None":
     return None
 
 
+_ANCHOR_SCOPE_REFRAME_FENCE_PATTERN = re.compile(r"^>*\s*```yaml\s*\n", re.MULTILINE)
+
+
+def _anchor_scope_reframe_fence_present(comment_body: str) -> bool:
+    """#2156 AC1: detect whether the comment body contains ANY ```yaml fence
+    marker at all (including a blockquote-embedded one), independent of
+    whether the fence's content parses as a valid ANCHOR_SCOPE_REFRAME_V1
+    payload.
+
+    Used only to distinguish genuine absence (no ```yaml fence anywhere in
+    the body -- the legitimate freeform lane) from present-but-invalid (a
+    fence exists but is malformed YAML, declares the wrong schema_version,
+    or is structurally rejected such as a blockquote-embedded fence).
+    Non-canonical fence variants (blockquoted, malformed, wrong
+    schema_version) must all stay in the present-but-invalid / fail_closed
+    bucket -- only a body with no ```yaml fence marker at all is genuine
+    absence.
+    """
+    return bool(_ANCHOR_SCOPE_REFRAME_FENCE_PATTERN.search(comment_body))
+
+
 def _classify_anchor_scope_reframe(
     *,
     comment_payload: "dict",
@@ -1399,8 +1420,28 @@ def _classify_anchor_scope_reframe(
     # Parse ANCHOR_SCOPE_REFRAME_V1 payload from body
     payload = _parse_anchor_scope_reframe_body(anchor_body)
     if payload is None:
+        # #2156 AC1-AC3: distinguish genuine absence (no ```yaml fence at
+        # all -- the legitimate freeform lane, #2053/#2086) from
+        # present-but-invalid (a fence exists but is malformed YAML,
+        # declares the wrong schema_version, or is structurally rejected
+        # such as a blockquote-embedded fence). Only genuine absence is
+        # downgraded to `not_applicable`; present-but-invalid stays
+        # `fail_closed` with a `schema_invalid:` reason so
+        # `_structured_anchor_payload_present_but_invalid()` continues to
+        # forbid the freeform-authority downgrade fallback for it.
+        if _anchor_scope_reframe_fence_present(anchor_body):
+            return {
+                "status": "fail_closed",
+                "reason": "schema_invalid: anchor_scope_reframe_v1_fence_present_but_unparseable_or_wrong_schema_version",
+                "implementation_go": False,
+                "anchor_author_association": author_assoc,
+                "anchor_comment_url": anchor_url,
+                "anchor_comment_hash": anchor_hash,
+                "allowed_path_deltas": [],
+                "required_rerun": [],
+            }
         return {
-            "status": "fail_closed",
+            "status": "not_applicable",
             "reason": "no_anchor_scope_reframe_v1_payload",
             "implementation_go": False,
             "anchor_author_association": author_assoc,
@@ -3050,25 +3091,50 @@ def _apply_multi_turn_candidate_route(
                 and predicates.get("source_ranges_covered") is True
             )
 
-            if (
-                original_status == "fail_closed"
-                and original_reason == "no_anchor_scope_reframe_v1_payload"
-                and integrity_confirmed
+            # #2156 AC5/AC6: `no_anchor_scope_reframe_v1_payload` (genuine
+            # absence) is produced by `_classify_anchor_scope_reframe()`
+            # with `status: not_applicable` now (AC2), but legacy/fixture
+            # callers may still pass a `status: fail_closed` decision
+            # carrying the same reason -- both upstream statuses must be
+            # recognized here so the advisory-upgrade / blocking-preserved
+            # invariants do not silently stop firing.
+            if original_reason == "no_anchor_scope_reframe_v1_payload" and original_status in (
+                "fail_closed",
+                "not_applicable",
             ):
-                updated = dict(scope_delta_decision)
-                updated["anchor_context_candidate_count"] = len(candidates)
-                updated["anchor_context_marked_segment_count"] = len(marked_segments)
-                updated["implementation_go"] = False
-                updated["status"] = "warn"
-                updated["reason"] = "multi_turn_anchor_context_trusted_owner_advisory"
-                updated["latest_owner_turn"] = latest_owner_turn
-                return updated
+                if integrity_confirmed:
+                    updated = dict(scope_delta_decision)
+                    updated["anchor_context_candidate_count"] = len(candidates)
+                    updated["anchor_context_marked_segment_count"] = len(marked_segments)
+                    updated["implementation_go"] = False
+                    updated["status"] = "warn"
+                    updated["reason"] = "multi_turn_anchor_context_trusted_owner_advisory"
+                    updated["latest_owner_turn"] = latest_owner_turn
+                    return updated
+
+                if original_status == "not_applicable":
+                    # #2156 AC6: the upstream genuine-absence status is
+                    # non-blocking (`not_applicable`), but multi-turn
+                    # retrieval integrity is unconfirmed here -- this must
+                    # not silently remain non-blocking. Force back to a
+                    # blocking `fail_closed` state rather than letting the
+                    # upstream not_applicable downgrade survive unchanged.
+                    updated = dict(scope_delta_decision)
+                    updated["status"] = "fail_closed"
+                    updated["implementation_go"] = False
+                    updated["latest_owner_turn"] = latest_owner_turn
+                    return updated
+
+                # original_status == "fail_closed" with unconfirmed
+                # integrity: pre-existing behavior, unchanged -- legacy
+                # callers/fixtures already representing a blocking decision
+                # are returned untouched (identity).
+                return scope_delta_decision
 
             # Any other original status/reason (schema_invalid, wrong_repo,
-            # wrong_issue_number, untrusted_author_association, or
-            # unconfirmed retrieval integrity) is returned unchanged -- the
-            # multi-turn advisory route never masks a distinct integrity
-            # problem.
+            # wrong_issue_number, untrusted_author_association) is returned
+            # unchanged -- the multi-turn advisory route never masks a
+            # distinct integrity problem.
             return scope_delta_decision
 
         updated = dict(scope_delta_decision)

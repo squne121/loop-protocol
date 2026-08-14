@@ -274,16 +274,18 @@ class TestFailClosed:
         result = _classify(comment)
         assert result["status"] == "fail_closed"
 
-    def test_no_yaml_block_fail_closed(self):
-        """AC4: comment with no ANCHOR_SCOPE_REFRAME_V1 yaml → fail_closed"""
+    def test_no_yaml_block_genuine_absence_not_applicable(self):
+        """#2156 AC2: comment with no ```yaml fence at all (genuine absence)
+        → not_applicable (freeform lane continues), reason unchanged."""
         comment = _make_comment(
             comment_id=2005,
             body="Just a plain comment without schema block.",
             author_association="OWNER",
         )
         result = _classify(comment)
-        assert result["status"] == "fail_closed"
+        assert result["status"] == "not_applicable"
         assert result["reason"] == "no_anchor_scope_reframe_v1_payload"
+        assert result["implementation_go"] is False
 
     def test_quoted_yaml_block_fail_closed(self):
         """AC4: blockquote-embedded yaml block → fail_closed (not canonical)"""
@@ -382,3 +384,72 @@ class TestScopeDeltaDecision:
         result = _classify(comment)
         assert result["status"] == "fail_closed"
         assert result["required_rerun"] == []
+
+
+# ---------------------------------------------------------------------------
+# #2156 AC1/AC2/AC3: genuine absence vs. present-but-invalid tri-state
+# ---------------------------------------------------------------------------
+
+
+class TestGenuineAbsenceVsPresentInvalidTriState:
+    def test_genuine_absence_vs_present_invalid_tri_state(self):
+        """AC1: `_anchor_scope_reframe_fence_present()` distinguishes a body
+        with no ```yaml fence at all (genuine absence) from a body that
+        contains a ```yaml fence which fails to parse as a valid
+        ANCHOR_SCOPE_REFRAME_V1 payload (present-but-invalid), independent
+        of the fence's content validity."""
+        genuinely_absent_body = "Just a plain comment without schema block."
+        malformed_body = "```yaml\n: invalid: [yaml: content\n```\n"
+        wrong_schema_body = "```yaml\nschema_version: WRONG_SCHEMA_V1\n```\n"
+
+        assert preflight._anchor_scope_reframe_fence_present(genuinely_absent_body) is False
+        assert preflight._anchor_scope_reframe_fence_present(malformed_body) is True
+        assert preflight._anchor_scope_reframe_fence_present(wrong_schema_body) is True
+
+        # AC2: genuine absence classifies as not_applicable (freeform lane
+        # continues), reason unchanged.
+        absent_comment = _make_comment(
+            comment_id=5001,
+            body=genuinely_absent_body,
+            author_association="OWNER",
+        )
+        absent_result = _classify(absent_comment)
+        assert absent_result["status"] == "not_applicable"
+        assert absent_result["reason"] == "no_anchor_scope_reframe_v1_payload"
+
+        # AC3: present-but-invalid (malformed YAML) stays fail_closed, never
+        # not_applicable, with a schema_invalid: reason.
+        malformed_comment = _make_comment(
+            comment_id=5002,
+            body=malformed_body,
+            author_association="OWNER",
+        )
+        malformed_result = _classify(malformed_comment)
+        assert malformed_result["status"] == "fail_closed"
+        assert malformed_result["reason"].startswith("schema_invalid:")
+
+        # AC3: present-but-invalid (wrong schema_version) stays fail_closed
+        # too.
+        wrong_schema_comment = _make_comment(
+            comment_id=5003,
+            body=wrong_schema_body,
+            author_association="OWNER",
+        )
+        wrong_schema_result = _classify(wrong_schema_comment)
+        assert wrong_schema_result["status"] == "fail_closed"
+        assert wrong_schema_result["reason"].startswith("schema_invalid:")
+
+    def test_present_invalid_wrong_schema_version_stays_fail_closed(self):
+        """AC3: a fenced ```yaml block that declares the wrong
+        schema_version is present-but-invalid, not genuine absence -- the
+        classifier must keep it fail_closed, never not_applicable."""
+        comment = _make_comment(
+            comment_id=5004,
+            body="```yaml\nschema_version: WRONG_SCHEMA_V1\n```\n",
+            author_association="MEMBER",
+        )
+        result = _classify(comment)
+        assert result["status"] == "fail_closed"
+        assert result["status"] != "not_applicable"
+        assert result["reason"].startswith("schema_invalid:")
+        assert result["implementation_go"] is False

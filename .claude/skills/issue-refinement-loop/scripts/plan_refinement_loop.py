@@ -1942,9 +1942,20 @@ def _project_scope_delta_decision_to_approval(known_context: "dict | None") -> d
     decision = (known_context or {}).get("scope_delta_decision")
     if not isinstance(decision, dict):
         return base
-    if decision.get("status") == "not_applicable":
-        # No anchor reframe was attempted at all: same lane as missing.
-        return base
+
+    # #2156 AC7: `status: not_applicable` is no longer treated as "no
+    # anchor reframe was attempted at all" (bare `missing` lane, evidence
+    # fields left at their `_base_approval_result()` defaults). Since #2156
+    # AC2, `_classify_anchor_scope_reframe()` returns `status:
+    # not_applicable` for the genuine-absence case where a trusted-author
+    # anchor comment DOES exist but simply carries no ANCHOR_SCOPE_REFRAME_V1
+    # marker -- the same scenario the `reason ==
+    # "no_anchor_scope_reframe_v1_payload"` branch below already projects to
+    # `status: missing_marker`, with the trusted author's anchor comment
+    # evidence (comment_url / body_sha256 / author_association /
+    # required_rerun) populated below rather than dropped. Falling through
+    # here (instead of returning `base` early) is what preserves that
+    # evidence for the genuine-absence case.
 
     base["present"] = True
     base["comment_url"] = decision.get("anchor_comment_url")
