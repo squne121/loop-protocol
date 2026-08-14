@@ -1942,8 +1942,33 @@ def _project_scope_delta_decision_to_approval(known_context: "dict | None") -> d
     decision = (known_context or {}).get("scope_delta_decision")
     if not isinstance(decision, dict):
         return base
-    if decision.get("status") == "not_applicable":
-        # No anchor reframe was attempted at all: same lane as missing.
+
+    # #2156 AC7: `status: not_applicable` is no longer treated as "no
+    # anchor reframe was attempted at all" (bare `missing` lane, evidence
+    # fields left at their `_base_approval_result()` defaults). Since #2156
+    # AC2, `_classify_anchor_scope_reframe()` returns `status:
+    # not_applicable` for the genuine-absence case where a trusted-author
+    # anchor comment DOES exist but simply carries no ANCHOR_SCOPE_REFRAME_V1
+    # marker -- the same scenario the `reason ==
+    # "no_anchor_scope_reframe_v1_payload"` branch below already projects to
+    # `status: missing_marker`, with the trusted author's anchor comment
+    # evidence (comment_url / body_sha256 / author_association /
+    # required_rerun) populated below rather than dropped. Falling through
+    # here (instead of returning `base` early) is what preserves that
+    # evidence for the genuine-absence case.
+    #
+    # PR #2171 fix_delta (P1-4, OWNER adversarial review): the above is
+    # deliberately scoped to `status == not_applicable` combined with
+    # `reason == no_anchor_scope_reframe_v1_payload` ONLY. A different
+    # `not_applicable` producer -- a bare `{"status": "not_applicable"}`
+    # with no reason, or an unrelated reason string -- carries no
+    # trustworthy anchor-comment evidence and must not fall through to the
+    # `invalid_scope_delta_approval` branch below (which would
+    # mischaracterize "no reframe info available" as "a reframe was
+    # attempted but rejected").
+    if decision.get("status") == "not_applicable" and decision.get("reason") != (
+        "no_anchor_scope_reframe_v1_payload"
+    ):
         return base
 
     base["present"] = True
