@@ -214,6 +214,20 @@ BLOCKER_ISSUE_EXECUTION_DECISION_VALIDATOR_UNAVAILABLE = "ISSUE_EXECUTION_DECISI
 # consumed by `_apply_exit_code_mapping()`, not just live inside
 # `known_context` where the planner never inspects them.
 BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED = "ANCHOR_MULTI_TURN_FAIL_CLOSED"
+
+# PR #2171 fix_delta (P0-1, OWNER adversarial review): the two distinct
+# fail_closed reasons `_apply_multi_turn_candidate_route()` can emit for a
+# multi-turn anchor -- the pre-existing hard block
+# ("multi_turn_anchor_context_requires_human_judgment") and the
+# integrity-unconfirmed forced-blocking route
+# ("multi_turn_anchor_context_retrieval_integrity_unconfirmed") -- both
+# must surface as BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED downstream.
+ANCHOR_MULTI_TURN_FAIL_CLOSED_REASONS = frozenset(
+    {
+        "multi_turn_anchor_context_requires_human_judgment",
+        "multi_turn_anchor_context_retrieval_integrity_unconfirmed",
+    }
+)
 BLOCKER_HEAVY_MUTATION_FAIL_CLOSED = "HEAVY_MUTATION_FAIL_CLOSED"
 BLOCKER_REPAIR_ENVIRONMENT_FAILURE = "REPAIR_ENVIRONMENT_FAILURE"
 
@@ -1356,25 +1370,119 @@ def _parse_anchor_scope_reframe_body(comment_body: str) -> "dict | None":
     return None
 
 
-_ANCHOR_SCOPE_REFRAME_FENCE_PATTERN = re.compile(r"^>*\s*```yaml\s*\n", re.MULTILINE)
+_FENCE_OPEN_RE = re.compile(
+    r"^(?P<prefix>(?:[ \t]*>)*[ \t]{0,8})(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>.*)$"
+)
+
+_ANCHOR_SCOPE_REFRAME_KEY_NAMES = ("target", "decision", "allowed_path_deltas")
+
+
+def _anchor_scope_reframe_fence_content_related(content_text: str) -> bool:
+    """PR #2171 fix_delta (P2, OWNER adversarial review): a ```yaml fence's
+    content only counts as an ANCHOR_SCOPE_REFRAME_V1 *attempt* -- not any
+    unrelated fenced yaml a reviewer happens to quote (e.g. a config
+    snippet) -- when it plausibly targets this schema.
+
+    Fail-closed on ambiguity: content that does not even parse as YAML
+    cannot be proven unrelated, so it is treated as related (the
+    pre-existing present-but-invalid / fail_closed behavior for malformed
+    fences, #2156 AC3, is preserved unchanged).
+    """
+    if "ANCHOR_SCOPE_REFRAME_V1" in content_text:
+        return True
+    try:
+        import yaml as _yaml
+
+        parsed = _yaml.safe_load(content_text)
+    except Exception:
+        return True
+    if not isinstance(parsed, dict):
+        return False
+    if "schema_version" in parsed:
+        return True
+    return len(set(_ANCHOR_SCOPE_REFRAME_KEY_NAMES) & set(parsed.keys())) >= 2
 
 
 def _anchor_scope_reframe_fence_present(comment_body: str) -> bool:
-    """#2156 AC1: detect whether the comment body contains ANY ```yaml fence
-    marker at all (including a blockquote-embedded one), independent of
-    whether the fence's content parses as a valid ANCHOR_SCOPE_REFRAME_V1
-    payload.
+    """#2156 AC1 / PR #2171 fix_delta (P0-2, OWNER adversarial review):
+    detect whether the comment body contains a ```yaml (or ~~~yaml) fence
+    that is plausibly an ANCHOR_SCOPE_REFRAME_V1 payload attempt,
+    independent of whether the fence's content parses as a valid
+    ANCHOR_SCOPE_REFRAME_V1 payload.
 
-    Used only to distinguish genuine absence (no ```yaml fence anywhere in
-    the body -- the legitimate freeform lane) from present-but-invalid (a
-    fence exists but is malformed YAML, declares the wrong schema_version,
-    or is structurally rejected such as a blockquote-embedded fence).
-    Non-canonical fence variants (blockquoted, malformed, wrong
-    schema_version) must all stay in the present-but-invalid / fail_closed
-    bucket -- only a body with no ```yaml fence marker at all is genuine
-    absence.
+    Used only to distinguish genuine absence (no such fence anywhere in the
+    body -- the legitimate freeform lane) from present-but-invalid (a fence
+    exists but is malformed YAML, declares the wrong schema_version, or is
+    structurally rejected such as a blockquote-embedded fence). Non-canonical
+    fence variants (blockquoted, malformed, wrong schema_version) must all
+    stay in the present-but-invalid / fail_closed bucket -- only a body with
+    no such fence marker at all is genuine absence.
+
+    This is a line-oriented internal scanner (repo policy: PyYAML +
+    jsonschema only, no external Markdown parser dependency added), not a
+    full CommonMark implementation. It handles, unlike a single top-level
+    regex: backtick fences of length >=3 (including 4+), tilde fences
+    (``~~~yaml``), opening/closing fence length matching, 0-8 space /
+    blockquote-marker indentation (including nested blockquotes), fences
+    left unclosed through EOF, and a case-insensitive ``yaml`` info string.
+    Presence is further gated on content relatedness (P2) via
+    `_anchor_scope_reframe_fence_content_related()` so an unrelated ```yaml
+    fence is not misclassified as a reframe attempt.
     """
-    return bool(_ANCHOR_SCOPE_REFRAME_FENCE_PATTERN.search(comment_body))
+    lines = comment_body.splitlines()
+    n = len(lines)
+    idx = 0
+    found_any_yaml_fence = False
+    found_related = False
+
+    while idx < n:
+        match = _FENCE_OPEN_RE.match(lines[idx])
+        if not match:
+            idx += 1
+            continue
+        info_tokens = match.group("info").strip().split()
+        info_first_token = info_tokens[0].lower() if info_tokens else ""
+        if info_first_token != "yaml":
+            idx += 1
+            continue
+
+        fence_char = match.group("fence")[0]
+        fence_len = len(match.group("fence"))
+        prefix = match.group("prefix")
+        close_re = re.compile(
+            r"^(?:[ \t]*>)*[ \t]{0,8}"
+            + re.escape(fence_char)
+            + "{"
+            + str(fence_len)
+            + ",}[ \t]*$"
+        )
+
+        content_lines: list[str] = []
+        close_idx = None
+        j = idx + 1
+        while j < n:
+            if close_re.match(lines[j]):
+                close_idx = j
+                break
+            content_lines.append(lines[j])
+            j += 1
+
+        found_any_yaml_fence = True
+
+        if prefix.strip(" \t"):
+            content_lines = [
+                re.sub(r"^(?:[ \t]*>)+[ \t]?", "", line) for line in content_lines
+            ]
+        content_text = "\n".join(content_lines)
+
+        if _anchor_scope_reframe_fence_content_related(content_text):
+            found_related = True
+
+        idx = (close_idx + 1) if close_idx is not None else n
+
+    if not found_any_yaml_fence:
+        return False
+    return found_related
 
 
 def _classify_anchor_scope_reframe(
@@ -3122,8 +3230,21 @@ def _apply_multi_turn_candidate_route(
                     # not silently remain non-blocking. Force back to a
                     # blocking `fail_closed` state rather than letting the
                     # upstream not_applicable downgrade survive unchanged.
+                    #
+                    # PR #2171 fix_delta (P0-1, OWNER adversarial review):
+                    # the `reason` must change to a dedicated value here --
+                    # leaving it as `no_anchor_scope_reframe_v1_payload`
+                    # (the upstream not_applicable reason) meant the
+                    # caller's canonical blocker conversion (which does an
+                    # exact match on
+                    # `multi_turn_anchor_context_requires_human_judgment`)
+                    # never recognized this route, so it silently never
+                    # reached `blockers` / the final exit code.
                     updated = dict(scope_delta_decision)
                     updated["status"] = "fail_closed"
+                    updated["reason"] = (
+                        "multi_turn_anchor_context_retrieval_integrity_unconfirmed"
+                    )
                     updated["implementation_go"] = False
                     updated["latest_owner_turn"] = latest_owner_turn
                     return updated
@@ -4224,9 +4345,24 @@ def run_preflight(
                 isinstance(_routed_scope_delta_decision, dict)
                 and _routed_scope_delta_decision.get("status") == "fail_closed"
                 and _routed_scope_delta_decision.get("reason")
-                == "multi_turn_anchor_context_requires_human_judgment"
+                in ANCHOR_MULTI_TURN_FAIL_CLOSED_REASONS
             ):
+                # PR #2171 fix_delta (P0-1, OWNER adversarial review):
+                # membership in ANCHOR_MULTI_TURN_FAIL_CLOSED_REASONS (not
+                # an exact match on a single reason string) is what makes
+                # the integrity-unconfirmed forced-blocking route above
+                # actually reach `blockers` / the final exit code.
                 blockers.append(BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED)
+                # PR #2171 fix_delta (P0-1, OWNER adversarial review): the
+                # freeform SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 built earlier
+                # (before the multi-turn route could downgrade the
+                # not_applicable pre-route decision to a blocking
+                # fail_closed) must not survive into the final
+                # known_context once the decision is confirmed blocking --
+                # otherwise a fail-closed integrity gap would still leave
+                # freeform authority evidence available to a downstream
+                # consumer.
+                _kc.pop("scope_delta_authority_evidence", None)
 
             known_context = _kc
 

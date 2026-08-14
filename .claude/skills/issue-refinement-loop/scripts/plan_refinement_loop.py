@@ -1956,6 +1956,20 @@ def _project_scope_delta_decision_to_approval(known_context: "dict | None") -> d
     # required_rerun) populated below rather than dropped. Falling through
     # here (instead of returning `base` early) is what preserves that
     # evidence for the genuine-absence case.
+    #
+    # PR #2171 fix_delta (P1-4, OWNER adversarial review): the above is
+    # deliberately scoped to `status == not_applicable` combined with
+    # `reason == no_anchor_scope_reframe_v1_payload` ONLY. A different
+    # `not_applicable` producer -- a bare `{"status": "not_applicable"}`
+    # with no reason, or an unrelated reason string -- carries no
+    # trustworthy anchor-comment evidence and must not fall through to the
+    # `invalid_scope_delta_approval` branch below (which would
+    # mischaracterize "no reframe info available" as "a reframe was
+    # attempted but rejected").
+    if decision.get("status") == "not_applicable" and decision.get("reason") != (
+        "no_anchor_scope_reframe_v1_payload"
+    ):
+        return base
 
     base["present"] = True
     base["comment_url"] = decision.get("anchor_comment_url")

@@ -52,6 +52,33 @@ _apply_multi_turn_candidate_route = preflight._apply_multi_turn_candidate_route
 _classify_heavy_mutation_gate = preflight._classify_heavy_mutation_gate
 _classify_anchor_scope_reframe = preflight._classify_anchor_scope_reframe
 
+import importlib.util as _importlib_util  # noqa: E402
+
+
+def _load_plan_refinement_loop_module():
+    """PR #2171 fix_delta (P1-3, OWNER adversarial review): load
+    `plan_refinement_loop.py`'s `_project_scope_delta_decision_to_approval()`
+    the same way `test_operator_selected_scope_reframe.py` does, so the
+    producer -> consumer -> projection chain can be exercised end to end in
+    this file too."""
+    if "scope_signal_delta" not in sys.modules:
+        _spec_sd = _importlib_util.spec_from_file_location(
+            "scope_signal_delta", SCRIPTS_DIR / "scope_signal_delta.py"
+        )
+        assert _spec_sd is not None and _spec_sd.loader is not None
+        _module_sd = _importlib_util.module_from_spec(_spec_sd)
+        sys.modules["scope_signal_delta"] = _module_sd
+        _spec_sd.loader.exec_module(_module_sd)
+
+    _spec = _importlib_util.spec_from_file_location(
+        "plan_refinement_loop_2156_multi_turn", SCRIPTS_DIR / "plan_refinement_loop.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    _module = _importlib_util.module_from_spec(_spec)
+    sys.modules["plan_refinement_loop_2156_multi_turn"] = _module
+    _spec.loader.exec_module(_module)
+    return _module
+
 _REPO_2156 = "squne121/loop-protocol"
 _ISSUE_2156 = 2156
 _URL_2156 = f"https://github.com/{_REPO_2156}/issues/{_ISSUE_2156}#issuecomment-999001"
@@ -572,6 +599,20 @@ def test_producer_consumer_chain_classify_to_route_to_approval():
     assert single_turn_routed == single_turn_decision
     assert single_turn_routed["status"] == "not_applicable"
 
+    # PR #2171 fix_delta (P1-3, OWNER adversarial review): actually reach
+    # `_project_scope_delta_decision_to_approval()` for this scenario, not
+    # just the classify/route steps.
+    planner = _load_plan_refinement_loop_module()
+    single_turn_approval = planner._project_scope_delta_decision_to_approval(
+        {"scope_delta_decision": single_turn_routed}
+    )
+    assert single_turn_approval["status"] == "missing_marker"
+    assert single_turn_approval["present"] is True
+    assert single_turn_approval["comment_url"] == single_turn_routed["anchor_comment_url"]
+    assert single_turn_approval["body_sha256"] == single_turn_routed["anchor_comment_hash"]
+    assert single_turn_approval["author_association"] == "OWNER"
+    assert single_turn_approval["valid"] is False
+
     # --- Scenario 2: multi-turn genuine absence, integrity confirmed ---
     multi_turn_decision = _classify_anchor_scope_reframe(
         comment_payload=_payload_2156("OWNER"),
@@ -596,6 +637,18 @@ def test_producer_consumer_chain_classify_to_route_to_approval():
     assert confirmed_routed["reason"] == "multi_turn_anchor_context_trusted_owner_advisory"
     assert confirmed_routed["implementation_go"] is False
 
+    # PR #2171 fix_delta (P1-3): the `warn` advisory route is not one of
+    # `_project_scope_delta_decision_to_approval()`'s two positive lanes
+    # (`approved_by_trusted_anchor` / `no_anchor_scope_reframe_v1_payload`),
+    # so it falls through to the invalid lane -- confirm the full chain
+    # reaches that projection without raising and without silently
+    # fabricating an `approved` status.
+    confirmed_approval = planner._project_scope_delta_decision_to_approval(
+        {"scope_delta_decision": confirmed_routed}
+    )
+    assert confirmed_approval["status"] == "invalid_scope_delta_approval"
+    assert confirmed_approval["valid"] is False
+
     # --- Scenario 3: multi-turn genuine absence, integrity unconfirmed ---
     unconfirmed_predicates = dict(_FULL_INTEGRITY_PREDICATES)
     unconfirmed_predicates["source_ranges_covered"] = False
@@ -608,6 +661,19 @@ def test_producer_consumer_chain_classify_to_route_to_approval():
     assert unconfirmed_routed["status"] == "fail_closed"
     assert unconfirmed_routed["status"] != "not_applicable"
     assert unconfirmed_routed["implementation_go"] is False
+    assert (
+        unconfirmed_routed["reason"]
+        == "multi_turn_anchor_context_retrieval_integrity_unconfirmed"
+    )
+
+    # PR #2171 fix_delta (P1-3): the integrity-unconfirmed forced-blocking
+    # route also reaches `_project_scope_delta_decision_to_approval()` and
+    # is correctly classified as the invalid lane (never `approved`).
+    unconfirmed_approval = planner._project_scope_delta_decision_to_approval(
+        {"scope_delta_decision": unconfirmed_routed}
+    )
+    assert unconfirmed_approval["status"] == "invalid_scope_delta_approval"
+    assert unconfirmed_approval["valid"] is False
 
     # --- Scenario 4: present-but-wrong-schema-version fence stays fail_closed ---
     wrong_schema_body = "```yaml\nschema_version: WRONG_SCHEMA_V1\n```\n"
@@ -634,6 +700,15 @@ def test_producer_consumer_chain_classify_to_route_to_approval():
     # unchanged, still fail_closed / schema_invalid.
     assert wrong_schema_routed == wrong_schema_decision
     assert wrong_schema_routed["status"] == "fail_closed"
+
+    # PR #2171 fix_delta (P1-3): the present-but-wrong-schema-version case
+    # also reaches the projection step and lands in the invalid lane, never
+    # `missing_marker` (which is reserved for genuine absence).
+    wrong_schema_approval = planner._project_scope_delta_decision_to_approval(
+        {"scope_delta_decision": wrong_schema_routed}
+    )
+    assert wrong_schema_approval["status"] == "invalid_scope_delta_approval"
+    assert wrong_schema_approval["valid"] is False
 
 
 def test_genuine_absence_integrity_confirmed_advisory_upgrade_via_classifier():
@@ -1308,6 +1383,103 @@ def test_run_preflight_subprocess_anchor_reframe_reflects_post_route_approved_st
 # PR #1973 (OWNER REQUEST_CHANGES, P1-5), test 8: `_apply_exit_code_mapping()`
 # direct-call assertion for the advisory-warn scenario.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# PR #2171 fix_delta (P0-1, OWNER adversarial review): the
+# integrity-unconfirmed forced-blocking route must actually reach the
+# wrapper's `status`/exit code AND the freeform
+# SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 built before that route ran must not
+# survive into the final known_context once the decision is confirmed
+# blocking.
+# ---------------------------------------------------------------------------
+
+_SUBPROC_ISSUE_MULTI_TURN_INTEGRITY_UNCONFIRMED = 99991891
+
+
+def test_run_preflight_direct_multi_turn_integrity_unconfirmed_blocks_and_drops_evidence(
+    tmp_path, monkeypatch
+):
+    """PR #2171 fix_delta (P0-1, OWNER adversarial review, item 4): a
+    genuine multi-turn OWNER anchor with genuine absence
+    (`no_anchor_scope_reframe_v1_payload`) but UNCONFIRMED multi-turn
+    retrieval integrity must make the real `run_preflight()` entrypoint
+    report `status: blocked` / `EXIT_BLOCKED` with
+    `BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED` present -- and the freeform
+    authority evidence eagerly built earlier in the same call (before the
+    multi-turn route could downgrade the decision to blocking) must not
+    remain in the final known_context / planner_input.json artifact.
+
+    Forcing an unconfirmed integrity predicate through a real end-to-end
+    body requires monkeypatching `compute_source_ranges_covered` --
+    `anchor_context.segment_body()`'s own segments always partition
+    `[1, line_count]` contiguously for a real fetched body (#1891 AC5), so
+    `source_ranges_covered` is always True through the genuine producer
+    chain otherwise.
+    """
+    issue_number = _SUBPROC_ISSUE_MULTI_TURN_INTEGRITY_UNCONFIRMED
+    comment_id = 88891894
+    anchor_url = (
+        f"https://github.com/{_SUBPROC_REPO}/issues/{issue_number}#issuecomment-{comment_id}"
+    )
+    fixture = _base_fixture(issue_number)
+    fixture["issue"]["number"] = issue_number
+    fixture["anchor_comment_urls"] = [anchor_url]
+    fixture["anchor_comments"] = [
+        {
+            "id": comment_id,
+            "body": FIXTURE_869_LINES,
+            "issue_url": f"https://api.github.com/repos/{_SUBPROC_REPO}/issues/{issue_number}",
+            "author_association": "OWNER",
+            "user": {"login": "owner", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "html_url": anchor_url,
+            "url": f"https://api.github.com/repos/{_SUBPROC_REPO}/issues/comments/{comment_id}",
+        }
+    ]
+
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    repo_root = _repo_root_for_test()
+    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+
+    monkeypatch.setattr(
+        preflight.anchor_context,
+        "compute_source_ranges_covered",
+        lambda *args, **kwargs: False,
+    )
+
+    try:
+        result, exit_code = preflight.run_preflight(
+            issue_number=issue_number,
+            repo=_SUBPROC_REPO,
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+        planner_input_path = artifact_dir / "planner_input.json"
+        planner_input = (
+            json.loads(planner_input_path.read_text(encoding="utf-8"))
+            if planner_input_path.exists()
+            else {}
+        )
+    finally:
+        if artifact_dir.exists():
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+
+    assert result.get("status") == "blocked", result
+    assert exit_code == preflight.EXIT_BLOCKED, (result, exit_code)
+    assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED in result.get("blockers", []), result
+
+    known_context = planner_input.get("known_context", {})
+    scope_delta_decision = known_context.get("scope_delta_decision", {})
+    assert scope_delta_decision.get("status") == "fail_closed", scope_delta_decision
+    assert (
+        scope_delta_decision.get("reason")
+        == "multi_turn_anchor_context_retrieval_integrity_unconfirmed"
+    ), scope_delta_decision
+    assert "scope_delta_authority_evidence" not in known_context, known_context
 
 
 def test_apply_exit_code_mapping_warn_scope_delta_decision_produces_exit_warn():

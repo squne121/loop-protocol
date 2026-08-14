@@ -453,3 +453,91 @@ class TestGenuineAbsenceVsPresentInvalidTriState:
         assert result["status"] != "not_applicable"
         assert result["reason"].startswith("schema_invalid:")
         assert result["implementation_go"] is False
+
+
+# ---------------------------------------------------------------------------
+# PR #2171 fix_delta (P0-2/P2, OWNER adversarial review): the fence scanner
+# must recognize GFM fence variants a plain `^>*\s*```yaml\s*\n` regex
+# misses (fail-open safety gap), while also NOT treating an unrelated
+# ```yaml fence as a reframe attempt (P2, over-broad match).
+# ---------------------------------------------------------------------------
+
+
+class TestFenceScannerGfmVariantsAndRelatedness:
+    def test_nested_blockquote_fence_detected(self):
+        """P0-2: a fence embedded two blockquote levels deep (`> > ` with a
+        space between markers) must still be detected as present -- the
+        previous fence-presence regex requires the `>` markers to be contiguous
+        with no interleaving space before the fence."""
+        body = "> > ```yaml\n> > schema_version: ANCHOR_SCOPE_REFRAME_V1\n> > ```\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_four_backtick_fence_detected(self):
+        """P0-2: a fence opened with 4 backticks (valid GFM/CommonMark,
+        needed e.g. when the fence content itself contains a 3-backtick
+        span) is not literal text "```yaml" and a plain regex looking for
+        exactly 3 backticks silently fails to match it."""
+        body = "````yaml\nschema_version: ANCHOR_SCOPE_REFRAME_V1\n````\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_tilde_fence_detected(self):
+        """P0-2: GFM also allows `~~~` fences, not just backticks."""
+        body = "~~~yaml\nschema_version: ANCHOR_SCOPE_REFRAME_V1\n~~~\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_uppercase_info_string_detected(self):
+        """P0-2: the ```yaml info string is case-insensitive in GFM."""
+        body = "```YAML\nschema_version: ANCHOR_SCOPE_REFRAME_V1\n```\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_unclosed_fence_through_eof_detected(self):
+        """P0-2: a fence never closed before EOF must still be scanned as
+        present (fail-closed on the presence question), not silently
+        ignored."""
+        body = "```yaml\nschema_version: ANCHOR_SCOPE_REFRAME_V1\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_unrelated_yaml_fence_is_not_present(self):
+        """P2: a ```yaml fence whose content is unambiguously unrelated to
+        ANCHOR_SCOPE_REFRAME_V1 (no schema_version key, no marker string,
+        fewer than two reframe keys, and it parses cleanly as YAML) must
+        NOT be classified as present -- otherwise an unrelated freeform
+        review comment that happens to quote a config snippet would be
+        forced fail_closed."""
+        body = "Here is the retry config we use:\n```yaml\ntimeout: 90\nretries: 3\n```\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is False
+
+        comment = _make_comment(
+            comment_id=5005,
+            body=body,
+            author_association="OWNER",
+        )
+        result = _classify(comment)
+        assert result["status"] == "not_applicable"
+        assert result["reason"] == "no_anchor_scope_reframe_v1_payload"
+
+    def test_unrelated_yaml_fence_nested_blockquote_still_not_present(self):
+        """P2: relatedness gating also applies to the nested-blockquote /
+        4-backtick / tilde fence variants above -- detecting the fence
+        structurally must not by itself flip an unrelated fence to
+        present."""
+        body = "> > ```yaml\n> > timeout: 90\n> > retries: 3\n> > ```\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is False
+
+    def test_related_fence_with_only_schema_version_key_stays_present(self):
+        """Regression: a fence declaring ONLY `schema_version` (even with
+        the wrong value) must still count as related/present -- this is
+        exactly the #2156 AC3 present-but-invalid case, and P2's
+        relatedness gating must not regress it."""
+        body = "```yaml\nschema_version: SOME_OTHER_SCHEMA\n```\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_related_fence_via_key_combination_without_marker_string(self):
+        """P2: a fence lacking the literal marker string but declaring at
+        least two of the reframe-specific keys (`target` / `decision` /
+        `allowed_path_deltas`) is still a plausible reframe attempt."""
+        body = (
+            "```yaml\ntarget:\n  repo: squne121/loop-protocol\n"
+            "  issue_number: 2156\ndecision: approve_scope_delta\n```\n"
+        )
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
