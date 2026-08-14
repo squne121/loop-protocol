@@ -56,27 +56,33 @@ validator（`validate_ci_reliability_assessment_v1.py`）は `run_attempt == 1` 
 
 ## sample_count_rule（サンプル数規約）
 
-`sample_count_rule.method` は `power_analysis` または `fixed_declared` のいずれかであり、`is_power_derived` で power 由来であることを明示する（`method == "power_analysis"` の場合は schema レベルで `is_power_derived: true` が強制される）。20 run を暗黙の既定値として使わない — 低頻度 failure の非悪化は 20 run では強く証明できない（0 failures / 20 runs でも Clopper-Pearson 両側 95% exact interval の上限は約 16.8%。下記参照）。
+`sample_count_rule.method` は `power_analysis` または `fixed_declared` のいずれかであり、`is_power_derived` で power 由来であることを明示する（`method == "power_analysis"` の場合は schema レベルで `is_power_derived: true` が強制され、`method == "fixed_declared"` の場合は逆に `is_power_derived: false` が schema レベルで強制される）。20 run を暗黙の既定値として使わない — 低頻度 failure の非悪化は 20 run では強く証明できない（0 failures / 20 runs でも Clopper-Pearson **両側** 95% exact interval の上限は約 16.8%。下記参照。片側 95% 上限は別途約 13.9% であり、両側と片側を混同しない）。
 
 ## 非劣性判定（non-inferiority evaluation）
 
-### 区間推定方式: Clopper-Pearson exact interval
+### 用語の訂正（旧版からの訂正: sidedness と二群比較）
 
-`non_inferiority_evaluation.interval_method` は `clopper_pearson_exact` に固定する。二項比率の正確な信頼区間（Wald 近似ではなく exact interval）を用いる理由は、before 側が 0 failure の場合でも区間の上限が有限かつ非ゼロになる（0% と誤認しない）ため。
+旧版の本ドキュメントは「`after` の Clopper-Pearson 区間上限を `before` の点推定値 + margin と比較する」という**単群（single-arm）比較**を非劣性判定として説明していた。これは PR #2175 への OWNER adversarial review で以下 2 点の false-green を許す欠陥として指摘された:
 
-`validate_ci_reliability_assessment_v1.py` は scipy 等の外部依存を持たず、正則不完全ベータ関数（regularized incomplete beta function）を Numerical Recipes の continued fraction アルゴリズムで実装し、二分探索でその分位点（quantile）を求めることで Clopper-Pearson 区間を計算する。
+1. `required_sample_count` を `after` 側でしか検証しておらず、`before` 側のサンプル数不足（例: before=1 failure/1 run）が判定から欠落していた。
+2. 「区間上限 vs 点推定値 + margin」は二項比率の正しい二群比較ではない。0/20 の「片側上限 約16.8%」という記述自体も sidedness を誤っていた（実装は `alpha/2` を使う **両側** 95% exact interval であり、正しい片側 95% 上限は約 `0.1391`）。
 
-例: 0 failures / 20 runs、信頼水準 95% の場合、片側上限は約 `0.1684`（約 16.8%）であり、0% ではない。
+これを受けて非劣性判定は以下のように再設計した。
+
+### 区間推定方式: 2 段構成（per-arm audit interval + 二群比較）
+
+`non_inferiority_evaluation` は 2 種類の区間推定を持つ。**このうち outcome の根拠になるのは `risk_difference` のみ**であり、`before`/`after` の Clopper-Pearson 区間は audit 用途（0 failure でも上限が有限であることの確認等）に限定される。
+
+1. **`before`/`after`（`interval_method: clopper_pearson_exact`、両側 audit interval、outcome には使わない）**: 二項比率の正確な信頼区間（Wald 近似ではなく exact interval）。`validate_ci_reliability_assessment_v1.py` は scipy 等の外部依存を持たず、正則不完全ベータ関数（regularized incomplete beta function）を Numerical Recipes の continued fraction アルゴリズムで実装し、二分探索でその分位点（quantile）を求めることで Clopper-Pearson 区間を計算する。例: 0 failures / 20 runs、信頼水準 95% の場合、**両側**上限は約 `0.1684`（約 16.8%）であり、0% ではない（片側 95% 上限は約 `0.1391`）。
+2. **`risk_difference`（`method: newcombe_score_wilson_hybrid`、片側、outcome の唯一の根拠）**: `p_after - p_before` という**二独立比率の差**に対する Newcombe/Wilson hybrid score（MOVER）法による片側 95% 上限。各 arm の片側 Wilson score interval（`statistics.NormalDist().inv_cdf()` による正規分位点、stdlib のみ、scipy/statsmodels 不使用）から合成する。`sidedness: "one_sided"` / `effect_measure: "risk_difference"` を schema レベルで明示する。
 
 ### 非劣性判定ロジック
 
-`before` cohort の実測率（`before.rate`）に事前宣言した `non_inferiority_margin` を加えた閾値と、`after` cohort の Clopper-Pearson 区間上限（`after.ci_upper`）を比較する:
+- `before` と `after` の **両方**の denominator が `sample_count_rule.required_sample_count` 未満 → `outcome: inconclusive`（片方でもサンプル数不足なら判定不能。旧版は `after` 側しか見ておらず、これが false-green の原因だった）。
+- 両方が `required_sample_count` を満たす場合、`risk_difference.ci_upper`（`p_after - p_before` の片側 95% 上限）を計算し、`risk_difference.ci_upper <= non_inferiority_margin` → `outcome: non_inferior`。
+- それ以外 → `outcome: inferior`。
 
-- `after` cohort の denominator が `sample_count_rule.required_sample_count` 未満 → `outcome: inconclusive`（サンプル数不足で判定不能）。
-- `after.ci_upper <= before.rate + non_inferiority_margin` → `outcome: non_inferior`（非劣性が確認された）。
-- それ以外 → `outcome: inferior`（非劣性が確認できない）。
-
-`before` 側が 0 failure の場合も、上記ロジックは `before.rate == 0.0` として margin をそのまま適用するため、0 failure を「今後も 0% であることが保証されている」とは扱わない（margin 自体が許容幅を表す）。
+`before` 側が 0 failure の場合も、Newcombe/Wilson の score interval は連続性補正なしの exact ではないが 0/N を 0% と誤認しない有限区間を返すため、0 failure を「今後も 0% であることが保証されている」とは扱わない（margin 自体が許容幅を表す）。
 
 ## cancelled / timed_out / infrastructure failure の扱い（分類方針）
 
@@ -91,13 +97,30 @@ validator（`validate_ci_reliability_assessment_v1.py`）は `run_attempt == 1` 
 
 Playwright logical test の最終 attempt が `skipped` の場合も、`playwright_flaky_test_rate` / `playwright_terminal_failure_rate` の両方の分母から除外する（実行されなかったテストとして扱う）。
 
+## Playwright expected outcome semantics（expected_status）
+
+`PlaywrightTestAttempt.expected_status`（任意項目、`status` と同じ enum）は Playwright 自身の `expectedStatus`（`test.fail()` 等で変化する）を表す。省略時は `"passed"` を既定値として扱う（既存 producer の後方互換性を維持）。
+
+分類ロジックは「最終 attempt の `status` が `expected_status` と一致するか」で expected/unexpected を判定する:
+
+- 最終 attempt が expected（`status == expected_status`）→ それより前の attempt に unexpected failure があれば `flaky`、なければ `success`。`test.fail()` のように `expected_status: "failed"` かつ `status: "failed"` の場合も `success` として扱う（reliability regression としてカウントしない）。
+- 最終 attempt が unexpected かつ `failed`/`timedOut`/`interrupted` → `terminal_failure`。
+- 最終 attempt が unexpected な `passed`（例: `expected_status: "failed"` の test が予期せず pass した）→ `excluded`（正常な success ケースと区別する。既定の成功として静かに数えない）。
+
+## attempt_number の一意性・順序（attempt ordering）
+
+`PlaywrightLogicalTestRun.attempts[]` は配列末尾（`attempts[-1]`）を最終結果として扱う。この前提を守るため、validator は `attempt_number` が重複なく昇順であることを検証し（`attempt_number_not_unique_or_ordered`）、順序が壊れている場合は semantic_valid を `false` にする。
+
 ## validator の検証範囲
 
 `validate_ci_reliability_assessment_v1.py` は以下を検証する:
 
 1. **structural_valid**: `schemas/ci_test_reliability_assessment_v1.schema.json`（Draft 2020-12）に対する構造検証。
 2. **semantic_valid**: `raw_attempts.{before,after}` から `reliability_metrics.{before,after}` の 3 指標（numerator/denominator/rate）を再計算し、自己申告値と一致するか検証する。不一致は `reliability_metric_recomputation_mismatch` エラーとして報告する。
-3. `non_inferiority_evaluation` の `before`/`after` の Clopper-Pearson 区間（`ci_lower`/`ci_upper`）と `outcome` を再計算し、自己申告値と一致するか検証する。
+3. `non_inferiority_evaluation` の `before`/`after` の Clopper-Pearson 監査区間（`ci_lower`/`ci_upper`、両側、audit only）を再計算し、自己申告値と一致するか検証する。
+4. `non_inferiority_evaluation.risk_difference`（`point_estimate`/`ci_upper`、Newcombe/Wilson 片側二群比較）と `outcome` を再計算し、自己申告値と一致するか検証する（outcome の唯一の根拠）。
+5. `raw_attempts.{before,after}.workflow_runs` の `(workflow_run_id, run_attempt)` 重複、`run_attempt == 1` の `workflow_run_id` 重複、`playwright_tests` の `(workflow_run_id, run_attempt, test_id)` 重複を hard-fail で拒否する（sample_identity.key の水増し防止）。
+6. `PlaywrightLogicalTestRun.attempts` の `attempt_number` が一意かつ昇順であることを検証する（配列末尾を最終結果とみなす前提の正当性を担保する）。
 
 自己申告された `reliability_metrics` / `non_inferiority_evaluation` の値は、`raw_attempts` からの独立再計算と一致しない限り信頼されない（fixture-driven semantic validator パターン。`validate_ci_performance_assessment_v2.py` と同様の設計方針）。
 

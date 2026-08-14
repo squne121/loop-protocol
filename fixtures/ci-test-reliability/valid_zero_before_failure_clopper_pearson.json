@@ -70,7 +70,14 @@
       "ci_lower": 0.0010121996997440874,
       "ci_upper": 0.20351691392215798
     },
-    "outcome": "inferior"
+    "outcome": "non_inferior",
+    "effect_measure": "risk_difference",
+    "sidedness": "one_sided",
+    "risk_difference": {
+      "method": "newcombe_score_wilson_hybrid",
+      "point_estimate": 0.04,
+      "ci_upper": 0.16086635709132557
+    }
   },
   "raw_attempts": {
     "before": {

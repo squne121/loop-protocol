@@ -170,7 +170,7 @@
     },
     "SampleCountRule": {
       "type": "object",
-      "description": "Must be explicit about whether the sample size is power-derived; a fixed sample count of 20 is never a silent default (see Background in issue #2170 -- 0/20 runs still leaves a ~16.8% one-sided 95% Clopper-Pearson upper bound).",
+      "description": "Must be explicit about whether the sample size is power-derived; a fixed sample count of 20 is never a silent default (see Background in issue #2170 -- 0/20 runs still leaves a ~16.8% two-sided 95% Clopper-Pearson upper bound -- the corresponding one-sided 95% upper bound is ~13.9%; see non_inferiority_evaluation.sidedness / risk_difference for the authoritative one-sided two-sample non-inferiority test).",
       "required": [
         "method",
         "is_power_derived",
@@ -244,6 +244,11 @@
             ]
           },
           "then": {
+            "properties": {
+              "is_power_derived": {
+                "const": false
+              }
+            },
             "not": {
               "anyOf": [
                 {
@@ -264,12 +269,15 @@
     },
     "NonInferiorityEvaluation": {
       "type": "object",
-      "description": "Non-inferiority judgment for target_metric, using an exact (Clopper-Pearson) interval so that a 0-failure before cohort is still handled (upper bound is finite, not treated as 0% risk).",
+      "description": "Non-inferiority judgment for target_metric. before/after are per-arm two-sided exact (Clopper-Pearson) intervals reported for audit only (so a 0-failure before cohort still shows a finite, non-zero upper bound) and are NOT the basis for outcome. outcome is derived solely from risk_difference: a genuine two-independent-proportions one-sided test of p_after - p_before (effect_measure), computed via the Newcombe/Wilson hybrid score (MOVER) method. Both before and after must individually meet sample_count_rule.required_sample_count or outcome is inconclusive.",
       "required": [
         "metric",
+        "effect_measure",
         "interval_method",
+        "sidedness",
         "before",
         "after",
+        "risk_difference",
         "outcome"
       ],
       "unevaluatedProperties": false,
@@ -278,7 +286,8 @@
           "$ref": "#/$defs/MetricName"
         },
         "interval_method": {
-          "const": "clopper_pearson_exact"
+          "const": "clopper_pearson_exact",
+          "description": "Method used ONLY for the per-arm audit intervals in before/after (two-sided exact Clopper-Pearson). NOT the method used to derive outcome -- see risk_difference.method."
         },
         "before": {
           "$ref": "#/$defs/IntervalEstimate"
@@ -293,6 +302,17 @@
             "inferior",
             "inconclusive"
           ]
+        },
+        "effect_measure": {
+          "const": "risk_difference",
+          "description": "The two-independent-proportions effect measure used for the non-inferiority hypothesis test (p_after - p_before). Distinct from the per-arm audit-only Clopper-Pearson intervals in before/after."
+        },
+        "sidedness": {
+          "const": "one_sided",
+          "description": "The non-inferiority hypothesis test (risk_difference.ci_upper vs non_inferiority_margin) is one-sided. This is independent of interval_method's before/after audit intervals, which are two-sided (see IntervalEstimate description)."
+        },
+        "risk_difference": {
+          "$ref": "#/$defs/RiskDifferenceEstimate"
         }
       }
     },
@@ -324,7 +344,8 @@
           "minimum": 0,
           "maximum": 1
         }
-      }
+      },
+      "description": "Per-arm two-sided exact (Clopper-Pearson) interval for a single binomial proportion, reported for audit/reporting only. NOT the basis for non_inferiority_evaluation.outcome -- see risk_difference for the authoritative one-sided two-sample test."
     },
     "RawAttemptCohort": {
       "type": "object",
@@ -432,6 +453,49 @@
             "interrupted",
             "skipped"
           ]
+        },
+        "expected_status": {
+          "type": "string",
+          "enum": [
+            "passed",
+            "failed",
+            "timedOut",
+            "interrupted",
+            "skipped"
+          ]
+        }
+      },
+      "description": "One Playwright internal retry attempt. expected_status (optional) mirrors Playwright's own expectedStatus (e.g. for test.fail()); when absent, expected_status defaults to 'passed' for classification purposes (preserves prior behavior for producers that do not emit it)."
+    },
+    "RiskDifferenceEstimate": {
+      "type": "object",
+      "description": "One-sided upper confidence bound for the two-independent-proportions risk difference p_after - p_before, computed via the Newcombe/Wilson hybrid score (MOVER) method (stdlib-only, no scipy/statsmodels). Authoritative for non_inferiority_evaluation.outcome. point_estimate/ci_upper are null when outcome is inconclusive (either arm below sample_count_rule.required_sample_count).",
+      "required": [
+        "method",
+        "point_estimate",
+        "ci_upper"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "method": {
+          "const": "newcombe_score_wilson_hybrid"
+        },
+        "point_estimate": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1
+        },
+        "ci_upper": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1,
+          "description": "One-sided upper bound at confidence_level for p_after - p_before. Compared against non_inferiority_margin to derive outcome."
         }
       }
     }

@@ -45,6 +45,7 @@ import argparse
 import json
 import math
 import os
+import statistics
 import sys
 from typing import Any
 
@@ -195,6 +196,89 @@ def clopper_pearson_interval(
 
 
 # --------------------------------------------------------------------------- #
+# Newcombe/Wilson hybrid score (MOVER) two-independent-proportions interval
+# (pure stdlib -- statistics.NormalDist for the normal quantile, no
+# scipy/statsmodels dependency). This is the AUTHORITATIVE method for
+# non_inferiority_evaluation.outcome; the Clopper-Pearson interval above is
+# per-arm audit-only (see docs/dev/ci-test-reliability-assessment.md).
+# --------------------------------------------------------------------------- #
+def _wilson_score_interval_one_sided(
+    numerator: int, denominator: int, confidence_level: float
+) -> tuple[float, float]:
+    """One-sided Wilson score interval for a single binomial proportion.
+    Both endpoints are returned; callers use only the endpoint relevant to
+    their one-sided hypothesis. z is the (1 - alpha) normal quantile (NOT
+    1 - alpha/2 -- that would be the two-sided quantile)."""
+    if denominator <= 0:
+        return (0.0, 1.0)
+    z = statistics.NormalDist().inv_cdf(confidence_level)
+    n = float(denominator)
+    x = float(numerator)
+    p = x / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (x + z2 / 2.0) / (n + z2)
+    half = (z / denom) * math.sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n))
+    lower = max(0.0, center - half)
+    upper = min(1.0, center + half)
+    return (lower, upper)
+
+
+def newcombe_risk_difference_one_sided_upper(
+    numerator_after: int,
+    denominator_after: int,
+    numerator_before: int,
+    denominator_before: int,
+    confidence_level: float,
+) -> tuple[float, float]:
+    """One-sided upper confidence bound for the risk difference
+    p_after - p_before, via Newcombe's hybrid score (MOVER) method built
+    from one-sided Wilson score intervals for each independent arm. This is
+    a genuine two-independent-proportions comparison (not a single-arm
+    interval compared against a point estimate). Returns
+    (point_estimate, ci_upper)."""
+    p_after = numerator_after / denominator_after
+    p_before = numerator_before / denominator_before
+    _, u_after = _wilson_score_interval_one_sided(
+        numerator_after, denominator_after, confidence_level
+    )
+    l_before, _ = _wilson_score_interval_one_sided(
+        numerator_before, denominator_before, confidence_level
+    )
+    diff = p_after - p_before
+    upper = diff + math.sqrt((u_after - p_after) ** 2 + (p_before - l_before) ** 2)
+    return diff, upper
+
+
+def evaluate_non_inferiority(
+    before_metric: dict[str, Any],
+    after_metric: dict[str, Any],
+    confidence_level: float,
+    margin: float,
+    required_sample_count: int,
+) -> dict[str, Any]:
+    """Genuine two-independent-proportions one-sided non-inferiority
+    evaluation of p_after - p_before. Both before AND after must
+    individually meet required_sample_count -- otherwise outcome is
+    inconclusive (fixes the false PASS where only the after side's sample
+    count was checked, e.g. before=1/1, after=20/20, margin=0.01 would
+    previously report non_inferior)."""
+    before_num = before_metric["numerator"]
+    before_den = before_metric["denominator"]
+    after_num = after_metric["numerator"]
+    after_den = after_metric["denominator"]
+
+    if before_den < required_sample_count or after_den < required_sample_count:
+        return {"outcome": "inconclusive", "point_estimate": None, "ci_upper": None}
+
+    point_estimate, ci_upper = newcombe_risk_difference_one_sided_upper(
+        after_num, after_den, before_num, before_den, confidence_level
+    )
+    outcome = "non_inferior" if ci_upper <= margin else "inferior"
+    return {"outcome": outcome, "point_estimate": point_estimate, "ci_upper": ci_upper}
+
+
+# --------------------------------------------------------------------------- #
 # Raw attempt classification / recomputation
 # --------------------------------------------------------------------------- #
 def _classify_workflow_run(conclusion: str) -> str:
@@ -209,23 +293,112 @@ def _classify_workflow_run(conclusion: str) -> str:
     return "excluded"
 
 
+def _attempt_is_expected(attempt: dict[str, Any]) -> bool:
+    """An attempt is "expected" when its status matches expected_status
+    (Playwright's own expectedStatus, e.g. for test.fail()). expected_status
+    defaults to "passed" when absent -- this preserves prior behavior for
+    producers that do not emit it (a plain failed/timedOut/interrupted
+    attempt with no expected_status is still "unexpected", i.e. a real
+    failure)."""
+    return attempt.get("status") == attempt.get("expected_status", "passed")
+
+
 def _classify_playwright_test(record: dict[str, Any]) -> str:
     """Returns one of: success, flaky, terminal_failure, excluded (skipped
-    final attempt)."""
+    final attempt).
+
+    Respects Playwright's outcome semantics via expected_status: a final
+    attempt whose status matches its expected_status (e.g. test.fail()
+    expecting "failed" and getting "failed") is treated as an expected
+    result (success / flaky-if-earlier-unexpected-failure), never as a
+    terminal_failure regression. Only an *unexpected* final status
+    (status != expected_status) that is failed/timedOut/interrupted counts
+    as terminal_failure."""
     attempts = record.get("attempts", [])
     if not attempts:
         return "excluded"
-    final_status = attempts[-1].get("status")
+    final = attempts[-1]
+    final_status = final.get("status")
     if final_status == "skipped":
         return "excluded"
-    earlier_failed = any(
-        a.get("status") in _TERMINAL_FAILURE_TEST_STATUSES for a in attempts[:-1]
+    final_expected = _attempt_is_expected(final)
+    earlier_unexpected_failure = any(
+        not _attempt_is_expected(a) and a.get("status") in _TERMINAL_FAILURE_TEST_STATUSES
+        for a in attempts[:-1]
     )
-    if final_status == "passed":
-        return "flaky" if earlier_failed else "success"
+    if final_expected:
+        return "flaky" if earlier_unexpected_failure else "success"
     if final_status in _TERMINAL_FAILURE_TEST_STATUSES:
         return "terminal_failure"
     return "excluded"
+
+
+def _check_duplicate_sample_identities(
+    cohort: dict[str, Any], cohort_label: str, errors: list[str]
+) -> None:
+    """sample_identity.key = workflow_run_id is a declared contract, not
+    just documentation -- hard-fail (reject, never silently dedupe) on
+    duplicate raw evidence records, since silent summation lets a producer
+    dilute the failure rate arbitrarily by duplicating a low-failure
+    record N times."""
+    seen_run_records: set[tuple[Any, Any]] = set()
+    for run in cohort.get("workflow_runs", []):
+        key = (run.get("workflow_run_id"), run.get("run_attempt"))
+        if key in seen_run_records:
+            _append_unique(
+                errors,
+                f"duplicate_workflow_run_record: {cohort_label} "
+                f"workflow_run_id={key[0]} run_attempt={key[1]}",
+            )
+        seen_run_records.add(key)
+
+    seen_attempt1_ids: set[Any] = set()
+    for run in cohort.get("workflow_runs", []):
+        if run.get("run_attempt") != 1:
+            continue
+        workflow_run_id = run.get("workflow_run_id")
+        if workflow_run_id in seen_attempt1_ids:
+            _append_unique(
+                errors,
+                f"duplicate_workflow_run_id: {cohort_label} "
+                f"workflow_run_id={workflow_run_id}",
+            )
+        seen_attempt1_ids.add(workflow_run_id)
+
+    seen_test_records: set[tuple[Any, Any, Any]] = set()
+    for test in cohort.get("playwright_tests", []):
+        key = (
+            test.get("workflow_run_id"),
+            test.get("run_attempt"),
+            test.get("test_id"),
+        )
+        if key in seen_test_records:
+            _append_unique(
+                errors,
+                f"duplicate_playwright_test_record: {cohort_label} "
+                f"workflow_run_id={key[0]} run_attempt={key[1]} test_id={key[2]}",
+            )
+        seen_test_records.add(key)
+
+
+def _check_attempt_number_ordering(
+    cohort: dict[str, Any], cohort_label: str, errors: list[str]
+) -> None:
+    """attempt_number must be unique and strictly increasing within a
+    PlaywrightLogicalTestRun.attempts array -- the validator (and
+    Playwright itself) treats attempts[-1] as authoritative for the final
+    outcome, so an unordered/duplicated array can silently flip a flaky
+    result into a false terminal_failure or vice versa."""
+    for test in cohort.get("playwright_tests", []):
+        numbers = [a.get("attempt_number") for a in test.get("attempts", [])]
+        if numbers != sorted(numbers) or len(set(numbers)) != len(numbers):
+            _append_unique(
+                errors,
+                f"attempt_number_not_unique_or_ordered: {cohort_label} "
+                f"test_id={test.get('test_id')} "
+                f"workflow_run_id={test.get('workflow_run_id')} "
+                f"run_attempt={test.get('run_attempt')}",
+            )
 
 
 def _recompute_metrics_block(cohort: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -318,6 +491,8 @@ def _check_reliability_metrics(
     raw_attempts = assessment["raw_attempts"]
     recomputed_by_cohort: dict[str, dict[str, Any]] = {}
     for cohort_label in ("before", "after"):
+        _check_duplicate_sample_identities(raw_attempts[cohort_label], cohort_label, errors)
+        _check_attempt_number_ordering(raw_attempts[cohort_label], cohort_label, errors)
         recomputed = _recompute_metrics_block(raw_attempts[cohort_label])
         recomputed_by_cohort[cohort_label] = recomputed
         declared = assessment["reliability_metrics"][cohort_label]
@@ -337,6 +512,19 @@ def _check_non_inferiority_evaluation(
     recomputed_metrics: dict[str, dict[str, Any]],
     errors: list[str],
 ) -> None:
+    """Cross-checks non_inferiority_evaluation against raw_attempts.
+
+    Two independent things are recomputed and cross-checked:
+    1. before/after: per-arm two-sided Clopper-Pearson intervals -- audit
+       only, NOT the basis for outcome (see IntervalEstimate description).
+    2. risk_difference + outcome: the AUTHORITATIVE genuine
+       two-independent-proportions one-sided non-inferiority test of
+       p_after - p_before (see evaluate_non_inferiority()). required_sample_count
+       is enforced on BOTH arms, not just after -- this is the P0-1 fix:
+       previously before=1/1, after=20/20, margin=0.01 recomputed as
+       non_inferior because only after's sample count and a single-arm
+       CI-vs-point-estimate comparison were checked.
+    """
     target_metric = assessment["target_metric"]
     evaluation = assessment["non_inferiority_evaluation"]
     confidence_level = assessment["confidence_level"]
@@ -377,26 +565,33 @@ def _check_non_inferiority_evaluation(
                 errors, f"clopper_pearson_interval_recomputation_mismatch: {cohort_label}"
             )
 
-    before_rate = recomputed_metrics["before"][target_metric]["rate"] or 0.0
-    after_denominator = recomputed_metrics["after"][target_metric]["denominator"]
-    after_upper = clopper_pearson_interval(
-        recomputed_metrics["after"][target_metric]["numerator"],
-        recomputed_metrics["after"][target_metric]["denominator"],
-        confidence_level,
-    )[1]
+    before_field = recomputed_metrics["before"][target_metric]
+    after_field = recomputed_metrics["after"][target_metric]
+    expected = evaluate_non_inferiority(
+        before_field, after_field, confidence_level, margin, required_sample_count
+    )
 
-    if after_denominator < required_sample_count:
-        expected_outcome = "inconclusive"
-    elif after_upper <= before_rate + margin:
-        expected_outcome = "non_inferior"
-    else:
-        expected_outcome = "inferior"
+    declared_rd = evaluation["risk_difference"]
+    declared_point = declared_rd["point_estimate"]
+    declared_upper = declared_rd["ci_upper"]
+    expected_point = expected["point_estimate"]
+    expected_upper = expected["ci_upper"]
 
-    if evaluation["outcome"] != expected_outcome:
+    def _matches(declared: float | None, computed: float | None) -> bool:
+        if declared is None or computed is None:
+            return declared is None and computed is None
+        return math.isclose(declared, computed, abs_tol=CI_TOLERANCE)
+
+    if not _matches(declared_point, expected_point):
+        _append_unique(errors, "risk_difference_point_estimate_recomputation_mismatch")
+    if not _matches(declared_upper, expected_upper):
+        _append_unique(errors, "risk_difference_ci_upper_recomputation_mismatch")
+
+    if evaluation["outcome"] != expected["outcome"]:
         _append_unique(
             errors,
             f"non_inferiority_outcome_recomputation_mismatch: "
-            f"declared={evaluation['outcome']} expected={expected_outcome}",
+            f"declared={evaluation['outcome']} expected={expected['outcome']}",
         )
 
 

@@ -49,7 +49,13 @@ class TestClopperPearsonInterval:
     def test_clopper_pearson_zero_failure_before_cohort_has_finite_nonzero_upper_bound(self):
         lower, upper = validator.clopper_pearson_interval(0, 20, 0.95)
         assert lower == 0.0
-        # matches the ~16.8% one-sided 95% exact upper bound cited in issue #2170
+        # matches the ~16.8% TWO-sided 95% exact upper bound (this is the
+        # value historically cited as "one-sided" in issue #2170's Background
+        # -- that labeling was wrong; clopper_pearson_interval() uses alpha/2
+        # on each tail, i.e. two-sided. The correct one-sided 95% upper bound
+        # for 0/20 is ~13.91% -- see
+        # TestNewcombeWilsonRiskDifference.test_clopper_pearson_two_sided_label_matches_math
+        # and docs/dev/ci-test-reliability-assessment.md.
         assert upper == pytest.approx(0.1684334709830182, abs=1e-9)
 
     def test_clopper_pearson_all_failures_upper_bound_is_one(self):
@@ -225,6 +231,246 @@ class TestStructuralValidation:
         exit_code, decision = validator.validate_assessment(str(broken_path))
         assert exit_code == 3
         assert "operational_error" in decision
+
+
+class TestP0RegressionFindings:
+    """Regression tests for the OWNER adversarial review on PR #2175 (two
+    P0 false-green findings: non-inferiority not a real two-sample test,
+    and sample_identity.key = workflow_run_id not enforced)."""
+
+    def test_duplicate_workflow_run_id_is_rejected(self):
+        cohort = {
+            "workflow_runs": [
+                {"workflow_run_id": 1, "run_attempt": 1, "conclusion": "failure"},
+                {"workflow_run_id": 1, "run_attempt": 1, "conclusion": "success"},
+            ],
+            "playwright_tests": [],
+        }
+        errors: list[str] = []
+        validator._check_duplicate_sample_identities(cohort, "before", errors)
+        assert any("duplicate_workflow_run_id" in err for err in errors)
+        assert any("duplicate_workflow_run_record" in err for err in errors)
+
+    def test_duplicate_playwright_test_record_is_rejected(self):
+        cohort = {
+            "workflow_runs": [],
+            "playwright_tests": [
+                {
+                    "test_id": "t1",
+                    "workflow_run_id": 1,
+                    "run_attempt": 1,
+                    "attempts": [{"attempt_number": 1, "status": "passed"}],
+                },
+                {
+                    "test_id": "t1",
+                    "workflow_run_id": 1,
+                    "run_attempt": 1,
+                    "attempts": [{"attempt_number": 1, "status": "passed"}],
+                },
+            ],
+        }
+        errors: list[str] = []
+        validator._check_duplicate_sample_identities(cohort, "before", errors)
+        assert any("duplicate_playwright_test_record" in err for err in errors)
+
+    def test_duplicate_inflation_cannot_dilute_workflow_failure_rate(self):
+        # A producer duplicating the same low-failure record 99x must not
+        # be able to silently dilute the recomputed failure rate -- the
+        # duplication itself must be surfaced as a hard error, even though
+        # naive summation would recompute a diluted (and self-consistent)
+        # rate.
+        cohort = {
+            "workflow_runs": [
+                {"workflow_run_id": 1, "run_attempt": 1, "conclusion": "failure"}
+            ]
+            + [
+                {"workflow_run_id": 2, "run_attempt": 1, "conclusion": "success"}
+                for _ in range(99)
+            ],
+            "playwright_tests": [],
+        }
+        errors: list[str] = []
+        validator._check_duplicate_sample_identities(cohort, "before", errors)
+        # 99 identical duplicate records of workflow_run_id=2 -- rejected.
+        assert any("workflow_run_id=2" in err for err in errors)
+
+    def test_before_sample_count_below_required_is_inconclusive(self):
+        before_field = {"numerator": 0, "denominator": 5, "rate": 0.0}
+        after_field = {"numerator": 0, "denominator": 25, "rate": 0.0}
+        result = validator.evaluate_non_inferiority(
+            before_field, after_field, confidence_level=0.95, margin=0.2,
+            required_sample_count=20,
+        )
+        assert result["outcome"] == "inconclusive"
+        assert result["point_estimate"] is None
+        assert result["ci_upper"] is None
+
+    def test_two_sample_noninferiority_rejects_false_green(self):
+        # Exact false-PASS scenario from the OWNER adversarial review:
+        # before=1 failure/1 run, after=20 failures/20 runs, margin=0.01.
+        # The old single-arm-only logic reported non_inferior. The fixed
+        # two-sample logic must NOT report non_inferior.
+        before_field = {"numerator": 1, "denominator": 1, "rate": 1.0}
+        after_field = {"numerator": 20, "denominator": 20, "rate": 1.0}
+        result = validator.evaluate_non_inferiority(
+            before_field, after_field, confidence_level=0.95, margin=0.01,
+            required_sample_count=20,
+        )
+        assert result["outcome"] != "non_inferior"
+        # before's denominator (1) is below required_sample_count (20) --
+        # correctly forced inconclusive rather than any spurious PASS.
+        assert result["outcome"] == "inconclusive"
+
+    def test_two_sample_noninferiority_detects_genuine_regression(self):
+        # Both arms meet required_sample_count; after is genuinely much
+        # worse than before -- must be "inferior", not "non_inferior".
+        before_field = {"numerator": 1, "denominator": 20, "rate": 0.05}
+        after_field = {"numerator": 18, "denominator": 20, "rate": 0.9}
+        result = validator.evaluate_non_inferiority(
+            before_field, after_field, confidence_level=0.95, margin=0.2,
+            required_sample_count=20,
+        )
+        assert result["outcome"] == "inferior"
+
+    def test_expected_failure_is_not_terminal_regression(self):
+        # A Playwright test.fail() style test: the attempt's status
+        # ("failed") matches its own expected_status ("failed"). This must
+        # be classified as "success" (an expected result), never as
+        # terminal_failure, even though the raw status literal is "failed".
+        record = {
+            "test_id": "e2e/expected-fail.spec.ts::always-fails",
+            "workflow_run_id": 1,
+            "run_attempt": 1,
+            "attempts": [
+                {"attempt_number": 1, "status": "failed", "expected_status": "failed"}
+            ],
+        }
+        assert validator._classify_playwright_test(record) == "success"
+
+    def test_unexpected_pass_of_expected_fail_test_is_not_silently_success(self):
+        # An expected-to-fail test that unexpectedly passes: status
+        # ("passed") does not match expected_status ("failed") -- this is
+        # NOT a matching/expected outcome. The final-attempt branch
+        # (final_expected is False, final status is "passed", not in
+        # _TERMINAL_FAILURE_TEST_STATUSES) is excluded rather than
+        # silently counted as a normal success, since it does not match
+        # the declared expectation.
+        record = {
+            "test_id": "e2e/expected-fail.spec.ts::unexpectedly-passes",
+            "workflow_run_id": 1,
+            "run_attempt": 1,
+            "attempts": [
+                {"attempt_number": 1, "status": "passed", "expected_status": "failed"}
+            ],
+        }
+        assert validator._classify_playwright_test(record) == "excluded"
+
+    def test_expected_status_absent_preserves_prior_behavior(self):
+        # No expected_status present -- defaults to "passed", identical to
+        # pre-fix classification.
+        record = {
+            "test_id": "e2e/normal.spec.ts::normal",
+            "workflow_run_id": 1,
+            "run_attempt": 1,
+            "attempts": [{"attempt_number": 1, "status": "failed"}],
+        }
+        assert validator._classify_playwright_test(record) == "terminal_failure"
+
+    def test_attempt_numbers_must_be_unique_and_ordered(self):
+        cohort = {
+            "workflow_runs": [],
+            "playwright_tests": [
+                {
+                    "test_id": "t1",
+                    "workflow_run_id": 1,
+                    "run_attempt": 1,
+                    "attempts": [
+                        {"attempt_number": 2, "status": "passed"},
+                        {"attempt_number": 1, "status": "failed"},
+                    ],
+                }
+            ],
+        }
+        errors: list[str] = []
+        validator._check_attempt_number_ordering(cohort, "before", errors)
+        assert any("attempt_number_not_unique_or_ordered" in err for err in errors)
+
+    def test_attempt_numbers_duplicate_is_rejected(self):
+        cohort = {
+            "workflow_runs": [],
+            "playwright_tests": [
+                {
+                    "test_id": "t1",
+                    "workflow_run_id": 1,
+                    "run_attempt": 1,
+                    "attempts": [
+                        {"attempt_number": 1, "status": "failed"},
+                        {"attempt_number": 1, "status": "passed"},
+                    ],
+                }
+            ],
+        }
+        errors: list[str] = []
+        validator._check_attempt_number_ordering(cohort, "before", errors)
+        assert any("attempt_number_not_unique_or_ordered" in err for err in errors)
+
+    def test_attempt_numbers_ordered_and_unique_is_not_rejected(self):
+        cohort = {
+            "workflow_runs": [],
+            "playwright_tests": [
+                {
+                    "test_id": "t1",
+                    "workflow_run_id": 1,
+                    "run_attempt": 1,
+                    "attempts": [
+                        {"attempt_number": 1, "status": "failed"},
+                        {"attempt_number": 2, "status": "passed"},
+                    ],
+                }
+            ],
+        }
+        errors: list[str] = []
+        validator._check_attempt_number_ordering(cohort, "before", errors)
+        assert errors == []
+
+    def test_fixed_declared_sample_count_forces_is_power_derived_false_structurally(
+        self, tmp_path
+    ):
+        base = _load_fixture("valid_workflow_failure_rate_non_inferior.json")
+        base["sample_count_rule"] = {
+            "method": "fixed_declared",
+            "is_power_derived": True,
+            "required_sample_count": 20,
+            "justification": "fixed sample size, not power-derived",
+        }
+        broken_path = tmp_path / "fixed_declared_wrong_is_power_derived.json"
+        broken_path.write_text(json.dumps(base), encoding="utf-8")
+        exit_code, decision = validator.validate_assessment(str(broken_path))
+        assert exit_code == 2
+        assert decision["structural_valid"] is False
+
+
+class TestNewcombeWilsonRiskDifference:
+    def test_wilson_score_one_sided_zero_failure_lower_bound_is_zero(self):
+        lower, _ = validator._wilson_score_interval_one_sided(0, 20, 0.95)
+        assert lower == 0.0
+
+    def test_newcombe_risk_difference_identical_rates_upper_bound_is_positive(self):
+        point_estimate, ci_upper = validator.newcombe_risk_difference_one_sided_upper(
+            10, 20, 10, 20, 0.95
+        )
+        assert point_estimate == pytest.approx(0.0)
+        assert ci_upper > 0.0
+
+    def test_clopper_pearson_two_sided_label_matches_math(self):
+        # 0/20 two-sided 95% CP upper endpoint (alpha/2 tail) is ~16.84%,
+        # NOT the one-sided 95% upper bound (~13.91%). This is the P1
+        # sidedness finding from the OWNER adversarial review -- the
+        # existing clopper_pearson_interval() implementation is correct
+        # (it computes the two-sided interval), but its docstring/tests
+        # must not claim "one-sided".
+        _, two_sided_upper = validator.clopper_pearson_interval(0, 20, 0.95)
+        assert two_sided_upper == pytest.approx(0.1684334709830182, abs=1e-9)
 
 
 class TestMainCLI:
