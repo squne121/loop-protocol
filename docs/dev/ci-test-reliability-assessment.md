@@ -78,7 +78,7 @@ validator（`validate_ci_reliability_assessment_v1.py`）は `run_attempt == 1` 
 
 `before` 側が 0 failure の場合も、上記ロジックは `before.rate == 0.0` として margin をそのまま適用するため、0 failure を「今後も 0% であることが保証されている」とは扱わない（margin 自体が許容幅を表す）。
 
-## cancelled / timed_out / infrastructure failure の扱い
+## cancelled / timed_out / infrastructure failure の扱い（分類方針）
 
 | conclusion | 分類 | workflow_failure_rate への算入 |
 |---|---|---|
@@ -101,7 +101,7 @@ Playwright logical test の最終 attempt が `skipped` の場合も、`playwrig
 
 自己申告された `reliability_metrics` / `non_inferiority_evaluation` の値は、`raw_attempts` からの独立再計算と一致しない限り信頼されない（fixture-driven semantic validator パターン。`validate_ci_performance_assessment_v2.py` と同様の設計方針）。
 
-## fixture
+## fixture（検証用フィクスチャ）
 
 `fixtures/ci-test-reliability/` に以下の fixture を配置する:
 
