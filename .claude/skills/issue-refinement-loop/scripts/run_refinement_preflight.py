@@ -1432,7 +1432,10 @@ def _classify_anchor_scope_reframe(
         if _anchor_scope_reframe_fence_present(anchor_body):
             return {
                 "status": "fail_closed",
-                "reason": "schema_invalid: anchor_scope_reframe_v1_fence_present_but_unparseable_or_wrong_schema_version",
+                "reason": (
+                    "schema_invalid: "
+                    "anchor_scope_reframe_v1_fence_present_but_unparseable_or_wrong_schema_version"
+                ),
                 "implementation_go": False,
                 "anchor_author_association": author_assoc,
                 "anchor_comment_url": anchor_url,

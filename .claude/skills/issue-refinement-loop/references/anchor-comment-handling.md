@@ -133,7 +133,7 @@ planner が受け取るのは normalized decision / hash / provenance のみと�
 
 詳細な shape は `references/scope-signal-guard.md` の「scope_delta_authority_evidence_v1（正規化済み evidence, AC14）」を参照する。
 
-### `_classify_anchor_scope_reframe()` の genuine absence / present-but-invalid tri-state（#2156）
+### `_classify_anchor_scope_reframe()` の三値判定（genuine absence と present-but-invalid の区別、#2156）
 
 `_classify_anchor_scope_reframe()` が ```yaml fenced block を解析できなかった場合、以下の 2 つを区別する:
 
