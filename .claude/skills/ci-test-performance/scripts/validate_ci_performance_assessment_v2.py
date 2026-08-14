@@ -369,37 +369,109 @@ def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
     return ordered[rank - 1]
 
 
+# #2159 P0-7 (fix_delta after adversarial review issuecomment-5295659213):
+# raw-sample percentile recomputation was previously OPTIONAL whenever
+# `run_details` was absent, so a producer could self-report p50/p95 with no
+# raw samples at all and sail through unchecked. `run_details` is now
+# MANDATORY whenever `performance_evidence.status == "complete"` AND
+# `claim.kind != "none"` (i.e. whenever a real, non-smoke-test performance
+# claim is being asserted). Backward compatibility is preserved ONLY for
+# `claim.kind == "none"` artifacts (the no-op smoke-test producer, #2159
+# P0-8).
+MIN_RAW_SAMPLE_COUNT = 20
+
+
 def _check_percentile_recomputed_from_raw_samples(
-    performance_evidence: dict[str, Any], errors: list[str]
+    assessment: dict[str, Any], errors: list[str], blockers: list[str]
 ) -> None:
-    """Issue #2159 AC8 (P0-9): recompute P50/P95 from
+    """Issue #2159 AC8 (P0-7/P0-9): recompute P50/P95 from
     `runtime_delta.<cohort>.run_details[].duration_seconds` raw samples and
     cross-check against the cohort's self-reported `p50_seconds` /
-    `p95_seconds`. Previously this validator only cross-checked the
-    before/after DELTA (`_recompute_delta`, from the already-aggregated
-    p50/p95 values) -- it never verified those aggregate p50/p95 values
-    themselves were honestly derived from the raw per-run samples.
-    `run_details` is an OPTIONAL field (schemas/ci_runtime_delta_v2.schema.json);
-    a cohort without it is not penalized here (no raw samples to recompute
-    from), preserving backward compatibility with existing assessments
-    that only report pre-aggregated statistics."""
+    `p95_seconds`. Also enforces the P0-7 raw-sample invariants:
+
+    - `run_details` is REQUIRED (not optional) whenever
+      `performance_evidence.status == "complete"` AND `claim.kind != "none"`
+      -- a real claim.kind (improvement/regression/absolute_budget/etc.)
+      backed by `status: complete` must always be accompanied by the raw
+      samples that back it, closing the P0-7 self-report bypass where a
+      producer omits `run_details` to dodge recomputation.
+    - `run_count == len(run_ids) == len(run_details)`.
+    - every `run_details[].workflow_run_id` is present in `run_ids`
+      (exact set match, no orphaned or missing raw-sample records).
+    - `duration_seconds` is a finite positive number (rejects NaN/Infinity/
+      non-numeric/negative/zero).
+    - no duplicate `workflow_run_id` within a single cohort's `run_details`.
+    - `run_details` must contain >= MIN_RAW_SAMPLE_COUNT valid samples once
+      the above invariants hold.
+    - the declared `p50_seconds`/`p95_seconds` must always equal the
+      recomputed value (recomputation is no longer skipped just because a
+      cohort happens not to declare one)."""
+    claim = assessment.get("claim", {})
+    claim_kind = claim.get("kind")
+    performance_evidence = assessment["performance_evidence"]
+    status = performance_evidence.get("status")
     runtime_delta = performance_evidence.get("runtime_delta")
+
+    run_details_required = status == "complete" and claim_kind != "none"
+
     if not runtime_delta:
+        if run_details_required:
+            _append_unique(blockers, "run_details_required_but_runtime_delta_missing")
         return
 
     for cohort_key in ("before", "after"):
         cohort = runtime_delta.get(cohort_key)
         if not cohort:
             continue
+
         run_details = cohort.get("run_details")
+
         if not run_details:
+            if run_details_required:
+                _append_unique(
+                    blockers,
+                    f"run_details_required_for_complete_non_none_claim_but_missing: {cohort_key}",
+                )
             continue
 
-        durations = [
-            rd.get("duration_seconds")
-            for rd in run_details
-            if isinstance(rd, dict) and isinstance(rd.get("duration_seconds"), (int, float))
+        run_ids = cohort.get("run_ids", [])
+        run_count = cohort.get("run_count")
+
+        if run_count is not None and run_count != len(run_details):
+            _append_unique(errors, f"run_count_mismatches_run_details_length: {cohort_key}")
+
+        detail_run_ids = [
+            rd.get("workflow_run_id") for rd in run_details if isinstance(rd, dict)
         ]
+        if len(detail_run_ids) != len(set(detail_run_ids)):
+            _append_unique(errors, f"run_details_duplicate_workflow_run_id: {cohort_key}")
+
+        if set(detail_run_ids) != set(run_ids):
+            _append_unique(errors, f"run_details_workflow_run_id_mismatches_run_ids: {cohort_key}")
+
+        durations: list[float] = []
+        for rd in run_details:
+            if not isinstance(rd, dict):
+                _append_unique(errors, f"run_details_entry_not_object: {cohort_key}")
+                continue
+            duration = rd.get("duration_seconds")
+            if (
+                not isinstance(duration, (int, float))
+                or isinstance(duration, bool)
+                or not math.isfinite(duration)
+                or duration <= 0
+            ):
+                _append_unique(errors, f"run_details_invalid_duration_seconds: {cohort_key}")
+                continue
+            durations.append(float(duration))
+
+        if run_details_required and len(durations) < MIN_RAW_SAMPLE_COUNT:
+            _append_unique(
+                blockers,
+                f"run_details_below_min_raw_sample_count: {cohort_key} "
+                f"({len(durations)} < {MIN_RAW_SAMPLE_COUNT})",
+            )
+
         if not durations:
             continue
 
@@ -409,6 +481,11 @@ def _check_percentile_recomputed_from_raw_samples(
         declared_p50 = cohort.get("p50_seconds")
         declared_p95 = cohort.get("p95_seconds")
 
+        if run_details_required and declared_p50 is None:
+            _append_unique(errors, f"declared_p50_missing_with_run_details_present: {cohort_key}")
+        if run_details_required and declared_p95 is None:
+            _append_unique(errors, f"declared_p95_missing_with_run_details_present: {cohort_key}")
+
         if declared_p50 is not None and not math.isclose(
             declared_p50, recomputed_p50, rel_tol=1e-6, abs_tol=DELTA_TOLERANCE
         ):
@@ -417,6 +494,19 @@ def _check_percentile_recomputed_from_raw_samples(
             declared_p95, recomputed_p95, rel_tol=1e-6, abs_tol=DELTA_TOLERANCE
         ):
             _append_unique(errors, f"percentile_recomputation_mismatch_p95: {cohort_key}")
+
+    before_ids = {
+        rd.get("workflow_run_id")
+        for rd in (runtime_delta.get("before", {}) or {}).get("run_details", []) or []
+        if isinstance(rd, dict)
+    }
+    after_ids = {
+        rd.get("workflow_run_id")
+        for rd in (runtime_delta.get("after", {}) or {}).get("run_details", []) or []
+        if isinstance(rd, dict)
+    }
+    if before_ids & after_ids:
+        _append_unique(errors, "run_details_workflow_run_id_overlap_before_after")
 
 
 def _check_cohort_comparability(
@@ -537,7 +627,7 @@ def run_semantic_checks(
         expected_artifact_digest,
     )
     _check_cohort_comparability(assessment["performance_evidence"], errors, blockers)
-    _check_percentile_recomputed_from_raw_samples(assessment["performance_evidence"], errors)
+    _check_percentile_recomputed_from_raw_samples(assessment, errors, blockers)
     _check_approval_gates(assessment, blockers)
 
     semantic_valid = len(errors) == 0

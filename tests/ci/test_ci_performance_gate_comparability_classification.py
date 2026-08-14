@@ -91,6 +91,19 @@ def test_within_cohort_fingerprint_still_excludes_mismatched_runs():
     assert result_ids == {1, 2, 3}
 
 
+def _fingerprinted_baseline(job: str, workflow_run_id: int, overrides: dict) -> dict:
+    b = {
+        "schema": "ci_runtime_baseline_v1",
+        "job": job,
+        "workflow_run_id": workflow_run_id,
+        "measurements": [{"phase_id": "test_e2e_ci", "elapsed_ms": 100_000, "status": 0}],
+    }
+    for field in gate.WITHIN_COHORT_REQUIRED_EQUAL:
+        b[field] = "shared-value"
+    b.update(overrides)
+    return b
+
+
 def test_cross_cohort_fields_used_to_compare_before_after_provenance():
     """GIVEN a before-arm cohort and an after-arm cohort WHEN checking
     cross-cohort comparability (infra should not silently change just
@@ -116,3 +129,82 @@ def test_cross_cohort_fields_used_to_compare_before_after_provenance():
 
     assert mismatched_matching == []
     assert mismatched_drifted == ["host_runner_image"]
+
+
+# --------------------------------------------------------------------------- #
+# #2159 P0-5 (fix_delta after adversarial review issuecomment-5295659213):
+# the PRE-fix_delta version of this file only ever compared two hand-built
+# dicts via a list comprehension -- it never called a real PRODUCTION
+# function, and `_comparable_cohort` itself never enforced cross-job/
+# cross-arm comparability (it picked the largest fingerprint group per job
+# INDEPENDENTLY). These tests call the real
+# `gate.validate_experiment_comparability` production function against
+# fixture cohorts that reproduce the review's exact attack example.
+# --------------------------------------------------------------------------- #
+def test_validate_experiment_comparability_accepts_fully_matching_cohorts():
+    """GIVEN before/after cohorts that all share the same
+    CROSS_COHORT_REQUIRED_EQUAL provenance WHEN
+    `validate_experiment_comparability` (the real production function)
+    runs THEN there are no violations."""
+    core = [_fingerprinted_baseline("e2e-core", i, {}) for i in range(1, 21)]
+    responsive = [_fingerprinted_baseline("e2e-responsive-matrix", i, {}) for i in range(1, 21)]
+    old_e2e = [_fingerprinted_baseline("e2e", i, {}) for i in range(1000, 1020)]
+
+    violations = gate.validate_experiment_comparability(
+        {"e2e-core": core, "e2e-responsive-matrix": responsive},
+        {"e2e": old_e2e},
+    )
+    assert violations == []
+
+
+def test_validate_experiment_comparability_rejects_review_attack_example():
+    """GIVEN the review's EXACT attack example -- before uses host image A,
+    after uses host image B; `e2e-core` uses container digest X,
+    `e2e-responsive-matrix` uses digest Y -- with each job's own cohort
+    individually reaching 20 legitimate same-fingerprint samples, WHEN
+    `validate_experiment_comparability` runs THEN it reports the drift
+    (proving the production `_comparable_cohort` selection is no longer
+    silently accepted as comparable just because each job's OWN group is
+    internally consistent)."""
+    core = [
+        _fingerprinted_baseline(
+            "e2e-core", i, {"host_runner_image": "image-A", "playwright_container_image_digest": "digest-X"}
+        )
+        for i in range(1, 21)
+    ]
+    responsive = [
+        _fingerprinted_baseline(
+            "e2e-responsive-matrix",
+            i,
+            {"host_runner_image": "image-A", "playwright_container_image_digest": "digest-Y"},
+        )
+        for i in range(1, 21)
+    ]
+    old_e2e = [
+        _fingerprinted_baseline(
+            "e2e", i, {"host_runner_image": "image-B", "playwright_container_image_digest": "digest-X"}
+        )
+        for i in range(1000, 1020)
+    ]
+
+    violations = gate.validate_experiment_comparability(
+        {"e2e-core": core, "e2e-responsive-matrix": responsive},
+        {"e2e": old_e2e},
+    )
+    assert any("playwright_container_image_digest" in v for v in violations), (
+        "e2e-core (digest-X) vs e2e-responsive-matrix (digest-Y) drift within "
+        "the same arm must be reported"
+    )
+    assert any("host_runner_image" in v for v in violations), (
+        "host image drift between the split-job arm (image-A) and the old "
+        "e2e arm (image-B) must be reported"
+    )
+
+
+def test_validate_experiment_comparability_empty_cohorts_are_not_falsely_flagged():
+    """GIVEN fewer than 2 non-empty cohorts to compare WHEN
+    `validate_experiment_comparability` runs THEN it returns no violations
+    (nothing to compare -- this is the pre-cohort-accumulation SKIP state,
+    not a drift finding)."""
+    assert gate.validate_experiment_comparability({"e2e-core": []}, {"e2e": []}) == []
+    assert gate.validate_experiment_comparability({}, {}) == []

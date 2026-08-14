@@ -37,6 +37,7 @@ def _record(
     artifact_id: int | None = None,
     artifact_digest: str | None = None,
     conclusion: str = "success",
+    workflow_digest: str = "workflow-digest-fixture-v1",
 ) -> dict:
     return {
         "workflow_run_id": workflow_run_id,
@@ -45,6 +46,7 @@ def _record(
         "artifact_id": artifact_id if artifact_id is not None else workflow_run_id,
         "artifact_digest": artifact_digest or ("sha256:" + f"{workflow_run_id:064x}"),
         "conclusion": conclusion,
+        "workflow_digest": workflow_digest,
     }
 
 
@@ -65,7 +67,12 @@ def test_fixed_sha_recorded():
     after_records = _full_job_set_records(1, AFTER_SHA, start_id=101)
 
     manifest = collector.collect_benchmark_manifest(
-        BEFORE_SHA, AFTER_SHA, before_records, after_records, min_run_count=1
+        BEFORE_SHA,
+        AFTER_SHA,
+        before_records,
+        after_records,
+        job_names=("e2e-core", "e2e-responsive-matrix", "e2e"),
+        min_run_count=1,
     )
     assert manifest["before_sha"] == BEFORE_SHA
     assert manifest["after_sha"] == AFTER_SHA
@@ -104,7 +111,13 @@ def test_sample_identity_20_run_cohort_deduped_correctly():
         before_records.append(_record(run_id, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=90000 + run_id))
     after_records = _full_job_set_records(20, AFTER_SHA, start_id=101)
 
-    manifest = collector.collect_benchmark_manifest(BEFORE_SHA, AFTER_SHA, before_records, after_records)
+    manifest = collector.collect_benchmark_manifest(
+        BEFORE_SHA,
+        AFTER_SHA,
+        before_records,
+        after_records,
+        job_names=("e2e-core", "e2e-responsive-matrix", "e2e"),
+    )
     before_core = manifest["arms"]["before"]["jobs"]["e2e-core"]
     assert before_core["run_count"] == 20
     assert len(before_core["sample_workflow_run_ids"]) == 20
@@ -127,6 +140,7 @@ def test_artifact_id_digest_head_job_verified():
         AFTER_SHA,
         good + [bad_digest, bad_head, malformed_head],
         _full_job_set_records(1, AFTER_SHA, start_id=101),
+        job_names=("e2e-core", "e2e-responsive-matrix", "e2e"),
         min_run_count=1,
     )
     core_ids = {r["workflow_run_id"] for r in manifest["arms"]["before"]["jobs"]["e2e-core"]["runs"]}
@@ -150,7 +164,13 @@ def test_manifest_conforms_to_schema():
     passes structural validation (AC7)."""
     before_records = _full_job_set_records(20, BEFORE_SHA, start_id=1)
     after_records = _full_job_set_records(20, AFTER_SHA, start_id=101)
-    manifest = collector.collect_benchmark_manifest(BEFORE_SHA, AFTER_SHA, before_records, after_records)
+    manifest = collector.collect_benchmark_manifest(
+        BEFORE_SHA,
+        AFTER_SHA,
+        before_records,
+        after_records,
+        job_names=("e2e-core", "e2e-responsive-matrix", "e2e"),
+    )
     # Must not raise.
     collector._validate_against_schema(manifest)
 
@@ -161,7 +181,13 @@ def test_manifest_incomplete_when_below_min_run_count():
     written -- CLI exit code 2, not silently marked complete)."""
     before_records = _full_job_set_records(5, BEFORE_SHA, start_id=1)
     after_records = _full_job_set_records(20, AFTER_SHA, start_id=101)
-    manifest = collector.collect_benchmark_manifest(BEFORE_SHA, AFTER_SHA, before_records, after_records)
+    manifest = collector.collect_benchmark_manifest(
+        BEFORE_SHA,
+        AFTER_SHA,
+        before_records,
+        after_records,
+        job_names=("e2e-core", "e2e-responsive-matrix", "e2e"),
+    )
     assert manifest["arms"]["before"]["complete"] is False
     assert manifest["arms"]["after"]["complete"] is True
 
@@ -239,4 +265,235 @@ def test_cli_operational_failure_on_unparseable_input(tmp_path):
         ]
     )
     assert exit_code == 3
+    assert not output_path.exists()
+
+
+# --------------------------------------------------------------------------- #
+# #2159 P0-4 (fix_delta after adversarial review issuecomment-5295659213):
+# arm-specific job topology + non-successful conclusion exclusion.
+# --------------------------------------------------------------------------- #
+def test_default_topology_is_arm_specific_not_symmetric():
+    """GIVEN the default (no explicit job_names) topology WHEN a manifest is
+    collected THEN the before arm only tracks the pre-split `e2e` job and
+    the after arm only tracks the post-split `e2e-core`/`e2e-responsive-matrix`
+    jobs -- NOT the same 3-job set applied symmetrically to both arms."""
+    before_records = [_record(i, job="e2e", head_sha=BEFORE_SHA) for i in range(1, 21)]
+    after_records = []
+    for i in range(20):
+        after_records.append(_record(100 + i, job="e2e-core", head_sha=AFTER_SHA))
+        after_records.append(_record(100 + i, job="e2e-responsive-matrix", head_sha=AFTER_SHA))
+
+    manifest = collector.collect_benchmark_manifest(BEFORE_SHA, AFTER_SHA, before_records, after_records)
+
+    assert set(manifest["arms"]["before"]["jobs"].keys()) == {"e2e"}
+    assert set(manifest["arms"]["after"]["jobs"].keys()) == {"e2e-core", "e2e-responsive-matrix"}
+    assert manifest["arms"]["before"]["topology"] == "pre_split"
+    assert manifest["arms"]["after"]["topology"] == "post_split"
+    assert manifest["arms"]["before"]["complete"] is True
+    assert manifest["arms"]["after"]["complete"] is True
+
+
+def test_before_arm_split_job_contamination_does_not_count_toward_pre_split_completeness():
+    """GIVEN a before-arm input record set that ALSO contains post-split
+    `e2e-core`/`e2e-responsive-matrix` records (a topology-contamination
+    attack) WHEN collected under the default arm-specific topology THEN
+    those contaminating records are silently out-of-scope for the before
+    arm (not tracked, not counted), and completeness is judged purely on
+    real `e2e` samples."""
+    before_records = [_record(i, job="e2e", head_sha=BEFORE_SHA) for i in range(1, 6)]
+    # Contamination: split-job records injected into the before arm's input.
+    before_records += [_record(1000 + i, job="e2e-core", head_sha=BEFORE_SHA) for i in range(20)]
+    after_records = []
+    for i in range(20):
+        after_records.append(_record(2000 + i, job="e2e-core", head_sha=AFTER_SHA))
+        after_records.append(_record(2000 + i, job="e2e-responsive-matrix", head_sha=AFTER_SHA))
+
+    manifest = collector.collect_benchmark_manifest(BEFORE_SHA, AFTER_SHA, before_records, after_records)
+    assert set(manifest["arms"]["before"]["jobs"].keys()) == {"e2e"}
+    assert manifest["arms"]["before"]["jobs"]["e2e"]["run_count"] == 5
+    assert manifest["arms"]["before"]["complete"] is False
+
+
+def test_after_core_responsive_pair_set_mismatch_detected_by_semantic_validator():
+    """GIVEN an after arm where `e2e-core` and `e2e-responsive-matrix` do
+    NOT share the same set of `workflow_run_id`s (an incomplete pairing)
+    WHEN `validate_manifest_semantics` runs THEN
+    `pair_set_mismatch_e2e_core_e2e_responsive_matrix` is reported for the
+    after arm (#2159 P0-9)."""
+    before_records = [_record(i, job="e2e", head_sha=BEFORE_SHA) for i in range(20)]
+    after_records = [_record(100 + i, job="e2e-core", head_sha=AFTER_SHA) for i in range(20)]
+    # Responsive side uses a DIFFERENT, non-overlapping id range.
+    after_records += [_record(9000 + i, job="e2e-responsive-matrix", head_sha=AFTER_SHA) for i in range(20)]
+
+    manifest = collector.collect_benchmark_manifest(BEFORE_SHA, AFTER_SHA, before_records, after_records)
+    violations = collector.validate_manifest_semantics(manifest)
+    assert any("pair_set_mismatch_e2e_core_e2e_responsive_matrix: after" in v for v in violations)
+
+
+def test_failure_conclusion_runs_excluded_from_sample_and_reported_as_evidence_error():
+    """GIVEN 20 structurally-valid `e2e` records all with `conclusion:
+    failure` WHEN collected THEN none of them count toward run_count/
+    completeness (a failed run's timing is not a valid performance sample),
+    and each is reported as an explicit
+    `non_successful_conclusion_excluded_from_sample` evidence error rather
+    than silently vanishing."""
+    before_records = [_record(i, job="e2e", head_sha=BEFORE_SHA, conclusion="failure") for i in range(1, 21)]
+    after_records = []
+    for i in range(20):
+        after_records.append(_record(100 + i, job="e2e-core", head_sha=AFTER_SHA))
+        after_records.append(_record(100 + i, job="e2e-responsive-matrix", head_sha=AFTER_SHA))
+
+    manifest = collector.collect_benchmark_manifest(BEFORE_SHA, AFTER_SHA, before_records, after_records)
+    assert manifest["arms"]["before"]["jobs"]["e2e"]["run_count"] == 0
+    assert manifest["arms"]["before"]["complete"] is False
+    non_success_errors = [
+        e
+        for e in manifest["evidence_errors"]
+        if e["arm"] == "before" and e["reason"] == "non_successful_conclusion_excluded_from_sample"
+    ]
+    assert len(non_success_errors) == 20
+
+
+def test_mixed_success_and_non_success_only_success_counts():
+    """GIVEN 20 `success` records and 5 additional `cancelled`/`skipped`/
+    `timed_out` records for the same job WHEN collected THEN run_count
+    reflects only the 20 successful samples, not 25."""
+    before_records = [_record(i, job="e2e", head_sha=BEFORE_SHA, conclusion="success") for i in range(1, 21)]
+    before_records += [
+        _record(500, job="e2e", head_sha=BEFORE_SHA, conclusion="cancelled"),
+        _record(501, job="e2e", head_sha=BEFORE_SHA, conclusion="skipped"),
+        _record(502, job="e2e", head_sha=BEFORE_SHA, conclusion="timed_out"),
+    ]
+    after_records = []
+    for i in range(20):
+        after_records.append(_record(100 + i, job="e2e-core", head_sha=AFTER_SHA))
+        after_records.append(_record(100 + i, job="e2e-responsive-matrix", head_sha=AFTER_SHA))
+
+    manifest = collector.collect_benchmark_manifest(BEFORE_SHA, AFTER_SHA, before_records, after_records)
+    assert manifest["arms"]["before"]["jobs"]["e2e"]["run_count"] == 20
+
+
+# --------------------------------------------------------------------------- #
+# #2159 P0-9: semantic manifest validator (cross-field invariants JSON
+# Schema alone cannot express).
+# --------------------------------------------------------------------------- #
+def _minimal_valid_manifest() -> dict:
+    before_records = [_record(i, job="e2e", head_sha=BEFORE_SHA) for i in range(20)]
+    after_records = []
+    for i in range(20):
+        after_records.append(_record(100 + i, job="e2e-core", head_sha=AFTER_SHA))
+        after_records.append(_record(100 + i, job="e2e-responsive-matrix", head_sha=AFTER_SHA))
+    return collector.collect_benchmark_manifest(BEFORE_SHA, AFTER_SHA, before_records, after_records)
+
+
+def test_semantic_validator_passes_on_self_produced_manifest():
+    """GIVEN a manifest produced by `collect_benchmark_manifest` itself
+    WHEN `validate_manifest_semantics` runs THEN there are no violations
+    (the producer's own output is internally consistent by construction)."""
+    manifest = _minimal_valid_manifest()
+    assert collector.validate_manifest_semantics(manifest) == []
+
+
+def test_semantic_validator_detects_root_sha_vs_arm_commit_sha_mismatch():
+    manifest = _minimal_valid_manifest()
+    manifest["arms"]["before"]["commit_sha"] = "c" * 40
+    violations = collector.validate_manifest_semantics(manifest)
+    assert any("commit_sha_mismatches_root_before_sha" in v for v in violations)
+
+
+def test_semantic_validator_detects_run_count_mismatches_len_runs():
+    manifest = _minimal_valid_manifest()
+    manifest["arms"]["before"]["jobs"]["e2e"]["run_count"] = 999
+    violations = collector.validate_manifest_semantics(manifest)
+    assert any("run_count_mismatches_len_runs: before/e2e" in v for v in violations)
+
+
+def test_semantic_validator_detects_sample_ids_mismatches_runs():
+    manifest = _minimal_valid_manifest()
+    manifest["arms"]["before"]["jobs"]["e2e"]["sample_workflow_run_ids"] = [999999]
+    violations = collector.validate_manifest_semantics(manifest)
+    assert any("sample_workflow_run_ids_mismatches_runs: before/e2e" in v for v in violations)
+
+
+def test_semantic_validator_detects_complete_true_with_zero_runs():
+    manifest = _minimal_valid_manifest()
+    manifest["arms"]["before"]["jobs"]["e2e"]["run_count"] = 0
+    manifest["arms"]["before"]["jobs"]["e2e"]["runs"] = []
+    manifest["arms"]["before"]["jobs"]["e2e"]["sample_workflow_run_ids"] = []
+    manifest["arms"]["before"]["complete"] = True
+    violations = collector.validate_manifest_semantics(manifest)
+    assert any("complete_true_with_zero_runs: before/e2e" in v for v in violations)
+
+
+def test_semantic_validator_detects_complete_true_with_evidence_errors():
+    manifest = _minimal_valid_manifest()
+    manifest["arms"]["before"]["complete"] = True
+    manifest["evidence_errors"].append(
+        {"arm": "before", "reason": "run_record_verification_failed", "detail": "workflow_run_id=999 violations=[]"}
+    )
+    violations = collector.validate_manifest_semantics(manifest)
+    assert any("complete_true_with_evidence_errors: before" in v for v in violations)
+
+
+def test_semantic_validator_detects_job_topology_mismatch():
+    manifest = _minimal_valid_manifest()
+    # Inject an out-of-topology job key into the pre_split before arm.
+    manifest["arms"]["before"]["jobs"]["e2e-core"] = dict(manifest["arms"]["after"]["jobs"]["e2e-core"])
+    violations = collector.validate_manifest_semantics(manifest)
+    assert any("job_topology_mismatch: before" in v for v in violations)
+
+
+def test_manifest_requires_workflow_digest_per_run_record():
+    """GIVEN a run record missing `workflow_digest` (the AC1 field the
+    review confirmed was entirely absent from this schema) WHEN
+    `_verify_run_record` runs THEN `missing_or_invalid_workflow_digest` is
+    reported and the record is excluded from the cohort (#2159 P0-9)."""
+    record = _record(1, job="e2e", head_sha=BEFORE_SHA)
+    del record["workflow_digest"]
+    violations = collector._verify_run_record(record, BEFORE_SHA)
+    assert "missing_or_invalid_workflow_digest" in violations
+
+
+def test_cli_semantic_violation_causes_operational_failure(tmp_path):
+    """GIVEN a manifest that would pass JSON Schema structural validation
+    but fails a semantic cross-field invariant WHEN `main()` runs THEN it
+    exits EXIT_OPERATIONAL_FAILURE (3), not silently written as if valid.
+    This is exercised by monkeypatching `validate_manifest_semantics` via a
+    contaminated before-arm topology (job map key does not match the
+    arm-specific default), which the CLI wiring rejects."""
+    before_path = tmp_path / "before_runs.json"
+    after_path = tmp_path / "after_runs.json"
+    output_path = tmp_path / "manifest.json"
+
+    # Force a job_topology_mismatch: request `e2e-core` as the before-arm
+    # job name (via --before-job-names), which does not match the
+    # pre_split topology label the collector always assigns to the before
+    # arm -- the semantic validator rejects this even though every
+    # individual record and the JSON Schema shape are both otherwise valid.
+    before_records = [_record(i, job="e2e-core", head_sha=BEFORE_SHA) for i in range(20)]
+    after_records = []
+    for i in range(20):
+        after_records.append(_record(100 + i, job="e2e-core", head_sha=AFTER_SHA))
+        after_records.append(_record(100 + i, job="e2e-responsive-matrix", head_sha=AFTER_SHA))
+
+    before_path.write_text(json.dumps(before_records), encoding="utf-8")
+    after_path.write_text(json.dumps(after_records), encoding="utf-8")
+
+    exit_code = collector.main(
+        [
+            "--before-sha",
+            BEFORE_SHA,
+            "--after-sha",
+            AFTER_SHA,
+            "--before-runs-json",
+            str(before_path),
+            "--after-runs-json",
+            str(after_path),
+            "--output",
+            str(output_path),
+            "--before-job-names",
+            "e2e-core",
+        ]
+    )
+    assert exit_code == collector.EXIT_OPERATIONAL_FAILURE
     assert not output_path.exists()

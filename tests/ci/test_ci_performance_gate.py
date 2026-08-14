@@ -356,6 +356,81 @@ def _gate_ready_latency_seconds(baselines: list[dict]) -> list[float]:
 
 
 # --------------------------------------------------------------------------- #
+# #2159 P0-5 (fix_delta after adversarial review issuecomment-5295659213):
+# `_comparable_cohort` selects the largest WITHIN_COHORT_REQUIRED_EQUAL
+# fingerprint group INDEPENDENTLY per job -- it never checks whether that
+# selected group's CROSS_COHORT_REQUIRED_EQUAL provenance subset actually
+# matches across DIFFERENT jobs within the same arm, or across the
+# before/after arms. This is exactly the attack the review describes:
+# before uses host image A, after uses host image B; `e2e-core` uses
+# container digest X, `e2e-responsive-matrix` uses digest Y -- each
+# individually accumulates a legitimate 20-run cohort and is silently
+# accepted as "comparable" even though the infrastructure drifted across
+# the very axis the split (`workflow_digest`, an INTENTIONAL_TREATMENT_
+# DIFFERENCE field) was supposed to isolate.
+# --------------------------------------------------------------------------- #
+def _representative_cross_cohort_fingerprint(
+    cohort: list[dict], fields: tuple[str, ...] = CROSS_COHORT_REQUIRED_EQUAL
+) -> tuple | None:
+    """Returns the CROSS_COHORT_REQUIRED_EQUAL fingerprint of an already
+    within-cohort-filtered baseline list (all entries in `cohort` are
+    assumed, by construction of `_comparable_cohort`, to already share the
+    same WITHIN_COHORT_REQUIRED_EQUAL fingerprint -- CROSS_COHORT_REQUIRED_EQUAL
+    is a strict subset of that, so any single representative entry's value
+    for those fields applies to the whole cohort). Returns None for an
+    empty cohort (nothing to compare)."""
+    if not cohort:
+        return None
+    return _fingerprint(cohort[0], fields)
+
+
+def validate_experiment_comparability(
+    before_cohort_by_job: dict[str, list[dict]],
+    after_cohort_by_job: dict[str, list[dict]],
+    cross_cohort_fields: tuple[str, ...] = CROSS_COHORT_REQUIRED_EQUAL,
+) -> list[str]:
+    """#2159 P0-5: validates that the CROSS_COHORT_REQUIRED_EQUAL
+    provenance fields are IDENTICAL across every job within the before
+    arm, every job within the after arm, AND between the before and after
+    arms themselves (host_runner_image / playwright_container_image_digest
+    / node_version / pnpm_version / playwright_version / lockfile_hash must
+    all be stable -- ONLY `workflow_digest`/`cohort_role`, the
+    INTENTIONAL_TREATMENT_DIFFERENCE fields, are allowed to differ).
+    Returns a list of violation strings (empty list == fully comparable).
+    This is the real production cross-cohort/cross-job check that was
+    missing: the pre-fix_delta version only had the three classification
+    TUPLES defined as constants, with no function actually enforcing
+    equality across jobs/arms."""
+    violations: list[str] = []
+    fingerprints: dict[str, tuple] = {}
+
+    for job, cohort in before_cohort_by_job.items():
+        fp = _representative_cross_cohort_fingerprint(cohort, cross_cohort_fields)
+        if fp is not None:
+            fingerprints[f"before/{job}"] = fp
+    for job, cohort in after_cohort_by_job.items():
+        fp = _representative_cross_cohort_fingerprint(cohort, cross_cohort_fields)
+        if fp is not None:
+            fingerprints[f"after/{job}"] = fp
+
+    if len(fingerprints) < 2:
+        return violations
+
+    keys = sorted(fingerprints)
+    reference_key = keys[0]
+    reference_fp = fingerprints[reference_key]
+    for key in keys[1:]:
+        fp = fingerprints[key]
+        for field, ref_value, value in zip(cross_cohort_fields, reference_fp, fp):
+            if ref_value != value:
+                violations.append(
+                    f"cross_cohort_provenance_drift: field={field!r} "
+                    f"{reference_key}={ref_value!r} != {key}={value!r}"
+                )
+    return violations
+
+
+# --------------------------------------------------------------------------- #
 # #2159 AC11 (P1-6): evidence-insufficient hard-failure path.
 # --------------------------------------------------------------------------- #
 class EvidenceInsufficientError(RuntimeError):
@@ -387,12 +462,89 @@ def _evidence_readiness_hard_check(
         )
 
 
+# --------------------------------------------------------------------------- #
+# #2159 P0-6 (fix_delta after adversarial review issuecomment-5295659213):
+# re-validate the sample floor AFTER pairing/duration/timestamp filtering,
+# not only on the raw pre-filter comparable-cohort counts. Raw per-job
+# counts can each individually satisfy MIN_COHORT_RUN_COUNT while still
+# collapsing to a single valid-duration (or valid-timestamp) sample once
+# exact-pairing and missing-measurement filtering are applied -- computing
+# a P50/P95 "gate" from n=1 while claiming an n>=20-backed result is a
+# fail-open defect this function closes.
+# --------------------------------------------------------------------------- #
+def _provider_post_filter_sample_count(
+    core_baselines: list[dict], responsive_baselines: list[dict]
+) -> tuple[int, list[dict]]:
+    """Returns `(post_filter_sample_count, evidence_errors)` for the
+    provider critical-path cohort AFTER exact pairing by `workflow_run_id`
+    AND after dropping pairs missing a real duration measurement on either
+    side (#2159 P0-6). This is the number that must be compared against
+    `MIN_COHORT_RUN_COUNT`, not the pre-pairing per-job baseline counts."""
+    pairs, evidence_errors = _pair_by_workflow_run_id(core_baselines, responsive_baselines)
+    provider = _provider_critical_path_paired_p50_p95(pairs)
+    post_filter_count = provider["sample_count"] if provider is not None else 0
+    return post_filter_count, evidence_errors
+
+
+def _gate_ready_post_filter_sample_count(baselines: list[dict]) -> int:
+    """Returns the number of baselines with a REAL (both-timestamps-present)
+    same-clock gate-ready latency AFTER timestamp filtering (#2159 P0-6).
+    `_gate_ready_latency_seconds` already silently drops timestamp-missing
+    baselines; this helper makes the resulting count an explicit,
+    independently checkable value rather than an implicit array length the
+    caller may forget to re-validate."""
+    return len(_gate_ready_latency_seconds(baselines))
+
+
+def _evidence_readiness_hard_check_post_filter(
+    provider_post_filter_count: int,
+    provider_evidence_errors: list[dict],
+    gate_ready_post_filter_counts: dict[str, int],
+    min_count: int = MIN_COHORT_RUN_COUNT,
+) -> None:
+    """#2159 P0-6 AC11 extension: the close-verification hard-check must
+    reject evidence whose sample count only meets `min_count` BEFORE
+    pairing/duration/timestamp filtering. This function re-validates the
+    floor using POST-filter counts (see `_provider_post_filter_sample_count`
+    / `_gate_ready_post_filter_sample_count`) and raises
+    `EvidenceInsufficientError` -- never a silent skip -- when the
+    post-filter evidence is insufficient, exactly mirroring
+    `_evidence_readiness_hard_check`'s fail-closed contract but operating on
+    the correct (post-filter) sample counts."""
+    problems: dict[str, object] = {}
+    if provider_post_filter_count < min_count:
+        problems["provider_post_filter_sample_count"] = provider_post_filter_count
+    if provider_evidence_errors:
+        problems["provider_evidence_errors"] = provider_evidence_errors
+    for role, count in gate_ready_post_filter_counts.items():
+        if count < min_count:
+            problems[f"gate_ready_post_filter_sample_count[{role}]"] = count
+    if problems:
+        raise EvidenceInsufficientError(
+            f"insufficient POST-FILTER comparable-cohort evidence (need >= {min_count} "
+            f"AFTER pairing/duration/timestamp filtering, not merely on raw pre-filter "
+            f"per-job counts): {problems!r}"
+        )
+
+
 def test_p50_provider_meets_absolute_and_relative_shortening_threshold():
     baselines = _find_all_baselines()
     cohort = _comparable_cohort(baselines, ("e2e-core", "e2e-responsive-matrix", "e2e"))
     core_baselines = cohort["e2e-core"]
     responsive_baselines = cohort["e2e-responsive-matrix"]
     old_e2e_baselines = cohort["e2e"]
+
+    # #2159 P0-5: reject the cohort outright if cross-job/cross-arm
+    # provenance has drifted, even if each job's own within-cohort
+    # fingerprint group independently reached MIN_COHORT_RUN_COUNT.
+    comparability_violations = validate_experiment_comparability(
+        {"e2e-core": core_baselines, "e2e-responsive-matrix": responsive_baselines},
+        {"e2e": old_e2e_baselines},
+    )
+    assert not comparability_violations, (
+        f"cross-cohort/cross-job provenance drift detected (AC6/#2159 P0-5): "
+        f"{comparability_violations}"
+    )
 
     if (
         len(core_baselines) < MIN_COHORT_RUN_COUNT
@@ -417,6 +569,18 @@ def test_p50_provider_meets_absolute_and_relative_shortening_threshold():
     )
     provider = _provider_critical_path_paired_p50_p95(pairs)
     assert provider is not None, "paired cohort must include real elapsed_ms measurements"
+
+    # #2159 P0-6: re-check the sample floor AFTER pairing/duration
+    # filtering. The pre-pairing per-job counts above (>= MIN_COHORT_RUN_COUNT
+    # each) do NOT guarantee the post-filter provider sample_count is also
+    # >= MIN_COHORT_RUN_COUNT -- missing-duration pairs are silently dropped
+    # by `_provider_critical_path_paired_p50_p95`.
+    assert provider["sample_count"] >= MIN_COHORT_RUN_COUNT, (
+        f"provider post-pairing/duration-filtering sample_count="
+        f"{provider['sample_count']} is below MIN_COHORT_RUN_COUNT="
+        f"{MIN_COHORT_RUN_COUNT} even though pre-filter per-job counts were "
+        f"sufficient (AC9a / #2159 P0-6)"
+    )
 
     old_durations = _job_duration_seconds(old_e2e_baselines)
     assert old_durations, "cohort must include real elapsed_ms measurements for the pre-split old e2e job"
@@ -472,6 +636,19 @@ def test_p50_gate_ready_latency_not_regressed():
     assert new_latencies and old_latencies, (
         "cohort must include real GitHub-API-clock gate-ready latency data "
         "(run_started_at / check_completed_at) for both arms (AC4)"
+    )
+
+    # #2159 P0-6: re-check the sample floor AFTER timestamp filtering, not
+    # only on the pre-filter baseline count.
+    assert len(new_latencies) >= MIN_COHORT_RUN_COUNT, (
+        f"post-timestamp-filtering new_e2e gate-ready sample_count="
+        f"{len(new_latencies)} is below MIN_COHORT_RUN_COUNT={MIN_COHORT_RUN_COUNT} "
+        f"even though the pre-filter baseline count was sufficient (AC9b / #2159 P0-6)"
+    )
+    assert len(old_latencies) >= MIN_COHORT_RUN_COUNT, (
+        f"post-timestamp-filtering old_e2e gate-ready sample_count="
+        f"{len(old_latencies)} is below MIN_COHORT_RUN_COUNT={MIN_COHORT_RUN_COUNT} "
+        f"even though the pre-filter baseline count was sufficient (AC9b / #2159 P0-6)"
     )
 
     new_p50 = statistics.median(new_latencies)

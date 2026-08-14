@@ -68,7 +68,8 @@
       "required": [
         "commit_sha",
         "jobs",
-        "complete"
+        "complete",
+        "topology"
       ],
       "unevaluatedProperties": false,
       "properties": {
@@ -85,6 +86,14 @@
         "complete": {
           "type": "boolean",
           "description": "True only if every job's deduped workflow_run_id sample count is >= min_run_count."
+        },
+        "topology": {
+          "type": "string",
+          "enum": [
+            "pre_split",
+            "post_split"
+          ],
+          "description": "#2159 P0-4: pre_split (before, monolithic e2e job) vs post_split (after, e2e-core/e2e-responsive-matrix)."
         }
       }
     },
@@ -131,7 +140,8 @@
         "head_sha",
         "artifact_id",
         "artifact_digest",
-        "conclusion"
+        "conclusion",
+        "workflow_digest"
       ],
       "unevaluatedProperties": false,
       "properties": {
@@ -164,6 +174,11 @@
             "skipped",
             "timed_out"
           ]
+        },
+        "workflow_digest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "#2159 P0-9/AC1: content identity of the workflow definition that produced this run (distinct from the measured-code head_sha)."
         }
       }
     },

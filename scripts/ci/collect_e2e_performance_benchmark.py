@@ -66,6 +66,28 @@ EXIT_OPERATIONAL_FAILURE = 3
 DEFAULT_MIN_RUN_COUNT = 20
 DEFAULT_JOB_NAMES = ("e2e-core", "e2e-responsive-matrix", "e2e")
 
+# #2159 P0-4 (fix_delta after adversarial review issuecomment-5295659213):
+# before/after are NOT symmetric topologies. `before` (pre-#2137-split) only
+# ever produced the monolithic `e2e` job; `after` (post-#2137-split) only
+# ever produces `e2e-core` / `e2e-responsive-matrix` (the aggregate `e2e`
+# job name is reused post-split for a DIFFERENT purpose -- gate-ready
+# latency tracking -- and is intentionally NOT required for `after`'s
+# provider critical-path topology). Applying the flat DEFAULT_JOB_NAMES
+# symmetrically to both arms made a legitimate `before` cohort permanently
+# unable to reach `complete: true` (it can never produce 20 real
+# `e2e-core`/`e2e-responsive-matrix` samples -- those jobs did not exist
+# pre-split).
+DEFAULT_BEFORE_JOB_NAMES = ("e2e",)
+DEFAULT_AFTER_JOB_NAMES = ("e2e-core", "e2e-responsive-matrix")
+
+# #2159 P0-4: only a "success" conclusion is eligible to count as a
+# performance sample. failure/cancelled/skipped/timed_out runs are excluded
+# from run_count/sample accounting and reported as an explicit evidence
+# error instead of silently inflating the cohort with non-representative
+# timing data (a failed run's elapsed_ms is not a valid performance
+# observation).
+ELIGIBLE_SAMPLE_CONCLUSIONS = frozenset({"success"})
+
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -111,6 +133,11 @@ def _verify_run_record(record: dict, expected_head_sha: str) -> list[str]:
         violations.append("missing_or_invalid_artifact_digest")
     if record.get("conclusion") not in ("success", "failure", "cancelled", "skipped", "timed_out"):
         violations.append("missing_or_invalid_conclusion")
+    # #2159 P0-9: AC1 claims `workflow_digest` is recorded in the manifest;
+    # require it on every run record (not just documented, structurally
+    # enforced).
+    if not isinstance(record.get("workflow_digest"), str) or not record.get("workflow_digest"):
+        violations.append("missing_or_invalid_workflow_digest")
     return violations
 
 
@@ -157,6 +184,22 @@ def _collect_arm(
             # Not one of the jobs this manifest tracks -- not an error,
             # simply out of scope for this benchmark's job set.
             continue
+        if record["conclusion"] not in ELIGIBLE_SAMPLE_CONCLUSIONS:
+            # #2159 P0-4: a structurally-verified but non-successful run is
+            # NOT a valid performance sample -- exclude it from the cohort
+            # and surface it as an explicit evidence error rather than
+            # silently counting it (or silently dropping it with no trace).
+            evidence_errors.append(
+                {
+                    "arm": arm_name,
+                    "reason": "non_successful_conclusion_excluded_from_sample",
+                    "detail": (
+                        f"workflow_run_id={record.get('workflow_run_id')!r} "
+                        f"job={job!r} conclusion={record['conclusion']!r}"
+                    ),
+                }
+            )
+            continue
         usable_by_job[job].append(record)
 
     jobs: dict[str, dict] = {}
@@ -178,6 +221,7 @@ def _collect_arm(
                     "artifact_id": r["artifact_id"],
                     "artifact_digest": r["artifact_digest"],
                     "conclusion": r["conclusion"],
+                    "workflow_digest": r["workflow_digest"],
                 }
                 for r in deduped
             ],
@@ -195,18 +239,43 @@ def collect_benchmark_manifest(
     after_sha: str,
     before_records: list[dict],
     after_records: list[dict],
-    job_names: tuple[str, ...] = DEFAULT_JOB_NAMES,
+    job_names: tuple[str, ...] | None = None,
+    before_job_names: tuple[str, ...] | None = None,
+    after_job_names: tuple[str, ...] | None = None,
     min_run_count: int = DEFAULT_MIN_RUN_COUNT,
     generated_at: str | None = None,
 ) -> dict:
+    """#2159 P0-4: `before_job_names`/`after_job_names` let the caller
+    express the (intentionally asymmetric) pre-split vs post-split job
+    topology. `job_names` (legacy, applies identically to both arms) is
+    still accepted for callers that explicitly want a symmetric topology
+    (e.g. same-schema unit fixtures); when neither `before_job_names` nor
+    `after_job_names` is given, `job_names` defaults to `DEFAULT_JOB_NAMES`
+    (the historical symmetric default). When `before_job_names`/
+    `after_job_names` ARE given (or `job_names` is omitted entirely), the
+    arm-specific `DEFAULT_BEFORE_JOB_NAMES`/`DEFAULT_AFTER_JOB_NAMES`
+    topology is used."""
     if not _is_valid_sha(before_sha):
         raise OperationalError(f"invalid_before_sha: {before_sha!r}")
     if not _is_valid_sha(after_sha):
         raise OperationalError(f"invalid_after_sha: {after_sha!r}")
 
+    if job_names is not None and before_job_names is None and after_job_names is None:
+        resolved_before_job_names = job_names
+        resolved_after_job_names = job_names
+    else:
+        resolved_before_job_names = before_job_names or DEFAULT_BEFORE_JOB_NAMES
+        resolved_after_job_names = after_job_names or DEFAULT_AFTER_JOB_NAMES
+
     evidence_errors: list[dict] = []
-    before_arm = _collect_arm("before", before_sha, before_records, job_names, min_run_count, evidence_errors)
-    after_arm = _collect_arm("after", after_sha, after_records, job_names, min_run_count, evidence_errors)
+    before_arm = _collect_arm(
+        "before", before_sha, before_records, resolved_before_job_names, min_run_count, evidence_errors
+    )
+    before_arm["topology"] = "pre_split"
+    after_arm = _collect_arm(
+        "after", after_sha, after_records, resolved_after_job_names, min_run_count, evidence_errors
+    )
+    after_arm["topology"] = "post_split"
 
     return {
         "schema": "e2e_performance_benchmark_manifest_v1",
@@ -221,6 +290,97 @@ def collect_benchmark_manifest(
         },
         "evidence_errors": evidence_errors,
     }
+
+
+# --------------------------------------------------------------------------- #
+# #2159 P0-9 (fix_delta after adversarial review issuecomment-5295659213):
+# JSON Schema alone cannot express cross-field invariants (root SHA vs arm
+# commit_sha, run_count vs len(runs), complete-but-empty, complete-but-
+# has-evidence-errors, job-map-key vs internal job mismatch, pair-set
+# mismatch between e2e-core/e2e-responsive-matrix). This semantic validator
+# is run from BOTH the producer (`main()` below, fail-closed at collection
+# time) and is importable for a consumer to re-run independently.
+# --------------------------------------------------------------------------- #
+def validate_manifest_semantics(manifest: dict) -> list[str]:
+    """Returns a list of semantic-invariant violation strings (empty list
+    == manifest is semantically consistent). Structural (JSON Schema)
+    validity is a PREREQUISITE, not a substitute, for this check."""
+    violations: list[str] = []
+
+    for arm_name in ("before", "after"):
+        arm = manifest.get("arms", {}).get(arm_name)
+        if not isinstance(arm, dict):
+            violations.append(f"missing_arm: {arm_name}")
+            continue
+
+        root_sha_key = f"{arm_name}_sha"
+        root_sha = manifest.get(root_sha_key)
+        if root_sha is not None and arm.get("commit_sha") != root_sha:
+            violations.append(
+                f"commit_sha_mismatches_root_{root_sha_key}: {arm_name} "
+                f"(root={root_sha!r} arm={arm.get('commit_sha')!r})"
+            )
+
+        jobs = arm.get("jobs", {})
+        if not isinstance(jobs, dict):
+            violations.append(f"jobs_not_object: {arm_name}")
+            continue
+
+        topology = arm.get("topology")
+        expected_jobs = None
+        if topology == "pre_split":
+            expected_jobs = set(DEFAULT_BEFORE_JOB_NAMES)
+        elif topology == "post_split":
+            expected_jobs = set(DEFAULT_AFTER_JOB_NAMES)
+        if expected_jobs is not None and set(jobs.keys()) != expected_jobs:
+            violations.append(
+                f"job_topology_mismatch: {arm_name} topology={topology!r} "
+                f"expected={sorted(expected_jobs)} actual={sorted(jobs.keys())}"
+            )
+
+        pair_sample_sets: dict[str, set] = {}
+        for job_key, cohort in jobs.items():
+            if not isinstance(cohort, dict):
+                violations.append(f"job_cohort_not_object: {arm_name}/{job_key}")
+                continue
+            if cohort.get("job") != job_key:
+                violations.append(
+                    f"job_map_key_mismatches_internal_job: {arm_name}/{job_key} "
+                    f"(internal={cohort.get('job')!r})"
+                )
+            runs = cohort.get("runs", [])
+            run_count = cohort.get("run_count")
+            if run_count is not None and run_count != len(runs):
+                violations.append(
+                    f"run_count_mismatches_len_runs: {arm_name}/{job_key} "
+                    f"(run_count={run_count} len(runs)={len(runs)})"
+                )
+            run_ids_from_runs = {r.get("workflow_run_id") for r in runs if isinstance(r, dict)}
+            sample_ids = set(cohort.get("sample_workflow_run_ids", []))
+            if sample_ids != run_ids_from_runs:
+                violations.append(
+                    f"sample_workflow_run_ids_mismatches_runs: {arm_name}/{job_key}"
+                )
+            if job_key in ("e2e-core", "e2e-responsive-matrix"):
+                pair_sample_sets[job_key] = run_ids_from_runs
+
+            if arm.get("complete") is True and run_count == 0:
+                violations.append(f"complete_true_with_zero_runs: {arm_name}/{job_key}")
+
+        if arm.get("complete") is True:
+            arm_evidence_errors = [
+                err for err in manifest.get("evidence_errors", []) if err.get("arm") == arm_name
+            ]
+            if arm_evidence_errors:
+                violations.append(f"complete_true_with_evidence_errors: {arm_name}")
+
+        if {"e2e-core", "e2e-responsive-matrix"} <= pair_sample_sets.keys():
+            core_ids = pair_sample_sets["e2e-core"]
+            responsive_ids = pair_sample_sets["e2e-responsive-matrix"]
+            if core_ids != responsive_ids:
+                violations.append(f"pair_set_mismatch_e2e_core_e2e_responsive_matrix: {arm_name}")
+
+    return violations
 
 
 def _validate_against_schema(manifest: dict) -> None:
@@ -266,6 +426,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_MIN_RUN_COUNT,
         help=f"Minimum deduped workflow_run_id sample count required per job (default {DEFAULT_MIN_RUN_COUNT})",
     )
+    parser.add_argument(
+        "--before-job-names",
+        default=",".join(DEFAULT_BEFORE_JOB_NAMES),
+        help=(
+            "Comma-separated pre-split job names required for the before arm "
+            f"(#2159 P0-4; default {','.join(DEFAULT_BEFORE_JOB_NAMES)!r})"
+        ),
+    )
+    parser.add_argument(
+        "--after-job-names",
+        default=",".join(DEFAULT_AFTER_JOB_NAMES),
+        help=(
+            "Comma-separated post-split job names required for the after arm "
+            f"(#2159 P0-4; default {','.join(DEFAULT_AFTER_JOB_NAMES)!r})"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -283,9 +459,14 @@ def main(argv: list[str] | None = None) -> int:
             args.after_sha,
             before_records,
             after_records,
+            before_job_names=tuple(args.before_job_names.split(",")),
+            after_job_names=tuple(args.after_job_names.split(",")),
             min_run_count=args.min_runs,
         )
         _validate_against_schema(manifest)
+        semantic_violations = validate_manifest_semantics(manifest)
+        if semantic_violations:
+            raise OperationalError(f"manifest_failed_semantic_validation: {semantic_violations}")
     except OperationalError as exc:
         sys.stderr.write(f"operational_failure: {exc}\n")
         return EXIT_OPERATIONAL_FAILURE
