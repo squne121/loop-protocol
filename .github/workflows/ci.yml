@@ -14,6 +14,42 @@ on:
           AC11) without paying for the unrelated jobs on each measurement run.
         type: boolean
         default: false
+      # #2159 P0-2 (fix_delta after adversarial review issuecomment-5295659213):
+      # dedicated fixed-SHA E2E benchmark dispatch route, following the SAME
+      # #1064 pattern `python_test_bench` already established above (dispatch
+      # this SAME workflow definition repeatedly against a fixed `ref`; each
+      # dispatch is one independent runner-identical sample). The GitHub REST
+      # `workflow_dispatch` `ref` parameter only accepts a branch/tag (never a
+      # raw commit SHA) -- `target_sha` is therefore a VERIFICATION input, not
+      # a checkout selector: the operator dispatches with `ref` set to a
+      # branch/tag whose tip IS `target_sha`, and the e2e-core /
+      # e2e-responsive-matrix jobs below hard-fail if the checked-out HEAD
+      # does not exactly match it (guards against the ref having moved
+      # between dispatch and checkout).
+      target_sha:
+        description: >-
+          Expected 40-hex commit SHA that `ref` must resolve to (verified via
+          `git rev-parse HEAD` immediately after checkout in e2e-core /
+          e2e-responsive-matrix). Leave empty for a normal (non-benchmark) run.
+        type: string
+        default: ""
+      cohort_role:
+        description: >-
+          Fixed-SHA E2E benchmark cohort role for this dispatch (before/after
+          the measured code change). Recorded as `cohort_role` in the
+          ci_runtime_baseline_v1 artifact; an
+          INTENTIONAL_TREATMENT_DIFFERENCE field (#2159 P0-5/P0-7), never
+          checked for cross-arm equality.
+        type: choice
+        options: ["", before, after]
+        default: ""
+      experiment_id:
+        description: >-
+          Free-form identifier grouping the dispatched runs belonging to one
+          fixed-SHA before/after experiment (for operator bookkeeping when
+          collecting `--before-runs-json`/`--after-runs-json` via `gh api`).
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -574,6 +610,12 @@ jobs:
         shell: bash
     env:
       PLAYWRIGHT_VERSION: "1.60.0"
+      # #2159 P0-1 (fix_delta after adversarial review issuecomment-5295659213):
+      # single source-of-truth mirror of this job's `container.image` digest
+      # (GH Actions does not support referencing `env.*` from `container:`),
+      # consumed by the ci_runtime_baseline_v2 producer below as
+      # `playwright_container_image_digest`.
+      PLAYWRIGHT_CONTAINER_IMAGE_DIGEST: "sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948"
       LOOP_E2E_LANE: core
       # Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 4): the
       # real PR head SHA for pull_request events (never the synthetic
@@ -590,6 +632,18 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Verify checked-out HEAD matches dispatched target_sha (#2159 P0-2)
+        if: ${{ github.event.inputs.target_sha != '' }}
+        env:
+          BENCHMARK_TARGET_SHA: ${{ github.event.inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          resolved_head="$(git rev-parse HEAD)"
+          if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
+            echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the dispatch ref branch/tag moved between dispatch and checkout. Refusing to record a benchmark sample for the wrong commit."
+            exit 1
+          fi
+          echo "target_sha verified: $resolved_head"
       - name: Enable pnpm via corepack
         run: |
           corepack enable pnpm
@@ -784,11 +838,35 @@ jobs:
           GH_RUN_ATTEMPT: ${{ github.run_attempt }}
           GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           GH_SHA: ${{ github.sha }}
+          GH_RUNNER_OS: ${{ runner.os }}
+          GH_RUNNER_ARCH: ${{ runner.arch }}
+          # #2159 P0-2: populated only on a dedicated fixed-SHA benchmark
+          # dispatch (empty string on a normal push/pull_request run, which
+          # the producer below falls back to "ci_default" for).
+          BENCHMARK_COHORT_ROLE: ${{ github.event.inputs.cohort_role }}
+          BENCHMARK_EXPERIMENT_ID: ${{ github.event.inputs.experiment_id }}
           # Issue #2119 AC9 comparable-cohort fingerprint (PR #2137 human
           # review issuecomment-5273090534 P0 fix): the P50 cohort loader
           # must be able to verify every run in a 20-run comparable cohort
           # shares the same runner image / Node / pnpm / Playwright /
           # lockfile / workflow digest, not just runner image.
+          # #2159 P0-1 (fix_delta after adversarial review
+          # issuecomment-5295659213): the ci_runtime_baseline_v1 producer
+          # previously emitted `runner_image` sourced from `ImageOS`/
+          # `ImageVersion`, which are NOT populated inside a containerized
+          # job (`container: image: mcr.microsoft.com/playwright@...`) --
+          # they resolved to the fail-closed-rejected placeholder
+          # "unknown/unknown", which `_fingerprint_has_placeholder`
+          # correctly (but permanently) excluded every real e2e-core/
+          # e2e-responsive-matrix artifact from any comparable cohort.
+          # `runner.os`/`runner.arch` ARE always populated (evaluated by the
+          # runner itself, not shell env inside the container). This
+          # producer now emits BOTH the legacy `runner_image` field
+          # (unchanged, for any existing consumer) AND the new
+          # `host_runner_image` / `playwright_container_image_digest` /
+          # `workflow_run_id` / `cohort_role` fields the redesigned
+          # WITHIN_COHORT_REQUIRED_EQUAL / CROSS_COHORT_REQUIRED_EQUAL
+          # contract (tests/ci/test_ci_performance_gate.py) requires.
           NODE_VERSION_RAW: ""
           PNPM_VERSION_RAW: ""
           LOCKFILE_HASH_RAW: ""
@@ -809,6 +887,20 @@ jobs:
               "playwright_version": os.environ.get("PLAYWRIGHT_VERSION", "unknown"),
               "lockfile_hash": os.environ.get("LOCKFILE_HASH_RAW", "unknown"),
               "workflow_digest": os.environ.get("WORKFLOW_DIGEST_RAW", "unknown"),
+          }
+          # #2159 P0-1: v2-contract fields, never placeholder-valued for a
+          # containerized job (see the env-block comment above for why the
+          # legacy runner_image field is placeholder-prone here).
+          v2_fields = {
+              "workflow_run_id": int(os.environ["GH_RUN_ID"]),
+              "host_runner_image": (
+                  os.environ.get("GH_RUNNER_OS", "unknown") + "/" + os.environ.get("GH_RUNNER_ARCH", "unknown")
+              ),
+              "playwright_container_image_digest": os.environ.get(
+                  "PLAYWRIGHT_CONTAINER_IMAGE_DIGEST", "unknown"
+              ),
+              "cohort_role": os.environ.get("BENCHMARK_COHORT_ROLE") or "ci_default",
+              "experiment_id": os.environ.get("BENCHMARK_EXPERIMENT_ID") or None,
           }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
@@ -837,6 +929,7 @@ jobs:
               "measurement_method": "date_plus3N_ms",
               "measurements": measurements,
               **fingerprint_fields,
+              **v2_fields,
           }
           out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
           out.write_text(json.dumps(artifact, indent=2))
@@ -1274,6 +1367,8 @@ jobs:
         shell: bash
     env:
       PLAYWRIGHT_VERSION: "1.60.0"
+      # #2159 P0-1: see e2e-core's identical comment above.
+      PLAYWRIGHT_CONTAINER_IMAGE_DIGEST: "sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948"
       LOOP_E2E_LANE: responsive
       EXPECTED_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     container:
@@ -1283,6 +1378,18 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Verify checked-out HEAD matches dispatched target_sha (#2159 P0-2)
+        if: ${{ github.event.inputs.target_sha != '' }}
+        env:
+          BENCHMARK_TARGET_SHA: ${{ github.event.inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          resolved_head="$(git rev-parse HEAD)"
+          if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
+            echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the dispatch ref branch/tag moved between dispatch and checkout. Refusing to record a benchmark sample for the wrong commit."
+            exit 1
+          fi
+          echo "target_sha verified: $resolved_head"
       - name: Enable pnpm via corepack
         run: |
           corepack enable pnpm
@@ -1404,11 +1511,35 @@ jobs:
           GH_RUN_ATTEMPT: ${{ github.run_attempt }}
           GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           GH_SHA: ${{ github.sha }}
+          GH_RUNNER_OS: ${{ runner.os }}
+          GH_RUNNER_ARCH: ${{ runner.arch }}
+          # #2159 P0-2: populated only on a dedicated fixed-SHA benchmark
+          # dispatch (empty string on a normal push/pull_request run, which
+          # the producer below falls back to "ci_default" for).
+          BENCHMARK_COHORT_ROLE: ${{ github.event.inputs.cohort_role }}
+          BENCHMARK_EXPERIMENT_ID: ${{ github.event.inputs.experiment_id }}
           # Issue #2119 AC9 comparable-cohort fingerprint (PR #2137 human
           # review issuecomment-5273090534 P0 fix): the P50 cohort loader
           # must be able to verify every run in a 20-run comparable cohort
           # shares the same runner image / Node / pnpm / Playwright /
           # lockfile / workflow digest, not just runner image.
+          # #2159 P0-1 (fix_delta after adversarial review
+          # issuecomment-5295659213): the ci_runtime_baseline_v1 producer
+          # previously emitted `runner_image` sourced from `ImageOS`/
+          # `ImageVersion`, which are NOT populated inside a containerized
+          # job (`container: image: mcr.microsoft.com/playwright@...`) --
+          # they resolved to the fail-closed-rejected placeholder
+          # "unknown/unknown", which `_fingerprint_has_placeholder`
+          # correctly (but permanently) excluded every real e2e-core/
+          # e2e-responsive-matrix artifact from any comparable cohort.
+          # `runner.os`/`runner.arch` ARE always populated (evaluated by the
+          # runner itself, not shell env inside the container). This
+          # producer now emits BOTH the legacy `runner_image` field
+          # (unchanged, for any existing consumer) AND the new
+          # `host_runner_image` / `playwright_container_image_digest` /
+          # `workflow_run_id` / `cohort_role` fields the redesigned
+          # WITHIN_COHORT_REQUIRED_EQUAL / CROSS_COHORT_REQUIRED_EQUAL
+          # contract (tests/ci/test_ci_performance_gate.py) requires.
           NODE_VERSION_RAW: ""
           PNPM_VERSION_RAW: ""
           LOCKFILE_HASH_RAW: ""
@@ -1429,6 +1560,20 @@ jobs:
               "playwright_version": os.environ.get("PLAYWRIGHT_VERSION", "unknown"),
               "lockfile_hash": os.environ.get("LOCKFILE_HASH_RAW", "unknown"),
               "workflow_digest": os.environ.get("WORKFLOW_DIGEST_RAW", "unknown"),
+          }
+          # #2159 P0-1: v2-contract fields, never placeholder-valued for a
+          # containerized job (see the env-block comment above for why the
+          # legacy runner_image field is placeholder-prone here).
+          v2_fields = {
+              "workflow_run_id": int(os.environ["GH_RUN_ID"]),
+              "host_runner_image": (
+                  os.environ.get("GH_RUNNER_OS", "unknown") + "/" + os.environ.get("GH_RUNNER_ARCH", "unknown")
+              ),
+              "playwright_container_image_digest": os.environ.get(
+                  "PLAYWRIGHT_CONTAINER_IMAGE_DIGEST", "unknown"
+              ),
+              "cohort_role": os.environ.get("BENCHMARK_COHORT_ROLE") or "ci_default",
+              "experiment_id": os.environ.get("BENCHMARK_EXPERIMENT_ID") or None,
           }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
@@ -1457,6 +1602,7 @@ jobs:
               "measurement_method": "date_plus3N_ms",
               "measurements": measurements,
               **fingerprint_fields,
+              **v2_fields,
           }
           out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
           out.write_text(json.dumps(artifact, indent=2))

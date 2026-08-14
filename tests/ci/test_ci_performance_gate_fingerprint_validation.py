@@ -101,3 +101,46 @@ def test_two_placeholder_baselines_never_treated_as_matching_each_other():
 
     cohort = gate._comparable_cohort([a, b], ("e2e-core",))
     assert cohort["e2e-core"] == []
+
+
+def test_v2_producer_shaped_baseline_from_ci_yml_is_admitted_to_cohort():
+    """GIVEN 20 baselines shaped exactly like the POST-P0-1-fix
+    `.github/workflows/ci.yml` `Collect ci_runtime_baseline_v1 artifact`
+    step output (real values: `host_runner_image` from `runner.os`/
+    `runner.arch` -- NEVER "unknown/unknown" inside a container, unlike the
+    pre-fix `ImageOS`/`ImageVersion`-sourced `runner_image` --
+    `playwright_container_image_digest` from the job's pinned container
+    image, `cohort_role: "ci_default"`, `workflow_run_id` as an int) WHEN
+    building a comparable cohort THEN all 20 are admitted (#2159 P0-1: this
+    is the regression guard that the real producer/consumer field-contract
+    gap the adversarial review found -- issuecomment-5295659213 P0-1 -- is
+    now actually closed, not just fixture-simulated with hand-picked-good
+    values)."""
+
+    def v2_producer_shaped_baseline(workflow_run_id: int) -> dict:
+        return {
+            "schema": "ci_runtime_baseline_v1",
+            "run_id": str(workflow_run_id),
+            "run_attempt": "1",
+            "head_sha": "a" * 40,
+            "merge_sha": "a" * 40,
+            "job": "e2e-core",
+            "measurement_method": "date_plus3N_ms",
+            "measurements": [{"phase_id": "test_e2e_ci", "elapsed_ms": 100_000, "status": 0}],
+            "runner_image": "unknown/unknown",  # legacy field, still placeholder-valued
+            "node_version": "v22.14.0",
+            "pnpm_version": "11.7.0",
+            "playwright_version": "1.60.0",
+            "lockfile_hash": "sha256:" + "c" * 64,
+            "workflow_digest": "sha256:" + "d" * 64,
+            "workflow_run_id": workflow_run_id,
+            "host_runner_image": "Linux/X64",
+            "playwright_container_image_digest": (
+                "sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948"
+            ),
+            "cohort_role": "ci_default",
+        }
+
+    baselines = [v2_producer_shaped_baseline(i) for i in range(1, 21)]
+    cohort = gate._comparable_cohort(baselines, ("e2e-core",))
+    assert len(cohort["e2e-core"]) == 20
