@@ -58,7 +58,7 @@ Gemini CLI は `disabled_by_operator` のため起動しない。旧 `preflight_
      --output-file <invocation-private output file>
    ```
 2. AGY が一次資料 citation と claim を支える内容を返した場合、その evidence を評価する。
-3. 以下のいずれかなら停止せず、利用可能な native Web route で同じ critical claim を検証する: auth/capability/query/grounding failure、citation materialization failure、citation extraction failure、provider provenance trace 不足、`web_tool_call_count == 0`、または AGY evidence quality 不足。
+3. 以下のいずれかなら停止せず、利用可能な native Web route で同じ critical claim を検証する: auth/capability/query/grounding failure、citation materialization failure、citation extraction failure、provider provenance trace 不足、または AGY evidence quality 不足。
 4. Claude runtime では利用可能な `WebSearch` と `WebFetch` を fallback に使ってよい。Codex runtime 固有の native tool 名はここで仮定しない。
 5. AGY 由来 URL を provider trace 不足だけで捨てない。ただし無条件に信頼せず、native fetch/search で URL と source content を再検証する。
 
