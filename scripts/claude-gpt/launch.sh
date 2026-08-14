@@ -143,8 +143,11 @@ MCP_JSON_EOF
 #    bwrap sandbox 環境下で実行されている場合、`sandbox.enabled: true` は Claude Code
 #    本体の Bash tool 実行を `Maximum call stack size exceeded` で完全に破壊することを
 #    確認した。Bash tool という中核機能を破壊しうる hardening を既定で有効化する方が
-#    実害が大きいため、既定は無効・opt-in とする（follow-up: 環境非依存の再現条件切り分けと
-#    upstream 報告）。
+#    実害が大きいため、既定は無効・opt-in とする。Issue #2173 で改めて実機検証し、
+#    ネスト実行環境下で sandbox.enabled: true / CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 は
+#    Bash tool 呼び出しを応答なしのビジーループへ陥らせることを 2/2, 1/1 の再現率で確認、
+#    既定 opt-in 無効を維持する判断を確定した
+#    （docs/dev/claude-gpt-sandbox-hardening-verification.md 参照）。
 # 3. session-scoped に repository/user plugin を無効化する（Parent #2154 gateway/context
 #    契約。P1-2）。
 SANDBOX_JSON_FRAGMENT=""
@@ -343,6 +346,8 @@ export STRICT_MCP_MODE
 # は単独でも Bash tool 呼び出しを `Maximum call stack size exceeded` で完全に破壊することを
 # 確認した（sandbox.enabled と同根の nested-sandbox 非互換）。中核機能を破壊しうる
 # hardening を既定で有効化する方が実害が大きいため、既定は無効・opt-in とする。
+# Issue #2173 で CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 単独（sandbox.enabled 非依存）でも
+# 同一の破壊（応答なしのビジーループ）が再現することを確認済み（1/1）。
 if [ "${CLAUDE_GPT_HARDENED_SANDBOX:-false}" = "true" ]; then
   export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
 fi

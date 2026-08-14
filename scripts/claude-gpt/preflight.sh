@@ -164,8 +164,11 @@ else
   # 場合に Claude Code 本体の Bash tool 実行を `Maximum call stack size exceeded` で
   # 完全に破壊することを確認した（bwrap 単体の起動自体は成功するため、単純な bwrap
   # self-test だけではこの非互換を検出できない）。Bash tool という中核機能を破壊する
-  # hardening を既定で有効化する方が実害が大きいため、既定は無効・opt-in とする
-  # （follow-up: 環境非依存の再現条件の切り分けと upstream への報告）。
+  # hardening を既定で有効化する方が実害が大きいため、既定は無効・opt-in とする。
+  # Issue #2173 で実機検証済み: ネスト実行環境下で sandbox.enabled: true /
+  # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 は Bash tool 呼び出しを応答なしのビジーループへ
+  # 陥らせることを 2/2, 1/1 の再現率で確認し、既定 opt-in 無効を維持する判断を確定した
+  # （docs/dev/claude-gpt-sandbox-hardening-verification.md 参照）。
   if [ "${CLAUDE_GPT_HARDENED_SANDBOX:-false}" = "true" ]; then
     SANDBOX_APPLICABLE=true
     if claude_gpt_check_sandbox_init; then
