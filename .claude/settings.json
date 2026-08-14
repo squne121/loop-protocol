@@ -31,7 +31,11 @@
       "Bash(gh pr review *)",
       "Bash(gh pr comment *)",
       "Bash(gh pr view *)",
-      "Bash(gh api *)"
+      "Bash(gh api *)",
+      "Read(.claude/agents/**)",
+      "Edit(.claude/agents/**)",
+      "Read(.claude/skills/**)",
+      "Edit(.claude/skills/**)"
     ],
     "ask": [],
     "deny": [
