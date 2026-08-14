@@ -545,20 +545,40 @@ def is_exact_skill_runtime_executor_command(
     return True
 
 
+# Issue #2136 adversarial hardening (H3): every value that flows through this
+# module's `_is_safe_repo_relative_fixture_path` gate is later re-validated
+# by an exact parser that re-tokenizes a *re-serialized* `" ".join(argv)`
+# string with `shlex.split()` (see `skill_runtime_exec.py`'s
+# `command_text = " ".join(command_tokens)` construction). That join/re-split
+# round trip is lossy for any value containing shell-lexer-significant
+# characters (whitespace, quotes, backslash): the value actually forwarded to
+# the real child subprocess (built from the untouched, un-split Python
+# string) can diverge from the shorter/differently-tokenized value the exact
+# parser actually validated at its fixed argv position. Rejecting these
+# characters here closes that validation/execution divergence for every
+# `repo_relative_file`-typed placeholder uniformly (production and
+# test-only), without changing any command's argv shape, flags, or accepted
+# command_ids.
+_SHLEX_ROUND_TRIP_UNSAFE_CHARS = frozenset({" ", "\t", "\"", "'", "\\"})
+
+
 def _is_safe_repo_relative_fixture_path(fixture: str, root: str) -> bool:
     """True iff `fixture` is a safe repo-relative path for `--fixture`.
 
     Rejects absolute paths, `..` traversal, NUL/newline injection, a leading
-    `-` (flag-injection), and any realpath resolution that escapes `root`
-    (including via symlink components). Issue #1439 Scope Delta 2 Out of
-    Scope: `--fixture` must never accept an absolute path, path traversal,
-    or a symlink-mediated repo-external reference.
+    `-` (flag-injection), whitespace/quote/backslash (shlex round-trip
+    divergence, Issue #2136 H3), and any realpath resolution that escapes
+    `root` (including via symlink components). Issue #1439 Scope Delta 2 Out
+    of Scope: `--fixture` must never accept an absolute path, path
+    traversal, or a symlink-mediated repo-external reference.
     """
     if not fixture or fixture.startswith("-"):
         return False
     if os.path.isabs(fixture):
         return False
     if "\x00" in fixture or "\n" in fixture or "\r" in fixture:
+        return False
+    if any(ch in fixture for ch in _SHLEX_ROUND_TRIP_UNSAFE_CHARS):
         return False
     parts = fixture.replace("\\", "/").split("/")
     if ".." in parts or "" in parts[1:]:
@@ -569,6 +589,31 @@ def _is_safe_repo_relative_fixture_path(fixture: str, root: str) -> bool:
     except ValueError:
         return False
     return common == root
+
+
+def _path_contains_symlink_component(root: str, rel_path: str) -> bool:
+    """True iff any path component between `root` and `rel_path` (inclusive
+    of the leaf) is itself a symlink.
+
+    Confinement checks built solely from `os.path.realpath()` +
+    `os.path.commonpath()` are bypassable when a directory *inside* (or
+    exactly at) the confinement prefix is a symlink to a location outside
+    the intended target: both sides of the comparison resolve through the
+    same symlink and still agree with each other (Issue #2136 adversarial
+    hardening H1). Walking every literal (non-resolved) path component and
+    rejecting on the first symlink closes that class of bypass regardless of
+    where the symlink ultimately points -- fixture path, transport path,
+    intermediate directory, leaf file, or the artifact-root prefix directory
+    itself (including a sibling-issue-root alias).
+    """
+    current = root
+    for part in rel_path.replace("\\", "/").split("/"):
+        if not part:
+            continue
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            return True
+    return False
 
 
 def _is_safe_issue_artifact_path(path: str, root: str, issue_number: str) -> bool:
@@ -582,6 +627,13 @@ def _is_safe_issue_artifact_path(path: str, root: str, issue_number: str) -> boo
         return False
     prefix = f".claude/artifacts/issue-refinement-loop/{issue_number}/"
     if not path.replace("\\", "/").startswith(prefix):
+        return False
+    # Issue #2136 H1: reject before resolving `artifact_root`/`resolved` via
+    # `realpath` -- a symlinked artifact-root prefix (or any intermediate
+    # component) would otherwise make both sides of the commonpath
+    # comparison below agree with each other while silently pointing at a
+    # different issue's artifact tree.
+    if _path_contains_symlink_component(root, prefix) or _path_contains_symlink_component(root, path):
         return False
     artifact_root = os.path.realpath(os.path.join(root, prefix))
     try:

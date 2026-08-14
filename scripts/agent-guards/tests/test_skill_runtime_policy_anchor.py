@@ -105,6 +105,90 @@ def test_fixture_human_context_parser_rejects_symlink_escape(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
+# Issue #2136 adversarial hardening H1: `_is_safe_issue_artifact_path`'s
+# `realpath(root/prefix)` + `commonpath([artifact_root, resolved])`
+# confinement is bypassable if a directory *inside* -- or exactly at -- the
+# confinement prefix is a symlink: both sides of the comparison resolve
+# through the same symlink and still agree with each other. These cases
+# supplement `test_fixture_human_context_parser_rejects_symlink_escape`
+# above (which only covers the leaf fixture file being a symlink) with
+# intermediate-directory, artifact-root-prefix, and transport-path variants.
+# ---------------------------------------------------------------------------
+
+
+def test_fixture_human_context_parser_rejects_intermediate_dir_symlink_escape(tmp_path: Path) -> None:
+    """A symlinked `fixtures/` directory (one level above the leaf file,
+    still nominally "under" the artifact root) must not bypass confinement."""
+    issue_root = tmp_path / ".claude/artifacts/issue-refinement-loop/2084"
+    issue_root.mkdir(parents=True)
+    outside = tmp_path / "outside-fixtures"
+    outside.mkdir()
+    (outside / "ac3.json").write_text("{}", encoding="utf-8")
+    (issue_root / "fixtures").symlink_to(outside)
+    command = _valid_fixture_human_context_command()
+    assert policy.parse_exact_skill_runtime_anchor_fixture_command(command, str(tmp_path)) is None
+
+
+def test_fixture_human_context_parser_rejects_artifact_root_prefix_symlink_alias(tmp_path: Path) -> None:
+    """The target Issue's own artifact-root prefix directory
+    (`.claude/artifacts/issue-refinement-loop/2084/`) being a symlink to a
+    DIFFERENT Issue's artifact root must not bypass confinement -- a
+    sibling-issue-root alias, even though `realpath(root/prefix)` and
+    `realpath(root/path)` both resolve into the same (wrong) tree and
+    therefore agree with each other."""
+    base = tmp_path / ".claude/artifacts/issue-refinement-loop"
+    base.mkdir(parents=True)
+    other_issue_root = base / "9999"
+    (other_issue_root / "fixtures").mkdir(parents=True)
+    (other_issue_root / "fixtures" / "ac3.json").write_text("{}", encoding="utf-8")
+    (base / "2084").symlink_to(other_issue_root)
+    command = _valid_fixture_human_context_command()
+    assert policy.parse_exact_skill_runtime_anchor_fixture_command(command, str(tmp_path)) is None
+
+
+def test_fixture_human_context_parser_rejects_transport_path_symlink_escape(tmp_path: Path) -> None:
+    """The optional `--investigation-evidence-transport-path` must be
+    confined identically to `--fixture` -- a symlinked transport file must
+    not bypass confinement even when the fixture path itself is genuinely
+    safe."""
+    issue_root = tmp_path / ".claude/artifacts/issue-refinement-loop/2084"
+    (issue_root / "fixtures").mkdir(parents=True)
+    (issue_root / "fixtures" / "ac3.json").write_text("{}", encoding="utf-8")
+    outside = tmp_path / "outside-transport.json"
+    outside.write_text("{}", encoding="utf-8")
+    (issue_root / "authority-transport").mkdir(parents=True)
+    (issue_root / "authority-transport" / "ac3").mkdir(parents=True)
+    (issue_root / "authority-transport" / "ac3" / "authority_transport_v1.json").symlink_to(outside)
+    command = _valid_fixture_human_context_command()
+    assert policy.parse_exact_skill_runtime_anchor_fixture_command(command, str(tmp_path)) is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2136 adversarial hardening H3: `skill_runtime_exec.py` re-serializes
+# already-parsed argv into `" ".join(command_tokens)` before this module's
+# exact parser re-tokenizes it with `shlex.split()`. That round trip is lossy
+# for values containing shell-lexer-significant characters -- a fixture path
+# containing a space could validate a different (shorter) substring than the
+# one actually forwarded to the real child. `_is_safe_repo_relative_fixture_path`
+# now rejects whitespace/quote/backslash outright, closing this regardless of
+# where in the pipeline the value is checked.
+# ---------------------------------------------------------------------------
+
+
+def test_fixture_human_context_exact_parser_rejects_whitespace_in_fixture_path() -> None:
+    valid = _valid_fixture_human_context_command()
+    fixture_path = ".claude/artifacts/issue-refinement-loop/2084/fixtures/ac3.json"
+    tampered = valid.replace(
+        fixture_path,
+        ".claude/artifacts/issue-refinement-loop/2084/fixtures/ac3.json extra",
+    )
+    assert policy.parse_exact_skill_runtime_anchor_fixture_command(tampered, str(REPO_ROOT)) is None
+    assert policy._is_safe_repo_relative_fixture_path(fixture_path + " x", str(REPO_ROOT)) is False
+    assert policy._is_safe_repo_relative_fixture_path(fixture_path + '"', str(REPO_ROOT)) is False
+    assert policy._is_safe_repo_relative_fixture_path(fixture_path + "\\", str(REPO_ROOT)) is False
+
+
+# ---------------------------------------------------------------------------
 # Pure unit tests: parse_exact_skill_runtime_decide_command malformed-shape
 # matrix (AC10). None of these should ever require a subprocess.
 # ---------------------------------------------------------------------------

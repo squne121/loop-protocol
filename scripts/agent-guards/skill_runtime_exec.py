@@ -24,6 +24,7 @@ from skill_runtime_command_policy import (
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
     ExactSkillRuntimeCommand,
+    _is_safe_issue_artifact_path,
     command_allows_root_no_worktree,
     current_branch,
     is_exact_skill_runtime_anchor_executor_command,
@@ -2007,6 +2008,26 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.loop_state_file or args.review_result_verdict or args.max_iterations:
             print("skill_runtime_exec: loop flags are not allowed for fixture human context", file=sys.stderr)
+            return 2
+        # Issue #2136 adversarial hardening (H3): validate the ORIGINAL,
+        # un-serialized argparse values directly (argv-native), in addition
+        # to (not instead of) the exact-parser gate below. The exact parser
+        # only sees a re-tokenized `" ".join(...)` + `shlex.split()` round
+        # trip of `command_tokens`, which is lossy for any value containing
+        # shell-lexer-significant characters -- a value the round trip
+        # mis-tokenizes could validate a different (truncated/shifted)
+        # substring than the one actually forwarded to `render_command()`
+        # and the real child subprocess below. Checking `args.fixture` /
+        # `args.investigation_evidence_transport_path` here, before any
+        # serialization, closes that validated-value-vs-used-value
+        # divergence for this command class.
+        if not _is_safe_issue_artifact_path(args.fixture, project_root, str(args.issue_number)):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+        if args.investigation_evidence_transport_path and not _is_safe_issue_artifact_path(
+            args.investigation_evidence_transport_path, project_root, str(args.issue_number)
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
         command_tokens = [
             "uv", "run", "python3", SKILL_RUNTIME_EXEC_REL,

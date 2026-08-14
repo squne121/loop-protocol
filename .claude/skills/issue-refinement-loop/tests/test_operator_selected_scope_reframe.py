@@ -863,6 +863,43 @@ def test_fixture_human_context_sibling_rejects_cross_lane_and_binding_inputs_bef
     ).exists()
 
 
+def test_fixture_human_context_sibling_admits_real_subprocess_without_optional_transport(tmp_path: Path):
+    """Issue #2136 adversarial hardening H2: the optional
+    `--investigation-evidence-transport-path` pair being entirely ABSENT
+    must be admitted by the REAL `skill_runtime_exec.py` subprocess (not
+    just the parser unit tests in `test_skill_runtime_policy_anchor.py`,
+    which only prove `parse_exact_skill_runtime_anchor_fixture_command`
+    itself -- not that `skill_runtime_exec.py`'s own admission/dispatch/
+    render code path agrees). A parser passing is not proof the executor's
+    absent-case doesn't wrongly reject before ever reaching a child."""
+    repo = _ac3_real_asset_repo(tmp_path)
+    anchor_url = URL
+    artifact_rel = f".claude/artifacts/issue-refinement-loop/{ISSUE}"
+    fixture_rel = f"{artifact_rel}/fixtures/ac3.json"
+    (repo / artifact_rel / "fixtures").mkdir(parents=True)
+    (repo / fixture_rel).write_text(json.dumps(_ac3_fixture(anchor_url)), encoding="utf-8")
+    home = tmp_path / "empty-home"
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    uv_bin = shutil.which("uv")
+    assert uv_bin is not None
+    shutil.copy2(uv_bin, bin_dir / "uv")
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("GH_", "GITHUB_"))}
+    env.update({
+        "CLAUDE_PROJECT_DIR": str(repo), "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(tmp_path),
+        "HOME": str(home), "GH_CONFIG_DIR": str(home / "empty-gh-config"), "GH_PROMPT_DISABLED": "1",
+    })
+    (home / "empty-gh-config").mkdir(parents=True)
+    subprocess.run([str(bin_dir / "uv"), "run", "python3", "--version"], cwd=repo, env=env,
+                   check=True, capture_output=True, text=True, timeout=120)
+    result = subprocess.run([
+        sys.executable, "scripts/agent-guards/skill_runtime_exec.py",
+        "--command-id", _AC3_COMMAND_ID, "--issue-number", str(ISSUE), "--repo", REPO,
+        "--fixture", fixture_rel, "--anchor-comment-url", anchor_url,
+    ], cwd=repo, env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert "exact command class rejected" not in result.stderr, (result.returncode, result.stdout, result.stderr)
+
+
 def test_fixture_human_context_sibling_fails_closed_on_transport_anchor_mismatch(tmp_path: Path):
     """AC5: a valid-shape transport for another anchor cannot clear scope."""
     repo = _ac3_real_asset_repo(tmp_path)
