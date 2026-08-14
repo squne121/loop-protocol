@@ -149,9 +149,22 @@ class TestWebResearcherAgent:
 
     def test_provider_telemetry_is_not_a_quality_gate(self):
         text = _read(WEB_RESEARCHER_MD)
+        # positive: diagnostics-only の制約文が維持されていること
         assert "observability / diagnostics only" in text
         assert "zero は failure" in text
-        assert "`web_tool_call_count == 0`" in text
+        # negative: fallback trigger セクション（## 調査手順 〜 ### Route ownership）に
+        # `web_tool_call_count == 0` が再導入されていないこと（#2059 契約との矛盾防止）
+        trigger_section_match = re.search(
+            r"## 調査手順(?P<body>.*?)### Route ownership", text, re.DOTALL
+        )
+        assert trigger_section_match is not None, (
+            "web-researcher.md から fallback trigger セクション（## 調査手順）が見つからない"
+        )
+        trigger_section = trigger_section_match.group("body")
+        assert "`web_tool_call_count == 0`" not in trigger_section, (
+            "fallback trigger 条件に `web_tool_call_count == 0` が再導入されている"
+            "（#2059 の diagnostics-only 契約と矛盾する）"
+        )
 
     def test_required_fallback_cases_are_described(self):
         text = _read(WEB_RESEARCHER_MD)
