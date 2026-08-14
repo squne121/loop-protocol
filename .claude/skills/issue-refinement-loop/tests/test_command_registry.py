@@ -337,6 +337,19 @@ class TestRegistryEntrySpecs:
     def test_plan_run_entry(self):
         self._assert_entry_complete("plan.run")
 
+    def test_web_research_route_entry(self):
+        self._assert_entry_complete("web_research.route")
+        assert reg.render_command(
+            "web_research.route", {"routing_input_file": "tmp/routing.json"}
+        ) == [
+            "uv",
+            "run",
+            "python3",
+            ".claude/skills/issue-refinement-loop/scripts/route_web_research_result.py",
+            "--input-file",
+            "tmp/routing.json",
+        ]
+
     def test_decide_run_entry(self):
         self._assert_entry_complete("decide.run")
 

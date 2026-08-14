@@ -89,8 +89,12 @@ routing-critical フィールド（`scope_rollup_decision`、`scope_signal_guard
 `follow_up_materialization`、`superseded_decision`）の定義は `references/loop-state.md` が SSOT。
 orchestrator はこれらのフィールドを直接 prose 再判定しない。
 
-主要な consumer フィールドの例: `web_research:` (web-researcher 実行状態)。
-web_research 結果に含まれる `critical_claims` の未解決 claim は human_escalation へ倒す。
+主要な consumer フィールドの例: `web_research:` (web-researcher 実行状態) と
+`critical_claims`（planner の `critical_external_claims` を join 時だけ参照する互換名）。
+これは新しい永続 ledger ではなく、current planner result に束縛された consumer input
+である。未解決 external claim は、その decision dependency が `dispositive` で
+repository evidence が disposition を独立に決定できない場合だけ human_escalation
+候補になる。
 
 ## 手順 (Procedure)
 
@@ -176,7 +180,7 @@ planner exit 0 かつ `fail_closed.required == false` かつ `decisions.*.confid
 - `ARTIFACT:` の `refinement_preflight_result_v1` パスから `fail_closed` / `decisions` を参照する
 - `ARTIFACT:` の `planner_input` パスで planner へ渡した stdin JSON を確認できる
 
-`STATUS: blocked` または `STATUS: environment_failure` の場合は停止し、人間判断へ送る。`investigation_policy` / `web_research_policy` / `scope_signal_guard` / `follow_up_materialization` の判定は planner を SSOT とし、このファイルで prose 再判定しない。
+`STATUS: blocked` または `STATUS: environment_failure` の場合は停止し、人間判断へ送る。ここでの `STATUS: environment_failure` は Step 0f preflight の repository/environment failure であり、Step 1b の external evidence provider transport status とは別である。`investigation_policy` / `web_research_policy` / `scope_signal_guard` / `follow_up_materialization` の判定は planner を SSOT とし、このファイルで prose 再判定しない。
 
 `scope_signal_guard.triggered: true` が含まれる場合でも、preflight 完了直後は
 `decide_next_loop_action.py` を呼ばない（#1873: `ISSUE_REFINEMENT_PHASE_STATE_V1`
@@ -207,11 +211,27 @@ anchor comment の fact-check 契約、`ANCHOR_COMMENT_CONTEXT_V1`、`ANCHOR_COM
 
 ### Step 1b: 外部Web調査 (Web Research)
 
-`REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy.required == true` の場合のみ `web-researcher` を起動する。orchestrator は `WEB_RESEARCH_RESULT_V1` を opaque に扱い、consumer field だけを `LOOP_STATE.web_research` へ反映する。retry / fallback / raw grounding state は保持しない。
+`REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy.required == true` の場合のみ `web-researcher` を起動する。外部 claim のハルシネーションまたは repository evidence だけでは解消できないエビデンス不足を切り分けるため、orchestrator は `WEB_RESEARCH_RESULT_V1` を opaque に扱い、consumer field だけを `LOOP_STATE.web_research` へ反映する。retry / fallback / raw grounding state は保持しない。
 
 Step 1（codebase-investigator）と Step 1b（web-researcher）は、両方が required の場合に並列実行できる。ただし両 SubAgent の結果を Step 2 前に合流させること。
 
 web-researcher は AGY-first / native Web fallback を内部で完結する。critical claim に一次資料エビデンスを示せず、両 route でも検証不能またはハルシネーション疑いと判定した場合だけ `human_escalation` に倒す（Step 5）。provider telemetry / provenance trace の不足だけを escalation 理由にしてはならない。
+
+Step 1 と Step 1b の完了後、main thread は current repository state、実 diff、実 test
+等の Step 1 evidence から `repository_decision` を組み立て、planner の
+`critical_external_claims[].role` と `WEB_RESEARCH_RESULT_V1` を
+`web_research.route` registry entry で join する。`non_dispositive` は repository
+evidence が requested disposition を独立に決定すると確認できた場合だけ使う。
+
+join result が `next_action: proceed` または `proceed_with_notes` なら Step 2 へ進む。
+後者は `transport_status: environment_failure` / `semantic_verdict: null` と
+unresolved risk を記録するが、それだけで Step 5 に進めない。dispositive claim が
+未解決、または repository decision が inconclusive の場合だけ
+`human_judgment_required` として Step 5 へ進む。web-researcher の retry/fallback、
+grounding trace、citation/provider provenance をこの consumer が再実装・保存しては
+ならない。consumer は `verification_route` の個々の値（`native_web` 等の producer 追加
+route を含む）を re-validate せず、`status: ok` かつ `verification_route` が非空なら
+transport/grounding 成功と扱う（詳細は `references/web-research-routing.md`）。
 
 詳細は `references/web-research-routing.md` を参照する。
 
