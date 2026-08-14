@@ -13,6 +13,9 @@
 #      ディレクトリへの read を拒否する deny rule が正しい絶対パス構文（`Read(//...)`)
 #      で生成されていること（P0-3）
 #   5. sandbox（bubblewrap）が実機で初期化可能であること（P0-3。--env-only では実施しない）
+#   6. isolated proxy principal（CLAUDE_GPT_ISOLATED_PROXY_USER）が設定されている場合、
+#      dedicated Unix user が provisioning 済みであること（P0-3 段階対応。opt-in。
+#      --env-only では実施しない。scripts/claude-gpt/provision_proxy_principal.sh 参照）
 #
 # 出力: 構造化 JSON を stdout に返す（scripts/CLAUDE.md 不変条件準拠）。
 # `canonical_paths` / `read_restriction` は `--env-only` モードでは実検査を行わない
@@ -27,6 +30,8 @@
 #   5  = canonical path 違反（repo/worktree 配下への書き込みを拒否）
 #   6  = read 制限 settings が未生成または不正
 #   8  = sandbox 初期化に失敗した（環境不可ではなく launcher/host 側の不備。SKIP に変換しない）
+#   9  = CLAUDE_GPT_ISOLATED_PROXY_USER が設定されているが provisioning が未完了
+#        （isolated_proxy_user_not_provisioned。silent fallback しない）
 #
 # 3 / 4 は「実行環境が利用不能」を意味し、呼び出し元（runtime_smoke_test.sh）はこれを
 # SKIP（exit 77）に変換してよい。5 / 6 / 8 は launcher の実装バグまたは host 側の不備であり
@@ -181,6 +186,74 @@ else
   fi
 fi
 
+# --- 6. isolated proxy principal 検証（P0-3 段階対応。opt-in。CLAUDE_GPT_ISOLATED_PROXY_USER
+#     が未設定の場合は既存の same-uid 動作を維持する。設定されている場合は
+#     scripts/claude-gpt/provision_proxy_principal.sh による事前 provisioning
+#     （dedicated Unix user 作成・ディレクトリ chown・sudoers テンプレート適用）が
+#     完了していることを (a) user 存在, (b) passwordless sudo 構成, (c) proxy
+#     credential/config/state/home ディレクトリの所有者、の3点で検証する。
+#     いずれか失敗時は silent fallback せず fail-closed で止める。 ---
+ISOLATED_PROXY_USER="${CLAUDE_GPT_ISOLATED_PROXY_USER:-}"
+CRED_ISO_MODE="same_uid"
+CRED_ISO_APPLICABLE=false
+CRED_ISO_OK=false
+CRED_ISO_DETAIL="not_configured"
+
+if [ -n "$ISOLATED_PROXY_USER" ]; then
+  CRED_ISO_MODE="isolated_proxy_user"
+  if [ "$ENV_ONLY" = "true" ]; then
+    CRED_ISO_DETAIL="skipped_env_only"
+  else
+    CRED_ISO_APPLICABLE=true
+    USER_EXISTS=false
+    if id "$ISOLATED_PROXY_USER" >/dev/null 2>&1; then
+      USER_EXISTS=true
+    fi
+    SUDO_OK=false
+    if [ "$USER_EXISTS" = "true" ] && sudo -n -u "$ISOLATED_PROXY_USER" true >/dev/null 2>&1; then
+      SUDO_OK=true
+    fi
+    DIR_OWNER_OK=false
+    if [ "$USER_EXISTS" = "true" ]; then
+      DIR_OWNER_OK=true
+      for d in "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET"; do
+        if [ -d "$d" ]; then
+          DIR_OWNER=$(stat -c '%U' "$d" 2>/dev/null || stat -f '%Su' "$d" 2>/dev/null || echo "")
+          if [ "$DIR_OWNER" != "$ISOLATED_PROXY_USER" ]; then
+            DIR_OWNER_OK=false
+          fi
+        else
+          DIR_OWNER_OK=false
+        fi
+      done
+    fi
+
+    if [ "$USER_EXISTS" = "true" ] && [ "$SUDO_OK" = "true" ] && [ "$DIR_OWNER_OK" = "true" ]; then
+      CRED_ISO_OK=true
+      CRED_ISO_DETAIL="provisioned"
+    else
+      CRED_ISO_DETAIL="isolated_proxy_user_not_provisioned"
+      if [ "$EXIT_CODE" -eq 0 ]; then EXIT_CODE=9; fi
+    fi
+  fi
+else
+  CRED_ISO_MODE="same_uid"
+  if [ "$ENV_ONLY" = "true" ]; then
+    CRED_ISO_APPLICABLE=false
+    CRED_ISO_DETAIL="skipped_env_only"
+  else
+    CRED_ISO_APPLICABLE=true
+    CRED_ISO_OK=true
+    CRED_ISO_DETAIL="same_uid_default"
+  fi
+fi
+
+CRED_ISO_ISOLATED=false
+if [ "$CRED_ISO_MODE" = "isolated_proxy_user" ] && [ "$CRED_ISO_OK" = "true" ]; then
+  CRED_ISO_ISOLATED=true
+fi
+
+
 cat <<JSON_EOF
 {
   "schema": "CLAUDE_GPT_PREFLIGHT_RESULT_V1",
@@ -207,6 +280,13 @@ cat <<JSON_EOF
   "sandbox_init": {
     "applicable": ${SANDBOX_APPLICABLE},
     "ok": ${SANDBOX_OK}
+  },
+  "credential_isolation": {
+    "mode": "${CRED_ISO_MODE}",
+    "isolated": ${CRED_ISO_ISOLATED},
+    "applicable": ${CRED_ISO_APPLICABLE},
+    "ok": ${CRED_ISO_OK},
+    "detail": "${CRED_ISO_DETAIL}"
   },
   "exit_code": ${EXIT_CODE}
 }

@@ -28,6 +28,8 @@
 #   6   read 制限 settings が未生成または不正
 #   7   proxy 起動失敗（loopback bind / readiness / model alias を確認できない）
 #   8   sandbox 初期化に失敗した
+#   9   CLAUDE_GPT_ISOLATED_PROXY_USER が設定されているが provisioning が未完了
+#       （isolated_proxy_user_not_provisioned。preflight.sh 参照）
 
 SELF_PATH=$0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
@@ -160,6 +162,21 @@ if [ "${CLAUDE_GPT_HARDENED_SANDBOX:-false}" = "true" ]; then
     }
   }'
 fi
+
+# --- narrow observability channel(Issue #2158/#2173, structured lane #2174/PR #2176 で並行実装中)。
+#     呼び出し元が任意の JSON 文字列を settings へ注入できる汎用経路は作らず、許可された固定値
+#     (`subagent-start-stop`)のみを受け付ける。それ以外の値は fragment を空のままにする(拒否)。
+#     既存の CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS(--settings 等 CLI 引数拒否)とは独立した経路であり、
+#     それを変更・弱体化するものではない。 ---
+HOOKS_JSON_FRAGMENT=""
+if [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-start-stop" ]; then
+  HOOKS_JSON_FRAGMENT=',
+  "hooks": {
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "cat"}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "cat"}]}]
+  }'
+fi
+
 cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
 {
   "permissions": {
@@ -169,7 +186,7 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
       "Read(/${PROXY_HOME_TARGET}/**)"
     ]
   }${SANDBOX_JSON_FRAGMENT},
-  "enabledPlugins": {}
+  "enabledPlugins": {}${HOOKS_JSON_FRAGMENT}
 }
 SETTINGS_JSON_EOF
 
@@ -204,14 +221,29 @@ while [ "$PORT_ATTEMPTS" -lt "$PORT_MAX_ATTEMPTS" ] && [ "$READY" != "true" ]; d
 
   # 親 shell から継承した CCP_* / HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 等は env -i で
   # リセットし、明示的に組み立てた変数のみを渡す。HOME は proxy 専用 HOME（P0-2）。
-  env -i \
-    "PATH=$PATH" \
-    "HOME=$PROXY_HOME_TARGET" \
-    "CCP_CONFIG_DIR=$PROXY_CONFIG_DIR_TARGET" \
-    "XDG_STATE_HOME=$PROXY_STATE_DIR_TARGET" \
-    "CCP_BIND_ADDRESS=127.0.0.1" \
-    "CCP_LOG_STDERR=1" \
-    claude-code-proxy serve --port "$PROXY_PORT" --no-monitor > "$PROXY_LOG" 2>&1 &
+  # CLAUDE_GPT_ISOLATED_PROXY_USER が設定されている場合（P0-3 段階対応。opt-in。
+  # scripts/claude-gpt/provision_proxy_principal.sh で事前 provisioning 済みであることは
+  # preflight.sh が既に検証済み — ここでの再検証はしない）、proxy を dedicated Unix user
+  # 配下で起動する。未設定なら従来通り同一 UID で起動する（既定動作は変更しない）。
+  if [ -n "${CLAUDE_GPT_ISOLATED_PROXY_USER:-}" ]; then
+    sudo -n -u "$CLAUDE_GPT_ISOLATED_PROXY_USER" env -i \
+      "PATH=$PATH" \
+      "HOME=$PROXY_HOME_TARGET" \
+      "CCP_CONFIG_DIR=$PROXY_CONFIG_DIR_TARGET" \
+      "XDG_STATE_HOME=$PROXY_STATE_DIR_TARGET" \
+      "CCP_BIND_ADDRESS=127.0.0.1" \
+      "CCP_LOG_STDERR=1" \
+      claude-code-proxy serve --port "$PROXY_PORT" --no-monitor > "$PROXY_LOG" 2>&1 &
+  else
+    env -i \
+      "PATH=$PATH" \
+      "HOME=$PROXY_HOME_TARGET" \
+      "CCP_CONFIG_DIR=$PROXY_CONFIG_DIR_TARGET" \
+      "XDG_STATE_HOME=$PROXY_STATE_DIR_TARGET" \
+      "CCP_BIND_ADDRESS=127.0.0.1" \
+      "CCP_LOG_STDERR=1" \
+      claude-code-proxy serve --port "$PROXY_PORT" --no-monitor > "$PROXY_LOG" 2>&1 &
+  fi
   PROXY_PID=$!
 
   # --- readiness poll（最大 10 秒） ---
