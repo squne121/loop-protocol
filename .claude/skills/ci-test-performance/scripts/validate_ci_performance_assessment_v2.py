@@ -446,7 +446,11 @@ def _check_percentile_recomputed_from_raw_samples(
         if len(detail_run_ids) != len(set(detail_run_ids)):
             _append_unique(errors, f"run_details_duplicate_workflow_run_id: {cohort_key}")
 
-        if set(detail_run_ids) != set(run_ids):
+        # `run_details[].workflow_run_id` is `integer` per schema, but
+        # `run_ids` is `array<string>` -- normalize both to string before
+        # comparing (comparing raw types here would ALWAYS report a false
+        # mismatch, since `9000 != "9000"` in Python).
+        if {str(v) for v in detail_run_ids} != {str(v) for v in run_ids}:
             _append_unique(errors, f"run_details_workflow_run_id_mismatches_run_ids: {cohort_key}")
 
         durations: list[float] = []
@@ -604,6 +608,140 @@ def _check_approval_gates(
 
     if outcome == "regressed":
         _append_unique(blockers, "observed_regression_blocks_approval")
+
+
+# --------------------------------------------------------------------------- #
+# #2159 P0-8 (fix_delta after adversarial review issuecomment-5295659213):
+# the `CI_TEST_PERFORMANCE_ASSESSMENT_V2` producer wired into every regular
+# `.github/workflows/ci.yml` run emits a FIXED `claim.kind: none` /
+# `performance_evidence.status: not_required` no-op payload -- it never
+# reads the fixed-SHA benchmark manifest (P0-2's dedicated dispatch route)
+# or any real E2E provider/gate-ready cohort data. Per the review's own
+# suggestion ("`claim.kind: none` producerを別用途のschema smokeとして残す
+# 場合は、#2159 AC10の性能producerとは区別してください"), that no-op
+# producer remains the regular-CI schema smoke test (unchanged). THIS is
+# the real, distinct out-of-band producer: it takes ALREADY-COMPUTED
+# before/after percentile cohort data (the shape
+# `tests/ci/test_ci_performance_gate.py::_provider_critical_path_paired_p50_p95`
+# already produces from a real `>= MIN_COHORT_RUN_COUNT` fixed-SHA cohort)
+# and emits a real, non-none `claim`. It does NOT read files itself (kept
+# a pure function for testability); wiring an actual CLI/workflow step
+# that reads a real accumulated `>= 20`-run before/after cohort and calls
+# this function is a follow-up once the P0-2 dedicated dispatch route has
+# real accumulated history (this PR cannot fabricate that history).
+# --------------------------------------------------------------------------- #
+def build_assessment_from_percentile_cohorts(
+    issue_number: int,
+    pr_number: int,
+    measured_at: str,
+    before_run_details: list[dict[str, Any]],
+    after_run_details: list[dict[str, Any]],
+    functional_evidence: dict[str, Any],
+    declared_impact: str,
+    risk_acknowledgement: dict[str, Any],
+    cohort_provenance: dict[str, Any],
+    relative_shortening_threshold: float = 0.35,
+) -> dict[str, Any]:
+    """#2159 P0-8: builds a REAL (non-no-op) CI_TEST_PERFORMANCE_ASSESSMENT_V2
+    from real before/after raw-duration samples. `before_run_details` /
+    `after_run_details` are lists of `{"run_id": str, "workflow_run_id":
+    int, "duration_seconds": float, ...}` (the same shape
+    `_check_percentile_recomputed_from_raw_samples`'s P0-7 invariants
+    validate). Raises `ValueError` if either cohort has fewer than
+    `MIN_RAW_SAMPLE_COUNT` valid samples -- this function never fabricates
+    a claim from insufficient evidence."""
+    before_durations = [
+        rd["duration_seconds"]
+        for rd in before_run_details
+        if isinstance(rd.get("duration_seconds"), (int, float)) and math.isfinite(rd["duration_seconds"])
+    ]
+    after_durations = [
+        rd["duration_seconds"]
+        for rd in after_run_details
+        if isinstance(rd.get("duration_seconds"), (int, float)) and math.isfinite(rd["duration_seconds"])
+    ]
+
+    if len(before_durations) < MIN_RAW_SAMPLE_COUNT or len(after_durations) < MIN_RAW_SAMPLE_COUNT:
+        raise ValueError(
+            f"insufficient raw samples to build a real assessment: "
+            f"before={len(before_durations)} after={len(after_durations)} "
+            f"(need >= {MIN_RAW_SAMPLE_COUNT} each)"
+        )
+
+    before_p50 = _nearest_rank_percentile(before_durations, 50)
+    before_p95 = _nearest_rank_percentile(before_durations, 95)
+    after_p50 = _nearest_rank_percentile(after_durations, 50)
+    after_p95 = _nearest_rank_percentile(after_durations, 95)
+
+    relative_shortening = (before_p50 - after_p50) / before_p50 if before_p50 else 0.0
+    if relative_shortening >= relative_shortening_threshold:
+        claim: dict[str, Any] = {
+            "kind": "improvement",
+            "metric": "provider_critical_path_p50_seconds",
+            "minimum_improvement_pct": relative_shortening_threshold * 100.0,
+        }
+        outcome = "improved"
+    elif after_p50 > before_p50:
+        # Schema's Claim enum has no "regression" kind -- a regression is
+        # represented as a non_regression claim that FAILED (observation:
+        # regressed), not a distinct claim.kind value.
+        claim = {
+            "kind": "non_regression",
+            "metric": "provider_critical_path_p50_seconds",
+            "maximum_regression_pct": 0.0,
+        }
+        outcome = "regressed"
+    else:
+        claim = {
+            "kind": "absolute_budget",
+            "metric": "provider_critical_path_p50_seconds",
+            "maximum_value_ms": before_p50 * 1000.0,
+        }
+        outcome = "inconclusive"
+
+    def _cohort(job_role: str, p50: float, p95: float, run_details: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "job": f"e2e-provider-critical-path-{job_role}",
+            "p50_seconds": p50,
+            "p95_seconds": p95,
+            "run_ids": [str(rd["workflow_run_id"]) for rd in run_details],
+            "run_count": len(run_details),
+            "run_details": run_details,
+            "runner_image": cohort_provenance["runner_image"],
+            "workers": cohort_provenance["workers"],
+            "scheduler": cohort_provenance["scheduler"],
+            "command_manifest_digest": cohort_provenance["command_manifest_digest"],
+            "test_selection_digest": cohort_provenance["test_selection_digest"],
+        }
+
+    return {
+        "schema": "CI_TEST_PERFORMANCE_ASSESSMENT_V2",
+        "schema_version": 2,
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "measured_at": measured_at,
+        "claim": claim,
+        "performance_evidence": {
+            "status": "complete",
+            "runtime_delta": {
+                "mode": "comparative",
+                "before": _cohort("before", before_p50, before_p95, before_run_details),
+                "after": _cohort("after", after_p50, after_p95, after_run_details),
+                "delta": _recompute_delta(
+                    {"p50_seconds": before_p50, "p95_seconds": before_p95},
+                    {"p50_seconds": after_p50, "p95_seconds": after_p95},
+                ),
+                "outlier_exclusions": [],
+            },
+        },
+        "observation": {"outcome": outcome},
+        "claim_evaluation": {
+            "outcome": "satisfied" if outcome == "improved" and claim["kind"] == "improvement" else "not_applicable"
+        },
+        "functional_evidence": functional_evidence,
+        "declared_impact": declared_impact,
+        "risk_acknowledgement": risk_acknowledgement,
+    }
 
 
 def run_semantic_checks(

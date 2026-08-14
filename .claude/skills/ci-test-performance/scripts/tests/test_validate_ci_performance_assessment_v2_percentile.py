@@ -42,11 +42,13 @@ def _base_assessment() -> dict:
     )
 
 
-def _run_details(durations: list[float], commit_sha: str = "a" * 40) -> list[dict]:
+def _run_details(
+    durations: list[float], commit_sha: str = "a" * 40, workflow_run_id_start: int = 9000
+) -> list[dict]:
     return [
         {
             "run_id": f"run-{i}",
-            "workflow_run_id": 9000 + i,
+            "workflow_run_id": workflow_run_id_start + i,
             "run_attempt": 1,
             "commit_sha": commit_sha,
             "conclusion": "success",
@@ -260,11 +262,14 @@ def test_run_details_workflow_run_id_mismatches_run_ids_is_rejected():
     run_ids, not an independent/fabricated set)."""
     assessment = _complete_non_none_claim_assessment(run_count=20)
     durations = [100.0 + i for i in range(20)]
-    run_details = _run_details(durations)
+    # workflow_run_id range intentionally disjoint from
+    # _complete_non_none_claim_assessment's before run_ids (9000..9019) so
+    # the mismatch is genuine, not a coincidental overlap.
+    run_details = _run_details(durations, workflow_run_id_start=50000)
     assessment["performance_evidence"]["runtime_delta"]["before"]["run_details"] = run_details
     # run_ids intentionally left as the fixture's mismatched placeholder set
     # (before ids from _complete_non_none_claim_assessment, workflow_run_id
-    # from _run_details starting at 9000 -- these do not overlap).
+    # from _run_details starting at 50000 -- these do not overlap).
     assessment["performance_evidence"]["runtime_delta"]["before"]["run_count"] = len(run_details)
 
     errors: list[str] = []

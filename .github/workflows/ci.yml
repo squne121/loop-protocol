@@ -35,13 +35,14 @@ on:
         default: ""
       cohort_role:
         description: >-
-          Fixed-SHA E2E benchmark cohort role for this dispatch (before/after
-          the measured code change). Recorded as `cohort_role` in the
+          Fixed-SHA E2E benchmark cohort role for this dispatch: "before" or
+          "after" the measured code change (leave empty for a normal
+          non-benchmark run). Recorded as `cohort_role` in the
           ci_runtime_baseline_v1 artifact; an
           INTENTIONAL_TREATMENT_DIFFERENCE field (#2159 P0-5/P0-7), never
-          checked for cross-arm equality.
-        type: choice
-        options: ["", before, after]
+          checked for cross-arm equality. Not a `type: choice` input because
+          actionlint's syntax-check rejects an empty string `choice` option.
+        type: string
         default: ""
       experiment_id:
         description: >-

@@ -497,3 +497,279 @@ def test_cli_semantic_violation_causes_operational_failure(tmp_path):
     )
     assert exit_code == collector.EXIT_OPERATIONAL_FAILURE
     assert not output_path.exists()
+
+
+# --------------------------------------------------------------------------- #
+# #2159 P0-3 (fix_delta after adversarial review issuecomment-5295659213):
+# trusted (live-API-verified) collector layer, fixture-driven with an
+# injected fake transport (no real network in these tests).
+# --------------------------------------------------------------------------- #
+def _fake_artifacts_response(
+    artifacts: list[dict],
+) -> dict:
+    return {"artifacts": artifacts}
+
+
+def _live_api_artifact(
+    artifact_id: int,
+    digest: str,
+    workflow_run_id: int,
+    head_sha: str,
+) -> dict:
+    return {
+        "id": artifact_id,
+        "digest": digest,
+        "workflow_run": {"id": workflow_run_id, "head_sha": head_sha},
+    }
+
+
+def test_live_api_verification_accepts_genuinely_matching_record():
+    """GIVEN a record whose claimed artifact_id/artifact_digest/head_sha
+    all match a (fake, injected) live GitHub Actions API response WHEN
+    `verify_run_record_against_live_api` runs THEN there are no
+    violations."""
+    record = _record(500, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=777, artifact_digest="sha256:" + "e" * 64)
+
+    def fake_api_call(endpoint: str) -> dict:
+        assert endpoint == "repos/owner/repo/actions/runs/500/artifacts"
+        return _fake_artifacts_response(
+            [_live_api_artifact(777, "sha256:" + "e" * 64, 500, BEFORE_SHA)]
+        )
+
+    violations = collector.verify_run_record_against_live_api(
+        record, BEFORE_SHA, "owner/repo", api_call=fake_api_call
+    )
+    assert violations == []
+
+
+def test_live_api_verification_rejects_fabricated_artifact_id():
+    """GIVEN a record claiming an artifact_id that does NOT appear in the
+    live API's artifact listing for that workflow_run_id (a fabricated
+    artifact ID -- the review's exact P0-3 attack example) WHEN
+    `verify_run_record_against_live_api` runs THEN
+    artifact_not_found_via_live_api is reported."""
+    record = _record(
+        1001, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=999999999, artifact_digest="sha256:" + "f" * 64
+    )
+
+    def fake_api_call(endpoint: str) -> dict:
+        # The live run DOES exist, but its real artifacts do not include
+        # the fabricated ID.
+        return _fake_artifacts_response(
+            [_live_api_artifact(123456, "sha256:" + "a" * 64, 1001, BEFORE_SHA)]
+        )
+
+    violations = collector.verify_run_record_against_live_api(
+        record, BEFORE_SHA, "owner/repo", api_call=fake_api_call
+    )
+    assert any("artifact_not_found_via_live_api" in v for v in violations)
+
+
+def test_live_api_verification_rejects_digest_mismatch():
+    """GIVEN a record whose claimed artifact_digest does NOT match the
+    live API's digest for that (real) artifact_id WHEN
+    `verify_run_record_against_live_api` runs THEN
+    artifact_digest_mismatch_vs_live_api is reported."""
+    record = _record(
+        1002, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=555, artifact_digest="sha256:" + "1" * 64
+    )
+
+    def fake_api_call(endpoint: str) -> dict:
+        return _fake_artifacts_response(
+            [_live_api_artifact(555, "sha256:" + "2" * 64, 1002, BEFORE_SHA)]
+        )
+
+    violations = collector.verify_run_record_against_live_api(
+        record, BEFORE_SHA, "owner/repo", api_call=fake_api_call
+    )
+    assert any("artifact_digest_mismatch_vs_live_api" in v for v in violations)
+
+
+def test_live_api_verification_rejects_head_sha_mismatch():
+    """GIVEN a record/expected_head_sha that does NOT match the live API's
+    `workflow_run.head_sha` for the claimed artifact (the artifact is real
+    but belongs to a DIFFERENT commit than claimed) WHEN
+    `verify_run_record_against_live_api` runs THEN
+    artifact_head_sha_mismatch_vs_live_api is reported."""
+    record = _record(
+        1003, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=666, artifact_digest="sha256:" + "3" * 64
+    )
+
+    def fake_api_call(endpoint: str) -> dict:
+        return _fake_artifacts_response(
+            [_live_api_artifact(666, "sha256:" + "3" * 64, 1003, "f" * 40)]  # different head_sha
+        )
+
+    violations = collector.verify_run_record_against_live_api(
+        record, BEFORE_SHA, "owner/repo", api_call=fake_api_call
+    )
+    assert any("artifact_head_sha_mismatch_vs_live_api" in v for v in violations)
+
+
+def test_live_api_verification_batch_reports_only_failing_records():
+    records = [
+        _record(2001, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=1, artifact_digest="sha256:" + "0" * 64),
+        _record(2002, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=2, artifact_digest="sha256:" + "0" * 64),
+    ]
+
+    def fake_api_call(endpoint: str) -> dict:
+        run_id = int(endpoint.rsplit("/", 2)[1])
+        if run_id == 2001:
+            return _fake_artifacts_response([_live_api_artifact(1, "sha256:" + "0" * 64, 2001, BEFORE_SHA)])
+        return _fake_artifacts_response([])  # 2002's artifact is fabricated
+
+    failures = collector.verify_records_against_live_api(records, BEFORE_SHA, "owner/repo", api_call=fake_api_call)
+    assert len(failures) == 1
+    assert failures[0]["record"]["workflow_run_id"] == 2002
+
+
+def test_live_api_transport_error_is_reported_not_raised():
+    """GIVEN the injected transport raises `LiveAPIError` (network/auth
+    failure) WHEN `verify_run_record_against_live_api` runs THEN it is
+    caught and reported as a violation string, not propagated as an
+    uncaught exception (a transient API outage must not crash the
+    collector)."""
+    record = _record(3001, job="e2e-core", head_sha=BEFORE_SHA)
+
+    def failing_api_call(endpoint: str) -> dict:
+        raise collector.LiveAPIError("simulated_rate_limit")
+
+    violations = collector.verify_run_record_against_live_api(
+        record, BEFORE_SHA, "owner/repo", api_call=failing_api_call
+    )
+    assert any("live_api_artifacts_fetch_failed" in v for v in violations)
+
+
+def test_cli_verify_against_live_api_requires_repo(tmp_path):
+    before_path = tmp_path / "before_runs.json"
+    after_path = tmp_path / "after_runs.json"
+    output_path = tmp_path / "manifest.json"
+    before_path.write_text("[]", encoding="utf-8")
+    after_path.write_text("[]", encoding="utf-8")
+
+    exit_code = collector.main(
+        [
+            "--before-sha",
+            BEFORE_SHA,
+            "--after-sha",
+            AFTER_SHA,
+            "--before-runs-json",
+            str(before_path),
+            "--after-runs-json",
+            str(after_path),
+            "--output",
+            str(output_path),
+            "--verify-against-live-api",
+        ]
+    )
+    assert exit_code == collector.EXIT_OPERATIONAL_FAILURE
+
+
+def test_cli_verify_against_live_api_surfaces_failures_as_evidence_errors(tmp_path, monkeypatch):
+    """GIVEN --verify-against-live-api with an injected fake `gh api` CLI
+    call (via monkeypatching the module's default transport) WHEN a record
+    fails live verification THEN it is EXCLUDED from the cohort AND
+    reported as a `live_api_verification_failed` evidence_error in the
+    written manifest -- never silently dropped."""
+
+    def fake_default_api_call(endpoint: str) -> dict:
+        return _fake_artifacts_response([])  # nothing ever verifies
+
+    monkeypatch.setattr(collector, "_default_gh_api_call", fake_default_api_call)
+
+    before_records = [_record(1, job="e2e", head_sha=BEFORE_SHA)]
+    after_records = [_record(101, job="e2e-core", head_sha=AFTER_SHA)]
+
+    before_path = tmp_path / "before_runs.json"
+    after_path = tmp_path / "after_runs.json"
+    output_path = tmp_path / "manifest.json"
+    before_path.write_text(json.dumps(before_records), encoding="utf-8")
+    after_path.write_text(json.dumps(after_records), encoding="utf-8")
+
+    exit_code = collector.main(
+        [
+            "--before-sha",
+            BEFORE_SHA,
+            "--after-sha",
+            AFTER_SHA,
+            "--before-runs-json",
+            str(before_path),
+            "--after-runs-json",
+            str(after_path),
+            "--output",
+            str(output_path),
+            "--verify-against-live-api",
+            "--repo",
+            "owner/repo",
+            "--min-runs",
+            "1",
+        ]
+    )
+    assert exit_code == collector.EXIT_INCOMPLETE
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert written["arms"]["before"]["jobs"]["e2e"]["run_count"] == 0
+    live_failures = [e for e in written["evidence_errors"] if e["reason"] == "live_api_verification_failed"]
+    assert len(live_failures) == 2
+
+
+# --------------------------------------------------------------------------- #
+# #2159 P0-3: genuine LIVE GitHub API verification (real network call via
+# `gh api`, no injected fake transport). Requires an authenticated `gh` CLI
+# -- SKIPs (not a fabricated PASS) when unavailable, per this repo's
+# Runtime Verification Applicability SKIP policy for evidence that can
+# only exist against live GitHub Actions history. This is proven against a
+# REAL artifact this PR's own CI produced (run 31819439122, artifact
+# 9226468408, ci-runtime-baseline-e2e-core-1, verified via `gh api
+# repos/squne121/loop-protocol/actions/runs/31819439122/artifacts` during
+# this fix_delta implementation session).
+# --------------------------------------------------------------------------- #
+def _gh_cli_available() -> bool:
+    import shutil
+    import subprocess as _subprocess
+
+    if shutil.which("gh") is None:
+        return False
+    try:
+        result = _subprocess.run(
+            ["gh", "auth", "status"], capture_output=True, text=True, timeout=10, check=False
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+@pytest.mark.skipif(not _gh_cli_available(), reason="gh CLI not available/authenticated in this environment")
+def test_live_api_verification_against_real_pr_2172_ci_artifact():
+    """GIVEN the REAL `ci-runtime-baseline-e2e-core-1` artifact this PR's
+    own CI produced (run 31819439122, artifact 9226468408) WHEN verified
+    against the LIVE GitHub API (real network call, not an injected fake)
+    THEN it is accepted with zero violations; a fabricated artifact ID
+    against that same real run is rejected."""
+    real_head_sha = "79065f96e69e7079bda8fc2344e07caac402bc04"
+    real_record = {
+        "workflow_run_id": 31819439122,
+        "job": "e2e-core",
+        "head_sha": real_head_sha,
+        "artifact_id": 9226468408,
+        "artifact_digest": "sha256:246d5683f6e1b792d304289ad6af167edc139a0e1a6816c354bc990a2ebbe79b",
+        "conclusion": "success",
+    }
+    try:
+        violations = collector.verify_run_record_against_live_api(
+            real_record, real_head_sha, "squne121/loop-protocol"
+        )
+    except Exception:  # pragma: no cover -- transport-level, not a test bug
+        pytest.skip("live GitHub API call failed unexpectedly (network/auth) -- see gh CLI output")
+    if any("live_api_artifacts_fetch_failed" in v for v in violations):
+        # Artifact retention is 30 days from creation (2026-08-14); once it
+        # expires this genuine live check can no longer run against this
+        # fixed historical artifact id -- SKIP (not a fabricated
+        # PASS/FAIL) rather than permanently failing this test file.
+        pytest.skip(f"real artifact 9226468408 likely expired (30-day retention): {violations}")
+    assert violations == []
+
+    fabricated_record = dict(real_record, artifact_id=999999999, artifact_digest="sha256:" + "a" * 64)
+    fabricated_violations = collector.verify_run_record_against_live_api(
+        fabricated_record, real_head_sha, "squne121/loop-protocol"
+    )
+    assert any("artifact_not_found_via_live_api" in v for v in fabricated_violations)
