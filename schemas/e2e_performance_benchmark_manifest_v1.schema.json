@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/e2e_performance_benchmark_manifest_v1.schema.json",
+  "title": "E2E Performance Benchmark Manifest V1",
+  "description": "Issue #2159 AC1/AC2/AC7: immutable manifest produced by scripts/ci/collect_e2e_performance_benchmark.py for a fixed before/after commit SHA e2e performance benchmark experiment. Each arm's evidence is a cross-run collector output (workflow-run-id-deduped, artifact-ID/digest/head-SHA/job verified) covering the jobs relevant to the pre-split `e2e` job and the post-split `e2e-core` / `e2e-responsive-matrix` jobs. This schema is intentionally immutable-by-convention: a manifest, once verified complete (arms[*].complete == true for all required jobs), must not be silently mutated in place -- a re-run produces a new manifest file (see docs/dev/e2e-performance-benchmark.md).",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "generated_at",
+    "before_sha",
+    "after_sha",
+    "min_run_count",
+    "arms",
+    "evidence_errors"
+  ],
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": {
+      "const": "e2e_performance_benchmark_manifest_v1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "minLength": 1,
+      "format": "date-time"
+    },
+    "before_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "after_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "min_run_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "arms": {
+      "type": "object",
+      "required": [
+        "before",
+        "after"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "before": {
+          "$ref": "#/$defs/Arm"
+        },
+        "after": {
+          "$ref": "#/$defs/Arm"
+        }
+      }
+    },
+    "evidence_errors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/EvidenceError"
+      }
+    }
+  },
+  "$defs": {
+    "Arm": {
+      "type": "object",
+      "required": [
+        "commit_sha",
+        "jobs",
+        "complete"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "jobs": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/JobCohort"
+          }
+        },
+        "complete": {
+          "type": "boolean",
+          "description": "True only if every job's deduped workflow_run_id sample count is >= min_run_count."
+        }
+      }
+    },
+    "JobCohort": {
+      "type": "object",
+      "required": [
+        "job",
+        "run_count",
+        "sample_workflow_run_ids",
+        "runs"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "job": {
+          "type": "string",
+          "minLength": 1
+        },
+        "run_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Deduped (by workflow_run_id) sample count -- rerun attempts of the same workflow_run_id never add an independent sample (Issue #2159 AC2/P1-1)."
+        },
+        "sample_workflow_run_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "uniqueItems": true
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RunRecord"
+          }
+        }
+      }
+    },
+    "RunRecord": {
+      "type": "object",
+      "required": [
+        "workflow_run_id",
+        "job",
+        "head_sha",
+        "artifact_id",
+        "artifact_digest",
+        "conclusion"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "workflow_run_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "job": {
+          "type": "string",
+          "minLength": 1
+        },
+        "head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "artifact_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "artifact_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "conclusion": {
+          "type": "string",
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "skipped",
+            "timed_out"
+          ]
+        }
+      }
+    },
+    "EvidenceError": {
+      "type": "object",
+      "required": [
+        "arm",
+        "reason",
+        "detail"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "arm": {
+          "type": "string",
+          "enum": [
+            "before",
+            "after"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

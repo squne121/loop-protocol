@@ -146,7 +146,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -265,7 +265,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -407,7 +407,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -537,7 +537,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -848,7 +848,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       # Summary step MUST be after upload steps: outputs.artifact-url is only
       # available once upload-artifact has run, and $GITHUB_STEP_SUMMARY is
@@ -1468,7 +1468,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
   # Issue #2119 AC6: aggregate `e2e` — the stable required-check name existing
@@ -2664,7 +2664,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -2887,7 +2887,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -2908,6 +2908,79 @@ jobs:
                       print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
           PY
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Generate CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_ISSUE_NUMBER: "2159"
+          GH_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mkdir -p ci_test_performance_assessment_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          from datetime import datetime, timezone
+
+          pr_number_raw = os.environ.get("GH_PR_NUMBER", "")
+          assessment = {
+              "schema": "CI_TEST_PERFORMANCE_ASSESSMENT_V2",
+              "schema_version": 2,
+              "issue_number": int(os.environ["GH_ISSUE_NUMBER"]),
+              "pr_number": int(pr_number_raw) if pr_number_raw else None,
+              "measured_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              # Issue #2159 AC10: this producer runs on EVERY CI run of the
+              # python-test-core job and asserts no performance CLAIM for
+              # this specific job's own instrumentation (claim.kind: none).
+              # A dedicated performance CLAIM (improvement/non_regression/
+              # absolute_budget) is authored separately, out-of-band, by
+              # scripts/ci/collect_e2e_performance_benchmark.py's fixed
+              # before/after SHA benchmark route (Issue #2159 AC1/AC2/AC7),
+              # not by this per-run producer -- this step's job is to prove
+              # a REAL CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact is
+              # actually generated from a real run (not just documented as
+              # a string in this workflow file).
+              "claim": {"kind": "none"},
+              "performance_evidence": {"status": "not_required"},
+              "observation": {"outcome": "not_observed"},
+              "claim_evaluation": {"outcome": "not_applicable"},
+              "functional_evidence": {
+                  "proof_level": "check_run_only",
+                  "coverage_bound": False,
+              },
+              "declared_impact": (
+                  "Routine CI_TEST_PERFORMANCE_ASSESSMENT_V2 producer run "
+                  f"(head_sha={os.environ['GH_HEAD_SHA']}); no performance "
+                  "claim is made by this per-run instrumentation step."
+              ),
+              "risk_acknowledgement": {
+                  "reference": {
+                      "source_kind": "commit_message",
+                      "source_id": os.environ["GH_HEAD_SHA"],
+                  },
+                  "verification_status": "unverified",
+              },
+          }
+          out = pathlib.Path(
+              "ci_test_performance_assessment_artifacts/ci_test_performance_assessment_v2.json"
+          )
+          out.write_text(json.dumps(assessment, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Validate CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact
+        if: ${{ !cancelled() }}
+        run: |
+          uv run --locked python3 \
+            .claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py \
+            --assessment ci_test_performance_assessment_artifacts/ci_test_performance_assessment_v2.json \
+            --output ci_test_performance_assessment_artifacts/ci_test_performance_assessment_v2_validation_result.json
+      - name: Upload CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-test-performance-assessment-v2-${{ github.run_attempt }}
+          path: ci_test_performance_assessment_artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
 
   python-test:
     # Issue #1760 AC5: required aggregate status check (name unchanged --
@@ -3328,7 +3401,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -3473,7 +3546,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}

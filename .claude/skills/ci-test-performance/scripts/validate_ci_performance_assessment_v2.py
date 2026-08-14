@@ -354,6 +354,71 @@ def _recompute_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str,
     }
 
 
+def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
+    """Issue #2159 AC8: `nearest_rank_v1` percentile method -- the smallest
+    value such that at least `percentile`% of the (sorted) sample is <=
+    that value. 1-indexed nearest-rank method. Kept as the same method
+    name/semantics as `tests/ci/test_ci_performance_gate.py`'s
+    `_nearest_rank_percentile` (duplicated rather than imported across the
+    Allowed Paths boundary between the two Issue #2159 contracts)."""
+    if not values:
+        raise ValueError("nearest_rank_v1 requires at least one value")
+    ordered = sorted(values)
+    n = len(ordered)
+    rank = max(1, min(n, math.ceil((percentile / 100.0) * n)))
+    return ordered[rank - 1]
+
+
+def _check_percentile_recomputed_from_raw_samples(
+    performance_evidence: dict[str, Any], errors: list[str]
+) -> None:
+    """Issue #2159 AC8 (P0-9): recompute P50/P95 from
+    `runtime_delta.<cohort>.run_details[].duration_seconds` raw samples and
+    cross-check against the cohort's self-reported `p50_seconds` /
+    `p95_seconds`. Previously this validator only cross-checked the
+    before/after DELTA (`_recompute_delta`, from the already-aggregated
+    p50/p95 values) -- it never verified those aggregate p50/p95 values
+    themselves were honestly derived from the raw per-run samples.
+    `run_details` is an OPTIONAL field (schemas/ci_runtime_delta_v2.schema.json);
+    a cohort without it is not penalized here (no raw samples to recompute
+    from), preserving backward compatibility with existing assessments
+    that only report pre-aggregated statistics."""
+    runtime_delta = performance_evidence.get("runtime_delta")
+    if not runtime_delta:
+        return
+
+    for cohort_key in ("before", "after"):
+        cohort = runtime_delta.get(cohort_key)
+        if not cohort:
+            continue
+        run_details = cohort.get("run_details")
+        if not run_details:
+            continue
+
+        durations = [
+            rd.get("duration_seconds")
+            for rd in run_details
+            if isinstance(rd, dict) and isinstance(rd.get("duration_seconds"), (int, float))
+        ]
+        if not durations:
+            continue
+
+        recomputed_p50 = _nearest_rank_percentile(durations, 50)
+        recomputed_p95 = _nearest_rank_percentile(durations, 95)
+
+        declared_p50 = cohort.get("p50_seconds")
+        declared_p95 = cohort.get("p95_seconds")
+
+        if declared_p50 is not None and not math.isclose(
+            declared_p50, recomputed_p50, rel_tol=1e-6, abs_tol=DELTA_TOLERANCE
+        ):
+            _append_unique(errors, f"percentile_recomputation_mismatch_p50: {cohort_key}")
+        if declared_p95 is not None and not math.isclose(
+            declared_p95, recomputed_p95, rel_tol=1e-6, abs_tol=DELTA_TOLERANCE
+        ):
+            _append_unique(errors, f"percentile_recomputation_mismatch_p95: {cohort_key}")
+
+
 def _check_cohort_comparability(
     performance_evidence: dict[str, Any],
     errors: list[str],
@@ -472,6 +537,7 @@ def run_semantic_checks(
         expected_artifact_digest,
     )
     _check_cohort_comparability(assessment["performance_evidence"], errors, blockers)
+    _check_percentile_recomputed_from_raw_samples(assessment["performance_evidence"], errors)
     _check_approval_gates(assessment, blockers)
 
     semantic_valid = len(errors) == 0
