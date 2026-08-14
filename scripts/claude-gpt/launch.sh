@@ -422,8 +422,34 @@ trap 'claude_gpt_forward_signal TERM' TERM
 trap 'claude_gpt_forward_signal HUP' HUP
 trap 'claude_gpt_cleanup' EXIT
 
+# --- launcher 自身の stdin を fd 9 として明示的に複製する（Issue #2158/#2162
+#     fix-delta。#2174/#2176 structured lane 実機発見）。
+#     job control が無効な非対話 shell（dash/bash 双方で確認済み）では、
+#     `cmd &` のように *明示的な入力リダイレクトを持たない* async command は、
+#     ターミナル/呼び出し元との stdin 競合を避けるため shell が自動的に
+#     `< /dev/null` を差し込む（POSIX 準拠の既定動作）。P0-4 supervisor 構成
+#     はまさにこの形（`"$CLAUDE_BIN" ... "$@" &`）だったため、`-p` へ prompt を
+#     stdin 経由で渡す呼び出し（structured lane 等）で子プロセスの stdin が
+#     空になり `Error: Input must be provided either through stdin or as a
+#     prompt argument when using --print` が発生していた（argv 経由で prompt
+#     を渡す runtime_smoke_test.sh の呼び出しは影響しない）。
+#     対策として fd 9 を明示的に複製し、claude 起動時に `<&9` で結びつけることで
+#     async command に明示的な入力リダイレクトを与え、shell 既定の
+#     `/dev/null` 差し替えを回避する（`set -m` による job control 有効化や
+#     `disown` は、前者は `[N]+ Done` ノイズが増えるだけで許容範囲内だが後者は
+#     `wait "$CLAUDE_PID"` を空振りさせ exit code 取得と signal forwarding を
+#     破壊することを検証済みのため、いずれも採用しない）。
+#     fd 0 が呼び出し元から正しく渡されていることは、他の全コマンド（proxy
+#     起動時の `env -i` 等）と同じく launcher の前提条件であり、fd 0 が
+#     既に閉じられているような非対応環境では `exec` 自体が失敗し launcher は
+#     即座に終了する（dash では POSIX 準拠の special builtin redirection
+#     failure として shell 全体が終了する。これは本変更が持ち込む新しい
+#     failure mode ではなく、fd 0 前提が壊れている場合に他のどの経路でも
+#     いずれ破綻していた状態を早期に顕在化させるだけである）。
+exec 9<&0
+
 # shellcheck disable=SC2086
-"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" "$@" &
+"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" "$@" <&9 &
 CLAUDE_PID=$!
 
 wait "$CLAUDE_PID"
