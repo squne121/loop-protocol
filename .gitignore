@@ -75,3 +75,10 @@ playwright-report/
 test-results/
 coverage/
 .cache/
+
+# claude-gpt launcher local state (Issue #2158)
+# CLAUDE_CONFIG_DIR / proxy config / state directories live under $HOME/.claude-gpt
+# (outside the repository), but this is a defensive ignore in case of accidental
+# repo-local generation. Never commit credentials/tokens.
+.claude-gpt/
+scripts/claude-gpt/.evidence/
