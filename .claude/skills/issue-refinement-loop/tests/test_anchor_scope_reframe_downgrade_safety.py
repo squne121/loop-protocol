@@ -120,7 +120,9 @@ def test_no_structured_payload_keeps_legitimate_freeform_lane_open():
         issue_number=TARGET_ISSUE,
         anchor_url=_anchor_url(),
     )
-    assert decision["status"] == "fail_closed"
+    # #2156 AC2: genuine absence (no ```yaml fence at all) classifies as
+    # not_applicable (freeform lane continues), not fail_closed.
+    assert decision["status"] == "not_applicable"
     assert decision["reason"] == "no_anchor_scope_reframe_v1_payload"
 
     # THEN the downgrade guard does NOT fire -- freeform evidence generation
