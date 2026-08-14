@@ -581,17 +581,52 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            claude_agent_name: str | None = None,
                            hermetic_agents_file: str | None = None,
                            hermetic_settings_file: str | None = None,
+                           claude_bin_is_override: bool = False,
                            ) -> tuple[int | None, str, str, bool]:
-    argv = [
-        claude_bin,
+    argv = [claude_bin]
+    if claude_bin_is_override:
+        # Issue #2176 (live AC3 finding): ``scripts/claude-gpt/launch.sh``
+        # only accepts its own launcher options (``--claude-bin``,
+        # ``--check-only``, ``--dry-run``) before a literal ``--``
+        # separator; any other ``-*`` token there is rejected as
+        # ``unknown_launcher_option`` (confirmed against the launcher
+        # committed at Issue #2158 / PR #2162's worktree HEAD). Everything
+        # after ``--`` is forwarded to the underlying claude binary
+        # unparsed. Native ``claude`` (no override) never receives this
+        # separator, so its argv shape is unchanged.
+        argv.append("--")
+    argv += [
         "-p",
         "--output-format", "stream-json",
         "--include-hook-events",
         "--no-session-persistence",
         "--max-turns", str(max_turns),
         "--verbose",
-        "--settings", _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON,
     ]
+    # Issue #2176: a launcher wrapper pinned via ``--claude-bin`` (e.g.
+    # ``scripts/claude-gpt/launch.sh``) rejects any ``--settings`` CLI flag
+    # outright as a policy-weakening extra flag
+    # (``CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS``), so unconditionally appending
+    # the fixed SubagentStart/SubagentStop observability
+    # ``--settings <JSON>`` flag here (as done for the native ``claude``
+    # binary below) would make every structured-lane launcher invocation a
+    # deterministic BLOCKED. Instead, when ``claude_bin`` was supplied via
+    # ``--claude-bin`` (``claude_bin_is_override=True``), request the same
+    # fixed hook pair through a narrow, value-fixed environment variable
+    # (``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop``) that the
+    # launcher itself interprets and materializes into its own
+    # launcher-managed settings file -- no caller-supplied JSON ever
+    # crosses the launcher's forbidden-flags boundary. When ``claude_bin``
+    # is the default (native ``claude`` resolved from ``PATH``,
+    # ``claude_bin_is_override=False``), this branch is not taken and argv
+    # keeps the pre-existing fixed ``--settings <JSON>`` flag unchanged
+    # (backward compatibility, AC6-equivalent for this narrow channel).
+    launch_env = None
+    if claude_bin_is_override:
+        launch_env = os.environ.copy()
+        launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = "subagent-start-stop"
+    else:
+        argv += ["--settings", _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON]
     # Issue #1734 fix_delta 3 (AC7): purely additive, opt-in persona binding.
     # When ``claude_agent_name`` is provided, insert ``--agent <name>`` so the
     # underlying ``claude`` process actually launches with that Agent as the
@@ -621,7 +656,7 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
         argv += ["--agents", hermetic_agents_json]
     if hermetic_settings_file:
         argv += ["--settings", hermetic_settings_file]
-    return _run(argv, cwd=worktree, timeout=timeout_seconds, input_text=prompt)
+    return _run(argv, cwd=worktree, timeout=timeout_seconds, input_text=prompt, env=launch_env)
 
 
 def run_structured_codex(worktree: str, prompt: str, timeout_seconds: float,
@@ -3177,6 +3212,7 @@ def main(argv: list[str] | None = None) -> int:
                     claude_agent_name=effective_claude_agent_name,
                     hermetic_agents_file=hermetic_agents_file if hermetic_active else None,
                     hermetic_settings_file=hermetic_settings_file if hermetic_active else None,
+                    claude_bin_is_override=bool(args.claude_bin),
                 )
                 capability_decision, capability_reason = classify_claude_structured_outcome(
                     rc, out, err, timed_out
