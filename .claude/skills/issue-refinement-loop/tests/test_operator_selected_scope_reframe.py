@@ -725,3 +725,169 @@ def test_genuine_positive_imperative_bullet_still_explicit_ac1_blocker4():
         == sda.DIRECTIVE_CONFIDENCE_EXPLICIT
     )
 
+
+# ---------------------------------------------------------------------------
+# #2156 AC7: `_project_scope_delta_decision_to_approval()` (plan_refinement_loop.py)
+# must not drop trusted-author anchor comment evidence for the genuine-absence
+# (`status: not_applicable`) case.
+# ---------------------------------------------------------------------------
+
+import importlib.util as _importlib_util  # noqa: E402
+
+_PLAN_SCRIPTS_DIR = SKILL_ROOT / "scripts"
+
+
+def _load_plan_refinement_loop_module():
+    if "scope_signal_delta" not in sys.modules:
+        _spec_sd = _importlib_util.spec_from_file_location(
+            "scope_signal_delta", _PLAN_SCRIPTS_DIR / "scope_signal_delta.py"
+        )
+        assert _spec_sd is not None and _spec_sd.loader is not None
+        _module_sd = _importlib_util.module_from_spec(_spec_sd)
+        sys.modules["scope_signal_delta"] = _module_sd
+        _spec_sd.loader.exec_module(_module_sd)
+
+    _spec = _importlib_util.spec_from_file_location(
+        "plan_refinement_loop_2156", _PLAN_SCRIPTS_DIR / "plan_refinement_loop.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    _module = _importlib_util.module_from_spec(_spec)
+    sys.modules["plan_refinement_loop_2156"] = _module
+    _spec.loader.exec_module(_module)
+    return _module
+
+
+def test_not_applicable_genuine_absence_preserves_anchor_evidence():
+    """AC7: when `scope_delta_decision.status == "not_applicable"` (the
+    genuine-absence case, #2156 AC2), `_project_scope_delta_decision_to_approval()`
+    must still populate the trusted author's anchor comment evidence fields
+    (`comment_url` / `body_sha256` / `author_association` / `required_rerun`)
+    from `scope_delta_decision` rather than leaving them at the
+    `_base_approval_result()` defaults. The final `approval["status"]` stays
+    `missing_marker` (unchanged from the pre-#2156 `fail_closed` +
+    `no_anchor_scope_reframe_v1_payload` projection)."""
+    planner = _load_plan_refinement_loop_module()
+
+    scope_delta_decision = preflight._classify_anchor_scope_reframe(
+        comment_payload=_payload(association="OWNER"),
+        anchor_body="Just a plain review comment without any reframe marker.",
+        repo=REPO,
+        issue_number=ISSUE,
+        anchor_url=URL,
+    )
+    assert scope_delta_decision["status"] == "not_applicable"
+    assert scope_delta_decision["reason"] == "no_anchor_scope_reframe_v1_payload"
+
+    known_context = {"scope_delta_decision": scope_delta_decision}
+    approval = planner._project_scope_delta_decision_to_approval(known_context)
+
+    assert approval["status"] == "missing_marker"
+    assert approval["present"] is True
+    assert approval["comment_url"] == scope_delta_decision["anchor_comment_url"]
+    assert approval["body_sha256"] == scope_delta_decision["anchor_comment_hash"]
+    assert approval["author_association"] == scope_delta_decision["anchor_author_association"]
+    assert approval["comment_url"], "comment_url evidence must not be dropped"
+    assert approval["body_sha256"], "body_sha256 evidence must not be dropped"
+    assert approval["author_association"] == "OWNER"
+
+
+# ---------------------------------------------------------------------------
+# PR #2171 fix_delta (P1-4, OWNER adversarial review):
+# `_project_scope_delta_decision_to_approval()`'s `status == "not_applicable"`
+# handling must stay scoped to the intended combination (`reason ==
+# no_anchor_scope_reframe_v1_payload` + trusted-author anchor evidence), and
+# must not change the meaning of other `not_applicable` producers (bare
+# `{"status": "not_applicable"}`, or an unrelated reason).
+# ---------------------------------------------------------------------------
+
+
+def test_bare_not_applicable_without_reason_stays_missing():
+    """A bare `{"status": "not_applicable"}` (no `reason`, no anchor comment
+    evidence at all) must project to the untouched `_base_approval_result()`
+    baseline (`status: missing`, `present: False`) -- never
+    `invalid_scope_delta_approval` (which would mischaracterize "no info
+    available" as "a reframe was attempted but rejected")."""
+    planner = _load_plan_refinement_loop_module()
+
+    known_context = {"scope_delta_decision": {"status": "not_applicable"}}
+    approval = planner._project_scope_delta_decision_to_approval(known_context)
+
+    assert approval["status"] == "missing"
+    assert approval["present"] is False
+    assert approval["comment_url"] is None
+    assert approval["body_sha256"] is None
+    assert approval["author_association"] is None
+
+
+def test_not_applicable_with_unrelated_reason_stays_missing():
+    """A `status: not_applicable` decision carrying a reason OTHER than
+    `no_anchor_scope_reframe_v1_payload` must also stay at the untouched
+    `missing` baseline -- P1-4 scopes the evidence-populating branch to the
+    ONE intended reason, not to `status == not_applicable` in general."""
+    planner = _load_plan_refinement_loop_module()
+
+    known_context = {
+        "scope_delta_decision": {
+            "status": "not_applicable",
+            "reason": "some_future_unrelated_producer_reason",
+            "anchor_comment_url": URL,
+            "anchor_comment_hash": "sha256:should-not-be-projected",
+            "anchor_author_association": "OWNER",
+        }
+    }
+    approval = planner._project_scope_delta_decision_to_approval(known_context)
+
+    assert approval["status"] == "missing"
+    assert approval["present"] is False
+    assert approval["comment_url"] is None
+    assert approval["body_sha256"] is None
+    assert approval["author_association"] is None
+
+
+def test_intended_reason_missing_url_hash_author_association_still_projects_missing_marker():
+    """The intended combination (`not_applicable` +
+    `no_anchor_scope_reframe_v1_payload`) with some evidence fields absent
+    (e.g. `anchor_comment_url` not set) must still reach the `missing_marker`
+    lane -- the scoping fix (P1-4) only restricts WHICH `not_applicable`
+    producers reach evidence population, not the intended lane's own
+    tolerance for partially-missing fields."""
+    planner = _load_plan_refinement_loop_module()
+
+    known_context = {
+        "scope_delta_decision": {
+            "status": "not_applicable",
+            "reason": "no_anchor_scope_reframe_v1_payload",
+        }
+    }
+    approval = planner._project_scope_delta_decision_to_approval(known_context)
+
+    assert approval["status"] == "missing_marker"
+    assert approval["present"] is True
+    assert approval["comment_url"] is None
+    assert approval["body_sha256"] is None
+    assert approval["author_association"] is None
+
+
+def test_intended_reason_with_full_trusted_evidence_projects_missing_marker_with_evidence():
+    """The intended combination with COMPLETE trusted-author anchor evidence
+    (the real `_classify_anchor_scope_reframe()` shape) is the pre-existing
+    #2156 AC7 behavior, re-asserted here as an explicit fourth regression
+    case alongside the three narrower ones above."""
+    planner = _load_plan_refinement_loop_module()
+
+    scope_delta_decision = preflight._classify_anchor_scope_reframe(
+        comment_payload=_payload(association="OWNER"),
+        anchor_body="Just a plain review comment without any reframe marker.",
+        repo=REPO,
+        issue_number=ISSUE,
+        anchor_url=URL,
+    )
+    known_context = {"scope_delta_decision": scope_delta_decision}
+    approval = planner._project_scope_delta_decision_to_approval(known_context)
+
+    assert approval["status"] == "missing_marker"
+    assert approval["present"] is True
+    assert approval["comment_url"] == scope_delta_decision["anchor_comment_url"]
+    assert approval["body_sha256"] == scope_delta_decision["anchor_comment_hash"]
+    assert approval["author_association"] == "OWNER"
+
