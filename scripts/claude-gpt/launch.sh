@@ -5,8 +5,9 @@
 #
 # herdr session B（ChatGPT Pro Codex subscription 経由 GPT-5.6 Sol/Terra/Luna）を
 # `raine/claude-code-proxy` 経由で起動する。Native Claude（herdr session A）とは
-# config root / credential / working tree を完全分離する（Issue #2158 / Parent #2154
-# アーキテクチャ決定 A〜E 準拠）。PR #2162 OWNER REQUEST_CHANGES（P0-1〜P0-4, P1-1〜P1-3）反映。
+# config root / credential / working tree を分離する（Issue #2158 / Parent #2154
+# アーキテクチャ決定 A〜E 準拠）。現行 Unix user のまま起動する（Issue #2158
+# Scope Reframe, 2026-08-15。dedicated user・OS-level sandbox は Phase 1 の non-goal）。
 #
 # Usage:
 #   scripts/claude-gpt/launch.sh [--check-only] [--dry-run] [--claude-bin <path>] [-- <claude 追加引数...>]
@@ -27,9 +28,6 @@
 #   5   canonical path 違反（repo/worktree 配下への書き込みを拒否）
 #   6   read 制限 settings が未生成または不正
 #   7   proxy 起動失敗（loopback bind / readiness / model alias を確認できない）
-#   8   sandbox 初期化に失敗した
-#   9   CLAUDE_GPT_ISOLATED_PROXY_USER が設定されているが provisioning が未完了
-#       （isolated_proxy_user_not_provisioned。preflight.sh 参照）
 
 SELF_PATH=$0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
@@ -138,30 +136,18 @@ cat > "$MCP_CONFIG_PATH" <<MCP_JSON_EOF
 MCP_JSON_EOF
 
 # --- Claude Code セッション設定 ---
-# 1. proxy credential/config/state/home ディレクトリへの read を拒否する（P0-3。
-#    絶対パスは `Read(//...)` の二重スラッシュ構文でなければ機能しない）。常に有効。
-# 2. sandbox（bubblewrap ベース）は CLAUDE_GPT_HARDENED_SANDBOX=true の場合のみ opt-in で
-#    有効化する。実機検証（PR #2162, 2026-08-14）で、launcher 自体がすでにネストした
-#    bwrap sandbox 環境下で実行されている場合、`sandbox.enabled: true` は Claude Code
-#    本体の Bash tool 実行を `Maximum call stack size exceeded` で完全に破壊することを
-#    確認した。Bash tool という中核機能を破壊しうる hardening を既定で有効化する方が
-#    実害が大きいため、既定は無効・opt-in とする。Issue #2173 で改めて実機検証し、
-#    ネスト実行環境下で sandbox.enabled: true / CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 は
-#    Bash tool 呼び出しを応答なしのビジーループへ陥らせることを 2/2, 1/1 の再現率で確認、
-#    既定 opt-in 無効を維持する判断を確定した
-#    （docs/dev/claude-gpt-sandbox-hardening-verification.md 参照）。
-# 3. session-scoped に repository/user plugin を無効化する（Parent #2154 gateway/context
+# 1. proxy credential/config/state/home ディレクトリへの read を、Claude Code 組み込み
+#    tool（Read 等）に対する best-effort の軽量防御として拒否する（絶対パスは
+#    `Read(//...)` の二重スラッシュ構文でなければ機能しない）。任意の Bash subprocess
+#    からの credential 秘匿を保証するものではない（Issue #2158 Scope Reframe）。
+# 2. session-scoped に repository/user plugin を無効化する（Parent #2154 gateway/context
 #    契約。P1-2）。
-SANDBOX_JSON_FRAGMENT=""
-if [ "${CLAUDE_GPT_HARDENED_SANDBOX:-false}" = "true" ]; then
-  SANDBOX_JSON_FRAGMENT=',
-  "sandbox": {
-    "enabled": true,
-    "network": {
-      "allowAllUnixSockets": false
-    }
-  }'
-fi
+#
+# OS-level sandbox hardening（sandbox.enabled / CLAUDE_CODE_SUBPROCESS_ENV_SCRUB）は
+# 実装しない。実機検証（PR #2162, 2026-08-14 / Issue #2173）で、launcher 自体が
+# ネストした sandbox 実行環境下にある場合、これらは Claude Code 本体の Bash tool を
+# 破壊することが確認され、Phase 1 の merge 条件から除外された（Issue #2158
+# Scope Reframe, 2026-08-15）。
 
 # --- narrow observability channel(Issue #2158/#2173, structured lane #2174/PR #2176 で並行実装中)。
 #     呼び出し元が任意の JSON 文字列を settings へ注入できる汎用経路は作らず、許可された固定値
@@ -185,7 +171,7 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
       "Read(/${PROXY_STATE_DIR_TARGET}/**)",
       "Read(/${PROXY_HOME_TARGET}/**)"
     ]
-  }${SANDBOX_JSON_FRAGMENT},
+  },
   "enabledPlugins": {}${HOOKS_JSON_FRAGMENT}
 }
 SETTINGS_JSON_EOF
@@ -221,29 +207,16 @@ while [ "$PORT_ATTEMPTS" -lt "$PORT_MAX_ATTEMPTS" ] && [ "$READY" != "true" ]; d
 
   # 親 shell から継承した CCP_* / HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 等は env -i で
   # リセットし、明示的に組み立てた変数のみを渡す。HOME は proxy 専用 HOME（P0-2）。
-  # CLAUDE_GPT_ISOLATED_PROXY_USER が設定されている場合（P0-3 段階対応。opt-in。
-  # scripts/claude-gpt/provision_proxy_principal.sh で事前 provisioning 済みであることは
-  # preflight.sh が既に検証済み — ここでの再検証はしない）、proxy を dedicated Unix user
-  # 配下で起動する。未設定なら従来通り同一 UID で起動する（既定動作は変更しない）。
-  if [ -n "${CLAUDE_GPT_ISOLATED_PROXY_USER:-}" ]; then
-    sudo -n -u "$CLAUDE_GPT_ISOLATED_PROXY_USER" env -i \
-      "PATH=$PATH" \
-      "HOME=$PROXY_HOME_TARGET" \
-      "CCP_CONFIG_DIR=$PROXY_CONFIG_DIR_TARGET" \
-      "XDG_STATE_HOME=$PROXY_STATE_DIR_TARGET" \
-      "CCP_BIND_ADDRESS=127.0.0.1" \
-      "CCP_LOG_STDERR=1" \
-      claude-code-proxy serve --port "$PROXY_PORT" --no-monitor > "$PROXY_LOG" 2>&1 &
-  else
-    env -i \
-      "PATH=$PATH" \
-      "HOME=$PROXY_HOME_TARGET" \
-      "CCP_CONFIG_DIR=$PROXY_CONFIG_DIR_TARGET" \
-      "XDG_STATE_HOME=$PROXY_STATE_DIR_TARGET" \
-      "CCP_BIND_ADDRESS=127.0.0.1" \
-      "CCP_LOG_STDERR=1" \
-      claude-code-proxy serve --port "$PROXY_PORT" --no-monitor > "$PROXY_LOG" 2>&1 &
-  fi
+  # 現行 Unix user のまま同一 UID で起動する（dedicated user は Phase 1 の non-goal。
+  # Issue #2158 Scope Reframe, 2026-08-15）。
+  env -i \
+    "PATH=$PATH" \
+    "HOME=$PROXY_HOME_TARGET" \
+    "CCP_CONFIG_DIR=$PROXY_CONFIG_DIR_TARGET" \
+    "XDG_STATE_HOME=$PROXY_STATE_DIR_TARGET" \
+    "CCP_BIND_ADDRESS=127.0.0.1" \
+    "CCP_LOG_STDERR=1" \
+    claude-code-proxy serve --port "$PROXY_PORT" --no-monitor > "$PROXY_LOG" 2>&1 &
   PROXY_PID=$!
 
   # --- readiness poll（最大 10 秒） ---
@@ -372,17 +345,9 @@ STRICT_MCP_MODE=true
 export STRICT_MCP_MODE
 
 # Parent #2154 gateway/context 契約（P1-2）。
-# CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 も sandbox.enabled 同様 CLAUDE_GPT_HARDENED_SANDBOX=true
-# の場合のみ opt-in で設定する。実機検証（PR #2162, 2026-08-14）で、launcher 自体がすでに
-# ネストした bwrap sandbox 環境下で実行されている場合、CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
-# は単独でも Bash tool 呼び出しを `Maximum call stack size exceeded` で完全に破壊することを
-# 確認した（sandbox.enabled と同根の nested-sandbox 非互換）。中核機能を破壊しうる
-# hardening を既定で有効化する方が実害が大きいため、既定は無効・opt-in とする。
-# Issue #2173 で CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 単独（sandbox.enabled 非依存）でも
-# 同一の破壊（応答なしのビジーループ）が再現することを確認済み（1/1）。
-if [ "${CLAUDE_GPT_HARDENED_SANDBOX:-false}" = "true" ]; then
-  export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
-fi
+# CLAUDE_CODE_SUBPROCESS_ENV_SCRUB は設定しない（OS-level sandbox hardening は Phase 1
+# の merge 条件から除外。実機検証で launcher がネストした sandbox 実行環境下にある場合
+# Bash tool を破壊することを確認したため。Issue #2158 Scope Reframe, 2026-08-15）。
 export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW=auto
 export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1

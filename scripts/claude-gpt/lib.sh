@@ -141,29 +141,3 @@ claude_gpt_build_proxy_env() {
   printf 'CCP_BIND_ADDRESS=%s\n' "$bind_address"
   printf 'CCP_LOG_STDERR=1\n'
 }
-
-# --- sandbox 初期化 preflight（P0-3） ---
-#
-# `sandbox.enabled: true` を Claude Code session 設定に強制する前提として、bubblewrap /
-# socat が実際に動作する環境であることを確認する。WSL2/Ubuntu の AppArmor 制約等で
-# unprivileged user namespace が無効化されている場合、bwrap 自体が起動できず sandbox は
-# 静かに無効化（もしくはエラー）されうるため、ここで実機起動確認を行い SKIP でなく
-# FAIL として扱えるようにする（呼び出し側が exit code を判断する）。
-# 注（Issue #2173）: この self-test は bwrap 単体の起動可否のみを検査する。ネストした
-# sandbox 実行環境下で `sandbox.enabled: true` / `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` が
-# Claude Code 本体の Bash tool 呼び出しを応答なしのビジーループへ陥らせる非互換は、この
-# self-test では検出できないことを実機確認した
-# （docs/dev/claude-gpt-sandbox-hardening-verification.md 参照）。
-# 戻り値: 0 = sandbox 初期化可能、1 = 不可
-claude_gpt_check_sandbox_init() {
-  if ! command -v bwrap >/dev/null 2>&1; then
-    return 1
-  fi
-  if ! command -v socat >/dev/null 2>&1; then
-    return 1
-  fi
-  if ! timeout 10 bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-parent true >/dev/null 2>&1; then
-    return 1
-  fi
-  return 0
-}

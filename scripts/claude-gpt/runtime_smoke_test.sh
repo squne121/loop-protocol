@@ -44,10 +44,23 @@ if [ "$PREFLIGHT_ENV_RC" -eq 3 ] || [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
 fi
 
 # =========================================================================
+# Phase 0: 実行環境確認（current user / cwd）
+#   AC1: root/sudo を使わず現行 Unix user のまま実行されていること。
+#   AC2: worktree directory を cwd としていること。
+# =========================================================================
+CURRENT_USER=$(id -un 2>/dev/null || whoami)
+CURRENT_UID=$(id -u 2>/dev/null || echo "-1")
+CURRENT_CWD=$(pwd -P)
+NOT_ROOT_OK=true
+if [ "$CURRENT_UID" = "0" ]; then
+  NOT_ROOT_OK=false
+fi
+
+# =========================================================================
 # Phase A: 構造確認（launch.sh --check-only）
 #   loopback bind / model alias 解決 / MCP 除外設定を実機確認する。
 #   preflight は env-only ではなく launch.sh 内部で実行される完全版（canonical_paths /
-#   read_restriction / sandbox_init が applicable:true の実検査結果）を使う（P0-1）。
+#   read_restriction が applicable:true の実検査結果）を使う（P0-1）。
 # =========================================================================
 LAUNCH_CHECK_STDERR=$(mktemp)
 LAUNCH_JSON=$("$SCRIPT_DIR/launch.sh" --check-only 2>"$LAUNCH_CHECK_STDERR")
@@ -62,7 +75,7 @@ if [ -f "$MCP_CONFIG_PATH" ] && grep -q '"mcpServers"' "$MCP_CONFIG_PATH" 2>/dev
 fi
 
 STRUCTURAL_OK=false
-if [ "$LAUNCH_RC" -eq 0 ] && [ "$MCP_CONFIG_OK" = "true" ]; then
+if [ "$LAUNCH_RC" -eq 0 ] && [ "$MCP_CONFIG_OK" = "true" ] && [ "$NOT_ROOT_OK" = "true" ]; then
   STRUCTURAL_OK=true
 fi
 
@@ -227,6 +240,12 @@ cat > "$EVIDENCE_FILE" <<EVIDENCE_JSON_EOF
   "schema": "CLAUDE_GPT_SMOKE_RESULT_V1",
   "status": "${STATUS}",
   "generated_at": "${TIMESTAMP}",
+  "runtime_environment": {
+    "not_root_ok": ${NOT_ROOT_OK},
+    "current_user": "$(json_escape "$CURRENT_USER")",
+    "current_uid": "${CURRENT_UID}",
+    "cwd": "$(json_escape "$CURRENT_CWD")"
+  },
   "structural_check": {
     "ok": ${STRUCTURAL_OK},
     "launch_check_only_rc": ${LAUNCH_RC},
