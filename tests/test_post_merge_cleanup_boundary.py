@@ -239,6 +239,66 @@ def test_report_validator_rejects_malformed_yaml():
     assert any("malformed YAML" in e for e in result.errors)
 
 
+# ── Issue #1523 fix_delta P1-2: additive optional discard_confirmation field ──
+
+
+def test_report_validator_accepts_absent_discard_confirmation_backward_compat():
+    """GIVEN a pre-#1523-shaped report (no discard_confirmation key at all)
+    WHEN validated THEN it still validates (backward compatible)."""
+    data = _valid_report()
+    assert "discard_confirmation" not in data
+    result = boundary.validate_report_v1(data)
+    assert result.valid, result.errors
+
+
+def test_report_validator_accepts_null_discard_confirmation():
+    data = _valid_report()
+    data["discard_confirmation"] = None
+    result = boundary.validate_report_v1(data)
+    assert result.valid, result.errors
+
+
+def test_report_validator_accepts_present_discard_confirmation():
+    data = _valid_report()
+    data["discard_confirmation"] = {
+        "contract_id": "a" * 32,
+        "contract_sha256": "b" * 64,
+        "pr_head_sha": "c" * 40,
+        "local_tip_sha": "d" * 40,
+        "local_only_commit_shas": ["d" * 40],
+        "expires_at": "2026-08-02T00:05:00Z",
+        "argv": ["uv", "run", "python3", "materialize_cleanup_contract.py"],
+    }
+    result = boundary.validate_report_v1(data)
+    assert result.valid, result.errors
+
+
+def test_report_validator_rejects_malformed_discard_confirmation_missing_subfield():
+    """A discard_confirmation present but missing a required sub-field fails validation."""
+    data = _valid_report()
+    data["discard_confirmation"] = {
+        "contract_id": "a" * 32,
+        # contract_sha256 missing
+        "pr_head_sha": "c" * 40,
+        "local_tip_sha": "d" * 40,
+        "local_only_commit_shas": ["d" * 40],
+        "expires_at": "2026-08-02T00:05:00Z",
+        "argv": [],
+    }
+    result = boundary.validate_report_v1(data)
+    assert not result.valid
+    assert any("discard_confirmation" in e for e in result.errors)
+
+
+def test_report_validator_rejects_discard_confirmation_wrong_type():
+    data = _valid_report()
+    data["discard_confirmation"] = "not-a-dict-or-null"
+    result = boundary.validate_report_v1(data)
+    assert not result.valid
+    assert any("discard_confirmation" in e for e in result.errors)
+
+
+
 def test_report_validator_accepts_wrapped_schema_key():
     wrapped = {"POST_MERGE_CLEANUP_REPORT_V1": _valid_report()}
     import yaml

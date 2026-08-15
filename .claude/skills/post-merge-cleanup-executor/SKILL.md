@@ -147,7 +147,31 @@ materialize 不能になり、bare-git ルートは `--no-verify` 無しでは�
 
 削除できないものは `unresolved_cleanup_items` に記録する。
 
+**discard レーン routing（Issue #1523 fix_delta P1-2）**: `cleanup_exec` が `reason_code:
+pr_head_oid_mismatch`（または local-only 未公開コミットの discard candidate シグナル）を返した場合、
+worker は破壊的操作を一切実行せず、以下の non-destructive `--check` probe のみを実行する:
+
+```bash
+uv run --locked python3 scripts/agent-ops/materialize_cleanup_contract.py \
+  --pr-number <pr> --linked-issue-number <issue> \
+  --worktree-path <絶対 worktree path> --branch-name <branch> \
+  --operation local_only_discard --check --json
+```
+
+`status: confirmation_required` の場合は、続けて `--check` なしで同一 argv を発行し（`--operation
+local_only_discard`、`--check`/`--consume` いずれも付けない issuance 呼び出し）、target+SHA-bound
+immutable per-nonce contract を materialize する。この issuance 呼び出しの応答 JSON に含まれる
+`confirmation` block（`contract_id` / `contract_sha256` / `pr_head_sha` / `local_tip_sha` /
+`local_only_commit_shas` / `expires_at` / `argv`）を **そのまま** `POST_MERGE_CLEANUP_REPORT_V1` の
+`discard_confirmation` field へ転記し、レポートで人間に提示する。
+
+worker はこの `confirmation.argv`（`--consume --contract-id <nonce> --expected-contract-sha256 <digest>`
+を含む）を **自分では実行しない**。`--consume` は人間専用のコマンドであり
+（`scripts/agent-guards/worktree_scope_guard.py` の argv allowlist が agent 発行の `--consume` を deny
+する）、worker の責務は confirmation block を正確に報告することで完結する。
+
 ### 4. parent issue クローズ条件確認
+
 
 `merged_pr_number` から linked issue → parent issue を辿り、parent の他 child の状態を確認:
 
@@ -267,9 +291,22 @@ POST_MERGE_CLEANUP_REPORT_V1:
   stash_entry_ref: "<stash@{N} or null>"
   warnings: []
   errors: []
+  discard_confirmation: null | { ... }  # optional (Issue #1523 fix_delta P1-2)
 ```
 
-closed-key スキーマ: 上記トップレベルキー以外を含む YAML は不正とみなす（`scripts/check_post_merge_cleanup_boundary.py` の `validate_report_v1` を参照）。
+closed-key スキーマ: 上記トップレベルキー以外を含む YAML は不正とみなす（`scripts/check_post_merge_cleanup_boundary.py` の `validate_report_v1` を参照）。`discard_confirmation` は additive-only の optional field（Issue #1523 fix_delta P1-2）: discard candidate が見つからない通常の実行では `null`（または省略）。見つかった場合は `materialize_cleanup_contract.py` issuance 呼び出しが返した `confirmation` block をそのまま格納する:
+
+```yaml
+discard_confirmation:
+  contract_id: "<nonce>"
+  contract_sha256: "<sha256 hex>"
+  pr_head_sha: "<sha>"
+  local_tip_sha: "<sha>"
+  local_only_commit_shas: []
+  expires_at: "<ISO 8601>"
+  argv: []  # 人間が実行する --consume 完全コマンド。worker はこれを実行しない
+```
+
 
 ## Probe Scripts for Read-Only Git Operations / 読み取り専用 Git probe script
 

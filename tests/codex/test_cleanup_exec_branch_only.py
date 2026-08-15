@@ -1575,8 +1575,10 @@ class TestDiscardCandidate:
         assert verified["discard_candidate"] is False
 
 
+
 class TestDiscardConfirmAndConsume:
-    """AC2/AC3: target+SHA-bound, one-shot, expiring confirmation gates the destructive discard."""
+    """AC2/AC3: target+SHA-bound, one-shot, expiring, digest-bound (fix_delta P0-1) confirmation
+    gates the destructive discard."""
 
     def test_consume_without_confirmation_refused(self, repo_discard_candidate):
         """GIVEN no contract materialized WHEN consume attempted THEN refused, nothing deleted."""
@@ -1588,7 +1590,9 @@ class TestDiscardConfirmAndConsume:
             patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
             patch.object(_ce, "_pr_state", return_value=fake_pr),
         ):
-            result = run_discard_consume(req, project_root=repo["root"])
+            result = run_discard_consume(
+                req, project_root=repo["root"], contract_id="a" * 32, expected_contract_sha256="b" * 64
+            )
 
         assert result["status"] == "refused"
         assert result["reason_code"] == CLEANUP_CONTRACT_CONSUMED
@@ -1596,7 +1600,8 @@ class TestDiscardConfirmAndConsume:
         assert Path(repo["worktree_path"]).exists()
 
     def test_confirm_then_consume_performs_discard(self, repo_discard_candidate):
-        """GIVEN materialized contract WHEN consumed THEN worktree+branch removed, actions recorded."""
+        """GIVEN materialized contract WHEN consumed with the shown contract_id/digest
+        THEN worktree+branch removed, actions recorded."""
         repo = repo_discard_candidate
         req = _make_discard_req(repo)
         fake_pr = _fake_discard_pr(repo)
@@ -1614,8 +1619,14 @@ class TestDiscardConfirmAndConsume:
                 project_root=repo["root"],
             )
             assert mat["status"] == "ok", mat
+            confirmation = mat["confirmation"]
 
-            result = run_discard_consume(req, project_root=repo["root"])
+            result = run_discard_consume(
+                req,
+                project_root=repo["root"],
+                contract_id=confirmation["contract_id"],
+                expected_contract_sha256=confirmation["contract_sha256"],
+            )
 
         assert result["status"] == "ok", result
         assert result["actions_taken"] == [OP_WORKTREE_REMOVE, OP_BRANCH_DELETE]
@@ -1646,11 +1657,22 @@ class TestDiscardConfirmAndConsume:
                 project_root=repo["root"],
             )
             assert mat["status"] == "ok", mat
+            confirmation = mat["confirmation"]
 
-            first = run_discard_consume(req, project_root=repo["root"])
+            first = run_discard_consume(
+                req,
+                project_root=repo["root"],
+                contract_id=confirmation["contract_id"],
+                expected_contract_sha256=confirmation["contract_sha256"],
+            )
             assert first["status"] == "ok", first
 
-            second = run_discard_consume(req, project_root=repo["root"])
+            second = run_discard_consume(
+                req,
+                project_root=repo["root"],
+                contract_id=confirmation["contract_id"],
+                expected_contract_sha256=confirmation["contract_sha256"],
+            )
 
         assert second["status"] == "refused"
         assert second["reason_code"] == CLEANUP_CONTRACT_CONSUMED
@@ -1678,10 +1700,16 @@ class TestDiscardConfirmAndConsume:
                 project_root=repo["root"],
             )
             assert mat["status"] == "ok", mat
+            confirmation = mat["confirmation"]
 
             time.sleep(1.2)
 
-            result = run_discard_consume(req, project_root=repo["root"])
+            result = run_discard_consume(
+                req,
+                project_root=repo["root"],
+                contract_id=confirmation["contract_id"],
+                expected_contract_sha256=confirmation["contract_sha256"],
+            )
 
         assert result["status"] == "refused"
         assert result["actions_taken"] == []
@@ -1706,13 +1734,19 @@ class TestDiscardConfirmAndConsume:
                 project_root=repo["root"],
             )
             assert mat["status"] == "ok", mat
+            confirmation = mat["confirmation"]
 
             # Move the branch tip AFTER the contract was issued (race condition).
             (Path(repo["worktree_path"]) / "another.txt").write_text("more work\n")
             _git("add", "another.txt", cwd=repo["worktree_path"])
             _git("commit", "-q", "-m", "wip: even more local-only work", cwd=repo["worktree_path"])
 
-            result = run_discard_consume(req, project_root=repo["root"])
+            result = run_discard_consume(
+                req,
+                project_root=repo["root"],
+                contract_id=confirmation["contract_id"],
+                expected_contract_sha256=confirmation["contract_sha256"],
+            )
 
         assert result["status"] == "refused"
         assert result["reason_code"] == DISCARD_SHA_BINDING_CHANGED
@@ -1739,7 +1773,8 @@ class TestDiscardConfirmAndConsume:
             )
         assert mat["status"] == "ok", mat
 
-        contract_path = Path(repo["root"]) / "artifacts" / "agent-ops" / "cleanup_contract.json"
+        contract_id = mat["confirmation"]["contract_id"]
+        contract_path = Path(repo["root"]) / "artifacts" / "agent-ops" / "cleanup-contracts" / f"{contract_id}.json"
         import json as _json
         contract = _json.loads(contract_path.read_text())
         assert contract["operation"] == OP_LOCAL_ONLY_DISCARD
@@ -1747,6 +1782,99 @@ class TestDiscardConfirmAndConsume:
         assert contract["branch_name"] == repo["branch_name"]
         assert contract["pr_head_sha"] == repo["pr_head_sha"]
         assert contract["local_tip_sha"] == repo["local_tip_sha"]
+
+    def test_two_contracts_coexist_and_mismatched_confirmation_rejected(self, repo_discard_candidate):
+        """P0-1 item 5: a second contract issued at a fresh nonce coexists with the first
+        (per-nonce immutable files, no overwrite); consuming with A's contract_id but B's
+        digest (a mismatched confirmation) is rejected, and A's own exact confirmation
+        succeeds and acts only on A's bound data."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            mat_a = materialize(
+                pr_number=req["pr_number"],
+                linked_issue_number=req["linked_issue_number"],
+                worktree_path=req["worktree_path"],
+                branch_name=req["branch_name"],
+                operation=OP_LOCAL_ONLY_DISCARD,
+                project_root=repo["root"],
+            )
+            assert mat_a["status"] == "ok", mat_a
+            mat_b = materialize(
+                pr_number=req["pr_number"],
+                linked_issue_number=req["linked_issue_number"],
+                worktree_path=req["worktree_path"],
+                branch_name=req["branch_name"],
+                operation=OP_LOCAL_ONLY_DISCARD,
+                project_root=repo["root"],
+            )
+            assert mat_b["status"] == "ok", mat_b
+
+            conf_a = mat_a["confirmation"]
+            conf_b = mat_b["confirmation"]
+            assert conf_a["contract_id"] != conf_b["contract_id"]
+            assert conf_a["contract_sha256"] != conf_b["contract_sha256"]
+            contracts_dir = Path(repo["root"]) / "artifacts" / "agent-ops" / "cleanup-contracts"
+            assert (contracts_dir / f"{conf_a['contract_id']}.json").exists()
+            assert (contracts_dir / f"{conf_b['contract_id']}.json").exists()
+
+            mismatched = run_discard_consume(
+                req,
+                project_root=repo["root"],
+                contract_id=conf_a["contract_id"],
+                expected_contract_sha256=conf_b["contract_sha256"],
+            )
+            assert mismatched["status"] == "refused"
+            assert mismatched["reason_code"] == "discard_contract_sha_mismatch"
+            assert Path(repo["worktree_path"]).exists()
+
+            result_a = run_discard_consume(
+                req,
+                project_root=repo["root"],
+                contract_id=conf_a["contract_id"],
+                expected_contract_sha256=conf_a["contract_sha256"],
+            )
+            assert result_a["status"] == "ok", result_a
+            assert (contracts_dir / f"{conf_b['contract_id']}.json").exists()
+
+    def test_consume_missing_contract_id_or_digest_refused(self, repo_discard_candidate):
+        """P0-1: --consume without both contract_id and expected_contract_sha256 is refused."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            mat = materialize(
+                pr_number=req["pr_number"],
+                linked_issue_number=req["linked_issue_number"],
+                worktree_path=req["worktree_path"],
+                branch_name=req["branch_name"],
+                operation=OP_LOCAL_ONLY_DISCARD,
+                project_root=repo["root"],
+            )
+            assert mat["status"] == "ok", mat
+            confirmation = mat["confirmation"]
+
+            missing_digest = run_discard_consume(
+                req, project_root=repo["root"], contract_id=confirmation["contract_id"]
+            )
+            missing_id = run_discard_consume(
+                req, project_root=repo["root"], expected_contract_sha256=confirmation["contract_sha256"]
+            )
+
+        assert missing_digest["status"] == "refused"
+        assert missing_digest["reason_code"] == "discard_contract_id_required"
+        assert missing_id["status"] == "refused"
+        assert missing_id["reason_code"] == "discard_contract_id_required"
+        assert Path(repo["worktree_path"]).exists()
 
 
 class TestDiscardResultAdditive:
@@ -1767,3 +1895,195 @@ class TestDiscardResultAdditive:
             assert key in result, f"missing base CLEANUP_EXEC_RESULT_V1 key: {key}"
         assert result["schema"] == "CLEANUP_EXEC_RESULT_V1"
         assert result["discard_lane"] is True
+
+
+class TestDiscardInLockRaceGuard:
+    """Fix_delta P0-2: TOCTOU-closing re-verification INSIDE the shared mutation lock,
+    immediately before the destructive worktree-remove / branch-delete calls. Each test
+    injects a race via ``_ce._DISCARD_RACE_HOOK`` — a seam invoked right after the lock is
+    acquired but before the in-lock re-checks — and asserts the destructive calls do NOT
+    proceed and the injected state survives."""
+
+    def _materialize_and_get_confirmation(self, repo, req, fake_pr):
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            mat = materialize(
+                pr_number=req["pr_number"],
+                linked_issue_number=req["linked_issue_number"],
+                worktree_path=req["worktree_path"],
+                branch_name=req["branch_name"],
+                operation=OP_LOCAL_ONLY_DISCARD,
+                project_root=repo["root"],
+            )
+        assert mat["status"] == "ok", mat
+        return mat["confirmation"]
+
+    def test_untracked_file_appears_after_check_worktree_remove_refused(
+        self, repo_discard_candidate, monkeypatch
+    ):
+        """(a) an untracked file appears after the clean-state check: plain
+        ``git worktree remove`` (no --force) refuses due to git's own dirty-check."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+        confirmation = self._materialize_and_get_confirmation(repo, req, fake_pr)
+
+        def race_hook(project_root, worktree_real, branch_name, contract):
+            (Path(worktree_real) / "untracked_race.txt").write_text("surprise\n")
+
+        monkeypatch.setattr(_ce, "_DISCARD_RACE_HOOK", race_hook)
+        try:
+            with (
+                patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+                patch.object(_ce, "_pr_state", return_value=fake_pr),
+            ):
+                result = run_discard_consume(
+                    req,
+                    project_root=repo["root"],
+                    contract_id=confirmation["contract_id"],
+                    expected_contract_sha256=confirmation["contract_sha256"],
+                )
+        finally:
+            monkeypatch.setattr(_ce, "_DISCARD_RACE_HOOK", None)
+
+        assert result["status"] == "error"
+        assert OP_WORKTREE_REMOVE not in result["actions_taken"]
+        assert Path(repo["worktree_path"]).exists(), "worktree must survive"
+        assert (Path(repo["worktree_path"]) / "untracked_race.txt").exists(), "the injected file must survive"
+
+    def test_tracked_file_modified_after_check_worktree_remove_refused(
+        self, repo_discard_candidate, monkeypatch
+    ):
+        """(b) a tracked file is modified after the check: plain ``git worktree remove``
+        refuses due to the dirty working tree."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+        confirmation = self._materialize_and_get_confirmation(repo, req, fake_pr)
+
+        def race_hook(project_root, worktree_real, branch_name, contract):
+            (Path(worktree_real) / "feature.txt").write_text("modified after check\n")
+
+        monkeypatch.setattr(_ce, "_DISCARD_RACE_HOOK", race_hook)
+        try:
+            with (
+                patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+                patch.object(_ce, "_pr_state", return_value=fake_pr),
+            ):
+                result = run_discard_consume(
+                    req,
+                    project_root=repo["root"],
+                    contract_id=confirmation["contract_id"],
+                    expected_contract_sha256=confirmation["contract_sha256"],
+                )
+        finally:
+            monkeypatch.setattr(_ce, "_DISCARD_RACE_HOOK", None)
+
+        assert result["status"] == "error"
+        assert OP_WORKTREE_REMOVE not in result["actions_taken"]
+        assert Path(repo["worktree_path"]).exists(), "worktree must survive"
+        assert (Path(repo["worktree_path"]) / "feature.txt").read_text() == "modified after check\n"
+
+    def test_new_commit_lands_after_check_branch_survives(self, repo_discard_candidate, monkeypatch):
+        """(c) a new commit lands (on the SAME worktree/branch) after the check: the
+        worktree may be removed (no uncommitted changes), but the CAS branch-delete
+        (compare-and-delete on the pre-race expected tip) must refuse, so the new
+        commit is not lost (the branch ref survives, still pointing at it)."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+        confirmation = self._materialize_and_get_confirmation(repo, req, fake_pr)
+
+        def race_hook(project_root, worktree_real, branch_name, contract):
+            (Path(worktree_real) / "even_more.txt").write_text("more work\n")
+            _git("add", "even_more.txt", cwd=worktree_real)
+            _git("commit", "-q", "-m", "wip: post-check commit", cwd=worktree_real)
+
+        monkeypatch.setattr(_ce, "_DISCARD_RACE_HOOK", race_hook)
+        try:
+            with (
+                patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+                patch.object(_ce, "_pr_state", return_value=fake_pr),
+            ):
+                result = run_discard_consume(
+                    req,
+                    project_root=repo["root"],
+                    contract_id=confirmation["contract_id"],
+                    expected_contract_sha256=confirmation["contract_sha256"],
+                )
+        finally:
+            monkeypatch.setattr(_ce, "_DISCARD_RACE_HOOK", None)
+
+        assert result["status"] == "error"
+        assert OP_BRANCH_DELETE not in result["actions_taken"]
+        branch_check = subprocess.run(
+            ["git", "-C", repo["root"], "rev-parse", "--verify", f"refs/heads/{repo['branch_name']}"],
+            capture_output=True, text=True,
+        )
+        assert branch_check.returncode == 0, "the branch (and its new commit) must survive"
+
+    def test_catalog_entry_changes_after_check_refused(self, repo_discard_candidate, monkeypatch):
+        """(d) the worktree catalog entry changes (branch rebound) after the check:
+        the in-lock branch-binding re-check refuses."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+        confirmation = self._materialize_and_get_confirmation(repo, req, fake_pr)
+
+        def race_hook(project_root, worktree_real, branch_name, contract):
+            _git("checkout", "-q", "-b", "issue-1523-discard-test-rebound", cwd=worktree_real)
+
+        monkeypatch.setattr(_ce, "_DISCARD_RACE_HOOK", race_hook)
+        try:
+            with (
+                patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+                patch.object(_ce, "_pr_state", return_value=fake_pr),
+            ):
+                result = run_discard_consume(
+                    req,
+                    project_root=repo["root"],
+                    contract_id=confirmation["contract_id"],
+                    expected_contract_sha256=confirmation["contract_sha256"],
+                )
+        finally:
+            monkeypatch.setattr(_ce, "_DISCARD_RACE_HOOK", None)
+
+        assert result["status"] == "error"
+        assert result["actions_taken"] == []
+        assert Path(repo["worktree_path"]).exists()
+
+    def test_contract_expires_during_lock_wait_refused(self, repo_discard_candidate, monkeypatch):
+        """(f) the contract expires during the lock-wait window: the in-lock fresh
+        expiry re-check refuses even though the pre-lock check passed."""
+        import datetime as _dt
+
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+        confirmation = self._materialize_and_get_confirmation(repo, req, fake_pr)
+
+        def race_hook(project_root, worktree_real, branch_name, contract):
+            contract["expires_at"] = (
+                _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=5)
+            ).isoformat().replace("+00:00", "Z")
+
+        monkeypatch.setattr(_ce, "_DISCARD_RACE_HOOK", race_hook)
+        try:
+            with (
+                patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+                patch.object(_ce, "_pr_state", return_value=fake_pr),
+            ):
+                result = run_discard_consume(
+                    req,
+                    project_root=repo["root"],
+                    contract_id=confirmation["contract_id"],
+                    expected_contract_sha256=confirmation["contract_sha256"],
+                )
+        finally:
+            monkeypatch.setattr(_ce, "_DISCARD_RACE_HOOK", None)
+
+        assert result["status"] == "error"
+        assert result["actions_taken"] == []
+        assert Path(repo["worktree_path"]).exists()

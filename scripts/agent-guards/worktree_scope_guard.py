@@ -272,13 +272,29 @@ _AGENT_OPS_ARG_SPECS = {
         "bool_flags": frozenset({"--json"}),
         "required": frozenset(),
     },
+    # Issue #1523 fix_delta P1-4: agent-issued ``--check`` (a non-destructive
+    # discard-lane probe) is explicitly ALLOWED here alongside plain issuance
+    # (no --check/--consume flag). Agent-issued ``--consume`` remains
+    # HUMAN-ONLY — ``--consume``, ``--contract-id``, and
+    # ``--expected-contract-sha256`` are deliberately ABSENT from both
+    # ``value_flags`` and ``bool_flags`` below, so ``_validate_agent_ops_argv``
+    # rejects (denies) ANY argv containing them (an unknown-flag argv fails the
+    # ``tok in bool_flags``/``tok in value_flags`` membership check and returns
+    # False), mirroring the same pattern already used to keep
+    # ``--project-root`` / ``--no-verify`` out of ``cleanup_exec.py``'s spec.
+    # This is resistant to alias/wrapper/``--flag=value``/duplicate-flag/
+    # env-var-prefix bypass by construction: ``_validate_agent_ops_argv``
+    # rejects ``=`` forms unconditionally, rejects duplicate flags via the
+    # ``seen`` set, and only ever inspects THIS argv (an alias/wrapper/env
+    # prefix does not change the literal token stream the guard receives).
     "scripts/agent-ops/materialize_cleanup_contract.py": {
         "value_flags": frozenset(
             {"--pr-number", "--linked-issue-number", "--worktree-path", "--branch-name", "--operation", "--ttl-seconds"}
         ),
-        "bool_flags": frozenset({"--json"}),
+        "bool_flags": frozenset({"--json", "--check"}),
         "required": frozenset({"--pr-number", "--worktree-path", "--branch-name"}),
     },
+
     "scripts/agent-ops/git_ref_probe.py": {
         "value_flags": frozenset({"--branch", "--remote"}),
         "bool_flags": frozenset({"--json"}),

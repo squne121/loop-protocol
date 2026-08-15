@@ -154,6 +154,21 @@ def canonical_command_hash(argv: list[str], operation: str, project_root: str, n
     return hashlib.sha256(blob).hexdigest()
 
 
+def discard_real_argv(worktree_path: str, branch_name: str, local_tip_sha: str) -> list[list[str]]:
+    """The ACTUAL two subprocess argv arrays ``_perform_discard`` executes (Issue
+    #1523 fix_delta P0-1 item 4) — used as the ``command_hash`` binding input
+    for the discard lane instead of a synthetic never-executed ``&&`` string.
+
+    ``update-ref -d`` is compare-and-delete on ``local_tip_sha`` (the old OID),
+    matching the P0-2 fix's CAS branch deletion.
+    """
+    return [
+        ["git", "worktree", "remove", worktree_path],
+        ["git", "update-ref", "-d", f"refs/heads/{branch_name}", local_tip_sha],
+    ]
+
+
+
 def _is_hex_sha256(value: object) -> bool:
     if not isinstance(value, str) or len(value) != 64:
         return False
@@ -570,3 +585,191 @@ def discard_claimed(project_root: str, claimed_name: str) -> None:
 def v2_fallback_forbidden(project_root: str) -> bool:
     """True iff a durable consume tombstone exists; forbids legacy V2 downgrade (Blocker 3)."""
     return os.path.lexists(os.path.join(project_root, TOMBSTONE_REL_PATH))
+
+
+# ── Per-nonce immutable discard-lane contracts (Issue #1523 fix_delta P0-1) ────
+# The discard lane's human-confirmation contract MUST be bound to one immutable
+# file per nonce (``artifacts/agent-ops/cleanup-contracts/<nonce>.json``) rather
+# than the single fixed-path file above, so a contract cannot be silently
+# replaced (temp-file + rename to the SAME final path) between issuance and
+# consumption. A human's ``--consume --contract-id <nonce> --expected-contract-sha256
+# <digest>`` invocation therefore always claims/consumes the EXACT contract
+# instance they reviewed, never whatever currently happens to sit at a shared
+# fixed path.
+DISCARD_CONTRACTS_DIR_REL = "artifacts/agent-ops/cleanup-contracts"
+CONTRACT_ID_MIN_LEN = 16
+
+
+def discard_contract_rel_path(contract_id: str) -> str:
+    """Relative path of the immutable per-nonce discard contract file."""
+    return f"{DISCARD_CONTRACTS_DIR_REL}/{contract_id}.json"
+
+
+def is_valid_contract_id(contract_id: object) -> bool:
+    """True iff ``contract_id`` is a plausible nonce (hex, bounded length)."""
+    if not isinstance(contract_id, str) or len(contract_id) < CONTRACT_ID_MIN_LEN or len(contract_id) > 128:
+        return False
+    try:
+        int(contract_id, 16)
+    except ValueError:
+        return False
+    return contract_id == contract_id.lower()
+
+
+def contract_content_sha256(contract: dict) -> str:
+    """SHA-256 digest of the canonical (sorted-key) contract content.
+
+    This is the ``contract_sha256`` a human is shown at issuance time and must
+    supply back via ``--expected-contract-sha256`` at consume time — it binds
+    the human's confirmation to the EXACT immutable contract instance, not just
+    its nonce/path.
+    """
+    blob = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def write_contract_create_only(project_root: str, rel_path: str, data: dict) -> None:
+    """Durably write JSON to ``project_root/rel_path`` WITHOUT ever replacing an
+    existing file at that path (create-no-replace).
+
+    Unlike ``write_json_durably`` (temp-file + rename to a SHARED fixed final
+    name, which can silently replace a not-yet-consumed contract), this opens
+    the FINAL path itself with ``O_CREAT|O_EXCL`` — a second write to the same
+    ``rel_path`` (e.g. a nonce collision) raises ``FileExistsError`` rather than
+    overwriting. Symlink-safe via per-component ``O_NOFOLLOW`` dir-fd traversal.
+    """
+    rel_components = [c for c in rel_path.split("/") if c]
+    if not rel_components:
+        raise ValueError("empty rel_path")
+    final_name = rel_components[-1]
+    blob = (json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    dir_fd = _walk_to_dir(project_root, rel_components, create=True)
+    try:
+        fd = os.open(
+            final_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=dir_fd,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            written = 0
+            while written < len(blob):
+                written += os.write(fd, blob[written:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def peek_contract_at(project_root: str, rel_path: str) -> dict | None:
+    """Non-destructively read (without claiming) the contract at ``rel_path``.
+
+    Used ONLY to check a supplied digest against the live file BEFORE claiming
+    it (Issue #1523 fix_delta P0-1): claiming is a one-shot, non-reversible
+    action, so a caller-supplied digest MUST be checked first — otherwise an
+    attacker (or a typo) supplying a wrong digest would burn the one-shot claim
+    and permanently deny the legitimate holder of the correct digest. Returns
+    ``None`` on ANY absence/IO/parse error (never raises).
+    """
+    if not IO_CAPABLE:
+        return None
+    try:
+        raw = read_regular_file_nofollow(project_root, rel_path)
+    except (OSError, ValueError):
+        return None
+    try:
+        contract = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(contract, dict):
+        return None
+    return contract
+
+
+def claim_contract_at(project_root: str, rel_path: str) -> str | None:
+
+    """Atomic claim-first rename of a SPECIFIC (per-nonce) contract file.
+
+    Generalizes ``claim_contract()`` (which is hardcoded to the legacy fixed
+    ``SAFE_SCRATCH_CONTRACT_PATH``) to an arbitrary ``rel_path`` so the discard
+    lane's per-nonce immutable files get the same one-shot claim-first
+    semantics. Returns the claimed basename, or ``None`` if nothing could be
+    claimed (absent / already claimed / lost race / IO error / unsupported
+    platform).
+    """
+    if not IO_CAPABLE:
+        return None
+    rel_components = [c for c in rel_path.split("/") if c]
+    if not rel_components:
+        return None
+    final_name = rel_components[-1]
+    token = secrets.token_hex(8)
+    claimed_name = f".{final_name}.claimed.{os.getpid()}.{token}"
+    try:
+        dir_fd = _walk_to_dir(project_root, rel_components, create=False)
+    except OSError:
+        return None
+    try:
+        try:
+            os.rename(final_name, claimed_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError:
+            return None
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        return claimed_name
+    finally:
+        os.close(dir_fd)
+
+
+def read_claimed_at(
+    project_root: str, rel_dir: str, claimed_name: str, now: datetime | None = None
+) -> tuple[bool, dict | None, str | None]:
+    """Generalized ``read_claimed_contract`` for an arbitrary ``rel_dir``."""
+    if not IO_CAPABLE:
+        return False, None, CLEANUP_IO_UNSUPPORTED_PLATFORM
+    rel_path = f"{rel_dir}/{claimed_name}" if rel_dir else claimed_name
+    try:
+        raw = read_regular_file_nofollow(project_root, rel_path)
+    except (OSError, ValueError):
+        return False, None, "read_error"
+    try:
+        contract = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return False, None, "json_error"
+    ok, reason = validate_v3_contract(contract, now=now)
+    if not ok:
+        return False, None, reason
+    if is_expired(contract, now=now):
+        return False, None, CLEANUP_CONTRACT_EXPIRED
+    return True, contract, None
+
+
+def discard_claimed_at(project_root: str, rel_dir: str, claimed_name: str) -> None:
+    """Remove a claimed per-nonce contract file (generalized ``discard_claimed``)."""
+    if not IO_CAPABLE:
+        return
+    rel_components = [c for c in rel_dir.split("/") if c]
+    try:
+        if rel_components:
+            dir_fd = _walk_to_dir(project_root, rel_components, create=False)
+        else:
+            dir_fd = os.open(os.path.realpath(project_root), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        try:
+            os.unlink(claimed_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+    finally:
+        os.close(dir_fd)
+

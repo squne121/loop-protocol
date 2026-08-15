@@ -397,9 +397,13 @@ class TestSameInvocationFallbackRefusalMatrix:
         )
         assert check.returncode == 0, "branch must survive when re-authorization is refused"
 
-    def test_same_invocation_fallback_succeeds_when_reauthorized(self, repo_normal_worktree, monkeypatch):
-        """GIVEN worktree_remove succeeds, branch -d fails, but re-authorization SUCCEEDS,
-        WHEN run() called THEN status ok and actions include worktree_remove + branch_delete."""
+    def test_same_invocation_fallback_succeeds_when_reauthorized_and_non_ancestor(
+        self, repo_normal_worktree, monkeypatch
+    ):
+        """GIVEN worktree_remove succeeds, branch -d fails, re-authorization SUCCEEDS, AND
+        merge-base --is-ancestor structurally confirms NON-ancestry (exit 1, the genuine
+        squash-merge shape this lane exists for) WHEN run() called THEN status ok and
+        actions include worktree_remove + branch_delete (fix_delta P1-3)."""
         repo = repo_normal_worktree
         req = _make_req(repo)
         fake_pr = _make_merged_pr(repo["branch_name"], repo["branch_tip"])
@@ -413,6 +417,13 @@ class TestSameInvocationFallbackRefusalMatrix:
                     stdout = ""
                     stderr = "error: The branch is not fully merged."
                 return _Fail()
+            if "merge-base" in args and "--is-ancestor" in args:
+                # Simulate the genuine squash-merge shape: NOT a git-visible ancestor.
+                class _NonAncestor:
+                    returncode = 1
+                    stdout = ""
+                    stderr = ""
+                return _NonAncestor()
             return original_git(args, deadline, maximum)
 
         monkeypatch.setattr(_ce, "_git", spy_git)
@@ -430,3 +441,155 @@ class TestSameInvocationFallbackRefusalMatrix:
             capture_output=True, text=True,
         )
         assert check.returncode != 0, "branch must be deleted on successful re-authorization"
+
+    def test_same_invocation_fallback_refused_when_ancestry_exit_code_zero(
+        self, repo_normal_worktree, monkeypatch
+    ):
+        """Fix_delta P1-3: GIVEN worktree_remove succeeds, branch -d fails, AND
+        merge-base --is-ancestor returns exit code 0 (mergedness IS structurally
+        established) WHEN run() called THEN the SAME-INVOCATION path must NOT escalate
+        to force-delete — the original branch -d failure was NOT "not fully merged" and
+        must not be papered over. Result preserves the ORIGINAL branch_delete_failed
+        reason code, actions_taken stays worktree_remove-only, the branch survives, and
+        no update-ref -d subprocess is ever invoked."""
+        repo = repo_normal_worktree
+        req = _make_req(repo)
+        fake_pr = _make_merged_pr(repo["branch_name"], repo["branch_tip"])
+
+        original_git = _ce._git
+        captured_update_ref_calls: list[list[str]] = []
+
+        def spy_git(args, deadline, maximum=10.0):
+            if "update-ref" in args:
+                captured_update_ref_calls.append(list(args))
+            if args[:3] == ["-C", repo["root"], "branch"] and "-d" in args and "-D" not in args:
+                class _Fail:
+                    returncode = 1
+                    stdout = ""
+                    stderr = "error: The branch is not fully merged."
+                return _Fail()
+            # Default (real) git resolves merge-base --is-ancestor for this
+            # fixture's real-merge branch tip to exit code 0 (ordinary ancestor).
+            return original_git(args, deadline, maximum)
+
+        monkeypatch.setattr(_ce, "_git", spy_git)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            result = run(req, project_root=repo["root"])
+
+        assert result["status"] == "error"
+        assert result["reason_code"].startswith("branch_delete_failed")
+        assert result["actions_taken"] == [OP_WORKTREE_REMOVE]
+        assert captured_update_ref_calls == [], (
+            "force-delete subprocess must never be invoked when ancestry exit code is 0"
+        )
+
+        check = subprocess.run(
+            ["git", "-C", repo["root"], "rev-parse", "--verify", f"refs/heads/{repo['branch_name']}"],
+            capture_output=True, text=True,
+        )
+        assert check.returncode == 0, "branch must survive when same-invocation ancestry is not confirmed"
+
+
+
+# ─── P0-3: in-lock worktree catalog / branch-usage re-check ───────────────────
+
+
+class TestBranchOnlyInLockCatalogRecheck:
+    def test_branch_only_delete_refused_when_branch_checked_out_between_authorization_and_lock(
+        self, repo_branch_only, monkeypatch
+    ):
+        """Fix_delta P0-3: GIVEN the pre-lock authorization check passed, but another
+        worktree checks out the SAME branch immediately after the shared mutation lock is
+        acquired (and before the delete), WHEN ``_perform_branch_only`` runs THEN the
+        delete is refused, the branch ref survives, and the new worktree remains intact."""
+        repo = repo_branch_only
+        req = _make_req(repo)
+        fake_pr = _make_merged_pr(repo["branch_name"], repo["branch_tip"])
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            ok_b, reason_b, verified_b = verify_branch_only_cleanup_authorization(
+                req, repo["root"], Deadline(30.0)
+            )
+        assert ok_b is True, f"expected branch-only authorization to succeed: {reason_b} {verified_b}"
+        expected_oid = verified_b["local_branch_tip_oid"]
+
+        other_wt = Path(repo["root"]) / ".claude" / "worktrees" / "issue-1523-branch-only-racer"
+
+        def race_hook(project_root, branch_name):
+            # Simulate another process checking the SAME branch out into a NEW
+            # worktree in the window between pre-lock authorization and the
+            # in-lock delete.
+            _git("worktree", "add", "-q", str(other_wt), branch_name, cwd=project_root)
+
+        monkeypatch.setattr(_ce, "_BRANCH_ONLY_RACE_HOOK", race_hook)
+        try:
+            actions, error = _perform_branch_only(
+                repo["branch_name"], expected_oid, "main", repo["root"], Deadline(30.0)
+            )
+        finally:
+            monkeypatch.setattr(_ce, "_BRANCH_ONLY_RACE_HOOK", None)
+
+        assert actions == []
+        assert error == _ce.BRANCH_CHECKED_OUT_IN_WORKTREE
+        live_tip = _rev_parse(repo["root"], f"refs/heads/{repo['branch_name']}")
+        assert live_tip == expected_oid, "branch ref must survive"
+        assert other_wt.exists(), "the racing worktree must remain intact"
+
+
+# ─── P1-1: fail-closed mutation lock ───────────────────────────────────────────
+
+
+class TestMutationLockFailsClosed:
+    def test_lock_raises_when_fcntl_unavailable(self, repo_branch_only, monkeypatch):
+        """GIVEN fcntl is unavailable (simulated) WHEN the mutation lock is entered
+        THEN MutationLockError is raised (fail-closed, never silently proceeds)."""
+        monkeypatch.setattr(_ce, "fcntl", None)
+        with pytest.raises(_ce.MutationLockError) as exc_info:
+            with _ce._mutation_lock(repo_branch_only["root"]):
+                pytest.fail("must not yield when fcntl is unavailable")
+        assert exc_info.value.reason_code == _ce.MUTATION_LOCK_FAILED
+
+    def test_lock_raises_when_lock_file_open_fails(self, repo_branch_only, monkeypatch):
+        """GIVEN the lock file cannot be opened WHEN the mutation lock is entered
+        THEN MutationLockError is raised (fail-closed)."""
+        def boom(*args, **kwargs):
+            raise OSError("simulated open failure")
+
+        monkeypatch.setattr(_ce.os, "open", boom)
+        with pytest.raises(_ce.MutationLockError):
+            with _ce._mutation_lock(repo_branch_only["root"]):
+                pytest.fail("must not yield when the lock file cannot be opened")
+
+    def test_lock_raises_when_flock_exhausts_retry_budget(self, repo_branch_only, monkeypatch):
+        """GIVEN flock() always raises (another holder has the lock) WHEN the bounded
+        retry budget is exhausted THEN MutationLockError is raised (fail-closed, never
+        proceeds without a held lock)."""
+        def always_blocked(fd, flags):
+            raise BlockingIOError("simulated: another process holds the lock")
+
+        monkeypatch.setattr(_ce.fcntl, "flock", always_blocked)
+        with pytest.raises(_ce.MutationLockError):
+            with _ce._mutation_lock(repo_branch_only["root"], Deadline(0.2)):
+                pytest.fail("must not yield when flock never succeeds")
+
+    def test_lock_uses_git_common_dir_not_hardcoded_git_path(self, repo_branch_only):
+        """Fix_delta P1-1: the lock path is resolved via
+        ``git rev-parse --git-common-dir`` (repository-identity-correct, works for
+        linked worktrees), not a hardcoded ``<root>/.git/...`` path."""
+        path = _ce._resolve_mutation_lock_path(repo_branch_only["root"], Deadline(10.0))
+        assert path == str(Path(repo_branch_only["root"]) / ".git" / _ce._MUTATION_LOCK_FILENAME)
+
+    def test_normal_lock_acquire_and_release_succeeds(self, repo_branch_only):
+        """GIVEN a healthy environment WHEN the mutation lock is entered and exited
+        THEN no exception is raised and the body executes exactly once."""
+        calls = []
+        with _ce._mutation_lock(repo_branch_only["root"], Deadline(10.0)):
+            calls.append(1)
+        assert calls == [1]
