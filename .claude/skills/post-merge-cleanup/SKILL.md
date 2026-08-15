@@ -127,6 +127,18 @@ executor（`post-merge-cleanup-executor` Skill）は branch / worktree の状態
 probe script の呼び出し手順そのものは executor 側の canonical body を参照し、本 orchestrator には
 複製しない。
 
+## Local-only unpublished commit discard lane（未公開 commit の破棄。Issue #1523）
+
+dedicated worktree に merged PR の head SHA を超える local-only commit が残っている場合（`cleanup_exec.py` が `pr_head_oid_mismatch` を返す状態のうち、PR head が local branch tip の祖先である候補）、worker / SubAgent は bare `git worktree remove --force` や bare `git branch -D` を実行しない。
+
+handoff は **executor（`materialize_cleanup_contract.py` / `cleanup_exec.py`）が生成した explicit human confirmation command だけ**とする。具体的には:
+
+1. worker は `materialize_cleanup_contract.py --operation local_only_discard ...`（引数なし＝発行のみ）を実行し、対象 PR・worktree realpath・branch・PR head SHA・local tip SHA・nonce・expiry に束縛された one-shot confirmation contract を発行する。この発行自体は破壊的操作ではなく、**agent 自身の承認とはみなさない**（one-shot contract の発行または検証だけでは削除は実行されない）。
+2. 実際に破棄を実行する `materialize_cleanup_contract.py --operation local_only_discard --consume` の実行は、人間が明示的に確認・実行する。
+3. `--consume` は claim-first の one-shot consume であり、confirmation 不在・期限切れ・replay・target SHA 不一致では拒否され、破壊的操作は一切実行されない。
+
+worker / SubAgent が独自に `git worktree remove --force` や `git branch -D` を直接組み立てて実行することは禁止する。
+
 ## Guardrails / ガードレール（orchestrator 側）
 
 - follow-up 起票は main thread（本 orchestrator）でのみ実行する。worker / executor 側は候補列挙のみで `gh issue create` を直接呼び出さない

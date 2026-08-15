@@ -100,6 +100,26 @@ _SUPERSEDED_PR_KEYS: dict[str, tuple[type, ...]] = {
     "url": (str,),
 }
 
+# Issue #1523 fix_delta P1-2: additive-only OPTIONAL top-level key. Absent or
+# ``None`` when no discard candidate was found (backward-compatible with
+# pre-#1523 reports that never emit this key at all). When present and not
+# ``None``, it MUST be a dict matching ``_DISCARD_CONFIRMATION_KEYS`` exactly
+# (closed-key, mirroring the confirmation block ``materialize_cleanup_contract.py``
+# emits for the discard lane's issuance response).
+_OPTIONAL_REPORT_KEYS: dict[str, tuple[type, ...]] = {
+    "discard_confirmation": (dict, type(None)),
+}
+_DISCARD_CONFIRMATION_KEYS: dict[str, tuple[type, ...]] = {
+    "contract_id": (str,),
+    "contract_sha256": (str,),
+    "pr_head_sha": (str, type(None)),
+    "local_tip_sha": (str, type(None)),
+    "local_only_commit_shas": (list,),
+    "expires_at": (str,),
+    "argv": (list,),
+}
+
+
 
 class ValidationResult:
     def __init__(self, valid: bool, errors: list[str] | None = None):
@@ -124,7 +144,8 @@ def validate_report_v1(data: Any) -> ValidationResult:
     if not isinstance(data, dict):
         return ValidationResult(False, [f"top-level payload must be a mapping, got {type(data).__name__}"])
 
-    unknown_keys = sorted(set(data.keys()) - set(_REPORT_REQUIRED_KEYS.keys()))
+    allowed_top_level_keys = set(_REPORT_REQUIRED_KEYS.keys()) | set(_OPTIONAL_REPORT_KEYS.keys())
+    unknown_keys = sorted(set(data.keys()) - allowed_top_level_keys)
     if unknown_keys:
         errors.append(f"unknown top-level key(s): {unknown_keys}")
 
@@ -140,7 +161,23 @@ def validate_report_v1(data: Any) -> ValidationResult:
             type_names = " | ".join(t.__name__ for t in expected_types)
             errors.append(f"key '{key}' expected type ({type_names}), got {type(value).__name__}")
 
+    for key, expected_types in _OPTIONAL_REPORT_KEYS.items():
+        if key not in data:
+            continue
+        value = data[key]
+        if not isinstance(value, expected_types):
+            type_names = " | ".join(t.__name__ for t in expected_types)
+            errors.append(f"key '{key}' expected type ({type_names}), got {type(value).__name__}")
+
+    if "discard_confirmation" in data and isinstance(data["discard_confirmation"], dict):
+        errors.extend(
+            _validate_closed_dict(
+                data["discard_confirmation"], "discard_confirmation", _DISCARD_CONFIRMATION_KEYS
+            )
+        )
+
     if "status" in data and isinstance(data["status"], str) and data["status"] not in _REPORT_ALLOWED_STATUS:
+
         errors.append(f"key 'status' has invalid value: {data['status']!r}")
 
     if "stash_restored" in data and isinstance(data["stash_restored"], str):

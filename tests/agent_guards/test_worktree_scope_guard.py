@@ -1754,6 +1754,55 @@ def test_agent_ops_tool_allowed_real_hook(tmp_path, script, extra_args):
     assert r.returncode == 0, f"agent-ops tool must allow; stderr={r.stderr}"
 
 
+def test_materialize_check_allowed_real_hook(tmp_path):
+    """P1-4: agent-issued check-flag probe on the discard lane is allowed."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1523", slug="x")
+    script = "scripts/agent-ops/materialize_cleanup_contract.py"
+    op_flag = "--operation local_only_discard --check"
+    cmd = f"uv run python3 {script} --json --pr-number 1 --worktree-path /tmp/wt --branch-name test-branch {op_flag}"
+    payload = _bash_payload(cmd, str(repo["root"]))
+    env3 = {}
+    env3["LOOP_ISSUE_NUMBER"] = "1523"
+    env3["CLAUDE_PROJECT_DIR"] = str(repo["root"])
+    r = _run_guard(payload, repo["root"], issue="1523", extra_env=env3)
+    assert r.returncode == 0, f"agent-issued check-flag must allow; stderr={r.stderr}"
+
+
+def _consume_argv_forms() -> list[str]:
+    placeholder_digest = "d" * 64
+    forms = []
+    base = "uv run python3 scripts/agent-ops/materialize_cleanup_contract.py"
+    forms.append(
+        base + " --json --pr-number 1 --worktree-path /tmp/wt --branch-name test-branch "
+        "--operation local_only_discard --consume --contract-id " + ("a" * 32)
+        + " --expected-contract-sha256 " + placeholder_digest
+    )
+    forms.append(
+        base + " --json --pr-number=1 --worktree-path=/tmp/wt --branch-name=test-branch "
+        "--operation=local_only_discard --consume"
+    )
+    forms.append(
+        base + " --json --pr-number 1 --pr-number 1 --worktree-path /tmp/wt --branch-name test-branch "
+        "--operation local_only_discard --consume"
+    )
+    return forms
+
+
+@pytest.mark.parametrize("consume_cmd", _consume_argv_forms())
+def test_materialize_consume_denied_real_hook(tmp_path, consume_cmd):
+    """P1-4: agent-issued consume flag (human-only, destructive) is DENIED in all
+    tested argv forms (bare, flag=value, duplicate-flag)."""
+    repo = _make_repo_with_worktree(tmp_path, issue="1523", slug="x")
+    payload = _bash_payload(consume_cmd, str(repo["root"]))
+    env4 = {}
+    env4["LOOP_ISSUE_NUMBER"] = "1523"
+    env4["CLAUDE_PROJECT_DIR"] = str(repo["root"])
+    r = _run_guard(payload, repo["root"], issue="1523", extra_env=env4)
+    assert r.returncode == 2, f"agent-issued consume flag must be denied; stderr={r.stderr}"
+
+
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -1773,7 +1822,10 @@ def test_agent_ops_tool_rejected_forms_real_hook(tmp_path, command):
 
 
 def test_agent_ops_tool_rejected_from_non_root(tmp_path):
+
     """AC3: agent-ops tool from a non-root cwd is not allowed by the exact class."""
+
+
     repo = _make_repo_with_worktree(tmp_path, issue="1137", slug="x")
     payload = _bash_payload("uv run python3 scripts/agent-ops/cleanup_exec.py --json", str(repo["worktree"]))
     env = {"CLAUDE_PROJECT_DIR": str(repo["root"]), "LOOP_ISSUE_NUMBER": "1137"}
