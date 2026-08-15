@@ -61,7 +61,7 @@ needs-fix を受け取ったとき:
 [Step 1: Investigation]      → codebase-investigator
 [Step 1b: Web research]      → web-researcher (conditional)
         ↓
-[Step 2: Review]             → issue-reviewer → ISSUE_REVIEW_RESULT_COMPACT_V1
+[Step 2: Review]             → issue-reviewer → root_review_pipeline(V2 delegate) → ISSUE_REVIEW_RESULT_COMPACT_V2
         ↓
  VERDICT を decide_next_loop_action.py にそのまま渡す（bounded decision, #1873）
    ├─ approve:
@@ -89,8 +89,12 @@ routing-critical フィールド（`scope_rollup_decision`、`scope_signal_guard
 `follow_up_materialization`、`superseded_decision`）の定義は `references/loop-state.md` が SSOT。
 orchestrator はこれらのフィールドを直接 prose 再判定しない。
 
-主要な consumer フィールドの例: `web_research:` (web-researcher 実行状態)。
-web_research 結果に含まれる `critical_claims` の未解決 claim は human_escalation へ倒す。
+主要な consumer フィールドの例: `web_research:` (web-researcher 実行状態) と
+`critical_claims`（planner の `critical_external_claims` を join 時だけ参照する互換名）。
+これは新しい永続 ledger ではなく、current planner result に束縛された consumer input
+である。未解決 external claim は、その decision dependency が `dispositive` で
+repository evidence が disposition を独立に決定できない場合だけ human_escalation
+候補になる。
 
 ## 手順 (Procedure)
 
@@ -176,7 +180,7 @@ planner exit 0 かつ `fail_closed.required == false` かつ `decisions.*.confid
 - `ARTIFACT:` の `refinement_preflight_result_v1` パスから `fail_closed` / `decisions` を参照する
 - `ARTIFACT:` の `planner_input` パスで planner へ渡した stdin JSON を確認できる
 
-`STATUS: blocked` または `STATUS: environment_failure` の場合は停止し、人間判断へ送る。`investigation_policy` / `web_research_policy` / `scope_signal_guard` / `follow_up_materialization` の判定は planner を SSOT とし、このファイルで prose 再判定しない。
+`STATUS: blocked` または `STATUS: environment_failure` の場合は停止し、人間判断へ送る。ここでの `STATUS: environment_failure` は Step 0f preflight の repository/environment failure であり、Step 1b の external evidence provider transport status とは別である。`investigation_policy` / `web_research_policy` / `scope_signal_guard` / `follow_up_materialization` の判定は planner を SSOT とし、このファイルで prose 再判定しない。
 
 `scope_signal_guard.triggered: true` が含まれる場合でも、preflight 完了直後は
 `decide_next_loop_action.py` を呼ばない（#1873: `ISSUE_REFINEMENT_PHASE_STATE_V1`
@@ -207,25 +211,47 @@ anchor comment の fact-check 契約、`ANCHOR_COMMENT_CONTEXT_V1`、`ANCHOR_COM
 
 ### Step 1b: 外部Web調査 (Web Research)
 
-`REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy.required == true` の場合のみ `web-researcher` を起動する。orchestrator は `WEB_RESEARCH_RESULT_V1` を opaque に扱い、consumer field だけを `LOOP_STATE.web_research` へ反映する。retry / fallback / raw grounding state は保持しない。
+`REFINEMENT_LOOP_PLAN_V1.decisions.web_research_policy.required == true` の場合のみ `web-researcher` を起動する。外部 claim のハルシネーションまたは repository evidence だけでは解消できないエビデンス不足を切り分けるため、orchestrator は `WEB_RESEARCH_RESULT_V1` を opaque に扱い、consumer field だけを `LOOP_STATE.web_research` へ反映する。retry / fallback / raw grounding state は保持しない。
 
 Step 1（codebase-investigator）と Step 1b（web-researcher）は、両方が required の場合に並列実行できる。ただし両 SubAgent の結果を Step 2 前に合流させること。
 
-web-researcher が critical claim にエビデンスを示せず、ハルシネーション疑いと判定した場合は `human_escalation` に倒す（Step 5）。
+web-researcher は AGY-first / native Web fallback を内部で完結する。critical claim に一次資料エビデンスを示せず、両 route でも検証不能またはハルシネーション疑いと判定した場合だけ `human_escalation` に倒す（Step 5）。provider telemetry / provenance trace の不足だけを escalation 理由にしてはならない。
+
+Step 1 と Step 1b の完了後、main thread は current repository state、実 diff、実 test
+等の Step 1 evidence から `repository_decision` を組み立て、planner の
+`critical_external_claims[].role` と `WEB_RESEARCH_RESULT_V1` を
+`web_research.route` registry entry で join する。`non_dispositive` は repository
+evidence が requested disposition を独立に決定すると確認できた場合だけ使う。
+
+join result が `next_action: proceed` または `proceed_with_notes` なら Step 2 へ進む。
+後者は `transport_status: environment_failure` / `semantic_verdict: null` と
+unresolved risk を記録するが、それだけで Step 5 に進めない。dispositive claim が
+未解決、または repository decision が inconclusive の場合だけ
+`human_judgment_required` として Step 5 へ進む。web-researcher の retry/fallback、
+grounding trace、citation/provider provenance をこの consumer が再実装・保存しては
+ならない。consumer は `verification_route` の個々の値（`native_web` 等の producer 追加
+route を含む）を re-validate せず、`status: ok` かつ `verification_route` が非空なら
+transport/grounding 成功と扱う（詳細は `references/web-research-routing.md`）。
 
 詳細は `references/web-research-routing.md` を参照する。
 
 ### Step 2: レビュー (Review)
 
-`issue-reviewer` SubAgent が `review-issue` を実行し、`ISSUE_REVIEW_RESULT_COMPACT_V1` を返す。
+**producer I/O は root-owned、compact envelope 生成も含め単一 producer（Issue #2049 / merged PR #2135、AC8 SSOT を #2054 が拡張）**: live body fetch・body SHA 固定・`check_issue_contract` / `contract_readiness_check` / merge_readiness の実行・`ISSUE_REVIEW_RESULT_COMPACT_V2` compact envelope の生成・full artifact / compact artifact の canonical artifact directory への保存は、すべて orchestrator（main thread）が
+`.claude/skills/issue-refinement-loop/scripts/run_root_review_pipeline.py produce --issue-number <N> --repo <owner/repo>`
+（`root_review_pipeline.produce`, command_registry.py 登録済み、外部 CLI 契約は #2054 でも変更しない）を実行して行う。`produce` の内部実装は #2054 で `.claude/skills/issue-refinement-loop/scripts/reviewer_transport.py`（V2 契約 SSOT）へ委譲し、`ISSUE_REVIEW_RESULT_COMPACT_V1`（9行、`EVIDENCE` あり）ではなく `ISSUE_REVIEW_RESULT_COMPACT_V2`（`ATTEMPT_ID`/`ARTIFACT_SHA256` を含む exact 11行 grammar）を生成・永続化する。V1 producer（`compact_review_result.py` の compact 生成関数）は retired であり、同一 commit での atomic cutover に downgrade fallback はない。`produce` の JSON 出力には `compact_result.stdout_lines`（既に render・永続化済みの `ISSUE_REVIEW_RESULT_COMPACT_V2` 11 行）が含まれる。`issue-reviewer` SubAgent（`.codex/agents/issue-reviewer.toml`, `default_permissions: loop-protocol-readonly`）は orchestrator からこの `compact_result.stdout_lines` を明示的な read-only input として受け取り、そのまま自身の最終出力として relay するだけで、producer I/O を一切行わない。
 
-消費側契約 (consumer contract): `ISSUE_REVIEW_RESULT_COMPACT_V1`（正本 (SSOT): `.claude/skills/issue-refinement-loop/scripts/compact_review_result.py`）
+これは Issue #2049 の root-owned pipeline アーキテクチャ（child agent は producer I/O を一切行わない）を維持したまま、#2054 が compact envelope の wire format を V1 から V2 へ atomic cutover した変更である。`run_root_review_pipeline.py` は #2054 が新設する第二の producer pipeline ではなく、既存の `classify_child_stdout()` / `retry_once_on_transport_failure()` / `readback_persisted_artifact()` の内部実装を `reviewer_transport.py` へ委譲する形で単一の V2 契約実装へ統合されている（AC8）。ステップ単位の所有権表は `.claude/skills/review-issue/SKILL.md` の「Producer I/O ownership」節を参照する。
 
-**validator-first 順序（Issue #1507 AC23、routing table より前に評価する）**: orchestrator は approve / needs-fix いずれの経路でも、SubAgent（child）stdout の raw bytes を consume する前に、必ず `validate_review_compact_output.py`（`review_compact.validate`, command_registry.py 登録済み、`--issue-number` 必須引数）へ child の raw stdout bytes をそのまま（re-transcribe せず）渡し、`REVIEW_COMPACT_VALIDATION_RESULT_V1` を得る。**validator 完了前に `VERDICT` / `NEXT_ACTION` / `ARTIFACT` を読んではならない。** `validation_status != valid` の場合は routing を `human_judgment_required` に固定する（fail-closed）。validation が `valid` の場合のみ、`normalized_payload` を根拠に以下の routing table を評価する:
+**child stdout が 0 byte または malformed（非空だが不正）のときの扱い（AC4/AC5/AC6）**: orchestrator は `issue-reviewer` の raw stdout が 0 byte のまま返った場合でも、必ず `validate_review_compact_output.py`（内部実装は V2 契約 SSOT の `reviewer_transport.validate_compact_v2()` へ委譲、V2 grammar 専用）を呼ぶ（呼ばずに再試行やスキップをしない）。バリデータは `empty_input` violation に `classification: reviewer_transport_failure` を付与する。この classification を受けた場合、orchestrator は root producer（`issue-reviewer` SubAgent 呼び出し）を一度だけ再実行する。再実行後も `empty_input` / `reviewer_transport_failure` のままであれば、それ以上再試行せず `NEXT_ACTION: human_judgment_required` として Step 5 (human_escalation) へ倒す（`run_root_review_pipeline.retry_once_on_transport_failure()` が同じ一度だけ再試行のセマンティクスを実装する。この関数の `classify_child_stdout()` は V2 契約 SSOT の `reviewer_transport.validate_compact_v2()` を直接呼ぶ単一の実行経路であり、非空だが malformed な stdout も同じ `reviewer_transport_failure` として一度だけ再試行される — 別の簡易 classifier を持たない）。transport failure（spawn / timeout / signal / empty output / malformed output / artifact 書き込み・整合性失敗を含む）は常に `STATUS: environment_failure` / `semantic_verdict: null` に収束し、`human_judgment_required` として記録しない。symlink／root escape／attempt mismatch／hash mismatch は `integrity_failure` として区別する。
+
+消費側契約 (consumer contract): `ISSUE_REVIEW_RESULT_COMPACT_V2`（正本 (SSOT): `.claude/skills/issue-refinement-loop/scripts/reviewer_transport.py`）。V1（`ISSUE_REVIEW_RESULT_COMPACT_V1`、`compact_review_result.py`）は retired であり、partial deployment・downgrade fallback は禁止する。
+
+**validator-first 順序（AC4/AC6、routing table より前に評価する）**: orchestrator は approve / needs-fix いずれの経路でも、SubAgent（child）stdout の raw bytes を consume する前に、必ず `run_root_review_pipeline.py classify-child-stdout`（`--issue-number` / `--artifact-root` / `--repo` / `--expected-body-sha256` を渡す）へ child の raw stdout bytes をそのまま（re-transcribe せず）渡す。この単一エントリポイントが内部で `validate_review_compact_output.py`（V2 grammar 判定）→ `reviewer_transport.verify_artifact()`（trusted artifact root FD を起点に `O_DIRECTORY|O_NOFOLLOW` で component-wise open、同一 accepted leaf FD から一度だけ bounded raw bytes を読み、その同じ raw bytes で SHA-256・strict JSON・schema/repository/issue/reviewed body SHA/invocation/attempt を検証する。`Path.resolve()` → `stat()` → 別 `open()` という resolve/stat と open を分離した security fallback は行わない）→ `reviewer_transport.verify_wire_matches_artifact()`（検証済み artifact の `semantic_result` から wire を再導出し、child が relay した wire と byte 単位で一致することを確認する。ARTIFACT/ARTIFACT_SHA256 を変えずに VERDICT/BLOCKERS/NEXT_ACTION だけを自己整合的に書き換えた wire はここで `integrity_failure` として reject される）の順に評価する。**この一連の検証が完了する前に `VERDICT` / `NEXT_ACTION` / `ARTIFACT` を読んではならない。** `classification` が `ok` 以外（`reviewer_transport_failure` または `integrity_failure`）の場合は routing を `human_judgment_required` に固定する（fail-closed。`integrity_failure` は再試行しない）。`classification: ok` の場合のみ、`normalized_payload` を根拠に以下の routing table を評価する:
 
 - `VERDICT: approve` → Step 4.5 へ
 - `VERDICT: needs-fix` → `decide_next_loop_action.py`（rewrite 後 / next-action 決定時に呼ぶ、下記「LOOP_STATE」参照）へ VERDICT をそのまま渡す（**#1873: 旧 Step 2a Replay Arbitration は撤去された** — orchestrator は VERDICT を独立に再計算せず直接信頼する）
-- full structured data は `EVIDENCE:` / `ARTIFACT:` パスから取得する（main context には返らない、validator 通過後のみ参照可）
+- full structured data は parent-verified V2 artifact（`ARTIFACT: compact_review_result_v2=<path>`）から取得する（main context には返らない、validator と artifact binding 通過後のみ参照可）
 
 anchor comment により stale approval を無効化する場合も、raw snapshot は Step 4 に渡さず、正規化済み `anchor_comment_feedback` だけを渡す。
 
@@ -298,6 +324,8 @@ exit_code_3:
 
 - `STATUS: ok` / `BODY_HASH: <sha256>` → 更新成功、`NEXT_ACTION: proceed` で Step 2 に戻る
 - `STATUS: no_change` → 変更なし、`NEXT_ACTION: proceed` で Step 2 に戻る
+
+**final review gate（Issue #2049 AC10）**: `STATUS: ok` / `BODY_HASH` readback により本文更新が確認できた場合にのみ Step 2 の "final review"（この body revision に対する terminal VERDICT を決める review pass）を実行する。readback が未確認、または `run_root_review_pipeline.py readback` が `verdict_identity: false` を返す（persisted artifact が regular file でない / symlink である / strict JSON でない / `body_sha256` が一致しない / `verdict` が一致しない、のいずれか）間は final review を実行しない。`run_root_review_pipeline.py gate-final-review --artifact-path <path> --expected-body-sha256 <sha> --expected-verdict <verdict> --remote-update-ok` が `final_review_allowed: true` を返した場合にのみ次段階（Step 4.5）へ進める。
 - `STATUS: failed` → 修正失敗、`NEXT_ACTION: human_judgment_required`、Step 5 human_escalation へ
 - `partial_failure` は廃止。issue-editor は `ok` / `no_change` / `failed` の 3 値のみを返す。
 - full mutation result は `ARTIFACT:` パスから取得する（main context には返らない）

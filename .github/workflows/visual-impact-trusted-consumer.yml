@@ -70,9 +70,14 @@ jobs:
       # `resolve_visual_impact.py` / `visual-impact.schema.json` / any
       # `package.json` script.
       - name: Checkout base/default branch (never the candidate PR head)
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          persist-credentials: false
+          # actions/checkout keeps its GitHub token in RUNNER_TEMP and
+          # removes it during post-job cleanup. This is the supported Git
+          # transport path for the trusted-side object fetch below; no token
+          # value is interpolated into the fetch command or persisted as an
+          # artifact.
+          persist-credentials: true
 
       - uses: ./.github/actions/setup-python-uv
 
@@ -139,6 +144,10 @@ jobs:
       - name: Independently re-derive trusted-side inputs
         id: trusted
         if: ${{ steps.pr.outputs.pr_number != '' }}
+        # Preserve the derivation failure as a distinct diagnostic. The
+        # publishing step still runs and must not mislabel this as a producer
+        # artifact semantic rejection.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -150,33 +159,51 @@ jobs:
           LIVE_BASE_SHA="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.base.sha')"
           echo "live_base_sha=${LIVE_BASE_SHA}" >> "$GITHUB_OUTPUT"
 
-          git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" \
-            fetch --no-tags --depth=1 origin "${LIVE_BASE_SHA}" "${LIVE_HEAD_SHA}"
+          # Authentication is supplied by actions/checkout's persisted
+          # credential helper. Do not pass or echo a credential in this
+          # command: this trusted job only fetches commit objects as data.
+          git fetch --no-tags --depth=1 origin "${LIVE_BASE_SHA}" "${LIVE_HEAD_SHA}"
 
           gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""' > artifacts/trusted/pr_body.txt
 
+          # Issue #2099 AC6: no `|| true` fail-open here -- `set -euo
+          # pipefail` above makes a genuine `git diff` plumbing failure
+          # abort this step (and this step's `continue-on-error: true`
+          # already keeps the publish step reachable to report it as
+          # `trusted_input_derivation_failed`, never a silently-empty
+          # changed-path set).
           git diff --name-status -z --find-renames "${LIVE_BASE_SHA}" "${LIVE_HEAD_SHA}" \
-            > artifacts/trusted/name_status.nul || true
+            > artifacts/trusted/name_status.nul
           uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
             --mode changed-paths \
             --name-status-file artifacts/trusted/name_status.nul \
             --typed-output artifacts/trusted/changed_paths_typed.json > /dev/null
 
+          # Issue #2099 AC7: `--mode resolve-trusted-registry-blob`
+          # distinguishes "registry does not exist at this ref" (normal,
+          # exit 0, no output file) from any OTHER git plumbing failure
+          # (exit 1, fail-closed via `set -euo pipefail` above) -- see
+          # `read_git_blob_at_ref()` in resolve_visual_impact.py.
           REGISTRY_PATH="docs/dev/visual-surfaces.yml"
-          if git show "${LIVE_BASE_SHA}:${REGISTRY_PATH}" > artifacts/trusted/base_registry.yml 2>/dev/null; then
-            git rev-parse "${LIVE_BASE_SHA}:${REGISTRY_PATH}" > artifacts/trusted/base_registry_blob_sha.txt
-          else
-            rm -f artifacts/trusted/base_registry.yml artifacts/trusted/base_registry_blob_sha.txt
-          fi
-          if git show "${LIVE_HEAD_SHA}:${REGISTRY_PATH}" > artifacts/trusted/head_registry.yml 2>/dev/null; then
-            git rev-parse "${LIVE_HEAD_SHA}:${REGISTRY_PATH}" > artifacts/trusted/head_registry_blob_sha.txt
-          else
-            rm -f artifacts/trusted/head_registry.yml artifacts/trusted/head_registry_blob_sha.txt
-          fi
+          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+            --mode resolve-trusted-registry-blob \
+            --ref "${LIVE_BASE_SHA}" \
+            --path "${REGISTRY_PATH}" \
+            --output-file artifacts/trusted/base_registry.yml \
+            --blob-sha-output-file artifacts/trusted/base_registry_blob_sha.txt
+          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+            --mode resolve-trusted-registry-blob \
+            --ref "${LIVE_HEAD_SHA}" \
+            --path "${REGISTRY_PATH}" \
+            --output-file artifacts/trusted/head_registry.yml \
+            --blob-sha-output-file artifacts/trusted/head_registry_blob_sha.txt
 
       - name: Independently re-verify producer artifacts (base-locked evaluator)
         id: verify
-        if: ${{ steps.pr.outputs.pr_number != '' }}
+        if: ${{ steps.pr.outputs.pr_number != '' && steps.trusted.outcome == 'success' }}
+        # Keep publishing after a semantic rejection. `outcome` remains
+        # `failure` while continuation lets the publisher classify that result.
+        continue-on-error: true
         env:
           EXPECTED_HEAD_SHA: ${{ steps.pr.outputs.live_head_sha }}
           EXPECTED_BASE_SHA: ${{ steps.trusted.outputs.live_base_sha }}
@@ -184,7 +211,7 @@ jobs:
           EXPECTED_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           ARTIFACT_ROOT: ${{ steps.download.outputs.artifact_root }}
         run: |
-          set +e
+          set -euo pipefail
           DECISION_FILE="${ARTIFACT_ROOT}/decision/visual_impact_decision_v1.json"
           EVIDENCE_FILE="${ARTIFACT_ROOT}/evidence/visual_baseline_review_evidence_v2.json"
           [ -f "${DECISION_FILE}" ] || DECISION_FILE=""
@@ -208,10 +235,10 @@ jobs:
             --expected-pr-number "${EXPECTED_PR_NUMBER}" \
             --pr-body-file artifacts/trusted/pr_body.txt \
             --changed-paths-typed-file artifacts/trusted/changed_paths_typed.json \
+            --trusted-candidate-tree-ref "${EXPECTED_HEAD_SHA}" \
             "${EXTRA_ARGS[@]}" \
             --verdict-output verdict.json
-          echo "verify_exit_code=$?" >> "$GITHUB_OUTPUT"
-          cat verdict.json || true
+          cat verdict.json
 
       - name: Publish visual-impact-policy-trusted CheckRun bound to candidate PR head
         if: ${{ always() }}
@@ -221,7 +248,8 @@ jobs:
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           LIVE_HEAD_SHA: ${{ steps.pr.outputs.live_head_sha }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-          VERIFY_EXIT_CODE: ${{ steps.verify.outputs.verify_exit_code || '' }}
+          TRUSTED_OUTCOME: ${{ steps.trusted.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
         run: |
           set -euo pipefail
           # AC37: bind to the candidate PR's exact CURRENT (freshly
@@ -239,12 +267,20 @@ jobs:
               # publish a verdict for a head that is no longer current.
               CONCLUSION="failure"
               SUMMARY="visual-impact-policy-trusted: stale workflow_run (head_sha ${RUN_HEAD_SHA}) does not match current PR #${PR_NUMBER} head (${LIVE_HEAD_SHA}); rejected."
-            elif [ "${VERIFY_EXIT_CODE}" = "0" ]; then
+            elif [ "${TRUSTED_OUTCOME}" != "success" ]; then
+              CONCLUSION="failure"
+              SUMMARY="visual-impact-policy-trusted: trusted_input_derivation_failed; verifier_not_run for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
+            elif [ "${VERIFY_OUTCOME}" = "success" ]; then
               CONCLUSION="success"
               SUMMARY="visual-impact-policy-trusted: producer VISUAL_IMPACT_DECISION_V1 artifact and evidence manifest independently re-verified for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
-            else
+            elif [ "${VERIFY_OUTCOME}" = "failure" ]; then
               CONCLUSION="failure"
-              SUMMARY="visual-impact-policy-trusted: producer artifact failed independent re-verification for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA} (see verdict.json in this run's logs)."
+              SUMMARY="visual-impact-policy-trusted: producer_artifact_verification_rejected for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
+            else
+              # `skipped`, `cancelled`, or an absent outcome has no semantic
+              # verifier result and is not an artifact rejection.
+              CONCLUSION="failure"
+              SUMMARY="visual-impact-policy-trusted: verifier_not_run after trusted input derivation for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
             fi
           fi
           gh api "repos/${REPO}/check-runs" \

@@ -24,9 +24,11 @@ from skill_runtime_command_policy import (
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
     ExactSkillRuntimeCommand,
+    _is_safe_issue_artifact_path,
     command_allows_root_no_worktree,
     current_branch,
     is_exact_skill_runtime_anchor_executor_command,
+    is_exact_skill_runtime_anchor_fixture_executor_command,
     is_exact_skill_runtime_authority_transport_consume_executor_command,
     is_exact_skill_runtime_authority_transport_produce_executor_command,
     is_exact_skill_runtime_contract_update_anchor_executor_command,
@@ -797,7 +799,7 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     return resolved if name == "python3" else real
 
 
-def _sanitize_env(project_root: str) -> dict[str, str]:
+def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
     allowed_keys = {
         "GH_HOST",
         "GH_TOKEN",
@@ -815,6 +817,11 @@ def _sanitize_env(project_root: str) -> dict[str, str]:
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",
     }
+    # Only the closed offline fixture sibling may receive its isolated gh
+    # configuration directory.  Production command environments retain their
+    # existing allowlist and PATH/trusted-executable behavior.
+    if command_id == "preflight.run.fixture.with_human_context":
+        allowed_keys.add("GH_CONFIG_DIR")
     env = {
         key: value
         for key, value in os.environ.items()
@@ -1897,6 +1904,7 @@ def _emit_timeout_failure(
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         description="Privileged exact skill runtime executor", allow_abbrev=False
     )
@@ -1928,7 +1936,21 @@ def main(argv: list[str] | None = None) -> int:
     # reachable through this executor before this fix_delta).
     parser.add_argument("--authority-transport-path", required=False, default=None)
     parser.add_argument("--authority-expected", action="store_true", default=False)
-    args = parser.parse_args(argv)
+    # Argparse accepts duplicate options and keeps the final value.  Reject
+    # the raw outer grammar first so a malformed invocation can never be
+    # normalized into a valid child command.
+    sibling_id = "preflight.run.fixture.with_human_context"
+    if sibling_id in raw_argv or f"--command-id={sibling_id}" in raw_argv:
+        raw_command = " ".join(
+            ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL, *raw_argv]
+        )
+        if not is_exact_skill_runtime_anchor_fixture_executor_command(
+            raw_command, resolve_project_root(), resolve_project_root()
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+
+    args = parser.parse_args(raw_argv)
 
     project_root = resolve_project_root()
     stale_entries = _normalize_and_validate_runtime_env(project_root)
@@ -1936,6 +1958,9 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_stale_runtime_failure(args.issue_number, stale_entries)
 
     is_fixture_command = args.command_id == "preflight.run.fixture"
+    is_fixture_human_context_command = (
+        args.command_id == "preflight.run.fixture.with_human_context"
+    )
     is_anchor_command = args.command_id in {
         "preflight.run.with_anchor",
         "preflight.run.with_human_context",
@@ -1973,7 +1998,57 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if is_fixture_command:
+    if is_fixture_human_context_command:
+        if not args.fixture or not args.anchor_comment_url:
+            print(
+                "skill_runtime_exec: --fixture and --anchor-comment-url are required for "
+                "preflight.run.fixture.with_human_context",
+                file=sys.stderr,
+            )
+            return 2
+        if args.loop_state_file or args.review_result_verdict or args.max_iterations:
+            print("skill_runtime_exec: loop flags are not allowed for fixture human context", file=sys.stderr)
+            return 2
+        # Issue #2136 adversarial hardening (H3): validate the ORIGINAL,
+        # un-serialized argparse values directly (argv-native), in addition
+        # to (not instead of) the exact-parser gate below. The exact parser
+        # only sees a re-tokenized `" ".join(...)` + `shlex.split()` round
+        # trip of `command_tokens`, which is lossy for any value containing
+        # shell-lexer-significant characters -- a value the round trip
+        # mis-tokenizes could validate a different (truncated/shifted)
+        # substring than the one actually forwarded to `render_command()`
+        # and the real child subprocess below. Checking `args.fixture` /
+        # `args.investigation_evidence_transport_path` here, before any
+        # serialization, closes that validated-value-vs-used-value
+        # divergence for this command class.
+        if not _is_safe_issue_artifact_path(args.fixture, project_root, str(args.issue_number)):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+        if args.investigation_evidence_transport_path and not _is_safe_issue_artifact_path(
+            args.investigation_evidence_transport_path, project_root, str(args.issue_number)
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+        command_tokens = [
+            "uv", "run", "python3", SKILL_RUNTIME_EXEC_REL,
+            "--command-id", args.command_id,
+            "--issue-number", str(args.issue_number),
+            "--repo", args.repo,
+            "--fixture", args.fixture,
+            "--anchor-comment-url", args.anchor_comment_url,
+        ]
+        if args.investigation_evidence_transport_path:
+            command_tokens.extend([
+                "--investigation-evidence-transport-path",
+                args.investigation_evidence_transport_path,
+            ])
+        command_text = " ".join(command_tokens)
+        if not is_exact_skill_runtime_anchor_fixture_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    elif is_fixture_command:
         if not args.fixture:
             print("skill_runtime_exec: --fixture required for preflight.run.fixture", file=sys.stderr)
             return 2
@@ -2406,9 +2481,9 @@ def main(argv: list[str] | None = None) -> int:
             render_params["anchor_context_file"] = args.anchor_context_file
     else:
         render_params = {"issue_number": args.issue_number, "repo": args.repo}
-        if is_fixture_command:
+        if is_fixture_command or is_fixture_human_context_command:
             render_params["fixture"] = args.fixture
-        if is_anchor_command or is_contract_update_command:
+        if is_anchor_command or is_contract_update_command or is_fixture_human_context_command:
             render_params["anchor_comment_url"] = args.anchor_comment_url
             if args.investigation_evidence_transport_path:
                 render_params["investigation_evidence_transport_path"] = (
@@ -2421,7 +2496,7 @@ def main(argv: list[str] | None = None) -> int:
     supervision = _run_child_with_supervision(
         child_argv,
         cwd=project_root,
-        env=_sanitize_env(project_root),
+        env=_sanitize_env(project_root, args.command_id),
         timeout_seconds=timeout_seconds,
     )
     if supervision.timed_out:

@@ -26,6 +26,7 @@
     ".claude/skills/issue-refinement-loop/scripts/tests/",
     ".claude/skills/issue-refinement-loop/tests/",
     "schemas/tests/",
+    "tests/ci/",
     "scripts/ci/tests/",
     "scripts/agent-guards/tests/",
     "scripts/agent-ops/tests/",

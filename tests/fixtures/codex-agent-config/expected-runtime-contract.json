@@ -208,7 +208,7 @@
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-web-research",
       "runtime_dependency_status": "followup_required",
-      "runtime_followup_route": "agy_grounded_research_only",
+      "runtime_followup_route": "agy_grounded_research_with_native_web_fallback",
       "agy_builder_profiles": [
         "grounded_research"
       ],

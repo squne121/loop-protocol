@@ -12,6 +12,8 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -461,3 +463,134 @@ def test_job_permissions_are_minimal(workflow_doc: dict):
         for scope, level in permissions.items():
             if scope != "checks":
                 assert level == "read", f"unexpected write permission granted: {scope}={level}"
+
+
+def test_trusted_fetch_uses_checkout_managed_credentials(workflow_doc: dict):
+    """AC1/AC5: use checkout's supported authenticated Git path, never echo a token."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    checkout = next(step for step in steps if step.get("uses", "").startswith("actions/checkout"))
+    trusted = next(step for step in steps if step.get("id") == "trusted")
+
+    assert checkout.get("with", {}).get("persist-credentials") is True
+    assert trusted.get("continue-on-error") is True
+    assert "git fetch --no-tags --depth=1 origin" in trusted["run"]
+    assert "http.extraheader" not in trusted["run"]
+    assert "GH_TOKEN" not in trusted["run"]
+
+
+def test_checkout_is_pinned_to_the_v6_0_3_immutable_revision(workflow_doc: dict):
+    """GIVEN the privileged consumer, WHEN checkout runs, THEN its action ref is immutable."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    checkout = next(step for step in steps if step.get("uses", "").startswith("actions/checkout"))
+
+    assert checkout["uses"] == "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10"
+
+
+def test_trusted_failure_blocks_verifier_using_pre_continue_on_error_outcome(workflow_doc: dict):
+    """GIVEN trusted derivation fails, WHEN continuation is enabled, THEN verifier stays skipped."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    verify = next(step for step in steps if step.get("id") == "verify")
+    publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
+
+    assert verify["if"] == "${{ steps.pr.outputs.pr_number != '' && steps.trusted.outcome == 'success' }}"
+    assert "TRUSTED_OUTCOME" in publish["env"]
+    assert publish["env"]["TRUSTED_OUTCOME"] == "${{ steps.trusted.outcome }}"
+
+
+def test_verifier_failure_is_artifact_rejection_not_verifier_not_run(workflow_doc: dict):
+    """GIVEN verifier ran and failed, WHEN publishing, THEN reject the producer artifact."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    verify = next(step for step in steps if step.get("id") == "verify")
+    publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
+
+    assert verify.get("continue-on-error") is True
+    assert "VERIFY_EXIT_CODE" not in publish["env"]
+    assert publish["env"]["VERIFY_OUTCOME"] == "${{ steps.verify.outcome }}"
+    assert 'elif [ "${VERIFY_OUTCOME}" = "failure" ]; then' in publish["run"]
+    assert "trusted_input_derivation_failed" in publish["run"]
+    assert "producer_artifact_verification_rejected" in publish["run"]
+
+
+def test_skipped_or_cancelled_verifier_is_not_artifact_rejection(workflow_doc: dict):
+    """GIVEN verifier has no outcome, WHEN publishing, THEN report verifier_not_run."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
+    run = publish["run"]
+
+    failure_branch = run.index('elif [ "${VERIFY_OUTCOME}" = "failure" ]; then')
+    rejection_summary = run.index("producer_artifact_verification_rejected")
+    no_run_summary = run.index("verifier_not_run after trusted input derivation")
+    assert failure_branch < rejection_summary < no_run_summary
+
+
+def _run_publish_step(
+    workflow_doc: dict,
+    tmp_path: Path,
+    *,
+    trusted_outcome: str,
+    verify_outcome: str,
+) -> list[str]:
+    """Execute the publish shell with a fake `gh`, returning its captured argv."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
+    captured_args = tmp_path / "gh-args.txt"
+    fake_gh = tmp_path / "gh"
+    fake_gh.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > \"$FAKE_GH_ARGS\"\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FAKE_GH_ARGS": str(captured_args),
+        "GH_TOKEN": "test-token",
+        "REPO": EXPECTED_REPOSITORY,
+        "RUN_HEAD_SHA": EXPECTED_HEAD_SHA,
+        "LIVE_HEAD_SHA": EXPECTED_HEAD_SHA,
+        "PR_NUMBER": str(EXPECTED_PR_NUMBER),
+        "TRUSTED_OUTCOME": trusted_outcome,
+        "VERIFY_OUTCOME": verify_outcome,
+    }
+    result = subprocess.run(
+        ["bash", "-c", publish["run"]],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return captured_args.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.parametrize(
+    ("trusted_outcome", "verify_outcome", "expected_conclusion", "expected_reason"),
+    [
+        ("failure", "success", "failure", "trusted_input_derivation_failed; verifier_not_run"),
+        ("success", "success", "success", "independently re-verified"),
+        ("success", "failure", "failure", "producer_artifact_verification_rejected"),
+        ("success", "skipped", "failure", "verifier_not_run after trusted input derivation"),
+        ("success", "cancelled", "failure", "verifier_not_run after trusted input derivation"),
+        ("success", "", "failure", "verifier_not_run after trusted input derivation"),
+    ],
+)
+def test_publish_step_executes_failure_taxonomy(
+    workflow_doc: dict,
+    tmp_path: Path,
+    trusted_outcome: str,
+    verify_outcome: str,
+    expected_conclusion: str,
+    expected_reason: str,
+):
+    """GIVEN each outcome combination, WHEN publishing, THEN its CheckRun reason is exact."""
+    gh_args = _run_publish_step(
+        workflow_doc,
+        tmp_path,
+        trusted_outcome=trusted_outcome,
+        verify_outcome=verify_outcome,
+    )
+
+    assert f"conclusion={expected_conclusion}" in gh_args
+    summary = next(arg for arg in gh_args if arg.startswith("output[summary]="))
+    assert expected_reason in summary

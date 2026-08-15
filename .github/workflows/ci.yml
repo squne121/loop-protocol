@@ -14,6 +14,88 @@ on:
           AC11) without paying for the unrelated jobs on each measurement run.
         type: boolean
         default: false
+      # #2159 P0-2 (fix_delta after adversarial review issuecomment-5295659213;
+      # STRUCTURALLY REVISED per OWNER scope-authority ruling
+      # issuecomment-5299412215, item 1): dedicated fixed-SHA E2E benchmark
+      # dispatch route. The operator ALWAYS dispatches this workflow with
+      # `ref` pointed at the CURRENT/default branch (e.g. `main`) -- NEVER at
+      # a branch/tag whose tip is the (possibly old) measured commit -- so
+      # `github.workflow_sha` (the WORKFLOW DEFINITION's own commit) stays
+      # current on every benchmark sample. `target_sha` is a SEPARATE
+      # checkout-selector input: the e2e-core / e2e-responsive-matrix jobs
+      # below explicitly `actions/checkout@v6` with `ref: target_sha` to pin
+      # ONLY the measured application code to the old/new commit under test,
+      # then hard-fail if the resulting checked-out HEAD does not exactly
+      # match it. `target_sha` (measured code) and `github.workflow_sha`
+      # (workflow definition) are therefore EXPECTED to differ and are
+      # recorded as two independent fields in the benchmark manifest/
+      # ci_runtime_baseline_v1 artifact (never conflated or asserted equal;
+      # see docs/dev/e2e-performance-benchmark.md).
+      target_sha:
+        description: >-
+          Expected 40-hex commit SHA of the APPLICATION CODE to measure
+          (checked out via an explicit `actions/checkout` `ref:` override in
+          e2e-core / e2e-responsive-matrix, then verified via `git rev-parse
+          HEAD`). Distinct from the `ref` this dispatch itself targets, which
+          should stay on the current/default branch so the WORKFLOW
+          DEFINITION (`github.workflow_sha`) remains current. Leave empty for
+          a normal (non-benchmark) run.
+        type: string
+        default: ""
+      cohort_role:
+        description: >-
+          Fixed-SHA E2E benchmark cohort role for this dispatch: "before" or
+          "after" the measured code change (leave empty for a normal
+          non-benchmark run). Recorded as `cohort_role` in the
+          ci_runtime_baseline_v1 artifact; an
+          INTENTIONAL_TREATMENT_DIFFERENCE field (#2159 P0-5/P0-7), never
+          checked for cross-arm equality. Not a `type: choice` input because
+          actionlint's syntax-check rejects an empty string `choice` option.
+        type: string
+        default: ""
+      experiment_id:
+        description: >-
+          Free-form identifier grouping the dispatched runs belonging to one
+          fixed-SHA before/after experiment (for operator bookkeeping when
+          collecting `--before-runs-json`/`--after-runs-json` via `gh api`).
+        type: string
+        default: ""
+      # #2159 OWNER scope-authority ruling (issuecomment-5299412215, items
+      # 2/P0-8 and 3/P1-3/AC11): opt-in trigger for the
+      # `e2e-performance-benchmark-assessment-gate` steps below (added to
+      # the existing `codex-execpolicy` job -- deliberately not a new job,
+      # see the comment above those steps). Never runs on
+      # a normal push/pull_request event -- the 20-run comparable-cohort
+      # wait is explicitly Out of Scope as a merge/close condition for
+      # #2159/#2172 (deferred to #2155); this input lets an operator
+      # exercise the REAL production gate (AC11 hard-check +
+      # `build_assessment_from_percentile_cohorts`) on demand, without ever
+      # blocking a regular PR's required `ci` check.
+      run_performance_assessment_gate:
+        description: >-
+          When true, the `codex-execpolicy` job additionally runs the
+          `e2e-performance-benchmark-assessment-gate` steps: read
+          `cohort_fixture_path` (a JSON file already present in the
+          checked-out worktree -- e.g. downloaded from a prior
+          collect_e2e_performance_benchmark.py manifest-derived artifact) and
+          fail-closed (non-zero exit) unless BOTH the before and after arms
+          have >= MIN_COHORT_RUN_COUNT post-filter samples, per Issue #2159
+          AC11. Leave `cohort_fixture_path` empty to exercise this gate
+          against a deliberately-insufficient smoke fixture (proves the
+          mechanism itself is wired and fail-closes correctly even with zero
+          real historical runs, per OWNER: "20件未満なら fail-closed する
+          production path を先に配線できます").
+        type: boolean
+        default: false
+      cohort_fixture_path:
+        description: >-
+          Path (relative to the repo root, already present in the
+          checked-out worktree) to a JSON cohort fixture matching
+          `run_evidence_gate`'s documented shape in
+          tests/ci/test_ci_performance_gate.py. Leave empty to use the
+          built-in insufficient-evidence smoke fixture.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -146,7 +228,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -265,7 +347,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -407,7 +489,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -537,7 +619,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -559,7 +641,14 @@ jobs:
           PY
           } >> "$GITHUB_STEP_SUMMARY"
 
-  e2e:
+  # Issue #2119: `e2e-core` owns the standard E2E suite (every spec except
+  # the responsive matrix), the exactly-once preview-namespace lane, and the
+  # existing visual artifact evidence pipeline (`scripts/check-visual-artifact-pipeline.py`
+  # producer authority). `e2e-responsive-matrix` (below) runs ONLY
+  # `assist-player-affordance-responsive.spec.ts` in parallel, with no DAG
+  # dependency between the two. The `e2e` aggregate job further below
+  # collects both via `needs` + `if: always()`.
+  e2e-core:
     if: ${{ github.event.inputs.python_test_bench != 'true' }}
     runs-on: ubuntu-24.04
     defaults:
@@ -567,6 +656,13 @@ jobs:
         shell: bash
     env:
       PLAYWRIGHT_VERSION: "1.60.0"
+      # #2159 P0-1 (fix_delta after adversarial review issuecomment-5295659213):
+      # single source-of-truth mirror of this job's `container.image` digest
+      # (GH Actions does not support referencing `env.*` from `container:`),
+      # consumed by the ci_runtime_baseline_v2 producer below as
+      # `playwright_container_image_digest`.
+      PLAYWRIGHT_CONTAINER_IMAGE_DIGEST: "sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948"
+      LOOP_E2E_LANE: core
       # Issue #1958 fix_delta iteration 3 (PR #2006 review, blocker 4): the
       # real PR head SHA for pull_request events (never the synthetic
       # "Merge <head> into <base>" ref that process.env.GITHUB_SHA resolves
@@ -582,6 +678,31 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # #2159 OWNER scope-authority ruling (issuecomment-5299412215,
+          # item 1/P0-2 structural fix): the `workflow_dispatch` `ref` this
+          # run was DISPATCHED against stays on the current/default branch
+          # (so the WORKFLOW DEFINITION -- `github.workflow_sha` -- is
+          # current, never reverted). The application code being MEASURED
+          # is checked out here via an EXPLICIT `ref:` override to
+          # `target_sha` -- a SEPARATE checkout selector from the dispatch
+          # `ref`. `target_sha` (measured code) and `github.workflow_sha`
+          # (workflow definition) are therefore allowed, and expected, to
+          # differ for a fixed-SHA benchmark dispatch; both are recorded as
+          # two independent fields below (never conflated or asserted
+          # equal).
+          ref: ${{ github.event.inputs.target_sha != '' && github.event.inputs.target_sha || github.sha }}
+      - name: Verify checked-out HEAD matches dispatched target_sha (#2159 P0-2)
+        if: ${{ github.event.inputs.target_sha != '' }}
+        env:
+          BENCHMARK_TARGET_SHA: ${{ github.event.inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          resolved_head="$(git rev-parse HEAD)"
+          if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
+            echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the explicit checkout ref override did not resolve to the expected commit. Refusing to record a benchmark sample for the wrong commit."
+            exit 1
+          fi
+          echo "target_sha verified: $resolved_head (workflow definition SHA: ${{ github.workflow_sha }})"
       - name: Enable pnpm via corepack
         run: |
           corepack enable pnpm
@@ -776,10 +897,85 @@ jobs:
           GH_RUN_ATTEMPT: ${{ github.run_attempt }}
           GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           GH_SHA: ${{ github.sha }}
+          GH_RUNNER_OS: ${{ runner.os }}
+          GH_RUNNER_ARCH: ${{ runner.arch }}
+          # #2159 OWNER scope-authority ruling (issuecomment-5299412215, item
+          # 1/P0-2): the WORKFLOW DEFINITION's own commit SHA (distinct from
+          # the measured application code's `head_sha`, which on a
+          # fixed-SHA benchmark dispatch is pinned via an explicit
+          # `actions/checkout` `ref:` override to `target_sha`).
+          GH_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          # #2159 P0-2: populated only on a dedicated fixed-SHA benchmark
+          # dispatch (empty string on a normal push/pull_request run, which
+          # the producer below falls back to "ci_default" for).
+          BENCHMARK_COHORT_ROLE: ${{ github.event.inputs.cohort_role }}
+          BENCHMARK_EXPERIMENT_ID: ${{ github.event.inputs.experiment_id }}
+          # Issue #2119 AC9 comparable-cohort fingerprint (PR #2137 human
+          # review issuecomment-5273090534 P0 fix): the P50 cohort loader
+          # must be able to verify every run in a 20-run comparable cohort
+          # shares the same runner image / Node / pnpm / Playwright /
+          # lockfile / workflow digest, not just runner image.
+          # #2159 P0-1 (fix_delta after adversarial review
+          # issuecomment-5295659213): the ci_runtime_baseline_v1 producer
+          # previously emitted `runner_image` sourced from `ImageOS`/
+          # `ImageVersion`, which are NOT populated inside a containerized
+          # job (`container: image: mcr.microsoft.com/playwright@...`) --
+          # they resolved to the fail-closed-rejected placeholder
+          # "unknown/unknown", which `_fingerprint_has_placeholder`
+          # correctly (but permanently) excluded every real e2e-core/
+          # e2e-responsive-matrix artifact from any comparable cohort.
+          # `runner.os`/`runner.arch` ARE always populated (evaluated by the
+          # runner itself, not shell env inside the container). This
+          # producer now emits BOTH the legacy `runner_image` field
+          # (unchanged, for any existing consumer) AND the new
+          # `host_runner_image` / `playwright_container_image_digest` /
+          # `workflow_run_id` / `cohort_role` fields the redesigned
+          # WITHIN_COHORT_REQUIRED_EQUAL / CROSS_COHORT_REQUIRED_EQUAL
+          # contract (tests/ci/test_ci_performance_gate.py) requires.
+          NODE_VERSION_RAW: ""
+          PNPM_VERSION_RAW: ""
+          LOCKFILE_HASH_RAW: ""
+          WORKFLOW_DIGEST_RAW: ""
         run: |
           mkdir -p ci_runtime_baseline_artifacts
+          NODE_VERSION_RAW="$(node -v 2>/dev/null || echo unknown)"
+          PNPM_VERSION_RAW="$(pnpm -v 2>/dev/null || echo unknown)"
+          LOCKFILE_HASH_RAW="sha256:$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
+          WORKFLOW_DIGEST_RAW="sha256:$(sha256sum .github/workflows/ci.yml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
+          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW
           python3 - <<'PY'
           import json, os, pathlib
+          fingerprint_fields = {
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "node_version": os.environ.get("NODE_VERSION_RAW", "unknown"),
+              "pnpm_version": os.environ.get("PNPM_VERSION_RAW", "unknown"),
+              "playwright_version": os.environ.get("PLAYWRIGHT_VERSION", "unknown"),
+              "lockfile_hash": os.environ.get("LOCKFILE_HASH_RAW", "unknown"),
+              "workflow_digest": os.environ.get("WORKFLOW_DIGEST_RAW", "unknown"),
+          }
+          # #2159 P0-1: v2-contract fields, never placeholder-valued for a
+          # containerized job (see the env-block comment above for why the
+          # legacy runner_image field is placeholder-prone here).
+          v2_fields = {
+              "workflow_run_id": int(os.environ["GH_RUN_ID"]),
+              "host_runner_image": (
+                  os.environ.get("GH_RUNNER_OS", "unknown") + "/" + os.environ.get("GH_RUNNER_ARCH", "unknown")
+              ),
+              "host_runner_image_provenance": "os_arch_fallback",
+              "playwright_container_image_digest": os.environ.get(
+                  "PLAYWRIGHT_CONTAINER_IMAGE_DIGEST", "unknown"
+              ),
+              "cohort_role": os.environ.get("BENCHMARK_COHORT_ROLE") or "ci_default",
+              "experiment_id": os.environ.get("BENCHMARK_EXPERIMENT_ID") or None,
+              # #2159 OWNER scope-authority ruling (issuecomment-5299412215,
+              # item 1/P0-2): `github.workflow_sha` is the commit of the
+              # WORKFLOW DEFINITION that produced this run (distinct from
+              # `head_sha`, the measured application code's commit, which on
+              # a fixed-SHA benchmark dispatch is pinned via an explicit
+              # `actions/checkout` `ref:` override to `target_sha`). Recorded
+              # as an independent field -- never conflated with `head_sha`.
+              "workflow_sha": os.environ.get("GH_WORKFLOW_SHA", "unknown"),
+          }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
           if p.exists():
@@ -793,8 +989,8 @@ jobs:
                           "head_sha": os.environ["GH_HEAD_SHA"],
                           "merge_sha": os.environ["GH_SHA"],
                           "job": os.environ["GH_JOB"],
-                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
-                          "measurement_method": "date_plus3N_ms"
+                          "measurement_method": "date_plus3N_ms",
+                          **fingerprint_fields,
                       })
                       measurements.append(r)
           artifact = {
@@ -804,9 +1000,10 @@ jobs:
               "head_sha": os.environ["GH_HEAD_SHA"],
               "merge_sha": os.environ["GH_SHA"],
               "job": os.environ["GH_JOB"],
-              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
               "measurement_method": "date_plus3N_ms",
               "measurements": measurements,
+              **fingerprint_fields,
+              **v2_fields,
           }
           out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
           out.write_text(json.dumps(artifact, indent=2))
@@ -818,7 +1015,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       # Summary step MUST be after upload steps: outputs.artifact-url is only
       # available once upload-artifact has run, and $GITHUB_STEP_SUMMARY is
@@ -1230,6 +1427,359 @@ jobs:
               )
           PY
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Issue #2119: dedicated provider job for the responsive viewport x DPR x
+  # browser-zoom geometry matrix (`tests/e2e/assist-player-affordance-responsive.spec.ts`),
+  # physically split out of `e2e-core` (it was that lane's single largest
+  # hotspot, ~3.2min of a ~6.5min run). No DAG dependency on `e2e-core` — the
+  # two run in parallel; the `e2e` aggregate job below collects both.
+  e2e-responsive-matrix:
+    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLAYWRIGHT_VERSION: "1.60.0"
+      # #2159 P0-1: see e2e-core's identical comment above.
+      PLAYWRIGHT_CONTAINER_IMAGE_DIGEST: "sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948"
+      LOOP_E2E_LANE: responsive
+      EXPECTED_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    container:
+      image: mcr.microsoft.com/playwright@sha256:9bd26ad900bb5e0f4dee75839e957a89ae89c2b7ab1e76050e559790e946b948
+      options: --ipc=host
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          # #2159 OWNER scope-authority ruling (issuecomment-5299412215,
+          # item 1/P0-2 structural fix): the `workflow_dispatch` `ref` this
+          # run was DISPATCHED against stays on the current/default branch
+          # (so the WORKFLOW DEFINITION -- `github.workflow_sha` -- is
+          # current, never reverted). The application code being MEASURED
+          # is checked out here via an EXPLICIT `ref:` override to
+          # `target_sha` -- a SEPARATE checkout selector from the dispatch
+          # `ref`. `target_sha` (measured code) and `github.workflow_sha`
+          # (workflow definition) are therefore allowed, and expected, to
+          # differ for a fixed-SHA benchmark dispatch; both are recorded as
+          # two independent fields below (never conflated or asserted
+          # equal).
+          ref: ${{ github.event.inputs.target_sha != '' && github.event.inputs.target_sha || github.sha }}
+      - name: Verify checked-out HEAD matches dispatched target_sha (#2159 P0-2)
+        if: ${{ github.event.inputs.target_sha != '' }}
+        env:
+          BENCHMARK_TARGET_SHA: ${{ github.event.inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          resolved_head="$(git rev-parse HEAD)"
+          if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
+            echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the explicit checkout ref override did not resolve to the expected commit. Refusing to record a benchmark sample for the wrong commit."
+            exit 1
+          fi
+          echo "target_sha verified: $resolved_head (workflow definition SHA: ${{ github.workflow_sha }})"
+      - name: Enable pnpm via corepack
+        run: |
+          corepack enable pnpm
+          corepack prepare pnpm@11.7.0 --activate
+      - name: Install dependencies (timed)
+        id: timed-pnpm-install
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_install pnpm install --frozen-lockfile
+      - name: Verify Playwright Docker image version
+        run: |
+          PW_VERSION="$(node -p "require('@playwright/test/package.json').version")"
+          if [ "$PW_VERSION" != "$PLAYWRIGHT_VERSION" ]; then
+            echo "::error::resolved @playwright/test=$PW_VERSION but Docker image expects v$PLAYWRIGHT_VERSION. Update PLAYWRIGHT_VERSION and container.image digest in ci.yml."
+            exit 1
+          fi
+          echo "playwright_version_match=ok resolved=$PW_VERSION expected=$PLAYWRIGHT_VERSION"
+      - name: Build for E2E (timed)
+        id: timed-build-e2e
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed pnpm_build_e2e env VITE_E2E_MODE=true pnpm build
+      - name: Verify E2E dist boundary
+        run: pnpm dist:e2e-boundary --mode e2e --dist dist
+      - name: Run responsive-matrix E2E tests (timed)
+        id: timed-e2e-responsive-matrix
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed test_e2e_responsive_matrix pnpm exec playwright test tests/e2e/assist-player-affordance-responsive.spec.ts
+      - name: Upload Playwright report (e2e-responsive-matrix)
+        id: upload-playwright-report-responsive
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: playwright-report-e2e-responsive-matrix
+          path: playwright-report-e2e-responsive-matrix/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Upload test results (e2e-responsive-matrix)
+        id: upload-test-results-responsive
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-results-e2e-responsive-matrix
+          path: test-results-e2e-responsive-matrix/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Locate responsive-canvas-runtime-evidence.json
+        # AC4/AC13: this is the required artifact for the responsive matrix's
+        # RESPONSIVE_CANVAS_MATRIX_CONTRACT_V1 evidence — fail closed (not
+        # warn) if the test did not actually produce it, per this Issue's
+        # Runtime Verification Applicability fallback_policy
+        # (fallback_success_is_pass: false).
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p responsive-canvas-runtime-evidence-artifact
+          found="$(find test-results-e2e-responsive-matrix -name 'responsive-canvas-runtime-evidence.json' -print -quit || true)"
+          if [ -z "$found" ]; then
+            echo "::error::responsive-canvas-runtime-evidence.json not found under test-results-e2e-responsive-matrix/ — e2e-responsive-matrix did not produce the required RESPONSIVE_CANVAS_MATRIX_CONTRACT_V1 evidence."
+            exit 1
+          fi
+          cp "$found" responsive-canvas-runtime-evidence-artifact/responsive-canvas-runtime-evidence.json
+      - name: Upload responsive-canvas-runtime-evidence artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: responsive-canvas-runtime-evidence-${{ github.run_attempt }}
+          path: responsive-canvas-runtime-evidence-artifact/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Collect ci_runtime_baseline_v1 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_JOB: ${{ github.job }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+          GH_RUNNER_OS: ${{ runner.os }}
+          GH_RUNNER_ARCH: ${{ runner.arch }}
+          # #2159 OWNER scope-authority ruling (issuecomment-5299412215, item
+          # 1/P0-2): the WORKFLOW DEFINITION's own commit SHA (distinct from
+          # the measured application code's `head_sha`, which on a
+          # fixed-SHA benchmark dispatch is pinned via an explicit
+          # `actions/checkout` `ref:` override to `target_sha`).
+          GH_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          # #2159 P0-2: populated only on a dedicated fixed-SHA benchmark
+          # dispatch (empty string on a normal push/pull_request run, which
+          # the producer below falls back to "ci_default" for).
+          BENCHMARK_COHORT_ROLE: ${{ github.event.inputs.cohort_role }}
+          BENCHMARK_EXPERIMENT_ID: ${{ github.event.inputs.experiment_id }}
+          # Issue #2119 AC9 comparable-cohort fingerprint (PR #2137 human
+          # review issuecomment-5273090534 P0 fix): the P50 cohort loader
+          # must be able to verify every run in a 20-run comparable cohort
+          # shares the same runner image / Node / pnpm / Playwright /
+          # lockfile / workflow digest, not just runner image.
+          # #2159 P0-1 (fix_delta after adversarial review
+          # issuecomment-5295659213): the ci_runtime_baseline_v1 producer
+          # previously emitted `runner_image` sourced from `ImageOS`/
+          # `ImageVersion`, which are NOT populated inside a containerized
+          # job (`container: image: mcr.microsoft.com/playwright@...`) --
+          # they resolved to the fail-closed-rejected placeholder
+          # "unknown/unknown", which `_fingerprint_has_placeholder`
+          # correctly (but permanently) excluded every real e2e-core/
+          # e2e-responsive-matrix artifact from any comparable cohort.
+          # `runner.os`/`runner.arch` ARE always populated (evaluated by the
+          # runner itself, not shell env inside the container). This
+          # producer now emits BOTH the legacy `runner_image` field
+          # (unchanged, for any existing consumer) AND the new
+          # `host_runner_image` / `playwright_container_image_digest` /
+          # `workflow_run_id` / `cohort_role` fields the redesigned
+          # WITHIN_COHORT_REQUIRED_EQUAL / CROSS_COHORT_REQUIRED_EQUAL
+          # contract (tests/ci/test_ci_performance_gate.py) requires.
+          NODE_VERSION_RAW: ""
+          PNPM_VERSION_RAW: ""
+          LOCKFILE_HASH_RAW: ""
+          WORKFLOW_DIGEST_RAW: ""
+        run: |
+          mkdir -p ci_runtime_baseline_artifacts
+          NODE_VERSION_RAW="$(node -v 2>/dev/null || echo unknown)"
+          PNPM_VERSION_RAW="$(pnpm -v 2>/dev/null || echo unknown)"
+          LOCKFILE_HASH_RAW="sha256:$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
+          WORKFLOW_DIGEST_RAW="sha256:$(sha256sum .github/workflows/ci.yml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
+          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW
+          python3 - <<'PY'
+          import json, os, pathlib
+          fingerprint_fields = {
+              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
+              "node_version": os.environ.get("NODE_VERSION_RAW", "unknown"),
+              "pnpm_version": os.environ.get("PNPM_VERSION_RAW", "unknown"),
+              "playwright_version": os.environ.get("PLAYWRIGHT_VERSION", "unknown"),
+              "lockfile_hash": os.environ.get("LOCKFILE_HASH_RAW", "unknown"),
+              "workflow_digest": os.environ.get("WORKFLOW_DIGEST_RAW", "unknown"),
+          }
+          # #2159 P0-1: v2-contract fields, never placeholder-valued for a
+          # containerized job (see the env-block comment above for why the
+          # legacy runner_image field is placeholder-prone here).
+          v2_fields = {
+              "workflow_run_id": int(os.environ["GH_RUN_ID"]),
+              "host_runner_image": (
+                  os.environ.get("GH_RUNNER_OS", "unknown") + "/" + os.environ.get("GH_RUNNER_ARCH", "unknown")
+              ),
+              "host_runner_image_provenance": "os_arch_fallback",
+              "playwright_container_image_digest": os.environ.get(
+                  "PLAYWRIGHT_CONTAINER_IMAGE_DIGEST", "unknown"
+              ),
+              "cohort_role": os.environ.get("BENCHMARK_COHORT_ROLE") or "ci_default",
+              "experiment_id": os.environ.get("BENCHMARK_EXPERIMENT_ID") or None,
+              # #2159 OWNER scope-authority ruling (issuecomment-5299412215,
+              # item 1/P0-2): `github.workflow_sha` is the commit of the
+              # WORKFLOW DEFINITION that produced this run (distinct from
+              # `head_sha`, the measured application code's commit, which on
+              # a fixed-SHA benchmark dispatch is pinned via an explicit
+              # `actions/checkout` `ref:` override to `target_sha`). Recorded
+              # as an independent field -- never conflated with `head_sha`.
+              "workflow_sha": os.environ.get("GH_WORKFLOW_SHA", "unknown"),
+          }
+          measurements = []
+          p = pathlib.Path("measurements.jsonl")
+          if p.exists():
+              for line in p.read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      r = json.loads(line)
+                      r.update({
+                          "run_id": os.environ["GH_RUN_ID"],
+                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+                          "head_sha": os.environ["GH_HEAD_SHA"],
+                          "merge_sha": os.environ["GH_SHA"],
+                          "job": os.environ["GH_JOB"],
+                          "measurement_method": "date_plus3N_ms",
+                          **fingerprint_fields,
+                      })
+                      measurements.append(r)
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": os.environ["GH_JOB"],
+              "measurement_method": "date_plus3N_ms",
+              "measurements": measurements,
+              **fingerprint_fields,
+              **v2_fields,
+          }
+          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
+          out.write_text(json.dumps(artifact, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Upload ci-runtime-baseline artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  # Issue #2119 AC6: aggregate `e2e` — the stable required-check name existing
+  # consumers (ci-verdict-summary, branch protection) already reference.
+  # `needs` + `if: always()` so it always runs and can distinguish, without
+  # degrading to success:
+  #   (a) static topology failure — a provider job definition itself missing
+  #       from the workflow (this would make the `needs:` list below
+  #       reference an undefined job, which GitHub Actions itself rejects at
+  #       workflow-parse time; `scripts/ci/verify-e2e-lane-partition.mjs` /
+  #       `tests/ci/` additionally verify the static topology independently
+  #       of a live run).
+  #   (b) runtime result failure — `needs.<job>.result` is failure/cancelled/skipped.
+  #   (c) runtime evidence failure — a provider job reports `success` but its
+  #       required artifact/output is actually missing (checked below via
+  #       each provider job's own fail-closed artifact upload step, whose
+  #       `if-no-files-found: error` already turns evidence absence into a
+  #       job failure — this step re-asserts that binding explicitly so a
+  #       provider job cannot report `success` while silently omitting its
+  #       required artifact).
+  e2e:
+    needs: [e2e-core, e2e-responsive-matrix]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Evaluate e2e-core / e2e-responsive-matrix conclusions
+        env:
+          E2E_CORE_RESULT: ${{ needs.e2e-core.result }}
+          E2E_RESPONSIVE_RESULT: ${{ needs.e2e-responsive-matrix.result }}
+        run: |
+          set -euo pipefail
+          echo "e2e-core.result=$E2E_CORE_RESULT"
+          echo "e2e-responsive-matrix.result=$E2E_RESPONSIVE_RESULT"
+          fail=0
+          for pair in "e2e-core:$E2E_CORE_RESULT" "e2e-responsive-matrix:$E2E_RESPONSIVE_RESULT"; do
+            job="${pair%%:*}"
+            result="${pair#*:}"
+            case "$result" in
+              success)
+                ;;
+              failure)
+                echo "::error::runtime result failure: $job concluded 'failure'"
+                fail=1
+                ;;
+              cancelled)
+                echo "::error::runtime result failure: $job concluded 'cancelled'"
+                fail=1
+                ;;
+              skipped)
+                echo "::error::runtime result failure: $job concluded 'skipped' (provider job did not run)"
+                fail=1
+                ;;
+              *)
+                echo "::error::unrecognized needs.$job.result: '$result'"
+                fail=1
+                ;;
+            esac
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::e2e aggregate: at least one provider job did not succeed — not degrading to success."
+            exit 1
+          fi
+          echo "e2e aggregate: both e2e-core and e2e-responsive-matrix succeeded (runtime result + provider-enforced runtime evidence via if-no-files-found: error)."
 
   component-vrt-report:
     # Issue #1389 (Scope Delta): non-required, report-only Vitest Browser
@@ -1826,9 +2376,21 @@ jobs:
             --flat-output changed_paths.txt
           cat changed_paths.txt
       - name: Write PR body to file (untrusted input -- never shell-expanded)
+        # PR #2137 human review issuecomment-5273090534 P1 fix: the prior
+        # `github.event.pull_request.body` reads a snapshot FROZEN at
+        # webhook-dispatch time for whatever event triggered this run (e.g.
+        # a `push`/`synchronize`), which can genuinely differ from the PR
+        # body `visual-impact-trusted-consumer.yml`'s independently-derived
+        # trusted step later re-fetches live via `gh api pulls/{num}`
+        # (confirmed via `pr_body_digest_mismatch` even with zero
+        # intervening body edits). Fetch the SAME live REST endpoint here,
+        # at actual producer-job execution time, so both sides bind to a
+        # freshly-read body instead of two different snapshots.
         env:
-          PR_BODY: ${{ github.event.pull_request.body || '' }}
-        run: printf '%s' "$PR_BODY" > pr_body.md
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""' > pr_body.md
       - name: Write trusted base-branch CODEOWNERS
         env:
           BASE_SHA: ${{ steps.shas.outputs.base_sha }}
@@ -2350,7 +2912,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -2573,7 +3135,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -2594,6 +3156,200 @@ jobs:
                       print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
           PY
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Generate CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact
+        if: ${{ !cancelled() }}
+        env:
+          GH_ISSUE_NUMBER: "2159"
+          GH_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mkdir -p ci_test_performance_assessment_artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          from datetime import datetime, timezone
+
+          pr_number_raw = os.environ.get("GH_PR_NUMBER", "")
+          assessment = {
+              "schema": "CI_TEST_PERFORMANCE_ASSESSMENT_V2",
+              "schema_version": 2,
+              "issue_number": int(os.environ["GH_ISSUE_NUMBER"]),
+              "pr_number": int(pr_number_raw) if pr_number_raw else None,
+              "measured_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              # Issue #2159 AC10: this producer runs on EVERY CI run of the
+              # python-test-core job and asserts no performance CLAIM for
+              # this specific job's own instrumentation (claim.kind: none).
+              # A dedicated performance CLAIM (improvement/non_regression/
+              # absolute_budget) is authored separately, out-of-band, by
+              # scripts/ci/collect_e2e_performance_benchmark.py's fixed
+              # before/after SHA benchmark route (Issue #2159 AC1/AC2/AC7),
+              # not by this per-run producer -- this step's job is to prove
+              # a REAL CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact is
+              # actually generated from a real run (not just documented as
+              # a string in this workflow file).
+              "claim": {"kind": "none"},
+              "performance_evidence": {"status": "not_required"},
+              "observation": {"outcome": "not_observed"},
+              "claim_evaluation": {"outcome": "not_applicable"},
+              "functional_evidence": {
+                  "proof_level": "check_run_only",
+                  "coverage_bound": False,
+              },
+              "declared_impact": (
+                  "Routine CI_TEST_PERFORMANCE_ASSESSMENT_V2 producer run "
+                  f"(head_sha={os.environ['GH_HEAD_SHA']}); no performance "
+                  "claim is made by this per-run instrumentation step."
+              ),
+              "risk_acknowledgement": {
+                  "reference": {
+                      "source_kind": "commit_message",
+                      "source_id": os.environ["GH_HEAD_SHA"],
+                  },
+                  "verification_status": "unverified",
+              },
+          }
+          out = pathlib.Path(
+              "ci_test_performance_assessment_artifacts/ci_test_performance_assessment_v2.json"
+          )
+          out.write_text(json.dumps(assessment, indent=2))
+          print(f"Written: {out}")
+          PY
+      - name: Validate CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact
+        if: ${{ !cancelled() }}
+        run: |
+          uv run --locked python3 \
+            .claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py \
+            --assessment ci_test_performance_assessment_artifacts/ci_test_performance_assessment_v2.json \
+            --output ci_test_performance_assessment_artifacts/ci_test_performance_assessment_v2_validation_result.json
+      - name: Upload CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-test-performance-assessment-v2-${{ github.run_attempt }}
+          path: ci_test_performance_assessment_artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      # #2159 OWNER scope-authority ruling (issuecomment-5299412215, items
+      # 2/P0-8 and 3/P1-3/AC11): the REAL, callable production wiring of (a)
+      # the AC11 evidence-readiness hard-check
+      # (`_evidence_readiness_hard_check_post_filter`,
+      # tests/ci/test_ci_performance_gate.py) into an actual workflow job's
+      # close/gate step, and (b) the P0-8 real (non-no-op)
+      # CI_TEST_PERFORMANCE_ASSESSMENT_V2 producer
+      # (`build_assessment_from_percentile_cohorts`). Distinct from the
+      # unconditional producer above, which intentionally remains a fixed
+      # `claim.kind: none` schema smoke-test payload run on EVERY regular CI
+      # run (per the review's own suggestion to keep that producer distinct
+      # from #2159 AC10's real performance producer). These steps are
+      # opt-in (`run_performance_assessment_gate: true` on
+      # `workflow_dispatch` only) so the 20-run comparable-cohort wait --
+      # Out of Scope as a #2159/#2172 merge/close condition -- never blocks
+      # a normal PR's required `ci` check; deliberately kept INSIDE this
+      # existing job (rather than a new job) so no new check-run name is
+      # introduced (a new job name would require a
+      # .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py
+      # CLASSIFICATION_MAP entry, which is outside #2159's Allowed Paths).
+      - name: Resolve cohort fixture (operator-supplied or built-in insufficient-evidence smoke fixture)
+        if: ${{ github.event.inputs.run_performance_assessment_gate == 'true' }}
+        env:
+          COHORT_FIXTURE_PATH_INPUT: ${{ github.event.inputs.cohort_fixture_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p e2e_performance_assessment_gate_artifacts
+          if [ -n "$COHORT_FIXTURE_PATH_INPUT" ]; then
+            if [ ! -f "$COHORT_FIXTURE_PATH_INPUT" ]; then
+              echo "::error::cohort_fixture_path=$COHORT_FIXTURE_PATH_INPUT does not exist in the checked-out worktree."
+              exit 1
+            fi
+            cp "$COHORT_FIXTURE_PATH_INPUT" e2e_performance_assessment_gate_artifacts/cohort_fixture.json
+            echo "cohort_fixture_source=operator_supplied path=$COHORT_FIXTURE_PATH_INPUT"
+          else
+            # #2159 OWNER ruling: "20件未満なら fail-closed する production
+            # path を先に配線できます" -- this built-in fixture is
+            # DELIBERATELY below MIN_COHORT_RUN_COUNT (20) per arm, proving
+            # the gate fail-closes correctly with zero real historical CI
+            # runs, exactly the state of this dev environment today.
+            python3 - <<'PY'
+          import json
+
+          def arm(commit_sha: str, count: int, start_id: int) -> dict:
+              core = [
+                  {
+                      "workflow_run_id": start_id + i,
+                      "job": "e2e-core",
+                      "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 60000 + i}],
+                  }
+                  for i in range(count)
+              ]
+              responsive = [
+                  {
+                      "workflow_run_id": start_id + i,
+                      "job": "e2e-responsive-matrix",
+                      "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 60000 + i}],
+                  }
+                  for i in range(count)
+              ]
+              gate_ready = [
+                  {
+                      "workflow_run_id": start_id + i,
+                      "run_started_at": "2026-08-15T00:00:00Z",
+                      "check_completed_at": "2026-08-15T00:05:00Z",
+                  }
+                  for i in range(count)
+              ]
+              return {
+                  "commit_sha": commit_sha,
+                  "core_baselines": core,
+                  "responsive_baselines": responsive,
+                  "gate_ready_baselines": gate_ready,
+              }
+
+          fixture = {
+              "issue_number": 2159,
+              "pr_number": 2172,
+              "measured_at": "2026-08-15T00:00:00Z",
+              "functional_evidence": {"proof_level": "check_run_only", "coverage_bound": False},
+              "declared_impact": (
+                  "e2e-performance-benchmark-assessment-gate smoke fixture "
+                  "(no cohort_fixture_path supplied) -- deliberately below "
+                  "MIN_COHORT_RUN_COUNT to prove the AC11 fail-closed gate "
+                  "is wired into a real workflow job."
+              ),
+              "risk_acknowledgement": {
+                  "reference": {"source_kind": "issue_comment", "source_id": "issuecomment-5299412215"},
+                  "verification_status": "unverified",
+              },
+              "cohort_provenance": {
+                  "runner_image": "ubuntu-24.04",
+                  "workers": 1,
+                  "scheduler": "loadscope",
+                  "command_manifest_digest": "sha256:" + "0" * 64,
+                  "test_selection_digest": "sha256:" + "0" * 64,
+              },
+              # 3 << MIN_COHORT_RUN_COUNT (20) -- intentional, see comment above.
+              "before": arm("0" * 40, 3, 9000),
+              "after": arm("1" * 40, 3, 19000),
+          }
+          with open("e2e_performance_assessment_gate_artifacts/cohort_fixture.json", "w", encoding="utf-8") as handle:
+              json.dump(fixture, handle, indent=2)
+          print("cohort_fixture_source=built_in_insufficient_evidence_smoke_fixture")
+          PY
+          fi
+      - name: Run AC11 evidence gate + P0-8 assessment producer (#2159 OWNER ruling issuecomment-5299412215 items 2/3)
+        if: ${{ github.event.inputs.run_performance_assessment_gate == 'true' }}
+        run: |
+          uv run --locked python3 tests/ci/test_ci_performance_gate.py \
+            --cohort-fixture e2e_performance_assessment_gate_artifacts/cohort_fixture.json \
+            --output e2e_performance_assessment_gate_artifacts/gate_result.json
+      - name: Upload e2e-performance-benchmark-assessment-gate artifact
+        if: ${{ !cancelled() && github.event.inputs.run_performance_assessment_gate == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-performance-benchmark-assessment-gate-${{ github.run_attempt }}
+          path: e2e_performance_assessment_gate_artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
 
   python-test:
     # Issue #1760 AC5: required aggregate status check (name unchanged --
@@ -3014,7 +3770,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -3159,7 +3915,7 @@ jobs:
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
           path: ci_runtime_baseline_artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
         if: ${{ !cancelled() }}
@@ -3263,6 +4019,84 @@ jobs:
         with:
           name: ci-verdict-summary-v2-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci_verdict_summary_v2_artifacts/
+          if-no-files-found: error
+          retention-days: 30
+      # Issue #2119 AC9(b) (PR #2137 human review issuecomment-5273090534 P0
+      # fix): gate-ready latency is the wall-clock time from workflow-run
+      # start until the required stable `e2e` aggregate check itself
+      # reaches a conclusion. Computed here (not inside jobs.e2e itself,
+      # which check-visual-artifact-pipeline.py's AC13 guard forbids from
+      # carrying any upload-artifact/download-artifact step, to prevent a
+      # compatibility shim impersonating the pre-#2119 jobs.e2e visual
+      # artifact contract) from the real per-commit check-run `completed_at`
+      # for the "e2e" check (fetched below) minus the real workflow-run
+      # `run_started_at` (both authoritative GitHub API timestamps, not
+      # self-measured wall-clock deltas). Prior to this Issue, the
+      # monolithic `e2e` job's OWN job runtime already equaled this
+      # quantity; post-split, the aggregate job depends on `needs`, so its
+      # own step runtime alone would undercount the real gate-ready latency.
+      - name: Record gate-ready latency (ci_runtime_baseline_v1)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p ci_runtime_baseline_artifacts
+          RUN_STARTED_AT="$(gh api "repos/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}" --jq .run_started_at)"
+          export RUN_STARTED_AT
+          python3 - <<'PY'
+          import json, os, pathlib
+          from datetime import datetime, timezone
+
+          run_started_at = datetime.fromisoformat(
+              os.environ["RUN_STARTED_AT"].replace("Z", "+00:00")
+          )
+
+          check_runs = json.loads(
+              pathlib.Path("ci_verdict_summary_v2_check_runs.json").read_text(encoding="utf-8")
+          ).get("check_runs", [])
+          e2e_runs = [c for c in check_runs if c.get("name") == "e2e" and c.get("status") == "completed"]
+
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": "e2e",
+              "run_started_at": os.environ["RUN_STARTED_AT"],
+              "measurements": [],
+          }
+
+          if e2e_runs:
+              completed_at = datetime.fromisoformat(
+                  e2e_runs[0]["completed_at"].replace("Z", "+00:00")
+              )
+              gate_ready_latency_ms = int((completed_at - run_started_at).total_seconds() * 1000)
+              artifact["gate_ready_latency_ms"] = gate_ready_latency_ms
+              artifact["gate_ready_at"] = e2e_runs[0]["completed_at"]
+              print(f"gate_ready_latency_ms={gate_ready_latency_ms}")
+          else:
+              # The "e2e" check-run was not found completed at fetch time --
+              # do NOT fabricate a latency value (fail-closed: this run is
+              # simply excluded from the gate-ready-latency cohort rather
+              # than silently degrading to success).
+              print("no completed 'e2e' check-run found; gate_ready_latency_ms omitted")
+
+          out = pathlib.Path("ci_runtime_baseline_artifacts") / "ci_runtime_baseline_v1_e2e.json"
+          out.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+          PY
+      - name: Upload ci_runtime_baseline_v1 (e2e aggregate gate-ready latency)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-e2e-gate-ready-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/ci_runtime_baseline_v1_e2e.json
           if-no-files-found: error
           retention-days: 30
       - name: Download codex-execpolicy sentinel artifact (AC9)

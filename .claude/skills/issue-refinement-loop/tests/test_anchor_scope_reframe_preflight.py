@@ -274,16 +274,18 @@ class TestFailClosed:
         result = _classify(comment)
         assert result["status"] == "fail_closed"
 
-    def test_no_yaml_block_fail_closed(self):
-        """AC4: comment with no ANCHOR_SCOPE_REFRAME_V1 yaml → fail_closed"""
+    def test_no_yaml_block_genuine_absence_not_applicable(self):
+        """#2156 AC2: comment with no ```yaml fence at all (genuine absence)
+        → not_applicable (freeform lane continues), reason unchanged."""
         comment = _make_comment(
             comment_id=2005,
             body="Just a plain comment without schema block.",
             author_association="OWNER",
         )
         result = _classify(comment)
-        assert result["status"] == "fail_closed"
+        assert result["status"] == "not_applicable"
         assert result["reason"] == "no_anchor_scope_reframe_v1_payload"
+        assert result["implementation_go"] is False
 
     def test_quoted_yaml_block_fail_closed(self):
         """AC4: blockquote-embedded yaml block → fail_closed (not canonical)"""
@@ -382,3 +384,160 @@ class TestScopeDeltaDecision:
         result = _classify(comment)
         assert result["status"] == "fail_closed"
         assert result["required_rerun"] == []
+
+
+# ---------------------------------------------------------------------------
+# #2156 AC1/AC2/AC3: genuine absence vs. present-but-invalid tri-state
+# ---------------------------------------------------------------------------
+
+
+class TestGenuineAbsenceVsPresentInvalidTriState:
+    def test_genuine_absence_vs_present_invalid_tri_state(self):
+        """AC1: `_anchor_scope_reframe_fence_present()` distinguishes a body
+        with no ```yaml fence at all (genuine absence) from a body that
+        contains a ```yaml fence which fails to parse as a valid
+        ANCHOR_SCOPE_REFRAME_V1 payload (present-but-invalid), independent
+        of the fence's content validity."""
+        genuinely_absent_body = "Just a plain comment without schema block."
+        malformed_body = "```yaml\n: invalid: [yaml: content\n```\n"
+        wrong_schema_body = "```yaml\nschema_version: WRONG_SCHEMA_V1\n```\n"
+
+        assert preflight._anchor_scope_reframe_fence_present(genuinely_absent_body) is False
+        assert preflight._anchor_scope_reframe_fence_present(malformed_body) is True
+        assert preflight._anchor_scope_reframe_fence_present(wrong_schema_body) is True
+
+        # AC2: genuine absence classifies as not_applicable (freeform lane
+        # continues), reason unchanged.
+        absent_comment = _make_comment(
+            comment_id=5001,
+            body=genuinely_absent_body,
+            author_association="OWNER",
+        )
+        absent_result = _classify(absent_comment)
+        assert absent_result["status"] == "not_applicable"
+        assert absent_result["reason"] == "no_anchor_scope_reframe_v1_payload"
+
+        # AC3: present-but-invalid (malformed YAML) stays fail_closed, never
+        # not_applicable, with a schema_invalid: reason.
+        malformed_comment = _make_comment(
+            comment_id=5002,
+            body=malformed_body,
+            author_association="OWNER",
+        )
+        malformed_result = _classify(malformed_comment)
+        assert malformed_result["status"] == "fail_closed"
+        assert malformed_result["reason"].startswith("schema_invalid:")
+
+        # AC3: present-but-invalid (wrong schema_version) stays fail_closed
+        # too.
+        wrong_schema_comment = _make_comment(
+            comment_id=5003,
+            body=wrong_schema_body,
+            author_association="OWNER",
+        )
+        wrong_schema_result = _classify(wrong_schema_comment)
+        assert wrong_schema_result["status"] == "fail_closed"
+        assert wrong_schema_result["reason"].startswith("schema_invalid:")
+
+    def test_present_invalid_wrong_schema_version_stays_fail_closed(self):
+        """AC3: a fenced ```yaml block that declares the wrong
+        schema_version is present-but-invalid, not genuine absence -- the
+        classifier must keep it fail_closed, never not_applicable."""
+        comment = _make_comment(
+            comment_id=5004,
+            body="```yaml\nschema_version: WRONG_SCHEMA_V1\n```\n",
+            author_association="MEMBER",
+        )
+        result = _classify(comment)
+        assert result["status"] == "fail_closed"
+        assert result["status"] != "not_applicable"
+        assert result["reason"].startswith("schema_invalid:")
+        assert result["implementation_go"] is False
+
+
+# ---------------------------------------------------------------------------
+# PR #2171 fix_delta (P0-2/P2, OWNER adversarial review): the fence scanner
+# must recognize GFM fence variants a plain `^>*\s*```yaml\s*\n` regex
+# misses (fail-open safety gap), while also NOT treating an unrelated
+# ```yaml fence as a reframe attempt (P2, over-broad match).
+# ---------------------------------------------------------------------------
+
+
+class TestFenceScannerGfmVariantsAndRelatedness:
+    def test_nested_blockquote_fence_detected(self):
+        """P0-2: a fence embedded two blockquote levels deep (`> > ` with a
+        space between markers) must still be detected as present -- the
+        previous fence-presence regex requires the `>` markers to be contiguous
+        with no interleaving space before the fence."""
+        body = "> > ```yaml\n> > schema_version: ANCHOR_SCOPE_REFRAME_V1\n> > ```\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_four_backtick_fence_detected(self):
+        """P0-2: a fence opened with 4 backticks (valid GFM/CommonMark,
+        needed e.g. when the fence content itself contains a 3-backtick
+        span) is not literal text "```yaml" and a plain regex looking for
+        exactly 3 backticks silently fails to match it."""
+        body = "````yaml\nschema_version: ANCHOR_SCOPE_REFRAME_V1\n````\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_tilde_fence_detected(self):
+        """P0-2: GFM also allows `~~~` fences, not just backticks."""
+        body = "~~~yaml\nschema_version: ANCHOR_SCOPE_REFRAME_V1\n~~~\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_uppercase_info_string_detected(self):
+        """P0-2: the ```yaml info string is case-insensitive in GFM."""
+        body = "```YAML\nschema_version: ANCHOR_SCOPE_REFRAME_V1\n```\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_unclosed_fence_through_eof_detected(self):
+        """P0-2: a fence never closed before EOF must still be scanned as
+        present (fail-closed on the presence question), not silently
+        ignored."""
+        body = "```yaml\nschema_version: ANCHOR_SCOPE_REFRAME_V1\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_unrelated_yaml_fence_is_not_present(self):
+        """P2: a ```yaml fence whose content is unambiguously unrelated to
+        ANCHOR_SCOPE_REFRAME_V1 (no schema_version key, no marker string,
+        fewer than two reframe keys, and it parses cleanly as YAML) must
+        NOT be classified as present -- otherwise an unrelated freeform
+        review comment that happens to quote a config snippet would be
+        forced fail_closed."""
+        body = "Here is the retry config we use:\n```yaml\ntimeout: 90\nretries: 3\n```\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is False
+
+        comment = _make_comment(
+            comment_id=5005,
+            body=body,
+            author_association="OWNER",
+        )
+        result = _classify(comment)
+        assert result["status"] == "not_applicable"
+        assert result["reason"] == "no_anchor_scope_reframe_v1_payload"
+
+    def test_unrelated_yaml_fence_nested_blockquote_still_not_present(self):
+        """P2: relatedness gating also applies to the nested-blockquote /
+        4-backtick / tilde fence variants above -- detecting the fence
+        structurally must not by itself flip an unrelated fence to
+        present."""
+        body = "> > ```yaml\n> > timeout: 90\n> > retries: 3\n> > ```\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is False
+
+    def test_related_fence_with_only_schema_version_key_stays_present(self):
+        """Regression: a fence declaring ONLY `schema_version` (even with
+        the wrong value) must still count as related/present -- this is
+        exactly the #2156 AC3 present-but-invalid case, and P2's
+        relatedness gating must not regress it."""
+        body = "```yaml\nschema_version: SOME_OTHER_SCHEMA\n```\n"
+        assert preflight._anchor_scope_reframe_fence_present(body) is True
+
+    def test_related_fence_via_key_combination_without_marker_string(self):
+        """P2: a fence lacking the literal marker string but declaring at
+        least two of the reframe-specific keys (`target` / `decision` /
+        `allowed_path_deltas`) is still a plausible reframe attempt."""
+        body = (
+            "```yaml\ntarget:\n  repo: squne121/loop-protocol\n"
+            "  issue_number: 2156\ndecision: approve_scope_delta\n```\n"
+        )
+        assert preflight._anchor_scope_reframe_fence_present(body) is True

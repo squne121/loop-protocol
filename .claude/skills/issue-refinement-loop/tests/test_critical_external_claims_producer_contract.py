@@ -23,7 +23,7 @@ SCRIPT = SKILL_ROOT / "scripts" / "plan_refinement_loop.py"
 SCHEMA_PATH = SKILL_ROOT / "schemas" / "refinement_loop_plan_v1.json"
 FIXTURE_MD = SKILL_ROOT / "tests" / "fixtures" / "positive" / "critical_external_claim_in_vc.md"
 
-EXTERNAL_CLAIM_REQUIRED_KEYS = {"claim", "affects", "source_hint"}
+EXTERNAL_CLAIM_REQUIRED_KEYS = {"claim", "affects", "source_hint", "role"}
 
 
 def _run_planner(input_data: dict[str, Any]) -> dict[str, Any]:
@@ -77,11 +77,12 @@ def test_planner_critical_external_claims_remain_external_claim_objects():
         )
         assert claim["affects"] in {"Outcome", "InScope", "AC", "VC", "StopCondition"}
         assert claim["source_hint"] is None or isinstance(claim["source_hint"], str)
+        assert claim["role"] in {"dispositive", "non_dispositive"}
 
     # Cross-check against the ExternalClaim schema definition directly.
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     external_claim_schema = schema["definitions"]["ExternalClaim"]
-    assert external_claim_schema["required"] == ["claim", "affects", "source_hint"]
+    assert external_claim_schema["required"] == ["claim", "affects", "source_hint", "role"]
     assert external_claim_schema["type"] == "object"
 
     # Full REFINEMENT_LOOP_PLAN_V1 output validates against the schema (jsonschema).

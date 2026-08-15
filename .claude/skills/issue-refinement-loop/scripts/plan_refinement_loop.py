@@ -31,6 +31,137 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+_IMPL_MAIN_DRIFT_SCRIPTS = (
+    Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts"
+)
+if str(_IMPL_MAIN_DRIFT_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_IMPL_MAIN_DRIFT_SCRIPTS))
+try:
+    from route_loop_verdict_v2 import classify_main_drift
+except ImportError:  # pragma: no cover
+    classify_main_drift = None
+
+
+def classify_refinement_evidence_epoch(context: dict[str, Any]) -> dict[str, Any]:
+    """Classify evidence only; refinement retains Issue/snapshot mutation."""
+    if classify_main_drift is None:
+        return {"route": "hard_stop", "reason_code": "main_drift_policy_import_failed"}
+    try:
+        result = classify_main_drift(
+            current_base_sha=context["current_base_sha"],
+            evidence_base_sha=context["evidence_base_sha"],
+            allowed_paths_snapshot_base_sha=context[
+                "allowed_paths_snapshot_base_sha"
+            ],
+            allowed_paths=context["allowed_paths"],
+            latest_main_net_diff=context.get("latest_main_net_diff", ()),
+            expected_head_sha=context["expected_head_sha"],
+            observed_head_sha=context["observed_head_sha"],
+            expected_old_sha=context["expected_old_sha"],
+            observed_old_sha=context["observed_old_sha"],
+            semantic_ambiguity=bool(context.get("semantic_ambiguity", False)),
+            owner="refinement",
+        )
+    except (KeyError, TypeError):
+        return {"route": "hard_stop", "reason_code": "main_drift_context_invalid"}
+    return {
+        "route": result.route,
+        "reason_code": result.reason_code,
+        "evidence_epoch": dict(result.evidence_epoch or {}),
+        "reverify": dict(result.reverify),
+        "reusable_evidence": dict(result.reusable_evidence),
+        "mutation_owner": "refinement",
+    }
+
+
+# ---------------------------------------------------------------------------
+# known_context["main_drift"] production contract (Issue #2102 fix_delta,
+# P0-C: the previous revision left this key's producer undocumented, making
+# classify_refinement_evidence_epoch() / _refinement_main_drift_decision()
+# unreachable in production).
+#
+# This planner is read-only and performs no git/GitHub I/O itself (see the
+# module docstring). known_context.main_drift is therefore never
+# self-populated -- it MUST be constructed by the orchestrator step that
+# invokes this script (the issue-refinement-loop control-plane step that
+# runs BEFORE issuing REFINEMENT_LOOP_PLANNER_INPUT_V1 to stdin), using the
+# same live-readback boundary already established for
+# known_context.scope_delta_decision (see the "唯一の production 呼び出し元"
+# / "診断用の echo であり canonical な mutation-phase routing は...consumer
+# 境界が担う" pattern in issue-refinement-loop/SKILL.md's Step 4 scope-reframe
+# section): this planner's `decisions.main_drift_evidence_epoch` output is an
+# ADVISORY diagnostic echo, not canonical mutation-phase routing authority.
+# The actual rebind/reverify mutation (fresh contract-snapshot
+# materialization, stale-evidence invalidation) is performed by the
+# refinement-loop consumer boundary that reads this echo, not by this
+# planner.
+#
+# Before invoking this script, the orchestrator must populate
+# known_context["main_drift"] as a dict with the following keys (all 40-hex
+# SHAs unless noted):
+#   current_base_sha                 live default-branch HEAD, read the same
+#                                     way materialize_issue_scope_snapshot.py
+#                                     ::_live_default_branch() reads it (a
+#                                     GitHub REST call, not a local ref).
+#   evidence_base_sha                base SHA the existing Contract Snapshot
+#                                     / scope snapshot is bound to.
+#   allowed_paths_snapshot_base_sha  base SHA the current Allowed Paths
+#                                     snapshot is bound to.
+#   allowed_paths                    list[str], from the live Issue body.
+#   latest_main_net_diff             list[str], `git diff --name-only
+#                                     evidence_base_sha current_base_sha`
+#                                     (main-drift-touched paths; this is
+#                                     DISTINCT from a final post-reconciliation
+#                                     net diff, which is the refinement/impl
+#                                     mutation consumer's responsibility, not
+#                                     this planner's).
+#   expected_old_sha / observed_old_sha   CAS pair for whatever ref this
+#                                     evidence rebind will ultimately mutate.
+#   semantic_ambiguity (optional)    bool; SHOULD be derived from an actual
+#                                     `git merge-tree --write-tree` conflict
+#                                     check by the orchestrator, not asserted
+#                                     freehand (see route_loop_verdict_v2.py /
+#                                     pr_head_replay_publish_exec.py for the
+#                                     canonical deterministic oracle used on
+#                                     the implementation-loop side).
+# If known_context.main_drift is omitted, this planner emits no
+# main_drift_evidence_epoch decision (the pre-#2102 behavior is preserved
+# for callers that do not yet supply main-drift facts).
+#
+# Current production-wiring status (honest disclosure, fix_delta iteration
+# 3): as of this revision, no production Python code path actually calls
+# run_refinement_preflight.py's orchestrator step to assemble
+# known_context["main_drift"] and pass it into this planner. The above
+# contract therefore documents a MUST requirement that the control-plane
+# has not yet implemented as automated wiring -- known_context.main_drift
+# remains dead code in production today (this file emits no
+# main_drift_evidence_epoch decision on any live invocation). Wiring the
+# orchestrator step described above (live GitHub REST readback, git diff,
+# and a git merge-tree --write-tree conflict check for semantic_ambiguity)
+# is tracked as follow-up work outside this Issue's bounded scope; the
+# `semantic_ambiguity` derivation the contract requires here mirrors the
+# same deterministic oracle already implemented in
+# pr_head_replay_publish_exec.py::_merge_tree_conflicts() on the
+# implementation-loop side (exit code from `git merge-tree --write-tree`,
+# non-zero == conflict), not a caller-asserted boolean.
+# ---------------------------------------------------------------------------
+
+
+def _refinement_main_drift_decision(
+    known_context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Project optional live main-drift facts into the planner's SSOT output.
+
+    See the known_context["main_drift"] production contract comment above
+    this function for who populates this key and when.
+    """
+    if not known_context or "main_drift" not in known_context:
+        return None
+    context = known_context["main_drift"]
+    if not isinstance(context, dict):
+        return {"route": "hard_stop", "reason_code": "main_drift_context_invalid"}
+    return classify_refinement_evidence_epoch(context)
+
 try:
     import yaml as _yaml_module
     _YAML_AVAILABLE = True
@@ -139,6 +270,14 @@ WEB_RESEARCH_REASON_HUMAN_REQUESTED = "human_requested_web_verification"
 WEB_RESEARCH_REASON_CLI_API_BEHAVIOR = "current_cli_api_auth_or_migration_behavior"
 WEB_RESEARCH_REASON_NO_CLAIM = "no_critical_external_claim"
 WEB_RESEARCH_REASON_UNKNOWN_SCHEMA = "unknown_input_schema"
+
+# External claim role is intentionally a small decision-dependency marker,
+# not a second evidence ledger.  The planner has only Issue text at this
+# point, so it defaults to fail-closed ``dispositive``.  A later consumer may
+# use ``non_dispositive`` only when the codebase investigation has established
+# that repository evidence independently determines the requested decision.
+EXTERNAL_CLAIM_ROLE_DISPOSITIVE = "dispositive"
+EXTERNAL_CLAIM_ROLE_NON_DISPOSITIVE = "non_dispositive"
 
 SCOPE_SIGNAL_REASON_NEW_IN_SCOPE = "new_in_scope_area"
 SCOPE_SIGNAL_REASON_NEW_PATH_LAYER = "new_allowed_path_layer"
@@ -1020,6 +1159,7 @@ def _extract_critical_external_claims(
                             "claim": claim,
                             "affects": _infer_affects_section(section_name),
                             "source_hint": None,
+                            "role": EXTERNAL_CLAIM_ROLE_DISPOSITIVE,
                         }
                     )
 
@@ -1033,12 +1173,19 @@ def _extract_critical_external_claims(
                 for keyword in HUMAN_WEB_VERIFICATION_KEYWORDS:
                     if keyword in comment_body.lower():
                         # Found human request for web verification in comments
-                        claim_text = comment_body[:100].strip() if comment_body else "Human requested web verification"
+                        claim_text = (
+                            comment_body[:100].strip()
+                            if comment_body
+                            else "Human requested web verification"
+                        )
                         claims.append(
                             {
                                 "claim": claim_text,
                                 "affects": "VC",
-                                "source_hint": f"comment_{comment_id}" if comment_id else "comment",
+                                "source_hint": (
+                                    f"comment_{comment_id}" if comment_id else "comment"
+                                ),
+                                "role": EXTERNAL_CLAIM_ROLE_DISPOSITIVE,
                             }
                         )
                         break  # Only add once per comment
@@ -1795,8 +1942,33 @@ def _project_scope_delta_decision_to_approval(known_context: "dict | None") -> d
     decision = (known_context or {}).get("scope_delta_decision")
     if not isinstance(decision, dict):
         return base
-    if decision.get("status") == "not_applicable":
-        # No anchor reframe was attempted at all: same lane as missing.
+
+    # #2156 AC7: `status: not_applicable` is no longer treated as "no
+    # anchor reframe was attempted at all" (bare `missing` lane, evidence
+    # fields left at their `_base_approval_result()` defaults). Since #2156
+    # AC2, `_classify_anchor_scope_reframe()` returns `status:
+    # not_applicable` for the genuine-absence case where a trusted-author
+    # anchor comment DOES exist but simply carries no ANCHOR_SCOPE_REFRAME_V1
+    # marker -- the same scenario the `reason ==
+    # "no_anchor_scope_reframe_v1_payload"` branch below already projects to
+    # `status: missing_marker`, with the trusted author's anchor comment
+    # evidence (comment_url / body_sha256 / author_association /
+    # required_rerun) populated below rather than dropped. Falling through
+    # here (instead of returning `base` early) is what preserves that
+    # evidence for the genuine-absence case.
+    #
+    # PR #2171 fix_delta (P1-4, OWNER adversarial review): the above is
+    # deliberately scoped to `status == not_applicable` combined with
+    # `reason == no_anchor_scope_reframe_v1_payload` ONLY. A different
+    # `not_applicable` producer -- a bare `{"status": "not_applicable"}`
+    # with no reason, or an unrelated reason string -- carries no
+    # trustworthy anchor-comment evidence and must not fall through to the
+    # `invalid_scope_delta_approval` branch below (which would
+    # mischaracterize "no reframe info available" as "a reframe was
+    # attempted but rejected").
+    if decision.get("status") == "not_applicable" and decision.get("reason") != (
+        "no_anchor_scope_reframe_v1_payload"
+    ):
         return base
 
     base["present"] = True
@@ -2381,6 +2553,11 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
         else:
             generated_at = datetime.now(timezone.utc).isoformat()
 
+        # The planner is the refinement loop's production decision source.
+        # If the caller supplies live main-drift facts, emit this decision
+        # before any consumer can reuse base-bound snapshot/CI/review data.
+        refinement_main_drift = _refinement_main_drift_decision(known_context)
+
         # Check for malformations
         fail_closed_reasons = []
         # Track missing sections and contract keys for FAIL_CLOSED_REWRITE_CONSTRAINTS_V1
@@ -2642,7 +2819,19 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 # path so cross-repo spoofed evidence fails closed here too.
                 scope_signal_guard_decision_v2["scope_delta_authority"] = classify_scope_delta_authority(
                     known_context.get("scope_delta_authority_evidence"),
-                    triggered=_raw_triggered,
+                    # A no-op delta must not suppress the separate freeform
+                    # authority lane: the classifier validates its evidence
+                    # and remains fail-closed for untrusted or ambiguous input.
+                    # PR #2083 review fix (P1-2): the outer `if` above already
+                    # confirmed "scope_delta_authority_evidence" in known_context,
+                    # i.e. evidence *presence*, not its value truthiness, is what
+                    # triggers this lane. Gating on `known_context.get(...)`'s
+                    # truthiness made a present-but-falsy evidence payload
+                    # ({}, [], "", None) combined with a no-op raw delta silently
+                    # fall to triggered=False -> not_triggered/implementation_allowed
+                    # (fail-open), diverging from the iteration-zero branch below,
+                    # which always uses triggered=True once presence is confirmed.
+                    triggered=True,
                     target_issue_number=issue_number,
                     base_issue_body_sha256=issue_body_sha256,
                     expected_repo=_expected_repo_for_issue(issue, known_context),
@@ -2749,6 +2938,15 @@ def plan_refinement_loop(input_data: dict[str, Any]) -> tuple[dict[str, Any], in
                 "human_message": "",
             },
         }
+
+        if refinement_main_drift is not None:
+            plan["decisions"]["main_drift_evidence_epoch"] = refinement_main_drift
+            if refinement_main_drift["route"] == "hard_stop":
+                plan["fail_closed"] = {
+                    "required": True,
+                    "reason_codes": [refinement_main_drift["reason_code"]],
+                    "human_message": "main drift evidence cannot be safely rebound",
+                }
 
         if scope_signal_guard_decision_v2 is not None:
             plan["scope_signal_guard_decision_v2"] = scope_signal_guard_decision_v2

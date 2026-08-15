@@ -164,6 +164,47 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "fixture": {"type": "repo_relative_file", "required": True},
         },
     },
+    # Issue #2136: test-only sibling profile for the real offline E2E.  It
+    # deliberately combines the fixture and human-context contracts without
+    # widening either production profile.
+    "preflight.run.fixture.with_human_context": {
+        "id": "preflight.run.fixture.with_human_context",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--fixture", "{fixture}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
+            "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_skill_runtime_anchor_fixture",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "local_only",
+        "stdin_contract": "none",
+        "stdout_contract": "refinement_preflight_result/v1",
+        "timeout_seconds": 120,
+        "mutation": False,
+        "test_only": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "fixture": {"type": "repo_relative_file", "required": True},
+            "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+            # The transport is a closed optional flag/value pair.  The
+            # test-only sibling must retain both the transport-present and
+            # transport-absent command grammars; policy/executor reject every
+            # partial, duplicate, reordered, equals, or unknown variant.
+            "investigation_evidence_transport_path": {
+                "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
+            },
+        },
+    },
     # An anchor URL is not an origin assertion.  The unlabelled profile is
     # intentionally read-only and resolves to generated/unknown provenance.
     "preflight.run.with_anchor": {
@@ -370,6 +411,23 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "timeout_seconds": 60,
         "mutation": False,
         "placeholders": {},
+    },
+    "web_research.route": {
+        "id": "web_research.route",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/route_web_research_result.py",
+            "--input-file", "{routing_input_file}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "none",
+        "stdout_contract": "web_research_routing_result/v1",
+        "timeout_seconds": 30,
+        "mutation": False,
+        "placeholders": {
+            "routing_input_file": {"type": "repo_relative_file", "required": True},
+        },
     },
     # #2086 AC10 (iteration 2, post-#2053/#2068 merge): `decide.run`'s argv
     # was extended by #2053 (now merged to main) to optionally carry the
@@ -651,6 +709,40 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "network_effect": "local_only",
         "placeholders": {
             "issue_number": {"type": "positive_int", "required": True},
+        },
+    },
+    # Issue #2049: root-owned producer I/O for the issue-refinement-loop
+    # review step. Fetches + pins the live Issue body exactly once, runs
+    # check_issue_contract.py / contract_readiness_check.py / merge_readiness,
+    # and persists the merged review result to the canonical artifact
+    # directory. PR #2135 human REQUEST_CHANGES iteration-3 P0-1: this
+    # command is now ALSO the sole producer of the ISSUE_REVIEW_RESULT_COMPACT_V1
+    # compact envelope (see `produce_compact_result()` /
+    # `compact_result.stdout_lines` in the stdout JSON) -- the read-only
+    # `issue-reviewer` custom agent (.codex/agents/issue-reviewer.toml) never
+    # invokes compact_review_result.py or performs any producer I/O itself;
+    # it only relays `compact_result.stdout_lines` verbatim. This is a
+    # deliberate, narrow exception to #1875's minimal-harness direction
+    # (see run_root_review_pipeline.py's module docstring "Architecture
+    # delta relative to #1875" for the full rationale/consumer inventory).
+    "root_review_pipeline.produce": {
+        "id": "root_review_pipeline.produce",
+        "argv": [
+            "uv", "run", "--locked", "python3",
+            f"{_SKILL_PREFIX}/run_root_review_pipeline.py",
+            "produce",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "stdin_contract": "none",
+        "stdout_contract": "root_review_pipeline_result/v1",
+        "timeout_seconds": 90,
+        "mutation": False,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
         },
     },
 }

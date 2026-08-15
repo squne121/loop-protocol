@@ -43,6 +43,16 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     ("ci", "test"): "required",
     ("ci", "build"): "required",
     ("ci", "e2e"): "evidence",
+    # Issue #2119: e2e-core / e2e-responsive-matrix are the two dedicated
+    # provider jobs the required aggregate `e2e` (above) depends on via
+    # `needs` + `if: always()`. Without an explicit classification entry
+    # both fall through to "unknown" (get_classification default), which
+    # determine_check_verdict() treats as ALWAYS blocking with
+    # failure_reason=gh_error even when both providers actually succeeded
+    # (the same class of regression Issue #1760 fixed for python-test-core /
+    # codex-execpolicy above).
+    ("ci", "e2e-core"): "evidence",
+    ("ci", "e2e-responsive-matrix"): "evidence",
     # Issue #1760: python-test-core / codex-execpolicy are the two dedicated lane
     # jobs that python-test (the required aggregate, still classified below) depends
     # on. Without an explicit classification entry both fall through to "unknown"
@@ -85,6 +95,12 @@ REQUIRED_CHECKS: set[tuple[str, str]] = {
     ("ci", "test"),
     ("ci", "build"),
     ("ci", "e2e"),
+    # Issue #2119: the two dedicated provider jobs that feed the "e2e"
+    # required aggregate must themselves be present with conclusion=success
+    # for the aggregate's own success to count as real merge-ready evidence
+    # (same pattern as python-test-core/codex-execpolicy below, Issue #1760).
+    ("ci", "e2e-core"),
+    ("ci", "e2e-responsive-matrix"),
     # Issue #1760: the two dedicated lane jobs that feed the "python-test"
     # required aggregate must themselves be present with conclusion=success
     # for the aggregate's own success to count as real merge-ready evidence.

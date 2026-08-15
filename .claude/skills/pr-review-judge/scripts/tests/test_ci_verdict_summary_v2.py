@@ -197,6 +197,8 @@ class TestAC10EnumExhaustiveness:
             make_check("test", conclusion="success"),
             make_check("build", conclusion="success"),
             make_check("e2e", conclusion="success"),
+            make_check("e2e-core", conclusion="success"),
+            make_check("e2e-responsive-matrix", conclusion="success"),
             make_check("python-test-core", conclusion="success"),
             make_check("codex-execpolicy", conclusion="success"),
             make_check("python-test", conclusion="success"),
@@ -449,6 +451,8 @@ class TestB3NoRequiredEvidence:
             ("ci", "test"),
             ("ci", "build"),
             ("ci", "e2e"),
+            ("ci", "e2e-core"),
+            ("ci", "e2e-responsive-matrix"),
             ("ci", "python-test-core"),
             ("ci", "codex-execpolicy"),
             ("ci", "python-test"),
@@ -466,6 +470,8 @@ class TestB3NoRequiredEvidence:
             make_check("test", conclusion="success"),
             make_check("build", conclusion="success"),
             make_check("e2e", conclusion="success"),
+            make_check("e2e-core", conclusion="success"),
+            make_check("e2e-responsive-matrix", conclusion="success"),
             make_check("python-test-core", conclusion="success"),
             make_check("codex-execpolicy", conclusion="success"),
             make_check("python-test", conclusion="success"),
@@ -486,6 +492,8 @@ class TestB3NoRequiredEvidence:
             make_check("test", conclusion="success"),
             make_check("build", conclusion="success"),
             make_check("e2e", conclusion="success"),
+            make_check("e2e-core", conclusion="success"),
+            make_check("e2e-responsive-matrix", conclusion="success"),
             make_check("python-test", conclusion="success"),
             make_check("node-backed-hook-tests", conclusion="success"),
             # actionlint missing
@@ -524,6 +532,8 @@ class TestB5UnknownClassificationBlocking:
             make_check("test", conclusion="success"),
             make_check("build", conclusion="success"),
             make_check("e2e", conclusion="success"),
+            make_check("e2e-core", conclusion="success"),
+            make_check("e2e-responsive-matrix", conclusion="success"),
             make_check("python-test", conclusion="success"),
             make_check("actionlint", conclusion="success"),
         ]
@@ -620,6 +630,7 @@ class TestP0RealCheckRunApiEvidence:
     def test_actual_check_runs_are_bound_to_current_workflow_and_head(self, v2):
         names = [
             "typecheck", "lint", "test", "build", "e2e",
+            "e2e-core", "e2e-responsive-matrix",
             "python-test-core", "codex-execpolicy", "python-test",
             "node-backed-hook-tests", "actionlint", "agy-causal-claim-drift-gate",
             "visual-impact-policy",
@@ -820,8 +831,20 @@ class TestP0_1AllRealCiJobsClassified:
     def test_real_ci_jobs_all_green_yields_merge_ready_not_gh_error(self, v2):
         """End-to-end reproduction of the reported bug (run 30271027218):
         every job that feeds ci-verdict-summary succeeds at the current head,
-        and overall_status must be merge_ready, never gh_error."""
+        and overall_status must be merge_ready, never gh_error.
+
+        The synthetic check-run set below is the union of ci-verdict-summary's
+        own `needs` AND every `("ci", <name>)` entry in REQUIRED_CHECKS (Issue
+        #2119: e2e-core / e2e-responsive-matrix are REQUIRED_CHECKS entries
+        but are deliberately NOT in ci-verdict-summary's `needs` — AC11, the
+        aggregate `e2e` is the sole authoritative dependency there — yet
+        GitHub's real check-runs API still returns a CheckRun for every
+        workflow job regardless of any other job's `needs` graph, so a
+        faithful "every real CI job succeeded" simulation must include them
+        too)."""
         needs = self._ci_verdict_summary_needs()
+        required_ci_names = {name for (workflow, name) in v2.REQUIRED_CHECKS if workflow == "ci"}
+        needs = sorted(set(needs) | required_ci_names)
         run_id = 4242
 
         def api_row(name: str) -> dict:

@@ -797,7 +797,8 @@
       "required": [
         "claim",
         "affects",
-        "source_hint"
+        "source_hint",
+        "role"
       ],
       "additionalProperties": false,
       "properties": {
@@ -818,6 +819,13 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "dispositive",
+            "non_dispositive"
           ]
         }
       }

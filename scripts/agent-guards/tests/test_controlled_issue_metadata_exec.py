@@ -1575,6 +1575,18 @@ class TestSingleCommentCanonicalReadback:
         parser = _load_single_comment_production_parser()
         issue_url = "https://github.com/squne121/loop-protocol/issues/1649"
         body_sha = _sha("current issue body")
+        fingerprint_json = json.dumps(
+            {
+                "issue_number": 1649,
+                "contract_source_kind": "issue_comment",
+                "contract_source_id": str(_SINGLE_COMMENT_ID),
+                "contract_body_sha256": body_sha,
+                "allowed_paths_normalized_sha256": "a" * 64,
+                "base_ref": "main",
+                "base_sha_at_snapshot": "b" * 40,
+            },
+            separators=(",", ":"),
+        )
         snapshot_body = "\n".join(
             [
                 "```yaml",
@@ -1584,14 +1596,7 @@ class TestSingleCommentCanonicalReadback:
                 f'  issue_url: "{issue_url}"',
                 '  generated_at: "2026-07-20T00:00:00Z"',
                 f'  body_sha256: "{body_sha}"',
-                "  expected_contract_fingerprint:",
-                "    issue_number: 1649",
-                "    contract_source_kind: issue_comment",
-                f'    contract_source_id: "{_SINGLE_COMMENT_ID}"',
-                f'    contract_body_sha256: "{body_sha}"',
-                "    allowed_paths_normalized_sha256: " + "a" * 64,
-                '    base_ref: "main"',
-                "    base_sha_at_snapshot: " + "b" * 40,
+                f"  expected_contract_fingerprint: '{fingerprint_json}'",
                 "```",
             ]
         )
@@ -1708,6 +1713,18 @@ class TestSingleCommentCanonicalReadback:
             "checks": {"product_spec_check": {"body_sha256": body_sha256}},
         }
         issue_url = "https://github.com/squne121/loop-protocol/issues/1649"
+        fingerprint_json = json.dumps(
+            {
+                "issue_number": 1649,
+                "contract_source_kind": "issue_comment",
+                "contract_source_id": str(_SINGLE_COMMENT_ID),
+                "contract_body_sha256": body_sha256,
+                "allowed_paths_normalized_sha256": "a" * 64,
+                "base_ref": "main",
+                "base_sha_at_snapshot": "b" * 40,
+            },
+            separators=(",", ":"),
+        )
         snapshot_body = "\n".join(
             [
                 "```yaml",
@@ -1717,14 +1734,7 @@ class TestSingleCommentCanonicalReadback:
                 f'  issue_url: "{issue_url}"',
                 '  generated_at: "2026-07-20T00:00:00Z"',
                 f'  body_sha256: "{body_sha256}"',
-                "  expected_contract_fingerprint:",
-                "    issue_number: 1649",
-                "    contract_source_kind: issue_comment",
-                f'    contract_source_id: "{_SINGLE_COMMENT_ID}"',
-                f'    contract_body_sha256: "{body_sha256}"',
-                "    allowed_paths_normalized_sha256: " + "a" * 64,
-                '    base_ref: "main"',
-                "    base_sha_at_snapshot: " + "b" * 40,
+                f"  expected_contract_fingerprint: '{fingerprint_json}'",
                 "```",
             ]
         )

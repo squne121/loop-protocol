@@ -60,9 +60,10 @@ errors:           tuple of human-readable error strings (empty on success)
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,7 @@ from typing import Any, Literal, Mapping
 ROUTE_APPROVED = "approved"
 ROUTE_CONTINUE_LOOP = "continue_loop"
 ROUTE_TO_UPDATE_BRANCH = "route_to_update_branch"
+ROUTE_SCOPE_CLEAN_RECONCILIATION = "route_scope_clean_reconciliation"
 ROUTE_STALE_HEAD_REREVIEW = "route_stale_head_rereview"
 ROUTE_HUMAN_ESCALATION = "route_human_escalation"
 ROUTE_CONFLICT_HARD_STOP = "conflict_hard_stop"
@@ -113,6 +115,166 @@ _REJECTED_LEGACY_FIELDS: tuple[str, ...] = (
 )
 
 
+# Shared, side-effect-free main-drift evidence policy (Issue #2102).  It is
+# located in this Allowed Paths exact file so implementation-loop consumers
+# need no separate mutation-capable module.  Refinement imports this pure API
+# but retains Issue/scope-snapshot mutation responsibility.
+_MAIN_DRIFT_SHA = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class MainDriftDecision:
+    route: str
+    reason_code: str | None
+    evidence_epoch: Mapping[str, object] | None
+    reverify: Mapping[str, bool]
+    reusable_evidence: Mapping[str, object | None]
+
+
+# Bounded outer drift-rebind budget (Issue #2102 P0-B). Independent of
+# LOOP_STATE.iteration / implementation_iteration_delta: main-drift-driven
+# rebinds never spend the implementation iteration budget, but they are not
+# unbounded either -- an actively churning main must not livelock the loop.
+# The bound mirrors the precedent set by #2039 (pre-dispatch rebase budget
+# capped at 1 retry, post-dispatch retry budget starts at 0 and never blind
+# retries) and #1023 (bounded no-progress state distinct from the ordinary
+# iteration counter).
+DEFAULT_MAX_DRIFT_REBIND_ATTEMPTS = 2
+
+
+def classify_main_drift(
+    *,
+    current_base_sha: str,
+    evidence_base_sha: str,
+    allowed_paths_snapshot_base_sha: str,
+    allowed_paths: Iterable[str],
+    latest_main_net_diff: Iterable[str],
+    expected_head_sha: str,
+    observed_head_sha: str,
+    expected_old_sha: str,
+    observed_old_sha: str,
+    semantic_ambiguity: bool = False,
+    behind_fast_path_eligible: bool = False,
+    owner: str = "implementation",
+    drift_rebind_attempts: int = 0,
+    max_drift_rebind_attempts: int = DEFAULT_MAX_DRIFT_REBIND_ATTEMPTS,
+) -> MainDriftDecision:
+    """Classify base-bound evidence freshness without performing mutation."""
+    values = (
+        current_base_sha,
+        evidence_base_sha,
+        allowed_paths_snapshot_base_sha,
+        expected_head_sha,
+        observed_head_sha,
+        expected_old_sha,
+        observed_old_sha,
+    )
+    if any(
+        not isinstance(value, str) or not _MAIN_DRIFT_SHA.fullmatch(value)
+        for value in values
+    ):
+        return MainDriftDecision("hard_stop", "base_sha_fingerprint_mismatch", None, {}, {})
+    if expected_head_sha != observed_head_sha:
+        return MainDriftDecision("hard_stop", "expected_head_cas_mismatch", None, {}, {})
+    if expected_old_sha != observed_old_sha:
+        return MainDriftDecision("hard_stop", "expected_old_cas_mismatch", None, {}, {})
+    if current_base_sha == evidence_base_sha:
+        return MainDriftDecision(
+            "fresh",
+            None,
+            {"base_sha": current_base_sha, "epoch": 0, "owner": owner},
+            {"snapshot": False, "ci": False, "review": False},
+            {"snapshot": "current", "ci": "current", "review": "current"},
+        )
+    if allowed_paths_snapshot_base_sha != current_base_sha:
+        return MainDriftDecision("hard_stop", "stale_allowed_paths_snapshot", None, {}, {})
+    if semantic_ambiguity:
+        return MainDriftDecision("hard_stop", "semantic_ambiguity", None, {}, {})
+    if any(
+        not any(
+            path == allowed or (allowed.endswith("/") and path.startswith(allowed))
+            for allowed in allowed_paths
+        )
+        for path in set(latest_main_net_diff)
+    ):
+        return MainDriftDecision("hard_stop", "allowed_paths_conflict", None, {}, {})
+    if (
+        not isinstance(drift_rebind_attempts, int)
+        or isinstance(drift_rebind_attempts, bool)
+        or drift_rebind_attempts < 0
+    ):
+        return MainDriftDecision("hard_stop", "main_drift_context_invalid", None, {}, {})
+    if drift_rebind_attempts >= max_drift_rebind_attempts:
+        # Deterministic, machine-decidable stop -- NOT a semantic-judgment
+        # failure. The caller must persist drift_rebind_attempts (e.g. in
+        # LOOP_STATE) across cycles for this bound to be effective; this
+        # function itself performs no persistence (no side effects).
+        return MainDriftDecision(
+            "hard_stop", "concurrent_base_churn_budget_exhausted", None, {}, {}
+        )
+
+    common = {
+        "evidence_epoch": {
+            "base_sha": current_base_sha,
+            "epoch": 1,
+            "owner": owner,
+            "implementation_iteration_delta": 0,
+            "drift_rebind_attempts": drift_rebind_attempts + 1,
+            "max_drift_rebind_attempts": max_drift_rebind_attempts,
+        },
+        "reverify": {"snapshot": True, "ci": True, "review": True},
+        "reusable_evidence": {"snapshot": None, "ci": None, "review": None},
+    }
+    if behind_fast_path_eligible:
+        return MainDriftDecision("behind_fast_path", "main_drift_scope_clean", **common)
+    return MainDriftDecision("scope_clean_reconciliation", "main_drift_scope_clean", **common)
+
+
+_STEP5_MAIN_DRIFT_FACTS = (
+    "current_base_sha",
+    "evidence_base_sha",
+    "allowed_paths_snapshot_base_sha",
+    "allowed_paths",
+    "latest_main_net_diff",
+    "expected_old_sha",
+    "observed_old_sha",
+)
+
+
+def build_step5_live_mergeability(
+    live_pr: Mapping[str, Any],
+    main_drift_facts: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the only Step 5 production input shape for main-drift routing.
+
+    The control-plane fetches ``live_pr`` and constructs
+    ``main_drift_facts`` from the same decision cycle.  It must not omit
+    these facts because the merge state is not ``BEHIND``: CLEAN and
+    HAS_HOOKS would otherwise permit stale evidence to reach ``approved``.
+    Missing facts are rejected instead of silently treating the decision as
+    non-drift.
+    """
+    if not isinstance(live_pr, Mapping):
+        raise ValueError("live_pr must be a mapping")
+    if not isinstance(main_drift_facts, Mapping):
+        raise ValueError("main_drift_facts must be a mapping")
+
+    missing = [key for key in _STEP5_MAIN_DRIFT_FACTS if key not in main_drift_facts]
+    if missing:
+        raise ValueError(f"main_drift_facts missing required keys: {', '.join(missing)}")
+
+    result = {
+        "head_sha": live_pr.get("head_sha"),
+        "mergeable": live_pr.get("mergeable"),
+        "merge_state_status": live_pr.get("merge_state_status"),
+        "main_drift": dict(main_drift_facts),
+    }
+    error = _validate_live_mergeability(result)
+    if error:
+        raise ValueError(error)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Output schema
 # ---------------------------------------------------------------------------
@@ -123,6 +285,7 @@ class RouteDecision:
         "approved",
         "continue_loop",
         "route_to_update_branch",
+        "route_scope_clean_reconciliation",
         "route_stale_head_rereview",
         "route_human_escalation",
         "conflict_hard_stop",
@@ -238,6 +401,76 @@ def _validate_live_mergeability(raw: Any) -> str | None:
         # malformed input, not a legitimate conflict signal.
         return f"schema_invalid_merge_state_status_value:{merge_state_status!r}"
 
+    main_drift_error = _validate_main_drift_facts(raw)
+    if main_drift_error:
+        return main_drift_error
+
+    return None
+
+
+def _validate_main_drift_facts(raw: Mapping[str, Any]) -> str | None:
+    """Validate main-drift facts IF the caller supplied them.
+
+    main_drift remains an OPTIONAL key on the public two-input routing
+    boundary (module docstring; Design Invariant in Issue #2102: the
+    public route_loop_verdict_v2(reviewer_verdict, live_mergeability)
+    signature does not change). Production callers that have live
+    current-main facts available SHOULD use
+    build_step5_live_mergeability(), which requires the complete fact set
+    up front and raises before this function is ever reached with a partial
+    payload. Callers that omit main_drift entirely keep the pre-#2102
+    routing behavior (no drift classification is applied). Only a PRESENT
+    but malformed main_drift dict is rejected here.
+    """
+    if "main_drift" not in raw:
+        return None
+
+    main_drift = raw["main_drift"]
+    if not isinstance(main_drift, Mapping):
+        return "main_drift_context_invalid"
+
+    missing = [key for key in _STEP5_MAIN_DRIFT_FACTS if key not in main_drift]
+    if missing:
+        return "main_drift_context_invalid"
+
+    for key in (
+        "current_base_sha",
+        "evidence_base_sha",
+        "allowed_paths_snapshot_base_sha",
+        "expected_old_sha",
+        "observed_old_sha",
+    ):
+        value = main_drift[key]
+        if not isinstance(value, str) or not _MAIN_DRIFT_SHA.fullmatch(value):
+            return "main_drift_context_invalid"
+
+    allowed_paths = main_drift["allowed_paths"]
+    if (
+        not isinstance(allowed_paths, (list, tuple))
+        or not allowed_paths
+        or any(not isinstance(path, str) or not path for path in allowed_paths)
+    ):
+        return "main_drift_context_invalid"
+
+    latest_main_net_diff = main_drift["latest_main_net_diff"]
+    if not isinstance(latest_main_net_diff, (list, tuple)) or any(
+        not isinstance(path, str) or not path for path in latest_main_net_diff
+    ):
+        return "main_drift_context_invalid"
+
+    for key in ("semantic_ambiguity", "behind_fast_path_eligible"):
+        if key in main_drift and not isinstance(main_drift[key], bool):
+            return "main_drift_context_invalid"
+
+    for int_key in ("drift_rebind_attempts", "max_drift_rebind_attempts"):
+        if int_key not in main_drift:
+            continue
+        value = main_drift[int_key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return "main_drift_context_invalid"
+        if int_key == "max_drift_rebind_attempts" and value < 1:
+            return "main_drift_context_invalid"
+
     return None
 
 
@@ -257,6 +490,61 @@ def _is_behind(merge_state_status: Any) -> bool:
     return merge_state_status == "BEHIND"
 
 
+def _classify_implementation_main_drift(
+    main_drift: Mapping[str, Any],
+    *,
+    reviewed_head_sha: str,
+    live_head_sha: str,
+    merge_state_status: str,
+) -> MainDriftDecision | None:
+    """Map caller-supplied live facts into the shared pure policy.
+
+    This is deliberately independent of approval / CI state.  A stale
+    base-bound snapshot, CI result, or review may not survive merely because
+    GitHub currently reports CLEAN, HAS_HOOKS, BLOCKED, or another state.
+    """
+    try:
+        return classify_main_drift(
+            current_base_sha=main_drift["current_base_sha"],
+            evidence_base_sha=main_drift["evidence_base_sha"],
+            allowed_paths_snapshot_base_sha=main_drift[
+                "allowed_paths_snapshot_base_sha"
+            ],
+            allowed_paths=main_drift["allowed_paths"],
+            latest_main_net_diff=main_drift["latest_main_net_diff"],
+            expected_head_sha=reviewed_head_sha,
+            observed_head_sha=live_head_sha,
+            expected_old_sha=main_drift["expected_old_sha"],
+            observed_old_sha=main_drift["observed_old_sha"],
+            semantic_ambiguity=bool(main_drift.get("semantic_ambiguity", False)),
+            behind_fast_path_eligible=(
+                _is_behind(merge_state_status)
+                and bool(main_drift.get("behind_fast_path_eligible", False))
+            ),
+            drift_rebind_attempts=int(main_drift.get("drift_rebind_attempts", 0)),
+            max_drift_rebind_attempts=int(
+                main_drift.get(
+                    "max_drift_rebind_attempts", DEFAULT_MAX_DRIFT_REBIND_ATTEMPTS
+                )
+            ),
+        )
+    except (KeyError, TypeError):
+        return None
+
+
+def _reconciliation_decision(drift: MainDriftDecision) -> RouteDecision:
+    return _decision(
+        ROUTE_SCOPE_CLEAN_RECONCILIATION,
+        reason_code=drift.reason_code,
+        selected_action={
+            "kind": "scope_clean_reconciliation",
+            "evidence_epoch": dict(drift.evidence_epoch or {}),
+            "reusable_evidence": dict(drift.reusable_evidence),
+        },
+        rerun_required=drift.reverify,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -274,7 +562,12 @@ def route_loop_verdict_v2(
         {verdict, reviewed_head_sha, blockers, warnings}.
     live_mergeability:
         Live GitHub PR state fetched by the caller:
-        {head_sha, mergeable, merge_state_status}.
+        {head_sha, mergeable, merge_state_status}.  When current-main facts
+        are available, the caller adds them under ``main_drift`` (optional
+        key; see build_step5_live_mergeability()) so the public two-input
+        routing boundary remains stable. A malformed (but present)
+        main_drift payload fails closed; an absent main_drift key falls
+        back to pre-#2102 routing (no drift classification).
 
     Returns
     -------
@@ -327,6 +620,31 @@ def route_loop_verdict_v2(
 
     if merge_state_status == "DIRTY":
         return _conflict("conflict_merge_state_status_DIRTY")
+
+    # Main drift is an implementation-loop transition, rather than a BEHIND
+    # special case.  Rebind/invalidate stale base-bound evidence before any
+    # reviewer verdict or merge-state dispatch can reuse it.  A real Git
+    # conflict remains the higher-priority terminal route above.
+    drift_strategy: str | None = None
+    main_drift = live_mergeability.get("main_drift")
+    if main_drift is not None:
+        drift = _classify_implementation_main_drift(
+            main_drift,
+            reviewed_head_sha=reviewed_head_sha,
+            live_head_sha=live_head_sha,
+            merge_state_status=merge_state_status,
+        )
+        if drift is None:
+            return _fail("main_drift_context_invalid", "main drift context is incomplete")
+        if drift.route == "hard_stop":
+            return _fail(
+                drift.reason_code or "main_drift_hard_stop",
+                "main drift reconciliation is unsafe",
+            )
+        if drift.route == "scope_clean_reconciliation":
+            return _reconciliation_decision(drift)
+        if drift.route == "behind_fast_path":
+            drift_strategy = "behind_fast_path"
 
     # ------------------------------------------------------------------
     # Priority 3: reviewer verdict dispatch.
@@ -385,6 +703,8 @@ def route_loop_verdict_v2(
             "mechanical": True,
             "expected_head_sha": reviewed_head_sha,
         }
+        if drift_strategy is not None:
+            action["main_drift_strategy"] = drift_strategy
         return _decision(
             ROUTE_TO_UPDATE_BRANCH,
             selected_action=action,
@@ -420,3 +740,81 @@ def route_loop_verdict_v2(
         f"mergeable={mergeable}, merge_state_status={merge_state_status} did not "
         f"match any known routing branch.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2102 fix_delta iteration 5, Blocker B: caller-side convenience
+# wrapper for the git-conflict-detection oracle.
+# ---------------------------------------------------------------------------
+#
+# route_loop_verdict_v2() above stays pure / side-effect-free (module
+# docstring Design Invariant: no gh, git, network, or subprocess calls at
+# module load or function call). It therefore continues to accept
+# main_drift["semantic_ambiguity"] as a caller-supplied boolean when
+# present, exactly as before this Issue.
+#
+# scripts/agent-ops/pr_head_replay_publish_exec.py is the implementation
+# loop's existing subprocess-capable Allowed Paths exact file: this wrapper
+# imports its compute_semantic_ambiguity() (a thin public export of the same
+# git merge-tree --write-tree oracle _merge_tree_conflicts() already uses for
+# the publish executor's own conflict check) rather than adding a new file
+# or granting route_loop_verdict_v2.py subprocess authority of its own.
+#
+# This is option (a) from the Issue #2102 fix_delta iteration 5 contract:
+# the router's own pure API is unchanged; a sibling function in the same
+# Allowed Paths exact file supplies the missing fact for callers that did
+# not already resolve it deterministically upstream (e.g. via
+# build_step5_live_mergeability(), which still accepts a caller-supplied
+# main_drift["semantic_ambiguity"] when the caller already computed it).
+def route_loop_verdict_v2_resolve_semantic_ambiguity(
+    reviewer_verdict: Mapping[str, Any],
+    live_mergeability: Mapping[str, Any],
+    *,
+    cwd: Any,
+) -> RouteDecision:
+    """Resolve main_drift["semantic_ambiguity"] via the real Git
+    merge-tree oracle before dispatching to the pure route_loop_verdict_v2().
+
+    If ``live_mergeability["main_drift"]`` is absent, malformed, or already
+    carries an explicit ``semantic_ambiguity`` boolean, this delegates to
+    ``route_loop_verdict_v2()`` unchanged (byte-identical routing to a
+    direct call). Only when main_drift is a well-formed mapping supplying
+    ``current_base_sha``/``evidence_base_sha`` but omitting
+    ``semantic_ambiguity`` does this wrapper perform the one Git subprocess
+    call (``git merge-tree --write-tree``, via
+    pr_head_replay_publish_exec.compute_semantic_ambiguity()) needed to fill
+    it in deterministically, never accepting a caller-asserted boolean as a
+    substitute.
+    """
+    main_drift = live_mergeability.get("main_drift") if isinstance(live_mergeability, Mapping) else None
+    if (
+        isinstance(main_drift, Mapping)
+        and "semantic_ambiguity" not in main_drift
+        and isinstance(main_drift.get("current_base_sha"), str)
+        and isinstance(main_drift.get("evidence_base_sha"), str)
+        and main_drift["current_base_sha"] != main_drift["evidence_base_sha"]
+    ):
+        import sys as _sys_for_semantic_ambiguity_import
+        from pathlib import Path as _Path_for_semantic_ambiguity_import
+
+        _agent_ops_dir = _Path_for_semantic_ambiguity_import(__file__).resolve().parents[4] / "scripts" / "agent-ops"
+        if str(_agent_ops_dir) not in _sys_for_semantic_ambiguity_import.path:
+            _sys_for_semantic_ambiguity_import.path.insert(0, str(_agent_ops_dir))
+        try:
+            from pr_head_replay_publish_exec import compute_semantic_ambiguity as _compute_semantic_ambiguity
+        except ImportError:
+            _compute_semantic_ambiguity = None
+
+        if _compute_semantic_ambiguity is not None:
+            resolved_ambiguity = _compute_semantic_ambiguity(
+                main_drift["evidence_base_sha"],
+                main_drift["current_base_sha"],
+                cwd=cwd,
+            )
+            live_mergeability = dict(live_mergeability)
+            live_mergeability["main_drift"] = {
+                **main_drift,
+                "semantic_ambiguity": bool(resolved_ambiguity),
+            }
+
+    return route_loop_verdict_v2(reviewer_verdict, live_mergeability)

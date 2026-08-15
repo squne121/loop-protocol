@@ -14,7 +14,11 @@ Outputs VISUAL_ARTIFACT_PIPELINE_CHECK_V1 to stdout.
 Exit code: 0 = pass, 1 = contract violation, 2 = usage / parse error.
 
 Contract (registry §5) — each is a HARD FAIL, not a range/presence check:
-  jobs.e2e upload steps for `playwright-report/` and `test-results/`:
+  jobs.e2e-core upload steps for `playwright-report/` and `test-results/`
+  (Issue #2119: producer authority moved from the pre-#2119 `jobs.e2e` to
+  `jobs.e2e-core`; the aggregate `jobs.e2e` job after #2119 only evaluates
+  e2e-core/e2e-responsive-matrix needs+if:always() conclusions and must not
+  re-upload/re-download provider artifacts to impersonate the old contract):
     - uses     == exact allowed pin (default: actions/upload-artifact@v6)
     - if       == "${{ !cancelled() }}"  (always()/failure() rejected)
     - id       == the contract id for that path
@@ -110,6 +114,15 @@ ARTIFACT_STATUS_REQUIRED_TOKENS = [
     "steps.upload-test-results.outputs.artifact-id",
     *ARTIFACT_STATUS_STATES,
 ]
+
+# Issue #2119 AC13: visual artifact producer authority is `e2e-core` (not the
+# `e2e` aggregate job, which after this Issue only evaluates
+# e2e-core/e2e-responsive-matrix needs+if:always() conclusions and no longer
+# owns any upload-artifact/summary steps itself). This validator follows
+# that move — it must NOT accept a compatibility shim that re-uploads/
+# re-downloads e2e-core's artifacts under the aggregate `e2e` job to
+# impersonate the old `jobs["e2e"]` contract.
+VISUAL_ARTIFACT_PRODUCER_JOB = "e2e-core"
 
 DEFAULT_WORKFLOW = ".github/workflows/ci.yml"
 DEFAULT_PW_CONFIG = "playwright.config.ts"
@@ -1473,12 +1486,36 @@ def main(argv: list[str]) -> int:
     failures: list[str] = []
 
     jobs = (doc or {}).get("jobs")
-    if not isinstance(jobs, dict) or "e2e" not in jobs:
-        return _emit(path, {}, [], False, ["missing jobs.e2e"])
+    if not isinstance(jobs, dict) or VISUAL_ARTIFACT_PRODUCER_JOB not in jobs:
+        return _emit(path, {}, [], False, [f"missing jobs.{VISUAL_ARTIFACT_PRODUCER_JOB}"])
 
-    steps = jobs["e2e"].get("steps")
+    # Issue #2119 AC13: the aggregate `e2e` job must not carry a
+    # compatibility shim that re-uploads/re-downloads e2e-core's artifacts to
+    # impersonate the pre-#2119 `jobs["e2e"]` contract.
+    aggregate_job = jobs.get("e2e")
+    if isinstance(aggregate_job, dict):
+        aggregate_steps = aggregate_job.get("steps") or []
+        for step in aggregate_steps:
+            if not isinstance(step, dict):
+                continue
+            uses = str(step.get("uses", ""))
+            action_name = uses.split("@", 1)[0]
+            if action_name in {"actions/upload-artifact", "actions/download-artifact"}:
+                return _emit(
+                    path,
+                    {},
+                    [],
+                    False,
+                    [
+                        "jobs.e2e (aggregate) must not re-upload/re-download provider "
+                        f"artifacts to impersonate the pre-#2119 jobs.e2e contract; "
+                        f"producer authority is jobs.{VISUAL_ARTIFACT_PRODUCER_JOB}",
+                    ],
+                )
+
+    steps = jobs[VISUAL_ARTIFACT_PRODUCER_JOB].get("steps")
     if not isinstance(steps, list):
-        return _emit(path, {}, [], False, ["jobs.e2e.steps is not a list"])
+        return _emit(path, {}, [], False, [f"jobs.{VISUAL_ARTIFACT_PRODUCER_JOB}.steps is not a list"])
 
     # Locate upload-artifact steps keyed by `with.path`.
     upload_steps: dict[str, dict] = {}

@@ -144,6 +144,23 @@ try:
 except ImportError:  # pragma: no cover - defensive fallback
     classify_repair_action = None
 
+_IMPL_MAIN_DRIFT_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts"
+if str(_IMPL_MAIN_DRIFT_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_IMPL_MAIN_DRIFT_SCRIPTS_DIR))
+try:
+    # Issue #2102 fix_delta (iteration 5, Blocker A): mirrors
+    # plan_refinement_loop.py's own best-effort import of the same symbol.
+    # This wrapper must not populate known_context["main_drift"] (a bounded
+    # live git fetch/diff/merge-tree probe) when the planner it feeds cannot
+    # even import the classifier that consumes that key -- a harness that
+    # only provisions this skill's own scripts/ directory (not its
+    # impl-review-loop sibling) would otherwise pay the live-readback cost
+    # only to have plan_refinement_loop.py hard_stop with
+    # main_drift_policy_import_failed regardless of the readback's content.
+    from route_loop_verdict_v2 import classify_main_drift as _main_drift_classifier_probe
+except ImportError:  # pragma: no cover - defensive fallback
+    _main_drift_classifier_probe = None
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -197,6 +214,20 @@ BLOCKER_ISSUE_EXECUTION_DECISION_VALIDATOR_UNAVAILABLE = "ISSUE_EXECUTION_DECISI
 # consumed by `_apply_exit_code_mapping()`, not just live inside
 # `known_context` where the planner never inspects them.
 BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED = "ANCHOR_MULTI_TURN_FAIL_CLOSED"
+
+# PR #2171 fix_delta (P0-1, OWNER adversarial review): the two distinct
+# fail_closed reasons `_apply_multi_turn_candidate_route()` can emit for a
+# multi-turn anchor -- the pre-existing hard block
+# ("multi_turn_anchor_context_requires_human_judgment") and the
+# integrity-unconfirmed forced-blocking route
+# ("multi_turn_anchor_context_retrieval_integrity_unconfirmed") -- both
+# must surface as BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED downstream.
+ANCHOR_MULTI_TURN_FAIL_CLOSED_REASONS = frozenset(
+    {
+        "multi_turn_anchor_context_requires_human_judgment",
+        "multi_turn_anchor_context_retrieval_integrity_unconfirmed",
+    }
+)
 BLOCKER_HEAVY_MUTATION_FAIL_CLOSED = "HEAVY_MUTATION_FAIL_CLOSED"
 BLOCKER_REPAIR_ENVIRONMENT_FAILURE = "REPAIR_ENVIRONMENT_FAILURE"
 
@@ -1339,6 +1370,121 @@ def _parse_anchor_scope_reframe_body(comment_body: str) -> "dict | None":
     return None
 
 
+_FENCE_OPEN_RE = re.compile(
+    r"^(?P<prefix>(?:[ \t]*>)*[ \t]{0,8})(?P<fence>`{3,}|~{3,})[ \t]*(?P<info>.*)$"
+)
+
+_ANCHOR_SCOPE_REFRAME_KEY_NAMES = ("target", "decision", "allowed_path_deltas")
+
+
+def _anchor_scope_reframe_fence_content_related(content_text: str) -> bool:
+    """PR #2171 fix_delta (P2, OWNER adversarial review): a ```yaml fence's
+    content only counts as an ANCHOR_SCOPE_REFRAME_V1 *attempt* -- not any
+    unrelated fenced yaml a reviewer happens to quote (e.g. a config
+    snippet) -- when it plausibly targets this schema.
+
+    Fail-closed on ambiguity: content that does not even parse as YAML
+    cannot be proven unrelated, so it is treated as related (the
+    pre-existing present-but-invalid / fail_closed behavior for malformed
+    fences, #2156 AC3, is preserved unchanged).
+    """
+    if "ANCHOR_SCOPE_REFRAME_V1" in content_text:
+        return True
+    try:
+        import yaml as _yaml
+
+        parsed = _yaml.safe_load(content_text)
+    except Exception:
+        return True
+    if not isinstance(parsed, dict):
+        return False
+    if "schema_version" in parsed:
+        return True
+    return len(set(_ANCHOR_SCOPE_REFRAME_KEY_NAMES) & set(parsed.keys())) >= 2
+
+
+def _anchor_scope_reframe_fence_present(comment_body: str) -> bool:
+    """#2156 AC1 / PR #2171 fix_delta (P0-2, OWNER adversarial review):
+    detect whether the comment body contains a ```yaml (or ~~~yaml) fence
+    that is plausibly an ANCHOR_SCOPE_REFRAME_V1 payload attempt,
+    independent of whether the fence's content parses as a valid
+    ANCHOR_SCOPE_REFRAME_V1 payload.
+
+    Used only to distinguish genuine absence (no such fence anywhere in the
+    body -- the legitimate freeform lane) from present-but-invalid (a fence
+    exists but is malformed YAML, declares the wrong schema_version, or is
+    structurally rejected such as a blockquote-embedded fence). Non-canonical
+    fence variants (blockquoted, malformed, wrong schema_version) must all
+    stay in the present-but-invalid / fail_closed bucket -- only a body with
+    no such fence marker at all is genuine absence.
+
+    This is a line-oriented internal scanner (repo policy: PyYAML +
+    jsonschema only, no external Markdown parser dependency added), not a
+    full CommonMark implementation. It handles, unlike a single top-level
+    regex: backtick fences of length >=3 (including 4+), tilde fences
+    (``~~~yaml``), opening/closing fence length matching, 0-8 space /
+    blockquote-marker indentation (including nested blockquotes), fences
+    left unclosed through EOF, and a case-insensitive ``yaml`` info string.
+    Presence is further gated on content relatedness (P2) via
+    `_anchor_scope_reframe_fence_content_related()` so an unrelated ```yaml
+    fence is not misclassified as a reframe attempt.
+    """
+    lines = comment_body.splitlines()
+    n = len(lines)
+    idx = 0
+    found_any_yaml_fence = False
+    found_related = False
+
+    while idx < n:
+        match = _FENCE_OPEN_RE.match(lines[idx])
+        if not match:
+            idx += 1
+            continue
+        info_tokens = match.group("info").strip().split()
+        info_first_token = info_tokens[0].lower() if info_tokens else ""
+        if info_first_token != "yaml":
+            idx += 1
+            continue
+
+        fence_char = match.group("fence")[0]
+        fence_len = len(match.group("fence"))
+        prefix = match.group("prefix")
+        close_re = re.compile(
+            r"^(?:[ \t]*>)*[ \t]{0,8}"
+            + re.escape(fence_char)
+            + "{"
+            + str(fence_len)
+            + ",}[ \t]*$"
+        )
+
+        content_lines: list[str] = []
+        close_idx = None
+        j = idx + 1
+        while j < n:
+            if close_re.match(lines[j]):
+                close_idx = j
+                break
+            content_lines.append(lines[j])
+            j += 1
+
+        found_any_yaml_fence = True
+
+        if prefix.strip(" \t"):
+            content_lines = [
+                re.sub(r"^(?:[ \t]*>)+[ \t]?", "", line) for line in content_lines
+            ]
+        content_text = "\n".join(content_lines)
+
+        if _anchor_scope_reframe_fence_content_related(content_text):
+            found_related = True
+
+        idx = (close_idx + 1) if close_idx is not None else n
+
+    if not found_any_yaml_fence:
+        return False
+    return found_related
+
+
 def _classify_anchor_scope_reframe(
     *,
     comment_payload: "dict",
@@ -1382,8 +1528,31 @@ def _classify_anchor_scope_reframe(
     # Parse ANCHOR_SCOPE_REFRAME_V1 payload from body
     payload = _parse_anchor_scope_reframe_body(anchor_body)
     if payload is None:
+        # #2156 AC1-AC3: distinguish genuine absence (no ```yaml fence at
+        # all -- the legitimate freeform lane, #2053/#2086) from
+        # present-but-invalid (a fence exists but is malformed YAML,
+        # declares the wrong schema_version, or is structurally rejected
+        # such as a blockquote-embedded fence). Only genuine absence is
+        # downgraded to `not_applicable`; present-but-invalid stays
+        # `fail_closed` with a `schema_invalid:` reason so
+        # `_structured_anchor_payload_present_but_invalid()` continues to
+        # forbid the freeform-authority downgrade fallback for it.
+        if _anchor_scope_reframe_fence_present(anchor_body):
+            return {
+                "status": "fail_closed",
+                "reason": (
+                    "schema_invalid: "
+                    "anchor_scope_reframe_v1_fence_present_but_unparseable_or_wrong_schema_version"
+                ),
+                "implementation_go": False,
+                "anchor_author_association": author_assoc,
+                "anchor_comment_url": anchor_url,
+                "anchor_comment_hash": anchor_hash,
+                "allowed_path_deltas": [],
+                "required_rerun": [],
+            }
         return {
-            "status": "fail_closed",
+            "status": "not_applicable",
             "reason": "no_anchor_scope_reframe_v1_payload",
             "implementation_go": False,
             "anchor_author_association": author_assoc,
@@ -3033,25 +3202,63 @@ def _apply_multi_turn_candidate_route(
                 and predicates.get("source_ranges_covered") is True
             )
 
-            if (
-                original_status == "fail_closed"
-                and original_reason == "no_anchor_scope_reframe_v1_payload"
-                and integrity_confirmed
+            # #2156 AC5/AC6: `no_anchor_scope_reframe_v1_payload` (genuine
+            # absence) is produced by `_classify_anchor_scope_reframe()`
+            # with `status: not_applicable` now (AC2), but legacy/fixture
+            # callers may still pass a `status: fail_closed` decision
+            # carrying the same reason -- both upstream statuses must be
+            # recognized here so the advisory-upgrade / blocking-preserved
+            # invariants do not silently stop firing.
+            if original_reason == "no_anchor_scope_reframe_v1_payload" and original_status in (
+                "fail_closed",
+                "not_applicable",
             ):
-                updated = dict(scope_delta_decision)
-                updated["anchor_context_candidate_count"] = len(candidates)
-                updated["anchor_context_marked_segment_count"] = len(marked_segments)
-                updated["implementation_go"] = False
-                updated["status"] = "warn"
-                updated["reason"] = "multi_turn_anchor_context_trusted_owner_advisory"
-                updated["latest_owner_turn"] = latest_owner_turn
-                return updated
+                if integrity_confirmed:
+                    updated = dict(scope_delta_decision)
+                    updated["anchor_context_candidate_count"] = len(candidates)
+                    updated["anchor_context_marked_segment_count"] = len(marked_segments)
+                    updated["implementation_go"] = False
+                    updated["status"] = "warn"
+                    updated["reason"] = "multi_turn_anchor_context_trusted_owner_advisory"
+                    updated["latest_owner_turn"] = latest_owner_turn
+                    return updated
+
+                if original_status == "not_applicable":
+                    # #2156 AC6: the upstream genuine-absence status is
+                    # non-blocking (`not_applicable`), but multi-turn
+                    # retrieval integrity is unconfirmed here -- this must
+                    # not silently remain non-blocking. Force back to a
+                    # blocking `fail_closed` state rather than letting the
+                    # upstream not_applicable downgrade survive unchanged.
+                    #
+                    # PR #2171 fix_delta (P0-1, OWNER adversarial review):
+                    # the `reason` must change to a dedicated value here --
+                    # leaving it as `no_anchor_scope_reframe_v1_payload`
+                    # (the upstream not_applicable reason) meant the
+                    # caller's canonical blocker conversion (which does an
+                    # exact match on
+                    # `multi_turn_anchor_context_requires_human_judgment`)
+                    # never recognized this route, so it silently never
+                    # reached `blockers` / the final exit code.
+                    updated = dict(scope_delta_decision)
+                    updated["status"] = "fail_closed"
+                    updated["reason"] = (
+                        "multi_turn_anchor_context_retrieval_integrity_unconfirmed"
+                    )
+                    updated["implementation_go"] = False
+                    updated["latest_owner_turn"] = latest_owner_turn
+                    return updated
+
+                # original_status == "fail_closed" with unconfirmed
+                # integrity: pre-existing behavior, unchanged -- legacy
+                # callers/fixtures already representing a blocking decision
+                # are returned untouched (identity).
+                return scope_delta_decision
 
             # Any other original status/reason (schema_invalid, wrong_repo,
-            # wrong_issue_number, untrusted_author_association, or
-            # unconfirmed retrieval integrity) is returned unchanged -- the
-            # multi-turn advisory route never masks a distinct integrity
-            # problem.
+            # wrong_issue_number, untrusted_author_association) is returned
+            # unchanged -- the multi-turn advisory route never masks a
+            # distinct integrity problem.
             return scope_delta_decision
 
         updated = dict(scope_delta_decision)
@@ -3807,6 +4014,7 @@ def run_preflight(
     consume_contract_patch_plan: bool = False,
     contract_update_callbacks: Optional[dict[str, Any]] = None,
     investigation_evidence_transport_path: "Optional[Path]" = None,
+    enable_main_drift_live_readback: bool = False,
 ) -> tuple[dict, int]:
     """
     Main preflight logic.
@@ -4137,9 +4345,24 @@ def run_preflight(
                 isinstance(_routed_scope_delta_decision, dict)
                 and _routed_scope_delta_decision.get("status") == "fail_closed"
                 and _routed_scope_delta_decision.get("reason")
-                == "multi_turn_anchor_context_requires_human_judgment"
+                in ANCHOR_MULTI_TURN_FAIL_CLOSED_REASONS
             ):
+                # PR #2171 fix_delta (P0-1, OWNER adversarial review):
+                # membership in ANCHOR_MULTI_TURN_FAIL_CLOSED_REASONS (not
+                # an exact match on a single reason string) is what makes
+                # the integrity-unconfirmed forced-blocking route above
+                # actually reach `blockers` / the final exit code.
                 blockers.append(BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED)
+                # PR #2171 fix_delta (P0-1, OWNER adversarial review): the
+                # freeform SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 built earlier
+                # (before the multi-turn route could downgrade the
+                # not_applicable pre-route decision to a blocking
+                # fail_closed) must not survive into the final
+                # known_context once the decision is confirmed blocking --
+                # otherwise a fail-closed integrity gap would still leave
+                # freeform authority evidence available to a downstream
+                # consumer.
+                _kc.pop("scope_delta_authority_evidence", None)
 
             known_context = _kc
 
@@ -4231,6 +4454,34 @@ def run_preflight(
         issue_number=issue_number,
         repo=repo,
     )
+    # Issue #2102 fix_delta (iteration 4, Blocker 4): populate
+    # known_context["main_drift"] from a live git readback (see
+    # `build_live_main_drift_known_context()` above) so
+    # `plan_refinement_loop.py`'s `_refinement_main_drift_decision()` is
+    # actually reachable in production, not just from hand-injected test
+    # `known_context`. Gated behind `enable_main_drift_live_readback`
+    # (default False, opt-in) rather than unconditional in every live-mode
+    # call: many existing callers configure a real `origin` remote URL in
+    # environments with no network access to it (or, worse, one that IS
+    # reachable but unrelated to the local repo state under test), and an
+    # unconditional live `git fetch` there would be a silent, surprising
+    # side effect on every ordinary preflight invocation. Fixture-mode
+    # invocations (`fixture_path is not None`) never run this regardless
+    # of the flag; an explicitly-supplied `known_context["main_drift"]`
+    # (fixture or caller override) is never overwritten.
+    if (
+        enable_main_drift_live_readback
+        and fixture_path is None
+        and _main_drift_classifier_probe is not None
+        and not (known_context and "main_drift" in known_context)
+    ):
+        _live_main_drift = build_live_main_drift_known_context(
+            repo_root=repo_root,
+            issue_body=issue.get("body", "") or "",
+        )
+        if _live_main_drift is not None:
+            known_context = dict(known_context) if known_context else {}
+            known_context["main_drift"] = _live_main_drift
     planner_input_dict = _build_planner_input(
         issue,
         comments,
@@ -4884,6 +5135,159 @@ def _git_head_sha(repo_root: Path) -> str:
         return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# known_context["main_drift"] live production producer (Issue #2102
+# fix_delta, iteration 4, Blocker 4). This is the orchestrator step the
+# `known_context["main_drift"] production contract` comment in
+# `plan_refinement_loop.py` documents as missing wiring: it performs the
+# live git readback (bounded `git fetch` / `rev-parse` / `diff` / `merge-tree
+# --write-tree`) and builds the dict that function's docstring requires,
+# then `run_preflight()` below merges it into `known_context` before
+# `plan_refinement_loop.py` is invoked. Every subprocess call is bounded and
+# fails closed to `None` (never a fabricated/partial dict) on any timeout,
+# non-zero exit, or missing origin remote.
+# ---------------------------------------------------------------------------
+
+
+def _run_git_readonly_bounded(argv: list, cwd: Path, timeout: int = 20):
+    """Bounded, fail-closed `git` readback helper (returns None on any
+    timeout/launch failure instead of raising -- callers must treat `None`
+    as "cannot confirm", never as a stand-in for a real result)."""
+    try:
+        return subprocess.run(
+            ["git", *argv],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            shell=False,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _extract_allowed_paths_from_issue_body(body: str) -> list:
+    """Parse the canonical `## Allowed Paths` bullet list the same shape
+    `pr_head_replay_publish_exec.py::_allowed_paths()` already parses on the
+    implementation-loop side (kept independently here since this module has
+    no import boundary into `scripts/agent-ops/`)."""
+    marker = "## Allowed Paths"
+    if marker not in body:
+        return []
+    section = body.split(marker, 1)[1].split("\n## ", 1)[0]
+    paths = []
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        candidate = stripped[1:].strip().strip("`")
+        if candidate:
+            paths.append(candidate)
+    return paths
+
+
+def build_live_main_drift_known_context(
+    *,
+    repo_root: Path,
+    issue_body: str,
+    base_ref: str = "main",
+    evidence_base_sha: Optional[str] = None,
+    allowed_paths_snapshot_base_sha: Optional[str] = None,
+    expected_head_sha: Optional[str] = None,
+    observed_head_sha: Optional[str] = None,
+    expected_old_sha: Optional[str] = None,
+    observed_old_sha: Optional[str] = None,
+) -> Optional[dict]:
+    """Build `known_context["main_drift"]` from a live git readback (Issue
+    #2102 fix_delta iteration 4, Blocker 4; CAS-pair defaults corrected in
+    fix_delta iteration 5, Blocker A). See the production contract comment
+    above `_refinement_main_drift_decision()` in `plan_refinement_loop.py`
+    for the exact key contract this satisfies, and
+    `route_loop_verdict_v2.classify_main_drift()` for the consumer that
+    validates every key below is present and well-formed.
+
+    Fails closed to `None` (never a dict built from partial/stale evidence)
+    if the live `origin/<base_ref>` readback, or (when the evidence epoch
+    actually differs from the live base) the `git diff` / `git merge-tree
+    --write-tree` probes, cannot be completed within their bounded
+    timeouts. Callers MUST treat a `None` return as "no main_drift evidence
+    available this cycle" -- never as "no drift detected".
+
+    `expected_head_sha`/`observed_head_sha` and `expected_old_sha`/
+    `observed_old_sha` are CAS guards `classify_main_drift()` uses to
+    reject a *concurrent* mutation of whatever ref this evidence rebind
+    will ultimately touch -- they are a distinct concern from the
+    `current_base_sha` vs `evidence_base_sha` drift comparison performed
+    below. This producer has no independent prior-known state to CAS
+    against (it is a read-only diagnostic epoch classification, not the
+    mutation itself), so every pair defaults to the SAME just-read live
+    value unless a caller supplies an explicit prior expectation to guard
+    against a race. Defaulting `expected_old_sha` to `evidence_base_sha`
+    while `observed_old_sha` defaulted to `current_base_sha` (the
+    pre-fix_delta-5 behavior) made these two CAS pairs mismatch on every
+    genuine drift, which caused `classify_main_drift()` to hard_stop with
+    `expected_old_cas_mismatch` on all drifted input -- silently defeating
+    AC1's scope-clean reconciliation route before it could ever be
+    reached in production.
+    """
+    fetched = _run_git_readonly_bounded(
+        ["fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{base_ref}"], repo_root, timeout=20
+    )
+    if fetched is None or fetched.returncode != 0:
+        return None
+    current = _run_git_readonly_bounded(["rev-parse", f"origin/{base_ref}"], repo_root, timeout=10)
+    if current is None or current.returncode != 0:
+        return None
+    current_base_sha = current.stdout.strip()
+    if not current_base_sha:
+        return None
+
+    resolved_evidence_base_sha = evidence_base_sha or current_base_sha
+    resolved_allowed_paths_snapshot_base_sha = allowed_paths_snapshot_base_sha or resolved_evidence_base_sha
+    resolved_expected_head_sha = expected_head_sha or current_base_sha
+    resolved_observed_head_sha = observed_head_sha or resolved_expected_head_sha
+    resolved_expected_old_sha = expected_old_sha or current_base_sha
+    resolved_observed_old_sha = observed_old_sha or resolved_expected_old_sha
+
+    allowed_paths = _extract_allowed_paths_from_issue_body(issue_body)
+
+    latest_main_net_diff: list = []
+    semantic_ambiguity = False
+    if resolved_evidence_base_sha != current_base_sha:
+        diff = _run_git_readonly_bounded(
+            ["diff", "--name-only", resolved_evidence_base_sha, current_base_sha], repo_root, timeout=20
+        )
+        if diff is None or diff.returncode != 0:
+            return None
+        latest_main_net_diff = [line for line in diff.stdout.splitlines() if line]
+
+        # Deterministic real-conflict oracle (mirrors
+        # `pr_head_replay_publish_exec.py::_merge_tree_conflicts()` on the
+        # implementation-loop side, Issue #2102 P1-C): a nonzero exit from
+        # the two-ref `git merge-tree --write-tree` form means the merge
+        # produced conflicts. This is never a caller-asserted boolean.
+        merge_probe = _run_git_readonly_bounded(
+            ["merge-tree", "--write-tree", resolved_evidence_base_sha, current_base_sha], repo_root, timeout=20
+        )
+        if merge_probe is None:
+            return None
+        semantic_ambiguity = merge_probe.returncode != 0
+
+    return {
+        "current_base_sha": current_base_sha,
+        "evidence_base_sha": resolved_evidence_base_sha,
+        "allowed_paths_snapshot_base_sha": resolved_allowed_paths_snapshot_base_sha,
+        "allowed_paths": allowed_paths,
+        "latest_main_net_diff": latest_main_net_diff,
+        "expected_head_sha": resolved_expected_head_sha,
+        "observed_head_sha": resolved_observed_head_sha,
+        "expected_old_sha": resolved_expected_old_sha,
+        "observed_old_sha": resolved_observed_old_sha,
+        "semantic_ambiguity": semantic_ambiguity,
+    }
+
+
 def _git_blob_sha(file_path: Path, repo_root: Path) -> str:
     """Return git blob SHA of a file or 'unknown' on failure."""
     try:
@@ -5294,6 +5698,28 @@ def main(argv: list[str] | None = None) -> None:
         help="Execute a trusted CONTRACT_PATCH_PLAN_V1 through edit_issue_txn.py.",
     )
     parser.add_argument(
+        "--disable-main-drift-live-readback",
+        dest="enable_main_drift_live_readback",
+        action="store_false",
+        default=True,
+        help="Issue #2102 fix_delta (iteration 5, Blocker A): the CLI/registry "
+        "production entrypoint (command_registry.py's 'preflight.run' family, which "
+        "never renders this flag) now performs the bounded live git readback "
+        "(fetch/diff/merge-tree against 'origin') to populate known_context['main_drift'] "
+        "before invoking the planner BY DEFAULT -- opt-out via this flag, not opt-in. "
+        "The prior opt-in default (Blocker 4, iteration 4) never actually enabled this "
+        "in production because no registered command_registry.py entry rendered the "
+        "old --enable-main-drift-live-readback flag, leaving the producer dead code; "
+        "see build_live_main_drift_known_context()'s docstring for the CAS-pair-default "
+        "correctness fix (iteration 5) that made this safe to flip. Only the CLI/main() "
+        "entrypoint's default changed -- run_preflight()'s own Python-level keyword "
+        "default is unchanged (False) so every other in-process caller (e.g. "
+        "_apply_contract_patch_plan_v1()'s fresh_checks() post-mutation reverification "
+        "helper, which does not have every skill's sibling scripts/ directory on "
+        "sys.path in every test harness) keeps its pre-existing behavior unless it "
+        "explicitly opts in.",
+    )
+    parser.add_argument(
         "--investigation-evidence-transport-path",
         type=Path,
         default=None,
@@ -5470,6 +5896,7 @@ def main(argv: list[str] | None = None) -> None:
         known_context=cli_known_context,
         consume_contract_patch_plan=args.consume_contract_patch_plan,
         investigation_evidence_transport_path=args.investigation_evidence_transport_path,
+        enable_main_drift_live_readback=args.enable_main_drift_live_readback,
     )
     sys.exit(exit_code)
 

@@ -1657,13 +1657,14 @@ CONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:
         declared_path_overlap = {}
     declared_path_overlap_json = json_yaml_scalar(declared_path_overlap)
 
-    # The fixed fingerprint schema has no advisory free-text. Keep its
-    # established strict JSON flow representation so the authority-binding
-    # readback contract remains byte-addressable by existing consumers.
-    fingerprint_json = json.dumps(
-        expected_contract_fingerprint, ensure_ascii=False, separators=(",", ":")
+    # The source-bound fingerprint is authority-bearing, unlike the advisory
+    # checks above.  Its transport is exactly one YAML single-quoted scalar
+    # containing bounded strict JSON; the parser validates this raw syntax
+    # before accepting the decoded mapping on either parser path.
+    fingerprint_yaml = (
+        "\n  expected_contract_fingerprint: "
+        + json_yaml_scalar(expected_contract_fingerprint)
     )
-    fingerprint_yaml = f"\n  expected_contract_fingerprint: {fingerprint_json}"
 
     return f"""{idempotency_marker}
 

@@ -29,6 +29,7 @@
         {
           "affects": "VC",
           "claim": "Reviewersはこれをwebで確認すること。公式 docsに記載されている動作を検証してください。",
+          "role": "dispositive",
           "source_hint": "comment_999"
         }
       ],

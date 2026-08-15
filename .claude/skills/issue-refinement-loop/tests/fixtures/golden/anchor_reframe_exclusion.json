@@ -51,11 +51,13 @@
         {
           "affects": "AC",
           "claim": "- AC2: Both manual and API changes are in scope",
+          "role": "dispositive",
           "source_hint": null
         },
         {
           "affects": "InScope",
           "claim": "- API surface remains stable",
+          "role": "dispositive",
           "source_hint": null
         }
       ],
