@@ -846,6 +846,27 @@ case "$1" in
       read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
     esac
     ;;
+  api)
+    case "$2" in
+      snapshot)
+        # Issue #2174 AC7: deterministic, unchanging workspace/agent/focus
+        # snapshot -- the same content on every call means before/after
+        # comparisons in the runner under test always observe zero drift.
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
 esac
 exit 0
 """
@@ -1178,6 +1199,15 @@ case "$1" in
       read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
     esac
     ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
 esac
 exit 0
 """
@@ -1330,6 +1360,15 @@ case "$1" in
       read) echo "pane transcript"; exit 0 ;;
     esac
     ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
 esac
 exit 0
 """ % (get_call_log,)
@@ -1415,6 +1454,15 @@ case "$1" in
       get) echo '{"state":"done"}'; exit 0 ;;
       explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
       read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
+    esac
+    ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
     esac
     ;;
 esac

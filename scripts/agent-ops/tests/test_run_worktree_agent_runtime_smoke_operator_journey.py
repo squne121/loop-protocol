@@ -194,6 +194,18 @@ case "$1" in
         ;;
     esac
     ;;
+  api)
+    case "$2" in
+      snapshot)
+        # Issue #2174 AC7: deterministic, unchanging workspace/agent/focus
+        # snapshot -- the same content on every call means before/after
+        # comparisons in the runner under test always observe zero drift.
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
 esac
 exit 0
 """

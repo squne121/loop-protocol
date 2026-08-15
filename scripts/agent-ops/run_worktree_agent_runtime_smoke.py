@@ -581,10 +581,23 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            claude_agent_name: str | None = None,
                            hermetic_agents_file: str | None = None,
                            hermetic_settings_file: str | None = None,
-                           claude_bin_is_override: bool = False,
+                           claude_adapter: str = "native",
                            ) -> tuple[int | None, str, str, bool]:
+    """Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173):
+    ``claude_adapter`` is the ONLY input that decides launcher-specific argv
+    shape / env-var injection -- never ``bool(claude_bin)`` alone (the prior
+    ``claude_bin_is_override`` parameter conflated "a --claude-bin path was
+    given" with "apply claude-gpt launcher protocol", which silently forced
+    claude-gpt argv/env handling onto ANY --claude-bin override, including a
+    plain absolute-path native claude binary or a transparent wrapper).
+    ``"native"`` (default): --claude-bin (if any) is a pure binary-path
+    override, argv is byte-identical to the PATH-resolved case (AC6).
+    ``"claude-gpt"``: --claude-bin must point at
+    scripts/claude-gpt/launch.sh; that launcher's own CLI contract is
+    honored (see below)."""
     argv = [claude_bin]
-    if claude_bin_is_override:
+    if claude_adapter == "claude-gpt":
         # Issue #2176 (live AC3 finding): ``scripts/claude-gpt/launch.sh``
         # only accepts its own launcher options (``--claude-bin``,
         # ``--check-only``, ``--dry-run``) before a literal ``--``
@@ -592,8 +605,8 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
         # ``unknown_launcher_option`` (confirmed against the launcher
         # committed at Issue #2158 / PR #2162's worktree HEAD). Everything
         # after ``--`` is forwarded to the underlying claude binary
-        # unparsed. Native ``claude`` (no override) never receives this
-        # separator, so its argv shape is unchanged.
+        # unparsed. The 'native' adapter never receives this separator, so
+        # its argv shape is unchanged.
         argv.append("--")
     argv += [
         "-p",
@@ -610,19 +623,18 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
     # the fixed SubagentStart/SubagentStop observability
     # ``--settings <JSON>`` flag here (as done for the native ``claude``
     # binary below) would make every structured-lane launcher invocation a
-    # deterministic BLOCKED. Instead, when ``claude_bin`` was supplied via
-    # ``--claude-bin`` (``claude_bin_is_override=True``), request the same
-    # fixed hook pair through a narrow, value-fixed environment variable
+    # deterministic BLOCKED. Instead, when the caller explicitly opted into
+    # ``--claude-adapter claude-gpt``, request the same fixed hook pair
+    # through a narrow, value-fixed environment variable
     # (``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop``) that the
     # launcher itself interprets and materializes into its own
     # launcher-managed settings file -- no caller-supplied JSON ever
-    # crosses the launcher's forbidden-flags boundary. When ``claude_bin``
-    # is the default (native ``claude`` resolved from ``PATH``,
-    # ``claude_bin_is_override=False``), this branch is not taken and argv
-    # keeps the pre-existing fixed ``--settings <JSON>`` flag unchanged
-    # (backward compatibility, AC6-equivalent for this narrow channel).
+    # crosses the launcher's forbidden-flags boundary. For the ``native``
+    # adapter (default, regardless of whether --claude-bin was given), this
+    # branch is not taken and argv keeps the pre-existing fixed
+    # ``--settings <JSON>`` flag unchanged (AC6 backward compatibility).
     launch_env = None
-    if claude_bin_is_override:
+    if claude_adapter == "claude-gpt":
         launch_env = os.environ.copy()
         launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = "subagent-start-stop"
     else:
@@ -657,6 +669,32 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
     if hermetic_settings_file:
         argv += ["--settings", hermetic_settings_file]
     return _run(argv, cwd=worktree, timeout=timeout_seconds, input_text=prompt, env=launch_env)
+
+
+_CLAUDE_GPT_LAUNCH_RESULT_RE = re.compile(
+    r'\{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1"[^\n]*\}'
+)
+
+
+def extract_claude_gpt_launcher_receipt(stderr: str) -> dict | None:
+    """Best-effort extraction of ``scripts/claude-gpt/launch.sh``'s own
+    ``CLAUDE_GPT_LAUNCH_RESULT_V1`` JSON receipt line from ``stderr`` (Issue
+    #2174 AC8). This runner does not implement or duplicate the launcher's
+    forbidden-flag policy -- it only surfaces the launcher's own,
+    already-structured refusal/success receipt as evidence, so a matrix
+    combination that structurally fails (e.g. claude-gpt adapter + hermetic
+    --settings forwarding) is independently observable rather than silently
+    swallowed as an opaque non-zero exit. Returns ``None`` when no such
+    receipt line is present (e.g. native adapter, or a run that never
+    reached the point of emitting one)."""
+    match = _CLAUDE_GPT_LAUNCH_RESULT_RE.search(stderr or "")
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def run_structured_codex(worktree: str, prompt: str, timeout_seconds: float,
@@ -2442,6 +2480,84 @@ def diff_herdr_session_baseline(
     return diffs
 
 
+# ---------------------------------------------------------------------------
+# Human Herdr session FULL snapshot preservation (Issue #2174 AC7)
+#
+# ``snapshot_herdr_sessions``/``diff_herdr_session_baseline`` above (Issue
+# #2176 P0-3) already cover session-LEVEL identity (name/default/running/
+# socket_path/session_dir), but AC7 additionally requires workspace ID,
+# agent ID, and the currently focused/active workspace-tab-pane selection
+# to be verified unchanged. ``herdr api snapshot`` (confirmed against
+# installed herdr v0.8.0) is the real endpoint that carries this: each
+# ``result.snapshot.agents[]`` entry has ``workspace_id``/``tab_id``/
+# ``pane_id``, and the top-level snapshot carries ``focused_workspace_id``/
+# ``focused_tab_id``/``focused_pane_id`` (the human's active selection).
+# Any required field being unobtainable fails the WHOLE snapshot closed
+# (``None``) -- never a partial/best-effort snapshot (AC7's explicit
+# fail-closed requirement).
+# ---------------------------------------------------------------------------
+
+_WORKSPACE_SNAPSHOT_AGENT_FIELDS = ("workspace_id", "tab_id", "pane_id")
+_WORKSPACE_SNAPSHOT_FOCUS_FIELDS = ("focused_workspace_id", "focused_tab_id", "focused_pane_id")
+
+
+def capture_herdr_workspace_snapshot(herdr_bin: str, env: dict[str, str] | None) -> dict | None:
+    """Fail-closed capture of workspace/agent/focus identity via ``herdr api
+    snapshot`` (Issue #2174 AC7). Returns ``None`` if ANY required field is
+    unobtainable."""
+    rc, out, _err, timed_out = _run([herdr_bin, "api", "snapshot"], timeout=15.0, env=env)
+    if timed_out or rc != 0:
+        return None
+    try:
+        payload = json.loads(out)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    result = payload.get("result") if isinstance(payload, dict) else None
+    snapshot = result.get("snapshot") if isinstance(result, dict) else None
+    if not isinstance(snapshot, dict):
+        return None
+    if any(field not in snapshot for field in _WORKSPACE_SNAPSHOT_FOCUS_FIELDS):
+        return None
+    agents_raw = snapshot.get("agents")
+    if not isinstance(agents_raw, list):
+        return None
+    locations: list[tuple[str, str, str]] = []
+    for agent in agents_raw:
+        if not isinstance(agent, dict) or any(
+            field not in agent for field in _WORKSPACE_SNAPSHOT_AGENT_FIELDS
+        ):
+            return None
+        locations.append(tuple(str(agent[field]) for field in _WORKSPACE_SNAPSHOT_AGENT_FIELDS))
+    return {
+        "focused_workspace_id": snapshot["focused_workspace_id"],
+        "focused_tab_id": snapshot["focused_tab_id"],
+        "focused_pane_id": snapshot["focused_pane_id"],
+        "agent_locations": sorted(locations),
+    }
+
+
+def diff_herdr_workspace_snapshot(before: dict | None, after: dict | None) -> list[str]:
+    """Compare two ``capture_herdr_workspace_snapshot`` results (Issue #2174
+    AC7). Fails closed (a single diagnostic entry) if either snapshot is
+    ``None`` -- unobtainable evidence is treated as a preservation FAILURE,
+    never silently skipped. This is a strict equality check: even the
+    addition/removal of an agent pane the run itself did not create is
+    reported (the interactive lane's own isolated session never appears
+    here at all, because it lives in a wholly separate herdr session)."""
+    if before is None or after is None:
+        return ["could not evaluate herdr workspace/agent/focus snapshot (api snapshot unavailable)"]
+    diffs: list[str] = []
+    for field in _WORKSPACE_SNAPSHOT_FOCUS_FIELDS:
+        if before[field] != after[field]:
+            diffs.append(f"{field} changed: {before[field]!r} -> {after[field]!r}")
+    if before["agent_locations"] != after["agent_locations"]:
+        diffs.append(
+            "agent workspace/tab/pane locations changed: "
+            f"{before['agent_locations']} -> {after['agent_locations']}"
+        )
+    return diffs
+
+
 def new_isolated_session_name(herdr_bin: str, env: dict[str, str] | None = None) -> str:
     """A high-entropy session name not currently present in
     ``herdr session list``. Never reuses the caller's own session.
@@ -2938,6 +3054,27 @@ def build_parser() -> argparse.ArgumentParser:
             "shutil.which('claude') PATH resolution is unchanged."
         ),
     )
+    parser.add_argument(
+        "--claude-adapter",
+        choices=["native", "claude-gpt"],
+        default="native",
+        help=(
+            "Issue #2174 AC1 (fix_delta, OWNER REQUEST_CHANGES "
+            "https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173): "
+            "explicit, INDEPENDENT launcher-adapter selection -- never "
+            "derived from bool(--claude-bin) alone. '--claude-bin' by "
+            "itself is a pure binary-path override with no argv/env side "
+            "effects (same argv shape as PATH resolution, e.g. for an "
+            "absolute-path native claude binary or a transparent wrapper). "
+            "'--claude-adapter claude-gpt' (requires --claude-bin) is what "
+            "opts into scripts/claude-gpt/launch.sh's own CLI contract: a "
+            "literal `--` separator before claude's own fixed argv, and "
+            "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop instead of "
+            "a caller-supplied --settings JSON flag (which that launcher "
+            "rejects as a policy-weakening flag). Default 'native' keeps "
+            "every pre-existing --claude-bin caller's argv unchanged."
+        ),
+    )
     parser.add_argument("--expect-marker", action="append", default=[])
     parser.add_argument(
         "--forbid-marker",
@@ -3151,6 +3288,9 @@ def main(argv: list[str] | None = None) -> int:
     _install_signal_handlers()
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.claude_adapter == "claude-gpt" and not args.claude_bin:
+        parser.error("--claude-adapter claude-gpt requires --claude-bin")
 
     run_id = uuid.uuid4().hex[:12]
     errors: list[str] = []
@@ -3415,10 +3555,20 @@ def main(argv: list[str] | None = None) -> int:
                     claude_agent_name=effective_claude_agent_name,
                     hermetic_agents_file=hermetic_agents_file if hermetic_active else None,
                     hermetic_settings_file=hermetic_settings_file if hermetic_active else None,
-                    claude_bin_is_override=bool(args.claude_bin),
+                    claude_adapter=args.claude_adapter,
                 )
                 capability_decision, capability_reason = classify_claude_structured_outcome(
                     rc, out, err, timed_out
+                )
+                # Issue #2174 AC8: this runner's own view of the launcher's
+                # own structured refusal receipt (e.g. a forbidden
+                # --settings flag forwarded via a hermetic combination),
+                # never a synthesized/guessed classification.
+                schema_summary["claude_adapter"] = args.claude_adapter
+                schema_summary["claude_gpt_launcher_receipt"] = (
+                    extract_claude_gpt_launcher_receipt(err)
+                    if args.claude_adapter == "claude-gpt"
+                    else None
                 )
                 # Issue #2046: real evidence now that stdout is captured.
                 schema_summary["main_agent_identity"] = build_main_agent_identity(args.claude_agent_name, out)
@@ -3738,6 +3888,21 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     exit_code = EXIT_FAIL
 
+            # Issue #2174 AC7: workspace/agent ID + focus preservation is a
+            # mandatory (always-on) runtime-verification requirement for
+            # every interactive lane run -- unlike
+            # ``--require-session-baseline-preservation`` above (an
+            # existing, opt-in, session-identity-only check), this cannot
+            # be disabled.
+            workspace_snapshot_before = capture_herdr_workspace_snapshot("herdr", _isolated_env())
+            schema_summary["herdr_workspace_snapshot_before_captured"] = workspace_snapshot_before is not None
+            if workspace_snapshot_before is None:
+                errors.append(
+                    "could not capture herdr workspace/agent/focus snapshot before interactive "
+                    "lane (api snapshot failed)"
+                )
+                exit_code = EXIT_FAIL
+
             try:
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
@@ -3814,6 +3979,23 @@ def main(argv: list[str] | None = None) -> int:
                                 f"herdr session baseline preservation failed: {baseline_diffs}"
                             )
                             exit_code = EXIT_FAIL
+
+                # Issue #2174 AC7: workspace/agent/focus preservation --
+                # always evaluated (see the mandatory before-capture above),
+                # regardless of ``--require-session-baseline-preservation``.
+                workspace_snapshot_after = capture_herdr_workspace_snapshot("herdr", _isolated_env())
+                schema_summary["herdr_workspace_snapshot_after_captured"] = workspace_snapshot_after is not None
+                workspace_snapshot_diffs = diff_herdr_workspace_snapshot(
+                    workspace_snapshot_before, workspace_snapshot_after
+                )
+                schema_summary["herdr_workspace_snapshot_diffs"] = workspace_snapshot_diffs
+                schema_summary["herdr_workspace_snapshot_preserved"] = not workspace_snapshot_diffs
+                if workspace_snapshot_diffs:
+                    errors.append(
+                        "herdr workspace/agent/focus snapshot not preserved across isolated "
+                        f"interactive lane run: {workspace_snapshot_diffs}"
+                    )
+                    exit_code = EXIT_FAIL
 
             schema_summary["session_name"] = evidence.get("session_name")
             schema_summary["pane_id"] = evidence.get("pane_id")

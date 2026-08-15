@@ -157,6 +157,61 @@ claude-gpt launcher）の絶対パスを明示的に指定できる。
 - `--claude-bin` 未指定時（既定の `None`）は、structured lane・interactive
   lane のいずれも既存の `shutil.which("claude")` PATH 解決から一切変更されない。
 
+## `--claude-adapter` による launcher 固有 argv/env 制御（Issue #2174 AC1 fix_delta）
+
+OWNER REQUEST_CHANGES（https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173）
+により、`--claude-bin` 単体（`bool(--claude-bin)`）を launcher 固有挙動の判定材料に
+してはならないと修正された。従来の実装は `--claude-bin` が指定されているという
+事実だけで、常に structured lane の argv 先頭へ `--` separator を挿入し、固定
+`--settings <hook-observability-json>` を省略して代わりに
+`CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop` 環境変数を注入していた。
+これは「binary path」と「launcher protocol」を混同する設計であり、絶対パス指定の
+native claude binary や透過的な wrapper に対しても意図せず claude-gpt 固有の
+argv/env 変換が適用されてしまう欠陥だった。
+
+`--claude-adapter native|claude-gpt`（既定 `native`）は、この launcher 固有挙動を
+`--claude-bin` から独立させた明示入力である:
+
+- `native`（既定）: `--claude-bin`（指定時）は純粋な binary path override。argv は
+  PATH 解決時と byte-identical（固定 `--settings <hook-observability-json>` を維持）。
+  `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS` は一切設定しない。
+- `claude-gpt`: `--claude-bin` の指定が必須（未指定なら `parser.error` で起動前に
+  blocked）。structured lane の固定 argv 先頭に literal `--` separator を挿入し
+  （`scripts/claude-gpt/launch.sh` は自身のオプション（`--claude-bin` /
+  `--check-only` / `--dry-run`）の後に `--` を要求し、以降を claude 本体へ素通しする）、
+  `--settings <JSON>` の代わりに `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop`
+  環境変数を子プロセスへ設定する（launcher が `--settings` を含む policy-weakening
+  flag を forbidden として拒否するため）。hermetic no-mutation lane
+  （`--hermetic-agent-definition`）が同時に有効な場合、hermetic 用の
+  `--settings <hermetic_settings_file>` は引き続き argv へ追加されるため、
+  `--` の後に launcher が拒否する `--settings` が渡り launcher 自身の
+  `unknown_launcher_option`/`policy_weakening_flag_rejected` 拒否で構造的に失敗する
+  （Issue #2174 AC8 が要求する検出可能な組み合わせ）。この拒否 receipt は
+  `extract_claude_gpt_launcher_receipt()` で stderr の `CLAUDE_GPT_LAUNCH_RESULT_V1`
+  JSON 行から抽出され、evidence の `claude_gpt_launcher_receipt` に記録される。
+
+## Herdr 全体 snapshot 保全検証（Issue #2174 AC7）
+
+`--mode interactive` は常に（オプトインではなく）、isolated interactive lane 実行の
+前後で呼び出し元自身の（デフォルト、非 isolated）Herdr session の状態を
+`capture_herdr_session_snapshot` 相当の 2 endpoint から取得し比較する:
+
+- `herdr session list --json`: 既存の `snapshot_herdr_sessions`
+  （`name`/`running`/`default`/`socket_path`/`session_dir`、Issue #2176 P0-3）
+- `herdr api snapshot`: 新規 `capture_herdr_workspace_snapshot`
+  （`result.snapshot.agents[].workspace_id`/`tab_id`/`pane_id`、および
+  `focused_workspace_id`/`focused_tab_id`/`focused_pane_id`）
+
+いずれかのフィールドが取得不能な場合は `capture_herdr_workspace_snapshot` が
+`None` を返し、`diff_herdr_workspace_snapshot` はこれを fail-closed で
+preservation failure として扱う（部分的な snapshot を証跡として扱わない）。
+この run 自身が作成した isolated session は比較対象から除外されるが、それ以外の
+workspace/agent/focus の変化は 1 件でも検出されると run 全体が FAIL する。
+`scripts/agent-ops/tests/test_run_worktree_agent_runtime_smoke_workspace_snapshot.py`
+に、focused workspace/tab/pane・agent location それぞれを意図的に変化させた
+negative（poison）test と、CLI 経由の end-to-end poison test（ambient snapshot が
+isolated lane 実行中に変化するケース）を追加した。
+
 ## 観測できる主な evidence
 
 - structured lane: `type: system/init`、`type: result`、hook lifecycle event の件数を確認できる

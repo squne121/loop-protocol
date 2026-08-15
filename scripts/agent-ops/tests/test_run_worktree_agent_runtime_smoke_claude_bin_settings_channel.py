@@ -127,11 +127,17 @@ exit 0
 """
 
 
-def test_claude_bin_override_omits_settings_flag_and_sets_env_channel(repo_with_worktree, tmp_path):
-    """Issue #2176: with ``--claude-bin``, the structured-lane invocation
+def test_claude_gpt_adapter_omits_settings_flag_and_sets_env_channel(repo_with_worktree, tmp_path):
+    """Issue #2174 AC1 fix_delta: with ``--claude-bin`` AND the explicit
+    ``--claude-adapter claude-gpt`` opt-in, the structured-lane invocation
     never carries a ``--settings`` flag on argv, and instead sets
     ``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop`` in the child
-    process environment."""
+    process environment. (Renamed from
+    ``test_claude_bin_override_omits_settings_flag_and_sets_env_channel``:
+    this launcher-specific behavior is no longer implied by
+    ``bool(--claude-bin)`` alone -- see
+    ``test_claude_bin_without_adapter_keeps_native_argv_shape`` below for the
+    corrected default.)"""
     repo, worktree = repo_with_worktree
 
     launcher_dir = tmp_path / "claude-gpt-launcher"
@@ -151,13 +157,14 @@ def test_claude_bin_override_omits_settings_flag_and_sets_env_channel(repo_with_
         "--runtime", "claude", "--mode", "structured",
         "--prompt-file", str(prompt), "--output-dir", str(out_dir),
         "--claude-bin", str(launcher_bin),
+        "--claude-adapter", "claude-gpt",
     )
     assert result.returncode == 0, result.stderr
     assert argv_marker.exists(), "launcher was not invoked"
     recorded_argv = argv_marker.read_text(encoding="utf-8")
     assert "--settings" not in recorded_argv, (
-        "structured lane must never pass --settings to a --claude-bin "
-        "launcher (forbidden extra flag, PR #2176 AC3 BLOCKED finding)"
+        "structured lane must never pass --settings to a --claude-adapter "
+        "claude-gpt launcher (forbidden extra flag, PR #2176 AC3 BLOCKED finding)"
     )
     argv_lines = recorded_argv.splitlines()
     assert argv_lines and argv_lines[0] == "--", (
@@ -168,6 +175,57 @@ def test_claude_bin_override_omits_settings_flag_and_sets_env_channel(repo_with_
     assert env_marker.exists()
     recorded_env = env_marker.read_text(encoding="utf-8").strip()
     assert recorded_env == "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop"
+
+
+def test_claude_bin_without_adapter_keeps_native_argv_shape(repo_with_worktree, tmp_path):
+    """Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES Blocker 1,
+    https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173):
+    ``--claude-bin`` BY ITSELF (default ``--claude-adapter native``) is a
+    pure binary-path override -- it must NOT insert a ``--`` separator, must
+    NOT drop the pre-existing fixed ``--settings <JSON>`` flag, and must NOT
+    inject ``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS``. This is the exact bug the
+    prior ``claude_bin_is_override=bool(args.claude_bin)`` design had: EVERY
+    --claude-bin override (even an absolute-path native claude binary or a
+    transparent wrapper) was forced through claude-gpt launcher argv/env
+    handling."""
+    repo, worktree = repo_with_worktree
+
+    plain_dir = tmp_path / "plain-claude-bin"
+    plain_dir.mkdir()
+    plain_bin = plain_dir / "claude"
+    argv_marker = tmp_path / "argv.recorded"
+    env_marker = tmp_path / "env.recorded"
+    _write_fake_exe(
+        plain_bin,
+        _recording_fake_claude_script(argv_marker, env_marker, version="1.0.0-plain"),
+    )
+
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--claude-bin", str(plain_bin),
+    )
+    assert result.returncode == 0, result.stderr
+    assert argv_marker.exists(), "claude binary was not invoked"
+    recorded_argv = argv_marker.read_text(encoding="utf-8")
+    argv_lines = recorded_argv.splitlines()
+    assert argv_lines and argv_lines[0] == "-p", (
+        "default --claude-adapter native must NOT insert a leading -- "
+        f"separator for a plain --claude-bin override, got: {argv_lines[:3]!r}"
+    )
+    assert "--settings" in recorded_argv, (
+        "default --claude-adapter native must keep the pre-existing fixed "
+        "--settings <JSON> observability flag, even with --claude-bin set"
+    )
+    assert env_marker.exists()
+    recorded_env = env_marker.read_text(encoding="utf-8").strip()
+    assert recorded_env == "", (
+        "default --claude-adapter native must never inject "
+        f"CLAUDE_GPT_RUNTIME_SMOKE_HOOKS, got env: {recorded_env!r}"
+    )
 
 
 def test_claude_bin_unspecified_keeps_settings_flag_and_no_env_channel(repo_with_worktree, tmp_path):
