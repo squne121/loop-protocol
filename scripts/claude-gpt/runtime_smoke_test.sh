@@ -28,6 +28,25 @@ mkdir -p "$EVIDENCE_DIR"
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
 EVIDENCE_FILE="${EVIDENCE_DIR}/smoke-${TIMESTAMP}.json"
 
+# --- SUT (System Under Test) provenance（PR #2162 敵対的レビュー対応: 実行元 worktree /
+#     commit / launcher スクリプト自体の同一性を証跡へ束縛し、stale worktree 実行事故を
+#     事後検出できるようにする）。proxy identity（absolute_path/version）も併せて記録する
+#     （P2 と共通）。 ---
+SUT_REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)
+SUT_LAUNCHER_PATH="$SCRIPT_DIR/launch.sh"
+SUT_GIT_HEAD=$(claude_gpt_git_head "$SUT_REPO_ROOT")
+SUT_GIT_DIRTY=$(claude_gpt_git_dirty "$SUT_REPO_ROOT")
+SUT_LAUNCH_SH_SHA256=$(claude_gpt_sha256_file "$SCRIPT_DIR/launch.sh")
+SUT_LIB_SH_SHA256=$(claude_gpt_sha256_file "$SCRIPT_DIR/lib.sh")
+SUT_PROXY_BIN=$(claude_gpt_resolve_proxy_bin)
+SUT_PROXY_VERSION="unknown"
+if [ -n "$SUT_PROXY_BIN" ]; then
+  SUT_PROXY_VERSION=$(claude_gpt_proxy_version "$SUT_PROXY_BIN")
+fi
+if [ -z "$SUT_PROXY_BIN" ]; then
+  SUT_PROXY_BIN="unknown"
+fi
+
 # --- 環境可用性判定（バイナリ / ChatGPT subscription 認証）。ディレクトリ/設定はまだ作らない。 ---
 PREFLIGHT_ENV_JSON=$("$SCRIPT_DIR/preflight.sh" --env-only)
 PREFLIGHT_ENV_RC=$?
@@ -37,8 +56,10 @@ if [ "$PREFLIGHT_ENV_RC" -eq 3 ] || [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
   if [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
     SKIP_REASON="chatgpt_subscription_auth_unavailable"
   fi
-  printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"skip","reason":"%s","preflight_env_only":%s,"generated_at":"%s"}\n' \
-    "$SKIP_REASON" "$PREFLIGHT_ENV_JSON" "$TIMESTAMP" > "$EVIDENCE_FILE"
+  printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"skip","reason":"%s","preflight_env_only":%s,"generated_at":"%s","sut":{"launcher_path":"%s","repository_root":"%s","git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","lib_sh_sha256":"%s"},"proxy":{"absolute_path":"%s","version":"%s"}}\n' \
+    "$SKIP_REASON" "$PREFLIGHT_ENV_JSON" "$TIMESTAMP" \
+    "$SUT_LAUNCHER_PATH" "$SUT_REPO_ROOT" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" \
+    "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" > "$EVIDENCE_FILE"
   echo "SKIP: ${SKIP_REASON} のため runtime smoke test を実行できません。証跡: ${EVIDENCE_FILE}"
   exit 77
 fi
@@ -240,6 +261,18 @@ cat > "$EVIDENCE_FILE" <<EVIDENCE_JSON_EOF
   "schema": "CLAUDE_GPT_SMOKE_RESULT_V1",
   "status": "${STATUS}",
   "generated_at": "${TIMESTAMP}",
+  "sut": {
+    "launcher_path": "$(json_escape "$SUT_LAUNCHER_PATH")",
+    "repository_root": "$(json_escape "$SUT_REPO_ROOT")",
+    "git_head": "${SUT_GIT_HEAD}",
+    "git_dirty": "${SUT_GIT_DIRTY}",
+    "launch_sh_sha256": "${SUT_LAUNCH_SH_SHA256}",
+    "lib_sh_sha256": "${SUT_LIB_SH_SHA256}"
+  },
+  "proxy": {
+    "absolute_path": "$(json_escape "$SUT_PROXY_BIN")",
+    "version": "$(json_escape "$SUT_PROXY_VERSION")"
+  },
   "runtime_environment": {
     "not_root_ok": ${NOT_ROOT_OK},
     "current_user": "$(json_escape "$CURRENT_USER")",

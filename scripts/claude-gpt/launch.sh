@@ -34,6 +34,30 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
 # shellcheck source=./lib.sh
 . "$SCRIPT_DIR/lib.sh"
 
+# --- SUT/proxy identity 事前解決 + 人間可読な起動診断行（P0-1 / P2）。
+#     どの経路（対話・非対話・--check-only・--dry-run・引数エラー含む）で launcher が
+#     終了しても、呼び出し元がどの worktree / commit / proxy version から起動したかを
+#     必ず stderr で確認できるようにする（stale worktree 起動事故の早期検出）。 ---
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)
+LAUNCHER_ABS_PATH="$SCRIPT_DIR/launch.sh"
+CLAUDE_GPT_GIT_HEAD=$(claude_gpt_git_head "$REPO_ROOT")
+CLAUDE_GPT_GIT_HEAD_SHORT="unknown"
+if [ "$CLAUDE_GPT_GIT_HEAD" != "unknown" ]; then
+  CLAUDE_GPT_GIT_HEAD_SHORT=$(printf '%s' "$CLAUDE_GPT_GIT_HEAD" | cut -c1-7)
+fi
+CLAUDE_GPT_GIT_DIRTY=$(claude_gpt_git_dirty "$REPO_ROOT")
+
+PROXY_BIN_TARGET=$(claude_gpt_resolve_proxy_bin)
+PROXY_VERSION_TARGET="unknown"
+if [ -n "$PROXY_BIN_TARGET" ]; then
+  PROXY_VERSION_TARGET=$(claude_gpt_proxy_version "$PROXY_BIN_TARGET")
+fi
+# preflight.sh（子プロセス）が同一の proxy バイナリを再解決する保証として export する
+# （PATH mutation 等による識別ズレを排除する。P2）。
+export CLAUDE_GPT_PROXY_BIN="$PROXY_BIN_TARGET"
+
+echo "launcher=${LAUNCHER_ABS_PATH} git=${CLAUDE_GPT_GIT_HEAD_SHORT} dirty=${CLAUDE_GPT_GIT_DIRTY} proxy=v${PROXY_VERSION_TARGET}" >&2
+
 CHECK_ONLY=false
 DRY_RUN=false
 
@@ -85,10 +109,19 @@ for arg in "$@"; do
         ;;
     esac
   done
+  # --permission-mode bypassPermissions（二引数形式）
   if [ "$prev" = "--permission-mode" ] && [ "$arg" = "bypassPermissions" ]; then
     printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"policy_weakening_flag_rejected","flag":"--permission-mode bypassPermissions"}\n' >&2
     exit 2
   fi
+  # --permission-mode=bypassPermissions（単一トークン形式。P1-3 fix-delta）。
+  # 表記揺れ（`--permission-mode=` の値部分）で二引数形式チェックをすり抜けさせない。
+  case "$arg" in
+    --permission-mode=bypassPermissions)
+      printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"policy_weakening_flag_rejected","flag":"--permission-mode=bypassPermissions"}\n' >&2
+      exit 2
+      ;;
+  esac
   prev="$arg"
 done
 
@@ -216,7 +249,7 @@ while [ "$PORT_ATTEMPTS" -lt "$PORT_MAX_ATTEMPTS" ] && [ "$READY" != "true" ]; d
     "XDG_STATE_HOME=$PROXY_STATE_DIR_TARGET" \
     "CCP_BIND_ADDRESS=127.0.0.1" \
     "CCP_LOG_STDERR=1" \
-    claude-code-proxy serve --port "$PROXY_PORT" --no-monitor > "$PROXY_LOG" 2>&1 &
+    "$PROXY_BIN_TARGET" serve --port "$PROXY_PORT" --no-monitor > "$PROXY_LOG" 2>&1 &
   PROXY_PID=$!
 
   # --- readiness poll（最大 10 秒） ---
@@ -321,8 +354,8 @@ echo "CLAUDE_GPT_PROXY_PID=${PROXY_PID}" >&2
 if [ "$CHECK_ONLY" = "true" ]; then
   kill "$PROXY_PID" 2>/dev/null
   wait "$PROXY_PID" 2>/dev/null
-  printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"ok","mode":"check_only","port":%s,"bind_ok":%s,"model_alias_ok":%s,"strict_mcp_mode":%s,"mcp_config_path":"%s","settings_path":"%s","proxy_home_dir":"%s","preflight":%s}\n' \
-    "$PROXY_PORT" "$BIND_OK" "$MODEL_ALIAS_OK" "$STRICT_MCP_MODE" "$MCP_CONFIG_PATH" "$SETTINGS_PATH" "$PROXY_HOME_TARGET" "$PREFLIGHT_JSON"
+  printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"ok","mode":"check_only","port":%s,"bind_ok":%s,"model_alias_ok":%s,"strict_mcp_mode":%s,"mcp_config_path":"%s","settings_path":"%s","proxy_home_dir":"%s","proxy":{"absolute_path":"%s","version":"%s"},"preflight":%s}\n' \
+    "$PROXY_PORT" "$BIND_OK" "$MODEL_ALIAS_OK" "$STRICT_MCP_MODE" "$MCP_CONFIG_PATH" "$SETTINGS_PATH" "$PROXY_HOME_TARGET" "$PROXY_BIN_TARGET" "$PROXY_VERSION_TARGET" "$PREFLIGHT_JSON"
   exit 0
 fi
 

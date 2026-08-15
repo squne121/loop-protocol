@@ -60,9 +60,12 @@ READ_RESTRICTION_OK=false
 READ_RESTRICTION_APPLICABLE=false
 EXIT_CODE=0
 
-# --- 1. バイナリ存在確認 ---
-if command -v claude-code-proxy >/dev/null 2>&1; then
+# --- 1. バイナリ存在確認（P2: absolute path を一度解決し以降すべて同一値を使い回す） ---
+PROXY_BIN=$(claude_gpt_resolve_proxy_bin)
+PROXY_VERSION="unknown"
+if [ -n "$PROXY_BIN" ]; then
   BINARY_OK=true
+  PROXY_VERSION=$(claude_gpt_proxy_version "$PROXY_BIN")
 else
   EXIT_CODE=3
 fi
@@ -79,7 +82,7 @@ fi
 
 # --- 2. ChatGPT subscription 認証状態確認（proxy 専用 HOME/CCP_CONFIG_DIR で確認。P0-2） ---
 if [ "$BINARY_OK" = "true" ] && [ "$PROXY_HOME_UNDER_REPO" = "false" ]; then
-  AUTH_STATUS_OUTPUT=$(HOME="$PROXY_HOME_TARGET" CCP_CONFIG_DIR="$PROXY_CONFIG_DIR_TARGET" claude-code-proxy codex auth status 2>&1)
+  AUTH_STATUS_OUTPUT=$(HOME="$PROXY_HOME_TARGET" CCP_CONFIG_DIR="$PROXY_CONFIG_DIR_TARGET" "$PROXY_BIN" codex auth status 2>&1)
   AUTH_STATUS_RC=$?
   if [ "$AUTH_STATUS_RC" -eq 0 ]; then
     case "$AUTH_STATUS_OUTPUT" in
@@ -151,6 +154,10 @@ cat <<JSON_EOF
   "schema": "CLAUDE_GPT_PREFLIGHT_RESULT_V1",
   "env_only": ${ENV_ONLY},
   "binary_available": ${BINARY_OK},
+  "proxy": {
+    "absolute_path": "${PROXY_BIN}",
+    "version": "${PROXY_VERSION}"
+  },
   "chatgpt_auth": {
     "available": ${AUTH_OK},
     "detail": "${AUTH_DETAIL}"

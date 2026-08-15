@@ -84,6 +84,81 @@ claude_gpt_resolve_claude_bin() {
   command -v claude 2>/dev/null
 }
 
+# --- proxy 実行バイナリの解決（P2: identity/version pinning） ---
+#
+# `command -v claude-code-proxy` を一度だけ解決し、以降 preflight / 起動 / 証跡すべてで
+# 同一の absolute path を使い回す。CLAUDE_GPT_PROXY_BIN が明示されていれば（launch.sh が
+# 一度解決した値を子プロセス preflight.sh へ export する場合など）それを優先し、
+# 再解決による差異（PATH mutation 等）を排除する。
+claude_gpt_resolve_proxy_bin() {
+  if [ -n "${CLAUDE_GPT_PROXY_BIN:-}" ]; then
+    printf '%s\n' "$CLAUDE_GPT_PROXY_BIN"
+    return 0
+  fi
+  command -v claude-code-proxy 2>/dev/null
+}
+
+# claude_gpt_proxy_version: 起動対象 proxy バイナリの version 識別子を取得する。
+# `--version` 相当が使えない/失敗する場合は sha256（存在すれば）、それも取れなければ
+# "unknown" を返す（証跡には常に何らかの identity 値を残す）。
+# 引数1: proxy バイナリの絶対パス
+claude_gpt_proxy_version() {
+  proxy_bin="$1"
+  if [ -z "$proxy_bin" ]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  version_output=$("$proxy_bin" --version 2>/dev/null | head -n1)
+  if [ -n "$version_output" ]; then
+    printf '%s\n' "$version_output"
+    return 0
+  fi
+  claude_gpt_sha256_file "$proxy_bin"
+}
+
+# claude_gpt_sha256_file: 任意ファイルの sha256 を計算する。sha256sum / shasum いずれも
+# 使えない環境では "unknown" を返す（VC preflight allowlist 外コマンドへ依存しない）。
+claude_gpt_sha256_file() {
+  file="$1"
+  if [ -z "$file" ] || [ ! -f "$file" ]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" 2>/dev/null | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" 2>/dev/null | cut -d' ' -f1
+  else
+    printf 'unknown\n'
+  fi
+}
+
+# claude_gpt_git_head: repo_root の現行 HEAD SHA を取得する（取得不可なら "unknown"）。
+claude_gpt_git_head() {
+  repo_root="$1"
+  head_sha=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null)
+  if [ -n "$head_sha" ]; then
+    printf '%s\n' "$head_sha"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+# claude_gpt_git_dirty: repo_root が dirty（untracked/modified あり）かどうかを
+# "true"/"false"/"unknown"（git repo でない等）で返す。
+claude_gpt_git_dirty() {
+  repo_root="$1"
+  if ! git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'unknown\n'
+    return 0
+  fi
+  if [ -n "$(git -C "$repo_root" status --porcelain 2>/dev/null)" ]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
 # launcher が内部で必ず自前設定する policy flag。呼び出し側（drop-in 先の
 # runtime smoke harness 等）が `--` の後ろに同名 flag を渡して弱体化させることを拒否する
 # ためのチェック対象一覧（P1-1）。
