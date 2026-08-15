@@ -173,8 +173,20 @@ MCP_JSON_EOF
 #    tool（Read 等）に対する best-effort の軽量防御として拒否する（絶対パスは
 #    `Read(//...)` の二重スラッシュ構文でなければ機能しない）。任意の Bash subprocess
 #    からの credential 秘匿を保証するものではない（Issue #2158 Scope Reframe）。
-# 2. session-scoped に repository/user plugin を無効化する（Parent #2154 gateway/context
-#    契約。P1-2）。
+# 2. `enabledPlugins: {}` は repository/user plugin を確実に「全無効化」する専用 API
+#    ではない（Claude Code CLI に plugin 専用の deny-all flag は存在しない。実機検証
+#    済み、PR #2162 P0-2 再検証, 2026-08-15）。実機観測では、この launcher が採用する
+#    CLAUDE_CONFIG_DIR 分離（isolated GPT 専用 config root。決定 C）により対象環境の
+#    plugin registry（installed_plugins.json / marketplaces / skills-dir）自体が空に
+#    なるため、user/global scope で登録済みの plugin（SessionStart hook を持つものを
+#    含む）は実機で発火しないことを確認した。`enabledPlugins: {}` はこれに重ねる
+#    defense-in-depth の軽減策であり、単独では plugin 全無効化を保証しない（Claude
+#    Code 内部ドキュメント文字列上、plugin は明示 disable が無い限り
+#    `defaultEnabled`（既定 true）で有効化されるため、空オブジェクトはどの plugin も
+#    明示的に無効化しない）。プロジェクト（repository）scope で settings.json に
+#    plugin/marketplace を宣言するケースは、`claude plugin install` 相当の明示的な
+#    trust/install 手順を経ないと有効化されないことを実機で確認したが、この経路への
+#    完全な防御は本 launcher の保証範囲外（Claude Code 本体の trust モデルに依存）。
 #
 # OS-level sandbox hardening（sandbox.enabled / CLAUDE_CODE_SUBPROCESS_ENV_SCRUB）は
 # 実装しない。実機検証（PR #2162, 2026-08-14 / Issue #2173）で、launcher 自体が
