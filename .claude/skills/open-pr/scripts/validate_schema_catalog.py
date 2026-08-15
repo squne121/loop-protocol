@@ -99,6 +99,13 @@ _COMMAND_REGISTRY: dict[str, dict[str, str]] = {
             "test_validate_ci_performance_assessment_v2.py"
         ),
     },
+    "validate_ci_reliability_assessment_v1": {
+        "runner": "pytest",
+        "target": (
+            ".claude/skills/ci-test-performance/scripts/tests/"
+            "test_validate_ci_reliability_assessment_v1.py"
+        ),
+    },
     "validate_gemini_grounding_evidence_tests": {
         "runner": "pytest",
         "target": ".claude/skills/gemini-cli-headless-delegation/tests/",
