@@ -755,6 +755,28 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
 
     start = datetime.now()
     try:
+        # Issue #2165 P1-2 (OWNER 2026-08-15 REQUEST_CHANGES): a full
+        # `Popen(start_new_session=True)` + `killpg()` process-tree reaping
+        # rewrite was attempted here so a VC command's own grandchildren
+        # (not merely its direct child) are reaped on timeout, matching
+        # `reviewer_transport.py`'s own process-group reaping one layer up.
+        # That rewrite was REVERTED: it requires replacing this function's
+        # `subprocess.run(argv, ...)` call shape, which
+        # `.claude/skills/issue-contract-review/tests/test_pnpm_gate_security_boundary.py::
+        # test_producer_evidence_round_trips_to_triage` (an existing,
+        # pre-#2165 test OUTSIDE this Issue's Allowed Paths) monkeypatches
+        # directly (`monkeypatch.setattr(baseline.subprocess, "run",
+        # fake_run)`) and asserts is called with this exact signature.
+        # Reimplementing via `Popen`/`communicate()` bypasses that mock
+        # entirely and breaks that test. Per this Issue's Stop Conditions
+        # ("Allowed Paths 外の変更が必要と判明した場合"), full grandchild
+        # reaping at this specific layer is deferred to a follow-up Issue
+        # that can also update that test's mock target (or move it to
+        # patch `Popen`); see the PR description for detail. This
+        # per-VC-command execution therefore still only guarantees the
+        # DIRECT child is killed/reaped on timeout (Python's
+        # `subprocess.run(..., timeout=...)` behavior, unchanged from
+        # before #2165).
         result = subprocess.run(
             argv,
             capture_output=True,
@@ -4455,3 +4477,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

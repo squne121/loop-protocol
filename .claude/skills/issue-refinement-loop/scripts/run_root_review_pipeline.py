@@ -157,6 +157,20 @@ from validate_review_compact_output import (  # noqa: E402
 )
 import reviewer_transport as _reviewer_transport  # noqa: E402
 
+# Issue #2165 P1-1 (OWNER 2026-08-15 REQUEST_CHANGES): import
+# `contract_readiness_check.py` as a module (not merely subprocess it) so
+# this file's `CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS` /
+# `CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS` /
+# `MERGE_READINESS_TIMEOUT_SECONDS` -- the SAME three subprocess budgets
+# that dominate a deterministic checker attempt's wall time -- can derive
+# the per-attempt/total deadline this module passes explicitly to
+# `reviewer_transport.run_reviewer_transport()`, instead of that transport
+# module guessing a number independently of the budgets THIS module owns
+# (the OWNER-flagged 300s-vs-310s arithmetic break).
+if str(_ISSUE_CONTRACT_REVIEW_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_ISSUE_CONTRACT_REVIEW_SCRIPTS))
+import contract_readiness_check as _contract_readiness_check  # noqa: E402
+
 # Issue #2054 AC8: `reviewer_transport.py` is the V2 contract SSOT. This
 # module no longer imports the retired V1 `compact_review_result()` renderer
 # (`compact_review_result.py`'s CLI/pure-function producer is retired --
@@ -252,7 +266,21 @@ def write_pinned_body_tempfile(body: str, *, dir: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run_check_issue_contract(body_file: str, *, timeout_seconds: int = 30) -> tuple[dict | None, int, str | None]:
+# Issue #2165 P1-1: named constants for the three sequential subprocess
+# budgets a single deterministic checker attempt executes. Kept small
+# (check_issue_contract's own real usage is sub-second) except where the
+# budget genuinely must absorb VC execution
+# (`CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS`, derived below from
+# `contract_readiness_check.py`'s own derived constant, which in turn
+# derives from `baseline_vc_preflight.py`'s per-VC-command cap).
+CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS = 30
+CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS = _contract_readiness_check.CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS
+MERGE_READINESS_TIMEOUT_SECONDS = 30
+
+
+def run_check_issue_contract(
+    body_file: str, *, timeout_seconds: int = CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS
+) -> tuple[dict | None, int, str | None]:
     """Run `check_issue_contract.py --file <body_file> --json` and parse stdout."""
     script_path = _REVIEW_ISSUE_SCRIPTS / "check_issue_contract.py"
     cmd = [sys.executable, str(script_path), "--file", body_file, "--json"]
@@ -267,16 +295,18 @@ def run_check_issue_contract(body_file: str, *, timeout_seconds: int = 30) -> tu
 
 
 def run_contract_readiness_check(
-    body_file: str, *, mode: str = "execute", timeout_seconds: int = 250
+    body_file: str, *, mode: str = "execute", timeout_seconds: int = CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS
 ) -> tuple[dict | None, int, str | None]:
     """Run `contract_readiness_check.py --body-file <body_file> --mode <mode>`.
 
-    Issue #2165: `timeout_seconds` must exceed `contract_readiness_check.py`'s
-    own internal worst-case budget (validate_issue_body.py subprocess timeout
-    30s + baseline_vc_preflight.py subprocess wrapper timeout 200s + minor
-    overhead), otherwise this wrapper kills a still-legitimately-running
-    `contract_readiness_check.py` before it can return its own bounded
-    timeout result. 250 keeps a small margin above that ~230s inner ceiling.
+    Issue #2165 P1-1: `timeout_seconds` defaults to
+    `contract_readiness_check.CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS`
+    (imported, not re-derived here) so this wrapper's timeout is always
+    DERIVED from -- and therefore always exceeds -- that module's own
+    internal worst-case budget (`validate_issue_body.py` subprocess timeout
+    + `baseline_vc_preflight.py` aggregate wrapper timeout + margin). This
+    removes the previous drift hazard where two independently hand-picked
+    numbers (250 here, ~230s inner ceiling there) could silently invert.
     """
     script_path = _ISSUE_CONTRACT_REVIEW_SCRIPTS / "contract_readiness_check.py"
     cmd = [sys.executable, str(script_path), "--body-file", body_file, "--mode", mode]
@@ -297,7 +327,7 @@ def run_merge_readiness(
     readiness_artifact_path: str,
     iteration_id: str,
     output_file: str,
-    timeout_seconds: int = 30,
+    timeout_seconds: int = MERGE_READINESS_TIMEOUT_SECONDS,
 ) -> tuple[dict | None, int, str | None]:
     """Run `check_issue_contract.py --mode merge_readiness ...`.
 
@@ -857,7 +887,7 @@ def produce_compact_result(
 
 def run_checker_pipeline_once(
     *, body_file: str, issue_number: int, body_sha256: str
-) -> tuple[dict[str, Any] | None, str | None]:
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
     """Run check_issue_contract -> contract_readiness_check -> merge_readiness
     exactly once against an already-fetched, already-pinned body file.
 
@@ -867,13 +897,41 @@ def run_checker_pipeline_once(
     subprocess child by `reviewer_transport.run_reviewer_transport()`) and
     directly by tests.  All intermediate JSON files live in a private
     temporary directory removed on return.
+
+    Returns ``(merged, error_code, timeout_phase)``. ``timeout_phase`` is
+    non-None only when ``error_code == "timeout"`` (Issue #2165 P0-1/P1-4):
+    it records WHICH layer produced the timeout -- the wrapper subprocess
+    itself (``check_issue_contract`` / ``contract_readiness_check_wrapper``
+    / ``merge_readiness``), or `contract_readiness_check.py`'s OWN typed
+    ``status: "runtime_error"`` payload (``baseline_vc_preflight_aggregate``,
+    forwarded from ``readiness_result["timeout_phase"]``) when its wrapper
+    subprocess itself completed but reported that its internal
+    `baseline_vc_preflight.py` execution timed out.
     """
     scratch_dir = Path(tempfile.mkdtemp(prefix="root_review_pipeline_attempt_"))
     try:
         review_result, _review_rc, review_err = run_check_issue_contract(body_file)
+        if review_result is None:
+            return None, review_err, ("check_issue_contract" if review_err == "timeout" else None)
+
         readiness_result, _readiness_rc, readiness_err = run_contract_readiness_check(body_file)
-        if review_result is None or readiness_result is None:
-            return None, review_err or readiness_err
+        if readiness_result is None:
+            return None, readiness_err, ("contract_readiness_check_wrapper" if readiness_err == "timeout" else None)
+
+        # Issue #2165 P0-1: `contract_readiness_check.py` can complete (its
+        # OWN wrapper subprocess does not itself raise TimeoutExpired) yet
+        # still report a typed `status: "runtime_error"` because ITS
+        # internal `baseline_vc_preflight.py` aggregate execution timed
+        # out. `readiness_result` being non-None previously meant this fell
+        # straight through to `run_merge_readiness()` as an ordinary
+        # semantic readiness result -- collapsing the runtime failure into
+        # `category: no_commands_extracted` / `needs_fix`. Treat it the
+        # SAME way an actual wrapper-level `subprocess.TimeoutExpired`
+        # would be treated: a transport-visible timeout, never handed to
+        # `run_merge_readiness()`.
+        if readiness_result.get("status") == "runtime_error":
+            phase = readiness_result.get("timeout_phase")
+            return None, "timeout", (phase if isinstance(phase, str) and phase else "contract_readiness_check")
 
         review_result_file = str(scratch_dir / "review_result.json")
         readiness_result_file = str(scratch_dir / "readiness_result.json")
@@ -889,10 +947,10 @@ def run_checker_pipeline_once(
             output_file=merged_output_file,
         )
         if merged is None:
-            return None, merge_err
+            return None, merge_err, ("merge_readiness" if merge_err == "timeout" else None)
 
         merged["body_sha256"] = body_sha256
-        return merged, None
+        return merged, None, None
     finally:
         shutil.rmtree(scratch_dir, ignore_errors=True)
 
@@ -913,11 +971,19 @@ def _cmd_run_checker_attempt(args: argparse.Namespace) -> int:
     docstring's subcommand list) and MUST NOT be invoked by anything other
     than `_cmd_produce()` via `run_reviewer_transport()`.
     """
-    merged, error_code = run_checker_pipeline_once(
+    merged, error_code, timeout_phase = run_checker_pipeline_once(
         body_file=args.body_file, issue_number=args.issue_number, body_sha256=args.body_sha256
     )
     if merged is None:
-        print(json.dumps({"error_code": error_code}), file=sys.stderr)
+        # Issue #2165 P1-4: `timeout_phase` is included ONLY when set (kept
+        # additive on the stderr envelope, matching `_attempt_result()`'s
+        # additive field on the parent side) so `reviewer_transport.py`'s
+        # existing `error_code == "timeout"` detection keeps working
+        # unchanged for consumers that only check `error_code`.
+        payload: dict[str, Any] = {"error_code": error_code}
+        if timeout_phase:
+            payload["timeout_phase"] = timeout_phase
+        print(json.dumps(payload), file=sys.stderr)
         return 2
     print(json.dumps(merged))
     return 0
@@ -965,6 +1031,27 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             body_sha256,
         ]
         artifact_root = _REPO_ROOT / _CANONICAL_ARTIFACT_DIR
+
+        # Issue #2165 P1-1 (OWNER 2026-08-15 REQUEST_CHANGES): derive and
+        # pass EXPLICIT per-attempt/total deadlines here, rather than
+        # relying on `reviewer_transport.py`'s own generic fallback
+        # constants -- THIS module is the one that knows the real layered
+        # budget the deterministic child executes
+        # (`CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS` +
+        # `CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS` +
+        # `MERGE_READINESS_TIMEOUT_SECONDS`), plus a margin for process
+        # spawn/IPC overhead around those three sequential subprocess
+        # calls. This ties the transport-level deadline to the SAME
+        # arithmetic that produces the child's own budgets, so the two
+        # cannot independently drift apart again.
+        _process_spawn_margin_seconds = 20
+        _deterministic_per_attempt_deadline = (
+            CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS
+            + CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS
+            + MERGE_READINESS_TIMEOUT_SECONDS
+            + _process_spawn_margin_seconds
+        )
+        _deterministic_total_deadline = _deterministic_per_attempt_deadline + 40
         transport_result = _reviewer_transport.run_reviewer_transport(
             base_argv=base_argv,
             command_id="root_review_pipeline.checker_attempt",
@@ -974,6 +1061,8 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             repo=args.repo,
             reviewed_body_sha256=body_sha256,
             artifact_root=artifact_root,
+            per_attempt_deadline=_deterministic_per_attempt_deadline,
+            total_deadline=_deterministic_total_deadline,
         )
         if transport_result["transport_status"] != "ok":
             print(
@@ -1165,3 +1254,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

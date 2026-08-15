@@ -57,9 +57,46 @@ if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from baseline_vc_preflight import extract_verification_commands_section  # noqa: E402
+from baseline_vc_preflight import (  # noqa: E402
+    DEFAULT_TIMEOUT_SECONDS as _PER_VC_COMMAND_TIMEOUT_SECONDS,
+    extract_verification_commands_section,
+)
 from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
 from prose_boundary_policy import HEADING_POLICY  # noqa: E402
+
+# Issue #2165 (OWNER 2026-08-15 REQUEST_CHANGES P1-1(c)): derive the
+# `baseline_vc_preflight.py` *aggregate* wrapper timeout from that module's
+# own per-VC-command cap instead of an independent hardcoded number, so a
+# future change to the per-command cap cannot silently reintroduce the
+# arithmetic break the OWNER flagged (two VCs near the per-command cap
+# already exceeding a hand-picked aggregate value). Budget assumption:
+# worst case is a small number of long-running VCs run sequentially
+# (`baseline_vc_preflight.py` executes VCs with `--max-workers=1` in strict
+# mode) plus a handful of fast (`rg` etc.) VCs whose combined overhead is
+# covered by the flat margin below.
+_MAX_SEQUENTIAL_NEAR_CAP_VCS_ASSUMED = 2
+_AGGREGATE_MARGIN_SECONDS = 50
+BASELINE_VC_PREFLIGHT_AGGREGATE_TIMEOUT_SECONDS = (
+    _PER_VC_COMMAND_TIMEOUT_SECONDS * _MAX_SEQUENTIAL_NEAR_CAP_VCS_ASSUMED + _AGGREGATE_MARGIN_SECONDS
+)
+
+# Issue #2165 P1-1: `run_validate_issue_body()` below uses this named
+# constant (was the bare literal `30`) so `CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS`
+# can be derived from it rather than duplicating the number.
+VALIDATE_ISSUE_BODY_TIMEOUT_SECONDS = 30
+
+# Issue #2165 P1-1: the wrapper timeout `run_root_review_pipeline.py`'s
+# `run_contract_readiness_check()` uses for the `contract_readiness_check.py`
+# subprocess it spawns. Derived (not independently guessed) from this
+# module's OWN internal worst-case budget -- `validate_issue_body.py`
+# subprocess (`VALIDATE_ISSUE_BODY_TIMEOUT_SECONDS`) + the
+# `baseline_vc_preflight.py` aggregate wrapper
+# (`BASELINE_VC_PREFLIGHT_AGGREGATE_TIMEOUT_SECONDS`) + a small margin for
+# process startup/teardown -- so the two values cannot drift apart the way
+# the OWNER-flagged 250s/230s pairing could.
+CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS = (
+    VALIDATE_ISSUE_BODY_TIMEOUT_SECONDS + BASELINE_VC_PREFLIGHT_AGGREGATE_TIMEOUT_SECONDS + 20
+)
 
 # Required fields for `decision: immediate` in Runtime Verification Applicability section
 _RVA_IMMEDIATE_REQUIRED_FIELDS = [
@@ -371,7 +408,7 @@ def run_validate_issue_body(body: str) -> dict[str, Any]:
             args,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=VALIDATE_ISSUE_BODY_TIMEOUT_SECONDS,
         )
         if result.stdout:
             return json.loads(result.stdout)
@@ -480,21 +517,21 @@ def run_baseline_vc_preflight(body: str) -> tuple[dict, int]:
         tmp_path = tf.name
 
     try:
-        # Issue #2165: `baseline_vc_preflight.py` の DEFAULT_TIMEOUT_SECONDS
-        # (150、per-VC-command timeout) が raise されたため、この wrapper
-        # timeout もそれを下回らないよう整合させる。1 Issue が複数 VC を
-        # 持つ場合 baseline_vc_preflight.py は VC を逐次実行するため、
-        # 単一の重い VC（例: skill 全体の pytest full suite、実測111秒）に
-        # 加えて残りの軽量 VC（rg 等、数秒未満）の合計時間を吸収できる値
-        # として 200 秒（DEFAULT_TIMEOUT_SECONDS=150 + 50 秒の追加マージン）
-        # を採用する。呼び出し元 `run_root_review_pipeline.py` の
-        # `run_contract_readiness_check()` 側の wrapper timeout もこの値の
-        # 上位に整合させている。
+        # Issue #2165 P1-1(c): the aggregate wrapper timeout is derived
+        # (`BASELINE_VC_PREFLIGHT_AGGREGATE_TIMEOUT_SECONDS`, above) from
+        # `baseline_vc_preflight.py`'s own per-VC-command cap rather than an
+        # independent hardcoded number, so the two values cannot drift the
+        # way the OWNER-flagged 150s-cap/200s-aggregate pairing could (two
+        # VCs near the per-command cap already exceeding the old fixed
+        # aggregate value). The caller (`run_root_review_pipeline.py`'s
+        # `run_contract_readiness_check()`) derives ITS OWN wrapper timeout
+        # (`CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS`) from this module's
+        # constants for the same reason.
         result = subprocess.run(
             [sys.executable, str(_BASELINE_VC_PREFLIGHT_PY), "--strict", "--body-file", tmp_path],
             capture_output=True,
             text=True,
-            timeout=200,
+            timeout=BASELINE_VC_PREFLIGHT_AGGREGATE_TIMEOUT_SECONDS,
         )
         exit_code = result.returncode
         if result.stdout:
@@ -509,14 +546,32 @@ def run_baseline_vc_preflight(body: str) -> tuple[dict, int]:
             exit_code,
         )
     except subprocess.TimeoutExpired:
+        # Issue #2165 P0-1 (OWNER 2026-08-15 REQUEST_CHANGES): this MUST be
+        # a typed runtime-error payload, not a plain `errors: ["timeout"]`
+        # blocked payload -- the latter was silently collapsed by
+        # `map_preflight_result_to_errors()`'s plain-string-error branch
+        # into `category: no_commands_extracted` / `readiness_status:
+        # needs_fix`, letting a genuine execution-budget timeout masquerade
+        # as an ordinary body-author-fixable semantic finding (and letting
+        # `run_root_review_pipeline.py`'s `run-checker-attempt` exit 0/1
+        # instead of the exit-2 structured failure `reviewer_transport.py`
+        # depends on to classify the attempt as `reason_code: timeout`).
+        # `status: "runtime_error"` is a NEW, distinct value from
+        # `go`/`needs_fix`/`human_judgment` that `_raise_status()` and
+        # `build_result()` propagate at the HIGHEST priority (see
+        # `_STATUS_PRIORITY` below) so it can never be silently downgraded
+        # to a semantic verdict.
         return (
             {
                 "schema": "baseline_vc_preflight/v1",
-                "status": "blocked",
+                "status": "runtime_error",
                 "results": [],
-                "errors": ["timeout"],
+                "errors": [],
+                "failure_class": "timeout",
+                "timeout_phase": "baseline_vc_preflight_aggregate",
+                "retryable": False,
             },
-            1,
+            -1,
         )
     except json.JSONDecodeError as exc:
         return (
@@ -591,6 +646,40 @@ def map_preflight_result_to_errors(
     aggregate = "go"
 
     overall_status = preflight_result.get("status", "blocked")
+
+    # Issue #2165 P0-1: a typed `status: "runtime_error"` payload (currently
+    # only the `baseline_vc_preflight.py` aggregate-execution timeout, see
+    # `run_baseline_vc_preflight()`) MUST NOT be folded into the plain
+    # `blocked` no-results branch below (which maps to `needs_fix` via
+    # `no_commands_extracted`) -- it is a transport-visible runtime failure,
+    # not a body-author-fixable semantic finding.
+    if overall_status == "runtime_error":
+        errors.append(
+            {
+                "rule_id": "VCP_RUNTIME_ERROR",
+                "severity": "error",
+                "source_check": "baseline_vc_preflight",
+                "category": "baseline_vc_preflight_runtime_error",
+                "section": "Verification Commands",
+                "line_start": 0,
+                "line_end": 0,
+                "minimal_context": [
+                    f"failure_class={preflight_result.get('failure_class')}",
+                    f"timeout_phase={preflight_result.get('timeout_phase')}",
+                ],
+                "fix_hint": (
+                    "baseline_vc_preflight execution exceeded its aggregate budget; "
+                    "this is a runtime/environment condition, not a body-fixable error."
+                ),
+                "autofixable": False,
+                "source_payload": {
+                    "failure_class": preflight_result.get("failure_class"),
+                    "timeout_phase": preflight_result.get("timeout_phase"),
+                    "retryable": preflight_result.get("retryable"),
+                },
+            }
+        )
+        return errors, "runtime_error"
 
     # Sentinel for absent "message" key (AC5: distinguish absent from None)
     _MISSING = object()
@@ -751,10 +840,19 @@ def map_preflight_result_to_errors(
     return errors, aggregate
 
 
+_STATUS_PRIORITY = {"go": 0, "needs_fix": 1, "human_judgment": 2, "runtime_error": 3}
+
+
 def _raise_status(current: str, candidate: str) -> str:
-    """Priority: human_judgment > needs_fix > go."""
-    priority = {"go": 0, "needs_fix": 1, "human_judgment": 2}
-    if priority.get(candidate, 0) > priority.get(current, 0):
+    """Priority: runtime_error > human_judgment > needs_fix > go.
+
+    Issue #2165 P0-1: `runtime_error` (a typed transport/execution-budget
+    failure, currently only the `baseline_vc_preflight.py` aggregate
+    timeout) sits ABOVE `human_judgment` so it can never be silently
+    downgraded to an ordinary semantic verdict by a later `_raise_status()`
+    call in the same aggregation pass.
+    """
+    if _STATUS_PRIORITY.get(candidate, 0) > _STATUS_PRIORITY.get(current, 0):
         return candidate
     return current
 
@@ -1358,9 +1456,13 @@ def main() -> int:
         return 0
     elif status == "needs_fix":
         return 1
-    else:  # human_judgment
+    elif status == "human_judgment":
         return 2
+    else:  # runtime_error (Issue #2165 P0-1): distinct exit code, never
+        # collapsed into the needs_fix(1)/human_judgment(2) semantic range.
+        return 4
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
