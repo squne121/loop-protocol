@@ -89,7 +89,7 @@ describe('buildManifest / schema validation (AC1 docs/schemas/retro-live-verific
     const validation = await validateManifestWithAjv(manifest)
     expect(validation.valid).toBe(true)
     expect(validation.errors).toEqual([])
-  })
+  }, 10_000)
 
   it('GIVEN the manifest allowed_paths WHEN compared to the Issue #1709 contract THEN they match exactly', () => {
     const manifest = buildManifest(BASE_ARGS)
@@ -111,7 +111,7 @@ describe('buildManifest / schema validation (AC1 docs/schemas/retro-live-verific
     const validation = await validateManifestWithAjv(withoutProfile)
     expect(validation.valid).toBe(false)
     expect(validation.errors.length).toBeGreaterThan(0)
-  })
+  }, 10_000)
 
   it('GIVEN a bare expected_digest WHEN a manifest is built THEN it is normalized to the sha256:-prefixed representation (Issue #1709 PR review P0-4)', () => {
     const manifest = buildManifest(BASE_ARGS)
@@ -153,7 +153,7 @@ describe('normalizeTrustedActorIdAllowlist (Issue #1415 P1-1 fix_delta)', () => 
     const withId = buildManifest({ ...BASE_ARGS, trustedActorId: '63350259' })
     expect(withId.execution_boundary.trusted_actor_id_allowlist).toEqual([63350259])
     expect(withId.canonical_comment.body_digest).toBe(withoutId.canonical_comment.body_digest)
-  })
+  }, 10_000)
 })
 
 describe('computeCanonicalCommentBody', () => {

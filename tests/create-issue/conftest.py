@@ -29,6 +29,7 @@ def _valid_child() -> dict:
         },
         "label_profile": "standard",
         "sections": {
+            "Runtime Verification Applicability": "- decision: not_applicable\n- reason: 静的検証のみで完結するため",
             "Outcome": "overlap gate が追加され Vitest が PASS する状態",
             "In Scope": "- overlap gate 実装\n- 対応する unit test",
             "Current Validated Scope": "- src/foo.ts に gate を追加",

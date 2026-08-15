@@ -550,6 +550,131 @@ class TestReadinessTimeout:
 
 
 # ---------------------------------------------------------------------------
+# AC12 (#2040): timeout_phase / execution_time_summary
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutPhaseAndExecutionSummary:
+    """GIVEN a subprocess step timeout WHEN run_once runs THEN it reports which
+    phase timed out (親 run-once/readiness, vc-preflight, or a generic child
+    command) plus a small bounded execution_time_summary, and issues no
+    automatic retry. Non-timeout runs never gain these fields."""
+
+    def test_readiness_timeout_reports_run_once_readiness_phase(self):
+        def timeout_readiness(cmd, timeout=_rcr_mod._DEFAULT_TIMEOUT):
+            return None, -1, "timeout"
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=timeout_readiness):
+            result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "runtime_error"
+        assert result["timeout_phase"] == "run_once_readiness"
+        assert result["execution_time_summary"]["phase"] == "run_once_readiness"
+        assert (
+            result["execution_time_summary"]["timeout_seconds"]
+            == _rcr_mod._DEFAULT_READINESS_TIMEOUT_SECONDS
+        )
+        assert isinstance(result["execution_time_summary"]["elapsed_seconds"], float)
+        assert result["execution_time_summary"]["elapsed_seconds"] >= 0.0
+
+    def test_vc_preflight_timeout_reports_vc_preflight_phase_not_readiness_phase(self):
+        readiness_json = _make_readiness_json("go")
+        product_spec_json = _make_product_spec_json("pass")
+
+        run_script_iter = iter([
+            (readiness_json, 0, None),
+            (product_spec_json, 0, None),
+        ])
+
+        def run_script(cmd, timeout=_rcr_mod._DEFAULT_TIMEOUT):
+            try:
+                return next(run_script_iter)
+            except StopIteration:
+                return None, -1, "timeout"
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=run_script):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=(0, "OK", "")):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "runtime_error"
+        assert result["timeout_phase"] == "vc_preflight"
+        assert result["timeout_phase"] != "run_once_readiness"
+        assert result["execution_time_summary"]["phase"] == "vc_preflight"
+        assert (
+            result["execution_time_summary"]["timeout_seconds"]
+            == _rcr_mod._VC_PREFLIGHT_TIMEOUT
+        )
+
+    def test_check_blockers_timeout_reports_child_command_phase(self):
+        readiness_json = _make_readiness_json("go")
+
+        with patch.object(_rcr_mod, "_run_script", return_value=(readiness_json, 0, None)):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=(-1, "", "timeout")):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "runtime_error"
+        assert result["timeout_phase"] == "child_command"
+        assert result["execution_time_summary"]["phase"] == "child_command"
+        assert (
+            result["execution_time_summary"]["timeout_seconds"]
+            == _rcr_mod._DEFAULT_TIMEOUT
+        )
+
+    def test_product_spec_timeout_reports_child_command_phase(self):
+        readiness_json = _make_readiness_json("go")
+
+        run_script_iter = iter([
+            (readiness_json, 0, None),
+            (None, -1, "timeout"),
+        ])
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_script_iter)):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=(0, "OK", "")):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "runtime_error"
+        assert result["timeout_phase"] == "child_command"
+        assert result["execution_time_summary"]["phase"] == "child_command"
+
+    def test_no_timeout_omits_timeout_fields(self):
+        """Normal (non-timeout) go run never gains timeout_phase / execution_time_summary."""
+        run_script_results, shell_results = _make_all_pass_side_effects()
+        run_iter = iter(run_script_results)
+        shell_iter = iter(shell_results)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_iter)):
+            with patch.object(_rcr_mod, "_run_shell_script", side_effect=lambda *a, **kw: next(shell_iter)):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    with patch.object(
+                        _rcr_mod,
+                        "_run_declared_path_overlap_check",
+                        return_value=_make_declared_path_overlap_result(disjoint=True),
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "go"
+        assert "timeout_phase" not in result
+        assert "execution_time_summary" not in result
+
+    def test_readiness_timeout_does_not_trigger_automatic_retry(self):
+        """No automatic retry: _run_script is invoked exactly once on readiness timeout."""
+        calls = []
+
+        def timeout_readiness(cmd, timeout=_rcr_mod._DEFAULT_TIMEOUT):
+            calls.append((cmd, timeout))
+            return None, -1, "timeout"
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=timeout_readiness):
+            result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "runtime_error"
+        assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # Status routing tests
 # ---------------------------------------------------------------------------
 

@@ -33,6 +33,11 @@ change_kind: code
 ## Current Validated Scope
 - docs/dev/
 
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
 ## Outcome
 Current-base evidence is required.
 
