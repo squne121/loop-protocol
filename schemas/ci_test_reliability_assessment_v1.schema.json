@@ -1,0 +1,503 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/ci_test_reliability_assessment_v1.schema.json",
+  "title": "CI Test Reliability Assessment V1",
+  "description": "Versioned schema for CI reliability (workflow failure rate / Playwright flaky test rate / Playwright terminal failure rate) non-inferiority assessments, defined independently from CI_TEST_PERFORMANCE_ASSESSMENT_V2 (schemas/ci_test_performance_assessment_v2.schema.json), which covers latency/performance only and is not modified by this schema. See docs/dev/ci-test-reliability-assessment.md for term definitions (denominators, retry vs rerun semantics, non-inferiority method). raw_attempts carries the raw per-run / per-test evidence that .claude/skills/ci-test-performance/scripts/validate_ci_reliability_assessment_v1.py recomputes reliability_metrics and non_inferiority_evaluation from; self-reported aggregates alone are never trusted.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "issue_number",
+    "pr_number",
+    "target_metric",
+    "reliability_metrics",
+    "sample_identity",
+    "confidence_level",
+    "non_inferiority_margin",
+    "sample_count_rule",
+    "non_inferiority_evaluation",
+    "raw_attempts"
+  ],
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": {
+      "const": "CI_TEST_RELIABILITY_ASSESSMENT_V1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "issue_number": {
+      "type": "integer"
+    },
+    "pr_number": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "measured_at": {
+      "type": "string",
+      "minLength": 1,
+      "format": "date-time"
+    },
+    "target_metric": {
+      "$ref": "#/$defs/MetricName"
+    },
+    "reliability_metrics": {
+      "type": "object",
+      "description": "Self-reported aggregates for the before (baseline) and after (candidate) cohorts. Recomputed and cross-checked against raw_attempts by the semantic validator -- never trusted alone.",
+      "required": [
+        "before",
+        "after"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "before": {
+          "$ref": "#/$defs/MetricsBlock"
+        },
+        "after": {
+          "$ref": "#/$defs/MetricsBlock"
+        }
+      }
+    },
+    "sample_identity": {
+      "type": "object",
+      "description": "Reliability's independent sample unit is workflow_run_id at run_attempt 1 (attempt-1 terminal outcome). GitHub Actions reruns (run_attempt > 1) are recorded in raw_attempts but are never counted as additional independent samples.",
+      "required": [
+        "key",
+        "required_run_attempt"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "key": {
+          "const": "workflow_run_id"
+        },
+        "required_run_attempt": {
+          "const": 1
+        }
+      }
+    },
+    "confidence_level": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "exclusiveMaximum": 1
+    },
+    "non_inferiority_margin": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "sample_count_rule": {
+      "$ref": "#/$defs/SampleCountRule"
+    },
+    "non_inferiority_evaluation": {
+      "$ref": "#/$defs/NonInferiorityEvaluation"
+    },
+    "raw_attempts": {
+      "type": "object",
+      "required": [
+        "before",
+        "after"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "before": {
+          "$ref": "#/$defs/RawAttemptCohort"
+        },
+        "after": {
+          "$ref": "#/$defs/RawAttemptCohort"
+        }
+      }
+    },
+    "notes": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "MetricName": {
+      "type": "string",
+      "enum": [
+        "workflow_failure_rate",
+        "playwright_flaky_test_rate",
+        "playwright_terminal_failure_rate"
+      ]
+    },
+    "MetricsBlock": {
+      "type": "object",
+      "required": [
+        "workflow_failure_rate",
+        "playwright_flaky_test_rate",
+        "playwright_terminal_failure_rate"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "workflow_failure_rate": {
+          "$ref": "#/$defs/RateFields",
+          "description": "numerator = terminal failure workflow run count (conclusion == failure, run_attempt == 1). denominator = eligible unique workflow_run_id count (run_attempt == 1, conclusion in {success, failure}; cancelled/timed_out/action_required are excluded from both numerator and denominator as infrastructure failure, not counted as terminal failure)."
+        },
+        "playwright_flaky_test_rate": {
+          "$ref": "#/$defs/RateFields",
+          "description": "numerator = logical tests (run_attempt == 1) whose final Playwright retry attempt passed after at least one earlier attempt failed/timedOut/interrupted. denominator = executed logical tests (run_attempt == 1, final attempt status != skipped)."
+        },
+        "playwright_terminal_failure_rate": {
+          "$ref": "#/$defs/RateFields",
+          "description": "numerator = logical tests (run_attempt == 1) whose final Playwright retry attempt is failed/timedOut/interrupted (all retries exhausted, still failing). denominator = same as playwright_flaky_test_rate."
+        }
+      }
+    },
+    "RateFields": {
+      "type": "object",
+      "required": [
+        "numerator",
+        "denominator",
+        "rate"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "numerator": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "denominator": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "SampleCountRule": {
+      "type": "object",
+      "description": "Must be explicit about whether the sample size is power-derived; a fixed sample count of 20 is never a silent default (see Background in issue #2170 -- 0/20 runs still leaves a ~16.8% two-sided 95% Clopper-Pearson upper bound -- the corresponding one-sided 95% upper bound is ~13.9%; see non_inferiority_evaluation.sidedness / risk_difference for the authoritative one-sided two-sample non-inferiority test).",
+      "required": [
+        "method",
+        "is_power_derived",
+        "required_sample_count",
+        "justification"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": [
+            "power_analysis",
+            "fixed_declared"
+          ]
+        },
+        "is_power_derived": {
+          "type": "boolean"
+        },
+        "required_sample_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "target_power": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1
+        },
+        "assumed_baseline_rate": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1
+        },
+        "justification": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "power_analysis"
+              }
+            },
+            "required": [
+              "method"
+            ]
+          },
+          "then": {
+            "required": [
+              "target_power",
+              "assumed_baseline_rate"
+            ],
+            "properties": {
+              "is_power_derived": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "fixed_declared"
+              }
+            },
+            "required": [
+              "method"
+            ]
+          },
+          "then": {
+            "properties": {
+              "is_power_derived": {
+                "const": false
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "target_power"
+                  ]
+                },
+                {
+                  "required": [
+                    "assumed_baseline_rate"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "NonInferiorityEvaluation": {
+      "type": "object",
+      "description": "Non-inferiority judgment for target_metric. before/after are per-arm two-sided exact (Clopper-Pearson) intervals reported for audit only (so a 0-failure before cohort still shows a finite, non-zero upper bound) and are NOT the basis for outcome. outcome is derived solely from risk_difference: a genuine two-independent-proportions one-sided test of p_after - p_before (effect_measure), computed via the Newcombe/Wilson hybrid score (MOVER) method. Both before and after must individually meet sample_count_rule.required_sample_count or outcome is inconclusive.",
+      "required": [
+        "metric",
+        "effect_measure",
+        "interval_method",
+        "sidedness",
+        "before",
+        "after",
+        "risk_difference",
+        "outcome"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "metric": {
+          "$ref": "#/$defs/MetricName"
+        },
+        "interval_method": {
+          "const": "clopper_pearson_exact",
+          "description": "Method used ONLY for the per-arm audit intervals in before/after (two-sided exact Clopper-Pearson). NOT the method used to derive outcome -- see risk_difference.method."
+        },
+        "before": {
+          "$ref": "#/$defs/IntervalEstimate"
+        },
+        "after": {
+          "$ref": "#/$defs/IntervalEstimate"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "non_inferior",
+            "inferior",
+            "inconclusive"
+          ]
+        },
+        "effect_measure": {
+          "const": "risk_difference",
+          "description": "The two-independent-proportions effect measure used for the non-inferiority hypothesis test (p_after - p_before). Distinct from the per-arm audit-only Clopper-Pearson intervals in before/after."
+        },
+        "sidedness": {
+          "const": "one_sided",
+          "description": "The non-inferiority hypothesis test (risk_difference.ci_upper vs non_inferiority_margin) is one-sided. This is independent of interval_method's before/after audit intervals, which are two-sided (see IntervalEstimate description)."
+        },
+        "risk_difference": {
+          "$ref": "#/$defs/RiskDifferenceEstimate"
+        }
+      }
+    },
+    "IntervalEstimate": {
+      "type": "object",
+      "required": [
+        "numerator",
+        "denominator",
+        "ci_lower",
+        "ci_upper"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "numerator": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "denominator": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "ci_lower": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "ci_upper": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "description": "Per-arm two-sided exact (Clopper-Pearson) interval for a single binomial proportion, reported for audit/reporting only. NOT the basis for non_inferiority_evaluation.outcome -- see risk_difference for the authoritative one-sided two-sample test."
+    },
+    "RawAttemptCohort": {
+      "type": "object",
+      "required": [
+        "workflow_runs",
+        "playwright_tests"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "workflow_runs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkflowRunAttempt"
+          }
+        },
+        "playwright_tests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlaywrightLogicalTestRun"
+          }
+        }
+      }
+    },
+    "WorkflowRunAttempt": {
+      "type": "object",
+      "description": "One GitHub Actions workflow run attempt. run_attempt 1 is the independent reliability sample; run_attempt > 1 is a GitHub Actions rerun, recorded here but never counted as an additional sample (see sample_identity).",
+      "required": [
+        "workflow_run_id",
+        "run_attempt",
+        "conclusion"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "workflow_run_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "conclusion": {
+          "type": "string",
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "timed_out",
+            "action_required",
+            "skipped"
+          ]
+        }
+      }
+    },
+    "PlaywrightLogicalTestRun": {
+      "type": "object",
+      "description": "One logical Playwright test as executed within a single workflow_run_id/run_attempt. attempts is Playwright's own internal retry sequence (retries config), which is distinct from a GitHub Actions workflow rerun (a separate PlaywrightLogicalTestRun entry with a different run_attempt).",
+      "required": [
+        "test_id",
+        "workflow_run_id",
+        "run_attempt",
+        "attempts"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "test_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_run_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "attempts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/PlaywrightTestAttempt"
+          }
+        }
+      }
+    },
+    "PlaywrightTestAttempt": {
+      "type": "object",
+      "required": [
+        "attempt_number",
+        "status"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "attempt_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "passed",
+            "failed",
+            "timedOut",
+            "interrupted",
+            "skipped"
+          ]
+        },
+        "expected_status": {
+          "type": "string",
+          "enum": [
+            "passed",
+            "failed",
+            "timedOut",
+            "interrupted",
+            "skipped"
+          ]
+        }
+      },
+      "description": "One Playwright internal retry attempt. expected_status (optional) mirrors Playwright's own expectedStatus (e.g. for test.fail()); when absent, expected_status defaults to 'passed' for classification purposes (preserves prior behavior for producers that do not emit it)."
+    },
+    "RiskDifferenceEstimate": {
+      "type": "object",
+      "description": "One-sided upper confidence bound for the two-independent-proportions risk difference p_after - p_before, computed via the Newcombe/Wilson hybrid score (MOVER) method (stdlib-only, no scipy/statsmodels). Authoritative for non_inferiority_evaluation.outcome. point_estimate/ci_upper are null when outcome is inconclusive (either arm below sample_count_rule.required_sample_count).",
+      "required": [
+        "method",
+        "point_estimate",
+        "ci_upper"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "method": {
+          "const": "newcombe_score_wilson_hybrid"
+        },
+        "point_estimate": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1
+        },
+        "ci_upper": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1,
+          "description": "One-sided upper bound at confidence_level for p_after - p_before. Compared against non_inferiority_margin to derive outcome."
+        }
+      }
+    }
+  }
+}

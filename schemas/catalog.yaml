@@ -3,6 +3,61 @@ catalog_id: "loop-protocol.schema-catalog/v1"
 generated_from: null
 entries:
 
+  - schema_id: "CI_TEST_RELIABILITY_ASSESSMENT_V1"
+    format: json_schema
+    source_kind: repo_path
+    definition_paths:
+      - "schemas/ci_test_reliability_assessment_v1.schema.json"
+      - ".claude/skills/ci-test-performance/scripts/validate_ci_reliability_assessment_v1.py"
+    producer:
+      owner: "ci-test-performance"
+      paths:
+        - ".claude/skills/ci-test-performance/scripts/validate_ci_reliability_assessment_v1.py"
+    consumers:
+      - id: "ci-test-performance"
+        paths:
+          - ".claude/skills/ci-test-performance/scripts/validate_ci_reliability_assessment_v1.py"
+      - id: "pr-review-judge"
+        paths:
+          - ".claude/skills/pr-review-judge/SKILL.md"
+    detection_patterns:
+      - id: "ci-test-reliability-assessment-v1-pattern"
+        engine: ripgrep
+        mode: regex
+        pattern: "CI_TEST_RELIABILITY_ASSESSMENT_V1"
+        paths:
+          - "."
+    required_test_commands:
+      - id: "validate_ci_reliability_assessment_v1"
+        runner: pytest
+        target: ".claude/skills/ci-test-performance/scripts/tests/test_validate_ci_reliability_assessment_v1.py"
+    compatibility:
+      mode: manual_policy
+      direction: backward
+      breaking_changes:
+        - remove_required_field
+        - rename_field
+        - narrow_type
+    validation:
+      catalog_lint_commands:
+        - id: "lint_catalog_yaml"
+          runner: pytest
+          target: "schemas/tests/test_catalog.py"
+      fixture_tests:
+        positive:
+          - "fixtures/ci-test-reliability/valid_workflow_failure_rate_non_inferior.json"
+          - "fixtures/ci-test-reliability/valid_zero_before_failure_clopper_pearson.json"
+        negative:
+          - "fixtures/ci-test-reliability/invalid_denominator_mismatch.json"
+          - "fixtures/ci-test-reliability/invalid_retry_rerun_confusion.json"
+          - "fixtures/ci-test-reliability/invalid_cancelled_misclassification.json"
+    migration:
+      required_for_breaking_change: true
+      followup_issue_required: true
+    last_verified:
+      commit: "52a536b13d929783b610c83a4395099dcd39d563"
+      command_id: "lint_catalog_yaml"
+
   - schema_id: "AGY_GROUNDING_EVIDENCE_VERDICT_V1"
     format: yaml
     source_kind: repo_path
