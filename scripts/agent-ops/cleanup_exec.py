@@ -141,7 +141,7 @@ BRANCH_ONLY_MATERIALIZE_DENIED = "branch_only_materialize_denied"    # materiali
 
 # Branch-only compare-and-delete reason codes (Issue #1523 AC7/AC8).
 BRANCH_TIP_CHANGED = "branch_tip_changed"                          # live tip != expected OID at delete time
-BRANCH_ONLY_NON_ANCESTRY_FAILURE = "branch_only_non_ancestry_failure"  # invalid object / non-1 merge-base exit / git error
+BRANCH_ONLY_NON_ANCESTRY_FAILURE = "branch_only_non_ancestry_failure"  # invalid object/non-1 merge-base/git error
 
 # Local-only unpublished commit discard lane reason codes (Issue #1523 AC1-AC6).
 DISCARD_PR_HEAD_NOT_ANCESTOR = "discard_pr_head_not_ancestor"      # PR head SHA not an ancestor of local tip

@@ -39,8 +39,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-ops"))
 
-import cleanup_exec as _ce
-from cleanup_exec import (
+import cleanup_exec as _ce  # noqa: E402
+from cleanup_exec import (  # noqa: E402
     run,
     verify_branch_only_cleanup_authorization,
     verify_cleanup_authorization,
@@ -50,8 +50,8 @@ from cleanup_exec import (
     BRANCH_TIP_CHANGED,
     BRANCH_ONLY_NON_ANCESTRY_FAILURE,
 )
-from cleanup_contract_v3 import OP_BRANCH_DELETE, OP_WORKTREE_REMOVE
-from worktree_catalog import Deadline
+from cleanup_contract_v3 import OP_BRANCH_DELETE, OP_WORKTREE_REMOVE  # noqa: E402
+from worktree_catalog import Deadline  # noqa: E402
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -162,7 +162,8 @@ def repo_normal_worktree(tmp_path):
 
 class TestBranchOnlyCompareAndDeleteRaceGuard:
     def test_branch_only_fallback_compare_and_delete_refuses_tip_change(self, repo_branch_only):
-        """GIVEN branch tip moved after authorization WHEN force-delete attempted THEN branch_tip_changed, branch survives."""
+        """GIVEN branch tip moved after authorization WHEN force-delete
+        attempted THEN branch_tip_changed, branch survives."""
         repo = repo_branch_only
         req = _make_req(repo)
         fake_pr = _make_merged_pr(repo["branch_name"], repo["branch_tip"])
@@ -318,8 +319,12 @@ class TestVerifiedPayloadSchemaParity:
         # never be a DIFFERENT concrete type across lanes.
         bool_keys = {k for k, v in _verified_template().items() if v is False}
         for key in bool_keys:
-            assert isinstance(verified_n[key], bool), f"{key!r} must be bool in normal lane, got {type(verified_n[key])}"
-            assert isinstance(verified_b[key], bool), f"{key!r} must be bool in branch-only lane, got {type(verified_b[key])}"
+            assert isinstance(verified_n[key], bool), (
+                f"{key!r} must be bool in normal lane, got {type(verified_n[key])}"
+            )
+            assert isinstance(verified_b[key], bool), (
+                f"{key!r} must be bool in branch-only lane, got {type(verified_b[key])}"
+            )
         optional_keys = template_keys - bool_keys
         for key in optional_keys:
             type_n = type(verified_n[key])
