@@ -474,6 +474,28 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
 - Runner（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は runtime 起動・観測・証跡収集だけを所有し、
   hook reason の意味分類・mutation deny の妥当性・review verdict 等の semantic 判定は caller が引き続き所有する。
 
+### launcher／wrapper／TUI 変更時の operator journey 検証（Issue #2176）
+
+人間が継続利用する launcher／wrapper／TUI（例: `scripts/claude-gpt/launch.sh` のような
+Claude Code 起動 launcher）を変更する Issue では、structured smoke（短命な非対話
+invocation、`claude -p` 等）だけでは runtime PASS としない。structured lane は起動可否・
+exit code・terminal event の存在を検証するだけであり、model/effort 誤認識や
+context window 誤設定のような「対話セッションを一定時間使い続けて初めて顕在化する」
+不具合を検出できない（PR #2162 の実機発見: `claude-gpt` launcher 起動後の model
+誤認識・context window 誤設定が structured smoke と単発 hello/response 確認の
+どちらでも検出されなかった）。
+
+代表的な operator journey（launcher 起動 → model/effort 確認 → Skill load →
+SubAgent spawn → completion 確認 → 追加 turn、のような実際の user 操作の流れ）を
+**同一の interactive lane session 内で最低 1 本** 通す必要がある。
+`worktree-agent-runtime-smoke` の interactive herdr lane（`--additional-prompt` に
+よる複数 turn 送信、`--forbid-marker` による `Context limit reached` /
+`Prompt is too long` / `automatic compaction failed` / unknown-model warning 等の
+無条件 FAIL guard）を用いて検証する（詳細は `.claude/skills/worktree-agent-runtime-smoke/SKILL.md`
+の「複数 turn の operator journey 検証」節を参照）。単一 turn の hello/response 確認のみ
+（旧 Issue #2174 AC4 相当）は、launcher／wrapper／TUI 自体の変更を伴う Issue の
+runtime PASS 条件としては不十分と扱う。
+
 ## 関連ドキュメント
 
 - `docs/dev/session-recording-policy.md` — session 記録 Kill Switch policy（`session_recording_policy/v1` SSOT）。`secrets_mode` 遷移時の session 記録制御・Kill Switch 手順・checkpoint visibility 検証を定める

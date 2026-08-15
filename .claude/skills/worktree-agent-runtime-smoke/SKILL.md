@@ -41,6 +41,8 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 - `--claude-agent-name <persona 名>`（任意。claude runtime + structured mode 限定。実際に `--agent <name>` として CLI へ forward し、main-session identity（`main_agent_identity`）・candidate Agent definition binding（`agent_definition`）・Skill evidence（`skill_evidence`）の evidence source になる。Issue #2046）
 - `--hermetic-agent-definition`（任意。`--claude-agent-name` 併用必須。project-discovery の `--agent <name>` lookup ではなく、candidate Agent 定義から決定論的に生成した session-local `--agents` JSON payload（tools は Read のみ固定）と session-local `--settings`（mutation-capable tool を deny）で起動する hermetic no-mutation lane。Issue #2046）
 - `--claude-bin <absolute path>`（任意。`--runtime claude` 限定。claude 互換の実行ファイル（例: `scripts/claude-gpt/launch.sh` launcher）の絶対パスを明示指定する。指定時は `shutil.which("claude")` による PATH 解決を bypass し、structured lane はその絶対パスを固定 argv の実行ファイルとして直接使用する。interactive herdr lane では、herdr 自身が `--kind claude` の実行ファイルを常に自分の PATH lookup で再解決するため、isolated session 専用の一時ディレクトリに `claude` という名前で `--claude-bin` の絶対パスへの symlink を作成し、その一時ディレクトリを isolated session の `PATH` 先頭に追加することで解決先を固定する。未指定時（既定）は既存の `shutil.which("claude")` PATH 解決が変更なく維持される（Issue #2174）。
+- `--additional-prompt <literal>`（repeatable、任意。`--mode interactive` 限定。既に開始済みの同一 agent／session に対して、初回 `--prompt-file` の turn が完了した後に順番に追加送信する turn。1 回の isolated session 内で model/effort 確認・Skill load・SubAgent spawn・completion 確認・追加 turn のような複数手順からなる operator journey を検証する用途（Issue #2176）。未指定時（既定）は従来どおり単一 turn のみで完結する
+- `--forbid-marker <literal>`（repeatable、任意。structured／interactive 両 lane 対応。指定した文字列が出力（structured: stdout+stderr、interactive: bounded pane transcript）のどこかに 1 つでも観測された場合、他のすべての判定結果に関わらず無条件で FAIL（exit 1）とする。`Context limit reached` / `Prompt is too long` / `automatic compaction failed` / unknown-model warning のような runtime malfunction 診断を検出する用途（Issue #2176）
 
 `--transport` と `--keep-pane` は存在しない（PR #1921 human OWNER fix-delta）。structured lane は
 常に direct subprocess、interactive lane は常に isolated named herdr session であり、
@@ -87,6 +89,16 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示等
 named session を新規生成し、その session 内だけで agent lifecycle を駆動し、
 終了時に session そのものを stop／delete し、`herdr session list --json` で消失を
 確認する（確認できない場合は fail-closed で exit 1）。詳細は `references/herdr.md` を参照。
+
+**単なる hello/response 確認では不十分な場合（operator journey 検証、Issue #2176）**:
+人間が継続利用する launcher／wrapper／TUI を変更した場合、単一 turn の hello/response
+だけでは実際の使用パターン（model/effort 確認 → Skill load → SubAgent spawn →
+completion 確認 → 追加 turn）を再現できない。`--additional-prompt` を繰り返し指定して
+同一 isolated session 内で複数 turn を順番に送信し、`--forbid-marker` で
+`Context limit reached` / `Prompt is too long` / `automatic compaction failed` /
+unknown-model warning のような runtime malfunction 診断が一切出現しないことを
+無条件の FAIL guard として検証する（詳細は
+`docs/dev/runtime-verification-policy.md` の該当節を参照）。
 
 ## Main-Session Agent Identity Evidence（メインセッション Agent Identity 証跡、Issue #2046）
 

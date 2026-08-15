@@ -2434,6 +2434,98 @@ def _session_socket_path(herdr_bin: str, session_name: str) -> str | None:
     return None
 
 
+def _send_prompt_turn(
+    herdr_bin: str,
+    agent_name: str,
+    prompt_text: str,
+    timeout_seconds: float,
+    isolated_env: dict[str, str],
+    evidence: dict,
+) -> None:
+    """Send a single prompt turn to an already-started herdr agent and block
+    until it settles, including the existing bracketed-paste stall-recovery
+    path (see module docstring / ``references/herdr.md``). Raises
+    ``HerdrLaneError`` on failure.
+
+    Issue #2176 (AC4 operator-journey strengthening): extracted from the
+    single-shot body ``run_interactive_herdr_isolated`` used to run inline so
+    a caller-supplied sequence of turns (see ``additional_prompts`` below)
+    can share the exact same send/wait/stall-recovery behavior per turn,
+    instead of only ever sending one prompt for the entire isolated session.
+    ``evidence["prompt_stall_recovered"]`` is only ever upgraded from
+    False/None to True across the whole multi-turn sequence -- a later turn
+    that does not need recovery must never erase an earlier turn's True."""
+    prompt_deadline = time.monotonic() + timeout_seconds
+    rc, out, err, timed_out = _run(
+        [herdr_bin, "agent", "prompt", agent_name, prompt_text, "--wait",
+         "--timeout", str(int(timeout_seconds * 1000))],
+        timeout=timeout_seconds + 20.0, env=isolated_env,
+    )
+    if timed_out:
+        raise HerdrLaneError("herdr agent prompt timed out")
+    if rc != 0:
+        if "agent_prompt_stalled" in (err or "") or "agent_prompt_stalled" in (out or ""):
+            # See references/herdr.md — Claude Code's bracketed-paste
+            # handling can leave a multi-line prompt unsubmitted. Recover
+            # deterministically, exactly once, by sending an explicit
+            # ``enter`` keypress, then poll for a genuine
+            # ``state_change_seq`` change before trusting ``agent wait``
+            # (which matches immediately if already idle at call time).
+            if evidence.get("prompt_stall_recovered") is not True:
+                evidence["prompt_stall_recovered"] = False
+            baseline_rc, baseline_out, _e, _t = _run(
+                [herdr_bin, "agent", "get", agent_name], timeout=15.0, env=isolated_env,
+            )
+            baseline_seq = (
+                _extract_agent_field(baseline_out, "state_change_seq")
+                if baseline_rc == 0 else None
+            )
+
+            remaining = max(1.0, prompt_deadline - time.monotonic())
+            send_rc, send_out, send_err, send_timed_out = _run(
+                [herdr_bin, "agent", "send-keys", agent_name, "enter"],
+                timeout=min(20.0, remaining), env=isolated_env,
+            )
+            if send_timed_out or send_rc != 0:
+                raise HerdrLaneError(
+                    "herdr agent prompt stalled and recovery send-keys failed: "
+                    f"{_redact(send_err or send_out or err or out)}"
+                )
+
+            poll_deadline = min(prompt_deadline, time.monotonic() + 15.0)
+            observed_change = baseline_seq is None
+            while not observed_change and time.monotonic() < poll_deadline:
+                poll_rc, poll_out, _e, _t = _run(
+                    [herdr_bin, "agent", "get", agent_name], timeout=10.0, env=isolated_env,
+                )
+                if poll_rc == 0:
+                    seq = _extract_agent_field(poll_out, "state_change_seq")
+                    if seq is not None and seq != baseline_seq:
+                        observed_change = True
+                        break
+                time.sleep(0.5)
+            if not observed_change:
+                raise HerdrLaneError(
+                    "herdr agent prompt stalled and recovery send-keys produced "
+                    "no observed state change; prompt remains unsubmitted"
+                )
+
+            remaining = max(1.0, prompt_deadline - time.monotonic())
+            wait_rc, wait_out, wait_err, wait_timed_out = _run(
+                [herdr_bin, "agent", "wait", agent_name,
+                 "--timeout", str(int(remaining * 1000))],
+                timeout=remaining + 20.0, env=isolated_env,
+            )
+            if wait_timed_out or wait_rc != 0:
+                raise HerdrLaneError(
+                    "herdr agent prompt stalled and recovery wait failed: "
+                    f"{_redact(wait_err or wait_out or err or out)}"
+                )
+            evidence["prompt_stall_recovered"] = True
+        else:
+            raise HerdrLaneError(f"herdr agent prompt failed: {_redact(err or out)}")
+
+
 def run_interactive_herdr_isolated(
     runtime: str,
     worktree: str,
@@ -2444,6 +2536,7 @@ def run_interactive_herdr_isolated(
     *,
     herdr_bin: str = "herdr",
     claude_bin_override: str | None = None,
+    additional_prompts: list[str] | None = None,
 ) -> list[str]:
     """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
     in place (so cleanup/session identity survive even if this raises) and
@@ -2460,7 +2553,19 @@ def run_interactive_herdr_isolated(
     ``claude_bin_override``) to ``PATH`` in the isolated session's own
     environment, before ``herdr workspace create`` / ``herdr agent start``
     run. Omitted by default (``claude_bin_override=None``), leaving every
-    pre-existing caller's isolated-session ``PATH`` unchanged (AC6)."""
+    pre-existing caller's isolated-session ``PATH`` unchanged (AC6).
+
+    Issue #2176 (AC4 operator-journey strengthening): ``additional_prompts``
+    is an optional, ordered list of extra prompt turns sent to the SAME
+    already-started agent/session AFTER the initial ``prompt`` turn settles
+    -- e.g. a representative operator journey (model/effort confirmation,
+    Skill load, SubAgent spawn + completion confirmation, one more
+    follow-up turn) driven end-to-end inside one isolated interactive
+    session, instead of only ever exercising a single hello/response turn.
+    Omitted by default (``None``), leaving every pre-existing caller's
+    single-turn behavior unchanged (AC6-equivalent for this lane).
+    ``evidence["turns_completed"]`` records how many prompt turns (initial +
+    additional) actually settled before this function returns or raises."""
     session_name = new_isolated_session_name(herdr_bin)
     evidence["session_name"] = session_name
 
@@ -2547,74 +2652,11 @@ def run_interactive_herdr_isolated(
         if start_timed_out or start_rc != 0:
             raise HerdrLaneError(f"herdr agent start failed: {_redact(start_err or start_out)}")
 
-        prompt_deadline = time.monotonic() + timeout_seconds
-        rc, out, err, timed_out = _run(
-            [herdr_bin, "agent", "prompt", agent_name, prompt, "--wait",
-             "--timeout", str(int(timeout_seconds * 1000))],
-            timeout=timeout_seconds + 20.0, env=isolated_env,
-        )
-        if timed_out:
-            raise HerdrLaneError("herdr agent prompt timed out")
-        if rc != 0:
-            if "agent_prompt_stalled" in (err or "") or "agent_prompt_stalled" in (out or ""):
-                # See references/herdr.md — Claude Code's bracketed-paste
-                # handling can leave a multi-line prompt unsubmitted. Recover
-                # deterministically, exactly once, by sending an explicit
-                # ``enter`` keypress, then poll for a genuine
-                # ``state_change_seq`` change before trusting ``agent wait``
-                # (which matches immediately if already idle at call time).
-                evidence["prompt_stall_recovered"] = False
-                baseline_rc, baseline_out, _e, _t = _run(
-                    [herdr_bin, "agent", "get", agent_name], timeout=15.0, env=isolated_env,
-                )
-                baseline_seq = (
-                    _extract_agent_field(baseline_out, "state_change_seq")
-                    if baseline_rc == 0 else None
-                )
-
-                remaining = max(1.0, prompt_deadline - time.monotonic())
-                send_rc, send_out, send_err, send_timed_out = _run(
-                    [herdr_bin, "agent", "send-keys", agent_name, "enter"],
-                    timeout=min(20.0, remaining), env=isolated_env,
-                )
-                if send_timed_out or send_rc != 0:
-                    raise HerdrLaneError(
-                        "herdr agent prompt stalled and recovery send-keys failed: "
-                        f"{_redact(send_err or send_out or err or out)}"
-                    )
-
-                poll_deadline = min(prompt_deadline, time.monotonic() + 15.0)
-                observed_change = baseline_seq is None
-                while not observed_change and time.monotonic() < poll_deadline:
-                    poll_rc, poll_out, _e, _t = _run(
-                        [herdr_bin, "agent", "get", agent_name], timeout=10.0, env=isolated_env,
-                    )
-                    if poll_rc == 0:
-                        seq = _extract_agent_field(poll_out, "state_change_seq")
-                        if seq is not None and seq != baseline_seq:
-                            observed_change = True
-                            break
-                    time.sleep(0.5)
-                if not observed_change:
-                    raise HerdrLaneError(
-                        "herdr agent prompt stalled and recovery send-keys produced "
-                        "no observed state change; prompt remains unsubmitted"
-                    )
-
-                remaining = max(1.0, prompt_deadline - time.monotonic())
-                wait_rc, wait_out, wait_err, wait_timed_out = _run(
-                    [herdr_bin, "agent", "wait", agent_name,
-                     "--timeout", str(int(remaining * 1000))],
-                    timeout=remaining + 20.0, env=isolated_env,
-                )
-                if wait_timed_out or wait_rc != 0:
-                    raise HerdrLaneError(
-                        "herdr agent prompt stalled and recovery wait failed: "
-                        f"{_redact(wait_err or wait_out or err or out)}"
-                    )
-                evidence["prompt_stall_recovered"] = True
-            else:
-                raise HerdrLaneError(f"herdr agent prompt failed: {_redact(err or out)}")
+        _send_prompt_turn(herdr_bin, agent_name, prompt, timeout_seconds, isolated_env, evidence)
+        evidence["turns_completed"] = 1
+        for extra_prompt in (additional_prompts or []):
+            _send_prompt_turn(herdr_bin, agent_name, extra_prompt, timeout_seconds, isolated_env, evidence)
+            evidence["turns_completed"] += 1
 
         rc, out, err, timed_out = _run(
             [herdr_bin, "agent", "get", agent_name], timeout=20.0, env=isolated_env,
@@ -2784,6 +2826,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--expect-marker", action="append", default=[])
+    parser.add_argument(
+        "--forbid-marker",
+        action="append",
+        default=[],
+        help=(
+            "Issue #2176: a literal string that, if observed anywhere in "
+            "the captured output (structured: stdout+stderr; interactive: "
+            "the bounded pane transcript), unconditionally FAILs the run "
+            "regardless of any other signal (e.g. a "
+            "'Context limit reached' / 'Prompt is too long' / "
+            "'automatic compaction failed' / unknown-model diagnostic). "
+            "May be repeated. Omitted by default, so every pre-existing "
+            "caller's behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--additional-prompt",
+        action="append",
+        default=[],
+        help=(
+            "Issue #2176 (AC4 operator-journey strengthening): interactive "
+            "mode only. An extra prompt turn sent to the SAME "
+            "already-started agent/session after the initial --prompt-file "
+            "turn settles. May be repeated (sent in the given order) to "
+            "drive a multi-turn operator journey (e.g. Skill load, SubAgent "
+            "spawn + completion confirmation, one more follow-up turn) "
+            "inside one isolated interactive session. Ignored for "
+            "--mode structured. Omitted by default, so every pre-existing "
+            "caller's single-turn behavior is unchanged."
+        ),
+    )
     parser.add_argument(
         "--require-observed-runtime-field",
         action="append",
@@ -3450,6 +3523,19 @@ def main(argv: list[str] | None = None) -> int:
                     errors.append(f"expected markers not observed: {missing}")
                     exit_code = EXIT_FAIL
 
+            # Issue #2176 (operator-journey FAIL guard, structured lane
+            # equivalent): unconditional (not gated on exit_code == EXIT_OK)
+            # so a forbidden diagnostic can never be silently absorbed by an
+            # otherwise-green run. See the interactive-lane counterpart
+            # above for the full rationale.
+            if args.forbid_marker:
+                combined_for_forbid = out + "\n" + err
+                present = [m for m in args.forbid_marker if m in combined_for_forbid]
+                schema_summary["forbidden_markers_observed"] = present
+                if present:
+                    errors.append(f"forbidden markers observed: {present}")
+                    exit_code = EXIT_FAIL
+
             required_observations = sorted(set(args.require_observed_runtime_field))
             if required_observations:
                 # These four fields have no independently extractable Codex
@@ -3499,6 +3585,7 @@ def main(argv: list[str] | None = None) -> int:
                 "detected_agent": None,
                 "detected_agent_confidence": None,
                 "prompt_stall_recovered": None,
+                "turns_completed": 0,
                 "cleanup": {"attempted": False, "stop_rc": None, "delete_rc": None, "confirmed_removed": False},
             }
             pane_output_lines: list[str] = []
@@ -3506,18 +3593,36 @@ def main(argv: list[str] | None = None) -> int:
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
                     claude_bin_override=args.claude_bin if args.runtime == "claude" else None,
+                    additional_prompts=args.additional_prompt or None,
                 )
 
                 if evidence.get("final_state") == "blocked":
                     errors.append("agent reached blocked state; evidence captured, not auto-approved")
                     exit_code = EXIT_FAIL
 
+                combined_pane_text = "\n".join(pane_output_lines)
+
                 if args.expect_marker:
-                    combined = "\n".join(pane_output_lines)
-                    missing = [m for m in args.expect_marker if m not in combined]
+                    missing = [m for m in args.expect_marker if m not in combined_pane_text]
                     schema_summary["expected_markers_missing"] = missing
                     if missing:
                         errors.append(f"expected markers not observed in pane output: {missing}")
+                        exit_code = EXIT_FAIL
+
+                # Issue #2176 (operator-journey FAIL guard): a forbidden
+                # marker (e.g. a context-limit / prompt-too-long /
+                # auto-compaction-failure / unknown-model diagnostic) found
+                # anywhere in the pane transcript is a genuine runtime
+                # malfunction that must always FAIL this run, even if every
+                # other signal (expect-marker, final_state, cleanup) looks
+                # fine. This check is unconditional (not gated on the
+                # current exit_code) so it can never be silently absorbed by
+                # an otherwise-green run.
+                if args.forbid_marker:
+                    present = [m for m in args.forbid_marker if m in combined_pane_text]
+                    schema_summary["forbidden_markers_observed"] = present
+                    if present:
+                        errors.append(f"forbidden markers observed in pane output: {present}")
                         exit_code = EXIT_FAIL
 
                 if args.require_session_log_metadata or args.inspect_session_log_metadata:
@@ -3536,6 +3641,7 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["detected_agent"] = evidence.get("detected_agent")
             schema_summary["detected_agent_confidence"] = evidence.get("detected_agent_confidence")
             schema_summary["prompt_stall_recovered"] = evidence.get("prompt_stall_recovered")
+            schema_summary["turns_completed"] = evidence.get("turns_completed")
 
             # Best-effort text-scan classification over the bounded, redacted
             # pane transcript (no native JSON event stream exists for the
