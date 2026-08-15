@@ -2408,7 +2408,12 @@ def _herdr_sessions(herdr_bin: str, env: dict[str, str] | None = None) -> list[d
         return None
     sessions = payload.get("sessions") if isinstance(payload, dict) else None
     if not isinstance(sessions, list):
-        return []
+        # Issue #2174 AC7 fail-closed requirement (PR #2176 OWNER
+        # REQUEST_CHANGES Finding 3): a malformed/unexpected payload shape
+        # is an UNOBTAINABLE session list, never an empty one. Silently
+        # returning [] here previously let a genuinely-unreadable session
+        # list masquerade as "there are no other sessions to protect".
+        return None
     return [entry for entry in sessions if isinstance(entry, dict)]
 
 
@@ -2497,15 +2502,69 @@ def diff_herdr_session_baseline(
 # fail-closed requirement).
 # ---------------------------------------------------------------------------
 
-_WORKSPACE_SNAPSHOT_AGENT_FIELDS = ("workspace_id", "tab_id", "pane_id")
+_WORKSPACE_SNAPSHOT_AGENT_FIELDS = ("agent", "terminal_id", "workspace_id", "tab_id", "pane_id")
 _WORKSPACE_SNAPSHOT_FOCUS_FIELDS = ("focused_workspace_id", "focused_tab_id", "focused_pane_id")
 
 
-def capture_herdr_workspace_snapshot(herdr_bin: str, env: dict[str, str] | None) -> dict | None:
-    """Fail-closed capture of workspace/agent/focus identity via ``herdr api
-    snapshot`` (Issue #2174 AC7). Returns ``None`` if ANY required field is
-    unobtainable."""
-    rc, out, _err, timed_out = _run([herdr_bin, "api", "snapshot"], timeout=15.0, env=env)
+def _normalize_agent_session(record: dict) -> tuple | None:
+    """Normalize herdr's native ``agent_session`` object (``kind``/``source``/
+    ``value``) into a hashable, comparable tuple, or ``None`` when absent
+    (e.g. a non-agent pane). ``value`` is the native per-agent session
+    identity herdr itself hands out (confirmed against live ``herdr api
+    snapshot`` v0.8.0 output) -- the strongest actually-available identity
+    signal, used in place of the "session ID" AC7 originally asked for
+    (see the module-level upstream-reality note below)."""
+    session = record.get("agent_session")
+    if not isinstance(session, dict):
+        return None
+    return (session.get("kind"), session.get("source"), session.get("value"))
+
+
+def capture_herdr_workspace_snapshot(
+    herdr_bin: str, env: dict[str, str] | None, *, session_name: str | None = None,
+) -> dict | None:
+    """Fail-closed capture of the FULL herdr session snapshot identity for
+    ONE named session (Issue #2174 AC7; PR #2176 OWNER REQUEST_CHANGES
+    Finding 3: https://github.com/squne121/loop-protocol/pull/2176#issuecomment-5302819792).
+
+    Unlike the prior implementation (which only projected each agent's
+    ``(workspace_id, tab_id, pane_id)`` location tuple), this captures each
+    agent's own identity (kind, ``terminal_id``, native ``agent_session``),
+    every pane record (including non-agent panes), every tab record, every
+    workspace record (including empty workspaces with no agent), and every
+    layout record's structural shape. Returns ``None`` if ANY required
+    field on ANY record is unobtainable (fail-closed; never a partial
+    snapshot).
+
+    Upstream-reality note (independently confirmed against the installed
+    live ``herdr session list --json`` / ``herdr api snapshot`` v0.8.0):
+    herdr's public ``SessionInfo`` (``session list``) has no separate
+    ``session_id`` field distinct from ``name`` -- only
+    name/default/running/socket_path/session_dir are exposed. This function
+    therefore does not claim a ``session_id`` field; the strongest actually
+    available per-agent identity is ``agent`` (kind) + ``terminal_id`` +
+    the native ``agent_session`` triple (kind/source/value), which IS
+    captured here as this run's operational definition of "agent ID".
+
+    Volatile-but-identity-irrelevant fields (``revision``, ``state_change_seq``,
+    ``scroll`` offsets, exact pixel ``rect`` dimensions from ordinary
+    terminal resize) are deliberately excluded from the compared
+    projection: herdr increments/changes them on ordinary agent activity
+    that has nothing to do with identity or layout, so including them would
+    fail this check on every run regardless of any real mutation. What IS
+    compared for layout is its structural shape (pane_id membership,
+    zoomed flag, split count), which DOES change when a pane is actually
+    added, removed, split, or unzoomed.
+
+    ``session_name`` (optional) targets a specific named herdr session via
+    ``herdr --session <name> api snapshot`` (Finding 4: without this, only
+    the ambient/default session was ever snapshotted, so a human operator
+    attached to e.g. ``HERDR_SESSION=development`` was never protected)."""
+    argv = [herdr_bin]
+    if session_name:
+        argv += ["--session", session_name]
+    argv += ["api", "snapshot"]
+    rc, out, _err, timed_out = _run(argv, timeout=15.0, env=env)
     if timed_out or rc != 0:
         return None
     try:
@@ -2518,43 +2577,182 @@ def capture_herdr_workspace_snapshot(herdr_bin: str, env: dict[str, str] | None)
         return None
     if any(field not in snapshot for field in _WORKSPACE_SNAPSHOT_FOCUS_FIELDS):
         return None
+
     agents_raw = snapshot.get("agents")
     if not isinstance(agents_raw, list):
         return None
-    locations: list[tuple[str, str, str]] = []
+    agent_records: list[tuple] = []
     for agent in agents_raw:
         if not isinstance(agent, dict) or any(
             field not in agent for field in _WORKSPACE_SNAPSHOT_AGENT_FIELDS
         ):
             return None
-        locations.append(tuple(str(agent[field]) for field in _WORKSPACE_SNAPSHOT_AGENT_FIELDS))
+        agent_records.append((
+            str(agent["pane_id"]),
+            tuple(str(agent[field]) for field in _WORKSPACE_SNAPSHOT_AGENT_FIELDS),
+            _normalize_agent_session(agent),
+        ))
+    agent_records.sort(key=lambda r: r[0])
+
+    panes_raw = snapshot.get("panes", [])
+    if not isinstance(panes_raw, list):
+        return None
+    pane_records: list[tuple] = []
+    for pane in panes_raw:
+        if not isinstance(pane, dict) or "pane_id" not in pane:
+            return None
+        pane_records.append((
+            str(pane["pane_id"]),
+            str(pane.get("workspace_id")),
+            str(pane.get("tab_id")),
+            str(pane["agent"]) if pane.get("agent") is not None else None,
+            str(pane["terminal_id"]) if pane.get("terminal_id") is not None else None,
+            _normalize_agent_session(pane),
+        ))
+    pane_records.sort(key=lambda r: r[0])
+
+    tabs_raw = snapshot.get("tabs", [])
+    if not isinstance(tabs_raw, list):
+        return None
+    tab_records: list[tuple] = []
+    for tab in tabs_raw:
+        if not isinstance(tab, dict) or "tab_id" not in tab:
+            return None
+        tab_records.append((str(tab["tab_id"]), str(tab.get("workspace_id")), tab.get("pane_count")))
+    tab_records.sort(key=lambda r: r[0])
+
+    workspaces_raw = snapshot.get("workspaces", [])
+    if not isinstance(workspaces_raw, list):
+        return None
+    workspace_records: list[tuple] = []
+    for ws in workspaces_raw:
+        if not isinstance(ws, dict) or "workspace_id" not in ws:
+            return None
+        workspace_records.append(
+            (str(ws["workspace_id"]), ws.get("pane_count"), ws.get("tab_count"), ws.get("label"))
+        )
+    workspace_records.sort(key=lambda r: r[0])
+
+    layouts_raw = snapshot.get("layouts", [])
+    if not isinstance(layouts_raw, list):
+        return None
+    layout_records: list[tuple] = []
+    for layout in layouts_raw:
+        if not isinstance(layout, dict) or "tab_id" not in layout:
+            return None
+        panes_in_layout = layout.get("panes")
+        if not isinstance(panes_in_layout, list):
+            return None
+        pane_ids_in_layout = tuple(sorted(
+            str(p.get("pane_id")) for p in panes_in_layout if isinstance(p, dict)
+        ))
+        splits = layout.get("splits")
+        layout_records.append((
+            str(layout["tab_id"]), str(layout.get("workspace_id")),
+            bool(layout.get("zoomed")), pane_ids_in_layout,
+            len(splits) if isinstance(splits, list) else None,
+        ))
+    layout_records.sort(key=lambda r: r[0])
+
     return {
         "focused_workspace_id": snapshot["focused_workspace_id"],
         "focused_tab_id": snapshot["focused_tab_id"],
         "focused_pane_id": snapshot["focused_pane_id"],
-        "agent_locations": sorted(locations),
+        "agent_records": agent_records,
+        "pane_records": pane_records,
+        "tab_records": tab_records,
+        "workspace_records": workspace_records,
+        "layout_records": layout_records,
     }
 
 
 def diff_herdr_workspace_snapshot(before: dict | None, after: dict | None) -> list[str]:
-    """Compare two ``capture_herdr_workspace_snapshot`` results (Issue #2174
-    AC7). Fails closed (a single diagnostic entry) if either snapshot is
-    ``None`` -- unobtainable evidence is treated as a preservation FAILURE,
-    never silently skipped. This is a strict equality check: even the
-    addition/removal of an agent pane the run itself did not create is
-    reported (the interactive lane's own isolated session never appears
-    here at all, because it lives in a wholly separate herdr session)."""
+    """Compare two ``capture_herdr_workspace_snapshot`` results for ONE
+    session (Issue #2174 AC7). Fails closed (a single diagnostic entry) if
+    either snapshot is ``None`` -- unobtainable evidence is treated as a
+    preservation FAILURE, never silently skipped. This is a strict
+    equality check across every captured record group (agent identity,
+    panes including non-agent ones, tabs, workspaces including empty ones,
+    and layout structure) -- not merely agent location."""
     if before is None or after is None:
         return ["could not evaluate herdr workspace/agent/focus snapshot (api snapshot unavailable)"]
     diffs: list[str] = []
     for field in _WORKSPACE_SNAPSHOT_FOCUS_FIELDS:
         if before[field] != after[field]:
             diffs.append(f"{field} changed: {before[field]!r} -> {after[field]!r}")
-    if before["agent_locations"] != after["agent_locations"]:
-        diffs.append(
-            "agent workspace/tab/pane locations changed: "
-            f"{before['agent_locations']} -> {after['agent_locations']}"
-        )
+    for key, label in (
+        ("agent_records", "agent identity records"),
+        ("pane_records", "pane records (including non-agent panes)"),
+        ("tab_records", "tab records"),
+        ("workspace_records", "workspace records"),
+        ("layout_records", "layout records"),
+    ):
+        if before[key] != after[key]:
+            diffs.append(f"{label} changed: {before[key]} -> {after[key]}")
+    return diffs
+
+
+def capture_all_herdr_workspace_snapshots(
+    herdr_bin: str, env: dict[str, str] | None,
+) -> dict[str, dict] | None:
+    """Snapshot the ambient/default herdr session AND every OTHER currently
+    running named session explicitly (Issue #2174 AC7; PR #2176 OWNER
+    REQUEST_CHANGES Finding 4:
+    https://github.com/squne121/loop-protocol/pull/2176#issuecomment-5302819792).
+    Previously only the ambient/default session was ever snapshotted (no
+    session enumeration at all), so a human operator attached to a
+    differently-named session (e.g. ``HERDR_SESSION=development``) was
+    never protected: this run could silently mutate it undetected. The
+    ambient/default session is still captured via the same bare
+    ``api snapshot`` call this lane has always used (keyed here as
+    ``"default"``); every additional named session found by
+    ``herdr session list --json`` is captured via an explicit
+    ``--session <name> api snapshot`` call. Returns ``None`` (fail-closed)
+    if session enumeration itself is unobtainable, or if ANY individual
+    session's own snapshot (including the default one) cannot be
+    captured."""
+    sessions = _herdr_sessions(herdr_bin, env=env)
+    if sessions is None:
+        return None
+    default_snapshot = capture_herdr_workspace_snapshot(herdr_bin, env)
+    if default_snapshot is None:
+        return None
+    result: dict[str, dict] = {"default": default_snapshot}
+    for entry in sessions:
+        name = entry.get("name")
+        if not name:
+            return None
+        if str(name) == "default" or bool(entry.get("default")):
+            continue
+        snapshot = capture_herdr_workspace_snapshot(herdr_bin, env, session_name=str(name))
+        if snapshot is None:
+            return None
+        result[str(name)] = snapshot
+    return result
+
+
+def diff_all_herdr_workspace_snapshots(
+    before: dict[str, dict] | None, after: dict[str, dict] | None,
+) -> list[str]:
+    """Compare two ``capture_all_herdr_workspace_snapshots`` results,
+    per-session, keyed by the stable session ``name`` (Issue #2174 AC7
+    Finding 4). A session present before and absent after (or vice versa)
+    is reported as a violation, exactly like any other identity diff."""
+    if before is None or after is None:
+        return [
+            "could not evaluate herdr workspace/agent/focus snapshot for one or "
+            "more sessions (api snapshot unavailable)"
+        ]
+    diffs: list[str] = []
+    for name in sorted(set(before) | set(after)):
+        if name not in before:
+            diffs.append(f"session {name!r} newly present after the isolated lane run")
+            continue
+        if name not in after:
+            diffs.append(f"session {name!r} missing after the isolated lane run")
+            continue
+        for d in diff_herdr_workspace_snapshot(before[name], after[name]):
+            diffs.append(f"session {name!r}: {d}")
     return diffs
 
 
@@ -2653,16 +2851,7 @@ def _send_prompt_turn(
     """Send a single prompt turn to an already-started herdr agent and block
     until it settles, including the existing bracketed-paste stall-recovery
     path (see module docstring / ``references/herdr.md``). Raises
-    ``HerdrLaneError`` on failure.
-
-    Issue #2176 (AC4 operator-journey strengthening): extracted from the
-    single-shot body ``run_interactive_herdr_isolated`` used to run inline so
-    a caller-supplied sequence of turns (see ``additional_prompts`` below)
-    can share the exact same send/wait/stall-recovery behavior per turn,
-    instead of only ever sending one prompt for the entire isolated session.
-    ``evidence["prompt_stall_recovered"]`` is only ever upgraded from
-    False/None to True across the whole multi-turn sequence -- a later turn
-    that does not need recovery must never erase an earlier turn's True."""
+    ``HerdrLaneError`` on failure."""
     prompt_deadline = time.monotonic() + timeout_seconds
     rc, out, err, timed_out = _run(
         [herdr_bin, "agent", "prompt", agent_name, prompt_text, "--wait",
@@ -2744,7 +2933,6 @@ def run_interactive_herdr_isolated(
     *,
     herdr_bin: str = "herdr",
     claude_bin_override: str | None = None,
-    additional_prompts: list[str] | None = None,
 ) -> list[str]:
     """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
     in place (so cleanup/session identity survive even if this raises) and
@@ -2756,24 +2944,29 @@ def run_interactive_herdr_isolated(
     on the ambient ``PATH``. ``herdr`` itself has no flag to accept an
     explicit binary path for ``--kind`` (it always re-resolves the runtime
     name via its own PATH lookup -- see ``references/claude-code.md``), so
-    this is done by prepending a session-local temporary directory
-    containing a single ``claude`` symlink (pointing at
-    ``claude_bin_override``) to ``PATH`` in the isolated session's own
-    environment, before ``herdr workspace create`` / ``herdr agent start``
-    run. Omitted by default (``claude_bin_override=None``), leaving every
-    pre-existing caller's isolated-session ``PATH`` unchanged (AC6).
-
-    Issue #2176 (AC4 operator-journey strengthening): ``additional_prompts``
-    is an optional, ordered list of extra prompt turns sent to the SAME
-    already-started agent/session AFTER the initial ``prompt`` turn settles
-    -- e.g. a representative operator journey (model/effort confirmation,
-    Skill load, SubAgent spawn + completion confirmation, one more
-    follow-up turn) driven end-to-end inside one isolated interactive
-    session, instead of only ever exercising a single hello/response turn.
-    Omitted by default (``None``), leaving every pre-existing caller's
-    single-turn behavior unchanged (AC6-equivalent for this lane).
-    ``evidence["turns_completed"]`` records how many prompt turns (initial +
-    additional) actually settled before this function returns or raises."""
+    this is done via a session-local temporary directory containing a single
+    ``claude`` FORWARDER SCRIPT (never a symlink -- a real shell script
+    generated from a hard-coded ``exec '<absolute-launcher>' "$@"`` template,
+    because a shell script invoked through a symlink resolves ``$0`` to the
+    symlink's own path, not the real script's directory, which breaks any
+    launcher that sources a sibling file such as ``lib.sh`` via
+    ``dirname -- "$0"``; see PR #2176 OWNER REQUEST_CHANGES Finding 2:
+    https://github.com/squne121/loop-protocol/pull/2176#issuecomment-5302819792).
+    The resulting shim directory is explicitly passed to Herdr's own
+    root-shell/PTY process via ``herdr workspace create --env PATH=...``
+    (Finding 1 of the same review: updating only this Python client's own
+    ``isolated_env["PATH"]`` never reaches the already-running Herdr server
+    process that actually resolves ``claude`` inside the PTY, so the shim
+    was previously unreachable and ``agent start --kind claude`` could
+    silently run the ambient/native ``claude`` on the server's own PATH
+    instead). The forwarder additionally writes a run-scoped nonce to a
+    0600 receipt file immediately before ``exec``-ing the real launcher;
+    this function reads that receipt back after the run and raises
+    ``HerdrLaneError`` (never silently accepts a PASS) if it is missing or
+    does not match, so a decoy ``claude`` anywhere else on the ambient PATH
+    can never produce a false-positive launcher-selection PASS. Omitted by
+    default (``claude_bin_override=None``), leaving every pre-existing
+    caller's isolated-session ``PATH`` unchanged (AC6)."""
     # Issue #2176 (P0-3 fix-delta): a single explicit, stripped ``isolated_env``
     # is computed once, up front, and threaded through EVERY herdr command
     # for this session's entire lifecycle -- the collision check, session
@@ -2813,6 +3006,9 @@ def run_interactive_herdr_isolated(
         if socket_path:
             isolated_env["HERDR_SOCKET_PATH"] = socket_path
 
+        claude_bin_receipt_path: str | None = None
+        claude_bin_launcher_nonce: str | None = None
+        workspace_create_argv = [herdr_bin, "workspace", "create", "--cwd", worktree, "--no-focus"]
         if runtime == "claude" and claude_bin_override:
             resolved_claude_bin_override = os.path.realpath(claude_bin_override)
             if not os.path.isfile(resolved_claude_bin_override) or not os.access(
@@ -2822,13 +3018,40 @@ def run_interactive_herdr_isolated(
                     "--claude-bin path is not an executable file: "
                     f"{claude_bin_override}"
                 )
+            # PR #2176 OWNER REQUEST_CHANGES Findings 1+2
+            # (https://github.com/squne121/loop-protocol/pull/2176#issuecomment-5302819792):
+            # a real forwarder script (never a symlink -- see the docstring
+            # above) that (a) writes a run-scoped nonce to a 0600 receipt
+            # file, then (b) ``exec``s the actual launcher, preserving its
+            # exit status / signal semantics. ``mkdtemp`` already creates the
+            # directory 0700; both the directory and the forwarder are
+            # explicitly (re)set to 0700 below so this never depends on the
+            # platform umask.
             claude_bin_shim_dir = tempfile.mkdtemp(prefix="worktree-agent-runtime-smoke-claude-bin-")
-            os.symlink(resolved_claude_bin_override, str(Path(claude_bin_shim_dir) / "claude"))
+            os.chmod(claude_bin_shim_dir, 0o700)
+            claude_bin_launcher_nonce = uuid.uuid4().hex
+            claude_bin_receipt_path = str(Path(claude_bin_shim_dir) / "receipt")
+            forwarder_path = Path(claude_bin_shim_dir) / "claude"
+            _escaped_target = resolved_claude_bin_override.replace("'", "'\\''")
+            _escaped_receipt = claude_bin_receipt_path.replace("'", "'\\''")
+            forwarder_path.write_text(
+                "#!/bin/sh\n"
+                "umask 0077\n"
+                f"printf '%s' '{claude_bin_launcher_nonce}' > '{_escaped_receipt}'\n"
+                f"exec '{_escaped_target}' \"$@\"\n",
+                encoding="utf-8",
+            )
+            forwarder_path.chmod(0o700)
+            evidence["claude_bin_shim_kind"] = "forwarder"
             existing_path = isolated_env.get("PATH", os.defpath)
             isolated_env["PATH"] = claude_bin_shim_dir + os.pathsep + existing_path
+            # Finding 1: the updated PATH must be handed to Herdr's own
+            # server/root-shell process explicitly -- updating only this
+            # Python client's isolated_env["PATH"] never reaches it.
+            workspace_create_argv += ["--env", "PATH=" + isolated_env["PATH"]]
 
         rc, out, err, timed_out = _run(
-            [herdr_bin, "workspace", "create", "--cwd", worktree, "--no-focus"],
+            workspace_create_argv,
             timeout=20.0, env=isolated_env,
         )
         if timed_out or rc != 0:
@@ -2872,9 +3095,6 @@ def run_interactive_herdr_isolated(
 
         _send_prompt_turn(herdr_bin, agent_name, prompt, timeout_seconds, isolated_env, evidence)
         evidence["turns_completed"] = 1
-        for extra_prompt in (additional_prompts or []):
-            _send_prompt_turn(herdr_bin, agent_name, extra_prompt, timeout_seconds, isolated_env, evidence)
-            evidence["turns_completed"] += 1
 
         rc, out, err, timed_out = _run(
             [herdr_bin, "agent", "get", agent_name], timeout=20.0, env=isolated_env,
@@ -2914,6 +3134,28 @@ def run_interactive_herdr_isolated(
         )
         if rc == 0:
             pane_output_lines = _bounded_redacted_lines(out, _MAX_PANE_LINES)
+
+        # Finding 1 causal-proof requirement: a PASS must never be possible
+        # from an ambient/native "claude" that happened to be on Herdr's own
+        # PATH instead of the specified launcher. The receipt is the only
+        # signal in this lifecycle that is actually written BY the
+        # specified launcher's own forwarder (a decoy binary elsewhere on
+        # PATH cannot produce it), so its absence or mismatch is a hard
+        # FAIL, never a silent pass-through.
+        if claude_bin_override and claude_bin_receipt_path is not None:
+            try:
+                _receipt_observed = Path(claude_bin_receipt_path).read_text(encoding="utf-8").strip()
+            except OSError:
+                _receipt_observed = None
+            evidence["claude_bin_launcher_receipt_verified"] = (
+                _receipt_observed is not None and _receipt_observed == claude_bin_launcher_nonce
+            )
+            if not evidence["claude_bin_launcher_receipt_verified"]:
+                raise HerdrLaneError(
+                    "--claude-bin launcher receipt not observed or mismatched; the "
+                    "specified launcher may not have actually executed (PATH shim "
+                    "did not reach the herdr workspace process)"
+                )
 
         return pane_output_lines
     finally:
@@ -3076,37 +3318,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--expect-marker", action="append", default=[])
-    parser.add_argument(
-        "--forbid-marker",
-        action="append",
-        default=[],
-        help=(
-            "Issue #2176: a literal string that, if observed anywhere in "
-            "the captured output (structured: stdout+stderr; interactive: "
-            "the bounded pane transcript), unconditionally FAILs the run "
-            "regardless of any other signal (e.g. a "
-            "'Context limit reached' / 'Prompt is too long' / "
-            "'automatic compaction failed' / unknown-model diagnostic). "
-            "May be repeated. Omitted by default, so every pre-existing "
-            "caller's behavior is unchanged."
-        ),
-    )
-    parser.add_argument(
-        "--additional-prompt",
-        action="append",
-        default=[],
-        help=(
-            "Issue #2176 (AC4 operator-journey strengthening): interactive "
-            "mode only. An extra prompt turn sent to the SAME "
-            "already-started agent/session after the initial --prompt-file "
-            "turn settles. May be repeated (sent in the given order) to "
-            "drive a multi-turn operator journey (e.g. Skill load, SubAgent "
-            "spawn + completion confirmation, one more follow-up turn) "
-            "inside one isolated interactive session. Ignored for "
-            "--mode structured. Omitted by default, so every pre-existing "
-            "caller's single-turn behavior is unchanged."
-        ),
-    )
     parser.add_argument(
         "--require-observed-runtime-field",
         action="append",
@@ -3291,6 +3502,25 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.claude_adapter == "claude-gpt" and not args.claude_bin:
         parser.error("--claude-adapter claude-gpt requires --claude-bin")
+
+    # PR #2176 OWNER REQUEST_CHANGES Finding 6
+    # (https://github.com/squne121/loop-protocol/pull/2176#issuecomment-5302819792):
+    # claude-specific inputs combined with --runtime codex were previously
+    # silently accepted and ignored while Codex actually ran, which could
+    # let a caller believe they had validated claude-gpt when they had
+    # actually run Codex. Likewise --hermetic-agent-definition outside
+    # structured mode was previously accepted and silently ignored.
+    if args.runtime != "claude":
+        if args.claude_bin:
+            parser.error("--claude-bin requires --runtime claude")
+        if args.claude_adapter != "native":
+            parser.error("--claude-adapter requires --runtime claude")
+        if args.claude_agent_name:
+            parser.error("--claude-agent-name requires --runtime claude")
+        if args.hermetic_agent_definition:
+            parser.error("--hermetic-agent-definition requires --runtime claude")
+    if args.mode != "structured" and args.hermetic_agent_definition:
+        parser.error("--hermetic-agent-definition requires --mode structured")
 
     run_id = uuid.uuid4().hex[:12]
     errors: list[str] = []
@@ -3803,19 +4033,6 @@ def main(argv: list[str] | None = None) -> int:
                     errors.append(f"expected markers not observed: {missing}")
                     exit_code = EXIT_FAIL
 
-            # Issue #2176 (operator-journey FAIL guard, structured lane
-            # equivalent): unconditional (not gated on exit_code == EXIT_OK)
-            # so a forbidden diagnostic can never be silently absorbed by an
-            # otherwise-green run. See the interactive-lane counterpart
-            # above for the full rationale.
-            if args.forbid_marker:
-                combined_for_forbid = out + "\n" + err
-                present = [m for m in args.forbid_marker if m in combined_for_forbid]
-                schema_summary["forbidden_markers_observed"] = present
-                if present:
-                    errors.append(f"forbidden markers observed: {present}")
-                    exit_code = EXIT_FAIL
-
             required_observations = sorted(set(args.require_observed_runtime_field))
             if required_observations:
                 # These four fields have no independently extractable Codex
@@ -3893,8 +4110,10 @@ def main(argv: list[str] | None = None) -> int:
             # every interactive lane run -- unlike
             # ``--require-session-baseline-preservation`` above (an
             # existing, opt-in, session-identity-only check), this cannot
-            # be disabled.
-            workspace_snapshot_before = capture_herdr_workspace_snapshot("herdr", _isolated_env())
+            # be disabled. PR #2176 OWNER REQUEST_CHANGES Finding 4: every
+            # currently running named session is snapshotted explicitly
+            # (never just the ambient/default one).
+            workspace_snapshot_before = capture_all_herdr_workspace_snapshots("herdr", _isolated_env())
             schema_summary["herdr_workspace_snapshot_before_captured"] = workspace_snapshot_before is not None
             if workspace_snapshot_before is None:
                 errors.append(
@@ -3907,7 +4126,6 @@ def main(argv: list[str] | None = None) -> int:
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
                     claude_bin_override=args.claude_bin if args.runtime == "claude" else None,
-                    additional_prompts=args.additional_prompt or None,
                 )
 
                 if evidence.get("final_state") == "blocked":
@@ -3923,20 +4141,6 @@ def main(argv: list[str] | None = None) -> int:
                         errors.append(f"expected markers not observed in pane output: {missing}")
                         exit_code = EXIT_FAIL
 
-                # Issue #2176 (operator-journey FAIL guard): a forbidden
-                # marker (e.g. a context-limit / prompt-too-long /
-                # auto-compaction-failure / unknown-model diagnostic) found
-                # anywhere in the pane transcript is a genuine runtime
-                # malfunction that must always FAIL this run, even if every
-                # other signal (expect-marker, final_state, cleanup) looks
-                # fine. This check is unconditional (not gated on the
-                # current exit_code) so it can never be silently absorbed by
-                # an otherwise-green run.
-                if args.forbid_marker:
-                    present = [m for m in args.forbid_marker if m in combined_pane_text]
-                    schema_summary["forbidden_markers_observed"] = present
-                    if present:
-                        errors.append(f"forbidden markers observed in pane output: {present}")
                         exit_code = EXIT_FAIL
 
                 if args.require_session_log_metadata or args.inspect_session_log_metadata:
@@ -3983,9 +4187,9 @@ def main(argv: list[str] | None = None) -> int:
                 # Issue #2174 AC7: workspace/agent/focus preservation --
                 # always evaluated (see the mandatory before-capture above),
                 # regardless of ``--require-session-baseline-preservation``.
-                workspace_snapshot_after = capture_herdr_workspace_snapshot("herdr", _isolated_env())
+                workspace_snapshot_after = capture_all_herdr_workspace_snapshots("herdr", _isolated_env())
                 schema_summary["herdr_workspace_snapshot_after_captured"] = workspace_snapshot_after is not None
-                workspace_snapshot_diffs = diff_herdr_workspace_snapshot(
+                workspace_snapshot_diffs = diff_all_herdr_workspace_snapshots(
                     workspace_snapshot_before, workspace_snapshot_after
                 )
                 schema_summary["herdr_workspace_snapshot_diffs"] = workspace_snapshot_diffs

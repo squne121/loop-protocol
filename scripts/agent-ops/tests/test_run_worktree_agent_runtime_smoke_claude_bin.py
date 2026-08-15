@@ -279,3 +279,294 @@ def test_preflight_claude_available_with_override_ignores_path(monkeypatch, tmp_
     resolved, skip_reason = module.preflight_claude_available(str(override_bin))
     assert skip_reason is None
     assert resolved == os.path.realpath(str(override_bin))
+
+
+# ---------------------------------------------------------------------------
+# Interactive herdr lane: forwarder + explicit --env PATH + causal receipt
+# (PR #2176 OWNER REQUEST_CHANGES Findings 1+2:
+# https://github.com/squne121/loop-protocol/pull/2176#issuecomment-5302819792)
+#
+# The fake herdr below deliberately mimics the ONE thing the prior
+# implementation got wrong: it resolves "claude" via ``command -v`` inside
+# ``agent start`` using whatever PATH THAT SPECIFIC subprocess invocation
+# received (exactly the process boundary Finding 1 is about -- a real
+# Herdr's persistent PTY would only ever see the shim if it is threaded
+# through explicitly, e.g. via ``workspace create --env PATH=...``, not
+# merely set on the Python client's own environment). It then actually
+# execs whatever "claude" resolves to, so the launcher fixture used here
+# (which sources a sibling ``lib.sh`` exactly like the real, merged
+# ``scripts/claude-gpt/launch.sh``) genuinely exercises whether the shim is
+# a working forwarder (Finding 2) rather than a symlink that would break
+# ``$0``-based sibling sourcing.
+# ---------------------------------------------------------------------------
+
+_FORWARDER_CAUSAL_PROOF_HERDR_BODY = """
+STATE_DIR="$FAKE_HERDR_STATE_DIR"
+mkdir -p "$STATE_DIR"
+if [ "$1" = "--session" ]; then
+  touch "$STATE_DIR/$2.session"
+  sleep 300
+  exit 0
+fi
+case "$1 $2" in
+  "status server")
+    exit 0
+    ;;
+esac
+case "$1" in
+  session)
+    case "$2" in
+      list)
+        out="{\\"sessions\\":["
+        first=1
+        for f in "$STATE_DIR"/*.session; do
+          [ -e "$f" ] || continue
+          name=$(basename "$f" .session)
+          if [ -e "$STATE_DIR/$name.stopped" ]; then running=false; else running=true; fi
+          if [ $first -eq 0 ]; then out="$out,"; fi
+          out="$out{\\"name\\":\\"$name\\",\\"running\\":$running}"
+          first=0
+        done
+        out="$out]}"
+        echo "$out"
+        exit 0
+        ;;
+      stop) touch "$STATE_DIR/$3.stopped"; exit 0 ;;
+      delete) rm -f "$STATE_DIR/$3.session" "$STATE_DIR/$3.stopped"; exit 0 ;;
+    esac
+    ;;
+  workspace)
+    case "$2" in
+      create)
+        printf '%s\n' "$@" > "$STATE_DIR/workspace_create_argv.log"
+        touch "$STATE_DIR/${HERDR_SESSION}.session"
+        echo '{"result":{"root_pane":{"pane_id":"pane-xyz"},"workspace":{"workspace_id":"w1"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+  agent)
+    case "$2" in
+      start)
+        resolved="$(command -v claude || true)"
+        printf '%s\n' "$resolved" > "$STATE_DIR/resolved_claude_path.log"
+        if [ -n "$resolved" ]; then
+          "$resolved" launched-by-fake-herdr-pty > "$STATE_DIR/claude_invocation_output.log" 2>&1
+        fi
+        exit 0
+        ;;
+      prompt) exit 0 ;;
+      get) echo '{"state":"idle"}'; exit 0 ;;
+      explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
+      read)
+        cat "$STATE_DIR/claude_invocation_output.log" 2>/dev/null || true
+        exit 0
+        ;;
+    esac
+    ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+"""
+
+
+def test_interactive_lane_forwarder_reaches_specified_launcher_not_ambient_decoy(
+    monkeypatch, tmp_path
+):
+    """Findings 1+2 end-to-end regression: an ambient decoy ``claude`` sits
+    on PATH (would exit 99 and never write a receipt if invoked); the
+    specified ``--claude-bin`` launcher sources a sibling ``lib.sh`` exactly
+    like the real merged ``scripts/claude-gpt/launch.sh`` (this FAILS if the
+    shim is a symlink, per Finding 2's ``$0``/``dirname`` argument). The
+    fake herdr's ``agent start`` resolves and invokes "claude" via its own
+    PATH (simulating the real Herdr PTY boundary), so this only observes
+    the launcher's own marker output -- never the decoy's -- if Findings 1
+    and 2 are both genuinely fixed."""
+    module = _load_module()
+
+    state_dir = tmp_path / "herdr-state"
+    fake_herdr = tmp_path / "herdr"
+    _write_fake_exe(fake_herdr, _FORWARDER_CAUSAL_PROOF_HERDR_BODY)
+
+    decoy_dir = tmp_path / "decoy-bin"
+    decoy_dir.mkdir()
+    decoy_marker = tmp_path / "decoy-invoked.marker"
+    _write_fake_exe(
+        decoy_dir / "claude",
+        'touch "' + str(decoy_marker) + '"\necho "DECOY_SHOULD_NEVER_RUN" >&2\nexit 99\n',
+    )
+
+    launcher_dir = tmp_path / "claude-gpt-launcher"
+    launcher_dir.mkdir()
+    (launcher_dir / "lib.sh").write_text("# sibling helper sourced by launch.sh\n", encoding="utf-8")
+    launcher = launcher_dir / "launch.sh"
+    _write_fake_exe(
+        launcher,
+        "SELF_PATH=$0\n"
+        'SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)\n'
+        '. "$SCRIPT_DIR/lib.sh"\n'
+        'echo "REAL_LAUNCHER_OBSERVED_MARKER $*"\n',
+    )
+
+    monkeypatch.setenv("PATH", str(decoy_dir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("FAKE_HERDR_STATE_DIR", str(state_dir))
+
+    evidence = {"cleanup": {}}
+    pane_lines = module.run_interactive_herdr_isolated(
+        "claude", str(tmp_path), "hello", 20.0, "abc123", evidence,
+        herdr_bin=str(fake_herdr),
+        claude_bin_override=str(launcher),
+    )
+
+    assert not decoy_marker.exists(), "ambient decoy claude must never be invoked"
+    assert any("REAL_LAUNCHER_OBSERVED_MARKER" in line for line in pane_lines), pane_lines
+    assert evidence.get("claude_bin_launcher_receipt_verified") is True
+
+    argv_log = (state_dir / "workspace_create_argv.log").read_text(encoding="utf-8")
+    assert "--env" in argv_log
+    assert "PATH=" in argv_log
+
+    resolved_log = (state_dir / "resolved_claude_path.log").read_text(encoding="utf-8").strip()
+    assert resolved_log, "fake herdr PTY could not resolve claude via PATH at all"
+    assert str(decoy_dir) not in resolved_log
+
+
+def test_interactive_lane_claude_bin_shim_is_forwarder_not_symlink(monkeypatch, tmp_path):
+    """Finding 2 (unit-level): the generated shim executable is a real
+    forwarder script, never a symlink, so a launcher relying on ``$0``
+    (e.g. to locate a sibling ``lib.sh``) is never broken by shim creation
+    itself."""
+    module = _load_module()
+
+    state_dir = tmp_path / "herdr-state"
+    fake_herdr = tmp_path / "herdr"
+    _write_fake_exe(fake_herdr, _FORWARDER_CAUSAL_PROOF_HERDR_BODY)
+
+    launcher_dir = tmp_path / "claude-gpt-launcher"
+    launcher_dir.mkdir()
+    launcher = launcher_dir / "launch.sh"
+    _write_fake_exe(launcher, 'echo "OK"\n')
+
+    monkeypatch.setenv("FAKE_HERDR_STATE_DIR", str(state_dir))
+
+    captured_shim_dir: dict[str, str] = {}
+    real_mkdtemp = module.tempfile.mkdtemp
+
+    def _spy_mkdtemp(*args, **kwargs):
+        d = real_mkdtemp(*args, **kwargs)
+        captured_shim_dir["dir"] = d
+        return d
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", _spy_mkdtemp)
+
+    evidence = {"cleanup": {}}
+    module.run_interactive_herdr_isolated(
+        "claude", str(tmp_path), "hello", 20.0, "abc123", evidence,
+        herdr_bin=str(fake_herdr),
+        claude_bin_override=str(launcher),
+    )
+    assert evidence.get("claude_bin_shim_kind") == "forwarder"
+    assert captured_shim_dir.get("dir")
+
+
+# ---------------------------------------------------------------------------
+# Finding 6 (PR #2176 OWNER REQUEST_CHANGES): invalid runtime/flag
+# combinations must be rejected at argparse time (exit 2), never silently
+# accepted and ignored while a different runtime actually runs.
+# ---------------------------------------------------------------------------
+
+
+def test_codex_runtime_with_claude_bin_is_rejected(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "codex", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--claude-bin", "/tmp/does-not-matter/launch.sh",
+    )
+    assert result.returncode == 2, result.stderr
+    assert "--claude-bin requires --runtime claude" in result.stderr
+
+
+def test_codex_runtime_with_claude_adapter_is_rejected(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "codex", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--claude-bin", "/tmp/does-not-matter/launch.sh",
+        "--claude-adapter", "claude-gpt",
+    )
+    assert result.returncode == 2, result.stderr
+
+
+def test_codex_runtime_with_claude_agent_name_is_rejected(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "codex", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--claude-agent-name", "some-agent",
+    )
+    assert result.returncode == 2, result.stderr
+    assert "--claude-agent-name requires --runtime claude" in result.stderr
+
+
+def test_codex_runtime_with_hermetic_agent_definition_is_rejected(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "codex", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--hermetic-agent-definition",
+    )
+    assert result.returncode == 2, result.stderr
+    assert "--hermetic-agent-definition requires --runtime claude" in result.stderr
+
+
+def test_hermetic_agent_definition_outside_structured_mode_is_rejected(repo_with_worktree, tmp_path):
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--claude-agent-name", "some-agent",
+        "--hermetic-agent-definition",
+    )
+    assert result.returncode == 2, result.stderr
+    assert "--hermetic-agent-definition requires --mode structured" in result.stderr
+
+
+def test_claude_runtime_with_claude_bin_is_still_accepted(repo_with_worktree, tmp_path):
+    """Negative control: the same claude-specific flags remain accepted
+    (never over-rejected) when --runtime claude IS specified."""
+    module = _load_module()
+    parser = module.build_parser()
+    args = parser.parse_args([
+        "--runtime", "claude", "--mode", "structured",
+        "--worktree", "/tmp/does-not-matter",
+        "--prompt-file", "/tmp/does-not-matter.md",
+        "--output-dir", "/tmp/does-not-matter-out",
+        "--claude-bin", "/tmp/does-not-matter/launch.sh",
+        "--claude-adapter", "claude-gpt",
+    ])
+    assert args.claude_bin == "/tmp/does-not-matter/launch.sh"
+    assert args.claude_adapter == "claude-gpt"

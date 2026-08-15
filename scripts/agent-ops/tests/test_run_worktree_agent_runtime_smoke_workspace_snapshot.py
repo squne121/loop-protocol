@@ -119,11 +119,27 @@ def _run(
 
 
 def _snapshot(*, workspace="w0", tab="w0:t0", pane="w0:p0", agents=()):
+    # ``agents`` here is an iterable of (workspace_id, tab_id, pane_id)
+    # location tuples, matching the pre-Finding-3 test fixtures; each is
+    # expanded into a full agent_records-shaped entry for the rewritten
+    # full-snapshot schema (PR #2176 OWNER REQUEST_CHANGES Finding 3).
+    agent_records = sorted(
+        (
+            pane_id,
+            (f"agent-{pane_id}", f"term-{pane_id}", ws, t, pane_id),
+            None,
+        )
+        for (ws, t, pane_id) in agents
+    )
     return {
         "focused_workspace_id": workspace,
         "focused_tab_id": tab,
         "focused_pane_id": pane,
-        "agent_locations": sorted(agents),
+        "agent_records": agent_records,
+        "pane_records": [],
+        "tab_records": [],
+        "workspace_records": [],
+        "layout_records": [],
     }
 
 
@@ -178,6 +194,18 @@ def test_diff_workspace_snapshot_poison_agent_location_is_detected():
     poisoned_after = _snapshot(agents=[("w2", "w2:t1", "w2:p1")])
     diffs = module.diff_herdr_workspace_snapshot(before, poisoned_after)
     assert diffs and any("agent" in d for d in diffs)
+
+
+def test_diff_workspace_snapshot_poison_pane_workspace_or_layout_is_detected():
+    """AC7 poison test (Finding 3): a change to pane/tab/workspace/layout
+    records -- not just agent location -- must be detected too."""
+    module = _load_module()
+    before = _snapshot()
+    before["pane_records"] = [("w0:p0", "w0", "w0:t0", None, "term-1", None)]
+    after = _snapshot()
+    after["pane_records"] = [("w0:p0", "w0", "w0:t0", "claude", "term-2", None)]
+    diffs = module.diff_herdr_workspace_snapshot(before, after)
+    assert diffs and any("pane records" in d for d in diffs)
 
 
 def test_capture_workspace_snapshot_missing_focus_field_is_fail_closed(tmp_path):

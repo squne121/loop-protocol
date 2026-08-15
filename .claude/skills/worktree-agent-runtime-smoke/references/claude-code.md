@@ -78,24 +78,6 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示の
 `agent_prompt_stalled` 節を参照）。runner はこれを検知した場合のみ
 `send-keys enter` による 1 回限りの回復を行う。
 
-### 複数 turn の operator journey 検証（`--additional-prompt` / `--forbid-marker`, Issue #2176）
-
-`herdr agent prompt <unique-name> "<prompt>" --wait` は既に開始済みの同一 agent／
-session に対して繰り返し呼び出せる。`--additional-prompt` を指定すると、初回
-`--prompt-file` の turn が settle した後、指定した順番で追加 turn を同じ agent へ
-送信する（stall 検知・`send-keys enter` 回復ロジックは各 turn で同一に適用される）。
-これにより「launcher 起動 → model/effort 確認 → Skill load → SubAgent spawn →
-completion 確認 → もう 1 turn」のような operator journey を 1 回の isolated session
-内で駆動できる。`summary.md` の `turns_completed` は実際に settle した turn 数
-（初回 + 追加）を記録する。
-
-`--forbid-marker` は structured／interactive 両 lane で使える無条件 FAIL guard で、
-指定した文字列（例: `Context limit reached` / `Prompt is too long` /
-`automatic compaction failed` / `is not a model this version of Claude Code
-recognizes`）が出力のどこかに 1 つでも観測された場合、`--expect-marker` の充足や
-`final_state` を含む他のすべての判定結果に関わらず exit 1 とする。`summary.md` の
-`forbidden_markers_observed` に観測された文字列一覧が記録される。
-
 ## メインセッション Agent Identity・定義束縛・Skill 証跡（main_agent_identity / agent_definition / skill_evidence, Issue #2046）
 
 `--claude-agent-name <persona>` を指定した structured lane 起動は、`--agent <persona>`
