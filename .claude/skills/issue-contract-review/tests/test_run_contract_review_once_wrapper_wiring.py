@@ -164,6 +164,41 @@ class TestVcPreflightTimeoutRelationshipAC2:
 
 
 # ---------------------------------------------------------------------------
+# Issue #1631: readiness outer timeout must exceed its nested execute timeout
+# ---------------------------------------------------------------------------
+
+
+class TestReadinessTimeoutRelationship:
+    """The outer readiness wrapper must not preempt its nested execute budget."""
+
+    def test_default_is_derived_from_nested_execute_budget_and_overhead(self):
+        assert _rcr_mod._READINESS_NESTED_EXECUTE_TIMEOUT_SECONDS == 120
+        assert (
+            _rcr_mod._READINESS_WRAPPER_OVERHEAD_SECONDS
+            == _rcr_mod._DEFAULT_TIMEOUT
+        )
+        assert _rcr_mod._DEFAULT_READINESS_TIMEOUT_SECONDS == (
+            _rcr_mod._READINESS_NESTED_EXECUTE_TIMEOUT_SECONDS
+            + _rcr_mod._READINESS_WRAPPER_OVERHEAD_SECONDS
+        )
+        assert (
+            _rcr_mod._DEFAULT_READINESS_TIMEOUT_SECONDS
+            > _rcr_mod._READINESS_NESTED_EXECUTE_TIMEOUT_SECONDS
+        )
+
+    def test_source_uses_named_relationship_not_a_bare_readiness_literal(self):
+        script_content = _RCR_PATH.read_text(encoding="utf-8")
+
+        assert "_DEFAULT_READINESS_TIMEOUT_SECONDS = 90" not in script_content
+        assert (
+            "_DEFAULT_READINESS_TIMEOUT_SECONDS = (\n"
+            "    _READINESS_NESTED_EXECUTE_TIMEOUT_SECONDS\n"
+            "    + _READINESS_WRAPPER_OVERHEAD_SECONDS\n"
+            ")"
+        ) in script_content
+
+
+# ---------------------------------------------------------------------------
 # AC3: --timeout-seconds is passed explicitly as argv to baseline_vc_preflight.py
 # ---------------------------------------------------------------------------
 
