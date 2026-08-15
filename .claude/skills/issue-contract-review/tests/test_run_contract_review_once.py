@@ -12,6 +12,7 @@ B1: run_once() から check_blockers.sh / check_product_spec_contract.py /
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -235,6 +236,7 @@ class TestAllChecksCalledB1:
         assert result["checks"]["declared_path_overlap"]["advisory"] is True
         assert result["checks"]["declared_path_overlap"]["blocking"] is False
 
+
     def test_current_head_arguments_are_forwarded_to_producer(self):
         """GIVEN certified current-head input WHEN review runs THEN it preserves the full envelope."""
         run_script_results, shell_results = _make_all_pass_side_effects()
@@ -426,6 +428,125 @@ class TestAllChecksCalledB1:
 
         assert result["status"] == "human_judgment"
         assert result["source"] == "vc_preflight"
+
+
+# ---------------------------------------------------------------------------
+# Issue #1631: readiness timeout is independently configurable
+# ---------------------------------------------------------------------------
+
+
+class TestReadinessTimeout:
+    """GIVEN readiness execution WHEN timeout is configured THEN only Step 2 uses it."""
+
+    def test_default_uses_only_readiness_timeout_and_applies_only_to_readiness(self):
+        run_script_results, shell_results = _make_all_pass_side_effects()
+        calls = []
+
+        def fake_run_script(cmd, timeout=_rcr_mod._DEFAULT_TIMEOUT):
+            calls.append((cmd, timeout))
+            return run_script_results.pop(0)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=fake_run_script):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=shell_results[0]):
+                with patch.object(
+                    _rcr_mod,
+                    "_run_declared_path_overlap_check",
+                    return_value=_make_declared_path_overlap_result(disjoint=True),
+                ):
+                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "go"
+        assert calls[0][1] == _rcr_mod._DEFAULT_READINESS_TIMEOUT_SECONDS
+        assert calls[1][1] == _rcr_mod._DEFAULT_TIMEOUT
+        assert calls[2][1] == _rcr_mod._VC_PREFLIGHT_TIMEOUT
+
+    def test_override_is_forwarded_to_readiness_and_reported_on_timeout(self):
+        applied_timeout_seconds = 47
+        captured = []
+
+        def timeout_readiness(cmd, timeout=_rcr_mod._DEFAULT_TIMEOUT):
+            captured.append((cmd, timeout))
+            return None, -1, "timeout"
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=timeout_readiness):
+            result = run_once(
+                _ISSUE_NUMBER,
+                _REPO,
+                skip_idempotency_check=True,
+                readiness_timeout_seconds=applied_timeout_seconds,
+            )
+
+        assert result["status"] == "runtime_error"
+        assert captured[0][1] == applied_timeout_seconds
+        assert result["errors"] == [
+            "readiness_check_error: timeout (readiness_timeout_seconds=47)"
+        ]
+
+    @pytest.mark.parametrize("invalid_value", [0, -1, False, "47"])
+    def test_programmatic_api_rejects_invalid_readiness_timeout_before_running(self, invalid_value):
+        with patch.object(_rcr_mod, "fetch_body_from_github") as fetch_body:
+            with patch.object(_rcr_mod, "_run_script") as run_script:
+                result = run_once(
+                    _ISSUE_NUMBER,
+                    _REPO,
+                    skip_idempotency_check=True,
+                    readiness_timeout_seconds=invalid_value,
+                )
+
+        assert result["status"] == "runtime_error"
+        assert result["errors"] == [
+            "invalid_readiness_timeout_seconds: must be a positive integer"
+        ]
+        fetch_body.assert_not_called()
+        run_script.assert_not_called()
+
+    def test_non_timeout_readiness_error_does_not_gain_timeout_annotation(self):
+        with patch.object(
+            _rcr_mod,
+            "_run_script",
+            return_value=(None, -1, "script_not_found: readiness.py"),
+        ):
+            result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "runtime_error"
+        assert result["errors"] == [
+            "readiness_check_error: script_not_found: readiness.py"
+        ]
+
+    def test_cli_wires_readiness_timeout_override(self):
+        with patch.object(_rcr_mod, "run_once", return_value={"status": "go"}) as mocked:
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_contract_review_once.py",
+                    "--issue-number",
+                    str(_ISSUE_NUMBER),
+                    "--readiness-timeout-seconds",
+                    "47",
+                ],
+            ):
+                assert _rcr_mod.main() == 0
+
+        assert mocked.call_args.kwargs["readiness_timeout_seconds"] == 47
+
+    @pytest.mark.parametrize("invalid_value", ["0", "-1"])
+    def test_cli_rejects_nonpositive_readiness_timeout(self, invalid_value):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "run_contract_review_once.py",
+                "--issue-number",
+                str(_ISSUE_NUMBER),
+                "--readiness-timeout-seconds",
+                invalid_value,
+            ],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                _rcr_mod.main()
+
+        assert exc_info.value.code == 2
 
 
 # ---------------------------------------------------------------------------

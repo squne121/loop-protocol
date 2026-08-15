@@ -208,6 +208,19 @@ _VC_PREFLIGHT_TIMEOUT = (
     + _VC_PREFLIGHT_OVERHEAD_SECONDS
 )
 _DEFAULT_TIMEOUT = 30
+# contract_readiness_check.py の execute path は baseline_vc_preflight.py を
+# 最大120秒まで待機する。この child budget は本 Issue の Allowed Paths 外で
+# hard-code されているため、ここではその canonical execute budget を明示して
+# outer wrapper が先に timeout しない関係を維持する。
+_READINESS_NESTED_EXECUTE_TIMEOUT_SECONDS = 120
+# subprocess 起動、body-file の受け渡し、JSON serialization のための wrapper
+# overhead。既存の短時間 subprocess budget を使用して独立した magic number を
+# 増やさず、nested execute budget より outer timeout が常に大きくなるようにする。
+_READINESS_WRAPPER_OVERHEAD_SECONDS = _DEFAULT_TIMEOUT
+_DEFAULT_READINESS_TIMEOUT_SECONDS = (
+    _READINESS_NESTED_EXECUTE_TIMEOUT_SECONDS
+    + _READINESS_WRAPPER_OVERHEAD_SECONDS
+)
 
 # Issue #1338 AC9: named constant for the --max-workers value explicitly
 # passed to baseline_vc_preflight.py. Bounded parallel execution there is
@@ -477,6 +490,7 @@ def run_once(
     evidence_mode: str = "baseline",
     cwd: str | None = None,
     reviewed_head_sha: str | None = None,
+    readiness_timeout_seconds: int = _DEFAULT_READINESS_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """
     Run issue-contract-review checks once for the given issue.
@@ -535,6 +549,19 @@ def run_once(
         },
         "errors": [],
     }
+
+    # `run_once()` is also a programmatic API. Reject invalid values before
+    # any GitHub or subprocess work so direct callers cannot accidentally
+    # disable the readiness timeout that the CLI already validates.
+    if (
+        not isinstance(readiness_timeout_seconds, int)
+        or isinstance(readiness_timeout_seconds, bool)
+        or readiness_timeout_seconds <= 0
+    ):
+        result["errors"].append(
+            "invalid_readiness_timeout_seconds: must be a positive integer"
+        )
+        return result
 
     # Issue #1914 P0-3 (#1940 review): fetch the Issue body exactly once, at
     # the very start of run_once(), before any check that reads body
@@ -610,10 +637,19 @@ def run_once(
             body_snapshot_path,
         ]
 
-        readiness_json, readiness_rc, readiness_err = _run_script(readiness_cmd)
+        readiness_json, readiness_rc, readiness_err = _run_script(
+            readiness_cmd,
+            timeout=readiness_timeout_seconds,
+        )
 
         if readiness_err:
-            result["errors"].append(f"readiness_check_error: {readiness_err}")
+            readiness_error = f"readiness_check_error: {readiness_err}"
+            if readiness_err == "timeout":
+                readiness_error += (
+                    " (readiness_timeout_seconds="
+                    f"{readiness_timeout_seconds})"
+                )
+            result["errors"].append(readiness_error)
             result["status"] = "runtime_error"
             return result
 
@@ -982,6 +1018,12 @@ def _run_declared_path_overlap_check(issue_number: int, repo: str) -> dict[str, 
 
 
 def main() -> int:
+    def positive_int(value: str) -> int:
+        parsed = int(value)
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("must be a positive integer")
+        return parsed
+
     parser = argparse.ArgumentParser(
         description=(
             "run_contract_review_once: run issue-contract-review checks once, "
@@ -1016,6 +1058,15 @@ def main() -> int:
         default=False,
         help="Skip existing go comment check",
     )
+    parser.add_argument(
+        "--readiness-timeout-seconds",
+        type=positive_int,
+        default=_DEFAULT_READINESS_TIMEOUT_SECONDS,
+        help=(
+            "Timeout in seconds for contract_readiness_check.py only "
+            f"(default: {_DEFAULT_READINESS_TIMEOUT_SECONDS})"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1027,6 +1078,7 @@ def main() -> int:
         evidence_mode=args.evidence_mode,
         cwd=args.cwd,
         reviewed_head_sha=args.reviewed_head_sha,
+        readiness_timeout_seconds=args.readiness_timeout_seconds,
     )
 
     print(json.dumps(result))
