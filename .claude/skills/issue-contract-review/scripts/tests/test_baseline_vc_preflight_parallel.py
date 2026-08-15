@@ -185,16 +185,24 @@ def test_p0_2_rg_missing_path_operand_target_is_not_eligible(tmp_path):
 
 def test_p0_2_run_command_uses_stdin_devnull(monkeypatch):
     """run_command() must always pass stdin=subprocess.DEVNULL to
-    subprocess.run() so concurrently-launched VCs never race on inherited
-    stdin (P0-2)."""
+    subprocess.Popen() so concurrently-launched VCs never race on inherited
+    stdin (P0-2).
+
+    Issue #2165 P1-2 (PR #2177 fix_delta iteration 5): run_command()
+    switched from subprocess.run() to subprocess.Popen(...) +
+    communicate(timeout=...) (fix_delta iteration 3), so this mock must
+    target Popen instead of run(). RecordingPopen subclasses the real
+    subprocess.Popen so the actual `true` process still launches (this
+    test asserts on the *launch kwargs*, not a canned return value)."""
     captured_kwargs = {}
-    original_run = vcp.subprocess.run
+    original_popen = vcp.subprocess.Popen
 
-    def recording_run(*args, **kwargs):
-        captured_kwargs.update(kwargs)
-        return original_run(*args, **kwargs)
+    class RecordingPopen(original_popen):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(vcp.subprocess, "run", recording_run)
+    monkeypatch.setattr(vcp.subprocess, "Popen", RecordingPopen)
     vcp.run_command("true", 5, str(_REPO_ROOT))
     assert captured_kwargs.get("stdin") is vcp.subprocess.DEVNULL
 

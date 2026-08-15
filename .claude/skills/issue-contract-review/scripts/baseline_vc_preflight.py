@@ -13,6 +13,7 @@ import os
 import json
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -44,7 +45,18 @@ import pnpm_gate_registry as pnpm_gate_registry  # noqa: E402
 # 安全マージン込みで上回る値（>= 90）を維持する。--timeout-seconds の
 # argparse default はこの定数を参照し、run_contract_review_once.py 側も
 # この定数を import して drift を防ぐ（AC2/AC3 参照）。
-DEFAULT_TIMEOUT_SECONDS = 90
+#
+# Issue #2165: この per-VC-command timeout は、Verification Command 1本の
+# 実行時間上限を決める最内層の値であり、ここでの過小値は上位層（reviewer
+# transport 等）の deadline 設計と無関係に単体で誤検知を起こす。
+# `issue-refinement-loop` skill 自身の full pytest suite VC
+# （`uv run --locked pytest .claude/skills/issue-refinement-loop/tests/ -q`）
+# は実測 111.07 秒であり、旧値 90 は単一の正当な長時間 VC でも超過する。
+# 150 は実測値に約35%の安全マージンを載せた値（呼び出し元の
+# `contract_readiness_check.py` / `run_root_review_pipeline.py` 側の
+# wrapper timeout もこの値に整合させて拡大している。詳細は
+# `reviewer_transport.py` の `PER_ATTEMPT_DEADLINE_SECONDS` docstring 参照）。
+DEFAULT_TIMEOUT_SECONDS = 150
 
 
 def collect_current_head_evidence(cwd: str, reviewed_head_sha: str) -> Dict[str, Any]:
@@ -743,12 +755,28 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
         run_env.update(env_delta)
 
     start = datetime.now()
+    process: Optional[subprocess.Popen] = None
     try:
-        result = subprocess.run(
+        # Issue #2165 P1-2 (OWNER 2026-08-15 REQUEST_CHANGES merge condition
+        # #5, PR #2177 fix_delta iteration 3): the VC subprocess is now
+        # launched via `Popen(..., start_new_session=True)` instead of the
+        # previous `subprocess.run(..., timeout=...)`. Python's official
+        # `subprocess.run(timeout=...)` contract only guarantees killing the
+        # DIRECT child on timeout, not any grandchild the VC command itself
+        # may have spawned. `start_new_session=True` puts this subprocess in
+        # its own new session (pgid == pid), independent of any other
+        # concurrently-running VC subprocess spawned via the
+        # `ThreadPoolExecutor(max_workers>1)` bounded-parallel executor
+        # below (each Popen call creates its own session id -- there is no
+        # shared/global pgid state, so this is safe under concurrency by
+        # construction). On timeout, `_kill_process_group()` below signals
+        # the ENTIRE process group (this VC's direct child AND any
+        # grandchildren it spawned), not just the direct child.
+        process = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
             cwd=cwd,
             shell=False,
             env=run_env,
@@ -758,15 +786,69 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
             # (e.g. two `rg` invocations) may run concurrently under the
             # bounded-parallel executor.
             stdin=subprocess.DEVNULL,
+            start_new_session=True,
         )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            # Drain pipes after the group is dead so `communicate()` doesn't
+            # block indefinitely on an orphaned pipe write-end still held
+            # open by a reaped-but-not-yet-reclaimed grandchild.
+            try:
+                process.communicate(timeout=5)
+            except Exception:
+                pass
+            duration_ms = int((datetime.now() - start).total_seconds() * 1000)
+            return -1, "", "timeout", duration_ms, env_delta
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
-        return result.returncode, result.stdout, result.stderr, duration_ms, env_delta
+        return process.returncode, stdout, stderr, duration_ms, env_delta
     except subprocess.TimeoutExpired:
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
         return -1, "", "timeout", duration_ms, env_delta
     except Exception as e:
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
         return -1, "", str(e), duration_ms, env_delta
+
+
+def _kill_process_group(process: "subprocess.Popen") -> None:
+    """
+    Reap an entire process group spawned with `start_new_session=True`.
+
+    Issue #2165 P1-2 (OWNER merge condition #5): on VC subprocess timeout,
+    kill the WHOLE process group (direct child + any grandchildren it
+    spawned), not merely the direct child pid. `start_new_session=True`
+    guarantees `os.getpgid(process.pid) == process.pid` for this process
+    (it is its own session/group leader), so this only ever targets the
+    group this specific Popen call created -- never a shared/global group,
+    and never another concurrently-running VC subprocess's group.
+
+    SIGTERM first, then a bounded grace period, then SIGKILL if the group
+    hasn't exited. Best-effort: a process (or the whole group) that already
+    exited between the timeout firing and this call running is not an
+    error.
+    """
+    try:
+        pgid = os.getpgid(process.pid)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _pnpm_gate_evidence_for_command(command: str, cwd: str) -> Optional[Dict[str, Any]]:
@@ -4444,3 +4526,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
