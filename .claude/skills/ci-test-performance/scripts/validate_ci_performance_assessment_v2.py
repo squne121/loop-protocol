@@ -354,6 +354,165 @@ def _recompute_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str,
     }
 
 
+def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
+    """Issue #2159 AC8: `nearest_rank_v1` percentile method -- the smallest
+    value such that at least `percentile`% of the (sorted) sample is <=
+    that value. 1-indexed nearest-rank method. Kept as the same method
+    name/semantics as `tests/ci/test_ci_performance_gate.py`'s
+    `_nearest_rank_percentile` (duplicated rather than imported across the
+    Allowed Paths boundary between the two Issue #2159 contracts)."""
+    if not values:
+        raise ValueError("nearest_rank_v1 requires at least one value")
+    ordered = sorted(values)
+    n = len(ordered)
+    rank = max(1, min(n, math.ceil((percentile / 100.0) * n)))
+    return ordered[rank - 1]
+
+
+# #2159 P0-7 (fix_delta after adversarial review issuecomment-5295659213):
+# raw-sample percentile recomputation was previously OPTIONAL whenever
+# `run_details` was absent, so a producer could self-report p50/p95 with no
+# raw samples at all and sail through unchecked. `run_details` is now
+# MANDATORY whenever `performance_evidence.status == "complete"` AND
+# `claim.kind != "none"` (i.e. whenever a real, non-smoke-test performance
+# claim is being asserted). Backward compatibility is preserved ONLY for
+# `claim.kind == "none"` artifacts (the no-op smoke-test producer, #2159
+# P0-8).
+MIN_RAW_SAMPLE_COUNT = 20
+
+
+def _check_percentile_recomputed_from_raw_samples(
+    assessment: dict[str, Any], errors: list[str], blockers: list[str]
+) -> None:
+    """Issue #2159 AC8 (P0-7/P0-9): recompute P50/P95 from
+    `runtime_delta.<cohort>.run_details[].duration_seconds` raw samples and
+    cross-check against the cohort's self-reported `p50_seconds` /
+    `p95_seconds`. Also enforces the P0-7 raw-sample invariants:
+
+    - `run_details` is REQUIRED (not optional) whenever
+      `performance_evidence.status == "complete"` AND `claim.kind != "none"`
+      -- a real claim.kind (improvement/regression/absolute_budget/etc.)
+      backed by `status: complete` must always be accompanied by the raw
+      samples that back it, closing the P0-7 self-report bypass where a
+      producer omits `run_details` to dodge recomputation.
+    - `run_count == len(run_ids) == len(run_details)`.
+    - every `run_details[].workflow_run_id` is present in `run_ids`
+      (exact set match, no orphaned or missing raw-sample records).
+    - `duration_seconds` is a finite positive number (rejects NaN/Infinity/
+      non-numeric/negative/zero).
+    - no duplicate `workflow_run_id` within a single cohort's `run_details`.
+    - `run_details` must contain >= MIN_RAW_SAMPLE_COUNT valid samples once
+      the above invariants hold.
+    - the declared `p50_seconds`/`p95_seconds` must always equal the
+      recomputed value (recomputation is no longer skipped just because a
+      cohort happens not to declare one)."""
+    claim = assessment.get("claim", {})
+    claim_kind = claim.get("kind")
+    performance_evidence = assessment["performance_evidence"]
+    status = performance_evidence.get("status")
+    runtime_delta = performance_evidence.get("runtime_delta")
+
+    run_details_required = status == "complete" and claim_kind != "none"
+
+    if not runtime_delta:
+        if run_details_required:
+            _append_unique(blockers, "run_details_required_but_runtime_delta_missing")
+        return
+
+    for cohort_key in ("before", "after"):
+        cohort = runtime_delta.get(cohort_key)
+        if not cohort:
+            continue
+
+        run_details = cohort.get("run_details")
+
+        if not run_details:
+            if run_details_required:
+                _append_unique(
+                    blockers,
+                    f"run_details_required_for_complete_non_none_claim_but_missing: {cohort_key}",
+                )
+            continue
+
+        run_ids = cohort.get("run_ids", [])
+        run_count = cohort.get("run_count")
+
+        if run_count is not None and run_count != len(run_details):
+            _append_unique(errors, f"run_count_mismatches_run_details_length: {cohort_key}")
+
+        detail_run_ids = [
+            rd.get("workflow_run_id") for rd in run_details if isinstance(rd, dict)
+        ]
+        if len(detail_run_ids) != len(set(detail_run_ids)):
+            _append_unique(errors, f"run_details_duplicate_workflow_run_id: {cohort_key}")
+
+        # `run_details[].workflow_run_id` is `integer` per schema, but
+        # `run_ids` is `array<string>` -- normalize both to string before
+        # comparing (comparing raw types here would ALWAYS report a false
+        # mismatch, since `9000 != "9000"` in Python).
+        if {str(v) for v in detail_run_ids} != {str(v) for v in run_ids}:
+            _append_unique(errors, f"run_details_workflow_run_id_mismatches_run_ids: {cohort_key}")
+
+        durations: list[float] = []
+        for rd in run_details:
+            if not isinstance(rd, dict):
+                _append_unique(errors, f"run_details_entry_not_object: {cohort_key}")
+                continue
+            duration = rd.get("duration_seconds")
+            if (
+                not isinstance(duration, (int, float))
+                or isinstance(duration, bool)
+                or not math.isfinite(duration)
+                or duration <= 0
+            ):
+                _append_unique(errors, f"run_details_invalid_duration_seconds: {cohort_key}")
+                continue
+            durations.append(float(duration))
+
+        if run_details_required and len(durations) < MIN_RAW_SAMPLE_COUNT:
+            _append_unique(
+                blockers,
+                f"run_details_below_min_raw_sample_count: {cohort_key} "
+                f"({len(durations)} < {MIN_RAW_SAMPLE_COUNT})",
+            )
+
+        if not durations:
+            continue
+
+        recomputed_p50 = _nearest_rank_percentile(durations, 50)
+        recomputed_p95 = _nearest_rank_percentile(durations, 95)
+
+        declared_p50 = cohort.get("p50_seconds")
+        declared_p95 = cohort.get("p95_seconds")
+
+        if run_details_required and declared_p50 is None:
+            _append_unique(errors, f"declared_p50_missing_with_run_details_present: {cohort_key}")
+        if run_details_required and declared_p95 is None:
+            _append_unique(errors, f"declared_p95_missing_with_run_details_present: {cohort_key}")
+
+        if declared_p50 is not None and not math.isclose(
+            declared_p50, recomputed_p50, rel_tol=1e-6, abs_tol=DELTA_TOLERANCE
+        ):
+            _append_unique(errors, f"percentile_recomputation_mismatch_p50: {cohort_key}")
+        if declared_p95 is not None and not math.isclose(
+            declared_p95, recomputed_p95, rel_tol=1e-6, abs_tol=DELTA_TOLERANCE
+        ):
+            _append_unique(errors, f"percentile_recomputation_mismatch_p95: {cohort_key}")
+
+    before_ids = {
+        rd.get("workflow_run_id")
+        for rd in (runtime_delta.get("before", {}) or {}).get("run_details", []) or []
+        if isinstance(rd, dict)
+    }
+    after_ids = {
+        rd.get("workflow_run_id")
+        for rd in (runtime_delta.get("after", {}) or {}).get("run_details", []) or []
+        if isinstance(rd, dict)
+    }
+    if before_ids & after_ids:
+        _append_unique(errors, "run_details_workflow_run_id_overlap_before_after")
+
+
 def _check_cohort_comparability(
     performance_evidence: dict[str, Any],
     errors: list[str],
@@ -451,6 +610,140 @@ def _check_approval_gates(
         _append_unique(blockers, "observed_regression_blocks_approval")
 
 
+# --------------------------------------------------------------------------- #
+# #2159 P0-8 (fix_delta after adversarial review issuecomment-5295659213):
+# the `CI_TEST_PERFORMANCE_ASSESSMENT_V2` producer wired into every regular
+# `.github/workflows/ci.yml` run emits a FIXED `claim.kind: none` /
+# `performance_evidence.status: not_required` no-op payload -- it never
+# reads the fixed-SHA benchmark manifest (P0-2's dedicated dispatch route)
+# or any real E2E provider/gate-ready cohort data. Per the review's own
+# suggestion ("`claim.kind: none` producerを別用途のschema smokeとして残す
+# 場合は、#2159 AC10の性能producerとは区別してください"), that no-op
+# producer remains the regular-CI schema smoke test (unchanged). THIS is
+# the real, distinct out-of-band producer: it takes ALREADY-COMPUTED
+# before/after percentile cohort data (the shape
+# `tests/ci/test_ci_performance_gate.py::_provider_critical_path_paired_p50_p95`
+# already produces from a real `>= MIN_COHORT_RUN_COUNT` fixed-SHA cohort)
+# and emits a real, non-none `claim`. It does NOT read files itself (kept
+# a pure function for testability); wiring an actual CLI/workflow step
+# that reads a real accumulated `>= 20`-run before/after cohort and calls
+# this function is a follow-up once the P0-2 dedicated dispatch route has
+# real accumulated history (this PR cannot fabricate that history).
+# --------------------------------------------------------------------------- #
+def build_assessment_from_percentile_cohorts(
+    issue_number: int,
+    pr_number: int,
+    measured_at: str,
+    before_run_details: list[dict[str, Any]],
+    after_run_details: list[dict[str, Any]],
+    functional_evidence: dict[str, Any],
+    declared_impact: str,
+    risk_acknowledgement: dict[str, Any],
+    cohort_provenance: dict[str, Any],
+    relative_shortening_threshold: float = 0.35,
+) -> dict[str, Any]:
+    """#2159 P0-8: builds a REAL (non-no-op) CI_TEST_PERFORMANCE_ASSESSMENT_V2
+    from real before/after raw-duration samples. `before_run_details` /
+    `after_run_details` are lists of `{"run_id": str, "workflow_run_id":
+    int, "duration_seconds": float, ...}` (the same shape
+    `_check_percentile_recomputed_from_raw_samples`'s P0-7 invariants
+    validate). Raises `ValueError` if either cohort has fewer than
+    `MIN_RAW_SAMPLE_COUNT` valid samples -- this function never fabricates
+    a claim from insufficient evidence."""
+    before_durations = [
+        rd["duration_seconds"]
+        for rd in before_run_details
+        if isinstance(rd.get("duration_seconds"), (int, float)) and math.isfinite(rd["duration_seconds"])
+    ]
+    after_durations = [
+        rd["duration_seconds"]
+        for rd in after_run_details
+        if isinstance(rd.get("duration_seconds"), (int, float)) and math.isfinite(rd["duration_seconds"])
+    ]
+
+    if len(before_durations) < MIN_RAW_SAMPLE_COUNT or len(after_durations) < MIN_RAW_SAMPLE_COUNT:
+        raise ValueError(
+            f"insufficient raw samples to build a real assessment: "
+            f"before={len(before_durations)} after={len(after_durations)} "
+            f"(need >= {MIN_RAW_SAMPLE_COUNT} each)"
+        )
+
+    before_p50 = _nearest_rank_percentile(before_durations, 50)
+    before_p95 = _nearest_rank_percentile(before_durations, 95)
+    after_p50 = _nearest_rank_percentile(after_durations, 50)
+    after_p95 = _nearest_rank_percentile(after_durations, 95)
+
+    relative_shortening = (before_p50 - after_p50) / before_p50 if before_p50 else 0.0
+    if relative_shortening >= relative_shortening_threshold:
+        claim: dict[str, Any] = {
+            "kind": "improvement",
+            "metric": "provider_critical_path_p50_seconds",
+            "minimum_improvement_pct": relative_shortening_threshold * 100.0,
+        }
+        outcome = "improved"
+    elif after_p50 > before_p50:
+        # Schema's Claim enum has no "regression" kind -- a regression is
+        # represented as a non_regression claim that FAILED (observation:
+        # regressed), not a distinct claim.kind value.
+        claim = {
+            "kind": "non_regression",
+            "metric": "provider_critical_path_p50_seconds",
+            "maximum_regression_pct": 0.0,
+        }
+        outcome = "regressed"
+    else:
+        claim = {
+            "kind": "absolute_budget",
+            "metric": "provider_critical_path_p50_seconds",
+            "maximum_value_ms": before_p50 * 1000.0,
+        }
+        outcome = "inconclusive"
+
+    def _cohort(job_role: str, p50: float, p95: float, run_details: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "job": f"e2e-provider-critical-path-{job_role}",
+            "p50_seconds": p50,
+            "p95_seconds": p95,
+            "run_ids": [str(rd["workflow_run_id"]) for rd in run_details],
+            "run_count": len(run_details),
+            "run_details": run_details,
+            "runner_image": cohort_provenance["runner_image"],
+            "workers": cohort_provenance["workers"],
+            "scheduler": cohort_provenance["scheduler"],
+            "command_manifest_digest": cohort_provenance["command_manifest_digest"],
+            "test_selection_digest": cohort_provenance["test_selection_digest"],
+        }
+
+    return {
+        "schema": "CI_TEST_PERFORMANCE_ASSESSMENT_V2",
+        "schema_version": 2,
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "measured_at": measured_at,
+        "claim": claim,
+        "performance_evidence": {
+            "status": "complete",
+            "runtime_delta": {
+                "mode": "comparative",
+                "before": _cohort("before", before_p50, before_p95, before_run_details),
+                "after": _cohort("after", after_p50, after_p95, after_run_details),
+                "delta": _recompute_delta(
+                    {"p50_seconds": before_p50, "p95_seconds": before_p95},
+                    {"p50_seconds": after_p50, "p95_seconds": after_p95},
+                ),
+                "outlier_exclusions": [],
+            },
+        },
+        "observation": {"outcome": outcome},
+        "claim_evaluation": {
+            "outcome": "satisfied" if outcome == "improved" and claim["kind"] == "improvement" else "not_applicable"
+        },
+        "functional_evidence": functional_evidence,
+        "declared_impact": declared_impact,
+        "risk_acknowledgement": risk_acknowledgement,
+    }
+
+
 def run_semantic_checks(
     assessment: dict[str, Any],
     ci_verdict_summary_path: str | None = None,
@@ -472,6 +765,7 @@ def run_semantic_checks(
         expected_artifact_digest,
     )
     _check_cohort_comparability(assessment["performance_evidence"], errors, blockers)
+    _check_percentile_recomputed_from_raw_samples(assessment, errors, blockers)
     _check_approval_gates(assessment, blockers)
 
     semantic_valid = len(errors) == 0
