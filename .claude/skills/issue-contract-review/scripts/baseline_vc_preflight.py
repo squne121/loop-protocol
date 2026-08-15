@@ -13,6 +13,7 @@ import os
 import json
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -754,64 +755,28 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
         run_env.update(env_delta)
 
     start = datetime.now()
+    process: Optional[subprocess.Popen] = None
     try:
-        # Issue #2165 P1-2 (OWNER 2026-08-15 REQUEST_CHANGES): a full
-        # `Popen(start_new_session=True)` + `killpg()` process-tree reaping
-        # rewrite was attempted here so a VC command's own grandchildren
-        # (not merely its direct child) are reaped on timeout, matching
-        # `reviewer_transport.py`'s own process-group reaping one layer up.
-        # That rewrite was REVERTED: it requires replacing this function's
-        # `subprocess.run(argv, ...)` call shape, which
-        # `.claude/skills/issue-contract-review/tests/test_pnpm_gate_security_boundary.py::
-        # test_producer_evidence_round_trips_to_triage` (an existing,
-        # pre-#2165 test OUTSIDE this Issue's Allowed Paths) monkeypatches
-        # directly (`monkeypatch.setattr(baseline.subprocess, "run",
-        # fake_run)`) and asserts is called with this exact signature.
-        # Reimplementing via `Popen`/`communicate()` bypasses that mock
-        # entirely and breaks that test. Per this Issue's Stop Conditions
-        # ("Allowed Paths 外の変更が必要と判明した場合"), full grandchild
-        # reaping at this specific layer is deferred to a follow-up Issue
-        # that can also update that test's mock target (or move it to
-        # patch `Popen`); see the PR description for detail. This
-        # per-VC-command execution therefore still only guarantees the
-        # DIRECT child is killed/reaped on timeout (Python's
-        # `subprocess.run(..., timeout=...)` behavior, unchanged from
-        # before #2165).
-        #
-        # PR #2177 OWNER 2026-08-15 REQUEST_CHANGES fix_delta iteration 2
-        # re-investigation (documented here rather than silently repeating
-        # the prior omission): a `subprocess.run(argv, ...,
-        # start_new_session=True)` call shape alone (keeping the literal
-        # `subprocess.run` call so the mock above still intercepts it) does
-        # NOT achieve process-group reaping either, because
-        # `subprocess.run()`'s own `TimeoutExpired` handling only has
-        # access to its internal `Popen` instance's direct-child `.kill()`
-        # -- it never exposes that instance's `pid`/`pgid` back to this
-        # caller, so there is no safe way to `os.killpg()` the group from
-        # here without capturing the child pid through a DIFFERENT channel.
-        # A `/proc`-based "diff of this process's children before/after
-        # spawn" workaround was also evaluated and REJECTED: `run_command()`
-        # is invoked concurrently through a `ThreadPoolExecutor` (see
-        # `args.max_workers > 1` below), so two VC commands can spawn within
-        # the same narrow diff window and a `/proc` diff can misattribute
-        # one VC's child pid to a DIFFERENT VC's timeout-triggered kill --
-        # an unsafe, racy "fix" for a security-relevant subprocess execution
-        # path is worse than the current, honestly-documented direct-child-
-        # only guarantee. Resolving this correctly requires either (a) a
-        # follow-up Issue with Allowed Paths extended to include
-        # `test_pnpm_gate_security_boundary.py` so `run_command()` can
-        # switch to `Popen`+`communicate(timeout=...)`+`killpg()` (the
-        # textbook-correct pattern for this) and that test's mock moved to
-        # patch `Popen` instead of `subprocess.run`, or (b) explicit OWNER
-        # authorization to touch that file within this PR. Neither is
-        # available within this Issue's Allowed Paths, so this specific
-        # merge condition (#5 / P1-2) remains UNRESOLVED in this PR; see the
-        # PR body Notes section for the same disclosure.
-        result = subprocess.run(
+        # Issue #2165 P1-2 (OWNER 2026-08-15 REQUEST_CHANGES merge condition
+        # #5, PR #2177 fix_delta iteration 3): the VC subprocess is now
+        # launched via `Popen(..., start_new_session=True)` instead of the
+        # previous `subprocess.run(..., timeout=...)`. Python's official
+        # `subprocess.run(timeout=...)` contract only guarantees killing the
+        # DIRECT child on timeout, not any grandchild the VC command itself
+        # may have spawned. `start_new_session=True` puts this subprocess in
+        # its own new session (pgid == pid), independent of any other
+        # concurrently-running VC subprocess spawned via the
+        # `ThreadPoolExecutor(max_workers>1)` bounded-parallel executor
+        # below (each Popen call creates its own session id -- there is no
+        # shared/global pgid state, so this is safe under concurrency by
+        # construction). On timeout, `_kill_process_group()` below signals
+        # the ENTIRE process group (this VC's direct child AND any
+        # grandchildren it spawned), not just the direct child.
+        process = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
             cwd=cwd,
             shell=False,
             env=run_env,
@@ -821,15 +786,69 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
             # (e.g. two `rg` invocations) may run concurrently under the
             # bounded-parallel executor.
             stdin=subprocess.DEVNULL,
+            start_new_session=True,
         )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            # Drain pipes after the group is dead so `communicate()` doesn't
+            # block indefinitely on an orphaned pipe write-end still held
+            # open by a reaped-but-not-yet-reclaimed grandchild.
+            try:
+                process.communicate(timeout=5)
+            except Exception:
+                pass
+            duration_ms = int((datetime.now() - start).total_seconds() * 1000)
+            return -1, "", "timeout", duration_ms, env_delta
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
-        return result.returncode, result.stdout, result.stderr, duration_ms, env_delta
+        return process.returncode, stdout, stderr, duration_ms, env_delta
     except subprocess.TimeoutExpired:
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
         return -1, "", "timeout", duration_ms, env_delta
     except Exception as e:
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
         return -1, "", str(e), duration_ms, env_delta
+
+
+def _kill_process_group(process: "subprocess.Popen") -> None:
+    """
+    Reap an entire process group spawned with `start_new_session=True`.
+
+    Issue #2165 P1-2 (OWNER merge condition #5): on VC subprocess timeout,
+    kill the WHOLE process group (direct child + any grandchildren it
+    spawned), not merely the direct child pid. `start_new_session=True`
+    guarantees `os.getpgid(process.pid) == process.pid` for this process
+    (it is its own session/group leader), so this only ever targets the
+    group this specific Popen call created -- never a shared/global group,
+    and never another concurrently-running VC subprocess's group.
+
+    SIGTERM first, then a bounded grace period, then SIGKILL if the group
+    hasn't exited. Best-effort: a process (or the whole group) that already
+    exited between the timeout firing and this call running is not an
+    error.
+    """
+    try:
+        pgid = os.getpgid(process.pid)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _pnpm_gate_evidence_for_command(command: str, cwd: str) -> Optional[Dict[str, Any]]:
