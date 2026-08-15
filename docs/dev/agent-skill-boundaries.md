@@ -2623,3 +2623,74 @@ Issue #1873 で `pr_review.publish` command id 自体および
 `PR_REVIEW_PUBLISH_MARKER_V1` / `PR_REVIEW_MARKER_ARCHIVE_RESULT_V1` schema は
 `docs/dev/schema-governance.md` の registry からも削除済み。過去に生成された marker file
 が repo 上に残存していても、本 skill lane はもはや参照・処理しない。）
+
+
+## `controlled_skill_mutation_exec.py` postcondition の metadata-snapshot 化と `.claude/.investigation-context.md` exemption（Issue #2163）
+
+### 背景
+
+`_check_no_tracked_changes`（postcondition checker）は、従来 mutation 実行後の
+`git status --porcelain=v1 --untracked-files=all` の 1 回のスナップショットだけを見て、
+`allowed_prefix`（`artifacts/{issue_number}/issue-metadata/{command_id}/`）配下を除く
+全ての staged/unstaged/untracked 行を無条件に violation として扱っていた（単純な
+「post 側 1 スナップショットの内容による set 判定」であり、実際には pre/post の**集合差分**
+すら取っていなかった）。この方式には 2 つの問題があった:
+
+1. **False positive**: mutation 実行前から repo に存在していた untracked ファイル
+   （`.claude/.investigation-context.md` 等）が、mutation と無関係に毎回 violation として
+   誤検知される。
+2. **False negative**: 逆に、mutation 実行前から存在した untracked/dirty ファイルの内容が
+   mutation の実行中に上書き・改変されても、`git status` の行としては pre-mutation と
+   post-mutation で同一に見えるため検出できない。
+
+### 修正内容（AC1）
+
+`_check_no_tracked_changes` を、`scripts/agent-guards/skill_runtime_exec.py` の
+`_snapshot_repo_paths` / `_find_unauthorized_repo_changes` に準ずる
+filesystem metadata snapshot（path -> (kind, mtime_ns, size)）比較方式へ置き換えた。
+`skill_runtime_exec.py` の実装と異なり、全 repo を `os.walk` で走査するのではなく、
+`git status` が返す候補パス集合（`allowed_prefix` 配下を除く staged/unstaged/untracked
+エントリ）に対してのみ `lstat()` を行う（`_snapshot_status_path_metadata`）。これにより
+`git status` の集合差分だけでは検出できなかった「候補として不変だが誤検知」
+「候補として存在するが内容改変」を区別しつつ、O(repo size) の全走査を避けている。
+
+呼び出し側は、mutation を開始する**前**に `_capture_pre_mutation_snapshot()` で
+pre-mutation snapshot を取得し、mutation 後の postcondition チェック
+（`_check_no_tracked_changes(..., before_snapshot=pre_mutation_snapshot)`）へ明示的に
+スレッドする。既存の 9 呼び出し箇所（`issue_scope_snapshot.materialize` /
+`issue_body.update` / `issue_content.update` / `issue_comment.publish` /
+`test_verdict.publish`（2 箇所）/ `contract_snapshot.publish` /
+`issue_dependency.remove` / `issue_relationship.update`）すべてがこの方式に統一されている。
+`issue_dependency.remove` と `issue_relationship.update` は、既存の precondition
+（`pre_mutation_changed` チェック、mutation 呼び出し直前に置かれている）と全く同じ地点で
+pre-mutation snapshot を取得することで、追加の `git status` 呼び出しを増やさずに
+両方の目的（precondition の集合チェックと postcondition の metadata 比較）を満たす。
+
+`before_snapshot=None`（未指定）の場合は、従来通り候補行を無条件に violation として扱う
+fail-closed な defensive fallback を維持している。
+
+### `.claude/.investigation-context.md` の調査結果と扱い（AC6）
+
+本 Issue の起票前調査、および実装時の再確認で、`rg -n "investigation-context"` は
+本 Issue によるコード追加以前は repo 内でゼロ件だった（producer/consumer の記述なし）。
+`.gitignore` にも未定義。`.claude/` 配下の固定パスに単一ファイルとして現れる
+グローバル untracked artifact であり、本 repo のどのスクリプトがこれを生成しているかを
+示す証跡は見つからなかった。最も可能性が高い生成元は Claude Code ツール本体（本 repo が
+制御できない外部プロセス）である。
+
+この判定に基づき、以下の 2 段構えの対応を行った:
+
+1. **一般対応（AC1 の metadata-snapshot 化）**: mutation の前後で内容
+   （mtime/size）が変化していない限り、そもそも violation として検出されなくなった。
+2. **明示的 exemption**: 1. だけでは、`.claude/.investigation-context.md` が
+   偶然この executor の mutation window 中に外部プロセスから触られた場合に
+   誤検知が残る可能性があるため、`skill_runtime_exec.py` の
+   race-tolerant-unattributable peer root（`_race_tolerant_unattributable_roots`）と
+   同じ考え方で、`_INVESTIGATION_CONTEXT_EXEMPT_REL`
+   （`.claude/.investigation-context.md`）を候補パス集合から明示的に除外した
+   （`_capture_pre_mutation_snapshot` / `_check_no_tracked_changes` の両方）。
+
+`.gitignore` にも `.claude/.investigation-context.md` を追加し、この既知の
+repo-uncontrollable な untracked artifact が `git status` のノイズとして
+恒常的に現れないようにした（根本原因の記録を `.gitignore` エントリだけに
+留めず、本セクションに残している）。

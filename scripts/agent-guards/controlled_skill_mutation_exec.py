@@ -861,15 +861,115 @@ def _post_gh_comment(issue_number: int, repo: str, body: str, gh_bin: str) -> tu
 
 # -- Postcondition check -------------------------------------------------------
 
+# Issue #2163: a global untracked singleton this repo has no producer/consumer
+# script for (`rg -n "investigation-context"` was zero hits across the repo
+# before this Issue). Its most plausible origin is the Claude Code tool runtime
+# itself (an external, repo-uncontrollable process -- see
+# `docs/dev/agent-skill-boundaries.md` for the recorded investigation and
+# decision), not any script this executor's mutations could have produced or
+# altered. It is therefore treated the same way `skill_runtime_exec.py` treats
+# its own race-tolerant-unattributable peer roots: excluded from the candidate
+# set outright, rather than relying solely on the metadata comparison below
+# (which would still fail closed if an unrelated concurrent process happened to
+# touch this file's mtime/size during this executor's own mutation window).
+_INVESTIGATION_CONTEXT_EXEMPT_REL = ".claude/.investigation-context.md"
 
-def _check_no_tracked_changes(project_root: Path, issue_number: int, allowed_prefix: str | None = None) -> list[str]:
+
+def _snapshot_status_path_metadata(
+    project_root: Path, paths: set[str]
+) -> dict[str, tuple[str, int, int] | None]:
+    """Stat each candidate path and return path -> (kind, mtime_ns, size), or None if absent.
+
+    Issue #2163: metadata-snapshot primitive conforming to
+    `scripts/agent-guards/skill_runtime_exec.py`'s `_snapshot_repo_paths` /
+    `_find_unauthorized_repo_changes` design (path -> (kind, mtime_ns, size)
+    comparison instead of a bare `git status` line set diff). Scoped to the
+    `git status` candidate paths (not a full repo walk) since those are the only
+    paths a `git status` set-diff could ever flag in the first place -- this
+    keeps the check O(changed files) rather than O(repo size) while still
+    correctly detecting in-place content changes to pre-existing
+    untracked/dirty files that a bare set diff would miss.
+    """
+    snapshot: dict[str, tuple[str, int, int] | None] = {}
+    for rel in paths:
+        try:
+            stat = (project_root / rel).lstat()
+        except OSError:
+            snapshot[rel] = None
+            continue
+        kind = "dir" if _stat.S_ISDIR(stat.st_mode) else "file"
+        snapshot[rel] = (kind, stat.st_mtime_ns, stat.st_size)
+    return snapshot
+
+
+def _capture_pre_mutation_snapshot(
+    project_root: Path, issue_number: int, allowed_prefix: str | None = None
+) -> dict[str, tuple[str, int, int] | None]:
+    """Capture the pre-mutation `git status` candidate set and their fs metadata.
+
+    Issue #2163: must be called before any local/remote mutation begins in each
+    `_run_*` command handler so `_check_no_tracked_changes` can later distinguish
+    a pre-existing untracked/dirty file whose content never changed (not a
+    violation -- AC2) from one that is newly created, removed, or overwritten
+    during this command's own mutation (violation -- AC3/AC4).
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(project_root), "status", "--porcelain=v1", "--untracked-files=all"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if out.returncode != 0:
+            return {}
+        if allowed_prefix is None:
+            allowed_prefix = f"artifacts/{issue_number}/"
+        candidates: set[str] = set()
+        for line in out.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            path = line[3:]
+            if path.startswith(allowed_prefix) or path == _INVESTIGATION_CONTEXT_EXEMPT_REL:
+                continue
+            candidates.add(path)
+        return _snapshot_status_path_metadata(project_root, candidates)
+    except Exception:
+        return {}
+
+
+def _check_no_tracked_changes(
+    project_root: Path,
+    issue_number: int,
+    allowed_prefix: str | None = None,
+    before_snapshot: dict[str, tuple[str, int, int] | None] | None = None,
+) -> list[str]:
     """Return list of violations (staged, unstaged, untracked source files). Empty = OK (AC14).
 
-    Uses git status --porcelain=v1 --untracked-files=all.
+    Uses git status --porcelain=v1 --untracked-files=all to enumerate candidate
+    changed paths, then (Issue #2163) compares each candidate's filesystem
+    metadata (kind, mtime_ns, size) against `before_snapshot` -- a pre-mutation
+    snapshot captured by `_capture_pre_mutation_snapshot` before this command's
+    own mutation began -- instead of treating bare presence in the post-mutation
+    `git status` output as sufficient evidence of a violation. This distinguishes:
+      - a pre-existing untracked/dirty file whose content never changed during
+        this command's mutation: NOT a violation (fixes the AC2 false positive
+        that the previous simple set-diff produced, e.g. for
+        `.claude/.investigation-context.md`).
+      - a pre-existing untracked/dirty file whose content WAS overwritten during
+        this command's mutation: still a violation (fixes the AC3 false negative
+        that the previous simple set-diff missed, since presence alone was
+        unconditionally treated as pre-existing == safe).
+      - any path newly created, removed-then-recreated, or otherwise not present
+        in `before_snapshot` (including a genuinely new tracked/untracked
+        change): still a violation (AC4 non-regression).
     Allows writes inside allowed_prefix. Defaults to artifacts/{issue_number}/.
     Issue #1284 Blocker 6: command ids pass a command-id-scoped prefix
     (artifacts/{issue_number}/issue-metadata/{command_id}/) so the postcondition
     cannot be satisfied by writes to a sibling command's namespace.
+
+    `before_snapshot=None` is a defensive fallback for any call site that has
+    not yet been threaded with a captured pre-mutation snapshot: every candidate
+    line is treated as a violation, matching the previous fail-closed behavior.
     """
     try:
         out = subprocess.run(
@@ -883,18 +983,28 @@ def _check_no_tracked_changes(project_root: Path, issue_number: int, allowed_pre
 
         if allowed_prefix is None:
             allowed_prefix = f"artifacts/{issue_number}/"
-        violations = []
+        candidates: dict[str, str] = {}
         for line in out.stdout.splitlines():
             if len(line) < 4:
                 continue
             xy = line[:2]
             path = line[3:]
             # Allow writes inside artifacts/{issue_number}/
-            if path.startswith(allowed_prefix):
+            if path.startswith(allowed_prefix) or path == _INVESTIGATION_CONTEXT_EXEMPT_REL:
                 continue
             # Block staged (xy[0] != ' ' and != '?'), unstaged (xy[1] != ' '),
             # untracked ('??')
             if xy.strip() or xy == "??":
+                candidates[path] = xy
+        if not candidates:
+            return []
+        if before_snapshot is None:
+            return [f"{xy}:{path}" for path, xy in sorted(candidates.items())]
+
+        after_snapshot = _snapshot_status_path_metadata(project_root, set(candidates))
+        violations = []
+        for path, xy in sorted(candidates.items()):
+            if before_snapshot.get(path) != after_snapshot.get(path):
                 violations.append(f"{xy}:{path}")
         return violations
     except Exception as exc:
@@ -1028,6 +1138,10 @@ def _run_issue_scope_snapshot_materialize(args, input_data, gh_bin, _fail, _ok) 
         return _fail("issue_scope_snapshot_materializer_module_shadowing")
     if args.dry_run:
         return _ok({"status_detail": "dry_run_ok"})
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
+    # Issue #2163: pre-mutation metadata snapshot captured before the
+    # materializer runs, threaded into the postcondition check below.
+    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
     try:
         from materialize_issue_scope_snapshot import materialize
 
@@ -1051,8 +1165,7 @@ def _run_issue_scope_snapshot_materialize(args, input_data, gh_bin, _fail, _ok) 
         )
     except Exception as exc:
         return _fail(f"issue_scope_snapshot_materialize_failed: {exc}", status="failed")
-    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
     if changed:
         return _fail("postcondition_tracked_changes_detected", changed, status="failed")
     return _ok({"materializer_result": result})
@@ -1083,6 +1196,10 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
         if args.output_json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
+
+    # Issue #2163: pre-mutation metadata snapshot captured before any remote
+    # PATCH is attempted, threaded into the postcondition check below.
+    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
 
     # -- Blocker 1: local marker is cache/audit only, never remote-mutation
     # authority. Marker metadata is checked for consistency, but success or
@@ -1149,12 +1266,13 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
 
     # -- AC14 / Blocker 6: postcondition -- no changes outside this command's
     # own write root (artifacts/{issue}/issue-metadata/issue_body.update/).
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
     if changed:
         return _fail(
             "postcondition_tracked_changes_detected",
             [f"changed: {f}" for f in changed[:20]],
             status="failed",
+            extra={"mutation_outcome": "applied"},
         )
 
     marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1194,6 +1312,10 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
         PROJECT_ROOT, args.issue_number, args.command_id, "issue_content_update.marker.json"
     )
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
+    # Issue #2163: pre-mutation metadata snapshot captured before any remote
+    # PATCH is attempted, threaded into _finalize_remote_success's postcondition
+    # check below.
+    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
 
     before, err = _fetch_issue_content(args.issue_number, args.repo, gh_bin)
     if before is None:
@@ -1234,7 +1356,7 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
             return f"issue_content_update_marker_write_failed: {exc}"
 
     def _finalize_remote_success(*, status_detail: str, body_sha256: str, patch_attempted: bool) -> int:
-        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
         if changed:
             return _fail(
                 "postcondition_tracked_changes_detected",
@@ -1352,6 +1474,10 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
+    # Issue #2163: pre-mutation metadata snapshot captured before any remote
+    # POST is attempted, threaded into the postcondition check below.
+    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+
     def _write_marker(comment_id, comment_url) -> None:
         marker_path.parent.mkdir(parents=True, exist_ok=True)
         marker_path.write_text(
@@ -1413,12 +1539,13 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
 
     # -- AC14 / Blocker 6: postcondition -- no changes outside this command's
     # own write root (artifacts/{issue}/issue-metadata/issue_comment.publish/).
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
     if changed:
         return _fail(
             "postcondition_tracked_changes_detected",
             [f"changed: {f}" for f in changed[:20]],
             status="failed",
+            extra={"mutation_outcome": "applied"},
         )
 
     _write_marker(readback.get("comment_id"), readback.get("comment_url"))
@@ -1944,6 +2071,9 @@ def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
         PROJECT_ROOT, args.issue_number, args.command_id, "test_verdict_publish.marker.json"
     )
     gh_env = _build_pr_review_gh_env()
+    # Issue #2163: pre-mutation metadata snapshot captured before any remote
+    # POST is attempted, threaded into the two postcondition checks below.
+    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
 
     def _write_marker(comment: dict) -> None:
         marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2055,7 +2185,7 @@ def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
                 f"published_but_stale: current_head={retry_head} expected_head={expected_head_sha}",
                 status="published_but_stale",
             )
-        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
         if changed:
             return _fail(
                 "postcondition_tracked_changes_detected", [f"changed: {f}" for f in changed[:20]], status="failed"
@@ -2110,7 +2240,7 @@ def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
             [f"posted_comment_id: {posted['id']}"],
             status="published_but_stale",
         )
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
     if changed:
         return _fail("postcondition_tracked_changes_detected", [f"changed: {f}" for f in changed[:20]], status="failed")
     _write_marker(comment)
@@ -2324,6 +2454,10 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
 
     artifact_dir = _issue_metadata_marker_path(PROJECT_ROOT, args.issue_number, args.command_id, "").parent
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
+    # Issue #2163: pre-mutation metadata snapshot captured before the
+    # ensure_contract_snapshot.py subprocess (which performs the remote POST)
+    # is launched, threaded into the postcondition check below.
+    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
     cmd = [
         sys.executable,
         str(publisher),
@@ -2393,7 +2527,7 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
 
     # -- AC14 / Blocker 6: postcondition -- no changes outside this command's
     # own write root (artifacts/{issue}/issue-metadata/contract_snapshot.publish/).
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
     if changed:
         return _fail(
             "postcondition_tracked_changes_detected",
@@ -2961,6 +3095,11 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
             status="precondition_rejected",
         )
 
+    # Issue #2163: pre-mutation metadata snapshot captured at this same point
+    # (immediately after the precondition above passes and before any remote
+    # mutation is attempted), threaded into the postcondition check below.
+    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+
     # -- Attempt marker (Issue #1667 review fix_delta P1): written BEFORE the
     # remote mutation call so any post-mutation failure (including an
     # interpreter crash) still leaves an audit trail proving the mutation
@@ -3084,7 +3223,7 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     # write root. Issue #1667 review fix_delta P1: classified as
     # postcondition_rejected (not the undefined "failed" status) -- the
     # closed result-status set for this command id never includes "failed".
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
     if changed:
         _write_marker(
             "postcondition_rejected",
@@ -3669,6 +3808,14 @@ def _run_issue_relationship_update(args, input_data, gh_bin, _fail, _ok) -> int:
             extra={"mutation_attempted": False, "before": before_snapshot, "desired": desired_snapshot},
         )
 
+    # Issue #2163: pre-mutation filesystem metadata snapshot captured at this
+    # same point (immediately after the precondition above passes and before
+    # any GraphQL mutation operation is executed), threaded into the
+    # postcondition check below. Named distinctly from `before_snapshot`
+    # (the native parent/blockedBy/blocking relationship state) to avoid
+    # confusion between the two unrelated "before" concepts.
+    pre_mutation_fs_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+
     operations: list[dict] = []
     if not parent_noop:
         if parent_action["action"] == "remove" and current_parent_number is not None:
@@ -3772,7 +3919,7 @@ def _run_issue_relationship_update(args, input_data, gh_bin, _fail, _ok) -> int:
             },
         )
 
-    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root)
+    changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_fs_snapshot)
     if changed:
         return _fail(
             "postcondition_tracked_changes_detected",

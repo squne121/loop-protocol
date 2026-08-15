@@ -32,11 +32,13 @@ Tests:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -46,7 +48,11 @@ if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
 import controlled_skill_mutation_exec as _exec
-from controlled_skill_mutation_policy import TRUSTED_REPO, COMMAND_ID_ISSUE_COMMENT_PUBLISH
+from controlled_skill_mutation_policy import (
+    TRUSTED_REPO,
+    COMMAND_ID_ISSUE_BODY_UPDATE,
+    COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+)
 
 
 # =============================================================================
@@ -385,6 +391,162 @@ class TestPostconditionExtended:
         allowed_prefix = f"artifacts/1166/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/"
         violations = _exec._check_no_tracked_changes(tmp_project, 1166, allowed_prefix)
         assert any("issue_body.update/unexpected.json" in v for v in violations)
+
+    # -- Issue #2163: metadata-snapshot postcondition comparison -------------
+
+    def test_postcondition_ignores_preexisting_untracked_file_no_content_change(self, tmp_project):
+        """AC2: an untracked file that already existed before the mutation began,
+        and whose content is unchanged during the mutation, must NOT be reported
+        as postcondition_tracked_changes_detected (false positive fix -- the
+        previous bare `git status` line set diff could not distinguish this from
+        a genuinely new/changed file since the file is untracked either way)."""
+        preexisting = tmp_project / "investigation_style_artifact.md"
+        preexisting.write_text("unchanged content")
+        write_root = "artifacts/1166/"
+        pre_snapshot = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
+        assert "investigation_style_artifact.md" in pre_snapshot
+
+        # Nothing touches the file during the (simulated) mutation.
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, pre_snapshot)
+        assert not any("investigation_style_artifact.md" in v for v in violations)
+
+    def test_postcondition_detects_content_change_to_preexisting_file(self, tmp_project):
+        """AC3: an untracked file that already existed before the mutation began,
+        but whose content WAS overwritten during the mutation, must still be
+        reported as postcondition_tracked_changes_detected (false negative fix --
+        the previous simple set-diff treated any pre-existing `git status` line
+        as unconditionally safe, regardless of whether its content actually
+        changed during this command's own mutation)."""
+        preexisting = tmp_project / "preexisting_overwritten.md"
+        preexisting.write_text("original content")
+        write_root = "artifacts/1166/"
+        pre_snapshot = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
+        assert "preexisting_overwritten.md" in pre_snapshot
+
+        # Simulate the mutation overwriting the pre-existing file's content
+        # in place (different size -- and, on most filesystems, different
+        # mtime_ns -- from the pre-mutation snapshot).
+        preexisting.write_text("overwritten content with a very different length")
+
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, pre_snapshot)
+        assert any("preexisting_overwritten.md" in v for v in violations)
+
+    def test_postcondition_detects_new_untracked_or_tracked_change(self, tmp_project):
+        """AC4 (non-regression): a new untracked file created during the
+        mutation (outside allowed_prefix) is still detected as a violation
+        under the new metadata-snapshot comparison, matching the previous
+        fail-closed behavior for genuinely new changes."""
+        write_root = "artifacts/1166/"
+        pre_snapshot = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
+        assert pre_snapshot == {}
+
+        (tmp_project / "new_during_mutation.md").write_text("created during the mutation")
+
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, pre_snapshot)
+        assert any("new_during_mutation.md" in v for v in violations)
+
+
+# =============================================================================
+# Issue #2163 AC5: issue_body.update / issue_comment.publish postcondition
+# failure must report mutation_outcome so callers can distinguish "remote
+# mutation succeeded but local postcondition failed" from a mutation that was
+# never attempted (precondition reject). Design reference:
+# `issue_content.update`'s existing `_finalize_remote_success` closure.
+# =============================================================================
+
+
+def _capture_fail_ok():
+    calls: dict = {}
+
+    def _fail(reason, errors=None, status="error", extra=None):
+        calls["reason"] = reason
+        calls["errors"] = errors
+        calls["status"] = status
+        calls["extra"] = extra
+        return 1
+
+    def _ok(extra):
+        calls["ok_extra"] = extra
+        return 0
+
+    return _fail, _ok, calls
+
+
+class TestMutationOutcomeOnPostconditionFailure:
+    def test_issue_body_update_postcondition_failure_reports_mutation_outcome(self, tmp_project, monkeypatch):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        old_body = "old body"
+        new_body = "new body"
+        old_body_sha256 = "sha256:" + hashlib.sha256(old_body.encode("utf-8")).hexdigest()
+        new_body_sha256 = "sha256:" + hashlib.sha256(new_body.encode("utf-8")).hexdigest()
+
+        readback_calls = {"count": 0}
+
+        def fake_fetch(issue_number, repo, gh_bin):
+            readback_calls["count"] += 1
+            if readback_calls["count"] == 1:
+                return old_body, "t1", ""
+            return new_body, "t2", ""
+
+        monkeypatch.setattr(_exec, "_fetch_issue_body_and_updated_at", fake_fetch)
+        monkeypatch.setattr(_exec, "_patch_issue_body", lambda *a, **k: "")
+        monkeypatch.setattr(_exec, "_check_no_tracked_changes", lambda *a, **k: ["??:unexpected_leftover.txt"])
+
+        args = SimpleNamespace(
+            issue_number=1166,
+            command_id=COMMAND_ID_ISSUE_BODY_UPDATE,
+            repo=TRUSTED_REPO,
+            dry_run=False,
+            output_json=False,
+        )
+        input_data = {
+            "previous_body_sha256": old_body_sha256,
+            "previous_updated_at": "t1",
+            "new_body": new_body,
+            "new_body_sha256": new_body_sha256,
+        }
+        _fail, _ok, calls = _capture_fail_ok()
+
+        rc = _exec._run_issue_body_update(args, input_data, "gh", _fail, _ok)
+
+        assert rc == 1
+        assert calls["reason"] == "postcondition_tracked_changes_detected"
+        assert calls["extra"] == {"mutation_outcome": "applied"}
+
+    def test_issue_comment_publish_postcondition_failure_reports_mutation_outcome(self, tmp_project, monkeypatch):
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        comment_body = "status update <!-- marker-1166 -->"
+        marker = "<!-- marker-1166 -->"
+        expected_body_sha256 = hashlib.sha256(comment_body.encode()).hexdigest()
+
+        monkeypatch.setattr(_exec, "_find_marker_matches", lambda *a, **k: ([], ""))
+        monkeypatch.setattr(_exec, "_post_gh_comment", lambda *a, **k: ("https://example/comment/1", "1", ""))
+        monkeypatch.setattr(
+            _exec,
+            "_readback_by_marker_literal",
+            lambda *a, **k: {
+                "comment_id": "1",
+                "comment_url": "https://example/comment/1",
+                "body_sha256": expected_body_sha256,
+            },
+        )
+        monkeypatch.setattr(_exec, "_check_no_tracked_changes", lambda *a, **k: ["??:unexpected_leftover.txt"])
+
+        args = SimpleNamespace(
+            issue_number=1166,
+            command_id=COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+            repo=TRUSTED_REPO,
+            dry_run=False,
+            output_json=False,
+        )
+        input_data = {"comment_body": comment_body, "marker": marker}
+        _fail, _ok, calls = _capture_fail_ok()
+
+        rc = _exec._run_issue_comment_publish(args, "", input_data, "gh", _fail, _ok)
+
+        assert rc == 1
+        assert calls["reason"] == "postcondition_tracked_changes_detected"
+        assert calls["extra"] == {"mutation_outcome": "applied"}
 
 
 # =============================================================================
