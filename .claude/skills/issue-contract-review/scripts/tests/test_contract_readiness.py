@@ -1487,3 +1487,117 @@ def test_readiness_baseline_expect_pass_unexpected_pass_is_go():
     errors, aggregate = map_preflight_result_to_errors(preflight)
     # With baseline_expect=pass, unexpected_pass should map to go
     assert aggregate == "go", f"Expected go but got {aggregate}"
+
+
+def test_implementation_missing_rva_is_exactly_one_rva002_even_with_runtime_only_marker():
+    """AC1/AC2: implementation RVA absence is a single deterministic readiness error."""
+    body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: none
+goal_ref: test
+change_kind: code
+```
+
+## Outcome
+
+RVA section absence is rejected.
+
+## Acceptance Criteria
+
+- [ ] AC1: readiness rejects the missing section
+
+## Verification Commands
+
+```bash
+# runtime_only
+$ test -f .claude/skills/issue-contract-review/scripts/contract_readiness_check.py # AC1
+```
+
+## Allowed Paths
+
+- .claude/skills/issue-contract-review/scripts/contract_readiness_check.py
+
+## Stop Conditions
+
+- stop
+"""
+    data, exit_code = run_readiness_with_body(body)
+
+    rva002_errors = [error for error in data["errors"] if error["rule_id"] == "RVA002"]
+    assert data["status"] == "needs_fix"
+    assert exit_code == 1
+    assert len(rva002_errors) == 1
+    assert rva002_errors[0] == {
+        "rule_id": "RVA002",
+        "severity": "error",
+        "source_check": "contract_readiness_check",
+        "category": "rva_section_missing",
+        "section": "Runtime Verification Applicability",
+        "line_start": 0,
+        "line_end": 0,
+        "minimal_context": ["Runtime Verification Applicability section is missing."],
+        "fix_hint": (
+            "Add the Runtime Verification Applicability section and explicitly choose "
+            "not_applicable, immediate, or deferred. Do not infer the decision."
+        ),
+        "autofixable": False,
+    }
+
+    without_runtime_only = body.replace("# runtime_only\n", "")
+    data_without_marker, exit_code_without_marker = run_readiness_with_body(without_runtime_only)
+    assert data_without_marker["status"] == "needs_fix"
+    assert exit_code_without_marker == 1
+    assert [
+        error for error in data_without_marker["errors"] if error["rule_id"] == "RVA002"
+    ] == rva002_errors
+
+
+def test_rva_heading_parser_ignores_fences_and_accepts_gfm_variants():
+    """AC3/AC5: only a top-level shared-policy RVA heading satisfies readiness."""
+    body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+```
+
+```markdown
+## Runtime Verification Applicability
+- decision: immediate
+```
+
+  ## Runtime Verification Applicability ###
+
+- decision: not_applicable
+- reason: static parser test
+"""
+    from contract_readiness_check import check_rva_immediate_fields
+
+    assert check_rva_immediate_fields(body) == []
+
+
+def test_rva_immediate_preserves_rva001_for_missing_immediate_fields():
+    """AC4: a present immediate section delegates incomplete fields to RVA001."""
+    body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+```
+
+## Runtime Verification Applicability
+
+- decision: immediate
+- applicable_acs: [AC1]
+"""
+    from contract_readiness_check import check_rva_immediate_fields
+
+    errors = check_rva_immediate_fields(body)
+    assert errors
+    assert {error["rule_id"] for error in errors} == {"RVA001"}

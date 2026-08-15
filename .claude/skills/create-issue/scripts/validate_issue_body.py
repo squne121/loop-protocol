@@ -686,7 +686,11 @@ def _validate_lp015_baseline_vc_heading_only(body: str) -> list[ValidationError]
     return []
 
 
-def _validate_lp020_runtime_verification_incomplete(body: str) -> list[ValidationError]:
+def _validate_lp020_runtime_verification_incomplete(
+    body: str,
+    *,
+    require_reason: bool = False,
+) -> list[ValidationError]:
     """LP020: Detect incomplete Runtime Verification Applicability."""
     section_info = _extract_section(body, "Runtime Verification Applicability")
     if not section_info:
@@ -708,6 +712,21 @@ def _validate_lp020_runtime_verification_incomplete(body: str) -> list[Validatio
             minimal_context=context,
             context_truncated=trunc,
             fix_hint="Add 'decision: not_applicable|immediate|deferred' to section.",
+            autofixable=False
+        )]
+
+    if require_reason and not re.search(r'^\s*-?\s*reason:\s*\S+', content, re.MULTILINE):
+        context, trunc = _get_context_lines(body, start_line, end_line)
+        return [ValidationError(
+            rule_id="LP020",
+            severity="error",
+            section="Runtime Verification Applicability",
+            line_start=start_line,
+            line_end=end_line,
+            message="Runtime Verification Applicability must include a non-empty 'reason' field",
+            minimal_context=context,
+            context_truncated=trunc,
+            fix_hint="Add a concrete 'reason: ...' for the selected decision.",
             autofixable=False
         )]
 
@@ -1192,7 +1211,12 @@ def validate_issue_body(
     all_errors.extend(_validate_lp018_vc_preflight_scope_value(body))
     all_errors.extend(_validate_lp019_vc_preflight_scope_attached(body))
     all_errors.extend(_validate_lp017_stop_conditions_incomplete(body, kind=effective_kind))
-    all_errors.extend(_validate_lp020_runtime_verification_incomplete(body))
+    all_errors.extend(
+        _validate_lp020_runtime_verification_incomplete(
+            body,
+            require_reason=effective_kind == "implementation",
+        )
+    )
     all_errors.extend(_validate_lp030_forbidden_authoring_doc_path(body))
 
     # LP031 title prefix check: use MRC issue_kind when CLI --kind is absent,

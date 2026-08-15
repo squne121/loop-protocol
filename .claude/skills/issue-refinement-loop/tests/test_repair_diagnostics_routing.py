@@ -854,8 +854,7 @@ _ISSUE_2013_FIXTURE_JSON = (
     r""" on whether to correct the Issue body (out of this worker's Allowed Paths) -- the test fun"""
     r"""ction name itself is left unchanged because it is fixed by Issue #2016's own canonical Ver"""
     r"""ification Commands section (AC7).",
-  "captured_body_sha256": "sha256:8a5641c90c38962f0e73"""
-    r"""a141b77c5e205c11e7aaedd05437fa360dbcfcd8126b",
+  "captured_body_sha256": "sha256:5d4e280132980296bc56b76187c06f3639c761c4fd0b750b86235911bbb68251",
   "expected_repair_kinds": [
     "insert_ba"""
     r"""seline_expect_fail"
@@ -869,7 +868,9 @@ _ISSUE_2013_FIXTURE_JSON = (
     r"""mplementation\nparent_issue: \"none\"\n```\n\n## Parent Issue\n\nなし（単独改善）\n\n## Pa"""
     r"""rent Goal Ref\n\n- Goal: none (standalone fixture)\n- Desired Destination: none (standalon"""
     r"""e fixture)\n\n## Current Validated Scope\n\n- docs/dev/issue-899-baseline-expect-regressio"""
-    r"""n.md を追加する\n\n## Remaining Parent Gaps\n\nなし\n\n## Required Skills\n\n- なし\n\n## """
+    r"""n.md を追加する\n\n## Remaining Parent Gaps\n\nなし\n\n## Runtime Verificatio"""
+    r"""n Applicability\n\ndecision: not_applicable\nreason: 静的検証のみで完結するため\n\n"""
+    r"""## Required Skills\n\n- なし\n\n## """
     r"""Outcome\n\nAdd docs/dev/issue-899-baseline-expect-regression.md documenting the\nbaseline_"""
     r"""vc_preflight.py --strict flag's annotation-missing VC handling.\n\n## In Scope\n\n- docs/d"""
     r"""ev/issue-899-baseline-expect-regression.md\n\n## Out of Scope\n\n- Everything else.\n\n## """

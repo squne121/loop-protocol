@@ -291,6 +291,19 @@ class TestNewSubAgentAbsence:
         )
 
 
+class TestLiveBodyRvaFallback:
+    """AC8: stale review telemetry cannot bypass the V1 live-body RVA guard."""
+
+    def test_missing_rva_stops_from_live_body_without_snapshot_substitution(self):
+        content = SKILL_FILE.read_text(encoding="utf-8")
+        start = content.index("### 2.5. Runtime Verification Applicability")
+        end = content.index("### 3. TDD + BDD")
+        section = content[start:end]
+        assert "live Issue body" in section
+        assert "contract snapshot" in section
+        assert "実装を開始せず" in section
+
+
 class TestExpectedHeadShaRequired:
     """AC6 / AC4: expected_head_sha required behavior for update_branch."""
 
