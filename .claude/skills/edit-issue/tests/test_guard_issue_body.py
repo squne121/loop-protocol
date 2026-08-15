@@ -287,6 +287,13 @@ goal_ref: "テスト用"
 change_kind: code
 ```
 
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
+
 ## Parent Issue
 
 none
@@ -649,6 +656,13 @@ contract_schema_version: v1
 issue_kind: implementation
 ```
 
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
+
 ## Acceptance Criteria
 
 - [ ] AC1 テスト1
@@ -688,6 +702,13 @@ pnpm test
 contract_schema_version: v1
 issue_kind: implementation
 ```
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
 
 ## Acceptance Criteria
 
@@ -774,6 +795,13 @@ contract_schema_version: v1
 issue_kind: implementation
 ```
 
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
+
 ## Machine-Readable Contract
 
 （MRC セクションに yaml ブロックなし）
@@ -811,6 +839,13 @@ class TestGuardTemplateFinding4:
 contract_schema_version: v1
 issue_kind: implementation
 ```
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
 
 ## Parent Issue
 
@@ -903,6 +938,13 @@ contract_schema_version: v1
 issue_kind: implementation
 ```
 
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
+
 ## Acceptance Criteria
 
 - [ ] AC1 テスト1
@@ -930,6 +972,13 @@ pnpm test --watch
 contract_schema_version: v1
 issue_kind: implementation
 ```
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
 
 ## Acceptance Criteria
 
@@ -970,6 +1019,13 @@ contract_schema_version: v1
 issue_kind: implementation
 ```
 
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
+
 ## Acceptance Criteria
 
 - [ ] AC1 テスト1
@@ -995,6 +1051,13 @@ pnpm test
 contract_schema_version: v1
 issue_kind: implementation
 ```
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
 
 ## Acceptance Criteria
 

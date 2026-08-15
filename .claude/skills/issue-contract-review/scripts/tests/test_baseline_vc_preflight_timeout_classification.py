@@ -147,6 +147,16 @@ $ uv run --locked pytest {_TIMEOUT_NODE_ID} -q
 - Allowed Paths 外の変更が必要と判明した場合
 - In Scope の固定契約の変更が必要になった場合
 - 新規 Issue の起票が必要と判断した場合
+
+## Runtime Verification Applicability
+
+```yaml
+decision: not_applicable
+reason: >
+  RVA section was missing in fixture and caused false-positive failure.
+  This contract uses this VC only to validate baseline timeout false-positive
+  classification and does not require runtime verification.
+```
 """
 
 

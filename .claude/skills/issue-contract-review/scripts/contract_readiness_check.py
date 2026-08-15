@@ -59,7 +59,13 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from baseline_vc_preflight import extract_verification_commands_section  # noqa: E402
 from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
-from prose_boundary_policy import HEADING_POLICY  # noqa: E402
+from prose_boundary_policy import (  # noqa: E402
+    BLOCK_KIND_CODE_FENCE,
+    HEADING_POLICY,
+    iter_markdown_blocks,
+    lookup_heading_policy,
+    parse_atx_heading_line,
+)
 
 # Required fields for `decision: immediate` in Runtime Verification Applicability section
 _RVA_IMMEDIATE_REQUIRED_FIELDS = [
@@ -791,8 +797,58 @@ def _default_fix_hint(category: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# AC4: Runtime Verification Applicability immediate field check
+# AC4: Runtime Verification Applicability checks
 # ---------------------------------------------------------------------------
+
+
+def _fenced_line_indices(body: str) -> set[int]:
+    """Return zero-based line indexes owned by fenced blocks using the shared policy."""
+    indices: set[int] = set()
+    line_index = 0
+    for block_text, block_kind in iter_markdown_blocks(body):
+        line_count = len(block_text.splitlines(keepends=True))
+        if block_kind == BLOCK_KIND_CODE_FENCE:
+            indices.update(range(line_index, line_index + line_count))
+        line_index += line_count
+    return indices
+
+
+def _extract_rva_section(body: str) -> tuple[str, int, int] | None:
+    """Extract the top-level RVA section with the shared GFM heading policy.
+
+    Fenced examples cannot satisfy or terminate the section.  The accepted
+    heading forms, indentation, and closing-hash handling are delegated to
+    prose_boundary_policy rather than reproduced with a body-wide regex.
+    """
+    lines = body.splitlines(keepends=True)
+    fenced = _fenced_line_indices(body)
+
+    for start_index, line in enumerate(lines):
+        if start_index in fenced:
+            continue
+        heading = parse_atx_heading_line(line.rstrip("\r\n"))
+        if heading is None or heading["level"] != 2:
+            continue
+        policy = lookup_heading_policy(heading["text"])
+        if not policy or policy.get("canonical_en") != "Runtime Verification Applicability":
+            continue
+
+        end_index = len(lines)
+        for index in range(start_index + 1, len(lines)):
+            if index in fenced:
+                continue
+            boundary = parse_atx_heading_line(lines[index].rstrip("\r\n"))
+            if boundary is not None and boundary["level"] == 2:
+                end_index = index
+                break
+        return "".join(lines[start_index + 1:end_index]), start_index + 1, end_index
+    return None
+
+
+def _is_canonical_implementation_issue(body: str) -> bool:
+    """Use the shared MRC parser; malformed contracts cannot imply an issue kind."""
+    contract = parse_machine_readable_contract(body)
+    return contract.ok and contract.get("issue_kind") == "implementation"
 
 
 def check_rva_immediate_fields(body: str) -> list[dict]:
@@ -807,18 +863,29 @@ def check_rva_immediate_fields(body: str) -> list[dict]:
     """
     errors: list[dict] = []
 
-    rva_match = re.search(
-        r"^##\s+Runtime Verification Applicability\s*$(.+?)(?=^##|\Z)",
-        body,
-        re.MULTILINE | re.DOTALL,
-    )
-    if not rva_match:
-        return []
+    section = _extract_rva_section(body)
+    if section is None:
+        if not _is_canonical_implementation_issue(body):
+            return []
+        return [
+            {
+                "rule_id": "RVA002",
+                "severity": "error",
+                "source_check": "contract_readiness_check",
+                "category": "rva_section_missing",
+                "section": "Runtime Verification Applicability",
+                "line_start": 0,
+                "line_end": 0,
+                "minimal_context": ["Runtime Verification Applicability section is missing."],
+                "fix_hint": (
+                    "Add the Runtime Verification Applicability section and explicitly choose "
+                    "not_applicable, immediate, or deferred. Do not infer the decision."
+                ),
+                "autofixable": False,
+            }
+        ]
 
-    section_content = rva_match.group(1)
-    section_start_line = body[: rva_match.start()].count("\n") + 1
-
-    # Only check when decision: immediate
+    section_content, section_start_line, section_end_line = section
     if not re.search(r"decision:\s*immediate", section_content, re.IGNORECASE):
         return []
 
@@ -846,7 +913,7 @@ def check_rva_immediate_fields(body: str) -> list[dict]:
                 "category": "rva_immediate_field_missing",
                 "section": "Runtime Verification Applicability",
                 "line_start": section_start_line,
-                "line_end": section_start_line + section_content.count("\n"),
+                "line_end": section_end_line,
                 "minimal_context": context_lines,
                 "fix_hint": (
                     f"Add '{field}' field to Runtime Verification Applicability section. "
