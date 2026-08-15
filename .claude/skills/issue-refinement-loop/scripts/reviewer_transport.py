@@ -49,9 +49,114 @@ ATTEMPT_SCHEMA = "REVIEWER_ATTEMPT_RESULT_V1"
 MANIFEST_SCHEMA = "REVIEWER_ATTEMPT_MANIFEST_V1"
 ARTIFACT_SCHEMA = "REVIEWER_COMPACT_ARTIFACT_V2"
 MAX_ATTEMPTS = 3
-PER_ATTEMPT_DEADLINE_SECONDS = 90
-TOTAL_DEADLINE_SECONDS = 240
+# Issue #2165 (OWNER 2026-08-15 REQUEST_CHANGES, P1-1): these two constants
+# previously assumed every attempt's wall time was governed only by
+# transport-level concerns (spawn/signal/hang detection). In production the
+# `deterministic` backend's single child process
+# (`run_root_review_pipeline.py run-checker-attempt`) also executes the
+# real checker chain synchronously inside that same attempt window --
+# `check_issue_contract.py` -> `contract_readiness_check.py` (dominated by
+# `baseline_vc_preflight.py` actually *running* every Verification Command
+# in the reviewed Issue body) -> `merge_readiness`. The old
+# PER_ATTEMPT_DEADLINE_SECONDS=90 could not fit even the single dominant VC
+# call, so any Issue with a legitimately long-running VC deterministically
+# timed out on every attempt; a later fix (PER_ATTEMPT=300/TOTAL=340) still
+# undershot the layered ceiling those three subprocess calls' OWN
+# independently-derived timeouts add up to (30 + 250 + 30 = 310 > 300).
+#
+# These module-level constants are now only a GENERIC FALLBACK for callers
+# that do not pass an explicit `per_attempt_deadline`/`total_deadline`.
+# `run_root_review_pipeline.py`'s `_cmd_produce()` (the deterministic
+# backend's actual caller) derives and passes its OWN explicit values from
+# `contract_readiness_check.CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS` (which
+# itself derives from `baseline_vc_preflight.py`'s per-VC-command cap, see
+# that module's Issue #2165 comments) plus the sibling
+# `check_issue_contract`/`merge_readiness` budgets and a process-spawn
+# margin, so the SAME arithmetic-break class of bug cannot recur here
+# independently of the value chosen below. The fallback values below are
+# kept generously above the pre-#2165-fix layered ceiling (310s) so a
+# caller that forgets to pass explicit deadlines still fails safe rather
+# than reintroducing the original bug.
+#
+# Retry policy (OWNER 2026-08-14/2026-08-15 review): resubmitting the SAME
+# deterministic checker command against the SAME pinned Issue body cannot
+# change the outcome of a `timeout` classification -- the VC itself is what
+# is over budget, not the process spawn/IPC layer -- so `retry_matrix()`
+# below excludes `timeout` from the deterministic backend's retryable set
+# (P1-3: the deterministic backend's retryable set is now a closed
+# allowlist of transport-layer-only reason codes -- `spawn_failure`,
+# `signal`, `capture_failure` -- not "every reason_code except timeout").
+# This means the deterministic backend effectively gets ONE full-length
+# attempt for a VC-execution-budget failure. Other backends
+# (`claude`/`codex`) keep retrying on timeout, since an LLM session hang is
+# plausibly transient in a way a deterministic subprocess budget overrun is
+# not.
+#
+# TOTAL_DEADLINE_SECONDS stays >= PER_ATTEMPT_DEADLINE_SECONDS (+40s margin)
+# so a single full-length attempt is never starved of its own per-attempt
+# budget by `min(per_attempt_deadline, total_deadline - elapsed)`; the
+# margin covers a small number of fast (`spawn_failure` etc.) retries that
+# remain possible for other reason codes, bounded further by
+# `MIN_RETRY_ATTEMPT_BUDGET_FRACTION` below (P1-1 marge condition 8): a
+# retry is never spawned once the time remaining before `total_deadline`
+# drops below that fraction of the PER-ATTEMPT budget.
+PER_ATTEMPT_DEADLINE_SECONDS = 480
+TOTAL_DEADLINE_SECONDS = 520
+# Issue #2165 P1-1 marge condition 8: the minimum time budget that must
+# remain before `total_deadline`, expressed as a FRACTION of
+# `per_attempt_deadline` (not an absolute constant), for a NEW (2nd/3rd)
+# attempt to be spawned at all -- covers process spawn + a minimal useful
+# execution slice + cleanup. A fraction (rather than a fixed number of
+# seconds) scales correctly across very different `per_attempt_deadline`
+# magnitudes: the deterministic backend's real ~480s per-attempt budget
+# needs tens of seconds of headroom to be worth retrying, while a
+# short-deadline caller (e.g. a test using a 1s per-attempt budget) needs
+# only a proportionally small headroom, not the same fixed floor. If the
+# remaining total-deadline budget is smaller than this fraction of the
+# per-attempt budget, spawning another attempt could not possibly complete
+# real work, so `run_reviewer_transport()` stops retrying instead of
+# unconditionally spawning a bounded-to-fail attempt.
+MIN_RETRY_ATTEMPT_BUDGET_FRACTION = 0.1
 STDOUT_CAP = 65_536
+# Issue #2165 merge condition #8 (PR #2177 OWNER 2026-08-15 REQUEST_CHANGES,
+# fix_delta iteration 2): `has_sufficient_retry_attempt_budget()` is the
+# SINGLE, backend-agnostic budget check that gates spawning ANY new attempt
+# (2nd/3rd, of ANY backend -- deterministic, claude, codex, fixture) after
+# the first. `run_reviewer_transport()`'s own attempt loop already applies
+# this uniformly regardless of `backend` (there is no `if backend ==
+# "deterministic"` branch around the check itself -- only `retry_matrix()`'s
+# retryable-reason-code allowlist differs per backend). The gap this
+# iteration closes is a SEPARATE, OUTER retry layer:
+# `run_root_review_pipeline.py`'s `retry_once_on_transport_failure()`, which
+# previously retried `invoke_child()` unconditionally exactly once on a
+# transport failure with NO remaining-budget awareness at all (a different
+# retry loop from this module's `run_reviewer_transport()` attempt loop,
+# and it had no way to reject a retry regardless of how little
+# total-deadline budget remained). This helper is exported so that other
+# in-process retry callers (in Allowed Paths) share the SAME guard rather
+# than a second, independently hand-picked policy.
+def has_sufficient_retry_attempt_budget(
+    *,
+    elapsed_seconds: float,
+    total_deadline_seconds: float,
+    per_attempt_deadline_seconds: float,
+    min_fraction: float = MIN_RETRY_ATTEMPT_BUDGET_FRACTION,
+) -> bool:
+    """Return whether a NEW attempt (of any backend) is worth spawning.
+
+    ``False`` when the time remaining before ``total_deadline_seconds`` is
+    smaller than ``min_fraction * per_attempt_deadline_seconds`` -- too
+    small for a new attempt to realistically spawn, do minimal useful work,
+    and clean up. Callers MUST NOT spawn a new attempt when this returns
+    ``False``, regardless of backend: a non-deterministic (claude/codex)
+    backend attempt has no better chance of completing useful work in a
+    near-zero remaining budget than a deterministic one does.
+    """
+    remaining_seconds = total_deadline_seconds - elapsed_seconds
+    return remaining_seconds >= per_attempt_deadline_seconds * min_fraction
+
+
+
 STDERR_CAP = 262_144
 ARTIFACT_MAX_BYTES = 1_048_576
 READER_JOIN_GRACE_SECONDS = 5
@@ -333,9 +438,35 @@ class RetryIntent:
     session_id: str | None
 
 
+# Issue #2165 P1-3 (OWNER 2026-08-15 REQUEST_CHANGES): for the
+# `deterministic` backend, retrying a checker attempt only makes sense for
+# a failure_class that is plausibly TRANSIENT for the exact same argv
+# against the exact same pinned Issue body -- process spawn failing to
+# launch, this process itself being killed by a signal, or this module's
+# own bounded pipe-reader thread failing to observe EOF in time
+# (`capture_failure`; a real signal/hang class, not a data-shape problem).
+# A CLOSED allowlist (not "every reason_code except timeout") because the
+# previous "subtract timeout/inner_timeout from everything" design left
+# `nonzero_exit` / `malformed_output` / `empty_output` /
+# `artifact_validation_failure` retryable for `deterministic` even though
+# none of those can change on retry: the checker chain deterministically
+# re-derives the identical output from the identical pinned body, so
+# retrying only adds load/latency without raising the success probability.
+_DETERMINISTIC_RETRYABLE_REASON_CODES = frozenset({"spawn_failure", "signal", "capture_failure"})
+
+
 def retry_matrix(*, backend: str, initial_session_id: str | None, attempt: int, reason_code: str) -> RetryIntent | None:
-    """Closed three-attempt matrix; no implicit fourth or fallback path."""
-    if attempt >= MAX_ATTEMPTS or reason_code not in {
+    """Closed three-attempt matrix; no implicit fourth or fallback path.
+
+    Issue #2165 P1-3: for `backend == "deterministic"` (the checker-pipeline
+    child spawned by `run_root_review_pipeline.py`'s `run-checker-attempt`),
+    the retryable set is `_DETERMINISTIC_RETRYABLE_REASON_CODES` (a closed
+    allowlist), not the generic set below with timeout subtracted. Other
+    backends keep the original retryable set unchanged (an LLM session hang
+    is plausibly transient in a way a deterministic subprocess budget
+    overrun is not).
+    """
+    retryable_reason_codes = {
         "spawn_failure",
         "timeout",
         "signal",
@@ -344,7 +475,10 @@ def retry_matrix(*, backend: str, initial_session_id: str | None, attempt: int, 
         "malformed_output",
         "capture_failure",
         "artifact_validation_failure",
-    }:
+    }
+    if backend == "deterministic":
+        retryable_reason_codes = set(_DETERMINISTIC_RETRYABLE_REASON_CODES)
+    if attempt >= MAX_ATTEMPTS or reason_code not in retryable_reason_codes:
         return None
     if attempt == 1 and initial_session_id:
         return RetryIntent("same_session_resume", initial_session_id)
@@ -684,7 +818,20 @@ def verify_wire_matches_artifact(
 
 
 def _attempt_result(**kwargs: Any) -> dict[str, Any]:
-    return {"schema": ATTEMPT_SCHEMA, "transport_status": "environment_failure", "semantic_verdict": None, **kwargs}
+    # Issue #2165 P1-4: `timeout_phase` is an ADDITIVE, always-present
+    # (nullable) field on every attempt result -- not a new closed-domain
+    # `reason_code` value -- so a `reason_code: "timeout"` attempt can carry
+    # WHICH layer timed out (`reviewer_transport_wait`,
+    # `baseline_vc_preflight_aggregate`, `check_issue_contract`,
+    # `merge_readiness`, etc.) without expanding the reason_code enum a
+    # consumer must branch on.
+    return {
+        "schema": ATTEMPT_SCHEMA,
+        "transport_status": "environment_failure",
+        "semantic_verdict": None,
+        "timeout_phase": None,
+        **kwargs,
+    }
 
 
 def run_reviewer_transport(
@@ -720,7 +867,29 @@ def run_reviewer_transport(
     active_session = session_id
     retry_intent_kind = "initial"
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        if time.monotonic() - started >= total_deadline:
+        elapsed = time.monotonic() - started
+        if elapsed >= total_deadline:
+            break
+        # Issue #2165 P1-1 marge condition 8: never spawn a RETRY (attempt
+        # 2/3) once the time remaining before `total_deadline` drops below
+        # `MIN_RETRY_ATTEMPT_BUDGET_FRACTION * per_attempt_deadline` -- an
+        # attempt that cannot possibly complete spawn + minimal work +
+        # cleanup in the time left would just burn the remaining budget
+        # without a realistic chance of succeeding. The FIRST attempt is
+        # exempt (it always gets its full per-attempt budget from a fresh
+        # `total_deadline` clock).
+        if attempt > 1 and not has_sufficient_retry_attempt_budget(
+            elapsed_seconds=elapsed,
+            total_deadline_seconds=total_deadline,
+            per_attempt_deadline_seconds=per_attempt_deadline,
+            # `min_fraction` is read from the MODULE global at call time
+            # (not the function's own default parameter value, which is
+            # bound once at def-time) so tests that monkeypatch
+            # `MIN_RETRY_ATTEMPT_BUDGET_FRACTION` at the module level (e.g.
+            # `test_reviewer_transport_deadline_matches_vc_worst_case.py`)
+            # still take effect here.
+            min_fraction=MIN_RETRY_ATTEMPT_BUDGET_FRACTION,
+        ):
             break
         intent = retry_intent_kind
         command = build_backend_command(backend=backend, base_argv=base_argv, session_id=active_session)
@@ -862,10 +1031,52 @@ def run_reviewer_transport(
         )
         if timed_out:
             reason_code = "timeout" if not reader_timed_out else "capture_failure"
-            result = _attempt_result(**common, failure_phase="execution", reason_code=reason_code)
-        elif process.returncode != 0:
             result = _attempt_result(
-                **common, failure_phase="execution", reason_code=("signal" if common["signal"] else "nonzero_exit")
+                **common,
+                failure_phase="execution",
+                reason_code=reason_code,
+                timeout_phase=("reviewer_transport_wait" if reason_code == "timeout" else None),
+            )
+        elif process.returncode != 0:
+            # Issue #2165 P1-4 (OWNER 2026-08-15 REQUEST_CHANGES): a
+            # structured `{"error_code": "timeout", "timeout_phase": ...}`
+            # the child itself detected (e.g.
+            # `run_root_review_pipeline.py _cmd_run_checker_attempt()`
+            # catching an inner checker's `subprocess.TimeoutExpired`, or
+            # `contract_readiness_check.py` reporting its own typed
+            # `status: "runtime_error"` baseline_vc_preflight aggregate
+            # timeout) is reclassified to the SAME `timeout` reason_code
+            # this branch's sibling (`timed_out` above) already uses -- NOT
+            # a separate `inner_timeout` value -- so the reason_code domain
+            # stays closed (`retry_matrix()`'s deterministic-backend
+            # allowlist only has to reason about one `timeout` value) and
+            # does not compete with Issue #2040's ongoing timeout_phase
+            # taxonomy work. `timeout_phase` (additive, see
+            # `_attempt_result()`) records WHICH layer reported it. A parse
+            # failure (non-JSON stderr, unrelated error shape, or JSON
+            # without `error_code == "timeout"`) intentionally falls back
+            # to `nonzero_exit` unchanged -- this is additive
+            # classification, not a new failure mode.
+            child_timeout_phase: str | None = None
+            if not common["signal"]:
+                try:
+                    stderr_payload = strict_json_loads(stderr.get("prefix", b"") or b"")
+                except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                    stderr_payload = None
+                if isinstance(stderr_payload, dict) and stderr_payload.get("error_code") == "timeout":
+                    phase = stderr_payload.get("timeout_phase")
+                    child_timeout_phase = phase if isinstance(phase, str) and phase else "unspecified"
+            if common["signal"]:
+                execution_reason_code = "signal"
+            elif child_timeout_phase is not None:
+                execution_reason_code = "timeout"
+            else:
+                execution_reason_code = "nonzero_exit"
+            result = _attempt_result(
+                **common,
+                failure_phase="execution",
+                reason_code=execution_reason_code,
+                timeout_phase=child_timeout_phase,
             )
         elif not stdout.get("length"):
             result = _attempt_result(**common, failure_phase="capture", reason_code="empty_output")
@@ -999,3 +1210,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
