@@ -49,8 +49,48 @@ ATTEMPT_SCHEMA = "REVIEWER_ATTEMPT_RESULT_V1"
 MANIFEST_SCHEMA = "REVIEWER_ATTEMPT_MANIFEST_V1"
 ARTIFACT_SCHEMA = "REVIEWER_COMPACT_ARTIFACT_V2"
 MAX_ATTEMPTS = 3
-PER_ATTEMPT_DEADLINE_SECONDS = 90
-TOTAL_DEADLINE_SECONDS = 240
+# Issue #2165: these two constants previously assumed every attempt's wall
+# time was governed only by transport-level concerns (spawn/signal/hang
+# detection). In production the `deterministic` backend's single child
+# process (`run_root_review_pipeline.py run-checker-attempt`) also executes
+# the real checker chain synchronously inside that same attempt window --
+# `check_issue_contract.py` (~30s budget, actual usage sub-second) ->
+# `contract_readiness_check.py` (~250s budget; dominated by
+# `baseline_vc_preflight.py` actually *running* every Verification Command
+# in the reviewed Issue body, e.g. `issue-refinement-loop`'s own full pytest
+# suite measured at 111.07s) -> `merge_readiness` (~30s budget). The old
+# PER_ATTEMPT_DEADLINE_SECONDS=90 could not fit even the single dominant VC
+# call, so any Issue with a legitimately long-running VC deterministically
+# timed out on every attempt.
+#
+# PER_ATTEMPT_DEADLINE_SECONDS=300 keeps margin above the realistic worst
+# case observed in production (~120s: one long VC + a handful of fast `rg`
+# VCs + checker overhead) while remaining well under the layered budget
+# ceiling (~310s: 30 + 250 + 30) so a genuine hang in a non-VC phase is
+# still caught before that ceiling.
+#
+# Retry policy fix (OWNER 2026-08-14 review): resubmitting the SAME
+# deterministic checker command against the SAME pinned Issue body cannot
+# change the outcome of a `timeout`/`inner_timeout` classification -- the VC
+# itself is what is over budget, not the process spawn/IPC layer -- so
+# `retry_matrix()` below excludes those two reason codes from the
+# deterministic backend's retryable set. This means the deterministic
+# backend effectively gets ONE full-length attempt, not
+# `MAX_ATTEMPTS * PER_ATTEMPT_DEADLINE_SECONDS` (the OWNER-flagged
+# 3 * 90s = 270s > 240s total-deadline arithmetic break; blindly restoring
+# that multiplication at the new, larger PER_ATTEMPT_DEADLINE_SECONDS would
+# only amplify load and latency without raising the success probability).
+# Other backends (`claude`/`codex`) keep retrying on timeout, since an LLM
+# session hang is plausibly transient in a way a deterministic subprocess
+# budget overrun is not.
+#
+# TOTAL_DEADLINE_SECONDS=340 stays >= PER_ATTEMPT_DEADLINE_SECONDS (+40s
+# margin) so the single non-retried deterministic attempt is never starved
+# of its own per-attempt budget by `min(per_attempt_deadline, total_deadline
+# - elapsed)`; the margin covers a small number of fast (`spawn_failure`
+# etc.) retries that remain possible for other reason codes.
+PER_ATTEMPT_DEADLINE_SECONDS = 300
+TOTAL_DEADLINE_SECONDS = 340
 STDOUT_CAP = 65_536
 STDERR_CAP = 262_144
 ARTIFACT_MAX_BYTES = 1_048_576
@@ -333,9 +373,26 @@ class RetryIntent:
     session_id: str | None
 
 
+# Issue #2165: reason codes that indicate the child's *deterministic checker
+# chain itself* ran over its VC-execution budget, as opposed to a transport
+# layer fault (spawn/signal/capture). Retrying these against the
+# `deterministic` backend cannot change the outcome -- the same pinned Issue
+# body's same Verification Commands will take the same real time again --
+# so they are excluded from that backend's retryable set below.
+_DETERMINISTIC_NON_RETRYABLE_TIMEOUT_CODES = frozenset({"timeout", "inner_timeout"})
+
+
 def retry_matrix(*, backend: str, initial_session_id: str | None, attempt: int, reason_code: str) -> RetryIntent | None:
-    """Closed three-attempt matrix; no implicit fourth or fallback path."""
-    if attempt >= MAX_ATTEMPTS or reason_code not in {
+    """Closed three-attempt matrix; no implicit fourth or fallback path.
+
+    Issue #2165: for `backend == "deterministic"` (the checker-pipeline
+    child spawned by `run_root_review_pipeline.py`'s `run-checker-attempt`),
+    `timeout` and `inner_timeout` are not retried -- see
+    `_DETERMINISTIC_NON_RETRYABLE_TIMEOUT_CODES`. Other backends keep the
+    original retryable set unchanged (an LLM session hang is plausibly
+    transient in a way a deterministic subprocess budget overrun is not).
+    """
+    retryable_reason_codes = {
         "spawn_failure",
         "timeout",
         "signal",
@@ -344,7 +401,11 @@ def retry_matrix(*, backend: str, initial_session_id: str | None, attempt: int, 
         "malformed_output",
         "capture_failure",
         "artifact_validation_failure",
-    }:
+        "inner_timeout",
+    }
+    if backend == "deterministic":
+        retryable_reason_codes -= _DETERMINISTIC_NON_RETRYABLE_TIMEOUT_CODES
+    if attempt >= MAX_ATTEMPTS or reason_code not in retryable_reason_codes:
         return None
     if attempt == 1 and initial_session_id:
         return RetryIntent("same_session_resume", initial_session_id)
@@ -864,9 +925,34 @@ def run_reviewer_transport(
             reason_code = "timeout" if not reader_timed_out else "capture_failure"
             result = _attempt_result(**common, failure_phase="execution", reason_code=reason_code)
         elif process.returncode != 0:
-            result = _attempt_result(
-                **common, failure_phase="execution", reason_code=("signal" if common["signal"] else "nonzero_exit")
-            )
+            # Issue #2165 (OWNER 2026-08-14 review): a structured
+            # `{"error_code": "timeout"}` the child itself detected (e.g.
+            # `run_root_review_pipeline.py _cmd_run_checker_attempt()`
+            # catching `subprocess.TimeoutExpired` from one of its own
+            # inner checker calls and exiting 2) was previously collapsed
+            # into the generic `nonzero_exit` reason code here, making it
+            # indistinguishable from any other non-timeout non-zero exit.
+            # Best-effort parse the captured stderr for that shape and
+            # reclassify as `inner_timeout` when it matches, so callers
+            # (and `retry_matrix()`) can tell the two apart. A parse
+            # failure (non-JSON stderr, unrelated error shape) intentionally
+            # falls back to `nonzero_exit` unchanged -- this is additive
+            # classification, not a new failure mode.
+            inner_timeout = False
+            if not common["signal"]:
+                try:
+                    stderr_payload = strict_json_loads(stderr.get("prefix", b"") or b"")
+                except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                    stderr_payload = None
+                if isinstance(stderr_payload, dict) and stderr_payload.get("error_code") == "timeout":
+                    inner_timeout = True
+            if common["signal"]:
+                execution_reason_code = "signal"
+            elif inner_timeout:
+                execution_reason_code = "inner_timeout"
+            else:
+                execution_reason_code = "nonzero_exit"
+            result = _attempt_result(**common, failure_phase="execution", reason_code=execution_reason_code)
         elif not stdout.get("length"):
             result = _attempt_result(**common, failure_phase="capture", reason_code="empty_output")
         elif stdout["length"] > STDOUT_CAP:

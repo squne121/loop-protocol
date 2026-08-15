@@ -44,7 +44,18 @@ import pnpm_gate_registry as pnpm_gate_registry  # noqa: E402
 # 安全マージン込みで上回る値（>= 90）を維持する。--timeout-seconds の
 # argparse default はこの定数を参照し、run_contract_review_once.py 側も
 # この定数を import して drift を防ぐ（AC2/AC3 参照）。
-DEFAULT_TIMEOUT_SECONDS = 90
+#
+# Issue #2165: この per-VC-command timeout は、Verification Command 1本の
+# 実行時間上限を決める最内層の値であり、ここでの過小値は上位層（reviewer
+# transport 等）の deadline 設計と無関係に単体で誤検知を起こす。
+# `issue-refinement-loop` skill 自身の full pytest suite VC
+# （`uv run --locked pytest .claude/skills/issue-refinement-loop/tests/ -q`）
+# は実測 111.07 秒であり、旧値 90 は単一の正当な長時間 VC でも超過する。
+# 150 は実測値に約35%の安全マージンを載せた値（呼び出し元の
+# `contract_readiness_check.py` / `run_root_review_pipeline.py` 側の
+# wrapper timeout もこの値に整合させて拡大している。詳細は
+# `reviewer_transport.py` の `PER_ATTEMPT_DEADLINE_SECONDS` docstring 参照）。
+DEFAULT_TIMEOUT_SECONDS = 150
 
 
 def collect_current_head_evidence(cwd: str, reviewed_head_sha: str) -> Dict[str, Any]:

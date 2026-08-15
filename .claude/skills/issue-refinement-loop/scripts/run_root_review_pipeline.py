@@ -267,9 +267,17 @@ def run_check_issue_contract(body_file: str, *, timeout_seconds: int = 30) -> tu
 
 
 def run_contract_readiness_check(
-    body_file: str, *, mode: str = "execute", timeout_seconds: int = 60
+    body_file: str, *, mode: str = "execute", timeout_seconds: int = 250
 ) -> tuple[dict | None, int, str | None]:
-    """Run `contract_readiness_check.py --body-file <body_file> --mode <mode>`."""
+    """Run `contract_readiness_check.py --body-file <body_file> --mode <mode>`.
+
+    Issue #2165: `timeout_seconds` must exceed `contract_readiness_check.py`'s
+    own internal worst-case budget (validate_issue_body.py subprocess timeout
+    30s + baseline_vc_preflight.py subprocess wrapper timeout 200s + minor
+    overhead), otherwise this wrapper kills a still-legitimately-running
+    `contract_readiness_check.py` before it can return its own bounded
+    timeout result. 250 keeps a small margin above that ~230s inner ceiling.
+    """
     script_path = _ISSUE_CONTRACT_REVIEW_SCRIPTS / "contract_readiness_check.py"
     cmd = [sys.executable, str(script_path), "--body-file", body_file, "--mode", mode]
     try:

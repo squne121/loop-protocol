@@ -480,11 +480,21 @@ def run_baseline_vc_preflight(body: str) -> tuple[dict, int]:
         tmp_path = tf.name
 
     try:
+        # Issue #2165: `baseline_vc_preflight.py` の DEFAULT_TIMEOUT_SECONDS
+        # (150、per-VC-command timeout) が raise されたため、この wrapper
+        # timeout もそれを下回らないよう整合させる。1 Issue が複数 VC を
+        # 持つ場合 baseline_vc_preflight.py は VC を逐次実行するため、
+        # 単一の重い VC（例: skill 全体の pytest full suite、実測111秒）に
+        # 加えて残りの軽量 VC（rg 等、数秒未満）の合計時間を吸収できる値
+        # として 200 秒（DEFAULT_TIMEOUT_SECONDS=150 + 50 秒の追加マージン）
+        # を採用する。呼び出し元 `run_root_review_pipeline.py` の
+        # `run_contract_readiness_check()` 側の wrapper timeout もこの値の
+        # 上位に整合させている。
         result = subprocess.run(
             [sys.executable, str(_BASELINE_VC_PREFLIGHT_PY), "--strict", "--body-file", tmp_path],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=200,
         )
         exit_code = result.returncode
         if result.stdout:
