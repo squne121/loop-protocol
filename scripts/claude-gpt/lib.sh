@@ -50,10 +50,26 @@ claude_gpt_evidence_dir() {
 
 # --- Model alias mapping（Parent #2154 アーキテクチャ決定 E 準拠） ---
 # opus -> gpt-5.6-sol / sonnet -> gpt-5.6-terra（main 推奨） / haiku -> gpt-5.6-luna
-CLAUDE_GPT_MODEL_MAIN="gpt-5.6-terra"
-CLAUDE_GPT_MODEL_OPUS="gpt-5.6-sol"
-CLAUDE_GPT_MODEL_SONNET="gpt-5.6-terra"
-CLAUDE_GPT_MODEL_HAIKU="gpt-5.6-luna"
+#
+# `[1m]` suffix は upstream raine/claude-code-proxy が公式に案内する起動形式
+# （https://claude-code-proxy.raine.dev/using/configure-claude-code/）で、Claude Code
+# 本体側の local context window policy を拡張する hint。proxy は upstream（ChatGPT
+# backend）へ転送する前にこの suffix を除去するため、実際に ChatGPT 側へ送られる
+# model ID は suffix なしの base 名のまま変わらない。suffix を付けずに起動すると
+# Claude Code が未知 model として扱い、実際の context 上限（272k）より小さい既定値
+# （200k）で誤って compaction を早期発動させ、summarization 失敗を引き起こす
+# （Issue #2158/PR #2162 実機再検証, 2026-08-15）。
+CLAUDE_GPT_MODEL_MAIN="gpt-5.6-terra[1m]"
+CLAUDE_GPT_MODEL_OPUS="gpt-5.6-sol[1m]"
+CLAUDE_GPT_MODEL_SONNET="gpt-5.6-terra[1m]"
+CLAUDE_GPT_MODEL_HAIKU="gpt-5.6-luna[1m]"
+
+# claude_gpt_strip_context_hint: model alias 末尾の `[1m]` 等 context-window hint suffix
+# を取り除き、proxy `/v1/models` が返す base model 名と比較できる形にする。
+# 引数1: model alias 文字列（例: "gpt-5.6-terra[1m]"）
+claude_gpt_strip_context_hint() {
+  printf '%s' "$1" | sed 's/\[[^]]*\]$//'
+}
 
 # --- claude 実行バイナリの解決（P1-1） ---
 #

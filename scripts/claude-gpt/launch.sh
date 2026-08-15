@@ -291,9 +291,13 @@ MODEL_ALIAS_OK=true
 if [ -z "$MODELS_JSON" ]; then
   MODEL_ALIAS_OK=false
 fi
+# proxy `/v1/models` は suffix なしの base model 名を返すため、`[1m]` context-window
+# hint suffix を除去した名前で照合する（実際に upstream へ送られる model ID も
+# proxy が suffix を除去した後の base 名である。上記 CLAUDE_GPT_MODEL_* 定義部コメント参照）。
 for m in "$CLAUDE_GPT_MODEL_MAIN" "$CLAUDE_GPT_MODEL_OPUS" "$CLAUDE_GPT_MODEL_HAIKU"; do
+  m_base=$(claude_gpt_strip_context_hint "$m")
   case "$MODELS_JSON" in
-    *"\"$m\""*) : ;;
+    *"\"$m_base\""*) : ;;
     *) MODEL_ALIAS_OK=false ;;
   esac
 done
@@ -336,8 +340,11 @@ export ANTHROPIC_MODEL="$CLAUDE_GPT_MODEL_MAIN"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$CLAUDE_GPT_MODEL_OPUS"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$CLAUDE_GPT_MODEL_SONNET"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$CLAUDE_GPT_MODEL_HAIKU"
-# ANTHROPIC_SMALL_FAST_MODEL は意図的に使わない。ANTHROPIC_DEFAULT_HAIKU_MODEL を正本として
-# 維持する（Parent #2154 gateway/context 契約。P1-2）。
+# upstream raine/claude-code-proxy の推奨起動例（configure-claude-code ドキュメント）は
+# ANTHROPIC_SMALL_FAST_MODEL を明示設定する構成のため、ANTHROPIC_DEFAULT_HAIKU_MODEL と
+# 併せて同じ alias を設定する（両方設定して competing/矛盾する挙動は確認されていない。
+# Issue #2158/PR #2162 実機再検証, 2026-08-15）。
+export ANTHROPIC_SMALL_FAST_MODEL="$CLAUDE_GPT_MODEL_HAIKU"
 
 # strict_mcp mode: repository/user MCP を一切読み込まない。--strict-mcp-config +
 # 空の mcp-config JSON（$MCP_CONFIG_PATH）の組み合わせで実現する。
@@ -349,7 +356,12 @@ export STRICT_MCP_MODE
 # の merge 条件から除外。実機検証で launcher がネストした sandbox 実行環境下にある場合
 # Bash tool を破壊することを確認したため。Issue #2158 Scope Reframe, 2026-08-15）。
 export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=auto
+# `auto` は `[1m]` suffix なし model 名の場合に未知 model として context window を
+# 200k と誤認し早期 compaction/summarization 失敗を招いた（実機再検証, 2026-08-15）。
+# upstream 推奨どおり ChatGPT backend の実 context 上限（272k）に固定する。
+# CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT は設定しない（OWNER が明示的に
+# 非推奨としている fail-safe でない回避策のため）。
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000
 export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
