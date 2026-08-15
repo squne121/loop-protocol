@@ -2348,8 +2348,20 @@ def _isolated_env() -> dict[str, str]:
     return env
 
 
-def _herdr_sessions(herdr_bin: str) -> list[dict] | None:
-    rc, out, _err, _timed_out = _run([herdr_bin, "session", "list", "--json"], timeout=15.0)
+def _herdr_sessions(herdr_bin: str, env: dict[str, str] | None = None) -> list[dict] | None:
+    """List every herdr session the local supervisor currently knows about.
+
+    Issue #2176 (P0-3 fix-delta): accepts an explicit ``env`` so every
+    caller in the isolated interactive lane -- collision check, creation
+    poll, socket lookup, baseline snapshot, and cleanup confirmation --
+    can be pinned to the exact same explicit environment instead of some
+    of them silently falling back to Python's default ``env=None``
+    (ambient/unstripped inherited environment). ``env=None`` (the default)
+    preserves every pre-existing caller's ambient-environment behavior.
+    """
+    rc, out, _err, _timed_out = _run(
+        [herdr_bin, "session", "list", "--json"], timeout=15.0, env=env
+    )
     if rc != 0:
         return None
     try:
@@ -2362,19 +2374,88 @@ def _herdr_sessions(herdr_bin: str) -> list[dict] | None:
     return [entry for entry in sessions if isinstance(entry, dict)]
 
 
-def _herdr_session_names(herdr_bin: str) -> set[str] | None:
-    sessions = _herdr_sessions(herdr_bin)
+def _herdr_session_names(herdr_bin: str, env: dict[str, str] | None = None) -> set[str] | None:
+    sessions = _herdr_sessions(herdr_bin, env=env)
     if sessions is None:
         return None
     return {str(entry["name"]) for entry in sessions if entry.get("name")}
 
 
-def new_isolated_session_name(herdr_bin: str) -> str:
+# Only stable, non-secret identity fields are kept in a baseline snapshot --
+# never a transcript, pane content, or credential-bearing field. herdr
+# session ids/names are not considered secrets (see caller instructions),
+# but nothing beyond bare session-registry identity is captured here.
+_SESSION_BASELINE_FIELDS = ("name", "running", "default", "socket_path", "session_dir")
+
+
+def snapshot_herdr_sessions(herdr_bin: str, env: dict[str, str] | None) -> list[dict] | None:
+    """A normalized, name-sorted snapshot of every herdr session the local
+    supervisor currently knows about (Issue #2176 P0-3: existing human
+    session baseline preservation).
+
+    Returns ``None`` if the session list itself could not be retrieved.
+    ``None`` MUST be treated by callers as "could not evaluate" -- never as
+    "no sessions" -- so a baseline comparison that cannot actually observe
+    the supervisor never silently reports success (fail-closed).
+    """
+    sessions = _herdr_sessions(herdr_bin, env=env)
+    if sessions is None:
+        return None
+    normalized = [
+        {field: entry.get(field) for field in _SESSION_BASELINE_FIELDS}
+        for entry in sessions
+    ]
+    return sorted(normalized, key=lambda item: str(item.get("name")))
+
+
+def diff_herdr_session_baseline(
+    before: list[dict] | None,
+    after: list[dict] | None,
+    *,
+    new_session_names: set[str],
+) -> list[str]:
+    """Compare two ``snapshot_herdr_sessions`` results, ignoring only the
+    isolated session(s) this specific run itself created and is
+    responsible for cleaning up (``new_session_names``).
+
+    Any OTHER addition, removal, or field change to a pre-existing session
+    -- including the caller's own attached human session -- is reported as
+    a baseline-preservation violation. ``None`` on either side means the
+    listing itself failed and cannot be evaluated; that is reported as a
+    violation too (fail-closed), never silently treated as "no change".
+    """
+    if before is None or after is None:
+        return ["could not evaluate herdr session baseline (session list failed)"]
+    before_by_name = {
+        str(item["name"]): item for item in before if str(item.get("name")) not in new_session_names
+    }
+    after_by_name = {
+        str(item["name"]): item for item in after if str(item.get("name")) not in new_session_names
+    }
+    diffs: list[str] = []
+    for name in sorted(set(before_by_name) | set(after_by_name)):
+        if before_by_name.get(name) != after_by_name.get(name):
+            diffs.append(
+                f"session baseline changed: {name} "
+                f"({before_by_name.get(name)} -> {after_by_name.get(name)})"
+            )
+    return diffs
+
+
+def new_isolated_session_name(herdr_bin: str, env: dict[str, str] | None = None) -> str:
     """A high-entropy session name not currently present in
-    ``herdr session list``. Never reuses the caller's own session."""
+    ``herdr session list``. Never reuses the caller's own session.
+
+    Issue #2176 (P0-3 fix-delta): the collision check now defaults to the
+    caller-supplied ``env`` (typically the same stripped, explicit
+    ``isolated_env`` that will go on to create the session), so the
+    collision check and the actual creation always share the same
+    explicit environment identity instead of the collision check silently
+    reading the ambient/unstripped environment.
+    """
     for _attempt in range(5):
         candidate = f"rts-{uuid.uuid4().hex}"[:32]
-        existing = _herdr_session_names(herdr_bin)
+        existing = _herdr_session_names(herdr_bin, env=env)
         if existing is None:
             raise HerdrLaneError("could not enumerate existing herdr sessions for collision check")
         if candidate not in existing:
@@ -2382,7 +2463,9 @@ def new_isolated_session_name(herdr_bin: str) -> str:
     raise HerdrLaneError("could not generate a unique isolated herdr session name")
 
 
-def create_isolated_session(herdr_bin: str, session_name: str, *, timeout_seconds: float = 20.0) -> subprocess.Popen:
+def create_isolated_session(
+    herdr_bin: str, session_name: str, env: dict[str, str], *, timeout_seconds: float = 20.0
+) -> subprocess.Popen:
     """Spawn a brand-new, detached, named Herdr session and block until its
     appearance in ``herdr session list --json`` is confirmed.
 
@@ -2393,13 +2476,22 @@ def create_isolated_session(herdr_bin: str, session_name: str, *, timeout_second
     failure (or any other failure to observe the new session actually
     appear) is a hard SKIP, not a fallback to operating in the ambient
     session (Issue #1921 P0-1 fix-delta).
+
+    Issue #2176 (P0-3 fix-delta): ``env`` is now a required, caller-supplied
+    explicit environment (the same stripped ``isolated_env`` the rest of
+    this session's lifecycle -- including its ``herdr session list``
+    creation-confirmation poll below -- uses), instead of this function
+    computing its own separate ``_isolated_env()`` copy that the poll loop
+    then silently did NOT reuse (the poll loop previously queried
+    ``_herdr_session_names(herdr_bin)`` with no ``env`` at all, i.e. the
+    ambient/unstripped environment). Spawn and creation-confirmation now
+    share one identity.
     """
-    isolation_env = _isolated_env()
     try:
         proc = subprocess.Popen(
             [herdr_bin, "--session", session_name],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env=isolation_env, start_new_session=True,
+            env=env, start_new_session=True,
         )
     except OSError as exc:
         raise HerdrLaneError(f"could not spawn isolated herdr session: {exc}", skip=True) from exc
@@ -2416,7 +2508,7 @@ def create_isolated_session(herdr_bin: str, session_name: str, *, timeout_second
                 f"(nested-session restrictions may be in effect): {_redact((err or '').strip()[:300])}",
                 skip=True,
             )
-        names = _herdr_session_names(herdr_bin)
+        names = _herdr_session_names(herdr_bin, env=env)
         if names is not None and session_name in names:
             return proc
         time.sleep(0.3)
@@ -2424,8 +2516,8 @@ def create_isolated_session(herdr_bin: str, session_name: str, *, timeout_second
     raise HerdrLaneError("herdr isolated session did not appear in session list within timeout", skip=True)
 
 
-def _session_socket_path(herdr_bin: str, session_name: str) -> str | None:
-    sessions = _herdr_sessions(herdr_bin)
+def _session_socket_path(herdr_bin: str, session_name: str, env: dict[str, str] | None = None) -> str | None:
+    sessions = _herdr_sessions(herdr_bin, env=env)
     if not sessions:
         return None
     for entry in sessions:
@@ -2566,7 +2658,18 @@ def run_interactive_herdr_isolated(
     single-turn behavior unchanged (AC6-equivalent for this lane).
     ``evidence["turns_completed"]`` records how many prompt turns (initial +
     additional) actually settled before this function returns or raises."""
-    session_name = new_isolated_session_name(herdr_bin)
+    # Issue #2176 (P0-3 fix-delta): a single explicit, stripped ``isolated_env``
+    # is computed once, up front, and threaded through EVERY herdr command
+    # for this session's entire lifecycle -- the collision check, session
+    # creation and its creation-confirmation poll, the socket lookup, the
+    # agent lifecycle (workspace/agent/prompt/get/explain/read, already
+    # isolated_env-consistent before this fix-delta), and -- previously the
+    # gap -- the ``finally`` cleanup below (``session stop`` / ``session
+    # delete`` / removal confirmation). No step in this lifecycle silently
+    # falls back to whatever ambient HERDR_SESSION/HERDR_SOCKET_PATH the
+    # CALLING process happens to have inherited.
+    isolated_env = _isolated_env()
+    session_name = new_isolated_session_name(herdr_bin, env=isolated_env)
     evidence["session_name"] = session_name
 
     agent_name = f"rts-{runtime}-{run_id}"[:32]
@@ -2587,10 +2690,9 @@ def run_interactive_herdr_isolated(
         # (Issue #1921 P0-2 fix-delta iteration 2: a session/process leak
         # was observed here when creation and the rest of the lifecycle
         # were in separate try scopes).
-        session_proc = create_isolated_session(herdr_bin, session_name, timeout_seconds=20.0)
+        session_proc = create_isolated_session(herdr_bin, session_name, isolated_env, timeout_seconds=20.0)
 
-        socket_path = _session_socket_path(herdr_bin, session_name)
-        isolated_env = _isolated_env()
+        socket_path = _session_socket_path(herdr_bin, session_name, env=isolated_env)
         isolated_env["HERDR_SESSION"] = session_name
         if socket_path:
             isolated_env["HERDR_SOCKET_PATH"] = socket_path
@@ -2701,15 +2803,26 @@ def run_interactive_herdr_isolated(
     finally:
         cleanup = evidence["cleanup"]
         cleanup["attempted"] = True
+        # Issue #2176 (P0-3 fix-delta): previously these three calls used
+        # Python's default ``env=None`` (i.e. the ambient/unstripped
+        # environment this whole process inherited from its own caller),
+        # while every OTHER herdr command in this lifecycle
+        # (workspace/agent/prompt/get/explain/read) already used the
+        # explicit ``isolated_env``. That asymmetry meant cleanup -- the
+        # one place a leaked isolated session or a mis-targeted stop/delete
+        # would matter most -- was the one place NOT pinned to the same
+        # explicit identity as the rest of the lifecycle. All three cleanup
+        # calls now share ``isolated_env`` with session creation, the
+        # collision check, and the socket lookup above.
         stop_rc, _o, _e, _t = _run(
-            [herdr_bin, "session", "stop", session_name, "--json"], timeout=20.0,
+            [herdr_bin, "session", "stop", session_name, "--json"], timeout=20.0, env=isolated_env,
         )
         cleanup["stop_rc"] = stop_rc
         delete_rc, _o2, _e2, _t2 = _run(
-            [herdr_bin, "session", "delete", session_name, "--json"], timeout=20.0,
+            [herdr_bin, "session", "delete", session_name, "--json"], timeout=20.0, env=isolated_env,
         )
         cleanup["delete_rc"] = delete_rc
-        remaining = _herdr_session_names(herdr_bin)
+        remaining = _herdr_session_names(herdr_bin, env=isolated_env)
         cleanup["confirmed_removed"] = bool(remaining is not None and session_name not in remaining)
         # Defense in depth: ``session stop``/``session delete`` should have
         # already ended the spawned client process, but terminate it
@@ -2868,6 +2981,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--require-clean-postcondition", action="store_true")
+    parser.add_argument(
+        "--require-session-baseline-preservation",
+        action="store_true",
+        help=(
+            "interactive mode only (Issue #2176 P0-3): snapshot every "
+            "pre-existing herdr session (name/running/default/socket_path/"
+            "session_dir) before the isolated lane starts, snapshot again "
+            "after it finishes (including cleanup), and FAIL if any "
+            "pre-existing session (e.g. the human operator's own attached "
+            "session) changed or disappeared -- excluding only the "
+            "temporary isolated session this run itself created and "
+            "cleaned up. A baseline that could not be captured at all "
+            "(session list failed) is also treated as a failure "
+            "(fail-closed), never silently skipped. Omitted by default, so "
+            "every pre-existing caller's behavior is unchanged."
+        ),
+    )
     parser.add_argument("--inspect-session-log-metadata", action="store_true")
     parser.add_argument("--require-session-log-metadata", action="store_true")
     parser.add_argument("--repo-root", default=None, help="override canonical repository root (tests only)")
@@ -3589,6 +3719,25 @@ def main(argv: list[str] | None = None) -> int:
                 "cleanup": {"attempted": False, "stop_rc": None, "delete_rc": None, "confirmed_removed": False},
             }
             pane_output_lines: list[str] = []
+
+            # Issue #2176 (P0-3): capture the existing herdr session
+            # baseline (e.g. any human operator's own attached session)
+            # BEFORE this run's isolated session is created. A snapshot
+            # failure here is fail-closed -- it means baseline preservation
+            # cannot be verified at all, so the run is FAILed immediately
+            # rather than silently proceeding as if no baseline check had
+            # been requested.
+            session_baseline_before: list[dict] | None = None
+            if args.require_session_baseline_preservation:
+                session_baseline_before = snapshot_herdr_sessions("herdr", _isolated_env())
+                schema_summary["session_baseline_before_captured"] = session_baseline_before is not None
+                if session_baseline_before is None:
+                    errors.append(
+                        "could not capture herdr session baseline before interactive lane "
+                        "(session list failed)"
+                    )
+                    exit_code = EXIT_FAIL
+
             try:
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
@@ -3633,6 +3782,38 @@ def main(argv: list[str] | None = None) -> int:
             except HerdrLaneError as exc:
                 errors.append(exc.message)
                 exit_code = EXIT_SKIP if exc.skip else EXIT_FAIL
+            finally:
+                # Issue #2176 (P0-3): re-snapshot AFTER the isolated lane
+                # (including its own ``finally``-block cleanup above) has
+                # fully run, whether it succeeded, FAILed, or SKIPped. Any
+                # difference from the before-snapshot -- other than the
+                # temporary session this run itself created -- is a
+                # baseline-preservation violation and is treated as a FAIL
+                # regardless of the lane's own exit_code (fail-closed): a
+                # corrupted/leaked ambient session is strictly worse than
+                # whatever this run's own outcome would otherwise have
+                # been, and must never be silently absorbed by it.
+                if args.require_session_baseline_preservation and session_baseline_before is not None:
+                    session_baseline_after = snapshot_herdr_sessions("herdr", _isolated_env())
+                    schema_summary["session_baseline_after_captured"] = session_baseline_after is not None
+                    if session_baseline_after is None:
+                        errors.append(
+                            "could not capture herdr session baseline after interactive lane "
+                            "(session list failed)"
+                        )
+                        exit_code = EXIT_FAIL
+                    else:
+                        created_name = evidence.get("session_name")
+                        baseline_diffs = diff_herdr_session_baseline(
+                            session_baseline_before, session_baseline_after,
+                            new_session_names={created_name} if created_name else set(),
+                        )
+                        schema_summary["session_baseline_diffs"] = baseline_diffs
+                        if baseline_diffs:
+                            errors.append(
+                                f"herdr session baseline preservation failed: {baseline_diffs}"
+                            )
+                            exit_code = EXIT_FAIL
 
             schema_summary["session_name"] = evidence.get("session_name")
             schema_summary["pane_id"] = evidence.get("pane_id")

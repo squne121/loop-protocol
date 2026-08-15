@@ -1090,7 +1090,7 @@ def test_given_first_candidate_collides_when_new_session_name_generated_then_ret
         calls["n"] += 1
         return _FakeUUID("1" * 32 if calls["n"] == 1 else "2" * 32)
 
-    def fake_names(_herdr_bin):
+    def fake_names(_herdr_bin, env=None):
         return {taken}
 
     monkeypatch.setattr(module.uuid, "uuid4", fake_uuid4)
@@ -1103,7 +1103,7 @@ def test_given_first_candidate_collides_when_new_session_name_generated_then_ret
 
 def test_given_collision_check_cannot_enumerate_sessions_when_generating_name_then_hard_error(monkeypatch):
     module = _load_module()
-    monkeypatch.setattr(module, "_herdr_session_names", lambda _herdr_bin: None)
+    monkeypatch.setattr(module, "_herdr_session_names", lambda _herdr_bin, env=None: None)
     with pytest.raises(module.HerdrLaneError):
         module.new_isolated_session_name("herdr")
 
