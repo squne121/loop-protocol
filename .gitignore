@@ -57,10 +57,6 @@ dist-ssr
 .claude/plans/
 # 個人ローカル上書き（API キー / ローカルパス / 好み等）。共有設定は .claude/settings.json に残す
 .claude/settings.local.json
-# Issue #2163: Claude Code ツール本体（本 repo が制御できない外部プロセス）が
-# 生成すると考えられるグローバル untracked singleton。repo 内に producer/consumer
-# の記述はない（詳細は docs/dev/agent-skill-boundaries.md の該当セクション参照）。
-.claude/.investigation-context.md
 # repo root の project-local pnpm store（root 限定）
 /.pnpm-store/
 

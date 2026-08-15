@@ -53,6 +53,7 @@ import stat as _stat
 import subprocess
 import sys
 import unicodedata
+from typing import NamedTuple
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -860,155 +861,481 @@ def _post_gh_comment(issue_number: int, repo: str, body: str, gh_bin: str) -> tu
 
 
 # -- Postcondition check -------------------------------------------------------
+#
+# Issue #2163 review fix_delta (PR #2178 REQUEST_CHANGES): the previous
+# metadata-snapshot design had multiple reproducible fail-open bypasses. This
+# section replaces it with three separated responsibilities, matching the
+# reviewer-recommended structure:
+#
+#   _collect_repo_state()        -- structured `git status --porcelain=v2 -z`
+#                                    index state + exact filesystem node/content
+#                                    identity for every non-allowed candidate.
+#   _check_clean_precondition()  -- current-state gate used before a remote
+#                                    mutation begins (returns the captured
+#                                    state too, so it doubles as the
+#                                    pre-mutation snapshot without a second
+#                                    `git status` invocation).
+#   _compare_repo_transition()   -- before/after union-based transition
+#                                    classification (Issue #2163 P0-2/P0-3).
+#
+# `_capture_pre_mutation_snapshot` / `_check_no_tracked_changes` remain as the
+# public entry points every `_run_*` command handler calls, now implemented
+# in terms of the three primitives above.
 
-# Issue #2163: a global untracked singleton this repo has no producer/consumer
-# script for (`rg -n "investigation-context"` was zero hits across the repo
-# before this Issue). Its most plausible origin is the Claude Code tool runtime
-# itself (an external, repo-uncontrollable process -- see
-# `docs/dev/agent-skill-boundaries.md` for the recorded investigation and
-# decision), not any script this executor's mutations could have produced or
-# altered. It is therefore treated the same way `skill_runtime_exec.py` treats
-# its own race-tolerant-unattributable peer roots: excluded from the candidate
-# set outright, rather than relying solely on the metadata comparison below
-# (which would still fail closed if an unrelated concurrent process happened to
-# touch this file's mtime/size during this executor's own mutation window).
-_INVESTIGATION_CONTEXT_EXEMPT_REL = ".claude/.investigation-context.md"
+
+class _AbsentMarker:
+    """Sentinel: this path was affirmatively confirmed not to exist
+    (`FileNotFoundError`) at capture time. Distinct from `_UNOBSERVED` (Issue
+    #2163 P0-2 deletion_absence_sentinel_collision)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover -- debug aid only
+        return "<ABSENT>"
 
 
-def _snapshot_status_path_metadata(
-    project_root: Path, paths: set[str]
-) -> dict[str, tuple[str, int, int] | None]:
-    """Stat each candidate path and return path -> (kind, mtime_ns, size), or None if absent.
+class _UnobservedMarker:
+    """Sentinel: this path was never a `git status` candidate in this
+    snapshot (neither observed present nor confirmed absent). Distinct from
+    `_ABSENT` (Issue #2163 P0-2)."""
 
-    Issue #2163: metadata-snapshot primitive conforming to
-    `scripts/agent-guards/skill_runtime_exec.py`'s `_snapshot_repo_paths` /
-    `_find_unauthorized_repo_changes` design (path -> (kind, mtime_ns, size)
-    comparison instead of a bare `git status` line set diff). Scoped to the
-    `git status` candidate paths (not a full repo walk) since those are the only
-    paths a `git status` set-diff could ever flag in the first place -- this
-    keeps the check O(changed files) rather than O(repo size) while still
-    correctly detecting in-place content changes to pre-existing
-    untracked/dirty files that a bare set diff would miss.
-    """
-    snapshot: dict[str, tuple[str, int, int] | None] = {}
-    for rel in paths:
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover -- debug aid only
+        return "<UNOBSERVED>"
+
+
+_ABSENT = _AbsentMarker()
+_UNOBSERVED = _UnobservedMarker()
+
+
+class _RepoStateCaptureError(Exception):
+    """Raised when repo state (git status v2 -z parse, or filesystem node
+    identity) cannot be captured with certainty. Issue #2163 P1-1
+    (ambiguous_oserror_treated_as_absent): any `OSError` other than
+    `FileNotFoundError` raises this instead of being folded into `_ABSENT`,
+    so the caller fails closed (baseline capture failure / postcondition
+    indeterminate) rather than silently treating an EACCES/EIO/ENOTDIR node
+    as though it does not exist."""
+
+
+class _FsNodeState(NamedTuple):
+    """Exact filesystem node identity for one path (Issue #2163 P1-1).
+
+    Regular files carry a SHA-256 content digest (not just mtime/size, which
+    cannot distinguish a same-size content rewrite with a restored mtime).
+    Symlinks carry their `readlink()` target. `st_mode`/`st_dev`/`st_ino`/
+    `st_nlink`/`st_ctime_ns` are preserved so mode-only changes (chmod),
+    hardlink-count changes, and atomic-replace inode changes are all visible
+    in equality comparison, matching `skill_runtime_exec.py`'s
+    `_snapshot_repo_paths` design intent."""
+
+    node_type: str  # "regular" | "symlink" | "dir" | "fifo" | "socket" | "block_device" | "char_device" | "other"
+    st_mode: int
+    st_dev: int
+    st_ino: int
+    st_nlink: int
+    st_ctime_ns: int
+    st_mtime_ns: int
+    st_size: int
+    content_sha256: str | None
+    symlink_target: str | None
+
+
+def _stat_fs_node(abs_path: Path) -> _FsNodeState | _AbsentMarker:
+    """Return the exact node identity for `abs_path`, `_ABSENT` if it
+    genuinely does not exist, or raise `_RepoStateCaptureError` for any other
+    `OSError` (Issue #2163 P1-1 fail-closed error semantics)."""
+    try:
+        st = abs_path.lstat()
+    except FileNotFoundError:
+        return _ABSENT
+    except OSError as exc:
+        raise _RepoStateCaptureError(f"lstat_failed: {abs_path}: {exc}") from exc
+
+    mode = st.st_mode
+    content_sha256: str | None = None
+    symlink_target: str | None = None
+    if _stat.S_ISREG(mode):
+        node_type = "regular"
         try:
-            stat = (project_root / rel).lstat()
-        except OSError:
-            snapshot[rel] = None
+            with open(abs_path, "rb") as fh:
+                content_sha256 = hashlib.file_digest(fh, "sha256").hexdigest()
+        except FileNotFoundError:
+            return _ABSENT
+        except OSError as exc:
+            raise _RepoStateCaptureError(f"content_digest_failed: {abs_path}: {exc}") from exc
+    elif _stat.S_ISLNK(mode):
+        node_type = "symlink"
+        try:
+            symlink_target = os.readlink(abs_path)
+        except FileNotFoundError:
+            return _ABSENT
+        except OSError as exc:
+            raise _RepoStateCaptureError(f"readlink_failed: {abs_path}: {exc}") from exc
+    elif _stat.S_ISDIR(mode):
+        node_type = "dir"
+    elif _stat.S_ISFIFO(mode):
+        node_type = "fifo"
+    elif _stat.S_ISSOCK(mode):
+        node_type = "socket"
+    elif _stat.S_ISBLK(mode):
+        node_type = "block_device"
+    elif _stat.S_ISCHR(mode):
+        node_type = "char_device"
+    else:
+        node_type = "other"  # pragma: no cover -- exotic node type
+
+    return _FsNodeState(
+        node_type=node_type,
+        st_mode=mode,
+        st_dev=st.st_dev,
+        st_ino=st.st_ino,
+        st_nlink=st.st_nlink,
+        st_ctime_ns=st.st_ctime_ns,
+        st_mtime_ns=st.st_mtime_ns,
+        st_size=st.st_size,
+        content_sha256=content_sha256,
+        symlink_target=symlink_target,
+    )
+
+
+class _PorcelainEntry(NamedTuple):
+    """One `git status --porcelain=v2 -z` record (Issue #2163 P0-3). Carries
+    the `XY` code plus HEAD/index/worktree mode and HEAD/index object id so a
+    staged/unstaged/untracked transition is detectable even when filesystem
+    metadata is unchanged (e.g. `git add` on an already-identical file)."""
+
+    xy: str
+    sub: str
+    mode_head: str | None
+    mode_index: str | None
+    mode_worktree: str | None
+    hash_head: str | None
+    hash_index: str | None
+    orig_path: str | None  # rename/copy source path (Issue #2163 P0-1), else None
+
+
+def _run_git_status_v2_z(project_root: Path) -> tuple[dict[str, _PorcelainEntry], str | None]:
+    """Run `git status --porcelain=v2 -z --untracked-files=all --renames` and
+    parse its NUL-delimited output into structured records (Issue #2163
+    P0-1: replaces the previous `--porcelain=v1` + `text=True` +
+    `splitlines()` + `line[3:]` parser, which does not decode C-style quoted
+    pathnames -- spaces/tabs/newlines/quotes/backslashes -- and does not
+    split a rename's two pathnames apart). Any parse failure returns an
+    explicit error instead of silently dropping records (fail-closed)."""
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(project_root),
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--renames",
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        return {}, f"git_status_v2_exception: {exc}"
+
+    # Defensive: `subprocess.run(..., capture_output=True)` without
+    # `text=True` always yields `bytes` for stdout/stderr in real execution
+    # -- this shape is unreachable via a genuine git invocation. A non-bytes
+    # `proc` here can only occur when something outside this function has
+    # substituted a different `subprocess.run` return value for an unrelated
+    # purpose; treat it as "no git status candidates observed" rather than
+    # raising, since real git output never takes this shape.
+    if not isinstance(proc.stdout, (bytes, bytearray)) or not isinstance(proc.stderr, (bytes, bytearray)):
+        return {}, None
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", "replace").strip()[:200]
+        return {}, f"git_status_v2_failed: {stderr}"
+
+    tokens = proc.stdout.split(b"\0")
+    if tokens and tokens[-1] == b"":
+        tokens.pop()
+
+    def _dec(raw: bytes) -> str:
+        return raw.decode("utf-8", "surrogateescape")
+
+    entries: dict[str, _PorcelainEntry] = {}
+    i = 0
+    n = len(tokens)
+    while i < n:
+        rec = tokens[i]
+        i += 1
+        if not rec:
             continue
-        kind = "dir" if _stat.S_ISDIR(stat.st_mode) else "file"
-        snapshot[rel] = (kind, stat.st_mtime_ns, stat.st_size)
-    return snapshot
+        kind = rec[:1]
+        try:
+            if kind == b"1":
+                parts = rec.split(b" ", 8)
+                if len(parts) != 9:
+                    return {}, f"git_status_v2_malformed_ordinary_record: {rec!r}"
+                _, xy, sub, mh, mi, mw, hh, hi, path_b = parts
+                path = _dec(path_b)
+                entries[path] = _PorcelainEntry(
+                    xy=_dec(xy),
+                    sub=_dec(sub),
+                    mode_head=_dec(mh),
+                    mode_index=_dec(mi),
+                    mode_worktree=_dec(mw),
+                    hash_head=_dec(hh),
+                    hash_index=_dec(hi),
+                    orig_path=None,
+                )
+            elif kind == b"2":
+                parts = rec.split(b" ", 9)
+                if len(parts) != 10:
+                    return {}, f"git_status_v2_malformed_rename_record: {rec!r}"
+                _, xy, sub, mh, mi, mw, hh, hi, _score, path_b = parts
+                path = _dec(path_b)
+                if i >= n:
+                    return {}, "git_status_v2_missing_orig_path_field"
+                orig_path = _dec(tokens[i])
+                i += 1
+                entries[path] = _PorcelainEntry(
+                    xy=_dec(xy),
+                    sub=_dec(sub),
+                    mode_head=_dec(mh),
+                    mode_index=_dec(mi),
+                    mode_worktree=_dec(mw),
+                    hash_head=_dec(hh),
+                    hash_index=_dec(hi),
+                    orig_path=orig_path,
+                )
+            elif kind == b"u":
+                parts = rec.split(b" ", 10)
+                if len(parts) != 11:
+                    return {}, f"git_status_v2_malformed_unmerged_record: {rec!r}"
+                _, xy, sub, m1, m2, m3, mw, h1, h2, h3, path_b = parts
+                path = _dec(path_b)
+                entries[path] = _PorcelainEntry(
+                    xy=_dec(xy),
+                    sub=_dec(sub),
+                    mode_head=_dec(m1),
+                    mode_index=_dec(m2) + ":" + _dec(m3),
+                    mode_worktree=_dec(mw),
+                    hash_head=_dec(h1),
+                    hash_index=_dec(h2) + ":" + _dec(h3),
+                    orig_path=None,
+                )
+            elif kind == b"?":
+                parts = rec.split(b" ", 1)
+                if len(parts) != 2:
+                    return {}, f"git_status_v2_malformed_untracked_record: {rec!r}"
+                path = _dec(parts[1])
+                entries[path] = _PorcelainEntry(
+                    xy="??",
+                    sub="",
+                    mode_head=None,
+                    mode_index=None,
+                    mode_worktree=None,
+                    hash_head=None,
+                    hash_index=None,
+                    orig_path=None,
+                )
+            elif kind == b"!":
+                continue  # ignored entries not requested (no --ignored flag), defensive only
+            else:
+                return {}, f"git_status_v2_unknown_record_kind: {rec[:1]!r}"
+        except (UnicodeDecodeError, ValueError) as exc:
+            return {}, f"git_status_v2_parse_error: {exc}"
+    return entries, None
+
+
+class _PathObservation(NamedTuple):
+    """Combined git-index-state + filesystem-node-identity observation for
+    one candidate path within a single `_RepoState` snapshot (Issue #2163
+    P0-3). `xy is None` means this path had no `git status` line of its own
+    in this snapshot (it is only present because it is the rename/copy
+    *source* side of a sibling entry)."""
+
+    xy: str | None
+    sub: str | None
+    mode_head: str | None
+    mode_index: str | None
+    mode_worktree: str | None
+    hash_head: str | None
+    hash_index: str | None
+    orig_path: str | None
+    fs: _FsNodeState | _AbsentMarker
+
+
+class _RepoState(NamedTuple):
+    """A single point-in-time `git status --porcelain=v2 -z` + filesystem
+    snapshot, scoped to the non-allowed candidate paths (Issue #2163)."""
+
+    candidate_paths: frozenset[str]
+    observations: dict[str, _PathObservation]
+
+
+def _collect_repo_state(project_root: Path, issue_number: int, allowed_prefix: str | None) -> _RepoState:
+    """Capture structured `git status --porcelain=v2 -z` index state and
+    exact filesystem node identity for every candidate path not fully
+    contained in `allowed_prefix` (Issue #2163 recommended
+    `collect_repo_state()` primitive).
+
+    A rename/copy entry is only treated as "fully allowed" (excluded from
+    the candidate set) when *both* its destination and its source path are
+    within `allowed_prefix` -- otherwise both endpoints are added as
+    individually-authorized candidates (Issue #2163 P0-1: a rename with only
+    one endpoint inside the allowed root must not be silently excluded).
+
+    Raises `_RepoStateCaptureError` on any `git status` parse failure or any
+    filesystem stat/read failure that is not a confirmed absence -- this
+    propagates to callers so pre-mutation capture failures stop the command
+    *before* any remote mutation is attempted (Issue #2163 P1-1).
+    """
+    if allowed_prefix is None:
+        allowed_prefix = f"artifacts/{issue_number}/"
+
+    entries, err = _run_git_status_v2_z(project_root)
+    if err is not None:
+        raise _RepoStateCaptureError(err)
+
+    def _within_allowed(rel: str) -> bool:
+        return rel.startswith(allowed_prefix)
+
+    candidate_paths: set[str] = set()
+    entry_by_candidate: dict[str, _PorcelainEntry] = {}
+    for path, entry in entries.items():
+        fully_allowed = _within_allowed(path) and (entry.orig_path is None or _within_allowed(entry.orig_path))
+        if fully_allowed:
+            continue
+        candidate_paths.add(path)
+        entry_by_candidate[path] = entry
+        if entry.orig_path is not None:
+            candidate_paths.add(entry.orig_path)
+            entry_by_candidate.setdefault(entry.orig_path, entry)
+
+    observations: dict[str, _PathObservation] = {}
+    for rel in candidate_paths:
+        entry = entry_by_candidate.get(rel)
+        fs = _stat_fs_node(project_root / rel)  # may raise _RepoStateCaptureError -- propagate
+        observations[rel] = _PathObservation(
+            xy=entry.xy if entry is not None else None,
+            sub=entry.sub if entry is not None else None,
+            mode_head=entry.mode_head if entry is not None else None,
+            mode_index=entry.mode_index if entry is not None else None,
+            mode_worktree=entry.mode_worktree if entry is not None else None,
+            hash_head=entry.hash_head if entry is not None else None,
+            hash_index=entry.hash_index if entry is not None else None,
+            orig_path=entry.orig_path if entry is not None else None,
+            fs=fs,
+        )
+
+    return _RepoState(candidate_paths=frozenset(candidate_paths), observations=observations)
+
+
+def _observation_display_xy(obs: _PathObservation | None) -> str:
+    if obs is not None and obs.xy:
+        return obs.xy
+    return "??"
+
+
+def _check_clean_precondition(
+    project_root: Path, issue_number: int, allowed_prefix: str | None = None
+) -> tuple[_RepoState | None, list[str]]:
+    """Current-state gate used before a remote mutation begins (Issue #2163
+    recommended `check_clean_precondition()` primitive). Returns
+    `(repo_state, violations)`. `repo_state` is `None` only when capture
+    itself failed (`violations` then contains the failure reason,
+    fail-closed). When `repo_state` is not `None`, it can be reused directly
+    as the pre-mutation snapshot for `_compare_repo_transition` without a
+    second `git status` invocation."""
+    try:
+        state = _collect_repo_state(project_root, issue_number, allowed_prefix)
+    except _RepoStateCaptureError as exc:
+        return None, [f"repo_state_capture_failed: {exc}"]
+    violations = sorted(
+        f"{_observation_display_xy(state.observations.get(p))}:{p}" for p in state.candidate_paths
+    )
+    return state, violations
+
+
+def _compare_repo_transition(before: _RepoState, after: _RepoState) -> list[str]:
+    """Union-based before/after transition classification (Issue #2163
+    recommended `compare_repo_transition()` primitive, fixes P0-2). Compares
+    `before.candidate_paths | after.candidate_paths` (not just the
+    post-mutation candidate set) so a path that was a candidate before the
+    mutation but disappeared entirely from `git status` afterward (e.g. a
+    pre-existing untracked file that was deleted, which leaves no trace in
+    `git status` output at all) is still flagged -- `_UNOBSERVED` in one
+    snapshot and a real observation in the other is always a violation."""
+    violations: list[str] = []
+    for path in sorted(before.candidate_paths | after.candidate_paths):
+        before_obs = before.observations.get(path, _UNOBSERVED)
+        after_obs = after.observations.get(path, _UNOBSERVED)
+        if before_obs == after_obs:
+            continue
+        display_obs = after_obs if after_obs is not _UNOBSERVED else before_obs
+        xy = _observation_display_xy(display_obs if isinstance(display_obs, _PathObservation) else None)
+        violations.append(f"{xy}:{path}")
+    return violations
 
 
 def _capture_pre_mutation_snapshot(
     project_root: Path, issue_number: int, allowed_prefix: str | None = None
-) -> dict[str, tuple[str, int, int] | None]:
-    """Capture the pre-mutation `git status` candidate set and their fs metadata.
-
-    Issue #2163: must be called before any local/remote mutation begins in each
-    `_run_*` command handler so `_check_no_tracked_changes` can later distinguish
-    a pre-existing untracked/dirty file whose content never changed (not a
-    violation -- AC2) from one that is newly created, removed, or overwritten
-    during this command's own mutation (violation -- AC3/AC4).
-    """
+) -> tuple[_RepoState | None, str | None]:
+    """Capture the pre-mutation repo state (Issue #2163). Returns
+    `(repo_state, error)`. On failure `repo_state` is `None` and `error`
+    describes why -- callers MUST check for this and stop *before* any
+    local/remote mutation is attempted (Issue #2163 P1-1: replaces the
+    previous `except Exception: return {}` fallback, which silently treated
+    a capture failure as an empty/trivially-satisfied snapshot)."""
     try:
-        out = subprocess.run(
-            ["git", "-C", str(project_root), "status", "--porcelain=v1", "--untracked-files=all"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if out.returncode != 0:
-            return {}
-        if allowed_prefix is None:
-            allowed_prefix = f"artifacts/{issue_number}/"
-        candidates: set[str] = set()
-        for line in out.stdout.splitlines():
-            if len(line) < 4:
-                continue
-            path = line[3:]
-            if path.startswith(allowed_prefix) or path == _INVESTIGATION_CONTEXT_EXEMPT_REL:
-                continue
-            candidates.add(path)
-        return _snapshot_status_path_metadata(project_root, candidates)
-    except Exception:
-        return {}
+        return _collect_repo_state(project_root, issue_number, allowed_prefix), None
+    except _RepoStateCaptureError as exc:
+        return None, str(exc)
 
 
 def _check_no_tracked_changes(
     project_root: Path,
     issue_number: int,
     allowed_prefix: str | None = None,
-    before_snapshot: dict[str, tuple[str, int, int] | None] | None = None,
+    before_snapshot: _RepoState | None = None,
 ) -> list[str]:
-    """Return list of violations (staged, unstaged, untracked source files). Empty = OK (AC14).
+    """Return list of violations (staged, unstaged, untracked, renamed,
+    deleted, mode-changed, or content-changed candidate paths). Empty = OK
+    (AC14).
 
-    Uses git status --porcelain=v1 --untracked-files=all to enumerate candidate
-    changed paths, then (Issue #2163) compares each candidate's filesystem
-    metadata (kind, mtime_ns, size) against `before_snapshot` -- a pre-mutation
-    snapshot captured by `_capture_pre_mutation_snapshot` before this command's
-    own mutation began -- instead of treating bare presence in the post-mutation
-    `git status` output as sufficient evidence of a violation. This distinguishes:
-      - a pre-existing untracked/dirty file whose content never changed during
-        this command's mutation: NOT a violation (fixes the AC2 false positive
-        that the previous simple set-diff produced, e.g. for
-        `.claude/.investigation-context.md`).
-      - a pre-existing untracked/dirty file whose content WAS overwritten during
-        this command's mutation: still a violation (fixes the AC3 false negative
-        that the previous simple set-diff missed, since presence alone was
-        unconditionally treated as pre-existing == safe).
-      - any path newly created, removed-then-recreated, or otherwise not present
-        in `before_snapshot` (including a genuinely new tracked/untracked
-        change): still a violation (AC4 non-regression).
+    Uses `_collect_repo_state` (Issue #2163: `git status --porcelain=v2 -z`
+    structural parse + exact filesystem node identity, see module docstring
+    above) to capture the current repo state, then (when `before_snapshot`
+    is provided) applies `_compare_repo_transition` against it -- comparing
+    the *union* of before/after candidate paths, not just the paths present
+    in the current snapshot, and comparing full index + filesystem node
+    identity (not just kind/mtime/size) -- instead of treating bare presence
+    in a single post-mutation `git status` line set as sufficient evidence.
+
     Allows writes inside allowed_prefix. Defaults to artifacts/{issue_number}/.
     Issue #1284 Blocker 6: command ids pass a command-id-scoped prefix
     (artifacts/{issue_number}/issue-metadata/{command_id}/) so the postcondition
     cannot be satisfied by writes to a sibling command's namespace.
 
-    `before_snapshot=None` is a defensive fallback for any call site that has
-    not yet been threaded with a captured pre-mutation snapshot: every candidate
-    line is treated as a violation, matching the previous fail-closed behavior.
+    `before_snapshot=None` is the current-state-only gate (equivalent to
+    `_check_clean_precondition`'s violations list): every remaining candidate
+    is treated as a violation, matching the previous fail-closed behavior for
+    callers that have not yet been threaded with a captured pre-mutation
+    snapshot.
     """
     try:
-        out = subprocess.run(
-            ["git", "-C", str(project_root), "status", "--porcelain=v1", "--untracked-files=all"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+        after_state = _collect_repo_state(project_root, issue_number, allowed_prefix)
+    except _RepoStateCaptureError as exc:
+        return [f"repo_state_capture_failed: {exc}"]
+
+    if before_snapshot is None:
+        return sorted(
+            f"{_observation_display_xy(after_state.observations.get(p))}:{p}" for p in after_state.candidate_paths
         )
-        if out.returncode != 0:
-            return [f"git_status_failed: {out.stderr.strip()[:100]}"]
 
-        if allowed_prefix is None:
-            allowed_prefix = f"artifacts/{issue_number}/"
-        candidates: dict[str, str] = {}
-        for line in out.stdout.splitlines():
-            if len(line) < 4:
-                continue
-            xy = line[:2]
-            path = line[3:]
-            # Allow writes inside artifacts/{issue_number}/
-            if path.startswith(allowed_prefix) or path == _INVESTIGATION_CONTEXT_EXEMPT_REL:
-                continue
-            # Block staged (xy[0] != ' ' and != '?'), unstaged (xy[1] != ' '),
-            # untracked ('??')
-            if xy.strip() or xy == "??":
-                candidates[path] = xy
-        if not candidates:
-            return []
-        if before_snapshot is None:
-            return [f"{xy}:{path}" for path, xy in sorted(candidates.items())]
-
-        after_snapshot = _snapshot_status_path_metadata(project_root, set(candidates))
-        violations = []
-        for path, xy in sorted(candidates.items()):
-            if before_snapshot.get(path) != after_snapshot.get(path):
-                violations.append(f"{xy}:{path}")
-        return violations
-    except Exception as exc:
-        return [f"git_status_exception: {exc}"]
+    return _compare_repo_transition(before_snapshot, after_state)
 
 
 # -- Main executor -------------------------------------------------------------
@@ -1141,7 +1468,14 @@ def _run_issue_scope_snapshot_materialize(args, input_data, gh_bin, _fail, _ok) 
     write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
     # Issue #2163: pre-mutation metadata snapshot captured before the
     # materializer runs, threaded into the postcondition check below.
-    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+    pre_mutation_snapshot, pre_mutation_snapshot_err = _capture_pre_mutation_snapshot(
+        PROJECT_ROOT, args.issue_number, write_root
+    )
+    if pre_mutation_snapshot_err is not None:
+        return _fail(
+            f"pre_mutation_snapshot_capture_failed: {pre_mutation_snapshot_err}",
+            status="failed",
+        )
     try:
         from materialize_issue_scope_snapshot import materialize
 
@@ -1199,7 +1533,14 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
 
     # Issue #2163: pre-mutation metadata snapshot captured before any remote
     # PATCH is attempted, threaded into the postcondition check below.
-    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+    pre_mutation_snapshot, pre_mutation_snapshot_err = _capture_pre_mutation_snapshot(
+        PROJECT_ROOT, args.issue_number, write_root
+    )
+    if pre_mutation_snapshot_err is not None:
+        return _fail(
+            f"pre_mutation_snapshot_capture_failed: {pre_mutation_snapshot_err}",
+            status="failed",
+        )
 
     # -- Blocker 1: local marker is cache/audit only, never remote-mutation
     # authority. Marker metadata is checked for consistency, but success or
@@ -1221,16 +1562,41 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
         return _fail(err, status="failed")
     current_body_sha256 = "sha256:" + hashlib.sha256((body or "").encode("utf-8")).hexdigest()
 
-    if marker_data is not None:
-        if current_body_sha256 == input_data["new_body_sha256"]:
-            return _ok(
+    # -- Issue #2163 P1-3 (markerless_remote_recovery_missing): the remote
+    # readback is checked against the desired state BEFORE the marker-present
+    # branch below, and regardless of whether a local marker exists. A prior
+    # attempt whose remote PATCH succeeded but whose local marker-write or
+    # postcondition check failed afterward must be recoverable on retry: the
+    # marker is (re)written here so the transaction becomes idempotent even
+    # when no local marker survived the earlier failure.
+    if current_body_sha256 == input_data["new_body_sha256"]:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps(
                 {
-                    "status_detail": "already_applied",
-                    "marker_state": "already_applied_remote_authority",
+                    "schema": "ISSUE_BODY_UPDATE_MARKER_V1",
+                    "issue_number": args.issue_number,
+                    "repo": args.repo,
                     "new_body_sha256": current_body_sha256,
-                    "idempotency_marker_found": True,
-                }
+                    "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                },
+                ensure_ascii=False,
+                indent=2,
             )
+        )
+        return _ok(
+            {
+                "status_detail": "already_applied",
+                "marker_state": (
+                    "already_applied_remote_authority" if marker_data is not None else "already_applied_marker_repaired"
+                ),
+                "new_body_sha256": current_body_sha256,
+                "idempotency_marker_found": marker_data is not None,
+                "idempotency_marker_repaired": marker_data is None,
+            }
+        )
+
+    if marker_data is not None:
         marker_state = "stale_local_marker_recovered"
 
     # -- AC9: stale-write precondition — readback must match previous_* --------
@@ -1268,11 +1634,28 @@ def _run_issue_body_update(args, input_data, gh_bin, _fail, _ok) -> int:
     # own write root (artifacts/{issue}/issue-metadata/issue_body.update/).
     changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
     if changed:
+        # Issue #2163 P1-3: the remote PATCH already succeeded (postcondition
+        # readback above matched new_body_sha256) -- this failure is a purely
+        # LOCAL problem (an unrelated tracked/untracked change was detected),
+        # not a mutation failure. Classified distinctly from an ordinary
+        # mutation failure ("applied_but_local_postcondition_failed", not
+        # "failed") and carries a remote receipt so the caller can decide
+        # whether to retry (a retry will hit the already_applied/marker-repair
+        # path above rather than re-PATCHing) or reconcile out of band.
         return _fail(
             "postcondition_tracked_changes_detected",
             [f"changed: {f}" for f in changed[:20]],
-            status="failed",
-            extra={"mutation_outcome": "applied"},
+            status="applied_but_local_postcondition_failed",
+            extra={
+                "mutation_outcome": "applied",
+                "remote_receipt": {
+                    "issue_number": args.issue_number,
+                    "repo": args.repo,
+                    "body_sha256": actual_new_sha256,
+                    "observed_updated_at": _updated_at_after,
+                },
+                "retry_policy": "safe_to_retry_next_attempt_will_detect_already_applied_and_repair_marker",
+            },
         )
 
     marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1315,7 +1698,14 @@ def _run_issue_content_update(args, input_data, gh_bin, _fail, _ok) -> int:
     # Issue #2163: pre-mutation metadata snapshot captured before any remote
     # PATCH is attempted, threaded into _finalize_remote_success's postcondition
     # check below.
-    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+    pre_mutation_snapshot, pre_mutation_snapshot_err = _capture_pre_mutation_snapshot(
+        PROJECT_ROOT, args.issue_number, write_root
+    )
+    if pre_mutation_snapshot_err is not None:
+        return _fail(
+            f"pre_mutation_snapshot_capture_failed: {pre_mutation_snapshot_err}",
+            status="failed",
+        )
 
     before, err = _fetch_issue_content(args.issue_number, args.repo, gh_bin)
     if before is None:
@@ -1476,7 +1866,14 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
 
     # Issue #2163: pre-mutation metadata snapshot captured before any remote
     # POST is attempted, threaded into the postcondition check below.
-    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+    pre_mutation_snapshot, pre_mutation_snapshot_err = _capture_pre_mutation_snapshot(
+        PROJECT_ROOT, args.issue_number, write_root
+    )
+    if pre_mutation_snapshot_err is not None:
+        return _fail(
+            f"pre_mutation_snapshot_capture_failed: {pre_mutation_snapshot_err}",
+            status="failed",
+        )
 
     def _write_marker(comment_id, comment_url) -> None:
         marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1541,11 +1938,29 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
     # own write root (artifacts/{issue}/issue-metadata/issue_comment.publish/).
     changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
     if changed:
+        # Issue #2163 P1-3: the remote POST already succeeded (marker-literal
+        # readback above matched expected_body_sha256) -- this is a purely
+        # LOCAL failure, not a mutation failure. A retry does not risk a
+        # duplicate POST: the pre-mutation remote marker precheck above
+        # (`_find_marker_matches`) will find the just-posted comment by its
+        # marker text and take the `already_published` no-op path instead of
+        # posting again, so markerless recovery on retry is already safe even
+        # though the local marker file was never written on this attempt.
         return _fail(
             "postcondition_tracked_changes_detected",
             [f"changed: {f}" for f in changed[:20]],
-            status="failed",
-            extra={"mutation_outcome": "applied"},
+            status="applied_but_local_postcondition_failed",
+            extra={
+                "mutation_outcome": "applied",
+                "remote_receipt": {
+                    "issue_number": args.issue_number,
+                    "repo": args.repo,
+                    "comment_id": readback.get("comment_id"),
+                    "comment_url": readback.get("comment_url"),
+                    "body_sha256": readback.get("body_sha256"),
+                },
+                "retry_policy": "safe_to_retry_remote_marker_precheck_will_detect_already_published",
+            },
         )
 
     _write_marker(readback.get("comment_id"), readback.get("comment_url"))
@@ -2073,7 +2488,14 @@ def _run_test_verdict_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     gh_env = _build_pr_review_gh_env()
     # Issue #2163: pre-mutation metadata snapshot captured before any remote
     # POST is attempted, threaded into the two postcondition checks below.
-    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+    pre_mutation_snapshot, pre_mutation_snapshot_err = _capture_pre_mutation_snapshot(
+        PROJECT_ROOT, args.issue_number, write_root
+    )
+    if pre_mutation_snapshot_err is not None:
+        return _fail(
+            f"pre_mutation_snapshot_capture_failed: {pre_mutation_snapshot_err}",
+            status="failed",
+        )
 
     def _write_marker(comment: dict) -> None:
         marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2457,7 +2879,14 @@ def _run_contract_snapshot_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     # Issue #2163: pre-mutation metadata snapshot captured before the
     # ensure_contract_snapshot.py subprocess (which performs the remote POST)
     # is launched, threaded into the postcondition check below.
-    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+    pre_mutation_snapshot, pre_mutation_snapshot_err = _capture_pre_mutation_snapshot(
+        PROJECT_ROOT, args.issue_number, write_root
+    )
+    if pre_mutation_snapshot_err is not None:
+        return _fail(
+            f"pre_mutation_snapshot_capture_failed: {pre_mutation_snapshot_err}",
+            status="failed",
+        )
     cmd = [
         sys.executable,
         str(publisher),
@@ -3098,7 +3527,17 @@ def _run_issue_dependency_remove(args, input_data, gh_bin, _fail, _ok) -> int:
     # Issue #2163: pre-mutation metadata snapshot captured at this same point
     # (immediately after the precondition above passes and before any remote
     # mutation is attempted), threaded into the postcondition check below.
-    pre_mutation_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+    pre_mutation_snapshot, pre_mutation_snapshot_err = _capture_pre_mutation_snapshot(
+        PROJECT_ROOT, args.issue_number, write_root
+    )
+    if pre_mutation_snapshot_err is not None:
+        # Issue #1667 review fix_delta P1: this command id's closed
+        # result-status set never includes "failed" -- classify as
+        # precondition_rejected, matching the sibling clean-state check above.
+        return _fail(
+            f"pre_mutation_snapshot_capture_failed: {pre_mutation_snapshot_err}",
+            status="precondition_rejected",
+        )
 
     # -- Attempt marker (Issue #1667 review fix_delta P1): written BEFORE the
     # remote mutation call so any post-mutation failure (including an
@@ -3814,7 +4253,18 @@ def _run_issue_relationship_update(args, input_data, gh_bin, _fail, _ok) -> int:
     # postcondition check below. Named distinctly from `before_snapshot`
     # (the native parent/blockedBy/blocking relationship state) to avoid
     # confusion between the two unrelated "before" concepts.
-    pre_mutation_fs_snapshot = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+    pre_mutation_fs_snapshot, pre_mutation_fs_snapshot_err = _capture_pre_mutation_snapshot(
+        PROJECT_ROOT, args.issue_number, write_root
+    )
+    if pre_mutation_fs_snapshot_err is not None:
+        # Issue #1667 review fix_delta P1 (via #2163): mirrors the sibling
+        # precondition_tracked_changes_detected classification above -- this
+        # command id's closed result-status set never includes "failed".
+        return _fail(
+            f"pre_mutation_snapshot_capture_failed: {pre_mutation_fs_snapshot_err}",
+            status="precondition_rejected",
+            extra={"mutation_attempted": False, "before": before_snapshot, "desired": desired_snapshot},
+        )
 
     operations: list[dict] = []
     if not parent_noop:

@@ -2625,72 +2625,151 @@ Issue #1873 で `pr_review.publish` command id 自体および
 が repo 上に残存していても、本 skill lane はもはや参照・処理しない。）
 
 
-## `controlled_skill_mutation_exec.py` の postcondition（事後条件）を metadata-snapshot 化し `.claude/.investigation-context.md` を例外扱いにする対応（Issue #2163）
+## `controlled_skill_mutation_exec.py` の postcondition（事後条件）を union-transition + 構造化 index/filesystem-identity 比較へ再設計する対応（Issue #2163、PR #2178 REQUEST_CHANGES fix_delta）
 
 ### 背景
 
-`_check_no_tracked_changes`（postcondition checker）は、従来 mutation 実行後の
+`_check_no_tracked_changes`（postcondition checker）は、当初 mutation 実行後の
 `git status --porcelain=v1 --untracked-files=all` の 1 回のスナップショットだけを見て、
 `allowed_prefix`（`artifacts/{issue_number}/issue-metadata/{command_id}/`）配下を除く
-全ての staged/unstaged/untracked 行を無条件に violation として扱っていた（単純な
-「post 側 1 スナップショットの内容による set 判定」であり、実際には pre/post の**集合差分**
-すら取っていなかった）。この方式には 2 つの問題があった:
+全ての staged/unstaged/untracked 行を無条件に violation として扱っていた。
 
-1. **False positive**: mutation 実行前から repo に存在していた untracked ファイル
-   （`.claude/.investigation-context.md` 等）が、mutation と無関係に毎回 violation として
-   誤検知される。
-2. **False negative**: 逆に、mutation 実行前から存在した untracked/dirty ファイルの内容が
-   mutation の実行中に上書き・改変されても、`git status` の行としては pre-mutation と
-   post-mutation で同一に見えるため検出できない。
+その後 1 度目の修正（本節の旧版）で filesystem metadata snapshot
+（path -> (kind, mtime_ns, size)）比較方式へ置き換えたが、この版は PR #2178 への
+OWNER REQUEST_CHANGES レビュー（reviewed_head_sha `c86d9928`）で、実際の
+Git repository を使った再現実験により複数の fail-open が指摘された。指摘は本節末尾の
+「PR #2178 review fix_delta」節に記録し、本節冒頭は現在の実装（3 responsibility 分割 +
+`git status --porcelain=v2 -z` 構造化パース + union-based transition 判定 + exact
+filesystem node identity）を説明する。
 
-### 修正内容（AC1）
+### 現在の実装
 
-`_check_no_tracked_changes` を、`scripts/agent-guards/skill_runtime_exec.py` の
-`_snapshot_repo_paths` / `_find_unauthorized_repo_changes` に準ずる
-filesystem metadata snapshot（path -> (kind, mtime_ns, size)）比較方式へ置き換えた。
-`skill_runtime_exec.py` の実装と異なり、全 repo を `os.walk` で走査するのではなく、
-`git status` が返す候補パス集合（`allowed_prefix` 配下を除く staged/unstaged/untracked
-エントリ）に対してのみ `lstat()` を行う（`_snapshot_status_path_metadata`）。これにより
-`git status` の集合差分だけでは検出できなかった「候補として不変だが誤検知」
-「候補として存在するが内容改変」を区別しつつ、O(repo size) の全走査を避けている。
+`scripts/agent-guards/controlled_skill_mutation_exec.py` の postcondition check は
+3 つの責務に分離されている（reviewer 推奨構造どおり）:
 
-呼び出し側は、mutation を開始する**前**に `_capture_pre_mutation_snapshot()` で
-pre-mutation snapshot を取得し、mutation 後の postcondition チェック
-（`_check_no_tracked_changes(..., before_snapshot=pre_mutation_snapshot)`）へ明示的に
-スレッドする。既存の 9 呼び出し箇所（`issue_scope_snapshot.materialize` /
-`issue_body.update` / `issue_content.update` / `issue_comment.publish` /
-`test_verdict.publish`（2 箇所）/ `contract_snapshot.publish` /
-`issue_dependency.remove` / `issue_relationship.update`）すべてがこの方式に統一されている。
-`issue_dependency.remove` と `issue_relationship.update` は、既存の precondition
-（`pre_mutation_changed` チェック、mutation 呼び出し直前に置かれている）と全く同じ地点で
-pre-mutation snapshot を取得することで、追加の `git status` 呼び出しを増やさずに
-両方の目的（precondition の集合チェックと postcondition の metadata 比較）を満たす。
+- `_collect_repo_state(project_root, issue_number, allowed_prefix)`: 1 回の
+  `git status --porcelain=v2 -z --untracked-files=all --renames` 呼び出しを bytes で
+  取得し、NUL 区切りレコードを構造的にパースする（`_run_git_status_v2_z`）。
+  Ordinary（`1 ...`）/ Rename・Copy（`2 ...` + 個別 orig-path フィールド）/
+  Unmerged（`u ...`）/ Untracked（`? ...`）の各レコード種別を、C-style quoting に
+  依存せず literal bytes のまま扱う。rename/copy は destination（`path`）と
+  source（`orig_path`）の両方を個別に `allowed_prefix` 判定し、どちらか一方でも
+  範囲外なら両エンドポイントとも候補集合に含める。候補となった各パスについて、
+  `_stat_fs_node()` で exact filesystem node identity（`node_type` /
+  `st_mode` / `st_dev` / `st_ino` / `st_nlink` / `st_ctime_ns` / `st_mtime_ns` /
+  `st_size` / regular file の場合は SHA-256 content digest / symlink の場合は
+  `readlink()` target）を取得する。
+- `_check_clean_precondition(project_root, issue_number, allowed_prefix)`: mutation 開始前の
+  「現在状態が clean か」を判定するゲート。`_collect_repo_state` を呼び、
+  候補パスがあれば違反として返す。戻り値は `(repo_state, violations)` で、
+  `repo_state` はそのまま pre-mutation snapshot として再利用できる
+  （`git status` の二重呼び出しを避ける）。
+- `_compare_repo_transition(before, after)`: `before.candidate_paths | after.candidate_paths`
+  の**和集合**を比較する（片方の snapshot にしか候補として現れないパスも判定対象に含める）。
+  各パスについて `_UNOBSERVED`（このスナップショットでは候補にすらならなかった）と
+  実際の観測結果を区別し、before/after で観測内容（index の `XY` / mode / object id /
+  filesystem node identity）が完全一致しない限り violation とする。
 
-`before_snapshot=None`（未指定）の場合は、従来通り候補行を無条件に violation として扱う
-fail-closed な defensive fallback を維持している。
+`_capture_pre_mutation_snapshot()` / `_check_no_tracked_changes()` は既存の呼び出し
+シグネチャを維持したまま、内部でこれら 3 primitive を使うよう再実装されている
+（各 `_run_*` コマンドハンドラ側の呼び出し箇所は変更不要）。
+`_capture_pre_mutation_snapshot()` は `(repo_state, error)` のタプルを返すようになり、
+capture 失敗時は `error` が `None` でなくなる。全 8 呼び出し箇所は capture 失敗を
+明示的にチェックし、リモート mutation を試みる前に停止する
+（`pre_mutation_snapshot_capture_failed` で `_fail(...)` する。旧版の
+`except Exception: return {}` フォールバックは廃止した）。
 
-### `.claude/.investigation-context.md` の調査結果と扱い（AC6）
+### PR #2178 review fix_delta（P0-1〜P1-3）で解消した fail-open
 
-本 Issue の起票前調査、および実装時の再確認で、`rg -n "investigation-context"` は
-本 Issue によるコード追加以前は repo 内でゼロ件だった（producer/consumer の記述なし）。
-`.gitignore` にも未定義。`.claude/` 配下の固定パスに単一ファイルとして現れる
-グローバル untracked artifact であり、本 repo のどのスクリプトがこれを生成しているかを
-示す証跡は見つからなかった。最も可能性が高い生成元は Claude Code ツール本体（本 repo が
-制御できない外部プロセス）である。
+OWNER レビューは、旧版の実装と同じ pathname 抽出・snapshot・比較式を最小 Git
+repository で再現し、新規作成・削除・rename・staging・内容改変・mode 改変の
+いずれについても検知漏れ（`[]`）を確認した。各指摘への対応は以下のとおり:
 
-この判定に基づき、以下の 2 段構えの対応を行った:
+- **P0-1（non_z_porcelain_path_parser_fail_open）**: `git status --porcelain=v1` +
+  `text=True` + `splitlines()` + `line[3:]` によるパースは、空白・タブ・改行・引用符・
+  バックスラッシュ等を含む pathname の C-style quoting を解釈できず、引用符付き文字列を
+  そのまま `lstat()` してしまう（実ファイルと一致せず `None == None` で許可される）。
+  また rename 行全体が許可 prefix から始まっていれば、移動先が範囲外でも丸ごと除外されて
+  いた。`git status --porcelain=v2 -z --untracked-files=all --renames` を bytes で
+  取得し NUL レコードを構造的に解析する方式へ置き換え、rename/copy の destination /
+  source を個別に許可判定するようにした（上記「現在の実装」参照）。
+- **P0-2（deletion_absence_sentinel_collision）**: 「snapshot にキーがない」
+  （このスナップショットでは候補にならなかった）と「ファイルが存在しない」
+  （lstat で `FileNotFoundError` を確認した）が同じ `None` に畳み込まれており、
+  clean な tracked file の削除や、pre-existing untracked file の削除
+  （post 側 `git status` から pathname 自体が消える）を検出できなかった。
+  `_ABSENT`（確認済みの不在）と `_UNOBSERVED`（このスナップショットでは候補でなかった）を
+  別 sentinel に分離し、`_compare_repo_transition` は
+  `before.candidate_paths | after.candidate_paths` の和集合を比較する。
+- **P0-3（git_index_transition_not_snapshotted）**: 旧版は `XY` を表示用にしか
+  使っておらず、before/after の index state 自体を比較していなかったため、
+  `git add`（untracked -> staged）や unstaged -> staged の遷移が、filesystem
+  metadata が不変であれば通過していた。`_PorcelainEntry` / `_PathObservation` に
+  `XY` / `mode_head` / `mode_index` / `mode_worktree` / `hash_head` / `hash_index` /
+  `orig_path` を保持し、`_PathObservation` の等価比較（frozen dataclass）に含めた。
+- **P1-1（metadata_identity_insufficient / ambiguous_oserror_treated_as_absent）**:
+  旧版は全ノードを `"file"` に畳み込み mtime/size のみ比較し、あらゆる `OSError` を
+  `None`（absent）扱いにしていた。同サイズの内容書換え + mtime 復元、chmod-only
+  変更、regular/symlink/FIFO/socket/device の置換、EACCES/EIO/ENOTDIR と真の不在の
+  区別ができなかった。`_stat_fs_node()` は `FileNotFoundError` のみ `_ABSENT` とし、
+  それ以外の `OSError` は `_RepoStateCaptureError` を送出して呼び出し元へ伝播させる
+  （baseline capture failure として fail-closed）。regular file は
+  `hashlib.file_digest(fh, "sha256")` で content digest を取り、symlink は
+  `os.readlink()` の target を保持し、`st_mode` / `st_dev` / `st_ino` / `st_nlink` /
+  `st_ctime_ns` を含めた。`_capture_pre_mutation_snapshot()` の `except Exception:
+  return {}` フォールバックは廃止し、capture 失敗はタプルの 2 要素目（`error`）で
+  明示的に呼び出し元へ返し、各 `_run_*` ハンドラはリモート mutation 前にこれを
+  チェックして停止する。
+- **P1-3（markerless_remote_recovery_missing）**: `issue_body.update` は、remote body が
+  既に `new_body_sha256` と一致しているかどうかのチェックが「ローカル marker が存在する」
+  分岐の内側にしかなく、marker が書き込まれる前に失敗した場合（remote PATCH は成功したが
+  local postcondition/marker 書き込みが失敗した場合）、次のリトライは marker なしで
+  `previous_body_sha256` の stale precondition に進んでしまっていた。remote readback と
+  desired state の比較を marker の有無に関係なく最初に行うよう変更し、一致していれば
+  marker を repair（再作成）して `already_applied`（`marker_state:
+  already_applied_marker_repaired`）として返すようにした。postcondition failure 時は
+  `status: applied_but_local_postcondition_failed`（通常の mutation failure と区別）と、
+  `remote_receipt`（issue 番号 / repo / body or comment のハッシュ・ID・URL /
+  observed updated_at）・`retry_policy` を `extra` に含めて返す。`issue_comment.publish`
+  は元々 POST 前の remote marker precheck（`_find_marker_matches`、marker 文字列による
+  リモート検索）を持っており、これは local marker file の有無に依存しない markerless
+  recovery として既に機能していたため、postcondition failure 時の `extra` /
+  `status` のみ同じ形式に揃えた。
 
-1. **一般対応（AC1 の metadata-snapshot 化）**: mutation の前後で内容
-   （mtime/size）が変化していない限り、そもそも violation として検出されなくなった。
-2. **明示的 exemption**: 1. だけでは、`.claude/.investigation-context.md` が
-   偶然この executor の mutation window 中に外部プロセスから触られた場合に
-   誤検知が残る可能性があるため、`skill_runtime_exec.py` の
-   race-tolerant-unattributable peer root（`_race_tolerant_unattributable_roots`）と
-   同じ考え方で、`_INVESTIGATION_CONTEXT_EXEMPT_REL`
-   （`.claude/.investigation-context.md`）を候補パス集合から明示的に除外した
-   （`_capture_pre_mutation_snapshot` / `_check_no_tracked_changes` の両方）。
+### `.claude/.investigation-context.md` の再調査と扱いの撤回（P1-2）
 
-`.gitignore` にも `.claude/.investigation-context.md` を追加し、この既知の
-repo-uncontrollable な untracked artifact が `git status` のノイズとして
-恒常的に現れないようにした（根本原因の記録を `.gitignore` エントリだけに
-留めず、本セクションに残している）。
+旧版は「repo 内に producer/consumer の記述がない」ことのみを根拠に、生成元を
+「Claude Code ツール本体である可能性が高い」と推測した上で、`.gitignore` への追加と
+`_INVESTIGATION_CONTEXT_EXEMPT_REL` によるチェッカーからの完全除外まで進めていた。
+OWNER レビューは、これが証明ではなく blind spot の恒久化であると指摘した
+（`.gitignore` 登録は `git status` ベースのチェッカーがこのファイルの作成・変更・削除を
+一切観測できなくすることを意味し、コード内の exact exemption よりも強い恒久的な
+blind spot になる）。
+
+本 fix_delta で以下を実施した:
+
+- `.gitignore` への `.claude/.investigation-context.md` エントリを撤回した。
+- コード内の `_INVESTIGATION_CONTEXT_EXEMPT_REL` によるチェッカー除外を撤回した。
+  以後このファイルは他の候補パスと全く同じ union-based transition 比較の対象になる。
+- 実際に確認できる範囲での再調査を行った: `git grep -n "investigation-context" -- .`
+  および `git log --all --diff-filter=A --name-only -- "**/.investigation-context.md"`
+  は本 repo でゼロ件（過去含め一度もコミットされたことがない）。`.claude/skills/**` の
+  スクリプト・`.claude/settings.json` のいずれにもこのファイル名への参照はなく、
+  このファイルを生成・消費する repo 管理下のコード / hook は見つからなかった。
+  Claude Code 公式の `.claude` ディレクトリ仕様（CLAUDE.md / settings / hooks /
+  skills / commands / subagents / rules）にも、このファイルを標準要素として扱う
+  根拠はない。以上により「本 repo が制御できる producer は存在しない」ことは
+  再確認できたが、「Claude Code ツール本体が生成している」という主張自体は
+  runtime trace や process open/write trace までは取得できておらず、確認済みの
+  事実ではなく推測の域を出ない。この限界を明記した上で、blanket exemption は行わない。
+- 既存の namespace 化された transport（`--investigation-evidence-transport-path`、
+  `.claude/artifacts/issue-refinement-loop/<issue>/<run-id>/`）は、issue-refinement-loop
+  の investigation evidence 専用の仕組みであり、本ファイル（`.claude/.investigation-context.md`）
+  の producer が repo 側に存在しない以上、統合先として使う対象がない
+  （統合すべき repo 側コードが見つからなかった）。
+- 結果として、このファイルが実際に mutation window 中に外部プロセスから変更された
+  場合、他の候補パスと同様に violation として検出される（fail-closed がデフォルトに
+  戻った）。もし将来この誤検知が実際に運用上の問題として観測された場合は、その時点で
+  得られる具体的な証跡（実際に観測された変更内容・タイミング）を根拠に、exact path の
+  producer を特定した上で再度対応を検討する。証跡のない事前の blanket exemption は
+  行わない。

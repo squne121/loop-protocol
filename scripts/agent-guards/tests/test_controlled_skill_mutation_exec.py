@@ -403,8 +403,9 @@ class TestPostconditionExtended:
         preexisting = tmp_project / "investigation_style_artifact.md"
         preexisting.write_text("unchanged content")
         write_root = "artifacts/1166/"
-        pre_snapshot = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
-        assert "investigation_style_artifact.md" in pre_snapshot
+        pre_snapshot, pre_err = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
+        assert pre_err is None
+        assert "investigation_style_artifact.md" in pre_snapshot.candidate_paths
 
         # Nothing touches the file during the (simulated) mutation.
         violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, pre_snapshot)
@@ -420,8 +421,9 @@ class TestPostconditionExtended:
         preexisting = tmp_project / "preexisting_overwritten.md"
         preexisting.write_text("original content")
         write_root = "artifacts/1166/"
-        pre_snapshot = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
-        assert "preexisting_overwritten.md" in pre_snapshot
+        pre_snapshot, pre_err = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
+        assert pre_err is None
+        assert "preexisting_overwritten.md" in pre_snapshot.candidate_paths
 
         # Simulate the mutation overwriting the pre-existing file's content
         # in place (different size -- and, on most filesystems, different
@@ -437,13 +439,303 @@ class TestPostconditionExtended:
         under the new metadata-snapshot comparison, matching the previous
         fail-closed behavior for genuinely new changes."""
         write_root = "artifacts/1166/"
-        pre_snapshot = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
-        assert pre_snapshot == {}
+        pre_snapshot, pre_err = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
+        assert pre_err is None
+        assert pre_snapshot.candidate_paths == frozenset()
 
         (tmp_project / "new_during_mutation.md").write_text("created during the mutation")
 
         violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, pre_snapshot)
         assert any("new_during_mutation.md" in v for v in violations)
+
+
+# =============================================================================
+# Issue #2163 review fix_delta (PR #2178 REQUEST_CHANGES): real Git-repository
+# regression tests for the porcelain=v2 -z / union-transition / metadata-
+# identity / fail-closed-error primitives. These run real `git status
+# --porcelain=v2 -z` subprocess calls against a real repository (not mocked)
+# so the tests exercise the same code path production traffic uses.
+# =============================================================================
+
+
+class TestPostconditionRealGitRegressions:
+    """OWNER-specified minimum regression coverage (PR #2178 review comment)."""
+
+    def _snapshot(self, project_root, write_root="artifacts/1166/"):
+        state, err = _exec._capture_pre_mutation_snapshot(project_root, 1166, write_root)
+        assert err is None, f"unexpected capture error: {err}"
+        return state
+
+    def test_rejects_new_untracked_path_with_space(self, tmp_project):
+        """P0-1: a brand-new untracked path containing a space must be parsed
+        correctly (porcelain=v1 C-style-quotes it; porcelain=v2 -z does not)
+        and detected as a violation, not silently dropped by a quote-vs-lstat
+        mismatch."""
+        before = self._snapshot(tmp_project)
+        (tmp_project / "space name.txt").write_text("new file with a space in its name")
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, "artifacts/1166/", before)
+        assert any("space name.txt" in v for v in violations)
+
+    def test_rejects_path_with_tab_newline_quote_and_backslash(self, tmp_project):
+        """P0-1: pathnames with characters porcelain=v1 would C-style-quote
+        (tab, double quote, backslash) must still be individually authorized
+        under -z's literal-bytes encoding."""
+        before = self._snapshot(tmp_project)
+        weird_name = 'weird"quote\\slash_and_tabbed.txt'
+        (tmp_project / weird_name).write_text("weird pathname content")
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, "artifacts/1166/", before)
+        assert any(weird_name in v for v in violations)
+
+    def test_rejects_rename_from_allowed_root_to_forbidden_root(self, tmp_project):
+        """P0-1: a rename whose destination lands outside allowed_prefix must
+        be rejected even though the whole porcelain line would have started
+        with the allowed prefix under the old whole-line-prefix check."""
+        write_root = "artifacts/1166/"
+        allowed_dir = tmp_project / "artifacts" / "1166"
+        allowed_dir.mkdir(parents=True, exist_ok=True)
+        src = allowed_dir / "inside.txt"
+        src.write_text("moved out of the allowed root")
+        subprocess.run(["git", "-C", str(tmp_project), "add", "-A"], capture_output=True, check=True)
+        subprocess.run(
+            ["git", "-C", str(tmp_project), "commit", "-m", "seed"],
+            capture_output=True,
+            check=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                 "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+        before = self._snapshot(tmp_project, write_root)
+        dest = tmp_project / "outside.txt"
+        subprocess.run(["git", "-C", str(tmp_project), "mv", str(src), str(dest)], capture_output=True, check=True)
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, before)
+        assert any("outside.txt" in v for v in violations)
+
+    def test_rejects_rename_from_forbidden_root_to_allowed_root(self, tmp_project):
+        """P0-1: a rename whose SOURCE is outside allowed_prefix must be
+        rejected even though its destination lands inside allowed_prefix."""
+        write_root = "artifacts/1166/"
+        src = tmp_project / "forbidden_source.txt"
+        src.write_text("about to be moved into the allowed root")
+        subprocess.run(["git", "-C", str(tmp_project), "add", "-A"], capture_output=True, check=True)
+        subprocess.run(
+            ["git", "-C", str(tmp_project), "commit", "-m", "seed"],
+            capture_output=True,
+            check=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                 "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+        before = self._snapshot(tmp_project, write_root)
+        (tmp_project / "artifacts" / "1166").mkdir(parents=True, exist_ok=True)
+        dest = tmp_project / "artifacts" / "1166" / "moved_in.txt"
+        subprocess.run(["git", "-C", str(tmp_project), "mv", str(src), str(dest)], capture_output=True, check=True)
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, before)
+        assert any("moved_in.txt" in v or "forbidden_source.txt" in v for v in violations)
+
+    def test_rejects_newly_deleted_tracked_file(self, tmp_project):
+        """P0-2: a clean tracked file deleted during the mutation window must
+        be rejected even though it never appeared as a `git status` candidate
+        before the deletion (it was clean)."""
+        write_root = "artifacts/1166/"
+        tracked = tmp_project / "README_TRACKED.md"
+        tracked.write_text("tracked and clean")
+        subprocess.run(["git", "-C", str(tmp_project), "add", "-A"], capture_output=True, check=True)
+        subprocess.run(
+            ["git", "-C", str(tmp_project), "commit", "-m", "seed"],
+            capture_output=True,
+            check=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                 "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+        before = self._snapshot(tmp_project, write_root)
+        assert "README_TRACKED.md" not in before.candidate_paths  # clean -> not a candidate yet
+        tracked.unlink()
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, before)
+        assert any("README_TRACKED.md" in v for v in violations)
+
+    def test_rejects_deleted_preexisting_untracked_file(self, tmp_project):
+        """P0-2: a pre-existing untracked file deleted during the mutation
+        window must be rejected even though its deletion leaves ZERO trace in
+        post-mutation `git status` output (an untracked path that no longer
+        exists is simply absent from the listing)."""
+        write_root = "artifacts/1166/"
+        preexisting = tmp_project / "preexisting_untracked_to_delete.md"
+        preexisting.write_text("will be deleted")
+        before = self._snapshot(tmp_project, write_root)
+        assert "preexisting_untracked_to_delete.md" in before.candidate_paths
+        preexisting.unlink()
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, before)
+        assert any("preexisting_untracked_to_delete.md" in v for v in violations)
+
+    def test_rejects_untracked_to_staged_transition(self, tmp_project):
+        """P0-3: `git add` on a previously-untracked file (staging it) must be
+        rejected even when filesystem metadata (mtime/size/content) is
+        completely unchanged -- the git INDEX state itself changed."""
+        write_root = "artifacts/1166/"
+        target = tmp_project / "untracked_then_staged.md"
+        target.write_text("unchanged content throughout")
+        before = self._snapshot(tmp_project, write_root)
+        subprocess.run(["git", "-C", str(tmp_project), "add", str(target)], capture_output=True, check=True)
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, before)
+        assert any("untracked_then_staged.md" in v for v in violations)
+
+    def test_rejects_unstaged_to_staged_transition(self, tmp_project):
+        """P0-3: `git add` on a previously-unstaged (already-tracked, already
+        modified) file must be rejected -- the XY code moves from ` M` to
+        `M ` even though the working-tree bytes never change again."""
+        write_root = "artifacts/1166/"
+        tracked = tmp_project / "tracked_modified.md"
+        tracked.write_text("original tracked content")
+        subprocess.run(["git", "-C", str(tmp_project), "add", "-A"], capture_output=True, check=True)
+        subprocess.run(
+            ["git", "-C", str(tmp_project), "commit", "-m", "seed"],
+            capture_output=True,
+            check=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                 "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+        tracked.write_text("modified but not yet staged")
+        before = self._snapshot(tmp_project, write_root)
+        assert "tracked_modified.md" in before.candidate_paths
+        subprocess.run(["git", "-C", str(tmp_project), "add", str(tracked)], capture_output=True, check=True)
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, before)
+        assert any("tracked_modified.md" in v for v in violations)
+
+    def test_rejects_same_size_content_change_with_restored_mtime(self, tmp_project):
+        """P1-1: a same-size content rewrite with the mtime restored to its
+        original value must still be rejected via the SHA-256 content digest
+        comparison (mtime/size alone cannot distinguish this)."""
+        write_root = "artifacts/1166/"
+        target = tmp_project / "same_size_rewrite.md"
+        target.write_text("AAAAAAAAAA")
+        before = self._snapshot(tmp_project, write_root)
+        original_stat = target.stat()
+        target.write_text("BBBBBBBBBB")
+        os.utime(target, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, before)
+        assert any("same_size_rewrite.md" in v for v in violations)
+
+    def test_rejects_chmod_only_change(self, tmp_project):
+        """P1-1: a mode-only change (chmod +x) on a pre-existing untracked
+        file, with content/mtime/size unchanged, must still be rejected via
+        `st_mode` comparison."""
+        write_root = "artifacts/1166/"
+        target = tmp_project / "chmod_only.md"
+        target.write_text("content never changes")
+        before = self._snapshot(tmp_project, write_root)
+        target.chmod(0o755)
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, before)
+        assert any("chmod_only.md" in v for v in violations)
+
+    def test_rejects_regular_to_symlink_fifo_or_socket_transition(self, tmp_project):
+        """P1-1: replacing a regular file with a symlink (same relative path)
+        must be rejected via `node_type` comparison."""
+        write_root = "artifacts/1166/"
+        target = tmp_project / "type_swap.md"
+        target.write_text("a regular file")
+        before = self._snapshot(tmp_project, write_root)
+        target.unlink()
+        target.symlink_to(tmp_project / "type_swap_target_does_not_matter.md")
+        violations = _exec._check_no_tracked_changes(tmp_project, 1166, write_root, before)
+        assert any("type_swap.md" in v for v in violations)
+
+    def test_fails_closed_on_lstat_eacces_eio_enotdir(self, tmp_project, monkeypatch):
+        """P1-1: any `OSError` other than `FileNotFoundError` while stat-ing a
+        candidate path (e.g. EACCES/EIO/ENOTDIR) must raise/propagate as a
+        capture failure, not be silently folded into "absent"."""
+        write_root = "artifacts/1166/"
+        target = tmp_project / "unreadable.md"
+        target.write_text("content")
+
+        real_lstat = Path.lstat
+
+        def _flaky_lstat(self, *a, **kw):
+            if self.name == "unreadable.md":
+                raise PermissionError(13, "Permission denied")
+            return real_lstat(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "lstat", _flaky_lstat)
+        state, err = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
+        assert state is None
+        assert err is not None
+        assert "lstat_failed" in err
+
+    def test_fails_before_remote_mutation_when_pre_snapshot_fails(self, tmp_project, monkeypatch):
+        """P1-1: `_capture_pre_mutation_snapshot`'s error must be surfaced
+        distinctly from a successful-but-empty snapshot (the previous
+        `except Exception: return {}` fallback was indistinguishable from
+        "nothing to compare against"), giving callers what they need to stop
+        before attempting any remote mutation."""
+        write_root = "artifacts/1166/"
+
+        def _boom(*a, **kw):
+            raise _exec._RepoStateCaptureError("git_status_v2_exception: simulated transport failure")
+
+        monkeypatch.setattr(_exec, "_collect_repo_state", _boom)
+        state, err = _exec._capture_pre_mutation_snapshot(tmp_project, 1166, write_root)
+        assert state is None
+        assert err is not None and "simulated transport failure" in err
+
+    def test_issue_body_retry_repairs_marker_after_remote_applied(self, tmp_project, monkeypatch):
+        """P1-3: on a retry after a prior attempt's remote PATCH succeeded but
+        local postcondition/marker writing failed, a fresh remote readback
+        that already matches the desired body must repair the marker and
+        report `already_applied` -- not fall through to a stale-precondition
+        rejection because no marker exists locally yet (the old code path
+        only checked remote-vs-desired equality inside the
+        `if marker_data is not None` branch)."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        new_body = "updated body content"
+        new_body_sha256 = "sha256:" + hashlib.sha256(new_body.encode("utf-8")).hexdigest()
+
+        marker_path = _exec._issue_metadata_marker_path(
+            tmp_project, 1166, COMMAND_ID_ISSUE_BODY_UPDATE, "issue_body_update.marker.json"
+        )
+        assert not marker_path.exists()  # no local marker survived the prior attempt's failure
+
+        # Remote already reflects the desired state -- as if a prior PATCH
+        # succeeded but the caller crashed / failed locally before writing
+        # the marker.
+        monkeypatch.setattr(
+            _exec, "_fetch_issue_body_and_updated_at", lambda *a, **k: (new_body, "t2", "")
+        )
+
+        patch_calls = {"n": 0}
+
+        def _fail_if_patched(*a, **k):
+            patch_calls["n"] += 1
+            return ""  # would only be reached if the bug regresses and a second PATCH is attempted
+
+        monkeypatch.setattr(_exec, "_patch_issue_body", _fail_if_patched)
+
+        args = SimpleNamespace(
+            issue_number=1166,
+            command_id=COMMAND_ID_ISSUE_BODY_UPDATE,
+            repo=TRUSTED_REPO,
+            dry_run=False,
+            output_json=False,
+        )
+        # previous_body_sha256/previous_updated_at intentionally do NOT match
+        # current remote state (they describe the state BEFORE the prior
+        # successful-but-unmarked PATCH) -- the stale-precondition check must
+        # never even be reached because the already-applied short-circuit
+        # above it takes priority.
+        input_data = {
+            "previous_body_sha256": "sha256:" + hashlib.sha256(b"stale original body").hexdigest(),
+            "previous_updated_at": "t0",
+            "new_body": new_body,
+            "new_body_sha256": new_body_sha256,
+        }
+        _fail, _ok, calls = _capture_fail_ok()
+
+        rc = _exec._run_issue_body_update(args, input_data, "gh", _fail, _ok)
+
+        assert rc == 0
+        assert patch_calls["n"] == 0  # no duplicate remote PATCH was attempted
+        assert calls["ok_extra"]["status_detail"] == "already_applied"
+        assert calls["ok_extra"]["marker_state"] == "already_applied_marker_repaired"
+        assert calls["ok_extra"]["idempotency_marker_repaired"] is True
+        assert marker_path.exists()  # the marker was repaired for future idempotency
+        repaired = json.loads(marker_path.read_text())
+        assert repaired["new_body_sha256"] == new_body_sha256
 
 
 # =============================================================================
@@ -511,7 +803,11 @@ class TestMutationOutcomeOnPostconditionFailure:
 
         assert rc == 1
         assert calls["reason"] == "postcondition_tracked_changes_detected"
-        assert calls["extra"] == {"mutation_outcome": "applied"}
+        assert calls["status"] == "applied_but_local_postcondition_failed"
+        assert calls["extra"]["mutation_outcome"] == "applied"
+        assert calls["extra"]["remote_receipt"]["body_sha256"] == new_body_sha256
+        assert calls["extra"]["remote_receipt"]["observed_updated_at"] == "t2"
+        assert "retry_policy" in calls["extra"]
 
     def test_issue_comment_publish_postcondition_failure_reports_mutation_outcome(self, tmp_project, monkeypatch):
         monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
@@ -546,7 +842,11 @@ class TestMutationOutcomeOnPostconditionFailure:
 
         assert rc == 1
         assert calls["reason"] == "postcondition_tracked_changes_detected"
-        assert calls["extra"] == {"mutation_outcome": "applied"}
+        assert calls["status"] == "applied_but_local_postcondition_failed"
+        assert calls["extra"]["mutation_outcome"] == "applied"
+        assert calls["extra"]["remote_receipt"]["comment_id"] == "1"
+        assert calls["extra"]["remote_receipt"]["body_sha256"] == expected_body_sha256
+        assert "retry_policy" in calls["extra"]
 
 
 # =============================================================================
