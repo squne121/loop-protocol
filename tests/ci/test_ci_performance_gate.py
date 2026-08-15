@@ -409,13 +409,76 @@ def _normalize_run_attempt(baseline: dict) -> int | None:
     return value
 
 
+def _identity_normalized_json(baseline: dict) -> str:
+    """#2182 P1 (fix_delta after OWNER adversarial review of PR #2182,
+    issuecomment-5302446086): canonical (sorted-keys) JSON view of
+    `baseline`, used for byte-for-byte identity comparison -- two
+    baselines compare equal under this function iff EVERY field
+    matches."""
+    return json.dumps(baseline, sort_keys=True, default=str)
+
+
+def _detect_run_attempt_identity_collisions(baselines: list[dict]) -> dict[object, list[dict]]:
+    """#2182 P1: identity is fixed to `(workflow_run_id, job,
+    run_attempt)` (`run_attempt` normalized via `_normalize_run_attempt`,
+    which -- for THIS gate module only, see `_select_initial_attempt_
+    baselines`'s own docstring for why -- still defaults a MISSING
+    `run_attempt` key to 1). Baselines sharing that identity slot are
+    treated as an idempotent, harmless duplicate ONLY if the ENTIRE
+    normalized baseline is byte-for-byte identical
+    (`_identity_normalized_json`); if even a SINGLE field differs
+    (`elapsed_ms` / fingerprint fields / `cohort_role` / any other
+    field), the WHOLE `workflow_run_id` sample is flagged as a
+    collision -- this supersedes the pre-fix_delta `min()` tie-break,
+    which silently picked one candidate instead of detecting a genuine
+    content conflict (the OWNER-flagged defect: two baselines sharing a
+    `workflow_run_id`/attempt but disagreeing on measurement/fingerprint/
+    policy fields would silently resolve via `min()`)."""
+    by_key: dict[tuple, list[dict]] = {}
+    for baseline in baselines:
+        workflow_run_id = baseline.get("workflow_run_id")
+        if workflow_run_id is None:
+            continue
+        if _normalize_run_attempt(baseline) != 1:
+            continue
+        by_key.setdefault((workflow_run_id, baseline.get("job"), 1), []).append(baseline)
+
+    collisions: dict[object, list[dict]] = {}
+    for (workflow_run_id, _job, _attempt), group in by_key.items():
+        if len(group) < 2:
+            continue
+        normalized = {_identity_normalized_json(b) for b in group}
+        if len(normalized) > 1:
+            collisions.setdefault(workflow_run_id, []).extend(group)
+    return collisions
+
+
 def _select_initial_attempt_baselines(baselines: list[dict]) -> dict[object, dict]:
     """#2179 P0-2/P1-1 (supersedes the #2159 first-seen-wins version):
     sample identity is `workflow_run_id`; among baselines sharing one id,
     only the run_attempt == 1 candidate (default when absent) is kept.
     Order-independent -- groups by id first via a dict-of-lists, never
     relies on insertion order. Baselines missing `workflow_run_id` are
-    excluded (cannot be deduped/paired safely)."""
+    excluded (cannot be deduped/paired safely).
+
+    NOTE (#2182 fix_delta scope boundary, OWNER adversarial review
+    issuecomment-5302446086 P0-3): unlike the COLLECTOR's
+    `_normalize_run_attempt` (`scripts/ci/collect_e2e_performance_
+    benchmark.py`), THIS gate module intentionally still defaults a
+    MISSING `run_attempt` key to 1 for trusted-cohort eligibility. Fully
+    unifying this with the collector's stricter (missing-excludes-from-
+    cohort) policy would require also changing `_baseline()` fixtures in
+    `tests/ci/test_ci_performance_gate_paired_critical_path.py` (and
+    other satellite files), which are OUTSIDE Issue #2179's Allowed
+    Paths -- an explicit Stop Condition ("performance gate related
+    files ... requiring a change is discovered"). This asymmetry is a
+    KNOWN, documented limitation of this fix_delta; a follow-up Issue
+    widening the Allowed Paths to the satellite files would be needed to
+    fully unify it. The #2182 P1 identity-collision fix
+    (`_detect_run_attempt_identity_collisions` above) IS fully applied
+    here, since it does not change any existing fixture's selected
+    result (collisions only trigger on genuine, previously-`min()`-
+    silenced content disagreement)."""
     by_id: dict[object, list[dict]] = {}
     for baseline in baselines:
         workflow_run_id = baseline.get("workflow_run_id")
@@ -423,8 +486,12 @@ def _select_initial_attempt_baselines(baselines: list[dict]) -> dict[object, dic
             continue
         by_id.setdefault(workflow_run_id, []).append(baseline)
 
+    collisions = _detect_run_attempt_identity_collisions(baselines)
+
     selected: dict[object, dict] = {}
     for workflow_run_id, group in by_id.items():
+        if workflow_run_id in collisions:
+            continue
         candidates = [b for b in group if _normalize_run_attempt(b) == 1]
         if not candidates:
             continue

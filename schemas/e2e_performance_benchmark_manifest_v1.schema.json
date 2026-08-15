@@ -192,9 +192,8 @@
           "description": "#2179 AC4: the GitHub Actions rerun-attempt number (`GITHUB_RUN_ATTEMPT`) SELECTED for this sample under `rerun_attempt_selection_policy` -- always 1 under the current `initial_attempt_only_v1` policy (a `workflow_run_id` whose attempt 1 failed/is missing is excluded from the cohort entirely, never substituted with a later attempt). Backward-compatible OPTIONAL field: manifests produced before #2179 omit it."
         },
         "rerun_attempt_selection_policy": {
-          "type": "string",
-          "minLength": 1,
-          "description": "#2179 AC3/AC4: identifies the deterministic, order-independent policy used to select `run_attempt` for this sample (currently always `initial_attempt_only_v1`). Backward-compatible OPTIONAL field: manifests produced before #2179 omit it."
+          "enum": ["initial_attempt_only_v1"],
+          "description": "#2179 AC3/AC4 (narrowed by #2182 fix_delta hygiene item, OWNER adversarial review issuecomment-5302446086): identifies the deterministic, order-independent policy used to select `run_attempt` for this sample. Restricted to the single currently-recognized policy name -- an unrecognized policy string is never silently accepted as if it were a known policy. Backward-compatible OPTIONAL field: manifests produced before #2179 omit it."
         }
       }
     },

@@ -162,3 +162,86 @@ def test_order_independent_parametrized_matches_canonical_sort(shuffle_fn):
         assert wid_a == wid_b
         assert core_a == core_b
         assert responsive_a == responsive_b
+
+
+
+# --------------------------------------------------------------------------- #
+# #2182 P1 (fix_delta after OWNER adversarial review of PR #2182,
+# issuecomment-5302446086): identity collisions must be detected on the
+# ENTIRE normalized baseline (byte-for-byte), never merely `min()`-
+# resolved -- mirrored from the collector's own #2182 P1 fix
+# (`scripts/ci/collect_e2e_performance_benchmark.py`), independently
+# implemented per this module's Allowed Paths boundary.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "extra_fields,differing_field,value_b",
+    [
+        ({}, "measurements", [{"phase_id": "test_e2e_ci", "elapsed_ms": 999_000, "status": 0}]),
+        ({"host_runner_image": "ubuntu-24.04"}, "host_runner_image", "ubuntu-22.04"),
+        (
+            {"rerun_attempt_selection_policy": "initial_attempt_only_v1"},
+            "rerun_attempt_selection_policy",
+            "some_other_policy",
+        ),
+    ],
+    ids=["measurement", "fingerprint", "policy_name"],
+)
+def test_identity_collision_on_any_disagreeing_field_excludes_whole_sample(extra_fields, differing_field, value_b):
+    """GIVEN two baselines sharing `(workflow_run_id, job, run_attempt)`
+    but disagreeing on a measurement / comparability-fingerprint / policy
+    field (the pre-fix_delta `min()` tie-break's blind spot -- it only
+    ever compared the canonical-JSON encoding as a TIE-BREAK KEY, never
+    detected the disagreement itself as a genuine conflict) WHEN examined
+    via `_detect_run_attempt_identity_collisions` THEN the
+    `workflow_run_id` is flagged as a collision (#2182 P1)."""
+    baseline_a = dict(_baseline("e2e-core", 990, elapsed_ms=100_000, run_attempt=1), **extra_fields)
+    baseline_b = dict(baseline_a, **{differing_field: value_b})
+    assert baseline_a[differing_field] != baseline_b[differing_field]
+
+    collisions = gate._detect_run_attempt_identity_collisions([baseline_a, baseline_b])
+    assert 990 in collisions
+    assert len(collisions[990]) == 2
+
+    selected = gate._select_initial_attempt_baselines([baseline_a, baseline_b])
+    assert 990 not in selected
+
+
+def test_byte_identical_duplicate_is_unchanged_not_a_collision():
+    """GIVEN two BYTE-FOR-BYTE identical baselines sharing
+    `(workflow_run_id, job, run_attempt)` (a harmless duplicate) WHEN
+    selected THEN this is NOT a collision -- exactly one baseline is
+    selected, with its original field values intact (#2182 P1: only
+    content DISAGREEMENT is a collision)."""
+    baseline_a = _baseline("e2e-core", 991, elapsed_ms=150_000, run_attempt=1)
+    baseline_b = dict(baseline_a)
+
+    collisions = gate._detect_run_attempt_identity_collisions([baseline_a, baseline_b])
+    assert 991 not in collisions
+
+    selected = gate._select_initial_attempt_baselines([baseline_a, baseline_b])
+    assert selected[991]["measurements"][0]["elapsed_ms"] == 150_000
+
+
+def test_missing_attempt_baseline_colliding_with_explicit_attempt_1_baseline_is_unaffected_by_grouping():
+    """GIVEN one baseline with a MISSING `run_attempt` key and another
+    with an EXPLICIT `run_attempt: 1`, sharing the same `workflow_run_id`/
+    `job` but disagreeing on content, WHEN examined THEN this IS a
+    collision under this gate module's collision grouping (missing keys
+    are grouped into the attempt-1 slot for `_normalize_run_attempt`
+    purposes here too, since gate's `_normalize_run_attempt` itself
+    already treats a missing key as attempt 1 -- see
+    `_select_initial_attempt_baselines`'s documented scope-boundary
+    note); this mirrors the collector's equivalent
+    `_effective_attempt_for_collision_grouping` behavior for this exact
+    scenario, keeping both modules' collision semantics aligned even
+    though their MISSING-key TRUSTED-cohort-eligibility policies
+    intentionally differ (#2182 P0-3 scope boundary)."""
+    explicit_attempt_1 = _baseline("e2e-core", 992, elapsed_ms=100_000, run_attempt=1)
+    missing_attempt = _baseline("e2e-core", 992, elapsed_ms=999_000)
+    assert "run_attempt" not in missing_attempt
+
+    collisions = gate._detect_run_attempt_identity_collisions([explicit_attempt_1, missing_attempt])
+    assert 992 in collisions
+
+    selected = gate._select_initial_attempt_baselines([explicit_attempt_1, missing_attempt])
+    assert 992 not in selected
