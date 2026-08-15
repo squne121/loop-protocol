@@ -17,6 +17,17 @@ before/after の比較は、任意の 2 コミットを事後的に比較する�
 
 独立サンプルの単位は GitHub の `workflow_run_id` である。同一 `workflow_run_id` の rerun attempt（`run_attempt` が異なるだけの再実行）は独立サンプルとして数えない（`scripts/ci/collect_e2e_performance_benchmark.py::_dedupe_by_workflow_run_id` / `tests/ci/test_ci_performance_gate.py::_dedupe_by_workflow_run_id`）。これは `(run_id, run_attempt)` を identity にしていた旧設計の rerun 水増し問題を修正したもの。
 
+## rerun attempt 選択ポリシー: `initial_attempt_only_v1`
+
+同一 `workflow_run_id` に複数の rerun attempt（`run_attempt` = 1, 2, 3, ...）が存在する場合、どの attempt を canonical サンプルとして採用するかは `initial_attempt_only_v1` という単一の明示的なポリシーに固定されている（Issue #2179、PR #2172 の OWNER adversarial review issuecomment-5295659213 P1-1 の指摘への対応）。
+
+- 採用するのは常に `run_attempt == 1`（`GITHUB_RUN_ATTEMPT` の初回値）の成功レコードのみ。`run_attempt` フィールドが欠落しているレコード（本ポリシー導入前に収集された記録）は attempt 1 とみなす後方互換のデフォルトが適用される。
+- **attempt 1 が失敗している、または欠落している場合、その `workflow_run_id` のサンプルは cohort から完全に除外される。** 同一 `workflow_run_id` の attempt 2 以降が成功していても、それを代わりに採用することはない（非決定論的な代替を避けるため）。除外は `evidence_errors`（`reason: missing_or_invalid_initial_attempt_excluded_from_sample`）に明示され、黙って消えることはない。運用上は、attempt 1 が失敗したサンプルを補いたい場合は新規に run を再起動して新しい `workflow_run_id` を取得する（同一 `workflow_run_id` の rerun を採用対象にはしない）。
+- 選択は `dict.setdefault()` による first-seen-wins（挿入順依存）や `dict` 内包表記による実質 last-seen-wins ではなく、`workflow_run_id` ごとにレコードをグルーピングしてから attempt 1 の候補を選ぶ 2 段階の実装（`_select_initial_attempt_records` / `_select_initial_attempt_baselines`）によって、入力配列の並び順に一切依存しない。
+- 同一 `(workflow_run_id, job, run_attempt)` で `artifact_id`・`artifact_digest` が異なる衝突が検出された場合（malformed input）、その `workflow_run_id` は fail-closed で cohort から除外され、`evidence_errors`（`reason: run_attempt_identity_collision`）に記録される。
+- 採用された `run_attempt` の値と選択ポリシー識別子（`rerun_attempt_selection_policy: "initial_attempt_only_v1"`）は、manifest の各 `RunRecord`（`schemas/e2e_performance_benchmark_manifest_v1.schema.json` の後方互換 optional field）に記録される。
+- collector 側では `run_attempt` を trusted evidence として扱い、attempt-specific jobs API（`GET .../actions/runs/{run_id}/attempts/{attempt_number}/jobs` 相当）と突き合わせて binding する（`verify_run_record_against_live_api`）。ライブ API 上に対応する attempt が存在しない場合は fail-closed で拒否する。
+
 ## ペア化 critical path（Paired critical path）統計
 
 post-split の `e2e-core` / `e2e-responsive-matrix` は並列実行される 2 つの独立ジョブであり、DAG 上の実際の critical path は「同一 `workflow_run_id` の中で両ジョブのうち遅い方」である。したがって provider の P50/P95 は次の式で計算する:

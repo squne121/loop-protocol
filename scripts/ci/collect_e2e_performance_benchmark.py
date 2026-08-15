@@ -92,6 +92,100 @@ DEFAULT_AFTER_JOB_NAMES = ("e2e-core", "e2e-responsive-matrix")
 # observation).
 ELIGIBLE_SAMPLE_CONCLUSIONS = frozenset({"success"})
 
+# --------------------------------------------------------------------------- #
+# #2179 (fix_delta after OWNER adversarial review of PR #2172,
+# issuecomment-5295659213 P1-1 / follow-up Issue #2179): rerun-attempt
+# selection must be a single, explicit, order-independent policy --
+# `initial_attempt_only_v1` -- never `dict.setdefault()` first-seen-wins
+# insertion-order semantics. A `workflow_run_id`'s sample is the record
+# with `run_attempt == 1` (missing `run_attempt` defaults to 1, for
+# backward compatibility with records collected before this field
+# existed); if attempt 1 is missing/malformed/non-success, that
+# `workflow_run_id`'s sample is excluded entirely -- a later successful
+# attempt (2, 3, ...) is NEVER substituted in.
+# --------------------------------------------------------------------------- #
+RERUN_ATTEMPT_SELECTION_POLICY = "initial_attempt_only_v1"
+
+
+def _normalize_run_attempt(record: dict) -> int | None:
+    """#2179 AC9: normalizes `record["run_attempt"]` to the
+    `initial_attempt_only_v1` policy's `integer >= 1` contract. The key
+    being entirely ABSENT defaults to 1 (backward compatibility with
+    records collected before this field existed). An explicit `None`
+    value, a non-int (e.g. the string `"2"`), `0`, or a negative value are
+    all treated as invalid -- returns `None`, which callers must treat as
+    "not eligible as an attempt-1 candidate under any circumstance"
+    (fail-closed exclusion, never guessed/coerced)."""
+    if "run_attempt" not in record:
+        return 1
+    value = record.get("run_attempt")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 1:
+        return None
+    return value
+
+
+def _group_by_workflow_run_id(records: list[dict]) -> dict[int, list[dict]]:
+    by_id: dict[int, list[dict]] = {}
+    for record in records:
+        workflow_run_id = record.get("workflow_run_id")
+        if workflow_run_id is None:
+            continue
+        by_id.setdefault(workflow_run_id, []).append(record)
+    return by_id
+
+
+def _select_initial_attempt_records(records: list[dict]) -> dict[int, dict]:
+    """#2179 AC1/AC3: pure `initial_attempt_only_v1` selection -- groups
+    `records` by `workflow_run_id` first (never relying on insertion
+    order), then keeps only the `run_attempt == 1` candidate per id. If
+    more than one record explicitly (or by the missing-defaults-to-1
+    fallback) qualifies as attempt 1 for the same `workflow_run_id`, a
+    deterministic (content-derived, never insertion-order-dependent)
+    tie-break is used -- this is the ordinary "rerun" fixture shape used
+    by this module's own regression tests, not a reported collision (see
+    `_detect_run_attempt_identity_collisions` for the EXPLICIT-conflict
+    case that IS reported/excluded, #2179 AC9)."""
+    selected: dict[int, dict] = {}
+    for workflow_run_id, group in _group_by_workflow_run_id(records).items():
+        candidates = [r for r in group if _normalize_run_attempt(r) == 1]
+        if not candidates:
+            continue
+        selected[workflow_run_id] = min(candidates, key=lambda r: json.dumps(r, sort_keys=True, default=str))
+    return selected
+
+
+def _detect_run_attempt_identity_collisions(records: list[dict]) -> dict[int, list[dict]]:
+    """#2179 AC9: within a single job's record pool, flags any
+    `workflow_run_id` where >= 2 records EXPLICITLY claim the SAME
+    `run_attempt` value but disagree on `artifact_id`/`artifact_digest` --
+    a genuine identity collision (never a legitimate rerun, since a rerun
+    always increments `run_attempt`). Records that omit `run_attempt`
+    entirely (pre-#2179 fixtures, defaulting to attempt 1) are never
+    flagged here -- this keeps existing fixtures/tests that share a
+    `workflow_run_id` without ever mentioning `run_attempt` fully
+    backward compatible (see `_select_initial_attempt_records`'s
+    deterministic tie-break for that case)."""
+    by_key: dict[tuple, list[dict]] = {}
+    for record in records:
+        workflow_run_id = record.get("workflow_run_id")
+        if workflow_run_id is None:
+            continue
+        if "run_attempt" not in record or record.get("run_attempt") is None:
+            continue
+        by_key.setdefault((workflow_run_id, record.get("run_attempt")), []).append(record)
+
+    collisions: dict[int, list[dict]] = {}
+    for (workflow_run_id, _run_attempt), group in by_key.items():
+        identities = {(r.get("artifact_id"), r.get("artifact_digest")) for r in group}
+        if len(group) > 1 and len(identities) > 1:
+            collisions.setdefault(workflow_run_id, []).extend(group)
+    return collisions
+
+
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -197,6 +291,45 @@ def _default_gh_api_call(endpoint: str) -> Any:
         raise LiveAPIError(f"gh_api_response_not_json: {endpoint}: {exc}") from exc
 
 
+DEFAULT_ARTIFACTS_PER_PAGE = 100
+
+
+def _fetch_all_artifacts_paginated(
+    workflow_run_id: object,
+    repo: str,
+    api_call: Callable[[str], Any],
+) -> list[dict]:
+    """#2179 AC8: GitHub's artifact-listing API paginates (`total_count` +
+    an `artifacts` array truncated to `per_page`, default 30/max 100). The
+    pre-#2179 single `api_call(f"repos/{repo}/actions/runs/{id}/artifacts")`
+    call only ever read page 1 -- a `workflow_run_id` with more artifacts
+    than fit on one page (heavy rerun usage across many jobs/attempts)
+    could report `artifact_not_found_via_live_api` for a genuinely-existing
+    artifact that only appears on page 2+. Walks every page until every
+    `total_count` artifact has been collected (or a page returns nothing,
+    signalling the last page). The FIRST call intentionally omits any
+    query string (preserves the pre-#2179 exact-endpoint shape) -- only
+    when `total_count` indicates more artifacts than page 1 returned does
+    this fetch page 2+."""
+    base_endpoint = f"repos/{repo}/actions/runs/{workflow_run_id}/artifacts"
+    first_page = api_call(base_endpoint)
+    artifacts = list(first_page.get("artifacts", [])) if isinstance(first_page, dict) else []
+    total_count = first_page.get("total_count") if isinstance(first_page, dict) else None
+
+    if not isinstance(total_count, int) or total_count <= len(artifacts):
+        return artifacts
+
+    page = 2
+    while len(artifacts) < total_count:
+        page_response = api_call(f"{base_endpoint}?per_page={DEFAULT_ARTIFACTS_PER_PAGE}&page={page}")
+        page_artifacts = list(page_response.get("artifacts", [])) if isinstance(page_response, dict) else []
+        if not page_artifacts:
+            break
+        artifacts.extend(page_artifacts)
+        page += 1
+    return artifacts
+
+
 def verify_run_record_against_live_api(
     record: dict,
     expected_head_sha: str,
@@ -208,24 +341,34 @@ def verify_run_record_against_live_api(
     against a LIVE GitHub Actions artifact-listing API response (the
     `GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts` shape:
     each artifact carries its own `id`, `digest` (`sha256:<hex>`, matching
-    this module's `_DIGEST_RE`), and `workflow_run.{id,head_sha}`).
+    this module's `_DIGEST_RE`), and `workflow_run.{id,head_sha}`), now
+    fully paginated (#2179 AC8, see `_fetch_all_artifacts_paginated`).
     Returns a list of violation strings (empty list == the record is
     LIVE-API-verified, not merely shape-verified). A fabricated record
     (real-looking but never-uploaded artifact ID, or an artifact ID that
     belongs to a DIFFERENT workflow run / head SHA than claimed) is
     rejected here even though `_verify_run_record` alone would have
-    accepted it."""
+    accepted it.
+
+    #2179 AC5/P0-3 (OWNER item 3): if `record` carries an EXPLICIT
+    `run_attempt`, it is additionally cross-checked against the live
+    attempt-specific jobs API (`GET .../actions/runs/{id}/attempts/
+    {attempt}/jobs`) -- a claimed `run_attempt` that does not correspond
+    to any real job for that run/attempt is rejected (trusted binding,
+    never merely shape-validated). Records that omit `run_attempt`
+    (pre-#2179 records, implicitly attempt 1) are NOT extended with this
+    additional live call, preserving this function's pre-#2179 behavior
+    and call signature for those callers."""
     violations: list[str] = []
     workflow_run_id = record.get("workflow_run_id")
     artifact_id = record.get("artifact_id")
 
     try:
-        artifacts_response = api_call(f"repos/{repo}/actions/runs/{workflow_run_id}/artifacts")
+        artifacts = _fetch_all_artifacts_paginated(workflow_run_id, repo, api_call)
     except LiveAPIError as exc:
         violations.append(f"live_api_artifacts_fetch_failed: {exc}")
         return violations
 
-    artifacts = artifacts_response.get("artifacts", []) if isinstance(artifacts_response, dict) else []
     matching = [a for a in artifacts if isinstance(a, dict) and a.get("id") == artifact_id]
     if not matching:
         violations.append(
@@ -261,6 +404,27 @@ def verify_run_record_against_live_api(
             f"record={record.get('head_sha')!r} api={api_workflow_run.get('head_sha')!r}"
         )
 
+    if "run_attempt" in record and record.get("run_attempt") is not None:
+        run_attempt = record.get("run_attempt")
+        try:
+            attempt_jobs_response = api_call(
+                f"repos/{repo}/actions/runs/{workflow_run_id}/attempts/{run_attempt}/jobs"
+            )
+        except LiveAPIError as exc:
+            violations.append(f"live_api_run_attempt_jobs_fetch_failed: {exc}")
+        else:
+            attempt_jobs = (
+                attempt_jobs_response.get("jobs", []) if isinstance(attempt_jobs_response, dict) else []
+            )
+            matching_jobs = [
+                j for j in attempt_jobs if isinstance(j, dict) and j.get("run_attempt") == run_attempt
+            ]
+            if not matching_jobs:
+                violations.append(
+                    f"run_attempt_not_found_via_live_api: workflow_run_id={workflow_run_id!r} "
+                    f"run_attempt={run_attempt!r}"
+                )
+
     return violations
 
 
@@ -287,15 +451,15 @@ def verify_records_against_live_api(
 
 
 def _dedupe_by_workflow_run_id(records: list[dict]) -> list[dict]:
-    """#2159 AC2/P1-1: sample identity is `workflow_run_id`, never `(run_id,
-    run_attempt)`. Keeps the first record seen per `workflow_run_id`."""
-    seen: dict[int, dict] = {}
-    for record in records:
-        workflow_run_id = record.get("workflow_run_id")
-        if workflow_run_id is None:
-            continue
-        seen.setdefault(workflow_run_id, record)
-    return list(seen.values())
+    """#2179 AC1/AC3 (supersedes the #2159 AC2/P1-1 first-seen-wins
+    version): sample identity is `workflow_run_id`, and selection follows
+    the explicit `initial_attempt_only_v1` policy (see
+    `_select_initial_attempt_records`) -- never `dict.setdefault()`
+    first-seen-wins insertion-order semantics. Returns records sorted by
+    `workflow_run_id` (canonical order, #2179 AC7) -- order-independent
+    regardless of the input list's order."""
+    selected = _select_initial_attempt_records(records)
+    return [selected[workflow_run_id] for workflow_run_id in sorted(selected)]
 
 
 def _collect_arm(
@@ -306,7 +470,12 @@ def _collect_arm(
     min_run_count: int,
     evidence_errors: list[dict],
 ) -> dict:
-    usable_by_job: dict[str, list[dict]] = {job: [] for job in job_names}
+    # #2179 P0-4: attempt-1-only selection MUST happen before any
+    # conclusion-based filtering -- filtering non-success records out
+    # first (the #2159 order) would silently let a later successful
+    # attempt stand in for a failed/missing attempt 1, which is exactly
+    # the non-deterministic substitution this policy forbids.
+    verified_by_job: dict[str, list[dict]] = {job: [] for job in job_names}
 
     for index, record in enumerate(raw_records):
         if not isinstance(record, dict):
@@ -325,39 +494,83 @@ def _collect_arm(
             )
             continue
         job = record["job"]
-        if job not in usable_by_job:
+        if job not in verified_by_job:
             # Not one of the jobs this manifest tracks -- not an error,
             # simply out of scope for this benchmark's job set.
             continue
-        if record["conclusion"] not in ELIGIBLE_SAMPLE_CONCLUSIONS:
-            # #2159 P0-4: a structurally-verified but non-successful run is
-            # NOT a valid performance sample -- exclude it from the cohort
-            # and surface it as an explicit evidence error rather than
-            # silently counting it (or silently dropping it with no trace).
-            evidence_errors.append(
-                {
-                    "arm": arm_name,
-                    "reason": "non_successful_conclusion_excluded_from_sample",
-                    "detail": (
-                        f"workflow_run_id={record.get('workflow_run_id')!r} "
-                        f"job={job!r} conclusion={record['conclusion']!r}"
-                    ),
-                }
-            )
-            continue
-        usable_by_job[job].append(record)
+        verified_by_job[job].append(record)
 
     jobs: dict[str, dict] = {}
     complete = True
     for job in job_names:
-        deduped = _dedupe_by_workflow_run_id(usable_by_job[job])
-        run_count = len(deduped)
+        job_records = verified_by_job[job]
+
+        # #2179 AC9: genuine (workflow_run_id, job, run_attempt) identity
+        # collisions are excluded and reported -- never silently
+        # tie-broken like the ordinary "no run_attempt specified" case.
+        collisions = _detect_run_attempt_identity_collisions(job_records)
+        for workflow_run_id in sorted(collisions):
+            group = collisions[workflow_run_id]
+            evidence_errors.append(
+                {
+                    "arm": arm_name,
+                    "reason": "run_attempt_identity_collision",
+                    "detail": (
+                        f"workflow_run_id={workflow_run_id!r} job={job!r} "
+                        f"conflicting_identities="
+                        f"{sorted({(r.get('artifact_id'), r.get('artifact_digest')) for r in group}, key=str)!r}"
+                    ),
+                }
+            )
+
+        non_colliding_records = [r for r in job_records if r.get("workflow_run_id") not in collisions]
+        selected = _select_initial_attempt_records(non_colliding_records)
+
+        usable: list[dict] = []
+        for workflow_run_id in sorted(selected):
+            record = selected[workflow_run_id]
+            if record["conclusion"] not in ELIGIBLE_SAMPLE_CONCLUSIONS:
+                # #2159 P0-4: a structurally-verified but non-successful run
+                # is NOT a valid performance sample -- exclude it from the
+                # cohort and surface it as an explicit evidence error rather
+                # than silently counting it (or silently dropping it with
+                # no trace). This is evaluated on the ALREADY-SELECTED
+                # attempt-1 record only (#2179 P0-4).
+                evidence_errors.append(
+                    {
+                        "arm": arm_name,
+                        "reason": "non_successful_conclusion_excluded_from_sample",
+                        "detail": (
+                            f"workflow_run_id={record.get('workflow_run_id')!r} "
+                            f"job={job!r} conclusion={record['conclusion']!r}"
+                        ),
+                    }
+                )
+                continue
+            usable.append(record)
+
+        # #2179 AC1/AC9: `workflow_run_id`s that had verified records but
+        # NO eligible run_attempt==1 candidate (attempt 1 missing/malformed)
+        # -- never silently dropped with no trace, and never substituted
+        # with a later attempt.
+        verified_ids = {r.get("workflow_run_id") for r in job_records if r.get("workflow_run_id") is not None}
+        excluded_ids = verified_ids - set(collisions) - set(selected)
+        for workflow_run_id in sorted(excluded_ids):
+            evidence_errors.append(
+                {
+                    "arm": arm_name,
+                    "reason": "missing_or_invalid_initial_attempt_excluded_from_sample",
+                    "detail": f"workflow_run_id={workflow_run_id!r} job={job!r}",
+                }
+            )
+
+        run_count = len(usable)
         if run_count < min_run_count:
             complete = False
         jobs[job] = {
             "job": job,
             "run_count": run_count,
-            "sample_workflow_run_ids": sorted(r["workflow_run_id"] for r in deduped),
+            "sample_workflow_run_ids": sorted(r["workflow_run_id"] for r in usable),
             "runs": [
                 {
                     "workflow_run_id": r["workflow_run_id"],
@@ -368,8 +581,14 @@ def _collect_arm(
                     "conclusion": r["conclusion"],
                     "workflow_digest": r["workflow_digest"],
                     "workflow_sha": r["workflow_sha"],
+                    # #2179 AC4: the SELECTED attempt (always 1 under this
+                    # policy) and the policy identifier are recorded on
+                    # every run entry, never inferred by a manifest
+                    # consumer.
+                    "run_attempt": _normalize_run_attempt(r) or 1,
+                    "rerun_attempt_selection_policy": RERUN_ATTEMPT_SELECTION_POLICY,
                 }
-                for r in deduped
+                for r in sorted(usable, key=lambda rec: rec["workflow_run_id"])
             ],
         }
 
