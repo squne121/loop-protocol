@@ -53,6 +53,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
@@ -296,6 +297,52 @@ def _run_shell_script(
         return -1, "", f"script_not_found: {cmd[0]}"
     except Exception as exc:
         return -1, "", f"subprocess_error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# AC12 (#2040): timeout_phase / execution_time_summary
+# ---------------------------------------------------------------------------
+#
+# When a subprocess step in run_once() times out, callers need to know WHICH
+# phase timed out (so they can distinguish "the outer run-once/readiness
+# budget was too small" from "the vc-preflight budget was too small" from
+# "an individual child command hung") and roughly how long it ran before
+# being killed. This is a small, bounded summary -- not a full step-by-step
+# execution trace -- and it is populated ONLY when a timeout actually
+# occurs. run_once() never retries automatically after a timeout; this
+# field exists purely to make the cause legible to a human/loop consumer so
+# an "unexplained retry" is not the only recourse.
+_TIMEOUT_PHASE_RUN_ONCE_READINESS = "run_once_readiness"
+_TIMEOUT_PHASE_VC_PREFLIGHT = "vc_preflight"
+_TIMEOUT_PHASE_CHILD_COMMAND = "child_command"
+
+
+def _timeout_execution_summary(
+    phase: str, timeout_seconds: int, elapsed_seconds: Optional[float]
+) -> dict[str, Any]:
+    """Build the bounded execution_time_summary payload for a timed-out step."""
+    return {
+        "phase": phase,
+        "timeout_seconds": timeout_seconds,
+        "elapsed_seconds": elapsed_seconds,
+    }
+
+
+def _record_timeout(
+    result: dict[str, Any],
+    phase: str,
+    timeout_seconds: int,
+    elapsed_seconds: Optional[float],
+) -> None:
+    """Record timeout_phase / execution_time_summary on `result` in-place.
+
+    Only invoked on the timeout path; normal (non-timeout) runs never set
+    these keys, so the existing CONTRACT_REVIEW_ONCE_RESULT_V1 field set is
+    unchanged for the common case (additive-only, backward compatible)."""
+    result["timeout_phase"] = phase
+    result["execution_time_summary"] = _timeout_execution_summary(
+        phase, timeout_seconds, elapsed_seconds
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -637,10 +684,12 @@ def run_once(
             body_snapshot_path,
         ]
 
+        _readiness_started_at = time.monotonic()
         readiness_json, readiness_rc, readiness_err = _run_script(
             readiness_cmd,
             timeout=readiness_timeout_seconds,
         )
+        _readiness_elapsed = time.monotonic() - _readiness_started_at
 
         if readiness_err:
             readiness_error = f"readiness_check_error: {readiness_err}"
@@ -648,6 +697,12 @@ def run_once(
                 readiness_error += (
                     " (readiness_timeout_seconds="
                     f"{readiness_timeout_seconds})"
+                )
+                _record_timeout(
+                    result,
+                    _TIMEOUT_PHASE_RUN_ONCE_READINESS,
+                    readiness_timeout_seconds,
+                    round(_readiness_elapsed, 3),
                 )
             result["errors"].append(readiness_error)
             result["status"] = "runtime_error"
@@ -682,15 +737,24 @@ def run_once(
             result["checks"]["readiness"] = "go"
 
         # Step 3: check_blockers.sh
+        _blockers_started_at = time.monotonic()
         blockers_rc, blockers_stdout, blockers_stderr = _run_shell_script(
             ["bash", str(_CHECK_BLOCKERS_SH), str(issue_number), repo],
             timeout=_DEFAULT_TIMEOUT,
         )
+        _blockers_elapsed = time.monotonic() - _blockers_started_at
 
         if blockers_rc == -1:
             # Script not found or timeout
             result["errors"].append(f"check_blockers_error: {blockers_stderr}")
             result["status"] = "runtime_error"
+            if blockers_stderr == "timeout":
+                _record_timeout(
+                    result,
+                    _TIMEOUT_PHASE_CHILD_COMMAND,
+                    _DEFAULT_TIMEOUT,
+                    round(_blockers_elapsed, 3),
+                )
             return result
         elif blockers_rc == 0:
             result["checks"]["blockers"] = "pass"
@@ -721,6 +785,7 @@ def run_once(
                 return result
 
         # Step 4: check_product_spec_contract.py
+        _product_spec_started_at = time.monotonic()
         product_spec_json, product_spec_rc, product_spec_err = _run_script(
             [
                 sys.executable,
@@ -734,10 +799,18 @@ def run_once(
             ],
             timeout=_DEFAULT_TIMEOUT,
         )
+        _product_spec_elapsed = time.monotonic() - _product_spec_started_at
 
         if product_spec_err:
             result["errors"].append(f"product_spec_check_error: {product_spec_err}")
             result["status"] = "runtime_error"
+            if product_spec_err == "timeout":
+                _record_timeout(
+                    result,
+                    _TIMEOUT_PHASE_CHILD_COMMAND,
+                    _DEFAULT_TIMEOUT,
+                    round(_product_spec_elapsed, 3),
+                )
             return result
 
         if product_spec_json is None:
@@ -845,14 +918,23 @@ def run_once(
                 "--reviewed-head-sha", reviewed_head_sha,
                 "--format", "json",
             ])
+        _vc_started_at = time.monotonic()
         vc_result_json, vc_rc, vc_err = _run_script(
             vc_command,
             timeout=_VC_PREFLIGHT_TIMEOUT,
         )
+        _vc_elapsed = time.monotonic() - _vc_started_at
 
         if vc_err:
             result["errors"].append(f"vc_preflight_error: {vc_err}")
             result["status"] = "runtime_error"
+            if vc_err == "timeout":
+                _record_timeout(
+                    result,
+                    _TIMEOUT_PHASE_VC_PREFLIGHT,
+                    _VC_PREFLIGHT_TIMEOUT,
+                    round(_vc_elapsed, 3),
+                )
             return result
 
         if vc_result_json is None:
