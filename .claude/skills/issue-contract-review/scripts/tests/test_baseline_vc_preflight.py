@@ -166,6 +166,30 @@ def run_preflight(fixture_file: str, issue_num: int = 999) -> dict:
 
     C2: exit code は status フィールドの値に応じて変わるため、
     ここで JSON を parse することが重要。
+
+    Issue #2165 P1-2 (PR #2177 fix_delta iteration 5, blocker 5): this
+    outer wrapper timeout predates and was never kept in sync with
+    baseline_vc_preflight.py's own per-VC-command `DEFAULT_TIMEOUT_SECONDS`
+    (raised 90 -> 150 in this Issue's iteration-1 commit, to legitimately
+    accommodate the `issue-refinement-loop` skill's full pytest suite VC,
+    real duration >100s). `fixtures/issue_393_body.md` is the only fixture
+    in this suite that exercises real (unmocked) regression-gate commands
+    serially (pnpm typecheck/lint/test/build + a real full pytest -v
+    invocation of `.claude/skills/issue-refinement-loop/tests/`), and its
+    total observed serial wall-clock time is ~180s -- so the old
+    timeout=90 here killed the CLI subprocess via a clean
+    subprocess.TimeoutExpired at exactly 90s (confirmed via isolated
+    reproduction: no hang, no deadlock past 90s). Running the same
+    invocation standalone (without this outer cap) completes cleanly in
+    ~181s with baseline_vc_preflight.py's own Popen-based per-VC timeout
+    (150s) correctly bounding the slowest VC via
+    `_kill_process_group()` and returning a clean `blocked`/-1 result for
+    it, not hanging. This is therefore a pre-existing test-infrastructure
+    staleness issue (this outer constant was never raised alongside the
+    inner one), not a regression introduced by the run_command()
+    subprocess.run -> subprocess.Popen refactor (fix_delta iteration 3).
+    Raised to 220s (safety margin over the ~181s observed) so this fixture
+    can complete for real instead of being killed mid-flight.
     """
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
     result = subprocess.run(
@@ -179,7 +203,7 @@ def run_preflight(fixture_file: str, issue_num: int = 999) -> dict:
         ],
         capture_output=True,
         text=True,
-        timeout=90,
+        timeout=220,
     )
     # C2: exit code は 0, 1, 2, 3 など様々な値
     # JSON parse が成功すれば status フィールドで判定する
@@ -1946,13 +1970,28 @@ def test_fixed_env_injects_ci_true_for_pnpm_build(monkeypatch):
 
     captured = {}
 
-    def fake_run(argv, **kwargs):
+    class FakeProcess:
+        """Minimal stand-in for the Popen instance run_command() now uses.
+
+        Issue #2165 P1-2 (PR #2177 fix_delta iteration 5): run_command()
+        switched from subprocess.run() to subprocess.Popen(...) +
+        communicate(timeout=...) (fix_delta iteration 3), so this mock
+        must target Popen instead of run(), mirroring the fake_popen
+        pattern already used in test_pnpm_gate_security_boundary.py.
+        """
+
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+    def fake_popen(argv, **kwargs):
         captured["argv"] = argv
         captured["env"] = kwargs.get("env")
         captured["shell"] = kwargs.get("shell")
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        return FakeProcess()
 
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(
         module.pnpm_gate_registry, "resolve_trusted_pnpm", lambda _root: "/trusted/pnpm"
     )
@@ -1972,14 +2011,24 @@ def test_fixed_env_applies_to_all_canonical_pnpm_gates(monkeypatch):
     sys.path.insert(0, str(script_path.parent))
     import baseline_vc_preflight as module
 
+    class FakeProcess:
+        """Issue #2165 P1-2 (PR #2177 fix_delta iteration 5): run_command()
+        now launches via subprocess.Popen(...) + communicate(timeout=...),
+        so this mock targets Popen instead of run()."""
+
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "", ""
+
     for gate in ("pnpm typecheck", "pnpm lint", "pnpm test", "pnpm build"):
         captured: dict = {}
 
-        def fake_run(argv, **kwargs):
+        def fake_popen(argv, **kwargs):
             captured["env"] = kwargs.get("env")
-            return subprocess.CompletedProcess(argv, 0, "", "")
+            return FakeProcess()
 
-        monkeypatch.setattr(module.subprocess, "run", fake_run)
+        monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
         monkeypatch.setattr(
             module.pnpm_gate_registry, "resolve_trusted_pnpm", lambda _root: "/trusted/pnpm"
         )
@@ -2033,12 +2082,22 @@ def test_runner_env_delta_output_exposes_only_fixed_env(monkeypatch, tmp_path, c
 
     monkeypatch.setenv("SHOULD_NOT_LEAK_SECRET", "sentinel-secret")
 
-    def fake_run(argv, **kwargs):
+    class FakeProcess:
+        """Issue #2165 P1-2 (PR #2177 fix_delta iteration 5): run_command()
+        now launches via subprocess.Popen(...) + communicate(timeout=...),
+        so this mock targets Popen instead of run()."""
+
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+    def fake_popen(argv, **kwargs):
         assert kwargs["env"]["CI"] == "true"
         assert kwargs["env"]["SHOULD_NOT_LEAK_SECRET"] == "sentinel-secret"
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        return FakeProcess()
 
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(
         module.pnpm_gate_registry, "resolve_trusted_pnpm", lambda _root: "/trusted/pnpm"
     )
