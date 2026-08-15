@@ -438,7 +438,7 @@ class TestAllChecksCalledB1:
 class TestReadinessTimeout:
     """GIVEN readiness execution WHEN timeout is configured THEN only Step 2 uses it."""
 
-    def test_default_exceeds_generic_timeout_and_applies_only_to_readiness(self):
+    def test_default_uses_only_readiness_timeout_and_applies_only_to_readiness(self):
         run_script_results, shell_results = _make_all_pass_side_effects()
         calls = []
 
@@ -456,7 +456,6 @@ class TestReadinessTimeout:
                     result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
 
         assert result["status"] == "go"
-        assert _rcr_mod._DEFAULT_READINESS_TIMEOUT_SECONDS > _rcr_mod._DEFAULT_TIMEOUT
         assert calls[0][1] == _rcr_mod._DEFAULT_READINESS_TIMEOUT_SECONDS
         assert calls[1][1] == _rcr_mod._DEFAULT_TIMEOUT
         assert calls[2][1] == _rcr_mod._VC_PREFLIGHT_TIMEOUT
@@ -481,6 +480,37 @@ class TestReadinessTimeout:
         assert captured[0][1] == applied_timeout_seconds
         assert result["errors"] == [
             "readiness_check_error: timeout (readiness_timeout_seconds=47)"
+        ]
+
+    @pytest.mark.parametrize("invalid_value", [0, -1, False, "47"])
+    def test_programmatic_api_rejects_invalid_readiness_timeout_before_running(self, invalid_value):
+        with patch.object(_rcr_mod, "fetch_body_from_github") as fetch_body:
+            with patch.object(_rcr_mod, "_run_script") as run_script:
+                result = run_once(
+                    _ISSUE_NUMBER,
+                    _REPO,
+                    skip_idempotency_check=True,
+                    readiness_timeout_seconds=invalid_value,
+                )
+
+        assert result["status"] == "runtime_error"
+        assert result["errors"] == [
+            "invalid_readiness_timeout_seconds: must be a positive integer"
+        ]
+        fetch_body.assert_not_called()
+        run_script.assert_not_called()
+
+    def test_non_timeout_readiness_error_does_not_gain_timeout_annotation(self):
+        with patch.object(
+            _rcr_mod,
+            "_run_script",
+            return_value=(None, -1, "script_not_found: readiness.py"),
+        ):
+            result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "runtime_error"
+        assert result["errors"] == [
+            "readiness_check_error: script_not_found: readiness.py"
         ]
 
     def test_cli_wires_readiness_timeout_override(self):

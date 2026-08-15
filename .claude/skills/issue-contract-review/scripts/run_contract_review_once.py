@@ -208,9 +208,19 @@ _VC_PREFLIGHT_TIMEOUT = (
     + _VC_PREFLIGHT_OVERHEAD_SECONDS
 )
 _DEFAULT_TIMEOUT = 30
-# readiness_check は Issue の全 Verification Commands を実行しうるため、
-# 他の短時間 subprocess 用の _DEFAULT_TIMEOUT とは別に余裕を持たせる。
-_DEFAULT_READINESS_TIMEOUT_SECONDS = 90
+# contract_readiness_check.py の execute path は baseline_vc_preflight.py を
+# 最大120秒まで待機する。この child budget は本 Issue の Allowed Paths 外で
+# hard-code されているため、ここではその canonical execute budget を明示して
+# outer wrapper が先に timeout しない関係を維持する。
+_READINESS_NESTED_EXECUTE_TIMEOUT_SECONDS = 120
+# subprocess 起動、body-file の受け渡し、JSON serialization のための wrapper
+# overhead。既存の短時間 subprocess budget を使用して独立した magic number を
+# 増やさず、nested execute budget より outer timeout が常に大きくなるようにする。
+_READINESS_WRAPPER_OVERHEAD_SECONDS = _DEFAULT_TIMEOUT
+_DEFAULT_READINESS_TIMEOUT_SECONDS = (
+    _READINESS_NESTED_EXECUTE_TIMEOUT_SECONDS
+    + _READINESS_WRAPPER_OVERHEAD_SECONDS
+)
 
 # Issue #1338 AC9: named constant for the --max-workers value explicitly
 # passed to baseline_vc_preflight.py. Bounded parallel execution there is
@@ -540,6 +550,19 @@ def run_once(
         "errors": [],
     }
 
+    # `run_once()` is also a programmatic API. Reject invalid values before
+    # any GitHub or subprocess work so direct callers cannot accidentally
+    # disable the readiness timeout that the CLI already validates.
+    if (
+        not isinstance(readiness_timeout_seconds, int)
+        or isinstance(readiness_timeout_seconds, bool)
+        or readiness_timeout_seconds <= 0
+    ):
+        result["errors"].append(
+            "invalid_readiness_timeout_seconds: must be a positive integer"
+        )
+        return result
+
     # Issue #1914 P0-3 (#1940 review): fetch the Issue body exactly once, at
     # the very start of run_once(), before any check that reads body
     # content. This single snapshot (and its body_sha256) is threaded
@@ -620,10 +643,13 @@ def run_once(
         )
 
         if readiness_err:
-            result["errors"].append(
-                "readiness_check_error: "
-                f"{readiness_err} (readiness_timeout_seconds={readiness_timeout_seconds})"
-            )
+            readiness_error = f"readiness_check_error: {readiness_err}"
+            if readiness_err == "timeout":
+                readiness_error += (
+                    " (readiness_timeout_seconds="
+                    f"{readiness_timeout_seconds})"
+                )
+            result["errors"].append(readiness_error)
             result["status"] = "runtime_error"
             return result
 
