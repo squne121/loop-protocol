@@ -27,6 +27,7 @@ if _HERE not in sys.path:
 
 from cleanup_contract_v3 import (  # noqa: E402
     MAX_TTL_SECONDS,
+    OP_LOCAL_ONLY_DISCARD,
     OP_WORKTREE_REMOVE,
     OPERATIONS,
     SAFE_SCRATCH_CONTRACT_PATH,
@@ -36,7 +37,13 @@ from cleanup_contract_v3 import (  # noqa: E402
     validate_v3_contract,
     write_json_durably,
 )
-from cleanup_exec import resolve_project_root, verify_cleanup_authorization  # noqa: E402
+from cleanup_exec import (  # noqa: E402
+    resolve_project_root,
+    run_discard_check,
+    run_discard_consume,
+    verify_cleanup_authorization,
+    verify_discard_authorization,
+)
 from worktree_catalog import Deadline, GuardDeadlineExceeded  # noqa: E402
 
 
@@ -70,9 +77,22 @@ def materialize(
         "branch_name": branch_name,
     }
 
+    pr_head_sha = None
+    local_tip_sha = None
     if verify:
         try:
-            ok, reason, _verified = verify_cleanup_authorization(req, root, Deadline(budget_seconds))
+            if operation == OP_LOCAL_ONLY_DISCARD:
+                # Issue #1523: the discard lane uses its OWN authorization
+                # (worktree still on disk, PR-head-ancestor + local-only-commit
+                # candidacy) rather than the normal-cleanup verifier.
+                ok, reason, verified_fields = verify_discard_authorization(
+                    req, root, Deadline(budget_seconds)
+                )
+                if ok:
+                    pr_head_sha = verified_fields.get("pr_head_sha")
+                    local_tip_sha = verified_fields.get("local_tip_sha")
+            else:
+                ok, reason, _verified = verify_cleanup_authorization(req, root, Deadline(budget_seconds))
         except GuardDeadlineExceeded as e:
             return {"status": "error", "error": str(e)}
         if not ok:
@@ -99,6 +119,13 @@ def materialize(
         "issued_at": issued_at,
         "expires_at": expires_at,
     }
+    if operation == OP_LOCAL_ONLY_DISCARD:
+        # Issue #1523 AC2: bind the confirmation to the EXACT PR head SHA and
+        # local branch tip SHA observed at authorization time — the consume
+        # step (``run_discard_consume``) re-verifies both against fresh live
+        # state before performing the destructive discard.
+        contract["pr_head_sha"] = pr_head_sha
+        contract["local_tip_sha"] = local_tip_sha
 
     valid, vreason = validate_v3_contract(contract, now=now)
     if not valid:
@@ -125,25 +152,53 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--branch-name", required=True)
     p.add_argument("--operation", default=OP_WORKTREE_REMOVE, choices=list(OPERATIONS))
     p.add_argument("--ttl-seconds", type=int, default=300)
+    # Issue #1523: --check / --consume are the EXPLICIT human confirmation
+    # commands for the local-only discard lane (AC2/AC5). Neither performs any
+    # destructive action on its own:
+    #   (no flag)   issue the target+SHA-bound one-shot confirmation contract
+    #               (the ONLY way a discard-consume can later succeed)
+    #   --check     non-destructive: report discard candidacy + local-only
+    #               commit SHAs a human would be confirming (AC1)
+    #   --consume   claim-first consume of a PREVIOUSLY issued contract; this
+    #               is the ONLY invocation that performs the destructive
+    #               discard, and only succeeds if a human already ran the
+    #               plain (no-flag) issuance invocation first
+    p.add_argument("--check", action="store_true", help="Discard lane: verify-only, no contract issued.")
+    p.add_argument("--consume", action="store_true", help="Discard lane: consume a previously issued contract.")
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
-    # Blocker 1 / Blocker 5: the public CLI exposes neither --no-verify (skipping
-    # authorization) nor --project-root (retargeting). Authorization always runs and
-    # the trusted root is resolved internally. ``verify`` / ``project_root`` remain
-    # function parameters for dependency-injected unit tests only.
-    result = materialize(
-        pr_number=a.pr_number,
-        linked_issue_number=a.linked_issue_number,
-        worktree_path=a.worktree_path,
-        branch_name=a.branch_name,
-        operation=a.operation,
-        ttl_seconds=a.ttl_seconds,
-    )
+    if a.check and a.consume:
+        result = {"status": "error", "error": "check_and_consume_mutually_exclusive"}
+    elif a.check or a.consume:
+        if a.operation != OP_LOCAL_ONLY_DISCARD:
+            result = {"status": "error", "error": "check_and_consume_require_local_only_discard_operation"}
+        else:
+            req = {
+                "pr_number": a.pr_number,
+                "linked_issue_number": a.linked_issue_number,
+                "worktree_path": a.worktree_path,
+                "branch_name": a.branch_name,
+            }
+            result = run_discard_check(req) if a.check else run_discard_consume(req)
+    else:
+        # Blocker 1 / Blocker 5: the public CLI exposes neither --no-verify
+        # (skipping authorization) nor --project-root (retargeting).
+        # Authorization always runs and the trusted root is resolved
+        # internally. ``verify`` / ``project_root`` remain function parameters
+        # for dependency-injected unit tests only.
+        result = materialize(
+            pr_number=a.pr_number,
+            linked_issue_number=a.linked_issue_number,
+            worktree_path=a.worktree_path,
+            branch_name=a.branch_name,
+            operation=a.operation,
+            ttl_seconds=a.ttl_seconds,
+        )
     if a.json:
         print(json.dumps(result, sort_keys=True))
     else:
         print(result.get("status", "error"))
-    return 0 if result.get("status") == "ok" else 1
+    return 0 if result.get("status") in ("ok", "confirmation_required") else 1
 
 
 if __name__ == "__main__":

@@ -35,28 +35,79 @@ authorizes cleanup via delta-equivalence ONLY when the candidate merge commit is
 verified to be a genuine squash-shaped commit (object exists locally AND has
 EXACTLY ONE parent). Normal merge commits (2+ parents) always fail-closed to the
 existing exact-OID comparison.
+
+Branch-only compare-and-delete + local-only discard lane (Issue #1523):
+
+  * ``_perform_branch_only`` now threads the ``expected`` branch-tip OID
+    captured at authorization time through to the destructive call. Inside a
+    shared repository mutation lock (``_mutation_lock``) it re-reads the LIVE
+    branch tip immediately before deleting and refuses (``branch_tip_changed``)
+    if it no longer matches — the git-native compare-and-delete equivalent of
+    ``git update-ref -d refs/heads/<branch> <expected-old-oid>``.
+  * Ancestry-failure classification is now structural
+    (``_verify_ancestry_for_force_delete``): the expected OID must resolve to a
+    real commit object AND ``git merge-base --is-ancestor`` must return a
+    structurally meaningful exit code — 0 (ordinary ancestor) or 1
+    (squash-shaped / not-``git``-visible-ancestor history, already authorized
+    via PR-head equivalence). Any OTHER exit code, invalid object, ref-lock
+    error, I/O error, or git/subprocess error fails closed to
+    ``branch_only_non_ancestry_failure`` rather than silently promoting to
+    force-delete.
+  * ``run()`` also handles the same-invocation fallback: when normal cleanup's
+    ``worktree remove`` succeeds but ``git branch -d`` then fails, it attempts
+    to RE-AUTHORIZE (not re-execute) via
+    ``verify_branch_only_cleanup_authorization`` and only proceeds to the
+    compare-and-delete force path when that re-authorization succeeds. Any
+    refusal during re-authorization preserves the ORIGINAL ``branch_delete_failed``
+    reason code, the ``actions_taken`` list unchanged (worktree_remove only),
+    and never invokes the force-delete subprocess.
+  * A brand-new local-only unpublished commit discard lane
+    (``verify_discard_authorization`` / ``run_discard_check`` /
+    ``run_discard_consume``) authorizes discarding a dedicated worktree's
+    local-only commits (commits beyond the merged PR's head SHA) ONLY after a
+    human runs the executor-issued, target+SHA-bound, one-shot, expiring
+    confirmation contract (``cleanup_contract_v3`` primitives, extended with
+    ``OP_LOCAL_ONLY_DISCARD``). ``verify_cleanup_authorization`` and
+    ``verify_branch_only_cleanup_authorization`` are UNCHANGED by this lane.
+  * ``verified`` payload keys/types are normalized across all three verifier
+    functions via a shared ``_verified_template()`` union (additive only — see
+    Issue #1523 AC9), so ``normal`` / ``branch-only`` / ``discard`` lanes all
+    populate the SAME key set with the SAME types.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platform
+    fcntl = None  # type: ignore[assignment]
+
 _HERE = os.path.dirname(os.path.realpath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from cleanup_contract_v3 import (  # noqa: E402
+    CLEANUP_CONTRACT_CONSUMED,
+    CLEANUP_OPERATION_MISMATCH,
     OP_BRANCH_DELETE,
+    OP_LOCAL_ONLY_DISCARD,
     OP_WORKTREE_REMOVE,
     PR_NOT_MERGED,
     WORKTREE_DIRTY,
     WORKTREE_NOT_IN_CATALOG,
     WORKTREE_PATH_MISMATCH,
+    claim_contract,
+    discard_claimed,
+    read_claimed_contract,
+    write_consume_tombstone,
 )
 from worktree_catalog import (  # noqa: E402
     Deadline,
@@ -87,6 +138,102 @@ BRANCH_CHECKED_OUT_IN_WORKTREE = "branch_checked_out_in_worktree"  # branch used
 LOCAL_BRANCH_MISSING = "local_branch_missing"                     # refs/heads/<branch> not present
 BRANCH_ONLY_FORCE_DELETE_DENIED = "branch_only_force_delete_denied"  # branch-only pre-checks failed
 BRANCH_ONLY_MATERIALIZE_DENIED = "branch_only_materialize_denied"    # materialize attempted branch-only
+
+# Branch-only compare-and-delete reason codes (Issue #1523 AC7/AC8).
+BRANCH_TIP_CHANGED = "branch_tip_changed"                          # live tip != expected OID at delete time
+BRANCH_ONLY_NON_ANCESTRY_FAILURE = "branch_only_non_ancestry_failure"  # invalid object / non-1 merge-base exit / git error
+
+# Local-only unpublished commit discard lane reason codes (Issue #1523 AC1-AC6).
+DISCARD_PR_HEAD_NOT_ANCESTOR = "discard_pr_head_not_ancestor"      # PR head SHA not an ancestor of local tip
+DISCARD_NO_LOCAL_ONLY_COMMITS = "discard_no_local_only_commits"    # no commits beyond PR head SHA
+DISCARD_SHA_BINDING_CHANGED = "discard_sha_binding_changed"        # live SHAs no longer match claimed contract
+DISCARD_CONTRACT_OPERATION_MISMATCH = CLEANUP_OPERATION_MISMATCH   # re-exported for discard-consume callers
+DISCARD_CONTRACT_NOT_CLAIMABLE = CLEANUP_CONTRACT_CONSUMED         # re-exported for discard-consume callers
+
+# Repository mutation lock (Issue #1523 AC7): scoped ONLY to the branch-only
+# compare-and-delete and discard destructive paths. No repo-wide mutation lock
+# / serialization primitive existed anywhere under scripts/agent-ops before
+# this Issue (verified via grep for mutation_lock/repo_lock/flock/FileLock).
+_MUTATION_LOCK_REL_PATH = os.path.join(".git", "loop-protocol-cleanup.lock")
+
+
+@contextlib.contextmanager
+def _mutation_lock(project_root: str):
+    """Serialize destructive branch-only-fallback / discard mutations (Issue #1523 AC7).
+
+    A local POSIX advisory ``flock`` on a lock file under ``<root>/.git/``. This
+    is intentionally narrow (scoped to the two destructive paths that call it,
+    not a general-purpose repository lock) and degrades to a no-op when the
+    platform lacks ``fcntl`` or the lock file cannot be opened — callers still
+    get the compare-and-delete primitive's own atomicity in that case, but lose
+    the additional serialization against concurrent local invocations.
+    """
+    lock_path = os.path.join(project_root, _MUTATION_LOCK_REL_PATH)
+    fd = None
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        fd = None
+    if fd is None or fcntl is None:
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _verified_template() -> dict:
+    """Canonical union of ``verified`` keys/types shared by ALL verifier lanes
+    (normal / branch-only / discard — Issue #1523 AC9).
+
+    Every ``verify_*_authorization`` function starts from a fresh copy of this
+    dict and only ever ADDS/overwrites values for the checks it performs — the
+    key SET and each key's TYPE are therefore identical across lanes, even
+    though which keys end up ``True``/populated differs by lane. This is
+    additive relative to the pre-#1523 per-lane dicts (AC4 / AC9): no existing
+    key was removed or retyped.
+    """
+    return {
+        "root_default": False,
+        "worktree_in_catalog": False,
+        "branch_match": False,
+        "worktree_clean": False,
+        "branch_only_candidate": False,
+        "worktree_path_under_worktrees_dir": False,
+        "worktree_absent_on_disk": False,
+        "worktree_absent_from_catalog": False,
+        "branch_absent_from_worktree_catalog": False,
+        "local_branch_exists": False,
+        "local_branch_tip_oid": None,
+        "pr_head_oid": None,
+        "pr_merged": False,
+        "head_branch_match": False,
+        "head_repo_match": False,
+        "base_branch_match": False,
+        "head_oid_match": False,
+        "linked_issue_match": False,
+        "head_equivalence_authorized": False,
+        "head_equivalence_mode": None,
+        "pr_merge_commit_oid": None,
+        "local_delta_paths_count": None,
+        "branch_only_force_delete_used": False,
+        # Discard-lane additive fields (Issue #1523 AC1).
+        "discard_candidate": False,
+        "pr_head_sha": None,
+        "local_tip_sha": None,
+        "pr_head_is_ancestor": False,
+        "local_only_commit_count": None,
+        "local_only_commit_shas": None,
+    }
 
 
 def resolve_project_root() -> str:
@@ -386,23 +533,7 @@ def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadlin
     materialize_cleanup_contract calls this function; it must never reach the
     branch-only verifier.  Branch-only logic is in run() only.
     """
-    verified = {
-        "root_default": False,
-        "worktree_in_catalog": False,
-        "branch_match": False,
-        "worktree_clean": False,
-        "pr_merged": False,
-        "head_branch_match": False,
-        "linked_issue_match": False,
-        "head_repo_match": False,
-        "base_branch_match": False,
-        "head_oid_match": False,
-        # Additive squash-merge equivalence fields (Issue #1337).
-        "head_equivalence_authorized": False,
-        "head_equivalence_mode": None,
-        "pr_merge_commit_oid": None,
-        "local_delta_paths_count": None,
-    }
+    verified = _verified_template()
     branch_name = req["branch_name"]
     worktree_real = os.path.realpath(req["worktree_path"])
 
@@ -507,30 +638,7 @@ def verify_branch_only_cleanup_authorization(
     worktree_real = os.path.realpath(req["worktree_path"])
     worktrees_dir = os.path.realpath(os.path.join(project_root, ".claude", "worktrees"))
 
-    verified: dict = {
-        "root_default": False,
-        "branch_only_candidate": False,
-        "worktree_path_under_worktrees_dir": False,
-        "worktree_absent_on_disk": False,
-        "worktree_absent_from_catalog": False,
-        "branch_absent_from_worktree_catalog": False,
-        "local_branch_exists": False,
-        "local_branch_tip_oid": None,
-        "pr_head_oid": None,
-        "head_oid_match": False,
-        "branch_only_force_delete_used": False,
-        # Additive squash-merge equivalence fields (Issue #1337).
-        "head_equivalence_authorized": False,
-        "head_equivalence_mode": None,
-        "pr_merge_commit_oid": None,
-        "local_delta_paths_count": None,
-        # Standard PR authorization fields (AC5 coverage)
-        "pr_merged": False,
-        "head_branch_match": False,
-        "head_repo_match": False,
-        "base_branch_match": False,
-        "linked_issue_match": False,
-    }
+    verified: dict = _verified_template()
 
     # 1. root default branch
     cur = _current_branch(project_root, deadline)
@@ -643,24 +751,349 @@ def _perform(branch_name: str, worktree_real: str, project_root: str,
     return actions, None
 
 
+def _verify_ancestry_for_force_delete(
+    project_root: str, expected_oid: str | None, comparison_ref: str, deadline: Deadline
+) -> tuple[bool, str | None]:
+    """Structural ancestry gate for branch-only force-delete (Issue #1523 AC8).
+
+    Requires (1) ``expected_oid`` resolves to a real, locally-present commit
+    object, AND (2) ``git merge-base --is-ancestor expected_oid comparison_ref``
+    returns a STRUCTURALLY MEANINGFUL result — exit code 0 (the ordinary case:
+    the branch tip is a plain ancestor of ``comparison_ref``, e.g. an
+    already-merged or content-identical branch) or exit code 1 (the
+    squash-merge case this force-delete lane exists for: the tip is genuinely
+    NOT a ``git``-visible ancestor even though authorization already confirmed
+    PR-head equivalence). ANY OTHER exit code, an invalid/unresolvable object, a
+    ref-lock error, an I/O error, or a git/subprocess failure of any kind is a
+    non-ancestry FAILURE (as opposed to a definite ancestor/non-ancestor
+    result) and fails closed to ``BRANCH_ONLY_NON_ANCESTRY_FAILURE`` — none of
+    these promote to force-delete.
+    """
+    if not expected_oid or not _commit_object_exists(project_root, expected_oid, deadline):
+        return False, BRANCH_ONLY_NON_ANCESTRY_FAILURE
+    try:
+        out = _git(
+            ["-C", project_root, "merge-base", "--is-ancestor", expected_oid, comparison_ref],
+            deadline, 10.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, BRANCH_ONLY_NON_ANCESTRY_FAILURE
+    if out.returncode not in (0, 1):
+        return False, BRANCH_ONLY_NON_ANCESTRY_FAILURE
+    return True, None
+
+
 def _perform_branch_only(
-    branch_name: str, project_root: str, deadline: Deadline
+    branch_name: str,
+    expected_oid: str | None,
+    comparison_ref: str,
+    project_root: str,
+    deadline: Deadline,
 ) -> tuple[list[str], str | None]:
-    """Execute branch-only force delete via internal subprocess array (Issue #1196 AC7).
+    """Execute branch-only force delete via compare-and-delete (Issue #1523 AC7/AC8).
 
     Uses ``git branch -D`` (force delete) because squash-merges leave the branch
-    undetectable by ``git branch -d`` even when the PR is merged.  Authorization
-    has already been verified by ``verify_branch_only_cleanup_authorization``.
+    undetectable by ``git branch -d`` even when the PR is merged. Authorization
+    has already been verified by ``verify_branch_only_cleanup_authorization``,
+    which captured ``expected_oid`` (the branch tip at authorization time).
+
+    Runs inside the shared repository ``_mutation_lock`` and, immediately before
+    deleting, (1) re-reads the LIVE branch tip and refuses with
+    ``BRANCH_TIP_CHANGED`` if it no longer equals ``expected_oid`` (a race
+    guard equivalent to ``git update-ref -d refs/heads/<branch> <expected-old-oid>``),
+    and (2) re-runs the structural ancestry check
+    (``_verify_ancestry_for_force_delete``) so an ancestry-comparison failure at
+    delete time also fails closed rather than promoting to force-delete.
 
     Returns ``(actions_taken, error)`` following the same Blocker 6 pattern as
-    ``_perform`` — error is non-None on failure.
+    ``_perform`` — error is non-None on failure. ``error`` is one of the bare
+    reason-code constants (``BRANCH_TIP_CHANGED`` /
+    ``BRANCH_ONLY_NON_ANCESTRY_FAILURE``) for pre-delete refusals, or a
+    ``"branch_delete_failed: ..."``-prefixed diagnostic string for a genuine
+    subprocess failure of the delete itself.
     """
     actions: list[str] = []
-    bd = _git(["-C", project_root, "branch", "-D", branch_name], deadline, 10.0)
-    if bd.returncode != 0:
-        return actions, f"branch_delete_failed: {bd.stderr.strip()[:120]}"
-    actions.append(OP_BRANCH_DELETE)
-    return actions, None
+    with _mutation_lock(project_root):
+        live_tip = _local_branch_tip(project_root, branch_name, deadline)
+        if live_tip is None or expected_oid is None or live_tip != expected_oid:
+            return actions, BRANCH_TIP_CHANGED
+        ancestry_ok, ancestry_reason = _verify_ancestry_for_force_delete(
+            project_root, expected_oid, comparison_ref, deadline
+        )
+        if not ancestry_ok:
+            return actions, ancestry_reason
+        # Compare-and-delete equivalent of
+        # ``git update-ref -d refs/heads/<branch> <expected-old-oid>``: passing
+        # the expected old value makes the ref update atomically fail if the ref
+        # no longer points at ``expected_oid`` (concurrent race after the check
+        # above, closed by the same primitive rather than a second read+delete).
+        bd = _git(
+            ["-C", project_root, "update-ref", "-d", f"refs/heads/{branch_name}", expected_oid],
+            deadline, 10.0,
+        )
+        if bd.returncode != 0:
+            return actions, f"branch_delete_failed: {bd.stderr.strip()[:120]}"
+        actions.append(OP_BRANCH_DELETE)
+        return actions, None
+
+
+def _perform_discard(
+    branch_name: str, worktree_real: str, project_root: str, deadline: Deadline
+) -> tuple[list[str], str | None]:
+    """Execute the local-only discard's force worktree remove + force branch delete.
+
+    Only reachable from ``run_discard_consume`` after a claimed, SHA-bound,
+    non-expired, non-replayed one-shot contract has been re-validated against
+    LIVE state (Issue #1523 AC1-AC3). Runs inside ``_mutation_lock``.
+    """
+    actions: list[str] = []
+    with _mutation_lock(project_root):
+        rm = _git(["-C", project_root, "worktree", "remove", "--force", worktree_real], deadline, 15.0)
+        if rm.returncode != 0:
+            return actions, f"worktree_remove_failed: {rm.stderr.strip()[:120]}"
+        actions.append(OP_WORKTREE_REMOVE)
+        bd = _git(["-C", project_root, "branch", "-D", branch_name], deadline, 10.0)
+        if bd.returncode != 0:
+            return actions, f"branch_delete_failed: {bd.stderr.strip()[:120]}"
+        actions.append(OP_BRANCH_DELETE)
+        return actions, None
+
+
+def verify_discard_authorization(req: dict, project_root: str, deadline: Deadline) -> tuple[bool, str | None, dict]:
+    """Authorize the local-only unpublished commit discard lane (Issue #1523 AC1).
+
+    Candidate conditions (all must hold):
+      * the target worktree is a catalog-registered dedicated worktree under
+        ``.claude/worktrees/`` whose branch matches the requested branch,
+      * the worktree has no uncommitted changes,
+      * the PR is merged, same-repo, correct head branch, correct base branch,
+        and (when supplied) the linked issue matches,
+      * the merged PR's head SHA resolves to a real, locally-present commit
+        object AND is an ancestor of the local branch tip (``pr_head_is_ancestor``),
+      * the local branch tip is strictly ahead of the PR head SHA by at least
+        one commit (the "local-only commits").
+
+    On success, ``verified["discard_candidate"]`` is ``True`` and
+    ``verified["local_only_commit_shas"]`` carries the exact SHA list of the
+    local-only commits (PR head SHA exclusive .. local tip inclusive) — this is
+    the structured "confirmation needed" output AC1 requires. This function
+    performs NO destructive action; it is called both by ``run_discard_check``
+    (pure verification) and re-called by ``run_discard_consume`` immediately
+    before the destructive step (fresh live re-verification, not a cache).
+    """
+    verified = _verified_template()
+    branch_name = req["branch_name"]
+    worktree_real = os.path.realpath(req["worktree_path"])
+
+    cur = _current_branch(project_root, deadline)
+    default = _default_branch(project_root, deadline)
+    if cur is None or cur != default:
+        return False, ROOT_NOT_DEFAULT, verified
+    verified["root_default"] = True
+
+    catalog = list_worktrees(project_root, deadline)
+    if catalog is None:
+        return False, WORKTREE_NOT_IN_CATALOG, verified
+    entry = find_by_realpath(catalog, worktree_real)
+    if entry is None:
+        return False, WORKTREE_NOT_IN_CATALOG, verified
+    verified["worktree_in_catalog"] = True
+    if branch_short_name(entry.get("branch_ref")) != branch_name:
+        return False, BRANCH_MISMATCH, verified
+    verified["branch_match"] = True
+
+    worktrees_dir = os.path.realpath(os.path.join(project_root, ".claude", "worktrees"))
+    if not worktree_real.startswith(worktrees_dir + os.sep):
+        return False, WORKTREE_PATH_MISMATCH, verified
+
+    try:
+        st = _git(["-C", worktree_real, "status", "--porcelain=v1", "-z"], deadline, 10.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, WORKTREE_DIRTY, verified
+    if st.returncode != 0 or st.stdout:
+        return False, WORKTREE_DIRTY, verified
+    verified["worktree_clean"] = True
+
+    repo_slug = _repo_slug(project_root, deadline)
+    if repo_slug is None:
+        return False, REPO_SLUG_UNRESOLVED, verified
+    pr = _pr_state(int(req["pr_number"]), project_root, repo_slug, deadline)
+    if pr is None or pr.get("state") != "MERGED" or not pr.get("mergedAt"):
+        return False, PR_NOT_MERGED, verified
+    verified["pr_merged"] = True
+    if pr.get("headRefName") != branch_name:
+        return False, HEAD_BRANCH_MISMATCH, verified
+    verified["head_branch_match"] = True
+    if pr.get("isCrossRepository"):
+        return False, HEAD_REPO_MISMATCH, verified
+    owner = (pr.get("headRepositoryOwner") or {}).get("login")
+    if owner and repo_slug and owner != repo_slug.split("/", 1)[0]:
+        return False, HEAD_REPO_MISMATCH, verified
+    verified["head_repo_match"] = True
+    if pr.get("baseRefName") != default:
+        return False, BASE_BRANCH_MISMATCH, verified
+    verified["base_branch_match"] = True
+
+    linked = req.get("linked_issue_number")
+    if linked is not None:
+        refs = {r.get("number") for r in (pr.get("closingIssuesReferences") or [])}
+        if int(linked) not in refs:
+            return False, LINKED_ISSUE_MISMATCH, verified
+    verified["linked_issue_match"] = True
+
+    local_tip = _local_branch_tip(project_root, branch_name, deadline)
+    if local_tip is None:
+        return False, LOCAL_BRANCH_MISSING, verified
+    verified["local_tip_sha"] = local_tip
+
+    pr_head_sha = pr.get("headRefOid")
+    verified["pr_head_sha"] = pr_head_sha
+    if not pr_head_sha or not _commit_object_exists(project_root, pr_head_sha, deadline):
+        return False, DISCARD_PR_HEAD_NOT_ANCESTOR, verified
+
+    if pr_head_sha == local_tip:
+        # PR head IS the local tip — no local-only commits to discard.
+        return False, DISCARD_NO_LOCAL_ONLY_COMMITS, verified
+
+    try:
+        anc = _git(["-C", project_root, "merge-base", "--is-ancestor", pr_head_sha, local_tip], deadline, 10.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, DISCARD_PR_HEAD_NOT_ANCESTOR, verified
+    if anc.returncode != 0:
+        return False, DISCARD_PR_HEAD_NOT_ANCESTOR, verified
+    verified["pr_head_is_ancestor"] = True
+
+    try:
+        log = _git(["-C", project_root, "rev-list", f"{pr_head_sha}..{local_tip}"], deadline, 10.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, DISCARD_NO_LOCAL_ONLY_COMMITS, verified
+    if log.returncode != 0:
+        return False, DISCARD_NO_LOCAL_ONLY_COMMITS, verified
+    commit_shas = [line for line in log.stdout.splitlines() if line.strip()]
+    verified["local_only_commit_count"] = len(commit_shas)
+    verified["local_only_commit_shas"] = commit_shas
+    if not commit_shas:
+        return False, DISCARD_NO_LOCAL_ONLY_COMMITS, verified
+
+    verified["discard_candidate"] = True
+    return True, None, verified
+
+
+def run_discard_check(req: dict, project_root: str | None = None, budget_seconds: float = 60.0) -> dict:
+    """Verify-only entry point for the discard lane (Issue #1523 AC1).
+
+    Performs NO destructive action and issues NO confirmation contract; it only
+    reports whether the target is a discard candidate and, if so, the exact
+    local-only commit SHAs a human would be confirming the discard of.
+    """
+    root = os.path.realpath(project_root) if project_root else resolve_project_root()
+    deadline = Deadline(budget_seconds)
+    try:
+        ok, reason, verified = verify_discard_authorization(req, root, deadline)
+    except GuardDeadlineExceeded as e:
+        return _discard_result("error", str(e), _verified_template(), [])
+    if not ok:
+        return _discard_result("refused", reason, verified, [])
+    return _discard_result("confirmation_required", None, verified, [])
+
+
+def run_discard_consume(req: dict, project_root: str | None = None, budget_seconds: float = 60.0) -> dict:
+    """Claim-first consume of a one-shot ``OP_LOCAL_ONLY_DISCARD`` contract (Issue #1523 AC2/AC3).
+
+    This is the ONLY entry point that performs the destructive discard, and it
+    is reachable ONLY when a human has already run the executor-issued
+    confirmation (i.e. ``materialize_cleanup_contract`` with
+    ``--operation local_only_discard``) so a claimable contract exists on disk.
+
+    Sequence (fail-closed at every step, never performing a partial destructive
+    action on refusal):
+      1. ``claim_contract`` — atomic rename; loses the race / already-consumed /
+         absent → refused (``cleanup_contract_consumed``). This is the one-shot /
+         replay-refusal guarantee (a second invocation cannot re-claim).
+      2. ``read_claimed_contract`` — schema/expiry validation of the CLAIMED
+         copy (symlink-safe IO); any failure (including expiry) → refused +
+         discard the claim.
+      3. Contract ``operation`` must be ``OP_LOCAL_ONLY_DISCARD`` → else refused.
+      4. Contract's target fields (PR number, linked issue, worktree realpath,
+         branch name) must equal the REQUEST's fields exactly (target binding).
+      5. Fresh LIVE re-verification via ``verify_discard_authorization`` — the
+         confirmation contract does not itself substitute for live
+         authorization; every original candidacy condition (clean worktree, PR
+         still merged, etc.) is re-checked at consume time.
+      6. The contract's bound ``pr_head_sha`` / ``local_tip_sha`` must equal the
+         FRESH live-verified SHAs (Issue #1523 AC2/AC3 SHA-binding race guard) —
+         a mismatch (branch moved, or a different PR head was merged in the
+         interim) refuses with ``DISCARD_SHA_BINDING_CHANGED`` rather than
+         performing a stale-binding discard.
+      7. Only then, inside ``_mutation_lock``, does the destructive
+         ``git worktree remove --force`` + ``git branch -D`` run.
+
+    A durable consume tombstone is written on every claimed-and-validated
+    attempt (success or failure past step 3) so replay is denied even if the
+    destructive step itself later fails.
+    """
+    root = os.path.realpath(project_root) if project_root else resolve_project_root()
+    deadline = Deadline(budget_seconds)
+
+    claimed_name = claim_contract(root)
+    if claimed_name is None:
+        return _discard_result("refused", CLEANUP_CONTRACT_CONSUMED, _verified_template(), [])
+
+    ok_c, contract, reason_c = read_claimed_contract(root, claimed_name)
+    if not ok_c:
+        discard_claimed(root, claimed_name)
+        return _discard_result("refused", reason_c, _verified_template(), [])
+
+    if contract.get("operation") != OP_LOCAL_ONLY_DISCARD:
+        write_consume_tombstone(root, contract)
+        discard_claimed(root, claimed_name)
+        return _discard_result("refused", CLEANUP_OPERATION_MISMATCH, _verified_template(), [])
+
+    worktree_real = os.path.realpath(req["worktree_path"])
+    if (
+        contract.get("pr_number") != req.get("pr_number")
+        or contract.get("linked_issue_number") != req.get("linked_issue_number")
+        or contract.get("worktree_path") != worktree_real
+        or contract.get("branch_name") != req["branch_name"]
+    ):
+        write_consume_tombstone(root, contract)
+        discard_claimed(root, claimed_name)
+        return _discard_result("refused", "cleanup_command_hash_mismatch", _verified_template(), [])
+
+    try:
+        ok, reason, verified = verify_discard_authorization(req, root, deadline)
+    except GuardDeadlineExceeded as e:
+        write_consume_tombstone(root, contract)
+        discard_claimed(root, claimed_name)
+        return _discard_result("error", str(e), _verified_template(), [])
+    if not ok:
+        write_consume_tombstone(root, contract)
+        discard_claimed(root, claimed_name)
+        return _discard_result("refused", reason, verified, [])
+
+    if (
+        contract.get("pr_head_sha") != verified.get("pr_head_sha")
+        or contract.get("local_tip_sha") != verified.get("local_tip_sha")
+    ):
+        write_consume_tombstone(root, contract)
+        discard_claimed(root, claimed_name)
+        return _discard_result("refused", DISCARD_SHA_BINDING_CHANGED, verified, [])
+
+    try:
+        actions, perform_error = _perform_discard(
+            req["branch_name"], worktree_real, root, deadline
+        )
+    except (GuardDeadlineExceeded, OSError, subprocess.TimeoutExpired) as e:
+        write_consume_tombstone(root, contract)
+        discard_claimed(root, claimed_name)
+        return _discard_result("error", str(e)[:160], verified, [])
+
+    write_consume_tombstone(root, contract)
+    discard_claimed(root, claimed_name)
+
+    if perform_error is not None:
+        return _discard_result("error", perform_error, verified, actions)
+    return _discard_result("ok", None, verified, actions)
 
 
 def run(req: dict, project_root: str | None = None, budget_seconds: float = 60.0) -> dict:
@@ -684,8 +1117,12 @@ def run(req: dict, project_root: str | None = None, budget_seconds: float = 60.0
             return _result("error", str(e), {}, [])
         if not ok_b:
             return _branch_only_result("refused", reason_b, verified_b, [])
+        default_branch = _default_branch(root, deadline)
+        expected_oid = verified_b.get("local_branch_tip_oid")
         try:
-            actions, perform_error = _perform_branch_only(req["branch_name"], root, deadline)
+            actions, perform_error = _perform_branch_only(
+                req["branch_name"], expected_oid, default_branch, root, deadline
+            )
         except (GuardDeadlineExceeded, OSError, subprocess.TimeoutExpired) as e:
             return _branch_only_result("error", str(e)[:160], verified_b, [])
         if perform_error is not None:
@@ -701,6 +1138,44 @@ def run(req: dict, project_root: str | None = None, budget_seconds: float = 60.0
     except (GuardDeadlineExceeded, OSError, subprocess.TimeoutExpired) as e:
         return _result("error", str(e)[:160], verified, [])
     if perform_error is not None:
+        # Same-invocation branch-only-fallback re-authorization (Issue #1523 AC10):
+        # when worktree_remove SUCCEEDED but the (non-force) ``branch -d`` then
+        # FAILED, the worktree is now genuinely absent from disk+catalog, which
+        # is exactly the branch-only lane's candidacy shape. Re-authorize (NOT
+        # re-execute) via the SAME branch-only verifier used by the standalone
+        # branch-only lane above; only on a fresh, independent authorization
+        # success do we proceed to the compare-and-delete force path. ANY
+        # refusal during re-authorization (confirmation absent/expired/replay,
+        # target-SHA mismatch, PR-not-merged, cross-repo, base/linked-issue/
+        # path/catalog/branch mismatch, not-local-only history, uncommitted
+        # changes) preserves the ORIGINAL ``branch_delete_failed`` reason code,
+        # leaves ``actions_taken`` as the already-succeeded ``worktree_remove``
+        # ONLY, leaves the branch intact, and NEVER invokes the force-delete
+        # subprocess.
+        if OP_WORKTREE_REMOVE in actions and perform_error.startswith("branch_delete_failed"):
+            try:
+                ok_b, reason_b, verified_b = verify_branch_only_cleanup_authorization(req, root, deadline)
+            except GuardDeadlineExceeded:
+                return _result("error", perform_error, verified, actions)
+            if ok_b:
+                default_branch = _default_branch(root, deadline)
+                expected_oid = verified_b.get("local_branch_tip_oid")
+                try:
+                    actions_b, perform_error_b = _perform_branch_only(
+                        req["branch_name"], expected_oid, default_branch, root, deadline
+                    )
+                except (GuardDeadlineExceeded, OSError, subprocess.TimeoutExpired):
+                    return _result("error", perform_error, verified, actions)
+                if perform_error_b is None:
+                    return _result("ok", None, verified, actions + actions_b)
+                # Re-authorized but the force-delete step itself failed/refused:
+                # preserve the original branch_delete_failed reason and keep
+                # actions_taken to worktree_remove only (force-delete subprocess
+                # WAS invoked here, but did not succeed).
+                return _result("error", perform_error, verified, actions)
+            # Re-authorization refused: preserve ORIGINAL reason code and
+            # actions_taken; the force-delete subprocess is NEVER invoked.
+            return _result("error", perform_error, verified, actions)
         # Blocker 6: keep the partial actions that DID run (e.g. worktree_remove).
         return _result("error", perform_error, verified, actions)
     return _result("ok", None, verified, actions)
@@ -734,7 +1209,31 @@ def _branch_only_result(status: str, reason: str | None, verified: dict, actions
     }
 
 
+def _discard_result(status: str, reason: str | None, verified: dict, actions: list[str]) -> dict:
+    """Result dict for the local-only unpublished commit discard lane (Issue #1523 AC4).
+
+    Additive-only relative to ``CLEANUP_EXEC_RESULT_V1``: adds ``discard_lane``
+    (mirroring the existing ``branch_only`` flag pattern) without changing any
+    pre-existing required key or type.
+    """
+    return {
+        "schema": SCHEMA_RESULT,
+        "status": status,
+        "reason_code": reason,
+        "verified": verified,
+        "actions_taken": actions,
+        "stderr_line_count": 0,
+        "discard_lane": True,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Issue #1523: this CLI shape is intentionally UNCHANGED (AC6) — the
+    # discard lane (``verify_discard_authorization`` / ``run_discard_check`` /
+    # ``run_discard_consume``) is a Python-level entry point only, invoked from
+    # ``materialize_cleanup_contract.py``'s ``--check`` / ``--consume`` CLI
+    # surface (which already carries the ``--operation local_only_discard``
+    # choice), never from a new flag on THIS executor's argparse.
     p = argparse.ArgumentParser(description="Verified single cleanup executor.")
     p.add_argument("--pr-number", type=int, required=True)
     p.add_argument("--linked-issue-number", type=int, default=None)

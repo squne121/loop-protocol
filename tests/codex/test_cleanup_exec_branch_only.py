@@ -45,8 +45,11 @@ sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-ops"))
 import cleanup_exec as _ce
 from cleanup_exec import (
     run,
+    run_discard_check,
+    run_discard_consume,
     verify_cleanup_authorization,
     verify_branch_only_cleanup_authorization,
+    verify_discard_authorization,
     WORKTREE_STILL_IN_CATALOG,
     BRANCH_CHECKED_OUT_IN_WORKTREE,
     LOCAL_BRANCH_MISSING,
@@ -56,8 +59,17 @@ from cleanup_exec import (
     HEAD_REPO_MISMATCH,
     BASE_BRANCH_MISMATCH,
     LINKED_ISSUE_MISMATCH,
+    DISCARD_NO_LOCAL_ONLY_COMMITS,
+    DISCARD_SHA_BINDING_CHANGED,
 )
-from cleanup_contract_v3 import OP_BRANCH_DELETE, OP_WORKTREE_REMOVE, WORKTREE_NOT_IN_CATALOG
+from cleanup_contract_v3 import (
+    CLEANUP_CONTRACT_CONSUMED,
+    OP_BRANCH_DELETE,
+    OP_LOCAL_ONLY_DISCARD,
+    OP_WORKTREE_REMOVE,
+    WORKTREE_NOT_IN_CATALOG,
+)
+from materialize_cleanup_contract import materialize
 from worktree_catalog import Deadline
 
 
@@ -610,8 +622,16 @@ class TestForceDelete:
         assert ok is False
         assert reason == BRANCH_ONLY_FORCE_DELETE_DENIED
 
-    def test_force_delete_authorized_uses_git_branch_D(self, repo_branch_only, monkeypatch):
-        """GIVEN authorized branch-only WHEN _perform_branch_only called THEN uses 'branch -D'."""
+    def test_force_delete_authorized_uses_oid_bound_compare_and_delete(self, repo_branch_only, monkeypatch):
+        """GIVEN authorized branch-only WHEN _perform_branch_only called THEN uses OID-bound compare-and-delete.
+
+        Issue #1523 AC7: the destructive call is threaded with the expected
+        branch-tip OID and performs the git-native compare-and-delete
+        equivalent (``git update-ref -d refs/heads/<branch> <expected-old-oid>``)
+        rather than a bare ``git branch -D`` with no OID binding. This is a
+        strictly STRONGER atomicity guarantee than plain force-delete (a bare
+        ``branch -d`` soft-delete must still never be used in this lane).
+        """
         repo = repo_branch_only
         captured_args: list[list[str]] = []
 
@@ -633,13 +653,18 @@ class TestForceDelete:
             result = run(req, project_root=repo["root"])
 
         assert result["status"] == "ok"
-        # Verify git branch -D was used (not -d)
+        # Verify the OID-bound update-ref compare-and-delete was used, bound to
+        # the exact expected branch tip OID.
+        update_ref_cmds = [a for a in captured_args if "update-ref" in a]
+        assert any(
+            "-d" in cmd and f"refs/heads/{repo['branch_name']}" in cmd and repo["branch_tip"] in cmd
+            for cmd in update_ref_cmds
+        ), f"Expected OID-bound 'update-ref -d refs/heads/<branch> <expected-oid>', got: {update_ref_cmds}"
+        # A bare soft branch -d (or any bare branch -D without OID binding) must
+        # not be used in this lane.
         branch_cmds = [a for a in captured_args if "branch" in a]
-        assert any("-D" in cmd for cmd in branch_cmds), (
-            f"Expected 'branch -D' in git calls, got: {branch_cmds}"
-        )
-        assert not any("-d" in cmd and "-D" not in cmd for cmd in branch_cmds), (
-            "branch -d (soft delete) must not be used in branch-only lane"
+        assert not branch_cmds, (
+            f"Expected no bare 'git branch' delete calls in branch-only lane, got: {branch_cmds}"
         )
 
     def test_branch_only_force_delete_used_field(self, repo_branch_only):
@@ -1416,3 +1441,329 @@ def test_non_squash_merge_commit_oid_mismatch_rejects_even_if_paths_match(
     assert ok is False, f"non-squash (2-parent) merge commit must fail-closed: {verified}"
     assert reason == HEAD_OID_MISMATCH
     assert verified["head_equivalence_authorized"] is False
+
+
+
+# ─── Issue #1523: local-only unpublished commit discard lane (AC1-AC6) ────────
+
+
+@pytest.fixture
+def repo_discard_candidate(tmp_path):
+    """Temp git repo with a dedicated worktree whose branch has ONE local-only
+    commit beyond the (fake) merged PR's head SHA.
+
+    Commit shape on the branch: seed (== main) -> B (represents the PR head
+    that was actually merged) -> C (a local-only commit never published in the
+    merged PR). ``pr_head_sha`` == B, ``local_tip_sha`` == C.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git("init", "-q", "-b", "main", cwd=root)
+    _git("config", "user.email", "t@t.com", cwd=root)
+    _git("config", "user.name", "T", cwd=root)
+    _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=root)
+    (root / "README.md").write_text("seed\n")
+    _git("add", "README.md", cwd=root)
+    _git("commit", "-q", "-m", "seed", cwd=root)
+
+    wt_parent = root / ".claude" / "worktrees"
+    wt_parent.mkdir(parents=True, exist_ok=True)
+    wt_path = wt_parent / "issue-1523-discard-test"
+    _git("worktree", "add", "-q", "-b", "issue-1523-discard-test", str(wt_path), "main", cwd=root)
+
+    (wt_path / "feature.txt").write_text("published\n")
+    _git("add", "feature.txt", cwd=wt_path)
+    _git("commit", "-q", "-m", "feat: published change (PR head)", cwd=wt_path)
+    pr_head_sha = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "refs/heads/issue-1523-discard-test"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    (wt_path / "scratch.txt").write_text("local only work\n")
+    _git("add", "scratch.txt", cwd=wt_path)
+    _git("commit", "-q", "-m", "wip: local-only unpublished commit", cwd=wt_path)
+    local_tip_sha = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "refs/heads/issue-1523-discard-test"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    yield {
+        "root": str(root),
+        "worktree_path": str(wt_path),
+        "branch_name": "issue-1523-discard-test",
+        "pr_head_sha": pr_head_sha,
+        "local_tip_sha": local_tip_sha,
+    }
+
+    if wt_path.exists():
+        subprocess.run(
+            ["git", "-C", str(root), "worktree", "remove", "--force", str(wt_path)],
+            capture_output=True,
+        )
+
+
+def _make_discard_req(repo: dict, *, linked_issue: int = 1523, pr_number: int = 1528) -> dict:
+    return {
+        "schema": "CLEANUP_EXEC_REQUEST_V1",
+        "pr_number": pr_number,
+        "linked_issue_number": linked_issue,
+        "worktree_path": repo["worktree_path"],
+        "branch_name": repo["branch_name"],
+    }
+
+
+def _fake_discard_pr(repo: dict, *, linked_issue: int = 1523, pr_number: int = 1528) -> dict:
+    return _make_merged_pr(
+        repo["branch_name"], repo["pr_head_sha"], pr_number=pr_number, linked_issue=linked_issue
+    )
+
+
+class TestDiscardCandidate:
+    """AC1: discard candidacy detection + structured local-only commit SHA output."""
+
+    def test_discard_candidate_reports_local_only_commit_shas(self, repo_discard_candidate):
+        """GIVEN one local-only commit beyond PR head WHEN verified THEN SHA list + count reported."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            ok, reason, verified = verify_discard_authorization(req, repo["root"], Deadline(30.0))
+
+        assert ok is True, f"expected discard candidate, got: reason={reason} verified={verified}"
+        assert verified["discard_candidate"] is True
+        assert verified["pr_head_sha"] == repo["pr_head_sha"]
+        assert verified["local_tip_sha"] == repo["local_tip_sha"]
+        assert verified["pr_head_is_ancestor"] is True
+        assert verified["local_only_commit_count"] == 1
+        assert verified["local_only_commit_shas"] == [repo["local_tip_sha"]]
+
+    def test_discard_check_is_non_destructive(self, repo_discard_candidate):
+        """GIVEN discard candidate WHEN run_discard_check called THEN worktree/branch untouched."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            result = run_discard_check(req, project_root=repo["root"])
+
+        assert result["status"] == "confirmation_required"
+        assert result["actions_taken"] == []
+        assert Path(repo["worktree_path"]).exists()
+
+    def test_discard_no_local_only_commits_refused(self, repo_discard_candidate):
+        """GIVEN PR head == local tip (nothing local-only) WHEN verified THEN refused."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        # PR head SHA equals the LOCAL TIP itself (nothing local-only beyond it).
+        fake_pr = _make_merged_pr(repo["branch_name"], repo["local_tip_sha"], pr_number=1528, linked_issue=1523)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            ok, reason, verified = verify_discard_authorization(req, repo["root"], Deadline(30.0))
+
+        assert ok is False
+        assert reason == DISCARD_NO_LOCAL_ONLY_COMMITS
+        assert verified["discard_candidate"] is False
+
+
+class TestDiscardConfirmAndConsume:
+    """AC2/AC3: target+SHA-bound, one-shot, expiring confirmation gates the destructive discard."""
+
+    def test_consume_without_confirmation_refused(self, repo_discard_candidate):
+        """GIVEN no contract materialized WHEN consume attempted THEN refused, nothing deleted."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            result = run_discard_consume(req, project_root=repo["root"])
+
+        assert result["status"] == "refused"
+        assert result["reason_code"] == CLEANUP_CONTRACT_CONSUMED
+        assert result["actions_taken"] == []
+        assert Path(repo["worktree_path"]).exists()
+
+    def test_confirm_then_consume_performs_discard(self, repo_discard_candidate):
+        """GIVEN materialized contract WHEN consumed THEN worktree+branch removed, actions recorded."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            mat = materialize(
+                pr_number=req["pr_number"],
+                linked_issue_number=req["linked_issue_number"],
+                worktree_path=req["worktree_path"],
+                branch_name=req["branch_name"],
+                operation=OP_LOCAL_ONLY_DISCARD,
+                project_root=repo["root"],
+            )
+            assert mat["status"] == "ok", mat
+
+            result = run_discard_consume(req, project_root=repo["root"])
+
+        assert result["status"] == "ok", result
+        assert result["actions_taken"] == [OP_WORKTREE_REMOVE, OP_BRANCH_DELETE]
+        assert result["discard_lane"] is True
+        assert not Path(repo["worktree_path"]).exists()
+        branch_check = subprocess.run(
+            ["git", "-C", repo["root"], "rev-parse", "--verify", f"refs/heads/{repo['branch_name']}"],
+            capture_output=True, text=True,
+        )
+        assert branch_check.returncode != 0, "branch must be deleted after discard consume"
+
+    def test_consume_replay_refused(self, repo_discard_candidate):
+        """GIVEN an already-consumed contract WHEN consume run again THEN refused (one-shot)."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            mat = materialize(
+                pr_number=req["pr_number"],
+                linked_issue_number=req["linked_issue_number"],
+                worktree_path=req["worktree_path"],
+                branch_name=req["branch_name"],
+                operation=OP_LOCAL_ONLY_DISCARD,
+                project_root=repo["root"],
+            )
+            assert mat["status"] == "ok", mat
+
+            first = run_discard_consume(req, project_root=repo["root"])
+            assert first["status"] == "ok", first
+
+            second = run_discard_consume(req, project_root=repo["root"])
+
+        assert second["status"] == "refused"
+        assert second["reason_code"] == CLEANUP_CONTRACT_CONSUMED
+        assert second["actions_taken"] == []
+
+    def test_consume_expired_contract_refused(self, repo_discard_candidate):
+        """GIVEN an expired one-shot contract WHEN consumed THEN refused, nothing deleted."""
+        import time
+
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            mat = materialize(
+                pr_number=req["pr_number"],
+                linked_issue_number=req["linked_issue_number"],
+                worktree_path=req["worktree_path"],
+                branch_name=req["branch_name"],
+                operation=OP_LOCAL_ONLY_DISCARD,
+                ttl_seconds=1,
+                project_root=repo["root"],
+            )
+            assert mat["status"] == "ok", mat
+
+            time.sleep(1.2)
+
+            result = run_discard_consume(req, project_root=repo["root"])
+
+        assert result["status"] == "refused"
+        assert result["actions_taken"] == []
+        assert Path(repo["worktree_path"]).exists()
+
+    def test_consume_sha_binding_changed_refused(self, repo_discard_candidate):
+        """GIVEN branch moved after materialize WHEN consumed THEN refused (SHA binding race guard)."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            mat = materialize(
+                pr_number=req["pr_number"],
+                linked_issue_number=req["linked_issue_number"],
+                worktree_path=req["worktree_path"],
+                branch_name=req["branch_name"],
+                operation=OP_LOCAL_ONLY_DISCARD,
+                project_root=repo["root"],
+            )
+            assert mat["status"] == "ok", mat
+
+            # Move the branch tip AFTER the contract was issued (race condition).
+            (Path(repo["worktree_path"]) / "another.txt").write_text("more work\n")
+            _git("add", "another.txt", cwd=repo["worktree_path"])
+            _git("commit", "-q", "-m", "wip: even more local-only work", cwd=repo["worktree_path"])
+
+            result = run_discard_consume(req, project_root=repo["root"])
+
+        assert result["status"] == "refused"
+        assert result["reason_code"] == DISCARD_SHA_BINDING_CHANGED
+        assert result["actions_taken"] == []
+        assert Path(repo["worktree_path"]).exists()
+
+    def test_confirmation_contract_binds_pr_head_and_local_tip_sha(self, repo_discard_candidate):
+        """AC2: materialized contract's fields are bound to the exact target + SHAs."""
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            mat = materialize(
+                pr_number=req["pr_number"],
+                linked_issue_number=req["linked_issue_number"],
+                worktree_path=req["worktree_path"],
+                branch_name=req["branch_name"],
+                operation=OP_LOCAL_ONLY_DISCARD,
+                project_root=repo["root"],
+            )
+        assert mat["status"] == "ok", mat
+
+        contract_path = Path(repo["root"]) / "artifacts" / "agent-ops" / "cleanup_contract.json"
+        import json as _json
+        contract = _json.loads(contract_path.read_text())
+        assert contract["operation"] == OP_LOCAL_ONLY_DISCARD
+        assert contract["worktree_path"] == os.path.realpath(repo["worktree_path"])
+        assert contract["branch_name"] == repo["branch_name"]
+        assert contract["pr_head_sha"] == repo["pr_head_sha"]
+        assert contract["local_tip_sha"] == repo["local_tip_sha"]
+
+
+class TestDiscardResultAdditive:
+    """AC4: discard-lane result fields are additive only relative to CLEANUP_EXEC_RESULT_V1."""
+
+    def test_discard_result_preserves_base_result_keys(self, repo_discard_candidate):
+        repo = repo_discard_candidate
+        req = _make_discard_req(repo)
+        fake_pr = _fake_discard_pr(repo)
+
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=fake_pr),
+        ):
+            result = run_discard_check(req, project_root=repo["root"])
+
+        for key in ("schema", "status", "reason_code", "verified", "actions_taken", "stderr_line_count"):
+            assert key in result, f"missing base CLEANUP_EXEC_RESULT_V1 key: {key}"
+        assert result["schema"] == "CLEANUP_EXEC_RESULT_V1"
+        assert result["discard_lane"] is True

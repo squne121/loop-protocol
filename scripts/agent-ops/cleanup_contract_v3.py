@@ -36,7 +36,11 @@ TOMBSTONE_SCHEMA = "POST_MERGE_CLEANUP_TOMBSTONE_V1"
 
 OP_WORKTREE_REMOVE = "worktree_remove"
 OP_BRANCH_DELETE = "branch_delete"
-OPERATIONS = (OP_WORKTREE_REMOVE, OP_BRANCH_DELETE)
+# Issue #1523: local-only unpublished commit discard lane. Bound (in addition to
+# worktree_path/branch_name) to pr_head_sha + local_tip_sha so the one-shot
+# confirmation is target-SHA bound, not just target-path bound.
+OP_LOCAL_ONLY_DISCARD = "local_only_discard"
+OPERATIONS = (OP_WORKTREE_REMOVE, OP_BRANCH_DELETE, OP_LOCAL_ONLY_DISCARD)
 
 # Maximum allowed TTL between issued_at and expires_at (a few minutes).
 MAX_TTL_SECONDS = 600
@@ -123,6 +127,13 @@ def expected_argv(operation: str, worktree_path: str, branch_name: str) -> list[
         return ["git", "worktree", "remove", worktree_path]
     if operation == OP_BRANCH_DELETE:
         return ["git", "branch", "-d", branch_name]
+    if operation == OP_LOCAL_ONLY_DISCARD:
+        # Issue #1523: composite argv hash input for the discard lane — this is a
+        # canonical hash input only (never executed as shell); the destructive
+        # steps are two separate internal subprocess arrays (force worktree
+        # remove + force branch delete).
+        return ["git", "worktree", "remove", "--force", worktree_path,
+                "&&", "git", "branch", "-D", branch_name]
     raise ValueError(f"unknown operation: {operation}")
 
 
@@ -145,6 +156,22 @@ def canonical_command_hash(argv: list[str], operation: str, project_root: str, n
 
 def _is_hex_sha256(value: object) -> bool:
     if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return value == value.lower()
+
+
+def _is_hex_commit_sha(value: object) -> bool:
+    """True iff ``value`` looks like a git commit SHA (hex, 7-64 chars, lowercase).
+
+    Issue #1523: the discard lane binds ``pr_head_sha`` / ``local_tip_sha`` to the
+    one-shot contract. Full-length SHA-1 (40 hex chars) is the common case but a
+    conservative length range is accepted defensively (e.g. future SHA-256 repos).
+    """
+    if not isinstance(value, str) or not (7 <= len(value) <= 64):
         return False
     try:
         int(value, 16)
@@ -269,6 +296,14 @@ def validate_v3_contract(contract: object, now: datetime | None = None) -> tuple
     linked = contract.get("linked_issue_number")
     if linked is not None and (not isinstance(linked, int) or isinstance(linked, bool)):
         return False, "linked_issue_number_invalid"
+
+    # Issue #1523: the discard lane additionally binds the confirmation to the
+    # exact PR head SHA and local branch tip SHA observed at authorization time.
+    if contract.get("operation") == OP_LOCAL_ONLY_DISCARD:
+        if not _is_hex_commit_sha(contract.get("pr_head_sha")):
+            return False, "pr_head_sha_invalid"
+        if not _is_hex_commit_sha(contract.get("local_tip_sha")):
+            return False, "local_tip_sha_invalid"
 
     return True, None
 
