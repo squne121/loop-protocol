@@ -158,7 +158,13 @@ def _cli_run_details_from_pairs(pairs: list[tuple], commit_sha: str) -> list[dic
     (`workflow_run_id`, core_baseline, responsive_baseline) tuples -- the
     per-run duration is the SAME `max(core, responsive)` provider
     critical-path statistic `_provider_critical_path_paired_p50_p95` uses
-    (#2159 P0-4), never a self-reported/aggregate number."""
+    (#2159 P0-4), never a self-reported/aggregate number.
+
+    #2179 AC2: `run_attempt` is no longer a `1` literal -- it is the
+    actual attempt SELECTED for this pair by `_pair_by_workflow_run_id`'s
+    `initial_attempt_only_v1` policy (always 1 under that policy, but
+    propagated from the record rather than hardcoded, so a future policy
+    change does not require touching this call site)."""
     run_details = []
     for workflow_run_id, core, responsive in pairs:
         core_duration = _single_baseline_duration_seconds(core)
@@ -169,7 +175,7 @@ def _cli_run_details_from_pairs(pairs: list[tuple], commit_sha: str) -> list[dic
             {
                 "run_id": str(workflow_run_id),
                 "workflow_run_id": workflow_run_id,
-                "run_attempt": 1,
+                "run_attempt": _normalize_run_attempt(core) or 1,
                 "commit_sha": commit_sha,
                 "conclusion": "success",
                 "duration_seconds": max(core_duration, responsive_duration),
@@ -360,19 +366,163 @@ def _fingerprint_has_placeholder(baseline: dict, fields: tuple[str, ...] = WITHI
     return any(_is_placeholder(baseline.get(field)) for field in fields)
 
 
-def _dedupe_by_workflow_run_id(baselines: list[dict]) -> list[dict]:
-    """#2159 P0-2/P1-1: sample identity is `workflow_run_id`, not `(run_id,
-    run_attempt)`. Baselines missing `workflow_run_id` are excluded (they
-    cannot be deduped or paired safely). Keeps the FIRST baseline seen per
-    `workflow_run_id` -- rerun attempts of the same run never add an
-    independent sample."""
-    seen: dict[object, dict] = {}
+# #2179 (fix_delta after OWNER adversarial review of PR #2172,
+# issuecomment-5295659213 P1-1 / follow-up Issue #2179): rerun-attempt
+# selection is the explicit, order-independent `initial_attempt_only_v1`
+# policy -- never `dict.setdefault()` first-seen-wins, and never a dict
+# comprehension's implicit last-seen-wins (see `_pair_by_workflow_run_id`
+# below). Independently implemented from
+# `scripts/ci/collect_e2e_performance_benchmark.py`'s copy per this
+# module's own Allowed Paths boundary (see module docstring).
+RERUN_ATTEMPT_SELECTION_POLICY = "initial_attempt_only_v1"
+
+
+def _normalize_run_attempt(baseline: dict) -> int | None:
+    """#2179: normalizes `baseline["run_attempt"]` to the
+    `initial_attempt_only_v1` policy's `integer >= 1` contract. A missing
+    key defaults to 1 and is treated as a TRUSTED attempt-1 candidate --
+    this is NOT backward compatibility with pre-`run_attempt` baselines
+    (`ci_runtime_baseline_v1` has included `run_attempt` since its
+    introduction in commit `9574ee5c`; every baseline has always carried
+    this field). It is a KNOWN, TRACKED limitation: this gate module's own
+    Allowed Paths boundary (#2179 fix_delta, OWNER adversarial review of
+    PR #2182, issuecomment-5302595322) excludes satellite fixture files
+    such as `tests/ci/test_ci_performance_gate_paired_critical_path.py`,
+    which construct baseline records without `run_attempt`. Defaulting a
+    missing key to untrusted (`None`) here would silently exclude every
+    baseline from those satellite fixtures from the trusted cohort,
+    breaking their existing tests. Fully unifying this with the
+    collector's stricter (`scripts/ci/collect_e2e_performance_
+    benchmark.py`) missing-excludes-from-cohort policy is tracked in
+    follow-up Issue #2187 (https://github.com/squne121/loop-protocol/
+    issues/2187), which widens the Allowed Paths to the satellite fixture
+    files. A numeric STRING (e.g. `"1"`) is accepted and coerced to int --
+    this is the REAL producer shape (`GITHUB_RUN_ATTEMPT` is a bash env
+    var, always a string, see `.github/workflows/ci.yml`'s
+    `Collect ci_runtime_baseline_v1 artifact` step and
+    `test_v2_producer_shaped_baseline_from_ci_yml_is_admitted_to_cohort`).
+    An explicit `None`, a non-numeric string, a bool, `0`, or a negative
+    value is invalid -- returns `None` (fail-closed exclusion, never
+    guessed)."""
+    if "run_attempt" not in baseline:
+        return 1
+    value = baseline.get("run_attempt")
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        if not value.isdigit():
+            return None
+        value = int(value)
+    elif not isinstance(value, int):
+        return None
+    if value < 1:
+        return None
+    return value
+
+
+def _identity_normalized_json(baseline: dict) -> str:
+    """#2182 P1 (fix_delta after OWNER adversarial review of PR #2182,
+    issuecomment-5302446086): canonical (sorted-keys) JSON view of
+    `baseline`, used for byte-for-byte identity comparison -- two
+    baselines compare equal under this function iff EVERY field
+    matches."""
+    return json.dumps(baseline, sort_keys=True, default=str)
+
+
+def _detect_run_attempt_identity_collisions(baselines: list[dict]) -> dict[object, list[dict]]:
+    """#2182 P1: identity is fixed to `(workflow_run_id, job,
+    run_attempt)` (`run_attempt` normalized via `_normalize_run_attempt`,
+    which -- for THIS gate module only, see `_select_initial_attempt_
+    baselines`'s own docstring for why -- still defaults a MISSING
+    `run_attempt` key to 1). Baselines sharing that identity slot are
+    treated as an idempotent, harmless duplicate ONLY if the ENTIRE
+    normalized baseline is byte-for-byte identical
+    (`_identity_normalized_json`); if even a SINGLE field differs
+    (`elapsed_ms` / fingerprint fields / `cohort_role` / any other
+    field), the WHOLE `workflow_run_id` sample is flagged as a
+    collision -- this supersedes the pre-fix_delta `min()` tie-break,
+    which silently picked one candidate instead of detecting a genuine
+    content conflict (the OWNER-flagged defect: two baselines sharing a
+    `workflow_run_id`/attempt but disagreeing on measurement/fingerprint/
+    policy fields would silently resolve via `min()`)."""
+    by_key: dict[tuple, list[dict]] = {}
     for baseline in baselines:
         workflow_run_id = baseline.get("workflow_run_id")
         if workflow_run_id is None:
             continue
-        seen.setdefault(workflow_run_id, baseline)
-    return list(seen.values())
+        if _normalize_run_attempt(baseline) != 1:
+            continue
+        by_key.setdefault((workflow_run_id, baseline.get("job"), 1), []).append(baseline)
+
+    collisions: dict[object, list[dict]] = {}
+    for (workflow_run_id, _job, _attempt), group in by_key.items():
+        if len(group) < 2:
+            continue
+        normalized = {_identity_normalized_json(b) for b in group}
+        if len(normalized) > 1:
+            collisions.setdefault(workflow_run_id, []).extend(group)
+    return collisions
+
+
+def _select_initial_attempt_baselines(baselines: list[dict]) -> dict[object, dict]:
+    """#2179 P0-2/P1-1 (supersedes the #2159 first-seen-wins version):
+    sample identity is `workflow_run_id`; among baselines sharing one id,
+    only the run_attempt == 1 candidate (default when absent) is kept.
+    Order-independent -- groups by id first via a dict-of-lists, never
+    relies on insertion order. Baselines missing `workflow_run_id` are
+    excluded (cannot be deduped/paired safely).
+
+    NOTE (#2182 fix_delta scope boundary, OWNER adversarial review
+    issuecomment-5302446086 P0-3): unlike the COLLECTOR's
+    `_normalize_run_attempt` (`scripts/ci/collect_e2e_performance_
+    benchmark.py`), THIS gate module intentionally still defaults a
+    MISSING `run_attempt` key to 1 for trusted-cohort eligibility. Fully
+    unifying this with the collector's stricter (missing-excludes-from-
+    cohort) policy would require also changing `_baseline()` fixtures in
+    `tests/ci/test_ci_performance_gate_paired_critical_path.py` (and
+    other satellite files), which are OUTSIDE Issue #2179's Allowed
+    Paths -- an explicit Stop Condition ("performance gate related
+    files ... requiring a change is discovered"). This asymmetry is a
+    KNOWN, documented limitation of this fix_delta; a follow-up Issue
+    widening the Allowed Paths to the satellite files would be needed to
+    fully unify it. The #2182 P1 identity-collision fix
+    (`_detect_run_attempt_identity_collisions` above) IS fully applied
+    here, since it does not change any existing fixture's selected
+    result (collisions only trigger on genuine, previously-`min()`-
+    silenced content disagreement)."""
+    by_id: dict[object, list[dict]] = {}
+    for baseline in baselines:
+        workflow_run_id = baseline.get("workflow_run_id")
+        if workflow_run_id is None:
+            continue
+        by_id.setdefault(workflow_run_id, []).append(baseline)
+
+    collisions = _detect_run_attempt_identity_collisions(baselines)
+
+    selected: dict[object, dict] = {}
+    for workflow_run_id, group in by_id.items():
+        if workflow_run_id in collisions:
+            continue
+        candidates = [b for b in group if _normalize_run_attempt(b) == 1]
+        if not candidates:
+            continue
+        selected[workflow_run_id] = min(candidates, key=lambda b: json.dumps(b, sort_keys=True, default=str))
+    return selected
+
+
+def _dedupe_by_workflow_run_id(baselines: list[dict]) -> list[dict]:
+    """#2179 P0-2/P1-1: sample identity is `workflow_run_id`, and
+    selection follows the explicit `initial_attempt_only_v1` policy (see
+    `_select_initial_attempt_baselines`) -- rerun attempts of the same
+    run never add an independent sample, and attempt 1 failing/missing
+    means the whole `workflow_run_id` is excluded (never substituted with
+    a later attempt). Returns baselines sorted by `workflow_run_id`
+    (canonical order, #2179 AC7) -- order-independent regardless of input
+    order."""
+    selected = _select_initial_attempt_baselines(baselines)
+    return [selected[workflow_run_id] for workflow_run_id in sorted(selected, key=str)]
 
 
 def _comparable_cohort(baselines: list[dict], job_names: tuple[str, ...]) -> dict[str, list[dict]]:
@@ -431,11 +581,17 @@ def _pair_by_workflow_run_id(
     the same `workflow_run_id`. Returns `(pairs, evidence_errors)`; a run
     present in only one lane is NOT silently dropped from cohort
     accounting -- it is reported as an explicit evidence error (#2159
-    AC3)."""
-    core_by_id = {b["workflow_run_id"]: b for b in core_baselines if b.get("workflow_run_id") is not None}
-    responsive_by_id = {
-        b["workflow_run_id"]: b for b in responsive_baselines if b.get("workflow_run_id") is not None
-    }
+    AC3).
+
+    #2179 AC2 (fix_delta after OWNER adversarial review issuecomment-5295659213
+    P1-1): each side's per-`workflow_run_id` candidate is selected via the
+    `initial_attempt_only_v1` policy (`_select_initial_attempt_baselines`),
+    NOT a `{b["workflow_run_id"]: b for b in ...}` dict comprehension --
+    that shape is an implicit "last baseline in the input list wins" for a
+    duplicate key, an insertion-order artifact this policy explicitly
+    forbids."""
+    core_by_id = _select_initial_attempt_baselines(core_baselines)
+    responsive_by_id = _select_initial_attempt_baselines(responsive_baselines)
     all_ids = sorted(set(core_by_id) | set(responsive_by_id), key=str)
 
     pairs: list[tuple[object, dict, dict]] = []
