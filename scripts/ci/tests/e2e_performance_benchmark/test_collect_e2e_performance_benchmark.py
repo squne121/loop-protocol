@@ -46,7 +46,16 @@ def _record(
     conclusion: str = "success",
     workflow_digest: str = "workflow-digest-fixture-v1",
     workflow_sha: str = WORKFLOW_SHA,
+    run_attempt: int = 1,
 ) -> dict:
+    # #2182 fix_delta (OWNER adversarial review issuecomment-5302446086,
+    # P0-3): every fixture in this baseline test file now carries an
+    # EXPLICIT `run_attempt` (default 1) -- a record with a MISSING
+    # `run_attempt` key is excluded from the trusted/selected cohort
+    # entirely under the corrected policy (see
+    # test_collect_e2e_performance_benchmark_rerun_attempt.py's
+    # `test_missing_run_attempt_excluded_from_trusted_cohort_and_reported`
+    # for the dedicated regression coverage of that exclusion itself).
     return {
         "workflow_run_id": workflow_run_id,
         "job": job,
@@ -56,6 +65,7 @@ def _record(
         "conclusion": conclusion,
         "workflow_digest": workflow_digest,
         "workflow_sha": workflow_sha,
+        "run_attempt": run_attempt,
     }
 
 
@@ -102,7 +112,11 @@ def test_sample_identity_workflow_run_id():
     attempts never add an independent sample (AC2/P1-1)."""
     records = [
         _record(500, job="e2e-core", head_sha=BEFORE_SHA),
-        _record(500, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=999),  # rerun of the same run
+        # #2182 fix_delta P1: an explicit run_attempt=2 rerun -- distinct
+        # from the run_attempt=1 original above, so this is a genuine
+        # non-attempt-1 exclusion, not an ambiguous same-identity-
+        # different-content collision (which would exclude BOTH).
+        _record(500, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=999, run_attempt=2),
         _record(501, job="e2e-core", head_sha=BEFORE_SHA),
     ]
     deduped = collector._dedupe_by_workflow_run_id(records)
@@ -116,8 +130,13 @@ def test_sample_identity_20_run_cohort_deduped_correctly():
     THEN the arm is complete (run_count == 20, not 25)."""
     before_records = _full_job_set_records(20, BEFORE_SHA, start_id=1)
     # 5 rerun duplicates of the first 5 workflow_run_ids for e2e-core only.
+    # #2182 fix_delta P1: explicit run_attempt=2 -- a genuine rerun
+    # attempt, distinct from the run_attempt=1 original (never an
+    # ambiguous same-identity-different-content collision).
     for run_id in range(1, 6):
-        before_records.append(_record(run_id, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=90000 + run_id))
+        before_records.append(
+            _record(run_id, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=90000 + run_id, run_attempt=2)
+        )
     after_records = _full_job_set_records(20, AFTER_SHA, start_id=101)
 
     manifest = collector.collect_benchmark_manifest(
@@ -560,26 +579,35 @@ def _live_api_artifact(
     digest: str,
     workflow_run_id: int,
     head_sha: str,
+    name: str | None = None,
 ) -> dict:
-    return {
+    artifact = {
         "id": artifact_id,
         "digest": digest,
         "workflow_run": {"id": workflow_run_id, "head_sha": head_sha},
     }
+    if name is not None:
+        artifact["name"] = name
+    return artifact
 
 
 def test_live_api_verification_accepts_genuinely_matching_record():
     """GIVEN a record whose claimed artifact_id/artifact_digest/head_sha
-    all match a (fake, injected) live GitHub Actions API response WHEN
+    all match a (fake, injected) live GitHub Actions API response, AND
+    whose (default, #2182 fix_delta) run_attempt=1 is bound to a genuine
+    attempt-specific job (matching name/head_sha/conclusion), WHEN
     `verify_run_record_against_live_api` runs THEN there are no
     violations."""
     record = _record(500, job="e2e-core", head_sha=BEFORE_SHA, artifact_id=777, artifact_digest="sha256:" + "e" * 64)
 
     def fake_api_call(endpoint: str) -> dict:
-        assert endpoint == "repos/owner/repo/actions/runs/500/artifacts"
-        return _fake_artifacts_response(
-            [_live_api_artifact(777, "sha256:" + "e" * 64, 500, BEFORE_SHA)]
-        )
+        if endpoint == "repos/owner/repo/actions/runs/500/artifacts?per_page=100&page=1":
+            return _fake_artifacts_response(
+                [_live_api_artifact(777, "sha256:" + "e" * 64, 500, BEFORE_SHA, name="ci-runtime-baseline-e2e-core-1")]
+            )
+        if endpoint == "repos/owner/repo/actions/runs/500/attempts/1/jobs":
+            return {"jobs": [{"run_attempt": 1, "name": "e2e-core", "head_sha": BEFORE_SHA, "conclusion": "success"}]}
+        raise AssertionError(f"unexpected endpoint: {endpoint}")
 
     violations = collector.verify_run_record_against_live_api(
         record, BEFORE_SHA, "owner/repo", api_call=fake_api_call
@@ -658,10 +686,15 @@ def test_live_api_verification_batch_reports_only_failing_records():
     ]
 
     def fake_api_call(endpoint: str) -> dict:
-        run_id = int(endpoint.rsplit("/", 2)[1])
-        if run_id == 2001:
-            return _fake_artifacts_response([_live_api_artifact(1, "sha256:" + "0" * 64, 2001, BEFORE_SHA)])
-        return _fake_artifacts_response([])  # 2002's artifact is fabricated
+        if endpoint == "repos/owner/repo/actions/runs/2001/artifacts?per_page=100&page=1":
+            return _fake_artifacts_response(
+                [_live_api_artifact(1, "sha256:" + "0" * 64, 2001, BEFORE_SHA, name="ci-runtime-baseline-e2e-core-1")]
+            )
+        if endpoint == "repos/owner/repo/actions/runs/2001/attempts/1/jobs":
+            return {"jobs": [{"run_attempt": 1, "name": "e2e-core", "head_sha": BEFORE_SHA, "conclusion": "success"}]}
+        if endpoint == "repos/owner/repo/actions/runs/2002/artifacts?per_page=100&page=1":
+            return _fake_artifacts_response([])  # 2002's artifact is fabricated
+        raise AssertionError(f"unexpected endpoint: {endpoint}")
 
     failures = collector.verify_records_against_live_api(records, BEFORE_SHA, "owner/repo", api_call=fake_api_call)
     assert len(failures) == 1

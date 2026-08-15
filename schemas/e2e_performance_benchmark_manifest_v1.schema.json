@@ -185,6 +185,15 @@
           "type": "string",
           "pattern": "^[0-9a-f]{40}$",
           "description": "#2159 OWNER scope-authority ruling (issuecomment-5299412215, item 1/P0-2): the commit SHA of the WORKFLOW DEFINITION that produced this run (`GITHUB_WORKFLOW_SHA`, i.e. the ref the run was dispatched against), distinct from both `head_sha` (the measured application code's commit, checked out via an explicit `actions/checkout` `ref:` override) and `workflow_digest` (a content hash of the workflow file). For a fixed-SHA benchmark dispatch these two SHAs are EXPECTED to differ: `workflow_sha` stays on the current/default branch tip so the workflow's OWN instrumentation logic is current, while `head_sha` pins the OLD/NEW application code being measured."
+        },
+        "run_attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "#2179 AC4: the GitHub Actions rerun-attempt number (`GITHUB_RUN_ATTEMPT`) SELECTED for this sample under `rerun_attempt_selection_policy` -- always 1 under the current `initial_attempt_only_v1` policy (a `workflow_run_id` whose attempt 1 failed/is missing is excluded from the cohort entirely, never substituted with a later attempt). Backward-compatible OPTIONAL field: manifests produced before #2179 omit it."
+        },
+        "rerun_attempt_selection_policy": {
+          "enum": ["initial_attempt_only_v1"],
+          "description": "#2179 AC3/AC4 (narrowed by #2182 fix_delta hygiene item, OWNER adversarial review issuecomment-5302446086): identifies the deterministic, order-independent policy used to select `run_attempt` for this sample. Restricted to the single currently-recognized policy name -- an unrecognized policy string is never silently accepted as if it were a known policy. Backward-compatible OPTIONAL field: manifests produced before #2179 omit it."
         }
       }
     },
