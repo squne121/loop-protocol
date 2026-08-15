@@ -23,12 +23,15 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
+REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 sda = importlib.import_module("scope_signal_delta")
@@ -633,6 +636,320 @@ def test_investigation_evidence_transport_tampered_digest_fails_closed_ac4(tmp_p
         _cleanup_investigation_evidence_transport_manifest(invocation_id)
     route = provenance["runtime_evidence"]["route"]
     assert route["action"] == "human_escalation", provenance
+
+
+# ---------------------------------------------------------------------------
+# #2136 AC3/AC4: the fixture + human-context sibling must travel through the
+# real executor, registry, preflight and planner.  The isolated repository is
+# a local clone populated with real current assets, never a stubbed registry,
+# executor, preflight or planner.
+# ---------------------------------------------------------------------------
+
+_AC3_COMMAND_ID = "preflight.run.fixture.with_human_context"
+
+
+def _ac3_real_asset_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "real-assets"
+    subprocess.run(
+        ["git", "clone", "--local", "--no-hardlinks", str(REPO_ROOT), str(repo)],
+        check=True, capture_output=True, text=True,
+    )
+    for rel in ("scripts/agent-guards", "scripts/agent-ops", ".claude/skills/issue-refinement-loop"):
+        shutil.copytree(REPO_ROOT / rel, repo / rel, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
+    subprocess.run(["git", "checkout", "-B", "main"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "https://github.com/squne121/loop-protocol.git"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    subprocess.run(["git", "add", "--all"], cwd=repo, check=True, capture_output=True, text=True)
+    pending = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    if pending.stdout:
+        subprocess.run(
+            ["git", "-c", "user.name=ac3", "-c", "user.email=ac3@example.invalid", "commit", "-m", "AC3 real assets"],
+            cwd=repo, check=True, capture_output=True, text=True,
+        )
+    return repo
+
+
+def _ac3_fixture(anchor_url: str) -> dict:
+    return {
+        "schema_version": "refinement_preflight_input/v1",
+        "issue_number": ISSUE,
+        "repo": REPO,
+        "now": "2026-08-12T00:00:00+00:00",
+        "issue": {"number": ISSUE, "title": "AC3 fixture", "body": _E2E_2086_ISSUE_BODY, "labels": []},
+        "comments": [],
+        "anchor_comment_urls": [anchor_url],
+        "anchor_comments": [{
+            "id": 5249734344,
+            "body": _VAGUE_ALLOWED_PATHS_BODY,
+            "issue_url": f"https://api.github.com/repos/{REPO}/issues/{ISSUE}",
+            "author_association": "OWNER", "user": {"login": "owner", "type": "User"},
+            "created_at": "2026-08-12T00:00:00Z", "updated_at": "2026-08-12T00:00:00Z",
+            "html_url": anchor_url,
+            "url": f"https://api.github.com/repos/{REPO}/issues/comments/5249734344",
+        }],
+    }
+
+
+def test_fixture_human_context_real_subprocess_reaches_contract_update_required_ac3(tmp_path: Path):
+    """AC3/AC4: real local assets reach the unique positive route without gh.
+
+    A temporary HOME contains a canary in the executor-effective PATH first
+    entry.  The fixture itself contains no ``known_context`` injection; the
+    real child must derive human authority from its CLI URL.  Production
+    executable trust remains untouched; any accidental gh invocation writes
+    the sentinel and makes this test fail.
+    """
+    repo = _ac3_real_asset_repo(tmp_path)
+    artifact_rel = f".claude/artifacts/issue-refinement-loop/{ISSUE}"
+    fixture_rel = f"{artifact_rel}/fixtures/ac3.json"
+    evidence_rel = f"{artifact_rel}/evidence.json"
+    anchor_url = URL
+    (repo / artifact_rel / "fixtures").mkdir(parents=True)
+    (repo / fixture_rel).write_text(json.dumps(_ac3_fixture(anchor_url)), encoding="utf-8")
+    (repo / evidence_rel).write_text(json.dumps([{
+        "comment_id": 5249734344, "comment_url": anchor_url,
+        "body_sha256": preflight._sha256(_E2E_2086_ISSUE_BODY),
+        "source_kind": "generated_by_agent",
+        "path_literals": ["docs/dev/workflow.md", ".claude/skills/impl-review-loop/SKILL.md"],
+    }]), encoding="utf-8")
+    assert "known_context" not in _ac3_fixture(anchor_url)
+    home = tmp_path / "empty-home"
+    canary = home / ".local" / "bin" / "gh"
+    sentinel = tmp_path / "gh-invoked"
+    canary.parent.mkdir(parents=True)
+    uv_bin = shutil.which("uv")
+    assert uv_bin is not None
+    shutil.copy2(uv_bin, canary.parent / "uv")
+    canary.write_text(f"#!/bin/sh\nprintf invoked > '{sentinel}'\nexit 97\n", encoding="utf-8")
+    canary.chmod(0o755)
+    github_env = {
+        "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+        "GH_HOST", "GH_REPO",
+    }
+    env = {key: value for key, value in os.environ.items() if key not in github_env}
+    env.update({
+        "CLAUDE_PROJECT_DIR": str(repo), "HOME": str(home),
+        "GH_CONFIG_DIR": str(home / "empty-gh-config"), "GH_PROMPT_DISABLED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(tmp_path),
+    })
+    (home / "empty-gh-config").mkdir(parents=True)
+    env_probe = subprocess.run(
+        [
+                sys.executable,
+                "-c",
+                "import json,sys;sys.path.insert(0,'scripts/agent-guards');"
+                "import skill_runtime_exec as e;"
+                "print(json.dumps(e._sanitize_env('.', 'preflight.run.fixture.with_human_context')))"
+        ],
+        cwd=repo, env=env, check=True, capture_output=True, text=True, timeout=30,
+    )
+    effective_env = json.loads(env_probe.stdout)
+    assert effective_env["PATH"].split(os.pathsep)[0] == str(canary.parent)
+    assert shutil.which("gh", path=effective_env["PATH"]) == str(canary)
+    assert effective_env["GH_CONFIG_DIR"] == str(home / "empty-gh-config")
+    subprocess.run(
+        [str(canary.parent / "uv"), "run", "python3", "--version"],
+        cwd=repo, env=env, check=True, capture_output=True, text=True, timeout=120,
+    )
+    produced, error = preflight.generate_authority_transport_manifest(
+        evidence=json.loads((repo / evidence_rel).read_text(encoding="utf-8")),
+        issue_number=ISSUE,
+        repo=REPO,
+        invocation_id="ac3-real",
+        git_head_sha=subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+        ).stdout.strip(),
+        repo_root=repo,
+    )
+    assert produced is not None, error
+    transport_rel = str(Path(produced["manifest_path"]).relative_to(repo))
+    result = subprocess.run([
+        sys.executable, "scripts/agent-guards/skill_runtime_exec.py",
+        "--command-id", _AC3_COMMAND_ID, "--issue-number", str(ISSUE), "--repo", REPO,
+        "--fixture", fixture_rel, "--anchor-comment-url", anchor_url,
+        "--investigation-evidence-transport-path", transport_rel,
+    ], cwd=repo, env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "exact command class rejected" not in result.stderr, result.stderr
+    provenance = json.loads((
+        repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE)
+        / "refinement_preflight_provenance_v1.json"
+    ).read_text(encoding="utf-8"))
+    route = provenance["runtime_evidence"]["route"]
+    assert route["action"] == "contract_update_required", provenance
+    assert route["implementation_allowed"] is False, provenance
+    planner_input = json.loads((
+        repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE) / "planner_input.json"
+    ).read_text(encoding="utf-8"))
+    assert planner_input["known_context"]["human_context_comment_urls"] == [anchor_url]
+    assert not sentinel.exists(), "fixture success must not hide a gh invocation"
+
+
+def test_fixture_human_context_sibling_rejects_cross_lane_and_binding_inputs_before_child(tmp_path: Path):
+    """AC5: sibling admission never broadens production or unlabelled lanes."""
+    repo = _ac3_real_asset_repo(tmp_path)
+    anchor_url = URL
+    artifact_rel = f".claude/artifacts/issue-refinement-loop/{ISSUE}"
+    fixture_rel = f"{artifact_rel}/fixtures/ac3.json"
+    transport_rel = f"{artifact_rel}/transport.json"
+    (repo / artifact_rel / "fixtures").mkdir(parents=True)
+    (repo / fixture_rel).write_text("{}", encoding="utf-8")
+    (repo / transport_rel).write_text("{}", encoding="utf-8")
+    home = tmp_path / "empty-home"
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    uv_bin = shutil.which("uv")
+    assert uv_bin is not None
+    shutil.copy2(uv_bin, bin_dir / "uv")
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("GH_", "GITHUB_"))}
+    env.update({
+        "CLAUDE_PROJECT_DIR": str(repo), "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(tmp_path),
+        "HOME": str(home), "GH_CONFIG_DIR": str(home / "empty-gh-config"), "GH_PROMPT_DISABLED": "1",
+    })
+    (home / "empty-gh-config").mkdir(parents=True)
+    subprocess.run([str(bin_dir / "uv"), "run", "python3", "--version"], cwd=repo, env=env,
+                   check=True, capture_output=True, text=True, timeout=120)
+    base = [
+        sys.executable, "scripts/agent-guards/skill_runtime_exec.py",
+        "--command-id", _AC3_COMMAND_ID, "--issue-number", str(ISSUE), "--repo", REPO,
+        "--fixture", fixture_rel, "--anchor-comment-url", anchor_url,
+        "--investigation-evidence-transport-path", transport_rel,
+    ]
+    rejected = (
+        [*base[:7], "other/repo", *base[8:]],
+        [*base[:5], "2085", *base[6:]],
+        [token for token in base if token != "--anchor-comment-url" and token != anchor_url],
+        [*base, "--fixture", fixture_rel],
+        [
+            *base[:8], "--fixture", fixture_rel, "--repo", REPO,
+            *base[10:],
+        ],
+        [
+            "--fixture=" + fixture_rel if token == "--fixture" else token
+            for token in base
+        ],
+        [
+            "--command-id=" + _AC3_COMMAND_ID if token == "--command-id" else token
+            for token in base
+        ],
+        [token for token in base if token != transport_rel],
+        [
+            sys.executable, "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id", "preflight.run.with_human_context", "--issue-number", str(ISSUE),
+            "--repo", REPO, "--fixture", fixture_rel, "--anchor-comment-url", anchor_url,
+        ],
+        [
+            sys.executable, "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id", "preflight.run.with_agent_report", "--issue-number", str(ISSUE),
+            "--repo", REPO, "--anchor-comment-url", anchor_url,
+            "--investigation-evidence-transport-path", transport_rel,
+        ],
+    )
+    for argv in rejected:
+        result = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=True, timeout=30, check=False)
+        assert result.returncode == 2, (argv, result.stdout, result.stderr)
+    assert not (
+        repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE)
+        / "refinement_preflight_result_v1.json"
+    ).exists()
+
+
+def test_fixture_human_context_sibling_admits_real_subprocess_without_optional_transport(tmp_path: Path):
+    """Issue #2136 adversarial hardening H2: the optional
+    `--investigation-evidence-transport-path` pair being entirely ABSENT
+    must be admitted by the REAL `skill_runtime_exec.py` subprocess (not
+    just the parser unit tests in `test_skill_runtime_policy_anchor.py`,
+    which only prove `parse_exact_skill_runtime_anchor_fixture_command`
+    itself -- not that `skill_runtime_exec.py`'s own admission/dispatch/
+    render code path agrees). A parser passing is not proof the executor's
+    absent-case doesn't wrongly reject before ever reaching a child."""
+    repo = _ac3_real_asset_repo(tmp_path)
+    anchor_url = URL
+    artifact_rel = f".claude/artifacts/issue-refinement-loop/{ISSUE}"
+    fixture_rel = f"{artifact_rel}/fixtures/ac3.json"
+    (repo / artifact_rel / "fixtures").mkdir(parents=True)
+    (repo / fixture_rel).write_text(json.dumps(_ac3_fixture(anchor_url)), encoding="utf-8")
+    home = tmp_path / "empty-home"
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    uv_bin = shutil.which("uv")
+    assert uv_bin is not None
+    shutil.copy2(uv_bin, bin_dir / "uv")
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("GH_", "GITHUB_"))}
+    env.update({
+        "CLAUDE_PROJECT_DIR": str(repo), "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(tmp_path),
+        "HOME": str(home), "GH_CONFIG_DIR": str(home / "empty-gh-config"), "GH_PROMPT_DISABLED": "1",
+    })
+    (home / "empty-gh-config").mkdir(parents=True)
+    subprocess.run([str(bin_dir / "uv"), "run", "python3", "--version"], cwd=repo, env=env,
+                   check=True, capture_output=True, text=True, timeout=120)
+    result = subprocess.run([
+        sys.executable, "scripts/agent-guards/skill_runtime_exec.py",
+        "--command-id", _AC3_COMMAND_ID, "--issue-number", str(ISSUE), "--repo", REPO,
+        "--fixture", fixture_rel, "--anchor-comment-url", anchor_url,
+    ], cwd=repo, env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert "exact command class rejected" not in result.stderr, (result.returncode, result.stdout, result.stderr)
+
+
+def test_fixture_human_context_sibling_fails_closed_on_transport_anchor_mismatch(tmp_path: Path):
+    """AC5: a valid-shape transport for another anchor cannot clear scope."""
+    repo = _ac3_real_asset_repo(tmp_path)
+    artifact_rel = f".claude/artifacts/issue-refinement-loop/{ISSUE}"
+    fixture_rel = f"{artifact_rel}/fixtures/ac3.json"
+    anchor_url = URL
+    wrong_anchor = f"https://github.com/{REPO}/issues/{ISSUE}#issuecomment-9999999999"
+    (repo / artifact_rel / "fixtures").mkdir(parents=True)
+    (repo / fixture_rel).write_text(json.dumps(_ac3_fixture(anchor_url)), encoding="utf-8")
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    produced, error = preflight.generate_authority_transport_manifest(
+        evidence=[{
+            "comment_id": 9999999999, "comment_url": wrong_anchor,
+            "body_sha256": preflight._sha256(_E2E_2086_ISSUE_BODY),
+            "source_kind": "generated_by_agent",
+            "path_literals": ["docs/dev/workflow.md"],
+        }],
+        issue_number=ISSUE, repo=REPO, invocation_id="ac3-wrong-anchor",
+        git_head_sha=head_sha, repo_root=repo,
+    )
+    assert produced is not None, error
+    transport_rel = str(Path(produced["manifest_path"]).relative_to(repo))
+    home = tmp_path / "empty-home"
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    uv_bin = shutil.which("uv")
+    assert uv_bin is not None
+    shutil.copy2(uv_bin, bin_dir / "uv")
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("GH_", "GITHUB_"))}
+    env.update({
+        "CLAUDE_PROJECT_DIR": str(repo), "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(tmp_path),
+        "HOME": str(home), "GH_CONFIG_DIR": str(home / "empty-gh-config"), "GH_PROMPT_DISABLED": "1",
+    })
+    (home / "empty-gh-config").mkdir(parents=True)
+    subprocess.run([str(bin_dir / "uv"), "run", "python3", "--version"], cwd=repo, env=env,
+                   check=True, capture_output=True, text=True, timeout=120)
+    result = subprocess.run([
+        sys.executable, "scripts/agent-guards/skill_runtime_exec.py",
+        "--command-id", _AC3_COMMAND_ID, "--issue-number", str(ISSUE), "--repo", REPO,
+        "--fixture", fixture_rel, "--anchor-comment-url", anchor_url,
+        "--investigation-evidence-transport-path", transport_rel,
+    ], cwd=repo, env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    provenance = json.loads((
+        repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE)
+        / "refinement_preflight_provenance_v1.json"
+    ).read_text(encoding="utf-8"))
+    assert provenance["runtime_evidence"]["route"]["action"] != "contract_update_required"
 
 
 def test_untrusted_author_association_never_gets_operator_relaxation_ac5():

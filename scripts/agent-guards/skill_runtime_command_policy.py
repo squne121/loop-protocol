@@ -36,6 +36,7 @@ _PLACEHOLDER_RE = re.compile(r"^\{[A-Za-z0-9_]+\}$")
 _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE = "exact_skill_runtime_fixture"
+SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR_FIXTURE = "exact_skill_runtime_anchor_fixture"
 
 # Issue #1498: sibling exact profile for anchor-comment-scoped preflight runs.
 # `preflight.run` itself (argv / placeholders / execution_class / timeout) is
@@ -105,6 +106,15 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
         # default branch / canonical root safety boundary applies.
         "preflight.run.fixture": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "local_only",
+        },
+        "preflight.run.fixture.with_human_context": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR_FIXTURE,
             "required_cwd": "canonical_main_root",
             "required_branch": "default_branch",
             "allowed_write_roots": [
@@ -221,6 +231,7 @@ ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset(
     {
         "preflight.run",
         "preflight.run.fixture",
+        "preflight.run.fixture.with_human_context",
         "preflight.run.with_anchor",
         "preflight.run.with_human_context",
         "preflight.run.with_agent_report",
@@ -241,6 +252,15 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
     },
     "preflight.run.fixture": {
         "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_FIXTURE,
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "local_only",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        ],
+    },
+    "preflight.run.fixture.with_human_context": {
+        "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_ANCHOR_FIXTURE,
         "required_cwd": "canonical_main_root",
         "required_branch": "default_branch",
         "network_effect": "local_only",
@@ -525,20 +545,40 @@ def is_exact_skill_runtime_executor_command(
     return True
 
 
+# Issue #2136 adversarial hardening (H3): every value that flows through this
+# module's `_is_safe_repo_relative_fixture_path` gate is later re-validated
+# by an exact parser that re-tokenizes a *re-serialized* `" ".join(argv)`
+# string with `shlex.split()` (see `skill_runtime_exec.py`'s
+# `command_text = " ".join(command_tokens)` construction). That join/re-split
+# round trip is lossy for any value containing shell-lexer-significant
+# characters (whitespace, quotes, backslash): the value actually forwarded to
+# the real child subprocess (built from the untouched, un-split Python
+# string) can diverge from the shorter/differently-tokenized value the exact
+# parser actually validated at its fixed argv position. Rejecting these
+# characters here closes that validation/execution divergence for every
+# `repo_relative_file`-typed placeholder uniformly (production and
+# test-only), without changing any command's argv shape, flags, or accepted
+# command_ids.
+_SHLEX_ROUND_TRIP_UNSAFE_CHARS = frozenset({" ", "\t", "\"", "'", "\\"})
+
+
 def _is_safe_repo_relative_fixture_path(fixture: str, root: str) -> bool:
     """True iff `fixture` is a safe repo-relative path for `--fixture`.
 
     Rejects absolute paths, `..` traversal, NUL/newline injection, a leading
-    `-` (flag-injection), and any realpath resolution that escapes `root`
-    (including via symlink components). Issue #1439 Scope Delta 2 Out of
-    Scope: `--fixture` must never accept an absolute path, path traversal,
-    or a symlink-mediated repo-external reference.
+    `-` (flag-injection), whitespace/quote/backslash (shlex round-trip
+    divergence, Issue #2136 H3), and any realpath resolution that escapes
+    `root` (including via symlink components). Issue #1439 Scope Delta 2 Out
+    of Scope: `--fixture` must never accept an absolute path, path
+    traversal, or a symlink-mediated repo-external reference.
     """
     if not fixture or fixture.startswith("-"):
         return False
     if os.path.isabs(fixture):
         return False
     if "\x00" in fixture or "\n" in fixture or "\r" in fixture:
+        return False
+    if any(ch in fixture for ch in _SHLEX_ROUND_TRIP_UNSAFE_CHARS):
         return False
     parts = fixture.replace("\\", "/").split("/")
     if ".." in parts or "" in parts[1:]:
@@ -549,6 +589,60 @@ def _is_safe_repo_relative_fixture_path(fixture: str, root: str) -> bool:
     except ValueError:
         return False
     return common == root
+
+
+def _path_contains_symlink_component(root: str, rel_path: str) -> bool:
+    """True iff any path component between `root` and `rel_path` (inclusive
+    of the leaf) is itself a symlink.
+
+    Confinement checks built solely from `os.path.realpath()` +
+    `os.path.commonpath()` are bypassable when a directory *inside* (or
+    exactly at) the confinement prefix is a symlink to a location outside
+    the intended target: both sides of the comparison resolve through the
+    same symlink and still agree with each other (Issue #2136 adversarial
+    hardening H1). Walking every literal (non-resolved) path component and
+    rejecting on the first symlink closes that class of bypass regardless of
+    where the symlink ultimately points -- fixture path, transport path,
+    intermediate directory, leaf file, or the artifact-root prefix directory
+    itself (including a sibling-issue-root alias).
+    """
+    current = root
+    for part in rel_path.replace("\\", "/").split("/"):
+        if not part:
+            continue
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            return True
+    return False
+
+
+def _is_safe_issue_artifact_path(path: str, root: str, issue_number: str) -> bool:
+    """Require #2136 sibling inputs to stay under their bound artifact root.
+
+    This intentionally supplements, rather than changes, the generic fixture
+    profile's repository-relative confinement.  Both the target issue number
+    and every symlink-resolved component are bound before a child can start.
+    """
+    if not _is_safe_repo_relative_fixture_path(path, root):
+        return False
+    prefix = f".claude/artifacts/issue-refinement-loop/{issue_number}/"
+    if not path.replace("\\", "/").startswith(prefix):
+        return False
+    # Issue #2136 H1: reject before resolving `artifact_root`/`resolved` via
+    # `realpath` -- a symlinked artifact-root prefix (or any intermediate
+    # component) would otherwise make both sides of the commonpath
+    # comparison below agree with each other while silently pointing at a
+    # different issue's artifact tree.
+    if _path_contains_symlink_component(root, prefix) or _path_contains_symlink_component(root, path):
+        return False
+    artifact_root = os.path.realpath(os.path.join(root, prefix))
+    try:
+        if os.path.commonpath([root, artifact_root]) != root:
+            return False
+        resolved = os.path.realpath(os.path.join(root, path))
+        return os.path.commonpath([artifact_root, resolved]) == artifact_root
+    except ValueError:
+        return False
 
 
 def parse_exact_skill_runtime_fixture_command(
@@ -642,6 +736,81 @@ def is_exact_skill_runtime_fixture_executor_command(
     if active_issue != parsed.issue_number or entry is None:
         return False
     return True
+
+
+def parse_exact_skill_runtime_anchor_fixture_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact parser for #2136's test-only fixture + human-context sibling.
+
+    This is intentionally separate from both the fixture and anchor parsers:
+    production profiles cannot acquire either field by this test-only route.
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    required_flags = ["--command-id", "--issue-number", "--repo", "--fixture", "--anchor-comment-url"]
+    required_positions = [4, 6, 8, 10, 12]
+    if len(tokens) not in {14, 16} or tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if any(tokens[pos] != flag for flag, pos in zip(required_flags, required_positions)):
+        return None
+    if len(tokens) == 16 and tokens[14] != "--investigation-evidence-transport-path":
+        return None
+    all_flags = [*required_flags, "--investigation-evidence-transport-path"]
+    if any(token.startswith(f"{flag}=") for token in tokens for flag in all_flags):
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    if os.path.realpath(os.path.join(root, tokens[3])) != os.path.realpath(
+        os.path.join(root, SKILL_RUNTIME_EXEC_REL)
+    ):
+        return None
+    command_id, issue_number, repo = tokens[5], tokens[7], tokens[9]
+    fixture, anchor_comment_url = tokens[11], tokens[13]
+    transport_path = tokens[15] if len(tokens) == 16 else None
+    if command_id != "preflight.run.fixture.with_human_context":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0 or repo != TRUSTED_REPO_SLUG:
+        return None
+    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+        return None
+    if not _is_safe_issue_artifact_path(fixture, root, issue_number):
+        return None
+    if transport_path is not None and not _is_safe_issue_artifact_path(transport_path, root, issue_number):
+        return None
+    match = _GH_ISSUE_COMMENT_URL_RE.fullmatch(anchor_comment_url)
+    if match is None or f"{match.group('owner')}/{match.group('repo')}" != repo:
+        return None
+    if match.group("issue") != issue_number:
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        fixture=fixture,
+        anchor_comment_url=anchor_comment_url,
+    )
+
+
+def is_exact_skill_runtime_anchor_fixture_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    parsed = parse_exact_skill_runtime_anchor_fixture_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    if current_branch(project_root, deadline) != resolve_default_branch(project_root, deadline):
+        return False
+    if resolve_repo_slug(project_root, deadline) != parsed.repo:
+        return False
+    return command_allows_root_no_worktree(parsed)
 
 
 def parse_exact_skill_runtime_decide_command(
@@ -1515,6 +1684,16 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "--fixture",
         "{fixture}",
     ],
+    "preflight.run.fixture.with_human_context": [
+        "uv", "run", "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number", "{issue_number}",
+        "--repo", "{repo}",
+        "--fixture", "{fixture}",
+        "--anchor-comment-url", "{anchor_comment_url}",
+        "--human-context-comment-url", "{anchor_comment_url}",
+        "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
+    ],
     "preflight.run.with_anchor": [
         "uv",
         "run",
@@ -1665,6 +1844,15 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "issue_number": {"type": "positive_int", "required": True},
         "repo": {"type": "owner_repo", "required": True},
         "fixture": {"type": "repo_relative_file", "required": True},
+    },
+    "preflight.run.fixture.with_human_context": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "fixture": {"type": "repo_relative_file", "required": True},
+        "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+        "investigation_evidence_transport_path": {
+            "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
+        },
     },
     "preflight.run.with_anchor": {
         "issue_number": {"type": "positive_int", "required": True},
