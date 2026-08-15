@@ -30,6 +30,13 @@ BEFORE_SHA = "a" * 40
 AFTER_SHA = "b" * 40
 
 
+# #2159 OWNER scope-authority ruling (issuecomment-5299412215, item
+# 1/P0-2): fixture workflow SHA distinct from BEFORE_SHA/AFTER_SHA (the
+# measured application code commits) -- proves `workflow_sha` is recorded
+# as an INDEPENDENT field, never conflated with `head_sha`.
+WORKFLOW_SHA = "c" * 40
+
+
 def _record(
     workflow_run_id: int,
     job: str = "e2e-core",
@@ -38,6 +45,7 @@ def _record(
     artifact_digest: str | None = None,
     conclusion: str = "success",
     workflow_digest: str = "workflow-digest-fixture-v1",
+    workflow_sha: str = WORKFLOW_SHA,
 ) -> dict:
     return {
         "workflow_run_id": workflow_run_id,
@@ -47,6 +55,7 @@ def _record(
         "artifact_digest": artifact_digest or ("sha256:" + f"{workflow_run_id:064x}"),
         "conclusion": conclusion,
         "workflow_digest": workflow_digest,
+        "workflow_sha": workflow_sha,
     }
 
 
@@ -441,6 +450,42 @@ def test_semantic_validator_detects_job_topology_mismatch():
     manifest["arms"]["before"]["jobs"]["e2e-core"] = dict(manifest["arms"]["after"]["jobs"]["e2e-core"])
     violations = collector.validate_manifest_semantics(manifest)
     assert any("job_topology_mismatch: before" in v for v in violations)
+
+
+def test_manifest_requires_workflow_sha_per_run_record():
+    """#2159 OWNER scope-authority ruling (issuecomment-5299412215, item
+    1/P0-2): a run record missing `workflow_sha` (the WORKFLOW DEFINITION's
+    own commit, distinct from `head_sha`) fails `_verify_run_record` with
+    `missing_or_invalid_workflow_sha` -- the collector never silently
+    accepts a record that conflates workflow_sha with head_sha or omits it
+    entirely."""
+    record = _record(1)
+    del record["workflow_sha"]
+    violations = collector._verify_run_record(record, BEFORE_SHA)
+    assert "missing_or_invalid_workflow_sha" in violations
+
+
+def test_manifest_records_workflow_sha_distinct_from_head_sha():
+    """GIVEN a run record whose `workflow_sha` differs from `head_sha`
+    (the expected shape for a fixed-SHA benchmark dispatch, where the
+    workflow definition stays on the current branch tip while the
+    application code is pinned to an old/new target_sha) WHEN the manifest
+    is collected THEN both fields are preserved, independently, on the
+    resulting manifest run record."""
+    records = [_record(1, job="e2e-core", head_sha=BEFORE_SHA, workflow_sha=WORKFLOW_SHA)]
+    evidence_errors: list[dict] = []
+    result = collector._collect_arm(
+        arm_name="before",
+        commit_sha=BEFORE_SHA,
+        raw_records=records,
+        job_names=("e2e-core",),
+        min_run_count=1,
+        evidence_errors=evidence_errors,
+    )
+    run = result["jobs"]["e2e-core"]["runs"][0]
+    assert run["head_sha"] == BEFORE_SHA
+    assert run["workflow_sha"] == WORKFLOW_SHA
+    assert run["head_sha"] != run["workflow_sha"]
 
 
 def test_manifest_requires_workflow_digest_per_run_record():

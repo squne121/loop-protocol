@@ -136,6 +136,192 @@ def _is_placeholder(value: object) -> bool:
     return value in PLACEHOLDER_VALUES
 
 
+
+# --------------------------------------------------------------------------- #
+# #2159 OWNER scope-authority ruling (issuecomment-5299412215, items 2/P0-8
+# and 3/P1-3/AC11): a REAL, callable production CLI path that wires
+# `_evidence_readiness_hard_check_post_filter` (AC11's hard-failure gate) and
+# `build_assessment_from_percentile_cohorts` (the P0-8 real, non-no-op
+# CI_TEST_PERFORMANCE_ASSESSMENT_V2 producer) together into a SINGLE gate
+# invocable from an actual `.github/workflows/ci.yml` job -- not merely a
+# unit-tested function that nothing outside pytest ever calls. Per OWNER:
+# "20件未満なら fail-closed する production path を先に配線できます" -- this
+# path correctly fail-closes (non-zero exit, `EvidenceInsufficientError`)
+# given fewer than MIN_COHORT_RUN_COUNT valid post-filter samples for either
+# arm, and only computes/emits a real `claim.kind != none` once BOTH arms
+# clear that floor. It never fabricates a claim from insufficient evidence.
+# --------------------------------------------------------------------------- #
+def _cli_run_details_from_pairs(pairs: list[tuple], commit_sha: str) -> list[dict]:
+    """Builds the `{"run_id", "workflow_run_id", "run_attempt", "commit_sha",
+    "conclusion", "duration_seconds"}` shape `build_assessment_from_percentile_
+    cohorts` (and its own P0-7 raw-sample invariants) requires, from paired
+    (`workflow_run_id`, core_baseline, responsive_baseline) tuples -- the
+    per-run duration is the SAME `max(core, responsive)` provider
+    critical-path statistic `_provider_critical_path_paired_p50_p95` uses
+    (#2159 P0-4), never a self-reported/aggregate number."""
+    run_details = []
+    for workflow_run_id, core, responsive in pairs:
+        core_duration = _single_baseline_duration_seconds(core)
+        responsive_duration = _single_baseline_duration_seconds(responsive)
+        if core_duration is None or responsive_duration is None:
+            continue
+        run_details.append(
+            {
+                "run_id": str(workflow_run_id),
+                "workflow_run_id": workflow_run_id,
+                "run_attempt": 1,
+                "commit_sha": commit_sha,
+                "conclusion": "success",
+                "duration_seconds": max(core_duration, responsive_duration),
+            }
+        )
+    return run_details
+
+
+def run_evidence_gate(fixture: dict) -> dict:
+    """#2159 items 2+3 (issuecomment-5299412215): the single production gate
+    function -- reads an already-assembled cohort fixture (shape: see
+    `--cohort-fixture` CLI help below), re-validates POST-FILTER evidence
+    sufficiency independently for the `before` and `after` arms via AC11's
+    `_evidence_readiness_hard_check_post_filter`, and -- only if BOTH arms
+    clear `MIN_COHORT_RUN_COUNT` -- computes a REAL assessment via
+    `build_assessment_from_percentile_cohorts` and runs it through the full
+    structural+semantic validator. Returns a JSON-serializable result dict
+    with `gate_status: insufficient_evidence | complete` and never raises for
+    the insufficient-evidence case (the CLI wrapper below converts that into
+    a non-zero process exit -- this function itself stays a pure, directly
+    unit-testable building block, mirroring `build_assessment_from_percentile_
+    cohorts`'s own existing testability design)."""
+    validator = _load_validator_module()
+
+    before_core = fixture["before"]["core_baselines"]
+    before_responsive = fixture["before"]["responsive_baselines"]
+    after_core = fixture["after"]["core_baselines"]
+    after_responsive = fixture["after"]["responsive_baselines"]
+    before_gate_ready = fixture["before"].get("gate_ready_baselines", [])
+    after_gate_ready = fixture["after"].get("gate_ready_baselines", [])
+
+    before_pairs, before_evidence_errors = _pair_by_workflow_run_id(before_core, before_responsive)
+    after_pairs, after_evidence_errors = _pair_by_workflow_run_id(after_core, after_responsive)
+
+    before_provider_count, _ = _provider_post_filter_sample_count(before_core, before_responsive)
+    after_provider_count, _ = _provider_post_filter_sample_count(after_core, after_responsive)
+    before_gate_ready_count = _gate_ready_post_filter_sample_count(before_gate_ready)
+    after_gate_ready_count = _gate_ready_post_filter_sample_count(after_gate_ready)
+
+    try:
+        _evidence_readiness_hard_check_post_filter(
+            before_provider_count, before_evidence_errors, {"before": before_gate_ready_count}
+        )
+        _evidence_readiness_hard_check_post_filter(
+            after_provider_count, after_evidence_errors, {"after": after_gate_ready_count}
+        )
+    except EvidenceInsufficientError as exc:
+        return {
+            "schema": "CI_PERFORMANCE_BENCHMARK_EVIDENCE_GATE_RESULT_V1",
+            "gate_status": "insufficient_evidence",
+            "reason": str(exc),
+            "before_provider_post_filter_count": before_provider_count,
+            "after_provider_post_filter_count": after_provider_count,
+            "assessment": None,
+            "validation_result": None,
+        }
+
+    before_run_details = _cli_run_details_from_pairs(before_pairs, fixture["before"]["commit_sha"])
+    after_run_details = _cli_run_details_from_pairs(after_pairs, fixture["after"]["commit_sha"])
+
+    assessment = validator.build_assessment_from_percentile_cohorts(
+        issue_number=fixture["issue_number"],
+        pr_number=fixture["pr_number"],
+        measured_at=fixture["measured_at"],
+        before_run_details=before_run_details,
+        after_run_details=after_run_details,
+        functional_evidence=fixture["functional_evidence"],
+        declared_impact=fixture["declared_impact"],
+        risk_acknowledgement=fixture["risk_acknowledgement"],
+        cohort_provenance=fixture["cohort_provenance"],
+    )
+
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as handle:
+        json.dump(assessment, handle)
+        assessment_tmp_path = handle.name
+    try:
+        exit_code, decision = validator.validate_assessment(assessment_tmp_path)
+    finally:
+        os.unlink(assessment_tmp_path)
+
+    return {
+        "schema": "CI_PERFORMANCE_BENCHMARK_EVIDENCE_GATE_RESULT_V1",
+        "gate_status": "complete",
+        "reason": None,
+        "before_provider_post_filter_count": before_provider_count,
+        "after_provider_post_filter_count": after_provider_count,
+        "assessment": assessment,
+        "validation_result": decision,
+        "validation_exit_code": exit_code,
+    }
+
+
+def _cli_main(argv: list[str] | None = None) -> int:
+    """Real callable entrypoint wired into `.github/workflows/ci.yml`'s
+    `e2e-performance-benchmark-assessment-gate` job (#2159 OWNER
+    scope-authority ruling issuecomment-5299412215, items 2+3). Exit codes:
+    0 = gate_status complete AND semantic_valid AND approval_eligible;
+    1 = insufficient_evidence (AC11 fail-closed -- the intended, CORRECT
+        outcome until a real >= 20-run cohort exists per-arm, per OWNER:
+        "20件未満なら fail-closed する production path");
+    2 = complete evidence but the built assessment failed structural/semantic
+        validation (defensive fail-closed; not expected given this module's
+        own P0-7 hardening, see
+        test_validate_ci_performance_assessment_v2_build_from_cohorts.py)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "#2159 items 2+3 production gate: fail-closed AC11 evidence "
+            "readiness check + P0-8 real CI_TEST_PERFORMANCE_ASSESSMENT_V2 "
+            "producer, wired from a single cohort fixture."
+        )
+    )
+    parser.add_argument(
+        "--cohort-fixture",
+        required=True,
+        help=(
+            "Path to a JSON fixture: "
+            '{"issue_number": int, "pr_number": int, "measured_at": str, '
+            '"functional_evidence": {...}, "declared_impact": str, '
+            '"risk_acknowledgement": {...}, "cohort_provenance": {...}, '
+            '"before": {"commit_sha": str, "core_baselines": [...], '
+            '"responsive_baselines": [...], "gate_ready_baselines": [...]}, '
+            '"after": {...same shape...}}'
+        ),
+    )
+    parser.add_argument("--output", required=True, help="Path to write the gate result JSON")
+    args = parser.parse_args(argv)
+
+    with open(args.cohort_fixture, encoding="utf-8") as handle:
+        fixture = json.load(handle)
+
+    result = run_evidence_gate(fixture)
+
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    with open(args.output, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2)
+        handle.write("\n")
+
+    if result["gate_status"] == "insufficient_evidence":
+        print(f"::error::CI_PERFORMANCE_BENCHMARK_EVIDENCE_GATE_RESULT_V1 insufficient_evidence: {result['reason']}")
+        return 1
+    if not (result["validation_result"] or {}).get("semantic_valid"):
+        print("::error::CI_PERFORMANCE_BENCHMARK_EVIDENCE_GATE_RESULT_V1 built assessment failed semantic validation")
+        return 2
+    claim = result["assessment"]["claim"]
+    print(f"CI_PERFORMANCE_BENCHMARK_EVIDENCE_GATE_RESULT_V1 gate_status=complete claim={claim}")
+    return 0
+
+
 def _load_validator_module():
     spec = importlib.util.spec_from_file_location("validate_ci_performance_assessment_v2", VALIDATOR)
     assert spec is not None and spec.loader is not None
@@ -714,3 +900,9 @@ def test_p95_failure_and_flaky_rate_validated_from_real_assessment_artifact():
             f"but NOT approval_eligible (blockers={decision.get('blockers')}) -- exit_code "
             f"alone is insufficient per AC10"
         )
+
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    _sys.exit(_cli_main())

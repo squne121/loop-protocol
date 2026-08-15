@@ -33,7 +33,10 @@ is expected to carry (at minimum):
       "head_sha": "<40-hex commit sha>",
       "artifact_id": <int>,
       "artifact_digest": "sha256:<hex>",
-      "conclusion": "success" | "failure" | "cancelled" | "skipped" | "timed_out"
+      "conclusion": "success" | "failure" | "cancelled" | "skipped" | "timed_out",
+      "workflow_digest": "<content digest of the workflow file that produced this run>",
+      "workflow_sha": "<40-hex sha of the WORKFLOW DEFINITION;
+        distinct from head_sha (#2159 issuecomment-5299412215 item 1)>"
     }
 
 Exit codes:
@@ -139,6 +142,13 @@ def _verify_run_record(record: dict, expected_head_sha: str) -> list[str]:
     # enforced).
     if not isinstance(record.get("workflow_digest"), str) or not record.get("workflow_digest"):
         violations.append("missing_or_invalid_workflow_digest")
+    # #2159 OWNER scope-authority ruling (issuecomment-5299412215, item
+    # 1/P0-2): `workflow_sha` (GITHUB_WORKFLOW_SHA -- the workflow
+    # DEFINITION's own commit) must be recorded as a field DISTINCT from
+    # `head_sha` (the measured application code's commit) -- never
+    # conflated, never asserted equal.
+    if not _is_valid_sha(record.get("workflow_sha")):
+        violations.append("missing_or_invalid_workflow_sha")
     return violations
 
 
@@ -357,6 +367,7 @@ def _collect_arm(
                     "artifact_digest": r["artifact_digest"],
                     "conclusion": r["conclusion"],
                     "workflow_digest": r["workflow_digest"],
+                    "workflow_sha": r["workflow_sha"],
                 }
                 for r in deduped
             ],

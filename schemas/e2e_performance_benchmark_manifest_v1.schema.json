@@ -141,7 +141,8 @@
         "artifact_id",
         "artifact_digest",
         "conclusion",
-        "workflow_digest"
+        "workflow_digest",
+        "workflow_sha"
       ],
       "unevaluatedProperties": false,
       "properties": {
@@ -179,6 +180,11 @@
           "type": "string",
           "minLength": 1,
           "description": "#2159 P0-9/AC1: content identity of the workflow definition that produced this run (distinct from the measured-code head_sha)."
+        },
+        "workflow_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "#2159 OWNER scope-authority ruling (issuecomment-5299412215, item 1/P0-2): the commit SHA of the WORKFLOW DEFINITION that produced this run (`GITHUB_WORKFLOW_SHA`, i.e. the ref the run was dispatched against), distinct from both `head_sha` (the measured application code's commit, checked out via an explicit `actions/checkout` `ref:` override) and `workflow_digest` (a content hash of the workflow file). For a fixed-SHA benchmark dispatch these two SHAs are EXPECTED to differ: `workflow_sha` stays on the current/default branch tip so the workflow's OWN instrumentation logic is current, while `head_sha` pins the OLD/NEW application code being measured."
         }
       }
     },

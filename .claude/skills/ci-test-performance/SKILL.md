@@ -224,6 +224,10 @@ uv run --locked python3 .claude/skills/ci-test-performance/scripts/validate_ci_p
 
 詳細スキーマは `schemas/ci_test_performance_assessment_v2.schema.json` / `schemas/ci_runtime_delta_v2.schema.json` を参照する。fixture は `.claude/skills/ci-test-performance/scripts/fixtures/` を参照する。
 
+### 実 production gate（#2159 OWNER scope-authority ruling issuecomment-5299412215, items 2/P0-8・3/P1-3/AC11）
+
+毎回の CI 実行で走る `claim.kind: none` の schema smoke producer（`codex-execpolicy` job 内）とは別に、`.github/workflows/ci.yml` の `e2e-performance-benchmark-assessment-gate` job（`workflow_dispatch` opt-in、通常 PR には配線しない）が `tests/ci/test_ci_performance_gate.py --cohort-fixture <path> --output <path>` を実 CLI として呼び出し、AC11 の `_evidence_readiness_hard_check_post_filter`（証拠不足時に非 zero exit）と P0-8 の `build_assessment_from_percentile_cohorts`（実 claim 計算）を 1 つの実行可能パスへ配線する。詳細は `docs/dev/e2e-performance-benchmark.md` の「実 production gate の配線」を参照する。
+
 ## 関連ドキュメント
 
 - `references/decision-matrix.md`: 詳細判断マトリクスと `CI_TEST_PERFORMANCE_DECISION_V1` 完全スキーマ

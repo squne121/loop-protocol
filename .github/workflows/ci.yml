@@ -14,23 +14,32 @@ on:
           AC11) without paying for the unrelated jobs on each measurement run.
         type: boolean
         default: false
-      # #2159 P0-2 (fix_delta after adversarial review issuecomment-5295659213):
-      # dedicated fixed-SHA E2E benchmark dispatch route, following the SAME
-      # #1064 pattern `python_test_bench` already established above (dispatch
-      # this SAME workflow definition repeatedly against a fixed `ref`; each
-      # dispatch is one independent runner-identical sample). The GitHub REST
-      # `workflow_dispatch` `ref` parameter only accepts a branch/tag (never a
-      # raw commit SHA) -- `target_sha` is therefore a VERIFICATION input, not
-      # a checkout selector: the operator dispatches with `ref` set to a
-      # branch/tag whose tip IS `target_sha`, and the e2e-core /
-      # e2e-responsive-matrix jobs below hard-fail if the checked-out HEAD
-      # does not exactly match it (guards against the ref having moved
-      # between dispatch and checkout).
+      # #2159 P0-2 (fix_delta after adversarial review issuecomment-5295659213;
+      # STRUCTURALLY REVISED per OWNER scope-authority ruling
+      # issuecomment-5299412215, item 1): dedicated fixed-SHA E2E benchmark
+      # dispatch route. The operator ALWAYS dispatches this workflow with
+      # `ref` pointed at the CURRENT/default branch (e.g. `main`) -- NEVER at
+      # a branch/tag whose tip is the (possibly old) measured commit -- so
+      # `github.workflow_sha` (the WORKFLOW DEFINITION's own commit) stays
+      # current on every benchmark sample. `target_sha` is a SEPARATE
+      # checkout-selector input: the e2e-core / e2e-responsive-matrix jobs
+      # below explicitly `actions/checkout@v6` with `ref: target_sha` to pin
+      # ONLY the measured application code to the old/new commit under test,
+      # then hard-fail if the resulting checked-out HEAD does not exactly
+      # match it. `target_sha` (measured code) and `github.workflow_sha`
+      # (workflow definition) are therefore EXPECTED to differ and are
+      # recorded as two independent fields in the benchmark manifest/
+      # ci_runtime_baseline_v1 artifact (never conflated or asserted equal;
+      # see docs/dev/e2e-performance-benchmark.md).
       target_sha:
         description: >-
-          Expected 40-hex commit SHA that `ref` must resolve to (verified via
-          `git rev-parse HEAD` immediately after checkout in e2e-core /
-          e2e-responsive-matrix). Leave empty for a normal (non-benchmark) run.
+          Expected 40-hex commit SHA of the APPLICATION CODE to measure
+          (checked out via an explicit `actions/checkout` `ref:` override in
+          e2e-core / e2e-responsive-matrix, then verified via `git rev-parse
+          HEAD`). Distinct from the `ref` this dispatch itself targets, which
+          should stay on the current/default branch so the WORKFLOW
+          DEFINITION (`github.workflow_sha`) remains current. Leave empty for
+          a normal (non-benchmark) run.
         type: string
         default: ""
       cohort_role:
@@ -49,6 +58,39 @@ on:
           Free-form identifier grouping the dispatched runs belonging to one
           fixed-SHA before/after experiment (for operator bookkeeping when
           collecting `--before-runs-json`/`--after-runs-json` via `gh api`).
+        type: string
+        default: ""
+      # #2159 OWNER scope-authority ruling (issuecomment-5299412215, items
+      # 2/P0-8 and 3/P1-3/AC11): opt-in trigger for the
+      # `e2e-performance-benchmark-assessment-gate` job below. Never runs on
+      # a normal push/pull_request event -- the 20-run comparable-cohort
+      # wait is explicitly Out of Scope as a merge/close condition for
+      # #2159/#2172 (deferred to #2155); this input lets an operator
+      # exercise the REAL production gate (AC11 hard-check +
+      # `build_assessment_from_percentile_cohorts`) on demand, without ever
+      # blocking a regular PR's required `ci` check.
+      run_performance_assessment_gate:
+        description: >-
+          When true, run ONLY the e2e-performance-benchmark-assessment-gate
+          job: read `cohort_fixture_path` (a JSON file already present in
+          the checked-out worktree -- e.g. downloaded from a prior
+          collect_e2e_performance_benchmark.py manifest-derived artifact) and
+          fail-closed (non-zero exit) unless BOTH the before and after arms
+          have >= MIN_COHORT_RUN_COUNT post-filter samples, per Issue #2159
+          AC11. Leave `cohort_fixture_path` empty to exercise this gate
+          against a deliberately-insufficient smoke fixture (proves the
+          mechanism itself is wired and fail-closes correctly even with zero
+          real historical runs, per OWNER: "20件未満なら fail-closed する
+          production path を先に配線できます").
+        type: boolean
+        default: false
+      cohort_fixture_path:
+        description: >-
+          Path (relative to the repo root, already present in the
+          checked-out worktree) to a JSON cohort fixture matching
+          `run_evidence_gate`'s documented shape in
+          tests/ci/test_ci_performance_gate.py. Leave empty to use the
+          built-in insufficient-evidence smoke fixture.
         type: string
         default: ""
 
@@ -633,6 +675,19 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # #2159 OWNER scope-authority ruling (issuecomment-5299412215,
+          # item 1/P0-2 structural fix): the `workflow_dispatch` `ref` this
+          # run was DISPATCHED against stays on the current/default branch
+          # (so the WORKFLOW DEFINITION -- `github.workflow_sha` -- is
+          # current, never reverted). The application code being MEASURED
+          # is checked out here via an EXPLICIT `ref:` override to
+          # `target_sha` -- a SEPARATE checkout selector from the dispatch
+          # `ref`. `target_sha` (measured code) and `github.workflow_sha`
+          # (workflow definition) are therefore allowed, and expected, to
+          # differ for a fixed-SHA benchmark dispatch; both are recorded as
+          # two independent fields below (never conflated or asserted
+          # equal).
+          ref: ${{ github.event.inputs.target_sha != '' && github.event.inputs.target_sha || github.sha }}
       - name: Verify checked-out HEAD matches dispatched target_sha (#2159 P0-2)
         if: ${{ github.event.inputs.target_sha != '' }}
         env:
@@ -641,10 +696,10 @@ jobs:
           set -euo pipefail
           resolved_head="$(git rev-parse HEAD)"
           if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
-            echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the dispatch ref branch/tag moved between dispatch and checkout. Refusing to record a benchmark sample for the wrong commit."
+            echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the explicit checkout ref override did not resolve to the expected commit. Refusing to record a benchmark sample for the wrong commit."
             exit 1
           fi
-          echo "target_sha verified: $resolved_head"
+          echo "target_sha verified: $resolved_head (workflow definition SHA: ${{ github.workflow_sha }})"
       - name: Enable pnpm via corepack
         run: |
           corepack enable pnpm
@@ -841,6 +896,12 @@ jobs:
           GH_SHA: ${{ github.sha }}
           GH_RUNNER_OS: ${{ runner.os }}
           GH_RUNNER_ARCH: ${{ runner.arch }}
+          # #2159 OWNER scope-authority ruling (issuecomment-5299412215, item
+          # 1/P0-2): the WORKFLOW DEFINITION's own commit SHA (distinct from
+          # the measured application code's `head_sha`, which on a
+          # fixed-SHA benchmark dispatch is pinned via an explicit
+          # `actions/checkout` `ref:` override to `target_sha`).
+          GH_WORKFLOW_SHA: ${{ github.workflow_sha }}
           # #2159 P0-2: populated only on a dedicated fixed-SHA benchmark
           # dispatch (empty string on a normal push/pull_request run, which
           # the producer below falls back to "ci_default" for).
@@ -897,11 +958,20 @@ jobs:
               "host_runner_image": (
                   os.environ.get("GH_RUNNER_OS", "unknown") + "/" + os.environ.get("GH_RUNNER_ARCH", "unknown")
               ),
+              "host_runner_image_provenance": "os_arch_fallback",
               "playwright_container_image_digest": os.environ.get(
                   "PLAYWRIGHT_CONTAINER_IMAGE_DIGEST", "unknown"
               ),
               "cohort_role": os.environ.get("BENCHMARK_COHORT_ROLE") or "ci_default",
               "experiment_id": os.environ.get("BENCHMARK_EXPERIMENT_ID") or None,
+              # #2159 OWNER scope-authority ruling (issuecomment-5299412215,
+              # item 1/P0-2): `github.workflow_sha` is the commit of the
+              # WORKFLOW DEFINITION that produced this run (distinct from
+              # `head_sha`, the measured application code's commit, which on
+              # a fixed-SHA benchmark dispatch is pinned via an explicit
+              # `actions/checkout` `ref:` override to `target_sha`). Recorded
+              # as an independent field -- never conflated with `head_sha`.
+              "workflow_sha": os.environ.get("GH_WORKFLOW_SHA", "unknown"),
           }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
@@ -1379,6 +1449,19 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # #2159 OWNER scope-authority ruling (issuecomment-5299412215,
+          # item 1/P0-2 structural fix): the `workflow_dispatch` `ref` this
+          # run was DISPATCHED against stays on the current/default branch
+          # (so the WORKFLOW DEFINITION -- `github.workflow_sha` -- is
+          # current, never reverted). The application code being MEASURED
+          # is checked out here via an EXPLICIT `ref:` override to
+          # `target_sha` -- a SEPARATE checkout selector from the dispatch
+          # `ref`. `target_sha` (measured code) and `github.workflow_sha`
+          # (workflow definition) are therefore allowed, and expected, to
+          # differ for a fixed-SHA benchmark dispatch; both are recorded as
+          # two independent fields below (never conflated or asserted
+          # equal).
+          ref: ${{ github.event.inputs.target_sha != '' && github.event.inputs.target_sha || github.sha }}
       - name: Verify checked-out HEAD matches dispatched target_sha (#2159 P0-2)
         if: ${{ github.event.inputs.target_sha != '' }}
         env:
@@ -1387,10 +1470,10 @@ jobs:
           set -euo pipefail
           resolved_head="$(git rev-parse HEAD)"
           if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
-            echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the dispatch ref branch/tag moved between dispatch and checkout. Refusing to record a benchmark sample for the wrong commit."
+            echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the explicit checkout ref override did not resolve to the expected commit. Refusing to record a benchmark sample for the wrong commit."
             exit 1
           fi
-          echo "target_sha verified: $resolved_head"
+          echo "target_sha verified: $resolved_head (workflow definition SHA: ${{ github.workflow_sha }})"
       - name: Enable pnpm via corepack
         run: |
           corepack enable pnpm
@@ -1514,6 +1597,12 @@ jobs:
           GH_SHA: ${{ github.sha }}
           GH_RUNNER_OS: ${{ runner.os }}
           GH_RUNNER_ARCH: ${{ runner.arch }}
+          # #2159 OWNER scope-authority ruling (issuecomment-5299412215, item
+          # 1/P0-2): the WORKFLOW DEFINITION's own commit SHA (distinct from
+          # the measured application code's `head_sha`, which on a
+          # fixed-SHA benchmark dispatch is pinned via an explicit
+          # `actions/checkout` `ref:` override to `target_sha`).
+          GH_WORKFLOW_SHA: ${{ github.workflow_sha }}
           # #2159 P0-2: populated only on a dedicated fixed-SHA benchmark
           # dispatch (empty string on a normal push/pull_request run, which
           # the producer below falls back to "ci_default" for).
@@ -1570,11 +1659,20 @@ jobs:
               "host_runner_image": (
                   os.environ.get("GH_RUNNER_OS", "unknown") + "/" + os.environ.get("GH_RUNNER_ARCH", "unknown")
               ),
+              "host_runner_image_provenance": "os_arch_fallback",
               "playwright_container_image_digest": os.environ.get(
                   "PLAYWRIGHT_CONTAINER_IMAGE_DIGEST", "unknown"
               ),
               "cohort_role": os.environ.get("BENCHMARK_COHORT_ROLE") or "ci_default",
               "experiment_id": os.environ.get("BENCHMARK_EXPERIMENT_ID") or None,
+              # #2159 OWNER scope-authority ruling (issuecomment-5299412215,
+              # item 1/P0-2): `github.workflow_sha` is the commit of the
+              # WORKFLOW DEFINITION that produced this run (distinct from
+              # `head_sha`, the measured application code's commit, which on
+              # a fixed-SHA benchmark dispatch is pinned via an explicit
+              # `actions/checkout` `ref:` override to `target_sha`). Recorded
+              # as an independent field -- never conflated with `head_sha`.
+              "workflow_sha": os.environ.get("GH_WORKFLOW_SHA", "unknown"),
           }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
@@ -1679,6 +1777,133 @@ jobs:
             exit 1
           fi
           echo "e2e aggregate: both e2e-core and e2e-responsive-matrix succeeded (runtime result + provider-enforced runtime evidence via if-no-files-found: error)."
+
+  # #2159 OWNER scope-authority ruling (issuecomment-5299412215, items 2/P0-8
+  # and 3/P1-3/AC11): the REAL, callable production wiring of (a) the AC11
+  # evidence-readiness hard-check (`_evidence_readiness_hard_check_post_
+  # filter`, tests/ci/test_ci_performance_gate.py) into an actual workflow
+  # job's close/gate step, and (b) the P0-8 real (non-no-op)
+  # CI_TEST_PERFORMANCE_ASSESSMENT_V2 producer
+  # (`build_assessment_from_percentile_cohorts`). Distinct from the
+  # unconditional `Generate CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact` step
+  # inside python-test-core below, which intentionally remains a fixed
+  # `claim.kind: none` schema smoke-test payload run on EVERY regular CI run
+  # (per the review's own suggestion to keep that producer distinct from
+  # #2159 AC10's real performance producer). THIS job is opt-in
+  # (`workflow_dispatch` only) so the 20-run comparable-cohort wait -- Out of
+  # Scope as a #2159/#2172 merge/close condition -- never blocks a normal
+  # PR's required `ci` check; it correctly fail-closes today (non-zero exit)
+  # given the built-in smoke fixture's deliberately-insufficient sample
+  # count, and will compute a real claim once an operator supplies a
+  # `cohort_fixture_path` backed by a real >= 20-run cohort (#2155-era).
+  e2e-performance-benchmark-assessment-gate:
+    if: ${{ github.event.inputs.run_performance_assessment_gate == 'true' }}
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Resolve cohort fixture (operator-supplied or built-in insufficient-evidence smoke fixture)
+        env:
+          COHORT_FIXTURE_PATH_INPUT: ${{ github.event.inputs.cohort_fixture_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p e2e_performance_assessment_gate_artifacts
+          if [ -n "$COHORT_FIXTURE_PATH_INPUT" ]; then
+            if [ ! -f "$COHORT_FIXTURE_PATH_INPUT" ]; then
+              echo "::error::cohort_fixture_path=$COHORT_FIXTURE_PATH_INPUT does not exist in the checked-out worktree."
+              exit 1
+            fi
+            cp "$COHORT_FIXTURE_PATH_INPUT" e2e_performance_assessment_gate_artifacts/cohort_fixture.json
+            echo "cohort_fixture_source=operator_supplied path=$COHORT_FIXTURE_PATH_INPUT"
+          else
+            # #2159 OWNER ruling: "20件未満なら fail-closed する production
+            # path を先に配線できます" -- this built-in fixture is
+            # DELIBERATELY below MIN_COHORT_RUN_COUNT (20) per arm, proving
+            # the gate fail-closes correctly with zero real historical CI
+            # runs, exactly the state of this dev environment today.
+            python3 - <<'PY'
+          import json
+
+          def arm(commit_sha: str, count: int, start_id: int) -> dict:
+              core = [
+                  {
+                      "workflow_run_id": start_id + i,
+                      "job": "e2e-core",
+                      "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 60000 + i}],
+                  }
+                  for i in range(count)
+              ]
+              responsive = [
+                  {
+                      "workflow_run_id": start_id + i,
+                      "job": "e2e-responsive-matrix",
+                      "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 60000 + i}],
+                  }
+                  for i in range(count)
+              ]
+              gate_ready = [
+                  {
+                      "workflow_run_id": start_id + i,
+                      "run_started_at": "2026-08-15T00:00:00Z",
+                      "check_completed_at": "2026-08-15T00:05:00Z",
+                  }
+                  for i in range(count)
+              ]
+              return {
+                  "commit_sha": commit_sha,
+                  "core_baselines": core,
+                  "responsive_baselines": responsive,
+                  "gate_ready_baselines": gate_ready,
+              }
+
+          fixture = {
+              "issue_number": 2159,
+              "pr_number": 2172,
+              "measured_at": "2026-08-15T00:00:00Z",
+              "functional_evidence": {"proof_level": "check_run_only", "coverage_bound": False},
+              "declared_impact": (
+                  "e2e-performance-benchmark-assessment-gate smoke fixture "
+                  "(no cohort_fixture_path supplied) -- deliberately below "
+                  "MIN_COHORT_RUN_COUNT to prove the AC11 fail-closed gate "
+                  "is wired into a real workflow job."
+              ),
+              "risk_acknowledgement": {
+                  "reference": {"source_kind": "issue_comment", "source_id": "issuecomment-5299412215"},
+                  "verification_status": "unverified",
+              },
+              "cohort_provenance": {
+                  "runner_image": "ubuntu-24.04",
+                  "workers": 1,
+                  "scheduler": "loadscope",
+                  "command_manifest_digest": "sha256:" + "0" * 64,
+                  "test_selection_digest": "sha256:" + "0" * 64,
+              },
+              # 3 << MIN_COHORT_RUN_COUNT (20) -- intentional, see comment above.
+              "before": arm("0" * 40, 3, 9000),
+              "after": arm("1" * 40, 3, 19000),
+          }
+          with open("e2e_performance_assessment_gate_artifacts/cohort_fixture.json", "w", encoding="utf-8") as handle:
+              json.dump(fixture, handle, indent=2)
+          print("cohort_fixture_source=built_in_insufficient_evidence_smoke_fixture")
+          PY
+          fi
+      - name: Run AC11 evidence gate + P0-8 assessment producer (#2159 OWNER ruling issuecomment-5299412215 items 2/3)
+        run: |
+          uv run --locked python3 tests/ci/test_ci_performance_gate.py \
+            --cohort-fixture e2e_performance_assessment_gate_artifacts/cohort_fixture.json \
+            --output e2e_performance_assessment_gate_artifacts/gate_result.json
+      - name: Upload e2e-performance-benchmark-assessment-gate artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-performance-benchmark-assessment-gate-${{ github.run_attempt }}
+          path: e2e_performance_assessment_gate_artifacts/
+          if-no-files-found: error
+          retention-days: 30
 
   component-vrt-report:
     # Issue #1389 (Scope Delta): non-required, report-only Vitest Browser

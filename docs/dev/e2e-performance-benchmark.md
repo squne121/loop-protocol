@@ -59,6 +59,24 @@ fingerprint フィールドが欠損しているか、`""` / `null` / `"unknown"
 
 各アームは `complete: true/false` を持ち、`min_run_count`（既定 20）に満たない job があれば `false` になる。manifest は書き込み後に再利用されず、再実行は新しいファイルとして生成する（in-place 上書きしない）。
 
+## `target_sha` / `workflow_sha` / `workflow_digest` の分離（OWNER scope-authority ruling issuecomment-5299412215, item 1/P0-2）
+
+固定 SHA ベンチマークの `workflow_dispatch` は、**必ず現在（default branch）の `ref` に対して起動する**（測定対象コミットを指す branch/tag へは向けない）。これにより `github.workflow_sha`（このワークフロー定義自身の commit）は常に最新のまま維持される。測定対象アプリケーションコードは `e2e-core` / `e2e-responsive-matrix` の `actions/checkout@v6` ステップが明示的な `ref: ${{ github.event.inputs.target_sha }}` で個別に checkout し、その結果の HEAD が `target_sha` と一致するかを検証する。
+
+したがって manifest の各 `RunRecord` は 3 つの独立したフィールドを持つ:
+
+- `head_sha` / `target_sha`: 測定対象アプリケーションコードの commit（`actions/checkout` の `ref:` で明示的に checkout したもの）。
+- `workflow_sha`（`GITHUB_WORKFLOW_SHA` = `github.workflow_sha`）: ワークフロー定義自身の commit。ベンチマーク dispatch では意図的に `head_sha`/`target_sha` と異なりうる（新しい instrumentation ロジックで古いコードを測定するため）。
+- `workflow_digest`: ワークフローファイルの内容ハッシュ（`sha256sum .github/workflows/ci.yml`）。
+
+この 3 フィールドは決して混同・同一性検証の対象にしない（`workflow_sha != head_sha` は正常な状態であり、エラーではない）。
+
+## `host_runner_image` の provenance 限界（追加指摘 issuecomment-5299412215）
+
+`host_runner_image` は現在も `${{ runner.os }}/${{ runner.arch }}`（例: `Linux/X64`）から生成している。GitHub 公式定義上 `runner.os`/`runner.arch` は OS 種別・CPU architecture のみを表し、hosted runner の実際の image build/version（`ImageOS`/`ImageVersion`、週次更新）を表さない。`ImageOS`/`ImageVersion` は `container:` を使うジョブ（`e2e-core`/`e2e-responsive-matrix` は両方とも `mcr.microsoft.com/playwright@sha256:...` コンテナ内で実行される）ではホスト側の環境変数がコンテナへ伝播しないため、シェルから直接取得できない（`ImageOS`/`ImageVersion` 未設定・空文字列になることを過去のセッションで確認済み）。
+
+このため ci_runtime_baseline_v1 producer は `host_runner_image_provenance: "os_arch_fallback"` フィールドを明示的に追加し、`host_runner_image` が真の runner image version provenance ではなく OS/architecture のみの弱い代替指標であることを機械可読に記録する（比較可能性契約のフィールド名だけで「runner image provenance を満たしている」と暗黙に主張しない）。真の image version を非コンテナ化した別ジョブで取得し `needs.*.outputs` 経由で伝播する設計は、より大きな job グラフ変更を伴うため本 Issue のスコープでは実施していない（follow-up 候補）。
+
 ## `CI_TEST_PERFORMANCE_ASSESSMENT_V2` の percentile 再計算（AC8）
 
 `validate_ci_performance_assessment_v2.py` は、`runtime_delta.<cohort>.run_details[].duration_seconds` の raw sample が存在する場合、それらから `nearest_rank_v1` で P50/P95 を再計算し、cohort の自己申告 `p50_seconds` / `p95_seconds` と照合する（`percentile_recomputation_mismatch_p50` / `percentile_recomputation_mismatch_p95`）。`run_details` は `schemas/ci_runtime_delta_v2.schema.json` 上 optional であり、存在しない場合はこのチェックをスキップする（後方互換）。
@@ -66,6 +84,23 @@ fingerprint フィールドが欠損しているか、`""` / `null` / `"unknown"
 ## `CI_TEST_PERFORMANCE_ASSESSMENT_V2` producer の配線（結線, wiring, AC10）
 
 `.github/workflows/ci.yml` の `codex-execpolicy` job に `Generate CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact` / `Validate CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact` / `Upload CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact` の 3 ステップを追加した。この producer は毎回の CI 実行で `claim.kind: none` の assessment を実際に生成・検証・artifact 化する（`if-no-files-found: error`）。固定 before/after SHA ベンチマークによる実際の性能主張（`claim.kind: improvement` 等）は、この毎回実行される producer とは別に、`scripts/ci/collect_e2e_performance_benchmark.py` の専用 benchmark route から out-of-band に作成する。
+
+### 実 production gate の配線（OWNER scope-authority ruling issuecomment-5299412215, items 2/P0-8・3/P1-3/AC11）
+
+上記の毎回実行される producer とは別に、`.github/workflows/ci.yml` の `e2e-performance-benchmark-assessment-gate` job（`workflow_dispatch` の `run_performance_assessment_gate: true` で opt-in、通常の push/pull_request では絶対に実行されない）が、`tests/ci/test_ci_performance_gate.py` を実 CLI として呼び出す:
+
+```bash
+uv run --locked python3 tests/ci/test_ci_performance_gate.py \
+  --cohort-fixture <cohort_fixture.json> \
+  --output <gate_result.json>
+```
+
+このエントリポイント（`run_evidence_gate` / `_cli_main`）は 2 つの機構を 1 つの実行可能パスへ配線する:
+
+1. **AC11 hard-check の実配線**: `_evidence_readiness_hard_check_post_filter`（post-filter サンプル数を before/after 両アームで再検証）を before/after それぞれに対して呼び出す。いずれかのアームが `MIN_COHORT_RUN_COUNT`（20）未満なら `EvidenceInsufficientError` を捕捉し、`gate_status: insufficient_evidence` を書き出した上で **非 zero exit（1）** で終了する。単体テストの中だけで存在する関数ではなく、実 workflow job の実行結果として非 zero exit が観測される。
+2. **P0-8 real producer の実配線**: 両アームが 20 件以上を満たした場合のみ `build_assessment_from_percentile_cohorts` を呼び出し、`claim.kind != none` の実 assessment を計算し、続けて `validate_ci_performance_assessment_v2.py` の構造/意味検証を通す。検証に失敗した場合も非 zero exit（2）とし、fail-open にしない。
+
+`cohort_fixture_path` を指定しない場合、このジョブは `MIN_COHORT_RUN_COUNT` を意図的に下回る smoke fixture（サンプル数 3）を使って自身を実行する。これは「実 20-run history がこの実装セッションには存在しない」という OWNER が明示的に許容した状態（"20件未満なら fail-closed する production path を先に配線できます"）を、実際の workflow job 実行として証明するためであり、20-run 蓄積そのものは #2155 のスコープのまま変わらない。
 
 ## Runtime Verification Applicability
 
