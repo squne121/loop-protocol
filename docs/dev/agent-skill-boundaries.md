@@ -2625,7 +2625,7 @@ Issue #1873 で `pr_review.publish` command id 自体および
 が repo 上に残存していても、本 skill lane はもはや参照・処理しない。）
 
 
-## `controlled_skill_mutation_exec.py` postcondition の metadata-snapshot 化と `.claude/.investigation-context.md` exemption（Issue #2163）
+## `controlled_skill_mutation_exec.py` の postcondition（事後条件）を metadata-snapshot 化し `.claude/.investigation-context.md` を例外扱いにする対応（Issue #2163）
 
 ### 背景
 
