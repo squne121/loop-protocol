@@ -380,12 +380,25 @@ RERUN_ATTEMPT_SELECTION_POLICY = "initial_attempt_only_v1"
 def _normalize_run_attempt(baseline: dict) -> int | None:
     """#2179: normalizes `baseline["run_attempt"]` to the
     `initial_attempt_only_v1` policy's `integer >= 1` contract. A missing
-    key defaults to 1 (backward compatibility with `ci_runtime_baseline_v1`
-    baselines collected before this field existed -- every existing
-    fixture/glob-discovered baseline in this test suite predates it). A
-    numeric STRING (e.g. `"1"`) is accepted and coerced to int -- this is
-    the REAL producer shape (`GITHUB_RUN_ATTEMPT` is a bash env var,
-    always a string, see `.github/workflows/ci.yml`'s
+    key defaults to 1 and is treated as a TRUSTED attempt-1 candidate --
+    this is NOT backward compatibility with pre-`run_attempt` baselines
+    (`ci_runtime_baseline_v1` has included `run_attempt` since its
+    introduction in commit `9574ee5c`; every baseline has always carried
+    this field). It is a KNOWN, TRACKED limitation: this gate module's own
+    Allowed Paths boundary (#2179 fix_delta, OWNER adversarial review of
+    PR #2182, issuecomment-5302595322) excludes satellite fixture files
+    such as `tests/ci/test_ci_performance_gate_paired_critical_path.py`,
+    which construct baseline records without `run_attempt`. Defaulting a
+    missing key to untrusted (`None`) here would silently exclude every
+    baseline from those satellite fixtures from the trusted cohort,
+    breaking their existing tests. Fully unifying this with the
+    collector's stricter (`scripts/ci/collect_e2e_performance_
+    benchmark.py`) missing-excludes-from-cohort policy is tracked in
+    follow-up Issue #2187 (https://github.com/squne121/loop-protocol/
+    issues/2187), which widens the Allowed Paths to the satellite fixture
+    files. A numeric STRING (e.g. `"1"`) is accepted and coerced to int --
+    this is the REAL producer shape (`GITHUB_RUN_ATTEMPT` is a bash env
+    var, always a string, see `.github/workflows/ci.yml`'s
     `Collect ci_runtime_baseline_v1 artifact` step and
     `test_v2_producer_shaped_baseline_from_ci_yml_is_admitted_to_cohort`).
     An explicit `None`, a non-numeric string, a bool, `0`, or a negative
