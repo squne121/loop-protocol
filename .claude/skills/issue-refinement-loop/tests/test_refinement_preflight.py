@@ -126,6 +126,11 @@ parent_issue: "#1"
 
 - [ ] Nothing remaining
 
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
 ## Outcome
 
 Add `scripts/example.py`.

@@ -51,6 +51,11 @@ change_kind: code
 ## Current Validated Scope
 - foo
 
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
 ## Outcome
 Some outcome.
 

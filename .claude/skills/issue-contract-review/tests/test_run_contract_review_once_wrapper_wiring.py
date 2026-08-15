@@ -303,3 +303,62 @@ class TestVcPreflightMaxWorkersWiringAC9:
         max_workers_idx = vc_preflight_cmd.index("--max-workers")
         assert vc_preflight_cmd[max_workers_idx + 1] == str(_rcr_mod._VC_PREFLIGHT_MAX_WORKERS)
         assert vc_preflight_cmd[max_workers_idx + 1] == "2"
+
+
+# ---------------------------------------------------------------------------
+# AC12 (#2040): timeout_phase reuses these same named timeout constants and
+# does not disturb the derived-relationship / explicit-argv wiring above.
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutPhaseUsesExistingNamedConstantsAC12:
+    """AC12: timeout_phase reporting must reference the existing named
+    timeout constants (not introduce independent duplicate literals), and
+    the readiness/vc_preflight timeout relationships above must be
+    unaffected by the new fields."""
+
+    def test_readiness_timeout_reports_configured_timeout_seconds_value(self):
+        def timeout_readiness(cmd, timeout=_rcr_mod._DEFAULT_TIMEOUT):
+            return None, -1, "timeout"
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=timeout_readiness):
+            result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["timeout_phase"] == "run_once_readiness"
+        assert (
+            result["execution_time_summary"]["timeout_seconds"]
+            == _rcr_mod._DEFAULT_READINESS_TIMEOUT_SECONDS
+        )
+        # unaffected: relationship still holds
+        assert _rcr_mod._DEFAULT_READINESS_TIMEOUT_SECONDS == (
+            _rcr_mod._READINESS_NESTED_EXECUTE_TIMEOUT_SECONDS
+            + _rcr_mod._READINESS_WRAPPER_OVERHEAD_SECONDS
+        )
+
+    def test_vc_preflight_timeout_reports_derived_vc_preflight_timeout_value(self):
+        readiness_json = _make_readiness_json("go")
+        product_spec_json = _make_product_spec_json("pass")
+
+        run_script_iter = iter([
+            (readiness_json, 0, None),
+            (product_spec_json, 0, None),
+            (None, -1, "timeout"),
+        ])
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=lambda *a, **kw: next(run_script_iter)):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=(0, "OK", "")):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["timeout_phase"] == "vc_preflight"
+        assert (
+            result["execution_time_summary"]["timeout_seconds"]
+            == _rcr_mod._VC_PREFLIGHT_TIMEOUT
+        )
+        # unaffected: relationship still holds
+        expected = (
+            _rcr_mod._VC_PREFLIGHT_PER_COMMAND_TIMEOUT
+            * _rcr_mod._VC_PREFLIGHT_MAX_COMMAND_BUDGET
+            + _rcr_mod._VC_PREFLIGHT_OVERHEAD_SECONDS
+        )
+        assert _rcr_mod._VC_PREFLIGHT_TIMEOUT == expected

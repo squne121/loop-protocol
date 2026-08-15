@@ -449,6 +449,11 @@ test
 
 none
 
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
 ## Outcome
 
 test
@@ -551,6 +556,11 @@ test
 ## Remaining Parent Gaps
 
 none
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
 
 ## Outcome
 

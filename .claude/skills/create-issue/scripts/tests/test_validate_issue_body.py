@@ -43,7 +43,7 @@ test -f /some/file  # AC1
 
 - /some/path
 """
-        result = validate_issue_body(body)
+        result = validate_issue_body(body, kind="implementation")
         assert result.status == "fail"
         lp001_errors = [e for e in result.errors if e.rule_id == "LP001"]
         assert any("Acceptance Criteria" in e.message for e in lp001_errors)
@@ -746,6 +746,45 @@ class TestLP020RuntimeVerificationIncomplete:
         result = validate_issue_body(body)
         lp020_errors = [e for e in result.errors if e.rule_id == "LP020"]
         assert len(lp020_errors) == 0
+
+    def test_lp020_positive_missing_reason(self):
+        """AC7: authoring validation requires an explicit RVA reason."""
+        body = """
+## Runtime Verification Applicability
+
+- decision: not_applicable
+"""
+        result = validate_issue_body(body, kind="implementation")
+        lp020_errors = [e for e in result.errors if e.rule_id == "LP020"]
+        assert any("reason" in e.message for e in lp020_errors)
+
+    def test_implementation_kind_requires_rva_section_from_issue_form(self):
+        """AC7: the implementation form makes RVA a required authoring section."""
+        body = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+```
+
+## Acceptance Criteria
+
+- [ ] AC1: test
+
+## Verification Commands
+
+```bash
+test -f file  # AC1
+```
+
+## Allowed Paths
+
+- file
+"""
+        result = validate_issue_body(body, kind="implementation")
+        lp001_errors = [e for e in result.errors if e.rule_id == "LP001"]
+        assert any("Runtime Verification Applicability" in e.message for e in lp001_errors)
 
 
 class TestLP030ForbiddenAuthPath:

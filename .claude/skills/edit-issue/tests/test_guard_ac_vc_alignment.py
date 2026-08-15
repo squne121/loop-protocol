@@ -90,6 +90,13 @@ contract_schema_version: v1
 issue_kind: implementation
 ```
 
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
+
 ## Acceptance Criteria
 
 - [ ] AC7 4つの検証コマンドを束ねる
@@ -115,6 +122,13 @@ _TRUE_MISMATCH_BODY = """\
 contract_schema_version: v1
 issue_kind: implementation
 ```
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
 
 ## Acceptance Criteria
 
@@ -164,6 +178,13 @@ class TestGuardAcVcAlignmentSetBased:
 contract_schema_version: v1
 issue_kind: implementation
 ```
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
 
 ## Acceptance Criteria
 
@@ -487,6 +508,13 @@ parent_issue: none
 goal_ref: "テスト用"
 change_kind: code
 ```
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: 静的検証のみで完結するため
+
+
 
 ## Parent Issue
 

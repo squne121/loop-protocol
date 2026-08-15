@@ -81,6 +81,17 @@ body:
       required: true
 
   - type: textarea
+    id: runtime-verification-applicability
+    attributes:
+      label: Runtime Verification Applicability
+      description: "動作検証の適用判定を明示する。decision を推測で省略しない。"
+      value: |
+        - decision: not_applicable
+        - reason: 静的検証のみで完結するため
+    validations:
+      required: true
+
+  - type: textarea
     id: in-scope
     attributes:
       label: In Scope
