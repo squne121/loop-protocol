@@ -537,6 +537,9 @@ def retry_once_on_transport_failure(
     artifact_root: Path | None = None,
     repo: str | None = None,
     expected_body_sha256: str | None = None,
+    elapsed_seconds: float | None = None,
+    total_deadline_seconds: float | None = None,
+    per_attempt_deadline_seconds: float | None = None,
 ):
     """Call `invoke_child()` (returns raw stdout text); if the FIRST call is
     classified `reviewer_transport_failure` (empty OR malformed, via the
@@ -555,6 +558,24 @@ def retry_once_on_transport_failure(
     retried and NEVER silently accepted as `status: ok`: retrying the same
     misbehaving/compromised relay is not expected to self-heal a semantic
     mismatch against parent-verified artifact ground truth.
+
+    Issue #2165 merge condition #8 (PR #2177 OWNER 2026-08-15
+    REQUEST_CHANGES, fix_delta iteration 2): this retry loop is a SEPARATE,
+    OUTER layer from `reviewer_transport.run_reviewer_transport()`'s own
+    attempt loop (which already applies
+    `reviewer_transport.has_sufficient_retry_attempt_budget()` uniformly
+    across all backends). Previously this function retried unconditionally
+    exactly once with no remaining-budget awareness at all -- a caller
+    driving `invoke_child()` against ANY backend (deterministic, claude,
+    codex) could spawn a second, doomed-to-timeout attempt even with almost
+    no total-deadline budget left. When `elapsed_seconds` /
+    `total_deadline_seconds` / `per_attempt_deadline_seconds` are all
+    supplied, the SAME backend-agnostic budget guard
+    `reviewer_transport.has_sufficient_retry_attempt_budget()` uses is
+    applied here before the retry call; when any of the three is omitted
+    (the caller does not track deadline state), behavior is unchanged from
+    before -- unconditional retry-exactly-once (backward compatible
+    default, matching every existing caller/test of this function).
     """
     first = invoke_child()
     classification = classify_child_stdout(
@@ -572,6 +593,24 @@ def retry_once_on_transport_failure(
             "attempts": 1,
             "final_classification": classification,
             "status": "integrity_failure",
+        }
+
+    if (
+        elapsed_seconds is not None
+        and total_deadline_seconds is not None
+        and per_attempt_deadline_seconds is not None
+        and not _reviewer_transport.has_sufficient_retry_attempt_budget(
+            elapsed_seconds=elapsed_seconds,
+            total_deadline_seconds=total_deadline_seconds,
+            per_attempt_deadline_seconds=per_attempt_deadline_seconds,
+        )
+    ):
+        return {
+            "raw_text": first,
+            "attempts": 1,
+            "final_classification": classification,
+            "status": "reviewer_transport_failure",
+            "retry_skipped_reason": "insufficient_retry_budget",
         }
 
     second = invoke_child()

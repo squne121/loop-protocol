@@ -43,6 +43,19 @@ import baseline_vc_preflight  # noqa: E402
 # Measured in Issue #2165's Background section: `1316 passed in 111.07s`.
 MEASURED_FULL_SUITE_SECONDS = 111.07
 
+# A valid V2 approve envelope, used below to make `retry_once_on_transport_
+# failure()`'s second call succeed (mirrors
+# `test_issue_reviewer_contract_static.py`'s `_APPROVE_STDOUT` fixture).
+_APPROVE_STDOUT = transport.build_compact_v2(
+    verdict="approve",
+    summary="contract ready",
+    blockers=0,
+    reviewed_body_sha256="sha256:" + "a" * 64,
+    attempt_id="fixture-attempt-2165",
+    artifact_relative="2165/fixture-attempt-2165/attempt-001/compact_review_result_v2.json",
+    artifact_sha256="sha256:" + "b" * 64,
+).decode("utf-8")
+
 
 # ---------------------------------------------------------------------------
 # Layered-budget derivation chain (P1-1(c)): each layer's aggregate/wrapper
@@ -228,3 +241,98 @@ def test_retry_attempt_is_spawned_when_remaining_budget_is_above_minimum(tmp_pat
     result = _run_spawn_failure_with_min_retry_fraction(tmp_path, fraction=0.01)
     assert result["transport_status"] == "environment_failure"
     assert len(result["attempts"]) == transport.MAX_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# Merge condition #8 (PR #2177 OWNER 2026-08-15 REQUEST_CHANGES, fix_delta
+# iteration 2): the retry-budget guard must apply uniformly regardless of
+# backend, including the SEPARATE, OUTER `retry_once_on_transport_failure()`
+# retry layer in `run_root_review_pipeline.py` (a different retry loop from
+# `run_reviewer_transport()`'s own attempt loop, which the two tests above
+# already cover for `backend="fixture"`).
+# ---------------------------------------------------------------------------
+
+
+def test_has_sufficient_retry_attempt_budget_is_backend_agnostic_by_construction():
+    # The helper takes no `backend` argument at all -- it cannot special-case
+    # any backend, so it necessarily applies uniformly to deterministic,
+    # claude, codex, and fixture callers alike.
+    assert "backend" not in transport.has_sufficient_retry_attempt_budget.__code__.co_varnames[
+        : transport.has_sufficient_retry_attempt_budget.__code__.co_argcount
+    ]
+    assert (
+        transport.has_sufficient_retry_attempt_budget(
+            elapsed_seconds=0.0, total_deadline_seconds=10.0, per_attempt_deadline_seconds=1.0
+        )
+        is True
+    )
+    assert (
+        transport.has_sufficient_retry_attempt_budget(
+            elapsed_seconds=9.95, total_deadline_seconds=10.0, per_attempt_deadline_seconds=1.0
+        )
+        is False
+    )
+
+
+def test_retry_once_on_transport_failure_skips_retry_when_budget_insufficient_for_non_deterministic_backend():
+    # `invoke_child` here stands in for a non-deterministic (claude/codex)
+    # backend caller of `retry_once_on_transport_failure()`. Even though the
+    # first call is a retryable transport failure (empty stdout), supplying
+    # deadline state that leaves less than `MIN_RETRY_ATTEMPT_BUDGET_FRACTION
+    # * per_attempt_deadline_seconds` of budget must skip the second call
+    # entirely -- mirroring the `run_reviewer_transport()` attempt-loop guard
+    # one layer up, for this SEPARATE outer retry loop.
+    calls = {"n": 0}
+
+    def invoke_child():
+        calls["n"] += 1
+        return ""
+
+    result = pipeline.retry_once_on_transport_failure(
+        invoke_child,
+        issue_number=2165,
+        elapsed_seconds=9.95,
+        total_deadline_seconds=10.0,
+        per_attempt_deadline_seconds=1.0,
+    )
+    assert calls["n"] == 1
+    assert result["attempts"] == 1
+    assert result["status"] == "reviewer_transport_failure"
+    assert result["retry_skipped_reason"] == "insufficient_retry_budget"
+
+
+def test_retry_once_on_transport_failure_still_retries_when_budget_sufficient_for_non_deterministic_backend():
+    # Control case: with ample remaining budget, the second call still
+    # happens -- the guard above is not just always blocking every retry.
+    calls = {"n": 0}
+
+    def invoke_child():
+        calls["n"] += 1
+        return "" if calls["n"] == 1 else _APPROVE_STDOUT
+
+    result = pipeline.retry_once_on_transport_failure(
+        invoke_child,
+        issue_number=2165,
+        elapsed_seconds=0.0,
+        total_deadline_seconds=10.0,
+        per_attempt_deadline_seconds=1.0,
+    )
+    assert calls["n"] == 2
+    assert result["attempts"] == 2
+    assert result["status"] == "ok"
+
+
+def test_retry_once_on_transport_failure_defaults_to_unconditional_retry_when_deadline_state_omitted():
+    # Backward compatibility: existing callers/tests that never pass
+    # deadline state must keep the pre-#2165 unconditional
+    # retry-exactly-once behavior unchanged.
+    calls = {"n": 0}
+
+    def invoke_child():
+        calls["n"] += 1
+        return "" if calls["n"] == 1 else _APPROVE_STDOUT
+
+    result = pipeline.retry_once_on_transport_failure(invoke_child, issue_number=2165)
+    assert calls["n"] == 2
+    assert result["attempts"] == 2
+    assert result["status"] == "ok"

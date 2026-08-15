@@ -777,6 +777,36 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
         # DIRECT child is killed/reaped on timeout (Python's
         # `subprocess.run(..., timeout=...)` behavior, unchanged from
         # before #2165).
+        #
+        # PR #2177 OWNER 2026-08-15 REQUEST_CHANGES fix_delta iteration 2
+        # re-investigation (documented here rather than silently repeating
+        # the prior omission): a `subprocess.run(argv, ...,
+        # start_new_session=True)` call shape alone (keeping the literal
+        # `subprocess.run` call so the mock above still intercepts it) does
+        # NOT achieve process-group reaping either, because
+        # `subprocess.run()`'s own `TimeoutExpired` handling only has
+        # access to its internal `Popen` instance's direct-child `.kill()`
+        # -- it never exposes that instance's `pid`/`pgid` back to this
+        # caller, so there is no safe way to `os.killpg()` the group from
+        # here without capturing the child pid through a DIFFERENT channel.
+        # A `/proc`-based "diff of this process's children before/after
+        # spawn" workaround was also evaluated and REJECTED: `run_command()`
+        # is invoked concurrently through a `ThreadPoolExecutor` (see
+        # `args.max_workers > 1` below), so two VC commands can spawn within
+        # the same narrow diff window and a `/proc` diff can misattribute
+        # one VC's child pid to a DIFFERENT VC's timeout-triggered kill --
+        # an unsafe, racy "fix" for a security-relevant subprocess execution
+        # path is worse than the current, honestly-documented direct-child-
+        # only guarantee. Resolving this correctly requires either (a) a
+        # follow-up Issue with Allowed Paths extended to include
+        # `test_pnpm_gate_security_boundary.py` so `run_command()` can
+        # switch to `Popen`+`communicate(timeout=...)`+`killpg()` (the
+        # textbook-correct pattern for this) and that test's mock moved to
+        # patch `Popen` instead of `subprocess.run`, or (b) explicit OWNER
+        # authorization to touch that file within this PR. Neither is
+        # available within this Issue's Allowed Paths, so this specific
+        # merge condition (#5 / P1-2) remains UNRESOLVED in this PR; see the
+        # PR body Notes section for the same disclosure.
         result = subprocess.run(
             argv,
             capture_output=True,

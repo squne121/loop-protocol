@@ -118,6 +118,45 @@ TOTAL_DEADLINE_SECONDS = 520
 # unconditionally spawning a bounded-to-fail attempt.
 MIN_RETRY_ATTEMPT_BUDGET_FRACTION = 0.1
 STDOUT_CAP = 65_536
+# Issue #2165 merge condition #8 (PR #2177 OWNER 2026-08-15 REQUEST_CHANGES,
+# fix_delta iteration 2): `has_sufficient_retry_attempt_budget()` is the
+# SINGLE, backend-agnostic budget check that gates spawning ANY new attempt
+# (2nd/3rd, of ANY backend -- deterministic, claude, codex, fixture) after
+# the first. `run_reviewer_transport()`'s own attempt loop already applies
+# this uniformly regardless of `backend` (there is no `if backend ==
+# "deterministic"` branch around the check itself -- only `retry_matrix()`'s
+# retryable-reason-code allowlist differs per backend). The gap this
+# iteration closes is a SEPARATE, OUTER retry layer:
+# `run_root_review_pipeline.py`'s `retry_once_on_transport_failure()`, which
+# previously retried `invoke_child()` unconditionally exactly once on a
+# transport failure with NO remaining-budget awareness at all (a different
+# retry loop from this module's `run_reviewer_transport()` attempt loop,
+# and it had no way to reject a retry regardless of how little
+# total-deadline budget remained). This helper is exported so that other
+# in-process retry callers (in Allowed Paths) share the SAME guard rather
+# than a second, independently hand-picked policy.
+def has_sufficient_retry_attempt_budget(
+    *,
+    elapsed_seconds: float,
+    total_deadline_seconds: float,
+    per_attempt_deadline_seconds: float,
+    min_fraction: float = MIN_RETRY_ATTEMPT_BUDGET_FRACTION,
+) -> bool:
+    """Return whether a NEW attempt (of any backend) is worth spawning.
+
+    ``False`` when the time remaining before ``total_deadline_seconds`` is
+    smaller than ``min_fraction * per_attempt_deadline_seconds`` -- too
+    small for a new attempt to realistically spawn, do minimal useful work,
+    and clean up. Callers MUST NOT spawn a new attempt when this returns
+    ``False``, regardless of backend: a non-deterministic (claude/codex)
+    backend attempt has no better chance of completing useful work in a
+    near-zero remaining budget than a deterministic one does.
+    """
+    remaining_seconds = total_deadline_seconds - elapsed_seconds
+    return remaining_seconds >= per_attempt_deadline_seconds * min_fraction
+
+
+
 STDERR_CAP = 262_144
 ARTIFACT_MAX_BYTES = 1_048_576
 READER_JOIN_GRACE_SECONDS = 5
@@ -839,7 +878,18 @@ def run_reviewer_transport(
         # without a realistic chance of succeeding. The FIRST attempt is
         # exempt (it always gets its full per-attempt budget from a fresh
         # `total_deadline` clock).
-        if attempt > 1 and (total_deadline - elapsed) < per_attempt_deadline * MIN_RETRY_ATTEMPT_BUDGET_FRACTION:
+        if attempt > 1 and not has_sufficient_retry_attempt_budget(
+            elapsed_seconds=elapsed,
+            total_deadline_seconds=total_deadline,
+            per_attempt_deadline_seconds=per_attempt_deadline,
+            # `min_fraction` is read from the MODULE global at call time
+            # (not the function's own default parameter value, which is
+            # bound once at def-time) so tests that monkeypatch
+            # `MIN_RETRY_ATTEMPT_BUDGET_FRACTION` at the module level (e.g.
+            # `test_reviewer_transport_deadline_matches_vc_worst_case.py`)
+            # still take effect here.
+            min_fraction=MIN_RETRY_ATTEMPT_BUDGET_FRACTION,
+        ):
             break
         intent = retry_intent_kind
         command = build_backend_command(backend=backend, base_argv=base_argv, session_id=active_session)
