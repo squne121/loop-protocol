@@ -3061,6 +3061,34 @@ def run_interactive_herdr_isolated(
             raise HerdrLaneError("could not parse pane_id from herdr workspace create output")
         evidence["pane_id"] = pane_id
 
+        if claude_bin_shim_dir is not None:
+            # Live-environment finding (2026-08-16 AC4 re-verification):
+            # ``workspace create --env PATH=...`` DOES set the newly
+            # spawned pane shell's initial process PATH (confirmed via
+            # ``herdr pane run <pane> 'echo $PATH'``), but an interactive
+            # login shell re-sources its own rc files (.bashrc/.zshrc/
+            # .profile) immediately afterward, and those commonly
+            # PREPEND the user's own standard directories (e.g.
+            # ``~/.local/bin``) in front of whatever was inherited --
+            # pushing the shim directory behind a real ambient ``claude``
+            # and silently defeating the override (exactly the false-PASS
+            # scenario Finding 1 warned about). ``herdr pane run`` executes
+            # a command in the ALREADY-running (post-rc-sourced) shell, so
+            # explicitly re-exporting PATH there -- immediately before
+            # ``agent start`` -- guarantees the shim wins regardless of
+            # rc-script ordering.
+            _escaped_shim_dir = claude_bin_shim_dir.replace("'", "'\\''")
+            _pin_rc, _pin_out, _pin_err, _pin_timed_out = _run(
+                [herdr_bin, "pane", "run", pane_id,
+                 f"export PATH='{_escaped_shim_dir}':\"$PATH\""],
+                timeout=15.0, env=isolated_env,
+            )
+            if _pin_timed_out or _pin_rc != 0:
+                raise HerdrLaneError(
+                    f"could not pin --claude-bin shim PATH in the isolated pane's "
+                    f"already-running shell: {_redact(_pin_err or _pin_out)}"
+                )
+
         # Issue #1960 AC5: the interactive lane never forwards
         # structured-only flags (``--output-format`` / ``--include-hook-events``
         # / ``--no-session-persistence`` / ``--max-turns``) to the TUI
@@ -3717,10 +3745,16 @@ def main(argv: list[str] | None = None) -> int:
         schema_summary["resolved_executable_binding_note"] = (
             "interactive lane launches via `herdr agent start --kind "
             "claude`; --claude-bin was supplied, so a session-local PATH "
-            "override (a `claude` name symlinked to the --claude-bin "
-            "absolute path) was prepended to the isolated herdr session's "
-            "environment before `herdr agent start`, so herdr's own PATH "
-            "lookup resolves to this explicit binary (Issue #2174)."
+            "override (a `claude`-named forwarder script -- never a "
+            "symlink, see PR #2176 OWNER REQUEST_CHANGES Finding 2 -- "
+            "that execs the --claude-bin absolute path) was prepended "
+            "to the isolated herdr session's PATH and passed explicitly "
+            "via `herdr workspace create --env PATH=...` and a "
+            "post-creation `herdr pane run` PATH re-export (Finding 1), "
+            "so herdr's own PATH lookup resolves to this explicit "
+            "binary; a run-scoped nonce/receipt (see "
+            "claude_bin_launcher_receipt_verified) independently confirms "
+            "the forwarder itself executed (Issue #2174)."
         ) if (args.runtime == "claude" and args.claude_bin) else (
             "interactive lane launches via `herdr agent start --kind "
             "<runtime>`, which re-resolves the binary via herdr's own PATH "
