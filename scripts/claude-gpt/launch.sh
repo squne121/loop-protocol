@@ -268,6 +268,12 @@ if [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-start-stop" ]; then
   }'
 fi
 
+# --- launcher-owned autoMode policy（Issue #2203, second-gate 判断補助。
+#     決定論的 authority は permissions.deny / PreToolUse hook / GitHub mutation
+#     transaction broker であり、この autoMode は project .claude/settings*.json
+#     ではなくこの launcher-owned --settings にのみ注入する） ---
+AUTO_MODE_JSON_FRAGMENT=$(claude_gpt_auto_mode_json_fragment)
+
 cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
 {
   "permissions": {
@@ -277,7 +283,8 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
       "Read(/${PROXY_HOME_TARGET}/**)"
     ]
   },
-  "enabledPlugins": {}${HOOKS_JSON_FRAGMENT}
+  "enabledPlugins": {}${HOOKS_JSON_FRAGMENT},
+  ${AUTO_MODE_JSON_FRAGMENT}
 }
 SETTINGS_JSON_EOF
 
@@ -530,8 +537,12 @@ trap 'claude_gpt_cleanup' EXIT
 #     いずれ破綻していた状態を早期に顕在化させるだけである）。
 exec 9<&0
 
+# --- launcher が exactly one の `--permission-mode auto` を注入する（Issue #2203
+#     Outcome 節）。caller 由来の `--permission-mode` は上記 forbidden-flag ループ
+#     （CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由）で既に全面拒否済みのため、ここに
+#     到達する時点で "$@" に `--permission-mode` トークンは含まれない。 ---
 # shellcheck disable=SC2086
-"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" "$@" <&9 &
+"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" --permission-mode auto "$@" <&9 &
 CLAUDE_PID=$!
 
 wait "$CLAUDE_PID"

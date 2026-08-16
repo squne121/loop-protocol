@@ -126,6 +126,18 @@ latitude_api_key_classification:
     本 repo の tracked file・git history に存在しないことを前提とする。
 ```
 
+#### claude-gpt GitHub mutation transaction broker の credential boundary (#2203)
+
+`scripts/claude-gpt/auto_mode_canary.py` の `GitHubMutationBroker` は `squne121/loop-protocol`
+に repository 固定した canary Issue lifecycle 専用の GitHub mutation transaction broker であり、
+`gh` CLI 自身の既存 auth store（`gh auth login` 済みの token）をそのまま使う。broker は
+`GH_REPO` / `GH_HOST` / ambient `GH_TOKEN` を子プロセス env から scrub し、`--repo` 引数で
+repository を固定した上で `shell=False` の固定 argv のみを実行する。GitHub write credential は
+broker（この Python プロセスの `gh` 子プロセス呼び出し）のみが保持し、claude-gpt launcher が
+起動する Claude/AGY プロセスの ambient environment には一切渡さない（本節は新規 Secret を
+Inventory へ追加するものではなく、既存 `gh` CLI credential の使用範囲を repository-bound な
+broker に限定する運用境界を明文化する）。
+
 ---
 
 ### 5. `checkpoint_token` — session 記録ツール用 token

@@ -2773,3 +2773,27 @@ blind spot になる）。
   得られる具体的な証跡（実際に観測された変更内容・タイミング）を根拠に、exact path の
   producer を特定した上で再度対応を検討する。証跡のない事前の blanket exemption は
   行わない。
+
+## claude-gpt launcher の auto mode second-gate boundary (#2203)
+
+`scripts/claude-gpt/launch.sh` が生成する launcher-owned `--settings` の
+`autoMode`（`environment` / `allow` / `classifyAllShell: true`）は、Claude Code の
+Auto mode 自然言語 classifier に対する判断補助（second gate）であり、決定論的な
+authority ではない（[Configure auto mode](https://code.claude.com/docs/en/auto-mode-config)、
+[Configure permissions](https://code.claude.com/docs/en/permissions) 準拠）。
+
+決定論的な authorization boundary は次の三層で構成される。
+
+1. `permissions.deny`（絶対拒否。autoMode では緩和しない）
+2. 引数・repository・object identity を検証する `PreToolUse` hook
+3. `squne121/loop-protocol` に repository 固定した GitHub mutation transaction
+   broker（`scripts/claude-gpt/auto_mode_canary.py` の `GitHubMutationBroker`。
+   `scripts/agent-guards/controlled_skill_mutation_exec.py` と同型の repository
+   binding / env scrub / shell=False / remote-state-is-authority readback 設計を
+   踏襲する）
+
+launcher は caller の `--permission-mode` 指定（値の種類を問わず一律）を forbidden
+flag として拒否し、launcher 自身が exactly one の `--permission-mode auto` を注入
+する（`scripts/claude-gpt/lib.sh` の `CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS`）。`autoMode`
+は project `.claude/settings.json` / `.claude/settings.local.json` には追加せず、
+launcher-owned `--settings` にのみ注入する。

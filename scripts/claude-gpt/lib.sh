@@ -171,7 +171,208 @@ claude_gpt_git_dirty() {
 # チェック（`--permission-mode=bypassPermissions` と同型のパターン）で個別に拒否する
 # （このリストに残すと exact トークンの pre-filter 後に到達する `=*` variant 判定と
 # 混在してしまうため、責務を分離した）。
-CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS="--settings --mcp-config --dangerously-skip-permissions --allow-dangerously-skip-permissions"
+#
+# `--permission-mode` は Issue #2203（2026-08-16 OWNER adversarial review 反映）で
+# 追加した。launcher 自身が exactly one の `--permission-mode auto` を注入する契約の
+# ため、caller が明示する `--permission-mode VALUE` / `--permission-mode=VALUE` は
+# 値の種類（bypassPermissions を含む）を問わず一律拒否する。この一覧は
+# launcher-level `--` 以降の全トークンを走査する forbidden-flag ループでチェックされる
+# ため、duplicate 指定・`--` 後方の literal を含め、出現位置によらず拒否される
+# （区別して全面拒否。Outcome 節参照）。
+CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS="--settings --mcp-config --dangerously-skip-permissions --allow-dangerously-skip-permissions --permission-mode"
+
+# --- Issue #2203: launcher-owned autoMode policy（second-gate の判断補助）--------
+#
+# `autoMode` は permissions.deny / PreToolUse hook / GitHub mutation transaction
+# broker の後段にある classifier ベースの判断補助であり、決定論的な authority では
+# ない（Configure auto mode ドキュメント準拠）。ここで生成する narrow 文字列は
+# launcher-owned `--settings` にのみ注入し、project `.claude/settings*.json` には
+# 追加しない。
+CLAUDE_GPT_TRUSTED_REPO="squne121/loop-protocol"
+
+CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL="claude-gpt launcher narrow environment（second-gate 判断補助。authority ではない）: このセッションが日常的に扱う対象は GitHub host github.com 上の ${CLAUDE_GPT_TRUSTED_REPO} リポジトリ（Issue/PR の read/create/edit/comment/review/close/reopen、および同一 repository への non-force task-branch push）と、repository-owned canonical codebase-investigator -> gemini-cli-headless-delegation -> provider=agy の read-only isolated delegation route のみである。GitHub write credential は launcher-owned transaction broker のみが保持し、Claude/AGY プロセスの ambient environment には渡さない。他 repository・他 host・broad gh api・arbitrary provider・force push・branch/tag/release 削除・repository settings/IAM/secret 変更はこの環境記述の対象外である。"
+
+CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL="claude-gpt launcher narrow allow（second-gate 判断補助。authority ではない）: ${CLAUDE_GPT_TRUSTED_REPO} に repository 固定した GitHub mutation transaction broker（canonical builder/wrapper 経由、raw gh api を使わない）による Issue の read/create/edit/comment/close と、同一 repository の PR の read/create/edit/comment/review、および同一 repository への non-force task-branch push（force push・branch/tag/release 削除・repository settings/IAM/secret 変更は含まない）。加えて repository-owned canonical codebase-investigator -> gemini-cli-headless-delegation -> provider=agy の read-only isolated delegation（direct arbitrary agy 起動・provider!=agy・canonical builder/wrapper bypass・AGY からの GitHub mutation は対象外）。決定論的な authority は permissions.deny / PreToolUse hook / transaction broker が持ち、この allow rule はその second-gate 判断補助に過ぎない。"
+
+# claude_gpt_json_escape: 任意文字列を JSON 文字列リテラル（引用符込み）へ変換する。
+# python3 が使えない環境では簡易 fallback（改行・制御文字は非対応）を使う。
+# 引数1: エスケープしたい生文字列
+claude_gpt_json_escape() {
+  value="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$value"
+  else
+    esc=$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '"%s"' "$esc"
+  fi
+}
+
+# claude_gpt_auto_mode_json_fragment: settings JSON の `"autoMode": {...}` フィールド
+# 本体（キー名を含む）を1行の文字列として返す。`"$defaults"` を各配列の先頭に必ず
+# 含め、`classifyAllShell: true` を必須化する（Issue #2203 Outcome 節）。
+claude_gpt_auto_mode_json_fragment() {
+  env_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL")
+  allow_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL")
+  printf '"autoMode": {"environment": ["$defaults", %s], "allow": ["$defaults", %s], "classifyAllShell": true}' \
+    "$env_label_json" "$allow_label_json"
+}
+
+# claude_gpt_auto_mode_standalone_json: 上記フラグメントを単独の JSON オブジェクトとして
+# 返す（hermetic test 用。生成された settings ファイル全体を経由せず、フラグメント単体の
+# JSON 妥当性・$defaults 存在・narrow scope を検証できるようにする）。
+claude_gpt_auto_mode_standalone_json() {
+  printf '{%s}\n' "$(claude_gpt_auto_mode_json_fragment)"
+}
+
+# claude_gpt_auto_mode_readback: `claude auto-mode defaults` / `claude auto-mode config`
+# の実 readback で、launcher-generated settings の autoMode が effective config に
+# 正しく反映されていること（narrow environment/allow label 反映・hard_deny/soft_deny
+# 不変・classifyAllShell 有効）を検証する（Issue #2203 AC1）。python3 必須（未対応
+# 環境は fail-closed）。呼び出し元プロセスの env を継承せず、`env -i` で最小限のみ渡す
+# （FAKE_CLAUDE_ARGV_FILE 等、他コンポーネントの hermetic test 観測用 env の汚染防止も
+# 兼ねる）。
+#
+# 引数1: claude 実行バイナリの絶対パス
+# 引数2: 検証対象の settings.local.json 絶対パス
+# 戻り値: 0 = readback 成功（PASS）、8 = fail-closed（未対応 version・readback
+#         mismatch・classifyAllShell 未反映）
+claude_gpt_auto_mode_readback() {
+  claude_bin="$1"
+  settings_path="$2"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1","status":"blocked","reason":"python3_unavailable"}\n'
+    return 8
+  fi
+
+  claude_config_dir=$(CDPATH= cd -- "$(dirname -- "$settings_path")" 2>/dev/null && pwd -P)
+  if [ -z "$claude_config_dir" ]; then
+    claude_config_dir="${HOME:-/tmp}"
+  fi
+
+  defaults_tmp=$(mktemp)
+  config_tmp=$(mktemp)
+
+  env -i PATH="$PATH" HOME="${HOME:-/tmp}" CLAUDE_CONFIG_DIR="$claude_config_dir" \
+    "$claude_bin" auto-mode defaults >"$defaults_tmp" 2>&1
+  defaults_rc=$?
+
+  env -i PATH="$PATH" HOME="${HOME:-/tmp}" CLAUDE_CONFIG_DIR="$claude_config_dir" \
+    "$claude_bin" --settings "$settings_path" auto-mode config >"$config_tmp" 2>&1
+  config_rc=$?
+
+  python3 - "$defaults_tmp" "$defaults_rc" "$config_tmp" "$config_rc" "$settings_path" \
+    "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL" "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL" <<'PYEOF'
+import hashlib
+import json
+import sys
+
+(
+    defaults_path,
+    defaults_rc,
+    config_path,
+    config_rc,
+    settings_path,
+    env_label,
+    allow_label,
+) = sys.argv[1:8]
+defaults_rc = int(defaults_rc)
+config_rc = int(config_rc)
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+reasons: list[str] = []
+
+with open(defaults_path, encoding="utf-8") as fh:
+    defaults_text = fh.read()
+with open(config_path, encoding="utf-8") as fh:
+    config_text = fh.read()
+
+defaults = None
+config = None
+
+if defaults_rc != 0:
+    reasons.append("auto_mode_defaults_command_failed")
+else:
+    try:
+        defaults = json.loads(defaults_text)
+    except ValueError:
+        reasons.append("auto_mode_defaults_unparsable")
+
+if config_rc != 0:
+    reasons.append("auto_mode_config_command_failed")
+else:
+    try:
+        config = json.loads(config_text)
+    except ValueError:
+        reasons.append("auto_mode_config_unparsable")
+
+env_label_present = False
+allow_label_present = False
+hard_soft_unmodified = None
+classify_all_shell_ok = False
+
+if defaults is not None and config is not None:
+    for key in ("environment", "allow", "hard_deny", "soft_deny"):
+        if key not in defaults or key not in config:
+            reasons.append(f"missing_key_{key}")
+
+    env_label_present = env_label in config.get("environment", [])
+    allow_label_present = allow_label in config.get("allow", [])
+    if not env_label_present:
+        reasons.append("environment_narrow_label_not_reflected")
+    if not allow_label_present:
+        reasons.append("allow_narrow_label_not_reflected")
+
+    hard_soft_unmodified = config.get("hard_deny") == defaults.get(
+        "hard_deny"
+    ) and config.get("soft_deny") == defaults.get("soft_deny")
+    if not hard_soft_unmodified:
+        reasons.append("hard_or_soft_deny_modified")
+
+try:
+    with open(settings_path, encoding="utf-8") as fh:
+        settings_text = fh.read()
+except OSError:
+    settings_text = ""
+classify_all_shell_ok = (
+    '"classifyAllShell": true' in settings_text
+    or '"classifyAllShell":true' in settings_text
+)
+if not classify_all_shell_ok:
+    reasons.append("classify_all_shell_not_enabled")
+
+defaults_digest = _digest(defaults_text) if defaults is not None else "unknown"
+config_digest = _digest(config_text) if config is not None else "unknown"
+
+ok = not reasons
+
+result = {
+    "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1",
+    "status": "ok" if ok else "blocked",
+    "ok": ok,
+    "checks": {
+        "environment_narrow_label_present": env_label_present,
+        "allow_narrow_label_present": allow_label_present,
+        "hard_soft_deny_unmodified": bool(hard_soft_unmodified),
+        "classify_all_shell_enabled": classify_all_shell_ok,
+    },
+    "digests": {
+        "auto_mode_defaults_digest": defaults_digest,
+        "effective_config_digest": config_digest,
+    },
+    "fail_closed_reasons": reasons,
+}
+print(json.dumps(result))
+sys.exit(0 if ok else 8)
+PYEOF
+  rc=$?
+  rm -f "$defaults_tmp" "$config_tmp"
+  return "$rc"
+}
 
 # --- Canonical path safety check ---
 #

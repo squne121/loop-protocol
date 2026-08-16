@@ -188,10 +188,14 @@ def _write_executable(path: Path, source: str) -> Path:
 
 
 def _canonical_prefix(tmp_path: Path) -> list[str]:
-    """launcher が最終 invocation の先頭に必ず付与する canonical flag 5 トークン分
-    （`--strict-mcp-config --mcp-config <path> --settings <path>`）を、テストが
-    使う CLAUDE_GPT_HOME から独立に計算する（lib.sh の
+    """launcher が最終 invocation の先頭に必ず付与する canonical flag 7 トークン分
+    （`--strict-mcp-config --mcp-config <path> --settings <path> --permission-mode auto`）
+    を、テストが使う CLAUDE_GPT_HOME から独立に計算する（lib.sh の
     claude_gpt_mcp_config_path / claude_gpt_session_settings_path と同一規則）。
+
+    Issue #2203（2026-08-16 OWNER adversarial review 反映, Scope Delta）で
+    launcher が exactly one の `--permission-mode auto` を注入する契約が加わり、
+    canonical prefix は 5 トークンから 7 トークンへ拡張された。
     """
     claude_config_dir = tmp_path / "claude-gpt-home" / "claude"
     mcp_config_path = claude_config_dir / "mcp-empty.json"
@@ -202,6 +206,8 @@ def _canonical_prefix(tmp_path: Path) -> list[str]:
         str(mcp_config_path),
         "--settings",
         str(settings_path),
+        "--permission-mode",
+        "auto",
     ]
 
 
