@@ -143,7 +143,9 @@ class TestCanonicalProducerToConsumerProvenanceE2E:
                 "body_update": {
                     "attempted": True,
                     "status": "ok",
-                    "remote_current_body_sha256": f"sha256:{hashlib.sha256(candidate_body.encode('utf-8')).hexdigest()}",
+                    "remote_current_body_sha256": (
+                        f"sha256:{hashlib.sha256(candidate_body.encode('utf-8')).hexdigest()}"
+                    ),
                 },
                 "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
             }
