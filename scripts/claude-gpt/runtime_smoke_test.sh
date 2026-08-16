@@ -6,6 +6,20 @@
 # Claude Code 本体を実際に非対話起動し、実際の `POST /v1/messages` 成功・deterministic
 # response marker・安全な Bash tool 呼び出し・SubAgent（Task tool）呼び出しを実機確認する。
 #
+# Issue #2204 PR #2205 OWNER REQUEST_CHANGES（iteration 2, P0-2/P0-1/P1-1/P1-2）反映:
+#   - transport 判定を grep tail -n1 のファイル全体単純一致から、構造化ログを
+#     `transport_log.py` で厳密パースし reqId 相関する方式へ置き換えた（各 step ごとに
+#     started_count>=1・websocket_count==0・auto_count==0・unknown_count==0・全 request の
+#     response 相関確認を fail-closed で必須化する）。
+#   - proxy 実行バイナリと本スクリプト自身の sha256 を証跡へ追加した（P1-1 の
+#     identity pinning。exact v0.1.34 source では configured transport がそのまま
+#     HTTP dispatch へ対応することを前提とする）。
+#   - `git_dirty == false` を PASS 条件に追加した（dirty worktree での live smoke は
+#     現行 head の統合状態を証明しない）。
+#   - `proxy_cleanup_ok_launcher_reported`（launcher 自己申告）と、PID/listen socket の
+#     独立再検証（`pid_absent_all` / `socket_absent_all`）を別フィールドとして分離した
+#     （P1-2。従来は同一集約値のエイリアスだった）。
+#
 # `raine/claude-code-proxy` または ChatGPT subscription 認証が利用不能な環境では、
 # exit code 77 で SKIP を返す（SKIP を PASS に昇格しない。fallback 実行や擬似成功判定は行わない）。
 #
@@ -27,21 +41,26 @@ EVIDENCE_DIR=$(claude_gpt_evidence_dir "$SELF_PATH")
 mkdir -p "$EVIDENCE_DIR"
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
 EVIDENCE_FILE="${EVIDENCE_DIR}/smoke-${TIMESTAMP}.json"
+TRANSPORT_LOG_PARSER="$SCRIPT_DIR/transport_log.py"
 
 # --- SUT (System Under Test) provenance（PR #2162 敵対的レビュー対応: 実行元 worktree /
 #     commit / launcher スクリプト自体の同一性を証跡へ束縛し、stale worktree 実行事故を
-#     事後検出できるようにする）。proxy identity（absolute_path/version）も併せて記録する
-#     （P2 と共通）。 ---
+#     事後検出できるようにする）。proxy identity（absolute_path/version/sha256）と
+#     本スクリプト自身の sha256 も併せて記録する（Issue #2204 P1-1）。 ---
 SUT_REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)
 SUT_LAUNCHER_PATH="$SCRIPT_DIR/launch.sh"
+SUT_RUNTIME_SMOKE_PATH="$SCRIPT_DIR/runtime_smoke_test.sh"
 SUT_GIT_HEAD=$(claude_gpt_git_head "$SUT_REPO_ROOT")
 SUT_GIT_DIRTY=$(claude_gpt_git_dirty "$SUT_REPO_ROOT")
 SUT_LAUNCH_SH_SHA256=$(claude_gpt_sha256_file "$SCRIPT_DIR/launch.sh")
 SUT_LIB_SH_SHA256=$(claude_gpt_sha256_file "$SCRIPT_DIR/lib.sh")
+SUT_RUNTIME_SMOKE_SHA256=$(claude_gpt_sha256_file "$SUT_RUNTIME_SMOKE_PATH")
 SUT_PROXY_BIN=$(claude_gpt_resolve_proxy_bin)
 SUT_PROXY_VERSION="unknown"
+SUT_PROXY_SHA256="unknown"
 if [ -n "$SUT_PROXY_BIN" ]; then
   SUT_PROXY_VERSION=$(claude_gpt_proxy_version "$SUT_PROXY_BIN")
+  SUT_PROXY_SHA256=$(claude_gpt_sha256_file "$SUT_PROXY_BIN")
 fi
 if [ -z "$SUT_PROXY_BIN" ]; then
   SUT_PROXY_BIN="unknown"
@@ -56,10 +75,10 @@ if [ "$PREFLIGHT_ENV_RC" -eq 3 ] || [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
   if [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
     SKIP_REASON="chatgpt_subscription_auth_unavailable"
   fi
-  printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"skip","reason":"%s","preflight_env_only":%s,"generated_at":"%s","sut":{"launcher_path":"%s","repository_root":"%s","git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","lib_sh_sha256":"%s"},"proxy":{"absolute_path":"%s","version":"%s"}}\n' \
+  printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"skip","reason":"%s","preflight_env_only":%s,"generated_at":"%s","sut":{"launcher_path":"%s","repository_root":"%s","git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","lib_sh_sha256":"%s","runtime_smoke_sha256":"%s"},"proxy":{"absolute_path":"%s","version":"%s","sha256":"%s"}}\n' \
     "$SKIP_REASON" "$PREFLIGHT_ENV_JSON" "$TIMESTAMP" \
-    "$SUT_LAUNCHER_PATH" "$SUT_REPO_ROOT" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" \
-    "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" > "$EVIDENCE_FILE"
+    "$SUT_LAUNCHER_PATH" "$SUT_REPO_ROOT" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
+    "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" > "$EVIDENCE_FILE"
   echo "SKIP: ${SKIP_REASON} のため runtime smoke test を実行できません。証跡: ${EVIDENCE_FILE}"
   exit 77
 fi
@@ -109,12 +128,12 @@ fi
 #     2. Bash tool 経由の marker（実サブプロセス実行）
 #     3. Task tool 経由の canary SubAgent 呼び出し marker
 #   をそれぞれ出力させ、stdout から grep で確認する。
-#   実際の `POST /v1/messages` 成功は proxy の構造化ログ（request / codex_upstream_request_started
-#   / request_completed, status=200）から確認する（自己申告ではなく proxy 側の一次証跡）。
-#   configured transport が repository-owned policy（http 固定, Issue #2204）どおりに
-#   実際に使われたことは、同じ構造化ログの codex_upstream_request_started 行に含まれる
-#   transport フィールドが "http" であることから確認する（launcher が env に付与した
-#   自己申告値の再掲ではなく、proxy 側が実際に upstream へ送出した transport 値）。
+#   実際の `POST /v1/messages` 成功と configured transport の実値は、proxy の構造化ログ
+#   （codex_upstream_request_started / request_completed）を `transport_log.py` で
+#   reqId 相関しながら厳密パースして確認する（Issue #2204 P0-2。自己申告ではなく
+#   proxy 側の一次証跡。各 step ごとに fail-closed で判定し、1 request でも
+#   websocket/auto/unknown transport が観測されれば全体を FAIL とする — 従来の
+#   「1 回でも http が観測されれば PASS」という OR 判定は廃止した）。
 # =========================================================================
 TEXT_MARKER="CLAUDE_GPT_CANARY_TEXT_OK"
 BASH_MARKER="CLAUDE_GPT_CANARY_BASH_OK"
@@ -125,21 +144,52 @@ CANARY_AGENTS_JSON='{"canary":{"description":"canary smoke test subagent used on
 # --- 単一 turn に複数ステップを詰め込むと model が一部のツール呼び出しを省略する挙動が
 #     実機観測で確認されたため（PR #2162 実装セッション, 2026-08-14）、Bash tool /
 #     Task tool / plain text の 3 観点を独立した `-p` invocation に分割し、それぞれの
-#     proxy ログから一次証跡を確認する。合算判定は AND、http_post_confirmed は OR。 ---
+#     proxy ログから一次証跡を確認する。合算判定は AND（全 step かつ全 request が http
+#     confirmed であることを要求する。Issue #2204 iteration 2）。 ---
 
 RC_LAST=0
-HTTP_POST_CONFIRMED=false
-CODEX_TRANSPORT_HTTP_CONFIRMED=false
 MODEL_USED=""
 PROVIDER_USED=""
-CLEANUP_ALL_OK=true
+CLEANUP_LAUNCHER_REPORTED_ALL=true
+CLEANUP_PID_ABSENT_ALL=true
+CLEANUP_SOCKET_ABSENT_ALL=true
+
+# --- 全 step を横断した transport 判定の集計（Issue #2204 iteration 2 P0-2）。
+#     各 step の transport_log.py 判定結果を AND で合成し、requests[] を連結する。 ---
+TRANSPORT_ALL_OK=true
+TRANSPORT_STARTED_TOTAL=0
+TRANSPORT_HTTP_TOTAL=0
+TRANSPORT_WEBSOCKET_TOTAL=0
+TRANSPORT_AUTO_TOTAL=0
+TRANSPORT_UNKNOWN_TOTAL=0
+TRANSPORT_MALFORMED_TOTAL=0
+REQUESTS_JSON_PARTS=""
+
+# --- 実 claude-code-proxy 構造化ログの実パス（Issue #2204 iteration 2 P0-2 再検証で判明）。
+#     `CLAUDE_GPT_PROXY_LOG`（launch.sh が env -i 起動時に生成する stdout/stderr 捕捉先）
+#     は起動バナー等の非 JSON 行を含む上、構造化 JSON イベント（"request" /
+#     "codex_upstream_request_started" / "request_completed"）そのものではない。
+#     実際の構造化 JSONL は `claude-code-proxy serve` が独自に
+#     `<XDG_STATE_HOME>/claude-code-proxy/proxy.log`（= `claude_gpt_proxy_state_dir`
+#     配下の固定パス）へ書き出す。このファイルは launcher 起動ごとの一意ファイルではなく
+#     `CLAUDE_GPT_HOME` 単位で累積・追記される長寿命ログのため、各 step の判定は
+#     step 実行前のバイトオフセットを記録し、実行後にその差分（このステップ内で新規に
+#     追記された行のみ）を切り出して渡す（過去の別 run・別 step のイベントを誤って
+#     相関しないようにするため）。 ---
+STRUCTURED_PROXY_LOG_PATH="$(claude_gpt_proxy_state_dir)/claude-code-proxy/proxy.log"
 
 run_convo_step() {
-  step_prompt="$1"
-  step_allowed_tools="$2"
-  step_agents_json="$3"
+  step_name="$1"
+  step_prompt="$2"
+  step_allowed_tools="$3"
+  step_agents_json="$4"
   step_stdout_file=$(mktemp)
   step_stderr_file=$(mktemp)
+
+  step_log_offset_before=0
+  if [ -f "$STRUCTURED_PROXY_LOG_PATH" ]; then
+    step_log_offset_before=$(wc -c < "$STRUCTURED_PROXY_LOG_PATH" 2>/dev/null || echo 0)
+  fi
 
   if [ -n "$step_agents_json" ] && [ -n "$step_allowed_tools" ]; then
     "$SCRIPT_DIR/launch.sh" -- -p "$step_prompt" --output-format text --no-session-persistence \
@@ -162,42 +212,82 @@ run_convo_step() {
   STEP_PROXY_PID=$(printf '%s\n' "$STEP_STDERR" | grep '^CLAUDE_GPT_PROXY_PID=' | tail -n1 | cut -d= -f2-)
   STEP_CLEANUP_OK=$(printf '%s\n' "$STEP_STDERR" | grep '^CLAUDE_GPT_PROXY_CLEANUP_OK=' | tail -n1 | cut -d= -f2-)
 
-  STEP_HTTP_OK=false
-  if [ -n "$STEP_PROXY_LOG" ] && [ -f "$STEP_PROXY_LOG" ]; then
-    if grep -q '"path":"/v1/messages"' "$STEP_PROXY_LOG" 2>/dev/null \
-      && grep -q '"msg":"request_completed"' "$STEP_PROXY_LOG" 2>/dev/null \
-      && grep -q '"status":200' "$STEP_PROXY_LOG" 2>/dev/null; then
-      STEP_HTTP_OK=true
-      MODEL_USED=$(grep -o '"model":"[^"]*"' "$STEP_PROXY_LOG" 2>/dev/null | head -n1 | cut -d: -f2 | tr -d '"')
-      PROVIDER_USED=$(grep -o '"provider":"[^"]*"' "$STEP_PROXY_LOG" 2>/dev/null | head -n1 | cut -d: -f2 | tr -d '"')
-      HTTP_POST_CONFIRMED=true
+  # --- transport / http 判定を transport_log.py へ委譲する（Issue #2204 P0-2）。
+  #     STRUCTURED_PROXY_LOG_PATH のこの step 内で新規追記された分だけを切り出して渡す。
+  #     ログが存在しない・パーサ自体が失敗した場合も fail-closed（TRANSPORT_ALL_OK=false）。 ---
+  STEP_TRANSPORT_JSON='{"ok":false,"reason":"structured_log_missing","transport":{"started_count":0,"http_count":0,"websocket_count":0,"auto_count":0,"unknown_count":0},"requests":[]}'
+  step_structured_slice=$(mktemp)
+  if [ -f "$STRUCTURED_PROXY_LOG_PATH" ]; then
+    tail -c "+$((step_log_offset_before + 1))" "$STRUCTURED_PROXY_LOG_PATH" > "$step_structured_slice" 2>/dev/null
+    STEP_TRANSPORT_JSON=$(python3 "$TRANSPORT_LOG_PARSER" "$step_structured_slice" 2>/dev/null)
+    if [ -z "$STEP_TRANSPORT_JSON" ]; then
+      STEP_TRANSPORT_JSON='{"ok":false,"reason":"parser_produced_no_output","transport":{"started_count":0,"http_count":0,"websocket_count":0,"auto_count":0,"unknown_count":0},"requests":[]}'
     fi
-    # --- Codex transport の一次証跡確認（Issue #2204）。proxy が Codex backend への
-    #     upstream request を開始したことを示す構造化ログ行を抽出し、その行自身が
-    #     transport フィールド "http" を含むことを確認する（同一行内での key 共起の
-    #     みを一致条件とし、ファイル全体での "http" 単純一致は使わない）。launcher
-    #     自身が付与した env の自己申告ではなく、proxy 側が実際に選択した transport を
-    #     一次証跡として確認する。 ---
-    STEP_TRANSPORT_LINE=$(grep '"msg":"codex_upstream_request_started"' "$STEP_PROXY_LOG" 2>/dev/null | tail -n1)
-    if [ -n "$STEP_TRANSPORT_LINE" ]; then
-      case "$STEP_TRANSPORT_LINE" in
-        *'"transport":"http"'*)
-          CODEX_TRANSPORT_HTTP_CONFIRMED=true
-          ;;
-      esac
+    if [ -z "$MODEL_USED" ]; then
+      MODEL_USED=$(grep -o '"model":"[^"]*"' "$step_structured_slice" 2>/dev/null | head -n1 | cut -d: -f2 | tr -d '"')
+      PROVIDER_USED=$(grep -o '"provider":"[^"]*"' "$step_structured_slice" 2>/dev/null | head -n1 | cut -d: -f2 | tr -d '"')
+    fi
+  fi
+  rm -f "$step_structured_slice"
+
+  STEP_TRANSPORT_OK=$(printf '%s' "$STEP_TRANSPORT_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("true" if d.get("ok") else "false")' 2>/dev/null || echo false)
+  if [ "$STEP_TRANSPORT_OK" != "true" ]; then
+    TRANSPORT_ALL_OK=false
+  fi
+
+  STEP_COUNTS=$(printf '%s' "$STEP_TRANSPORT_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+t = d.get("transport", {})
+malformed = d.get("malformed_line_count", 0)
+print(t.get("started_count", 0), t.get("http_count", 0), t.get("websocket_count", 0), t.get("auto_count", 0), t.get("unknown_count", 0), malformed)
+' 2>/dev/null || echo "0 0 0 0 0 0")
+  STEP_STARTED=$(printf '%s' "$STEP_COUNTS" | cut -d' ' -f1)
+  STEP_HTTP=$(printf '%s' "$STEP_COUNTS" | cut -d' ' -f2)
+  STEP_WS=$(printf '%s' "$STEP_COUNTS" | cut -d' ' -f3)
+  STEP_AUTO=$(printf '%s' "$STEP_COUNTS" | cut -d' ' -f4)
+  STEP_UNKNOWN=$(printf '%s' "$STEP_COUNTS" | cut -d' ' -f5)
+  STEP_MALFORMED=$(printf '%s' "$STEP_COUNTS" | cut -d' ' -f6)
+
+  TRANSPORT_STARTED_TOTAL=$((TRANSPORT_STARTED_TOTAL + STEP_STARTED))
+  TRANSPORT_HTTP_TOTAL=$((TRANSPORT_HTTP_TOTAL + STEP_HTTP))
+  TRANSPORT_WEBSOCKET_TOTAL=$((TRANSPORT_WEBSOCKET_TOTAL + STEP_WS))
+  TRANSPORT_AUTO_TOTAL=$((TRANSPORT_AUTO_TOTAL + STEP_AUTO))
+  TRANSPORT_UNKNOWN_TOTAL=$((TRANSPORT_UNKNOWN_TOTAL + STEP_UNKNOWN))
+  TRANSPORT_MALFORMED_TOTAL=$((TRANSPORT_MALFORMED_TOTAL + STEP_MALFORMED))
+
+  STEP_REQUESTS_ANNOTATED=$(printf '%s' "$STEP_TRANSPORT_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+step = sys.argv[1]
+out = []
+for r in d.get("requests", []):
+    r = dict(r)
+    r["step"] = step
+    out.append(r)
+print(json.dumps(out))
+' "$step_name" 2>/dev/null || echo "[]")
+  if [ "$STEP_REQUESTS_ANNOTATED" != "[]" ]; then
+    inner=$(printf '%s' "$STEP_REQUESTS_ANNOTATED" | sed -e 's/^\[//' -e 's/\]$//')
+    if [ -n "$inner" ]; then
+      if [ -n "$REQUESTS_JSON_PARTS" ]; then
+        REQUESTS_JSON_PARTS="${REQUESTS_JSON_PARTS},${inner}"
+      else
+        REQUESTS_JSON_PARTS="$inner"
+      fi
     fi
   fi
 
   if [ -n "$STEP_PROXY_PID" ]; then
     if kill -0 "$STEP_PROXY_PID" 2>/dev/null; then
-      CLEANUP_ALL_OK=false
+      CLEANUP_PID_ABSENT_ALL=false
     fi
     if ss -ltnp 2>/dev/null | grep -q "pid=${STEP_PROXY_PID},"; then
-      CLEANUP_ALL_OK=false
+      CLEANUP_SOCKET_ABSENT_ALL=false
     fi
   fi
   if [ "$STEP_CLEANUP_OK" != "true" ]; then
-    CLEANUP_ALL_OK=false
+    CLEANUP_LAUNCHER_REPORTED_ALL=false
   fi
 
   RC_LAST=$STEP_RC
@@ -212,7 +302,7 @@ BASH_RC=1
 bash_attempt=0
 while [ "$bash_attempt" -lt 3 ]; do
   bash_attempt=$((bash_attempt + 1))
-  run_convo_step "You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Bash tool right now (an actual tool call, not a description) to run exactly: echo ${BASH_MARKER}
+  run_convo_step "bash" "You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Bash tool right now (an actual tool call, not a description) to run exactly: echo ${BASH_MARKER}
 Then print its real stdout output verbatim on its own line." "Bash(echo *)" ""
   BASH_STDOUT="$STEP_STDOUT"
   BASH_RC="$STEP_RC"
@@ -221,11 +311,25 @@ Then print its real stdout output verbatim on its own line." "Bash(echo *)" ""
   esac
 done
 
-run_convo_step "You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Task tool right now (an actual tool call, not a description) to launch the subagent named canary with any instructions, then print its exact output verbatim." "Task" "$CANARY_AGENTS_JSON"
-SUBAGENT_STDOUT="$STEP_STDOUT"
-SUBAGENT_RC="$STEP_RC"
+# SubAgent canary も Bash canary と同様の実機観測された non-determinism（model が
+# tool 呼び出し自体は行うが、最終応答に SubAgent 出力を verbatim で反映し損ねる挙動）が
+# 生じうるため、marker 未検出時のみ bounded retry する（最大 3 回。fallback や
+# 擬似成功判定は行わない — 毎回実際に Task tool を再試行する。Issue #2204 iteration 2
+# 実機再検証, 2026-08-16）。
+SUBAGENT_STDOUT=""
+SUBAGENT_RC=1
+subagent_attempt=0
+while [ "$subagent_attempt" -lt 3 ]; do
+  subagent_attempt=$((subagent_attempt + 1))
+  run_convo_step "subagent" "You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Task tool right now (an actual tool call, not a description) to launch the subagent named canary with any instructions, then print its exact output verbatim." "Task" "$CANARY_AGENTS_JSON"
+  SUBAGENT_STDOUT="$STEP_STDOUT"
+  SUBAGENT_RC="$STEP_RC"
+  case "$SUBAGENT_STDOUT" in
+    *"$SUBAGENT_MARKER"*) break ;;
+  esac
+done
 
-run_convo_step "You are running inside an automated, non-interactive runtime smoke test with no real user present. Print exactly the following text and nothing else: ${TEXT_MARKER}" "" ""
+run_convo_step "text" "You are running inside an automated, non-interactive runtime smoke test with no real user present. Print exactly the following text and nothing else: ${TEXT_MARKER}" "" ""
 TEXT_STDOUT="$STEP_STDOUT"
 TEXT_RC="$STEP_RC"
 
@@ -244,11 +348,27 @@ case "$SUBAGENT_STDOUT" in
   *"$SUBAGENT_MARKER"*) SUBAGENT_MARKER_OK=true ;;
 esac
 
-CONVO_CLEANUP_OK="$CLEANUP_ALL_OK"
-CLEANUP_INDEPENDENT_OK="$CLEANUP_ALL_OK"
+# --- SubAgent lifecycle 一次証跡（Issue #2204 P0-3。部分対応 — Gap は PR body に明記する）:
+#     現時点では標準出力 marker 検出のみを一次証跡とする。SubagentStart/SubagentStop hook
+#     JSON との対応・複数 SubAgent 同時実行・同一 session 内複数 turn・session-log
+#     metadata の確認は、`worktree-agent-runtime-smoke` skill 側の live authenticated
+#     session 経由でのみ実施可能であり、本 launcher 単体スクリプトの scope 外として
+#     gap のまま残す（PR body Gap セクション参照）。 ---
+SUBAGENT_LIFECYCLE_VERIFIED=false
+
+CONVO_CLEANUP_OK="$CLEANUP_LAUNCHER_REPORTED_ALL"
+CLEANUP_INDEPENDENT_OK=true
+if [ "$CLEANUP_PID_ABSENT_ALL" != "true" ] || [ "$CLEANUP_SOCKET_ABSENT_ALL" != "true" ]; then
+  CLEANUP_INDEPENDENT_OK=false
+fi
 CONVO_RC=0
 if [ "$BASH_RC" -ne 0 ] || [ "$SUBAGENT_RC" -ne 0 ] || [ "$TEXT_RC" -ne 0 ]; then
   CONVO_RC=1
+fi
+
+GIT_DIRTY_OK=false
+if [ "$SUT_GIT_DIRTY" = "false" ]; then
+  GIT_DIRTY_OK=true
 fi
 
 RUNTIME_CONVERSATION_OK=false
@@ -256,10 +376,10 @@ if [ "$CONVO_RC" -eq 0 ] \
   && [ "$TEXT_MARKER_OK" = "true" ] \
   && [ "$BASH_MARKER_OK" = "true" ] \
   && [ "$SUBAGENT_MARKER_OK" = "true" ] \
-  && [ "$HTTP_POST_CONFIRMED" = "true" ] \
-  && [ "$CODEX_TRANSPORT_HTTP_CONFIRMED" = "true" ] \
+  && [ "$TRANSPORT_ALL_OK" = "true" ] \
   && [ "$CONVO_CLEANUP_OK" = "true" ] \
-  && [ "$CLEANUP_INDEPENDENT_OK" = "true" ]; then
+  && [ "$CLEANUP_INDEPENDENT_OK" = "true" ] \
+  && [ "$GIT_DIRTY_OK" = "true" ]; then
   RUNTIME_CONVERSATION_OK=true
 fi
 
@@ -276,9 +396,12 @@ json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
 }
 
+REQUESTS_JSON_ARRAY="[${REQUESTS_JSON_PARTS}]"
+
 cat > "$EVIDENCE_FILE" <<EVIDENCE_JSON_EOF
 {
   "schema": "CLAUDE_GPT_SMOKE_RESULT_V1",
+  "schema_version": 2,
   "status": "${STATUS}",
   "generated_at": "${TIMESTAMP}",
   "sut": {
@@ -287,11 +410,13 @@ cat > "$EVIDENCE_FILE" <<EVIDENCE_JSON_EOF
     "git_head": "${SUT_GIT_HEAD}",
     "git_dirty": "${SUT_GIT_DIRTY}",
     "launch_sh_sha256": "${SUT_LAUNCH_SH_SHA256}",
-    "lib_sh_sha256": "${SUT_LIB_SH_SHA256}"
+    "lib_sh_sha256": "${SUT_LIB_SH_SHA256}",
+    "runtime_smoke_sha256": "${SUT_RUNTIME_SMOKE_SHA256}"
   },
   "proxy": {
     "absolute_path": "$(json_escape "$SUT_PROXY_BIN")",
-    "version": "$(json_escape "$SUT_PROXY_VERSION")"
+    "version": "$(json_escape "$SUT_PROXY_VERSION")",
+    "sha256": "${SUT_PROXY_SHA256}"
   },
   "runtime_environment": {
     "not_root_ok": ${NOT_ROOT_OK},
@@ -306,18 +431,38 @@ cat > "$EVIDENCE_FILE" <<EVIDENCE_JSON_EOF
     "mcp_config_path": "${MCP_CONFIG_PATH}",
     "launch_result": ${LAUNCH_JSON}
   },
+  "transport": {
+    "ok": ${TRANSPORT_ALL_OK},
+    "started_count": ${TRANSPORT_STARTED_TOTAL},
+    "http_count": ${TRANSPORT_HTTP_TOTAL},
+    "websocket_count": ${TRANSPORT_WEBSOCKET_TOTAL},
+    "auto_count": ${TRANSPORT_AUTO_TOTAL},
+    "unknown_count": ${TRANSPORT_UNKNOWN_TOTAL},
+    "malformed_line_count": ${TRANSPORT_MALFORMED_TOTAL}
+  },
+  "requests": ${REQUESTS_JSON_ARRAY},
+  "subagents": {
+    "marker_ok": ${SUBAGENT_MARKER_OK},
+    "lifecycle_verified": ${SUBAGENT_LIFECYCLE_VERIFIED},
+    "note": "SubagentStart/SubagentStop hook pairing・複数 SubAgent 同時実行・session-log metadata 確認は本スクリプトの scope 外（worktree-agent-runtime-smoke 経由の別途実施が必要。PR body Gap 参照）"
+  },
   "runtime_conversation_check": {
     "ok": ${RUNTIME_CONVERSATION_OK},
     "claude_exit_code": ${CONVO_RC},
     "text_marker_ok": ${TEXT_MARKER_OK},
     "bash_tool_marker_ok": ${BASH_MARKER_OK},
     "subagent_marker_ok": ${SUBAGENT_MARKER_OK},
-    "http_post_v1_messages_confirmed": ${HTTP_POST_CONFIRMED},
-    "codex_upstream_transport_http_confirmed": ${CODEX_TRANSPORT_HTTP_CONFIRMED},
+    "http_post_v1_messages_confirmed": ${TRANSPORT_ALL_OK},
+    "codex_upstream_transport_http_confirmed": ${TRANSPORT_ALL_OK},
     "model_used": "$(json_escape "$MODEL_USED")",
     "provider_used": "$(json_escape "$PROVIDER_USED")",
-    "proxy_cleanup_ok_launcher_reported": ${CONVO_CLEANUP_OK:-false},
-    "proxy_cleanup_ok_independent_reverify": ${CLEANUP_INDEPENDENT_OK}
+    "git_dirty_ok": ${GIT_DIRTY_OK}
+  },
+  "cleanup": {
+    "launcher_reported": ${CLEANUP_LAUNCHER_REPORTED_ALL},
+    "pid_absent": ${CLEANUP_PID_ABSENT_ALL},
+    "socket_absent": ${CLEANUP_SOCKET_ABSENT_ALL},
+    "herdr_session_absent": "not_verified"
   }
 }
 EVIDENCE_JSON_EOF
@@ -325,7 +470,7 @@ EVIDENCE_JSON_EOF
 if [ "$STATUS" = "pass" ]; then
   echo "PASS: claude-gpt launcher runtime smoke test（構造確認 + 対話 runtime 確認）が成功しました。証跡: ${EVIDENCE_FILE}"
 else
-  echo "FAIL: claude-gpt launcher runtime smoke test が失敗しました（structural_ok=${STRUCTURAL_OK}, runtime_conversation_ok=${RUNTIME_CONVERSATION_OK}）。証跡: ${EVIDENCE_FILE}"
+  echo "FAIL: claude-gpt launcher runtime smoke test が失敗しました（structural_ok=${STRUCTURAL_OK}, runtime_conversation_ok=${RUNTIME_CONVERSATION_OK}, transport_ok=${TRANSPORT_ALL_OK}, git_dirty_ok=${GIT_DIRTY_OK}）。証跡: ${EVIDENCE_FILE}"
 fi
 
 exit "$EXIT_CODE"
