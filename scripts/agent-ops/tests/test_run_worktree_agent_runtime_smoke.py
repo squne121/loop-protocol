@@ -846,6 +846,27 @@ case "$1" in
       read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
     esac
     ;;
+  api)
+    case "$2" in
+      snapshot)
+        # Issue #2174 AC7: deterministic, unchanging workspace/agent/focus
+        # snapshot -- the same content on every call means before/after
+        # comparisons in the runner under test always observe zero drift.
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
 esac
 exit 0
 """
@@ -1090,7 +1111,7 @@ def test_given_first_candidate_collides_when_new_session_name_generated_then_ret
         calls["n"] += 1
         return _FakeUUID("1" * 32 if calls["n"] == 1 else "2" * 32)
 
-    def fake_names(_herdr_bin):
+    def fake_names(_herdr_bin, env=None):
         return {taken}
 
     monkeypatch.setattr(module.uuid, "uuid4", fake_uuid4)
@@ -1103,7 +1124,7 @@ def test_given_first_candidate_collides_when_new_session_name_generated_then_ret
 
 def test_given_collision_check_cannot_enumerate_sessions_when_generating_name_then_hard_error(monkeypatch):
     module = _load_module()
-    monkeypatch.setattr(module, "_herdr_session_names", lambda _herdr_bin: None)
+    monkeypatch.setattr(module, "_herdr_session_names", lambda _herdr_bin, env=None: None)
     with pytest.raises(module.HerdrLaneError):
         module.new_isolated_session_name("herdr")
 
@@ -1176,6 +1197,15 @@ case "$1" in
       get) echo '{"state":"done"}'; exit 0 ;;
       explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
       read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
+    esac
+    ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
     esac
     ;;
 esac
@@ -1330,6 +1360,15 @@ case "$1" in
       read) echo "pane transcript"; exit 0 ;;
     esac
     ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
 esac
 exit 0
 """ % (get_call_log,)
@@ -1415,6 +1454,15 @@ case "$1" in
       get) echo '{"state":"done"}'; exit 0 ;;
       explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
       read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
+    esac
+    ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
     esac
     ;;
 esac
