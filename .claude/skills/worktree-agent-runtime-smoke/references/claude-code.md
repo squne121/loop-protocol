@@ -215,14 +215,54 @@ claude -p --output-format stream-json --include-hook-events \
 （`count_claude_stream_turns()`）が `min_turns` 以上であること、の両方を要求する。
 どちらか一方でも欠けると `verified: False`（fail-closed）。
 
-設計判断（選択肢 A 採用の理由）: Issue #2219 は「interactive herdr lane に
-`--additional-prompt` 相当のフラグを再実装する」選択肢 B（PR #2176 が prototype し、
-commit `5a44ebf0`/`06d8baa9` でスコープ外として revert 済み）を第一候補として挙げていた。
-しかし structured lane の既存 `--max-turns` は、単一プロセス・単一 `session_id` の
-まま複数 turn の agentic loop を既に実行しており、これは「同一 session identity の
-まま複数 turn」という AC2 の要求をそのまま満たす。選択肢 B（interactive lane への
-機能追加）を実装するコストは、500 行超の `run_interactive_herdr_isolated` を変更する
-リスクを伴う一方、追加で得られる evidentiary 価値は限定的と判断し、選択肢 A を採用した。
+設計判断（fix_delta iteration 1、pr-reviewer REQUEST_CHANGES、PR #2222 で改訂）:
+初回実装は選択肢 A のみを採用し、Issue #2219 が第一候補として挙げていた選択肢 B
+（interactive herdr lane への `--additional-prompt` 相当フラグの再実装、PR #2176 が
+commit `06d8baa9` で prototype し、Issue #2174 のスコープ外として commit `5a44ebf0`
+で revert 済み）を試みていなかった。この revert はスコープ判断であり技術的な却下では
+ないため、fix_delta iteration 1 で選択肢 B を Issue #2219 の scope で再実装し、
+選択肢 A/B の両方を利用可能にした。structured lane は引き続き選択肢 A
+（`--max-turns` が駆動する単一 session 内 agentic loop）を使う。interactive lane は
+選択肢 B（`--additional-prompt`）を使い、下記「interactive lane の同一 session
+multi-turn（`--additional-prompt`、選択肢 B）」で詳細を説明する。
+
+### interactive lane の同一 session multi-turn（`--additional-prompt`、選択肢 B）
+
+`run_interactive_herdr_isolated()` は既に起動済みの、単一の herdr
+`session_name`/`agent_name`（関数内のローカル変数として一度だけ生成され、
+この関数全体のライフサイクルを通して同じ値のまま使われる）に対して、初回
+`--prompt-file` の turn に続けて `--additional-prompt`（repeatable）で指定した
+追加 turn を、既存の `_send_prompt_turn()`（stall-recovery 込みの send/wait
+helper。初回 turn と完全に同じロジック）で順次送信する。`evidence["turns_completed"]`
+は実際に settle した turn 数（初回 + 追加）を記録する。
+
+interactive lane には structured lane の `--output-format stream-json` に相当する
+native stdout イベントストリームが存在しない（TUI の pane transcript は plain text
+であり、hook イベントの JSON 形状を確実に判別できない）。しかし interactive lane は
+`--no-session-persistence` を forward しない（structured-only flag、AC5）ため、
+Claude Code は通常どおりこの run 自身の session transcript を
+`~/.claude/projects/<cwd-slug>/<session_id>.jsonl` へ永続化する。この transcript は
+structured lane の stdout と同じ stream-json イベント形状（`session_id`/`sessionId`、
+`type: "assistant"`、`tool_use_result.agentId`/`agentType`）を持つ。
+
+`_find_claude_interactive_transcript(worktree, since_epoch)` は
+`~/.claude/projects/*/*.jsonl` を走査し、（1）mtime が `since_epoch`（run 開始直前に
+記録）以降であること、（2）ファイル先頭行の `cwd` フィールドが `worktree` と厳密一致
+することの両方を満たすファイルを content-linked に特定する（filename からの推測では
+ない）。一致するファイルが複数ある場合は最も新しい mtime のものを採用し、1 件も
+見つからない場合は `None`（`interactive_transcript_found: False`）を返す -- 推測しない。
+
+この transcript のテキストを、structured lane と全く同じ
+`classify_claude_multi_child_lifecycle()` / `verify_same_main_session_across_turns()`
+/ `verify_no_forbidden_marker()` へそのまま渡す。Option A 用に実装したこれらの関数を
+Option B の共有 building block として再利用しており、別ロジックを再発明していない。
+transcript が見つからない場合は空文字列を渡すため、`--require-min-turns` /
+`--require-min-subagents` が指定されていれば fail-closed に FAIL する。
+
+`--require-min-turns` を interactive mode で指定する場合、`--max-turns`（structured
+lane 専用で interactive lane には forward されない）ではなく、`1 +
+len(--additional-prompt)` がその値以上であることが起動前に `parser.error` で
+validate される。
 
 ### 複数 SubAgent の spawn/completion 証明（`--require-min-subagents`）
 

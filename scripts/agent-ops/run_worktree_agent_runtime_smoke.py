@@ -1807,22 +1807,31 @@ def verify_same_main_session_across_turns(stdout: str, min_turns: int) -> dict:
     """Fail-closed proof that the SAME main session_id persisted across at
     least ``min_turns`` agentic-loop turns (Issue #2219 AC2).
 
-    Design choice (documented per the Issue's own two-option framing):
-    Option A -- a single ``claude -p --output-format stream-json
-    --max-turns >= min_turns`` invocation's own internal agentic loop,
-    verified via the native ``session_id`` field that is already present
-    on every stream-json event. Option B (re-implementing an
-    ``--additional-prompt``-like flag for the interactive herdr lane, as
-    PR #2176 prototyped and then reverted for scope reasons -- commits
-    5a44ebf0 / 06d8baa9) was NOT taken for this iteration: the structured
-    lane's existing ``--max-turns`` flag already drives Claude Code's own
-    multi-turn agentic loop within one process/one session, which is
-    exactly "same session identity across >= 2 turns" -- re-implementing a
-    second, interactive-lane-only multi-turn mechanism on top of that
-    would duplicate an existing, already-verifiable capability and touch
-    the large (500+ line) ``run_interactive_herdr_isolated`` interactive
-    lane for no additional evidentiary value for this AC. See the PR body
-    for the full reasoning trail.
+    Design choice (documented per the Issue's own two-option framing, and
+    revised by fix_delta iteration 1 -- pr-reviewer REQUEST_CHANGES,
+    https://github.com/squne121/loop-protocol/pull/2222): this function is
+    Option A's own primitive -- a single ``claude -p --output-format
+    stream-json --max-turns >= min_turns`` invocation's own internal
+    agentic loop, verified via the native ``session_id`` field that is
+    already present on every stream-json event -- and remains the
+    structured lane's wiring. Iteration 1's OWNER decision procedure
+    (Issue #2219 body) required attempting Option B FIRST (re-implementing
+    an ``--additional-prompt``-like flag for the interactive herdr lane,
+    as PR #2176 prototyped in commit 06d8baa9 and reverted in commit
+    5a44ebf0 -- a SCOPE decision for Issue #2174, not a technical
+    rejection) before falling back to Option A; the prior iteration
+    skipped that attempt and was rejected. Option B is now ALSO
+    implemented (``run_interactive_herdr_isolated``'s ``additional_prompts``
+    parameter, driven by the new ``--additional-prompt`` CLI flag) and
+    reuses THIS SAME function as a shared building block: the interactive
+    lane's own persisted session transcript (see
+    ``_find_claude_interactive_transcript`` -- the interactive lane never
+    passes ``--no-session-persistence``, so Claude Code persists it) is
+    fed into this function exactly like structured-lane stdout is, so
+    "same session identity across >= 2 turns" is verified identically
+    across both lanes. Both A and B remain available; the structured
+    lane's ``--require-min-turns``/``--max-turns`` combination still
+    exercises Option A's own agentic-loop path unchanged.
 
     Returns ``{"verified": bool, "turn_count": int, "session_ids_observed":
     list[str], "lane": "option_a_single_invocation_agentic_loop"}``.
@@ -1988,6 +1997,75 @@ def extract_claude_child_session_id(
             if match:
                 return match.group(1)
         return None
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2219 fix_delta iteration 1 (Option B reintroduction): the interactive
+# herdr lane has no native ``--output-format stream-json`` stdout stream (see
+# ``run_interactive_herdr_isolated``'s own AC5 note -- structured-only flags
+# are never forwarded to the TUI launch). It DOES, however, never pass
+# ``--no-session-persistence`` (that flag is structured-lane only), so Claude
+# Code persists this run's own session transcript to the same
+# ``~/.claude/projects/<cwd-slug>/<session_id>.jsonl`` file used elsewhere in
+# this module (see ``extract_claude_child_session_id``'s fallback path) --
+# containing the SAME stream-json event shapes (``session_id``/``sessionId``,
+# ``type: "assistant"``, ``tool_use_result.agentId``/``agentType``) that the
+# structured lane's Option A functions (``extract_claude_stream_session_ids``,
+# ``count_claude_stream_turns``, ``verify_same_main_session_across_turns``,
+# ``classify_claude_multi_child_lifecycle``) already parse. Locating and
+# reading this persisted transcript is therefore the wiring point that lets
+# the interactive lane reuse those exact functions as shared building blocks
+# instead of re-deriving equivalent logic for a pane-text transcript (which
+# cannot reliably distinguish a genuine multi-agent hook event from ordinary
+# TUI prose -- see the existing documented ``spawn_events: None`` gap for
+# this lane).
+# ---------------------------------------------------------------------------
+
+
+def _find_claude_interactive_transcript(worktree: str, since_epoch: float) -> Path | None:
+    """Best-effort, content-linked (never filename-guessed) locate of the
+    persisted Claude Code session transcript this interactive-lane run
+    itself wrote, by scanning every ``~/.claude/projects/*/*.jsonl`` file
+    for one whose (a) mtime is at or after ``since_epoch`` (a small 2s grace
+    window absorbs clock/flush skew) and (b) own first-line-derived ``cwd``
+    field equals ``worktree`` exactly -- so a concurrent or leftover session
+    for a DIFFERENT worktree can never be mistaken for this run's own
+    transcript. When multiple candidates match (e.g. a stale file from an
+    earlier run against the same worktree that happens to satisfy the mtime
+    window), the most recently modified one is returned. Returns ``None``
+    (never a guess) if no matching file is found or the scan itself fails
+    (missing ``~/.claude/projects`` directory, permission error, etc.)."""
+    try:
+        projects_dir = Path.home() / ".claude" / "projects"
+        if not projects_dir.is_dir():
+            return None
+        best: tuple[float, Path] | None = None
+        for candidate in projects_dir.glob("*/*.jsonl"):
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < since_epoch - 2.0:
+                continue
+            try:
+                with candidate.open(encoding="utf-8", errors="replace") as handle:
+                    first_line = handle.readline()
+            except OSError:
+                continue
+            first_line = first_line.strip()
+            if not first_line:
+                continue
+            try:
+                record = json.loads(first_line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(record, dict) or record.get("cwd") != worktree:
+                continue
+            if best is None or mtime > best[0]:
+                best = (mtime, candidate)
+        return best[1] if best else None
     except OSError:
         return None
 
@@ -3275,10 +3353,28 @@ def run_interactive_herdr_isolated(
     herdr_bin: str = "herdr",
     claude_bin_override: str | None = None,
     claude_adapter: str = "native",
+    additional_prompts: list[str] | None = None,
 ) -> list[str]:
     """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
     in place (so cleanup/session identity survive even if this raises) and
     returns the bounded, redacted pane output lines.
+
+    Issue #2219 (fix_delta iteration 1, Option B reintroduction):
+    ``additional_prompts`` is an optional, ordered list of extra prompt
+    turns sent to the SAME already-started agent/session AFTER the initial
+    ``prompt`` turn settles, reusing the exact same per-turn send/wait/
+    stall-recovery behavior (``_send_prompt_turn``) as the initial turn --
+    re-implementing, in spirit, the ``--additional-prompt`` mechanism PR
+    #2176 prototyped in commit 06d8baa9 and reverted in commit 5a44ebf0 for
+    being out of scope for Issue #2174 (a scope decision, not a technical
+    rejection). ``evidence["turns_completed"]`` counts how many prompt
+    turns (initial + additional) actually settled. The herdr
+    ``session_name``/``agent_name`` used for every turn are the SAME local
+    values captured once above and threaded through this whole function --
+    structurally the same Herdr session/agent for the entire multi-turn
+    journey, never re-created per turn. Omitted by default (``None``),
+    leaving every pre-existing caller's single-turn behavior unchanged
+    (AC6-equivalent for this lane).
 
     Issue #2176 (post-merge live-environment finding, 2026-08-16): when
     ``claude_adapter == "claude-gpt"``, the PATH shim built below (needed so
@@ -3512,6 +3608,9 @@ def run_interactive_herdr_isolated(
 
         _send_prompt_turn(herdr_bin, agent_name, prompt, timeout_seconds, isolated_env, evidence)
         evidence["turns_completed"] = 1
+        for extra_prompt in (additional_prompts or []):
+            _send_prompt_turn(herdr_bin, agent_name, extra_prompt, timeout_seconds, isolated_env, evidence)
+            evidence["turns_completed"] += 1
 
         rc, out, err, timed_out = _run(
             [herdr_bin, "agent", "get", agent_name], timeout=20.0, env=isolated_env,
@@ -3861,11 +3960,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Issue #2219 AC6: opt-in (default off). When set, scans "
-            "structured-lane stdout/stderr for a fixed, literal forbidden "
-            "failure marker allowlist (verify_no_forbidden_marker) -- e.g. "
-            "'403 WebSocket upgrade', 'Please run /login' -- and FAILs if "
-            "any is observed. Applies to --runtime claude only. Omitted "
-            "(off) by default, so every pre-existing caller's behavior is "
+            "captured output (structured lane: stdout/stderr; interactive "
+            "lane: the persisted session transcript plus the bounded pane "
+            "excerpt) for a fixed, literal forbidden failure marker "
+            "allowlist (verify_no_forbidden_marker) -- e.g. '403 WebSocket "
+            "upgrade', 'Please run /login' -- and FAILs if any is observed. "
+            "Applies to --runtime claude only. Omitted (off) by default, so "
+            "every pre-existing caller's behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--additional-prompt",
+        action="append",
+        default=[],
+        help=(
+            "Issue #2219 fix_delta iteration 1 (Option B reintroduction, in "
+            "the spirit of PR #2176 commit 06d8baa9's --additional-prompt, "
+            "reverted in commit 5a44ebf0 for being out of scope for Issue "
+            "#2174): interactive mode only. An extra prompt turn sent to "
+            "the SAME already-started agent/session after the initial "
+            "--prompt-file turn settles. May be repeated (sent in the "
+            "given order) to drive a multi-turn operator journey inside "
+            "one isolated interactive session. Combine with "
+            "--require-min-turns / --require-min-subagents / "
+            "--scan-forbidden-markers to verify same-session-identity, "
+            "multi-SubAgent lifecycle, and forbidden-marker absence across "
+            "the resulting persisted session transcript. Requires --mode "
+            "interactive and --runtime claude. Omitted by default, so "
+            "every pre-existing caller's single-turn behavior is "
             "unchanged."
         ),
     )
@@ -3983,7 +4105,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--require-min-subagents must be >= 0")
     if args.require_min_turns < 0:
         parser.error("--require-min-turns must be >= 0")
-    if args.require_min_turns > 0 and args.max_turns < args.require_min_turns:
+    if args.mode == "structured" and args.require_min_turns > 0 and args.max_turns < args.require_min_turns:
         parser.error("--require-min-turns requires --max-turns >= --require-min-turns")
     if args.require_min_subagents > 0 and args.runtime != "claude":
         parser.error("--require-min-subagents requires --runtime claude")
@@ -3991,6 +4113,23 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--require-min-turns requires --runtime claude")
     if args.scan_forbidden_markers and args.runtime != "claude":
         parser.error("--scan-forbidden-markers requires --runtime claude")
+    if args.additional_prompt and args.mode != "interactive":
+        parser.error("--additional-prompt requires --mode interactive")
+    if args.additional_prompt and args.runtime != "claude":
+        parser.error("--additional-prompt requires --runtime claude")
+    # Issue #2219 fix_delta iteration 1 (Option B): the interactive lane's
+    # own turn count is 1 (the initial --prompt-file turn) plus however many
+    # --additional-prompt entries were supplied -- there is no --max-turns
+    # equivalent for this lane (never forwarded to the TUI launch, see AC5).
+    if (
+        args.mode == "interactive"
+        and args.require_min_turns > 0
+        and (1 + len(args.additional_prompt)) < args.require_min_turns
+    ):
+        parser.error(
+            "--require-min-turns requires enough --additional-prompt entries "
+            "(1 initial turn + len(--additional-prompt) must be >= --require-min-turns)"
+        )
 
     run_id = uuid.uuid4().hex[:12]
     errors: list[str] = []
@@ -4667,11 +4806,19 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 exit_code = EXIT_FAIL
 
+            # Issue #2219 fix_delta iteration 1 (Option B): captured BEFORE
+            # the isolated session is created, so the persisted-transcript
+            # lookup below (_find_claude_interactive_transcript) has an
+            # honest lower bound on mtime and can never match a stale
+            # transcript file left over from an earlier, unrelated run
+            # against the same worktree.
+            interactive_run_started_epoch = time.time()
             try:
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
                     claude_bin_override=args.claude_bin if args.runtime == "claude" else None,
                     claude_adapter=args.claude_adapter,
+                    additional_prompts=args.additional_prompt or None,
                 )
 
                 if evidence.get("final_state") == "blocked":
@@ -4687,7 +4834,70 @@ def main(argv: list[str] | None = None) -> int:
                         errors.append(f"expected markers not observed in pane output: {missing}")
                         exit_code = EXIT_FAIL
 
-                        exit_code = EXIT_FAIL
+                # Issue #2219 fix_delta iteration 1 (Option B reintroduction):
+                # wire the SAME multi-SubAgent lifecycle / same-session /
+                # forbidden-marker functions Option A already built for the
+                # structured lane into this interactive lane, via the
+                # persisted session transcript this run itself wrote (see
+                # _find_claude_interactive_transcript docstring for why that
+                # file -- not the pane text -- carries the required
+                # stream-json event shapes). Only attempted when at least one
+                # of the corresponding opt-in flags was actually requested,
+                # so a pre-existing caller that passes none of them never
+                # pays the extra filesystem scan.
+                if args.runtime == "claude" and (
+                    args.require_min_subagents > 0
+                    or args.require_min_turns > 0
+                    or args.scan_forbidden_markers
+                ):
+                    transcript_path = _find_claude_interactive_transcript(
+                        worktree, interactive_run_started_epoch
+                    )
+                    schema_summary["interactive_transcript_found"] = transcript_path is not None
+                    transcript_text = ""
+                    if transcript_path is not None:
+                        try:
+                            transcript_text = transcript_path.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            transcript_text = ""
+                            schema_summary["interactive_transcript_found"] = False
+
+                    if args.require_min_subagents > 0:
+                        multi_child_lifecycle = classify_claude_multi_child_lifecycle(
+                            transcript_text, args.require_min_subagents
+                        )
+                        schema_summary["multi_child_lifecycle"] = multi_child_lifecycle
+                        if not multi_child_lifecycle["verified"]:
+                            errors.append(
+                                "multi-SubAgent lifecycle not verified (interactive lane): "
+                                f"{multi_child_lifecycle}"
+                            )
+                            exit_code = EXIT_FAIL
+
+                    if args.require_min_turns > 0:
+                        same_session_turns = verify_same_main_session_across_turns(
+                            transcript_text, args.require_min_turns
+                        )
+                        schema_summary["same_session_across_turns"] = same_session_turns
+                        if not same_session_turns["verified"]:
+                            errors.append(
+                                "same main session across >= "
+                                f"{args.require_min_turns} turns not verified "
+                                f"(interactive lane): {same_session_turns}"
+                            )
+                            exit_code = EXIT_FAIL
+
+                    if args.scan_forbidden_markers:
+                        forbidden_marker_scan = verify_no_forbidden_marker(
+                            transcript_text, "", combined_pane_text
+                        )
+                        schema_summary["forbidden_marker_scan"] = forbidden_marker_scan
+                        if not forbidden_marker_scan["verified"]:
+                            errors.append(
+                                "forbidden failure marker(s) observed (interactive lane): "
+                                f"{forbidden_marker_scan['matched_markers']}"
+                            )
+                            exit_code = EXIT_FAIL
 
                 if args.require_session_log_metadata or args.inspect_session_log_metadata:
                     schema_summary["session_log_metadata_count"] = 0

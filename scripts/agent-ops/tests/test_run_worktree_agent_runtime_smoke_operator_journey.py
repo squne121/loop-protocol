@@ -520,3 +520,360 @@ exit 0
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "multi_child_lifecycle" in summary
     assert "same_session_across_turns" in summary
+
+
+# ---------------------------------------------------------------------------
+# Issue #2219 fix_delta iteration 1 (Option B reintroduction): interactive
+# herdr lane multi-turn support (--additional-prompt), wired into the SAME
+# classify_claude_multi_child_lifecycle() / verify_same_main_session_across_
+# turns() / verify_no_forbidden_marker() functions Option A already built
+# for the structured lane, via the persisted session transcript this lane's
+# own Claude Code process writes to ~/.claude/projects/*/<session_id>.jsonl
+# (see _find_claude_interactive_transcript). These tests fake the herdr CLI
+# (mirroring the existing test_run_worktree_agent_runtime_smoke.py /
+# test_run_worktree_agent_runtime_smoke_herdr_isolation.py convention -- no
+# live herdr session is required) and, where the persisted-transcript wiring
+# is exercised, pre-seed a fake ~/.claude/projects transcript file under an
+# isolated HOME so the module's own Path.home() lookup never touches the
+# real machine's Claude Code project directory.
+# ---------------------------------------------------------------------------
+
+
+_HELP_BRANCH = """
+if [ "$1" = "--help" ]; then
+  echo "--output-format --include-hook-events --no-session-persistence --max-turns"
+  exit 0
+fi
+"""
+
+
+_FAKE_ISOLATED_HERDR_BODY_MULTI_TURN = """
+STATE_DIR="$FAKE_HERDR_STATE_DIR"
+mkdir -p "$STATE_DIR"
+if [ "$1" = "--session" ]; then
+  touch "$STATE_DIR/$2.session"
+  sleep 300
+  exit 0
+fi
+case "$1 $2" in
+  "status server")
+    exit 0
+    ;;
+esac
+case "$1" in
+  session)
+    case "$2" in
+      list)
+        out="{\\"sessions\\":["
+        first=1
+        for f in "$STATE_DIR"/*.session; do
+          [ -e "$f" ] || continue
+          name=$(basename "$f" .session)
+          if [ -e "$STATE_DIR/$name.stopped" ]; then running=false; else running=true; fi
+          if [ $first -eq 0 ]; then out="$out,"; fi
+          out="$out{\\"name\\":\\"$name\\",\\"running\\":$running}"
+          first=0
+        done
+        out="$out]}"
+        echo "$out"
+        exit 0
+        ;;
+      stop)
+        touch "$STATE_DIR/$3.stopped"
+        exit 0
+        ;;
+      delete)
+        rm -f "$STATE_DIR/$3.session" "$STATE_DIR/$3.stopped"
+        exit 0
+        ;;
+    esac
+    ;;
+  workspace)
+    case "$2" in
+      create)
+        touch "$STATE_DIR/${HERDR_SESSION}.session"
+        echo '{"result":{"root_pane":{"pane_id":"pane-xyz"},"workspace":{"workspace_id":"w1"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+  agent)
+    case "$2" in
+      start) exit 0 ;;
+      prompt)
+        count_file="$STATE_DIR/prompt_call_count"
+        n=0
+        [ -f "$count_file" ] && n=$(cat "$count_file")
+        n=$((n + 1))
+        echo "$n" > "$count_file"
+        if [ -n "$FAIL_PROMPT_CALL_NUMBER" ] && [ "$n" = "$FAIL_PROMPT_CALL_NUMBER" ]; then
+          echo "fake prompt failure (not a stall)" >&2
+          exit 1
+        fi
+        exit 0
+        ;;
+      get) echo '{"state":"idle"}'; exit 0 ;;
+      explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
+      read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
+    esac
+    ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+"""
+
+
+def _seed_fake_claude_transcript(
+    fake_home: Path, worktree: Path, lines: list[dict]
+) -> Path:
+    """Write a fake persisted Claude Code session transcript under
+    ``<fake_home>/.claude/projects/<any-slug>/<any-name>.jsonl`` whose first
+    line carries ``cwd`` equal to the resolved worktree path -- exactly the
+    content-linked shape ``_find_claude_interactive_transcript`` scans for.
+    """
+    project_dir = fake_home / ".claude" / "projects" / "fixture-project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = project_dir / "fake-session.jsonl"
+    resolved_worktree = str(worktree.resolve())
+    body_lines = [dict(lines[0], cwd=resolved_worktree)] + [dict(line) for line in lines[1:]]
+    transcript_path.write_text(
+        "\n".join(json.dumps(line) for line in body_lines) + "\n", encoding="utf-8"
+    )
+    return transcript_path
+
+
+def test_given_additional_prompt_when_interactive_lane_runs_then_turns_completed_records_all_turns(
+    repo_with_worktree, tmp_path
+):
+    """Positive control: --additional-prompt drives a second turn through
+    the SAME already-started herdr agent/session (turns_completed counts
+    both), with no --require-min-* flags so the persisted-transcript
+    wiring is not exercised in this test."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY_MULTI_TURN)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--expect-marker", "OBSERVED_MARKER",
+        "--additional-prompt", "second turn: confirm same session",
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "turns_completed: 2" in summary
+
+
+def test_given_second_additional_prompt_turn_never_settles_when_interactive_lane_runs_then_fail(
+    repo_with_worktree, tmp_path
+):
+    """AC6-spirit negative: the second (--additional-prompt) turn's own
+    ``herdr agent prompt`` call fails (not a stall -- a genuine failure),
+    so it must never silently be treated as settled. turns_completed must
+    stay at 1 (only the initial turn settled) and the run must FAIL."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY_MULTI_TURN)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--additional-prompt", "second turn never settles",
+        fake_bin_dir=fake_bin,
+        extra_env={
+            "HERDR_ENV": "1",
+            "FAKE_HERDR_STATE_DIR": str(state_dir),
+            "FAIL_PROMPT_CALL_NUMBER": "2",
+        },
+    )
+    assert result.returncode == 1, f"stdout={result.stdout}\nstderr={result.stderr}"
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "turns_completed: 1" in summary
+    assert "herdr agent prompt failed" in summary
+
+
+def test_given_additional_prompt_when_argument_error_outside_interactive_mode(
+    repo_with_worktree, tmp_path
+):
+    """--additional-prompt requires --mode interactive."""
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "additional-prompt-structured"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--additional-prompt", "not allowed here",
+    )
+    assert result.returncode == 2
+    assert "--additional-prompt" in result.stderr
+
+
+def test_given_require_min_turns_without_enough_additional_prompts_when_interactive_then_argument_error(
+    repo_with_worktree, tmp_path
+):
+    """--require-min-turns 2 in interactive mode requires at least 1
+    --additional-prompt entry (1 initial turn + N additional >= 2)."""
+    repo, worktree = repo_with_worktree
+    prompt = _prompt_file(tmp_path)
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "require-min-turns-interactive-invalid"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--require-min-turns", "2",
+    )
+    assert result.returncode == 2
+    assert "--require-min-turns" in result.stderr
+
+
+def test_given_interactive_multi_turn_with_matching_session_identity_when_transcript_wired_then_pass(
+    repo_with_worktree, tmp_path
+):
+    """Positive control: a genuine 2-turn interactive journey whose
+    persisted transcript carries ONE session_id across both turns plus two
+    genuinely paired SubAgents -- classify_claude_multi_child_lifecycle()
+    and verify_same_main_session_across_turns() (the SAME Option A
+    functions) both PASS when wired through the interactive lane's own
+    persisted-transcript lookup."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY_MULTI_TURN)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    _seed_fake_claude_transcript(
+        fake_home, worktree,
+        [
+            {"type": "system", "subtype": "init", "session_id": "same-sess-1"},
+            {"type": "assistant", "session_id": "same-sess-1"},
+            {"type": "user", "tool_use_result": {"agentId": "agent-a", "status": "completed"}},
+            {"type": "user", "tool_use_result": {"agentId": "agent-b", "status": "completed"}},
+            {"type": "assistant", "session_id": "same-sess-1"},
+        ],
+    )
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--additional-prompt", "second turn",
+        "--require-min-turns", "2",
+        "--require-min-subagents", "2",
+        "--scan-forbidden-markers",
+        fake_bin_dir=fake_bin,
+        extra_env={
+            "HERDR_ENV": "1",
+            "FAKE_HERDR_STATE_DIR": str(state_dir),
+            "HOME": str(fake_home),
+        },
+    )
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "interactive_transcript_found: True" in summary
+    assert "'verified': True" in summary
+
+
+def test_given_interactive_multi_turn_with_session_identity_change_when_transcript_wired_then_fail(
+    repo_with_worktree, tmp_path
+):
+    """Negative: the persisted transcript's session_id CHANGES between the
+    two turns (a genuine same-session-identity violation) -- must FAIL,
+    never silently accepted as PASS."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY_MULTI_TURN)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    _seed_fake_claude_transcript(
+        fake_home, worktree,
+        [
+            {"type": "system", "subtype": "init", "session_id": "sess-turn-1"},
+            {"type": "assistant", "session_id": "sess-turn-1"},
+            {"type": "assistant", "session_id": "sess-turn-2-DIFFERENT"},
+        ],
+    )
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--additional-prompt", "second turn",
+        "--require-min-turns", "2",
+        fake_bin_dir=fake_bin,
+        extra_env={
+            "HERDR_ENV": "1",
+            "FAKE_HERDR_STATE_DIR": str(state_dir),
+            "HOME": str(fake_home),
+        },
+    )
+    assert result.returncode == 1, f"stdout={result.stdout}\nstderr={result.stderr}"
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "same_session_across_turns" in summary
+    assert "'verified': False" in summary
+
+
+def test_given_interactive_lane_no_transcript_found_when_require_min_turns_then_fail_closed(
+    repo_with_worktree, tmp_path
+):
+    """No persisted transcript exists at all (fake HOME has no
+    ~/.claude/projects tree): interactive_transcript_found must be False
+    and the run must FAIL closed, never silently PASS with no evidence."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY_MULTI_TURN)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    fake_home = tmp_path / "fake-home-empty"
+    fake_home.mkdir()
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--additional-prompt", "second turn",
+        "--require-min-turns", "2",
+        fake_bin_dir=fake_bin,
+        extra_env={
+            "HERDR_ENV": "1",
+            "FAKE_HERDR_STATE_DIR": str(state_dir),
+            "HOME": str(fake_home),
+        },
+    )
+    assert result.returncode == 1, f"stdout={result.stdout}\nstderr={result.stderr}"
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "interactive_transcript_found: False" in summary
