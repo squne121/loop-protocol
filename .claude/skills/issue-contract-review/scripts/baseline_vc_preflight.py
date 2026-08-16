@@ -745,11 +745,16 @@ def _is_parallel_eligible_command(
 #   / `_dedup_seen_keys` bookkeeping in `main()` below, without executing
 #   anything.
 #
-# `N = max(2, launch_upper_bound)` is the value
+# `N = max(2, command_occurrence_count)` is the value
 # `contract_readiness_check.derive_review_budget()` consumes to derive the
-# timeout envelope.
+# timeout envelope (Issue #2207 OWNER P1-3, PR #2221 REQUEST_CHANGES: the
+# Issue #2207 Outcome/AC5 contract fixes the denominator as
+# `command_occurrence_count`, the raw VC occurrence count -- NOT
+# `launch_upper_bound`, the dedup-aware actual-launch upper bound also
+# reported on this same plan for other, non-budget uses).
 
-# Issue #2207 AC7: fixed policy ceiling on `launch_upper_bound`. Chosen so a
+# Issue #2207 AC7 / OWNER P1-3: fixed policy ceiling applied to
+# `command_occurrence_count` (not `launch_upper_bound`). Chosen so a
 # reasonable worst-case aggregate timeout stays bounded even at the ceiling
 # (40 * (150 + 15) + 20 = 6620s ~ 110 minutes) while comfortably exceeding
 # any currently-observed live Issue body VC count. A body whose canonical
@@ -861,30 +866,133 @@ def detect_compound_command(command: str) -> bool:
 
 _ACTIVE_PROCESS_GROUPS_LOCK = threading.Lock()
 _ACTIVE_PROCESS_GROUPS: set = set()
+# Issue #2207 OWNER P1-2 item 5 (fault-injection-discovered fix): pgid ->
+# the Popen handle for the DIRECT child of THIS process in that group.
+# `os.killpg(pgid, SIGTERM/SIGKILL)` makes the process exit at the kernel
+# level, but without an explicit `.wait()`/`.poll()` from ITS actual
+# parent (this process), the direct child becomes a zombie that
+# `os.killpg(pgid, 0)` / `os.kill(pid, 0)` still report as "alive"
+# (a zombie still occupies its pid/pgid slot until reaped) -- indefinitely,
+# if nothing ever calls `wait()` on it. `reap_all_active_process_groups()`
+# uses this mapping to explicitly reap the direct child it owns after
+# signaling (grandchildren are not this process's own children and are
+# reaped by their own eventual re-parenting once the direct child exits,
+# which the OS handles once the direct child itself is gone).
+_ACTIVE_PROCESS_HANDLES: Dict[int, "subprocess.Popen"] = {}
+
+# Issue #2207 OWNER P0-2 (PR #2221 REQUEST_CHANGES): a module-level flag
+# only, mutated by the signal handler with a plain attribute assignment
+# (atomic under the GIL, no lock needed). Read/cleared only from ordinary
+# control flow (never from inside the handler itself).
+_CANCEL_REQUESTED = False
 
 
-def _register_active_process_group(pid: int) -> None:
+class CooperativeCancellationRequested(BaseException):
+    """Raised BY the SIGTERM handler (never caught there) so that PEP 475
+    ("interrupted system calls are retried") does NOT silently swallow the
+    signal while the main thread is blocked inside `Popen.communicate()`.
+    Deriving from `BaseException` (not `Exception`) is deliberate: ordinary
+    `except Exception` clauses inside `run_command()` must NOT intercept
+    this and must let it propagate all the way to a single top-level
+    handler in `main()`, where the ACTUAL registry snapshot + TERM/KILL +
+    wait work happens in normal control flow -- never inside the signal
+    handler (Issue #2207 OWNER P0-2: a signal handler that acquires
+    `_ACTIVE_PROCESS_GROUPS_LOCK` can deadlock the single main thread if
+    the signal lands while that same thread already holds the lock inside
+    `_register_active_process_group()` / `_unregister_active_process_group()`,
+    since `threading.Lock` is non-reentrant and no other thread can ever
+    release it for a single-threaded program)."""
+
+
+def _register_active_process_group(
+    pid: int, process: Optional["subprocess.Popen"] = None
+) -> Optional[int]:
+    """Register `pid`'s process group as active and return the PGID token
+    that was registered (or `None` if the pid could not be resolved).
+
+    Issue #2207 OWNER P1-1: the caller MUST hold onto this returned token
+    and pass it back to `_unregister_active_process_group()` verbatim
+    rather than re-deriving a PGID from the PID at unregister time -- by
+    the time a process is unregistered it has typically already been
+    waited/reaped, so `os.getpgid(pid)` reliably raises `ProcessLookupError`
+    and unregistration would silently no-op, leaving a stale PGID in the
+    registry forever (a correctness hazard, not just a leak: Linux PIDs
+    wrap at `pid_max` and a stale PGID can be reassigned to an unrelated
+    process group that a later SIGTERM sweep would then kill).
+
+    `process` (Issue #2207 OWNER P1-2 item 5 fault-injection-discovered
+    fix), if given, is the `Popen` handle for THIS process's own direct
+    child in that group; it is kept so `reap_all_active_process_groups()`
+    can explicitly `.wait()` it (avoiding a zombie -- `os.killpg`/`os.kill`
+    signal-0 liveness checks still report a zombie as "alive" until its
+    actual parent reaps it)."""
     try:
         pgid = os.getpgid(pid)
     except (ProcessLookupError, OSError):
-        return
+        return None
     with _ACTIVE_PROCESS_GROUPS_LOCK:
         _ACTIVE_PROCESS_GROUPS.add(pgid)
+        if process is not None:
+            _ACTIVE_PROCESS_HANDLES[pgid] = process
+    return pgid
 
 
-def _unregister_active_process_group(pid: int) -> None:
-    try:
-        pgid = os.getpgid(pid)
-    except (ProcessLookupError, OSError):
-        pgid = None
+def _unregister_active_process_group(pgid: Optional[int]) -> None:
+    """Remove a previously-registered PGID token from the active-groups
+    registry. `pgid` MUST be the exact value `_register_active_process_group()`
+    returned (Issue #2207 OWNER P1-1) -- never re-resolved from a PID."""
+    if pgid is None:
+        return
     with _ACTIVE_PROCESS_GROUPS_LOCK:
-        if pgid is not None:
-            _ACTIVE_PROCESS_GROUPS.discard(pgid)
+        _ACTIVE_PROCESS_GROUPS.discard(pgid)
+        _ACTIVE_PROCESS_HANDLES.pop(pgid, None)
+
+
+def _reap_owned_handle_if_present(pgid: int) -> None:
+    """Best-effort, non-blocking: if THIS process registered a `Popen`
+    handle for `pgid` (its own direct child in that group), reap it now if
+    it has already exited (Issue #2207 OWNER P1-2 item 5
+    fault-injection-discovered fix: signaling alone does not reap;
+    grandchildren are not this process's own children and are left to
+    re-parenting, which only proceeds once the direct child itself is
+    actually reaped, not merely killed)."""
+    with _ACTIVE_PROCESS_GROUPS_LOCK:
+        handle = _ACTIVE_PROCESS_HANDLES.get(pgid)
+    if handle is None:
+        return
+    try:
+        handle.wait(timeout=0)
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+
+
+def _process_group_is_absent(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, OSError):
+        return True
+    return False
 
 
 def reap_all_active_process_groups(*, grace_seconds: float = 5.0, poll_interval: float = 0.05) -> int:
     """Terminate + reap every VC process group currently registered as
-    active. SIGTERM first, bounded grace period, SIGKILL if still alive.
+    active.
+
+    Issue #2207 OWNER P0-2 fix: this function is called from ORDINARY
+    control flow only (a top-level `except CooperativeCancellationRequested`
+    in `main()`), never from inside the signal handler itself, so taking
+    `_ACTIVE_PROCESS_GROUPS_LOCK` here cannot deadlock the (single) main
+    thread the way taking it from inside the handler could.
+
+    Issue #2207 OWNER P0-2 (ordering) fix: SIGTERM is sent to EVERY active
+    group FIRST, then a SINGLE global grace period is awaited (not one
+    grace period PER group serially -- with up to `MAX_VC_EXECUTION_SLOTS`
+    (40) groups, a naive per-group `wait(timeout=5)` loop could take
+    minutes), and only groups still alive after that single grace window
+    are SIGKILLed.
+
     Best-effort/idempotent: a group that already exited between
     registration and this call is not an error. Returns the number of
     groups that were signaled (not necessarily still alive).
@@ -892,55 +1000,81 @@ def reap_all_active_process_groups(*, grace_seconds: float = 5.0, poll_interval:
     with _ACTIVE_PROCESS_GROUPS_LOCK:
         pgids = list(_ACTIVE_PROCESS_GROUPS)
 
-    signaled = 0
+    signaled: List[int] = []
     for pgid in pgids:
         try:
             os.killpg(pgid, signal.SIGTERM)
         except (ProcessLookupError, OSError):
-            with _ACTIVE_PROCESS_GROUPS_LOCK:
-                _ACTIVE_PROCESS_GROUPS.discard(pgid)
+            _unregister_active_process_group(pgid)
             continue
-        signaled += 1
+        signaled.append(pgid)
 
-        deadline = time.monotonic() + grace_seconds
-        alive = True
-        while time.monotonic() < deadline:
-            try:
-                os.killpg(pgid, 0)
-            except (ProcessLookupError, OSError):
-                alive = False
-                break
+    still_alive = set(signaled)
+    deadline = time.monotonic() + grace_seconds
+    while still_alive and time.monotonic() < deadline:
+        for pgid in list(still_alive):
+            # Issue #2207 OWNER P1-2 item 5 (fault-injection-discovered
+            # fix): reap this process's own direct child in the group FIRST
+            # -- a zombie direct child still answers `killpg(pgid, 0)` as
+            # "alive", so `_process_group_is_absent()` below would never
+            # observe absence for a group whose only remaining member is
+            # our own unreaped (but already-exited) direct child.
+            _reap_owned_handle_if_present(pgid)
+            if _process_group_is_absent(pgid):
+                still_alive.discard(pgid)
+                _unregister_active_process_group(pgid)
+        if still_alive:
             time.sleep(poll_interval)
-        if alive:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
 
-        with _ACTIVE_PROCESS_GROUPS_LOCK:
-            _ACTIVE_PROCESS_GROUPS.discard(pgid)
+    for pgid in still_alive:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
 
-    return signaled
+    # Issue #2207 OWNER P1-2 item 5 (fault-injection-discovered fix): after
+    # SIGKILL, bounded-poll (reusing the same grace window shape as
+    # `_kill_process_group()`) so the direct child actually gets reaped
+    # (and the group's absence actually gets confirmed) before this
+    # function returns, instead of returning immediately after sending
+    # SIGKILL with no confirmation.
+    kill_deadline = time.monotonic() + grace_seconds
+    while still_alive and time.monotonic() < kill_deadline:
+        for pgid in list(still_alive):
+            _reap_owned_handle_if_present(pgid)
+            if _process_group_is_absent(pgid):
+                still_alive.discard(pgid)
+        if still_alive:
+            time.sleep(poll_interval)
+
+    for pgid in signaled:
+        _unregister_active_process_group(pgid)
+
+    return len(signaled)
+
+
+def _sigterm_cooperative_handler(signum: int, frame: Any) -> None:  # noqa: ANN401
+    """Issue #2207 OWNER P0-2: the ENTIRE body of a SIGTERM handler must be
+    limited to setting a plain flag and raising a dedicated exception --
+    NO lock acquisition, NO sleep, NO process wait, NO kill here. Raising
+    `CooperativeCancellationRequested` (a `BaseException`) is what actually
+    unwinds the main thread out of a blocking `Popen.communicate()` call
+    (PEP 475 only auto-retries an interrupted syscall when the handler
+    returns normally; raising instead propagates the exception through the
+    call stack), so the REAL cleanup work happens afterwards in ordinary
+    control flow inside `main()`."""
+    global _CANCEL_REQUESTED
+    _CANCEL_REQUESTED = True
+    raise CooperativeCancellationRequested()
 
 
 def install_sigterm_cooperative_cancellation() -> None:
-    """Install a SIGTERM handler that reaps all active VC process groups
-    before this process terminates (Issue #2207 AC9). POSIX-only (relies on
-    `os.killpg` / process-group semantics); a caller on a platform without
-    POSIX process-group support should NOT call this (the caller is
-    expected to treat that as `environment blocked`, not silently skip
-    cancellation).
-    """
-
-    def _handler(signum: int, frame: Any) -> None:  # noqa: ANN401
-        reap_all_active_process_groups()
-        # Restore default disposition and re-raise so THIS process still
-        # actually terminates on SIGTERM (cooperative cleanup, not a
-        # swallow-and-continue handler).
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    signal.signal(signal.SIGTERM, _handler)
+    """Install a SIGTERM handler that requests cooperative cancellation
+    (Issue #2207 AC9). POSIX-only (relies on `os.killpg` / process-group
+    semantics); a caller on a platform without them should NOT call this
+    (the caller is expected to treat that as `environment blocked`, not
+    silently skip cancellation)."""
+    signal.signal(signal.SIGTERM, _sigterm_cooperative_handler)
 
 
 def posix_process_groups_supported() -> bool:
@@ -1020,28 +1154,41 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
         # doubles stand in for `subprocess.Popen` without a `.pid` attribute
         # (they never exercise the timeout/SIGTERM path); registration is a
         # best-effort side channel and must not raise for those.
+        #
+        # Issue #2207 OWNER P1-1: `_register_active_process_group()` returns
+        # the PGID TOKEN it registered; that exact token (never a PID
+        # re-resolved later) is what gets passed to
+        # `_unregister_active_process_group()` below.
         _vc_process_pid = getattr(process, "pid", None)
+        _vc_group_token: Optional[int] = None
         if _vc_process_pid is not None:
-            _register_active_process_group(_vc_process_pid)
+            _vc_group_token = _register_active_process_group(_vc_process_pid, process)
         try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            # Drain pipes after the group is dead so `communicate()` doesn't
+            # block indefinitely on an orphaned pipe write-end still held
+            # open by a reaped-but-not-yet-reclaimed grandchild.
             try:
-                stdout, stderr = process.communicate(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                _kill_process_group(process)
-                # Drain pipes after the group is dead so `communicate()` doesn't
-                # block indefinitely on an orphaned pipe write-end still held
-                # open by a reaped-but-not-yet-reclaimed grandchild.
-                try:
-                    process.communicate(timeout=5)
-                except Exception:
-                    pass
-                duration_ms = int((datetime.now() - start).total_seconds() * 1000)
-                return -1, "", "timeout", duration_ms, env_delta
+                process.communicate(timeout=5)
+            except Exception:
+                pass
             duration_ms = int((datetime.now() - start).total_seconds() * 1000)
-            return process.returncode, stdout, stderr, duration_ms, env_delta
-        finally:
-            if _vc_process_pid is not None:
-                _unregister_active_process_group(_vc_process_pid)
+            _unregister_active_process_group(_vc_group_token)
+            return -1, "", "timeout", duration_ms, env_delta
+        except CooperativeCancellationRequested:
+            # Issue #2207 OWNER P0-2: propagate WITHOUT unregistering -- the
+            # process group is still (as far as we know) alive; a top-level
+            # handler in `main()` calls `reap_all_active_process_groups()` in
+            # ordinary control flow, which needs this PGID to still be in
+            # the registry to reap it.
+            raise
+        duration_ms = int((datetime.now() - start).total_seconds() * 1000)
+        _unregister_active_process_group(_vc_group_token)
+        return process.returncode, stdout, stderr, duration_ms, env_delta
+    except CooperativeCancellationRequested:
+        raise
     except subprocess.TimeoutExpired:
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
         return -1, "", "timeout", duration_ms, env_delta
@@ -1050,7 +1197,9 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
         return -1, "", str(e), duration_ms, env_delta
 
 
-def _kill_process_group(process: "subprocess.Popen") -> None:
+def _kill_process_group(
+    process: "subprocess.Popen", *, grace_seconds: float = 5.0, poll_interval: float = 0.05
+) -> None:
     """
     Reap an entire process group spawned with `start_new_session=True`.
 
@@ -1062,10 +1211,18 @@ def _kill_process_group(process: "subprocess.Popen") -> None:
     group this specific Popen call created -- never a shared/global group,
     and never another concurrently-running VC subprocess's group.
 
-    SIGTERM first, then a bounded grace period, then SIGKILL if the group
-    hasn't exited. Best-effort: a process (or the whole group) that already
-    exited between the timeout firing and this call running is not an
-    error.
+    Issue #2207 OWNER P0-3 fix: the group LEADER exiting (`process.wait()`
+    returning after the SIGTERM grace period) does NOT imply the whole
+    process GROUP is gone -- a grandchild that ignores SIGTERM survives
+    independently once the leader has exited, and the previous
+    implementation `return`ed as soon as `process.wait()` succeeded,
+    leaving such a grandchild running forever (SIGKILL was only ever sent
+    to the leader's own wait path, never to the group as a fallback after
+    leader-exit). This version ALWAYS explicitly probes group membership
+    with `os.killpg(pgid, 0)` after the leader wait returns (successfully
+    or not) and unconditionally SIGKILLs the group (not just the leader)
+    if anything is still alive, then bounded-polls until the group is
+    confirmed absent.
     """
     try:
         pgid = os.getpgid(process.pid)
@@ -1076,18 +1233,146 @@ def _kill_process_group(process: "subprocess.Popen") -> None:
     except (ProcessLookupError, OSError):
         return
     try:
-        process.wait(timeout=5)
-        return
+        process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
         pass
+
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, OSError):
+        return  # group (leader + any grandchildren) already absent
+
     try:
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, OSError):
-        pass
+        return
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, OSError):
+            return
+        time.sleep(poll_interval)
+
+
+class SupervisedSubprocessResult:
+    """Result of `run_subprocess_with_cooperative_supervisor()`. Shaped
+    similarly to `subprocess.CompletedProcess` plus a `timed_out` flag
+    (Issue #2207 OWNER P0-1)."""
+
+    __slots__ = ("returncode", "stdout", "stderr", "timed_out", "duration_seconds")
+
+    def __init__(
+        self, returncode: int, stdout: str, stderr: str, timed_out: bool, duration_seconds: float
+    ) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+        self.duration_seconds = duration_seconds
+
+
+def run_subprocess_with_cooperative_supervisor(
+    argv: List[str],
+    *,
+    timeout_seconds: float,
+    cwd: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    grace_seconds: float = 5.0,
+    poll_interval: float = 0.05,
+) -> SupervisedSubprocessResult:
+    """Issue #2207 OWNER P0-1 (PR #2221 REQUEST_CHANGES): a cooperative
+    replacement for `subprocess.run(argv, timeout=timeout_seconds)`.
+
+    CPython's `subprocess.run(timeout=...)` sends `process.kill()`
+    (SIGKILL) DIRECTLY to the direct child on timeout -- this bypasses any
+    SIGTERM handler the child installs (e.g. `baseline_vc_preflight.py`'s
+    own `install_sigterm_cooperative_cancellation()`) entirely, and (since
+    the child is isolated into its OWN process group via
+    `start_new_session=True`) never reaches any VC descendant process
+    group the child itself is tracking. `contract_readiness_check.py`'s
+    `run_baseline_vc_preflight()` and `run_root_review_pipeline.py`'s
+    `run_contract_readiness_check()` both call THIS function instead so
+    the direct child gets a real chance to run its own cooperative cleanup
+    before being forcibly killed.
+
+    Behavior:
+    1. Launches `argv` in its OWN process group (`start_new_session=True`),
+       so this supervisor can signal the whole group, not just the leader.
+    2. On `timeout_seconds` elapsing, sends SIGTERM to the child's process
+       GROUP (never SIGKILL first).
+    3. Waits a SINGLE bounded `grace_seconds` for the child to exit on its
+       own (giving its own cooperative cleanup, if any, time to run).
+    4. Only after that grace period does it send SIGKILL to the group.
+    5. Confirms the process group is actually gone (bounded poll) before
+       returning, then drains stdout/stderr.
+
+    Float `timeout_seconds` is intentional (Issue #2207 OWNER P1-2 item 7):
+    callers under test inject sub-second deadlines (e.g. 0.15s) to
+    exercise the OUTER deadline path without waiting on realistic
+    production-scale timeouts.
+    """
+    start = time.monotonic()
+    process = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        shell=False,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     try:
-        process.wait(timeout=5)
+        pgid: Optional[int] = os.getpgid(process.pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+        duration = time.monotonic() - start
+        return SupervisedSubprocessResult(process.returncode, stdout, stderr, False, duration)
     except subprocess.TimeoutExpired:
         pass
+
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pgid = None
+
+    if pgid is not None:
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
+        if not _process_group_is_absent(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            deadline = time.monotonic() + grace_seconds
+            while time.monotonic() < deadline and not _process_group_is_absent(pgid):
+                time.sleep(poll_interval)
+    else:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    try:
+        stdout, stderr = process.communicate(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            stdout, stderr = process.communicate(timeout=1)
+        except Exception:
+            stdout, stderr = "", ""
+
+    duration = time.monotonic() - start
+    returncode = process.returncode if process.returncode is not None else -1
+    return SupervisedSubprocessResult(returncode, stdout or "", stderr or "", True, duration)
 
 
 def _pnpm_gate_evidence_for_command(command: str, cwd: str) -> Optional[Dict[str, Any]]:
@@ -3899,7 +4184,7 @@ def bounded_worker_count(value: str) -> int:
     return parsed
 
 
-def main() -> int:
+def _main_impl() -> int:
     parser = argparse.ArgumentParser(
         description="Baseline VC Preflight: extract and classify VCs from Issue body"
     )
@@ -4780,6 +5065,70 @@ def main() -> int:
     # C2: Exit code contract
     # status: pass → 0, blocked → 1, human_judgment → 3
     return exit_code_for_status(output["status"])
+
+
+_TEST_REAP_GRACE_SECONDS_ENV_VAR = "BASELINE_VC_PREFLIGHT_TEST_REAP_GRACE_SECONDS"
+_TEST_SIGTERM_MARKER_PATH_ENV_VAR = "BASELINE_VC_PREFLIGHT_TEST_SIGTERM_MARKER_PATH"
+
+
+def _test_reap_grace_seconds_override() -> Optional[float]:
+    """Issue #2207 OWNER P1-2 item 5: test-only dependency injection so a
+    scaled fault-injection test can bound `reap_all_active_process_groups()`'s
+    grace period to a fast value instead of the production 5.0s default --
+    without this, a test that spawns a SIGTERM-ignoring grandchild would
+    have to wait the full production grace window on every repeat. Absent
+    or unparseable in production (the env var is never set by any
+    production caller), this returns `None` and production behavior
+    (5.0s default) is unchanged."""
+    raw = os.environ.get(_TEST_REAP_GRACE_SECONDS_ENV_VAR)
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def main() -> int:
+    """Issue #2207 OWNER P0-2: the ONLY place `CooperativeCancellationRequested`
+    is caught -- a single top-level handler that runs the ACTUAL registry
+    snapshot + TERM/KILL + wait work in ordinary (non-signal-handler)
+    control flow, then terminates this process via the default SIGTERM
+    disposition (so the process's own exit still looks like a normal
+    signal-based termination to whatever supervised it)."""
+    try:
+        return _main_impl()
+    except CooperativeCancellationRequested:
+        # Issue #2207 OWNER P1-2 item 5: test-only marker write, proving the
+        # SIGTERM handler actually ran (as opposed to this process being
+        # killed outright by an outer supervisor without ever reaching this
+        # handler). Best-effort and a pure no-op unless a test sets the env
+        # var; never raises into the reap/terminate path below.
+        _marker_path = os.environ.get(_TEST_SIGTERM_MARKER_PATH_ENV_VAR)
+        if _marker_path:
+            try:
+                with open(_marker_path, "w", encoding="utf-8") as _mf:
+                    _mf.write(f"sigterm_handler_entered pid={os.getpid()}\n")
+            except OSError:
+                pass
+        _grace = _test_reap_grace_seconds_override()
+        if _grace is not None:
+            reap_all_active_process_groups(grace_seconds=_grace)
+        else:
+            reap_all_active_process_groups()
+        sys.stderr.write(
+            "baseline_vc_preflight: SIGTERM received, reaped active VC process groups\n"
+        )
+        sys.stderr.flush()
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+        # Unreachable in practice (the line above re-delivers SIGTERM to
+        # this process under its default disposition, which terminates
+        # it); kept only so a non-POSIX/mocked test double that stubs
+        # `os.kill` without actually terminating the process still returns
+        # a deterministic non-zero exit code instead of falling through to
+        # an implicit `None`.
+        return 143
 
 
 if __name__ == "__main__":

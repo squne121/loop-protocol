@@ -35,7 +35,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Optional
+from typing import Any, Dict, Literal, NamedTuple, Optional
 
 import yaml
 
@@ -61,6 +61,7 @@ from baseline_vc_preflight import (  # noqa: E402
     DEFAULT_TIMEOUT_SECONDS as _PER_VC_COMMAND_TIMEOUT_SECONDS,
     compute_canonical_vc_plan as _compute_canonical_vc_plan,
     extract_verification_commands_section,
+    run_subprocess_with_cooperative_supervisor as _run_subprocess_with_cooperative_supervisor,
 )
 from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
 from prose_boundary_policy import (  # noqa: E402
@@ -109,7 +110,12 @@ CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS = (
 # Cleanup-aware review timeout budget formula (Issue #2207)
 # ---------------------------------------------------------------------------
 #
-# Given `N` (the canonical VC plan's `launch_upper_bound`, see
+# Given `N` (the canonical VC plan's `command_occurrence_count` -- Issue
+# #2207 OWNER P1-3 (PR #2221 REQUEST_CHANGES): the Issue #2207 Outcome/AC5
+# contract fixes the budget denominator as `N = max(2, command_occurrence_count)`;
+# an earlier implementation iteration substituted `launch_upper_bound`
+# (the dedup-aware actual-launch upper bound) without an Issue reframe,
+# which the OWNER flagged as an unauthorized silent contract change. See
 # `baseline_vc_preflight.compute_canonical_vc_plan()`), derives the 4-value
 # invocation-local timeout envelope the review pipeline uses:
 #
@@ -166,12 +172,14 @@ _BUDGET_LOW_COUNT_FLOOR = 2
 
 # Issue #2207 AC7: same fixed policy ceiling
 # `baseline_vc_preflight.compute_canonical_vc_plan()` reports as
-# `policy_cap`.
+# `policy_cap`. Applied to `command_occurrence_count` (Issue #2207 OWNER
+# P1-3), not `launch_upper_bound`.
 MAX_VC_EXECUTION_SLOTS = 40
 
 
 class VerificationBudgetExceedsPolicyError(Exception):
-    """Typed, non-retryable rejection: `N` exceeds the fixed policy ceiling.
+    """Typed, non-retryable rejection: `N` (the Issue #2207 Outcome/AC5
+    contract's `command_occurrence_count`) exceeds the fixed policy ceiling.
 
     Raised BEFORE any subprocess is launched (Issue #2207 AC7).
     """
@@ -182,7 +190,7 @@ class VerificationBudgetExceedsPolicyError(Exception):
         self.n = n
         self.policy_cap = policy_cap
         super().__init__(
-            f"launch_upper_bound={n} exceeds policy_cap={policy_cap} ({self.error_code})"
+            f"command_occurrence_count={n} exceeds policy_cap={policy_cap} ({self.error_code})"
         )
 
 
@@ -196,17 +204,24 @@ class ReviewBudget(NamedTuple):
 
 
 def derive_review_budget(
-    launch_upper_bound: int, *, policy_cap: int = MAX_VC_EXECUTION_SLOTS
+    command_occurrence_count: int, *, policy_cap: int = MAX_VC_EXECUTION_SLOTS
 ) -> ReviewBudget:
-    """Derive the invocation-local `ReviewBudget` from `launch_upper_bound`.
+    """Derive the invocation-local `ReviewBudget` from `command_occurrence_count`.
+
+    Issue #2207 OWNER P1-3 (PR #2221 REQUEST_CHANGES): the Issue #2207
+    Outcome / AC5 contract fixes `N = max(2, command_occurrence_count)` as
+    the budget denominator (the RAW count of VC command lines, not the
+    dedup-aware `launch_upper_bound`). Callers MUST pass
+    `compute_canonical_vc_plan()`'s `command_occurrence_count` field here,
+    not `launch_upper_bound`.
 
     Raises `VerificationBudgetExceedsPolicyError` (non-retryable, subprocess
-    NOT launched) if `launch_upper_bound > policy_cap`.
+    NOT launched) if `command_occurrence_count > policy_cap`.
     """
-    if launch_upper_bound > policy_cap:
-        raise VerificationBudgetExceedsPolicyError(launch_upper_bound, policy_cap)
+    if command_occurrence_count > policy_cap:
+        raise VerificationBudgetExceedsPolicyError(command_occurrence_count, policy_cap)
 
-    effective_n = max(_BUDGET_LOW_COUNT_FLOOR, launch_upper_bound)
+    effective_n = max(_BUDGET_LOW_COUNT_FLOOR, command_occurrence_count)
 
     baseline_aggregate = effective_n * _PER_VC_SLOT_SECONDS + _BUDGET_AGGREGATE_MARGIN_SECONDS
     readiness_wrapper = (
@@ -221,7 +236,7 @@ def derive_review_budget(
     total = per_attempt + _BUDGET_TOTAL_MARGIN_SECONDS
 
     return ReviewBudget(
-        n=launch_upper_bound,
+        n=command_occurrence_count,
         effective_n=effective_n,
         baseline_aggregate_seconds=baseline_aggregate,
         readiness_wrapper_seconds=readiness_wrapper,
@@ -650,15 +665,44 @@ def compute_invocation_local_baseline_timeout(body: str) -> int:
     any subprocess is launched.
     """
     plan = _compute_canonical_vc_plan(body)
-    budget = derive_review_budget(plan["launch_upper_bound"], policy_cap=plan["policy_cap"])
+    # Issue #2207 OWNER P1-3: `command_occurrence_count`, per the Issue
+    # #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`.
+    budget = derive_review_budget(plan["command_occurrence_count"], policy_cap=plan["policy_cap"])
     return budget.baseline_aggregate_seconds
 
 
-def run_baseline_vc_preflight(body: str) -> tuple[dict, int]:
+def run_baseline_vc_preflight(
+    body: str,
+    *,
+    override_timeout_seconds: Optional[float] = None,
+    override_grace_seconds: Optional[float] = None,
+    _test_extra_env: Optional[Dict[str, str]] = None,
+) -> tuple[dict, int]:
     """
-    Run baseline_vc_preflight.py via subprocess.
+    Run baseline_vc_preflight.py via a cooperative subprocess supervisor.
     Returns (parsed_json, exit_code).
     Only called in --mode execute.
+
+    `override_timeout_seconds` (Issue #2207 OWNER P1-2 item 7): test-only
+    hook to inject a float (sub-second) aggregate deadline instead of the
+    computed production value, so a real outer-deadline fault-injection
+    test can exercise this EXACT production code path without waiting on
+    realistic production-scale timeouts. `None` (the default) preserves
+    production behavior exactly (the computed int-seconds budget).
+
+    `override_grace_seconds` (Issue #2207 OWNER P1-2 item 5): test-only
+    hook that scales BOTH (a) this supervisor's own grace period while
+    waiting for the direct child (`baseline_vc_preflight.py`) to exit after
+    SIGTERM, AND (b) -- via `_test_extra_env` -- the grace period the
+    child's OWN top-level `main()` uses for `reap_all_active_process_groups()`
+    when it cooperatively reaps ITS VC descendants. Without (b), a fast
+    outer grace here would still leave the child's inner reap blocked on
+    the production 5.0s default, defeating the point of scaling. `None`
+    (the default) preserves the production 5.0s default at both layers.
+
+    `_test_extra_env` is test-only free-form environment passthrough to the
+    spawned `baseline_vc_preflight.py` child (e.g. a SIGTERM-handler-entry
+    marker-file path); production callers never pass this.
     """
     # Issue #2207: compute the invocation-local aggregate timeout from the
     # SAME canonical VC plan the executor's occurrence count is bound to,
@@ -667,7 +711,7 @@ def run_baseline_vc_preflight(body: str) -> tuple[dict, int]:
     # non-retryable `runtime_error` / `verification_budget_exceeds_policy`)
     # rather than ever spawning `baseline_vc_preflight.py`.
     try:
-        aggregate_timeout_seconds = compute_invocation_local_baseline_timeout(body)
+        aggregate_timeout_seconds: float = compute_invocation_local_baseline_timeout(body)
     except VerificationBudgetExceedsPolicyError as exc:
         return (
             {
@@ -682,6 +726,9 @@ def run_baseline_vc_preflight(body: str) -> tuple[dict, int]:
             -1,
         )
 
+    if override_timeout_seconds is not None:
+        aggregate_timeout_seconds = override_timeout_seconds
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".md", delete=False, encoding="utf-8"
     ) as tf:
@@ -691,58 +738,93 @@ def run_baseline_vc_preflight(body: str) -> tuple[dict, int]:
     try:
         # Issue #2165 P1-1(c) / Issue #2207: the aggregate wrapper timeout is
         # derived from `baseline_vc_preflight.py`'s own per-VC-command cap
-        # AND (Issue #2207) the canonical VC plan's `launch_upper_bound` for
-        # THIS body, rather than an independent hardcoded number or a fixed
-        # `N<=2` assumption -- so the two values cannot drift the way the
-        # OWNER-flagged pairings could. The caller
+        # AND (Issue #2207) the canonical VC plan's `command_occurrence_count`
+        # for THIS body, rather than an independent hardcoded number or a
+        # fixed `N<=2` assumption -- so the two values cannot drift the way
+        # the OWNER-flagged pairings could. The caller
         # (`run_root_review_pipeline.py`'s `run_contract_readiness_check()`)
         # derives ITS OWN wrapper timeout from the SAME canonical plan for
         # the same reason (Issue #2207 AC8).
-        result = subprocess.run(
+        #
+        # Issue #2207 OWNER P0-1 (PR #2221 REQUEST_CHANGES): a cooperative
+        # supervisor replaces `subprocess.run(timeout=...)`. CPython's
+        # `subprocess.run(timeout=...)` sends SIGKILL directly to the
+        # direct child on timeout, bypassing `baseline_vc_preflight.py`'s
+        # own SIGTERM handler entirely and never reaching the VC process
+        # GROUPS it tracks (each isolated via `start_new_session=True`).
+        # `run_subprocess_with_cooperative_supervisor()` sends SIGTERM to
+        # the direct child's process group first, gives it a bounded grace
+        # period to run its own cooperative cleanup, and only escalates to
+        # SIGKILL after that grace period elapses.
+        _child_env: Optional[Dict[str, str]] = None
+        if override_grace_seconds is not None or _test_extra_env:
+            _child_env = dict(os.environ)
+            if override_grace_seconds is not None:
+                _child_env["BASELINE_VC_PREFLIGHT_TEST_REAP_GRACE_SECONDS"] = str(
+                    override_grace_seconds
+                )
+            if _test_extra_env:
+                _child_env.update(_test_extra_env)
+        # Issue #2207 OWNER P1-2 item 5 (fault-injection-discovered fix):
+        # `override_grace_seconds` scales ONLY the CHILD's own inner
+        # `reap_all_active_process_groups()` grace (via `_child_env` above)
+        # -- NOT this supervisor's own outer `grace_seconds`. The child
+        # needs a FULL, uninterrupted window to run its own SIGTERM-then-
+        # SIGKILL-then-confirm sequence for ITS VC descendants before it
+        # exits; if this supervisor's own grace were scaled down to the
+        # SAME small value, it could SIGKILL the child (`baseline_vc_preflight.py`
+        # itself) mid-reap, before the child ever finishes signaling its
+        # own VC process group -- orphaning it. Keeping this supervisor's
+        # own `grace_seconds` at the production default is safe for test
+        # speed too: `Popen.wait(timeout=...)` returns as soon as the
+        # child actually exits, not after the full window, so a child that
+        # finishes its (scaled-down) inner reap quickly still returns
+        # quickly here.
+        supervised = _run_subprocess_with_cooperative_supervisor(
             [sys.executable, str(_BASELINE_VC_PREFLIGHT_PY), "--strict", "--body-file", tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=aggregate_timeout_seconds,
+            timeout_seconds=aggregate_timeout_seconds,
+            env=_child_env,
         )
-        exit_code = result.returncode
-        if result.stdout:
-            return json.loads(result.stdout), exit_code
+        if supervised.timed_out:
+            # Issue #2165 P0-1 (OWNER 2026-08-15 REQUEST_CHANGES): this MUST
+            # be a typed runtime-error payload, not a plain
+            # `errors: ["timeout"]` blocked payload -- the latter was
+            # silently collapsed by `map_preflight_result_to_errors()`'s
+            # plain-string-error branch into `category:
+            # no_commands_extracted` / `readiness_status: needs_fix`,
+            # letting a genuine execution-budget timeout masquerade as an
+            # ordinary body-author-fixable semantic finding (and letting
+            # `run_root_review_pipeline.py`'s `run-checker-attempt` exit
+            # 0/1 instead of the exit-2 structured failure
+            # `reviewer_transport.py` depends on to classify the attempt
+            # as `reason_code: timeout`). `status: "runtime_error"` is a
+            # NEW, distinct value from `go`/`needs_fix`/`human_judgment`
+            # that `_raise_status()` and `build_result()` propagate at the
+            # HIGHEST priority (see `_STATUS_PRIORITY` below) so it can
+            # never be silently downgraded to a semantic verdict.
+            return (
+                {
+                    "schema": "baseline_vc_preflight/v1",
+                    "status": "runtime_error",
+                    "results": [],
+                    "errors": [],
+                    "failure_class": "timeout",
+                    "timeout_phase": "baseline_vc_preflight_aggregate",
+                    "retryable": False,
+                },
+                -1,
+            )
+        exit_code = supervised.returncode
+        if supervised.stdout:
+            return json.loads(supervised.stdout), exit_code
         return (
             {
                 "schema": "baseline_vc_preflight/v1",
                 "status": "blocked",
                 "results": [],
-                "errors": [result.stderr or "no output"],
+                "errors": [supervised.stderr or "no output"],
             },
             exit_code,
-        )
-    except subprocess.TimeoutExpired:
-        # Issue #2165 P0-1 (OWNER 2026-08-15 REQUEST_CHANGES): this MUST be
-        # a typed runtime-error payload, not a plain `errors: ["timeout"]`
-        # blocked payload -- the latter was silently collapsed by
-        # `map_preflight_result_to_errors()`'s plain-string-error branch
-        # into `category: no_commands_extracted` / `readiness_status:
-        # needs_fix`, letting a genuine execution-budget timeout masquerade
-        # as an ordinary body-author-fixable semantic finding (and letting
-        # `run_root_review_pipeline.py`'s `run-checker-attempt` exit 0/1
-        # instead of the exit-2 structured failure `reviewer_transport.py`
-        # depends on to classify the attempt as `reason_code: timeout`).
-        # `status: "runtime_error"` is a NEW, distinct value from
-        # `go`/`needs_fix`/`human_judgment` that `_raise_status()` and
-        # `build_result()` propagate at the HIGHEST priority (see
-        # `_STATUS_PRIORITY` below) so it can never be silently downgraded
-        # to a semantic verdict.
-        return (
-            {
-                "schema": "baseline_vc_preflight/v1",
-                "status": "runtime_error",
-                "results": [],
-                "errors": [],
-                "failure_class": "timeout",
-                "timeout_phase": "baseline_vc_preflight_aggregate",
-                "retryable": False,
-            },
-            -1,
         )
     except json.JSONDecodeError as exc:
         return (

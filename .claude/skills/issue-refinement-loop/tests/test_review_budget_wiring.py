@@ -64,8 +64,11 @@ def test_root_pipeline_passes_invocation_local_deadline_to_transport(monkeypatch
     from the N<=2 compatibility values for a high-N body -- and
     `reviewer_transport.py`'s own module fallback constants are untouched."""
     plan = compute_canonical_vc_plan(_HIGH_N_BODY)
-    expected_budget = derive_review_budget(plan["launch_upper_bound"], policy_cap=plan["policy_cap"])
-    assert plan["launch_upper_bound"] >= 3
+    # Issue #2207 OWNER P1-3 (PR #2221 REQUEST_CHANGES): the budget
+    # denominator is `command_occurrence_count` per the Issue #2207
+    # Outcome/AC5 contract, not `launch_upper_bound`.
+    expected_budget = derive_review_budget(plan["command_occurrence_count"], policy_cap=plan["policy_cap"])
+    assert plan["command_occurrence_count"] >= 3
     assert expected_budget.per_attempt_seconds != transport.PER_ATTEMPT_DEADLINE_SECONDS
     assert expected_budget.total_seconds != transport.TOTAL_DEADLINE_SECONDS
 
@@ -133,7 +136,7 @@ def test_policy_ceiling_exceeded_rejects_before_any_checker_subprocess(monkeypat
     )
     over_cap_body = f"## Verification Commands\n\n```bash\n{lines}\n```\n"
     plan = compute_canonical_vc_plan(over_cap_body)
-    assert plan["launch_upper_bound"] > plan["policy_cap"]
+    assert plan["command_occurrence_count"] > plan["policy_cap"]
 
     def fake_fetch_and_pin_live_body(issue_number, repo, **kwargs):
         return over_cap_body, pipeline.sha256_of(over_cap_body), None

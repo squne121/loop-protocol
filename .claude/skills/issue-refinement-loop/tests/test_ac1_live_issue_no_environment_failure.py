@@ -112,20 +112,34 @@ $ rg --version
 
 def test_given_scaled_aggregate_timeout_when_run_baseline_vc_preflight_then_typed_runtime_error(monkeypatch):
     # Reproduces the P0-1 regression at the innermost layer WITHOUT waiting
-    # a real ~150-350s: the `subprocess.run()` call
+    # a real ~150-350s: the cooperative-supervisor call
     # `run_baseline_vc_preflight()` makes for the `baseline_vc_preflight.py`
-    # subprocess is monkeypatched to deterministically raise
-    # `subprocess.TimeoutExpired` (the exact exception the real 200s+
-    # aggregate wrapper timeout raises when a genuinely slow VC exceeds
-    # it), and the resulting payload must be a typed `status:
+    # subprocess (Issue #2207 OWNER P0-1, PR #2221 REQUEST_CHANGES:
+    # `subprocess.run(timeout=...)` was replaced with
+    # `baseline_vc_preflight.run_subprocess_with_cooperative_supervisor()`,
+    # which reports a timeout via a `SupervisedSubprocessResult.timed_out`
+    # flag rather than raising `subprocess.TimeoutExpired` -- this test is
+    # updated to monkeypatch THAT call site instead) is monkeypatched to
+    # deterministically report a timed-out result (the exact shape the
+    # real 200s+ aggregate wrapper timeout produces when a genuinely slow
+    # VC exceeds it), and the resulting payload must be a typed `status:
     # "runtime_error"`, never the old plain `errors: ["timeout"]` blocked
     # payload.
-    import subprocess as _subprocess
+    class _FakeTimedOutSupervisedResult:
+        timed_out = True
+        returncode = -1
+        stdout = ""
+        stderr = ""
+        duration_seconds = 0.5
 
-    def _raise_timeout_expired(*args, **kwargs):
-        raise _subprocess.TimeoutExpired(cmd=["baseline_vc_preflight.py"], timeout=0.5)
+    def _fake_supervisor(*args, **kwargs):
+        return _FakeTimedOutSupervisedResult()
 
-    monkeypatch.setattr(_contract_readiness_check.subprocess, "run", _raise_timeout_expired)
+    monkeypatch.setattr(
+        _contract_readiness_check,
+        "_run_subprocess_with_cooperative_supervisor",
+        _fake_supervisor,
+    )
     result, exit_code = _contract_readiness_check.run_baseline_vc_preflight(_SCALED_BODY_WITH_LONG_VC)
     assert result["status"] == "runtime_error"
     assert result["failure_class"] == "timeout"

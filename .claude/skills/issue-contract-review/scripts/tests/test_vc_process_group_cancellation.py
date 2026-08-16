@@ -39,6 +39,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import baseline_vc_preflight as vcp  # noqa: E402
+import contract_readiness_check as crc  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not vcp.posix_process_groups_supported(),
@@ -263,3 +264,231 @@ def test_sleep_and_mark_completion():
     # overwritten to "completed_without_being_killed"), proving the
     # process was actually reaped mid-sleep rather than allowed to finish.
     assert marker_path.read_text() == "started"
+
+
+# Issue #2207 OWNER P1-2 item 5 (PR #2221 REQUEST_CHANGES): repeat count.
+# Each repeat launches a REAL `uv run --locked pytest` subprocess tree
+# (interpreter + pytest collection + a grandchild process) and waits out an
+# outer deadline + bounded reap -- unlike the in-process race tests
+# elsewhere in this repo, this cannot be sped up to microseconds. ~50
+# same-shape repeats of a full production subprocess spawn would take
+# several minutes and make this suite impractical to run routinely; 10
+# repeats already exercises the SIGTERM-delivery -> handler-raises ->
+# top-level-catch -> register/unregister -> reap -> confirm-absence
+# sequence enough times to catch the register/unregister ordering races
+# this item targets (a single run cannot distinguish "always correct" from
+# "correct by luck once"), while keeping wall-clock time bounded to roughly
+# a repeat_count * (deadline + reap grace) upper bound.
+_OUTER_DEADLINE_REPEAT_COUNT = 10
+
+# Issue #2207 OWNER P1-2 item 5: the literal 50-200ms range specified for
+# the injected deadline assumes negligible child-process startup. Measured
+# in THIS repo, `.venv/bin/python3 -m pytest --version` alone (interpreter
+# boot + pytest import, before any collection) already costs ~200ms (see
+# also the documented `uv run --locked pytest` startup-jitter finding in
+# `test_scaled_fault_injection_inner_timeout_precedes_outer_deadline` above
+# in this same file) -- a 50-200ms deadline would fire before the fixture's
+# grandchild is even spawned, making it impossible to prove grandchild
+# reaping (as opposed to "nothing had started yet"). 600ms is the smallest
+# value that reliably let the fixture reach "grandchild spawned and alive"
+# before the outer deadline fires in local measurement, while still being
+# a small fraction (well under 1%) of the real per-VC-command production
+# cap (150s). The venv interpreter (`sys.executable`, NOT `uv run
+# --locked`) is used as the VC command's interpreter to avoid uv's own
+# per-invocation dependency-resolution overhead stacking on top.
+_OUTER_DEADLINE_SECONDS = 0.6
+_REAP_GRACE_SECONDS = 0.2
+
+
+def test_outer_deadline_via_run_baseline_vc_preflight_reaps_full_process_tree(tmp_path):
+    """Issue #2207 OWNER P1-2 item 5 (PR #2221 REQUEST_CHANGES): a
+    production-shaped integration test that goes through
+    `contract_readiness_check.run_baseline_vc_preflight()` -- the REAL
+    production entry point `run_root_review_pipeline.py`'s
+    `_cmd_produce()` uses -- not a hand-rolled harness that calls
+    `baseline_vc_preflight.py` internals directly. It actually triggers an
+    outer (aggregate wrapper) deadline via `override_timeout_seconds`
+    (Issue #2207 OWNER P1-2 item 7's DI hook), spawns both a direct child
+    (the VC leader, a `pytest` worker process) and a SIGTERM-ignoring
+    grandchild, confirms the `baseline_vc_preflight.py` SIGTERM handler
+    actually ran (via a test-only marker file it writes on handler entry),
+    confirms FULL absence of the wrapper (`baseline_vc_preflight.py`
+    itself), the VC leader, and the grandchild afterward, confirms the
+    outer result is the typed `runtime_error` / `baseline_vc_preflight_aggregate`
+    timeout-phase payload (never a plain `errors: [...]` blocked payload),
+    and repeats this `_OUTER_DEADLINE_REPEAT_COUNT` times (see rationale
+    above) to catch register/unregister ordering races."""
+    # `sys.executable` itself may report basename "python" (e.g. a venv's
+    # primary entry point) rather than "python3", but the VC preflight
+    # allowlist requires the literal basename "python3" (Issue #2207 OWNER
+    # P1-2 item 5). venvs created by `uv`/`python -m venv` conventionally
+    # also install a "python3" sibling binary alongside "python" in the
+    # same bin directory (pointing at the same interpreter) -- use that
+    # sibling so the spawned process still has pytest installed.
+    interpreter = str(Path(sys.executable).parent / "python3")
+    assert Path(interpreter).exists(), (
+        f"expected a 'python3' sibling binary next to sys.executable ({sys.executable!r}) "
+        f"for the VC preflight allowlist to accept it, but {interpreter!r} does not exist"
+    )
+
+    for iteration in range(_OUTER_DEADLINE_REPEAT_COUNT):
+        marker_dir = tmp_path / f"iter_{iteration}"
+        marker_dir.mkdir()
+
+        sigterm_marker_path = marker_dir / "sigterm_handler.marker"
+        self_pid_path = marker_dir / "self.pid"
+        grandchild_pid_path = marker_dir / "grandchild.pid"
+
+        fixture_source = (
+            "import os\n"
+            "import signal\n"
+            "import subprocess\n"
+            "import sys\n"
+            "\n"
+            "\n"
+            "def _ignore_sigterm(signum, frame):\n"
+            "    pass\n"
+            "\n"
+            "\n"
+            "def test_spawn_sigterm_ignoring_grandchild_and_sleep():\n"
+            "    signal.signal(signal.SIGTERM, _ignore_sigterm)\n"
+            "    grandchild = subprocess.Popen(\n"
+            "        [sys.executable, \"-c\",\n"
+            "         \"import signal, time\\n\"\n"
+            "         \"signal.signal(signal.SIGTERM, lambda *a: None)\\n\"\n"
+            "         \"time.sleep(30.0)\"]\n"
+            "    )\n"
+            f"    with open({str(self_pid_path)!r}, \"w\") as f:\n"
+            "        f.write(str(os.getpid()))\n"
+            f"    with open({str(grandchild_pid_path)!r}, \"w\") as f:\n"
+            "        f.write(str(grandchild.pid))\n"
+            "    grandchild.wait()\n"
+        )
+        fixture_path = marker_dir / "test_immortal_grandchild_fixture.py"
+        fixture_path.write_text(fixture_source, encoding="utf-8")
+
+        body = (
+            "## Verification Commands\n\n"
+            "```bash\n"
+            f"$ {interpreter} -m pytest {fixture_path} -q -s\n"
+            "```\n"
+        )
+
+        result, exit_code = crc.run_baseline_vc_preflight(
+            body,
+            override_timeout_seconds=_OUTER_DEADLINE_SECONDS,
+            override_grace_seconds=_REAP_GRACE_SECONDS,
+            _test_extra_env={
+                "BASELINE_VC_PREFLIGHT_TEST_SIGTERM_MARKER_PATH": str(sigterm_marker_path),
+            },
+        )
+
+        # Typed runtime_error payload (Issue #2165 P0-1 / Issue #2207 OWNER
+        # P0-1): never a plain `errors: ["timeout"]` blocked payload.
+        assert result["status"] == "runtime_error", result
+        assert result["failure_class"] == "timeout", result
+        assert result["timeout_phase"] == "baseline_vc_preflight_aggregate", result
+        assert result["retryable"] is False, result
+        assert exit_code == -1
+
+        # The SIGTERM handler must have actually run (not just "the process
+        # died somehow") -- the marker file is written ONLY from inside
+        # `main()`'s `except CooperativeCancellationRequested` block.
+        _wait_for_file(sigterm_marker_path, timeout=5.0)
+        marker_content = sigterm_marker_path.read_text()
+        assert marker_content.startswith("sigterm_handler_entered pid="), marker_content
+        wrapper_pid = int(marker_content.strip().split("pid=", 1)[1])
+
+        # The VC leader and grandchild pid files are only written once the
+        # fixture actually started running, so their presence here proves
+        # the process tree was genuinely alive before the outer deadline
+        # reaped it (not "never started").
+        _wait_for_file(self_pid_path, timeout=5.0)
+        _wait_for_file(grandchild_pid_path, timeout=5.0)
+        vc_leader_pid = int(self_pid_path.read_text().strip())
+        grandchild_pid = int(grandchild_pid_path.read_text().strip())
+
+        # Full absence of wrapper / VC-leader / grandchild, confirmed via
+        # bounded poll (reap is asynchronous relative to
+        # `run_baseline_vc_preflight()` returning in the rare case the
+        # supervisor's own poll window elapsed right at the edge).
+        assert _wait_until_dead(wrapper_pid, timeout=5.0), (
+            f"wrapper (baseline_vc_preflight.py, pid={wrapper_pid}) was not reaped "
+            f"after the outer deadline (iteration {iteration})"
+        )
+        assert _wait_until_dead(vc_leader_pid, timeout=5.0), (
+            f"VC leader (pid={vc_leader_pid}) was not reaped after the outer "
+            f"deadline (iteration {iteration})"
+        )
+        assert _wait_until_dead(grandchild_pid, timeout=5.0), (
+            f"SIGTERM-ignoring grandchild (pid={grandchild_pid}) was not reaped "
+            f"after the outer deadline (iteration {iteration}) -- process group leak"
+        )
+
+
+
+def test_kill_process_group_reaps_sigterm_ignoring_grandchild(tmp_path):
+    """Issue #2207 OWNER P0-3 (PR #2221 REQUEST_CHANGES) regression test:
+    `_kill_process_group()` must reap the WHOLE process group, not just
+    the leader, even when a grandchild explicitly ignores SIGTERM. Prior
+    behavior `return`ed as soon as the LEADER's own `process.wait()`
+    succeeded (the leader itself does not ignore SIGTERM here and exits
+    normally), leaving the SIGTERM-ignoring grandchild running forever
+    (SIGKILL was only ever sent along the leader's own wait path, never as
+    a group-wide fallback after leader-exit)."""
+    self_pid_path = tmp_path / "leader.pid"
+    grandchild_pid_path = tmp_path / "grandchild.pid"
+
+    leader_source = (
+        "import os\n"
+        "import subprocess\n"
+        "import sys\n"
+        "\n"
+        "grandchild = subprocess.Popen(\n"
+        "    [sys.executable, \"-c\",\n"
+        "     \"import signal, time\\n\"\n"
+        "     \"signal.signal(signal.SIGTERM, lambda *a: None)\\n\"\n"
+        "     \"time.sleep(30.0)\"]\n"
+        ")\n"
+        f"with open({str(self_pid_path)!r}, \"w\") as f:\n"
+        "    f.write(str(os.getpid()))\n"
+        f"with open({str(grandchild_pid_path)!r}, \"w\") as f:\n"
+        "    f.write(str(grandchild.pid))\n"
+        "grandchild.wait()\n"
+    )
+    leader_path = tmp_path / "leader.py"
+    leader_path.write_text(leader_source, encoding="utf-8")
+
+    process = subprocess.Popen(
+        [sys.executable, str(leader_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        _wait_for_file(self_pid_path)
+        _wait_for_file(grandchild_pid_path)
+        leader_pid = int(self_pid_path.read_text().strip())
+        grandchild_pid = int(grandchild_pid_path.read_text().strip())
+        assert leader_pid == process.pid
+        assert _pid_alive(leader_pid)
+        assert _pid_alive(grandchild_pid)
+
+        vcp._kill_process_group(process, grace_seconds=0.5, poll_interval=0.02)
+
+        assert _wait_until_dead(leader_pid, timeout=5.0), "leader was not reaped"
+        assert _wait_until_dead(
+            grandchild_pid, timeout=5.0
+        ), "SIGTERM-ignoring grandchild survived _kill_process_group() -- process group leak"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        for p in (self_pid_path, grandchild_pid_path):
+            if p.exists():
+                try:
+                    pid = int(p.read_text().strip())
+                    if _pid_alive(pid):
+                        os.kill(pid, signal.SIGKILL)
+                except (ValueError, OSError):
+                    pass

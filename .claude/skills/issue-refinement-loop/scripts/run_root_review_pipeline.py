@@ -310,7 +310,7 @@ def run_check_issue_contract(
 
 
 def run_contract_readiness_check(
-    body_file: str, *, mode: str = "execute", timeout_seconds: int = CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS
+    body_file: str, *, mode: str = "execute", timeout_seconds: float = CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS
 ) -> tuple[dict | None, int, str | None]:
     """Run `contract_readiness_check.py --body-file <body_file> --mode <mode>`.
 
@@ -322,17 +322,28 @@ def run_contract_readiness_check(
     + `baseline_vc_preflight.py` aggregate wrapper timeout + margin). This
     removes the previous drift hazard where two independently hand-picked
     numbers (250 here, ~230s inner ceiling there) could silently invert.
+
+    Issue #2207 OWNER P0-1 (PR #2221 REQUEST_CHANGES): uses
+    `baseline_vc_preflight.run_subprocess_with_cooperative_supervisor()`
+    instead of `subprocess.run(timeout=...)` -- the latter sends SIGKILL
+    directly to `contract_readiness_check.py` on timeout, bypassing that
+    process's own cooperative SIGTERM handling (which itself needs to run
+    to cooperatively reap `baseline_vc_preflight.py`'s VC descendants) and
+    orphaning VC process groups several levels down. `timeout_seconds` is
+    `float` (not `int`) so callers under test can inject sub-second
+    deadlines (Issue #2207 OWNER P1-2 item 7).
     """
     script_path = _ISSUE_CONTRACT_REVIEW_SCRIPTS / "contract_readiness_check.py"
     cmd = [sys.executable, str(script_path), "--body-file", body_file, "--mode", mode]
-    try:
-        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
+    supervised = _baseline_vc_preflight.run_subprocess_with_cooperative_supervisor(
+        cmd, timeout_seconds=timeout_seconds
+    )
+    if supervised.timed_out:
         return None, -1, "timeout"
     try:
-        return json.loads(completed.stdout), completed.returncode, None
+        return json.loads(supervised.stdout), supervised.returncode, None
     except json.JSONDecodeError:
-        return None, completed.returncode, "malformed_json"
+        return None, supervised.returncode, "malformed_json"
 
 
 def run_merge_readiness(
@@ -1081,8 +1092,12 @@ def _cmd_produce(args: argparse.Namespace) -> int:
     # `run_reviewer_transport()` / `run-checker-attempt`.
     _vc_plan = _compute_canonical_vc_plan(body)
     try:
+        # Issue #2207 OWNER P1-3 (PR #2221 REQUEST_CHANGES): `command_occurrence_count`,
+        # per the Issue #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`
+        # (an earlier implementation iteration substituted the dedup-aware
+        # actual-launch upper bound without an Issue reframe).
         _review_budget = _derive_review_budget(
-            _vc_plan["launch_upper_bound"], policy_cap=_vc_plan["policy_cap"]
+            _vc_plan["command_occurrence_count"], policy_cap=_vc_plan["policy_cap"]
         )
     except _VerificationBudgetExceedsPolicyError as exc:
         print(
