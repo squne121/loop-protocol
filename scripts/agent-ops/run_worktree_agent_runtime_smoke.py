@@ -1826,34 +1826,68 @@ def _marker_provenance_verified(
     expected_markers: list[str] | None,
     last_assistant_message: str | None,
     transcript_content: str | None,
-) -> bool:
-    """Issue #2183 AC11/AC12 / PR #2220 P0-2 fix-delta: whether EVERY
-    expected marker (not merely at least one, as the pre-fix-delta ``any()``
-    check allowed) is recovered from a CHILD-scoped source -- the
+) -> tuple[bool, bool]:
+    """Issue #2183 AC11/AC12 / PR #2220 P0-2 fix-delta (further refined by
+    the P1-1-vs-``last_assistant_message``-primacy fix-delta below): whether
+    EVERY expected marker (not merely at least one, as the pre-fix-delta
+    ``any()`` check allowed) is recovered from a CHILD-scoped source -- the
     correlated ``SubagentStop`` event's own ``last_assistant_message``
     field (the primary provenance source: the child's actual final
     response, per the official hook payload contract), and/or the
     assistant-authored records of the child's own transcript file (parsed
     via ``_extract_assistant_message_texts_from_transcript``, which excludes
-    user-prompt and tool-input records -- the exact provenance gap this
-    fix-delta closes: a marker that appears ONLY in the child's own prompt
-    or tool input, never in anything the child itself said, must not count).
+    user-prompt and tool-input records -- the exact provenance gap the
+    P0-2 fix-delta closed: a marker that appears ONLY in the child's own
+    prompt or tool input, never in anything the child itself said, must not
+    count).
 
-    ``True`` when ``expected_markers`` is empty/``None`` (no marker
-    provenance claim is being made, so there is nothing to fail). ``False``
-    when there is no child-scoped text to search at all, or when any single
-    expected marker is absent from the combined child-scoped text."""
-    if not expected_markers:
-        return True
+    Returns ``(verified, transcript_fallback_used)``.
+
+    P1-1-vs-primacy fix-delta (live-verified against a real ``--runtime
+    claude --mode structured`` run, run_id ``2e93d701786c``, tested_head
+    ``28c16484``): when ``last_assistant_message`` ALONE already satisfies
+    every expected marker, ``transcript_fallback_used`` is ``False`` -- the
+    caller must NOT then also require ``agent_transcript_verified`` (P1-1's
+    file-existence/content check) to be ``True``. Structured-lane
+    ``--no-session-persistence`` runs have been observed to write only a
+    small ``agent-<id>.meta.json`` stub, never the full per-agent
+    ``.jsonl`` transcript that P1-1 verifies -- a structural, runtime-mode
+    artifact of that lane, not evidence the SubAgent didn't genuinely run.
+    ``last_assistant_message`` is the OFFICIAL hook payload's own
+    provenance field for "what did this child actually say", independent
+    of whether its transcript file was persisted.
+
+    In every other case (``last_assistant_message`` absent, or present but
+    not sufficient on its own to cover every expected marker)
+    ``transcript_fallback_used`` is ``True`` and the child's own transcript
+    file content is folded into the combined text the markers are checked
+    against -- exactly the original (pre-this-fix-delta) behavior. This
+    keeps ``agent_transcript_verified`` a hard gate for every case that
+    still relies, even partially, on the transcript file for marker
+    provenance (AC11's file-existence/symlink/size/content checks, and
+    AC12's negative control, are unaffected).
+
+    ``verified`` is ``True`` when ``expected_markers`` is empty/``None``
+    (no marker provenance claim is being made, so there is nothing to
+    fail) -- and in that case ``transcript_fallback_used`` stays ``True``
+    (no ``last_assistant_message``-alone fast path applies when there was
+    no marker claim to satisfy from it in the first place), preserving the
+    pre-existing requirement that a correlated Stop with no expected
+    markers still needs a genuinely verified transcript file (AC11)."""
+    if expected_markers and last_assistant_message:
+        if all(marker in last_assistant_message for marker in expected_markers):
+            return True, False
     child_texts: list[str] = []
     if last_assistant_message:
         child_texts.append(last_assistant_message)
     if transcript_content:
         child_texts.extend(_extract_assistant_message_texts_from_transcript(transcript_content))
+    if not expected_markers:
+        return True, True
     if not child_texts:
-        return False
+        return False, True
     combined = "\n".join(child_texts)
-    return all(marker in combined for marker in expected_markers)
+    return all(marker in combined for marker in expected_markers), True
 
 
 def subagent_causal_evidence_verdict(
@@ -1966,16 +2000,30 @@ def subagent_causal_evidence_verdict(
         tool_invocation_id_correlated = tool_correlation["tool_invocation_id_correlated"]
         terminal_tool_result_success = tool_correlation["terminal_tool_result_success"]
 
-        marker_provenance_verified = _marker_provenance_verified(
-            expected_markers, stop["last_assistant_message"], transcript_content
+        marker_provenance_verified, marker_provenance_transcript_fallback_used = (
+            _marker_provenance_verified(
+                expected_markers, stop["last_assistant_message"], transcript_content
+            )
         )
 
+        # P1-1-vs-primacy fix-delta (Issue #2183 PR #2220 OWNER P0-2
+        # follow-up): ``agent_transcript_verified`` (P1-1's file-existence/
+        # symlink/size/content check) is a hard gate ONLY when marker
+        # provenance actually relied on the transcript file -- i.e. when
+        # ``last_assistant_message`` was absent or, alone, did not already
+        # cover every expected marker. When ``last_assistant_message``
+        # alone fully satisfied marker provenance, an unverifiable/missing
+        # transcript file (e.g. the structured ``--no-session-persistence``
+        # lane's ``agent-<id>.meta.json`` stub, which never writes the full
+        # ``.jsonl`` transcript) must not, by itself, block promotion --
+        # ``agent_transcript_verified`` is recorded as audit metadata only
+        # in that case, never consulted for ``qualifies``.
         qualifies = (
             agent_transcript_path is not None
-            and agent_transcript_verified
             and tool_invocation_id_correlated
             and terminal_tool_result_success
             and marker_provenance_verified
+            and (not marker_provenance_transcript_fallback_used or agent_transcript_verified)
         )
         evaluated_candidates.append(
             {
@@ -1986,6 +2034,9 @@ def subagent_causal_evidence_verdict(
                 "tool_invocation_id_correlated": tool_invocation_id_correlated,
                 "terminal_tool_result_success": terminal_tool_result_success,
                 "marker_provenance_verified": marker_provenance_verified,
+                "marker_provenance_transcript_fallback_used": (
+                    marker_provenance_transcript_fallback_used
+                ),
                 "last_assistant_message": stop["last_assistant_message"],
                 "qualifies": qualifies,
             }
@@ -2011,12 +2062,16 @@ def subagent_causal_evidence_verdict(
         agent_transcript_verified = chosen["agent_transcript_verified"]
         tool_invocation_id_correlated = chosen["tool_invocation_id_correlated"]
         marker_provenance_verified = chosen["marker_provenance_verified"]
+        marker_provenance_transcript_fallback_used = chosen[
+            "marker_provenance_transcript_fallback_used"
+        ]
     else:
         agent_id = None
         agent_transcript_path = None
         agent_transcript_verified = False
         tool_invocation_id_correlated = False
         marker_provenance_verified = not expected_markers
+        marker_provenance_transcript_fallback_used = True
 
     if causal_evidence_source is None:
         if events:
@@ -2043,9 +2098,20 @@ def subagent_causal_evidence_verdict(
         "subagent_start_observed": subagent_start_observed,
         "subagent_stop_observed": subagent_stop_observed,
         "agent_transcript_path": agent_transcript_path,
+        # P1-1-vs-primacy fix-delta (audit metadata only -- see
+        # ``_marker_provenance_verified`` and the ``qualifies`` computation
+        # above for how this field's meaning as a hard gate is now scoped):
+        # ``agent_transcript_verified`` remains the honest P1-1 file
+        # existence/symlink/size/content verdict for this candidate's
+        # transcript path, but it only participates in
+        # ``causal_evidence_source`` promotion when
+        # ``marker_provenance_transcript_fallback_used`` is True.
         "agent_transcript_verified": agent_transcript_verified,
         "tool_invocation_id_correlated": tool_invocation_id_correlated,
         "marker_provenance_verified": marker_provenance_verified,
+        "marker_provenance_transcript_fallback_used": (
+            marker_provenance_transcript_fallback_used
+        ),
         "causal_evidence_source": causal_evidence_source,
         "causal_evidence_ambiguous_candidate_count": (
             len(fully_qualifying) if len(fully_qualifying) > 1 else None

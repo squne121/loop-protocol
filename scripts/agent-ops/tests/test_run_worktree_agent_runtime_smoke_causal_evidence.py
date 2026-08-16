@@ -1114,3 +1114,129 @@ def test_given_multiple_fully_qualifying_candidate_chains_when_verdict_computed_
     verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
     assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
     assert verdict["causal_evidence_ambiguous_candidate_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# PR #2220 fix_delta (P1-1-vs-``last_assistant_message``-primacy):
+# live-verified regression -- ``run_worktree_agent_runtime_smoke.py`` run
+# against native Claude Code (``--runtime claude --mode structured``,
+# run_id ``2e93d701786c``, tested_head ``28c16484``) genuinely observed
+# ``subagent_start_observed``/``subagent_stop_observed`` True (matching
+# ``agent_id``), ``tool_invocation_id_correlated`` True, and
+# ``marker_provenance_verified`` True via ``last_assistant_message`` --
+# yet the correlated Stop's ``agent_transcript_path`` pointed at a
+# ``.jsonl`` file that was never actually written (the structured lane's
+# ``--no-session-persistence`` mode instead wrote only a small
+# ``agent-<id>.meta.json`` stub), so ``agent_transcript_verified`` was
+# False and the pre-fix-delta code fell all the way through to
+# ``causal_evidence_source: 'no_evidence'``, wrongly FAILing
+# ``--require-subagent-causal-evidence`` despite genuine, hook-ID-
+# correlated SubAgent evidence being present. Per OWNER's own P0-2
+# comment, ``last_assistant_message`` is the correct PRIMARY provenance
+# source and the transcript file is merely supplementary audit evidence,
+# not a hard gate, once marker provenance is independently confirmed from
+# ``last_assistant_message`` alone.
+# ---------------------------------------------------------------------------
+
+
+def test_given_last_assistant_message_satisfies_markers_transcript_missing_then_hook_id_correlated(
+    tmp_path,
+) -> None:
+    # Regression fixture mirroring the live run_id 2e93d701786c evidence:
+    # a genuine, fully-correlated Start/Stop/tool-invocation chain whose
+    # SubagentStop payload DOES carry a synthetic ``agent_transcript_path``
+    # (exactly the shape a real hook payload has), but no file was ever
+    # written at that path -- the structured ``--no-session-persistence``
+    # lane's actual observed behavior. ``last_assistant_message`` alone
+    # already contains every expected marker.
+    missing_transcript_path = tmp_path / "agent-a14b7e0673d997e52.jsonl"
+    stdout = "\n".join(
+        _fully_correlated_stdout_lines(
+            str(missing_transcript_path),
+            last_assistant_message=f"Subagent finished: {COMPLETION_MARKER}",
+        )
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["subagent_start_observed"] is True
+    assert verdict["subagent_stop_observed"] is True
+    assert verdict["agent_id"] == CHILD_AGENT_ID
+    assert verdict["tool_invocation_id_correlated"] is True
+    assert verdict["agent_transcript_path"] == str(missing_transcript_path)
+    # The audit-only P1-1 file-existence check is genuinely False here --
+    # this fixture must NOT paper over that fact -- but it must not, by
+    # itself, block promotion once last_assistant_message alone has
+    # already confirmed marker provenance.
+    assert verdict["agent_transcript_verified"] is False
+    assert verdict["marker_provenance_verified"] is True
+    assert verdict["marker_provenance_transcript_fallback_used"] is False
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_given_no_last_assistant_message_and_transcript_missing_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    # Companion negative case for the fix above (task item 3): when
+    # ``last_assistant_message`` is NOT available at all, marker
+    # provenance must still fall back to the transcript file, and a
+    # missing transcript file must still fail closed exactly as before --
+    # the P1-1-vs-primacy relaxation must never apply when there is no
+    # last_assistant_message to serve as the primary source.
+    missing_transcript_path = tmp_path / "agent-a14b7e0673d997e52.jsonl"
+    stdout = "\n".join(_fully_correlated_stdout_lines(str(missing_transcript_path)))
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_transcript_verified"] is False
+    assert verdict["marker_provenance_verified"] is False
+    assert verdict["marker_provenance_transcript_fallback_used"] is True
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_last_assistant_message_partial_markers_and_transcript_missing_then_not_correlated(
+    tmp_path,
+) -> None:
+    # When last_assistant_message covers only SOME of the expected
+    # markers, the fast path must NOT apply (it requires ALL expected
+    # markers to already be satisfied from last_assistant_message alone) --
+    # provenance falls back to the (here, missing) transcript file, and
+    # must still fail closed even though last_assistant_message contains
+    # one of the two markers.
+    missing_transcript_path = tmp_path / "agent-a14b7e0673d997e52.jsonl"
+    stdout = "\n".join(
+        _fully_correlated_stdout_lines(
+            str(missing_transcript_path),
+            last_assistant_message=f"done: {MARKER_1}",
+        )
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [MARKER_1, MARKER_2])
+    assert verdict["agent_transcript_verified"] is False
+    assert verdict["marker_provenance_transcript_fallback_used"] is True
+    assert verdict["marker_provenance_verified"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_unrelated_subagent_message_has_marker_transcript_missing_then_not_correlated(
+    tmp_path,
+) -> None:
+    # AC12 negative-control companion: even with the P1-1-vs-primacy
+    # relaxation, an UNRELATED SubAgent's own last_assistant_message must
+    # still independently confirm the parent's expected marker on its own
+    # scoped terms -- this is not a weakening of AC12, it is the same
+    # marker-provenance check, just exercised via the
+    # last_assistant_message fast path instead of the transcript-fallback
+    # path. Included to pin that the relaxation is scoped to the
+    # transcript-verification gate only, never to which child's own text
+    # is searched.
+    missing_transcript_path = tmp_path / "unrelated-agent-transcript.jsonl"
+    stdout = "\n".join(
+        _fully_correlated_stdout_lines(
+            str(missing_transcript_path),
+            agent_id=OTHER_AGENT_ID,
+            last_assistant_message="the unrelated child said something else entirely",
+        )
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_id"] == OTHER_AGENT_ID
+    assert verdict["marker_provenance_verified"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
