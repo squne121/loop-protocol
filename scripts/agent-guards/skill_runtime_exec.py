@@ -40,6 +40,7 @@ from skill_runtime_command_policy import (
     is_exact_skill_runtime_decide_executor_command,
     is_exact_skill_runtime_executor_command,
     is_exact_skill_runtime_fixture_executor_command,
+    is_exact_skill_runtime_repair_action_apply_executor_command,
     load_registry_entry,
     parse_config_get_regexp_name_only_nul,
     reject_git_global_options,
@@ -1931,6 +1932,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--router-receipt-path", required=False, default=None)
     parser.add_argument("--contract-patch-plan-file", required=False, default=None)
     parser.add_argument("--anchor-context-file", required=False, default=None)
+    # Issue #2039 AC8/AC11: repair_action.apply.
+    parser.add_argument("--apply-repair-action", required=False, default=None)
     # #2086 P0 fix_delta (Blocker 1/2): only ever meaningful for
     # preflight.run.with_human_context (the operator-selected human-context
     # lane) -- see skill_runtime_command_policy._parse_exact_skill_runtime_anchor_command.
@@ -1981,6 +1984,7 @@ def main(argv: list[str] | None = None) -> int:
     is_decide_command = args.command_id == "decide.run"
     is_produce_command = args.command_id == "authority_transport.produce"
     is_consume_command = args.command_id == "authority_transport.consume"
+    is_repair_action_apply_command = args.command_id == "repair_action.apply"
     # #2086 P0 fix_delta (Blocker 3): decide.run may ALSO carry
     # --invocation-id/--git-head-sha (bound into its Mode B authority-check
     # sub-fields), in addition to authority_transport.produce/consume.
@@ -1996,6 +2000,18 @@ def main(argv: list[str] | None = None) -> int:
             "skill_runtime_exec: --invocation-id/--git-head-sha/--evidence-fixture-path/"
             "--router-receipt-path/--contract-patch-plan-file/--anchor-context-file are "
             "only allowed for authority_transport.produce/authority_transport.consume/decide.run",
+            file=sys.stderr,
+        )
+        return 2
+    if not is_repair_action_apply_command and args.apply_repair_action:
+        print(
+            "skill_runtime_exec: --apply-repair-action is only allowed for repair_action.apply",
+            file=sys.stderr,
+        )
+        return 2
+    if is_repair_action_apply_command and not args.apply_repair_action:
+        print(
+            "skill_runtime_exec: --apply-repair-action is required for repair_action.apply",
             file=sys.stderr,
         )
         return 2
@@ -2350,6 +2366,41 @@ def main(argv: list[str] | None = None) -> int:
         ):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
+    elif is_repair_action_apply_command:
+        if (
+            args.fixture
+            or args.anchor_comment_url
+            or args.loop_state_file
+            or args.review_result_verdict
+            or args.max_iterations
+        ):
+            print(
+                "skill_runtime_exec: only --apply-repair-action is allowed for "
+                "repair_action.apply",
+                file=sys.stderr,
+            )
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--apply-repair-action",
+                args.apply_repair_action,
+            ]
+        )
+        if not is_exact_skill_runtime_repair_action_apply_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
     else:
         if args.fixture:
             print("skill_runtime_exec: --fixture is only allowed for preflight.run.fixture", file=sys.stderr)
@@ -2487,6 +2538,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.contract_patch_plan_file and args.anchor_context_file:
             render_params["contract_patch_plan_file"] = args.contract_patch_plan_file
             render_params["anchor_context_file"] = args.anchor_context_file
+    elif is_repair_action_apply_command:
+        render_params = {
+            "issue_number": args.issue_number,
+            "repo": args.repo,
+            "preflight_result_path": args.apply_repair_action,
+        }
     else:
         render_params = {"issue_number": args.issue_number, "repo": args.repo}
         if is_fixture_command or is_fixture_human_context_command:

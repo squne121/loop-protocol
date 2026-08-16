@@ -387,7 +387,7 @@
     },
     "repair_action": {
       "type": "object",
-      "description": "Versioned repair_action disposition projection (Issue #2016). Present only when status == needs_fix (disposition: auto_apply_safe). Mirrors the producer repair_action contract (repair_issue_contract_result_v1.schema.json) with wrapper-owned diagnostics_artifact / candidate_body_artifact paths filled in.",
+      "description": "Versioned repair_action disposition projection (Issue #2016). Present only when status == needs_fix (disposition: auto_apply_safe). Mirrors the producer repair_action contract (repair_issue_contract_result_v1.schema.json) with wrapper-owned diagnostics_artifact / candidate_body_artifact paths filled in. Migrated for Issue #2039 repair_action.apply consumer: adds optional provenance-lane fields (source_lane, preflight_run_identity, original_updated_at, source_refs_digest). These are additive/optional; absence (older artifacts) does not invalidate the payload.",
       "additionalProperties": false,
       "required": [
         "schema_version",
@@ -447,6 +447,40 @@
           "items": {
             "type": "string"
           }
+        },
+        "source_lane": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "human_context",
+            "anchor",
+            "unanchored",
+            null
+          ],
+          "description": "Provenance lane the producer run executed under (Issue #2039 AC9). Null for pre-migration historical artifacts."
+        },
+        "preflight_run_identity": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Identity of the preflight run that produced this repair_action (e.g. result_core_sha256 of that run). Null for pre-migration historical artifacts."
+        },
+        "original_updated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "GitHub Issue updatedAt captured at candidate-generation time. Null for pre-migration historical artifacts."
+        },
+        "source_refs_digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Digest binding source refs (anchor comment URL/id, human-context evidence) used by the producer run. Null for unanchored lane or pre-migration historical artifacts."
         }
       }
     },
