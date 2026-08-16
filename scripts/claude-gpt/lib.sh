@@ -34,6 +34,30 @@ claude_gpt_proxy_home_dir() {
   printf '%s/proxy-home\n' "$CLAUDE_GPT_HOME"
 }
 
+# --- Claude/AGY プロセス専用の隔離 HOME / GH_CONFIG_DIR / XDG directories（P0-6）。
+# OWNER adversarial review（PR #2214 コメント）は、Claude process が proxy 専用 HOME
+# 分離とは独立に、呼び出し元の実 HOME をそのまま継承しているため ambient `gh auth`
+# credential（`$HOME/.config/gh` 等）へ到達可能である点を指摘した。ここで用意する
+# ディレクトリは空（`gh auth login` 未実行）のまま launch.sh が Claude 子プロセスの
+# `HOME` / `GH_CONFIG_DIR` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` として注入し、
+# raw `gh` を Claude/AGY プロセスから起動しても genuine auth context を利用できない
+# ようにする（GitHub write credential は broker のみが保持する。Outcome 節）。
+claude_gpt_claude_isolated_home_dir() {
+  printf '%s/claude-home\n' "$CLAUDE_GPT_HOME"
+}
+
+claude_gpt_claude_isolated_gh_config_dir() {
+  printf '%s/claude-gh-config\n' "$CLAUDE_GPT_HOME"
+}
+
+claude_gpt_claude_isolated_xdg_config_dir() {
+  printf '%s/claude-xdg-config\n' "$CLAUDE_GPT_HOME"
+}
+
+claude_gpt_claude_isolated_xdg_cache_dir() {
+  printf '%s/claude-xdg-cache\n' "$CLAUDE_GPT_HOME"
+}
+
 claude_gpt_mcp_config_path() {
   printf '%s/mcp-empty.json\n' "$(claude_gpt_claude_config_dir)"
 }
@@ -194,6 +218,23 @@ CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL="claude-gpt launcher narrow enviro
 
 CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL="claude-gpt launcher narrow allow（second-gate 判断補助。authority ではない）: ${CLAUDE_GPT_TRUSTED_REPO} に repository 固定した GitHub mutation transaction broker（canonical builder/wrapper 経由、raw gh api を使わない）による Issue の read/create/edit/comment/close と、同一 repository の PR の read/create/edit/comment/review、および同一 repository への non-force task-branch push（force push・branch/tag/release 削除・repository settings/IAM/secret 変更は含まない）。加えて repository-owned canonical codebase-investigator -> gemini-cli-headless-delegation -> provider=agy の read-only isolated delegation（direct arbitrary agy 起動・provider!=agy・canonical builder/wrapper bypass・AGY からの GitHub mutation は対象外）。決定論的な authority は permissions.deny / PreToolUse hook / transaction broker が持ち、この allow rule はその second-gate 判断補助に過ぎない。"
 
+# hard_deny への追加分（P0-2, PR #2214 OWNER adversarial review 反映）。$defaults の
+# hard_deny を置換・削除せず、default branch push・force push・remote ref
+# deletion を明示的に追加する。これは defense-in-depth の second-gate 補強であり、
+# 決定論的 authority は broker/PreToolUse hook 側にある（本 Issue の Allowed Paths
+# 内で実装できる範囲は launcher-owned settings のこの追加分と、Claude/AGY プロセスの
+# 隔離 HOME/GH_CONFIG_DIR による raw `gh` 認証遮断に限られる。raw `gh` /
+# raw `git push` を PreToolUse hook で deterministic に拒否する実装は、project
+# `.claude/settings.json` / hooks 設定という本 Issue の Allowed Paths 外への変更を
+# 要するため、別途 follow-up Issue で扱う）。
+CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL="claude-gpt launcher hard_deny 追加分（second-gate 補助・defense-in-depth）: ${CLAUDE_GPT_TRUSTED_REPO} の default branch（main）への直接 push は絶対拒否する。task-branch 以外への push は行わない。"
+CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL="claude-gpt launcher hard_deny 追加分（second-gate 補助・defense-in-depth）: force push（--force / --force-with-lease / +refspec）は絶対拒否する。"
+CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL="claude-gpt launcher hard_deny 追加分（second-gate 補助・defense-in-depth）: remote ref（branch/tag/release）の削除は絶対拒否する。"
+
+# `claude auto-mode config` readback で version-gate と実動作を検証する対応最小
+# Claude Code version（`classifyAllShell` が黙って無視されない最小 version。P0-3）。
+CLAUDE_GPT_MIN_SUPPORTED_CLAUDE_VERSION="2.1.193"
+
 # claude_gpt_json_escape: 任意文字列を JSON 文字列リテラル（引用符込み）へ変換する。
 # python3 が使えない環境では簡易 fallback（改行・制御文字は非対応）を使う。
 # 引数1: エスケープしたい生文字列
@@ -213,8 +254,12 @@ claude_gpt_json_escape() {
 claude_gpt_auto_mode_json_fragment() {
   env_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL")
   allow_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL")
-  printf '"autoMode": {"environment": ["$defaults", %s], "allow": ["$defaults", %s], "classifyAllShell": true}' \
-    "$env_label_json" "$allow_label_json"
+  hard_deny_default_branch_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL")
+  hard_deny_force_push_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL")
+  hard_deny_ref_deletion_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL")
+  printf '"autoMode": {"environment": ["$defaults", %s], "allow": ["$defaults", %s], "hard_deny": ["$defaults", %s, %s, %s], "classifyAllShell": true}' \
+    "$env_label_json" "$allow_label_json" \
+    "$hard_deny_default_branch_json" "$hard_deny_force_push_json" "$hard_deny_ref_deletion_json"
 }
 
 # claude_gpt_auto_mode_standalone_json: 上記フラグメントを単独の JSON オブジェクトとして
@@ -250,24 +295,48 @@ claude_gpt_auto_mode_readback() {
     claude_config_dir="${HOME:-/tmp}"
   fi
 
+  version_tmp=$(mktemp)
   defaults_tmp=$(mktemp)
   config_tmp=$(mktemp)
 
+  # `env -i` は呼び出し元の環境を明示指定分のみへリセットする（ambient env の
+  # readback invocation への意図しない漏洩を防ぐ）。hermetic test 用の fake
+  # claude binary 観測 channel（`FAKE_CLAUDE_*`）だけは、実 production では
+  # 一切設定されない前提のため、明示的に forward する（未設定時は空文字列の
+  # まま渡り、fake binary 側の `os.environ.get()` が falsy として扱う）。
   env -i PATH="$PATH" HOME="${HOME:-/tmp}" CLAUDE_CONFIG_DIR="$claude_config_dir" \
+    FAKE_CLAUDE_ARGV_LOG="${FAKE_CLAUDE_ARGV_LOG:-}" FAKE_CLAUDE_ARGV_FILE="${FAKE_CLAUDE_ARGV_FILE:-}" \
+    FAKE_CLAUDE_VERSION="${FAKE_CLAUDE_VERSION:-}" \
+    FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL="${FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL:-}" \
+    "$claude_bin" --version >"$version_tmp" 2>&1
+  version_rc=$?
+
+  env -i PATH="$PATH" HOME="${HOME:-/tmp}" CLAUDE_CONFIG_DIR="$claude_config_dir" \
+    FAKE_CLAUDE_ARGV_LOG="${FAKE_CLAUDE_ARGV_LOG:-}" FAKE_CLAUDE_ARGV_FILE="${FAKE_CLAUDE_ARGV_FILE:-}" \
+    FAKE_CLAUDE_VERSION="${FAKE_CLAUDE_VERSION:-}" \
+    FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL="${FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL:-}" \
     "$claude_bin" auto-mode defaults >"$defaults_tmp" 2>&1
   defaults_rc=$?
 
   env -i PATH="$PATH" HOME="${HOME:-/tmp}" CLAUDE_CONFIG_DIR="$claude_config_dir" \
+    FAKE_CLAUDE_ARGV_LOG="${FAKE_CLAUDE_ARGV_LOG:-}" FAKE_CLAUDE_ARGV_FILE="${FAKE_CLAUDE_ARGV_FILE:-}" \
+    FAKE_CLAUDE_VERSION="${FAKE_CLAUDE_VERSION:-}" \
+    FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL="${FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL:-}" \
     "$claude_bin" --settings "$settings_path" auto-mode config >"$config_tmp" 2>&1
   config_rc=$?
 
-  python3 - "$defaults_tmp" "$defaults_rc" "$config_tmp" "$config_rc" "$settings_path" \
-    "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL" "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL" <<'PYEOF'
+  python3 - "$version_tmp" "$version_rc" "$defaults_tmp" "$defaults_rc" "$config_tmp" "$config_rc" "$settings_path" \
+    "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL" "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL" \
+    "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL" "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL" \
+    "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL" "$CLAUDE_GPT_MIN_SUPPORTED_CLAUDE_VERSION" <<'PYEOF'
 import hashlib
 import json
+import re
 import sys
 
 (
+    version_path,
+    version_rc,
     defaults_path,
     defaults_rc,
     config_path,
@@ -275,7 +344,12 @@ import sys
     settings_path,
     env_label,
     allow_label,
-) = sys.argv[1:8]
+    hard_deny_default_branch_label,
+    hard_deny_force_push_label,
+    hard_deny_ref_deletion_label,
+    min_supported_version,
+) = sys.argv[1:14]
+version_rc = int(version_rc)
 defaults_rc = int(defaults_rc)
 config_rc = int(config_rc)
 
@@ -284,12 +358,36 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _parse_version(text: str) -> tuple[int, ...] | None:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
 reasons: list[str] = []
 
+with open(version_path, encoding="utf-8") as fh:
+    version_text = fh.read()
 with open(defaults_path, encoding="utf-8") as fh:
     defaults_text = fh.read()
 with open(config_path, encoding="utf-8") as fh:
     config_text = fh.read()
+
+# --- version gate（P0-3）。classifyAllShell は Claude Code v2.1.193 未満では
+#     黙って無視されるため、settings 文字列の有無ではなく実際に対応 version かを
+#     機械的に確認し、未対応/取得不能なら fail-closed とする。 ---
+parsed_version = _parse_version(version_text) if version_rc == 0 else None
+min_version = _parse_version(min_supported_version)
+version_ok = False
+if version_rc != 0:
+    reasons.append("claude_version_command_failed")
+elif parsed_version is None:
+    reasons.append("claude_version_unparsable")
+elif min_version is not None and parsed_version < min_version:
+    reasons.append("claude_version_below_minimum_supported")
+else:
+    version_ok = True
 
 defaults = None
 config = None
@@ -312,8 +410,10 @@ else:
 
 env_label_present = False
 allow_label_present = False
-hard_soft_unmodified = None
+hard_deny_superset_ok = None
+soft_deny_unmodified = None
 classify_all_shell_ok = False
+classify_all_shell_source = "not_evaluated"
 
 if defaults is not None and config is not None:
     for key in ("environment", "allow", "hard_deny", "soft_deny"):
@@ -327,38 +427,85 @@ if defaults is not None and config is not None:
     if not allow_label_present:
         reasons.append("allow_narrow_label_not_reflected")
 
-    hard_soft_unmodified = config.get("hard_deny") == defaults.get(
-        "hard_deny"
-    ) and config.get("soft_deny") == defaults.get("soft_deny")
-    if not hard_soft_unmodified:
-        reasons.append("hard_or_soft_deny_modified")
+    # hard_deny は $defaults を置換・削除せず、narrow な追加分（default branch
+    # push / force push / ref deletion）だけを加える契約（P0-2）。defaults の
+    # 全 entry を含み、かつ3件の追加 deny 文言を含むことを確認する（任意の
+    # 超集合を許容する緩い検査にはしない）。
+    config_hard_deny = config.get("hard_deny", [])
+    defaults_hard_deny = defaults.get("hard_deny", [])
+    hard_deny_contains_defaults = all(entry in config_hard_deny for entry in defaults_hard_deny)
+    hard_deny_contains_additions = (
+        hard_deny_default_branch_label in config_hard_deny
+        and hard_deny_force_push_label in config_hard_deny
+        and hard_deny_ref_deletion_label in config_hard_deny
+    )
+    hard_deny_superset_ok = hard_deny_contains_defaults and hard_deny_contains_additions
+    if not hard_deny_superset_ok:
+        reasons.append("hard_deny_defaults_or_additions_missing")
 
-try:
-    with open(settings_path, encoding="utf-8") as fh:
-        settings_text = fh.read()
-except OSError:
-    settings_text = ""
-classify_all_shell_ok = (
-    '"classifyAllShell": true' in settings_text
-    or '"classifyAllShell":true' in settings_text
-)
-if not classify_all_shell_ok:
-    reasons.append("classify_all_shell_not_enabled")
+    soft_deny_unmodified = config.get("soft_deny") == defaults.get("soft_deny")
+    if not soft_deny_unmodified:
+        reasons.append("soft_deny_modified")
+
+    # classifyAllShell の readback（P0-3）。実機検証（Claude Code 2.1.233,
+    # 2026-08-16）の結果、現行 CLI の `auto-mode defaults` / `auto-mode config`
+    # JSON はこの key 自体を一切出力しない（settings 側で明示 true にしていても
+    # effective config オブジェクトに現れない）。そのため effective config の
+    # key 存在を正本にする検証は現行 CLI では原理的に成立しない（vendor CLI の
+    # 制約であり、settings 文字列チェックの単純な置き換えでは代替できない）。
+    # ここでは「settings 文字列存在チェックだけでは CLI が key を無視していても
+    # PASS してしまう」という P0-3 の懸念に対し、二重の検証で fail-closed に
+    # 倒す。
+    #   1. effective config に key が現れる場合（将来 CLI がこの key を
+    #      公開した場合）はそれを正本として使う。
+    #   2. key が現れない場合は、(a) version gate（対応 CLI version 以上）と
+    #      (b) settings ファイル上の literal `"classifyAllShell": true` の
+    #      両方を要求する（version gate 単独より厳格。CLI が対応 version
+    #      以上であっても readback で真偽を確認できない現状の限界を、
+    #      「未対応 version は無条件 fail-closed」で部分的に補う）。
+    classify_all_shell_source = "effective_config"
+    if "classifyAllShell" in config:
+        classify_all_shell_ok = config.get("classifyAllShell") is True
+        if not classify_all_shell_ok:
+            reasons.append("classify_all_shell_not_enabled")
+    else:
+        classify_all_shell_source = "settings_literal_plus_version_gate_best_effort"
+        try:
+            with open(settings_path, encoding="utf-8") as fh:
+                settings_text = fh.read()
+        except OSError:
+            settings_text = ""
+        settings_literal_ok = (
+            '"classifyAllShell": true' in settings_text or '"classifyAllShell":true' in settings_text
+        )
+        classify_all_shell_ok = settings_literal_ok and version_ok
+        if not settings_literal_ok:
+            reasons.append("classify_all_shell_not_enabled")
+        elif not version_ok:
+            reasons.append("classify_all_shell_unverifiable_below_minimum_version")
 
 defaults_digest = _digest(defaults_text) if defaults is not None else "unknown"
 config_digest = _digest(config_text) if config is not None else "unknown"
 
-ok = not reasons
+ok = not reasons and version_ok
 
 result = {
     "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1",
     "status": "ok" if ok else "blocked",
     "ok": ok,
+    "claude_version": {
+        "raw": version_text.strip(),
+        "parsed": list(parsed_version) if parsed_version else None,
+        "min_supported": list(min_version) if min_version else None,
+        "ok": version_ok,
+    },
     "checks": {
         "environment_narrow_label_present": env_label_present,
         "allow_narrow_label_present": allow_label_present,
-        "hard_soft_deny_unmodified": bool(hard_soft_unmodified),
+        "hard_deny_defaults_and_additions_present": bool(hard_deny_superset_ok),
+        "soft_deny_unmodified": bool(soft_deny_unmodified),
         "classify_all_shell_enabled": classify_all_shell_ok,
+        "classify_all_shell_verification_source": classify_all_shell_source,
     },
     "digests": {
         "auto_mode_defaults_digest": defaults_digest,
@@ -370,7 +517,7 @@ print(json.dumps(result))
 sys.exit(0 if ok else 8)
 PYEOF
   rc=$?
-  rm -f "$defaults_tmp" "$config_tmp"
+  rm -f "$version_tmp" "$defaults_tmp" "$config_tmp"
   return "$rc"
 }
 

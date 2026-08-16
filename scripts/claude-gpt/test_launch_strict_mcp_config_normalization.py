@@ -112,10 +112,78 @@ import signal
 import sys
 import time
 
+argv = sys.argv[1:]
+
+# --- Issue #2203 (P0-3, PR #2214 OWNER adversarial review fix-delta): 単に
+#     「最後の argv を記録する」recorder だと、launch.sh が通常起動へ配線した
+#     `preflight.sh --auto-mode-check`（`--version` / `auto-mode defaults` /
+#     `auto-mode config`）の複数回 invocation と、実際の claude 本体 invocation
+#     を区別できない。全 invocation を JSONL へ追記し、呼び出し元テストが
+#     preflight invocation と本 invocation を別々に assert できるようにする。 ---
+argv_log = os.environ.get("FAKE_CLAUDE_ARGV_LOG")
+if argv_log:
+    with open(argv_log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(argv) + "\n")
+
+# --- readback subcommand（`--version` / `auto-mode defaults` / `auto-mode
+#     config`）に応答する。既定では launcher の narrow autoMode 契約
+#     （hard_deny/soft_deny の $defaults 保持 + narrow 追加 + classifyAllShell）を
+#     満たす effective config を返し、readback が PASS するようにする
+#     （FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL=1 で意図的に readback を失敗させる
+#     ことも可能。fail-closed 経路のテスト用）。 ---
+if argv and argv[0] == "--version":
+    print(os.environ.get("FAKE_CLAUDE_VERSION") or "2.1.211 (Claude Code)")
+    sys.exit(0)
+
+if "auto-mode" in argv:
+    auto_mode_idx = argv.index("auto-mode")
+    subcommand = argv[auto_mode_idx + 1] if auto_mode_idx + 1 < len(argv) else ""
+    force_fail = os.environ.get("FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL") == "1"
+    baseline = {
+        "environment": ["defaults-env-baseline"],
+        "allow": ["defaults-allow-baseline"],
+        "hard_deny": ["defaults-hard-deny-baseline"],
+        "soft_deny": ["defaults-soft-deny-baseline"],
+        "classifyAllShell": False,
+    }
+    if subcommand == "defaults":
+        print(json.dumps(baseline))
+        sys.exit(0)
+    if subcommand == "config":
+        config = dict(baseline)
+        settings_path = None
+        for i, tok in enumerate(argv):
+            if tok == "--settings" and i + 1 < len(argv):
+                settings_path = argv[i + 1]
+        if settings_path and os.path.exists(settings_path) and not force_fail:
+            with open(settings_path, encoding="utf-8") as fh:
+                settings = json.load(fh)
+            auto_mode = settings.get("autoMode", {})
+
+            def _merge(key: str) -> None:
+                entries = auto_mode.get(key)
+                if entries is None:
+                    return
+                merged = []
+                for entry in entries:
+                    if entry == "$defaults":
+                        merged.extend(baseline[key])
+                    else:
+                        merged.append(entry)
+                config[key] = merged
+
+            _merge("environment")
+            _merge("allow")
+            _merge("hard_deny")
+            if auto_mode.get("classifyAllShell"):
+                config["classifyAllShell"] = True
+        print(json.dumps(config))
+        sys.exit(0)
+
 argv_file = os.environ.get("FAKE_CLAUDE_ARGV_FILE")
 if argv_file:
     with open(argv_file, "w", encoding="utf-8") as fh:
-        json.dump(sys.argv[1:], fh)
+        json.dump(argv, fh)
 
 trap_term_exit_code = os.environ.get("FAKE_CLAUDE_TRAP_TERM_EXIT_CODE")
 if trap_term_exit_code:
@@ -158,6 +226,62 @@ VALUE_FLAGS = {
 }
 
 argv = sys.argv[1:]
+
+argv_log = os.environ.get("FAKE_CLAUDE_ARGV_LOG")
+if argv_log:
+    with open(argv_log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(argv) + "\n")
+
+# --- readback subcommand（Issue #2203 P0-3）は unknown-flag 判定より前に応答する
+#     （launch.sh が本 invocation の前に必ず --auto-mode-check を実行するため、
+#     strict fake もここで readback PASS を返さないと本 invocation へ到達できず、
+#     unknown-flag rejection の検証ができなくなる）。 ---
+if argv and argv[0] == "--version":
+    print(os.environ.get("FAKE_CLAUDE_VERSION") or "2.1.211 (Claude Code)")
+    sys.exit(0)
+if "auto-mode" in argv:
+    auto_mode_idx = argv.index("auto-mode")
+    subcommand = argv[auto_mode_idx + 1] if auto_mode_idx + 1 < len(argv) else ""
+    baseline = {
+        "environment": ["defaults-env-baseline"],
+        "allow": ["defaults-allow-baseline"],
+        "hard_deny": ["defaults-hard-deny-baseline"],
+        "soft_deny": ["defaults-soft-deny-baseline"],
+        "classifyAllShell": False,
+    }
+    if subcommand == "defaults":
+        print(json.dumps(baseline))
+        sys.exit(0)
+    if subcommand == "config":
+        config = dict(baseline)
+        settings_path = None
+        for i, tok in enumerate(argv):
+            if tok == "--settings" and i + 1 < len(argv):
+                settings_path = argv[i + 1]
+        if settings_path and os.path.exists(settings_path):
+            with open(settings_path, encoding="utf-8") as fh:
+                settings = json.load(fh)
+            auto_mode = settings.get("autoMode", {})
+
+            def _merge(key: str) -> None:
+                entries = auto_mode.get(key)
+                if entries is None:
+                    return
+                merged = []
+                for entry in entries:
+                    if entry == "$defaults":
+                        merged.extend(baseline[key])
+                    else:
+                        merged.append(entry)
+                config[key] = merged
+
+            _merge("environment")
+            _merge("allow")
+            _merge("hard_deny")
+            if auto_mode.get("classifyAllShell"):
+                config["classifyAllShell"] = True
+        print(json.dumps(config))
+        sys.exit(0)
 
 argv_file = os.environ.get("FAKE_CLAUDE_ARGV_FILE")
 if argv_file:
@@ -229,6 +353,7 @@ def _build_env(
         env["CLAUDE_GPT_PROXY_BIN"] = str(fake_proxy)
         env["CLAUDE_GPT_CLAUDE_BIN"] = str(fake_claude)
         env["FAKE_CLAUDE_ARGV_FILE"] = str(argv_file)
+        env["FAKE_CLAUDE_ARGV_LOG"] = str(tmp_path / "claude-argv-log.jsonl")
     else:
         # 拒否系ケースは forbidden-flag / unknown-launcher-option チェックの時点で
         # exit するため、未解決の proxy/claude バイナリに依存させない（fail-fast）。
@@ -285,6 +410,15 @@ def _run_launch_raw(
         timeout=timeout,
     )
     return result
+
+
+def _read_claude_argv_log(tmp_path: Path) -> list[list[str]]:
+    """FAKE_CLAUDE_ARGV_LOG（JSONL, 全 invocation 追記）を読み、invocation ごとの
+    argv リストを順番どおり返す（Issue #2203 P0-3, PR #2214 fix-delta）。"""
+    log_path = tmp_path / "claude-argv-log.jsonl"
+    assert log_path.exists(), "fake claude argv log was not written (readback not wired?)"
+    lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [json.loads(line) for line in lines]
 
 
 def _read_claude_argv(tmp_path: Path) -> list[str]:
@@ -944,6 +1078,69 @@ class TestRealCliParserProbe:
             f"claude version={version!r} unexpectedly rejected downstream literal "
             f"as unknown option: {combined!r}"
         )
+
+
+# --- Issue #2203 P0-3 (PR #2214 OWNER adversarial review fix-delta): 通常起動へ
+#     fail-closed auto-mode readback を配線する ---------------------------------
+
+
+def test_normal_launch_wires_auto_mode_readback_before_main_invocation(tmp_path):
+    """GIVEN 通常起動（--check-only/--dry-run なし）
+    WHEN launch.sh を実行する
+    THEN claude 本体起動前に `--version` / `auto-mode defaults` / `auto-mode
+    config` の readback invocation が記録され、最後に本 invocation（canonical
+    prefix + caller argv）が記録される（readback が unwired のまま放置される
+    regression を防ぐ）
+    """
+    result = _run_launch(tmp_path, ["-p", "hello"], use_fakes=True)
+    assert result.returncode == 0, result.stderr
+    invocations = _read_claude_argv_log(tmp_path)
+    assert invocations[0] == ["--version"]
+    auto_mode_calls = [argv for argv in invocations if "auto-mode" in argv]
+    assert ["auto-mode", "defaults"] in auto_mode_calls
+    assert any(argv[-2:] == ["auto-mode", "config"] for argv in auto_mode_calls)
+    main_invocation = invocations[-1]
+    canonical = _canonical_prefix(tmp_path)
+    assert main_invocation == canonical + ["-p", "hello"]
+    assert "CLAUDE_GPT_AUTO_MODE_CHECK_PATH=" in result.stderr
+
+
+def test_normal_launch_writes_auto_mode_check_evidence_artifact(tmp_path):
+    """GIVEN 通常起動が成功する
+    WHEN launch.sh を実行する
+    THEN readback 結果 JSON（digests / checks を含む）が
+    `<claude_config_dir>/auto-mode-check.json` に書き出される（P1-3: evidence
+    schema が実 digest を再計算できるようにする入力）
+    """
+    result = _run_launch(tmp_path, ["-p", "hello"], use_fakes=True)
+    assert result.returncode == 0, result.stderr
+    check_path = tmp_path / "claude-gpt-home" / "claude" / "auto-mode-check.json"
+    assert check_path.exists()
+    payload = json.loads(check_path.read_text(encoding="utf-8"))
+    assert payload["ok"] is True
+    assert payload["digests"]["auto_mode_defaults_digest"] != "unknown"
+    assert payload["digests"]["effective_config_digest"] != "unknown"
+
+
+def test_normal_launch_blocks_when_auto_mode_readback_fails(tmp_path):
+    """GIVEN readback（`auto-mode config`）が narrow label を反映しない effective
+    config を返す実行環境
+    WHEN launch.sh を実行する
+    THEN claude 本体の main invocation は一度も行われず、exit 8 で
+    auto_mode_readback_failed として fail-closed 拒否される
+    """
+    result = _run_launch(
+        tmp_path,
+        ["-p", "hello"],
+        use_fakes=True,
+        extra_env={"FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL": "1"},
+    )
+    assert result.returncode == 8, result.stdout + result.stderr
+    assert "auto_mode_readback_failed" in (result.stdout + result.stderr)
+    invocations = _read_claude_argv_log(tmp_path)
+    assert not any("-p" in argv for argv in invocations), (
+        "claude 本体は readback 失敗後に一切起動されてはならない"
+    )
 
 
 if __name__ == "__main__":

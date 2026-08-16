@@ -147,13 +147,33 @@ class BrokerError(Exception):
         self.detail = detail
 
 
+_TRUSTED_GH_BIN_CACHE: str | None = None
+_TRUSTED_GH_BIN_RESOLVED = False
+
+
 def _find_gh_bin() -> str | None:
-    return shutil.which("gh")
+    """`gh` executable の絶対パスを解決する。一度解決した後は同一 run 内で
+    再解決しない（P0-6, PR #2214 OWNER adversarial review 反映。ambient PATH
+    mutation による差し替え race を避け、trusted absolute path を固定する）。
+    `AUTO_MODE_CANARY_TRUSTED_GH_PATH` が明示されていればそれを優先する。"""
+    global _TRUSTED_GH_BIN_CACHE, _TRUSTED_GH_BIN_RESOLVED
+    if _TRUSTED_GH_BIN_RESOLVED:
+        return _TRUSTED_GH_BIN_CACHE
+    pinned = os.environ.get("AUTO_MODE_CANARY_TRUSTED_GH_PATH")
+    resolved = pinned if pinned and Path(pinned).is_file() else shutil.which("gh")
+    _TRUSTED_GH_BIN_CACHE = resolved
+    _TRUSTED_GH_BIN_RESOLVED = True
+    return resolved
 
 
 def _sanitized_gh_env() -> dict[str, str]:
-    """GH_REPO / GH_HOST / ambient GH_TOKEN を scrub し、最小限の allowlist env の
-    みを子プロセスへ渡す（Outcome 節 GitHub mutation transaction broker 要件）。"""
+    """GH_REPO / GH_HOST / ambient GH_TOKEN / GITHUB_TOKEN 系を scrub し、
+    最小限の allowlist env のみを broker 子プロセスへ渡す（Outcome 節 GitHub
+    mutation transaction broker 要件）。broker はこの canary script を直接
+    実行する呼び出し元（開発者 / CI。Claude/AGY プロセスではない）の ambient
+    実 HOME/GH_CONFIG_DIR を使って genuine mutation credential を得る想定であり、
+    Claude/AGY プロセス側の isolation（launch.sh が注入する隔離
+    HOME/GH_CONFIG_DIR）とは別レイヤーである。"""
     env: dict[str, str] = {"PATH": os.environ.get("PATH", "")}
     home = os.environ.get("HOME")
     if home:
@@ -164,19 +184,43 @@ def _sanitized_gh_env() -> dict[str, str]:
     return env
 
 
-def _run_gh(args: list[str], *, timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
+@dataclass
+class GhCallResult:
+    """`_run_gh` の統一 result type（P1-2）。`subprocess.run(..., timeout=...)` は
+    timeout 時に non-zero `CompletedProcess` ではなく `TimeoutExpired` を送出する
+    ため、呼び出し側が `result.returncode != 0` だけを見ていると実 timeout を
+    見逃す。`timed_out` を明示フィールドとして持たせ、呼び出し側に timeout と
+    通常の非ゼロ終了を区別させる。"""
+
+    returncode: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return not self.timed_out and self.returncode == 0
+
+
+def _run_gh(args: list[str], *, timeout: float = 30.0) -> GhCallResult:
     gh_bin = _find_gh_bin()
     if not gh_bin:
         raise RuntimeError("gh_binary_not_found")
     argv = [gh_bin, "--repo", TRUSTED_REPO, *args]
-    return subprocess.run(
-        argv,
-        shell=False,
-        env=_sanitized_gh_env(),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    try:
+        result = subprocess.run(
+            argv,
+            shell=False,
+            env=_sanitized_gh_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return GhCallResult(returncode=None, stdout=stdout, stderr=stderr, timed_out=True)
+    return GhCallResult(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
 
 
 @dataclass
@@ -241,9 +285,34 @@ class GitHubMutationBroker:
     def _parse_issue_number_from_url(url: str) -> int:
         return int(url.rstrip("/").rsplit("/", 1)[-1])
 
-    def _recover_created_issue_after_timeout(self, title: str) -> int | None:
+    @staticmethod
+    def _within_creation_window(created_at: str | None, window_start_iso: str, *, tolerance_seconds: int = 600) -> bool:
+        """recovery candidate の createdAt が create リクエスト開始から bounded
+        tolerance（既定10分）以内かを検証する（P1-2: creation window 検証）。
+        パース不能な場合は境界を保証できないため False（fail-closed）。"""
+        if not created_at:
+            return False
+        try:
+            from datetime import datetime as _dt
+
+            created_dt = _dt.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
+            window_start_dt = _dt.strptime(window_start_iso, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            return False
+        delta = (created_dt - window_start_dt).total_seconds()
+        return -tolerance_seconds <= delta <= tolerance_seconds
+
+    def _recover_created_issue_after_timeout(self, title: str, creation_window_start: str) -> int | None:
         """create request timeout 後の remote-success recovery。同一 run_nonce を
-        body に含む同一 title の Issue が既に存在するかを readback で確認する。"""
+        body に含む同一 title の Issue が候補として存在するかを readback で確認する。
+        (P1-2, PR #2214 OWNER adversarial review 反映) 誤った recovery による二重
+        操作を避けるため、以下すべてを満たす候補が **ちょうど1件（cardinality=1）**
+        でない限り recovery を諦める（fail-closed。曖昧な複数候補や候補ゼロは
+        通常の create_failed へフォールバックする）。
+          - exact title 一致
+          - run_nonce が body に含まれる
+          - createdAt が bounded creation window 内
+        """
         result = _run_gh(
             [
                 "issue",
@@ -251,23 +320,27 @@ class GitHubMutationBroker:
                 "--search",
                 f'"{title}" in:title',
                 "--json",
-                "number,title,body,createdAt",
+                "number,title,body,createdAt,author",
                 "--limit",
-                "5",
+                "10",
             ]
         )
-        if result.returncode != 0:
+        if not result.ok:
             return None
         try:
             candidates = json.loads(result.stdout)
         except ValueError:
             return None
-        for candidate in candidates:
-            if candidate.get("title") == title and self.state.run_nonce in (
-                candidate.get("body") or ""
-            ):
-                return int(candidate["number"])
-        return None
+        matches = [
+            candidate
+            for candidate in candidates
+            if candidate.get("title") == title
+            and self.state.run_nonce in (candidate.get("body") or "")
+            and self._within_creation_window(candidate.get("createdAt"), creation_window_start)
+        ]
+        if len(matches) != 1:
+            return None
+        return int(matches[0]["number"])
 
     # --- allowed operations ---------------------------------------------------
 
@@ -281,10 +354,17 @@ class GitHubMutationBroker:
 
         creation_window_start = _now_iso()
         result = _run_gh(["issue", "create", "--title", title, "--body", body])
-        if result.returncode != 0:
-            recovered = self._recover_created_issue_after_timeout(title)
+        if not result.ok:
+            # timeout（result.timed_out）も非ゼロ終了も同じ recovery 経路へ流す
+            # （P1-2: `subprocess.run(timeout=...)` は timeout 時 non-zero
+            # CompletedProcess ではなく TimeoutExpired を送出するため、
+            # `_run_gh` が変換した `GhCallResult.timed_out` を明示的に扱う）。
+            recovered = self._recover_created_issue_after_timeout(title, creation_window_start)
             if recovered is None:
-                raise BrokerError("create_failed", detail=result.stderr.strip())
+                raise BrokerError(
+                    "create_failed",
+                    detail=("timeout" if result.timed_out else result.stderr.strip()),
+                )
             issue_number = recovered
         else:
             issue_number = self._parse_issue_number_from_url(result.stdout.strip())
@@ -306,15 +386,27 @@ class GitHubMutationBroker:
         self.state.operations.append("canary_issue_create")
         return issue_number
 
+    def _assert_node_id_unchanged(self, readback: dict) -> None:
+        """各 transition で node_id が session-created Issue のものと一致することを
+        再確認する（P1-2: object-identity の transition ごとの再検証）。"""
+        if self.state.created_issue_node_id is not None and readback.get("id") != self.state.created_issue_node_id:
+            raise BrokerError("node_id_mismatch")
+
     def edit_canary_issue(self, issue_number: int, new_body: str) -> None:
         self._assert_owned(issue_number)
         self._assert_previous_body_sha256(issue_number)
         result = _run_gh(["issue", "edit", str(issue_number), "--body", new_body])
-        if result.returncode != 0:
-            raise BrokerError("edit_failed", detail=result.stderr.strip())
+        if not result.ok:
+            raise BrokerError("edit_failed", detail=("timeout" if result.timed_out else result.stderr.strip()))
         readback = self._readback(issue_number)
+        self._assert_node_id_unchanged(readback)
         if self.state.run_nonce not in (readback.get("body") or ""):
             raise BrokerError("readback_run_nonce_mismatch_after_edit")
+        # P1-2: run_nonce の部分一致だけでなく、edit 後 body が new_body と完全
+        # 一致することを検証する（GitHub 側の意図しない正規化・切り詰め・
+        # 別 Issue への誤適用を検出する）。
+        if (readback.get("body") or "") != new_body:
+            raise BrokerError("edit_body_mismatch")
         self.state.expected_previous_body_sha256 = _sha256_text(readback.get("body") or "")
         self.state.operations.append("canary_issue_edit")
 
@@ -322,17 +414,41 @@ class GitHubMutationBroker:
         self._assert_owned(issue_number)
         self._assert_previous_body_sha256(issue_number)
         result = _run_gh(["issue", "comment", str(issue_number), "--body", comment_body])
-        if result.returncode != 0:
-            raise BrokerError("comment_failed", detail=result.stderr.strip())
+        if not result.ok:
+            raise BrokerError("comment_failed", detail=("timeout" if result.timed_out else result.stderr.strip()))
+        # P1-2: comment ID・body・author を readback で確認する（`gh issue comment`
+        # の stdout は作成された comment の URL を返す。末尾の issuecomment-<id>
+        # を抽出して同一 Issue 配下の comment 一覧から該当 comment を照合する）。
+        comment_url = result.stdout.strip()
+        readback = _run_gh(["issue", "view", str(issue_number), "--json", "comments"])
+        if not readback.ok:
+            raise BrokerError(
+                "comment_readback_failed",
+                detail=("timeout" if readback.timed_out else readback.stderr.strip()),
+            )
+        try:
+            comments = json.loads(readback.stdout).get("comments", [])
+        except ValueError as exc:
+            raise BrokerError("comment_readback_unparsable") from exc
+        matched = None
+        for entry in comments:
+            if comment_url and (entry.get("url") or "") == comment_url:
+                matched = entry
+                break
+        if matched is None:
+            raise BrokerError("comment_readback_not_found")
+        if (matched.get("body") or "") != comment_body:
+            raise BrokerError("comment_body_mismatch")
         self.state.operations.append("canary_issue_comment")
 
     def close_canary_issue(self, issue_number: int) -> None:
         self._assert_owned(issue_number)
         self._assert_previous_body_sha256(issue_number)
         result = _run_gh(["issue", "close", str(issue_number)])
-        if result.returncode != 0:
-            raise BrokerError("close_failed", detail=result.stderr.strip())
+        if not result.ok:
+            raise BrokerError("close_failed", detail=("timeout" if result.timed_out else result.stderr.strip()))
         readback = self._readback(issue_number)
+        self._assert_node_id_unchanged(readback)
         if readback.get("state") != "CLOSED":
             raise BrokerError("close_postcondition_failed")
         self.state.final_state = "closed"
@@ -440,13 +556,16 @@ def run_github_mutation_canary() -> tuple[int, dict]:
     gh_bin = _find_gh_bin()
     if gh_bin is None:
         return EXIT_SKIP, {"skip_reason": "gh_binary_not_found"}
-    auth = subprocess.run(
-        [gh_bin, "auth", "status"],
-        capture_output=True,
-        text=True,
-        env=_sanitized_gh_env(),
-        timeout=15,
-    )
+    try:
+        auth = subprocess.run(
+            [gh_bin, "auth", "status"],
+            capture_output=True,
+            text=True,
+            env=_sanitized_gh_env(),
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return EXIT_SKIP, {"skip_reason": "gh_auth_status_timeout"}
     if auth.returncode != 0:
         return EXIT_SKIP, {"skip_reason": "gh_not_authenticated"}
 
@@ -461,17 +580,67 @@ def run_github_mutation_canary() -> tuple[int, dict]:
         "Safe to ignore; will auto-close within the same run."
     )
     issue_number: int | None = None
+    neg_ok: bool | None = None
+    neg_attempts: list[dict] | None = None
     try:
         issue_number = broker.create_canary_issue(title, body)
         broker.edit_canary_issue(issue_number, body + "\n\n(edited by canary; AC5 readback check)")
         broker.comment_canary_issue(issue_number, "canary comment (AC5 readback check)")
         neg_ok, neg_attempts = run_negative_controls(broker)
+        # P1-1 (PR #2214 OWNER adversarial review 反映): `neg_ok == False` を
+        # side-effect-free ではない negative control 違反として明示的に FAIL
+        # 扱いする。従来は例外が出ない限り EXIT_OK を返してしまい、future
+        # regression で forbidden method が broker に生えても evidence 内が
+        # false になるだけで process exit は PASS のままだった。
+        if not neg_ok:
+            raise BrokerError(
+                "negative_control_not_side_effect_free",
+                detail=json.dumps(
+                    [a for a in neg_attempts if not a.get("rejected")], sort_keys=True
+                ),
+            )
         broker.close_canary_issue(issue_number)
     except BrokerError as exc:
-        orphan = issue_number is not None and broker.state.final_state != "closed"
+        # P1-2: create 後のあらゆる例外経路で best-effort cleanup（close）を試みる。
+        # cleanup が確実に成功したことを確認できない限り orphan_issue: true とする
+        # （fail-closed。cleanup 成功可否を自己申告 boolean で楽観視しない）。
+        orphan = True
+        if issue_number is not None and broker.state.final_state != "closed":
+            try:
+                broker.close_canary_issue(issue_number)
+                orphan = broker.state.final_state != "closed"
+            except BrokerError:
+                orphan = True
+        elif issue_number is not None and broker.state.final_state == "closed":
+            orphan = False
         return EXIT_FAIL, {
             "fail_reason": exc.reason,
             "detail": exc.detail,
+            "negative_control": (
+                {"attempted": neg_attempts, "all_side_effect_free": neg_ok}
+                if neg_attempts is not None
+                else None
+            ),
+            "cleanup_status": {"orphan_issue": orphan},
+        }
+    except Exception as exc:  # noqa: BLE001 - P1-2: 未分類例外でも cleanup を試み fail-closed で報告する
+        orphan = True
+        if issue_number is not None and broker.state.final_state != "closed":
+            try:
+                broker.close_canary_issue(issue_number)
+                orphan = broker.state.final_state != "closed"
+            except Exception:  # noqa: BLE001
+                orphan = True
+        elif issue_number is not None and broker.state.final_state == "closed":
+            orphan = False
+        return EXIT_FAIL, {
+            "fail_reason": "unexpected_exception",
+            "detail": f"{type(exc).__name__}: {exc}",
+            "negative_control": (
+                {"attempted": neg_attempts, "all_side_effect_free": neg_ok}
+                if neg_attempts is not None
+                else None
+            ),
             "cleanup_status": {"orphan_issue": orphan},
         }
 
@@ -520,6 +689,55 @@ def _sut_revision() -> dict:
         "agy_version": "not_applicable_no_direct_cli",
         "gh_version": _version("gh", "--version"),
     }
+
+
+def _effective_policy(auto_mode_check_json_path: Path | None, settings_path: Path | None) -> dict:
+    """P1-3 (PR #2214 OWNER adversarial review 反映): evidence の
+    `auto_mode_defaults_digest` / `effective_config_digest` を placeholder
+    文字列（`"see_preflight_auto_mode_check_output"`）のまま出さず、
+    launch.sh が書き出す実 readback 結果（`preflight.sh --auto-mode-check` の
+    出力 JSON）を入力として受け取り、そこに含まれる実 digest をそのまま転記する
+    （再計算ではなく、fail-closed readback が計算した digest の照合転記。
+    渡されなかった場合は "unavailable_not_provided" と明示し、
+    偽の計算済み値を捏造しない）。加えて canary script / lib.sh / preflight.sh /
+    generated settings / trusted gh binary の SHA-256 を含める。"""
+    policy: dict = {
+        "permission_mode": "auto",
+        "classify_all_shell": True,
+        "auto_mode_defaults_digest": "unavailable_not_provided",
+        "effective_config_digest": "unavailable_not_provided",
+        "auto_mode_readback_ok": None,
+        "canary_script_sha256": _sha256_file(Path(__file__).resolve()),
+        "broker_source_sha256": _sha256_file(Path(__file__).resolve()),
+        "lib_sh_sha256": _sha256_file(SCRIPT_DIR / "lib.sh"),
+        "preflight_sh_sha256": _sha256_file(SCRIPT_DIR / "preflight.sh"),
+        "settings_sha256": "unavailable_not_provided",
+        "trusted_gh_path": "unavailable",
+        "trusted_gh_sha256": "unavailable",
+    }
+
+    if auto_mode_check_json_path is not None and auto_mode_check_json_path.is_file():
+        try:
+            check_payload = json.loads(auto_mode_check_json_path.read_text(encoding="utf-8"))
+        except ValueError:
+            check_payload = {}
+        digests = check_payload.get("digests", {})
+        policy["auto_mode_defaults_digest"] = digests.get("auto_mode_defaults_digest", "unknown")
+        policy["effective_config_digest"] = digests.get("effective_config_digest", "unknown")
+        policy["auto_mode_readback_ok"] = check_payload.get("ok")
+        policy["classify_all_shell"] = bool(
+            check_payload.get("checks", {}).get("classify_all_shell_enabled", policy["classify_all_shell"])
+        )
+
+    if settings_path is not None:
+        policy["settings_sha256"] = _sha256_file(settings_path)
+
+    gh_bin = _find_gh_bin()
+    if gh_bin:
+        policy["trusted_gh_path"] = gh_bin
+        policy["trusted_gh_sha256"] = _sha256_file(Path(gh_bin))
+
+    return policy
 
 
 def _write_evidence(payload: dict) -> Path:
@@ -572,6 +790,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-evidence",
         action="store_true",
         help="worktree-local ignored artifact への証跡書き込みを省略する（テスト専用）",
+    )
+    parser.add_argument(
+        "--auto-mode-check-json",
+        type=Path,
+        default=None,
+        help=(
+            "launch.sh が書き出す `preflight.sh --auto-mode-check` の出力 JSON "
+            "（<claude_config_dir>/auto-mode-check.json）への path。evidence の "
+            "auto_mode_defaults_digest / effective_config_digest を実際の readback "
+            "結果から転記するために使う（P1-3）。"
+        ),
+    )
+    parser.add_argument(
+        "--settings-path",
+        type=Path,
+        default=None,
+        help="launcher-generated settings.local.json への path（evidence の settings_sha256 用）",
     )
     return parser
 
@@ -633,12 +868,7 @@ def main(argv: list[str] | None = None) -> int:
         "generated_at": _now_iso(),
         "mode": args.mode,
         "sut_revision": _sut_revision(),
-        "effective_policy": {
-            "permission_mode": "auto",
-            "classify_all_shell": True,
-            "auto_mode_defaults_digest": "see_preflight_auto_mode_check_output",
-            "effective_config_digest": "see_preflight_auto_mode_check_output",
-        },
+        "effective_policy": _effective_policy(args.auto_mode_check_json, args.settings_path),
         "agy_causal_receipt": results.get("agy"),
         "github_remote_object_identity": results.get("github"),
         "negative_control": (results.get("github") or results.get("negative") or {}).get(

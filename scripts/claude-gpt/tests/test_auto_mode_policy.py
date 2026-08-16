@@ -116,13 +116,78 @@ def test_generated_settings_defaults_readback_via_real_claude_cli(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
-    assert payload["ok"] is True
+    assert payload["ok"] is True, payload
     assert payload["checks"]["environment_narrow_label_present"] is True
     assert payload["checks"]["allow_narrow_label_present"] is True
-    assert payload["checks"]["hard_soft_deny_unmodified"] is True
+    assert payload["checks"]["hard_deny_defaults_and_additions_present"] is True
+    assert payload["checks"]["soft_deny_unmodified"] is True
     assert payload["checks"]["classify_all_shell_enabled"] is True
+    # 実機検証（Claude Code 2.1.233, 2026-08-16）: 現行 CLI の `auto-mode config`
+    # JSON は classifyAllShell key 自体を公開しない。effective config に key が
+    # 現れる場合はそれを正本にし、現れない場合は version gate + settings 文字列の
+    # best-effort 二重検証へ fall back する（P0-3 fix-delta。lib.sh コメント参照）。
+    assert payload["checks"]["classify_all_shell_verification_source"] in (
+        "effective_config",
+        "settings_literal_plus_version_gate_best_effort",
+    )
     assert payload["digests"]["auto_mode_defaults_digest"] != "unknown"
     assert payload["digests"]["effective_config_digest"] != "unknown"
+    assert payload["claude_version"]["ok"] is True
+
+
+def test_auto_mode_readback_fail_closed_on_unsupported_claude_version(tmp_path):
+    """GIVEN claude --version が min supported version 未満を報告する
+    WHEN preflight.sh --auto-mode-check を実行する
+    THEN classifyAllShell 等の他チェックに関わらず fail-closed（exit 8,
+    claude_version_below_minimum_supported）で拒否する（P0-3: settings 文字列
+    存在チェックだけでは検出できない version-gate 要件）
+    """
+    fake_claude_source = r"""#!/usr/bin/env python3
+import json
+import sys
+
+argv = sys.argv[1:]
+if argv and argv[0] == "--version":
+    print("2.0.0 (Claude Code)")
+    sys.exit(0)
+if "auto-mode" in argv:
+    idx = argv.index("auto-mode")
+    sub = argv[idx + 1] if idx + 1 < len(argv) else ""
+    baseline = {
+        "environment": ["defaults-env-baseline"],
+        "allow": ["defaults-allow-baseline"],
+        "hard_deny": ["defaults-hard-deny-baseline"],
+        "soft_deny": ["defaults-soft-deny-baseline"],
+        "classifyAllShell": True,
+    }
+    print(json.dumps(baseline))
+    sys.exit(0)
+sys.exit(1)
+"""
+    fake_claude = tmp_path / "fake-claude-old-version"
+    fake_claude.write_text(fake_claude_source, encoding="utf-8")
+    fake_claude.chmod(0o755)
+
+    claude_config_dir = tmp_path / "claude-gpt-home" / "claude"
+    claude_config_dir.mkdir(parents=True)
+    settings_path = claude_config_dir / "settings.local.json"
+    fragment = _run_sh_function("claude_gpt_auto_mode_json_fragment").stdout.strip()
+    settings_path.write_text("{\n  " + fragment + "\n}\n", encoding="utf-8")
+
+    env = dict(os.environ)
+    env["CLAUDE_GPT_CLAUDE_BIN"] = str(fake_claude)
+    result = subprocess.run(
+        [str(PREFLIGHT_SH), "--auto-mode-check", str(settings_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    assert result.returncode == 8, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert "claude_version_below_minimum_supported" in payload["fail_closed_reasons"]
+    assert payload["claude_version"]["ok"] is False
 
 
 # --- AC2: narrow_policy_scope -------------------------------------------------
@@ -231,10 +296,69 @@ import json
 import os
 import sys
 
+argv = sys.argv[1:]
+
+# --- Issue #2203 P0-3 (PR #2214 fix-delta): 通常起動が launch.sh から
+#     `preflight.sh --auto-mode-check`（`--version` / `auto-mode defaults` /
+#     `auto-mode config`）を必ず呼ぶため、この fake claude もそれらの
+#     readback subcommand に応答し PASS を返す。全 invocation は JSONL へ
+#     追記する（preflight invocation と本 invocation を別々に assert できる）。
+argv_log = os.environ.get("FAKE_CLAUDE_ARGV_LOG")
+if argv_log:
+    with open(argv_log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(argv) + "\n")
+
+if argv and argv[0] == "--version":
+    print(os.environ.get("FAKE_CLAUDE_VERSION") or "2.1.211 (Claude Code)")
+    sys.exit(0)
+if "auto-mode" in argv:
+    auto_mode_idx = argv.index("auto-mode")
+    subcommand = argv[auto_mode_idx + 1] if auto_mode_idx + 1 < len(argv) else ""
+    baseline = {
+        "environment": ["defaults-env-baseline"],
+        "allow": ["defaults-allow-baseline"],
+        "hard_deny": ["defaults-hard-deny-baseline"],
+        "soft_deny": ["defaults-soft-deny-baseline"],
+        "classifyAllShell": False,
+    }
+    if subcommand == "defaults":
+        print(json.dumps(baseline))
+        sys.exit(0)
+    if subcommand == "config":
+        config = dict(baseline)
+        settings_path = None
+        for i, tok in enumerate(argv):
+            if tok == "--settings" and i + 1 < len(argv):
+                settings_path = argv[i + 1]
+        if settings_path and os.path.exists(settings_path):
+            with open(settings_path, encoding="utf-8") as fh:
+                settings = json.load(fh)
+            auto_mode = settings.get("autoMode", {})
+
+            def _merge(key):
+                entries = auto_mode.get(key)
+                if entries is None:
+                    return
+                merged = []
+                for entry in entries:
+                    if entry == "$defaults":
+                        merged.extend(baseline[key])
+                    else:
+                        merged.append(entry)
+                config[key] = merged
+
+            _merge("environment")
+            _merge("allow")
+            _merge("hard_deny")
+            if auto_mode.get("classifyAllShell"):
+                config["classifyAllShell"] = True
+        print(json.dumps(config))
+        sys.exit(0)
+
 argv_file = os.environ.get("FAKE_CLAUDE_ARGV_FILE")
 if argv_file:
     with open(argv_file, "w", encoding="utf-8") as fh:
-        json.dump(sys.argv[1:], fh)
+        json.dump(argv, fh)
 sys.exit(int(os.environ.get("FAKE_CLAUDE_EXIT_CODE", "0")))
 """
 
@@ -410,13 +534,29 @@ def test_live_agy_canary_passes_on_valid_receipt(tmp_path):
 # --- AC5: live_github_mutation_canary -----------------------------------------
 
 
+@pytest.mark.github_live
 def test_live_github_mutation_canary_skips_or_passes():
     """GIVEN 実行環境
     WHEN auto_mode_canary.py --mode github を実行する
     THEN gh CLI/認証が利用不能なら SKIP（exit 77）、利用可能なら実際に canary
     Issue を create/edit/comment/close して PASS（exit 0）を返す（FAIL は実装
     バグを意味するためテスト失敗として扱う）
+
+    P1-4（PR #2214 OWNER adversarial review 反映）: この test は authenticated
+    `gh` があれば通常 pytest 実行時に production repository へ実際に Issue を
+    作成する（開発者の個人 credential を使用し、CI/local で意味が変わり、
+    repeated run で repository noise が増える）。`github_live` marker
+    （既存 project-wide 規約, pyproject.toml `-m 'not github_live'` により既定で
+    deselect）に加え、`AUTO_MODE_CANARY_LIVE_GITHUB_MUTATION=1` の明示 env gate
+    が無い限り実行しない（marker 単独の deselect し忘れに対する二重の
+    fail-closed opt-in）。通常 pytest は fake transport による hermetic
+    state-machine test（本ファイルの他 test）のみに限定する。
     """
+    if os.environ.get("AUTO_MODE_CANARY_LIVE_GITHUB_MUTATION") != "1":
+        pytest.skip(
+            "live GitHub mutation test requires explicit opt-in: "
+            "AUTO_MODE_CANARY_LIVE_GITHUB_MUTATION=1 (Issue #2203 P1-4)"
+        )
     if REAL_GH_BIN is None:
         pytest.skip("gh CLI not available in this environment")
     auth = subprocess.run([REAL_GH_BIN, "auth", "status"], capture_output=True, text=True, timeout=15)
@@ -625,3 +765,324 @@ def test_negative_controls_all_cases_are_side_effect_free(monkeypatch):
 
 def test_negative_controls_trusted_repo_is_fixed_constant():
     assert canary.TRUSTED_REPO == "squne121/loop-protocol"
+
+
+# --- P0-2: autoMode.hard_deny narrow additions ---------------------------------
+
+
+def test_hard_deny_preserves_defaults_and_adds_narrow_push_denials():
+    """GIVEN lib.sh の claude_gpt_auto_mode_standalone_json
+    WHEN autoMode.hard_deny を確認する
+    THEN 先頭が "$defaults" であり、default branch push / force push / remote
+    ref deletion の narrow 追加分がそれぞれ含まれる（P0-2, PR #2214 OWNER
+    adversarial review 反映。$defaults の hard_deny を置換・削除しない）
+    """
+    result = _run_sh_function("claude_gpt_auto_mode_standalone_json")
+    payload = json.loads(result.stdout)
+    hard_deny = payload["autoMode"]["hard_deny"]
+    assert hard_deny[0] == "$defaults"
+    assert len(hard_deny) == 4
+    joined = " ".join(hard_deny)
+    assert "default branch" in joined or "main" in joined
+    assert "force push" in joined
+    assert "削除" in joined
+
+
+# --- P1-1: negative control 違反は github mode を FAIL にする（PR #2214 fix-delta）
+
+
+def test_github_mode_neg_ok_false_returns_exit_fail_and_attempts_cleanup(monkeypatch):
+    """GIVEN negative control の一部が rejected=False（regression で broker に
+    forbidden method が生えた等）を返す
+    WHEN run_github_mutation_canary() を実行する
+    THEN 例外が出なくても EXIT_FAIL を返し（P1-1: neg_ok==False を fail-closed に
+    扱う）、cleanup（close）を試みる
+    """
+    broker_cls = canary.GitHubMutationBroker
+    closed = {"value": False}
+
+    def fake_create(self, title, body):  # noqa: ANN001
+        self.state.created_issue_number = 42
+        self.state.created_issue_node_id = "node-42"
+        self.state.final_state = "open"
+        self.state.operations.append("canary_issue_create")
+        return 42
+
+    def fake_edit(self, issue_number, new_body):  # noqa: ANN001
+        self.state.operations.append("canary_issue_edit")
+
+    def fake_comment(self, issue_number, comment_body):  # noqa: ANN001
+        self.state.operations.append("canary_issue_comment")
+
+    def fake_close(self, issue_number):  # noqa: ANN001
+        self.state.final_state = "closed"
+        self.state.operations.append("canary_issue_close")
+        closed["value"] = True
+
+    monkeypatch.setattr(broker_cls, "create_canary_issue", fake_create)
+    monkeypatch.setattr(broker_cls, "edit_canary_issue", fake_edit)
+    monkeypatch.setattr(broker_cls, "comment_canary_issue", fake_comment)
+    monkeypatch.setattr(broker_cls, "close_canary_issue", fake_close)
+    monkeypatch.setattr(
+        canary,
+        "run_negative_controls",
+        lambda broker: (False, [{"case": "force_push", "rejected": False, "detail": "regression"}]),
+    )
+    monkeypatch.setattr(canary, "_find_gh_bin", lambda: "/usr/bin/gh")
+
+    class _FakeAuth:
+        returncode = 0
+
+    monkeypatch.setattr(canary.subprocess, "run", lambda *a, **k: _FakeAuth())
+
+    rc, detail = canary.run_github_mutation_canary()
+    assert rc == canary.EXIT_FAIL
+    assert detail["fail_reason"] == "negative_control_not_side_effect_free"
+    assert detail["negative_control"]["all_side_effect_free"] is False
+    assert closed["value"] is True
+    assert detail["cleanup_status"]["orphan_issue"] is False
+
+
+# --- P1-2: TimeoutExpired handling ----------------------------------------------
+
+
+def test_run_gh_converts_timeout_expired_to_timed_out_result(monkeypatch):
+    """GIVEN subprocess.run が TimeoutExpired を送出する
+    WHEN _run_gh を呼ぶ
+    THEN 例外を伝播させず、timed_out=True の GhCallResult に変換する（P1-2:
+    従来は TimeoutExpired が未捕捉のまま create_canary_issue の recovery 分岐に
+    到達できなかった）
+    """
+
+    def _raise_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["gh"], timeout=1)
+
+    monkeypatch.setattr(canary, "_find_gh_bin", lambda: "/usr/bin/gh")
+    monkeypatch.setattr(canary.subprocess, "run", _raise_timeout)
+
+    result = canary._run_gh(["issue", "view", "1"])
+    assert result.timed_out is True
+    assert result.returncode is None
+    assert result.ok is False
+
+
+def test_recovery_after_timeout_requires_exact_cardinality_one(monkeypatch):
+    """GIVEN create timeout 後、同一 title/run_nonce/creation window に一致する
+    候補が2件見つかる（曖昧な状態）
+    WHEN _recover_created_issue_after_timeout を呼ぶ
+    THEN cardinality != 1 のため None（recovery を諦める。fail-closed）
+    """
+    broker = canary.GitHubMutationBroker()
+    window_start = canary._now_iso()
+    candidates = [
+        {
+            "number": 101,
+            "title": "[claude-gpt-auto-mode-canary] run=abc",
+            "body": f"run_nonce={broker.state.run_nonce}",
+            "createdAt": window_start,
+        },
+        {
+            "number": 102,
+            "title": "[claude-gpt-auto-mode-canary] run=abc",
+            "body": f"run_nonce={broker.state.run_nonce}",
+            "createdAt": window_start,
+        },
+    ]
+
+    def _fake_run_gh(args, **kwargs):  # noqa: ANN001
+        return canary.GhCallResult(returncode=0, stdout=json.dumps(candidates), stderr="")
+
+    monkeypatch.setattr(canary, "_run_gh", _fake_run_gh)
+    recovered = broker._recover_created_issue_after_timeout(
+        "[claude-gpt-auto-mode-canary] run=abc", window_start
+    )
+    assert recovered is None
+
+
+def test_recovery_after_timeout_accepts_single_matching_candidate(monkeypatch):
+    """GIVEN cardinality=1 の一致候補のみ
+    WHEN _recover_created_issue_after_timeout を呼ぶ
+    THEN その issue number を返す
+    """
+    broker = canary.GitHubMutationBroker()
+    window_start = canary._now_iso()
+    candidates = [
+        {
+            "number": 101,
+            "title": "[claude-gpt-auto-mode-canary] run=abc",
+            "body": f"run_nonce={broker.state.run_nonce}",
+            "createdAt": window_start,
+        }
+    ]
+
+    def _fake_run_gh(args, **kwargs):  # noqa: ANN001
+        return canary.GhCallResult(returncode=0, stdout=json.dumps(candidates), stderr="")
+
+    monkeypatch.setattr(canary, "_run_gh", _fake_run_gh)
+    recovered = broker._recover_created_issue_after_timeout(
+        "[claude-gpt-auto-mode-canary] run=abc", window_start
+    )
+    assert recovered == 101
+
+
+# --- P1-3: evidence digest は placeholder ではなく実 readback 結果を転記する ----
+
+
+def test_effective_policy_transcribes_real_digests_not_placeholder(tmp_path):
+    """GIVEN preflight.sh --auto-mode-check の出力 JSON（digests を含む）
+    WHEN _effective_policy に渡す
+    THEN placeholder 文字列（"see_preflight_auto_mode_check_output"）ではなく
+    実 digest がそのまま転記され、canary script / lib.sh / preflight.sh の
+    SHA-256 が含まれる（P1-3）
+    """
+    check_json_path = tmp_path / "auto-mode-check.json"
+    check_json_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "checks": {"classify_all_shell_enabled": True},
+                "digests": {
+                    "auto_mode_defaults_digest": "a" * 64,
+                    "effective_config_digest": "b" * 64,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings_path = tmp_path / "settings.local.json"
+    settings_path.write_text("{}", encoding="utf-8")
+
+    policy = canary._effective_policy(check_json_path, settings_path)
+    assert policy["auto_mode_defaults_digest"] == "a" * 64
+    assert policy["effective_config_digest"] == "b" * 64
+    assert policy["auto_mode_defaults_digest"] != "see_preflight_auto_mode_check_output"
+    assert policy["auto_mode_readback_ok"] is True
+    assert policy["canary_script_sha256"] != "unknown"
+    assert policy["lib_sh_sha256"] != "unknown"
+    assert policy["preflight_sh_sha256"] != "unknown"
+    assert policy["settings_sha256"] != "unavailable_not_provided"
+
+
+# --- P1-2: edit body 完全一致 / comment readback 検証 ---------------------------
+
+
+def test_edit_canary_issue_requires_exact_body_match(monkeypatch):
+    """GIVEN edit 後の readback body が要求した new_body と完全一致しない
+    （GitHub 側の正規化・切り詰め・別 Issue への誤適用等）
+    WHEN edit_canary_issue を呼ぶ
+    THEN edit_body_mismatch で拒否する（run_nonce の部分一致だけでは検出できない）
+    """
+    broker = canary.GitHubMutationBroker()
+    broker.state.created_issue_number = 5
+    broker.state.created_issue_node_id = "node-5"
+    broker.state.expected_previous_body_sha256 = canary._sha256_text("old body")
+    nonce = broker.state.run_nonce
+    requested_body = f"requested new body run_nonce={nonce}"
+    view_calls = {"n": 0}
+
+    def _fake_run_gh(args, **_kwargs):  # noqa: ANN001
+        if args[:2] == ["issue", "edit"]:
+            return canary.GhCallResult(returncode=0, stdout="", stderr="")
+        if args[:2] == ["issue", "view"]:
+            view_calls["n"] += 1
+            body = "old body" if view_calls["n"] == 1 else f"DIFFERENT body than requested run_nonce={nonce}"
+            return canary.GhCallResult(returncode=0, stdout=json.dumps({"id": "node-5", "body": body}), stderr="")
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(canary, "_run_gh", _fake_run_gh)
+    with pytest.raises(canary.BrokerError) as exc_info:
+        broker.edit_canary_issue(5, requested_body)
+    assert exc_info.value.reason == "edit_body_mismatch"
+
+
+def test_comment_canary_issue_verifies_readback_body(monkeypatch):
+    """GIVEN comment 作成後の readback comment body が投稿した comment_body と一致する
+    WHEN comment_canary_issue を呼ぶ
+    THEN 正常に完了する（P1-2: comment ID・body を readback で照合する）
+    """
+    broker = canary.GitHubMutationBroker()
+    broker.state.created_issue_number = 7
+    broker.state.created_issue_node_id = "node-7"
+    broker.state.expected_previous_body_sha256 = canary._sha256_text("body-7")
+    comment_url = "https://github.com/squne121/loop-protocol/issues/7#issuecomment-999"
+
+    def _fake_run_gh(args, **_kwargs):  # noqa: ANN001
+        if args[:2] == ["issue", "comment"]:
+            return canary.GhCallResult(returncode=0, stdout=comment_url, stderr="")
+        if args[:4] == ["issue", "view", "7", "--json"] and args[4] == "comments":
+            return canary.GhCallResult(
+                returncode=0,
+                stdout=json.dumps({"comments": [{"url": comment_url, "body": "expected comment body"}]}),
+                stderr="",
+            )
+        if args[:2] == ["issue", "view"]:
+            return canary.GhCallResult(returncode=0, stdout=json.dumps({"id": "node-7", "body": "body-7"}), stderr="")
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(canary, "_run_gh", _fake_run_gh)
+    broker.comment_canary_issue(7, "expected comment body")
+    assert broker.state.operations == ["canary_issue_comment"]
+
+
+def test_comment_canary_issue_rejects_body_mismatch_in_readback(monkeypatch):
+    broker = canary.GitHubMutationBroker()
+    broker.state.created_issue_number = 7
+    broker.state.created_issue_node_id = "node-7"
+    broker.state.expected_previous_body_sha256 = canary._sha256_text("body-7")
+    comment_url = "https://github.com/squne121/loop-protocol/issues/7#issuecomment-999"
+
+    def _fake_run_gh(args, **_kwargs):  # noqa: ANN001
+        if args[:2] == ["issue", "comment"]:
+            return canary.GhCallResult(returncode=0, stdout=comment_url, stderr="")
+        if args[:4] == ["issue", "view", "7", "--json"] and args[4] == "comments":
+            return canary.GhCallResult(
+                returncode=0,
+                stdout=json.dumps({"comments": [{"url": comment_url, "body": "tampered body"}]}),
+                stderr="",
+            )
+        if args[:2] == ["issue", "view"]:
+            return canary.GhCallResult(returncode=0, stdout=json.dumps({"id": "node-7", "body": "body-7"}), stderr="")
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(canary, "_run_gh", _fake_run_gh)
+    with pytest.raises(canary.BrokerError) as exc_info:
+        broker.comment_canary_issue(7, "expected comment body")
+    assert exc_info.value.reason == "comment_body_mismatch"
+
+
+def test_effective_policy_marks_unavailable_when_not_provided():
+    """GIVEN readback JSON が渡されない
+    WHEN _effective_policy に None を渡す
+    THEN placeholder ではなく明示的な "unavailable_not_provided" を返す（偽の
+    計算済み値を捏造しない）
+    """
+    policy = canary._effective_policy(None, None)
+    assert policy["auto_mode_defaults_digest"] == "unavailable_not_provided"
+    assert policy["effective_config_digest"] == "unavailable_not_provided"
+
+
+# --- P0-6: gh executable の trusted absolute path 固定 --------------------------
+
+
+def test_find_gh_bin_respects_trusted_path_env_override(monkeypatch, tmp_path):
+    """GIVEN AUTO_MODE_CANARY_TRUSTED_GH_PATH が実在ファイルを指す
+    WHEN _find_gh_bin を呼ぶ
+    THEN ambient PATH 上の gh ではなく、その pinned absolute path を使う
+    （P0-6, PR #2214 OWNER adversarial review 反映）
+    """
+    pinned = tmp_path / "trusted-gh"
+    pinned.write_text("#!/bin/sh\necho fake-gh\n", encoding="utf-8")
+    pinned.chmod(0o755)
+    canary._TRUSTED_GH_BIN_RESOLVED = False
+    canary._TRUSTED_GH_BIN_CACHE = None
+    monkeypatch.setenv("AUTO_MODE_CANARY_TRUSTED_GH_PATH", str(pinned))
+    try:
+        resolved = canary._find_gh_bin()
+        assert resolved == str(pinned)
+        # 同一プロセス内で再解決しない（cache が効く。ambient PATH mutation race
+        # を避けるため）。
+        monkeypatch.delenv("AUTO_MODE_CANARY_TRUSTED_GH_PATH", raising=False)
+        assert canary._find_gh_bin() == str(pinned)
+    finally:
+        canary._TRUSTED_GH_BIN_RESOLVED = False
+        canary._TRUSTED_GH_BIN_CACHE = None
