@@ -191,9 +191,19 @@ PROXY_STATE_DIR_TARGET=$(claude_gpt_proxy_state_dir)
 PROXY_HOME_TARGET=$(claude_gpt_proxy_home_dir)
 MCP_CONFIG_PATH=$(claude_gpt_mcp_config_path)
 SETTINGS_PATH=$(claude_gpt_session_settings_path)
+# --- Claude/AGY プロセス専用の隔離 HOME/GH_CONFIG_DIR/XDG（P0-6）。credential を
+#     一切置かない空ディレクトリとして扱う。ambient `gh auth` credential を
+#     Claude/AGY プロセスから利用不能にすることが目的であり、broker（別プロセス、
+#     GitHub mutation transaction broker）はこの隔離ディレクトリを使わない。 ---
+CLAUDE_ISOLATED_HOME_TARGET=$(claude_gpt_claude_isolated_home_dir)
+CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET=$(claude_gpt_claude_isolated_gh_config_dir)
+CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_config_dir)
+CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_cache_dir)
 
 # --- canonical path safety（ディレクトリ作成前に必ず検証する） ---
-for d in "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET"; do
+for d in "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
+  "$CLAUDE_ISOLATED_HOME_TARGET" "$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET" \
+  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"; do
   if ! claude_gpt_reject_if_under_repo "$d" "$SELF_PATH"; then
     printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"canonical_path_under_repo_or_worktree","path":"%s"}\n' "$d"
     exit 5
@@ -218,7 +228,9 @@ fi
 umask 077
 
 # --- GPT 専用ディレクトリを準備する（既存なら idempotent） ---
-mkdir -p "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET"
+mkdir -p "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
+  "$CLAUDE_ISOLATED_HOME_TARGET" "$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET" \
+  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"
 
 # --- strict_mcp mode 用の空 MCP config を書き込む（repository/user MCP を読み込ませない） ---
 STRICT_MCP_MODE=true
@@ -268,6 +280,12 @@ if [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-start-stop" ]; then
   }'
 fi
 
+# --- launcher-owned autoMode policy（Issue #2203, second-gate 判断補助。
+#     決定論的 authority は permissions.deny / PreToolUse hook / GitHub mutation
+#     transaction broker であり、この autoMode は project .claude/settings*.json
+#     ではなくこの launcher-owned --settings にのみ注入する） ---
+AUTO_MODE_JSON_FRAGMENT=$(claude_gpt_auto_mode_json_fragment)
+
 cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
 {
   "permissions": {
@@ -277,7 +295,8 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
       "Read(/${PROXY_HOME_TARGET}/**)"
     ]
   },
-  "enabledPlugins": {}${HOOKS_JSON_FRAGMENT}
+  "enabledPlugins": {}${HOOKS_JSON_FRAGMENT},
+  ${AUTO_MODE_JSON_FRAGMENT}
 }
 SETTINGS_JSON_EOF
 
@@ -435,6 +454,26 @@ if [ "$CHECK_ONLY" = "true" ]; then
   exit 0
 fi
 
+# --- Issue #2203 AC1: 通常起動が実際に Claude process を起動する直前に、必ず
+#     effective readback（`preflight.sh --auto-mode-check`）を実行する（P0-3,
+#     PR #2214 OWNER adversarial review 反映）。従来はこの opt-in サブコマンドが
+#     通常起動へ一度も配線されておらず、readback 未実行のまま launch_result が
+#     ok を返せてしまっていた。readback 失敗（未対応 version・narrow label 未反映・
+#     hard_deny/soft_deny 不整合・classifyAllShell 未有効化のいずれか）は fail-closed
+#     で起動を止める。 ---
+export CLAUDE_GPT_CLAUDE_BIN="$CLAUDE_BIN"
+AUTO_MODE_CHECK_JSON=$("$SCRIPT_DIR/preflight.sh" --auto-mode-check "$SETTINGS_PATH")
+AUTO_MODE_CHECK_RC=$?
+AUTO_MODE_CHECK_PATH="${CLAUDE_CONFIG_DIR_TARGET}/auto-mode-check.json"
+printf '%s\n' "$AUTO_MODE_CHECK_JSON" > "$AUTO_MODE_CHECK_PATH"
+if [ "$AUTO_MODE_CHECK_RC" -ne 0 ]; then
+  kill "$PROXY_PID" 2>/dev/null
+  wait "$PROXY_PID" 2>/dev/null
+  printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"auto_mode_readback_failed","auto_mode_check":%s}\n' "$AUTO_MODE_CHECK_JSON"
+  exit 8
+fi
+echo "CLAUDE_GPT_AUTO_MODE_CHECK_PATH=${AUTO_MODE_CHECK_PATH}" >&2
+
 # --- 通常起動: claude 本体を子プロセスとして起動する supervisor 構成（P0-4）。
 #     `exec` は shell process image を claude に置き換えてしまい EXIT trap に二度と
 #     到達しないため使わない。shell を supervisor として維持し、全終了経路
@@ -464,6 +503,23 @@ export STRICT_MCP_MODE
 # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB は設定しない（OS-level sandbox hardening は Phase 1
 # の merge 条件から除外。実機検証で launcher がネストした sandbox 実行環境下にある場合
 # Bash tool を破壊することを確認したため。Issue #2158 Scope Reframe, 2026-08-15）。
+# --- Claude/AGY プロセスから genuine `gh` auth context を利用不能にする（P0-6,
+#     PR #2214 OWNER adversarial review 反映）。GitHub write credential は
+#     GitHub mutation transaction broker（別プロセス、ambient 実 HOME/GH_CONFIG_DIR
+#     を使う）のみが保持する。ここで Claude 子プロセスの HOME/GH_CONFIG_DIR/
+#     XDG_CONFIG_HOME/XDG_CACHE_HOME を空の隔離ディレクトリへ差し替え、
+#     GH_TOKEN 系 / SSH_AUTH_SOCK / GIT_ASKPASS 系を scrub することで、raw `gh` /
+#     raw `git push`（SSH 経由を含む）を Claude セッション内から実行しても
+#     既存 authentication に到達できない状態にする。 ---
+export HOME="$CLAUDE_ISOLATED_HOME_TARGET"
+export GH_CONFIG_DIR="$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET"
+export XDG_CONFIG_HOME="$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET"
+export XDG_CACHE_HOME="$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+unset GH_HOST GH_REPO
+unset SSH_AUTH_SOCK
+unset GIT_ASKPASS SSH_ASKPASS GIT_CREDENTIAL_HELPER
+
 export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1
 # `auto` は `[1m]` suffix なし model 名の場合に未知 model として context window を
 # 200k と誤認し早期 compaction/summarization 失敗を招いた（実機再検証, 2026-08-15）。
@@ -534,8 +590,12 @@ trap 'claude_gpt_cleanup' EXIT
 #     いずれ破綻していた状態を早期に顕在化させるだけである）。
 exec 9<&0
 
+# --- launcher が exactly one の `--permission-mode auto` を注入する（Issue #2203
+#     Outcome 節）。caller 由来の `--permission-mode` は上記 forbidden-flag ループ
+#     （CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由）で既に全面拒否済みのため、ここに
+#     到達する時点で "$@" に `--permission-mode` トークンは含まれない。 ---
 # shellcheck disable=SC2086
-"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" "$@" <&9 &
+"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" --permission-mode auto "$@" <&9 &
 CLAUDE_PID=$!
 
 wait "$CLAUDE_PID"

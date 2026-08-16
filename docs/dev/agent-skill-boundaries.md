@@ -2773,3 +2773,41 @@ blind spot になる）。
   得られる具体的な証跡（実際に観測された変更内容・タイミング）を根拠に、exact path の
   producer を特定した上で再度対応を検討する。証跡のない事前の blanket exemption は
   行わない。
+
+## claude-gpt launcher における auto mode の second-gate 境界（Issue #2203）
+
+`scripts/claude-gpt/launch.sh` が生成する launcher-owned `--settings` の
+`autoMode`（`environment` / `allow` / `classifyAllShell: true`）は、Claude Code の
+Auto mode 自然言語 classifier に対する判断補助（second gate）であり、決定論的な
+authority ではない（[Configure auto mode](https://code.claude.com/docs/en/auto-mode-config)、
+[Configure permissions](https://code.claude.com/docs/en/permissions) 準拠）。
+
+本 Issue（#2203）の Allowed Paths 内で実装した決定論的な authorization boundary は
+次の三層で構成される。ただし各層のスコープは限定的であり、raw `gh` / raw `git push`
+全般に対する production-grade な deterministic deny ではない（下記「未達スコープ」参照）。
+
+1. `permissions.deny`（絶対拒否。autoMode では緩和しない）
+2. 引数・repository・object identity を検証する `PreToolUse` hook
+3. `squne121/loop-protocol` に repository 固定した **canary Issue lifecycle 専用**の
+   GitHub mutation transaction broker（`scripts/claude-gpt/auto_mode_canary.py` の
+   `GitHubMutationBroker`。`scripts/agent-guards/controlled_skill_mutation_exec.py`
+   と同型の repository binding / env scrub / shell=False / remote-state-is-authority
+   readback 設計を踏襲するが、対応する操作は canary Issue の create/edit/comment/close
+   に限定される）
+
+launcher は caller の `--permission-mode` 指定（値の種類を問わず一律）を forbidden
+flag として拒否し、launcher 自身が exactly one の `--permission-mode auto` を注入
+する（`scripts/claude-gpt/lib.sh` の `CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS`）。`autoMode`
+は project `.claude/settings.json` / `.claude/settings.local.json` には追加せず、
+launcher-owned `--settings` にのみ注入する。
+
+### 未達スコープ（production broker は別 Issue）
+
+上記 3 層目の `GitHubMutationBroker` は `squne121/loop-protocol` の canary Issue
+lifecycle（本 Issue の live 検証専用）にスコープが限定された broker であり、汎用の
+GitHub mutation authority（任意の `gh` / raw `git push` 全般）に対する決定論的な
+authorization boundary ではない。raw `gh` / raw `git push`（force push・default branch
+push・remote ref 削除・repository settings 変更等）を deterministic に deny する
+production-grade な broker / hook-level deny の実装は本 Issue の scope 外であり、
+follow-up Issue #2223（実装: raw gh/git push を deterministic deny し GitHub
+mutation production broker を実装する、OPEN）で対応する。
