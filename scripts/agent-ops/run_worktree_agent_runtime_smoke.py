@@ -4215,22 +4215,30 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--hermetic-agent-definition requires --mode structured")
 
     # Issue #2183 PR #2220 OWNER REQUEST_CHANGES P0-1
-    # (https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514):
-    # ``subagent_causal_evidence_verdict()`` only has a structural
-    # hook-lifecycle channel to evaluate for ``--runtime claude --mode
-    # structured`` -- every other runtime/mode combination leaves
+    # (https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514),
+    # narrowed by the follow-up fix-delta
+    # (https://github.com/squne121/loop-protocol/pull/2220 P0-1 re-review):
+    # ``subagent_causal_evidence_verdict()`` is only ever computed
+    # (non-``None``) for ``--runtime claude`` -- every other runtime leaves
     # ``causal_evidence`` unconditionally ``None``, which
     # ``--require-subagent-causal-evidence`` would then always fail on,
     # regardless of whether the underlying run actually succeeded. Reject
-    # the combination at parse time (fail fast, before any process is
+    # that combination at parse time (fail fast, before any process is
     # spawned) rather than let it silently FAIL every such run downstream.
-    if args.require_subagent_causal_evidence and (
-        args.runtime != "claude" or args.mode != "structured"
-    ):
+    #
+    # This must NOT also reject ``--mode interactive``: the interactive
+    # lane computes the SAME ``causal_evidence`` verdict for
+    # ``--runtime claude`` (see ``run_interactive_herdr_isolated`` call
+    # site below) and honors ``--require-subagent-causal-evidence`` as a
+    # genuine opt-in gate there too (Issue #2183 AC10) -- it simply tends
+    # to observe ``no_evidence``/``marker_only_insufficient`` in practice,
+    # because the herdr pane render does not echo the
+    # ``--include-hook-events`` stream-json hook payloads the structured
+    # lane can parse. That is an expected gate *outcome*, not a reason to
+    # reject the flag/mode combination outright.
+    if args.require_subagent_causal_evidence and args.runtime != "claude":
         parser.error(
-            "--require-subagent-causal-evidence requires --runtime claude --mode structured "
-            "(no hook-lifecycle causal-evidence channel exists for any other runtime/mode "
-            "combination)"
+            "--require-subagent-causal-evidence requires --runtime claude"
         )
 
     run_id = uuid.uuid4().hex[:12]
@@ -4787,14 +4795,13 @@ def main(argv: list[str] | None = None) -> int:
             # expected marker text was still forced to FAIL purely because
             # this harness has no hook-lifecycle channel for Codex, not
             # because anything about the run was actually wrong. The
-            # requirement is now explicitly scoped to the one runtime/mode
-            # combination that structurally has a causal-evidence channel
-            # at all; ``main()`` rejects (at argparse time, via
-            # ``parser.error``) any attempt to combine
-            # ``--require-subagent-causal-evidence`` with a runtime/mode
-            # pair outside that combination, so by the time this line runs
-            # ``args.require_subagent_causal_evidence`` being ``True``
-            # already implies ``args.runtime == "claude"``.
+            # requirement is now explicitly scoped to the one runtime that
+            # structurally has a causal-evidence channel at all (any mode);
+            # ``main()`` rejects (at argparse time, via ``parser.error``)
+            # any attempt to combine ``--require-subagent-causal-evidence``
+            # with a runtime other than ``claude``, so by the time this
+            # line runs ``args.require_subagent_causal_evidence`` being
+            # ``True`` already implies ``args.runtime == "claude"``.
             causal_evidence_required = args.require_subagent_causal_evidence or (
                 args.runtime == "claude" and bool(args.expect_marker)
             )
