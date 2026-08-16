@@ -524,31 +524,42 @@ REPAIR_APPLY_FAILURE_NO_MUTATION_INTENT = "no_mutation_intent"
 
 def resolve_repair_apply_mutation_intent(
     *,
-    contract_patch_plan: "dict | None",
+    contract_update: "dict | None",
     repair_action: "dict | None",
 ) -> dict:
     """Issue #2039 AC1: exactly-one mutation-intent arbiter for the
     repair_action.apply command lane.
 
-    `contract_patch_plan` and `repair_action` must not both be present in
-    the same preflight result. When both are given this returns a
-    fail-closed verdict (`failure_code=multiple_mutation_intents`,
+    PR #2202 review fix (P0-1): this arbiter reads the CANONICAL
+    `refinement_preflight_result_v1` top-level field `contract_update`
+    (emitted by `contract_update.run.with_anchor`) -- not the unrelated,
+    schema-invalid `contract_patch_plan` key that a canonical result can
+    never carry (`additionalProperties: false`). Reading the wrong field
+    made the earlier version of this arbiter always see
+    `has_contract_update=False` for real production artifacts, so it could
+    never detect the real hazard this AC exists to prevent: a canonical
+    result that already carries a completed/attempted `contract_update`
+    handoff *and* a `repair_action` projection at the same time.
+
+    `contract_update` and `repair_action` must not both be present in the
+    same preflight result. When both are given this returns a fail-closed
+    verdict (`failure_code=multiple_mutation_intents`,
     `mutation_outcome=not_attempted`) *before* any GitHub mutation is
     attempted. A subsequent intent must be regenerated as a fresh preflight
     in a separate command, never resolved by this arbiter picking one of
     the two present intents.
     """
-    has_patch_plan = contract_patch_plan is not None
+    has_contract_update = contract_update is not None
     has_repair_action = repair_action is not None
 
-    if has_patch_plan and has_repair_action:
+    if has_contract_update and has_repair_action:
         return {
             "intent": None,
             "ok": False,
             "failure_code": REPAIR_APPLY_FAILURE_MULTIPLE_MUTATION_INTENTS,
             "mutation_outcome": "not_attempted",
             "reason": (
-                "contract_patch_plan and repair_action are both present in the "
+                "contract_update and repair_action are both present in the "
                 "same preflight result; exactly one mutation intent is required. "
                 "Apply one intent, then regenerate a fresh preflight as a "
                 "separate command for the other."
@@ -562,9 +573,9 @@ def resolve_repair_apply_mutation_intent(
             "mutation_outcome": None,
             "reason": None,
         }
-    if has_patch_plan:
+    if has_contract_update:
         return {
-            "intent": "contract_patch_plan",
+            "intent": "contract_update",
             "ok": True,
             "failure_code": None,
             "mutation_outcome": None,
@@ -575,7 +586,7 @@ def resolve_repair_apply_mutation_intent(
         "ok": False,
         "failure_code": REPAIR_APPLY_FAILURE_NO_MUTATION_INTENT,
         "mutation_outcome": "not_attempted",
-        "reason": "Neither contract_patch_plan nor repair_action is present.",
+        "reason": "Neither contract_update nor repair_action is present.",
     }
 
 
@@ -1084,10 +1095,10 @@ def run_repair_action_apply(
             repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
         )
 
-    contract_patch_plan = parsed.get("contract_patch_plan")
+    contract_update = parsed.get("contract_update")
     repair_action = parsed.get("repair_action")
     intent = resolve_repair_apply_mutation_intent(
-        contract_patch_plan=contract_patch_plan, repair_action=repair_action
+        contract_update=contract_update, repair_action=repair_action
     )
     if not intent["ok"]:
         return _repair_apply_not_attempted_result(

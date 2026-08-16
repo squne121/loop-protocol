@@ -1,6 +1,6 @@
 """Behavioral tests for `resolve_repair_apply_mutation_intent` (Issue #2039 AC1).
 
-GIVEN a preflight result carrying `contract_patch_plan` and/or
+GIVEN a preflight result carrying `contract_update` and/or
 `repair_action`, WHEN the arbiter resolves the mutation intent, THEN it
 must select exactly one intent, and must fail closed (no GitHub mutation
 attempted) when both or neither are present.
@@ -34,7 +34,7 @@ class ResolveRepairApplyMutationIntentTests(unittest.TestCase):
         self,
     ) -> None:
         verdict = resolve_repair_apply_mutation_intent(
-            contract_patch_plan={"some": "patch"},
+            contract_update={"some": "patch"},
             repair_action={"disposition": "auto_apply_safe"},
         )
 
@@ -52,7 +52,7 @@ class ResolveRepairApplyMutationIntentTests(unittest.TestCase):
         self,
     ) -> None:
         verdict = resolve_repair_apply_mutation_intent(
-            contract_patch_plan=None,
+            contract_update=None,
             repair_action={"disposition": "auto_apply_safe"},
         )
 
@@ -61,18 +61,18 @@ class ResolveRepairApplyMutationIntentTests(unittest.TestCase):
         self.assertIsNone(verdict["failure_code"])
         self.assertIsNone(verdict["mutation_outcome"])
 
-    # -- GIVEN only contract_patch_plan present WHEN resolved THEN intent=contract_patch_plan --
+    # -- GIVEN only contract_update present WHEN resolved THEN intent=contract_update --
 
-    def test_given_only_contract_patch_plan_when_resolved_then_contract_patch_plan_intent(
+    def test_given_only_contract_update_when_resolved_then_contract_update_intent(
         self,
     ) -> None:
         verdict = resolve_repair_apply_mutation_intent(
-            contract_patch_plan={"some": "patch"},
+            contract_update={"some": "patch"},
             repair_action=None,
         )
 
         self.assertTrue(verdict["ok"])
-        self.assertEqual(verdict["intent"], "contract_patch_plan")
+        self.assertEqual(verdict["intent"], "contract_update")
         self.assertIsNone(verdict["failure_code"])
         self.assertIsNone(verdict["mutation_outcome"])
 
@@ -82,7 +82,7 @@ class ResolveRepairApplyMutationIntentTests(unittest.TestCase):
         self,
     ) -> None:
         verdict = resolve_repair_apply_mutation_intent(
-            contract_patch_plan=None,
+            contract_update=None,
             repair_action=None,
         )
 
@@ -100,7 +100,7 @@ class ResolveRepairApplyMutationIntentTests(unittest.TestCase):
         # `is not None`, not truthiness, so a technically-empty-but-present
         # repair_action payload is not silently treated as absent.
         verdict = resolve_repair_apply_mutation_intent(
-            contract_patch_plan=None,
+            contract_update=None,
             repair_action={},
         )
 
@@ -111,7 +111,7 @@ class ResolveRepairApplyMutationIntentTests(unittest.TestCase):
         self,
     ) -> None:
         verdict = resolve_repair_apply_mutation_intent(
-            contract_patch_plan={},
+            contract_update={},
             repair_action={},
         )
 
