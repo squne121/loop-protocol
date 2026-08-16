@@ -478,6 +478,115 @@ def test_interactive_lane_claude_bin_shim_is_forwarder_not_symlink(monkeypatch, 
 
 
 # ---------------------------------------------------------------------------
+# Issue #2176 (live-environment finding, 2026-08-16): CLAUDE_GPT_CLAUDE_BIN
+# self-recursion regression. Once the shim directory built above is
+# prepended to the isolated session's PATH, ``scripts/claude-gpt/
+# launch.sh`` (invoked via the shim once Herdr's own ``agent start``
+# resolves it) would ALSO see that shim on its own PATH -- so its internal
+# ``claude_gpt_resolve_claude_bin()`` (``scripts/claude-gpt/lib.sh``),
+# which falls back to ``command -v claude`` when ``CLAUDE_GPT_CLAUDE_BIN``
+# is unset, resolves back to the shim itself and launch.sh execs itself
+# again (self-recursion), which its own top-level parser then rejects.
+# These tests confirm ``claude_adapter == "claude-gpt"`` resolves the REAL
+# native claude binary against the pre-shim PATH and threads it through as
+# ``CLAUDE_GPT_CLAUDE_BIN`` to both the ``herdr workspace create --env``
+# call and the ``herdr pane run ... export`` re-pin step, and that the
+# ``native`` adapter (default) never does this (AC6 backward compatibility).
+# ---------------------------------------------------------------------------
+
+_FORWARDER_CAUSAL_PROOF_HERDR_BODY_WITH_PANE_LOG = _FORWARDER_CAUSAL_PROOF_HERDR_BODY.replace(
+    'mkdir -p "$STATE_DIR"\n',
+    'mkdir -p "$STATE_DIR"\n'
+    'if [ "$1" = "pane" ] && [ "$2" = "run" ]; then\n'
+    '  printf \'%s\\n\' "$@" >> "$STATE_DIR/pane_run_argv.log"\n'
+    'fi\n',
+    1,
+)
+
+
+def test_interactive_lane_claude_gpt_adapter_threads_claude_gpt_claude_bin_env(monkeypatch, tmp_path):
+    """The real native ``claude`` binary's absolute path must be resolved
+    against the ORIGINAL (pre-shim) PATH and passed through as
+    ``CLAUDE_GPT_CLAUDE_BIN`` to both the ``workspace create --env`` call
+    and the pane re-pin ``export`` step, whenever ``claude_adapter ==
+    "claude-gpt"``."""
+    module = _load_module()
+
+    state_dir = tmp_path / "herdr-state"
+    fake_herdr = tmp_path / "herdr"
+    _write_fake_exe(fake_herdr, _FORWARDER_CAUSAL_PROOF_HERDR_BODY_WITH_PANE_LOG)
+
+    real_claude_dir = tmp_path / "real-claude-bin"
+    real_claude_dir.mkdir()
+    _write_fake_exe(real_claude_dir / "claude", 'echo "REAL_NATIVE_CLAUDE"\n')
+
+    launcher_dir = tmp_path / "claude-gpt-launcher"
+    launcher_dir.mkdir()
+    launcher = launcher_dir / "launch.sh"
+    _write_fake_exe(launcher, 'echo "OK"\n')
+
+    monkeypatch.setenv("PATH", str(real_claude_dir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("FAKE_HERDR_STATE_DIR", str(state_dir))
+
+    evidence = {"cleanup": {}}
+    module.run_interactive_herdr_isolated(
+        "claude", str(tmp_path), "hello", 20.0, "abc123", evidence,
+        herdr_bin=str(fake_herdr),
+        claude_bin_override=str(launcher),
+        claude_adapter="claude-gpt",
+    )
+
+    expected_real_claude = os.path.realpath(str(real_claude_dir / "claude"))
+    assert evidence.get("claude_gpt_claude_bin_resolved") == expected_real_claude
+
+    argv_log = (state_dir / "workspace_create_argv.log").read_text(encoding="utf-8")
+    assert f"CLAUDE_GPT_CLAUDE_BIN={expected_real_claude}" in argv_log
+
+    pane_log_path = state_dir / "pane_run_argv.log"
+    assert pane_log_path.exists(), "pane run re-pin step was never invoked"
+    pane_log = pane_log_path.read_text(encoding="utf-8")
+    assert f"export CLAUDE_GPT_CLAUDE_BIN='{expected_real_claude}'" in pane_log
+
+
+def test_interactive_lane_native_adapter_never_sets_claude_gpt_claude_bin_env(monkeypatch, tmp_path):
+    """Negative control (AC6): the default ``native`` adapter must never
+    inject ``CLAUDE_GPT_CLAUDE_BIN`` -- this is exclusively a
+    ``claude-gpt``-adapter concern, and every pre-existing caller's
+    isolated-session env must be unchanged."""
+    module = _load_module()
+
+    state_dir = tmp_path / "herdr-state"
+    fake_herdr = tmp_path / "herdr"
+    _write_fake_exe(fake_herdr, _FORWARDER_CAUSAL_PROOF_HERDR_BODY_WITH_PANE_LOG)
+
+    real_claude_dir = tmp_path / "real-claude-bin"
+    real_claude_dir.mkdir()
+    _write_fake_exe(real_claude_dir / "claude", 'echo "REAL_NATIVE_CLAUDE"\n')
+
+    launcher_dir = tmp_path / "native-launcher"
+    launcher_dir.mkdir()
+    launcher = launcher_dir / "launch.sh"
+    _write_fake_exe(launcher, 'echo "OK"\n')
+
+    monkeypatch.setenv("PATH", str(real_claude_dir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("FAKE_HERDR_STATE_DIR", str(state_dir))
+
+    evidence = {"cleanup": {}}
+    module.run_interactive_herdr_isolated(
+        "claude", str(tmp_path), "hello", 20.0, "abc123", evidence,
+        herdr_bin=str(fake_herdr),
+        claude_bin_override=str(launcher),
+    )
+
+    assert "claude_gpt_claude_bin_resolved" not in evidence
+    argv_log = (state_dir / "workspace_create_argv.log").read_text(encoding="utf-8")
+    assert "CLAUDE_GPT_CLAUDE_BIN" not in argv_log
+    pane_log_path = state_dir / "pane_run_argv.log"
+    if pane_log_path.exists():
+        assert "CLAUDE_GPT_CLAUDE_BIN" not in pane_log_path.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Finding 6 (PR #2176 OWNER REQUEST_CHANGES): invalid runtime/flag
 # combinations must be rejected at argparse time (exit 2), never silently
 # accepted and ignored while a different runtime actually runs.

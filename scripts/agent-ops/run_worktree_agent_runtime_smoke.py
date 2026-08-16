@@ -2933,10 +2933,33 @@ def run_interactive_herdr_isolated(
     *,
     herdr_bin: str = "herdr",
     claude_bin_override: str | None = None,
+    claude_adapter: str = "native",
 ) -> list[str]:
     """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
     in place (so cleanup/session identity survive even if this raises) and
     returns the bounded, redacted pane output lines.
+
+    Issue #2176 (post-merge live-environment finding, 2026-08-16): when
+    ``claude_adapter == "claude-gpt"``, the PATH shim built below (needed so
+    Herdr's own ``agent start --kind claude`` resolves the forwarder) is
+    ALSO visible to ``scripts/claude-gpt/launch.sh`` itself once it execs.
+    ``launch.sh`` internally calls ``claude_gpt_resolve_claude_bin()``
+    (``scripts/claude-gpt/lib.sh``), which falls back to ``command -v
+    claude`` whenever ``CLAUDE_GPT_CLAUDE_BIN`` is unset -- and with the shim
+    directory prepended to PATH, that lookup resolves back to the shim
+    itself, so ``launch.sh`` execs itself again (self-recursion) with its
+    own canonical flags (including ``--strict-mcp-config``) appended, which
+    its own top-level parser then rejects as an externally-supplied flag,
+    exiting 2 before Claude Code ever starts (Herdr then times out waiting
+    for agent startup). To break this loop, the REAL native ``claude``
+    binary's absolute path is resolved here via ``shutil.which("claude")``
+    against the ORIGINAL (pre-shim) PATH, and threaded into
+    ``CLAUDE_GPT_CLAUDE_BIN`` for both the ``herdr workspace create --env``
+    call and the ``herdr pane run ... export`` re-pin step below -- this
+    tells ``launch.sh`` exactly which real binary to use, bypassing its own
+    self-referential PATH-based lookup entirely. Omitted for
+    ``claude_adapter == "native"`` (default), so every pre-existing
+    caller's isolated-session env is unchanged (AC6).
 
     Issue #2174 (AC1): when ``runtime == "claude"`` and ``claude_bin_override``
     is a non-empty absolute path, ``herdr agent start --kind claude`` is made
@@ -3044,11 +3067,28 @@ def run_interactive_herdr_isolated(
             forwarder_path.chmod(0o700)
             evidence["claude_bin_shim_kind"] = "forwarder"
             existing_path = isolated_env.get("PATH", os.defpath)
+            claude_gpt_real_claude_bin: str | None = None
+            if claude_adapter == "claude-gpt":
+                # Resolved against the PRE-shim PATH (``existing_path``, not
+                # ``isolated_env["PATH"]`` after the prepend below) so this
+                # never finds the forwarder itself. See the function
+                # docstring (Issue #2176 CLAUDE_GPT_CLAUDE_BIN self-
+                # recursion fix, 2026-08-16).
+                claude_gpt_real_claude_bin = shutil.which("claude", path=existing_path)
+                if claude_gpt_real_claude_bin:
+                    isolated_env["CLAUDE_GPT_CLAUDE_BIN"] = claude_gpt_real_claude_bin
+                    evidence["claude_gpt_claude_bin_resolved"] = claude_gpt_real_claude_bin
+                else:
+                    evidence["claude_gpt_claude_bin_resolved"] = None
             isolated_env["PATH"] = claude_bin_shim_dir + os.pathsep + existing_path
             # Finding 1: the updated PATH must be handed to Herdr's own
             # server/root-shell process explicitly -- updating only this
             # Python client's isolated_env["PATH"] never reaches it.
             workspace_create_argv += ["--env", "PATH=" + isolated_env["PATH"]]
+            if claude_gpt_real_claude_bin:
+                workspace_create_argv += [
+                    "--env", "CLAUDE_GPT_CLAUDE_BIN=" + claude_gpt_real_claude_bin,
+                ]
 
         rc, out, err, timed_out = _run(
             workspace_create_argv,
@@ -3078,9 +3118,17 @@ def run_interactive_herdr_isolated(
             # ``agent start`` -- guarantees the shim wins regardless of
             # rc-script ordering.
             _escaped_shim_dir = claude_bin_shim_dir.replace("'", "'\\''")
+            _pin_cmd = f"export PATH='{_escaped_shim_dir}':\"$PATH\""
+            if claude_adapter == "claude-gpt" and isolated_env.get("CLAUDE_GPT_CLAUDE_BIN"):
+                # Same self-recursion fix as the ``--env`` above (Issue
+                # #2176, 2026-08-16), re-applied to the already-running,
+                # post-rc-sourced pane shell for the same reason PATH is
+                # re-pinned here: an interactive login shell's own rc files
+                # could otherwise clobber an inherited env var too.
+                _escaped_claude_gpt_bin = isolated_env["CLAUDE_GPT_CLAUDE_BIN"].replace("'", "'\\''")
+                _pin_cmd += f" && export CLAUDE_GPT_CLAUDE_BIN='{_escaped_claude_gpt_bin}'"
             _pin_rc, _pin_out, _pin_err, _pin_timed_out = _run(
-                [herdr_bin, "pane", "run", pane_id,
-                 f"export PATH='{_escaped_shim_dir}':\"$PATH\""],
+                [herdr_bin, "pane", "run", pane_id, _pin_cmd],
                 timeout=15.0, env=isolated_env,
             )
             if _pin_timed_out or _pin_rc != 0:
@@ -4160,6 +4208,7 @@ def main(argv: list[str] | None = None) -> int:
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
                     claude_bin_override=args.claude_bin if args.runtime == "claude" else None,
+                    claude_adapter=args.claude_adapter,
                 )
 
                 if evidence.get("final_state") == "blocked":
