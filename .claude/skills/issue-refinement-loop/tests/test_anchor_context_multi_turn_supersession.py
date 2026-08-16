@@ -923,7 +923,10 @@ _VALID_CONTRACT_BODY = """\
 contract_schema_version: v1
 issue_kind: implementation
 parent_issue: "#1"
+goal_ref: "Test goal"
+change_kind: code
 ```
+
 
 ## Parent Issue
 
