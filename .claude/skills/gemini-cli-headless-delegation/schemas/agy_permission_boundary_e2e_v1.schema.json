@@ -279,6 +279,69 @@
         "descendant_processes_absent": {
           "type": "boolean",
           "description": "Issue #1979 AC7: whether no process remains in that process group after the run."
+        },
+        "temporary_tree_removal": {
+          "description": "Issue #1997: optional v1 additive temporary-tree removal ledger. New producers emit it for every run so artifacts record whether retry was observation-only or enabled; it never contains raw paths or filenames.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "initial_result",
+            "initial_exception_type",
+            "initial_errno",
+            "initial_errno_name",
+            "initial_operation",
+            "path_class",
+            "relative_path_digest",
+            "residual_observation",
+            "retry_policy_mode",
+            "retry_eligible",
+            "retry_count",
+            "retry_result",
+            "final_cleanup_verdict",
+            "postcondition_absent",
+            "producer_contract_revision"
+          ],
+          "properties": {
+            "producer_contract_revision": {
+              "type": "string",
+              "description": "Issue #1997 fix_delta P2-2: identifies which producer contract revision emitted this ledger, so a legacy pre-fix_delta artifact (lacking this field entirely, since the whole object remains optional) can never be confused with a current producer's output.",
+              "minLength": 1
+            },
+            "initial_result": {"enum": ["success", "failure"]},
+            "initial_exception_type": {"type": ["string", "null"]},
+            "initial_errno": {"type": ["integer", "null"]},
+            "initial_errno_name": {"type": ["string", "null"]},
+            "initial_operation": {"type": ["string", "null"], "enum": ["rmdir", "unlink", "remove", "lstat", "rmtree", "unknown", null]},
+            "path_class": {"type": ["string", "null"], "enum": ["root", "descendant", "unknown", null]},
+            "relative_path_digest": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+            "residual_observation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "entry_count", "holder_status"],
+              "properties": {
+                "status": {"enum": ["not_run", "complete", "unsupported", "error"]},
+                "entry_count": {"type": ["integer", "null"], "minimum": 0},
+                "holder_status": {"enum": ["not_checked", "absent", "busy", "unsupported", "error"]}
+              }
+            },
+            "retry_policy_mode": {"enum": ["observation_only", "single_retry_enabled"]},
+            "retry_eligible": {"type": "boolean"},
+            "retry_count": {"enum": [0, 1]},
+            "retry_result": {"enum": ["not_run", "success", "failure"]},
+            "final_cleanup_verdict": {"enum": ["removed", "failed"]},
+            "postcondition_absent": {"type": "boolean"}
+          },
+          "allOf": [
+            {
+              "description": "Issue #1997 fix_delta P1-1 (OWNER review issuecomment-5307195963): postcondition_absent and final_cleanup_verdict must be a schema-enforced bidirectional equivalence, not just a Python-validator check.",
+              "if": {"properties": {"postcondition_absent": {"const": true}}, "required": ["postcondition_absent"]},
+              "then": {"properties": {"final_cleanup_verdict": {"const": "removed"}}}
+            },
+            {
+              "if": {"properties": {"postcondition_absent": {"const": false}}, "required": ["postcondition_absent"]},
+              "then": {"properties": {"final_cleanup_verdict": {"const": "failed"}}}
+            }
+          ]
         }
       }
     },
