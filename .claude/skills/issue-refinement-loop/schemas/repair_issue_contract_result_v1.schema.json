@@ -576,6 +576,20 @@
             "human_review_required",
             "no_missing_fields_detected"
           ]
+        },
+        "template_git_blob_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Issue #995 fix_delta (P1-3): git blob SHA (`git hash-object`) of the `.github/ISSUE_TEMPLATE/*.yml` file this bundle was diffed against, as resolved by the caller (this producer never shells out to git itself). Null when the caller did not supply one (e.g. standalone unit tests constructing template_text in-memory)."
+        },
+        "template_source_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Issue #995 fix_delta (P1-3): `<repo>@<commit-sha>` the caller resolved the template from, additive alongside template_git_blob_sha. Null when the caller did not supply one."
         }
       },
       "allOf": [
@@ -583,6 +597,7 @@
           "if": {
             "properties": {
               "disposition_summary": {
+
                 "const": "no_missing_fields_detected"
               }
             },

@@ -1916,11 +1916,27 @@ def build_structural_repair_bundle(
     original_updated_at: Optional[str] = None,
     known_scalars: Optional[dict] = None,
     source_spans: Optional[dict] = None,
+    template_git_blob_sha: Optional[str] = None,
+    template_source_ref: Optional[str] = None,
 ) -> dict:
     """Produce the single versioned handoff bundle for one producer run
     (AC2/AC6/AC7). Pure Python string/YAML processing only: never invokes
     `gh`/GitHub REST/GraphQL, never writes the Issue body, never dispatches
     items individually — #2039 (out of scope here) owns consumption.
+
+    `template_git_blob_sha`/`template_source_ref` (Issue #995 fix_delta
+    P1-3, OWNER adversarial review) are OPTIONAL, additive provenance the
+    CALLER supplies -- this module stays pure and never shells out to `git`
+    itself. `template_digest` (each item's content SHA-256 of
+    `template_text`, unchanged) still binds a template's exact BYTES;
+    these two new top-level fields additionally bind the template FILE's
+    git blob identity and the repo@commit ref the caller resolved it from,
+    so a caller with git/GitHub access (e.g. run_refinement_preflight.py)
+    can prove the template text actually came from a trusted repository
+    ref rather than an arbitrary/tampered local file. Both are `None` when
+    the caller does not supply them (e.g. the standalone unit tests in
+    this repo, which construct `template_text` in-memory with no git blob
+    to bind to).
     """
     original_body_sha256 = _sha256(body)
     items = detect_missing_template_sections(
@@ -1954,7 +1970,10 @@ def build_structural_repair_bundle(
         "original_updated_at": original_updated_at,
         "items": items,
         "disposition_summary": disposition_summary,
+        "template_git_blob_sha": template_git_blob_sha,
+        "template_source_ref": template_source_ref,
     }
+
 
 
 # ---------------------------------------------------------------------------

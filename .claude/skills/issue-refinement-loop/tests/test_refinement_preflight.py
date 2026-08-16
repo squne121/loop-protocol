@@ -2233,3 +2233,296 @@ class TestAC3AC7RewriteConstraintsInvariant:
                 f"AC7 invariant violated: required_contract_keys={required_contract_keys} "
                 f"!= must_add_contract_keys={must_add_contract_keys}"
             )
+
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #995 fix_delta (P0-1, OWNER adversarial review): production wiring
+# of build_structural_repair_bundle()/route_structural_repair_disposition()
+# into run_preflight() -- previously only reachable from
+# test_template_section_repair.py's standalone unit tests, never from this
+# module's own production entrypoint.
+# ---------------------------------------------------------------------------
+
+_STRUCTURAL_WIRING_TEMPLATE_TEXT = """\
+name: "Implementation Issue"
+description: "test double"
+body:
+  - type: textarea
+    id: machine-readable-contract
+    attributes:
+      label: "Machine-Readable Contract"
+      value: |
+        ```yaml
+        contract_schema_version: v1
+        issue_kind: implementation
+        parent_issue: "#0"
+        goal_ref: "N/A"
+        change_kind: code
+        ```
+    validations:
+      required: true
+  - type: textarea
+    id: stop-conditions
+    attributes:
+      label: "Stop Conditions"
+      value: |
+        - none
+    validations:
+      required: true
+"""
+
+
+def _seed_structural_wiring_template(tmp_path: Path) -> None:
+    """Materializes a minimal local `.github/ISSUE_TEMPLATE/implementation.yml`
+    under `tmp_path` so `_resolve_structural_repair_template()` (which only
+    ever reads from `repo_root`, never GitHub) resolves it the same way it
+    resolves the real repo's template in production -- isolated from this
+    test's real checkout, mirroring the existing `_find_repo_root` mock
+    pattern used throughout this file."""
+    template_dir = tmp_path / ".github" / "ISSUE_TEMPLATE"
+    template_dir.mkdir(parents=True, exist_ok=True)
+    (template_dir / "implementation.yml").write_text(
+        _STRUCTURAL_WIRING_TEMPLATE_TEXT, encoding="utf-8"
+    )
+
+
+# A body with every heading `plan_refinement_loop.py`'s OWN (heading-only)
+# required-section check demands for `issue_kind: implementation` -- i.e. the
+# planner itself does NOT fail_closed on this body -- but whose
+# machine-readable-contract omits `goal_ref`/`change_kind`. Structural repair
+# checks required MACHINE-READABLE-CONTRACT KEYS (via the authoring SSOT),
+# which the planner's heading-only check never inspects, so this body is the
+# minimal case that isolates "planner alone would pass/warn, but the
+# structural bundle alone would route to blocked" -- proving
+# structural_repair_action is reachable from run_preflight() as a genuinely
+# ADDITIONAL, independent check, not a passthrough of pre-existing planner
+# blockers.
+_STRUCTURAL_WIRING_BODY_MISSING_MRC_KEYS = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "#0"
+```
+
+## Parent Issue
+
+#0
+
+## Parent Goal Ref
+
+- Goal: test
+
+## Current Validated Scope
+
+- x
+
+## Remaining Parent Gaps
+
+- none
+
+## Runtime Verification Applicability
+
+decision: not_applicable
+reason: test
+
+## Outcome
+
+text
+
+## In Scope
+
+- x
+
+## Out of Scope
+
+- y
+
+## Acceptance Criteria
+
+- AC1: x
+
+## Verification Commands
+
+- `pnpm test`
+
+## Allowed Paths
+
+- x
+
+## Stop Conditions
+
+- none
+
+## Required Skills
+
+- python
+"""
+
+# A body missing MANY of the planner's own required headings entirely (only
+# Machine-Readable Contract + Outcome present). The planner's own heading-only
+# check fails_closed on this FIRST (more severe: blocked), before this
+# fix_delta's structural pass ever gets a chance to independently route its
+# own (weaker, auto_apply_safe) verdict to needs_fix -- the precedence case
+# `route_structural_repair_disposition()`'s caller must defer to.
+_STRUCTURAL_WIRING_BODY_MANY_SECTIONS_MISSING = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "#0"
+goal_ref: "N/A"
+change_kind: code
+```
+
+## Outcome
+
+text
+"""
+
+
+class TestStructuralRepairWiring:
+    """Issue #995 fix_delta P0-1: structural_repair_action is reachable from
+    run_preflight() itself, and its disposition_summary deterministically
+    drives status/next_action per route_structural_repair_disposition()."""
+
+    def test_resolve_structural_repair_template_reads_self_declared_issue_kind(self, tmp_path):
+        """P0-1: local-only (no GitHub call) resolution reads the body's own
+        machine-readable-contract issue_kind and the matching local template."""
+        _seed_structural_wiring_template(tmp_path)
+        body = "## Machine-Readable Contract\n\n```yaml\nissue_kind: implementation\n```\n"
+        kind, text, relpath = wrapper._resolve_structural_repair_template(body, tmp_path)
+        assert kind == "implementation"
+        assert relpath == ".github/ISSUE_TEMPLATE/implementation.yml"
+        assert text == _STRUCTURAL_WIRING_TEMPLATE_TEXT
+
+    def test_resolve_structural_repair_template_unresolvable_issue_kind_fails_closed(self, tmp_path):
+        """P0-1: a body with no self-declared issue_kind (or an unknown one)
+        resolves to (None, None, None) rather than guessing -- the caller
+        then leaves structural_repair_action absent for that run."""
+        _seed_structural_wiring_template(tmp_path)
+        assert wrapper._resolve_structural_repair_template("## Outcome\n\ntext\n", tmp_path) == (
+            None, None, None,
+        )
+        assert wrapper._resolve_structural_repair_template(
+            "issue_kind: bogus_kind\n", tmp_path
+        ) == (None, None, None)
+
+    def test_run_preflight_missing_mrc_keys_forces_blocked_even_when_planner_would_pass(self, tmp_path):
+        """P0-1: a body the planner's OWN heading-only check would not
+        fail_closed on (every required heading present) still gets forced to
+        status=blocked/next_action=human_judgment_required once
+        structural_repair_action finds missing required MRC keys
+        (goal_ref/change_kind) -- the exact OWNER-specified
+        `human_review_required -> blocked` routing rule, exercised through
+        the real production entrypoint (not a bespoke test-local reader), on
+        a defect the planner's own check cannot see."""
+        fixture_path = tmp_path / "fixture.json"
+        fixture_path.write_text(
+            json.dumps(
+                make_minimal_fixture(
+                    issue_number=995001, body=_STRUCTURAL_WIRING_BODY_MISSING_MRC_KEYS
+                )
+            ),
+            encoding="utf-8",
+        )
+        _seed_structural_wiring_template(tmp_path)
+
+        with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=995001,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        assert result.get("structural_repair_action") is not None, result
+        assert result["structural_repair_action"]["disposition_summary"] == "human_review_required"
+        assert result["status"] == "blocked", result
+        assert result["next_action"] == "human_judgment_required", result
+        assert exit_code == wrapper.EXIT_BLOCKED
+        assert any(
+            b.startswith("structural_repair_action:") for b in result["blockers"]
+        ), result
+
+        # Validate the attached bundle + the wrapping result against both
+        # schemas (never just self-reported by the producer).
+        result_schema = json.loads(
+            (SCHEMAS_DIR / "refinement_preflight_result_v1.schema.json").read_text(encoding="utf-8")
+        )
+        import jsonschema
+        jsonschema.validate(instance=result, schema=result_schema)
+
+    def test_run_preflight_never_downgrades_a_more_severe_pre_existing_status(self, tmp_path):
+        """P0-1 (schema-safety corollary): a structural finding must never
+        SILENTLY DOWNGRADE an already-blocked run (here: the planner's own
+        heading-only check fail-closing on many missing sections, which is
+        MORE severe than the structural bundle's own auto_apply_safe verdict
+        for the one field its narrower stub template happens to check) --
+        the schema's const invariant would otherwise force such a downgrade
+        if the bundle were attached unconditionally. It is deferred instead,
+        with its reason codes still surfaced as informational blockers so
+        the finding is never silently dropped."""
+        fixture_path = tmp_path / "fixture.json"
+        fixture_path.write_text(
+            json.dumps(
+                make_minimal_fixture(
+                    issue_number=995002, body=_STRUCTURAL_WIRING_BODY_MANY_SECTIONS_MISSING
+                )
+            ),
+            encoding="utf-8",
+        )
+        _seed_structural_wiring_template(tmp_path)
+
+        with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=995002,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        assert result["status"] == "blocked", result
+        assert "missing_required_section" in result["blockers"], result
+        # The would-be needs_fix verdict is not silently dropped -- and not
+        # silently promoted to override the pre-existing blocked status either.
+        assert result.get("structural_repair_action") is None, result
+        assert any(
+            b.startswith("structural_repair_action_deferred:") for b in result["blockers"]
+        ), result
+
+    def test_run_preflight_complete_body_attaches_no_missing_fields_without_status_constraint(self, tmp_path):
+        """P0-1: disposition_summary=no_missing_fields_detected carries no
+        status constraint -- it is safe to attach alongside pass/warn."""
+        fixture_path = tmp_path / "fixture.json"
+        fixture_path.write_text(
+            json.dumps(
+                make_minimal_fixture(
+                    issue_number=995003, body=_STRUCTURAL_WIRING_BODY_MISSING_MRC_KEYS.replace(
+                        'parent_issue: "#0"\n```',
+                        'parent_issue: "#0"\ngoal_ref: "N/A"\nchange_kind: code\n```',
+                    )
+                )
+            ),
+            encoding="utf-8",
+        )
+        _seed_structural_wiring_template(tmp_path)
+
+        with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=995003,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        assert result.get("structural_repair_action") is not None, result
+        assert (
+            result["structural_repair_action"]["disposition_summary"]
+            == "no_missing_fields_detected"
+        )
+        assert result["status"] in ("pass", "warn", "needs_fix", "blocked", "environment_failure")
