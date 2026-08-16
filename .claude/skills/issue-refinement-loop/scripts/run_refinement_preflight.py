@@ -581,6 +581,17 @@ def resolve_repair_apply_mutation_intent(
 REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION = "repair_apply_result/v1"
 EDIT_ISSUE_TXN_SCRIPT_REL = "edit-issue/scripts/edit_issue_txn.py"
 
+# Issue #2039 AC3: provenance-mismatch failure codes, in the order they are
+# checked (repo/issue identity first, then run identity, then payload
+# replacement, then leaf-artifact digest).
+REPAIR_APPLY_FAILURE_CROSS_ISSUE = "cross_issue_provenance_mismatch"
+REPAIR_APPLY_FAILURE_STALE_RUN = "stale_run_provenance_mismatch"
+REPAIR_APPLY_FAILURE_REPLACEMENT = "replacement_provenance_mismatch"
+REPAIR_APPLY_FAILURE_DIGEST_MISMATCH = "digest_mismatch"
+REPAIR_APPLY_FAILURE_PROVENANCE_UNRECONSTRUCTABLE = "provenance_unreconstructable"
+REPAIR_APPLY_FAILURE_SECOND_DRIFT = "second_body_drift"
+REPAIR_APPLY_FAILURE_NON_SAFE_AFTER_RERUN = "non_safe_disposition_after_rerun"
+
 
 def _repair_apply_not_attempted_result(
     *,
@@ -589,11 +600,13 @@ def _repair_apply_not_attempted_result(
     phase: str,
     failure_code: "str | None",
     provenance: "dict | None" = None,
+    rebase: "dict | None" = None,
 ) -> dict:
     """Issue #2039 AC8/AC11: shared not_attempted stdout-contract shape for
     every early-exit branch of run_repair_action_apply() (multiple intent,
-    no intent, non-safe disposition, unreadable candidate, readback
-    failure). Never emits a GitHub mutation."""
+    no intent, non-safe disposition, unreadable candidate, provenance
+    mismatch, second body drift, readback failure). Never emits a GitHub
+    mutation."""
     return {
         "schema_version": REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION,
         "phase": phase,
@@ -615,7 +628,8 @@ def _repair_apply_not_attempted_result(
             "source_lane": "unanchored",
             "source_refs_digest": None,
         },
-        "rebase": {
+        "rebase": rebase
+        or {
             "attempted": False,
             "producer_reruns": 0,
             "drift_detected": False,
@@ -639,11 +653,171 @@ def _repair_apply_not_attempted_result(
     }
 
 
-def _repair_receipt_from_txn_result(txn_result: dict) -> dict:
+def _repair_apply_strip_sha_prefix(value: "str | None") -> "str | None":
+    """Normalize a `sha256:<hex>` or bare-`<hex>` digest string to its bare
+    lowercase hex form for equality comparison, so digests produced by
+    different callers (some prefixed, some not) can still be compared
+    correctly (Issue #2039 AC3/AC4/AC5)."""
+    if not value:
+        return None
+    if value.startswith("sha256:"):
+        value = value[len("sha256:") :]
+    return value.lower()
+
+
+def _repair_action_core_projection(repair_action: dict) -> dict:
+    """Issue #2039 AC3: the environment-independent core of a repair_action
+    payload that provenance binding is computed over."""
+    return {
+        "schema_version": repair_action.get("schema_version"),
+        "policy_version": repair_action.get("policy_version"),
+        "disposition": repair_action.get("disposition"),
+        "original_body_sha256": repair_action.get("original_body_sha256"),
+        "repaired_body_sha256": repair_action.get("repaired_body_sha256"),
+        "repair_kinds": repair_action.get("repair_kinds"),
+        "reason_codes": repair_action.get("reason_codes"),
+    }
+
+
+def _repair_action_core_sha256(repair_action: dict) -> str:
+    core = _repair_action_core_projection(repair_action)
+    return hashlib.sha256(json.dumps(core, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _validate_repair_apply_provenance_binding(
+    provenance: dict,
+    *,
+    repo: str,
+    issue_number: int,
+    expected_provenance: "dict | None",
+) -> "str | None":
+    """Issue #2039 AC3: reject cross-Issue, old-run, replacement, and
+    candidate-digest-mismatch cases *before* any GitHub mutation is
+    dispatched.
+
+    The always-available self-consistency check (the candidate's own
+    provenance must target the repo/issue this command was invoked for) is
+    enforced unconditionally. When a caller additionally supplies
+    `expected_provenance` (e.g. the run identity / core hash / candidate
+    digest it originally bound to), every supplied field must match exactly,
+    or this returns the corresponding fail-closed reason code. Returns None
+    when provenance is fully consistent.
+    """
+    if provenance.get("repo") != repo or provenance.get("issue_number") != issue_number:
+        return REPAIR_APPLY_FAILURE_CROSS_ISSUE
+    if not expected_provenance:
+        return None
+
+    exp_repo = expected_provenance.get("repo")
+    if exp_repo is not None and exp_repo != provenance.get("repo"):
+        return REPAIR_APPLY_FAILURE_CROSS_ISSUE
+    exp_issue = expected_provenance.get("issue_number")
+    if exp_issue is not None and exp_issue != provenance.get("issue_number"):
+        return REPAIR_APPLY_FAILURE_CROSS_ISSUE
+
+    exp_run_identity = expected_provenance.get("preflight_run_identity")
+    if exp_run_identity is not None and exp_run_identity != provenance.get("preflight_run_identity"):
+        return REPAIR_APPLY_FAILURE_STALE_RUN
+    exp_original_sha = expected_provenance.get("original_body_sha256")
+    if exp_original_sha is not None and _repair_apply_strip_sha_prefix(
+        exp_original_sha
+    ) != _repair_apply_strip_sha_prefix(provenance.get("original_body_sha256")):
+        return REPAIR_APPLY_FAILURE_STALE_RUN
+
+    exp_core = expected_provenance.get("repair_action_core_sha256")
+    if exp_core is not None and exp_core != provenance.get("repair_action_core_sha256"):
+        return REPAIR_APPLY_FAILURE_REPLACEMENT
+
+    exp_digest = expected_provenance.get("candidate_digest")
+    if exp_digest is not None and _repair_apply_strip_sha_prefix(exp_digest) != _repair_apply_strip_sha_prefix(
+        provenance.get("candidate_digest")
+    ):
+        return REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+
+    return None
+
+
+def _default_rerun_repair_producer(body: str, artifact_dir: Path) -> "tuple[dict | None, str | None]":
+    """Issue #2039 AC4 default pre-dispatch rebase: rerun the SAME producer
+    (repair_issue_contract.py dry-run, then --apply materialize) against a
+    fresh live body -- never a whole-body textual rebase/diff-apply. Returns
+    a repair_action-shaped dict (possibly non-`auto_apply_safe`, which the
+    caller must classify as `non_safe_disposition_after_rerun`), or
+    (None, reason) on any subprocess/materialization failure."""
+    dry = _invoke_repair(body)
+    if dry.get("error"):
+        return None, f"rerun_dry_run_error:{dry.get('error')}"
+    raw_action = dry.get("repair_action")
+    if dry.get("changed") is not True or not isinstance(raw_action, dict):
+        # No repair classified against the fresh body at all: there is
+        # nothing safe left to apply, and the caller must not silently
+        # fabricate a disposition here.
+        return None, "rerun_no_actionable_repair"
+
+    if raw_action.get("disposition") != "auto_apply_safe":
+        return {
+            "schema_version": raw_action.get("schema_version", "repair_action/v1"),
+            "policy_version": raw_action.get("policy_version", "deterministic-issue-repair/v1"),
+            "disposition": raw_action.get("disposition"),
+            "original_body_sha256": raw_action.get("original_body_sha256"),
+            "repaired_body_sha256": raw_action.get("repaired_body_sha256"),
+            "candidate_body_artifact": None,
+            "repair_kinds": raw_action.get("repair_kinds", []),
+            "reason_codes": raw_action.get("reason_codes", []),
+        }, None
+
+    apply_result, apply_error = _materialize_auto_apply_candidate(body, dry, artifact_dir)
+    if apply_error is not None:
+        return None, f"rerun_apply_error:{apply_error}"
+    candidate_path = artifact_dir / "repaired_issue_body.md"
+    return {
+        "schema_version": raw_action.get("schema_version", "repair_action/v1"),
+        "policy_version": raw_action.get("policy_version", "deterministic-issue-repair/v1"),
+        "disposition": "auto_apply_safe",
+        "original_body_sha256": raw_action.get("original_body_sha256"),
+        "repaired_body_sha256": raw_action.get("repaired_body_sha256"),
+        "candidate_body_artifact": str(candidate_path),
+        "repair_kinds": raw_action.get("repair_kinds", []),
+        "reason_codes": raw_action.get("reason_codes", []),
+    }, None
+
+
+def _classify_repair_apply_readback_digest(
+    remote_sha: "str | None", candidate_digest: "str | None", old_digest: "str | None"
+) -> str:
+    """Issue #2039 AC5: authoritative-readback digest classification.
+    Distinguishes candidate (the dispatched body took effect) / old (the
+    body is unchanged from before dispatch) / third (neither -- e.g. a
+    concurrent human edit) / unknown (no readback digest available)."""
+    norm_remote = _repair_apply_strip_sha_prefix(remote_sha)
+    if norm_remote is None:
+        return "unknown"
+    if norm_remote == _repair_apply_strip_sha_prefix(candidate_digest):
+        return "candidate"
+    if old_digest is not None and norm_remote == _repair_apply_strip_sha_prefix(old_digest):
+        return "old"
+    return "third"
+
+
+def _repair_receipt_from_txn_result(
+    txn_result: dict,
+    *,
+    candidate_digest: "str | None" = None,
+    old_digest: "str | None" = None,
+    resolve_readback=None,
+) -> dict:
     """Issue #2039 AC6: lossless projection of edit_issue_txn.py's
     ISSUE_EDIT_TXN_RESULT_V1 receipt into the repair_apply_result/v1
     receipt shape. `unknown` is preserved, never collapsed into
-    failed/not_attempted/no_change."""
+    failed/not_attempted/no_change.
+
+    Issue #2039 AC5: post-dispatch retry budget is 0 -- this NEVER re-issues
+    the mutation. When the transaction result carries no
+    `remote_current_body_sha256` (executor could not itself confirm the
+    outcome), `resolve_readback` (if given) is called at most once to fetch
+    an authoritative post-dispatch snapshot for digest classification only;
+    it never re-dispatches a mutation.
+    """
     status = txn_result.get("status")
     mutation_outcome_map = {
         "ok": "applied",
@@ -660,12 +834,24 @@ def _repair_receipt_from_txn_result(txn_result: dict) -> dict:
         failure_code = "final_readback_unresolvable"
     elif mutation_outcome == "not_attempted" and (txn_result.get("errors") or []):
         failure_code = "transaction_execute_error"
+
     remote_sha = txn_result.get("remote_current_body_sha256")
-    final_readback = {
-        "status": "verified" if remote_sha else "unresolved",
-        "digest": remote_sha,
-        "digest_class": "unknown" if remote_sha else "not_applicable",
-    }
+    if not remote_sha and mutation_outcome == "unknown" and resolve_readback is not None:
+        # AC5: a single authoritative read (never a mutation retry),
+        # performed ONLY to disambiguate a genuinely executor-unconfirmed
+        # outcome -- not_attempted/no_change/applied results with no
+        # reported digest are not second-guessed via an extra read.
+        try:
+            remote_sha = resolve_readback()
+        except Exception:
+            remote_sha = None
+
+    if remote_sha:
+        digest_class = _classify_repair_apply_readback_digest(remote_sha, candidate_digest, old_digest)
+        final_readback = {"status": "verified", "digest": remote_sha, "digest_class": digest_class}
+    else:
+        final_readback = {"status": "unresolved", "digest": None, "digest_class": "not_applicable"}
+
     return {
         "patch_attempted": patch_attempted,
         "executor_status": status,
@@ -683,6 +869,8 @@ def run_repair_action_apply(
     repo_root: "Path | None" = None,
     fetch_current=None,
     apply_transaction=None,
+    expected_provenance: "dict | None" = None,
+    rerun_producer=None,
 ) -> dict:
     """Issue #2039 AC8/AC11: `repair_action.apply` controlled consumer.
 
@@ -693,18 +881,41 @@ def run_repair_action_apply(
     through the existing `edit_issue_txn.py` controlled transaction script
     (a real subprocess call; never a raw `gh issue edit` call -- AC11).
 
-    Scope note (this iteration wires AC8/AC11 -- the registry / policy /
-    parser / executor / stdout-contract surface -- with a real,
-    non-fixture subprocess dispatch path). Pre-dispatch rebase-on-drift
-    (AC4), full provenance cross-Issue/old-run/replacement rejection
-    (AC3), post-dispatch authoritative-readback digest classification
-    (AC5), and lane-preserving fresh validation (AC9) are intentionally
-    NOT implemented here (out of this iteration's declared scope):
-    `rebase` is always the untried default, `fresh_validation.status` is
-    always `not_run`, and `provenance` is populated from the candidate
-    artifact's own self-reported fields without a second, independent
-    live-Issue cross-check. The returned payload never claims a
-    verification step it did not actually perform.
+    AC3 (provenance binding): the candidate's own repo/issue_number is
+    always cross-checked against the requested target. When a caller
+    supplies `expected_provenance` (repo, issue_number,
+    preflight_run_identity, original_body_sha256, repair_action_core_sha256,
+    candidate_digest), every supplied field is required to match exactly, or
+    dispatch is rejected before any GitHub mutation
+    (cross_issue_provenance_mismatch / stale_run_provenance_mismatch /
+    replacement_provenance_mismatch / digest_mismatch).
+
+    AC4 (body-drift handling): before dispatch, the live Issue body is
+    compared against the candidate's own recorded `original_body_sha256`.
+    On drift, the producer (repair_issue_contract.py) is rerun at most once
+    against the fresh live body (never a whole-body textual rebase/diff
+    apply) via `rerun_producer` (injectable; defaults to
+    `_default_rerun_repair_producer`). A second drift, a non-safe
+    disposition after rerun, or an unreconstructable rerun result fails
+    closed with no mutation.
+
+    AC5 (retry-budget separation): `retry.post_dispatch_retry_budget` is
+    always 0 -- this function NEVER re-dispatches `edit_issue_txn.py` after
+    a first attempt. An executor-unconfirmed (`unknown`) outcome is instead
+    resolved, at most once, via an authoritative readback (a read, not a
+    mutation) that classifies the live digest as candidate/old/third.
+
+    AC6 (lossless receipt projection): `edit_issue_txn.py`'s receipt fields
+    are projected losslessly via `_repair_receipt_from_txn_result()`;
+    `unknown` is never collapsed into failed/not_attempted/no_change, and
+    `phase`/`mutation_outcome`/`failure_code` are kept as separate fields
+    (the repair lane never emits `contract_patch_plan_missing`).
+
+    Scope note: lane-preserving fresh validation (AC9) and historical
+    artifact retention semantics beyond `latest_action_reference_invalidated`
+    (AC10) remain declared scope gaps of this iteration -- see PR body /
+    IMPLEMENT_RESULT_V1 for status. `fresh_validation.status` is always
+    `not_run`.
     """
     root = repo_root or _find_repo_root()
     _pf_path = Path(preflight_result_path)
@@ -752,18 +963,7 @@ def run_repair_action_apply(
     raw_source_lane = parsed.get("source_lane")
     source_lane = raw_source_lane if raw_source_lane in {"human_context", "anchor", "unanchored"} else "unanchored"
 
-    repair_action_core = {
-        "schema_version": repair_action.get("schema_version"),
-        "policy_version": repair_action.get("policy_version"),
-        "disposition": repair_action.get("disposition"),
-        "original_body_sha256": repair_action.get("original_body_sha256"),
-        "repaired_body_sha256": repair_action.get("repaired_body_sha256"),
-        "repair_kinds": repair_action.get("repair_kinds"),
-        "reason_codes": repair_action.get("reason_codes"),
-    }
-    repair_action_core_sha256 = hashlib.sha256(
-        json.dumps(repair_action_core, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
+    repair_action_core_sha256 = _repair_action_core_sha256(repair_action)
 
     _candidate_path = Path(candidate_body_artifact)
     if not _candidate_path.is_absolute():
@@ -795,12 +995,30 @@ def run_repair_action_apply(
     if (
         provenance["producer_schema_version"] != "repair_action/v1"
         or provenance["producer_policy_version"] != "deterministic-issue-repair/v1"
+        or not provenance["original_body_sha256"]
+        or not provenance["repair_action_core_sha256"]
+        or not provenance["candidate_digest"]
     ):
         return _repair_apply_not_attempted_result(
             repo=repo,
             issue_number=issue_number,
             phase="provenance_validation",
-            failure_code="provenance_unreconstructable",
+            failure_code=REPAIR_APPLY_FAILURE_PROVENANCE_UNRECONSTRUCTABLE,
+            provenance=provenance,
+        )
+
+    # AC3: bind against repo/issue identity always, and against any
+    # caller-declared expectation (run identity, core hash, candidate
+    # digest) when supplied. Fail-closed BEFORE any GitHub mutation.
+    _provenance_failure = _validate_repair_apply_provenance_binding(
+        provenance, repo=repo, issue_number=issue_number, expected_provenance=expected_provenance
+    )
+    if _provenance_failure is not None:
+        return _repair_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="provenance_validation",
+            failure_code=_provenance_failure,
             provenance=provenance,
         )
 
@@ -821,6 +1039,117 @@ def run_repair_action_apply(
             failure_code="final_readback_unresolvable",
             provenance=provenance,
         )
+
+    # AC4: pre-dispatch body-drift handling. Compare the live body against
+    # the candidate's own recorded original_body_sha256. On drift, rerun the
+    # producer AT MOST ONCE against the fresh live body (never a whole-body
+    # textual rebase/diff-apply); a second drift, a non-safe disposition
+    # after rerun, or an unreconstructable rerun result fails closed with no
+    # mutation dispatched.
+    rebase_projection = {"attempted": False, "producer_reruns": 0, "drift_detected": False, "second_drift": False}
+    live_body = current_issue.get("body", "") or ""
+    live_body_digest = hashlib.sha256(live_body.encode("utf-8")).hexdigest()
+    drift_detected = _repair_apply_strip_sha_prefix(live_body_digest) != _repair_apply_strip_sha_prefix(
+        repair_action.get("original_body_sha256")
+    )
+
+    if drift_detected:
+        rebase_projection["drift_detected"] = True
+        rebase_projection["attempted"] = True
+        rebase_projection["producer_reruns"] = 1
+
+        rebase_dir = (
+            root
+            / ".claude"
+            / "artifacts"
+            / "issue-refinement-loop"
+            / str(issue_number)
+            / "repair-action-apply"
+            / "rebase"
+        )
+        rebase_dir.mkdir(parents=True, exist_ok=True)
+        rerun_fn = rerun_producer or (lambda body: _default_rerun_repair_producer(body, rebase_dir))
+        rerun_action, rerun_error = rerun_fn(live_body)
+
+        if rerun_error is not None or not isinstance(rerun_action, dict):
+            return _repair_apply_not_attempted_result(
+                repo=repo,
+                issue_number=issue_number,
+                phase="rebase",
+                failure_code=REPAIR_APPLY_FAILURE_PROVENANCE_UNRECONSTRUCTABLE,
+                provenance=provenance,
+                rebase=rebase_projection,
+            )
+        if rerun_action.get("disposition") != "auto_apply_safe" or not rerun_action.get("candidate_body_artifact"):
+            return _repair_apply_not_attempted_result(
+                repo=repo,
+                issue_number=issue_number,
+                phase="rebase",
+                failure_code=REPAIR_APPLY_FAILURE_NON_SAFE_AFTER_RERUN,
+                provenance=provenance,
+                rebase=rebase_projection,
+            )
+
+        # Second live read: detect whether the body drifted again between
+        # the rerun's basis (live_body) and now. If it did, fail closed --
+        # the single rebase budget is exhausted (post-dispatch retry stays
+        # separately budgeted at 0; this is still pre-dispatch).
+        try:
+            second_issue = fetch()
+        except Exception:
+            return _repair_apply_not_attempted_result(
+                repo=repo,
+                issue_number=issue_number,
+                phase="rebase",
+                failure_code=REPAIR_APPLY_FAILURE_PROVENANCE_UNRECONSTRUCTABLE,
+                provenance=provenance,
+                rebase=rebase_projection,
+            )
+        second_body = second_issue.get("body", "") or ""
+        second_body_digest = hashlib.sha256(second_body.encode("utf-8")).hexdigest()
+        if second_body_digest != live_body_digest:
+            rebase_projection["second_drift"] = True
+            return _repair_apply_not_attempted_result(
+                repo=repo,
+                issue_number=issue_number,
+                phase="rebase",
+                failure_code=REPAIR_APPLY_FAILURE_SECOND_DRIFT,
+                provenance=provenance,
+                rebase=rebase_projection,
+            )
+
+        # No second drift: the rerun's candidate is safe to dispatch.
+        # Re-read the rerun candidate through the FD-based secure reader
+        # (AC7) and rebuild provenance from the rerun repair_action, never
+        # by textually patching the original candidate.
+        rerun_candidate_path = Path(rerun_action["candidate_body_artifact"])
+        if not rerun_candidate_path.is_absolute():
+            rerun_candidate_path = root / rerun_candidate_path
+        try:
+            candidate_body_text, candidate_digest = secure_read_repair_apply_artifact(
+                rerun_candidate_path,
+                root=root,
+                expected_sha256=rerun_action.get("repaired_body_sha256"),
+            )
+        except RepairApplySecureOpenError:
+            return _repair_apply_not_attempted_result(
+                repo=repo,
+                issue_number=issue_number,
+                phase="rebase",
+                failure_code=REPAIR_APPLY_FAILURE_PROVENANCE_UNRECONSTRUCTABLE,
+                provenance=provenance,
+                rebase=rebase_projection,
+            )
+
+        repair_action = rerun_action
+        current_issue = second_issue
+        repair_action_core_sha256 = _repair_action_core_sha256(repair_action)
+        provenance = {
+            **provenance,
+            "original_body_sha256": repair_action.get("original_body_sha256") or "",
+            "repair_action_core_sha256": repair_action_core_sha256,
+            "candidate_digest": candidate_digest,
+        }
 
     def _default_apply_transaction(current_issue_: dict, candidate_body: str) -> dict:
         from scope_signal_delta import build_issue_edit_txn_input
@@ -922,9 +1251,24 @@ def run_repair_action_apply(
     apply_fn = apply_transaction or _default_apply_transaction
     txn_result = apply_fn(current_issue, candidate_body_text)
 
-    receipt = _repair_receipt_from_txn_result(txn_result)
+    def _resolve_readback() -> "str | None":
+        # AC5: a single authoritative read (never a mutation retry) used
+        # only when the transaction result itself carried no
+        # remote_current_body_sha256.
+        fresh_issue = fetch()
+        return f"sha256:{_sha256(fresh_issue.get('body', '') or '')}"
+
+    receipt = _repair_receipt_from_txn_result(
+        txn_result,
+        candidate_digest=candidate_digest,
+        old_digest=live_body_digest,
+        resolve_readback=_resolve_readback,
+    )
     mutation_outcome = receipt["mutation_outcome"]
-    phase = "complete" if mutation_outcome in {"applied", "no_change", "not_attempted"} else "transaction_execute"
+    # AC6: phase/mutation_outcome/failure_code stay separate fields; an
+    # `unknown` outcome (executor could not itself confirm the result) never
+    # reaches phase=complete (schema-enforced invariant).
+    phase = "complete" if mutation_outcome in {"applied", "no_change", "not_attempted"} else "final_readback"
     failure_code = receipt["failure_code"]
 
     return {
@@ -935,7 +1279,7 @@ def run_repair_action_apply(
         "repo": repo,
         "issue_number": issue_number,
         "provenance": provenance,
-        "rebase": {"attempted": False, "producer_reruns": 0, "drift_detected": False, "second_drift": False},
+        "rebase": rebase_projection,
         "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
         "receipt": receipt,
         "fresh_validation": {
