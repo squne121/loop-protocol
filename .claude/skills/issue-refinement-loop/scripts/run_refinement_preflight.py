@@ -358,14 +358,17 @@ def _canonical_json(obj: Any) -> str:
 # the exactly-one mutation-intent arbiter core (AC1), and the schema
 # migration (AC2, repair_apply_result_v1.schema.json /
 # refinement_preflight_result_v1.schema.json) are implemented. AC8/AC11 are
-# now wired: run_repair_action_apply() below is registered as the
+# wired: run_repair_action_apply() below is registered as the
 # `repair_action.apply` command_id in command_registry.py /
 # skill_runtime_command_policy.py, dispatched by skill_runtime_exec.py, and
-# constrained to stdout_contract `repair_apply_result/v1`. The full AC3-6/
-# AC9/AC10 provenance-rebase/retry/fresh-validation/historical-artifact
-# surface remains a deliberate scope gap of this iteration -- see
-# run_repair_action_apply()'s own docstring. See PR body / IMPLEMENT_RESULT_V1
-# for status.
+# constrained to stdout_contract `repair_apply_result/v1`. AC3 (provenance
+# binding), AC4 (pre-dispatch rebase-on-drift), AC5 (post-dispatch
+# retry-budget separation + authoritative readback), and AC6 (lossless
+# receipt projection, phase/failure_code separation) are also implemented --
+# see run_repair_action_apply()'s own docstring. AC9 (lane-preserving fresh
+# validation) and the AC10 historical-artifact-retention surface beyond
+# `latest_action_reference_invalidated` remain a deliberate scope gap of
+# this iteration. See PR body / IMPLEMENT_RESULT_V1 for status.
 # ---------------------------------------------------------------------------
 
 
