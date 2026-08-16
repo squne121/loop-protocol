@@ -534,7 +534,6 @@ def test_live_agy_canary_passes_on_valid_receipt(tmp_path):
 # --- AC5: live_github_mutation_canary -----------------------------------------
 
 
-@pytest.mark.github_live
 def test_live_github_mutation_canary_skips_or_passes():
     """GIVEN 実行環境
     WHEN auto_mode_canary.py --mode github を実行する
@@ -542,15 +541,26 @@ def test_live_github_mutation_canary_skips_or_passes():
     Issue を create/edit/comment/close して PASS（exit 0）を返す（FAIL は実装
     バグを意味するためテスト失敗として扱う）
 
-    P1-4（PR #2214 OWNER adversarial review 反映）: この test は authenticated
-    `gh` があれば通常 pytest 実行時に production repository へ実際に Issue を
-    作成する（開発者の個人 credential を使用し、CI/local で意味が変わり、
-    repeated run で repository noise が増える）。`github_live` marker
-    （既存 project-wide 規約, pyproject.toml `-m 'not github_live'` により既定で
-    deselect）に加え、`AUTO_MODE_CANARY_LIVE_GITHUB_MUTATION=1` の明示 env gate
-    が無い限り実行しない（marker 単独の deselect し忘れに対する二重の
-    fail-closed opt-in）。通常 pytest は fake transport による hermetic
-    state-machine test（本ファイルの他 test）のみに限定する。
+    P1-4（PR #2214 OWNER adversarial review 反映・P1-4 fix_delta で再改訂）:
+    この test は authenticated `gh` があれば通常 pytest 実行時に production
+    repository へ実際に Issue を作成する（開発者の個人 credential を使用し、
+    CI/local で意味が変わり、repeated run で repository noise が増える）ため、
+    `AUTO_MODE_CANARY_LIVE_GITHUB_MUTATION=1` の明示 env gate が無い限り
+    テスト本体内の `pytest.skip()` により実行しない（fail-closed opt-in）。
+    通常 pytest は fake transport による hermetic state-machine test（本
+    ファイルの他 test）のみに限定する。
+
+    この test には project-wide `github_live` pytest marker
+    （pyproject.toml `-m 'not github_live'` により既定で collection-level に
+    deselect される）を意図的に付与しない。marker による collection-level
+    exclusion を使うと、`pytest -k live_github_mutation_canary` のような
+    明示的な `-k` 選択実行が「0 tests collected」（exit 5, no tests ran）と
+    なり、Issue #2203 AC5 の Verification Command（
+    `pytest ... -k live_github_mutation_canary` は選択・実行され、
+    env var 未設定時は 1 skipped / exit 0 になることを期待する）と衝突する。
+    安全性は marker ではなく、このテスト関数内の env var チェック +
+    `pytest.skip()` のみで担保する（二重ゲートではなく単一の明示的
+    fail-closed opt-in）。
     """
     if os.environ.get("AUTO_MODE_CANARY_LIVE_GITHUB_MUTATION") != "1":
         pytest.skip(
