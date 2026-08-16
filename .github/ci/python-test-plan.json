@@ -30,6 +30,7 @@
     "scripts/ci/tests/",
     "scripts/agent-guards/tests/",
     "scripts/agent-ops/tests/",
+    "scripts/claude-gpt/",
     "tests/codex/test_codex_hook_surface_guard.py",
     "tests/codex/test_codex_permission_profile_config.py",
     "tests/codex/test_fixture_repo_artifact_exclusion.py",
