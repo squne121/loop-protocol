@@ -121,6 +121,40 @@ evidence が #1881（pr-reviewer persona の production settings lane）の perm
 claim へ昇格しないことを明示する。#1881 未完了時点ではこの hermetic evidence を
 production permission の根拠にしない。
 
+## SubAgent Causal Evidence（hook ID 相関、Issue #2183）
+
+`subagent_causal_evidence_verdict(stdout, expected_markers=None)`
+（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は、SubAgent 実行の
+causal evidence を marker 文字列出力のみに依存せず、hook ID 相関（`SubagentStart`/
+`SubagentStop` の同一 `agent_id` 相関）で判定する純粋関数。structured lane の
+captured stdout（stream-json）を入力とする。
+
+戻り値のフィールド:
+
+- `causal_evidence_source`（enum）: `hook_id_correlated` / `marker_only_insufficient` /
+  `no_evidence`。`hook_id_correlated` は、同一 `agent_id` を持つ `SubagentStart`/
+  `SubagentStop` ペアが観測され、かつ `SubagentStop` payload の `agent_transcript_path`
+  が回収できた場合のみ返る。lone `SubagentStart`（`SubagentStop` 欠落）や
+  `agent_transcript_path` 欠落は `no_evidence` に、hook イベントが一切なく
+  `expected_markers` の文字列のみが `stdout` にあれば `marker_only_insufficient` に
+  fail-closed する
+- `tool_invocation_id_correlated`（bool）: 相関済み `agent_id` が `Agent` tool_use の
+  `id` と対応する `tool_result` の `tool_use_id` を介して同一の tool 呼び出しに
+  紐づいていることを追加検証する（`extract_claude_canonical_read_receipt` と同じ
+  tool_use_id 相関パターンを `Agent` tool 呼び出しに適用したもの）
+- `agent_id` / `subagent_start_observed` / `subagent_stop_observed` /
+  `agent_transcript_path`: 個別の観測事実（すべて fail-closed、推測しない）
+
+呼び出し側は `--require-subagent-causal-evidence`（runner CLI フラグ、既定 OFF）を
+指定することで、`causal_evidence_source != hook_id_correlated` の場合に exit 1 へ
+昇格させることができる。指定しない場合でも判定結果は常に
+`summary.md` / `schema_summary["subagent_causal_evidence"]` に記録され、marker のみの
+PASS だったのか hook ID 相関で PASS したのかを事後に判別できる。interactive lane は
+herdr pane のテキストにはこの stream-json hook payload が現れないため、
+`causal_evidence_source` は今のところ `no_evidence`／`marker_only_insufficient` に
+なる想定であり、interactive lane 向けの hook 出力チャネル整備は本 Issue の対象外
+（follow-up）。
+
 ## 手順
 
 1. **worktree identity を確認する**（root checkout・別 repository・cwd mismatch を実行前に拒否する。runner が自動で検証する）

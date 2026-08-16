@@ -473,6 +473,16 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
   確認できない場合は fail-closed で exit 1 とする（PR #1921 human OWNER fix-delta）。
 - Runner（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は runtime 起動・観測・証跡収集だけを所有し、
   hook reason の意味分類・mutation deny の妥当性・review verdict 等の semantic 判定は caller が引き続き所有する。
+- **SubAgent 実行の causal evidence は hook ID 相関を要求し、marker 文字列出力のみでは不十分とする**（Issue #2183、
+  Issue #2174 OWNER REQUEST_CHANGES https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173、
+  PR #2214 OWNER レビュー https://github.com/squne121/loop-protocol/pull/2214#issuecomment-5307009937 を踏まえた
+  明文化）。完了 marker（`--forbid-marker` / 完了 marker 等）はモデル生成テキストの一部であり、synthetic な
+  fixture でも trivially 満たせる自己申告に等しい。SubAgent 実行の PASS 判定は、`subagent_causal_evidence_verdict()`
+  （`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）が計算する `causal_evidence_source` が
+  `hook_id_correlated`（同一 `agent_id` を持つ `SubagentStart`/`SubagentStop` ペアが観測され、かつ
+  `SubagentStop` payload の `agent_transcript_path` が観測できた場合のみ）であることを必要条件とする。
+  marker 文字列の一致のみを根拠に PASS と判定してはならない（`marker_only_insufficient`／`no_evidence` は
+  PASS の根拠にならない）。marker 文字列判定は補助情報として残してよいが、単独で PASS 判定に用いない。
 
 ## 関連ドキュメント
 

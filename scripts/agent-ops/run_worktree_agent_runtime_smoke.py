@@ -1428,8 +1428,13 @@ def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
     the conflation this function exists to undo).
 
     Each entry: ``{"hook_event": "SubagentStart"|"SubagentStop",
-    "agent_id": str|None, "agent_type": str|None}``. Best-effort / fail
-    closed to ``None`` fields on any parse mismatch -- never a guess."""
+    "agent_id": str|None, "agent_type": str|None, "agent_transcript_path":
+    str|None}``. ``agent_transcript_path`` (Issue #2183 AC1/AC2 causal
+    evidence): the official hook stdin payload documented above also
+    carries an ``agent_transcript_path`` field on ``SubagentStop`` --
+    recovered here the same best-effort way as ``agent_id``/``agent_type``
+    (never guessed, ``None`` when absent). Best-effort / fail closed to
+    ``None`` fields on any parse mismatch -- never a guess."""
     events: list[dict] = []
     for payload in _iter_claude_stream_events(stdout):
         if payload.get("type") != "system":
@@ -1437,7 +1442,12 @@ def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
         hook_event = payload.get("hook_event")
         if hook_event not in _CLAUDE_HOOK_LIFECYCLE_EVENTS:
             continue
-        entry: dict = {"hook_event": hook_event, "agent_id": None, "agent_type": None}
+        entry: dict = {
+            "hook_event": hook_event,
+            "agent_id": None,
+            "agent_type": None,
+            "agent_transcript_path": None,
+        }
         hook_name = payload.get("hook_name")
         if isinstance(hook_name, str) and hook_name.startswith(f"{hook_event}:"):
             suffix = hook_name.split(":", 1)[1].strip()
@@ -1452,12 +1462,175 @@ def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
                 continue
             agent_id = parsed.get("agent_id")
             agent_type = parsed.get("agent_type")
+            agent_transcript_path = parsed.get("agent_transcript_path")
             if isinstance(agent_id, str) and agent_id:
                 entry["agent_id"] = agent_id
             if isinstance(agent_type, str) and agent_type:
                 entry["agent_type"] = agent_type
+            if isinstance(agent_transcript_path, str) and agent_transcript_path:
+                entry["agent_transcript_path"] = agent_transcript_path
         events.append(entry)
     return events
+
+
+# ---------------------------------------------------------------------------
+# Hook-ID-correlated SubAgent causal evidence (Issue #2183, follow-up to
+# Issue #2174 OWNER REQUEST_CHANGES
+# https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173,
+# and PR #2214 OWNER review
+# https://github.com/squne121/loop-protocol/pull/2214#issuecomment-5307009937):
+# a marker string observed in captured stdout/pane text proves only that
+# SOME text containing that literal token appeared somewhere in the
+# transcript -- it is trivially satisfiable by a synthetic fixture that
+# never spawned a real child at all. This section adds a verdict function that instead
+# requires a structural, hook-ID-correlated signal: the SAME ``agent_id``
+# observed on BOTH a ``SubagentStart`` and a ``SubagentStop`` hook lifecycle
+# event, with the ``SubagentStop`` event additionally carrying a
+# ``agent_transcript_path`` (proof a durable child transcript actually
+# exists, not merely that two hook events with a matching id happened to
+# appear in the stream).
+# ---------------------------------------------------------------------------
+
+CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED = "hook_id_correlated"
+CAUSAL_EVIDENCE_SOURCE_MARKER_ONLY_INSUFFICIENT = "marker_only_insufficient"
+CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE = "no_evidence"
+
+
+def _claude_agent_tool_invocation_correlated(stdout: str, agent_id: str | None) -> bool:
+    """Issue #2183 AC3: whether the runtime's own tool-invocation-ID
+    correlation channel ties the observed ``agent_id`` back to a specific
+    ``Agent`` tool call this run itself made, rather than any bare
+    hook-channel identity floating unattached in the stream.
+
+    Mirrors the existing ``tool_use_id`` correlation pattern already used by
+    ``extract_claude_canonical_read_receipt`` for the ``Read`` tool: an
+    ``Agent`` ``tool_use`` block's own ``id`` is matched against a
+    ``tool_result`` block's ``tool_use_id`` in the SAME already-captured
+    stream, and the matched ``tool_result``'s ``tool_use_result.agentId``
+    must equal ``agent_id`` exactly. This is the same ``tool_use_id``-shaped
+    correlation field the AC text (Claude Code hook payload's ``tool_use_id``
+    equivalent) describes; a dedicated ``PreToolUse``/``PostToolUse`` hook
+    wiring is deliberately not added here (Out of Scope: no new hook
+    settings/matcher configuration in this Issue). Fails closed to ``False``
+    on any missing/unmatched id -- never a guess."""
+    if not agent_id:
+        return False
+    pending_agent_tool_use_ids: set[str] = set()
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") == "assistant":
+            message = payload.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                if block.get("name") != _CLAUDE_SPAWN_TOOL_NAME:
+                    continue
+                tool_use_id = block.get("id")
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    pending_agent_tool_use_ids.add(tool_use_id)
+        elif payload.get("type") == "user":
+            message = payload.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if not isinstance(tool_use_id, str) or tool_use_id not in pending_agent_tool_use_ids:
+                    continue
+                tool_use_result = payload.get("tool_use_result")
+                if isinstance(tool_use_result, dict) and tool_use_result.get("agentId") == agent_id:
+                    return True
+    return False
+
+
+def subagent_causal_evidence_verdict(stdout: str, expected_markers: list[str] | None = None) -> dict:
+    """Issue #2183 AC1/AC2/AC3: structural, hook-ID-correlated causal
+    evidence that a SubAgent genuinely ran, replacing a bare marker-string
+    observation as the PASS-determining signal.
+
+    Returns a dict with:
+
+    - ``agent_id``: the correlated ``SubagentStart``/``SubagentStop``
+      ``agent_id`` (``None`` if no Start/Stop pair shares one).
+    - ``subagent_start_observed`` / ``subagent_stop_observed``: bool,
+      whether at least one hook event of that kind was observed at all
+      (independent of correlation -- this is what lets a caller
+      distinguish a lone ``SubagentStart`` with no matching ``SubagentStop``
+      from no hook evidence whatsoever).
+    - ``agent_transcript_path``: the ``SubagentStop`` payload's own
+      ``agent_transcript_path`` field for the correlated ``agent_id``
+      (``None`` unless both Start/Stop correlate AND the transcript path
+      was recovered).
+    - ``tool_invocation_id_correlated`` (AC3): whether the correlated
+      ``agent_id`` is additionally tied to a specific ``Agent`` tool
+      invocation in this stream via a matched tool_use/tool_result id pair
+      (see ``_claude_agent_tool_invocation_correlated``).
+    - ``causal_evidence_source`` (AC2, enum):
+      ``hook_id_correlated`` only when a same-``agent_id`` Start/Stop pair
+      AND a recovered ``agent_transcript_path`` are BOTH present (AC2's
+      literal requirement); ``marker_only_insufficient`` when no hook
+      lifecycle evidence exists at all but a caller-supplied
+      ``expected_markers`` string was found in ``stdout`` (the exact
+      marker-only-PASS scenario this function exists to stop trusting);
+      ``no_evidence`` otherwise -- including the AC4 scenario of a lone
+      ``SubagentStart`` with no matching ``SubagentStop`` (or a Stop
+      lacking ``agent_transcript_path``), which must never be silently
+      promoted to ``hook_id_correlated``.
+
+    Fails closed on every field -- a value that cannot be honestly derived
+    from the already-captured stream is left ``None``/``False``/
+    ``no_evidence``, never guessed or promoted from a weaker signal."""
+    events = extract_claude_hook_lifecycle_events(stdout)
+    start_agent_ids = {
+        event["agent_id"]
+        for event in events
+        if event["hook_event"] == "SubagentStart" and event["agent_id"]
+    }
+    subagent_start_observed = bool(start_agent_ids) or any(
+        event["hook_event"] == "SubagentStart" for event in events
+    )
+    subagent_stop_observed = any(event["hook_event"] == "SubagentStop" for event in events)
+
+    correlated_agent_id: str | None = None
+    agent_transcript_path: str | None = None
+    for event in events:
+        if event["hook_event"] != "SubagentStop":
+            continue
+        agent_id = event["agent_id"]
+        if agent_id and agent_id in start_agent_ids:
+            correlated_agent_id = agent_id
+            agent_transcript_path = event["agent_transcript_path"]
+            break
+
+    tool_invocation_id_correlated = _claude_agent_tool_invocation_correlated(stdout, correlated_agent_id)
+
+    if correlated_agent_id and agent_transcript_path:
+        causal_evidence_source = CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    elif events:
+        # Some hook lifecycle evidence was observed (e.g. a lone
+        # SubagentStart with no matching SubagentStop, or a correlated Stop
+        # missing its transcript path) -- never promoted to correlated, and
+        # never re-classified as marker_only_insufficient (hook evidence,
+        # even incomplete, is a stronger/different signal than "no hook
+        # evidence at all, just a marker").
+        causal_evidence_source = CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+    elif expected_markers and any(marker in stdout for marker in expected_markers):
+        causal_evidence_source = CAUSAL_EVIDENCE_SOURCE_MARKER_ONLY_INSUFFICIENT
+    else:
+        causal_evidence_source = CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+    return {
+        "agent_id": correlated_agent_id,
+        "subagent_start_observed": subagent_start_observed,
+        "subagent_stop_observed": subagent_stop_observed,
+        "agent_transcript_path": agent_transcript_path,
+        "tool_invocation_id_correlated": tool_invocation_id_correlated,
+        "causal_evidence_source": causal_evidence_source,
+    }
 
 
 def classify_claude_child_completion(stdout: str, spawn_agent_id: str | None) -> dict:
@@ -3395,6 +3568,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--expect-marker", action="append", default=[])
     parser.add_argument(
+        "--require-subagent-causal-evidence",
+        action="store_true",
+        help=(
+            "Issue #2183: in addition to any --expect-marker check, require "
+            "subagent_causal_evidence_verdict()'s causal_evidence_source to be "
+            "hook_id_correlated (a same-agent_id SubagentStart/SubagentStop "
+            "pair with a recovered agent_transcript_path) for exit_code to "
+            "remain PASS -- a marker string observed in stdout/pane text "
+            "alone is never sufficient. The causal-evidence verdict itself "
+            "is always recorded in schema_summary['subagent_causal_evidence'] "
+            "regardless of this flag; this flag only controls whether an "
+            "insufficient verdict is promoted to a FAIL, so every "
+            "pre-existing caller's exit_code is unchanged by default "
+            "(opt-in, backward compatible)."
+        ),
+    )
+    parser.add_argument(
         "--require-observed-runtime-field",
         action="append",
         choices=sorted(_REQUIRED_RUNTIME_OBSERVATION_FIELDS),
@@ -4115,6 +4305,34 @@ def main(argv: list[str] | None = None) -> int:
                     errors.append(f"expected markers not observed: {missing}")
                     exit_code = EXIT_FAIL
 
+            # Issue #2183: structural, hook-ID-correlated causal evidence,
+            # recorded unconditionally (never gated on any flag) so a
+            # future reader can always see WHY a marker-only PASS was or
+            # was not trusted. Only Claude's structured lane has the
+            # SubagentStart/SubagentStop stream-json channel this function
+            # parses (`out` above); the Codex lane has no equivalent
+            # channel in this harness, so the verdict is left `None` there
+            # rather than fabricated from an unrelated shape.
+            if args.runtime == "claude":
+                causal_evidence = subagent_causal_evidence_verdict(out, args.expect_marker)
+            else:
+                causal_evidence = None
+            schema_summary["subagent_causal_evidence"] = causal_evidence
+            if (
+                args.require_subagent_causal_evidence
+                and exit_code == EXIT_OK
+                and (
+                    causal_evidence is None
+                    or causal_evidence["causal_evidence_source"] != CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+                )
+            ):
+                observed_source = causal_evidence["causal_evidence_source"] if causal_evidence else None
+                errors.append(
+                    "subagent causal evidence insufficient (--require-subagent-causal-evidence): "
+                    f"causal_evidence_source={observed_source!r}"
+                )
+                exit_code = EXIT_FAIL
+
             required_observations = sorted(set(args.require_observed_runtime_field))
             if required_observations:
                 # These four fields have no independently extractable Codex
@@ -4225,6 +4443,39 @@ def main(argv: list[str] | None = None) -> int:
                         exit_code = EXIT_FAIL
 
                         exit_code = EXIT_FAIL
+
+                # Issue #2183: same structural causal-evidence verdict as
+                # the structured lane, applied here to the captured pane
+                # text. Recorded unconditionally; only gates exit_code when
+                # --require-subagent-causal-evidence is set. Honest
+                # limitation (documented, not silently worked around): the
+                # interactive lane's herdr pane is a terminal render of
+                # Claude Code's own interactive UI, which does not echo the
+                # `--include-hook-events` stream-json hook payloads this
+                # function parses -- so causal_evidence_source is expected
+                # to be no_evidence/marker_only_insufficient here today.
+                # Wiring an interactive-lane hook-output channel equivalent
+                # to the structured lane's is future work, not this Issue's
+                # scope (no new hook settings/matcher configuration here).
+                if args.runtime == "claude":
+                    causal_evidence = subagent_causal_evidence_verdict(combined_pane_text, args.expect_marker)
+                else:
+                    causal_evidence = None
+                schema_summary["subagent_causal_evidence"] = causal_evidence
+                if (
+                    args.require_subagent_causal_evidence
+                    and exit_code == EXIT_OK
+                    and (
+                        causal_evidence is None
+                        or causal_evidence["causal_evidence_source"] != CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+                    )
+                ):
+                    observed_source = causal_evidence["causal_evidence_source"] if causal_evidence else None
+                    errors.append(
+                        "subagent causal evidence insufficient (--require-subagent-causal-evidence): "
+                        f"causal_evidence_source={observed_source!r}"
+                    )
+                    exit_code = EXIT_FAIL
 
                 if args.require_session_log_metadata or args.inspect_session_log_metadata:
                     schema_summary["session_log_metadata_count"] = 0
