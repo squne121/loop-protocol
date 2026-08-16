@@ -126,7 +126,7 @@ latitude_api_key_classification:
     本 repo の tracked file・git history に存在しないことを前提とする。
 ```
 
-#### claude-gpt GitHub mutation transaction broker の credential boundary (#2203)
+#### claude-gpt の GitHub mutation transaction broker が保持する credential boundary（認証情報の境界）(#2203)
 
 `scripts/claude-gpt/auto_mode_canary.py` の `GitHubMutationBroker` は `squne121/loop-protocol`
 に repository 固定した canary Issue lifecycle 専用の GitHub mutation transaction broker であり、
