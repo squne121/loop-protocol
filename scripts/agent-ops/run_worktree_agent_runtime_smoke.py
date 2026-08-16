@@ -1773,9 +1773,21 @@ def classify_claude_multi_child_lifecycle(stdout: str, min_required: int) -> dic
     Returns ``{"verified": bool, "spawned_agent_ids": list[str],
     "completed_agent_ids": list[str], "paired_agent_ids": list[str],
     "orphan_starts": list[str], "unknown_children": list[str],
-    "duplicate_completions": list[str]}``."""
+    "duplicate_completions": list[str]}``.
+
+    Live verification (Issue #2219 AC12) surfaced that this repo's own
+    project ``.claude/settings.json`` wires a ``SubagentStop`` hook, so a
+    single real completion is independently corroborated by BOTH the
+    ``SubagentStop`` hook event channel and the ``tool_use_result``
+    synchronous "completed" shape channel. Treating that cross-channel
+    corroboration as a duplicate (as a single flat multiset would) makes
+    ``verified`` structurally unreachable in this repo's live environment.
+    Duplicate detection is therefore scoped to WITHIN each independent
+    evidence channel -- a genuine double-fire of the SAME channel for the
+    SAME agent_id still fails closed via ``_pair_agent_lifecycle``'s
+    multiset check, exactly as the AC4 poison test expects."""
     spawn_ids: list[str] = []
-    stop_ids: list[str] = []
+    hook_stop_ids: list[str] = []
     for event in extract_claude_hook_lifecycle_events(stdout):
         agent_id = event.get("agent_id")
         if not agent_id:
@@ -1783,7 +1795,8 @@ def classify_claude_multi_child_lifecycle(stdout: str, min_required: int) -> dic
         if event["hook_event"] == "SubagentStart":
             spawn_ids.append(agent_id)
         elif event["hook_event"] == "SubagentStop":
-            stop_ids.append(agent_id)
+            hook_stop_ids.append(agent_id)
+    tool_result_stop_ids: list[str] = []
     for payload in _iter_claude_stream_events(stdout):
         if payload.get("type") != "user":
             continue
@@ -1796,15 +1809,34 @@ def classify_claude_multi_child_lifecycle(stdout: str, min_required: int) -> dic
         if agent_id not in spawn_ids:
             spawn_ids.append(agent_id)
         if tool_use_result.get("status") == SPAWN_LAUNCH_MODE_COMPLETED:
-            stop_ids.append(agent_id)
+            tool_result_stop_ids.append(agent_id)
     # Issue #2219 fix_delta iteration 2: an async-launched spawn's own
     # tool_use_result never transitions to "completed" in place (see
     # extract_claude_task_notification_completions docstring) -- only
     # bind a task-notification completion to a spawn_id ALREADY observed
     # above, so this can never itself manufacture a spawn event.
-    for agent_id in extract_claude_task_notification_completions(stdout):
-        if agent_id in spawn_ids:
-            stop_ids.append(agent_id)
+    notification_stop_ids: list[str] = [
+        agent_id for agent_id in extract_claude_task_notification_completions(stdout) if agent_id in spawn_ids
+    ]
+
+    stop_channels = (hook_stop_ids, tool_result_stop_ids, notification_stop_ids)
+    duplicate_within_channel: set[str] = set()
+    for channel in stop_channels:
+        seen: set[str] = set()
+        for agent_id in channel:
+            if agent_id in seen:
+                duplicate_within_channel.add(agent_id)
+            seen.add(agent_id)
+    stop_ids: list[str] = []
+    merged_seen: set[str] = set()
+    for channel in stop_channels:
+        for agent_id in channel:
+            if agent_id not in merged_seen:
+                stop_ids.append(agent_id)
+                merged_seen.add(agent_id)
+    # Re-inject genuine within-channel duplicates so the shared multiset
+    # check in ``_pair_agent_lifecycle`` still fails closed on them.
+    stop_ids.extend(sorted(duplicate_within_channel))
 
     return _pair_agent_lifecycle(spawn_ids, stop_ids, min_required)
 

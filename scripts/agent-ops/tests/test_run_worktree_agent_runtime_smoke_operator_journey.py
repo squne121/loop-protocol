@@ -187,6 +187,42 @@ def test_given_two_genuinely_paired_subagents_when_multi_child_lifecycle_classif
     assert result["paired_agent_ids"] == ["agent-a", "agent-b"]
 
 
+def test_given_hook_and_tool_result_both_corroborate_same_completion_when_multi_child_lifecycle_classified_then_verified():
+    """Issue #2219 AC12 live-verification finding: this repo's own project
+    ``.claude/settings.json`` wires a SubagentStop hook, so a single real
+    completion is independently observed via BOTH the SubagentStop hook
+    event channel and the tool_use_result "completed" synchronous shape
+    channel. That cross-channel corroboration of the SAME single real
+    completion must NOT be misclassified as duplicate_completions."""
+    stdout = "\n".join([
+        _hook_event("SubagentStart", "agent-a"),
+        _hook_event("SubagentStart", "agent-b"),
+        _hook_event("SubagentStop", "agent-a"),
+        _hook_event("SubagentStop", "agent-b"),
+        _sse({"type": "user", "tool_use_result": {"agentId": "agent-a", "status": "completed"}}),
+        _sse({"type": "user", "tool_use_result": {"agentId": "agent-b", "status": "completed"}}),
+    ])
+    result = MODULE.classify_claude_multi_child_lifecycle(stdout, 2)
+    assert result["verified"] is True
+    assert result["duplicate_completions"] == []
+    assert result["paired_agent_ids"] == ["agent-a", "agent-b"]
+
+
+def test_given_same_hook_channel_fires_stop_twice_when_multi_child_lifecycle_classified_then_not_verified():
+    """A genuine double-fire WITHIN the same evidence channel (two
+    SubagentStop hook events for the same agent_id) must still fail closed
+    -- cross-channel corroboration tolerance must not mask a real
+    within-channel duplicate."""
+    stdout = "\n".join([
+        _hook_event("SubagentStart", "agent-a"),
+        _hook_event("SubagentStop", "agent-a"),
+        _hook_event("SubagentStop", "agent-a"),
+    ])
+    result = MODULE.classify_claude_multi_child_lifecycle(stdout, 1)
+    assert result["verified"] is False
+    assert result["duplicate_completions"] == ["agent-a"]
+
+
 # ---------------------------------------------------------------------------
 # AC5: marker-only PASS rejection (poison test #1)
 # ---------------------------------------------------------------------------
