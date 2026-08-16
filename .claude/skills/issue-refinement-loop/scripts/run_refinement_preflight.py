@@ -885,7 +885,9 @@ def _default_fresh_validate_producer(body: str, expected_source_lane: str) -> di
         return {"error": dry.get("error"), "source_lane": expected_source_lane, "actionable_repair": None}
     raw_action = dry.get("repair_action")
     actionable = bool(
-        dry.get("changed") is True and isinstance(raw_action, dict) and raw_action.get("disposition") == "auto_apply_safe"
+        dry.get("changed") is True
+        and isinstance(raw_action, dict)
+        and raw_action.get("disposition") == "auto_apply_safe"
     )
     return {"error": None, "source_lane": expected_source_lane, "actionable_repair": actionable}
 
@@ -1337,8 +1339,6 @@ def run_repair_action_apply(
         }
 
     def _default_apply_transaction(current_issue_: dict, candidate_body: str) -> dict:
-        from scope_signal_delta import build_issue_edit_txn_input
-
         # Issue #2039 AC8: unlike the sibling contract_update.run.with_anchor
         # lane (which uses the shared, non-Issue-scoped `tmp/` workspace),
         # repair_action.apply's transaction-local scratch files live under
