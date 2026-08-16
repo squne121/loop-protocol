@@ -461,6 +461,63 @@ class RepairApplySecureOpenError(RuntimeError):
 REPAIR_APPLY_MAX_ARTIFACT_BYTES = 1_048_576  # 1 MiB read-size ceiling (AC7)
 
 
+def _repair_apply_scratch_create(dir_fd: int, name: str, content: bytes) -> None:
+    """Create `name` inside the directory referenced by `dir_fd`, ONLY if it
+    does not already exist (PR #2202 review P1-1: fixed-name scratch-file
+    race/symlink-clobber hardening).
+
+    Uses `O_CREAT | O_EXCL | O_NOFOLLOW` (dir-FD-relative, never a bare
+    pathname): `O_EXCL` makes creation fail rather than silently overwrite
+    or follow anything already at that name -- including a symlink
+    pre-placed by another process with the same permissions, which would
+    otherwise redirect this write to clobber an arbitrary writable file
+    elsewhere, and would do so BEFORE `edit_issue_txn.py`'s own downstream
+    symlink checks ever run. After creation, `fstat()`s the resulting FD
+    and verifies it is a genuinely new regular file (`st_nlink == 1`)
+    before trusting it, then writes `content` and closes.
+
+    Raises `RepairApplySecureOpenError` (fail-closed) if the name already
+    exists, is not a plain regular file post-creation, or has more than
+    one hard link.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
+    except FileExistsError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_scratch_already_exists:{name}") from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RepairApplySecureOpenError(f"repair_apply_scratch_is_symlink:{name}") from exc
+        raise RepairApplySecureOpenError(f"repair_apply_scratch_create_error:{name}:{exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise RepairApplySecureOpenError(f"repair_apply_scratch_unsafe_fd:{name}")
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = -1  # fdopen now owns the fd; do not close twice below
+            handle.write(content)
+    except RepairApplySecureOpenError:
+        raise
+    except OSError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_scratch_write_error:{name}:{exc}") from exc
+    finally:
+        if fd != -1:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _repair_apply_scratch_unlink(dir_fd: int, name: str) -> None:
+    """Unlink `name` inside the directory referenced by `dir_fd` (PR #2202
+    review P1-1). Directory-FD-relative, never a reconstructed pathname
+    string, so cleanup cannot be redirected by a symlink swapped into
+    place after creation but before cleanup. Best-effort: swallows
+    `OSError` (e.g. already removed / never created)."""
+    with contextlib.suppress(OSError):
+        os.unlink(name, dir_fd=dir_fd)
+
+
 def _repair_apply_dirfd_open_leaf(path: Path, *, root: Path) -> int:
     """Open `path` for reading using ONLY directory-FD-relative traversal
     from `root` (PR #2202 review P1-2: dir-FD-relative TOCTOU hardening).
@@ -1623,23 +1680,52 @@ def run_repair_action_apply(
         # skill_runtime_exec.py's git-status-diff postcondition check (which
         # has no `tmp/`-specific exemption of its own for a bare ignored
         # directory's mere existence).
-        _txn_dir = root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number) / "repair-action-apply"
-        candidate_path = _txn_dir / f"issue_{issue_number}_repair_action_candidate.md"
-        input_path = _txn_dir / f"issue_{issue_number}_repair_action_txn.json"
-        candidate_path.parent.mkdir(parents=True, exist_ok=True)
-        candidate_path.write_text(candidate_body, encoding="utf-8")
+        #
+        # PR #2202 review fix (P1-1): a FIXED issue-number-keyed scratch
+        # path here (e.g. `issue_<N>_repair_action_candidate.md`) lets two
+        # concurrent invocations for the same Issue clobber each other's
+        # candidate/input files, and -- worse -- lets another process with
+        # the same permissions pre-place a symlink at that exact,
+        # guessable path BEFORE this code ever runs, redirecting the write
+        # below to silently overwrite an arbitrary writable file
+        # elsewhere. This happens strictly upstream of
+        # `edit_issue_txn.py`'s own symlink checks, which only ever see
+        # the file we already (unsafely) wrote. Use a per-invocation
+        # random subdirectory (`tempfile.mkdtemp`, mode 0700, unguessable
+        # name) under the same allowed-write-roots base, then create each
+        # scratch file inside it via dir-FD-relative
+        # `O_CREAT|O_EXCL|O_NOFOLLOW` so we fail closed instead of
+        # following/overwriting anything unexpectedly already there.
+        _txn_base_dir = (
+            root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number) / "repair-action-apply"
+        )
+        _txn_base_dir.mkdir(parents=True, exist_ok=True)
+        _scratch_dir = Path(tempfile.mkdtemp(dir=str(_txn_base_dir)))
+        candidate_path = _scratch_dir / "repair_action_candidate.md"
+        input_path = _scratch_dir / "repair_action_txn.json"
 
+        _scratch_dir_fd = os.open(str(_scratch_dir), os.O_RDONLY | os.O_DIRECTORY)
         try:
-            return _default_apply_transaction_inner(current_issue_, candidate_body, candidate_path, input_path)
+            _repair_apply_scratch_create(_scratch_dir_fd, candidate_path.name, candidate_body.encode("utf-8"))
+            try:
+                return _default_apply_transaction_inner(
+                    current_issue_, candidate_body, candidate_path, input_path, _scratch_dir_fd
+                )
+            finally:
+                for _tmp_path in (candidate_path, input_path):
+                    _repair_apply_scratch_unlink(_scratch_dir_fd, _tmp_path.name)
         finally:
-            for _tmp_path in (candidate_path, input_path):
-                try:
-                    _tmp_path.unlink()
-                except OSError:
-                    pass
+            with contextlib.suppress(OSError):
+                os.close(_scratch_dir_fd)
+            with contextlib.suppress(OSError):
+                os.rmdir(_scratch_dir)
 
     def _default_apply_transaction_inner(
-        current_issue_: dict, candidate_body: str, candidate_path: Path, input_path: Path
+        current_issue_: dict,
+        candidate_body: str,
+        candidate_path: Path,
+        input_path: Path,
+        _scratch_dir_fd: int,
     ) -> dict:
         from scope_signal_delta import build_issue_edit_txn_input
 
@@ -1698,7 +1784,13 @@ def run_repair_action_apply(
             new_body_file=str(candidate_path.relative_to(root)),
             readiness_result=readiness_forwarding,
         )
-        input_path.write_text(json.dumps(transaction_input, ensure_ascii=False), encoding="utf-8")
+        # PR #2202 review fix (P1-1): dir-FD-relative O_CREAT|O_EXCL create
+        # (see `_default_apply_transaction`'s docstring comment above for
+        # the full rationale) instead of a plain `Path.write_text()` at a
+        # fixed, guessable pathname.
+        _repair_apply_scratch_create(
+            _scratch_dir_fd, input_path.name, json.dumps(transaction_input, ensure_ascii=False).encode("utf-8")
+        )
 
         def _unknown_dispatch_txn_result(error_code: str, message: str) -> dict:
             # PR #2202 review fix-delta (P0-6): a genuinely-unconfirmed

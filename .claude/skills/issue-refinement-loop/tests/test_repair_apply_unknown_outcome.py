@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -515,6 +516,177 @@ def test_repair_action_apply_outer_registry_timeout_covers_worst_case_inner_budg
         f"({rrp.REPAIR_APPLY_READBACK_RESERVE_SECONDS}) = {required_minimum}"
     )
     assert entry["timeout_seconds"] >= required_minimum + rrp.REPAIR_APPLY_OUTER_TIMEOUT_MARGIN_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# PR #2202 review fix (P1-1): fixed-name scratch-file concurrency race /
+# symlink-clobber hardening in the default `apply_transaction` closure.
+# ---------------------------------------------------------------------------
+
+
+def test_default_apply_transaction_uses_unguessable_random_scratch_dir_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-1: the default apply_transaction must NOT write to a fixed,
+    issue-number-keyed scratch path (guessable, collision-prone across
+    concurrent invocations, and pre-placeable by a symlink). It must use a
+    random per-invocation subdirectory of the same allowed-write-roots
+    base, and must leave no scratch files or directories behind once the
+    call completes (success path)."""
+    result_path = _write_candidate(tmp_path)
+    readiness_stdout = _readiness_stdout_ok()
+
+    observed_body_file_args: list[str] = []
+    observed_input_file_args: list[str] = []
+
+    def _fake_run(argv, **kwargs):
+        script_path = str(argv[1])
+        if "contract_readiness_check.py" in script_path:
+            observed_body_file_args.append(argv[argv.index("--body-file") + 1])
+            return subprocess.CompletedProcess(argv, 0, stdout=readiness_stdout, stderr="")
+        if "edit_issue_txn.py" in script_path:
+            observed_input_file_args.append(argv[argv.index("--input-file") + 1])
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "status": "ok",
+                        "mutation_started": True,
+                        "body_update": {"attempted": True, "status": "ok"},
+                        "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+                        "errors": [],
+                    }
+                ),
+                stderr="",
+            )
+        raise AssertionError(f"unexpected subprocess.run call: {argv}")
+
+    monkeypatch.setattr(rrp.subprocess, "run", _fake_run)
+
+    fetch_bodies = iter([ORIGINAL_BODY, REPAIRED_BODY])
+
+    def _fetch():
+        return {"body": next(fetch_bodies), "updatedAt": "2024-01-01T00:00:00Z"}
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2039,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=_fetch,
+    )
+
+    jsonschema.validate(result, _SCHEMA)
+    assert observed_body_file_args, "readiness check must actually have been invoked"
+    assert observed_input_file_args, "edit_issue_txn.py dispatch must actually have been invoked"
+
+    fixed_candidate_name = "issue_2039_repair_action_candidate.md"
+    fixed_input_name = "issue_2039_repair_action_txn.json"
+    assert fixed_candidate_name not in observed_body_file_args[0]
+    assert fixed_input_name not in observed_input_file_args[0]
+
+    base_dir = tmp_path / ".claude" / "artifacts" / "issue-refinement-loop" / "2039" / "repair-action-apply"
+    body_file_path = Path(observed_body_file_args[0])
+    assert body_file_path.is_absolute()
+    # The scratch path must live one level deeper than the allowed-write-
+    # roots base, inside a per-invocation random subdirectory (never
+    # directly in the base dir under a fixed name).
+    assert body_file_path.parent != base_dir
+    assert body_file_path.parent.parent == base_dir
+
+    # After the call, no scratch files or directories are left behind
+    # under the allowed-write-roots base (full cleanup, including the
+    # per-invocation random subdirectory itself).
+    if base_dir.exists():
+        leftovers = list(base_dir.iterdir())
+        assert leftovers == [], f"leftover scratch entries after cleanup: {leftovers}"
+
+
+def test_repair_apply_scratch_create_rejects_preplaced_symlink_at_target_name(tmp_path: Path) -> None:
+    """P1-1: `_repair_apply_scratch_create()` must fail closed (never
+    follow/overwrite) when something already exists at the target scratch
+    name -- including a symlink pre-placed by another process with the
+    same permissions, pointing at an arbitrary writable file elsewhere.
+    `O_CREAT | O_EXCL` makes the kernel reject this atomically before any
+    content bytes are ever written through the symlink."""
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir(mode=0o700)
+    outside_target = tmp_path / "outside_target.txt"
+    outside_target.write_text("do not overwrite me")
+    os.symlink(str(outside_target), str(scratch_dir / "candidate.md"))
+
+    dir_fd = os.open(str(scratch_dir), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(rrp.RepairApplySecureOpenError) as exc_info:
+            rrp._repair_apply_scratch_create(dir_fd, "candidate.md", b"attacker payload")
+        message = str(exc_info.value)
+        assert "repair_apply_scratch_already_exists" in message or "repair_apply_scratch_is_symlink" in message
+    finally:
+        os.close(dir_fd)
+
+    assert outside_target.read_text() == "do not overwrite me", (
+        "O_EXCL must prevent the pre-placed symlink from being followed or overwritten"
+    )
+
+
+def test_repair_apply_scratch_create_writes_and_fstat_verifies_regular_single_link_file(
+    tmp_path: Path,
+) -> None:
+    """P1-1: the happy path still creates a genuine regular file with the
+    expected content, having passed the post-create `fstat()`
+    regular-file + `st_nlink == 1` check."""
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir(mode=0o700)
+
+    dir_fd = os.open(str(scratch_dir), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        rrp._repair_apply_scratch_create(dir_fd, "candidate.md", b"trusted content")
+    finally:
+        os.close(dir_fd)
+
+    written = scratch_dir / "candidate.md"
+    assert written.read_bytes() == b"trusted content"
+    assert oct(written.stat().st_mode & 0o777) == oct(0o600)
+
+
+def test_repair_apply_scratch_unlink_is_dir_fd_relative_and_survives_ancestor_rename(
+    tmp_path: Path,
+) -> None:
+    """P1-1: cleanup (`_repair_apply_scratch_unlink()`) must be
+    directory-FD-relative, not a reconstructed pathname string -- so a
+    concurrent rename of the scratch directory's own pathname (or a decoy
+    placed at the stale pathname) between creation and cleanup cannot
+    redirect cleanup to the wrong target."""
+    scratch_dir = tmp_path / "scratch_orig"
+    scratch_dir.mkdir(mode=0o700)
+    dir_fd = os.open(str(scratch_dir), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        rrp._repair_apply_scratch_create(dir_fd, "candidate.md", b"trusted")
+
+        # Simulate an attacker (or an unrelated concurrent rename) moving
+        # the scratch directory's own pathname away, then placing a decoy
+        # directory with the SAME name and a same-named file inside it. A
+        # pathname-reconstructing cleanup (`Path(root/.../candidate.md
+        # ).unlink()`) would hit the decoy instead of the real file.
+        os.rename(str(scratch_dir), str(tmp_path / "scratch_renamed"))
+        decoy_dir = tmp_path / "scratch_orig"
+        decoy_dir.mkdir()
+        (decoy_dir / "candidate.md").write_text("DECOY - must not be touched")
+
+        rrp._repair_apply_scratch_unlink(dir_fd, "candidate.md")
+
+        assert not (tmp_path / "scratch_renamed" / "candidate.md").exists(), (
+            "dir-FD-relative unlink must remove the file from the real "
+            "(renamed) directory it actually lives in"
+        )
+        assert (decoy_dir / "candidate.md").read_text() == "DECOY - must not be touched", (
+            "a pathname-based cleanup would have wrongly deleted/matched "
+            "the decoy at the stale pathname; dir-FD-relative cleanup "
+            "must never touch it"
+        )
+    finally:
+        os.close(dir_fd)
 
 
 if __name__ == "__main__":
