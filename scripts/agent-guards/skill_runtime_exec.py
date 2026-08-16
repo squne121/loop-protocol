@@ -13,6 +13,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Iterable
@@ -20,10 +21,13 @@ from typing import Iterable
 sys.dont_write_bytecode = True
 
 from skill_runtime_command_policy import (
+    GIT_SUBPROCESS_UNSET_ENV_KEYS,
+    INSTEADOF_CONFIG_NAME_REGEXP,
     REGISTRY_REL,
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
     ExactSkillRuntimeCommand,
+    GitSubprocessConfigProbeFailed,
     _is_safe_issue_artifact_path,
     command_allows_root_no_worktree,
     current_branch,
@@ -37,6 +41,10 @@ from skill_runtime_command_policy import (
     is_exact_skill_runtime_executor_command,
     is_exact_skill_runtime_fixture_executor_command,
     load_registry_entry,
+    parse_config_get_regexp_name_only_nul,
+    reject_git_global_options,
+    reject_insteadof_rewrite,
+    reject_option_like_positional,
     resolve_active_issue,
     resolve_default_branch,
     resolve_project_root,
@@ -2548,6 +2556,426 @@ def main(argv: list[str] | None = None) -> int:
     if result.stderr:
         sys.stderr.write(result.stderr)
     return result.returncode
+
+# ---------------------------------------------------------------------------
+# Issue #2196 (Child 1 of #2190): dedicated sanitized Git subprocess
+# execution utility. Not yet wired into any production command dispatch
+# path -- later children (#2197/#2198/#2199/#2200) are the ones that will
+# call the closed `run_control_plane_git_*` builders below for their own
+# dedicated Git subprocesses. This Issue only establishes and self-tests
+# the utility. Per PR #2201's owner adversarial review (P1-3), there is no
+# production-callsite API that accepts a raw `list[str]` argv: the only
+# entry points are the closed, typed builders at the bottom of this
+# section, each of which only accepts a fixed, validated subcommand shape.
+# ---------------------------------------------------------------------------
+
+_GIT_SUBPROCESS_EXECUTABLE_CACHE: str | None = None
+
+
+def resolve_git_subprocess_executable(project_root: str) -> str:
+    """Resolve the absolute path to the trusted `git` executable exactly
+    once per process and reuse the cached value for every subsequent
+    dedicated Git subprocess invocation (Issue #2196 AC2). Resolving only
+    once (instead of re-resolving on every call, the way
+    `_resolve_child_argv`/`_resolve_trusted_executable` deliberately do for
+    `uv`/`python3` to defend against a TOCTOU venv-symlink rewrite) means a
+    PATH or symlink change made mid-session cannot silently swap which
+    `git` binary later dedicated-subprocess invocations run -- every
+    invocation within this process keeps using the exact same absolute
+    path string that was validated at first resolution.
+    """
+    global _GIT_SUBPROCESS_EXECUTABLE_CACHE
+    if _GIT_SUBPROCESS_EXECUTABLE_CACHE is None:
+        _GIT_SUBPROCESS_EXECUTABLE_CACHE = _resolve_trusted_executable("git", project_root)
+    return _GIT_SUBPROCESS_EXECUTABLE_CACHE
+
+
+def _reset_git_subprocess_executable_cache_for_tests() -> None:
+    """Test-only reset hook. Production code never needs to call this --
+    the whole point of AC2 is that the cache is never invalidated within a
+    process lifetime."""
+    global _GIT_SUBPROCESS_EXECUTABLE_CACHE
+    _GIT_SUBPROCESS_EXECUTABLE_CACHE = None
+
+
+def _resolve_trusted_ssh_command() -> str:
+    """Resolve `GIT_SSH_COMMAND` to an absolute, trusted `ssh` executable
+    resolved only from the same trusted `PATH` allowlist used for the rest
+    of the dedicated Git subprocess environment (Issue #2196 AC7 / P1-2).
+    Never falls back to an unqualified `"ssh"` token, which would resolve
+    via whatever `PATH` the child process happened to inherit -- if no
+    trusted `ssh` executable can be found, `GIT_SSH_COMMAND` is pointed at
+    `false` (a command that always fails) instead, so an `ssh://` remote
+    can never silently succeed through an unvetted `ssh`."""
+    safe_path = os.pathsep.join(_safe_path_entries())
+    ssh_path = shutil.which("ssh", path=safe_path)
+    if ssh_path:
+        return f"{ssh_path} -oBatchMode=yes -oStrictHostKeyChecking=yes"
+    return "false"
+
+
+def sanitized_git_subprocess_env(project_root: str) -> dict[str, str]:
+    """Build the environment for a dedicated Git subprocess (Issue #2196
+    AC1/AC5/AC7).
+
+    Every key in `GIT_SUBPROCESS_UNSET_ENV_KEYS` is guaranteed absent from
+    the returned mapping -- built by copying `os.environ` and excluding
+    those keys, never by overwriting them with an empty string, so no
+    caller-controlled value for any of them can survive into the child
+    process. `PATH` is replaced entirely with the same trusted allowlist
+    used to resolve the `git` executable itself (never the inherited
+    `PATH`), so a poisoned `PATH` entry cannot substitute a fake Git
+    helper (e.g. `git-remote-https`) or a fake `ssh` (Issue #2196 P1-2:
+    `GIT_EXEC_PATH` alone unset is not sufficient, since Git also searches
+    `PATH` for `git-<command>` helpers). Interactive prompting, an ambient
+    credential helper, and interactive SSH are all disabled (terminal
+    prompt disabled, the two askpass-style hooks cleared, SSH forced to
+    batch mode against a trusted absolute `ssh` path) so the subprocess can
+    never block waiting on stdin or silently invoke an ambient credential
+    helper or an untrusted `ssh`.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in GIT_SUBPROCESS_UNSET_ENV_KEYS
+    }
+    env["CLAUDE_PROJECT_DIR"] = project_root
+    env["PATH"] = os.pathsep.join(_safe_path_entries())
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = ""
+    env["SSH_ASKPASS"] = ""
+    env["GIT_SSH_COMMAND"] = _resolve_trusted_ssh_command()
+    return env
+
+
+def git_subprocess_trusted_hooks_dir(scratch_root: str) -> str:
+    """Return the absolute realpath of a fresh, verified-empty,
+    per-invocation directory to pin `core.hooksPath` at for a dedicated
+    Git subprocess invocation (Issue #2196 AC3).
+
+    `scratch_root` (and every existing ancestor of it) must not be a
+    symlink -- rejected fail-closed via `_is_symlink_path`'s component-wise,
+    no-follow walk -- and must be an absolute path, so a caller cannot
+    redirect this trusted directory outside the location it appears to be
+    in. A brand-new directory is created under `scratch_root` for every
+    call (never a fixed, reused name), so no two invocations -- even
+    concurrent ones -- ever share the same trusted-empty-hooks directory,
+    and its resolved realpath is checked to equal itself (i.e. it is not
+    itself reached through a symlink) before being handed back. Git only
+    looks for hooks inside the configured `core.hooksPath`, and this
+    directory can never contain any (verified empty immediately after
+    creation), so no hook script (attacker- or accident-placed, e.g. a
+    repo-local `.git/hooks/post-checkout`) can ever fire for a dedicated
+    Git subprocess.
+    """
+    scratch_path = Path(scratch_root)
+    if not scratch_path.is_absolute():
+        raise RuntimeError("git_subprocess_scratch_root_not_absolute")
+    if _is_symlink_path(scratch_path):
+        raise RuntimeError("git_subprocess_scratch_root_symlinked")
+    scratch_path.mkdir(parents=True, exist_ok=True)
+    hooks_dir = Path(
+        tempfile.mkdtemp(prefix=".skill-runtime-git-hooks-", dir=str(scratch_path))
+    )
+    real_hooks_dir = Path(os.path.realpath(hooks_dir))
+    if real_hooks_dir != hooks_dir:
+        raise RuntimeError("git_subprocess_trusted_hooks_dir_not_realpath")
+    if any(hooks_dir.iterdir()):
+        raise RuntimeError("git_subprocess_trusted_hooks_dir_not_empty")
+    return str(hooks_dir)
+
+
+def _probe_insteadof_rewrite_keys(
+    git_executable: str,
+    *,
+    cwd: str,
+    env: dict[str, str],
+    hooks_dir: str,
+    timeout: float,
+) -> list[str]:
+    """Run the structured, name-only, NUL-delimited, regexp-limited
+    `insteadOf`/`pushInsteadOf` config probe (Issue #2196 AC4/AC6/AC9 /
+    P1-1/P1-4/P1-5), using the exact same `git_executable`, `env`, and
+    `-c core.hooksPath=`/`-c credential.helper=`/`--no-replace-objects`
+    global options as the real command that follows it, so the probe and
+    the real command are provably bound to identical config authority
+    (P1-1: this is what makes a `GIT_CONFIG`-style split-execution attack
+    structurally impossible here -- `GIT_CONFIG` itself is already unset
+    for both, and both read config through the same argv/env/cwd shape).
+
+    Returns the list of matched `url.<base>.(insteadOf|pushInsteadOf)`
+    config key names (empty if none). Raises
+    `GitSubprocessConfigProbeFailed` for any outcome other than "the probe
+    positively established zero matches" -- a timeout, an OS-level
+    transport error, a decode failure, or a nonzero exit accompanied by
+    stderr output are all treated as "could not be evaluated", never as
+    "no rewrite exists" (P1-5).
+    """
+    argv = [
+        git_executable,
+        "--no-replace-objects",
+        "-c",
+        "core.hooksPath=" + hooks_dir,
+        "-c",
+        "credential.helper=",
+        "-C",
+        cwd,
+        "config",
+        "--get-regexp",
+        "--name-only",
+        "-z",
+        INSTEADOF_CONFIG_NAME_REGEXP,
+    ]
+    try:
+        probe = subprocess.run(
+            argv,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitSubprocessConfigProbeFailed("probe_timeout") from exc
+    except OSError as exc:
+        raise GitSubprocessConfigProbeFailed(f"probe_os_error:{exc}") from exc
+
+    if probe.returncode == 0:
+        return parse_config_get_regexp_name_only_nul(probe.stdout)
+    if probe.returncode == 1:
+        # `git config --get-regexp` exits 1 when no key matches the given
+        # regexp -- but only when that is genuinely the reason: a nonzero
+        # exit accompanied by stderr output means something else went
+        # wrong (a config syntax error, a bad `include`, a permission
+        # error, ...), which must not be silently treated as "no match".
+        stderr_text = probe.stderr.decode("utf-8", errors="replace") if probe.stderr else ""
+        if stderr_text.strip() == "":
+            return []
+        raise GitSubprocessConfigProbeFailed(
+            f"probe_nonzero_exit_with_stderr:{stderr_text.strip()!r}"
+        )
+    raise GitSubprocessConfigProbeFailed(f"probe_nonzero_exit:{probe.returncode}")
+
+
+def _run_sanitized_git_subprocess(
+    argv: list[str],
+    *,
+    cwd: str,
+    project_root: str,
+    scratch_root: str | None = None,
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """Internal engine for a dedicated, sanitized Git subprocess (Issue
+    #2196). Private (leading underscore): the only production callers are
+    the closed `run_control_plane_git_*` builders below, each of which
+    constructs `argv` itself from validated, structured parameters -- this
+    function is never exposed as a raw-argv production API (P1-3).
+
+    `argv` is the Git subcommand and its arguments, WITHOUT the leading
+    `git` executable name (e.g. `["status", "--short"]`) and WITHOUT any
+    Git global option (rejected via `reject_git_global_options`, P1-3).
+    This function:
+
+    1. Resolves (once, cached -- AC2) the absolute trusted `git`
+       executable.
+    2. Builds the sanitized environment (AC1/AC5/AC7): GIT_* variables in
+       `GIT_SUBPROCESS_UNSET_ENV_KEYS` are unset, `PATH` is a trusted
+       allowlist, interactive prompting/credential helper/SSH prompting
+       are disabled.
+    3. Fixes `core.hooksPath` at a fresh, verified-empty, per-invocation
+       trusted directory (AC3) via a config override applied identically
+       to both the probe and the real command invocation, and
+       additionally disables any ambient credential helper the same way.
+    4. Fail-closed rejects the invocation before the real command runs if
+       `cwd`'s effective Git configuration declares any
+       `url.<base>.insteadOf`/`pushInsteadOf` rewrite (AC4/AC6), using a
+       structured, name-only, NUL-delimited probe bound to identical
+       config authority as the real command (P1-1/P1-4), and fails closed
+       (rather than proceeding) if that probe itself could not be
+       positively evaluated (AC9/P1-5).
+    5. Applies `--no-replace-objects` as a fixed global option on every
+       invocation (AC11), defaults `stdin=subprocess.DEVNULL` and requires
+       a bounded `timeout` (AC10/P2-2).
+
+    Raises `GitSubprocessRewriteRejected` for step 4's rewrite rejection,
+    `GitSubprocessConfigProbeFailed` for step 4's probe-failure rejection.
+    Any other precondition failure (e.g. an unexpected leading `git` token
+    or embedded global option in `argv`, a non-bounded `timeout`, or a
+    non-empty trusted hooks directory) raises `ValueError` / `RuntimeError`
+    before any subprocess is spawned.
+    """
+    if not argv or argv[0] == "git":
+        raise ValueError("argv_must_not_include_executable_name")
+    if timeout is None or timeout <= 0:
+        raise ValueError("timeout_required_bounded")
+    reject_git_global_options(argv)
+
+    git_executable = resolve_git_subprocess_executable(project_root)
+    env = sanitized_git_subprocess_env(project_root)
+    hooks_dir = git_subprocess_trusted_hooks_dir(scratch_root or project_root)
+
+    matched_keys = _probe_insteadof_rewrite_keys(
+        git_executable,
+        cwd=cwd,
+        env=env,
+        hooks_dir=hooks_dir,
+        timeout=timeout,
+    )
+    reject_insteadof_rewrite(matched_keys)
+
+    full_argv = [
+        git_executable,
+        "--no-replace-objects",
+        "-c",
+        "core.hooksPath=" + hooks_dir,
+        "-c",
+        "credential.helper=",
+        *argv,
+    ]
+    return subprocess.run(
+        full_argv,
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Closed command builder API (Issue #2196 AC8 / P1-3).
+#
+# Each builder below accepts only a fixed, validated subcommand shape --
+# structured keyword/positional parameters describing *data* (a repo URL, a
+# ref name, an object id, ...), never a caller-supplied argv list. None of
+# them accept a Git global option in any form: `reject_git_global_options`
+# defends the constructed argv itself (defense in depth), and every
+# caller-supplied positional value is separately checked by
+# `reject_option_like_positional` so it cannot be interpreted by Git as a
+# flag. This is the only sanctioned way for production code (later
+# children #2197-#2200) to run a dedicated sanitized Git subprocess; no
+# raw-argv equivalent is exposed at production callsites.
+# ---------------------------------------------------------------------------
+
+
+def run_control_plane_git_ls_remote(
+    repo: str,
+    *,
+    cwd: str,
+    project_root: str,
+    scratch_root: str | None = None,
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """Closed builder for `git ls-remote -- <repo>`."""
+    reject_option_like_positional(repo)
+    return _run_sanitized_git_subprocess(
+        ["ls-remote", "--", repo],
+        cwd=cwd,
+        project_root=project_root,
+        scratch_root=scratch_root,
+        timeout=timeout,
+    )
+
+
+def run_control_plane_git_fetch(
+    repo: str,
+    refspec: str,
+    *,
+    cwd: str,
+    project_root: str,
+    scratch_root: str | None = None,
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """Closed builder for `git fetch -- <repo> <refspec>`."""
+    reject_option_like_positional(repo)
+    reject_option_like_positional(refspec)
+    return _run_sanitized_git_subprocess(
+        ["fetch", "--", repo, refspec],
+        cwd=cwd,
+        project_root=project_root,
+        scratch_root=scratch_root,
+        timeout=timeout,
+    )
+
+
+_CAT_FILE_ALLOWED_MODES = frozenset({"-p", "-t", "-s"})
+
+
+def run_control_plane_git_cat_file(
+    object_id: str,
+    *,
+    mode: str = "-p",
+    cwd: str,
+    project_root: str,
+    scratch_root: str | None = None,
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """Closed builder for `git cat-file <mode> <object_id>`. `mode` must be
+    one of `-p`/`-t`/`-s` (the fixed, validated subcommand shape for this
+    builder); any other value is rejected before a subprocess is spawned.
+    """
+    if mode not in _CAT_FILE_ALLOWED_MODES:
+        raise ValueError(f"cat_file_mode_not_allowed:{mode}")
+    reject_option_like_positional(object_id)
+    return _run_sanitized_git_subprocess(
+        ["cat-file", mode, object_id],
+        cwd=cwd,
+        project_root=project_root,
+        scratch_root=scratch_root,
+        timeout=timeout,
+    )
+
+
+def run_control_plane_git_update_ref(
+    ref: str,
+    new_oid: str,
+    *,
+    cwd: str,
+    project_root: str,
+    scratch_root: str | None = None,
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """Closed builder for `git update-ref -- <ref> <new_oid>`."""
+    reject_option_like_positional(ref)
+    reject_option_like_positional(new_oid)
+    return _run_sanitized_git_subprocess(
+        ["update-ref", "--", ref, new_oid],
+        cwd=cwd,
+        project_root=project_root,
+        scratch_root=scratch_root,
+        timeout=timeout,
+    )
+
+
+_WORKTREE_ALLOWED_ACTIONS = frozenset({"list", "add", "remove", "prune"})
+
+
+def run_control_plane_git_worktree(
+    action: str,
+    *args: str,
+    cwd: str,
+    project_root: str,
+    scratch_root: str | None = None,
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """Closed builder for `git worktree <action> [args...]`. `action` must
+    be one of `list`/`add`/`remove`/`prune` (the fixed, validated
+    subcommand shape for this builder); any other value is rejected before
+    a subprocess is spawned. Every element of `args` is separately checked
+    by `reject_option_like_positional`.
+    """
+    if action not in _WORKTREE_ALLOWED_ACTIONS:
+        raise ValueError(f"worktree_action_not_allowed:{action}")
+    for value in args:
+        reject_option_like_positional(value)
+    return _run_sanitized_git_subprocess(
+        ["worktree", action, *args],
+        cwd=cwd,
+        project_root=project_root,
+        scratch_root=scratch_root,
+        timeout=timeout,
+    )
 
 
 if __name__ == "__main__":
