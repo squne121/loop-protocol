@@ -1992,17 +1992,26 @@ def build_structural_repair_bundle(
 # function so a wrapper can never emit a `status: pass` / `next_action:
 # proceed` result alongside a structural_repair_action that disagrees.
 #
-# NOTE (scope disclosure): `run_refinement_preflight.py` does not yet call
-# `build_structural_repair_bundle()` unconditionally on every preflight run
-# (that would require resolving the live GitHub Issue's issue_kind AND
-# fetching/caching the matching `.github/ISSUE_TEMPLATE/*.yml` on every
-# invocation, which is out of this fix_delta's bounded scope -- see the PR
-# comment for the explicit disclosure). What IS wired: (1) this routing
-# function, (2) a schema-level `allOf` invariant in
-# refinement_preflight_result_v1.schema.json that fails closed if a result
-# ever carries `status: pass` alongside a `structural_repair_action` whose
-# `disposition_summary` is not `no_missing_fields_detected` -- the exact
-# contradiction the OWNER's P0-1 example showed.
+# NOTE (scope disclosure, updated for the P0-1 wiring fix_delta commit):
+# `run_refinement_preflight.py` DOES now call `build_structural_repair_bundle()`
+# and `route_structural_repair_disposition()` from its production preflight
+# path (see `_resolve_structural_repair_template()` and the "Structural
+# (template-derived) repair pass" block in that module). The call remains
+# CONDITIONAL, not unconditional: it only fires when the Issue body carries a
+# locally-resolvable self-declared `issue_kind:` scalar that
+# `_resolve_structural_repair_template()` can match to one of the closed
+# {parent, implementation, research} kinds and their checked-in
+# `.github/ISSUE_TEMPLATE/*.yml` file -- this stays a purely local, no-GitHub
+# -call resolution, never a live-Issue-metadata fetch. When no such
+# self-declared kind is resolvable, `structural_repair_action` stays absent
+# for that run (schema-documented as "absent when the producer was not
+# invoked in structural-repair mode") rather than guessing. What IS wired:
+# (1) this routing function, called from the production path above, (2) a
+# schema-level `allOf` invariant in refinement_preflight_result_v1.schema.json
+# that fails closed if a result ever carries `status: pass` alongside a
+# `structural_repair_action` whose `disposition_summary` is not
+# `no_missing_fields_detected` -- the exact contradiction the OWNER's P0-1
+# example showed.
 # ---------------------------------------------------------------------------
 
 STRUCTURAL_REPAIR_ROUTE_STATUS_PASS = "pass"
