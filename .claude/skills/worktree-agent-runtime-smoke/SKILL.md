@@ -145,15 +145,22 @@ captured stdout（stream-json）を入力とする。
 - `agent_id` / `subagent_start_observed` / `subagent_stop_observed` /
   `agent_transcript_path`: 個別の観測事実（すべて fail-closed、推測しない）
 
-呼び出し側は `--require-subagent-causal-evidence`（runner CLI フラグ、既定 OFF）を
-指定することで、`causal_evidence_source != hook_id_correlated` の場合に exit 1 へ
-昇格させることができる。指定しない場合でも判定結果は常に
-`summary.md` / `schema_summary["subagent_causal_evidence"]` に記録され、marker のみの
-PASS だったのか hook ID 相関で PASS したのかを事後に判別できる。interactive lane は
-herdr pane のテキストにはこの stream-json hook payload が現れないため、
-`causal_evidence_source` は今のところ `no_evidence`／`marker_only_insufficient` に
-なる想定であり、interactive lane 向けの hook 出力チャネル整備は本 Issue の対象外
+**structured lane** は `SubagentStart`/`SubagentStop` の stream-json チャンネルが常に
+利用可能なため、呼び出し側が `--expect-marker` を指定する場合、この causal-evidence
+要件（`causal_evidence_source == hook_id_correlated`）は **追加フラグなしで既定強制**
+される（PR #2220 レビュー fix-delta）。`--require-subagent-causal-evidence`（runner CLI
+フラグ、既定 OFF）は、`--expect-marker` を指定しない structured lane 実行にもこの要件
+を課したい場合にのみ使う。
+
+**interactive lane** は herdr pane のテキストレンダリングにはこの stream-json hook
+payload が構造的に現れないため、`causal_evidence_source` は今のところ
+`no_evidence`／`marker_only_insufficient` になる想定であり、この lane では本要件は
+引き続き **opt-in**（`--require-subagent-causal-evidence` を明示した場合のみ exit を
+昇格）のままとする。interactive lane 向けの hook 出力チャネル整備は本 Issue の対象外
 （follow-up）。
+
+いずれの lane でも判定結果は常に `summary.md` / `schema_summary["subagent_causal_evidence"]`
+に記録され、marker のみの PASS だったのか hook ID 相関で PASS したのかを事後に判別できる。
 
 ## 手順
 

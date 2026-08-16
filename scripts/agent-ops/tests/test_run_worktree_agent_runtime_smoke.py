@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -143,6 +144,48 @@ FAKE_CLAUDE_SUCCESS_BODY = (
 )
 
 
+def _subagent_hook_lines(
+    agent_id: str = "child-fixture-1",
+    transcript_path: str = "/tmp/child-fixture-1-transcript.jsonl",
+) -> str:
+    """Issue #2183 PR #2220 review fix-delta: correlated SubagentStart/
+    SubagentStop stream-json hook lines (matching the real Claude Code
+    hook payload shape ``extract_claude_hook_lifecycle_events`` parses),
+    for fake ``claude`` fixtures whose structured-lane invocation also
+    passes ``--expect-marker`` -- the structured lane now requires
+    causal_evidence_source == hook_id_correlated by default whenever a
+    marker is expected, so these fixtures must emit real hook evidence
+    instead of relying on the marker string alone."""
+
+    def _event(hook_event: str, *, with_transcript: bool) -> str:
+        inner: dict[str, str] = {"agent_id": agent_id, "agent_type": "general-purpose"}
+        if with_transcript:
+            inner["agent_transcript_path"] = transcript_path
+        inner_json = json.dumps(inner)
+        payload = {
+            "type": "system",
+            "subtype": "hook_response",
+            "hook_event": hook_event,
+            "hook_name": hook_event,
+            "session_id": "fixture-session",
+            "stdout": inner_json,
+            "output": inner_json,
+        }
+        return f"echo {shlex.quote(json.dumps(payload))}\n"
+
+    return _event("SubagentStart", with_transcript=False) + _event("SubagentStop", with_transcript=True)
+
+
+FAKE_CLAUDE_SUCCESS_BODY_WITH_SUBAGENT_EVIDENCE = (
+    "\n"
+    "cat > /dev/null\n"
+    'echo \'{"type":"system","subtype":"init"}\'\n'
+    + _subagent_hook_lines()
+    + 'echo \'{"type":"result","subtype":"success","marker":"MARKER_TOKEN_WT"}\'\n'
+    "exit 0\n"
+)
+
+
 # ---------------------------------------------------------------------------
 # AC2: worktree / repository identity rejection
 # ---------------------------------------------------------------------------
@@ -254,12 +297,18 @@ def test_given_fake_claude_success_when_structured_lane_runs_then_exit0_and_summ
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+    _write_fake_exe(
+        fake_bin / "claude",
+        _HELP_BRANCH
+        + """
 cat > /dev/null
 echo '{"type":"system","subtype":"init"}'
-echo '{"type":"result","subtype":"success","marker":"MARKER_TOKEN_1"}'
+"""
+        + _subagent_hook_lines()
+        + """echo '{"type":"result","subtype":"success","marker":"MARKER_TOKEN_1"}'
 exit 0
-""")
+""",
+    )
     prompt = _prompt_file(tmp_path, "MARKER_TOKEN_1\n")
     out_dir = worktree / "artifacts" / "runtime-smoke" / "claude-structured"
     result = _run(
@@ -271,7 +320,14 @@ exit 0
     )
     assert result.returncode == 0, result.stderr
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
-    assert "native_event_count: 2" in summary
+    # PR #2220 review fix-delta: the structured lane's --expect-marker
+    # default causal-evidence gate requires the fake claude fixture to
+    # also emit a correlated SubagentStart/SubagentStop pair, which adds
+    # 2 more parseable stream-json lines on top of the pre-existing
+    # init + result lines.
+    assert "native_event_count: 4" in summary
+    assert "subagent_causal_evidence" in summary
+    assert "'causal_evidence_source': 'hook_id_correlated'" in summary
     assert "terminal_event_observed: True" in summary
     # Only summary.md is persisted (Issue #1921 P1 evidence-hygiene fix-delta).
     assert sorted(p.name for p in out_dir.iterdir()) == ["summary.md"]
@@ -549,7 +605,13 @@ def test_given_required_unavailable_runtime_field_when_fake_claude_succeeds_then
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    # PR #2220 review fix-delta: this fixture must emit correlated
+    # SubagentStart/SubagentStop hook evidence, since --expect-marker
+    # below now requires causal_evidence_source == hook_id_correlated by
+    # default in the structured lane -- otherwise the causal-evidence
+    # gate would FAIL before the --require-observed-runtime-field SKIP
+    # classification below ever runs.
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY_WITH_SUBAGENT_EVIDENCE)
     prompt = _prompt_file(tmp_path)
     out_dir = tmp_path / "out"
     result = _run(
@@ -1664,7 +1726,10 @@ def test_given_script_checked_out_inside_linked_worktree_when_invoked_without_re
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    # PR #2220 review fix-delta: --expect-marker below now requires
+    # correlated SubagentStart/SubagentStop hook evidence by default in
+    # the structured lane.
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY_WITH_SUBAGENT_EVIDENCE)
     prompt = _prompt_file(tmp_path, "MARKER_TOKEN_WT\n")
     out_dir = worktree / "artifacts" / "runtime-smoke" / "claude-structured"
     env = dict(os.environ)

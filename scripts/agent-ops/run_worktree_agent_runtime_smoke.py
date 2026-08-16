@@ -3571,17 +3571,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-subagent-causal-evidence",
         action="store_true",
         help=(
-            "Issue #2183: in addition to any --expect-marker check, require "
+            "Issue #2183 (PR #2220 review fix-delta): require "
             "subagent_causal_evidence_verdict()'s causal_evidence_source to be "
             "hook_id_correlated (a same-agent_id SubagentStart/SubagentStop "
             "pair with a recovered agent_transcript_path) for exit_code to "
             "remain PASS -- a marker string observed in stdout/pane text "
             "alone is never sufficient. The causal-evidence verdict itself "
             "is always recorded in schema_summary['subagent_causal_evidence'] "
-            "regardless of this flag; this flag only controls whether an "
-            "insufficient verdict is promoted to a FAIL, so every "
-            "pre-existing caller's exit_code is unchanged by default "
-            "(opt-in, backward compatible)."
+            "regardless of this flag. In the STRUCTURED lane, this "
+            "requirement is already applied BY DEFAULT (no flag needed) "
+            "whenever --expect-marker is also given, since the structured "
+            "lane always has the hook stream-json channel available; this "
+            "flag is only needed there to require the gate on structured "
+            "runs that pass no --expect-marker at all. In the INTERACTIVE "
+            "lane, and for structured runs with no --expect-marker, this "
+            "flag remains genuinely opt-in: the herdr pane text does not "
+            "structurally carry hook payload today, so pre-existing "
+            "interactive-lane callers' exit_code is unchanged by default."
         ),
     )
     parser.add_argument(
@@ -4318,8 +4324,24 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 causal_evidence = None
             schema_summary["subagent_causal_evidence"] = causal_evidence
+            # PR #2220 review fix-delta: the structured lane already has the
+            # SubagentStart/SubagentStop stream-json channel available on
+            # every invocation, so a marker-only PASS in this lane is
+            # exactly the "narrow scope without amendment" gap Issue #2183
+            # set out to close -- it must not remain opt-in-only. Whenever
+            # the caller supplies ``--expect-marker`` (i.e. the run is
+            # actually being used to assert a SubAgent produced some
+            # observable output), the structured lane now REQUIRES
+            # causal_evidence_source == hook_id_correlated by default, with
+            # no flag needed. ``--require-subagent-causal-evidence`` still
+            # exists to opt in to the same requirement for structured runs
+            # that don't use ``--expect-marker`` at all, and for the
+            # interactive lane (see below), where hook payload is not
+            # structurally available in the herdr pane text and the
+            # requirement remains genuinely opt-in.
+            causal_evidence_required = args.require_subagent_causal_evidence or bool(args.expect_marker)
             if (
-                args.require_subagent_causal_evidence
+                causal_evidence_required
                 and exit_code == EXIT_OK
                 and (
                     causal_evidence is None
@@ -4327,8 +4349,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
             ):
                 observed_source = causal_evidence["causal_evidence_source"] if causal_evidence else None
+                trigger = (
+                    "--require-subagent-causal-evidence"
+                    if args.require_subagent_causal_evidence
+                    else "--expect-marker default gate (Issue #2183 fix-delta)"
+                )
                 errors.append(
-                    "subagent causal evidence insufficient (--require-subagent-causal-evidence): "
+                    f"subagent causal evidence insufficient ({trigger}): "
                     f"causal_evidence_source={observed_source!r}"
                 )
                 exit_code = EXIT_FAIL
@@ -4447,13 +4474,19 @@ def main(argv: list[str] | None = None) -> int:
                 # Issue #2183: same structural causal-evidence verdict as
                 # the structured lane, applied here to the captured pane
                 # text. Recorded unconditionally; only gates exit_code when
-                # --require-subagent-causal-evidence is set. Honest
-                # limitation (documented, not silently worked around): the
-                # interactive lane's herdr pane is a terminal render of
-                # Claude Code's own interactive UI, which does not echo the
-                # `--include-hook-events` stream-json hook payloads this
-                # function parses -- so causal_evidence_source is expected
-                # to be no_evidence/marker_only_insufficient here today.
+                # --require-subagent-causal-evidence is set (unlike the
+                # structured lane, this stays genuinely opt-in here even
+                # when --expect-marker is given -- see PR #2220 review
+                # fix-delta). Honest limitation (documented, not silently
+                # worked around): the interactive lane's herdr pane is a
+                # terminal render of Claude Code's own interactive UI,
+                # which does not echo the `--include-hook-events`
+                # stream-json hook payloads this function parses -- so
+                # causal_evidence_source is expected to be
+                # no_evidence/marker_only_insufficient here today, and
+                # defaulting this gate to on would make every
+                # --expect-marker interactive-lane caller FAIL
+                # unconditionally, not just detect a real regression.
                 # Wiring an interactive-lane hook-output channel equivalent
                 # to the structured lane's is future work, not this Issue's
                 # scope (no new hook settings/matcher configuration here).
