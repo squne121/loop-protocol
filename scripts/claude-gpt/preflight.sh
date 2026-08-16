@@ -44,6 +44,36 @@ if [ "${1:-}" = "--env-only" ]; then
   ENV_ONLY=true
 fi
 
+# --auto-mode-check <settings_path>: Issue #2203 AC1。launcher-generated settings の
+# autoMode 設定が effective config に正しく反映されているかを `claude auto-mode config`
+# / `claude auto-mode defaults` の readback で検証する独立モード。既存の完全モード
+# （引数なし）の exit code 契約（0/3/4/5/6）や、それを subprocess 経由で駆動する既存
+# hermetic test（test_launch_strict_mcp_config_normalization.py 等、fake claude binary
+# を使う）を汚染しないよう、既定パス（launch.sh からの通常呼び出し）には組み込まず、
+# 明示的な opt-in サブコマンドとして分離する（真の起動フローへの配線は followup とする）。
+#
+# Exit code:
+#   0  = auto-mode readback 成功、$defaults 保持・narrow scope 反映・classifyAllShell
+#        有効を確認
+#   2  = 呼び出しエラー（settings_path 未指定・不存在）
+#   3  = claude バイナリが見つからない（環境不可）
+#   8  = auto-mode 未対応 version・readback mismatch・classifyAllShell 未反映
+#        （launcher バグまたは host 側の不備。fail-closed）
+if [ "${1:-}" = "--auto-mode-check" ]; then
+  AUTO_MODE_SETTINGS_PATH="${2:-}"
+  if [ -z "$AUTO_MODE_SETTINGS_PATH" ] || [ ! -f "$AUTO_MODE_SETTINGS_PATH" ]; then
+    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1","status":"blocked","reason":"settings_path_missing_or_not_found"}\n'
+    exit 2
+  fi
+  CLAUDE_BIN_FOR_CHECK=$(claude_gpt_resolve_claude_bin)
+  if [ -z "$CLAUDE_BIN_FOR_CHECK" ]; then
+    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1","status":"blocked","reason":"claude_binary_not_found"}\n'
+    exit 3
+  fi
+  claude_gpt_auto_mode_readback "$CLAUDE_BIN_FOR_CHECK" "$AUTO_MODE_SETTINGS_PATH"
+  exit "$?"
+fi
+
 CLAUDE_CONFIG_DIR_TARGET=$(claude_gpt_claude_config_dir)
 PROXY_CONFIG_DIR_TARGET=$(claude_gpt_proxy_config_dir)
 PROXY_STATE_DIR_TARGET=$(claude_gpt_proxy_state_dir)
