@@ -158,6 +158,220 @@
     "error": {
       "type": "string",
       "description": "Present only on CLI-level failure (body_file_not_found, body_read_error, repair_error). repair_action is absent in that case."
+    },
+    "structural_repair_action": {
+      "type": "object",
+      "description": "Versioned template-derived structural-repair handoff bundle (Issue #995). One producer run batches every missing/duplicate/empty/placeholder-only required template section and Machine-Readable Contract key into this single bundle. Optional/additive: absent when the producer was not invoked in structural-repair mode.",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "policy_version",
+        "issue_kind",
+        "repo",
+        "issue_number",
+        "original_body_sha256",
+        "original_updated_at",
+        "items",
+        "disposition_summary"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "structural_repair_action/v1"
+        },
+        "policy_version": {
+          "type": "string",
+          "const": "template-derived-structural-repair/v1"
+        },
+        "issue_kind": {
+          "type": "string"
+        },
+        "repo": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "issue_number": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "original_body_sha256": {
+          "type": "string"
+        },
+        "original_updated_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "field_id",
+              "label",
+              "required",
+              "template_field_order",
+              "template_path",
+              "template_digest",
+              "expected_cardinality",
+              "observed_cardinality",
+              "disposition",
+              "derivation",
+              "reason_codes",
+              "repo",
+              "issue_number",
+              "original_body_sha256",
+              "original_updated_at"
+            ],
+            "properties": {
+              "field_id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "template_field_order": {
+                "type": "integer"
+              },
+              "template_path": {
+                "type": "string"
+              },
+              "template_digest": {
+                "type": "string"
+              },
+              "expected_cardinality": {
+                "type": "integer"
+              },
+              "observed_cardinality": {
+                "type": "integer"
+              },
+              "disposition": {
+                "type": "string",
+                "enum": [
+                  "auto_apply_safe",
+                  "human_review_required"
+                ]
+              },
+              "derivation": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "template_value_exact",
+                  "source_span_exact",
+                  "derived_scalar_exact",
+                  null
+                ]
+              },
+              "reason_codes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "candidate_value": {
+                "type": "string"
+              },
+              "candidate_digest": {
+                "type": "string"
+              },
+              "source_url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_span": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "line_start": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "line_end": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                }
+              },
+              "repo": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "issue_number": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "original_body_sha256": {
+                "type": "string"
+              },
+              "original_updated_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "disposition": {
+                      "const": "auto_apply_safe"
+                    }
+                  },
+                  "required": [
+                    "disposition"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "derivation": {
+                      "type": "string",
+                      "enum": [
+                        "template_value_exact",
+                        "source_span_exact",
+                        "derived_scalar_exact"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "candidate_value",
+                    "candidate_digest"
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "disposition_summary": {
+          "type": "string",
+          "enum": [
+            "auto_apply_safe",
+            "human_review_required",
+            "no_missing_fields_detected"
+          ]
+        }
+      }
     }
   },
   "anyOf": [

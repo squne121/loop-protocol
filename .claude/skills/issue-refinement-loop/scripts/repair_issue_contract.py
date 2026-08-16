@@ -969,6 +969,480 @@ def run_repair(
 
 
 # ---------------------------------------------------------------------------
+# Template-derived structural repair (Issue #995)
+#
+# Detector / classifier / proposal producer for template-required section and
+# Machine-Readable Contract key gaps. This is a distinct concern from the
+# body-defect repairs above (escaped fences / runtime-only commands /
+# baseline-expect annotations): it reads the *resolved GitHub issue-form
+# template* (field id, label, required, default value, field order, template
+# path, immutable template-file digest) and the *issue_kind authoring SSOT*
+# (required Machine-Readable Contract keys; see
+# .claude/skills/create-issue/references/body-authoring.md) to find gaps that
+# heading-set-membership alone would miss (duplicate / empty / placeholder-only
+# / ambiguous-cardinality sections).
+#
+# Mutation-free: never calls GitHub, never writes the Issue body, never
+# dispatches items individually. A single producer run returns one versioned
+# handoff bundle listing every missing/ambiguous item in template field
+# order, then field id. #2039 (out of scope for #995) owns GitHub mutation,
+# authoritative readback, and per-item consumer classification/transaction.
+# ---------------------------------------------------------------------------
+
+STRUCTURAL_REPAIR_SCHEMA_VERSION = "structural_repair_action/v1"
+STRUCTURAL_REPAIR_POLICY_VERSION = "template-derived-structural-repair/v1"
+
+# Closed derivation-mode enum (Issue #995 Outcome). No other derivation mode
+# may ever appear on an auto_apply_safe item.
+DERIVATION_TEMPLATE_VALUE_EXACT = "template_value_exact"
+DERIVATION_SOURCE_SPAN_EXACT = "source_span_exact"
+DERIVATION_DERIVED_SCALAR_EXACT = "derived_scalar_exact"
+CLOSED_DERIVATION_MODES = frozenset({
+    DERIVATION_TEMPLATE_VALUE_EXACT,
+    DERIVATION_SOURCE_SPAN_EXACT,
+    DERIVATION_DERIVED_SCALAR_EXACT,
+})
+
+STRUCT_DISPOSITION_AUTO_APPLY_SAFE = "auto_apply_safe"
+STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED = "human_review_required"
+
+# issue_kind -> required Machine-Readable Contract YAML keys. SSOT:
+# .claude/skills/create-issue/references/body-authoring.md
+# "Machine-Readable Contract Block Guidance" section.
+REQUIRED_CONTRACT_KEYS_BY_KIND = {
+    "parent": [
+        "contract_schema_version", "issue_kind", "goal_ref", "change_kind",
+        "parent_mode", "closure_mode",
+    ],
+    "implementation": [
+        "contract_schema_version", "issue_kind", "parent_issue", "goal_ref",
+        "change_kind",
+    ],
+    "research": [
+        "contract_schema_version", "issue_kind", "parent_issue", "goal_ref",
+        "change_kind",
+    ],
+}
+
+# Template field ids whose `attributes.value` is a real, byte-exact, non-
+# placeholder default (boilerplate the template author already committed to)
+# rather than a `placeholder:`-only authoring hint. Only these field ids are
+# ever eligible for template_value_exact auto_apply_safe classification
+# (AC4). All other required fields are semantic/free-form and MUST be
+# human_review_required when missing (AC3) even though they are `required`
+# in the template.
+_TEMPLATE_VALUE_AUTO_SAFE_FIELD_IDS = frozenset({
+    "machine-readable-contract",
+    "runtime-verification-applicability",
+    "verification-commands",
+    "stop-conditions",
+    "required-skills",
+    "scope-delta",
+})
+
+# A `<required: ...>` placeholder token left un-replaced in a resolved field.
+_REQUIRED_PLACEHOLDER_RE = re.compile(r"^<required:[^>]*>$")
+
+_H2_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$")
+_FENCE_LINE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})")
+
+
+def parse_issue_template_fields(template_text: str, template_path: str) -> list[dict]:
+    """Parse a GitHub issue-form YAML template (`.github/ISSUE_TEMPLATE/*.yml`)
+    into ordered field metadata.
+
+    Each returned dict carries: field_id, label, required, value, placeholder,
+    order (0-indexed field-declaration order, `markdown` blocks excluded since
+    they are not addressable contract fields), template_path, and
+    template_digest (sha256 of the raw template file text — an immutable
+    blob-identity binding for every field extracted from it, per AC1).
+    """
+    import yaml as _yaml
+
+    template_digest = _sha256(template_text)
+    doc = _yaml.safe_load(template_text) or {}
+    body_items = doc.get("body") or []
+
+    fields: list[dict] = []
+    order = 0
+    for item in body_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "markdown":
+            continue  # informational block, not an addressable contract field
+        field_id = item.get("id")
+        if not field_id:
+            continue
+        attrs = item.get("attributes") or {}
+        validations = item.get("validations") or {}
+        fields.append({
+            "field_id": field_id,
+            "label": attrs.get("label", ""),
+            "required": bool(validations.get("required", False)),
+            "value": attrs.get("value"),
+            "placeholder": attrs.get("placeholder"),
+            "order": order,
+            "template_path": template_path,
+            "template_digest": template_digest,
+        })
+        order += 1
+    return fields
+
+
+def _parse_h2_sections(body: str) -> list[dict]:
+    """Parse top-level (``## ``) CommonMark headings, fence-aware: a line that
+    looks like a heading but occurs inside a fenced code block (```` ``` ````
+    or ``~~~``) is NOT treated as a heading (so a body containing a literal
+    ``## Foo`` inside an example fenced block is not misread).
+
+    Returns an ordered list of ``{heading, start_line, content}`` (1-indexed
+    start_line; content is the section body with leading/trailing whitespace
+    stripped, excluding the heading line itself).
+    """
+    lines = body.split("\n")
+    sections: list[dict] = []
+    current: Optional[dict] = None
+    in_fence = False
+    fence_marker: Optional[tuple[str, int]] = None
+
+    for idx, line in enumerate(lines):
+        m_fence = _FENCE_LINE_RE.match(line)
+        if m_fence:
+            marker_char = m_fence.group(2)[0]
+            marker_len = len(m_fence.group(2))
+            if not in_fence:
+                in_fence = True
+                fence_marker = (marker_char, marker_len)
+            elif (
+                fence_marker is not None
+                and marker_char == fence_marker[0]
+                and marker_len >= fence_marker[1]
+            ):
+                in_fence = False
+                fence_marker = None
+            if current is not None:
+                current["content_lines"].append(line)
+            continue
+
+        if not in_fence:
+            m = _H2_HEADING_RE.match(line)
+            if m:
+                if current is not None:
+                    sections.append(current)
+                current = {
+                    "heading": m.group(1).strip(),
+                    "start_line": idx + 1,
+                    "content_lines": [],
+                }
+                continue
+
+        if current is not None:
+            current["content_lines"].append(line)
+
+    if current is not None:
+        sections.append(current)
+
+    for section in sections:
+        section["content"] = "\n".join(section["content_lines"]).strip()
+        del section["content_lines"]
+    return sections
+
+
+def _extract_mrc_contract_keys(body: str) -> Optional[dict]:
+    """Parse the ``## Machine-Readable Contract`` fenced YAML block and return
+    its top-level keys as a dict, or ``None`` if the section, the fence, or
+    the YAML itself is missing/unparseable (never raises)."""
+    sections = _parse_h2_sections(body)
+    mrc = next((s for s in sections if s["heading"] == "Machine-Readable Contract"), None)
+    if mrc is None:
+        return None
+    m = re.search(r"```ya?ml\n(.*?)```", mrc["content"], re.DOTALL)
+    if not m:
+        return None
+    import yaml as _yaml
+    try:
+        parsed = _yaml.safe_load(m.group(1))
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _is_syntactic_scalar(value: object) -> bool:
+    """Guard for `derived_scalar_exact`: only a syntactically unique scalar
+    (issue number, `none`, a single template-order-derived label, etc.) may
+    ever be used — never prose, never a summary/interpretation."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or "\n" in s:
+            return False
+        return bool(re.fullmatch(r"#?\d+|none|N/A|[a-zA-Z][a-zA-Z0-9_/.\-]{0,63}", s))
+    return False
+
+
+def _classify_missing_field(
+    field: dict,
+    known_scalars: dict,
+    source_spans: dict,
+) -> dict:
+    """Classify a single missing required field into the closed derivation
+    enum (auto_apply_safe) or human_review_required (AC3/AC4/AC5)."""
+    field_id = field["field_id"]
+
+    value = field.get("value")
+    has_exact_template_value = value is not None and str(value).strip() != ""
+    if field_id in _TEMPLATE_VALUE_AUTO_SAFE_FIELD_IDS and has_exact_template_value:
+        candidate = str(value)
+        return {
+            "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+            "derivation": DERIVATION_TEMPLATE_VALUE_EXACT,
+            "candidate_value": candidate,
+            "candidate_digest": _sha256(candidate),
+            "reason_codes": ["template_default_value_exact"],
+        }
+
+    span_entry = source_spans.get(field_id)
+    if isinstance(span_entry, list):
+        if len(span_entry) > 1:
+            return {
+                "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+                "derivation": None,
+                "reason_codes": ["multiple_source_conflict"],
+            }
+        span_entry = span_entry[0] if span_entry else None
+    if (
+        isinstance(span_entry, dict)
+        and isinstance(span_entry.get("text"), str)
+        and span_entry["text"].strip() != ""
+    ):
+        candidate = span_entry["text"]
+        return {
+            "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+            "derivation": DERIVATION_SOURCE_SPAN_EXACT,
+            "candidate_value": candidate,
+            "candidate_digest": _sha256(candidate),
+            "source_url": span_entry.get("source_url"),
+            "source_span": {
+                "line_start": span_entry.get("line_start"),
+                "line_end": span_entry.get("line_end"),
+            },
+            "reason_codes": ["single_authoritative_source_span"],
+        }
+
+    scalar = known_scalars.get(field_id)
+    if scalar is not None and _is_syntactic_scalar(scalar):
+        candidate = str(scalar)
+        return {
+            "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+            "derivation": DERIVATION_DERIVED_SCALAR_EXACT,
+            "candidate_value": candidate,
+            "candidate_digest": _sha256(candidate),
+            "reason_codes": ["validated_syntactic_scalar"],
+        }
+
+    return {
+        "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+        "derivation": None,
+        "reason_codes": ["missing_required_field_without_exact_source"],
+    }
+
+
+def _classify_missing_contract_key(
+    key: str,
+    issue_kind: str,
+    known_scalars: dict,
+    source_spans: dict,
+    template_path: str,
+    template_digest: str,
+) -> dict:
+    """Classify a missing/placeholder Machine-Readable Contract key."""
+    if key == "contract_schema_version":
+        candidate = "v1"
+        return {
+            "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+            "derivation": DERIVATION_TEMPLATE_VALUE_EXACT,
+            "candidate_value": candidate,
+            "candidate_digest": _sha256(candidate),
+            "reason_codes": ["template_default_value_exact"],
+        }
+    if key == "issue_kind":
+        return {
+            "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+            "derivation": DERIVATION_DERIVED_SCALAR_EXACT,
+            "candidate_value": issue_kind,
+            "candidate_digest": _sha256(issue_kind),
+            "reason_codes": ["single_valid_issue_kind_scalar"],
+        }
+    synthetic_field = {"field_id": f"machine-readable-contract.{key}", "value": None}
+    return _classify_missing_field(synthetic_field, known_scalars, source_spans)
+
+
+def detect_missing_template_sections(
+    body: str,
+    *,
+    issue_kind: str,
+    template_text: str,
+    template_path: str,
+    known_scalars: Optional[dict] = None,
+    source_spans: Optional[dict] = None,
+) -> list[dict]:
+    """Detect, in a single deterministic batch, every missing / duplicate /
+    empty / placeholder-only required template-derived section and every
+    missing/placeholder Machine-Readable Contract key (AC1/AC2/AC5).
+
+    Returns items ordered by template field order, then field id (AC2).
+    Heading set membership alone is never used to assert presence: a
+    duplicate heading, an empty section, or a section containing only the
+    template's authoring placeholder is still reported (AC5).
+    """
+    known_scalars = known_scalars or {}
+    source_spans = source_spans or {}
+
+    template_fields = parse_issue_template_fields(template_text, template_path)
+    sections = _parse_h2_sections(body)
+
+    heading_index: dict[str, list[dict]] = {}
+    for section in sections:
+        heading_index.setdefault(section["heading"].strip().casefold(), []).append(section)
+
+    items: list[dict] = []
+
+    for field in template_fields:
+        if not field["required"]:
+            continue
+        norm_label = field["label"].strip().casefold()
+        matches = heading_index.get(norm_label, [])
+        observed_cardinality = len(matches)
+
+        base_item = {
+            "field_id": field["field_id"],
+            "label": field["label"],
+            "required": True,
+            "template_field_order": field["order"],
+            "template_path": field["template_path"],
+            "template_digest": field["template_digest"],
+            "expected_cardinality": 1,
+            "observed_cardinality": observed_cardinality,
+        }
+
+        if observed_cardinality > 1:
+            items.append({
+                **base_item,
+                "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+                "derivation": None,
+                "reason_codes": ["duplicate_heading"],
+            })
+            continue
+
+        if observed_cardinality == 1:
+            content = matches[0]["content"]
+            placeholder = field.get("placeholder")
+            is_empty = content == ""
+            is_placeholder_only = bool(placeholder) and content.strip() == str(placeholder).strip()
+            is_required_token = bool(_REQUIRED_PLACEHOLDER_RE.match(content.strip()))
+            if is_empty or is_placeholder_only or is_required_token:
+                items.append({
+                    **base_item,
+                    "observed_cardinality": 0,
+                    "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+                    "derivation": None,
+                    "reason_codes": ["empty_or_placeholder_only_section"],
+                })
+            continue
+
+        items.append({
+            **base_item,
+            **_classify_missing_field(field, known_scalars, source_spans),
+        })
+
+    mrc_keys = _extract_mrc_contract_keys(body)
+    required_keys = REQUIRED_CONTRACT_KEYS_BY_KIND.get(issue_kind, [])
+    template_digest = _sha256(template_text)
+    if mrc_keys is not None:
+        for key in required_keys:
+            is_missing = key not in mrc_keys
+            value = mrc_keys.get(key)
+            is_placeholder = isinstance(value, str) and bool(
+                _REQUIRED_PLACEHOLDER_RE.match(value.strip())
+            )
+            if not (is_missing or is_placeholder):
+                continue
+            items.append({
+                "field_id": f"machine-readable-contract.{key}",
+                "label": f"Machine-Readable Contract: {key}",
+                "required": True,
+                "template_field_order": -1,
+                "template_path": template_path,
+                "template_digest": template_digest,
+                "expected_cardinality": 1,
+                "observed_cardinality": 0 if is_missing else 1,
+                **_classify_missing_contract_key(
+                    key, issue_kind, known_scalars, source_spans, template_path, template_digest,
+                ),
+            })
+
+    items.sort(key=lambda i: (i["template_field_order"], i["field_id"]))
+    return items
+
+
+def build_structural_repair_bundle(
+    body: str,
+    *,
+    issue_kind: str,
+    template_text: str,
+    template_path: str,
+    repo: Optional[str] = None,
+    issue_number: Optional[int] = None,
+    original_updated_at: Optional[str] = None,
+    known_scalars: Optional[dict] = None,
+    source_spans: Optional[dict] = None,
+) -> dict:
+    """Produce the single versioned handoff bundle for one producer run
+    (AC2/AC6/AC7). Pure Python string/YAML processing only: never invokes
+    `gh`/GitHub REST/GraphQL, never writes the Issue body, never dispatches
+    items individually — #2039 (out of scope here) owns consumption.
+    """
+    original_body_sha256 = _sha256(body)
+    items = detect_missing_template_sections(
+        body,
+        issue_kind=issue_kind,
+        template_text=template_text,
+        template_path=template_path,
+        known_scalars=known_scalars,
+        source_spans=source_spans,
+    )
+    for item in items:
+        item["repo"] = repo
+        item["issue_number"] = issue_number
+        item["original_body_sha256"] = original_body_sha256
+        item["original_updated_at"] = original_updated_at
+
+    if not items:
+        disposition_summary = "no_missing_fields_detected"
+    elif any(i["disposition"] == STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED for i in items):
+        disposition_summary = STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
+    else:
+        disposition_summary = STRUCT_DISPOSITION_AUTO_APPLY_SAFE
+
+    return {
+        "schema_version": STRUCTURAL_REPAIR_SCHEMA_VERSION,
+        "policy_version": STRUCTURAL_REPAIR_POLICY_VERSION,
+        "issue_kind": issue_kind,
+        "repo": repo,
+        "issue_number": issue_number,
+        "original_body_sha256": original_body_sha256,
+        "original_updated_at": original_updated_at,
+        "items": items,
+        "disposition_summary": disposition_summary,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
