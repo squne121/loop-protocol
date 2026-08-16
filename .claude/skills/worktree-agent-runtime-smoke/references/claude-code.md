@@ -194,6 +194,78 @@ workspace/agent/focus の変化は 1 件でも検出されると run 全体が F
 negative（poison）test と、CLI 経由の end-to-end poison test（ambient snapshot が
 isolated lane 実行中に変化するケース）を追加した。
 
+## claude-gpt launcher の同一 session multi-turn / 複数 SubAgent lifecycle / proxy cleanup（Issue #2219）
+
+`--claude-adapter claude-gpt` の run では、以下 3 種類の追加証明が opt-in フラグ経由で
+可能になる。いずれも `scripts/claude-gpt/launch.sh` 自体には手を入れず、launcher が
+既に emit している stdout stream-json / stderr `KEY=value` 行を parse するだけである。
+
+### 同一 main session 内で最低 N turn（`--require-min-turns`）
+
+```bash
+claude -p --output-format stream-json --include-hook-events \
+  --no-session-persistence --max-turns "$MAX_TURNS" --verbose
+```
+
+`--max-turns >= 2` は Claude Code 自身の agentic loop に複数 turn（tool 呼び出しの
+往復）を駆動させる。各 stream-json イベントは `session_id`/`sessionId` フィールドを
+持ち、`extract_claude_stream_session_ids()` は登場順に重複排除した全ての distinct
+値を返す。`verify_same_main_session_across_turns(stdout, min_turns)` は
+（1）distinct session_id が厳密に 1 個であること、（2）`type: "assistant"` イベント数
+（`count_claude_stream_turns()`）が `min_turns` 以上であること、の両方を要求する。
+どちらか一方でも欠けると `verified: False`（fail-closed）。
+
+設計判断（選択肢 A 採用の理由）: Issue #2219 は「interactive herdr lane に
+`--additional-prompt` 相当のフラグを再実装する」選択肢 B（PR #2176 が prototype し、
+commit `5a44ebf0`/`06d8baa9` でスコープ外として revert 済み）を第一候補として挙げていた。
+しかし structured lane の既存 `--max-turns` は、単一プロセス・単一 `session_id` の
+まま複数 turn の agentic loop を既に実行しており、これは「同一 session identity の
+まま複数 turn」という AC2 の要求をそのまま満たす。選択肢 B（interactive lane への
+機能追加）を実装するコストは、500 行超の `run_interactive_herdr_isolated` を変更する
+リスクを伴う一方、追加で得られる evidentiary 価値は限定的と判断し、選択肢 A を採用した。
+
+### 複数 SubAgent の spawn/completion 証明（`--require-min-subagents`）
+
+既存の `extract_claude_hook_lifecycle_events()`（`SubagentStart`/`SubagentStop`
+hook lifecycle）と `tool_use_result.agentId`（synchronous completion）の 2 チャネルを
+そのまま再利用し、`classify_claude_multi_child_lifecycle(stdout, min_required)` が
+agent_id ごとに spawn/stop を集計する:
+
+- `spawned_agent_ids` ⊇ `completed_agent_ids` の共通部分（`paired_agent_ids`）が
+  `min_required` 以上
+- `orphan_starts`（spawn はあったが completion がない agent_id）が空
+- `unknown_children`（completion はあったが spawn がない agent_id。agent_id mismatch
+  や偽装された completion を含む）が空
+- `duplicate_completions`（同一 agent_id の completion が複数回観測された）が空
+
+いずれか 1 つでも該当すれば `verified: False` となり run は FAIL する。
+
+### 独立 proxy cleanup 再確認（launcher の全 run で自動）
+
+`launch.sh` は起動直後に stderr へ次を emit する:
+
+```
+CLAUDE_GPT_PROXY_PORT=<port>
+CLAUDE_GPT_PROXY_LOG=<log path>
+CLAUDE_GPT_PROXY_PID=<pid>
+```
+
+終了直前には次を emit する:
+
+```
+CLAUDE_GPT_PROXY_CLEANUP_OK=<true|false>
+CLAUDE_GPT_CLAUDE_EXIT_CODE=<exit code>
+```
+
+`extract_claude_gpt_proxy_sidechannel(stderr)` はこれらを parse するのみで、
+`launch.sh` 自身のクリーンアップ判定ロジックを再実装しない。
+`verify_claude_gpt_proxy_cleanup_independent(proxy_pid, proxy_port)` は
+`CLAUDE_GPT_PROXY_CLEANUP_OK` の自己申告を信用せず、`kill(pid, 0)`（プロセス生存確認）
+と `ss -ltn`（listen socket 確認）を **この runner プロセス自身が** bounded
+poll-with-retry（既定 3 回、0.5 秒間隔）で再実行する。自己申告が `true` でも
+独立再確認が clean を確認できなければ run 全体を FAIL とする（launcher の自己申告を
+権威にしない、Issue #2219 AC7）。
+
 ## 観測できる主な evidence
 
 - structured lane: `type: system/init`、`type: result`、hook lifecycle event の件数を確認できる

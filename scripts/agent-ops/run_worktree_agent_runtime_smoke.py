@@ -697,6 +697,174 @@ def extract_claude_gpt_launcher_receipt(stderr: str) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
+# ---------------------------------------------------------------------------
+# Issue #2219 AC1/AC7: claude-gpt launcher proxy stderr side-channel parsing
+# and INDEPENDENT proxy cleanup re-confirmation.
+#
+# ``scripts/claude-gpt/launch.sh`` (Out of Scope for this Issue -- confirmed
+# by prior investigation to already emit everything needed) writes fixed
+# ``KEY=value`` lines to stderr around proxy startup
+# (``CLAUDE_GPT_PROXY_PORT``/``_LOG``/``_PID``, ``launch.sh:420-424``) and
+# cleanup (``CLAUDE_GPT_PROXY_CLEANUP_OK``/``CLAUDE_GPT_CLAUDE_EXIT_CODE``,
+# ``launch.sh:548-551``). This runner only PARSES those already-emitted
+# lines; it never re-implements or duplicates the launcher's own proxy
+# lifecycle management.
+# ---------------------------------------------------------------------------
+
+
+def extract_claude_gpt_proxy_sidechannel(stderr: str) -> dict:
+    """Parse the claude-gpt launcher's stderr ``KEY=value`` proxy
+    side-channel lines (Issue #2219 AC1/AC7).
+
+    Returns ``{"proxy_port": int|None, "proxy_log": str|None, "proxy_pid":
+    int|None, "proxy_cleanup_ok_self_reported": bool|None,
+    "claude_exit_code_self_reported": int|None}``. Every field fails
+    closed to ``None`` when its line is absent or malformed -- never
+    guessed."""
+    result: dict = {
+        "proxy_port": None,
+        "proxy_log": None,
+        "proxy_pid": None,
+        "proxy_cleanup_ok_self_reported": None,
+        "claude_exit_code_self_reported": None,
+    }
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key == "CLAUDE_GPT_PROXY_PORT" and value.isdigit():
+            result["proxy_port"] = int(value)
+        elif key == "CLAUDE_GPT_PROXY_LOG" and value:
+            result["proxy_log"] = value
+        elif key == "CLAUDE_GPT_PROXY_PID" and value.isdigit():
+            result["proxy_pid"] = int(value)
+        elif key == "CLAUDE_GPT_PROXY_CLEANUP_OK":
+            if value == "true":
+                result["proxy_cleanup_ok_self_reported"] = True
+            elif value == "false":
+                result["proxy_cleanup_ok_self_reported"] = False
+        elif key == "CLAUDE_GPT_CLAUDE_EXIT_CODE" and value.lstrip("-").isdigit():
+            result["claude_exit_code_self_reported"] = int(value)
+    return result
+
+
+def _claude_gpt_proxy_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _claude_gpt_proxy_port_listening(port: int) -> bool:
+    ss = shutil.which("ss")
+    if ss is None:
+        return False
+    rc, out, _err, timed_out = _run([ss, "-ltn"], timeout=10.0)
+    if timed_out or rc != 0:
+        return False
+    needle = f":{port} "
+    return any(needle in line or line.rstrip().endswith(f":{port}") for line in out.splitlines())
+
+
+def verify_claude_gpt_proxy_cleanup_independent(
+    proxy_pid: int | None, proxy_port: int | None, *,
+    max_attempts: int = 3, sleep_seconds: float = 0.5,
+) -> dict:
+    """Bounded poll-with-retry, INDEPENDENT re-confirmation that the
+    claude-gpt launcher's proxy process/port are actually gone (Issue
+    #2219 AC7) -- never trusting
+    ``extract_claude_gpt_proxy_sidechannel``'s
+    ``proxy_cleanup_ok_self_reported`` value. Checks ``kill(pid, 0)``
+    (process liveness) and ``ss -ltn`` (listen-socket presence) directly
+    from THIS process, independent of the launcher's own already-printed
+    verdict.
+
+    When both ``proxy_pid`` and ``proxy_port`` are ``None`` (nothing to
+    check -- e.g. a non-claude-gpt-adapter run), returns ``checked:
+    False``, ``cleanup_confirmed: None``: absence of evidence is never
+    asserted as a pass.
+
+    Returns ``{"checked": bool, "pid_alive": bool|None, "port_listening":
+    bool|None, "cleanup_confirmed": bool|None, "attempts": int}``.
+    ``cleanup_confirmed`` is ``True`` only once BOTH applicable checks
+    report clean on the SAME attempt within ``max_attempts`` bounded
+    retries."""
+    if proxy_pid is None and proxy_port is None:
+        return {
+            "checked": False, "pid_alive": None, "port_listening": None,
+            "cleanup_confirmed": None, "attempts": 0,
+        }
+    attempts = 0
+    pid_alive: bool | None = None
+    port_listening: bool | None = None
+    for attempt in range(1, max_attempts + 1):
+        attempts = attempt
+        pid_alive = _claude_gpt_proxy_pid_alive(proxy_pid) if proxy_pid is not None else None
+        port_listening = _claude_gpt_proxy_port_listening(proxy_port) if proxy_port is not None else None
+        if not pid_alive and not port_listening:
+            return {
+                "checked": True, "pid_alive": pid_alive, "port_listening": port_listening,
+                "cleanup_confirmed": True, "attempts": attempts,
+            }
+        if attempt < max_attempts:
+            time.sleep(sleep_seconds)
+    return {
+        "checked": True, "pid_alive": pid_alive, "port_listening": port_listening,
+        "cleanup_confirmed": False, "attempts": attempts,
+    }
+
+
+def extract_claude_resolved_executable_sha256(resolved_executable: str | None) -> str | None:
+    """sha256 of the resolved launcher/executable FILE CONTENT (Issue #2219
+    AC1), binding evidence to the exact binary bytes actually invoked --
+    not merely its path (a path can be repointed by a symlink swap between
+    preflight and execution without a path-only claim changing). Returns
+    ``None`` when ``resolved_executable`` is ``None`` or the file cannot be
+    read (fails closed -- never a guessed/partial digest)."""
+    if not resolved_executable:
+        return None
+    try:
+        with open(resolved_executable, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def verify_evidence_not_stale(
+    evidence_tested_head: str | None,
+    evidence_repo_fingerprint: dict | None,
+    fresh_worktree_head: str | None,
+    fresh_repo_fingerprint: dict | None,
+) -> dict:
+    """Explicit rejection guard for stale-head evidence reuse (Issue #2219
+    AC10): a previously-written evidence JSON's ``tested_head`` /
+    ``repo_fingerprint`` must match a FRESH worktree HEAD/fingerprint taken
+    at verification time, or it must be rejected as PASS-ineligible --
+    never silently re-accepted just because it once passed.
+
+    Returns ``{"stale": bool, "reason": str|None}``. ``stale=True``
+    whenever either the head SHA or the fingerprint dict differs (or the
+    fresh head/fingerprint itself could not be captured -- an unverifiable
+    freshness claim is treated as stale, fail-closed)."""
+    if not fresh_worktree_head:
+        return {"stale": True, "reason": "fresh_worktree_head_unavailable"}
+    if not evidence_tested_head:
+        return {"stale": True, "reason": "evidence_tested_head_missing"}
+    if evidence_tested_head != fresh_worktree_head:
+        return {"stale": True, "reason": "tested_head_mismatch"}
+    if evidence_repo_fingerprint != fresh_repo_fingerprint:
+        return {"stale": True, "reason": "repo_fingerprint_mismatch"}
+    return {"stale": False, "reason": None}
+
+
 def run_structured_codex(worktree: str, prompt: str, timeout_seconds: float,
                           codex_bin: str = "codex") -> tuple[int | None, str, str, bool]:
     # ``-`` reads the prompt from stdin instead of argv, so the prompt text
@@ -1530,6 +1698,179 @@ def classify_claude_child_spawn_agent_id(stdout: str) -> tuple[str | None, str |
         if event["hook_event"] == "SubagentStart" and event["agent_id"]:
             return event["agent_id"], "hook_subagent_start"
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2219 AC2/AC3/AC6: multi-SubAgent lifecycle (set-operation based,
+# extending the single-child classify_claude_child_spawn_agent_id /
+# classify_claude_child_completion pair above to the multi-agent case),
+# same-main-session-across-turns verification, and forbidden-marker
+# scanning.
+# ---------------------------------------------------------------------------
+
+
+def classify_claude_multi_child_lifecycle(stdout: str, min_required: int) -> dict:
+    """Set/multiset-operation-based proof that at least ``min_required``
+    DISTINCT SubAgents were spawned AND all reached a terminal completion,
+    via agent_id EXACT pairing (Issue #2219 AC3) -- extending the existing
+    single-child ``classify_claude_child_spawn_agent_id`` /
+    ``classify_claude_child_completion`` pair (which only ever binds ONE
+    spawn id) to the multi-agent case, reusing the same two evidence
+    channels (hook lifecycle events + the ``tool_use_result`` synchronous
+    completion shape) without re-deriving their parsing.
+
+    Detects, and fails closed on, every one of the AC4 negative scenarios:
+    start-only (``orphan_starts``), stop-only / agent_id mismatch /
+    unknown child (``unknown_children``), and duplicate completion
+    (``duplicate_completions``) -- any one of these overrides
+    ``verified`` to ``False`` even when the required PAIRED count is met.
+
+    Returns ``{"verified": bool, "spawned_agent_ids": list[str],
+    "completed_agent_ids": list[str], "paired_agent_ids": list[str],
+    "orphan_starts": list[str], "unknown_children": list[str],
+    "duplicate_completions": list[str]}``."""
+    spawn_ids: list[str] = []
+    stop_ids: list[str] = []
+    for event in extract_claude_hook_lifecycle_events(stdout):
+        agent_id = event.get("agent_id")
+        if not agent_id:
+            continue
+        if event["hook_event"] == "SubagentStart":
+            spawn_ids.append(agent_id)
+        elif event["hook_event"] == "SubagentStop":
+            stop_ids.append(agent_id)
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "user":
+            continue
+        tool_use_result = payload.get("tool_use_result")
+        if not isinstance(tool_use_result, dict):
+            continue
+        agent_id = tool_use_result.get("agentId")
+        if not isinstance(agent_id, str) or not agent_id:
+            continue
+        if agent_id not in spawn_ids:
+            spawn_ids.append(agent_id)
+        if tool_use_result.get("status") == SPAWN_LAUNCH_MODE_COMPLETED:
+            stop_ids.append(agent_id)
+
+    spawned = set(spawn_ids)
+    completed = set(stop_ids)
+    duplicate_completions = sorted({aid for aid in stop_ids if stop_ids.count(aid) > 1})
+    unknown_children = sorted(completed - spawned)
+    orphan_starts = sorted(spawned - completed)
+    paired = spawned & completed
+    verified = (
+        len(paired) >= max(min_required, 1)
+        and not orphan_starts
+        and not unknown_children
+        and not duplicate_completions
+    )
+    return {
+        "verified": verified,
+        "spawned_agent_ids": sorted(spawned),
+        "completed_agent_ids": sorted(completed),
+        "paired_agent_ids": sorted(paired),
+        "orphan_starts": orphan_starts,
+        "unknown_children": unknown_children,
+        "duplicate_completions": duplicate_completions,
+    }
+
+
+def extract_claude_stream_session_ids(stdout: str) -> list[str]:
+    """Every DISTINCT ``session_id``/``sessionId`` value observed across
+    the stream-json output, IN ORDER of first appearance (Issue #2219
+    AC2) -- unlike ``extract_claude_parent_session_id`` (which returns
+    only the first value seen and stops), this sees a session id that
+    silently changed mid-stream instead of masking it."""
+    seen: list[str] = []
+    for payload in _iter_claude_stream_events(stdout):
+        for key in ("session_id", "sessionId"):
+            value = payload.get(key)
+            if isinstance(value, str) and value and value not in seen:
+                seen.append(value)
+    return seen
+
+
+def count_claude_stream_turns(stdout: str) -> int:
+    """Number of assistant-message turns observed in a single
+    structured-lane stream-json invocation (Issue #2219 AC2). Each
+    ``type: "assistant"`` event is one agentic-loop turn -- counted
+    independently of the runtime's own self-declared ``--max-turns``
+    bound, never assumed equal to it."""
+    return sum(
+        1 for payload in _iter_claude_stream_events(stdout)
+        if payload.get("type") == "assistant"
+    )
+
+
+def verify_same_main_session_across_turns(stdout: str, min_turns: int) -> dict:
+    """Fail-closed proof that the SAME main session_id persisted across at
+    least ``min_turns`` agentic-loop turns (Issue #2219 AC2).
+
+    Design choice (documented per the Issue's own two-option framing):
+    Option A -- a single ``claude -p --output-format stream-json
+    --max-turns >= min_turns`` invocation's own internal agentic loop,
+    verified via the native ``session_id`` field that is already present
+    on every stream-json event. Option B (re-implementing an
+    ``--additional-prompt``-like flag for the interactive herdr lane, as
+    PR #2176 prototyped and then reverted for scope reasons -- commits
+    5a44ebf0 / 06d8baa9) was NOT taken for this iteration: the structured
+    lane's existing ``--max-turns`` flag already drives Claude Code's own
+    multi-turn agentic loop within one process/one session, which is
+    exactly "same session identity across >= 2 turns" -- re-implementing a
+    second, interactive-lane-only multi-turn mechanism on top of that
+    would duplicate an existing, already-verifiable capability and touch
+    the large (500+ line) ``run_interactive_herdr_isolated`` interactive
+    lane for no additional evidentiary value for this AC. See the PR body
+    for the full reasoning trail.
+
+    Returns ``{"verified": bool, "turn_count": int, "session_ids_observed":
+    list[str], "lane": "option_a_single_invocation_agentic_loop"}``.
+    ``verified`` is ``True`` only when EXACTLY ONE distinct session_id was
+    observed AND ``turn_count >= min_turns``; zero or multiple distinct
+    ids, or too few turns, both fail closed to ``False`` -- never
+    guessed."""
+    session_ids = extract_claude_stream_session_ids(stdout)
+    turn_count = count_claude_stream_turns(stdout)
+    verified = len(session_ids) == 1 and turn_count >= max(min_turns, 1)
+    return {
+        "verified": verified,
+        "turn_count": turn_count,
+        "session_ids_observed": session_ids,
+        "lane": "option_a_single_invocation_agentic_loop",
+    }
+
+
+# Issue #2219 AC6: fixed, literal allowlist of forbidden failure markers.
+# Deliberately literal substring matching only -- no fuzzy/regex matching --
+# so this never over-matches unrelated text that merely resembles one of
+# these fixed strings.
+_FORBIDDEN_FAILURE_MARKERS = (
+    "403 WebSocket upgrade",
+    "WebSocket upgrade was rejected",
+    "Please run /login",
+    "early termination",
+    "context limit",
+    "auto-compaction failure",
+)
+
+
+def verify_no_forbidden_marker(
+    stdout: str, stderr: str, herdr_pane_excerpt: str | None = None
+) -> dict:
+    """Fail-closed scan for the fixed ``_FORBIDDEN_FAILURE_MARKERS``
+    allowlist (Issue #2219 AC6) across every text channel this harness
+    captures (structured lane stdout/stderr, or the interactive lane's own
+    redacted pane excerpt).
+
+    Returns ``{"verified": bool, "matched_markers": list[str]}``.
+    ``verified`` is ``True`` (PASS) only when the allowlist matched ZERO
+    markers across all supplied channels."""
+    combined = "\n".join(
+        text for text in (stdout, stderr, herdr_pane_excerpt) if isinstance(text, str)
+    )
+    matched = [marker for marker in _FORBIDDEN_FAILURE_MARKERS if marker in combined]
+    return {"verified": not matched, "matched_markers": matched}
 
 
 def extract_claude_child_agent_type_with_source(stdout: str) -> tuple[str | None, str | None]:
@@ -3487,6 +3828,47 @@ def build_parser() -> argparse.ArgumentParser:
             "by default, so every pre-existing caller's argv is unchanged."
         ),
     )
+    parser.add_argument(
+        "--require-min-subagents",
+        type=int,
+        default=0,
+        help=(
+            "Issue #2219 AC3/AC11: opt-in (default 0 = not required). When "
+            "> 0, requires at least this many DISTINCT SubAgents to be "
+            "spawned AND completed (agent_id exact pairing, "
+            "classify_claude_multi_child_lifecycle) or the run FAILs. "
+            "Applies to --runtime claude only. Omitted (0) by default, so "
+            "every pre-existing caller's behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--require-min-turns",
+        type=int,
+        default=0,
+        help=(
+            "Issue #2219 AC2/AC11: opt-in (default 0 = not required). When "
+            "> 0, requires the SAME main session_id to persist across at "
+            "least this many agentic-loop turns within a single structured "
+            "-lane invocation (verify_same_main_session_across_turns) or the "
+            "run FAILs. Requires --max-turns >= this value (validated below "
+            "as a parser.error, never silently clamped). Applies to "
+            "--runtime claude only. Omitted (0) by default, so every "
+            "pre-existing caller's behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--scan-forbidden-markers",
+        action="store_true",
+        help=(
+            "Issue #2219 AC6: opt-in (default off). When set, scans "
+            "structured-lane stdout/stderr for a fixed, literal forbidden "
+            "failure marker allowlist (verify_no_forbidden_marker) -- e.g. "
+            "'403 WebSocket upgrade', 'Please run /login' -- and FAILs if "
+            "any is observed. Applies to --runtime claude only. Omitted "
+            "(off) by default, so every pre-existing caller's behavior is "
+            "unchanged."
+        ),
+    )
     return parser
 
 
@@ -3597,6 +3979,18 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--hermetic-agent-definition requires --runtime claude")
     if args.mode != "structured" and args.hermetic_agent_definition:
         parser.error("--hermetic-agent-definition requires --mode structured")
+    if args.require_min_subagents < 0:
+        parser.error("--require-min-subagents must be >= 0")
+    if args.require_min_turns < 0:
+        parser.error("--require-min-turns must be >= 0")
+    if args.require_min_turns > 0 and args.max_turns < args.require_min_turns:
+        parser.error("--require-min-turns requires --max-turns >= --require-min-turns")
+    if args.require_min_subagents > 0 and args.runtime != "claude":
+        parser.error("--require-min-subagents requires --runtime claude")
+    if args.require_min_turns > 0 and args.runtime != "claude":
+        parser.error("--require-min-turns requires --runtime claude")
+    if args.scan_forbidden_markers and args.runtime != "claude":
+        parser.error("--scan-forbidden-markers requires --runtime claude")
 
     run_id = uuid.uuid4().hex[:12]
     errors: list[str] = []
@@ -3701,6 +4095,13 @@ def main(argv: list[str] | None = None) -> int:
     # static frontmatter fact independent of the run itself.
     tested_head = _git_rev_parse(worktree, "HEAD")
     runtime_version = capture_runtime_version(resolved_runtime_bin) if resolved_runtime_bin else None
+    # Issue #2219 AC1: sha256 of the resolved executable's FILE CONTENT,
+    # binding evidence to the exact binary bytes actually invoked.
+    resolved_executable_sha256 = (
+        extract_claude_resolved_executable_sha256(resolved_runtime_bin)
+        if resolved_runtime_bin
+        else None
+    )
     requested_agent_type = args.agent_type
     # A requested agent is a declaration, not runtime observation.  The
     # effective identity remains unavailable until the native child evidence
@@ -3752,6 +4153,7 @@ def main(argv: list[str] | None = None) -> int:
         "tested_head": tested_head,
         "runtime_version": runtime_version,
         "resolved_executable": resolved_runtime_bin,
+        "resolved_executable_sha256": resolved_executable_sha256,
         "requested_agent_type": requested_agent_type,
         "effective_agent_type": effective_agent_type,
         "loaded_skills": loaded_skills,
@@ -3882,6 +4284,30 @@ def main(argv: list[str] | None = None) -> int:
                     if args.claude_adapter == "claude-gpt"
                     else None
                 )
+                # Issue #2219 AC1/AC7: parse the launcher's own proxy
+                # stderr side-channel and INDEPENDENTLY re-confirm cleanup
+                # -- never trusting the launcher's own
+                # CLAUDE_GPT_PROXY_CLEANUP_OK self-report.
+                if args.claude_adapter == "claude-gpt":
+                    proxy_sidechannel = extract_claude_gpt_proxy_sidechannel(err)
+                    schema_summary["claude_gpt_proxy_sidechannel"] = proxy_sidechannel
+                    proxy_cleanup_independent = verify_claude_gpt_proxy_cleanup_independent(
+                        proxy_sidechannel["proxy_pid"], proxy_sidechannel["proxy_port"]
+                    )
+                    schema_summary["claude_gpt_proxy_cleanup_independent"] = proxy_cleanup_independent
+                    if (
+                        proxy_cleanup_independent["checked"]
+                        and not proxy_cleanup_independent["cleanup_confirmed"]
+                    ):
+                        errors.append(
+                            "claude-gpt proxy cleanup not independently confirmed "
+                            f"(self-reported={proxy_sidechannel['proxy_cleanup_ok_self_reported']}): "
+                            f"{proxy_cleanup_independent}"
+                        )
+                        exit_code = EXIT_FAIL
+                else:
+                    schema_summary["claude_gpt_proxy_sidechannel"] = None
+                    schema_summary["claude_gpt_proxy_cleanup_independent"] = None
                 # Issue #2046: real evidence now that stdout is captured.
                 schema_summary["main_agent_identity"] = build_main_agent_identity(args.claude_agent_name, out)
                 schema_summary["skill_evidence"] = build_skill_evidence(args.claude_agent_name, worktree, out)
@@ -3917,6 +4343,43 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["direct_web_tool_event_count"] = count_direct_web_tool_events(
                 args.runtime, out
             )
+
+            # Issue #2219 AC2/AC3/AC6: opt-in multi-SubAgent lifecycle /
+            # same-main-session-across-turns / forbidden-marker checks.
+            # Each is gated on its own opt-in flag so every pre-existing
+            # caller's evidence/exit-code behavior is unchanged.
+            if args.runtime == "claude":
+                if args.require_min_subagents > 0:
+                    multi_child_lifecycle = classify_claude_multi_child_lifecycle(
+                        out, args.require_min_subagents
+                    )
+                    schema_summary["multi_child_lifecycle"] = multi_child_lifecycle
+                    if not multi_child_lifecycle["verified"]:
+                        errors.append(
+                            "multi-SubAgent lifecycle not verified: "
+                            f"{multi_child_lifecycle}"
+                        )
+                        exit_code = EXIT_FAIL
+                if args.require_min_turns > 0:
+                    same_session_turns = verify_same_main_session_across_turns(
+                        out, args.require_min_turns
+                    )
+                    schema_summary["same_session_across_turns"] = same_session_turns
+                    if not same_session_turns["verified"]:
+                        errors.append(
+                            "same main session across >= "
+                            f"{args.require_min_turns} turns not verified: {same_session_turns}"
+                        )
+                        exit_code = EXIT_FAIL
+                if args.scan_forbidden_markers:
+                    forbidden_marker_scan = verify_no_forbidden_marker(out, err)
+                    schema_summary["forbidden_marker_scan"] = forbidden_marker_scan
+                    if not forbidden_marker_scan["verified"]:
+                        errors.append(
+                            "forbidden failure marker(s) observed: "
+                            f"{forbidden_marker_scan['matched_markers']}"
+                        )
+                        exit_code = EXIT_FAIL
 
             # Issue #1886 AC7: native, runtime-returned spawn session
             # evidence (see extractors above). ``native_spawn_event_observed``

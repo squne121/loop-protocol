@@ -42,6 +42,9 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 - `--hermetic-agent-definition`（任意。`--claude-agent-name` 併用必須。project-discovery の `--agent <name>` lookup ではなく、candidate Agent 定義から決定論的に生成した session-local `--agents` JSON payload（tools は Read のみ固定）と session-local `--settings`（mutation-capable tool を deny）で起動する hermetic no-mutation lane。Issue #2046）
 - `--claude-bin <absolute path>`（任意。`--runtime claude` 限定。claude 互換の実行ファイル（例: `scripts/claude-gpt/launch.sh` launcher）の絶対パスを明示指定する。指定時は `shutil.which("claude")` による PATH 解決を bypass し、structured lane はその絶対パスを固定 argv の実行ファイルとして直接使用する。interactive herdr lane では、herdr 自身が `--kind claude` の実行ファイルを常に自分の PATH lookup で再解決するため、isolated session 専用の一時ディレクトリに `claude` という名前の forwarder script（symlink ではない。`exec '<絶対パス>' "$@"` で実際の launcher を exec するシェルスクリプト。symlink だと `$0` が symlink 自身のパスになり、sibling `lib.sh` を `dirname -- "$0"` で source する launcher が壊れるため。PR #2176 OWNER REQUEST_CHANGES Finding 2）を生成し、`herdr workspace create --env PATH=<shim-dir>:<既存PATH>` で Herdr 自身のサーバ／root shell プロセスへ明示的に渡す（Python クライアント側の `PATH` を更新するだけでは Herdr サーバの PTY プロセスへ届かないため。Finding 1）。forwarder は起動直前に run-scoped nonce を 0600 の receipt ファイルへ書き込み、runner はその nonce を run 終了後に readback して指定 launcher が実際に実行されたことを検証する（ambient PATH 上の別 `claude` が実行された場合は receipt が観測できず FAIL する）。未指定時（既定）は既存の `shutil.which("claude")` PATH 解決が変更なく維持される（Issue #2174）。
 - `--claude-adapter native|claude-gpt`（任意。既定値 `native`。Issue #2174 AC1 fix_delta、OWNER REQUEST_CHANGES https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173 で追加。`--claude-bin` とは独立した明示入力であり、`bool(--claude-bin)` から launcher 固有挙動を暗黙適用しない。`native`（既定）: `--claude-bin`（指定時）は純粋な binary path override として扱われ、PATH 解決時と同一の固定 argv（`--settings <hook-observability-json>` を含む）で起動する。`claude-gpt`: `--claude-bin` の指定が必須（未指定なら起動前に blocked）。`scripts/claude-gpt/launch.sh` 自身の CLI 契約（自身のオプションの後に literal `--` separator、以降は claude 本体へ素通し）に従い、structured lane の固定 argv 先頭に `--` を挿入し、`--settings <JSON>` の代わりに `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop` 環境変数を設定する（launcher が `--settings` を含む policy-weakening flag を拒否するため）。launcher 自身の `CLAUDE_GPT_LAUNCH_RESULT_V1` 受理/拒否 receipt は evidence の `claude_gpt_launcher_receipt` としてそのまま記録される（Issue #2174 AC8）。`--runtime codex` と組み合わせると argparse 時点で拒否される（PR #2176 OWNER REQUEST_CHANGES Finding 6）。
+- `--require-min-subagents <int>`（任意。既定 0 = 未要求。`--runtime claude` 限定。0 より大きい値を指定すると、最低この個数の DISTINCT SubAgent が spawn かつ completion までagent_id exact pairing で確認されるまで run が FAIL する。Issue #2219 AC3）
+- `--require-min-turns <int>`（任意。既定 0 = 未要求。`--runtime claude` 限定。0 より大きい値を指定すると、単一 structured invocation 内で SAME main session_id が最低このturn 数持続することを要求し、`--max-turns` がこの値未満だと `parser.error`（起動前拒否）になる。Issue #2219 AC2/AC11）
+- `--scan-forbidden-markers`（任意。既定 off。`--runtime claude` 限定。`403 WebSocket upgrade` / `WebSocket upgrade was rejected` / `Please run /login` / `early termination` / `context limit` / `auto-compaction failure` の固定 literal allowlist を stdout/stderrから scan し、1 件でも観測されれば FAIL する。Issue #2219 AC6）
 
 `--mode interactive` は常に（オプトインではなく）、isolated interactive lane 実行の前後で、その時点で running な herdr session すべてに対して明示的に `herdr --session <name> api snapshot`（PR #2176 OWNER REQUEST_CHANGES Finding 4。デフォルト session だけでなく、人間が attach 中の named session も含めすべて明示的に snapshot する）を取得し、full snapshot（agent の kind・`terminal_id`・native `agent_session`、非 agent pane を含む全 pane record、全 tab record、空 workspace を含む全 workspace record、layout の構造）を、この run 自身が作成した isolated session を除いて完全に一致することを検証する（Issue #2174 AC7、PR #2176 OWNER REQUEST_CHANGES Finding 3）。いずれかのフィールドが取得不能な場合も fail-closed で FAIL とする（session 一覧自体が取得不能な場合も同様。空集合として扱わない）。evidence は `herdr_workspace_snapshot_diffs` / `herdr_workspace_snapshot_preserved` として記録される。なお herdr v0.8.0 の公開 `SessionInfo`（`session list`）には name と独立した `session_id` フィールドが存在しないことを実機確認済みであり、本 skill は `agent`（kind）+ `terminal_id` + native `agent_session`（kind/source/value）を実際に利用可能な最強の agent identity として扱う。
 
@@ -120,6 +123,69 @@ named session を新規生成し、その session 内だけで agent lifecycle �
 evidence が #1881（pr-reviewer persona の production settings lane）の permission
 claim へ昇格しないことを明示する。#1881 未完了時点ではこの hermetic evidence を
 production permission の根拠にしない。
+
+## claude-gpt Launcher 向け Multi-Turn / 複数 SubAgent Lifecycle Evidence（Issue #2219）
+
+`--claude-adapter claude-gpt`（`scripts/claude-gpt/launch.sh`。本 Skill は launcher の
+実装そのものを変更しない — launcher は既に proxy PID/port/log/cleanup-OK を stderr
+`KEY=value` 行として emit 済みであり、本 Skill はそれを parse するだけである）を対象に、
+以下の evidence を `summary.md` に追加で記録する:
+
+- `resolved_executable_sha256`: preflight で解決した実行ファイル（launcher 自身の
+  絶対パス、または PATH 解決された `claude`）のファイル内容 sha256。path 一致だけでなく
+  内容一致まで束縛する（Issue #2219 AC1）
+- `same_session_across_turns`（`--require-min-turns` 指定時のみ）: 単一
+  `claude -p --output-format stream-json --max-turns >= N` invocation の中で、
+  native `session_id`/`sessionId` フィールドが全 turn を通して単一値のままであることを
+  `verify_same_main_session_across_turns()` が検証する。「同一 main session 内で
+  最低 2 turn 完了する」の実装方針として、PR #2176 が prototype しスコープ判断で revert
+  した interactive herdr lane 向け `--additional-prompt` 相当フラグの再実装（選択肢 B）
+  ではなく、既存の structured lane `--max-turns` が既に駆動する agentic loop を
+  そのまま検証する方式（選択肢 A）を採用した。理由: `--max-turns` は単一プロセス・
+  単一 session 内で複数 turn の agentic loop を既に駆動しており、「同一 session
+  identity のまま複数 turn」という AC の要求を追加実装なしで満たせる一方、選択肢 B は
+  500 行超の `run_interactive_herdr_isolated` を変更する追加リスクを負う割に
+  evidentiary な上乗せが小さいため（Issue #2219 AC2）
+- `multi_child_lifecycle`（`--require-min-subagents` 指定時のみ）: 既存の単一 child
+  向け `classify_claude_child_spawn_agent_id` / `classify_claude_child_completion`
+  を集合演算で複数 agent_id へ拡張した `classify_claude_multi_child_lifecycle()` が、
+  spawn-only（`orphan_starts`）／stop-only・agent_id mismatch・unknown child
+  （`unknown_children`）／duplicate completion（`duplicate_completions`）のいずれかを
+  検出したら FAIL とする（Issue #2219 AC3/AC4）
+- `forbidden_marker_scan`（`--scan-forbidden-markers` 指定時のみ）: 固定 literal
+  allowlist に対する fuzzy match を行わない substring scan（Issue #2219 AC6）
+- `claude_gpt_proxy_sidechannel` / `claude_gpt_proxy_cleanup_independent`
+  （`--claude-adapter claude-gpt` の全 run で自動記録）: launcher が stderr へ emit
+  する `CLAUDE_GPT_PROXY_PORT`/`_LOG`/`_PID`/`CLAUDE_GPT_PROXY_CLEANUP_OK` 行を
+  `extract_claude_gpt_proxy_sidechannel()` が parse し、
+  `verify_claude_gpt_proxy_cleanup_independent()` が launcher 自身の
+  `CLAUDE_GPT_PROXY_CLEANUP_OK` 自己申告を信用せず `kill(pid, 0)` / `ss -ltn` で
+  bounded poll-with-retry（既定 3 回、0.5 秒間隔）の独立再確認を行う。自己申告が
+  `true` でも独立再確認が FAIL なら run 全体を FAIL とする（Issue #2219 AC7）
+
+`verify_evidence_not_stale()`（Issue #2219 AC10）は、過去に書き出した evidence JSON の
+`tested_head`/`repo_fingerprint` を fresh worktree HEAD/fingerprint と突き合わせ、
+不一致（または fresh 値自体が取得できない場合）を `stale: True` として拒否する明示ガード
+関数である。stale evidence の PASS への再利用を防ぐためのユーティリティ関数であり、
+runner の CLI からは呼び出されない（呼び出し元が evidence 再利用を判断する場面で使う）。
+
+## PR reviewer 向け: evidence の `tested_head` と live PR head の突き合わせ
+
+`summary.md` の `tested_head` は evidence 生成時点の worktree HEAD SHA である。
+PR reviewer は、参照された evidence が対象 PR の **現在の** head に対するものかを
+`cleanup_exec.py` の `head_oid_match` パターン（`gh pr view --json headRefOid` で
+取得した live headRefOid と、evidence 側が主張する commit SHA を文字列完全一致で
+比較する）に倣って独立検証する:
+
+```bash
+gh pr view <PR番号> --repo squne121/loop-protocol --json headRefOid --jq .headRefOid
+```
+
+この値と evidence の `tested_head` が一致しない場合、その evidence は該当 PR の
+現在の head に対する証跡ではない（stale head evidence、Issue #2219 AC10）。
+`verify_evidence_not_stale()` はこの突き合わせを worktree ローカルの fresh HEAD に
+対して行うプログラム的なガードであり、PR reviewer が行う `headRefOid` 突き合わせは
+それと独立した GitHub 側の live 確認である。
 
 ## 手順
 
