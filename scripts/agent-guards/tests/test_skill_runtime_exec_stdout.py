@@ -80,15 +80,42 @@ def _write_candidate(
         "repair_kinds": ["trailing_whitespace"],
         "reason_codes": ["trailing_whitespace_stripped"],
     }
+    # PR #2202 review fix (P0-1 follow-through / P0-2): repair_action.*
+    # carries the provenance-lane fields under the canonical schema
+    # location (not top-level), and the dual-mutation-intent hazard this
+    # arbiter guards against is signaled by the CANONICAL
+    # `contract_update` field (additionalProperties: false rejects the
+    # non-existent `contract_patch_plan` key on any real artifact).
+    repair_action["source_lane"] = "unanchored"
+    repair_action["preflight_run_identity"] = "sha256:testrun"
+    repair_action["original_updated_at"] = "2024-01-01T00:00:00Z"
+    repair_action["source_refs_digest"] = None
     preflight_result: dict = {
-        "schema": "issue_refinement_preflight_result/v1",
+        "schema_version": "refinement_preflight_result/v1",
+        "status": "needs_fix",
+        "issue_number": issue_number,
+        "repo": "squne121/loop-protocol",
+        "planner_exit_code": None,
+        "planner_fail_closed": None,
+        "next_action": "apply_deterministic_repair",
+        "must_read": [],
+        "do_not_read": [],
+        "commands": [],
+        "blockers": [],
+        "artifacts": {},
+        "hashes": {"result_core_sha256": "sha256:testrun"},
         "repair_action": repair_action,
-        "original_updated_at": "2024-01-01T00:00:00Z",
-        "result_core_sha256": "sha256:testrun",
-        "source_lane": "unanchored",
     }
     if include_contract_patch_plan:
-        preflight_result["contract_patch_plan"] = {"operations": []}
+        preflight_result["contract_update"] = {
+            "status": "applied",
+            "writes": 1,
+            "iterations": 1,
+            "final_readback": "verified",
+            "fresh_preflight": "pass",
+            "fresh_review": "pass",
+            "fresh_readiness": "pass",
+        }
     result_path = artifact_dir / "preflight_result.json"
     result_path.write_text(json.dumps(preflight_result))
     return result_path, preflight_result

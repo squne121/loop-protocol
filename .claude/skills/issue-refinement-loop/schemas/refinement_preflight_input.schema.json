@@ -49,6 +49,13 @@
           "items": {
             "type": "string"
           }
+        },
+        "updatedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "PR #2202 review fix (P0-2): optional fixture-mode GitHub Issue updatedAt, mirroring the field live mode already fetches via _fetch_issue(). Lets fixture-driven tests exercise the repair_action.apply provenance-binding original_updated_at capture without a live gh call."
         }
       }
     },

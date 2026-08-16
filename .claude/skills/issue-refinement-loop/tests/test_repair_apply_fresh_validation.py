@@ -59,13 +59,28 @@ def _write_candidate(
         "candidate_body_artifact": str(candidate_path),
         "repair_kinds": ["trailing_whitespace"],
         "reason_codes": ["trailing_whitespace_stripped"],
+        # PR #2202 review fix (P0-2): these live under repair_action.* in
+        # the canonical schema, not top-level.
+        "source_lane": source_lane,
+        "preflight_run_identity": "sha256:testrun",
+        "original_updated_at": "2024-01-01T00:00:00Z",
+        "source_refs_digest": None,
     }
     preflight_result = {
-        "schema": "issue_refinement_preflight_result/v1",
+        "schema_version": "refinement_preflight_result/v1",
+        "status": "needs_fix",
+        "issue_number": issue_number,
+        "repo": "squne121/loop-protocol",
+        "planner_exit_code": None,
+        "planner_fail_closed": None,
+        "next_action": "apply_deterministic_repair",
+        "must_read": [],
+        "do_not_read": [],
+        "commands": [],
+        "blockers": [],
+        "artifacts": {},
+        "hashes": {"result_core_sha256": "sha256:testrun"},
         "repair_action": repair_action,
-        "original_updated_at": "2024-01-01T00:00:00Z",
-        "result_core_sha256": "sha256:testrun",
-        "source_lane": source_lane,
     }
     result_path = artifact_dir / "preflight_result.json"
     result_path.write_text(json.dumps(preflight_result))

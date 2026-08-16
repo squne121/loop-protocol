@@ -349,6 +349,63 @@ def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
+# PR #2202 review fix (P0-2): producer-side provenance-lane determination
+# for repair_action.apply. Reuses the SAME control-plane-explicit-lane
+# classifier already used for scope-delta authority evidence
+# (_resolve_scope_delta_source_kind) rather than inventing a second
+# classification path, translated into the repair_action.apply vocabulary
+# (human_context/anchor/unanchored, see repair_apply_result_v1.schema.json)
+# established by the AC9 fresh-validation lane-preservation check.
+def _determine_repair_source_lane(anchor_url: "str | None", known_context: "dict | None") -> str:
+    """Resolve the repair-lane provenance the current preflight run executed
+    under: 'unanchored' (no anchor comment at all), 'human_context' (an
+    operator-labeled human-context anchor), or 'anchor' (an agent-authored /
+    unlabeled anchor)."""
+    if not anchor_url:
+        return "unanchored"
+    source_kind = _resolve_scope_delta_source_kind(
+        anchor_url,
+        human_context_comment_urls=(
+            known_context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD) if isinstance(known_context, dict) else None
+        ),
+        agent_report_comment_urls=(
+            known_context.get(_AGENT_REPORT_COMMENT_URLS_FIELD) if isinstance(known_context, dict) else None
+        ),
+    )
+    return "human_context" if source_kind == "issue_comment" else "anchor"
+
+
+def _repair_source_refs_digest(source_lane: str, anchor_url: "str | None") -> "str | None":
+    """Digest binding the source refs (anchor comment URL/id) a repair_action
+    producer run relied on. None for the unanchored lane (Issue #2039 AC3)."""
+    if source_lane == "unanchored" or not anchor_url:
+        return None
+    parsed_anchor = _parse_anchor_comment_url(anchor_url)
+    return "sha256:" + _sha256(
+        _canonical_json({"anchor_url": anchor_url, "comment_id": parsed_anchor.get("comment_id")})
+    )
+
+
+def _repair_preflight_run_identity(
+    *, issue_number: int, repo: str, original_body_sha256: str, captured_at: str, source_lane: str
+) -> str:
+    """A per-run identity for the producer run that generated a
+    repair_action candidate (Issue #2039 AC3). Deliberately independent of
+    `hashes.result_core_sha256` (which is itself computed from a
+    `result_core_for_hash` dict that MAY embed `repair_action_core` -- using
+    it here would be self-referential)."""
+    return "sha256:" + _sha256(
+        _canonical_json(
+            {
+                "issue_number": issue_number,
+                "repo": repo,
+                "original_body_sha256": original_body_sha256,
+                "captured_at": captured_at,
+                "source_lane": source_lane,
+            }
+        )
+    )
+
 
 # ---------------------------------------------------------------------------
 # Issue #2039: repair_action.apply controlled consumer -- foundational
@@ -501,7 +558,16 @@ def secure_read_repair_apply_artifact(
         raise RepairApplySecureOpenError(f"repair_apply_leaf_not_utf8:{path}:{exc}") from exc
 
     digest = hashlib.sha256(raw).hexdigest()
-    if expected_sha256 is not None and digest != expected_sha256:
+    # PR #2202 review fix (P0-2 collateral bug, found by the required
+    # canonical-producer E2E test): repair_action.*_body_sha256 fields are
+    # always "sha256:<hex>"-prefixed (see repair_issue_contract.py /
+    # classify_repair_action()), but every caller here always passed a
+    # prefixed expected_sha256 while this compared it against a bare hex
+    # digest -- so a REAL producer artifact ALWAYS failed this check
+    # (silently masked before now because every hand-built test fixture
+    # happened to pass a bare, un-prefixed expected_sha256 instead of a
+    # real repair_action's own value).
+    if expected_sha256 is not None and digest != _repair_apply_strip_sha_prefix(expected_sha256):
         raise RepairApplySecureOpenError(
             f"repair_apply_digest_mismatch:{path}:expected={expected_sha256}:actual={digest}"
         )
@@ -1116,7 +1182,7 @@ def run_repair_action_apply(
             repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
         )
 
-    raw_source_lane = parsed.get("source_lane")
+    raw_source_lane = repair_action.get("source_lane")
     source_lane = raw_source_lane if raw_source_lane in {"human_context", "anchor", "unanchored"} else "unanchored"
 
     repair_action_core_sha256 = _repair_action_core_sha256(repair_action)
@@ -1135,18 +1201,27 @@ def run_repair_action_apply(
             repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
         )
 
+    # PR #2202 review fix (P0-2): these are nested under `repair_action.*`
+    # (and `hashes.result_core_sha256`) in the canonical
+    # refinement_preflight_result_v1 schema, never top-level `parsed.*`.
+    # Reading the wrong location made every real production artifact report
+    # null/None here (run identity + updatedAt), silently disabling the
+    # provenance binding this AC exists to enforce.
     provenance = {
         "repo": repo,
         "issue_number": issue_number,
         "original_body_sha256": repair_action.get("original_body_sha256") or "",
-        "original_updated_at": parsed.get("original_updated_at"),
-        "preflight_run_identity": parsed.get("result_core_sha256") or parsed.get("preflight_run_identity"),
+        "original_updated_at": repair_action.get("original_updated_at"),
+        "preflight_run_identity": (
+            repair_action.get("preflight_run_identity")
+            or (parsed.get("hashes") if isinstance(parsed.get("hashes"), dict) else {}).get("result_core_sha256")
+        ),
         "producer_schema_version": repair_action.get("schema_version") or "repair_action/v1",
         "producer_policy_version": repair_action.get("policy_version") or "deterministic-issue-repair/v1",
         "repair_action_core_sha256": repair_action_core_sha256,
         "candidate_digest": candidate_digest,
         "source_lane": source_lane,
-        "source_refs_digest": parsed.get("source_refs_digest"),
+        "source_refs_digest": repair_action.get("source_refs_digest"),
     }
     if (
         provenance["producer_schema_version"] != "repair_action/v1"
@@ -1205,8 +1280,22 @@ def run_repair_action_apply(
     rebase_projection = {"attempted": False, "producer_reruns": 0, "drift_detected": False, "second_drift": False}
     live_body = current_issue.get("body", "") or ""
     live_body_digest = hashlib.sha256(live_body.encode("utf-8")).hexdigest()
-    drift_detected = _repair_apply_strip_sha_prefix(live_body_digest) != _repair_apply_strip_sha_prefix(
-        repair_action.get("original_body_sha256")
+    live_updated_at = current_issue.get("updatedAt")
+    # PR #2202 review fix (P0-3): body-SHA-only drift detection allows an
+    # A(t1) -> B(t2) -> A(t3) ABA sequence through undetected (body SHA
+    # matches again at t3, but the candidate was generated against the t1
+    # authority epoch, not t3). When the producer recorded a non-null
+    # original_updated_at (fresh, post-migration artifacts), ALSO compare it
+    # against the live updatedAt; either mismatch counts as drift. Historical
+    # pre-migration artifacts with a null original_updated_at fall back to
+    # the pre-existing body-SHA-only comparison (they never recorded an
+    # updatedAt to compare against).
+    expected_updated_at = provenance.get("original_updated_at")
+    updated_at_drift = expected_updated_at is not None and live_updated_at != expected_updated_at
+    drift_detected = (
+        _repair_apply_strip_sha_prefix(live_body_digest)
+        != _repair_apply_strip_sha_prefix(repair_action.get("original_body_sha256"))
+        or updated_at_drift
     )
 
     if drift_detected:
@@ -1305,7 +1394,13 @@ def run_repair_action_apply(
             )
         second_body = second_issue.get("body", "") or ""
         second_body_digest = hashlib.sha256(second_body.encode("utf-8")).hexdigest()
-        if second_body_digest != live_body_digest:
+        second_updated_at = second_issue.get("updatedAt")
+        # PR #2202 review fix (P0-3): the second (post-rerun) drift check
+        # must ALSO catch an updatedAt-only change (body text happens to
+        # match the rerun's basis again, but updatedAt advanced between the
+        # rerun's basis read and this second read) -- not just a
+        # body-digest change.
+        if second_body_digest != live_body_digest or second_updated_at != live_updated_at:
             rebase_projection["second_drift"] = True
             return _repair_apply_not_attempted_result(
                 repo=repo,
@@ -1342,9 +1437,29 @@ def run_repair_action_apply(
         repair_action = rerun_action
         current_issue = second_issue
         repair_action_core_sha256 = _repair_action_core_sha256(repair_action)
+        # PR #2202 review fix (P0-3): after a rerun, re-bind to the NEW body
+        # SHA, NEW updatedAt, a NEW run identity, and the new repair_action
+        # core/candidate digests -- while source_lane and source_refs_digest
+        # stay pinned to the values already in `provenance` (same underlying
+        # human-context/anchor lane; only the body/candidate were
+        # regenerated against the current authority epoch).
         provenance = {
             **provenance,
             "original_body_sha256": repair_action.get("original_body_sha256") or "",
+            "original_updated_at": second_updated_at,
+            "preflight_run_identity": "sha256:"
+            + _sha256(
+                _canonical_json(
+                    {
+                        "issue_number": issue_number,
+                        "repo": repo,
+                        "original_body_sha256": repair_action.get("original_body_sha256"),
+                        "original_updated_at": second_updated_at,
+                        "source_lane": provenance.get("source_lane"),
+                        "rebase": True,
+                    }
+                )
+            ),
             "repair_action_core_sha256": repair_action_core_sha256,
             "candidate_digest": candidate_digest,
         }
@@ -5550,6 +5665,24 @@ def run_preflight(
     # repair_result is included in the preflight output as repair_diagnostics (BLOCKER 1 fix).
     _repair_result = _invoke_repair(issue.get("body", "") or "")
 
+    # PR #2202 review fix (P0-2): capture the repair_action.apply provenance
+    # fields (source lane, run identity, live updatedAt, source refs digest)
+    # at THIS producer run's own capture time, so a downstream
+    # repair_action.apply consumer can bind against them instead of silently
+    # seeing null/None (the schema already carries these under
+    # `repair_action.*`; this producer previously never populated them).
+    _repair_captured_at = now or _now_iso()
+    _repair_original_updated_at = issue.get("updatedAt") if isinstance(issue, dict) else None
+    _repair_source_lane = _determine_repair_source_lane(anchor_url_for_consumer, known_context)
+    _repair_source_refs_digest_value = _repair_source_refs_digest(_repair_source_lane, anchor_url_for_consumer)
+    _repair_preflight_run_identity_value = _repair_preflight_run_identity(
+        issue_number=issue_number,
+        repo=repo,
+        original_body_sha256=_sha256(issue.get("body", "") or ""),
+        captured_at=_repair_captured_at,
+        source_lane=_repair_source_lane,
+    )
+
     # Issue #2016 iteration-3 P1-3 (OWNER adversarial review): a repair
     # subprocess-level failure must dominate a *later* planner failure.
     # Established precedence (see _apply_exit_code_mapping docstring):
@@ -6087,6 +6220,13 @@ def run_preflight(
                 "candidate_body_artifact": _candidate_body_artifact,
                 "repair_kinds": _repair_action_raw.get("repair_kinds", []),
                 "reason_codes": _repair_action_raw.get("reason_codes", []),
+                # PR #2202 review fix (P0-2): AC9 provenance-lane fields
+                # (previously always absent, silently defeating
+                # repair_action.apply's provenance binding).
+                "source_lane": _repair_source_lane,
+                "preflight_run_identity": _repair_preflight_run_identity_value,
+                "original_updated_at": _repair_original_updated_at,
+                "source_refs_digest": _repair_source_refs_digest_value,
             }
             repair_needs_fix = True
     elif _repair_changed is True and repair_artifact_path is not None:
@@ -6991,10 +7131,43 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(0)
 
     if args.apply_repair_action is not None:
+        # PR #2202 review fix (P0-2 bullet 3): the production CLI entrypoint
+        # previously never constructed `expected_provenance` at all -- only
+        # test code injected it -- so the provenance-binding check inside
+        # run_repair_action_apply() was effectively unreachable in
+        # production beyond its own always-on repo/issue self-consistency
+        # check. Derive it here from the SAME artifact's own
+        # producer-emitted provenance fields (secure-read via the same
+        # FD-based reader run_repair_action_apply() itself uses) plus the
+        # live repo/issue identity this invocation was given, so a
+        # mid-flight artifact replacement between this read and
+        # run_repair_action_apply()'s own internal read is still caught as
+        # a mismatch rather than silently accepted.
+        _cli_repo_root = _find_repo_root()
+        _cli_expected_provenance: "dict | None" = None
+        try:
+            _cli_pf_path = Path(str(args.apply_repair_action))
+            if not _cli_pf_path.is_absolute():
+                _cli_pf_path = _cli_repo_root / _cli_pf_path
+            _cli_text, _ = secure_read_repair_apply_artifact(_cli_pf_path, root=_cli_repo_root)
+            _cli_parsed = json.loads(_cli_text)
+            _cli_repair_action = _cli_parsed.get("repair_action") if isinstance(_cli_parsed, dict) else None
+            if isinstance(_cli_repair_action, dict):
+                _cli_expected_provenance = {
+                    "repo": args.repo,
+                    "issue_number": args.issue_number,
+                    "preflight_run_identity": _cli_repair_action.get("preflight_run_identity"),
+                    "original_body_sha256": _cli_repair_action.get("original_body_sha256"),
+                    "repair_action_core_sha256": _repair_action_core_sha256(_cli_repair_action),
+                }
+        except (RepairApplySecureOpenError, json.JSONDecodeError, OSError):
+            _cli_expected_provenance = None
+
         result = run_repair_action_apply(
             repo=args.repo,
             issue_number=args.issue_number,
             preflight_result_path=str(args.apply_repair_action),
+            expected_provenance=_cli_expected_provenance,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         outcome = result.get("mutation_outcome")

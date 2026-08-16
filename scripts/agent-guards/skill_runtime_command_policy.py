@@ -1248,7 +1248,12 @@ def parse_exact_skill_runtime_repair_action_apply_command(
         return None
     if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
         return None
-    if not _is_safe_repo_relative_fixture_path(preflight_result_path, root):
+    # PR #2202 review fix (P0-2): bind the artifact path to THIS Issue's own
+    # artifact tree (.claude/artifacts/issue-refinement-loop/{issue_number}/)
+    # via the Issue-scoped helper, not the generic repo-relative fixture
+    # helper -- otherwise a candidate belonging to a different Issue number
+    # (or any other repo-relative file) is accepted.
+    if not _is_safe_issue_artifact_path(preflight_result_path, root, issue_number):
         return None
     return ExactSkillRuntimeCommand(
         command_id=command_id,
