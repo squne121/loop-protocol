@@ -129,7 +129,7 @@ evidence が #1881（pr-reviewer persona の production settings lane）の perm
 claim へ昇格しないことを明示する。#1881 未完了時点ではこの hermetic evidence を
 production permission の根拠にしない。
 
-## claude-gpt Launcher 向け Multi-Turn / 複数 SubAgent Lifecycle Evidence（Issue #2219）
+## claude-gpt Launcher 向け Multi-Turn / 複数 SubAgent Lifecycle Evidence（同一セッション複数ターン・複数サブエージェント証跡、Issue #2219）
 
 `--claude-adapter claude-gpt`（`scripts/claude-gpt/launch.sh`。本 Skill は launcher の
 実装そのものを変更しない — launcher は既に proxy PID/port/log/cleanup-OK を stderr
@@ -191,7 +191,7 @@ production permission の根拠にしない。
   bounded poll-with-retry（既定 3 回、0.5 秒間隔）の独立再確認を行う。自己申告が
   `true` でも独立再確認が FAIL なら run 全体を FAIL とする（Issue #2219 AC7）
 
-### interactive lane の evidence 設計変遷（Option A → Option B(transcript) → Option 1(hook-event)）
+### interactive lane の evidence（証拠）設計変遷（選択肢 A から transcript ベースの選択肢 B を経て、現行の hook-event 方式へ移行した経緯）
 
 interactive lane の「同一 session multi-turn / 複数 SubAgent lifecycle」evidence 設計は、
 OWNER anchor 決定（Issue #2219 本文、PR #2205/#2222 コメント、2026-08-16）により
@@ -270,7 +270,7 @@ in-place で reframe された。過去の設計判断・FAIL 記録は履歴と
 関数である。stale evidence の PASS への再利用を防ぐためのユーティリティ関数であり、
 runner の CLI からは呼び出されない（呼び出し元が evidence 再利用を判断する場面で使う）。
 
-## PR reviewer 向け: evidence の `tested_head` と live PR head の突き合わせ
+## PR reviewer 向け: evidence の `tested_head` と live PR head の突き合わせ（照合手順）
 
 `summary.md` の `tested_head` は evidence 生成時点の worktree HEAD SHA である。
 PR reviewer は、参照された evidence が対象 PR の **現在の** head に対するものかを

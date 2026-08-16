@@ -194,7 +194,7 @@ workspace/agent/focus の変化は 1 件でも検出されると run 全体が F
 negative（poison）test と、CLI 経由の end-to-end poison test（ambient snapshot が
 isolated lane 実行中に変化するケース）を追加した。
 
-## claude-gpt launcher の同一 session multi-turn / 複数 SubAgent lifecycle / proxy cleanup（Issue #2219）
+## claude-gpt launcher の同一 session multi-turn / 複数 SubAgent lifecycle / proxy cleanup（Issue #2219、同一セッション複数ターン・複数サブエージェント生存確認）
 
 `--claude-adapter claude-gpt` の run では、以下 3 種類の追加証明が opt-in フラグ経由で
 可能になる。いずれも `scripts/claude-gpt/launch.sh` 自体には手を入れず、launcher が
@@ -239,7 +239,7 @@ herdr-PTY-driven な claude-gpt session が構造的にフラットな main tran
 `subagents/agent-*.meta.json` という completion field を持たない fragmentary
 metadata のみ）。下記の transcript-based 記述はこの falsify された設計判断の
 記録として保持する。現行の hook-event evidence channel の詳細は
-`### interactive lane の hook-event evidence channel（Option 1、現行）` を参照。
+`### interactive lane の hook-event evidence channel（フック事象証拠経路、選択肢 1、現行方式）` を参照。
 
 ### interactive lane の同一 session multi-turn（`--additional-prompt`、選択肢 B）
 
@@ -306,7 +306,7 @@ lane 専用で interactive lane には forward されない）ではなく、`1 
 len(--additional-prompt)` がその値以上であることが起動前に `parser.error` で
 validate される。
 
-### interactive lane の hook-event evidence channel（Option 1、現行）
+### interactive lane の hook-event evidence channel（フック事象証拠経路、選択肢 1、現行方式）
 
 `--require-min-turns`/`--require-min-subagents` のいずれかが指定された
 `--runtime claude --mode interactive` run では、`run_interactive_herdr_isolated()`
