@@ -162,7 +162,16 @@ claude_gpt_git_dirty() {
 # launcher が内部で必ず自前設定する policy flag。呼び出し側（drop-in 先の
 # runtime smoke harness 等）が `--` の後ろに同名 flag を渡して弱体化させることを拒否する
 # ためのチェック対象一覧（P1-1）。
-CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS="--settings --mcp-config --strict-mcp-config --dangerously-skip-permissions --allow-dangerously-skip-permissions"
+#
+# `--strict-mcp-config` はここに含めない（Issue #2189）。値を取らない純粋な boolean
+# flag であり、Herdr が常時付与する exact 一致トークンは launcher 自身が最終的に付与
+# する既定値と idempotent であるため、launch.sh の forbidden-flag 拒否ループの直前で
+# exact-match の pre-filter により安全に取り除く。値付き variant
+# （`--strict-mcp-config=...`）は本リストに依存せず、launch.sh 内の専用 exact-prefix
+# チェック（`--permission-mode=bypassPermissions` と同型のパターン）で個別に拒否する
+# （このリストに残すと exact トークンの pre-filter 後に到達する `=*` variant 判定と
+# 混在してしまうため、責務を分離した）。
+CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS="--settings --mcp-config --dangerously-skip-permissions --allow-dangerously-skip-permissions"
 
 # --- Canonical path safety check ---
 #

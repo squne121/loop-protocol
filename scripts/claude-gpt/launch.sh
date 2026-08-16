@@ -96,6 +96,33 @@ done
 
 # --- 以降 "$@" は `--` の後ろに来た claude 追加引数そのもの。文字列へ結合して再分割しない。 ---
 
+# --- Herdr 由来の exact --strict-mcp-config トークンの安全な pre-filter（Issue #2189）。
+#     launcher 自身が起動時に必ず --strict-mcp-config を最終 invocation へ付与する
+#     （下記 L474 相当）ため、呼び出し元（Herdr）が渡す exact 一致トークンはこの既定値と
+#     idempotent であり、下段の forbidden-flag 拒否ループより前に安全に取り除いてよい。
+#     削除対象は完全一致トークン `--strict-mcp-config` のみ（重複があれば全て削除）。
+#     値付き variant（`--strict-mcp-config=...`）、大文字小文字違い
+#     （`--Strict-Mcp-Config` 等）、部分文字列を含む別トークン
+#     （`--strict-mcp-config-evil` 等）は削除せず、下段の forbidden-flag チェックへ
+#     そのまま残す（forbidden 判定または unknown flag 判定に落ちる）。
+#     POSIX sh の positional parameter を quoted "$@" のまま for/set -- で再構築する
+#     （bash 配列・unquoted $@・`case ... *)` glob match は使わない。exact-match のみ）。
+CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED=false
+for arg in "$@"; do
+  if [ "$arg" = "--strict-mcp-config" ]; then
+    continue
+  fi
+  if [ "$CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED" = "false" ]; then
+    set -- "$arg"
+    CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED=true
+  else
+    set -- "$@" "$arg"
+  fi
+done
+if [ "$CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED" = "false" ]; then
+  set --
+fi
+
 # --- policy-weakening flag 拒否（P1-1）。呼び出し元が --settings / --mcp-config /
 #     --strict-mcp-config / --dangerously-skip-permissions で launcher の安全設定を
 #     上書きすることを拒否する。--permission-mode bypassPermissions も拒否する。 ---
@@ -119,6 +146,16 @@ for arg in "$@"; do
   case "$arg" in
     --permission-mode=bypassPermissions)
       printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"policy_weakening_flag_rejected","flag":"--permission-mode=bypassPermissions"}\n' >&2
+      exit 2
+      ;;
+  esac
+  # --strict-mcp-config=...（値付き variant。Issue #2189）。boolean flag のため
+  # 値を取る形は正当な用法ではなく、pre-filter が削除する exact トークン
+  # （値なし `--strict-mcp-config`）とは別に、この variant は forbidden のまま残す
+  # （CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS には含めず、この専用チェックで拒否する）。
+  case "$arg" in
+    --strict-mcp-config=*)
+      printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"policy_weakening_flag_rejected","flag":"--strict-mcp-config=..."}\n' >&2
       exit 2
       ;;
   esac
