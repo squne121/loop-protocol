@@ -344,6 +344,9 @@ def test_no_visual_impact_empty_surfaces_pass():
         changed_path_entries=changed_entries,
         base_registry_doc=registry_doc,
         head_registry_doc=registry_doc,
+        component_vrt_checkrun_provenance=rvi.ComponentVrtCheckrunProvenanceResult(
+            ok=True, reason_codes=[]
+        ),
     )
     verdict = _verify(decision, manifest=None, trusted_rederivation=trusted)
     assert verdict.ok is True
@@ -594,3 +597,40 @@ def test_publish_step_executes_failure_taxonomy(
     assert f"conclusion={expected_conclusion}" in gh_args
     summary = next(arg for arg in gh_args if arg.startswith("output[summary]="))
     assert expected_reason in summary
+
+
+def test_component_vrt_provenance_uses_strict_attempt_and_exact_checkrun(workflow_doc: dict):
+    """#2100: final verification receives only the trusted API join tuple."""
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    trusted = next(step for step in steps if step.get("id") == "trusted")
+    verify = next(step for step in steps if step.get("id") == "verify")
+
+    assert trusted["env"]["RUN_ID"] == "${{ github.event.workflow_run.id }}"
+    assert trusted["env"]["RUN_ATTEMPT"] == "${{ github.event.workflow_run.run_attempt }}"
+    assert "/actions/runs/${EXPECTED_RUN_ID}/attempts/${EXPECTED_RUN_ATTEMPT}/jobs" in trusted["run"]
+    assert "while :; do" in trusted["run"]
+    assert "TOTAL_COUNT" in trusted["run"]
+    assert "component_vrt_attempt_jobs.json" in trusted["run"]
+    assert '[.[] | select(.name == "component-vrt-report") | .check_run_url]' in trusted["run"]
+    assert "https://api.github.com/repos/${REPO}/check-runs/" in trusted["run"]
+    assert 'gh api "repos/${REPO}/check-runs/${CHECK_RUN_ID}"' in trusted["run"]
+    assert "checkout --ref" not in trusted["run"]
+    assert "set -euo pipefail" in trusted["run"]
+    assert "jobs total_count changed while paginating" in trusted["run"]
+    assert "incomplete jobs pagination" in trusted["run"]
+    assert '[ "${PAGE_COUNT}" -gt 0 ] ||' in trusted["run"]
+    assert "exit 1" in trusted["run"]
+    assert "UNIQUE_JOB_ID_COUNT" in trusted["run"]
+    assert "duplicate Actions job ID across attempt job pages" in trusted["run"]
+    assert 'if type == "number" and floor == . and . > 0' in trusted["run"]
+
+    assert verify["env"]["EXPECTED_WORKFLOW_RUN_ID"] == "${{ github.event.workflow_run.id }}"
+    assert verify["env"]["EXPECTED_WORKFLOW_RUN_ATTEMPT"] == "${{ github.event.workflow_run.run_attempt }}"
+    for argument in (
+        "--expected-workflow-run-id",
+        "--expected-workflow-run-attempt",
+        "--component-vrt-jobs-file",
+        "--component-vrt-check-run-file",
+        "--component-vrt-jobs-complete",
+    ):
+        assert argument in verify["run"]

@@ -1389,6 +1389,127 @@ class TrustedArtifactVerdict:
         }
 
 
+COMPONENT_VRT_CHECKRUN_NAME = "component-vrt-report"
+GITHUB_ACTIONS_APP_ID = 15368
+GITHUB_ACTIONS_APP_SLUG = "github-actions"
+
+
+@dataclass(frozen=True)
+class ComponentVrtCheckrunProvenanceResult:
+    """Result of the base-locked component-VRT job/CheckRun authentication."""
+
+    ok: bool
+    reason_codes: list[str]
+
+
+def verify_component_vrt_checkrun_provenance(
+    *,
+    check_run: object,
+    workflow_jobs: object,
+    jobs_complete: bool,
+    expected_workflow_run_id: object,
+    expected_run_attempt: object,
+    expected_head_sha: object,
+    expected_repository: object,
+) -> ComponentVrtCheckrunProvenanceResult:
+    """Fail closed unless an exact CheckRun belongs to this run *attempt*.
+
+    Both payloads are independently obtained by the base-locked consumer.
+    This deliberately verifies only cross-run/attempt substitution; a
+    candidate-controlled producer inside the same run remains #2101's
+    attestation boundary.
+    """
+    reasons: list[str] = []
+    if jobs_complete is not True:
+        reasons.append("component_vrt_jobs_incomplete")
+    if type(expected_workflow_run_id) is not int or expected_workflow_run_id <= 0:
+        reasons.append("component_vrt_expected_workflow_run_invalid")
+    if type(expected_run_attempt) is not int or expected_run_attempt <= 0:
+        reasons.append("component_vrt_expected_run_attempt_invalid")
+    if not isinstance(expected_head_sha, str) or not expected_head_sha:
+        reasons.append("component_vrt_expected_head_sha_invalid")
+    if not isinstance(expected_repository, str) or expected_repository.count("/") != 1:
+        reasons.append("component_vrt_expected_repository_invalid")
+
+    if not isinstance(workflow_jobs, list) or any(not isinstance(job, dict) for job in workflow_jobs):
+        reasons.append("component_vrt_jobs_payload_invalid")
+        matches: list[dict[str, Any]] = []
+    else:
+        job_ids: set[int] = set()
+        for candidate in workflow_jobs:
+            job_id = candidate.get("id")
+            if type(job_id) is not int or job_id <= 0:
+                reasons.append("component_vrt_job_id_invalid")
+                continue
+            if job_id in job_ids:
+                reasons.append("component_vrt_job_id_duplicate")
+                continue
+            job_ids.add(job_id)
+        matches = [job for job in workflow_jobs if job.get("name") == COMPONENT_VRT_CHECKRUN_NAME]
+    if len(matches) != 1:
+        reasons.append("component_vrt_job_cardinality_invalid")
+        job: dict[str, Any] = {}
+    else:
+        job = matches[0]
+
+    check_run_id: int | None = None
+    if not isinstance(check_run, dict):
+        reasons.append("component_vrt_check_run_payload_invalid")
+        check: dict[str, Any] = {}
+    else:
+        check = check_run
+        raw_id = check.get("id")
+        if type(raw_id) is not int or raw_id <= 0:
+            reasons.append("component_vrt_check_run_id_invalid")
+        else:
+            check_run_id = raw_id
+        if check.get("name") != COMPONENT_VRT_CHECKRUN_NAME:
+            reasons.append("component_vrt_check_run_name_mismatch")
+        if check.get("head_sha") != expected_head_sha:
+            reasons.append("component_vrt_check_run_head_sha_mismatch")
+        if check.get("status") != "completed":
+            reasons.append("component_vrt_check_run_status_invalid")
+        if check.get("conclusion") != "success":
+            reasons.append("component_vrt_check_run_conclusion_invalid")
+        app = check.get("app")
+        if not isinstance(app, dict):
+            reasons.append("component_vrt_check_run_app_invalid")
+        else:
+            if type(app.get("id")) is not int:
+                reasons.append("component_vrt_check_run_app_id_invalid")
+            elif app.get("id") != GITHUB_ACTIONS_APP_ID:
+                reasons.append("component_vrt_check_run_app_id_mismatch")
+            if not isinstance(app.get("slug"), str):
+                reasons.append("component_vrt_check_run_app_slug_invalid")
+            elif app.get("slug") != GITHUB_ACTIONS_APP_SLUG:
+                reasons.append("component_vrt_check_run_app_slug_mismatch")
+
+    if job:
+        if type(job.get("run_id")) is not int:
+            reasons.append("component_vrt_job_run_id_invalid")
+        elif job.get("run_id") != expected_workflow_run_id:
+            reasons.append("component_vrt_check_run_workflow_mismatch")
+        if type(job.get("run_attempt")) is not int:
+            reasons.append("component_vrt_job_run_attempt_invalid")
+        elif job.get("run_attempt") != expected_run_attempt:
+            reasons.append("component_vrt_check_run_attempt_mismatch")
+        if job.get("head_sha") != expected_head_sha:
+            reasons.append("component_vrt_job_head_sha_mismatch")
+        if job.get("name") != COMPONENT_VRT_CHECKRUN_NAME:
+            reasons.append("component_vrt_job_name_mismatch")
+        if job.get("conclusion") != "success":
+            reasons.append("component_vrt_job_conclusion_invalid")
+        expected_url = (
+            f"https://api.github.com/repos/{expected_repository}/check-runs/{check_run_id}"
+            if check_run_id is not None
+            else None
+        )
+        if expected_url is None or job.get("check_run_url") != expected_url:
+            reasons.append("component_vrt_job_check_run_relation_mismatch")
+
+    return ComponentVrtCheckrunProvenanceResult(ok=not reasons, reason_codes=reasons)
+
+
 @dataclass
 class TrustedRederivation:
     """Issue #2091 AC1: bundles every input the trusted consumer workflow
@@ -1432,6 +1553,11 @@ class TrustedRederivation:
     # already has `candidate_head_ref` fetched as an object).
     repo_root: Path | None = None
 
+    # Issue #2100: exact Actions attempt jobs and exact CheckRun response,
+    # both independently fetched by the base-locked consumer. Legacy callers
+    # retain their pre-#2100 behavior unless they opt into this required gate.
+    component_vrt_checkrun_provenance: ComponentVrtCheckrunProvenanceResult | None = None
+    require_component_vrt_checkrun_provenance: bool = False
 
 # --- Issue #2099 AC1/AC2 (trusted-side TS import graph transitive --------
 # reachability): a base-locked, read-only static import resolver that walks
@@ -2172,6 +2298,19 @@ def verify_trusted_artifact(
 
     if trusted_rederivation is not None:
         tr = trusted_rederivation
+        provenance = tr.component_vrt_checkrun_provenance
+        if tr.require_component_vrt_checkrun_provenance:
+            if provenance is None:
+                reasons.append("component_vrt_checkrun_provenance_missing")
+            elif not provenance.ok and not provenance.reason_codes:
+                reasons.append("component_vrt_checkrun_provenance_rejected")
+            else:
+                reasons.extend(provenance.reason_codes)
+        elif provenance is not None:
+            # Preserve legacy optional rederivation behavior while retaining
+            # any explicit provenance rejection supplied by a caller.
+            reasons.extend(provenance.reason_codes)
+
         if tr.expected_base_sha is not None and decision.get("base_sha") != tr.expected_base_sha:
             reasons.append("base_sha_mismatch")
         if tr.pr_body_raw is not None:
@@ -2292,6 +2431,40 @@ def _build_trusted_rederivation_from_args(args: argparse.Namespace) -> tuple[Tru
     "field not supplied")."""
     load_errors: list[str] = []
 
+    provenance_inputs = (
+        getattr(args, "component_vrt_jobs_file", None),
+        getattr(args, "component_vrt_check_run_file", None),
+        getattr(args, "expected_workflow_run_id", None),
+        getattr(args, "expected_workflow_run_attempt", None),
+        getattr(args, "component_vrt_jobs_complete", None),
+    )
+    if all(value is None for value in provenance_inputs):
+        component_vrt_provenance = ComponentVrtCheckrunProvenanceResult(
+            ok=False, reason_codes=["component_vrt_trusted_provenance_missing"]
+        )
+    elif any(value is None for value in provenance_inputs):
+        component_vrt_provenance = ComponentVrtCheckrunProvenanceResult(
+            ok=False, reason_codes=["component_vrt_trusted_provenance_partial"]
+        )
+    else:
+        try:
+            workflow_jobs = json.loads(Path(args.component_vrt_jobs_file).read_text(encoding="utf-8"))
+            check_run = json.loads(Path(args.component_vrt_check_run_file).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            component_vrt_provenance = ComponentVrtCheckrunProvenanceResult(
+                ok=False, reason_codes=["component_vrt_trusted_api_payload_invalid"]
+            )
+        else:
+            component_vrt_provenance = verify_component_vrt_checkrun_provenance(
+                check_run=check_run,
+                workflow_jobs=workflow_jobs,
+                jobs_complete=args.component_vrt_jobs_complete,
+                expected_workflow_run_id=args.expected_workflow_run_id,
+                expected_run_attempt=args.expected_workflow_run_attempt,
+                expected_head_sha=args.expected_head_sha,
+                expected_repository=args.expected_repository,
+            )
+
     pr_body_raw: bytes | None = None
     if args.pr_body_file and Path(args.pr_body_file).exists():
         pr_body_raw = Path(args.pr_body_file).read_bytes()
@@ -2339,6 +2512,10 @@ def _build_trusted_rederivation_from_args(args: argparse.Namespace) -> tuple[Tru
         # `git fetch --depth=1`'d this exact commit as a Git object (never a
         # working-tree checkout of it).
         candidate_head_ref=args.trusted_candidate_tree_ref,
+        component_vrt_checkrun_provenance=component_vrt_provenance,
+        # The #2100 CLI is the base-locked trusted-consumer authentication
+        # path. No caller-controlled CLI switch may disable this requirement.
+        require_component_vrt_checkrun_provenance=True,
     )
     return trusted_rederivation, load_errors
 
@@ -2652,6 +2829,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--base-ref", type=str, default=None)
     parser.add_argument("--head-ref", type=str, default=None)
+    parser.add_argument("--expected-workflow-run-id", type=int, default=None)
+    parser.add_argument("--expected-workflow-run-attempt", type=int, default=None)
+    parser.add_argument("--component-vrt-jobs-file", type=str, default=None)
+    parser.add_argument("--component-vrt-check-run-file", type=str, default=None)
+    parser.add_argument("--component-vrt-jobs-complete", action="store_true", default=None)
     parser.add_argument("--node-bin", type=str, default="node")
     parser.add_argument("--pr-body-file", type=str, default=None)
     parser.add_argument("--evidence-manifest-file", type=str, default=None)

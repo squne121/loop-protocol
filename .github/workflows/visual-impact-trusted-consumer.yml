@@ -153,9 +153,54 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           LIVE_HEAD_SHA: ${{ steps.pr.outputs.live_head_sha }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
           set -euo pipefail
           mkdir -p artifacts/trusted
+          # Issue #2100: authenticate the producer CheckRun from trusted API
+          # responses. The attempt endpoint plus the total-count loop makes an
+          # earlier run attempt or an unvisited page ineligible as evidence.
+          EXPECTED_RUN_ID="${RUN_ID:?missing workflow run id}"
+          EXPECTED_RUN_ATTEMPT="${RUN_ATTEMPT:?missing workflow run attempt}"
+          JOBS_PAGE_DIR="artifacts/trusted/component_vrt_attempt_job_pages"
+          mkdir -p "${JOBS_PAGE_DIR}"
+          PAGE=1
+          TOTAL_COUNT=""
+          COLLECTED_COUNT=0
+          while :; do
+            PAGE_FILE="${JOBS_PAGE_DIR}/page-${PAGE}.json"
+            gh api "repos/${REPO}/actions/runs/${EXPECTED_RUN_ID}/attempts/${EXPECTED_RUN_ATTEMPT}/jobs?per_page=100&page=${PAGE}" > "${PAGE_FILE}"
+            PAGE_TOTAL="$(jq -er 'if (.total_count | type) == "number" and (.total_count | floor) == .total_count and .total_count >= 0 then .total_count else error("invalid total_count") end' "${PAGE_FILE}")"
+            PAGE_COUNT="$(jq -er 'if (.jobs | type) == "array" then (.jobs | length) else error("invalid jobs") end' "${PAGE_FILE}")"
+            [ "${PAGE_COUNT}" -le 100 ] || { echo "unexpected jobs page size" >&2; exit 1; }
+            if [ -z "${TOTAL_COUNT}" ]; then
+              TOTAL_COUNT="${PAGE_TOTAL}"
+            elif [ "${TOTAL_COUNT}" != "${PAGE_TOTAL}" ]; then
+              echo "jobs total_count changed while paginating" >&2
+              exit 1
+            fi
+            COLLECTED_COUNT=$((COLLECTED_COUNT + PAGE_COUNT))
+            [ "${COLLECTED_COUNT}" -le "${TOTAL_COUNT}" ] || { echo "jobs page exceeds total_count" >&2; exit 1; }
+            if [ "${COLLECTED_COUNT}" -eq "${TOTAL_COUNT}" ]; then
+              break
+            fi
+            [ "${PAGE_COUNT}" -gt 0 ] || { echo "incomplete jobs pagination" >&2; exit 1; }
+            PAGE=$((PAGE + 1))
+          done
+          jq -s '[.[] | .jobs[]]' "${JOBS_PAGE_DIR}"/*.json > artifacts/trusted/component_vrt_attempt_jobs.json
+          COMPONENT_CHECK_RUN_URL="$(jq -er '[.[] | select(.name == "component-vrt-report") | .check_run_url] | if length == 1 and (.[0] | type) == "string" then .[0] else error("component-vrt-report cardinality or URL invalid") end' artifacts/trusted/component_vrt_attempt_jobs.json)"
+          JOB_COUNT="$(jq -er 'length' artifacts/trusted/component_vrt_attempt_jobs.json)"
+          UNIQUE_JOB_ID_COUNT="$(jq -er '[.[] | .id | if type == "number" and floor == . and . > 0 then . else error("invalid Actions job id") end] | unique | length' artifacts/trusted/component_vrt_attempt_jobs.json)"
+          [ "${JOB_COUNT}" -eq "${UNIQUE_JOB_ID_COUNT}" ] || { echo "duplicate Actions job ID across attempt job pages" >&2; exit 1; }
+
+          EXPECTED_CHECK_RUN_URL_PREFIX="https://api.github.com/repos/${REPO}/check-runs/"
+          case "${COMPONENT_CHECK_RUN_URL}" in
+            "${EXPECTED_CHECK_RUN_URL_PREFIX}"*) CHECK_RUN_ID="${COMPONENT_CHECK_RUN_URL#"${EXPECTED_CHECK_RUN_URL_PREFIX}"}" ;;
+            *) echo "component job CheckRun URL is not the canonical repository Checks path" >&2; exit 1 ;;
+          esac
+          [[ "${CHECK_RUN_ID}" =~ ^[1-9][0-9]*$ ]] || { echo "invalid CheckRun ID" >&2; exit 1; }
+          gh api "repos/${REPO}/check-runs/${CHECK_RUN_ID}" > artifacts/trusted/component_vrt_check_run.json
           LIVE_BASE_SHA="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.base.sha')"
           echo "live_base_sha=${LIVE_BASE_SHA}" >> "$GITHUB_OUTPUT"
 
@@ -210,6 +255,8 @@ jobs:
           EXPECTED_REPOSITORY: ${{ github.repository }}
           EXPECTED_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           ARTIFACT_ROOT: ${{ steps.download.outputs.artifact_root }}
+          EXPECTED_WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          EXPECTED_WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
           set -euo pipefail
           DECISION_FILE="${ARTIFACT_ROOT}/decision/visual_impact_decision_v1.json"
@@ -232,6 +279,11 @@ jobs:
             --expected-head-sha "${EXPECTED_HEAD_SHA}" \
             --expected-base-sha "${EXPECTED_BASE_SHA}" \
             --expected-repository "${EXPECTED_REPOSITORY}" \
+            --expected-workflow-run-id "${EXPECTED_WORKFLOW_RUN_ID}" \
+            --expected-workflow-run-attempt "${EXPECTED_WORKFLOW_RUN_ATTEMPT}" \
+            --component-vrt-jobs-file artifacts/trusted/component_vrt_attempt_jobs.json \
+            --component-vrt-check-run-file artifacts/trusted/component_vrt_check_run.json \
+            --component-vrt-jobs-complete \
             --expected-pr-number "${EXPECTED_PR_NUMBER}" \
             --pr-body-file artifacts/trusted/pr_body.txt \
             --changed-paths-typed-file artifacts/trusted/changed_paths_typed.json \
