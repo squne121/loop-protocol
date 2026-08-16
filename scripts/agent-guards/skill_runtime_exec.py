@@ -20,6 +20,7 @@ from typing import Iterable
 sys.dont_write_bytecode = True
 
 from skill_runtime_command_policy import (
+    GIT_SUBPROCESS_UNSET_ENV_KEYS,
     REGISTRY_REL,
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
@@ -41,6 +42,7 @@ from skill_runtime_command_policy import (
     resolve_default_branch,
     resolve_project_root,
     resolve_repo_slug,
+    reject_insteadof_rewrite,
     validate_registry_entry,
 )
 
@@ -2548,6 +2550,153 @@ def main(argv: list[str] | None = None) -> int:
     if result.stderr:
         sys.stderr.write(result.stderr)
     return result.returncode
+
+
+# ---------------------------------------------------------------------------
+# Issue #2196 (Child 1 of #2190): dedicated sanitized Git subprocess
+# execution utility. Not yet wired into any production command dispatch
+# path -- later children (#2197/#2198/#2199/#2200) are the ones that will
+# call `run_sanitized_git_subprocess` for their own dedicated Git
+# subprocesses. This Issue only establishes and self-tests the utility.
+# ---------------------------------------------------------------------------
+
+_GIT_SUBPROCESS_EXECUTABLE_CACHE: str | None = None
+
+
+def resolve_git_subprocess_executable(project_root: str) -> str:
+    """Resolve the absolute path to the trusted `git` executable exactly
+    once per process and reuse the cached value for every subsequent
+    dedicated Git subprocess invocation (Issue #2196 AC2). Resolving only
+    once (instead of re-resolving on every call, the way
+    `_resolve_child_argv`/`_resolve_trusted_executable` deliberately do for
+    `uv`/`python3` to defend against a TOCTOU venv-symlink rewrite) means a
+    PATH or symlink change made mid-session cannot silently swap which
+    `git` binary later dedicated-subprocess invocations run -- every
+    invocation within this process keeps using the exact same absolute
+    path string that was validated at first resolution.
+    """
+    global _GIT_SUBPROCESS_EXECUTABLE_CACHE
+    if _GIT_SUBPROCESS_EXECUTABLE_CACHE is None:
+        _GIT_SUBPROCESS_EXECUTABLE_CACHE = _resolve_trusted_executable("git", project_root)
+    return _GIT_SUBPROCESS_EXECUTABLE_CACHE
+
+
+def _reset_git_subprocess_executable_cache_for_tests() -> None:
+    """Test-only reset hook. Production code never needs to call this --
+    the whole point of AC2 is that the cache is never invalidated within a
+    process lifetime."""
+    global _GIT_SUBPROCESS_EXECUTABLE_CACHE
+    _GIT_SUBPROCESS_EXECUTABLE_CACHE = None
+
+
+def sanitized_git_subprocess_env(project_root: str) -> dict[str, str]:
+    """Build the environment for a dedicated Git subprocess (Issue #2196
+    AC1/AC5).
+
+    Every key in `GIT_SUBPROCESS_UNSET_ENV_KEYS` is guaranteed absent from
+    the returned mapping -- built by copying `os.environ` and excluding
+    those keys, never by overwriting them with an empty string, so no
+    caller-controlled value for any of them can survive into the child
+    process. Interactive prompting, an ambient credential helper, and
+    interactive SSH prompting are disabled (terminal prompt disabled,
+    the two askpass-style hooks cleared, SSH forced to batch mode) so the
+    subprocess can never block waiting on stdin or silently invoke an
+    ambient credential helper.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in GIT_SUBPROCESS_UNSET_ENV_KEYS
+    }
+    env["CLAUDE_PROJECT_DIR"] = project_root
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = ""
+    env["SSH_ASKPASS"] = ""
+    env["GIT_SSH_COMMAND"] = "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes"
+    return env
+
+
+def git_subprocess_trusted_hooks_dir(scratch_root: str) -> str:
+    """Return the absolute path of a trusted, verified-empty directory to
+    pin `core.hooksPath` at for every dedicated Git subprocess invocation
+    (Issue #2196 AC3). Creating it fresh under `scratch_root` and failing
+    closed if it is ever found non-empty is what guarantees no hook script
+    (attacker- or accident-placed, e.g. a repo-local
+    `.git/hooks/post-checkout`) can ever fire for a dedicated Git
+    subprocess: Git only looks for hooks inside the configured
+    `core.hooksPath`, and this directory can never contain any.
+    """
+    hooks_dir = Path(scratch_root) / ".skill-runtime-git-empty-hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    if any(hooks_dir.iterdir()):
+        raise RuntimeError("git_subprocess_trusted_hooks_dir_not_empty")
+    return str(hooks_dir)
+
+
+def run_sanitized_git_subprocess(
+    argv: list[str],
+    *,
+    cwd: str,
+    project_root: str,
+    scratch_root: str | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a dedicated, sanitized Git subprocess (Issue #2196).
+
+    `argv` is the Git subcommand and its arguments, WITHOUT the leading
+    `git` executable name (e.g. `["status", "--short"]`). This function:
+
+    1. Resolves (once, cached -- AC2) the absolute trusted `git`
+       executable.
+    2. Builds the sanitized environment (AC1/AC5): GIT_* variables in
+       `GIT_SUBPROCESS_UNSET_ENV_KEYS` are unset, interactive
+       prompting/credential helper/SSH prompting are disabled.
+    3. Fixes `core.hooksPath` at a verified-empty trusted directory (AC3)
+       via a config override on the actual command invocation, and
+       additionally disables any ambient credential helper the same way.
+    4. Fail-closed rejects the invocation before the real command runs if
+       `cwd`'s effective Git configuration declares any
+       `url.<base>.insteadOf` rewrite (AC4), by probing
+       `git config --list` first with the same sanitized environment.
+
+    Raises `GitSubprocessRewriteRejected` for step 4's rejection. Any
+    other precondition failure (e.g. an unexpected leading `git` token in
+    `argv`, or a non-empty trusted hooks directory) raises `ValueError` /
+    `RuntimeError` before any subprocess is spawned.
+    """
+    if argv and argv[0] == "git":
+        raise ValueError("argv_must_not_include_executable_name")
+    git_executable = resolve_git_subprocess_executable(project_root)
+    env = sanitized_git_subprocess_env(project_root)
+    hooks_dir = git_subprocess_trusted_hooks_dir(scratch_root or project_root)
+
+    probe = subprocess.run(
+        [git_executable, "-C", cwd, "config", "--list"],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if probe.returncode == 0:
+        reject_insteadof_rewrite(probe.stdout.splitlines())
+
+    full_argv = [
+        git_executable,
+        "-c",
+        "core.hooksPath=" + hooks_dir,
+        "-c",
+        "credential.helper=",
+        *argv,
+    ]
+    return subprocess.run(
+        full_argv,
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
 
 
 if __name__ == "__main__":

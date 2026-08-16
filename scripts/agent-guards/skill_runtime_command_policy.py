@@ -1960,3 +1960,72 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
         raise ValueError("argv_placeholder_contract_mismatch")
     if "{active_issue}" not in "".join(expected_write_roots):
         raise ValueError("active_issue_placeholder_missing")
+
+
+# ---------------------------------------------------------------------------
+# Issue #2196 (Child 1 of #2190's worktree-migration split): sanitized Git
+# subprocess execution environment policy.
+#
+# Threat model (explicitly documented per this Issue's In Scope item):
+# this policy defends against *misrouting* -- an inherited GIT_* variable,
+# an ambient `url.<base>.insteadOf` rewrite, or a repo-local
+# `.git/hooks/post-checkout` script silently firing -- from either an
+# accidentally-inherited caller environment or an ordinary local Git
+# config the dedicated subprocess did not expect. It does NOT defend
+# against a same-UID active attacker who can already set arbitrary
+# environment variables or write to this process's own filesystem: such an
+# attacker has a strictly stronger position than anything checked below.
+# ---------------------------------------------------------------------------
+
+# GIT_* environment variables that must never leak into a dedicated Git
+# subprocess's environment (Issue #2196 AC1). An inherited value for any of
+# these silently redirects git's repository/object/config discovery away
+# from the caller-specified cwd (e.g. an ambient `GIT_DIR` pointing at an
+# unrelated repository), which is exactly the misrouting class this
+# Issue's threat model targets.
+GIT_SUBPROCESS_UNSET_ENV_KEYS = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT",
+    }
+)
+
+_GIT_SUBPROCESS_INSTEADOF_CONFIG_RE = re.compile(r"^url\.(.+)\.insteadof$")
+
+
+class GitSubprocessRewriteRejected(RuntimeError):
+    """Raised when the effective Git configuration a dedicated Git
+    subprocess would see declares a `url.<base>.insteadOf` rewrite rule
+    (Issue #2196 AC4). `insteadOf` silently rewrites the resolved remote
+    URL for any command that references the rewritten base, which can
+    redirect a fetch/push to an unintended remote without the caller's
+    argv ever mentioning it -- this is rejected fail-closed before the
+    real command is ever executed."""
+
+
+def reject_insteadof_rewrite(config_lines: list[str]) -> None:
+    """Fail-closed rejection of `url.<base>.insteadOf` rewrite rules.
+
+    `config_lines` is the line-oriented output of `git config --list` (or
+    equivalent) for the *effective* configuration a dedicated Git
+    subprocess would see for its target cwd. Any `url.<base>.insteadof=...`
+    entry (key match is case-insensitive per Git's own config key
+    matching rules) raises `GitSubprocessRewriteRejected` naming the
+    offending key. Lines that do not parse as `key=value` (or that use a
+    key not matching `url.<base>.insteadof`) are ignored -- this function
+    only ever raises on a genuine insteadOf declaration, never as a side
+    effect of unrelated config content.
+    """
+    for line in config_lines:
+        if "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip().lower()
+        if _GIT_SUBPROCESS_INSTEADOF_CONFIG_RE.match(key):
+            raise GitSubprocessRewriteRejected(key)
