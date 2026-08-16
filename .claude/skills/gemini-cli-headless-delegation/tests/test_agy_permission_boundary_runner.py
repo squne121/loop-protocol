@@ -654,11 +654,30 @@ def test_main_writes_structured_exit_1_artifact_and_cleans_runtime_after_runner_
     assert MODULE.main() == 1
     artifact = json.loads((artifact_dir / "agy_permission_boundary_e2e.json").read_text())
     assert artifact["runner"]["exit_code"] == 1
-    assert artifact["cleanup"] == {
-        "temporary_processes_removed": True,
-        "loopback_servers_stopped": True,
-        "process_group_isolated": True,
-        "descendant_processes_absent": True,
+    # Issue #1997: the producer now always emits the optional-additive
+    # `temporary_tree_removal` ledger alongside the legacy boolean fields, so
+    # this asserts the legacy fields plus the new ledger's shape rather than
+    # an exact 4-key dict match.
+    assert artifact["cleanup"]["temporary_processes_removed"] is True
+    assert artifact["cleanup"]["loopback_servers_stopped"] is True
+    assert artifact["cleanup"]["process_group_isolated"] is True
+    assert artifact["cleanup"]["descendant_processes_absent"] is True
+    assert artifact["cleanup"]["temporary_tree_removal"] == {
+        "initial_result": "success",
+        "initial_exception_type": None,
+        "initial_errno": None,
+        "initial_errno_name": None,
+        "initial_operation": None,
+        "path_class": None,
+        "relative_path_digest": None,
+        "residual_observation": {"status": "not_run", "entry_count": None, "holder_status": "not_checked"},
+        "retry_policy_mode": "single_retry_enabled",
+        "retry_eligible": False,
+        "retry_count": 0,
+        "retry_result": "not_run",
+        "final_cleanup_verdict": "removed",
+        "postcondition_absent": True,
+        "producer_contract_revision": MODULE.PRODUCER_CONTRACT_REVISION,
     }
     assert not list(artifact_dir.glob("agy-boundary-*"))
 
