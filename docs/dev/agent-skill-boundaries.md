@@ -2774,7 +2774,7 @@ blind spot になる）。
   producer を特定した上で再度対応を検討する。証跡のない事前の blanket exemption は
   行わない。
 
-## claude-gpt launcher の auto mode second-gate boundary (#2203)
+## claude-gpt launcher における auto mode の second-gate 境界（Issue #2203）
 
 `scripts/claude-gpt/launch.sh` が生成する launcher-owned `--settings` の
 `autoMode`（`environment` / `allow` / `classifyAllShell: true`）は、Claude Code の
