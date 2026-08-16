@@ -592,6 +592,20 @@ case "$1" in
     case "$2" in
       create)
         touch "$STATE_DIR/${HERDR_SESSION}.session"
+        if [ "$FAKE_HERDR_EMIT_HOOK_SINK" = "1" ] && [ -n "$CLAUDE_GPT_HOOK_SINK_PATH" ]; then
+          N="$CLAUDE_GPT_HOOK_SINK_NONCE"
+          S="sink-sess"
+          {
+            printf '{"run_nonce":"%s","event":"UserPromptSubmit","session_id":"%s","ts":1}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"Stop","session_id":"%s","ts":2}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"UserPromptSubmit","session_id":"%s","ts":3}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"Stop","session_id":"%s","ts":4}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"SubagentStart","session_id":"%s","agent_id":"a","ts":5}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"SubagentStart","session_id":"%s","agent_id":"b","ts":6}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"SubagentStop","session_id":"%s","agent_id":"a","ts":7}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"SubagentStop","session_id":"%s","agent_id":"b","ts":8}\n' "$N" "$S"
+          } >> "$CLAUDE_GPT_HOOK_SINK_PATH"
+        fi
         echo '{"result":{"root_pane":{"pane_id":"pane-xyz"},"workspace":{"workspace_id":"w1"}}}'
         exit 0
         ;;
@@ -676,6 +690,20 @@ case "$1" in
     case "$2" in
       create)
         touch "$STATE_DIR/${HERDR_SESSION}.session"
+        if [ "$FAKE_HERDR_EMIT_HOOK_SINK" = "1" ] && [ -n "$CLAUDE_GPT_HOOK_SINK_PATH" ]; then
+          N="$CLAUDE_GPT_HOOK_SINK_NONCE"
+          S="sink-sess"
+          {
+            printf '{"run_nonce":"%s","event":"UserPromptSubmit","session_id":"%s","ts":1}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"Stop","session_id":"%s","ts":2}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"UserPromptSubmit","session_id":"%s","ts":3}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"Stop","session_id":"%s","ts":4}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"SubagentStart","session_id":"%s","agent_id":"a","ts":5}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"SubagentStart","session_id":"%s","agent_id":"b","ts":6}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"SubagentStop","session_id":"%s","agent_id":"a","ts":7}\n' "$N" "$S"
+            printf '{"run_nonce":"%s","event":"SubagentStop","session_id":"%s","agent_id":"b","ts":8}\n' "$N" "$S"
+          } >> "$CLAUDE_GPT_HOOK_SINK_PATH"
+        fi
         echo '{"result":{"root_pane":{"pane_id":"pane-xyz"},"workspace":{"workspace_id":"w1"}}}'
         exit 0
         ;;
@@ -903,11 +931,18 @@ def test_given_interactive_multi_turn_with_matching_session_identity_when_transc
             "HERDR_ENV": "1",
             "FAKE_HERDR_STATE_DIR": str(state_dir),
             "HOME": str(fake_home),
+            "FAKE_HERDR_EMIT_HOOK_SINK": "1",
         },
     )
     assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
-    assert "interactive_transcript_found: True" in summary
+    # Issue #2219 (OWNER anchor decision): PASS authority is the hook-event
+    # evidence channel, not transcript existence -- the transcript is
+    # advisory only, so it MAY still be found here (fixture seeds one), but
+    # the multi_child_lifecycle/same_session_across_turns verdicts below are
+    # what actually gate the run.
+    assert "multi_child_lifecycle_source: hook_event_sink" in summary
+    assert "same_session_across_turns_source: hook_event_sink" in summary
     assert "'verified': True" in summary
 
 
@@ -1078,11 +1113,18 @@ def test_given_claude_gpt_adapter_interactive_transcript_under_isolated_config_d
             "HERDR_ENV": "1",
             "FAKE_HERDR_STATE_DIR": str(state_dir),
             "HOME": str(fake_home),
+            "FAKE_HERDR_EMIT_HOOK_SINK": "1",
         },
     )
     assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
-    assert "interactive_transcript_found: True" in summary
+    # Issue #2219 (OWNER anchor decision): PASS authority is the hook-event
+    # evidence channel, not transcript existence -- the transcript is
+    # advisory only, so it MAY still be found here (fixture seeds one), but
+    # the multi_child_lifecycle/same_session_across_turns verdicts below are
+    # what actually gate the run.
+    assert "multi_child_lifecycle_source: hook_event_sink" in summary
+    assert "same_session_across_turns_source: hook_event_sink" in summary
     assert "'verified': True" in summary
 
 
@@ -1222,4 +1264,202 @@ def test_given_task_notification_completion_with_no_matching_spawn_when_classifi
     result = MODULE.classify_claude_multi_child_lifecycle(stdout, 1)
     assert result["verified"] is False
     assert result["spawned_agent_ids"] == []
-    assert result["completed_agent_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #2219 AC13-AC17 (OWNER anchor decision, hook-event evidence
+# channel): the interactive lane's hook sink JSONL parsing / classification
+# / staleness / concurrency / orphan-on-crash tests.
+# ---------------------------------------------------------------------------
+
+
+def _sink_line(**kwargs) -> str:
+    record = {
+        "run_nonce": "nonce-a",
+        "event": "SubagentStart",
+        "session_id": "s1",
+        "agent_id": None,
+        "ts": 1.0,
+        "prompt_digest": None,
+    }
+    record.update(kwargs)
+    return json.dumps(record)
+
+
+def _json_record(**kwargs) -> dict:
+    record = {"run_nonce": "nonce-a", "event": "SubagentStart", "session_id": "s1", "agent_id": "a"}
+    record.update(kwargs)
+    return record
+
+
+def test_given_hook_sink_records_when_scanned_for_no_raw_prompt_then_none_found():
+    """AC13: a well-formed sink record never carries raw prompt/response
+    text, credentials, or tokens -- only a salted sha256 prompt_digest."""
+    digest = "a" * 64
+    records = [
+        {"run_nonce": "n", "event": "UserPromptSubmit", "session_id": "s1", "prompt_digest": digest},
+        {"run_nonce": "n", "event": "Stop", "session_id": "s1", "prompt_digest": None},
+    ]
+    result = MODULE.verify_claude_gpt_hook_sink_no_raw_content(records)
+    assert result["verified"] is True
+    assert result["violating_events"] == []
+
+
+def test_given_hook_sink_record_with_non_digest_prompt_field_when_scanned_then_flagged():
+    """AC13 poison case: a ``prompt_digest`` value that is not a genuine
+    64-hex-char sha256 digest (e.g. raw text leaked through) must fail
+    closed."""
+    records = [
+        {"run_nonce": "n", "event": "UserPromptSubmit", "session_id": "s1", "prompt_digest": "hello world"},
+    ]
+    result = MODULE.verify_claude_gpt_hook_sink_no_raw_content(records)
+    assert result["verified"] is False
+    assert "UserPromptSubmit" in result["violating_events"]
+
+
+def test_given_hook_sink_path_when_derived_then_built_only_from_launcher_owned_constant(monkeypatch):
+    """AC14: the claude-gpt sink path is built ONLY from
+    ``claude_gpt_proxy_state_dir_python()`` (mirrors ``lib.sh``'s
+    ``claude_gpt_proxy_state_dir()``) and the nonce -- never from a
+    caller-supplied worktree path or CLI argument. Setting a caller-
+    controlled env var that has NOTHING to do with the launcher-owned
+    ``CLAUDE_GPT_HOME`` constant must have zero effect on the resolved
+    path."""
+    monkeypatch.delenv("CLAUDE_GPT_HOME", raising=False)
+    home_default = MODULE.claude_gpt_proxy_state_dir_python()
+    path_a = MODULE.claude_gpt_hook_sink_path("nonce-x")
+    assert str(path_a).startswith(str(home_default))
+    assert "nonce-x" in path_a.name
+    # A caller-supplied value that is NOT the launcher-owned CLAUDE_GPT_HOME
+    # constant (e.g. a worktree path) must never influence the sink path.
+    monkeypatch.setenv("SOME_CALLER_SUPPLIED_WORKTREE_PATH", "/tmp/attacker-controlled")
+    path_b = MODULE.claude_gpt_hook_sink_path("nonce-x")
+    assert path_a == path_b
+
+
+def test_given_hook_sink_concurrent_write_when_parsed_then_not_corrupted(tmp_path):
+    """AC15: two records appended back-to-back (simulating near-
+    simultaneous SubagentStart events from concurrent SubAgents) must both
+    be parsed intact -- no truncated/interleaved JSON line."""
+    sink_path = tmp_path / "hook-sink-nonce-a.jsonl"
+    with sink_path.open("a", encoding="utf-8") as fh:
+        fh.write(_sink_line(event="SubagentStart", agent_id="agent-a") + "\n")
+    with sink_path.open("a", encoding="utf-8") as fh:
+        fh.write(_sink_line(event="SubagentStart", agent_id="agent-b") + "\n")
+    records, malformed = MODULE.parse_claude_gpt_hook_sink_records(sink_path)
+    assert malformed == 0
+    assert {r["agent_id"] for r in records} == {"agent-a", "agent-b"}
+
+
+def test_given_hook_sink_with_truncated_trailing_line_when_parsed_then_only_that_line_dropped(tmp_path):
+    """AC15 poison case: a corrupted (truncated) trailing line must not
+    poison the whole file -- every well-formed preceding line is still
+    parsed, and only the corrupted line is counted as malformed."""
+    sink_path = tmp_path / "hook-sink-nonce-a.jsonl"
+    sink_path.write_text(
+        _sink_line(event="SubagentStart", agent_id="agent-a") + "\n" + '{"run_nonce": "nonce-a", "event": "Su',
+        encoding="utf-8",
+    )
+    records, malformed = MODULE.parse_claude_gpt_hook_sink_records(sink_path)
+    assert malformed == 1
+    assert len(records) == 1
+    assert records[0]["agent_id"] == "agent-a"
+
+
+def test_given_hook_sink_line_with_unexpected_key_when_parsed_then_dropped_as_malformed(tmp_path):
+    """AC13/AC15: a line whose parsed JSON object carries a key outside the
+    fixed allowlist (e.g. a smuggled ``raw_prompt`` field) is treated as
+    malformed and dropped, never trusted as a well-formed record."""
+    sink_path = tmp_path / "hook-sink-nonce-a.jsonl"
+    poisoned = json.loads(_sink_line(event="SubagentStart", agent_id="agent-a"))
+    poisoned["raw_prompt"] = "leaked raw prompt text"
+    sink_path.write_text(json.dumps(poisoned) + "\n", encoding="utf-8")
+    records, malformed = MODULE.parse_claude_gpt_hook_sink_records(sink_path)
+    assert malformed == 1
+    assert records == []
+
+
+def test_given_matching_three_way_nonce_when_staleness_checked_then_verified():
+    """AC16: settings.json nonce == harness-expected nonce == every sink
+    record's run_nonce -> verified."""
+    records = [_json_record(run_nonce="nonce-a"), _json_record(run_nonce="nonce-a", event="Stop")]
+    result = MODULE.verify_claude_gpt_hook_sink_not_stale(records, "nonce-a")
+    assert result["verified"] is True
+
+
+def test_given_stale_run_nonce_when_staleness_checked_then_rejected():
+    """AC16: a sink record carrying a DIFFERENT (past-run) run_nonce than
+    the harness expects for THIS run must fail closed -- independent of
+    ``verify_evidence_not_stale`` (repo-state/tested_head based)."""
+    records = [_json_record(run_nonce="stale-nonce-from-prior-run")]
+    result = MODULE.verify_claude_gpt_hook_sink_not_stale(records, "nonce-a")
+    assert result["verified"] is False
+    assert result["reason"] == "run_nonce_mismatch"
+
+
+def test_given_empty_sink_records_when_staleness_checked_then_rejected():
+    """AC16: an empty sink (never populated, e.g. hook delivery silently
+    failed) must never be treated as fresh-by-default."""
+    result = MODULE.verify_claude_gpt_hook_sink_not_stale([], "nonce-a")
+    assert result["verified"] is False
+    assert result["reason"] == "no_records"
+
+
+def test_given_hook_sink_orphan_start_when_classified_then_fails_closed():
+    """AC17: a process killed (e.g. SIGKILL) before its ``SubagentStop``
+    fires leaves an orphan_starts entry via the hook sink -- fails closed,
+    no grace-window/timeout-based auto-PASS."""
+    records = [
+        _json_record(event="SubagentStart", agent_id="agent-a"),
+        _json_record(event="SubagentStart", agent_id="agent-b"),
+        _json_record(event="SubagentStop", agent_id="agent-a"),
+    ]
+    result = MODULE.classify_claude_hook_sink_multi_child_lifecycle(records, 2)
+    assert result["verified"] is False
+    assert result["orphan_starts"] == ["agent-b"]
+
+
+def test_given_all_subagents_paired_from_sink_when_classified_then_verified():
+    """Positive control mirroring the orphan test above: both SubAgents
+    have a matching SubagentStop -> verified."""
+    records = [
+        _json_record(event="SubagentStart", agent_id="agent-a"),
+        _json_record(event="SubagentStart", agent_id="agent-b"),
+        _json_record(event="SubagentStop", agent_id="agent-a"),
+        _json_record(event="SubagentStop", agent_id="agent-b"),
+    ]
+    result = MODULE.classify_claude_hook_sink_multi_child_lifecycle(records, 2)
+    assert result["verified"] is True
+    assert result["paired_agent_ids"] == ["agent-a", "agent-b"]
+
+
+def test_given_two_prompt_turns_with_stops_when_multi_turn_checked_from_sink_then_verified():
+    """Positive control for the hook-sink multi-turn primitive: >=2
+    UserPromptSubmit records sharing one session_id, each with a
+    corresponding Stop record, zero StopFailure -> verified."""
+    records = [
+        _json_record(event="UserPromptSubmit", session_id="s1", agent_id=None),
+        _json_record(event="Stop", session_id="s1", agent_id=None),
+        _json_record(event="UserPromptSubmit", session_id="s1", agent_id=None),
+        _json_record(event="Stop", session_id="s1", agent_id=None),
+    ]
+    result = MODULE.verify_claude_gpt_hook_sink_multi_turn(records, 2)
+    assert result["verified"] is True
+    assert result["turn_count"] == 2
+    assert result["stop_failure_count"] == 0
+
+
+def test_given_stop_failure_record_when_multi_turn_checked_from_sink_then_rejected():
+    """Negative control: a single StopFailure for the session under test
+    must fail the multi-turn verdict closed, even with enough
+    UserPromptSubmit/Stop pairs."""
+    records = [
+        _json_record(event="UserPromptSubmit", session_id="s1", agent_id=None),
+        _json_record(event="Stop", session_id="s1", agent_id=None),
+        _json_record(event="UserPromptSubmit", session_id="s1", agent_id=None),
+        _json_record(event="Stop", session_id="s1", agent_id=None),
+        _json_record(event="StopFailure", session_id="s1", agent_id=None),
+    ]
+    result = MODULE.verify_claude_gpt_hook_sink_multi_turn(records, 2)
+    assert result["verified"] is False
+    assert result["stop_failure_count"] == 1

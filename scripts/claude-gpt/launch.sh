@@ -260,12 +260,96 @@ MCP_JSON_EOF
 #     既存の CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS(--settings 等 CLI 引数拒否)とは独立した経路であり、
 #     それを変更・弱体化するものではない。 ---
 HOOKS_JSON_FRAGMENT=""
+ENV_JSON_FRAGMENT=""
 if [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-start-stop" ]; then
   HOOKS_JSON_FRAGMENT=',
   "hooks": {
     "SubagentStart": [{"hooks": [{"type": "command", "command": "cat"}]}],
     "SubagentStop": [{"hooks": [{"type": "command", "command": "cat"}]}]
   }'
+elif [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "hook-sink-multi-turn" ]; then
+  # --- Issue #2219 (OWNER anchor decision, hook-event evidence channel).
+  #     Narrow addition to the same fixed-value gate above: a SECOND fixed
+  #     value that ALSO registers UserPromptSubmit/Stop/StopFailure hooks
+  #     (in addition to SubagentStart/SubagentStop), all pointed at a
+  #     durable, run-nonce-keyed, O_EXCL-created append-only JSONL sink
+  #     whose path is built ONLY from the launcher-owned
+  #     `claude_gpt_proxy_state_dir()` constant plus the caller-supplied
+  #     nonce -- never from any other caller-supplied value. The hook
+  #     command string itself is FIXED (no caller-supplied string is ever
+  #     interpolated into it); it only references two launcher-set env
+  #     vars (`CLAUDE_GPT_HOOK_SINK_NONCE`, `CLAUDE_GPT_HOOK_SINK_PATH`)
+  #     that are resolved by the shell that actually runs the hook, not by
+  #     this heredoc. This does not touch lib.sh, does not weaken
+  #     CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS, and does not accept an arbitrary
+  #     caller-supplied --settings/hook command.
+  : "${CLAUDE_GPT_HOOK_SINK_NONCE:?CLAUDE_GPT_HOOK_SINK_NONCE must be set by the caller for hook-sink-multi-turn}"
+  CLAUDE_GPT_HOOK_SINK_PATH="${PROXY_STATE_DIR_TARGET}/hook-sink-${CLAUDE_GPT_HOOK_SINK_NONCE}.jsonl"
+  ( umask 077 && set -C && : > "$CLAUDE_GPT_HOOK_SINK_PATH" )
+  CLAUDE_GPT_HOOK_SINK_WRITER="${PROXY_STATE_DIR_TARGET}/hook-sink-writer-${CLAUDE_GPT_HOOK_SINK_NONCE}.py"
+  ( umask 077 && cat > "$CLAUDE_GPT_HOOK_SINK_WRITER" <<'HOOK_SINK_WRITER_EOF'
+import hashlib
+import json
+import os
+import sys
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    event = payload.get("hook_event_name", "")
+    session_id = payload.get("session_id")
+    agent_id = payload.get("agent_id") or payload.get("subagent_id")
+    nonce = os.environ.get("CLAUDE_GPT_HOOK_SINK_NONCE", "")
+    sink_path = os.environ.get("CLAUDE_GPT_HOOK_SINK_PATH")
+    prompt = payload.get("prompt") if event == "UserPromptSubmit" else None
+    digest = None
+    if isinstance(prompt, str):
+        digest = hashlib.sha256((nonce + prompt).encode("utf-8")).hexdigest()
+    record = {
+        "run_nonce": nonce,
+        "event": event,
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "ts": __import__("time").time(),
+        "prompt_digest": digest,
+    }
+    line = json.dumps(record, separators=(",", ":"))
+    if sink_path:
+        # Single bounded write per record: one open + one write call,
+        # well under PIPE_BUF, so concurrent SubagentStart events never
+        # interleave/corrupt lines (Issue #2219 AC15).
+        with open(sink_path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+
+if __name__ == "__main__":
+    main()
+HOOK_SINK_WRITER_EOF
+  )
+  HOOKS_JSON_FRAGMENT=',
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}],
+    "StopFailure": [{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}]
+  }'
+  # Also baked literally into settings.json's own "env" block (belt-and-
+  # braces alongside the exported shell env vars below) so the 3-way
+  # run_nonce match the harness verifies (AC16) has a nonce value that is
+  # genuinely "baked into settings.json at launch", not merely inherited.
+  ENV_JSON_FRAGMENT=",
+  \"env\": {
+    \"CLAUDE_GPT_HOOK_SINK_NONCE\": \"${CLAUDE_GPT_HOOK_SINK_NONCE}\",
+    \"CLAUDE_GPT_HOOK_SINK_PATH\": \"${CLAUDE_GPT_HOOK_SINK_PATH}\",
+    \"CLAUDE_GPT_HOOK_SINK_WRITER\": \"${CLAUDE_GPT_HOOK_SINK_WRITER}\"
+  }"
+  export CLAUDE_GPT_HOOK_SINK_NONCE CLAUDE_GPT_HOOK_SINK_PATH CLAUDE_GPT_HOOK_SINK_WRITER
 fi
 
 cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
@@ -277,7 +361,7 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
       "Read(/${PROXY_HOME_TARGET}/**)"
     ]
   },
-  "enabledPlugins": {}${HOOKS_JSON_FRAGMENT}
+  "enabledPlugins": {}${HOOKS_JSON_FRAGMENT}${ENV_JSON_FRAGMENT}
 }
 SETTINGS_JSON_EOF
 

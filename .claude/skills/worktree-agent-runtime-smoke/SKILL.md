@@ -191,6 +191,79 @@ production permission の根拠にしない。
   bounded poll-with-retry（既定 3 回、0.5 秒間隔）の独立再確認を行う。自己申告が
   `true` でも独立再確認が FAIL なら run 全体を FAIL とする（Issue #2219 AC7）
 
+### interactive lane の evidence 設計変遷（Option A → Option B(transcript) → Option 1(hook-event)）
+
+interactive lane の「同一 session multi-turn / 複数 SubAgent lifecycle」evidence 設計は、
+OWNER anchor 決定（Issue #2219 本文、PR #2205/#2222 コメント、2026-08-16）により
+in-place で reframe された。過去の設計判断・FAIL 記録は履歴として保持する:
+
+1. **Option A**（structured lane 単一 invocation）を最初に実装したが、
+   reviewer が「同一 Herdr session である」ことを要求したため差し戻された。
+2. **Option B（transcript ベース）**: 上記「選択肢 B」として、interactive lane
+   自身が書き出す永続化 session transcript（`*/<session_id>.jsonl`）を
+   `_find_claude_interactive_transcript()` で特定し、Option A と同じ純粋関数
+   （`verify_same_main_session_across_turns()` / `classify_claude_multi_child_
+   lifecycle()`）へそのまま入力する設計を実装した。しかし live 検証
+   （PR #2222 fix_delta iteration 2、2026-08-16）で、herdr-PTY-driven な
+   claude-gpt session が構造的にフラットな main transcript を一切書かない
+   ことが複数回の live 実行で再現され、この設計は FAIL した（書かれるのは
+   `subagents/agent-*.meta.json` という fragmentary な spawn metadata のみで、
+   completion field も cwd field も持たない）。
+3. **Option 1（hook-event evidence channel、現行）**: `.jsonl` transcript の
+   存在有無に依存しない、deterministic な Claude Code hook 機構
+   （`UserPromptSubmit`/`Stop`/`StopFailure`/`SubagentStart`/`SubagentStop`
+   の 5 種類、すべて既存の `command` 型 hook 経由）へ置き換えた。
+   `subagents/*.meta.json` および transcript 存在チェックは advisory/diagnostic
+   情報として `summary.md` に残るが、PASS 判定には昇格しない。
+
+現行設計（interactive lane）の要点:
+
+- **Sink**: run-nonce キー付き、O_EXCL で新規作成する append-only JSONL
+  ファイル。パスは launcher-owned な定数（claude-gpt adapter:
+  `claude_gpt_proxy_state_dir()`/Python 側ミラー
+  `claude_gpt_proxy_state_dir_python()`。native adapter: harness が
+  `tempfile.mkdtemp()` で生成する専用ディレクトリ）のみから構築し、
+  caller-supplied な値（worktree path・CLI 引数）は一切使わない
+  （Issue #2219 AC14）。
+- **Event set**: 5 種類すべて、固定の hook command 文字列（caller-supplied な
+  文字列を埋め込まない）から、launcher-set env var
+  （`CLAUDE_GPT_HOOK_SINK_PATH`/`CLAUDE_GPT_HOOK_SINK_NONCE`）経由でのみ
+  sink path/nonce を参照する。
+- **Record**: `run_nonce` / `event` / `session_id` / `agent_id`（該当時） /
+  `ts` / `prompt_digest`（`sha256(run_nonce + prompt)`、raw prompt 本文は
+  一切含まない）のみ（Issue #2219 AC13）。
+- **multi-turn 判定**: `verify_claude_gpt_hook_sink_multi_turn()` が、同一
+  `session_id` を持つ `UserPromptSubmit` record が最低 2 件、各々に対応する
+  同一 session の `Stop` record、`StopFailure` record 0 件を AND 条件で検証する。
+- **SubAgent lifecycle 判定**: `classify_claude_hook_sink_multi_child_
+  lifecycle()` が、structured lane の `classify_claude_multi_child_lifecycle()`
+  と**同一の** `_pair_agent_lifecycle()` 集合演算コアを再利用する（別のより
+  緩い classifier を新設しない）。`SubagentStop` 前にプロセスが強制終了された
+  場合は `orphan_starts` が非空になり fail-closed（Issue #2219 AC17。
+  grace window・タイムアウト猶予による自動 PASS 昇格はしない）。
+- **Sink 専用 staleness 検証**: `verify_claude_gpt_hook_sink_not_stale()` が、
+  settings.json に焼き込まれた nonce・harness がこの実行に期待する nonce・
+  sink 内の全 record の `run_nonce` の 3 点一致を検証する。
+  `verify_evidence_not_stale()`（repo-state/`tested_head` ベース）とは
+  独立したチェックである（Issue #2219 AC16）。
+- **Concurrency/atomicity**: hook command は単一の bounded-size `printf`/
+  `write()` で 1 record 1 書き込み（PIPE_BUF 未満）とし、
+  `SubagentStart` が複数ほぼ同時に発火しても書き込みが interleave/truncate
+  しない（Issue #2219 AC15）。
+- **Identity**: `agent_id`/`session_id` のみを pairing/identity 判定に使い、
+  `agent_type`（model 自己申告で信用できない）は使わない。
+- **claude-gpt adapter の narrow launch.sh 変更**: `scripts/claude-gpt/
+  launch.sh` の既存 `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS` 固定値ゲート
+  （`subagent-start-stop`）に、新しい固定値 `hook-sink-multi-turn` を
+  1 つ追加した。この値は `UserPromptSubmit`/`Stop`/`StopFailure`/
+  `SubagentStart`/`SubagentStop` の 5 hook すべてを durable JSONL sink へ
+  配線する。`lib.sh` は変更していない。`CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS` の
+  緩和や caller-supplied な任意 `--settings`/hook command の受け入れは行って
+  いない。
+- **native adapter**: `scripts/claude-gpt/**` を一切変更せず、harness 側
+  （`run_worktree_agent_runtime_smoke.py` が生成する `CLAUDE_CONFIG_DIR`/
+  `settings.json`）のみで完結する。
+
 `verify_evidence_not_stale()`（Issue #2219 AC10）は、過去に書き出した evidence JSON の
 `tested_head`/`repo_fingerprint` を fresh worktree HEAD/fingerprint と突き合わせ、
 不一致（または fresh 値自体が取得できない場合）を `stale: True` として拒否する明示ガード

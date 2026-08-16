@@ -1806,6 +1806,20 @@ def classify_claude_multi_child_lifecycle(stdout: str, min_required: int) -> dic
         if agent_id in spawn_ids:
             stop_ids.append(agent_id)
 
+    return _pair_agent_lifecycle(spawn_ids, stop_ids, min_required)
+
+
+def _pair_agent_lifecycle(spawn_ids: list[str], stop_ids: list[str], min_required: int) -> dict:
+    """Shared agent_id set/multiset-operation pairing core (Issue #2219 AC3,
+    factored out in the AC13-AC17 hook-event-evidence-channel fix_delta so
+    ``classify_claude_hook_sink_multi_child_lifecycle`` -- which sources its
+    ``spawn_ids``/``stop_ids`` from the interactive lane's durable hook sink
+    JSONL rather than structured-lane stdout -- reuses the EXACT SAME
+    fail-closed pairing algorithm as ``classify_claude_multi_child_lifecycle``
+    instead of re-deriving a separate, looser classifier (OWNER anchor
+    decision, Issue #2219 body: "既存の classify_claude_multi_child_lifecycle()
+    のロジックを...再利用し、structured lane 用と別のより緩い classifier を
+    新設しない")."""
     spawned = set(spawn_ids)
     completed = set(stop_ids)
     duplicate_completions = sorted({aid for aid in stop_ids if stop_ids.count(aid) > 1})
@@ -1933,6 +1947,245 @@ def verify_no_forbidden_marker(
     )
     matched = [marker for marker in _FORBIDDEN_FAILURE_MARKERS if marker in combined]
     return {"verified": not matched, "matched_markers": matched}
+
+
+# ---------------------------------------------------------------------------
+# Issue #2219 AC2/AC3/AC13-AC17 (OWNER anchor decision, 2026-08-16): the
+# interactive-lane hook-event evidence channel. Live investigation proved
+# herdr-PTY-driven claude-gpt sessions never write a flat ``<session-id>.jsonl``
+# main transcript (see ``_find_claude_interactive_transcript`` docstring and
+# the Issue body Notes for Reviewer for the full incident trail), so this
+# channel replaces transcript-existence as the interactive lane's PASS
+# authority. Every function below consumes already-parsed hook sink RECORDS
+# (never the raw sink file text, never raw prompt/response content) -- the
+# sink itself is written by a launcher-owned (``launch.sh``, "claude-gpt") or
+# harness-owned (native adapter) fixed hook command, never from a
+# caller-influenced string.
+# ---------------------------------------------------------------------------
+
+# The ONLY keys a well-formed hook sink record may carry (AC13: no raw
+# prompt/response/credential/token content ever appears in a record).
+_HOOK_SINK_ALLOWED_RECORD_KEYS = frozenset(
+    {"run_nonce", "event", "session_id", "agent_id", "ts", "prompt_digest"}
+)
+_HOOK_SINK_LIFECYCLE_EVENTS = frozenset(
+    {"UserPromptSubmit", "Stop", "StopFailure", "SubagentStart", "SubagentStop"}
+)
+# Bounded read: a single sink file is never trusted to be arbitrarily large
+# (defense in depth against a corrupted/runaway sink being read wholesale).
+_MAX_HOOK_SINK_LINES = 20000
+
+# Native-adapter hook sink writer (Issue #2219 In Scope: native adapter is
+# wired entirely from THIS harness, never scripts/claude-gpt/**). Same
+# record schema and same single-bounded-``printf``-equivalent-write
+# atomicity guarantee (AC15: one ``open(..., "a")`` + one ``write()`` call
+# per invocation, each record well under PIPE_BUF) as the claude-gpt
+# adapter's inline hook command in ``scripts/claude-gpt/launch.sh``'s
+# ``hook-sink-multi-turn`` gate -- kept in sync deliberately (same record
+# shape, same field names) so both adapters' sinks are parsed by the exact
+# same ``parse_claude_gpt_hook_sink_records``.
+_HOOK_SINK_WRITER_SOURCE = '''\
+import hashlib
+import json
+import os
+import sys
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    event = payload.get("hook_event_name", "")
+    session_id = payload.get("session_id")
+    agent_id = payload.get("agent_id") or payload.get("subagent_id")
+    nonce = os.environ.get("CLAUDE_GPT_HOOK_SINK_NONCE", "")
+    sink_path = os.environ.get("CLAUDE_GPT_HOOK_SINK_PATH")
+    prompt = payload.get("prompt") if event == "UserPromptSubmit" else None
+    digest = None
+    if isinstance(prompt, str):
+        digest = hashlib.sha256((nonce + prompt).encode("utf-8")).hexdigest()
+    record = {
+        "run_nonce": nonce,
+        "event": event,
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "ts": __import__("time").time(),
+        "prompt_digest": digest,
+    }
+    line = json.dumps(record, separators=(",", ":"))
+    if sink_path:
+        # Single bounded write per record (AC15): one open + one write
+        # call, well under PIPE_BUF, so concurrent SubagentStart events
+        # never interleave/corrupt lines.
+        with open(sink_path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\\n")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def parse_claude_gpt_hook_sink_records(sink_path: str | Path) -> tuple[list[dict], int]:
+    """Bounded, fail-closed parse of the append-only hook-event sink JSONL
+    file (Issue #2219 AC13/AC15). Returns ``(records, malformed_line_count)``
+    -- ``records`` contains ONLY well-formed lines (valid JSON object, a
+    recognized ``event`` value, and no key outside
+    ``_HOOK_SINK_ALLOWED_RECORD_KEYS``); every other line (parse failure,
+    non-dict payload, unrecognized event, or an extra/unexpected key --
+    which would indicate either sink corruption from an interleaved
+    concurrent write, AC15, or a smuggled raw-content field, AC13) is
+    counted in ``malformed_line_count`` and silently dropped from
+    ``records`` rather than guessed at or repaired. Missing file (sink never
+    configured, or the lane never ran) returns ``([], 0)``, never raises."""
+    try:
+        path = Path(sink_path)
+        if not path.is_file():
+            return [], 0
+        raw_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return [], 0
+    records: list[dict] = []
+    malformed = 0
+    for line in raw_lines[:_MAX_HOOK_SINK_LINES]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            malformed += 1
+            continue
+        if not isinstance(payload, dict):
+            malformed += 1
+            continue
+        if not set(payload.keys()) <= _HOOK_SINK_ALLOWED_RECORD_KEYS:
+            malformed += 1
+            continue
+        if payload.get("event") not in _HOOK_SINK_LIFECYCLE_EVENTS:
+            malformed += 1
+            continue
+        records.append(payload)
+    return records, malformed
+
+
+def classify_claude_hook_sink_multi_child_lifecycle(records: list[dict], min_required: int) -> dict:
+    """Multi-SubAgent lifecycle proof sourced from hook sink records (Issue
+    #2219 AC3/AC17), via the SAME ``_pair_agent_lifecycle`` set-operation
+    core ``classify_claude_multi_child_lifecycle`` uses for the structured
+    lane -- never a separately re-derived, looser classifier. A process
+    killed before its ``SubagentStop`` fires (Issue #2219 AC17, e.g.
+    SIGKILL) leaves its ``agent_id`` in ``orphan_starts``, which fails
+    ``verified`` closed with no grace-window/timeout-based auto-PASS."""
+    spawn_ids = [r["agent_id"] for r in records if r.get("event") == "SubagentStart" and r.get("agent_id")]
+    stop_ids = [r["agent_id"] for r in records if r.get("event") == "SubagentStop" and r.get("agent_id")]
+    return _pair_agent_lifecycle(spawn_ids, stop_ids, min_required)
+
+
+def verify_claude_gpt_hook_sink_multi_turn(records: list[dict], min_turns: int) -> dict:
+    """Multi-turn same-session proof sourced from hook sink records (Issue
+    #2219 AC2), independent of any persisted transcript file. ``verified``
+    requires: (1) exactly one distinct ``session_id`` observed across
+    ``UserPromptSubmit`` records, (2) at least ``min_turns`` such records for
+    that session_id, (3) a ``Stop`` record for that SAME session_id for each
+    ``UserPromptSubmit`` (paired count, not merely an aggregate count -- a
+    stalled/never-completed turn is not silently counted as done), and (4)
+    zero ``StopFailure`` records for that session_id. Zero or multiple
+    distinct session_ids both fail closed.
+
+    Returns ``{"verified": bool, "session_id": str|None, "turn_count": int,
+    "stop_count": int, "stop_failure_count": int}``."""
+    prompt_sids = [r["session_id"] for r in records if r.get("event") == "UserPromptSubmit" and r.get("session_id")]
+    stop_sids = [r["session_id"] for r in records if r.get("event") == "Stop" and r.get("session_id")]
+    stop_failure_sids = [
+        r["session_id"] for r in records if r.get("event") == "StopFailure" and r.get("session_id")
+    ]
+    distinct_prompt_sids = sorted(set(prompt_sids))
+    session_id = distinct_prompt_sids[0] if len(distinct_prompt_sids) == 1 else None
+    turn_count = prompt_sids.count(session_id) if session_id else 0
+    stop_count = stop_sids.count(session_id) if session_id else 0
+    stop_failure_count = stop_failure_sids.count(session_id) if session_id else len(stop_failure_sids)
+    verified = (
+        session_id is not None
+        and turn_count >= max(min_turns, 1)
+        and stop_count >= turn_count
+        and stop_failure_count == 0
+    )
+    return {
+        "verified": verified,
+        "session_id": session_id,
+        "turn_count": turn_count,
+        "stop_count": stop_count,
+        "stop_failure_count": stop_failure_count,
+    }
+
+
+def verify_claude_gpt_hook_sink_not_stale(records: list[dict], expected_nonce: str | None) -> dict:
+    """Sink-specific staleness guard (Issue #2219 AC16), deliberately
+    SEPARATE from ``verify_evidence_not_stale`` (which is repo-state/
+    ``tested_head`` based, not sink-based). Verifies the 3-way ``run_nonce``
+    match the Issue body requires: the nonce baked into ``settings.json`` at
+    launch, the nonce THIS harness invocation expects (``expected_nonce``),
+    and the ``run_nonce`` stamped on EVERY record actually observed in the
+    sink -- a single mismatching or missing-nonce record fails the whole
+    check closed (never "mostly fresh"). An empty ``records`` list (sink
+    never populated) or a missing/empty ``expected_nonce`` also fails
+    closed."""
+    if not expected_nonce:
+        return {"verified": False, "reason": "expected_nonce_missing", "mismatched_count": 0}
+    if not records:
+        return {"verified": False, "reason": "no_records", "mismatched_count": 0}
+    mismatched = [r for r in records if r.get("run_nonce") != expected_nonce]
+    return {
+        "verified": not mismatched,
+        "reason": None if not mismatched else "run_nonce_mismatch",
+        "mismatched_count": len(mismatched),
+    }
+
+
+def verify_claude_gpt_hook_sink_no_raw_content(records: list[dict]) -> dict:
+    """Structural, fail-closed proof that no sink record smuggles raw
+    prompt/response text or a credential/token (Issue #2219 AC13). Because
+    ``parse_claude_gpt_hook_sink_records`` already drops any record carrying
+    a key outside the fixed allowlist, this only needs to additionally
+    check the ONE field that legitimately carries prompt-derived content --
+    ``prompt_digest`` -- is always either absent/``None`` or a 64-hex-
+    character SHA-256 digest, never raw text."""
+    violations: list[str] = []
+    for record in records:
+        digest = record.get("prompt_digest")
+        if digest is None:
+            continue
+        if not (isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)):
+            violations.append(str(record.get("event")))
+    return {"verified": not violations, "violating_events": violations}
+
+
+def claude_gpt_proxy_state_dir_python() -> Path:
+    """Python-side mirror of ``scripts/claude-gpt/lib.sh``'s
+    ``claude_gpt_proxy_state_dir()`` -- ``$CLAUDE_GPT_HOME/state`` (default
+    ``~/.claude-gpt/state`` when ``CLAUDE_GPT_HOME`` is unset). Mirrors the
+    launcher's own default expression exactly (same pattern as
+    ``_resolve_claude_projects_root``) rather than re-deriving a different
+    one, so an operator-set ``CLAUDE_GPT_HOME`` is honored identically on
+    both sides. This IS the "launcher-owned constant" the Issue body
+    requires the sink path be built from (AC14) -- never any
+    caller-supplied value (worktree path, CLI argument, etc.)."""
+    claude_gpt_home = os.environ.get("CLAUDE_GPT_HOME") or str(Path.home() / ".claude-gpt")
+    return Path(claude_gpt_home) / "state"
+
+
+def claude_gpt_hook_sink_path(nonce: str) -> Path:
+    """Deterministic sink path for the ``claude-gpt`` adapter (Issue #2219
+    AC14), built ONLY from ``claude_gpt_proxy_state_dir_python()`` (a
+    launcher-owned constant) and the run nonce -- never from ``worktree``,
+    CLI args, or any other caller-supplied value. Must byte-for-byte match
+    the path ``scripts/claude-gpt/launch.sh`` computes for the same nonce
+    (see the ``hook-sink-multi-turn`` gate there)."""
+    return claude_gpt_proxy_state_dir_python() / f"hook-sink-{nonce}.jsonl"
 
 
 def extract_claude_child_agent_type_with_source(stdout: str) -> tuple[str | None, str | None]:
@@ -3518,6 +3771,7 @@ def run_interactive_herdr_isolated(
     claude_bin_override: str | None = None,
     claude_adapter: str = "native",
     additional_prompts: list[str] | None = None,
+    hook_sink_enabled: bool = False,
 ) -> list[str]:
     """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
     in place (so cleanup/session identity survive even if this raises) and
@@ -3610,6 +3864,7 @@ def run_interactive_herdr_isolated(
     pane_output_lines: list[str] = []
     session_proc: subprocess.Popen | None = None
     claude_bin_shim_dir: str | None = None
+    hook_sink_shim_dir: str | None = None
     try:
         # Actually create the isolated session (not merely set an env var and
         # hope) and block until its independent existence is confirmed via
@@ -3691,6 +3946,80 @@ def run_interactive_herdr_isolated(
                     "--env", "CLAUDE_GPT_CLAUDE_BIN=" + claude_gpt_real_claude_bin,
                 ]
 
+        # Issue #2219 AC2/AC3/AC13-AC17 (OWNER anchor decision, hook-event
+        # evidence channel): wire the interactive lane's durable hook sink
+        # the SAME way ``CLAUDE_GPT_CLAUDE_BIN``/``PATH`` are already
+        # threaded above -- via ``herdr workspace create --env`` (Finding 1:
+        # updating only this process's own env never reaches the already-
+        # running Herdr server/pane process) AND the pane re-pin
+        # ``export`` string below (an interactive login shell's own rc
+        # files can clobber an inherited env var, same Finding 2 rationale).
+        # Independent of ``claude_bin_override`` -- this applies whenever
+        # the caller opted in via ``--require-min-subagents``/
+        # ``--require-min-turns`` (``hook_sink_enabled``), regardless of
+        # whether a ``--claude-bin`` override was also requested.
+        hook_sink_env_pairs: list[tuple[str, str]] = []
+        if runtime == "claude" and hook_sink_enabled:
+            hook_sink_nonce = uuid.uuid4().hex
+            evidence["hook_sink_nonce"] = hook_sink_nonce
+            if claude_adapter == "claude-gpt":
+                # Path built ONLY from the launcher-owned constant
+                # (``claude_gpt_proxy_state_dir_python()`` mirrors
+                # ``scripts/claude-gpt/lib.sh``'s
+                # ``claude_gpt_proxy_state_dir()`` exactly) plus the nonce
+                # generated above -- never from ``worktree`` or any other
+                # caller-supplied value (AC14). ``scripts/claude-gpt/
+                # launch.sh``'s own ``hook-sink-multi-turn`` gate computes
+                # the identical path for the same nonce.
+                hook_sink_path = claude_gpt_hook_sink_path(hook_sink_nonce)
+                hook_sink_path.parent.mkdir(parents=True, exist_ok=True)
+                evidence["hook_sink_path"] = str(hook_sink_path)
+                hook_sink_env_pairs = [
+                    ("CLAUDE_GPT_RUNTIME_SMOKE_HOOKS", "hook-sink-multi-turn"),
+                    ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
+                    # launch.sh independently computes this SAME path from
+                    # its own launcher-owned constant + this nonce; also
+                    # exporting it here is redundant-but-harmless
+                    # observability, never an input launch.sh trusts for
+                    # path construction (AC14).
+                    ("CLAUDE_GPT_HOOK_SINK_PATH", str(hook_sink_path)),
+                ]
+            else:
+                # native adapter (Issue #2219 In Scope: "native adapter は
+                # scripts/claude-gpt/** を一切変更せず harness 側のみで完結
+                # させる"): a harness-owned CLAUDE_CONFIG_DIR pointing at a
+                # generated settings.json with the SAME fixed hook set
+                # (UserPromptSubmit/Stop/StopFailure/SubagentStart/
+                # SubagentStop), all self-contained in a fresh temp dir
+                # this function itself controls -- no scripts/claude-gpt/**
+                # file is read or written for this branch.
+                hook_sink_shim_dir = tempfile.mkdtemp(prefix="worktree-agent-runtime-smoke-hook-sink-")
+                os.chmod(hook_sink_shim_dir, 0o700)
+                hook_sink_path = Path(hook_sink_shim_dir) / f"hook-sink-{hook_sink_nonce}.jsonl"
+                hook_sink_writer_path = Path(hook_sink_shim_dir) / "hook_sink_writer.py"
+                hook_sink_writer_path.write_text(_HOOK_SINK_WRITER_SOURCE, encoding="utf-8")
+                hook_sink_writer_path.chmod(0o700)
+                claude_config_dir = Path(hook_sink_shim_dir) / "claude-config"
+                claude_config_dir.mkdir(parents=True, exist_ok=True)
+                settings_path = claude_config_dir / "settings.json"
+                hook_command = f'python3 "{hook_sink_writer_path}"'
+                settings_payload = {
+                    "hooks": {
+                        event_name: [{"hooks": [{"type": "command", "command": hook_command}]}]
+                        for event_name in sorted(_HOOK_SINK_LIFECYCLE_EVENTS)
+                    },
+                }
+                settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
+                evidence["hook_sink_path"] = str(hook_sink_path)
+                hook_sink_env_pairs = [
+                    ("CLAUDE_CONFIG_DIR", str(claude_config_dir)),
+                    ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
+                    ("CLAUDE_GPT_HOOK_SINK_PATH", str(hook_sink_path)),
+                ]
+            for key, value in hook_sink_env_pairs:
+                isolated_env[key] = value
+                workspace_create_argv += ["--env", f"{key}={value}"]
+
         rc, out, err, timed_out = _run(
             workspace_create_argv,
             timeout=20.0, env=isolated_env,
@@ -3736,6 +4065,25 @@ def run_interactive_herdr_isolated(
                 raise HerdrLaneError(
                     f"could not pin --claude-bin shim PATH in the isolated pane's "
                     f"already-running shell: {_redact(_pin_err or _pin_out)}"
+                )
+
+        if hook_sink_env_pairs:
+            # Same re-pin rationale as the ``--claude-bin`` shim above: an
+            # interactive login shell's own rc files can clobber an
+            # inherited env var, so every hook-sink env var is explicitly
+            # re-exported in the already-running pane shell too.
+            _pin_hook_sink_cmd = " && ".join(
+                f"export {key}='{value.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
+                for key, value in hook_sink_env_pairs
+            )
+            _pin_hs_rc, _pin_hs_out, _pin_hs_err, _pin_hs_timed_out = _run(
+                [herdr_bin, "pane", "run", pane_id, _pin_hook_sink_cmd],
+                timeout=15.0, env=isolated_env,
+            )
+            if _pin_hs_timed_out or _pin_hs_rc != 0:
+                raise HerdrLaneError(
+                    "could not pin hook-sink env vars in the isolated pane's "
+                    f"already-running shell: {_redact(_pin_hs_err or _pin_hs_out)}"
                 )
 
         # Issue #1960 AC5: the interactive lane never forwards
@@ -3837,8 +4185,23 @@ def run_interactive_herdr_isolated(
                     "did not reach the herdr workspace process)"
                 )
 
+        if hook_sink_env_pairs:
+            # Parsed HERE (before the temp dir, native adapter only, is
+            # removed in the ``finally`` below) so the sink's own records
+            # survive in ``evidence`` regardless of adapter. Never the raw
+            # sink file text -- only already-validated records (Issue
+            # #2219 AC13: no raw prompt/response content ever leaves this
+            # function).
+            _hook_sink_records, _hook_sink_malformed = parse_claude_gpt_hook_sink_records(
+                evidence.get("hook_sink_path", "")
+            )
+            evidence["hook_sink_records"] = _hook_sink_records
+            evidence["hook_sink_malformed_line_count"] = _hook_sink_malformed
+
         return pane_output_lines
     finally:
+        if hook_sink_shim_dir is not None:
+            shutil.rmtree(hook_sink_shim_dir, ignore_errors=True)
         cleanup = evidence["cleanup"]
         cleanup["attempted"] = True
         # Issue #2176 (P0-3 fix-delta): previously these three calls used
@@ -4978,11 +5341,15 @@ def main(argv: list[str] | None = None) -> int:
             # against the same worktree.
             interactive_run_started_epoch = time.time()
             try:
+                _hook_sink_enabled = args.runtime == "claude" and (
+                    args.require_min_subagents > 0 or args.require_min_turns > 0
+                )
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
                     claude_bin_override=args.claude_bin if args.runtime == "claude" else None,
                     claude_adapter=args.claude_adapter,
                     additional_prompts=args.additional_prompt or None,
+                    hook_sink_enabled=_hook_sink_enabled,
                 )
 
                 if evidence.get("final_state") == "blocked":
@@ -4998,17 +5365,20 @@ def main(argv: list[str] | None = None) -> int:
                         errors.append(f"expected markers not observed in pane output: {missing}")
                         exit_code = EXIT_FAIL
 
-                # Issue #2219 fix_delta iteration 1 (Option B reintroduction):
-                # wire the SAME multi-SubAgent lifecycle / same-session /
-                # forbidden-marker functions Option A already built for the
-                # structured lane into this interactive lane, via the
-                # persisted session transcript this run itself wrote (see
-                # _find_claude_interactive_transcript docstring for why that
-                # file -- not the pane text -- carries the required
-                # stream-json event shapes). Only attempted when at least one
-                # of the corresponding opt-in flags was actually requested,
-                # so a pre-existing caller that passes none of them never
-                # pays the extra filesystem scan.
+                # Issue #2219 (OWNER anchor decision, 2026-08-16): the
+                # interactive lane's PASS authority for multi-turn/multi-
+                # SubAgent lifecycle is the hook-event evidence channel
+                # (hook sink records already parsed into
+                # ``evidence["hook_sink_records"]`` inside
+                # ``run_interactive_herdr_isolated``), NOT transcript
+                # existence -- live investigation proved herdr-PTY-driven
+                # claude-gpt sessions never write a flat
+                # ``<session-id>.jsonl`` main transcript (see
+                # ``_find_claude_interactive_transcript`` docstring for the
+                # full incident trail). The transcript lookup below is kept
+                # for ADVISORY/diagnostic breadcrumbs only (never promoted
+                # to PASS authority) alongside the fragmentary
+                # ``subagents/*.meta.json`` scan.
                 if args.runtime == "claude" and (
                     args.require_min_subagents > 0
                     or args.require_min_turns > 0
@@ -5019,9 +5389,10 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     schema_summary["interactive_transcript_found"] = transcript_path is not None
                     if transcript_path is None:
-                        # Issue #2219 fix_delta iteration 2 live finding: advisory-only
-                        # breadcrumb, never a PASS-capable evidence source -- see
-                        # _find_claude_interactive_subagent_only_session_dirs docstring.
+                        # Advisory-only breadcrumb, never a PASS-capable
+                        # evidence source -- see
+                        # _find_claude_interactive_subagent_only_session_dirs
+                        # docstring.
                         schema_summary["interactive_transcript_subagent_only_session_dirs"] = (
                             _find_claude_interactive_subagent_only_session_dirs(
                                 worktree, interactive_run_started_epoch, args.claude_adapter
@@ -5035,28 +5406,49 @@ def main(argv: list[str] | None = None) -> int:
                             transcript_text = ""
                             schema_summary["interactive_transcript_found"] = False
 
+                    hook_sink_records = evidence.get("hook_sink_records") or []
+                    hook_sink_malformed = evidence.get("hook_sink_malformed_line_count", 0)
+                    hook_sink_expected_nonce = evidence.get("hook_sink_nonce")
+                    hook_sink_staleness = verify_claude_gpt_hook_sink_not_stale(
+                        hook_sink_records, hook_sink_expected_nonce
+                    )
+                    schema_summary["hook_sink_records_count"] = len(hook_sink_records)
+                    schema_summary["hook_sink_malformed_line_count"] = hook_sink_malformed
+                    schema_summary["hook_sink_staleness"] = hook_sink_staleness
+                    schema_summary["hook_sink_no_raw_content"] = verify_claude_gpt_hook_sink_no_raw_content(
+                        hook_sink_records
+                    )
+                    if _hook_sink_enabled and not hook_sink_staleness["verified"]:
+                        errors.append(
+                            "hook-event evidence sink stale or unavailable (interactive lane): "
+                            f"{hook_sink_staleness}"
+                        )
+                        exit_code = EXIT_FAIL
+
                     if args.require_min_subagents > 0:
-                        multi_child_lifecycle = classify_claude_multi_child_lifecycle(
-                            transcript_text, args.require_min_subagents
+                        multi_child_lifecycle = classify_claude_hook_sink_multi_child_lifecycle(
+                            hook_sink_records, args.require_min_subagents
                         )
                         schema_summary["multi_child_lifecycle"] = multi_child_lifecycle
+                        schema_summary["multi_child_lifecycle_source"] = "hook_event_sink"
                         if not multi_child_lifecycle["verified"]:
                             errors.append(
-                                "multi-SubAgent lifecycle not verified (interactive lane): "
-                                f"{multi_child_lifecycle}"
+                                "multi-SubAgent lifecycle not verified (interactive lane, "
+                                f"hook_event_sink): {multi_child_lifecycle}"
                             )
                             exit_code = EXIT_FAIL
 
                     if args.require_min_turns > 0:
-                        same_session_turns = verify_same_main_session_across_turns(
-                            transcript_text, args.require_min_turns
+                        same_session_turns = verify_claude_gpt_hook_sink_multi_turn(
+                            hook_sink_records, args.require_min_turns
                         )
                         schema_summary["same_session_across_turns"] = same_session_turns
+                        schema_summary["same_session_across_turns_source"] = "hook_event_sink"
                         if not same_session_turns["verified"]:
                             errors.append(
                                 "same main session across >= "
                                 f"{args.require_min_turns} turns not verified "
-                                f"(interactive lane): {same_session_turns}"
+                                f"(interactive lane, hook_event_sink): {same_session_turns}"
                             )
                             exit_code = EXIT_FAIL
 

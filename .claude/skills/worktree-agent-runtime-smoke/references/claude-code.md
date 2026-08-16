@@ -226,6 +226,21 @@ commit `06d8baa9` で prototype し、Issue #2174 のスコープ外として co
 選択肢 B（`--additional-prompt`）を使い、下記「interactive lane の同一 session
 multi-turn（`--additional-prompt`、選択肢 B）」で詳細を説明する。
 
+### 【superseded】interactive lane の同一 session multi-turn の evidence source（Option 1 へ移行）
+
+**この節（`--additional-prompt` 自体は現行のまま有効。以下の transcript-based
+evidence source の記述は historical であり、現行の PASS authority ではない）**:
+OWNER anchor 決定（Issue #2219 本文、2026-08-16）により、interactive lane の
+multi-turn/multi-SubAgent evidence source は、下記の transcript-existence
+ベース設計（Option B）から、**hook-event evidence channel（Option 1）**へ
+置き換えられた。理由: live 検証（PR #2222 fix_delta iteration 2）で、
+herdr-PTY-driven な claude-gpt session が構造的にフラットな main transcript
+（`<session-id>.jsonl`）を一切書かないことが再現されたため（書かれるのは
+`subagents/agent-*.meta.json` という completion field を持たない fragmentary
+metadata のみ）。下記の transcript-based 記述はこの falsify された設計判断の
+記録として保持する。現行の hook-event evidence channel の詳細は
+`### interactive lane の hook-event evidence channel（Option 1、現行）` を参照。
+
 ### interactive lane の同一 session multi-turn（`--additional-prompt`、選択肢 B）
 
 `run_interactive_herdr_isolated()` は既に起動済みの、単一の herdr
@@ -290,6 +305,55 @@ transcript が見つからない場合は空文字列を渡すため、`--requir
 lane 専用で interactive lane には forward されない）ではなく、`1 +
 len(--additional-prompt)` がその値以上であることが起動前に `parser.error` で
 validate される。
+
+### interactive lane の hook-event evidence channel（Option 1、現行）
+
+`--require-min-turns`/`--require-min-subagents` のいずれかが指定された
+`--runtime claude --mode interactive` run では、`run_interactive_herdr_isolated()`
+が `hook_sink_enabled=True` で呼ばれ、以下を行う:
+
+1. `uuid.uuid4().hex` で `hook_sink_nonce` を生成する（この run 専用、caller
+   から渡されない）。
+2. **claude-gpt adapter**: `claude_gpt_hook_sink_path(nonce)`
+   （= `claude_gpt_proxy_state_dir_python() / f"hook-sink-{nonce}.jsonl"`、
+   `scripts/claude-gpt/lib.sh` の `claude_gpt_proxy_state_dir()` の Python
+   ミラー）でパスを決定し、`CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=hook-sink-multi-turn`
+   と `CLAUDE_GPT_HOOK_SINK_NONCE=<nonce>` を `herdr workspace create --env`
+   （かつ pane 再 pin の `export`）で isolated session に注入する。
+   `scripts/claude-gpt/launch.sh` 自身がこの2つの env var からパスを
+   再構築し、settings.json の `hooks`/`env` ブロックへ書き込む。
+3. **native adapter**: `tempfile.mkdtemp()` で harness 専用ディレクトリを作り、
+   `hook_sink_writer.py`（`_HOOK_SINK_WRITER_SOURCE` 定数）と、5 hook すべてを
+   `python3 "<writer>"` にバインドした `settings.json` をそこに書き、
+   `CLAUDE_CONFIG_DIR=<そのディレクトリ>/claude-config` を同じ `--env`/
+   pane 再 pin パターンで注入する（`scripts/claude-gpt/**` は一切触らない）。
+4. run 終了直前（`finally` で一時ディレクトリを消す前）に
+   `parse_claude_gpt_hook_sink_records(sink_path)` で sink を読み、
+   `evidence["hook_sink_records"]` / `evidence["hook_sink_malformed_line_count"]`
+   に格納する。
+
+`main()` 側では、hook sink records を以下の関数へ渡す（structured lane と
+**同一のアルゴリズム核** `_pair_agent_lifecycle()` を経由する）:
+
+- `verify_claude_gpt_hook_sink_not_stale(records, expected_nonce)`: 3-way
+  `run_nonce` 一致検証（`verify_evidence_not_stale()` とは独立）。
+- `classify_claude_hook_sink_multi_child_lifecycle(records, min_required)`:
+  `SubagentStart`/`SubagentStop` の agent_id を `_pair_agent_lifecycle()` へ
+  渡す（structured lane の `classify_claude_multi_child_lifecycle()` と
+  同じ core）。
+- `verify_claude_gpt_hook_sink_multi_turn(records, min_turns)`:
+  `UserPromptSubmit`/`Stop`/`StopFailure` の `session_id` から同一
+  session 内の paired turn 数を判定する。
+- `verify_claude_gpt_hook_sink_no_raw_content(records)`: `prompt_digest` が
+  64-hex-char の sha256 digest 以外を含んでいないかを構造的に検証する
+  （AC13）。
+
+`transcript_path`/`interactive_transcript_subagent_only_session_dirs` は
+`summary.md` に advisory フィールドとして残り続けるが、`multi_child_lifecycle`
+/`same_session_across_turns` の `verified` 判定には使われない
+（`schema_summary["multi_child_lifecycle_source"] == "hook_event_sink"` /
+`schema_summary["same_session_across_turns_source"] == "hook_event_sink"`
+がこれを示す）。
 
 ### 複数 SubAgent の spawn/completion 証明（`--require-min-subagents`）
 
