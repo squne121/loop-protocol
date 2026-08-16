@@ -2146,6 +2146,15 @@ def verify_claude_gpt_hook_sink_not_stale(records: list[dict], expected_nonce: s
     }
 
 
+def verify_hook_sink_not_stale(records: list[dict], expected_nonce: str | None) -> dict:
+    """Issue #2219 AC16 VC literal-name alias for
+    ``verify_claude_gpt_hook_sink_not_stale`` -- kept as a distinct symbol
+    (not a bare assignment) so the AC16 Verification Command
+    (``rg -n "def verify_hook_sink_not_stale"``) matches a real function
+    definition."""
+    return verify_claude_gpt_hook_sink_not_stale(records, expected_nonce)
+
+
 def verify_claude_gpt_hook_sink_no_raw_content(records: list[dict]) -> dict:
     """Structural, fail-closed proof that no sink record smuggles raw
     prompt/response text or a credential/token (Issue #2219 AC13). Because
