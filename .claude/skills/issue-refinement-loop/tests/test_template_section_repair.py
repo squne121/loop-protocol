@@ -951,8 +951,10 @@ x
         template_text=TEMPLATE_TEXT, template_path=TEMPLATE_PATH,
     )
     by_id = {i["field_id"]: i for i in items}
-    assert by_id["machine-readable-contract.parent_issue"]["disposition"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
-    assert by_id["machine-readable-contract.goal_ref"]["disposition"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
+    parent_issue_item = by_id["machine-readable-contract.parent_issue"]
+    assert parent_issue_item["disposition"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
+    goal_ref_item = by_id["machine-readable-contract.goal_ref"]
+    assert goal_ref_item["disposition"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
 
     body_duplicate_key = """\
 ## Machine-Readable Contract
