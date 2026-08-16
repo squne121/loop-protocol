@@ -96,22 +96,45 @@ done
 
 # --- 以降 "$@" は `--` の後ろに来た claude 追加引数そのもの。文字列へ結合して再分割しない。 ---
 
-# --- Herdr 由来の exact --strict-mcp-config トークンの安全な pre-filter（Issue #2189）。
-#     launcher 自身が起動時に必ず --strict-mcp-config を最終 invocation へ付与する
-#     （下記 L474 相当）ため、呼び出し元（Herdr）が渡す exact 一致トークンはこの既定値と
-#     idempotent であり、下段の forbidden-flag 拒否ループより前に安全に取り除いてよい。
-#     削除対象は完全一致トークン `--strict-mcp-config` のみ（重複があれば全て削除）。
-#     値付き variant（`--strict-mcp-config=...`）、大文字小文字違い
+# --- caller argv 正規化: launcher-level `--` 直後から始まる連続した exact
+#     --strict-mcp-config トークンの leading run のみを安全に削除する pre-filter
+#     （Issue #2189, Provenance Correction 反映）。
+#
+#     当初は「Herdr が claude-kind agent 起動時に exact --strict-mcp-config を常時
+#     付与する」という前提で、caller argv 中の任意位置から無条件に当該トークンを
+#     削除する実装だった。しかし Herdr v0.8.0 upstream source・ローカル installed
+#     binary・現行 run_worktree_agent_runtime_smoke.py のいずれにも、この flag を
+#     自動注入する経路は存在しないことが判明し、その前提は撤回された
+#     （Issue #2189 Provenance Correction 節参照）。一方で、任意位置からの無条件削除
+#     実装そのものには、provenance とは独立に実機で再現された本物のバグが存在した
+#     （`-p <value>` の値・downstream `--` より後の positional literal・
+#     `--append-system-prompt` 等任意文字列を受けるオプションの値として渡された同一
+#     文字列を誤って削除してしまう。Issue #2189 Live Reproduction 節で実 Claude Code
+#     binary に対して再現済み）。
+#
+#     このため、削除対象を launcher-level `--` 直後の位置から始まる「先頭からの
+#     連続した run」のみに限定する。run の走査中に exact 一致しないトークンが
+#     1つでも現れた時点でそこで走査を終了し、それ以降のトークン（そのトークン自身、
+#     downstream の `--`、値、prompt 等すべてを含む）には一切触れず無条件で保持する。
+#     これにより、run の先頭にない --strict-mcp-config（オプション値・downstream
+#     positional literal 等）は削除対象にならず安全側に倒れる。
+#
+#     削除対象は完全一致トークン `--strict-mcp-config` のみ（run 内に重複があれば
+#     全て削除）。値付き variant（`--strict-mcp-config=...`）、大文字小文字違い
 #     （`--Strict-Mcp-Config` 等）、部分文字列を含む別トークン
-#     （`--strict-mcp-config-evil` 等）は削除せず、下段の forbidden-flag チェックへ
-#     そのまま残す（forbidden 判定または unknown flag 判定に落ちる）。
+#     （`--strict-mcp-config-evil` 等）は run の一致判定に使わず、run を止めた上で
+#     下段の forbidden-flag チェックへそのまま残す（forbidden 判定または unknown
+#     flag 判定に落ちる）。
 #     POSIX sh の positional parameter を quoted "$@" のまま for/set -- で再構築する
 #     （bash 配列・unquoted $@・`case ... *)` glob match は使わない。exact-match のみ）。
 CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED=false
+CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STOPPED=false
 for arg in "$@"; do
-  if [ "$arg" = "--strict-mcp-config" ]; then
+  if [ "$CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STOPPED" = "false" ] && [ "$arg" = "--strict-mcp-config" ]; then
     continue
   fi
+  # leading run はここで終了する。以降の全トークンは無条件で保持する。
+  CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STOPPED=true
   if [ "$CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED" = "false" ]; then
     set -- "$arg"
     CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED=true
