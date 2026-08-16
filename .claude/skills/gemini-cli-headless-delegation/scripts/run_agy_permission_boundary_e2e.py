@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
 import hashlib
 import http.server
 import importlib.util
@@ -463,7 +464,41 @@ def validate_artifact(artifact: Mapping[str, Any], *, forbidden: tuple[str, ...]
             return False, "attempt_predicates_invalid"
     exit_code = runner["exit_code"]
     completion = failure["completion"]
-    cleanup_ok = all(cleanup.values())
+    removal = cleanup.get("temporary_tree_removal")
+    if isinstance(removal, Mapping):
+        retry_eligible = removal["retry_eligible"]
+        observation = removal["residual_observation"]
+        if cleanup["temporary_processes_removed"] != removal["postcondition_absent"]:
+            return False, "temporary_removal_projection_invalid"
+        if removal["final_cleanup_verdict"] == "removed" and not removal["postcondition_absent"]:
+            return False, "temporary_removal_removed_without_enoent"
+        if retry_eligible:
+            if not (
+                removal["initial_result"] == "failure"
+                and removal["initial_errno"] in RETRYABLE_TEMPORARY_REMOVAL_ERRNOS
+                and observation["status"] == "complete"
+                and observation["holder_status"] == "absent"
+                and removal["retry_count"] == 1
+            ):
+                return False, "temporary_removal_retry_policy_invalid"
+        elif removal["retry_count"] != 0 or removal["retry_result"] != "not_run":
+            return False, "temporary_removal_uneligible_retry_invalid"
+        if removal["retry_result"] != "not_run" and removal["retry_count"] != 1:
+            return False, "temporary_removal_retry_count_invalid"
+        if removal["final_cleanup_verdict"] == "removed" and not (
+            removal["initial_result"] == "success" or removal["retry_result"] == "success"
+        ):
+            return False, "temporary_removal_removed_without_successful_delete"
+        if removal["retry_policy_mode"] == "observation_only" and retry_eligible:
+            return False, "temporary_removal_observation_only_retry_invalid"
+        if removal["retry_policy_mode"] not in {"observation_only", "single_retry_enabled"}:
+            return False, "temporary_removal_retry_policy_mode_invalid"
+    cleanup_ok = (
+        cleanup["temporary_processes_removed"]
+        and cleanup["loopback_servers_stopped"]
+        and bool(cleanup.get("process_group_isolated", True))
+        and bool(cleanup.get("descendant_processes_absent", True))
+    )
     all_predicates = all(all(item["predicates"].values()) for item in attempts)
     if not cleanup_ok and exit_code != EXIT_FAIL:
         return False, "cleanup_exit_invariant_invalid"
@@ -1312,6 +1347,192 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
     return attempts
 
 
+RETRYABLE_TEMPORARY_REMOVAL_ERRNOS = frozenset({errno.ENOTEMPTY, errno.EEXIST})
+_MAX_RESIDUAL_ENTRIES = 64
+_MAX_PROC_HOLDER_PROBES = 4096
+_MAX_PROC_FDS_PER_PROCESS = 64
+_SAFE_RMTREE_OPERATIONS = frozenset({"rmdir", "unlink", "remove", "lstat", "rmtree"})
+
+
+def _temporary_path_identity(root: Path, path: str | os.PathLike[str]) -> tuple[str, str | None]:
+    """Classify an rmtree callback path without persisting its raw value."""
+    try:
+        relative = Path(path).relative_to(root)
+    except ValueError:
+        return "unknown", None
+    path_class = "root" if relative == Path(".") else "descendant"
+    return path_class, "sha256:" + hashlib.sha256(relative.as_posix().encode("utf-8")).hexdigest()
+
+
+def _sanitized_rmtree_operation(operation: object) -> str:
+    name = getattr(operation, "__name__", "")
+    return name if name in _SAFE_RMTREE_OPERATIONS else "unknown"
+
+
+def _failure_provenance(
+    root: Path, operation: object, path: str | os.PathLike[str], exception: BaseException
+) -> dict[str, Any]:
+    error_number = exception.errno if isinstance(exception, OSError) else None
+    path_class, relative_path_digest = _temporary_path_identity(root, path)
+    return {
+        "initial_exception_type": type(exception).__name__,
+        "initial_errno": error_number,
+        "initial_errno_name": errno.errorcode.get(error_number) if error_number is not None else None,
+        "initial_operation": _sanitized_rmtree_operation(operation),
+        "path_class": path_class,
+        "relative_path_digest": relative_path_digest,
+    }
+
+
+def _raise_rmtree_callback_exception(exception: object) -> None:
+    """Make ``onexc`` stop rmtree after recording the first failure."""
+    if isinstance(exception, BaseException):
+        raise exception
+    if isinstance(exception, tuple) and len(exception) > 1 and isinstance(exception[1], BaseException):
+        raise exception[1]
+    raise OSError("rmtree onexc supplied no exception instance")
+
+
+def _rmtree_once(root: Path) -> tuple[bool, dict[str, Any] | None]:
+    first_failure: dict[str, Any] | None = None
+
+    def onexc(operation: object, path: str, exception: object) -> None:
+        nonlocal first_failure
+        if first_failure is None:
+            actual_exception = exception if isinstance(exception, BaseException) else OSError("unknown rmtree error")
+            first_failure = _failure_provenance(root, operation, path, actual_exception)
+        _raise_rmtree_callback_exception(exception)
+
+    try:
+        shutil.rmtree(root, onexc=onexc)
+    except BaseException as exception:  # keep unknown filesystem failures fail-closed
+        if first_failure is None:
+            first_failure = _failure_provenance(root, "rmtree", root, exception)
+        return False, first_failure
+    return True, first_failure
+
+
+def _observe_proc_holders(root: Path) -> str:
+    """Boundedly inspect Linux /proc FDs; never persist command lines or paths."""
+    proc = Path("/proc")
+    if os.name != "posix" or not proc.is_dir():
+        return "unsupported"
+    try:
+        process_dirs: list[Path] = []
+        for candidate in proc.iterdir():
+            if not candidate.name.isdigit():
+                continue
+            if len(process_dirs) >= _MAX_PROC_HOLDER_PROBES:
+                return "unsupported"
+            process_dirs.append(candidate)
+    except OSError:
+        return "error"
+    if len(process_dirs) == _MAX_PROC_HOLDER_PROBES:
+        return "unsupported"
+    root_value = str(root)
+    for process_dir in sorted(process_dirs):
+        fd_dir = process_dir / "fd"
+        try:
+            for descriptor_count, descriptor in enumerate(fd_dir.iterdir(), start=1):
+                # Hitting either observation bound is incomplete evidence, never
+                # evidence that retry is safe.  Do not materialize the FD list.
+                if descriptor_count >= _MAX_PROC_FDS_PER_PROCESS:
+                    return "unsupported"
+                try:
+                    target = os.readlink(descriptor)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return "error"
+                target = target.removesuffix(" (deleted)")
+                if target == root_value or target.startswith(root_value + os.sep):
+                    return "busy"
+        except PermissionError:
+            return "unsupported"
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "error"
+    return "absent"
+
+
+def _observe_temporary_residual(root: Path) -> dict[str, Any]:
+    """Return a bounded, read-only residual summary with no filenames."""
+    try:
+        with os.scandir(root) as entries:
+            entry_count = 0
+            for _entry in entries:
+                entry_count += 1
+                if entry_count > _MAX_RESIDUAL_ENTRIES:
+                    return {"status": "unsupported", "entry_count": None, "holder_status": "not_checked"}
+    except FileNotFoundError:
+        return {"status": "complete", "entry_count": 0, "holder_status": "absent"}
+    except OSError:
+        return {"status": "error", "entry_count": None, "holder_status": "error"}
+    holder_status = _observe_proc_holders(root)
+    if holder_status == "unsupported":
+        status = "unsupported"
+    elif holder_status == "error":
+        status = "error"
+    else:
+        status = "complete"
+    return {"status": status, "entry_count": entry_count, "holder_status": holder_status}
+
+
+def _temporary_root_absent(root: Path) -> bool:
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _remove_temporary_tree_with_evidence(root: Path, *, retry_enabled: bool = True) -> dict[str, Any]:
+    """Delete a runner-owned temp tree with provenance and one fail-closed retry."""
+    evidence: dict[str, Any] = {
+        "initial_result": "success",
+        "initial_exception_type": None,
+        "initial_errno": None,
+        "initial_errno_name": None,
+        "initial_operation": None,
+        "path_class": None,
+        "relative_path_digest": None,
+        "residual_observation": {"status": "not_run", "entry_count": None, "holder_status": "not_checked"},
+        "retry_policy_mode": "single_retry_enabled" if retry_enabled else "observation_only",
+        "retry_eligible": False,
+        "retry_count": 0,
+        "retry_result": "not_run",
+        "final_cleanup_verdict": "failed",
+        "postcondition_absent": False,
+    }
+    initial_success, provenance = _rmtree_once(root)
+    if not initial_success:
+        evidence["initial_result"] = "failure"
+        assert provenance is not None
+        evidence.update(provenance)
+        observation = _observe_temporary_residual(root)
+        evidence["residual_observation"] = observation
+        retry_eligible = (
+            retry_enabled
+            and evidence["initial_errno"] in RETRYABLE_TEMPORARY_REMOVAL_ERRNOS
+            and observation["status"] == "complete"
+            and observation["holder_status"] == "absent"
+        )
+        evidence["retry_eligible"] = retry_eligible
+        if retry_eligible:
+            evidence["retry_count"] = 1
+            retry_success, _retry_provenance = _rmtree_once(root)
+            evidence["retry_result"] = "success" if retry_success else "failure"
+    postcondition_absent = _temporary_root_absent(root)
+    evidence["postcondition_absent"] = postcondition_absent
+    successful_removal = initial_success or evidence["retry_result"] == "success"
+    if successful_removal and postcondition_absent:
+        evidence["final_cleanup_verdict"] = "removed"
+    return evidence
+
+
 def _verify_process_group_absent(pgid: int) -> bool:
     """Issue #1979 AC7: confirm no process remains in *pgid*'s process group.
 
@@ -1639,11 +1860,9 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             loopback_canary = runtime.get("loopback_canary")
             if isinstance(loopback_canary, _LoopbackCanary):
                 loopback_stopped_ok = loopback_canary.stop()
-        temporary_removed_ok = True
-        try:
-            shutil.rmtree(temporary)
-        except OSError:
-            temporary_removed_ok = False
+        observation_only = bool(getattr(args, "cleanup_observation_only", False))
+        temporary_tree_removal = _remove_temporary_tree_with_evidence(temporary, retry_enabled=not observation_only)
+        temporary_removed_ok = temporary_tree_removal["final_cleanup_verdict"] == "removed"
         cleanup_ok = loopback_stopped_ok and temporary_removed_ok
         if not cleanup_ok:
             exit_code = EXIT_FAIL
@@ -1656,6 +1875,10 @@ def _run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "process_group_isolated": process_group_isolated,
             "descendant_processes_absent": descendant_processes_absent,
         }
+        # The object is optional in v1 so legacy artifacts remain valid, but
+        # this producer always records the retry mode: retry_count == 0 alone
+        # cannot distinguish Phase A observation-only from Phase B.
+        result["cleanup"]["temporary_tree_removal"] = temporary_tree_removal
         result["artifact"]["digest"] = _artifact_digest(result)
         result["runner"]["artifact_digest"] = result["artifact"]["digest"]
     return exit_code, result
@@ -1789,6 +2012,11 @@ def main() -> int:
     parser.add_argument("--agy", help="explicit fake executable in hermetic mode")
     parser.add_argument("--mode", choices=("hermetic", "live"), default="live")
     parser.add_argument("--allow-live", action="store_true", help="caller has confirmed no additional charge")
+    parser.add_argument(
+        "--cleanup-observation-only",
+        action="store_true",
+        help="record cleanup provenance without permitting the bounded retry",
+    )
     args = parser.parse_args()
     if args.profile not in {"no_tools", "local_asset_research", "grounded_research", "proposal_only"}:
         parser.error("unknown profile")
