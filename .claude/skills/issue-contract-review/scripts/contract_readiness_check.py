@@ -59,6 +59,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from baseline_vc_preflight import (  # noqa: E402
     DEFAULT_TIMEOUT_SECONDS as _PER_VC_COMMAND_TIMEOUT_SECONDS,
+    compute_canonical_vc_plan as _compute_canonical_vc_plan,
     extract_verification_commands_section,
 )
 from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
@@ -103,6 +104,131 @@ VALIDATE_ISSUE_BODY_TIMEOUT_SECONDS = 30
 CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS = (
     VALIDATE_ISSUE_BODY_TIMEOUT_SECONDS + BASELINE_VC_PREFLIGHT_AGGREGATE_TIMEOUT_SECONDS + 20
 )
+
+# ---------------------------------------------------------------------------
+# Cleanup-aware review timeout budget formula (Issue #2207)
+# ---------------------------------------------------------------------------
+#
+# Given `N` (the canonical VC plan's `launch_upper_bound`, see
+# `baseline_vc_preflight.compute_canonical_vc_plan()`), derives the 4-value
+# invocation-local timeout envelope the review pipeline uses:
+#
+#   - `baseline_aggregate_seconds`: this module's OWN
+#     `BASELINE_VC_PREFLIGHT_AGGREGATE_TIMEOUT_SECONDS`-equivalent, but
+#     invocation-local (derived from THIS body's plan, not the N<=2
+#     compatibility module constant)
+#   - `readiness_wrapper_seconds`: this module's OWN
+#     `CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS`-equivalent, invocation-local
+#   - `per_attempt_seconds`: the deadline `run_root_review_pipeline.py`
+#     passes to `reviewer_transport.run_reviewer_transport(per_attempt_deadline=...)`
+#   - `total_seconds`: the deadline passed as `total_deadline=...`
+#
+# Formula (Issue #2207 OWNER-reviewed redesign):
+#
+#     per_vc_slot          = per_command_cap (150s) + cleanup_tail (15s)
+#                           = 165s
+#     effective_n           = max(2, N)
+#     baseline_aggregate    = effective_n * per_vc_slot + AGGREGATE_MARGIN_SECONDS (20s)
+#     readiness_wrapper     = VALIDATE_ISSUE_BODY_TIMEOUT_SECONDS (30s)
+#                             + baseline_aggregate
+#                             + READINESS_WRAPPER_MARGIN_SECONDS (20s)
+#     per_attempt           = CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS (30s)
+#                             + readiness_wrapper
+#                             + MERGE_READINESS_TIMEOUT_SECONDS (30s)
+#                             + PER_ATTEMPT_MARGIN_SECONDS (20s)
+#     total                 = per_attempt + TOTAL_MARGIN_SECONDS (40s)
+#
+# At `effective_n == 2` (i.e. `N <= 2`) this reduces EXACTLY to the current
+# production values (350s / 400s / 480s / 520s) -- Issue #2207 AC5 "low-count
+# compatibility" is therefore a natural consequence of the `max(2, N)`
+# floor, not a separately hand-coded branch (avoiding a second place the
+# two could drift apart again). Note `VALIDATE_ISSUE_BODY_TIMEOUT_SECONDS`
+# here is the SAME named constant defined above (not re-derived).
+#
+# `_CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS_MIRROR` /
+# `_MERGE_READINESS_TIMEOUT_SECONDS_MIRROR` are intentionally mirrored here
+# (not imported) from `run_root_review_pipeline.py`'s own constants of the
+# same name, to avoid a circular import (`run_root_review_pipeline.py`
+# already imports THIS module). A pytest in `issue-refinement-loop/tests/`
+# cross-checks the two stay identical.
+
+_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = 15
+_PER_VC_SLOT_SECONDS = _PER_VC_COMMAND_TIMEOUT_SECONDS + _PER_VC_SLOT_CLEANUP_TAIL_SECONDS  # 165
+
+_BUDGET_AGGREGATE_MARGIN_SECONDS = 20
+_BUDGET_READINESS_WRAPPER_MARGIN_SECONDS = 20
+_CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS_MIRROR = 30
+_MERGE_READINESS_TIMEOUT_SECONDS_MIRROR = 30
+_BUDGET_PER_ATTEMPT_MARGIN_SECONDS = 20
+_BUDGET_TOTAL_MARGIN_SECONDS = 40
+
+_BUDGET_LOW_COUNT_FLOOR = 2
+
+# Issue #2207 AC7: same fixed policy ceiling
+# `baseline_vc_preflight.compute_canonical_vc_plan()` reports as
+# `policy_cap`.
+MAX_VC_EXECUTION_SLOTS = 40
+
+
+class VerificationBudgetExceedsPolicyError(Exception):
+    """Typed, non-retryable rejection: `N` exceeds the fixed policy ceiling.
+
+    Raised BEFORE any subprocess is launched (Issue #2207 AC7).
+    """
+
+    error_code = "verification_budget_exceeds_policy"
+
+    def __init__(self, n: int, policy_cap: int):
+        self.n = n
+        self.policy_cap = policy_cap
+        super().__init__(
+            f"launch_upper_bound={n} exceeds policy_cap={policy_cap} ({self.error_code})"
+        )
+
+
+class ReviewBudget(NamedTuple):
+    n: int
+    effective_n: int
+    baseline_aggregate_seconds: int
+    readiness_wrapper_seconds: int
+    per_attempt_seconds: int
+    total_seconds: int
+
+
+def derive_review_budget(
+    launch_upper_bound: int, *, policy_cap: int = MAX_VC_EXECUTION_SLOTS
+) -> ReviewBudget:
+    """Derive the invocation-local `ReviewBudget` from `launch_upper_bound`.
+
+    Raises `VerificationBudgetExceedsPolicyError` (non-retryable, subprocess
+    NOT launched) if `launch_upper_bound > policy_cap`.
+    """
+    if launch_upper_bound > policy_cap:
+        raise VerificationBudgetExceedsPolicyError(launch_upper_bound, policy_cap)
+
+    effective_n = max(_BUDGET_LOW_COUNT_FLOOR, launch_upper_bound)
+
+    baseline_aggregate = effective_n * _PER_VC_SLOT_SECONDS + _BUDGET_AGGREGATE_MARGIN_SECONDS
+    readiness_wrapper = (
+        VALIDATE_ISSUE_BODY_TIMEOUT_SECONDS + baseline_aggregate + _BUDGET_READINESS_WRAPPER_MARGIN_SECONDS
+    )
+    per_attempt = (
+        _CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS_MIRROR
+        + readiness_wrapper
+        + _MERGE_READINESS_TIMEOUT_SECONDS_MIRROR
+        + _BUDGET_PER_ATTEMPT_MARGIN_SECONDS
+    )
+    total = per_attempt + _BUDGET_TOTAL_MARGIN_SECONDS
+
+    return ReviewBudget(
+        n=launch_upper_bound,
+        effective_n=effective_n,
+        baseline_aggregate_seconds=baseline_aggregate,
+        readiness_wrapper_seconds=readiness_wrapper,
+        per_attempt_seconds=per_attempt,
+        total_seconds=total,
+    )
+
 
 # Required fields for `decision: immediate` in Runtime Verification Applicability section
 _RVA_IMMEDIATE_REQUIRED_FIELDS = [
@@ -510,12 +636,52 @@ def map_validate_errors_to_readiness_errors(validate_result: dict) -> list[dict]
 # ---------------------------------------------------------------------------
 
 
+def compute_invocation_local_baseline_timeout(body: str) -> int:
+    """Issue #2207: derive the `baseline_vc_preflight.py` aggregate wrapper
+    timeout for THIS specific pinned `body`, from the canonical VC plan's
+    `launch_upper_bound` -- instead of the fixed
+    `BASELINE_VC_PREFLIGHT_AGGREGATE_TIMEOUT_SECONDS` module constant (which
+    remains the `N<=2` compatibility value used when this function is not
+    invoked, e.g. by any external importer still reading the module
+    constant directly).
+
+    Raises `VerificationBudgetExceedsPolicyError` (non-retryable) if the
+    plan's `launch_upper_bound` exceeds the fixed policy ceiling -- BEFORE
+    any subprocess is launched.
+    """
+    plan = _compute_canonical_vc_plan(body)
+    budget = derive_review_budget(plan["launch_upper_bound"], policy_cap=plan["policy_cap"])
+    return budget.baseline_aggregate_seconds
+
+
 def run_baseline_vc_preflight(body: str) -> tuple[dict, int]:
     """
     Run baseline_vc_preflight.py via subprocess.
     Returns (parsed_json, exit_code).
     Only called in --mode execute.
     """
+    # Issue #2207: compute the invocation-local aggregate timeout from the
+    # SAME canonical VC plan the executor's occurrence count is bound to,
+    # BEFORE writing the tempfile / launching any subprocess. A body whose
+    # plan exceeds the policy ceiling is rejected here (typed,
+    # non-retryable `runtime_error` / `verification_budget_exceeds_policy`)
+    # rather than ever spawning `baseline_vc_preflight.py`.
+    try:
+        aggregate_timeout_seconds = compute_invocation_local_baseline_timeout(body)
+    except VerificationBudgetExceedsPolicyError as exc:
+        return (
+            {
+                "schema": "baseline_vc_preflight/v1",
+                "status": "runtime_error",
+                "results": [],
+                "errors": [],
+                "failure_class": exc.error_code,
+                "timeout_phase": None,
+                "retryable": False,
+            },
+            -1,
+        )
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".md", delete=False, encoding="utf-8"
     ) as tf:
@@ -523,21 +689,20 @@ def run_baseline_vc_preflight(body: str) -> tuple[dict, int]:
         tmp_path = tf.name
 
     try:
-        # Issue #2165 P1-1(c): the aggregate wrapper timeout is derived
-        # (`BASELINE_VC_PREFLIGHT_AGGREGATE_TIMEOUT_SECONDS`, above) from
-        # `baseline_vc_preflight.py`'s own per-VC-command cap rather than an
-        # independent hardcoded number, so the two values cannot drift the
-        # way the OWNER-flagged 150s-cap/200s-aggregate pairing could (two
-        # VCs near the per-command cap already exceeding the old fixed
-        # aggregate value). The caller (`run_root_review_pipeline.py`'s
-        # `run_contract_readiness_check()`) derives ITS OWN wrapper timeout
-        # (`CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS`) from this module's
-        # constants for the same reason.
+        # Issue #2165 P1-1(c) / Issue #2207: the aggregate wrapper timeout is
+        # derived from `baseline_vc_preflight.py`'s own per-VC-command cap
+        # AND (Issue #2207) the canonical VC plan's `launch_upper_bound` for
+        # THIS body, rather than an independent hardcoded number or a fixed
+        # `N<=2` assumption -- so the two values cannot drift the way the
+        # OWNER-flagged pairings could. The caller
+        # (`run_root_review_pipeline.py`'s `run_contract_readiness_check()`)
+        # derives ITS OWN wrapper timeout from the SAME canonical plan for
+        # the same reason (Issue #2207 AC8).
         result = subprocess.run(
             [sys.executable, str(_BASELINE_VC_PREFLIGHT_PY), "--strict", "--body-file", tmp_path],
             capture_output=True,
             text=True,
-            timeout=BASELINE_VC_PREFLIGHT_AGGREGATE_TIMEOUT_SECONDS,
+            timeout=aggregate_timeout_seconds,
         )
         exit_code = result.returncode
         if result.stdout:

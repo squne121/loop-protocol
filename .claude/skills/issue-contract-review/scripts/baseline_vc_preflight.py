@@ -17,6 +17,8 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -704,6 +706,121 @@ def _is_parallel_eligible_command(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Canonical VC occurrence planner (Issue #2207)
+# ---------------------------------------------------------------------------
+#
+# Side-effect-free planner shared by budget derivation
+# (`contract_readiness_check.py`'s `derive_review_budget()`) and THIS
+# module's own executor loop below. Given pinned Issue body bytes, computes
+# a canonical plan binding a `body_sha256` to the conservative upper bound
+# of VC subprocess launches the executor may actually spawn for that body.
+#
+# This function NEVER executes a subprocess and NEVER performs I/O beyond
+# reading the in-memory `body` string it is given. It reuses the SAME
+# normal-execution parsing primitives (`extract_verification_commands_section()`
+# / `extract_fenced_bash_blocks()` / `parse_commands_from_block()` /
+# `_is_parallel_eligible_command()`) the executor loop in `main()` below
+# uses, so the plan cannot silently drift from what the executor actually
+# does (Issue #2207 OWNER finding: "budget/execution parser drift").
+#
+# Counting semantics (OWNER-reviewed redesign, Issue #2207):
+#
+# - `command_occurrence_count`: the RAW number of VC command lines extracted
+#   from the `## Verification Commands` section, with NO dedup applied at
+#   all (pure or non-pure). This is a diagnostic total occurrence count --
+#   every duplicate non-pure command occurrence counts (AC2), and distinct
+#   pure commands (`rg` / exact `test -f|-d|-s`) are included too (AC3).
+#
+# - `launch_upper_bound`: the conservative upper bound of ACTUAL subprocess
+#   launches the executor may perform for this body. Non-pure commands are
+#   NEVER dedup-replayed by the executor, so every occurrence counts as a
+#   separate launch and also advances the executor's `state_epoch` (state
+#   barrier semantics). Pure commands ARE dedup-replayed by the executor
+#   when an identical (command-text) observation recurs within the SAME
+#   state epoch (no non-pure barrier between them) -- so a repeated
+#   observation within one epoch is counted once, but the SAME pure command
+#   observed again after a barrier belongs to a new epoch and is counted as
+#   a separate launch (AC4). This mirrors this module's own `_state_epoch`
+#   / `_dedup_seen_keys` bookkeeping in `main()` below, without executing
+#   anything.
+#
+# `N = max(2, launch_upper_bound)` is the value
+# `contract_readiness_check.derive_review_budget()` consumes to derive the
+# timeout envelope.
+
+# Issue #2207 AC7: fixed policy ceiling on `launch_upper_bound`. Chosen so a
+# reasonable worst-case aggregate timeout stays bounded even at the ceiling
+# (40 * (150 + 15) + 20 = 6620s ~ 110 minutes) while comfortably exceeding
+# any currently-observed live Issue body VC count. A body whose canonical
+# plan exceeds this MUST be rejected before any subprocess is launched
+# (`verification_budget_exceeds_policy`, non-retryable).
+MAX_VC_EXECUTION_SLOTS = 40
+
+VC_PLAN_PARSER_CONTRACT_VERSION = "v1"
+
+# Matches this module's `--max-workers` default (fully serial execution).
+# The canonical plan does not itself change execution concurrency; it
+# reports the value the executor would use unless the caller overrides it.
+_VC_PLAN_DEFAULT_MAX_WORKERS = 1
+
+
+def compute_canonical_vc_plan(
+    body: str,
+    *,
+    policy_cap: int = MAX_VC_EXECUTION_SLOTS,
+    max_workers: int = _VC_PLAN_DEFAULT_MAX_WORKERS,
+    per_command_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Compute the canonical, side-effect-free VC plan for `body`.
+
+    Returns a dict with `body_sha256` / `parser_contract_version` /
+    `command_occurrence_count` / `launch_upper_bound` /
+    `per_command_timeout_seconds` / `max_workers` / `policy_cap`.
+    """
+    body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    section = extract_verification_commands_section(body) or ""
+    blocks = extract_fenced_bash_blocks(section)
+
+    command_occurrence_count = 0
+    launch_upper_bound = 0
+    state_epoch = 0
+    seen_in_epoch: Dict[int, set] = {}
+
+    for block in blocks:
+        for entry in parse_commands_from_block(block):
+            command = entry[1]
+            command_occurrence_count += 1
+
+            is_pure = _is_parallel_eligible_command(command)
+            if is_pure:
+                bucket = seen_in_epoch.setdefault(state_epoch, set())
+                key = command.strip()
+                if key in bucket:
+                    # Executor dedup-replays this observation: not an
+                    # additional subprocess launch.
+                    continue
+                bucket.add(key)
+                launch_upper_bound += 1
+            else:
+                # Non-pure: never dedup-replayed, and advances the state
+                # barrier so any later repeat of an earlier pure command
+                # belongs to a new epoch (AC4).
+                launch_upper_bound += 1
+                state_epoch += 1
+
+    return {
+        "body_sha256": body_sha256,
+        "parser_contract_version": VC_PLAN_PARSER_CONTRACT_VERSION,
+        "command_occurrence_count": command_occurrence_count,
+        "launch_upper_bound": launch_upper_bound,
+        "per_command_timeout_seconds": per_command_timeout_seconds,
+        "max_workers": max_workers,
+        "policy_cap": policy_cap,
+    }
+
+
 def detect_compound_command(command: str) -> bool:
     """
     コマンドが compound shell syntax を含むか検出
@@ -725,6 +842,113 @@ def detect_compound_command(command: str) -> bool:
     # shell operators
     operators = {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
     return any(t in operators for t in tokens)
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM cooperative cancellation (Issue #2207 AC9)
+# ---------------------------------------------------------------------------
+#
+# `run_command()` below already kills an INDIVIDUAL VC subprocess's whole
+# process group on ITS OWN per-command timeout (`_kill_process_group()`).
+# This section adds a SEPARATE, process-wide layer: while any VC
+# subprocess is in flight, its process group id is tracked in
+# `_ACTIVE_PROCESS_GROUPS`. If THIS `baseline_vc_preflight.py` process
+# itself receives SIGTERM (e.g. a future outer aggregate-deadline wrapper
+# terminating it because the aggregate budget was exceeded), the installed
+# handler reaps every CURRENTLY active VC process group (direct child +
+# grandchildren, since each was launched with `start_new_session=True`)
+# before this process exits, so no VC descendant is left orphaned.
+
+_ACTIVE_PROCESS_GROUPS_LOCK = threading.Lock()
+_ACTIVE_PROCESS_GROUPS: set = set()
+
+
+def _register_active_process_group(pid: int) -> None:
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, OSError):
+        return
+    with _ACTIVE_PROCESS_GROUPS_LOCK:
+        _ACTIVE_PROCESS_GROUPS.add(pgid)
+
+
+def _unregister_active_process_group(pid: int) -> None:
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+    with _ACTIVE_PROCESS_GROUPS_LOCK:
+        if pgid is not None:
+            _ACTIVE_PROCESS_GROUPS.discard(pgid)
+
+
+def reap_all_active_process_groups(*, grace_seconds: float = 5.0, poll_interval: float = 0.05) -> int:
+    """Terminate + reap every VC process group currently registered as
+    active. SIGTERM first, bounded grace period, SIGKILL if still alive.
+    Best-effort/idempotent: a group that already exited between
+    registration and this call is not an error. Returns the number of
+    groups that were signaled (not necessarily still alive).
+    """
+    with _ACTIVE_PROCESS_GROUPS_LOCK:
+        pgids = list(_ACTIVE_PROCESS_GROUPS)
+
+    signaled = 0
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            with _ACTIVE_PROCESS_GROUPS_LOCK:
+                _ACTIVE_PROCESS_GROUPS.discard(pgid)
+            continue
+        signaled += 1
+
+        deadline = time.monotonic() + grace_seconds
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, OSError):
+                alive = False
+                break
+            time.sleep(poll_interval)
+        if alive:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+
+        with _ACTIVE_PROCESS_GROUPS_LOCK:
+            _ACTIVE_PROCESS_GROUPS.discard(pgid)
+
+    return signaled
+
+
+def install_sigterm_cooperative_cancellation() -> None:
+    """Install a SIGTERM handler that reaps all active VC process groups
+    before this process terminates (Issue #2207 AC9). POSIX-only (relies on
+    `os.killpg` / process-group semantics); a caller on a platform without
+    POSIX process-group support should NOT call this (the caller is
+    expected to treat that as `environment blocked`, not silently skip
+    cancellation).
+    """
+
+    def _handler(signum: int, frame: Any) -> None:  # noqa: ANN401
+        reap_all_active_process_groups()
+        # Restore default disposition and re-raise so THIS process still
+        # actually terminates on SIGTERM (cooperative cleanup, not a
+        # swallow-and-continue handler).
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _handler)
+
+
+def posix_process_groups_supported() -> bool:
+    """Issue #2207 AC9: whether this environment provides POSIX process
+    group semantics (`os.killpg` / `start_new_session`). If False, the
+    caller must treat SIGTERM cooperative cancellation as unavailable
+    (`environment blocked`), never silently degrade to a no-op success."""
+    return os.name == "posix" and hasattr(os, "killpg") and hasattr(signal, "SIGTERM")
 
 
 def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str, str, int, Dict[str, str]]:
@@ -788,21 +1012,36 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
+        # Issue #2207 AC9: track this VC subprocess's process group while
+        # it is in flight so a SIGTERM to the OUTER `baseline_vc_preflight.py`
+        # process itself (see `install_sigterm_cooperative_cancellation()`)
+        # can reap it even though this specific per-command timeout path
+        # hasn't fired. `getattr(process, "pid", None)`: some existing test
+        # doubles stand in for `subprocess.Popen` without a `.pid` attribute
+        # (they never exercise the timeout/SIGTERM path); registration is a
+        # best-effort side channel and must not raise for those.
+        _vc_process_pid = getattr(process, "pid", None)
+        if _vc_process_pid is not None:
+            _register_active_process_group(_vc_process_pid)
         try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            _kill_process_group(process)
-            # Drain pipes after the group is dead so `communicate()` doesn't
-            # block indefinitely on an orphaned pipe write-end still held
-            # open by a reaped-but-not-yet-reclaimed grandchild.
             try:
-                process.communicate(timeout=5)
-            except Exception:
-                pass
+                stdout, stderr = process.communicate(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(process)
+                # Drain pipes after the group is dead so `communicate()` doesn't
+                # block indefinitely on an orphaned pipe write-end still held
+                # open by a reaped-but-not-yet-reclaimed grandchild.
+                try:
+                    process.communicate(timeout=5)
+                except Exception:
+                    pass
+                duration_ms = int((datetime.now() - start).total_seconds() * 1000)
+                return -1, "", "timeout", duration_ms, env_delta
             duration_ms = int((datetime.now() - start).total_seconds() * 1000)
-            return -1, "", "timeout", duration_ms, env_delta
-        duration_ms = int((datetime.now() - start).total_seconds() * 1000)
-        return process.returncode, stdout, stderr, duration_ms, env_delta
+            return process.returncode, stdout, stderr, duration_ms, env_delta
+        finally:
+            if _vc_process_pid is not None:
+                _unregister_active_process_group(_vc_process_pid)
     except subprocess.TimeoutExpired:
         duration_ms = int((datetime.now() - start).total_seconds() * 1000)
         return -1, "", "timeout", duration_ms, env_delta
@@ -2912,6 +3151,26 @@ def classify_result(
             "baseline_fail_expected"
         )
 
+    # timeout check (Issue #1892: exact canonical runner sentinel only.
+    # run_command() sets stderr to the literal string "timeout" and
+    # exit_code to -1 exclusively on subprocess.TimeoutExpired; matching on
+    # a stderr substring ("timeout" in stderr.lower()) previously caused
+    # any non-timeout command whose stderr merely contained the word
+    # "timeout" (e.g. a pytest node-id or error message referencing a
+    # timeout test) to be misclassified as a real timeout.
+    #
+    # Issue #2207 AC9/AC10: this check MUST run BEFORE the regression_gate
+    # branch below. `_is_regression_gate_command()` matches on command
+    # SHAPE only (e.g. any pytest/uv-run-pytest invocation), independent of
+    # exit_code -- so a regression-gate-shaped VC that actually timed out
+    # (exit_code -1, run_command()'s canonical sentinel) would otherwise
+    # fall into the regression_gate branch's generic
+    # "Regression gate command failed" classification and NEVER reach this
+    # timeout-specific classification, masking a genuine per-command-timeout
+    # fault as an ordinary regression-gate failure.
+    if exit_code == -1 and stderr.strip() == "timeout":
+        return "blocked", "timeout", "blocked", "Command exceeded timeout", "baseline_fail_expected"
+
     # AC4: regression_gate prefix detection AFTER static checks
     # If it's a regression gate, apply special rules
     if _is_regression_gate_command(command, cwd=cwd):
@@ -3012,16 +3271,6 @@ def classify_result(
                 "pytest collected 0 tests (exit 5); check -k filter or test path",
                 "baseline_fail_expected",
             )
-
-    # timeout check (Issue #1892: exact canonical runner sentinel only.
-    # run_command() sets stderr to the literal string "timeout" and
-    # exit_code to -1 exclusively on subprocess.TimeoutExpired; matching on
-    # a stderr substring ("timeout" in stderr.lower()) previously caused
-    # any non-timeout command whose stderr merely contained the word
-    # "timeout" (e.g. a pytest node-id or error message referencing a
-    # timeout test) to be misclassified as a real timeout.
-    if exit_code == -1 and stderr.strip() == "timeout":
-        return "blocked", "timeout", "blocked", "Command exceeded timeout", "baseline_fail_expected"
 
     # exit_code = 0 で回帰ゲート以外
     # Issue #1488: current-head evidence-mode では、静的 policy を通過して
@@ -3716,6 +3965,15 @@ def main() -> int:
     cwd_supplied = args.cwd is not None
     args.cwd = args.cwd or "."
     current_evidence: Optional[Dict[str, Any]] = None
+
+    # Issue #2207 AC9: install cooperative SIGTERM cancellation so an outer
+    # caller terminating THIS process (e.g. an aggregate-deadline wrapper)
+    # cannot leave in-flight VC subprocess process groups orphaned. POSIX
+    # process-group semantics are required; on a platform without them this
+    # is intentionally left uninstalled (callers relying on AC9 behavior
+    # must treat that as `environment blocked`, not a silent no-op).
+    if posix_process_groups_supported():
+        install_sigterm_cooperative_cancellation()
 
     if args.evidence_mode == "current-head":
         invalid_reason = None
