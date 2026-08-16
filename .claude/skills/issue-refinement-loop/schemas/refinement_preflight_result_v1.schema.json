@@ -552,7 +552,8 @@
               "repo",
               "issue_number",
               "original_body_sha256",
-              "original_updated_at"
+              "original_updated_at",
+              "insertion"
             ],
             "properties": {
               "field_id": {
@@ -562,22 +563,27 @@
                 "type": "string"
               },
               "required": {
-                "type": "boolean"
+                "type": "boolean",
+                "const": true
               },
               "template_field_order": {
-                "type": "integer"
+                "type": "integer",
+                "minimum": -1
               },
               "template_path": {
                 "type": "string"
               },
               "template_digest": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
               },
               "expected_cardinality": {
-                "type": "integer"
+                "type": "integer",
+                "minimum": 1
               },
               "observed_cardinality": {
-                "type": "integer"
+                "type": "integer",
+                "minimum": 0
               },
               "disposition": {
                 "type": "string",
@@ -602,13 +608,15 @@
                 "type": "array",
                 "items": {
                   "type": "string"
-                }
+                },
+                "minItems": 1
               },
               "candidate_value": {
                 "type": "string"
               },
               "candidate_digest": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
               },
               "source_url": {
                 "type": [
@@ -624,13 +632,72 @@
                     "type": [
                       "integer",
                       "null"
-                    ]
+                    ],
+                    "minimum": 1
                   },
                   "line_end": {
                     "type": [
                       "integer",
                       "null"
+                    ],
+                    "minimum": 1
+                  },
+                  "authority_kind": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "enum": [
+                      "parent_issue",
+                      "owner_anchor",
+                      "design_reference",
+                      null
                     ]
+                  },
+                  "source_repo": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "pattern": "^[^/\\s]+/[^/\\s]+$|^$"
+                  },
+                  "source_object_kind": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "enum": [
+                      "issue_body",
+                      "issue_comment",
+                      "git_blob",
+                      null
+                    ]
+                  },
+                  "source_object_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "source_revision": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "source_text_sha256": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "pattern": "^sha256:[0-9a-f]{64}$"
+                  },
+                  "candidate_sha256": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "pattern": "^sha256:[0-9a-f]{64}$"
                   }
                 }
               },
@@ -647,13 +714,114 @@
                 ]
               },
               "original_body_sha256": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
               },
               "original_updated_at": {
                 "type": [
                   "string",
                   "null"
                 ]
+              },
+              "insertion": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "disposition",
+                  "relation",
+                  "anchor_field_id",
+                  "anchor_heading",
+                  "anchor_start_line",
+                  "anchor_digest",
+                  "rendered_heading",
+                  "candidate_section_digest"
+                ],
+                "properties": {
+                  "disposition": {
+                    "type": "string",
+                    "enum": [
+                      "exact",
+                      "ambiguous"
+                    ]
+                  },
+                  "relation": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "enum": [
+                      "before",
+                      "after",
+                      "replace_section_content",
+                      "insert_contract_key",
+                      null
+                    ]
+                  },
+                  "anchor_field_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "anchor_heading": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "anchor_start_line": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 1
+                  },
+                  "anchor_digest": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "pattern": "^sha256:[0-9a-f]{64}$"
+                  },
+                  "rendered_heading": {
+                    "type": "string"
+                  },
+                  "candidate_section_digest": {
+                    "type": "string",
+                    "pattern": "^sha256:[0-9a-f]{64}$"
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "disposition": {
+                          "const": "ambiguous"
+                        }
+                      },
+                      "required": [
+                        "disposition"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "anchor_field_id": {
+                          "const": null
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "content_state": {
+                "type": "string",
+                "enum": [
+                  "nonempty",
+                  "empty",
+                  "placeholder",
+                  "malformed"
+                ],
+                "description": "Issue #995 P1-3: observed content state, kept independent of observed_cardinality (a heading observed once but empty/placeholder-only still has observed_cardinality: 1)."
               }
             },
             "allOf": [
@@ -684,6 +852,44 @@
                     "candidate_digest"
                   ]
                 }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "disposition": {
+                      "const": "human_review_required"
+                    }
+                  },
+                  "required": [
+                    "disposition"
+                  ]
+                },
+                "then": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "candidate_value"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "candidate_digest"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "source_url"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "source_span"
+                        ]
+                      }
+                    ]
+                  }
+                }
               }
             ]
           }
@@ -696,7 +902,80 @@
             "no_missing_fields_detected"
           ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "disposition_summary": {
+                "const": "no_missing_fields_detected"
+              }
+            },
+            "required": [
+              "disposition_summary"
+            ]
+          },
+          "then": {
+            "properties": {
+              "items": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "disposition_summary": {
+                "const": "auto_apply_safe"
+              }
+            },
+            "required": [
+              "disposition_summary"
+            ]
+          },
+          "then": {
+            "properties": {
+              "items": {
+                "minItems": 1,
+                "contains": {
+                  "properties": {
+                    "disposition": {
+                      "const": "auto_apply_safe"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "disposition_summary": {
+                "const": "human_review_required"
+              }
+            },
+            "required": [
+              "disposition_summary"
+            ]
+          },
+          "then": {
+            "properties": {
+              "items": {
+                "minItems": 1,
+                "contains": {
+                  "properties": {
+                    "disposition": {
+                      "const": "human_review_required"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     }
   },
   "allOf": [
@@ -732,44 +1011,117 @@
         ]
       },
       "then": {
-        "required": [
-          "repair_action",
-          "artifacts"
-        ],
-        "properties": {
-          "repair_action": {
-            "type": "object",
+        "anyOf": [
+          {
             "required": [
-              "disposition",
-              "diagnostics_artifact",
-              "candidate_body_artifact"
+              "repair_action",
+              "artifacts"
             ],
             "properties": {
-              "disposition": {
-                "const": "auto_apply_safe"
+              "repair_action": {
+                "type": "object",
+                "required": [
+                  "disposition",
+                  "diagnostics_artifact",
+                  "candidate_body_artifact"
+                ],
+                "properties": {
+                  "disposition": {
+                    "const": "auto_apply_safe"
+                  },
+                  "diagnostics_artifact": {
+                    "type": "string"
+                  },
+                  "candidate_body_artifact": {
+                    "type": "string"
+                  }
+                }
               },
-              "diagnostics_artifact": {
-                "type": "string"
-              },
-              "candidate_body_artifact": {
-                "type": "string"
+              "artifacts": {
+                "type": "object",
+                "required": [
+                  "repair_diagnostics",
+                  "repair_candidate_body"
+                ],
+                "properties": {
+                  "repair_diagnostics": {
+                    "type": "string"
+                  },
+                  "repair_candidate_body": {
+                    "type": "string"
+                  }
+                }
               }
             }
           },
-          "artifacts": {
-            "type": "object",
+          {
             "required": [
-              "repair_diagnostics",
-              "repair_candidate_body"
+              "structural_repair_action"
             ],
             "properties": {
-              "repair_diagnostics": {
-                "type": "string"
-              },
-              "repair_candidate_body": {
-                "type": "string"
+              "structural_repair_action": {
+                "properties": {
+                  "disposition_summary": {
+                    "const": "auto_apply_safe"
+                  }
+                },
+                "required": [
+                  "disposition_summary"
+                ]
               }
             }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "structural_repair_action": {
+            "properties": {
+              "disposition_summary": {
+                "const": "auto_apply_safe"
+              }
+            },
+            "required": [
+              "disposition_summary"
+            ]
+          }
+        },
+        "required": [
+          "structural_repair_action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "needs_fix"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "structural_repair_action": {
+            "properties": {
+              "disposition_summary": {
+                "const": "human_review_required"
+              }
+            },
+            "required": [
+              "disposition_summary"
+            ]
+          }
+        },
+        "required": [
+          "structural_repair_action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "blocked"
           }
         }
       }

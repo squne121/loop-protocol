@@ -46,6 +46,18 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Issue #995 P0-5 fix_delta: reuse the canonical, section-bound,
+# duplicate-key-rejecting Machine-Readable Contract parser (Issue #1135 SSOT)
+# instead of an ad-hoc regex that fails open (returns None -> callers silently
+# skip required-key checks) on malformed/duplicate-key/multi-fence input.
+_CREATE_ISSUE_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "create-issue" / "scripts"
+if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS_DIR))
+try:
+    from mrc_contract_parser import parse_machine_readable_contract as _canonical_parse_mrc
+except ImportError:  # pragma: no cover - defensive fallback (fail-closed, not fail-open)
+    _canonical_parse_mrc = None
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1006,10 +1018,19 @@ CLOSED_DERIVATION_MODES = frozenset({
 STRUCT_DISPOSITION_AUTO_APPLY_SAFE = "auto_apply_safe"
 STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED = "human_review_required"
 
-# issue_kind -> required Machine-Readable Contract YAML keys. SSOT:
-# .claude/skills/create-issue/references/body-authoring.md
-# "Machine-Readable Contract Block Guidance" section.
-REQUIRED_CONTRACT_KEYS_BY_KIND = {
+# issue_kind -> required Machine-Readable Contract YAML keys.
+#
+# Issue #995 fix_delta (OWNER REQUEST_CHANGES P1-3): this is no longer a
+# hand-transcribed literal copy of the authoring SSOT. It is parsed at
+# import time from the actual SSOT document
+# (.claude/skills/create-issue/references/body-authoring.md, "Machine-
+# Readable Contract Block Guidance" bullet list), so drift between the SSOT
+# prose and this policy is caught by test_ssot_policy_digest_changes_when_
+# authoring_policy_changes instead of silently accumulating. A hard-coded
+# fallback is retained ONLY for the case where the SSOT file is missing or
+# its bullet format changes incompatibly (fail-safe bootstrap, not a
+# silently-preferred source of truth).
+_REQUIRED_CONTRACT_KEYS_BY_KIND_FALLBACK = {
     "parent": [
         "contract_schema_version", "issue_kind", "goal_ref", "change_kind",
         "parent_mode", "closure_mode",
@@ -1023,6 +1044,56 @@ REQUIRED_CONTRACT_KEYS_BY_KIND = {
         "change_kind",
     ],
 }
+
+_BODY_AUTHORING_SSOT_PATH = (
+    Path(__file__).resolve().parents[4]
+    / ".claude" / "skills" / "create-issue" / "references" / "body-authoring.md"
+)
+
+# Matches lines of the form:
+#   - `parent`: `contract_schema_version`, `issue_kind`, `goal_ref`, `change_kind`, `parent_mode`, `closure_mode`
+#   - `implementation` / `research`: `contract_schema_version`, `issue_kind`, `parent_issue`, `goal_ref`, `change_kind`
+_SSOT_REQUIRED_KEYS_LINE_RE = re.compile(
+    r"^-\s*(?P<kinds>(?:`[\w-]+`(?:\s*/\s*)?)+):\s*(?P<keys>(?:`[\w-]+`(?:,\s*)?)+)\s*$"
+)
+
+
+def _parse_required_contract_keys_ssot(text: str) -> dict[str, list[str]]:
+    """Parse the body-authoring.md "required key ごとの required key を維持する"
+    bullet list into {issue_kind: [required_keys]} (Issue #995 P1-3)."""
+    result: dict[str, list[str]] = {}
+    for raw_line in text.splitlines():
+        m = _SSOT_REQUIRED_KEYS_LINE_RE.match(raw_line.strip())
+        if not m:
+            continue
+        kinds = [k.strip("` ") for k in m.group("kinds").split("/")]
+        keys = [k.strip("` ") for k in m.group("keys").split(",")]
+        kinds = [k for k in kinds if k]
+        keys = [k for k in keys if k]
+        if not kinds or not keys:
+            continue
+        for kind in kinds:
+            result[kind] = keys
+    return result
+
+
+def _load_required_contract_keys_by_kind() -> dict[str, list[str]]:
+    try:
+        text = _BODY_AUTHORING_SSOT_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return dict(_REQUIRED_CONTRACT_KEYS_BY_KIND_FALLBACK)
+    parsed = _parse_required_contract_keys_ssot(text)
+    if not parsed:
+        return dict(_REQUIRED_CONTRACT_KEYS_BY_KIND_FALLBACK)
+    return parsed
+
+
+REQUIRED_CONTRACT_KEYS_BY_KIND = _load_required_contract_keys_by_kind()
+
+# The canonical closed issue_kind enum is derived from the same SSOT-parsed
+# policy (its keys), not re-declared as an independent literal (Issue #995
+# P0-5 test_unknown_issue_kind_fails_closed).
+_CANONICAL_ISSUE_KINDS = frozenset(REQUIRED_CONTRACT_KEYS_BY_KIND.keys())
 
 # Template field ids whose `attributes.value` is a real, byte-exact, non-
 # placeholder default (boilerplate the template author already committed to)
@@ -1043,8 +1114,128 @@ _TEMPLATE_VALUE_AUTO_SAFE_FIELD_IDS = frozenset({
 # A `<required: ...>` placeholder token left un-replaced in a resolved field.
 _REQUIRED_PLACEHOLDER_RE = re.compile(r"^<required:[^>]*>$")
 
-_H2_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$")
-_FENCE_LINE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})")
+# Issue #995 fix_delta (P1-1): CommonMark-compatible-enough ATX H2 heading
+# match (up to 3 leading spaces, optional trailing closing-hash run) --
+# reused verbatim from mrc_contract_parser.py's already-tested `_H2_RE` so
+# heading recognition does not diverge across the two producers.
+_H2_HEADING_RE = re.compile(r"^[ ]{0,3}##[ \t]+(?P<heading>.+?)[ \t]*#*[ \t]*$")
+# Fence OPEN: up to 3 leading spaces, 3+ backtick/tilde chars, optional trailing
+# info string (anything). Fence CLOSE: up to 3 leading spaces, 3+ same-char
+# fence chars, and NOTHING else (CommonMark: a closing fence's marker line may
+# only be followed by spaces/tabs). Issue #995 P1-1 fix: the previous
+# `_FENCE_LINE_RE` matched a leading fence marker regardless of trailing text,
+# so ` ```not-a-close ` was treated as a real closing fence, letting a
+# fenced-code example containing a fake `## Heading` re-open scope outside
+# the code block.
+_FENCE_OPEN_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE_ONLY_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})[ \t]*$")
+
+# Issue #995 fix_delta (P0-4): a template's `attributes.value` default can be
+# a placeholder/scaffold string (an angle-bracket hint like
+# `<parent-issue-number>`, or an unselected `a|b|c` enum) rather than a real
+# committed value. Both must be rejected from `template_value_exact` /
+# `auto_apply_safe` -- `validations.required` and a non-empty `value` alone
+# do NOT prove semantic completeness (GitHub Issue Forms `value` is just a
+# textarea pre-fill, not a validity claim).
+_PLACEHOLDER_ANGLE_TOKEN_RE = re.compile(r"<[^<>\n]{1,160}>")
+_UNSELECTED_ENUM_VALUE_RE = re.compile(
+    r"^[\w][\w\-./ ]*(\|[\w][\w\-./ ]*){1,}$"
+)
+
+
+def _contains_placeholder_scaffold(text: str) -> bool:
+    """Recursively (line-by-line) reject `<...>` authoring hints and bare
+    unselected `a|b|c` enum scaffolds anywhere in `text` (Issue #995 P0-4)."""
+    if not isinstance(text, str):
+        return False
+    if _PLACEHOLDER_ANGLE_TOKEN_RE.search(text):
+        return True
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("```") or line.startswith("~~~"):
+            continue
+        rhs = line.split(":", 1)[1].strip() if ":" in line else line
+        rhs = rhs.strip().strip('"').strip("'").strip()
+        if "|" in rhs and _UNSELECTED_ENUM_VALUE_RE.match(rhs):
+            return True
+    return False
+
+
+def _extract_template_declared_scalar(block_text: object, key: str) -> Optional[str]:
+    """Extract a single top-level scalar key's value from a template field's
+    fenced-YAML `value` default (e.g. the real `contract_schema_version: v1`
+    already committed inside the implementation template's Machine-Readable
+    Contract scaffold), instead of hard-coding that value independently
+    (Issue #995 P0-4)."""
+    if not isinstance(block_text, str):
+        return None
+    m = re.search(r"```ya?ml\n(.*?)```", block_text, re.DOTALL)
+    if not m:
+        return None
+    import yaml as _yaml
+    try:
+        data = _yaml.safe_load(m.group(1))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip() or _contains_placeholder_scaffold(value):
+        return None
+    return value.strip()
+
+
+# Issue #995 fix_delta (P0-3): `derived_scalar_exact` field-specific closed
+# validators. A field WITHOUT an entry here still uses the generic syntactic
+# guard (`_is_syntactic_scalar`) as a weaker fallback -- but any field listed
+# here MUST match its own closed pattern, closing the
+# `known_scalars={"parent-issue": "foobar"}` hole the OWNER review flagged.
+_DERIVED_SCALAR_FIELD_VALIDATORS: dict[str, re.Pattern] = {
+    "parent-issue": re.compile(r"^(?:none|#[1-9][0-9]*)$"),
+    "parent_issue": re.compile(r"^(?:none|#[1-9][0-9]*)$"),
+    "machine-readable-contract.parent_issue": re.compile(r"^(?:none|#[1-9][0-9]*)$"),
+}
+
+# Issue #995 fix_delta (P0-3): `source_span_exact` provenance fields that MUST
+# all be present (non-null, non-empty) before a source span can ever back an
+# `auto_apply_safe` item -- authority alone (a non-empty `text`) is not
+# sufficient. `text` is the raw source bytes (used to compute
+# `source_text_sha256` and cross-check `candidate_sha256`), not part of the
+# emitted provenance object itself.
+_SOURCE_SPAN_AUTHORITY_KINDS = frozenset({"parent_issue", "owner_anchor", "design_reference"})
+_SOURCE_SPAN_OBJECT_KINDS = frozenset({"issue_body", "issue_comment", "git_blob"})
+_SOURCE_SPAN_REQUIRED_FIELDS = (
+    "authority_kind", "source_repo", "source_object_kind", "source_object_id",
+    "source_url", "source_revision", "line_start", "line_end", "text",
+)
+
+
+def _validate_source_span_provenance(span: dict) -> tuple[bool, list[str]]:
+    """Return (ok, reason_codes). Fail-closed: any missing/empty required
+    provenance field, or an out-of-enum authority_kind/source_object_kind, or
+    a malformed line range, rejects the span from `auto_apply_safe`."""
+    reasons: list[str] = []
+    for field_name in _SOURCE_SPAN_REQUIRED_FIELDS:
+        value = span.get(field_name)
+        if value is None:
+            reasons.append(f"source_span_missing_{field_name}")
+        elif isinstance(value, str) and value.strip() == "":
+            reasons.append(f"source_span_missing_{field_name}")
+    if reasons:
+        return False, reasons
+    if span.get("authority_kind") not in _SOURCE_SPAN_AUTHORITY_KINDS:
+        reasons.append("source_span_invalid_authority_kind")
+    if span.get("source_object_kind") not in _SOURCE_SPAN_OBJECT_KINDS:
+        reasons.append("source_span_invalid_object_kind")
+    line_start, line_end = span.get("line_start"), span.get("line_end")
+    valid_range = (
+        isinstance(line_start, int) and isinstance(line_end, int)
+        and not isinstance(line_start, bool) and not isinstance(line_end, bool)
+        and line_start >= 1 and line_end >= line_start
+    )
+    if not valid_range:
+        reasons.append("source_span_invalid_line_range")
+    return (len(reasons) == 0), reasons
 
 
 def parse_issue_template_fields(template_text: str, template_path: str) -> list[dict]:
@@ -1106,35 +1297,52 @@ def _parse_h2_sections(body: str) -> list[dict]:
     fence_marker: Optional[tuple[str, int]] = None
 
     for idx, line in enumerate(lines):
-        m_fence = _FENCE_LINE_RE.match(line)
-        if m_fence:
-            marker_char = m_fence.group(2)[0]
-            marker_len = len(m_fence.group(2))
-            if not in_fence:
-                in_fence = True
-                fence_marker = (marker_char, marker_len)
-            elif (
-                fence_marker is not None
-                and marker_char == fence_marker[0]
-                and marker_len >= fence_marker[1]
-            ):
-                in_fence = False
-                fence_marker = None
+        # Issue #995 fix_delta (P1-1): open/close are matched with DIFFERENT
+        # regexes. A line can only CLOSE the currently-open fence if it
+        # consists of nothing but (<=3 leading spaces + fence chars +
+        # trailing spaces/tabs) -- CommonMark forbids trailing non-whitespace
+        # (incl. an info string) on a closing fence line. Previously a single
+        # regex matched a leading fence marker regardless of trailing text,
+        # so a fenced code EXAMPLE containing a fake closer
+        # (` ```not-a-close `) was treated as real, letting content after it
+        # (e.g. a spoofed `## Outcome`) escape the code block and be parsed
+        # as a real section.
+        if in_fence:
+            m_close = _FENCE_CLOSE_ONLY_RE.match(line)
+            if m_close:
+                marker_char = m_close.group(2)[0]
+                marker_len = len(m_close.group(2))
+                if (
+                    fence_marker is not None
+                    and marker_char == fence_marker[0]
+                    and marker_len >= fence_marker[1]
+                ):
+                    in_fence = False
+                    fence_marker = None
             if current is not None:
                 current["content_lines"].append(line)
             continue
 
-        if not in_fence:
-            m = _H2_HEADING_RE.match(line)
-            if m:
-                if current is not None:
-                    sections.append(current)
-                current = {
-                    "heading": m.group(1).strip(),
-                    "start_line": idx + 1,
-                    "content_lines": [],
-                }
-                continue
+        m_open = _FENCE_OPEN_RE.match(line)
+        if m_open:
+            marker_char = m_open.group(2)[0]
+            marker_len = len(m_open.group(2))
+            in_fence = True
+            fence_marker = (marker_char, marker_len)
+            if current is not None:
+                current["content_lines"].append(line)
+            continue
+
+        m = _H2_HEADING_RE.match(line)
+        if m:
+            if current is not None:
+                sections.append(current)
+            current = {
+                "heading": m.group("heading").strip(),
+                "start_line": idx + 1,
+                "content_lines": [],
+            }
+            continue
 
         if current is not None:
             current["content_lines"].append(line)
@@ -1148,31 +1356,57 @@ def _parse_h2_sections(body: str) -> list[dict]:
     return sections
 
 
-def _extract_mrc_contract_keys(body: str) -> Optional[dict]:
-    """Parse the ``## Machine-Readable Contract`` fenced YAML block and return
-    its top-level keys as a dict, or ``None`` if the section, the fence, or
-    the YAML itself is missing/unparseable (never raises)."""
-    sections = _parse_h2_sections(body)
-    mrc = next((s for s in sections if s["heading"] == "Machine-Readable Contract"), None)
-    if mrc is None:
-        return None
-    m = re.search(r"```ya?ml\n(.*?)```", mrc["content"], re.DOTALL)
-    if not m:
-        return None
-    import yaml as _yaml
-    try:
-        parsed = _yaml.safe_load(m.group(1))
-    except Exception:
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    return parsed
+# Issue #995 fix_delta (P0-5): discriminated MRC parse result -- fail-closed
+# statuses only, never a bare ``None`` that a caller could mistake for "no
+# defect" and silently skip the required-key check for.
+MRC_PARSE_STATUS_OK = "ok"
+MRC_PARSE_STATUS_MISSING = "missing"
+MRC_PARSE_STATUS_MALFORMED = "malformed"
+MRC_PARSE_STATUS_DUPLICATE_KEY = "duplicate_key"
+MRC_PARSE_STATUS_AMBIGUOUS = "ambiguous"
+
+
+def _mrc_parse(body: str) -> dict:
+    """Parse the ``## Machine-Readable Contract`` section using the
+    canonical, section-bound, duplicate-key-rejecting parser
+    (mrc_contract_parser.parse_machine_readable_contract, Issue #1135 SSOT).
+
+    Returns ``{"status": ..., "keys": dict, "errors": [str, ...]}`` where
+    status is one of the closed MRC_PARSE_STATUS_* values above. `status`
+    is NEVER silently treated as "no defect" by callers -- every non-"ok"
+    status routes to human_review_required (Issue #995 P0-5)."""
+    if _canonical_parse_mrc is None:
+        # Fail-closed environment failure: the canonical parser dependency
+        # itself could not be imported. Never fall back to a permissive
+        # local reimplementation that could silently diverge from the SSOT.
+        return {"status": MRC_PARSE_STATUS_MALFORMED, "keys": {}, "errors": ["mrc_parser_import_failed"]}
+
+    result = _canonical_parse_mrc(body)
+    if result.ok:
+        return {"status": MRC_PARSE_STATUS_OK, "keys": dict(result.data or {}), "errors": []}
+
+    reason = result.reason
+    if reason == "mrc_section_missing":
+        return {"status": MRC_PARSE_STATUS_MISSING, "keys": {}, "errors": [reason]}
+    if reason == "duplicate_key":
+        return {
+            "status": MRC_PARSE_STATUS_DUPLICATE_KEY,
+            "keys": {},
+            "errors": [f"{reason}:{result.duplicate_key}"],
+        }
+    if reason in ("mrc_section_multiple", "mrc_yaml_fence_multiple"):
+        return {"status": MRC_PARSE_STATUS_AMBIGUOUS, "keys": {}, "errors": [reason]}
+    # mrc_yaml_fence_missing / mrc_yaml_syntax_error / mrc_root_not_mapping
+    return {"status": MRC_PARSE_STATUS_MALFORMED, "keys": {}, "errors": [reason]}
 
 
 def _is_syntactic_scalar(value: object) -> bool:
     """Guard for `derived_scalar_exact`: only a syntactically unique scalar
     (issue number, `none`, a single template-order-derived label, etc.) may
-    ever be used — never prose, never a summary/interpretation."""
+    ever be used — never prose, never a summary/interpretation. This is a
+    generic fallback guard, weaker than a field-specific closed validator
+    (`_DERIVED_SCALAR_FIELD_VALIDATORS`); used only for fields that do not
+    have one (Issue #995 P0-3)."""
     if isinstance(value, bool):
         return False
     if isinstance(value, int):
@@ -1198,13 +1432,18 @@ def _classify_missing_field(
     has_exact_template_value = value is not None and str(value).strip() != ""
     if field_id in _TEMPLATE_VALUE_AUTO_SAFE_FIELD_IDS and has_exact_template_value:
         candidate = str(value)
-        return {
-            "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
-            "derivation": DERIVATION_TEMPLATE_VALUE_EXACT,
-            "candidate_value": candidate,
-            "candidate_digest": _sha256(candidate),
-            "reason_codes": ["template_default_value_exact"],
-        }
+        # Issue #995 fix_delta (P0-4): a non-empty template default is not
+        # automatically a real value -- it can be an authoring placeholder
+        # scaffold (angle-bracket hint / unselected enum). Only a
+        # placeholder-free default may ever be template_value_exact.
+        if not _contains_placeholder_scaffold(candidate):
+            return {
+                "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+                "derivation": DERIVATION_TEMPLATE_VALUE_EXACT,
+                "candidate_value": candidate,
+                "candidate_digest": _sha256(candidate),
+                "reason_codes": ["template_default_value_exact"],
+            }
 
     span_entry = source_spans.get(field_id)
     if isinstance(span_entry, list):
@@ -1220,30 +1459,69 @@ def _classify_missing_field(
         and isinstance(span_entry.get("text"), str)
         and span_entry["text"].strip() != ""
     ):
-        candidate = span_entry["text"]
+        # Issue #995 fix_delta (P0-3): a `text` field alone is no longer
+        # sufficient. Full authority/source/span/digest provenance is
+        # required before a source span can back an auto_apply_safe item.
+        span_ok, span_reasons = _validate_source_span_provenance(span_entry)
+        if span_ok:
+            candidate = span_entry["text"]
+            source_text_sha256 = _sha256(candidate)
+            return {
+                "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+                "derivation": DERIVATION_SOURCE_SPAN_EXACT,
+                "candidate_value": candidate,
+                "candidate_digest": source_text_sha256,
+                "source_url": span_entry.get("source_url"),
+                "source_span": {
+                    "line_start": span_entry.get("line_start"),
+                    "line_end": span_entry.get("line_end"),
+                    "authority_kind": span_entry.get("authority_kind"),
+                    "source_repo": span_entry.get("source_repo"),
+                    "source_object_kind": span_entry.get("source_object_kind"),
+                    "source_object_id": span_entry.get("source_object_id"),
+                    "source_revision": span_entry.get("source_revision"),
+                    "source_text_sha256": source_text_sha256,
+                    "candidate_sha256": source_text_sha256,
+                },
+                "reason_codes": ["single_authoritative_source_span_with_provenance"],
+            }
         return {
-            "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
-            "derivation": DERIVATION_SOURCE_SPAN_EXACT,
-            "candidate_value": candidate,
-            "candidate_digest": _sha256(candidate),
-            "source_url": span_entry.get("source_url"),
-            "source_span": {
-                "line_start": span_entry.get("line_start"),
-                "line_end": span_entry.get("line_end"),
-            },
-            "reason_codes": ["single_authoritative_source_span"],
+            "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+            "derivation": None,
+            "reason_codes": span_reasons,
         }
 
     scalar = known_scalars.get(field_id)
-    if scalar is not None and _is_syntactic_scalar(scalar):
-        candidate = str(scalar)
-        return {
-            "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
-            "derivation": DERIVATION_DERIVED_SCALAR_EXACT,
-            "candidate_value": candidate,
-            "candidate_digest": _sha256(candidate),
-            "reason_codes": ["validated_syntactic_scalar"],
-        }
+    if scalar is not None:
+        validator = _DERIVED_SCALAR_FIELD_VALIDATORS.get(field_id)
+        if validator is not None:
+            # Issue #995 fix_delta (P0-3): field-specific closed validator.
+            # A field WITH a validator entry must match it, or it is
+            # human_review_required -- it may NOT silently fall through to
+            # the weaker generic syntactic guard below.
+            if isinstance(scalar, str) and validator.match(scalar.strip()):
+                candidate = scalar.strip()
+                return {
+                    "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+                    "derivation": DERIVATION_DERIVED_SCALAR_EXACT,
+                    "candidate_value": candidate,
+                    "candidate_digest": _sha256(candidate),
+                    "reason_codes": ["field_specific_closed_validator_match"],
+                }
+            return {
+                "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+                "derivation": None,
+                "reason_codes": ["derived_scalar_failed_field_specific_validator"],
+            }
+        if _is_syntactic_scalar(scalar):
+            candidate = str(scalar)
+            return {
+                "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+                "derivation": DERIVATION_DERIVED_SCALAR_EXACT,
+                "candidate_value": candidate,
+                "candidate_digest": _sha256(candidate),
+                "reason_codes": ["validated_syntactic_scalar_generic_guard"],
+            }
 
     return {
         "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
@@ -1259,18 +1537,36 @@ def _classify_missing_contract_key(
     source_spans: dict,
     template_path: str,
     template_digest: str,
+    *,
+    template_declared_schema_version: Optional[str] = None,
 ) -> dict:
     """Classify a missing/placeholder Machine-Readable Contract key."""
     if key == "contract_schema_version":
-        candidate = "v1"
+        # Issue #995 fix_delta (P0-4): derive from the template's OWN
+        # committed scalar (`_extract_template_declared_scalar`) instead of
+        # an independently hard-coded "v1" literal that could silently
+        # diverge from a future template revision.
+        if template_declared_schema_version:
+            candidate = template_declared_schema_version
+            return {
+                "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+                "derivation": DERIVATION_TEMPLATE_VALUE_EXACT,
+                "candidate_value": candidate,
+                "candidate_digest": _sha256(candidate),
+                "reason_codes": ["template_declared_schema_version_exact"],
+            }
         return {
-            "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
-            "derivation": DERIVATION_TEMPLATE_VALUE_EXACT,
-            "candidate_value": candidate,
-            "candidate_digest": _sha256(candidate),
-            "reason_codes": ["template_default_value_exact"],
+            "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+            "derivation": None,
+            "reason_codes": ["contract_schema_version_not_resolvable_from_template"],
         }
     if key == "issue_kind":
+        if issue_kind not in _CANONICAL_ISSUE_KINDS:
+            return {
+                "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+                "derivation": None,
+                "reason_codes": ["unknown_issue_kind"],
+            }
         return {
             "disposition": STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
             "derivation": DERIVATION_DERIVED_SCALAR_EXACT,
@@ -1280,6 +1576,132 @@ def _classify_missing_contract_key(
         }
     synthetic_field = {"field_id": f"machine-readable-contract.{key}", "value": None}
     return _classify_missing_field(synthetic_field, known_scalars, source_spans)
+
+
+# ---------------------------------------------------------------------------
+# Insertion decision / insertion anchor (Issue #995 P0-2)
+#
+# A consumer applying a proposal must know WHERE to insert it, not just what
+# to insert. `_apply_insertion_decision` never invents an anchor: it only
+# ever anchors relative to a template-adjacent heading that is present
+# EXACTLY ONCE in the body (an ambiguous/duplicate/absent neighbourhood
+# forces `insertion.disposition: ambiguous`, which in turn forces the whole
+# item to `human_review_required` -- consumer/producer separation means the
+# consumer must never invent its own insertion policy, Issue #995 Outcome).
+# ---------------------------------------------------------------------------
+
+
+def _section_line_bounds(sections: list[dict], body_line_count: int) -> dict[int, tuple[int, int]]:
+    """Map each section object's identity -> (start_line, end_line), where
+    end_line is the line just before the next section (or end of body)."""
+    ordered = sorted(sections, key=lambda s: s["start_line"])
+    bounds: dict[int, tuple[int, int]] = {}
+    for idx, sec in enumerate(ordered):
+        end = ordered[idx + 1]["start_line"] - 1 if idx + 1 < len(ordered) else body_line_count
+        bounds[id(sec)] = (sec["start_line"], end)
+    return bounds
+
+
+def _apply_insertion_decision(
+    item: dict,
+    template_fields: list[dict],
+    heading_index: dict[str, list[dict]],
+    body: str,
+) -> dict:
+    """Attach `item["insertion"]` (Issue #995 P0-2) and, when no unambiguous
+    anchor exists, downgrade the item to human_review_required regardless of
+    its prior derivation-based classification (an unanchorable auto-safe
+    candidate is not safe to hand to a consumer)."""
+    body_lines = body.split("\n")
+    all_sections = [sec for lst in heading_index.values() for sec in lst]
+    bounds = _section_line_bounds(all_sections, len(body_lines))
+
+    is_mrc_key_item = (
+        item["field_id"].startswith("machine-readable-contract.")
+        and item["field_id"] != "machine-readable-contract"
+    )
+    rendered_heading = "## Machine-Readable Contract" if is_mrc_key_item else f"## {item['label']}"
+    candidate_value = item.get("candidate_value")
+    candidate_section_digest = _sha256(
+        f"{rendered_heading}\n\n{candidate_value}\n" if candidate_value else f"{rendered_heading}\n"
+    )
+    reason_codes = list(item.get("reason_codes") or [])
+
+    def _finalize(disposition: str, relation: Optional[str], **anchor_fields) -> dict:
+        item["insertion"] = {
+            "disposition": disposition,
+            "relation": relation,
+            "anchor_field_id": anchor_fields.get("anchor_field_id"),
+            "anchor_heading": anchor_fields.get("anchor_heading"),
+            "anchor_start_line": anchor_fields.get("anchor_start_line"),
+            "anchor_digest": anchor_fields.get("anchor_digest"),
+            "rendered_heading": rendered_heading,
+            "candidate_section_digest": candidate_section_digest,
+        }
+        if disposition == "ambiguous" and item.get("disposition") != STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED:
+            item["disposition"] = STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
+            item["derivation"] = None
+            item["reason_codes"] = [*reason_codes, "ambiguous_insertion_anchor"]
+            for auto_safe_only_field in ("candidate_value", "candidate_digest", "source_url", "source_span"):
+                item.pop(auto_safe_only_field, None)
+        return item
+
+    if "duplicate_heading" in reason_codes:
+        return _finalize("ambiguous", "replace_section_content")
+
+    norm_label = item["label"].strip().casefold() if not is_mrc_key_item else None
+    if norm_label is not None:
+        existing = heading_index.get(norm_label, [])
+        if len(existing) == 1:
+            sec = existing[0]
+            start, _end = bounds.get(id(sec), (sec["start_line"], sec["start_line"]))
+            return _finalize(
+                "exact", "replace_section_content",
+                anchor_field_id=item["field_id"], anchor_heading=sec["heading"],
+                anchor_start_line=start, anchor_digest=_sha256(f"## {sec['heading']}"),
+            )
+
+    if is_mrc_key_item:
+        # NOTE: this looks up the actual body H2 HEADING TEXT ("Machine-
+        # Readable Contract", casefolded), NOT the hyphenated template
+        # `field_id` -- they are different strings by construction.
+        mrc_sections = heading_index.get("Machine-Readable Contract".casefold(), [])
+        if len(mrc_sections) == 1:
+            sec = mrc_sections[0]
+            _start, end = bounds.get(id(sec), (sec["start_line"], sec["start_line"]))
+            return _finalize(
+                "exact", "insert_contract_key",
+                anchor_field_id="machine-readable-contract", anchor_heading=sec["heading"],
+                anchor_start_line=end, anchor_digest=_sha256(f"## {sec['heading']}"),
+            )
+        return _finalize("ambiguous", "insert_contract_key")
+
+    order = item["template_field_order"]
+    ordered_fields = sorted(template_fields, key=lambda f: f["order"])
+    preceding = [f for f in ordered_fields if f["order"] < order]
+    following = [f for f in ordered_fields if f["order"] > order]
+
+    for f in reversed(preceding):
+        cand = heading_index.get(f["label"].strip().casefold(), [])
+        if len(cand) == 1:
+            sec = cand[0]
+            _start, end = bounds.get(id(sec), (sec["start_line"], sec["start_line"]))
+            return _finalize(
+                "exact", "after",
+                anchor_field_id=f["field_id"], anchor_heading=sec["heading"],
+                anchor_start_line=end, anchor_digest=_sha256(f"## {sec['heading']}"),
+            )
+    for f in following:
+        cand = heading_index.get(f["label"].strip().casefold(), [])
+        if len(cand) == 1:
+            sec = cand[0]
+            start, _end = bounds.get(id(sec), (sec["start_line"], sec["start_line"]))
+            return _finalize(
+                "exact", "before",
+                anchor_field_id=f["field_id"], anchor_heading=sec["heading"],
+                anchor_start_line=start, anchor_digest=_sha256(f"## {sec['heading']}"),
+            )
+    return _finalize("ambiguous", None)
 
 
 def detect_missing_template_sections(
@@ -1346,9 +1768,15 @@ def detect_missing_template_sections(
             is_placeholder_only = bool(placeholder) and content.strip() == str(placeholder).strip()
             is_required_token = bool(_REQUIRED_PLACEHOLDER_RE.match(content.strip()))
             if is_empty or is_placeholder_only or is_required_token:
+                # Issue #995 fix_delta (P1-3): a heading that is genuinely
+                # PRESENT once (but empty/placeholder-only) must keep
+                # observed_cardinality == 1 -- overwriting it to 0
+                # conflated "this content is not usable" with "this heading
+                # was never observed", which the OWNER review flagged as
+                # confusing observed fact with content-state judgment.
                 items.append({
                     **base_item,
-                    "observed_cardinality": 0,
+                    "content_state": "empty" if is_empty else "placeholder",
                     "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
                     "derivation": None,
                     "reason_codes": ["empty_or_placeholder_only_section"],
@@ -1360,32 +1788,119 @@ def detect_missing_template_sections(
             **_classify_missing_field(field, known_scalars, source_spans),
         })
 
-    mrc_keys = _extract_mrc_contract_keys(body)
-    required_keys = REQUIRED_CONTRACT_KEYS_BY_KIND.get(issue_kind, [])
+    # Issue #995 fix_delta (P0-5): the MRC parse result is a discriminated,
+    # fail-closed status -- "ok" is the ONLY status that skips the
+    # section-missing/malformed handling below. Every other status still
+    # enumerates every required contract key for `issue_kind` as
+    # human_review_required (never silently skipped, unlike the old
+    # `if mrc_keys is not None:` fail-open guard).
+    mrc_result = _mrc_parse(body)
+    required_keys = REQUIRED_CONTRACT_KEYS_BY_KIND.get(issue_kind)
     template_digest = _sha256(template_text)
-    if mrc_keys is not None:
+    mrc_template_field = next(
+        (f for f in template_fields if f["field_id"] == "machine-readable-contract"), None
+    )
+    template_declared_schema_version = _extract_template_declared_scalar(
+        mrc_template_field.get("value") if mrc_template_field else None,
+        "contract_schema_version",
+    )
+
+    def _mrc_key_item(key: str, *, observed_cardinality: int, classification: dict) -> dict:
+        return {
+            "field_id": f"machine-readable-contract.{key}",
+            "label": f"Machine-Readable Contract: {key}",
+            "required": True,
+            "template_field_order": -1,
+            "template_path": template_path,
+            "template_digest": template_digest,
+            "expected_cardinality": 1,
+            "observed_cardinality": observed_cardinality,
+            **classification,
+        }
+
+    if required_keys is None:
+        # Issue #995 fix_delta (P0-5): an issue_kind outside the SSOT-parsed
+        # closed enum can never resolve a required-key set -- fail closed
+        # rather than silently using an empty list (which previously made
+        # `for key in required_keys` a no-op).
+        items.append(_mrc_key_item(
+            "<unresolved>",
+            observed_cardinality=0,
+            classification={
+                "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+                "derivation": None,
+                "reason_codes": ["unknown_issue_kind"],
+            },
+        ))
+    elif mrc_result["status"] == MRC_PARSE_STATUS_OK:
+        mrc_keys = mrc_result["keys"]
+        observed_issue_kind = mrc_keys.get("issue_kind")
+        if (
+            isinstance(observed_issue_kind, str)
+            and observed_issue_kind.strip()
+            and observed_issue_kind.strip() != issue_kind
+        ):
+            # Issue #995 fix_delta (P0-5): the MRC's own `issue_kind` value
+            # disagreeing with the trusted resolved issue_kind is an
+            # authority conflict, never silently auto-safe.
+            items.append(_mrc_key_item(
+                "issue_kind",
+                observed_cardinality=1,
+                classification={
+                    "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+                    "derivation": None,
+                    "reason_codes": ["issue_kind_authority_conflict"],
+                },
+            ))
         for key in required_keys:
             is_missing = key not in mrc_keys
             value = mrc_keys.get(key)
-            is_placeholder = isinstance(value, str) and bool(
-                _REQUIRED_PLACEHOLDER_RE.match(value.strip())
+            is_null_or_empty = (not is_missing) and (
+                value is None or (isinstance(value, str) and value.strip() == "")
             )
-            if not (is_missing or is_placeholder):
+            is_placeholder = isinstance(value, str) and (
+                bool(_REQUIRED_PLACEHOLDER_RE.match(value.strip()))
+                or _contains_placeholder_scaffold(value)
+            )
+            if not (is_missing or is_null_or_empty or is_placeholder):
                 continue
-            items.append({
-                "field_id": f"machine-readable-contract.{key}",
-                "label": f"Machine-Readable Contract: {key}",
-                "required": True,
-                "template_field_order": -1,
-                "template_path": template_path,
-                "template_digest": template_digest,
-                "expected_cardinality": 1,
-                "observed_cardinality": 0 if is_missing else 1,
-                **_classify_missing_contract_key(
+            items.append(_mrc_key_item(
+                key,
+                observed_cardinality=0 if (is_missing or is_null_or_empty) else 1,
+                classification=_classify_missing_contract_key(
                     key, issue_kind, known_scalars, source_spans, template_path, template_digest,
+                    template_declared_schema_version=template_declared_schema_version,
                 ),
-            })
+            ))
+    elif mrc_result["status"] == MRC_PARSE_STATUS_MISSING:
+        for key in required_keys:
+            items.append(_mrc_key_item(
+                key,
+                observed_cardinality=0,
+                classification={
+                    "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+                    "derivation": None,
+                    "reason_codes": ["mrc_section_missing"],
+                },
+            ))
+    else:
+        # malformed / duplicate_key / ambiguous: fail closed for every
+        # required key of this issue_kind (Issue #995 P0-5).
+        for key in required_keys:
+            items.append(_mrc_key_item(
+                key,
+                observed_cardinality=0,
+                classification={
+                    "disposition": STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED,
+                    "derivation": None,
+                    "reason_codes": [mrc_result["status"], *mrc_result["errors"]],
+                },
+            ))
 
+    items = [
+        _apply_insertion_decision(item, template_fields, heading_index, body)
+        for item in items
+    ]
     items.sort(key=lambda i: (i["template_field_order"], i["field_id"]))
     return items
 
@@ -1439,6 +1954,97 @@ def build_structural_repair_bundle(
         "original_updated_at": original_updated_at,
         "items": items,
         "disposition_summary": disposition_summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# structural_repair_action -> control-plane routing (Issue #995 fix_delta P0-1)
+#
+# Mirrors `classify_repair_action()`'s producer-side role for the
+# body-defect repair lane: a single, versioned, closed-enum function that
+# maps `structural_repair_action.disposition_summary` to the SAME
+# status/next_action vocabulary `run_refinement_preflight.py` already uses
+# for `repair_action` (needs_fix / apply_deterministic_repair, blocked /
+# human_judgment_required). This is the producer-side half of "connect
+# structural_repair_action to control-plane routing" -- the OWNER's P0-1
+# concrete requirement ("disposition_summary=auto_apply_safe -> needs_fix",
+# "human_review_required -> blocked", "no_missing_fields_detected -> pass/
+# warn only") is implemented here as a pure, independently unit-tested
+# function so a wrapper can never emit a `status: pass` / `next_action:
+# proceed` result alongside a structural_repair_action that disagrees.
+#
+# NOTE (scope disclosure): `run_refinement_preflight.py` does not yet call
+# `build_structural_repair_bundle()` unconditionally on every preflight run
+# (that would require resolving the live GitHub Issue's issue_kind AND
+# fetching/caching the matching `.github/ISSUE_TEMPLATE/*.yml` on every
+# invocation, which is out of this fix_delta's bounded scope -- see the PR
+# comment for the explicit disclosure). What IS wired: (1) this routing
+# function, (2) a schema-level `allOf` invariant in
+# refinement_preflight_result_v1.schema.json that fails closed if a result
+# ever carries `status: pass` alongside a `structural_repair_action` whose
+# `disposition_summary` is not `no_missing_fields_detected` -- the exact
+# contradiction the OWNER's P0-1 example showed.
+# ---------------------------------------------------------------------------
+
+STRUCTURAL_REPAIR_ROUTE_STATUS_PASS = "pass"
+STRUCTURAL_REPAIR_ROUTE_STATUS_NEEDS_FIX = "needs_fix"
+STRUCTURAL_REPAIR_ROUTE_STATUS_BLOCKED = "blocked"
+
+
+def route_structural_repair_disposition(structural_repair_action: dict) -> dict:
+    """Closed-enum routing for a `structural_repair_action` bundle
+    (Issue #995 P0-1). Returns
+    ``{"status": ..., "next_action": ..., "reason_codes": [...]}``.
+
+    Routing table (never silently defaulted to pass/proceed):
+      disposition_summary == "auto_apply_safe"          -> needs_fix / apply_deterministic_structural_repair
+      disposition_summary == "human_review_required"     -> blocked / human_judgment_required
+      disposition_summary == "no_missing_fields_detected" -> pass / proceed
+      anything else (malformed bundle)                    -> blocked / human_judgment_required
+    """
+    if not isinstance(structural_repair_action, dict):
+        return {
+            "status": STRUCTURAL_REPAIR_ROUTE_STATUS_BLOCKED,
+            "next_action": "human_judgment_required",
+            "reason_codes": ["structural_repair_action_not_an_object"],
+        }
+    disposition_summary = structural_repair_action.get("disposition_summary")
+    items = structural_repair_action.get("items")
+    if disposition_summary == "no_missing_fields_detected":
+        return {
+            "status": STRUCTURAL_REPAIR_ROUTE_STATUS_PASS,
+            "next_action": "proceed",
+            "reason_codes": ["no_missing_fields_detected"],
+        }
+    if disposition_summary == STRUCT_DISPOSITION_AUTO_APPLY_SAFE:
+        if not isinstance(items, list) or not items or any(
+            not isinstance(i, dict) or i.get("disposition") != STRUCT_DISPOSITION_AUTO_APPLY_SAFE
+            for i in items
+        ):
+            # Schema-invariant violation surfaced as a routing decision too
+            # (defence in depth): a summary claiming auto_apply_safe MUST be
+            # backed by >=1 item that is ITSELF auto_apply_safe, and no item
+            # may contradict the summary.
+            return {
+                "status": STRUCTURAL_REPAIR_ROUTE_STATUS_BLOCKED,
+                "next_action": "human_judgment_required",
+                "reason_codes": ["disposition_summary_items_mismatch"],
+            }
+        return {
+            "status": STRUCTURAL_REPAIR_ROUTE_STATUS_NEEDS_FIX,
+            "next_action": "apply_deterministic_structural_repair",
+            "reason_codes": ["structural_auto_apply_safe_items_present"],
+        }
+    if disposition_summary == STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED:
+        return {
+            "status": STRUCTURAL_REPAIR_ROUTE_STATUS_BLOCKED,
+            "next_action": "human_judgment_required",
+            "reason_codes": ["structural_human_review_required_items_present"],
+        }
+    return {
+        "status": STRUCTURAL_REPAIR_ROUTE_STATUS_BLOCKED,
+        "next_action": "human_judgment_required",
+        "reason_codes": [f"unknown_disposition_summary:{disposition_summary!r}"],
     }
 
 
