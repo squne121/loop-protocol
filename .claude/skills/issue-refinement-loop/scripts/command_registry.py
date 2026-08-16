@@ -569,6 +569,60 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "anchor_context_file": {"type": "path", "required": False, "optional_flag_pair": True},
         },
     },
+    # Issue #2039 AC8/AC11: `repair_action.apply` controlled consumer --
+    # bridges a repair_issue_contract.py auto_apply_safe candidate to a
+    # controlled edit_issue_txn.py Issue-body mutation. Fixed repo-root cwd,
+    # `mutation: true`, `network_effect: github_mutation` (this command's
+    # default execution path performs a real GitHub Issue mutation via
+    # edit_issue_txn.py, never a raw `gh issue edit` call). stdout is
+    # constrained to `repair_apply_result/v1`.
+    "repair_action.apply": {
+        "id": "repair_action.apply",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--apply-repair-action", "{preflight_result_path}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_repair_action_apply",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_mutation",
+        "stdin_contract": "none",
+        "stdout_contract": "repair_apply_result/v1",
+        # PR #2202 review fix-delta (P0-6): this outer supervisor timeout
+        # MUST stay strictly greater than the sum of
+        # run_refinement_preflight.py's own inner subprocess budgets for
+        # `run_repair_action_apply()` --
+        # REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS (30s) +
+        # REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS (60s) = 90s
+        # worst-case critical path -- PLUS a readback reserve
+        # (REPAIR_APPLY_READBACK_RESERVE_SECONDS, one GH_API_TIMEOUT-bounded
+        # `_fetch_issue()` read = 30s) so the AC5 authoritative-readback
+        # path always has time to run after a genuine
+        # timeout/OSError/unparseable-stdout `unknown` outcome, PLUS a
+        # margin (REPAIR_APPLY_OUTER_TIMEOUT_MARGIN_SECONDS, 30s) for
+        # interpreter startup, argv parsing, and non-subprocess local work.
+        # 90 + 30 + 30 = 150. Previously this was 60s (strictly LESS than
+        # even the 90s inner critical path alone), which meant the outer
+        # supervisor could kill this process mid-dispatch -- after a PATCH
+        # may already have been sent to GitHub -- before the readback path
+        # ever ran. See run_refinement_preflight.py's
+        # REPAIR_APPLY_*_SECONDS constants (kept in sync manually; no
+        # runtime cross-import exists between this registry module and
+        # run_refinement_preflight.py's inner subprocess timeouts).
+        "timeout_seconds": 150,
+        "mutation": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "preflight_result_path": {"type": "path", "required": True},
+        },
+    },
     "gh.issue.view": {
         "id": "gh.issue.view",
         "argv": [
