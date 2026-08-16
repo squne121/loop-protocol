@@ -187,7 +187,7 @@ def test_given_two_genuinely_paired_subagents_when_multi_child_lifecycle_classif
     assert result["paired_agent_ids"] == ["agent-a", "agent-b"]
 
 
-def test_given_hook_and_tool_result_both_corroborate_same_completion_when_multi_child_lifecycle_classified_then_verified():
+def test_given_hook_and_tool_result_corroborate_same_completion_when_lifecycle_classified_then_verified():
     """Issue #2219 AC12 live-verification finding: this repo's own project
     ``.claude/settings.json`` wires a SubagentStop hook, so a single real
     completion is independently observed via BOTH the SubagentStop hook
