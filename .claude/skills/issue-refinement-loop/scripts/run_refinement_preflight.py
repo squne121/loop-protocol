@@ -146,6 +146,27 @@ try:
 except ImportError:  # pragma: no cover - defensive fallback
     classify_repair_action = None
 
+try:
+    # Issue #995 fix_delta (P0-1, OWNER adversarial review): connects the
+    # template-derived structural-repair producer to this production
+    # preflight execution path. Imported directly (a pure function, no
+    # subprocess isolation needed, unlike the repair_action.apply mutation
+    # lane) so run_preflight() and the standalone unit tests share the SAME
+    # closed-enum bundle/routing functions.
+    from repair_issue_contract import (
+        build_structural_repair_bundle,
+        route_structural_repair_disposition,
+        STRUCTURAL_REPAIR_ROUTE_STATUS_PASS,
+        STRUCTURAL_REPAIR_ROUTE_STATUS_NEEDS_FIX,
+    )
+except ImportError:  # pragma: no cover - defensive fallback
+    build_structural_repair_bundle = None
+    route_structural_repair_disposition = None
+    STRUCTURAL_REPAIR_ROUTE_STATUS_PASS = "pass"
+    STRUCTURAL_REPAIR_ROUTE_STATUS_NEEDS_FIX = "needs_fix"
+
+
+
 _IMPL_MAIN_DRIFT_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts"
 if str(_IMPL_MAIN_DRIFT_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_IMPL_MAIN_DRIFT_SCRIPTS_DIR))
@@ -4441,6 +4462,7 @@ def _build_result(
     hashes: dict[str, str],
     contract_update: Optional[dict[str, Any]] = None,
     repair_action: Optional[dict[str, Any]] = None,
+    structural_repair_action: Optional[dict[str, Any]] = None,
 ) -> dict:
     """Build a refinement_preflight_result/v1 compliant dict."""
     result = {
@@ -4467,7 +4489,10 @@ def _build_result(
         result["contract_update"] = contract_update
     if repair_action is not None:
         result["repair_action"] = repair_action
+    if structural_repair_action is not None:
+        result["structural_repair_action"] = structural_repair_action
     return result
+
 
 
 def _bounded_contract_update_handoff(consumer_result: dict[str, Any]) -> dict[str, Any]:
@@ -5628,10 +5653,67 @@ def _satisfied_trusted_directive_noop_patch_plan(
     )
 
 
+# ---------------------------------------------------------------------------
+# Structural (template-derived) repair -- local-only issue_kind/template
+# resolution (Issue #995 fix_delta P0-1)
+#
+# `build_structural_repair_bundle()` requires a TRUSTED `issue_kind` (it is
+# used to select the required-key/required-section set the Issue body is
+# diffed against) plus the matching `.github/ISSUE_TEMPLATE/*.yml` text. This
+# repo ships exactly one template file per issue_kind (parent/implementation/
+# research), all checked in, so resolving the template never needs a GitHub
+# call -- only `repo_root`. Resolving a TRUSTED issue_kind without an
+# external signal is genuinely ambiguous for a body whose
+# machine-readable-contract section is entirely missing/malformed (that is
+# exactly the defect structural-repair exists to catch), so this function
+# fails closed to (None, None, None) rather than guessing: the caller then
+# leaves `structural_repair_action` absent for that run (schema-documented
+# as "absent when the producer was not invoked in structural-repair mode"),
+# instead of silently fabricating a `no_missing_fields_detected` or
+# `human_review_required` verdict from an unresolvable issue_kind. When the
+# body's self-declared `issue_kind` IS present, `detect_missing_template_
+# sections()` independently re-validates it against the MRC's own parsed
+# `issue_kind` key (`issue_kind_authority_conflict`), so a body that lies
+# about its own kind is still caught downstream, not trusted blindly here.
+# ---------------------------------------------------------------------------
+
+_STRUCTURAL_ISSUE_KIND_RE = re.compile(r"(?m)^[ \t]*issue_kind:[ \t]*([A-Za-z0-9_-]+)[ \t]*$")
+_KNOWN_STRUCTURAL_ISSUE_KINDS = frozenset({"parent", "implementation", "research"})
+
+
+def _resolve_structural_repair_template(
+    body: str, repo_root: Path
+) -> "tuple[Optional[str], Optional[str], Optional[str]]":
+    """Best-effort, LOCAL-ONLY (no GitHub call) resolution of which
+    `.github/ISSUE_TEMPLATE/<kind>.yml` a structural-repair pass should diff
+    the Issue body against.
+
+    Returns (issue_kind, template_text, template_relpath) or
+    (None, None, None) when the body has no resolvable self-declared
+    `issue_kind` scalar, the declared value is not one of the closed
+    {parent, implementation, research} kinds, or the corresponding template
+    file cannot be read from repo_root.
+    """
+    match = _STRUCTURAL_ISSUE_KIND_RE.search(body or "")
+    if match is None:
+        return None, None, None
+    candidate_kind = match.group(1).strip()
+    if candidate_kind not in _KNOWN_STRUCTURAL_ISSUE_KINDS:
+        return None, None, None
+    template_relpath = f".github/ISSUE_TEMPLATE/{candidate_kind}.yml"
+    template_path = repo_root / template_relpath
+    try:
+        template_text = template_path.read_text(encoding="utf-8")
+    except OSError:
+        return None, None, None
+    return candidate_kind, template_text, template_relpath
+
+
 def run_preflight(
     issue_number: int,
     repo: str,
     anchor_comment_urls: list[str],
+
     fixture_path: Optional[Path] = None,
     known_context: Optional[dict] = None,
     now: Optional[str] = None,
@@ -6026,7 +6108,51 @@ def run_preflight(
         source_lane=_repair_source_lane,
     )
 
+    # --- Structural (template-derived) repair pass (Issue #995 fix_delta P0-1) ---
+    # Connects build_structural_repair_bundle()/route_structural_repair_disposition()
+    # to this production preflight execution path. Local-only resolution (see
+    # _resolve_structural_repair_template()'s docstring); when the body has no
+    # resolvable self-declared issue_kind, structural_repair_action stays None
+    # and this run behaves exactly as before (field omitted -- schema-documented
+    # as "absent when the producer was not invoked in structural-repair mode").
+    structural_repair_action: Optional[dict[str, Any]] = None
+    structural_repair_route: Optional[dict[str, Any]] = None
+    if build_structural_repair_bundle is not None and route_structural_repair_disposition is not None:
+        _struct_kind, _struct_template_text, _struct_template_relpath = _resolve_structural_repair_template(
+            issue.get("body", "") or "", repo_root
+        )
+        if _struct_kind is not None:
+            # Issue #995 fix_delta (P1-3, OWNER adversarial review): bind
+            # template provenance to the git blob SHA of the actual template
+            # FILE this bundle diffed against (not just a content-only SHA-256
+            # of the text already carried in each item's template_digest),
+            # plus the repo@commit ref this preflight run itself resolved.
+            # repair_issue_contract.py stays pure Python (no git subprocess of
+            # its own); the caller here supplies this optional provenance.
+            _struct_git_blob_sha = _git_blob_sha(repo_root / _struct_template_relpath, repo_root)
+            if _struct_git_blob_sha == "unknown":
+                _struct_git_blob_sha = None
+            _struct_head_sha = _git_head_sha(repo_root)
+            _struct_source_ref = (
+                f"{repo}@{_struct_head_sha}"
+                if _struct_head_sha and _struct_head_sha != "unknown"
+                else None
+            )
+            structural_repair_action = build_structural_repair_bundle(
+                issue.get("body", "") or "",
+                issue_kind=_struct_kind,
+                template_text=_struct_template_text,
+                template_path=_struct_template_relpath,
+                repo=repo,
+                issue_number=issue_number,
+                original_updated_at=_repair_original_updated_at,
+                template_git_blob_sha=_struct_git_blob_sha,
+                template_source_ref=_struct_source_ref,
+            )
+            structural_repair_route = route_structural_repair_disposition(structural_repair_action)
+
     # Issue #2016 iteration-3 P1-3 (OWNER adversarial review): a repair
+
     # subprocess-level failure must dominate a *later* planner failure.
     # Established precedence (see _apply_exit_code_mapping docstring):
     #   environment_failure > blocked > needs_fix > warn > pass
@@ -6610,7 +6736,56 @@ def run_preflight(
     else:
         next_action = "fix_environment"
 
+    # --- Structural repair routing (Issue #995 fix_delta P0-1) ---
+    # `refinement_preflight_result_v1.schema.json`'s allOf invariants require
+    # `status` to be the EXACT const the attached structural_repair_action's
+    # disposition_summary dictates (auto_apply_safe -> needs_fix,
+    # human_review_required -> blocked). Honor the SAME
+    # environment_failure > blocked > needs_fix > warn > pass precedence
+    # documented above for the sibling repair_action lane: only apply the
+    # structural verdict when it would not force a downgrade of a
+    # MORE severe pre-existing status. When it would, the bundle is left
+    # unattached this run (schema-safe) and its reason codes are still
+    # surfaced as non-status-affecting informational blockers so the
+    # finding is never silently dropped.
+    if structural_repair_action is not None and structural_repair_route is not None:
+        _structural_target_status = structural_repair_route["status"]
+        if _structural_target_status == STRUCTURAL_REPAIR_ROUTE_STATUS_PASS:
+            # no_missing_fields_detected: no status constraint; always safe.
+            pass
+        else:
+            _status_severity = {
+                "pass": 0,
+                "warn": 1,
+                "needs_fix": 2,
+                "blocked": 3,
+                "environment_failure": 4,
+            }
+            _current_rank = _status_severity.get(status, 0)
+            _target_rank = _status_severity[_structural_target_status]
+            if _current_rank > _target_rank:
+                for _struct_rc in structural_repair_route["reason_codes"]:
+                    _struct_entry = f"structural_repair_action_deferred:{_struct_rc}"
+                    if _struct_entry not in blockers:
+                        blockers.append(_struct_entry)
+                structural_repair_action = None
+                structural_repair_route = None
+            else:
+                status = _structural_target_status
+                if _structural_target_status == STRUCTURAL_REPAIR_ROUTE_STATUS_NEEDS_FIX:
+                    next_action = "apply_deterministic_structural_repair"
+                    exit_code = EXIT_NEEDS_FIX
+                else:
+                    next_action = "human_judgment_required"
+                    exit_code = EXIT_BLOCKED
+                    for _struct_rc in structural_repair_route["reason_codes"]:
+                        _struct_entry = f"structural_repair_action:{_struct_rc}"
+                        if _struct_entry not in blockers:
+                            blockers.append(_struct_entry)
+
+
     # #2048 Scope Delta: an approved trusted-anchor scope reframe whose
+
     # operations[] is empty AND is not yet reflected in the current body
     # (full_rewrite_required) is routed to issue_editor_required regardless
     # of the ordinary status-derived next_action above. This is the ONLY
@@ -6664,7 +6839,23 @@ def run_preflight(
             "repair_kinds": sorted(repair_action_projection.get("repair_kinds", []) or []),
             "reason_codes": sorted(repair_action_projection.get("reason_codes", []) or []),
         }
+    # Issue #995 fix_delta (P0-1): mirror the same integrity-hash binding for
+    # structural_repair_action -- otherwise its disposition/items could be
+    # silently altered without changing result_core_sha256, exactly the
+    # P1-2 gap the repair_action_core binding above was added to close.
+    if isinstance(structural_repair_action, dict):
+        result_core_for_hash["structural_repair_action_core"] = {
+            "schema_version": structural_repair_action.get("schema_version"),
+            "policy_version": structural_repair_action.get("policy_version"),
+            "issue_kind": structural_repair_action.get("issue_kind"),
+            "disposition_summary": structural_repair_action.get("disposition_summary"),
+            "original_body_sha256": structural_repair_action.get("original_body_sha256"),
+            "item_field_ids": sorted(
+                i.get("field_id") for i in structural_repair_action.get("items", []) if isinstance(i, dict)
+            ),
+        }
     result_core_text = json.dumps(result_core_for_hash, sort_keys=True, ensure_ascii=False, allow_nan=False)
+
 
     hashes = {
         "raw_issue_snapshot_sha256": _sha256(snapshot_text),
@@ -6709,9 +6900,11 @@ def run_preflight(
         hashes=hashes,
         contract_update=contract_update_handoff,
         repair_action=repair_action_projection,
+        structural_repair_action=structural_repair_action,
     )
     try:
         _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input_dict, result)
+
     except Exception as exc:
         result = _build_result(
             status="environment_failure",
