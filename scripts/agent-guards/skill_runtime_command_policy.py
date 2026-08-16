@@ -2097,3 +2097,168 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
         raise ValueError("argv_placeholder_contract_mismatch")
     if "{active_issue}" not in "".join(expected_write_roots):
         raise ValueError("active_issue_placeholder_missing")
+
+
+# ---------------------------------------------------------------------------
+# Issue #2196 (Child 1 of #2190's worktree-migration split): sanitized Git
+# subprocess execution environment policy.
+#
+# Threat model (explicitly documented per this Issue's In Scope item):
+# this policy defends against *misrouting* -- an inherited GIT_* variable,
+# an ambient `url.<base>.insteadOf` rewrite, or a repo-local
+# `.git/hooks/post-checkout` script silently firing -- from either an
+# accidentally-inherited caller environment or an ordinary local Git
+# config the dedicated subprocess did not expect. It does NOT defend
+# against a same-UID active attacker who can already set arbitrary
+# environment variables or write to this process's own filesystem: such an
+# attacker has a strictly stronger position than anything checked below.
+# ---------------------------------------------------------------------------
+
+# GIT_* environment variables that must never leak into a dedicated Git
+# subprocess's environment (Issue #2196 AC1). An inherited value for any of
+# these silently redirects git's repository/object/config/executable
+# discovery away from the caller-specified cwd (e.g. an ambient `GIT_DIR`
+# pointing at an unrelated repository, or a `GIT_CONFIG` that only
+# redirects a `git config` *probe* while the real command still reads
+# repository-local config -- Issue #2196 PR #2201 owner review P1-1), which
+# is exactly the misrouting class this Issue's threat model targets.
+# `GIT_EXEC_PATH` / `GIT_CEILING_DIRECTORIES` are unset for the same
+# reason as the discovery variables: `GIT_EXEC_PATH` can substitute a
+# poisoned Git helper (e.g. a fake `git-remote-https`) ahead of the real
+# one (P1-2), and `GIT_SSL_NO_VERIFY` is unset so TLS verification can
+# never be silently disabled by an inherited value.
+GIT_SUBPROCESS_UNSET_ENV_KEYS = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_EXEC_PATH",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_SSL_NO_VERIFY",
+    }
+)
+
+# The structured, name-only query pattern used to detect `url.<base>.insteadOf`
+# and `url.<base>.pushInsteadOf` rewrite rules (Issue #2196 AC4 / P1-4).
+# This is passed to `git config --get-regexp --name-only -z <pattern>` (or
+# the modern `git config get --all --show-names --null --regexp <pattern>`
+# on Git versions that support it) -- never to a hand-written split of the
+# human-readable `git config --list` line format, which cannot
+# distinguish a `=` inside a legal subsection name (e.g.
+# `url.https://evil.example/?x=y.insteadof=https://good.example/`) from
+# the key/value separator. Git normalizes the section and key parts of a
+# config name to lowercase for matching purposes, so this pattern matches
+# both `insteadOf`/`pushInsteadOf`-cased fixtures and their normalized
+# lowercase form; only the subsection segment (`.*`) is genuinely
+# case-sensitive, which is exactly the segment this pattern treats as an
+# opaque wildcard.
+INSTEADOF_CONFIG_NAME_REGEXP = r"^url\..*\.(insteadof|pushinsteadof)$"
+
+
+class GitSubprocessRewriteRejected(RuntimeError):
+    """Raised when the effective Git configuration a dedicated Git
+    subprocess would see declares a `url.<base>.insteadOf` or
+    `url.<base>.pushInsteadOf` rewrite rule (Issue #2196 AC4). Either
+    directive silently rewrites the resolved remote URL for any command
+    that references the rewritten base, which can redirect a fetch/push to
+    an unintended remote without the caller's argv ever mentioning it --
+    this is rejected fail-closed before the real command is ever
+    executed."""
+
+
+class GitSubprocessConfigProbeFailed(RuntimeError):
+    """Raised when the `insteadOf`/`pushInsteadOf` config probe could not
+    be positively evaluated as "no matching key" (Issue #2196 AC9 / P1-5).
+    A nonzero exit code, a timeout, or a stdout decode failure can each
+    mean a config syntax error, a permission error, a bad `include`
+    directive, an I/O error, or some other failure unrelated to whether a
+    rewrite rule exists -- none of those outcomes license treating the
+    probe as having proven "no rewrite exists". Callers must fail closed
+    (stop before running the real command) whenever this is raised,
+    exactly as they do for `GitSubprocessRewriteRejected` itself."""
+
+
+def reject_insteadof_rewrite(matched_key_names: list[str]) -> None:
+    """Fail-closed rejection of `url.<base>.insteadOf` /
+    `url.<base>.pushInsteadOf` rewrite rules.
+
+    `matched_key_names` is the result of a *structured* query (e.g. `git
+    config --get-regexp --name-only -z INSTEADOF_CONFIG_NAME_REGEXP`) for
+    the effective configuration a dedicated Git subprocess would see for
+    its target cwd -- never a hand split of `git config --list` line
+    output (Issue #2196 P1-4). Any non-empty list raises
+    `GitSubprocessRewriteRejected` naming the first offending key.
+    """
+    if matched_key_names:
+        raise GitSubprocessRewriteRejected(matched_key_names[0])
+
+
+def parse_config_get_regexp_name_only_nul(stdout: bytes) -> list[str]:
+    """Parse the NUL-delimited stdout of `git config --get-regexp
+    --name-only -z <pattern>` (or equivalent structured, name-only,
+    NUL-delimited query) into a list of matched config key names.
+
+    Raises `GitSubprocessConfigProbeFailed` if `stdout` cannot be decoded
+    as UTF-8 -- an undecodable probe result is a probe failure, not
+    evidence of "no matching keys" (Issue #2196 AC9 / P1-5).
+    """
+    try:
+        text = stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise GitSubprocessConfigProbeFailed("probe_stdout_decode_error") from exc
+    return [name for name in text.split("\0") if name]
+
+
+# Git global options that, if smuggled into a dedicated Git subprocess's
+# argv ahead of (or anywhere alongside) its subcommand, silently override
+# this module's own `-c core.hooksPath=...` / `-c credential.helper=`
+# wrapper settings -- re-enabling hooks, redirecting repository discovery,
+# or injecting further config overrides invisible to the insteadOf probe
+# (Issue #2196 AC8 / P1-3). The closed command builder API never accepts
+# these from a caller; this set is also used as a defense-in-depth check
+# on the internal argv the builders themselves construct.
+GIT_GLOBAL_OPTION_TOKENS = frozenset(
+    {
+        "-c",
+        "--config-env",
+        "-C",
+        "--git-dir",
+        "--work-tree",
+        "--exec-path",
+        "--namespace",
+    }
+)
+
+
+def reject_git_global_options(argv: list[str]) -> None:
+    """Fail-closed rejection of Git global options appearing anywhere in a
+    dedicated-Git-subprocess argv (Issue #2196 AC8 / P1-3).
+
+    Rejects an exact match against `GIT_GLOBAL_OPTION_TOKENS`, and the
+    `--long-option=value` form of any of the `--`-prefixed tokens in that
+    set, wherever they occur in `argv` -- not only at position 0 -- since
+    Git accepts its global options interleaved before the subcommand.
+    """
+    for token in argv:
+        if token in GIT_GLOBAL_OPTION_TOKENS:
+            raise ValueError(f"git_global_option_not_allowed:{token}")
+        for prefix in GIT_GLOBAL_OPTION_TOKENS:
+            if prefix.startswith("--") and token.startswith(prefix + "="):
+                raise ValueError(f"git_global_option_not_allowed:{token}")
+
+
+def reject_option_like_positional(value: str) -> None:
+    """Fail-closed rejection of a positional argument that looks like a
+    Git option (starts with `-`). Used by the closed command builders to
+    stop a caller-supplied value (e.g. a ref name or object id) from being
+    interpreted by Git as a flag instead of data (Issue #2196 P1-3)."""
+    if value.startswith("-"):
+        raise ValueError(f"positional_argument_looks_like_option:{value}")
