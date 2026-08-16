@@ -138,6 +138,12 @@ broker（この Python プロセスの `gh` 子プロセス呼び出し）のみ
 Inventory へ追加するものではなく、既存 `gh` CLI credential の使用範囲を repository-bound な
 broker に限定する運用境界を明文化する）。
 
+本 broker は canary Issue lifecycle（本 Issue の live 検証専用）にスコープが限定されており、
+raw `gh` / raw `git push` 全般に対する production-grade な credential boundary ではない。
+汎用の GitHub mutation credential boundary（production broker）の実装は follow-up Issue
+#2223（実装: raw gh/git push を deterministic deny し GitHub mutation production broker を
+実装する、OPEN）で対応する。
+
 ---
 
 ### 5. `checkpoint_token` — session 記録ツール用 token
