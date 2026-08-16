@@ -200,7 +200,7 @@ isolated lane 実行中に変化するケース）を追加した。
 - interactive lane: `agent explain` から抽出した detected agent／confidence と observed lifecycle state
   （`summary.md` の allowlist フィールドのみ。raw pane transcript は保存しない）
 
-## SubAgent 実行の hook-ID-correlated causal evidence（`subagent_causal_evidence_verdict()`、Issue #2183）
+## SubAgent 実行の hook ID 相関による causal evidence 判定関数（`subagent_causal_evidence_verdict()`、Issue #2183 対応）
 
 `subagent_causal_evidence_verdict(stdout, expected_markers=None)`
 （`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は、SubAgent が実際に
