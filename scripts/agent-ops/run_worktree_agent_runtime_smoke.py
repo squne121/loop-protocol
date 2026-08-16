@@ -1457,6 +1457,51 @@ SPAWN_LAUNCH_MODE_ASYNC = "async_launched"
 SPAWN_LAUNCH_MODE_COMPLETED = "completed"
 SPAWN_LAUNCH_MODE_UNKNOWN = None
 
+# Issue #2219 fix_delta iteration 2: ``_find_claude_interactive_transcript``
+# scans this many leading lines of a candidate transcript for a ``cwd``
+# field before giving up on that line-window (a real persisted transcript's
+# first ``cwd``-bearing record is typically the 3rd-4th line, not the
+# first -- see that function's own docstring for the live evidence).
+_TRANSCRIPT_CWD_SCAN_LINES = 50
+
+# Issue #2219 fix_delta iteration 2 (live verification finding): an ASYNC
+# spawn's own ``tool_use_result`` never transitions to ``status: "completed"``
+# in place -- live inspection of a real claude-gpt interactive session
+# transcript found its completion notification arrives later, as a SEPARATE
+# ``queue-operation``/``queued_command`` record whose ``content``/``prompt``
+# string embeds a ``<task-notification>`` block with this exact
+# ``<task-id>...</task-id>`` / ``<status>completed</status>`` shape. This is
+# Claude Code's own async Task-dispatch notification protocol (observed
+# identically for the structured lane's single-child async path too, not an
+# adapter-specific quirk), so it is read generically -- not gated on
+# ``claude_adapter``.
+_CLAUDE_TASK_NOTIFICATION_RE = re.compile(
+    r"<task-id>([0-9a-zA-Z_-]+)</task-id>.*?<status>([a-z_]+)</status>",
+    re.DOTALL,
+)
+
+
+def extract_claude_task_notification_completions(text: str) -> set[str]:
+    """Agent ids whose async ``<task-notification>`` block (see
+    ``_CLAUDE_TASK_NOTIFICATION_RE`` docstring above) reports
+    ``<status>completed</status>`` anywhere in ``text``. This is a SEPARATE
+    completion channel from ``tool_use_result.status == "completed"``
+    (the synchronous-completion shape) -- an async-launched spawn's
+    ``tool_use_result`` instead reports ``status: "async_launched"``
+    (``SPAWN_LAUNCH_MODE_ASYNC``) and never updates in place; the actual
+    completion signal for that child arrives later as one of these
+    notification blocks. Scans the RAW text directly (not per-event JSON
+    fields) since the notification payload is itself embedded as escaped
+    text inside a JSON string value, not a top-level structured field.
+    Best-effort / fail-closed: returns an empty set, never a guess, on any
+    text that does not contain a matching block."""
+    completed: set[str] = set()
+    for match in _CLAUDE_TASK_NOTIFICATION_RE.finditer(text):
+        agent_id, status = match.group(1), match.group(2)
+        if status == SPAWN_LAUNCH_MODE_COMPLETED:
+            completed.add(agent_id)
+    return completed
+
 
 def _iter_claude_stream_events(stdout: str):
     """Yield each stream-json line that parses to a JSON object."""
@@ -1752,6 +1797,14 @@ def classify_claude_multi_child_lifecycle(stdout: str, min_required: int) -> dic
             spawn_ids.append(agent_id)
         if tool_use_result.get("status") == SPAWN_LAUNCH_MODE_COMPLETED:
             stop_ids.append(agent_id)
+    # Issue #2219 fix_delta iteration 2: an async-launched spawn's own
+    # tool_use_result never transitions to "completed" in place (see
+    # extract_claude_task_notification_completions docstring) -- only
+    # bind a task-notification completion to a spawn_id ALREADY observed
+    # above, so this can never itself manufacture a spawn event.
+    for agent_id in extract_claude_task_notification_completions(stdout):
+        if agent_id in spawn_ids:
+            stop_ids.append(agent_id)
 
     spawned = set(spawn_ids)
     completed = set(stop_ids)
@@ -2007,11 +2060,11 @@ def extract_claude_child_session_id(
 # ``run_interactive_herdr_isolated``'s own AC5 note -- structured-only flags
 # are never forwarded to the TUI launch). It DOES, however, never pass
 # ``--no-session-persistence`` (that flag is structured-lane only), so Claude
-# Code persists this run's own session transcript to the same
-# ``~/.claude/projects/<cwd-slug>/<session_id>.jsonl`` file used elsewhere in
-# this module (see ``extract_claude_child_session_id``'s fallback path) --
-# containing the SAME stream-json event shapes (``session_id``/``sessionId``,
-# ``type: "assistant"``, ``tool_use_result.agentId``/``agentType``) that the
+# Code persists this run's own session transcript to a
+# ``<projects-root>/<cwd-slug>/<session_id>.jsonl`` file (see
+# ``extract_claude_child_session_id``'s fallback path) -- containing the SAME
+# stream-json event shapes (``session_id``/``sessionId``, ``type:
+# "assistant"``, ``tool_use_result.agentId``/``agentType``) that the
 # structured lane's Option A functions (``extract_claude_stream_session_ids``,
 # ``count_claude_stream_turns``, ``verify_same_main_session_across_turns``,
 # ``classify_claude_multi_child_lifecycle``) already parse. Locating and
@@ -2021,24 +2074,71 @@ def extract_claude_child_session_id(
 # cannot reliably distinguish a genuine multi-agent hook event from ordinary
 # TUI prose -- see the existing documented ``spawn_events: None`` gap for
 # this lane).
+#
+# Issue #2219 fix_delta iteration 2 (live verification finding against the
+# real claude-gpt adapter, https://github.com/squne121/loop-protocol/pull/2222#issuecomment-5307351011):
+# ``<projects-root>`` above is NOT always ``~/.claude/projects``. The
+# ``claude-gpt`` adapter isolates its whole Claude Code config root to
+# ``$CLAUDE_GPT_HOME/claude`` (default ``~/.claude-gpt/claude`` -- see
+# ``scripts/claude-gpt/lib.sh``'s ``claude_gpt_claude_config_dir``, exported
+# as ``CLAUDE_CONFIG_DIR`` by ``launch.sh`` before the isolated session ever
+# starts), so its session transcript is persisted under
+# ``$CLAUDE_GPT_HOME/claude/projects`` instead -- the old hardcoded
+# ``~/.claude/projects`` scan could never find it, producing a false
+# ``interactive_transcript_found: False``. Live filesystem inspection of a
+# real isolated claude-gpt session
+# (``~/.claude-gpt/claude/projects/<cwd-slug>/<session-id>.jsonl``) confirms
+# the SAME flat, single-file, native stream-json-shaped transcript format the
+# native adapter writes -- there is no adapter-specific transcript shape to
+# special-case here; only the ROOT directory differs, and it differs for the
+# exact same reason (and using the exact same resolution logic) the launcher
+# itself already isolates it. ``_resolve_claude_projects_root`` below mirrors
+# ``lib.sh``'s own default expression exactly, rather than re-deriving a
+# different one, so an operator-set ``CLAUDE_GPT_HOME`` is honored
+# identically on both sides.
 # ---------------------------------------------------------------------------
 
 
-def _find_claude_interactive_transcript(worktree: str, since_epoch: float) -> Path | None:
+def _resolve_claude_projects_root(claude_adapter: str) -> Path:
+    """The Claude Code ``projects`` directory root this run's own session
+    transcript was actually persisted under, based on which adapter
+    launched it (Issue #2219 fix_delta iteration 2). ``native`` (the
+    default) uses ``~/.claude/projects`` directly. ``claude-gpt`` isolates
+    its Claude Code config root to ``$CLAUDE_GPT_HOME/claude`` (default
+    ``~/.claude-gpt/claude`` when ``CLAUDE_GPT_HOME`` is unset -- mirrors
+    ``scripts/claude-gpt/lib.sh``'s ``claude_gpt_claude_config_dir``
+    default expression exactly), so its transcript lives under
+    ``$CLAUDE_GPT_HOME/claude/projects`` instead."""
+    if claude_adapter == "claude-gpt":
+        claude_gpt_home = os.environ.get("CLAUDE_GPT_HOME") or str(Path.home() / ".claude-gpt")
+        return Path(claude_gpt_home) / "claude" / "projects"
+    return Path.home() / ".claude" / "projects"
+
+
+def _find_claude_interactive_transcript(
+    worktree: str, since_epoch: float, claude_adapter: str = "native"
+) -> Path | None:
     """Best-effort, content-linked (never filename-guessed) locate of the
     persisted Claude Code session transcript this interactive-lane run
-    itself wrote, by scanning every ``~/.claude/projects/*/*.jsonl`` file
-    for one whose (a) mtime is at or after ``since_epoch`` (a small 2s grace
-    window absorbs clock/flush skew) and (b) own first-line-derived ``cwd``
-    field equals ``worktree`` exactly -- so a concurrent or leftover session
-    for a DIFFERENT worktree can never be mistaken for this run's own
-    transcript. When multiple candidates match (e.g. a stale file from an
-    earlier run against the same worktree that happens to satisfy the mtime
-    window), the most recently modified one is returned. Returns ``None``
-    (never a guess) if no matching file is found or the scan itself fails
-    (missing ``~/.claude/projects`` directory, permission error, etc.)."""
+    itself wrote, by scanning every ``*/*.jsonl`` file under the adapter's
+    own resolved projects root (see ``_resolve_claude_projects_root``) for
+    one whose (a) mtime is at or after ``since_epoch`` (a small 2s grace
+    window absorbs clock/flush skew) and (b) contains a ``cwd`` field
+    (checked across the first ``_TRANSCRIPT_CWD_SCAN_LINES`` lines, not just
+    the first -- Issue #2219 fix_delta iteration 2 live finding: a real
+    Claude Code transcript's first line(s) are session-bookkeeping records
+    with no ``cwd`` field at all; ``cwd`` only appears once the first actual
+    message record is written, typically the 3rd-4th line, so a first-line-
+    only check silently failed to ever find a real transcript, native or
+    claude-gpt alike) equal to ``worktree`` exactly -- so a concurrent or
+    leftover session for a DIFFERENT worktree can never be mistaken for this
+    run's own transcript. When multiple candidates match (e.g. a stale file
+    from an earlier run against the same worktree that happens to satisfy
+    the mtime window), the most recently modified one is returned. Returns
+    ``None`` (never a guess) if no matching file is found or the scan itself
+    fails (missing projects directory, permission error, etc.)."""
     try:
-        projects_dir = Path.home() / ".claude" / "projects"
+        projects_dir = _resolve_claude_projects_root(claude_adapter)
         if not projects_dir.is_dir():
             return None
         best: tuple[float, Path] | None = None
@@ -2050,24 +2150,88 @@ def _find_claude_interactive_transcript(worktree: str, since_epoch: float) -> Pa
             if mtime < since_epoch - 2.0:
                 continue
             try:
+                matched_cwd = False
                 with candidate.open(encoding="utf-8", errors="replace") as handle:
-                    first_line = handle.readline()
+                    for _ in range(_TRANSCRIPT_CWD_SCAN_LINES):
+                        line = handle.readline()
+                        if not line:
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if not isinstance(record, dict):
+                            continue
+                        if "cwd" not in record:
+                            continue
+                        matched_cwd = record.get("cwd") == worktree
+                        break
             except OSError:
                 continue
-            first_line = first_line.strip()
-            if not first_line:
-                continue
-            try:
-                record = json.loads(first_line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if not isinstance(record, dict) or record.get("cwd") != worktree:
+            if not matched_cwd:
                 continue
             if best is None or mtime > best[0]:
                 best = (mtime, candidate)
         return best[1] if best else None
     except OSError:
         return None
+
+
+def _find_claude_interactive_subagent_only_session_dirs(
+    worktree: str, since_epoch: float, claude_adapter: str = "native"
+) -> list[str]:
+    """Issue #2219 fix_delta iteration 2 LIVE re-verification finding
+    (https://github.com/squne121/loop-protocol/pull/2222, live run against
+    the real claude-gpt adapter after the iteration-2 fixes above): every
+    session directory this scan can find in the mtime window that contains
+    ``subagents/*.meta.json`` spawn evidence (genuine SubAgent activity
+    confirmed on disk) but NO sibling flat ``<session-id>.jsonl`` transcript
+    file at all -- unlike the flat-transcript shape
+    ``_find_claude_interactive_transcript`` looks for above (confirmed
+    present for OLDER/manually-driven sessions inspected during this same
+    investigation), this harness's own herdr-PTY-automation-driven
+    claude-gpt interactive sessions in this environment were live-observed
+    to NEVER produce a flat transcript at all -- reproducibly, across four
+    separate real runs against the same worktree, spanning hours -- only
+    the per-SubAgent ``subagents/*.meta.json`` spawn metadata (Issue #2219
+    fix_delta iteration 2's own live verification requirement) is ever
+    written for THIS invocation shape. That metadata alone cannot supply an
+    honest ``cwd`` match (no such field) or a completion signal (no such
+    field either -- see references/claude-code.md), so it is NOT promoted
+    to a PASS-capable evidence source here; this function exists ONLY to
+    surface a non-fabricated diagnostic breadcrumb (an advisory list of
+    matching session directory paths) for a human/follow-up investigation,
+    never to satisfy ``--require-min-subagents``/``--require-min-turns``.
+    Returns an empty list (never a guess) on any lookup failure."""
+    try:
+        projects_dir = _resolve_claude_projects_root(claude_adapter)
+        if not projects_dir.is_dir():
+            return []
+        found: list[str] = []
+        for candidate in projects_dir.glob("*/*"):
+            if not candidate.is_dir():
+                continue
+            subagents_dir = candidate / "subagents"
+            if not subagents_dir.is_dir():
+                continue
+            if not any(subagents_dir.glob("*.meta.json")):
+                continue
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < since_epoch - 2.0:
+                continue
+            sibling_transcript = candidate.parent / f"{candidate.name}.jsonl"
+            if sibling_transcript.exists():
+                continue
+            found.append(str(candidate))
+        return sorted(found)
+    except OSError:
+        return []
 
 
 def extract_codex_parent_session_id(stdout: str) -> str | None:
@@ -4851,9 +5015,18 @@ def main(argv: list[str] | None = None) -> int:
                     or args.scan_forbidden_markers
                 ):
                     transcript_path = _find_claude_interactive_transcript(
-                        worktree, interactive_run_started_epoch
+                        worktree, interactive_run_started_epoch, args.claude_adapter
                     )
                     schema_summary["interactive_transcript_found"] = transcript_path is not None
+                    if transcript_path is None:
+                        # Issue #2219 fix_delta iteration 2 live finding: advisory-only
+                        # breadcrumb, never a PASS-capable evidence source -- see
+                        # _find_claude_interactive_subagent_only_session_dirs docstring.
+                        schema_summary["interactive_transcript_subagent_only_session_dirs"] = (
+                            _find_claude_interactive_subagent_only_session_dirs(
+                                worktree, interactive_run_started_epoch, args.claude_adapter
+                            )
+                        )
                     transcript_text = ""
                     if transcript_path is not None:
                         try:

@@ -245,12 +245,39 @@ Claude Code は通常どおりこの run 自身の session transcript を
 structured lane の stdout と同じ stream-json イベント形状（`session_id`/`sessionId`、
 `type: "assistant"`、`tool_use_result.agentId`/`agentType`）を持つ。
 
-`_find_claude_interactive_transcript(worktree, since_epoch)` は
-`~/.claude/projects/*/*.jsonl` を走査し、（1）mtime が `since_epoch`（run 開始直前に
-記録）以降であること、（2）ファイル先頭行の `cwd` フィールドが `worktree` と厳密一致
-することの両方を満たすファイルを content-linked に特定する（filename からの推測では
-ない）。一致するファイルが複数ある場合は最も新しい mtime のものを採用し、1 件も
-見つからない場合は `None`（`interactive_transcript_found: False`）を返す -- 推測しない。
+`_find_claude_interactive_transcript(worktree, since_epoch, claude_adapter)` は
+`_resolve_claude_projects_root(claude_adapter)` が解決した projects root 配下の
+`*/*.jsonl` を走査し、（1）mtime が `since_epoch`（run 開始直前に記録）以降であること、
+（2）先頭から最大 `_TRANSCRIPT_CWD_SCAN_LINES`（50）行以内に現れる `cwd` フィールドが
+`worktree` と厳密一致することの両方を満たすファイルを content-linked に特定する
+（filename からの推測ではない）。一致するファイルが複数ある場合は最も新しい mtime の
+ものを採用し、1 件も見つからない場合は `None`（`interactive_transcript_found: False`）
+を返す -- 推測しない。
+
+**Issue #2219 fix_delta iteration 2（claude-gpt adapter に対する live 再検証で発見した
+2 つの実バグの修正）**:
+
+1. **projects root のハードコード**: 旧実装は `~/.claude/projects` を常に固定で
+   走査していたため、`--claude-adapter claude-gpt` の run では常に
+   `interactive_transcript_found: False` になっていた（`scripts/claude-gpt/launch.sh`
+   は自身の Claude Code config root を `$CLAUDE_GPT_HOME/claude`（既定
+   `~/.claude-gpt/claude`、`scripts/claude-gpt/lib.sh` の
+   `claude_gpt_claude_config_dir` と同じ既定式）に隔離し、`CLAUDE_CONFIG_DIR` として
+   export するため、実際の session transcript は
+   `$CLAUDE_GPT_HOME/claude/projects/<cwd-slug>/<session-id>.jsonl` に永続化される）。
+   `_resolve_claude_projects_root()` を新設し、`claude_adapter` に応じて正しい root
+   を返すよう修正した。live filesystem 調査（`~/.claude-gpt/claude/projects/.../<session-id>.jsonl`
+   の直接確認）の結果、claude-gpt adapter は native adapter と **全く同じ flat
+   single-file の stream-json 形状** で transcript を書き出しており、adapter 固有の
+   transcript 形状の作り分けは不要と判明した（root だけが異なる）。
+2. **`cwd` フィールドの位置の誤仮定**: 旧実装は transcript の **先頭行のみ**
+   `cwd` フィールドを確認していたが、live transcript（native / claude-gpt 双方）を
+   実地確認した結果、先頭行は `{"type": "mode", ...}` のような session
+   bookkeeping レコードで `cwd` を持たず、`cwd` は最初の実メッセージレコード
+   （典型的には 3〜4 行目）に初めて現れることが判明した。そのため旧実装は
+   claude-gpt に限らず **native adapter でも** transcript を実質的に発見できて
+   いなかった（先頭行只の check が常に不一致になるため）。`_TRANSCRIPT_CWD_SCAN_LINES`
+   行分の window で `cwd` を探すよう修正した。
 
 この transcript のテキストを、structured lane と全く同じ
 `classify_claude_multi_child_lifecycle()` / `verify_same_main_session_across_turns()`
@@ -280,6 +307,37 @@ agent_id ごとに spawn/stop を集計する:
 
 いずれか 1 つでも該当すれば `verified: False` となり run は FAIL する。
 
+**Issue #2219 fix_delta iteration 2（async completion チャネルの追加）**: live
+claude-gpt session の実地調査で、ASYNC dispatch された SubAgent の
+`tool_use_result` は `status: "async_launched"`（`SPAWN_LAUNCH_MODE_ASYNC`）の
+まま **その場では `"completed"` に遷移しない** ことが判明した。実際の completion
+通知は、後続の別レコード（`type: "queue-operation"` / `"queued_command"` の
+`content`/`prompt` 文字列に埋め込まれた `<task-notification>` block）として
+transcript 内に到着する:
+
+```
+<task-notification>
+<task-id>a2be4b1bac93c3190</task-id>
+...
+<status>completed</status>
+...
+</task-notification>
+```
+
+（これは Claude Code 自身の async Task dispatch 通知プロトコルであり、claude-gpt
+固有の挙動ではない。structured lane の単一 child 向け実装（Issue #2015 AC11）が
+`CHILD_TERMINAL_STATUS_ASYNC_NO_STOP` として completion 未確認のまま残していた
+既知のギャップと同じ根本現象。interactive lane は run 全体の持続時間分だけ長く
+transcript を観測できるため、後続の task-notification が到着する時間的余裕がある。）
+
+`extract_claude_task_notification_completions(text)` は raw transcript テキストを
+直接正規表現でスキャンし（通知 payload は JSON フィールドとしてではなく、JSON
+文字列値の中にエスケープされたテキストとして埋め込まれているため）、
+`<status>completed</status>` を報告している `<task-id>` を集合として返す。
+`classify_claude_multi_child_lifecycle()` はこれを **既に spawn 済みと確認できた
+agent_id にのみ** completion として bind する（spawn 観測なしに completion 通知
+単独から spawn を捏造しない）。
+
 ### 独立 proxy cleanup 再確認（launcher の全 run で自動）
 
 `launch.sh` は起動直後に stderr へ次を emit する:
@@ -305,6 +363,29 @@ CLAUDE_GPT_CLAUDE_EXIT_CODE=<exit code>
 poll-with-retry（既定 3 回、0.5 秒間隔）で再実行する。自己申告が `true` でも
 独立再確認が clean を確認できなければ run 全体を FAIL とする（launcher の自己申告を
 権威にしない、Issue #2219 AC7）。
+
+### claude-gpt adapter のセッションデータの実際の形状（Issue #2219 fix_delta iteration 2 live 調査）
+
+`$CLAUDE_GPT_HOME/claude/projects/<cwd-slug>/<session-id>/subagents/` 配下には
+spawn された SubAgent ごとに `agent-<agent-id>.meta.json`
+（`{"agentType", "description", "toolUseId", "spawnDepth", "parentAgentId"?,
+"worktreeCleanlyRemoved"?}`）が書かれる。**これは spawn 時のメタデータのみであり、
+completion の有無を示すフィールドを一切含まない**（`worktreeCleanlyRemoved` は
+その SubAgent 自身が worktree を持っていた場合にのみ現れる、cleanup 状況の傍証で
+あって completion 信号ではない）。同ディレクトリには一部の SubAgent についてのみ
+`agent-<agent-id>.jsonl`（その SubAgent 自身の完全な transcript）も存在するが、
+全 SubAgent に対して一律には書かれない。
+
+一方、`<cwd-slug>/<session-id>.jsonl`（session ディレクトリと同じ階層にある、
+親セッション自身の flat transcript）には、上記の spawn メタデータと **同じ
+agent_id を用いた** spawn evidence（`tool_use_result.agentId`）と completion
+evidence（`<task-notification>` block、上記参照）の両方が揃っている。
+
+したがって本 harness は `subagents/*.meta.json` を evidence source として
+使わない（completion 判定に使えるフィールドを持たないため）。親セッションの
+flat `.jsonl` transcript 1 つだけで spawn + completion の両方を証明できる、
+という結論に至った（native adapter と同型の evidence source を、正しい root
+の下で読むだけでよい）。
 
 ## 観測できる主な evidence
 

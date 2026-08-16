@@ -631,19 +631,130 @@ exit 0
 """
 
 
+# Issue #2219 fix_delta iteration 2: same as _FAKE_ISOLATED_HERDR_BODY_MULTI_TURN
+# above, but its "agent start" case actually resolves and invokes "claude"
+# via PATH (mirroring _FORWARDER_CAUSAL_PROOF_HERDR_BODY in
+# test_run_worktree_agent_runtime_smoke_claude_bin.py) -- required so the
+# --claude-bin launcher-receipt causal check passes when a test needs
+# --claude-adapter claude-gpt (which itself requires --claude-bin).
+_FAKE_ISOLATED_HERDR_BODY_MULTI_TURN_WITH_CLAUDE_BIN_RECEIPT = """
+STATE_DIR="$FAKE_HERDR_STATE_DIR"
+mkdir -p "$STATE_DIR"
+if [ "$1" = "--session" ]; then
+  touch "$STATE_DIR/$2.session"
+  sleep 300
+  exit 0
+fi
+case "$1 $2" in
+  "status server")
+    exit 0
+    ;;
+esac
+case "$1" in
+  session)
+    case "$2" in
+      list)
+        out="{\\"sessions\\":["
+        first=1
+        for f in "$STATE_DIR"/*.session; do
+          [ -e "$f" ] || continue
+          name=$(basename "$f" .session)
+          if [ -e "$STATE_DIR/$name.stopped" ]; then running=false; else running=true; fi
+          if [ $first -eq 0 ]; then out="$out,"; fi
+          out="$out{\\"name\\":\\"$name\\",\\"running\\":$running}"
+          first=0
+        done
+        out="$out]}"
+        echo "$out"
+        exit 0
+        ;;
+      stop) touch "$STATE_DIR/$3.stopped"; exit 0 ;;
+      delete) rm -f "$STATE_DIR/$3.session" "$STATE_DIR/$3.stopped"; exit 0 ;;
+    esac
+    ;;
+  workspace)
+    case "$2" in
+      create)
+        touch "$STATE_DIR/${HERDR_SESSION}.session"
+        echo '{"result":{"root_pane":{"pane_id":"pane-xyz"},"workspace":{"workspace_id":"w1"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+  pane)
+    exit 0
+    ;;
+  agent)
+    case "$2" in
+      start)
+        resolved="$(command -v claude || true)"
+        if [ -n "$resolved" ]; then
+          "$resolved" launched-by-fake-herdr-pty > /dev/null 2>&1 || true
+        fi
+        exit 0
+        ;;
+      prompt)
+        count_file="$STATE_DIR/prompt_call_count"
+        n=0
+        [ -f "$count_file" ] && n=$(cat "$count_file")
+        n=$((n + 1))
+        echo "$n" > "$count_file"
+        if [ -n "$FAIL_PROMPT_CALL_NUMBER" ] && [ "$n" = "$FAIL_PROMPT_CALL_NUMBER" ]; then
+          echo "fake prompt failure (not a stall)" >&2
+          exit 1
+        fi
+        exit 0
+        ;;
+      get) echo '{"state":"idle"}'; exit 0 ;;
+      explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
+      read) echo "OBSERVED_MARKER pane transcript line"; exit 0 ;;
+    esac
+    ;;
+  api)
+    case "$2" in
+      snapshot)
+        echo '{"result":{"snapshot":{"agents":[],"focused_workspace_id":"w0",'\\
+'"focused_tab_id":"w0:t0","focused_pane_id":"w0:p0"}}}'
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+"""
+
+
 def _seed_fake_claude_transcript(
-    fake_home: Path, worktree: Path, lines: list[dict]
+    fake_home: Path, worktree: Path, lines: list[dict], claude_adapter: str = "native"
 ) -> Path:
-    """Write a fake persisted Claude Code session transcript under
-    ``<fake_home>/.claude/projects/<any-slug>/<any-name>.jsonl`` whose first
-    line carries ``cwd`` equal to the resolved worktree path -- exactly the
-    content-linked shape ``_find_claude_interactive_transcript`` scans for.
-    """
-    project_dir = fake_home / ".claude" / "projects" / "fixture-project"
+    """Write a fake persisted Claude Code session transcript reproducing the
+    REAL on-disk shape (Issue #2219 fix_delta iteration 2 live finding,
+    https://github.com/squne121/loop-protocol/pull/2222#issuecomment-5307351011):
+    a genuine transcript's leading line(s) are session-bookkeeping records
+    (``{"type": "mode", ...}``) with NO ``cwd`` field at all -- ``cwd`` only
+    appears on the first actual message record, several lines in -- so the
+    ``cwd``-carrying record is deliberately placed as the SECOND line here
+    (never the first), matching what ``_find_claude_interactive_transcript``'s
+    ``_TRANSCRIPT_CWD_SCAN_LINES``-line scan window must actually handle.
+
+    ``claude_adapter="native"`` writes under
+    ``<fake_home>/.claude/projects/<any-slug>/<any-name>.jsonl`` (the
+    default adapter's projects root). ``claude_adapter="claude-gpt"`` writes
+    under ``<fake_home>/.claude-gpt/claude/projects/<any-slug>/<any-name>.jsonl``
+    instead, mirroring ``scripts/claude-gpt/lib.sh``'s own
+    ``CLAUDE_GPT_HOME``-default (``$HOME/.claude-gpt``) resolution exactly."""
+    if claude_adapter == "claude-gpt":
+        projects_root = fake_home / ".claude-gpt" / "claude" / "projects"
+    else:
+        projects_root = fake_home / ".claude" / "projects"
+    project_dir = projects_root / "fixture-project"
     project_dir.mkdir(parents=True, exist_ok=True)
     transcript_path = project_dir / "fake-session.jsonl"
     resolved_worktree = str(worktree.resolve())
-    body_lines = [dict(lines[0], cwd=resolved_worktree)] + [dict(line) for line in lines[1:]]
+    bookkeeping_line = {"type": "mode", "mode": "normal"}
+    body_lines = (
+        [bookkeeping_line, dict(lines[0], cwd=resolved_worktree)] + [dict(line) for line in lines[1:]]
+    )
     transcript_path.write_text(
         "\n".join(json.dumps(line) for line in body_lines) + "\n", encoding="utf-8"
     )
@@ -877,3 +988,238 @@ def test_given_interactive_lane_no_transcript_found_when_require_min_turns_then_
     assert result.returncode == 1, f"stdout={result.stdout}\nstderr={result.stderr}"
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "interactive_transcript_found: False" in summary
+
+
+# ---------------------------------------------------------------------------
+# Issue #2219 fix_delta iteration 2: live-verification-discovered claude-gpt
+# adapter transcript root bug (PR #2222
+# https://github.com/squne121/loop-protocol/pull/2222#issuecomment-5307351011)
+# ---------------------------------------------------------------------------
+
+
+def test_given_claude_gpt_adapter_when_resolving_projects_root_then_uses_isolated_config_dir():
+    """Pure-function unit test (Issue #2219 fix_delta iteration 2): the
+    claude-gpt adapter's projects root is $CLAUDE_GPT_HOME/claude/projects
+    (default $HOME/.claude-gpt/claude/projects when CLAUDE_GPT_HOME is
+    unset), never the native ~/.claude/projects."""
+    original = os.environ.pop("CLAUDE_GPT_HOME", None)
+    try:
+        native_root = MODULE._resolve_claude_projects_root("native")
+        gpt_root = MODULE._resolve_claude_projects_root("claude-gpt")
+        assert native_root == Path.home() / ".claude" / "projects"
+        assert gpt_root == Path.home() / ".claude-gpt" / "claude" / "projects"
+        assert native_root != gpt_root
+    finally:
+        if original is not None:
+            os.environ["CLAUDE_GPT_HOME"] = original
+
+
+def test_given_claude_gpt_home_override_when_resolving_projects_root_then_honored():
+    """A caller-set CLAUDE_GPT_HOME (matching scripts/claude-gpt/lib.sh's own
+    override mechanism) must be honored identically, not silently ignored
+    in favor of a re-derived default."""
+    original = os.environ.get("CLAUDE_GPT_HOME")
+    os.environ["CLAUDE_GPT_HOME"] = "/tmp/custom-claude-gpt-home"
+    try:
+        gpt_root = MODULE._resolve_claude_projects_root("claude-gpt")
+        assert gpt_root == Path("/tmp/custom-claude-gpt-home") / "claude" / "projects"
+    finally:
+        if original is None:
+            os.environ.pop("CLAUDE_GPT_HOME", None)
+        else:
+            os.environ["CLAUDE_GPT_HOME"] = original
+
+
+def test_given_claude_gpt_adapter_interactive_transcript_under_isolated_config_dir_when_wired_then_pass(
+    repo_with_worktree, tmp_path
+):
+    """Genuine live/synthetic-gap regression (Issue #2219 fix_delta
+    iteration 2): a claude-gpt interactive session's persisted transcript
+    lives under $HOME/.claude-gpt/claude/projects, NOT $HOME/.claude/projects.
+    Before this fix, --claude-adapter claude-gpt always produced
+    interactive_transcript_found: False (a false FAIL) because the scan
+    hardcoded the native root. This reproduces the fake claude-gpt-shaped
+    session directory observed via live filesystem inspection during the
+    PR #2222 live run and proves the fix genuinely finds and correctly
+    classifies multi-turn/multi-subagent evidence for THIS adapter shape."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY_MULTI_TURN_WITH_CLAUDE_BIN_RECEIPT)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    _seed_fake_claude_transcript(
+        fake_home, worktree,
+        [
+            {"type": "system", "subtype": "init", "session_id": "gpt-sess-1"},
+            {"type": "assistant", "session_id": "gpt-sess-1"},
+            {"type": "user", "tool_use_result": {"agentId": "agent-a", "status": "completed"}},
+            {"type": "user", "tool_use_result": {"agentId": "agent-b", "status": "completed"}},
+            {"type": "assistant", "session_id": "gpt-sess-1"},
+        ],
+        claude_adapter="claude-gpt",
+    )
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--claude-bin", str(fake_bin / "claude"), "--claude-adapter", "claude-gpt",
+        "--additional-prompt", "second turn",
+        "--require-min-turns", "2",
+        "--require-min-subagents", "2",
+        "--scan-forbidden-markers",
+        fake_bin_dir=fake_bin,
+        extra_env={
+            "HERDR_ENV": "1",
+            "FAKE_HERDR_STATE_DIR": str(state_dir),
+            "HOME": str(fake_home),
+        },
+    )
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "interactive_transcript_found: True" in summary
+    assert "'verified': True" in summary
+
+
+def test_given_claude_gpt_transcript_only_under_native_root_when_adapter_is_claude_gpt_then_not_found(
+    repo_with_worktree, tmp_path
+):
+    """Negative control proving root selection is genuinely adapter-aware
+    (not a change that makes every root match): a transcript seeded ONLY
+    under the NATIVE root while --claude-adapter claude-gpt is requested
+    must NOT be found -- the isolated adapter must never accidentally read
+    another adapter's (or another isolation boundary's) session data."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY_MULTI_TURN_WITH_CLAUDE_BIN_RECEIPT)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    _seed_fake_claude_transcript(
+        fake_home, worktree,
+        [{"type": "system", "subtype": "init", "session_id": "native-only-sess"}],
+        claude_adapter="native",
+    )
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--claude-bin", str(fake_bin / "claude"), "--claude-adapter", "claude-gpt",
+        "--additional-prompt", "second turn",
+        "--require-min-turns", "2",
+        fake_bin_dir=fake_bin,
+        extra_env={
+            "HERDR_ENV": "1",
+            "FAKE_HERDR_STATE_DIR": str(state_dir),
+            "HOME": str(fake_home),
+        },
+    )
+    assert result.returncode == 1, f"stdout={result.stdout}\nstderr={result.stderr}"
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "interactive_transcript_found: False" in summary
+
+
+# ---------------------------------------------------------------------------
+# Issue #2219 fix_delta iteration 2: async task-notification completion
+# channel (live verification finding -- an async-launched spawn's own
+# tool_use_result never transitions to "completed" in place; the real
+# completion signal is a separate <task-notification> block).
+# ---------------------------------------------------------------------------
+
+
+def test_given_task_notification_completed_block_when_extracted_then_agent_id_returned():
+    text = (
+        '{"type":"queue-operation","operation":"enqueue","content":'
+        '"<task-notification>\\n<task-id>a2be4b1bac93c3190</task-id>\\n'
+        '<status>completed</status>\\n</task-notification>"}'
+    )
+    completed = MODULE.extract_claude_task_notification_completions(text)
+    assert completed == {"a2be4b1bac93c3190"}
+
+
+def test_given_task_notification_non_completed_status_when_extracted_then_not_returned():
+    text = (
+        '<task-notification><task-id>agent-x</task-id><status>running</status></task-notification>'
+    )
+    completed = MODULE.extract_claude_task_notification_completions(text)
+    assert completed == set()
+
+
+def test_given_async_launched_spawn_with_task_notification_completion_when_classified_then_verified():
+    """The exact live-observed shape (Issue #2219 fix_delta iteration 2):
+    spawn's tool_use_result reports status "async_launched" (never
+    "completed" in place); the real completion signal arrives later as a
+    separate queue-operation record embedding a <task-notification> block.
+    classify_claude_multi_child_lifecycle must bind that notification's
+    agent_id to the already-observed spawn and verify successfully."""
+    stdout = "\n".join([
+        _sse({
+            "type": "user",
+            "tool_use_result": {"agentId": "agent-a", "status": "async_launched"},
+        }),
+        _sse({
+            "type": "user",
+            "tool_use_result": {"agentId": "agent-b", "status": "async_launched"},
+        }),
+        _sse({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": (
+                "<task-notification><task-id>agent-a</task-id>"
+                "<status>completed</status></task-notification>"
+            ),
+        }),
+        _sse({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": (
+                "<task-notification><task-id>agent-b</task-id>"
+                "<status>completed</status></task-notification>"
+            ),
+        }),
+    ])
+    result = MODULE.classify_claude_multi_child_lifecycle(stdout, 2)
+    assert result["verified"] is True, result
+    assert result["paired_agent_ids"] == ["agent-a", "agent-b"]
+    assert result["orphan_starts"] == []
+
+
+def test_given_async_launched_spawn_with_no_task_notification_when_classified_then_not_verified():
+    """Negative control: an async-launched spawn with NO completion
+    notification anywhere must remain an orphan start -- never silently
+    treated as complete just because it was launched."""
+    stdout = _sse({
+        "type": "user",
+        "tool_use_result": {"agentId": "agent-a", "status": "async_launched"},
+    })
+    result = MODULE.classify_claude_multi_child_lifecycle(stdout, 1)
+    assert result["verified"] is False
+    assert result["orphan_starts"] == ["agent-a"]
+
+
+def test_given_task_notification_completion_with_no_matching_spawn_when_classified_then_unknown_child():
+    """A task-notification completion for an agent_id that was NEVER
+    observed as a spawn must be treated as an unknown child, never silently
+    manufacture a spawn event out of a completion notification alone."""
+    stdout = _sse({
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "content": (
+            "<task-notification><task-id>ghost-agent</task-id>"
+            "<status>completed</status></task-notification>"
+        ),
+    })
+    result = MODULE.classify_claude_multi_child_lifecycle(stdout, 1)
+    assert result["verified"] is False
+    assert result["spawned_agent_ids"] == []
+    assert result["completed_agent_ids"] == []

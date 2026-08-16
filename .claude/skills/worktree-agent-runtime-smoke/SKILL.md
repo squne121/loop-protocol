@@ -45,7 +45,11 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 - `--require-min-subagents <int>`（任意。既定 0 = 未要求。`--runtime claude` 限定。structured lane と interactive lane の両方に適用される。0 より大きい値を指定すると、最低この個数の DISTINCT SubAgent が spawn かつ completion まで agent_id exact pairing で確認されるまで run が FAIL する。structured lane は stdout を、interactive lane は永続化された session transcript を evidence source として同じ `classify_claude_multi_child_lifecycle()` で判定する。Issue #2219 AC3）
 - `--require-min-turns <int>`（任意。既定 0 = 未要求。`--runtime claude` 限定。structured lane と interactive lane の両方に適用される。0 より大きい値を指定すると、SAME main session_id が最低このturn 数持続することを要求する。structured lane では単一 invocation 内で `--max-turns` がこの値未満だと `parser.error`（起動前拒否）になる。interactive lane では 1（初回 turn）+ `--additional-prompt` の指定数がこの値未満だと `parser.error` になる。Issue #2219 AC2/AC11、fix_delta iteration 1）
 - `--scan-forbidden-markers`（任意。既定 off。`--runtime claude` 限定。structured lane と interactive lane の両方に適用される。`403 WebSocket upgrade` / `WebSocket upgrade was rejected` / `Please run /login` / `early termination` / `context limit` / `auto-compaction failure` の固定 literal allowlist を、structured lane は stdout/stderr から、interactive lane は永続化された session transcript と bounded pane 抜粋から scan し、1 件でも観測されれば FAIL する。Issue #2219 AC6、fix_delta iteration 1）
-- `--additional-prompt <prompt>`（任意、repeatable。既定なし。`--mode interactive` かつ `--runtime claude` 限定。指定順に、既に起動済みの SAME herdr agent/session へ追加の prompt turn を送信する。PR #2176 commit 06d8baa9 が prototype し commit 5a44ebf0 で Issue #2174 のスコープ外として revert された `--additional-prompt` 相当の再実装（Issue #2219 fix_delta iteration 1、選択肢 B）。`--require-min-turns` / `--require-min-subagents` / `--scan-forbidden-markers` と組み合わせることで、この lane 自身が書き出す 永続化 session transcript（`~/.claude/projects/*/<session_id>.jsonl` -- interactive lane は `--no-session-persistence` を forward しないため実際に 書かれる）を evidence source として同一 session identity・複数 SubAgent lifecycle・forbidden marker 不在を検証できる）
+- `--additional-prompt <prompt>`（任意、repeatable。既定なし。`--mode interactive` かつ `--runtime claude` 限定。指定順に、既に起動済みの SAME herdr agent/session へ追加の prompt turn を送信する。PR #2176 commit 06d8baa9 が prototype し commit 5a44ebf0 で Issue #2174 のスコープ外として revert された `--additional-prompt` 相当の再実装（Issue #2219 fix_delta iteration 1、選択肢 B）。`--require-min-turns` / `--require-min-subagents` / `--scan-forbidden-markers` と組み合わせることで、この lane 自身が書き出す 永続化 session transcript（adapter 固有の projects root（native: `~/.claude/projects`、claude-gpt:
+`$CLAUDE_GPT_HOME/claude/projects`。fix_delta iteration 2）配下の
+`*/<session_id>.jsonl` -- interactive lane は `--no-session-persistence` を forward
+しないため実際に書かれる）を evidence source として同一 session identity・複数
+SubAgent lifecycle・forbidden marker 不在を検証できる）
 
 `--mode interactive` は常に（オプトインではなく）、isolated interactive lane 実行の前後で、その時点で running な herdr session すべてに対して明示的に `herdr --session <name> api snapshot`（PR #2176 OWNER REQUEST_CHANGES Finding 4。デフォルト session だけでなく、人間が attach 中の named session も含めすべて明示的に snapshot する）を取得し、full snapshot（agent の kind・`terminal_id`・native `agent_session`、非 agent pane を含む全 pane record、全 tab record、空 workspace を含む全 workspace record、layout の構造）を、この run 自身が作成した isolated session を除いて完全に一致することを検証する（Issue #2174 AC7、PR #2176 OWNER REQUEST_CHANGES Finding 3）。いずれかのフィールドが取得不能な場合も fail-closed で FAIL とする（session 一覧自体が取得不能な場合も同様。空集合として扱わない）。evidence は `herdr_workspace_snapshot_diffs` / `herdr_workspace_snapshot_preserved` として記録される。なお herdr v0.8.0 の公開 `SessionInfo`（`session list`）には name と独立した `session_id` フィールドが存在しないことを実機確認済みであり、本 skill は `agent`（kind）+ `terminal_id` + native `agent_session`（kind/source/value）を実際に利用可能な最強の agent identity として扱う。
 
@@ -148,10 +152,14 @@ production permission の根拠にしない。
     revert した `--additional-prompt` 相当フラグを Issue #2219 の scope で
     再実装した。同一の既に起動済み herdr agent/session へ複数 turn を順次送信し、
     その herdr session 自身が書き出す永続化 session transcript
-    （`~/.claude/projects/*/<session_id>.jsonl` -- interactive lane は
+    （adapter に応じて `_resolve_claude_projects_root()` が解決する root 配下の
+    `*/<session_id>.jsonl`（native: `~/.claude/projects`、claude-gpt:
+    `$CLAUDE_GPT_HOME/claude/projects`。fix_delta iteration 2、
+    references/claude-code.md 参照） -- interactive lane は
     `--no-session-persistence` を forward しないため実際に書かれる。
-    `_find_claude_interactive_transcript()` が worktree の `cwd` 一致で
-    content-linked に特定する）を、選択肢 A と全く同じ
+    `_find_claude_interactive_transcript()` が worktree の `cwd` 一致（先頭
+    最大 50 行の window。fix_delta iteration 2）で content-linked に特定する）
+    を、選択肢 A と全く同じ
     `verify_same_main_session_across_turns()` / `classify_claude_multi_child_
     lifecycle()` / `verify_no_forbidden_marker()` へそのまま入力する（Option A の
     純粋関数を Option B の共有 building block として再利用しており、
@@ -163,7 +171,13 @@ production permission の根拠にしない。
   spawn-only（`orphan_starts`）／stop-only・agent_id mismatch・unknown child
   （`unknown_children`）／duplicate completion（`duplicate_completions`）のいずれかを
   検出したら FAIL とする（Issue #2219 AC3/AC4。interactive lane は永続化された
-  session transcript を evidence source として同じ関数で判定する）
+  session transcript を evidence source として同じ関数で判定する）。completion 判定は
+  同期完了（`tool_use_result.status == "completed"`）に加え、async 起動
+  （`status: "async_launched"`）が後続で受け取る `<task-notification>` block
+  （`<task-id>...<status>completed</status>...`）も第 2 の completion channel
+  として認識する。ただし既に spawn 済みと確認できた agent_id にのみ bind し、
+  通知単独から spawn を捏造しない（fix_delta iteration 2、live claude-gpt 検証で
+  発見。references/claude-code.md 参照）
 - `forbidden_marker_scan`（`--scan-forbidden-markers` 指定時のみ、structured lane・
   interactive lane 共通）: 固定 literal allowlist に対する fuzzy match を行わない
   substring scan（Issue #2219 AC6。interactive lane は永続化された session
