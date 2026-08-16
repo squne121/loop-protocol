@@ -121,7 +121,7 @@ evidence が #1881（pr-reviewer persona の production settings lane）の perm
 claim へ昇格しないことを明示する。#1881 未完了時点ではこの hermetic evidence を
 production permission の根拠にしない。
 
-## SubAgent Causal Evidence（hook ID 相関、Issue #2183）
+## SubAgent 実行の因果関係証跡（SubAgent Causal Evidence、hook ID 相関、Issue #2183）
 
 `subagent_causal_evidence_verdict(stdout, expected_markers=None)`
 （`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は、SubAgent 実行の
