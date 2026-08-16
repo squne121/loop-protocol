@@ -896,6 +896,22 @@ def _repair_receipt_from_txn_result(
     an authoritative post-dispatch snapshot for digest classification only;
     it never re-dispatches a mutation.
     """
+    # Issue #2039 P0-4 fix: ISSUE_EDIT_TXN_RESULT_V1's canonical shape nests
+    # the attempt/outcome/digest fields the receipt needs under
+    # `body_update` and `content_update` (see edit_issue_txn.py
+    # `_render_result()`); only `status` and `mutation_started` live at the
+    # top level. Reading e.g. `txn_result["body_attempted"]` or
+    # `txn_result["remote_current_body_sha256"]` at the top level always
+    # misses (those keys never exist there), which previously caused
+    # `patch_attempted` to silently degrade to False and skip fresh
+    # validation even when a body patch had genuinely been attempted.
+    body_update = txn_result.get("body_update")
+    if not isinstance(body_update, dict):
+        body_update = {}
+    content_update = txn_result.get("content_update")
+    if not isinstance(content_update, dict):
+        content_update = {}
+
     status = txn_result.get("status")
     mutation_outcome_map = {
         "ok": "applied",
@@ -906,14 +922,33 @@ def _repair_receipt_from_txn_result(
         "failed_after_mutation": "unknown",
     }
     mutation_outcome = mutation_outcome_map.get(status, "unknown")
-    patch_attempted = bool(txn_result.get("body_attempted") or txn_result.get("mutation_started"))
+    patch_attempted = bool(
+        body_update.get("attempted")
+        or content_update.get("patch_attempted")
+        or txn_result.get("mutation_started")
+    )
+
+    # Cross-field consistency (Issue #2039 P0-4 item 3): when a body/content
+    # patch was actually attempted, the nested
+    # `content_update.mutation_outcome` is the executor's own scoped signal
+    # for that patch and MUST NOT be silently overridden by a more
+    # optimistic top-level `status`-derived reading. If the executor itself
+    # could not confirm the patch outcome
+    # (`content_update.mutation_outcome == "unknown"`), this receipt's
+    # `mutation_outcome` stays `unknown` even if the overall transaction
+    # `status` looked definitive -- this is the exact
+    # mutation_outcome_unknown hazard the review flagged (fail closed,
+    # never collapse `unknown` into a definitive outcome).
+    if patch_attempted and content_update.get("mutation_outcome") == "unknown":
+        mutation_outcome = "unknown"
+
     failure_code = None
     if mutation_outcome == "unknown":
         failure_code = "final_readback_unresolvable"
     elif mutation_outcome == "not_attempted" and (txn_result.get("errors") or []):
         failure_code = "transaction_execute_error"
 
-    remote_sha = txn_result.get("remote_current_body_sha256")
+    remote_sha = body_update.get("remote_current_body_sha256")
     if not remote_sha and mutation_outcome == "unknown" and resolve_readback is not None:
         # AC5: a single authoritative read (never a mutation retry),
         # performed ONLY to disambiguate a genuinely executor-unconfirmed

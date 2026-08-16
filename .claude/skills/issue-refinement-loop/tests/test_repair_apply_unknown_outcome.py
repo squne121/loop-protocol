@@ -176,5 +176,138 @@ def test_unknown_outcome_authoritative_readback_classifies_old_when_body_unchang
     assert result["receipt"]["final_readback"]["digest_class"] == "old"
 
 
+# ---------------------------------------------------------------------------
+# Issue #2039 P0-4: canonical (nested) ISSUE_EDIT_TXN_RESULT_V1 receipt shape
+# ---------------------------------------------------------------------------
+#
+# edit_issue_txn.py's real `_render_result()` nests the attempted/outcome
+# fields the receipt adapter needs under `body_update` and `content_update`;
+# only `status`/`mutation_started`/`errors` live at the top level. A prior
+# version of `_repair_receipt_from_txn_result()` read a nonexistent
+# top-level `body_attempted` / `remote_current_body_sha256`, which always
+# missed against a real (nested) receipt and silently degraded
+# `patch_attempted` to False -- skipping AC9 fresh validation exactly when
+# the executor reported `mutation_outcome_unknown` (mutation_started=False,
+# body_update.attempted=True, content_update.patch_attempted=True,
+# content_update.mutation_outcome="unknown"). These tests exercise the real
+# nested shape directly (never an invented flat one) so this regression
+# cannot silently reappear.
+
+
+def test_receipt_reads_nested_body_and_content_update_not_top_level_flat_keys():
+    """Issue #2039 P0-4: `patch_attempted` and the remote digest must come
+    from the nested `body_update`/`content_update` objects of the real
+    ISSUE_EDIT_TXN_RESULT_V1 shape, not from nonexistent top-level flat
+    keys."""
+    canonical_unknown_receipt = {
+        "schema": "issue_edit_txn_result/v1",
+        "status": "mutation_outcome_unknown",
+        "mutation_started": False,
+        "body_update": {
+            "attempted": True,
+            "status": "failed",
+            "previous_body_sha256": "sha256:old",
+            "new_body_sha256": "sha256:candidate",
+            "remote_current_body_sha256": "sha256:live-refreshed",
+            "artifact_ref": "artifacts/2039/issue-metadata/x.input.json",
+        },
+        "content_update": {
+            "previous_title": None,
+            "requested_title": None,
+            "remote_current_title": None,
+            "patch_attempted": True,
+            "mutation_outcome": "unknown",
+        },
+        "errors": [],
+    }
+
+    receipt = _repair_receipt_from_txn_result(
+        canonical_unknown_receipt, candidate_digest="candidate", old_digest="old"
+    )
+
+    # Nested body_update.attempted / content_update.patch_attempted must be
+    # honored -- a top-level-only reader would silently see False here.
+    assert receipt["patch_attempted"] is True
+    assert receipt["mutation_outcome"] == "unknown"
+    assert receipt["failure_code"] == "final_readback_unresolvable"
+    # Nested body_update.remote_current_body_sha256 must be honored -- a
+    # top-level-only reader would see None and fall through to an
+    # unresolved readback even though the executor actually reported a
+    # digest.
+    assert receipt["final_readback"]["digest"] == "sha256:live-refreshed"
+    assert receipt["final_readback"]["status"] == "verified"
+
+
+def test_receipt_top_level_flat_keys_are_ignored_when_absent_from_nested_shape():
+    """A receipt that ONLY carries invented top-level flat keys (no
+    body_update/content_update at all) must be treated as patch NOT
+    attempted -- those top-level keys never exist on a real
+    ISSUE_EDIT_TXN_RESULT_V1 receipt, so honoring them would be reading a
+    shape edit_issue_txn.py never actually emits."""
+    flat_only_stub = {
+        "status": "ok",
+        "body_attempted": True,
+        "remote_current_body_sha256": "sha256:should-be-ignored",
+        "errors": [],
+    }
+
+    receipt = _repair_receipt_from_txn_result(flat_only_stub, candidate_digest="abc", old_digest="def")
+
+    assert receipt["patch_attempted"] is False
+    assert receipt["final_readback"]["digest"] is None
+    assert receipt["final_readback"]["status"] == "unresolved"
+
+
+def test_mutation_outcome_unknown_with_patch_attempted_does_not_skip_fresh_validation(tmp_path: Path) -> None:
+    """Issue #2039 P0-4 / AC9: when the canonical (nested) receipt reports
+    content_update.patch_attempted=True under a mutation_outcome_unknown
+    status, fresh validation must actually run (status != "not_run"), never
+    be silently skipped because the adapter misread patch_attempted as
+    False."""
+    result_path = _write_candidate(tmp_path)
+    canonical_unknown_txn_result = {
+        "status": "mutation_outcome_unknown",
+        "mutation_started": False,
+        "body_update": {
+            "attempted": True,
+            "status": "failed",
+            "remote_current_body_sha256": f"sha256:{_hex(ORIGINAL_BODY)}",
+        },
+        "content_update": {
+            "patch_attempted": True,
+            "mutation_outcome": "unknown",
+        },
+        "errors": [],
+    }
+    apply_txn = RecordingApplyTransaction(canonical_unknown_txn_result)
+
+    fresh_validate_calls: list[str] = []
+
+    def _fresh_validate(body: str) -> dict:
+        fresh_validate_calls.append(body)
+        return {"actionable_repair": False, "source_lane": "unanchored", "error": None}
+
+    def _fetch():
+        return {"body": ORIGINAL_BODY, "updatedAt": "2024-01-01T00:00:00Z"}
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2039,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=_fetch,
+        apply_transaction=apply_txn,
+        fresh_validate=_fresh_validate,
+    )
+
+    jsonschema.validate(result, _SCHEMA)
+    assert result["receipt"]["patch_attempted"] is True
+    assert result["mutation_outcome"] == "unknown"
+    # The regression: fresh_validation must NOT stay "not_run" when a patch
+    # was actually attempted, even though the overall outcome is unknown.
+    assert result["fresh_validation"]["status"] != "not_run"
+    assert fresh_validate_calls, "fresh_validate producer must actually be invoked, not skipped"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

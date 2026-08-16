@@ -69,7 +69,17 @@ class RecordingApplyTransaction:
 
     def __call__(self, current_issue: dict, candidate_body: str) -> dict:
         self.calls += 1
-        return {"status": "ok", "body_attempted": True, "remote_current_body_sha256": f"sha256:{_hex(candidate_body)}"}
+        # Issue #2039 P0-4: canonical nested ISSUE_EDIT_TXN_RESULT_V1 shape.
+        return {
+            "status": "ok",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(candidate_body)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+        }
 
 
 def test_second_drift_fails_closed_with_no_dispatch(tmp_path: Path) -> None:

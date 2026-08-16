@@ -253,7 +253,16 @@ def test_expected_provenance_full_match_proceeds_to_dispatch(tmp_path: Path) -> 
 
     def _apply_transaction(current_issue: dict, candidate_body: str) -> dict:
         dispatched.append(candidate_body)
-        return {"status": "ok", "body_attempted": True, "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}"}
+        return {
+            "status": "ok",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+        }
 
     result = rrp.run_repair_action_apply(
         repo="squne121/loop-protocol",

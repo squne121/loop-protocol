@@ -97,11 +97,24 @@ def test_no_drift_happy_path_dispatches_and_is_schema_conformant(tmp_path: Path)
     """AC1/AC6: no body drift -> exactly one dispatch, lossless applied
     receipt, schema conformant."""
     result_path = _write_candidate(tmp_path)
+    # Issue #2039 P0-4: canonical ISSUE_EDIT_TXN_RESULT_V1 shape -- attempted
+    # / remote-digest fields live nested under body_update/content_update,
+    # not at the top level (only `status`/`mutation_started`/`errors` are
+    # top-level). This is the real `edit_issue_txn.py` `_render_result()`
+    # shape, not an invented flat one.
     apply_txn = CallCountingApplyTransaction(
         {
             "status": "ok",
-            "body_attempted": True,
-            "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            },
+            "content_update": {
+                "patch_attempted": True,
+                "mutation_outcome": "applied",
+            },
             "errors": [],
         }
     )
@@ -230,8 +243,22 @@ def test_body_drift_triggers_single_producer_rerun_and_dispatches_new_candidate(
     def _fetch():
         return {"body": next(fetch_bodies), "updatedAt": "2024-01-01T00:00:00Z"}
 
+    # Issue #2039 P0-4: canonical nested ISSUE_EDIT_TXN_RESULT_V1 shape (see
+    # comment above in test_no_drift_happy_path_dispatches_and_is_schema_conformant).
     apply_txn = CallCountingApplyTransaction(
-        {"status": "ok", "body_attempted": True, "remote_current_body_sha256": f"sha256:{_hex(rebased_candidate_body)}"}
+        {
+            "status": "ok",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(rebased_candidate_body)}",
+            },
+            "content_update": {
+                "patch_attempted": True,
+                "mutation_outcome": "applied",
+            },
+        }
     )
 
     result = rrp.run_repair_action_apply(

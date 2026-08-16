@@ -139,8 +139,13 @@ class TestCanonicalProducerToConsumerProvenanceE2E:
             dispatched.append(candidate_body)
             return {
                 "status": "ok",
-                "body_attempted": True,
-                "remote_current_body_sha256": f"sha256:{hashlib.sha256(candidate_body.encode('utf-8')).hexdigest()}",
+                "mutation_started": True,
+                "body_update": {
+                    "attempted": True,
+                    "status": "ok",
+                    "remote_current_body_sha256": f"sha256:{hashlib.sha256(candidate_body.encode('utf-8')).hexdigest()}",
+                },
+                "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
             }
 
         consumer_result = wrapper.run_repair_action_apply(
@@ -187,7 +192,12 @@ class TestABAUpdatedAtProtection:
 
         def _apply_transaction(current_issue, candidate_body):
             dispatched.append(candidate_body)
-            return {"status": "ok", "body_attempted": True}
+            return {
+                "status": "ok",
+                "mutation_started": True,
+                "body_update": {"attempted": True, "status": "ok"},
+                "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+            }
 
         consumer_result = wrapper.run_repair_action_apply(
             repo="testowner/testrepo",
@@ -233,7 +243,12 @@ class TestABAUpdatedAtProtection:
             preflight_result_path=str(artifact_path.relative_to(tmp_path)),
             repo_root=tmp_path,
             fetch_current=_fetch,
-            apply_transaction=lambda current_issue, candidate_body: {"status": "ok", "body_attempted": True},
+            apply_transaction=lambda current_issue, candidate_body: {
+                "status": "ok",
+                "mutation_started": True,
+                "body_update": {"attempted": True, "status": "ok"},
+                "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+            },
         )
 
         assert consumer_result["rebase"]["drift_detected"] is True

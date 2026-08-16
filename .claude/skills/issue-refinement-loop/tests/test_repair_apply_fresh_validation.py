@@ -114,8 +114,13 @@ def test_fresh_validation_succeeds_when_no_actionable_repair_and_digest_matches(
     apply_txn = CallCountingApplyTransaction(
         {
             "status": "ok",
-            "body_attempted": True,
-            "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
             "errors": [],
         }
     )
@@ -154,8 +159,13 @@ def test_fresh_validation_rejects_source_lane_promotion(tmp_path: Path) -> None:
     apply_txn = CallCountingApplyTransaction(
         {
             "status": "ok",
-            "body_attempted": True,
-            "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
             "errors": [],
         }
     )
@@ -190,8 +200,13 @@ def test_fresh_validation_rejects_lane_mixup_to_human_context(tmp_path: Path) ->
     apply_txn = CallCountingApplyTransaction(
         {
             "status": "ok",
-            "body_attempted": True,
-            "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
             "errors": [],
         }
     )
@@ -222,8 +237,13 @@ def test_fresh_validation_fails_when_actionable_repair_remains(tmp_path: Path) -
     apply_txn = CallCountingApplyTransaction(
         {
             "status": "ok",
-            "body_attempted": True,
-            "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
             "errors": [],
         }
     )
@@ -256,8 +276,13 @@ def test_fresh_validation_fails_when_digest_does_not_match(tmp_path: Path) -> No
     apply_txn = CallCountingApplyTransaction(
         {
             "status": "ok",
-            "body_attempted": True,
-            "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
             "errors": [],
         }
     )
@@ -320,8 +345,13 @@ def test_fresh_validation_default_producer_preserves_lane_and_uses_real_repair_c
     apply_txn = CallCountingApplyTransaction(
         {
             "status": "ok",
-            "body_attempted": True,
-            "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
             "errors": [],
         }
     )
@@ -348,7 +378,14 @@ def test_ac10_replay_of_already_applied_change_resolves_to_no_change(tmp_path: P
     GitHub mutation -- the change was already applied by a prior
     invocation."""
     result_path = _write_candidate(tmp_path)
-    apply_txn = CallCountingApplyTransaction({"status": "ok", "body_attempted": True})
+    apply_txn = CallCountingApplyTransaction(
+        {
+            "status": "ok",
+            "mutation_started": True,
+            "body_update": {"attempted": True, "status": "ok"},
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+        }
+    )
 
     def _rerun_producer_should_not_be_called(body: str):
         raise AssertionError("rerun_producer must not be called on an already-applied replay")
