@@ -167,13 +167,24 @@ def test_scaled_fault_injection_inner_timeout_precedes_outer_deadline(tmp_path):
     finish."""
     marker_path = tmp_path / "marker.txt"
 
-    # Inner (per-command) timeout: 1s (integer-seconds CLI contract). Fixture
-    # sleeps far longer (5s) than the inner cap, so the inner cap must fire
-    # first (classified `timeout`) well before the fixture's own natural
-    # completion -- and well before any outer aggregate deadline would
-    # matter (this test does not need to reach one).
-    inner_timeout_seconds = 1
-    fixture_sleep_seconds = 5.0
+    # Inner (per-command) timeout: 3s (integer-seconds CLI contract).
+    # `uv run --locked pytest <fixture>` subprocess startup overhead
+    # (interpreter boot + venv/lock resolution + pytest collection) can
+    # itself consume well over 1s before the fixture even reaches its
+    # first statement, which previously caused the inner cap to fire
+    # before the fixture wrote its "started" marker (FileNotFoundError,
+    # not a genuine inner-precedes-outer signal). Widening the inner cap
+    # to 3s -- combined with the warm-up invocation below, which pre-primes
+    # the uv/pytest environment (venv resolution, bytecode compilation) so
+    # the TIMED invocation's own startup overhead is negligible -- makes
+    # the "marker written before kill" assertion robust to subprocess/
+    # interpreter startup jitter instead of racing against it. Fixture
+    # sleeps far longer (8s) than the inner cap, so the inner cap must
+    # fire first (classified `timeout`) well before the fixture's own
+    # natural completion -- and well before any outer aggregate deadline
+    # would matter (this test does not need to reach one).
+    inner_timeout_seconds = 3
+    fixture_sleep_seconds = 8.0
 
     fixture_source = f'''
 import time
@@ -198,6 +209,27 @@ def test_sleep_and_mark_completion():
         f"$ uv run --locked pytest {fixture_path} -q -s\n"
         "```\n",
         encoding="utf-8",
+    )
+
+    # Pre-warm the uv/pytest environment (venv resolution, dependency
+    # locking, bytecode compilation) OUTSIDE the timed window by running a
+    # throwaway collect-only invocation first. This amortizes subprocess
+    # startup jitter so it does not compete with the fixture's own
+    # `time.sleep()` for the narrow inner_timeout_seconds budget below.
+    subprocess.run(
+        [
+            "uv",
+            "run",
+            "--locked",
+            "pytest",
+            str(fixture_path),
+            "-q",
+            "--collect-only",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+        timeout=60,
     )
 
     start = time.monotonic()
