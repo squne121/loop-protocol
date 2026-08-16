@@ -1429,12 +1429,19 @@ def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
 
     Each entry: ``{"hook_event": "SubagentStart"|"SubagentStop",
     "agent_id": str|None, "agent_type": str|None, "agent_transcript_path":
-    str|None}``. ``agent_transcript_path`` (Issue #2183 AC1/AC2 causal
-    evidence): the official hook stdin payload documented above also
-    carries an ``agent_transcript_path`` field on ``SubagentStop`` --
-    recovered here the same best-effort way as ``agent_id``/``agent_type``
-    (never guessed, ``None`` when absent). Best-effort / fail closed to
-    ``None`` fields on any parse mismatch -- never a guess."""
+    str|None, "last_assistant_message": str|None}``.
+    ``agent_transcript_path`` (Issue #2183 AC1/AC2 causal evidence): the
+    official hook stdin payload documented above also carries an
+    ``agent_transcript_path`` field on ``SubagentStop`` -- recovered here
+    the same best-effort way as ``agent_id``/``agent_type`` (never guessed,
+    ``None`` when absent). ``last_assistant_message`` (Issue #2183 AC11):
+    when the ``SubagentStop`` hook payload additionally carries a
+    ``last_assistant_message`` field (the child's own final response text,
+    as opposed to the PARENT model's own final response), it is recovered
+    the same way -- used by ``subagent_causal_evidence_verdict()`` as an
+    alternate, still child-scoped, provenance source for expected-marker
+    matching when no transcript file is readable. Best-effort / fail closed
+    to ``None`` fields on any parse mismatch -- never a guess."""
     events: list[dict] = []
     for payload in _iter_claude_stream_events(stdout):
         if payload.get("type") != "system":
@@ -1447,6 +1454,7 @@ def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
             "agent_id": None,
             "agent_type": None,
             "agent_transcript_path": None,
+            "last_assistant_message": None,
         }
         hook_name = payload.get("hook_name")
         if isinstance(hook_name, str) and hook_name.startswith(f"{hook_event}:"):
@@ -1454,21 +1462,24 @@ def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
             if suffix:
                 entry["agent_type"] = suffix
         for key in ("stdout", "output"):
-            text = payload.get(key)
-            if not isinstance(text, str) or not text.strip():
+            raw_text = payload.get(key)
+            if not isinstance(raw_text, str) or not raw_text.strip():
                 continue
-            parsed = _parse_embedded_json_object(text)
+            parsed = _parse_embedded_json_object(raw_text)
             if parsed is None:
                 continue
             agent_id = parsed.get("agent_id")
             agent_type = parsed.get("agent_type")
             agent_transcript_path = parsed.get("agent_transcript_path")
+            last_assistant_message = parsed.get("last_assistant_message")
             if isinstance(agent_id, str) and agent_id:
                 entry["agent_id"] = agent_id
             if isinstance(agent_type, str) and agent_type:
                 entry["agent_type"] = agent_type
             if isinstance(agent_transcript_path, str) and agent_transcript_path:
                 entry["agent_transcript_path"] = agent_transcript_path
+            if isinstance(last_assistant_message, str) and last_assistant_message:
+                entry["last_assistant_message"] = last_assistant_message
         events.append(entry)
     return events
 
@@ -1494,6 +1505,30 @@ def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
 CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED = "hook_id_correlated"
 CAUSAL_EVIDENCE_SOURCE_MARKER_ONLY_INSUFFICIENT = "marker_only_insufficient"
 CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE = "no_evidence"
+
+
+def _read_claude_agent_transcript_content(agent_transcript_path: str | None) -> str | None:
+    """Issue #2183 AC11: best-effort read of the durable child transcript
+    file a ``SubagentStop`` hook payload claims to have written.
+
+    Returns the file's own text content when ``agent_transcript_path`` is a
+    non-empty string that names a REGULAR, READABLE, NON-EMPTY file;
+    ``None`` in every other case (path missing/empty, file does not exist,
+    is not a regular file, cannot be opened, or is empty/whitespace-only).
+    A path string that was merely echoed in a hook payload but never
+    materialized on disk must never be trusted as durable evidence -- this
+    function is the single place that distinguishes "a path string was
+    reported" from "a transcript actually exists"."""
+    if not agent_transcript_path:
+        return None
+    try:
+        if not os.path.isfile(agent_transcript_path):
+            return None
+        with open(agent_transcript_path, "r", encoding="utf-8", errors="replace") as handle:
+            content = handle.read()
+    except OSError:
+        return None
+    return content if content.strip() else None
 
 
 def _claude_agent_tool_invocation_correlated(stdout: str, agent_id: str | None) -> bool:
@@ -1565,25 +1600,51 @@ def subagent_causal_evidence_verdict(stdout: str, expected_markers: list[str] | 
       ``agent_transcript_path`` field for the correlated ``agent_id``
       (``None`` unless both Start/Stop correlate AND the transcript path
       was recovered).
+    - ``agent_transcript_verified`` (AC11): whether ``agent_transcript_path``
+      points at a file that actually exists on disk, is readable, and is
+      non-empty (see ``_read_claude_agent_transcript_content``). A path
+      string that was merely echoed in the hook payload but never
+      materialized on disk (or is empty) is never trusted as durable
+      evidence.
     - ``tool_invocation_id_correlated`` (AC3): whether the correlated
       ``agent_id`` is additionally tied to a specific ``Agent`` tool
       invocation in this stream via a matched tool_use/tool_result id pair
-      (see ``_claude_agent_tool_invocation_correlated``).
+      (see ``_claude_agent_tool_invocation_correlated``). This field now
+      participates directly in ``causal_evidence_source`` promotion (AC3
+      strengthening): ``tool_invocation_id_correlated == False`` alone is
+      sufficient to keep ``causal_evidence_source`` out of
+      ``hook_id_correlated``, even when the Start/Stop pair and transcript
+      path both correlate.
+    - ``marker_provenance_verified`` (AC11/AC12): only meaningful when the
+      caller supplies ``expected_markers``. ``True`` when at least one
+      expected marker is found either in the correlated child's own
+      transcript file content, or in the correlated ``SubagentStop``
+      event's ``last_assistant_message`` field -- i.e. the marker's
+      provenance is the CHILD's own output, not merely "somewhere in the
+      combined stdout" (which also contains the PARENT model's own final
+      response text). When ``expected_markers`` is not supplied this field
+      is ``True`` (no marker provenance claim is being made, so there is
+      nothing to fail).
     - ``causal_evidence_source`` (AC2, enum):
-      ``hook_id_correlated`` only when a same-``agent_id`` Start/Stop pair
-      AND a recovered ``agent_transcript_path`` are BOTH present (AC2's
-      literal requirement); ``marker_only_insufficient`` when no hook
-      lifecycle evidence exists at all but a caller-supplied
-      ``expected_markers`` string was found in ``stdout`` (the exact
-      marker-only-PASS scenario this function exists to stop trusting);
-      ``no_evidence`` otherwise -- including the AC4 scenario of a lone
-      ``SubagentStart`` with no matching ``SubagentStop`` (or a Stop
-      lacking ``agent_transcript_path``), which must never be silently
-      promoted to ``hook_id_correlated``.
+      ``hook_id_correlated`` only when ALL of the following hold (AC2/AC3/
+      AC11 literal requirements -- any single omission fails closed):
+      a same-``agent_id`` Start/Stop pair; a recovered
+      ``agent_transcript_path``; ``agent_transcript_verified`` (the
+      transcript file exists, is readable, and is non-empty);
+      ``tool_invocation_id_correlated``; and (only when ``expected_markers``
+      was supplied) ``marker_provenance_verified``.
+      ``marker_only_insufficient`` when no hook lifecycle evidence exists
+      at all but a caller-supplied ``expected_markers`` string was found in
+      ``stdout`` (the exact marker-only-PASS scenario this function exists
+      to stop trusting); ``no_evidence`` otherwise -- including the AC4
+      scenario of a lone ``SubagentStart`` with no matching ``SubagentStop``
+      (or a Stop lacking ``agent_transcript_path``), which must never be
+      silently promoted to ``hook_id_correlated``.
 
     Fails closed on every field -- a value that cannot be honestly derived
-    from the already-captured stream is left ``None``/``False``/
-    ``no_evidence``, never guessed or promoted from a weaker signal."""
+    from the already-captured stream (or, for ``agent_transcript_verified``,
+    the filesystem) is left ``None``/``False``/``no_evidence``, never
+    guessed or promoted from a weaker signal."""
     events = extract_claude_hook_lifecycle_events(stdout)
     start_agent_ids = {
         event["agent_id"]
@@ -1597,6 +1658,7 @@ def subagent_causal_evidence_verdict(stdout: str, expected_markers: list[str] | 
 
     correlated_agent_id: str | None = None
     agent_transcript_path: str | None = None
+    last_assistant_message: str | None = None
     for event in events:
         if event["hook_event"] != "SubagentStop":
             continue
@@ -1604,19 +1666,49 @@ def subagent_causal_evidence_verdict(stdout: str, expected_markers: list[str] | 
         if agent_id and agent_id in start_agent_ids:
             correlated_agent_id = agent_id
             agent_transcript_path = event["agent_transcript_path"]
+            last_assistant_message = event.get("last_assistant_message")
             break
 
     tool_invocation_id_correlated = _claude_agent_tool_invocation_correlated(stdout, correlated_agent_id)
 
-    if correlated_agent_id and agent_transcript_path:
+    transcript_content = _read_claude_agent_transcript_content(agent_transcript_path)
+    agent_transcript_verified = transcript_content is not None
+
+    # AC11/AC12: when the caller is asserting a specific expected artifact
+    # (``expected_markers``), the marker's PROVENANCE must be the
+    # correlated child's own output (its transcript file content, or the
+    # SubagentStop event's own ``last_assistant_message`` field) -- never
+    # merely "found somewhere in the combined stdout", which also contains
+    # the PARENT model's own final response text. This is the exact AC12
+    # negative-control scenario: an unrelated SubAgent completes cleanly
+    # (real Start/Stop/transcript/tool-invocation correlation) while the
+    # expected marker only ever appears in the parent's own final message.
+    if not expected_markers:
+        marker_provenance_verified = True
+    elif transcript_content and any(marker in transcript_content for marker in expected_markers):
+        marker_provenance_verified = True
+    elif last_assistant_message and any(marker in last_assistant_message for marker in expected_markers):
+        marker_provenance_verified = True
+    else:
+        marker_provenance_verified = False
+
+    if (
+        correlated_agent_id
+        and agent_transcript_path
+        and agent_transcript_verified
+        and tool_invocation_id_correlated
+        and marker_provenance_verified
+    ):
         causal_evidence_source = CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
     elif events:
         # Some hook lifecycle evidence was observed (e.g. a lone
-        # SubagentStart with no matching SubagentStop, or a correlated Stop
-        # missing its transcript path) -- never promoted to correlated, and
-        # never re-classified as marker_only_insufficient (hook evidence,
-        # even incomplete, is a stronger/different signal than "no hook
-        # evidence at all, just a marker").
+        # SubagentStart with no matching SubagentStop, a correlated Stop
+        # missing its transcript path or unverifiable transcript, a Stop not
+        # tied to a matching Agent tool invocation, or a Stop whose expected
+        # marker provenance can't be confirmed) -- never promoted to
+        # correlated, and never re-classified as marker_only_insufficient
+        # (hook evidence, even incomplete, is a stronger/different signal
+        # than "no hook evidence at all, just a marker").
         causal_evidence_source = CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
     elif expected_markers and any(marker in stdout for marker in expected_markers):
         causal_evidence_source = CAUSAL_EVIDENCE_SOURCE_MARKER_ONLY_INSUFFICIENT
@@ -1628,7 +1720,9 @@ def subagent_causal_evidence_verdict(stdout: str, expected_markers: list[str] | 
         "subagent_start_observed": subagent_start_observed,
         "subagent_stop_observed": subagent_stop_observed,
         "agent_transcript_path": agent_transcript_path,
+        "agent_transcript_verified": agent_transcript_verified,
         "tool_invocation_id_correlated": tool_invocation_id_correlated,
+        "marker_provenance_verified": marker_provenance_verified,
         "causal_evidence_source": causal_evidence_source,
     }
 

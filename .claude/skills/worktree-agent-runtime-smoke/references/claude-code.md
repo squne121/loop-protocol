@@ -199,3 +199,76 @@ isolated lane 実行中に変化するケース）を追加した。
 - structured lane: `type: system/init`、`type: result`、hook lifecycle event の件数を確認できる
 - interactive lane: `agent explain` から抽出した detected agent／confidence と observed lifecycle state
   （`summary.md` の allowlist フィールドのみ。raw pane transcript は保存しない）
+
+## SubAgent 実行の hook-ID-correlated causal evidence（`subagent_causal_evidence_verdict()`、Issue #2183）
+
+`subagent_causal_evidence_verdict(stdout, expected_markers=None)`
+（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は、SubAgent が実際に
+実行されたことの証跡を、marker 文字列（synthetic fixture でも trivially 満たせる）
+のみに依存させず、hook lifecycle event の ID 相関という構造的シグナルで判定する
+純粋関数。structured lane の captured stdout（`--include-hook-events` の
+stream-json）を入力とし、live 実行を新規に起動しない hermetic pytest で全域を
+検証できる（本 Issue の Runtime Verification Applicability: `not_applicable`）。
+
+### 利用方法
+
+呼び出し元は structured/interactive いずれの lane でも、captured された
+stdout（または herdr pane text）と、検証対象の `expected_markers`（`--expect-marker`
+と同じリスト）を渡すだけでよい:
+
+```python
+causal_evidence = subagent_causal_evidence_verdict(out, args.expect_marker)
+schema_summary["subagent_causal_evidence"] = causal_evidence
+```
+
+戻り値は常に `schema_summary["subagent_causal_evidence"]` へ無条件（フラグの
+有無に関わらず）に記録される。これにより、実際に exit_code を昇格させたか
+どうかとは独立に、「marker のみの PASS だったのか、hook ID 相関で PASS した
+のか」を事後に判別できる。
+
+### `causal_evidence_source` の意味
+
+3 値の enum で、`hook_id_correlated` へ昇格するのは以下を **すべて** 満たした
+場合に限る（fail-closed。いずれか一つでも欠落・不一致なら昇格しない）:
+
+1. 同一 `agent_id` を持つ `SubagentStart` と `SubagentStop` の hook lifecycle
+   event ペアが観測される
+2. `SubagentStop` payload の `agent_transcript_path` が回収でき、かつそのパスが
+   指すファイルが実在し・読み取り可能・非空である（`agent_transcript_verified`。
+   Issue #2183 AC11 — payload にパス文字列があるだけでは足りない）
+3. 相関済み `agent_id` が `Agent` tool_use/tool_result の `tool_use_id` 相関
+   （`_claude_agent_tool_invocation_correlated`）で裏付けられている
+   （`tool_invocation_id_correlated == True`。Issue #2183 AC3 — この bool は
+   フィールドとして計算されるだけでなく、判定そのものに参加する）
+4. `expected_markers` を指定した呼び出しでは、その期待マーカーが相関済み
+   child 自身の transcript ファイル内容、または `SubagentStop` の
+   `last_assistant_message` 相当フィールド由来であることが確認できる
+   （`marker_provenance_verified`。Issue #2183 AC11/AC12 — parent 自身の
+   最終応答文字列にのみ一致した場合は昇格しない。無関係な SubAgent が
+   正常に Start/Stop・transcript・tool 相関まで揃って完了しても、期待
+   マーカーが parent 自身の最終応答テキストにしか現れない negative
+   control シナリオは、この条件で `no_evidence` に fail-close する）
+
+`marker_only_insufficient` は、hook lifecycle event が一切なく `expected_markers`
+の文字列のみが `stdout` にある場合。それ以外（lone `SubagentStart`、
+`agent_id` 不一致、transcript 未実在/空、tool 相関なし、marker provenance
+未確認など）はすべて `no_evidence` になる。
+
+### lane ごとの既定挙動
+
+- **structured lane**（`run_structured_claude` 経由）: `SubagentStart`/
+  `SubagentStop` の stream-json チャンネルが常に構造的に利用可能なため、
+  呼び出し側が `--expect-marker` を指定する場合、`causal_evidence_source ==
+  hook_id_correlated` は **既定強制**（追加フラグ不要。PR #2220 レビュー
+  fix-delta）。`--expect-marker` を指定しない structured lane 実行にこの
+  要件を課したい場合は `--require-subagent-causal-evidence`（既定 OFF）を
+  明示する。
+- **interactive lane**（`run_interactive_herdr_isolated` 経由）: herdr pane
+  のテキストレンダリングは `--include-hook-events` の stream-json hook
+  payload を構造的にエコーしないため、`causal_evidence_source` は今のところ
+  `no_evidence`／`marker_only_insufficient` になる想定である。この lane では
+  本要件は引き続き **opt-in**（`--require-subagent-causal-evidence` を明示
+  した場合のみ exit を昇格）のままとし、既存の operability / multi-turn /
+  session isolation の証拠（Herdr session baseline 比較等）を PASS 条件として
+  維持する。interactive lane 向けの hook 出力チャネル整備（herdr 側の構造的
+  制約変更）は本 Issue の対象外（別 Issue の scope）。

@@ -11,7 +11,12 @@ functions in ``run_worktree_agent_runtime_smoke.py`` directly with synthetic
 fixture stream-json text -- no live Claude Code / Codex CLI process is ever
 spawned (Runtime Verification Applicability: not_applicable, per Issue
 #2183's own contract). Fixture shapes mirror
-``test_child_spawn_completion_evidence.py`` (Issue #2015 AC11).
+``test_child_spawn_completion_evidence.py`` (Issue #2015 AC11). Tests that
+need a durable transcript ``agent_transcript_path`` to actually exist on
+disk (AC11's file-existence/content-verification requirement) use pytest's
+``tmp_path`` fixture rather than a hardcoded non-existent path -- a hook
+payload that merely CLAIMS a transcript path is not, on its own, honest
+evidence of one (that is the exact gap AC11 closes).
 """
 from __future__ import annotations
 
@@ -49,6 +54,7 @@ def _hook_payload(
     *,
     agent_type: str = AGENT_TYPE,
     agent_transcript_path: str | None = None,
+    last_assistant_message: str | None = None,
 ) -> str:
     payload = {
         "session_id": SESSION_ID,
@@ -58,6 +64,8 @@ def _hook_payload(
     }
     if agent_transcript_path is not None:
         payload["agent_transcript_path"] = agent_transcript_path
+    if last_assistant_message is not None:
+        payload["last_assistant_message"] = last_assistant_message
     return json.dumps(payload)
 
 
@@ -67,6 +75,7 @@ def _hook_event(
     agent_id: str,
     agent_type: str = AGENT_TYPE,
     agent_transcript_path: str | None = None,
+    last_assistant_message: str | None = None,
 ) -> str:
     return _line(
         {
@@ -76,10 +85,18 @@ def _hook_event(
             "hook_name": hook_event,
             "session_id": SESSION_ID,
             "stdout": _hook_payload(
-                agent_id, hook_event, agent_type=agent_type, agent_transcript_path=agent_transcript_path
+                agent_id,
+                hook_event,
+                agent_type=agent_type,
+                agent_transcript_path=agent_transcript_path,
+                last_assistant_message=last_assistant_message,
             ),
             "output": _hook_payload(
-                agent_id, hook_event, agent_type=agent_type, agent_transcript_path=agent_transcript_path
+                agent_id,
+                hook_event,
+                agent_type=agent_type,
+                agent_transcript_path=agent_transcript_path,
+                last_assistant_message=last_assistant_message,
             ),
         }
     )
@@ -125,33 +142,72 @@ def test_function_exists_and_returns_required_fields() -> None:
     assert "tool_invocation_id_correlated" in verdict
     assert "agent_id" in verdict
     assert "agent_transcript_path" in verdict
+    assert "agent_transcript_verified" in verdict
+    assert "marker_provenance_verified" in verdict
 
 
 # ---------------------------------------------------------------------------
-# Positive case: correlated Start/Stop pair + transcript path + tool
-# invocation correlation -> hook_id_correlated, tool_invocation_id_correlated
-# True.
+# Positive case: correlated Start/Stop pair + a REAL, non-empty transcript
+# file + tool invocation correlation + marker recovered from the child's own
+# transcript content -> hook_id_correlated, tool_invocation_id_correlated
+# True, agent_transcript_verified True, marker_provenance_verified True.
 # ---------------------------------------------------------------------------
 
 
-def test_given_correlated_start_stop_with_transcript_when_verdict_computed_then_hook_id_correlated() -> None:
+def test_given_correlated_start_stop_with_transcript_when_verdict_computed_then_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "assistant", "message": {"content": COMPLETION_MARKER}}) + "\n",
+        encoding="utf-8",
+    )
     stdout = "\n".join(
         [
             _agent_tool_use_event(),
             _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
             _agent_tool_result_event(CHILD_AGENT_ID),
             _hook_event(
-                "SubagentStop", agent_id=CHILD_AGENT_ID, agent_transcript_path=TRANSCRIPT_PATH
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
             ),
         ]
     )
     verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
     assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
     assert verdict["agent_id"] == CHILD_AGENT_ID
-    assert verdict["agent_transcript_path"] == TRANSCRIPT_PATH
+    assert verdict["agent_transcript_path"] == str(transcript_path)
+    assert verdict["agent_transcript_verified"] is True
+    assert verdict["marker_provenance_verified"] is True
     assert verdict["tool_invocation_id_correlated"] is True
     assert verdict["subagent_start_observed"] is True
     assert verdict["subagent_stop_observed"] is True
+
+
+def test_given_correlated_start_stop_no_expected_markers_when_verdict_computed_then_hook_id_correlated(
+    tmp_path,
+) -> None:
+    # When the caller does not request any expected marker at all,
+    # marker_provenance_verified makes no claim and defaults True -- it
+    # must not itself block promotion.
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text("unrelated transcript content\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout)
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["marker_provenance_verified"] is True
 
 
 def test_given_correlated_start_stop_no_transcript_path_when_verdict_computed_then_not_correlated() -> None:
@@ -167,6 +223,7 @@ def test_given_correlated_start_stop_no_transcript_path_when_verdict_computed_th
     verdict = smoke.subagent_causal_evidence_verdict(stdout)
     assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
     assert verdict["agent_transcript_path"] is None
+    assert verdict["agent_transcript_verified"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -230,42 +287,69 @@ def test_given_empty_stdout_when_verdict_computed_then_no_evidence() -> None:
     assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
     assert verdict["agent_id"] is None
     assert verdict["tool_invocation_id_correlated"] is False
+    assert verdict["agent_transcript_verified"] is False
 
 
 # ---------------------------------------------------------------------------
-# AC3: tool_invocation_id_correlated must fail closed to False when the
-# Agent tool_use/tool_result envelope is absent, even if the hook channel
-# itself is fully correlated.
+# AC3 (strengthened): tool_invocation_id_correlated must fail closed to
+# False when the Agent tool_use/tool_result envelope is absent, AND that
+# False value must now, by itself, be sufficient to keep
+# causal_evidence_source OUT of hook_id_correlated -- even when the hook
+# Start/Stop pair and a genuinely real, verified transcript are both
+# present. Prior to the AC3 strengthening this field was computed but
+# never consulted by the promotion decision; these tests pin the new,
+# effective gate.
 # ---------------------------------------------------------------------------
 
 
-def test_given_hook_correlated_but_no_agent_tool_result_when_verdict_computed_then_no_correlation() -> None:
+def test_given_hook_correlated_but_no_agent_tool_result_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    # Deliberately gives this Stop event a REAL, non-empty, readable
+    # transcript file (unlike the raw hardcoded TRANSCRIPT_PATH used
+    # elsewhere in this module, which does not exist on disk) so that this
+    # test isolates exactly one failure cause: the missing Agent
+    # tool_use/tool_result correlation, not an AC11 transcript-verification
+    # failure that would otherwise also block promotion.
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text("real transcript content, but no tool_use/tool_result pair\n", encoding="utf-8")
     stdout = "\n".join(
         [
             _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
             _hook_event(
-                "SubagentStop", agent_id=CHILD_AGENT_ID, agent_transcript_path=TRANSCRIPT_PATH
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
             ),
         ]
     )
     verdict = smoke.subagent_causal_evidence_verdict(stdout)
-    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
     assert verdict["tool_invocation_id_correlated"] is False
+    assert verdict["agent_transcript_verified"] is True
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
 
 
-def test_given_agent_tool_result_agent_id_mismatch_when_verdict_computed_then_tool_invocation_not_correlated() -> None:
+def test_given_agent_tool_result_agent_id_mismatch_when_verdict_computed_then_tool_invocation_not_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text("real transcript content\n", encoding="utf-8")
     stdout = "\n".join(
         [
             _agent_tool_use_event(),
             _agent_tool_result_event(OTHER_AGENT_ID),
             _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
             _hook_event(
-                "SubagentStop", agent_id=CHILD_AGENT_ID, agent_transcript_path=TRANSCRIPT_PATH
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
             ),
         ]
     )
     verdict = smoke.subagent_causal_evidence_verdict(stdout)
     assert verdict["tool_invocation_id_correlated"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
 
 
 # ---------------------------------------------------------------------------
@@ -288,3 +372,202 @@ def test_extract_claude_hook_lifecycle_events_agent_transcript_path_none_when_ab
     events = smoke.extract_claude_hook_lifecycle_events(stdout)
     assert len(events) == 1
     assert events[0]["agent_transcript_path"] is None
+
+
+def test_extract_claude_hook_lifecycle_events_recovers_last_assistant_message() -> None:
+    stdout = _hook_event(
+        "SubagentStop",
+        agent_id=CHILD_AGENT_ID,
+        agent_transcript_path=TRANSCRIPT_PATH,
+        last_assistant_message=COMPLETION_MARKER,
+    )
+    events = smoke.extract_claude_hook_lifecycle_events(stdout)
+    assert len(events) == 1
+    assert events[0]["last_assistant_message"] == COMPLETION_MARKER
+
+
+# ---------------------------------------------------------------------------
+# AC11: agent_transcript_path realism (existence/readability/non-emptiness)
+# and marker/artifact content-provenance verification.
+# ---------------------------------------------------------------------------
+
+
+def test_given_agent_transcript_path_file_does_not_exist_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    missing_path = tmp_path / "does-not-exist.jsonl"
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(missing_path),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout)
+    assert verdict["agent_transcript_verified"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_agent_transcript_path_file_is_empty_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    empty_path = tmp_path / "empty-transcript.jsonl"
+    empty_path.write_text("", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(empty_path),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout)
+    assert verdict["agent_transcript_verified"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_given_whitespace_only_transcript_file_when_verdict_computed_then_not_verified(tmp_path) -> None:
+    whitespace_path = tmp_path / "whitespace-only-transcript.jsonl"
+    whitespace_path.write_text("   \n\t\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(whitespace_path),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout)
+    assert verdict["agent_transcript_verified"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_given_expected_marker_absent_from_real_transcript_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    # The transcript file is real, non-empty, and readable, and the hook
+    # chain + tool-invocation correlation are all fully valid -- but the
+    # expected marker text never appears in that transcript's own content,
+    # and no last_assistant_message field was supplied either. This must
+    # still fail closed: a genuinely real but content-irrelevant transcript
+    # is not evidence the EXPECTED artifact came from this child.
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text("the child did unrelated work and said nothing matching\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_transcript_verified"] is True
+    assert verdict["tool_invocation_id_correlated"] is True
+    assert verdict["marker_provenance_verified"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_expected_marker_recovered_only_from_last_assistant_message_when_verdict_computed_then_hook_id_correlated(
+    tmp_path,
+) -> None:
+    # The child's transcript FILE does not itself contain the marker (e.g.
+    # it only logged tool activity, not the final response text), but the
+    # SubagentStop hook payload's own last_assistant_message field -- still
+    # a CHILD-scoped field, not the parent's -- does. This is a valid
+    # alternate provenance source per AC11's contract text.
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text("tool activity log only, no final response text\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+                last_assistant_message=f"child finished: {COMPLETION_MARKER}",
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["marker_provenance_verified"] is True
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+# ---------------------------------------------------------------------------
+# AC12: negative control -- an UNRELATED SubAgent completes cleanly (real
+# agent_id correlation, real transcript, real tool-invocation correlation),
+# but the expected marker only ever appears in the PARENT model's own final
+# response text (i.e. plain assistant prose in the combined stdout stream,
+# never inside the unrelated child's transcript or last_assistant_message).
+# This must not be promoted to hook_id_correlated -- the marker's
+# provenance is the parent, not the (unrelated) correlated child.
+# ---------------------------------------------------------------------------
+
+
+def test_given_unrelated_subagent_completes_and_parent_emits_marker_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    unrelated_transcript_path = tmp_path / "unrelated-child-transcript.jsonl"
+    unrelated_transcript_path.write_text(
+        "the unrelated child did its own unrelated work\n", encoding="utf-8"
+    )
+    parent_final_message_event = _line(
+        {
+            "type": "assistant",
+            "session_id": SESSION_ID,
+            "message": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Parent's own final response, unrelated to any child: {COMPLETION_MARKER}",
+                    }
+                ]
+            },
+        }
+    )
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=OTHER_AGENT_ID),
+            _agent_tool_result_event(OTHER_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=OTHER_AGENT_ID,
+                agent_transcript_path=str(unrelated_transcript_path),
+            ),
+            parent_final_message_event,
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    # Sanity: the unrelated child's own hook/tool-invocation correlation IS
+    # genuinely valid on its own terms -- this negative control specifically
+    # isolates the marker-provenance requirement, not a weaker hook-chain
+    # failure that would trivially explain the non-promotion.
+    assert verdict["agent_id"] == OTHER_AGENT_ID
+    assert verdict["agent_transcript_verified"] is True
+    assert verdict["tool_invocation_id_correlated"] is True
+    assert verdict["marker_provenance_verified"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE

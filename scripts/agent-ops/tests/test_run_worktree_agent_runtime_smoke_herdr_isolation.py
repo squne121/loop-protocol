@@ -445,6 +445,79 @@ def test_given_no_baseline_preservation_flag_when_interactive_lane_runs_then_bas
 
 
 # ---------------------------------------------------------------------------
+# 3b. Issue #2183 AC10: interactive lane causal-evidence gate is opt-in
+#     (unlike the structured lane's --expect-marker default forcing), since
+#     the herdr pane's plain-text rendering never echoes the
+#     --include-hook-events stream-json hook payload
+#     subagent_causal_evidence_verdict() parses.
+# ---------------------------------------------------------------------------
+
+
+def test_given_interactive_lane_marker_only_when_require_subagent_causal_evidence_opt_in_then_fails(
+    repo_with_worktree, tmp_path
+):
+    """Issue #2183 AC10: when a caller explicitly opts in via
+    --require-subagent-causal-evidence, the interactive lane DOES gate
+    exit_code on causal_evidence_source -- the herdr pane here only ever
+    renders the plain marker text (no hook lifecycle JSON), so this must
+    FAIL even though the plain --expect-marker text match itself would
+    have succeeded."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY_ENV_LOGGING)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--expect-marker", "OBSERVED_MARKER",
+        "--require-subagent-causal-evidence",
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
+    )
+    assert result.returncode == 1
+    assert "subagent causal evidence insufficient (--require-subagent-causal-evidence)" in result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "'causal_evidence_source': 'marker_only_insufficient'" in summary
+
+
+def test_given_herdr_interactive_lane_pane_marker_only_when_causal_evidence_not_required_then_exit0(
+    repo_with_worktree, tmp_path
+):
+    """Issue #2183 AC10 (opt-in default): the SAME marker-only herdr pane
+    shape as the test above, but WITHOUT --require-subagent-causal-evidence
+    -- unlike the structured lane's --expect-marker default forcing, the
+    interactive lane must NOT gate exit_code on causal evidence unless the
+    caller explicitly opts in. The verdict is still computed and recorded
+    (never silently dropped), just not consulted for exit_code."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY_ENV_LOGGING)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
+    state_dir = tmp_path / "herdr-state"
+    prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
+    out_dir = tmp_path / "out"
+
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--expect-marker", "OBSERVED_MARKER",
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "'causal_evidence_source': 'marker_only_insufficient'" in summary
+
+
+# ---------------------------------------------------------------------------
 # 4. Real-herdr live poison test (Issue #2176 P0-3 item 3).
 # ---------------------------------------------------------------------------
 

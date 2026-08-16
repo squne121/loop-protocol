@@ -132,16 +132,38 @@ captured stdout（stream-json）を入力とする。
 戻り値のフィールド:
 
 - `causal_evidence_source`（enum）: `hook_id_correlated` / `marker_only_insufficient` /
-  `no_evidence`。`hook_id_correlated` は、同一 `agent_id` を持つ `SubagentStart`/
-  `SubagentStop` ペアが観測され、かつ `SubagentStop` payload の `agent_transcript_path`
-  が回収できた場合のみ返る。lone `SubagentStart`（`SubagentStop` 欠落）や
-  `agent_transcript_path` 欠落は `no_evidence` に、hook イベントが一切なく
-  `expected_markers` の文字列のみが `stdout` にあれば `marker_only_insufficient` に
-  fail-closed する
+  `no_evidence`。`hook_id_correlated` は、以下を **すべて** 満たした場合にのみ返る
+  （Issue #2183 AC3/AC11 強化。いずれか一つでも欠落すれば fail-closed に
+  `no_evidence`/`marker_only_insufficient` に留まる）:
+  1. 同一 `agent_id` を持つ `SubagentStart`/`SubagentStop` ペアが観測される
+  2. `SubagentStop` payload の `agent_transcript_path` が回収でき、かつそのパスが
+     指すファイルが実在し・読み取り可能・非空である（`agent_transcript_verified`）
+  3. 相関済み `agent_id` が `Agent` tool_use/tool_result の tool_use_id 相関で
+     裏付けられている（`tool_invocation_id_correlated == True`）
+  4. `expected_markers` を指定した呼び出しでは、その期待マーカーが
+     相関済み child 自身の transcript ファイル内容、または `SubagentStop` の
+     `last_assistant_message` 相当フィールド由来であることが確認できる
+     （`marker_provenance_verified`。parent 自身の最終応答文字列にのみ一致した
+     場合は昇格しない）
+
+  lone `SubagentStart`（`SubagentStop` 欠落）・`agent_transcript_path` 欠落・
+  transcript 未実在／空・`tool_invocation_id_correlated == False`・marker
+  provenance 未確認は、いずれも `no_evidence` に fail-closed する。hook イベントが
+  一切なく `expected_markers` の文字列のみが `stdout` にあれば
+  `marker_only_insufficient` になる
 - `tool_invocation_id_correlated`（bool）: 相関済み `agent_id` が `Agent` tool_use の
   `id` と対応する `tool_result` の `tool_use_id` を介して同一の tool 呼び出しに
   紐づいていることを追加検証する（`extract_claude_canonical_read_receipt` と同じ
-  tool_use_id 相関パターンを `Agent` tool 呼び出しに適用したもの）
+  tool_use_id 相関パターンを `Agent` tool 呼び出しに適用したもの）。この値は
+  `causal_evidence_source` の判定に直接参加する（AC3 強化。フィールドとして
+  計算されるだけで判定に無関係、という状態は解消済み）
+- `agent_transcript_verified`（bool、AC11）: `agent_transcript_path` が実在し・
+  読み取り可能・非空なファイルを指しているか。パス文字列が payload に含まれて
+  いるだけでは `True` にならない
+- `marker_provenance_verified`（bool、AC11/AC12）: `expected_markers` 指定時のみ
+  意味を持つ。マーカーが相関済み child の transcript 内容または
+  `last_assistant_message` 由来であれば `True`。`expected_markers` 未指定時は
+  常に `True`（provenance の主張自体がないため）
 - `agent_id` / `subagent_start_observed` / `subagent_stop_observed` /
   `agent_transcript_path`: 個別の観測事実（すべて fail-closed、推測しない）
 
