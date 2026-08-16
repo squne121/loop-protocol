@@ -191,6 +191,14 @@ def test_fresh_validation_rejects_source_lane_promotion(tmp_path: Path) -> None:
     assert result["provenance"]["source_lane"] == "unanchored"
     assert result["fresh_validation"]["status"] == "failed"
     assert result["fresh_validation"]["source_lane_preserved"] is False
+    # PR #2202 review fix-delta (P0-5): a fresh-validation failure must
+    # surface as phase=fresh_validation / a non-null failure_code -- it
+    # must never leave phase=complete/failure_code=null even though the
+    # mutation itself genuinely applied. mutation_outcome is left untouched
+    # (it is a fact about GitHub state, separate from this check).
+    assert result["mutation_outcome"] == "applied"
+    assert result["phase"] == "fresh_validation"
+    assert result["failure_code"] == "source_lane_mismatch"
 
 
 def test_fresh_validation_rejects_lane_mixup_to_human_context(tmp_path: Path) -> None:
@@ -228,6 +236,11 @@ def test_fresh_validation_rejects_lane_mixup_to_human_context(tmp_path: Path) ->
     jsonschema.validate(result, _SCHEMA)
     assert result["fresh_validation"]["status"] == "failed"
     assert result["fresh_validation"]["source_lane_preserved"] is False
+    # PR #2202 review fix-delta (P0-5): same phase/failure_code override as
+    # the lane-promotion case above.
+    assert result["mutation_outcome"] == "applied"
+    assert result["phase"] == "fresh_validation"
+    assert result["failure_code"] == "source_lane_mismatch"
 
 
 def test_fresh_validation_fails_when_actionable_repair_remains(tmp_path: Path) -> None:
@@ -266,6 +279,11 @@ def test_fresh_validation_fails_when_actionable_repair_remains(tmp_path: Path) -
     assert result["fresh_validation"]["status"] == "failed"
     assert result["fresh_validation"]["actionable_repair_remaining"] is True
     assert result["fresh_validation"]["source_lane_preserved"] is True
+    # PR #2202 review fix-delta (P0-5): lane was preserved here, so the
+    # generic (non-lane-specific) failure code applies.
+    assert result["mutation_outcome"] == "applied"
+    assert result["phase"] == "fresh_validation"
+    assert result["failure_code"] == "fresh_validation_failed"
 
 
 def test_fresh_validation_fails_when_digest_does_not_match(tmp_path: Path) -> None:
@@ -306,6 +324,11 @@ def test_fresh_validation_fails_when_digest_does_not_match(tmp_path: Path) -> No
     jsonschema.validate(result, _SCHEMA)
     assert result["fresh_validation"]["status"] == "failed"
     assert result["fresh_validation"]["final_body_digest_match"] is False
+    # PR #2202 review fix-delta (P0-5): digest mismatch is also a
+    # non-lane-specific fresh-validation failure.
+    assert result["mutation_outcome"] == "applied"
+    assert result["phase"] == "fresh_validation"
+    assert result["failure_code"] == "fresh_validation_failed"
 
 
 def test_fresh_validation_not_run_when_mutation_not_attempted(tmp_path: Path) -> None:
@@ -369,6 +392,148 @@ def test_fresh_validation_default_producer_preserves_lane_and_uses_real_repair_c
     jsonschema.validate(result, _SCHEMA)
     assert result["fresh_validation"]["source_lane_preserved"] is True
     assert result["fresh_validation"]["status"] in {"success", "failed"}
+
+
+def test_fresh_validation_default_producer_detects_real_lane_mismatch(tmp_path: Path) -> None:
+    """PR #2202 review fix-delta (P0-5, item 4): the DEFAULT fresh-validation
+    producer must genuinely re-derive the source lane from real
+    (fresh_anchor_url, fresh_known_context) state via the SAME classifier
+    the original producer uses (_determine_repair_source_lane ->
+    _resolve_scope_delta_source_kind), not merely echo back the recorded
+    source_lane. No `fresh_validate` test double is injected here -- this
+    exercises the real default path."""
+    result_path = _write_candidate(tmp_path, source_lane="unanchored")
+    apply_txn = CallCountingApplyTransaction(
+        {
+            "status": "ok",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+            "errors": [],
+        }
+    )
+    fetch = _fetch_sequence([ORIGINAL_BODY, REPAIRED_BODY])
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2039,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=fetch,
+        apply_transaction=apply_txn,
+        # The original candidate was generated under the "unanchored" lane
+        # (no anchor comment). If the live/current state now carries an
+        # anchor comment, the SAME classifier the producer uses must report
+        # a different (non-unanchored) lane -- a genuine mismatch, not a
+        # fabricated one.
+        fresh_anchor_url="https://github.com/squne121/loop-protocol/issues/2039#issuecomment-999",
+        fresh_known_context={},
+    )
+
+    jsonschema.validate(result, _SCHEMA)
+    assert result["fresh_validation"]["source_lane_preserved"] is False
+    assert result["fresh_validation"]["status"] == "failed"
+    assert result["mutation_outcome"] == "applied"
+    assert result["phase"] == "fresh_validation"
+    assert result["failure_code"] == "source_lane_mismatch"
+
+
+def test_fresh_validation_default_producer_reports_lane_preserved_with_matching_anchor_context(
+    tmp_path: Path,
+) -> None:
+    """PR #2202 review fix-delta (P0-5, item 4): the real re-derivation path
+    must also report success (lane preserved) when the supplied
+    fresh_anchor_url/fresh_known_context genuinely still resolve to the
+    SAME lane the candidate was generated under -- proving the check is a
+    real comparison, not a fixed always-fail stub."""
+    result_path = _write_candidate(tmp_path, source_lane="human_context")
+    apply_txn = CallCountingApplyTransaction(
+        {
+            "status": "ok",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_hex(REPAIRED_BODY)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+            "errors": [],
+        }
+    )
+    fetch = _fetch_sequence([ORIGINAL_BODY, REPAIRED_BODY])
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/2039#issuecomment-999"
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2039,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=fetch,
+        apply_transaction=apply_txn,
+        fresh_anchor_url=anchor_url,
+        fresh_known_context={"human_context_comment_urls": [anchor_url]},
+    )
+
+    jsonschema.validate(result, _SCHEMA)
+    assert result["fresh_validation"]["source_lane_preserved"] is True
+
+
+def test_cli_apply_repair_action_exits_nonzero_on_fresh_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #2202 review fix-delta (P0-5, item 3): the CLI/dispatch exit-code
+    logic must inspect phase/failure_code, not mutation_outcome alone -- a
+    genuinely applied mutation whose fresh validation subsequently failed
+    (phase=fresh_validation, failure_code non-null) must exit non-zero,
+    never 0."""
+    result_path = _write_candidate(tmp_path)
+
+    def _fake_run_repair_action_apply(**kwargs):
+        return {
+            "schema_version": "repair_apply_result/v1",
+            "phase": "fresh_validation",
+            "mutation_outcome": "applied",
+            "failure_code": "source_lane_mismatch",
+            "repo": "squne121/loop-protocol",
+            "issue_number": 2039,
+            "provenance": {},
+            "rebase": {"attempted": False, "producer_reruns": 0, "drift_detected": False, "second_drift": False},
+            "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
+            "receipt": {
+                "patch_attempted": True,
+                "executor_status": "ok",
+                "mutation_outcome": "applied",
+                "failure_code": None,
+                "final_readback": {"status": "verified", "digest": "sha256:x", "digest_class": "candidate"},
+            },
+            "fresh_validation": {
+                "status": "failed",
+                "source_lane_preserved": False,
+                "actionable_repair_remaining": False,
+                "final_body_digest_match": True,
+            },
+            "historical_artifacts": {"physically_deleted": False, "latest_action_reference_invalidated": True},
+        }
+
+    monkeypatch.setattr(rrp, "run_repair_action_apply", _fake_run_repair_action_apply)
+
+    with pytest.raises(SystemExit) as exc_info:
+        rrp.main(
+            [
+                "--issue-number",
+                "2039",
+                "--repo",
+                "squne121/loop-protocol",
+                "--apply-repair-action",
+                str(result_path),
+            ]
+        )
+
+    assert exc_info.value.code != 0
 
 
 def test_ac10_replay_of_already_applied_change_resolves_to_no_change(tmp_path: Path) -> None:

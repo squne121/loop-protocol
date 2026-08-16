@@ -977,20 +977,33 @@ def _repair_receipt_from_txn_result(
 REPAIR_APPLY_VALID_SOURCE_LANES = {"human_context", "anchor", "unanchored"}
 
 
-def _default_fresh_validate_producer(body: str, expected_source_lane: str) -> dict:
+def _default_fresh_validate_producer(
+    body: str,
+    expected_source_lane: str,
+    *,
+    anchor_url: "str | None" = None,
+    known_context: "dict | None" = None,
+) -> dict:
     """Issue #2039 AC9 default fresh-validation producer.
 
     Reruns the SAME narrow repair producer (dry-run only -- no
     materialization, no mutation) against `body` to determine whether an
-    actionable repair still remains after the mutation attempt. This
-    narrow producer has no lane-reclassification capability of its own, so
-    by construction it reports back the same `expected_source_lane` it was
-    invoked with (it never promotes unanchored -> anchor, never converts to
-    with_anchor, and never mixes lanes). A caller-injected `fresh_validate`
-    callable (e.g. a lane-aware fresh-preflight test double) is required to
-    exercise genuine lane-promotion / with_anchor-conversion / lane-mix-up
-    rejection; this default is the fail-closed-safe baseline for the common
-    "nothing about lane classification changed" case.
+    actionable repair still remains after the mutation attempt.
+
+    PR #2202 review fix-delta (P0-5, item 4): when the caller supplies the
+    SAME `anchor_url` / `known_context` inputs the original producer run
+    used to classify its source lane, this now genuinely re-derives the
+    lane by rerunning the SAME classifier
+    (`_determine_repair_source_lane` -> `_resolve_scope_delta_source_kind`)
+    against the CURRENT (fresh) state -- it does not simply trust/echo
+    `expected_source_lane`. This is what makes a real lane-promotion /
+    lane-mix-up bug detectable, not merely an injected test double. When no
+    anchor context is supplied (the common case for callers that do not
+    thread it through -- e.g. this function has no independent way to
+    discover which GitHub comment was originally the anchor without being
+    told), this stays the fail-closed-safe baseline of reporting the lane
+    it was told to preserve (it never promotes unanchored -> anchor, never
+    converts to with_anchor, and never mixes lanes on its own).
     """
     dry = _invoke_repair(body)
     if dry.get("error"):
@@ -1001,7 +1014,11 @@ def _default_fresh_validate_producer(body: str, expected_source_lane: str) -> di
         and isinstance(raw_action, dict)
         and raw_action.get("disposition") == "auto_apply_safe"
     )
-    return {"error": None, "source_lane": expected_source_lane, "actionable_repair": actionable}
+    if anchor_url is not None or known_context is not None:
+        reported_lane = _determine_repair_source_lane(anchor_url, known_context)
+    else:
+        reported_lane = expected_source_lane
+    return {"error": None, "source_lane": reported_lane, "actionable_repair": actionable}
 
 
 def _repair_apply_expected_post_mutation_digest(
@@ -1108,6 +1125,8 @@ def run_repair_action_apply(
     expected_provenance: "dict | None" = None,
     rerun_producer=None,
     fresh_validate=None,
+    fresh_anchor_url: "str | None" = None,
+    fresh_known_context: "dict | None" = None,
 ) -> dict:
     """Issue #2039 AC8/AC11: `repair_action.apply` controlled consumer.
 
@@ -1161,7 +1180,21 @@ def run_repair_action_apply(
     mix-up), and the live body digest matches the digest AC5's own
     authoritative-readback classification already established. This never
     re-dispatches a mutation and is independent of the AC5 post-dispatch
-    retry budget.
+    retry budget. `fresh_anchor_url` / `fresh_known_context` (optional) are
+    forwarded to the default fresh-validation producer so it can genuinely
+    re-derive the source lane from current state instead of echoing back
+    the lane it was told to preserve (PR #2202 review fix-delta, P0-5).
+
+    PR #2202 review fix-delta (P0-5): a fresh validation `status ==
+    "failed"` that occurs after a mutation that otherwise reached
+    `phase == "complete"` (an `applied`/`no_change` outcome) now overrides
+    `phase` to `"fresh_validation"` and sets a non-null `failure_code`
+    (`source_lane_mismatch` when the lane was not preserved, else
+    `fresh_validation_failed`) -- `mutation_outcome` itself is never
+    altered (it is a fact about GitHub state, independent of this
+    consistency check), but a genuine fresh-validation failure can no
+    longer be silently reported as `phase=complete` /
+    `failure_code=null`.
 
     AC10 (historical artifact immutability): this function never deletes
     the preflight-result artifact it reads, the producer's own recorded
@@ -1629,7 +1662,9 @@ def run_repair_action_apply(
             old_digest=live_body_digest,
         )
         fresh_validate_fn = fresh_validate or (
-            lambda body: _default_fresh_validate_producer(body, source_lane)
+            lambda body: _default_fresh_validate_producer(
+                body, source_lane, anchor_url=fresh_anchor_url, known_context=fresh_known_context
+            )
         )
         fresh_validation = _run_repair_apply_fresh_validation(
             fetch=fetch,
@@ -1644,6 +1679,19 @@ def run_repair_action_apply(
             "actionable_repair_remaining": None,
             "final_body_digest_match": None,
         }
+
+    # PR #2202 review fix-delta (P0-5): a fresh-validation failure that
+    # follows an otherwise-`complete` phase (applied/no_change) must be
+    # surfaced -- it must not be silently absorbed into
+    # phase=complete/failure_code=null. `mutation_outcome` itself is left
+    # untouched: it is a fact about GitHub state (the mutation genuinely
+    # happened or did not), separate from this post-mutation consistency
+    # check.
+    if fresh_validation["status"] == "failed" and phase == "complete":
+        phase = "fresh_validation"
+        failure_code = (
+            "source_lane_mismatch" if fresh_validation["source_lane_preserved"] is False else "fresh_validation_failed"
+        )
 
     return {
         "schema_version": REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION,
@@ -7206,6 +7254,12 @@ def main(argv: list[str] | None = None) -> None:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         outcome = result.get("mutation_outcome")
+        # PR #2202 review fix-delta (P0-5): a real fresh-validation failure
+        # (phase == "fresh_validation" with a non-null failure_code) must
+        # exit non-zero even when the mutation itself genuinely applied --
+        # mutation_outcome alone previously hid this failure behind exit 0.
+        if result.get("phase") == "fresh_validation" and result.get("failure_code"):
+            sys.exit(EXIT_ENVIRONMENT_FAILURE)
         if outcome in {"applied", "no_change"}:
             sys.exit(0)
         if outcome == "not_attempted":

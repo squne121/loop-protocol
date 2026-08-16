@@ -407,11 +407,67 @@
             "required": [
               "patch_attempted"
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mutation_outcome": {
+            "const": "applied"
           },
+          "phase": {
+            "const": "complete"
+          }
+        },
+        "required": [
+          "mutation_outcome",
+          "phase"
+        ]
+      },
+      "then": {
+        "properties": {
           "failure_code": {
             "const": null
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "const": "fresh_validation"
+          }
+        },
+        "required": [
+          "phase"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "enum": [
+              "source_lane_mismatch",
+              "fresh_validation_failed"
+            ]
+          },
+          "fresh_validation": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "failure_code"
+        ]
       }
     },
     {

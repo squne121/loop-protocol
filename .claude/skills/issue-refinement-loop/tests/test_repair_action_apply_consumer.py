@@ -80,6 +80,22 @@ def _fetch_stub(body: str = ORIGINAL_BODY):
     return _fetch
 
 
+def _fetch_sequence_stub(bodies: list[str]):
+    """PR #2202 review fix-delta (P0-5): `fetch_current` is invoked at both
+    the pre-dispatch precondition read AND (when a patch was actually
+    attempted) the AC9 post-dispatch fresh-validation reread. A fixed
+    single-body `_fetch_stub()` was stale by the time AC9 wiring made
+    fresh_validation failures affect `phase`/`failure_code` -- this returns
+    each body in sequence, one per call, so a happy-path test can genuinely
+    reflect the live body actually changing after a real dispatch."""
+    it = iter(bodies)
+
+    def _fetch():
+        return {"body": next(it), "updatedAt": "2024-01-01T00:00:00Z"}
+
+    return _fetch
+
+
 class CallCountingApplyTransaction:
     """Records how many times the transaction dispatch closure is invoked,
     so a test can prove no blind retry happened (AC5)."""
@@ -124,7 +140,14 @@ def test_no_drift_happy_path_dispatches_and_is_schema_conformant(tmp_path: Path)
         issue_number=2039,
         preflight_result_path=str(result_path.relative_to(tmp_path)),
         repo_root=tmp_path,
-        fetch_current=_fetch_stub(),
+        # PR #2202 review fix-delta (P0-5): patch_attempted is True here, so
+        # AC9 fresh validation now reruns `fetch_current` a second time to
+        # re-read the live body post-dispatch. A realistic post-mutation
+        # state has the live body actually equal to REPAIRED_BODY by then
+        # (the mutation genuinely applied) -- a fixed single-body stub was
+        # stale and would now (correctly) surface as a fresh-validation
+        # digest-mismatch failure.
+        fetch_current=_fetch_sequence_stub([ORIGINAL_BODY, REPAIRED_BODY]),
         apply_transaction=apply_txn,
     )
 
@@ -140,6 +163,11 @@ def test_no_drift_happy_path_dispatches_and_is_schema_conformant(tmp_path: Path)
         "second_drift": False,
     }
     assert result["receipt"]["final_readback"]["digest_class"] == "candidate"
+    # PR #2202 review fix-delta (P0-5): a genuinely successful mutation
+    # followed by a genuinely successful fresh validation must still land
+    # on phase=complete/failure_code=null (the override only fires on
+    # fresh_validation failure).
+    assert result["fresh_validation"]["status"] == "success"
 
 
 def test_missing_original_body_sha256_is_provenance_unreconstructable(tmp_path: Path) -> None:
