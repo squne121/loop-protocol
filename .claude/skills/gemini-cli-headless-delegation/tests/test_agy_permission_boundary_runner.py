@@ -677,6 +677,7 @@ def test_main_writes_structured_exit_1_artifact_and_cleans_runtime_after_runner_
         "retry_result": "not_run",
         "final_cleanup_verdict": "removed",
         "postcondition_absent": True,
+        "producer_contract_revision": MODULE.PRODUCER_CONTRACT_REVISION,
     }
     assert not list(artifact_dir.glob("agy-boundary-*"))
 

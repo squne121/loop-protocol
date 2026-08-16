@@ -298,9 +298,15 @@
             "retry_count",
             "retry_result",
             "final_cleanup_verdict",
-            "postcondition_absent"
+            "postcondition_absent",
+            "producer_contract_revision"
           ],
           "properties": {
+            "producer_contract_revision": {
+              "type": "string",
+              "description": "Issue #1997 fix_delta P2-2: identifies which producer contract revision emitted this ledger, so a legacy pre-fix_delta artifact (lacking this field entirely, since the whole object remains optional) can never be confused with a current producer's output.",
+              "minLength": 1
+            },
             "initial_result": {"enum": ["success", "failure"]},
             "initial_exception_type": {"type": ["string", "null"]},
             "initial_errno": {"type": ["integer", "null"]},
@@ -324,7 +330,18 @@
             "retry_result": {"enum": ["not_run", "success", "failure"]},
             "final_cleanup_verdict": {"enum": ["removed", "failed"]},
             "postcondition_absent": {"type": "boolean"}
-          }
+          },
+          "allOf": [
+            {
+              "description": "Issue #1997 fix_delta P1-1 (OWNER review issuecomment-5307195963): postcondition_absent and final_cleanup_verdict must be a schema-enforced bidirectional equivalence, not just a Python-validator check.",
+              "if": {"properties": {"postcondition_absent": {"const": true}}, "required": ["postcondition_absent"]},
+              "then": {"properties": {"final_cleanup_verdict": {"const": "removed"}}}
+            },
+            {
+              "if": {"properties": {"postcondition_absent": {"const": false}}, "required": ["postcondition_absent"]},
+              "then": {"properties": {"final_cleanup_verdict": {"const": "failed"}}}
+            }
+          ]
         }
       }
     },

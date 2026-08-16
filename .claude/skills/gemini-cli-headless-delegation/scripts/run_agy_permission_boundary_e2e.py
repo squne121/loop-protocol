@@ -468,15 +468,23 @@ def validate_artifact(artifact: Mapping[str, Any], *, forbidden: tuple[str, ...]
     if isinstance(removal, Mapping):
         retry_eligible = removal["retry_eligible"]
         observation = removal["residual_observation"]
+        # Issue #1997 fix_delta P0-1/P1-1 (OWNER review issuecomment-5307195963):
+        # `final_cleanup_verdict == "removed"` and `postcondition_absent` must
+        # be a full bidirectional equivalence, not a one-directional check --
+        # a producer that reports the root already absent must always report
+        # "removed", regardless of whether any delete operation "succeeded".
         if cleanup["temporary_processes_removed"] != removal["postcondition_absent"]:
             return False, "temporary_removal_projection_invalid"
         if removal["final_cleanup_verdict"] == "removed" and not removal["postcondition_absent"]:
             return False, "temporary_removal_removed_without_enoent"
+        if removal["postcondition_absent"] and removal["final_cleanup_verdict"] != "removed":
+            return False, "temporary_removal_postcondition_without_removed_verdict"
         if retry_eligible:
             if not (
                 removal["initial_result"] == "failure"
                 and removal["initial_errno"] in RETRYABLE_TEMPORARY_REMOVAL_ERRNOS
                 and observation["status"] == "complete"
+                and observation["entry_count"] == 0
                 and observation["holder_status"] == "absent"
                 and removal["retry_count"] == 1
             ):
@@ -485,10 +493,6 @@ def validate_artifact(artifact: Mapping[str, Any], *, forbidden: tuple[str, ...]
             return False, "temporary_removal_uneligible_retry_invalid"
         if removal["retry_result"] != "not_run" and removal["retry_count"] != 1:
             return False, "temporary_removal_retry_count_invalid"
-        if removal["final_cleanup_verdict"] == "removed" and not (
-            removal["initial_result"] == "success" or removal["retry_result"] == "success"
-        ):
-            return False, "temporary_removal_removed_without_successful_delete"
         if removal["retry_policy_mode"] == "observation_only" and retry_eligible:
             return False, "temporary_removal_observation_only_retry_invalid"
         if removal["retry_policy_mode"] not in {"observation_only", "single_retry_enabled"}:
@@ -644,6 +648,7 @@ def _artifact(
     process_group_isolated: bool = True,
     descendant_processes_absent: bool = True,
     prompt_compliance: Mapping[str, Any] | None = None,
+    cleanup_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     digest = _file_digest(executable) if executable is not None and executable.is_file() else "sha256:" + "0" * 64
     resolved_capability_gate = dict(capability_gate) if capability_gate is not None else _bootstrap_capability_gate()
@@ -682,7 +687,7 @@ def _artifact(
             if exit_code == EXIT_PROMPT_NONCOMPLIANT
             else "fix_or_reprobe",
         },
-        "cleanup": {
+        "cleanup": dict(cleanup_override) if cleanup_override is not None else {
             "temporary_processes_removed": cleanup_ok,
             "loopback_servers_stopped": cleanup_ok,
             "process_group_isolated": process_group_isolated,
@@ -714,6 +719,7 @@ def _unavailable_artifact(
     capability_gate: Mapping[str, Any] | None = None,
     process_group_isolated: bool = True,
     descendant_processes_absent: bool = True,
+    cleanup_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a schema-valid non-completion artifact.
 
@@ -753,6 +759,7 @@ def _unavailable_artifact(
         cleanup_ok=process_group_isolated and descendant_processes_absent,
         process_group_isolated=process_group_isolated,
         descendant_processes_absent=descendant_processes_absent,
+        cleanup_override=cleanup_override,
     )
 
 
@@ -1348,6 +1355,8 @@ def _attempts_from_parent_observation(runtime: Mapping[str, Any], profile: str) 
 
 
 RETRYABLE_TEMPORARY_REMOVAL_ERRNOS = frozenset({errno.ENOTEMPTY, errno.EEXIST})
+# Issue #1997 fix_delta P0-1/P0-2/P2-2 (OWNER review issuecomment-5307195963).
+PRODUCER_CONTRACT_REVISION = "1997-fix-delta-1"
 _MAX_RESIDUAL_ENTRIES = 64
 _MAX_PROC_HOLDER_PROBES = 4096
 _MAX_PROC_FDS_PER_PROCESS = 64
@@ -1405,7 +1414,7 @@ def _rmtree_once(root: Path) -> tuple[bool, dict[str, Any] | None]:
 
     try:
         shutil.rmtree(root, onexc=onexc)
-    except BaseException as exception:  # keep unknown filesystem failures fail-closed
+    except OSError as exception:  # keep unknown filesystem failures fail-closed
         if first_failure is None:
             first_failure = _failure_provenance(root, "rmtree", root, exception)
         return False, first_failure
@@ -1489,6 +1498,22 @@ def _temporary_root_absent(root: Path) -> bool:
     return False
 
 
+def _root_identity(root: Path) -> tuple[int, int] | None:
+    """Return ``(st_dev, st_ino)`` for *root*, or ``None`` if it cannot be statted.
+
+    Issue #1997 fix_delta P0-2: guards retry authorization against a root
+    that was replaced (rename / symlink substitution / recreation by another
+    actor) between the initial failure and the retry decision. Retry must
+    never be authorized against a different filesystem object than the one
+    that actually failed.
+    """
+    try:
+        stat_result = os.lstat(root)
+    except OSError:
+        return None
+    return (stat_result.st_dev, stat_result.st_ino)
+
+
 def _remove_temporary_tree_with_evidence(root: Path, *, retry_enabled: bool = True) -> dict[str, Any]:
     """Delete a runner-owned temp tree with provenance and one fail-closed retry."""
     evidence: dict[str, Any] = {
@@ -1506,30 +1531,51 @@ def _remove_temporary_tree_with_evidence(root: Path, *, retry_enabled: bool = Tr
         "retry_result": "not_run",
         "final_cleanup_verdict": "failed",
         "postcondition_absent": False,
+        "producer_contract_revision": PRODUCER_CONTRACT_REVISION,
     }
     initial_success, provenance = _rmtree_once(root)
     if not initial_success:
         evidence["initial_result"] = "failure"
         assert provenance is not None
         evidence.update(provenance)
+        # Issue #1997 fix_delta P0-2: identity must be captured before the
+        # (read-only) residual observation runs and re-checked immediately
+        # before the eligibility decision -- a changed identity means some
+        # other actor touched *root* in that window and retry is unsafe.
+        identity_at_failure = _root_identity(root)
         observation = _observe_temporary_residual(root)
         evidence["residual_observation"] = observation
+        identity_at_decision = _root_identity(root)
+        root_identity_unchanged = (
+            identity_at_failure is not None
+            and identity_at_decision is not None
+            and identity_at_failure == identity_at_decision
+        )
         retry_eligible = (
             retry_enabled
             and evidence["initial_errno"] in RETRYABLE_TEMPORARY_REMOVAL_ERRNOS
             and observation["status"] == "complete"
+            and observation["entry_count"] == 0
             and observation["holder_status"] == "absent"
+            and root_identity_unchanged
         )
         evidence["retry_eligible"] = retry_eligible
         if retry_eligible:
             evidence["retry_count"] = 1
             retry_success, _retry_provenance = _rmtree_once(root)
             evidence["retry_result"] = "success" if retry_success else "failure"
+    # Issue #1997 fix_delta P0-1 (OWNER review issuecomment-5307195963):
+    # `final_cleanup_verdict` and the legacy `temporary_processes_removed`
+    # projection are derived *only* from the final `lstat` postcondition,
+    # never from whether a delete operation reported success. A root that is
+    # already absent (e.g. a top-level ENOENT, or removed by another actor)
+    # is a legitimate "removed" outcome; a root whose delete "succeeded" but
+    # that still exists afterward is not. This keeps the ledger a pure
+    # function of observable final state, so it can never disagree with
+    # itself the way an operation-result-gated verdict could.
     postcondition_absent = _temporary_root_absent(root)
     evidence["postcondition_absent"] = postcondition_absent
-    successful_removal = initial_success or evidence["retry_result"] == "success"
-    if successful_removal and postcondition_absent:
-        evidence["final_cleanup_verdict"] = "removed"
+    evidence["final_cleanup_verdict"] = "removed" if postcondition_absent else "failed"
     return evidence
 
 
@@ -1992,9 +2038,16 @@ def _failure_artifact(
     prior_cleanup = prior_result.get("cleanup") if isinstance(prior_result, Mapping) else None
     process_group_isolated = True
     descendant_processes_absent = True
+    cleanup_override: Mapping[str, Any] | None = None
     if isinstance(prior_cleanup, Mapping):
         process_group_isolated = bool(prior_cleanup.get("process_group_isolated", True))
         descendant_processes_absent = bool(prior_cleanup.get("descendant_processes_absent", True))
+        # Issue #1997 fix_delta P0-1 (OWNER review issuecomment-5307195963):
+        # preserve the full prior cleanup ledger losslessly. Reconstructing
+        # only the two process-group booleans here would let a downstream
+        # validator rejection silently fabricate a "temp-tree removed" claim
+        # for a run whose real temp-tree cleanup had already failed.
+        cleanup_override = dict(prior_cleanup)
     return _unavailable_artifact(
         reason,
         profile=profile,
@@ -2002,6 +2055,7 @@ def _failure_artifact(
         artifact_dir=artifact_dir,
         process_group_isolated=process_group_isolated,
         descendant_processes_absent=descendant_processes_absent,
+        cleanup_override=cleanup_override,
     )
 
 

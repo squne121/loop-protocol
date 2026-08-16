@@ -257,6 +257,7 @@ def test_cleanup_schema_additive_provenance_contract(tmp_path: Path) -> None:
         "retry_result": "success",
         "final_cleanup_verdict": "removed",
         "postcondition_absent": True,
+        "producer_contract_revision": MODULE.PRODUCER_CONTRACT_REVISION,
     }
     artifact["cleanup"]["temporary_processes_removed"] = True
     assert MODULE._schema_errors(artifact) == []
@@ -338,3 +339,250 @@ def test_remove_tree_evidence_records_retry_mode_for_successful_phase_b_artifact
     phase_a_removal = phase_a_artifact["cleanup"]["temporary_tree_removal"]
     assert phase_a_removal["retry_count"] == removal["retry_count"] == 0
     assert phase_a_removal["retry_policy_mode"] == "observation_only"
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #1997 fix_delta regression coverage (OWNER review issuecomment-5307195963)
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_enoent_is_a_self_consistent_removed_verdict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P0-1: a root that is already gone before rmtree even starts (top-level
+    ENOENT, propagated to the caller rather than routed through ``onexc``)
+    must produce a ledger that agrees with its own ``postcondition_absent``:
+    the goal (no temp root) is met, so this is a "removed" outcome even
+    though no delete operation of ours "succeeded"."""
+    root = tmp_path / "temporary-root"  # deliberately never created
+
+    def raise_enoent(_path: Path, *, onexc: object) -> None:
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT))
+
+    monkeypatch.setattr(MODULE.shutil, "rmtree", raise_enoent)
+
+    evidence = MODULE._remove_temporary_tree_with_evidence(root)
+
+    assert evidence["initial_result"] == "failure"
+    assert evidence["initial_errno"] == errno.ENOENT
+    assert evidence["retry_eligible"] is False
+    assert evidence["retry_count"] == 0
+    assert evidence["postcondition_absent"] is True
+    assert evidence["final_cleanup_verdict"] == "removed"
+
+
+def test_validator_rejects_postcondition_absent_without_removed_verdict(tmp_path: Path) -> None:
+    """P1-1: the validator must enforce the postcondition<->verdict
+    equivalence in both directions, not just reject `removed` without
+    ENOENT."""
+    artifact = MODULE._unavailable_artifact(MODULE.FAILURE_UNAVAILABLE, profile="no_tools", artifact_dir=tmp_path)
+    artifact["cleanup"]["temporary_tree_removal"] = {
+        "initial_result": "failure",
+        "initial_exception_type": "OSError",
+        "initial_errno": errno.ENOENT,
+        "initial_errno_name": "ENOENT",
+        "initial_operation": "rmtree",
+        "path_class": "root",
+        "relative_path_digest": "sha256:" + "0" * 64,
+        "residual_observation": {"status": "not_run", "entry_count": None, "holder_status": "not_checked"},
+        "retry_policy_mode": "single_retry_enabled",
+        "retry_eligible": False,
+        "retry_count": 0,
+        "retry_result": "not_run",
+        # Inconsistent on purpose: postcondition says absent but the verdict
+        # still claims failure.
+        "final_cleanup_verdict": "failed",
+        "postcondition_absent": True,
+        "producer_contract_revision": MODULE.PRODUCER_CONTRACT_REVISION,
+    }
+    artifact["cleanup"]["temporary_processes_removed"] = True
+    valid, reason = MODULE.validate_artifact(artifact)
+    assert valid is False
+    # The schema-level allOf bidirectional equivalence (added alongside this
+    # fix_delta) rejects the inconsistent state before the Python cross-field
+    # check ever runs -- defense in depth working as intended.
+    assert reason == "draft202012_invalid"
+
+
+def test_retry_failure_after_eligible_attempt_is_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P1-2: an eligible retry that ALSO fails must record
+    `retry_result: failure`, keep `final_cleanup_verdict: failed`, and never
+    discard the original failure provenance."""
+    root = tmp_path / "temporary-root"
+    root.mkdir()
+    calls = 0
+
+    def always_fail(_path: Path, *, onexc: object) -> None:
+        nonlocal calls
+        calls += 1
+        onexc(os.rmdir, str(root), _failure(errno.ENOTEMPTY))  # type: ignore[operator]
+
+    monkeypatch.setattr(MODULE.shutil, "rmtree", always_fail)
+    monkeypatch.setattr(
+        MODULE,
+        "_observe_temporary_residual",
+        lambda _root: {"status": "complete", "entry_count": 0, "holder_status": "absent"},
+    )
+    evidence = MODULE._remove_temporary_tree_with_evidence(root)
+
+    assert calls == 2
+    assert evidence["retry_eligible"] is True
+    assert evidence["retry_count"] == 1
+    assert evidence["retry_result"] == "failure"
+    assert evidence["final_cleanup_verdict"] == "failed"
+    assert evidence["postcondition_absent"] is False
+    assert evidence["initial_errno"] == errno.ENOTEMPTY
+
+
+def test_entry_count_positive_blocks_retry_even_with_absent_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-2: `ENOTEMPTY` genuinely means non-empty. A positive `entry_count`
+    must block retry regardless of `holder_status`, since no-matching-FD-observed
+    is not proof the directory is actually empty."""
+    root = tmp_path / "temporary-root"
+    root.mkdir()
+
+    def fail_once(_path: Path, *, onexc: object) -> None:
+        onexc(os.rmdir, str(root), _failure(errno.ENOTEMPTY))  # type: ignore[operator]
+
+    monkeypatch.setattr(MODULE.shutil, "rmtree", fail_once)
+    monkeypatch.setattr(
+        MODULE,
+        "_observe_temporary_residual",
+        lambda _root: {"status": "complete", "entry_count": 3, "holder_status": "absent"},
+    )
+    evidence = MODULE._remove_temporary_tree_with_evidence(root)
+    assert evidence["retry_eligible"] is False
+    assert evidence["retry_count"] == 0
+
+
+def test_root_identity_replacement_between_failure_and_decision_blocks_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-2: if *root* is replaced (rename / symlink substitution / recreation
+    by another actor) between the initial failure and the eligibility
+    decision, retry must never be authorized against the new object."""
+    root = tmp_path / "temporary-root"
+    root.mkdir()
+
+    def fail_once(_path: Path, *, onexc: object) -> None:
+        onexc(os.rmdir, str(root), _failure(errno.ENOTEMPTY))  # type: ignore[operator]
+
+    monkeypatch.setattr(MODULE.shutil, "rmtree", fail_once)
+    monkeypatch.setattr(
+        MODULE,
+        "_observe_temporary_residual",
+        lambda _root: {"status": "complete", "entry_count": 0, "holder_status": "absent"},
+    )
+    identity_calls = {"count": 0}
+
+    def flaky_identity(_root: Path) -> tuple[int, int] | None:
+        identity_calls["count"] += 1
+        return (1, 100) if identity_calls["count"] == 1 else (1, 999)
+
+    monkeypatch.setattr(MODULE, "_root_identity", flaky_identity)
+    evidence = MODULE._remove_temporary_tree_with_evidence(root)
+    assert identity_calls["count"] == 2
+    assert evidence["retry_eligible"] is False
+    assert evidence["retry_count"] == 0
+
+
+def test_root_removed_by_another_actor_before_retry_decision_is_still_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-1/P0-2: if some other actor removes *root* between our initial
+    failure and the retry decision, we must not blindly retry against a
+    vanished target -- but the final ledger must still honestly report
+    "removed", since the goal (no temp root) was actually achieved."""
+    root = tmp_path / "temporary-root"
+    root.mkdir()
+
+    def fail_once(_path: Path, *, onexc: object) -> None:
+        onexc(os.rmdir, str(root), _failure(errno.ENOTEMPTY))  # type: ignore[operator]
+
+    def observe_then_vanish(_root: Path) -> dict[str, object]:
+        # Simulate another actor removing root during our bounded, read-only
+        # residual observation window -- i.e. strictly between the two
+        # `_root_identity()` captures in `_remove_temporary_tree_with_evidence`.
+        root.rmdir()
+        return {"status": "complete", "entry_count": 0, "holder_status": "absent"}
+
+    monkeypatch.setattr(MODULE.shutil, "rmtree", fail_once)
+    monkeypatch.setattr(MODULE, "_observe_temporary_residual", observe_then_vanish)
+    evidence = MODULE._remove_temporary_tree_with_evidence(root)
+    assert evidence["retry_eligible"] is False
+    assert evidence["retry_count"] == 0
+    assert evidence["postcondition_absent"] is True
+    assert evidence["final_cleanup_verdict"] == "removed"
+
+
+def test_failure_artifact_preserves_full_prior_cleanup_ledger_losslessly(tmp_path: Path) -> None:
+    """P0-1 #4: when `main()` replaces a result via `_failure_artifact()`
+    (e.g. after a validator rejection), the real cleanup ledger -- including
+    `temporary_tree_removal` -- must survive verbatim rather than being
+    silently reconstructed (and potentially fabricated) from two booleans."""
+    prior_cleanup = {
+        "temporary_processes_removed": False,
+        "loopback_servers_stopped": True,
+        "process_group_isolated": True,
+        "descendant_processes_absent": True,
+        "temporary_tree_removal": {
+            "initial_result": "failure",
+            "initial_exception_type": "OSError",
+            "initial_errno": errno.EACCES,
+            "initial_errno_name": "EACCES",
+            "initial_operation": "rmdir",
+            "path_class": "root",
+            "relative_path_digest": "sha256:" + "1" * 64,
+            "residual_observation": {"status": "not_run", "entry_count": None, "holder_status": "not_checked"},
+            "retry_policy_mode": "single_retry_enabled",
+            "retry_eligible": False,
+            "retry_count": 0,
+            "retry_result": "not_run",
+            "final_cleanup_verdict": "failed",
+            "postcondition_absent": False,
+            "producer_contract_revision": MODULE.PRODUCER_CONTRACT_REVISION,
+        },
+    }
+    prior_result = {"cleanup": prior_cleanup}
+    artifact = MODULE._failure_artifact(
+        "agy_permission_boundary_validator_exception",
+        profile="no_tools",
+        artifact_dir=tmp_path,
+        prior_result=prior_result,
+    )
+    assert artifact["cleanup"] == prior_cleanup
+
+
+def test_setsid_escaped_child_recreates_root_content_after_initial_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC5/P0-2: an escaped `setsid()` child that is still writing into the
+    temp root after the initial rmtree failure must never be authorized for
+    retry solely because `holder_status: absent` (no *matching* FD observed)
+    -- deterministically modeled here (rather than as a true OS-level race)
+    since the same escaped-child semantics are already exercised live by
+    `test_setsid_escape_is_not_proven_absent_by_original_pgid`; this test
+    isolates the retry-authorization predicate itself."""
+    root = tmp_path / "temporary-root"
+    root.mkdir()
+
+    def escaped_child_recreates_content(_path: Path, *, onexc: object) -> None:
+        onexc(os.rmdir, str(root), _failure(errno.ENOTEMPTY))  # type: ignore[operator]
+        # The escaped child (already outside our process group -- see
+        # test_setsid_escape_is_not_proven_absent_by_original_pgid) is still
+        # alive and recreates a file in root right after our first attempt.
+        (root / "still-alive-marker").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(MODULE.shutil, "rmtree", escaped_child_recreates_content)
+    monkeypatch.setattr(
+        MODULE,
+        "_observe_temporary_residual",
+        # The escaped child holds no FD we can observe via /proc matching,
+        # but the residual entry it just created is real.
+        lambda _root: {"status": "complete", "entry_count": 1, "holder_status": "absent"},
+    )
+    evidence = MODULE._remove_temporary_tree_with_evidence(root)
+    assert evidence["retry_eligible"] is False
+    assert evidence["retry_count"] == 0
+    assert evidence["final_cleanup_verdict"] == "failed"
