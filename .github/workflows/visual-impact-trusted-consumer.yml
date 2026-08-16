@@ -90,13 +90,17 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          PR_NUMBER="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq '.pull_requests[0].number // empty')"
+          # PR #2229 review fix_delta P2: pin the REST API version/media
+          # type explicitly on every `gh api` call in this step rather than
+          # relying on `gh api`'s current defaults.
+          gh_api() { gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
+          PR_NUMBER="$(gh_api "repos/${REPO}/actions/runs/${RUN_ID}" --jq '.pull_requests[0].number // empty')"
           if [ -z "${PR_NUMBER}" ]; then
             # `workflow_run.pull_requests[]` is only populated for
             # same-repo (non-fork) PRs; fall back to the
             # commits-associated-PRs API so a same-repo PR is still found
             # even when the run payload omitted it.
-            PR_NUMBER="$(gh api "repos/${REPO}/commits/${RUN_HEAD_SHA}/pulls" --jq '[.[] | select(.state=="open")][0].number // empty')"
+            PR_NUMBER="$(gh_api "repos/${REPO}/commits/${RUN_HEAD_SHA}/pulls" --jq '[.[] | select(.state=="open")][0].number // empty')"
           fi
           if [ -z "${PR_NUMBER}" ]; then
             echo "::warning::no open PR associated with workflow_run head_sha ${RUN_HEAD_SHA}; nothing to verify"
@@ -104,7 +108,7 @@ jobs:
             echo "live_head_sha=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          LIVE_HEAD_SHA="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          LIVE_HEAD_SHA="$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
           echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "live_head_sha=${LIVE_HEAD_SHA}" >> "$GITHUB_OUTPUT"
 
@@ -117,17 +121,20 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # PR #2229 review fix_delta P2: pin the REST API version/media
+          # type explicitly on every `gh api` call in this step.
+          gh_api() { gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
           ARTIFACT_ROOT="$(mktemp -d "${RUNNER_TEMP}/visual-impact-trusted-${RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
           mkdir -p "${ARTIFACT_ROOT}/decision" "${ARTIFACT_ROOT}/evidence"
-          gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" > "${ARTIFACT_ROOT}/run_artifacts.json"
+          gh_api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" > "${ARTIFACT_ROOT}/run_artifacts.json"
           DECISION_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="visual-impact-decision-v1")][0].id // empty' "${ARTIFACT_ROOT}/run_artifacts.json")"
           EVIDENCE_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="component-vrt-evidence-manifest")][0].id // empty' "${ARTIFACT_ROOT}/run_artifacts.json")"
           if [ -n "${DECISION_ARTIFACT_ID}" ]; then
-            gh api "repos/${REPO}/actions/artifacts/${DECISION_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/decision.zip"
+            gh_api "repos/${REPO}/actions/artifacts/${DECISION_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/decision.zip"
             unzip -o -q "${ARTIFACT_ROOT}/decision.zip" -d "${ARTIFACT_ROOT}/decision"
           fi
           if [ -n "${EVIDENCE_ARTIFACT_ID}" ]; then
-            gh api "repos/${REPO}/actions/artifacts/${EVIDENCE_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/evidence.zip"
+            gh_api "repos/${REPO}/actions/artifacts/${EVIDENCE_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/evidence.zip"
             unzip -o -q "${ARTIFACT_ROOT}/evidence.zip" -d "${ARTIFACT_ROOT}/evidence"
           fi
           echo "artifact_root=${ARTIFACT_ROOT}" >> "$GITHUB_OUTPUT"
@@ -157,51 +164,30 @@ jobs:
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
           set -euo pipefail
+          # PR #2229 review fix_delta P2: pin the REST API version/media
+          # type explicitly on every `gh api` call in this step.
+          gh_api() { gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
           mkdir -p artifacts/trusted
-          # Issue #2100: authenticate the producer CheckRun from trusted API
-          # responses. The attempt endpoint plus the total-count loop makes an
-          # earlier run attempt or an unvisited page ineligible as evidence.
+          # Issue #2100 PR #2229 review fix_delta P1-3: authenticate the
+          # producer CheckRun via `acquire_component_vrt_checkrun()` in
+          # resolve_visual_impact.py -- an executable, adversarially tested
+          # Python function with an injectable HTTP transport -- instead of
+          # this formerly-inline `gh api`/`jq` shell (which had no
+          # executable/current-head runtime test coverage, only grep-style
+          # assertions against the workflow YAML text). The attempt-scoped
+          # endpoint plus the function's own total-count pagination loop
+          # makes an earlier run attempt or an unvisited page ineligible as
+          # evidence, same as before.
           EXPECTED_RUN_ID="${RUN_ID:?missing workflow run id}"
           EXPECTED_RUN_ATTEMPT="${RUN_ATTEMPT:?missing workflow run attempt}"
-          JOBS_PAGE_DIR="artifacts/trusted/component_vrt_attempt_job_pages"
-          mkdir -p "${JOBS_PAGE_DIR}"
-          PAGE=1
-          TOTAL_COUNT=""
-          COLLECTED_COUNT=0
-          while :; do
-            PAGE_FILE="${JOBS_PAGE_DIR}/page-${PAGE}.json"
-            gh api "repos/${REPO}/actions/runs/${EXPECTED_RUN_ID}/attempts/${EXPECTED_RUN_ATTEMPT}/jobs?per_page=100&page=${PAGE}" > "${PAGE_FILE}"
-            PAGE_TOTAL="$(jq -er 'if (.total_count | type) == "number" and (.total_count | floor) == .total_count and .total_count >= 0 then .total_count else error("invalid total_count") end' "${PAGE_FILE}")"
-            PAGE_COUNT="$(jq -er 'if (.jobs | type) == "array" then (.jobs | length) else error("invalid jobs") end' "${PAGE_FILE}")"
-            [ "${PAGE_COUNT}" -le 100 ] || { echo "unexpected jobs page size" >&2; exit 1; }
-            if [ -z "${TOTAL_COUNT}" ]; then
-              TOTAL_COUNT="${PAGE_TOTAL}"
-            elif [ "${TOTAL_COUNT}" != "${PAGE_TOTAL}" ]; then
-              echo "jobs total_count changed while paginating" >&2
-              exit 1
-            fi
-            COLLECTED_COUNT=$((COLLECTED_COUNT + PAGE_COUNT))
-            [ "${COLLECTED_COUNT}" -le "${TOTAL_COUNT}" ] || { echo "jobs page exceeds total_count" >&2; exit 1; }
-            if [ "${COLLECTED_COUNT}" -eq "${TOTAL_COUNT}" ]; then
-              break
-            fi
-            [ "${PAGE_COUNT}" -gt 0 ] || { echo "incomplete jobs pagination" >&2; exit 1; }
-            PAGE=$((PAGE + 1))
-          done
-          jq -s '[.[] | .jobs[]]' "${JOBS_PAGE_DIR}"/*.json > artifacts/trusted/component_vrt_attempt_jobs.json
-          COMPONENT_CHECK_RUN_URL="$(jq -er '[.[] | select(.name == "component-vrt-report") | .check_run_url] | if length == 1 and (.[0] | type) == "string" then .[0] else error("component-vrt-report cardinality or URL invalid") end' artifacts/trusted/component_vrt_attempt_jobs.json)"
-          JOB_COUNT="$(jq -er 'length' artifacts/trusted/component_vrt_attempt_jobs.json)"
-          UNIQUE_JOB_ID_COUNT="$(jq -er '[.[] | .id | if type == "number" and floor == . and . > 0 then . else error("invalid Actions job id") end] | unique | length' artifacts/trusted/component_vrt_attempt_jobs.json)"
-          [ "${JOB_COUNT}" -eq "${UNIQUE_JOB_ID_COUNT}" ] || { echo "duplicate Actions job ID across attempt job pages" >&2; exit 1; }
-
-          EXPECTED_CHECK_RUN_URL_PREFIX="https://api.github.com/repos/${REPO}/check-runs/"
-          case "${COMPONENT_CHECK_RUN_URL}" in
-            "${EXPECTED_CHECK_RUN_URL_PREFIX}"*) CHECK_RUN_ID="${COMPONENT_CHECK_RUN_URL#"${EXPECTED_CHECK_RUN_URL_PREFIX}"}" ;;
-            *) echo "component job CheckRun URL is not the canonical repository Checks path" >&2; exit 1 ;;
-          esac
-          [[ "${CHECK_RUN_ID}" =~ ^[1-9][0-9]*$ ]] || { echo "invalid CheckRun ID" >&2; exit 1; }
-          gh api "repos/${REPO}/check-runs/${CHECK_RUN_ID}" > artifacts/trusted/component_vrt_check_run.json
-          LIVE_BASE_SHA="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.base.sha')"
+          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+            --mode acquire-component-vrt-checkrun \
+            --repository "${REPO}" \
+            --run-id "${EXPECTED_RUN_ID}" \
+            --run-attempt "${EXPECTED_RUN_ATTEMPT}" \
+            --jobs-output-file artifacts/trusted/component_vrt_attempt_jobs.json \
+            --check-run-output-file artifacts/trusted/component_vrt_check_run.json
+          LIVE_BASE_SHA="$(gh_api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.base.sha')"
           echo "live_base_sha=${LIVE_BASE_SHA}" >> "$GITHUB_OUTPUT"
 
           # Authentication is supplied by actions/checkout's persisted
@@ -209,7 +195,7 @@ jobs:
           # command: this trusted job only fetches commit objects as data.
           git fetch --no-tags --depth=1 origin "${LIVE_BASE_SHA}" "${LIVE_HEAD_SHA}"
 
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""' > artifacts/trusted/pr_body.txt
+          gh_api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""' > artifacts/trusted/pr_body.txt
 
           # Issue #2099 AC6: no `|| true` fail-open here -- `set -euo
           # pipefail` above makes a genuine `git diff` plumbing failure
@@ -335,7 +321,8 @@ jobs:
               SUMMARY="visual-impact-policy-trusted: verifier_not_run after trusted input derivation for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
             fi
           fi
-          gh api "repos/${REPO}/check-runs" \
+          gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${REPO}/check-runs" \
             -f name="visual-impact-policy-trusted" \
             -f head_sha="${BIND_SHA}" \
             -f status="completed" \

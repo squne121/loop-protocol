@@ -33,6 +33,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 VISUAL_IMPACT_SCHEMA_PATH = REPO_ROOT / "docs" / "dev" / "visual-impact.schema.json"
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "visual-impact-trusted-consumer.yml"
 
+_FAKE_GH_TEMPLATE = '#!/usr/bin/env python3\nimport json\nimport sys\n\nRESPONSES = {responses_literal!r}\nARGV_TEXT = " ".join(sys.argv[1:])\nfor needle, response in RESPONSES.items():\n    if needle in ARGV_TEXT:\n        sys.stdout.write(response["status_line"] + "\\r\\n\\r\\n" + response["body"])\n        sys.exit(0 if response.get("exit_zero", True) else 1)\nsys.stderr.write("unexpected gh invocation: " + ARGV_TEXT + "\\n")\nsys.exit(1)\n'  # noqa: E501 -- generated fake-gh script source
+
 EXPECTED_REPOSITORY = "squne121/loop-protocol"
 EXPECTED_PR_NUMBER = 2019
 EXPECTED_HEAD_SHA = "b" * 40
@@ -340,12 +342,24 @@ def test_no_visual_impact_empty_surfaces_pass():
     changed_entries = [{"status": "modified", "path": "docs/README.md"}]
     registry_doc = _registry_doc(producer_paths=["src/ui/combatHud.ts"], coverage_roots=["src/ui/**"])
     decision = _forged_decision(changed_path_entries=changed_entries, affected_surfaces=[])
+    # PR #2229 review fix_delta P1-1: `verify_trusted_artifact()` now
+    # cross-checks the decision's self-reported
+    # `component_vrt_report_check_run_id`/`github_actions_app_identity`
+    # against the AUTHENTICATED provenance identity when that provenance
+    # succeeded -- give this test a realistic matching pair instead of the
+    # `_forged_decision()` default `null` check-run id (a real CI run
+    # always populates this field, no-visual-impact or not).
+    decision["component_vrt_report_check_run_id"] = "555"
     trusted = rvi.TrustedRederivation(
         changed_path_entries=changed_entries,
         base_registry_doc=registry_doc,
         head_registry_doc=registry_doc,
         component_vrt_checkrun_provenance=rvi.ComponentVrtCheckrunProvenanceResult(
-            ok=True, reason_codes=[]
+            ok=True,
+            reason_codes=[],
+            check_run_id=555,
+            app_id=rvi.GITHUB_ACTIONS_APP_ID,
+            app_slug=rvi.GITHUB_ACTIONS_APP_SLUG,
         ),
     )
     verdict = _verify(decision, manifest=None, trusted_rederivation=trusted)
@@ -600,29 +614,30 @@ def test_publish_step_executes_failure_taxonomy(
 
 
 def test_component_vrt_provenance_uses_strict_attempt_and_exact_checkrun(workflow_doc: dict):
-    """#2100: final verification receives only the trusted API join tuple."""
+    """#2100: final verification receives only the trusted API join tuple.
+
+    PR #2229 review fix_delta P1-3: the attempt-scoped jobs pagination /
+    cardinality / canonical-URL / exact-CheckRun-fetch logic that used to
+    live inline in this step's shell (and was only ever grep-verified as
+    workflow-YAML string content) now runs as the executable, adversarially
+    tested `acquire_component_vrt_checkrun()` Python function (see
+    `scripts/agent-ops/tests/test_resolve_visual_impact_checkrun_adversarial.py`).
+    This test now only asserts the workflow correctly invokes that CLI mode
+    with the base-locked run/attempt identity and never checks out /
+    executes candidate PR head code to do so."""
     steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
     trusted = next(step for step in steps if step.get("id") == "trusted")
     verify = next(step for step in steps if step.get("id") == "verify")
 
     assert trusted["env"]["RUN_ID"] == "${{ github.event.workflow_run.id }}"
     assert trusted["env"]["RUN_ATTEMPT"] == "${{ github.event.workflow_run.run_attempt }}"
-    assert "/actions/runs/${EXPECTED_RUN_ID}/attempts/${EXPECTED_RUN_ATTEMPT}/jobs" in trusted["run"]
-    assert "while :; do" in trusted["run"]
-    assert "TOTAL_COUNT" in trusted["run"]
-    assert "component_vrt_attempt_jobs.json" in trusted["run"]
-    assert '[.[] | select(.name == "component-vrt-report") | .check_run_url]' in trusted["run"]
-    assert "https://api.github.com/repos/${REPO}/check-runs/" in trusted["run"]
-    assert 'gh api "repos/${REPO}/check-runs/${CHECK_RUN_ID}"' in trusted["run"]
+    assert "--mode acquire-component-vrt-checkrun" in trusted["run"]
+    assert '--run-id "${EXPECTED_RUN_ID}"' in trusted["run"]
+    assert '--run-attempt "${EXPECTED_RUN_ATTEMPT}"' in trusted["run"]
+    assert "--jobs-output-file artifacts/trusted/component_vrt_attempt_jobs.json" in trusted["run"]
+    assert "--check-run-output-file artifacts/trusted/component_vrt_check_run.json" in trusted["run"]
     assert "checkout --ref" not in trusted["run"]
     assert "set -euo pipefail" in trusted["run"]
-    assert "jobs total_count changed while paginating" in trusted["run"]
-    assert "incomplete jobs pagination" in trusted["run"]
-    assert '[ "${PAGE_COUNT}" -gt 0 ] ||' in trusted["run"]
-    assert "exit 1" in trusted["run"]
-    assert "UNIQUE_JOB_ID_COUNT" in trusted["run"]
-    assert "duplicate Actions job ID across attempt job pages" in trusted["run"]
-    assert 'if type == "number" and floor == . and . > 0' in trusted["run"]
 
     assert verify["env"]["EXPECTED_WORKFLOW_RUN_ID"] == "${{ github.event.workflow_run.id }}"
     assert verify["env"]["EXPECTED_WORKFLOW_RUN_ATTEMPT"] == "${{ github.event.workflow_run.run_attempt }}"
@@ -634,3 +649,118 @@ def test_component_vrt_provenance_uses_strict_attempt_and_exact_checkrun(workflo
         "--component-vrt-jobs-complete",
     ):
         assert argument in verify["run"]
+
+
+
+# --- PR #2229 review fix_delta P1-3: end-to-end CLI runtime evidence -----
+# for `--mode acquire-component-vrt-checkrun`, invoked exactly as the
+# workflow invokes it (real subprocess execution against a fake `gh`
+# binary on PATH, never a self-reported/simulated result). The fake `gh` is
+# itself a tiny Python script mimicking `gh api --include`'s status-line +
+# blank-line + JSON-body response shape, so `_gh_api_transport()`'s real
+# parsing path is exercised end-to-end.
+
+
+def _write_fake_gh(tmp_path: Path, responses: dict) -> None:
+    fake_gh = tmp_path / "gh"
+    fake_gh.write_text(_FAKE_GH_TEMPLATE.format(responses_literal=responses), encoding="utf-8")
+    fake_gh.chmod(0o755)
+
+
+def test_acquire_component_vrt_checkrun_cli_mode_executes_end_to_end(tmp_path: Path):
+    check_run_id = 55501
+    jobs_body = {
+        "total_count": 1,
+        "jobs": [
+            {
+                "id": 42,
+                "name": "component-vrt-report",
+                "run_id": 999,
+                "run_attempt": 3,
+                "check_run_url": f"https://api.github.com/repos/{EXPECTED_REPOSITORY}/check-runs/{check_run_id}",
+            }
+        ],
+    }
+    check_run_body = {
+        "id": check_run_id,
+        "name": "component-vrt-report",
+        "head_sha": EXPECTED_HEAD_SHA,
+        "status": "completed",
+        "conclusion": "success",
+        "app": {"id": 15368, "slug": "github-actions"},
+    }
+    _write_fake_gh(
+        tmp_path,
+        {
+            "/jobs?": {"status_line": "HTTP/2.0 200 OK", "body": json.dumps(jobs_body)},
+            "/check-runs/": {"status_line": "HTTP/2.0 200 OK", "body": json.dumps(check_run_body)},
+        },
+    )
+
+    jobs_output = tmp_path / "jobs.json"
+    check_run_output = tmp_path / "check_run.json"
+    path_var = "PATH"
+    env = {**os.environ, path_var: str(tmp_path) + os.pathsep + os.environ[path_var]}
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_MODULE_PATH),
+            "--mode",
+            "acquire-component-vrt-checkrun",
+            "--repository",
+            EXPECTED_REPOSITORY,
+            "--run-id",
+            "999",
+            "--run-attempt",
+            "3",
+            "--jobs-output-file",
+            str(jobs_output),
+            "--check-run-output-file",
+            str(check_run_output),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["ok"] is True
+    assert output["check_run_id"] == check_run_id
+    assert json.loads(jobs_output.read_text(encoding="utf-8")) == jobs_body["jobs"]
+    assert json.loads(check_run_output.read_text(encoding="utf-8")) == check_run_body
+
+
+def test_acquire_component_vrt_checkrun_cli_mode_fails_closed_on_non_2xx(tmp_path: Path):
+    _write_fake_gh(
+        tmp_path,
+        {
+            "/jobs?": {"status_line": "HTTP/2.0 502 Bad Gateway", "body": "", "exit_zero": False},
+        },
+    )
+    path_var = "PATH"
+    env = {**os.environ, path_var: str(tmp_path) + os.pathsep + os.environ[path_var]}
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_MODULE_PATH),
+            "--mode",
+            "acquire-component-vrt-checkrun",
+            "--repository",
+            EXPECTED_REPOSITORY,
+            "--run-id",
+            "999",
+            "--run-attempt",
+            "3",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    output = json.loads(result.stdout)
+    assert output["ok"] is False
+    assert "component_vrt_acquire_jobs_http_status_invalid" in output["reason_codes"]

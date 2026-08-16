@@ -59,7 +59,16 @@ def _provenance(*, jobs: object | None = None, check_run: object | None = None, 
     )
 
 
-def _final_verdict(provenance, *, require_component_vrt_checkrun_provenance: bool = True):
+_UNSET = object()
+
+
+def _final_verdict(
+    provenance,
+    *,
+    require_component_vrt_checkrun_provenance: bool = True,
+    component_vrt_report_check_run_id=_UNSET,
+    github_actions_app_identity: str = "github-actions[bot]",
+):
     decision = rvi.build_decision(
         repository=REPOSITORY,
         pull_request_number=2100,
@@ -70,8 +79,10 @@ def _final_verdict(provenance, *, require_component_vrt_checkrun_provenance: boo
         pr_body="",
         changed_path_entries=[],
         affected_surfaces=[],
-        component_vrt_report_check_run_id=str(CHECK_RUN_ID),
-        github_actions_app_identity="github-actions[bot]",
+        component_vrt_report_check_run_id=(
+            str(CHECK_RUN_ID) if component_vrt_report_check_run_id is _UNSET else component_vrt_report_check_run_id
+        ),
+        github_actions_app_identity=github_actions_app_identity,
         artifact_id="artifact",
         artifact_digest="e" * 64,
     )
@@ -316,3 +327,255 @@ def test_job_cardinality_or_pagination_replayed_page_duplicate_target_fails_clos
     final = _final_verdict(result)
     assert final.ok is False
     assert "component_vrt_job_id_duplicate" in final.reason_codes
+
+
+# --- PR #2229 review fix_delta P1-1: authenticated CheckRun identity is --
+# cross-checked against the producer's self-reported decision fields ------
+
+
+def test_decision_check_run_id_matching_authenticated_provenance_is_accepted():
+    provenance = _provenance()
+    assert provenance.ok is True
+    verdict = _final_verdict(provenance)
+    assert verdict.ok is True
+    assert verdict.reason_codes == []
+
+
+def test_decision_check_run_id_mismatch_against_authenticated_provenance_is_rejected():
+    provenance = _provenance()
+    assert provenance.ok is True
+    verdict = _final_verdict(provenance, component_vrt_report_check_run_id=str(CHECK_RUN_ID + 1))
+    assert verdict.ok is False
+    assert "component_vrt_report_check_run_id_decision_mismatch" in verdict.reason_codes
+
+
+def test_decision_check_run_id_unrelated_but_genuine_run_is_rejected():
+    """A producer cannot smuggle a DIFFERENT (real, unrelated) CheckRun ID
+    through a decision even though the authenticated provenance for THIS
+    run/attempt/head is itself genuine."""
+    provenance = _provenance()
+    assert provenance.ok is True
+    verdict = _final_verdict(provenance, component_vrt_report_check_run_id=str(CHECK_RUN_ID * 7 + 3))
+    assert verdict.ok is False
+    assert "component_vrt_report_check_run_id_decision_mismatch" in verdict.reason_codes
+
+
+def test_decision_check_run_id_null_against_authenticated_provenance_is_rejected():
+    provenance = _provenance()
+    verdict = _final_verdict(provenance, component_vrt_report_check_run_id=None)
+    assert verdict.ok is False
+    assert "component_vrt_report_check_run_id_decision_mismatch" in verdict.reason_codes
+
+
+def test_decision_app_identity_mismatch_against_authenticated_provenance_is_rejected():
+    provenance = _provenance()
+    assert provenance.ok is True
+    verdict = _final_verdict(provenance, github_actions_app_identity="not-github-actions[bot]")
+    assert verdict.ok is False
+    assert "github_actions_app_identity_decision_mismatch" in verdict.reason_codes
+
+
+def test_decision_identity_cross_check_is_skipped_when_provenance_itself_failed():
+    """When the authenticated provenance itself is rejected, the identity
+    cross-check must not additionally fire (the provenance rejection reason
+    codes already fail the verdict closed; this only asserts no crash/extra
+    noise from missing `check_run_id`/`app_id` on a failed provenance)."""
+    job = _job()
+    job["run_id"] = RUN_ID + 1
+    provenance = _provenance(jobs=[job])
+    assert provenance.ok is False
+    assert provenance.check_run_id is None
+    verdict = _final_verdict(provenance)
+    assert verdict.ok is False
+    assert "component_vrt_report_check_run_id_decision_mismatch" not in verdict.reason_codes
+    assert "github_actions_app_identity_decision_mismatch" not in verdict.reason_codes
+
+
+# --- PR #2229 review fix_delta P1-3: executable, injectable-transport ----
+# acquisition of the attempt-scoped jobs list + exact CheckRun -----------
+
+
+def _transport_from_pages(pages: list[dict], *, check_run_status: int = 200, check_run_body: dict | None = None):
+    calls: list[str] = []
+
+    def transport(path: str) -> "rvi.HttpTransportResponse":
+        calls.append(path)
+        if "/check-runs/" in path:
+            body = check_run_body if check_run_body is not None else _check_run()
+            return rvi.HttpTransportResponse(status_code=check_run_status, json_body=body)
+        page_number = int(path.rsplit("page=", 1)[1])
+        page = pages[page_number - 1]
+        return rvi.HttpTransportResponse(status_code=page.get("status_code", 200), json_body=page.get("body"))
+
+    transport.calls = calls  # type: ignore[attr-defined]
+    return transport
+
+
+def _acquire(pages: list[dict], **kwargs):
+    transport_kwargs = {k: v for k, v in kwargs.items() if k in ("check_run_status", "check_run_body")}
+    transport = _transport_from_pages(pages, **transport_kwargs)
+    return rvi.acquire_component_vrt_checkrun(
+        transport=transport,
+        repository=REPOSITORY,
+        run_id=RUN_ID,
+        run_attempt=RUN_ATTEMPT,
+    ), transport
+
+
+def test_acquire_multi_page_pagination_completes_and_finds_exact_checkrun():
+    jobs_page_1 = [
+        {"id": i, "name": f"other-job-{i}", "run_id": RUN_ID, "run_attempt": RUN_ATTEMPT} for i in range(1, 100)
+    ]
+    jobs_page_2 = [_job()]
+    pages = [
+        {"body": {"total_count": 100, "jobs": jobs_page_1}},
+        {"body": {"total_count": 100, "jobs": jobs_page_2}},
+    ]
+    result, transport = _acquire(pages)
+    assert result.ok is True
+    assert result.check_run_id == CHECK_RUN_ID
+    assert len(result.jobs) == 100
+    assert len({job["id"] for job in result.jobs}) == 100
+    assert len(transport.calls) == 3  # 2 job pages + 1 check-run fetch
+
+
+def test_acquire_target_job_zero_matches_is_rejected():
+    pages = [{"body": {"total_count": 1, "jobs": [{"id": 1, "name": "unrelated", "run_id": RUN_ID}]}}]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_component_job_cardinality_invalid" in result.reason_codes
+
+
+def test_acquire_target_job_two_matches_is_rejected():
+    second_job = copy.deepcopy(_job())
+    second_job["id"] = _job()["id"] + 1
+    pages = [{"body": {"total_count": 2, "jobs": [_job(), second_job]}}]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_component_job_cardinality_invalid" in result.reason_codes
+
+
+def test_acquire_duplicate_job_id_across_pages_is_rejected():
+    pages = [
+        {"body": {"total_count": 2, "jobs": [_job()]}},
+        {"body": {"total_count": 2, "jobs": [copy.deepcopy(_job())]}},
+    ]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_job_id_duplicate" in result.reason_codes
+
+
+def test_acquire_total_count_changes_mid_pagination_is_rejected():
+    pages = [
+        {"body": {"total_count": 2, "jobs": [{"id": 1, "name": "x", "run_id": RUN_ID}]}},
+        {"body": {"total_count": 3, "jobs": [_job()]}},
+    ]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_jobs_total_count_changed" in result.reason_codes
+
+
+def test_acquire_empty_page_before_total_count_reached_is_rejected():
+    pages = [{"body": {"total_count": 5, "jobs": []}}]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_jobs_pagination_incomplete" in result.reason_codes
+
+
+def test_acquire_non_2xx_jobs_response_is_rejected():
+    pages = [{"status_code": 502, "body": None}]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_jobs_http_status_invalid" in result.reason_codes
+
+
+def test_acquire_malformed_jobs_json_body_is_rejected():
+    pages = [{"body": "not-a-dict"}]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_jobs_response_invalid" in result.reason_codes
+
+
+def test_acquire_jobs_missing_required_fields_is_rejected():
+    pages = [{"body": {"jobs": [_job()]}}]  # missing total_count
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_jobs_total_count_invalid" in result.reason_codes
+
+    pages_bad_type = [{"body": {"total_count": "1", "jobs": [_job()]}}]
+    result2, _ = _acquire(pages_bad_type)
+    assert result2.ok is False
+    assert "component_vrt_acquire_jobs_total_count_invalid" in result2.reason_codes
+
+
+def test_acquire_wrong_run_id_job_fails_cardinality_when_filtered():
+    pages = [{"body": {"total_count": 0, "jobs": []}}]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_component_job_cardinality_invalid" in result.reason_codes
+
+
+def test_acquire_wrong_check_run_name_or_status_never_matched_by_producer_job_is_rejected():
+    other_named_job = {
+        "id": 100,
+        "name": "not-component-vrt-report",
+        "run_id": RUN_ID,
+        "run_attempt": RUN_ATTEMPT,
+        "check_run_url": f"https://api.github.com/repos/{REPOSITORY}/check-runs/{CHECK_RUN_ID}",
+    }
+    pages = [{"body": {"total_count": 1, "jobs": [other_named_job]}}]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_component_job_cardinality_invalid" in result.reason_codes
+
+
+def test_acquire_check_run_url_not_canonical_is_rejected():
+    job = _job()
+    job["check_run_url"] = "https://evil.example.com/check-runs/1"
+    pages = [{"body": {"total_count": 1, "jobs": [job]}}]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert "component_vrt_acquire_check_run_url_not_canonical" in result.reason_codes
+
+
+def test_acquire_check_run_id_response_mismatch_with_canonical_url_id_is_still_bound_to_url():
+    """The acquired `check_run_id` is derived from the canonical URL, never
+    the fetched CheckRun response body's own `.id` -- a caller performing a
+    subsequent identity comparison (P1-1) is protected even if a malicious
+    endpoint tried to return a mismatched `.id` in the body, because the
+    downstream `verify_component_vrt_checkrun_provenance()` re-validates
+    `check.get('id')` against the job/CheckRun relation independently."""
+    mismatched_check_run_body = _check_run()
+    mismatched_check_run_body["id"] = CHECK_RUN_ID + 999
+    pages = [{"body": {"total_count": 1, "jobs": [_job()]}}]
+    result, _ = _acquire(pages, check_run_body=mismatched_check_run_body)
+    assert result.ok is True
+    assert result.check_run_id == CHECK_RUN_ID
+    assert result.check_run["id"] == CHECK_RUN_ID + 999
+
+
+def test_acquire_non_2xx_check_run_response_is_rejected():
+    pages = [{"body": {"total_count": 1, "jobs": [_job()]}}]
+    result, _ = _acquire(pages, check_run_status=404)
+    assert result.ok is False
+    assert "component_vrt_acquire_check_run_http_status_invalid" in result.reason_codes
+
+
+def test_acquire_malformed_check_run_response_body_is_rejected():
+    pages = [{"body": {"total_count": 1, "jobs": [_job()]}}]
+    result, _ = _acquire(pages, check_run_body="not-a-dict")
+    assert result.ok is False
+    assert "component_vrt_acquire_check_run_response_invalid" in result.reason_codes
+
+
+def test_acquire_failure_propagates_to_final_verify_component_vrt_checkrun_provenance_boundary():
+    """AC: an acquisition failure never reaches
+    `verify_component_vrt_checkrun_provenance()` as a silently-empty/valid
+    input -- the caller (workflow step) must treat a non-zero exit / `ok:
+    false` result as a hard stop, same as any other reason code in this
+    module's fail-closed contract."""
+    pages = [{"body": {"total_count": 0, "jobs": []}}]
+    result, _ = _acquire(pages)
+    assert result.ok is False
+    assert result.check_run_id is None
+    assert result.check_run is None
