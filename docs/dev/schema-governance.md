@@ -104,6 +104,8 @@ MCP `unsupported_by_design` の根拠は `agy_permission_enforcement_hook.py` �
 
 **P1-1（互換性主張の一方向性についての明確化）**: 本 schema の「`backward_compatible`」「`migration_required: no`」という記述は、実際には **new-reader-of-old-artifact のみ**（新しい producer/validator が旧 shape の artifact を引き続きスキーマ有効と認める）を指しており、その逆（旧 shape を前提とした validator/consumer が新 shape の artifact を受理できること）は保証しない。`additionalProperties: false` を維持したまま additive field を追加している以上、旧 validator が新 artifact を見れば未知フィールドとして拒否するのは schema 設計上当然の帰結であり、無条件の双方向互換ではない。本 schema の実際の consumer は同一リポジトリ内の producer・`validate_artifact()`・test のみで、外部への配布・別バージョンの validator が並行稼働する実績がないため、実害は生じていない。
 
+**Compatibility Decision（Issue #1997）**: `agy_permission_boundary_e2e/v1.cleanup.temporary_tree_removal` は optional additive object であり、schema id の `v2` bump は行わない。`cleanup` の既存 required boolean `temporary_processes_removed` は final `lstat(temp_root) == ENOENT` postcondition の backward-compatible projection として維持する。producer は `run_agy_permission_boundary_e2e.py`、consumer は同 runner の `validate_artifact()` と reviewer、test consumer は `test_agy_temporary_cleanup_retry.py` / `test_agy_process_cleanup_evidence.py` である。`additionalProperties: false` は nested object にも維持する。新 producer は成功・failure のいずれでも `retry_policy_mode: observation_only|single_retry_enabled` を含む ledger を出力し、`retry_count: 0` だけでは判別不能な Phase A と Phase B を artifact 単体で区別できるようにする。schema が object を optional に保つため、field のない success-only legacy artifact も引き続き schema-valid である。first-failure provenance、bounded residual observation、single-retry ledger に raw absolute path、filename、tree content、command line は含めず、path class と relative-path digest だけを記録する。
+
 ## temp_residue_classification/v1 と temp_residue_owner/v1 詳細登録
 
 ```yaml
