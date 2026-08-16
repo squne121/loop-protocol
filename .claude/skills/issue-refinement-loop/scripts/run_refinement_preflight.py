@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import importlib.metadata
 import io
@@ -460,40 +461,115 @@ class RepairApplySecureOpenError(RuntimeError):
 REPAIR_APPLY_MAX_ARTIFACT_BYTES = 1_048_576  # 1 MiB read-size ceiling (AC7)
 
 
-def _repair_apply_reject_unsafe_ancestors(path: Path, root: Path) -> None:
-    """Fail-closed: reject if any ancestor directory between `path`'s parent
-    and `root` (inclusive) is itself a symlink, or if the resolved parent
-    directory is not contained within `root` (AC7 parent-symlink / parent
-    substitution rejection). Uses os.lstat (does NOT follow symlinks)."""
-    resolved_root = root.resolve(strict=False)
-    node = path.parent
-    seen = 0
-    while True:
-        seen += 1
-        if seen > 256:
-            raise RepairApplySecureOpenError(f"repair_apply_ancestor_chain_too_deep:{path}")
-        try:
-            st = os.lstat(node)
-        except FileNotFoundError as exc:
-            raise RepairApplySecureOpenError(f"repair_apply_ancestor_missing:{node}") from exc
-        except OSError as exc:
-            raise RepairApplySecureOpenError(f"repair_apply_ancestor_lstat_error:{node}:{exc}") from exc
-        if stat.S_ISLNK(st.st_mode):
-            raise RepairApplySecureOpenError(f"repair_apply_ancestor_is_symlink:{node}")
-        if node.resolve(strict=False) == resolved_root:
-            break
-        parent = node.parent
-        if parent == node:
-            raise RepairApplySecureOpenError(
-                f"repair_apply_ancestor_root_not_found:{path}:not_under:{resolved_root}"
-            )
-        node = parent
+def _repair_apply_dirfd_open_leaf(path: Path, *, root: Path) -> int:
+    """Open `path` for reading using ONLY directory-FD-relative traversal
+    from `root` (PR #2202 review P1-2: dir-FD-relative TOCTOU hardening).
 
-    resolved_parent = path.parent.resolve(strict=False)
-    if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+    Unlike a pathname-based `lstat()`-then-`open()` pair (which leaves a
+    window in which an ancestor directory can be swapped to a symlink
+    between the check and the use, redirecting the open outside `root`
+    even though the ancestor check "passed" moments earlier), this walks
+    every ancestor component with `os.open(..., dir_fd=<already-open
+    parent fd>)`. Each step operates on an FD that is already open (not a
+    freshly re-resolved pathname), so no ancestor can be substituted
+    mid-traversal -- the kernel resolves each component exactly once,
+    relative to a directory descriptor whose identity is already fixed.
+
+    `openat2(RESOLVE_BENEATH)` (Linux 5.6+) would be a stronger/simpler
+    primitive for this, but CPython's stdlib `os` module does not expose
+    it (no `os.openat2()`); adding it would require reaching for a raw
+    `ctypes`/syscall shim, which was judged riskier to introduce here than
+    this component-wise dir-FD walk. This walk closes the specific
+    ancestor-swap TOCTOU window described in review P1-2 without any new
+    dependency; it does not implement `RESOLVE_BENEATH`'s additional
+    guarantees (e.g. rejecting `..`-escapes mid-resolution at the kernel
+    level), which is instead enforced above by explicitly rejecting `..`
+    /`.`/empty path components before any FD is opened.
+
+    Every ancestor directory is opened with `O_NOFOLLOW | O_DIRECTORY`
+    (rejects a symlink or non-directory masquerading as an ancestor). The
+    leaf is opened with `O_NOFOLLOW | O_NONBLOCK` (rejects a leaf symlink
+    atomically at open() time via the kernel, and `O_NONBLOCK` prevents an
+    indefinite block if the leaf turns out to be a FIFO with no writer --
+    such leaves are still rejected as non-regular via the caller's
+    post-open `fstat()` check, never trusted).
+
+    Returns an open file descriptor to the leaf; caller owns and must
+    close it. Raises `RepairApplySecureOpenError` (fail-closed) for any
+    ancestor/leaf that is missing, a symlink, outside `root`, or otherwise
+    cannot be opened this way.
+    """
+    resolved_root = root.resolve(strict=False)
+    try:
+        rel_parts = path.relative_to(resolved_root).parts
+    except ValueError as exc:
         raise RepairApplySecureOpenError(
-            f"repair_apply_parent_outside_root:{resolved_parent}:not_under:{resolved_root}"
-        )
+            f"repair_apply_parent_outside_root:{path}:not_under:{resolved_root}"
+        ) from exc
+    if not rel_parts:
+        raise RepairApplySecureOpenError(f"repair_apply_path_is_root:{path}")
+    for part in rel_parts:
+        if part in ("", ".", ".."):
+            raise RepairApplySecureOpenError(f"repair_apply_path_component_invalid:{path}:{part}")
+
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    leaf_flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        dir_flags |= os.O_CLOEXEC
+        leaf_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        leaf_flags |= os.O_NONBLOCK
+
+    try:
+        current_fd = os.open(str(resolved_root), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_root_open_error:{resolved_root}:{exc}") from exc
+
+    opened_fds = [current_fd]
+    try:
+        for part in rel_parts[:-1]:
+            try:
+                next_fd = os.open(part, dir_flags, dir_fd=current_fd)
+            except FileNotFoundError as exc:
+                raise RepairApplySecureOpenError(f"repair_apply_ancestor_missing:{path}:{part}") from exc
+            except OSError as exc:
+                # ELOOP: kernel refused to resolve a symlink component
+                # (O_NOFOLLOW). ENOTDIR: the O_DIRECTORY|O_NOFOLLOW pair
+                # requires the final resolved component to already be a
+                # directory without following a symlink to get there -- a
+                # symlinked ancestor (even one that points at a real
+                # directory) fails this exact way on Linux, which is why
+                # both errno values are treated as "ancestor is a symlink"
+                # here (the two are not distinguished further since either
+                # way the ancestor is rejected as unsafe).
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise RepairApplySecureOpenError(
+                        f"repair_apply_ancestor_is_symlink:{path}:{part}"
+                    ) from exc
+                raise RepairApplySecureOpenError(
+                    f"repair_apply_ancestor_dirfd_open_error:{path}:{part}:{exc}"
+                ) from exc
+            opened_fds.append(next_fd)
+            current_fd = next_fd
+
+        leaf_name = rel_parts[-1]
+        try:
+            leaf_fd = os.open(leaf_name, leaf_flags, dir_fd=current_fd)
+        except FileNotFoundError as exc:
+            raise RepairApplySecureOpenError(f"repair_apply_leaf_not_found:{path}") from exc
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise RepairApplySecureOpenError(f"repair_apply_leaf_is_symlink:{path}") from exc
+            if exc.errno == errno.ENXIO:
+                raise RepairApplySecureOpenError(
+                    f"repair_apply_leaf_not_regular_file:{path}:special_file"
+                ) from exc
+            raise RepairApplySecureOpenError(f"repair_apply_leaf_open_error:{path}:{exc}") from exc
+        return leaf_fd
+    finally:
+        for fd in opened_fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def secure_read_repair_apply_artifact(
@@ -503,61 +579,41 @@ def secure_read_repair_apply_artifact(
     max_bytes: int = REPAIR_APPLY_MAX_ARTIFACT_BYTES,
     expected_sha256: Optional[str] = None,
 ) -> "tuple[str, str]":
-    """FD-based secure read of a repair_apply artifact (Issue #2039 AC7).
+    """FD-based secure read of a repair_apply artifact (Issue #2039 AC7;
+    PR #2202 review P1-2 dir-FD-relative traversal hardening).
 
     Rejects (fail-closed, before any content bytes are trusted):
       - leaf symlink, FIFO, socket, device, directory (regular files only)
       - parent-directory symlink anywhere between the leaf and `root`
       - parent substitution (resolved parent outside `root`)
-      - post-open identity mismatch (open()+fstat() vs the initial lstat())
       - oversize content (> max_bytes)
       - non-UTF-8 content (strict decode)
       - digest mismatch against `expected_sha256`, when given
       - leaf replaced with a symlink between the read and the post-read
         identity re-check
 
-    Uses O_NOFOLLOW on open() so a leaf symlink introduced between the
-    lstat check and the open() call is rejected by the kernel (not just
-    detected after the fact), and fstat()-vs-lstat() identity comparison
-    (st_dev / st_ino) closes the residual TOCTOU window between the lstat
-    and the open().
+    The leaf and every ancestor directory between it and `root` are opened
+    via `_repair_apply_dirfd_open_leaf()`, i.e. purely through
+    directory-FD-relative `open(..., dir_fd=...)` calls chained from an
+    already-open `root` FD -- never through a freshly re-resolved
+    pathname. This closes the TOCTOU window that a separate
+    `lstat()`-then-`open()` pair leaves open (an ancestor directory being
+    swapped to a symlink between the ancestor check and the open() call):
+    each traversal step operates on an FD whose identity was already
+    fixed by the previous step, so there is no window in which a
+    concurrent rename/symlink-swap of an ancestor can redirect the open.
 
     Returns (text, sha256_hex_digest_of_raw_bytes).
     """
     resolved_root = root.resolve(strict=False)
-    _repair_apply_reject_unsafe_ancestors(path, resolved_root)
-
-    try:
-        pre_st = os.lstat(path)
-    except FileNotFoundError as exc:
-        raise RepairApplySecureOpenError(f"repair_apply_leaf_not_found:{path}") from exc
-    except OSError as exc:
-        raise RepairApplySecureOpenError(f"repair_apply_leaf_lstat_error:{path}:{exc}") from exc
-
-    if stat.S_ISLNK(pre_st.st_mode):
-        raise RepairApplySecureOpenError(f"repair_apply_leaf_is_symlink:{path}")
-    if not stat.S_ISREG(pre_st.st_mode):
-        kind = "directory" if stat.S_ISDIR(pre_st.st_mode) else "special_file"
-        raise RepairApplySecureOpenError(f"repair_apply_leaf_not_regular_file:{path}:{kind}")
-
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-
-    try:
-        fd = os.open(str(path), flags)
-    except OSError as exc:
-        raise RepairApplySecureOpenError(f"repair_apply_leaf_open_error:{path}:{exc}") from exc
+    fd = _repair_apply_dirfd_open_leaf(path, root=resolved_root)
 
     raw = b""
     try:
         post_st = os.fstat(fd)
         if not stat.S_ISREG(post_st.st_mode):
             raise RepairApplySecureOpenError(f"repair_apply_leaf_not_regular_file_post_open:{path}")
-        if (post_st.st_dev, post_st.st_ino) != (pre_st.st_dev, pre_st.st_ino):
-            raise RepairApplySecureOpenError(f"repair_apply_leaf_identity_mismatch:{path}")
+        pre_st = post_st
         if post_st.st_size > max_bytes:
             raise RepairApplySecureOpenError(
                 f"repair_apply_leaf_oversize:{path}:{post_st.st_size}:>:{max_bytes}"
