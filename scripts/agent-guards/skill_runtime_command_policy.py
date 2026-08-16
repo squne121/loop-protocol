@@ -68,6 +68,8 @@ SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR = "exact_skill_runtime_cont
 SKILL_RUNTIME_EXECUTION_CLASS_DECIDE = "exact_router_authority_transport"
 SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_PRODUCER = "exact_authority_transport_producer"
 SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_CONSUMER = "exact_authority_transport_consumer"
+# Issue #2039 AC8/AC11: repair_action.apply controlled consumer command class.
+SKILL_RUNTIME_EXECUTION_CLASS_REPAIR_ACTION_APPLY = "exact_repair_action_apply"
 _DECIDE_VERDICT_VALUES = frozenset({"approve", "request_changes", "needs-fix"})
 
 
@@ -224,6 +226,20 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
             ],
             "network_effect": "github_mutation",
         },
+        # Issue #2039 AC8/AC11: repair_action.apply controlled consumer --
+        # bridges a repair_issue_contract.py auto_apply_safe candidate to a
+        # controlled edit_issue_txn.py Issue-body mutation. Bound to the
+        # issue's own active worktree (not root-no-worktree eligible), same
+        # boundary as authority_transport.consume.
+        "repair_action.apply": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_REPAIR_ACTION_APPLY,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "github_mutation",
+        },
     },
 }
 
@@ -345,6 +361,8 @@ class ExactSkillRuntimeCommand:
     router_receipt_path: str = ""
     contract_patch_plan_file: str = ""
     anchor_context_file: str = ""
+    # Issue #2039 AC8/AC11: repair_action.apply field.
+    preflight_result_path: str = ""
 
 
 def command_allows_root_no_worktree(parsed: ExactSkillRuntimeCommand) -> bool:
@@ -1173,6 +1191,106 @@ def is_exact_skill_runtime_authority_transport_produce_executor_command(
     return True
 
 
+def parse_exact_skill_runtime_repair_action_apply_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact-match parser for the `repair_action.apply` command class
+    (Issue #2039 AC8/AC11).
+
+    Mirrors `parse_exact_skill_runtime_command` token-for-token, with two
+    additional trailing tokens (`--apply-repair-action <repo-relative-path>`).
+    The single placeholder is `required: True` in command_registry.py's
+    `repair_action.apply` entry, so this is a single fixed-length (12-token)
+    shape -- no optional-segment ambiguity, same as
+    `authority_transport.produce`. This is a separate, independent function;
+    every other parser above is entirely unmodified by this addition.
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    if len(tokens) != 12:
+        return None
+    if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    expected_flags = ["--command-id", "--issue-number", "--repo", "--apply-repair-action"]
+    expected_positions = [4, 6, 8, 10]
+    for flag, pos in zip(expected_flags, expected_positions):
+        if tokens[pos] != flag:
+            return None
+    if any(
+        tok.startswith("--command-id=")
+        or tok.startswith("--issue-number=")
+        or tok.startswith("--repo=")
+        or tok.startswith("--apply-repair-action=")
+        for tok in tokens
+    ):
+        return None
+    command_id = tokens[5]
+    issue_number = tokens[7]
+    repo = tokens[9]
+    preflight_result_path = tokens[11]
+    if command_id != "repair_action.apply":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0:
+        return None
+    if repo != TRUSTED_REPO_SLUG:
+        return None
+    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+        return None
+    # PR #2202 review fix (P0-2): bind the artifact path to THIS Issue's own
+    # artifact tree (.claude/artifacts/issue-refinement-loop/{issue_number}/)
+    # via the Issue-scoped helper, not the generic repo-relative fixture
+    # helper -- otherwise a candidate belonging to a different Issue number
+    # (or any other repo-relative file) is accepted.
+    if not _is_safe_issue_artifact_path(preflight_result_path, root, issue_number):
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        preflight_result_path=preflight_result_path,
+    )
+
+
+def is_exact_skill_runtime_repair_action_apply_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """Same trusted-repo / default-branch / canonical-root / active-issue
+    safety boundary as `is_exact_skill_runtime_executor_command`, applied to
+    the `repair_action.apply` command class (Issue #2039 AC8/AC11).
+    `repair_action.apply` is bound to the issue's own active worktree --
+    like `authority_transport.consume`, it is not root-no-worktree
+    eligible."""
+    parsed = parse_exact_skill_runtime_repair_action_apply_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    default_branch = resolve_default_branch(project_root, deadline)
+    if not branch or branch != default_branch:
+        return False
+    repo_slug = resolve_repo_slug(project_root, deadline)
+    if repo_slug != parsed.repo:
+        return False
+    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
+    if active_issue != parsed.issue_number or entry is None:
+        return False
+    return True
+
+
 def _parse_exact_skill_runtime_authority_transport_consume_tail(
     tokens: list[str], root: str
 ) -> ExactSkillRuntimeCommand | None:
@@ -1834,6 +1952,19 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "--anchor-context-file",
         "{anchor_context_file}",
     ],
+    # Issue #2039 AC8/AC11
+    "repair_action.apply": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--apply-repair-action",
+        "{preflight_result_path}",
+    ],
 }
 _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
     "preflight.run": {
@@ -1912,6 +2043,12 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "router_receipt_path": {"type": "path", "required": True},
         "contract_patch_plan_file": {"type": "path", "required": False, "optional_flag_pair": True},
         "anchor_context_file": {"type": "path", "required": False, "optional_flag_pair": True},
+    },
+    # Issue #2039 AC8/AC11
+    "repair_action.apply": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "preflight_result_path": {"type": "path", "required": True},
     },
 }
 

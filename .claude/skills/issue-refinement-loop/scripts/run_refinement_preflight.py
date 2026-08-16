@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import importlib.metadata
 import io
@@ -87,6 +88,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -178,6 +180,31 @@ SCHEMA_VERSION_INPUT_FIXTURE = "refinement_preflight_input/v1"
 # Timeout constants (seconds)
 GH_API_TIMEOUT = 30
 PLANNER_TIMEOUT = 60
+
+# PR #2202 review fix-delta (P0-6): `repair_action.apply`'s worst-case inner
+# critical path runs the readiness-check subprocess and the
+# edit_issue_txn.py subprocess SEQUENTIALLY inside a single
+# `run_refinement_preflight.py --apply-repair-action` process invocation.
+# The registry-level outer supervisor timeout for the `repair_action.apply`
+# command_id (command_registry.py REGISTRY["repair_action.apply"]
+# ["timeout_seconds"]) MUST stay strictly greater than
+# REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS +
+# REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS +
+# REPAIR_APPLY_READBACK_RESERVE_SECONDS + margin -- otherwise the outer
+# supervisor can kill this process mid-dispatch (after a PATCH may already
+# have been sent to GitHub) before the AC5 authoritative-readback path ever
+# runs, silently converting a genuinely-mutated Issue into a reported
+# failure/crash instead of a resolvable `unknown` outcome.
+REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS = 30
+REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS = 60
+# One bounded `_fetch_issue()` GitHub read (GH_API_TIMEOUT-bounded) is the
+# most this function ever spends resolving the AC5 authoritative readback
+# after a TimeoutExpired/OSError/unparseable-stdout `unknown` outcome.
+REPAIR_APPLY_READBACK_RESERVE_SECONDS = GH_API_TIMEOUT
+# inner_total(90) + readback_reserve(30) = 120; command_registry.py's
+# `repair_action.apply["timeout_seconds"]` is set to 150 (30s margin above
+# that combined worst case) -- see the comment on that registry entry.
+REPAIR_APPLY_OUTER_TIMEOUT_MARGIN_SECONDS = 30
 
 # Exit codes
 EXIT_PASS = 0
@@ -346,6 +373,1603 @@ def _now_iso() -> str:
 
 def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+# PR #2202 review fix (P0-2): producer-side provenance-lane determination
+# for repair_action.apply. Reuses the SAME control-plane-explicit-lane
+# classifier already used for scope-delta authority evidence
+# (_resolve_scope_delta_source_kind) rather than inventing a second
+# classification path, translated into the repair_action.apply vocabulary
+# (human_context/anchor/unanchored, see repair_apply_result_v1.schema.json)
+# established by the AC9 fresh-validation lane-preservation check.
+def _determine_repair_source_lane(anchor_url: "str | None", known_context: "dict | None") -> str:
+    """Resolve the repair-lane provenance the current preflight run executed
+    under: 'unanchored' (no anchor comment at all), 'human_context' (an
+    operator-labeled human-context anchor), or 'anchor' (an agent-authored /
+    unlabeled anchor)."""
+    if not anchor_url:
+        return "unanchored"
+    source_kind = _resolve_scope_delta_source_kind(
+        anchor_url,
+        human_context_comment_urls=(
+            known_context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD) if isinstance(known_context, dict) else None
+        ),
+        agent_report_comment_urls=(
+            known_context.get(_AGENT_REPORT_COMMENT_URLS_FIELD) if isinstance(known_context, dict) else None
+        ),
+    )
+    return "human_context" if source_kind == "issue_comment" else "anchor"
+
+
+def _repair_source_refs_digest(source_lane: str, anchor_url: "str | None") -> "str | None":
+    """Digest binding the source refs (anchor comment URL/id) a repair_action
+    producer run relied on. None for the unanchored lane (Issue #2039 AC3)."""
+    if source_lane == "unanchored" or not anchor_url:
+        return None
+    parsed_anchor = _parse_anchor_comment_url(anchor_url)
+    return "sha256:" + _sha256(
+        _canonical_json({"anchor_url": anchor_url, "comment_id": parsed_anchor.get("comment_id")})
+    )
+
+
+def _repair_preflight_run_identity(
+    *, issue_number: int, repo: str, original_body_sha256: str, captured_at: str, source_lane: str
+) -> str:
+    """A per-run identity for the producer run that generated a
+    repair_action candidate (Issue #2039 AC3). Deliberately independent of
+    `hashes.result_core_sha256` (which is itself computed from a
+    `result_core_for_hash` dict that MAY embed `repair_action_core` -- using
+    it here would be self-referential)."""
+    return "sha256:" + _sha256(
+        _canonical_json(
+            {
+                "issue_number": issue_number,
+                "repo": repo,
+                "original_body_sha256": original_body_sha256,
+                "captured_at": captured_at,
+                "source_lane": source_lane,
+            }
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2039: repair_action.apply controlled consumer -- foundational
+# building blocks. (REPAIR_APPLY_BLOCK_MARKER_ISSUE_2039)
+#
+# NOTE: the FD-based secure artifact reader (AC7), the exactly-one
+# mutation-intent arbiter core (AC1), and the schema migration (AC2,
+# repair_apply_result_v1.schema.json / refinement_preflight_result_v1.schema
+# .json) are implemented. AC8/AC11 are wired: run_repair_action_apply()
+# below is registered as the `repair_action.apply` command_id in
+# command_registry.py / skill_runtime_command_policy.py, dispatched by
+# skill_runtime_exec.py, and constrained to stdout_contract
+# `repair_apply_result/v1`. AC3 (provenance binding), AC4 (pre-dispatch
+# rebase-on-drift), AC5 (post-dispatch retry-budget separation +
+# authoritative readback), AC6 (lossless receipt projection, phase/
+# failure_code separation), AC9 (lane-preserving fresh validation), and AC10
+# (historical-artifact immutability + replay-resolves-to-no_change) are also
+# implemented -- see run_repair_action_apply()'s own docstring.
+# ---------------------------------------------------------------------------
+
+
+class RepairApplySecureOpenError(RuntimeError):
+    """Raised when a repair_apply artifact fails FD-based secure-open
+    validation (Issue #2039 AC7)."""
+
+
+REPAIR_APPLY_MAX_ARTIFACT_BYTES = 1_048_576  # 1 MiB read-size ceiling (AC7)
+
+
+def _repair_apply_scratch_create(dir_fd: int, name: str, content: bytes) -> None:
+    """Create `name` inside the directory referenced by `dir_fd`, ONLY if it
+    does not already exist (PR #2202 review P1-1: fixed-name scratch-file
+    race/symlink-clobber hardening).
+
+    Uses `O_CREAT | O_EXCL | O_NOFOLLOW` (dir-FD-relative, never a bare
+    pathname): `O_EXCL` makes creation fail rather than silently overwrite
+    or follow anything already at that name -- including a symlink
+    pre-placed by another process with the same permissions, which would
+    otherwise redirect this write to clobber an arbitrary writable file
+    elsewhere, and would do so BEFORE `edit_issue_txn.py`'s own downstream
+    symlink checks ever run. After creation, `fstat()`s the resulting FD
+    and verifies it is a genuinely new regular file (`st_nlink == 1`)
+    before trusting it, then writes `content` and closes.
+
+    Raises `RepairApplySecureOpenError` (fail-closed) if the name already
+    exists, is not a plain regular file post-creation, or has more than
+    one hard link.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
+    except FileExistsError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_scratch_already_exists:{name}") from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RepairApplySecureOpenError(f"repair_apply_scratch_is_symlink:{name}") from exc
+        raise RepairApplySecureOpenError(f"repair_apply_scratch_create_error:{name}:{exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise RepairApplySecureOpenError(f"repair_apply_scratch_unsafe_fd:{name}")
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = -1  # fdopen now owns the fd; do not close twice below
+            handle.write(content)
+    except RepairApplySecureOpenError:
+        raise
+    except OSError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_scratch_write_error:{name}:{exc}") from exc
+    finally:
+        if fd != -1:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _repair_apply_scratch_unlink(dir_fd: int, name: str) -> None:
+    """Unlink `name` inside the directory referenced by `dir_fd` (PR #2202
+    review P1-1). Directory-FD-relative, never a reconstructed pathname
+    string, so cleanup cannot be redirected by a symlink swapped into
+    place after creation but before cleanup. Best-effort: swallows
+    `OSError` (e.g. already removed / never created)."""
+    with contextlib.suppress(OSError):
+        os.unlink(name, dir_fd=dir_fd)
+
+
+def _repair_apply_dirfd_open_leaf(path: Path, *, root: Path) -> int:
+    """Open `path` for reading using ONLY directory-FD-relative traversal
+    from `root` (PR #2202 review P1-2: dir-FD-relative TOCTOU hardening).
+
+    Unlike a pathname-based `lstat()`-then-`open()` pair (which leaves a
+    window in which an ancestor directory can be swapped to a symlink
+    between the check and the use, redirecting the open outside `root`
+    even though the ancestor check "passed" moments earlier), this walks
+    every ancestor component with `os.open(..., dir_fd=<already-open
+    parent fd>)`. Each step operates on an FD that is already open (not a
+    freshly re-resolved pathname), so no ancestor can be substituted
+    mid-traversal -- the kernel resolves each component exactly once,
+    relative to a directory descriptor whose identity is already fixed.
+
+    `openat2(RESOLVE_BENEATH)` (Linux 5.6+) would be a stronger/simpler
+    primitive for this, but CPython's stdlib `os` module does not expose
+    it (no `os.openat2()`); adding it would require reaching for a raw
+    `ctypes`/syscall shim, which was judged riskier to introduce here than
+    this component-wise dir-FD walk. This walk closes the specific
+    ancestor-swap TOCTOU window described in review P1-2 without any new
+    dependency; it does not implement `RESOLVE_BENEATH`'s additional
+    guarantees (e.g. rejecting `..`-escapes mid-resolution at the kernel
+    level), which is instead enforced above by explicitly rejecting `..`
+    /`.`/empty path components before any FD is opened.
+
+    Every ancestor directory is opened with `O_NOFOLLOW | O_DIRECTORY`
+    (rejects a symlink or non-directory masquerading as an ancestor). The
+    leaf is opened with `O_NOFOLLOW | O_NONBLOCK` (rejects a leaf symlink
+    atomically at open() time via the kernel, and `O_NONBLOCK` prevents an
+    indefinite block if the leaf turns out to be a FIFO with no writer --
+    such leaves are still rejected as non-regular via the caller's
+    post-open `fstat()` check, never trusted).
+
+    Returns an open file descriptor to the leaf; caller owns and must
+    close it. Raises `RepairApplySecureOpenError` (fail-closed) for any
+    ancestor/leaf that is missing, a symlink, outside `root`, or otherwise
+    cannot be opened this way.
+    """
+    resolved_root = root.resolve(strict=False)
+    try:
+        rel_parts = path.relative_to(resolved_root).parts
+    except ValueError as exc:
+        raise RepairApplySecureOpenError(
+            f"repair_apply_parent_outside_root:{path}:not_under:{resolved_root}"
+        ) from exc
+    if not rel_parts:
+        raise RepairApplySecureOpenError(f"repair_apply_path_is_root:{path}")
+    for part in rel_parts:
+        if part in ("", ".", ".."):
+            raise RepairApplySecureOpenError(f"repair_apply_path_component_invalid:{path}:{part}")
+
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    leaf_flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        dir_flags |= os.O_CLOEXEC
+        leaf_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        leaf_flags |= os.O_NONBLOCK
+
+    try:
+        current_fd = os.open(str(resolved_root), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_root_open_error:{resolved_root}:{exc}") from exc
+
+    opened_fds = [current_fd]
+    try:
+        for part in rel_parts[:-1]:
+            try:
+                next_fd = os.open(part, dir_flags, dir_fd=current_fd)
+            except FileNotFoundError as exc:
+                raise RepairApplySecureOpenError(f"repair_apply_ancestor_missing:{path}:{part}") from exc
+            except OSError as exc:
+                # ELOOP: kernel refused to resolve a symlink component
+                # (O_NOFOLLOW). ENOTDIR: the O_DIRECTORY|O_NOFOLLOW pair
+                # requires the final resolved component to already be a
+                # directory without following a symlink to get there -- a
+                # symlinked ancestor (even one that points at a real
+                # directory) fails this exact way on Linux, which is why
+                # both errno values are treated as "ancestor is a symlink"
+                # here (the two are not distinguished further since either
+                # way the ancestor is rejected as unsafe).
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise RepairApplySecureOpenError(
+                        f"repair_apply_ancestor_is_symlink:{path}:{part}"
+                    ) from exc
+                raise RepairApplySecureOpenError(
+                    f"repair_apply_ancestor_dirfd_open_error:{path}:{part}:{exc}"
+                ) from exc
+            opened_fds.append(next_fd)
+            current_fd = next_fd
+
+        leaf_name = rel_parts[-1]
+        try:
+            leaf_fd = os.open(leaf_name, leaf_flags, dir_fd=current_fd)
+        except FileNotFoundError as exc:
+            raise RepairApplySecureOpenError(f"repair_apply_leaf_not_found:{path}") from exc
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise RepairApplySecureOpenError(f"repair_apply_leaf_is_symlink:{path}") from exc
+            if exc.errno == errno.ENXIO:
+                raise RepairApplySecureOpenError(
+                    f"repair_apply_leaf_not_regular_file:{path}:special_file"
+                ) from exc
+            raise RepairApplySecureOpenError(f"repair_apply_leaf_open_error:{path}:{exc}") from exc
+        return leaf_fd
+    finally:
+        for fd in opened_fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def secure_read_repair_apply_artifact(
+    path: Path,
+    *,
+    root: Path,
+    max_bytes: int = REPAIR_APPLY_MAX_ARTIFACT_BYTES,
+    expected_sha256: Optional[str] = None,
+) -> "tuple[str, str]":
+    """FD-based secure read of a repair_apply artifact (Issue #2039 AC7;
+    PR #2202 review P1-2 dir-FD-relative traversal hardening).
+
+    Rejects (fail-closed, before any content bytes are trusted):
+      - leaf symlink, FIFO, socket, device, directory (regular files only)
+      - parent-directory symlink anywhere between the leaf and `root`
+      - parent substitution (resolved parent outside `root`)
+      - oversize content (> max_bytes)
+      - non-UTF-8 content (strict decode)
+      - digest mismatch against `expected_sha256`, when given
+      - leaf replaced with a symlink between the read and the post-read
+        identity re-check
+
+    The leaf and every ancestor directory between it and `root` are opened
+    via `_repair_apply_dirfd_open_leaf()`, i.e. purely through
+    directory-FD-relative `open(..., dir_fd=...)` calls chained from an
+    already-open `root` FD -- never through a freshly re-resolved
+    pathname. This closes the TOCTOU window that a separate
+    `lstat()`-then-`open()` pair leaves open (an ancestor directory being
+    swapped to a symlink between the ancestor check and the open() call):
+    each traversal step operates on an FD whose identity was already
+    fixed by the previous step, so there is no window in which a
+    concurrent rename/symlink-swap of an ancestor can redirect the open.
+
+    Returns (text, sha256_hex_digest_of_raw_bytes).
+    """
+    resolved_root = root.resolve(strict=False)
+    fd = _repair_apply_dirfd_open_leaf(path, root=resolved_root)
+
+    raw = b""
+    try:
+        post_st = os.fstat(fd)
+        if not stat.S_ISREG(post_st.st_mode):
+            raise RepairApplySecureOpenError(f"repair_apply_leaf_not_regular_file_post_open:{path}")
+        pre_st = post_st
+        if post_st.st_size > max_bytes:
+            raise RepairApplySecureOpenError(
+                f"repair_apply_leaf_oversize:{path}:{post_st.st_size}:>:{max_bytes}"
+            )
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1  # fdopen now owns the fd; do not close twice below
+            raw = handle.read(max_bytes + 1)
+    except RepairApplySecureOpenError:
+        raise
+    except OSError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_read_error:{path}:{exc}") from exc
+    finally:
+        if fd != -1:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    if len(raw) > max_bytes:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_oversize_on_read:{path}:>:{max_bytes}")
+
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_not_utf8:{path}:{exc}") from exc
+
+    digest = hashlib.sha256(raw).hexdigest()
+    # PR #2202 review fix (P0-2 collateral bug, found by the required
+    # canonical-producer E2E test): repair_action.*_body_sha256 fields are
+    # always "sha256:<hex>"-prefixed (see repair_issue_contract.py /
+    # classify_repair_action()), but every caller here always passed a
+    # prefixed expected_sha256 while this compared it against a bare hex
+    # digest -- so a REAL producer artifact ALWAYS failed this check
+    # (silently masked before now because every hand-built test fixture
+    # happened to pass a bare, un-prefixed expected_sha256 instead of a
+    # real repair_action's own value).
+    if expected_sha256 is not None and digest != _repair_apply_strip_sha_prefix(expected_sha256):
+        raise RepairApplySecureOpenError(
+            f"repair_apply_digest_mismatch:{path}:expected={expected_sha256}:actual={digest}"
+        )
+
+    try:
+        after_st = os.lstat(path)
+    except OSError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_post_read_lstat_error:{path}:{exc}") from exc
+    if stat.S_ISLNK(after_st.st_mode):
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_replaced_with_symlink:{path}")
+    if (after_st.st_dev, after_st.st_ino) != (pre_st.st_dev, pre_st.st_ino):
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_replaced_post_read:{path}")
+
+    return text, digest
+
+
+REPAIR_APPLY_FAILURE_MULTIPLE_MUTATION_INTENTS = "multiple_mutation_intents"
+REPAIR_APPLY_FAILURE_NO_MUTATION_INTENT = "no_mutation_intent"
+
+
+def resolve_repair_apply_mutation_intent(
+    *,
+    contract_update: "dict | None",
+    repair_action: "dict | None",
+) -> dict:
+    """Issue #2039 AC1: exactly-one mutation-intent arbiter for the
+    repair_action.apply command lane.
+
+    PR #2202 review fix (P0-1): this arbiter reads the CANONICAL
+    `refinement_preflight_result_v1` top-level field `contract_update`
+    (emitted by `contract_update.run.with_anchor`) -- not the unrelated,
+    schema-invalid `contract_patch_plan` key that a canonical result can
+    never carry (`additionalProperties: false`). Reading the wrong field
+    made the earlier version of this arbiter always see
+    `has_contract_update=False` for real production artifacts, so it could
+    never detect the real hazard this AC exists to prevent: a canonical
+    result that already carries a completed/attempted `contract_update`
+    handoff *and* a `repair_action` projection at the same time.
+
+    `contract_update` and `repair_action` must not both be present in the
+    same preflight result. When both are given this returns a fail-closed
+    verdict (`failure_code=multiple_mutation_intents`,
+    `mutation_outcome=not_attempted`) *before* any GitHub mutation is
+    attempted. A subsequent intent must be regenerated as a fresh preflight
+    in a separate command, never resolved by this arbiter picking one of
+    the two present intents.
+    """
+    has_contract_update = contract_update is not None
+    has_repair_action = repair_action is not None
+
+    if has_contract_update and has_repair_action:
+        return {
+            "intent": None,
+            "ok": False,
+            "failure_code": REPAIR_APPLY_FAILURE_MULTIPLE_MUTATION_INTENTS,
+            "mutation_outcome": "not_attempted",
+            "reason": (
+                "contract_update and repair_action are both present in the "
+                "same preflight result; exactly one mutation intent is required. "
+                "Apply one intent, then regenerate a fresh preflight as a "
+                "separate command for the other."
+            ),
+        }
+    if has_repair_action:
+        return {
+            "intent": "repair_action",
+            "ok": True,
+            "failure_code": None,
+            "mutation_outcome": None,
+            "reason": None,
+        }
+    if has_contract_update:
+        return {
+            "intent": "contract_update",
+            "ok": True,
+            "failure_code": None,
+            "mutation_outcome": None,
+            "reason": None,
+        }
+    return {
+        "intent": None,
+        "ok": False,
+        "failure_code": REPAIR_APPLY_FAILURE_NO_MUTATION_INTENT,
+        "mutation_outcome": "not_attempted",
+        "reason": "Neither contract_update nor repair_action is present.",
+    }
+
+
+REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION = "repair_apply_result/v1"
+EDIT_ISSUE_TXN_SCRIPT_REL = "edit-issue/scripts/edit_issue_txn.py"
+
+# Issue #2039 AC3: provenance-mismatch failure codes, in the order they are
+# checked (repo/issue identity first, then run identity, then payload
+# replacement, then leaf-artifact digest).
+REPAIR_APPLY_FAILURE_CROSS_ISSUE = "cross_issue_provenance_mismatch"
+REPAIR_APPLY_FAILURE_STALE_RUN = "stale_run_provenance_mismatch"
+REPAIR_APPLY_FAILURE_REPLACEMENT = "replacement_provenance_mismatch"
+REPAIR_APPLY_FAILURE_DIGEST_MISMATCH = "digest_mismatch"
+REPAIR_APPLY_FAILURE_PROVENANCE_UNRECONSTRUCTABLE = "provenance_unreconstructable"
+REPAIR_APPLY_FAILURE_SECOND_DRIFT = "second_body_drift"
+REPAIR_APPLY_FAILURE_NON_SAFE_AFTER_RERUN = "non_safe_disposition_after_rerun"
+
+
+def _repair_apply_not_attempted_result(
+    *,
+    repo: str,
+    issue_number: int,
+    phase: str,
+    failure_code: "str | None",
+    provenance: "dict | None" = None,
+    rebase: "dict | None" = None,
+) -> dict:
+    """Issue #2039 AC8/AC11: shared not_attempted stdout-contract shape for
+    every early-exit branch of run_repair_action_apply() (multiple intent,
+    no intent, non-safe disposition, unreadable candidate, provenance
+    mismatch, second body drift, readback failure). Never emits a GitHub
+    mutation."""
+    return {
+        "schema_version": REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION,
+        "phase": phase,
+        "mutation_outcome": "not_attempted",
+        "failure_code": failure_code,
+        "repo": repo,
+        "issue_number": issue_number,
+        "provenance": provenance
+        or {
+            "repo": repo,
+            "issue_number": issue_number,
+            "original_body_sha256": "",
+            "original_updated_at": None,
+            "preflight_run_identity": None,
+            "producer_schema_version": "repair_action/v1",
+            "producer_policy_version": "deterministic-issue-repair/v1",
+            "repair_action_core_sha256": "",
+            "candidate_digest": "",
+            "source_lane": "unanchored",
+            "source_refs_digest": None,
+        },
+        "rebase": rebase
+        or {
+            "attempted": False,
+            "producer_reruns": 0,
+            "drift_detected": False,
+            "second_drift": False,
+        },
+        "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
+        "receipt": {
+            "patch_attempted": False,
+            "executor_status": None,
+            "mutation_outcome": "not_attempted",
+            "failure_code": failure_code,
+            "final_readback": {"status": "not_applicable", "digest": None, "digest_class": "not_applicable"},
+        },
+        "fresh_validation": {
+            "status": "not_run",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": None,
+        },
+        "historical_artifacts": {"physically_deleted": False, "latest_action_reference_invalidated": False},
+    }
+
+
+def _repair_apply_strip_sha_prefix(value: "str | None") -> "str | None":
+    """Normalize a `sha256:<hex>` or bare-`<hex>` digest string to its bare
+    lowercase hex form for equality comparison, so digests produced by
+    different callers (some prefixed, some not) can still be compared
+    correctly (Issue #2039 AC3/AC4/AC5)."""
+    if not value:
+        return None
+    if value.startswith("sha256:"):
+        value = value[len("sha256:") :]
+    return value.lower()
+
+
+def _repair_action_core_projection(repair_action: dict) -> dict:
+    """Issue #2039 AC3: the environment-independent core of a repair_action
+    payload that provenance binding is computed over."""
+    return {
+        "schema_version": repair_action.get("schema_version"),
+        "policy_version": repair_action.get("policy_version"),
+        "disposition": repair_action.get("disposition"),
+        "original_body_sha256": repair_action.get("original_body_sha256"),
+        "repaired_body_sha256": repair_action.get("repaired_body_sha256"),
+        "repair_kinds": repair_action.get("repair_kinds"),
+        "reason_codes": repair_action.get("reason_codes"),
+    }
+
+
+def _repair_action_core_sha256(repair_action: dict) -> str:
+    core = _repair_action_core_projection(repair_action)
+    return hashlib.sha256(json.dumps(core, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _validate_repair_apply_provenance_binding(
+    provenance: dict,
+    *,
+    repo: str,
+    issue_number: int,
+    expected_provenance: "dict | None",
+) -> "str | None":
+    """Issue #2039 AC3: reject cross-Issue, old-run, replacement, and
+    candidate-digest-mismatch cases *before* any GitHub mutation is
+    dispatched.
+
+    The always-available self-consistency check (the candidate's own
+    provenance must target the repo/issue this command was invoked for) is
+    enforced unconditionally. When a caller additionally supplies
+    `expected_provenance` (e.g. the run identity / core hash / candidate
+    digest it originally bound to), every supplied field must match exactly,
+    or this returns the corresponding fail-closed reason code. Returns None
+    when provenance is fully consistent.
+    """
+    if provenance.get("repo") != repo or provenance.get("issue_number") != issue_number:
+        return REPAIR_APPLY_FAILURE_CROSS_ISSUE
+    if not expected_provenance:
+        return None
+
+    exp_repo = expected_provenance.get("repo")
+    if exp_repo is not None and exp_repo != provenance.get("repo"):
+        return REPAIR_APPLY_FAILURE_CROSS_ISSUE
+    exp_issue = expected_provenance.get("issue_number")
+    if exp_issue is not None and exp_issue != provenance.get("issue_number"):
+        return REPAIR_APPLY_FAILURE_CROSS_ISSUE
+
+    exp_run_identity = expected_provenance.get("preflight_run_identity")
+    if exp_run_identity is not None and exp_run_identity != provenance.get("preflight_run_identity"):
+        return REPAIR_APPLY_FAILURE_STALE_RUN
+    exp_original_sha = expected_provenance.get("original_body_sha256")
+    if exp_original_sha is not None and _repair_apply_strip_sha_prefix(
+        exp_original_sha
+    ) != _repair_apply_strip_sha_prefix(provenance.get("original_body_sha256")):
+        return REPAIR_APPLY_FAILURE_STALE_RUN
+
+    exp_core = expected_provenance.get("repair_action_core_sha256")
+    if exp_core is not None and exp_core != provenance.get("repair_action_core_sha256"):
+        return REPAIR_APPLY_FAILURE_REPLACEMENT
+
+    exp_digest = expected_provenance.get("candidate_digest")
+    if exp_digest is not None and _repair_apply_strip_sha_prefix(exp_digest) != _repair_apply_strip_sha_prefix(
+        provenance.get("candidate_digest")
+    ):
+        return REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+
+    return None
+
+
+def _default_rerun_repair_producer(body: str, artifact_dir: Path) -> "tuple[dict | None, str | None]":
+    """Issue #2039 AC4 default pre-dispatch rebase: rerun the SAME producer
+    (repair_issue_contract.py dry-run, then --apply materialize) against a
+    fresh live body -- never a whole-body textual rebase/diff-apply. Returns
+    a repair_action-shaped dict (possibly non-`auto_apply_safe`, which the
+    caller must classify as `non_safe_disposition_after_rerun`), or
+    (None, reason) on any subprocess/materialization failure."""
+    dry = _invoke_repair(body)
+    if dry.get("error"):
+        return None, f"rerun_dry_run_error:{dry.get('error')}"
+    raw_action = dry.get("repair_action")
+    if dry.get("changed") is not True or not isinstance(raw_action, dict):
+        # No repair classified against the fresh body at all: there is
+        # nothing safe left to apply, and the caller must not silently
+        # fabricate a disposition here.
+        return None, "rerun_no_actionable_repair"
+
+    if raw_action.get("disposition") != "auto_apply_safe":
+        return {
+            "schema_version": raw_action.get("schema_version", "repair_action/v1"),
+            "policy_version": raw_action.get("policy_version", "deterministic-issue-repair/v1"),
+            "disposition": raw_action.get("disposition"),
+            "original_body_sha256": raw_action.get("original_body_sha256"),
+            "repaired_body_sha256": raw_action.get("repaired_body_sha256"),
+            "candidate_body_artifact": None,
+            "repair_kinds": raw_action.get("repair_kinds", []),
+            "reason_codes": raw_action.get("reason_codes", []),
+        }, None
+
+    apply_result, apply_error = _materialize_auto_apply_candidate(body, dry, artifact_dir)
+    if apply_error is not None:
+        return None, f"rerun_apply_error:{apply_error}"
+    candidate_path = artifact_dir / "repaired_issue_body.md"
+    return {
+        "schema_version": raw_action.get("schema_version", "repair_action/v1"),
+        "policy_version": raw_action.get("policy_version", "deterministic-issue-repair/v1"),
+        "disposition": "auto_apply_safe",
+        "original_body_sha256": raw_action.get("original_body_sha256"),
+        "repaired_body_sha256": raw_action.get("repaired_body_sha256"),
+        "candidate_body_artifact": str(candidate_path),
+        "repair_kinds": raw_action.get("repair_kinds", []),
+        "reason_codes": raw_action.get("reason_codes", []),
+    }, None
+
+
+def _classify_repair_apply_readback_digest(
+    remote_sha: "str | None", candidate_digest: "str | None", old_digest: "str | None"
+) -> str:
+    """Issue #2039 AC5: authoritative-readback digest classification.
+    Distinguishes candidate (the dispatched body took effect) / old (the
+    body is unchanged from before dispatch) / third (neither -- e.g. a
+    concurrent human edit) / unknown (no readback digest available)."""
+    norm_remote = _repair_apply_strip_sha_prefix(remote_sha)
+    if norm_remote is None:
+        return "unknown"
+    if norm_remote == _repair_apply_strip_sha_prefix(candidate_digest):
+        return "candidate"
+    if old_digest is not None and norm_remote == _repair_apply_strip_sha_prefix(old_digest):
+        return "old"
+    return "third"
+
+
+def _repair_receipt_from_txn_result(
+    txn_result: dict,
+    *,
+    candidate_digest: "str | None" = None,
+    old_digest: "str | None" = None,
+    resolve_readback=None,
+) -> dict:
+    """Issue #2039 AC6: lossless projection of edit_issue_txn.py's
+    ISSUE_EDIT_TXN_RESULT_V1 receipt into the repair_apply_result/v1
+    receipt shape. `unknown` is preserved, never collapsed into
+    failed/not_attempted/no_change.
+
+    Issue #2039 AC5: post-dispatch retry budget is 0 -- this NEVER re-issues
+    the mutation. When the transaction result carries no
+    `remote_current_body_sha256` (executor could not itself confirm the
+    outcome), `resolve_readback` (if given) is called at most once to fetch
+    an authoritative post-dispatch snapshot for digest classification only;
+    it never re-dispatches a mutation.
+    """
+    # Issue #2039 P0-4 fix: ISSUE_EDIT_TXN_RESULT_V1's canonical shape nests
+    # the attempt/outcome/digest fields the receipt needs under
+    # `body_update` and `content_update` (see edit_issue_txn.py
+    # `_render_result()`); only `status` and `mutation_started` live at the
+    # top level. Reading e.g. `txn_result["body_attempted"]` or
+    # `txn_result["remote_current_body_sha256"]` at the top level always
+    # misses (those keys never exist there), which previously caused
+    # `patch_attempted` to silently degrade to False and skip fresh
+    # validation even when a body patch had genuinely been attempted.
+    body_update = txn_result.get("body_update")
+    if not isinstance(body_update, dict):
+        body_update = {}
+    content_update = txn_result.get("content_update")
+    if not isinstance(content_update, dict):
+        content_update = {}
+
+    status = txn_result.get("status")
+    mutation_outcome_map = {
+        "ok": "applied",
+        "no_change": "no_change",
+        "failed_no_mutation": "not_attempted",
+        "human_judgment": "not_attempted",
+        "mutation_outcome_unknown": "unknown",
+        "failed_after_mutation": "unknown",
+    }
+    mutation_outcome = mutation_outcome_map.get(status, "unknown")
+    patch_attempted = bool(
+        body_update.get("attempted")
+        or content_update.get("patch_attempted")
+        or txn_result.get("mutation_started")
+    )
+
+    # Cross-field consistency (Issue #2039 P0-4 item 3): when a body/content
+    # patch was actually attempted, the nested
+    # `content_update.mutation_outcome` is the executor's own scoped signal
+    # for that patch and MUST NOT be silently overridden by a more
+    # optimistic top-level `status`-derived reading. If the executor itself
+    # could not confirm the patch outcome
+    # (`content_update.mutation_outcome == "unknown"`), this receipt's
+    # `mutation_outcome` stays `unknown` even if the overall transaction
+    # `status` looked definitive -- this is the exact
+    # mutation_outcome_unknown hazard the review flagged (fail closed,
+    # never collapse `unknown` into a definitive outcome).
+    if patch_attempted and content_update.get("mutation_outcome") == "unknown":
+        mutation_outcome = "unknown"
+
+    remote_sha = body_update.get("remote_current_body_sha256")
+    # PR #2202 review fix-delta (P1-3): a genuinely-unconfirmed outcome is
+    # not only `mutation_outcome == "unknown"` -- an `applied` outcome with
+    # no reported remote digest is equally unconfirmed (the executor
+    # reported success but this receipt has no independent evidence of the
+    # resulting body state). Attempt the SAME single authoritative readback
+    # (never a mutation retry, still budget-1 per AC5) for that case too,
+    # so `applied` never reaches `phase=complete` with an `unresolved`
+    # final_readback (the exact schema invariant this fix-delta adds).
+    if not remote_sha and mutation_outcome in ("unknown", "applied") and resolve_readback is not None:
+        try:
+            remote_sha = resolve_readback()
+        except Exception:
+            remote_sha = None
+
+    if remote_sha:
+        digest_class = _classify_repair_apply_readback_digest(remote_sha, candidate_digest, old_digest)
+        final_readback = {"status": "verified", "digest": remote_sha, "digest_class": digest_class}
+    else:
+        final_readback = {"status": "unresolved", "digest": None, "digest_class": "not_applicable"}
+        if mutation_outcome == "applied":
+            # PR #2202 review fix-delta (P1-3): even after the readback
+            # attempt above, no digest could be confirmed for a reported
+            # `applied` outcome -- downgrade to `unknown` rather than
+            # emitting a definitive `applied` result with no verifying
+            # evidence. Mirrors the existing `mutation_outcome_unknown`
+            # handling exactly (same failure_code, same AC5 single-read
+            # budget already spent above).
+            mutation_outcome = "unknown"
+
+    failure_code = None
+    if mutation_outcome == "unknown":
+        failure_code = "final_readback_unresolvable"
+    elif mutation_outcome == "not_attempted" and (txn_result.get("errors") or []):
+        failure_code = "transaction_execute_error"
+
+    return {
+        "patch_attempted": patch_attempted,
+        "executor_status": status,
+        "mutation_outcome": mutation_outcome,
+        "failure_code": failure_code,
+        "final_readback": final_readback,
+    }
+
+
+REPAIR_APPLY_VALID_SOURCE_LANES = {"human_context", "anchor", "unanchored"}
+
+
+def _default_fresh_validate_producer(
+    body: str,
+    expected_source_lane: str,
+    *,
+    anchor_url: "str | None" = None,
+    known_context: "dict | None" = None,
+) -> dict:
+    """Issue #2039 AC9 default fresh-validation producer.
+
+    Reruns the SAME narrow repair producer (dry-run only -- no
+    materialization, no mutation) against `body` to determine whether an
+    actionable repair still remains after the mutation attempt.
+
+    PR #2202 review fix-delta (P0-5, item 4): when the caller supplies the
+    SAME `anchor_url` / `known_context` inputs the original producer run
+    used to classify its source lane, this now genuinely re-derives the
+    lane by rerunning the SAME classifier
+    (`_determine_repair_source_lane` -> `_resolve_scope_delta_source_kind`)
+    against the CURRENT (fresh) state -- it does not simply trust/echo
+    `expected_source_lane`. This is what makes a real lane-promotion /
+    lane-mix-up bug detectable, not merely an injected test double. When no
+    anchor context is supplied (the common case for callers that do not
+    thread it through -- e.g. this function has no independent way to
+    discover which GitHub comment was originally the anchor without being
+    told), this stays the fail-closed-safe baseline of reporting the lane
+    it was told to preserve (it never promotes unanchored -> anchor, never
+    converts to with_anchor, and never mixes lanes on its own).
+    """
+    dry = _invoke_repair(body)
+    if dry.get("error"):
+        return {"error": dry.get("error"), "source_lane": expected_source_lane, "actionable_repair": None}
+    raw_action = dry.get("repair_action")
+    actionable = bool(
+        dry.get("changed") is True
+        and isinstance(raw_action, dict)
+        and raw_action.get("disposition") == "auto_apply_safe"
+    )
+    if anchor_url is not None or known_context is not None:
+        reported_lane = _determine_repair_source_lane(anchor_url, known_context)
+    else:
+        reported_lane = expected_source_lane
+    return {"error": None, "source_lane": reported_lane, "actionable_repair": actionable}
+
+
+def _repair_apply_expected_post_mutation_digest(
+    *,
+    mutation_outcome: str,
+    receipt: dict,
+    candidate_digest: "str | None",
+    old_digest: "str | None",
+) -> "str | None":
+    """Issue #2039 AC9: the digest fresh validation must confirm the live
+    body against, derived from the SAME authoritative signals AC5/AC6
+    already computed -- never re-guessed independently.
+
+    `applied` expects the candidate digest; `no_change` expects the
+    pre-dispatch (old) digest; an `unknown` outcome defers entirely to the
+    AC5 authoritative-readback digest classification (candidate/old), and
+    is unresolvable (None) when that classification itself is `third` or
+    `unknown` -- fresh validation must not fabricate an expectation the
+    readback itself could not establish.
+    """
+    if mutation_outcome == "applied":
+        return candidate_digest
+    if mutation_outcome == "no_change":
+        return old_digest
+    digest_class = (receipt.get("final_readback") or {}).get("digest_class")
+    if digest_class == "candidate":
+        return candidate_digest
+    if digest_class == "old":
+        return old_digest
+    return None
+
+
+def _run_repair_apply_fresh_validation(
+    *,
+    fetch,
+    producer,
+    expected_source_lane: str,
+    expected_digest: "str | None",
+) -> dict:
+    """Issue #2039 AC9: post-mutation fresh validation.
+
+    Re-reads the live Issue body (a read, never a mutation retry -- this is
+    independent of, and does not consume, the AC5 post-dispatch retry
+    budget) and reruns `producer` against it to determine whether the
+    original human-context/anchor/unanchored provenance lane was preserved
+    and whether any actionable repair remains. Succeeds ONLY when the fresh
+    result carries no actionable repair AND the live body digest matches
+    `expected_digest`; an unresolvable expected digest (e.g. an `unknown`
+    outcome whose readback digest_class was itself `third`/`unknown`) is
+    always a failure, never a silent skip.
+    """
+    if expected_digest is None:
+        return {
+            "status": "failed",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": None,
+        }
+
+    try:
+        fresh_issue = fetch()
+    except Exception:
+        return {
+            "status": "failed",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": None,
+        }
+
+    fresh_body = fresh_issue.get("body", "") or ""
+    fresh_digest = _sha256(fresh_body)
+    digest_match = _repair_apply_strip_sha_prefix(fresh_digest) == _repair_apply_strip_sha_prefix(expected_digest)
+
+    produced = producer(fresh_body)
+    if produced.get("error") is not None:
+        return {
+            "status": "failed",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": digest_match,
+        }
+
+    reported_lane = produced.get("source_lane")
+    lane_preserved = reported_lane in REPAIR_APPLY_VALID_SOURCE_LANES and reported_lane == expected_source_lane
+    actionable_remaining = produced.get("actionable_repair")
+
+    status = "success" if (lane_preserved and actionable_remaining is False and digest_match) else "failed"
+    return {
+        "status": status,
+        "source_lane_preserved": lane_preserved,
+        "actionable_repair_remaining": actionable_remaining,
+        "final_body_digest_match": digest_match,
+    }
+
+
+def run_repair_action_apply(
+    *,
+    repo: str,
+    issue_number: int,
+    preflight_result_path: str,
+    repo_root: "Path | None" = None,
+    fetch_current=None,
+    apply_transaction=None,
+    expected_provenance: "dict | None" = None,
+    rerun_producer=None,
+    fresh_validate=None,
+    fresh_anchor_url: "str | None" = None,
+    fresh_known_context: "dict | None" = None,
+) -> dict:
+    """Issue #2039 AC8/AC11: `repair_action.apply` controlled consumer.
+
+    Reads a previously-produced preflight result artifact via the FD-based
+    secure reader (AC7), resolves the exactly-one mutation intent (AC1),
+    and -- only when the intent is `repair_action` with
+    `disposition == auto_apply_safe` -- dispatches the repaired body
+    through the existing `edit_issue_txn.py` controlled transaction script
+    (a real subprocess call; never a raw `gh issue edit` call -- AC11).
+
+    AC3 (provenance binding): the candidate's own repo/issue_number is
+    always cross-checked against the requested target. When a caller
+    supplies `expected_provenance` (repo, issue_number,
+    preflight_run_identity, original_body_sha256, repair_action_core_sha256,
+    candidate_digest), every supplied field is required to match exactly, or
+    dispatch is rejected before any GitHub mutation
+    (cross_issue_provenance_mismatch / stale_run_provenance_mismatch /
+    replacement_provenance_mismatch / digest_mismatch).
+
+    AC4 (body-drift handling): before dispatch, the live Issue body is
+    compared against the candidate's own recorded `original_body_sha256`.
+    On drift, the producer (repair_issue_contract.py) is rerun at most once
+    against the fresh live body (never a whole-body textual rebase/diff
+    apply) via `rerun_producer` (injectable; defaults to
+    `_default_rerun_repair_producer`). A second drift, a non-safe
+    disposition after rerun, or an unreconstructable rerun result fails
+    closed with no mutation.
+
+    AC5 (retry-budget separation): `retry.post_dispatch_retry_budget` is
+    always 0 -- this function NEVER re-dispatches `edit_issue_txn.py` after
+    a first attempt. An executor-unconfirmed (`unknown`) outcome is instead
+    resolved, at most once, via an authoritative readback (a read, not a
+    mutation) that classifies the live digest as candidate/old/third.
+
+    AC6 (lossless receipt projection): `edit_issue_txn.py`'s receipt fields
+    are projected losslessly via `_repair_receipt_from_txn_result()`;
+    `unknown` is never collapsed into failed/not_attempted/no_change, and
+    `phase`/`mutation_outcome`/`failure_code` are kept as separate fields
+    (the repair lane never emits `contract_patch_plan_missing`).
+
+    AC9 (lane-preserving fresh validation): after any attempt that reaches
+    transaction dispatch (`receipt.patch_attempted` is True -- applied,
+    no_change, or unknown outcomes; never a not_attempted outcome, since
+    nothing was ever attempted there), a single read-only fresh validation
+    reruns `fresh_validate` (injectable; defaults to
+    `_default_fresh_validate_producer`) against the now-current live body
+    and re-reads the live Issue once more. It succeeds ONLY when the fresh
+    result reports no actionable repair remaining, the original source
+    lane (human_context/anchor/unanchored) is preserved (never an
+    unconditional `with_anchor` conversion, source-lane promotion, or lane
+    mix-up), and the live body digest matches the digest AC5's own
+    authoritative-readback classification already established. This never
+    re-dispatches a mutation and is independent of the AC5 post-dispatch
+    retry budget. `fresh_anchor_url` / `fresh_known_context` (optional) are
+    forwarded to the default fresh-validation producer so it can genuinely
+    re-derive the source lane from current state instead of echoing back
+    the lane it was told to preserve (PR #2202 review fix-delta, P0-5).
+
+    PR #2202 review fix-delta (P0-5): a fresh validation `status ==
+    "failed"` that occurs after a mutation that otherwise reached
+    `phase == "complete"` (an `applied`/`no_change` outcome) now overrides
+    `phase` to `"fresh_validation"` and sets a non-null `failure_code`
+    (`source_lane_mismatch` when the lane was not preserved, else
+    `fresh_validation_failed`) -- `mutation_outcome` itself is never
+    altered (it is a fact about GitHub state, independent of this
+    consistency check), but a genuine fresh-validation failure can no
+    longer be silently reported as `phase=complete` /
+    `failure_code=null`.
+
+    AC10 (historical artifact immutability): this function never deletes
+    the preflight-result artifact it reads, the producer's own recorded
+    `candidate_body_artifact`, or any rebase-rerun artifact -- only its own
+    transaction-local scratch re-serialization (a fresh copy written for
+    `edit_issue_txn.py`'s own consumption) is ever removed, in a `finally`
+    block, after dispatch. A replay against a live body that already
+    matches this candidate's own recorded `repaired_body_sha256` (i.e. the
+    change was already applied by a prior invocation) is detected before
+    the AC4 rebase budget is spent and resolves deterministically to
+    `mutation_outcome=no_change` with no GitHub mutation dispatched.
+    """
+    root = repo_root or _find_repo_root()
+    _pf_path = Path(preflight_result_path)
+    if not _pf_path.is_absolute():
+        _pf_path = root / _pf_path
+    try:
+        result_text, _result_digest = secure_read_repair_apply_artifact(_pf_path, root=root)
+    except RepairApplySecureOpenError:
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+
+    try:
+        parsed = json.loads(result_text)
+    except json.JSONDecodeError:
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+    if not isinstance(parsed, dict):
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+
+    contract_update = parsed.get("contract_update")
+    repair_action = parsed.get("repair_action")
+    intent = resolve_repair_apply_mutation_intent(
+        contract_update=contract_update, repair_action=repair_action
+    )
+    if not intent["ok"]:
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code=intent["failure_code"]
+        )
+
+    if not isinstance(repair_action, dict) or repair_action.get("disposition") != "auto_apply_safe":
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="provenance_validation", failure_code="invalid_disposition"
+        )
+
+    candidate_body_artifact = repair_action.get("candidate_body_artifact")
+    if not candidate_body_artifact:
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+
+    raw_source_lane = repair_action.get("source_lane")
+    source_lane = raw_source_lane if raw_source_lane in {"human_context", "anchor", "unanchored"} else "unanchored"
+
+    repair_action_core_sha256 = _repair_action_core_sha256(repair_action)
+
+    _candidate_path = Path(candidate_body_artifact)
+    if not _candidate_path.is_absolute():
+        _candidate_path = root / _candidate_path
+    try:
+        candidate_body_text, candidate_digest = secure_read_repair_apply_artifact(
+            _candidate_path,
+            root=root,
+            expected_sha256=repair_action.get("repaired_body_sha256"),
+        )
+    except RepairApplySecureOpenError:
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+
+    # PR #2202 review fix (P0-2): these are nested under `repair_action.*`
+    # (and `hashes.result_core_sha256`) in the canonical
+    # refinement_preflight_result_v1 schema, never top-level `parsed.*`.
+    # Reading the wrong location made every real production artifact report
+    # null/None here (run identity + updatedAt), silently disabling the
+    # provenance binding this AC exists to enforce.
+    provenance = {
+        "repo": repo,
+        "issue_number": issue_number,
+        "original_body_sha256": repair_action.get("original_body_sha256") or "",
+        "original_updated_at": repair_action.get("original_updated_at"),
+        "preflight_run_identity": (
+            repair_action.get("preflight_run_identity")
+            or (parsed.get("hashes") if isinstance(parsed.get("hashes"), dict) else {}).get("result_core_sha256")
+        ),
+        "producer_schema_version": repair_action.get("schema_version") or "repair_action/v1",
+        "producer_policy_version": repair_action.get("policy_version") or "deterministic-issue-repair/v1",
+        "repair_action_core_sha256": repair_action_core_sha256,
+        "candidate_digest": candidate_digest,
+        "source_lane": source_lane,
+        "source_refs_digest": repair_action.get("source_refs_digest"),
+    }
+    if (
+        provenance["producer_schema_version"] != "repair_action/v1"
+        or provenance["producer_policy_version"] != "deterministic-issue-repair/v1"
+        or not provenance["original_body_sha256"]
+        or not provenance["repair_action_core_sha256"]
+        or not provenance["candidate_digest"]
+        # PR #2202 review fix-delta (P1-3): a null `original_updated_at` or
+        # `preflight_run_identity` silently disables the P0-3 ABA (A->B->A)
+        # protection (the pre-dispatch drift check falls back to a
+        # body-SHA-only comparison whenever `original_updated_at` is None --
+        # see the `updated_at_drift` computation below). Auto-apply
+        # dispatch must never proceed on that degraded protection; only a
+        # producer run that actually recorded both fields may reach
+        # transaction_execute. This closes the gap fail-closed rather than
+        # relying on the (undispatched) historical-artifact-replay comment.
+        or provenance["original_updated_at"] is None
+        or provenance["preflight_run_identity"] is None
+    ):
+        return _repair_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="provenance_validation",
+            failure_code=REPAIR_APPLY_FAILURE_PROVENANCE_UNRECONSTRUCTABLE,
+            provenance=provenance,
+        )
+
+    # AC3: bind against repo/issue identity always, and against any
+    # caller-declared expectation (run identity, core hash, candidate
+    # digest) when supplied. Fail-closed BEFORE any GitHub mutation.
+    _provenance_failure = _validate_repair_apply_provenance_binding(
+        provenance, repo=repo, issue_number=issue_number, expected_provenance=expected_provenance
+    )
+    if _provenance_failure is not None:
+        return _repair_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="provenance_validation",
+            failure_code=_provenance_failure,
+            provenance=provenance,
+        )
+
+    def _default_fetch_current():
+        current_issue, issue_error = _fetch_issue(repo, issue_number)
+        if current_issue is None:
+            raise RuntimeError(f"issue_readback_failed:{issue_error}")
+        return current_issue
+
+    fetch = fetch_current or _default_fetch_current
+    try:
+        current_issue = fetch()
+    except Exception:
+        return _repair_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="precondition_read",
+            failure_code="final_readback_unresolvable",
+            provenance=provenance,
+        )
+
+    # AC4: pre-dispatch body-drift handling. Compare the live body against
+    # the candidate's own recorded original_body_sha256. On drift, rerun the
+    # producer AT MOST ONCE against the fresh live body (never a whole-body
+    # textual rebase/diff-apply); a second drift, a non-safe disposition
+    # after rerun, or an unreconstructable rerun result fails closed with no
+    # mutation dispatched.
+    rebase_projection = {"attempted": False, "producer_reruns": 0, "drift_detected": False, "second_drift": False}
+    live_body = current_issue.get("body", "") or ""
+    live_body_digest = hashlib.sha256(live_body.encode("utf-8")).hexdigest()
+    live_updated_at = current_issue.get("updatedAt")
+    # PR #2202 review fix (P0-3): body-SHA-only drift detection allows an
+    # A(t1) -> B(t2) -> A(t3) ABA sequence through undetected (body SHA
+    # matches again at t3, but the candidate was generated against the t1
+    # authority epoch, not t3). When the producer recorded a non-null
+    # original_updated_at (fresh, post-migration artifacts), ALSO compare it
+    # against the live updatedAt; either mismatch counts as drift. Historical
+    # pre-migration artifacts with a null original_updated_at fall back to
+    # the pre-existing body-SHA-only comparison (they never recorded an
+    # updatedAt to compare against).
+    expected_updated_at = provenance.get("original_updated_at")
+    updated_at_drift = expected_updated_at is not None and live_updated_at != expected_updated_at
+    drift_detected = (
+        _repair_apply_strip_sha_prefix(live_body_digest)
+        != _repair_apply_strip_sha_prefix(repair_action.get("original_body_sha256"))
+        or updated_at_drift
+    )
+
+    if drift_detected:
+        rebase_projection["drift_detected"] = True
+
+        # AC10: replay-of-an-already-applied-change short circuit. If the
+        # live body already matches THIS candidate's own recorded target
+        # (repaired_body_sha256), the requested change was already
+        # achieved by a prior invocation (or externally) -- this is a
+        # replay, not a fresh drift that needs rebasing. Resolve
+        # deterministically to no_change WITHOUT spending the single
+        # pre-dispatch rebase budget and WITHOUT dispatching any GitHub
+        # mutation.
+        if _repair_apply_strip_sha_prefix(live_body_digest) == _repair_apply_strip_sha_prefix(
+            repair_action.get("repaired_body_sha256")
+        ):
+            return {
+                "schema_version": REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION,
+                "phase": "complete",
+                "mutation_outcome": "no_change",
+                "failure_code": None,
+                "repo": repo,
+                "issue_number": issue_number,
+                "provenance": provenance,
+                "rebase": rebase_projection,
+                "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
+                "receipt": {
+                    "patch_attempted": False,
+                    "executor_status": None,
+                    "mutation_outcome": "no_change",
+                    "failure_code": None,
+                    "final_readback": {
+                        "status": "verified",
+                        "digest": f"sha256:{live_body_digest}",
+                        "digest_class": "candidate",
+                    },
+                },
+                "fresh_validation": {
+                    "status": "not_run",
+                    "source_lane_preserved": True,
+                    "actionable_repair_remaining": None,
+                    "final_body_digest_match": None,
+                },
+                "historical_artifacts": {"physically_deleted": False, "latest_action_reference_invalidated": False},
+            }
+
+        rebase_projection["attempted"] = True
+        rebase_projection["producer_reruns"] = 1
+
+        rebase_dir = (
+            root
+            / ".claude"
+            / "artifacts"
+            / "issue-refinement-loop"
+            / str(issue_number)
+            / "repair-action-apply"
+            / "rebase"
+        )
+        rebase_dir.mkdir(parents=True, exist_ok=True)
+        rerun_fn = rerun_producer or (lambda body: _default_rerun_repair_producer(body, rebase_dir))
+        rerun_action, rerun_error = rerun_fn(live_body)
+
+        if rerun_error is not None or not isinstance(rerun_action, dict):
+            return _repair_apply_not_attempted_result(
+                repo=repo,
+                issue_number=issue_number,
+                phase="rebase",
+                failure_code=REPAIR_APPLY_FAILURE_PROVENANCE_UNRECONSTRUCTABLE,
+                provenance=provenance,
+                rebase=rebase_projection,
+            )
+        if rerun_action.get("disposition") != "auto_apply_safe" or not rerun_action.get("candidate_body_artifact"):
+            return _repair_apply_not_attempted_result(
+                repo=repo,
+                issue_number=issue_number,
+                phase="rebase",
+                failure_code=REPAIR_APPLY_FAILURE_NON_SAFE_AFTER_RERUN,
+                provenance=provenance,
+                rebase=rebase_projection,
+            )
+
+        # Second live read: detect whether the body drifted again between
+        # the rerun's basis (live_body) and now. If it did, fail closed --
+        # the single rebase budget is exhausted (post-dispatch retry stays
+        # separately budgeted at 0; this is still pre-dispatch).
+        try:
+            second_issue = fetch()
+        except Exception:
+            return _repair_apply_not_attempted_result(
+                repo=repo,
+                issue_number=issue_number,
+                phase="rebase",
+                failure_code=REPAIR_APPLY_FAILURE_PROVENANCE_UNRECONSTRUCTABLE,
+                provenance=provenance,
+                rebase=rebase_projection,
+            )
+        second_body = second_issue.get("body", "") or ""
+        second_body_digest = hashlib.sha256(second_body.encode("utf-8")).hexdigest()
+        second_updated_at = second_issue.get("updatedAt")
+        # PR #2202 review fix (P0-3): the second (post-rerun) drift check
+        # must ALSO catch an updatedAt-only change (body text happens to
+        # match the rerun's basis again, but updatedAt advanced between the
+        # rerun's basis read and this second read) -- not just a
+        # body-digest change.
+        if second_body_digest != live_body_digest or second_updated_at != live_updated_at:
+            rebase_projection["second_drift"] = True
+            return _repair_apply_not_attempted_result(
+                repo=repo,
+                issue_number=issue_number,
+                phase="rebase",
+                failure_code=REPAIR_APPLY_FAILURE_SECOND_DRIFT,
+                provenance=provenance,
+                rebase=rebase_projection,
+            )
+
+        # No second drift: the rerun's candidate is safe to dispatch.
+        # Re-read the rerun candidate through the FD-based secure reader
+        # (AC7) and rebuild provenance from the rerun repair_action, never
+        # by textually patching the original candidate.
+        rerun_candidate_path = Path(rerun_action["candidate_body_artifact"])
+        if not rerun_candidate_path.is_absolute():
+            rerun_candidate_path = root / rerun_candidate_path
+        try:
+            candidate_body_text, candidate_digest = secure_read_repair_apply_artifact(
+                rerun_candidate_path,
+                root=root,
+                expected_sha256=rerun_action.get("repaired_body_sha256"),
+            )
+        except RepairApplySecureOpenError:
+            return _repair_apply_not_attempted_result(
+                repo=repo,
+                issue_number=issue_number,
+                phase="rebase",
+                failure_code=REPAIR_APPLY_FAILURE_PROVENANCE_UNRECONSTRUCTABLE,
+                provenance=provenance,
+                rebase=rebase_projection,
+            )
+
+        repair_action = rerun_action
+        current_issue = second_issue
+        repair_action_core_sha256 = _repair_action_core_sha256(repair_action)
+        # PR #2202 review fix (P0-3): after a rerun, re-bind to the NEW body
+        # SHA, NEW updatedAt, a NEW run identity, and the new repair_action
+        # core/candidate digests -- while source_lane and source_refs_digest
+        # stay pinned to the values already in `provenance` (same underlying
+        # human-context/anchor lane; only the body/candidate were
+        # regenerated against the current authority epoch).
+        provenance = {
+            **provenance,
+            "original_body_sha256": repair_action.get("original_body_sha256") or "",
+            "original_updated_at": second_updated_at,
+            "preflight_run_identity": "sha256:"
+            + _sha256(
+                _canonical_json(
+                    {
+                        "issue_number": issue_number,
+                        "repo": repo,
+                        "original_body_sha256": repair_action.get("original_body_sha256"),
+                        "original_updated_at": second_updated_at,
+                        "source_lane": provenance.get("source_lane"),
+                        "rebase": True,
+                    }
+                )
+            ),
+            "repair_action_core_sha256": repair_action_core_sha256,
+            "candidate_digest": candidate_digest,
+        }
+
+    def _default_apply_transaction(current_issue_: dict, candidate_body: str) -> dict:
+        # Issue #2039 AC8: unlike the sibling contract_update.run.with_anchor
+        # lane (which uses the shared, non-Issue-scoped `tmp/` workspace),
+        # repair_action.apply's transaction-local scratch files live under
+        # this command_id's own declared `allowed_write_roots` entry
+        # (`.claude/artifacts/issue-refinement-loop/{issue_number}/`), so
+        # they are never reported as an unauthorized write by
+        # skill_runtime_exec.py's git-status-diff postcondition check (which
+        # has no `tmp/`-specific exemption of its own for a bare ignored
+        # directory's mere existence).
+        #
+        # PR #2202 review fix (P1-1): a FIXED issue-number-keyed scratch
+        # path here (e.g. `issue_<N>_repair_action_candidate.md`) lets two
+        # concurrent invocations for the same Issue clobber each other's
+        # candidate/input files, and -- worse -- lets another process with
+        # the same permissions pre-place a symlink at that exact,
+        # guessable path BEFORE this code ever runs, redirecting the write
+        # below to silently overwrite an arbitrary writable file
+        # elsewhere. This happens strictly upstream of
+        # `edit_issue_txn.py`'s own symlink checks, which only ever see
+        # the file we already (unsafely) wrote. Use a per-invocation
+        # random subdirectory (`tempfile.mkdtemp`, mode 0700, unguessable
+        # name) under the same allowed-write-roots base, then create each
+        # scratch file inside it via dir-FD-relative
+        # `O_CREAT|O_EXCL|O_NOFOLLOW` so we fail closed instead of
+        # following/overwriting anything unexpectedly already there.
+        _txn_base_dir = (
+            root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number) / "repair-action-apply"
+        )
+        _txn_base_dir.mkdir(parents=True, exist_ok=True)
+        _scratch_dir = Path(tempfile.mkdtemp(dir=str(_txn_base_dir)))
+        candidate_path = _scratch_dir / "repair_action_candidate.md"
+        input_path = _scratch_dir / "repair_action_txn.json"
+
+        _scratch_dir_fd = os.open(str(_scratch_dir), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            _repair_apply_scratch_create(_scratch_dir_fd, candidate_path.name, candidate_body.encode("utf-8"))
+            try:
+                return _default_apply_transaction_inner(
+                    current_issue_, candidate_body, candidate_path, input_path, _scratch_dir_fd
+                )
+            finally:
+                for _tmp_path in (candidate_path, input_path):
+                    _repair_apply_scratch_unlink(_scratch_dir_fd, _tmp_path.name)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(_scratch_dir_fd)
+            with contextlib.suppress(OSError):
+                os.rmdir(_scratch_dir)
+
+    def _default_apply_transaction_inner(
+        current_issue_: dict,
+        candidate_body: str,
+        candidate_path: Path,
+        input_path: Path,
+        _scratch_dir_fd: int,
+    ) -> dict:
+        from scope_signal_delta import build_issue_edit_txn_input
+
+        readiness_script = (
+            _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
+        )
+        try:
+            completed_readiness = subprocess.run(
+                [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
+                capture_output=True,
+                text=True,
+                shell=False,
+                timeout=REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+            readiness_stdout = completed_readiness.stdout
+        except (subprocess.TimeoutExpired, OSError):
+            # PR #2202 review fix-delta (P0-6, item 2): the readiness check
+            # never touches GitHub -- it runs strictly BEFORE
+            # edit_issue_txn.py is ever invoked below, so a
+            # TimeoutExpired/OSError here proves no mutation could possibly
+            # have been dispatched yet. It is therefore always safe to fall
+            # through to the SAME degraded-readiness fallback already used
+            # for non-JSON readiness stdout below (never a fabricated
+            # "verified"/"unresolved" readiness signal, and never routed
+            # into the mutation-side `unknown` handling this is not).
+            readiness_stdout = ""
+        try:
+            readiness = json.loads(readiness_stdout)
+        except json.JSONDecodeError:
+            readiness = {}
+        if not isinstance(readiness, dict):
+            readiness = {}
+        readiness.setdefault("status", "input_or_runtime_error")
+        readiness.setdefault("body_sha256", f"sha256:{_sha256(candidate_body)}")
+        readiness.setdefault("source_checks", [])
+        readiness.setdefault("errors", [])
+        readiness["readiness_result_ref"] = "transaction-local"
+        readiness_forwarding = {
+            key: readiness[key]
+            for key in (
+                "status",
+                "body_sha256",
+                "source_checks",
+                "errors",
+                "readiness_result_ref",
+                "resolution_evidence",
+            )
+            if key in readiness
+        }
+
+        transaction_input = build_issue_edit_txn_input(
+            issue_number=issue_number,
+            repo=repo,
+            previous_body_sha256=f"sha256:{_sha256(current_issue_.get('body', ''))}",
+            previous_updated_at=current_issue_["updatedAt"],
+            new_body_file=str(candidate_path.relative_to(root)),
+            readiness_result=readiness_forwarding,
+        )
+        # PR #2202 review fix (P1-1): dir-FD-relative O_CREAT|O_EXCL create
+        # (see `_default_apply_transaction`'s docstring comment above for
+        # the full rationale) instead of a plain `Path.write_text()` at a
+        # fixed, guessable pathname.
+        _repair_apply_scratch_create(
+            _scratch_dir_fd, input_path.name, json.dumps(transaction_input, ensure_ascii=False).encode("utf-8")
+        )
+
+        def _unknown_dispatch_txn_result(error_code: str, message: str) -> dict:
+            # PR #2202 review fix-delta (P0-6): a genuinely-unconfirmed
+            # outcome detected HERE (never through a raw-executor receipt)
+            # still followed an actual edit_issue_txn.py subprocess
+            # invocation attempt, so `content_update.patch_attempted=True`
+            # is set (mirroring the canonical ISSUE_EDIT_TXN_RESULT_V1
+            # `mutation_outcome_unknown` shape) so AC9 fresh validation
+            # still runs after this outcome, exactly as it would for a
+            # genuine executor-reported unknown receipt.
+            return {
+                "status": "mutation_outcome_unknown",
+                "content_update": {"patch_attempted": True, "mutation_outcome": "unknown"},
+                "errors": [{"code": error_code, "message": message[:200]}],
+            }
+
+        # AC11: the ONLY GitHub-mutation subprocess this consumer ever
+        # invokes is edit_issue_txn.py --input-file. No `gh issue edit`
+        # call exists anywhere in this function.
+        transaction_script = _SCRIPTS_DIR.parent.parent / EDIT_ISSUE_TXN_SCRIPT_REL
+        try:
+            completed = subprocess.run(
+                [sys.executable, str(transaction_script), "--input-file", str(input_path.relative_to(root))],
+                capture_output=True,
+                text=True,
+                shell=False,
+                cwd=str(root),
+                timeout=REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # PR #2202 review fix-delta (P0-6, items 2+3): this is the ONLY
+            # subprocess this consumer ever invokes to dispatch a real
+            # GitHub PATCH (AC11). `subprocess.run(timeout=...)` kills the
+            # child only AFTER the timeout has already elapsed, so a
+            # TimeoutExpired here does NOT prove the PATCH never reached
+            # GitHub -- the child (or GitHub itself) may already have
+            # applied it. Reporting this as "no mutation" would be an
+            # unsafe mis-report of a non-retriable PATCH (review P0-6 item
+            # 3), so this is always routed to the SAME
+            # `mutation_outcome_unknown` status the executor itself uses to
+            # signal an unconfirmed outcome -- never a degraded
+            # `failed_no_mutation` shortcut. `_repair_receipt_from_txn_result`
+            # maps this to `mutation_outcome=unknown` and triggers the
+            # existing AC5 single authoritative-readback path.
+            return _unknown_dispatch_txn_result("txn_subprocess_timeout", str(exc))
+        except OSError as exc:
+            # Same reasoning as the TimeoutExpired branch above: an OSError
+            # raised by subprocess.run() itself (e.g. a transient OS-level
+            # wait/communicate failure) after the call has already been
+            # made does not prove the PATCH was never dispatched.
+            return _unknown_dispatch_txn_result("txn_subprocess_oserror", str(exc))
+        try:
+            txn_result = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            # PR #2202 review fix-delta (P0-6, item 3): stdout being empty,
+            # truncated, or non-JSON AFTER the subprocess call above has
+            # already completed does NOT prove no mutation happened -- the
+            # child may have dispatched the PATCH and then failed to
+            # flush/emit its own confirmation. Degrading this to
+            # `failed_no_mutation` (the prior behavior) risked silently
+            # reporting "no mutation" after a real, non-retriable PATCH.
+            # This must resolve to `unknown` and route into the SAME AC5
+            # authoritative-readback path used for a genuine executor-
+            # reported `mutation_outcome_unknown` receipt.
+            txn_result = _unknown_dispatch_txn_result("txn_stdout_not_json", completed.stderr or "")
+        # Same reasoning: a parsed-but-non-dict stdout shape still followed
+        # a completed subprocess call, so it must not be reported as
+        # `failed_no_mutation` either.
+        return txn_result if isinstance(txn_result, dict) else _unknown_dispatch_txn_result(
+            "txn_stdout_not_dict", "parsed stdout JSON was not a dict"
+        )
+
+    apply_fn = apply_transaction or _default_apply_transaction
+    txn_result = apply_fn(current_issue, candidate_body_text)
+
+    def _resolve_readback() -> "str | None":
+        # AC5: a single authoritative read (never a mutation retry) used
+        # only when the transaction result itself carried no
+        # remote_current_body_sha256.
+        fresh_issue = fetch()
+        return f"sha256:{_sha256(fresh_issue.get('body', '') or '')}"
+
+    receipt = _repair_receipt_from_txn_result(
+        txn_result,
+        candidate_digest=candidate_digest,
+        old_digest=live_body_digest,
+        resolve_readback=_resolve_readback,
+    )
+    mutation_outcome = receipt["mutation_outcome"]
+    # AC6: phase/mutation_outcome/failure_code stay separate fields; an
+    # `unknown` outcome (executor could not itself confirm the result) never
+    # reaches phase=complete (schema-enforced invariant).
+    phase = "complete" if mutation_outcome in {"applied", "no_change", "not_attempted"} else "final_readback"
+    failure_code = receipt["failure_code"]
+
+    # AC9: fresh validation only runs after an attempt that actually
+    # reached transaction dispatch (patch_attempted) -- a not_attempted
+    # outcome never touched GitHub, so there is nothing post-mutation to
+    # validate, and fresh_validation stays not_run.
+    if receipt.get("patch_attempted"):
+        expected_digest = _repair_apply_expected_post_mutation_digest(
+            mutation_outcome=mutation_outcome,
+            receipt=receipt,
+            candidate_digest=candidate_digest,
+            old_digest=live_body_digest,
+        )
+        fresh_validate_fn = fresh_validate or (
+            lambda body: _default_fresh_validate_producer(
+                body, source_lane, anchor_url=fresh_anchor_url, known_context=fresh_known_context
+            )
+        )
+        fresh_validation = _run_repair_apply_fresh_validation(
+            fetch=fetch,
+            producer=fresh_validate_fn,
+            expected_source_lane=source_lane,
+            expected_digest=expected_digest,
+        )
+    else:
+        fresh_validation = {
+            "status": "not_run",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": None,
+        }
+
+    # PR #2202 review fix-delta (P0-5): a fresh-validation failure that
+    # follows an otherwise-`complete` phase (applied/no_change) must be
+    # surfaced -- it must not be silently absorbed into
+    # phase=complete/failure_code=null. `mutation_outcome` itself is left
+    # untouched: it is a fact about GitHub state (the mutation genuinely
+    # happened or did not), separate from this post-mutation consistency
+    # check.
+    if fresh_validation["status"] == "failed" and phase == "complete":
+        phase = "fresh_validation"
+        failure_code = (
+            "source_lane_mismatch" if fresh_validation["source_lane_preserved"] is False else "fresh_validation_failed"
+        )
+
+    return {
+        "schema_version": REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION,
+        "phase": phase,
+        "mutation_outcome": mutation_outcome,
+        "failure_code": failure_code,
+        "repo": repo,
+        "issue_number": issue_number,
+        "provenance": provenance,
+        "rebase": rebase_projection,
+        "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
+        "receipt": receipt,
+        "fresh_validation": fresh_validation,
+        "historical_artifacts": {
+            "physically_deleted": False,
+            "latest_action_reference_invalidated": mutation_outcome == "applied",
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4384,6 +6008,24 @@ def run_preflight(
     # repair_result is included in the preflight output as repair_diagnostics (BLOCKER 1 fix).
     _repair_result = _invoke_repair(issue.get("body", "") or "")
 
+    # PR #2202 review fix (P0-2): capture the repair_action.apply provenance
+    # fields (source lane, run identity, live updatedAt, source refs digest)
+    # at THIS producer run's own capture time, so a downstream
+    # repair_action.apply consumer can bind against them instead of silently
+    # seeing null/None (the schema already carries these under
+    # `repair_action.*`; this producer previously never populated them).
+    _repair_captured_at = now or _now_iso()
+    _repair_original_updated_at = issue.get("updatedAt") if isinstance(issue, dict) else None
+    _repair_source_lane = _determine_repair_source_lane(anchor_url_for_consumer, known_context)
+    _repair_source_refs_digest_value = _repair_source_refs_digest(_repair_source_lane, anchor_url_for_consumer)
+    _repair_preflight_run_identity_value = _repair_preflight_run_identity(
+        issue_number=issue_number,
+        repo=repo,
+        original_body_sha256=_sha256(issue.get("body", "") or ""),
+        captured_at=_repair_captured_at,
+        source_lane=_repair_source_lane,
+    )
+
     # Issue #2016 iteration-3 P1-3 (OWNER adversarial review): a repair
     # subprocess-level failure must dominate a *later* planner failure.
     # Established precedence (see _apply_exit_code_mapping docstring):
@@ -4921,6 +6563,13 @@ def run_preflight(
                 "candidate_body_artifact": _candidate_body_artifact,
                 "repair_kinds": _repair_action_raw.get("repair_kinds", []),
                 "reason_codes": _repair_action_raw.get("reason_codes", []),
+                # PR #2202 review fix (P0-2): AC9 provenance-lane fields
+                # (previously always absent, silently defeating
+                # repair_action.apply's provenance binding).
+                "source_lane": _repair_source_lane,
+                "preflight_run_identity": _repair_preflight_run_identity_value,
+                "original_updated_at": _repair_original_updated_at,
+                "source_refs_digest": _repair_source_refs_digest_value,
             }
             repair_needs_fix = True
     elif _repair_changed is True and repair_artifact_path is not None:
@@ -5784,6 +7433,18 @@ def main(argv: list[str] | None = None) -> None:
         "(and optionally `known_context`).",
     )
 
+    parser.add_argument(
+        "--apply-repair-action",
+        type=Path,
+        default=None,
+        metavar="PREFLIGHT_RESULT_JSON_PATH",
+        help="Issue #2039 AC8/AC11: read a previously-produced preflight result "
+        "JSON artifact (FD-based secure open), resolve the exactly-one mutation "
+        "intent, and -- only when repair_action.disposition == auto_apply_safe -- "
+        "dispatch the repaired body through edit_issue_txn.py --input-file "
+        "(never a raw `gh issue edit` call). Requires --issue-number, --repo.",
+    )
+
     args = parser.parse_args(argv)
 
     # #2053: producer / consumer dedicated CLI modes -- bypass the full
@@ -5811,6 +7472,59 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(EXIT_ENVIRONMENT_FAILURE)
         print(json.dumps({"status": "ok", **result}, ensure_ascii=False, indent=2, sort_keys=True))
         sys.exit(0)
+
+    if args.apply_repair_action is not None:
+        # PR #2202 review fix (P0-2 bullet 3): the production CLI entrypoint
+        # previously never constructed `expected_provenance` at all -- only
+        # test code injected it -- so the provenance-binding check inside
+        # run_repair_action_apply() was effectively unreachable in
+        # production beyond its own always-on repo/issue self-consistency
+        # check. Derive it here from the SAME artifact's own
+        # producer-emitted provenance fields (secure-read via the same
+        # FD-based reader run_repair_action_apply() itself uses) plus the
+        # live repo/issue identity this invocation was given, so a
+        # mid-flight artifact replacement between this read and
+        # run_repair_action_apply()'s own internal read is still caught as
+        # a mismatch rather than silently accepted.
+        _cli_repo_root = _find_repo_root()
+        _cli_expected_provenance: "dict | None" = None
+        try:
+            _cli_pf_path = Path(str(args.apply_repair_action))
+            if not _cli_pf_path.is_absolute():
+                _cli_pf_path = _cli_repo_root / _cli_pf_path
+            _cli_text, _ = secure_read_repair_apply_artifact(_cli_pf_path, root=_cli_repo_root)
+            _cli_parsed = json.loads(_cli_text)
+            _cli_repair_action = _cli_parsed.get("repair_action") if isinstance(_cli_parsed, dict) else None
+            if isinstance(_cli_repair_action, dict):
+                _cli_expected_provenance = {
+                    "repo": args.repo,
+                    "issue_number": args.issue_number,
+                    "preflight_run_identity": _cli_repair_action.get("preflight_run_identity"),
+                    "original_body_sha256": _cli_repair_action.get("original_body_sha256"),
+                    "repair_action_core_sha256": _repair_action_core_sha256(_cli_repair_action),
+                }
+        except (RepairApplySecureOpenError, json.JSONDecodeError, OSError):
+            _cli_expected_provenance = None
+
+        result = run_repair_action_apply(
+            repo=args.repo,
+            issue_number=args.issue_number,
+            preflight_result_path=str(args.apply_repair_action),
+            expected_provenance=_cli_expected_provenance,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        outcome = result.get("mutation_outcome")
+        # PR #2202 review fix-delta (P0-5): a real fresh-validation failure
+        # (phase == "fresh_validation" with a non-null failure_code) must
+        # exit non-zero even when the mutation itself genuinely applied --
+        # mutation_outcome alone previously hid this failure behind exit 0.
+        if result.get("phase") == "fresh_validation" and result.get("failure_code"):
+            sys.exit(EXIT_ENVIRONMENT_FAILURE)
+        if outcome in {"applied", "no_change"}:
+            sys.exit(0)
+        if outcome == "not_attempted":
+            sys.exit(EXIT_BLOCKED)
+        sys.exit(EXIT_ENVIRONMENT_FAILURE)
 
     if args.consume_authority_transport is not None:
         _repo_root = _find_repo_root()
