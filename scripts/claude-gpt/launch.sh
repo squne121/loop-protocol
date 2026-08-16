@@ -96,6 +96,56 @@ done
 
 # --- 以降 "$@" は `--` の後ろに来た claude 追加引数そのもの。文字列へ結合して再分割しない。 ---
 
+# --- caller argv 正規化: launcher-level `--` 直後から始まる連続した exact
+#     --strict-mcp-config トークンの leading run のみを安全に削除する pre-filter
+#     （Issue #2189, Provenance Correction 反映）。
+#
+#     当初は「Herdr が claude-kind agent 起動時に exact --strict-mcp-config を常時
+#     付与する」という前提で、caller argv 中の任意位置から無条件に当該トークンを
+#     削除する実装だった。しかし Herdr v0.8.0 upstream source・ローカル installed
+#     binary・現行 run_worktree_agent_runtime_smoke.py のいずれにも、この flag を
+#     自動注入する経路は存在しないことが判明し、その前提は撤回された
+#     （Issue #2189 Provenance Correction 節参照）。一方で、任意位置からの無条件削除
+#     実装そのものには、provenance とは独立に実機で再現された本物のバグが存在した
+#     （`-p <value>` の値・downstream `--` より後の positional literal・
+#     `--append-system-prompt` 等任意文字列を受けるオプションの値として渡された同一
+#     文字列を誤って削除してしまう。Issue #2189 Live Reproduction 節で実 Claude Code
+#     binary に対して再現済み）。
+#
+#     このため、削除対象を launcher-level `--` 直後の位置から始まる「先頭からの
+#     連続した run」のみに限定する。run の走査中に exact 一致しないトークンが
+#     1つでも現れた時点でそこで走査を終了し、それ以降のトークン（そのトークン自身、
+#     downstream の `--`、値、prompt 等すべてを含む）には一切触れず無条件で保持する。
+#     これにより、run の先頭にない --strict-mcp-config（オプション値・downstream
+#     positional literal 等）は削除対象にならず安全側に倒れる。
+#
+#     削除対象は完全一致トークン `--strict-mcp-config` のみ（run 内に重複があれば
+#     全て削除）。値付き variant（`--strict-mcp-config=...`）、大文字小文字違い
+#     （`--Strict-Mcp-Config` 等）、部分文字列を含む別トークン
+#     （`--strict-mcp-config-evil` 等）は run の一致判定に使わず、run を止めた上で
+#     下段の forbidden-flag チェックへそのまま残す（forbidden 判定または unknown
+#     flag 判定に落ちる）。
+#     POSIX sh の positional parameter を quoted "$@" のまま for/set -- で再構築する
+#     （bash 配列・unquoted $@・`case ... *)` glob match は使わない。exact-match のみ）。
+CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED=false
+CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STOPPED=false
+for arg in "$@"; do
+  if [ "$CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STOPPED" = "false" ] && [ "$arg" = "--strict-mcp-config" ]; then
+    continue
+  fi
+  # leading run はここで終了する。以降の全トークンは無条件で保持する。
+  CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STOPPED=true
+  if [ "$CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED" = "false" ]; then
+    set -- "$arg"
+    CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED=true
+  else
+    set -- "$@" "$arg"
+  fi
+done
+if [ "$CLAUDE_GPT_STRICT_MCP_CONFIG_PREFILTER_STARTED" = "false" ]; then
+  set --
+fi
+
 # --- policy-weakening flag 拒否（P1-1）。呼び出し元が --settings / --mcp-config /
 #     --strict-mcp-config / --dangerously-skip-permissions で launcher の安全設定を
 #     上書きすることを拒否する。--permission-mode bypassPermissions も拒否する。 ---
@@ -119,6 +169,16 @@ for arg in "$@"; do
   case "$arg" in
     --permission-mode=bypassPermissions)
       printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"policy_weakening_flag_rejected","flag":"--permission-mode=bypassPermissions"}\n' >&2
+      exit 2
+      ;;
+  esac
+  # --strict-mcp-config=...（値付き variant。Issue #2189）。boolean flag のため
+  # 値を取る形は正当な用法ではなく、pre-filter が削除する exact トークン
+  # （値なし `--strict-mcp-config`）とは別に、この variant は forbidden のまま残す
+  # （CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS には含めず、この専用チェックで拒否する）。
+  case "$arg" in
+    --strict-mcp-config=*)
+      printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"policy_weakening_flag_rejected","flag":"--strict-mcp-config=..."}\n' >&2
       exit 2
       ;;
   esac
