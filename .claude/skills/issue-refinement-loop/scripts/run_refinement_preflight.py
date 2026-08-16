@@ -354,15 +354,18 @@ def _canonical_json(obj: Any) -> str:
 # Issue #2039: repair_action.apply controlled consumer -- foundational
 # building blocks. (REPAIR_APPLY_BLOCK_MARKER_ISSUE_2039)
 #
-# NOTE (partial implementation): the two units below (FD-based secure
-# artifact reader for AC7, and the exactly-one mutation-intent arbiter core
-# for AC1) are implemented and unit-tested in isolation. They are NOT yet
-# wired into command_registry.py / skill_runtime_command_policy.py /
-# skill_runtime_exec.py, and the remaining AC2-AC6, AC8-AC11 surface
-# (schema migration, provenance binding, retry-budget separation, lossless
-# receipt projection, fresh-validation lane preservation, historical
-# artifact immutability, and registry/policy/executor wiring) is not yet
-# implemented. See PR body / IMPLEMENT_RESULT_V1 for status.
+# NOTE (partial implementation): the FD-based secure artifact reader (AC7),
+# the exactly-one mutation-intent arbiter core (AC1), and the schema
+# migration (AC2, repair_apply_result_v1.schema.json /
+# refinement_preflight_result_v1.schema.json) are implemented. AC8/AC11 are
+# now wired: run_repair_action_apply() below is registered as the
+# `repair_action.apply` command_id in command_registry.py /
+# skill_runtime_command_policy.py, dispatched by skill_runtime_exec.py, and
+# constrained to stdout_contract `repair_apply_result/v1`. The full AC3-6/
+# AC9/AC10 provenance-rebase/retry/fresh-validation/historical-artifact
+# surface remains a deliberate scope gap of this iteration -- see
+# run_repair_action_apply()'s own docstring. See PR body / IMPLEMENT_RESULT_V1
+# for status.
 # ---------------------------------------------------------------------------
 
 
@@ -572,6 +575,379 @@ def resolve_repair_apply_mutation_intent(
         "failure_code": REPAIR_APPLY_FAILURE_NO_MUTATION_INTENT,
         "mutation_outcome": "not_attempted",
         "reason": "Neither contract_patch_plan nor repair_action is present.",
+    }
+
+
+REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION = "repair_apply_result/v1"
+EDIT_ISSUE_TXN_SCRIPT_REL = "edit-issue/scripts/edit_issue_txn.py"
+
+
+def _repair_apply_not_attempted_result(
+    *,
+    repo: str,
+    issue_number: int,
+    phase: str,
+    failure_code: "str | None",
+    provenance: "dict | None" = None,
+) -> dict:
+    """Issue #2039 AC8/AC11: shared not_attempted stdout-contract shape for
+    every early-exit branch of run_repair_action_apply() (multiple intent,
+    no intent, non-safe disposition, unreadable candidate, readback
+    failure). Never emits a GitHub mutation."""
+    return {
+        "schema_version": REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION,
+        "phase": phase,
+        "mutation_outcome": "not_attempted",
+        "failure_code": failure_code,
+        "repo": repo,
+        "issue_number": issue_number,
+        "provenance": provenance
+        or {
+            "repo": repo,
+            "issue_number": issue_number,
+            "original_body_sha256": "",
+            "original_updated_at": None,
+            "preflight_run_identity": None,
+            "producer_schema_version": "repair_action/v1",
+            "producer_policy_version": "deterministic-issue-repair/v1",
+            "repair_action_core_sha256": "",
+            "candidate_digest": "",
+            "source_lane": "unanchored",
+            "source_refs_digest": None,
+        },
+        "rebase": {
+            "attempted": False,
+            "producer_reruns": 0,
+            "drift_detected": False,
+            "second_drift": False,
+        },
+        "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
+        "receipt": {
+            "patch_attempted": False,
+            "executor_status": None,
+            "mutation_outcome": "not_attempted",
+            "failure_code": failure_code,
+            "final_readback": {"status": "not_applicable", "digest": None, "digest_class": "not_applicable"},
+        },
+        "fresh_validation": {
+            "status": "not_run",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": None,
+        },
+        "historical_artifacts": {"physically_deleted": False, "latest_action_reference_invalidated": False},
+    }
+
+
+def _repair_receipt_from_txn_result(txn_result: dict) -> dict:
+    """Issue #2039 AC6: lossless projection of edit_issue_txn.py's
+    ISSUE_EDIT_TXN_RESULT_V1 receipt into the repair_apply_result/v1
+    receipt shape. `unknown` is preserved, never collapsed into
+    failed/not_attempted/no_change."""
+    status = txn_result.get("status")
+    mutation_outcome_map = {
+        "ok": "applied",
+        "no_change": "no_change",
+        "failed_no_mutation": "not_attempted",
+        "human_judgment": "not_attempted",
+        "mutation_outcome_unknown": "unknown",
+        "failed_after_mutation": "unknown",
+    }
+    mutation_outcome = mutation_outcome_map.get(status, "unknown")
+    patch_attempted = bool(txn_result.get("body_attempted") or txn_result.get("mutation_started"))
+    failure_code = None
+    if mutation_outcome == "unknown":
+        failure_code = "final_readback_unresolvable"
+    elif mutation_outcome == "not_attempted" and (txn_result.get("errors") or []):
+        failure_code = "transaction_execute_error"
+    remote_sha = txn_result.get("remote_current_body_sha256")
+    final_readback = {
+        "status": "verified" if remote_sha else "unresolved",
+        "digest": remote_sha,
+        "digest_class": "unknown" if remote_sha else "not_applicable",
+    }
+    return {
+        "patch_attempted": patch_attempted,
+        "executor_status": status,
+        "mutation_outcome": mutation_outcome,
+        "failure_code": failure_code,
+        "final_readback": final_readback,
+    }
+
+
+def run_repair_action_apply(
+    *,
+    repo: str,
+    issue_number: int,
+    preflight_result_path: str,
+    repo_root: "Path | None" = None,
+    fetch_current=None,
+    apply_transaction=None,
+) -> dict:
+    """Issue #2039 AC8/AC11: `repair_action.apply` controlled consumer.
+
+    Reads a previously-produced preflight result artifact via the FD-based
+    secure reader (AC7), resolves the exactly-one mutation intent (AC1),
+    and -- only when the intent is `repair_action` with
+    `disposition == auto_apply_safe` -- dispatches the repaired body
+    through the existing `edit_issue_txn.py` controlled transaction script
+    (a real subprocess call; never a raw `gh issue edit` call -- AC11).
+
+    Scope note (this iteration wires AC8/AC11 -- the registry / policy /
+    parser / executor / stdout-contract surface -- with a real,
+    non-fixture subprocess dispatch path). Pre-dispatch rebase-on-drift
+    (AC4), full provenance cross-Issue/old-run/replacement rejection
+    (AC3), post-dispatch authoritative-readback digest classification
+    (AC5), and lane-preserving fresh validation (AC9) are intentionally
+    NOT implemented here (out of this iteration's declared scope):
+    `rebase` is always the untried default, `fresh_validation.status` is
+    always `not_run`, and `provenance` is populated from the candidate
+    artifact's own self-reported fields without a second, independent
+    live-Issue cross-check. The returned payload never claims a
+    verification step it did not actually perform.
+    """
+    root = repo_root or _find_repo_root()
+    _pf_path = Path(preflight_result_path)
+    if not _pf_path.is_absolute():
+        _pf_path = root / _pf_path
+    try:
+        result_text, _result_digest = secure_read_repair_apply_artifact(_pf_path, root=root)
+    except RepairApplySecureOpenError:
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+
+    try:
+        parsed = json.loads(result_text)
+    except json.JSONDecodeError:
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+    if not isinstance(parsed, dict):
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+
+    contract_patch_plan = parsed.get("contract_patch_plan")
+    repair_action = parsed.get("repair_action")
+    intent = resolve_repair_apply_mutation_intent(
+        contract_patch_plan=contract_patch_plan, repair_action=repair_action
+    )
+    if not intent["ok"]:
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code=intent["failure_code"]
+        )
+
+    if not isinstance(repair_action, dict) or repair_action.get("disposition") != "auto_apply_safe":
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="provenance_validation", failure_code="invalid_disposition"
+        )
+
+    candidate_body_artifact = repair_action.get("candidate_body_artifact")
+    if not candidate_body_artifact:
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+
+    raw_source_lane = parsed.get("source_lane")
+    source_lane = raw_source_lane if raw_source_lane in {"human_context", "anchor", "unanchored"} else "unanchored"
+
+    repair_action_core = {
+        "schema_version": repair_action.get("schema_version"),
+        "policy_version": repair_action.get("policy_version"),
+        "disposition": repair_action.get("disposition"),
+        "original_body_sha256": repair_action.get("original_body_sha256"),
+        "repaired_body_sha256": repair_action.get("repaired_body_sha256"),
+        "repair_kinds": repair_action.get("repair_kinds"),
+        "reason_codes": repair_action.get("reason_codes"),
+    }
+    repair_action_core_sha256 = hashlib.sha256(
+        json.dumps(repair_action_core, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+    _candidate_path = Path(candidate_body_artifact)
+    if not _candidate_path.is_absolute():
+        _candidate_path = root / _candidate_path
+    try:
+        candidate_body_text, candidate_digest = secure_read_repair_apply_artifact(
+            _candidate_path,
+            root=root,
+            expected_sha256=repair_action.get("repaired_body_sha256"),
+        )
+    except RepairApplySecureOpenError:
+        return _repair_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+
+    provenance = {
+        "repo": repo,
+        "issue_number": issue_number,
+        "original_body_sha256": repair_action.get("original_body_sha256") or "",
+        "original_updated_at": parsed.get("original_updated_at"),
+        "preflight_run_identity": parsed.get("result_core_sha256") or parsed.get("preflight_run_identity"),
+        "producer_schema_version": repair_action.get("schema_version") or "repair_action/v1",
+        "producer_policy_version": repair_action.get("policy_version") or "deterministic-issue-repair/v1",
+        "repair_action_core_sha256": repair_action_core_sha256,
+        "candidate_digest": candidate_digest,
+        "source_lane": source_lane,
+        "source_refs_digest": parsed.get("source_refs_digest"),
+    }
+    if (
+        provenance["producer_schema_version"] != "repair_action/v1"
+        or provenance["producer_policy_version"] != "deterministic-issue-repair/v1"
+    ):
+        return _repair_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="provenance_validation",
+            failure_code="provenance_unreconstructable",
+            provenance=provenance,
+        )
+
+    def _default_fetch_current():
+        current_issue, issue_error = _fetch_issue(repo, issue_number)
+        if current_issue is None:
+            raise RuntimeError(f"issue_readback_failed:{issue_error}")
+        return current_issue
+
+    fetch = fetch_current or _default_fetch_current
+    try:
+        current_issue = fetch()
+    except Exception:
+        return _repair_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="precondition_read",
+            failure_code="final_readback_unresolvable",
+            provenance=provenance,
+        )
+
+    def _default_apply_transaction(current_issue_: dict, candidate_body: str) -> dict:
+        from scope_signal_delta import build_issue_edit_txn_input
+
+        # Issue #2039 AC8: unlike the sibling contract_update.run.with_anchor
+        # lane (which uses the shared, non-Issue-scoped `tmp/` workspace),
+        # repair_action.apply's transaction-local scratch files live under
+        # this command_id's own declared `allowed_write_roots` entry
+        # (`.claude/artifacts/issue-refinement-loop/{issue_number}/`), so
+        # they are never reported as an unauthorized write by
+        # skill_runtime_exec.py's git-status-diff postcondition check (which
+        # has no `tmp/`-specific exemption of its own for a bare ignored
+        # directory's mere existence).
+        _txn_dir = root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number) / "repair-action-apply"
+        candidate_path = _txn_dir / f"issue_{issue_number}_repair_action_candidate.md"
+        input_path = _txn_dir / f"issue_{issue_number}_repair_action_txn.json"
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        candidate_path.write_text(candidate_body, encoding="utf-8")
+
+        try:
+            return _default_apply_transaction_inner(current_issue_, candidate_body, candidate_path, input_path)
+        finally:
+            for _tmp_path in (candidate_path, input_path):
+                try:
+                    _tmp_path.unlink()
+                except OSError:
+                    pass
+
+    def _default_apply_transaction_inner(
+        current_issue_: dict, candidate_body: str, candidate_path: Path, input_path: Path
+    ) -> dict:
+        from scope_signal_delta import build_issue_edit_txn_input
+
+        readiness_script = (
+            _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
+        )
+        completed_readiness = subprocess.run(
+            [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=30,
+        )
+        try:
+            readiness = json.loads(completed_readiness.stdout)
+        except json.JSONDecodeError:
+            readiness = {}
+        if not isinstance(readiness, dict):
+            readiness = {}
+        readiness.setdefault("status", "input_or_runtime_error")
+        readiness.setdefault("body_sha256", f"sha256:{_sha256(candidate_body)}")
+        readiness.setdefault("source_checks", [])
+        readiness.setdefault("errors", [])
+        readiness["readiness_result_ref"] = "transaction-local"
+        readiness_forwarding = {
+            key: readiness[key]
+            for key in (
+                "status",
+                "body_sha256",
+                "source_checks",
+                "errors",
+                "readiness_result_ref",
+                "resolution_evidence",
+            )
+            if key in readiness
+        }
+
+        transaction_input = build_issue_edit_txn_input(
+            issue_number=issue_number,
+            repo=repo,
+            previous_body_sha256=f"sha256:{_sha256(current_issue_.get('body', ''))}",
+            previous_updated_at=current_issue_["updatedAt"],
+            new_body_file=str(candidate_path.relative_to(root)),
+            readiness_result=readiness_forwarding,
+        )
+        input_path.write_text(json.dumps(transaction_input, ensure_ascii=False), encoding="utf-8")
+
+        # AC11: the ONLY GitHub-mutation subprocess this consumer ever
+        # invokes is edit_issue_txn.py --input-file. No `gh issue edit`
+        # call exists anywhere in this function.
+        transaction_script = _SCRIPTS_DIR.parent.parent / EDIT_ISSUE_TXN_SCRIPT_REL
+        completed = subprocess.run(
+            [sys.executable, str(transaction_script), "--input-file", str(input_path.relative_to(root))],
+            capture_output=True,
+            text=True,
+            shell=False,
+            cwd=str(root),
+            timeout=60,
+        )
+        try:
+            txn_result = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            txn_result = {
+                "status": "failed_no_mutation",
+                "errors": [{"code": "txn_stdout_not_json", "message": (completed.stderr or "")[:200]}],
+            }
+        return txn_result if isinstance(txn_result, dict) else {"status": "failed_no_mutation"}
+
+    apply_fn = apply_transaction or _default_apply_transaction
+    txn_result = apply_fn(current_issue, candidate_body_text)
+
+    receipt = _repair_receipt_from_txn_result(txn_result)
+    mutation_outcome = receipt["mutation_outcome"]
+    phase = "complete" if mutation_outcome in {"applied", "no_change", "not_attempted"} else "transaction_execute"
+    failure_code = receipt["failure_code"]
+
+    return {
+        "schema_version": REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION,
+        "phase": phase,
+        "mutation_outcome": mutation_outcome,
+        "failure_code": failure_code,
+        "repo": repo,
+        "issue_number": issue_number,
+        "provenance": provenance,
+        "rebase": {"attempted": False, "producer_reruns": 0, "drift_detected": False, "second_drift": False},
+        "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
+        "receipt": receipt,
+        "fresh_validation": {
+            "status": "not_run",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": None,
+        },
+        "historical_artifacts": {
+            "physically_deleted": False,
+            "latest_action_reference_invalidated": mutation_outcome == "applied",
+        },
     }
 
 
@@ -6011,6 +6387,18 @@ def main(argv: list[str] | None = None) -> None:
         "(and optionally `known_context`).",
     )
 
+    parser.add_argument(
+        "--apply-repair-action",
+        type=Path,
+        default=None,
+        metavar="PREFLIGHT_RESULT_JSON_PATH",
+        help="Issue #2039 AC8/AC11: read a previously-produced preflight result "
+        "JSON artifact (FD-based secure open), resolve the exactly-one mutation "
+        "intent, and -- only when repair_action.disposition == auto_apply_safe -- "
+        "dispatch the repaired body through edit_issue_txn.py --input-file "
+        "(never a raw `gh issue edit` call). Requires --issue-number, --repo.",
+    )
+
     args = parser.parse_args(argv)
 
     # #2053: producer / consumer dedicated CLI modes -- bypass the full
@@ -6038,6 +6426,20 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(EXIT_ENVIRONMENT_FAILURE)
         print(json.dumps({"status": "ok", **result}, ensure_ascii=False, indent=2, sort_keys=True))
         sys.exit(0)
+
+    if args.apply_repair_action is not None:
+        result = run_repair_action_apply(
+            repo=args.repo,
+            issue_number=args.issue_number,
+            preflight_result_path=str(args.apply_repair_action),
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        outcome = result.get("mutation_outcome")
+        if outcome in {"applied", "no_change"}:
+            sys.exit(0)
+        if outcome == "not_attempted":
+            sys.exit(EXIT_BLOCKED)
+        sys.exit(EXIT_ENVIRONMENT_FAILURE)
 
     if args.consume_authority_transport is not None:
         _repo_root = _find_repo_root()

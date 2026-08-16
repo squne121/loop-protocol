@@ -569,6 +569,39 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "anchor_context_file": {"type": "path", "required": False, "optional_flag_pair": True},
         },
     },
+    # Issue #2039 AC8/AC11: `repair_action.apply` controlled consumer --
+    # bridges a repair_issue_contract.py auto_apply_safe candidate to a
+    # controlled edit_issue_txn.py Issue-body mutation. Fixed repo-root cwd,
+    # `mutation: true`, `network_effect: github_mutation` (this command's
+    # default execution path performs a real GitHub Issue mutation via
+    # edit_issue_txn.py, never a raw `gh issue edit` call). stdout is
+    # constrained to `repair_apply_result/v1`.
+    "repair_action.apply": {
+        "id": "repair_action.apply",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--apply-repair-action", "{preflight_result_path}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_repair_action_apply",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_mutation",
+        "stdin_contract": "none",
+        "stdout_contract": "repair_apply_result/v1",
+        "timeout_seconds": 60,
+        "mutation": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "preflight_result_path": {"type": "path", "required": True},
+        },
+    },
     "gh.issue.view": {
         "id": "gh.issue.view",
         "argv": [
