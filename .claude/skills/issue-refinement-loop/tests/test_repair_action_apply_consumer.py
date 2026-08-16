@@ -60,13 +60,23 @@ def _write_candidate(
         "candidate_body_artifact": str(candidate_path),
         "repair_kinds": ["trailing_whitespace"],
         "reason_codes": ["trailing_whitespace_stripped"],
+        # PR #2202 review fix-delta (P1-3): these live under repair_action.*
+        # in the canonical refinement_preflight_result_v1 schema (P0-2),
+        # never top-level. This fixture previously left them at the
+        # top-level `preflight_result` dict below, which the P0-2 fix never
+        # reads from -- silently exercising the consumer's now-closed
+        # null-provenance fail-closed path (P1-3) instead of a genuine
+        # dispatch. Moving them here matches
+        # test_repair_apply_fresh_validation.py / test_repair_apply_provenance.py.
+        "source_lane": source_lane,
+        "preflight_run_identity": "sha256:testrun",
+        "original_updated_at": "2024-01-01T00:00:00Z",
+        "source_refs_digest": None,
     }
     preflight_result = {
         "schema": "issue_refinement_preflight_result/v1",
         "repair_action": repair_action,
-        "original_updated_at": "2024-01-01T00:00:00Z",
         "result_core_sha256": "sha256:testrun",
-        "source_lane": source_lane,
     }
     result_path = artifact_dir / "preflight_result.json"
     result_path.write_text(json.dumps(preflight_result))
@@ -311,6 +321,180 @@ def test_body_drift_triggers_single_producer_rerun_and_dispatches_new_candidate(
     assert len(apply_txn.calls) == 1
     dispatched_body = apply_txn.calls[0][1]
     assert dispatched_body == rebased_candidate_body
+
+
+# ---------------------------------------------------------------------------
+# PR #2202 human adversarial review, 'マージ前に必須の追加テスト' item 4
+# ('canonical receipt matrix'): the SAME statuses covered by
+# test_receipt_projection_is_lossless_across_statuses above, but built via
+# the REAL edit_issue_txn.py `_render_result()` function (imported read-only
+# for test fidelity; edit_issue_txn.py itself is not modified) instead of a
+# hand-rolled `{"status": ..., "errors": []}` dict, so the receipt adapter is
+# exercised against the actual canonical ISSUE_EDIT_TXN_RESULT_V1 nested
+# shape (body_update/content_update/comment_publish/native_relationships),
+# not merely a shape someone believes it has.
+# ---------------------------------------------------------------------------
+
+_EDIT_ISSUE_TXN_SCRIPTS_DIR = _SKILL_ROOT.parent / "edit-issue" / "scripts"
+if str(_EDIT_ISSUE_TXN_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_EDIT_ISSUE_TXN_SCRIPTS_DIR))
+
+import edit_issue_txn  # noqa: E402
+
+
+def _render_no_change_result() -> dict:
+    return edit_issue_txn._render_result(
+        status="no_change",
+        issue_number=2039,
+        repo="squne121/loop-protocol",
+        mutation_started=False,
+        body_attempted=True,
+        body_status="no_change",
+        comment_attempted=False,
+        comment_status="not_run",
+        comment_id=None,
+        comment_url=None,
+        comment_body_sha256=None,
+        previous_body_sha256=_hex(ORIGINAL_BODY),
+        requested_new_body_sha256=_hex(ORIGINAL_BODY),
+        remote_current_body_sha256=_hex(ORIGINAL_BODY),
+        body_input_ref=None,
+        comment_input_ref=None,
+        errors=[],
+        patch_attempted=True,
+        mutation_outcome="no_change",
+    )
+
+
+def _render_applied_result() -> dict:
+    return edit_issue_txn._render_result(
+        status="ok",
+        issue_number=2039,
+        repo="squne121/loop-protocol",
+        mutation_started=True,
+        body_attempted=True,
+        body_status="ok",
+        comment_attempted=False,
+        comment_status="not_run",
+        comment_id=None,
+        comment_url=None,
+        comment_body_sha256=None,
+        previous_body_sha256=_hex(ORIGINAL_BODY),
+        requested_new_body_sha256=_hex(REPAIRED_BODY),
+        remote_current_body_sha256=_hex(REPAIRED_BODY),
+        body_input_ref=None,
+        comment_input_ref=None,
+        errors=[],
+        patch_attempted=True,
+        mutation_outcome="applied",
+    )
+
+
+def _render_mutation_outcome_unknown_result() -> dict:
+    return edit_issue_txn._render_result(
+        status="mutation_outcome_unknown",
+        issue_number=2039,
+        repo="squne121/loop-protocol",
+        mutation_started=True,
+        body_attempted=True,
+        body_status="unknown",
+        comment_attempted=False,
+        comment_status="not_run",
+        comment_id=None,
+        comment_url=None,
+        comment_body_sha256=None,
+        previous_body_sha256=_hex(ORIGINAL_BODY),
+        requested_new_body_sha256=_hex(REPAIRED_BODY),
+        remote_current_body_sha256=None,
+        body_input_ref=None,
+        comment_input_ref=None,
+        errors=[{"code": "readback_timeout", "message": "could not confirm outcome"}],
+        patch_attempted=True,
+        mutation_outcome="unknown",
+    )
+
+
+def _render_failed_after_mutation_result() -> dict:
+    # `_render_result()` itself promotes failed_no_mutation ->
+    # failed_after_mutation whenever mutation_started is True (see its own
+    # P0-1 bullet 5 fail-closed logic) -- passing status="failed_no_mutation"
+    # here with mutation_started=True exercises that REAL promotion path,
+    # rather than hand-asserting the post-promotion status string.
+    return edit_issue_txn._render_result(
+        status="failed_no_mutation",
+        issue_number=2039,
+        repo="squne121/loop-protocol",
+        mutation_started=True,
+        body_attempted=True,
+        body_status="error",
+        comment_attempted=False,
+        comment_status="not_run",
+        comment_id=None,
+        comment_url=None,
+        comment_body_sha256=None,
+        previous_body_sha256=_hex(ORIGINAL_BODY),
+        requested_new_body_sha256=_hex(REPAIRED_BODY),
+        remote_current_body_sha256=None,
+        body_input_ref=None,
+        comment_input_ref=None,
+        errors=[{"code": "unexpected_post_mutation_error", "message": "boom"}],
+        patch_attempted=True,
+        mutation_outcome="unknown",
+    )
+
+
+@pytest.mark.parametrize(
+    ("render_fn", "expected_outcome", "post_dispatch_bodies"),
+    [
+        # no_change: nothing was mutated, so a fresh post-dispatch read
+        # genuinely still sees the ORIGINAL body both times.
+        (_render_no_change_result, "no_change", [ORIGINAL_BODY, ORIGINAL_BODY]),
+        # applied: the mutation genuinely happened, so a fresh post-dispatch
+        # read sees the REPAIRED body the second time.
+        (_render_applied_result, "applied", [ORIGINAL_BODY, REPAIRED_BODY]),
+        # unknown outcomes never reach fresh validation's live-body
+        # comparison the same way (patch_attempted is still True here, so
+        # fresh validation DOES run -- feed it the repaired body as the
+        # plausible post-mutation state; the receipt-matrix assertion below
+        # only checks mutation_outcome/phase/failure_code, not fresh
+        # validation's own status).
+        (_render_mutation_outcome_unknown_result, "unknown", [ORIGINAL_BODY, REPAIRED_BODY]),
+        (_render_failed_after_mutation_result, "unknown", [ORIGINAL_BODY, REPAIRED_BODY]),
+    ],
+)
+def test_canonical_render_result_receipt_matrix_projects_losslessly(
+    tmp_path: Path, render_fn, expected_outcome: str, post_dispatch_bodies: list[str]
+) -> None:
+    """Required test 4 (canonical receipt matrix): each REAL
+    edit_issue_txn.py `_render_result()` shape (no_change, applied/ok,
+    mutation_outcome_unknown, failed_after_mutation-via-promotion) projects
+    to its own correct `mutation_outcome` through the actual
+    `_repair_receipt_from_txn_result()` adapter -- exercised end to end via
+    `run_repair_action_apply()`, not a unit-level adapter call."""
+    result_path = _write_candidate(tmp_path)
+    txn_result = render_fn()
+    assert txn_result["schema"] == edit_issue_txn.RESULT_SCHEMA, (
+        "sanity check: this must be the REAL canonical schema tag, proving "
+        "_render_result() actually ran"
+    )
+
+    apply_txn = CallCountingApplyTransaction(txn_result)
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2039,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=_fetch_sequence_stub(post_dispatch_bodies),
+        apply_transaction=apply_txn,
+    )
+
+    jsonschema.validate(result, _SCHEMA)
+    assert result["mutation_outcome"] == expected_outcome
+    assert result["receipt"]["mutation_outcome"] == expected_outcome
+    if expected_outcome == "unknown":
+        assert result["phase"] == "final_readback"
+        assert result["failure_code"] == "final_readback_unresolvable"
 
 
 if __name__ == "__main__":

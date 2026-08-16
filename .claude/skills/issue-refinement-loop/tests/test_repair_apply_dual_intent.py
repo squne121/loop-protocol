@@ -121,5 +121,137 @@ class ResolveRepairApplyMutationIntentTests(unittest.TestCase):
         )
 
 
+class RealCanonicalDualIntentProductionShapeTests(unittest.TestCase):
+    """PR #2202 human adversarial review, 'マージ前に必須の追加テスト' item 2
+    ('dual-intent production shape'): a canonical, schema-valid preflight
+    result that carries BOTH `contract_update` and `repair_action` must be
+    rejected by `run_repair_action_apply()` BEFORE any GitHub read --
+    exercised via a REAL `repair_action` produced by the actual
+    `run_preflight()` producer (never a hand-built dict), with a
+    schema-valid `contract_update` block spliced onto the SAME real
+    artifact (the genuine dual-intent hazard: an artifact that already
+    carries a completed/attempted `contract_update` block ALSO carrying a
+    `repair_action`)."""
+
+    ISSUE_BODY = """\
+## Outcome
+
+Add a new doc.
+
+## Verification Commands
+
+```bash
+$ test -f docs/dev/issue-2039-dual-intent.md
+```
+
+## Allowed Paths
+
+- `docs/dev/issue-2039-dual-intent.md`
+
+## Stop Conditions
+
+- none
+"""
+
+    def test_real_producer_repair_action_with_contract_update_spliced_in_is_rejected_before_github_read(
+        self,
+    ) -> None:
+        import json
+        from unittest import mock
+
+        import run_refinement_preflight as wrapper
+
+        tmp_path = Path(self._make_tmp_dir())
+        issue_number = 209904
+
+        fixture = {
+            "schema_version": "refinement_preflight_input/v1",
+            "issue_number": issue_number,
+            "repo": "testowner/testrepo",
+            "now": "2026-01-01T00:00:00+00:00",
+            "issue": {
+                "number": issue_number,
+                "title": "Test Issue",
+                "body": self.ISSUE_BODY,
+                "labels": [],
+                "updatedAt": "2026-01-01T00:00:00Z",
+            },
+            "comments": [],
+            "anchor_comment_urls": [],
+        }
+        fixture_path = tmp_path / "fixture.json"
+        fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+        mock_plan_pass = {
+            "schema_version": "refinement_loop_plan/v1",
+            "fail_closed": {"required": False, "reason_codes": []},
+            "decisions": {},
+        }
+
+        with (
+            mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+            mock.patch.object(wrapper, "_invoke_planner", return_value=(mock_plan_pass, 0, "", "")),
+        ):
+            result, exit_code = wrapper.run_preflight(
+                issue_number=issue_number,
+                repo="testowner/testrepo",
+                anchor_comment_urls=[],
+                fixture_path=fixture_path,
+            )
+
+        self.assertEqual(result["status"], "needs_fix", result)
+        self.assertIn("repair_action", result)
+        self.assertIsNotNone(result["repair_action"])
+
+        # Splice a schema-valid contract_update block onto the SAME real,
+        # producer-generated artifact -- this is the genuine dual-intent
+        # hazard the review flagged: an artifact that already carries a
+        # completed contract_update ALSO carrying a repair_action, which
+        # `additionalProperties: false` alone does not prevent (both keys
+        # are independently valid top-level properties of
+        # refinement_preflight_result_v1).
+        artifact_path = Path(result["artifacts"]["refinement_preflight_result_v1"])
+        on_disk = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertIn("repair_action", on_disk)
+        on_disk["contract_update"] = {
+            "status": "applied",
+            "writes": 1,
+            "iterations": 1,
+            "final_readback": "verified",
+            "fresh_preflight": "pass",
+            "fresh_review": "pass",
+            "fresh_readiness": "pass",
+        }
+        artifact_path.write_text(json.dumps(on_disk), encoding="utf-8")
+
+        github_read_calls: list[None] = []
+
+        def _fetch_should_not_be_called():
+            github_read_calls.append(None)
+            return {"body": self.ISSUE_BODY, "updatedAt": "2026-01-01T00:00:00Z"}
+
+        consumer_result = wrapper.run_repair_action_apply(
+            repo="testowner/testrepo",
+            issue_number=issue_number,
+            preflight_result_path=str(artifact_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_should_not_be_called,
+        )
+
+        self.assertEqual(consumer_result["failure_code"], REPAIR_APPLY_FAILURE_MULTIPLE_MUTATION_INTENTS)
+        self.assertEqual(consumer_result["mutation_outcome"], "not_attempted")
+        self.assertEqual(
+            github_read_calls, [], "dual-intent artifact must be rejected before any GitHub read"
+        )
+
+    def _make_tmp_dir(self) -> str:
+        import shutil
+        import tempfile
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+
 if __name__ == "__main__":
     unittest.main()

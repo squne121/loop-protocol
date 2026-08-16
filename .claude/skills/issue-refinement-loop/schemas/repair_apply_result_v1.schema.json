@@ -402,16 +402,682 @@
             "properties": {
               "patch_attempted": {
                 "const": true
+              },
+              "final_readback": {
+                "type": "object",
+                "description": "PR #2202 review fix-delta (P1-3): an `applied` outcome must carry independently-verified evidence of the resulting body state -- never an unresolved final readback.",
+                "properties": {
+                  "status": {
+                    "const": "verified"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
               }
             },
             "required": [
-              "patch_attempted"
+              "patch_attempted",
+              "final_readback"
             ]
           }
         }
       }
     },
     {
+      "description": "PR #2202 review fix-delta (P1-3): top-level mutation_outcome must always equal receipt.mutation_outcome (never a divergent/synthesized top-level value).",
+      "if": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "mutation_outcome": {
+                "const": "not_attempted"
+              }
+            },
+            "required": [
+              "mutation_outcome"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mutation_outcome": {
+            "const": "not_attempted"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "mutation_outcome": {
+                "const": "no_change"
+              }
+            },
+            "required": [
+              "mutation_outcome"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mutation_outcome": {
+            "const": "no_change"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "mutation_outcome": {
+                "const": "applied"
+              }
+            },
+            "required": [
+              "mutation_outcome"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mutation_outcome": {
+            "const": "applied"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "mutation_outcome": {
+                "const": "unknown"
+              }
+            },
+            "required": [
+              "mutation_outcome"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mutation_outcome": {
+            "const": "unknown"
+          },
+          "phase": {
+            "const": "final_readback"
+          },
+          "failure_code": {
+            "const": "final_readback_unresolvable"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "multiple_mutation_intents"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "multiple_mutation_intents"
+          }
+        }
+      },
+      "description": "PR #2202 review fix-delta (P1-3): top-level failure_code must equal receipt.failure_code EXCEPT when phase==fresh_validation, where the top-level code is deliberately re-derived to surface a post-mutation control-plane consistency failure that is distinct from (and may not exist on) the underlying GitHub-transaction receipt. One if/then branch per receipt.failure_code enum value (standard JSON Schema has no cross-property $data equality operator in this draft)."
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "no_mutation_intent"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "no_mutation_intent"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "invalid_disposition"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "invalid_disposition"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "cross_issue_provenance_mismatch"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "cross_issue_provenance_mismatch"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "stale_run_provenance_mismatch"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "stale_run_provenance_mismatch"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "replacement_provenance_mismatch"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "replacement_provenance_mismatch"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "digest_mismatch"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "digest_mismatch"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "second_body_drift"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "second_body_drift"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "non_safe_disposition_after_rerun"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "non_safe_disposition_after_rerun"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "provenance_unreconstructable"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "provenance_unreconstructable"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "secure_open_rejected"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "secure_open_rejected"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "transaction_execute_error"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "transaction_execute_error"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "final_readback_unresolvable"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "final_readback_unresolvable"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "source_lane_mismatch"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "source_lane_mismatch"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": "fresh_validation_failed"
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": "fresh_validation_failed"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "not": {
+              "const": "fresh_validation"
+            }
+          },
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "failure_code": {
+                "const": null
+              }
+            },
+            "required": [
+              "failure_code"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_code": {
+            "const": null
+          }
+        }
+      }
+    },
+    {
+      "description": "phase=complete is always a definitively-resolved terminal state: applied/no_change (a genuine mutation outcome), or a not_attempted outcome that itself reached a terminal resolution (e.g. a pre-dispatch reject, or a dispatched-but-declined edit_issue_txn.py outcome such as human_judgment/failed_no_mutation -- see the `receipt.failure_code == failure_code` equality invariant above for the applicable failure_code in that case). Never `unknown` -- an unresolved outcome sits at phase=final_readback instead (see the receipt.mutation_outcome==unknown rule above).",
+      "if": {
+        "properties": {
+          "phase": {
+            "const": "complete"
+          }
+        },
+        "required": [
+          "phase"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mutation_outcome": {
+            "enum": [
+              "no_change",
+              "applied",
+              "not_attempted"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "description": "PR #2202 review fix-delta (P1-3): applied + phase=complete requires fresh validation to have genuinely succeeded (a failed fresh validation moves phase to fresh_validation instead -- see the phase==fresh_validation rule below).",
       "if": {
         "properties": {
           "mutation_outcome": {
@@ -428,8 +1094,90 @@
       },
       "then": {
         "properties": {
-          "failure_code": {
-            "const": null
+          "fresh_validation": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "success"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "description": "PR #2202 review fix-delta (P1-3): the converse of the phase==fresh_validation rule below -- a reported fresh_validation failure that follows a definitive (applied/no_change/not_attempted) outcome must always be surfaced via phase=fresh_validation, never silently left at phase=complete. Scoped to mutation_outcome != unknown: an `unknown` outcome already sits at phase=final_readback (its own genuinely-unconfirmed-result phase, unrelated to this post-mutation consistency check) and a fresh_validation failure on top of that does not relocate it.",
+      "if": {
+        "properties": {
+          "mutation_outcome": {
+            "not": {
+              "const": "unknown"
+            }
+          },
+          "fresh_validation": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "mutation_outcome",
+          "fresh_validation"
+        ]
+      },
+      "then": {
+        "properties": {
+          "phase": {
+            "const": "fresh_validation"
+          }
+        }
+      }
+    },
+    {
+      "description": "PR #2202 review fix-delta (P1-3): an actually-dispatched mutation (receipt.patch_attempted) must carry a full, non-null ABA-protection provenance binding -- original_updated_at and preflight_run_identity are never null once dispatch has been attempted (mirrors the run_repair_action_apply() pre-dispatch fail-closed gate at the code level).",
+      "if": {
+        "properties": {
+          "receipt": {
+            "type": "object",
+            "properties": {
+              "patch_attempted": {
+                "const": true
+              }
+            },
+            "required": [
+              "patch_attempted"
+            ]
+          }
+        },
+        "required": [
+          "receipt"
+        ]
+      },
+      "then": {
+        "properties": {
+          "provenance": {
+            "type": "object",
+            "properties": {
+              "original_updated_at": {
+                "type": "string"
+              },
+              "preflight_run_identity": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "original_updated_at",
+              "preflight_run_identity"
+            ]
           }
         }
       }

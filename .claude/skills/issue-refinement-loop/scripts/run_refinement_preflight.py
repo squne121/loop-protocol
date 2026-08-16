@@ -1080,18 +1080,16 @@ def _repair_receipt_from_txn_result(
     if patch_attempted and content_update.get("mutation_outcome") == "unknown":
         mutation_outcome = "unknown"
 
-    failure_code = None
-    if mutation_outcome == "unknown":
-        failure_code = "final_readback_unresolvable"
-    elif mutation_outcome == "not_attempted" and (txn_result.get("errors") or []):
-        failure_code = "transaction_execute_error"
-
     remote_sha = body_update.get("remote_current_body_sha256")
-    if not remote_sha and mutation_outcome == "unknown" and resolve_readback is not None:
-        # AC5: a single authoritative read (never a mutation retry),
-        # performed ONLY to disambiguate a genuinely executor-unconfirmed
-        # outcome -- not_attempted/no_change/applied results with no
-        # reported digest are not second-guessed via an extra read.
+    # PR #2202 review fix-delta (P1-3): a genuinely-unconfirmed outcome is
+    # not only `mutation_outcome == "unknown"` -- an `applied` outcome with
+    # no reported remote digest is equally unconfirmed (the executor
+    # reported success but this receipt has no independent evidence of the
+    # resulting body state). Attempt the SAME single authoritative readback
+    # (never a mutation retry, still budget-1 per AC5) for that case too,
+    # so `applied` never reaches `phase=complete` with an `unresolved`
+    # final_readback (the exact schema invariant this fix-delta adds).
+    if not remote_sha and mutation_outcome in ("unknown", "applied") and resolve_readback is not None:
         try:
             remote_sha = resolve_readback()
         except Exception:
@@ -1102,6 +1100,21 @@ def _repair_receipt_from_txn_result(
         final_readback = {"status": "verified", "digest": remote_sha, "digest_class": digest_class}
     else:
         final_readback = {"status": "unresolved", "digest": None, "digest_class": "not_applicable"}
+        if mutation_outcome == "applied":
+            # PR #2202 review fix-delta (P1-3): even after the readback
+            # attempt above, no digest could be confirmed for a reported
+            # `applied` outcome -- downgrade to `unknown` rather than
+            # emitting a definitive `applied` result with no verifying
+            # evidence. Mirrors the existing `mutation_outcome_unknown`
+            # handling exactly (same failure_code, same AC5 single-read
+            # budget already spent above).
+            mutation_outcome = "unknown"
+
+    failure_code = None
+    if mutation_outcome == "unknown":
+        failure_code = "final_readback_unresolvable"
+    elif mutation_outcome == "not_attempted" and (txn_result.get("errors") or []):
+        failure_code = "transaction_execute_error"
 
     return {
         "patch_attempted": patch_attempted,
@@ -1435,6 +1448,17 @@ def run_repair_action_apply(
         or not provenance["original_body_sha256"]
         or not provenance["repair_action_core_sha256"]
         or not provenance["candidate_digest"]
+        # PR #2202 review fix-delta (P1-3): a null `original_updated_at` or
+        # `preflight_run_identity` silently disables the P0-3 ABA (A->B->A)
+        # protection (the pre-dispatch drift check falls back to a
+        # body-SHA-only comparison whenever `original_updated_at` is None --
+        # see the `updated_at_drift` computation below). Auto-apply
+        # dispatch must never proceed on that degraded protection; only a
+        # producer run that actually recorded both fields may reach
+        # transaction_execute. This closes the gap fail-closed rather than
+        # relying on the (undispatched) historical-artifact-replay comment.
+        or provenance["original_updated_at"] is None
+        or provenance["preflight_run_identity"] is None
     ):
         return _repair_apply_not_attempted_result(
             repo=repo,

@@ -50,13 +50,18 @@ def _write_candidate(tmp_path: Path, *, issue_number: int = 2039) -> Path:
         "candidate_body_artifact": str(candidate_path),
         "repair_kinds": ["trailing_whitespace"],
         "reason_codes": ["trailing_whitespace_stripped"],
+        # PR #2202 review fix-delta (P1-3): these live under repair_action.*
+        # in the canonical schema (P0-2), never top-level -- see
+        # test_repair_action_apply_consumer.py for the same fix.
+        "source_lane": "unanchored",
+        "preflight_run_identity": "sha256:testrun",
+        "original_updated_at": "2024-01-01T00:00:00Z",
+        "source_refs_digest": None,
     }
     preflight_result = {
         "schema": "issue_refinement_preflight_result/v1",
         "repair_action": repair_action,
-        "original_updated_at": "2024-01-01T00:00:00Z",
         "result_core_sha256": "sha256:testrun",
-        "source_lane": "unanchored",
     }
     result_path = artifact_dir / "preflight_result.json"
     result_path.write_text(json.dumps(preflight_result))

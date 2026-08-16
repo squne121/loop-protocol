@@ -57,13 +57,18 @@ def _write_candidate(tmp_path: Path, *, issue_number: int = 2039) -> Path:
         "candidate_body_artifact": str(candidate_path),
         "repair_kinds": [],
         "reason_codes": [],
+        # PR #2202 review fix-delta (P1-3): these live under repair_action.*
+        # in the canonical schema (P0-2), never top-level -- see
+        # test_repair_action_apply_consumer.py for the same fix.
+        "source_lane": "unanchored",
+        "preflight_run_identity": "sha256:testrun",
+        "original_updated_at": "2024-01-01T00:00:00Z",
+        "source_refs_digest": None,
     }
     preflight_result = {
         "schema": "issue_refinement_preflight_result/v1",
         "repair_action": repair_action,
-        "original_updated_at": "2024-01-01T00:00:00Z",
         "result_core_sha256": "sha256:testrun",
-        "source_lane": "unanchored",
     }
     result_path = artifact_dir / "preflight_result.json"
     result_path.write_text(json.dumps(preflight_result))
@@ -687,6 +692,69 @@ def test_repair_apply_scratch_unlink_is_dir_fd_relative_and_survives_ancestor_re
         )
     finally:
         os.close(dir_fd)
+
+
+def test_two_concurrent_invocations_for_the_same_issue_never_collide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #2202 review required test 6 (scratch-file adversarial cases):
+    two 'concurrent' `run_repair_action_apply()` invocations for the SAME
+    Issue number must never write to the same scratch path (which a fixed,
+    issue-number-keyed pathname -- the pre-P1-1 behavior -- would have
+    allowed, letting one invocation clobber the other's candidate/input
+    file). Modeled as two sequential invocations sharing the same
+    allowed-write-roots base dir; the per-invocation random subdirectory
+    makes genuine concurrent execution safe by the same construction."""
+    readiness_stdout = _readiness_stdout_ok()
+    observed_body_file_args: list[str] = []
+
+    def _fake_run(argv, **kwargs):
+        script_path = str(argv[1])
+        if "contract_readiness_check.py" in script_path:
+            observed_body_file_args.append(argv[argv.index("--body-file") + 1])
+            return subprocess.CompletedProcess(argv, 0, stdout=readiness_stdout, stderr="")
+        if "edit_issue_txn.py" in script_path:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "status": "ok",
+                        "mutation_started": True,
+                        "body_update": {"attempted": True, "status": "ok"},
+                        "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+                        "errors": [],
+                    }
+                ),
+                stderr="",
+            )
+        raise AssertionError(f"unexpected subprocess.run call: {argv}")
+
+    monkeypatch.setattr(rrp.subprocess, "run", _fake_run)
+
+    for _ in range(2):
+        result_path = _write_candidate(tmp_path)
+        fetch_bodies = iter([ORIGINAL_BODY, REPAIRED_BODY])
+
+        def _fetch():
+            return {"body": next(fetch_bodies), "updatedAt": "2024-01-01T00:00:00Z"}
+
+        result = rrp.run_repair_action_apply(
+            repo="squne121/loop-protocol",
+            issue_number=2039,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch,
+        )
+        jsonschema.validate(result, _SCHEMA)
+
+    assert len(observed_body_file_args) == 2
+    first_scratch_dir = Path(observed_body_file_args[0]).parent
+    second_scratch_dir = Path(observed_body_file_args[1]).parent
+    assert first_scratch_dir != second_scratch_dir, (
+        "two invocations for the same Issue number must never reuse the "
+        "same per-invocation scratch subdirectory"
+    )
 
 
 if __name__ == "__main__":

@@ -181,6 +181,13 @@ class TestABAUpdatedAtProtection:
         )
         assert result["status"] == "needs_fix", result
         artifact_path = Path(result["artifacts"]["refinement_preflight_result_v1"])
+        # PR #2202 review required test 3 (ABA): the t1 run's own identity,
+        # captured BEFORE the consumer runs, so we can assert below that the
+        # dispatched mutation is bound to a genuinely NEW (post-rerun) run
+        # identity -- never the stale t1 one -- proving the t1 candidate was
+        # actually rejected rather than silently reused.
+        t1_preflight_run_identity = result["repair_action"]["preflight_run_identity"]
+        assert t1_preflight_run_identity
 
         # Live Issue is now at t3: the body has cycled A -> B -> A (the live
         # body is byte-identical to the t1 candidate's original_body_sha256
@@ -221,6 +228,18 @@ class TestABAUpdatedAtProtection:
         # source_lane must stay pinned across the rebind (same human-context
         # / anchor / unanchored lane -- only body/candidate regenerated).
         assert consumer_result["provenance"]["source_lane"] == "unanchored"
+        # PR #2202 review required test 3 (ABA): the STALE t1 candidate must
+        # genuinely be rejected, not merely have its metadata relabeled --
+        # exactly one dispatch happens (never a stale-then-fresh double
+        # dispatch), and it is bound to a run identity that is NOT the t1
+        # one (the pre-dispatch rebase always mints a fresh
+        # `preflight_run_identity` from the post-rerun body/updatedAt --
+        # see run_repair_action_apply()'s rebase provenance rebinding).
+        assert len(dispatched) == 1, "expected exactly one dispatch (the rebased candidate, never the stale t1 one)"
+        assert consumer_result["provenance"]["preflight_run_identity"] != t1_preflight_run_identity, (
+            "the dispatched mutation must be bound to a fresh post-rerun run identity, "
+            "never the stale t1 run identity"
+        )
 
     def test_pure_body_drift_still_detected_without_updated_at_change(self, tmp_path: Path) -> None:
         """Regression guard: the updatedAt-aware fix must not weaken the

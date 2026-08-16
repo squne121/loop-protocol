@@ -209,15 +209,44 @@ def test_repair_action_apply_stdout_schema_conformance_on_applied_path(tmp_path:
     """AC8/AC6: a stubbed `applied` transaction outcome still produces a
     schema-conformant payload (mutation_outcome applied requires
     receipt.patch_attempted true and failure_code null)."""
-    result_path, _ = _write_candidate(tmp_path)
+    applied_candidate_body = "not a valid issue contract body\n"
+    result_path, _ = _write_candidate(tmp_path, candidate_body=applied_candidate_body)
+
+    # PR #2202 review fix-delta (P1-3): AC9 fresh validation genuinely
+    # re-fetches the live Issue body a second time post-dispatch (P0-5).
+    # The original stub returned the SAME pre-mutation body on both calls,
+    # which made fresh validation's digest-match check genuinely fail
+    # (live body still == old_digest, never == candidate_digest) --
+    # silently masking a fresh-validation failure behind an `applied`
+    # assertion that never actually exercised AC9's real digest-match
+    # path. A realistic post-dispatch state returns the candidate body on
+    # the second (fresh-validation) fetch.
+    fetch_bodies = iter(["original body\n", applied_candidate_body])
+
+    def _fetch_after_dispatch() -> dict:
+        return {"body": next(fetch_bodies), "updatedAt": "2024-01-01T00:00:00Z"}
 
     def _fake_apply_transaction(current_issue: dict, candidate_body: str) -> dict:
         del current_issue, candidate_body
+        # PR #2202 review fix-delta (P1-3): the canonical
+        # ISSUE_EDIT_TXN_RESULT_V1 shape (P0-4) nests the attempted/outcome
+        # fields under `body_update`/`content_update`; the previous flat
+        # `body_attempted`/`body_status`/`remote_current_body_sha256` keys
+        # here were never read by `_repair_receipt_from_txn_result()` (P0-4
+        # reads only the nested shape), which silently produced
+        # receipt.patch_attempted=False alongside a top-level
+        # mutation_outcome=applied -- exactly the self-contradictory state
+        # this session's schema invariants (applied requires
+        # receipt.patch_attempted=true) now correctly reject.
         return {
             "status": "ok",
-            "body_attempted": True,
-            "body_status": "ok",
-            "remote_current_body_sha256": "sha256:aaaa",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": "sha256:aaaa",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
             "errors": [],
         }
 
@@ -226,7 +255,7 @@ def test_repair_action_apply_stdout_schema_conformance_on_applied_path(tmp_path:
         issue_number=2039,
         preflight_result_path=str(result_path.relative_to(tmp_path)),
         repo_root=tmp_path,
-        fetch_current=_fetch_current_stub,
+        fetch_current=_fetch_after_dispatch,
         apply_transaction=_fake_apply_transaction,
     )
     jsonschema.validate(result, _SCHEMA)
@@ -234,6 +263,8 @@ def test_repair_action_apply_stdout_schema_conformance_on_applied_path(tmp_path:
     assert result["failure_code"] is None
     assert result["phase"] == "complete"
     assert result["receipt"]["patch_attempted"] is True
+    assert result["receipt"]["final_readback"]["status"] == "verified"
+    assert result["fresh_validation"]["status"] == "success"
 
 
 def test_repair_action_apply_unknown_outcome_never_reaches_complete_phase(tmp_path: Path) -> None:
