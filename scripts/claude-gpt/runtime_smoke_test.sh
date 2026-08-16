@@ -111,6 +111,10 @@ fi
 #   をそれぞれ出力させ、stdout から grep で確認する。
 #   実際の `POST /v1/messages` 成功は proxy の構造化ログ（request / codex_upstream_request_started
 #   / request_completed, status=200）から確認する（自己申告ではなく proxy 側の一次証跡）。
+#   configured transport が repository-owned policy（http 固定, Issue #2204）どおりに
+#   実際に使われたことは、同じ構造化ログの codex_upstream_request_started 行に含まれる
+#   transport フィールドが "http" であることから確認する（launcher が env に付与した
+#   自己申告値の再掲ではなく、proxy 側が実際に upstream へ送出した transport 値）。
 # =========================================================================
 TEXT_MARKER="CLAUDE_GPT_CANARY_TEXT_OK"
 BASH_MARKER="CLAUDE_GPT_CANARY_BASH_OK"
@@ -125,6 +129,7 @@ CANARY_AGENTS_JSON='{"canary":{"description":"canary smoke test subagent used on
 
 RC_LAST=0
 HTTP_POST_CONFIRMED=false
+CODEX_TRANSPORT_HTTP_CONFIRMED=false
 MODEL_USED=""
 PROVIDER_USED=""
 CLEANUP_ALL_OK=true
@@ -166,6 +171,20 @@ run_convo_step() {
       MODEL_USED=$(grep -o '"model":"[^"]*"' "$STEP_PROXY_LOG" 2>/dev/null | head -n1 | cut -d: -f2 | tr -d '"')
       PROVIDER_USED=$(grep -o '"provider":"[^"]*"' "$STEP_PROXY_LOG" 2>/dev/null | head -n1 | cut -d: -f2 | tr -d '"')
       HTTP_POST_CONFIRMED=true
+    fi
+    # --- Codex transport の一次証跡確認（Issue #2204）。proxy が Codex backend への
+    #     upstream request を開始したことを示す構造化ログ行を抽出し、その行自身が
+    #     transport フィールド "http" を含むことを確認する（同一行内での key 共起の
+    #     みを一致条件とし、ファイル全体での "http" 単純一致は使わない）。launcher
+    #     自身が付与した env の自己申告ではなく、proxy 側が実際に選択した transport を
+    #     一次証跡として確認する。 ---
+    STEP_TRANSPORT_LINE=$(grep '"msg":"codex_upstream_request_started"' "$STEP_PROXY_LOG" 2>/dev/null | tail -n1)
+    if [ -n "$STEP_TRANSPORT_LINE" ]; then
+      case "$STEP_TRANSPORT_LINE" in
+        *'"transport":"http"'*)
+          CODEX_TRANSPORT_HTTP_CONFIRMED=true
+          ;;
+      esac
     fi
   fi
 
@@ -238,6 +257,7 @@ if [ "$CONVO_RC" -eq 0 ] \
   && [ "$BASH_MARKER_OK" = "true" ] \
   && [ "$SUBAGENT_MARKER_OK" = "true" ] \
   && [ "$HTTP_POST_CONFIRMED" = "true" ] \
+  && [ "$CODEX_TRANSPORT_HTTP_CONFIRMED" = "true" ] \
   && [ "$CONVO_CLEANUP_OK" = "true" ] \
   && [ "$CLEANUP_INDEPENDENT_OK" = "true" ]; then
   RUNTIME_CONVERSATION_OK=true
@@ -293,6 +313,7 @@ cat > "$EVIDENCE_FILE" <<EVIDENCE_JSON_EOF
     "bash_tool_marker_ok": ${BASH_MARKER_OK},
     "subagent_marker_ok": ${SUBAGENT_MARKER_OK},
     "http_post_v1_messages_confirmed": ${HTTP_POST_CONFIRMED},
+    "codex_upstream_transport_http_confirmed": ${CODEX_TRANSPORT_HTTP_CONFIRMED},
     "model_used": "$(json_escape "$MODEL_USED")",
     "provider_used": "$(json_escape "$PROVIDER_USED")",
     "proxy_cleanup_ok_launcher_reported": ${CONVO_CLEANUP_OK:-false},

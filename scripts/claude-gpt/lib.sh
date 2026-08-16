@@ -211,12 +211,27 @@ claude_gpt_reject_if_under_repo() {
   return 0
 }
 
+# --- Codex transport policy（Issue #2204, Parent #2154）---
+#
+# isolated proxy child が Codex backend への接続に使う transport を、親 shell の
+# CCP_CODEX_TRANSPORT pass-through や isolated proxy config.json の transport 指定
+# よりも優先して repository-owned に固定する無条件定数。auto ではなく http 固定を
+# 採る理由は Issue #2204 Outcome 直下の設計判断（decision block）を参照。
+# 親環境で上書き可能な `: "${VAR:=http}"` ではなく、無条件代入にすることで
+# 親 shell の値を一切参照しない（親 env は launch.sh の `env -i` により proxy
+# 子プロセスへそもそも継承されないが、本定数は isolated config.json 由来の
+# transport 指定にも優先する必要があるため、明示 env として常に渡す）。
+CLAUDE_GPT_CODEX_TRANSPORT_POLICY=http
+
 # --- proxy 子プロセス起動用 env allowlist ---
 #
 # 親 shell から継承した CCP_* / HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 等を
 # そのまま proxy へ引き渡さず、launcher が明示的に組み立てた allowlist のみへ限定する。
 # HOME は proxy 専用 HOME（claude_gpt_proxy_home_dir）を渡すこと（P0-2。実 HOME をそのまま
 # 渡すと legacy credential へフォールバックし credential 分離が成立しない）。
+# CCP_CODEX_TRANSPORT は CLAUDE_GPT_CODEX_TRANSPORT_POLICY を単一の source of truth
+# として参照する（Issue #2204。isolated config.json や upstream built-in default の
+# websocket を明示 env で上書きする）。
 # 呼び出し側は `env -i $(claude_gpt_build_proxy_env "$config_dir" "$state_dir" "$proxy_home" "$port") claude-code-proxy serve ...`
 # のように使う。
 claude_gpt_build_proxy_env() {
@@ -231,4 +246,5 @@ claude_gpt_build_proxy_env() {
   printf 'XDG_STATE_HOME=%s\n' "$proxy_state_dir"
   printf 'CCP_BIND_ADDRESS=%s\n' "$bind_address"
   printf 'CCP_LOG_STDERR=1\n'
+  printf 'CCP_CODEX_TRANSPORT=%s\n' "$CLAUDE_GPT_CODEX_TRANSPORT_POLICY"
 }
