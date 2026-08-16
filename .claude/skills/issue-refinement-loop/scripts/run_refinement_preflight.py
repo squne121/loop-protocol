@@ -87,6 +87,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -346,6 +347,232 @@ def _now_iso() -> str:
 
 def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #2039: repair_action.apply controlled consumer -- foundational
+# building blocks. (REPAIR_APPLY_BLOCK_MARKER_ISSUE_2039)
+#
+# NOTE (partial implementation): the two units below (FD-based secure
+# artifact reader for AC7, and the exactly-one mutation-intent arbiter core
+# for AC1) are implemented and unit-tested in isolation. They are NOT yet
+# wired into command_registry.py / skill_runtime_command_policy.py /
+# skill_runtime_exec.py, and the remaining AC2-AC6, AC8-AC11 surface
+# (schema migration, provenance binding, retry-budget separation, lossless
+# receipt projection, fresh-validation lane preservation, historical
+# artifact immutability, and registry/policy/executor wiring) is not yet
+# implemented. See PR body / IMPLEMENT_RESULT_V1 for status.
+# ---------------------------------------------------------------------------
+
+
+class RepairApplySecureOpenError(RuntimeError):
+    """Raised when a repair_apply artifact fails FD-based secure-open
+    validation (Issue #2039 AC7)."""
+
+
+REPAIR_APPLY_MAX_ARTIFACT_BYTES = 1_048_576  # 1 MiB read-size ceiling (AC7)
+
+
+def _repair_apply_reject_unsafe_ancestors(path: Path, root: Path) -> None:
+    """Fail-closed: reject if any ancestor directory between `path`'s parent
+    and `root` (inclusive) is itself a symlink, or if the resolved parent
+    directory is not contained within `root` (AC7 parent-symlink / parent
+    substitution rejection). Uses os.lstat (does NOT follow symlinks)."""
+    resolved_root = root.resolve(strict=False)
+    node = path.parent
+    seen = 0
+    while True:
+        seen += 1
+        if seen > 256:
+            raise RepairApplySecureOpenError(f"repair_apply_ancestor_chain_too_deep:{path}")
+        try:
+            st = os.lstat(node)
+        except FileNotFoundError as exc:
+            raise RepairApplySecureOpenError(f"repair_apply_ancestor_missing:{node}") from exc
+        except OSError as exc:
+            raise RepairApplySecureOpenError(f"repair_apply_ancestor_lstat_error:{node}:{exc}") from exc
+        if stat.S_ISLNK(st.st_mode):
+            raise RepairApplySecureOpenError(f"repair_apply_ancestor_is_symlink:{node}")
+        if node.resolve(strict=False) == resolved_root:
+            break
+        parent = node.parent
+        if parent == node:
+            raise RepairApplySecureOpenError(
+                f"repair_apply_ancestor_root_not_found:{path}:not_under:{resolved_root}"
+            )
+        node = parent
+
+    resolved_parent = path.parent.resolve(strict=False)
+    if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+        raise RepairApplySecureOpenError(
+            f"repair_apply_parent_outside_root:{resolved_parent}:not_under:{resolved_root}"
+        )
+
+
+def secure_read_repair_apply_artifact(
+    path: Path,
+    *,
+    root: Path,
+    max_bytes: int = REPAIR_APPLY_MAX_ARTIFACT_BYTES,
+    expected_sha256: Optional[str] = None,
+) -> "tuple[str, str]":
+    """FD-based secure read of a repair_apply artifact (Issue #2039 AC7).
+
+    Rejects (fail-closed, before any content bytes are trusted):
+      - leaf symlink, FIFO, socket, device, directory (regular files only)
+      - parent-directory symlink anywhere between the leaf and `root`
+      - parent substitution (resolved parent outside `root`)
+      - post-open identity mismatch (open()+fstat() vs the initial lstat())
+      - oversize content (> max_bytes)
+      - non-UTF-8 content (strict decode)
+      - digest mismatch against `expected_sha256`, when given
+      - leaf replaced with a symlink between the read and the post-read
+        identity re-check
+
+    Uses O_NOFOLLOW on open() so a leaf symlink introduced between the
+    lstat check and the open() call is rejected by the kernel (not just
+    detected after the fact), and fstat()-vs-lstat() identity comparison
+    (st_dev / st_ino) closes the residual TOCTOU window between the lstat
+    and the open().
+
+    Returns (text, sha256_hex_digest_of_raw_bytes).
+    """
+    resolved_root = root.resolve(strict=False)
+    _repair_apply_reject_unsafe_ancestors(path, resolved_root)
+
+    try:
+        pre_st = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_not_found:{path}") from exc
+    except OSError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_lstat_error:{path}:{exc}") from exc
+
+    if stat.S_ISLNK(pre_st.st_mode):
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_is_symlink:{path}")
+    if not stat.S_ISREG(pre_st.st_mode):
+        kind = "directory" if stat.S_ISDIR(pre_st.st_mode) else "special_file"
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_not_regular_file:{path}:{kind}")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_open_error:{path}:{exc}") from exc
+
+    raw = b""
+    try:
+        post_st = os.fstat(fd)
+        if not stat.S_ISREG(post_st.st_mode):
+            raise RepairApplySecureOpenError(f"repair_apply_leaf_not_regular_file_post_open:{path}")
+        if (post_st.st_dev, post_st.st_ino) != (pre_st.st_dev, pre_st.st_ino):
+            raise RepairApplySecureOpenError(f"repair_apply_leaf_identity_mismatch:{path}")
+        if post_st.st_size > max_bytes:
+            raise RepairApplySecureOpenError(
+                f"repair_apply_leaf_oversize:{path}:{post_st.st_size}:>:{max_bytes}"
+            )
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1  # fdopen now owns the fd; do not close twice below
+            raw = handle.read(max_bytes + 1)
+    except RepairApplySecureOpenError:
+        raise
+    except OSError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_read_error:{path}:{exc}") from exc
+    finally:
+        if fd != -1:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    if len(raw) > max_bytes:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_oversize_on_read:{path}:>:{max_bytes}")
+
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_not_utf8:{path}:{exc}") from exc
+
+    digest = hashlib.sha256(raw).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise RepairApplySecureOpenError(
+            f"repair_apply_digest_mismatch:{path}:expected={expected_sha256}:actual={digest}"
+        )
+
+    try:
+        after_st = os.lstat(path)
+    except OSError as exc:
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_post_read_lstat_error:{path}:{exc}") from exc
+    if stat.S_ISLNK(after_st.st_mode):
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_replaced_with_symlink:{path}")
+    if (after_st.st_dev, after_st.st_ino) != (pre_st.st_dev, pre_st.st_ino):
+        raise RepairApplySecureOpenError(f"repair_apply_leaf_replaced_post_read:{path}")
+
+    return text, digest
+
+
+REPAIR_APPLY_FAILURE_MULTIPLE_MUTATION_INTENTS = "multiple_mutation_intents"
+REPAIR_APPLY_FAILURE_NO_MUTATION_INTENT = "no_mutation_intent"
+
+
+def resolve_repair_apply_mutation_intent(
+    *,
+    contract_patch_plan: "dict | None",
+    repair_action: "dict | None",
+) -> dict:
+    """Issue #2039 AC1: exactly-one mutation-intent arbiter for the
+    repair_action.apply command lane.
+
+    `contract_patch_plan` and `repair_action` must not both be present in
+    the same preflight result. When both are given this returns a
+    fail-closed verdict (`failure_code=multiple_mutation_intents`,
+    `mutation_outcome=not_attempted`) *before* any GitHub mutation is
+    attempted. A subsequent intent must be regenerated as a fresh preflight
+    in a separate command, never resolved by this arbiter picking one of
+    the two present intents.
+    """
+    has_patch_plan = contract_patch_plan is not None
+    has_repair_action = repair_action is not None
+
+    if has_patch_plan and has_repair_action:
+        return {
+            "intent": None,
+            "ok": False,
+            "failure_code": REPAIR_APPLY_FAILURE_MULTIPLE_MUTATION_INTENTS,
+            "mutation_outcome": "not_attempted",
+            "reason": (
+                "contract_patch_plan and repair_action are both present in the "
+                "same preflight result; exactly one mutation intent is required. "
+                "Apply one intent, then regenerate a fresh preflight as a "
+                "separate command for the other."
+            ),
+        }
+    if has_repair_action:
+        return {
+            "intent": "repair_action",
+            "ok": True,
+            "failure_code": None,
+            "mutation_outcome": None,
+            "reason": None,
+        }
+    if has_patch_plan:
+        return {
+            "intent": "contract_patch_plan",
+            "ok": True,
+            "failure_code": None,
+            "mutation_outcome": None,
+            "reason": None,
+        }
+    return {
+        "intent": None,
+        "ok": False,
+        "failure_code": REPAIR_APPLY_FAILURE_NO_MUTATION_INTENT,
+        "mutation_outcome": "not_attempted",
+        "reason": "Neither contract_patch_plan nor repair_action is present.",
+    }
 
 
 # ---------------------------------------------------------------------------
