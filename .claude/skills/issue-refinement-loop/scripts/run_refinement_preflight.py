@@ -180,6 +180,31 @@ SCHEMA_VERSION_INPUT_FIXTURE = "refinement_preflight_input/v1"
 GH_API_TIMEOUT = 30
 PLANNER_TIMEOUT = 60
 
+# PR #2202 review fix-delta (P0-6): `repair_action.apply`'s worst-case inner
+# critical path runs the readiness-check subprocess and the
+# edit_issue_txn.py subprocess SEQUENTIALLY inside a single
+# `run_refinement_preflight.py --apply-repair-action` process invocation.
+# The registry-level outer supervisor timeout for the `repair_action.apply`
+# command_id (command_registry.py REGISTRY["repair_action.apply"]
+# ["timeout_seconds"]) MUST stay strictly greater than
+# REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS +
+# REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS +
+# REPAIR_APPLY_READBACK_RESERVE_SECONDS + margin -- otherwise the outer
+# supervisor can kill this process mid-dispatch (after a PATCH may already
+# have been sent to GitHub) before the AC5 authoritative-readback path ever
+# runs, silently converting a genuinely-mutated Issue into a reported
+# failure/crash instead of a resolvable `unknown` outcome.
+REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS = 30
+REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS = 60
+# One bounded `_fetch_issue()` GitHub read (GH_API_TIMEOUT-bounded) is the
+# most this function ever spends resolving the AC5 authoritative readback
+# after a TimeoutExpired/OSError/unparseable-stdout `unknown` outcome.
+REPAIR_APPLY_READBACK_RESERVE_SECONDS = GH_API_TIMEOUT
+# inner_total(90) + readback_reserve(30) = 120; command_registry.py's
+# `repair_action.apply["timeout_seconds"]` is set to 150 (30s margin above
+# that combined worst case) -- see the comment on that registry entry.
+REPAIR_APPLY_OUTER_TIMEOUT_MARGIN_SECONDS = 30
+
 # Exit codes
 EXIT_PASS = 0
 EXIT_WARN = 1
@@ -1565,15 +1590,28 @@ def run_repair_action_apply(
         readiness_script = (
             _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
         )
-        completed_readiness = subprocess.run(
-            [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
-            capture_output=True,
-            text=True,
-            shell=False,
-            timeout=30,
-        )
         try:
-            readiness = json.loads(completed_readiness.stdout)
+            completed_readiness = subprocess.run(
+                [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
+                capture_output=True,
+                text=True,
+                shell=False,
+                timeout=REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+            readiness_stdout = completed_readiness.stdout
+        except (subprocess.TimeoutExpired, OSError):
+            # PR #2202 review fix-delta (P0-6, item 2): the readiness check
+            # never touches GitHub -- it runs strictly BEFORE
+            # edit_issue_txn.py is ever invoked below, so a
+            # TimeoutExpired/OSError here proves no mutation could possibly
+            # have been dispatched yet. It is therefore always safe to fall
+            # through to the SAME degraded-readiness fallback already used
+            # for non-JSON readiness stdout below (never a fabricated
+            # "verified"/"unresolved" readiness signal, and never routed
+            # into the mutation-side `unknown` handling this is not).
+            readiness_stdout = ""
+        try:
+            readiness = json.loads(readiness_stdout)
         except json.JSONDecodeError:
             readiness = {}
         if not isinstance(readiness, dict):
@@ -1606,26 +1644,76 @@ def run_repair_action_apply(
         )
         input_path.write_text(json.dumps(transaction_input, ensure_ascii=False), encoding="utf-8")
 
+        def _unknown_dispatch_txn_result(error_code: str, message: str) -> dict:
+            # PR #2202 review fix-delta (P0-6): a genuinely-unconfirmed
+            # outcome detected HERE (never through a raw-executor receipt)
+            # still followed an actual edit_issue_txn.py subprocess
+            # invocation attempt, so `content_update.patch_attempted=True`
+            # is set (mirroring the canonical ISSUE_EDIT_TXN_RESULT_V1
+            # `mutation_outcome_unknown` shape) so AC9 fresh validation
+            # still runs after this outcome, exactly as it would for a
+            # genuine executor-reported unknown receipt.
+            return {
+                "status": "mutation_outcome_unknown",
+                "content_update": {"patch_attempted": True, "mutation_outcome": "unknown"},
+                "errors": [{"code": error_code, "message": message[:200]}],
+            }
+
         # AC11: the ONLY GitHub-mutation subprocess this consumer ever
         # invokes is edit_issue_txn.py --input-file. No `gh issue edit`
         # call exists anywhere in this function.
         transaction_script = _SCRIPTS_DIR.parent.parent / EDIT_ISSUE_TXN_SCRIPT_REL
-        completed = subprocess.run(
-            [sys.executable, str(transaction_script), "--input-file", str(input_path.relative_to(root))],
-            capture_output=True,
-            text=True,
-            shell=False,
-            cwd=str(root),
-            timeout=60,
-        )
+        try:
+            completed = subprocess.run(
+                [sys.executable, str(transaction_script), "--input-file", str(input_path.relative_to(root))],
+                capture_output=True,
+                text=True,
+                shell=False,
+                cwd=str(root),
+                timeout=REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # PR #2202 review fix-delta (P0-6, items 2+3): this is the ONLY
+            # subprocess this consumer ever invokes to dispatch a real
+            # GitHub PATCH (AC11). `subprocess.run(timeout=...)` kills the
+            # child only AFTER the timeout has already elapsed, so a
+            # TimeoutExpired here does NOT prove the PATCH never reached
+            # GitHub -- the child (or GitHub itself) may already have
+            # applied it. Reporting this as "no mutation" would be an
+            # unsafe mis-report of a non-retriable PATCH (review P0-6 item
+            # 3), so this is always routed to the SAME
+            # `mutation_outcome_unknown` status the executor itself uses to
+            # signal an unconfirmed outcome -- never a degraded
+            # `failed_no_mutation` shortcut. `_repair_receipt_from_txn_result`
+            # maps this to `mutation_outcome=unknown` and triggers the
+            # existing AC5 single authoritative-readback path.
+            return _unknown_dispatch_txn_result("txn_subprocess_timeout", str(exc))
+        except OSError as exc:
+            # Same reasoning as the TimeoutExpired branch above: an OSError
+            # raised by subprocess.run() itself (e.g. a transient OS-level
+            # wait/communicate failure) after the call has already been
+            # made does not prove the PATCH was never dispatched.
+            return _unknown_dispatch_txn_result("txn_subprocess_oserror", str(exc))
         try:
             txn_result = json.loads(completed.stdout)
         except json.JSONDecodeError:
-            txn_result = {
-                "status": "failed_no_mutation",
-                "errors": [{"code": "txn_stdout_not_json", "message": (completed.stderr or "")[:200]}],
-            }
-        return txn_result if isinstance(txn_result, dict) else {"status": "failed_no_mutation"}
+            # PR #2202 review fix-delta (P0-6, item 3): stdout being empty,
+            # truncated, or non-JSON AFTER the subprocess call above has
+            # already completed does NOT prove no mutation happened -- the
+            # child may have dispatched the PATCH and then failed to
+            # flush/emit its own confirmation. Degrading this to
+            # `failed_no_mutation` (the prior behavior) risked silently
+            # reporting "no mutation" after a real, non-retriable PATCH.
+            # This must resolve to `unknown` and route into the SAME AC5
+            # authoritative-readback path used for a genuine executor-
+            # reported `mutation_outcome_unknown` receipt.
+            txn_result = _unknown_dispatch_txn_result("txn_stdout_not_json", completed.stderr or "")
+        # Same reasoning: a parsed-but-non-dict stdout shape still followed
+        # a completed subprocess call, so it must not be reported as
+        # `failed_no_mutation` either.
+        return txn_result if isinstance(txn_result, dict) else _unknown_dispatch_txn_result(
+            "txn_stdout_not_dict", "parsed stdout JSON was not a dict"
+        )
 
     apply_fn = apply_transaction or _default_apply_transaction
     txn_result = apply_fn(current_issue, candidate_body_text)

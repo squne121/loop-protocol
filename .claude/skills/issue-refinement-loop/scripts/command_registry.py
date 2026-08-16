@@ -594,7 +594,28 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "network_effect": "github_mutation",
         "stdin_contract": "none",
         "stdout_contract": "repair_apply_result/v1",
-        "timeout_seconds": 60,
+        # PR #2202 review fix-delta (P0-6): this outer supervisor timeout
+        # MUST stay strictly greater than the sum of
+        # run_refinement_preflight.py's own inner subprocess budgets for
+        # `run_repair_action_apply()` --
+        # REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS (30s) +
+        # REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS (60s) = 90s
+        # worst-case critical path -- PLUS a readback reserve
+        # (REPAIR_APPLY_READBACK_RESERVE_SECONDS, one GH_API_TIMEOUT-bounded
+        # `_fetch_issue()` read = 30s) so the AC5 authoritative-readback
+        # path always has time to run after a genuine
+        # timeout/OSError/unparseable-stdout `unknown` outcome, PLUS a
+        # margin (REPAIR_APPLY_OUTER_TIMEOUT_MARGIN_SECONDS, 30s) for
+        # interpreter startup, argv parsing, and non-subprocess local work.
+        # 90 + 30 + 30 = 150. Previously this was 60s (strictly LESS than
+        # even the 90s inner critical path alone), which meant the outer
+        # supervisor could kill this process mid-dispatch -- after a PATCH
+        # may already have been sent to GitHub -- before the readback path
+        # ever ran. See run_refinement_preflight.py's
+        # REPAIR_APPLY_*_SECONDS constants (kept in sync manually; no
+        # runtime cross-import exists between this registry module and
+        # run_refinement_preflight.py's inner subprocess timeouts).
+        "timeout_seconds": 150,
         "mutation": True,
         "placeholders": {
             "issue_number": {"type": "positive_int", "required": True},

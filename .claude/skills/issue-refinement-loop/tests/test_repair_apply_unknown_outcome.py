@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -307,6 +308,213 @@ def test_mutation_outcome_unknown_with_patch_attempted_does_not_skip_fresh_valid
     # was actually attempted, even though the overall outcome is unknown.
     assert result["fresh_validation"]["status"] != "not_run"
     assert fresh_validate_calls, "fresh_validate producer must actually be invoked, not skipped"
+
+
+# ---------------------------------------------------------------------------
+# PR #2202 review fix-delta (P0-6): timeout/unknown recovery safety of the
+# DEFAULT `apply_transaction` (the real subprocess-calling path, exercised
+# with apply_transaction=None -- never the injectable RecordingApplyTransaction
+# seam the tests above use, since that seam bypasses the subprocess.run()
+# calls this fix actually changes).
+# ---------------------------------------------------------------------------
+
+
+def _readiness_stdout_ok() -> str:
+    return json.dumps({"status": "pass", "body_sha256": "sha256:x", "source_checks": [], "errors": []})
+
+
+def test_default_apply_transaction_timeout_during_edit_issue_txn_yields_unknown_not_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-6 items 1+2: a `subprocess.TimeoutExpired` raised by the REAL
+    `subprocess.run()` call that dispatches edit_issue_txn.py (inside the
+    default apply_transaction, not through the injectable seam) must
+    resolve to `mutation_outcome=unknown` and trigger the AC5 authoritative-
+    readback path -- never crash uncaught, never degrade to
+    `failed_no_mutation`."""
+    result_path = _write_candidate(tmp_path)
+    readiness_stdout = _readiness_stdout_ok()
+
+    def _fake_run(argv, **kwargs):
+        script_path = str(argv[1])
+        if "edit_issue_txn.py" in script_path:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+        return subprocess.CompletedProcess(argv, 0, stdout=readiness_stdout, stderr="")
+
+    monkeypatch.setattr(rrp.subprocess, "run", _fake_run)
+
+    fetch_calls: list[None] = []
+
+    def _fetch():
+        fetch_calls.append(None)
+        return {"body": ORIGINAL_BODY, "updatedAt": "2024-01-01T00:00:00Z"}
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2039,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=_fetch,
+    )
+
+    jsonschema.validate(result, _SCHEMA)
+    assert result["mutation_outcome"] == "unknown"
+    assert result["mutation_outcome"] != "not_attempted"
+    assert result["phase"] != "complete"
+    assert result["receipt"]["executor_status"] == "mutation_outcome_unknown"
+    assert result["receipt"]["failure_code"] == "final_readback_unresolvable"
+    # AC5: the authoritative readback must have actually run -- fetch() was
+    # called at least once for the precondition read and again to resolve
+    # the unknown outcome.
+    assert len(fetch_calls) >= 2
+    assert result["receipt"]["final_readback"]["status"] == "verified"
+
+
+def test_default_apply_transaction_oserror_during_edit_issue_txn_yields_unknown_not_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-6 items 1+2: an `OSError` raised by the REAL `subprocess.run()`
+    call (e.g. a transient OS-level failure) must resolve the SAME way as a
+    TimeoutExpired -- `unknown`, never an uncaught crash, never
+    `failed_no_mutation`."""
+    result_path = _write_candidate(tmp_path)
+    readiness_stdout = _readiness_stdout_ok()
+
+    def _fake_run(argv, **kwargs):
+        script_path = str(argv[1])
+        if "edit_issue_txn.py" in script_path:
+            raise OSError("transient os-level subprocess failure")
+        return subprocess.CompletedProcess(argv, 0, stdout=readiness_stdout, stderr="")
+
+    monkeypatch.setattr(rrp.subprocess, "run", _fake_run)
+
+    def _fetch():
+        return {"body": ORIGINAL_BODY, "updatedAt": "2024-01-01T00:00:00Z"}
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2039,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=_fetch,
+    )
+
+    jsonschema.validate(result, _SCHEMA)
+    assert result["mutation_outcome"] == "unknown"
+    assert result["mutation_outcome"] != "not_attempted"
+    assert result["receipt"]["executor_status"] == "mutation_outcome_unknown"
+
+
+def test_default_apply_transaction_truncated_non_json_stdout_yields_unknown_not_failed_no_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-6 item 3: when the REAL edit_issue_txn.py subprocess call
+    completes (no exception) but its stdout is empty/truncated/non-JSON,
+    the outcome must be `unknown` -- NEVER the `failed_no_mutation`
+    shortcut this previously used, since a PATCH may genuinely have been
+    dispatched even though stdout confirmation could not be read."""
+    result_path = _write_candidate(tmp_path)
+    readiness_stdout = _readiness_stdout_ok()
+
+    def _fake_run(argv, **kwargs):
+        script_path = str(argv[1])
+        if "edit_issue_txn.py" in script_path:
+            # Non-zero return code AND truncated/non-JSON stdout -- exactly
+            # the "may have run and dispatched a mutation, but we lost the
+            # confirmation" shape the review flagged as unsafe to degrade.
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="connection reset while reading child stdout"
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout=readiness_stdout, stderr="")
+
+    monkeypatch.setattr(rrp.subprocess, "run", _fake_run)
+
+    def _fetch():
+        return {"body": ORIGINAL_BODY, "updatedAt": "2024-01-01T00:00:00Z"}
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2039,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=_fetch,
+    )
+
+    jsonschema.validate(result, _SCHEMA)
+    assert result["mutation_outcome"] == "unknown"
+    assert result["mutation_outcome"] != "not_attempted"
+    assert result["receipt"]["executor_status"] == "mutation_outcome_unknown"
+    assert result["receipt"]["failure_code"] == "final_readback_unresolvable"
+
+
+def test_default_apply_transaction_unknown_dispatch_paths_mark_patch_attempted_for_fresh_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-6 / AC9 consistency: a subprocess-level unknown outcome detected
+    HERE (timeout/OSError/non-JSON stdout) reflects an actual attempt to
+    dispatch edit_issue_txn.py, so it must set `receipt.patch_attempted`
+    True (mirroring a genuine executor-reported `mutation_outcome_unknown`
+    receipt) so AC9 fresh validation still runs afterward, instead of
+    silently staying `not_run`."""
+    result_path = _write_candidate(tmp_path)
+    readiness_stdout = _readiness_stdout_ok()
+
+    def _fake_run(argv, **kwargs):
+        script_path = str(argv[1])
+        if "edit_issue_txn.py" in script_path:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+        return subprocess.CompletedProcess(argv, 0, stdout=readiness_stdout, stderr="")
+
+    monkeypatch.setattr(rrp.subprocess, "run", _fake_run)
+
+    fresh_validate_calls: list[str] = []
+
+    def _fresh_validate(body: str) -> dict:
+        fresh_validate_calls.append(body)
+        return {"actionable_repair": False, "source_lane": "unanchored", "error": None}
+
+    def _fetch():
+        return {"body": ORIGINAL_BODY, "updatedAt": "2024-01-01T00:00:00Z"}
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2039,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=_fetch,
+        fresh_validate=_fresh_validate,
+    )
+
+    jsonschema.validate(result, _SCHEMA)
+    assert result["receipt"]["patch_attempted"] is True
+    assert result["fresh_validation"]["status"] != "not_run"
+    assert fresh_validate_calls, "fresh_validate producer must actually run after an unknown dispatch outcome"
+
+
+def test_repair_action_apply_outer_registry_timeout_covers_worst_case_inner_budget_plus_reserve() -> None:
+    """P0-6: a simple static arithmetic assertion (never a live-timing
+    test) that the `repair_action.apply` registry entry's outer supervisor
+    `timeout_seconds` stays strictly greater than the documented worst-case
+    inner critical path (readiness subprocess + edit_issue_txn.py
+    subprocess) plus the AC5 readback reserve -- this is exactly the
+    timeout-budget mismatch the review found (a 60s outer timeout against a
+    90s worst-case inner critical path)."""
+    import command_registry
+
+    entry = command_registry.REGISTRY["repair_action.apply"]
+    inner_total = (
+        rrp.REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS
+        + rrp.REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS
+    )
+    required_minimum = inner_total + rrp.REPAIR_APPLY_READBACK_RESERVE_SECONDS
+
+    assert inner_total == 90, "readiness(30s) + edit_issue_txn.py(60s) worst-case critical path"
+    assert entry["timeout_seconds"] > required_minimum, (
+        f"outer timeout_seconds={entry['timeout_seconds']} must exceed "
+        f"inner_total({inner_total}) + readback_reserve"
+        f"({rrp.REPAIR_APPLY_READBACK_RESERVE_SECONDS}) = {required_minimum}"
+    )
+    assert entry["timeout_seconds"] >= required_minimum + rrp.REPAIR_APPLY_OUTER_TIMEOUT_MARGIN_SECONDS
 
 
 if __name__ == "__main__":
