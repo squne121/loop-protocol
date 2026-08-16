@@ -354,21 +354,19 @@ def _canonical_json(obj: Any) -> str:
 # Issue #2039: repair_action.apply controlled consumer -- foundational
 # building blocks. (REPAIR_APPLY_BLOCK_MARKER_ISSUE_2039)
 #
-# NOTE (partial implementation): the FD-based secure artifact reader (AC7),
-# the exactly-one mutation-intent arbiter core (AC1), and the schema
-# migration (AC2, repair_apply_result_v1.schema.json /
-# refinement_preflight_result_v1.schema.json) are implemented. AC8/AC11 are
-# wired: run_repair_action_apply() below is registered as the
-# `repair_action.apply` command_id in command_registry.py /
-# skill_runtime_command_policy.py, dispatched by skill_runtime_exec.py, and
-# constrained to stdout_contract `repair_apply_result/v1`. AC3 (provenance
-# binding), AC4 (pre-dispatch rebase-on-drift), AC5 (post-dispatch
-# retry-budget separation + authoritative readback), and AC6 (lossless
-# receipt projection, phase/failure_code separation) are also implemented --
-# see run_repair_action_apply()'s own docstring. AC9 (lane-preserving fresh
-# validation) and the AC10 historical-artifact-retention surface beyond
-# `latest_action_reference_invalidated` remain a deliberate scope gap of
-# this iteration. See PR body / IMPLEMENT_RESULT_V1 for status.
+# NOTE: the FD-based secure artifact reader (AC7), the exactly-one
+# mutation-intent arbiter core (AC1), and the schema migration (AC2,
+# repair_apply_result_v1.schema.json / refinement_preflight_result_v1.schema
+# .json) are implemented. AC8/AC11 are wired: run_repair_action_apply()
+# below is registered as the `repair_action.apply` command_id in
+# command_registry.py / skill_runtime_command_policy.py, dispatched by
+# skill_runtime_exec.py, and constrained to stdout_contract
+# `repair_apply_result/v1`. AC3 (provenance binding), AC4 (pre-dispatch
+# rebase-on-drift), AC5 (post-dispatch retry-budget separation +
+# authoritative readback), AC6 (lossless receipt projection, phase/
+# failure_code separation), AC9 (lane-preserving fresh validation), and AC10
+# (historical-artifact immutability + replay-resolves-to-no_change) are also
+# implemented -- see run_repair_action_apply()'s own docstring.
 # ---------------------------------------------------------------------------
 
 
@@ -864,6 +862,127 @@ def _repair_receipt_from_txn_result(
     }
 
 
+REPAIR_APPLY_VALID_SOURCE_LANES = {"human_context", "anchor", "unanchored"}
+
+
+def _default_fresh_validate_producer(body: str, expected_source_lane: str) -> dict:
+    """Issue #2039 AC9 default fresh-validation producer.
+
+    Reruns the SAME narrow repair producer (dry-run only -- no
+    materialization, no mutation) against `body` to determine whether an
+    actionable repair still remains after the mutation attempt. This
+    narrow producer has no lane-reclassification capability of its own, so
+    by construction it reports back the same `expected_source_lane` it was
+    invoked with (it never promotes unanchored -> anchor, never converts to
+    with_anchor, and never mixes lanes). A caller-injected `fresh_validate`
+    callable (e.g. a lane-aware fresh-preflight test double) is required to
+    exercise genuine lane-promotion / with_anchor-conversion / lane-mix-up
+    rejection; this default is the fail-closed-safe baseline for the common
+    "nothing about lane classification changed" case.
+    """
+    dry = _invoke_repair(body)
+    if dry.get("error"):
+        return {"error": dry.get("error"), "source_lane": expected_source_lane, "actionable_repair": None}
+    raw_action = dry.get("repair_action")
+    actionable = bool(
+        dry.get("changed") is True and isinstance(raw_action, dict) and raw_action.get("disposition") == "auto_apply_safe"
+    )
+    return {"error": None, "source_lane": expected_source_lane, "actionable_repair": actionable}
+
+
+def _repair_apply_expected_post_mutation_digest(
+    *,
+    mutation_outcome: str,
+    receipt: dict,
+    candidate_digest: "str | None",
+    old_digest: "str | None",
+) -> "str | None":
+    """Issue #2039 AC9: the digest fresh validation must confirm the live
+    body against, derived from the SAME authoritative signals AC5/AC6
+    already computed -- never re-guessed independently.
+
+    `applied` expects the candidate digest; `no_change` expects the
+    pre-dispatch (old) digest; an `unknown` outcome defers entirely to the
+    AC5 authoritative-readback digest classification (candidate/old), and
+    is unresolvable (None) when that classification itself is `third` or
+    `unknown` -- fresh validation must not fabricate an expectation the
+    readback itself could not establish.
+    """
+    if mutation_outcome == "applied":
+        return candidate_digest
+    if mutation_outcome == "no_change":
+        return old_digest
+    digest_class = (receipt.get("final_readback") or {}).get("digest_class")
+    if digest_class == "candidate":
+        return candidate_digest
+    if digest_class == "old":
+        return old_digest
+    return None
+
+
+def _run_repair_apply_fresh_validation(
+    *,
+    fetch,
+    producer,
+    expected_source_lane: str,
+    expected_digest: "str | None",
+) -> dict:
+    """Issue #2039 AC9: post-mutation fresh validation.
+
+    Re-reads the live Issue body (a read, never a mutation retry -- this is
+    independent of, and does not consume, the AC5 post-dispatch retry
+    budget) and reruns `producer` against it to determine whether the
+    original human-context/anchor/unanchored provenance lane was preserved
+    and whether any actionable repair remains. Succeeds ONLY when the fresh
+    result carries no actionable repair AND the live body digest matches
+    `expected_digest`; an unresolvable expected digest (e.g. an `unknown`
+    outcome whose readback digest_class was itself `third`/`unknown`) is
+    always a failure, never a silent skip.
+    """
+    if expected_digest is None:
+        return {
+            "status": "failed",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": None,
+        }
+
+    try:
+        fresh_issue = fetch()
+    except Exception:
+        return {
+            "status": "failed",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": None,
+        }
+
+    fresh_body = fresh_issue.get("body", "") or ""
+    fresh_digest = _sha256(fresh_body)
+    digest_match = _repair_apply_strip_sha_prefix(fresh_digest) == _repair_apply_strip_sha_prefix(expected_digest)
+
+    produced = producer(fresh_body)
+    if produced.get("error") is not None:
+        return {
+            "status": "failed",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": digest_match,
+        }
+
+    reported_lane = produced.get("source_lane")
+    lane_preserved = reported_lane in REPAIR_APPLY_VALID_SOURCE_LANES and reported_lane == expected_source_lane
+    actionable_remaining = produced.get("actionable_repair")
+
+    status = "success" if (lane_preserved and actionable_remaining is False and digest_match) else "failed"
+    return {
+        "status": status,
+        "source_lane_preserved": lane_preserved,
+        "actionable_repair_remaining": actionable_remaining,
+        "final_body_digest_match": digest_match,
+    }
+
+
 def run_repair_action_apply(
     *,
     repo: str,
@@ -874,6 +993,7 @@ def run_repair_action_apply(
     apply_transaction=None,
     expected_provenance: "dict | None" = None,
     rerun_producer=None,
+    fresh_validate=None,
 ) -> dict:
     """Issue #2039 AC8/AC11: `repair_action.apply` controlled consumer.
 
@@ -914,11 +1034,31 @@ def run_repair_action_apply(
     `phase`/`mutation_outcome`/`failure_code` are kept as separate fields
     (the repair lane never emits `contract_patch_plan_missing`).
 
-    Scope note: lane-preserving fresh validation (AC9) and historical
-    artifact retention semantics beyond `latest_action_reference_invalidated`
-    (AC10) remain declared scope gaps of this iteration -- see PR body /
-    IMPLEMENT_RESULT_V1 for status. `fresh_validation.status` is always
-    `not_run`.
+    AC9 (lane-preserving fresh validation): after any attempt that reaches
+    transaction dispatch (`receipt.patch_attempted` is True -- applied,
+    no_change, or unknown outcomes; never a not_attempted outcome, since
+    nothing was ever attempted there), a single read-only fresh validation
+    reruns `fresh_validate` (injectable; defaults to
+    `_default_fresh_validate_producer`) against the now-current live body
+    and re-reads the live Issue once more. It succeeds ONLY when the fresh
+    result reports no actionable repair remaining, the original source
+    lane (human_context/anchor/unanchored) is preserved (never an
+    unconditional `with_anchor` conversion, source-lane promotion, or lane
+    mix-up), and the live body digest matches the digest AC5's own
+    authoritative-readback classification already established. This never
+    re-dispatches a mutation and is independent of the AC5 post-dispatch
+    retry budget.
+
+    AC10 (historical artifact immutability): this function never deletes
+    the preflight-result artifact it reads, the producer's own recorded
+    `candidate_body_artifact`, or any rebase-rerun artifact -- only its own
+    transaction-local scratch re-serialization (a fresh copy written for
+    `edit_issue_txn.py`'s own consumption) is ever removed, in a `finally`
+    block, after dispatch. A replay against a live body that already
+    matches this candidate's own recorded `repaired_body_sha256` (i.e. the
+    change was already applied by a prior invocation) is detected before
+    the AC4 rebase budget is spent and resolves deterministically to
+    `mutation_outcome=no_change` with no GitHub mutation dispatched.
     """
     root = repo_root or _find_repo_root()
     _pf_path = Path(preflight_result_path)
@@ -1058,6 +1198,48 @@ def run_repair_action_apply(
 
     if drift_detected:
         rebase_projection["drift_detected"] = True
+
+        # AC10: replay-of-an-already-applied-change short circuit. If the
+        # live body already matches THIS candidate's own recorded target
+        # (repaired_body_sha256), the requested change was already
+        # achieved by a prior invocation (or externally) -- this is a
+        # replay, not a fresh drift that needs rebasing. Resolve
+        # deterministically to no_change WITHOUT spending the single
+        # pre-dispatch rebase budget and WITHOUT dispatching any GitHub
+        # mutation.
+        if _repair_apply_strip_sha_prefix(live_body_digest) == _repair_apply_strip_sha_prefix(
+            repair_action.get("repaired_body_sha256")
+        ):
+            return {
+                "schema_version": REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION,
+                "phase": "complete",
+                "mutation_outcome": "no_change",
+                "failure_code": None,
+                "repo": repo,
+                "issue_number": issue_number,
+                "provenance": provenance,
+                "rebase": rebase_projection,
+                "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
+                "receipt": {
+                    "patch_attempted": False,
+                    "executor_status": None,
+                    "mutation_outcome": "no_change",
+                    "failure_code": None,
+                    "final_readback": {
+                        "status": "verified",
+                        "digest": f"sha256:{live_body_digest}",
+                        "digest_class": "candidate",
+                    },
+                },
+                "fresh_validation": {
+                    "status": "not_run",
+                    "source_lane_preserved": True,
+                    "actionable_repair_remaining": None,
+                    "final_body_digest_match": None,
+                },
+                "historical_artifacts": {"physically_deleted": False, "latest_action_reference_invalidated": False},
+            }
+
         rebase_projection["attempted"] = True
         rebase_projection["producer_reruns"] = 1
 
@@ -1274,6 +1456,34 @@ def run_repair_action_apply(
     phase = "complete" if mutation_outcome in {"applied", "no_change", "not_attempted"} else "final_readback"
     failure_code = receipt["failure_code"]
 
+    # AC9: fresh validation only runs after an attempt that actually
+    # reached transaction dispatch (patch_attempted) -- a not_attempted
+    # outcome never touched GitHub, so there is nothing post-mutation to
+    # validate, and fresh_validation stays not_run.
+    if receipt.get("patch_attempted"):
+        expected_digest = _repair_apply_expected_post_mutation_digest(
+            mutation_outcome=mutation_outcome,
+            receipt=receipt,
+            candidate_digest=candidate_digest,
+            old_digest=live_body_digest,
+        )
+        fresh_validate_fn = fresh_validate or (
+            lambda body: _default_fresh_validate_producer(body, source_lane)
+        )
+        fresh_validation = _run_repair_apply_fresh_validation(
+            fetch=fetch,
+            producer=fresh_validate_fn,
+            expected_source_lane=source_lane,
+            expected_digest=expected_digest,
+        )
+    else:
+        fresh_validation = {
+            "status": "not_run",
+            "source_lane_preserved": True,
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": None,
+        }
+
     return {
         "schema_version": REPAIR_ACTION_APPLY_STDOUT_SCHEMA_VERSION,
         "phase": phase,
@@ -1285,12 +1495,7 @@ def run_repair_action_apply(
         "rebase": rebase_projection,
         "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
         "receipt": receipt,
-        "fresh_validation": {
-            "status": "not_run",
-            "source_lane_preserved": True,
-            "actionable_repair_remaining": None,
-            "final_body_digest_match": None,
-        },
+        "fresh_validation": fresh_validation,
         "historical_artifacts": {
             "physically_deleted": False,
             "latest_action_reference_invalidated": mutation_outcome == "applied",
