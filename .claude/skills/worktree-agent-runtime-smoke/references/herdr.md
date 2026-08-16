@@ -95,3 +95,20 @@ evidence の `prompt_stall_recovered: true` として記録し、成功を偽装
   （他 run の session 名を対象にしない）
 - `agent_prompt_stalled` からの回復は `send-keys enter` 1 回のみとし、
   無限リトライや SKIP への降格で失敗を隠さない
+
+## isolated session lifecycle 全体で同一の explicit identity を使う（Issue #2176 P0-3）
+
+collision check（`new_isolated_session_name`）・session 作成
+（`create_isolated_session`）・socket lookup（`_session_socket_path`）に加えて、
+cleanup（`session stop` -> `session delete` -> `session list --json` 消失確認）も、
+同一の明示的な stripped `isolated_env`（`HERDR_SESSION`／`HERDR_SOCKET_PATH` を
+この run 自身の値に固定した環境）で実行する。cleanup だけが暗黙の ambient
+環境（呼び出し元プロセスが継承した `HERDR_SESSION`／`HERDR_SOCKET_PATH`）に
+フォールバックする非対称は許容しない。
+
+`--require-session-baseline-preservation` を指定すると、isolated session を
+作成する前後で `herdr session list --json` の全件（この run が自分で作成した
+session を除く）を比較し、既存の人間 session を含む pre-existing session が
+一件でも変化・消失していれば fail-closed で FAIL とする（snapshot 自体の取得
+失敗も FAIL 扱いとし、黙って skip しない）。省略時（既定）は従来どおりこの
+検証を行わない。
