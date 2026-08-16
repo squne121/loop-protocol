@@ -827,6 +827,49 @@ exit 0
     assert "codex prompt text" in stdin_text
 
 
+def test_given_fake_codex_success_with_expected_marker_when_structured_lane_runs_then_exit0_and_causal_evidence_null(
+    repo_with_worktree, tmp_path
+):
+    """Issue #2183 PR #2220 OWNER REQUEST_CHANGES P0-1
+    (https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514):
+    the structured lane's --expect-marker default causal-evidence gate
+    (``causal_evidence_required``) must be scoped to ``args.runtime ==
+    "claude"`` -- ``subagent_causal_evidence_verdict()`` is only ever
+    computed for the Claude structured lane (the Codex lane has no
+    SubagentStart/SubagentStop stream-json channel this harness can parse,
+    so ``causal_evidence`` is unconditionally ``None`` there). Before this
+    fix-delta, a Codex run that exited 0, reached a terminal event, AND
+    printed the expected marker text was still forced to FAIL purely
+    because ``causal_evidence is None`` -- a bug, not a genuine causal-
+    evidence gap, since Codex was never expected to have that channel in
+    the first place."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "codex", """
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "--json --ephemeral -C"
+  exit 0
+fi
+cat > /dev/null
+echo '{"type":"item.completed","text":"MARKER_TOKEN_CODEX_P0_1"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path, "codex prompt text\n")
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "codex", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--expect-marker", "MARKER_TOKEN_CODEX_P0_1",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "subagent_causal_evidence: None" in summary
+    assert "subagent causal evidence insufficient" not in result.stderr
+
+
 # ---------------------------------------------------------------------------
 # AC9 / postcondition (Issue #1921 P0-5: full repository fingerprint)
 # ---------------------------------------------------------------------------

@@ -55,9 +55,12 @@ def _hook_payload(
     agent_type: str = AGENT_TYPE,
     agent_transcript_path: str | None = None,
     last_assistant_message: str | None = None,
+    session_id: str = SESSION_ID,
+    prompt_id: str | None = None,
+    stop_hook_active: bool | None = None,
 ) -> str:
     payload = {
-        "session_id": SESSION_ID,
+        "session_id": session_id,
         "hook_event_name": hook_event_name,
         "agent_id": agent_id,
         "agent_type": agent_type,
@@ -66,6 +69,10 @@ def _hook_payload(
         payload["agent_transcript_path"] = agent_transcript_path
     if last_assistant_message is not None:
         payload["last_assistant_message"] = last_assistant_message
+    if prompt_id is not None:
+        payload["prompt_id"] = prompt_id
+    if stop_hook_active is not None:
+        payload["stop_hook_active"] = stop_hook_active
     return json.dumps(payload)
 
 
@@ -76,59 +83,83 @@ def _hook_event(
     agent_type: str = AGENT_TYPE,
     agent_transcript_path: str | None = None,
     last_assistant_message: str | None = None,
+    session_id: str = SESSION_ID,
+    prompt_id: str | None = None,
+    stop_hook_active: bool | None = None,
+    outer_session_id: str | None = None,
+    stdout_override: str | None = None,
+    output_override: str | None = None,
 ) -> str:
+    embedded = _hook_payload(
+        agent_id,
+        hook_event,
+        agent_type=agent_type,
+        agent_transcript_path=agent_transcript_path,
+        last_assistant_message=last_assistant_message,
+        session_id=session_id,
+        prompt_id=prompt_id,
+        stop_hook_active=stop_hook_active,
+    )
     return _line(
         {
             "type": "system",
             "subtype": "hook_response",
             "hook_event": hook_event,
             "hook_name": hook_event,
-            "session_id": SESSION_ID,
-            "stdout": _hook_payload(
-                agent_id,
-                hook_event,
-                agent_type=agent_type,
-                agent_transcript_path=agent_transcript_path,
-                last_assistant_message=last_assistant_message,
-            ),
-            "output": _hook_payload(
-                agent_id,
-                hook_event,
-                agent_type=agent_type,
-                agent_transcript_path=agent_transcript_path,
-                last_assistant_message=last_assistant_message,
-            ),
+            "session_id": outer_session_id if outer_session_id is not None else session_id,
+            "stdout": stdout_override if stdout_override is not None else embedded,
+            "output": output_override if output_override is not None else embedded,
         }
     )
 
 
-def _agent_tool_use_event(tool_use_id: str = AGENT_TOOL_USE_ID) -> str:
-    return _line(
-        {
-            "type": "assistant",
-            "session_id": SESSION_ID,
-            "message": {
-                "content": [
-                    {"type": "tool_use", "id": tool_use_id, "name": "Agent", "input": {}},
-                ]
-            },
-        }
-    )
+def _agent_tool_use_event(
+    tool_use_id: str = AGENT_TOOL_USE_ID,
+    *,
+    session_id: str = SESSION_ID,
+    prompt_id: str | None = None,
+) -> str:
+    payload = {
+        "type": "assistant",
+        "session_id": session_id,
+        "message": {
+            "content": [
+                {"type": "tool_use", "id": tool_use_id, "name": "Agent", "input": {}},
+            ]
+        },
+    }
+    if prompt_id is not None:
+        payload["prompt_id"] = prompt_id
+    return _line(payload)
 
 
-def _agent_tool_result_event(agent_id: str, tool_use_id: str = AGENT_TOOL_USE_ID) -> str:
-    return _line(
-        {
-            "type": "user",
-            "session_id": SESSION_ID,
-            "message": {
-                "content": [
-                    {"type": "tool_result", "tool_use_id": tool_use_id, "content": "done"},
-                ]
-            },
-            "tool_use_result": {"status": "completed", "agentId": agent_id, "agentType": AGENT_TYPE},
-        }
-    )
+def _agent_tool_result_event(
+    agent_id: str,
+    tool_use_id: str = AGENT_TOOL_USE_ID,
+    *,
+    session_id: str = SESSION_ID,
+    prompt_id: str | None = None,
+    status: str = "completed",
+    is_error: bool = False,
+) -> str:
+    payload = {
+        "type": "user",
+        "session_id": session_id,
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": "done",
+                    "is_error": is_error,
+                },
+            ]
+        },
+        "tool_use_result": {"status": status, "agentId": agent_id, "agentType": AGENT_TYPE},
+    }
+    if prompt_id is not None:
+        payload["prompt_id"] = prompt_id
+    return _line(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -571,3 +602,515 @@ def test_given_unrelated_subagent_completes_and_parent_emits_marker_when_verdict
     assert verdict["marker_provenance_verified"] is False
     assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
     assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+# ---------------------------------------------------------------------------
+# PR #2220 OWNER REQUEST_CHANGES P0-2
+# (https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514):
+# marker_provenance_verified must require EVERY expected marker to be
+# recovered from a CHILD-scoped source (the correlated SubagentStop's own
+# last_assistant_message, or an assistant-authored record of the child's
+# own transcript file) -- never "at least one" (the pre-fix-delta any()
+# check), and never a user-prompt/tool-input record inside that same
+# transcript file.
+# ---------------------------------------------------------------------------
+
+
+def _assistant_transcript_line(text: str) -> str:
+    return json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+
+
+def _user_transcript_line(text: str) -> str:
+    return json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": text}]}})
+
+
+def _tool_use_transcript_line(command_text: str) -> str:
+    return json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": command_text}}
+                ]
+            },
+        }
+    )
+
+
+MARKER_1 = "MARKER_ONE_CHILD"
+MARKER_2 = "MARKER_TWO_PARENT_ONLY"
+
+
+def _fully_correlated_stdout_lines(
+    transcript_path: str,
+    *,
+    agent_id: str = CHILD_AGENT_ID,
+    last_assistant_message: str | None = None,
+) -> list[str]:
+    return [
+        _agent_tool_use_event(),
+        _hook_event("SubagentStart", agent_id=agent_id),
+        _agent_tool_result_event(agent_id),
+        _hook_event(
+            "SubagentStop",
+            agent_id=agent_id,
+            agent_transcript_path=transcript_path,
+            last_assistant_message=last_assistant_message,
+        ),
+    ]
+
+
+def test_given_marker_two_only_in_parent_final_message_when_verdict_computed_then_not_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(MARKER_1) + "\n", encoding="utf-8")
+    parent_message = _line(
+        {
+            "type": "assistant",
+            "session_id": SESSION_ID,
+            "message": {"content": [{"type": "text", "text": f"parent says {MARKER_2}"}]},
+        }
+    )
+    stdout = "\n".join(
+        _fully_correlated_stdout_lines(str(transcript_path)) + [parent_message]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [MARKER_1, MARKER_2])
+    assert verdict["agent_transcript_verified"] is True
+    assert verdict["tool_invocation_id_correlated"] is True
+    assert verdict["marker_provenance_verified"] is False
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_marker_only_in_child_user_prompt_record_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_user_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(_fully_correlated_stdout_lines(str(transcript_path)))
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_transcript_verified"] is True
+    assert verdict["tool_invocation_id_correlated"] is True
+    assert verdict["marker_provenance_verified"] is False
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_marker_only_in_child_tool_input_record_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(
+        _tool_use_transcript_line(f"echo {COMPLETION_MARKER}") + "\n", encoding="utf-8"
+    )
+    stdout = "\n".join(_fully_correlated_stdout_lines(str(transcript_path)))
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_transcript_verified"] is True
+    assert verdict["marker_provenance_verified"] is False
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_marker_only_in_child_assistant_final_message_when_verdict_computed_then_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(_fully_correlated_stdout_lines(str(transcript_path)))
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["marker_provenance_verified"] is True
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_given_multiple_expected_markers_all_in_child_assistant_output_when_verdict_computed_then_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(MARKER_1) + "\n", encoding="utf-8")
+    stdout = "\n".join(
+        _fully_correlated_stdout_lines(
+            str(transcript_path), last_assistant_message=f"done: {MARKER_2}"
+        )
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [MARKER_1, MARKER_2])
+    assert verdict["marker_provenance_verified"] is True
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_given_parent_and_child_emit_same_marker_when_verdict_computed_then_child_provenance_independently_confirmed(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    parent_message = _line(
+        {
+            "type": "assistant",
+            "session_id": SESSION_ID,
+            "message": {"content": [{"type": "text", "text": f"parent also says {COMPLETION_MARKER}"}]},
+        }
+    )
+    stdout = "\n".join(
+        _fully_correlated_stdout_lines(str(transcript_path)) + [parent_message]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["marker_provenance_verified"] is True
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+# ---------------------------------------------------------------------------
+# PR #2220 OWNER REQUEST_CHANGES P0-3
+# (https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514):
+# session_id / prompt_id / stream ordering / agent_type / tool-invocation
+# session-prompt scoping / terminal-success must all participate in
+# correlation -- a bare agent_id set-membership match is not enough.
+# ---------------------------------------------------------------------------
+
+
+def test_given_start_and_stop_in_different_sessions_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID, session_id="session-A"),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+                session_id="session-B",
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_id"] is None
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_stop_stream_index_before_start_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+            ),
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_id"] is None
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_start_and_stop_in_different_prompts_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID, prompt_id="prompt-1"),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+                prompt_id="prompt-2",
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_id"] is None
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_start_and_stop_agent_type_mismatch_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID, agent_type="type-a"),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_type="type-b",
+                agent_transcript_path=str(transcript_path),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_id"] is None
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_agent_tool_call_in_different_session_when_verdict_computed_then_tool_invocation_not_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(session_id="other-session"),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
+            _agent_tool_result_event(CHILD_AGENT_ID, session_id="other-session"),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["tool_invocation_id_correlated"] is False
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_agent_tool_call_in_different_prompt_when_verdict_computed_then_tool_invocation_not_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(prompt_id="other-prompt"),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID, prompt_id="prompt-1"),
+            _agent_tool_result_event(CHILD_AGENT_ID, prompt_id="other-prompt"),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+                prompt_id="prompt-1",
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["tool_invocation_id_correlated"] is False
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_agent_tool_result_status_error_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
+            _agent_tool_result_event(CHILD_AGENT_ID, status="error", is_error=True),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["tool_invocation_id_correlated"] is True
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_agent_tool_result_status_async_not_terminal_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event("SubagentStart", agent_id=CHILD_AGENT_ID),
+            _agent_tool_result_event(CHILD_AGENT_ID, status="async_launched"),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["tool_invocation_id_correlated"] is True
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+# ---------------------------------------------------------------------------
+# PR #2220 OWNER REQUEST_CHANGES P1-1
+# (https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514):
+# a durable child transcript must not merely exist -- it must not be a
+# symlink, must be within any caller-supplied allowed roots, must be
+# consistent with a caller-supplied run time window, and must not exceed a
+# bounded size.
+# ---------------------------------------------------------------------------
+
+
+def test_given_transcript_path_is_symlink_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    real_target = tmp_path / "real-transcript.jsonl"
+    real_target.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    symlink_path = tmp_path / "symlinked-transcript.jsonl"
+    symlink_path.symlink_to(real_target)
+    stdout = "\n".join(_fully_correlated_stdout_lines(str(symlink_path)))
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_transcript_verified"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_given_read_transcript_content_symlink_path_when_read_then_rejected_is_symlink(tmp_path) -> None:
+    real_target = tmp_path / "real-transcript.jsonl"
+    real_target.write_text("content\n", encoding="utf-8")
+    symlink_path = tmp_path / "symlinked-transcript.jsonl"
+    symlink_path.symlink_to(real_target)
+    result = smoke._read_claude_agent_transcript_content(str(symlink_path))
+    assert result["content"] is None
+    assert result["rejected_reason"] == "is_symlink"
+
+
+def test_given_transcript_path_outside_allowed_roots_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "outside" / "child-transcript.jsonl"
+    transcript_path.parent.mkdir()
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    allowed_root = tmp_path / "allowed-worktree"
+    allowed_root.mkdir()
+    stdout = "\n".join(_fully_correlated_stdout_lines(str(transcript_path)))
+    verdict = smoke.subagent_causal_evidence_verdict(
+        stdout, [COMPLETION_MARKER], transcript_allowed_roots=[str(allowed_root)]
+    )
+    assert verdict["agent_transcript_verified"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_given_read_transcript_content_within_allowed_roots_when_read_then_content_returned(tmp_path) -> None:
+    allowed_root = tmp_path / "allowed-worktree"
+    allowed_root.mkdir()
+    transcript_path = allowed_root / "child-transcript.jsonl"
+    transcript_path.write_text("real content\n", encoding="utf-8")
+    result = smoke._read_claude_agent_transcript_content(
+        str(transcript_path), allowed_roots=[str(allowed_root)]
+    )
+    assert result["content"] == "real content\n"
+    assert result["rejected_reason"] is None
+    assert result["sha256"] is not None
+
+
+def test_given_transcript_mtime_outside_run_window_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    stdout = "\n".join(_fully_correlated_stdout_lines(str(transcript_path)))
+    far_future_start = 4102444800.0  # 2100-01-01T00:00:00Z
+    far_future_end = 4102448400.0
+    verdict = smoke.subagent_causal_evidence_verdict(
+        stdout,
+        [COMPLETION_MARKER],
+        run_start_time=far_future_start,
+        run_end_time=far_future_end,
+    )
+    assert verdict["agent_transcript_verified"] is False
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_given_read_transcript_content_oversized_when_read_then_rejected_oversized(tmp_path) -> None:
+    transcript_path = tmp_path / "big-transcript.jsonl"
+    transcript_path.write_text("x" * 1000, encoding="utf-8")
+    result = smoke._read_claude_agent_transcript_content(str(transcript_path), max_bytes=100)
+    assert result["content"] is None
+    assert result["rejected_reason"] == "oversized"
+
+
+# ---------------------------------------------------------------------------
+# PR #2220 OWNER REQUEST_CHANGES P1-2
+# (https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514):
+# a stdout/output contradiction on the same hook event, and an ambiguous
+# multi-candidate chain, must both fail closed rather than silently prefer
+# one channel/candidate.
+# ---------------------------------------------------------------------------
+
+
+def test_given_stdout_output_contradiction_on_hook_event_when_extracted_then_marked_contradictory() -> None:
+    conflicting_stdout = _hook_payload(CHILD_AGENT_ID, "SubagentStart")
+    conflicting_output = _hook_payload(OTHER_AGENT_ID, "SubagentStart")
+    stdout = _hook_event(
+        "SubagentStart",
+        agent_id=CHILD_AGENT_ID,
+        stdout_override=conflicting_stdout,
+        output_override=conflicting_output,
+    )
+    events = smoke.extract_claude_hook_lifecycle_events(stdout)
+    assert len(events) == 1
+    assert events[0]["contradictory"] is True
+    assert events[0]["agent_id"] is None
+
+
+def test_given_stdout_output_contradiction_when_verdict_computed_then_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    transcript_path = tmp_path / "child-transcript.jsonl"
+    transcript_path.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    conflicting_stdout = _hook_payload(
+        CHILD_AGENT_ID, "SubagentStart", agent_transcript_path=str(transcript_path)
+    )
+    conflicting_output = _hook_payload(
+        OTHER_AGENT_ID, "SubagentStart", agent_transcript_path=str(transcript_path)
+    )
+    stdout = "\n".join(
+        [
+            _agent_tool_use_event(),
+            _hook_event(
+                "SubagentStart",
+                agent_id=CHILD_AGENT_ID,
+                stdout_override=conflicting_stdout,
+                output_override=conflicting_output,
+            ),
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _hook_event(
+                "SubagentStop",
+                agent_id=CHILD_AGENT_ID,
+                agent_transcript_path=str(transcript_path),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["agent_id"] is None
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def test_given_multiple_fully_qualifying_candidate_chains_when_verdict_computed_then_ambiguous_not_hook_id_correlated(
+    tmp_path,
+) -> None:
+    first_transcript = tmp_path / "first-transcript.jsonl"
+    first_transcript.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    second_transcript = tmp_path / "second-transcript.jsonl"
+    second_transcript.write_text(_assistant_transcript_line(COMPLETION_MARKER) + "\n", encoding="utf-8")
+    second_agent_id = "b25c8f0673d997e52"
+    second_tool_use_id = "toolu_02AgentInvocation"
+    stdout = "\n".join(
+        _fully_correlated_stdout_lines(str(first_transcript))
+        + [
+            _agent_tool_use_event(second_tool_use_id),
+            _hook_event("SubagentStart", agent_id=second_agent_id),
+            _agent_tool_result_event(second_agent_id, second_tool_use_id),
+            _hook_event(
+                "SubagentStop",
+                agent_id=second_agent_id,
+                agent_transcript_path=str(second_transcript),
+            ),
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [COMPLETION_MARKER])
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["causal_evidence_ambiguous_candidate_count"] == 2

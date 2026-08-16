@@ -445,23 +445,31 @@ def test_given_no_baseline_preservation_flag_when_interactive_lane_runs_then_bas
 
 
 # ---------------------------------------------------------------------------
-# 3b. Issue #2183 AC10: interactive lane causal-evidence gate is opt-in
-#     (unlike the structured lane's --expect-marker default forcing), since
-#     the herdr pane's plain-text rendering never echoes the
-#     --include-hook-events stream-json hook payload
-#     subagent_causal_evidence_verdict() parses.
+# 3b. Issue #2183 AC10 (superseded by PR #2220 OWNER REQUEST_CHANGES P0-1,
+#     https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514):
+#     --require-subagent-causal-evidence is now rejected at argparse time for
+#     any runtime/mode combination other than ``--runtime claude --mode
+#     structured``, because that is the ONLY combination for which
+#     subagent_causal_evidence_verdict() has a structural hook-lifecycle
+#     channel to evaluate at all -- the interactive lane's herdr pane
+#     plain-text rendering never echoes the --include-hook-events
+#     stream-json hook payload that function parses, so the flag would
+#     always FAIL every interactive-lane run regardless of whether it
+#     actually succeeded. The interactive lane no longer has an opt-in path
+#     for this gate (P0-1 fix-delta); --expect-marker without the flag
+#     remains available and unaffected (see the exit0 test below).
 # ---------------------------------------------------------------------------
 
 
-def test_given_interactive_lane_marker_only_when_require_subagent_causal_evidence_opt_in_then_fails(
+def test_given_interactive_lane_with_require_subagent_causal_evidence_when_parsed_then_rejected(
     repo_with_worktree, tmp_path
 ):
-    """Issue #2183 AC10: when a caller explicitly opts in via
-    --require-subagent-causal-evidence, the interactive lane DOES gate
-    exit_code on causal_evidence_source -- the herdr pane here only ever
-    renders the plain marker text (no hook lifecycle JSON), so this must
-    FAIL even though the plain --expect-marker text match itself would
-    have succeeded."""
+    """PR #2220 OWNER REQUEST_CHANGES P0-1: --require-subagent-causal-evidence
+    combined with --mode interactive (or any --runtime other than claude) is
+    now rejected at argparse time (exit 2, before any process is spawned),
+    since subagent_causal_evidence_verdict() never has a hook-lifecycle
+    channel to evaluate outside --runtime claude --mode structured -- the
+    flag would otherwise always force a FAIL regardless of run outcome."""
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -480,10 +488,9 @@ def test_given_interactive_lane_marker_only_when_require_subagent_causal_evidenc
         fake_bin_dir=fake_bin,
         extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
     )
-    assert result.returncode == 1
-    assert "subagent causal evidence insufficient (--require-subagent-causal-evidence)" in result.stderr
-    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
-    assert "'causal_evidence_source': 'marker_only_insufficient'" in summary
+    assert result.returncode == 2
+    assert "--require-subagent-causal-evidence requires --runtime claude --mode structured" in result.stderr
+    assert not out_dir.exists()
 
 
 def test_given_herdr_interactive_lane_pane_marker_only_when_causal_evidence_not_required_then_exit0(

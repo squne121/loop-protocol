@@ -132,25 +132,41 @@ captured stdout（stream-json）を入力とする。
 戻り値のフィールド:
 
 - `causal_evidence_source`（enum）: `hook_id_correlated` / `marker_only_insufficient` /
-  `no_evidence`。`hook_id_correlated` は、以下を **すべて** 満たした場合にのみ返る
-  （Issue #2183 AC3/AC11 強化。いずれか一つでも欠落すれば fail-closed に
-  `no_evidence`/`marker_only_insufficient` に留まる）:
-  1. 同一 `agent_id` を持つ `SubagentStart`/`SubagentStop` ペアが観測される
-  2. `SubagentStop` payload の `agent_transcript_path` が回収でき、かつそのパスが
-     指すファイルが実在し・読み取り可能・非空である（`agent_transcript_verified`）
-  3. 相関済み `agent_id` が `Agent` tool_use/tool_result の tool_use_id 相関で
-     裏付けられている（`tool_invocation_id_correlated == True`）
-  4. `expected_markers` を指定した呼び出しでは、その期待マーカーが
-     相関済み child 自身の transcript ファイル内容、または `SubagentStop` の
-     `last_assistant_message` 相当フィールド由来であることが確認できる
-     （`marker_provenance_verified`。parent 自身の最終応答文字列にのみ一致した
-     場合は昇格しない）
+  `no_evidence`。`hook_id_correlated` は、単一の曖昧さのない Start/Stop chain が以下を
+  **すべて** 満たした場合にのみ返る（Issue #2183 AC3/AC11 強化、PR #2220 OWNER
+  REQUEST_CHANGES P0-2/P0-3/P1-1/P1-2 でさらに強化。いずれか一つでも欠落・不一致・
+  曖昧なら fail-closed に `no_evidence`/`marker_only_insufficient` に留まる）:
+  1. 同一 `agent_id` を持つ `SubagentStart`/`SubagentStop` ペアが観測され、Start の
+     出現順序（`stream_index`）が Stop より構造的に先行している
+  2. 両イベントが値を持つ場合の `session_id`／`prompt_id`／`agent_type` が一致する
+     （P0-3。値を持たない場合はスキップされる best-effort 契約）。同一 `agent_id`
+     に複数の Start または複数の terminal Stop がある場合は候補から除外される
+     （P1-2、曖昧な chain を「最初の 1 件」で解決しない）
+  3. `SubagentStop` payload の `agent_transcript_path` が回収でき、かつそのパスが
+     指すファイルが実在し・シンボリックリンクでなく・（許可 root を指定した場合は）
+     その配下であり・サイズ上限以下であり・読み取り可能・非空である
+     （`agent_transcript_verified`。P1-1 で symlink 拒否・containment・サイズ上限・
+     mtime 整合チェックを追加）
+  4. 相関済み `agent_id` が、同一 session/prompt スコープ内の `Agent` tool_use/
+     tool_result の tool_use_id 相関で裏付けられ、その tool_result が terminal かつ
+     成功（`status == "completed"` かつ非 error）である
+     （`tool_invocation_id_correlated == True` かつ `terminal_tool_result_success ==
+     True`。P0-3 でエラー・未完了の tool_result を明示的に除外）
+  5. `expected_markers` を指定した呼び出しでは、その **すべての** 期待マーカー
+     （P0-2 で「いずれか 1 つ」から強化）が、相関済み child 自身の transcript ファイル
+     の assistant 発話 record（JSONL パースで user prompt/tool input を除外）、または
+     `SubagentStop` の `last_assistant_message` 由来であることが確認できる
+     （`marker_provenance_verified`。parent 自身の最終応答文字列や child 自身の
+     user prompt/tool input にのみ一致した場合は昇格しない）
+  6. 上記すべてを満たす候補 chain が **ちょうど 1 つ** であること（P0-3。複数の
+     `agent_id` が独立に全条件を満たす場合はいずれも昇格しない）
 
-  lone `SubagentStart`（`SubagentStop` 欠落）・`agent_transcript_path` 欠落・
-  transcript 未実在／空・`tool_invocation_id_correlated == False`・marker
-  provenance 未確認は、いずれも `no_evidence` に fail-closed する。hook イベントが
-  一切なく `expected_markers` の文字列のみが `stdout` にあれば
-  `marker_only_insufficient` になる
+  lone `SubagentStart`（`SubagentStop` 欠落）・session/prompt/type 不一致・
+  `agent_transcript_path` 欠落・transcript 未実在／空／symlink／範囲外／サイズ
+  超過・`tool_invocation_id_correlated == False`・terminal でない tool_result・
+  marker provenance 未確認・候補 chain の曖昧さは、いずれも `no_evidence` に
+  fail-closed する。hook イベントが一切なく `expected_markers` の文字列のみが
+  `stdout` にあれば `marker_only_insufficient` になる
 - `tool_invocation_id_correlated`（bool）: 相関済み `agent_id` が `Agent` tool_use の
   `id` と対応する `tool_result` の `tool_use_id` を介して同一の tool 呼び出しに
   紐づいていることを追加検証する（`extract_claude_canonical_read_receipt` と同じ
@@ -167,19 +183,30 @@ captured stdout（stream-json）を入力とする。
 - `agent_id` / `subagent_start_observed` / `subagent_stop_observed` /
   `agent_transcript_path`: 個別の観測事実（すべて fail-closed、推測しない）
 
-**structured lane** は `SubagentStart`/`SubagentStop` の stream-json チャンネルが常に
-利用可能なため、呼び出し側が `--expect-marker` を指定する場合、この causal-evidence
-要件（`causal_evidence_source == hook_id_correlated`）は **追加フラグなしで既定強制**
-される（PR #2220 レビュー fix-delta）。`--require-subagent-causal-evidence`（runner CLI
-フラグ、既定 OFF）は、`--expect-marker` を指定しない structured lane 実行にもこの要件
-を課したい場合にのみ使う。
+**structured lane かつ `--runtime claude`** は `SubagentStart`/`SubagentStop` の
+stream-json チャンネルが常に利用可能なため、呼び出し側が `--expect-marker` を指定する
+場合、この causal-evidence 要件（`causal_evidence_source == hook_id_correlated`）は
+**追加フラグなしで既定強制** される（PR #2220 レビュー fix-delta）。
+`--require-subagent-causal-evidence`（runner CLI フラグ、既定 OFF）は、
+`--expect-marker` を指定しない `--runtime claude --mode structured` 実行にもこの
+要件を課したい場合にのみ使う。
+
+**`--runtime codex`（structured lane）** には `SubagentStart`/`SubagentStop` 相当の
+stream-json hook channel が存在せず、`causal_evidence` は常に `None` になる。PR #2220
+OWNER REQUEST_CHANGES P0-1（https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514）
+より、structured lane の既定強制は `args.runtime == "claude"` に明示的にスコープされて
+おり、Codex の `--expect-marker` marker-only PASS はこの gate の対象外になる（修正前は
+runtime を判別しなかったため、正常終了し marker も出力した Codex 実行が
+`causal_evidence is None` を理由に誤って FAIL していた）。
 
 **interactive lane** は herdr pane のテキストレンダリングにはこの stream-json hook
 payload が構造的に現れないため、`causal_evidence_source` は今のところ
-`no_evidence`／`marker_only_insufficient` になる想定であり、この lane では本要件は
-引き続き **opt-in**（`--require-subagent-causal-evidence` を明示した場合のみ exit を
-昇格）のままとする。interactive lane 向けの hook 出力チャネル整備は本 Issue の対象外
-（follow-up）。
+`no_evidence`／`marker_only_insufficient` になる想定である。PR #2220 P0-1 fix-delta
+より、`--require-subagent-causal-evidence` は `--runtime claude --mode structured`
+以外の組み合わせでは `main()` が起動前に `parser.error`（exit 2）で拒否するようになり、
+**interactive lane はこのフラグの opt-in 対象ではなくなった**（従来 opt-in だった
+経路も含む破壊的変更）。interactive lane 向けの hook 出力チャネル整備は本 Issue の
+対象外（follow-up）。
 
 いずれの lane でも判定結果は常に `summary.md` / `schema_summary["subagent_causal_evidence"]`
 に記録され、marker のみの PASS だったのか hook ID 相関で PASS したのかを事後に判別できる。
