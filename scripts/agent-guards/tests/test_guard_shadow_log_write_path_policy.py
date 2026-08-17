@@ -401,9 +401,306 @@ def test_guard_shadow_log_valid_append_succeeds(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #2243 AC1 / AC9: a synthetic .guard_shadow_log.jsonl over the old
+# 8MiB ceiling must not trigger unauthorized_write_path -- neither at the
+# direct-unit level (AC1) nor through the canonical skill_runtime_exec.py
+# executor (AC9 runtime verification). The fixture is generated at test-run
+# time under tmp_path and never committed to the repository.
+# ---------------------------------------------------------------------------
+
+
+def _write_synthetic_jsonl(path: Path, min_bytes: int) -> int:
+    """Write a synthetic well-formed JSONL fixture at `path` with at least
+    `min_bytes` bytes, returning the actual byte count written. Never
+    committed to the repository -- generated fresh under tmp_path."""
+    written = 0
+    seq = 0
+    with open(path, "wb") as f:
+        while written < min_bytes:
+            line = (json.dumps({"schema_version": "1", "event": "synthetic", "seq": seq}) + "\n").encode()
+            f.write(line)
+            written += len(line)
+            seq += 1
+    return written
+
+
+def test_guard_shadow_log_over_8mib_direct_unit_append_not_blocked(tmp_path: Path) -> None:
+    """AC1 (direct unit level): a `.guard_shadow_log.jsonl` synthetic fixture
+    larger than the old 8MiB ceiling, with a regular JSONL append applied to
+    it, must be authorized as a valid `regular -> regular` content
+    transition by the new bounded-memory streaming capture -- the old
+    `_SHADOW_LOG_MAX_BYTES` sentinel-fail behavior must not resurface."""
+    module = _load_skill_runtime_exec_module()
+    over_8mib = (8 * 1024 * 1024) + (64 * 1024)
+    before_path = tmp_path / "shadow-log-before.jsonl"
+    _write_synthetic_jsonl(before_path, over_8mib)
+    before_bytes = before_path.read_bytes()
+    before_capture = _capture_from_bytes(module, before_bytes, tmp_path)
+    assert before_capture is not None
+    assert before_capture.total > 8 * 1024 * 1024
+
+    appended = before_bytes + (json.dumps({"schema_version": "1", "event": "appended"}) + "\n").encode()
+    after_capture = _capture_from_bytes(module, appended, tmp_path, prefix_size=before_capture.total)
+    assert after_capture is not None
+
+    assert module._is_authorized_shadow_log_content_transition_capture(before_capture, after_capture)
+
+
+def test_guard_shadow_log_over_8mib_runtime_smoke_via_executor(tmp_path: Path) -> None:
+    """AC1 / AC9 (runtime verification): the canonical `skill_runtime_exec.py`
+    privileged executor, run against a synthetic fixture repo whose
+    `.guard_shadow_log.jsonl` is seeded above the old 8MiB ceiling before a
+    regular JSONL peer append happens during the run, must not fail with
+    `unauthorized_write_path`. The fixture is generated fresh under
+    `tmp_path` and is never written to a permanently tracked repository
+    path."""
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    shadow_log = repo / ".guard_shadow_log.jsonl"
+    written = _write_synthetic_jsonl(shadow_log, (8 * 1024 * 1024) + (64 * 1024))
+    assert written > 8 * 1024 * 1024
+
+    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SHADOW_LOG_MUTATE": "self-append"})
+    assert result.returncode == 0, result.stderr
+    lines = [line for line in shadow_log.read_text().splitlines() if line]
+    assert lines[-1]
+    assert json.loads(lines[-1])["event"] == "self-append"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2243 AC2: a 32MiB+ synthetic log must not require a total-size
+# proportional buffer. This is demonstrated both structurally (the streaming
+# scan never grows a Python-heap allocation proportional to file size) and
+# via a `tracemalloc` peak-usage bound well under the file size.
+# ---------------------------------------------------------------------------
+
+
+def test_guard_shadow_log_32mib_stream_capture_bounded_memory(tmp_path: Path) -> None:
+    """AC2: streaming a 32MiB+ synthetic `.guard_shadow_log.jsonl` through
+    `_shadow_log_stream_capture` must not allocate memory proportional to
+    the total file size -- peak traced allocation must stay well under the
+    file size (bounded by a small multiple of the chunk size / per-record
+    bound, not by total file size)."""
+    import tracemalloc
+
+    module = _load_skill_runtime_exec_module()
+    over_32mib = (32 * 1024 * 1024) + (128 * 1024)
+    path = tmp_path / "shadow-log-32mib.jsonl"
+    written = _write_synthetic_jsonl(path, over_32mib)
+    assert written > 32 * 1024 * 1024
+
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        tracemalloc.start()
+        try:
+            capture = module._shadow_log_stream_capture(fd)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+    finally:
+        os.close(fd)
+
+    assert capture is not None
+    assert capture.total == written
+    assert capture.valid_jsonl
+    # A total-size-proportional buffer (the old chunks.append()/b"".join()
+    # pattern) would peak at roughly `written` bytes (32MiB+). Bounded
+    # streaming must stay far below that -- generously allow up to 4MiB of
+    # traced Python-level allocation (chunk buffers, hashers, scanner
+    # state), which is still an order of magnitude below the file size.
+    assert peak < 4 * 1024 * 1024, f"peak traced memory {peak} bytes suggests a total-size-proportional buffer"
+
+
+def test_guard_shadow_log_stream_capture_has_no_total_size_proportional_buffer(tmp_path: Path) -> None:
+    """AC2 (structural/code-level control): `_shadow_log_stream_capture` must
+    never accumulate the full stream into a single buffer -- verified by
+    wrapping `os.read` to track the largest single object ever handed back
+    from a read call and asserting it never exceeds the bounded chunk size,
+    regardless of total file size."""
+    module = _load_skill_runtime_exec_module()
+    over_32mib = (32 * 1024 * 1024) + (64 * 1024)
+    path = tmp_path / "shadow-log-32mib-structural.jsonl"
+    written = _write_synthetic_jsonl(path, over_32mib)
+
+    real_read = os.read
+    max_chunk_seen = 0
+
+    def _tracked_read(fd: int, n: int) -> bytes:
+        nonlocal max_chunk_seen
+        chunk = real_read(fd, n)
+        max_chunk_seen = max(max_chunk_seen, len(chunk))
+        return chunk
+
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        original_os_read = module.os.read
+        module.os.read = _tracked_read
+        try:
+            capture = module._shadow_log_stream_capture(fd)
+        finally:
+            module.os.read = original_os_read
+    finally:
+        os.close(fd)
+
+    assert capture is not None
+    assert capture.total == written
+    assert max_chunk_seen <= module._SHADOW_LOG_STREAM_CHUNK_BYTES
+    assert max_chunk_seen < written
+
+
+# ---------------------------------------------------------------------------
+# Issue #2243 Negative controls: disabling prefix-digest / JSONL validity /
+# non-regular-kind checks must make the corresponding AC3/AC4/AC5 regression
+# fail, proving those checks are actually load-bearing.
+# ---------------------------------------------------------------------------
+
+
+def test_guard_shadow_log_negative_control_prefix_comparison_disabled_breaks_ac3(tmp_path: Path) -> None:
+    """Negative control for AC3: if the prefix-digest comparison inside
+    `_is_authorized_shadow_log_content_transition_capture` is disabled
+    (monkeypatched to always treat the prefix as matching), a truncated /
+    1-byte-mutated "after" state that AC3 requires to fail closed would
+    instead be authorized -- proving the real implementation's prefix check
+    is load-bearing."""
+    module = _load_skill_runtime_exec_module()
+    before_bytes = (json.dumps({"schema_version": "1", "event": "seed"}) + "\n").encode()
+    # Mutate the single byte inside the prefix region (truncate + replace
+    # with unrelated content of the same-or-different length) -- this must
+    # be rejected by AC3 under the real implementation.
+    mutated_after_bytes = (json.dumps({"schema_version": "1", "event": "tampered"}) + "\n").encode()
+
+    before_capture = _capture_from_bytes(module, before_bytes, tmp_path)
+    after_capture = _capture_from_bytes(module, mutated_after_bytes, tmp_path, prefix_size=before_capture.total)
+
+    # Sanity: the real implementation correctly fails closed.
+    assert not module._is_authorized_shadow_log_content_transition_capture(before_capture, after_capture)
+
+    def _always_matching_transition(before, after) -> bool:
+        # Simulates a disabled prefix-digest comparison: skip straight to
+        # "the appended tail is well-formed JSONL" without ever checking
+        # that the prefix actually matches `before`.
+        if after.total < before.total:
+            return False
+        if not before.valid_jsonl:
+            return False
+        return bool(after.valid_jsonl)
+
+    original = module._is_authorized_shadow_log_content_transition_capture
+    module._is_authorized_shadow_log_content_transition_capture = _always_matching_transition
+    try:
+        assert module._is_authorized_shadow_log_content_transition_capture(before_capture, after_capture)
+    finally:
+        module._is_authorized_shadow_log_content_transition_capture = original
+
+
+def test_guard_shadow_log_negative_control_jsonl_validation_disabled_breaks_ac4(tmp_path: Path) -> None:
+    """Negative control for AC4: if JSONL well-formedness validation is
+    disabled (a scanner that always reports `valid_jsonl=True`), malformed
+    appended content that AC4 requires to fail closed would instead be
+    authorized -- proving the real `_JsonlLineScanner` validation is
+    load-bearing."""
+    module = _load_skill_runtime_exec_module()
+
+    class _AlwaysValidScanner:
+        def feed(self, chunk: bytes) -> None:
+            pass
+
+        def finalize(self) -> bool:
+            return True
+
+    before_bytes = (json.dumps({"schema_version": "1", "event": "seed"}) + "\n").encode()
+    malformed_after_bytes = before_bytes + b"not-json-at-all\n"
+
+    before_capture = _capture_from_bytes(module, before_bytes, tmp_path)
+    after_capture = _capture_from_bytes(module, malformed_after_bytes, tmp_path, prefix_size=before_capture.total)
+
+    # Sanity: the real implementation correctly fails closed on malformed
+    # appended content.
+    assert after_capture.suffix_valid_jsonl is False
+    assert not module._is_authorized_shadow_log_content_transition_capture(before_capture, after_capture)
+
+    original_scanner_cls = module._JsonlLineScanner
+    module._JsonlLineScanner = _AlwaysValidScanner
+    try:
+        disabled_after_capture = _capture_from_bytes(
+            module, malformed_after_bytes, tmp_path, prefix_size=before_capture.total
+        )
+        assert disabled_after_capture.suffix_valid_jsonl is True
+        assert module._is_authorized_shadow_log_content_transition_capture(before_capture, disabled_after_capture)
+    finally:
+        module._JsonlLineScanner = original_scanner_cls
+
+
+def test_guard_shadow_log_negative_control_nonregular_kind_check_disabled_breaks_ac5(tmp_path: Path) -> None:
+    """Negative control for AC5: if the non-regular-kind check
+    (`_is_allowed_shadow_log_kind_transition`) is disabled (monkeypatched to
+    always authorize), a `regular -> symlink` substitution that AC5
+    requires to fail closed would instead be silently authorized -- proving
+    the real allow-tuple check is load-bearing."""
+    module = _load_skill_runtime_exec_module()
+    repo = _make_repo(tmp_path)
+    before_snapshot = module._snapshot_repo_paths(str(repo), "1228")
+    before_status = module._git_status_paths(str(repo))
+    _seed_shadow_log(repo)
+    before_bytes = (repo / module._SHADOW_LOG_EXACT_REL).read_bytes()
+    before_stat = (repo / module._SHADOW_LOG_EXACT_REL).stat()
+    before_identity = (before_stat.st_dev, before_stat.st_ino, before_stat.st_size, before_stat.st_mtime_ns)
+    before_capture = _capture_from_bytes(module, before_bytes, tmp_path)
+
+    (repo / module._SHADOW_LOG_EXACT_REL).unlink()
+    (repo / module._SHADOW_LOG_EXACT_REL).symlink_to("/etc/hostname")
+
+    # Sanity: the real implementation correctly fails closed on the
+    # regular -> symlink substitution.
+    unauthorized = module._find_unauthorized_repo_changes(
+        str(repo),
+        "1228",
+        before_snapshot,
+        before_status,
+        shadow_log_before_kind="regular",
+        shadow_log_before_capture=before_capture,
+        shadow_log_before_identity=before_identity,
+    )
+    assert unauthorized == module._SHADOW_LOG_EXACT_REL
+
+    original = module._is_allowed_shadow_log_kind_transition
+    module._is_allowed_shadow_log_kind_transition = lambda before_kind, after_kind: True
+    try:
+        disabled_unauthorized = module._find_unauthorized_repo_changes(
+            str(repo),
+            "1228",
+            before_snapshot,
+            before_status,
+            shadow_log_before_kind="regular",
+            shadow_log_before_capture=before_capture,
+            shadow_log_before_identity=before_identity,
+        )
+        assert disabled_unauthorized is None
+    finally:
+        module._is_allowed_shadow_log_kind_transition = original
+
+
+# ---------------------------------------------------------------------------
 # AC6: behavior-based test that the guarantee is NOT implemented as a bare
 # tuple addition to _RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS.
 # ---------------------------------------------------------------------------
+
+
+def _capture_from_bytes(module, data: bytes, tmp_path: Path, prefix_size: int | None = None):
+    """Test helper: build a `ShadowLogStreamCapture` for a fixed in-memory
+    byte blob by writing it to a scratch file and running it through the
+    production streaming capture function, so direct unit tests can assert
+    against the new capture-struct-based contract without needing raw
+    buffered bytes plumbed through `_find_unauthorized_repo_changes`."""
+    scratch = tmp_path / f"shadow-log-capture-scratch-{os.getpid()}-{id(data)}.jsonl"
+    scratch.write_bytes(data)
+    fd = os.open(str(scratch), os.O_RDONLY)
+    try:
+        capture = module._shadow_log_stream_capture(fd, prefix_size=prefix_size)
+    finally:
+        os.close(fd)
+    scratch.unlink()
+    return capture
 
 
 def _load_skill_runtime_exec_module():
@@ -448,7 +745,7 @@ def test_guard_shadow_log_is_not_a_directory_root_exclusion(tmp_path: Path) -> N
         before_snapshot,
         before_status,
         shadow_log_before_kind="absent",
-        shadow_log_before_bytes=None,
+        shadow_log_before_capture=None,
     )
     assert unauthorized == module._SHADOW_LOG_EXACT_REL
 
@@ -523,7 +820,9 @@ def test_guard_shadow_log_check_runs_after_generic_snapshot(tmp_path: Path, monk
         before_snapshot,
         before_status,
         shadow_log_before_kind="regular",
-        shadow_log_before_bytes=(repo / module._SHADOW_LOG_EXACT_REL).read_bytes(),
+        shadow_log_before_capture=_capture_from_bytes(
+            module, (repo / module._SHADOW_LOG_EXACT_REL).read_bytes(), tmp_path
+        ),
         shadow_log_before_identity=(0, 0, 0, 0),
     )
     # The before_identity is deliberately a placeholder that will never
@@ -633,12 +932,13 @@ def test_guard_shadow_log_content_transition_rejects_different_inode(tmp_path: P
     """Direct unit-level regression for Blocker 3: `_find_unauthorized_repo_changes`
     must reject a regular -> regular transition whose before/after identity
     tuples have different (st_dev, st_ino), even though the content-only
-    check (`_is_authorized_shadow_log_content_transition`) would authorize
-    it as a valid append."""
+    check (`_is_authorized_shadow_log_content_transition_capture`) would
+    authorize it as a valid append."""
     module = _load_skill_runtime_exec_module()
     repo = _make_repo(tmp_path)
     shadow_log = _seed_shadow_log(repo)
     before_bytes = shadow_log.read_bytes()
+    before_capture = _capture_from_bytes(module, before_bytes, tmp_path)
     before_stat = shadow_log.stat()
     before_identity = (before_stat.st_dev, before_stat.st_ino, before_stat.st_size, before_stat.st_mtime_ns)
 
@@ -651,7 +951,8 @@ def test_guard_shadow_log_content_transition_rejects_different_inode(tmp_path: P
 
     # Sanity: the content-only check alone would authorize this transition.
     after_bytes = shadow_log.read_bytes()
-    assert module._is_authorized_shadow_log_content_transition(before_bytes, after_bytes)
+    after_capture = _capture_from_bytes(module, after_bytes, tmp_path, prefix_size=before_capture.total)
+    assert module._is_authorized_shadow_log_content_transition_capture(before_capture, after_capture)
 
     unauthorized = module._find_unauthorized_repo_changes(
         str(repo),
@@ -659,7 +960,7 @@ def test_guard_shadow_log_content_transition_rejects_different_inode(tmp_path: P
         before_snapshot,
         before_status,
         shadow_log_before_kind="regular",
-        shadow_log_before_bytes=before_bytes,
+        shadow_log_before_capture=before_capture,
         shadow_log_before_identity=before_identity,
     )
     assert unauthorized == module._SHADOW_LOG_EXACT_REL
@@ -772,8 +1073,12 @@ def test_shadow_log_hook_producer_writes_well_formed_line(tmp_path: Path) -> Non
 
 
 def test_guard_shadow_log_oversized_content_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """Issue #2243: the old `_SHADOW_LOG_MAX_BYTES` total-file-size ceiling
+    was replaced by `_SHADOW_LOG_SAFETY_VALVE_MAX_BYTES` (a pure DoS safety
+    valve, not the primary bounded-memory defense). This regression asserts
+    the safety valve still fails closed at whatever bound it is set to."""
     module = _load_skill_runtime_exec_module()
-    monkeypatch.setattr(module, "_SHADOW_LOG_MAX_BYTES", 16)
+    monkeypatch.setattr(module, "_SHADOW_LOG_SAFETY_VALVE_MAX_BYTES", 16)
 
     path = tmp_path / ".guard_shadow_log.jsonl"
     path.write_text(json.dumps({"schema_version": "1", "event": "this-record-is-too-long"}) + "\n")
@@ -939,6 +1244,7 @@ def test_guard_shadow_log_real_fifo_substitution_fails_closed(tmp_path: Path) ->
     repo = _make_repo(tmp_path)
     shadow_log = _seed_shadow_log(repo)
     before_bytes = shadow_log.read_bytes()
+    before_capture = _capture_from_bytes(module, before_bytes, tmp_path)
     before_stat = shadow_log.stat()
     before_identity = (before_stat.st_dev, before_stat.st_ino, before_stat.st_size, before_stat.st_mtime_ns)
 
@@ -958,7 +1264,7 @@ def test_guard_shadow_log_real_fifo_substitution_fails_closed(tmp_path: Path) ->
             before_snapshot,
             before_status,
             shadow_log_before_kind="regular",
-            shadow_log_before_bytes=before_bytes,
+            shadow_log_before_capture=before_capture,
             shadow_log_before_identity=before_identity,
         )
         assert unauthorized == module._SHADOW_LOG_EXACT_REL
@@ -979,6 +1285,7 @@ def test_guard_shadow_log_real_unix_socket_substitution_fails_closed(tmp_path: P
     repo = _make_repo(tmp_path)
     shadow_log = _seed_shadow_log(repo)
     before_bytes = shadow_log.read_bytes()
+    before_capture = _capture_from_bytes(module, before_bytes, tmp_path)
     before_stat = shadow_log.stat()
     before_identity = (before_stat.st_dev, before_stat.st_ino, before_stat.st_size, before_stat.st_mtime_ns)
 
@@ -999,7 +1306,7 @@ def test_guard_shadow_log_real_unix_socket_substitution_fails_closed(tmp_path: P
             before_snapshot,
             before_status,
             shadow_log_before_kind="regular",
-            shadow_log_before_bytes=before_bytes,
+            shadow_log_before_capture=before_capture,
             shadow_log_before_identity=before_identity,
         )
         assert unauthorized == module._SHADOW_LOG_EXACT_REL
@@ -1020,6 +1327,7 @@ def test_guard_shadow_log_real_device_node_substitution_fails_closed(tmp_path: P
     repo = _make_repo(tmp_path)
     shadow_log = _seed_shadow_log(repo)
     before_bytes = shadow_log.read_bytes()
+    before_capture = _capture_from_bytes(module, before_bytes, tmp_path)
     before_stat = shadow_log.stat()
     before_identity = (before_stat.st_dev, before_stat.st_ino, before_stat.st_size, before_stat.st_mtime_ns)
 
@@ -1043,7 +1351,7 @@ def test_guard_shadow_log_real_device_node_substitution_fails_closed(tmp_path: P
             before_snapshot,
             before_status,
             shadow_log_before_kind="regular",
-            shadow_log_before_bytes=before_bytes,
+            shadow_log_before_capture=before_capture,
             shadow_log_before_identity=before_identity,
         )
         assert unauthorized == module._SHADOW_LOG_EXACT_REL
