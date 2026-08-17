@@ -191,6 +191,7 @@ PROXY_STATE_DIR_TARGET=$(claude_gpt_proxy_state_dir)
 PROXY_HOME_TARGET=$(claude_gpt_proxy_home_dir)
 MCP_CONFIG_PATH=$(claude_gpt_mcp_config_path)
 SETTINGS_PATH=$(claude_gpt_session_settings_path)
+SPARK_AUTH_DIR_TARGET=$(claude_gpt_spark_auth_dir)
 # --- Claude/AGY プロセス専用の隔離 HOME/GH_CONFIG_DIR/XDG（P0-6）。credential を
 #     一切置かない空ディレクトリとして扱う。ambient `gh auth` credential を
 #     Claude/AGY プロセスから利用不能にすることが目的であり、broker（別プロセス、
@@ -203,7 +204,8 @@ CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_cache_dir)
 # --- canonical path safety（ディレクトリ作成前に必ず検証する） ---
 for d in "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
   "$CLAUDE_ISOLATED_HOME_TARGET" "$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET" \
-  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"; do
+  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET" \
+  "$SPARK_AUTH_DIR_TARGET"; do
   if ! claude_gpt_reject_if_under_repo "$d" "$SELF_PATH"; then
     printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"canonical_path_under_repo_or_worktree","path":"%s"}\n' "$d"
     exit 5
@@ -230,7 +232,8 @@ umask 077
 # --- GPT 専用ディレクトリを準備する（既存なら idempotent） ---
 mkdir -p "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
   "$CLAUDE_ISOLATED_HOME_TARGET" "$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET" \
-  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"
+  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET" \
+  "$SPARK_AUTH_DIR_TARGET"
 
 # --- strict_mcp mode 用の空 MCP config を書き込む（repository/user MCP を読み込ませない） ---
 STRICT_MCP_MODE=true
@@ -271,8 +274,221 @@ MCP_JSON_EOF
 #     (`subagent-start-stop`)のみを受け付ける。それ以外の値は fragment を空のままにする(拒否)。
 #     既存の CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS(--settings 等 CLI 引数拒否)とは独立した経路であり、
 #     それを変更・弱体化するものではない。 ---
-HOOKS_JSON_FRAGMENT=""
-ENV_JSON_FRAGMENT=""
+# --- Spark explicit-only authorization gate (Issue #2186) ------------------
+#
+# Session-local, nonce-keyed sidecar authorization gate. The gate writer
+# python source below is embedded between fixed markers
+# (`SPARK_GATE_WRITER_PY_BEGIN`/`_END`) so hermetic tests can extract the
+# exact executed source (single source of truth, no drift between runtime
+# and test fixtures) instead of re-implementing the same logic twice.
+SPARK_LAUNCH_NONCE="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+SPARK_GATE_WRITER="${PROXY_STATE_DIR_TARGET}/spark-gate-${SPARK_LAUNCH_NONCE}.py"
+( umask 077 && cat > "$SPARK_GATE_WRITER" <<'SPARK_GATE_WRITER_PY_END_MARKER'
+# SPARK_GATE_WRITER_PY_BEGIN
+import json
+import os
+import re
+import sys
+import time
+import uuid
+
+SPARK_AGENT = "spark-codex"
+AUTH_DIR = os.environ.get("CLAUDE_GPT_SPARK_AUTH_DIR", "")
+LAUNCH_NONCE = os.environ.get("CLAUDE_GPT_SPARK_LAUNCH_NONCE", "")
+
+MENTION_RE = re.compile(r"(?<![\w-])@agent-spark-codex(?![\w-])")
+FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+DQUOTE_RE = re.compile(r'"[^"\n]*"')
+SQUOTE_RE = re.compile(r"'[^'\n]*'")
+
+
+def strip_non_authorizing(text):
+    text = FENCE_RE.sub(" ", text)
+    text = INLINE_CODE_RE.sub(" ", text)
+    text = DQUOTE_RE.sub(" ", text)
+    text = SQUOTE_RE.sub(" ", text)
+    kept = []
+    for line in text.split("\n"):
+        if line.lstrip().startswith(">"):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def has_canonical_mention(prompt_text):
+    if not isinstance(prompt_text, str):
+        return False
+    return bool(MENTION_RE.search(strip_non_authorizing(prompt_text)))
+
+
+def read_payload():
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def pending_path(session_id):
+    return os.path.join(AUTH_DIR, "pending-" + session_id + ".json")
+
+
+def counter_path(session_id):
+    return os.path.join(AUTH_DIR, "counter-" + session_id + ".txt")
+
+
+def next_prompt_counter(session_id):
+    path = counter_path(session_id)
+    n = 0
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            n = int((fh.read() or "0").strip() or "0")
+    except (OSError, ValueError):
+        n = 0
+    n += 1
+    tmp = path + ".tmp-" + str(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(str(n))
+    os.replace(tmp, path)
+    return n
+
+
+def clear_pending(session_id):
+    try:
+        os.remove(pending_path(session_id))
+    except OSError:
+        pass
+
+
+def cmd_user_prompt_submit(payload):
+    session_id = payload.get("session_id") or ""
+    prompt = payload.get("prompt")
+    if not session_id or not AUTH_DIR:
+        return
+    try:
+        os.makedirs(AUTH_DIR, exist_ok=True)
+    except OSError:
+        return
+    counter = next_prompt_counter(session_id)
+    # A new turn always invalidates any previous unconsumed authorization for
+    # this session first -- authorization never carries over to the next turn
+    # (Issue #2186 AC3).
+    clear_pending(session_id)
+    if not has_canonical_mention(prompt):
+        return
+    record = {
+        "session_id": session_id,
+        "prompt_id": counter,
+        "launch_nonce": LAUNCH_NONCE,
+        "authorization_turn_id": session_id + ":" + str(counter),
+        "consumed": False,
+        "created_ts": time.time(),
+        "nonce": uuid.uuid4().hex,
+    }
+    target = pending_path(session_id)
+    tmp = target + ".tmp-" + str(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(record, fh)
+    os.replace(tmp, target)
+
+
+def cmd_pre_tool_use_agent(payload):
+    tool_input = payload.get("tool_input")
+    subagent_type = tool_input.get("subagent_type") if isinstance(tool_input, dict) else None
+    if subagent_type != SPARK_AGENT:
+        # Not our concern -- explicit allow, no interference with ordinary
+        # SubAgent mapping (Issue #2186 AC1).
+        return
+    session_id = payload.get("session_id") or ""
+    decision = "deny"
+    reason = "no_pending_authorization"
+    record = None
+    if session_id and AUTH_DIR:
+        pending = pending_path(session_id)
+        try:
+            with open(pending, "r", encoding="utf-8") as fh:
+                record = json.load(fh)
+        except (OSError, ValueError):
+            record = None
+        if isinstance(record, dict) and record.get("consumed") is False and record.get("launch_nonce") == LAUNCH_NONCE:
+            consumed_marker = pending + ".consumed-" + uuid.uuid4().hex
+            try:
+                os.rename(pending, consumed_marker)
+                decision = "allow"
+                reason = "authorization_consumed"
+            except OSError:
+                decision = "deny"
+                reason = "authorization_consume_race_lost"
+        elif isinstance(record, dict) and record.get("launch_nonce") != LAUNCH_NONCE:
+            reason = "authorization_carryover_stale_launch_nonce"
+        elif isinstance(record, dict) and record.get("consumed") is not False:
+            reason = "authorization_already_consumed"
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+    }
+    sys.stdout.write(json.dumps(output))
+    if decision != "allow":
+        sys.exit(2)
+
+
+def cmd_subagent_lifecycle(payload):
+    # SubagentStart/SubagentStop are audit-only for this gate; causal evidence
+    # itself is derived independently from `--include-hook-events` stream-json
+    # lifecycle events (PR #2220 `extract_claude_hook_lifecycle_events()`),
+    # reused unchanged (Issue #2186 In Scope).
+    return
+
+
+def main():
+    event = sys.argv[1] if len(sys.argv) > 1 else ""
+    payload = read_payload()
+    try:
+        if event == "user-prompt-submit":
+            cmd_user_prompt_submit(payload)
+        elif event == "pre-tool-use-agent":
+            cmd_pre_tool_use_agent(payload)
+        elif event in ("subagent-start", "subagent-stop"):
+            cmd_subagent_lifecycle(payload)
+    except SystemExit:
+        raise
+    except Exception:
+        # Fail closed: never let an unexpected exception here silently permit
+        # a spark-codex invocation nor crash the parent claude-gpt session.
+        if event == "pre-tool-use-agent":
+            sys.exit(2)
+        return
+
+
+if __name__ == "__main__":
+    main()
+# SPARK_GATE_WRITER_PY_END
+SPARK_GATE_WRITER_PY_END_MARKER
+)
+export CLAUDE_GPT_SPARK_AUTH_DIR="$SPARK_AUTH_DIR_TARGET"
+export CLAUDE_GPT_SPARK_LAUNCH_NONCE="$SPARK_LAUNCH_NONCE"
+export SPARK_GATE_WRITER
+SPARK_AGENTS_JSON=$(claude_gpt_spark_agents_json_fragment)
+
+HOOKS_JSON_FRAGMENT=',
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" user-prompt-submit"}]}],
+    "PreToolUse": [{"matcher": "Agent", "hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" pre-tool-use-agent"}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" subagent-start"}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" subagent-stop"}]}]
+  }'
+ENV_JSON_FRAGMENT=",
+  \"env\": {\"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\"}"
 if [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-start-stop" ]; then
   HOOKS_JSON_FRAGMENT=',
   "hooks": {
@@ -679,7 +895,7 @@ exec 9<&0
 #     （CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由）で既に全面拒否済みのため、ここに
 #     到達する時点で "$@" に `--permission-mode` トークンは含まれない。 ---
 # shellcheck disable=SC2086
-"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" --permission-mode auto "$@" <&9 &
+"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" --permission-mode auto --agents "$SPARK_AGENTS_JSON" "$@" <&9 &
 CLAUDE_PID=$!
 
 wait "$CLAUDE_PID"
