@@ -668,6 +668,76 @@ def secure_read_json(
         return {"status": "integrity_failure", "reason_code": str(exc)}
 
 
+def check_artifact_binding(
+    payload: dict[str, Any],
+    *,
+    expected_repo: str,
+    expected_issue: int,
+    expected_body_sha256: str,
+    expected_invocation_id: str,
+    expected_attempt: int,
+) -> str | None:
+    """Canonical binding-field equality check on an ALREADY schema-verified
+    ``payload`` dict (Issue #2242).  This is the SAME comparison
+    :func:`verify_artifact` performs; it is factored out here so a caller
+    that already holds a verified payload in memory (and therefore does not
+    need to repeat :func:`verify_artifact`'s own open+read+hash I/O, e.g.
+    ``run_root_review_pipeline.readback_persisted_artifact()``) can reuse
+    the exact fail-closed decision instead of reimplementing a separate
+    loose ``.get()`` comparison. Returns the fail-closed reason code
+    (``"artifact_binding_mismatch"``) or ``None`` if every field matches.
+    """
+    expected = {
+        "repository": expected_repo,
+        "issue_number": expected_issue,
+        "reviewed_body_sha256": expected_body_sha256,
+        "invocation_id": expected_invocation_id,
+        "attempt": expected_attempt,
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        return "artifact_binding_mismatch"
+    return None
+
+
+def extract_binding_context(payload: Any) -> dict[str, Any] | None:
+    """Extract + type-validate a V2 artifact's OWN binding-context fields
+    (``repository`` / ``issue_number`` / ``invocation_id`` / ``attempt``) as
+    a single canonical accessor (Issue #2242 AC7), so a consumer that
+    already holds a schema-verified payload never maintains a second,
+    independent field-map of this layout. Returns ``None`` if ``payload``
+    is not a :data:`ARTIFACT_SCHEMA` object or any binding field is
+    missing/mistyped.
+    """
+    if not isinstance(payload, dict) or payload.get("schema") != ARTIFACT_SCHEMA:
+        return None
+    repository = payload.get("repository")
+    issue_number = payload.get("issue_number")
+    invocation_id = payload.get("invocation_id")
+    attempt = payload.get("attempt")
+    if (
+        not isinstance(repository, str)
+        or not isinstance(issue_number, int)
+        or not isinstance(invocation_id, str)
+        or not isinstance(attempt, int)
+    ):
+        return None
+    return {
+        "repository": repository,
+        "issue_number": issue_number,
+        "invocation_id": invocation_id,
+        "attempt": attempt,
+    }
+
+
+def semantic_verdict_and_count(semantic_result: Any) -> tuple[str, int]:
+    """Public wrapper around ``_semantic_verdict_and_count()`` for external
+    consumers (e.g.
+    ``run_root_review_pipeline.readback_persisted_artifact()``) that must
+    not reimplement ``semantic_result``'s internal key layout (Issue #2242
+    AC7/design point 2)."""
+    return _semantic_verdict_and_count(semantic_result)
+
+
 def verify_artifact(
     *,
     artifact_root: Path,
@@ -689,15 +759,16 @@ def verify_artifact(
         return {"status": "integrity_failure", "reason_code": "raw_byte_hash_mismatch"}
     if not isinstance(payload, dict) or payload.get("schema") != ARTIFACT_SCHEMA:
         return {"status": "integrity_failure", "reason_code": "schema_mismatch"}
-    expected = {
-        "repository": expected_repo,
-        "issue_number": expected_issue,
-        "reviewed_body_sha256": expected_body_sha256,
-        "invocation_id": expected_invocation_id,
-        "attempt": expected_attempt,
-    }
-    if any(payload.get(key) != value for key, value in expected.items()):
-        return {"status": "integrity_failure", "reason_code": "artifact_binding_mismatch"}
+    binding_violation = check_artifact_binding(
+        payload,
+        expected_repo=expected_repo,
+        expected_issue=expected_issue,
+        expected_body_sha256=expected_body_sha256,
+        expected_invocation_id=expected_invocation_id,
+        expected_attempt=expected_attempt,
+    )
+    if binding_violation is not None:
+        return {"status": "integrity_failure", "reason_code": binding_violation}
     return {"status": "valid", "raw_bytes": raw, "payload": payload}
 
 

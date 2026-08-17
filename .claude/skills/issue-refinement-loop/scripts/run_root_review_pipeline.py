@@ -707,8 +707,17 @@ def readback_persisted_artifact(
     Checks (all must pass for `verdict_identity: true`):
       1. `artifact_path` opens (no-follow) as a regular file within bounds.
       2. File content parses as strict JSON via the SAME raw bytes read once.
-      3. `body_sha256` in the artifact matches `expected_body_sha256` exactly.
-      4. `verdict` in the artifact matches `expected_verdict` exactly.
+      3. The parsed payload is a `REVIEWER_COMPACT_ARTIFACT_V2` object with a
+         well-typed binding context (`reviewer_transport.extract_binding_context()`).
+      4. The artifact's top-level `reviewed_body_sha256` matches
+         `expected_body_sha256` exactly, verified via
+         `reviewer_transport.check_artifact_binding()` -- the SAME
+         fail-closed comparison `reviewer_transport.verify_artifact()` uses,
+         not a locally reimplemented `.get()` comparison (Issue #2242).
+      5. The artifact's nested `semantic_result.verdict` (extracted via
+         `reviewer_transport.semantic_verdict_and_count()`, never a locally
+         reimplemented `semantic_result` field-map) matches
+         `expected_verdict` exactly.
     """
     path = Path(artifact_path)
     violations: list[str] = []
@@ -757,11 +766,45 @@ def readback_persisted_artifact(
         violations.append("artifact_not_strict_json")
         return {"verdict_identity": False, "violations": violations}
 
-    actual_body_sha256 = payload.get("body_sha256")
-    if actual_body_sha256 != expected_body_sha256:
+    # Issue #2242: the canonical V2 writer (reviewer_transport.write_semantic_artifact())
+    # persists reviewed_body_sha256 (top-level) and semantic_result.verdict
+    # (nested) -- NOT the flat V1 body_sha256/verdict top-level keys this
+    # readback previously read (a permanently-None regression against every
+    # fresh V2 artifact). This module must not reimplement the V2 payload's
+    # internal field layout: extract_binding_context() + check_artifact_binding()
+    # are the SAME accessors/comparison reviewer_transport.verify_artifact()
+    # uses, and semantic_verdict_and_count() is the SAME semantic_result
+    # accessor project_compact_v2_from_artifact() uses -- reviewer_transport.py
+    # remains the sole owner of this schema (Issue #2054/PR #2142 SSOT, AC7/AC8).
+    context = _reviewer_transport.extract_binding_context(payload)
+    if context is None:
+        violations.append("artifact_schema_mismatch")
+        return {"verdict_identity": False, "violations": violations, "payload": payload}
+
+    binding_violation = _reviewer_transport.check_artifact_binding(
+        payload,
+        expected_repo=context["repository"],
+        expected_issue=context["issue_number"],
+        expected_body_sha256=expected_body_sha256,
+        expected_invocation_id=context["invocation_id"],
+        expected_attempt=context["attempt"],
+    )
+    if binding_violation is not None:
+        # Every OTHER expected_* value above was derived from this SAME
+        # payload (self-consistent by construction), so the only field that
+        # can actually disagree is the caller-supplied expected_body_sha256
+        # -- the failure is reported using the pre-existing violation name
+        # readback callers already key on.
         violations.append("body_sha256_mismatch")
 
-    actual_verdict = payload.get("verdict")
+    try:
+        actual_verdict, _blocking_count = _reviewer_transport.semantic_verdict_and_count(
+            payload.get("semantic_result")
+        )
+    except ValueError:
+        violations.append("semantic_result_invalid")
+        return {"verdict_identity": False, "violations": violations, "payload": payload}
+
     if actual_verdict != expected_verdict:
         violations.append("verdict_mismatch")
 
