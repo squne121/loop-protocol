@@ -171,6 +171,21 @@ if str(_ISSUE_CONTRACT_REVIEW_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_ISSUE_CONTRACT_REVIEW_SCRIPTS))
 import contract_readiness_check as _contract_readiness_check  # noqa: E402
 
+# Issue #2207 AC8: the SAME canonical VC plan (`baseline_vc_preflight.py`) /
+# budget-formula (`contract_readiness_check.py`) functions those modules
+# use internally to derive their OWN dynamic timeouts, imported here so
+# THIS module can derive an invocation-local `ReviewBudget` from the SAME
+# pinned body and pass it explicitly to
+# `reviewer_transport.run_reviewer_transport()` -- instead of relying on
+# reviewer_transport.py's generic module-level fallback constants
+# (`PER_ATTEMPT_DEADLINE_SECONDS` / `TOTAL_DEADLINE_SECONDS`), which remain
+# UNCHANGED by this wiring.
+_VerificationBudgetExceedsPolicyError = _contract_readiness_check.VerificationBudgetExceedsPolicyError
+_derive_review_budget = _contract_readiness_check.derive_review_budget
+import baseline_vc_preflight as _baseline_vc_preflight  # noqa: E402
+
+_compute_canonical_vc_plan = _baseline_vc_preflight.compute_canonical_vc_plan
+
 # Issue #2054 AC8: `reviewer_transport.py` is the V2 contract SSOT. This
 # module no longer imports the retired V1 `compact_review_result()` renderer
 # (`compact_review_result.py`'s CLI/pure-function producer is retired --
@@ -295,7 +310,7 @@ def run_check_issue_contract(
 
 
 def run_contract_readiness_check(
-    body_file: str, *, mode: str = "execute", timeout_seconds: int = CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS
+    body_file: str, *, mode: str = "execute", timeout_seconds: float = CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS
 ) -> tuple[dict | None, int, str | None]:
     """Run `contract_readiness_check.py --body-file <body_file> --mode <mode>`.
 
@@ -307,17 +322,28 @@ def run_contract_readiness_check(
     + `baseline_vc_preflight.py` aggregate wrapper timeout + margin). This
     removes the previous drift hazard where two independently hand-picked
     numbers (250 here, ~230s inner ceiling there) could silently invert.
+
+    Issue #2207 OWNER P0-1 (PR #2221 REQUEST_CHANGES): uses
+    `baseline_vc_preflight.run_subprocess_with_cooperative_supervisor()`
+    instead of `subprocess.run(timeout=...)` -- the latter sends SIGKILL
+    directly to `contract_readiness_check.py` on timeout, bypassing that
+    process's own cooperative SIGTERM handling (which itself needs to run
+    to cooperatively reap `baseline_vc_preflight.py`'s VC descendants) and
+    orphaning VC process groups several levels down. `timeout_seconds` is
+    `float` (not `int`) so callers under test can inject sub-second
+    deadlines (Issue #2207 OWNER P1-2 item 7).
     """
     script_path = _ISSUE_CONTRACT_REVIEW_SCRIPTS / "contract_readiness_check.py"
     cmd = [sys.executable, str(script_path), "--body-file", body_file, "--mode", mode]
-    try:
-        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
+    supervised = _baseline_vc_preflight.run_subprocess_with_cooperative_supervisor(
+        cmd, timeout_seconds=timeout_seconds
+    )
+    if supervised.timed_out:
         return None, -1, "timeout"
     try:
-        return json.loads(completed.stdout), completed.returncode, None
+        return json.loads(supervised.stdout), supervised.returncode, None
     except json.JSONDecodeError:
-        return None, completed.returncode, "malformed_json"
+        return None, supervised.returncode, "malformed_json"
 
 
 def run_merge_readiness(
@@ -925,7 +951,11 @@ def produce_compact_result(
 
 
 def run_checker_pipeline_once(
-    *, body_file: str, issue_number: int, body_sha256: str
+    *,
+    body_file: str,
+    issue_number: int,
+    body_sha256: str,
+    readiness_timeout_seconds: int | None = None,
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
     """Run check_issue_contract -> contract_readiness_check -> merge_readiness
     exactly once against an already-fetched, already-pinned body file.
@@ -953,7 +983,16 @@ def run_checker_pipeline_once(
         if review_result is None:
             return None, review_err, ("check_issue_contract" if review_err == "timeout" else None)
 
-        readiness_result, _readiness_rc, readiness_err = run_contract_readiness_check(body_file)
+        # Issue #2207 AC8: use the invocation-local dynamic readiness-wrapper
+        # timeout (derived by `_cmd_produce()` from the SAME pinned body via
+        # the canonical VC plan / budget formula) when supplied, instead of
+        # `run_contract_readiness_check()`'s static `N<=2`-compatible default.
+        if readiness_timeout_seconds is not None:
+            readiness_result, _readiness_rc, readiness_err = run_contract_readiness_check(
+                body_file, timeout_seconds=readiness_timeout_seconds
+            )
+        else:
+            readiness_result, _readiness_rc, readiness_err = run_contract_readiness_check(body_file)
         if readiness_result is None:
             return None, readiness_err, ("contract_readiness_check_wrapper" if readiness_err == "timeout" else None)
 
@@ -1011,7 +1050,10 @@ def _cmd_run_checker_attempt(args: argparse.Namespace) -> int:
     than `_cmd_produce()` via `run_reviewer_transport()`.
     """
     merged, error_code, timeout_phase = run_checker_pipeline_once(
-        body_file=args.body_file, issue_number=args.issue_number, body_sha256=args.body_sha256
+        body_file=args.body_file,
+        issue_number=args.issue_number,
+        body_sha256=args.body_sha256,
+        readiness_timeout_seconds=args.readiness_timeout_seconds,
     )
     if merged is None:
         # Issue #2165 P1-4: `timeout_phase` is included ONLY when set (kept
@@ -1043,6 +1085,33 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # Issue #2207 AC7/AC8: compute the invocation-local canonical VC plan
+    # and derive its `ReviewBudget` from the SAME pinned body BEFORE any
+    # checker subprocess is spawned. A body whose plan exceeds the fixed
+    # policy ceiling is rejected here (typed, non-retryable), never reaching
+    # `run_reviewer_transport()` / `run-checker-attempt`.
+    _vc_plan = _compute_canonical_vc_plan(body)
+    try:
+        # Issue #2207 OWNER P1-3 (PR #2221 REQUEST_CHANGES): `command_occurrence_count`,
+        # per the Issue #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`
+        # (an earlier implementation iteration substituted the dedup-aware
+        # actual-launch upper bound without an Issue reframe).
+        _review_budget = _derive_review_budget(
+            _vc_plan["command_occurrence_count"], policy_cap=_vc_plan["policy_cap"]
+        )
+    except _VerificationBudgetExceedsPolicyError as exc:
+        print(
+            json.dumps(
+                {
+                    "schema": SCHEMA,
+                    "schema_version": SCHEMA_VERSION,
+                    "status": "input_or_runtime_error",
+                    "error_code": exc.error_code,
+                }
+            )
+        )
+        return 2
+
     tmp_root = _REPO_ROOT / "tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=str(tmp_root), prefix="root_review_pipeline_") as scratch_dir:
@@ -1068,29 +1137,26 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             str(args.issue_number),
             "--body-sha256",
             body_sha256,
+            "--readiness-timeout-seconds",
+            str(_review_budget.readiness_wrapper_seconds),
         ]
         artifact_root = _REPO_ROOT / _CANONICAL_ARTIFACT_DIR
 
-        # Issue #2165 P1-1 (OWNER 2026-08-15 REQUEST_CHANGES): derive and
-        # pass EXPLICIT per-attempt/total deadlines here, rather than
-        # relying on `reviewer_transport.py`'s own generic fallback
-        # constants -- THIS module is the one that knows the real layered
-        # budget the deterministic child executes
-        # (`CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS` +
-        # `CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS` +
-        # `MERGE_READINESS_TIMEOUT_SECONDS`), plus a margin for process
-        # spawn/IPC overhead around those three sequential subprocess
-        # calls. This ties the transport-level deadline to the SAME
-        # arithmetic that produces the child's own budgets, so the two
-        # cannot independently drift apart again.
-        _process_spawn_margin_seconds = 20
-        _deterministic_per_attempt_deadline = (
-            CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS
-            + CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS
-            + MERGE_READINESS_TIMEOUT_SECONDS
-            + _process_spawn_margin_seconds
-        )
-        _deterministic_total_deadline = _deterministic_per_attempt_deadline + 40
+        # Issue #2165 P1-1 / Issue #2207 AC8: derive and pass EXPLICIT
+        # per-attempt/total deadlines here, rather than relying on
+        # `reviewer_transport.py`'s own generic fallback constants -- THIS
+        # module is the one that knows the real layered budget the
+        # deterministic child executes. `_review_budget` (computed above,
+        # BEFORE this subprocess was spawned, from the SAME pinned body via
+        # the canonical VC plan / budget formula) already folds in
+        # `CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS`'s invocation-local
+        # dynamic value (`readiness_wrapper_seconds`) plus
+        # `CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS` /
+        # `MERGE_READINESS_TIMEOUT_SECONDS` / process-spawn margin -- ties
+        # the transport-level deadline to the SAME arithmetic that produces
+        # the child's own budgets (and, at `N<=2`, reduces to the exact
+        # values `_deterministic_per_attempt_deadline` used to hand-derive),
+        # so the two cannot independently drift apart again.
         transport_result = _reviewer_transport.run_reviewer_transport(
             base_argv=base_argv,
             command_id="root_review_pipeline.checker_attempt",
@@ -1100,8 +1166,8 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             repo=args.repo,
             reviewed_body_sha256=body_sha256,
             artifact_root=artifact_root,
-            per_attempt_deadline=_deterministic_per_attempt_deadline,
-            total_deadline=_deterministic_total_deadline,
+            per_attempt_deadline=_review_budget.per_attempt_seconds,
+            total_deadline=_review_budget.total_seconds,
         )
         if transport_result["transport_status"] != "ok":
             print(
@@ -1258,6 +1324,11 @@ def main(argv: list[str] | None = None) -> int:
     p_attempt.add_argument("--body-file", required=True)
     p_attempt.add_argument("--issue-number", type=int, required=True)
     p_attempt.add_argument("--body-sha256", required=True)
+    # Issue #2207 AC8: invocation-local readiness-wrapper timeout derived by
+    # `_cmd_produce()` from the SAME pinned body (canonical VC plan / budget
+    # formula). Optional so direct/test invocations without it fall back to
+    # `run_contract_readiness_check()`'s static default.
+    p_attempt.add_argument("--readiness-timeout-seconds", type=int, default=None)
     p_attempt.set_defaults(func=_cmd_run_checker_attempt)
 
     p_classify = sub.add_parser("classify-child-stdout", help="Classify child agent raw stdout")
