@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -143,6 +144,88 @@ FAKE_CLAUDE_SUCCESS_BODY = (
 )
 
 
+def _subagent_hook_lines(
+    agent_id: str = "child-fixture-1",
+    transcript_path: str | None = None,
+    tool_use_id: str = "toolu_fixture_agent_call",
+    transcript_marker: str | None = None,
+) -> str:
+    """Issue #2183 PR #2220 review fix-delta (AC3/AC11 strengthening):
+    correlated SubagentStart/SubagentStop stream-json hook lines PLUS a
+    real ``Agent`` tool_use/tool_result envelope PLUS (when
+    ``transcript_marker`` is given) an ACTUAL, non-empty, readable
+    transcript file materialized on disk before the fake process exits --
+    matching the real Claude Code hook/tool-invocation payload shapes
+    ``extract_claude_hook_lifecycle_events`` /
+    ``_claude_agent_tool_invocation_correlated`` /
+    ``_read_claude_agent_transcript_content`` parse. A lone Start/Stop
+    pair referencing a transcript path that was never actually written to
+    disk (the prior shape of this fixture, before Issue #2183's AC3/AC11
+    strengthening added ``tool_invocation_id_correlated`` and
+    ``agent_transcript_verified``/``marker_provenance_verified`` to the
+    ``causal_evidence_source`` promotion gate) is no longer sufficient for
+    a fixture whose invocation also passes ``--expect-marker``."""
+    resolved_transcript_path = transcript_path or f"/tmp/{agent_id}-{os.getpid()}-transcript.jsonl"
+
+    def _hook_event(hook_event: str, *, with_transcript: bool) -> str:
+        inner: dict[str, str] = {"agent_id": agent_id, "agent_type": "general-purpose"}
+        if with_transcript:
+            inner["agent_transcript_path"] = resolved_transcript_path
+        inner_json = json.dumps(inner)
+        payload = {
+            "type": "system",
+            "subtype": "hook_response",
+            "hook_event": hook_event,
+            "hook_name": hook_event,
+            "session_id": "fixture-session",
+            "stdout": inner_json,
+            "output": inner_json,
+        }
+        return f"echo {shlex.quote(json.dumps(payload))}\n"
+
+    def _agent_tool_use_line() -> str:
+        payload = {
+            "type": "assistant",
+            "session_id": "fixture-session",
+            "message": {"content": [{"type": "tool_use", "id": tool_use_id, "name": "Agent", "input": {}}]},
+        }
+        return f"echo {shlex.quote(json.dumps(payload))}\n"
+
+    def _agent_tool_result_line() -> str:
+        payload = {
+            "type": "user",
+            "session_id": "fixture-session",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": "done"}]},
+            "tool_use_result": {"status": "completed", "agentId": agent_id, "agentType": "general-purpose"},
+        }
+        return f"echo {shlex.quote(json.dumps(payload))}\n"
+
+    write_transcript_line = ""
+    if transcript_marker is not None:
+        transcript_content = json.dumps({"type": "assistant", "message": {"content": transcript_marker}}) + "\n"
+        quoted_content = shlex.quote(transcript_content)
+        quoted_path = shlex.quote(resolved_transcript_path)
+        write_transcript_line = f"printf %s {quoted_content} > {quoted_path}\n"
+
+    return (
+        write_transcript_line
+        + _agent_tool_use_line()
+        + _hook_event("SubagentStart", with_transcript=False)
+        + _agent_tool_result_line()
+        + _hook_event("SubagentStop", with_transcript=True)
+    )
+
+
+FAKE_CLAUDE_SUCCESS_BODY_WITH_SUBAGENT_EVIDENCE = (
+    "\n"
+    "cat > /dev/null\n"
+    'echo \'{"type":"system","subtype":"init"}\'\n'
+    + _subagent_hook_lines(transcript_marker="MARKER_TOKEN_WT")
+    + 'echo \'{"type":"result","subtype":"success","marker":"MARKER_TOKEN_WT"}\'\n'
+    "exit 0\n"
+)
+
+
 # ---------------------------------------------------------------------------
 # AC2: worktree / repository identity rejection
 # ---------------------------------------------------------------------------
@@ -254,12 +337,18 @@ def test_given_fake_claude_success_when_structured_lane_runs_then_exit0_and_summ
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + """
+    _write_fake_exe(
+        fake_bin / "claude",
+        _HELP_BRANCH
+        + """
 cat > /dev/null
 echo '{"type":"system","subtype":"init"}'
-echo '{"type":"result","subtype":"success","marker":"MARKER_TOKEN_1"}'
+"""
+        + _subagent_hook_lines(transcript_marker="MARKER_TOKEN_1")
+        + """echo '{"type":"result","subtype":"success","marker":"MARKER_TOKEN_1"}'
 exit 0
-""")
+""",
+    )
     prompt = _prompt_file(tmp_path, "MARKER_TOKEN_1\n")
     out_dir = worktree / "artifacts" / "runtime-smoke" / "claude-structured"
     result = _run(
@@ -271,10 +360,83 @@ exit 0
     )
     assert result.returncode == 0, result.stderr
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
-    assert "native_event_count: 2" in summary
+    # Issue #2183 AC3/AC11 strengthening (PR #2220 review fix-delta): the
+    # structured lane's --expect-marker default causal-evidence gate now
+    # requires the fake claude fixture to also emit a real Agent
+    # tool_use/tool_result envelope (tool_invocation_id_correlated) in
+    # addition to the correlated SubagentStart/SubagentStop pair, which
+    # adds 4 more parseable stream-json lines on top of the pre-existing
+    # init + result lines.
+    assert "native_event_count: 6" in summary
+    assert "subagent_causal_evidence" in summary
+    assert "'causal_evidence_source': 'hook_id_correlated'" in summary
     assert "terminal_event_observed: True" in summary
     # Only summary.md is persisted (Issue #1921 P1 evidence-hygiene fix-delta).
     assert sorted(p.name for p in out_dir.iterdir()) == ["summary.md"]
+
+
+def test_given_marker_only_fake_claude_when_default_require_causal_evidence_gate_applies_then_structured_lane_fails(
+    repo_with_worktree, tmp_path
+):
+    """Issue #2183 AC9: the structured lane requires
+    causal_evidence_source == hook_id_correlated as the DEFAULT (no
+    --require-subagent-causal-evidence flag needed) whenever the caller
+    supplies --expect-marker. This fixture's fake claude emits the
+    expected marker string in its stdout but NO SubagentStart/SubagentStop
+    hook lifecycle events at all -- exactly the marker-only-PASS shape
+    this Issue's causal-evidence gate exists to stop trusting -- so the
+    run must FAIL (exit 1) even though the plain --expect-marker text
+    match itself would have succeeded."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    prompt = _prompt_file(tmp_path, "MARKER_TOKEN_WT\n")
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "claude-structured"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--timeout-seconds", "30", "--expect-marker", "MARKER_TOKEN_WT",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1
+    assert "subagent causal evidence insufficient" in result.stderr
+    assert "--expect-marker default gate" in result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "'causal_evidence_source': 'marker_only_insufficient'" in summary
+
+
+def test_given_marker_only_fake_claude_when_no_expect_marker_then_default_causal_gate_does_not_apply(
+    repo_with_worktree, tmp_path
+):
+    """Issue #2183 AC9 (negative-of-negative sanity check): the DEFAULT
+    causal-evidence gate is scoped to callers who actually supply
+    --expect-marker. A structured lane run with neither --expect-marker
+    nor --require-subagent-causal-evidence must not be gated on causal
+    evidence at all (the verdict is still computed and recorded, but never
+    consulted for exit_code)."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    prompt = _prompt_file(tmp_path)
+    out_dir = worktree / "artifacts" / "runtime-smoke" / "claude-structured"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--timeout-seconds", "30",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    # No --expect-marker was supplied, so subagent_causal_evidence_verdict()
+    # never had an expected_markers list to check stdout against at all --
+    # this observes no_evidence (not marker_only_insufficient, which
+    # requires an expected_markers match), and critically it must never
+    # gate exit_code (asserted above via returncode == 0).
+    assert "'causal_evidence_source': 'no_evidence'" in summary
 
 
 def test_given_fake_claude_help_omits_max_turns_but_runtime_accepts_it_when_structured_lane_runs_then_exit0(
@@ -549,7 +711,13 @@ def test_given_required_unavailable_runtime_field_when_fake_claude_succeeds_then
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    # PR #2220 review fix-delta: this fixture must emit correlated
+    # SubagentStart/SubagentStop hook evidence, since --expect-marker
+    # below now requires causal_evidence_source == hook_id_correlated by
+    # default in the structured lane -- otherwise the causal-evidence
+    # gate would FAIL before the --require-observed-runtime-field SKIP
+    # classification below ever runs.
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY_WITH_SUBAGENT_EVIDENCE)
     prompt = _prompt_file(tmp_path)
     out_dir = tmp_path / "out"
     result = _run(
@@ -657,6 +825,49 @@ exit 0
     assert "codex prompt text" not in argv_text
     stdin_text = stdin_log.read_text(encoding="utf-8")
     assert "codex prompt text" in stdin_text
+
+
+def test_given_fake_codex_success_with_expected_marker_when_structured_lane_runs_then_exit0_and_causal_evidence_null(
+    repo_with_worktree, tmp_path
+):
+    """Issue #2183 PR #2220 OWNER REQUEST_CHANGES P0-1
+    (https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514):
+    the structured lane's --expect-marker default causal-evidence gate
+    (``causal_evidence_required``) must be scoped to ``args.runtime ==
+    "claude"`` -- ``subagent_causal_evidence_verdict()`` is only ever
+    computed for the Claude structured lane (the Codex lane has no
+    SubagentStart/SubagentStop stream-json channel this harness can parse,
+    so ``causal_evidence`` is unconditionally ``None`` there). Before this
+    fix-delta, a Codex run that exited 0, reached a terminal event, AND
+    printed the expected marker text was still forced to FAIL purely
+    because ``causal_evidence is None`` -- a bug, not a genuine causal-
+    evidence gap, since Codex was never expected to have that channel in
+    the first place."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "codex", """
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  echo "--json --ephemeral -C"
+  exit 0
+fi
+cat > /dev/null
+echo '{"type":"item.completed","text":"MARKER_TOKEN_CODEX_P0_1"}'
+exit 0
+""")
+    prompt = _prompt_file(tmp_path, "codex prompt text\n")
+    out_dir = tmp_path / "out"
+    result = _run(
+        repo, worktree,
+        "--runtime", "codex", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--expect-marker", "MARKER_TOKEN_CODEX_P0_1",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 0, result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "subagent_causal_evidence: None" in summary
+    assert "subagent causal evidence insufficient" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -1664,7 +1875,10 @@ def test_given_script_checked_out_inside_linked_worktree_when_invoked_without_re
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+    # PR #2220 review fix-delta: --expect-marker below now requires
+    # correlated SubagentStart/SubagentStop hook evidence by default in
+    # the structured lane.
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY_WITH_SUBAGENT_EVIDENCE)
     prompt = _prompt_file(tmp_path, "MARKER_TOKEN_WT\n")
     out_dir = worktree / "artifacts" / "runtime-smoke" / "claude-structured"
     env = dict(os.environ)
