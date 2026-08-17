@@ -697,6 +697,174 @@ def extract_claude_gpt_launcher_receipt(stderr: str) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
+# ---------------------------------------------------------------------------
+# Issue #2219 AC1/AC7: claude-gpt launcher proxy stderr side-channel parsing
+# and INDEPENDENT proxy cleanup re-confirmation.
+#
+# ``scripts/claude-gpt/launch.sh`` (Out of Scope for this Issue -- confirmed
+# by prior investigation to already emit everything needed) writes fixed
+# ``KEY=value`` lines to stderr around proxy startup
+# (``CLAUDE_GPT_PROXY_PORT``/``_LOG``/``_PID``, ``launch.sh:420-424``) and
+# cleanup (``CLAUDE_GPT_PROXY_CLEANUP_OK``/``CLAUDE_GPT_CLAUDE_EXIT_CODE``,
+# ``launch.sh:548-551``). This runner only PARSES those already-emitted
+# lines; it never re-implements or duplicates the launcher's own proxy
+# lifecycle management.
+# ---------------------------------------------------------------------------
+
+
+def extract_claude_gpt_proxy_sidechannel(stderr: str) -> dict:
+    """Parse the claude-gpt launcher's stderr ``KEY=value`` proxy
+    side-channel lines (Issue #2219 AC1/AC7).
+
+    Returns ``{"proxy_port": int|None, "proxy_log": str|None, "proxy_pid":
+    int|None, "proxy_cleanup_ok_self_reported": bool|None,
+    "claude_exit_code_self_reported": int|None}``. Every field fails
+    closed to ``None`` when its line is absent or malformed -- never
+    guessed."""
+    result: dict = {
+        "proxy_port": None,
+        "proxy_log": None,
+        "proxy_pid": None,
+        "proxy_cleanup_ok_self_reported": None,
+        "claude_exit_code_self_reported": None,
+    }
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key == "CLAUDE_GPT_PROXY_PORT" and value.isdigit():
+            result["proxy_port"] = int(value)
+        elif key == "CLAUDE_GPT_PROXY_LOG" and value:
+            result["proxy_log"] = value
+        elif key == "CLAUDE_GPT_PROXY_PID" and value.isdigit():
+            result["proxy_pid"] = int(value)
+        elif key == "CLAUDE_GPT_PROXY_CLEANUP_OK":
+            if value == "true":
+                result["proxy_cleanup_ok_self_reported"] = True
+            elif value == "false":
+                result["proxy_cleanup_ok_self_reported"] = False
+        elif key == "CLAUDE_GPT_CLAUDE_EXIT_CODE" and value.lstrip("-").isdigit():
+            result["claude_exit_code_self_reported"] = int(value)
+    return result
+
+
+def _claude_gpt_proxy_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _claude_gpt_proxy_port_listening(port: int) -> bool:
+    ss = shutil.which("ss")
+    if ss is None:
+        return False
+    rc, out, _err, timed_out = _run([ss, "-ltn"], timeout=10.0)
+    if timed_out or rc != 0:
+        return False
+    needle = f":{port} "
+    return any(needle in line or line.rstrip().endswith(f":{port}") for line in out.splitlines())
+
+
+def verify_claude_gpt_proxy_cleanup_independent(
+    proxy_pid: int | None, proxy_port: int | None, *,
+    max_attempts: int = 3, sleep_seconds: float = 0.5,
+) -> dict:
+    """Bounded poll-with-retry, INDEPENDENT re-confirmation that the
+    claude-gpt launcher's proxy process/port are actually gone (Issue
+    #2219 AC7) -- never trusting
+    ``extract_claude_gpt_proxy_sidechannel``'s
+    ``proxy_cleanup_ok_self_reported`` value. Checks ``kill(pid, 0)``
+    (process liveness) and ``ss -ltn`` (listen-socket presence) directly
+    from THIS process, independent of the launcher's own already-printed
+    verdict.
+
+    When both ``proxy_pid`` and ``proxy_port`` are ``None`` (nothing to
+    check -- e.g. a non-claude-gpt-adapter run), returns ``checked:
+    False``, ``cleanup_confirmed: None``: absence of evidence is never
+    asserted as a pass.
+
+    Returns ``{"checked": bool, "pid_alive": bool|None, "port_listening":
+    bool|None, "cleanup_confirmed": bool|None, "attempts": int}``.
+    ``cleanup_confirmed`` is ``True`` only once BOTH applicable checks
+    report clean on the SAME attempt within ``max_attempts`` bounded
+    retries."""
+    if proxy_pid is None and proxy_port is None:
+        return {
+            "checked": False, "pid_alive": None, "port_listening": None,
+            "cleanup_confirmed": None, "attempts": 0,
+        }
+    attempts = 0
+    pid_alive: bool | None = None
+    port_listening: bool | None = None
+    for attempt in range(1, max_attempts + 1):
+        attempts = attempt
+        pid_alive = _claude_gpt_proxy_pid_alive(proxy_pid) if proxy_pid is not None else None
+        port_listening = _claude_gpt_proxy_port_listening(proxy_port) if proxy_port is not None else None
+        if not pid_alive and not port_listening:
+            return {
+                "checked": True, "pid_alive": pid_alive, "port_listening": port_listening,
+                "cleanup_confirmed": True, "attempts": attempts,
+            }
+        if attempt < max_attempts:
+            time.sleep(sleep_seconds)
+    return {
+        "checked": True, "pid_alive": pid_alive, "port_listening": port_listening,
+        "cleanup_confirmed": False, "attempts": attempts,
+    }
+
+
+def extract_claude_resolved_executable_sha256(resolved_executable: str | None) -> str | None:
+    """sha256 of the resolved launcher/executable FILE CONTENT (Issue #2219
+    AC1), binding evidence to the exact binary bytes actually invoked --
+    not merely its path (a path can be repointed by a symlink swap between
+    preflight and execution without a path-only claim changing). Returns
+    ``None`` when ``resolved_executable`` is ``None`` or the file cannot be
+    read (fails closed -- never a guessed/partial digest)."""
+    if not resolved_executable:
+        return None
+    try:
+        with open(resolved_executable, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def verify_evidence_not_stale(
+    evidence_tested_head: str | None,
+    evidence_repo_fingerprint: dict | None,
+    fresh_worktree_head: str | None,
+    fresh_repo_fingerprint: dict | None,
+) -> dict:
+    """Explicit rejection guard for stale-head evidence reuse (Issue #2219
+    AC10): a previously-written evidence JSON's ``tested_head`` /
+    ``repo_fingerprint`` must match a FRESH worktree HEAD/fingerprint taken
+    at verification time, or it must be rejected as PASS-ineligible --
+    never silently re-accepted just because it once passed.
+
+    Returns ``{"stale": bool, "reason": str|None}``. ``stale=True``
+    whenever either the head SHA or the fingerprint dict differs (or the
+    fresh head/fingerprint itself could not be captured -- an unverifiable
+    freshness claim is treated as stale, fail-closed)."""
+    if not fresh_worktree_head:
+        return {"stale": True, "reason": "fresh_worktree_head_unavailable"}
+    if not evidence_tested_head:
+        return {"stale": True, "reason": "evidence_tested_head_missing"}
+    if evidence_tested_head != fresh_worktree_head:
+        return {"stale": True, "reason": "tested_head_mismatch"}
+    if evidence_repo_fingerprint != fresh_repo_fingerprint:
+        return {"stale": True, "reason": "repo_fingerprint_mismatch"}
+    return {"stale": False, "reason": None}
+
+
 def run_structured_codex(worktree: str, prompt: str, timeout_seconds: float,
                           codex_bin: str = "codex") -> tuple[int | None, str, str, bool]:
     # ``-`` reads the prompt from stdin instead of argv, so the prompt text
@@ -1288,6 +1456,51 @@ AGENT_TYPE_SOURCE_HOOK_NAME = "hook_name"
 SPAWN_LAUNCH_MODE_ASYNC = "async_launched"
 SPAWN_LAUNCH_MODE_COMPLETED = "completed"
 SPAWN_LAUNCH_MODE_UNKNOWN = None
+
+# Issue #2219 fix_delta iteration 2: ``_find_claude_interactive_transcript``
+# scans this many leading lines of a candidate transcript for a ``cwd``
+# field before giving up on that line-window (a real persisted transcript's
+# first ``cwd``-bearing record is typically the 3rd-4th line, not the
+# first -- see that function's own docstring for the live evidence).
+_TRANSCRIPT_CWD_SCAN_LINES = 50
+
+# Issue #2219 fix_delta iteration 2 (live verification finding): an ASYNC
+# spawn's own ``tool_use_result`` never transitions to ``status: "completed"``
+# in place -- live inspection of a real claude-gpt interactive session
+# transcript found its completion notification arrives later, as a SEPARATE
+# ``queue-operation``/``queued_command`` record whose ``content``/``prompt``
+# string embeds a ``<task-notification>`` block with this exact
+# ``<task-id>...</task-id>`` / ``<status>completed</status>`` shape. This is
+# Claude Code's own async Task-dispatch notification protocol (observed
+# identically for the structured lane's single-child async path too, not an
+# adapter-specific quirk), so it is read generically -- not gated on
+# ``claude_adapter``.
+_CLAUDE_TASK_NOTIFICATION_RE = re.compile(
+    r"<task-id>([0-9a-zA-Z_-]+)</task-id>.*?<status>([a-z_]+)</status>",
+    re.DOTALL,
+)
+
+
+def extract_claude_task_notification_completions(text: str) -> set[str]:
+    """Agent ids whose async ``<task-notification>`` block (see
+    ``_CLAUDE_TASK_NOTIFICATION_RE`` docstring above) reports
+    ``<status>completed</status>`` anywhere in ``text``. This is a SEPARATE
+    completion channel from ``tool_use_result.status == "completed"``
+    (the synchronous-completion shape) -- an async-launched spawn's
+    ``tool_use_result`` instead reports ``status: "async_launched"``
+    (``SPAWN_LAUNCH_MODE_ASYNC``) and never updates in place; the actual
+    completion signal for that child arrives later as one of these
+    notification blocks. Scans the RAW text directly (not per-event JSON
+    fields) since the notification payload is itself embedded as escaped
+    text inside a JSON string value, not a top-level structured field.
+    Best-effort / fail-closed: returns an empty set, never a guess, on any
+    text that does not contain a matching block."""
+    completed: set[str] = set()
+    for match in _CLAUDE_TASK_NOTIFICATION_RE.finditer(text):
+        agent_id, status = match.group(1), match.group(2)
+        if status == SPAWN_LAUNCH_MODE_COMPLETED:
+            completed.add(agent_id)
+    return completed
 
 
 def _iter_claude_stream_events(stdout: str):
@@ -2191,6 +2404,490 @@ def classify_claude_child_spawn_agent_id(stdout: str) -> tuple[str | None, str |
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# Issue #2219 AC2/AC3/AC6: multi-SubAgent lifecycle (set-operation based,
+# extending the single-child classify_claude_child_spawn_agent_id /
+# classify_claude_child_completion pair above to the multi-agent case),
+# same-main-session-across-turns verification, and forbidden-marker
+# scanning.
+# ---------------------------------------------------------------------------
+
+
+def classify_claude_multi_child_lifecycle(stdout: str, min_required: int) -> dict:
+    """Set/multiset-operation-based proof that at least ``min_required``
+    DISTINCT SubAgents were spawned AND all reached a terminal completion,
+    via agent_id EXACT pairing (Issue #2219 AC3) -- extending the existing
+    single-child ``classify_claude_child_spawn_agent_id`` /
+    ``classify_claude_child_completion`` pair (which only ever binds ONE
+    spawn id) to the multi-agent case, reusing the same two evidence
+    channels (hook lifecycle events + the ``tool_use_result`` synchronous
+    completion shape) without re-deriving their parsing.
+
+    Detects, and fails closed on, every one of the AC4 negative scenarios:
+    start-only (``orphan_starts``), stop-only / agent_id mismatch /
+    unknown child (``unknown_children``), and duplicate completion
+    (``duplicate_completions``) -- any one of these overrides
+    ``verified`` to ``False`` even when the required PAIRED count is met.
+
+    Returns ``{"verified": bool, "spawned_agent_ids": list[str],
+    "completed_agent_ids": list[str], "paired_agent_ids": list[str],
+    "orphan_starts": list[str], "unknown_children": list[str],
+    "duplicate_completions": list[str]}``.
+
+    Live verification (Issue #2219 AC12) surfaced that this repo's own
+    project ``.claude/settings.json`` wires a ``SubagentStop`` hook, so a
+    single real completion is independently corroborated by BOTH the
+    ``SubagentStop`` hook event channel and the ``tool_use_result``
+    synchronous "completed" shape channel. Treating that cross-channel
+    corroboration as a duplicate (as a single flat multiset would) makes
+    ``verified`` structurally unreachable in this repo's live environment.
+    Duplicate detection is therefore scoped to WITHIN each independent
+    evidence channel -- a genuine double-fire of the SAME channel for the
+    SAME agent_id still fails closed via ``_pair_agent_lifecycle``'s
+    multiset check, exactly as the AC4 poison test expects."""
+    spawn_ids: list[str] = []
+    hook_stop_ids: list[str] = []
+    for event in extract_claude_hook_lifecycle_events(stdout):
+        agent_id = event.get("agent_id")
+        if not agent_id:
+            continue
+        if event["hook_event"] == "SubagentStart":
+            spawn_ids.append(agent_id)
+        elif event["hook_event"] == "SubagentStop":
+            hook_stop_ids.append(agent_id)
+    tool_result_stop_ids: list[str] = []
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "user":
+            continue
+        tool_use_result = payload.get("tool_use_result")
+        if not isinstance(tool_use_result, dict):
+            continue
+        agent_id = tool_use_result.get("agentId")
+        if not isinstance(agent_id, str) or not agent_id:
+            continue
+        if agent_id not in spawn_ids:
+            spawn_ids.append(agent_id)
+        if tool_use_result.get("status") == SPAWN_LAUNCH_MODE_COMPLETED:
+            tool_result_stop_ids.append(agent_id)
+    # Issue #2219 fix_delta iteration 2: an async-launched spawn's own
+    # tool_use_result never transitions to "completed" in place (see
+    # extract_claude_task_notification_completions docstring) -- only
+    # bind a task-notification completion to a spawn_id ALREADY observed
+    # above, so this can never itself manufacture a spawn event.
+    notification_stop_ids: list[str] = [
+        agent_id for agent_id in extract_claude_task_notification_completions(stdout) if agent_id in spawn_ids
+    ]
+
+    stop_channels = (hook_stop_ids, tool_result_stop_ids, notification_stop_ids)
+    duplicate_within_channel: set[str] = set()
+    for channel in stop_channels:
+        seen: set[str] = set()
+        for agent_id in channel:
+            if agent_id in seen:
+                duplicate_within_channel.add(agent_id)
+            seen.add(agent_id)
+    stop_ids: list[str] = []
+    merged_seen: set[str] = set()
+    for channel in stop_channels:
+        for agent_id in channel:
+            if agent_id not in merged_seen:
+                stop_ids.append(agent_id)
+                merged_seen.add(agent_id)
+    # Re-inject genuine within-channel duplicates so the shared multiset
+    # check in ``_pair_agent_lifecycle`` still fails closed on them.
+    stop_ids.extend(sorted(duplicate_within_channel))
+
+    return _pair_agent_lifecycle(spawn_ids, stop_ids, min_required)
+
+
+def _pair_agent_lifecycle(spawn_ids: list[str], stop_ids: list[str], min_required: int) -> dict:
+    """Shared agent_id set/multiset-operation pairing core (Issue #2219 AC3,
+    factored out in the AC13-AC17 hook-event-evidence-channel fix_delta so
+    ``classify_claude_hook_sink_multi_child_lifecycle`` -- which sources its
+    ``spawn_ids``/``stop_ids`` from the interactive lane's durable hook sink
+    JSONL rather than structured-lane stdout -- reuses the EXACT SAME
+    fail-closed pairing algorithm as ``classify_claude_multi_child_lifecycle``
+    instead of re-deriving a separate, looser classifier (OWNER anchor
+    decision, Issue #2219 body: "既存の classify_claude_multi_child_lifecycle()
+    のロジックを...再利用し、structured lane 用と別のより緩い classifier を
+    新設しない")."""
+    spawned = set(spawn_ids)
+    completed = set(stop_ids)
+    duplicate_completions = sorted({aid for aid in stop_ids if stop_ids.count(aid) > 1})
+    unknown_children = sorted(completed - spawned)
+    orphan_starts = sorted(spawned - completed)
+    paired = spawned & completed
+    verified = (
+        len(paired) >= max(min_required, 1)
+        and not orphan_starts
+        and not unknown_children
+        and not duplicate_completions
+    )
+    return {
+        "verified": verified,
+        "spawned_agent_ids": sorted(spawned),
+        "completed_agent_ids": sorted(completed),
+        "paired_agent_ids": sorted(paired),
+        "orphan_starts": orphan_starts,
+        "unknown_children": unknown_children,
+        "duplicate_completions": duplicate_completions,
+    }
+
+
+def extract_claude_stream_session_ids(stdout: str) -> list[str]:
+    """Every DISTINCT ``session_id``/``sessionId`` value observed across
+    the stream-json output, IN ORDER of first appearance (Issue #2219
+    AC2) -- unlike ``extract_claude_parent_session_id`` (which returns
+    only the first value seen and stops), this sees a session id that
+    silently changed mid-stream instead of masking it."""
+    seen: list[str] = []
+    for payload in _iter_claude_stream_events(stdout):
+        for key in ("session_id", "sessionId"):
+            value = payload.get(key)
+            if isinstance(value, str) and value and value not in seen:
+                seen.append(value)
+    return seen
+
+
+def count_claude_stream_turns(stdout: str) -> int:
+    """Number of assistant-message turns observed in a single
+    structured-lane stream-json invocation (Issue #2219 AC2). Each
+    ``type: "assistant"`` event is one agentic-loop turn -- counted
+    independently of the runtime's own self-declared ``--max-turns``
+    bound, never assumed equal to it."""
+    return sum(
+        1 for payload in _iter_claude_stream_events(stdout)
+        if payload.get("type") == "assistant"
+    )
+
+
+def verify_same_main_session_across_turns(stdout: str, min_turns: int) -> dict:
+    """Fail-closed proof that the SAME main session_id persisted across at
+    least ``min_turns`` agentic-loop turns (Issue #2219 AC2).
+
+    Design choice (documented per the Issue's own two-option framing, and
+    revised by fix_delta iteration 1 -- pr-reviewer REQUEST_CHANGES,
+    https://github.com/squne121/loop-protocol/pull/2222): this function is
+    Option A's own primitive -- a single ``claude -p --output-format
+    stream-json --max-turns >= min_turns`` invocation's own internal
+    agentic loop, verified via the native ``session_id`` field that is
+    already present on every stream-json event -- and remains the
+    structured lane's wiring. Iteration 1's OWNER decision procedure
+    (Issue #2219 body) required attempting Option B FIRST (re-implementing
+    an ``--additional-prompt``-like flag for the interactive herdr lane,
+    as PR #2176 prototyped in commit 06d8baa9 and reverted in commit
+    5a44ebf0 -- a SCOPE decision for Issue #2174, not a technical
+    rejection) before falling back to Option A; the prior iteration
+    skipped that attempt and was rejected. Option B is now ALSO
+    implemented (``run_interactive_herdr_isolated``'s ``additional_prompts``
+    parameter, driven by the new ``--additional-prompt`` CLI flag) and
+    reuses THIS SAME function as a shared building block: the interactive
+    lane's own persisted session transcript (see
+    ``_find_claude_interactive_transcript`` -- the interactive lane never
+    passes ``--no-session-persistence``, so Claude Code persists it) is
+    fed into this function exactly like structured-lane stdout is, so
+    "same session identity across >= 2 turns" is verified identically
+    across both lanes. Both A and B remain available; the structured
+    lane's ``--require-min-turns``/``--max-turns`` combination still
+    exercises Option A's own agentic-loop path unchanged.
+
+    Returns ``{"verified": bool, "turn_count": int, "session_ids_observed":
+    list[str], "lane": "option_a_single_invocation_agentic_loop"}``.
+    ``verified`` is ``True`` only when EXACTLY ONE distinct session_id was
+    observed AND ``turn_count >= min_turns``; zero or multiple distinct
+    ids, or too few turns, both fail closed to ``False`` -- never
+    guessed."""
+    session_ids = extract_claude_stream_session_ids(stdout)
+    turn_count = count_claude_stream_turns(stdout)
+    verified = len(session_ids) == 1 and turn_count >= max(min_turns, 1)
+    return {
+        "verified": verified,
+        "turn_count": turn_count,
+        "session_ids_observed": session_ids,
+        "lane": "option_a_single_invocation_agentic_loop",
+    }
+
+
+# Issue #2219 AC6: fixed, literal allowlist of forbidden failure markers.
+# Deliberately literal substring matching only -- no fuzzy/regex matching --
+# so this never over-matches unrelated text that merely resembles one of
+# these fixed strings.
+_FORBIDDEN_FAILURE_MARKERS = (
+    "403 WebSocket upgrade",
+    "WebSocket upgrade was rejected",
+    "Please run /login",
+    "early termination",
+    "context limit",
+    "auto-compaction failure",
+)
+
+
+def verify_no_forbidden_marker(
+    stdout: str, stderr: str, herdr_pane_excerpt: str | None = None
+) -> dict:
+    """Fail-closed scan for the fixed ``_FORBIDDEN_FAILURE_MARKERS``
+    allowlist (Issue #2219 AC6) across every text channel this harness
+    captures (structured lane stdout/stderr, or the interactive lane's own
+    redacted pane excerpt).
+
+    Returns ``{"verified": bool, "matched_markers": list[str]}``.
+    ``verified`` is ``True`` (PASS) only when the allowlist matched ZERO
+    markers across all supplied channels."""
+    combined = "\n".join(
+        text for text in (stdout, stderr, herdr_pane_excerpt) if isinstance(text, str)
+    )
+    matched = [marker for marker in _FORBIDDEN_FAILURE_MARKERS if marker in combined]
+    return {"verified": not matched, "matched_markers": matched}
+
+
+# ---------------------------------------------------------------------------
+# Issue #2219 AC2/AC3/AC13-AC17 (OWNER anchor decision, 2026-08-16): the
+# interactive-lane hook-event evidence channel. Live investigation proved
+# herdr-PTY-driven claude-gpt sessions never write a flat ``<session-id>.jsonl``
+# main transcript (see ``_find_claude_interactive_transcript`` docstring and
+# the Issue body Notes for Reviewer for the full incident trail), so this
+# channel replaces transcript-existence as the interactive lane's PASS
+# authority. Every function below consumes already-parsed hook sink RECORDS
+# (never the raw sink file text, never raw prompt/response content) -- the
+# sink itself is written by a launcher-owned (``launch.sh``, "claude-gpt") or
+# harness-owned (native adapter) fixed hook command, never from a
+# caller-influenced string.
+# ---------------------------------------------------------------------------
+
+# The ONLY keys a well-formed hook sink record may carry (AC13: no raw
+# prompt/response/credential/token content ever appears in a record).
+_HOOK_SINK_ALLOWED_RECORD_KEYS = frozenset(
+    {"run_nonce", "event", "session_id", "agent_id", "ts", "prompt_digest"}
+)
+_HOOK_SINK_LIFECYCLE_EVENTS = frozenset(
+    {"UserPromptSubmit", "Stop", "StopFailure", "SubagentStart", "SubagentStop"}
+)
+# Bounded read: a single sink file is never trusted to be arbitrarily large
+# (defense in depth against a corrupted/runaway sink being read wholesale).
+_MAX_HOOK_SINK_LINES = 20000
+
+# Native-adapter hook sink writer (Issue #2219 In Scope: native adapter is
+# wired entirely from THIS harness, never scripts/claude-gpt/**). Same
+# record schema and same single-bounded-``printf``-equivalent-write
+# atomicity guarantee (AC15: one ``open(..., "a")`` + one ``write()`` call
+# per invocation, each record well under PIPE_BUF) as the claude-gpt
+# adapter's inline hook command in ``scripts/claude-gpt/launch.sh``'s
+# ``hook-sink-multi-turn`` gate -- kept in sync deliberately (same record
+# shape, same field names) so both adapters' sinks are parsed by the exact
+# same ``parse_claude_gpt_hook_sink_records``.
+_HOOK_SINK_WRITER_SOURCE = '''\
+import hashlib
+import json
+import os
+import sys
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    event = payload.get("hook_event_name", "")
+    session_id = payload.get("session_id")
+    agent_id = payload.get("agent_id") or payload.get("subagent_id")
+    nonce = os.environ.get("CLAUDE_GPT_HOOK_SINK_NONCE", "")
+    sink_path = os.environ.get("CLAUDE_GPT_HOOK_SINK_PATH")
+    prompt = payload.get("prompt") if event == "UserPromptSubmit" else None
+    digest = None
+    if isinstance(prompt, str):
+        digest = hashlib.sha256((nonce + prompt).encode("utf-8")).hexdigest()
+    record = {
+        "run_nonce": nonce,
+        "event": event,
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "ts": __import__("time").time(),
+        "prompt_digest": digest,
+    }
+    line = json.dumps(record, separators=(",", ":"))
+    if sink_path:
+        # Single bounded write per record (AC15): one open + one write
+        # call, well under PIPE_BUF, so concurrent SubagentStart events
+        # never interleave/corrupt lines.
+        with open(sink_path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\\n")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def parse_claude_gpt_hook_sink_records(sink_path: str | Path) -> tuple[list[dict], int]:
+    """Bounded, fail-closed parse of the append-only hook-event sink JSONL
+    file (Issue #2219 AC13/AC15). Returns ``(records, malformed_line_count)``
+    -- ``records`` contains ONLY well-formed lines (valid JSON object, a
+    recognized ``event`` value, and no key outside
+    ``_HOOK_SINK_ALLOWED_RECORD_KEYS``); every other line (parse failure,
+    non-dict payload, unrecognized event, or an extra/unexpected key --
+    which would indicate either sink corruption from an interleaved
+    concurrent write, AC15, or a smuggled raw-content field, AC13) is
+    counted in ``malformed_line_count`` and silently dropped from
+    ``records`` rather than guessed at or repaired. Missing file (sink never
+    configured, or the lane never ran) returns ``([], 0)``, never raises."""
+    try:
+        path = Path(sink_path)
+        if not path.is_file():
+            return [], 0
+        raw_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return [], 0
+    records: list[dict] = []
+    malformed = 0
+    for line in raw_lines[:_MAX_HOOK_SINK_LINES]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            malformed += 1
+            continue
+        if not isinstance(payload, dict):
+            malformed += 1
+            continue
+        if not set(payload.keys()) <= _HOOK_SINK_ALLOWED_RECORD_KEYS:
+            malformed += 1
+            continue
+        if payload.get("event") not in _HOOK_SINK_LIFECYCLE_EVENTS:
+            malformed += 1
+            continue
+        records.append(payload)
+    return records, malformed
+
+
+def classify_claude_hook_sink_multi_child_lifecycle(records: list[dict], min_required: int) -> dict:
+    """Multi-SubAgent lifecycle proof sourced from hook sink records (Issue
+    #2219 AC3/AC17), via the SAME ``_pair_agent_lifecycle`` set-operation
+    core ``classify_claude_multi_child_lifecycle`` uses for the structured
+    lane -- never a separately re-derived, looser classifier. A process
+    killed before its ``SubagentStop`` fires (Issue #2219 AC17, e.g.
+    SIGKILL) leaves its ``agent_id`` in ``orphan_starts``, which fails
+    ``verified`` closed with no grace-window/timeout-based auto-PASS."""
+    spawn_ids = [r["agent_id"] for r in records if r.get("event") == "SubagentStart" and r.get("agent_id")]
+    stop_ids = [r["agent_id"] for r in records if r.get("event") == "SubagentStop" and r.get("agent_id")]
+    return _pair_agent_lifecycle(spawn_ids, stop_ids, min_required)
+
+
+def verify_claude_gpt_hook_sink_multi_turn(records: list[dict], min_turns: int) -> dict:
+    """Multi-turn same-session proof sourced from hook sink records (Issue
+    #2219 AC2), independent of any persisted transcript file. ``verified``
+    requires: (1) exactly one distinct ``session_id`` observed across
+    ``UserPromptSubmit`` records, (2) at least ``min_turns`` such records for
+    that session_id, (3) a ``Stop`` record for that SAME session_id for each
+    ``UserPromptSubmit`` (paired count, not merely an aggregate count -- a
+    stalled/never-completed turn is not silently counted as done), and (4)
+    zero ``StopFailure`` records for that session_id. Zero or multiple
+    distinct session_ids both fail closed.
+
+    Returns ``{"verified": bool, "session_id": str|None, "turn_count": int,
+    "stop_count": int, "stop_failure_count": int}``."""
+    prompt_sids = [r["session_id"] for r in records if r.get("event") == "UserPromptSubmit" and r.get("session_id")]
+    stop_sids = [r["session_id"] for r in records if r.get("event") == "Stop" and r.get("session_id")]
+    stop_failure_sids = [
+        r["session_id"] for r in records if r.get("event") == "StopFailure" and r.get("session_id")
+    ]
+    distinct_prompt_sids = sorted(set(prompt_sids))
+    session_id = distinct_prompt_sids[0] if len(distinct_prompt_sids) == 1 else None
+    turn_count = prompt_sids.count(session_id) if session_id else 0
+    stop_count = stop_sids.count(session_id) if session_id else 0
+    stop_failure_count = stop_failure_sids.count(session_id) if session_id else len(stop_failure_sids)
+    verified = (
+        session_id is not None
+        and turn_count >= max(min_turns, 1)
+        and stop_count >= turn_count
+        and stop_failure_count == 0
+    )
+    return {
+        "verified": verified,
+        "session_id": session_id,
+        "turn_count": turn_count,
+        "stop_count": stop_count,
+        "stop_failure_count": stop_failure_count,
+    }
+
+
+def verify_claude_gpt_hook_sink_not_stale(records: list[dict], expected_nonce: str | None) -> dict:
+    """Sink-specific staleness guard (Issue #2219 AC16), deliberately
+    SEPARATE from ``verify_evidence_not_stale`` (which is repo-state/
+    ``tested_head`` based, not sink-based). Verifies the 3-way ``run_nonce``
+    match the Issue body requires: the nonce baked into ``settings.json`` at
+    launch, the nonce THIS harness invocation expects (``expected_nonce``),
+    and the ``run_nonce`` stamped on EVERY record actually observed in the
+    sink -- a single mismatching or missing-nonce record fails the whole
+    check closed (never "mostly fresh"). An empty ``records`` list (sink
+    never populated) or a missing/empty ``expected_nonce`` also fails
+    closed."""
+    if not expected_nonce:
+        return {"verified": False, "reason": "expected_nonce_missing", "mismatched_count": 0}
+    if not records:
+        return {"verified": False, "reason": "no_records", "mismatched_count": 0}
+    mismatched = [r for r in records if r.get("run_nonce") != expected_nonce]
+    return {
+        "verified": not mismatched,
+        "reason": None if not mismatched else "run_nonce_mismatch",
+        "mismatched_count": len(mismatched),
+    }
+
+
+def verify_hook_sink_not_stale(records: list[dict], expected_nonce: str | None) -> dict:
+    """Issue #2219 AC16 VC literal-name alias for
+    ``verify_claude_gpt_hook_sink_not_stale`` -- kept as a distinct symbol
+    (not a bare assignment) so the AC16 Verification Command
+    (``rg -n "def verify_hook_sink_not_stale"``) matches a real function
+    definition."""
+    return verify_claude_gpt_hook_sink_not_stale(records, expected_nonce)
+
+
+def verify_claude_gpt_hook_sink_no_raw_content(records: list[dict]) -> dict:
+    """Structural, fail-closed proof that no sink record smuggles raw
+    prompt/response text or a credential/token (Issue #2219 AC13). Because
+    ``parse_claude_gpt_hook_sink_records`` already drops any record carrying
+    a key outside the fixed allowlist, this only needs to additionally
+    check the ONE field that legitimately carries prompt-derived content --
+    ``prompt_digest`` -- is always either absent/``None`` or a 64-hex-
+    character SHA-256 digest, never raw text."""
+    violations: list[str] = []
+    for record in records:
+        digest = record.get("prompt_digest")
+        if digest is None:
+            continue
+        if not (isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)):
+            violations.append(str(record.get("event")))
+    return {"verified": not violations, "violating_events": violations}
+
+
+def claude_gpt_proxy_state_dir_python() -> Path:
+    """Python-side mirror of ``scripts/claude-gpt/lib.sh``'s
+    ``claude_gpt_proxy_state_dir()`` -- ``$CLAUDE_GPT_HOME/state`` (default
+    ``~/.claude-gpt/state`` when ``CLAUDE_GPT_HOME`` is unset). Mirrors the
+    launcher's own default expression exactly (same pattern as
+    ``_resolve_claude_projects_root``) rather than re-deriving a different
+    one, so an operator-set ``CLAUDE_GPT_HOME`` is honored identically on
+    both sides. This IS the "launcher-owned constant" the Issue body
+    requires the sink path be built from (AC14) -- never any
+    caller-supplied value (worktree path, CLI argument, etc.)."""
+    claude_gpt_home = os.environ.get("CLAUDE_GPT_HOME") or str(Path.home() / ".claude-gpt")
+    return Path(claude_gpt_home) / "state"
+
+
+def claude_gpt_hook_sink_path(nonce: str) -> Path:
+    """Deterministic sink path for the ``claude-gpt`` adapter (Issue #2219
+    AC14), built ONLY from ``claude_gpt_proxy_state_dir_python()`` (a
+    launcher-owned constant) and the run nonce -- never from ``worktree``,
+    CLI args, or any other caller-supplied value. Must byte-for-byte match
+    the path ``scripts/claude-gpt/launch.sh`` computes for the same nonce
+    (see the ``hook-sink-multi-turn`` gate there)."""
+    return claude_gpt_proxy_state_dir_python() / f"hook-sink-{nonce}.jsonl"
+
+
 def extract_claude_child_agent_type_with_source(stdout: str) -> tuple[str | None, str | None]:
     """``(agent_type, source)`` -- the agent type together with the provenance
     of the channel it was actually observed on. Both are ``None`` when no
@@ -2308,6 +3005,186 @@ def extract_claude_child_session_id(
         return None
     except OSError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2219 fix_delta iteration 1 (Option B reintroduction): the interactive
+# herdr lane has no native ``--output-format stream-json`` stdout stream (see
+# ``run_interactive_herdr_isolated``'s own AC5 note -- structured-only flags
+# are never forwarded to the TUI launch). It DOES, however, never pass
+# ``--no-session-persistence`` (that flag is structured-lane only), so Claude
+# Code persists this run's own session transcript to a
+# ``<projects-root>/<cwd-slug>/<session_id>.jsonl`` file (see
+# ``extract_claude_child_session_id``'s fallback path) -- containing the SAME
+# stream-json event shapes (``session_id``/``sessionId``, ``type:
+# "assistant"``, ``tool_use_result.agentId``/``agentType``) that the
+# structured lane's Option A functions (``extract_claude_stream_session_ids``,
+# ``count_claude_stream_turns``, ``verify_same_main_session_across_turns``,
+# ``classify_claude_multi_child_lifecycle``) already parse. Locating and
+# reading this persisted transcript is therefore the wiring point that lets
+# the interactive lane reuse those exact functions as shared building blocks
+# instead of re-deriving equivalent logic for a pane-text transcript (which
+# cannot reliably distinguish a genuine multi-agent hook event from ordinary
+# TUI prose -- see the existing documented ``spawn_events: None`` gap for
+# this lane).
+#
+# Issue #2219 fix_delta iteration 2 (live verification finding against the
+# real claude-gpt adapter, https://github.com/squne121/loop-protocol/pull/2222#issuecomment-5307351011):
+# ``<projects-root>`` above is NOT always ``~/.claude/projects``. The
+# ``claude-gpt`` adapter isolates its whole Claude Code config root to
+# ``$CLAUDE_GPT_HOME/claude`` (default ``~/.claude-gpt/claude`` -- see
+# ``scripts/claude-gpt/lib.sh``'s ``claude_gpt_claude_config_dir``, exported
+# as ``CLAUDE_CONFIG_DIR`` by ``launch.sh`` before the isolated session ever
+# starts), so its session transcript is persisted under
+# ``$CLAUDE_GPT_HOME/claude/projects`` instead -- the old hardcoded
+# ``~/.claude/projects`` scan could never find it, producing a false
+# ``interactive_transcript_found: False``. Live filesystem inspection of a
+# real isolated claude-gpt session
+# (``~/.claude-gpt/claude/projects/<cwd-slug>/<session-id>.jsonl``) confirms
+# the SAME flat, single-file, native stream-json-shaped transcript format the
+# native adapter writes -- there is no adapter-specific transcript shape to
+# special-case here; only the ROOT directory differs, and it differs for the
+# exact same reason (and using the exact same resolution logic) the launcher
+# itself already isolates it. ``_resolve_claude_projects_root`` below mirrors
+# ``lib.sh``'s own default expression exactly, rather than re-deriving a
+# different one, so an operator-set ``CLAUDE_GPT_HOME`` is honored
+# identically on both sides.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_claude_projects_root(claude_adapter: str) -> Path:
+    """The Claude Code ``projects`` directory root this run's own session
+    transcript was actually persisted under, based on which adapter
+    launched it (Issue #2219 fix_delta iteration 2). ``native`` (the
+    default) uses ``~/.claude/projects`` directly. ``claude-gpt`` isolates
+    its Claude Code config root to ``$CLAUDE_GPT_HOME/claude`` (default
+    ``~/.claude-gpt/claude`` when ``CLAUDE_GPT_HOME`` is unset -- mirrors
+    ``scripts/claude-gpt/lib.sh``'s ``claude_gpt_claude_config_dir``
+    default expression exactly), so its transcript lives under
+    ``$CLAUDE_GPT_HOME/claude/projects`` instead."""
+    if claude_adapter == "claude-gpt":
+        claude_gpt_home = os.environ.get("CLAUDE_GPT_HOME") or str(Path.home() / ".claude-gpt")
+        return Path(claude_gpt_home) / "claude" / "projects"
+    return Path.home() / ".claude" / "projects"
+
+
+def _find_claude_interactive_transcript(
+    worktree: str, since_epoch: float, claude_adapter: str = "native"
+) -> Path | None:
+    """Best-effort, content-linked (never filename-guessed) locate of the
+    persisted Claude Code session transcript this interactive-lane run
+    itself wrote, by scanning every ``*/*.jsonl`` file under the adapter's
+    own resolved projects root (see ``_resolve_claude_projects_root``) for
+    one whose (a) mtime is at or after ``since_epoch`` (a small 2s grace
+    window absorbs clock/flush skew) and (b) contains a ``cwd`` field
+    (checked across the first ``_TRANSCRIPT_CWD_SCAN_LINES`` lines, not just
+    the first -- Issue #2219 fix_delta iteration 2 live finding: a real
+    Claude Code transcript's first line(s) are session-bookkeeping records
+    with no ``cwd`` field at all; ``cwd`` only appears once the first actual
+    message record is written, typically the 3rd-4th line, so a first-line-
+    only check silently failed to ever find a real transcript, native or
+    claude-gpt alike) equal to ``worktree`` exactly -- so a concurrent or
+    leftover session for a DIFFERENT worktree can never be mistaken for this
+    run's own transcript. When multiple candidates match (e.g. a stale file
+    from an earlier run against the same worktree that happens to satisfy
+    the mtime window), the most recently modified one is returned. Returns
+    ``None`` (never a guess) if no matching file is found or the scan itself
+    fails (missing projects directory, permission error, etc.)."""
+    try:
+        projects_dir = _resolve_claude_projects_root(claude_adapter)
+        if not projects_dir.is_dir():
+            return None
+        best: tuple[float, Path] | None = None
+        for candidate in projects_dir.glob("*/*.jsonl"):
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < since_epoch - 2.0:
+                continue
+            try:
+                matched_cwd = False
+                with candidate.open(encoding="utf-8", errors="replace") as handle:
+                    for _ in range(_TRANSCRIPT_CWD_SCAN_LINES):
+                        line = handle.readline()
+                        if not line:
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if not isinstance(record, dict):
+                            continue
+                        if "cwd" not in record:
+                            continue
+                        matched_cwd = record.get("cwd") == worktree
+                        break
+            except OSError:
+                continue
+            if not matched_cwd:
+                continue
+            if best is None or mtime > best[0]:
+                best = (mtime, candidate)
+        return best[1] if best else None
+    except OSError:
+        return None
+
+
+def _find_claude_interactive_subagent_only_session_dirs(
+    worktree: str, since_epoch: float, claude_adapter: str = "native"
+) -> list[str]:
+    """Issue #2219 fix_delta iteration 2 LIVE re-verification finding
+    (https://github.com/squne121/loop-protocol/pull/2222, live run against
+    the real claude-gpt adapter after the iteration-2 fixes above): every
+    session directory this scan can find in the mtime window that contains
+    ``subagents/*.meta.json`` spawn evidence (genuine SubAgent activity
+    confirmed on disk) but NO sibling flat ``<session-id>.jsonl`` transcript
+    file at all -- unlike the flat-transcript shape
+    ``_find_claude_interactive_transcript`` looks for above (confirmed
+    present for OLDER/manually-driven sessions inspected during this same
+    investigation), this harness's own herdr-PTY-automation-driven
+    claude-gpt interactive sessions in this environment were live-observed
+    to NEVER produce a flat transcript at all -- reproducibly, across four
+    separate real runs against the same worktree, spanning hours -- only
+    the per-SubAgent ``subagents/*.meta.json`` spawn metadata (Issue #2219
+    fix_delta iteration 2's own live verification requirement) is ever
+    written for THIS invocation shape. That metadata alone cannot supply an
+    honest ``cwd`` match (no such field) or a completion signal (no such
+    field either -- see references/claude-code.md), so it is NOT promoted
+    to a PASS-capable evidence source here; this function exists ONLY to
+    surface a non-fabricated diagnostic breadcrumb (an advisory list of
+    matching session directory paths) for a human/follow-up investigation,
+    never to satisfy ``--require-min-subagents``/``--require-min-turns``.
+    Returns an empty list (never a guess) on any lookup failure."""
+    try:
+        projects_dir = _resolve_claude_projects_root(claude_adapter)
+        if not projects_dir.is_dir():
+            return []
+        found: list[str] = []
+        for candidate in projects_dir.glob("*/*"):
+            if not candidate.is_dir():
+                continue
+            subagents_dir = candidate / "subagents"
+            if not subagents_dir.is_dir():
+                continue
+            if not any(subagents_dir.glob("*.meta.json")):
+                continue
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < since_epoch - 2.0:
+                continue
+            sibling_transcript = candidate.parent / f"{candidate.name}.jsonl"
+            if sibling_transcript.exists():
+                continue
+            found.append(str(candidate))
+        return sorted(found)
+    except OSError:
+        return []
 
 
 def extract_codex_parent_session_id(stdout: str) -> str | None:
@@ -3593,10 +4470,29 @@ def run_interactive_herdr_isolated(
     herdr_bin: str = "herdr",
     claude_bin_override: str | None = None,
     claude_adapter: str = "native",
+    additional_prompts: list[str] | None = None,
+    hook_sink_enabled: bool = False,
 ) -> list[str]:
     """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
     in place (so cleanup/session identity survive even if this raises) and
     returns the bounded, redacted pane output lines.
+
+    Issue #2219 (fix_delta iteration 1, Option B reintroduction):
+    ``additional_prompts`` is an optional, ordered list of extra prompt
+    turns sent to the SAME already-started agent/session AFTER the initial
+    ``prompt`` turn settles, reusing the exact same per-turn send/wait/
+    stall-recovery behavior (``_send_prompt_turn``) as the initial turn --
+    re-implementing, in spirit, the ``--additional-prompt`` mechanism PR
+    #2176 prototyped in commit 06d8baa9 and reverted in commit 5a44ebf0 for
+    being out of scope for Issue #2174 (a scope decision, not a technical
+    rejection). ``evidence["turns_completed"]`` counts how many prompt
+    turns (initial + additional) actually settled. The herdr
+    ``session_name``/``agent_name`` used for every turn are the SAME local
+    values captured once above and threaded through this whole function --
+    structurally the same Herdr session/agent for the entire multi-turn
+    journey, never re-created per turn. Omitted by default (``None``),
+    leaving every pre-existing caller's single-turn behavior unchanged
+    (AC6-equivalent for this lane).
 
     Issue #2176 (post-merge live-environment finding, 2026-08-16): when
     ``claude_adapter == "claude-gpt"``, the PATH shim built below (needed so
@@ -3668,6 +4564,7 @@ def run_interactive_herdr_isolated(
     pane_output_lines: list[str] = []
     session_proc: subprocess.Popen | None = None
     claude_bin_shim_dir: str | None = None
+    hook_sink_shim_dir: str | None = None
     try:
         # Actually create the isolated session (not merely set an env var and
         # hope) and block until its independent existence is confirmed via
@@ -3749,6 +4646,80 @@ def run_interactive_herdr_isolated(
                     "--env", "CLAUDE_GPT_CLAUDE_BIN=" + claude_gpt_real_claude_bin,
                 ]
 
+        # Issue #2219 AC2/AC3/AC13-AC17 (OWNER anchor decision, hook-event
+        # evidence channel): wire the interactive lane's durable hook sink
+        # the SAME way ``CLAUDE_GPT_CLAUDE_BIN``/``PATH`` are already
+        # threaded above -- via ``herdr workspace create --env`` (Finding 1:
+        # updating only this process's own env never reaches the already-
+        # running Herdr server/pane process) AND the pane re-pin
+        # ``export`` string below (an interactive login shell's own rc
+        # files can clobber an inherited env var, same Finding 2 rationale).
+        # Independent of ``claude_bin_override`` -- this applies whenever
+        # the caller opted in via ``--require-min-subagents``/
+        # ``--require-min-turns`` (``hook_sink_enabled``), regardless of
+        # whether a ``--claude-bin`` override was also requested.
+        hook_sink_env_pairs: list[tuple[str, str]] = []
+        if runtime == "claude" and hook_sink_enabled:
+            hook_sink_nonce = uuid.uuid4().hex
+            evidence["hook_sink_nonce"] = hook_sink_nonce
+            if claude_adapter == "claude-gpt":
+                # Path built ONLY from the launcher-owned constant
+                # (``claude_gpt_proxy_state_dir_python()`` mirrors
+                # ``scripts/claude-gpt/lib.sh``'s
+                # ``claude_gpt_proxy_state_dir()`` exactly) plus the nonce
+                # generated above -- never from ``worktree`` or any other
+                # caller-supplied value (AC14). ``scripts/claude-gpt/
+                # launch.sh``'s own ``hook-sink-multi-turn`` gate computes
+                # the identical path for the same nonce.
+                hook_sink_path = claude_gpt_hook_sink_path(hook_sink_nonce)
+                hook_sink_path.parent.mkdir(parents=True, exist_ok=True)
+                evidence["hook_sink_path"] = str(hook_sink_path)
+                hook_sink_env_pairs = [
+                    ("CLAUDE_GPT_RUNTIME_SMOKE_HOOKS", "hook-sink-multi-turn"),
+                    ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
+                    # launch.sh independently computes this SAME path from
+                    # its own launcher-owned constant + this nonce; also
+                    # exporting it here is redundant-but-harmless
+                    # observability, never an input launch.sh trusts for
+                    # path construction (AC14).
+                    ("CLAUDE_GPT_HOOK_SINK_PATH", str(hook_sink_path)),
+                ]
+            else:
+                # native adapter (Issue #2219 In Scope: "native adapter は
+                # scripts/claude-gpt/** を一切変更せず harness 側のみで完結
+                # させる"): a harness-owned CLAUDE_CONFIG_DIR pointing at a
+                # generated settings.json with the SAME fixed hook set
+                # (UserPromptSubmit/Stop/StopFailure/SubagentStart/
+                # SubagentStop), all self-contained in a fresh temp dir
+                # this function itself controls -- no scripts/claude-gpt/**
+                # file is read or written for this branch.
+                hook_sink_shim_dir = tempfile.mkdtemp(prefix="worktree-agent-runtime-smoke-hook-sink-")
+                os.chmod(hook_sink_shim_dir, 0o700)
+                hook_sink_path = Path(hook_sink_shim_dir) / f"hook-sink-{hook_sink_nonce}.jsonl"
+                hook_sink_writer_path = Path(hook_sink_shim_dir) / "hook_sink_writer.py"
+                hook_sink_writer_path.write_text(_HOOK_SINK_WRITER_SOURCE, encoding="utf-8")
+                hook_sink_writer_path.chmod(0o700)
+                claude_config_dir = Path(hook_sink_shim_dir) / "claude-config"
+                claude_config_dir.mkdir(parents=True, exist_ok=True)
+                settings_path = claude_config_dir / "settings.json"
+                hook_command = f'python3 "{hook_sink_writer_path}"'
+                settings_payload = {
+                    "hooks": {
+                        event_name: [{"hooks": [{"type": "command", "command": hook_command}]}]
+                        for event_name in sorted(_HOOK_SINK_LIFECYCLE_EVENTS)
+                    },
+                }
+                settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
+                evidence["hook_sink_path"] = str(hook_sink_path)
+                hook_sink_env_pairs = [
+                    ("CLAUDE_CONFIG_DIR", str(claude_config_dir)),
+                    ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
+                    ("CLAUDE_GPT_HOOK_SINK_PATH", str(hook_sink_path)),
+                ]
+            for key, value in hook_sink_env_pairs:
+                isolated_env[key] = value
+                workspace_create_argv += ["--env", f"{key}={value}"]
+
         rc, out, err, timed_out = _run(
             workspace_create_argv,
             timeout=20.0, env=isolated_env,
@@ -3796,6 +4767,25 @@ def run_interactive_herdr_isolated(
                     f"already-running shell: {_redact(_pin_err or _pin_out)}"
                 )
 
+        if hook_sink_env_pairs:
+            # Same re-pin rationale as the ``--claude-bin`` shim above: an
+            # interactive login shell's own rc files can clobber an
+            # inherited env var, so every hook-sink env var is explicitly
+            # re-exported in the already-running pane shell too.
+            _pin_hook_sink_cmd = " && ".join(
+                f"export {key}='{value.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
+                for key, value in hook_sink_env_pairs
+            )
+            _pin_hs_rc, _pin_hs_out, _pin_hs_err, _pin_hs_timed_out = _run(
+                [herdr_bin, "pane", "run", pane_id, _pin_hook_sink_cmd],
+                timeout=15.0, env=isolated_env,
+            )
+            if _pin_hs_timed_out or _pin_hs_rc != 0:
+                raise HerdrLaneError(
+                    "could not pin hook-sink env vars in the isolated pane's "
+                    f"already-running shell: {_redact(_pin_hs_err or _pin_hs_out)}"
+                )
+
         # Issue #1960 AC5: the interactive lane never forwards
         # structured-only flags (``--output-format`` / ``--include-hook-events``
         # / ``--no-session-persistence`` / ``--max-turns``) to the TUI
@@ -3830,6 +4820,9 @@ def run_interactive_herdr_isolated(
 
         _send_prompt_turn(herdr_bin, agent_name, prompt, timeout_seconds, isolated_env, evidence)
         evidence["turns_completed"] = 1
+        for extra_prompt in (additional_prompts or []):
+            _send_prompt_turn(herdr_bin, agent_name, extra_prompt, timeout_seconds, isolated_env, evidence)
+            evidence["turns_completed"] += 1
 
         rc, out, err, timed_out = _run(
             [herdr_bin, "agent", "get", agent_name], timeout=20.0, env=isolated_env,
@@ -3892,8 +4885,23 @@ def run_interactive_herdr_isolated(
                     "did not reach the herdr workspace process)"
                 )
 
+        if hook_sink_env_pairs:
+            # Parsed HERE (before the temp dir, native adapter only, is
+            # removed in the ``finally`` below) so the sink's own records
+            # survive in ``evidence`` regardless of adapter. Never the raw
+            # sink file text -- only already-validated records (Issue
+            # #2219 AC13: no raw prompt/response content ever leaves this
+            # function).
+            _hook_sink_records, _hook_sink_malformed = parse_claude_gpt_hook_sink_records(
+                evidence.get("hook_sink_path", "")
+            )
+            evidence["hook_sink_records"] = _hook_sink_records
+            evidence["hook_sink_malformed_line_count"] = _hook_sink_malformed
+
         return pane_output_lines
     finally:
+        if hook_sink_shim_dir is not None:
+            shutil.rmtree(hook_sink_shim_dir, ignore_errors=True)
         cleanup = evidence["cleanup"]
         cleanup["attempted"] = True
         # Issue #2176 (P0-3 fix-delta): previously these three calls used
@@ -4169,6 +5177,70 @@ def build_parser() -> argparse.ArgumentParser:
             "by default, so every pre-existing caller's argv is unchanged."
         ),
     )
+    parser.add_argument(
+        "--require-min-subagents",
+        type=int,
+        default=0,
+        help=(
+            "Issue #2219 AC3/AC11: opt-in (default 0 = not required). When "
+            "> 0, requires at least this many DISTINCT SubAgents to be "
+            "spawned AND completed (agent_id exact pairing, "
+            "classify_claude_multi_child_lifecycle) or the run FAILs. "
+            "Applies to --runtime claude only. Omitted (0) by default, so "
+            "every pre-existing caller's behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--require-min-turns",
+        type=int,
+        default=0,
+        help=(
+            "Issue #2219 AC2/AC11: opt-in (default 0 = not required). When "
+            "> 0, requires the SAME main session_id to persist across at "
+            "least this many agentic-loop turns within a single structured "
+            "-lane invocation (verify_same_main_session_across_turns) or the "
+            "run FAILs. Requires --max-turns >= this value (validated below "
+            "as a parser.error, never silently clamped). Applies to "
+            "--runtime claude only. Omitted (0) by default, so every "
+            "pre-existing caller's behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--scan-forbidden-markers",
+        action="store_true",
+        help=(
+            "Issue #2219 AC6: opt-in (default off). When set, scans "
+            "captured output (structured lane: stdout/stderr; interactive "
+            "lane: the persisted session transcript plus the bounded pane "
+            "excerpt) for a fixed, literal forbidden failure marker "
+            "allowlist (verify_no_forbidden_marker) -- e.g. '403 WebSocket "
+            "upgrade', 'Please run /login' -- and FAILs if any is observed. "
+            "Applies to --runtime claude only. Omitted (off) by default, so "
+            "every pre-existing caller's behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--additional-prompt",
+        action="append",
+        default=[],
+        help=(
+            "Issue #2219 fix_delta iteration 1 (Option B reintroduction, in "
+            "the spirit of PR #2176 commit 06d8baa9's --additional-prompt, "
+            "reverted in commit 5a44ebf0 for being out of scope for Issue "
+            "#2174): interactive mode only. An extra prompt turn sent to "
+            "the SAME already-started agent/session after the initial "
+            "--prompt-file turn settles. May be repeated (sent in the "
+            "given order) to drive a multi-turn operator journey inside "
+            "one isolated interactive session. Combine with "
+            "--require-min-turns / --require-min-subagents / "
+            "--scan-forbidden-markers to verify same-session-identity, "
+            "multi-SubAgent lifecycle, and forbidden-marker absence across "
+            "the resulting persisted session transcript. Requires --mode "
+            "interactive and --runtime claude. Omitted by default, so "
+            "every pre-existing caller's single-turn behavior is "
+            "unchanged."
+        ),
+    )
     return parser
 
 
@@ -4279,6 +5351,35 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--hermetic-agent-definition requires --runtime claude")
     if args.mode != "structured" and args.hermetic_agent_definition:
         parser.error("--hermetic-agent-definition requires --mode structured")
+    if args.require_min_subagents < 0:
+        parser.error("--require-min-subagents must be >= 0")
+    if args.require_min_turns < 0:
+        parser.error("--require-min-turns must be >= 0")
+    if args.mode == "structured" and args.require_min_turns > 0 and args.max_turns < args.require_min_turns:
+        parser.error("--require-min-turns requires --max-turns >= --require-min-turns")
+    if args.require_min_subagents > 0 and args.runtime != "claude":
+        parser.error("--require-min-subagents requires --runtime claude")
+    if args.require_min_turns > 0 and args.runtime != "claude":
+        parser.error("--require-min-turns requires --runtime claude")
+    if args.scan_forbidden_markers and args.runtime != "claude":
+        parser.error("--scan-forbidden-markers requires --runtime claude")
+    if args.additional_prompt and args.mode != "interactive":
+        parser.error("--additional-prompt requires --mode interactive")
+    if args.additional_prompt and args.runtime != "claude":
+        parser.error("--additional-prompt requires --runtime claude")
+    # Issue #2219 fix_delta iteration 1 (Option B): the interactive lane's
+    # own turn count is 1 (the initial --prompt-file turn) plus however many
+    # --additional-prompt entries were supplied -- there is no --max-turns
+    # equivalent for this lane (never forwarded to the TUI launch, see AC5).
+    if (
+        args.mode == "interactive"
+        and args.require_min_turns > 0
+        and (1 + len(args.additional_prompt)) < args.require_min_turns
+    ):
+        parser.error(
+            "--require-min-turns requires enough --additional-prompt entries "
+            "(1 initial turn + len(--additional-prompt) must be >= --require-min-turns)"
+        )
 
     # Issue #2183 PR #2220 OWNER REQUEST_CHANGES P0-1
     # (https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514),
@@ -4410,6 +5511,13 @@ def main(argv: list[str] | None = None) -> int:
     # static frontmatter fact independent of the run itself.
     tested_head = _git_rev_parse(worktree, "HEAD")
     runtime_version = capture_runtime_version(resolved_runtime_bin) if resolved_runtime_bin else None
+    # Issue #2219 AC1: sha256 of the resolved executable's FILE CONTENT,
+    # binding evidence to the exact binary bytes actually invoked.
+    resolved_executable_sha256 = (
+        extract_claude_resolved_executable_sha256(resolved_runtime_bin)
+        if resolved_runtime_bin
+        else None
+    )
     requested_agent_type = args.agent_type
     # A requested agent is a declaration, not runtime observation.  The
     # effective identity remains unavailable until the native child evidence
@@ -4461,6 +5569,7 @@ def main(argv: list[str] | None = None) -> int:
         "tested_head": tested_head,
         "runtime_version": runtime_version,
         "resolved_executable": resolved_runtime_bin,
+        "resolved_executable_sha256": resolved_executable_sha256,
         "requested_agent_type": requested_agent_type,
         "effective_agent_type": effective_agent_type,
         "loaded_skills": loaded_skills,
@@ -4591,6 +5700,30 @@ def main(argv: list[str] | None = None) -> int:
                     if args.claude_adapter == "claude-gpt"
                     else None
                 )
+                # Issue #2219 AC1/AC7: parse the launcher's own proxy
+                # stderr side-channel and INDEPENDENTLY re-confirm cleanup
+                # -- never trusting the launcher's own
+                # CLAUDE_GPT_PROXY_CLEANUP_OK self-report.
+                if args.claude_adapter == "claude-gpt":
+                    proxy_sidechannel = extract_claude_gpt_proxy_sidechannel(err)
+                    schema_summary["claude_gpt_proxy_sidechannel"] = proxy_sidechannel
+                    proxy_cleanup_independent = verify_claude_gpt_proxy_cleanup_independent(
+                        proxy_sidechannel["proxy_pid"], proxy_sidechannel["proxy_port"]
+                    )
+                    schema_summary["claude_gpt_proxy_cleanup_independent"] = proxy_cleanup_independent
+                    if (
+                        proxy_cleanup_independent["checked"]
+                        and not proxy_cleanup_independent["cleanup_confirmed"]
+                    ):
+                        errors.append(
+                            "claude-gpt proxy cleanup not independently confirmed "
+                            f"(self-reported={proxy_sidechannel['proxy_cleanup_ok_self_reported']}): "
+                            f"{proxy_cleanup_independent}"
+                        )
+                        exit_code = EXIT_FAIL
+                else:
+                    schema_summary["claude_gpt_proxy_sidechannel"] = None
+                    schema_summary["claude_gpt_proxy_cleanup_independent"] = None
                 # Issue #2046: real evidence now that stdout is captured.
                 schema_summary["main_agent_identity"] = build_main_agent_identity(args.claude_agent_name, out)
                 schema_summary["skill_evidence"] = build_skill_evidence(args.claude_agent_name, worktree, out)
@@ -4626,6 +5759,43 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["direct_web_tool_event_count"] = count_direct_web_tool_events(
                 args.runtime, out
             )
+
+            # Issue #2219 AC2/AC3/AC6: opt-in multi-SubAgent lifecycle /
+            # same-main-session-across-turns / forbidden-marker checks.
+            # Each is gated on its own opt-in flag so every pre-existing
+            # caller's evidence/exit-code behavior is unchanged.
+            if args.runtime == "claude":
+                if args.require_min_subagents > 0:
+                    multi_child_lifecycle = classify_claude_multi_child_lifecycle(
+                        out, args.require_min_subagents
+                    )
+                    schema_summary["multi_child_lifecycle"] = multi_child_lifecycle
+                    if not multi_child_lifecycle["verified"]:
+                        errors.append(
+                            "multi-SubAgent lifecycle not verified: "
+                            f"{multi_child_lifecycle}"
+                        )
+                        exit_code = EXIT_FAIL
+                if args.require_min_turns > 0:
+                    same_session_turns = verify_same_main_session_across_turns(
+                        out, args.require_min_turns
+                    )
+                    schema_summary["same_session_across_turns"] = same_session_turns
+                    if not same_session_turns["verified"]:
+                        errors.append(
+                            "same main session across >= "
+                            f"{args.require_min_turns} turns not verified: {same_session_turns}"
+                        )
+                        exit_code = EXIT_FAIL
+                if args.scan_forbidden_markers:
+                    forbidden_marker_scan = verify_no_forbidden_marker(out, err)
+                    schema_summary["forbidden_marker_scan"] = forbidden_marker_scan
+                    if not forbidden_marker_scan["verified"]:
+                        errors.append(
+                            "forbidden failure marker(s) observed: "
+                            f"{forbidden_marker_scan['matched_markers']}"
+                        )
+                        exit_code = EXIT_FAIL
 
             # Issue #1886 AC7: native, runtime-returned spawn session
             # evidence (see extractors above). ``native_spawn_event_observed``
@@ -4980,11 +6150,23 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 exit_code = EXIT_FAIL
 
+            # Issue #2219 fix_delta iteration 1 (Option B): captured BEFORE
+            # the isolated session is created, so the persisted-transcript
+            # lookup below (_find_claude_interactive_transcript) has an
+            # honest lower bound on mtime and can never match a stale
+            # transcript file left over from an earlier, unrelated run
+            # against the same worktree.
+            interactive_run_started_epoch = time.time()
             try:
+                _hook_sink_enabled = args.runtime == "claude" and (
+                    args.require_min_subagents > 0 or args.require_min_turns > 0
+                )
                 pane_output_lines = run_interactive_herdr_isolated(
                     args.runtime, worktree, prompt, float(args.timeout_seconds), run_id, evidence,
                     claude_bin_override=args.claude_bin if args.runtime == "claude" else None,
                     claude_adapter=args.claude_adapter,
+                    additional_prompts=args.additional_prompt or None,
+                    hook_sink_enabled=_hook_sink_enabled,
                 )
 
                 if evidence.get("final_state") == "blocked":
@@ -5000,7 +6182,104 @@ def main(argv: list[str] | None = None) -> int:
                         errors.append(f"expected markers not observed in pane output: {missing}")
                         exit_code = EXIT_FAIL
 
+                # Issue #2219 (OWNER anchor decision, 2026-08-16): the
+                # interactive lane's PASS authority for multi-turn/multi-
+                # SubAgent lifecycle is the hook-event evidence channel
+                # (hook sink records already parsed into
+                # ``evidence["hook_sink_records"]`` inside
+                # ``run_interactive_herdr_isolated``), NOT transcript
+                # existence -- live investigation proved herdr-PTY-driven
+                # claude-gpt sessions never write a flat
+                # ``<session-id>.jsonl`` main transcript (see
+                # ``_find_claude_interactive_transcript`` docstring for the
+                # full incident trail). The transcript lookup below is kept
+                # for ADVISORY/diagnostic breadcrumbs only (never promoted
+                # to PASS authority) alongside the fragmentary
+                # ``subagents/*.meta.json`` scan.
+                if args.runtime == "claude" and (
+                    args.require_min_subagents > 0
+                    or args.require_min_turns > 0
+                    or args.scan_forbidden_markers
+                ):
+                    transcript_path = _find_claude_interactive_transcript(
+                        worktree, interactive_run_started_epoch, args.claude_adapter
+                    )
+                    schema_summary["interactive_transcript_found"] = transcript_path is not None
+                    if transcript_path is None:
+                        # Advisory-only breadcrumb, never a PASS-capable
+                        # evidence source -- see
+                        # _find_claude_interactive_subagent_only_session_dirs
+                        # docstring.
+                        schema_summary["interactive_transcript_subagent_only_session_dirs"] = (
+                            _find_claude_interactive_subagent_only_session_dirs(
+                                worktree, interactive_run_started_epoch, args.claude_adapter
+                            )
+                        )
+                    transcript_text = ""
+                    if transcript_path is not None:
+                        try:
+                            transcript_text = transcript_path.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            transcript_text = ""
+                            schema_summary["interactive_transcript_found"] = False
+
+                    hook_sink_records = evidence.get("hook_sink_records") or []
+                    hook_sink_malformed = evidence.get("hook_sink_malformed_line_count", 0)
+                    hook_sink_expected_nonce = evidence.get("hook_sink_nonce")
+                    hook_sink_staleness = verify_claude_gpt_hook_sink_not_stale(
+                        hook_sink_records, hook_sink_expected_nonce
+                    )
+                    schema_summary["hook_sink_records_count"] = len(hook_sink_records)
+                    schema_summary["hook_sink_malformed_line_count"] = hook_sink_malformed
+                    schema_summary["hook_sink_staleness"] = hook_sink_staleness
+                    schema_summary["hook_sink_no_raw_content"] = verify_claude_gpt_hook_sink_no_raw_content(
+                        hook_sink_records
+                    )
+                    if _hook_sink_enabled and not hook_sink_staleness["verified"]:
+                        errors.append(
+                            "hook-event evidence sink stale or unavailable (interactive lane): "
+                            f"{hook_sink_staleness}"
+                        )
                         exit_code = EXIT_FAIL
+
+                    if args.require_min_subagents > 0:
+                        multi_child_lifecycle = classify_claude_hook_sink_multi_child_lifecycle(
+                            hook_sink_records, args.require_min_subagents
+                        )
+                        schema_summary["multi_child_lifecycle"] = multi_child_lifecycle
+                        schema_summary["multi_child_lifecycle_source"] = "hook_event_sink"
+                        if not multi_child_lifecycle["verified"]:
+                            errors.append(
+                                "multi-SubAgent lifecycle not verified (interactive lane, "
+                                f"hook_event_sink): {multi_child_lifecycle}"
+                            )
+                            exit_code = EXIT_FAIL
+
+                    if args.require_min_turns > 0:
+                        same_session_turns = verify_claude_gpt_hook_sink_multi_turn(
+                            hook_sink_records, args.require_min_turns
+                        )
+                        schema_summary["same_session_across_turns"] = same_session_turns
+                        schema_summary["same_session_across_turns_source"] = "hook_event_sink"
+                        if not same_session_turns["verified"]:
+                            errors.append(
+                                "same main session across >= "
+                                f"{args.require_min_turns} turns not verified "
+                                f"(interactive lane, hook_event_sink): {same_session_turns}"
+                            )
+                            exit_code = EXIT_FAIL
+
+                    if args.scan_forbidden_markers:
+                        forbidden_marker_scan = verify_no_forbidden_marker(
+                            transcript_text, "", combined_pane_text
+                        )
+                        schema_summary["forbidden_marker_scan"] = forbidden_marker_scan
+                        if not forbidden_marker_scan["verified"]:
+                            errors.append(
+                                "forbidden failure marker(s) observed (interactive lane): "
+                                f"{forbidden_marker_scan['matched_markers']}"
+                            )
+                            exit_code = EXIT_FAIL
 
                 # Issue #2183: same structural causal-evidence verdict as
                 # the structured lane, applied here to the captured pane

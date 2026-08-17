@@ -79,10 +79,13 @@ def _run(
     worktree: Path,
     *args: str,
     fake_bin_dir: Path | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if fake_bin_dir is not None:
         env["PATH"] = f"{fake_bin_dir}:{env['PATH']}"
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--repo-root", str(repo), "--worktree", str(worktree), *args],
         cwd=str(repo),
@@ -124,6 +127,96 @@ done
 echo '{"type":"result","subtype":"success"}'
 exit 0
 """
+
+
+# Issue #2219 AC7 extension: a fake launcher that ADDITIONALLY emits the
+# real launch.sh's own stderr proxy side-channel lines
+# (CLAUDE_GPT_PROXY_PORT/_LOG/_PID at startup,
+# CLAUDE_GPT_PROXY_CLEANUP_OK/CLAUDE_GPT_CLAUDE_EXIT_CODE at cleanup),
+# controllable via env vars so tests can exercise both the "genuinely
+# clean" and "self-report lies" cases against
+# verify_claude_gpt_proxy_cleanup_independent's INDEPENDENT re-check.
+_FAKE_CLAUDE_GPT_LAUNCHER_WITH_PROXY_SIDECHANNEL = """
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --claude-bin) shift 2 ;;
+    --check-only|--dry-run) shift ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *) shift ;;
+  esac
+done
+echo "CLAUDE_GPT_PROXY_PORT=${FAKE_PROXY_PORT:-18080}" 1>&2
+echo "CLAUDE_GPT_PROXY_LOG=/tmp/fake-proxy.log" 1>&2
+echo "CLAUDE_GPT_PROXY_PID=${FAKE_PROXY_PID:-1}" 1>&2
+echo '{"type":"result","subtype":"success"}'
+echo "CLAUDE_GPT_PROXY_CLEANUP_OK=${FAKE_PROXY_CLEANUP_OK:-true}" 1>&2
+echo "CLAUDE_GPT_CLAUDE_EXIT_CODE=0" 1>&2
+exit 0
+"""
+
+
+def test_claude_gpt_adapter_proxy_cleanup_confirmed_independently_when_pid_gone(
+    repo_with_worktree, tmp_path
+):
+    """Issue #2219 AC7 (positive control): a genuinely-gone proxy pid
+    (never allocated by this test process) plus a truthful
+    CLAUDE_GPT_PROXY_CLEANUP_OK=true self-report both agree -- the
+    INDEPENDENT re-check must confirm cleanup, and the run PASSes."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launcher_bin = tmp_path / "claude-gpt" / "launch.sh"
+    launcher_bin.parent.mkdir()
+    _write_fake_exe(launcher_bin, _FAKE_CLAUDE_GPT_LAUNCHER_WITH_PROXY_SIDECHANNEL)
+
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out-claude-gpt-proxy-cleanup-ok"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--claude-bin", str(launcher_bin),
+        "--claude-adapter", "claude-gpt",
+        fake_bin_dir=fake_bin,
+        extra_env={"FAKE_PROXY_PID": "999999999", "FAKE_PROXY_CLEANUP_OK": "true"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "claude_gpt_proxy_cleanup_independent" in summary
+    assert "'cleanup_confirmed': True" in summary
+
+
+def test_claude_gpt_adapter_proxy_cleanup_self_report_lie_overridden_by_independent_recheck(
+    repo_with_worktree, tmp_path
+):
+    """Issue #2219 AC7 (poison test): the launcher self-reports
+    CLAUDE_GPT_PROXY_CLEANUP_OK=true, but the reported proxy pid is THIS
+    TEST PROCESS's own pid (guaranteed alive). The independent re-check
+    must override the self-report and FAIL the run -- never trusting the
+    launcher's own claim."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launcher_bin = tmp_path / "claude-gpt" / "launch.sh"
+    launcher_bin.parent.mkdir()
+    _write_fake_exe(launcher_bin, _FAKE_CLAUDE_GPT_LAUNCHER_WITH_PROXY_SIDECHANNEL)
+
+    prompt = _prompt_file(tmp_path)
+    out_dir = tmp_path / "out-claude-gpt-proxy-cleanup-lie"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--claude-bin", str(launcher_bin),
+        "--claude-adapter", "claude-gpt",
+        fake_bin_dir=fake_bin,
+        extra_env={"FAKE_PROXY_PID": str(os.getpid()), "FAKE_PROXY_CLEANUP_OK": "true"},
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
+    assert "'cleanup_confirmed': False" in summary
+    assert "proxy_cleanup_ok_self_reported': True" in summary
 
 
 def _fake_native_claude(version: str = "1.0.0") -> str:
