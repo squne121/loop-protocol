@@ -473,6 +473,25 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
   確認できない場合は fail-closed で exit 1 とする（PR #1921 human OWNER fix-delta）。
 - Runner（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は runtime 起動・観測・証跡収集だけを所有し、
   hook reason の意味分類・mutation deny の妥当性・review verdict 等の semantic 判定は caller が引き続き所有する。
+- **SubAgent 実行の causal evidence は hook ID 相関を要求し、marker 文字列出力のみでは不十分とする**（Issue #2183、
+  Issue #2174 OWNER REQUEST_CHANGES https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173、
+  PR #2214 OWNER レビュー https://github.com/squne121/loop-protocol/pull/2214#issuecomment-5307009937、
+  PR #2220 レビュー fix-delta を踏まえた明文化）。完了 marker（`--forbid-marker` / 完了 marker 等）はモデル生成
+  テキストの一部であり、synthetic な fixture でも trivially 満たせる自己申告に等しい。SubAgent 実行の PASS 判定
+  は、`subagent_causal_evidence_verdict()`（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）が計算する
+  `causal_evidence_source` が `hook_id_correlated`（同一 `agent_id` を持つ `SubagentStart`/`SubagentStop` ペアが
+  観測され、かつ `SubagentStop` payload の `agent_transcript_path` が観測できた場合のみ）であることを必要条件と
+  する。marker 文字列の一致のみを根拠に PASS と判定してはならない（`marker_only_insufficient`／`no_evidence` は
+  PASS の根拠にならない）。marker 文字列判定は補助情報として残してよいが、単独で PASS 判定に用いない。
+  - **適用範囲（opt-in ではなく既定強制の範囲を明示する）**: structured lane（`run_structured_claude` 経由）は
+    hook stream-json チャンネルが常に利用可能なため、呼び出し側が `--expect-marker` を指定する場合、この
+    causal-evidence 要件は **既定で強制される**（追加フラグ不要）。`--require-subagent-causal-evidence` フラグは、
+    `--expect-marker` を指定しない structured lane 実行にもこの要件を課したい場合にのみ必要となる。
+  - **interactive lane の限定**: interactive lane（`run_interactive_herdr_isolated` 経由、herdr pane の
+    テキストレンダリング）は `--include-hook-events` の stream-json hook payload を構造的に転記しないため、
+    `causal_evidence_source` は現状 `no_evidence`／`marker_only_insufficient` に留まる構造的制約がある。この
+    lane では本要件は引き続き **opt-in**（`--require-subagent-causal-evidence` を明示した場合のみ exit を
+    昇格）であり、interactive-lane 向け hook 出力チャネルの整備は別途 follow-up とする。
 
 ## 関連ドキュメント
 
