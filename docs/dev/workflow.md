@@ -383,6 +383,23 @@ GitHub full-text search の false positive は候補 Issue body の `## Allowed 
 | GitHub Milestone 操作 | `docs/dev/milestone-ops.md` |
 | 運用単位（issue-refinement-loop / impl-review-loop 等）の状態機械・SubAgent 契約・escalation 方針の変更 | `docs/dev/workflows/*.md`（derived_design_note） |
 
+## Availability Invariant（可用性不変条件）
+
+security / isolation 強化を目的とする変更（例: 認証情報の非露出化、実行環境の分離強化、trust boundary の縮小）は、
+分離や遮断を強めるだけの変更になりがちで、結果として正規の canonical workflow 自体が実行不能になる回帰を静的検証だけでは検出できないことがある
+（Issue #2241: Claude-GPT isolated session の `HOME` 分離強化が意図せず trusted `uv` toolchain 解決を壊した事例）。
+
+このため、security / isolation 強化変更を含む delivery（Issue / PR）は、**同一 delivery 内で最低 1 つの canonical positive workflow を、
+fresh isolated session から実証しなければならない**（Availability Invariant）。
+
+- 「fresh isolated session からの実証」とは、`HOME` override や manual cache delete 等の workaround を用いず、
+  対象の isolated 実行環境（例: Claude-GPT launcher が起動するセッション）をそのまま起動し、
+  当該 canonical workflow（例: `preflight.run.with_human_context` 相当の control-plane command）が
+  bootstrap / authentication 理由では停止せず完走することを指す。
+- 動作検証の適用判定・SKIP 規約・証跡保存・Stop Condition 連動は `docs/dev/runtime-verification-policy.md` の
+  「Runtime Verification Applicability」を正本とする。
+- fallback 経由の成功（例: `HOME` override での代替成功）を canonical positive workflow の実証として扱ってはならない。
+
 ## SSOT Routing Table（SSOT ルーティング表）
 
 SSOT 追加時の参照先を集約した索引。AI エージェントは実装着手前に対象トピックの SSOT を本表から確認する。
