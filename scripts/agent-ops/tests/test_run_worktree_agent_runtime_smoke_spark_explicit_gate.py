@@ -102,7 +102,9 @@ def _user_prompt_submit(gate_script_path, auth_dir, session_id, prompt, *, launc
     )
 
 
-def _pre_tool_use_agent(gate_script_path, auth_dir, session_id, subagent_type="spark-codex", *, launch_nonce="nonce-fixture"):
+def _pre_tool_use_agent(
+    gate_script_path, auth_dir, session_id, subagent_type="spark-codex", *, launch_nonce="nonce-fixture"
+):
     return _run_gate(
         gate_script_path,
         "pre-tool-use-agent",
@@ -208,7 +210,9 @@ def test_authorization_single_use_next_turn_carryover_rejected(gate_script_path,
 
 def test_authorization_single_use_stale_resume_launch_nonce_rejected(gate_script_path, tmp_path):
     auth_dir = tmp_path / "auth-resume"
-    _user_prompt_submit(gate_script_path, auth_dir, "sess-e", "@agent-spark-codex please", launch_nonce="nonce-old-session")
+    _user_prompt_submit(
+        gate_script_path, auth_dir, "sess-e", "@agent-spark-codex please", launch_nonce="nonce-old-session"
+    )
     result = _pre_tool_use_agent(gate_script_path, auth_dir, "sess-e", launch_nonce="nonce-new-session-after-resume")
     assert _decision(result) == "deny"
 
