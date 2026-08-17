@@ -417,6 +417,9 @@ while [ "$PORT_ATTEMPTS" -lt "$PORT_MAX_ATTEMPTS" ] && [ "$READY" != "true" ]; d
   # リセットし、明示的に組み立てた変数のみを渡す。HOME は proxy 専用 HOME（P0-2）。
   # 現行 Unix user のまま同一 UID で起動する（dedicated user は Phase 1 の non-goal。
   # Issue #2158 Scope Reframe, 2026-08-15）。
+  # CCP_CODEX_TRANSPORT は repository-owned の CLAUDE_GPT_CODEX_TRANSPORT_POLICY（lib.sh
+  # 単一 source of truth）を無条件で渡し、isolated proxy config.json や upstream
+  # built-in default の websocket よりも優先させる（Issue #2204）。
   env -i \
     "PATH=$PATH" \
     "HOME=$PROXY_HOME_TARGET" \
@@ -424,6 +427,7 @@ while [ "$PORT_ATTEMPTS" -lt "$PORT_MAX_ATTEMPTS" ] && [ "$READY" != "true" ]; d
     "XDG_STATE_HOME=$PROXY_STATE_DIR_TARGET" \
     "CCP_BIND_ADDRESS=127.0.0.1" \
     "CCP_LOG_STDERR=1" \
+    "CCP_CODEX_TRANSPORT=$CLAUDE_GPT_CODEX_TRANSPORT_POLICY" \
     "$PROXY_BIN_TARGET" serve --port "$PROXY_PORT" --no-monitor > "$PROXY_LOG" 2>&1 &
   PROXY_PID=$!
 
