@@ -58,6 +58,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from baseline_vc_preflight import (  # noqa: E402
+    CLEANUP_TAIL_SECONDS as _COMMAND_CLEANUP_TAIL_SECONDS,
     DEFAULT_TIMEOUT_SECONDS as _PER_VC_COMMAND_TIMEOUT_SECONDS,
     compute_canonical_vc_plan as _compute_canonical_vc_plan,
     extract_verification_commands_section,
@@ -158,7 +159,11 @@ CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS = (
 # already imports THIS module). A pytest in `issue-refinement-loop/tests/`
 # cross-checks the two stay identical.
 
-_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = 15
+# Issue #2233 AC2: sourced from baseline_vc_preflight.py's single canonical
+# `CLEANUP_TAIL_SECONDS` (the same value each command_timeout_budget/v1
+# entry in compute_canonical_vc_plan()'s command_budgets[] carries) instead
+# of an independent local literal `15`.
+_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = _COMMAND_CLEANUP_TAIL_SECONDS
 _PER_VC_SLOT_SECONDS = _PER_VC_COMMAND_TIMEOUT_SECONDS + _PER_VC_SLOT_CLEANUP_TAIL_SECONDS  # 165
 
 _BUDGET_AGGREGATE_MARGIN_SECONDS = 20

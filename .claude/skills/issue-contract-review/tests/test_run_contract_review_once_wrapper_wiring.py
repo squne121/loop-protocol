@@ -362,3 +362,104 @@ class TestTimeoutPhaseUsesExistingNamedConstantsAC12:
             + _rcr_mod._VC_PREFLIGHT_OVERHEAD_SECONDS
         )
         assert _rcr_mod._VC_PREFLIGHT_TIMEOUT == expected
+
+
+# ---------------------------------------------------------------------------
+# Issue #2233 AC2: command-level timeout budget plumbing across the review
+# wrapper chain. Complements TestVcPreflightTimeoutRelationshipAC2 (#1333)
+# above, which already fixes that `_VC_PREFLIGHT_PER_COMMAND_TIMEOUT` is a
+# single import (not an independent literal); this class additionally
+# fixes that `contract_readiness_check.py`'s cleanup-tail constant and
+# `run_root_review_pipeline.py`'s canonical-plan consumption are likewise
+# sourced from `baseline_vc_preflight.py`'s single-owner constants/producer
+# -- and that the plan's NEW `command_budgets[]` field is present and
+# internally consistent.
+# ---------------------------------------------------------------------------
+
+
+def _load_run_root_review_pipeline():
+    """Load `run_root_review_pipeline.py` the same importlib way this file
+    loads `run_contract_review_once.py` above, so its own
+    `sys.path.insert()` side effects (needed to resolve ITS `from
+    baseline_vc_preflight import ...` / `from contract_readiness_check
+    import ...`) run before we inspect its module-level bindings."""
+    _rrrp_path = (
+        _HERE.parent.parent / "issue-refinement-loop" / "scripts" / "run_root_review_pipeline.py"
+    )
+    _spec = importlib.util.spec_from_file_location("run_root_review_pipeline", _rrrp_path)
+    assert _spec is not None and _spec.loader is not None
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+    return _mod
+
+
+class TestCommandTimeoutBudgetWiringIssue2233:
+    """AC2: no file independently re-specifies the per-command timeout or
+    cleanup-tail scalar; all four consumers derive from the SAME canonical
+    plan / named constants baseline_vc_preflight.py owns."""
+
+    def test_contract_readiness_check_cleanup_tail_matches_baseline_constant(self):
+        """`contract_readiness_check._PER_VC_SLOT_CLEANUP_TAIL_SECONDS` is
+        imported from `baseline_vc_preflight.CLEANUP_TAIL_SECONDS`, not an
+        independent local literal `15`."""
+        import baseline_vc_preflight
+        import contract_readiness_check
+
+        assert (
+            contract_readiness_check._PER_VC_SLOT_CLEANUP_TAIL_SECONDS
+            == baseline_vc_preflight.CLEANUP_TAIL_SECONDS
+        )
+
+    def test_contract_readiness_check_source_does_not_hardcode_cleanup_tail_literal(self):
+        """Regression guard: `_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = 15` (a bare
+        re-specified literal) must not reappear in the source."""
+        crc_path = _SCRIPTS_DIR / "contract_readiness_check.py"
+        with open(crc_path) as f:
+            script_content = f.read()
+        assert "_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = 15" not in script_content
+        assert "_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = _COMMAND_CLEANUP_TAIL_SECONDS" in script_content
+
+    def test_run_root_review_pipeline_imports_same_compute_canonical_vc_plan(self):
+        """`run_root_review_pipeline.py`'s `_compute_canonical_vc_plan` IS
+        (by identity) `baseline_vc_preflight.compute_canonical_vc_plan` --
+        not a re-implemented or independently-derived function."""
+        import baseline_vc_preflight
+
+        run_root_review_pipeline = _load_run_root_review_pipeline()
+        assert (
+            run_root_review_pipeline._compute_canonical_vc_plan
+            is baseline_vc_preflight.compute_canonical_vc_plan
+        )
+
+    def test_run_root_review_pipeline_imports_same_derive_review_budget(self):
+        import contract_readiness_check
+
+        run_root_review_pipeline = _load_run_root_review_pipeline()
+        assert (
+            run_root_review_pipeline._derive_review_budget
+            is contract_readiness_check.derive_review_budget
+        )
+
+    def test_canonical_plan_command_budgets_present_and_consistent(self):
+        """The canonical plan `contract_readiness_check.py` /
+        `run_root_review_pipeline.py` consume now carries `command_budgets`
+        (Issue #2233 AC1), and `aggregate_timeout_seconds` is the sum of
+        each occurrence's own `timeout_seconds + cleanup_tail_seconds`."""
+        import baseline_vc_preflight
+
+        body = (
+            "## Verification Commands\n\n"
+            "```bash\n$ pnpm typecheck\n```\n\n"
+            "```bash\n$ pnpm lint\n```\n"
+        )
+        plan = baseline_vc_preflight.compute_canonical_vc_plan(body)
+
+        assert "command_budgets" in plan
+        assert "aggregate_timeout_seconds" in plan
+        assert "estimator_evidence_digest" in plan
+        assert len(plan["command_budgets"]) == 2
+
+        expected_sum = sum(
+            b["timeout_seconds"] + b["cleanup_tail_seconds"] for b in plan["command_budgets"]
+        )
+        assert plan["aggregate_timeout_seconds"] == expected_sum

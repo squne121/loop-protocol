@@ -60,6 +60,163 @@ import pnpm_gate_registry as pnpm_gate_registry  # noqa: E402
 # `reviewer_transport.py` の `PER_ATTEMPT_DEADLINE_SECONDS` docstring 参照）。
 DEFAULT_TIMEOUT_SECONDS = 150
 
+# ---------------------------------------------------------------------------
+# Command-level timeout budget (Issue #2233)
+# ---------------------------------------------------------------------------
+#
+# `DEFAULT_TIMEOUT_SECONDS` above is the single ROOT-owned per-command
+# fallback value; `contract_readiness_check.py` / `run_contract_review_once.py`
+# / `run_root_review_pipeline.py` import it (directly or via
+# `compute_canonical_vc_plan()`) rather than re-defining an independent
+# `150` scalar (Issue #2233 AC2). This section adds the `command_timeout_budget/v1`
+# data type and its deterministic `static_fallback` producer
+# (`compute_command_timeout_budget()`), consumed by `compute_canonical_vc_plan()`
+# below to populate the canonical plan's `command_budgets[]` field.
+#
+# Scope note (Issue #2233 Out of Scope): history-based (P50/P95) calibration
+# is intentionally NOT implemented here. `estimated_seconds` below is a
+# forward-compatible hook for a future history-based estimator to supply a
+# value through the SAME policy-ceiling enforcement path; no production
+# caller in this Issue passes it.
+
+# Alias making the per-command role of `DEFAULT_TIMEOUT_SECONDS` explicit at
+# call sites that reason about command-level budgets specifically.
+DEFAULT_PER_COMMAND_TIMEOUT_SECONDS = DEFAULT_TIMEOUT_SECONDS
+
+# Floor for any resolved per-command timeout (explicit override, estimate, or
+# fallback): guards against a degenerate 0/negative value reaching
+# `run_command()` / `run_subprocess_with_cooperative_supervisor()`.
+MIN_PER_COMMAND_TIMEOUT_SECONDS = 30
+
+# Hard ceiling (Issue #2233 OWNER point 3 / Background): a resolved
+# per-command timeout that would exceed this value is REJECTED before any
+# subprocess is launched (`CommandTimeoutExceedsPolicyError`,
+# `command_timeout_exceeds_policy`), rather than silently honored. Chosen
+# equal to `DEFAULT_PER_COMMAND_TIMEOUT_SECONDS` so the existing #2207
+# aggregate formula's worst-case assumption (every command costs at most
+# `DEFAULT_TIMEOUT_SECONDS` seconds) can never be silently invalidated by a
+# per-command budget this module produces (Issue #2233 AC3 aggregate
+# invariant). A caller needing a genuinely larger per-command budget for a
+# specific known-slow VC is Out of Scope for this Issue (history-based
+# calibration / per-command policy overrides are follow-up work).
+MAX_PER_COMMAND_TIMEOUT_SECONDS = DEFAULT_PER_COMMAND_TIMEOUT_SECONDS
+
+# Fixed post-SIGTERM cleanup tail budgeted per command slot. This is the SAME
+# value `contract_readiness_check.py`'s `_PER_VC_SLOT_CLEANUP_TAIL_SECONDS`
+# used to hardcode independently (Issue #2233 AC2): that module now imports
+# this constant instead.
+CLEANUP_TAIL_SECONDS = 15
+
+# Aggregate hard ceiling implied by `MAX_VC_EXECUTION_SLOTS` (defined below)
+# at the per-command hard maximum. Informational / test-facing constant; the
+# actual policy_cap enforcement remains `MAX_VC_EXECUTION_SLOTS`-based
+# (`VerificationBudgetExceedsPolicyError` in contract_readiness_check.py),
+# unchanged by this Issue (Out of Scope: the #2207 aggregate formula itself).
+MAX_TOTAL_VERIFICATION_BUDGET_SECONDS = 40 * (
+    MAX_PER_COMMAND_TIMEOUT_SECONDS + CLEANUP_TAIL_SECONDS
+)
+
+COMMAND_TIMEOUT_BUDGET_SCHEMA = "command_timeout_budget/v1"
+COMMAND_TIMEOUT_BUDGET_ESTIMATOR_VERSION = "v1"
+
+
+class CommandTimeoutExceedsPolicyError(Exception):
+    """Typed, non-retryable rejection: a resolved per-command timeout exceeds
+    `MAX_PER_COMMAND_TIMEOUT_SECONDS`. Raised BEFORE any subprocess for that
+    command is launched (Issue #2233 AC5)."""
+
+    error_code = "command_timeout_exceeds_policy"
+
+    def __init__(self, command_hash: str, requested_seconds: int, max_seconds: int):
+        self.command_hash = command_hash
+        self.requested_seconds = requested_seconds
+        self.max_seconds = max_seconds
+        super().__init__(
+            f"command_hash={command_hash} requested_seconds={requested_seconds} "
+            f"exceeds max_seconds={max_seconds} ({self.error_code})"
+        )
+
+
+def compute_command_timeout_budget(
+    command: str,
+    *,
+    override_seconds: Optional[int] = None,
+    estimated_seconds: Optional[int] = None,
+    default_seconds: int = DEFAULT_PER_COMMAND_TIMEOUT_SECONDS,
+    cleanup_tail_seconds: int = CLEANUP_TAIL_SECONDS,
+    min_seconds: int = MIN_PER_COMMAND_TIMEOUT_SECONDS,
+    max_seconds: int = MAX_PER_COMMAND_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Compute a `command_timeout_budget/v1` entry for a single VC command.
+
+    Precedence (Issue #2233 AC4): `override_seconds` (an explicit
+    `--timeout-seconds` CLI value) is a HARD GLOBAL override and always wins
+    over `estimated_seconds` / `default_seconds`.
+
+    `estimated_seconds` is a forward-compatible hook for a future
+    history-based estimator (Out of Scope for this Issue); no production
+    caller currently supplies it.
+
+    Raises `CommandTimeoutExceedsPolicyError` (Issue #2233 AC5) BEFORE
+    returning if the resolved value would exceed `max_seconds` -- this
+    applies to EVERY source (override, estimate, or fallback) so the #2207
+    aggregate formula's per-command worst-case assumption can never be
+    silently violated.
+    """
+    command_hash = compute_command_hash(command)
+
+    if override_seconds is not None:
+        source = "explicit_override"
+        resolved_seconds = int(override_seconds)
+        sample_count = 0
+        observed_p95_ms: Optional[int] = None
+    elif estimated_seconds is not None:
+        source = "history_estimate"
+        resolved_seconds = int(estimated_seconds)
+        sample_count = 1
+        observed_p95_ms = int(estimated_seconds) * 1000
+    else:
+        source = "static_fallback"
+        resolved_seconds = int(default_seconds)
+        sample_count = 0
+        observed_p95_ms = None
+
+    if resolved_seconds > max_seconds:
+        raise CommandTimeoutExceedsPolicyError(command_hash, resolved_seconds, max_seconds)
+    # Issue #2233: `min_seconds` is a documented floor for the
+    # `static_fallback` / future `history_estimate` sources ONLY. An
+    # `explicit_override` (Issue #2233 AC4 hard global override, e.g. a
+    # fault-injection test's deliberately narrow `--timeout-seconds`) is
+    # honored byte-for-byte and never silently raised to `min_seconds` --
+    # doing so would defeat the caller's explicit intent.
+    if source != "explicit_override":
+        resolved_seconds = max(min_seconds, resolved_seconds)
+
+    estimator_input_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "command_hash": command_hash,
+                "source": source,
+                "timeout_seconds": resolved_seconds,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    return {
+        "schema": COMMAND_TIMEOUT_BUDGET_SCHEMA,
+        "command_hash": command_hash,
+        "execution_key_hash": command_hash,
+        "timeout_seconds": resolved_seconds,
+        "cleanup_tail_seconds": cleanup_tail_seconds,
+        "source": source,
+        "estimator_version": COMMAND_TIMEOUT_BUDGET_ESTIMATOR_VERSION,
+        "estimator_input_digest": f"sha256:{estimator_input_digest}",
+        "sample_count": sample_count,
+        "observed_p95_ms": observed_p95_ms,
+        "policy_clamped": False,
+    }
+
 
 def collect_current_head_evidence(cwd: str, reviewed_head_sha: str) -> Dict[str, Any]:
     """Observe and certify one clean worktree against a reviewed commit object.
@@ -776,12 +933,37 @@ def compute_canonical_vc_plan(
     policy_cap: int = MAX_VC_EXECUTION_SLOTS,
     max_workers: int = _VC_PLAN_DEFAULT_MAX_WORKERS,
     per_command_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    global_override_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Compute the canonical, side-effect-free VC plan for `body`.
 
     Returns a dict with `body_sha256` / `parser_contract_version` /
     `command_occurrence_count` / `launch_upper_bound` /
-    `per_command_timeout_seconds` / `max_workers` / `policy_cap`.
+    `per_command_timeout_seconds` / `max_workers` / `policy_cap` /
+    `command_budgets` / `aggregate_timeout_seconds` /
+    `estimator_evidence_digest` (Issue #2233 AC1/AC2/AC3/AC6).
+
+    `command_budgets` is a list of `command_timeout_budget/v1` entries, one
+    per DISTINCT command text extracted from the `## Verification Commands`
+    section (see `compute_command_timeout_budget()`). `global_override_seconds`
+    (Issue #2233 AC4), when given, is a hard override applied to every
+    command's budget (`source: explicit_override`); this mirrors
+    `baseline_vc_preflight.py`'s own `--timeout-seconds` CLI precedence so a
+    caller of THIS function observes the identical override semantics the
+    executor applies.
+
+    `aggregate_timeout_seconds` sums, over every VC OCCURRENCE (not
+    deduplicated), `timeout_seconds + cleanup_tail_seconds` from that
+    occurrence's command budget. Because `MAX_PER_COMMAND_TIMEOUT_SECONDS ==
+    DEFAULT_PER_COMMAND_TIMEOUT_SECONDS`, this sum can never exceed the
+    #2207 `derive_review_budget()` aggregate formula's own worst-case
+    assumption (Issue #2233 AC3 aggregate invariant), which this function
+    does NOT recompute (Out of Scope: the #2207 formula itself is owned by
+    `contract_readiness_check.derive_review_budget()`).
+
+    Raises `CommandTimeoutExceedsPolicyError` (Issue #2233 AC5) BEFORE
+    returning if any resolved command budget would exceed the per-command
+    hard maximum.
     """
     body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -793,10 +975,25 @@ def compute_canonical_vc_plan(
     state_epoch = 0
     seen_in_epoch: Dict[int, set] = {}
 
+    budgets_by_hash: Dict[str, Dict[str, Any]] = {}
+    aggregate_timeout_seconds = 0
+
     for block in blocks:
         for entry in parse_commands_from_block(block):
             command = entry[1]
             command_occurrence_count += 1
+
+            command_hash = compute_command_hash(command)
+            if command_hash not in budgets_by_hash:
+                budgets_by_hash[command_hash] = compute_command_timeout_budget(
+                    command,
+                    override_seconds=global_override_seconds,
+                    default_seconds=per_command_timeout_seconds,
+                )
+            _budget = budgets_by_hash[command_hash]
+            aggregate_timeout_seconds += (
+                _budget["timeout_seconds"] + _budget["cleanup_tail_seconds"]
+            )
 
             is_pure = _is_parallel_eligible_command(command)
             if is_pure:
@@ -815,6 +1012,14 @@ def compute_canonical_vc_plan(
                 launch_upper_bound += 1
                 state_epoch += 1
 
+    command_budgets = list(budgets_by_hash.values())
+    estimator_evidence_digest = hashlib.sha256(
+        json.dumps(
+            sorted(b["estimator_input_digest"] for b in command_budgets),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
     return {
         "body_sha256": body_sha256,
         "parser_contract_version": VC_PLAN_PARSER_CONTRACT_VERSION,
@@ -823,6 +1028,9 @@ def compute_canonical_vc_plan(
         "per_command_timeout_seconds": per_command_timeout_seconds,
         "max_workers": max_workers,
         "policy_cap": policy_cap,
+        "command_budgets": command_budgets,
+        "aggregate_timeout_seconds": aggregate_timeout_seconds,
+        "estimator_evidence_digest": f"sha256:{estimator_evidence_digest}",
     }
 
 
@@ -4010,6 +4218,7 @@ def _build_result_item(
     source_line: Optional[int] = None,
     certified_target_paths: Optional[List[str]] = None,
     cwd: Optional[str] = None,
+    timeout_provenance: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build one VC result entry.
 
@@ -4146,6 +4355,12 @@ def _build_result_item(
         # Consumers must fail closed if this producer-declared requirement is
         # present but its companion evidence is missing or malformed.
         result_item["pnpm_gate_evidence_required"] = True
+
+    if timeout_provenance is not None:
+        # Issue #2233 AC6: effective per-command timeout provenance, sourced
+        # from this command's own `command_timeout_budget/v1` plan entry
+        # (never a copy of another command's budget).
+        result_item["timeout_provenance"] = timeout_provenance
 
     if is_dedup_replay:
         # AC2/AC3: dedup replay carries provenance of the source execution,
@@ -4491,6 +4706,83 @@ def _main_impl() -> int:
         "extraction_errors": 0,
     }
 
+    # -----------------------------------------------------------------
+    # Issue #2233 AC1/AC2/AC4/AC5/AC6: command-level timeout budget.
+    #
+    # `--timeout-seconds`, when explicitly passed on the CLI, is a HARD
+    # GLOBAL override applied to every command (AC4); otherwise each
+    # command gets its own `command_timeout_budget/v1` entry (currently
+    # all resolving to the SAME `static_fallback` value, since no
+    # history-based estimator exists yet -- Out of Scope for this Issue).
+    # Every command's budget is computed BEFORE any subprocess is
+    # launched, so a policy-ceiling violation (AC5) is rejected up front
+    # rather than surfacing mid-execution.
+    # -----------------------------------------------------------------
+    _explicit_timeout_override = any(
+        _a == "--timeout-seconds" or _a.startswith("--timeout-seconds=")
+        for _a in sys.argv[1:]
+    )
+    _global_override_seconds = args.timeout_seconds if _explicit_timeout_override else None
+    _command_budgets_by_hash: Dict[str, Dict[str, Any]] = {}
+    try:
+        for _cmd_entry in commands:
+            _cmd_text = _cmd_entry[1]
+            _cmd_hash = compute_command_hash(_cmd_text)
+            if _cmd_hash not in _command_budgets_by_hash:
+                _command_budgets_by_hash[_cmd_hash] = compute_command_timeout_budget(
+                    _cmd_text,
+                    override_seconds=_global_override_seconds,
+                    default_seconds=DEFAULT_TIMEOUT_SECONDS,
+                )
+    except CommandTimeoutExceedsPolicyError as _budget_exc:
+        _policy_error = {
+            "kind": "command_timeout_exceeds_policy",
+            "rule": "VCP_COMMAND_TIMEOUT_EXCEEDS_POLICY",
+            "message": str(_budget_exc),
+            "minimal_context": f"command_hash=sha256:{_budget_exc.command_hash}",
+            "fix_hint": (
+                "Requested per-command timeout exceeds the fixed policy ceiling "
+                f"({_budget_exc.max_seconds}s); no subprocess was launched."
+            ),
+        }
+        _policy_result = {
+            "schema": "baseline_vc_preflight/v1",
+            "issue": args.issue or 0,
+            "repo": args.repo,
+            "generated_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "source": {
+                "kind": source_kind,
+                "body_sha256": f"sha256:{compute_source_hash(body)}",
+            },
+            "status": "blocked",
+            "summary": {
+                "expected_fail": 0,
+                "unexpected_pass": 0,
+                "blocked": 0,
+                "human_judgment": 0,
+                "extraction_errors": 0,
+            },
+            "results": [],
+            "errors": [_policy_error],
+            "failure_class": "command_timeout_exceeds_policy",
+            "retryable": False,
+        }
+        emit_json(_policy_result, args.evidence_mode, current_evidence)
+        return exit_code_for_status("blocked")
+
+    def _timeout_provenance_for(command_text: str) -> Dict[str, Any]:
+        _b = _command_budgets_by_hash[compute_command_hash(command_text)]
+        return {
+            "timeout_seconds": _b["timeout_seconds"],
+            "cleanup_tail_seconds": _b["cleanup_tail_seconds"],
+            "source": _b["source"],
+            "estimator_version": _b["estimator_version"],
+            "estimator_input_digest": _b["estimator_input_digest"],
+        }
+
+    def _effective_timeout_for(command_text: str) -> int:
+        return _command_budgets_by_hash[compute_command_hash(command_text)]["timeout_seconds"]
+
     # ---------------------------------------------------------------------
     # Issue #1338 (PR #1508 review P0-1/P0-2/P1-1 fixes)
     #
@@ -4537,7 +4829,7 @@ def _main_impl() -> int:
     def _run_and_cache_pure_job(job: Dict[str, Any]) -> None:
         _key = job["_key"]
         _exit_code, _stdout, _stderr, _duration_ms, _runner_env_delta = run_command(
-            job["command"], args.timeout_seconds, args.cwd
+            job["command"], _effective_timeout_for(job["command"]), args.cwd
         )
         # P0-2: fail-closed quiet-success -- a pure observation VC that exits
         # 0 but leaves non-empty stderr is not a trustworthy silent pass.
@@ -4568,7 +4860,7 @@ def _main_impl() -> int:
             _dedup_seen_keys.add(_key)
         else:
             _exit_code, _stdout, _stderr, _duration_ms, _runner_env_delta = run_command(
-                job["command"], args.timeout_seconds, args.cwd
+                job["command"], _effective_timeout_for(job["command"]), args.cwd
             )
             _outcome = {
                 "exit_code": _exit_code,
@@ -4665,6 +4957,7 @@ def _main_impl() -> int:
                 else None
             ),
             cwd=args.cwd,
+            timeout_provenance=_timeout_provenance_for(job["command"]),
         )
         results[job["idx"]] = _result_item
         summary[_result_item["classification"]] += 1
@@ -4874,7 +5167,7 @@ def _main_impl() -> int:
                     _endpoint = _assert_argv[4]
                     assert_exit = _check_github_metadata_assertion(
                         _assertion_type, _field, _literal, _endpoint,
-                        timeout_seconds=args.timeout_seconds,
+                        timeout_seconds=_effective_timeout_for(command),
                     )
                     # P0-1: an external GitHub API observation is a state
                     # barrier -- advance the epoch so later pure observations
@@ -4995,6 +5288,7 @@ def _main_impl() -> int:
                 else None
             ),
             cwd=args.cwd,
+            timeout_provenance=_timeout_provenance_for(command),
         )
         results[_cmd_idx] = result_item
         summary[result_item["classification"]] += 1
