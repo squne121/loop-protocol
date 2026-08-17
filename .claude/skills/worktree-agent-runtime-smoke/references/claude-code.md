@@ -199,3 +199,125 @@ isolated lane 実行中に変化するケース）を追加した。
 - structured lane: `type: system/init`、`type: result`、hook lifecycle event の件数を確認できる
 - interactive lane: `agent explain` から抽出した detected agent／confidence と observed lifecycle state
   （`summary.md` の allowlist フィールドのみ。raw pane transcript は保存しない）
+
+## SubAgent 実行の hook ID 相関による causal evidence 判定関数（`subagent_causal_evidence_verdict()`、Issue #2183 対応）
+
+`subagent_causal_evidence_verdict(stdout, expected_markers=None)`
+（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は、SubAgent が実際に
+実行されたことの証跡を、marker 文字列（synthetic fixture でも trivially 満たせる）
+のみに依存させず、hook lifecycle event の ID 相関という構造的シグナルで判定する
+純粋関数。structured lane の captured stdout（`--include-hook-events` の
+stream-json）を入力とし、live 実行を新規に起動しない hermetic pytest で全域を
+検証できる（本 Issue の Runtime Verification Applicability: `not_applicable`）。
+
+### 利用方法
+
+呼び出し元は structured/interactive いずれの lane でも、captured された
+stdout（または herdr pane text）と、検証対象の `expected_markers`（`--expect-marker`
+と同じリスト）を渡すだけでよい:
+
+```python
+causal_evidence = subagent_causal_evidence_verdict(out, args.expect_marker)
+schema_summary["subagent_causal_evidence"] = causal_evidence
+```
+
+戻り値は常に `schema_summary["subagent_causal_evidence"]` へ無条件（フラグの
+有無に関わらず）に記録される。これにより、実際に exit_code を昇格させたか
+どうかとは独立に、「marker のみの PASS だったのか、hook ID 相関で PASS した
+のか」を事後に判別できる。
+
+### `causal_evidence_source` の意味（PR #2220 OWNER REQUEST_CHANGES
+P0-2/P0-3/P1-1/P1-2 で強化、
+https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514）
+
+3 値の enum で、`hook_id_correlated` へ昇格するのは、単一の曖昧さのない
+Start/Stop chain が以下を **すべて** 満たした場合に限る（fail-closed。
+いずれか一つでも欠落・不一致・曖昧なら昇格しない）:
+
+1. 同一 `agent_id` を持つ `SubagentStart` と `SubagentStop` の hook lifecycle
+   event ペアが観測され、かつ Start 自身の `stream_index`（captured stdout
+   内の出現順序）が Stop より構造的に先行している（P0-3 — 逆順や壊れた
+   ストリームで Stop が先に現れるケースを弾く）
+2. 両イベントが `session_id` を持つ場合は同一であること、`prompt_id` を
+   持つ場合は同一であること、`agent_type` を持つ場合は同一であること
+   （いずれも P0-3。値を持たない場合はその条件はスキップされる — 「取得
+   できる場合」の best-effort 契約）
+3. 同一 `agent_id` に紐づく `SubagentStart`／`SubagentStop` がそれぞれ
+   ちょうど 1 件のみであること（P1-2 — 複数の Start または複数の
+   terminal Stop を持つ `agent_id` は候補から除外される、曖昧な chain を
+   決して「最初の 1 件」で解決しない）
+4. `SubagentStop` payload の `agent_transcript_path` が回収でき、かつそのパスが
+   指すファイルが実在し・シンボリックリンクでなく・通常ファイルであり・
+   （`transcript_allowed_roots` を指定した呼び出しでは）許可された root
+   配下であり・サイズ上限以下であり・（`run_start_time`/`run_end_time` を
+   指定した呼び出しでは）その時間窓内の mtime を持ち・読み取り可能・非空
+   である（`agent_transcript_verified`。Issue #2183 AC11 / PR #2220 P1-1 —
+   payload にパス文字列があるだけでは足りない）
+5. 相関済み `agent_id` が、同一 `session_id`/`prompt_id` スコープ内の
+   `Agent` tool_use/tool_result の `tool_use_id` 相関
+   （`_claude_agent_tool_invocation_correlated`）で裏付けられており、かつ
+   その tool_result が terminal かつ成功（`status == "completed"` かつ
+   `is_error` でない）であること（`tool_invocation_id_correlated` と
+   `terminal_tool_result_success` の両方が `True`。Issue #2183 AC3 / PR
+   #2220 P0-3 — エラーや未完了（`async_launched` のまま）の tool_result は
+   causal evidence として扱わない）
+6. `expected_markers` を指定した呼び出しでは、その **すべての** 期待マーカー
+   （従来の「いずれか 1 つ」ではない — PR #2220 P0-2 で強化）が、相関済み
+   child 自身の `SubagentStop` の `last_assistant_message`（主たる provenance
+   source）、または child 自身の transcript ファイルの assistant 発話record
+   （JSONL としてパースし `type: "assistant"` の record のみを対象とする
+   — user prompt／tool input record は対象外）由来であることが確認できる
+   （`marker_provenance_verified`。Issue #2183 AC11/AC12 — parent 自身の
+   最終応答文字列や child 自身の user prompt／tool input にのみ一致した
+   場合は昇格しない）
+7. 上記すべてを満たす候補 chain が **ちょうど 1 つ** であること（P0-3 —
+   複数の `agent_id` がそれぞれ独立に全条件を満たす場合、どちらを選ぶかを
+   決定できないため、いずれも昇格しない。この場合
+   `causal_evidence_ambiguous_candidate_count` に候補数が記録される）
+
+stdout/output の 2 チャンネルが同じ hook event の `agent_id`/`agent_type`/
+`agent_transcript_path` について矛盾する値を報告した場合、そのイベントは
+`contradictory: True` としてマークされ、いかなる派生フィールドも信用せず
+相関に一切参加しない（PR #2220 P1-2）。
+
+`marker_only_insufficient` は、hook lifecycle event が一切なく `expected_markers`
+の文字列のみが `stdout` にある場合。それ以外（lone `SubagentStart`、
+`agent_id` 不一致、session/prompt/type 不一致、transcript 未実在/空/
+symlink/範囲外/サイズ超過/mtime 不整合、tool 相関なし、terminal でない
+tool_result、marker provenance 未確認、候補 chain の曖昧さなど）はすべて
+`no_evidence` になる。
+
+### lane ごとの既定挙動（PR #2220 OWNER REQUEST_CHANGES P0-1 で再修正、
+https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514）
+
+`subagent_causal_evidence_verdict()` が構造的に評価できる hook lifecycle
+channel は `--runtime claude --mode structured` の captured stdout にしか
+存在しない。`causal_evidence_required` の判定はこの一点に明示的にスコープ
+される:
+
+```python
+causal_evidence_required = args.require_subagent_causal_evidence or (
+    args.runtime == "claude" and bool(args.expect_marker)
+)
+```
+
+- **structured lane かつ `--runtime claude`**: 呼び出し側が `--expect-marker`
+  を指定する場合、`causal_evidence_source == hook_id_correlated` は
+  **既定強制**（追加フラグ不要）。`--expect-marker` を指定しない structured
+  lane 実行にこの要件を課したい場合は `--require-subagent-causal-evidence`
+  （既定 OFF）を明示する。
+- **structured lane かつ `--runtime codex`**: Codex には
+  `SubagentStart`/`SubagentStop` 相当の stream-json hook channel が存在せず
+  `causal_evidence` は常に `None` になる。P0-1 修正前は
+  `causal_evidence_required` が runtime を判別しなかったため、Codex が正常
+  終了し `--expect-marker` の marker も出力していても `causal_evidence is
+  None` を理由に exit 1 へ誤反転していた（バグ、意図した causal-evidence
+  gap ではない）。修正後は `args.runtime == "claude"` を満たさない限り
+  `causal_evidence_required` は `False` のままで、Codex の marker-only PASS
+  はこの gate の対象外になる。
+- **`--require-subagent-causal-evidence` の argparse-level 制約**: このフラグ
+  を明示した場合、`--runtime claude --mode structured` 以外の組み合わせは
+  `main()` が起動前に `parser.error`（exit 2）で拒否する。**interactive
+  lane（`--mode interactive`）はこのフラグの opt-in 対象ではなくなった**
+  （P0-1 fix-delta による破壊的変更 -- 従来 opt-in だった経路も含め、
+  hook-lifecycle channel を構造的に持たない組み合わせでは常に拒否する）。
