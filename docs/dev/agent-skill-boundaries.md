@@ -2812,7 +2812,7 @@ production-grade な broker / hook-level deny の実装は本 Issue の scope �
 follow-up Issue #2223（実装: raw gh/git push を deterministic deny し GitHub
 mutation production broker を実装する、OPEN）で対応する。
 
-## agent-retrospective の run boundary / source authority / mutation boundary（ADR 0007、Issue #2234）
+## agent-retrospective の run 境界 / source authority（情報源の権威） / mutation boundary（変更操作の境界）（ADR 0007、Issue #2234）
 
 継続的 retrospective Skill（`.claude/skills/agent-retrospective/`、#2192）が扱う
 `agent_retrospective_run/v1` / `agent_improvement_candidate/v1` の概念契約（run
