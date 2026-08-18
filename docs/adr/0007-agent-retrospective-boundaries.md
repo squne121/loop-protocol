@@ -1,6 +1,7 @@
 ---
 adr_id: "0007"
 title: "agent-retrospective の run boundary・source authority・threat/trust matrix・mutation boundary・public/private artifact 境界"
+summary_ja: "継続的 retrospective Skill（agent-retrospective）の run 境界・情報源の権威・脅威と信頼のマトリクス・変更操作の境界・公開/非公開成果物の境界を定める決定記録"
 status: accepted
 decision_date: "2026-08-19"
 confirmed_date: "2026-08-19"
@@ -24,7 +25,7 @@ frontmatter キーの運用規約:
 - supersedes / superseded_by: ADR 間の代替関係を ADR ID 配列で表現
 -->
 
-## Context
+## Context（背景）
 
 継続的 retrospective Skill（`.claude/skills/agent-retrospective/`、#2192）は、複数の
 情報源（repository の Git 履歴、GitHub Issue/PR/comment/review/check、Web 参照情報）
@@ -58,7 +59,7 @@ Child ごとの局所判断に委ねると、次の問題が生じる:
 `docs/adr/0007-agent-retrospective-boundaries.md` の新規追加という Current Validated
 Scope への収束）を反映して確定する。
 
-## Considered Options
+## Considered Options（検討した選択肢）
 
 1. **各 Child Issue の局所判断に委ねる**: schema/collector/persistence の実装時に、
    その場で run boundary や source authority を決める。実装速度は速いが、Child 間で
@@ -79,11 +80,11 @@ Scope への収束）を反映して確定する。
    非公開とし、schema-controlled projection のみを public とする。実装コストは
    選択肢 4 より高いが、fail-closed な安全側の設計になる。
 
-## Decision
+## Decision（決定事項）
 
 以下 7 項目を、Child 2〜6 が実装時に参照する normative decision table として確定する。
 
-### 1. Run consistency model（bounded observation）
+### 1. Run consistency model（bounded observation・境界付き観測モデル）
 
 各 run は単一の atomic snapshot ではなく、**`bounded observation`** として定義する。
 
@@ -136,7 +137,7 @@ Scope への収束）を反映して確定する。
 - **`unavailable evidence`**: 対立ではなく、必要な情報源にそもそもアクセスできない
   状態（rate limit、権限不足、404 等）。claim を確定せず保留として扱う。
 
-## 3. Threat/trust matrix
+## 3. Threat/trust matrix（脅威・信頼マトリクス）
 
 `asset × trust level × capability × sink × mitigation` の形式で少なくとも以下を扱う。
 
@@ -155,7 +156,7 @@ Scope への収束）を反映して確定する。
 直接シェル評価しない）および Claude Code の prompt injection 防御方針
 （permission・isolation・sanitization の三層）と整合する形で運用する。
 
-## 4. Mutation boundary（artifact-publication mutation と remediation の区別）
+## 4. Mutation boundary（artifact-publication mutation と remediation の区別・変更操作の権限境界）
 
 mutation を次の 2 分類に明示的に分け、それぞれの human authorization point を定義する。
 
@@ -239,7 +240,7 @@ retrospective 記録から導出される索引）としての役割を維持し
   リンク集）を保持する既存の役割のまま維持し、state の正本にはしない。
 - Child 2〜6 の実装は、`agent_retro_index/v1` を state の書き込み先として使わない。
 
-## Consequences
+## Consequences（帰結）
 
 **肯定的影響**:
 
@@ -274,7 +275,7 @@ retrospective 記録から導出される索引）としての役割を維持し
   追随修正が必要。
 - Child 7（plugin distribution）: Child 4 完了後に着手する。
 
-## References
+## References（参考文献）
 
 - #2192（親 Issue: 継続的 retrospective Skill 実現）
 - #2234（本 Issue: 本 ADR の起票元）
