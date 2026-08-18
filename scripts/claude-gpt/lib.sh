@@ -203,7 +203,7 @@ claude_gpt_git_dirty() {
 # launcher-level `--` 以降の全トークンを走査する forbidden-flag ループでチェックされる
 # ため、duplicate 指定・`--` 後方の literal を含め、出現位置によらず拒否される
 # （区別して全面拒否。Outcome 節参照）。
-CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS="--settings --mcp-config --dangerously-skip-permissions --allow-dangerously-skip-permissions --permission-mode"
+CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS="--settings --mcp-config --dangerously-skip-permissions --allow-dangerously-skip-permissions --permission-mode --agents"
 
 # --- Issue #2203: launcher-owned autoMode policy（second-gate の判断補助）--------
 #
@@ -566,6 +566,52 @@ claude_gpt_reject_if_under_repo() {
   esac
 
   return 0
+}
+
+# --- Spark custom SubAgent（Issue #2186, Parent #2154 Gate1/Gate2 準拠）---
+#
+# `spark-codex` は claude-gpt session にだけ `--agents` フラグ経由で session-local
+# 登録する custom SubAgent。`.claude/agents/spark-codex.md` は意図的に作らない
+# （project scope の agent 定義は Native session にも露出するため。Issue #2186
+# Gate1 採用済み設計）。`model` に非 Anthropic full model ID
+# （`gpt-5.3-codex-spark`）を渡すことで、その SubAgent 単体の推論だけが proxy 経由で
+# Codex backend へ route され、parent session の model は変化しない（Gate2 live
+# canary 実証済み）。Spark は text-only research preview であり、通常 profile の
+# `[1m]`/272k context suffix・閾値を継承しない（source document context ceiling は
+# 128K。Issue #2186 Background）。
+CLAUDE_GPT_SPARK_AGENT_NAME="spark-codex"
+CLAUDE_GPT_SPARK_MODEL="gpt-5.3-codex-spark"
+
+# claude_gpt_spark_agent_prompt: spark-codex custom SubAgent の system prompt 本文。
+# 通常 profile の main model 切替や自律呼び出しではなく、user の current-turn
+# 明示 `@agent-spark-codex` mention の後にだけ authorization gate を通って起動する
+# delegate であることを明記する。
+claude_gpt_spark_agent_prompt() {
+  printf 'You are spark-codex, an explicit-only GPT-5.3-Codex-Spark delegate SubAgent. You are only ever invoked when the user has written the canonical @agent-spark-codex mention in their current turn and an explicit-only fail-closed authorization gate (UserPromptSubmit -> PreToolUse(Agent) -> consume) has allowed exactly this one invocation. You are text-only (no image/web-search capability) and must treat your context ceiling as a conservative 128K (do not assume the ordinary profile 272K/[1m] budget). Report failures explicitly to the parent; never silently fall back to another model.
+'
+}
+
+# claude_gpt_spark_agents_json_fragment: `--agents` フラグへ渡す session-local JSON
+# 本体を返す（このセッションだけに spark-codex を登録し、project `.claude/agents/**`
+# の既存12定義・Native session には一切影響しない）。
+#
+# `disallowedTools`（Issue #2186 P2 fix-delta, PR #2244 adversarial review）:
+# Spark は text-only research preview であり image/web-search capability を
+# 持たない前提（Issue #2186 Background/Out of Scope）。この制約を prose
+# だけでなく agent 定義自体の構造でも強制するため、web 系 tool を
+# 明示的に disallow する。
+claude_gpt_spark_agents_json_fragment() {
+  description_json=$(claude_gpt_json_escape "Explicit-only GPT-5.3-Codex-Spark delegate. Invoked only via canonical current-turn @agent-spark-codex mention.")
+  prompt_json=$(claude_gpt_json_escape "$(claude_gpt_spark_agent_prompt)")
+  printf '{"%s": {"description": %s, "prompt": %s, "model": "%s", "disallowedTools": ["WebFetch", "WebSearch"]}}' \
+    "$CLAUDE_GPT_SPARK_AGENT_NAME" "$description_json" "$prompt_json" "$CLAUDE_GPT_SPARK_MODEL"
+}
+
+# claude_gpt_spark_auth_dir: explicit-only authorization gate の nonce/session_id
+# keyed sidecar file を置くディレクトリ（GPT 専用 HOME 配下。worktree/repo 配下では
+# ない。claude_gpt_reject_if_under_repo による canonical path safety の対象）。
+claude_gpt_spark_auth_dir() {
+  printf '%s/spark-auth\n' "$CLAUDE_GPT_HOME"
 }
 
 # --- Codex transport policy（Issue #2204, Parent #2154）---
