@@ -204,10 +204,19 @@ class TestReadinessTimeoutRelationship:
 
 
 class TestBaselineVcPreflightTimeoutArgvAC3:
-    """AC3: baseline_vc_preflight.py の subprocess 起動 argv に
-    --timeout-seconds が明示的に含まれることを固定する。"""
+    """AC3 (#1333) + Issue #2233 fix_delta P0-1 (OWNER merge_blocker 1):
+    baseline_vc_preflight.py の subprocess 起動 argv に --timeout-seconds を
+    無条件に明示することは廃止した(そうすると常に source: explicit_override
+    になり、canonical plan 由来の per-command budget -- 特に static_policy
+    ソースの budget -- が握りつぶされていた)。代わりに --expected-plan-digest
+    が明示的に含まれ、その値が同じ body から computed した
+    compute_canonical_vc_plan()['plan_digest'] と一致することを固定する。"""
 
-    def test_timeout_seconds_argv_passed_to_baseline_vc_preflight(self):
+    def test_timeout_seconds_argv_is_not_unconditionally_passed(self):
+        """fix_delta P0-1: no operator-facing override flag exists on
+        run_contract_review_once.py's own CLI, so `--timeout-seconds` MUST
+        NOT be forced onto every invocation (regression guard for OWNER
+        merge_blocker 1)."""
         readiness_json = _make_readiness_json("go")
         product_spec_json = _make_product_spec_json("pass")
         vc_json = _make_vc_preflight_json("pass")
@@ -238,11 +247,47 @@ class TestBaselineVcPreflightTimeoutArgvAC3:
         # vc_preflight is the 3rd _run_script call (readiness, product_spec, vc_preflight)
         vc_preflight_cmd = captured_calls[2]
         assert str(_rcr_mod._BASELINE_VC_PREFLIGHT_PY) in vc_preflight_cmd
-        assert "--timeout-seconds" in vc_preflight_cmd
+        assert "--timeout-seconds" not in vc_preflight_cmd
 
-        timeout_idx = vc_preflight_cmd.index("--timeout-seconds")
-        timeout_value = vc_preflight_cmd[timeout_idx + 1]
-        assert timeout_value == str(_rcr_mod._VC_PREFLIGHT_PER_COMMAND_TIMEOUT)
+    def test_expected_plan_digest_argv_passed_and_matches_same_body_plan(self):
+        """fix_delta P0-1: --expected-plan-digest IS explicitly passed, and
+        its value is exactly `compute_canonical_vc_plan(body_snapshot)['plan_digest']`
+        for the SAME `_DEFAULT_BODY_SNAPSHOT` fixture body this test module
+        fetches (via the autouse `_default_body_snapshot_fetch` fixture)."""
+        import baseline_vc_preflight
+
+        readiness_json = _make_readiness_json("go")
+        product_spec_json = _make_product_spec_json("pass")
+        vc_json = _make_vc_preflight_json("pass")
+
+        run_script_iter = iter(
+            [
+                (readiness_json, 0, None),
+                (product_spec_json, 0, None),
+                (vc_json, 0, None),
+            ]
+        )
+        captured_calls = []
+
+        def _fake_run_script(cmd, *args, **kwargs):
+            captured_calls.append(cmd)
+            return next(run_script_iter)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=_fake_run_script):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=(0, "OK", "")):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    with patch.object(
+                        _rcr_mod, "_run_declared_path_overlap_check", return_value={"disjoint": True}
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "go"
+
+        vc_preflight_cmd = captured_calls[2]
+        assert "--expected-plan-digest" in vc_preflight_cmd
+        digest_idx = vc_preflight_cmd.index("--expected-plan-digest")
+        expected_plan = baseline_vc_preflight.compute_canonical_vc_plan(_DEFAULT_BODY_SNAPSHOT)
+        assert vc_preflight_cmd[digest_idx + 1] == expected_plan["plan_digest"]
 
 
 
@@ -260,10 +305,12 @@ class TestVcPreflightMaxWorkersWiringAC9:
         assert hasattr(_rcr_mod, "_VC_PREFLIGHT_MAX_WORKERS")
         assert _rcr_mod._VC_PREFLIGHT_MAX_WORKERS == 2
 
-    def test_vc_preflight_invocation_passes_explicit_max_workers_and_timeout(self):
-        """The baseline_vc_preflight.py subprocess argv explicitly includes both
-        --timeout-seconds and --max-workers (sourced from the named constants),
-        not merely relying on the sub-script's own defaults."""
+    def test_vc_preflight_invocation_passes_explicit_max_workers_not_timeout(self):
+        """The baseline_vc_preflight.py subprocess argv explicitly includes
+        --max-workers (sourced from the named constant), and (fix_delta
+        P0-1) does NOT include --timeout-seconds (see
+        TestBaselineVcPreflightTimeoutArgvAC3 above for the digest-based
+        replacement mechanism)."""
         readiness_json = _make_readiness_json("go")
         product_spec_json = _make_product_spec_json("pass")
         vc_json = _make_vc_preflight_json("pass")
@@ -295,9 +342,7 @@ class TestVcPreflightMaxWorkersWiringAC9:
         vc_preflight_cmd = captured_calls[2]
         assert str(_rcr_mod._BASELINE_VC_PREFLIGHT_PY) in vc_preflight_cmd
 
-        assert "--timeout-seconds" in vc_preflight_cmd
-        timeout_idx = vc_preflight_cmd.index("--timeout-seconds")
-        assert vc_preflight_cmd[timeout_idx + 1] == str(_rcr_mod._VC_PREFLIGHT_PER_COMMAND_TIMEOUT)
+        assert "--timeout-seconds" not in vc_preflight_cmd
 
         assert "--max-workers" in vc_preflight_cmd
         max_workers_idx = vc_preflight_cmd.index("--max-workers")
@@ -362,3 +407,104 @@ class TestTimeoutPhaseUsesExistingNamedConstantsAC12:
             + _rcr_mod._VC_PREFLIGHT_OVERHEAD_SECONDS
         )
         assert _rcr_mod._VC_PREFLIGHT_TIMEOUT == expected
+
+
+# ---------------------------------------------------------------------------
+# Issue #2233 AC2: command-level timeout budget plumbing across the review
+# wrapper chain. Complements TestVcPreflightTimeoutRelationshipAC2 (#1333)
+# above, which already fixes that `_VC_PREFLIGHT_PER_COMMAND_TIMEOUT` is a
+# single import (not an independent literal); this class additionally
+# fixes that `contract_readiness_check.py`'s cleanup-tail constant and
+# `run_root_review_pipeline.py`'s canonical-plan consumption are likewise
+# sourced from `baseline_vc_preflight.py`'s single-owner constants/producer
+# -- and that the plan's NEW `command_budgets[]` field is present and
+# internally consistent.
+# ---------------------------------------------------------------------------
+
+
+def _load_run_root_review_pipeline():
+    """Load `run_root_review_pipeline.py` the same importlib way this file
+    loads `run_contract_review_once.py` above, so its own
+    `sys.path.insert()` side effects (needed to resolve ITS `from
+    baseline_vc_preflight import ...` / `from contract_readiness_check
+    import ...`) run before we inspect its module-level bindings."""
+    _rrrp_path = (
+        _HERE.parent.parent / "issue-refinement-loop" / "scripts" / "run_root_review_pipeline.py"
+    )
+    _spec = importlib.util.spec_from_file_location("run_root_review_pipeline", _rrrp_path)
+    assert _spec is not None and _spec.loader is not None
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+    return _mod
+
+
+class TestCommandTimeoutBudgetWiringIssue2233:
+    """AC2: no file independently re-specifies the per-command timeout or
+    cleanup-tail scalar; all four consumers derive from the SAME canonical
+    plan / named constants baseline_vc_preflight.py owns."""
+
+    def test_contract_readiness_check_cleanup_tail_matches_baseline_constant(self):
+        """`contract_readiness_check._PER_VC_SLOT_CLEANUP_TAIL_SECONDS` is
+        imported from `baseline_vc_preflight.CLEANUP_TAIL_SECONDS`, not an
+        independent local literal `15`."""
+        import baseline_vc_preflight
+        import contract_readiness_check
+
+        assert (
+            contract_readiness_check._PER_VC_SLOT_CLEANUP_TAIL_SECONDS
+            == baseline_vc_preflight.CLEANUP_TAIL_SECONDS
+        )
+
+    def test_contract_readiness_check_source_does_not_hardcode_cleanup_tail_literal(self):
+        """Regression guard: `_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = 15` (a bare
+        re-specified literal) must not reappear in the source."""
+        crc_path = _SCRIPTS_DIR / "contract_readiness_check.py"
+        with open(crc_path) as f:
+            script_content = f.read()
+        assert "_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = 15" not in script_content
+        assert "_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = _COMMAND_CLEANUP_TAIL_SECONDS" in script_content
+
+    def test_run_root_review_pipeline_imports_same_compute_canonical_vc_plan(self):
+        """`run_root_review_pipeline.py`'s `_compute_canonical_vc_plan` IS
+        (by identity) `baseline_vc_preflight.compute_canonical_vc_plan` --
+        not a re-implemented or independently-derived function."""
+        import baseline_vc_preflight
+
+        run_root_review_pipeline = _load_run_root_review_pipeline()
+        assert (
+            run_root_review_pipeline._compute_canonical_vc_plan
+            is baseline_vc_preflight.compute_canonical_vc_plan
+        )
+
+    def test_run_root_review_pipeline_imports_same_derive_review_budget(self):
+        import contract_readiness_check
+
+        run_root_review_pipeline = _load_run_root_review_pipeline()
+        assert (
+            run_root_review_pipeline._derive_review_budget
+            is contract_readiness_check.derive_review_budget
+        )
+
+    def test_canonical_plan_command_budgets_present_and_consistent(self):
+        """The canonical plan `contract_readiness_check.py` /
+        `run_root_review_pipeline.py` consume now carries `command_budgets`
+        (Issue #2233 AC1), and `aggregate_timeout_seconds` is the sum of
+        each occurrence's own `timeout_seconds + cleanup_tail_seconds`."""
+        import baseline_vc_preflight
+
+        body = (
+            "## Verification Commands\n\n"
+            "```bash\n$ pnpm typecheck\n```\n\n"
+            "```bash\n$ pnpm lint\n```\n"
+        )
+        plan = baseline_vc_preflight.compute_canonical_vc_plan(body)
+
+        assert "command_budgets" in plan
+        assert "aggregate_timeout_seconds" in plan
+        assert "estimator_evidence_digest" in plan
+        assert len(plan["command_budgets"]) == 2
+
+        expected_sum = sum(
+            b["timeout_seconds"] + b["cleanup_tail_seconds"] for b in plan["command_budgets"]
+        )
+        assert plan["aggregate_timeout_seconds"] == expected_sum

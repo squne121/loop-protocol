@@ -92,6 +92,14 @@ if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS_DIR))
 
 from baseline_vc_preflight import extract_verification_commands_section  # noqa: E402
+# Issue #2233 fix_delta P0-1: single root-owned canonical plan producer,
+# imported so Step 5 below can compute a `plan_digest` from the SAME
+# pinned `body_snapshot` and pass it through to the
+# baseline_vc_preflight.py subprocess for cross-process verification,
+# instead of unconditionally forcing an explicit `--timeout-seconds`
+# override that bypassed the plan's own (possibly `static_policy`
+# sourced) per-command budgets.
+from baseline_vc_preflight import compute_canonical_vc_plan  # noqa: E402
 from contract_readiness_check import (  # noqa: E402
     fetch_body_from_github,
     resolve_existing_issue_validation_profile,
@@ -891,6 +899,16 @@ def run_once(
             return result
 
         # Step 5: baseline_vc_preflight.py (run in all modes)
+        # Issue #2233 fix_delta P0-1 (OWNER merge_blocker 1): this call site
+        # MUST NOT unconditionally pass `--timeout-seconds` -- doing so
+        # forced `source: explicit_override` on every command, silently
+        # discarding the canonical plan's own per-command budgets (in
+        # particular any `static_policy`-sourced budget above
+        # DEFAULT_PER_COMMAND_TIMEOUT_SECONDS). No operator-facing override
+        # flag exists on THIS script's own CLI (see argparse below), so
+        # `--timeout-seconds` is never passed here; the child resolves its
+        # own plan-derived budget per command.
+        _vc_plan_for_digest = compute_canonical_vc_plan(body_snapshot)
         vc_command = [
                 sys.executable,
                 str(_BASELINE_VC_PREFLIGHT_PY),
@@ -898,13 +916,24 @@ def run_once(
                 str(issue_number),
                 "--repo",
                 repo,
-                "--timeout-seconds",
-                str(_VC_PREFLIGHT_PER_COMMAND_TIMEOUT),
                 "--max-workers",
                 str(_VC_PREFLIGHT_MAX_WORKERS),
                 "--body-file",
                 body_snapshot_path,
+                "--expected-plan-digest",
+                _vc_plan_for_digest["plan_digest"],
         ]
+        # Issue #2233 fix_delta P0-2: the outer subprocess.run() timeout for
+        # THIS invocation must never be smaller than the plan's own
+        # aggregate_timeout_seconds (+ margin) -- otherwise a
+        # `static_policy`-elevated per-command budget inside the child could
+        # legitimately still be running when this wrapper's own timeout
+        # fires. `_VC_PREFLIGHT_TIMEOUT` (the #1333/#1338-owned constant
+        # below) remains the floor for the common case.
+        _vc_preflight_timeout = max(
+            _VC_PREFLIGHT_TIMEOUT,
+            _vc_plan_for_digest["aggregate_timeout_seconds"] + _VC_PREFLIGHT_OVERHEAD_SECONDS,
+        )
         if evidence_mode == "current-head":
             if not cwd or not reviewed_head_sha:
                 result["status"] = "blocked"
@@ -921,7 +950,7 @@ def run_once(
         _vc_started_at = time.monotonic()
         vc_result_json, vc_rc, vc_err = _run_script(
             vc_command,
-            timeout=_VC_PREFLIGHT_TIMEOUT,
+            timeout=_vc_preflight_timeout,
         )
         _vc_elapsed = time.monotonic() - _vc_started_at
 
@@ -929,10 +958,15 @@ def run_once(
             result["errors"].append(f"vc_preflight_error: {vc_err}")
             result["status"] = "runtime_error"
             if vc_err == "timeout":
+                # Issue #2233 fix_delta: report the ACTUAL timeout used for
+                # this invocation (`_vc_preflight_timeout`, which may exceed
+                # `_VC_PREFLIGHT_TIMEOUT` when the plan's own
+                # aggregate_timeout_seconds is larger), not the stale module
+                # constant.
                 _record_timeout(
                     result,
                     _TIMEOUT_PHASE_VC_PREFLIGHT,
-                    _VC_PREFLIGHT_TIMEOUT,
+                    _vc_preflight_timeout,
                     round(_vc_elapsed, 3),
                 )
             return result
