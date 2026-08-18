@@ -955,8 +955,8 @@ SUBJECTIVE_PATTERNS = [
     r"efficiently",
     r"appropriately",
     r"properly",
-    r"optimized?",
-    r"improved?",
+    r"\boptimized?\b",
+    r"\bimproved?\b",
 ]
 
 VAGUE_OUTCOME_PATTERNS = [
