@@ -1209,8 +1209,24 @@ _SHADOW_LOG_EXACT_REL = ".guard_shadow_log.jsonl"
 # legitimate in-flight peer write landing exactly inside the fd-fstat /
 # final-lstat consistency window. Kept short: a real race here is on the
 # order of a single syscall pair, not seconds.
+#
+# Issue #2243 AC7 (fixed-cutoff snapshot semantics, "B案"): each attempt
+# below now reads only `[0, observed_end)` where `observed_end` is the size
+# observed by `fstat()` at the top of that attempt -- it never waits for the
+# stream to reach EOF, so a continuously-appending producer cannot indefinitely
+# extend a single attempt's read. Retries here exist only to absorb kind
+# replacement / truncation-below-`observed_end` races, not ongoing legitimate
+# growth past the cutoff (growth past the cutoff is simply left for the next
+# audit epoch to observe). Because a large file could still in principle be
+# re-scanned once per retry attempt (e.g. under a truncate/replace/truncate
+# adversarial loop), `_SHADOW_LOG_STABLE_OBSERVATION_DEADLINE_SECONDS` bounds
+# the *wall-clock* cost of the whole retry loop as a second, independent
+# guard -- so "25 attempts x one full cutoff-bound scan each" cannot become an
+# unbounded-latency operation on an implausibly large file even in the
+# adversarial-replace case.
 _SHADOW_LOG_STABLE_OBSERVATION_ATTEMPTS = 25
 _SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS = 0.01
+_SHADOW_LOG_STABLE_OBSERVATION_DEADLINE_SECONDS = 2.0
 
 # Sentinel kind returned by `_shadow_log_stable_observation` when a
 # self-consistent observation could not be made within the retry budget.
@@ -1235,18 +1251,33 @@ _SHADOW_LOG_STREAM_CHUNK_BYTES = 1 << 20
 # `_SHADOW_LOG_MAX_RECORD_BYTES` bounds the amount of buffered data held for
 # a single not-yet-terminated JSONL line/record, so one pathologically large
 # record cannot make working memory unbounded even though the overall file
-# scan is streamed. Real shadow-log records are ~400-610 bytes; this bound
-# is generous headroom above that baseline.
-_SHADOW_LOG_MAX_RECORD_BYTES = 64 * 1024
+# scan is streamed. This is a per-record memory bound, not a producer/consumer
+# wire-format contract change: real shadow-log producer records observed in
+# repository log evidence are ~400-610 bytes (max observed ~609 bytes as of
+# Issue #2243), so a `regular -> regular` append composed entirely of records
+# at or below this bound is always accepted regardless of where this constant
+# is set within that range. 4MiB is chosen (raised from a prior 64KiB) purely
+# as a generous compatibility safety margin above the ~609-byte observed
+# maximum -- not because any existing or anticipated producer emits records
+# anywhere near that size -- so this change strictly widens the accepted set
+# (no previously-accepted record becomes rejected) and never narrows it.
+_SHADOW_LOG_MAX_RECORD_BYTES = 4 * 1024 * 1024
 
 # `_SHADOW_LOG_SAFETY_VALVE_MAX_BYTES` is a pure DoS safety valve, not the
 # primary bounded-memory defense (that defense is the streaming scan itself,
 # which never buffers content proportional to total file size). A file at or
 # growing past this size still fails closed (sentinel
-# `_SHADOW_LOG_KIND_UNSTABLE`), but this is a deliberately new, much larger
-# constant -- not a raised `_SHADOW_LOG_MAX_BYTES` -- because "just raise the
-# cap" alone would not fix the underlying unbounded-heap-allocation defect
-# (Issue #2243 Prohibited fixes).
+# `_SHADOW_LOG_KIND_UNSTABLE`, surfaced by the caller as the
+# `unauthorized_write_path` reason code), but this is a deliberately new,
+# much larger constant -- not a raised `_SHADOW_LOG_MAX_BYTES` -- because
+# "just raise the cap" alone would not fix the underlying
+# unbounded-heap-allocation defect (Issue #2243 Prohibited fixes). This valve
+# only guards against an implausibly large file; it is not a retention,
+# segmentation, or migration policy for the shadow log approaching this size
+# in legitimate long-running operation -- that follow-up concern (rotation /
+# segmentation / moving persistent runtime state outside the repository
+# checkout once a file approaches this order of magnitude) is tracked
+# separately in Issue #2252, not solved here.
 _SHADOW_LOG_SAFETY_VALVE_MAX_BYTES = 512 * 1024 * 1024
 
 
@@ -1336,7 +1367,12 @@ class _JsonlLineScanner:
             return
         try:
             obj = json.loads(text, parse_constant=_reject_shadow_log_json_constant)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # `RecursionError` (pathologically deeply nested JSON, e.g.
+            # `[[[[...]]]]`) is caught alongside `ValueError` so a
+            # stack-exhausting adversarial record fails closed as an
+            # invalid record rather than propagating out of the scanner and
+            # aborting the whole observation.
             self._valid = False
             return
         if not isinstance(obj, dict):
@@ -1354,7 +1390,11 @@ class _JsonlLineScanner:
         return not self._pending_partial_line and len(self._buf) == 0
 
 
-def _shadow_log_stream_capture(fd: int, prefix_size: int | None = None) -> ShadowLogStreamCapture | None:
+def _shadow_log_stream_capture(
+    fd: int,
+    prefix_size: int | None = None,
+    read_upto: int | None = None,
+) -> ShadowLogStreamCapture | None:
     """Stream-read `fd` in bounded `_SHADOW_LOG_STREAM_CHUNK_BYTES` chunks,
     computing a full-content SHA-256 digest and JSONL validity without ever
     buffering content proportional to total file size (Issue #2243). When
@@ -1362,15 +1402,32 @@ def _shadow_log_stream_capture(fd: int, prefix_size: int | None = None) -> Shado
     the first `prefix_size` bytes and JSONL validity over just the bytes at
     or after that offset. Returns `None` if the stream exceeds
     `_SHADOW_LOG_SAFETY_VALVE_MAX_BYTES` (pure DoS safety valve, not the
-    primary defense)."""
+    primary defense).
+
+    Issue #2243 AC7 (fixed-cutoff snapshot semantics): when `read_upto` is
+    given, this function reads *exactly* that many bytes (a fixed
+    `fstat()`-observed cutoff) rather than reading until EOF -- it never
+    blocks on / waits for a concurrently-appending writer to stop growing
+    the file, so an append-only producer that keeps writing past the cutoff
+    cannot prevent this read from completing. When `read_upto` is omitted
+    (`None`), the stream is read to EOF (used by callers, and by direct unit
+    tests, that want the whole current file content in a single call)."""
     full_hasher = hashlib.sha256()
     full_scanner = _JsonlLineScanner()
     prefix_hasher = hashlib.sha256() if prefix_size is not None else None
     suffix_scanner = _JsonlLineScanner() if prefix_size is not None else None
     total = 0
-    while True:
-        chunk = os.read(fd, _SHADOW_LOG_STREAM_CHUNK_BYTES)
+    while read_upto is None or total < read_upto:
+        want = _SHADOW_LOG_STREAM_CHUNK_BYTES
+        if read_upto is not None:
+            want = min(want, read_upto - total)
+        chunk = os.read(fd, want)
         if not chunk:
+            # EOF (or, when `read_upto` is set, a short/absent read before
+            # reaching the cutoff -- e.g. a concurrent truncation). Either
+            # way there is nothing more to consume; the caller compares
+            # `total` against the requested cutoff to decide whether this
+            # was a clean, complete cutoff-bound read.
             break
         chunk_len = len(chunk)
         full_hasher.update(chunk)
@@ -1435,10 +1492,11 @@ def _shadow_log_stable_observation(
     - `identity`: `(st_dev, st_ino, st_size, st_mtime_ns)` for a non-absent
       path, else `None`.
     - `capture`: a `ShadowLogStreamCapture` bounded-memory streaming
-      observation (digest + JSONL validity) of the file's full content when
-      `kind == "regular"`, else `None`. Issue #2243: this REPLACES the file's
-      raw buffered bytes that this function previously returned as its third
-      element -- callers must not expect raw `bytes` here anymore.
+      observation (digest + JSONL validity) of the file's content in
+      `[0, observed_end)` when `kind == "regular"`, else `None`. Issue #2243:
+      this REPLACES the file's raw buffered bytes that this function
+      previously returned as its third element -- callers must not expect
+      raw `bytes` here anymore.
     - `prefix_size`: when given and the observed content is at least this
       many bytes long, `capture.prefix_sha256_hex` / `capture.suffix_valid_jsonl`
       are additionally computed against this prefix offset (used by the
@@ -1457,12 +1515,38 @@ def _shadow_log_stable_observation(
     generation being read, streaming the content from that same descriptor
     (Issue #2243: bounded-memory, never buffered in full), and then
     re-`lstat()`-ing the path afterward to confirm its identity still
-    matches what was `fstat()`'d. A bounded number of retries absorbs a
-    legitimate in-flight write landing exactly inside this narrow window; if
-    the observation still cannot be made self-consistent after the retry
-    budget, `_SHADOW_LOG_KIND_UNSTABLE` is returned, which always fails
-    closed."""
+    matches what was `fstat()`'d.
+
+    Issue #2243 AC7 (fixed-cutoff snapshot semantics, "B案", adopted via
+    OWNER adversarial review of PR #2248): `fstat()` on the freshly opened
+    descriptor fixes `observed_end` as this attempt's audit-epoch cutoff, and
+    only `[0, observed_end)` is ever read here -- this function does NOT wait
+    for the stream to reach EOF. A continuously-appending producer can extend
+    the file arbitrarily far past `observed_end` while this attempt is
+    running without ever causing this attempt to fail or retry: content
+    appended at or after `observed_end` is simply left unobserved by this
+    call and will be picked up as part of the *next* audit epoch (the next
+    `_shadow_log_stable_observation` call, e.g. the caller's next "before"/
+    "after" pair). This function guarantees only that `[0, observed_end)` was
+    read from a single, self-consistent filesystem generation -- it does NOT
+    guarantee "every byte present in the file at return time was validated".
+    A bounded number of retries (both an attempt-count budget and, as a
+    second independent bound, a wall-clock deadline -- see
+    `_SHADOW_LOG_STABLE_OBSERVATION_DEADLINE_SECONDS`) absorbs a legitimate
+    kind replacement / truncation-below-cutoff race landing exactly inside
+    this narrow window; if the observation still cannot be made
+    self-consistent within that budget, `_SHADOW_LOG_KIND_UNSTABLE` is
+    returned, which always fails closed."""
+    deadline_at = time.monotonic() + _SHADOW_LOG_STABLE_OBSERVATION_DEADLINE_SECONDS
     for _ in range(_SHADOW_LOG_STABLE_OBSERVATION_ATTEMPTS):
+        if time.monotonic() >= deadline_at:
+            # Issue #2243: an independent wall-clock bound on top of the
+            # attempt-count budget, so a persistent adversarial
+            # replace/truncate loop on an implausibly large file cannot cost
+            # up to `_SHADOW_LOG_STABLE_OBSERVATION_ATTEMPTS` full
+            # cutoff-bound scans' worth of latency -- it fails closed as soon
+            # as either bound is exhausted, whichever comes first.
+            break
         try:
             lst = path.lstat()
         except FileNotFoundError:
@@ -1512,14 +1596,30 @@ def _shadow_log_stable_observation(
                 # which never buffers content proportional to file size).
                 # An implausibly large file is still rejected outright
                 # (fail closed, sentinel kind) without even attempting the
-                # streaming scan.
+                # streaming scan. Follow-up: retention/segmentation/
+                # repository-external migration once a file approaches this
+                # order of magnitude is tracked separately in Issue #2252.
                 return _SHADOW_LOG_KIND_UNSTABLE, None, None
-            capture = _shadow_log_stream_capture(fd, prefix_size=prefix_size)
+            # Issue #2243 AC7: `observed_end` fixes this attempt's
+            # audit-epoch cutoff at the size `fstat()` just observed. The
+            # streaming capture below reads exactly `[0, observed_end)` and
+            # never waits for EOF, so ongoing legitimate append past this
+            # cutoff cannot block or fail this attempt.
+            observed_end = fstat_result.st_size
+            capture = _shadow_log_stream_capture(fd, prefix_size=prefix_size, read_upto=observed_end)
             if capture is None:
-                # Grew past the safety-valve bound during this very read
-                # (concurrent append mid-read) -- also fail closed rather
-                # than continuing to stream unbounded content.
+                # Exceeded the safety-valve bound while streaming (should not
+                # happen given the `observed_end` cutoff and the check just
+                # above, but fail closed defensively if it ever does).
                 return _SHADOW_LOG_KIND_UNSTABLE, None, None
+            if capture.total != observed_end:
+                # A short read before reaching the cutoff (e.g. a concurrent
+                # truncation racing the read) -- this attempt's content is
+                # not a self-consistent `[0, observed_end)` snapshot. Do not
+                # return it; re-observe from scratch (the `finally` below
+                # still closes `fd` before this `continue` takes effect).
+                time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
+                continue
         finally:
             os.close(fd)
 
@@ -1529,14 +1629,26 @@ def _shadow_log_stable_observation(
             time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
             continue
 
+        # Issue #2243 AC7: identity consistency no longer requires the
+        # final `mtime` to be byte-identical to the `fstat()`-time `mtime`
+        # (that would re-introduce the old "any concurrent write at all
+        # fails this attempt" defect this redesign removes) -- it requires
+        # only that (a) the path is still the same regular-file generation
+        # (same `(st_dev, st_ino)`, ruling out a symlink/dir/FIFO/socket/
+        # device substitution or an `os.replace()` onto a distinct inode),
+        # and (b) the file was never observed to shrink below the cutoff
+        # (`final_lst.st_size >= observed_end`, ruling out a truncation that
+        # raced the read). Growth past `observed_end` between the `fstat()`
+        # above and this `lstat()` is expected and authorized -- it is
+        # simply outside this audit epoch's cutoff and will be covered by
+        # the next one.
         identity_matches = (
             stat.S_ISREG(final_lst.st_mode)
             and (final_lst.st_dev, final_lst.st_ino) == (fstat_result.st_dev, fstat_result.st_ino)
-            and final_lst.st_size == capture.total
-            and final_lst.st_mtime_ns == fstat_result.st_mtime_ns
+            and final_lst.st_size >= observed_end
         )
         if identity_matches:
-            identity = (fstat_result.st_dev, fstat_result.st_ino, capture.total, fstat_result.st_mtime_ns)
+            identity = (fstat_result.st_dev, fstat_result.st_ino, observed_end, fstat_result.st_mtime_ns)
             return "regular", identity, capture
         time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
 
@@ -1593,7 +1705,9 @@ def _parse_shadow_log_jsonl(data: bytes) -> list[dict] | None:
             return None
         try:
             obj = json.loads(line, parse_constant=_reject_shadow_log_json_constant)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # RecursionError (pathologically deeply nested JSON) fails
+            # closed the same way a ValueError-raising malformed line does.
             return None
         if not isinstance(obj, dict):
             return None
