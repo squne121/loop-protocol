@@ -44,6 +44,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# ---------------------------------------------------------------------------
+# Sibling/cross-skill module imports (Issue #2242 OWNER adversarial review,
+# https://github.com/squne121/loop-protocol/pull/2246#issuecomment-5328161000,
+# Blocker 4): reuse the canonical owner/repo format regex already defined by
+# `command_registry.py` (same `scripts/` directory) and the canonical
+# `REVIEW_ISSUE_RESULT_V1` jsonschema validator already defined by
+# `review-issue/scripts/check_issue_contract.py`, instead of reimplementing
+# either as a second, independently drifting copy.
+# ---------------------------------------------------------------------------
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+from command_registry import _OWNER_REPO_RE as _CANONICAL_OWNER_REPO_RE  # noqa: E402
+
+_REPO_ROOT = _SCRIPTS_DIR.parent.parent.parent.parent
+_REVIEW_ISSUE_SCRIPTS = _REPO_ROOT / ".claude" / "skills" / "review-issue" / "scripts"
+if str(_REVIEW_ISSUE_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_REVIEW_ISSUE_SCRIPTS))
+import check_issue_contract as _check_issue_contract  # noqa: E402
+
 SCHEMA_V2 = "ISSUE_REVIEW_RESULT_COMPACT_V2"
 ATTEMPT_SCHEMA = "REVIEWER_ATTEMPT_RESULT_V1"
 MANIFEST_SCHEMA = "REVIEWER_ATTEMPT_MANIFEST_V1"
@@ -266,7 +287,17 @@ def _open_no_follow(root: Path, relative: str) -> tuple[int, int]:
             if current != root_fd:
                 os.close(current)
             current = next_fd
-        leaf_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current)
+        # Issue #2242 OWNER adversarial review Blocker 3
+        # (https://github.com/squne121/loop-protocol/pull/2246#issuecomment-5328161000):
+        # `O_NONBLOCK` on the leaf open prevents an indefinite hang (a real
+        # denial-of-service risk, not merely a correctness gap) if a FIFO
+        # (named pipe) with no writer is substituted for the artifact path --
+        # POSIX `open()` on a read-only FIFO blocks until a writer opens it
+        # UNLESS `O_NONBLOCK` is set, in which case it returns immediately.
+        # `O_NONBLOCK` has no effect on regular-file open/read semantics, so
+        # this is safe for the legitimate regular-file case; the subsequent
+        # `stat.S_ISREG()` check in `secure_read_json()` rejects the FIFO.
+        leaf_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=current)
         if current != root_fd:
             os.close(current)
         return root_fd, leaf_fd
@@ -687,14 +718,23 @@ def check_artifact_binding(
     loose ``.get()`` comparison. Returns the fail-closed reason code
     (``"artifact_binding_mismatch"``) or ``None`` if every field matches.
     """
-    expected = {
+    # Issue #2242 OWNER adversarial review Blocker 4
+    # (https://github.com/squne121/loop-protocol/pull/2246#issuecomment-5328161000):
+    # `payload.get(key) != value` alone is INSECURE for `issue_number` /
+    # `attempt` -- Python's `bool` is an `int` subclass, so a payload with
+    # `issue_number: true` and `expected_issue=1` compares EQUAL
+    # (`True != 1` is `False`). Exact `type(...) is int` checks reject a
+    # bool-typed binding field outright, regardless of its truthy value.
+    if type(payload.get("issue_number")) is not int or payload.get("issue_number") != expected_issue:
+        return "artifact_binding_mismatch"
+    if type(payload.get("attempt")) is not int or payload.get("attempt") != expected_attempt:
+        return "artifact_binding_mismatch"
+    string_fields = {
         "repository": expected_repo,
-        "issue_number": expected_issue,
         "reviewed_body_sha256": expected_body_sha256,
         "invocation_id": expected_invocation_id,
-        "attempt": expected_attempt,
     }
-    if any(payload.get(key) != value for key, value in expected.items()):
+    if any(payload.get(key) != value for key, value in string_fields.items()):
         return "artifact_binding_mismatch"
     return None
 
@@ -706,7 +746,28 @@ def extract_binding_context(payload: Any) -> dict[str, Any] | None:
     already holds a schema-verified payload never maintains a second,
     independent field-map of this layout. Returns ``None`` if ``payload``
     is not a :data:`ARTIFACT_SCHEMA` object or any binding field is
-    missing/mistyped.
+    missing/mistyped/malformed.
+
+    Issue #2242 OWNER adversarial review Blocker 4
+    (https://github.com/squne121/loop-protocol/pull/2246#issuecomment-5328161000):
+    the previous revision used ``isinstance(x, int)`` for ``issue_number`` /
+    ``attempt``, which -- because Python's ``bool`` is an ``int`` subclass --
+    silently accepted JSON ``true``/``false`` as a valid issue number or
+    attempt. It also accepted an empty ``repository`` / ``invocation_id``
+    string and applied no positive-value constraint. This revision uses
+    exact ``type(x) is int`` checks (rejecting ``bool``), a ``>= 1``
+    constraint on both integer fields, the canonical owner/repo format regex
+    already defined by ``command_registry._OWNER_REPO_RE`` (reused, not
+    duplicated), and the canonical invocation-id token format already
+    defined by this module's own ``_ATTEMPT`` regex (the same format
+    ``artifact_relative_path()`` already enforces on write).
+
+    NOTE: this function is used ONLY to validate the SHAPE of an artifact's
+    own embedded binding fields (schema-conformance gate). It is never used
+    to derive "expected" values for a binding comparison against itself --
+    see Issue #2242 Blocker 2 / ``run_root_review_pipeline.readback_persisted_artifact()``,
+    which now requires the caller to supply independent expected binding
+    values and delegates the actual comparison to :func:`verify_artifact`.
     """
     if not isinstance(payload, dict) or payload.get("schema") != ARTIFACT_SCHEMA:
         return None
@@ -714,11 +775,18 @@ def extract_binding_context(payload: Any) -> dict[str, Any] | None:
     issue_number = payload.get("issue_number")
     invocation_id = payload.get("invocation_id")
     attempt = payload.get("attempt")
+    reviewed_body_sha256 = payload.get("reviewed_body_sha256")
     if (
         not isinstance(repository, str)
-        or not isinstance(issue_number, int)
+        or not _CANONICAL_OWNER_REPO_RE.match(repository)
+        or type(issue_number) is not int
+        or issue_number < 1
         or not isinstance(invocation_id, str)
-        or not isinstance(attempt, int)
+        or not _ATTEMPT.match(invocation_id)
+        or type(attempt) is not int
+        or attempt < 1
+        or not isinstance(reviewed_body_sha256, str)
+        or not _SHA.match(reviewed_body_sha256)
     ):
         return None
     return {
@@ -727,6 +795,28 @@ def extract_binding_context(payload: Any) -> dict[str, Any] | None:
         "invocation_id": invocation_id,
         "attempt": attempt,
     }
+
+
+def validate_semantic_result_schema(semantic_result: Any) -> str | None:
+    """Validate ``semantic_result`` against the FULL ``REVIEW_ISSUE_RESULT_V1``
+    jsonschema (Issue #2242 OWNER adversarial review Blocker 4).
+
+    Reuses the canonical jsonschema-based validator already defined by
+    ``review-issue/scripts/check_issue_contract.py``
+    (``_validate_review_issue_result_payload()``) instead of reimplementing a
+    second, weaker structural check (the prior revision only checked
+    ``verdict``/``blocking_issues`` presence via
+    ``_semantic_verdict_and_count()``). Returns a stable violation code
+    string on failure, or ``None`` when ``semantic_result`` validates
+    cleanly.
+    """
+    if not isinstance(semantic_result, dict):
+        return "semantic_result_schema_invalid"
+    try:
+        _check_issue_contract._validate_review_issue_result_payload(semantic_result)
+    except Exception:
+        return "semantic_result_schema_invalid"
+    return None
 
 
 def semantic_verdict_and_count(semantic_result: Any) -> tuple[str, int]:
@@ -758,6 +848,14 @@ def verify_artifact(
     if read["sha256"] != expected_sha256:
         return {"status": "integrity_failure", "reason_code": "raw_byte_hash_mismatch"}
     if not isinstance(payload, dict) or payload.get("schema") != ARTIFACT_SCHEMA:
+        return {"status": "integrity_failure", "reason_code": "schema_mismatch"}
+    # Issue #2242 OWNER adversarial review Blocker 4: a schema-shape gate on
+    # the artifact's OWN binding fields (exact int types, positive values,
+    # canonical owner/repo / invocation-id / body-sha256 formats) BEFORE the
+    # binding-value comparison below, so a malformed/mistyped artifact
+    # (e.g. `issue_number: true`, `repository: ""`) is rejected even if a
+    # value-level comparison could otherwise be fooled.
+    if extract_binding_context(payload) is None:
         return {"status": "integrity_failure", "reason_code": "schema_mismatch"}
     binding_violation = check_artifact_binding(
         payload,
