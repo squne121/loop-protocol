@@ -383,6 +383,43 @@ GitHub full-text search の false positive は候補 Issue body の `## Allowed 
 | GitHub Milestone 操作 | `docs/dev/milestone-ops.md` |
 | 運用単位（issue-refinement-loop / impl-review-loop 等）の状態機械・SubAgent 契約・escalation 方針の変更 | `docs/dev/workflows/*.md`（derived_design_note） |
 
+## Availability Invariant（可用性不変条件）
+
+security / isolation 強化を目的とする変更（例: 認証情報の非露出化、実行環境の分離強化、trust boundary の縮小）は、
+分離や遮断を強めるだけの変更になりがちで、結果として正規の canonical workflow 自体が実行不能になる回帰を静的検証だけでは検出できないことがある
+（Issue #2241: Claude-GPT isolated session の `HOME` 分離強化が意図せず trusted `uv` toolchain 解決を壊した事例）。
+
+このため、security / isolation 強化変更を含む delivery（Issue / PR）は、**同一 delivery 内で最低 1 つの canonical positive workflow を、
+fresh isolated session から実証しなければならない**（Availability Invariant）。
+
+- 「fresh isolated session からの実証」とは、`HOME` override や manual cache delete 等の workaround を用いず、
+  対象の isolated 実行環境（例: Claude-GPT launcher が起動するセッション）をそのまま起動し、
+  当該 canonical workflow（例: `preflight.run.with_human_context` 相当の control-plane command）が
+  bootstrap / authentication 理由では停止せず完走することを指す。
+- 動作検証の適用判定・SKIP 規約・証跡保存・Stop Condition 連動は `docs/dev/runtime-verification-policy.md` の
+  「Runtime Verification Applicability」を正本とする。
+- fallback 経由の成功（例: `HOME` override での代替成功）を canonical positive workflow の実証として扱ってはならない。
+
+### Not Controlled（PR #2247 人間レビュー時点での既知の未解決事項）
+
+Issue #2241 / PR #2247 の実装範囲では、以下は意図的に「未解決」として明記する（過大な安全主張を避けるため）:
+
+- **credentialless GitHub read の production preflight への未接続**: `scripts/agent-guards/github_credentialless_read.py`
+  は Issue 本体・comments（pagination 追従込み）を無認証で読む transport（`CredentiallessGitHubReadTransport` /
+  `read_public_issue` / `list_issue_comments`）を提供するが、`.claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py`
+  の `_fetch_issue()` / `_fetch_issue_comments()` はこの transport をまだ呼び出していない（引き続き `gh issue view` /
+  `gh api --paginate` 経由）。このファイルは Issue #2241 の Allowed Paths に含まれておらず、本 Issue のスコープでは配線できない。
+  isolated Claude-GPT session からの `preflight.run.with_human_context` 相当 command は、host `GH_TOKEN` 等が launcher に
+  よって遮断されている限り、引き続き `gh` 認証失敗で停止しうる。配線には Allowed Paths 拡張（follow-up Issue または
+  Scope Delta）が必要。
+- **`~/.local/bin` trust root の same-UID 攻撃モデル**: `scripts/agent-guards/skill_runtime_exec.py` の
+  `_validate_account_local_bin_trust` は ancestor ディレクトリの owner uid / group-world-writable 検証と symlink 解決先
+  検証、および `_validate_local_bin_executable_version` による `--version` 出力照合を追加したが、これは
+  「別 UID がこのディレクトリに書き込めない」ことの検証であり、「この実行アカウント自身として既に任意コード実行を得た
+  攻撃者が `~/.local/bin/uv` を置き換える」ケースは引き続き制御できない（CWE-427 相当の構造的制約が残る）。
+  完全な解決には launcher-owned・child 非書き込みな専用 toolchain ディレクトリの新設が必要であり、これは本 Issue の
+  スコープを超える。
+
 ## SSOT Routing Table（SSOT ルーティング表）
 
 SSOT 追加時の参照先を集約した索引。AI エージェントは実装着手前に対象トピックの SSOT を本表から確認する。

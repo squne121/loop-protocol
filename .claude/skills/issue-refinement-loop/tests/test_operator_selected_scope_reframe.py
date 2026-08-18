@@ -24,10 +24,12 @@ import importlib
 import importlib.util
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
@@ -47,6 +49,11 @@ def _load_module(name: str, filename: str):
 
 
 preflight = _load_module("run_refinement_preflight_2086_regression", "run_refinement_preflight.py")
+
+_AGENT_GUARDS_DIR = REPO_ROOT / "scripts" / "agent-guards"
+if str(_AGENT_GUARDS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_GUARDS_DIR))
+skill_runtime_exec_mod = importlib.import_module("skill_runtime_exec")
 
 REPO = "squne121/loop-protocol"
 ISSUE = 2084
@@ -745,17 +752,28 @@ def test_fixture_human_context_real_subprocess_reaches_contract_update_required_
         "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(tmp_path),
     })
     (home / "empty-gh-config").mkdir(parents=True)
-    env_probe = subprocess.run(
-        [
-                sys.executable,
-                "-c",
-                "import json,sys;sys.path.insert(0,'scripts/agent-guards');"
-                "import skill_runtime_exec as e;"
-                "print(json.dumps(e._sanitize_env('.', 'preflight.run.fixture.with_human_context')))"
-        ],
-        cwd=repo, env=env, check=True, capture_output=True, text=True, timeout=30,
-    )
-    effective_env = json.loads(env_probe.stdout)
+    # Issue #2241: `_safe_path_entries`/`_sanitize_env` derive their PATH
+    # trust root via `pwd.getpwuid(os.getuid()).pw_dir` (the real OS account
+    # home), independent of the `HOME` environment variable -- an isolated
+    # Claude-GPT session's fake `HOME` must no longer narrow or replace the
+    # trusted toolchain PATH. A real subprocess launched with `HOME=home`
+    # therefore can no longer be used to observe trust-root derivation
+    # against this test's isolated `home` (its own `_sanitize_env` call
+    # would resolve the *real* OS account home, not `home`). To still
+    # deterministically exercise `_sanitize_env`'s trust-root and
+    # `GH_CONFIG_DIR` isolation behavior against this test's isolated
+    # `home`, call it in-process with `pwd.getpwuid` patched to report
+    # `home` as the account home, instead of relying on an out-of-process
+    # `HOME` env override the production code no longer honors for trust
+    # root purposes.
+    fake_pw_entry = pwd.struct_passwd((
+        "issue-2241-isolated-home-account", "x", os.getuid(), os.getgid(), "", str(home), "/bin/sh",
+    ))
+    with patch.object(skill_runtime_exec_mod.pwd, "getpwuid", return_value=fake_pw_entry), \
+            patch.dict(os.environ, env, clear=True):
+        effective_env = skill_runtime_exec_mod._sanitize_env(
+            str(repo), "preflight.run.fixture.with_human_context"
+        )
     assert effective_env["PATH"].split(os.pathsep)[0] == str(canary.parent)
     assert shutil.which("gh", path=effective_env["PATH"]) == str(canary)
     assert effective_env["GH_CONFIG_DIR"] == str(home / "empty-gh-config")
@@ -795,6 +813,55 @@ def test_fixture_human_context_real_subprocess_reaches_contract_update_required_
     ).read_text(encoding="utf-8"))
     assert planner_input["known_context"]["human_context_comment_urls"] == [anchor_url]
     assert not sentinel.exists(), "fixture success must not hide a gh invocation"
+
+
+def test_sanitize_env_trust_root_real_subprocess_ignores_home_override_ac3(tmp_path: Path):
+    """PR #2247 review P1-4.4: a real, out-of-process subprocess boundary
+    test for the same trust-root invariant the in-process
+    `pwd.getpwuid`-patched call above exercises.
+
+    The in-process call above was introduced by a prior fix_delta as a
+    *replacement* for a real subprocess assertion, because production trust
+    resolution now keys off `pwd.getpwuid(os.getuid()).pw_dir` (the real OS
+    account, invariant to `HOME`) rather than `HOME` itself -- so a
+    subprocess launched with `HOME` overridden to an isolated directory can
+    no longer be used to *redirect* the trust root to that directory (that
+    redirection is exactly the vulnerability #2241 fixed). This test keeps
+    that real-subprocess boundary coverage instead of relying solely on the
+    in-process mock: it spawns an actual child process (same OS account,
+    `HOME` overridden to a fresh empty isolated directory, matching what
+    the Claude-GPT launcher does) and asserts, from the CHILD's own stdout,
+    that `_safe_path_entries()`'s `.local/bin` trust entry resolved to the
+    REAL account home -- not the isolated `HOME` the child process itself
+    was launched with. This is deliberately independent of (and does not
+    replace) the in-process mock test immediately above."""
+    real_account_home = pwd.getpwuid(os.getuid()).pw_dir
+    isolated_home = tmp_path / "isolated-home-real-subprocess"
+    isolated_home.mkdir()
+    guards_dir = str((REPO_ROOT / "scripts" / "agent-guards").resolve())
+    probe_script = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {guards_dir!r})\n"
+        "import skill_runtime_exec as exec_mod\n"
+        "entries = exec_mod._safe_path_entries()\n"
+        "sys.stdout.write(json.dumps(entries))\n"
+    )
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("GH_", "GITHUB_"))}
+    env["HOME"] = str(isolated_home)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe_script],
+        env=env, capture_output=True, text=True, timeout=30, check=True,
+    )
+
+    entries = json.loads(result.stdout)
+    local_bin_entries = [e for e in entries if e.endswith(str(Path(".local") / "bin"))]
+    assert local_bin_entries, (entries, result.stderr)
+    assert not any(str(isolated_home) in entry for entry in local_bin_entries), (entries, result.stderr)
+    assert any(str(Path(real_account_home) / ".local" / "bin") == entry for entry in local_bin_entries), (
+        entries, result.stderr,
+    )
 
 
 def test_fixture_human_context_sibling_rejects_cross_lane_and_binding_inputs_before_child(tmp_path: Path):
