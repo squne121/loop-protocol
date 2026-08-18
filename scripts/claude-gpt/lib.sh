@@ -594,10 +594,16 @@ claude_gpt_spark_agent_prompt() {
 # claude_gpt_spark_agents_json_fragment: `--agents` フラグへ渡す session-local JSON
 # 本体を返す（このセッションだけに spark-codex を登録し、project `.claude/agents/**`
 # の既存12定義・Native session には一切影響しない）。
+#
+# `disallowedTools`（Issue #2186 P2 fix-delta, PR #2244 adversarial review）:
+# Spark は text-only research preview であり image/web-search capability を
+# 持たない前提（Issue #2186 Background/Out of Scope）。この制約を prose
+# だけでなく agent 定義自体の構造でも強制するため、web 系 tool を
+# 明示的に disallow する。
 claude_gpt_spark_agents_json_fragment() {
   description_json=$(claude_gpt_json_escape "Explicit-only GPT-5.3-Codex-Spark delegate. Invoked only via canonical current-turn @agent-spark-codex mention.")
   prompt_json=$(claude_gpt_json_escape "$(claude_gpt_spark_agent_prompt)")
-  printf '{"%s": {"description": %s, "prompt": %s, "model": "%s"}}' \
+  printf '{"%s": {"description": %s, "prompt": %s, "model": "%s", "disallowedTools": ["WebFetch", "WebSearch"]}}' \
     "$CLAUDE_GPT_SPARK_AGENT_NAME" "$description_json" "$prompt_json" "$CLAUDE_GPT_SPARK_MODEL"
 }
 
