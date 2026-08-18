@@ -70,6 +70,7 @@
 - 失敗した場合は握りつぶさず、未解決のまま報告する。
 - Runtime Verification Applicability が `immediate` の Issue は `docs/dev/runtime-verification-policy.md` の SKIP 規約・証跡保存・Stop Condition 連動に従う（適用判定スキーマは policy.md の「Runtime Verification Applicability」を参照）。
 - 既存 OPEN Issue（特に #26 等）の VC が `immediate` / `deferred` / `not_applicable` のどれに該当するかは、policy.md の適用判定スキーマを基準に確認する。
+- security / isolation 強化変更の Availability Invariant（`docs/dev/workflow.md` の「Availability Invariant」参照）に従う。
 
 ## Git Read-Only Probe Script 方針
 
