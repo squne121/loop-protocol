@@ -4970,7 +4970,13 @@ def _main_impl() -> int:
     )
     _global_override_seconds = args.timeout_seconds if _explicit_timeout_override else None
 
-    def _emit_blocked_policy_error(_error_code: str, _rule: str, _message: str, _minimal_context: str, _fix_hint: str) -> int:
+    def _emit_blocked_policy_error(
+        _error_code: str,
+        _rule: str,
+        _message: str,
+        _minimal_context: str,
+        _fix_hint: str,
+    ) -> int:
         _policy_error = {
             "kind": _error_code,
             "rule": _rule,
