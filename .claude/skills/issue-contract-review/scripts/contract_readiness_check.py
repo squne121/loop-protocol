@@ -58,6 +58,10 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from baseline_vc_preflight import (  # noqa: E402
+    AggregateTimeoutExceedsPolicyError,
+    CLEANUP_TAIL_SECONDS as _COMMAND_CLEANUP_TAIL_SECONDS,
+    CommandTimeoutExceedsPolicyError,
+    CommandTimeoutNonPositiveError,
     DEFAULT_TIMEOUT_SECONDS as _PER_VC_COMMAND_TIMEOUT_SECONDS,
     compute_canonical_vc_plan as _compute_canonical_vc_plan,
     extract_verification_commands_section,
@@ -158,7 +162,11 @@ CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS = (
 # already imports THIS module). A pytest in `issue-refinement-loop/tests/`
 # cross-checks the two stay identical.
 
-_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = 15
+# Issue #2233 AC2: sourced from baseline_vc_preflight.py's single canonical
+# `CLEANUP_TAIL_SECONDS` (the same value each command_timeout_budget/v1
+# entry in compute_canonical_vc_plan()'s command_budgets[] carries) instead
+# of an independent local literal `15`.
+_PER_VC_SLOT_CLEANUP_TAIL_SECONDS = _COMMAND_CLEANUP_TAIL_SECONDS
 _PER_VC_SLOT_SECONDS = _PER_VC_COMMAND_TIMEOUT_SECONDS + _PER_VC_SLOT_CLEANUP_TAIL_SECONDS  # 165
 
 _BUDGET_AGGREGATE_MARGIN_SECONDS = 20
@@ -238,6 +246,71 @@ def derive_review_budget(
     return ReviewBudget(
         n=command_occurrence_count,
         effective_n=effective_n,
+        baseline_aggregate_seconds=baseline_aggregate,
+        readiness_wrapper_seconds=readiness_wrapper,
+        per_attempt_seconds=per_attempt,
+        total_seconds=total,
+    )
+
+
+# Issue #2233 fix_delta P0-2: the margin added on top of a canonical plan's
+# own `aggregate_timeout_seconds` (the sum of REAL resolved per-command
+# budgets, which may legitimately exceed the #2207 formula's
+# `DEFAULT_PER_COMMAND_TIMEOUT_SECONDS`-per-command worst case once a
+# `static_policy` entry applies) when it is used as a floor below.
+#
+# Deliberately == `_BUDGET_AGGREGATE_MARGIN_SECONDS` (the #2207 formula's
+# OWN margin): for a body with NO `static_policy`-elevated command,
+# `plan["aggregate_timeout_seconds"] == command_occurrence_count * 165`
+# exactly, and the #2207 formula's `baseline_aggregate_seconds ==
+# max(2, command_occurrence_count) * 165 + 20 >=
+# command_occurrence_count * 165 + 20`. Using the SAME margin here
+# guarantees `effective_review_budget()` is a NO-OP (returns `review_budget`
+# UNCHANGED) for every body that does not actually need a larger budget --
+# it only floors upward when a REAL static_policy elevation makes the
+# plan's own aggregate exceed what the #2207 formula assumed.
+_PLAN_AGGREGATE_MARGIN_SECONDS = _BUDGET_AGGREGATE_MARGIN_SECONDS
+
+
+def effective_review_budget(review_budget: "ReviewBudget", plan: Dict[str, Any]) -> "ReviewBudget":
+    """Issue #2233 fix_delta P0-2: recompute a `ReviewBudget` using the
+    EXACT SAME `derive_review_budget()` linear relationships (this function
+    does NOT change that formula -- Out of Scope), but with
+    `baseline_aggregate_seconds` floored to also cover the canonical plan's
+    own per-command budget sum (`plan["aggregate_timeout_seconds"]` +
+    `_PLAN_AGGREGATE_MARGIN_SECONDS`).
+
+    Without this, a `static_policy`-sourced per-command budget above
+    `DEFAULT_PER_COMMAND_TIMEOUT_SECONDS` (Issue #2233 Background: the
+    271.31s `issue-refinement-loop` test suite) would resolve correctly at
+    the per-command layer (`baseline_vc_preflight.py`'s own subprocess
+    timeout for that command) but still be silently killed by an OUTER
+    wrapper (`run_baseline_vc_preflight()` below /
+    `run_root_review_pipeline.py`'s own supervisor) still assuming the
+    OLD per-command-DEFAULT worst case.
+
+    When the plan's own aggregate does not exceed the #2207 formula's
+    result, `review_budget` is returned UNCHANGED (this is a floor, not a
+    replacement)."""
+    plan_floor = plan["aggregate_timeout_seconds"] + _PLAN_AGGREGATE_MARGIN_SECONDS
+    if plan_floor <= review_budget.baseline_aggregate_seconds:
+        return review_budget
+
+    baseline_aggregate = plan_floor
+    readiness_wrapper = (
+        VALIDATE_ISSUE_BODY_TIMEOUT_SECONDS
+        + baseline_aggregate
+        + _BUDGET_READINESS_WRAPPER_MARGIN_SECONDS
+    )
+    per_attempt = (
+        _CHECK_ISSUE_CONTRACT_TIMEOUT_SECONDS_MIRROR
+        + readiness_wrapper
+        + _MERGE_READINESS_TIMEOUT_SECONDS_MIRROR
+        + _BUDGET_PER_ATTEMPT_MARGIN_SECONDS
+    )
+    total = per_attempt + _BUDGET_TOTAL_MARGIN_SECONDS
+
+    return review_budget._replace(
         baseline_aggregate_seconds=baseline_aggregate,
         readiness_wrapper_seconds=readiness_wrapper,
         per_attempt_seconds=per_attempt,
@@ -668,6 +741,12 @@ def compute_invocation_local_baseline_timeout(body: str) -> int:
     # Issue #2207 OWNER P1-3: `command_occurrence_count`, per the Issue
     # #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`.
     budget = derive_review_budget(plan["command_occurrence_count"], policy_cap=plan["policy_cap"])
+    # Issue #2233 fix_delta P0-2: floor the #2207-formula result with the
+    # SAME plan's own `aggregate_timeout_seconds` (the sum of REAL resolved
+    # per-command budgets, e.g. a `static_policy` entry above
+    # DEFAULT_PER_COMMAND_TIMEOUT_SECONDS) so a legitimately-slow VC's outer
+    # wrapper timeout is never smaller than its own per-command budget.
+    budget = effective_review_budget(budget, plan)
     return budget.baseline_aggregate_seconds
 
 
@@ -712,7 +791,18 @@ def run_baseline_vc_preflight(
     # rather than ever spawning `baseline_vc_preflight.py`.
     try:
         aggregate_timeout_seconds: float = compute_invocation_local_baseline_timeout(body)
-    except VerificationBudgetExceedsPolicyError as exc:
+    except (
+        VerificationBudgetExceedsPolicyError,
+        AggregateTimeoutExceedsPolicyError,
+        CommandTimeoutExceedsPolicyError,
+        CommandTimeoutNonPositiveError,
+    ) as exc:
+        # Issue #2233 fix_delta: the canonical plan producer this function
+        # calls (`compute_invocation_local_baseline_timeout()` ->
+        # `_compute_canonical_vc_plan()`) can now ALSO reject a body whose
+        # per-command or aggregate command-level budget exceeds policy --
+        # BEFORE this function ever writes the body tempfile or launches
+        # `baseline_vc_preflight.py`.
         return (
             {
                 "schema": "baseline_vc_preflight/v1",
@@ -780,8 +870,24 @@ def run_baseline_vc_preflight(
         # child actually exits, not after the full window, so a child that
         # finishes its (scaled-down) inner reap quickly still returns
         # quickly here.
+        # Issue #2233 fix_delta P0-1: compute the SAME canonical plan this
+        # function already used (via `compute_invocation_local_baseline_timeout()`
+        # above) to derive `aggregate_timeout_seconds`, and pass its
+        # `plan_digest` through to the child so the child's OWN recomputed
+        # plan (from the SAME `tmp_path` body) can be verified against it
+        # before the child launches any VC subprocess -- protecting against
+        # the body drifting between this write and the child's read.
+        _plan_for_digest = _compute_canonical_vc_plan(body)
         supervised = _run_subprocess_with_cooperative_supervisor(
-            [sys.executable, str(_BASELINE_VC_PREFLIGHT_PY), "--strict", "--body-file", tmp_path],
+            [
+                sys.executable,
+                str(_BASELINE_VC_PREFLIGHT_PY),
+                "--strict",
+                "--body-file",
+                tmp_path,
+                "--expected-plan-digest",
+                _plan_for_digest["plan_digest"],
+            ],
             timeout_seconds=aggregate_timeout_seconds,
             env=_child_env,
         )
