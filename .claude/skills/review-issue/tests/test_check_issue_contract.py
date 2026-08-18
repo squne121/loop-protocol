@@ -658,6 +658,25 @@ class TestC6Fail:
         )
 
 
+class TestC6WordBoundary:
+    """GIVEN AC/VC text with identifier-like tokens WHEN C6 runs THEN it does not flag word-boundary-safe patterns as subjective phrasing."""
+
+    def test_improvement_candidate_identifier_not_flagged(self):
+        """GIVEN AC/VC text containing 'agent_improvement_candidate' identifier WHEN C6 runs THEN result is pass (no false positive)."""
+        body = (
+            "## Acceptance Criteria\n"
+            "- [ ] AC1: `agent_improvement_candidate_v1.schema.json` is generated\n\n"
+            "## Verification Commands\n"
+            "```bash\n"
+            "rg -n agent_improvement_candidate schema/\n"
+            "```\n"
+        )
+        result, findings = checker.check_c6_no_subjective_phrasing(body)
+        assert result == checker.CheckResult.PASS, (
+            f"Expected PASS for identifier-only text, got {result} with findings={findings}"
+        )
+
+
 class TestC8Fail:
     """GIVEN a fixture with vague Outcome WHEN checker runs THEN C8 fails."""
 
