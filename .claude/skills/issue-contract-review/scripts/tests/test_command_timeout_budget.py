@@ -38,7 +38,10 @@ def test_command_timeout_budget_has_all_ac1_fields():
     expected_fields = {
         "schema",
         "command_hash",
-        "execution_key_hash",
+        # fix_delta P1-2: renamed from `execution_key_hash` -- NOT the same
+        # value/semantics as `compute_execution_key_hash()` (which
+        # additionally binds argv/cwd/env/timeout/state epoch).
+        "command_identity_hash",
         "timeout_seconds",
         "cleanup_tail_seconds",
         "source",
@@ -94,16 +97,99 @@ def test_policy_ceiling_rejects_override_exceeding_max():
         assert exc.max_seconds == m.MAX_PER_COMMAND_TIMEOUT_SECONDS
 
 
-def test_policy_ceiling_rejects_history_estimate_exceeding_max():
-    """AC5: a (future) history-based estimate exceeding the ceiling is
-    rejected through the SAME enforcement path as an explicit override --
-    a single hard ceiling applies regardless of source."""
+def test_policy_ceiling_rejects_static_policy_entry_exceeding_max(monkeypatch):
+    """AC5 (fix_delta): a `static_policy`-sourced entry is rejected through
+    the SAME enforcement path as an explicit override if it exceeds the
+    ceiling -- a single hard ceiling applies regardless of source. Uses
+    monkeypatch to inject a deliberately-over-ceiling static policy entry
+    rather than mutating the production `STATIC_PER_COMMAND_TIMEOUT_POLICY`
+    table."""
+    command = "pnpm build --deliberately-over-ceiling-fixture"
     too_large = m.MAX_PER_COMMAND_TIMEOUT_SECONDS + 500
+    bad_policy = {command: too_large}
     try:
-        m.compute_command_timeout_budget("pnpm build", estimated_seconds=too_large)
+        m.compute_command_timeout_budget(command, static_policy=bad_policy)
         assert False, "expected CommandTimeoutExceedsPolicyError"
     except m.CommandTimeoutExceedsPolicyError as exc:
         assert exc.error_code == "command_timeout_exceeds_policy"
+
+
+def test_static_policy_entry_below_ceiling_resolves_with_static_policy_source():
+    """fix_delta P0-2: the trusted static policy authority -- a REAL
+    production entry, not a test-only fabrication -- resolves to a budget
+    ABOVE DEFAULT_PER_COMMAND_TIMEOUT_SECONDS (150s), proving Issue #2233's
+    original failure mode (a legitimate single VC taking 271.31s getting
+    killed by a fixed 150s cap) is addressed by a real authority."""
+    slow_command = "uv run --locked pytest .claude/skills/issue-refinement-loop/tests -v"
+    assert slow_command in m.STATIC_PER_COMMAND_TIMEOUT_POLICY
+    budget = m.compute_command_timeout_budget(slow_command)
+    assert budget["source"] == "static_policy"
+    assert budget["timeout_seconds"] > m.DEFAULT_PER_COMMAND_TIMEOUT_SECONDS
+    assert budget["timeout_seconds"] >= 271  # exceeds the measured 271.31s failure case
+    assert budget["timeout_seconds"] <= m.MAX_PER_COMMAND_TIMEOUT_SECONDS
+
+
+def test_static_policy_ceiling_dominates_every_curated_entry():
+    """Structural guarantee: MAX_PER_COMMAND_TIMEOUT_SECONDS must always be
+    >= every STATIC_PER_COMMAND_TIMEOUT_POLICY entry (enforced by an
+    assertion at import time too); this test fixes the relationship for
+    regression coverage independent of module import order."""
+    assert m.MAX_PER_COMMAND_TIMEOUT_SECONDS >= max(
+        m.STATIC_PER_COMMAND_TIMEOUT_POLICY.values()
+    )
+
+
+def test_resolved_seconds_non_positive_is_rejected_regardless_of_source():
+    """fix_delta P2: a non-positive explicit override is rejected (not
+    silently accepted, as the pre-fix_delta version did -- it checked only
+    the ceiling, not a floor on non-positive values)."""
+    for bad_value in (0, -1, -1000):
+        try:
+            m.compute_command_timeout_budget("pnpm test", override_seconds=bad_value)
+            assert False, f"expected CommandTimeoutNonPositiveError for {bad_value}"
+        except m.CommandTimeoutNonPositiveError as exc:
+            assert exc.error_code == "command_timeout_non_positive"
+            assert exc.requested_seconds == bad_value
+
+
+def test_aggregate_hard_maximum_enforced_in_compute_canonical_vc_plan():
+    """AC5 (fix_delta P1-1): the aggregate hard maximum
+    (MAX_TOTAL_VERIFICATION_BUDGET_SECONDS) is a REAL production check
+    inside compute_canonical_vc_plan(), not merely an informational
+    constant -- a plan whose aggregate exceeds it is rejected BEFORE any
+    subprocess is launched (proven here: compute_canonical_vc_plan() itself
+    never launches a subprocess)."""
+    # Build a body with enough occurrences of the static_policy slow command
+    # that the aggregate (each occurrence contributing 420+15=435s) exceeds
+    # MAX_TOTAL_VERIFICATION_BUDGET_SECONDS, while staying comfortably under
+    # the UNRELATED occurrence-count policy_cap (40) so this test isolates
+    # the aggregate-seconds check, not the occurrence-count check.
+    slow_command = "uv run --locked pytest .claude/skills/issue-refinement-loop/tests -v"
+    # `compute_canonical_vc_plan()` does NOT itself enforce the UNRELATED
+    # occurrence-count `policy_cap` (that is `contract_readiness_check.py`'s
+    # `derive_review_budget()`'s job) -- so this fixture is free to use an
+    # occurrence count larger than `MAX_VC_EXECUTION_SLOTS` to isolate the
+    # aggregate-seconds check.
+    occurrences_needed = (m.MAX_TOTAL_VERIFICATION_BUDGET_SECONDS // 435) + 2
+    blocks = "\n\n".join(
+        f"```bash\n$ {slow_command} --shard={i}\n```" for i in range(occurrences_needed)
+    )
+    # Each shard is a DISTINCT command text (so none dedupe in
+    # command_budgets), but none matches the curated static_policy key
+    # exactly (that key has no `--shard=`), so every occurrence resolves via
+    # static_fallback... which would UNDER-shoot the aggregate ceiling at
+    # 150s each. Instead, drive the aggregate over the ceiling using
+    # override_seconds via global_override_seconds, which the aggregate
+    # check applies uniformly regardless of source.
+    body = "## Verification Commands\n\n" + blocks + "\n"
+    try:
+        m.compute_canonical_vc_plan(
+            body, global_override_seconds=m.MAX_PER_COMMAND_TIMEOUT_SECONDS
+        )
+        assert False, "expected AggregateTimeoutExceedsPolicyError"
+    except m.AggregateTimeoutExceedsPolicyError as exc:
+        assert exc.error_code == "aggregate_timeout_exceeds_policy"
+        assert exc.aggregate_timeout_seconds > m.MAX_TOTAL_VERIFICATION_BUDGET_SECONDS
 
 
 def test_policy_ceiling_allows_value_exactly_at_max():

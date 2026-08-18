@@ -29,14 +29,14 @@ def test_explicit_override_wins_over_static_fallback_default():
     assert budget["timeout_seconds"] == 45
 
 
-def test_explicit_override_wins_even_when_estimated_seconds_also_supplied():
-    """AC4: precedence is `override_seconds` > `estimated_seconds` >
-    `default_seconds`. A caller supplying BOTH override and estimate must
-    resolve to the override (the estimate is silently superseded, not
-    merged/averaged)."""
-    budget = m.compute_command_timeout_budget(
-        "pnpm lint", override_seconds=45, estimated_seconds=120, default_seconds=150
-    )
+def test_explicit_override_wins_even_when_command_matches_static_policy():
+    """AC4: precedence is `override_seconds` > `static_policy` >
+    `default_seconds`. A caller supplying an override for a command that
+    ALSO has a static_policy entry must resolve to the override (the
+    static_policy entry is silently superseded, not merged/averaged)."""
+    slow_command = "uv run --locked pytest .claude/skills/issue-refinement-loop/tests -v"
+    assert slow_command in m.STATIC_PER_COMMAND_TIMEOUT_POLICY
+    budget = m.compute_command_timeout_budget(slow_command, override_seconds=45)
     assert budget["source"] == "explicit_override"
     assert budget["timeout_seconds"] == 45
 

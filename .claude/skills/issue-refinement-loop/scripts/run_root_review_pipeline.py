@@ -1090,8 +1090,8 @@ def _cmd_produce(args: argparse.Namespace) -> int:
     # checker subprocess is spawned. A body whose plan exceeds the fixed
     # policy ceiling is rejected here (typed, non-retryable), never reaching
     # `run_reviewer_transport()` / `run-checker-attempt`.
-    _vc_plan = _compute_canonical_vc_plan(body)
     try:
+        _vc_plan = _compute_canonical_vc_plan(body)
         # Issue #2207 OWNER P1-3 (PR #2221 REQUEST_CHANGES): `command_occurrence_count`,
         # per the Issue #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`
         # (an earlier implementation iteration substituted the dedup-aware
@@ -1099,7 +1099,21 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         _review_budget = _derive_review_budget(
             _vc_plan["command_occurrence_count"], policy_cap=_vc_plan["policy_cap"]
         )
-    except _VerificationBudgetExceedsPolicyError as exc:
+        # Issue #2233 fix_delta P0-2: floor the #2207-formula result with
+        # the SAME plan's own `aggregate_timeout_seconds` (the real,
+        # possibly `static_policy`-elevated, per-command budget sum) so
+        # THIS pipeline's own downstream deadlines (readiness_wrapper /
+        # per_attempt / total, all derived from `baseline_aggregate_seconds`)
+        # are never smaller than what the plan itself says the VCs need.
+        _review_budget = _contract_readiness_check.effective_review_budget(
+            _review_budget, _vc_plan
+        )
+    except (
+        _VerificationBudgetExceedsPolicyError,
+        _baseline_vc_preflight.AggregateTimeoutExceedsPolicyError,
+        _baseline_vc_preflight.CommandTimeoutExceedsPolicyError,
+        _baseline_vc_preflight.CommandTimeoutNonPositiveError,
+    ) as exc:
         print(
             json.dumps(
                 {

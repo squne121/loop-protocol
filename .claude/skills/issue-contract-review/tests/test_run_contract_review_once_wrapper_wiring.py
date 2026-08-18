@@ -204,10 +204,19 @@ class TestReadinessTimeoutRelationship:
 
 
 class TestBaselineVcPreflightTimeoutArgvAC3:
-    """AC3: baseline_vc_preflight.py の subprocess 起動 argv に
-    --timeout-seconds が明示的に含まれることを固定する。"""
+    """AC3 (#1333) + Issue #2233 fix_delta P0-1 (OWNER merge_blocker 1):
+    baseline_vc_preflight.py の subprocess 起動 argv に --timeout-seconds を
+    無条件に明示することは廃止した(そうすると常に source: explicit_override
+    になり、canonical plan 由来の per-command budget -- 特に static_policy
+    ソースの budget -- が握りつぶされていた)。代わりに --expected-plan-digest
+    が明示的に含まれ、その値が同じ body から computed した
+    compute_canonical_vc_plan()['plan_digest'] と一致することを固定する。"""
 
-    def test_timeout_seconds_argv_passed_to_baseline_vc_preflight(self):
+    def test_timeout_seconds_argv_is_not_unconditionally_passed(self):
+        """fix_delta P0-1: no operator-facing override flag exists on
+        run_contract_review_once.py's own CLI, so `--timeout-seconds` MUST
+        NOT be forced onto every invocation (regression guard for OWNER
+        merge_blocker 1)."""
         readiness_json = _make_readiness_json("go")
         product_spec_json = _make_product_spec_json("pass")
         vc_json = _make_vc_preflight_json("pass")
@@ -238,11 +247,47 @@ class TestBaselineVcPreflightTimeoutArgvAC3:
         # vc_preflight is the 3rd _run_script call (readiness, product_spec, vc_preflight)
         vc_preflight_cmd = captured_calls[2]
         assert str(_rcr_mod._BASELINE_VC_PREFLIGHT_PY) in vc_preflight_cmd
-        assert "--timeout-seconds" in vc_preflight_cmd
+        assert "--timeout-seconds" not in vc_preflight_cmd
 
-        timeout_idx = vc_preflight_cmd.index("--timeout-seconds")
-        timeout_value = vc_preflight_cmd[timeout_idx + 1]
-        assert timeout_value == str(_rcr_mod._VC_PREFLIGHT_PER_COMMAND_TIMEOUT)
+    def test_expected_plan_digest_argv_passed_and_matches_same_body_plan(self):
+        """fix_delta P0-1: --expected-plan-digest IS explicitly passed, and
+        its value is exactly `compute_canonical_vc_plan(body_snapshot)['plan_digest']`
+        for the SAME `_DEFAULT_BODY_SNAPSHOT` fixture body this test module
+        fetches (via the autouse `_default_body_snapshot_fetch` fixture)."""
+        import baseline_vc_preflight
+
+        readiness_json = _make_readiness_json("go")
+        product_spec_json = _make_product_spec_json("pass")
+        vc_json = _make_vc_preflight_json("pass")
+
+        run_script_iter = iter(
+            [
+                (readiness_json, 0, None),
+                (product_spec_json, 0, None),
+                (vc_json, 0, None),
+            ]
+        )
+        captured_calls = []
+
+        def _fake_run_script(cmd, *args, **kwargs):
+            captured_calls.append(cmd)
+            return next(run_script_iter)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=_fake_run_script):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=(0, "OK", "")):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    with patch.object(
+                        _rcr_mod, "_run_declared_path_overlap_check", return_value={"disjoint": True}
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "go"
+
+        vc_preflight_cmd = captured_calls[2]
+        assert "--expected-plan-digest" in vc_preflight_cmd
+        digest_idx = vc_preflight_cmd.index("--expected-plan-digest")
+        expected_plan = baseline_vc_preflight.compute_canonical_vc_plan(_DEFAULT_BODY_SNAPSHOT)
+        assert vc_preflight_cmd[digest_idx + 1] == expected_plan["plan_digest"]
 
 
 
@@ -260,10 +305,12 @@ class TestVcPreflightMaxWorkersWiringAC9:
         assert hasattr(_rcr_mod, "_VC_PREFLIGHT_MAX_WORKERS")
         assert _rcr_mod._VC_PREFLIGHT_MAX_WORKERS == 2
 
-    def test_vc_preflight_invocation_passes_explicit_max_workers_and_timeout(self):
-        """The baseline_vc_preflight.py subprocess argv explicitly includes both
-        --timeout-seconds and --max-workers (sourced from the named constants),
-        not merely relying on the sub-script's own defaults."""
+    def test_vc_preflight_invocation_passes_explicit_max_workers_not_timeout(self):
+        """The baseline_vc_preflight.py subprocess argv explicitly includes
+        --max-workers (sourced from the named constant), and (fix_delta
+        P0-1) does NOT include --timeout-seconds (see
+        TestBaselineVcPreflightTimeoutArgvAC3 above for the digest-based
+        replacement mechanism)."""
         readiness_json = _make_readiness_json("go")
         product_spec_json = _make_product_spec_json("pass")
         vc_json = _make_vc_preflight_json("pass")
@@ -295,9 +342,7 @@ class TestVcPreflightMaxWorkersWiringAC9:
         vc_preflight_cmd = captured_calls[2]
         assert str(_rcr_mod._BASELINE_VC_PREFLIGHT_PY) in vc_preflight_cmd
 
-        assert "--timeout-seconds" in vc_preflight_cmd
-        timeout_idx = vc_preflight_cmd.index("--timeout-seconds")
-        assert vc_preflight_cmd[timeout_idx + 1] == str(_rcr_mod._VC_PREFLIGHT_PER_COMMAND_TIMEOUT)
+        assert "--timeout-seconds" not in vc_preflight_cmd
 
         assert "--max-workers" in vc_preflight_cmd
         max_workers_idx = vc_preflight_cmd.index("--max-workers")
