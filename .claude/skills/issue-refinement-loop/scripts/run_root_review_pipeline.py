@@ -50,15 +50,33 @@ CLI subcommands:
                          also classifies as `reviewer_transport_failure` /
                          `malformed_output` instead of being silently accepted
                          as "ok".
-    readback            Verify the persisted compact artifact:
-                         regular file, no symlink, strict JSON (parser-level
-                         rejection of NaN/Infinity via
-                         `compact_review_result._strict_json_loads`, not a
-                         raw substring search -- PR #2135 iteration-3 P1-5),
-                         body SHA match, verdict identity (Issue #2049 AC7).
+    readback            Verify the persisted `REVIEWER_COMPACT_ARTIFACT_V2`
+                         artifact -- i.e. `produce`'s
+                         `verified_transport_artifact` /
+                         `compact_result.artifact_path`, NEVER the top-level
+                         `artifact_path` / `full_review_artifact`
+                         (`REVIEW_ISSUE_RESULT_V1`) -- via full delegation to
+                         `reviewer_transport.verify_artifact()`: dir-fd
+                         anchored, component-wise no-follow open on EVERY
+                         intermediate path component (not just the leaf),
+                         1 MiB cap, strict JSON (parser-level rejection of
+                         NaN/Infinity via `reviewer_transport.strict_json_loads`,
+                         not a raw substring search -- PR #2135 iteration-3
+                         P1-5), SHA-256 raw-byte match, independently
+                         caller-supplied repo/issue/body-SHA/invocation/attempt
+                         binding match, full `REVIEW_ISSUE_RESULT_V1` schema
+                         validation of `semantic_result`, and verdict
+                         identity (Issue #2049 AC7; Issue #2242 OWNER
+                         adversarial review Blockers 2/3/4,
+                         https://github.com/squne121/loop-protocol/pull/2246#issuecomment-5328161000).
     gate-final-review   Decide whether the "final review" (remote Issue body
                          update) may proceed: only after readback verifies
-                         (Issue #2049 AC10).
+                         (Issue #2049 AC10). Takes the SAME
+                         `--artifact-root`/`--artifact-relative` +
+                         `--expected-*` arguments as `readback` (Issue #2242
+                         Blocker 2: every expected binding value is
+                         caller-supplied, never re-derived from the artifact
+                         itself).
     check-agent-contract
                          Static check that a read-only agent's
                          developer_instructions does not carry a workspace
@@ -112,7 +130,6 @@ import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -676,92 +693,150 @@ def retry_once_on_transport_failure(
 # ---------------------------------------------------------------------------
 
 
-def _open_readonly_no_follow(path: Path):
-    """Open exactly once, no-follow, without any preceding `resolve()` /
-    `stat()` (Issue #2054 AC6). Returns an fd or raises OSError."""
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    return os.open(path, flags)
+def _classify_verify_artifact_failure(reason_code: str) -> str:
+    """Translate `reviewer_transport.verify_artifact()` / `secure_read_json()`'s
+    internal `reason_code` vocabulary into `readback_persisted_artifact()`'s
+    pre-existing, stable EXTERNAL violation vocabulary (Issue #2242 OWNER
+    adversarial review, Blocker 3).
+
+    This is a PRESENTATION-LAYER mapping only -- it never opens, reads,
+    hashes, or otherwise touches the artifact bytes itself; that is fully
+    delegated to `reviewer_transport.verify_artifact()`. Its sole purpose is
+    to keep `readback_persisted_artifact()`'s caller-facing violation codes
+    stable across this refactor (which replaced a custom, leaf-only
+    `os.open(..., O_NOFOLLOW)` + hand-rolled read loop with full delegation
+    to the dir-fd-anchored, component-wise no-follow, SHA-256-verified
+    `verify_artifact()` / `secure_read_json()` primitives).
+    """
+    if reason_code == "raw_byte_hash_mismatch":
+        return "artifact_sha256_mismatch"
+    if reason_code == "schema_mismatch":
+        return "artifact_schema_mismatch"
+    if reason_code == "artifact_binding_mismatch":
+        return "artifact_binding_mismatch"
+    if reason_code in (
+        "non_regular_or_oversize_artifact",
+        "raw_byte_oversize",
+        "unsupported_secure_open_capability",
+        "artifact_path_not_relative",
+    ):
+        return "artifact_not_regular_file"
+    lowered = reason_code.lower()
+    if any(
+        token in lowered
+        for token in (
+            "symbolic link", "eloop", "no such file", "not a directory", "permission denied", "is a directory"
+        )
+    ):
+        return "artifact_not_regular_file"
+    # Every other failure at this layer is a strict-JSON parse failure:
+    # `duplicate_json_key` / `non_finite_json` (both raised by
+    # `reviewer_transport.strict_json_loads()`) or a raw `json.JSONDecodeError`
+    # message.
+    return "artifact_not_strict_json"
 
 
 def readback_persisted_artifact(
-    artifact_path: str | Path,
     *,
+    artifact_root: str | Path,
+    artifact_relative: str,
+    expected_repo: str,
+    expected_issue: int,
     expected_body_sha256: str,
+    expected_invocation_id: str,
+    expected_attempt: int,
+    expected_artifact_sha256: str,
     expected_verdict: str,
 ) -> dict[str, Any]:
     """Verify a persisted compact-review artifact before allowing the
     "final review" (remote Issue body update) step to run.
 
-    Issue #2054 AC6: delegates the actual open+read to a single dir-fd-free
-    no-follow `os.open()` + `os.fstat()` + one bounded `os.read()` on the
-    SAME fd, then parses those SAME raw bytes with `reviewer_transport`'s
-    `strict_json_loads()` (the V2 contract SSOT's strict JSON primitive --
-    duplicate keys and non-finite constants rejected at the parser level,
-    not via a raw substring scan). No `Path.resolve()` -> `stat()` ->
-    separate `open()` security fallback is used anywhere in this path: a
-    symlink leaf is rejected by the no-follow `open()` itself (`ELOOP`),
-    not by a preceding, separately racy `is_symlink()` check.
+    Issue #2242 OWNER adversarial review
+    (https://github.com/squne121/loop-protocol/pull/2246#issuecomment-5328161000),
+    Blocker 2 + Blocker 3:
+
+    Blocker 2 (AC4 binding verification was self-referential/tautological):
+    the previous revision read `repository`/`issue_number`/`invocation_id`/
+    `attempt` OUT of the artifact itself via `extract_binding_context()`,
+    then compared those SAME values back against the artifact as "expected"
+    values -- a comparison that can never fail except accidentally via
+    `body_sha256` (`payload["x"] == payload["x"]`). This revision requires
+    the CALLER to supply every expected binding value independently
+    (`expected_repo` / `expected_issue` / `expected_invocation_id` /
+    `expected_attempt` / `expected_artifact_sha256`, sourced from the
+    orchestrator's own known repo/issue/invocation/attempt context -- never
+    re-derived from the artifact being verified) and passes them straight
+    through to `reviewer_transport.verify_artifact()`.
+
+    Blocker 3 (custom insecure symlink-following file open instead of full
+    delegation): the previous revision implemented its own
+    `os.open(path, O_NOFOLLOW)` + custom 10 MiB size cap + custom read loop.
+    `O_NOFOLLOW` on a single flat `os.open()` call only rejects a symlink at
+    the LEAF path component -- it does NOT reject symlinks in intermediate
+    path components, so a symlinked parent directory could smuggle in an
+    out-of-root regular file. This revision deletes that reimplementation
+    entirely and fully delegates the open+read+hash+binding-verify to
+    `reviewer_transport.verify_artifact()`, which anchors traversal via
+    `artifact_root` + a validated repo-relative `artifact_relative` path,
+    applies `O_DIRECTORY|O_NOFOLLOW` on EVERY intermediate path component
+    (not just the leaf), enforces a 1 MiB cap
+    (`reviewer_transport.ARTIFACT_MAX_BYTES`), computes SHA-256 over the
+    same raw bytes, and independently verifies binding. No parallel
+    open/read/hash logic is reimplemented in this module.
+
+    `_classify_verify_artifact_failure()` translates `verify_artifact()`'s
+    internal `reason_code` vocabulary into this function's pre-existing
+    external violation vocabulary (presentation layer only -- see that
+    function's docstring).
 
     Checks (all must pass for `verdict_identity: true`):
-      1. `artifact_path` opens (no-follow) as a regular file within bounds.
+      1. `artifact_root`/`artifact_relative` open (dir-fd-anchored,
+         component-wise no-follow) as a regular file within the 1 MiB cap.
       2. File content parses as strict JSON via the SAME raw bytes read once.
-      3. `body_sha256` in the artifact matches `expected_body_sha256` exactly.
-      4. `verdict` in the artifact matches `expected_verdict` exactly.
+      3. The parsed payload is a `REVIEWER_COMPACT_ARTIFACT_V2` object whose
+         raw-byte SHA-256 matches `expected_artifact_sha256` exactly.
+      4. The artifact's `repository` / `issue_number` / `reviewed_body_sha256`
+         / `invocation_id` / `attempt` fields ALL match the caller-supplied
+         `expected_repo` / `expected_issue` / `expected_body_sha256` /
+         `expected_invocation_id` / `expected_attempt` exactly
+         (`reviewer_transport.check_artifact_binding()`).
+      5. The artifact's nested `semantic_result` validates against the FULL
+         `REVIEW_ISSUE_RESULT_V1` jsonschema
+         (`reviewer_transport.validate_semantic_result_schema()`, Issue #2242
+         Blocker 4 -- not merely `verdict`/`blocking_issues` presence).
+      6. The artifact's nested `semantic_result.verdict` (extracted via
+         `reviewer_transport.semantic_verdict_and_count()`, never a locally
+         reimplemented `semantic_result` field-map) matches
+         `expected_verdict` exactly.
     """
-    path = Path(artifact_path)
+    verified = _reviewer_transport.verify_artifact(
+        artifact_root=Path(artifact_root),
+        artifact_relative=artifact_relative,
+        expected_repo=expected_repo,
+        expected_issue=expected_issue,
+        expected_body_sha256=expected_body_sha256,
+        expected_invocation_id=expected_invocation_id,
+        expected_attempt=expected_attempt,
+        expected_sha256=expected_artifact_sha256,
+    )
+    if verified["status"] != "valid":
+        violation = _classify_verify_artifact_failure(verified.get("reason_code", ""))
+        return {"verdict_identity": False, "violations": [violation]}
+
+    payload = verified["payload"]
     violations: list[str] = []
 
-    try:
-        fd = _open_readonly_no_follow(path)
-    except OSError:
-        violations.append("artifact_not_regular_file")
-        return {"verdict_identity": False, "violations": violations}
+    semantic_result = payload.get("semantic_result")
+    schema_violation = _reviewer_transport.validate_semantic_result_schema(semantic_result)
+    if schema_violation is not None:
+        violations.append(schema_violation)
 
     try:
-        file_stat = os.fstat(fd)
-        max_bytes = 10 * 1024 * 1024
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > max_bytes:
-            violations.append("artifact_not_regular_file")
-            return {"verdict_identity": False, "violations": violations}
-        chunks: list[bytes] = []
-        remaining = max_bytes + 1
-        while remaining:
-            chunk = os.read(fd, min(65536, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
-    finally:
-        os.close(fd)
+        actual_verdict, _blocking_count = _reviewer_transport.semantic_verdict_and_count(semantic_result)
+    except ValueError:
+        violations.append("semantic_result_invalid")
+        return {"verdict_identity": False, "violations": violations, "payload": payload}
 
-    if len(raw) > max_bytes:
-        violations.append("artifact_not_regular_file")
-        return {"verdict_identity": False, "violations": violations}
-
-    try:
-        text = raw.decode("utf-8")
-        payload = _reviewer_transport.strict_json_loads(text)
-    except (UnicodeDecodeError, ValueError):
-        # `strict_json_loads` raises `ValueError` (via `parse_constant`) for
-        # NaN/Infinity/-Infinity tokens and for duplicate object members, so
-        # this single except clause covers malformed JSON, non-finite
-        # values, and duplicate keys -- no separate raw-text substring scan
-        # is needed or performed.
-        violations.append("artifact_not_strict_json")
-        return {"verdict_identity": False, "violations": violations}
-
-    if not isinstance(payload, dict):
-        violations.append("artifact_not_strict_json")
-        return {"verdict_identity": False, "violations": violations}
-
-    actual_body_sha256 = payload.get("body_sha256")
-    if actual_body_sha256 != expected_body_sha256:
-        violations.append("body_sha256_mismatch")
-
-    actual_verdict = payload.get("verdict")
     if actual_verdict != expected_verdict:
         violations.append("verdict_mismatch")
 
@@ -1260,6 +1335,38 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             "attempt_id": compact_fields["ATTEMPT_ID"],
         }
 
+        # Issue #2242 OWNER adversarial review Blocker 1
+        # (https://github.com/squne121/loop-protocol/pull/2246#issuecomment-5328161000):
+        # `produce` returns TWO separate, differently-schemad artifacts --
+        # the top-level `artifact_path` (the FULL `REVIEW_ISSUE_RESULT_V1`,
+        # written via `persist_to_canonical_artifact_directory()`, satisfying
+        # Issue #2049 AC3's "save full artifact to canonical artifact
+        # directory" contract) and `compact_result.artifact_path` (the
+        # `REVIEWER_COMPACT_ARTIFACT_V2` wrapper, written via
+        # `reviewer_transport.write_semantic_artifact()`). These typed
+        # `full_review_artifact` / `verified_transport_artifact` fields make
+        # that distinction explicit and machine-readable instead of leaving
+        # it implicit in two differently-named `artifact_path` keys.
+        #
+        # CANONICAL CONTRACT (explicit, not ambiguous): `readback` /
+        # `gate-final-review` consume `verified_transport_artifact`
+        # (`REVIEWER_COMPACT_ARTIFACT_V2`, via its `root`/`relative_path`/
+        # `sha256`) as their canonical input -- that schema carries the
+        # verifiable repo/issue/body-sha/invocation/attempt binding context
+        # `readback_persisted_artifact()` requires. `full_review_artifact`
+        # (`REVIEW_ISSUE_RESULT_V1`) is NOT valid input to `readback`/
+        # `gate-final-review`; it remains the durable, human/tooling-facing
+        # full checker result Issue #2049 AC3 requires to be persisted.
+        full_review_artifact = {"path": str(artifact_path), "schema": "REVIEW_ISSUE_RESULT_V1"}
+        verified_transport_artifact = {
+            "root": str(artifact_root),
+            "relative_path": artifact_relative,
+            "sha256": compact_fields["ARTIFACT_SHA256"],
+            "schema": "REVIEWER_COMPACT_ARTIFACT_V2",
+            "invocation_id": transport_result["invocation_id"],
+            "attempt": last_attempt["attempt"],
+        }
+
         print(
             json.dumps(
                 {
@@ -1271,6 +1378,8 @@ def _cmd_produce(args: argparse.Namespace) -> int:
                     "merged_review_result": merged,
                     "artifact_path": str(artifact_path),
                     "compact_result": compact_result,
+                    "full_review_artifact": full_review_artifact,
+                    "verified_transport_artifact": verified_transport_artifact,
                 }
             )
         )
@@ -1296,8 +1405,14 @@ def _cmd_classify_child_stdout(args: argparse.Namespace) -> int:
 
 def _cmd_readback(args: argparse.Namespace) -> int:
     result = readback_persisted_artifact(
-        args.artifact_path,
+        artifact_root=args.artifact_root,
+        artifact_relative=args.artifact_relative,
+        expected_repo=args.expected_repo,
+        expected_issue=args.expected_issue,
         expected_body_sha256=args.expected_body_sha256,
+        expected_invocation_id=args.expected_invocation_id,
+        expected_attempt=args.expected_attempt,
+        expected_artifact_sha256=args.expected_artifact_sha256,
         expected_verdict=args.expected_verdict,
     )
     print(json.dumps(result))
@@ -1306,8 +1421,14 @@ def _cmd_readback(args: argparse.Namespace) -> int:
 
 def _cmd_gate_final_review(args: argparse.Namespace) -> int:
     readback = readback_persisted_artifact(
-        args.artifact_path,
+        artifact_root=args.artifact_root,
+        artifact_relative=args.artifact_relative,
+        expected_repo=args.expected_repo,
+        expected_issue=args.expected_issue,
         expected_body_sha256=args.expected_body_sha256,
+        expected_invocation_id=args.expected_invocation_id,
+        expected_attempt=args.expected_attempt,
+        expected_artifact_sha256=args.expected_artifact_sha256,
         expected_verdict=args.expected_verdict,
     )
     result = gate_final_review(remote_update_ok=args.remote_update_ok, readback=readback)
@@ -1355,15 +1476,36 @@ def main(argv: list[str] | None = None) -> int:
     p_classify.add_argument("--expected-body-sha256", default=None)
     p_classify.set_defaults(func=_cmd_classify_child_stdout)
 
+    # Issue #2242 OWNER adversarial review Blocker 2/3
+    # (https://github.com/squne121/loop-protocol/pull/2246#issuecomment-5328161000):
+    # `--artifact-root`/`--artifact-relative` replace the prior single
+    # `--artifact-path` so `readback_persisted_artifact()` can fully delegate
+    # to `reviewer_transport.verify_artifact()`'s dir-fd-anchored, no-follow
+    # traversal (which requires a trusted root + a validated repo-relative
+    # path, not an arbitrary pre-joined filesystem path). Every other
+    # `--expected-*` flag is a caller-supplied, artifact-independent expected
+    # binding value (never re-derived from the artifact being verified).
     p_readback = sub.add_parser("readback", help="Readback a persisted compact artifact")
-    p_readback.add_argument("--artifact-path", required=True)
+    p_readback.add_argument("--artifact-root", required=True)
+    p_readback.add_argument("--artifact-relative", required=True)
+    p_readback.add_argument("--expected-repo", required=True)
+    p_readback.add_argument("--expected-issue", type=int, required=True)
     p_readback.add_argument("--expected-body-sha256", required=True)
+    p_readback.add_argument("--expected-invocation-id", required=True)
+    p_readback.add_argument("--expected-attempt", type=int, required=True)
+    p_readback.add_argument("--expected-artifact-sha256", required=True)
     p_readback.add_argument("--expected-verdict", required=True)
     p_readback.set_defaults(func=_cmd_readback)
 
     p_gate = sub.add_parser("gate-final-review", help="Decide if final review may run")
-    p_gate.add_argument("--artifact-path", required=True)
+    p_gate.add_argument("--artifact-root", required=True)
+    p_gate.add_argument("--artifact-relative", required=True)
+    p_gate.add_argument("--expected-repo", required=True)
+    p_gate.add_argument("--expected-issue", type=int, required=True)
     p_gate.add_argument("--expected-body-sha256", required=True)
+    p_gate.add_argument("--expected-invocation-id", required=True)
+    p_gate.add_argument("--expected-attempt", type=int, required=True)
+    p_gate.add_argument("--expected-artifact-sha256", required=True)
     p_gate.add_argument("--expected-verdict", required=True)
     p_gate.add_argument("--remote-update-ok", action="store_true")
     p_gate.set_defaults(func=_cmd_gate_final_review)
