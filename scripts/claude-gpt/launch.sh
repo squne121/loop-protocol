@@ -191,6 +191,7 @@ PROXY_STATE_DIR_TARGET=$(claude_gpt_proxy_state_dir)
 PROXY_HOME_TARGET=$(claude_gpt_proxy_home_dir)
 MCP_CONFIG_PATH=$(claude_gpt_mcp_config_path)
 SETTINGS_PATH=$(claude_gpt_session_settings_path)
+SPARK_AUTH_DIR_TARGET=$(claude_gpt_spark_auth_dir)
 # --- Claude/AGY プロセス専用の隔離 HOME/GH_CONFIG_DIR/XDG（P0-6）。credential を
 #     一切置かない空ディレクトリとして扱う。ambient `gh auth` credential を
 #     Claude/AGY プロセスから利用不能にすることが目的であり、broker（別プロセス、
@@ -203,7 +204,8 @@ CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_cache_dir)
 # --- canonical path safety（ディレクトリ作成前に必ず検証する） ---
 for d in "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
   "$CLAUDE_ISOLATED_HOME_TARGET" "$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET" \
-  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"; do
+  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET" \
+  "$SPARK_AUTH_DIR_TARGET"; do
   if ! claude_gpt_reject_if_under_repo "$d" "$SELF_PATH"; then
     printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"canonical_path_under_repo_or_worktree","path":"%s"}\n' "$d"
     exit 5
@@ -230,7 +232,8 @@ umask 077
 # --- GPT 専用ディレクトリを準備する（既存なら idempotent） ---
 mkdir -p "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
   "$CLAUDE_ISOLATED_HOME_TARGET" "$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET" \
-  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"
+  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET" \
+  "$SPARK_AUTH_DIR_TARGET"
 
 # --- strict_mcp mode 用の空 MCP config を書き込む（repository/user MCP を読み込ませない） ---
 STRICT_MCP_MODE=true
@@ -271,14 +274,311 @@ MCP_JSON_EOF
 #     (`subagent-start-stop`)のみを受け付ける。それ以外の値は fragment を空のままにする(拒否)。
 #     既存の CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS(--settings 等 CLI 引数拒否)とは独立した経路であり、
 #     それを変更・弱体化するものではない。 ---
-HOOKS_JSON_FRAGMENT=""
-ENV_JSON_FRAGMENT=""
+# --- Spark explicit-only authorization gate (Issue #2186) ------------------
+#
+# Session-local, nonce-keyed sidecar authorization gate. The gate writer
+# python source below is embedded between fixed markers
+# (`SPARK_GATE_WRITER_PY_BEGIN`/`_END`) so hermetic tests can extract the
+# exact executed source (single source of truth, no drift between runtime
+# and test fixtures) instead of re-implementing the same logic twice.
+SPARK_LAUNCH_NONCE="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+SPARK_GATE_WRITER="${PROXY_STATE_DIR_TARGET}/spark-gate-${SPARK_LAUNCH_NONCE}.py"
+( umask 077 && cat > "$SPARK_GATE_WRITER" <<'SPARK_GATE_WRITER_PY_END_MARKER'
+# SPARK_GATE_WRITER_PY_BEGIN
+import json
+import os
+import re
+import sys
+import time
+import uuid
+
+SPARK_AGENT = "spark-codex"
+AUTH_DIR = os.environ.get("CLAUDE_GPT_SPARK_AUTH_DIR", "")
+# Issue #2186 P0 fix-delta (PR #2244 adversarial review, forgery finding):
+# the launch nonce is intentionally NOT read from a process environment
+# variable. `export`ing it would make it visible to the main `claude`
+# process's own env (and therefore to the unrestricted Bash tool via `env`),
+# letting main Claude itself forge a fake pending-authorization sidecar file
+# with the correct launch_nonce and self-authorize a spark-codex invocation
+# without ever going through UserPromptSubmit. Instead, launch.sh substitutes
+# this placeholder with the literal per-launch nonce value via a post-heredoc
+# `sed` rewrite of this file (see `SPARK_GATE_WRITER` generation), so the
+# value is only ever present inside a file under a `permissions.deny`
+# Read-denied directory, never inside the claude process's own environ.
+LAUNCH_NONCE = "__CLAUDE_GPT_SPARK_LAUNCH_NONCE__"
+
+MENTION_RE = re.compile(r"(?<![\w-])@agent-spark-codex(?![\w-])")
+FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+DQUOTE_RE = re.compile(r'"[^"\n]*"')
+SQUOTE_RE = re.compile(r"'[^'\n]*'")
+
+
+def strip_non_authorizing(text):
+    text = FENCE_RE.sub(" ", text)
+    text = INLINE_CODE_RE.sub(" ", text)
+    text = DQUOTE_RE.sub(" ", text)
+    text = SQUOTE_RE.sub(" ", text)
+    kept = []
+    for line in text.split("\n"):
+        if line.lstrip().startswith(">"):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def has_canonical_mention(prompt_text):
+    if not isinstance(prompt_text, str):
+        return False
+    return bool(MENTION_RE.search(strip_non_authorizing(prompt_text)))
+
+
+def read_payload():
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def pending_path(session_id):
+    return os.path.join(AUTH_DIR, "pending-" + session_id + ".json")
+
+
+def counter_path(session_id):
+    return os.path.join(AUTH_DIR, "counter-" + session_id + ".txt")
+
+
+def next_prompt_counter(session_id):
+    path = counter_path(session_id)
+    n = 0
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            n = int((fh.read() or "0").strip() or "0")
+    except (OSError, ValueError):
+        n = 0
+    n += 1
+    tmp = path + ".tmp-" + str(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(str(n))
+    os.replace(tmp, path)
+    return n
+
+
+def clear_pending(session_id):
+    try:
+        os.remove(pending_path(session_id))
+    except OSError:
+        pass
+
+
+def has_nested_agent_origin(payload):
+    # Issue #2186 P1 fix-delta: a genuinely top-level user turn's hook
+    # payload never carries an `agent_id`/`parent_tool_use_id` (or
+    # `parentToolUseId`) field -- those are only present when the event
+    # originates from within a SubAgent's own execution context. Requiring
+    # their absence at BOTH UserPromptSubmit and PreToolUse(Agent) time
+    # closes the gap where a different SubAgent sharing the same
+    # `session_id` could otherwise piggyback on (or independently trigger)
+    # an authorization intended only for the top-level main session.
+    for key in ("agent_id", "parent_tool_use_id", "parentToolUseId"):
+        if payload.get(key):
+            return True
+    return False
+
+
+def cmd_user_prompt_submit(payload):
+    session_id = payload.get("session_id") or ""
+    prompt = payload.get("prompt")
+    if not session_id or not AUTH_DIR:
+        return
+    if has_nested_agent_origin(payload):
+        # A prompt-submit event that itself carries nested-agent origin
+        # fields cannot be a genuine top-level user turn; never record a
+        # pending authorization from it (fail closed).
+        return
+    try:
+        os.makedirs(AUTH_DIR, exist_ok=True)
+    except OSError:
+        return
+    counter = next_prompt_counter(session_id)
+    # A new turn always invalidates any previous unconsumed authorization for
+    # this session first -- authorization never carries over to the next turn
+    # (Issue #2186 AC3).
+    clear_pending(session_id)
+    if not has_canonical_mention(prompt):
+        return
+    record = {
+        "session_id": session_id,
+        "prompt_id": counter,
+        "launch_nonce": LAUNCH_NONCE,
+        "authorization_turn_id": session_id + ":" + str(counter),
+        "consumed": False,
+        "created_ts": time.time(),
+        "nonce": uuid.uuid4().hex,
+    }
+    target = pending_path(session_id)
+    tmp = target + ".tmp-" + str(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(record, fh)
+    os.replace(tmp, target)
+
+
+def cmd_pre_tool_use_agent(payload):
+    tool_input = payload.get("tool_input")
+    subagent_type = tool_input.get("subagent_type") if isinstance(tool_input, dict) else None
+    if subagent_type != SPARK_AGENT:
+        # Not our concern -- explicit allow, no interference with ordinary
+        # SubAgent mapping (Issue #2186 AC1).
+        return
+    session_id = payload.get("session_id") or ""
+    decision = "deny"
+    reason = "no_pending_authorization"
+    record = None
+    if has_nested_agent_origin(payload):
+        # Issue #2186 P1 fix-delta (AC5): the Agent tool_use itself
+        # originates from a nested SubAgent context (or reports fields
+        # consistent with one), never from the top-level main session --
+        # deny unconditionally, independent of whether a pending
+        # authorization otherwise exists for this session_id.
+        reason = "nested_agent_origin_forbidden"
+    elif session_id and AUTH_DIR:
+        pending = pending_path(session_id)
+        try:
+            with open(pending, "r", encoding="utf-8") as fh:
+                record = json.load(fh)
+        except (OSError, ValueError):
+            record = None
+        if isinstance(record, dict) and record.get("consumed") is False and record.get("launch_nonce") == LAUNCH_NONCE:
+            consumed_marker = pending + ".consumed-" + uuid.uuid4().hex
+            try:
+                os.rename(pending, consumed_marker)
+                decision = "allow"
+                reason = "authorization_consumed"
+            except OSError:
+                decision = "deny"
+                reason = "authorization_consume_race_lost"
+        elif isinstance(record, dict) and record.get("launch_nonce") != LAUNCH_NONCE:
+            reason = "authorization_carryover_stale_launch_nonce"
+        elif isinstance(record, dict) and record.get("consumed") is not False:
+            reason = "authorization_already_consumed"
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+    }
+    # Issue #2186 P1 fix-delta (PR #2244 adversarial review): allow/deny is
+    # communicated EXCLUSIVELY via exit-0 stdout structured JSON
+    # (`hookSpecificOutput.permissionDecision`), never via `exit 2` +
+    # stderr blocking-error semantics. Claude Code's own hook contract
+    # treats structured JSON decisions and exit-2 blocking errors as two
+    # separate mechanisms; mixing them risked `permissionDecisionReason`
+    # diagnostic values (e.g. `authorization_carryover_stale_launch_nonce`)
+    # never actually being interpreted because they were written to stdout
+    # while exit 2 signals a stderr-based blocking error path instead.
+    sys.stdout.write(json.dumps(output))
+    sys.exit(0)
+
+
+def cmd_subagent_lifecycle(payload):
+    # SubagentStart/SubagentStop are audit-only for this gate; causal evidence
+    # itself is derived independently from `--include-hook-events` stream-json
+    # lifecycle events (PR #2220 `extract_claude_hook_lifecycle_events()`),
+    # reused unchanged (Issue #2186 In Scope).
+    return
+
+
+def main():
+    event = sys.argv[1] if len(sys.argv) > 1 else ""
+    payload = read_payload()
+    try:
+        if event == "user-prompt-submit":
+            cmd_user_prompt_submit(payload)
+        elif event == "pre-tool-use-agent":
+            cmd_pre_tool_use_agent(payload)
+        elif event in ("subagent-start", "subagent-stop"):
+            cmd_subagent_lifecycle(payload)
+    except SystemExit:
+        raise
+    except Exception:
+        # Fail closed: never let an unexpected exception here silently permit
+        # a spark-codex invocation nor crash the parent claude-gpt session.
+        # Decision channel is exit-0 stdout JSON only (Issue #2186 P1
+        # fix-delta) -- never exit 2, so this path stays consistent with
+        # cmd_pre_tool_use_agent's normal deny path.
+        if event == "pre-tool-use-agent":
+            output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "gate_internal_error",
+                }
+            }
+            sys.stdout.write(json.dumps(output))
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+# SPARK_GATE_WRITER_PY_END
+SPARK_GATE_WRITER_PY_END_MARKER
+)
+# Issue #2186 P0 fix-delta: SPARK_LAUNCH_NONCE is generated exclusively from
+# `date -u +%Y%m%dT%H%M%SZ` and `$$` (see SPARK_LAUNCH_NONCE= above), so it is
+# always `[0-9A-Za-z_-]+` and safe as a sed replacement (no `/`, `&`,
+# backslash, or newline). Fail closed if that assumption is ever violated
+# instead of silently emitting a broken gate script.
+case "$SPARK_LAUNCH_NONCE" in
+  *[!0-9A-Za-z_-]*)
+    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"spark_launch_nonce_unsafe_chars"}\n'
+    exit 9
+    ;;
+esac
+# Substitute the literal nonce into the gate script file directly, rather
+# than exporting CLAUDE_GPT_SPARK_LAUNCH_NONCE into the claude process's own
+# environment (P0 forgery fix -- see the LAUNCH_NONCE placeholder comment
+# embedded in the gate script above).
+sed -i "s/__CLAUDE_GPT_SPARK_LAUNCH_NONCE__/${SPARK_LAUNCH_NONCE}/" "$SPARK_GATE_WRITER"
+export CLAUDE_GPT_SPARK_AUTH_DIR="$SPARK_AUTH_DIR_TARGET"
+export SPARK_GATE_WRITER
+SPARK_AGENTS_JSON=$(claude_gpt_spark_agents_json_fragment)
+
+# --- explicit-only authorization gate hook groups (Issue #2186 P0 fix-delta,
+#     PR #2244 adversarial review) ---
+#
+# The gate-owning hook groups below MUST always be present, regardless of
+# CLAUDE_GPT_RUNTIME_SMOKE_HOOKS. Prior to this fix, setting
+# CLAUDE_GPT_RUNTIME_SMOKE_HOOKS reassigned HOOKS_JSON_FRAGMENT wholesale,
+# which silently dropped the "PreToolUse"(matcher: Agent) authorization gate
+# entry (and the UserPromptSubmit/SubagentStart/SubagentStop gate entries)
+# whenever runtime-smoke observation hooks were requested -- leaving the
+# spark-codex authorization gate structurally absent (Claude Code
+# default-allows tool calls when no PreToolUse hook matches). Runtime-smoke
+# observation commands are now appended as ADDITIONAL hook-group objects
+# within the same event's array, never as a replacement.
+UPS_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" user-prompt-submit"}]}'
+PTU_HOOK_GROUPS='{"matcher": "Agent", "hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" pre-tool-use-agent"}]}'
+SAS_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" subagent-start"}]}'
+SAP_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" subagent-stop"}]}'
+STOP_HOOK_GROUPS=""
+STOPFAILURE_HOOK_GROUPS=""
+ENV_JSON_FRAGMENT=",
+  \"env\": {\"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\"}"
 if [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-start-stop" ]; then
-  HOOKS_JSON_FRAGMENT=',
-  "hooks": {
-    "SubagentStart": [{"hooks": [{"type": "command", "command": "cat"}]}],
-    "SubagentStop": [{"hooks": [{"type": "command", "command": "cat"}]}]
-  }'
+  # Observation-only "cat" sinks appended as an additional matcher-group,
+  # alongside (never instead of) the gate's SubagentStart/SubagentStop
+  # audit entries above.
+  CAT_SINK_GROUP='{"hooks": [{"type": "command", "command": "cat"}]}'
+  SAS_HOOK_GROUPS="${SAS_HOOK_GROUPS}, ${CAT_SINK_GROUP}"
+  SAP_HOOK_GROUPS="${SAP_HOOK_GROUPS}, ${CAT_SINK_GROUP}"
 elif [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "hook-sink-multi-turn" ]; then
   # --- Issue #2219 (OWNER anchor decision, hook-event evidence channel).
   #     Narrow addition to the same fixed-value gate above: a SECOND fixed
@@ -343,26 +643,61 @@ if __name__ == "__main__":
     main()
 HOOK_SINK_WRITER_EOF
   )
-  HOOKS_JSON_FRAGMENT=',
-  "hooks": {
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}],
-    "StopFailure": [{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}],
-    "SubagentStart": [{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}],
-    "SubagentStop": [{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}]
-  }'
+  # Observation-only sink writer groups appended alongside (never instead
+  # of) the gate's UserPromptSubmit/SubagentStart/SubagentStop entries
+  # above; gate command runs first within each event's hook array.
+  # Stop/StopFailure have no gate equivalent, so they get sink-only groups.
+  SINK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}'
+  UPS_HOOK_GROUPS="${UPS_HOOK_GROUPS}, ${SINK_GROUP}"
+  STOP_HOOK_GROUPS="${SINK_GROUP}"
+  STOPFAILURE_HOOK_GROUPS="${SINK_GROUP}"
+  SAS_HOOK_GROUPS="${SAS_HOOK_GROUPS}, ${SINK_GROUP}"
+  SAP_HOOK_GROUPS="${SAP_HOOK_GROUPS}, ${SINK_GROUP}"
   # Also baked literally into settings.json's own "env" block (belt-and-
   # braces alongside the exported shell env vars below) so the 3-way
   # run_nonce match the harness verifies (AC16) has a nonce value that is
   # genuinely "baked into settings.json at launch", not merely inherited.
+  # SPARK_GATE_WRITER is retained here too, since the authorization gate
+  # hook commands above remain wired and still need it resolved.
   ENV_JSON_FRAGMENT=",
   \"env\": {
+    \"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\",
     \"CLAUDE_GPT_HOOK_SINK_NONCE\": \"${CLAUDE_GPT_HOOK_SINK_NONCE}\",
     \"CLAUDE_GPT_HOOK_SINK_PATH\": \"${CLAUDE_GPT_HOOK_SINK_PATH}\",
     \"CLAUDE_GPT_HOOK_SINK_WRITER\": \"${CLAUDE_GPT_HOOK_SINK_WRITER}\"
   }"
   export CLAUDE_GPT_HOOK_SINK_NONCE CLAUDE_GPT_HOOK_SINK_PATH CLAUDE_GPT_HOOK_SINK_WRITER
 fi
+
+HOOKS_JSON_FRAGMENT=',
+  "hooks": {
+    "UserPromptSubmit": ['"${UPS_HOOK_GROUPS}"'],
+    "PreToolUse": ['"${PTU_HOOK_GROUPS}"'],
+    "SubagentStart": ['"${SAS_HOOK_GROUPS}"'],
+    "SubagentStop": ['"${SAP_HOOK_GROUPS}"']'"$(
+  if [ -n "$STOP_HOOK_GROUPS" ]; then
+    printf ',\n    "Stop": [%s],\n    "StopFailure": [%s]' "$STOP_HOOK_GROUPS" "$STOPFAILURE_HOOK_GROUPS"
+  fi
+)"'
+  }'
+
+# --- Spark authorization sidecar directory deny (Issue #2186 P0 fix-delta,
+#     PR #2244 adversarial review, forgery finding) ---
+#
+# `Read`/`Write`/`Edit` deny on SPARK_AUTH_DIR_TARGET is a best-effort
+# defense against main Claude's built-in tools directly forging or reading
+# the pending-authorization sidecar file. Like the existing
+# PROXY_CONFIG_DIR_TARGET/PROXY_STATE_DIR_TARGET/PROXY_HOME_TARGET denies
+# above, this does NOT constrain the unrestricted Bash tool (`cat`,
+# `python3 -c`, etc. can still read/write under this directory); combined
+# with removing CLAUDE_GPT_SPARK_LAUNCH_NONCE from the claude process's own
+# environment (see the sed substitution above), forging a pending record
+# with the correct `launch_nonce` value now additionally requires
+# discovering that value via a Bash-tool file read rather than a trivial
+# `env` inspection, but is not architecturally impossible for an
+# unrestricted Bash tool. This residual gap is a known limitation, not a
+# closed security boundary (documented for the reviewer, consistent with
+# Issue #2158's Scope Reframe treatment of the analogous proxy-dir denies).
 
 # --- launcher-owned autoMode policy（Issue #2203, second-gate 判断補助。
 #     決定論的 authority は permissions.deny / PreToolUse hook / GitHub mutation
@@ -376,7 +711,10 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
     "deny": [
       "Read(/${PROXY_CONFIG_DIR_TARGET}/**)",
       "Read(/${PROXY_STATE_DIR_TARGET}/**)",
-      "Read(/${PROXY_HOME_TARGET}/**)"
+      "Read(/${PROXY_HOME_TARGET}/**)",
+      "Read(/${SPARK_AUTH_DIR_TARGET}/**)",
+      "Write(/${SPARK_AUTH_DIR_TARGET}/**)",
+      "Edit(/${SPARK_AUTH_DIR_TARGET}/**)"
     ]
   },
   "enabledPlugins": {}${HOOKS_JSON_FRAGMENT}${ENV_JSON_FRAGMENT},
@@ -679,7 +1017,7 @@ exec 9<&0
 #     （CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由）で既に全面拒否済みのため、ここに
 #     到達する時点で "$@" に `--permission-mode` トークンは含まれない。 ---
 # shellcheck disable=SC2086
-"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" --permission-mode auto "$@" <&9 &
+"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" --permission-mode auto --agents "$SPARK_AGENTS_JSON" "$@" <&9 &
 CLAUDE_PID=$!
 
 wait "$CLAUDE_PID"
