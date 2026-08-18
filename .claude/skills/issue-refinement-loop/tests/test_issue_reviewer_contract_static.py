@@ -270,15 +270,76 @@ def test_retry_once_on_transport_failure_accepts_valid_result_on_first_try():
 # ---------------------------------------------------------------------------
 
 
+# Issue #2242 AC6/AC10: these fixtures previously hand-wrote the OLD flat V1
+# shape (`{"body_sha256": ..., "verdict": ...}` top-level), which does not
+# match what the canonical V2 writer (`reviewer_transport.write_semantic_artifact()`)
+# actually persists (top-level `reviewed_body_sha256` + nested
+# `semantic_result.verdict`) and therefore could not detect the writer/reader
+# drift regression this Issue fixes -- they are updated here to the
+# production writer's V2 output shape while preserving each test's original
+# security-regression intent (malformed-JSON / duplicate-key / non-finite
+# rejection must still fail closed; a legitimate string that merely CONTAINS
+# "NaN"/"Infinity" must still be accepted).
+
+_FIXTURE_REPO = "squne121/loop-protocol"
+_FIXTURE_ISSUE = 2242
+_FIXTURE_INVOCATION_ID = "fixture-readback-2242"
+_FIXTURE_ATTEMPT = 1
+# Issue #2242 OWNER adversarial review Blocker 4
+# (https://github.com/squne121/loop-protocol/pull/2246#issuecomment-5328161000):
+# a well-formed sha256:<64-hex> value is now required (the previous
+# "sha256:aa" fixture value would itself be rejected by the new
+# reviewer_transport.extract_binding_context() format check).
+_FIXTURE_BODY_SHA256 = "sha256:" + "a" * 64
+
+
+def _fixture_review_result_v1(FIXTURES_DIR: Path, *, message: str | None = None) -> dict:
+    """A COMPLETE production-shaped REVIEW_ISSUE_RESULT_V1 fixture (Issue
+    #2242 Blocker 4: readback now validates the full schema, not merely
+    verdict+blocking_issues), optionally carrying an extra `message` field
+    inside `blocking_issues[0]` so a legitimate "NaN"/"Infinity" SUBSTRING
+    can still be exercised without breaking schema validity."""
+    import json as _json
+
+    fixture = _json.loads((FIXTURES_DIR / "review_result_approve.json").read_text(encoding="utf-8"))
+    fixture["body_sha256"] = _FIXTURE_BODY_SHA256
+    if message is not None:
+        fixture["findings"] = [
+            {
+                "finding_kind": "checker_gap",
+                "deterministic_domain_key": "fixture_message_probe",
+                "blocking": False,
+                "checker_evidence": [],
+                "message": message,
+            }
+        ]
+    return fixture
+
+
 def test_readback_rejects_actual_nan_json_token(tmp_path):
     """GIVEN a persisted artifact containing a literal `NaN` JSON constant
+    inside an otherwise production-shaped (V2) payload
     WHEN read back via `readback_persisted_artifact`
     THEN it is rejected `artifact_not_strict_json` (parser-level rejection,
-    Issue #2049 AC7 / PR #2135 iteration-3 P1-5)."""
+    Issue #2049 AC7 / PR #2135 iteration-3 P1-5; Issue #2242 AC6)."""
     artifact = tmp_path / "artifact.json"
-    artifact.write_text('{"body_sha256": "sha256:aa", "verdict": "approve", "score": NaN}', encoding="utf-8")
+    artifact.write_text(
+        '{"schema": "REVIEWER_COMPACT_ARTIFACT_V2", "repository": "squne121/loop-protocol", '
+        '"issue_number": 2242, "reviewed_body_sha256": "sha256:aa", '
+        '"invocation_id": "fixture-readback-2242", "attempt": 1, '
+        '"semantic_result": {"verdict": "approve", "blocking_issues": [], "score": NaN}}',
+        encoding="utf-8",
+    )
     result = _PIPELINE.readback_persisted_artifact(
-        artifact, expected_body_sha256="sha256:aa", expected_verdict="approve"
+        artifact_root=tmp_path,
+        artifact_relative="artifact.json",
+        expected_repo=_FIXTURE_REPO,
+        expected_issue=_FIXTURE_ISSUE,
+        expected_body_sha256=_FIXTURE_BODY_SHA256,
+        expected_invocation_id=_FIXTURE_INVOCATION_ID,
+        expected_attempt=_FIXTURE_ATTEMPT,
+        expected_artifact_sha256="sha256:" + "0" * 64,
+        expected_verdict="approve",
     )
     assert result["verdict_identity"] is False
     assert "artifact_not_strict_json" in result["violations"]
@@ -286,54 +347,97 @@ def test_readback_rejects_actual_nan_json_token(tmp_path):
 
 def test_readback_rejects_actual_infinity_json_token(tmp_path):
     """GIVEN a persisted artifact containing a literal `Infinity` JSON
-    constant
+    constant inside an otherwise production-shaped (V2) payload
     WHEN read back via `readback_persisted_artifact`
     THEN it is rejected `artifact_not_strict_json` (Issue #2049 AC7 / PR
-    #2135 iteration-3 P1-5)."""
+    #2135 iteration-3 P1-5; Issue #2242 AC6)."""
     artifact = tmp_path / "artifact.json"
     artifact.write_text(
-        '{"body_sha256": "sha256:aa", "verdict": "approve", "score": Infinity}', encoding="utf-8"
+        '{"schema": "REVIEWER_COMPACT_ARTIFACT_V2", "repository": "squne121/loop-protocol", '
+        '"issue_number": 2242, "reviewed_body_sha256": "sha256:aa", '
+        '"invocation_id": "fixture-readback-2242", "attempt": 1, '
+        '"semantic_result": {"verdict": "approve", "blocking_issues": [], "score": Infinity}}',
+        encoding="utf-8",
     )
     result = _PIPELINE.readback_persisted_artifact(
-        artifact, expected_body_sha256="sha256:aa", expected_verdict="approve"
+        artifact_root=tmp_path,
+        artifact_relative="artifact.json",
+        expected_repo=_FIXTURE_REPO,
+        expected_issue=_FIXTURE_ISSUE,
+        expected_body_sha256=_FIXTURE_BODY_SHA256,
+        expected_invocation_id=_FIXTURE_INVOCATION_ID,
+        expected_attempt=_FIXTURE_ATTEMPT,
+        expected_artifact_sha256="sha256:" + "0" * 64,
+        expected_verdict="approve",
     )
     assert result["verdict_identity"] is False
     assert "artifact_not_strict_json" in result["violations"]
 
 
 def test_readback_accepts_legitimate_string_containing_infinity_substring(tmp_path):
-    """GIVEN a persisted artifact whose ONLY appearance of the text
-    "Infinity" is inside a legitimate string value (not a JSON constant
-    token)
+    """GIVEN a persisted artifact, written by the REAL production writer
+    (`reviewer_transport.write_semantic_artifact()`, not a hand-written
+    fixture), whose ONLY appearance of the text "Infinity" is inside a
+    legitimate `semantic_result` string value (not a JSON constant token)
     WHEN read back via `readback_persisted_artifact`
-    THEN it is NOT rejected for that reason (PR #2135 iteration-3 P1-5
+    THEN it is NOT rejected for that reason, and verdict/body-sha binding
+    both resolve correctly against the V2 schema (PR #2135 iteration-3 P1-5
     closes the prior false-positive bug where a raw substring search over
     the whole file rejected valid strings like `"message": "Infinity
-    handling"`)."""
-    artifact = tmp_path / "artifact.json"
-    artifact.write_text(
-        '{"body_sha256": "sha256:aa", "verdict": "approve", "message": "Infinity handling"}',
-        encoding="utf-8",
+    handling"`; Issue #2242 AC6/AC10 proves this against the ACTUAL V2
+    writer output, not a hand-written flat fixture)."""
+    semantic_result = _fixture_review_result_v1(FIXTURES_DIR, message="Infinity handling")
+    relative, artifact_sha256 = _transport.write_semantic_artifact(
+        artifact_root=tmp_path,
+        issue_number=_FIXTURE_ISSUE,
+        repo=_FIXTURE_REPO,
+        invocation_id=_FIXTURE_INVOCATION_ID,
+        attempt=_FIXTURE_ATTEMPT,
+        reviewed_body_sha256=_FIXTURE_BODY_SHA256,
+        semantic_result=semantic_result,
     )
     result = _PIPELINE.readback_persisted_artifact(
-        artifact, expected_body_sha256="sha256:aa", expected_verdict="approve"
+        artifact_root=tmp_path,
+        artifact_relative=relative,
+        expected_repo=_FIXTURE_REPO,
+        expected_issue=_FIXTURE_ISSUE,
+        expected_body_sha256=_FIXTURE_BODY_SHA256,
+        expected_invocation_id=_FIXTURE_INVOCATION_ID,
+        expected_attempt=_FIXTURE_ATTEMPT,
+        expected_artifact_sha256=artifact_sha256,
+        expected_verdict="approve",
     )
     assert result["verdict_identity"] is True
     assert result["violations"] == []
 
 
 def test_readback_accepts_legitimate_string_containing_nan_substring(tmp_path):
-    """GIVEN a persisted artifact whose ONLY appearance of the text "NaN"
-    is inside a legitimate string value
+    """GIVEN a persisted artifact, written by the REAL production writer,
+    whose ONLY appearance of the text "NaN" is inside a legitimate
+    `semantic_result` string value
     WHEN read back via `readback_persisted_artifact`
-    THEN it is NOT rejected for that reason (PR #2135 iteration-3 P1-5)."""
-    artifact = tmp_path / "artifact.json"
-    artifact.write_text(
-        '{"body_sha256": "sha256:aa", "verdict": "approve", "message": "NaN check passed"}',
-        encoding="utf-8",
+    THEN it is NOT rejected for that reason (PR #2135 iteration-3 P1-5;
+    Issue #2242 AC6/AC10)."""
+    semantic_result = _fixture_review_result_v1(FIXTURES_DIR, message="NaN check passed")
+    relative, artifact_sha256 = _transport.write_semantic_artifact(
+        artifact_root=tmp_path,
+        issue_number=_FIXTURE_ISSUE,
+        repo=_FIXTURE_REPO,
+        invocation_id=_FIXTURE_INVOCATION_ID,
+        attempt=_FIXTURE_ATTEMPT,
+        reviewed_body_sha256=_FIXTURE_BODY_SHA256,
+        semantic_result=semantic_result,
     )
     result = _PIPELINE.readback_persisted_artifact(
-        artifact, expected_body_sha256="sha256:aa", expected_verdict="approve"
+        artifact_root=tmp_path,
+        artifact_relative=relative,
+        expected_repo=_FIXTURE_REPO,
+        expected_issue=_FIXTURE_ISSUE,
+        expected_body_sha256=_FIXTURE_BODY_SHA256,
+        expected_invocation_id=_FIXTURE_INVOCATION_ID,
+        expected_attempt=_FIXTURE_ATTEMPT,
+        expected_artifact_sha256=artifact_sha256,
+        expected_verdict="approve",
     )
     assert result["verdict_identity"] is True
     assert result["violations"] == []
