@@ -6436,5 +6436,76 @@ def main(argv: list[str] | None = None) -> int:
     return exit_code
 
 
+
+# --- Issue #2186 AC7: Spark sanitized failure classification -----------------
+#
+# Fixed, closed classification set for entitlement/catalog/parameter/quota/
+# tool/context-continuation failures observed for the explicit-only
+# spark-codex SubAgent. No caller of this function may promote any of these
+# classifications to PASS or to an automatic fallback (ordinary model, Lite
+# lane, or cached/catalog-only result) -- ``fallback_eligible`` and
+# ``promotable_to_pass`` are unconditionally ``False`` for every branch.
+SPARK_FAILURE_CLASSIFICATIONS = (
+    "unsupported_entitlement",
+    "unavailable_catalog",
+    "request_parameter_incompatibility",
+    "quota",
+    "tool_incompatibility",
+    "context_continuation_error",
+    "other_safe_failure",
+)
+
+
+def classify_spark_failure(sanitized_reason: str) -> dict:
+    """Map a sanitized (credential/token/raw-auth/raw-request-response/raw-
+    transcript-free) failure reason string to one of the fixed
+    ``SPARK_FAILURE_CLASSIFICATIONS`` categories. Always returns exit_code 77
+    (SKIP/blocked) and never PASS; never marks the result fallback-eligible.
+    """
+    reason = (sanitized_reason or "").lower()
+    if "entitlement" in reason or "not entitled" in reason or "forbidden" in reason:
+        classification = "unsupported_entitlement"
+    elif "catalog" in reason or "model not found" in reason or "unknown model" in reason:
+        classification = "unavailable_catalog"
+    elif "quota" in reason or "rate limit" in reason or "429" in reason:
+        classification = "quota"
+    elif "tool" in reason and ("unsupported" in reason or "incompatib" in reason):
+        classification = "tool_incompatibility"
+    elif "context" in reason or "continuation" in reason or "compaction" in reason:
+        classification = "context_continuation_error"
+    elif "parameter" in reason or "invalid_request" in reason or "unsupported parameter" in reason:
+        classification = "request_parameter_incompatibility"
+    else:
+        classification = "other_safe_failure"
+    return {
+        "schema": "SPARK_FAILURE_CLASSIFICATION_RESULT_V1",
+        "classification": classification,
+        "exit_code": 77,
+        "status": "skipped_blocked",
+        "fallback_eligible": False,
+        "promotable_to_pass": False,
+        "redaction_confirmed": True,
+    }
+
+
+def extract_spark_gate_writer_source(launch_sh_text: str) -> str | None:
+    """Extract the exact python source embedded in ``scripts/claude-gpt/
+    launch.sh`` between the ``SPARK_GATE_WRITER_PY_BEGIN``/``_END`` markers
+    (Issue #2186). This is the single source of truth for the explicit-only
+    authorization gate logic actually executed at runtime; tests use this
+    instead of re-implementing/duplicating the gate logic, so there is no
+    drift between what is tested and what actually runs."""
+    begin_marker = "# SPARK_GATE_WRITER_PY_BEGIN\n"
+    end_marker = "# SPARK_GATE_WRITER_PY_END\n"
+    begin_idx = launch_sh_text.find(begin_marker)
+    if begin_idx == -1:
+        return None
+    begin_idx += len(begin_marker)
+    end_idx = launch_sh_text.find(end_marker, begin_idx)
+    if end_idx == -1:
+        return None
+    return launch_sh_text[begin_idx:end_idx]
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

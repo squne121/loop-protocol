@@ -335,6 +335,43 @@ def _canonical_prefix(tmp_path: Path) -> list[str]:
     ]
 
 
+def _extract_agents_flag(argv: list[str]) -> tuple[dict, list[str]]:
+    """canonical prefix 直後の argv から launcher-owned `--agents <json>` flag を
+    検出し、`(parsed_json, remaining_argv)` を返す。
+
+    Issue #2186（PR #2244 P0/P1 adversarial review fix-delta）で launcher が
+    session-local `spark-codex` custom SubAgent を登録するため、canonical prefix
+    へ新規 launcher-owned flag `--agents <json>` が追加された。本ヘルパーは
+    「launcher-owned flag は exactly once・正しい flag/value pairing で存在する」
+    という構造的 invariant だけを検証し、それ以降の caller argv（`remaining`）は
+    一切加工せず返す。これにより「launcher-owned flag の構造的検証」と
+    「caller argv が byte-for-byte で一切改変されていないことの検証」を分離する。
+
+    `--agents` が存在しない場合は `({}, argv)` を返す（Spark 機能が無効な旧経路
+    との後方互換）。`--agents` が複数回存在する場合は `AssertionError`。
+    """
+    count = argv.count("--agents")
+    assert count <= 1, f"--agents must appear at most once, found {count} times: {argv!r}"
+    if count == 0:
+        return {}, argv
+    idx = argv.index("--agents")
+    assert idx + 1 < len(argv), f"--agents flag missing its value: {argv!r}"
+    parsed = json.loads(argv[idx + 1])
+    remaining = argv[:idx] + argv[idx + 2 :]
+    return parsed, remaining
+
+
+def _assert_agents_flag_wired(argv: list[str]) -> list[str]:
+    """`argv`（canonical prefix 除去済み）から `--agents` flag を抽出し、
+    spark-codex の `model` が `gpt-5.3-codex-spark` と一致することを検証した上で、
+    残り（caller argv 相当）を返す。"""
+    agents_flag, remaining = _extract_agents_flag(argv)
+    assert agents_flag.get("spark-codex", {}).get("model") == "gpt-5.3-codex-spark", (
+        f"--agents flag missing or malformed spark-codex model id: {agents_flag!r}"
+    )
+    return remaining
+
+
 def _build_env(
     tmp_path: Path,
     *,
@@ -789,7 +826,9 @@ def test_value_position_p_flag_value_is_not_stripped(tmp_path):
     assert result.returncode == 0, result.stderr
     argv = _read_claude_argv(tmp_path)
     canonical = _canonical_prefix(tmp_path)
-    assert argv == canonical + ["-p", "--strict-mcp-config"]
+    assert argv[: len(canonical)] == canonical
+    remaining = _assert_agents_flag_wired(argv[len(canonical) :])
+    assert remaining == ["-p", "--strict-mcp-config"]
     assert argv.count("--strict-mcp-config") == 2
 
 
@@ -802,7 +841,9 @@ def test_value_position_downstream_double_dash_literal_is_not_stripped(tmp_path)
     assert result.returncode == 0, result.stderr
     argv = _read_claude_argv(tmp_path)
     canonical = _canonical_prefix(tmp_path)
-    assert argv == canonical + ["--", "--strict-mcp-config"]
+    assert argv[: len(canonical)] == canonical
+    remaining = _assert_agents_flag_wired(argv[len(canonical) :])
+    assert remaining == ["--", "--strict-mcp-config"]
     assert argv.count("--strict-mcp-config") == 2
 
 
@@ -818,7 +859,9 @@ def test_value_position_arbitrary_string_option_value_is_not_stripped(tmp_path):
     assert result.returncode == 0, result.stderr
     argv = _read_claude_argv(tmp_path)
     canonical = _canonical_prefix(tmp_path)
-    assert argv == canonical + ["--append-system-prompt", "--strict-mcp-config"]
+    assert argv[: len(canonical)] == canonical
+    remaining = _assert_agents_flag_wired(argv[len(canonical) :])
+    assert remaining == ["--append-system-prompt", "--strict-mcp-config"]
     assert argv.count("--strict-mcp-config") == 2
 
 
@@ -842,7 +885,9 @@ def test_leading_run_stops_at_first_mismatch_but_removes_prior_run(tmp_path):
     assert result.returncode == 0, result.stderr
     argv = _read_claude_argv(tmp_path)
     canonical = _canonical_prefix(tmp_path)
-    assert argv == canonical + ["-p", "--strict-mcp-config"]
+    assert argv[: len(canonical)] == canonical
+    remaining = _assert_agents_flag_wired(argv[len(canonical) :])
+    assert remaining == ["-p", "--strict-mcp-config"]
     assert argv.count("--strict-mcp-config") == 2
 
 
@@ -863,7 +908,8 @@ def test_argv_recorder_restores_empty_string_and_embedded_newline_and_trailing_e
     argv = _read_claude_argv(tmp_path)
     canonical = _canonical_prefix(tmp_path)
     assert argv[: len(canonical)] == canonical
-    assert argv[len(canonical) :] == claude_argv
+    remaining = _assert_agents_flag_wired(argv[len(canonical) :])
+    assert remaining == claude_argv
 
 
 def test_argv_recorder_restores_whitespace_and_glob_metacharacters(tmp_path):
@@ -876,7 +922,8 @@ def test_argv_recorder_restores_whitespace_and_glob_metacharacters(tmp_path):
     assert result.returncode == 0, result.stderr
     argv = _read_claude_argv(tmp_path)
     canonical = _canonical_prefix(tmp_path)
-    assert argv[len(canonical) :] == claude_argv
+    remaining = _assert_agents_flag_wired(argv[len(canonical) :])
+    assert remaining == claude_argv
 
 
 # --- --mcp-config / --settings の exactly-once + canonical path 一致（AC10） --
@@ -1101,7 +1148,9 @@ def test_normal_launch_wires_auto_mode_readback_before_main_invocation(tmp_path)
     assert any(argv[-2:] == ["auto-mode", "config"] for argv in auto_mode_calls)
     main_invocation = invocations[-1]
     canonical = _canonical_prefix(tmp_path)
-    assert main_invocation == canonical + ["-p", "hello"]
+    assert main_invocation[: len(canonical)] == canonical
+    remaining = _assert_agents_flag_wired(main_invocation[len(canonical) :])
+    assert remaining == ["-p", "hello"]
     assert "CLAUDE_GPT_AUTO_MODE_CHECK_PATH=" in result.stderr
 
 
@@ -1141,6 +1190,63 @@ def test_normal_launch_blocks_when_auto_mode_readback_fails(tmp_path):
     assert not any("-p" in argv for argv in invocations), (
         "claude 本体は readback 失敗後に一切起動されてはならない"
     )
+
+
+# --- Issue #2186 P0 fix-delta (PR #2244 adversarial review): runtime-smoke
+#     observation hooks must never displace the spark-codex authorization
+#     gate's PreToolUse(matcher: Agent) entry ----------------------------
+
+
+@pytest.mark.parametrize(
+    ("smoke_hooks_value", "extra_env"),
+    [
+        ("subagent-start-stop", {}),
+        ("hook-sink-multi-turn", {"CLAUDE_GPT_HOOK_SINK_NONCE": "nonce-fixture-hooksink"}),
+    ],
+)
+def test_runtime_smoke_hooks_never_drop_spark_authorization_gate(
+    tmp_path, smoke_hooks_value, extra_env
+):
+    """GIVEN CLAUDE_GPT_RUNTIME_SMOKE_HOOKS is set to either
+    ``subagent-start-stop`` or ``hook-sink-multi-turn``
+    WHEN launch.sh generates the launcher-owned ``--settings`` JSON
+    THEN ``hooks.PreToolUse`` still contains a ``matcher: "Agent"`` entry
+    whose command references ``SPARK_GATE_WRITER`` (Issue #2186 P0
+    fix-delta: prior to this fix, requesting runtime-smoke observation hooks
+    silently REPLACED the entire hooks fragment, dropping the spark-codex
+    explicit-only authorization gate's PreToolUse entry entirely -- which
+    left Claude Code's default-allow behavior in effect for any Agent tool
+    call while runtime-smoke observation was active).
+    """
+    result = _run_launch(
+        tmp_path,
+        ["-p", "hello"],
+        use_fakes=True,
+        extra_env={"CLAUDE_GPT_RUNTIME_SMOKE_HOOKS": smoke_hooks_value, **extra_env},
+    )
+    assert result.returncode == 0, result.stderr
+    settings_path = tmp_path / "claude-gpt-home" / "claude" / "settings.local.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    hooks = settings["hooks"]
+
+    pre_tool_use_groups = hooks["PreToolUse"]
+    agent_groups = [g for g in pre_tool_use_groups if g.get("matcher") == "Agent"]
+    assert agent_groups, f"no matcher=Agent PreToolUse group found: {pre_tool_use_groups!r}"
+    assert any(
+        "SPARK_GATE_WRITER" in h.get("command", "")
+        for g in agent_groups
+        for h in g.get("hooks", [])
+    ), f"matcher=Agent PreToolUse group missing SPARK_GATE_WRITER command: {agent_groups!r}"
+
+    # The gate's UserPromptSubmit/SubagentStart/SubagentStop entries must
+    # also survive alongside any observation-only sink commands.
+    for event in ("UserPromptSubmit", "SubagentStart", "SubagentStop"):
+        groups = hooks[event]
+        assert any(
+            "SPARK_GATE_WRITER" in h.get("command", "")
+            for g in groups
+            for h in g.get("hooks", [])
+        ), f"{event} missing SPARK_GATE_WRITER gate command: {groups!r}"
 
 
 if __name__ == "__main__":
