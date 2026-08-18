@@ -86,6 +86,7 @@ import importlib.metadata
 import io
 import json
 import os
+import pwd
 import re
 import shlex
 import stat
@@ -170,6 +171,23 @@ except ImportError:  # pragma: no cover - defensive fallback
 _IMPL_MAIN_DRIFT_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts"
 if str(_IMPL_MAIN_DRIFT_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_IMPL_MAIN_DRIFT_SCRIPTS_DIR))
+
+# Issue #2241 AC8 / PR #2247 review P1-1: an isolated Claude-GPT session
+# never receives the host's GH_TOKEN/GITHUB_TOKEN/GH_CONFIG_DIR (Issue #2232
+# comment 5316900237 root cause), so `gh issue view`/`gh api` cannot succeed
+# there. `github_credentialless_read.py` (scripts/agent-guards/) provides an
+# unauthenticated REST transport for that profile; imported best-effort so a
+# harness that only provisions this skill's own scripts/ directory keeps its
+# pre-existing behavior (falls through to the `gh` CLI path, which is the
+# only path in that case anyway since `_is_isolated_claude_gpt_profile()`
+# gates the credentialless branch, not this import).
+_AGENT_GUARDS_SCRIPTS_DIR = Path(__file__).resolve().parents[4] / "scripts" / "agent-guards"
+if str(_AGENT_GUARDS_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_GUARDS_SCRIPTS_DIR))
+try:
+    import github_credentialless_read as _credentialless_read
+except ImportError:  # pragma: no cover - defensive fallback
+    _credentialless_read = None
 try:
     # Issue #2102 fix_delta (iteration 5, Blocker A): mirrors
     # plan_refinement_loop.py's own best-effort import of the same symbol.
@@ -2922,8 +2940,58 @@ def _run_gh(argv: list[str], timeout: int = GH_API_TIMEOUT) -> tuple[dict | list
     return parsed, ""
 
 
+def _is_isolated_claude_gpt_profile() -> bool:
+    """Detect a Claude-GPT isolated session (Issue #2241 AC8).
+
+    `scripts/claude-gpt/launch.sh` deliberately overrides `HOME` (and
+    `GH_CONFIG_DIR`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`) to a fresh, empty
+    sandbox directory before spawning the isolated Claude child process --
+    it never forwards the host's real `GH_TOKEN`/`GITHUB_TOKEN`/
+    `GH_CONFIG_DIR` into that child (Issue #2232 comment 5316900237 root
+    cause), so `gh` has no credential to authenticate with there.
+
+    This reuses the exact divergence Issue #2241 AC1 already established as
+    the deterministic isolated-session signal for
+    `skill_runtime_exec.py::_os_account_home()`'s trust-root fix: the real
+    OS account home (resolved via the passwd database, never via `HOME`)
+    differs from the current `HOME` env var only inside that launcher's
+    sandbox -- never in a normal human/dev/CI shell, where `HOME` is left
+    at its OS-assigned value and therefore equals `pwd.getpwuid(...).pw_dir`.
+    """
+    current_home = os.environ.get("HOME")
+    if not current_home:
+        return False
+    try:
+        real_home = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        return False
+    return current_home != real_home
+
+
 def _fetch_issue(repo: str, issue_number: int) -> tuple[dict | None, str]:
-    """Fetch issue data via gh issue view --json."""
+    """Fetch issue data.
+
+    Isolated Claude-GPT profile (Issue #2241 AC8 / PR #2247 review P1-1):
+    uses the credentialless REST transport (`github_credentialless_read.py`)
+    exclusively -- never falls back to `gh issue view` in that profile, so a
+    `gh` executable that is unavailable/unauthenticated there never gets
+    invoked.
+
+    All other profiles (human/agent context with a working `gh` CLI):
+    unchanged `gh issue view --json` behavior.
+    """
+    if _is_isolated_claude_gpt_profile():
+        if _credentialless_read is None:
+            return None, "BLOCKER_CREDENTIALLESS_TRANSPORT_UNAVAILABLE: github_credentialless_read import failed"
+        try:
+            transport = _credentialless_read.CredentiallessGitHubReadTransport()
+            data = transport.read_issue(repo, issue_number)
+        except _credentialless_read.CredentiallessReadError as exc:
+            return None, f"credentialless_read_error: {exc}"
+        except Exception as exc:  # pragma: no cover - defensive fail-closed
+            return None, f"credentialless_read_unexpected_error: {exc}"
+        return data, ""
+
     data, err = _run_gh(
         [
             "gh",
@@ -2940,11 +3008,34 @@ def _fetch_issue(repo: str, issue_number: int) -> tuple[dict | None, str]:
 
 
 def _fetch_issue_comments(repo: str, issue_number: int) -> tuple[list | None, str]:
-    """Fetch all issue comments via gh api with --paginate --slurp.
+    """Fetch all issue comments.
+
+    Isolated Claude-GPT profile (Issue #2241 AC8 / PR #2247 review P1-1):
+    uses the credentialless REST transport's `list_issue_comments()`, which
+    follows `Link: rel="next"` pagination itself and returns the same
+    flat, `gh api`-shaped list this function has always returned -- never
+    falls back to `gh api --paginate --slurp` in that profile.
+
+    All other profiles (human/agent context with a working `gh` CLI):
+    unchanged `gh api --paginate --slurp` behavior.
 
     gh 2.88.1+ --slurp returns [[...page1...], [...page2...]] which must be
     flattened to a single list.  Single-page results are also wrapped as [[...]].
     """
+    if _is_isolated_claude_gpt_profile():
+        if _credentialless_read is None:
+            return None, "BLOCKER_CREDENTIALLESS_TRANSPORT_UNAVAILABLE: github_credentialless_read import failed"
+        try:
+            transport = _credentialless_read.CredentiallessGitHubReadTransport()
+            comments = transport.list_issue_comments(repo, issue_number)
+        except _credentialless_read.CredentiallessReadError as exc:
+            return None, f"credentialless_read_error: {exc}"
+        except Exception as exc:  # pragma: no cover - defensive fail-closed
+            return None, f"credentialless_read_unexpected_error: {exc}"
+        if not isinstance(comments, list):
+            return None, f"credentialless_comments_unexpected_type: {type(comments).__name__}"
+        return comments, ""
+
     try:
         from command_registry import render_command as _render_command
 
