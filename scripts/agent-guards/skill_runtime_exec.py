@@ -719,10 +719,105 @@ def _os_account_home() -> str:
     return pwd.getpwuid(os.getuid()).pw_dir
 
 
+def _validate_account_local_bin_trust(local_bin: Path, account_uid: int) -> bool:
+    """Validate `local_bin` (`<account_home>/.local/bin`) and its account-home
+    ancestors before treating it as a trust root (Issue #2241 / PR #2247
+    review P1-3).
+
+    NOT CONTROLLED: this is same-UID hardening, not a full trust boundary.
+    `local_bin` is, by construction, writable by the very Unix account this
+    executor process itself runs as (that is what makes it useful as a
+    per-account toolchain cache in the first place). An attacker who
+    already has arbitrary code execution as this account can create or
+    replace files under `local_bin` regardless of any check performed
+    here -- no ownership/permission/version check can distinguish
+    "the legitimate account installed `uv` here" from "an attacker running
+    as the same account planted a lookalike `uv` here". Closing that gap
+    would require a dedicated, launcher-owned, non-account-writable
+    toolchain directory (a real trust-boundary change), which is out of
+    scope for this Issue (see Issue #2241 "Out of Scope" /
+    PR #2247 review). What this function *does* defend against is the
+    narrower case where an ancestor directory is unexpectedly
+    group/world-writable (a different UID could plant something there) or
+    `local_bin` itself is a symlink redirecting the trust root elsewhere.
+    """
+    account_home = local_bin.parent.parent
+    dotlocal = local_bin.parent
+    for candidate in (account_home, dotlocal, local_bin):
+        try:
+            st = candidate.lstat()
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode):
+            # `local_bin` (or an ancestor) being a symlink means the actual
+            # trust root is whatever it resolves to -- validate the
+            # resolved target's ownership/writability too, not just the
+            # symlink entry itself.
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                return False
+            try:
+                real_st = resolved.stat()
+            except OSError:
+                return False
+            if real_st.st_uid != account_uid:
+                return False
+            if real_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                return False
+            if candidate == local_bin and not resolved.is_dir():
+                return False
+            continue
+        if st.st_uid != account_uid:
+            return False
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return False
+        if candidate == local_bin and not stat.S_ISDIR(st.st_mode):
+            return False
+    return True
+
+
+# Executable-name -> expected `<exe> --version` stdout pattern. Used as a
+# cheap defense-in-depth "version 照合" for executables resolved from the
+# account-writable `.local/bin` trust root (Issue #2241 / PR #2247 review
+# P1-3). This does not add a real trust boundary on its own (see
+# `_validate_account_local_bin_trust` docstring), but it does reject an
+# executable that was replaced with something that does not even look like
+# the expected tool (e.g. a shell script that never emits a `uv`-shaped
+# version banner).
+_TOOL_VERSION_OUTPUT_RE: dict[str, re.Pattern[str]] = {
+    "uv": re.compile(r"^uv \d+\.\d+\.\d+"),
+}
+
+
+def _validate_local_bin_executable_version(name: str, resolved: str) -> bool:
+    pattern = _TOOL_VERSION_OUTPUT_RE.get(name)
+    if pattern is None:
+        # No known pattern registered for this executable name -- nothing
+        # to compare against, so this check is inapplicable rather than a
+        # rejection (avoids hard-coding every possible trusted executable
+        # name here; the ownership/writability checks above remain the
+        # primary defense).
+        return True
+    try:
+        proc = subprocess.run(
+            [resolved, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return bool(pattern.match((proc.stdout or "").strip()))
+
+
 def _safe_path_entries() -> list[str]:
     account_home = _os_account_home()
+    account_uid = os.getuid()
+    local_bin = Path(account_home) / ".local" / "bin"
     entries = [
-        str(Path(account_home) / ".local" / "bin"),
+        *([str(local_bin)] if _validate_account_local_bin_trust(local_bin, account_uid) else []),
         *_trusted_toolchain_dirs("uv"),
         "/usr/local/sbin",
         "/usr/local/bin",
@@ -883,6 +978,16 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     runtime_dir = os.path.realpath(str(Path(sys.executable).resolve().parent))
     if real_parent not in allowed_dirs and real_parent != runtime_dir:
         raise RuntimeError(f"{name}_outside_trusted_path")
+    if name != "python3":
+        # Issue #2241 / PR #2247 review P1-3(c): a resolution that came from
+        # the account-writable `.local/bin` trust root (i.e. not one of the
+        # strongly-validated hostedtoolcache dirs) gets an additional
+        # "version 照合" defense-in-depth check -- see
+        # `_validate_local_bin_executable_version` docstring for why this
+        # is a confirmation, not a trust boundary, on its own.
+        hosted_dirs = {os.path.realpath(entry) for entry in _trusted_toolchain_dirs(name)}
+        if real_parent not in hosted_dirs and not _validate_local_bin_executable_version(name, real):
+            raise RuntimeError(f"{name}_version_mismatch")
     return resolved if name == "python3" else real
 
 

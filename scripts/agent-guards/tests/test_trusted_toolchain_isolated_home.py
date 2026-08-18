@@ -9,8 +9,11 @@ still block once the trust root is generalized to
 
 from __future__ import annotations
 
+import json
 import os
+import pwd
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -181,3 +184,148 @@ def test_trusted_toolchain_dirs_rejects_non_root_non_account_ownership(tmp_path,
     monkeypatch.setattr(exec_mod.os, "stat", _fake_stat)
 
     assert exec_mod._trusted_toolchain_dirs("uv") == []
+
+
+# ---------------------------------------------------------------------------
+# PR #2247 review P1-3: `~/.local/bin` is writable by the very account this
+# executor process runs as. These tests document the same-UID hardening
+# implemented in `_validate_account_local_bin_trust` -- ancestor
+# ownership/writability/symlink checks -- while making explicit (via the
+# NOT CONTROLLED docstring on that function) that a same-UID attacker who
+# already has arbitrary code execution is still not fully excluded by this
+# check. See PR #2247 body "Not controlled" section.
+# ---------------------------------------------------------------------------
+
+
+def _fake_account_home(monkeypatch, home: Path) -> None:
+    fake_pw_entry = pwd.struct_passwd((
+        "issue-2241-account", "x", os.getuid(), os.getgid(), "", str(home), "/bin/sh",
+    ))
+    monkeypatch.setattr(exec_mod.pwd, "getpwuid", lambda _uid: fake_pw_entry)
+
+
+def test_account_local_bin_regular_file_marker_is_rejected(monkeypatch, tmp_path):
+    """GIVEN `<account_home>/.local/bin` exists but is a regular file (not a
+    directory) instead of the expected toolchain cache directory
+    WHEN `_safe_path_entries` is called
+    THEN that path is never trusted (Issue #2241 / PR #2247 P1-3,
+    documents pre-existing expected behavior)."""
+    home = tmp_path / "account-home"
+    (home / ".local").mkdir(parents=True)
+    (home / ".local" / "bin").write_text("not a directory\n", encoding="utf-8")
+    _fake_account_home(monkeypatch, home)
+
+    entries = exec_mod._safe_path_entries()
+
+    assert str(home / ".local" / "bin") not in entries
+
+
+def test_account_local_bin_symlink_directory_is_rejected(monkeypatch, tmp_path):
+    """GIVEN `<account_home>/.local/bin` is a symlink to a directory that is
+    world-writable
+    WHEN `_safe_path_entries` is called
+    THEN the symlinked trust root is rejected -- symlink targets are
+    validated, not implicitly trusted (Issue #2241 / PR #2247 P1-3(b))."""
+    home = tmp_path / "account-home"
+    (home / ".local").mkdir(parents=True)
+    evil_target = tmp_path / "world-writable-target"
+    evil_target.mkdir()
+    evil_target.chmod(0o777)
+    (home / ".local" / "bin").symlink_to(evil_target, target_is_directory=True)
+    _fake_account_home(monkeypatch, home)
+
+    entries = exec_mod._safe_path_entries()
+
+    assert str(home / ".local" / "bin") not in entries
+
+
+def test_group_writable_toolchain_ancestor_is_rejected(monkeypatch, tmp_path):
+    """GIVEN the `.local` ancestor directory is group-writable
+    WHEN `_safe_path_entries` is called
+    THEN `.local/bin` is not trusted (Issue #2241 / PR #2247 P1-3(a))."""
+    home = tmp_path / "account-home"
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    dotlocal = home / ".local"
+    dotlocal.chmod(dotlocal.stat().st_mode | stat.S_IWGRP)
+    _fake_account_home(monkeypatch, home)
+
+    entries = exec_mod._safe_path_entries()
+
+    assert str(local_bin) not in entries
+
+
+def test_world_writable_toolchain_ancestor_is_rejected(monkeypatch, tmp_path):
+    """GIVEN the account-home ancestor directory is world-writable
+    WHEN `_safe_path_entries` is called
+    THEN `.local/bin` is not trusted (Issue #2241 / PR #2247 P1-3(a))."""
+    home = tmp_path / "account-home"
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    home.chmod(home.stat().st_mode | stat.S_IWOTH)
+    _fake_account_home(monkeypatch, home)
+
+    entries = exec_mod._safe_path_entries()
+
+    assert str(local_bin) not in entries
+
+
+# ---------------------------------------------------------------------------
+# PR #2247 review P1-4.3: `_sanitize_env` must be proven against a real
+# child process's actual environment/stdout/stderr/artifact, not just an
+# in-process dict comparison. The existing in-process assertions on
+# `_sanitize_env`'s return value are kept elsewhere; this test adds the
+# missing black-box layer.
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_env_secret_canary_never_reaches_real_child_process(monkeypatch, tmp_path):
+    """GIVEN a secret canary embedded only in a fake host `GH_CONFIG_DIR`
+    (its env var value AND its on-disk `hosts.yml` content -- the thing an
+    isolated Claude-GPT session's launcher must never forward, per Issue
+    #2241 AC2 / #2232 comment 5316900237)
+    WHEN `_sanitize_env` builds a child environment for the default
+    (non-fixture) command lane, and that environment is used to spawn a
+    REAL child process (not an in-process mock)
+    THEN the canary never appears in the child's own reported environment
+    snapshot, the child's stdout, the child's stderr, or any artifact file
+    the child writes -- `_sanitize_env` unconditionally drops the
+    `GH_CONFIG_DIR` key itself for this command lane, so its value (the
+    canary-bearing directory path) cannot leak even though `GH_TOKEN` is
+    intentionally allowlisted for lanes that need authenticated `gh` calls
+    (Issue #2241 AC2, PR #2247 review P1-4.3)."""
+    canary = "CANARY-SECRET-6f3c9b2a-2247"
+    fake_gh_config_dir = tmp_path / "fake-gh-config-with-canary" / canary
+    fake_gh_config_dir.mkdir(parents=True)
+    (fake_gh_config_dir / "hosts.yml").write_text(f"canary: {canary}\n", encoding="utf-8")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(fake_gh_config_dir))
+
+    child_env = exec_mod._sanitize_env(str(REPO_ROOT))
+    # Non-fixture command lane: `GH_CONFIG_DIR` is dropped outright, so its
+    # canary-bearing path value cannot appear anywhere downstream.
+    assert "GH_CONFIG_DIR" not in child_env
+    assert canary not in json.dumps(child_env)
+
+    artifact_path = tmp_path / "child-artifact.txt"
+    probe_script = (
+        "import json, os, sys\n"
+        "env_snapshot = dict(os.environ)\n"
+        "sys.stdout.write(json.dumps(env_snapshot))\n"
+        f"open({str(artifact_path)!r}, 'w').write(json.dumps(env_snapshot))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe_script],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+
+    assert canary not in result.stdout
+    assert canary not in result.stderr
+    child_reported_env = json.loads(result.stdout)
+    assert canary not in json.dumps(child_reported_env)
+    assert "GH_CONFIG_DIR" not in child_reported_env
+    artifact_text = artifact_path.read_text(encoding="utf-8")
+    assert canary not in artifact_text
