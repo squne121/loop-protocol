@@ -1,0 +1,30 @@
+{
+  "run_identity": {
+    "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+    "generated_at": "2026-08-20T00:00:00Z",
+    "runtime_version": "agent-retrospective/0.1.0",
+    "source_set_digest": "27ddc85a3c6f8611a373d0d9aa9dfc7b223221f8beaffe72b95e0ad0104e7f6c"
+  },
+  "source_observations": [
+    {
+      "source_type": "repository",
+      "pagination_completeness": "complete"
+    },
+    {
+      "source_type": "github",
+      "observed_from": "2026-08-19T00:00:00Z",
+      "observed_until": "2026-08-20T00:00:00Z",
+      "fetch_started_at": "2026-08-20T00:00:00Z",
+      "fetch_completed_at": "2026-08-20T00:05:00Z",
+      "resource_updated_at_min": "2026-08-19T01:00:00Z",
+      "resource_updated_at_max": "2026-08-19T23:00:00Z",
+      "pagination_completeness": "complete",
+      "cursor": "cursor-final",
+      "etag": "W/\"abc123\"",
+      "endpoint": "https://api.github.com/repos/squne121/loop-protocol/issues",
+      "api_version": "2022-11-28",
+      "query_params": { "state": "all" },
+      "page_size": 100
+    }
+  ]
+}
