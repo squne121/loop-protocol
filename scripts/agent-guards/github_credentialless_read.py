@@ -110,10 +110,22 @@ class MalformedResponseBody(CredentiallessReadError):
 
 
 class RateLimitedRejected(CredentiallessReadError):
-    """Raised on HTTP 403/429 (anonymous rate limit exhausted or abuse
-    detection). Distinguished from `UnexpectedAuthenticationDependency` and
-    `CanonicalResourceMissing` so callers can tell "try again later" apart
-    from "this read structurally cannot succeed" (PR #2247 review P1-4.1)."""
+    """Raised on HTTP 429, or HTTP 403 when safe response-header metadata
+    (`x-ratelimit-remaining: 0`, or a `Retry-After` header indicating
+    GitHub's secondary/abuse-detection rate limit) actually indicates a rate
+    limit condition. Distinguished from `UnexpectedAuthenticationDependency`
+    and `CanonicalResourceMissing` so callers can tell "try again later"
+    apart from "this read structurally cannot succeed" (PR #2247 review
+    P1-4.1). Issue #2257 AC9: a bare 403 with no such header evidence is
+    `ForbiddenRejected`, not this class -- 403 alone is not a sufficient
+    condition for "rate limited"."""
+
+
+class ForbiddenRejected(CredentiallessReadError):
+    """Raised on HTTP 403 when safe response-header metadata does not
+    indicate a rate limit condition (Issue #2257 AC9). A conservative,
+    non-rate-limit classification: the response body is never consulted to
+    make this determination."""
 
 
 class UnexpectedAuthenticationDependency(CredentiallessReadError):
@@ -206,14 +218,19 @@ _opener = urllib.request.build_opener(_RedirectRejectingHandler)
 
 def _classify_http_error(exc: urllib.error.HTTPError) -> Exception:
     """Map an `HTTPError` status code to the specific exception class
-    callers should see (PR #2247 review P1-4.1).
+    callers should see (PR #2247 review P1-4.1; refined by Issue #2257 AC9).
 
     401 -> UnexpectedAuthenticationDependency (a public GET should never
            need auth)
-    403, 429 -> RateLimitedRejected (anonymous rate limit / abuse
-           detection -- also covers GitHub's documented behavior of
-           returning 403 rather than 429 for the unauthenticated REST rate
-           limit)
+    429 -> RateLimitedRejected unconditionally (GitHub's unambiguous "Too
+           Many Requests" status).
+    403 -> RateLimitedRejected ONLY when safe response-header metadata
+           actually indicates a rate limit: `x-ratelimit-remaining: 0`
+           (primary rate limit) or a `Retry-After` header (secondary /
+           abuse-detection rate limit). A bare 403 with neither header is
+           `ForbiddenRejected` -- 403 alone is never treated as sufficient
+           evidence of rate limiting (Issue #2257 AC9; the response body is
+           never consulted for this decision).
     404 -> CanonicalResourceMissing
     5xx -> UpstreamEnvironmentFailure
     anything else -> the original HTTPError, unmodified
@@ -221,8 +238,17 @@ def _classify_http_error(exc: urllib.error.HTTPError) -> Exception:
     status = exc.code
     if status == 401:
         return UnexpectedAuthenticationDependency(f"unexpected_authentication_dependency:{status}")
-    if status in (403, 429):
+    if status == 429:
         return RateLimitedRejected(f"rate_limited:{status}")
+    if status == 403:
+        headers = exc.headers
+        remaining = headers.get("x-ratelimit-remaining") if headers is not None else None
+        if remaining == "0":
+            return RateLimitedRejected("rate_limited:403_primary_ratelimit_exhausted")
+        retry_after = headers.get("Retry-After") if headers is not None else None
+        if retry_after:
+            return RateLimitedRejected("rate_limited:403_secondary_ratelimit")
+        return ForbiddenRejected("http_403_forbidden")
     if status == 404:
         return CanonicalResourceMissing(f"canonical_resource_missing:{status}")
     if 500 <= status < 600:
@@ -253,6 +279,13 @@ def _credentialless_get(url: str, *, timeout: float = 15.0) -> dict:
     """
     data, _next_url = _credentialless_get_page(url, timeout=timeout)
     return data
+
+
+# Matches `rel="next"` anywhere in a `Link` header, independent of whether
+# the URL portion parses (Issue #2257 AC7(b)): used to distinguish "no next
+# page" (no `rel="next"` token at all) from "a `rel="next"` token is present
+# but the header is malformed" (must reject, not silently stop pagination).
+_LINK_REL_NEXT_PRESENT_RE = re.compile(r'rel="next"')
 
 
 def _credentialless_get_page(url: str, *, timeout: float = 15.0) -> tuple[object, "str | None"]:
@@ -286,27 +319,50 @@ def _credentialless_get_page(url: str, *, timeout: float = 15.0) -> tuple[object
         raise TransportConnectivityFailure(f"transport_connectivity_failure:{reason_cls}") from exc
     try:
         data = json.loads(raw)
+    except UnicodeDecodeError as exc:
+        # Issue #2257 P0-4: a response body that decoded to bytes but is not
+        # valid text in the encoding `json.loads` inferred is a malformed
+        # response, not a JSON syntax error -- kept in the same closed
+        # exception class (`MalformedResponseBody`) with a distinct reason
+        # code so callers can still tell the two apart if needed.
+        raise MalformedResponseBody("malformed_response_body:invalid_encoding") from exc
     except json.JSONDecodeError as exc:
         raise MalformedResponseBody("malformed_response_body:invalid_json") from exc
     next_match = _LINK_NEXT_RE.search(link_header or "")
-    next_url = next_match.group(1) if next_match else None
-    if next_url is not None:
-        _validate_pagination_target(next_url)
+    if next_match is None:
+        if _LINK_REL_NEXT_PRESENT_RE.search(link_header or ""):
+            # Issue #2257 AC7(b): a `rel="next"` token exists but the URL
+            # portion of the Link header did not parse -- reject rather than
+            # silently treating this as "no more pages" (which would
+            # truncate pagination without any signal).
+            raise MalformedResponseBody("malformed_response_body:malformed_link_header")
+        return data, None
+    next_url = next_match.group(1)
     return data, next_url
 
 
-def _validate_pagination_target(url: str) -> None:
+def _validate_pagination_target(url: str, *, repo: str, issue_number: int) -> None:
     """Re-validate a `Link: rel="next"` URL before it is followed
-    (PR #2247 review P1-2 defense-in-depth): pagination is a second,
-    server-supplied URL this module did not construct itself, so it gets
-    the same host/scheme trust check as the redirect handler applies to
-    redirects, rather than being followed unconditionally."""
+    (PR #2247 review P1-2 defense-in-depth, hardened by Issue #2257 AC7/P1-5):
+    pagination is a second, server-supplied URL this module did not
+    construct itself, so it gets the same host/scheme trust check as the
+    redirect handler applies to redirects, PLUS a check that the URL still
+    targets the exact same repository/issue/endpoint this call started with
+    -- a same-host Link header pointing at a different repository, a
+    different issue, or a different REST endpoint entirely (e.g. a crafted
+    response trying to redirect comment pagination onto an unrelated
+    resource) is rejected rather than followed unconditionally."""
     parsed_scheme, _, rest = url.partition("://")
     if parsed_scheme != "https":
         raise CrossRepositoryReadRejected(f"pagination_scheme_rejected:{url!r}")
-    host = rest.split("/", 1)[0].split("@")[-1].split(":")[0]
+    host_and_path = rest.split("?", 1)[0]
+    host = host_and_path.split("/", 1)[0].split("@")[-1].split(":")[0]
     if host != _TRUSTED_API_HOST:
         raise CrossRepositoryReadRejected(f"pagination_host_rejected:{url!r}")
+    path = "/" + host_and_path.split("/", 1)[1] if "/" in host_and_path else ""
+    expected_prefix = f"/repos/{repo}/issues/{issue_number}/comments"
+    if not path.startswith(expected_prefix):
+        raise CrossRepositoryReadRejected(f"pagination_endpoint_rejected:{url!r}")
 
 
 def read_public_issue(issue_number: int, repo: str = TRUSTED_REPO_SLUG) -> dict:
@@ -374,16 +430,47 @@ def list_issue_comments(issue_number: int, repo: str = TRUSTED_REPO_SLUG, *, per
     if not isinstance(per_page, int) or not (1 <= per_page <= 100):
         raise CredentiallessReadError(f"invalid_per_page:{per_page!r}")
     comments: list[dict] = []
+    seen_comment_ids: set[object] = set()
     url = f"{GITHUB_API_BASE}/repos/{repo}/issues/{issue_number}/comments?per_page={per_page}"
     seen_urls: set[str] = set()
+    page_count = 0
+    # Issue #2257 AC7: an unbounded loop bounded only by cycle detection is
+    # still a denial-of-service surface if a malicious/misbehaving server
+    # returns a `Link: rel="next"` chain that never repeats a URL and never
+    # progresses -- cap the number of pages this function will ever follow
+    # for a single call, independent of cycle detection.
+    max_pages = 1000
     while url:
         if url in seen_urls:
             raise CredentiallessReadError(f"pagination_cycle_detected:{url!r}")
         seen_urls.add(url)
-        page, url = _credentialless_get_page(url)
+        page_count += 1
+        if page_count > max_pages:
+            raise CredentiallessReadError(f"pagination_page_limit_exceeded:{max_pages}")
+        page, next_url = _credentialless_get_page(url)
         if not isinstance(page, list):
             raise CredentiallessReadError(f"unexpected_comments_page_type:{type(page).__name__}")
-        comments.extend(page)
+        if next_url is not None:
+            _validate_pagination_target(next_url, repo=repo, issue_number=issue_number)
+            if next_url == url:
+                # Issue #2257 AC7(d): the server-advertised "next" page is
+                # identical to the page just fetched -- pagination is not
+                # progressing. Reject rather than looping forever (cycle
+                # detection above only catches a URL seen on an EARLIER
+                # iteration, not immediate non-progression on the first
+                # repeat).
+                raise CredentiallessReadError(f"pagination_non_progressing:{next_url!r}")
+        for item in page:
+            comment_id = item.get("id") if isinstance(item, dict) else None
+            if comment_id is not None:
+                if comment_id in seen_comment_ids:
+                    # Issue #2257 AC7(e): dedupe by comment id -- a
+                    # misbehaving/overlapping pagination response must not
+                    # produce duplicate comments in the traversal result.
+                    continue
+                seen_comment_ids.add(comment_id)
+            comments.append(item)
+        url = next_url
     return comments
 
 
@@ -412,16 +499,26 @@ def issue_to_gh_cli_shape(raw_issue: dict) -> dict:
 
 
 class GitHubReadTransport(Protocol):
-    """Transport-selector interface (PR #2247 review P1-1): a caller that
-    needs to fetch an Issue and its comments without caring whether the
-    underlying transport is `gh` (authenticated) or this credentialless
-    module can depend on this Protocol instead of importing either
-    transport module directly."""
+    """Transport-selector interface (PR #2247 review P1-1; extended by
+    Issue #2257 P0-1): a caller that needs to fetch an Issue, its comments,
+    and (only when a fresh single-comment readback is explicitly required,
+    e.g. TOCTOU verification around a trusted-anchor contract update)
+    an individual comment, without caring whether the underlying transport
+    is `gh` (authenticated) or this credentialless module, can depend on
+    this Protocol instead of importing either transport module directly.
+    A single instance of an implementation of this Protocol must be
+    selected once per invocation and threaded through every read on that
+    invocation's critical path -- no call site may re-select or
+    re-instantiate a transport independently (Issue #2257 single-authority
+    contract)."""
 
     def read_issue(self, repo: str, issue_number: int) -> dict:
         ...
 
     def list_issue_comments(self, repo: str, issue_number: int) -> list[dict]:
+        ...
+
+    def read_issue_comment(self, repo: str, comment_id: int) -> dict:
         ...
 
 
@@ -429,14 +526,18 @@ class CredentiallessGitHubReadTransport:
     """`GitHubReadTransport` implementation backed entirely by this
     module's unauthenticated REST GET functions. Returns the `gh` CLI
     field-name shape for `read_issue` (via `issue_to_gh_cli_shape`) and the
-    raw REST shape for `list_issue_comments` (already `gh api`-shaped) so a
-    caller written against `gh`-shaped data needs no other changes."""
+    raw REST shape for `list_issue_comments`/`read_issue_comment` (already
+    `gh api`-shaped) so a caller written against `gh`-shaped data needs no
+    other changes."""
 
     def read_issue(self, repo: str, issue_number: int) -> dict:
         return issue_to_gh_cli_shape(read_public_issue(issue_number, repo=repo))
 
     def list_issue_comments(self, repo: str, issue_number: int) -> list[dict]:
         return list_issue_comments(issue_number, repo=repo)
+
+    def read_issue_comment(self, repo: str, comment_id: int) -> dict:
+        return read_single_comment(comment_id, repo=repo)
 
 
 __all__ = [
@@ -447,6 +548,7 @@ __all__ = [
     "InvalidIssueNumberRejected",
     "InvalidCommentIdRejected",
     "RateLimitedRejected",
+    "ForbiddenRejected",
     "UnexpectedAuthenticationDependency",
     "CanonicalResourceMissing",
     "UpstreamEnvironmentFailure",

@@ -308,16 +308,19 @@ def test_redirect_301_transferred_issue_is_rejected_end_to_end(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _http_error(status: int) -> urllib.error.HTTPError:
+def _http_error(status: int, headers: dict | None = None) -> urllib.error.HTTPError:
     return urllib.error.HTTPError(
         "https://api.github.com/repos/squne121/loop-protocol/issues/1",
-        status, "err", {}, io.BytesIO(b""),
+        status, "err", headers or {}, io.BytesIO(b""),
     )
 
 
 @pytest.mark.parametrize("status,expected_cls", [
     (401, gcr.UnexpectedAuthenticationDependency),
-    (403, gcr.RateLimitedRejected),
+    # Issue #2257 AC9: a bare 403 with no rate-limit header evidence is
+    # `ForbiddenRejected`, NOT `RateLimitedRejected` -- 403 alone is not
+    # sufficient evidence of rate limiting.
+    (403, gcr.ForbiddenRejected),
     (429, gcr.RateLimitedRejected),
     (404, gcr.CanonicalResourceMissing),
     (500, gcr.UpstreamEnvironmentFailure),
@@ -327,7 +330,8 @@ def test_http_error_status_is_classified_not_hidden(monkeypatch, status, expecte
     """GIVEN the opener raises `HTTPError` for a given status
     WHEN `read_public_issue` calls through `_credentialless_get`
     THEN the specific, distinguishable exception class is raised -- never a
-    blanket `pytest.skip`-worthy `OSError` (PR #2247 review P1-4.1)."""
+    blanket `pytest.skip`-worthy `OSError` (PR #2247 review P1-4.1; 403
+    header-aware classification per Issue #2257 AC9)."""
 
     def _fake_open(request, timeout=None):
         raise _http_error(status)
@@ -335,6 +339,53 @@ def test_http_error_status_is_classified_not_hidden(monkeypatch, status, expecte
     monkeypatch.setattr(gcr._opener, "open", _fake_open)
 
     with pytest.raises(expected_cls):
+        gcr.read_public_issue(1)
+
+
+def test_403_with_zero_remaining_header_is_primary_rate_limit(monkeypatch):
+    """GIVEN the opener raises `HTTPError(403)` WITH `x-ratelimit-remaining:
+    0` in the response headers
+    WHEN `read_public_issue` calls through `_credentialless_get`
+    THEN `RateLimitedRejected` is raised -- safe header metadata is
+    sufficient evidence of a primary rate limit (Issue #2257 AC9)."""
+
+    def _fake_open(request, timeout=None):
+        raise _http_error(403, headers={"x-ratelimit-remaining": "0"})
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.RateLimitedRejected):
+        gcr.read_public_issue(1)
+
+
+def test_403_with_retry_after_header_is_secondary_rate_limit(monkeypatch):
+    """GIVEN the opener raises `HTTPError(403)` WITH a `Retry-After` header
+    (GitHub's secondary/abuse-detection rate limit signal)
+    WHEN `read_public_issue` calls through `_credentialless_get`
+    THEN `RateLimitedRejected` is raised (Issue #2257 AC9)."""
+
+    def _fake_open(request, timeout=None):
+        raise _http_error(403, headers={"Retry-After": "60"})
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.RateLimitedRejected):
+        gcr.read_public_issue(1)
+
+
+def test_403_without_any_ratelimit_header_evidence_is_forbidden_not_ratelimited(monkeypatch):
+    """GIVEN the opener raises `HTTPError(403)` with no rate-limit-related
+    headers at all
+    WHEN `read_public_issue` calls through `_credentialless_get`
+    THEN `ForbiddenRejected` is raised, and the response body is never
+    consulted to make this determination (Issue #2257 AC9)."""
+
+    def _fake_open(request, timeout=None):
+        raise _http_error(403, headers={"X-Unrelated": "1"})
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.ForbiddenRejected):
         gcr.read_public_issue(1)
 
 
@@ -456,7 +507,7 @@ def test_read_single_comment_rejects_cross_repository_and_invalid_comment_id():
 
 @pytest.mark.parametrize("status,expected_cls", [
     (401, gcr.UnexpectedAuthenticationDependency),
-    (403, gcr.RateLimitedRejected),
+    (403, gcr.ForbiddenRejected),
     (404, gcr.CanonicalResourceMissing),
     (429, gcr.RateLimitedRejected),
     (500, gcr.UpstreamEnvironmentFailure),
@@ -467,7 +518,8 @@ def test_read_single_comment_http_error_status_is_classified(monkeypatch, status
     resolving a single comment
     WHEN `read_single_comment` is called
     THEN the specific, distinguishable exception class is raised (Issue
-    #2257 AC7 fault-injection matrix: 401/403/404/429/5xx)."""
+    #2257 AC7 fault-injection matrix: 401/403/404/429/5xx; 403 header-aware
+    classification per AC9)."""
 
     def _fake_open(request, timeout=None):
         raise _http_error(status)
@@ -572,3 +624,156 @@ def test_list_issue_comments_non_list_page_is_rejected(monkeypatch):
 
     with pytest.raises(gcr.CredentiallessReadError):
         gcr.list_issue_comments(1)
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #2257 AC7 negative controls (a)-(e): pagination hardening beyond
+# host/scheme trust -- same-host-but-wrong-target, malformed Link header,
+# a true multi-hop cycle, immediate non-progression, and duplicate comment
+# id dedupe.
+# ---------------------------------------------------------------------------
+
+
+def test_list_issue_comments_rejects_same_host_link_to_different_issue(monkeypatch):
+    """AC7(a): GIVEN a `Link: rel="next"` header that is same-host/same-scheme
+    but points at a DIFFERENT issue number's comments endpoint
+    WHEN `list_issue_comments` follows pagination
+    THEN it is rejected (`CrossRepositoryReadRejected`) -- host/scheme trust
+    alone is not sufficient; the endpoint identity must also match."""
+    page_1_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1/comments?per_page=100"
+    wrong_issue_url = "https://api.github.com/repos/squne121/loop-protocol/issues/999/comments?per_page=100&page=2"
+
+    def _fake_open(request, timeout=None):
+        if request.full_url == page_1_url:
+            return _FakeResponse(b'[{"id": 1}]', headers={"Link": f'<{wrong_issue_url}>; rel="next"'})
+        raise AssertionError(f"unexpected follow-through to {request.full_url!r}")
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.CrossRepositoryReadRejected):
+        gcr.list_issue_comments(1)
+
+
+def test_list_issue_comments_rejects_same_host_link_to_different_repo(monkeypatch):
+    """AC7(a): GIVEN a `Link: rel="next"` header that is same-host but points
+    at a different repository's comments endpoint
+    WHEN `list_issue_comments` follows pagination
+    THEN it is rejected (`CrossRepositoryReadRejected`)."""
+    page_1_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1/comments?per_page=100"
+    wrong_repo_url = "https://api.github.com/repos/attacker-org/other-repo/issues/1/comments?per_page=100&page=2"
+
+    def _fake_open(request, timeout=None):
+        if request.full_url == page_1_url:
+            return _FakeResponse(b'[{"id": 1}]', headers={"Link": f'<{wrong_repo_url}>; rel="next"'})
+        raise AssertionError(f"unexpected follow-through to {request.full_url!r}")
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.CrossRepositoryReadRejected):
+        gcr.list_issue_comments(1)
+
+
+def test_list_issue_comments_rejects_same_host_link_to_different_endpoint(monkeypatch):
+    """AC7(a): GIVEN a `Link: rel="next"` header that is same-host/same-repo
+    but points at a DIFFERENT REST endpoint entirely (not the comments
+    listing)
+    WHEN `list_issue_comments` follows pagination
+    THEN it is rejected (`CrossRepositoryReadRejected`)."""
+    page_1_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1/comments?per_page=100"
+    wrong_endpoint_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1?page=2"
+
+    def _fake_open(request, timeout=None):
+        if request.full_url == page_1_url:
+            return _FakeResponse(b'[{"id": 1}]', headers={"Link": f'<{wrong_endpoint_url}>; rel="next"'})
+        raise AssertionError(f"unexpected follow-through to {request.full_url!r}")
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.CrossRepositoryReadRejected):
+        gcr.list_issue_comments(1)
+
+
+def test_list_issue_comments_rejects_malformed_link_header(monkeypatch):
+    """AC7(b): GIVEN a `Link` header that contains a `rel="next"` token but
+    whose URL portion does not parse
+    WHEN `list_issue_comments` follows pagination
+    THEN it is rejected (`MalformedResponseBody`) rather than silently
+    treated as "no more pages" (which would truncate the traversal without
+    any signal)."""
+    page_1_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1/comments?per_page=100"
+
+    def _fake_open(request, timeout=None):
+        assert request.full_url == page_1_url
+        # `rel="next"` present, but no well-formed `<url>` token precedes it.
+        return _FakeResponse(b'[{"id": 1}]', headers={"Link": 'rel="next", garbage'})
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.MalformedResponseBody):
+        gcr.list_issue_comments(1)
+
+
+def test_list_issue_comments_detects_true_multi_hop_cycle(monkeypatch):
+    """AC7(c): GIVEN a `Link: rel="next"` chain that returns to page 1 only
+    after visiting page 2 (a true multi-hop cycle, not an immediate
+    non-progression)
+    WHEN `list_issue_comments` follows pagination
+    THEN it fails closed with `CredentiallessReadError`."""
+    page_1_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1/comments?per_page=100"
+    page_2_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1/comments?per_page=100&page=2"
+
+    def _fake_open(request, timeout=None):
+        if request.full_url == page_1_url:
+            return _FakeResponse(b'[{"id": 1}]', headers={"Link": f'<{page_2_url}>; rel="next"'})
+        if request.full_url == page_2_url:
+            return _FakeResponse(b'[{"id": 2}]', headers={"Link": f'<{page_1_url}>; rel="next"'})
+        raise AssertionError(f"unexpected url {request.full_url!r}")
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.CredentiallessReadError):
+        gcr.list_issue_comments(1)
+
+
+def test_list_issue_comments_rejects_immediately_non_progressing_page(monkeypatch):
+    """AC7(d): GIVEN a `Link: rel="next"` header on page 1 that points at
+    page 1 itself (not merely a later-seen URL, but the URL just fetched)
+    WHEN `list_issue_comments` follows pagination
+    THEN it fails closed with `CredentiallessReadError` on the very first
+    non-progression, without requiring a second full loop iteration."""
+    page_1_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1/comments?per_page=100"
+
+    def _fake_open(request, timeout=None):
+        assert request.full_url == page_1_url
+        return _FakeResponse(b'[{"id": 1}]', headers={"Link": f'<{page_1_url}>; rel="next"'})
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.CredentiallessReadError):
+        gcr.list_issue_comments(1)
+
+
+def test_list_issue_comments_dedupes_duplicate_comment_ids_across_pages(monkeypatch):
+    """AC7(e): GIVEN two pages whose comment lists overlap on a shared
+    comment id
+    WHEN `list_issue_comments` follows pagination
+    THEN the duplicate id appears only once in the returned traversal."""
+    page_1_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1/comments?per_page=100"
+    page_2_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1/comments?per_page=100&page=2"
+
+    def _fake_open(request, timeout=None):
+        if request.full_url == page_1_url:
+            return _FakeResponse(
+                b'[{"id": 1}, {"id": 2}]',
+                headers={"Link": f'<{page_2_url}>; rel="next"'},
+            )
+        assert request.full_url == page_2_url
+        # comment id 2 overlaps with the last item of page 1.
+        return _FakeResponse(b'[{"id": 2}, {"id": 3}]', headers={})
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    comments = gcr.list_issue_comments(1)
+
+    assert [c["id"] for c in comments] == [1, 2, 3]

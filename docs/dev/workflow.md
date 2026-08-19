@@ -404,17 +404,47 @@ fresh isolated session から実証しなければならない**（Availability 
 
 Issue #2241 / PR #2247 の実装範囲では、以下は意図的に「未解決」として明記する（過大な安全主張を避けるため）:
 
-- **credentialless GitHub read の production preflight への配線（解決済み）**: `scripts/agent-guards/github_credentialless_read.py`
+- **credentialless GitHub read の production preflight への配線（部分的に解決・残課題あり）**: `scripts/agent-guards/github_credentialless_read.py`
   が提供する無認証 read transport（`CredentiallessGitHubReadTransport` / `read_public_issue` / `list_issue_comments` /
-  `read_single_comment`）は、PR #2247（Issue #2241）で `run_refinement_preflight.py` の `_fetch_issue()` /
-  `_fetch_issue_comments()` に配線済み、続く Issue #2257 で単一 anchor comment を解決する `_fetch_single_comment()` にも
-  配線済みである。`_fetch_single_comment()` だけがこの isolated-profile 分岐を持たず無条件で `gh api` を呼んでいたこと
-  （split-brain transport）が、Issue #2197 のアンカーコメント 5315264311 を isolated Claude-GPT session が誤って
-  missing と判定した根本原因だった。isolated Claude-GPT session からの `preflight.run.with_human_context` 相当 command
-  は、Issue/comments 一覧/単一 anchor comment のいずれも credentialless transport のみで解決し、`gh` へフォールバック
-  しない。transport failure（認証依存/rate limit/5xx/DNS/接続/timeout/不正 JSON/pagination 不完全）は
-  `semantic_missing` と区別された `environment_failure` として報告され、実在する anchor comment を missing と誤分類
-  しない（Issue #2257 AC1-AC7）。
+  `read_single_comment` / `read_issue_comment`）は、PR #2247（Issue #2241）で `run_refinement_preflight.py` の
+  `_fetch_issue()` / `_fetch_issue_comments()` に配線済みだった。Issue #2257 では、`_fetch_single_comment()` だけが
+  isolated-profile 分岐を持たず無条件で `gh api` を呼んでいたこと（split-brain transport、Issue #2197 のアンカーコメント
+  5315264311 誤 missing 判定の直接原因）を修正し、さらに OWNER レビュー（PR #2260）指摘を受けて以下を実装した:
+  - `run_preflight()` が invocation ごとに単一の read-authority transport（isolated 時は
+    `_CredentiallessPreflightTransport`、通常時は `_GhCliPreflightTransport`）を一度だけ `_select_read_transport()` で
+    選択し、`_fetch_issue()` / `_fetch_issue_comments()` / `_fetch_single_comment()` / `_validate_anchor_comment_url()` /
+    `_validate_anchor_comments_batch()` へ明示的に引き渡す構造に変更した。initial anchor comment は、live mode で
+    `run_preflight()` が既に取得済みの `comments`（complete paginated traversal の結果）から解決され、以前のように
+    毎回 single-comment GET を再実行することはない（single-comment GET は、その traversal 結果に anchor が含まれない
+    場合の fresh-readback フォールバック、および trusted-anchor contract update の TOCTOU 検証でのみ使われる）。
+  - `github_credentialless_read.py` の 403 分類を `x-ratelimit-remaining`/`Retry-After` ヘッダ evidence ベースに変更し
+    （AC9）、根拠のない 403 は新設の `ForbiddenRejected` に分類する。
+  - `_credentialless_get_page()` に `UnicodeDecodeError` と malformed `Link` header（`rel="next"` はあるが URL が
+    パースできない）の closed taxonomy 分類を追加した。
+  - `list_issue_comments()` の pagination hardening を強化し、同一ホスト上でも repo/issue/endpoint が一致しない
+    `Link: rel="next"` の reject、非進行ページの即時検出、複数ホップの cycle 検出、comment ID の重複除去を追加した
+    （AC7 negative control (a)-(e)）。
+  - `refinement_preflight_result_v1.schema.json` に `status == "environment_failure"` のときのみ必須・それ以外では
+    禁止という `reason_code`/`source`/`operation` の conditional projection を追加し、`run_preflight()` の
+    environment_failure 生成箇所（transport 読み取り失敗・fixture load 失敗・artifact 書き込み失敗・planner 内部
+    エラー）にこの projection を実装した。
+
+  isolated Claude-GPT session からの `preflight.run.with_human_context` 相当 command は、Issue/comments 一覧/単一
+  anchor comment のいずれも credentialless transport のみで解決し、`gh` へフォールバックしない。transport failure
+  （認証依存/rate limit(primary/secondary区別)/403 forbidden/5xx/DNS/接続/timeout/不正 JSON・エンコーディング/
+  pagination 不完全）は `semantic_missing` と区別された `environment_failure` として報告され、実在する anchor
+  comment を missing と誤分類しない。
+
+  **未解決事項（Issue #2257 スコープ内の残課題、PR #2260 OWNER レビュー時点）**:
+  - `scripts/agent-guards/tests/test_isolated_anchor_single_authority.py` /
+    `test_skill_runtime_exec_anchor.py` の live subprocess replay（AC5/AC6/AC7 の runtime verification）は、
+    GitHub API へ到達できない場合に `pytest.skip()` へフォールバックしている箇所が残っており、
+    `docs/dev/runtime-verification-policy.md` が要求する「到達不能は SKIP ではなく environment_failure として扱う」
+    という規約への完全準拠（production graph 側での `environment_failure` 判定の直接検証、および
+    `gh invocation == 0` 計装が「credentialless single-comment GET 実装でも PASS してしまう」弱点の解消）は未完了。
+  - gh CLI 経由（非 isolated profile）の `_run_gh()` エラー文字列（stderr snippet を含む）は、この Issue の
+    スコープである credentialless transport 側の closed taxonomy 化の対象外のまま維持している（AC8 の非退行要件
+    を優先し、gh 経路の広範な改変は別 Issue とする）。
 - **`~/.local/bin` trust root の same-UID 攻撃モデル**: `scripts/agent-guards/skill_runtime_exec.py` の
   `_validate_account_local_bin_trust` は ancestor ディレクトリの owner uid / group-world-writable 検証と symlink 解決先
   検証、および `_validate_local_bin_executable_version` による `--version` 出力照合を追加したが、これは
