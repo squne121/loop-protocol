@@ -384,9 +384,10 @@ def test_fetch_single_comment_non_isolated_profile_gh_exit_4_is_transport_failur
     real_home = preflight.pwd.getpwuid(os.getuid()).pw_dir
     monkeypatch.setenv("HOME", real_home)
 
-    monkeypatch.setattr(
-        preflight, "_run_gh", lambda argv, timeout=preflight.GH_API_TIMEOUT: (None, "gh_exit_4: authentication required")
-    )
+    def _fake_run_gh(argv, timeout=preflight.GH_API_TIMEOUT):
+        return None, "gh_exit_4: authentication required"
+
+    monkeypatch.setattr(preflight, "_run_gh", _fake_run_gh)
 
     data, err = preflight._fetch_single_comment(REPO, 1)
 
