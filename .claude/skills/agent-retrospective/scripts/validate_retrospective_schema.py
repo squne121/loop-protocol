@@ -4,9 +4,19 @@
 This module intentionally stays a pure, static validation library:
 
 - JSON Schema validation for both schemas (``validate_run`` / ``validate_candidate``),
-  including ``format`` (e.g. ``date-time``) checking via an explicit
-  ``jsonschema.FormatChecker`` -- ``jsonschema.validate()`` does NOT check ``format``
-  by default, so a validator instance is constructed explicitly here instead.
+  including ``format`` (e.g. ``date-time``) checking via an explicit,
+  module-local ``jsonschema.FormatChecker`` instance with a stdlib-only "date-time"
+  checker registered on it (see ``_FORMAT_CHECKER`` / ``_check_date_time_stdlib``
+  below) -- ``jsonschema.validate()`` does NOT check ``format`` by default, and
+  jsonschema's own built-in "date-time" checker only activates when an optional
+  format-validation dependency (e.g. rfc3339-validator) is installed, which this
+  repo's ``jsonschema`` dependency intentionally does not include (see
+  ``scripts/ci/tests/test_runtime_dependency_smoke.py`` and
+  ``.claude/skills/issue-refinement-loop/tests/test_issue_execution_decision_schema_parity.py``,
+  which pin the exact no-extras dependency specifier and document that gap repo-wide,
+  respectively). Registering the checker on a locally-scoped ``FormatChecker``
+  instance (rather than adding the dependency) enforces date-time format for this
+  module only, without perturbing those other files' contracts.
 - Digest consistency: ``validate_run`` recomputes ``compute_source_set_digest()`` over
   the instance's ``source_observations`` and rejects the instance if it does not match
   the stored ``run_identity.source_set_digest`` -- callers cannot supply an arbitrary,
@@ -39,12 +49,48 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import jsonschema
 
 _SCHEMAS_DIR = Path(__file__).resolve().parents[1] / "schemas"
+
+# ---------------------------------------------------------------------------
+# format checking (date-time)
+# ---------------------------------------------------------------------------
+#
+# jsonschema does not check "format" unless an explicit FormatChecker is supplied,
+# and jsonschema's own built-in "date-time" checker only activates when an optional
+# format-validation dependency (e.g. rfc3339-validator, installed via the
+# jsonschema[format] extra) is present -- this repo's jsonschema dependency does not
+# include that extra (scripts/ci/tests/test_runtime_dependency_smoke.py pins the exact
+# `jsonschema>=4.0` specifier with no extras, and
+# .claude/skills/issue-refinement-loop/tests/test_issue_execution_decision_schema_parity.py
+# documents that "date-time" is intentionally absent from the default FormatChecker's
+# registered checkers repo-wide). Rather than adding a new dependency and the
+# repo-wide follow-up that test explicitly calls for, this module registers its own
+# minimal, stdlib-only "date-time" checker on a locally-scoped FormatChecker instance
+# (this does not touch jsonschema's global/default FormatChecker used elsewhere).
+
+_FORMAT_CHECKER = jsonschema.FormatChecker()
+
+
+@_FORMAT_CHECKER.checks("date-time", raises=ValueError)
+def _check_date_time_stdlib(value: object) -> bool:
+    """Reject strings that are not a valid ISO 8601 date-time (stdlib-only).
+
+    ``datetime.fromisoformat`` (Python 3.11+) natively accepts the ``Z`` UTC
+    suffix, so no manual normalization is needed. Non-string values are left to
+    jsonschema's ``type`` keyword to reject; format checkers only apply to values
+    that already match the declared type.
+    """
+    if not isinstance(value, str):
+        return True
+    datetime.fromisoformat(value)
+    return True
+
 
 RUN_SCHEMA_PATH = _SCHEMAS_DIR / "agent_retrospective_run_v1.schema.json"
 CANDIDATE_SCHEMA_PATH = _SCHEMAS_DIR / "agent_improvement_candidate_v1.schema.json"
@@ -110,13 +156,14 @@ def _validate_with_format_checking(instance: dict[str, Any], schema: dict[str, A
 
     `jsonschema.validate()` does not check `format` unless an explicit
     `format_checker` is supplied (this is documented `jsonschema` behavior, not a
-    LOOP_PROTOCOL-specific choice). This helper always constructs a validator with a
-    `FormatChecker` so malformed `date-time` values are rejected rather than silently
-    accepted.
+    LOOP_PROTOCOL-specific choice). This helper always constructs a validator with the
+    module-local `_FORMAT_CHECKER` (stdlib-only "date-time" checker, see above) so
+    malformed `date-time` values are rejected rather than silently accepted, without
+    depending on an optional format-validation package.
     """
     validator_cls = jsonschema.validators.validator_for(schema)
     validator_cls.check_schema(schema)
-    validator = validator_cls(schema, format_checker=jsonschema.FormatChecker())
+    validator = validator_cls(schema, format_checker=_FORMAT_CHECKER)
     validator.validate(instance)
 
 
