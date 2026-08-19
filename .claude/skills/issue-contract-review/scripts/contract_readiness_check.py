@@ -64,6 +64,7 @@ from baseline_vc_preflight import (  # noqa: E402
     CommandTimeoutNonPositiveError,
     DEFAULT_TIMEOUT_SECONDS as _PER_VC_COMMAND_TIMEOUT_SECONDS,
     compute_canonical_vc_plan as _compute_canonical_vc_plan,
+    extract_allowed_paths as _extract_allowed_paths,
     extract_verification_commands_section,
     run_subprocess_with_cooperative_supervisor as _run_subprocess_with_cooperative_supervisor,
 )
@@ -737,7 +738,16 @@ def compute_invocation_local_baseline_timeout(body: str) -> int:
     plan's `launch_upper_bound` exceeds the fixed policy ceiling -- BEFORE
     any subprocess is launched.
     """
-    plan = _compute_canonical_vc_plan(body)
+    # Issue #2232 Scope Delta P0-1 (OWNER REQUEST_CHANGES
+    # https://github.com/squne121/loop-protocol/pull/2255#issuecomment-5340600982):
+    # this parent-side classification context (`cwd="."`, Allowed Paths
+    # extracted from this SAME `body`) mirrors what the `baseline_vc_preflight.py`
+    # subprocess launched below (via `run_baseline_vc_preflight()`) resolves
+    # for its OWN `args.cwd or "."` default and `allowed_paths_from_body`,
+    # keeping `plan_digest` convergent across the process boundary.
+    plan = _compute_canonical_vc_plan(
+        body, cwd=".", allowed_paths=_extract_allowed_paths(body)
+    )
     # Issue #2207 OWNER P1-3: `command_occurrence_count`, per the Issue
     # #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`.
     budget = derive_review_budget(plan["command_occurrence_count"], policy_cap=plan["policy_cap"])
@@ -877,7 +887,16 @@ def run_baseline_vc_preflight(
         # plan (from the SAME `tmp_path` body) can be verified against it
         # before the child launches any VC subprocess -- protecting against
         # the body drifting between this write and the child's read.
-        _plan_for_digest = _compute_canonical_vc_plan(body)
+        # Issue #2232 Scope Delta P0-1: the child subprocess below is
+        # launched WITHOUT an explicit `--cwd`, so its own
+        # `args.cwd or "."` default applies, resolved (like this parent's
+        # own process) against the real OS-level working directory. Passing
+        # `cwd="."` + the SAME body's extracted Allowed Paths here mirrors
+        # that exact classification context so `plan_digest` stays
+        # convergent across this subprocess boundary.
+        _plan_for_digest = _compute_canonical_vc_plan(
+            body, cwd=".", allowed_paths=_extract_allowed_paths(body)
+        )
         supervised = _run_subprocess_with_cooperative_supervisor(
             [
                 sys.executable,

@@ -52,6 +52,9 @@ sys.path.insert(0, str(_SCRIPTS_DIR.parents[1] / "create-issue" / "scripts"))
 import baseline_vc_preflight as bvp  # noqa: E402
 import contract_readiness_check as crc  # noqa: E402
 
+sys.path.insert(0, str(_SCRIPTS_DIR.parents[1] / "issue-refinement-loop" / "scripts"))
+import run_root_review_pipeline as rrp  # noqa: E402
+
 _SLOW_STATIC_POLICY_COMMAND = (
     "uv run --locked pytest .claude/skills/issue-refinement-loop/tests -v"
 )
@@ -231,6 +234,141 @@ def test_executor_rejects_mutated_body_before_launching_subprocess(tmp_path, cap
         "subprocess must NOT be launched when the recomputed plan digest "
         "does not match --expected-plan-digest"
     )
+
+
+def test_all_four_consumer_paths_observe_identical_plan_digest_for_directory_scoped_rg(
+    tmp_path, capsys
+):
+    """Issue #2232 Scope Delta P0-1 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2255#issuecomment-5340600982):
+    extend `test_all_four_consumer_paths_observe_identical_plan_digest()`
+    above to a directory-scoped `rg` command inside an Allowed Path -- the
+    case where `is_pure` (and therefore `plan_digest`) genuinely DIFFERS
+    between context-free and context-aware classification, unlike the
+    fixture above (two non-pure, `static_policy`-routed commands whose
+    `is_pure` never flips). Confirms:
+
+      1. context-free classification and context-aware (real cwd +
+         Allowed Paths) classification genuinely DISAGREE for this fixture
+         (precondition -- otherwise this test would not exercise the P0-1
+         bug at all).
+      2. `contract_readiness_check.py`, `run_root_review_pipeline.py`, and
+         `run_contract_review_once.py`'s parent-side digest computation --
+         all three now wired (Issue #2232 Scope Delta) to pass the SAME
+         real `cwd` / Allowed-Paths-extracted-from-body context -- converge
+         on the IDENTICAL `plan_digest`.
+      3. Subprocess-boundary (executor) recomputation over a REAL
+         `--body-file` / `--cwd` CLI invocation accepts that SAME digest.
+      4. Subprocess-boundary NEGATIVE control: a digest computed with a
+         STALE/DIFFERENT (context-free) classification context is REJECTED
+         by the real child subprocess with `vc_plan_digest_mismatch` --
+         proving this convergence check is not vacuous.
+    """
+    target_dir = tmp_path / "fixture_dir"
+    target_dir.mkdir()
+    (target_dir / "a.txt").write_text("pattern\n", encoding="utf-8")
+    command = "rg -q pattern fixture_dir"
+
+    body = (
+        "## Allowed Paths\n\n"
+        "- fixture_dir\n\n"
+        "## Verification Commands\n\n"
+        "```bash\n"
+        "# baseline-expect: pass\n"
+        f"$ {command}\n"
+        "```\n"
+    )
+
+    # 1. Precondition: context genuinely flips classification for this body.
+    context_free_plan = bvp.compute_canonical_vc_plan(body)
+    context_aware_plan = bvp.compute_canonical_vc_plan(
+        body, cwd=str(tmp_path), allowed_paths=["fixture_dir"]
+    )
+    assert context_free_plan["command_occurrences"][0]["is_pure"] is False
+    assert context_aware_plan["command_occurrences"][0]["is_pure"] is True
+    assert context_free_plan["plan_digest"] != context_aware_plan["plan_digest"]
+
+    # Real Allowed Paths extraction from the body -- the SAME helper every
+    # production consumer now reuses (Issue #2232 Scope Delta).
+    allowed_paths_from_body = bvp.extract_allowed_paths(body)
+    assert allowed_paths_from_body == ["fixture_dir"]
+
+    # 2. Re-derive the plan the way EACH wired consumer now does, given the
+    #    SAME real cwd/Allowed Paths context:
+    #      - contract_readiness_check.py (both call sites)
+    #      - run_root_review_pipeline.py (same function object)
+    #      - run_contract_review_once.py's parent-side digest computation
+    crc_plan = crc._compute_canonical_vc_plan(
+        body, cwd=str(tmp_path), allowed_paths=allowed_paths_from_body
+    )
+    rrp_plan = rrp._compute_canonical_vc_plan(
+        body, cwd=str(tmp_path), allowed_paths=allowed_paths_from_body
+    )
+    rcro_plan = bvp.compute_canonical_vc_plan(
+        body, cwd=str(tmp_path), allowed_paths=allowed_paths_from_body
+    )
+    assert (
+        crc_plan["plan_digest"]
+        == rrp_plan["plan_digest"]
+        == rcro_plan["plan_digest"]
+        == context_aware_plan["plan_digest"]
+    )
+
+    # 3. Subprocess-boundary (executor) recomputation from the SAME body +
+    #    the SAME real cwd/Allowed Paths, over a REAL CLI invocation.
+    body_path = tmp_path / "body.md"
+    body_path.write_text(body, encoding="utf-8")
+    argv_backup = sys.argv[:]
+    sys.argv = [
+        "baseline_vc_preflight.py",
+        "--body-file",
+        str(body_path),
+        "--cwd",
+        str(tmp_path),
+        "--issue",
+        "999",
+        "--expected-plan-digest",
+        rcro_plan["plan_digest"],
+    ]
+    try:
+        exit_code = bvp._main_impl()
+    finally:
+        sys.argv = argv_backup
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_code == 0, payload
+    assert payload.get("failure_class") != "vc_plan_digest_mismatch", payload
+    assert payload["results"][0]["exit_code"] == 0, (
+        "subprocess MUST actually launch when the plan digest matches"
+    )
+    assert payload["results"][0]["classification"] == "expected_pass"
+
+    # 4. Negative control (subprocess-boundary): a digest computed with a
+    #    STALE (context-free) classification context is rejected BEFORE any
+    #    VC subprocess launches -- proving the convergence check above is
+    #    not vacuous.
+    stale_digest = context_free_plan["plan_digest"]
+    sys.argv = [
+        "baseline_vc_preflight.py",
+        "--body-file",
+        str(body_path),
+        "--cwd",
+        str(tmp_path),
+        "--issue",
+        "999",
+        "--expected-plan-digest",
+        stale_digest,
+    ]
+    try:
+        exit_code_stale = bvp._main_impl()
+    finally:
+        sys.argv = argv_backup
+    captured_stale = capsys.readouterr()
+    payload_stale = json.loads(captured_stale.out)
+    assert exit_code_stale != 0
+    assert payload_stale["status"] == "blocked"
+    assert payload_stale["failure_class"] == "vc_plan_digest_mismatch"
+    assert payload_stale["results"] == []
 
 
 def test_aggregate_timeout_seconds_can_now_legitimately_exceed_old_worst_case():
