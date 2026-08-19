@@ -100,6 +100,16 @@ from baseline_vc_preflight import extract_verification_commands_section  # noqa:
 # override that bypassed the plan's own (possibly `static_policy`
 # sourced) per-command budgets.
 from baseline_vc_preflight import compute_canonical_vc_plan  # noqa: E402
+# Issue #2232 Scope Delta (OWNER REQUEST_CHANGES P0-1
+# https://github.com/squne121/loop-protocol/pull/2255#issuecomment-5340600982):
+# `compute_canonical_vc_plan()`'s `is_pure` classification (and therefore
+# `plan_digest`) now depends on `cwd` / Allowed Paths. This SAME extraction
+# helper -- the one `baseline_vc_preflight.py`'s own `_main_impl()` uses to
+# derive `allowed_paths_from_body` before calling `compute_canonical_vc_plan()`
+# -- is imported here so this parent process supplies the child subprocess's
+# EXACT classification context instead of the function's context-free
+# defaults, keeping `plan_digest` convergent across the process boundary.
+from baseline_vc_preflight import extract_allowed_paths  # noqa: E402
 from contract_readiness_check import (  # noqa: E402
     fetch_body_from_github,
     resolve_existing_issue_validation_profile,
@@ -908,7 +918,21 @@ def run_once(
         # flag exists on THIS script's own CLI (see argparse below), so
         # `--timeout-seconds` is never passed here; the child resolves its
         # own plan-derived budget per command.
-        _vc_plan_for_digest = compute_canonical_vc_plan(body_snapshot)
+        # Issue #2232 Scope Delta P0-1: the child (`baseline_vc_preflight.py`
+        # `_main_impl()`) only ever receives `--cwd cwd` when
+        # `evidence_mode == "current-head"` (see the `vc_command.extend([...])`
+        # below); otherwise its own `args.cwd = args.cwd or "."` default
+        # applies. Mirror that EXACT resolution here so this parent-side
+        # digest is computed with the SAME `cwd` / Allowed Paths context the
+        # child will actually use, instead of the function's context-free
+        # defaults that previously caused `vc_plan_digest_mismatch` for
+        # Allowed-Paths-sensitive directory `rg` commands.
+        _effective_cwd_for_digest = cwd if (evidence_mode == "current-head" and cwd) else "."
+        _vc_plan_for_digest = compute_canonical_vc_plan(
+            body_snapshot,
+            cwd=_effective_cwd_for_digest,
+            allowed_paths=extract_allowed_paths(body_snapshot),
+        )
         vc_command = [
                 sys.executable,
                 str(_BASELINE_VC_PREFLIGHT_PY),
