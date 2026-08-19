@@ -531,6 +531,7 @@ def current_head_blocked_result(args: argparse.Namespace, evidence: Dict[str, An
         },
         "results": [],
         "errors": [message, *evidence.get("errors", [])],
+        "diagnostic_report": not_computed_diagnostic_report(),
     }
 
 
@@ -1086,6 +1087,8 @@ def compute_canonical_vc_plan(
     max_workers: int = _VC_PLAN_DEFAULT_MAX_WORKERS,
     per_command_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     global_override_seconds: Optional[int] = None,
+    cwd: str = ".",
+    allowed_paths: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Compute the canonical, side-effect-free VC plan for `body`.
 
@@ -1177,7 +1180,7 @@ def compute_canonical_vc_plan(
                 _budget["timeout_seconds"] + _budget["cleanup_tail_seconds"]
             )
 
-            is_pure = _is_parallel_eligible_command(command)
+            is_pure = _is_parallel_eligible_command(command, cwd, allowed_paths)
             command_occurrences.append(
                 {"command_hash": command_hash, "is_pure": is_pure}
             )
@@ -1258,6 +1261,177 @@ def verify_canonical_vc_plan_digest(plan: Dict[str, Any], expected_digest: Optio
     actual_digest = plan["plan_digest"]
     if actual_digest != expected_digest:
         raise VcPlanDigestMismatchError(expected_digest, actual_digest)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate non-pure VC command diagnostics (Issue #2232)
+# ---------------------------------------------------------------------------
+#
+# `vc_duplicate_diagnostic_report/v1` is a diagnostic-only report,
+# INDEPENDENT of the canonical execution plan above (`command_occurrence_count`
+# / `launch_upper_bound` / `status` / `results` / exit code are never
+# changed by anything in this section -- Issue #2232 Outcome). It detects
+# the SAME non-pure (state-barrier) VC command text occurring more than
+# once in a body's `## Verification Commands` section, which is USUALLY an
+# accidental duplication (copy/paste) rather than an intentional re-run.
+#
+# Pure (dedup-eligible) commands (`_is_parallel_eligible_command()`) are
+# NEVER flagged: the canonical plan already treats their repetition as safe
+# to dedup-replay, so a diagnostic warning would be pure noise (Issue #2232
+# In Scope, positive/negative control).
+#
+# Scope semantics fixed by Issue #2232 AC6 (each is a deliberate, tested
+# design decision -- NOT an incidental default):
+#
+#   - `preflight-scope: pr_review_only` / `preflight-scope: runtime_only`
+#     commands ARE included. The scope marker only changes WHICH execution
+#     phase actually runs the command; it does not change the fact that the
+#     same non-pure command text appears twice in the body, so the
+#     duplication signal is still meaningful within that phase.
+#   - `baseline-expect: deferred` commands are EXCLUDED. `baseline_vc_preflight`
+#     intentionally never executes a `deferred` VC, so two `deferred`
+#     occurrences never race/duplicate a real subprocess launch; flagging
+#     them would be a false positive against a command the preflight never
+#     runs at all.
+#   - Commands that `classify_static_command()` statically blocks (e.g.
+#     unsupported shell syntax, compound commands, denied commands) are
+#     EXCLUDED: a statically-blocked command never reaches subprocess
+#     execution, so duplicate occurrences of it can never duplicate a real
+#     launch.
+#   - A state-changing (non-pure) command interposed between two
+#     occurrences of an otherwise-identical non-pure command does NOT
+#     suppress the diagnostic: this report is a body-text-level duplication
+#     signal, independent of the canonical plan's `state_epoch` barrier
+#     bookkeeping (which only affects whether a PURE command may be
+#     dedup-replayed, not whether a NON-pure duplicate is worth flagging).
+
+VC_DUPLICATE_DIAGNOSTIC_SCHEMA = "vc_duplicate_diagnostic_report/v1"
+VC_DUPLICATE_DIAGNOSTIC_RULE_ID = "VCP_DUPLICATE_NON_PURE_COMMAND"
+VC_DUPLICATE_DIAGNOSTIC_LEVEL = "warning"
+
+
+def not_computed_diagnostic_report() -> Dict[str, Any]:
+    """Issue #2232 AC3: `status: not_computed` distinguishes "diagnosed and
+    found zero duplicates" (`status: complete`, `items: []`) from "never
+    diagnosed" (this function) -- used by every early-return `main()` path
+    that exits BEFORE the body/canonical plan is obtained (retrieval
+    failure, current-head validation failure, VC section/command
+    extraction failure, budget/digest policy rejection)."""
+    return {
+        "schema": VC_DUPLICATE_DIAGNOSTIC_SCHEMA,
+        "status": "not_computed",
+        "items": [],
+    }
+
+
+def compute_duplicate_diagnostic_report(
+    body: str,
+    canonical_plan_digest: Optional[str],
+    cwd: str,
+    allowed_paths: List[str],
+) -> Dict[str, Any]:
+    """Issue #2232: compute the `vc_duplicate_diagnostic_report/v1` for
+    `body`, bound to `body_sha256`, the canonical plan's `plan_digest`
+    (`canonical_plan_digest`, for pinning context only -- never fed back
+    into the canonical plan's OWN digest computation, Issue #2232 Out of
+    Scope), and the classification context (`cwd` / `allowed_paths`) used
+    for pure/non-pure convergence (AC2).
+
+    Deterministic (AC5): re-running this function against the SAME `body`
+    and the SAME classification context always returns byte-identical
+    `items[]`, ordered by first-occurrence ordinal, tie-broken by
+    `command_identity_hash`.
+    """
+    section = extract_verification_commands_section(body) or ""
+    blocks = extract_fenced_bash_blocks(section)
+    resolved_allowed_paths = list(allowed_paths or [])
+    resolved_cwd = Path(cwd)
+
+    ordinal = 0
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+
+    for block_index, block in enumerate(blocks):
+        for entry in parse_commands_from_block(block):
+            (
+                ac_label,
+                command,
+                line_in_block,
+                _preflight_scope,
+                _vc_regex_intent,
+                baseline_expect,
+                _vc_role,
+                _annotation_line_no,
+                _annotation_raw,
+            ) = entry
+            ordinal += 1
+
+            # Pure (dedup-eligible) commands are never flagged (AC2 convergence).
+            if _is_parallel_eligible_command(command, cwd, resolved_allowed_paths):
+                continue
+            # `baseline-expect: deferred` commands are never executed by
+            # baseline preflight (AC6).
+            if baseline_expect == "deferred":
+                continue
+            # Statically-blocked commands never reach subprocess execution (AC6).
+            if classify_static_command(
+                command, resolved_cwd, allowed_paths=resolved_allowed_paths
+            ) is not None:
+                continue
+
+            command_identity_hash = compute_command_hash(command)
+            groups.setdefault(command_identity_hash, []).append(
+                {
+                    "ordinal": ordinal,
+                    "ac_label": ac_label,
+                    "block_index": block_index,
+                    "line_in_block": line_in_block,
+                    "command": command,
+                }
+            )
+
+    items: List[Dict[str, Any]] = []
+    for command_identity_hash, occurrences in groups.items():
+        if len(occurrences) < 2:
+            continue
+        items.append(
+            {
+                "rule_id": VC_DUPLICATE_DIAGNOSTIC_RULE_ID,
+                "level": VC_DUPLICATE_DIAGNOSTIC_LEVEL,
+                "message": (
+                    f"Non-pure VC command occurs {len(occurrences)} times in "
+                    "the Verification Commands section: "
+                    f"{occurrences[0]['command']!r}"
+                ),
+                "command_identity_hash": command_identity_hash,
+                "occurrence_count": len(occurrences),
+                "occurrences": [
+                    {
+                        "ordinal": occ["ordinal"],
+                        "ac_label": occ["ac_label"],
+                        "block_index": occ["block_index"],
+                        "line_in_block": occ["line_in_block"],
+                    }
+                    for occ in occurrences
+                ],
+                "_first_ordinal": occurrences[0]["ordinal"],
+            }
+        )
+
+    items.sort(key=lambda item: (item["_first_ordinal"], item["command_identity_hash"]))
+    for item in items:
+        del item["_first_ordinal"]
+
+    return {
+        "schema": VC_DUPLICATE_DIAGNOSTIC_SCHEMA,
+        "status": "complete",
+        "body_sha256": f"sha256:{compute_source_hash(body)}",
+        "canonical_plan_digest": canonical_plan_digest,
+        "classification_context": {
+            "cwd": cwd,
+            "allowed_paths": resolved_allowed_paths,
+        },
+        "items": items,
+    }
 
 
 def detect_compound_command(command: str) -> bool:
@@ -4782,6 +4956,7 @@ def _main_impl() -> int:
                     "fix_hint": "Check GitHub credentials (gh auth status) and issue number",
                 }
             ],
+            "diagnostic_report": not_computed_diagnostic_report(),
         }
         emit_json(result, args.evidence_mode, current_evidence)
         # C2: exit code 2 for retrieval/parse errors
@@ -4817,6 +4992,7 @@ def _main_impl() -> int:
                     "fix_hint": "Add a '## Verification Commands' section with fenced bash blocks to the Issue body",
                 }
             ],
+            "diagnostic_report": not_computed_diagnostic_report(),
         }
         emit_json(result, args.evidence_mode, current_evidence)
         # C2: exit code 2 for extraction errors
@@ -4865,6 +5041,7 @@ def _main_impl() -> int:
             },
             "results": static_results,
             "errors": [],
+            "diagnostic_report": not_computed_diagnostic_report(),
         }
         emit_json(result, args.evidence_mode, current_evidence)
         return 0 if static_status == "ok" else 1
@@ -4923,6 +5100,7 @@ def _main_impl() -> int:
             },
             "results": [],
             "errors": [no_cmd_error],
+            "diagnostic_report": not_computed_diagnostic_report(),
         }
         emit_json(result, args.evidence_mode, current_evidence)
         # C2: exit code 2 for extraction errors
@@ -5005,6 +5183,7 @@ def _main_impl() -> int:
             "errors": [_policy_error],
             "failure_class": _error_code,
             "retryable": False,
+            "diagnostic_report": not_computed_diagnostic_report(),
         }
         emit_json(_policy_result, args.evidence_mode, current_evidence)
         return exit_code_for_status("blocked")
@@ -5013,6 +5192,8 @@ def _main_impl() -> int:
         _vc_plan = compute_canonical_vc_plan(
             body,
             global_override_seconds=_global_override_seconds,
+            cwd=args.cwd,
+            allowed_paths=allowed_paths_from_body,
         )
     except CommandTimeoutExceedsPolicyError as _budget_exc:
         return _emit_blocked_policy_error(
@@ -5059,6 +5240,17 @@ def _main_impl() -> int:
                 "no subprocess was launched."
             ),
         )
+
+    # Issue #2232: duplicate non-pure VC command diagnostic, independent of
+    # the canonical execution plan above (never influences status/results/
+    # exit code -- see the "Duplicate non-pure VC command diagnostics"
+    # section docstring near compute_duplicate_diagnostic_report()).
+    _diagnostic_report = compute_duplicate_diagnostic_report(
+        body,
+        _vc_plan["plan_digest"],
+        args.cwd,
+        allowed_paths_from_body,
+    )
 
     _command_budgets_by_hash: Dict[str, Dict[str, Any]] = {
         _b["command_hash"]: _b for _b in _vc_plan["command_budgets"]
@@ -5614,6 +5806,7 @@ def _main_impl() -> int:
         "summary": summary,
         "results": results,
         "errors": [],
+        "diagnostic_report": _diagnostic_report,
     }
 
     if current_evidence is not None:
@@ -5641,6 +5834,7 @@ def _main_impl() -> int:
                 "summary": summary,
                 "results": results,
                 "errors": ["PyYAML is required for contract-review-fragment format; install pyyaml"],
+                "diagnostic_report": _diagnostic_report,
             }
             emit_json(error_result, args.evidence_mode, current_evidence)
             # C2: exit code 2 for missing dependency

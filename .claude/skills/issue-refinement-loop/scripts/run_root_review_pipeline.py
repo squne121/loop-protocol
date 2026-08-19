@@ -202,6 +202,14 @@ _derive_review_budget = _contract_readiness_check.derive_review_budget
 import baseline_vc_preflight as _baseline_vc_preflight  # noqa: E402
 
 _compute_canonical_vc_plan = _baseline_vc_preflight.compute_canonical_vc_plan
+# Issue #2232 Scope Delta P0-1 (OWNER REQUEST_CHANGES
+# https://github.com/squne121/loop-protocol/pull/2255#issuecomment-5340600982):
+# reuse the SAME `extract_allowed_paths()` helper `baseline_vc_preflight.py`'s
+# own executor uses to derive `allowed_paths_from_body`, so this pipeline's
+# invocation-local canonical plan is computed with the identical `cwd` /
+# Allowed Paths classification context, keeping `plan_digest` convergent
+# with every other canonical-plan consumer.
+_extract_allowed_paths = _baseline_vc_preflight.extract_allowed_paths
 
 # Issue #2054 AC8: `reviewer_transport.py` is the V2 contract SSOT. This
 # module no longer imports the retired V1 `compact_review_result()` renderer
@@ -1166,7 +1174,15 @@ def _cmd_produce(args: argparse.Namespace) -> int:
     # policy ceiling is rejected here (typed, non-retryable), never reaching
     # `run_reviewer_transport()` / `run-checker-attempt`.
     try:
-        _vc_plan = _compute_canonical_vc_plan(body)
+        # Issue #2232 Scope Delta P0-1: `cwd="."` + Allowed Paths extracted
+        # from this SAME `body` mirrors the classification context
+        # `baseline_vc_preflight.py`'s own executor resolves (its
+        # `args.cwd or "."` default and `allowed_paths_from_body`), keeping
+        # this pipeline's canonical plan (and any digest derived from it
+        # downstream) convergent with the other canonical-plan consumers.
+        _vc_plan = _compute_canonical_vc_plan(
+            body, cwd=".", allowed_paths=_extract_allowed_paths(body)
+        )
         # Issue #2207 OWNER P1-3 (PR #2221 REQUEST_CHANGES): `command_occurrence_count`,
         # per the Issue #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`
         # (an earlier implementation iteration substituted the dedup-aware
