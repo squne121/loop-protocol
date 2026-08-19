@@ -90,7 +90,7 @@ uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py \
 
 `<invocation_id>` / `<requested_at>` は入力で受け取った値をそのまま渡す（executor は独自に UUID / timestamp を生成しない。Issue #1547 fix_delta P0-1）。
 
-このコマンドは `local_main_branch_guard.py` / `skill_runtime_command_policy.py` に登録された exact command class（`scope_rollup.run`、12 トークン固定形状）としてのみ canonical root context で許可される。旧設計の `gh issue view/list` / `gh pr list` の raw shell redirect（`> /tmp/scope_rollup_*.json`）、`python -c` による SHA256 計算、`plan_issue_scope_rollup.py` の `> result.json 2>&1` は一切使用しない。
+このコマンドは `skill_runtime_command_policy.py`（`ScopeRollupRunCommand` / `parse_scope_rollup_run_command` / `is_scope_rollup_run_command`）に classifier/policy として登録された exact command class（`scope_rollup.run`、12 トークン固定形状）である。`local_main_branch_guard.py` は現在 `.claude/settings.json` の `hooks.PreToolUse` に project hook として wiring されておらず（PR #1691, commit `f971a95d`）、この exact command class を Claude project runtime レベルで technically enforce する仕組みではない。canonical execution contract としては、この exact invocation 形状への準拠を executor / Skill 側の自己規律（workflow/producer-consumer 契約）として維持する。旧設計の `gh issue view/list` / `gh pr list` の raw shell redirect（`> /tmp/scope_rollup_*.json`）、`python -c` による SHA256 計算、`plan_issue_scope_rollup.py` の `> result.json 2>&1` は一切使用しない。
 
 実行結果は `SCOPE_ROLLUP_RUN_RESULT_V1` JSON として stdout に返る:
 
