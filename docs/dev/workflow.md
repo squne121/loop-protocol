@@ -404,14 +404,17 @@ fresh isolated session から実証しなければならない**（Availability 
 
 Issue #2241 / PR #2247 の実装範囲では、以下は意図的に「未解決」として明記する（過大な安全主張を避けるため）:
 
-- **credentialless GitHub read の production preflight への未接続**: `scripts/agent-guards/github_credentialless_read.py`
-  は Issue 本体・comments（pagination 追従込み）を無認証で読む transport（`CredentiallessGitHubReadTransport` /
-  `read_public_issue` / `list_issue_comments`）を提供するが、`.claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py`
-  の `_fetch_issue()` / `_fetch_issue_comments()` はこの transport をまだ呼び出していない（引き続き `gh issue view` /
-  `gh api --paginate` 経由）。このファイルは Issue #2241 の Allowed Paths に含まれておらず、本 Issue のスコープでは配線できない。
-  isolated Claude-GPT session からの `preflight.run.with_human_context` 相当 command は、host `GH_TOKEN` 等が launcher に
-  よって遮断されている限り、引き続き `gh` 認証失敗で停止しうる。配線には Allowed Paths 拡張（follow-up Issue または
-  Scope Delta）が必要。
+- **credentialless GitHub read の production preflight への配線（解決済み）**: `scripts/agent-guards/github_credentialless_read.py`
+  が提供する無認証 read transport（`CredentiallessGitHubReadTransport` / `read_public_issue` / `list_issue_comments` /
+  `read_single_comment`）は、PR #2247（Issue #2241）で `run_refinement_preflight.py` の `_fetch_issue()` /
+  `_fetch_issue_comments()` に配線済み、続く Issue #2257 で単一 anchor comment を解決する `_fetch_single_comment()` にも
+  配線済みである。`_fetch_single_comment()` だけがこの isolated-profile 分岐を持たず無条件で `gh api` を呼んでいたこと
+  （split-brain transport）が、Issue #2197 のアンカーコメント 5315264311 を isolated Claude-GPT session が誤って
+  missing と判定した根本原因だった。isolated Claude-GPT session からの `preflight.run.with_human_context` 相当 command
+  は、Issue/comments 一覧/単一 anchor comment のいずれも credentialless transport のみで解決し、`gh` へフォールバック
+  しない。transport failure（認証依存/rate limit/5xx/DNS/接続/timeout/不正 JSON/pagination 不完全）は
+  `semantic_missing` と区別された `environment_failure` として報告され、実在する anchor comment を missing と誤分類
+  しない（Issue #2257 AC1-AC7）。
 - **`~/.local/bin` trust root の same-UID 攻撃モデル**: `scripts/agent-guards/skill_runtime_exec.py` の
   `_validate_account_local_bin_trust` は ancestor ディレクトリの owner uid / group-world-writable 検証と symlink 解決先
   検証、および `_validate_local_bin_executable_version` による `--version` 出力照合を追加したが、これは

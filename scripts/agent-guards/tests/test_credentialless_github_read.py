@@ -410,3 +410,165 @@ def test_credentialless_transport_implements_read_transport_protocol(monkeypatch
 
     with pytest.raises(gcr.CrossRepositoryReadRejected):
         transport.read_issue("attacker-org/other-repo", 7)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2257 AC1/AC3/AC7: `read_single_comment` and the fault-injection
+# matrix (401/403/404/429/5xx/DNS/connection/timeout/invalid JSON/incomplete
+# pagination) that `_fetch_single_comment` in `run_refinement_preflight.py`
+# depends on to distinguish semantic_missing from transport_failure.
+# ---------------------------------------------------------------------------
+
+
+def test_read_single_comment_sends_exact_get_request_with_no_body_or_auth(monkeypatch):
+    """GIVEN a trusted repo/comment_id
+    WHEN `read_single_comment` is called
+    THEN the actual request is a GET with no body, no Authorization
+    header, and the exact expected single-comment URL (Issue #2257 AC1)."""
+    captured: dict[str, object] = {}
+    _patch_opener_open(monkeypatch, captured, body=b'{"id": 5315264311, "issue_url": "x"}')
+
+    result = gcr.read_single_comment(5315264311)
+
+    assert result == {"id": 5315264311, "issue_url": "x"}
+    request = captured["request"]
+    assert request.get_method() == "GET"
+    assert request.data is None
+    assert request.full_url == "https://api.github.com/repos/squne121/loop-protocol/issues/comments/5315264311"
+    header_names_lower = {k.lower() for k in captured["headers"]}
+    assert "authorization" not in header_names_lower
+
+
+def test_read_single_comment_rejects_cross_repository_and_invalid_comment_id():
+    """GIVEN a repository other than TRUSTED_REPO_SLUG, or a non-positive
+    comment id
+    WHEN `read_single_comment` is called
+    THEN it is rejected before any network call (Issue #2257 AC1)."""
+    with pytest.raises(gcr.CrossRepositoryReadRejected):
+        gcr.read_single_comment(1, repo="attacker-org/other-repo")
+
+    with pytest.raises(gcr.InvalidCommentIdRejected):
+        gcr.read_single_comment(0)
+
+    with pytest.raises(gcr.InvalidCommentIdRejected):
+        gcr.read_single_comment(-1)
+
+
+@pytest.mark.parametrize("status,expected_cls", [
+    (401, gcr.UnexpectedAuthenticationDependency),
+    (403, gcr.RateLimitedRejected),
+    (404, gcr.CanonicalResourceMissing),
+    (429, gcr.RateLimitedRejected),
+    (500, gcr.UpstreamEnvironmentFailure),
+    (503, gcr.UpstreamEnvironmentFailure),
+])
+def test_read_single_comment_http_error_status_is_classified(monkeypatch, status, expected_cls):
+    """GIVEN the opener raises `HTTPError` for a given status while
+    resolving a single comment
+    WHEN `read_single_comment` is called
+    THEN the specific, distinguishable exception class is raised (Issue
+    #2257 AC7 fault-injection matrix: 401/403/404/429/5xx)."""
+
+    def _fake_open(request, timeout=None):
+        raise _http_error(status)
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(expected_cls):
+        gcr.read_single_comment(1)
+
+
+def test_read_single_comment_dns_failure_is_transport_connectivity_failure(monkeypatch):
+    """GIVEN the opener raises `URLError` wrapping a DNS resolution
+    failure (`socket.gaierror`)
+    WHEN `read_single_comment` is called
+    THEN `TransportConnectivityFailure` is raised -- distinct from any
+    HTTP-status-derived exception, since no HTTP response was ever
+    received (Issue #2257 AC3/AC7)."""
+    import socket
+
+    def _fake_open(request, timeout=None):
+        raise urllib.error.URLError(socket.gaierror("Name or service not known"))
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.TransportConnectivityFailure):
+        gcr.read_single_comment(1)
+
+
+def test_read_single_comment_connection_refused_is_transport_connectivity_failure(monkeypatch):
+    """GIVEN the opener raises `URLError` wrapping a connection-refused
+    error
+    WHEN `read_single_comment` is called
+    THEN `TransportConnectivityFailure` is raised (Issue #2257 AC3/AC7:
+    connection fault-injection case)."""
+
+    def _fake_open(request, timeout=None):
+        raise urllib.error.URLError(ConnectionRefusedError("Connection refused"))
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.TransportConnectivityFailure):
+        gcr.read_single_comment(1)
+
+
+def test_read_single_comment_timeout_is_transport_connectivity_failure(monkeypatch):
+    """GIVEN the opener raises a bare `TimeoutError` (as `urlopen` does on
+    a read timeout, not always wrapped in `URLError`)
+    WHEN `read_single_comment` is called
+    THEN `TransportConnectivityFailure` is raised (Issue #2257 AC3/AC7:
+    timeout fault-injection case)."""
+
+    def _fake_open(request, timeout=None):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.TransportConnectivityFailure):
+        gcr.read_single_comment(1)
+
+
+def test_read_single_comment_invalid_json_is_malformed_response_body(monkeypatch):
+    """GIVEN a real HTTP response body that is not valid JSON
+    WHEN `read_single_comment` is called
+    THEN `MalformedResponseBody` is raised -- distinct from a transport
+    failure, since a real response was received (Issue #2257 AC3/AC7:
+    invalid JSON fault-injection case)."""
+    captured: dict[str, object] = {}
+    _patch_opener_open(monkeypatch, captured, body=b"not valid json{{{")
+
+    with pytest.raises(gcr.MalformedResponseBody):
+        gcr.read_single_comment(1)
+
+
+def test_list_issue_comments_incomplete_pagination_cycle_is_rejected(monkeypatch):
+    """GIVEN a `Link: rel="next"` response that cycles back to an
+    already-seen page URL (a malformed/incomplete pagination sequence)
+    WHEN `list_issue_comments` follows pagination
+    THEN it fails closed with `CredentiallessReadError` instead of looping
+    forever or silently truncating the comment list (Issue #2257 AC7:
+    incomplete pagination fault-injection case)."""
+    page_1_url = "https://api.github.com/repos/squne121/loop-protocol/issues/1/comments?per_page=100"
+
+    def _fake_open(request, timeout=None):
+        # Always points back at itself: an incomplete/cyclic pagination
+        # sequence a well-behaved server would never produce.
+        return _FakeResponse(b'[{"id": 1}]', headers={"Link": f'<{page_1_url}>; rel="next"'})
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    with pytest.raises(gcr.CredentiallessReadError):
+        gcr.list_issue_comments(1)
+
+
+def test_list_issue_comments_non_list_page_is_rejected(monkeypatch):
+    """GIVEN a comments page response body that is not a JSON list (an
+    incomplete/malformed pagination page)
+    WHEN `list_issue_comments` is called
+    THEN it fails closed with `CredentiallessReadError` (Issue #2257 AC7:
+    incomplete pagination fault-injection case)."""
+    captured: dict[str, object] = {}
+    _patch_opener_open(monkeypatch, captured, body=b'{"not": "a list"}')
+
+    with pytest.raises(gcr.CredentiallessReadError):
+        gcr.list_issue_comments(1)

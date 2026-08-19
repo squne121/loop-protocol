@@ -89,6 +89,26 @@ class InvalidIssueNumberRejected(CredentiallessReadError):
     """Raised when the requested issue number is not a positive integer."""
 
 
+class InvalidCommentIdRejected(CredentiallessReadError):
+    """Raised when the requested comment id is not a positive integer
+    (Issue #2257 AC1 -- `read_single_comment` companion to
+    `InvalidIssueNumberRejected`)."""
+
+
+class TransportConnectivityFailure(CredentiallessReadError):
+    """Raised when the underlying network transport itself fails before
+    any HTTP response is received: DNS resolution failure, connection
+    refused/reset, no route to host, or a client-side timeout (Issue #2257
+    AC3/AC7). Distinguished from the HTTP-status-derived exceptions above
+    because no HTTP status code was ever received to classify."""
+
+
+class MalformedResponseBody(CredentiallessReadError):
+    """Raised when a response body that was received successfully (a real
+    HTTP response, not a transport failure) cannot be parsed as JSON
+    (Issue #2257 AC3/AC7)."""
+
+
 class RateLimitedRejected(CredentiallessReadError):
     """Raised on HTTP 403/429 (anonymous rate limit exhausted or abuse
     detection). Distinguished from `UnexpectedAuthenticationDependency` and
@@ -141,6 +161,11 @@ def _validate_repo(repo: str) -> None:
 def _validate_issue_number(issue_number: int) -> None:
     if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
         raise InvalidIssueNumberRejected(f"invalid_issue_number:{issue_number!r}")
+
+
+def _validate_comment_id(comment_id: int) -> None:
+    if isinstance(comment_id, bool) or not isinstance(comment_id, int) or comment_id <= 0:
+        raise InvalidCommentIdRejected(f"invalid_comment_id:{comment_id!r}")
 
 
 class _RedirectRejectingHandler(urllib.request.HTTPRedirectHandler):
@@ -246,7 +271,23 @@ def _credentialless_get_page(url: str, *, timeout: float = 15.0) -> tuple[object
             link_header = response.headers.get("Link", "")
     except urllib.error.HTTPError as exc:
         raise _classify_http_error(exc) from exc
-    data = json.loads(raw)
+    except TimeoutError as exc:
+        # `socket.timeout` is `TimeoutError` (Python 3.10+); urlopen can
+        # raise this directly (not wrapped in URLError) on a read timeout
+        # (Issue #2257 AC3/AC7).
+        raise TransportConnectivityFailure("transport_connectivity_failure:timeout") from exc
+    except urllib.error.URLError as exc:
+        # DNS resolution failure, connection refused/reset, no route to
+        # host, or a wrapped timeout -- no HTTP response was ever received
+        # to classify via `_classify_http_error` (Issue #2257 AC3/AC7). The
+        # sanitized reason is the underlying OSError subclass name only,
+        # never `str(exc.reason)` (which can include hostnames/addresses).
+        reason_cls = type(exc.reason).__name__ if exc.reason is not None else "unknown"
+        raise TransportConnectivityFailure(f"transport_connectivity_failure:{reason_cls}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise MalformedResponseBody("malformed_response_body:invalid_json") from exc
     next_match = _LINK_NEXT_RE.search(link_header or "")
     next_url = next_match.group(1) if next_match else None
     if next_url is not None:
@@ -282,6 +323,39 @@ def read_public_issue(issue_number: int, repo: str = TRUSTED_REPO_SLUG) -> dict:
     _validate_repo(repo)
     _validate_issue_number(issue_number)
     url = f"{GITHUB_API_BASE}/repos/{repo}/issues/{issue_number}"
+    return _credentialless_get(url)
+
+
+def read_single_comment(comment_id: int, repo: str = TRUSTED_REPO_SLUG) -> dict:
+    """Read a single public GitHub Issue comment in `repo` with no
+    authentication (Issue #2257 AC1).
+
+    This is the credentialless counterpart to `_fetch_single_comment`'s
+    previously-unconditional `gh api repos/{repo}/issues/comments/{id}`
+    call in `run_refinement_preflight.py` (Issue #2257 root cause: that
+    call had no isolated-profile branch, so an isolated Claude-GPT session
+    -- which never has a working `gh` credential -- always failed there,
+    even for a genuinely-existing anchor comment).
+
+    Raises `CrossRepositoryReadRejected` if `repo` is not
+    `TRUSTED_REPO_SLUG`, `InvalidCommentIdRejected` if `comment_id` is not
+    a positive integer (both checks happen before any network call is
+    attempted), and one of `UnexpectedAuthenticationDependency` /
+    `RateLimitedRejected` / `CanonicalResourceMissing` /
+    `UpstreamEnvironmentFailure` / `TransportConnectivityFailure` /
+    `MalformedResponseBody` for the corresponding failure. Only
+    `CanonicalResourceMissing` (a true HTTP 404) means the comment does
+    not exist -- every other exception here is a transport failure that
+    must never be reported as "comment not found" (Issue #2257 AC2/AC3).
+
+    Returns the same REST JSON shape `gh api
+    repos/{repo}/issues/comments/{comment_id}` would return (this endpoint
+    IS that REST endpoint), so a caller that already consumes that `gh
+    api` shape needs no field-name translation.
+    """
+    _validate_repo(repo)
+    _validate_comment_id(comment_id)
+    url = f"{GITHUB_API_BASE}/repos/{repo}/issues/comments/{comment_id}"
     return _credentialless_get(url)
 
 
@@ -371,12 +445,16 @@ __all__ = [
     "CredentiallessReadError",
     "CrossRepositoryReadRejected",
     "InvalidIssueNumberRejected",
+    "InvalidCommentIdRejected",
     "RateLimitedRejected",
     "UnexpectedAuthenticationDependency",
     "CanonicalResourceMissing",
     "UpstreamEnvironmentFailure",
+    "TransportConnectivityFailure",
+    "MalformedResponseBody",
     "sanitized_env",
     "read_public_issue",
+    "read_single_comment",
     "list_issue_comments",
     "issue_to_gh_cli_shape",
     "GitHubReadTransport",

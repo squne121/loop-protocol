@@ -262,6 +262,13 @@ BLOCKER_FAIL_CLOSED = "PLANNER_FAIL_CLOSED"
 BLOCKER_ANCHOR_REPO_MISMATCH = "ANCHOR_REPO_MISMATCH"
 BLOCKER_ANCHOR_ISSUE_NUMBER_MISMATCH = "ANCHOR_ISSUE_NUMBER_MISMATCH"
 BLOCKER_ANCHOR_COMMENT_NOT_FOUND = "ANCHOR_COMMENT_NOT_FOUND"
+# Issue #2257 AC3: a transport failure (auth dependency, rate limit,
+# 5xx, DNS/connection, timeout, malformed JSON, incomplete pagination,
+# read authority divergence) resolving the anchor comment must never be
+# reported as "comment not found" -- it is a distinct, environment_failure
+# blocker (Issue #2197 incident: anchor comment 5315264311 was
+# misclassified as missing because of exactly this conflation).
+BLOCKER_ANCHOR_FETCH_TRANSPORT_FAILURE = "ANCHOR_FETCH_TRANSPORT_FAILURE"
 BLOCKER_ANCHOR_ISSUE_URL_MISMATCH = "ANCHOR_ISSUE_URL_MISMATCH"
 BLOCKER_ANCHOR_COMMENT_SCHEMA_INVALID = "ANCHOR_COMMENT_SCHEMA_INVALID"
 BLOCKER_ANCHOR_COMMENT_MULTIPLE_UNSUPPORTED = "ANCHOR_COMMENT_MULTIPLE_UNSUPPORTED"
@@ -3061,10 +3068,112 @@ def _fetch_issue_comments(repo: str, issue_number: int) -> tuple[list | None, st
     return None, f"gh_comments_unexpected_type: {type(data).__name__}"
 
 
+# Issue #2257 AC3/AC4: `err` is prefixed with one of these two sanitized
+# classification tags so callers can distinguish "the comment genuinely
+# does not exist" (semantic_missing) from "the fetch itself failed"
+# (transport_failure) without ever exposing credential/token/header/raw
+# response/OS error detail downstream.
+_SEMANTIC_MISSING_PREFIX = "semantic_missing:"
+_TRANSPORT_FAILURE_PREFIX = "transport_failure:"
+
+
+def _is_transport_failure(err: str) -> bool:
+    """True iff `err` (as returned by `_fetch_single_comment`) is a
+    transport failure rather than a semantic "comment not found"
+    (Issue #2257 AC2/AC3)."""
+    return err.startswith(_TRANSPORT_FAILURE_PREFIX)
+
+
+def _classify_gh_single_comment_error(err: str) -> str:
+    """Classify a `_run_gh` error string for the single-comment fetch path
+    (Issue #2257 AC3): only a genuine HTTP 404 is `semantic_missing`;
+    every other gh CLI failure (auth dependency incl. gh exit 4, timeout,
+    gh not found, JSON decode failure, any other non-zero exit/HTTP
+    status) is `transport_failure`. Returns a sanitized reason -- never
+    the raw stderr snippet (AC4)."""
+    if err.startswith("gh_exit_"):
+        rest = err[len("gh_exit_"):]
+        code_str, _, detail = rest.partition(":")
+        detail_lower = detail.strip().lower()
+        if "404" in detail_lower or "not found" in detail_lower:
+            return f"{_SEMANTIC_MISSING_PREFIX}gh_404_not_found"
+        code_str = code_str.strip()
+        if code_str == "4":
+            # gh CLI's documented "authentication required" exit code --
+            # this is exactly the isolated-profile failure mode Issue
+            # #2197 misclassified as ANCHOR_COMMENT_NOT_FOUND.
+            return f"{_TRANSPORT_FAILURE_PREFIX}gh_auth_required"
+        return f"{_TRANSPORT_FAILURE_PREFIX}gh_exit_{code_str}"
+    if err.startswith("gh_not_found"):
+        return f"{_TRANSPORT_FAILURE_PREFIX}gh_not_found"
+    if err.startswith("gh_timeout"):
+        return f"{_TRANSPORT_FAILURE_PREFIX}gh_timeout"
+    if err.startswith("gh_json_decode_error"):
+        return f"{_TRANSPORT_FAILURE_PREFIX}gh_json_decode_error"
+    if err.startswith("gh_unexpected_error"):
+        return f"{_TRANSPORT_FAILURE_PREFIX}gh_unexpected_error"
+    return f"{_TRANSPORT_FAILURE_PREFIX}gh_unclassified_error"
+
+
 def _fetch_single_comment(repo: str, comment_id: int) -> tuple[dict | None, str]:
-    """Fetch a single issue comment via gh api to validate issue_url field."""
+    """Fetch a single issue comment to validate the issue_url field
+    (Issue #2257 AC1/AC2/AC3).
+
+    Isolated Claude-GPT profile: uses the credentialless REST transport
+    (`github_credentialless_read.read_single_comment`) exclusively --
+    never falls back to `gh api` in that profile. This closes the
+    split-brain transport that caused Issue #2197's anchor comment
+    5315264311 (a genuinely-existing comment) to be misclassified as
+    missing: `_fetch_issue()`/`_fetch_issue_comments()` already had this
+    isolated-profile branch, but this function did not, so it always hit
+    an unauthenticated `gh api` call that fails with gh exit 4 in that
+    profile.
+
+    All other profiles: unchanged `gh api
+    repos/{repo}/issues/comments/{comment_id}` behavior.
+
+    On failure, `err` is prefixed with either `_SEMANTIC_MISSING_PREFIX`
+    (the comment genuinely does not exist at the canonical URL -- a true
+    404) or `_TRANSPORT_FAILURE_PREFIX` (every other failure: auth
+    dependency, rate limit, 5xx, DNS/connection, timeout, malformed JSON,
+    incomplete pagination, read authority divergence). Callers must route
+    these two categories differently -- only `semantic_missing` may be
+    treated as "comment not found" (AC2); `transport_failure` must never
+    be misreported as a missing comment (AC3). The sanitized reason after
+    the prefix never contains credential/token/header/raw response/OS
+    error detail (AC4).
+    """
+    if _is_isolated_claude_gpt_profile():
+        if _credentialless_read is None:
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}credentialless_transport_unavailable"
+        try:
+            data = _credentialless_read.read_single_comment(comment_id, repo=repo)
+        except _credentialless_read.CanonicalResourceMissing:
+            return None, f"{_SEMANTIC_MISSING_PREFIX}canonical_resource_missing"
+        except _credentialless_read.UnexpectedAuthenticationDependency:
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}unexpected_authentication_dependency"
+        except _credentialless_read.RateLimitedRejected:
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}rate_limited"
+        except _credentialless_read.UpstreamEnvironmentFailure:
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}upstream_environment_failure"
+        except _credentialless_read.TransportConnectivityFailure:
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}transport_connectivity_failure"
+        except _credentialless_read.MalformedResponseBody:
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}malformed_response_body"
+        except _credentialless_read.CrossRepositoryReadRejected:
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}cross_repository_read_rejected"
+        except _credentialless_read.InvalidCommentIdRejected:
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}invalid_comment_id"
+        except _credentialless_read.CredentiallessReadError:
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}credentialless_read_error"
+        except Exception:  # pragma: no cover - defensive fail-closed
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}credentialless_unexpected_error"
+        return data, ""
+
     data, err = _run_gh(["gh", "api", f"repos/{repo}/issues/comments/{comment_id}"])
-    return data, err
+    if data is not None:
+        return data, ""
+    return None, _classify_gh_single_comment_error(err)
 
 
 def _load_anchor_comment_schema() -> dict[str, Any]:
@@ -3490,9 +3599,15 @@ def _validate_anchor_comment_url(
         if comment_data is None:
             return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND, BLOCKER_ANCHOR_NOT_IN_ISSUE]
     else:
-        # Live mode: fetch via gh api
+        # Live mode: fetch via the single read authority (credentialless
+        # transport in isolated profile, gh api otherwise) -- Issue #2257
+        # AC1. Only a genuine semantic_missing (true 404) is reported as
+        # BLOCKER_ANCHOR_COMMENT_NOT_FOUND; a transport_failure must never
+        # be misreported as "comment not found" (AC2/AC3).
         comment_data, err = _fetch_single_comment(repo, comment_id)
         if comment_data is None:
+            if _is_transport_failure(err):
+                return False, [BLOCKER_ANCHOR_FETCH_TRANSPORT_FAILURE]
             return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND, BLOCKER_ANCHOR_NOT_IN_ISSUE]
 
     # Check 4: issue_url field validation — must be present and non-empty
@@ -5951,6 +6066,25 @@ def run_preflight(
         )
         if anchor_blockers:
             blockers.extend(anchor_blockers)
+            # Issue #2257 AC3: a transport failure resolving the anchor
+            # comment (auth dependency, rate limit, 5xx, DNS/connection,
+            # timeout, malformed JSON, incomplete pagination, read
+            # authority divergence) is reported as environment_failure --
+            # never as the semantic "blocked/human_judgment_required" path
+            # that ANCHOR_COMMENT_NOT_FOUND takes for a true 404.
+            if BLOCKER_ANCHOR_FETCH_TRANSPORT_FAILURE in anchor_blockers:
+                return _emit_failure_result(
+                    repo_root=repo_root,
+                    issue_number=issue_number,
+                    repo=repo,
+                    status="environment_failure",
+                    next_action="fix_environment",
+                    blockers=blockers,
+                    planner_fail_closed_reason_codes=[],
+                    required_sections=[],
+                    required_contract_keys=[],
+                    rewrite_constraints=None,
+                )
             return _emit_failure_result(
                 repo_root=repo_root,
                 issue_number=issue_number,
@@ -5975,9 +6109,18 @@ def run_preflight(
                         comment_payload = item
                         break
             else:
+                # Issue #2257 (low-priority follow-up noted alongside the
+                # AC1-AC3 fix): keep this re-fetch's err classification
+                # consistent with `_validate_anchor_comment_url` above
+                # instead of silently discarding it -- a true
+                # semantic_missing here (the comment vanished between the
+                # batch validation above and this re-fetch) still gets a
+                # distinguishing blocker, not just a generic GH_API_FAILURE.
                 comment_payload, err = _fetch_single_comment(repo, comment_id)
                 if comment_payload is None:
                     blockers.append(BLOCKER_GH_FAILURE)
+                    if not _is_transport_failure(err):
+                        blockers.append(BLOCKER_ANCHOR_COMMENT_NOT_FOUND)
                     return _emit_failure_result(
                         repo_root=repo_root,
                         issue_number=issue_number,

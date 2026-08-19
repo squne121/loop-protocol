@@ -28,6 +28,8 @@ import stat
 import sys
 from pathlib import Path
 
+import pytest
+
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -223,3 +225,244 @@ def test_non_isolated_profile_is_not_detected_as_isolated(monkeypatch):
     monkeypatch.setenv("HOME", real_home)
 
     assert preflight._is_isolated_claude_gpt_profile() is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #2257 AC1/AC2/AC3/AC6: `_fetch_single_comment` isolated-profile
+# regression coverage. Issue #2197's anchor comment 5315264311 was
+# misclassified as missing because `_fetch_single_comment` (unlike
+# `_fetch_issue`/`_fetch_issue_comments` above) had no isolated-profile
+# branch and always hit an unauthenticated `gh api` call.
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_single_comment_isolated_profile_never_invokes_gh_marker_executable(tmp_path, monkeypatch):
+    """GIVEN an isolated Claude-GPT session profile and a marker `gh`
+    executable installed at the front of PATH
+    WHEN `_fetch_single_comment()` is called
+    THEN it succeeds via the credentialless transport and the marker `gh`
+    executable is never invoked (Issue #2257 AC1/AC6 -- this is the exact
+    function Issue #2197's incident traced to)."""
+    invocation_marker_file = _install_gh_marker_executable(tmp_path, monkeypatch)
+    _force_isolated_profile(tmp_path, monkeypatch)
+
+    comment_id = 5315264311
+    comment_url = f"https://api.github.com/repos/{REPO}/issues/comments/{comment_id}"
+    comment_body = (
+        b'{"id": 5315264311, "body": "anchor comment body", '
+        b'"issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/2197"}'
+    )
+    _patch_credentialless_opener(monkeypatch, {comment_url: (comment_body, {})})
+
+    data, err = preflight._fetch_single_comment(REPO, comment_id)
+
+    assert err == ""
+    assert data is not None
+    assert data["id"] == 5315264311
+    assert not invocation_marker_file.exists(), (
+        "gh marker executable was invoked -- isolated profile fell back to the gh CLI "
+        "(this is exactly the Issue #2197 regression: a genuinely-existing anchor "
+        "comment must never be resolved through an unauthenticated gh api call)"
+    )
+
+
+def test_fetch_single_comment_isolated_profile_true_404_is_semantic_missing(tmp_path, monkeypatch):
+    """GIVEN an isolated Claude-GPT session profile and a genuinely
+    nonexistent comment id (a true HTTP 404)
+    WHEN `_fetch_single_comment()` is called
+    THEN the error is classified as `semantic_missing`, not
+    `transport_failure` (Issue #2257 AC2)."""
+    _install_gh_marker_executable(tmp_path, monkeypatch)
+    _force_isolated_profile(tmp_path, monkeypatch)
+
+    comment_id = 99999999
+    comment_url = f"https://api.github.com/repos/{REPO}/issues/comments/{comment_id}"
+
+    def _fake_open(request, timeout=None):
+        raise __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+            comment_url, 404, "Not Found", {}, __import__("io").BytesIO(b"")
+        )
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    data, err = preflight._fetch_single_comment(REPO, comment_id)
+
+    assert data is None
+    assert err.startswith("semantic_missing:")
+    assert not preflight._is_transport_failure(err)
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500, 503])
+def test_fetch_single_comment_isolated_profile_transport_failures_are_never_semantic_missing(
+    tmp_path, monkeypatch, status
+):
+    """GIVEN an isolated Claude-GPT session profile and any non-404 HTTP
+    failure resolving the anchor comment (401/403/429/5xx)
+    WHEN `_fetch_single_comment()` is called
+    THEN the error is classified as `transport_failure`, never
+    `semantic_missing` -- a genuinely-existing anchor comment must never
+    be reported as not found because of an auth/rate-limit/upstream
+    failure (Issue #2257 AC3, exact regression class of the #2197
+    incident: gh exit 4 in the isolated profile was being conflated with
+    ANCHOR_COMMENT_NOT_FOUND)."""
+    _install_gh_marker_executable(tmp_path, monkeypatch)
+    _force_isolated_profile(tmp_path, monkeypatch)
+
+    comment_id = 5315264311
+    comment_url = f"https://api.github.com/repos/{REPO}/issues/comments/{comment_id}"
+
+    def _fake_open(request, timeout=None):
+        raise __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+            comment_url, status, "err", {}, __import__("io").BytesIO(b"")
+        )
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    data, err = preflight._fetch_single_comment(REPO, comment_id)
+
+    assert data is None
+    assert err.startswith("transport_failure:")
+    assert preflight._is_transport_failure(err)
+    assert not err.startswith("semantic_missing:")
+
+
+def test_fetch_single_comment_isolated_profile_dns_failure_is_transport_failure(tmp_path, monkeypatch):
+    """GIVEN an isolated Claude-GPT session profile and a DNS resolution
+    failure resolving the anchor comment
+    WHEN `_fetch_single_comment()` is called
+    THEN the error is classified as `transport_failure` (Issue #2257 AC3/
+    AC7: DNS fault-injection case)."""
+    import socket
+    import urllib.error as _urllib_error
+
+    _install_gh_marker_executable(tmp_path, monkeypatch)
+    _force_isolated_profile(tmp_path, monkeypatch)
+
+    def _fake_open(request, timeout=None):
+        raise _urllib_error.URLError(socket.gaierror("Name or service not known"))
+
+    monkeypatch.setattr(gcr._opener, "open", _fake_open)
+
+    data, err = preflight._fetch_single_comment(REPO, 5315264311)
+
+    assert data is None
+    assert err.startswith("transport_failure:")
+
+
+def test_fetch_single_comment_non_isolated_profile_uses_gh_cli(monkeypatch):
+    """GIVEN a normal (non-isolated) profile
+    WHEN `_fetch_single_comment()` is called
+    THEN it still routes through `_run_gh` (unchanged `gh api` behavior --
+    Issue #2257 AC8: the normal-profile gh path must not regress)."""
+    real_home = preflight.pwd.getpwuid(os.getuid()).pw_dir
+    monkeypatch.setenv("HOME", real_home)
+    assert preflight._is_isolated_claude_gpt_profile() is False
+
+    calls: list[list[str]] = []
+
+    def _fake_run_gh(argv, timeout=preflight.GH_API_TIMEOUT):
+        calls.append(argv)
+        return {"id": 1, "issue_url": "x"}, ""
+
+    monkeypatch.setattr(preflight, "_run_gh", _fake_run_gh)
+
+    data, err = preflight._fetch_single_comment(REPO, 1)
+
+    assert err == ""
+    assert data == {"id": 1, "issue_url": "x"}
+    assert len(calls) == 1
+    assert calls[0] == ["gh", "api", f"repos/{REPO}/issues/comments/1"]
+
+
+def test_fetch_single_comment_non_isolated_profile_gh_exit_4_is_transport_failure(monkeypatch):
+    """GIVEN a normal (non-isolated) profile where `gh api` fails with
+    exit code 4 (gh CLI's documented "authentication required" exit code)
+    WHEN `_fetch_single_comment()` is called
+    THEN the error is classified as `transport_failure`, not
+    `semantic_missing` (Issue #2257 AC3: the gh-CLI-path mirror of the
+    isolated-profile 401 case above)."""
+    real_home = preflight.pwd.getpwuid(os.getuid()).pw_dir
+    monkeypatch.setenv("HOME", real_home)
+
+    monkeypatch.setattr(
+        preflight, "_run_gh", lambda argv, timeout=preflight.GH_API_TIMEOUT: (None, "gh_exit_4: authentication required")
+    )
+
+    data, err = preflight._fetch_single_comment(REPO, 1)
+
+    assert data is None
+    assert err.startswith("transport_failure:")
+
+
+def test_fetch_single_comment_non_isolated_profile_gh_404_is_semantic_missing(monkeypatch):
+    """GIVEN a normal (non-isolated) profile where `gh api` fails with a
+    genuine HTTP 404
+    WHEN `_fetch_single_comment()` is called
+    THEN the error is classified as `semantic_missing` (Issue #2257 AC2)."""
+    real_home = preflight.pwd.getpwuid(os.getuid()).pw_dir
+    monkeypatch.setenv("HOME", real_home)
+
+    monkeypatch.setattr(
+        preflight,
+        "_run_gh",
+        lambda argv, timeout=preflight.GH_API_TIMEOUT: (None, "gh_exit_1: HTTP 404: Not Found (https://api.github.com/...)"),
+    )
+
+    data, err = preflight._fetch_single_comment(REPO, 1)
+
+    assert data is None
+    assert err.startswith("semantic_missing:")
+
+
+# ---------------------------------------------------------------------------
+# Issue #2257 AC5/AC6: exact incident replay against the real GitHub REST
+# API (no opener mocking) -- Issue #2197 anchor comment 5315264311, under a
+# fresh isolated HOME, empty GH_CONFIG_DIR, token unset. Only DNS/egress-
+# unavailable/upstream-5xx/rate-limit failures are an environment SKIP
+# (never silently upgraded to PASS); any auth-dependency result is a hard
+# `pytest.fail` -- that IS the #2197 regression reproducing.
+# ---------------------------------------------------------------------------
+
+
+def test_ac5_exact_incident_replay_anchor_comment_5315264311_resolves_live(tmp_path, monkeypatch):
+    """GIVEN a fresh isolated HOME, empty GH_CONFIG_DIR, GH_TOKEN/GITHUB_TOKEN
+    unset, and a fail-on-use `gh` marker executable at the front of PATH
+    WHEN `_fetch_single_comment()` resolves Issue #2197's real anchor
+    comment 5315264311 with NO transport mocking (a real, unauthenticated
+    GitHub REST call)
+    THEN the comment resolves successfully via the credentialless
+    transport, the `gh` marker executable is never invoked, and its
+    `issue_url` points at Issue #2197 -- reproducing the exact incident
+    input and proving it no longer misclassifies as missing (Issue #2257
+    AC5/AC6)."""
+    invocation_marker_file = _install_gh_marker_executable(tmp_path, monkeypatch)
+    _force_isolated_profile(tmp_path, monkeypatch)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    empty_gh_config_dir = tmp_path / "empty-gh-config-dir"
+    empty_gh_config_dir.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(empty_gh_config_dir))
+
+    try:
+        data, err = preflight._fetch_single_comment("squne121/loop-protocol", 5315264311)
+    finally:
+        assert not invocation_marker_file.exists(), (
+            "gh marker executable was invoked during the AC5 exact incident "
+            "replay -- the isolated profile fell back to the gh CLI, "
+            "reproducing the Issue #2197 split-brain transport regression"
+        )
+
+    if err.startswith("transport_failure:") and (
+        "rate_limited" in err or "upstream_environment_failure" in err or "transport_connectivity_failure" in err
+    ):
+        pytest.skip(f"network/rate-limit/upstream unavailable in this environment: {err}")
+    if err.startswith("transport_failure:") and "authentication" in err:
+        pytest.fail(
+            f"AC5 unmet: exact incident replay reproduced the Issue #2197 auth-dependency "
+            f"misclassification for a genuinely-existing anchor comment: {err}"
+        )
+
+    assert err == "", f"AC5 unmet: anchor comment 5315264311 did not resolve: {err}"
+    assert data is not None
+    assert str(data.get("id")) == "5315264311"
+    assert data.get("issue_url") == "https://api.github.com/repos/squne121/loop-protocol/issues/2197"
