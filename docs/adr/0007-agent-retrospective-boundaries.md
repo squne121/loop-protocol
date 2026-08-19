@@ -96,19 +96,32 @@ Scope への収束）を反映して確定する。
   を取得できない。ページング中に新しい comment が追加される、review の状態が変化する
   等の理由で、収集完了時点と収集開始時点の状態が一致しない可能性が構造的に存在する。
   run 全体を単一の atomic snapshot だと誤認して扱ってはならない。
-- source ごとに以下の evidence metadata を持たせる:
-  - `observed_from` / `observed_until`: そのソースの観測を開始・終了した時刻
-    （wall-clock ISO 8601、または API から取得できる更新時刻の範囲）
+- source ごとに以下の evidence metadata を持たせる。2026-08-19 OWNER レビュー
+  （P1-8）を反映し、「収集した wall-clock の範囲」（acquisition window）と「取得した
+  API resource 自体が更新された時刻の範囲」（resource-event window）を同一 field に
+  混在させず分離する（旧 `observed_from` / `observed_until` はこの 2 種類を区別せず
+  1 組の field に格納していたため、本 ADR で明示的に分離する）:
+  - `fetch_started_at` / `fetch_completed_at`（acquisition window。収集開始終了時刻）:
+    run が当該ソースへの API 呼び出しを開始・完了した wall-clock 時刻（ISO 8601）。
+  - `resource_updated_at_min` / `resource_updated_at_max`（resource-event window。
+    resource 更新時刻範囲）: 収集した resource 群（Issue/PR/comment/review/check 等）が
+    API 上で最後に更新された時刻の最小値・最大値。旧 `observed_from` / `observed_until`
+    が指していた「API から取得できる更新時刻の範囲」はこちらに対応する。
+  - `endpoint` / `api_version`: 呼び出した API endpoint と、その version（例: GitHub
+    REST API のバージョンヘッダ）。
   - `query_params`: 適用したフィルタ・クエリパラメータ（例: `state=all`,
     `since=<timestamp>`）
-  - `pagination_completeness`: 全ページを完走したか（`complete` /
-    `partial` /  `unknown`）。`partial` の場合は打ち切り理由（rate limit、
-    タイムアウト等）を残す
-  - `cursor` / `etag`: 再現性・差分検知のための identity metadata（利用可能な場合）
+  - `page_size`: 1 ページあたりの取得件数。
+  - `pagination_completeness`（Link header 等による traversal 完了状況を含む）: 全ページを
+    完走したか（`complete` / `partial` / `unknown`）。`partial` の場合は打ち切り理由
+    （rate limit、タイムアウト等）を残す。
+  - `cursor` / `etag`: 再現性・差分検知のための identity metadata（利用可能な場合）。
 - Child 2（#2235）の run identity（`base_sha` + timestamp + runtime_version +
   source_set_digest）は、このモデルに整合するよう、GitHub/Web source について
-  `observed_from`/`observed_until` 等の evidence metadata を run identity とは別に
-  source ごとに保持する必要がある（Remaining Parent Gaps 参照、追随修正が必要）。
+  `fetch_started_at`/`fetch_completed_at`（acquisition window）と
+  `resource_updated_at_min`/`resource_updated_at_max`（resource-event window。旧
+  `observed_from`/`observed_until` 相当）等の evidence metadata を run identity とは
+  別に source ごとに保持する必要がある（Remaining Parent Gaps 参照、追随修正が必要）。
 
 ### 2. Claim-class 単位の source authority
 
@@ -119,8 +132,11 @@ Scope への収束）を反映して確定する。
 |---|---|---|---|---|
 | `code_content`（コードの現在の内容） | repository（`base_sha` 時点） | なし（単一正本） | N/A（対立しない） | run を fail-closed で中断 |
 | `code_authorship_timing`（いつ・誰が書いたか） | repository（`git log`/`git blame`） | GitHub（PR/commit metadata） | `temporal mismatch` として記録し repository を優先、GitHub 側の差分を注記 | `unavailable evidence` として記録し claim を保留 |
-| `review_decision`（レビュー結果・承認状態） | GitHub（PR review/comment API） | なし | `identity mismatch`（review 対象 commit と現在の head が異なる）を検出したら claim を保留 | `unavailable evidence` として記録 |
-| `issue_intent`（Issue の意図・スコープ） | GitHub（Issue body、最新版） | GitHub Issue comments（refinement 履歴） | `semantic disagreement`（body と comment 履歴の解釈が割れる）を記録し body を優先、comment の異論を注記 | `unavailable evidence` として記録 |
+| `internal_loop_review_verdict`（この repository 固有の review モデル。impl-review-loop の pr-reviewer が生成し、`gh pr review` の native Reviews API ではなく通常の PR timeline comment として投稿する LOOP_VERDICT） | control-plane が投稿した pr-reviewer 生成 PR comment（GitHub Issue Comments API 経由で取得。`reviewed_head_sha` を provenance として保持する） | なし | `identity mismatch`（`reviewed_head_sha` と現在の PR head が異なる）を検出したら claim を保留 | `unavailable evidence` として記録 |
+| `github_native_review_state`（GitHub 標準の Pull Request Review 状態。`APPROVED` / `CHANGES_REQUESTED` / `COMMENTED` 等） | GitHub Reviews API（`GET /pulls/{number}/reviews`） | なし | `identity mismatch`（review 対象 commit と現在の head が異なる）を検出したら claim を保留 | `unavailable evidence` として記録 |
+| `review_comment`（diff 上の review comment、または通常の PR timeline comment。互いに別 API object） | GitHub Review Comments API（diff 上のコメント）、GitHub Issue Comments API（通常の PR timeline comment） | なし | `temporal mismatch`（コメント時点と現在の PR head のズレ）を検出したら claim を保留 | `unavailable evidence` として記録 |
+| `mergeability`（PR の merge 可否・merge 状態） | GitHub PR resource の `mergeable` / `mergeStateStatus` | なし | `temporal mismatch`（判定取得時点と現在の PR head のズレ）を検出したら claim を保留 | `unavailable evidence` として記録 |
+| `issue_intent`（Issue の意図・スコープ） | current Issue body（最新版）＋ trusted directive/anchor events（OWNER/MEMBER/COLLABORATOR 由来の comment で、`issue-refinement-loop` が anchor として採用したもの。temporal supersession により、最新の trusted directive が current body へ反映済みであればそちらを正本とする） | untrusted（OWNER/MEMBER/COLLABORATOR 以外の投稿者による）Issue comment（intent authority には昇格させず、参考情報に留める） | `semantic disagreement`（current body と未反映の trusted directive/anchor の解釈が割れる、または複数の trusted directive 間で解釈が割れる）を記録し、temporal supersession で決定した最新の trusted directive を優先、他方を注記 | `unavailable evidence` として記録 |
 | `external_fact`（外部ライブラリ仕様・ドキュメント記載等） | Web（一次情報 URL） | なし | `semantic disagreement` を記録し claim を保留、human 判断を要求 | `unavailable evidence` として記録し claim を保留 |
 | `runtime_behavior`（実行結果・テスト結果） | runtime（実行ログ・test artifact） | repository（テストコード内容） | `temporal mismatch`（実行時点と評価対象 commit のズレ）を検出したら claim を保留 | `unavailable evidence` として記録し claim を保留 |
 
@@ -137,20 +153,61 @@ Scope への収束）を反映して確定する。
 - **`unavailable evidence`**: 対立ではなく、必要な情報源にそもそもアクセスできない
   状態（rate limit、権限不足、404 等）。claim を確定せず保留として扱う。
 
+**2026-08-19 OWNER レビュー（P0-2）を反映した `issue_intent` の authority model 補足**:
+`issue-refinement-loop` は OWNER/MEMBER/COLLABORATOR による trusted anchor comment を
+authority evidence として扱い、scope/contract update の入力とする設計であり、本 Issue
+（#2234）自身も OWNER の `REQUEST_CHANGES` comment を trusted human-context anchor として
+採用し Issue body を rewrite した実績がある。したがって `issue_intent` は「body が常に
+優先」という単純な固定順位ではなく、「current body ＋ typed trusted-directive/anchor
+events（OWNER/MEMBER/COLLABORATOR 由来）＋ temporal supersession」としてモデル化する。
+untrusted な comment（OWNER/MEMBER/COLLABORATOR 以外）は intent authority に昇格させ
+ないが、trusted provenance を持つ directive は contract delta authority を持つ。
+
+**2026-08-19 OWNER レビュー（P0-3）を反映した review 系 claim_class 分割の補足**:
+GitHub 上では Pull Request Review（Reviews API）、diff 上の review comment（Review
+Comments API）、通常の PR timeline comment（Issue Comments API）は別オブジェクトであり、
+かつこの repository の impl-review-loop は native `gh pr review` を使わず、pr-reviewer の
+LOOP_VERDICT を通常の PR comment として投稿する独自モデルを用いる。そのため単一の
+`review_decision` に一括せず、`internal_loop_review_verdict` /
+`github_native_review_state` / `review_comment` / `mergeability` の 4 claim_class に分割し、
+各々の authoritative source と provenance（`reviewed_head_sha` 等）を明記する。
+
 ## 3. Threat/trust matrix（脅威・信頼マトリクス）
 
 `asset × trust level × capability × sink × mitigation` の形式で少なくとも以下を扱う。
 
+**2026-08-19 OWNER レビュー（P0-5）を反映した normative 原則**: untrusted な GitHub
+content（Issue/PR/comment/title/branch・ref 名等）や Web content について、「shell/tool
+引数へ直接連結しない」だけでは不十分である。prompt injection においては、untrusted な
+テキストが LLM の実行可能コンテキスト（evaluator/orchestrator が判断・mutation 承認を
+行う privileged context）に「テキストとして」入ること自体が攻撃経路になる。したがって
+untrusted content は次の多段境界を経由させ、raw な untrusted payload を authorization・
+synthesis を行う main context（privileged evaluator/control-plane context）へ直接投入
+しない:
+
+1. **deterministic extraction**（決定論的抽出）: API/parser で構造化データとして取り出す
+   （自由形式のテキスト全体を無検証で転記しない）。
+2. **provenance/taint 付与**: 抽出したデータに「untrusted GitHub content 由来」である
+   ことを示す taint/provenance metadata を付与する。
+3. **isolated observation context**（隔離された観測コンテキスト）: untrusted content は
+   まず、mutation 承認権限を持たない隔離された observation/collector context でのみ
+   扱う。
+4. **structured projection**（構造化された投影）: schema-controlled projection（下記
+   6 項の allowlist モデル）を経て、必要な情報のみを構造化データとして次段へ渡す。
+5. **privileged evaluator/control-plane**（権限を持つ評価者・control-plane）: mutation
+   の承認・synthesis を行う privileged context には、上記の構造化投影を経た結果のみを
+   渡し、raw untrusted payload を直接渡さない。
+
 | asset | trust level | capability（何ができるか） | sink（どこに流れうるか） | mitigation |
 |---|---|---|---|---|
-| malicious Issue/PR body（untrusted GitHub content） | untrusted（外部投稿者が制御可能） | 任意のテキストを埋め込める | LLM プロンプトコンテキスト、Issue/PR comment 生成、shell コマンド引数 | untrusted content を実行可能コンテキスト（shell コマンド、ツール引数構築）へ直接連結しない。テキストとしてのみ LLM コンテキストに渡し、そこから抽出した「指示」をそのまま権限のある操作へ変換しない（GitHub のスクリプトインジェクション防御方針、Claude Code の prompt injection 防御方針〔permission・isolation・sanitization〕と整合） |
+| malicious Issue/PR body（untrusted GitHub content） | untrusted（外部投稿者が制御可能） | 任意のテキストを埋め込める | LLM プロンプトコンテキスト（isolated observation context を含む）、Issue/PR comment 生成、shell コマンド引数 | untrusted content を実行可能コンテキスト（shell コマンド、ツール引数構築）へ直接連結しない。上記の多段境界（deterministic extraction → provenance/taint 付与 → isolated observation context → structured projection → privileged evaluator/control-plane）を経由させ、raw untrusted テキストを privileged evaluator/control-plane context へ直接投入しない。そこから抽出した「指示」をそのまま権限のある操作へ変換しない（GitHub のスクリプトインジェクション防御方針、Claude Code の prompt injection 防御方針〔permission・isolation・sanitization〕と整合） |
 | malicious comment（untrusted GitHub content） | untrusted | 任意のテキスト・リンクを埋め込める | 同上 | 同上 |
 | malicious title（untrusted GitHub content） | untrusted | 短文だが同様のリスク | 同上 | 同上 |
 | malicious branch/ref 名（untrusted GitHub content） | untrusted | shell 引数として解釈されうる文字列を含められる | `git` コマンド引数、shell 実行 | shell 引数は配列渡し（`shell=False` 相当）で構築し、branch/ref 名を shell 文字列連結で組み立てない |
 | secret（API token、credential） | confidential（repo/env に存在する場合は trusted source だが公開してはならない） | 存在するだけで漏洩リスクを持つ | public artifact（Issue comment、PR body、public な成果物ファイル） | public/private artifact 境界（下記 6 項）の allowlist モデルに従い、schema-controlled projection にのみ含まれることを保証する。secret を含みうる raw evidence は既定で非公開 |
 | absolute local path | 準機密（実行環境・ユーザー情報を推測されうる） | 環境情報の漏洩 | 同上 | 同上（allowlist モデルで非公開） |
 | raw stdout/stderr（tool 実行結果） | untrusted〜準機密混在（外部コマンドの出力は untrusted content を含みうる） | secret・path の漏洩、prompt injection の再入力経路 | LLM プロンプトコンテキスト、public artifact | raw stdout/stderr を schema-controlled projection を経ずに public artifact へ転記しない。LLM コンテキストへの再投入時も untrusted content として扱う |
-| prompt injection payload（Issue/PR/comment/Web に埋め込まれた LLM 向け指示文字列） | untrusted | LLM の判断・以後のツール呼び出しを誘導しうる | LLM プロンプトコンテキスト、以後の mutation 判断 | untrusted external content を「データ」としてのみ扱い、そこに含まれる指示文をそのまま権限のある操作（mutation boundary 下記 4 項の remediation/control-plane mutation）の承認根拠にしない。mutation は本 ADR の mutation boundary（human authorization point）に従う |
+| prompt injection payload（Issue/PR/comment/Web に埋め込まれた LLM 向け指示文字列） | untrusted | LLM の判断・以後のツール呼び出しを誘導しうる | LLM プロンプトコンテキスト（isolated observation context を含む）、以後の mutation 判断 | untrusted external content を「データ」としてのみ扱い、isolated observation context に隔離した上で structured projection を経由させ、raw payload を privileged evaluator/control-plane context に直接渡さない。そこに含まれる指示文をそのまま権限のある操作（mutation boundary 下記 4 項の remediation/control-plane mutation）の承認根拠にしない。mutation は本 ADR の mutation boundary（human authorization point）に従う |
 
 本 matrix は、GitHub の script injection 防御方針（Actions のようにコンテンツを
 直接シェル評価しない）および Claude Code の prompt injection 防御方針
@@ -163,9 +220,14 @@ mutation を次の 2 分類に明示的に分け、それぞれの human authori
 - **`artifact-publication mutation`**: retrospective run の観測結果そのものを記録・
   公開する mutation。例: `agent_retrospective_run/v1` を Issue comment として投稿する
   こと。これは「run が何を観測したか」を記録する行為であり、repo のコード・設定・
-  runtime の挙動を変更しない。human authorization point: **事前承認不要（自動投稿を
-  許可してよい）**。ただし投稿内容は本 ADR の public/private artifact 境界
-  （下記 6 項の allowlist モデル）を満たしたものに限る。
+  runtime の挙動を変更しない。**2026-08-19 OWNER レビュー（P0-1）を反映**:
+  Parent #2192 は現時点で retrospective run を proposal-only とし、Issue/PR/repository
+  mutation は人間判断後に controlled executor へ routing することを固定契約にしている。
+  本 Issue（#2234）の OWNER レビューは「自動許可するか人間承認にするかを ADR で固定
+  せよ」と求めたものであり、「自動許可へ変更してよい」とまでは示していない。したがって
+  human authorization point: **事前の人間承認が必要（自動投稿は不可。proposal-only）**。
+  Issue comment としての投稿を含め、artifact-publication mutation も remediation /
+  control-plane mutation と同様に、人間判断を経てから controlled executor が実行する。
 - **`remediation / control-plane mutation`**: retrospective の結果を受けて、状態や
   repo に対して変更を加える mutation。例: improvement candidate を `accepted` 状態に
   遷移させる、実装 Issue（implementation issue）を新規作成する、repo ファイルを編集
@@ -174,11 +236,14 @@ mutation を次の 2 分類に明示的に分け、それぞれの human authori
   Skill は improvement candidate を `proposed` 状態で提示するに留め、`accepted` への
   遷移・実装 Issue の起票・repo ファイル編集を自動で行わない。
 
-Child 5（#2238）が実装する `agent_retrospective_run/v1` の Issue comment 自動投稿は
-`artifact-publication mutation` に該当し、事前承認不要で自動投稿してよい。これは
-「improvement candidate を提案のみに留める」という proposal-only の原則と矛盾しない
-（run の観測結果を記録することと、改善候補を承認することは別の mutation class である
-ため）。
+Child 5（#2238）が実装する `agent_retrospective_run/v1` の Issue comment 投稿は
+`artifact-publication mutation` に該当するが、上記の通り本 ADR は human authorization
+point を「事前の人間承認が必要」に固定する。Child 5 の現行実装が事前承認なしで
+自動投稿している場合、本 ADR に合わせて追随修正が必要（Remaining Parent Gaps 参照）。
+これは「improvement candidate を提案のみに留める」という proposal-only の原則と矛盾
+しない（run の観測結果を記録することと、改善候補を承認することは別の mutation class
+であるが、いずれも repository/Issue/PR への mutation であるため、同じ human
+authorization point に従う）。
 
 ## 5. Optimistic concurrency と idempotency の区別
 
@@ -211,6 +276,22 @@ Parent Gaps 参照）。真の optimistic concurrency（`expected_previous_diges
 採用しない。代わりに **allowlist モデル**を採用する: raw evidence は既定で非公開とし、
 public な成果物は schema で定義された field のみを含む **schema-controlled
 projection** に限定する。
+
+**2026-08-19 OWNER レビュー（P0-6）を反映した二層防御の明記**: JSON Schema の
+`additionalProperties` は property set（どの field を含めてよいか）を制限するだけで
+あり、許可済み string field の中身が secret / absolute path / PII / private GitHub
+content / prompt injection payload を含むかどうかまでは自動的に安全化しない。したがって
+本 allowlist モデルは以下 2 層で構成する:
+
+1. **field allowlist**（どの key を public にするか）: schema に明示的に定義された
+   field のみを public な成果物に含める。schema に未定義の field を「とりあえず
+   含める」判断を実装時に行わない。
+2. **value-level public-safety validator / redaction / taint policy**（許可された
+   field の中身が secret 等を含んでいないかの検証）: field allowlist を通過した値
+   についても、secret / absolute local path / PII / private GitHub content / prompt
+   injection payload が値の中に混入していないかを value-level validator で検証し、
+   検出した場合は redaction するか投稿自体を拒否する。field allowlist だけでは
+   value-level safety を保証しない。
 
 非公開対象（public artifact に含めてはならない raw evidence）の例:
 
@@ -249,8 +330,8 @@ retrospective 記録から導出される索引）としての役割を維持し
 - claim-class 単位の source authority と conflict taxonomy により、Child 6 の
   automated verification が「対立の種類」を機械的に分類できる。
 - mutation boundary の明確化により、Child 4（Skill/SubAgent 実装）が
-  `artifact-publication mutation` の自動投稿と `remediation` の人間承認を型として
-  区別しやすくなる。
+  `artifact-publication mutation` と `remediation` を型として区別しつつ、両者とも
+  事前の人間承認（proposal-only）を要する mutation class として一貫して扱える。
 - allowlist モデルの採用により、schema に未定義の field が誤って public 化される
   リスクを構造的に下げる。
 
@@ -266,13 +347,16 @@ retrospective 記録から導出される索引）としての役割を維持し
 - Child 5（#2238）: `(repo, base_sha, source_set_digest, scope)` ベースの重複抑止を
   idempotency として明示し、真の optimistic concurrency（`expected_previous_digest`/
   `version` 等）を別途設計する追随修正が必要。
-- Child 5（#2238）: `agent_retrospective_run/v1` の Issue comment 自動投稿契約を、
-  本 ADR の mutation boundary（`artifact-publication mutation` に該当する旨）に
-  合わせて再確認する追随修正が必要。
+- Child 5（#2238）: `agent_retrospective_run/v1` の Issue comment 投稿契約を、
+  本 ADR の mutation boundary（`artifact-publication mutation` は事前の人間承認
+  （proposal-only）を要する旨。2026-08-19 OWNER レビュー P0-1 で確定）に合わせて
+  再確認する追随修正が必要。現行実装が事前承認なしで自動投稿している場合は修正が必要。
 - Child 2（#2235）: run identity（`base_sha` + timestamp + runtime_version +
   source_set_digest）を、本 ADR の bounded observation モデル（source ごとの
-  `observed_from`/`observed_until` 等の evidence metadata）に合わせて再確認する
-  追随修正が必要。
+  `fetch_started_at`/`fetch_completed_at`（acquisition window）と
+  `resource_updated_at_min`/`resource_updated_at_max`（resource-event window。旧
+  `observed_from`/`observed_until` 相当）等の evidence metadata。2026-08-19 OWNER
+  レビュー P1-8 で分離を明確化）に合わせて再確認する追随修正が必要。
 - Child 7（plugin distribution）: Child 4 完了後に着手する。
 
 ## References（参考文献）
@@ -289,3 +373,10 @@ retrospective 記録から導出される索引）としての役割を維持し
 - 2026-08-18 OWNER レビュー
   （https://github.com/squne121/loop-protocol/issues/2234#issuecomment-5327616033、
   verdict: REQUEST_CHANGES / reframe_in_place）
+- 2026-08-19 OWNER レビュー
+  （https://github.com/squne121/loop-protocol/pull/2253#issuecomment-5340596392、
+  verdict: REQUEST_CHANGES。P0-1（artifact-publication mutation の authorization）、
+  P0-2（issue_intent の authority model）、P0-3（review_decision の claim class
+  分割）、P0-5（threat matrix の untrusted content 扱い）、P0-6（schema-controlled
+  projection の value-level safety）、P1-8（bounded observation の timestamp
+  semantics）を反映）
