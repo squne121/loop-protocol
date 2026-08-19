@@ -303,7 +303,9 @@ def test_production_command_registry_wires_anchor_command_to_run_refinement_pref
 # invocation-count assertion.
 # ---------------------------------------------------------------------------
 
-_SKILL_RUNTIME_EXEC_ANCHOR_FIXTURES_MODULE = REPO_ROOT / "scripts" / "agent-guards" / "tests" / "test_skill_runtime_exec_anchor.py"
+_SKILL_RUNTIME_EXEC_ANCHOR_FIXTURES_MODULE = (
+    REPO_ROOT / "scripts" / "agent-guards" / "tests" / "test_skill_runtime_exec_anchor.py"
+)
 
 
 def _load_skill_runtime_exec_anchor_fixtures():
