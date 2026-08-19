@@ -2811,3 +2811,15 @@ push・remote ref 削除・repository settings 変更等）を deterministic に
 production-grade な broker / hook-level deny の実装は本 Issue の scope 外であり、
 follow-up Issue #2223（実装: raw gh/git push を deterministic deny し GitHub
 mutation production broker を実装する、OPEN）で対応する。
+
+## agent-retrospective の run 境界 / source authority（情報源の権威） / mutation boundary（変更操作の境界）（ADR 0007、Issue #2234）
+
+継続的 retrospective Skill（`.claude/skills/agent-retrospective/`、#2192）が扱う
+`agent_retrospective_run/v1` / `agent_improvement_candidate/v1` の概念契約（run
+consistency model、claim-class 単位の source authority、threat/trust matrix、
+mutation boundary、optimistic concurrency と idempotency の区別、public/private
+artifact 境界、既存 `agent_retro_index/v1` との責務分離）は
+`docs/adr/0007-agent-retrospective-boundaries.md` を正本とする。Child 2〜6
+（schema、source adapter、Skill/SubAgent 実装、永続化、セキュリティ境界の自動テスト）
+は同 ADR の normative decision table を実装契約として参照する。JSON Schema 自体の
+実装は Child 2（#2235）の責務であり、本節および同 ADR はテキスト仕様に留まる。
