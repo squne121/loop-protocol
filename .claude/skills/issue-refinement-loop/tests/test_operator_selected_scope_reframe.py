@@ -752,30 +752,24 @@ def test_fixture_human_context_real_subprocess_reaches_contract_update_required_
         "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(tmp_path),
     })
     (home / "empty-gh-config").mkdir(parents=True)
-    # Issue #2241: `_safe_path_entries`/`_sanitize_env` derive their PATH
-    # trust root via `pwd.getpwuid(os.getuid()).pw_dir` (the real OS account
-    # home), independent of the `HOME` environment variable -- an isolated
-    # Claude-GPT session's fake `HOME` must no longer narrow or replace the
-    # trusted toolchain PATH. A real subprocess launched with `HOME=home`
-    # therefore can no longer be used to observe trust-root derivation
-    # against this test's isolated `home` (its own `_sanitize_env` call
-    # would resolve the *real* OS account home, not `home`). To still
-    # deterministically exercise `_sanitize_env`'s trust-root and
-    # `GH_CONFIG_DIR` isolation behavior against this test's isolated
-    # `home`, call it in-process with `pwd.getpwuid` patched to report
-    # `home` as the account home, instead of relying on an out-of-process
-    # `HOME` env override the production code no longer honors for trust
-    # root purposes.
-    fake_pw_entry = pwd.struct_passwd((
-        "issue-2241-isolated-home-account", "x", os.getuid(), os.getgid(), "", str(home), "/bin/sh",
-    ))
-    with patch.object(skill_runtime_exec_mod.pwd, "getpwuid", return_value=fake_pw_entry), \
-            patch.dict(os.environ, env, clear=True):
+    # Issue #2251: account-home `~/.local/bin` is now excluded from
+    # `_safe_path_entries()`'s trust root unconditionally -- not merely
+    # validated against the real OS account home the way the prior #2241
+    # `pwd.getpwuid`-derived design did. This test no longer needs to spoof
+    # the account home via `pwd.getpwuid` patching to observe trust-root
+    # behavior against this test's isolated `home`: `_sanitize_env` is
+    # called in-process (env only, no `pwd` patch) to assert the canary
+    # planted at `home/.local/bin/gh` is never admitted into the sanitized
+    # PATH (the same CWE-427 same-UID lookalike this test used to plant is
+    # now categorically excluded rather than merely observed), while
+    # `GH_CONFIG_DIR` isolation -- independent of trust-root resolution --
+    # is still preserved.
+    with patch.dict(os.environ, env, clear=True):
         effective_env = skill_runtime_exec_mod._sanitize_env(
             str(repo), "preflight.run.fixture.with_human_context"
         )
-    assert effective_env["PATH"].split(os.pathsep)[0] == str(canary.parent)
-    assert shutil.which("gh", path=effective_env["PATH"]) == str(canary)
+    assert str(canary.parent) not in effective_env["PATH"].split(os.pathsep)
+    assert shutil.which("gh", path=effective_env["PATH"]) != str(canary)
     assert effective_env["GH_CONFIG_DIR"] == str(home / "empty-gh-config")
     subprocess.run(
         [str(canary.parent / "uv"), "run", "python3", "--version"],
@@ -793,6 +787,24 @@ def test_fixture_human_context_real_subprocess_reaches_contract_update_required_
     )
     assert produced is not None, error
     transport_rel = str(Path(produced["manifest_path"]).relative_to(repo))
+    # Issue #2251: `canary.parent` (`home/.local/bin`) is no longer a trust
+    # root `skill_runtime_exec.py`'s own dispatch will resolve `uv` from --
+    # only a root-installed hostedtoolcache (CI runner images) or a system
+    # standard directory qualifies now. On a plain dev sandbox lacking
+    # both, the top-level process fails closed with `uv_not_found` before
+    # it can even spawn the nested child that performs the real AC3/AC4
+    # routing this test targets. Probe trusted-`uv` availability in-process
+    # (read-only, no side effects) so this test asserts the concrete,
+    # environment-appropriate fail-closed/positive outcome instead of
+    # silently masking a real difference between "reached
+    # contract_update_required" (CI/hostedtoolcache-equipped) and "failed
+    # closed before dispatch" (this sandbox) -- both `returncode == 1`, but
+    # for different reasons distinguished via stderr/provenance below.
+    try:
+        skill_runtime_exec_mod._resolve_trusted_executable("uv", str(repo))
+        trusted_uv_available = True
+    except RuntimeError:
+        trusted_uv_available = False
     result = subprocess.run([
         sys.executable, "scripts/agent-guards/skill_runtime_exec.py",
         "--command-id", _AC3_COMMAND_ID, "--issue-number", str(ISSUE), "--repo", REPO,
@@ -800,41 +812,46 @@ def test_fixture_human_context_real_subprocess_reaches_contract_update_required_
         "--investigation-evidence-transport-path", transport_rel,
     ], cwd=repo, env=env, capture_output=True, text=True, timeout=120, check=False)
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert "exact command class rejected" not in result.stderr, result.stderr
-    provenance = json.loads((
-        repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE)
-        / "refinement_preflight_provenance_v1.json"
-    ).read_text(encoding="utf-8"))
-    route = provenance["runtime_evidence"]["route"]
-    assert route["action"] == "contract_update_required", provenance
-    assert route["implementation_allowed"] is False, provenance
-    planner_input = json.loads((
-        repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE) / "planner_input.json"
-    ).read_text(encoding="utf-8"))
-    assert planner_input["known_context"]["human_context_comment_urls"] == [anchor_url]
+    if trusted_uv_available:
+        assert "exact command class rejected" not in result.stderr, result.stderr
+        provenance = json.loads((
+            repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE)
+            / "refinement_preflight_provenance_v1.json"
+        ).read_text(encoding="utf-8"))
+        route = provenance["runtime_evidence"]["route"]
+        assert route["action"] == "contract_update_required", provenance
+        assert route["implementation_allowed"] is False, provenance
+        planner_input = json.loads((
+            repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE) / "planner_input.json"
+        ).read_text(encoding="utf-8"))
+        assert planner_input["known_context"]["human_context_comment_urls"] == [anchor_url]
+    else:
+        assert "uv_not_found" in result.stderr, (result.stdout, result.stderr)
     assert not sentinel.exists(), "fixture success must not hide a gh invocation"
 
 
 def test_sanitize_env_trust_root_real_subprocess_ignores_home_override_ac3(tmp_path: Path):
-    """PR #2247 review P1-4.4: a real, out-of-process subprocess boundary
-    test for the same trust-root invariant the in-process
-    `pwd.getpwuid`-patched call above exercises.
+    """PR #2247 review P1-4.4 / Issue #2251: a real, out-of-process
+    subprocess boundary test for the trust-root invariant the in-process
+    call above exercises.
 
-    The in-process call above was introduced by a prior fix_delta as a
-    *replacement* for a real subprocess assertion, because production trust
-    resolution now keys off `pwd.getpwuid(os.getuid()).pw_dir` (the real OS
-    account, invariant to `HOME`) rather than `HOME` itself -- so a
-    subprocess launched with `HOME` overridden to an isolated directory can
-    no longer be used to *redirect* the trust root to that directory (that
-    redirection is exactly the vulnerability #2241 fixed). This test keeps
-    that real-subprocess boundary coverage instead of relying solely on the
-    in-process mock: it spawns an actual child process (same OS account,
-    `HOME` overridden to a fresh empty isolated directory, matching what
-    the Claude-GPT launcher does) and asserts, from the CHILD's own stdout,
-    that `_safe_path_entries()`'s `.local/bin` trust entry resolved to the
-    REAL account home -- not the isolated `HOME` the child process itself
-    was launched with. This is deliberately independent of (and does not
-    replace) the in-process mock test immediately above."""
+    Prior to Issue #2251, production trust resolution keyed off
+    `pwd.getpwuid(os.getuid()).pw_dir` (the real OS account home,
+    invariant to `HOME`) to decide *which* `.local/bin` to trust -- so a
+    subprocess launched with `HOME` overridden to an isolated directory
+    could not be used to *redirect* the trust root to that directory. Issue
+    #2251 closes the underlying CWE-427 same-UID gap entirely by dropping
+    account-home `.local/bin` -- both the real account's and any
+    HOME-overridden one -- from the trust root altogether (see
+    `_safe_path_entries()`). This test keeps the real-subprocess boundary
+    coverage instead of relying solely on the in-process mock: it spawns an
+    actual child process (same OS account, `HOME` overridden to a fresh
+    empty isolated directory, matching what the Claude-GPT launcher does)
+    and asserts, from the CHILD's own stdout, that `_safe_path_entries()`
+    contains NO `.local/bin` entry at all -- neither the isolated `HOME`
+    the child process itself was launched with, nor the real account home.
+    This is deliberately independent of (and does not replace) the
+    in-process mock test immediately above."""
     real_account_home = pwd.getpwuid(os.getuid()).pw_dir
     isolated_home = tmp_path / "isolated-home-real-subprocess"
     isolated_home.mkdir()
@@ -857,11 +874,11 @@ def test_sanitize_env_trust_root_real_subprocess_ignores_home_override_ac3(tmp_p
 
     entries = json.loads(result.stdout)
     local_bin_entries = [e for e in entries if e.endswith(str(Path(".local") / "bin"))]
-    assert local_bin_entries, (entries, result.stderr)
-    assert not any(str(isolated_home) in entry for entry in local_bin_entries), (entries, result.stderr)
-    assert any(str(Path(real_account_home) / ".local" / "bin") == entry for entry in local_bin_entries), (
-        entries, result.stderr,
-    )
+    assert not local_bin_entries, (entries, result.stderr)
+    assert not any(str(isolated_home) in entry for entry in entries), (entries, result.stderr)
+    assert not any(
+        str(Path(real_account_home) / ".local" / "bin") == entry for entry in entries
+    ), (entries, result.stderr)
 
 
 def test_fixture_human_context_sibling_rejects_cross_lane_and_binding_inputs_before_child(tmp_path: Path):
@@ -1008,18 +1025,41 @@ def test_fixture_human_context_sibling_fails_closed_on_transport_anchor_mismatch
     (home / "empty-gh-config").mkdir(parents=True)
     subprocess.run([str(bin_dir / "uv"), "run", "python3", "--version"], cwd=repo, env=env,
                    check=True, capture_output=True, text=True, timeout=120)
+    # Issue #2251: `bin_dir` (`home/.local/bin`) is no longer a trust root
+    # `skill_runtime_exec.py`'s own dispatch will resolve `uv` from -- only
+    # a root-installed hostedtoolcache (CI runner images) or a system
+    # standard directory qualifies now. On a plain dev sandbox lacking
+    # both, the top-level process fails closed with `uv_not_found` before
+    # it can even spawn the nested child that performs the anchor-mismatch
+    # check this test targets (AC5). Probe trusted-`uv` availability
+    # in-process (read-only, no side effects) so this test asserts the
+    # concrete, environment-appropriate fail-closed outcome instead of
+    # silently masking a real difference: on hostedtoolcache-equipped
+    # environments (CI) the mismatch check itself is reached and rejects
+    # with returncode 2; on this sandbox it fails closed one layer earlier
+    # with returncode 1 and `uv_not_found` -- both are genuine fail-closed
+    # outcomes, never a silent success on the mismatched anchor.
+    try:
+        skill_runtime_exec_mod._resolve_trusted_executable("uv", str(repo))
+        trusted_uv_available = True
+    except RuntimeError:
+        trusted_uv_available = False
     result = subprocess.run([
         sys.executable, "scripts/agent-guards/skill_runtime_exec.py",
         "--command-id", _AC3_COMMAND_ID, "--issue-number", str(ISSUE), "--repo", REPO,
         "--fixture", fixture_rel, "--anchor-comment-url", anchor_url,
         "--investigation-evidence-transport-path", transport_rel,
     ], cwd=repo, env=env, capture_output=True, text=True, timeout=120, check=False)
-    assert result.returncode == 2, (result.stdout, result.stderr)
-    provenance = json.loads((
-        repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE)
-        / "refinement_preflight_provenance_v1.json"
-    ).read_text(encoding="utf-8"))
-    assert provenance["runtime_evidence"]["route"]["action"] != "contract_update_required"
+    if trusted_uv_available:
+        assert result.returncode == 2, (result.stdout, result.stderr)
+        provenance = json.loads((
+            repo / ".claude/artifacts/issue-refinement-loop" / str(ISSUE)
+            / "refinement_preflight_provenance_v1.json"
+        ).read_text(encoding="utf-8"))
+        assert provenance["runtime_evidence"]["route"]["action"] != "contract_update_required"
+    else:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert "uv_not_found" in result.stderr, (result.stdout, result.stderr)
 
 
 def test_untrusted_author_association_never_gets_operator_relaxation_ac5():
