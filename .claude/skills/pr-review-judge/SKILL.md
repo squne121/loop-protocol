@@ -179,7 +179,7 @@ gh pr comment <PR番号> --repo <owner>/<repo> --body-file <本文テキスト�
 - 投稿前後に `gh pr view --json headRefOid` で head をリードバックする。投稿後に head が変化していた場合は
   その投稿を stale note として扱い、fresh review を実行する（Safety Invariants）。
 - self-authored でも常に `event: COMMENT` 相当の通常コメント投稿（`gh pr review --approve` / `--request-changes` は使わない）
-- 生の `gh pr review` を直接呼び出してはならない（root checkout からは `local_main_branch_guard.sh` が `gh_mutation_denied` として拒否する）
+- 生の `gh pr review` を直接呼び出してはならない（reviewer と呼び出し元の間の behavioral workflow contract。`local_main_branch_guard.sh` は現在 `.claude/settings.json` の `hooks.PreToolUse` に wiring されておらず（PR #1691, commit `f971a95d`）、この契約の technical enforcement authority ではない。command/routing/permission/prohibition の詳細は本 SKILL.md が owner — #1732）
 
 ## Output Contract（出力契約、Issue #1873 最小 convention）
 
