@@ -54,7 +54,7 @@ controlled-executor receipt は補助的な観測情報（advisory telemetry）�
 
 ### 完了時の返却（destination: pr-review-judge SKILL.md 6) verdict 投稿）
 
-完了時は verdict 本文（人間可読 Markdown + 最小 YAML ブロック）を組み立て、`verdict` / `reviewed_head_sha` / `blockers` / `warnings` とともに呼び出し元へ返す。実際の GitHub 投稿（通常の `gh pr comment --body-file`）は本 agent の責務ではなく、呼び出し元（trusted orchestrator）が担う。本 agent 自身は worktree を作成せず、生の `gh pr review` も呼ばない（`local_main_branch_guard.sh` が root checkout からの生 `gh pr review` を引き続き `gh_mutation_denied` として拒否するため）。mergeability（`mergeable` / `merge_state_status`）は本 agent の出力に含めない -- control-plane が `gh pr view` で直接取得する。
+完了時は verdict 本文（人間可読 Markdown + 最小 YAML ブロック）を組み立て、`verdict` / `reviewed_head_sha` / `blockers` / `warnings` とともに呼び出し元へ返す。実際の GitHub 投稿（通常の `gh pr comment --body-file`）は本 agent の責務ではなく、呼び出し元（trusted orchestrator）が担う。本 agent 自身は worktree を作成せず、生の `gh pr review` も呼ばない（reviewer と呼び出し元の間の behavioral workflow contract であり、`local_main_branch_guard.sh` は現在 `.claude/settings.json` の `hooks.PreToolUse` に wiring されておらず（PR #1691, commit `f971a95d`）、この契約の technical enforcement authority ではない）。mergeability（`mergeable` / `merge_state_status`）は本 agent の出力に含めない -- control-plane が `gh pr view` で直接取得する。
 
 ## 終端状態・verdict・publish_event・merge_ready（別軸、AC7）
 
