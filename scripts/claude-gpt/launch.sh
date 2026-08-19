@@ -405,6 +405,23 @@ def parse_delegation_directive(prompt_text):
             # Not a spark delegation directive at all (different schema
             # value); keep scanning other candidate blocks.
             continue
+        # Issue #2258 P1-7 fix-delta: hardening checks for this
+        # authorization-parsing surface, applied only once a block has
+        # already matched `schema: DELEGATION_REQUEST_V1` (ordinary
+        # unrelated `key: value`-shaped prose elsewhere in the prompt is
+        # never touched by these checks -- same scanning behavior as
+        # before). A duplicated key is rejected instead of silently
+        # keeping the last-write-wins value, and any key outside the
+        # known schema is rejected instead of being silently ignored.
+        seen_counts = {}
+        for k, _ in block:
+            seen_counts[k] = seen_counts.get(k, 0) + 1
+        duplicated = [k for k, c in seen_counts.items() if c > 1]
+        if duplicated:
+            return {"status": "malformed", "reason": "duplicate_key", "key": duplicated[0]}
+        unknown = [k for k in values if k not in DELEGATION_REQUIRED_KEYS]
+        if unknown:
+            return {"status": "malformed", "reason": "unknown_key", "key": unknown[0]}
         missing = [k for k in DELEGATION_REQUIRED_KEYS if k not in values]
         if missing:
             return {"status": "malformed", "reason": "missing_required_keys", "missing": missing}
@@ -416,6 +433,21 @@ def parse_delegation_directive(prompt_text):
             return {"status": "malformed", "reason": "invalid_mode", "value": values["mode"]}
         if values["fallback"] not in DELEGATION_VALID_FALLBACK:
             return {"status": "malformed", "reason": "invalid_fallback", "value": values["fallback"]}
+        # Issue #2258 P1-5 fix-delta: `mode`/`fallback` are individually
+        # valid enum values above, but the pairing itself must not be
+        # semantically contradictory. The Issue #2258 contract is
+        # `required => no fallback` / `preferred => fallback allowed`; the
+        # enum value set itself is unchanged (schema stays the same).
+        if (values["mode"], values["fallback"]) not in (
+            ("required", "forbidden"),
+            ("preferred", "allowed"),
+        ):
+            return {
+                "status": "malformed",
+                "reason": "contradictory_mode_fallback",
+                "mode": values["mode"],
+                "fallback": values["fallback"],
+            }
         if values["wait"] != "true":
             return {"status": "malformed", "reason": "invalid_wait", "value": values["wait"]}
         if values["authorization_source"] != DELEGATION_AUTH_SOURCE:
@@ -570,9 +602,18 @@ def cmd_user_prompt_submit(payload):
     elif has_canonical_mention(prompt):
         authorization_source = "canonical_mention"
 
+    # Issue #2258 P1-6 fix-delta: a malformed directive attempt is always
+    # recorded as an explicit diagnostic artifact, independent of whether a
+    # SEPARATE canonical-mention authorization is granted this same turn --
+    # both happen together (grant authorization AND record the diagnostic),
+    # never either/or. Previously this write was skipped whenever
+    # canonical-mention authorization already set `authorization_source`,
+    # silently suppressing the diagnostic.
+    if directive.get("status") == "malformed":
+        _write_malformed_directive_marker(session_id, counter, directive)
+
     if authorization_source is None:
         if directive.get("status") == "malformed":
-            _write_malformed_directive_marker(session_id, counter, directive)
             output = {
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
@@ -582,6 +623,27 @@ def cmd_user_prompt_submit(payload):
             }
             sys.stdout.write(json.dumps(output))
         return
+
+    # Issue #2258 P0-1/P0-2 fix-delta: for `mode: required` + `fallback:
+    # forbidden`, establish the no-fallback delegation lock RIGHT NOW (at
+    # UserPromptSubmit time), before any Agent tool call this turn can
+    # happen -- not only after the Spark authorization is later consumed.
+    # This closes the loophole where a non-Spark Agent call made BEFORE the
+    # FIRST Spark PreToolUse call this turn would otherwise pass through the
+    # ordinary allow no-op path untouched (the lock file didn't exist yet).
+    # `clear_delegation_locks()` above already released any prior turn's
+    # lock, so this never leaks across turns.
+    #
+    # Fail-CLOSED: if the lock file cannot be written, treat this the same
+    # as "no authorization granted this turn" -- do not write the pending
+    # authorization record either. A `required`+`forbidden` directive must
+    # never result in Spark being allowed with no lock enforced.
+    if delegation_mode == "required" and delegation_fallback == "forbidden":
+        try:
+            with open(required_lock_path(session_id), "w", encoding="utf-8") as fh:
+                json.dump({"session_id": session_id, "created_ts": time.time()}, fh)
+        except OSError:
+            return
 
     record = {
         "session_id": session_id,
@@ -683,6 +745,19 @@ def cmd_pre_tool_use_agent(payload):
             reason = "authorization_carryover_stale_launch_nonce"
         elif isinstance(record, dict) and record.get("consumed") is not False:
             reason = "authorization_already_consumed"
+    # Issue #2258 P0-3 fix-delta: an explicit `model` field in the actual
+    # Agent tool_input payload that does not exactly match the pinned Spark
+    # model is a hard negative control -- an attacker/confused-model trying
+    # to invoke spark-codex with a different model parameter must not be
+    # silently allowed, even if a genuine pending authorization would
+    # otherwise have been consumed above (consumption already happened;
+    # denying now is still fail-closed since the authorization is spent
+    # either way).
+    if decision == "allow" and isinstance(tool_input, dict):
+        model_override = tool_input.get("model")
+        if model_override is not None and model_override != DELEGATION_MODEL:
+            decision = "deny"
+            reason = "explicit_model_override_mismatch"
     output = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -690,6 +765,20 @@ def cmd_pre_tool_use_agent(payload):
             "permissionDecisionReason": reason,
         }
     }
+    if decision == "allow":
+        # Issue #2258 P0-3/P0-4 fix-delta: pin the actual executed model to
+        # the Spark model (present or absent in the original tool_input --
+        # either way the pinned value wins) and force foreground execution
+        # (`run_in_background: false`) so a `wait: true` directive's Spark
+        # invocation is deterministically blocking, regardless of what
+        # run_in_background value Claude Code itself proposed. Paired with
+        # `permissionDecision: "allow"` (never `"defer"`, since `defer`
+        # drops `updatedInput` per the PreToolUse hook contract).
+        base_input = tool_input if isinstance(tool_input, dict) else {}
+        updated_input = dict(base_input)
+        updated_input["model"] = DELEGATION_MODEL
+        updated_input["run_in_background"] = False
+        output["hookSpecificOutput"]["updatedInput"] = updated_input
     if decision == "allow" and isinstance(record, dict) and session_id and AUTH_DIR:
         # Issue #2258 AC2/AC3: wire the directive's mode/fallback policy
         # into the delegation lock/marker state (see required_lock_path /
@@ -701,11 +790,10 @@ def cmd_pre_tool_use_agent(payload):
         mode_v = record.get("delegation_mode")
         fallback_v = record.get("delegation_fallback")
         if mode_v == "required" and fallback_v == "forbidden":
-            try:
-                with open(required_lock_path(session_id), "w", encoding="utf-8") as fh:
-                    json.dump({"session_id": session_id, "created_ts": time.time()}, fh)
-            except OSError:
-                pass
+            # Issue #2258 P0-1 fix-delta: the no-fallback lock was already
+            # established at UserPromptSubmit time (see
+            # cmd_user_prompt_submit), not here -- this branch now only
+            # surfaces the additionalContext instruction message.
             output["hookSpecificOutput"]["additionalContext"] = "CLAUDE_GPT_SPARK_DELEGATION_V1 " + json.dumps(
                 {
                     "mode": mode_v,

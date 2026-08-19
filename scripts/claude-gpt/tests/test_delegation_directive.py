@@ -163,6 +163,18 @@ def _pre_tool_use_agent(
     )
 
 
+def _pre_tool_use_agent_full(
+    gate_script_source, auth_dir, session_id, tool_input, *, launch_nonce="nonce-fixture"
+):
+    return _run_gate(
+        gate_script_source,
+        "pre-tool-use-agent",
+        {"session_id": session_id, "tool_input": tool_input},
+        auth_dir=auth_dir,
+        launch_nonce=launch_nonce,
+    )
+
+
 def _output(result: subprocess.CompletedProcess[str]) -> dict | None:
     if not result.stdout.strip():
         return None
@@ -291,15 +303,25 @@ def test_required_terminal_failure_lock_released_next_turn(gate_script_source, t
     assert ordinary.returncode == 0
 
 
-def test_required_terminal_failure_without_forbidden_fallback_does_not_lock(gate_script_source, tmp_path):
-    # mode: required with fallback: allowed is a distinct, valid combination
-    # from the Technical Recommendation's example (required+forbidden) --
-    # only required+forbidden creates the no-fallback lock.
+def test_required_terminal_failure_required_with_allowed_fallback_is_contradictory_malformed(
+    gate_script_source, tmp_path
+):
+    # Issue #2258 P1-5 fix-delta: `mode: required` + `fallback: allowed` is a
+    # semantically contradictory combination under this Issue's contract
+    # (`required => no fallback`, `preferred => fallback allowed`) and is now
+    # rejected as malformed rather than silently treated as a distinct valid
+    # combination that grants an unlocked Spark authorization.
     auth_dir = tmp_path / "auth-req-allowed-fallback"
     prompt = "please:\n" + VALID_DIRECTIVE_LINES.format(mode="required", fallback="allowed")
-    _user_prompt_submit(gate_script_source, auth_dir, "sess-req-allow", prompt)
+    submit_result = _user_prompt_submit(gate_script_source, auth_dir, "sess-req-allow", prompt)
+    assert not _pending_path(auth_dir, "sess-req-allow").exists()
+    context = _additional_context(submit_result)
+    assert context is not None
+    assert context.startswith("CLAUDE_GPT_SPARK_DIRECTIVE_MALFORMED_V1 ")
+    payload = json.loads(context[len("CLAUDE_GPT_SPARK_DIRECTIVE_MALFORMED_V1 ") :])
+    assert payload["reason"] == "contradictory_mode_fallback"
     result = _pre_tool_use_agent(gate_script_source, auth_dir, "sess-req-allow")
-    assert _decision(result) == "allow"
+    assert _decision(result) == "deny"
     assert not _required_lock_path(auth_dir, "sess-req-allow").exists()
     ordinary = _pre_tool_use_agent(gate_script_source, auth_dir, "sess-req-allow", subagent_type="generic-worker")
     assert ordinary.stdout.strip() == ""
@@ -441,3 +463,210 @@ def test_exactly_once_consume_new_directive_next_turn_reauthorizes(gate_script_s
     _user_prompt_submit(gate_script_source, auth_dir, "sess-reauth", _required_directive())
     third = _pre_tool_use_agent(gate_script_source, auth_dir, "sess-reauth")
     assert _decision(third) == "allow"
+
+
+# --- Issue #2258 PR #2263 human REQUEST_CHANGES fix_delta ---------------------
+
+
+# P0-1: the required-lock must exist at UserPromptSubmit time, before ANY
+# Agent tool call this turn happens -- not only after a Spark authorization
+# is consumed.
+
+
+def test_p0_1_required_lock_established_at_user_prompt_submit_time(gate_script_source, tmp_path):
+    auth_dir = tmp_path / "auth-p0-1-lock-at-submit"
+    _user_prompt_submit(gate_script_source, auth_dir, "sess-p0-1", _required_directive())
+    assert _required_lock_path(auth_dir, "sess-p0-1").exists()
+
+
+def test_p0_1_first_non_spark_agent_call_before_any_spark_call_is_denied(gate_script_source, tmp_path):
+    # Previously the FIRST Agent tool call of a `required`+`forbidden` turn
+    # being a non-Spark subagent_type would silently pass through the
+    # ordinary allow no-op path, because the lock was only written after a
+    # Spark authorization was consumed. It must now be denied.
+    auth_dir = tmp_path / "auth-p0-1-first-non-spark"
+    _user_prompt_submit(gate_script_source, auth_dir, "sess-p0-1-first", _required_directive())
+    first_call = _pre_tool_use_agent(
+        gate_script_source, auth_dir, "sess-p0-1-first", subagent_type="generic-worker"
+    )
+    assert _decision(first_call) == "deny"
+    payload = _output(first_call)
+    assert (
+        payload["hookSpecificOutput"]["permissionDecisionReason"]
+        == "required_delegation_lock_active_no_fallback_agent_allowed"
+    )
+
+
+# P0-2: required-lock write failures at UserPromptSubmit time must be
+# fail-CLOSED -- no pending authorization record either, and no non-Spark
+# Agent call silently allowed (denied for lack of authorization, not because
+# of a lock).
+
+
+def test_p0_2_required_lock_write_failure_is_fail_closed(gate_script_source, tmp_path):
+    auth_dir = tmp_path / "auth-p0-2-lock-write-fail"
+    auth_dir.mkdir(parents=True)
+    os.chmod(auth_dir, 0o500)
+    try:
+        submit_result = _user_prompt_submit(gate_script_source, auth_dir, "sess-p0-2", _required_directive())
+        assert submit_result.returncode == 0
+        # (a) no pending authorization record exists.
+        assert not _pending_path(auth_dir, "sess-p0-2").exists()
+        assert not _required_lock_path(auth_dir, "sess-p0-2").exists()
+        # (b) a subsequent Spark PreToolUse call is denied.
+        spark_attempt = _pre_tool_use_agent(gate_script_source, auth_dir, "sess-p0-2")
+        assert _decision(spark_attempt) == "deny"
+        payload = _output(spark_attempt)
+        assert payload["hookSpecificOutput"]["permissionDecisionReason"] == "no_pending_authorization"
+        # (c) no non-Spark Agent call is silently allowed either -- it is
+        # simply denied because no authorization exists at all, not because
+        # of a lock (stdout is empty, i.e. the ordinary ungated no-op path,
+        # not a `deny` gate decision citing an active lock).
+        fallback_attempt = _pre_tool_use_agent(
+            gate_script_source, auth_dir, "sess-p0-2", subagent_type="generic-worker"
+        )
+        assert fallback_attempt.stdout.strip() == ""
+        assert fallback_attempt.returncode == 0
+    finally:
+        os.chmod(auth_dir, 0o700)
+
+
+# P0-3: an explicit non-Spark `model` field in the actual tool_input is a
+# hard negative control (deny); an allow always pins `model` to the Spark
+# model via `updatedInput`.
+
+
+def test_p0_3_explicit_model_override_mismatch_denied(gate_script_source, tmp_path):
+    auth_dir = tmp_path / "auth-p0-3-model-mismatch"
+    _user_prompt_submit(gate_script_source, auth_dir, "sess-p0-3-mismatch", _required_directive())
+    result = _pre_tool_use_agent_full(
+        gate_script_source,
+        auth_dir,
+        "sess-p0-3-mismatch",
+        {"subagent_type": "spark-codex", "model": "claude-opus-4-5"},
+    )
+    assert _decision(result) == "deny"
+    payload = _output(result)
+    assert payload["hookSpecificOutput"]["permissionDecisionReason"] == "explicit_model_override_mismatch"
+    assert "updatedInput" not in payload["hookSpecificOutput"]
+
+
+def test_p0_3_absent_model_key_allowed_and_pinned(gate_script_source, tmp_path):
+    auth_dir = tmp_path / "auth-p0-3-model-absent"
+    _user_prompt_submit(gate_script_source, auth_dir, "sess-p0-3-absent", _required_directive())
+    result = _pre_tool_use_agent_full(
+        gate_script_source, auth_dir, "sess-p0-3-absent", {"subagent_type": "spark-codex"}
+    )
+    assert _decision(result) == "allow"
+    payload = _output(result)
+    assert payload["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-5.3-codex-spark"
+
+
+def test_p0_3_already_pinned_model_allowed_and_consistent(gate_script_source, tmp_path):
+    auth_dir = tmp_path / "auth-p0-3-model-pinned"
+    _user_prompt_submit(gate_script_source, auth_dir, "sess-p0-3-pinned", _required_directive())
+    result = _pre_tool_use_agent_full(
+        gate_script_source,
+        auth_dir,
+        "sess-p0-3-pinned",
+        {"subagent_type": "spark-codex", "model": "gpt-5.3-codex-spark"},
+    )
+    assert _decision(result) == "allow"
+    payload = _output(result)
+    assert payload["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-5.3-codex-spark"
+
+
+# P0-4: on the allow path, `run_in_background` is force-pinned to `false` in
+# `updatedInput` regardless of what value the caller proposed.
+
+
+def test_p0_4_run_in_background_forced_false_on_allow(gate_script_source, tmp_path):
+    auth_dir = tmp_path / "auth-p0-4-wait-foreground"
+    _user_prompt_submit(gate_script_source, auth_dir, "sess-p0-4", _required_directive())
+    result = _pre_tool_use_agent_full(
+        gate_script_source,
+        auth_dir,
+        "sess-p0-4",
+        {"subagent_type": "spark-codex", "run_in_background": True},
+    )
+    assert _decision(result) == "allow"
+    payload = _output(result)
+    assert payload["hookSpecificOutput"]["updatedInput"]["run_in_background"] is False
+
+
+# P1-5: contradictory `mode`/`fallback` combinations are rejected as
+# malformed instead of silently accepted.
+
+
+@pytest.mark.parametrize(
+    "mode,fallback",
+    [("required", "allowed"), ("preferred", "forbidden")],
+    ids=["required-allowed", "preferred-forbidden"],
+)
+def test_p1_5_contradictory_mode_fallback_rejected_as_malformed(gate_script_source, tmp_path, mode, fallback):
+    auth_dir = tmp_path / f"auth-p1-5-contradictory-{mode}-{fallback}"
+    prompt = "please:\n" + VALID_DIRECTIVE_LINES.format(mode=mode, fallback=fallback)
+    result = _user_prompt_submit(gate_script_source, auth_dir, "sess-p1-5", prompt)
+    assert not _pending_path(auth_dir, "sess-p1-5").exists()
+    context = _additional_context(result)
+    assert context is not None
+    assert context.startswith("CLAUDE_GPT_SPARK_DIRECTIVE_MALFORMED_V1 ")
+    payload = json.loads(context[len("CLAUDE_GPT_SPARK_DIRECTIVE_MALFORMED_V1 ") :])
+    assert payload["reason"] == "contradictory_mode_fallback"
+
+
+# P1-6: a malformed-directive diagnostic marker is always written when
+# `status == "malformed"`, independent of whether a SEPARATE canonical
+# mention also grants authorization this same turn.
+
+
+def test_p1_6_malformed_marker_written_alongside_canonical_mention_authorization(gate_script_source, tmp_path):
+    auth_dir = tmp_path / "auth-p1-6-malformed-plus-canonical"
+    malformed_block = (
+        "schema: DELEGATION_REQUEST_V1\nagent_id: spark-codex\nmodel: gpt-5.3-codex-spark\nmode: Required\n"
+        "fallback: forbidden\nwait: true\nauthorization_source: explicit_directive\n"
+    )
+    prompt = malformed_block + "\nalso @agent-spark-codex please handle this directly.\n"
+    _user_prompt_submit(gate_script_source, auth_dir, "sess-p1-6", prompt)
+    # Canonical mention still authorizes Spark (backward compat preserved).
+    assert _pending_path(auth_dir, "sess-p1-6").exists()
+    # AND a malformed-directive diagnostic marker is still written for the
+    # malformed directive attempt (both happen, not either/or).
+    malformed_markers = list(auth_dir.glob("malformed-sess-p1-6-*.json"))
+    assert len(malformed_markers) == 1
+    spark_result = _pre_tool_use_agent(gate_script_source, auth_dir, "sess-p1-6")
+    assert _decision(spark_result) == "allow"
+
+
+# P1-7: a duplicated key or an unrecognized/extra key within an already
+# schema-matched directive block is rejected as malformed instead of
+# silently keeping the last-write-wins value / silently ignoring the extra
+# key.
+
+
+def test_p1_7_duplicate_key_in_directive_block_rejected_as_malformed(gate_script_source, tmp_path):
+    auth_dir = tmp_path / "auth-p1-7-duplicate-key"
+    prompt = (
+        "schema: DELEGATION_REQUEST_V1\nagent_id: spark-codex\nmodel: gpt-5.3-codex-spark\nmode: required\n"
+        "mode: preferred\nfallback: forbidden\nwait: true\nauthorization_source: explicit_directive\n"
+    )
+    result = _user_prompt_submit(gate_script_source, auth_dir, "sess-p1-7-dup", prompt)
+    assert not _pending_path(auth_dir, "sess-p1-7-dup").exists()
+    context = _additional_context(result)
+    assert context is not None
+    payload = json.loads(context[len("CLAUDE_GPT_SPARK_DIRECTIVE_MALFORMED_V1 ") :])
+    assert payload["reason"] == "duplicate_key"
+
+
+def test_p1_7_unknown_key_in_directive_block_rejected_as_malformed(gate_script_source, tmp_path):
+    auth_dir = tmp_path / "auth-p1-7-unknown-key"
+    prompt = (
+        "schema: DELEGATION_REQUEST_V1\nagent_id: spark-codex\nmodel: gpt-5.3-codex-spark\nmode: required\n"
+        "fallback: forbidden\nwait: true\nauthorization_source: explicit_directive\npriority: high\n"
+    )
+    result = _user_prompt_submit(gate_script_source, auth_dir, "sess-p1-7-unknown", prompt)
+    assert not _pending_path(auth_dir, "sess-p1-7-unknown").exists()
+    context = _additional_context(result)
+    assert context is not None
+    payload = json.loads(context[len("CLAUDE_GPT_SPARK_DIRECTIVE_MALFORMED_V1 ") :])
+    assert payload["reason"] == "unknown_key"
