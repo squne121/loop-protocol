@@ -49,10 +49,47 @@ never-fabricated-logic checks are used together:
    (1), this closes the `skill_runtime_exec.py` -> command registry ->
    `run_refinement_preflight.py` subprocess graph without re-deriving its
    safety-gate logic in test code.
+
+PR #2260 review fix_delta (iteration 2) adds a THIRD test that closes the
+remaining gap the above two (deliberately) leave open: neither (1) nor (2)
+ever actually launches `skill_runtime_exec.py --command-id
+preflight.run.with_human_context` itself as a subprocess. (1) loads
+`run_refinement_preflight.py`'s `_fetch_single_comment()` directly via a
+bespoke driver script -- the real production entrypoint (`skill_runtime_exec.py`)
+never runs. (2) only inspects `render_command()`'s and the policy parser's
+*static* output -- no process is ever spawned. `test_skill_runtime_exec_anchor.py`
+already established (Issue #1498) the disposable-repo fixture that lets a
+*genuine* `uv run python3 scripts/agent-guards/skill_runtime_exec.py
+--command-id ...` subprocess reach the REAL `command_registry.py` ->
+REAL `run_refinement_preflight.py` chain, backed by a real `uv sync --locked`
+bootstrap and a `sitecustomize.py` process-boundary instrumentation hook
+(`_install_real_contract_update_fixture()`). `test_ac5_ac6_...` below reuses
+that exact helper (imported from the sibling module, never re-derived) instead
+of hand-rolling a second disposable-repo bootstrap, then layers the isolated
+Claude-GPT profile (fresh `HOME`, empty `GH_CONFIG_DIR`, `GH_TOKEN`/
+`GITHUB_TOKEN` unset) on top of it and asserts, from OUTSIDE the child
+process (so it cannot be spoofed by anything the child prints), that the `gh`
+CLI was invoked zero times end-to-end while the real anchor comment resolves.
+
+Because `skill_runtime_exec.py`'s own `_sanitize_env()` unconditionally
+rebuilds `PATH` from a fixed, hardcoded allowlist of real system directories
+before spawning its child (Issue #2241 hardening), a `PATH`-prepended marker
+executable -- the technique test (1) above uses -- cannot survive into the
+grandchild `run_refinement_preflight.py` process launched through
+`skill_runtime_exec.py`: there is no way to write to `/usr/bin` or the other
+allowlisted system directories from a test, nor would doing so be safe. This
+is exactly why `_install_real_contract_update_fixture()`'s `sitecustomize.py`
+approach is reused instead of the marker-executable approach: it intercepts
+`subprocess.run`/`subprocess.Popen` at the Python call site inside the child
+interpreter itself (via `PYTHONPATH`-triggered `sitecustomize` auto-import,
+which CPython performs regardless of `PATH`), so it still catches a `gh`
+invocation attempt even though `PATH` no longer contains an interceptable
+marker.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import stat
@@ -256,3 +293,170 @@ def test_production_command_registry_wires_anchor_command_to_run_refinement_pref
         sys.path.remove(str(_AGENT_GUARDS_DIR))
         sys.modules.pop("command_registry", None)
         sys.modules.pop("skill_runtime_command_policy", None)
+
+
+# ---------------------------------------------------------------------------
+# PR #2260 review fix_delta (iteration 2): real `skill_runtime_exec.py
+# --command-id preflight.run.with_human_context` subprocess launch, resolving
+# the AC5/AC6 real anchor comment via live network from OUTSIDE any mocked
+# transport, with an independent (never child-self-reported) `gh`
+# invocation-count assertion.
+# ---------------------------------------------------------------------------
+
+_SKILL_RUNTIME_EXEC_ANCHOR_FIXTURES_MODULE = REPO_ROOT / "scripts" / "agent-guards" / "tests" / "test_skill_runtime_exec_anchor.py"
+
+
+def _load_skill_runtime_exec_anchor_fixtures():
+    """Import `test_skill_runtime_exec_anchor.py`'s disposable-repo fixture
+    helpers (`_make_repo()` / `_install_real_contract_update_fixture()`)
+    under a private module name, rather than re-deriving the disposable git
+    repo / real `uv sync --locked` bootstrap / `sitecustomize.py`
+    subprocess-instrumentation pattern that module already establishes and
+    exercises for the real `skill_runtime_exec.py` subprocess chain (Issue
+    #1498, PR #2260 review fix_delta iteration 2 blocker 2)."""
+    spec = importlib.util.spec_from_file_location(
+        "test_skill_runtime_exec_anchor_fixtures_for_2257_live_command_graph",
+        str(_SKILL_RUNTIME_EXEC_ANCHOR_FIXTURES_MODULE),
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_ac5_ac6_skill_runtime_exec_with_human_context_live_subprocess_resolves_anchor_via_credentialless_authority(
+    tmp_path: Path,
+) -> None:
+    """GIVEN the REAL `skill_runtime_exec.py --command-id
+    preflight.run.with_human_context` production command graph (privileged
+    executor -> `command_registry.py` -> `run_refinement_preflight.py`),
+    launched as a genuine `uv run python3` subprocess against a disposable
+    fixture repository (`_install_real_contract_update_fixture()`, reused
+    unmodified from `test_skill_runtime_exec_anchor.py`) with a fresh
+    isolated `HOME`, an empty `GH_CONFIG_DIR`, and `GH_TOKEN`/`GITHUB_TOKEN`
+    unset
+    WHEN that subprocess graph resolves Issue #2197's real anchor comment
+    5315264311 with NO transport mocking (a real, unauthenticated GitHub
+    REST call reached only through `github_credentialless_read.py`)
+    THEN the command graph resolves the anchor comment successfully and the
+    `gh` CLI is invoked zero times anywhere in the real subprocess chain --
+    verified independently, from outside the child process, via a
+    `sitecustomize.py` `subprocess.run`/`subprocess.Popen` interception hook
+    that survives `skill_runtime_exec.py`'s own `PATH`-allowlist rebuild
+    (Issue #2257 AC5/AC6, PR #2260 review fix_delta iteration 2, blockers
+    1 and 2)."""
+    fixtures = _load_skill_runtime_exec_anchor_fixtures()
+    repo = fixtures._make_repo(tmp_path)
+    fixtures._install_real_contract_update_fixture(repo)
+    # `_install_real_contract_update_fixture()` only materializes
+    # `skill_runtime_exec.py` / `skill_runtime_command_policy.py` from
+    # `scripts/agent-guards/` (its own tests never exercise the isolated
+    # Claude-GPT profile). `run_refinement_preflight.py`'s isolated-profile
+    # branch additionally needs the REAL, unmodified
+    # `github_credentialless_read.py` at the exact same repo-relative path
+    # (`_AGENT_GUARDS_SCRIPTS_DIR = parents[4] / "scripts" / "agent-guards"`)
+    # so the credentialless transport is genuinely reachable rather than
+    # falling through its best-effort `ImportError` fallback.
+    (repo / "scripts" / "agent-guards" / "github_credentialless_read.py").write_text(
+        (REPO_ROOT / "scripts" / "agent-guards" / "github_credentialless_read.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    isolated_home = tmp_path / "isolated-home-command-graph"
+    isolated_home.mkdir()
+    empty_gh_config_dir = tmp_path / "empty-gh-config-dir-command-graph"
+    empty_gh_config_dir.mkdir()
+
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo)}
+    env["HOME"] = str(isolated_home)
+    env["GH_CONFIG_DIR"] = str(empty_gh_config_dir)
+    env.pop("GH_TOKEN", None)
+    env.pop("GITHUB_TOKEN", None)
+
+    anchor_url = f"https://github.com/{REPO}/issues/{ISSUE_NUMBER}#issuecomment-{ANCHOR_COMMENT_ID}"
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "python3",
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "--command-id",
+            "preflight.run.with_human_context",
+            "--issue-number",
+            str(ISSUE_NUMBER),
+            "--repo",
+            REPO,
+            "--anchor-comment-url",
+            anchor_url,
+        ],
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    # The fixture's `sitecustomize.py` (installed by
+    # `_install_real_contract_update_fixture()`) logs EVERY `subprocess.run`
+    # call whose argv[0] resolves to `gh`, regardless of which issue number
+    # the call was for, to this fixed path -- this is an independent,
+    # outside-the-child-process invocation counter that cannot be spoofed by
+    # anything the child process itself prints to stdout/stderr.
+    gh_calls_file = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498" / "fake_gh_calls.jsonl"
+    assert not gh_calls_file.exists(), (
+        "AC6 unmet: the gh CLI was invoked by the real skill_runtime_exec.py -> "
+        "command_registry.py -> run_refinement_preflight.py production subprocess "
+        f"graph while resolving the isolated-profile anchor comment: "
+        f"{gh_calls_file.read_text(encoding='utf-8') if gh_calls_file.exists() else ''}. "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    stdout = result.stdout
+    assert "BLOCKER_ANCHOR_COMMENT_NOT_FOUND" not in stdout, (
+        f"AC5 unmet: real anchor comment {ANCHOR_COMMENT_ID} was misclassified as "
+        f"missing across the real production subprocess graph. "
+        f"stdout={stdout!r} stderr={result.stderr!r}"
+    )
+    assert "ANCHOR_NOT_IN_ISSUE" not in stdout, (
+        f"AC5 unmet: real anchor comment {ANCHOR_COMMENT_ID} was misclassified as "
+        f"not belonging to Issue #{ISSUE_NUMBER} across the real production "
+        f"subprocess graph. stdout={stdout!r} stderr={result.stderr!r}"
+    )
+
+    if result.returncode == 3 and (
+        "rate_limited" in stdout
+        or "upstream_environment_failure" in stdout
+        or "transport_connectivity_failure" in stdout
+        or "rate_limited" in result.stderr
+        or "upstream_environment_failure" in result.stderr
+        or "transport_connectivity_failure" in result.stderr
+    ):
+        pytest.skip(
+            f"network/rate-limit/upstream unavailable in this environment: "
+            f"stdout={stdout!r} stderr={result.stderr!r}"
+        )
+    assert "authentication" not in stdout and "gh_exit_4" not in stdout, (
+        f"AC5/AC6 unmet: exact incident replay reproduced the Issue #2197 "
+        f"auth-dependency misclassification across the real production "
+        f"subprocess graph. stdout={stdout!r} stderr={result.stderr!r}"
+    )
+
+    raw_snapshot_path = (
+        repo / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER) / "raw_issue_snapshot.json"
+    )
+    assert raw_snapshot_path.is_file(), (
+        f"AC5 unmet: no raw_issue_snapshot.json artifact was produced by the real "
+        f"production subprocess graph (early-failure path never reached anchor "
+        f"resolution). stdout={stdout!r} stderr={result.stderr!r}"
+    )
+    raw_snapshot = json.loads(raw_snapshot_path.read_text(encoding="utf-8"))
+    anchor_comment_state = raw_snapshot.get("anchor_comment")
+    assert anchor_comment_state is not None, (
+        f"AC5 unmet: raw_issue_snapshot.json has no anchor_comment entry -- the "
+        f"real anchor comment {ANCHOR_COMMENT_ID} did not resolve through the "
+        f"real production subprocess graph. raw_snapshot={raw_snapshot!r}"
+    )
+    assert str(ANCHOR_COMMENT_ID) in str(anchor_comment_state.get("url", "")), (
+        f"AC5 unmet: resolved anchor_comment does not reference comment "
+        f"{ANCHOR_COMMENT_ID}: {anchor_comment_state!r}"
+    )
