@@ -3,17 +3,19 @@
     "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
     "generated_at": "2026-08-20T00:00:00Z",
     "runtime_version": "agent-retrospective/0.1.0",
-    "source_set_digest": "27ddc85a3c6f8611a373d0d9aa9dfc7b223221f8beaffe72b95e0ad0104e7f6c"
+    "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
   },
   "source_observations": [
     {
       "source_type": "repository",
+      "source_id": "repository",
+      "source_status": "complete",
       "pagination_completeness": "complete"
     },
     {
       "source_type": "github",
-      "observed_from": "2026-08-19T00:00:00Z",
-      "observed_until": "2026-08-20T00:00:00Z",
+      "source_id": "github",
+      "source_status": "complete",
       "fetch_started_at": "2026-08-20T00:00:00Z",
       "fetch_completed_at": "2026-08-20T00:05:00Z",
       "resource_updated_at_min": "2026-08-19T01:00:00Z",

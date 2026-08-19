@@ -5,7 +5,7 @@
   "description": "candidate_status uses a value outside the closed enum.",
   "source_run_ref": {
     "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
-    "source_set_digest": "27ddc85a3c6f8611a373d0d9aa9dfc7b223221f8beaffe72b95e0ad0104e7f6c"
+    "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
   },
   "created_at": "2026-08-20T00:00:00Z",
   "updated_at": "2026-08-20T00:00:00Z"

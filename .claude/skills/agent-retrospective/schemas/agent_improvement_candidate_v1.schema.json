@@ -1,11 +1,44 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://loop-protocol.dev/schemas/agent_improvement_candidate_v1.schema.json",
   "title": "agent_improvement_candidate/v1",
   "description": "Schema for a single improvement candidate proposed by an agent-retrospective run. candidate_status is a closed enum whose transitions are constrained by the state machine in validate_retrospective_schema.py (ALLOWED_TRANSITIONS / validate_transition()), not merely by this schema's enum. Per ADR 0007 Decision 4 (mutation boundary), transitioning a candidate to 'accepted' and beyond, and creating an implementation issue, are remediation / control-plane mutations that require prior explicit human authorization; this schema only describes the shape of a candidate record, it does not itself perform or authorize any mutation.",
   "type": "object",
   "additionalProperties": false,
   "required": ["candidate_id", "candidate_status", "title", "description", "source_run_ref", "created_at", "updated_at"],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "candidate_status": {
+            "enum": ["implementation_issue_created", "implemented", "validating", "validated"]
+          }
+        },
+        "required": ["candidate_status"]
+      },
+      "then": {
+        "required": ["implementation_issue_ref"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "candidate_status": { "const": "rejected" } },
+        "required": ["candidate_status"]
+      },
+      "then": {
+        "required": ["rejection_reason"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "candidate_status": { "const": "superseded" } },
+        "required": ["candidate_status"]
+      },
+      "then": {
+        "required": ["superseded_by"]
+      }
+    }
+  ],
   "properties": {
     "candidate_id": {
       "type": "string",
@@ -14,7 +47,7 @@
     },
     "candidate_status": {
       "type": "string",
-      "description": "Closed enum of candidate lifecycle states. Valid transitions between these states are enforced by validate_transition() in validate_retrospective_schema.py, not by this schema alone (e.g. 'rejected' -> 'implemented' is a value each individually valid but a transition rejected by the state machine).",
+      "description": "Closed enum of candidate lifecycle states. Valid transitions between these states are enforced by validate_transition() in validate_retrospective_schema.py, not by this schema alone (e.g. 'rejected' -> 'implemented' is a value each individually valid but a transition rejected by the state machine). implementation_issue_created/implemented/validating/validated require implementation_issue_ref; rejected requires rejection_reason; superseded requires superseded_by (schema-enforced via the allOf/if/then invariants above).",
       "enum": [
         "proposed",
         "accepted",
@@ -33,7 +66,7 @@
     },
     "description": {
       "type": "string",
-      "description": "Full description of the proposed improvement. MUST be a schema-controlled projection (ADR 0007 Decision 6 allowlist model) -- not a raw transcript, and must not contain secrets, absolute local paths, or unredacted private GitHub content.",
+      "description": "Full description of the proposed improvement. MUST be a schema-controlled projection (ADR 0007 Decision 6 allowlist model) -- not a raw transcript, and must not contain secrets, absolute local paths, or unredacted private GitHub content. This schema enforces the field allowlist only; value-level public-safety validation (secret/PII/path redaction) is Child 6's responsibility (ADR 0007 Decision 6, two-layer defense).",
       "minLength": 1
     },
     "source_run_ref": {
@@ -62,15 +95,18 @@
     },
     "implementation_issue_ref": {
       "type": "string",
-      "description": "Reference (e.g. issue number/URL) to the implementation issue, present once candidate_status reaches implementation_issue_created or later."
+      "description": "Reference (e.g. issue number/URL) to the implementation issue. Required once candidate_status reaches implementation_issue_created or later (schema-enforced).",
+      "minLength": 1
     },
     "rejection_reason": {
       "type": "string",
-      "description": "Present when candidate_status is rejected; explains why the candidate was not accepted."
+      "description": "Required when candidate_status is rejected (schema-enforced); explains why the candidate was not accepted.",
+      "minLength": 1
     },
     "superseded_by": {
       "type": "string",
-      "description": "Reference to the candidate that superseded this one, present when candidate_status is superseded."
+      "description": "Reference to the candidate that superseded this one. Required when candidate_status is superseded (schema-enforced).",
+      "minLength": 1
     }
   }
 }
