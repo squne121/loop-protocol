@@ -412,13 +412,23 @@ Issue #2241 / PR #2247 の実装範囲では、以下は意図的に「未解決
   isolated Claude-GPT session からの `preflight.run.with_human_context` 相当 command は、host `GH_TOKEN` 等が launcher に
   よって遮断されている限り、引き続き `gh` 認証失敗で停止しうる。配線には Allowed Paths 拡張（follow-up Issue または
   Scope Delta）が必要。
-- **`~/.local/bin` trust root の same-UID 攻撃モデル**: `scripts/agent-guards/skill_runtime_exec.py` の
-  `_validate_account_local_bin_trust` は ancestor ディレクトリの owner uid / group-world-writable 検証と symlink 解決先
-  検証、および `_validate_local_bin_executable_version` による `--version` 出力照合を追加したが、これは
-  「別 UID がこのディレクトリに書き込めない」ことの検証であり、「この実行アカウント自身として既に任意コード実行を得た
-  攻撃者が `~/.local/bin/uv` を置き換える」ケースは引き続き制御できない（CWE-427 相当の構造的制約が残る）。
-  完全な解決には launcher-owned・child 非書き込みな専用 toolchain ディレクトリの新設が必要であり、これは本 Issue の
-  スコープを超える。
+- **`~/.local/bin` trust root の CWE-427 search-selection risk（Issue #2251 で解消済み）**: PR #2247 時点では
+  `scripts/agent-guards/skill_runtime_exec.py` の `_safe_path_entries()` が account-home `~/.local/bin` を trust root
+  候補に含め、`_validate_account_local_bin_trust`（ancestor owner uid / group-world-writable 検証・symlink 解決先検証）
+  と `_validate_local_bin_executable_version`（`--version` 出力の緩い pattern 照合）で防御していた。Issue #2251 は
+  `~/.local/bin` を trust root 候補そのものから除外し（`_validate_account_local_bin_trust` は削除）、CWE-427 の
+  search-selection element（攻撃者が制御可能な search path 要素を trust root に含めてしまうリスク）自体を縮小した。
+  account-home `.local/bin` にしか `uv` が存在せず hostedtoolcache/system 標準ディレクトリからも解決できない場合、
+  resolver は silent fallback せず `uv_not_found` で deterministic に fail-closed する。
+- **同一 UID による executable 本体置換（引き続き Not Controlled）**: `~/.local/bin` を trust root 候補から除外して
+  も、`_safe_path_entries()` が残す hostedtoolcache（`/opt/hostedtoolcache/uv` 等）や `/usr/local/bin` 等の
+  システム標準ディレクトリ自体は、CI ランナーやホスト設定次第では依然としてこの実行アカウントと同一 UID で
+  書き込み可能な場合がある。「この実行アカウント自身として既に任意コード実行を得た攻撃者が、trust root 配下の
+  `uv` 実体そのものを置き換える」ケースは、`_validate_trusted_executable_version` による `pyproject.toml`
+  `[tool.uv].required-version` 完全一致の `--version` 照合を加えても引き続き制御できない（同一 UID である限り、
+  攻撃者は正規に見える `--version` バナーを返す偽 binary を用意できるため）。完全な解決には launcher-owned・
+  child 非書き込みな専用 toolchain ディレクトリ、または dedicated user / OS-level sandbox の新設が必要であり、
+  これは Issue #2251 のスコープを超える（CWE-427 相当の構造的制約が残る）。
 
 ## SSOT Routing Table（SSOT ルーティング表）
 
