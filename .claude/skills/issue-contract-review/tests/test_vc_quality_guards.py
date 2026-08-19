@@ -38,6 +38,21 @@ PREFLIGHT_SCRIPT = _SCRIPTS_DIR / "baseline_vc_preflight.py"
 # Add scripts dir to sys.path for direct imports
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
+# Versioned allowlist of top-level `baseline_vc_preflight/v1` keys that were
+# deliberately added AFTER this schema-guard test was first written (#648).
+# `test_unexpected_pass_classification_no_new_schema()` treats any top-level
+# key NOT in `required_keys` and NOT in this allowlist as a genuinely
+# UNEXPECTED/accidental schema leak. Each entry below cites the Issue that
+# introduced it so future additive migrations can extend this set the same
+# way instead of relaxing the guard.
+_ADDITIVE_OPTIONAL_TOP_LEVEL_KEYS = {
+    # Issue #2232: `vc_duplicate_diagnostic_report/v1`, bound to `body_sha256`
+    # / canonical plan digest / classification context, deliberately added
+    # as a top-level field independent of the canonical execution plan
+    # (`status` / `results` / exit code stay unaffected -- see AC7).
+    "diagnostic_report",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -335,7 +350,21 @@ def test_existing_asset_hit_is_unexpected_pass():
 
 
 def test_unexpected_pass_classification_no_new_schema():
-    """AC4: unexpected_pass must use the existing classification schema (no new top-level key)."""
+    """AC4: unexpected_pass must use the existing classification schema.
+
+    `required_keys` are the ORIGINAL, pre-#2232 top-level keys that MUST
+    always be present. `_ADDITIVE_OPTIONAL_TOP_LEVEL_KEYS` is a versioned
+    allowlist of top-level keys that were deliberately, and additively,
+    introduced to the stable `baseline_vc_preflight/v1` contract AFTER
+    this guard test was first written -- each entry documents which Issue
+    introduced it so this test continues to guard against genuinely
+    UNEXPECTED/accidental new top-level keys while explicitly permitting
+    known, documented additions (Issue #2232 OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2255#issuecomment-5340600982,
+    P0 blocker 2: this test previously treated `diagnostic_report` as an
+    accidental schema leak instead of the Issue #2232 Outcome's explicit,
+    intentional additive field).
+    """
     existing_file = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
     body = make_body(f'rg "def classify_result" {existing_file}', allowed_paths=[existing_file])
     data = run_preflight(body)
@@ -346,8 +375,10 @@ def test_unexpected_pass_classification_no_new_schema():
         f"Missing required top-level keys: {required_keys - set(data.keys())}"
     )
 
-    # Verify no new unexpected top-level schema was added
-    unexpected_keys = set(data.keys()) - required_keys
+    # Verify no new UNEXPECTED top-level schema was added -- only the
+    # explicitly allowlisted additive keys below are permitted beyond
+    # `required_keys`.
+    unexpected_keys = set(data.keys()) - required_keys - _ADDITIVE_OPTIONAL_TOP_LEVEL_KEYS
     assert not unexpected_keys, f"Unexpected new top-level keys: {unexpected_keys}"
 
     # The result item should have the standard classification fields
