@@ -333,6 +333,101 @@ def has_canonical_mention(prompt_text):
     return bool(MENTION_RE.search(strip_non_authorizing(prompt_text)))
 
 
+# --- Structured delegation directive (Issue #2258) -------------------------
+#
+# In addition to the canonical `@agent-spark-codex` mention above (kept
+# fully unchanged/backward-compatible), a human's prompt text may contain a
+# structured `DELEGATION_REQUEST_V1` directive as plain (non-fenced,
+# non-quoted, non-blockquoted) `key: value` lines. It is parsed from the
+# SAME `strip_non_authorizing()`-stripped text used for mention detection,
+# so a directive appearing only inside a quoted string / fenced code block /
+# inline code span / blockquote is never authorizing (Issue #2258 AC4) --
+# it is entirely removed before this parser ever sees it.
+DELEGATION_SCHEMA_VALUE = "DELEGATION_REQUEST_V1"
+DELEGATION_AGENT_ID = "spark-codex"
+DELEGATION_MODEL = "gpt-5.3-codex-spark"
+DELEGATION_VALID_MODES = ("required", "preferred")
+DELEGATION_VALID_FALLBACK = ("forbidden", "allowed")
+DELEGATION_AUTH_SOURCE = "explicit_directive"
+DELEGATION_REQUIRED_KEYS = (
+    "schema",
+    "agent_id",
+    "model",
+    "mode",
+    "fallback",
+    "wait",
+    "authorization_source",
+)
+
+DIRECTIVE_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+?)\s*$")
+
+
+def _candidate_directive_blocks(stripped_text):
+    # Group consecutive `key: value` lines into blocks, separated by any
+    # blank line or any line that does not match the `key: value` shape
+    # (e.g. ordinary prose). A block never spans across such a break, so a
+    # directive-looking fragment interrupted by unrelated prose never
+    # accidentally merges with a genuine directive elsewhere in the prompt.
+    blocks = []
+    current = []
+    for line in stripped_text.split("\n"):
+        m = DIRECTIVE_LINE_RE.match(line)
+        if m:
+            current.append((m.group(1), m.group(2)))
+        else:
+            if current:
+                blocks.append(current)
+                current = []
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def parse_delegation_directive(prompt_text):
+    """Parse an explicit-only DELEGATION_REQUEST_V1 directive out of
+    `prompt_text`. Returns a dict with `status` of `absent` (no directive
+    attempt found), `malformed` (a `schema: DELEGATION_REQUEST_V1` anchor
+    line was found but the surrounding block fails strict validation --
+    missing keys, wrong enum value, typo/case mismatch, wrong agent_id/model
+    -- Issue #2258 AC5), or `valid` (fully well-formed directive; also
+    carries `mode`/`fallback`, Issue #2258 AC1/AC2)."""
+    if not isinstance(prompt_text, str):
+        return {"status": "absent"}
+    stripped = strip_non_authorizing(prompt_text)
+    for block in _candidate_directive_blocks(stripped):
+        keys_seen = [k for k, _ in block]
+        if "schema" not in keys_seen:
+            continue
+        values = {}
+        for k, v in block:
+            values[k] = v
+        if values.get("schema") != DELEGATION_SCHEMA_VALUE:
+            # Not a spark delegation directive at all (different schema
+            # value); keep scanning other candidate blocks.
+            continue
+        missing = [k for k in DELEGATION_REQUIRED_KEYS if k not in values]
+        if missing:
+            return {"status": "malformed", "reason": "missing_required_keys", "missing": missing}
+        if values["agent_id"] != DELEGATION_AGENT_ID:
+            return {"status": "malformed", "reason": "invalid_agent_id", "value": values["agent_id"]}
+        if values["model"] != DELEGATION_MODEL:
+            return {"status": "malformed", "reason": "invalid_model", "value": values["model"]}
+        if values["mode"] not in DELEGATION_VALID_MODES:
+            return {"status": "malformed", "reason": "invalid_mode", "value": values["mode"]}
+        if values["fallback"] not in DELEGATION_VALID_FALLBACK:
+            return {"status": "malformed", "reason": "invalid_fallback", "value": values["fallback"]}
+        if values["wait"] != "true":
+            return {"status": "malformed", "reason": "invalid_wait", "value": values["wait"]}
+        if values["authorization_source"] != DELEGATION_AUTH_SOURCE:
+            return {
+                "status": "malformed",
+                "reason": "invalid_authorization_source",
+                "value": values["authorization_source"],
+            }
+        return {"status": "valid", "mode": values["mode"], "fallback": values["fallback"]}
+    return {"status": "absent"}
+
+
 def read_payload():
     try:
         raw = sys.stdin.read()
@@ -378,6 +473,36 @@ def clear_pending(session_id):
         pass
 
 
+def required_lock_path(session_id):
+    # Issue #2258 AC3: while this file exists for a session, the current
+    # turn's Agent tool calls for any subagent_type OTHER than spark-codex
+    # are denied -- a `mode: required` + `fallback: forbidden` directive's
+    # Spark authorization was consumed and no silent substitute delegation
+    # is permitted for the remainder of this turn (structured terminal stop
+    # of the Agent-delegation path, forcing the failure/result to be
+    # surfaced explicitly rather than silently downgraded).
+    return os.path.join(AUTH_DIR, "required-lock-" + session_id + ".json")
+
+
+def preferred_marker_path(session_id):
+    # Issue #2258 AC2: while this file exists for a session, the NEXT
+    # non-spark Agent tool call for this turn is logged (once) as an
+    # explicit fallback-from-preferred-Spark event via additionalContext,
+    # then the marker is consumed (single-shot log, not a gate decision).
+    return os.path.join(AUTH_DIR, "preferred-marker-" + session_id + ".json")
+
+
+def clear_delegation_locks(session_id):
+    # A new turn (UserPromptSubmit) always releases any delegation lock/
+    # marker left over from a prior turn -- these never carry over, exactly
+    # like the pending mention/directive authorization itself.
+    for path in (required_lock_path(session_id), preferred_marker_path(session_id)):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def has_nested_agent_origin(payload):
     # Issue #2186 P1 fix-delta: a genuinely top-level user turn's hook
     # payload never carries an `agent_id`/`parent_tool_use_id` (or
@@ -391,6 +516,22 @@ def has_nested_agent_origin(payload):
         if payload.get(key):
             return True
     return False
+
+
+def _write_malformed_directive_marker(session_id, counter, directive):
+    # Issue #2258 AC5: a malformed directive attempt is recorded as an
+    # explicit, independently-inspectable diagnostic artifact (never a
+    # silent no-op indistinguishable from "no directive present at all",
+    # and never an authorization).
+    path = os.path.join(AUTH_DIR, "malformed-" + session_id + "-" + str(counter) + ".json")
+    tmp = path + ".tmp-" + str(os.getpid())
+    record = {"session_id": session_id, "prompt_id": counter, "directive": directive}
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def cmd_user_prompt_submit(payload):
@@ -410,10 +551,38 @@ def cmd_user_prompt_submit(payload):
     counter = next_prompt_counter(session_id)
     # A new turn always invalidates any previous unconsumed authorization for
     # this session first -- authorization never carries over to the next turn
-    # (Issue #2186 AC3).
+    # (Issue #2186 AC3), and likewise releases any delegation lock/marker
+    # left over from a prior turn (Issue #2258).
     clear_pending(session_id)
-    if not has_canonical_mention(prompt):
+    clear_delegation_locks(session_id)
+
+    # Issue #2258: a structured DELEGATION_REQUEST_V1 directive is an
+    # independent, additional authorization source alongside (never a
+    # replacement for) the canonical @agent-spark-codex mention above.
+    directive = parse_delegation_directive(prompt)
+    delegation_mode = None
+    delegation_fallback = None
+    authorization_source = None
+    if directive.get("status") == "valid":
+        delegation_mode = directive["mode"]
+        delegation_fallback = directive["fallback"]
+        authorization_source = DELEGATION_AUTH_SOURCE
+    elif has_canonical_mention(prompt):
+        authorization_source = "canonical_mention"
+
+    if authorization_source is None:
+        if directive.get("status") == "malformed":
+            _write_malformed_directive_marker(session_id, counter, directive)
+            output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "CLAUDE_GPT_SPARK_DIRECTIVE_MALFORMED_V1 "
+                    + json.dumps({"reason": directive.get("reason")}),
+                }
+            }
+            sys.stdout.write(json.dumps(output))
         return
+
     record = {
         "session_id": session_id,
         "prompt_id": counter,
@@ -422,6 +591,9 @@ def cmd_user_prompt_submit(payload):
         "consumed": False,
         "created_ts": time.time(),
         "nonce": uuid.uuid4().hex,
+        "authorization_source": authorization_source,
+        "delegation_mode": delegation_mode,
+        "delegation_fallback": delegation_fallback,
     }
     target = pending_path(session_id)
     tmp = target + ".tmp-" + str(os.getpid())
@@ -433,11 +605,54 @@ def cmd_user_prompt_submit(payload):
 def cmd_pre_tool_use_agent(payload):
     tool_input = payload.get("tool_input")
     subagent_type = tool_input.get("subagent_type") if isinstance(tool_input, dict) else None
+    session_id = payload.get("session_id") or ""
     if subagent_type != SPARK_AGENT:
+        # Issue #2258 AC3: a `mode: required` + `fallback: forbidden`
+        # directive whose Spark authorization was already consumed this
+        # turn forbids ANY other Agent subagent_type for the remainder of
+        # the turn -- no silent substitute/fallback delegation. This is a
+        # gate decision (fail-closed deny), unlike the ordinary no-op
+        # pass-through below.
+        if session_id and AUTH_DIR and os.path.exists(required_lock_path(session_id)):
+            output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "required_delegation_lock_active_no_fallback_agent_allowed",
+                }
+            }
+            sys.stdout.write(json.dumps(output))
+            sys.exit(0)
+        # Issue #2258 AC2: a `mode: preferred` directive whose Spark
+        # authorization was consumed this turn allows fallback to any other
+        # subagent_type, but the fallback event is logged explicitly
+        # (advisory additionalContext only, single-shot -- never a gate
+        # decision, never interferes with ordinary SubAgent mapping).
+        if session_id and AUTH_DIR:
+            marker = preferred_marker_path(session_id)
+            if os.path.exists(marker):
+                try:
+                    os.remove(marker)
+                except OSError:
+                    pass
+                output = {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": "CLAUDE_GPT_SPARK_FALLBACK_LOGGED_V1 "
+                        + json.dumps(
+                            {
+                                "session_id": session_id,
+                                "reason": "preferred_mode_fallback_to_non_spark_agent",
+                                "subagent_type": subagent_type,
+                            }
+                        ),
+                    }
+                }
+                sys.stdout.write(json.dumps(output))
+                sys.exit(0)
         # Not our concern -- explicit allow, no interference with ordinary
         # SubAgent mapping (Issue #2186 AC1).
         return
-    session_id = payload.get("session_id") or ""
     decision = "deny"
     reason = "no_pending_authorization"
     record = None
@@ -475,6 +690,39 @@ def cmd_pre_tool_use_agent(payload):
             "permissionDecisionReason": reason,
         }
     }
+    if decision == "allow" and isinstance(record, dict) and session_id and AUTH_DIR:
+        # Issue #2258 AC2/AC3: wire the directive's mode/fallback policy
+        # into the delegation lock/marker state (see required_lock_path /
+        # preferred_marker_path) and surface it to the model via
+        # additionalContext, so a `required`+`forbidden` invocation is
+        # explicitly told never to silently substitute another
+        # model/agent on failure, and a `preferred` invocation's eventual
+        # fallback gets logged (Issue #2258 AC2).
+        mode_v = record.get("delegation_mode")
+        fallback_v = record.get("delegation_fallback")
+        if mode_v == "required" and fallback_v == "forbidden":
+            try:
+                with open(required_lock_path(session_id), "w", encoding="utf-8") as fh:
+                    json.dump({"session_id": session_id, "created_ts": time.time()}, fh)
+            except OSError:
+                pass
+            output["hookSpecificOutput"]["additionalContext"] = "CLAUDE_GPT_SPARK_DELEGATION_V1 " + json.dumps(
+                {
+                    "mode": mode_v,
+                    "fallback": fallback_v,
+                    "instruction": (
+                        "If this Spark invocation fails for any reason, you MUST NOT "
+                        "silently substitute a different agent or model; report the "
+                        "failure explicitly to the user and stop this delegation path."
+                    ),
+                }
+            )
+        elif mode_v == "preferred":
+            try:
+                with open(preferred_marker_path(session_id), "w", encoding="utf-8") as fh:
+                    json.dump({"session_id": session_id, "created_ts": time.time()}, fh)
+            except OSError:
+                pass
     # Issue #2186 P1 fix-delta (PR #2244 adversarial review): allow/deny is
     # communicated EXCLUSIVELY via exit-0 stdout structured JSON
     # (`hookSpecificOutput.permissionDecision`), never via `exit 2` +
