@@ -235,7 +235,6 @@ class TestSettingsManifestAlignment:
 class TestTelemetryHooksClassification:
     TELEMETRY_HOOKS = {
         "session_manifest_coordinator",
-        "rtk_boundary_shadow_guard",
     }
 
     def test_telemetry_hooks_classified(self, manifest_entries: list[dict[str, Any]]) -> None:
