@@ -302,11 +302,13 @@ class TestGuardJapaneseProseClassification:
         )
 
     def test_guard_japanese_prose_has_mode_values(self, manifest_entries: list[dict[str, Any]]) -> None:
-        """AC8: guard-japanese-prose に shadow と enforce の mode_values が記述されている。"""
+        """#2265: guard-japanese-prose に off(unset相当) と enforce の mode_values が記述されている。"""
         manifest_by_id = {e["handler_id"]: e for e in manifest_entries}
         entry = manifest_by_id.get(self.HANDLER_ID, {})
         mode_values = entry.get("mode_values", {})
-        assert "unset_or_shadow" in mode_values, "mode_values に unset_or_shadow がありません"
+        assert "unset_or_off_or_shadow" in mode_values, (
+            "mode_values に unset_or_off_or_shadow がありません"
+        )
         assert "enforce" in mode_values, "mode_values に enforce がありません"
 
 

@@ -244,24 +244,26 @@ hook_boundaries_manifest_v1:
       exit_2_effect: blocks_tool_call
       other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent
-    stderr_contract: jsonl_shadow_log_or_block_reason
+    stderr_contract: block_reason_only
     redaction_contract:
       no_raw_command: true
       no_raw_secret_like_value: true
       no_raw_transcript: true
       no_manifest_body_on_stdout: true
     agent_action:
-      on_nonzero_shadow: proceed_and_log
+      on_nonzero_shadow: proceed
       on_nonzero_enforce: stop_tool_call
       on_zero: proceed
     mode_env: GUARD_JAPANESE_PROSE_MODE
     mode_values:
-      unset_or_shadow: "exit 0（shadow モード: block せず JSONL に記録のみ）"
+      unset_or_off_or_shadow: "exit 0（non-blocking。persistent file は生成しない。legacy `shadow` は `off` の compatibility alias）"
       enforce: "exit 2（enforce モード: 日本語比率不足でブロック）"
-      invalid: "shadow として動作 + invalid_mode を JSONL に記録"
+      invalid: "exit 0（non-blocking diagnostic として off と同様に動作。persistent file なし）"
     notes: >
-      default は shadow モード（exit 0）。
-      GUARD_JAPANESE_PROSE_MODE=enforce 設定時のみ exit 2 でブロックする（AC8）。
+      default は off モード（exit 0）。unset / off / shadow(legacy alias) / enforce / invalid
+      の 5 状態が mode contract（#2265）。GUARD_JAPANESE_PROSE_MODE=enforce 設定時のみ
+      exit 2 でブロックする。persistent shadow logging（`.guard_shadow_log.jsonl` への write）は
+      #2265 により廃止済みで、いずれの mode でも write は発生しない。
       handler_id はスクリプトファイル名（guard-japanese-prose）と一致する。
 
   - handler_id: rtk_boundary_shadow_guard
@@ -527,7 +529,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `secret_boundary_guard.sh` | blocker | **操作を停止（block）** |
 | `local_main_branch_guard.sh` | blocker | **操作を停止（block）** |
 | `worktree_scope_guard.sh` | blocker | **操作を停止（block）** |
-| `guard-japanese-prose.sh` | mode_dependent | shadow モード: 継続（log のみ）/ enforce モード: **停止** |
+| `guard-japanese-prose.sh` | mode_dependent | unset/off/shadow(legacy alias)/invalid モード: 継続（block なし、persistent log なし）/ enforce モード: **停止** |
 | `rtk_boundary_shadow_guard.sh` | telemetry | 継続（log のみ） |
 | `ci_test_performance_advisory.sh` | warning / fail_open | 継続（advisory 出力のみ、block なし） |
 | `session_manifest_coordinator.sh`（Stop） | telemetry | 継続 |
@@ -577,15 +579,19 @@ AC3 対応: `secret_boundary_guard.sh` は fail-closed 設計を維持する。
 
 ## 7. mode_dependent: guard-japanese-prose.sh（モード依存）
 
-AC8 対応: `guard-japanese-prose.sh` の default 動作は **shadow モード（exit 0）**。
+`guard-japanese-prose.sh` の default 動作は **off モード（exit 0）**。#2265 により
+persistent shadow logging（`.guard_shadow_log.jsonl` への write）は廃止され、
+mode contract は unset / off / shadow(legacy alias) / enforce / invalid の 5 状態。
 
 | `GUARD_JAPANESE_PROSE_MODE` | 動作 |
 |---|---|
-| 未設定 / `shadow` | exit 0（shadow モード: block せず JSONL に記録のみ） |
+| 未設定 / `off` | exit 0（non-blocking。persistent file は生成しない） |
+| `shadow`（legacy alias） | exit 0（`off` と同一挙動。persistent file は生成しない） |
 | `enforce` | exit 2（enforce モード: 日本語比率不足でブロック） |
-| 不正値 | shadow として動作 + `invalid_mode` を JSONL に記録 |
+| 不正値 | exit 0（non-blocking diagnostic として `off` と同様に動作。persistent file なし） |
 
 この分離により、CI や強制モードでのみ block が発動し、通常開発フローの妨げを最小化する。
+persistent telemetry backend は追加しない（#2265 の Out of Scope）。
 
 ---
 

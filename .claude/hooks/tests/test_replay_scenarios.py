@@ -2,14 +2,10 @@
 
 Claude Code replay scenario R1〜R7 の structured log harness と test。
 
-各シナリオで以下をアサートする（AC10）:
-  - route_id
-  - body_source
-  - public_mutation
-  - decision_would_be
-  - failed_block_count
-  - exit_code
-  - JSONL schema_version
+各シナリオで exit_code をアサートする。#2265 により persistent shadow
+logging（.guard_shadow_log.jsonl への write）は廃止されたため、shadow mode の
+各シナリオで production/override 先いずれの JSONL も生成されないことを
+test -f 相当の existence assertion（`os.path.exists`）で検証する（AC4）。
 
 AC5, AC10, AC12 対応。
 """
@@ -24,6 +20,7 @@ import pytest
 
 HOOK_SCRIPT = Path(__file__).parent.parent / "guard-japanese-prose.sh"
 SHADOW_LOG_PY = Path(__file__).parent.parent / "shadow_log.py"
+PROJECT_DIR = Path(__file__).parent.parent.parent.parent
 
 # テスト用の fake gh スクリプトディレクトリ（後で tmp_path に作成）
 FAKE_GH_SCRIPT = """#!/usr/bin/env bash
@@ -219,13 +216,11 @@ class TestR1IssueCreateJapanese:
         # exit_code アサート
         assert result.returncode == 0, f"R1: must exit 0, got {result.returncode}"
 
-        # JSONL フィールドアサート（決定論的に記録されなくてもよい: allow は記録対象外）
-        # allow ルートでは JSONL が存在しないか decision_would_be=allow のどちらか
-        if os.path.exists(log_file):
-            entries = read_jsonl(log_file)
-            if entries:
-                entry = entries[-1]
-                assert entry.get("schema_version") == "1", f"R1: schema_version != 1: {entry}"
+        # AC4: #2265 により persistent shadow logging は廃止済み。
+        # R1 shadow 実行後、production/override 先の JSONL は一切生成されない。
+        assert not os.path.exists(log_file), (
+            f"R1: persistent shadow log must not be created: {log_file}"
+        )
 
     def test_R1_issue_create_japanese_body_enforce(self, tmp_path):
         """R1: 日本語 body は enforce mode でも allow（exit 0）。"""
@@ -320,17 +315,10 @@ class TestR3IssueCommentEnglishProse:
             f"R3 shadow: must exit 0, got {result.returncode}"
         )
 
-        # JSONL: decision_would_be=deny, public_mutation=true
-        if os.path.exists(log_file):
-            entries = read_jsonl(log_file)
-            deny_entries = [e for e in entries if e.get("decision_would_be") == "deny"]
-            if deny_entries:
-                entry = deny_entries[-1]
-                assert entry.get("schema_version") == "1", f"R3: schema_version != 1: {entry}"
-                assert "route_id" in entry, f"R3: route_id 欠落: {entry}"
-                assert "body_source" in entry, f"R3: body_source 欠落: {entry}"
-                assert "public_mutation" in entry, f"R3: public_mutation 欠落: {entry}"
-                assert "failed_block_count" in entry, f"R3: failed_block_count 欠落: {entry}"
+        # AC4: would-deny ケース（英語 prose）でも persistent shadow log は生成されない。
+        assert not os.path.exists(log_file), (
+            f"R3: persistent shadow log must not be created: {log_file}"
+        )
 
     def test_R3_enforce_deny(self, tmp_path):
         """R3 enforce: 英語 prose は exit 2 でブロック。"""
@@ -514,6 +502,10 @@ class TestR6RestCommentRouteClassification:
         assert result.returncode == 0, (
             f"R6 shadow: must exit 0, got {result.returncode}\nstderr: {result.stderr}"
         )
+        # AC4: persistent shadow log は生成されない。
+        assert not os.path.exists(log_file), (
+            f"R6: persistent shadow log must not be created: {log_file}"
+        )
 
     def test_R6_enforce_gh_api_field_body_deny(self, tmp_path):
         """R6 enforce: gh api -X POST -f body= 英語 body は exit 2。"""
@@ -564,16 +556,10 @@ class TestR7GraphQLConservativeDeny:
             f"R7 shadow: must exit 0 (would-deny), got {result.returncode}"
         )
 
-        # JSONL: would-deny / conservative_deny が記録されているか確認
-        if os.path.exists(log_file):
-            entries = read_jsonl(log_file)
-            if entries:
-                entry = entries[-1]
-                assert entry.get("schema_version") == "1", f"R7: schema_version != 1: {entry}"
-                assert "route_id" in entry, f"R7: route_id 欠落: {entry}"
-                assert "body_source" in entry, f"R7: body_source 欠落: {entry}"
-                assert "public_mutation" in entry, f"R7: public_mutation 欠落: {entry}"
-                assert "failed_block_count" in entry, f"R7: failed_block_count 欠落: {entry}"
+        # AC4: conservative_deny would-deny ケースでも persistent shadow log は生成されない。
+        assert not os.path.exists(log_file), (
+            f"R7: persistent shadow log must not be created: {log_file}"
+        )
 
     def test_R7_enforce_graphql_mutation_deny(self, tmp_path):
         """R7 enforce: GraphQL mutation は exit 2（conservative deny）。"""
@@ -611,6 +597,50 @@ class TestR7GraphQLConservativeDeny:
         for pattern in forbidden_patterns:
             assert not re.search(pattern, script_text), (
                 f"AC12: guard-japanese-prose.sh に禁止パターン '{pattern}' が存在する"
+            )
+
+
+# ---------------------------------------------------------------------------
+# AC4: R1〜R7 replay 実行が production .guard_shadow_log.jsonl を作成しない
+# ---------------------------------------------------------------------------
+
+class TestReplayScenariosDoNotCreateProductionShadowLog:
+    """AC4: replay scenario 実行中に production 側 .guard_shadow_log.jsonl を作成しない。
+
+    GUARD_JAPANESE_PROSE_SHADOW_LOG を明示指定せず、worktree ルート（PROJECT_DIR）
+    を cwd として hook を実行しても、production 側 shadow log の存在状態・mtime が
+    変化しないことを test -f 相当の existence assertion で検証する。
+    """
+
+    def test_R3_style_shadow_run_does_not_touch_production_shadow_log(self, tmp_path):
+        production_path = PROJECT_DIR / ".guard_shadow_log.jsonl"
+        existed_before = production_path.exists()
+        mtime_before = production_path.stat().st_mtime_ns if existed_before else None
+
+        body_file = tmp_path / "body.md"
+        body_file.write_text(
+            "This is entirely English prose for a GitHub comment. "
+            "Production shadow log must not be touched by replay scenarios.",
+            encoding="utf-8",
+        )
+        fake_gh_dir = make_fake_gh(tmp_path)
+        command = f"gh issue comment 657 --body-file {body_file}"
+
+        result = run_hook(
+            "Bash", command,
+            env_mode="shadow",
+            fake_gh_bin_dir=fake_gh_dir,
+        )
+        assert result.returncode == 0
+
+        existed_after = production_path.exists()
+        assert existed_before == existed_after, (
+            "production .guard_shadow_log.jsonl の存在状態が変化した"
+        )
+        if existed_before:
+            mtime_after = production_path.stat().st_mtime_ns
+            assert mtime_before == mtime_after, (
+                "production .guard_shadow_log.jsonl の mtime が変化した"
             )
 
 
