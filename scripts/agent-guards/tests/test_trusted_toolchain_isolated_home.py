@@ -5,13 +5,19 @@ Covers AC1 (isolated `HOME` `uv` resolution succeeds) and AC6-adjacent
 regression coverage (existing fail-closed adversarial trust-path checks
 still block once the trust root is generalized to
 `_trusted_toolchain_dirs`).
+
+Issue #2251 narrows the trust root itself: account-home `~/.local/bin` is
+excluded from `_safe_path_entries()` entirely (CWE-427 search-selection
+hardening) rather than merely validated. AC1/AC2/AC3/AC5/AC7 coverage for
+that change lives in this module (see the "Issue #2251" section below);
+AC4 is this whole module's positive-path regression suite, and AC6 is
+`test_skill_runtime_control_plane_exec.py`.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import pwd
 import stat
 import subprocess
 import sys
@@ -41,54 +47,51 @@ def _write_fake_uv(hosted_root: Path, version: str, *, mode: int | None = None) 
 def test_resolve_trusted_executable_uv_succeeds_under_isolated_home(monkeypatch, tmp_path):
     """GIVEN an isolated HOME (Claude-GPT launcher style: fresh, empty,
     no `.local/bin` toolchain cache) with no `HOME` override applied by the
-    caller
+    caller, and a deterministic hostedtoolcache `uv` (Issue #2251: real
+    host state -- whether `uv` happens to live in hostedtoolcache, a
+    system directory, or only account-home `.local/bin` -- must not decide
+    this test's outcome; account-home `.local/bin` is no longer a trust
+    root candidate at all, see `test_safe_path_entries_excludes_local_bin`)
     WHEN `_resolve_trusted_executable("uv", ...)` is called
-    THEN it succeeds by resolving `uv` from the real hosted toolcache root
-    (or the account/system PATH), not from the isolated `HOME`'s
-    now-nonexistent `.local/bin` (Issue #2241 AC1)."""
+    THEN it succeeds by resolving `uv` from the hosted toolcache root, not
+    from the isolated `HOME`'s now-nonexistent, and now categorically
+    untrusted, `.local/bin` (Issue #2241 AC1 / Issue #2251 AC4)."""
     isolated_home = tmp_path / "isolated-home"
     isolated_home.mkdir()
     monkeypatch.setenv("HOME", str(isolated_home))
+    hosted_root = tmp_path / "hostedtoolcache" / "uv"
+    hosted_uv_path = _write_fake_uv(hosted_root, "0.11.29")
+    monkeypatch.setitem(exec_mod._TRUSTED_TOOLCHAIN_HOSTED_ROOTS, "uv", hosted_root)
 
     resolved = exec_mod._resolve_trusted_executable("uv", str(REPO_ROOT))
 
     assert os.path.isabs(resolved)
     assert os.path.basename(resolved) == "uv"
     assert os.access(resolved, os.X_OK)
+    assert os.path.realpath(resolved) == os.path.realpath(str(hosted_uv_path))
     # The isolated HOME's .local/bin must never be where this actually
-    # resolved from -- it is empty by construction.
+    # resolved from -- it is empty by construction, and excluded outright.
     assert not resolved.startswith(str(isolated_home))
 
 
-def test_os_account_home_ignores_home_env_override(monkeypatch, tmp_path):
-    """GIVEN `HOME` overridden to an attacker/isolated-session-controlled
-    directory
-    WHEN `_os_account_home` is called
-    THEN it still returns the real OS account home directory (via the
-    passwd database), never the overridden `HOME` value (Issue #2241)."""
-    fake_home = tmp_path / "fake-home"
-    fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
-
-    account_home = exec_mod._os_account_home()
-
-    assert account_home != str(fake_home)
-
-
-def test_safe_path_entries_local_bin_uses_os_account_home_not_isolated_home(monkeypatch, tmp_path):
-    """GIVEN an isolated HOME
+def test_safe_path_entries_excludes_local_bin(monkeypatch, tmp_path):
+    """GIVEN an existing account-home `.local/bin` directory (real or
+    isolated-session-style, via `HOME`)
     WHEN `_safe_path_entries` is called
-    THEN its `.local/bin` trust entry is derived from the OS account home,
-    not the isolated `HOME` (Issue #2241 AC1 / AC6 regression)."""
+    THEN no entry is, or is derived from, an account-home `.local/bin`
+    directory -- account-home `.local/bin` is no longer a trust root
+    candidate at all (Issue #2251 AC1: CWE-427 search-selection hardening
+    excludes the location categorically; it used to be merely validated,
+    see the superseded `test_safe_path_entries_local_bin_uses_os_account_home_not_isolated_home`
+    from Issue #2241)."""
     isolated_home = tmp_path / "isolated-home"
-    isolated_home.mkdir()
+    (isolated_home / ".local" / "bin").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(isolated_home))
 
     entries = exec_mod._safe_path_entries()
-    local_bin_entries = [e for e in entries if e.endswith(str(Path(".local") / "bin"))]
 
-    assert local_bin_entries, "expected a .local/bin trust entry"
-    assert not any(str(isolated_home) in entry for entry in local_bin_entries)
+    assert not any(entry.endswith(str(Path(".local") / "bin")) for entry in entries)
+    assert not any(str(isolated_home) in entry for entry in entries)
 
 
 def test_trusted_toolchain_dirs_generalizes_beyond_uv(tmp_path, monkeypatch):
@@ -187,87 +190,155 @@ def test_trusted_toolchain_dirs_rejects_non_root_non_account_ownership(tmp_path,
 
 
 # ---------------------------------------------------------------------------
-# PR #2247 review P1-3: `~/.local/bin` is writable by the very account this
-# executor process runs as. These tests document the same-UID hardening
-# implemented in `_validate_account_local_bin_trust` -- ancestor
-# ownership/writability/symlink checks -- while making explicit (via the
-# NOT CONTROLLED docstring on that function) that a same-UID attacker who
-# already has arbitrary code execution is still not fully excluded by this
-# check. See PR #2247 body "Not controlled" section.
+# Issue #2251: account-home `~/.local/bin` is excluded from
+# `_safe_path_entries()` entirely (CWE-427 search-selection hardening),
+# superseding the PR #2247 review P1-3 same-UID ancestor
+# ownership/writability/symlink validation this section used to document
+# (that validation function, `_validate_account_local_bin_trust`, has been
+# removed along with the `.local/bin` entry it used to gate -- see
+# `test_safe_path_entries_excludes_local_bin` above for the AC1 exclusion
+# test). This section covers the remaining Issue #2251 ACs: AC2 (fake
+# `.local/bin` executable is never selected), AC3 (hostedtoolcache lane
+# regression), AC5 (fail-closed when `uv` exists only under `.local/bin`),
+# and AC7 (`pyproject.toml` required-version SSOT consumption).
 # ---------------------------------------------------------------------------
 
 
-def _fake_account_home(monkeypatch, home: Path) -> None:
-    fake_pw_entry = pwd.struct_passwd((
-        "issue-2241-account", "x", os.getuid(), os.getgid(), "", str(home), "/bin/sh",
-    ))
-    monkeypatch.setattr(exec_mod.pwd, "getpwuid", lambda _uid: fake_pw_entry)
-
-
-def test_account_local_bin_regular_file_marker_is_rejected(monkeypatch, tmp_path):
-    """GIVEN `<account_home>/.local/bin` exists but is a regular file (not a
-    directory) instead of the expected toolchain cache directory
-    WHEN `_safe_path_entries` is called
-    THEN that path is never trusted (Issue #2241 / PR #2247 P1-3,
-    documents pre-existing expected behavior)."""
+def test_local_bin_fake_executable_not_selected(monkeypatch, tmp_path):
+    """GIVEN a fake `uv` executable planted at account-home `.local/bin/uv`
+    (not sourced from the hostedtoolcache trust root)
+    WHEN `_resolve_trusted_executable("uv", ...)` is called
+    THEN it never selects the account-home fake executable -- either it
+    fails closed with `uv_not_found`, or (if a real `uv` happens to exist
+    elsewhere on the fixed system/hostedtoolcache trust roots) it resolves
+    to that real executable, never to the fake one under `.local/bin`
+    (Issue #2251 AC2 negative test)."""
     home = tmp_path / "account-home"
-    (home / ".local").mkdir(parents=True)
-    (home / ".local" / "bin").write_text("not a directory\n", encoding="utf-8")
-    _fake_account_home(monkeypatch, home)
+    fake_local_bin = home / ".local" / "bin"
+    fake_local_bin.mkdir(parents=True)
+    fake_uv = fake_local_bin / "uv"
+    fake_uv.write_text("#!/bin/sh\necho 'uv 0.11.29'\n", encoding="utf-8")
+    fake_uv.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+    monkeypatch.setenv("HOME", str(home))
 
-    entries = exec_mod._safe_path_entries()
+    try:
+        resolved = exec_mod._resolve_trusted_executable("uv", str(REPO_ROOT))
+    except RuntimeError as exc:
+        assert "uv_not_found" in str(exc)
+        return
 
-    assert str(home / ".local" / "bin") not in entries
-
-
-def test_account_local_bin_symlink_directory_is_rejected(monkeypatch, tmp_path):
-    """GIVEN `<account_home>/.local/bin` is a symlink to a directory that is
-    world-writable
-    WHEN `_safe_path_entries` is called
-    THEN the symlinked trust root is rejected -- symlink targets are
-    validated, not implicitly trusted (Issue #2241 / PR #2247 P1-3(b))."""
-    home = tmp_path / "account-home"
-    (home / ".local").mkdir(parents=True)
-    evil_target = tmp_path / "world-writable-target"
-    evil_target.mkdir()
-    evil_target.chmod(0o777)
-    (home / ".local" / "bin").symlink_to(evil_target, target_is_directory=True)
-    _fake_account_home(monkeypatch, home)
-
-    entries = exec_mod._safe_path_entries()
-
-    assert str(home / ".local" / "bin") not in entries
+    assert os.path.realpath(resolved) != os.path.realpath(str(fake_uv))
+    assert not resolved.startswith(str(fake_local_bin))
 
 
-def test_group_writable_toolchain_ancestor_is_rejected(monkeypatch, tmp_path):
-    """GIVEN the `.local` ancestor directory is group-writable
-    WHEN `_safe_path_entries` is called
-    THEN `.local/bin` is not trusted (Issue #2241 / PR #2247 P1-3(a))."""
-    home = tmp_path / "account-home"
-    local_bin = home / ".local" / "bin"
-    local_bin.mkdir(parents=True)
-    dotlocal = home / ".local"
-    dotlocal.chmod(dotlocal.stat().st_mode | stat.S_IWGRP)
-    _fake_account_home(monkeypatch, home)
+def test_hostedtoolcache_lane_regression(monkeypatch, tmp_path):
+    """GIVEN a well-formed hostedtoolcache `uv` (the system/hostedtoolcache
+    lane) and no account-home `.local/bin` involvement at all
+    WHEN `_resolve_trusted_executable("uv", ...)` is called
+    THEN it still resolves successfully from the hostedtoolcache root --
+    excluding account-home `.local/bin` from the trust root candidates
+    does not regress this lane (Issue #2251 AC3)."""
+    hosted_root = tmp_path / "hostedtoolcache" / "uv"
+    uv_path = _write_fake_uv(hosted_root, "0.11.29")
+    monkeypatch.setitem(exec_mod._TRUSTED_TOOLCHAIN_HOSTED_ROOTS, "uv", hosted_root)
 
-    entries = exec_mod._safe_path_entries()
+    resolved = exec_mod._resolve_trusted_executable("uv", str(REPO_ROOT))
 
-    assert str(local_bin) not in entries
+    assert os.path.realpath(resolved) == os.path.realpath(str(uv_path))
 
 
-def test_world_writable_toolchain_ancestor_is_rejected(monkeypatch, tmp_path):
-    """GIVEN the account-home ancestor directory is world-writable
-    WHEN `_safe_path_entries` is called
-    THEN `.local/bin` is not trusted (Issue #2241 / PR #2247 P1-3(a))."""
+def test_local_bin_only_fails_closed(monkeypatch, tmp_path):
+    """GIVEN `uv` exists only at account-home `.local/bin` (no
+    hostedtoolcache candidate at all)
+    WHEN `_resolve_trusted_executable("uv", ...)` is called
+    THEN it fails closed with a `uv_not_found` RuntimeError rather than
+    silently falling back to the account-home executable -- no new pin
+    mechanism is introduced, this is the existing fail-closed
+    `{name}_not_found` path (Issue #2251 AC5)."""
     home = tmp_path / "account-home"
     local_bin = home / ".local" / "bin"
     local_bin.mkdir(parents=True)
-    home.chmod(home.stat().st_mode | stat.S_IWOTH)
-    _fake_account_home(monkeypatch, home)
+    uv_path = local_bin / "uv"
+    uv_path.write_text("#!/bin/sh\necho 'uv 0.11.29'\n", encoding="utf-8")
+    uv_path.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setitem(
+        exec_mod._TRUSTED_TOOLCHAIN_HOSTED_ROOTS, "uv", tmp_path / "no-hostedtoolcache-here"
+    )
 
-    entries = exec_mod._safe_path_entries()
+    with pytest.raises(RuntimeError, match="uv_not_found"):
+        exec_mod._resolve_trusted_executable("uv", str(REPO_ROOT))
 
-    assert str(local_bin) not in entries
+
+def test_required_version_mismatch_fails_closed(tmp_path):
+    """GIVEN a `uv` executable whose `--version` banner does not match
+    `pyproject.toml`'s `[tool.uv].required-version` pin
+    WHEN `_validate_trusted_executable_version("uv", ...)` is called
+    THEN it fails closed (returns False) rather than accepting the
+    mismatched version (Issue #2251 AC7: `.local/bin`-derived -- and any
+    other non-hostedtoolcache -- version validation consumes the
+    `pyproject.toml` SSOT, exact match only)."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "pyproject.toml").write_text(
+        '[tool.uv]\nrequired-version = "==0.11.29"\n', encoding="utf-8"
+    )
+    mismatched_uv = tmp_path / "mismatched-uv"
+    mismatched_uv.write_text("#!/bin/sh\necho 'uv 9.9.9'\n", encoding="utf-8")
+    mismatched_uv.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+
+    assert not exec_mod._validate_trusted_executable_version(
+        "uv", str(mismatched_uv), str(project_root)
+    )
+
+
+def test_required_version_match_succeeds(tmp_path):
+    """GIVEN a `uv` executable whose `--version` banner exactly matches
+    `pyproject.toml`'s `[tool.uv].required-version` pin
+    WHEN `_validate_trusted_executable_version("uv", ...)` is called
+    THEN it succeeds (Issue #2251 AC7 positive counterpart)."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "pyproject.toml").write_text(
+        '[tool.uv]\nrequired-version = "==0.11.29"\n', encoding="utf-8"
+    )
+    matching_uv = tmp_path / "matching-uv"
+    matching_uv.write_text("#!/bin/sh\necho 'uv 0.11.29'\n", encoding="utf-8")
+    matching_uv.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+
+    assert exec_mod._validate_trusted_executable_version(
+        "uv", str(matching_uv), str(project_root)
+    )
+
+
+def test_required_version_missing_ssot_fails_closed(tmp_path):
+    """GIVEN a `project_root` whose `pyproject.toml` has no
+    `[tool.uv].required-version`
+    WHEN `_validate_trusted_executable_version("uv", ...)` is called
+    THEN it fails closed (returns False) -- there is nothing trustworthy to
+    compare against, so this is not silently skipped (Issue #2251 AC7)."""
+    project_root = tmp_path / "project-without-pin"
+    project_root.mkdir()
+    (project_root / "pyproject.toml").write_text("[project]\nname = \"x\"\n", encoding="utf-8")
+    some_uv = tmp_path / "some-uv"
+    some_uv.write_text("#!/bin/sh\necho 'uv 0.11.29'\n", encoding="utf-8")
+    some_uv.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+
+    assert not exec_mod._validate_trusted_executable_version(
+        "uv", str(some_uv), str(project_root)
+    )
+
+
+def test_required_uv_version_reads_repo_pyproject_toml_ssot():
+    """GIVEN the real repository `pyproject.toml`
+    WHEN `_required_uv_version` is called with `REPO_ROOT`
+    THEN it returns the exact pinned version, read-only, from
+    `[tool.uv].required-version` (Issue #2251 AC7 SSOT-consumption
+    requirement -- no new version literal is introduced by this module)."""
+    version = exec_mod._required_uv_version(str(REPO_ROOT))
+
+    assert version is not None
+    assert exec_mod._EXACT_VERSION_PIN_RE.fullmatch(f"=={version}")
 
 
 # ---------------------------------------------------------------------------

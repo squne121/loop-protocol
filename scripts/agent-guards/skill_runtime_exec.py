@@ -8,7 +8,6 @@ import errno
 import hashlib
 import json
 import os
-import pwd
 import re
 import shutil
 import signal
@@ -17,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
@@ -695,111 +695,64 @@ def _ensure_artifact_path_safe(project_root: str, issue_number: str, command_id:
     return artifact_roots[0]
 
 
-def _os_account_home() -> str:
-    """Resolve the OS account home directory via the passwd database, never
-    via the `HOME` environment variable (Issue #2241).
-
-    Trust roots consumed by `_safe_path_entries`/`_resolve_trusted_executable`
-    must not be attacker-controllable through child-process environment
-    mutation. Prior to this fix, `_safe_path_entries()` derived its trust
-    root from `Path.home()`, which itself resolves via the `HOME`
-    environment variable -- so an isolated Claude-GPT session (whose
-    launcher intentionally sets `HOME` to a fresh, empty sandbox directory
-    with no `.local/bin` toolchain cache) would have its trusted PATH
-    silently narrowed to a directory that never contains the `uv`
-    toolchain, causing every command that needs a trusted `uv`/`python3`
-    resolution to fail closed with `{name}_not_found` -- not because of an
-    actual security violation, but because the isolated session's `HOME`
-    happens not to be the OS account home. Resolving through
-    `pwd.getpwuid(os.getuid()).pw_dir` instead ties the trust root to the
-    OS account that the executor process itself is running as, which is
-    invariant under child environment mutation (including `HOME`
-    overrides) and therefore behaves identically whether the session's
-    `HOME` has been overridden or not.
-    """
-    return pwd.getpwuid(os.getuid()).pw_dir
+# `pyproject.toml`'s `[tool.uv].required-version` is the canonical, read-only
+# SSOT for the repository's pinned `uv` version (Issue #1598). This module
+# never writes it and never introduces a second version literal -- it only
+# consumes it as a defense-in-depth "version 照合" check on a `uv`
+# resolution that did not come from the strongly-validated hostedtoolcache
+# trust root (e.g. a system PATH directory such as `/usr/local/bin`); see
+# `_validate_trusted_executable_version` below (Issue #2251 AC7).
+_EXACT_VERSION_PIN_RE = re.compile(r"^==(?P<version>\d+\.\d+\.\d+)$")
 
 
-def _validate_account_local_bin_trust(local_bin: Path, account_uid: int) -> bool:
-    """Validate `local_bin` (`<account_home>/.local/bin`) and its account-home
-    ancestors before treating it as a trust root (Issue #2241 / PR #2247
-    review P1-3).
-
-    NOT CONTROLLED: this is same-UID hardening, not a full trust boundary.
-    `local_bin` is, by construction, writable by the very Unix account this
-    executor process itself runs as (that is what makes it useful as a
-    per-account toolchain cache in the first place). An attacker who
-    already has arbitrary code execution as this account can create or
-    replace files under `local_bin` regardless of any check performed
-    here -- no ownership/permission/version check can distinguish
-    "the legitimate account installed `uv` here" from "an attacker running
-    as the same account planted a lookalike `uv` here". Closing that gap
-    would require a dedicated, launcher-owned, non-account-writable
-    toolchain directory (a real trust-boundary change), which is out of
-    scope for this Issue (see Issue #2241 "Out of Scope" /
-    PR #2247 review). What this function *does* defend against is the
-    narrower case where an ancestor directory is unexpectedly
-    group/world-writable (a different UID could plant something there) or
-    `local_bin` itself is a symlink redirecting the trust root elsewhere.
-    """
-    account_home = local_bin.parent.parent
-    dotlocal = local_bin.parent
-    for candidate in (account_home, dotlocal, local_bin):
-        try:
-            st = candidate.lstat()
-        except OSError:
-            return False
-        if stat.S_ISLNK(st.st_mode):
-            # `local_bin` (or an ancestor) being a symlink means the actual
-            # trust root is whatever it resolves to -- validate the
-            # resolved target's ownership/writability too, not just the
-            # symlink entry itself.
-            try:
-                resolved = candidate.resolve(strict=True)
-            except OSError:
-                return False
-            try:
-                real_st = resolved.stat()
-            except OSError:
-                return False
-            if real_st.st_uid != account_uid:
-                return False
-            if real_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                return False
-            if candidate == local_bin and not resolved.is_dir():
-                return False
-            continue
-        if st.st_uid != account_uid:
-            return False
-        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            return False
-        if candidate == local_bin and not stat.S_ISDIR(st.st_mode):
-            return False
-    return True
+def _required_uv_version(project_root: str) -> str | None:
+    """Return the numeric `uv` version pinned by `pyproject.toml`'s
+    `[tool.uv].required-version`, or None if that SSOT is missing,
+    unreadable, or not an exact `==X.Y.Z` pin (Issue #2251 AC7)."""
+    pyproject_path = Path(project_root) / "pyproject.toml"
+    try:
+        raw_toml = pyproject_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = tomllib.loads(raw_toml)
+    except tomllib.TOMLDecodeError:
+        return None
+    uv_section = data.get("tool", {}).get("uv")
+    if not isinstance(uv_section, dict):
+        return None
+    raw_pin = uv_section.get("required-version")
+    if not isinstance(raw_pin, str):
+        return None
+    match = _EXACT_VERSION_PIN_RE.fullmatch(raw_pin.strip())
+    return match.group("version") if match else None
 
 
-# Executable-name -> expected `<exe> --version` stdout pattern. Used as a
-# cheap defense-in-depth "version 照合" for executables resolved from the
-# account-writable `.local/bin` trust root (Issue #2241 / PR #2247 review
-# P1-3). This does not add a real trust boundary on its own (see
-# `_validate_account_local_bin_trust` docstring), but it does reject an
-# executable that was replaced with something that does not even look like
-# the expected tool (e.g. a shell script that never emits a `uv`-shaped
-# version banner).
-_TOOL_VERSION_OUTPUT_RE: dict[str, re.Pattern[str]] = {
-    "uv": re.compile(r"^uv \d+\.\d+\.\d+"),
-}
+def _validate_trusted_executable_version(name: str, resolved: str, project_root: str) -> bool:
+    """Defense-in-depth "version 照合" for a trusted executable resolved from
+    outside the strongly-validated hostedtoolcache trust root (Issue #2241 /
+    PR #2247 review P1-3; Issue #2251 narrowed the trust root itself by
+    excluding account-home `~/.local/bin`, but a `uv` resolved from a
+    remaining non-hostedtoolcache entry -- e.g. `/usr/local/bin` -- still
+    gets this check).
 
-
-def _validate_local_bin_executable_version(name: str, resolved: str) -> bool:
-    pattern = _TOOL_VERSION_OUTPUT_RE.get(name)
-    if pattern is None:
-        # No known pattern registered for this executable name -- nothing
-        # to compare against, so this check is inapplicable rather than a
-        # rejection (avoids hard-coding every possible trusted executable
-        # name here; the ownership/writability checks above remain the
-        # primary defense).
+    This is not a trust boundary on its own (an executable that emits a
+    matching `--version` banner is not thereby proven authentic), but it
+    does reject an executable that was replaced with something that does
+    not even claim to be the pinned `uv` version. For `uv`, the expected
+    version is the exact `pyproject.toml` [tool.uv].required-version pin
+    (Issue #2251 AC7) -- if that SSOT is missing/malformed there is nothing
+    trustworthy to compare against, so this fails closed (returns False)
+    rather than skipping the check."""
+    if name != "uv":
+        # No registered expectation for this executable name -- nothing to
+        # compare against, so this check is inapplicable rather than a
+        # rejection (the ownership/commonpath/regular-file checks above
+        # remain the primary defense for non-`uv` names).
         return True
+    required_version = _required_uv_version(project_root)
+    if required_version is None:
+        return False
     try:
         proc = subprocess.run(
             [resolved, "--version"],
@@ -810,15 +763,29 @@ def _validate_local_bin_executable_version(name: str, resolved: str) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return bool(pattern.match((proc.stdout or "").strip()))
+    match = re.match(r"^uv (\d+\.\d+\.\d+)", (proc.stdout or "").strip())
+    return bool(match) and match.group(1) == required_version
 
 
 def _safe_path_entries() -> list[str]:
-    account_home = _os_account_home()
-    account_uid = os.getuid()
-    local_bin = Path(account_home) / ".local" / "bin"
+    """Return the ordered list of trusted PATH directories consumed by
+    `_resolve_trusted_executable`/`_sanitize_env`.
+
+    Account-home `~/.local/bin` is deliberately NOT included (Issue #2251):
+    it is writable by the very Unix account this executor process itself
+    runs as, so a same-UID attacker who already has arbitrary code
+    execution could plant a lookalike `uv` there -- no ownership,
+    writability, or `--version` check can distinguish that from a
+    legitimately installed toolchain (see PR #2247 review P1-3,
+    `docs/dev/workflow.md` "Not Controlled"). Excluding it entirely
+    (rather than merely validating it, as this module did before Issue
+    #2251) closes the CWE-427 search-selection element itself: if `uv` is
+    not resolvable from the hostedtoolcache trust root or a system
+    standard directory below, resolution now fails closed with
+    `{name}_not_found` instead of silently falling back to an
+    account-writable location.
+    """
     entries = [
-        *([str(local_bin)] if _validate_account_local_bin_trust(local_bin, account_uid) else []),
         *_trusted_toolchain_dirs("uv"),
         "/usr/local/sbin",
         "/usr/local/bin",
@@ -980,14 +947,16 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     if real_parent not in allowed_dirs and real_parent != runtime_dir:
         raise RuntimeError(f"{name}_outside_trusted_path")
     if name != "python3":
-        # Issue #2241 / PR #2247 review P1-3(c): a resolution that came from
-        # the account-writable `.local/bin` trust root (i.e. not one of the
-        # strongly-validated hostedtoolcache dirs) gets an additional
-        # "version 照合" defense-in-depth check -- see
-        # `_validate_local_bin_executable_version` docstring for why this
-        # is a confirmation, not a trust boundary, on its own.
+        # Issue #2241 / PR #2247 review P1-3(c) / Issue #2251: a resolution
+        # that came from outside the strongly-validated hostedtoolcache
+        # trust root (account-home `~/.local/bin` is no longer even a
+        # candidate as of Issue #2251 -- this now only reaches a remaining
+        # system PATH directory such as `/usr/local/bin`) gets an
+        # additional "version 照合" defense-in-depth check -- see
+        # `_validate_trusted_executable_version` docstring for why this is
+        # a confirmation, not a trust boundary, on its own.
         hosted_dirs = {os.path.realpath(entry) for entry in _trusted_toolchain_dirs(name)}
-        if real_parent not in hosted_dirs and not _validate_local_bin_executable_version(name, real):
+        if real_parent not in hosted_dirs and not _validate_trusted_executable_version(name, real, project_root):
             raise RuntimeError(f"{name}_version_mismatch")
     return resolved if name == "python3" else real
 
