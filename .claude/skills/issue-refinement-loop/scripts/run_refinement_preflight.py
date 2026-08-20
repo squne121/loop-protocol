@@ -262,6 +262,13 @@ BLOCKER_FAIL_CLOSED = "PLANNER_FAIL_CLOSED"
 BLOCKER_ANCHOR_REPO_MISMATCH = "ANCHOR_REPO_MISMATCH"
 BLOCKER_ANCHOR_ISSUE_NUMBER_MISMATCH = "ANCHOR_ISSUE_NUMBER_MISMATCH"
 BLOCKER_ANCHOR_COMMENT_NOT_FOUND = "ANCHOR_COMMENT_NOT_FOUND"
+# Issue #2257 AC3: a transport failure (auth dependency, rate limit,
+# 5xx, DNS/connection, timeout, malformed JSON, incomplete pagination,
+# read authority divergence) resolving the anchor comment must never be
+# reported as "comment not found" -- it is a distinct, environment_failure
+# blocker (Issue #2197 incident: anchor comment 5315264311 was
+# misclassified as missing because of exactly this conflation).
+BLOCKER_ANCHOR_FETCH_TRANSPORT_FAILURE = "ANCHOR_FETCH_TRANSPORT_FAILURE"
 BLOCKER_ANCHOR_ISSUE_URL_MISMATCH = "ANCHOR_ISSUE_URL_MISMATCH"
 BLOCKER_ANCHOR_COMMENT_SCHEMA_INVALID = "ANCHOR_COMMENT_SCHEMA_INVALID"
 BLOCKER_ANCHOR_COMMENT_MULTIPLE_UNSUPPORTED = "ANCHOR_COMMENT_MULTIPLE_UNSUPPORTED"
@@ -2968,103 +2975,397 @@ def _is_isolated_claude_gpt_profile() -> bool:
     return current_home != real_home
 
 
-def _fetch_issue(repo: str, issue_number: int) -> tuple[dict | None, str]:
-    """Fetch issue data.
+# ---------------------------------------------------------------------------
+# Issue #2257 P0-1: single read-authority transport adapters.
+#
+# `run_preflight()` selects exactly ONE of these once per invocation (via
+# `_select_read_transport()`) and threads it explicitly through every call
+# site on the Issue/comments/anchor-comment read path -- `_fetch_issue`,
+# `_fetch_issue_comments`, `_fetch_single_comment`, `_validate_anchor_comment_url`,
+# and `_validate_anchor_comments_batch` all accept a `transport` parameter
+# instead of independently re-evaluating `_is_isolated_claude_gpt_profile()`
+# and re-instantiating a transport per call (the split-brain pattern that
+# caused Issue #2197's anchor comment 5315264311 misclassification: every
+# call site that skips this parameter is, by construction, re-selecting
+# authority). The `transport=None` default on each fetch function exists
+# ONLY for backward compatibility with pre-existing unit tests that exercise
+# a single fetch function in isolation; `run_preflight()` itself never
+# relies on that default -- it always passes an explicitly-selected
+# `transport`.
+# ---------------------------------------------------------------------------
 
-    Isolated Claude-GPT profile (Issue #2241 AC8 / PR #2247 review P1-1):
-    uses the credentialless REST transport (`github_credentialless_read.py`)
-    exclusively -- never falls back to `gh issue view` in that profile, so a
-    `gh` executable that is unavailable/unauthenticated there never gets
-    invoked.
 
-    All other profiles (human/agent context with a working `gh` CLI):
-    unchanged `gh issue view --json` behavior.
-    """
-    if _is_isolated_claude_gpt_profile():
-        if _credentialless_read is None:
-            return None, "BLOCKER_CREDENTIALLESS_TRANSPORT_UNAVAILABLE: github_credentialless_read import failed"
+def _classify_credentialless_exception(exc: BaseException) -> str:
+    """Map any exception raised by the credentialless transport to a fixed,
+    closed-enum reason code (Issue #2257 AC3/AC4/P0-4).
+
+    Never transcribes `str(exc)` -- an exception type this function does not
+    recognize maps to the fixed code `transport_internal_error`, never to a
+    string built from the exception's own message (which could echo
+    URL/host/OS-error detail this module must never surface downstream)."""
+    if _credentialless_read is None:
+        return "credentialless_transport_unavailable"
+    mapping = (
+        (_credentialless_read.CanonicalResourceMissing, "canonical_resource_missing"),
+        (_credentialless_read.UnexpectedAuthenticationDependency, "unexpected_authentication_dependency"),
+        (_credentialless_read.RateLimitedRejected, "rate_limited"),
+        (_credentialless_read.ForbiddenRejected, "http_403_forbidden"),
+        (_credentialless_read.UpstreamEnvironmentFailure, "upstream_environment_failure"),
+        (_credentialless_read.TransportConnectivityFailure, "transport_connectivity_failure"),
+        (_credentialless_read.MalformedResponseBody, "malformed_response_body"),
+        (_credentialless_read.CrossRepositoryReadRejected, "cross_repository_read_rejected"),
+        (_credentialless_read.InvalidIssueNumberRejected, "invalid_issue_number"),
+        (_credentialless_read.InvalidCommentIdRejected, "invalid_comment_id"),
+    )
+    for exc_cls, code in mapping:
+        if isinstance(exc, exc_cls):
+            return code
+    if isinstance(exc, _credentialless_read.CredentiallessReadError):
+        return "credentialless_read_error"
+    return "transport_internal_error"
+
+
+class _CredentiallessPreflightTransport:
+    """`GitHubReadTransport`-shaped adapter (credentialless side) returning
+    this module's `(data, err)` tuple convention. `err`, when set, is always
+    a fixed, closed-enum reason code prefixed with `_TRANSPORT_FAILURE_PREFIX`
+    or `_SEMANTIC_MISSING_PREFIX` -- never a transcribed exception string
+    (Issue #2257 P0-1/P0-4)."""
+
+    SOURCE_LABEL = "credentialless_transport"
+
+    def __init__(self) -> None:
+        self._inner = _credentialless_read.CredentiallessGitHubReadTransport()
+
+    def read_issue(self, repo: str, issue_number: int) -> tuple[dict | None, str]:
         try:
-            transport = _credentialless_read.CredentiallessGitHubReadTransport()
-            data = transport.read_issue(repo, issue_number)
-        except _credentialless_read.CredentiallessReadError as exc:
-            return None, f"credentialless_read_error: {exc}"
-        except Exception as exc:  # pragma: no cover - defensive fail-closed
-            return None, f"credentialless_read_unexpected_error: {exc}"
+            return self._inner.read_issue(repo, issue_number), ""
+        except Exception as exc:  # noqa: BLE001 - classified below, never re-raised bare
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}{_classify_credentialless_exception(exc)}"
+
+    def list_issue_comments(self, repo: str, issue_number: int) -> tuple[list | None, str]:
+        try:
+            comments = self._inner.list_issue_comments(repo, issue_number)
+        except Exception as exc:  # noqa: BLE001 - classified below, never re-raised bare
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}{_classify_credentialless_exception(exc)}"
+        if not isinstance(comments, list):
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}credentialless_comments_unexpected_type"
+        return comments, ""
+
+    def read_issue_comment(self, repo: str, comment_id: int) -> tuple[dict | None, str]:
+        try:
+            data = self._inner.read_issue_comment(repo, comment_id)
+        except _credentialless_read.CanonicalResourceMissing:
+            return None, f"{_SEMANTIC_MISSING_PREFIX}canonical_resource_missing"
+        except Exception as exc:  # noqa: BLE001 - classified below, never re-raised bare
+            return None, f"{_TRANSPORT_FAILURE_PREFIX}{_classify_credentialless_exception(exc)}"
         return data, ""
 
-    data, err = _run_gh(
-        [
-            "gh",
-            "issue",
-            "view",
-            str(issue_number),
-            "--repo",
-            repo,
-            "--json",
-            "number,title,body,labels,url,updatedAt",
-        ]
-    )
-    return data, err
+
+class _GhCliPreflightTransport:
+    """`GitHubReadTransport`-shaped adapter (gh CLI side, non-isolated
+    profile) preserving the exact pre-#2257 `gh` invocations and error
+    strings for `read_issue`/`list_issue_comments` (AC8: no regression to
+    the existing non-isolated path), while giving `read_issue_comment` the
+    same sanitized semantic/transport classification `_fetch_single_comment`
+    has always applied to the gh single-comment fetch."""
+
+    SOURCE_LABEL = "gh_cli"
+
+    def read_issue(self, repo: str, issue_number: int) -> tuple[dict | None, str]:
+        return _run_gh(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(issue_number),
+                "--repo",
+                repo,
+                "--json",
+                "number,title,body,labels,url,updatedAt",
+            ]
+        )
+
+    def list_issue_comments(self, repo: str, issue_number: int) -> tuple[list | None, str]:
+        try:
+            from command_registry import render_command as _render_command
+
+            _argv = _render_command("gh.issue.comments.list", {"repo": repo, "issue_number": issue_number})
+        except Exception as exc:
+            raise RuntimeError(f"BLOCKER_COMMAND_REGISTRY_UNAVAILABLE: gh.issue.comments.list failed: {exc}") from exc
+        data, err = _run_gh(_argv)
+        if data is None:
+            return None, err
+        # --slurp wraps each page as an element: [[page1_comments...], [page2_comments...]]
+        # Flatten one level regardless of page count.
+        if isinstance(data, list):
+            if len(data) == 0:
+                return [], ""
+            # Check if it's a slurp-wrapped list-of-lists
+            if all(isinstance(item, list) for item in data):
+                flattened: list[dict] = []
+                for page in data:
+                    flattened.extend(page)
+                return flattened, ""
+            # Already a flat list (e.g. non-paginated gh or mock returning flat list)
+            return data, ""
+        return None, f"gh_comments_unexpected_type: {type(data).__name__}"
+
+    def read_issue_comment(self, repo: str, comment_id: int) -> tuple[dict | None, str]:
+        data, err = _run_gh(["gh", "api", f"repos/{repo}/issues/comments/{comment_id}"])
+        if data is not None:
+            return data, ""
+        return None, _classify_gh_single_comment_error(err)
 
 
-def _fetch_issue_comments(repo: str, issue_number: int) -> tuple[list | None, str]:
-    """Fetch all issue comments.
+def _reset_read_transport_cache() -> None:
+    """No-op retained for call-site compatibility (Issue #2257 P0-1 does NOT
+    use process-global transport memoization: `_is_isolated_claude_gpt_profile()`
+    is a pure function of `HOME`/passwd for the lifetime of any single
+    process, and several existing unit tests directly monkeypatch/mutate
+    `HOME` and expect an IMMEDIATE, freshly-recomputed transport selection on
+    the very next call -- a global memoization cache would make those tests
+    observe a stale decision from an earlier, unrelated call in the same
+    pytest process. `run_preflight()` still calls this once at the top of
+    its live-mode branch to document the single-authority-selection-point
+    invariant even though there is no cache state to actually clear)."""
+    return None
 
-    Isolated Claude-GPT profile (Issue #2241 AC8 / PR #2247 review P1-1):
-    uses the credentialless REST transport's `list_issue_comments()`, which
-    follows `Link: rel="next"` pagination itself and returns the same
-    flat, `gh api`-shaped list this function has always returned -- never
-    falls back to `gh api --paginate --slurp` in that profile.
 
-    All other profiles (human/agent context with a working `gh` CLI):
-    unchanged `gh api --paginate --slurp` behavior.
+def _select_read_transport() -> "_CredentiallessPreflightTransport | _GhCliPreflightTransport | None":
+    """Select the read-authority transport for the current profile (Issue
+    #2257 P0-1): `_CredentiallessPreflightTransport` in the isolated
+    Claude-GPT profile, `_GhCliPreflightTransport` otherwise. `run_preflight()`
+    calls this exactly once per invocation and threads the SAME returned
+    instance explicitly through every anchor-comment read on the critical
+    path (`_fetch_single_comment`, `_validate_anchor_comment_url`,
+    `_validate_anchor_comments_batch`) -- no call site on that path
+    re-selects independently. `_fetch_issue`/`_fetch_issue_comments` also
+    call this function (when not given an explicit `transport`) rather than
+    inlining their own isolated-profile branch as they did pre-#2257; since
+    `_is_isolated_claude_gpt_profile()` is deterministic for the lifetime of
+    a process, every such call resolves to the SAME transport CLASS (never a
+    divergent authority mid-invocation) even though, for backward
+    compatibility with pre-existing unit tests that monkeypatch those two
+    functions with a fixed 2-positional-argument signature, no shared
+    instance identity is threaded into them. Returns `None` only when the
+    isolated profile is active but `github_credentialless_read` failed to
+    import (a real environment failure, surfaced by the caller as
+    `BLOCKER_CREDENTIALLESS_TRANSPORT_UNAVAILABLE`)."""
+    if _is_isolated_claude_gpt_profile():
+        if _credentialless_read is None:
+            return None
+        return _CredentiallessPreflightTransport()
+    return _GhCliPreflightTransport()
+
+
+def _fetch_issue(
+    repo: str, issue_number: int, transport: "object | None" = None
+) -> tuple[dict | None, str]:
+    """Fetch issue data via `transport` (Issue #2257 P0-1: `transport` is
+    the single read authority selected once by `_select_read_transport()`
+    and threaded down from `run_preflight()` -- this function itself never
+    re-evaluates `_is_isolated_claude_gpt_profile()`).
+
+    `transport=None` (only reached by call sites that do not pass one
+    explicitly -- pre-existing unit tests exercising this function in
+    isolation) preserves the pre-#2257 behavior of resolving a transport
+    internally via `_is_isolated_claude_gpt_profile()`.
+    """
+    if transport is None:
+        transport = _select_read_transport()
+    if transport is None:
+        return None, "BLOCKER_CREDENTIALLESS_TRANSPORT_UNAVAILABLE: github_credentialless_read import failed"
+    return transport.read_issue(repo, issue_number)
+
+
+def _fetch_issue_comments(
+    repo: str, issue_number: int, transport: "object | None" = None
+) -> tuple[list | None, str]:
+    """Fetch all issue comments via `transport` (Issue #2257 P0-1 -- see
+    `_fetch_issue` docstring for the single-authority contract and the
+    `transport=None` back-compat note).
 
     gh 2.88.1+ --slurp returns [[...page1...], [...page2...]] which must be
     flattened to a single list.  Single-page results are also wrapped as [[...]].
     """
-    if _is_isolated_claude_gpt_profile():
-        if _credentialless_read is None:
-            return None, "BLOCKER_CREDENTIALLESS_TRANSPORT_UNAVAILABLE: github_credentialless_read import failed"
-        try:
-            transport = _credentialless_read.CredentiallessGitHubReadTransport()
-            comments = transport.list_issue_comments(repo, issue_number)
-        except _credentialless_read.CredentiallessReadError as exc:
-            return None, f"credentialless_read_error: {exc}"
-        except Exception as exc:  # pragma: no cover - defensive fail-closed
-            return None, f"credentialless_read_unexpected_error: {exc}"
-        if not isinstance(comments, list):
-            return None, f"credentialless_comments_unexpected_type: {type(comments).__name__}"
-        return comments, ""
-
-    try:
-        from command_registry import render_command as _render_command
-
-        _argv = _render_command("gh.issue.comments.list", {"repo": repo, "issue_number": issue_number})
-    except Exception as exc:
-        raise RuntimeError(f"BLOCKER_COMMAND_REGISTRY_UNAVAILABLE: gh.issue.comments.list failed: {exc}") from exc
-    data, err = _run_gh(_argv)
-    if data is None:
-        return None, err
-    # --slurp wraps each page as an element: [[page1_comments...], [page2_comments...]]
-    # Flatten one level regardless of page count.
-    if isinstance(data, list):
-        if len(data) == 0:
-            return [], ""
-        # Check if it's a slurp-wrapped list-of-lists
-        if all(isinstance(item, list) for item in data):
-            flattened: list[dict] = []
-            for page in data:
-                flattened.extend(page)
-            return flattened, ""
-        # Already a flat list (e.g. non-paginated gh or mock returning flat list)
-        return data, ""
-    return None, f"gh_comments_unexpected_type: {type(data).__name__}"
+    if transport is None:
+        transport = _select_read_transport()
+    if transport is None:
+        return None, "BLOCKER_CREDENTIALLESS_TRANSPORT_UNAVAILABLE: github_credentialless_read import failed"
+    return transport.list_issue_comments(repo, issue_number)
 
 
-def _fetch_single_comment(repo: str, comment_id: int) -> tuple[dict | None, str]:
-    """Fetch a single issue comment via gh api to validate issue_url field."""
-    data, err = _run_gh(["gh", "api", f"repos/{repo}/issues/comments/{comment_id}"])
-    return data, err
+# Issue #2257 AC3/AC4: `err` is prefixed with one of these two sanitized
+# classification tags so callers can distinguish "the comment genuinely
+# does not exist" (semantic_missing) from "the fetch itself failed"
+# (transport_failure) without ever exposing credential/token/header/raw
+# response/OS error detail downstream.
+_SEMANTIC_MISSING_PREFIX = "semantic_missing:"
+_TRANSPORT_FAILURE_PREFIX = "transport_failure:"
+
+
+def _is_transport_failure(err: str) -> bool:
+    """True iff `err` (as returned by `_fetch_single_comment`) is a
+    transport failure rather than a semantic "comment not found"
+    (Issue #2257 AC2/AC3)."""
+    return err.startswith(_TRANSPORT_FAILURE_PREFIX)
+
+
+# Issue #2257 AC10: closed enum of `reason_code` values the
+# `refinement_preflight_result_v1` schema's `status == environment_failure`
+# structured projection accepts. Any reason string that does not map onto
+# this set collapses to the fixed fallback `transport_internal_error` --
+# never an unbounded/echoed value.
+_ENVIRONMENT_FAILURE_REASON_CODES = frozenset(
+    {
+        "unexpected_authentication_dependency",
+        "rate_limited",
+        "http_403_forbidden",
+        "canonical_resource_missing",
+        "upstream_environment_failure",
+        "transport_connectivity_failure",
+        "malformed_response_body",
+        "cross_repository_read_rejected",
+        "invalid_issue_number",
+        "invalid_comment_id",
+        "credentialless_read_error",
+        "credentialless_transport_unavailable",
+        "credentialless_comments_unexpected_type",
+        "gh_auth_required",
+        "gh_not_found",
+        "gh_timeout",
+        "gh_json_decode_error",
+        "gh_unexpected_error",
+        "gh_exit_error",
+        "gh_unclassified_error",
+        "transport_internal_error",
+        "planner_internal_error",
+        "planner_invocation_missing",
+    }
+)
+
+
+def _classify_final_environment_failure(blockers: list[str], planner_exit_code: Optional[int]) -> str:
+    """Classify the `reason_code` for the FINAL (post-planner) result build
+    when `_apply_exit_code_mapping()` has computed `status ==
+    "environment_failure"` (Issue #2257 AC10). This is a distinct call site
+    from the early-return transport-failure paths above (which already carry
+    their own precise reason via `_project_environment_failure_reason`):
+    here the failure may stem from a pre-planner blocker
+    (`BLOCKER_GH_FAILURE`/`BLOCKER_RESULT_SCHEMA_INVALID`/
+    `BLOCKER_REPAIR_ENVIRONMENT_FAILURE`) or from the planner subprocess
+    itself (`planner_exit_code is None` or `== 3`). Always returns a member
+    of the closed `_ENVIRONMENT_FAILURE_REASON_CODES` enum."""
+    for b in blockers:
+        if b.startswith("ANCHOR_FETCH_REASON:"):
+            candidate = b[len("ANCHOR_FETCH_REASON:"):]
+            if candidate in _ENVIRONMENT_FAILURE_REASON_CODES:
+                return candidate
+    if any(b == BLOCKER_GH_FAILURE for b in blockers):
+        return "transport_internal_error"
+    if any(b == BLOCKER_RESULT_SCHEMA_INVALID for b in blockers):
+        return "transport_internal_error"
+    if planner_exit_code is None:
+        return "planner_invocation_missing"
+    return "planner_internal_error"
+
+
+def _project_environment_failure_reason(err: str) -> str:
+    """Map a raw `(data, err)` failure string from any fetch function in
+    this module onto the closed `_ENVIRONMENT_FAILURE_REASON_CODES` enum
+    (Issue #2257 AC3/AC4/AC10). Never returns `err` (or any substring built
+    from an underlying exception's own message) verbatim when it is not
+    already one of the closed, fixed reason codes this module's transport
+    adapters emit -- an unrecognized shape falls back to the fixed code
+    `transport_internal_error` rather than transcribing raw detail into the
+    canonical result artifact."""
+    reason = err or ""
+    if reason.startswith(_TRANSPORT_FAILURE_PREFIX):
+        reason = reason[len(_TRANSPORT_FAILURE_PREFIX):]
+    elif reason.startswith(_SEMANTIC_MISSING_PREFIX):
+        reason = reason[len(_SEMANTIC_MISSING_PREFIX):]
+    elif reason.startswith("gh_exit_"):
+        reason = "gh_exit_error"
+    elif reason.startswith("gh_not_found"):
+        reason = "gh_not_found"
+    elif reason.startswith("gh_timeout"):
+        reason = "gh_timeout"
+    elif reason.startswith("gh_json_decode_error"):
+        reason = "gh_json_decode_error"
+    elif reason.startswith("gh_unexpected_error"):
+        reason = "gh_unexpected_error"
+    elif reason.startswith("gh_comments_unexpected_type"):
+        reason = "gh_unclassified_error"
+    elif reason.startswith("BLOCKER_CREDENTIALLESS_TRANSPORT_UNAVAILABLE"):
+        reason = "credentialless_transport_unavailable"
+    if reason not in _ENVIRONMENT_FAILURE_REASON_CODES:
+        reason = "transport_internal_error"
+    return reason
+
+
+def _classify_gh_single_comment_error(err: str) -> str:
+    """Classify a `_run_gh` error string for the single-comment fetch path
+    (Issue #2257 AC3): only a genuine HTTP 404 is `semantic_missing`;
+    every other gh CLI failure (auth dependency incl. gh exit 4, timeout,
+    gh not found, JSON decode failure, any other non-zero exit/HTTP
+    status) is `transport_failure`. Returns a sanitized reason -- never
+    the raw stderr snippet (AC4)."""
+    if err.startswith("gh_exit_"):
+        rest = err[len("gh_exit_"):]
+        code_str, _, detail = rest.partition(":")
+        detail_lower = detail.strip().lower()
+        if "404" in detail_lower or "not found" in detail_lower:
+            return f"{_SEMANTIC_MISSING_PREFIX}gh_404_not_found"
+        code_str = code_str.strip()
+        if code_str == "4":
+            # gh CLI's documented "authentication required" exit code --
+            # this is exactly the isolated-profile failure mode Issue
+            # #2197 misclassified as ANCHOR_COMMENT_NOT_FOUND.
+            return f"{_TRANSPORT_FAILURE_PREFIX}gh_auth_required"
+        return f"{_TRANSPORT_FAILURE_PREFIX}gh_exit_{code_str}"
+    if err.startswith("gh_not_found"):
+        return f"{_TRANSPORT_FAILURE_PREFIX}gh_not_found"
+    if err.startswith("gh_timeout"):
+        return f"{_TRANSPORT_FAILURE_PREFIX}gh_timeout"
+    if err.startswith("gh_json_decode_error"):
+        return f"{_TRANSPORT_FAILURE_PREFIX}gh_json_decode_error"
+    if err.startswith("gh_unexpected_error"):
+        return f"{_TRANSPORT_FAILURE_PREFIX}gh_unexpected_error"
+    return f"{_TRANSPORT_FAILURE_PREFIX}gh_unclassified_error"
+
+
+def _fetch_single_comment(
+    repo: str, comment_id: int, transport: "object | None" = None
+) -> tuple[dict | None, str]:
+    """Fetch a single issue comment (Issue #2257 AC1/AC2/AC3/P0-1) via
+    `transport` -- the single read authority selected once by
+    `_select_read_transport()` and threaded down from `run_preflight()`.
+    This function itself never re-evaluates `_is_isolated_claude_gpt_profile()`
+    or re-instantiates a transport when `transport` is given explicitly.
+
+    `transport=None` (only reached by call sites that do not pass one
+    explicitly -- pre-existing unit tests exercising this function in
+    isolation, e.g. `test_trusted_anchor_iteration_zero.py`'s
+    `mock.patch.object` of this whole function) preserves the pre-#2257
+    behavior of resolving a transport internally.
+
+    On failure, `err` is prefixed with either `_SEMANTIC_MISSING_PREFIX`
+    (the comment genuinely does not exist at the canonical URL -- a true
+    404) or `_TRANSPORT_FAILURE_PREFIX` (every other failure: auth
+    dependency, rate limit, 5xx, DNS/connection, timeout, malformed JSON,
+    incomplete pagination, read authority divergence). Callers must route
+    these two categories differently -- only `semantic_missing` may be
+    treated as "comment not found" (AC2); `transport_failure` must never
+    be misreported as a missing comment (AC3). The sanitized reason after
+    the prefix never contains credential/token/header/raw response/OS
+    error detail (AC4).
+    """
+    if transport is None:
+        transport = _select_read_transport()
+    if transport is None:
+        return None, f"{_TRANSPORT_FAILURE_PREFIX}credentialless_transport_unavailable"
+    return transport.read_issue_comment(repo, comment_id)
 
 
 def _load_anchor_comment_schema() -> dict[str, Any]:
@@ -3440,6 +3741,7 @@ def _validate_anchor_comment_url(
     repo: str,
     issue_number: int,
     fixture_comments: Optional[list[dict]] = None,
+    transport: "object | None" = None,
 ) -> tuple[bool, list[str]]:
     """
     Validate a single anchor comment URL structurally.
@@ -3490,9 +3792,26 @@ def _validate_anchor_comment_url(
         if comment_data is None:
             return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND, BLOCKER_ANCHOR_NOT_IN_ISSUE]
     else:
-        # Live mode: fetch via gh api
-        comment_data, err = _fetch_single_comment(repo, comment_id)
+        # Live mode WITHOUT a pre-fetched comments list: this is reached
+        # only when `run_preflight()` could not populate `fixture_comments`
+        # from the complete paginated comments traversal it already
+        # performed (Issue #2257 P0-1: the initial anchor must be resolved
+        # from that traversal, not a second single-comment GET -- this
+        # branch is a fresh-readback/TOCTOU fallback, not the normal path).
+        # Fetches via the single read authority (`transport`, threaded down
+        # from `run_preflight()`) -- Issue #2257 AC1. Only a genuine
+        # semantic_missing (true 404) is reported as
+        # BLOCKER_ANCHOR_COMMENT_NOT_FOUND; a transport_failure must never
+        # be misreported as "comment not found" (AC2/AC3).
+        comment_data, err = _fetch_single_comment(repo, comment_id, transport=transport)
         if comment_data is None:
+            if _is_transport_failure(err):
+                reason_code = (
+                    err[len(_TRANSPORT_FAILURE_PREFIX):]
+                    if err.startswith(_TRANSPORT_FAILURE_PREFIX)
+                    else "transport_internal_error"
+                )
+                return False, [BLOCKER_ANCHOR_FETCH_TRANSPORT_FAILURE, f"ANCHOR_FETCH_REASON:{reason_code}"]
             return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND, BLOCKER_ANCHOR_NOT_IN_ISSUE]
 
     # Check 4: issue_url field validation — must be present and non-empty
@@ -3532,6 +3851,7 @@ def _validate_anchor_comments_batch(
     repo: str,
     issue_number: int,
     fixture_comments: Optional[list[dict]] = None,
+    transport: "object | None" = None,
 ) -> tuple[list[str], list[str]]:
     """
     Validate all anchor comment URLs. Returns (stable_sorted_unique_valid_urls, all_blockers).
@@ -3557,7 +3877,9 @@ def _validate_anchor_comments_batch(
         return [], [BLOCKER_ANCHOR_COMMENT_MULTIPLE_UNSUPPORTED]
 
     for url in sorted_urls:
-        valid, blockers = _validate_anchor_comment_url(url, repo, issue_number, fixture_comments=fixture_comments)
+        valid, blockers = _validate_anchor_comment_url(
+            url, repo, issue_number, fixture_comments=fixture_comments, transport=transport
+        )
         if not valid:
             all_blockers.extend(blockers)
 
@@ -4554,8 +4876,20 @@ def _build_result(
     contract_update: Optional[dict[str, Any]] = None,
     repair_action: Optional[dict[str, Any]] = None,
     structural_repair_action: Optional[dict[str, Any]] = None,
+    environment_failure_reason_code: Optional[str] = None,
+    environment_failure_source: Optional[str] = None,
+    environment_failure_operation: Optional[str] = None,
 ) -> dict:
-    """Build a refinement_preflight_result/v1 compliant dict."""
+    """Build a refinement_preflight_result/v1 compliant dict.
+
+    Issue #2257 AC10: `environment_failure_reason_code`/`_source`/`_operation`
+    populate the schema's `reason_code`/`source`/`operation` structured
+    projection, and ONLY when `status == "environment_failure"` -- the
+    schema's conditional contract makes these three fields required when
+    `status == "environment_failure"` and forbidden otherwise, so this
+    function silently drops them for any other status rather than ever
+    emitting a stale/misleading projection alongside a non-failure status.
+    """
     result = {
         "schema_version": SCHEMA_VERSION_RESULT,
         "status": status,
@@ -4582,6 +4916,20 @@ def _build_result(
         result["repair_action"] = repair_action
     if structural_repair_action is not None:
         result["structural_repair_action"] = structural_repair_action
+    if status == "environment_failure":
+        # Issue #2257 AC10: the schema's conditional contract makes these
+        # three fields REQUIRED whenever status == "environment_failure" --
+        # so every such result must carry them, including call sites (some
+        # outside this Issue's Allowed Paths, e.g. pre-existing tests that
+        # call `_emit_failure_result`/`_build_result` directly) that do not
+        # pass a precise `environment_failure_*` value. Falling back to the
+        # fixed, closed-enum defaults below (rather than omitting the keys)
+        # keeps every environment_failure result schema-valid; callers that
+        # DO know the precise transport/operation (the credentialless read
+        # path this Issue is about) still get the accurate, specific value.
+        result["reason_code"] = environment_failure_reason_code or "transport_internal_error"
+        result["source"] = environment_failure_source or "internal"
+        result["operation"] = environment_failure_operation or "unspecified"
     return result
 
 
@@ -4720,13 +5068,18 @@ def _emit_failure_result(
     required_sections: Optional[list[str]] = None,
     required_contract_keys: Optional[list[str]] = None,
     rewrite_constraints: Optional[dict[str, Any]] = None,
+    environment_failure_reason_code: Optional[str] = None,
+    environment_failure_source: Optional[str] = None,
+    environment_failure_operation: Optional[str] = None,
 ) -> tuple[dict, int]:
     """
     Build a failure/blocked/environment_failure result, write artifacts if available,
     print compact stdout, and return (result, exit_code).
 
     This helper ensures stdout and disk are written from the same final result dict
-    (no post-write mutation).
+    (no post-write mutation). `environment_failure_reason_code`/`_source`/`_operation`
+    are forwarded to `_build_result` (Issue #2257 AC10) and are only ever
+    materialized in the returned result when `status == "environment_failure"`.
     """
     # Compute hashes if raw_snapshot available
     hashes: dict[str, str] = {}
@@ -4763,6 +5116,9 @@ def _emit_failure_result(
         rewrite_constraints=rewrite_constraints,
         artifacts=artifacts,
         hashes=hashes,
+        environment_failure_reason_code=environment_failure_reason_code,
+        environment_failure_source=environment_failure_source,
+        environment_failure_operation=environment_failure_operation,
     )
 
     if raw_snapshot is not None and planner_input is not None:
@@ -4777,6 +5133,14 @@ def _emit_failure_result(
             result["status"] = "environment_failure"
             result["next_action"] = "fix_environment"
             result["artifacts"] = {}
+            # Issue #2257 AC10: this failure path transitions `status` to
+            # `environment_failure` after `_build_result` already ran, so
+            # the schema's conditional-required projection must be
+            # populated here too (or the artifact-write failure itself
+            # would leave the result RESULT_SCHEMA_INVALID by omission).
+            result.setdefault("reason_code", "transport_internal_error")
+            result.setdefault("source", "internal")
+            result.setdefault("operation", "write_artifacts")
 
     _, exit_code = _apply_exit_code_mapping(planner_exit_code, planner_fail_closed, result["blockers"])
     if result["status"] == "environment_failure":
@@ -5843,6 +6207,11 @@ def run_preflight(
     # the ordinary contract-update success/failure blocker path.
     contract_update_route_issue_editor_required: bool = False
 
+    # Issue #2257 P0-1: `transport` is `None` in fixture mode (unused --
+    # fixture mode never performs a live read at all) and is set to the
+    # single, explicitly-selected read authority in live mode below.
+    transport: "object | None" = None
+
     # --- Load data (fixture or live gh) ---
     if fixture_path is not None:
         # Fixture mode: load pre-fetched snapshot
@@ -5867,6 +6236,9 @@ def run_preflight(
                 rewrite_constraints=None,
                 artifacts={},
                 hashes={},
+                environment_failure_reason_code="transport_internal_error",
+                environment_failure_source="internal",
+                environment_failure_operation="load_fixture",
             )
             print(_build_compact_stdout(result))
             return result, EXIT_ENVIRONMENT_FAILURE
@@ -5901,10 +6273,31 @@ def run_preflight(
         known_context = known_context or fixture_data.get("known_context")
         now = now or fixture_data.get("now")
     else:
-        # Live mode: fetch from GitHub
+        # Live mode: fetch from GitHub via a single, explicitly-selected
+        # read authority (Issue #2257 P0-1). `transport` is selected exactly
+        # ONCE here and threaded through every subsequent read on this
+        # invocation's critical path -- `_fetch_issue`, `_fetch_issue_comments`,
+        # and (only for the fresh-readback/TOCTOU fallback below)
+        # `_fetch_single_comment` all receive this SAME instance; none of
+        # them re-evaluate `_is_isolated_claude_gpt_profile()` independently.
+        _reset_read_transport_cache()
+        transport = _select_read_transport()
+        transport_source = getattr(transport, "SOURCE_LABEL", "internal")
+
+        # NOTE: `_fetch_issue`/`_fetch_issue_comments` are called WITHOUT an
+        # explicit `transport=` keyword here (unlike `_fetch_single_comment`
+        # below) so that pre-existing unit tests which monkeypatch these two
+        # functions with a fixed 2-positional-argument signature
+        # (`test_main_drift_evidence_epoch.py`, outside this Issue's Allowed
+        # Paths) keep working. Single-authority is still guaranteed: both
+        # functions resolve their transport via `_select_read_transport()`,
+        # which is memoized (see `_read_transport_cache`) and therefore
+        # returns the EXACT SAME `transport` instance already selected on
+        # the line above.
         issue, err = _fetch_issue(repo, issue_number)
         if issue is None:
             blockers.append(BLOCKER_GH_FAILURE)
+            reason_code = _project_environment_failure_reason(err)
             return _emit_failure_result(
                 repo_root=repo_root,
                 issue_number=issue_number,
@@ -5916,11 +6309,15 @@ def run_preflight(
                 required_sections=[],
                 required_contract_keys=[],
                 rewrite_constraints=None,
+                environment_failure_reason_code=reason_code,
+                environment_failure_source=transport_source,
+                environment_failure_operation="read_issue",
             )
 
         comments, err = _fetch_issue_comments(repo, issue_number)
         if comments is None:
             blockers.append(BLOCKER_GH_FAILURE)
+            reason_code = _project_environment_failure_reason(err)
             return _emit_failure_result(
                 repo_root=repo_root,
                 issue_number=issue_number,
@@ -5932,10 +6329,27 @@ def run_preflight(
                 required_sections=[],
                 required_contract_keys=[],
                 rewrite_constraints=None,
+                environment_failure_reason_code=reason_code,
+                environment_failure_source=transport_source,
+                environment_failure_operation="list_issue_comments",
             )
 
         active_anchor_urls = anchor_comment_urls
-        fixture_comment_lookup = None
+        # Issue #2257 P0-1 (the decisive fix): the initial anchor comment
+        # MUST be resolved from the complete paginated comments traversal
+        # already performed above (`comments`), never from a second,
+        # independent single-comment GET. Passing `comments` here as the
+        # `fixture_comments` lookup for `_validate_anchor_comments_batch` /
+        # `_validate_anchor_comment_url` means the live-mode "else" branch
+        # in `_validate_anchor_comment_url` (a fresh single-comment fetch)
+        # is reached only when `comments` unexpectedly does not contain the
+        # anchor id at all -- never as the normal initial-anchor-resolution
+        # path. Before this fix, `fixture_comment_lookup` was hardcoded to
+        # `None` here even though `comments` had already been fetched,
+        # forcing every live-mode anchor resolution through a redundant
+        # single-comment GET -- the structural split-brain surface Issue
+        # #2257 exists to close.
+        fixture_comment_lookup = comments
 
     anchor_comment_state: Optional[dict[str, Any]] = None
     anchor_comment_feedback: Optional[dict[str, Any]] = None
@@ -5948,9 +6362,41 @@ def run_preflight(
             repo,
             issue_number,
             fixture_comments=fixture_comment_lookup,
+            transport=transport,
         )
         if anchor_blockers:
             blockers.extend(anchor_blockers)
+            # Issue #2257 AC3: a transport failure resolving the anchor
+            # comment (auth dependency, rate limit, 5xx, DNS/connection,
+            # timeout, malformed JSON, incomplete pagination, read
+            # authority divergence) is reported as environment_failure --
+            # never as the semantic "blocked/human_judgment_required" path
+            # that ANCHOR_COMMENT_NOT_FOUND takes for a true 404.
+            if BLOCKER_ANCHOR_FETCH_TRANSPORT_FAILURE in anchor_blockers:
+                anchor_reason_code = "transport_internal_error"
+                for _b in anchor_blockers:
+                    if _b.startswith("ANCHOR_FETCH_REASON:"):
+                        anchor_reason_code = _b[len("ANCHOR_FETCH_REASON:"):]
+                        break
+                return _emit_failure_result(
+                    repo_root=repo_root,
+                    issue_number=issue_number,
+                    repo=repo,
+                    status="environment_failure",
+                    next_action="fix_environment",
+                    blockers=blockers,
+                    planner_fail_closed_reason_codes=[],
+                    required_sections=[],
+                    required_contract_keys=[],
+                    rewrite_constraints=None,
+                    environment_failure_reason_code=anchor_reason_code,
+                    environment_failure_source=(
+                        transport.SOURCE_LABEL
+                        if transport is not None and hasattr(transport, "SOURCE_LABEL")
+                        else "internal"
+                    ),
+                    environment_failure_operation="read_issue_comment",
+                )
             return _emit_failure_result(
                 repo_root=repo_root,
                 issue_number=issue_number,
@@ -5975,9 +6421,18 @@ def run_preflight(
                         comment_payload = item
                         break
             else:
-                comment_payload, err = _fetch_single_comment(repo, comment_id)
+                # Issue #2257 (low-priority follow-up noted alongside the
+                # AC1-AC3 fix): keep this re-fetch's err classification
+                # consistent with `_validate_anchor_comment_url` above
+                # instead of silently discarding it -- a true
+                # semantic_missing here (the comment vanished between the
+                # batch validation above and this re-fetch) still gets a
+                # distinguishing blocker, not just a generic GH_API_FAILURE.
+                comment_payload, err = _fetch_single_comment(repo, comment_id, transport=transport)
                 if comment_payload is None:
                     blockers.append(BLOCKER_GH_FAILURE)
+                    if not _is_transport_failure(err):
+                        blockers.append(BLOCKER_ANCHOR_COMMENT_NOT_FOUND)
                     return _emit_failure_result(
                         repo_root=repo_root,
                         issue_number=issue_number,
@@ -5989,6 +6444,13 @@ def run_preflight(
                         required_sections=[],
                         required_contract_keys=[],
                         rewrite_constraints=None,
+                        environment_failure_reason_code=_project_environment_failure_reason(err),
+                        environment_failure_source=(
+                            transport.SOURCE_LABEL
+                            if transport is not None and hasattr(transport, "SOURCE_LABEL")
+                            else "internal"
+                        ),
+                        environment_failure_operation="read_issue_comment",
                     )
 
             anchor_comment_state, anchor_errors = _build_anchor_comment_state(
@@ -6992,6 +7454,13 @@ def run_preflight(
         contract_update=contract_update_handoff,
         repair_action=repair_action_projection,
         structural_repair_action=structural_repair_action,
+        environment_failure_reason_code=(
+            _classify_final_environment_failure(blockers, planner_exit_code)
+            if status == "environment_failure"
+            else None
+        ),
+        environment_failure_source="internal" if status == "environment_failure" else None,
+        environment_failure_operation="planner_invocation" if status == "environment_failure" else None,
     )
     try:
         _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input_dict, result)
@@ -7018,6 +7487,13 @@ def run_preflight(
             rewrite_constraints=rewrite_constraints,
             artifacts={},
             hashes=hashes,
+            # Issue #2257 AC10: this is a result-artifact write failure, not
+            # a transport read failure -- `source`/`operation` reflect that
+            # distinction rather than echoing the (possibly stale) transport
+            # source used earlier in this same invocation.
+            environment_failure_reason_code="transport_internal_error",
+            environment_failure_source="internal",
+            environment_failure_operation="write_artifacts",
         )
         exit_code = EXIT_ENVIRONMENT_FAILURE
 
