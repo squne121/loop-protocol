@@ -30,6 +30,49 @@ section for the full rationale):
   local filesystem path or a credential/Authorization-header-shaped value --
   enforced centrally by ``_scrub`` (AC9), applied to every ``CollectorResult``
   this module constructs.
+
+PR #2269 human REQUEST_CHANGES follow-up fixes (2026-08-20, reviewed at head
+9f2f599ef71d8ac4a46d7d89c994980810bcce5a):
+
+- Web adapter: eliminated a DNS-rebinding/TOCTOU gap where the boundary
+  check's validated IP was discarded and the production fetch re-resolved
+  the (attacker-influenced) hostname a second time. Resolution now happens
+  exactly once per fetch attempt (`_resolve_pinned_ip`), and the validated
+  IP is threaded through to `fetch`/`default_https_fetch`, which connects
+  directly to that IP while presenting the original hostname for TLS SNI /
+  the HTTP `Host` header. `default_https_fetch` no longer uses
+  `urllib.request`'s opener chain at all, so `http_proxy`/`https_proxy`
+  environment variables are never consulted.
+- Claude-GPT adapter: `_load_transport_log_module()` now registers the
+  dynamically-loaded module in `sys.modules` *before* `exec_module()`
+  (standard recipe), which is required on Python 3.12 because
+  `transport_log.py` uses `from __future__ import annotations` +
+  `@dataclass`, and 3.12's dataclass machinery resolves string annotations
+  via `sys.modules[cls.__module__].__dict__`.
+- Web adapter: `_resolve_pinned_ip` only catches `socket.gaierror`/`OSError`
+  around the injected `resolver` call, so a resolver programmer bug
+  (`KeyError`, `AssertionError`, ...) is never misclassified as
+  `dns_resolution_failed`/`blocked` -- it propagates as a run-level fatal
+  error, matching AC6's general invariant.
+- GitHub adapter: 403/429 responses are classified using status code +
+  `Retry-After`/`X-RateLimit-Remaining`/`X-RateLimit-Reset` headers + the
+  error body, distinguishing `rate_limited` from `permission_denied` instead
+  of collapsing every 403/429 into `rate_limited`.
+- GitHub adapter: added `default_github_fetch_page`, a production
+  `fetch_page` implementation backed by `gh api --include` (pinning the
+  GitHub REST API version via `X-GitHub-Api-Version`).
+- AC9 scrubbing hardened: absolute-local-path detection now also covers
+  `/tmp/`, `/mnt/`, `/var/`, `/workspace/` and searches for embedded
+  occurrences (not just a string prefix); `diagnostics` dicts built from
+  caught exceptions no longer hold `str(exc)`/raw `stderr` verbatim -- only
+  `reason_code`, `exception_class`, `errno`, and other bounded structured
+  metadata are kept unconditionally, and any other free-form text is passed
+  through a fail-closed allowlist validator (`_safe_diagnostic_text`) before
+  being retained at all.
+- Claude Code / Claude-GPT adapters: a source with malformed JSONL lines
+  alongside valid evidence no longer reports `complete` -- it now reports
+  `partial` (`malformed_response`), so the presence of corrupt evidence is
+  never silently absorbed into a clean-looking result.
 """
 
 from __future__ import annotations
@@ -38,7 +81,10 @@ import hashlib
 import ipaddress
 import json
 import re
+import socket
+import ssl
 import subprocess
+import sys
 import urllib.parse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -110,11 +156,21 @@ class _AdapterOperationalError(Exception):
     never wrapped here and propagates untouched (AC6).
     """
 
-    def __init__(self, message: str, *, source_status: str, reason_code: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_status: str,
+        reason_code: str,
+        exception_class: str | None = None,
+        errno: int | None = None,
+    ) -> None:
         super().__init__(message)
         assert source_status in ("unavailable", "blocked"), source_status
         self.source_status = source_status
         self.reason_code = reason_code
+        self.exception_class = exception_class
+        self.errno = errno
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +180,21 @@ class _AdapterOperationalError(Exception):
 _SECRET_KEY_RE = re.compile(
     r"(token|secret|password|passwd|authorization|credential|api[_-]?key|cookie)", re.IGNORECASE
 )
-_ABS_PATH_RE = re.compile(r"^(/home/|/Users/|/root/|[A-Za-z]:\\)")
-_BEARER_RE = re.compile(r"^(bearer|basic|token)\s+\S+", re.IGNORECASE)
+#: matches an absolute local filesystem path either at the start of a string
+#: or embedded after a non-identifier character (e.g. inside a longer
+#: diagnostic message such as "Permission denied: '/home/user/secret'").
+_ABS_PATH_RE = re.compile(r"(?:^|[^A-Za-z0-9_])(/(?:home|Users|root|tmp|mnt|var|workspace)/\S*|[A-Za-z]:\\\S*)")
+#: matches a Bearer/Basic/token-style credential value, or a recognizable
+#: GitHub token shape, anywhere in a string (not just at the start).
+_BEARER_RE = re.compile(
+    r"(?:authorization\s*:\s*)?\b(?:bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{6,}"
+    r"|\bghp_[A-Za-z0-9]{20,}\b"
+    r"|\bgithub_pat_[A-Za-z0-9_]{20,}\b",
+    re.IGNORECASE,
+)
+#: fail-closed allowlist for free-form diagnostic text (see
+#: `_safe_diagnostic_text`): narrowly-charactered and bounded in length.
+_SAFE_DIAGNOSTIC_TEXT_RE = re.compile(r"^[A-Za-z0-9 ,.:;_/=\-]{0,200}$")
 
 
 def _scrub(value: Any) -> Any:
@@ -138,11 +207,28 @@ def _scrub(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_scrub(v) for v in value)
     if isinstance(value, str):
-        if _ABS_PATH_RE.match(value):
+        if _ABS_PATH_RE.search(value):
             return "[redacted-local-path]"
-        if _BEARER_RE.match(value):
+        if _BEARER_RE.search(value):
             return "[redacted-credential]"
         return value
+    return value
+
+
+def _safe_diagnostic_text(value: str | None) -> str | None:
+    """Fail-closed allowlist validator for free-form diagnostic text (AC9 /
+    PR #2269 P1 fix). `private_evidence.diagnostics` must never hold a raw
+    exception message / stderr blob verbatim -- only bounded structured
+    metadata (`reason_code`, `exception_class`, `errno`, ...) is kept
+    unconditionally. Any other free-form text is dropped (returns `None`)
+    unless it is short, narrowly-charactered, and contains no path-like or
+    credential-like substring; nothing is ever partially leaked."""
+    if not value:
+        return None
+    if not _SAFE_DIAGNOSTIC_TEXT_RE.match(value):
+        return None
+    if _ABS_PATH_RE.search(value) or _BEARER_RE.search(value):
+        return None
     return value
 
 
@@ -207,7 +293,12 @@ def _operational_result(
             "normalized_records": [],
             "evidence_digest": _digest([]),
             "provenance": {},
-            "diagnostics": {"reason_code": exc.reason_code, "message": str(exc)},
+            "diagnostics": {
+                "reason_code": exc.reason_code,
+                "exception_class": exc.exception_class or type(exc).__name__,
+                "errno": exc.errno,
+                "safe_detail": _safe_diagnostic_text(str(exc)),
+            },
         },
     )
 
@@ -238,6 +329,12 @@ def collect_claude_code_source(
     hermetically testable. Raw absolute file paths are never embedded in the
     returned records (AC9) -- only per-session record counts are kept as
     provenance.
+
+    A source with malformed JSONL lines *alongside* valid evidence is never
+    reported as `complete` -- the presence of corrupt lines forces `partial`
+    (`malformed_response`) even though usable records exist (PR #2269
+    hardening: a prior asymmetry allowed malformed evidence to be silently
+    absorbed whenever at least one valid record was present).
     """
     fetch_started_at = _iso(clock())
     normalized: list[dict[str, Any]] = []
@@ -254,6 +351,8 @@ def collect_claude_code_source(
                     f"claude_code_read_failed:{type(exc).__name__}",
                     source_status="unavailable",
                     reason_code="source_not_present",
+                    exception_class=type(exc).__name__,
+                    errno=getattr(exc, "errno", None),
                 ) from exc
             sessions_read += 1
             for line in text.splitlines():
@@ -273,14 +372,20 @@ def collect_claude_code_source(
         )
 
     fetch_completed_at = _iso(clock())
-    status = "complete" if normalized else "unavailable"
+    if not normalized:
+        status, pagination, reason = "unavailable", "unknown", None
+    elif malformed_line_count > 0:
+        status, pagination, reason = "partial", "partial", "malformed_response"
+    else:
+        status, pagination, reason = "complete", "complete", None
     observation = _build_observation(
         source_type="runtime",
         source_id=source_id,
         source_status=status,
-        pagination_completeness="complete" if normalized else "unknown",
+        pagination_completeness=pagination,
         fetch_started_at=fetch_started_at,
         fetch_completed_at=fetch_completed_at,
+        partial_reason=reason if pagination == "partial" else None,
     )
     return _finalize(
         observation,
@@ -290,7 +395,7 @@ def collect_claude_code_source(
             "provenance": {"session_count": len(session_paths), "sessions_read": sessions_read},
             "diagnostics": {
                 "malformed_line_count": malformed_line_count,
-                "reason_code": None if normalized else "source_not_present",
+                "reason_code": reason if reason else (None if normalized else "source_not_present"),
             },
         },
     )
@@ -301,9 +406,7 @@ def collect_claude_code_source(
 # ---------------------------------------------------------------------------
 
 _HOOK_SINK_ALLOWED_KEYS = frozenset({"run_nonce", "event", "session_id", "agent_id", "ts", "prompt_digest"})
-_HOOK_SINK_ALLOWED_EVENTS = frozenset(
-    {"UserPromptSubmit", "Stop", "StopFailure", "SubagentStart", "SubagentStop"}
-)
+_HOOK_SINK_ALLOWED_EVENTS = frozenset({"UserPromptSubmit", "Stop", "StopFailure", "SubagentStart", "SubagentStop"})
 
 
 def _parse_hook_sink(hook_sink_path: Path) -> tuple[list[dict[str, Any]], int]:
@@ -316,6 +419,8 @@ def _parse_hook_sink(hook_sink_path: Path) -> tuple[list[dict[str, Any]], int]:
             f"hook_sink_read_failed:{type(exc).__name__}",
             source_status="unavailable",
             reason_code="source_not_present",
+            exception_class=type(exc).__name__,
+            errno=getattr(exc, "errno", None),
         ) from exc
 
     records: list[dict[str, Any]] = []
@@ -339,7 +444,19 @@ def _parse_hook_sink(hook_sink_path: Path) -> tuple[list[dict[str, Any]], int]:
 def _load_transport_log_module():
     """Load `scripts/claude-gpt/transport_log.py` by path (Issue #2236: the
     Claude-GPT adapter reuses this module's ``reqId`` correlation/diagnostics
-    logic rather than re-implementing a raw log grep)."""
+    logic rather than re-implementing a raw log grep).
+
+    PR #2269 P1 fix: the loaded module is registered in `sys.modules`
+    *before* `exec_module()` is called (the standard
+    `importlib.util.module_from_spec` recipe). `transport_log.py` uses
+    ``from __future__ import annotations`` together with ``@dataclass``, and
+    on Python 3.12 the dataclass machinery resolves string annotations via
+    ``sys.modules[cls.__module__].__dict__`` -- without the `sys.modules`
+    registration this raises `AttributeError` on `None.__dict__` the first
+    time `TransportVerdict` is defined. On any failure the partially-loaded
+    module is removed from `sys.modules` again so a later retry does not see
+    a broken half-initialized module.
+    """
     import importlib.util
 
     module_path = _REPO_ROOT / "scripts" / "claude-gpt" / "transport_log.py"
@@ -349,7 +466,12 @@ def _load_transport_log_module():
             "transport_log_module_unavailable", source_status="unavailable", reason_code="source_not_present"
         )
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
     return module
 
 
@@ -370,6 +492,10 @@ def collect_claude_gpt_source(
     ``complete`` (AC8) -- this adapter never reads a flat transcript at all.
     ``transport_log_path``, when supplied, is diagnosed via
     ``transport_log.evaluate_transport_log`` (reused, not re-implemented).
+
+    A source with malformed hook-sink lines alongside otherwise-complete
+    session pairing no longer reports `complete` -- see the module docstring
+    (PR #2269 hardening).
     """
     fetch_started_at = _iso(clock())
     try:
@@ -404,7 +530,10 @@ def collect_claude_gpt_source(
         # AC8: presence alone is never sufficient for "complete".
         status, pagination, reason = "unavailable", "unknown", "stale_runtime_evidence"
     elif complete_sessions:
-        status, pagination, reason = "complete", "complete", None
+        if malformed_line_count > 0:
+            status, pagination, reason = "partial", "partial", "malformed_response"
+        else:
+            status, pagination, reason = "complete", "complete", None
     else:
         status, pagination, reason = "partial", "partial", "session_incomplete"
 
@@ -478,7 +607,13 @@ def collect_repository_source(
             source_id=source_id,
             fetch_started_at=None,
             clock=_utcnow,
-            exc=_AdapterOperationalError(str(exc), source_status="unavailable", reason_code=reason),
+            exc=_AdapterOperationalError(
+                str(exc),
+                source_status="unavailable",
+                reason_code=reason,
+                exception_class=type(exc).__name__,
+                errno=getattr(exc, "errno", None),
+            ),
         )
 
     if completed.returncode != 0:
@@ -494,7 +629,10 @@ def collect_repository_source(
                 "normalized_records": [],
                 "evidence_digest": _digest([]),
                 "provenance": {"base_sha": base_sha, "returncode": completed.returncode},
-                "diagnostics": {"stderr": (completed.stderr or "")[:500], "reason_code": "source_not_present"},
+                "diagnostics": {
+                    "reason_code": "source_not_present",
+                    "stderr_excerpt": _safe_diagnostic_text((completed.stderr or "")[:200]),
+                },
             },
         )
 
@@ -529,6 +667,8 @@ _GITHUB_BLOCKED_REASON_CODES = frozenset({"auth_ambiguous_404", "permission_deni
 
 _GITHUB_SECRET_ITEM_KEYS = frozenset({"token", "authorization"})
 
+_GITHUB_API_VERSION = "2022-11-28"
+
 
 @dataclass
 class GithubPageResponse:
@@ -548,6 +688,49 @@ def _redact_github_item(item: Any) -> Any:
     if not isinstance(item, dict):
         return item
     return {k: v for k, v in item.items() if k.lower() not in _GITHUB_SECRET_ITEM_KEYS}
+
+
+def _header_lookup(headers: dict[str, str], name: str) -> str | None:
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return None
+
+
+def _classify_github_status(status_code: int, headers: dict[str, str], body: Any) -> str | None:
+    """Classify a non-2xx GitHub response into a `reason_code`.
+
+    PR #2269 P1 fix: 403 is not inherently a rate-limit signal (it is also
+    returned for plain permission-denied). This now distinguishes
+    `rate_limited` from `permission_denied` using the HTTP status code, the
+    `Retry-After` / `X-RateLimit-Remaining` headers, and the error body's
+    `message` field, rather than collapsing every 403/429 into
+    `rate_limited`.
+    """
+    if status_code == 200:
+        return None
+    if status_code == 404:
+        return "auth_ambiguous_404"
+    if status_code == 401:
+        return "permission_denied"
+    if status_code in (403, 429):
+        retry_after = _header_lookup(headers, "Retry-After")
+        remaining = _header_lookup(headers, "X-RateLimit-Remaining")
+        message = ""
+        if isinstance(body, dict):
+            message = str(body.get("message") or "")
+        message_lower = message.lower()
+        rate_limited_signal = (
+            status_code == 429
+            or retry_after is not None
+            or (remaining is not None and str(remaining).strip() == "0")
+            or "rate limit" in message_lower
+            or "abuse detection" in message_lower
+            or "secondary rate limit" in message_lower
+        )
+        return "rate_limited" if rate_limited_signal else "permission_denied"
+    return "malformed_response"
 
 
 def collect_github_source(
@@ -613,34 +796,31 @@ def collect_github_source(
             link = headers.get("Link") or headers.get("link")
             etag = headers.get("ETag") or headers.get("etag")
             status_code = response.status
+            body = response.body
 
-            reason_code: str | None = None
-            if status_code in (403, 429):
-                reason_code = "rate_limited"
-            elif status_code == 404:
-                reason_code = "auth_ambiguous_404"
-            elif status_code == 401:
-                reason_code = "permission_denied"
-            elif status_code != 200:
-                reason_code = "malformed_response"
+            reason_code = _classify_github_status(status_code, headers, body)
 
             if reason_code is not None:
                 any_partial = True
-                provenance_pages.append(
-                    {
-                        "endpoint": endpoint,
-                        "page": page_index,
-                        "status": status_code,
-                        "link": link,
-                        "etag": etag,
-                        "complete": False,
-                        "reason_code": reason_code,
+                page_provenance: dict[str, Any] = {
+                    "endpoint": endpoint,
+                    "page": page_index,
+                    "status": status_code,
+                    "link": link,
+                    "etag": etag,
+                    "complete": False,
+                    "reason_code": reason_code,
+                }
+                if reason_code == "rate_limited":
+                    page_provenance["rate_limit"] = {
+                        "retry_after": _header_lookup(headers, "Retry-After"),
+                        "remaining": _header_lookup(headers, "X-RateLimit-Remaining"),
+                        "reset": _header_lookup(headers, "X-RateLimit-Reset"),
                     }
-                )
+                provenance_pages.append(page_provenance)
                 diagnostics["errors"].append(f"{reason_code}:{endpoint}:page={page_index}")
                 break
 
-            body = response.body
             if isinstance(body, list):
                 normalized.extend(_redact_github_item(item) for item in body)
             else:
@@ -672,9 +852,9 @@ def collect_github_source(
 
     partial_reason = None
     if pagination_completeness == "partial":
-        partial_reason = ",".join(
-            sorted({p["reason_code"] for p in provenance_pages if p.get("reason_code")})
-        ) or "partial"
+        partial_reason = (
+            ",".join(sorted({p["reason_code"] for p in provenance_pages if p.get("reason_code")})) or "partial"
+        )
 
     observation = _build_observation(
         source_type="github",
@@ -696,6 +876,85 @@ def collect_github_source(
     )
 
 
+def _default_gh_runner(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(args, capture_output=True, text=True, timeout=30)  # noqa: S603
+
+
+def _parse_gh_api_include_output(raw: str) -> tuple[int | None, dict[str, str], str]:
+    """Parse `gh api --include`'s stdout: an HTTP status line, a header
+    block, a blank line, then the (possibly-JSON) response body."""
+    lines = raw.splitlines()
+    if not lines or not lines[0].startswith("HTTP/"):
+        return None, {}, ""
+    status_line = lines[0]
+    parts = status_line.split(" ")
+    try:
+        status = int(parts[1])
+    except (IndexError, ValueError):
+        return None, {}, ""
+    headers: dict[str, str] = {}
+    idx = 1
+    while idx < len(lines) and lines[idx].strip():
+        header_line = lines[idx]
+        if ":" in header_line:
+            key, _, value = header_line.partition(":")
+            headers[key.strip()] = value.strip()
+        idx += 1
+    body_text = "\n".join(lines[idx + 1 :])
+    return status, headers, body_text
+
+
+def default_github_fetch_page(
+    url: str,
+    *,
+    gh_runner: Callable[[list[str]], subprocess.CompletedProcess] = _default_gh_runner,
+) -> GithubPageResponse:
+    """Production `fetch_page` implementation for `collect_github_source`
+    (Issue #2236 PR #2269 P1 fix: no production transport previously
+    existed, only the injectable hermetic-test seam).
+
+    Invokes ``gh api --include <url>``: ``--include`` makes `gh` print the
+    raw HTTP status line and response headers (so `Link`/`ETag`/rate-limit
+    provenance can be captured) before the JSON body. The GitHub REST API
+    version is pinned explicitly via the `X-GitHub-Api-Version` header so
+    the endpoint response shape does not silently drift out from under this
+    adapter as the API evolves.
+    """
+    try:
+        completed = gh_runner(
+            [
+                "gh",
+                "api",
+                "--include",
+                "-H",
+                f"X-GitHub-Api-Version: {_GITHUB_API_VERSION}",
+                url,
+            ]
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        reason = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "source_not_present"
+        raise _AdapterOperationalError(
+            f"github_fetch_failed:{type(exc).__name__}",
+            source_status="unavailable",
+            reason_code=reason,
+            exception_class=type(exc).__name__,
+            errno=getattr(exc, "errno", None),
+        ) from exc
+
+    status, headers, body_text = _parse_gh_api_include_output(completed.stdout or "")
+    if status is None:
+        raise _AdapterOperationalError(
+            f"github_fetch_transport_error:rc={completed.returncode}",
+            source_status="unavailable",
+            reason_code="source_not_present",
+        )
+    try:
+        body = json.loads(body_text) if body_text.strip() else None
+    except json.JSONDecodeError:
+        body = None
+    return GithubPageResponse(status=status, body=body, headers=headers)
+
+
 # ---------------------------------------------------------------------------
 # Web adapter (SSRF-defended primary-source fetch)
 # ---------------------------------------------------------------------------
@@ -712,36 +971,43 @@ class WebFetchResult:
 
 
 def _default_resolve(hostname: str) -> list[str]:
-    import socket
-
     return [info[4][0] for info in socket.getaddrinfo(hostname, None)]
 
 
-def _check_web_boundary(url: str, *, resolver: Callable[[str], list[str]]) -> str | None:
-    try:
-        parsed = urllib.parse.urlsplit(url)
-    except ValueError:
-        return "malformed_url"
-    if parsed.scheme != "https":
-        return "non_https_scheme"
-    if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
-        return "credential_bearing_url"
-    hostname = parsed.hostname
-    if not hostname:
-        return "missing_hostname"
-    if hostname.lower() == "localhost":
-        return "localhost_rejected"
+def _resolve_pinned_ip(hostname: str, *, resolver: Callable[[str], list[str]]) -> tuple[str | None, str | None]:
+    """Resolve ``hostname`` exactly once and validate every returned address
+    against the SSRF boundary (private/loopback/link-local/multicast/
+    reserved/unspecified/metadata). Returns ``(connect_ip, violation)``: on
+    success ``violation`` is `None` and ``connect_ip`` is the first
+    validated address; on failure ``connect_ip`` is `None` and ``violation``
+    is a `reason_code` string.
+
+    This is the *sole* DNS resolution point used for a given `fetch`
+    attempt -- `_check_web_boundary` (the pre-flight gate) and
+    `collect_web_source` (which threads the returned `connect_ip` straight
+    into `fetch`) both go through this single function, so no second,
+    TOCTOU-vulnerable resolution of the (potentially attacker-influenced)
+    hostname ever happens between validation and connect (Issue #2236
+    PR #2269 P0 fix).
+
+    Only `socket.gaierror`/`OSError` (typed, operational DNS failures) are
+    caught around the injected `resolver` call -- a resolver programmer bug
+    (`KeyError`, `AssertionError`, ...) is never misclassified as
+    `dns_resolution_failed`; it propagates untouched (PR #2269 P1 fix,
+    consistent with AC6's general typed-vs-programmer-error invariant).
+    """
     try:
         addresses = resolver(hostname)
-    except Exception:
-        return "dns_resolution_failed"
+    except (socket.gaierror, OSError):
+        return None, "dns_resolution_failed"
     if not addresses:
-        return "dns_resolution_failed"
+        return None, "dns_resolution_failed"
+    validated: list[str] = []
     for raw_addr in addresses:
         try:
             ip = ipaddress.ip_address(raw_addr)
         except ValueError:
-            return "dns_resolution_failed"
+            return None, "dns_resolution_failed"
         if (
             ip.is_private
             or ip.is_loopback
@@ -751,16 +1017,42 @@ def _check_web_boundary(url: str, *, resolver: Callable[[str], list[str]]) -> st
             or ip.is_unspecified
             or str(ip) in _METADATA_ADDRESSES
         ):
-            return "private_or_metadata_address_rejected"
-    return None
+            return None, "private_or_metadata_address_rejected"
+        validated.append(str(ip))
+    return validated[0], None
+
+
+def _check_web_boundary(url: str, *, resolver: Callable[[str], list[str]]) -> tuple[str | None, str | None]:
+    """Validate `url` against the Web adapter SSRF boundary.
+
+    Returns ``(connect_ip, violation)``: on success `violation` is `None`
+    and `connect_ip` is the single validated address `collect_web_source`
+    should hand to `fetch` (see `_resolve_pinned_ip`); on failure
+    `connect_ip` is `None` and `violation` is a `reason_code` string.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None, "malformed_url"
+    if parsed.scheme != "https":
+        return None, "non_https_scheme"
+    if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
+        return None, "credential_bearing_url"
+    hostname = parsed.hostname
+    if not hostname:
+        return None, "missing_hostname"
+    if hostname.lower() == "localhost":
+        return None, "localhost_rejected"
+    return _resolve_pinned_ip(hostname, resolver=resolver)
 
 
 def collect_web_source(
     url: str,
     *,
-    fetch: Callable[[str], WebFetchResult],
+    fetch: Callable[[str, str], WebFetchResult],
     resolver: Callable[[str], list[str]] = _default_resolve,
     max_bytes: int = 2_000_000,
+    max_redirects: int = 5,
     source_id: str = "web",
     clock: Callable[[], datetime] = _utcnow,
 ) -> CollectorResult:
@@ -768,45 +1060,32 @@ def collect_web_source(
     defense boundary fixed by Issue #2236 ("Web adapter のネットワーク安全境界"):
     https-only, no credential-bearing URL, no localhost/private/link-local/
     multicast/metadata-address target (post-DNS-resolution), redirects
-    re-validated against the same boundary rather than followed blindly, a
-    response-size cap, and bytes/text-only handling (no HTML/JS execution).
-    Boundary violations return ``source_status: blocked`` -- distinct from a
-    plain transient ``unavailable`` failure (AC5).
+    re-validated against the same boundary at every hop (rather than
+    followed blindly), a response-size cap, and bytes/text-only handling (no
+    HTML/JS execution). Boundary violations return ``source_status:
+    blocked`` -- distinct from a plain transient ``unavailable`` failure
+    (AC5).
+
+    ``fetch`` receives ``(current_url, connect_ip)`` -- ``connect_ip`` is the
+    single already-validated address for ``current_url``'s hostname (see
+    `_check_web_boundary`/`_resolve_pinned_ip`); this is threaded through so
+    a production `fetch` (e.g. `default_https_fetch`) can connect directly
+    to it instead of re-resolving the hostname a second time (PR #2269 P0
+    fix). If `fetch` reports a different `final_url` (i.e. an HTTP redirect
+    occurred), this function re-applies the full boundary check -- including
+    a fresh single DNS resolution for the *new* hostname -- and calls
+    `fetch` again for that hop, up to `max_redirects` hops.
     """
     fetch_started_at = _iso(clock())
-    violation = _check_web_boundary(url, resolver=resolver)
-    if violation:
-        fetch_completed_at = _iso(clock())
-        observation = _build_observation(
-            source_type="web",
-            source_id=source_id,
-            source_status="blocked",
-            pagination_completeness="unknown",
-            fetch_started_at=fetch_started_at,
-            fetch_completed_at=fetch_completed_at,
-        )
-        return _finalize(
-            observation,
-            {
-                "normalized_records": [],
-                "evidence_digest": _digest([]),
-                "provenance": {"url": url},
-                "diagnostics": {"reason_code": violation},
-            },
-        )
+    current_url = url
+    redirect_hop = 0
+    response: WebFetchResult | None = None
 
-    try:
-        response = fetch(url)
-    except _AdapterOperationalError as exc:
-        return _operational_result(
-            source_type="web", source_id=source_id, fetch_started_at=fetch_started_at, clock=clock, exc=exc
-        )
-
-    fetch_completed_at = _iso(clock())
-
-    if response.final_url != url:
-        redirect_violation = _check_web_boundary(response.final_url, resolver=resolver)
-        if redirect_violation:
+    while True:
+        connect_ip, violation = _check_web_boundary(current_url, resolver=resolver)
+        if violation:
+            reason_code = violation if redirect_hop == 0 else f"redirect_{violation}"
+            fetch_completed_at = _iso(clock())
             observation = _build_observation(
                 source_type="web",
                 source_id=source_id,
@@ -820,10 +1099,50 @@ def collect_web_source(
                 {
                     "normalized_records": [],
                     "evidence_digest": _digest([]),
-                    "provenance": {"url": url, "final_url": response.final_url},
-                    "diagnostics": {"reason_code": f"redirect_{redirect_violation}"},
+                    "provenance": {"url": url, "current_url": current_url, "redirect_hop": redirect_hop},
+                    "diagnostics": {"reason_code": reason_code},
                 },
             )
+
+        try:
+            response = fetch(current_url, connect_ip)
+        except _AdapterOperationalError as exc:
+            return _operational_result(
+                source_type="web", source_id=source_id, fetch_started_at=fetch_started_at, clock=clock, exc=exc
+            )
+
+        if response.final_url != current_url:
+            redirect_hop += 1
+            if redirect_hop > max_redirects:
+                fetch_completed_at = _iso(clock())
+                observation = _build_observation(
+                    source_type="web",
+                    source_id=source_id,
+                    source_status="blocked",
+                    pagination_completeness="unknown",
+                    fetch_started_at=fetch_started_at,
+                    fetch_completed_at=fetch_completed_at,
+                )
+                return _finalize(
+                    observation,
+                    {
+                        "normalized_records": [],
+                        "evidence_digest": _digest([]),
+                        "provenance": {
+                            "url": url,
+                            "current_url": current_url,
+                            "attempted_redirect": response.final_url,
+                        },
+                        "diagnostics": {"reason_code": "redirect_limit_exceeded"},
+                    },
+                )
+            current_url = response.final_url
+            continue
+
+        break
+
+    assert response is not None  # the loop always assigns `response` before `break`
+    fetch_completed_at = _iso(clock())
 
     if len(response.content) > max_bytes:
         observation = _build_observation(
@@ -839,7 +1158,7 @@ def collect_web_source(
             {
                 "normalized_records": [],
                 "evidence_digest": _digest([]),
-                "provenance": {"url": url},
+                "provenance": {"url": url, "current_url": current_url},
                 "diagnostics": {"reason_code": "response_size_exceeded"},
             },
         )
@@ -858,13 +1177,13 @@ def collect_web_source(
             {
                 "normalized_records": [],
                 "evidence_digest": _digest([]),
-                "provenance": {"url": url, "status": response.status},
+                "provenance": {"url": url, "current_url": current_url, "status": response.status},
                 "diagnostics": {"reason_code": "malformed_response"},
             },
         )
 
     text = response.content.decode("utf-8", errors="replace")
-    normalized = [{"url": url, "status": response.status, "text_excerpt": text[:2000]}]
+    normalized = [{"url": current_url, "status": response.status, "text_excerpt": text[:2000]}]
     observation = _build_observation(
         source_type="web",
         source_id=source_id,
@@ -878,53 +1197,169 @@ def collect_web_source(
         {
             "normalized_records": normalized,
             "evidence_digest": _digest(normalized),
-            "provenance": {"url": url, "status": response.status},
+            "provenance": {"url": url, "current_url": current_url, "status": response.status},
             "diagnostics": {},
         },
     )
 
 
-def default_https_fetch(url: str, *, timeout: float = 10.0, max_bytes: int = 2_000_000) -> WebFetchResult:
-    """Production `fetch` implementation for `collect_web_source`: a single
-    GET with no automatic redirect following (redirects are surfaced as
-    `final_url` != `url` via a manual, bounded, re-validated hop so
-    `collect_web_source` can re-apply the SSRF boundary at each hop rather
-    than trusting `urllib`'s default silent-follow behavior), a hard byte
-    cap enforced while reading, and bytes-only handling (never executes
-    HTML/JS)."""
-    import urllib.error
-    import urllib.request
+def _parse_raw_http_response(raw: bytes) -> tuple[int, dict[str, str], bytes]:
+    """Parse a raw HTTP/1.1 response (status line + headers + body). Bodies
+    are sliced to `Content-Length` when present; a response with neither
+    `Content-Length` nor `Transfer-Encoding: chunked` is read to EOF by the
+    caller (this adapter always sends `Connection: close`), so the
+    remaining bytes are the full body either way."""
+    header_blob, _, body = raw.partition(b"\r\n\r\n")
+    lines = header_blob.split(b"\r\n")
+    status_line = lines[0].decode("iso-8859-1", errors="replace")
+    parts = status_line.split(" ", 2)
+    status = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        if b":" in line:
+            key, _, value = line.partition(b":")
+            headers[key.decode("iso-8859-1", errors="replace").strip()] = value.decode(
+                "iso-8859-1", errors="replace"
+            ).strip()
+    content_length = headers.get("Content-Length") or headers.get("content-length")
+    if content_length is not None:
+        try:
+            body = body[: int(content_length)]
+        except ValueError:
+            pass
+    return status, headers, body
 
-    class _RedirectSignal(Exception):
-        def __init__(self, target: str) -> None:
-            super().__init__(target)
-            self.target = target
 
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
-            raise _RedirectSignal(newurl)
+def _open_pinned_tls_socket(hostname: str, connect_ip: str, port: int, timeout: float) -> ssl.SSLSocket:
+    """Open a TCP socket connected directly to the already-DNS-validated
+    ``connect_ip`` (never re-resolving ``hostname``) and TLS-wrap it with
+    ``hostname`` as the SNI / certificate-verification target.
 
-    opener = urllib.request.build_opener(_NoRedirect)
-    request = urllib.request.Request(url, method="GET")
-    request.add_header("User-Agent", "loop-protocol-agent-retrospective-web-adapter (Issue-2236)")
+    This is the single production connection primitive `default_https_fetch`
+    uses. Because the socket connects to a numeric IP rather than
+    re-resolving ``hostname``, no second (TOCTOU-vulnerable) DNS lookup for
+    the untrusted target hostname ever happens; and because this bypasses
+    `urllib.request`'s opener chain entirely, no `http_proxy`/`https_proxy`
+    environment variable is ever consulted either (Issue #2236 PR #2269 P0
+    fix).
+    """
+    raw_sock = socket.create_connection((connect_ip, port), timeout=timeout)
+    context = ssl.create_default_context()
+    return context.wrap_socket(raw_sock, server_hostname=hostname)
+
+
+def default_https_fetch(
+    url: str,
+    connect_ip: str,
+    *,
+    timeout: float = 10.0,
+    max_bytes: int = 2_000_000,
+    socket_opener: Callable[[str, str, int, float], Any] = _open_pinned_tls_socket,
+) -> WebFetchResult:
+    """Production `fetch` implementation for `collect_web_source`.
+
+    ``connect_ip`` is the caller-supplied, single-resolution, validated IP
+    address for `url`'s hostname (see `_resolve_pinned_ip`/
+    `_check_web_boundary`). Connecting directly to this IP -- rather than
+    handing the hostname to a general-purpose HTTP client that would
+    re-resolve it -- closes the DNS-rebinding/TOCTOU window between
+    validation and connect that the pre-fix implementation had (it discarded
+    the validated IP and let `urllib.request` re-resolve the original
+    hostname via the opener chain, which also silently honored
+    `http_proxy`/`https_proxy` environment variables).
+
+    Manual redirects (HTTP 3xx `Location`) are surfaced to the caller as a
+    `final_url` != `url` result rather than followed automatically, so
+    `collect_web_source` can re-apply the full SSRF boundary (including a
+    fresh, single DNS resolution) to each hop.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise _AdapterOperationalError(
+            "web_fetch_missing_hostname", source_status="blocked", reason_code="missing_hostname"
+        )
+    port = parsed.port or 443
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
 
     try:
-        with opener.open(request, timeout=timeout) as response:  # noqa: S310
-            content = response.read(max_bytes + 1)
-            status = response.status
-            final_url = response.geturl()
-    except _RedirectSignal as exc:
-        return WebFetchResult(status=0, content=b"", final_url=exc.target)
+        tls_sock = socket_opener(hostname, connect_ip, port, timeout)
     except TimeoutError as exc:
-        raise _AdapterOperationalError("web_fetch_timeout", source_status="unavailable", reason_code="timeout") from exc
-    except urllib.error.URLError as exc:
         raise _AdapterOperationalError(
-            f"web_fetch_transport_error:{type(exc.reason).__name__}",
+            "web_fetch_timeout",
+            source_status="unavailable",
+            reason_code="timeout",
+            exception_class=type(exc).__name__,
+        ) from exc
+    except (OSError, ssl.SSLError) as exc:
+        raise _AdapterOperationalError(
+            f"web_fetch_transport_error:{type(exc).__name__}",
             source_status="unavailable",
             reason_code="source_not_present",
+            exception_class=type(exc).__name__,
+            errno=getattr(exc, "errno", None),
         ) from exc
 
-    return WebFetchResult(status=status, content=content, final_url=final_url)
+    try:
+        request_text = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {hostname}\r\n"
+            "User-Agent: loop-protocol-agent-retrospective-web-adapter (Issue-2236)\r\n"
+            "Accept-Encoding: identity\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        )
+        try:
+            tls_sock.sendall(request_text.encode("ascii"))
+            raw_response = b""
+            while True:
+                chunk = tls_sock.recv(65536)
+                if not chunk:
+                    break
+                raw_response += chunk
+                if len(raw_response) > max_bytes + 65536:
+                    break
+        except TimeoutError as exc:
+            raise _AdapterOperationalError(
+                "web_fetch_timeout",
+                source_status="unavailable",
+                reason_code="timeout",
+                exception_class=type(exc).__name__,
+            ) from exc
+        except OSError as exc:
+            raise _AdapterOperationalError(
+                f"web_fetch_transport_error:{type(exc).__name__}",
+                source_status="unavailable",
+                reason_code="source_not_present",
+                exception_class=type(exc).__name__,
+                errno=getattr(exc, "errno", None),
+            ) from exc
+    finally:
+        try:
+            tls_sock.close()
+        except OSError:
+            pass
+
+    status, headers, body = _parse_raw_http_response(raw_response)
+    if status == 0:
+        raise _AdapterOperationalError(
+            "web_fetch_malformed_status_line", source_status="unavailable", reason_code="malformed_response"
+        )
+
+    if 300 <= status < 400:
+        location = headers.get("Location") or headers.get("location")
+        if not location:
+            raise _AdapterOperationalError(
+                "web_fetch_redirect_missing_location",
+                source_status="unavailable",
+                reason_code="malformed_response",
+            )
+        final_url = urllib.parse.urljoin(url, location)
+        return WebFetchResult(status=0, content=b"", final_url=final_url, headers=headers)
+
+    return WebFetchResult(status=status, content=body[: max_bytes + 1], final_url=url, headers=headers)
 
 
 # ---------------------------------------------------------------------------
