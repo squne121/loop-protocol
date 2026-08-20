@@ -1,0 +1,13 @@
+{
+  "run_identity": {
+    "base_sha": "not-a-sha",
+    "generated_at": "2026-08-20T00:00:00Z",
+    "runtime_version": "agent-retrospective/0.1.0"
+  },
+  "source_observations": [
+    {
+      "source_type": "github",
+      "pagination_completeness": "complete"
+    }
+  ]
+}
