@@ -920,7 +920,6 @@
       "allOf": [
         {
           "if": {
-
             "properties": {
               "disposition_summary": {
                 "const": "no_missing_fields_detected"
@@ -991,6 +990,57 @@
           }
         }
       ]
+    },
+    "reason_code": {
+      "type": "string",
+      "enum": [
+        "unexpected_authentication_dependency",
+        "rate_limited",
+        "http_403_forbidden",
+        "canonical_resource_missing",
+        "upstream_environment_failure",
+        "transport_connectivity_failure",
+        "malformed_response_body",
+        "cross_repository_read_rejected",
+        "invalid_issue_number",
+        "invalid_comment_id",
+        "credentialless_read_error",
+        "credentialless_transport_unavailable",
+        "credentialless_comments_unexpected_type",
+        "gh_auth_required",
+        "gh_not_found",
+        "gh_timeout",
+        "gh_json_decode_error",
+        "gh_unexpected_error",
+        "gh_exit_error",
+        "gh_unclassified_error",
+        "transport_internal_error",
+        "planner_internal_error",
+        "planner_invocation_missing"
+      ],
+      "description": "Issue #2257 AC10: sanitized, closed-enum classification of an environment_failure. Required when status == \"environment_failure\", forbidden otherwise. Never a transcribed exception message -- an unrecognized underlying failure always maps to the fixed fallback 'transport_internal_error'."
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "credentialless_transport",
+        "gh_cli",
+        "internal"
+      ],
+      "description": "Issue #2257 AC10: which read authority (or internal subsystem) the environment_failure originated from. Required when status == \"environment_failure\", forbidden otherwise."
+    },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "read_issue",
+        "list_issue_comments",
+        "read_issue_comment",
+        "write_artifacts",
+        "load_fixture",
+        "planner_invocation",
+        "unspecified"
+      ],
+      "description": "Issue #2257 AC10: which operation was in progress when the environment_failure occurred. Required when status == \"environment_failure\", forbidden otherwise."
     }
   },
   "allOf": [
@@ -1138,6 +1188,46 @@
           "status": {
             "const": "blocked"
           }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "environment_failure"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "reason_code",
+          "source",
+          "operation"
+        ]
+      },
+      "else": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "reason_code"
+              ]
+            },
+            {
+              "required": [
+                "source"
+              ]
+            },
+            {
+              "required": [
+                "operation"
+              ]
+            }
+          ]
         }
       }
     }

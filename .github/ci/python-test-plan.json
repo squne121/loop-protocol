@@ -25,6 +25,7 @@
     ".claude/skills/review-issue/tests/",
     ".claude/skills/issue-refinement-loop/scripts/tests/",
     ".claude/skills/issue-refinement-loop/tests/",
+    ".claude/skills/agent-retrospective/scripts/tests/",
     "schemas/tests/",
     "tests/ci/",
     "scripts/ci/tests/",
