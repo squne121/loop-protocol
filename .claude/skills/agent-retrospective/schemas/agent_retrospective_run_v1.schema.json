@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.dev/schemas/agent_retrospective_run_v1.schema.json",
+  "title": "agent_retrospective_run/v1",
+  "description": "Schema for a single agent-retrospective run. A run is modeled as a bounded observation (docs/adr/0007-agent-retrospective-boundaries.md, Decision 1), NOT as a single atomic snapshot: the repository source is an immutable snapshot anchored at run_identity.base_sha, but GitHub/web/runtime sources are paginated and can change mid-collection, so each source's observation window and pagination completeness must be recorded independently in source_observations. This schema is the state primary record for a run; docs/dev/agent-retro-index.md (agent_retro_index/v1) remains a derived index only and is not a state store (ADR 0007, Decision 7).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_identity", "source_observations"],
+  "properties": {
+    "run_identity": {
+      "type": "object",
+      "description": "Identity of the run as a whole. base_sha anchors the repository-source immutable snapshot; source_set_digest is a deterministic digest over source_observations (see compute_source_set_digest() in validate_retrospective_schema.py) intended for idempotency use only ((repo, base_sha, source_set_digest, scope) duplicate suppression, ADR 0007 Decision 5). It is NOT an optimistic-concurrency / stale-write-protection token; that mechanism (expected_previous_digest / version) is out of scope for this schema (Child 5 / #2238 responsibility). validate_run() recomputes and cross-checks this digest against source_observations; it is not a free-form caller-supplied value.",
+      "additionalProperties": false,
+      "required": ["base_sha", "generated_at", "runtime_version", "source_set_digest"],
+      "properties": {
+        "base_sha": {
+          "type": "string",
+          "description": "Full-length repository commit SHA the run is anchored to. Repository-source claims are treated as an immutable snapshot at this commit.",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "generated_at": {
+          "type": "string",
+          "description": "ISO 8601 timestamp when this run record was generated.",
+          "format": "date-time"
+        },
+        "runtime_version": {
+          "type": "string",
+          "description": "Version identifier of the agent-retrospective runtime that produced this run.",
+          "minLength": 1
+        },
+        "source_set_digest": {
+          "type": "string",
+          "description": "Deterministic sha256 hex digest computed over source_observations by compute_source_set_digest(). Used for idempotency (duplicate suppression) only -- not for optimistic concurrency. validate_run() rejects any run whose stored digest does not match the recomputed value.",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "source_observations": {
+      "type": "array",
+      "description": "Per-source bounded observation records. Required so a run is never mistaken for a single atomic snapshot (ADR 0007 Decision 1). One entry per Child 3 (#2236) adapter invocation (claude_code / claude_gpt / repository / github / web); source_id identifies which adapter produced the entry independently of the coarser source_type trust class.",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/source_observation" }
+    }
+  },
+  "$defs": {
+    "source_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_type", "source_id", "source_status", "pagination_completeness"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "source_type": { "const": "repository" } },
+            "required": ["source_type"]
+          },
+          "then": {},
+          "else": {
+            "required": ["fetch_started_at", "fetch_completed_at"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "pagination_completeness": { "const": "partial" } },
+            "required": ["pagination_completeness"]
+          },
+          "then": {
+            "required": ["partial_reason"]
+          }
+        }
+      ],
+      "properties": {
+        "source_type": {
+          "type": "string",
+          "description": "Coarse trust/authority class of the source observed, used by the ADR 0007 Decision 2 claim-class source-authority table. 'repository' is treated as an immutable snapshot anchored at run_identity.base_sha (fetch_started_at/fetch_completed_at are optional for this source_type). Non-repository source_type values (github/web/runtime) are paginated / time-varying and MUST record fetch_started_at/fetch_completed_at. 'runtime' covers both the claude_code and claude_gpt adapters (#2236); source_id disambiguates which one produced this entry.",
+          "enum": ["repository", "github", "web", "runtime"]
+        },
+        "source_id": {
+          "type": "string",
+          "description": "Identity of the specific Child 3 (#2236) adapter that produced this observation. Distinct from source_type: source_type groups claude_code and claude_gpt under the coarser 'runtime' trust class, while source_id disambiguates the two.",
+          "enum": ["claude_code", "claude_gpt", "repository", "github", "web"]
+        },
+        "source_status": {
+          "type": "string",
+          "description": "Outcome of this adapter's collection attempt, returned independently of every other source's status (Child 3 / #2236 AC2, fail-independent collection). 'blocked' covers permission/authorization failures distinct from transient 'unavailable' failures.",
+          "enum": ["complete", "partial", "unavailable", "blocked"]
+        },
+        "observed_from": {
+          "type": "string",
+          "description": "Deprecated: superseded by fetch_started_at (acquisition window) and resource_updated_at_min (resource-event window) per ADR 0007 Decision 1 (2026-08-19 OWNER review P1-8). Retained only for backward-compatible reads of pre-ADR-0007 records; new writers MUST use the split fields instead.",
+          "format": "date-time"
+        },
+        "observed_until": {
+          "type": "string",
+          "description": "Deprecated: superseded by fetch_completed_at (acquisition window) and resource_updated_at_max (resource-event window) per ADR 0007 Decision 1 (2026-08-19 OWNER review P1-8). Retained only for backward-compatible reads of pre-ADR-0007 records; new writers MUST use the split fields instead.",
+          "format": "date-time"
+        },
+        "fetch_started_at": {
+          "type": "string",
+          "description": "Acquisition window start: wall-clock time this source's API collection began (ADR 0007 Decision 1, distinct from resource_updated_at_min/max). Required for all non-repository source_type values.",
+          "format": "date-time"
+        },
+        "fetch_completed_at": {
+          "type": "string",
+          "description": "Acquisition window end: wall-clock time this source's API collection completed. Required for all non-repository source_type values.",
+          "format": "date-time"
+        },
+        "resource_updated_at_min": {
+          "type": "string",
+          "description": "Resource-event window minimum: earliest last-updated timestamp among the collected resources.",
+          "format": "date-time"
+        },
+        "resource_updated_at_max": {
+          "type": "string",
+          "description": "Resource-event window maximum: latest last-updated timestamp among the collected resources.",
+          "format": "date-time"
+        },
+        "pagination_completeness": {
+          "type": "string",
+          "description": "Whether pagination traversal for this source completed. 'partial' MUST be accompanied by partial_reason (enforced by the allOf/if/then invariant above, not description text alone).",
+          "enum": ["complete", "partial", "unknown"]
+        },
+        "partial_reason": {
+          "type": "string",
+          "description": "Reason pagination was cut short (e.g. rate_limit, timeout). Required when pagination_completeness is 'partial' (schema-enforced).",
+          "minLength": 1
+        },
+        "cursor": {
+          "type": "string",
+          "description": "Pagination cursor / continuation token, when available, for reproducibility and diffing."
+        },
+        "etag": {
+          "type": "string",
+          "description": "ETag or equivalent identity metadata for change detection, when available."
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "API endpoint queried for this source."
+        },
+        "api_version": {
+          "type": "string",
+          "description": "API version used for this source's collection."
+        },
+        "query_params": {
+          "type": "object",
+          "description": "Filter / query parameters applied when collecting this source."
+        },
+        "page_size": {
+          "type": "integer",
+          "description": "Page size used for this source's collection.",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}
