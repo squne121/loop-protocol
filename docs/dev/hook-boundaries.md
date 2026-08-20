@@ -94,139 +94,6 @@ hook_boundaries_manifest_v1:
       jq 不在など自身がエラーになった場合も fail-closed（exit 2）。
       このフックは fail-closed のまま維持し、best-effort 化してはならない（AC3）。
 
-  - handler_id: local_main_branch_guard
-    event: PreToolUse
-    matcher: "Bash"
-    command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/local_main_branch_guard.sh"
-    args: []
-    timeout: 10
-    classification: blocker
-    fail_policy: fail_closed
-    script_exit_contract:
-      normal: 0
-      block: 2
-      internal_producer_failure: 2
-    claude_event_semantics:
-      event: PreToolUse
-      exit_2_effect: blocks_tool_call
-      other_nonzero_effect: non_blocking_error_or_stderr_visible
-    stdout_contract: silent_on_allow
-    stderr_contract: minimal_structural_message_on_block
-    redaction_contract:
-      no_raw_command: true
-      no_raw_secret_like_value: true
-      no_raw_transcript: true
-      no_manifest_body_on_stdout: true
-    agent_action:
-      on_nonzero: stop_tool_call
-      on_zero: proceed
-    notes: >
-      local root checkout のブランチ drift を early-stage でブロックするフック。
-      secret_boundary_guard の後、worktree_scope_guard の前に配置する
-      （順序: secret → local_main → worktree）。
-      local root context（cwd == primary worktree root）かつ default branch 以外への
-      branch mutation コマンドを fail-closed で block する。
-      linked issue worktree 内では allow し、既存の worktree_scope_guard に委譲する。
-      guard script 不在など自身がエラーになった場合も fail-closed（exit 2）。
-      このフックは fail-closed のまま維持し、best-effort 化してはならない（Issue #1014）。
-      reason_code 一覧（#1089 追加、#1109 で gh_mutation_denied 分離、#1124 で 5 分類追加）:
-      readonly_command / branch_safe_maintenance_command / deterministic_checker_command /
-      github_remote_ops_command / gh_mutation_denied / unparseable_branch_mutation。
-      gh_mutation_denied: gh issue/pr のうち readonly allowlist 外かつ github_remote_ops_command・github_issue_mutation_command 外の mutation 系コマンドを fail-closed した場合に使用（#1109）。
-      github_remote_ops_command: post-merge-cleanup 最小集合（gh issue close/comment/reopen, gh pr comment/edit）および github_issue_mutation_command に使用（#1124）。
-      unparseable_branch_mutation: compound/wrapper/redirection・/tmp wrapper・python -c・parse failure 等に使用。
-      fd-duplication（2>&1 |）はパイプ前のみ正規化して readonly_command として許可。
-      gh issue view/list, gh pr view/list/status は readonly_command として許可。
-      gh issue/pr mutation コマンド（edit/close/merge 等）は gh_mutation_denied で fail-closed（#1109）。
-      /tmp wrapper / python -c は unparseable_branch_mutation で fail-closed。
-      deterministic_checker_command は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可。
-      probe scripts (git_ref_probe.py / git_worktree_probe.py) は DETERMINISTIC_CHECKER_ALLOWLIST に登録済み（Issue #1197）。
-      `issue_scope_snapshot.materialize` は controlled_skill_mutation_exec の exact command id
-      としてのみ許可する。live GitHub-bound scope snapshot artifact の producer であり、
-      任意の Python/heredoc または raw git commit を代替経路として許可しない。
-      local root default branch 保護（branch drift 防止）は維持しつつ、Issue #1241 以降は shared policy で
-      bounded な `rtk git add/commit/push` と `HOOK_COMMAND_REPAIR_HINT_V1` を扱う。
-
-      ## gh CLI コマンド 5 分類（#1124）
-
-      local_main_branch_guard は gh issue/pr コマンドを以下の 5 分類で判定する:
-
-      | 分類 | reason_code | 代表コマンド | 判断基準 |
-      |---|---|---|---|
-      | display_readonly_command | readonly_command | gh issue view, gh pr view, gh issue list | DISPLAY_READONLY_PATTERNS に合致 |
-      | readonly_artifact_export_command | readonly_command | gh issue view <N> ... > tmp/<file> | `>` で tmp/ 先へのリダイレクトのみ |
-      | github_issue_mutation_command | github_remote_ops_command | gh issue create | --repo squne121/loop-protocol + --body-file tmp/... 必須 |
-      | github_pr_metadata_command | github_remote_ops_command | gh pr comment/edit | is_github_remote_ops_command で判定 |
-      | github_destructive_command | gh_mutation_denied | gh pr merge, gh pr checkout | 上記以外の gh issue/pr mutation |
-
-      ### github_issue_mutation_command の allow 条件
-
-      `gh issue create` が以下の条件をすべて満たす場合のみ allow:
-      1. `--repo squne121/loop-protocol` が存在する（完全一致）
-      2. `--body-file tmp/<path>` が存在する（tmp/ から始まる相対パス、"-" は不可）
-      3. interactive フラグ不在: `--editor` / `-e` / `--web` / `-w`
-      4. `--title <value>` が存在する
-
-      ### readonly_artifact_export_command の allow 条件
-
-      `gh issue view <N> ... > tmp/<filename>` が以下の条件をすべて満たす場合のみ allow:
-      1. `gh issue view <N>` で始まる（view のみ、edit/create は不可）
-      2. リダイレクトは `>` のみ（`>>` は不可）
-      3. 先は `tmp/` から始まる（src/, docs/, .env, .git は不可）
-      4. lhs にシェルメタキャラ（|, ;, &&, ||, backtick, $()）なし
-      raw `gh issue edit` / `gh issue comment` は `gh_mutation_denied` で block される。
-      `gh api -f body=...` / `gh api graphql -f query='mutation { ... }'` /
-      `gh api --method POST ...` のような allowlist 外 `gh api` は
-      `github_api_command` (`gh_api_not_allowed`) で block される。
-
-  - handler_id: worktree_scope_guard
-    event: PreToolUse
-    matcher: "Bash|Write|Edit|MultiEdit"
-    command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree_scope_guard.sh"
-    args: []
-    timeout: 10
-    classification: blocker
-    fail_policy: fail_closed
-    script_exit_contract:
-      normal: 0
-      block: 2
-      internal_producer_failure: 2
-    claude_event_semantics:
-      event: PreToolUse
-      exit_2_effect: blocks_tool_call
-      other_nonzero_effect: non_blocking_error_or_stderr_visible
-    stdout_contract: silent_on_allow
-    stderr_contract: minimal_structural_message_on_block
-    redaction_contract:
-      no_raw_command: true
-      no_raw_secret_like_value: true
-      no_raw_transcript: true
-      no_manifest_body_on_stdout: true
-    agent_action:
-      on_nonzero: stop_tool_call
-      on_zero: proceed
-    notes: >
-      worktree スコープ外の mutation を遮断するフック。
-      python3 不在など自身がエラーになった場合も fail-closed（exit 2）。
-      active issue worktree がある場合でも shared cleanup / skill-runtime exact policy のみを例外とし、
-      bootstrap 系の追加 allowlist はこの PR では導入しない。
-      Issue #1241 以降は issue worktree publish path の `rtk git add/commit/push` だけを shared bounded
-      policy で解釈し、deny 時は `HOOK_COMMAND_REPAIR_HINT_V1` を stderr に返す。
-      Issue #1688 以降は hook adapter が hook process と fresh git probe から
-      `CONTROLLED_PUBLISH_CONTEXT_V1` を生成し、policy CLI に JSON 引数として明示注入する。
-      canonical existing-branch push は controlled transaction 内で 1 回だけ実行し、同じ remote ref の
-      readback が local HEAD と一致した場合だけ完了する。外側の shell push は transaction 完了後も deny
-      して二重実行を防ぐ。context の欠落・partial・malformed、branch/HEAD/remote/Allowed Paths digest の
-      不一致は fail-closed とする。`env LOOP_PUBLISH_...=... rtk git push ...` は context injection ではない。
-      #1688 fix delta: existing_branch_update / initial_branch_create の real remote write は、
-      `boundary_layer` が `worktree_scope_guard_denied`（本 hook の既定値）または
-      `codex_hook_adapter_pretooluse`（Codex 側 `PreToolUse`）のいずれかであることを
-      `git_mutation_command_policy.py` 側でも独立に fail-closed 検証する（second-layer
-      defense）。Codex 側の `PermissionRequest` は同じ transaction を一切起動しない
-      （event boundary gate は adapter 側の呼び出し口で行う）。詳細は
-      `docs/dev/session-recording-policy.md` の「existing_branch_update /
-      initial_branch_create レーンの event boundary と timeout budget（#1688 fix delta）」を
-      参照。
 
   - handler_id: guard-japanese-prose
     event: PreToolUse
@@ -522,11 +389,17 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 
 ## 3. agent 判断表（Claude Code / Claude Code 向け）
 
+`local_main_branch_guard.sh` / `worktree_scope_guard.sh` は repo-controlled
+`.claude/settings.json` の project PreToolUse には現在登録されていない
+（#2193/#2256）。以下の表は「project PreToolUse で実行された場合の
+behavioral contract」を記述するものであり、両スクリプトが実際に project
+PreToolUse から呼び出されているという主張ではない。
+
 | hook | 分類 | hook failure 時の agent 動作 |
 |---|---|---|
-| `secret_boundary_guard.sh` | blocker | **操作を停止（block）** |
-| `local_main_branch_guard.sh` | blocker | **操作を停止（block）** |
-| `worktree_scope_guard.sh` | blocker | **操作を停止（block）** |
+| `secret_boundary_guard.sh` | blocker | **操作を停止（block）**（project PreToolUse に登録済み） |
+| `local_main_branch_guard.sh` | blocker（behavioral contract。project PreToolUse 未登録） | **操作を停止（block）** |
+| `worktree_scope_guard.sh` | blocker（behavioral contract。project PreToolUse 未登録） | **操作を停止（block）** |
 | `guard-japanese-prose.sh` | mode_dependent | shadow モード: 継続（log のみ）/ enforce モード: **停止** |
 | `rtk_boundary_shadow_guard.sh` | telemetry | 継続（log のみ） |
 | `ci_test_performance_advisory.sh` | warning / fail_open | 継続（advisory 出力のみ、block なし） |
@@ -543,7 +416,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | hook | Codex CLI での扱い |
 |---|---|
 | `secret_boundary_guard.sh` | この manifest の対象外。同等の制御は Codex 固有の policy / allowed-tools 設定で別途実装する必要がある |
-| `local_main_branch_guard.sh` | `.codex/hooks.json` の PreToolUse・PermissionRequest 経由で Codex parity を実現。startup preflight `check_local_main_branch_state.py` も必須（Codex PreToolUse は完全な interception boundary ではないため） |
+| `local_main_branch_guard.sh` | repo-controlled `.codex/hooks.json` は現在 `SessionEnd` / `SubagentStop` の passive advisory recorder のみを宣言している（Issue #1830 quarantine）。この guard を呼び出す PreToolUse / PermissionRequest 宣言は存在しない。branch-safety policy の authority は Agent/Skill-side behavioral contract にあり、startup preflight `check_local_main_branch_state.py` は Codex セッション開始前に必須実行する |
 | `guard-japanese-prose.sh` | この manifest の対象外（Claude Code のみ） |
 | その他 telemetry hooks | この manifest の対象外。Codex セッションでの telemetry 収集は Codex 固有実装に依存する |
 
@@ -616,17 +489,24 @@ PR review・session 終了時に artifact 欠落が検出された場合、follo
 startup preflight: `uv run python3 scripts/check_local_main_branch_state.py --json`
 Codex セッション開始前に必須実行。非ゼロ終了時は実装作業を開始しない。
 
-### PreToolUse hook 実行順序（Claude Code）
+### project settings に宣言されている PreToolUse handlers（Claude Code）
 
-`secret_boundary_guard` → `local_main_branch_guard` → `worktree_scope_guard` → その他
+Claude Code は同一イベントで match した複数 hooks を実行するが、実行順序に
+決定論的な保証はない（複数 handler が同一イベントに match した場合、順序は
+non-deterministic）。固定順序（例: `secret_boundary_guard` → `local_main_branch_guard`
+→ `worktree_scope_guard`）を前提にした設計・記述は行わない。
 
-理由: branch drift は worktree scope violation より前に、より明確な reason code で止めるべき。
+repo-controlled `.claude/settings.json` の project PreToolUse には現在
+`secret_boundary_guard` / `guard-japanese-prose` / `rtk_boundary_shadow_guard` /
+`ci_test_performance_advisory` / `root_temporary_residue_advisory` が宣言されており、
+`local_main_branch_guard` / `worktree_scope_guard` は宣言されていない（negative invariant。
+`scripts/check_hook_boundaries.py` で検証可能）。
 
 ---
 
 ## 10. pretool_fastpath_classifier.py による fast-path 分類（Issue #1289）
 
-`scripts/agent-guards/pretool_fastpath_classifier.py` は **独立した PreToolUse hook として登録しない共有ライブラリ** である。`local_main_branch_guard.py`（および Bash ラッパー経由で `.codex/hooks.json` の `local_main_branch_guard.sh` エントリ）から内部的に import され、既存の allow/block 判定を変更せずに telemetry を bounded な fast-path 分類で補強する。`.claude/settings.json` と `.codex/hooks.json` の PreToolUse hook トポロジ（hook 数）は本変更前後で変わらない（`check_hook_boundaries.py` で検証可能）。`.codex/hooks.json` は Codex runtime config であり、root key は `hooks` のみを許可する。fast-path contract metadata は下記 `fastpath_contract_v1` を正本とし、runtime config root へ再混入させない。
+`scripts/agent-guards/pretool_fastpath_classifier.py` は **独立した PreToolUse hook として登録しない共有ライブラリ** である。`local_main_branch_guard.py`（Bash ラッパー `local_main_branch_guard.sh` から呼び出される Agent/Skill-side behavioral contract の一部であり、`.codex/hooks.json` には PreToolUse として宣言されていない）から内部的に import され、既存の allow/block 判定を変更せずに telemetry を bounded な fast-path 分類で補強する。`.claude/settings.json` と `.codex/hooks.json` の PreToolUse hook トポロジ（hook 数）は本変更前後で変わらない（`check_hook_boundaries.py` で検証可能）。`.codex/hooks.json` は Codex runtime config であり、root key は `hooks` のみを許可する。fast-path contract metadata は下記 `fastpath_contract_v1` を正本とし、runtime config root へ再混入させない。
 
 ```yaml
 fastpath_contract_v1:

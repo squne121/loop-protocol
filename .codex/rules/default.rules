@@ -460,8 +460,11 @@ prefix_rule(
 # --- Issue #1137: cleanup exact commands on the guarded cleanup route ---
 # `git worktree`/`git branch` are split so the exact cleanup commands are NOT
 # statically allowed and NOT broadly forbidden, but routed to worktree_scope_guard
-# (the guarded cleanup route, wired in .codex/hooks.json) against the V3 one-shot
-# contract. Force / destructive variants stay forbidden; read-only forms allowed.
+# (the guarded cleanup route, a documented Agent/Skill-side behavioral contract.
+# Current .codex/hooks.json declares only SessionEnd and SubagentStop as a
+# passive advisory recorder and does not register this guard; see
+# docs/dev/hook-boundaries.md #2193/#2256) against the V3 one-shot contract.
+# Force / destructive variants stay forbidden; read-only forms allowed.
 
 prefix_rule(
     pattern = ["git", "worktree", "list"],
