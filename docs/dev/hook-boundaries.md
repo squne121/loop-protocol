@@ -423,7 +423,7 @@ local_main_branch_guard は gh issue/pr コマンドを以下の 5 分類で判�
 | github_pr_metadata_command | github_remote_ops_command | gh pr comment/edit | is_github_remote_ops_command で判定 |
 | github_destructive_command | gh_mutation_denied | gh pr merge, gh pr checkout | 上記以外の gh issue/pr mutation |
 
-### deterministic_checker_command と probe scripts（#1197）
+### deterministic_checker_command と probe scripts の登録範囲（#1197）
 
 上記と同じく、以下は `local_main_branch_guard.py` 内部の behavioral contract の記述であり、
 project PreToolUse への現在の登録状況とは独立している。
