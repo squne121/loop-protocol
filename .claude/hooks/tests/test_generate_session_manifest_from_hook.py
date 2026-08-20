@@ -27,10 +27,10 @@ spec.loader.exec_module(check_hook_boundaries)
 
 
 def test_hook_boundaries_sync():
-    """Issue #1690 note: local_main_branch_guard and worktree_scope_guard are
-    temporarily removed from settings.json pending the #1690 policy decision,
-    so check_hook_boundaries.py drift is expected to be limited to exactly
-    those two removals until #1690 resolves."""
+    """Issue #2262 AC6 note: local_main_branch_guard and worktree_scope_guard
+    manifest entries were removed from hook-boundaries.md (they are not
+    registered in settings.json project PreToolUse; see #2193/#2256), so
+    check_hook_boundaries.py drift is expected to be empty."""
     result = subprocess.run(
         ["uv", "run", "python3", "scripts/check_hook_boundaries.py"],
         cwd=REPO_ROOT,
@@ -38,16 +38,14 @@ def test_hook_boundaries_sync():
         capture_output=True,
         check=False,
     )
-    expected_drift_lines = {
-        "  [drift] manifest に存在するが settings.json にない "
-        "(handler_id='local_main_branch_guard', event='PreToolUse')",
-        "  [drift] manifest に存在するが settings.json にない "
-        "(handler_id='worktree_scope_guard', event='PreToolUse')",
-    }
     stderr_lines = {line for line in result.stderr.splitlines() if line.startswith("  [drift]")}
-    assert stderr_lines == expected_drift_lines, (
-        f"check_hook_boundaries.py drift must be exactly the two #1690 "
-        f"removals; got:\n{result.stderr}\n{result.stdout}"
+    assert stderr_lines == set(), (
+        f"check_hook_boundaries.py drift must be empty after #2262 AC6 "
+        f"manifest cleanup; got:\n{result.stderr}\n{result.stdout}"
+    )
+    assert result.returncode == 0, (
+        f"check_hook_boundaries.py must exit 0 when drift is empty; "
+        f"got returncode={result.returncode}\n{result.stderr}\n{result.stdout}"
     )
 
 

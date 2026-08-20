@@ -423,6 +423,14 @@ local_main_branch_guard は gh issue/pr コマンドを以下の 5 分類で判�
 | github_pr_metadata_command | github_remote_ops_command | gh pr comment/edit | is_github_remote_ops_command で判定 |
 | github_destructive_command | gh_mutation_denied | gh pr merge, gh pr checkout | 上記以外の gh issue/pr mutation |
 
+### deterministic_checker_command と probe scripts（#1197）
+
+上記と同じく、以下は `local_main_branch_guard.py` 内部の behavioral contract の記述であり、
+project PreToolUse への現在の登録状況とは独立している。
+`deterministic_checker_command` は DETERMINISTIC_CHECKER_ALLOWLIST の exact-path のみ許可する。
+probe scripts（`git_ref_probe.py` / `git_worktree_probe.py`）は DETERMINISTIC_CHECKER_ALLOWLIST に
+登録済み（Issue #1197）。
+
 ### github_issue_mutation_command の allow 条件
 
 `gh issue create` が以下の条件をすべて満たす場合のみ allow:
