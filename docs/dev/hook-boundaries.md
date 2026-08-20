@@ -391,9 +391,12 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 
 `local_main_branch_guard.sh` / `worktree_scope_guard.sh` は repo-controlled
 `.claude/settings.json` の project PreToolUse には現在登録されていない
-（#2193/#2256）。以下の表は「project PreToolUse で実行された場合の
-behavioral contract」を記述するものであり、両スクリプトが実際に project
-PreToolUse から呼び出されているという主張ではない。
+（#2193/#2256）。以下の表のうち `local_main_branch_guard.sh` / `worktree_scope_guard.sh`
+の2行のみが「project PreToolUse で実行された場合の behavioral contract」を記述するもの
+であり、両スクリプトが実際に project PreToolUse から呼び出されているという主張ではない。
+他の行（`secret_boundary_guard.sh` 等の project PreToolUse 登録済み handler、および
+Stop / SubagentStop / PostToolUse で実際に動作する `session_manifest_coordinator.sh` /
+`session_manifest_debounce.mjs`）は、それぞれが実際に登録されているイベントにおける挙動を記述する。
 
 | hook | 分類 | hook failure 時の agent 動作 |
 |---|---|---|
@@ -540,11 +543,12 @@ Claude Code は同一イベントで match した複数 hooks を実行するが
 non-deterministic）。固定順序（例: `secret_boundary_guard` → `local_main_branch_guard`
 → `worktree_scope_guard`）を前提にした設計・記述は行わない。
 
-repo-controlled `.claude/settings.json` の project PreToolUse には現在
-`secret_boundary_guard` / `guard-japanese-prose` / `rtk_boundary_shadow_guard` /
-`ci_test_performance_advisory` / `root_temporary_residue_advisory` が宣言されており、
-`local_main_branch_guard` / `worktree_scope_guard` は宣言されていない（negative invariant。
-`scripts/check_hook_boundaries.py` で検証可能）。
+repo-controlled `.claude/settings.json` の project PreToolUse に
+`local_main_branch_guard` / `worktree_scope_guard` は登録されていない（negative invariant）。
+具体的にどの handler が project PreToolUse に宣言されているかという active handler topology の
+正本は、本 docs の `hook_boundaries_manifest_v1`（機械可読 SSOT。§2）と `.claude/settings.json`
+に対する `scripts/check_hook_boundaries.py` の structural check とする。固定 cardinality の
+handler 一覧を本節の prose に列挙しない。
 
 ---
 
@@ -662,8 +666,11 @@ PR review の最終判定コメント投稿は、呼び出し元（orchestrator/
 Markdown 本文を `gh pr comment --repo <owner/repo> --body-file <file>` で投稿する通常の
 gh 操作に置換された（`.claude/settings.json` の `permissions.allow` には
 `Bash(gh pr comment *)` が既に存在するため、新規の認可ルール追加は不要）。
-生の `gh pr review` 呼び出しは引き続き `local_main_branch_guard.sh` で
-`gh_mutation_denied` として block される（本 Issue で変更しない）。
+生の `gh pr review` 呼び出しは `local_main_branch_guard.sh` の behavioral contract 上
+`gh_mutation_denied` として block 対象と定義されている（本 Issue で変更しない）。ただし
+`local_main_branch_guard.sh` は現行 project config では PreToolUse handler として
+wiring されていない（#2193/#2256）ため、この block は実行時の active enforcement では
+なく、Agent/Skill 側の behavioral workflow contract として維持される。
 
 ## 12c. scope_rollup.run の位置づけ（Issue #1547）
 
@@ -672,7 +679,7 @@ gh 操作に置換された（`.claude/settings.json` の `permissions.allow` �
 - **command**: `uv run python3 scripts/agent-guards/run_scope_rollup_preflight.py --issue-number <N> --repo <owner/repo> --invocation-id <id> --requested-at <ISO8601>`（12 token 完全一致。`--invocation-id` / `--requested-at` は PR #1560 fix_delta で追加 -- caller (scope-rollup-runner) が生成した値をそのまま渡し、executor は独自に UUID / timestamp を生成しない。`--flag=value` 形・追加 flag・wrapper・shell metacharacter はすべて `unparseable_branch_mutation` で fail-closed）
 - **destination**: caller は出力先を指定しない。GitHub 生入力（`issues.json` / `prs.json`）は executor-owned private invocation directory（`tempfile.mkdtemp()`, mode `0700`）内に `O_CREAT | O_EXCL | O_NOFOLLOW` + mode `0600` で `.part` ファイルを排他生成し、同一 directory 内 `os.link()` ベースの排他 finalize（`os.rename` は使わない -- 既存 destination を静かに置換しうるため）+ flush + `fsync` で確定する。planner の実行結果（`plan_result.json` 相当）はファイル化せず、bounded streaming で in-memory capture した stdout を直接 JSON parse し、verifier も in-process の `verify_payload()` で検証する（PR #1560 P0-2）。success / failure / timeout の全経路で private directory を `finally` で cleanup し、cleanup 失敗自体も `cleanup_failed` として transaction failure に変換する（P1-3）。`SCOPE_ROLLUP_RUN_RESULT_V1` JSON のみを stdout へ返す（永続 artifact は残さない）
 - **safety boundary**: canonical root cwd・default branch・trusted repo（`squne121/loop-protocol`）を実行前後で拘束。`gh` は固定 trusted search dirs（`/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, `/bin`）から解決し、realpath・owner 権限・ancestor directory の world/group-writable 状態（sticky bit なし）まで検証する（PATH shadowing 対策、P1-1）。`GH_HOST` / `GH_REPO` / `GH_FORCE_TTY` / `GH_PAGER` / `PAGER` / `GH_CONFIG_DIR` / `GH_DEBUG` / `GH_PATH` / `GH_PROMPT_DISABLED` は sanitize（呼び出し元環境から継承しない）
-- raw `gh issue view / list` / `gh pr list` の shell redirect（`gh ... > /tmp/...`）は引き続き `local_main_branch_guard` の compound/metachar 判定で block される。`scope_rollup.run` の exact invocation だけが許可レーンであり、redirect の部分許可は導入していない
+- raw `gh issue view / list` / `gh pr list` の shell redirect（`gh ... > /tmp/...`）は `local_main_branch_guard` の compound/metachar 判定ロジック上は block 対象と定義される（ただしこの判定は現行 project config では PreToolUse handler として wiring されていないため、runtime での active な block ではなく behavioral contract である）。`scope_rollup.run` の exact invocation だけが許可レーンであり、redirect の部分許可は導入していない
 - pagination は Issue / Pull Request の各 connection を GraphQL cursor で取得し、各 page の top-level `errors` 不在、`nodes` の schema・node ID / number の一意性、`hasNextPage` の bool、次 page の non-empty / progress する cursor、terminal `hasNextPage: false`、server `totalCount == unique item_count` を満たした場合だけ planner へ渡す。partial response、malformed connection、null / duplicate node、cursor stalled、count mismatch は stable reason code で transaction 全体を fail-close する。query schema v3 は inventory DTO に Issue/PR の `labels` と PR の `closingIssuesReferences` を含んでいたが、query schema v4 は planner が消費する `id`、基本属性、Issue の `stateReason`、PR の `changedFiles` / `files` だけを projection する。削除した connection は completeness 対象外なのではなく inventory projection 自体に含まれず、canonical normalized DTO と sha256 にも現れない。manifest `query_schema_version: 4` の `page_count` は算出値ではなく成功応答として実際に処理した page 数であり、`pagination_complete: true`、`total_count`、canonical normalized DTO の sha256 とともに marker/parser の必須 producer/consumer contract である。scope-rollup-runner marker は 明示的な `marker_schema_version: 3` を維持する。parser (`parse_scope_rollup_run_result.py`) は marker schema v3 の完全性契約を必須にしつつ、既存 query schema v3 marker と current query schema v4 marker の両方を受理する。v3 marker の alias hash/count は対応する completeness block と一致し、count/page/budget は bool を許さない非負値、消費量は max 以下、deadline は正値でなければならない。`marker_schema_version` フィールド自体が存在しない pre-#1593 の legacy v2 マーカーも、Issue #1593 AC6 の要求通り引き続き受理される
 - transaction-wide pagination budget は Issue page、Pull Request page、nested PR files page を合算し、monotonic deadline、最大 page 数、最大 response byte 数、最大 inventory item 数を共通で enforce する。いずれかの budget 超過時は partial inventory を planner に渡さず fail-close する。PR files connection の個別 `MAX_PR_FILE_PAGES` はこの共通 budget を置き換えない
 - PR の `files` connection は `files(first: 100)` に固定されるため、`changedFiles` がフェッチ済み `files` 件数を上回る PR については `gh api graphql` でその PR の files connection のみを `hasNextPage` が false になるまで cursor pagination し、完走できなければ `pr_files_pagination_incomplete` として fail-close する（101 件目以降のファイルで overlap を見逃す false negative の防止、P0-3）
@@ -707,7 +714,7 @@ merge 実行後は、active branch 不変・`HEAD == target_sha`・`git status` 
 
 ### deny 境界
 
-- root checkout（default branch）・非 issue-worktree 命名の branch・detached HEAD はいずれも `git merge` 呼び出し前に deny される（`local_main_branch_guard.py` / Codex 両 flavor で回帰確認済み）。
+- root checkout（default branch）・非 issue-worktree 命名の branch・detached HEAD はいずれも `git merge` 呼び出し前に deny する設計になっている（`local_main_branch_guard.py` / Codex 両 flavor の unit test で回帰確認済み。ただし `local_main_branch_guard.py` は現行 project config では PreToolUse handler として wiring されていないため、これは実装レベルの behavioral contract であり runtime での active enforcement の主張ではない）。
 - `git reset --hard` / `rtk git push --force ...` 等の既存 destructive command deny は本 lane 追加後も維持される。
 - raw `git merge`（`rtk` prefix なし）は本 policy の対象外（`classify_rtk_git_mutation` は `no_match` を返し、他レイヤーの一般的な mutating command 判定に委ねる）。
 - `.claude/worktrees/issue-1589-linked-issue-worktree-verified-fast-forw` の worktree_scope_guard 統合は、既存の `classify_rtk_git_mutation` 汎用ディスパッチ（resolved active Issue の clean linked worktree にのみ command class を通す既存経路）をそのまま利用し、本 Issue で `worktree_scope_guard.py` 自体の分岐追加は不要だった（既存 230 テスト回帰確認済み）。

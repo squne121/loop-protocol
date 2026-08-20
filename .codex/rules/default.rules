@@ -476,7 +476,7 @@ prefix_rule(
 prefix_rule(
     pattern = ["git", "worktree", "remove"],
     decision = "prompt",
-    justification = "Exact `git worktree remove` is a cleanup command on the guarded cleanup route; worktree_scope_guard arbitrates it against the V3 one-shot contract. Not static-allowed.",
+    justification = "Exact `git worktree remove` is a cleanup command on the guarded cleanup route. `prompt` is the Codex approval boundary here, and the current project config does not call `worktree_scope_guard` from this route: the canonical Agent/Skill cleanup path is `cleanup_exec.py`, and `worktree_scope_guard` itself remains a behavioral/defense-in-depth contract in the repo but is not wired as a `.codex/hooks.json` PreToolUse / PermissionRequest handler. Not static-allowed.",
     match = ["git worktree remove .claude/worktrees/issue-1-x"],
 )
 
@@ -497,14 +497,14 @@ prefix_rule(
 prefix_rule(
     pattern = ["git", "branch", "-d"],
     decision = "prompt",
-    justification = "Exact `git branch -d` is a cleanup command on the guarded cleanup route; worktree_scope_guard arbitrates it against the V3 one-shot contract. Not static-allowed.",
+    justification = "Exact `git branch -d` is a cleanup command on the guarded cleanup route. `prompt` is the Codex approval boundary here, and the current project config does not call `worktree_scope_guard` from this route: the canonical Agent/Skill cleanup path is `cleanup_exec.py`, and `worktree_scope_guard` itself remains a behavioral/defense-in-depth contract in the repo but is not wired as a `.codex/hooks.json` PreToolUse / PermissionRequest handler. Not static-allowed.",
     match = ["git branch -d issue-1-x"],
 )
 
 prefix_rule(
     pattern = ["git", "branch", ["-D", "-f", "--force", "--delete", "-m", "-M"]],
     decision = "forbidden",
-    justification = "Force / rename branch operations are forbidden; the runtime hook also denies branch_force_delete_denied.",
+    justification = "Force / rename branch operations are forbidden by this static rule itself. `worktree_scope_guard`'s behavioral contract (branch_force_delete_denied) documents the same intent as an Agent/Skill-side convention, but under the current project config no `.codex/hooks.json` PreToolUse / PermissionRequest wiring actually invokes it -- this static rule is the enforcement layer.",
     match = ["git branch -D x", "git branch -f x", "git branch -m old new"],
 )
 
