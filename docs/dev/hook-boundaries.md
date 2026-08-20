@@ -238,6 +238,7 @@ hook_boundaries_manifest_v1:
     fail_policy: shadow_by_default
     script_exit_contract:
       normal: 0
+      invalid_mode_diagnostic: 1
       block_only_in_enforce_mode: 2
     claude_event_semantics:
       event: PreToolUse
@@ -258,11 +259,13 @@ hook_boundaries_manifest_v1:
     mode_values:
       unset_or_off_or_shadow: "exit 0（non-blocking。persistent file は生成しない。legacy `shadow` は `off` の compatibility alias）"
       enforce: "exit 2（enforce モード: 日本語比率不足でブロック）"
-      invalid: "exit 0（non-blocking diagnostic として off と同様に動作。persistent file なし）"
+      invalid: "exit 1（non-blocking diagnostic。stderr に invalid_guard_mode reason code + 不正値を出力。exit 2 のみが tool call を block するため exit 1 は block しない。persistent file なし）"
     notes: >
       default は off モード（exit 0）。unset / off / shadow(legacy alias) / enforce / invalid
       の 5 状態が mode contract（#2265）。GUARD_JAPANESE_PROSE_MODE=enforce 設定時のみ
-      exit 2 でブロックする。persistent shadow logging（`.guard_shadow_log.jsonl` への write）は
+      exit 2 でブロックする。不正値は #2265 PR #2267 BLOCKER1 fix_delta により
+      silent-allow（exit 0）から visible-but-non-blocking diagnostic（exit 1）へ変更された。
+      persistent shadow logging（`.guard_shadow_log.jsonl` への write）は
       #2265 により廃止済みで、いずれの mode でも write は発生しない。
       handler_id はスクリプトファイル名（guard-japanese-prose）と一致する。
 
@@ -529,7 +532,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `secret_boundary_guard.sh` | blocker | **操作を停止（block）** |
 | `local_main_branch_guard.sh` | blocker | **操作を停止（block）** |
 | `worktree_scope_guard.sh` | blocker | **操作を停止（block）** |
-| `guard-japanese-prose.sh` | mode_dependent | unset/off/shadow(legacy alias)/invalid モード: 継続（block なし、persistent log なし）/ enforce モード: **停止** |
+| `guard-japanese-prose.sh` | mode_dependent | unset/off/shadow(legacy alias) モード: 継続（block なし、persistent log なし）/ invalid モード: 継続（exit 1 non-blocking diagnostic、stderr に invalid_guard_mode）/ enforce モード: **停止** |
 | `rtk_boundary_shadow_guard.sh` | telemetry | 継続（log のみ） |
 | `ci_test_performance_advisory.sh` | warning / fail_open | 継続（advisory 出力のみ、block なし） |
 | `session_manifest_coordinator.sh`（Stop） | telemetry | 継続 |
@@ -585,10 +588,15 @@ mode contract は unset / off / shadow(legacy alias) / enforce / invalid の 5 �
 
 | `GUARD_JAPANESE_PROSE_MODE` | 動作 |
 |---|---|
-| 未設定 / `off` | exit 0（non-blocking。persistent file は生成しない） |
+| 未設定 / `off` | exit 0（non-blocking。entry point で即座に allow。persistent file は生成しない） |
 | `shadow`（legacy alias） | exit 0（`off` と同一挙動。persistent file は生成しない） |
 | `enforce` | exit 2（enforce モード: 日本語比率不足でブロック） |
-| 不正値 | exit 0（non-blocking diagnostic として `off` と同様に動作。persistent file なし） |
+| 不正値 | exit 1（non-blocking diagnostic。stderr に `invalid_guard_mode` reason code + 不正値を出力。PreToolUse hook contract 上 exit 1 は tool call を block しない。persistent file なし） |
+
+PreToolUse hook の exit code 契約は「exit 2 のみ tool call を block する」。exit 1 は
+non-blocking error として Claude Code に stderr が可視化されるのみで tool call は継続する。
+#2265 PR #2267 BLOCKER1 fix_delta により、不正 mode 値は silent-allow（exit 0）から
+visible-but-non-blocking diagnostic（exit 1）へ変更された。
 
 この分離により、CI や強制モードでのみ block が発動し、通常開発フローの妨げを最小化する。
 persistent telemetry backend は追加しない（#2265 の Out of Scope）。

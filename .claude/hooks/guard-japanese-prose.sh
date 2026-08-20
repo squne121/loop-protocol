@@ -3,10 +3,13 @@
 #
 # Claude Code PreToolUse hook: 日本語 prose 比率不足の GitHub 送信・下書きファイルをブロックする
 #
-# GUARD_JAPANESE_PROSE_MODE の動作（#2265: persistent shadow logging 廃止後）:
-#   未設定 / off / shadow: block せず exit 0（persistent file は生成しない）
+# GUARD_JAPANESE_PROSE_MODE の動作（#2265 BLOCKER1 fix_delta: invalid mode 診断化後）:
+#   未設定 / off / shadow: block せず exit 0（persistent file は生成しない、entry point で即座に allow）
 #   enforce:               従来どおり block する
-#   不正値:                 non-blocking diagnostic として off と同様に動作する（persistent file なし）
+#   不正値:                 exit 1 の non-blocking diagnostic（stderr に invalid_guard_mode
+#                           reason code + 不正値を出力）。PreToolUse hook contract 上、
+#                           exit 1 は tool call を block しない（block するのは exit 2 のみ）。
+#                           persistent file は一切生成しない。
 #
 # legacy `shadow` 設定値は `off` の compatibility alias。mode contract は
 # unset / off / shadow / enforce / invalid の 5 状態。
@@ -29,7 +32,8 @@
 #   - PATCH repos/{owner}/{repo}/pulls/{n} + body key: delta check (AC18)
 #
 # Exit codes:
-#   0 = allow (日本語比率 OK、またはガード対象外、または unset/off/shadow/invalid mode)
+#   0 = allow (日本語比率 OK、またはガード対象外、または unset/off/shadow mode)
+#   1 = non-blocking diagnostic (invalid mode。tool call は block しない)
 #   2 = block (日本語比率不足 — blocking error として Claude Code に通知 / enforce mode のみ)
 
 set -euo pipefail
@@ -41,44 +45,49 @@ VALIDATOR="${PROJECT_DIR}/.claude/skills/create-issue/scripts/validate_japanese_
 MATRIX="${PROJECT_DIR}/.claude/skills/create-issue/scripts/mutation_route_matrix.py"
 
 # ============================================================
-# GUARD_JAPANESE_PROSE_MODE の解決（#2265: persistent shadow logging 廃止後）
+# GUARD_JAPANESE_PROSE_MODE の解決（#2265 BLOCKER1 fix_delta: invalid mode 診断化）
 # mode contract: unset / off / shadow / enforce / invalid の5状態
 # 未設定 = off（default）。legacy `shadow` 設定値は `off` の compatibility alias。
-# enforce のみ block。不正値は non-blocking diagnostic として off と同様に動作する。
+# enforce のみ block。
+# invalid mode: entry point で即座に exit 1（non-blocking diagnostic。stderr に
+#   invalid_guard_mode reason code + 不正値を出力）。PreToolUse hook contract 上、
+#   exit 1 は tool call を block しない（block するのは exit 2 のみ）。
+#   計算（hash/route_id/clock 等）は一切行わない。
+# off/shadow(legacy alias) mode: 計算を一切行わず即座に exit 0（HIGH1: dead code 削減）。
 # persistent file（.guard_shadow_log.jsonl）へは一切 write しない（#2265）。
 # ============================================================
 _GUARD_MODE_RAW="${GUARD_JAPANESE_PROSE_MODE:-}"
-_GUARD_MODE_EFFECTIVE="off"   # default
-_GUARD_MODE_INVALID=false
 
-if [ -z "$_GUARD_MODE_RAW" ]; then
-    _GUARD_MODE_EFFECTIVE="off"
-elif [ "$_GUARD_MODE_RAW" = "off" ]; then
-    _GUARD_MODE_EFFECTIVE="off"
-elif [ "$_GUARD_MODE_RAW" = "shadow" ]; then
-    # legacy alias: off と同一挙動
-    _GUARD_MODE_EFFECTIVE="off"
-elif [ "$_GUARD_MODE_RAW" = "enforce" ]; then
-    _GUARD_MODE_EFFECTIVE="enforce"
-else
-    # 不正値: non-blocking diagnostic として off と同様に動作（persistent file なし）
-    _GUARD_MODE_EFFECTIVE="off"
-    _GUARD_MODE_INVALID=true
-fi
+case "$_GUARD_MODE_RAW" in
+    ""|off|shadow)
+        # 未設定 / off / shadow(legacy alias): block せず即座に exit 0。
+        # gh コマンド解析・prose 検証などの計算は一切行わない（HIGH1）。
+        exit 0
+        ;;
+    enforce)
+        _GUARD_MODE_EFFECTIVE="enforce"
+        ;;
+    *)
+        # 不正値: entry point で non-blocking diagnostic として即座に exit 1。
+        # stable な reason code (invalid_guard_mode) + 不正値を stderr に出力する。
+        # プロンプト本文・tool body・認証情報は一切含めない（不正値そのものと reason code のみ）。
+        # persistent file への write は行わない。
+        echo "GUARD: invalid_guard_mode value=${_GUARD_MODE_RAW}" >&2
+        exit 1
+        ;;
+esac
 
-# off/shadow(legacy alias)/invalid mode で would-block 判定を通過させる。
-# #2265 により persistent file への write は行わない（exit 0 の pass-through のみ）。
-# 引数は呼び出し互換のため維持するが、logging には使用しない。
+# ここに到達するのは enforce mode のみ（off/shadow/invalid は上で exit 済み）。
+
+# enforce mode でのみ到達する block ヘルパー。
+# off/shadow/invalid mode は entry point で既に exit 0 / exit 1 しているため、
+# ここに到達するのは enforce mode のみ（HIGH1: hash/route_id/clock 等の
+# dead computation を削除。persistent logging なし）。
+# 引数は呼び出し互換のため維持するが未使用。
 # $1: route_id  $2: body_source  $3: public_mutation  $4: reason_code
-# $5: failed_block_count  $6: duration_ms  $7: body_sha256  $8: body_bytes
-_shadow_allow() {
-    exit 0
-}
-
-# off/shadow(legacy alias)/invalid mode での allow pass（persistent logging なし）。
-# $1: route_id  $2: body_source  $3: public_mutation
-_shadow_pass() {
-    exit 0
+# $5: failed_block_count  $6: body_text
+_block_or_shadow() {
+    exit 2
 }
 
 # stdin から JSON を読む
@@ -100,40 +109,7 @@ fi
 # ============================================================
 # ヘルパー関数
 # ============================================================
-
-# off/shadow(legacy alias)/enforce モード判定で block または allow を返す
-# enforce mode: exit 2（従来どおり block）
-# off/shadow(legacy alias)/invalid mode: _shadow_allow 経由で exit 0（persistent logging なし）
-# $1: route_id  $2: body_source  $3: public_mutation（true|false）
-# $4: reason_code  $5: failed_block_count  $6: body_text（呼び出し互換のため維持、未使用）
-_block_or_shadow() {
-    local _bos_start_ms
-    _bos_start_ms="$(date +%s%3N 2>/dev/null || echo 0)"
-
-    local route_id="$1"
-    local body_source="$2"
-    local public_mutation="$3"
-    local reason_code="$4"
-    local failed_block_count="${5:-1}"
-    local body_text="${6:-}"
-
-    local body_sha256=""
-    local body_bytes=0
-    if [ -n "$body_text" ]; then
-        body_sha256="$(printf '%s' "$body_text" | sha256sum | awk '{print $1}')"
-        body_bytes="$(printf '%s' "$body_text" | wc -c | tr -d ' ')"
-    fi
-
-    if [ "$_GUARD_MODE_EFFECTIVE" = "enforce" ]; then
-        # enforce mode: 従来どおり exit 2 でブロック（stderr は呼び出し元が出力済み）
-        exit 2
-    else
-        # off/shadow(legacy alias)/invalid mode: persistent logging なしで exit 0
-        _shadow_allow "$route_id" "$body_source" "$public_mutation" \
-            "$reason_code" "$failed_block_count" "" "$body_sha256" "$body_bytes"
-        # _shadow_allow 内で exit 0 するので以下には到達しない
-    fi
-}
+# _block_or_shadow() は entry point の mode 解決部分で定義済み（enforce mode 専用、exit 2）。
 
 # 日本語比率を検証する
 # $1: チェック対象の本文テキスト

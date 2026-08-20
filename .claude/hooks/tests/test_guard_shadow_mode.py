@@ -9,7 +9,8 @@ AC2: GUARD_JAPANESE_PROSE_MODE=enforce のとき従来どおり英語 prose を 
 AC4: mode は環境変数で rollback 可能で、default 値が off（未設定 = off）
 AC6: GUARD_JAPANESE_PROSE_SHADOW_LOG で出力先を上書きしても write は発生しない
 AC7: mode semantics が固定される（未設定/off/shadow(legacy alias)/enforce/不正値の各挙動）
-AC8: invalid mode 設定時、tool 実行は allow され persistent file を生成しない
+AC8: invalid mode 設定時（#2265 BLOCKER1 fix_delta）、tool 実行は exit 1 の
+     non-blocking diagnostic として通知され（block しない）、persistent file を生成しない
 """
 
 import json
@@ -285,8 +286,14 @@ class TestModeSemantics:
         assert result.returncode == 2
         assert not os.path.exists(log_file)
 
-    def test_mode_semantics_invalid_value_acts_as_shadow(self, tmp_path):
-        """AC7/AC8: 不正値（例: 'dry-run'）は off 相当として動作し block しない。"""
+    def test_mode_semantics_invalid_value_is_nonblocking_diagnostic(self, tmp_path):
+        """AC7/AC8 (#2265 BLOCKER1 fix_delta): 不正値（例: 'dry-run'）は
+        exit 1 の non-blocking diagnostic として動作する。
+
+        PreToolUse hook contract 上、exit 1 は tool call を block しない
+        （block するのは exit 2 のみ）。silent allow (exit 0) から
+        visible-but-non-blocking diagnostic (exit 1) へ変更された。
+        """
         log_file = str(tmp_path / "shadow.jsonl")
         body_file = tmp_path / "body.md"
         body_file.write_text(
@@ -299,12 +306,24 @@ class TestModeSemantics:
             shadow_log_file=log_file,
             extra_env={"GUARD_JAPANESE_PROSE_MODE": "dry-run"},
         )
-        assert result.returncode == 0, (
-            f"invalid mode must act as off (non-blocking): exit={result.returncode}"
+        # (a) returncode == 1
+        assert result.returncode == 1, (
+            f"invalid mode must be a non-blocking diagnostic (exit 1), "
+            f"not silent-allow (exit 0) or block (exit 2): exit={result.returncode}"
+        )
+        # (b) exit 1 is distinguishable from the enforce-violation exit 2 path
+        assert result.returncode != 2, "invalid mode must not use the block exit code"
+        # (c) stderr contains the stable reason code string
+        assert "invalid_guard_mode" in result.stderr, (
+            f"stderr must contain stable reason code 'invalid_guard_mode': "
+            f"{result.stderr!r}"
+        )
+        assert "dry-run" in result.stderr, (
+            f"stderr must surface the offending mode value: {result.stderr!r}"
         )
 
     def test_mode_semantics_invalid_value_does_not_create_persistent_file(self, tmp_path):
-        """AC7/AC8: 不正値のとき persistent file は生成されない。"""
+        """AC7/AC8: 不正値のとき persistent file は生成されない（exit 1 でも変わらず）。"""
         log_file = str(tmp_path / "shadow.jsonl")
         body_file = tmp_path / "body.md"
         body_file.write_text(
@@ -312,12 +331,15 @@ class TestModeSemantics:
             encoding="utf-8",
         )
         command = f"gh issue create --body-file {body_file}"
-        run_hook(
+        result = run_hook(
             "Bash", command,
             shadow_log_file=log_file,
             extra_env={"GUARD_JAPANESE_PROSE_MODE": "invalid_value_xyz"},
         )
 
+        # (d) no persistent file created as a side effect of this path
         assert not os.path.exists(log_file), (
             f"invalid mode で persistent file が生成されている: {log_file}"
         )
+        assert result.returncode == 1
+        assert "invalid_guard_mode" in result.stderr

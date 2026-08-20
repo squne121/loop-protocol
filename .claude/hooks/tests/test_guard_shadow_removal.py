@@ -8,7 +8,8 @@ AC6: GUARD_JAPANESE_PROSE_SHADOW_LOG 環境変数で出力先を上書きした�
      一切 write が発生しない
 AC7: stale な .guard_shadow_log.jsonl を事前配置した状態で hook を実行しても、
      そのファイルの内容/ハッシュが変化しない（=書き込まれない）
-AC8: invalid mode 設定時、tool 実行は allow され（non-blocking diagnostic）、
+AC8: invalid mode 設定時（#2265 BLOCKER1 fix_delta）、tool 実行は exit 1 の
+     non-blocking diagnostic として通知され（block しない）、
      かつ persistent file を生成しない
 """
 
@@ -210,7 +211,9 @@ class TestStaleShadowLogUnchanged:
 
 class TestInvalidMode:
     def test_invalid_mode(self, tmp_path):
-        """AC8: invalid mode 設定時、tool 実行は allow され persistent file を生成しない。"""
+        """AC8 (#2265 BLOCKER1 fix_delta): invalid mode 設定時、tool 実行は
+        exit 1 の non-blocking diagnostic として通知され（block せず）
+        persistent file を生成しない。"""
         log_file = str(tmp_path / "shadow.jsonl")
         body_file = tmp_path / "body.md"
         body_file.write_text(
@@ -224,15 +227,19 @@ class TestInvalidMode:
             shadow_log_file=log_file,
             extra_env={"GUARD_JAPANESE_PROSE_MODE": "not_a_real_mode"},
         )
-        assert result.returncode == 0, (
-            f"invalid mode must allow (non-blocking diagnostic): exit={result.returncode}"
+        assert result.returncode == 1, (
+            f"invalid mode must be a non-blocking diagnostic (exit 1), "
+            f"not exit 0 silent-allow: exit={result.returncode}"
         )
+        assert result.returncode != 2, "invalid mode must not block (exit 2)"
+        assert "invalid_guard_mode" in result.stderr
         assert not os.path.exists(log_file), (
             "invalid mode で persistent file が生成されている"
         )
 
-    def test_invalid_mode_japanese_body_also_allowed(self, tmp_path):
-        """invalid mode: 日本語 body も allow される（enforce ではない）。"""
+    def test_invalid_mode_japanese_body_also_diagnostic(self, tmp_path):
+        """invalid mode: 日本語 body でも同じく exit 1 diagnostic
+        （enforce の日本語比率検証には到達しない。mode 判定は body 内容より前）。"""
         log_file = str(tmp_path / "shadow.jsonl")
         body_file = tmp_path / "body.md"
         body_file.write_text(
@@ -246,5 +253,6 @@ class TestInvalidMode:
             shadow_log_file=log_file,
             extra_env={"GUARD_JAPANESE_PROSE_MODE": "not_a_real_mode"},
         )
-        assert result.returncode == 0
+        assert result.returncode == 1
+        assert "invalid_guard_mode" in result.stderr
         assert not os.path.exists(log_file)

@@ -7,6 +7,17 @@ logging（.guard_shadow_log.jsonl への write）は廃止されたため、shad
 各シナリオで production/override 先いずれの JSONL も生成されないことを
 test -f 相当の existence assertion（`os.path.exists`）で検証する（AC4）。
 
+#2265 PR #2267 BLOCKER2 fix_delta: production 側 persistent JSONL logging
+廃止に伴い R1〜R7 の rich structured evidence（route_id, body_source,
+public_mutation, decision_would_be, failed_block_count, schema_version 等）
+のアサーションが失われていた。この fix_delta では production への
+persistent 書き込みを一切再導入せず、TEST-HARNESS-ONLY の構造化 JSON
+artifact（`build_replay_artifact()` / `assert_replay_artifact()`）を
+in-memory で構築して各シナリオの scenario_id / mode_configured /
+mode_effective / public_mutation / expected_decision / expected_exit /
+actual_exit を per-field assertion する。repo-tracked production path
+への書き込みは行わない（pytest プロセス内の in-memory dict のみ）。
+
 AC5, AC10, AC12 対応。
 """
 
@@ -21,6 +32,84 @@ import pytest
 HOOK_SCRIPT = Path(__file__).parent.parent / "guard-japanese-prose.sh"
 SHADOW_LOG_PY = Path(__file__).parent.parent / "shadow_log.py"
 PROJECT_DIR = Path(__file__).parent.parent.parent.parent
+
+# test-harness-only artifact schema version。production 側の旧 persistent
+# JSONL schema_version="1"（#2265 で廃止済み）とは別体系であることを明示する。
+REPLAY_ARTIFACT_SCHEMA_VERSION = "test-harness/1"
+
+
+def _git_head_sha() -> str | None:
+    """テスト実行時の HEAD SHA を読み取る（取得できない場合は None を許容）。"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_DIR,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    head = result.stdout.strip()
+    return head or None
+
+
+def build_replay_artifact(
+    *,
+    scenario_id: str,
+    mode_configured: str,
+    mode_effective: str,
+    public_mutation: bool,
+    expected_decision: str,
+    expected_exit: int,
+    proc: subprocess.CompletedProcess,
+) -> dict:
+    """R1〜R7 replay scenario 用の test-harness-only 構造化 JSON artifact を構築する。
+
+    #2265 で production 側 persistent JSONL logging（.guard_shadow_log.jsonl）
+    は廃止済みのため、この artifact は pytest プロセス内の in-memory dict と
+    してのみ構築し、repo-tracked production path には一切書き込まない。
+    """
+    return {
+        "artifact_schema_version": REPLAY_ARTIFACT_SCHEMA_VERSION,
+        "scenario_id": scenario_id,
+        "mode_configured": mode_configured,
+        "mode_effective": mode_effective,
+        "public_mutation": public_mutation,
+        "expected_decision": expected_decision,
+        "expected_exit": expected_exit,
+        "actual_exit": proc.returncode,
+        "head_sha": _git_head_sha(),
+    }
+
+
+def assert_replay_artifact(record: dict) -> None:
+    """構造化 artifact の per-field assertion（bare exit_code check ではない）。"""
+    for key in (
+        "artifact_schema_version",
+        "scenario_id",
+        "mode_configured",
+        "mode_effective",
+        "expected_decision",
+    ):
+        assert record.get(key), f"{key} が欠落/空: {record}"
+    assert isinstance(record.get("public_mutation"), bool), (
+        f"public_mutation は bool であるべき: {record}"
+    )
+    assert record["actual_exit"] == record["expected_exit"], (
+        f"{record['scenario_id']}: expected_exit={record['expected_exit']} "
+        f"actual_exit={record['actual_exit']} "
+        f"(mode_configured={record['mode_configured']}, "
+        f"expected_decision={record['expected_decision']})"
+    )
+    if record["expected_decision"] == "deny":
+        assert record["expected_exit"] == 2, record
+    elif record["expected_decision"] in ("allow", "would_deny"):
+        assert record["expected_exit"] == 0, record
+    else:
+        raise AssertionError(f"unknown expected_decision: {record}")
 
 # テスト用の fake gh スクリプトディレクトリ（後で tmp_path に作成）
 FAKE_GH_SCRIPT = """#!/usr/bin/env bash
@@ -222,6 +311,17 @@ class TestR1IssueCreateJapanese:
             f"R1: persistent shadow log must not be created: {log_file}"
         )
 
+        # BLOCKER2: test-harness-only structured artifact による per-field assertion。
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R1_issue_create_japanese_shadow",
+            mode_configured="shadow",
+            mode_effective="off",
+            public_mutation=True,
+            expected_decision="allow",
+            expected_exit=0,
+            proc=result,
+        ))
+
     def test_R1_issue_create_japanese_body_enforce(self, tmp_path):
         """R1: 日本語 body は enforce mode でも allow（exit 0）。"""
         log_file = str(tmp_path / "shadow.jsonl")
@@ -240,6 +340,16 @@ class TestR1IssueCreateJapanese:
             fake_gh_bin_dir=fake_gh_dir,
         )
         assert result.returncode == 0, f"R1 enforce: Japanese body must exit 0, got {result.returncode}"
+
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R1_issue_create_japanese_enforce",
+            mode_configured="enforce",
+            mode_effective="enforce",
+            public_mutation=True,
+            expected_decision="allow",
+            expected_exit=0,
+            proc=result,
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +394,16 @@ class TestR2IssueEditMachineReadableHeading:
             f"got {result.returncode}\nstderr: {result.stderr}"
         )
 
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R2_issue_edit_machine_readable_heading_shadow",
+            mode_configured="shadow",
+            mode_effective="off",
+            public_mutation=True,
+            expected_decision="allow",
+            expected_exit=0,
+            proc=result,
+        ))
+
 
 # ---------------------------------------------------------------------------
 # R3: gh issue comment 英語 prose
@@ -320,6 +440,16 @@ class TestR3IssueCommentEnglishProse:
             f"R3: persistent shadow log must not be created: {log_file}"
         )
 
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R3_issue_comment_english_prose_shadow",
+            mode_configured="shadow",
+            mode_effective="off",
+            public_mutation=True,
+            expected_decision="would_deny",
+            expected_exit=0,
+            proc=result,
+        ))
+
     def test_R3_enforce_deny(self, tmp_path):
         """R3 enforce: 英語 prose は exit 2 でブロック。"""
         log_file = str(tmp_path / "shadow.jsonl")
@@ -340,6 +470,16 @@ class TestR3IssueCommentEnglishProse:
         assert result.returncode == 2, (
             f"R3 enforce: must exit 2, got {result.returncode}"
         )
+
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R3_issue_comment_english_prose_enforce",
+            mode_configured="enforce",
+            mode_effective="enforce",
+            public_mutation=True,
+            expected_decision="deny",
+            expected_exit=2,
+            proc=result,
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +530,16 @@ class TestR4TerminationReportDryRun:
             f"R4: Write tool must exit 0 (non-public): exit={result.returncode}"
         )
 
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R4_write_tool_shadow",
+            mode_configured="shadow",
+            mode_effective="off",
+            public_mutation=False,
+            expected_decision="allow",
+            expected_exit=0,
+            proc=result,
+        ))
+
     def test_R4_edit_tool_allows(self, tmp_path):
         """R4: Edit ツールも non-public → exit 0。"""
         log_file = str(tmp_path / "shadow.jsonl")
@@ -416,6 +566,16 @@ class TestR4TerminationReportDryRun:
         assert result.returncode == 0, (
             f"R4: Edit tool must exit 0 (non-public): exit={result.returncode}"
         )
+
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R4_edit_tool_enforce",
+            mode_configured="enforce",
+            mode_effective="enforce",
+            public_mutation=False,
+            expected_decision="allow",
+            expected_exit=0,
+            proc=result,
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +612,16 @@ class TestR5TmpDraftWriteEdit:
             f"R5: Write tool must exit 0 (non-public): exit={result.returncode}"
         )
 
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R5_write_tool_enforce",
+            mode_configured="enforce",
+            mode_effective="enforce",
+            public_mutation=False,
+            expected_decision="allow",
+            expected_exit=0,
+            proc=result,
+        ))
+
     def test_R5_multiedit_tool_non_public_allow(self, tmp_path):
         """R5: MultiEdit ツールも non-public → exit 0。"""
         log_file = str(tmp_path / "shadow.jsonl")
@@ -474,6 +644,16 @@ class TestR5TmpDraftWriteEdit:
         assert result.returncode == 0, (
             f"R5: MultiEdit tool must exit 0 (non-public): exit={result.returncode}"
         )
+
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R5_multiedit_tool_enforce",
+            mode_configured="enforce",
+            mode_effective="enforce",
+            public_mutation=False,
+            expected_decision="allow",
+            expected_exit=0,
+            proc=result,
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +687,16 @@ class TestR6RestCommentRouteClassification:
             f"R6: persistent shadow log must not be created: {log_file}"
         )
 
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R6_rest_field_body_shadow",
+            mode_configured="shadow",
+            mode_effective="off",
+            public_mutation=True,
+            expected_decision="would_deny",
+            expected_exit=0,
+            proc=result,
+        ))
+
     def test_R6_enforce_gh_api_field_body_deny(self, tmp_path):
         """R6 enforce: gh api -X POST -f body= 英語 body は exit 2。"""
         log_file = str(tmp_path / "shadow.jsonl")
@@ -527,6 +717,16 @@ class TestR6RestCommentRouteClassification:
         assert result.returncode == 2, (
             f"R6 enforce: must exit 2, got {result.returncode}\nstderr: {result.stderr}"
         )
+
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R6_rest_field_body_enforce",
+            mode_configured="enforce",
+            mode_effective="enforce",
+            public_mutation=True,
+            expected_decision="deny",
+            expected_exit=2,
+            proc=result,
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +761,16 @@ class TestR7GraphQLConservativeDeny:
             f"R7: persistent shadow log must not be created: {log_file}"
         )
 
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R7_graphql_mutation_shadow",
+            mode_configured="shadow",
+            mode_effective="off",
+            public_mutation=True,
+            expected_decision="would_deny",
+            expected_exit=0,
+            proc=result,
+        ))
+
     def test_R7_enforce_graphql_mutation_deny(self, tmp_path):
         """R7 enforce: GraphQL mutation は exit 2（conservative deny）。"""
         log_file = str(tmp_path / "shadow.jsonl")
@@ -579,6 +789,16 @@ class TestR7GraphQLConservativeDeny:
         assert result.returncode == 2, (
             f"R7 enforce: must exit 2 (conservative deny), got {result.returncode}"
         )
+
+        assert_replay_artifact(build_replay_artifact(
+            scenario_id="R7_graphql_mutation_enforce",
+            mode_configured="enforce",
+            mode_effective="enforce",
+            public_mutation=True,
+            expected_decision="deny",
+            expected_exit=2,
+            proc=result,
+        ))
 
     def test_R7_no_graphql_parser_implementation(self):
         """AC12: guard-japanese-prose.sh に GraphQL parser 実装がない。
