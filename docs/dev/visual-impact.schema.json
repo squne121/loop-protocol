@@ -112,7 +112,9 @@
         "component_vrt_report_check_run_id",
         "github_actions_app_identity",
         "artifact_id",
-        "artifact_digest"
+        "artifact_digest",
+        "workflow_run_id",
+        "run_attempt"
       ],
       "properties": {
         "schema": { "const": "VISUAL_IMPACT_DECISION_V1" },
@@ -145,7 +147,17 @@
         "component_vrt_report_check_run_id": { "type": ["string", "null"] },
         "github_actions_app_identity": { "type": "string", "minLength": 1 },
         "artifact_id": { "type": ["string", "null"] },
-        "artifact_digest": { "type": ["string", "null"] }
+        "artifact_digest": { "type": ["string", "null"] },
+        "workflow_run_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Issue #2230 AC2: the producer job's own ${{ github.run_id }} -- binds this decision artifact's CONTENT to the exact triggering workflow run, independent of the attempt-specific artifact NAME."
+        },
+        "run_attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Issue #2230 AC2: the producer job's own ${{ github.run_attempt }} -- rerun-safe freshness/consistency binding so a stale attempt's artifact content can never be silently adopted by a later attempt's trusted consumer."
+        }
       }
     }
   },

@@ -118,7 +118,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           REPO: ${{ github.repository }}
+          # Issue #2230 fix_delta P2-1 (best-effort): the triggering
+          # workflow_run's OWN head_sha -- this is what the acquired
+          # artifact's nested `workflow_run.head_sha` should equal (this is
+          # a same-run consistency check, distinct from the separate
+          # RUN_HEAD_SHA-vs-LIVE_HEAD_SHA staleness check the publish step
+          # below already performs).
+          EXPECTED_ARTIFACT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           # PR #2229 review fix_delta P2: pin the REST API version/media
@@ -126,16 +134,52 @@ jobs:
           gh_api() { gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
           ARTIFACT_ROOT="$(mktemp -d "${RUNNER_TEMP}/visual-impact-trusted-${RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
           mkdir -p "${ARTIFACT_ROOT}/decision" "${ARTIFACT_ROOT}/evidence"
-          gh_api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" > "${ARTIFACT_ROOT}/run_artifacts.json"
-          DECISION_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="visual-impact-decision-v1")][0].id // empty' "${ARTIFACT_ROOT}/run_artifacts.json")"
-          EVIDENCE_ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name=="component-vrt-evidence-manifest")][0].id // empty' "${ARTIFACT_ROOT}/run_artifacts.json")"
-          if [ -n "${DECISION_ARTIFACT_ID}" ]; then
+          # Issue #2230 AC3/AC4/AC5: replaces the former inline
+          # `gh api .../artifacts?per_page=100 | jq
+          # '[.artifacts[] | select(.name=="...")][0]'` pattern (no
+          # pagination-completion check, no cardinality check, no `expired`
+          # check -- silently adopted the FIRST same-named artifact
+          # regardless of which run attempt produced it) with
+          # `acquire_trusted_artifact()` -- an executable, adversarially
+          # tested Python function (scripts/agent-ops/tests/
+          # test_resolve_visual_impact_artifact_attempt_binding.py) that
+          # queries the `name=` filter, paginates fully via `per_page=100`,
+          # fails closed on `total_count` mismatch/incomplete pagination,
+          # and requires cardinality exactly one for the expected
+          # attempt-specific name.
+          DECISION_ARTIFACT_NAME="visual-impact-decision-v1-${RUN_ATTEMPT}"
+          EVIDENCE_ARTIFACT_NAME="component-vrt-evidence-manifest-${RUN_ATTEMPT}"
+          set +e
+          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+            --mode acquire-trusted-artifact \
+            --repository "${REPO}" \
+            --run-id "${RUN_ID}" \
+            --expected-artifact-name "${DECISION_ARTIFACT_NAME}" \
+            --expected-artifact-head-sha "${EXPECTED_ARTIFACT_HEAD_SHA}" \
+            --artifact-id-output-file "${ARTIFACT_ROOT}/decision_artifact_id.txt"
+          DECISION_ACQUIRE_STATUS=$?
+          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
+            --mode acquire-trusted-artifact \
+            --repository "${REPO}" \
+            --run-id "${RUN_ID}" \
+            --expected-artifact-name "${EVIDENCE_ARTIFACT_NAME}" \
+            --expected-artifact-head-sha "${EXPECTED_ARTIFACT_HEAD_SHA}" \
+            --artifact-id-output-file "${ARTIFACT_ROOT}/evidence_artifact_id.txt"
+          EVIDENCE_ACQUIRE_STATUS=$?
+          set -e
+          if [ "${DECISION_ACQUIRE_STATUS}" -eq 0 ] && [ -s "${ARTIFACT_ROOT}/decision_artifact_id.txt" ]; then
+            DECISION_ARTIFACT_ID="$(cat "${ARTIFACT_ROOT}/decision_artifact_id.txt")"
             gh_api "repos/${REPO}/actions/artifacts/${DECISION_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/decision.zip"
             unzip -o -q "${ARTIFACT_ROOT}/decision.zip" -d "${ARTIFACT_ROOT}/decision"
+          else
+            echo "::warning::trusted decision artifact '${DECISION_ARTIFACT_NAME}' could not be acquired (fail-closed; exit=${DECISION_ACQUIRE_STATUS})"
           fi
-          if [ -n "${EVIDENCE_ARTIFACT_ID}" ]; then
+          if [ "${EVIDENCE_ACQUIRE_STATUS}" -eq 0 ] && [ -s "${ARTIFACT_ROOT}/evidence_artifact_id.txt" ]; then
+            EVIDENCE_ARTIFACT_ID="$(cat "${ARTIFACT_ROOT}/evidence_artifact_id.txt")"
             gh_api "repos/${REPO}/actions/artifacts/${EVIDENCE_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/evidence.zip"
             unzip -o -q "${ARTIFACT_ROOT}/evidence.zip" -d "${ARTIFACT_ROOT}/evidence"
+          else
+            echo "::warning::trusted evidence-manifest artifact '${EVIDENCE_ARTIFACT_NAME}' could not be acquired (fail-closed; exit=${EVIDENCE_ACQUIRE_STATUS})"
           fi
           echo "artifact_root=${ARTIFACT_ROOT}" >> "$GITHUB_OUTPUT"
 

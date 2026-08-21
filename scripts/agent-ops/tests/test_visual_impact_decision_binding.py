@@ -58,6 +58,8 @@ def _sample_decision() -> dict:
         github_actions_app_identity="github-actions[bot]",
         artifact_id="987",
         artifact_digest="sha256:" + "e" * 64,
+        workflow_run_id=555,
+        run_attempt=1,
     )
 
 
@@ -211,6 +213,8 @@ def test_pr2045_evaluate_pr_policy_evidence_payload_validates_against_schema(dec
         github_actions_app_identity="github-actions[bot]",
         artifact_id="987",
         artifact_digest="sha256:" + "e" * 64,
+        workflow_run_id=555,
+        run_attempt=1,
     )
     jsonschema.validate(decision, decision_schema)
     evidence = decision["affected_surfaces"][0]["evidence"]
