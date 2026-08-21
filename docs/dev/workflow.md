@@ -400,7 +400,7 @@ fresh isolated session から実証しなければならない**（Availability 
   「Runtime Verification Applicability」を正本とする。
 - fallback 経由の成功（例: `HOME` override での代替成功）を canonical positive workflow の実証として扱ってはならない。
 
-### 防御対象（Controlled、Issue #2276 の決定記録で明示化）
+### Controlled（防御対象、Issue #2276 の決定記録で明示化）
 
 `scripts/agent-guards/skill_runtime_exec.py` の trusted `uv` resolver（`_resolve_trusted_executable` /
 `_safe_path_entries`）が防ぐことを主張する対象は以下に限定される（Issue #2276 / #2280）:
