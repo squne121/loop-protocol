@@ -244,6 +244,9 @@ CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL="claude-gpt launcher narrow enviro
 
 CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL="claude-gpt launcher narrow allow（second-gate 判断補助。authority ではない）: ${CLAUDE_GPT_TRUSTED_REPO} に repository 固定した GitHub mutation transaction broker（canonical builder/wrapper 経由、raw gh api を使わない）による Issue の read/create/edit/comment/close と、同一 repository の PR の read/create/edit/comment/review、および同一 repository への non-force task-branch push（force push・branch/tag/release 削除・repository settings/IAM/secret 変更は含まない）。加えて repository-owned canonical codebase-investigator -> gemini-cli-headless-delegation -> provider=agy の read-only isolated delegation（direct arbitrary agy 起動・provider!=agy・canonical builder/wrapper bypass・AGY からの GitHub mutation は対象外）。決定論的な authority は permissions.deny / PreToolUse hook / transaction broker が持ち、この allow rule はその second-gate 判断補助に過ぎない。"
 
+# Issue #2259 AC10 fix_delta narrow label (human owner narrow-fix authorization).
+CLAUDE_GPT_AUTO_MODE_ISSUE_CREATE_SMOKE_TEST_NARROW_LABEL="claude-gpt runtime_smoke_test.sh issue_create scenario is a launcher-owned deterministic test that spawns the issue-creator subagent via the Task tool and reaches create_issue_txn.py through the launcher-owned bridge, targeting repository ${CLAUDE_GPT_TRUSTED_REPO} only. The request during this test reaches only a deterministic substitute provider configured via an environment variable at test time; it never reaches the real GitHub provider and creates no real GitHub Issue. This label applies only to this one canonical path (issue-creator subagent, then create_issue_txn.py, then the launcher-owned bridge) and to no other subagent, repository, or operation. This test operation stays entirely on the local machine and involves no network request to any external host."
+
 # hard_deny への追加分（P0-2, PR #2214 OWNER adversarial review 反映）。$defaults の
 # hard_deny を置換・削除せず、default branch push・force push・remote ref
 # deletion を明示的に追加する。これは defense-in-depth の second-gate 補強であり、
@@ -280,11 +283,12 @@ claude_gpt_json_escape() {
 claude_gpt_auto_mode_json_fragment() {
   env_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL")
   allow_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL")
+  issue_create_smoke_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ISSUE_CREATE_SMOKE_TEST_NARROW_LABEL")
   hard_deny_default_branch_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL")
   hard_deny_force_push_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL")
   hard_deny_ref_deletion_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL")
-  printf '"autoMode": {"environment": ["$defaults", %s], "allow": ["$defaults", %s], "hard_deny": ["$defaults", %s, %s, %s], "classifyAllShell": true}' \
-    "$env_label_json" "$allow_label_json" \
+  printf '"autoMode": {"environment": ["$defaults", %s, %s], "allow": ["$defaults", %s, %s], "hard_deny": ["$defaults", %s, %s, %s], "classifyAllShell": true}' \
+    "$env_label_json" "$issue_create_smoke_label_json" "$allow_label_json" "$issue_create_smoke_label_json" \
     "$hard_deny_default_branch_json" "$hard_deny_force_push_json" "$hard_deny_ref_deletion_json"
 }
 

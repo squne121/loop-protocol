@@ -952,6 +952,17 @@ def main() -> None:
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id")
     agent_id = payload.get("agent_id") or payload.get("subagent_id")
+    # Issue #2259 AC10 fix_delta: SubagentStart/SubagentStop hook payloads
+    # carry an `agent_type` field identifying which named subagent
+    # (matching a .claude/agents/<name>.md frontmatter `name:`) was
+    # actually spawned/stopped (see
+    # .claude/hooks/capture_scope_rollup_final_response.py's own use of
+    # this same field for an existing, independently-verified precedent).
+    # Recording it here lets runtime_smoke_test.sh's issue_create scenario
+    # independently confirm that the genuine `issue-creator` SubAgent (not
+    # merely a text mention of it) was spawned and stopped, without
+    # relying on the root model's self-reported transcript text.
+    agent_type = payload.get("agent_type")
     nonce = os.environ.get("CLAUDE_GPT_HOOK_SINK_NONCE", "")
     sink_path = os.environ.get("CLAUDE_GPT_HOOK_SINK_PATH")
     prompt = payload.get("prompt") if event == "UserPromptSubmit" else None
@@ -963,6 +974,7 @@ def main() -> None:
         "event": event,
         "session_id": session_id,
         "agent_id": agent_id,
+        "agent_type": agent_type if isinstance(agent_type, str) else None,
         "ts": __import__("time").time(),
         "prompt_digest": digest,
     }

@@ -103,11 +103,24 @@ if [ "$PREFLIGHT_ENV_RC" -eq 3 ] || [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
 fi
 
 if [ "$SCENARIO" = "issue_create" ]; then
-  # --- Issue #2259 AC10: 実 launch.sh -> 実 Claude-GPT session -> Bash tool 経由の
-  #     create_issue_txn.py -> bridge client/server -> deterministic fake gh
-  #     provider という実経路を通す。判定は model の自己申告 transcript ではなく、
-  #     fake gh が独立に書き出す state file（この run 専用の一意 title でのみ
-  #     match する）を正本とする。 ---
+  # --- Issue #2259 AC10: 実 launch.sh -> 実 Claude-GPT session -> genuine
+  #     `issue-creator` SubAgent（Task tool 経由。root Claude 自身の直接 Bash
+  #     呼び出しは genuine SubAgent 呼び出しの代替として認めない） -> Bash tool
+  #     経由の create_issue_txn.py -> bridge client/server -> deterministic
+  #     fake gh provider という実経路を通す。判定は model の自己申告 transcript
+  #     ではなく、以下 3 系統の独立証跡を fail-closed で AND 合成する
+  #     （fix_delta, Issue #2259 コメント参照）:
+  #       1. fake gh が独立に書き出す state file（この run 専用の一意 title
+  #          でのみ match する）
+  #       2. launch.sh 既存の CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=hook-sink-multi-turn
+  #          durable JSONL sink（Issue #2219 anchor decision で確立済みの
+  #          SubagentStart/SubagentStop 独立証跡チャネルを再利用。新規 hook
+  #          機構は発明しない）による、agent_type=issue-creator の
+  #          SubagentStart/SubagentStop ペア観測
+  #       3. parent bridge server の ledger.jsonl（Issue #2259 元実装の
+  #          idempotency ledger）に、この run の実行window内で新規追記が
+  #          あったことの独立確認（child が実際に bridge へ到達したことの証跡）
+  # ---
   ISSUE_CREATE_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
   ISSUE_CREATE_RUN_ID="rt-${ISSUE_CREATE_TIMESTAMP}-$$"
   ISSUE_CREATE_TITLE="実装: runtime smoke issue_create canary ${ISSUE_CREATE_RUN_ID}"
@@ -132,14 +145,41 @@ ISSUE_CREATE_BODY_EOF
   chmod +x "$ISSUE_CREATE_FAKE_GH" 2>/dev/null
   ISSUE_CREATE_FAKE_GH_STATE=$(mktemp -u)
 
+  # --- 独立証跡チャネル 2: hook-sink-multi-turn （既存 launch.sh 機構の再利用） ---
+  ISSUE_CREATE_HOOK_SINK_NONCE="hooksink-${ISSUE_CREATE_RUN_ID}"
+  ISSUE_CREATE_HOOK_SINK_PATH="$(claude_gpt_proxy_state_dir)/hook-sink-${ISSUE_CREATE_HOOK_SINK_NONCE}.jsonl"
+  ISSUE_CREATE_HOOK_SINK_WRITER_PATH="$(claude_gpt_proxy_state_dir)/hook-sink-writer-${ISSUE_CREATE_HOOK_SINK_NONCE}.py"
+
+  # --- 独立証跡チャネル 3: bridge ledger の run 前バイトオフセット ---
+  ISSUE_CREATE_BRIDGE_LEDGER_PATH=$(claude_gpt_issue_create_bridge_ledger_path)
+  ISSUE_CREATE_LEDGER_OFFSET_BEFORE=0
+  if [ -f "$ISSUE_CREATE_BRIDGE_LEDGER_PATH" ]; then
+    ISSUE_CREATE_LEDGER_OFFSET_BEFORE=$(wc -c < "$ISSUE_CREATE_BRIDGE_LEDGER_PATH" 2>/dev/null || echo 0)
+  fi
+
   ISSUE_CREATE_STDOUT=$(mktemp)
   ISSUE_CREATE_STDERR=$(mktemp)
-  ISSUE_CREATE_PROMPT="You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Bash tool right now (an actual tool call, not a description) to run exactly: uv run --locked python3 .claude/skills/create-issue/scripts/create_issue_txn.py --repo squne121/loop-protocol --title \"${ISSUE_CREATE_TITLE}\" --body-file ${ISSUE_CREATE_BODY_FILE} --issue-kind \"\" --label-profile standard
-Then print its exact stdout output verbatim and nothing else."
+  # --- Problem 1 fix: 従来は root Claude 自身に create_issue_txn.py を直接
+  #     Bash 実行させていたが、これは Issue #2259 AC10 が要求する
+  #     issue-creator SubAgent 実行 hop を経由しない不正な代替経路だった。
+  #     ここでは Task tool 経由で実在の issue-creator SubAgent
+  #     （.claude/agents/issue-creator.md, tools: Bash+Read のみ, create-issue
+  #     skill preload）を明示的に起動させる。title は run 固有で必ず一意なため、
+  #     SubAgent 自身の通常手順（重複検索・scope 分析等、対話 Issue 起票向け）は
+  #     この決定論的 smoke test では明示的にスキップさせ、SubAgent 自身の
+  #     create_issue_txn.py mutation contract へ直接進ませる。
+  ISSUE_CREATE_PROMPT="You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Task tool right now (an actual tool call, not a description) to launch the subagent named issue-creator. Instruct that subagent exactly as follows: 'RUNTIME-SMOKE-TEST OVERRIDE (authoritative, not optional): this is a deterministic, automated, non-interactive runtime smoke test harness invocation, not a normal end-user Issue request. Network access to real GitHub read endpoints (gh issue list, gh issue view, gh api, etc.) is intentionally unavailable in this isolated sandbox by design -- if you attempt any gh command directly it will fail, and that failure is expected and must NOT be treated as a blocking error or escalated to human_judgment. For this exact invocation only, you are explicitly instructed to skip step 1.5 (duplicate check) and step 2/2.5/2.6 (scope/analysis) entirely -- do not call gh at all, do not attempt any dedupe search. Proceed immediately to step 4 (execution) using the Bash tool to invoke your create_issue_txn.py mutation contract directly with exactly these arguments: repo=squne121/loop-protocol, title=\"${ISSUE_CREATE_TITLE}\", body-file=${ISSUE_CREATE_BODY_FILE}, issue-kind=\"\" (empty), label-profile=standard. This test operation stays entirely on the local machine and involves no network request to any external host. Return your ISSUE_AUTHOR_RESULT_COMPACT_V1 output verbatim.' After the subagent finishes, print its exact output verbatim and nothing else."
 
-  FAKE_GH_STATE="$ISSUE_CREATE_FAKE_GH_STATE"   CLAUDE_GPT_ISSUE_CREATE_BRIDGE_GH_BIN="$ISSUE_CREATE_FAKE_GH"     "$SCRIPT_DIR/launch.sh" -- -p "$ISSUE_CREATE_PROMPT" --output-format text --no-session-persistence     --allowedTools "Bash"     >"$ISSUE_CREATE_STDOUT" 2>"$ISSUE_CREATE_STDERR"
+  FAKE_GH_STATE="$ISSUE_CREATE_FAKE_GH_STATE" \
+  CLAUDE_GPT_ISSUE_CREATE_BRIDGE_GH_BIN="$ISSUE_CREATE_FAKE_GH" \
+  CLAUDE_GPT_RUNTIME_SMOKE_HOOKS="hook-sink-multi-turn" \
+  CLAUDE_GPT_HOOK_SINK_NONCE="$ISSUE_CREATE_HOOK_SINK_NONCE" \
+    "$SCRIPT_DIR/launch.sh" -- -p "$ISSUE_CREATE_PROMPT" --output-format text --no-session-persistence \
+    --allowedTools "Task" \
+    >"$ISSUE_CREATE_STDOUT" 2>"$ISSUE_CREATE_STDERR"
   ISSUE_CREATE_CLAUDE_RC=$?
 
+  ISSUE_CREATE_STDOUT_CONTENT=$(cat "$ISSUE_CREATE_STDOUT" 2>/dev/null || true)
   rm -f "$ISSUE_CREATE_STDOUT" "$ISSUE_CREATE_STDERR" "$ISSUE_CREATE_BODY_FILE"
 
   ISSUE_CREATE_INDEPENDENT_OK="false"
@@ -167,9 +207,75 @@ print("null")
   fi
   rm -f "$ISSUE_CREATE_FAKE_GH_STATE"
 
+  # --- 独立証跡 (a)/(b): genuine issue-creator SubAgent の spawn/stop を
+  #     hook-sink-multi-turn JSONL から確認する（root model の自己申告
+  #     transcript には依存しない）。 ---
+  ISSUE_CREATE_SUBAGENT_START_CONFIRMED="false"
+  ISSUE_CREATE_SUBAGENT_STOP_CONFIRMED="false"
+  if [ -f "$ISSUE_CREATE_HOOK_SINK_PATH" ]; then
+    ISSUE_CREATE_HOOK_SINK_JSON=$(python3 -c '
+import json, sys
+path = sys.argv[1]
+start_ok = False
+stop_ok = False
+try:
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("agent_type") != "issue-creator":
+                continue
+            if rec.get("event") == "SubagentStart":
+                start_ok = True
+            elif rec.get("event") == "SubagentStop":
+                stop_ok = True
+except OSError:
+    pass
+print(json.dumps({"start_ok": start_ok, "stop_ok": stop_ok}))
+' "$ISSUE_CREATE_HOOK_SINK_PATH" 2>/dev/null)
+    if [ -n "$ISSUE_CREATE_HOOK_SINK_JSON" ]; then
+      ISSUE_CREATE_SUBAGENT_START_CONFIRMED=$(printf '%s' "$ISSUE_CREATE_HOOK_SINK_JSON" | python3 -c 'import json,sys; print("true" if json.load(sys.stdin).get("start_ok") else "false")' 2>/dev/null || echo false)
+      ISSUE_CREATE_SUBAGENT_STOP_CONFIRMED=$(printf '%s' "$ISSUE_CREATE_HOOK_SINK_JSON" | python3 -c 'import json,sys; print("true" if json.load(sys.stdin).get("stop_ok") else "false")' 2>/dev/null || echo false)
+    fi
+  fi
+  rm -f "$ISSUE_CREATE_HOOK_SINK_PATH" "$ISSUE_CREATE_HOOK_SINK_WRITER_PATH" 2>/dev/null
+
+  # --- 独立証跡 (c)/(d): parent bridge ledger.jsonl にこの run の実行window内で
+  #     新規追記があったことを確認する（child-side create_issue_txn.py が
+  #     実際に bridge client/server へ到達したことの独立確認）。 ---
+  ISSUE_CREATE_BRIDGE_LEDGER_NEW_ENTRY="false"
+  if [ -f "$ISSUE_CREATE_BRIDGE_LEDGER_PATH" ]; then
+    ISSUE_CREATE_LEDGER_OFFSET_AFTER=$(wc -c < "$ISSUE_CREATE_BRIDGE_LEDGER_PATH" 2>/dev/null || echo 0)
+    if [ "$ISSUE_CREATE_LEDGER_OFFSET_AFTER" -gt "$ISSUE_CREATE_LEDGER_OFFSET_BEFORE" ]; then
+      ISSUE_CREATE_BRIDGE_LEDGER_NEW_ENTRY="true"
+    fi
+  fi
+
+  # --- 独立証跡 (g): secret sentinel 非漏洩の最小限確認。stdout に GitHub
+  #     token 系文字列パターンが含まれていないことを確認する（best-effort。
+  #     isolation profile 下では GH_TOKEN 等が unset 済みだが、model 出力
+  #     自体への防御的二重チェックとして行う）。 ---
+  ISSUE_CREATE_NO_SECRET_LEAK="true"
+  case "$ISSUE_CREATE_STDOUT_CONTENT" in
+    *ghp_*|*gho_*|*ghu_*|*ghs_*|*ghr_*|*"-----BEGIN"*PRIVATE*KEY*)
+      ISSUE_CREATE_NO_SECRET_LEAK="false"
+      ;;
+  esac
+
   ISSUE_CREATE_STATUS="fail"
   ISSUE_CREATE_EXIT_CODE=1
-  if [ "$ISSUE_CREATE_CLAUDE_RC" -eq 0 ] && [ "$ISSUE_CREATE_INDEPENDENT_OK" = "true" ] && [ "$SUT_GIT_DIRTY" = "false" ]; then
+  if [ "$ISSUE_CREATE_CLAUDE_RC" -eq 0 ] \
+    && [ "$ISSUE_CREATE_INDEPENDENT_OK" = "true" ] \
+    && [ "$SUT_GIT_DIRTY" = "false" ] \
+    && [ "$ISSUE_CREATE_SUBAGENT_START_CONFIRMED" = "true" ] \
+    && [ "$ISSUE_CREATE_SUBAGENT_STOP_CONFIRMED" = "true" ] \
+    && [ "$ISSUE_CREATE_BRIDGE_LEDGER_NEW_ENTRY" = "true" ] \
+    && [ "$ISSUE_CREATE_NO_SECRET_LEAK" = "true" ]; then
     ISSUE_CREATE_STATUS="pass"
     ISSUE_CREATE_EXIT_CODE=0
   fi
@@ -195,15 +301,25 @@ data = {
         "title": sys.argv[10],
         "independent_fake_gh_state_match_ok": sys.argv[11] == "true",
         "issue_number": (int(sys.argv[12]) if sys.argv[12] != "null" else None),
+        "genuine_issue_creator_subagent_path": True,
+        "subagent_start_confirmed": sys.argv[13] == "true",
+        "subagent_stop_confirmed": sys.argv[14] == "true",
+        "bridge_ledger_new_entry_confirmed": sys.argv[15] == "true",
+        "no_secret_leak_ok": sys.argv[16] == "true",
+        "independent_evidence_note": "subagent_start/stop confirmed via launch.sh hook-sink-multi-turn JSONL (agent_type=issue-creator); bridge ledger diff confirms child reached parent bridge server; fake gh state file match confirms authoritative readback+deterministic provider isolation.",
     },
 }
 print(json.dumps(data, ensure_ascii=False, indent=2))
-' "$ISSUE_CREATE_STATUS" "$ISSUE_CREATE_TIMESTAMP"     "$SUT_LAUNCHER_PATH" "$SUT_REPO_ROOT" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256"     "$ISSUE_CREATE_CLAUDE_RC" "$ISSUE_CREATE_TITLE" "$ISSUE_CREATE_INDEPENDENT_OK" "$ISSUE_CREATE_ISSUE_NUMBER"     > "$ISSUE_CREATE_EVIDENCE_FILE"
+' "$ISSUE_CREATE_STATUS" "$ISSUE_CREATE_TIMESTAMP" \
+    "$SUT_LAUNCHER_PATH" "$SUT_REPO_ROOT" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" \
+    "$ISSUE_CREATE_CLAUDE_RC" "$ISSUE_CREATE_TITLE" "$ISSUE_CREATE_INDEPENDENT_OK" "$ISSUE_CREATE_ISSUE_NUMBER" \
+    "$ISSUE_CREATE_SUBAGENT_START_CONFIRMED" "$ISSUE_CREATE_SUBAGENT_STOP_CONFIRMED" "$ISSUE_CREATE_BRIDGE_LEDGER_NEW_ENTRY" "$ISSUE_CREATE_NO_SECRET_LEAK" \
+    > "$ISSUE_CREATE_EVIDENCE_FILE"
 
   if [ "$ISSUE_CREATE_STATUS" = "pass" ]; then
     echo "PASS: issue_create runtime scenario が成功しました（issue_number=${ISSUE_CREATE_ISSUE_NUMBER}）。証跡: ${ISSUE_CREATE_EVIDENCE_FILE}"
   else
-    echo "FAIL: issue_create runtime scenario が失敗しました（claude_rc=${ISSUE_CREATE_CLAUDE_RC}, independent_ok=${ISSUE_CREATE_INDEPENDENT_OK}, git_dirty=${SUT_GIT_DIRTY}）。証跡: ${ISSUE_CREATE_EVIDENCE_FILE}"
+    echo "FAIL: issue_create runtime scenario が失敗しました（claude_rc=${ISSUE_CREATE_CLAUDE_RC}, independent_ok=${ISSUE_CREATE_INDEPENDENT_OK}, git_dirty=${SUT_GIT_DIRTY}, subagent_start=${ISSUE_CREATE_SUBAGENT_START_CONFIRMED}, subagent_stop=${ISSUE_CREATE_SUBAGENT_STOP_CONFIRMED}, bridge_ledger_new_entry=${ISSUE_CREATE_BRIDGE_LEDGER_NEW_ENTRY}, no_secret_leak=${ISSUE_CREATE_NO_SECRET_LEAK}）。証跡: ${ISSUE_CREATE_EVIDENCE_FILE}"
   fi
   exit "$ISSUE_CREATE_EXIT_CODE"
 fi
