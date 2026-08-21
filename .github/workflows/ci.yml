@@ -2037,6 +2037,12 @@ jobs:
           # to this instead, matching the pattern already used elsewhere in
           # this file (e.g. line 104).
           GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Issue #2230 AC2: the producer's own ${{ github.run_attempt }}
+          # context, threaded into the per-surface evidence manifest record
+          # so the trusted consumer can bind evidence CONTENT (not merely
+          # the attempt-specific artifact NAME) to the exact triggering
+          # run attempt.
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -o pipefail
           ACTUAL_1="$(grep -o 'actual_sha256_run_1=.*' /tmp/vrt-evidence-triple-run.log | tail -1 | cut -d= -f2)"
@@ -2080,14 +2086,14 @@ jobs:
             CRITICAL_VERIFY_SUCCEEDED=false
           fi
 
-          python3 - "$GH_HEAD_SHA" "$GITHUB_RUN_ID" "$ACTUAL_1" "$RUNNING_MISMATCHED" "$RUNNING_VERIFY_SUCCEEDED" "$CRITICAL_MISMATCHED" "$CRITICAL_VERIFY_SUCCEEDED" "$SCREENSHOTS_ARTIFACT_ID" <<'PY' > surface_inputs.json
+          python3 - "$GH_HEAD_SHA" "$GITHUB_RUN_ID" "$GH_RUN_ATTEMPT" "$ACTUAL_1" "$RUNNING_MISMATCHED" "$RUNNING_VERIFY_SUCCEEDED" "$CRITICAL_MISMATCHED" "$CRITICAL_VERIFY_SUCCEEDED" "$SCREENSHOTS_ARTIFACT_ID" <<'PY' > surface_inputs.json
           import json
           import sys
 
           (
-              head_sha, run_id, running_actual_sha256, running_mismatched, running_verify_succeeded,
+              head_sha, run_id, run_attempt, running_actual_sha256, running_mismatched, running_verify_succeeded,
               critical_mismatched, critical_verify_succeeded, screenshots_artifact_id,
-          ) = sys.argv[1:9]
+          ) = sys.argv[1:10]
 
           def to_bool(value):
               return value == "true"
@@ -2095,11 +2101,26 @@ jobs:
           def to_mismatched(value):
               return int(value) if value.lstrip("-").isdigit() else value
 
+          # Issue #2230 fix_delta P1-2: `workflow_run_id`/`run_attempt` are
+          # IDENTITY fields consumed by `resolve_visual_impact.py`'s strict,
+          # non-coercing `_require_strict_positive_int` validator (never the
+          # lenient `to_mismatched`-style string-coercion above, which is
+          # correct only for pixel counts). `$GITHUB_RUN_ID`/`$GH_RUN_ATTEMPT`
+          # arrive here as shell strings via sys.argv; GitHub's own
+          # `github.run_id`/`github.run_attempt` context values are ALWAYS
+          # positive integers by contract, so a plain `int()` cast (not a
+          # defensive fallback-to-string) is correct -- if this ever raises,
+          # that is itself a real bug worth surfacing loudly, not silently
+          # swallowing back into a string identity field.
+          run_id_int = int(run_id)
+          run_attempt_int = int(run_attempt)
+
           records = [
               {
                   "surface_id": "combat-hud-running",
                   "head_sha": head_sha,
-                  "workflow_run_id": run_id,
+                  "workflow_run_id": run_id_int,
+                  "run_attempt": run_attempt_int,
                   "actual_sha256": running_actual_sha256,
                   "mismatched_pixels": to_mismatched(running_mismatched),
                   "verify_succeeded": to_bool(running_verify_succeeded),
@@ -2112,7 +2133,8 @@ jobs:
               {
                   "surface_id": "combat-hud-critical",
                   "head_sha": head_sha,
-                  "workflow_run_id": run_id,
+                  "workflow_run_id": run_id_int,
+                  "run_attempt": run_attempt_int,
                   # No independent zero-tolerance probe exists for this
                   # surface today -- never fabricate a per-run actual PNG
                   # hash it did not itself produce.
@@ -2144,7 +2166,13 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
-          name: component-vrt-evidence-manifest
+          # Issue #2230 AC1/Outcome: attempt-specific artifact name (never a
+          # fixed name across reruns) so a rerun's `visual-impact-policy`
+          # (same run, matching attempt via `actions/download-artifact`'s
+          # exact-name resolution) and the base-locked
+          # `visual-impact-trusted-consumer.yml` `name=` filter can never
+          # silently adopt an OLDER attempt's stale evidence manifest.
+          name: component-vrt-evidence-manifest-${{ github.run_attempt }}
           path: /tmp/visual_baseline_review_evidence_v2.json
           if-no-files-found: error
           retention-days: 30
@@ -2401,7 +2429,11 @@ jobs:
         if: ${{ needs.component-vrt-report.outputs.vrt_evidence_artifact_id != '' }}
         uses: actions/download-artifact@v6
         with:
-          name: component-vrt-evidence-manifest
+          # Issue #2230: same-run, same-attempt exact-name match (this job
+          # and `component-vrt-report` always share the same
+          # `github.run_attempt` since both run within the same workflow
+          # attempt).
+          name: component-vrt-evidence-manifest-${{ github.run_attempt }}
           path: evidence-manifest-download
       # PR #2045 OWNER fix_delta P0-5 second-round REQUEST_CHANGES: the
       # downloaded manifest is UNTRUSTED input at this point (produced by a
@@ -2471,6 +2503,10 @@ jobs:
           COMPONENT_VRT_APP_ID: ${{ steps.component-vrt-check-run.outputs.app_id || '' }}
           COMPONENT_VRT_APP_SLUG: ${{ steps.component-vrt-check-run.outputs.app_slug || '' }}
           COMPONENT_VRT_CHECK_CONCLUSION: ${{ steps.component-vrt-check-run.outputs.check_conclusion || '' }}
+          # Issue #2230 AC2: the producer's own run identity, bound into the
+          # decision artifact's CONTENT via `--run-id`/`--run-attempt` below.
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           # PR #2045 OWNER fix_delta P0-1: `set +o pipefail` here made the
           # `| tee` pipeline's exit status always be `tee`'s (0), so a
@@ -2490,6 +2526,28 @@ jobs:
           # working-tree path because the evaluator itself resolves registry
           # CONTENT via `--head-ref`/`--base-ref` (`git show <ref>:<path>`),
           # never the raw working-tree file, for both base and head.
+          #
+          # NOTE (Issue #2230 fix_delta P1-1/P1-5, 2026-08-21, PR #2279
+          # review comment #2279#issuecomment-5369771738): because this
+          # step ALWAYS runs the BASE-BRANCH-LOCKED evaluator above, a PR
+          # that changes `build_decision()`'s signature/behavior (like
+          # Issue #2230's `workflow_run_id`/`run_attempt` threading) can
+          # never exercise its OWN new logic on its OWN CI run -- on THIS
+          # PR's own pre-merge run, `--run-id`/`--run-attempt` below parse
+          # fine (base already has those CLI flags from an unrelated
+          # subcommand) but are silently NOT forwarded into `decision.json`
+          # yet, since base's `build_decision()` predates this change. Do
+          # not mistake that for a regression. This is an INHERENT
+          # bootstrap/self-validation gap shared by every past change to
+          # this base-locked evaluator (#2019, #2091, #2099, #2100, #2229)
+          # -- splitting a change across multiple PRs does not remove the
+          # gap, it only relocates which PR carries it, since producer
+          # (this job) and consumer (`visual-impact-trusted-consumer.yml`)
+          # both flip to the new workflow-file version simultaneously at
+          # merge (no version-skew window). The first real proof that new
+          # evaluator logic works end to end can only come from a
+          # POST-MERGE run on `main` (see PR #2279's AC9 section, corrected
+          # to SKIP/OPEN for exactly this reason).
           uv run --locked python3 trusted_evaluator/scripts/agent-ops/resolve_visual_impact.py \
             --mode policy-check \
             --registry docs/dev/visual-surfaces.yml \
@@ -2519,13 +2577,18 @@ jobs:
             --github-actions-app-identity "github-actions[bot]" \
             --artifact-id "${VRT_ARTIFACT_ID}" \
             --artifact-digest "${VRT_ARTIFACT_DIGEST}" \
+            --run-id "${GH_RUN_ID}" \
+            --run-attempt "${GH_RUN_ATTEMPT}" \
             --decision-output visual_impact_decision_v1.json \
             | tee policy_check_output.json
       - name: Upload VISUAL_IMPACT_DECISION_V1 artifact
         if: ${{ always() && github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@v6
         with:
-          name: visual-impact-decision-v1
+          # Issue #2230 AC1/Outcome: attempt-specific artifact name -- see
+          # the identical rationale on the evidence-manifest upload step
+          # above.
+          name: visual-impact-decision-v1-${{ github.run_attempt }}
           path: visual_impact_decision_v1.json
           # PR #2045 OWNER fix_delta P0-1: `warn` let a policy-check failure
           # (which now, with `--decision-output` withheld on schema-invalid

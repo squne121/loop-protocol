@@ -88,6 +88,12 @@ def _decision(*, head_sha: str, changed_path_entries: list[dict], affected_surfa
         github_actions_app_identity="github-actions[bot]",
         artifact_id=None,
         artifact_digest=None,
+        # Issue #2230 AC2: no component_vrt_checkrun_provenance is supplied
+        # in this file's trusted_rederivation fixtures, so any fixed valid
+        # tuple satisfies schema without affecting the transitive-graph
+        # assertions under test here.
+        workflow_run_id=1,
+        run_attempt=1,
     )
 
 
@@ -98,9 +104,17 @@ def _verify(
     trusted_rederivation: "rvi.TrustedRederivation",
 ) -> "rvi.TrustedArtifactVerdict":
     decision_raw = json.dumps(decision).encode("utf-8")
+    # Issue #2230 fix_delta P1-5: this file's fixtures focus on the trusted
+    # transitive-graph re-derivation, not evidence-manifest acquisition -- a
+    # genuinely PRESENT (never missing), schema-valid, empty V2 manifest
+    # keeps `verify_trusted_artifact()`'s new unconditional "evidence-
+    # manifest artifact must be present" check from polluting these
+    # graph-walk-focused assertions with an unrelated
+    # `producer_artifact_acquisition_failed:evidence_manifest_missing`.
+    empty_manifest_raw = json.dumps({"schema": rvi.EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": []}).encode("utf-8")
     return rvi.verify_trusted_artifact(
         decision_raw=decision_raw,
-        evidence_manifest_raw=None,
+        evidence_manifest_raw=empty_manifest_raw,
         visual_impact_schema_path=VISUAL_IMPACT_SCHEMA_PATH,
         expected_head_sha=head_sha,
         expected_repository=EXPECTED_REPOSITORY,
