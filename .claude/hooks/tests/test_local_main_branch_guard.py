@@ -563,29 +563,27 @@ class TestAC7HookBoundariesManifest:
         )
 
     def test_check_hook_boundaries_passes(self):
-        """scripts/check_hook_boundaries.py drift must be limited to the two
-        known #1690 removals (local_main_branch_guard, worktree_scope_guard).
+        """scripts/check_hook_boundaries.py drift must be empty.
 
-        Issue #1690 note: these two hooks are temporarily removed from
-        settings.json pending the #1690 policy decision, so
-        check_hook_boundaries.py is expected to report exactly this drift
-        (and nothing else) until #1690 resolves.
+        Issue #2262 AC6 note: the local_main_branch_guard and
+        worktree_scope_guard manifest entries were removed from
+        hook-boundaries.md (they are not registered in settings.json
+        project PreToolUse; see #2193/#2256), so check_hook_boundaries.py
+        is expected to report no drift.
         """
         result = subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "check_hook_boundaries.py")],
             capture_output=True,
             text=True,
         )
-        expected_drift_lines = {
-            "  [drift] manifest に存在するが settings.json にない "
-            "(handler_id='local_main_branch_guard', event='PreToolUse')",
-            "  [drift] manifest に存在するが settings.json にない "
-            "(handler_id='worktree_scope_guard', event='PreToolUse')",
-        }
         stderr_lines = {line for line in result.stderr.splitlines() if line.startswith("  [drift]")}
-        assert stderr_lines == expected_drift_lines, (
-            f"check_hook_boundaries.py drift must be exactly the two #1690 "
-            f"removals; got:\n{result.stderr}\n{result.stdout}"
+        assert stderr_lines == set(), (
+            f"check_hook_boundaries.py drift must be empty after #2262 AC6 "
+            f"manifest cleanup; got:\n{result.stderr}\n{result.stdout}"
+        )
+        assert result.returncode == 0, (
+            f"check_hook_boundaries.py must exit 0 when drift is empty; "
+            f"got returncode={result.returncode}\n{result.stderr}\n{result.stdout}"
         )
 
 

@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# local_main_branch_guard.sh — Claude Code PreToolUse wrapper
+# local_main_branch_guard.sh — Claude Code PreToolUse-shaped wrapper
 #
 # Delegates to scripts/agent-guards/local_main_branch_guard.py.
 # Reads PreToolUse JSON from stdin, exits 0 (allow) or 2 (block).
 #
-# Invoked by .claude/settings.json PreToolUse hook.
-# Order: secret_boundary_guard -> local_main_branch_guard -> worktree_scope_guard
+# Wrapper existence: this script remains in the repo and is invocable in a
+# PreToolUse-shaped calling convention (stdin JSON, exit 0/2).
+# Project wiring: repo-controlled .claude/settings.json project PreToolUse
+# does NOT currently register this script (verify via
+# scripts/check_hook_boundaries.py — see #2193/#2256).
+# Workflow authority: the authority for branch-safety policy is the
+# Agent/Skill-side behavioral contract (docs/dev/hook-boundaries.md), not a
+# claim that this shell wrapper is actively executed by project PreToolUse.
 
 set -euo pipefail
 

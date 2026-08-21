@@ -116,8 +116,11 @@ uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/classify-git-s
 
 agent は bare `git -C <worktree>` で clean 判定や `git worktree remove` / `git branch -d` を直接実行しない。
 clean 判定・PR merged / head branch / linked issue / catalog / branch / root=default の検証・削除は、
-単一の認可境界 `scripts/agent-ops/cleanup_exec.py` が実行のたびに内部で行う（agent からの bare git cleanup は
-`worktree_scope_guard` が deny する）。
+単一の認可境界 `scripts/agent-ops/cleanup_exec.py` が実行のたびに内部で行う。agent が bare git cleanup を
+発行しない運用上の理由は「単一の認可境界を `cleanup_exec` に一本化する」こと自体にある。`worktree_scope_guard`
+は behavioral/defense-in-depth contract として repo に残存するが、現行 project config（`.claude/settings.json`
+/ `.codex/hooks.json`）の project PreToolUse としては wiring されておらず、bare git cleanup を実行時に
+deny する active enforcement 経路ではない。
 
 1. guard arbitration を機械判定する（mutation を行わない・`AGENT_GUARD_PREFLIGHT_V1` を返す）:
 ```bash
@@ -166,9 +169,11 @@ immutable per-nonce contract を materialize する。この issuance 呼び出�
 `discard_confirmation` field へ転記し、レポートで人間に提示する。
 
 worker はこの `confirmation.argv`（`--consume --contract-id <nonce> --expected-contract-sha256 <digest>`
-を含む）を **自分では実行しない**。`--consume` は人間専用のコマンドであり
-（`scripts/agent-guards/worktree_scope_guard.py` の argv allowlist が agent 発行の `--consume` を deny
-する）、worker の責務は confirmation block を正確に報告することで完結する。
+を含む）を **自分では実行しない**。`--consume` は人間専用の運用ルールであり、
+`scripts/agent-guards/worktree_scope_guard.py` の argv allowlist ロジックはこの意図を behavioral/
+defense-in-depth contract として実装として保持するが、現行 project config では PreToolUse / PermissionRequest
+として wiring されておらず、agent 発行の `--consume` を実行時に自動 deny する active enforcement 経路ではない。
+worker の責務は confirmation block を正確に報告することで完結する。
 
 ### 4. parent issue クローズ条件確認
 
