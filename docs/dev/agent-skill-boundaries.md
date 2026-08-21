@@ -1403,8 +1403,12 @@ issue dependency 削除など、GitHub へのリモートミューテーショ�
 `contract_snapshot.publish` / `test_verdict.publish` /
 `issue_scope_snapshot.materialize` / `issue_dependency.remove`。
 
-これらの command id を直接呼び出す raw `gh issue edit` / `gh issue comment` 等は
-worktree_scope_guard および local_main_branch_guard によって deny される。
+これらの command id を直接呼び出す raw `gh issue edit` / `gh issue comment` 等は、
+`worktree_scope_guard` / `local_main_branch_guard` の behavioral/defense-in-depth contract として
+deny 対象と定義されている。ただし現行 project config（`.claude/settings.json` の project
+PreToolUse、`.codex/hooks.json`）には両スクリプトとも PreToolUse handler として wiring されて
+おらず（#1691）、実行時の technical enforcement は `controlled_skill_mutation_exec.py` を
+唯一の executor とする単一 executor 制約そのものが担う。
 
 ### ポリシーレジストリ（例: `issue_comment.publish`）
 
@@ -1480,15 +1484,19 @@ readback が authority（marker 単体を成功の根拠にしない）。
 executor は `--repo <owner/repo>` を必須引数として受け取り、`gh` 呼び出しに明示的に渡す。
 `GITHUB_REPOSITORY` 環境変数や暗黙の gh デフォルトに依存しない。
 
-### settings.json wildcard と hook enforcement（wildcard と hook 強制の適用境界）
+### settings.json wildcard と behavioral contract（wildcard と behavioral contract の適用境界）
 
 `.claude/settings.json` の `Bash(uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py *)` は
 Claude Code permission syntax の制約上 `*` を使用しているが、settings は **最終 enforcement ではない**。
 
 - settings は「このコマンドクラスを allow する UI 層」
-- 実際の argv 制限・policy binding は `worktree_scope_guard.py` / `local_main_branch_guard.py` の hook 層で強制される
-- wildcard を悪用した不正 argv（例: `--unknown-flag`）は hook の `_validate_executor_argv` によって deny される
-- `test_worktree_scope_guard.py` / `test_local_main_branch_guard.py` の hook integrity tests が両軸（deny/allow）を確認
+- argv 制限ロジック（`_validate_executor_argv` 相当）は `worktree_scope_guard.py` / `local_main_branch_guard.py`
+  にコードとして実装されており、`test_worktree_scope_guard.py` / `test_local_main_branch_guard.py` の unit test
+  で検証される。ただし現行 project config（`.claude/settings.json` の project PreToolUse、`.codex/hooks.json`）
+  には両スクリプトとも PreToolUse handler として wiring されていない（#1691）ため、この argv 制限は
+  実行時の PreToolUse hook 層として動作する enforcement ではない
+- wildcard を悪用した不正 argv（例: `--unknown-flag`）を deny する実効的な境界は、executor script
+  （`controlled_skill_mutation_exec.py`）自身の内部検証、および Agent/Skill 側の運用規律である
 
 ### OUTPUT_BUDGET_V1
 
@@ -1576,9 +1584,12 @@ repo binding のみで実行でき、存在する場合のみ `--issue-number` �
 `worktree_scope_guard.py` の `is_controlled_skill_mutation_exec_command` による
 exact command class allow は executor script identity + argv 形状のみを検証し、
 `--command-id` の値には依存しない。そのため metadata mutation command id は追加の allowlist entry
-なしで同じ allow 経路に乗る。raw `gh issue edit` / `gh issue comment` は
-`_classify_gh` により引き続き `mutating` に分類され、active issue + no-matching-worktree
-状態では block される。
+なしで同じ allow 経路に乗る。raw `gh issue edit` / `gh issue comment` は `worktree_scope_guard.py`
+内の `_classify_gh` ロジック上は `mutating` に分類され、active issue + no-matching-worktree
+状態では behavioral/defense-in-depth contract として block 対象と定義される。ただし現行 project config
+（`.claude/settings.json` の project PreToolUse、`.codex/hooks.json`）には `worktree_scope_guard`
+が PreToolUse handler として wiring されていない（#1691）ため、この分類が実行時に自動的な block を
+引き起こす経路は現在存在しない。
 
 ## isolation worktree agent の Issue コメント投稿ブリッジ機構（Issue #1633）
 

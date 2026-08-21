@@ -141,9 +141,12 @@ reason code を記録する（`provenance.eligibility_artifact_digest` / `proven
 
 ---
 
-## active PreToolUse handlers（#783 追加・有効ハンドラー一覧）
+## PreToolUse handlers 設計資料（#783 追加、Issue #1830 以後は historical）
 
-`.codex/hooks.json` に登録されている active PreToolUse handlers とその責務境界。
+Issue #1830 以前の設計時点で `.codex/hooks.json` に登録されていた PreToolUse handlers とその
+責務境界（historical。上記「Codex CLI Hook Boundary」節の通り、現行 `.codex/hooks.json` は
+`SessionEnd` / `SubagentStop` の passive advisory recorder のみであり、以下の handler は
+登録されていない。再導入には別 Issue が必要）。
 
 | matcher | handler | 責務 |
 |---|---|---|
