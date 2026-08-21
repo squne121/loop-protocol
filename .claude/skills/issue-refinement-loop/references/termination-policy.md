@@ -443,7 +443,7 @@ scope / goal / AC への semantic change が検出されたとき、`issue-refin
 各委譲は `auto_fixes.required` エントリとして記録し、`result: applied` かつ `evidence` 完備のものだけが `impl_ready` に貢献する。
 
 
-## Root-Owned Synchronous Entry Transition（root-owned 同期 entry transition, #2272 正本）
+## Root-Owned Synchronous Entry Transition（root が単独で所有する同期的な実装着手への遷移経路、#2272 正本）
 
 `issue-refinement-loop` の `approved` 終了（`LOOP_HANDOFF_RESULT_V1.status: impl_ready`）は
 `impl-review-loop` Step 1 起動の **唯一の authority ではない**。root/main thread が
@@ -485,7 +485,7 @@ route で exact base SHA を pin し、その SHA から worktree を作成す�
 drift が解消しない場合は `route: stop` / `reason: base_preflight_retry_exhausted` を
 terminal result として返す。
 
-### production carrier（producer / consumer / call site の固定）
+### production carrier（送り手・受け手・呼び出し口を固定する運搬経路の定義）
 
 ```yaml
 carrier:
