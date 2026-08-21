@@ -900,6 +900,106 @@ def cmd_subagent_lifecycle(payload):
     return
 
 
+def detect_available_models_silent_fallback(payload):
+    """Issue #2274 AC12: given an evidence payload carrying
+    ``requested_model`` (the session-local custom agent definition's
+    declared model -- DELEGATION_MODEL), and whichever of
+    ``resolved_model`` / ``models_used`` / ``available_models`` the runtime
+    actually surfaced for a completed Agent invocation, detect a SILENT
+    fallback to an inherited/substituted model instead of ever promoting
+    such a run to PASS.
+
+    This is pure evidence analysis -- it never gates a tool call (unlike
+    ``cmd_pre_tool_use_agent``) and is never wired into the PreToolUse
+    authorization decision or the gate hook registration. It exists so the
+    live evidence pipeline (SPARK_DELEGATION_EVIDENCE_V2, Issue #2274
+    AC5/AC6/AC7) has a single, independently testable, typed classifier for
+    this specific failure shape instead of silently treating "no explicit
+    error" as success.
+
+    Returns a dict with ``status`` (``"pass"`` or ``"blocked"``, never a
+    bare boolean) and a typed ``reason`` (never ``None`` when blocked):
+
+    - ``requested_model_missing``: ``requested_model`` itself was not a
+      non-empty string -- nothing to compare against, fail closed.
+    - ``insufficient_evidence``: neither ``resolved_model`` nor
+      ``models_used`` was observed at all -- nothing to compare
+      ``requested_model`` against, fail closed (never assumed to match).
+    - ``available_models_excludes_requested_silent_fallback``: the runtime
+      surfaced a non-empty ``available_models`` list that does NOT contain
+      ``requested_model``, AND the observed ``resolved_model``/
+      ``models_used`` disagree with ``requested_model`` -- the exact
+      silent-substitution shape this AC exists to catch (Claude Code
+      falling back to an inherited model when the requested one is not in
+      ``availableModels``, per the Issue's Current Validated Scope
+      analysis of https://code.claude.com/docs/en/model-config).
+    - ``resolved_model_mismatch_despite_available``: ``available_models``
+      DID contain ``requested_model``, yet the observed resolved/used model
+      still disagrees -- a distinct anomaly, still never PASS.
+    - ``resolved_model_mismatch_without_available_models_evidence``: the
+      observed resolved/used model disagrees with ``requested_model`` but
+      ``available_models`` itself was never observed, so the more specific
+      exclusion reason above could not be confirmed -- still never PASS.
+    - ``match``: ``resolved_model`` (when observed) equals
+      ``requested_model``, and ``requested_model`` is present in
+      ``models_used`` (when that list was observed).
+
+    Fails closed on every field -- a comparison that cannot be honestly
+    made from the already-captured evidence never defaults to ``"pass"``.
+    """
+    requested_model = payload.get("requested_model") if isinstance(payload, dict) else None
+    resolved_model = payload.get("resolved_model") if isinstance(payload, dict) else None
+    models_used = payload.get("models_used") if isinstance(payload, dict) else None
+    available_models = payload.get("available_models") if isinstance(payload, dict) else None
+
+    result = {
+        "status": None,
+        "reason": None,
+        "requested_model": requested_model,
+        "resolved_model": resolved_model,
+        "models_used": models_used,
+        "available_models": available_models,
+    }
+
+    if not isinstance(requested_model, str) or not requested_model:
+        result["status"] = "blocked"
+        result["reason"] = "requested_model_missing"
+        return result
+
+    has_resolved_evidence = isinstance(resolved_model, str) and bool(resolved_model)
+    has_models_used_evidence = isinstance(models_used, list) and len(models_used) > 0
+
+    if not has_resolved_evidence and not has_models_used_evidence:
+        result["status"] = "blocked"
+        result["reason"] = "insufficient_evidence"
+        return result
+
+    resolved_match = (not has_resolved_evidence) or (resolved_model == requested_model)
+    models_used_match = (not has_models_used_evidence) or (requested_model in models_used)
+
+    if resolved_match and models_used_match:
+        result["status"] = "pass"
+        result["reason"] = "match"
+        return result
+
+    has_available_models_evidence = isinstance(available_models, list) and len(available_models) > 0
+    if has_available_models_evidence and requested_model not in available_models:
+        result["status"] = "blocked"
+        result["reason"] = "available_models_excludes_requested_silent_fallback"
+    elif has_available_models_evidence:
+        result["status"] = "blocked"
+        result["reason"] = "resolved_model_mismatch_despite_available"
+    else:
+        result["status"] = "blocked"
+        result["reason"] = "resolved_model_mismatch_without_available_models_evidence"
+    return result
+
+
+def cmd_detect_available_models_fallback(payload):
+    sys.stdout.write(json.dumps(detect_available_models_silent_fallback(payload)))
+    sys.exit(0)
+
+
 def main():
     event = sys.argv[1] if len(sys.argv) > 1 else ""
     payload = read_payload()
@@ -910,6 +1010,8 @@ def main():
             cmd_pre_tool_use_agent(payload)
         elif event in ("subagent-start", "subagent-stop"):
             cmd_subagent_lifecycle(payload)
+        elif event == "detect-available-models-fallback":
+            cmd_detect_available_models_fallback(payload)
     except SystemExit:
         raise
     except Exception:
@@ -954,6 +1056,25 @@ sed -i "s/__CLAUDE_GPT_SPARK_LAUNCH_NONCE__/${SPARK_LAUNCH_NONCE}/" "$SPARK_GATE
 export CLAUDE_GPT_SPARK_AUTH_DIR="$SPARK_AUTH_DIR_TARGET"
 export SPARK_GATE_WRITER
 SPARK_AGENTS_JSON=$(claude_gpt_spark_agents_json_fragment)
+
+# --- Issue #2274 AC14/AC15: runtime_smoke_test.sh 専用 launcher-owned canary
+#     SubAgent fixture の内部合成経路。caller-owned `--agents` は
+#     CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由で引き続き無条件拒否する（上記の
+#     policy-weakening flag 拒否ループを一切変更しない）。
+#     `runtime_smoke_test.sh` はこの環境変数（caller argv ではなく launcher が
+#     読む専用の内部チャネル）経由でのみ canary fixture JSON を渡し、ここで
+#     session-local spark-codex 定義（`$SPARK_AGENTS_JSON`）とマージ検証する。
+#     マージが失敗する（malformed JSON・agent name 衝突）場合は fail-closed で
+#     起動そのものを中断する（malformed な `--agents` をそのまま `claude` へ
+#     渡さない）。 ---
+if [ -n "${CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON:-}" ]; then
+  MERGED_AGENTS_JSON=$(claude_gpt_agents_json_merge_validate "$SPARK_AGENTS_JSON" "$CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON")
+  if [ -z "$MERGED_AGENTS_JSON" ]; then
+    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"smoke_canary_agents_merge_failed"}\n' >&2
+    exit 2
+  fi
+  SPARK_AGENTS_JSON="$MERGED_AGENTS_JSON"
+fi
 
 # --- explicit-only authorization gate hook groups (Issue #2186 P0 fix-delta,
 #     PR #2244 adversarial review) ---

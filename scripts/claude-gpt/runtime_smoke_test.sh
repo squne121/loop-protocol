@@ -31,6 +31,26 @@
 #   0   PASS（構造確認 + 対話 runtime 確認のすべてを実機確認）
 #   1   FAIL（環境は利用可能だが検証項目のいずれかが失敗した）
 #   77  SKIP（proxy バイナリ不在 or ChatGPT subscription 認証が利用不能）
+#
+# --- Issue #2274 AC5/AC6/AC7: `--spark-delegation` mode ---
+# 通常の一般 canary smoke（Phase A/B、上記と同じ exit code 規約）とは別に、
+# `SPARK_DELEGATION_EVIDENCE_V2` schema（Issue #2274 本文の「推奨する evidence
+# schema」参照）による live Spark E2E smoke を要求するモード。この mode は
+# static plumbing のみを実装する: 環境（proxy バイナリ / ChatGPT subscription
+# 認証）が利用不能な場合は他の mode と同じく exit 77 で SKIP する（fallback
+# 実行や擬似成功判定は行わない）。環境が利用可能な場合でも、`SPARK_DELEGATION_
+# EVIDENCE_V2` の `authorization`/`definition`/`invocation`/`agent`/`proxy` 各
+# フィールドを出所別に分離して収集する live conversation harness 自体は本
+# iteration では未実装であり、その場合は `verdict.status: "blocked"`,
+# `verdict.reason: "spark_delegation_live_harness_not_implemented"` を証跡へ
+# 記録して exit 1 する（static hook output test の結果を live smoke の代わりに
+# PASS へ昇格させることは絶対に行わない -- AC7 が明示的に禁止する）。
+SPARK_DELEGATION_MODE=false
+for _arg in "$@"; do
+  case "$_arg" in
+    --spark-delegation) SPARK_DELEGATION_MODE=true ;;
+  esac
+done
 
 SELF_PATH=$0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
@@ -75,12 +95,33 @@ if [ "$PREFLIGHT_ENV_RC" -eq 3 ] || [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
   if [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
     SKIP_REASON="chatgpt_subscription_auth_unavailable"
   fi
+  if [ "$SPARK_DELEGATION_MODE" = "true" ]; then
+    printf '{"schema":"SPARK_DELEGATION_EVIDENCE_V2","generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"launch_sh_sha256":"%s","lib_sh_sha256":"%s","runtime_smoke_sha256":"%s"},"proxy":{"absolute_path":"%s","version":"%s","sha256":"%s"},"verdict":{"status":"blocked","reason":"%s"}}\n' \
+      "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
+      "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" "$SKIP_REASON" > "$EVIDENCE_FILE"
+    echo "SKIP: ${SKIP_REASON} のため --spark-delegation live smoke を実行できません（fallback 実行なし）。証跡: ${EVIDENCE_FILE}"
+    exit 77
+  fi
   printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"skip","reason":"%s","preflight_env_only":%s,"generated_at":"%s","sut":{"launcher_path":"%s","repository_root":"%s","git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","lib_sh_sha256":"%s","runtime_smoke_sha256":"%s"},"proxy":{"absolute_path":"%s","version":"%s","sha256":"%s"}}\n' \
     "$SKIP_REASON" "$PREFLIGHT_ENV_JSON" "$TIMESTAMP" \
     "$SUT_LAUNCHER_PATH" "$SUT_REPO_ROOT" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
     "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" > "$EVIDENCE_FILE"
   echo "SKIP: ${SKIP_REASON} のため runtime smoke test を実行できません。証跡: ${EVIDENCE_FILE}"
   exit 77
+fi
+
+# --- Issue #2274 AC5/AC6/AC7 static plumbing: 環境は利用可能だが、
+#     SPARK_DELEGATION_EVIDENCE_V2 の各フィールドを出所別に分離して収集する
+#     live conversation harness 自体は本 iteration では未実装。static hook
+#     output test の結果を live smoke の代わりに PASS へ昇格させることは
+#     絶対に行わない（AC7）ため、typed blocked 判定のまま fail-closed で
+#     停止する。 ---
+if [ "$SPARK_DELEGATION_MODE" = "true" ]; then
+  printf '{"schema":"SPARK_DELEGATION_EVIDENCE_V2","generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"launch_sh_sha256":"%s","lib_sh_sha256":"%s","runtime_smoke_sha256":"%s"},"proxy":{"absolute_path":"%s","version":"%s","sha256":"%s"},"verdict":{"status":"blocked","reason":"spark_delegation_live_harness_not_implemented"}}\n' \
+    "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
+    "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" > "$EVIDENCE_FILE"
+  echo "FAIL: --spark-delegation の live conversation harness は本 iteration では未実装です（static hook output test を PASS の代わりに昇格させません）。証跡: ${EVIDENCE_FILE}"
+  exit 1
 fi
 
 # =========================================================================
@@ -139,7 +180,37 @@ TEXT_MARKER="CLAUDE_GPT_CANARY_TEXT_OK"
 BASH_MARKER="CLAUDE_GPT_CANARY_BASH_OK"
 SUBAGENT_MARKER="CLAUDE_GPT_CANARY_SUBAGENT_OK"
 
-CANARY_AGENTS_JSON='{"canary":{"description":"canary smoke test subagent used only for claude-gpt launcher runtime smoke testing","prompt":"You are a canary subagent used only for launcher runtime smoke testing. When invoked, respond with exactly: '"${SUBAGENT_MARKER}"' and nothing else."}}'
+# --- canary SubAgent fixture（Issue #2274 AC14/AC15）: caller-owned `--agents`
+#     を forbidden flag として拒否する launch.sh の判定はそのまま維持し
+#     （このスクリプトは launch.sh の pre-filter を経由しない一般 smoke lane
+#     専用の launcher-owned fixture であり、caller-supplied `--agents` の経路
+#     ではない）、canary agent 自体は smoke run 固有の高エントロピー nonce
+#     から `claude_gpt_smoke_canary_agents_json_fragment`（lib.sh）で毎回
+#     内部合成する。name/prompt/model/tools を caller から受け取らない固定
+#     spec（tools: [] / 固定 prompt・marker）で JSON serializer が一括生成し、
+#     生成直後に自身で parse/readback して malformed JSON・duplicate
+#     top-level key・予約済み spark 定義名との衝突を fail-closed で拒否する
+#     （lib.sh 側の実装参照）。 ---
+SMOKE_CANARY_NONCE="${TIMESTAMP}-$$-$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+if [ -z "$SMOKE_CANARY_NONCE" ] || [ "$SMOKE_CANARY_NONCE" = "${TIMESTAMP}-$$-" ]; then
+  # /dev/urandom が利用不能な hermetic 環境向けの fallback（それでも
+  # $TIMESTAMP と $$ の組み合わせで run ごとに一意）。
+  SMOKE_CANARY_NONCE="${TIMESTAMP}-$$-$(date -u +%s%N 2>/dev/null || date -u +%s)"
+fi
+CANARY_AGENTS_JSON=$(claude_gpt_smoke_canary_agents_json_fragment "$SUBAGENT_MARKER" "$SMOKE_CANARY_NONCE" "$CLAUDE_GPT_SPARK_AGENT_NAME")
+if [ -z "$CANARY_AGENTS_JSON" ]; then
+  printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"fail","reason":"canary_agent_fixture_synthesis_failed","generated_at":"%s","sut":{"git_head":"%s"}}\n' \
+    "$TIMESTAMP" "$SUT_GIT_HEAD" > "$EVIDENCE_FILE"
+  echo "FAIL: canary SubAgent fixture の内部合成（Issue #2274 AC14/AC15）に失敗しました。証跡: ${EVIDENCE_FILE}"
+  exit 1
+fi
+CANARY_AGENT_NAME=$(printf '%s' "$CANARY_AGENTS_JSON" | python3 -c 'import json,sys; print(next(iter(json.load(sys.stdin))))' 2>/dev/null)
+if [ -z "$CANARY_AGENT_NAME" ]; then
+  printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"fail","reason":"canary_agent_name_readback_failed","generated_at":"%s","sut":{"git_head":"%s"}}\n' \
+    "$TIMESTAMP" "$SUT_GIT_HEAD" > "$EVIDENCE_FILE"
+  echo "FAIL: canary SubAgent fixture の agent name readback（Issue #2274 AC14/AC15）に失敗しました。証跡: ${EVIDENCE_FILE}"
+  exit 1
+fi
 
 # --- 単一 turn に複数ステップを詰め込むと model が一部のツール呼び出しを省略する挙動が
 #     実機観測で確認されたため（PR #2162 実装セッション, 2026-08-14）、Bash tool /
@@ -192,8 +263,16 @@ run_convo_step() {
   fi
 
   if [ -n "$step_agents_json" ] && [ -n "$step_allowed_tools" ]; then
-    "$SCRIPT_DIR/launch.sh" -- -p "$step_prompt" --output-format text --no-session-persistence \
-      --allowedTools "$step_allowed_tools" --agents "$step_agents_json" \
+    # Issue #2274 AC14/AC15: the canary SubAgent fixture is passed to
+    # launch.sh via a launcher-owned internal env channel
+    # (CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON), never as a caller-supplied
+    # `--agents` CLI flag -- launch.sh's own `--agents` forbidden-flag
+    # rejection (CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS) stays unconditional for
+    # caller argv, and launch.sh internally merges this fixture with the
+    # session-local spark-codex definition before invoking the real
+    # `claude` binary.
+    CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON="$step_agents_json" "$SCRIPT_DIR/launch.sh" -- -p "$step_prompt" --output-format text --no-session-persistence \
+      --allowedTools "$step_allowed_tools" \
       >"$step_stdout_file" 2>"$step_stderr_file"
   elif [ -n "$step_allowed_tools" ]; then
     "$SCRIPT_DIR/launch.sh" -- -p "$step_prompt" --output-format text --no-session-persistence \
@@ -321,7 +400,7 @@ SUBAGENT_RC=1
 subagent_attempt=0
 while [ "$subagent_attempt" -lt 3 ]; do
   subagent_attempt=$((subagent_attempt + 1))
-  run_convo_step "subagent" "You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Task tool right now (an actual tool call, not a description) to launch the subagent named canary with any instructions, then print its exact output verbatim." "Task" "$CANARY_AGENTS_JSON"
+  run_convo_step "subagent" "You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Task tool right now (an actual tool call, not a description) to launch the subagent named ${CANARY_AGENT_NAME} with any instructions, then print its exact output verbatim." "Task" "$CANARY_AGENTS_JSON"
   SUBAGENT_STDOUT="$STEP_STDOUT"
   SUBAGENT_RC="$STEP_RC"
   case "$SUBAGENT_STDOUT" in
