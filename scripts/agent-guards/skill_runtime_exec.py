@@ -8,6 +8,7 @@ import errno
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -767,33 +768,89 @@ def _validate_trusted_executable_version(name: str, resolved: str, project_root:
     return bool(match) and match.group(1) == required_version
 
 
-def _safe_path_entries() -> list[str]:
-    """Return the ordered list of trusted PATH directories consumed by
-    `_resolve_trusted_executable`/`_sanitize_env`.
+def _os_account_home() -> str | None:
+    """Return the real OS account home directory for the UID this process
+    itself runs as, resolved via the passwd database (`pwd.getpwuid`) --
+    never via the ambient `HOME` environment variable, which a caller or
+    launcher can freely set to an arbitrary path (e.g. `HOME=/tmp/evil`)
+    without that changing which Unix account this process actually runs
+    as (Issue #2276 decision record). Returns None if the account has no
+    passwd entry, so callers fail closed rather than raising."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        return None
 
-    Account-home `~/.local/bin` is deliberately NOT included (Issue #2251):
-    it is writable by the very Unix account this executor process itself
-    runs as, so a same-UID attacker who already has arbitrary code
-    execution could plant a lookalike `uv` there -- no ownership,
-    writability, or `--version` check can distinguish that from a
-    legitimately installed toolchain (see PR #2247 review P1-3,
-    `docs/dev/workflow.md` "Not Controlled"). Excluding it entirely
-    (rather than merely validating it, as this module did before Issue
-    #2251) closes the CWE-427 search-selection element itself: if `uv` is
-    not resolvable from the hostedtoolcache trust root or a system
-    standard directory below, resolution now fails closed with
-    `{name}_not_found` instead of silently falling back to an
-    account-writable location.
+
+def _trusted_account_home_uv_dir() -> list[str]:
+    """Return the real-account-home `.local/bin` directory as a `uv`
+    PATH candidate (Issue #2276 / #2280), or an empty list if unavailable.
+
+    This is the standard install location used by the official `uv`
+    standalone installer on Linux, so no bespoke `trusted-bin` directory,
+    sudo installation step, or repository-owned checksum authority is
+    introduced. The directory is derived from `_os_account_home()`, not
+    the ambient `HOME` env var, so an attacker who can only set `HOME`
+    cannot relocate this trust candidate. It is not, on its own, a
+    stronger guarantee than the pre-existing system PATH lane: anything
+    resolved from here still must pass the exact-version check in
+    `_validate_trusted_executable_version` (this directory is never part
+    of the hostedtoolcache trust root), so a wrong-version or replaced
+    `uv` here still fails closed exactly like `/usr/local/bin` does
+    today."""
+    home = _os_account_home()
+    if not home:
+        return []
+    candidate = os.path.join(home, ".local", "bin")
+    return [candidate] if os.path.isdir(candidate) else []
+
+
+def _safe_path_entries() -> list[str]:
+    """Return the ordered list of trusted, name-agnostic PATH directories
+    consumed by `_resolve_trusted_executable`/`_sanitize_env`/
+    `sanitized_git_subprocess_env` for every trusted executable name this
+    module resolves (`uv`, `git`, `ssh`, ...).
+
+    Real-account-home `.local/bin` (Issue #2276 / #2280 decision record) is
+    deliberately NOT included here: see `_resolve_trusted_executable`,
+    which adds it as a `uv`-only candidate on top of this shared list. This
+    list is shared across every executable name, and a real account's
+    `~/.local/bin` commonly contains a whole toolchain -- `git` included --
+    installed by that same account, unlike hostedtoolcache (which
+    structurally can only ever contain the pinned `uv`). Since
+    `_validate_trusted_executable_version` is a no-op for names other than
+    `uv`, widening this shared list to include account-home would let a
+    same-UID attacker's lookalike `git` (or any other non-`uv` name
+    resolved through this module) be trusted with zero version-pin defense
+    (Issue #2280 Out of Scope: this module's `uv` trust boundary decision
+    must not widen trust for any other executable name).
+
+    This module does not claim to contain an attacker who already has
+    arbitrary code execution as the same Unix account this process runs
+    as -- such an attacker could modify any of these directories (or this
+    module's own source) regardless of which ones are listed here; see
+    `docs/dev/workflow.md` "Not Controlled". What this list *does* defend
+    is "unintended executable selection": ambient `PATH` pollution and
+    CWD/project-local substitution are excluded by construction. No new
+    dedicated `trusted-bin` directory, sudo installation step, or
+    repository-owned checksum authority is introduced by this lane.
     """
-    entries = [
-        *_trusted_toolchain_dirs("uv"),
-        "/usr/local/sbin",
-        "/usr/local/bin",
-        "/usr/sbin",
-        "/usr/bin",
-        "/sbin",
-        "/bin",
-    ]
+    return _dedupe_path_entries([*_trusted_toolchain_dirs("uv"), *_SYSTEM_STANDARD_PATH_DIRS])
+
+
+# Fixed system standard directories, shared by `_safe_path_entries()` and
+# `_resolve_trusted_executable`'s `uv`-only account-home extension below.
+_SYSTEM_STANDARD_PATH_DIRS: tuple[str, ...] = (
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
+
+
+def _dedupe_path_entries(entries: list[str]) -> list[str]:
     seen: set[str] = set()
     ordered: list[str] = []
     for entry in entries:
@@ -929,7 +986,26 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     `sys.executable`); this fix does not change which check is effective,
     only which string is returned once that check passes.
     """
-    safe_entries = _safe_path_entries()
+    # The account-home `.local/bin` lane (Issue #2276 / #2280) is added on
+    # top of the shared, name-agnostic `_safe_path_entries()` list ONLY for
+    # `uv` -- never for `git`, `ssh`, or any other name resolved through
+    # this function -- so that lane does not widen trust for executables
+    # whose resolution has no version-pin defense (see `_safe_path_entries`
+    # docstring). `_sanitize_env`/`sanitized_git_subprocess_env` also call
+    # `_safe_path_entries()` directly (without this addition), so the
+    # account-home lane never reaches the generic child `PATH` either.
+    # Ordering: hostedtoolcache first (strongest validation), then the
+    # account-home lane, then system standard directories -- so a
+    # correctly pinned hostedtoolcache `uv` is preferred over the
+    # local-dev convenience lane whenever both are present.
+    if name == "uv":
+        safe_entries = _dedupe_path_entries([
+            *_trusted_toolchain_dirs("uv"),
+            *_trusted_account_home_uv_dir(),
+            *_SYSTEM_STANDARD_PATH_DIRS,
+        ])
+    else:
+        safe_entries = _safe_path_entries()
     safe_path = os.pathsep.join(safe_entries)
     if name == "python3":
         resolved = sys.executable
@@ -947,14 +1023,14 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     if real_parent not in allowed_dirs and real_parent != runtime_dir:
         raise RuntimeError(f"{name}_outside_trusted_path")
     if name != "python3":
-        # Issue #2241 / PR #2247 review P1-3(c) / Issue #2251: a resolution
-        # that came from outside the strongly-validated hostedtoolcache
-        # trust root (account-home `~/.local/bin` is no longer even a
-        # candidate as of Issue #2251 -- this now only reaches a remaining
-        # system PATH directory such as `/usr/local/bin`) gets an
-        # additional "version 照合" defense-in-depth check -- see
-        # `_validate_trusted_executable_version` docstring for why this is
-        # a confirmation, not a trust boundary, on its own.
+        # Issue #2241 / PR #2247 review P1-3(c) / Issue #2251 / Issue #2276:
+        # a resolution that came from outside the strongly-validated
+        # hostedtoolcache trust root (a system PATH directory such as
+        # `/usr/local/bin`, or the real-account-home `.local/bin` lane
+        # re-permitted by Issue #2276) gets an additional "version 照合"
+        # defense-in-depth check -- see `_validate_trusted_executable_version`
+        # docstring for why this is a confirmation, not a trust boundary, on
+        # its own.
         hosted_dirs = {os.path.realpath(entry) for entry in _trusted_toolchain_dirs(name)}
         if real_parent not in hosted_dirs and not _validate_trusted_executable_version(name, real, project_root):
             raise RuntimeError(f"{name}_version_mismatch")
