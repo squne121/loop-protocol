@@ -108,12 +108,17 @@ def _decision(*, workflow_run_id, run_attempt, check_run_id=CHECK_RUN_ID) -> dic
 
 
 def _manifest_record(*, workflow_run_id, run_attempt, head_sha=HEAD_SHA, surface_id="combat-hud-running") -> dict:
-    return rvi.build_evidence_manifest_v2_record(
+    # `run_attempt` is NOT part of `_MANIFEST_V2_RECORD_FIELDS` /
+    # `manifest_sha256` (Issue #2230 fix_delta: the tamper-evidence digest
+    # must stay identical to the base-branch-locked consumer's field set --
+    # attempt-forgery is instead caught by the separate
+    # `evidence_manifest_run_attempt_mismatch` cross-check). Set it on the
+    # returned dict after construction, outside the digested field set.
+    record = rvi.build_evidence_manifest_v2_record(
         surface_id=surface_id,
         contract_digest="f" * 64,
         head_sha=head_sha,
         workflow_run_id=workflow_run_id,
-        run_attempt=run_attempt,
         check_run_id=None,
         check_suite_id=None,
         github_app_id=None,
@@ -132,6 +137,8 @@ def _manifest_record(*, workflow_run_id, run_attempt, head_sha=HEAD_SHA, surface
         actual_artifact_id="a1",
         diff_artifact_id="d1",
     )
+    record["run_attempt"] = run_attempt
+    return record
 
 
 def _verify(decision: dict, manifest: dict | None, *, provenance=None):

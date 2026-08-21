@@ -958,7 +958,6 @@ _MANIFEST_V2_RECORD_FIELDS: tuple[str, ...] = (
     "contract_digest",
     "head_sha",
     "workflow_run_id",
-    "run_attempt",
     "check_run_id",
     "check_suite_id",
     "github_app_id",
@@ -3211,12 +3210,6 @@ def _run_build_evidence_manifest(args: argparse.Namespace) -> int:
             contract_digest=compute_contract_digest(surface_def),
             head_sha=item.get("head_sha"),
             workflow_run_id=item.get("workflow_run_id"),
-            # Issue #2230 AC2: the producer's OWN `${{ github.run_attempt }}`
-            # context, never re-derived elsewhere -- paired with
-            # `workflow_run_id` + `head_sha` this is the exact tuple
-            # `verify_trusted_artifact()` cross-checks against the trusted
-            # consumer's authenticated CheckRun provenance.
-            run_attempt=item.get("run_attempt"),
             # CheckRun binding fields are always populated by the CONSUMER
             # (visual-impact-policy job's independently-fetched CheckRun API
             # lookup), never by this producer step -- see
@@ -3239,6 +3232,18 @@ def _run_build_evidence_manifest(args: argparse.Namespace) -> int:
             actual_artifact_id=item.get("actual_artifact_id"),
             diff_artifact_id=item.get("diff_artifact_id"),
         )
+        # Issue #2230 AC2: the producer's OWN `${{ github.run_attempt }}`
+        # context, never re-derived elsewhere -- paired with
+        # `workflow_run_id` + `head_sha` this is the exact tuple
+        # `verify_trusted_artifact()` cross-checks against the trusted
+        # consumer's authenticated CheckRun provenance. NOT part of
+        # `_MANIFEST_V2_RECORD_FIELDS` / `manifest_sha256`: attempt-forgery
+        # is caught by the separate `evidence_manifest_run_attempt_mismatch`
+        # cross-check against independently-authenticated CheckRun
+        # provenance, not by the tamper-evidence digest (which must stay
+        # identical to the base-branch-locked consumer's field set so the
+        # digest self-verifies pre-merge).
+        record["run_attempt"] = item.get("run_attempt")
         records.append(record)
 
     manifest = {"schema": EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": records}
