@@ -33,8 +33,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 LIB_SH = REPO_ROOT / "scripts" / "claude-gpt" / "lib.sh"
 RUNTIME_SMOKE_SH = REPO_ROOT / "scripts" / "claude-gpt" / "runtime_smoke_test.sh"
