@@ -279,14 +279,36 @@ def test_hostedtoolcache_lane_regression(monkeypatch, tmp_path):
     assert os.path.realpath(resolved) == os.path.realpath(str(uv_path))
 
 
-def test_safe_path_entries_includes_real_account_home_local_bin(monkeypatch, tmp_path):
+def test_safe_path_entries_never_includes_account_home(monkeypatch, tmp_path):
+    """GIVEN a real (`pwd`-resolved) account home with a `.local/bin`
+    directory
+    WHEN the shared, name-agnostic `_safe_path_entries()` (consumed by
+    `_sanitize_env`/`sanitized_git_subprocess_env`/`_resolve_trusted_ssh_command`
+    for every trusted executable name) is called
+    THEN it never includes the account-home lane -- that lane is added only
+    inside `_resolve_trusted_executable` for `name == "uv"` specifically
+    (see `test_trusted_account_home_uv_dir_returns_real_account_home_local_bin`
+    and `test_resolve_trusted_executable_uv_lane_includes_account_home_only_for_uv`
+    below), never the shared list (Issue #2280 Out of Scope: this Issue's
+    `uv` trust boundary decision must not widen trust for `git`/`ssh`/any
+    other executable name, since `_validate_trusted_executable_version` is
+    a no-op for non-`uv` names and would provide no defense-in-depth if
+    this shared list included it)."""
+    real_account_home = tmp_path / "real-account-home"
+    (real_account_home / ".local" / "bin").mkdir(parents=True)
+    _patch_real_account_home(monkeypatch, real_account_home)
+
+    real_local_bin = str(real_account_home / ".local" / "bin")
+    assert real_local_bin not in exec_mod._safe_path_entries()
+
+
+def test_trusted_account_home_uv_dir_returns_real_account_home_local_bin(monkeypatch, tmp_path):
     """GIVEN a real (`pwd`-resolved) account home with a `.local/bin`
     directory, and a *different* `HOME`-env-spoofed directory that also has
     a `.local/bin` directory
-    WHEN `_safe_path_entries` is called
-    THEN the real account home's `.local/bin` is included when resolving
-    `uv`, but the `HOME`-spoofed directory's `.local/bin` is never included
-    regardless (Issue #2276 AC2/AC4)."""
+    WHEN `_trusted_account_home_uv_dir()` is called
+    THEN it returns the real account home's `.local/bin`, never the
+    `HOME`-spoofed directory's (Issue #2276 AC2/AC4)."""
     real_account_home = tmp_path / "real-account-home"
     (real_account_home / ".local" / "bin").mkdir(parents=True)
     _patch_real_account_home(monkeypatch, real_account_home)
@@ -294,48 +316,26 @@ def test_safe_path_entries_includes_real_account_home_local_bin(monkeypatch, tmp
     (spoofed_home / ".local" / "bin").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(spoofed_home))
 
-    entries = exec_mod._safe_path_entries("uv")
+    entries = exec_mod._trusted_account_home_uv_dir()
 
     real_local_bin = str(real_account_home / ".local" / "bin")
     spoofed_local_bin = str(spoofed_home / ".local" / "bin")
-    assert real_local_bin in entries
+    assert entries == [real_local_bin]
     assert spoofed_local_bin not in entries
 
 
-def test_safe_path_entries_excludes_account_home_for_non_uv_names(monkeypatch, tmp_path):
+def test_resolve_trusted_executable_uv_lane_includes_account_home_only_for_uv(monkeypatch, tmp_path):
     """GIVEN a real account home whose `.local/bin` contains a fake `git`
     executable (same-UID writable, exactly the CWE-427 lookalike-binary
-    scenario Issue #2251 closed)
-    WHEN `_safe_path_entries("git")` -- or the default, name-agnostic
-    `_safe_path_entries()` used for `_sanitize_env`/`sanitized_git_subprocess_env`
-    -- is called
-    THEN the account-home lane is NOT included: it is scoped to `uv`
-    resolution only (Issue #2280 Out of Scope: this Issue's `uv` trust
-    boundary decision must not widen trust for `git` or any other
-    executable name, since `_validate_trusted_executable_version` is a
-    no-op for non-`uv` names and would provide no defense-in-depth if this
-    lane were shared)."""
-    real_account_home = tmp_path / "real-account-home"
-    (real_account_home / ".local" / "bin").mkdir(parents=True)
-    _patch_real_account_home(monkeypatch, real_account_home)
-
-    real_local_bin = str(real_account_home / ".local" / "bin")
-    assert real_local_bin not in exec_mod._safe_path_entries("git")
-    assert real_local_bin not in exec_mod._safe_path_entries(None)
-    assert real_local_bin not in exec_mod._safe_path_entries()
-
-
-def test_resolve_trusted_executable_git_never_selects_account_home_fake(monkeypatch, tmp_path):
-    """GIVEN a fake `git` executable planted at the real account home's
-    `.local/bin` (same-UID writable), and no real `git` reachable from the
-    hostedtoolcache/system lanes
+    scenario Issue #2251 closed for `uv`), reachable only from that
+    account-home directory
     WHEN `_resolve_trusted_executable("git", ...)` is called
-    THEN it never resolves to the account-home fake -- either it fails
-    closed with `git_not_found`, or (if a real `git` happens to exist on
-    the fixed system directories) it resolves to that real executable,
-    never to the account-home fake, since the account-home lane is `uv`-
-    scoped only (Issue #2280 adversarial regression: this Issue's `uv`
-    trust boundary decision must not widen trust for `git`)."""
+    THEN the account-home lane is not consulted for `git` -- it is scoped
+    to `_resolve_trusted_executable("uv", ...)` only (Issue #2280 Out of
+    Scope: this Issue's `uv` trust boundary decision must not widen trust
+    for `git` or any other executable name, since
+    `_validate_trusted_executable_version` is a no-op for non-`uv` names
+    and would provide no defense-in-depth if this lane were shared)."""
     real_account_home = tmp_path / "real-account-home"
     fake_local_bin = real_account_home / ".local" / "bin"
     fake_local_bin.mkdir(parents=True)

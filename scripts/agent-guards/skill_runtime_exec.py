@@ -805,55 +805,52 @@ def _trusted_account_home_uv_dir() -> list[str]:
     return [candidate] if os.path.isdir(candidate) else []
 
 
-def _safe_path_entries(executable_name: str | None = None) -> list[str]:
-    """Return the ordered list of trusted PATH directories consumed by
-    `_resolve_trusted_executable`/`_sanitize_env`.
+def _safe_path_entries() -> list[str]:
+    """Return the ordered list of trusted, name-agnostic PATH directories
+    consumed by `_resolve_trusted_executable`/`_sanitize_env`/
+    `sanitized_git_subprocess_env` for every trusted executable name this
+    module resolves (`uv`, `git`, `ssh`, ...).
 
     Real-account-home `.local/bin` (Issue #2276 / #2280 decision record) is
-    included as a no-sudo local-dev convenience lane ONLY when
-    `executable_name == "uv"`. This is deliberately narrower than the
-    hostedtoolcache/system directories below, which are shared across every
-    trusted executable name this module resolves (e.g. `git`, via
-    `_resolve_trusted_executable("git", ...)`): unlike hostedtoolcache
-    (which structurally can only ever contain the pinned `uv`, never a
-    same-named `git`) and the system directories (which the exact-version
-    check does not gate for non-`uv` names either, but which are not
-    ordinarily same-UID-writable), a real account's `~/.local/bin` commonly
-    contains a whole toolchain -- `git` included -- installed by that same
-    account. Widening it into the shared, name-agnostic candidate list
-    would let a same-UID attacker's lookalike `git` (or any other
-    non-`uv` name resolved through this module) be trusted with zero
-    version-pin defense, since `_validate_trusted_executable_version` is a
-    no-op for names other than `uv` (Issue #2280 Out of Scope: this
-    module's `uv` trust boundary decision must not widen trust for any
-    other executable name). Keeping the account-home lane `uv`-scoped
-    closes that gap while still satisfying the no-sudo local-dev Outcome.
+    deliberately NOT included here: see `_resolve_trusted_executable`,
+    which adds it as a `uv`-only candidate on top of this shared list. This
+    list is shared across every executable name, and a real account's
+    `~/.local/bin` commonly contains a whole toolchain -- `git` included --
+    installed by that same account, unlike hostedtoolcache (which
+    structurally can only ever contain the pinned `uv`). Since
+    `_validate_trusted_executable_version` is a no-op for names other than
+    `uv`, widening this shared list to include account-home would let a
+    same-UID attacker's lookalike `git` (or any other non-`uv` name
+    resolved through this module) be trusted with zero version-pin defense
+    (Issue #2280 Out of Scope: this module's `uv` trust boundary decision
+    must not widen trust for any other executable name).
 
     This module does not claim to contain an attacker who already has
     arbitrary code execution as the same Unix account this process runs
     as -- such an attacker could modify any of these directories (or this
     module's own source) regardless of which ones are listed here; see
     `docs/dev/workflow.md` "Not Controlled". What this list *does* defend
-    is "unintended executable selection": ambient `PATH` pollution, a
-    spoofed `HOME` env var, and CWD/project-local substitution are all
-    excluded by construction (`_os_account_home` ignores `HOME`;
-    `_resolve_trusted_executable` rejects project-root paths), and for
-    `uv` specifically, anything resolved from a non-hostedtoolcache entry
-    below (including the account-home lane) still must pass the exact
-    `pyproject.toml`-pinned `uv --version` check before it is trusted. No
-    new dedicated `trusted-bin` directory, sudo installation step, or
+    is "unintended executable selection": ambient `PATH` pollution and
+    CWD/project-local substitution are excluded by construction. No new
+    dedicated `trusted-bin` directory, sudo installation step, or
     repository-owned checksum authority is introduced by this lane.
     """
-    entries = [
-        *_trusted_toolchain_dirs("uv"),
-        *(_trusted_account_home_uv_dir() if executable_name == "uv" else []),
-        "/usr/local/sbin",
-        "/usr/local/bin",
-        "/usr/sbin",
-        "/usr/bin",
-        "/sbin",
-        "/bin",
-    ]
+    return _dedupe_path_entries([*_trusted_toolchain_dirs("uv"), *_SYSTEM_STANDARD_PATH_DIRS])
+
+
+# Fixed system standard directories, shared by `_safe_path_entries()` and
+# `_resolve_trusted_executable`'s `uv`-only account-home extension below.
+_SYSTEM_STANDARD_PATH_DIRS: tuple[str, ...] = (
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
+
+
+def _dedupe_path_entries(entries: list[str]) -> list[str]:
     seen: set[str] = set()
     ordered: list[str] = []
     for entry in entries:
@@ -989,7 +986,26 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     `sys.executable`); this fix does not change which check is effective,
     only which string is returned once that check passes.
     """
-    safe_entries = _safe_path_entries(name)
+    # The account-home `.local/bin` lane (Issue #2276 / #2280) is added on
+    # top of the shared, name-agnostic `_safe_path_entries()` list ONLY for
+    # `uv` -- never for `git`, `ssh`, or any other name resolved through
+    # this function -- so that lane does not widen trust for executables
+    # whose resolution has no version-pin defense (see `_safe_path_entries`
+    # docstring). `_sanitize_env`/`sanitized_git_subprocess_env` also call
+    # `_safe_path_entries()` directly (without this addition), so the
+    # account-home lane never reaches the generic child `PATH` either.
+    # Ordering: hostedtoolcache first (strongest validation), then the
+    # account-home lane, then system standard directories -- so a
+    # correctly pinned hostedtoolcache `uv` is preferred over the
+    # local-dev convenience lane whenever both are present.
+    if name == "uv":
+        safe_entries = _dedupe_path_entries([
+            *_trusted_toolchain_dirs("uv"),
+            *_trusted_account_home_uv_dir(),
+            *_SYSTEM_STANDARD_PATH_DIRS,
+        ])
+    else:
+        safe_entries = _safe_path_entries()
     safe_path = os.pathsep.join(safe_entries)
     if name == "python3":
         resolved = sys.executable
