@@ -831,27 +831,28 @@ def test_fixture_human_context_real_subprocess_reaches_contract_update_required_
 
 
 def test_sanitize_env_trust_root_real_subprocess_ignores_home_override_ac3(tmp_path: Path):
-    """PR #2247 review P1-4.4 / Issue #2251: a real, out-of-process
-    subprocess boundary test for the trust-root invariant the in-process
-    call above exercises.
+    """PR #2247 review P1-4.4 / Issue #2251 / Issue #2276: a real,
+    out-of-process subprocess boundary test for the trust-root invariant
+    the in-process call above exercises.
 
-    Prior to Issue #2251, production trust resolution keyed off
-    `pwd.getpwuid(os.getuid()).pw_dir` (the real OS account home,
-    invariant to `HOME`) to decide *which* `.local/bin` to trust -- so a
-    subprocess launched with `HOME` overridden to an isolated directory
-    could not be used to *redirect* the trust root to that directory. Issue
-    #2251 closes the underlying CWE-427 same-UID gap entirely by dropping
-    account-home `.local/bin` -- both the real account's and any
-    HOME-overridden one -- from the trust root altogether (see
-    `_safe_path_entries()`). This test keeps the real-subprocess boundary
-    coverage instead of relying solely on the in-process mock: it spawns an
-    actual child process (same OS account, `HOME` overridden to a fresh
-    empty isolated directory, matching what the Claude-GPT launcher does)
-    and asserts, from the CHILD's own stdout, that `_safe_path_entries()`
-    contains NO `.local/bin` entry at all -- neither the isolated `HOME`
-    the child process itself was launched with, nor the real account home.
-    This is deliberately independent of (and does not replace) the
-    in-process mock test immediately above."""
+    Production trust resolution keys off `pwd.getpwuid(os.getuid()).pw_dir`
+    (the real OS account home, invariant to `HOME`) to decide *which*
+    `.local/bin` to trust -- so a subprocess launched with `HOME`
+    overridden to an isolated directory cannot be used to *redirect* the
+    trust root to that directory. Issue #2251 originally closed the
+    underlying CWE-427 same-UID gap by dropping account-home `.local/bin`
+    entirely from the trust root; Issue #2276 / #2280 re-permits the REAL
+    account home's `.local/bin` as a no-sudo local-dev lane (still gated by
+    the exact-version pin), while keeping any `HOME`-overridden path
+    untrusted. This test keeps the real-subprocess boundary coverage
+    instead of relying solely on the in-process mock: it spawns an actual
+    child process (same OS account, `HOME` overridden to a fresh empty
+    isolated directory, matching what the Claude-GPT launcher does) and
+    asserts, from the CHILD's own stdout, that `_safe_path_entries()`
+    contains no entry derived from the isolated `HOME` override, while the
+    real account home's `.local/bin` (if present on this machine) is
+    unaffected by that override. This is deliberately independent of (and
+    does not replace) the in-process mock test immediately above."""
     real_account_home = pwd.getpwuid(os.getuid()).pw_dir
     isolated_home = tmp_path / "isolated-home-real-subprocess"
     isolated_home.mkdir()
@@ -873,12 +874,13 @@ def test_sanitize_env_trust_root_real_subprocess_ignores_home_override_ac3(tmp_p
     )
 
     entries = json.loads(result.stdout)
-    local_bin_entries = [e for e in entries if e.endswith(str(Path(".local") / "bin"))]
-    assert not local_bin_entries, (entries, result.stderr)
+    real_account_local_bin = str(Path(real_account_home) / ".local" / "bin")
+    isolated_local_bin_entries = [
+        e for e in entries
+        if e.endswith(str(Path(".local") / "bin")) and e != real_account_local_bin
+    ]
+    assert not isolated_local_bin_entries, (entries, result.stderr)
     assert not any(str(isolated_home) in entry for entry in entries), (entries, result.stderr)
-    assert not any(
-        str(Path(real_account_home) / ".local" / "bin") == entry for entry in entries
-    ), (entries, result.stderr)
 
 
 def test_fixture_human_context_sibling_rejects_cross_lane_and_binding_inputs_before_child(tmp_path: Path):
