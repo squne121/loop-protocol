@@ -269,36 +269,6 @@ hook_boundaries_manifest_v1:
       #2265 により廃止済みで、いずれの mode でも write は発生しない。
       handler_id はスクリプトファイル名（guard-japanese-prose）と一致する。
 
-  - handler_id: rtk_boundary_shadow_guard
-    event: PreToolUse
-    matcher: "Bash"
-    command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/rtk_boundary_shadow_guard.sh"
-    args: []
-    timeout: 10
-    classification: telemetry
-    fail_policy: fail_open
-    script_exit_contract:
-      normal: 0
-      internal_producer_failure: 0
-    claude_event_semantics:
-      event: PreToolUse
-      exit_2_effect: blocks_tool_call
-      other_nonzero_effect: non_blocking_error_or_stderr_visible
-    stdout_contract: silent
-    stderr_contract: jsonl_shadow_log_only
-    redaction_contract:
-      no_raw_command: true
-      no_raw_secret_like_value: true
-      no_raw_transcript: true
-      no_manifest_body_on_stdout: true
-    agent_action:
-      on_any: proceed
-    notes: >
-      rtk trust boundary の direct bypass を shadow モードで記録するのみ。
-      block は一切行わず、常に exit 0。
-      task blocker にしてはならない（AC2）。
-      hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
-
   - handler_id: session_manifest_coordinator
     event: Stop
     matcher: null
@@ -533,7 +503,6 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 | `local_main_branch_guard.sh` | blocker | **操作を停止（block）** |
 | `worktree_scope_guard.sh` | blocker | **操作を停止（block）** |
 | `guard-japanese-prose.sh` | mode_dependent | unset/off/shadow(legacy alias) モード: 継続（block なし、persistent log なし）/ invalid モード: 継続（exit 1 non-blocking diagnostic、stderr に invalid_guard_mode）/ enforce モード: **停止** |
-| `rtk_boundary_shadow_guard.sh` | telemetry | 継続（log のみ） |
 | `ci_test_performance_advisory.sh` | warning / fail_open | 継続（advisory 出力のみ、block なし） |
 | `session_manifest_coordinator.sh`（Stop） | telemetry | 継続 |
 | `session_manifest_coordinator.sh`（SubagentStop） | telemetry | 継続 |
@@ -560,7 +529,6 @@ AC2 対応: 以下の best-effort telemetry フックは作業 blocker にしな
 
 - `session_manifest_coordinator.sh`（Stop / SubagentStop）: 停止時コーディネータ
 - `session_manifest_debounce.mjs`（PostToolUse front gate）: 事前集約ゲート
-- `rtk_boundary_shadow_guard.sh`（PreToolUse）: shadow 記録ガード
 
 これらは全て `fail_policy: fail_open` で設計されており、hook failure 時も exit 0 を返す（AC2）。
 
@@ -610,7 +578,6 @@ AC10 対応: telemetry hook failure は **task blocker ではない** が、以�
 - `session_manifest_coordinator.sh`: stderr に diagnostic を出力（最大 10 行）し、artifact 欠落を記録
 - `session_manifest_debounce.mjs`: stderr に front gate / flush / producer timeout の machine-readable summary を出力し、artifact 欠落を記録
 - `generate_session_manifest_from_hook.mjs`: downstream producer failure を redacted stderr に出力し、artifact 欠落を記録
-- `rtk_boundary_shadow_guard.sh`: JSONL shadow log に記録（log write 失敗時は無言で pass）
 
 PR review・session 終了時に artifact 欠落が検出された場合、follow-up issue として記録・追跡する。
 
