@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -230,12 +231,120 @@ class TestSettingsManifestAlignment:
         )
 
 
+# ─── AC4 (fix_delta P1): base revision との実際の topology delta 証明 ─────────
+
+# このPR（Issue #2264 / PR #2270）の base revision（merge-base）。
+# rtk_boundary_shadow_guard 削除前の .claude/settings.json 状態を表す。
+# OWNER fix_delta（2026-08-20, PR #2270 REQUEST_CHANGES）により追加。
+# TestSettingsManifestAlignment は head 内の manifest(docs) vs head 内の
+# settings.json の整合のみを検証しており、settings.json と docs と test
+# expectation が同時に誤変更されても pass し得る脆弱性を持つ。本テストは
+# 実際の git revision 間の diff を機械的に検証し、この脆弱性を塞ぐ。
+BASE_REVISION_SHA = "a50c5e659b43b0cf977fc35b8a02c5a17eb1f5fd"
+
+
+def _load_settings_hooks_at_revision(revision: str) -> list[dict[str, Any]]:
+    """指定した git revision の .claude/settings.json を読み、正規化済み hook リストを返す。
+
+    SKIP は用いない。git show が失敗した場合（fetch-depth 不足等）はテストを
+    fail させる（fallback や SKIP guard は Issue #2264 fix_delta の禁止事項）。
+    """
+    result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "show", f"{revision}:.claude/settings.json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"git show {revision}:.claude/settings.json に失敗しました "
+        f"(fetch-depth 不足の可能性があります): stderr={result.stderr!r}"
+    )
+    settings = json.loads(result.stdout)
+    return checker.extract_settings_hooks(settings)
+
+
+def _hook_tuple(entry: dict[str, Any]) -> tuple[Any, ...]:
+    """matcher/command/args/timeout を比較可能なタプル化する。"""
+    return (
+        entry["handler_id"],
+        entry["event"],
+        entry["matcher"],
+        entry["command"],
+        tuple(entry["args"]),
+        entry["timeout"],
+    )
+
+
+class TestBaseHeadHookTopologyDelta:
+    """AC4 (fix_delta P1): base revision と head revision 間の実際の PreToolUse
+    hook topology delta を検証する。
+
+    Issue #2264 が要求する「削除は rtk_boundary_shadow_guard 1 handler のみ、
+    surviving handler は不変、added=0」を、head 内整合チェック（
+    TestSettingsManifestAlignment）だけでなく base/head 間の実際の git diff
+    から機械的に証明する。
+    """
+
+    REMOVED_HANDLER_ID = "rtk_boundary_shadow_guard"
+    REMOVED_EVENT = "PreToolUse"
+
+    def test_topology_delta_is_exact_single_handler_removal(self) -> None:
+        base_entries = _load_settings_hooks_at_revision(BASE_REVISION_SHA)
+        head_entries = _load_settings_hooks_at_revision("HEAD")
+
+        base_by_key = {(e["handler_id"], e["event"]): e for e in base_entries}
+        head_by_key = {(e["handler_id"], e["event"]): e for e in head_entries}
+
+        base_keys = set(base_by_key)
+        head_keys = set(head_by_key)
+
+        removed_keys = base_keys - head_keys
+        added_keys = head_keys - base_keys
+        common_keys = base_keys & head_keys
+
+        # 1. removed_handlers == {rtk_boundary_shadow_guard の exact handler tuple}
+        expected_removed_key = (self.REMOVED_HANDLER_ID, self.REMOVED_EVENT)
+        assert removed_keys == {expected_removed_key}, (
+            f"removed handlers が想定と異なります: {removed_keys} "
+            f"(期待: {{{expected_removed_key}}})"
+        )
+        removed_entry = base_by_key[expected_removed_key]
+        assert removed_entry["matcher"] == "Bash", (
+            f"removed handler の matcher が想定外です: {removed_entry['matcher']!r}"
+        )
+        assert removed_entry["command"] == (
+            "${CLAUDE_PROJECT_DIR}/.claude/hooks/rtk_boundary_shadow_guard.sh"
+        ), f"removed handler の command が想定外です: {removed_entry['command']!r}"
+        assert removed_entry["args"] == [], (
+            f"removed handler の args が想定外です: {removed_entry['args']!r}"
+        )
+        assert removed_entry["timeout"] == 10, (
+            f"removed handler の timeout が想定外です: {removed_entry['timeout']!r}"
+        )
+
+        # 2. added_handlers == ∅
+        assert added_keys == set(), (
+            f"added handlers が検出されました（想定は0件）: {added_keys}"
+        )
+
+        # 3. changed_survivors == ∅
+        #    （他の全 handler の matcher/command/args/timeout が base/head で完全一致）
+        changed_survivors = []
+        for key in sorted(common_keys):
+            base_tuple = _hook_tuple(base_by_key[key])
+            head_tuple = _hook_tuple(head_by_key[key])
+            if base_tuple != head_tuple:
+                changed_survivors.append((key, base_tuple, head_tuple))
+        assert not changed_survivors, (
+            f"surviving handler の topology が変化しています: {changed_survivors}"
+        )
+
+
 # ─── AC2: telemetry hooks の分類確認 ─────────────────────────────────────────
 
 class TestTelemetryHooksClassification:
     TELEMETRY_HOOKS = {
         "session_manifest_coordinator",
-        "rtk_boundary_shadow_guard",
     }
 
     def test_telemetry_hooks_classified(self, manifest_entries: list[dict[str, Any]]) -> None:
