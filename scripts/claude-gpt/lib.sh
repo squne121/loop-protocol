@@ -72,6 +72,32 @@ claude_gpt_evidence_dir() {
   printf '%s/.evidence\n' "$script_dir"
 }
 
+# --- Issue #2259: 隔離 Claude-GPT の issue.create 要求を処理する parent bridge。
+# ソケット / ledger は CLAUDE_GPT_HOME 配下の専用ディレクトリに置く（HOME isolation
+# ディレクトリ群とは別。bridge server は launcher 自身の信頼された ambient
+# credential で動作するため、Claude 子プロセス向けの隔離 HOME とは混同しない）。
+claude_gpt_issue_create_bridge_dir() {
+  printf '%s/issue-create-bridge\n' "$CLAUDE_GPT_HOME"
+}
+
+# 引数1: run_id（例: $$。同時に複数 launcher が起動しても衝突しないよう
+# 呼び出し元が一意な値を渡す）
+claude_gpt_issue_create_bridge_socket_path() {
+  printf '%s/bridge-%s.sock\n' "$(claude_gpt_issue_create_bridge_dir)" "$1"
+}
+
+claude_gpt_issue_create_bridge_ledger_path() {
+  printf '%s/ledger.jsonl\n' "$(claude_gpt_issue_create_bridge_dir)"
+}
+
+# 32 byte の run-scoped random nonce を hex で生成する（POSIX sh 準拠、
+# openssl 依存なし）。bridge request の run_nonce フィールドと照合し、
+# 別 run の bridge socket へ迷い込んだ request を拒否するための run-scoping。
+claude_gpt_generate_run_nonce() {
+  od -An -tx1 -N32 /dev/urandom | tr -d ' \n'
+  printf '\n'
+}
+
 # --- Model alias mapping（Parent #2154 アーキテクチャ決定 E 準拠） ---
 # opus -> gpt-5.6-sol / sonnet -> gpt-5.6-terra（main 推奨） / haiku -> gpt-5.6-luna
 #

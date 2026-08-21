@@ -1204,11 +1204,22 @@ echo "CLAUDE_GPT_PROXY_PORT=${PROXY_PORT}" >&2
 echo "CLAUDE_GPT_PROXY_LOG=${PROXY_LOG}" >&2
 echo "CLAUDE_GPT_PROXY_PID=${PROXY_PID}" >&2
 
+# --- Issue #2259: 隔離 Claude-GPT の issue.create 要求を処理する parent bridge の
+#     endpoint（socket path / run nonce）をここで計算する。実際の bridge server
+#     process 起動は通常起動経路（HOME isolation 切り替え直前）でのみ行うが、
+#     endpoint 自体は check-only でも計算し JSON へ含めることで、fake claude/proxy
+#     を用意せず本経路を hermetic に検証できるようにする（AC2/AC3 の配線確認）。 ---
+BRIDGE_SOCKET_PATH=$(claude_gpt_issue_create_bridge_socket_path "$$")
+BRIDGE_LEDGER_PATH=$(claude_gpt_issue_create_bridge_ledger_path)
+BRIDGE_RUN_NONCE=$(claude_gpt_generate_run_nonce)
+BRIDGE_RUN_NONCE_LEN=${#BRIDGE_RUN_NONCE}
+
 if [ "$CHECK_ONLY" = "true" ]; then
   kill "$PROXY_PID" 2>/dev/null
   wait "$PROXY_PID" 2>/dev/null
-  printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"ok","mode":"check_only","port":%s,"bind_ok":%s,"model_alias_ok":%s,"strict_mcp_mode":%s,"mcp_config_path":"%s","settings_path":"%s","proxy_home_dir":"%s","proxy":{"absolute_path":"%s","version":"%s"},"preflight":%s}\n' \
-    "$PROXY_PORT" "$BIND_OK" "$MODEL_ALIAS_OK" "$STRICT_MCP_MODE" "$MCP_CONFIG_PATH" "$SETTINGS_PATH" "$PROXY_HOME_TARGET" "$PROXY_BIN_TARGET" "$PROXY_VERSION_TARGET" "$PREFLIGHT_JSON"
+  printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"ok","mode":"check_only","port":%s,"bind_ok":%s,"model_alias_ok":%s,"strict_mcp_mode":%s,"mcp_config_path":"%s","settings_path":"%s","proxy_home_dir":"%s","proxy":{"absolute_path":"%s","version":"%s"},"preflight":%s,"issue_create_bridge":{"socket_path":"%s","ledger_path":"%s","run_nonce_len":%s}}\n' \
+    "$PROXY_PORT" "$BIND_OK" "$MODEL_ALIAS_OK" "$STRICT_MCP_MODE" "$MCP_CONFIG_PATH" "$SETTINGS_PATH" "$PROXY_HOME_TARGET" "$PROXY_BIN_TARGET" "$PROXY_VERSION_TARGET" "$PREFLIGHT_JSON" \
+    "$BRIDGE_SOCKET_PATH" "$BRIDGE_LEDGER_PATH" "$BRIDGE_RUN_NONCE_LEN"
   exit 0
 fi
 
@@ -1269,6 +1280,40 @@ export STRICT_MCP_MODE
 #     GH_TOKEN 系 / SSH_AUTH_SOCK / GIT_ASKPASS 系を scrub することで、raw `gh` /
 #     raw `git push`（SSH 経由を含む）を Claude セッション内から実行しても
 #     既存 authentication に到達できない状態にする。 ---
+# --- Issue #2259: parent bridge server の起動。launcher 自身の trusted ambient
+#     env（実 HOME/GH_CONFIG_DIR/GH_TOKEN 等）がまだ生きているこの時点で起動する
+#     ことで、bridge server プロセスだけが GitHub write credential へ到達できる
+#     状態を作る（Outcome 節）。子 Claude プロセスは isolation profile 環境変数
+#     経由でのみこの bridge と通信し、raw gh には到達しない。 ---
+BRIDGE_REPO=$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null | sed -E 's#.*github\.com[:/]##; s#\.git$##')
+# CLAUDE_GPT_ISSUE_CREATE_BRIDGE_GH_BIN: bridge server 起動時にのみ参照する gh 実行
+# ファイルの上書き（既定 "gh"）。runtime_smoke_test.sh の issue_create シナリオが
+# 実 GitHub network を叩かない fake gh provider に差し替えるための唯一の入口。
+BRIDGE_GH_BIN="${CLAUDE_GPT_ISSUE_CREATE_BRIDGE_GH_BIN:-gh}"
+mkdir -p "$(dirname "$BRIDGE_SOCKET_PATH")"
+uv run --locked python3 "$SCRIPT_DIR/issue_create_bridge_server.py" \
+  --socket-path "$BRIDGE_SOCKET_PATH" \
+  --run-nonce "$BRIDGE_RUN_NONCE" \
+  --repo "$BRIDGE_REPO" \
+  --gh "$BRIDGE_GH_BIN" \
+  --ledger-path "$BRIDGE_LEDGER_PATH" \
+  --repo-root "$REPO_ROOT" \
+  >/dev/null 2>&1 &
+BRIDGE_PID=$!
+
+# bridge server がソケットを bind するまで bounded wait（最大 5 秒）。
+BRIDGE_WAIT_ATTEMPTS=0
+while [ ! -S "$BRIDGE_SOCKET_PATH" ] && [ "$BRIDGE_WAIT_ATTEMPTS" -lt 50 ]; do
+  sleep 0.1
+  BRIDGE_WAIT_ATTEMPTS=$((BRIDGE_WAIT_ATTEMPTS + 1))
+done
+echo "CLAUDE_GPT_ISSUE_CREATE_BRIDGE_PID=${BRIDGE_PID}" >&2
+echo "CLAUDE_GPT_ISSUE_CREATE_BRIDGE_SOCKET=${BRIDGE_SOCKET_PATH}" >&2
+
+export CLAUDE_GPT_ISOLATION_PROFILE=1
+export CLAUDE_GPT_ISSUE_CREATE_SOCKET="$BRIDGE_SOCKET_PATH"
+export CLAUDE_GPT_ISSUE_CREATE_RUN_NONCE="$BRIDGE_RUN_NONCE"
+
 export HOME="$CLAUDE_ISOLATED_HOME_TARGET"
 export GH_CONFIG_DIR="$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET"
 export XDG_CONFIG_HOME="$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET"
@@ -1303,6 +1348,17 @@ claude_gpt_cleanup() {
   if kill -0 "$PROXY_PID" 2>/dev/null; then
     kill "$PROXY_PID" 2>/dev/null
     wait "$PROXY_PID" 2>/dev/null
+  fi
+  # Issue #2259: parent bridge server も launcher が所有する終了/cleanup 対象。
+  # SIGTERM を送ると server 側が自身のソケットファイルを削除して終了するが
+  # (issue_create_bridge_server.py の SIGTERM handler)、念のためここでも
+  # best-effort でソケットファイルを削除する。
+  if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
+    kill "$BRIDGE_PID" 2>/dev/null
+    wait "$BRIDGE_PID" 2>/dev/null
+  fi
+  if [ -n "$BRIDGE_SOCKET_PATH" ] && [ -S "$BRIDGE_SOCKET_PATH" ]; then
+    rm -f "$BRIDGE_SOCKET_PATH" 2>/dev/null
   fi
 }
 

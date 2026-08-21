@@ -37,6 +37,25 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
 # shellcheck source=./lib.sh
 . "$SCRIPT_DIR/lib.sh"
 
+# --- Issue #2259 AC10: --scenario issue_create は、isolated Claude-GPT の
+#     issue.create 要求が parent bridge 経由で処理される実経路（実 launch.sh →
+#     実 Claude-GPT session → Bash tool 経由の create_issue_txn.py → bridge
+#     client/server → deterministic fake gh provider → 独立 ledger 確認）を
+#     通す専用シナリオ。既定（引数なし）は従来どおりの Issue #2158/#2204 の
+#     canary シナリオ（Phase 0 以降、本ファイルの残り全体）。 ---
+SCENARIO="default"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --scenario)
+      SCENARIO="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
 EVIDENCE_DIR=$(claude_gpt_evidence_dir "$SELF_PATH")
 mkdir -p "$EVIDENCE_DIR"
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -81,6 +100,112 @@ if [ "$PREFLIGHT_ENV_RC" -eq 3 ] || [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
     "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" > "$EVIDENCE_FILE"
   echo "SKIP: ${SKIP_REASON} のため runtime smoke test を実行できません。証跡: ${EVIDENCE_FILE}"
   exit 77
+fi
+
+if [ "$SCENARIO" = "issue_create" ]; then
+  # --- Issue #2259 AC10: 実 launch.sh -> 実 Claude-GPT session -> Bash tool 経由の
+  #     create_issue_txn.py -> bridge client/server -> deterministic fake gh
+  #     provider という実経路を通す。判定は model の自己申告 transcript ではなく、
+  #     fake gh が独立に書き出す state file（この run 専用の一意 title でのみ
+  #     match する）を正本とする。 ---
+  ISSUE_CREATE_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+  ISSUE_CREATE_RUN_ID="rt-${ISSUE_CREATE_TIMESTAMP}-$$"
+  ISSUE_CREATE_TITLE="実装: runtime smoke issue_create canary ${ISSUE_CREATE_RUN_ID}"
+  ISSUE_CREATE_BODY_FILE=$(mktemp)
+  cat > "$ISSUE_CREATE_BODY_FILE" <<'ISSUE_CREATE_BODY_EOF'
+## Acceptance Criteria
+
+- [ ] AC1: runtime smoke canary body
+
+## Verification Commands
+
+```bash
+test -n "ok"  # AC1
+```
+
+## Allowed Paths
+
+- src/**
+ISSUE_CREATE_BODY_EOF
+
+  ISSUE_CREATE_FAKE_GH="$SCRIPT_DIR/tests/fixtures/fake_gh.py"
+  chmod +x "$ISSUE_CREATE_FAKE_GH" 2>/dev/null
+  ISSUE_CREATE_FAKE_GH_STATE=$(mktemp -u)
+
+  ISSUE_CREATE_STDOUT=$(mktemp)
+  ISSUE_CREATE_STDERR=$(mktemp)
+  ISSUE_CREATE_PROMPT="You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Bash tool right now (an actual tool call, not a description) to run exactly: uv run --locked python3 .claude/skills/create-issue/scripts/create_issue_txn.py --repo squne121/loop-protocol --title \"${ISSUE_CREATE_TITLE}\" --body-file ${ISSUE_CREATE_BODY_FILE} --issue-kind \"\" --label-profile standard
+Then print its exact stdout output verbatim and nothing else."
+
+  FAKE_GH_STATE="$ISSUE_CREATE_FAKE_GH_STATE"   CLAUDE_GPT_ISSUE_CREATE_BRIDGE_GH_BIN="$ISSUE_CREATE_FAKE_GH"     "$SCRIPT_DIR/launch.sh" -- -p "$ISSUE_CREATE_PROMPT" --output-format text --no-session-persistence     --allowedTools "Bash"     >"$ISSUE_CREATE_STDOUT" 2>"$ISSUE_CREATE_STDERR"
+  ISSUE_CREATE_CLAUDE_RC=$?
+
+  rm -f "$ISSUE_CREATE_STDOUT" "$ISSUE_CREATE_STDERR" "$ISSUE_CREATE_BODY_FILE"
+
+  ISSUE_CREATE_INDEPENDENT_OK="false"
+  ISSUE_CREATE_ISSUE_NUMBER="null"
+  if [ -f "$ISSUE_CREATE_FAKE_GH_STATE" ]; then
+    ISSUE_CREATE_MATCH_JSON=$(python3 -c '
+import json, sys
+title, path = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as fh:
+        state = json.load(fh)
+except (OSError, json.JSONDecodeError):
+    print("null")
+    raise SystemExit(0)
+for number, info in state.get("issues", {}).items():
+    if info.get("title") == title:
+        print(json.dumps({"number": int(number)}))
+        raise SystemExit(0)
+print("null")
+' "$ISSUE_CREATE_TITLE" "$ISSUE_CREATE_FAKE_GH_STATE" 2>/dev/null)
+    if [ -n "$ISSUE_CREATE_MATCH_JSON" ] && [ "$ISSUE_CREATE_MATCH_JSON" != "null" ]; then
+      ISSUE_CREATE_INDEPENDENT_OK="true"
+      ISSUE_CREATE_ISSUE_NUMBER=$(printf '%s' "$ISSUE_CREATE_MATCH_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["number"])' 2>/dev/null || echo null)
+    fi
+  fi
+  rm -f "$ISSUE_CREATE_FAKE_GH_STATE"
+
+  ISSUE_CREATE_STATUS="fail"
+  ISSUE_CREATE_EXIT_CODE=1
+  if [ "$ISSUE_CREATE_CLAUDE_RC" -eq 0 ] && [ "$ISSUE_CREATE_INDEPENDENT_OK" = "true" ] && [ "$SUT_GIT_DIRTY" = "false" ]; then
+    ISSUE_CREATE_STATUS="pass"
+    ISSUE_CREATE_EXIT_CODE=0
+  fi
+
+  ISSUE_CREATE_EVIDENCE_FILE="${EVIDENCE_DIR}/smoke-issue-create-${ISSUE_CREATE_TIMESTAMP}.json"
+  python3 -c '
+import json, sys
+data = {
+    "schema": "CLAUDE_GPT_SMOKE_RESULT_V1",
+    "scenario": "issue_create",
+    "status": sys.argv[1],
+    "generated_at": sys.argv[2],
+    "sut": {
+        "launcher_path": sys.argv[3],
+        "repository_root": sys.argv[4],
+        "git_head": sys.argv[5],
+        "git_dirty": sys.argv[6],
+        "launch_sh_sha256": sys.argv[7],
+        "lib_sh_sha256": sys.argv[8],
+    },
+    "issue_create": {
+        "claude_exit_code": int(sys.argv[9]),
+        "title": sys.argv[10],
+        "independent_fake_gh_state_match_ok": sys.argv[11] == "true",
+        "issue_number": (int(sys.argv[12]) if sys.argv[12] != "null" else None),
+    },
+}
+print(json.dumps(data, ensure_ascii=False, indent=2))
+' "$ISSUE_CREATE_STATUS" "$ISSUE_CREATE_TIMESTAMP"     "$SUT_LAUNCHER_PATH" "$SUT_REPO_ROOT" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256"     "$ISSUE_CREATE_CLAUDE_RC" "$ISSUE_CREATE_TITLE" "$ISSUE_CREATE_INDEPENDENT_OK" "$ISSUE_CREATE_ISSUE_NUMBER"     > "$ISSUE_CREATE_EVIDENCE_FILE"
+
+  if [ "$ISSUE_CREATE_STATUS" = "pass" ]; then
+    echo "PASS: issue_create runtime scenario が成功しました（issue_number=${ISSUE_CREATE_ISSUE_NUMBER}）。証跡: ${ISSUE_CREATE_EVIDENCE_FILE}"
+  else
+    echo "FAIL: issue_create runtime scenario が失敗しました（claude_rc=${ISSUE_CREATE_CLAUDE_RC}, independent_ok=${ISSUE_CREATE_INDEPENDENT_OK}, git_dirty=${SUT_GIT_DIRTY}）。証跡: ${ISSUE_CREATE_EVIDENCE_FILE}"
+  fi
+  exit "$ISSUE_CREATE_EXIT_CODE"
 fi
 
 # =========================================================================

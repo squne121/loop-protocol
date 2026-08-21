@@ -547,6 +547,7 @@ uv run --locked python3 .claude/skills/create-issue/scripts/plan_child_materiali
 - `docs/dev/github-ops.md` — `gh` CLI 利用規約、Parent Mode、コメント記録テンプレ
 - `docs/dev/directory-structure.md` — リポジトリ構造
 - `docs/dev/current-focus.md` — 現在のフェーズ・優先項目
+- `docs/dev/secret-policy.md` — Secret Inventory・GitHub write credential の isolation/broker 境界（isolated Claude-GPT の issue.create parent-mediated narrow bridge を含む、#2259）
 - `docs/adr/` — アーキテクチャ決定記録
 - `docs/product/` — プロダクト仕様
 - ルート `CLAUDE.md` — プロジェクト憲法（自動ロード）

@@ -146,6 +146,33 @@ raw `gh` / raw `git push` 全般に対する production-grade な credential bou
 
 ---
 
+#### isolated Claude-GPT の issue.create 要求を処理する parent-mediated narrow bridge（認証情報の境界）(#2259)
+
+`scripts/claude-gpt/launch.sh` が明示する credential-isolated profile
+（`CLAUDE_GPT_ISOLATION_PROFILE=1`）では、isolated Claude-GPT 子プロセス側の
+`.claude/skills/create-issue/scripts/create_issue_txn.py` は raw `gh issue create`
+を一切起動せず、`.claude/skills/create-issue/scripts/issue_create_bridge_client.py`
+経由で closed-schema `ISOLATION_ISSUE_CREATE_REQUEST_V1` request を run-scoped
+Unix domain socket 経由（stdout 混在なし）で launcher-owned parent bridge server
+（`scripts/claude-gpt/issue_create_bridge_server.py`）へ送信する。
+
+parent bridge server は launcher 自身の trusted ambient credential（実 `HOME`/
+`GH_CONFIG_DIR`/`GH_TOKEN` 等、Claude 子プロセスへの isolation 切り替え前）を
+保持したまま、repository・credential source・helper path・`gh` 実行ファイル
+パスを server 側で固定し（child request からの上書き不可）、trusted
+`create_issue_txn.py` を subprocess として起動する際に bridge 関連 env var を
+明示的に strip する（no-recursion 保証）。GitHub write credential はこの
+parent bridge server プロセスのみが保持し、isolated Claude-GPT/AGY プロセスの
+ambient environment には一切渡さない。
+
+本 bridge は #2203 の canary-lifecycle broker（上記）や follow-up Issue #2223
+（Owner Decision により CLOSED・汎用 broker/新規 enforcing hook は不採用）とは
+別物であり、GitHub security authority や workflow-wide generic broker では
+ない。credential/capability transport および mutation correctness helper と
+してスコープが限定されている（詳細は Issue #2259 本文の Outcome 節参照）。
+
+---
+
 ### 5. `checkpoint_token` — session 記録ツール用 token
 
 | 項目 | 内容 |

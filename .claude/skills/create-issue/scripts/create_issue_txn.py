@@ -27,15 +27,18 @@ caller wiring at this time.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dataclass_replace
 from pathlib import Path
 from typing import Any, Literal
+
+import issue_create_bridge_client
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +115,11 @@ class TransactionResult:
     failed_readbacks: list[dict] = field(default_factory=list)
     pending_steps: list[str] = field(default_factory=list)
     audit_comment_posted: bool | None = None
+    # Authoritative post-create readback fields (Issue #2259 AC7). Populated by
+    # run_transaction_with_authoritative_readback(); left None for callers that
+    # invoke run_transaction() directly (unchanged, backward compatible).
+    node_id: str | None = None
+    body_sha256: str | None = None
 
 
 def run_command(
@@ -2642,6 +2650,57 @@ def run_transaction(
         )
 
 
+def run_transaction_with_authoritative_readback(
+    *,
+    repo: str,
+    title: str,
+    body: str,
+    body_file: str,
+    labels: list[str],
+    issue_kind: str = "",
+    label_profile: str = "standard",
+    parent_issue_number: int,
+    dependency_issue_numbers: list[int | str],
+    gh_bin: str,
+    blocking_issue_numbers: list[int | str] | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> TransactionResult:
+    """Wrap run_transaction() with an authoritative post-create GraphQL readback
+    of node_id, plus a body_sha256 computed from the effective body text
+    (Issue #2259 AC7). Used by the isolated-profile bridge dispatch path in
+    main(); run_transaction() itself is left untouched for existing callers.
+    """
+    result = run_transaction(
+        repo=repo,
+        title=title,
+        body=body,
+        body_file=body_file,
+        labels=labels,
+        issue_kind=issue_kind,
+        label_profile=label_profile,
+        parent_issue_number=parent_issue_number,
+        dependency_issue_numbers=dependency_issue_numbers,
+        gh_bin=gh_bin,
+        blocking_issue_numbers=blocking_issue_numbers,
+        sleep_fn=sleep_fn,
+    )
+    if result.issue_number is None:
+        return result
+    node_id: str | None = None
+    try:
+        node_id, _ = _issue_graphql_ids(repo, result.issue_number, gh_bin)
+    except TransactionError:
+        node_id = None
+    effective_body = body
+    if body_file:
+        try:
+            effective_body = Path(body_file).read_text(encoding="utf-8")
+        except OSError:
+            effective_body = body
+    body_sha256 = hashlib.sha256(effective_body.encode("utf-8")).hexdigest()
+    return _dataclass_replace(result, node_id=node_id, body_sha256=body_sha256)
+
+
 def reconcile_transaction(
     *,
     repo: str,
@@ -2916,6 +2975,67 @@ def reconcile_transaction(
     )
 
 
+def _run_create_via_isolated_bridge(args: argparse.Namespace) -> TransactionResult:
+    """Isolated-profile dispatch path (Issue #2259 AC2). Never invokes raw
+    ``gh issue create`` -- builds a closed-schema request and sends it over the
+    launcher-owned parent bridge Unix domain socket instead."""
+    body_text = args.body
+    if args.body_file:
+        try:
+            body_text = Path(args.body_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            return TransactionResult(
+                status="failure",
+                issue_number=None,
+                issue_url=None,
+                completed_steps=[],
+                failure_stage="body-file-read",
+                failure_message=str(exc),
+            )
+    try:
+        request = issue_create_bridge_client.build_request(
+            claimed_repo=args.repo,
+            title=args.title,
+            body=body_text,
+            labels=list(args.label),
+            issue_kind=args.issue_kind,
+            label_profile=args.label_profile,
+            parent_issue_number=(args.parent_issue or None),
+            dependency_issue_numbers=[int(v) for v in args.dependency],
+            blocking_issue_numbers=[int(v) for v in args.blocking],
+        )
+        bridge_result = issue_create_bridge_client.send_issue_create_request(request)
+    except (
+        issue_create_bridge_client.BridgeClientError,
+        issue_create_bridge_client.BridgeSchemaError,
+    ) as exc:
+        return TransactionResult(
+            status="failure",
+            issue_number=None,
+            issue_url=None,
+            completed_steps=[],
+            failure_stage="bridge-transport",
+            failure_message=str(exc),
+        )
+
+    status_map = {
+        "success": "success",
+        "duplicate": "success",
+        "partial_failure": "partial_failure",
+        "failure": "failure",
+    }
+    return TransactionResult(
+        status=status_map.get(bridge_result["status"], "failure"),
+        issue_number=bridge_result["issue_number"],
+        issue_url=bridge_result["issue_url"],
+        completed_steps=list(bridge_result["completed_steps"]),
+        failure_stage=bridge_result["failure_stage"],
+        failure_message=bridge_result["failure_message"],
+        node_id=bridge_result["node_id"],
+        body_sha256=bridge_result["body_sha256"],
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if getattr(args, "subcommand", "create") == "reconcile":
@@ -2928,6 +3048,8 @@ def main(argv: list[str] | None = None) -> int:
             blocking_issue_numbers=args.blocking,
             gh_bin=args.gh,
         )
+    elif issue_create_bridge_client.is_isolated_profile():
+        result = _run_create_via_isolated_bridge(args)
     else:
         result = run_transaction(
             repo=args.repo,
