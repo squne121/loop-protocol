@@ -16,7 +16,7 @@ PR review の失敗など、artifact chain から独立した安全境界に限�
 
 ループ開始前に LOOP_STATE を初期化し、必要な前提を確認する。
 
-## Root-Owned Synchronous Entry Transition Consumer（統一 Entry Policy, #2272 正本）
+## Root-Owned Synchronous Entry Transition Consumer（ルート起点の同期エントリ遷移コンシューマ、統一 Entry Policy, #2272 正本）
 
 `impl-review-loop` の Step 1 起動判断は、root/main thread が同一 control flow 内で
 生成する process-local `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1`（producer:
@@ -35,7 +35,9 @@ body/base drift の区別・bounded retry・nonce 方針は
   `invocation_token` を持たないため、consumer は常に拒否し fresh review へ差し戻す
   （Handoff Rule: コメント再取得は audit telemetry であり、単独では実装を authorize
   しない）。
-- 下記「0. Intake Gate」の `stale_contract_review` サブ理由は、
+- 下記「0. Intake Gate」で定義する優先順位付き停止理由（サブ理由）のうち、
+  最高優先の理由（title prefix 欠落等）に次ぐ 2 番目の理由、すなわち陳腐化した
+  契約レビュー（go コメント発行後に Issue 本文が更新された状態）を扱うサブ理由は、
   `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` 経由で起動された invocation では
   **終端 stop としては再適用しない**（body drift は producer 側で
   `rerun_contract_review` route として既に処理済みのため）。同サブ理由は
