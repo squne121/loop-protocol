@@ -3,10 +3,16 @@
 #
 # Claude Code PreToolUse hook: 日本語 prose 比率不足の GitHub 送信・下書きファイルをブロックする
 #
-# GUARD_JAPANESE_PROSE_MODE の動作:
-#   未設定 / shadow: block せず exit 0、would-block 判定を JSONL に記録する（AC1, AC4, AC7）
-#   enforce:         従来どおり block する（AC3）
-#   不正値:          shadow として動作 + invalid_mode を JSONL に記録（AC7）
+# GUARD_JAPANESE_PROSE_MODE の動作（#2265 BLOCKER1 fix_delta: invalid mode 診断化後）:
+#   未設定 / off / shadow: block せず exit 0（persistent file は生成しない、entry point で即座に allow）
+#   enforce:               従来どおり block する
+#   不正値:                 exit 1 の non-blocking diagnostic（stderr に invalid_guard_mode
+#                           reason code + 不正値を出力）。PreToolUse hook contract 上、
+#                           exit 1 は tool call を block しない（block するのは exit 2 のみ）。
+#                           persistent file は一切生成しない。
+#
+# legacy `shadow` 設定値は `off` の compatibility alias。mode contract は
+# unset / off / shadow / enforce / invalid の 5 状態。
 #
 # Mode A: Bash ツール + gh コマンドで Issue/PR/comment body を送信しようとする場合
 # Mode B: Write/Edit/MultiEdit ツールで tmp/ 下書き候補 Markdown を書こうとする場合
@@ -26,7 +32,8 @@
 #   - PATCH repos/{owner}/{repo}/pulls/{n} + body key: delta check (AC18)
 #
 # Exit codes:
-#   0 = allow (日本語比率 OK、またはガード対象外、または shadow mode)
+#   0 = allow (日本語比率 OK、またはガード対象外、または unset/off/shadow mode)
+#   1 = non-blocking diagnostic (invalid mode。tool call は block しない)
 #   2 = block (日本語比率不足 — blocking error として Claude Code に通知 / enforce mode のみ)
 
 set -euo pipefail
@@ -36,154 +43,51 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 VALIDATOR="${PROJECT_DIR}/.claude/skills/create-issue/scripts/validate_japanese_content.py"
 MATRIX="${PROJECT_DIR}/.claude/skills/create-issue/scripts/mutation_route_matrix.py"
-SHADOW_LOG_PY="${SCRIPT_DIR}/shadow_log.py"
 
 # ============================================================
-# GUARD_JAPANESE_PROSE_MODE の解決（AC4, AC7）
-# 未設定 = shadow（default）
-# shadow / enforce は有効値
-# 不正値 = shadow として動作（invalid_mode フラグ付き）
+# GUARD_JAPANESE_PROSE_MODE の解決（#2265 BLOCKER1 fix_delta: invalid mode 診断化）
+# mode contract: unset / off / shadow / enforce / invalid の5状態
+# 未設定 = off（default）。legacy `shadow` 設定値は `off` の compatibility alias。
+# enforce のみ block。
+# invalid mode: entry point で即座に exit 1（non-blocking diagnostic。stderr に
+#   invalid_guard_mode reason code + 不正値を出力）。PreToolUse hook contract 上、
+#   exit 1 は tool call を block しない（block するのは exit 2 のみ）。
+#   計算（hash/route_id/clock 等）は一切行わない。
+# off/shadow(legacy alias) mode: 計算を一切行わず即座に exit 0（HIGH1: dead code 削減）。
+# persistent file（.guard_shadow_log.jsonl）へは一切 write しない（#2265）。
 # ============================================================
 _GUARD_MODE_RAW="${GUARD_JAPANESE_PROSE_MODE:-}"
-_GUARD_MODE_EFFECTIVE="shadow"   # default
-_GUARD_MODE_INVALID=false
 
-if [ -z "$_GUARD_MODE_RAW" ]; then
-    _GUARD_MODE_EFFECTIVE="shadow"
-elif [ "$_GUARD_MODE_RAW" = "shadow" ]; then
-    _GUARD_MODE_EFFECTIVE="shadow"
-elif [ "$_GUARD_MODE_RAW" = "enforce" ]; then
-    _GUARD_MODE_EFFECTIVE="enforce"
-else
-    # 不正値: shadow として動作 + invalid_mode 記録
-    _GUARD_MODE_EFFECTIVE="shadow"
-    _GUARD_MODE_INVALID=true
-fi
+case "$_GUARD_MODE_RAW" in
+    ""|off|shadow)
+        # 未設定 / off / shadow(legacy alias): block せず即座に exit 0。
+        # gh コマンド解析・prose 検証などの計算は一切行わない（HIGH1）。
+        exit 0
+        ;;
+    enforce)
+        _GUARD_MODE_EFFECTIVE="enforce"
+        ;;
+    *)
+        # 不正値: entry point で non-blocking diagnostic として即座に exit 1。
+        # stable な reason code (invalid_guard_mode) + 不正値を stderr に出力する。
+        # プロンプト本文・tool body・認証情報は一切含めない（不正値そのものと reason code のみ）。
+        # persistent file への write は行わない。
+        echo "GUARD: invalid_guard_mode value=${_GUARD_MODE_RAW}" >&2
+        exit 1
+        ;;
+esac
 
-# JSONL 出力先（環境変数でオーバーライド可能、デフォルトは PROJECT_DIR 直下）
-SHADOW_LOG_FILE="${GUARD_JAPANESE_PROSE_SHADOW_LOG:-${PROJECT_DIR}/.guard_shadow_log.jsonl}"
+# ここに到達するのは enforce mode のみ（off/shadow/invalid は上で exit 済み）。
 
-# ============================================================
-# shadow_log ヘルパー関数（AC9: instrumentation 失敗は silent allow しない）
-# ============================================================
-_guard_shadow_log() {
-    # $1: JSON フィールド文字列
-    local fields_json="$1"
-    if [ -f "$SHADOW_LOG_PY" ]; then
-        if ! uv run python3 "$SHADOW_LOG_PY" \
-            --log-file "$SHADOW_LOG_FILE" \
-            --fields-json "$fields_json" 2>&1; then
-            # AC9: instrumentation 失敗を stderr に記録する（silent allow しない）
-            echo "GUARD: shadow_log instrumentation_error (logging failed)" >&2
-            echo "  instrumentation_error: shadow_log.py write failed" >&2
-        fi
-    else
-        # shadow_log.py が存在しない場合も stderr に記録（AC9）
-        echo "GUARD: shadow_log instrumentation_error (shadow_log.py not found)" >&2
-        echo "  instrumentation_error: shadow_log.py not found at ${SHADOW_LOG_PY}" >&2
-    fi
-}
-
-# shadow mode で would-block 判定を記録して exit 0 で通過する
+# enforce mode でのみ到達する block ヘルパー。
+# off/shadow/invalid mode は entry point で既に exit 0 / exit 1 しているため、
+# ここに到達するのは enforce mode のみ（HIGH1: hash/route_id/clock 等の
+# dead computation を削除。persistent logging なし）。
+# 引数は呼び出し互換のため維持するが未使用。
 # $1: route_id  $2: body_source  $3: public_mutation  $4: reason_code
-# $5: failed_block_count（数値、不明なら -1）  $6: duration_ms  $7: body_sha256  $8: body_bytes
-_shadow_allow() {
-    local route_id="$1"
-    local body_source="$2"
-    local public_mutation="$3"
-    local reason_code="$4"
-    local failed_block_count="${5:--1}"
-    local duration_ms="${6:-0}"
-    local body_sha256="${7:-}"
-    local body_bytes="${8:-0}"
-
-    local mode_configured="$_GUARD_MODE_RAW"
-    local mode_effective="$_GUARD_MODE_EFFECTIVE"
-
-    # invalid_mode の場合は reason_code に付記
-    if [ "$_GUARD_MODE_INVALID" = "true" ]; then
-        reason_code="${reason_code}+invalid_mode"
-    fi
-
-    # AC8: raw body / full command / token / Authorization header は記録しない
-    local fields_json
-    fields_json="$(jq -n \
-        --arg hook_event "PreToolUse" \
-        --arg mode_configured "$mode_configured" \
-        --arg mode_effective "$mode_effective" \
-        --arg tool_name "$TOOL_NAME" \
-        --arg route_id "$route_id" \
-        --arg body_source "$body_source" \
-        --argjson public_mutation "$public_mutation" \
-        --arg decision_would_be "deny" \
-        --arg reason_code "$reason_code" \
-        --argjson failed_block_count "$failed_block_count" \
-        --argjson duration_ms "$duration_ms" \
-        --arg body_sha256 "$body_sha256" \
-        --argjson body_bytes "$body_bytes" \
-        '{ hook_event: $hook_event,
-           mode_configured: $mode_configured,
-           mode_effective: $mode_effective,
-           tool_name: $tool_name,
-           route_id: $route_id,
-           body_source: $body_source,
-           public_mutation: $public_mutation,
-           decision_would_be: $decision_would_be,
-           reason_code: $reason_code,
-           failed_block_count: $failed_block_count,
-           duration_ms: $duration_ms,
-           body_sha256: $body_sha256,
-           body_bytes: $body_bytes }')"
-    _guard_shadow_log "$fields_json"
-    exit 0
-}
-
-# shadow mode での allow pass（would-block でない場合の計測記録）
-# $1: route_id  $2: body_source  $3: public_mutation
-_shadow_pass() {
-    local route_id="$1"
-    local body_source="$2"
-    local public_mutation="$3"
-
-    local mode_configured="$_GUARD_MODE_RAW"
-    local mode_effective="$_GUARD_MODE_EFFECTIVE"
-
-    if [ "$_GUARD_MODE_INVALID" = "true" ]; then
-        local extra_reason="invalid_mode"
-    else
-        local extra_reason=""
-    fi
-
-    local fields_json
-    fields_json="$(jq -n \
-        --arg hook_event "PreToolUse" \
-        --arg mode_configured "$mode_configured" \
-        --arg mode_effective "$mode_effective" \
-        --arg tool_name "$TOOL_NAME" \
-        --arg route_id "$route_id" \
-        --arg body_source "$body_source" \
-        --argjson public_mutation "$public_mutation" \
-        --arg decision_would_be "allow" \
-        --arg reason_code "$extra_reason" \
-        --argjson failed_block_count 0 \
-        --argjson duration_ms 0 \
-        --arg body_sha256 "" \
-        --argjson body_bytes 0 \
-        '{ hook_event: $hook_event,
-           mode_configured: $mode_configured,
-           mode_effective: $mode_effective,
-           tool_name: $tool_name,
-           route_id: $route_id,
-           body_source: $body_source,
-           public_mutation: $public_mutation,
-           decision_would_be: $decision_would_be,
-           reason_code: $reason_code,
-           failed_block_count: $failed_block_count,
-           duration_ms: $duration_ms,
-           body_sha256: $body_sha256,
-           body_bytes: $body_bytes }')"
-    _guard_shadow_log "$fields_json"
-    exit 0
+# $5: failed_block_count  $6: body_text
+_block_or_shadow() {
+    exit 2
 }
 
 # stdin から JSON を読む
@@ -205,44 +109,7 @@ fi
 # ============================================================
 # ヘルパー関数
 # ============================================================
-
-# shadow / enforce モード判定で block または allow を返す
-# enforce mode: exit 2（従来どおり block）
-# shadow mode:  _shadow_allow 経由で JSONL 記録 + exit 0
-# $1: route_id  $2: body_source  $3: public_mutation（true|false）
-# $4: reason_code  $5: failed_block_count  $6: body_text（sha256/bytes 計算用）
-_block_or_shadow() {
-    local _bos_start_ms
-    _bos_start_ms="$(date +%s%3N 2>/dev/null || echo 0)"
-
-    local route_id="$1"
-    local body_source="$2"
-    local public_mutation="$3"
-    local reason_code="$4"
-    local failed_block_count="${5:-1}"
-    local body_text="${6:-}"
-
-    local body_sha256=""
-    local body_bytes=0
-    if [ -n "$body_text" ]; then
-        body_sha256="$(printf '%s' "$body_text" | sha256sum | awk '{print $1}')"
-        body_bytes="$(printf '%s' "$body_text" | wc -c | tr -d ' ')"
-    fi
-
-    if [ "$_GUARD_MODE_EFFECTIVE" = "enforce" ]; then
-        # enforce mode: 従来どおり exit 2 でブロック（stderr は呼び出し元が出力済み）
-        exit 2
-    else
-        # shadow mode: JSONL 記録 + exit 0
-        local _bos_end_ms
-        _bos_end_ms="$(date +%s%3N 2>/dev/null || echo 0)"
-        local duration_ms=$(( _bos_end_ms - _bos_start_ms ))
-
-        _shadow_allow "$route_id" "$body_source" "$public_mutation" \
-            "$reason_code" "$failed_block_count" "$duration_ms" "$body_sha256" "$body_bytes"
-        # _shadow_allow 内で exit 0 するので以下には到達しない
-    fi
-}
+# _block_or_shadow() は entry point の mode 解決部分で定義済み（enforce mode 専用、exit 2）。
 
 # 日本語比率を検証する
 # $1: チェック対象の本文テキスト
