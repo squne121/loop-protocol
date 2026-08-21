@@ -39,6 +39,12 @@ EXPECTED_REPOSITORY = "squne121/loop-protocol"
 EXPECTED_PR_NUMBER = 2019
 EXPECTED_HEAD_SHA = "b" * 40
 SURFACE_ID = "combat-hud-running"
+# Issue #2230 AC2: fixed workflow_run_id/run_attempt used by every
+# build_decision() call in this file so schema validation always passes;
+# only tests that supply a matching authenticated
+# component_vrt_checkrun_provenance additionally need these to line up.
+EXPECTED_WORKFLOW_RUN_ID = 4242
+EXPECTED_RUN_ATTEMPT = 2
 
 
 def _sample_manifest_record() -> dict:
@@ -94,6 +100,8 @@ def _sample_decision(*, head_sha: str = EXPECTED_HEAD_SHA, evidence_manifest_dig
         github_actions_app_identity="github-actions[bot]",
         artifact_id="art-decision-1",
         artifact_digest="e" * 64,
+        workflow_run_id=EXPECTED_WORKFLOW_RUN_ID,
+        run_attempt=EXPECTED_RUN_ATTEMPT,
     )
 
 
@@ -278,6 +286,8 @@ def _forged_decision(*, changed_path_entries: list[dict], affected_surfaces: lis
         github_actions_app_identity="github-actions[bot]",
         artifact_id=None,
         artifact_digest=None,
+        workflow_run_id=EXPECTED_WORKFLOW_RUN_ID,
+        run_attempt=EXPECTED_RUN_ATTEMPT,
     )
 
 
@@ -358,6 +368,8 @@ def test_no_visual_impact_empty_surfaces_pass():
             ok=True,
             reason_codes=[],
             check_run_id=555,
+            workflow_run_id=EXPECTED_WORKFLOW_RUN_ID,
+            run_attempt=EXPECTED_RUN_ATTEMPT,
             app_id=rvi.GITHUB_ACTIONS_APP_ID,
             app_slug=rvi.GITHUB_ACTIONS_APP_SLUG,
         ),

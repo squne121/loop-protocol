@@ -88,6 +88,12 @@ def _decision(*, head_sha: str, changed_path_entries: list[dict], affected_surfa
         github_actions_app_identity="github-actions[bot]",
         artifact_id=None,
         artifact_digest=None,
+        # Issue #2230 AC2: no component_vrt_checkrun_provenance is supplied
+        # in this file's trusted_rederivation fixtures, so any fixed valid
+        # tuple satisfies schema without affecting the transitive-graph
+        # assertions under test here.
+        workflow_run_id=1,
+        run_attempt=1,
     )
 
 

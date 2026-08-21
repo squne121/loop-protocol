@@ -85,6 +85,12 @@ def _final_verdict(
         github_actions_app_identity=github_actions_app_identity,
         artifact_id="artifact",
         artifact_digest="e" * 64,
+        # Issue #2230 AC2: matches the authenticated provenance's own
+        # RUN_ID/RUN_ATTEMPT so the new tuple-binding checks never
+        # interfere with this file's existing CheckRun-provenance-focused
+        # assertions.
+        workflow_run_id=RUN_ID,
+        run_attempt=RUN_ATTEMPT,
     )
     schema = Path(__file__).resolve().parents[3] / "docs/dev/visual-impact.schema.json"
     return rvi.verify_trusted_artifact(
