@@ -359,6 +359,44 @@ DELEGATION_REQUIRED_KEYS = (
     "authorization_source",
 )
 
+
+# --- Issue #2274 AC11/AC13: effective-environment fail-closed detection ----
+#
+# `CLAUDE_CODE_SUBAGENT_MODEL` (and, separately, the fork/background
+# execution posture) can be re-injected into the actual `claude` child
+# process's environment via managed/user/project/local Claude Code settings
+# `env` blocks, not only via an ambient shell export -- launch.sh's own
+# `unset CLAUDE_CODE_SUBAGENT_MODEL` (see below) cannot observe or prevent
+# that re-injection from a settings layer. Rather than attempting to
+# hermetically reproduce every settings-layer merge (out of scope -- managed
+# settings in particular cannot be fully controlled from a test harness),
+# this hook inspects `os.environ` at the moment it actually runs inside the
+# `claude` child process: any re-injection from ANY source (shell export or
+# settings `env` block) surfaces identically in `os.environ` by the time
+# Claude Code invokes this hook, so a single check covers all sources without
+# over-claiming that managed settings were independently controlled.
+def effective_env_override_reason():
+    subagent_model = os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
+    if subagent_model not in (None, ""):
+        if subagent_model != DELEGATION_MODEL:
+            # Covers both a genuinely conflicting model AND the literal
+            # string "inherit" (Claude Code's own inherit sentinel is not a
+            # value this launcher ever wants to see re-injected here --
+            # session-local custom agent definition is the sole authority).
+            return "unsupported_effective_model_override"
+    fork_value = os.environ.get("CLAUDE_CODE_FORK_SUBAGENT", "")
+    disable_background_value = os.environ.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "")
+    fork_enabled = fork_value not in ("", "0")
+    disable_background_enabled = disable_background_value == "1"
+    if fork_enabled or not disable_background_enabled:
+        # Production invariant (Issue #2274 In Scope): `CLAUDE_CODE_FORK_SUBAGENT`
+        # unset/0 AND `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: 1`. Any of the 5
+        # distinguishable states outside that invariant (both unset, fork-only,
+        # disable-background-only, both, or re-injected via settings) denies
+        # BEFORE the Agent launches -- never a post-hoc detection.
+        return "background_execution_invariant_violation"
+    return None
+
 DIRECTIVE_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+?)\s*$")
 
 
@@ -753,9 +791,32 @@ def cmd_pre_tool_use_agent(payload):
     # otherwise have been consumed above (consumption already happened;
     # denying now is still fail-closed since the authorization is spent
     # either way).
-    if decision == "allow" and isinstance(tool_input, dict):
-        model_override = tool_input.get("model")
-        if model_override is not None and model_override != DELEGATION_MODEL:
+    # Issue #2274 (OWNER adversarial reframe of #2258 P0-3/P0-4): model
+    # binding for spark-codex is owned exclusively by the session-local
+    # custom agent definition (`--agents`). This hook no longer injects a
+    # `model` field into `updatedInput` -- it only inspects, normalizes, or
+    # rejects a `model` field the caller itself proposed, per the
+    # normalization contract:
+    #   * key absent                          -> allow, leave input untouched
+    #   * exact DELEGATION_MODEL string        -> allow, strip the key (the
+    #                                             definition route owns it)
+    #   * any other string (alias/`inherit`/
+    #     a different full model id)           -> deny
+    #                                             `explicit_model_override_mismatch`
+    #   * non-string JSON type (null/object/
+    #     array/number)                        -> deny
+    #                                             `invalid_model_field_type`
+    if decision == "allow" and subagent_type == SPARK_AGENT:
+        env_violation_reason = effective_env_override_reason()
+        if env_violation_reason is not None:
+            decision = "deny"
+            reason = env_violation_reason
+    if decision == "allow" and isinstance(tool_input, dict) and "model" in tool_input:
+        model_value = tool_input.get("model")
+        if not isinstance(model_value, str):
+            decision = "deny"
+            reason = "invalid_model_field_type"
+        elif model_value != DELEGATION_MODEL:
             decision = "deny"
             reason = "explicit_model_override_mismatch"
     output = {
@@ -774,9 +835,16 @@ def cmd_pre_tool_use_agent(payload):
         # run_in_background value Claude Code itself proposed. Paired with
         # `permissionDecision: "allow"` (never `"defer"`, since `defer`
         # drops `updatedInput` per the PreToolUse hook contract).
+        # Issue #2274 AC1/AC2: never generate/forward a `model` field --
+        # custom agent definition (session-local `--agents`) is the sole
+        # model binding authority. A caller-proposed `model` field that
+        # reached this point is guaranteed (by the normalization contract
+        # above) to be the exact DELEGATION_MODEL string, so stripping it
+        # here is a pure normalization (not a behavior change) rather than
+        # a pin.
         base_input = tool_input if isinstance(tool_input, dict) else {}
         updated_input = dict(base_input)
-        updated_input["model"] = DELEGATION_MODEL
+        updated_input.pop("model", None)
         updated_input["run_in_background"] = False
         output["hookSpecificOutput"]["updatedInput"] = updated_input
     if decision == "allow" and isinstance(record, dict) and session_id and AUTH_DIR:
@@ -1238,6 +1306,13 @@ echo "CLAUDE_GPT_AUTO_MODE_CHECK_PATH=${AUTO_MODE_CHECK_PATH}" >&2
 #     （正常/エラー/timeout/SIGINT/SIGTERM）で確実に proxy を kill/wait する。 ---
 
 unset CLAUDE_CODE_SUBAGENT_MODEL
+# Issue #2274 AC13: pin the production fork/background invariant
+# (`CLAUDE_CODE_FORK_SUBAGENT` unset/0, `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: 1`)
+# for the real claude child process. `unset` (not merely absent) so a
+# leaked ambient export from the launching shell cannot survive into the
+# child process's environment.
+unset CLAUDE_CODE_FORK_SUBAGENT
+export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
 
 export CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_TARGET"
 export ANTHROPIC_BASE_URL="http://127.0.0.1:${PROXY_PORT}"

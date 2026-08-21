@@ -94,6 +94,22 @@ def _render_gate_script(directory: Path, source: str, launch_nonce: str) -> Path
     return gate_path
 
 
+# Issue #2274 AC11/AC13: the production launcher always exports the
+# fork/background invariant (`CLAUDE_CODE_FORK_SUBAGENT` unset,
+# `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`) and never re-exports
+# `CLAUDE_CODE_SUBAGENT_MODEL` before the real `claude` child process (and
+# therefore this hook) runs. This suite predates that invariant and
+# implicitly assumes the compliant baseline (it never exercises the
+# invariant itself -- see test_background_execution_foreground_invariant.py
+# for that), so `_run_gate` applies it here to avoid false-failing against
+# whatever the ambient test-runner shell environment happens to have set.
+_DEFAULT_COMPLIANT_EFFECTIVE_ENV = {
+    "CLAUDE_CODE_FORK_SUBAGENT": "",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "",
+}
+
+
 def _run_gate(
     gate_script_source: str,
     event: str,
@@ -109,6 +125,7 @@ def _run_gate(
     gate_script_path = _render_gate_script(auth_dir.parent / "gate-scripts", gate_script_source, launch_nonce)
     env = {
         **os.environ,
+        **_DEFAULT_COMPLIANT_EFFECTIVE_ENV,
         "CLAUDE_GPT_SPARK_AUTH_DIR": str(auth_dir),
     }
     return subprocess.run(
