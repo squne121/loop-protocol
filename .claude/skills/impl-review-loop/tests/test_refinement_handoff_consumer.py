@@ -19,7 +19,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 
 _SKILL_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS_DIR = _SKILL_ROOT / "scripts"
