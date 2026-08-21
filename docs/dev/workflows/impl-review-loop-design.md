@@ -81,6 +81,18 @@ open/closed state・Machine-Readable Contract・GitHub native dependency close �
 explicit operator/OWNER directive・review/test/CI 結果に基づく）のみであり、label が
 readiness を左右することはない。
 
+### Entry Transition（Step 1 起動契約, #2272）
+
+Step 1 起動の実 authority は `CONTRACT_REVIEW_RESULT_V1.status: go` の telemetry
+確認だけでなく、root/main thread が同一 control flow 内で生成・消費する
+process-local `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` である（producer:
+`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`、consumer:
+`.claude/skills/impl-review-loop/scripts/preparation_entry_router.py`）。GitHub
+コメント上の過去 `LOOP_HANDOFF_RESULT_V1` は audit telemetry に過ぎず、単独では
+Step 1 を authorize しない。正本は
+`.claude/skills/issue-refinement-loop/references/termination-policy.md` の
+「Root-Owned Synchronous Entry Transition」節。
+
 ## Workflow Topology（ワークフロー構成）
 
 ```

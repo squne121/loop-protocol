@@ -16,6 +16,32 @@ PR review の失敗など、artifact chain から独立した安全境界に限�
 
 ループ開始前に LOOP_STATE を初期化し、必要な前提を確認する。
 
+## Root-Owned Synchronous Entry Transition Consumer（統一 Entry Policy, #2272 正本）
+
+`impl-review-loop` の Step 1 起動判断は、root/main thread が同一 control flow 内で
+生成する process-local `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1`（producer:
+`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`）を、本 skill 側の
+consumer（`.claude/skills/impl-review-loop/scripts/preparation_entry_router.py`
+`consume_root_entry_route()`）が実 consume することで確定する。詳細な routing 優先順位・
+body/base drift の区別・bounded retry・nonce 方針は
+`.claude/skills/issue-refinement-loop/references/termination-policy.md` の
+「Root-Owned Synchronous Entry Transition」節を正本として参照する。
+
+- `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1.route == invoke_impl_review_loop` かつ、
+  同一 invocation 内で発行された `invocation_token` が一致し、かつ consumer 自身の
+  独立 live 再検証（`reviewed_body_sha256` / `reviewed_base_sha` の直接比較）が
+  一致する場合にのみ Step 1 を起動する。
+- GitHub コメント上の過去 `LOOP_HANDOFF_RESULT_V1`（`status: impl_ready`）単独は
+  `invocation_token` を持たないため、consumer は常に拒否し fresh review へ差し戻す
+  （Handoff Rule: コメント再取得は audit telemetry であり、単独では実装を authorize
+  しない）。
+- 下記「0. Intake Gate」の `stale_contract_review` サブ理由は、
+  `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` 経由で起動された invocation では
+  **終端 stop としては再適用しない**（body drift は producer 側で
+  `rerun_contract_review` route として既に処理済みのため）。同サブ理由は
+  `contract_snapshot_url` が明示提供された legacy / 非 Root-routed 直接呼び出し
+  経路にのみ適用される、後方互換のための限定ゲートである。
+
 ## 0-a. Intake capsule-first（インテーク処理をカプセル生成優先で行う）
 
 着手直後は **`IMPL_REVIEW_INTAKE_CAPSULE_V1` を最優先で生成して利用**する。
@@ -126,6 +152,16 @@ title prefix が欠落していれば `intake_gate_failed: metadata_not_ready` �
 - `body_sha256` フィールドが存在しない場合のフォールバック: `CONTRACT_REVIEW_RESULT_V1.generated_at` < Issue の `updated_at`（go コメント生成後に Issue 本文が更新された）
 
 いずれかの条件が真の場合は `intake_gate_failed: stale_contract_review` で停止し、`issue-contract-review` の再実行を人間に依頼する。
+
+**Root-Owned Entry Transition との関係（#2272、相反規則の除去）**: 本サブ理由は
+`ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` を経由しない legacy / 非 Root-routed
+直接呼び出し（`contract_snapshot_url` 明示提供時の自動検出フロー）にのみ適用する。
+`ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` 経由の invocation では、body drift（stale
+prior review を含む）は producer 側の `rerun_contract_review` route として既に
+処理され fresh review へ差し戻されている（terminal stop にしない）ため、本節を
+重ねて `intake_gate_failed` の terminal stop として再適用しない。両者は互いに
+排他的な入力経路（Root-routed か legacy か）に対する規則であり、同一
+invocation に対して同時に適用されることはない。
 
 #### 3. `body_snapshot_mismatch`（本文スナップショット不一致）
 
