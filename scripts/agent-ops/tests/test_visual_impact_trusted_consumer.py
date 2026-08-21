@@ -344,23 +344,8 @@ def test_missing_ref_object_never_silently_empty_registry_in_resolve():
     assert result.affected_surfaces == []
 
 
-def test_no_visual_impact_empty_surfaces_pass():
-    """AC5 regression: a genuinely no-visual-impact PR (changed paths match
-    no producer/contract/global-invalidator/coverage-root) legitimately
-    reports `affected_surfaces: []` and PASSES -- trusted-side re-derivation
-    must never turn a real empty set into a false rejection."""
-    changed_entries = [{"status": "modified", "path": "docs/README.md"}]
-    registry_doc = _registry_doc(producer_paths=["src/ui/combatHud.ts"], coverage_roots=["src/ui/**"])
-    decision = _forged_decision(changed_path_entries=changed_entries, affected_surfaces=[])
-    # PR #2229 review fix_delta P1-1: `verify_trusted_artifact()` now
-    # cross-checks the decision's self-reported
-    # `component_vrt_report_check_run_id`/`github_actions_app_identity`
-    # against the AUTHENTICATED provenance identity when that provenance
-    # succeeded -- give this test a realistic matching pair instead of the
-    # `_forged_decision()` default `null` check-run id (a real CI run
-    # always populates this field, no-visual-impact or not).
-    decision["component_vrt_report_check_run_id"] = "555"
-    trusted = rvi.TrustedRederivation(
+def _no_impact_trusted_rederivation(changed_entries: list[dict], registry_doc: dict) -> "rvi.TrustedRederivation":
+    return rvi.TrustedRederivation(
         changed_path_entries=changed_entries,
         base_registry_doc=registry_doc,
         head_registry_doc=registry_doc,
@@ -374,7 +359,49 @@ def test_no_visual_impact_empty_surfaces_pass():
             app_slug=rvi.GITHUB_ACTIONS_APP_SLUG,
         ),
     )
+
+
+def test_no_visual_impact_empty_surfaces_missing_evidence_manifest_fails_closed():
+    """Issue #2230 fix_delta P1-5 (human reviewer): a genuinely
+    no-visual-impact PR (`affected_surfaces: []`) with a COMPLETELY MISSING
+    evidence-manifest artifact (`evidence_manifest_raw=None`) must now fail
+    closed -- AC2 requires BOTH the decision AND evidence-manifest artifacts
+    to be present/acquired, unconditionally, never only when a surface's
+    decision entry happens to claim an `evidence_manifest_digest`. This
+    inverts the PREVIOUS (buggy) expectation of this test, which asserted
+    `ok=True` for a totally-missing evidence-manifest artifact just because
+    `affected_surfaces` was empty and the per-surface digest-claim loop
+    therefore never executed."""
+    changed_entries = [{"status": "modified", "path": "docs/README.md"}]
+    registry_doc = _registry_doc(producer_paths=["src/ui/combatHud.ts"], coverage_roots=["src/ui/**"])
+    decision = _forged_decision(changed_path_entries=changed_entries, affected_surfaces=[])
+    # PR #2229 review fix_delta P1-1: `verify_trusted_artifact()` now
+    # cross-checks the decision's self-reported
+    # `component_vrt_report_check_run_id`/`github_actions_app_identity`
+    # against the AUTHENTICATED provenance identity when that provenance
+    # succeeded -- give this test a realistic matching pair instead of the
+    # `_forged_decision()` default `null` check-run id (a real CI run
+    # always populates this field, no-visual-impact or not).
+    decision["component_vrt_report_check_run_id"] = "555"
+    trusted = _no_impact_trusted_rederivation(changed_entries, registry_doc)
     verdict = _verify(decision, manifest=None, trusted_rederivation=trusted)
+    assert verdict.ok is False
+    assert "producer_artifact_acquisition_failed:evidence_manifest_missing" in verdict.reason_codes
+
+
+def test_no_visual_impact_empty_surfaces_present_empty_manifest_still_passes():
+    """Companion positive regression: the same no-visual-impact decision,
+    but the evidence-manifest artifact IS actually present (schema-valid,
+    genuinely empty `surfaces: []`, never merely `None`/missing) -- this
+    must still PASS. A real, present, empty manifest is fine; a MISSING
+    manifest artifact is not (this is the distinction the fix draws)."""
+    changed_entries = [{"status": "modified", "path": "docs/README.md"}]
+    registry_doc = _registry_doc(producer_paths=["src/ui/combatHud.ts"], coverage_roots=["src/ui/**"])
+    decision = _forged_decision(changed_path_entries=changed_entries, affected_surfaces=[])
+    decision["component_vrt_report_check_run_id"] = "555"
+    trusted = _no_impact_trusted_rederivation(changed_entries, registry_doc)
+    empty_manifest = {"schema": rvi.EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": []}
+    verdict = _verify(decision, manifest=empty_manifest, trusted_rederivation=trusted)
     assert verdict.ok is True
     assert verdict.reason_codes == []
 

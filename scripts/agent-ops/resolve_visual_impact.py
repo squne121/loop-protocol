@@ -950,6 +950,26 @@ def build_evidence_from_manifest(
 
 EVIDENCE_MANIFEST_V2_SCHEMA = "VISUAL_BASELINE_REVIEW_EVIDENCE_V2"
 
+# DEFERRED (Issue #2230 fix_delta P2-2, human reviewer, 2026-08-21, best-
+# effort item explicitly NOT implemented in this PR): `run_attempt` is
+# deliberately excluded from `_MANIFEST_V2_RECORD_FIELDS` / `manifest_sha256`
+# below -- cross-attempt forgery of `run_attempt` is instead caught by the
+# separate `evidence_manifest_run_attempt_mismatch` CheckRun-provenance
+# cross-check in `verify_trusted_artifact()`. The reviewer's PERMANENT
+# recommendation is a versioned schema bump (a new
+# `VISUAL_BASELINE_REVIEW_EVIDENCE_V3` schema with `run_attempt` INSIDE the
+# digest fields, plus V2/V3 dual-read during a migration window). This is a
+# genuine schema migration -- new schema constant, V3 record builder/
+# verifier alongside the existing V2 ones, a `find_evidence_manifest_v2_
+# record`-equivalent for V3, a `build_evidence_from_manifest_v2`-equivalent
+# for V3, dual-read call-site logic, AND a `ci.yml` producer-side switch of
+# which builder it calls -- spanning many more call sites than fit within
+# this fix_delta cycle's scope. Deferred to a dedicated follow-up Issue;
+# do not silently treat this as resolved by the `_require_strict_positive_
+# int()` identity-field fix elsewhere in this same fix_delta (that fix
+# only tightens TYPE validation of `run_attempt`, it does not add
+# `run_attempt` to the tamper-evidence digest).
+#
 # The field set below is the canonical shape of one V2 record (Issue #2019 /
 # PR #2045 OWNER REQUEST_CHANGES). `manifest_sha256` is NEVER included in the
 # digest input -- it is the digest of every OTHER field.
@@ -1031,6 +1051,23 @@ def _coerce_mismatched_pixels(mismatched: Any) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _require_strict_positive_int(value: Any, field_name: str) -> tuple[int | None, str | None]:
+    """Strict identity-field validator (Issue #2230 fix_delta P1-2). Unlike
+    `_coerce_mismatched_pixels` (deliberately lenient/string-coercing --
+    correct ONLY for pixel counts, where a producer's bash-shelled-out
+    integer sometimes legitimately arrives as a JSON string), identity
+    fields (`workflow_run_id`/`run_attempt`) must NEVER silently accept a
+    string/bool/float. Returns `(value, None)` only if `type(value) is int
+    and value >= 1`, else `(None, error_message)` -- fail-closed, no
+    fallback-to-string, no coercion. GitHub's `github.run_id`/
+    `github.run_attempt` are always positive integers per GitHub's own
+    contract, so a plain strict-int check (not a lenient coercer) is
+    correct here."""
+    if type(value) is int and value >= 1:
+        return value, None
+    return None, f"{field_name} must be a JSON integer >= 1, got {value!r} ({type(value).__name__})"
 
 
 def build_evidence_from_manifest_v2(
@@ -1722,6 +1759,7 @@ def acquire_trusted_artifact(
     expected_artifact_name: str,
     page_size: int = 100,
     max_pages: int = 1000,
+    expected_head_sha: str | None = None,
 ) -> TrustedArtifactAcquisitionResult:
     """Issue #2230 AC3/AC4: trusted-side (base-locked consumer) acquisition
     of a single attempt-specific producer artifact by exact name, replacing
@@ -1740,7 +1778,19 @@ def acquire_trusted_artifact(
     server-side filter alone: every returned artifact is re-checked against
     `expected_artifact_name` (and `expired == false`) client-side too, and
     every failure path returns `ok=False` with a stable reason code -- there
-    is no partial/best-effort success path."""
+    is no partial/best-effort success path.
+
+    Issue #2230 fix_delta P2-1 (best-effort): when `expected_head_sha` is
+    supplied, the SELECTED artifact's nested `workflow_run.id`/
+    `workflow_run.head_sha` (a real field the GitHub REST artifacts-list
+    response includes per artifact) are cross-checked against `run_id`/
+    `expected_head_sha`. A mismatch here would mean the artifact this
+    endpoint returned under this exact `run_id` scope claims to belong to a
+    DIFFERENT run/head than what was requested -- a signal worth rejecting
+    on even though the `run_id`-scoped list endpoint itself should never
+    return artifacts from other runs. `expected_head_sha=None` (the
+    default) skips this check entirely, preserving this function's
+    existing signature/behavior for callers that do not supply it."""
     reasons: list[str] = []
     artifacts: list[dict[str, Any]] = []
     artifact_ids: set[int] = set()
@@ -1800,17 +1850,46 @@ def acquire_trusted_artifact(
             return TrustedArtifactAcquisitionResult(ok=False, reason_codes=reasons)
         page += 1
 
-    # Issue #2230 AC3/AC4: never trust the server-side `name=` filter alone
-    # -- re-check client-side, reject `expired` artifacts, and require
-    # cardinality exactly one for the expected attempt-specific name (0 or
-    # >1 matches, including old-attempt/current-attempt coexistence under
-    # the SAME name, is fail-closed).
-    matches = [a for a in artifacts if a.get("name") == expected_artifact_name and a.get("expired") is False]
-    if len(matches) != 1:
+    # Issue #2230 AC3/AC4 (fix_delta P1-4): never trust the server-side
+    # `name=` filter alone -- re-check client-side. Cardinality-exactly-one
+    # is evaluated over the NAME match ALONE (never pre-filtered by
+    # `expired`); a second condition on the sole resulting artifact then
+    # separately rejects it if it is expired. The previous combined
+    # `name == expected AND expired is False` filter silently succeeded
+    # whenever exactly one LIVE artifact happened to coexist with one or
+    # more EXPIRED same-named artifacts (e.g. an old run-attempt's expired
+    # artifact plus the current attempt's live one) -- 2 same-named
+    # artifacts total is always a cardinality violation regardless of
+    # expired status, and must never be silently narrowed away by the
+    # expired filter before the cardinality check runs.
+    named = [a for a in artifacts if a.get("name") == expected_artifact_name]
+    if len(named) != 1:
         reasons.append(f"trusted_artifact_cardinality_invalid:{expected_artifact_name}")
         return TrustedArtifactAcquisitionResult(ok=False, reason_codes=reasons, artifacts=artifacts)
 
-    return TrustedArtifactAcquisitionResult(ok=True, reason_codes=[], artifact_id=matches[0]["id"], artifacts=artifacts)
+    artifact = named[0]
+    if artifact.get("expired") is not False:
+        reasons.append(f"trusted_artifact_expired:{expected_artifact_name}")
+        return TrustedArtifactAcquisitionResult(ok=False, reason_codes=reasons, artifacts=artifacts)
+
+    # Issue #2230 fix_delta P2-1 (best-effort): cross-check the SELECTED
+    # artifact's nested `workflow_run.id`/`workflow_run.head_sha` against
+    # the caller-supplied `run_id`/`expected_head_sha`. Never trust the
+    # request-scoping (`run_id` in the URL path) alone to prove the
+    # returned artifact actually belongs to that run/head.
+    workflow_run = artifact.get("workflow_run")
+    if expected_head_sha is not None:
+        if not isinstance(workflow_run, dict):
+            reasons.append(f"trusted_artifact_workflow_run_missing:{expected_artifact_name}")
+            return TrustedArtifactAcquisitionResult(ok=False, reason_codes=reasons, artifacts=artifacts)
+        if workflow_run.get("id") != run_id:
+            reasons.append(f"trusted_artifact_workflow_run_id_mismatch:{expected_artifact_name}")
+        if workflow_run.get("head_sha") != expected_head_sha:
+            reasons.append(f"trusted_artifact_workflow_run_head_sha_mismatch:{expected_artifact_name}")
+        if reasons:
+            return TrustedArtifactAcquisitionResult(ok=False, reason_codes=reasons, artifacts=artifacts)
+
+    return TrustedArtifactAcquisitionResult(ok=True, reason_codes=[], artifact_id=artifact["id"], artifacts=artifacts)
 
 
 def _gh_api_transport(path: str) -> HttpTransportResponse:
@@ -1865,6 +1944,7 @@ def _run_acquire_trusted_artifact(args: argparse.Namespace) -> int:
         repository=args.repository,
         run_id=args.run_id,
         expected_artifact_name=args.expected_artifact_name,
+        expected_head_sha=getattr(args, "expected_artifact_head_sha", None) or None,
     )
     output = {
         "schema": "TRUSTED_ARTIFACT_ACQUISITION_RESULT_V1",
@@ -2842,13 +2922,25 @@ def verify_trusted_artifact(
                     reasons.append(f"unmapped_visual_candidate_undetected:{path}")
 
     if evidence_manifest_raw is None:
+        # Issue #2230 fix_delta P1-5: Issue #2230 AC2 requires BOTH the
+        # decision AND evidence-manifest artifacts to be present/acquired,
+        # UNCONDITIONALLY -- never only when a surface's decision entry
+        # happens to claim an `evidence_manifest_digest`. Without this
+        # unconditional check, a completely-missing evidence-manifest
+        # artifact silently passed for any no-impact decision
+        # (`affected_surfaces == []`), since the per-surface loop below
+        # never executes for an empty list. Fail closed here first,
+        # regardless of `affected_surfaces` content.
+        reasons.append("producer_artifact_acquisition_failed:evidence_manifest_missing")
         # No evidence manifest artifact could be retrieved at all -- any
         # affected surface whose decision entry claims an
         # `evidence_manifest_digest` cannot be corroborated, so fail-closed
         # for those surfaces rather than silently accepting the decision's
         # self-report as sufficient (this is what catches a candidate PR
         # deleting the base-locked evaluator's materialize step, or the
-        # producer job's evidence-manifest upload step, entirely).
+        # producer job's evidence-manifest upload step, entirely). Kept in
+        # addition to the unconditional check above -- still useful
+        # per-surface diagnostics for the affected-surfaces>0 case.
         for surface in decision.get("affected_surfaces", []) or []:
             evidence = surface.get("evidence") or {}
             if evidence.get("evidence_manifest_digest"):
@@ -2890,18 +2982,32 @@ def verify_trusted_artifact(
                     if trusted_rederivation is not None and trusted_rederivation.component_vrt_checkrun_provenance:
                         surf_provenance = trusted_rederivation.component_vrt_checkrun_provenance
                         if surf_provenance.ok:
-                            if (
-                                surf_provenance.workflow_run_id is None
-                                or _coerce_mismatched_pixels(record.get("workflow_run_id"))
-                                != surf_provenance.workflow_run_id
-                            ):
+                            # Issue #2230 fix_delta P1-2: these are IDENTITY
+                            # fields, never pixel counts -- reuse the strict
+                            # validator (`_require_strict_positive_int`), not
+                            # `_coerce_mismatched_pixels`'s deliberately
+                            # lenient string-coercion, which would silently
+                            # accept a forged string `"1"` as equal to
+                            # `surf_provenance`'s authenticated int `1`.
+                            record_run_id, _run_id_err = _require_strict_positive_int(
+                                record.get("workflow_run_id"), "workflow_run_id"
+                            )
+                            run_id_matches = (
+                                surf_provenance.workflow_run_id is not None
+                                and record_run_id == surf_provenance.workflow_run_id
+                            )
+                            if not run_id_matches:
                                 reasons.append(
                                     f"evidence_manifest_workflow_run_id_mismatch:{surface.get('surface_id')}"
                                 )
-                            if (
-                                surf_provenance.run_attempt is None
-                                or _coerce_mismatched_pixels(record.get("run_attempt")) != surf_provenance.run_attempt
-                            ):
+                            record_run_attempt, _run_attempt_err = _require_strict_positive_int(
+                                record.get("run_attempt"), "run_attempt"
+                            )
+                            run_attempt_matches = (
+                                surf_provenance.run_attempt is not None
+                                and record_run_attempt == surf_provenance.run_attempt
+                            )
+                            if not run_attempt_matches:
                                 reasons.append(f"evidence_manifest_run_attempt_mismatch:{surface.get('surface_id')}")
                         if record.get("head_sha") != expected_head_sha:
                             reasons.append(f"evidence_manifest_head_sha_mismatch:{surface.get('surface_id')}")
@@ -3205,11 +3311,29 @@ def _run_build_evidence_manifest(args: argparse.Namespace) -> int:
         mismatched_coerced = _coerce_mismatched_pixels(mismatched_raw)
         mismatched_pixels: Any = mismatched_coerced if mismatched_coerced is not None else mismatched_raw
 
+        # Issue #2230 fix_delta P1-2: `workflow_run_id`/`run_attempt` are
+        # IDENTITY fields, not pixel counts -- validate with the strict,
+        # non-coercing `_require_strict_positive_int` (never
+        # `_coerce_mismatched_pixels`'s lenient string-coercion, which is
+        # correct only for `mismatched_pixels` above). A string/bool/float
+        # producer value here is a real bug (e.g. a bash heredoc that never
+        # cast `$GITHUB_RUN_ID`/`$GH_RUN_ATTEMPT` to int before writing
+        # `surface_inputs.json`) and must fail this function closed (via
+        # `errors`), never be silently accepted or coerced.
+        workflow_run_id_value, workflow_run_id_error = _require_strict_positive_int(
+            item.get("workflow_run_id"), "workflow_run_id"
+        )
+        if workflow_run_id_error:
+            errors.append(f"{surface_id}: {workflow_run_id_error}")
+        run_attempt_value, run_attempt_error = _require_strict_positive_int(item.get("run_attempt"), "run_attempt")
+        if run_attempt_error:
+            errors.append(f"{surface_id}: {run_attempt_error}")
+
         record = build_evidence_manifest_v2_record(
             surface_id=surface_id,
             contract_digest=compute_contract_digest(surface_def),
             head_sha=item.get("head_sha"),
-            workflow_run_id=item.get("workflow_run_id"),
+            workflow_run_id=workflow_run_id_value,
             # CheckRun binding fields are always populated by the CONSUMER
             # (visual-impact-policy job's independently-fetched CheckRun API
             # lookup), never by this producer step -- see
@@ -3243,13 +3367,20 @@ def _run_build_evidence_manifest(args: argparse.Namespace) -> int:
         # provenance, not by the tamper-evidence digest (which must stay
         # identical to the base-branch-locked consumer's field set so the
         # digest self-verifies pre-merge).
-        record["run_attempt"] = item.get("run_attempt")
+        record["run_attempt"] = run_attempt_value
         records.append(record)
 
     manifest = {"schema": EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": records}
     print(json.dumps(manifest, indent=2))
     if args.manifest_output:
         Path(args.manifest_output).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    # Issue #2230 fix_delta P1-2: `errors` previously only affected the exit
+    # code -- never actually surfaced to the caller, which made a fail-closed
+    # identity-field validation failure indistinguishable (in CI logs) from
+    # an unrelated non-zero exit. Print each error to stderr so the CI job's
+    # log output actually names the offending surface/field.
+    for error in errors:
+        print(f"build-evidence-manifest error: {error}", file=sys.stderr)
     return 0 if not errors else 1
 
 
@@ -3416,6 +3547,13 @@ def main(argv: list[str] | None = None) -> int:
     # Issue #2230: `--mode acquire-trusted-artifact` CLI surface.
     parser.add_argument("--expected-artifact-name", type=str, default=None)
     parser.add_argument("--artifact-id-output-file", type=str, default=None)
+    # Issue #2230 fix_delta P2-1 (best-effort): optional nested
+    # `workflow_run.id`/`workflow_run.head_sha` cross-check on the selected
+    # artifact -- omitted entirely (skips the check) when not supplied.
+    # Distinct flag name from `--expected-head-sha` (already used by
+    # `--mode verify-trusted-artifact`, a different CLI surface) to avoid
+    # an argparse option-string conflict on the shared parser.
+    parser.add_argument("--expected-artifact-head-sha", type=str, default=None)
     # PR #2045 OWNER fix_delta P0-5 (V2 manifest): `build-evidence-manifest`
     # mode is invoked by the `component-vrt-report` CI job to produce the
     # VISUAL_BASELINE_REVIEW_EVIDENCE_V2 artifact from real per-surface VRT

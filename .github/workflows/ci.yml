@@ -2101,12 +2101,26 @@ jobs:
           def to_mismatched(value):
               return int(value) if value.lstrip("-").isdigit() else value
 
+          # Issue #2230 fix_delta P1-2: `workflow_run_id`/`run_attempt` are
+          # IDENTITY fields consumed by `resolve_visual_impact.py`'s strict,
+          # non-coercing `_require_strict_positive_int` validator (never the
+          # lenient `to_mismatched`-style string-coercion above, which is
+          # correct only for pixel counts). `$GITHUB_RUN_ID`/`$GH_RUN_ATTEMPT`
+          # arrive here as shell strings via sys.argv; GitHub's own
+          # `github.run_id`/`github.run_attempt` context values are ALWAYS
+          # positive integers by contract, so a plain `int()` cast (not a
+          # defensive fallback-to-string) is correct -- if this ever raises,
+          # that is itself a real bug worth surfacing loudly, not silently
+          # swallowing back into a string identity field.
+          run_id_int = int(run_id)
+          run_attempt_int = int(run_attempt)
+
           records = [
               {
                   "surface_id": "combat-hud-running",
                   "head_sha": head_sha,
-                  "workflow_run_id": run_id,
-                  "run_attempt": run_attempt,
+                  "workflow_run_id": run_id_int,
+                  "run_attempt": run_attempt_int,
                   "actual_sha256": running_actual_sha256,
                   "mismatched_pixels": to_mismatched(running_mismatched),
                   "verify_succeeded": to_bool(running_verify_succeeded),
@@ -2119,8 +2133,8 @@ jobs:
               {
                   "surface_id": "combat-hud-critical",
                   "head_sha": head_sha,
-                  "workflow_run_id": run_id,
-                  "run_attempt": run_attempt,
+                  "workflow_run_id": run_id_int,
+                  "run_attempt": run_attempt_int,
                   # No independent zero-tolerance probe exists for this
                   # surface today -- never fabricate a per-run actual PNG
                   # hash it did not itself produce.
@@ -2512,6 +2526,28 @@ jobs:
           # working-tree path because the evaluator itself resolves registry
           # CONTENT via `--head-ref`/`--base-ref` (`git show <ref>:<path>`),
           # never the raw working-tree file, for both base and head.
+          #
+          # NOTE (Issue #2230 fix_delta P1-1/P1-5, 2026-08-21, PR #2279
+          # review comment #2279#issuecomment-5369771738): because this
+          # step ALWAYS runs the BASE-BRANCH-LOCKED evaluator above, a PR
+          # that changes `build_decision()`'s signature/behavior (like
+          # Issue #2230's `workflow_run_id`/`run_attempt` threading) can
+          # never exercise its OWN new logic on its OWN CI run -- on THIS
+          # PR's own pre-merge run, `--run-id`/`--run-attempt` below parse
+          # fine (base already has those CLI flags from an unrelated
+          # subcommand) but are silently NOT forwarded into `decision.json`
+          # yet, since base's `build_decision()` predates this change. Do
+          # not mistake that for a regression. This is an INHERENT
+          # bootstrap/self-validation gap shared by every past change to
+          # this base-locked evaluator (#2019, #2091, #2099, #2100, #2229)
+          # -- splitting a change across multiple PRs does not remove the
+          # gap, it only relocates which PR carries it, since producer
+          # (this job) and consumer (`visual-impact-trusted-consumer.yml`)
+          # both flip to the new workflow-file version simultaneously at
+          # merge (no version-skew window). The first real proof that new
+          # evaluator logic works end to end can only come from a
+          # POST-MERGE run on `main` (see PR #2279's AC9 section, corrected
+          # to SKIP/OPEN for exactly this reason).
           uv run --locked python3 trusted_evaluator/scripts/agent-ops/resolve_visual_impact.py \
             --mode policy-check \
             --registry docs/dev/visual-surfaces.yml \

@@ -120,6 +120,13 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           REPO: ${{ github.repository }}
+          # Issue #2230 fix_delta P2-1 (best-effort): the triggering
+          # workflow_run's OWN head_sha -- this is what the acquired
+          # artifact's nested `workflow_run.head_sha` should equal (this is
+          # a same-run consistency check, distinct from the separate
+          # RUN_HEAD_SHA-vs-LIVE_HEAD_SHA staleness check the publish step
+          # below already performs).
+          EXPECTED_ARTIFACT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           # PR #2229 review fix_delta P2: pin the REST API version/media
@@ -148,6 +155,7 @@ jobs:
             --repository "${REPO}" \
             --run-id "${RUN_ID}" \
             --expected-artifact-name "${DECISION_ARTIFACT_NAME}" \
+            --expected-artifact-head-sha "${EXPECTED_ARTIFACT_HEAD_SHA}" \
             --artifact-id-output-file "${ARTIFACT_ROOT}/decision_artifact_id.txt"
           DECISION_ACQUIRE_STATUS=$?
           uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
@@ -155,6 +163,7 @@ jobs:
             --repository "${REPO}" \
             --run-id "${RUN_ID}" \
             --expected-artifact-name "${EVIDENCE_ARTIFACT_NAME}" \
+            --expected-artifact-head-sha "${EXPECTED_ARTIFACT_HEAD_SHA}" \
             --artifact-id-output-file "${ARTIFACT_ROOT}/evidence_artifact_id.txt"
           EVIDENCE_ACQUIRE_STATUS=$?
           set -e

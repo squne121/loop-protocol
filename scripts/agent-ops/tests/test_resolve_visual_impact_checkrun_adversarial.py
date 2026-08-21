@@ -93,9 +93,17 @@ def _final_verdict(
         run_attempt=RUN_ATTEMPT,
     )
     schema = Path(__file__).resolve().parents[3] / "docs/dev/visual-impact.schema.json"
+    # Issue #2230 fix_delta P1-5: this file's fixtures focus on CheckRun
+    # provenance, not evidence-manifest acquisition -- `affected_surfaces`
+    # is always `[]` here, so a genuinely PRESENT (never missing), schema-
+    # valid, empty V2 manifest keeps `verify_trusted_artifact()`'s new
+    # unconditional "evidence-manifest artifact must be present" check from
+    # polluting these provenance-focused assertions with an unrelated
+    # `producer_artifact_acquisition_failed:evidence_manifest_missing`.
+    empty_manifest_raw = json.dumps({"schema": rvi.EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": []}).encode()
     return rvi.verify_trusted_artifact(
         decision_raw=json.dumps(decision).encode(),
-        evidence_manifest_raw=None,
+        evidence_manifest_raw=empty_manifest_raw,
         visual_impact_schema_path=schema,
         expected_head_sha=HEAD_SHA,
         expected_repository=REPOSITORY,

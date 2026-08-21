@@ -278,8 +278,13 @@ def test_tuple_binding_both_artifacts_schema_requires_workflow_run_id_and_run_at
 # ---------------------------------------------------------------------------
 
 
-def _artifact(*, artifact_id: int, name: str, expired: bool = False) -> dict:
-    return {"id": artifact_id, "name": name, "expired": expired}
+def _artifact(
+    *, artifact_id: int, name: str, expired: bool = False, workflow_run: dict | None = None
+) -> dict:
+    record = {"id": artifact_id, "name": name, "expired": expired}
+    if workflow_run is not None:
+        record["workflow_run"] = workflow_run
+    return record
 
 
 def _paged_transport(
@@ -407,10 +412,14 @@ def test_attempt_specific_name_cardinality_multiple_matches_fails_closed():
     assert f"trusted_artifact_cardinality_invalid:{DECISION_NAME}" in result.reason_codes
 
 
-def test_attempt_specific_name_cardinality_expired_artifact_excluded_from_match():
-    """A single non-expired match plus an expired one under the SAME name
-    must still resolve to exactly-one (the expired copy is excluded, never
-    counted toward cardinality)."""
+def test_attempt_specific_name_cardinality_same_name_expired_plus_live_fails_closed():
+    """Issue #2230 fix_delta P1-4 (human reviewer): cardinality-exactly-one
+    is evaluated over the NAME match ALONE, never pre-filtered by `expired`.
+    A same-named expired artifact coexisting with a same-named live one
+    (e.g. an old run-attempt's expired artifact plus the current attempt's
+    live one) is 2 name matches -- a cardinality violation, regardless of
+    expired status -- and must never be silently narrowed to "exactly one"
+    by excluding the expired copy before the cardinality check runs."""
     transport = _paged_transport(
         [
             [
@@ -422,17 +431,132 @@ def test_attempt_specific_name_cardinality_expired_artifact_excluded_from_match(
     result = rvi.acquire_trusted_artifact(
         transport=transport, repository=REPOSITORY, run_id=RUN_ID, expected_artifact_name=DECISION_NAME
     )
-    assert result.ok is True
-    assert result.artifact_id == 2
+    assert result.ok is False
+    assert f"trusted_artifact_cardinality_invalid:{DECISION_NAME}" in result.reason_codes
 
 
 def test_attempt_specific_name_cardinality_exactly_one_expired_only_fails_closed():
+    """Exactly one same-named match, but that sole artifact is expired --
+    cardinality is satisfied (exactly one), so this must fail on the
+    SEPARATE expired check, not be conflated with a cardinality violation."""
     transport = _paged_transport([[_artifact(artifact_id=1, name=DECISION_NAME, expired=True)]])
     result = rvi.acquire_trusted_artifact(
         transport=transport, repository=REPOSITORY, run_id=RUN_ID, expected_artifact_name=DECISION_NAME
     )
     assert result.ok is False
-    assert f"trusted_artifact_cardinality_invalid:{DECISION_NAME}" in result.reason_codes
+    assert f"trusted_artifact_expired:{DECISION_NAME}" in result.reason_codes
+
+
+# ---------------------------------------------------------------------------
+# Issue #2230 fix_delta P2-1 (best-effort): nested workflow_run.id/head_sha
+# cross-check on the SELECTED artifact, when `expected_head_sha` is supplied.
+# ---------------------------------------------------------------------------
+
+EXPECTED_HEAD_SHA_FOR_ACQUIRE = "f" * 40
+
+
+def test_acquire_trusted_artifact_nested_workflow_run_head_sha_mismatch_rejected():
+    """A same-named, non-expired, cardinality-exactly-one artifact whose
+    nested `workflow_run.head_sha` does NOT match the caller-supplied
+    `expected_head_sha` must be rejected, not silently accepted."""
+    transport = _paged_transport(
+        [
+            [
+                _artifact(
+                    artifact_id=1,
+                    name=DECISION_NAME,
+                    workflow_run={"id": RUN_ID, "head_sha": "0" * 40},
+                )
+            ]
+        ]
+    )
+    result = rvi.acquire_trusted_artifact(
+        transport=transport,
+        repository=REPOSITORY,
+        run_id=RUN_ID,
+        expected_artifact_name=DECISION_NAME,
+        expected_head_sha=EXPECTED_HEAD_SHA_FOR_ACQUIRE,
+    )
+    assert result.ok is False
+    assert f"trusted_artifact_workflow_run_head_sha_mismatch:{DECISION_NAME}" in result.reason_codes
+
+
+def test_acquire_trusted_artifact_nested_workflow_run_id_mismatch_rejected():
+    """Same, but the nested `workflow_run.id` (not `head_sha`) is the field
+    that disagrees with the caller-supplied `run_id`."""
+    transport = _paged_transport(
+        [
+            [
+                _artifact(
+                    artifact_id=1,
+                    name=DECISION_NAME,
+                    workflow_run={"id": RUN_ID + 1, "head_sha": EXPECTED_HEAD_SHA_FOR_ACQUIRE},
+                )
+            ]
+        ]
+    )
+    result = rvi.acquire_trusted_artifact(
+        transport=transport,
+        repository=REPOSITORY,
+        run_id=RUN_ID,
+        expected_artifact_name=DECISION_NAME,
+        expected_head_sha=EXPECTED_HEAD_SHA_FOR_ACQUIRE,
+    )
+    assert result.ok is False
+    assert f"trusted_artifact_workflow_run_id_mismatch:{DECISION_NAME}" in result.reason_codes
+
+
+def test_acquire_trusted_artifact_nested_workflow_run_missing_rejected():
+    """When `expected_head_sha` is supplied but the artifact response omits
+    the `workflow_run` object entirely, this must fail closed rather than
+    silently skip the check."""
+    transport = _paged_transport([[_artifact(artifact_id=1, name=DECISION_NAME)]])
+    result = rvi.acquire_trusted_artifact(
+        transport=transport,
+        repository=REPOSITORY,
+        run_id=RUN_ID,
+        expected_artifact_name=DECISION_NAME,
+        expected_head_sha=EXPECTED_HEAD_SHA_FOR_ACQUIRE,
+    )
+    assert result.ok is False
+    assert f"trusted_artifact_workflow_run_missing:{DECISION_NAME}" in result.reason_codes
+
+
+def test_acquire_trusted_artifact_nested_workflow_run_matching_tuple_accepted():
+    """Companion positive case: a matching nested
+    `(workflow_run.id, workflow_run.head_sha)` tuple must still succeed."""
+    transport = _paged_transport(
+        [
+            [
+                _artifact(
+                    artifact_id=1,
+                    name=DECISION_NAME,
+                    workflow_run={"id": RUN_ID, "head_sha": EXPECTED_HEAD_SHA_FOR_ACQUIRE},
+                )
+            ]
+        ]
+    )
+    result = rvi.acquire_trusted_artifact(
+        transport=transport,
+        repository=REPOSITORY,
+        run_id=RUN_ID,
+        expected_artifact_name=DECISION_NAME,
+        expected_head_sha=EXPECTED_HEAD_SHA_FOR_ACQUIRE,
+    )
+    assert result.ok is True
+    assert result.artifact_id == 1
+
+
+def test_acquire_trusted_artifact_no_expected_head_sha_skips_nested_check():
+    """When `expected_head_sha` is omitted (default `None`), the nested
+    cross-check must be skipped entirely -- existing callers that never
+    supply it keep their prior behavior unchanged."""
+    transport = _paged_transport([[_artifact(artifact_id=1, name=DECISION_NAME)]])
+    result = rvi.acquire_trusted_artifact(
+        transport=transport, repository=REPOSITORY, run_id=RUN_ID, expected_artifact_name=DECISION_NAME
+    )
+    assert result.ok is True
+    assert result.artifact_id == 1
 
 
 # ---------------------------------------------------------------------------
