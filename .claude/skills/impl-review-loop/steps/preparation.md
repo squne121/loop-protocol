@@ -16,6 +16,39 @@ PR review の失敗など、artifact chain から独立した安全境界に限�
 
 ループ開始前に LOOP_STATE を初期化し、必要な前提を確認する。
 
+## Root-Owned Synchronous Entry Transition（ルート起点の同期エントリ遷移、統一 Entry Policy, #2272 正本、root-direct 再設計）
+
+`impl-review-loop` の Step 1 起動判断は、root/main thread が単一の継続した control
+flow の中で完結させる（OWNER REQUEST_CHANGES
+https://github.com/squne121/loop-protocol/pull/2282#issuecomment-5371853364
+を受けた root-direct 再設計）。producer/consumer をまたぐ再提示可能な
+`invocation_token` は廃止済みで、以下は同一プロセス・同一呼び出しの中で順に実行される
+一続きの手順である（`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`
+の `run_root_transition()`）。詳細な routing 優先順位・body/base drift の区別・
+bounded retry 方針は `.claude/skills/issue-refinement-loop/references/termination-policy.md`
+の「Root-Owned Synchronous Entry Transition」節を正本として参照する。
+
+- root は capability preflight → live Issue fetch → 同一呼び出し内での current-run
+  `issue-contract-review`（既存 `run_once()` を関数として直接 import・呼び出し。
+  `.claude/skills/issue-contract-review/**` 自体は変更しない）→ 直後の live 再取得
+  → `decide_root_entry_route()` によるルーティング決定 → route が
+  `invoke_impl_review_loop` の場合のみ、同じ呼び出しの中で Step 1 を直接起動する、
+  という一続きの手順を実行する。`review_verdict` / `reviewed_body_sha256` /
+  `reviewed_base_sha` は呼び出し元から受け取る値ではなく、この呼び出し自身が実行した
+  current-run review と live fetch の結果から導出される。
+- GitHub コメント上の過去 `LOOP_HANDOFF_RESULT_V1`（`status: impl_ready`）は、
+  それ単独では `run_root_transition()` の入力にすらならない（同関数は route/envelope
+  を一切受理しない）。コメント再取得は audit telemetry であり、単独では実装を
+  authorize しない。
+- 下記「0. Intake Gate」で定義する優先順位付き停止理由（サブ理由）のうち、
+  最高優先の理由（title prefix 欠落等）に次ぐ 2 番目の理由、すなわち陳腐化した
+  契約レビュー（go コメント発行後に Issue 本文が更新された状態）を扱うサブ理由は、
+  `run_root_transition()` 経由で起動された invocation では
+  **終端 stop としては再適用しない**（body drift は `run_root_transition()` 内で
+  `rerun_contract_review` route として既に処理済みのため）。同サブ理由は
+  `contract_snapshot_url` が明示提供された legacy / 非 Root-routed 直接呼び出し
+  経路にのみ適用される、後方互換のための限定ゲートである。
+
 ## 0-a. Intake capsule-first（インテーク処理をカプセル生成優先で行う）
 
 着手直後は **`IMPL_REVIEW_INTAKE_CAPSULE_V1` を最優先で生成して利用**する。
@@ -126,6 +159,16 @@ title prefix が欠落していれば `intake_gate_failed: metadata_not_ready` �
 - `body_sha256` フィールドが存在しない場合のフォールバック: `CONTRACT_REVIEW_RESULT_V1.generated_at` < Issue の `updated_at`（go コメント生成後に Issue 本文が更新された）
 
 いずれかの条件が真の場合は `intake_gate_failed: stale_contract_review` で停止し、`issue-contract-review` の再実行を人間に依頼する。
+
+**Root-Owned Entry Transition との関係（#2272、相反規則の除去）**: 本サブ理由は
+`ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` を経由しない legacy / 非 Root-routed
+直接呼び出し（`contract_snapshot_url` 明示提供時の自動検出フロー）にのみ適用する。
+`ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` 経由の invocation では、body drift（stale
+prior review を含む）は producer 側の `rerun_contract_review` route として既に
+処理され fresh review へ差し戻されている（terminal stop にしない）ため、本節を
+重ねて `intake_gate_failed` の terminal stop として再適用しない。両者は互いに
+排他的な入力経路（Root-routed か legacy か）に対する規則であり、同一
+invocation に対して同時に適用されることはない。
 
 #### 3. `body_snapshot_mismatch`（本文スナップショット不一致）
 

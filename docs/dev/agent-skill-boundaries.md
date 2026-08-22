@@ -18,6 +18,25 @@ worker や CI/review/security/permission/publication の safety stop と混同�
 | merge-readiness consumer | GitHub の `mergeable_state` と `merge_state_status` を別 field で consume | semantic planning を再分類すること |
 | open-pr consumer | canonical repository 解決（`resolve_canonical_repository()`）と evidence の `repository` field binding 検証を、overlap 機能から独立した fail-closed hard gate として維持する。overlap preflight evidence の producer/consumer（stored/fresh hash・drift・collection contract・safety predicate route・digest・waiver・warning comment・`check_implementation_overlap.py` checker）は #1679 により production path から完全に削除済みであり、advisory validation も含め存在しない | canonical repository 解決失敗時に raw repo へフォールバックすること |
 
+## Root-Owned Synchronous Entry Transition 境界（単一の継続した呼び出しの中で完結する root-direct 方式、#2272）
+
+`issue-refinement-loop` から `impl-review-loop` への実装着手起動は、GitHub コメント
+（`LOOP_HANDOFF_RESULT_V1`）を authorization 手段にしない。root/main thread が
+同一 control flow 内で `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1`（process-local, 非永続）を
+生成・消費する:
+
+- **entry point**: `.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`
+  の `run_root_transition()`（root-direct、#2272 再設計）。capability preflight・
+  live Issue fetch・同一呼び出し内での current-run `issue-contract-review`・
+  body/base drift 判定・bounded retry・Step 1 の直接起動までを単一の継続した
+  call stack の中で行う。producer/consumer を別プロセスに分離し
+  `invocation_token` の再提示で authorize する旧方式は撤回済み。
+
+`LOOP_HANDOFF_RESULT_V1` の GitHub コメント marker は audit telemetry として残るが、
+Step 1 起動の authority ではない。正本は
+`.claude/skills/issue-refinement-loop/references/termination-policy.md` の
+「Root-Owned Synchronous Entry Transition」節。
+
 ## SubAgent 役割分類と permissionMode 一覧
 
 各 SubAgent を役割カテゴリ別に分類し、それぞれの `permissionMode` と主要ツール制約を示す。
