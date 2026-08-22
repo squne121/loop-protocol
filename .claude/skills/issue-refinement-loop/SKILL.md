@@ -352,7 +352,7 @@ delivery-rollup parent の child materialization gate と、approve 後の follo
 
 終了条件、`human_escalation` 経路、scope change signal 停止、loop termination table は `references/termination-policy.md` を参照する。
 
-`approved` 終了時、`issue_kind: implementation` の Issue（`impl-review-loop` への handoff を伴う通常実装 Issue）は `LOOP_HANDOFF_RESULT_V1` marker を終了コメントに出力する（形式・routing rules は `references/termination-policy.md#LOOP_HANDOFF_RESULT_V1` 参照）。出力は `<!-- LOOP_HANDOFF_RESULT_V1 -->` HTML comment と fenced YAML block の 2 要素。
+`approved` 終了時、`issue_kind: implementation` の Issue（`impl-review-loop` への handoff を伴う通常実装 Issue）は `LOOP_HANDOFF_RESULT_V1` marker を終了コメントに出力する（形式・routing rules は `references/termination-policy.md#LOOP_HANDOFF_RESULT_V1` 参照。このコメントは audit telemetry のみで Step 1 起動の authority ではない）。出力は `<!-- LOOP_HANDOFF_RESULT_V1 -->` HTML comment と fenced YAML block の 2 要素。root/main thread は同じ turn 内で直ちに `run_root_transition()`（CLI: `root_entry_router.py --issue-number <N> --repo <owner/repo>`、#2272 root-direct 正本）を実行し、`invoked: true` の場合のみその場で `impl-review-loop` を起動する（詳細は `references/termination-policy.md`）。
 
 **適用範囲外（`issue_kind: parent`、delivery-rollup parent を含む、#1914）**: `issue_kind: parent` の Issue が `approved` 終了する場合、本 marker は出力しない（`impl-review-loop` への handoff が発生しないため）。plain Markdown の終了要約のみを投稿し、delivery-rollup parent の場合は要約に `Final Gate: not applicable` と reason code を明記する。詳細は `references/termination-policy.md` の `LOOP_HANDOFF_RESULT_V1` セクション（適用範囲節）を SSOT とする — 本ファイルはそれを矛盾なく要約するのみで、独自の無条件規則を持たない。
 

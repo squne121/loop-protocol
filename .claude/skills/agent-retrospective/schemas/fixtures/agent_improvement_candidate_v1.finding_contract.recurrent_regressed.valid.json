@@ -1,0 +1,140 @@
+{
+  "candidate_id": "cand-finding-recurrent-0001",
+  "candidate_status": "proposed",
+  "title": "finding_contract fixture: recurrent_rule",
+  "description": "Fixture candidate for finding_contract schema validation (Issue #2288).",
+  "source_run_ref": {
+    "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+    "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+  },
+  "created_at": "2026-08-22T00:00:00Z",
+  "updated_at": "2026-08-22T00:00:00Z",
+  "finding_contract": {
+    "schema_version": "v1",
+    "identity": {
+      "algorithm": "sha256-jcs-v1",
+      "key": {
+        "repository_id": "squne121/loop-protocol",
+        "claim_class": "runtime_behavior",
+        "subject_ref": {
+          "kind": "repository_path",
+          "value": "schemas/z.json"
+        },
+        "rule_id": "recurrent_rule"
+      },
+      "value": "sha256:8a4fd960011bba1624e3e2e7b244d21573dc09821b6e9140d741cd49adec03dd"
+    },
+    "claim_class": "runtime_behavior",
+    "evaluations": [
+      {
+        "evaluation_id": "sha256:fb231e3ed814da184d83890250838b93475951c6d14d112d9b9c655849816fca",
+        "evaluated_run_ref": {
+          "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+          "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+        },
+        "previous_evaluation_ref": null,
+        "observed": true,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "new",
+        "signal_delta": "unknown",
+        "indeterminate_reason": null,
+        "baseline_signal": null,
+        "current_signal": {
+          "signal_type": "boolean",
+          "value": true,
+          "comparator": "eq",
+          "worse_direction": "not_applicable"
+        },
+        "expected_signal": null,
+        "evidence_refs": [
+          {
+            "ref_type": "repository_blob",
+            "source_id": "repository",
+            "resource_identity": ".claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py#recurrent-new-1",
+            "projection_digest": "sha256:08fe39a247c1fc9ab1ab3a49d2dddad43e30065243fd9049fc94dd9f3700c5d4"
+          }
+        ],
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "delta-evaluator/v1",
+        "delta_status": "new"
+      },
+      {
+        "evaluation_id": "sha256:9d0b12b1568ce8743584cbae30a93aab3ff6e14c69b0a30ea10d6b5740383e6b",
+        "evaluated_run_ref": {
+          "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+          "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+        },
+        "previous_evaluation_ref": "sha256:fb231e3ed814da184d83890250838b93475951c6d14d112d9b9c655849816fca",
+        "observed": false,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "resolved",
+        "signal_delta": "unknown",
+        "indeterminate_reason": null,
+        "baseline_signal": {
+          "signal_type": "boolean",
+          "value": true,
+          "comparator": "eq",
+          "worse_direction": "not_applicable"
+        },
+        "current_signal": null,
+        "expected_signal": null,
+        "evidence_refs": [
+          {
+            "ref_type": "repository_blob",
+            "source_id": "repository",
+            "resource_identity": ".claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py#recurrent-resolved-1",
+            "projection_digest": "sha256:96ce8c3079bcd31d5a754907f28227e565de005402fce7f3c6ee999606a9e41a"
+          }
+        ],
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "delta-evaluator/v1",
+        "delta_status": "resolved"
+      },
+      {
+        "evaluation_id": "sha256:eb0a2440be39ff21429506df81251485c7126d17f4764f85dda96d661f446446",
+        "evaluated_run_ref": {
+          "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+          "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+        },
+        "previous_evaluation_ref": "sha256:9d0b12b1568ce8743584cbae30a93aab3ff6e14c69b0a30ea10d6b5740383e6b",
+        "observed": true,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "recurrent",
+        "signal_delta": "regressed",
+        "indeterminate_reason": null,
+        "baseline_signal": {
+          "signal_type": "integer",
+          "value": 2,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "current_signal": {
+          "signal_type": "integer",
+          "value": 9,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "expected_signal": {
+          "signal_type": "integer",
+          "value": 0,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "evidence_refs": [
+          {
+            "ref_type": "repository_blob",
+            "source_id": "repository",
+            "resource_identity": ".claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py#recurrent-regressed-1",
+            "projection_digest": "sha256:f30c0838b00a9f6f0249460beb6fe7c45fac757e853ef8b5a8013b0dac0516b2"
+          }
+        ],
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "delta-evaluator/v1",
+        "delta_status": "recurrent"
+      }
+    ]
+  }
+}

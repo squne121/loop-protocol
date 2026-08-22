@@ -443,6 +443,121 @@ scope / goal / AC への semantic change が検出されたとき、`issue-refin
 各委譲は `auto_fixes.required` エントリとして記録し、`result: applied` かつ `evidence` 完備のものだけが `impl_ready` に貢献する。
 
 
+## Root-Owned Synchronous Entry Transition（root が単独で所有する同期的な実装着手への遷移経路、#2272 正本）
+
+`issue-refinement-loop` の `approved` 終了（`LOOP_HANDOFF_RESULT_V1.status: impl_ready`）は
+`impl-review-loop` Step 1 起動の **唯一の authority ではない**。root/main thread が
+Issue review 開始から `impl-review-loop` 起動判断までを単一の連続した control flow
+として実行する invocation（同一 root invocation）の中でのみ、以下の process-local な
+戻り値 `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` を生成・消費する。durable authorization
+packet ではなく、保存・再ロード用の API を持たない。GitHub comment・artifact・
+digest・invocation ID のいずれも単独では Step 1 起動を authorize しない。
+
+```yaml
+ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1:
+  route: invoke_impl_review_loop | rerun_contract_review | rerun_base_preflight | stop
+  reason:
+  issue_number:
+  reviewed_body_sha256:
+  observed_live_body_sha256:
+  reviewed_base_sha:
+  observed_base_sha:
+  resume_from:
+  retry_count:
+```
+
+### Routing 優先順位
+
+| 優先度 | 条件 | route |
+|---|---|---|
+| 1 | capability／live fetch／identity が検証不能 | stop |
+| 2 | Issue body または Allowed Paths drift | rerun_contract_review |
+| 3 | base SHA のみ drift | rerun_base_preflight |
+| 4 | verdict が blocked / request_changes | stop |
+| 5 | current-run go かつ live equality 成立 | invoke_impl_review_loop |
+
+数値が小さい優先度を優先する。複数条件が同時成立する場合は最小番号の route を採用する。
+
+body／Allowed Paths drift（review subject 自体の変更）は常に full `issue-contract-review`
+を再実行する（`rerun_contract_review`）。base SHA drift のみは `rerun_base_preflight`
+route で exact base SHA を pin し、その SHA から worktree を作成する。
+`rerun_base_preflight` の再試行上限は 3 回（`MAX_BASE_PREFLIGHT_RETRIES`）。上限到達後も
+drift が解消しない場合は `route: stop` / `reason: base_preflight_retry_exhausted` を
+terminal result として返す。
+
+### production carrier（送り手・受け手・呼び出し口を固定する運搬経路の定義、root-direct 再設計）
+
+OWNER REQUEST_CHANGES
+（https://github.com/squne121/loop-protocol/pull/2282#issuecomment-5371853364 ）
+を受け、producer/consumer を別プロセス・別 script に分離し `invocation_token` の
+再提示で authorize する方式は撤回した。root/main thread は単一の継続した invocation
+（in-process 呼び出しなら同一 call stack、CLI subprocess 経由なら同一 continuous
+turn — 後者は subprocess がこの turn の tool call を直接駆動できないための区別。
+下記 delivery 参照）の中で以下を自ら実行する（`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`
+の `run_root_transition()`）。
+
+```yaml
+carrier:
+  entry_point: .claude/skills/issue-refinement-loop/scripts/root_entry_router.py::run_root_transition
+  encoding: strict JSON（CLI 経由で呼ぶ場合の stdout。in-process 呼び出しの場合は plain dict）
+  delivery: 同一 call stack 内の直接関数呼出し。プロセス境界を越える必要がある場合
+    （例: root/main thread から独立した CLI 実行）も、CLI の標準出力は SAME
+    continuous turn 内で直ちに読み取られ次の判断に使われるのみで、再提示可能な
+    形で保存・再利用されない。
+  forbidden:
+    - GitHub comment discovery
+    - ambient environment lookup
+    - stale artifact lookup
+    - transcript scraping
+    - re-presentable authorization token（invocation_token 相当のもの一切）
+```
+
+`run_root_transition()` は以下を1回の呼び出しの中で順に実行する: capability
+preflight → live Issue fetch → 同一呼び出し内での current-run
+`issue-contract-review`（既存 `run_once()` を関数として直接呼び出す。呼び出し元が
+`review_verdict` / `reviewed_body_sha256` / `reviewed_base_sha` を供給することは
+できない — これらのパラメータは公開 API に存在しない）→ 直後の live 再取得 →
+`decide_root_entry_route()` によるルーティング決定（base drift のみ、関数内部の
+ループでの bounded retry。retry_count は呼び出し元へ公開されない local state） →
+route が `invoke_impl_review_loop` の場合のみ、同じ呼び出しの中で
+`invoke_step1()` コールバックを直接実行する。
+
+### root invocation の識別（プロセスローカルな相関用ラベルであり認可根拠ではない）
+
+payload 内に自己申告の `root_invocation_id` を含めない。host から `prompt_id` が
+取得可能な場合は audit ログ相関にのみ利用し（`generate_root_invocation_nonce(prompt_id)`）、
+取得不能な場合は process-local nonce を生成する（`generate_root_invocation_nonce()`）。
+この nonce / prompt_id 由来の correlation id は **いかなる authorization 判断にも
+関与しない**（比較・照合されることが一切ない）。nonce を payload や audit comment
+から再取得することもない。process restart 後は nonce を復元せず、常に fresh
+review（capability preflight → live fetch → current-run review）からやり直す。
+
+`ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` を受理する別 consumer は存在しない。
+GitHub コメントのみから再構成された route や、process 再開後に古い route を
+再利用しようとする試みは、`run_root_transition()` が route/envelope を一切
+外部入力として受理しない設計そのものによって構造的に不可能である。
+
+### fingerprint の再利用範囲（AC13 の明確化）
+
+既存 `issue-contract-review` の comment-based fingerprint validator
+（`contract_source_kind == issue_comment` を要求し、実 comment ID・trusted author
+provenance を検証する既存 parser）は、本節の direct result には適用しない。
+`reviewed_body_sha256` と `observed_live_body_sha256`、`reviewed_base_sha` と
+`observed_base_sha` を直接比較する live equality check として実装する。SHA256
+算出・正規化方式は既存 `issue-contract-review` の `contract_body_sha256` /
+`allowed_paths_normalized_sha256` と同一の canonicalization ロジック
+（`"sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()`）を独立実装として
+流用するが、comment provenance 検証は要求しない。既存 comment-based fingerprint
+parser 本体（`.claude/skills/issue-contract-review/**`）は変更対象に含めない。
+
+### audit comment の位置付け（非 authoritative）
+
+`impl-review-loop` 起動判断（`route` の決定）は GitHub audit comment の publish
+成否を条件にしない。audit comment publish は route 決定後の best-effort 処理とし、
+失敗時は warning として記録するのみで route を変更しない
+（`publish_audit_comment_best_effort()`）。restart 時は audit comment を authority
+として扱わず、常に fresh review からやり直す。
+
 ## Termination Summary Publish Flow（終了サマリー投稿フロー, #1873）
 
 #1873（bounded review loops）で `render_termination_report.py`（`TERMINATION_REPORT_INPUT_V1` ->
