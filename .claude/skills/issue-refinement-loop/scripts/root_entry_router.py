@@ -390,6 +390,18 @@ class GhCliGitHubEntryTransport:
 
     repo: str
     base_ref: str = "main"
+    spark_mode: str | None = None
+    spark_fallback: str | None = None
+    planned_operations: tuple[dict, ...] = field(
+        default_factory=lambda: (
+            {
+                "phase": "audit",
+                "actor_role": "root_entry_router",
+                "operation": "issue_comment",
+                "requires_mutation": True,
+            },
+        )
+    )
 
     def capability_preflight(self) -> bool:
         """Consume the structured ``CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1``
@@ -407,16 +419,38 @@ class GhCliGitHubEntryTransport:
         preflight_script = (
             repo_root / "scripts" / "claude-gpt" / "workflow_capability_preflight.py"
         )
+        argv = [
+            sys.executable,
+            str(preflight_script),
+            "--profile",
+            "issue-to-impl",
+            "--repo",
+            self.repo,
+        ]
+        if self.spark_mode is not None:
+            argv.extend(["--spark-mode", self.spark_mode])
+        if self.spark_fallback is not None:
+            argv.extend(["--spark-fallback", self.spark_fallback])
+        planned_ops_path: Optional[str] = None
+        if self.planned_operations:
+            import tempfile
+
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".json",
+                prefix="planned-operations-",
+                delete=False,
+                encoding="utf-8",
+            )
+            try:
+                json.dump(list(self.planned_operations), tmp)
+            finally:
+                tmp.close()
+            planned_ops_path = tmp.name
+            argv.extend(["--planned-operations-json", planned_ops_path])
         try:
             proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(preflight_script),
-                    "--profile",
-                    "issue-to-impl",
-                    "--repo",
-                    self.repo,
-                ],
+                argv,
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -427,6 +461,12 @@ class GhCliGitHubEntryTransport:
             return result.get("decision") in ("ready", "degraded")
         except Exception:
             return False
+        finally:
+            if planned_ops_path is not None:
+                try:
+                    Path(planned_ops_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def fetch_live_issue(self, issue_number: int) -> dict:
         try:
@@ -576,9 +616,9 @@ def run_root_transition(
 
     correlation_id = generate_root_invocation_nonce(prompt_id)
 
-    def _finish(route: dict, invoked: bool) -> dict:
+    def _finish(route: dict, invoked: bool, *, audit_eligible: bool) -> dict:
         audit = {"published": None, "warning": None}
-        if publish_audit:
+        if publish_audit and audit_eligible:
             audit = publish_audit_comment_best_effort(transport, issue_number, route)
         return {
             "route": route,
@@ -604,7 +644,11 @@ def run_root_transition(
         except Exception:
             capability_ok = False
         if not capability_ok:
-            return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
+            return _finish(
+                _stop_route(issue_number, "capability_or_identity_unverifiable"),
+                False,
+                audit_eligible=False,
+            )
 
         try:
             live0 = transport.fetch_live_issue(issue_number)
@@ -612,7 +656,11 @@ def run_root_transition(
         except Exception:
             fetch_ok0, live0 = False, {}
         if not fetch_ok0:
-            return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
+            return _finish(
+                _stop_route(issue_number, "capability_or_identity_unverifiable"),
+                False,
+                audit_eligible=False,
+            )
 
         observed_body_sha0 = compute_body_sha256(live0.get("body", ""))
         observed_base_sha0 = live0.get("base_sha")
@@ -646,23 +694,35 @@ def run_root_transition(
             "mutation_partial_failure",
             resume_from=resume_from_after_mutation_failure(mutation_partial_failure_phase),
         )
-        return _finish(route, False)
+        return _finish(route, False, audit_eligible=False)
 
     try:
         capability_ok = bool(transport.capability_preflight())
     except Exception:
         capability_ok = False
     if not capability_ok:
-        return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
+        return _finish(
+            _stop_route(issue_number, "capability_or_identity_unverifiable"),
+            False,
+            audit_eligible=False,
+        )
 
     if expected_repository_identity is None:
-        return _finish(_stop_route(issue_number, "expected_repository_identity_required"), False)
+        return _finish(
+            _stop_route(issue_number, "expected_repository_identity_required"),
+            False,
+            audit_eligible=False,
+        )
     try:
         observed_identity = transport.canonical_repository_identity()
     except Exception:
         observed_identity = None
     if observed_identity != expected_repository_identity:
-        return _finish(_stop_route(issue_number, "repository_identity_mismatch"), False)
+        return _finish(
+            _stop_route(issue_number, "repository_identity_mismatch"),
+            False,
+            audit_eligible=False,
+        )
 
     def _fetch() -> tuple[bool, dict]:
         try:
@@ -674,7 +734,11 @@ def run_root_transition(
 
     fetch_ok, live = _fetch()
     if not fetch_ok:
-        return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
+        return _finish(
+            _stop_route(issue_number, "capability_or_identity_unverifiable"),
+            False,
+            audit_eligible=False,
+        )
 
     reviewed_base_sha = live.get("base_sha")
     retry_count = 0
@@ -686,17 +750,29 @@ def run_root_transition(
                 issue_number=issue_number, repo=repo, mode=mode, reviewed_head_sha=reviewed_base_sha
             )
         except Exception:
-            return _finish(_stop_route(issue_number, "contract_reviewer_transport_failure"), False)
+            return _finish(
+                _stop_route(issue_number, "contract_reviewer_transport_failure"),
+                False,
+                audit_eligible=True,
+            )
 
         if not isinstance(review_result, dict):
-            return _finish(_stop_route(issue_number, "contract_reviewer_malformed_result"), False)
+            return _finish(
+                _stop_route(issue_number, "contract_reviewer_malformed_result"),
+                False,
+                audit_eligible=True,
+            )
 
         review_verdict = "go" if review_result.get("status") == "go" else "blocked"
         reviewed_body_sha256 = review_result.get("body_sha256")
 
         fetch_ok2, live2 = _fetch()
         if not fetch_ok2:
-            return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
+            return _finish(
+                _stop_route(issue_number, "capability_or_identity_unverifiable"),
+                False,
+                audit_eligible=True,
+            )
 
         observed_live_body_sha256 = compute_body_sha256(live2.get("body", ""))
         observed_base_sha = live2.get("base_sha")
@@ -742,7 +818,7 @@ def run_root_transition(
             invoke_step1()
             invoked = True
 
-    return _finish(route, invoked)
+    return _finish(route, invoked, audit_eligible=True)
 
 
 # ---------------------------------------------------------------------------

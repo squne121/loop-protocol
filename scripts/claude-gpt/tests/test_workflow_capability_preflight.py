@@ -10,6 +10,7 @@ AC15/AC16 live in
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -352,3 +353,135 @@ def test_no_broker_dependency_reference():
     )
     for term in forbidden_terms:
         assert term not in source, f"unexpected broker dependency reference: {term}"
+
+
+
+# --- P1-1: repo_read: false must be blocked, not degraded ------------------
+
+
+def test_workflow_capability_repo_read_false_blocks(monkeypatch):
+    """GIVEN github auth succeeds but the repository read probe fails
+    (`gh repo view` non-zero)
+    THEN decision must be `blocked`, not `degraded` -- a workflow cannot
+    read the very issue/PR state it needs to operate on, so this is not a
+    merely-degraded capability state (P1-1 fix)."""
+
+    monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
+    monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: False)
+    result = wcp.assess(
+        project_root=str(_REPO_ROOT),
+        profile="issue-to-impl",
+        repo=_DEFAULT_REPO,
+        spark_mode=None,
+        spark_fallback=None,
+        planned_operations=[],
+    )
+    assert result["checks"]["github"]["auth"] is True
+    assert result["checks"]["github"]["repo_read"] is False
+    assert result["decision"] == wcp.DECISION_BLOCKED
+    assert any("repo_read_unavailable" in reason for reason in result["reasons"])
+
+
+# --- P1-2: --workflow-profile must not bootstrap via an unverified PATH uv -
+
+
+def test_workflow_profile_dispatch_does_not_invoke_path_uv(tmp_path):
+    """GIVEN the `--workflow-profile` branch of `preflight.sh`
+    WHEN it dispatches to `workflow_capability_preflight.py`
+    THEN the dispatch must launch the Python module directly (system
+    `python3`), never a PATH-resolved `uv run --locked ...` bootstrap step
+    -- the module performs its OWN trusted-uv judgment internally, so
+    executing an unverified PATH `uv` first would run untrusted code before
+    that judgment even happens (P1-2 fix)."""
+
+    fake_bin_dir = tmp_path / "fakebin"
+    fake_bin_dir.mkdir()
+    # A `uv` on PATH that, if invoked at all by the dispatcher, records the
+    # fact by writing a sentinel file -- proving whether it was executed.
+    sentinel = tmp_path / "uv_was_invoked.sentinel"
+    fake_uv = fake_bin_dir / "uv"
+    fake_uv.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 1\n")
+    fake_uv.chmod(0o755)
+
+    child_env = dict(os.environ)
+    child_env["PATH"] = str(fake_bin_dir) + os.pathsep + child_env.get("PATH", "")
+
+    proc = subprocess.run(
+        ["sh", str(PREFLIGHT_SH), "--workflow-profile", "issue-to-impl"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=child_env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["schema"] == "CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1"
+    assert not sentinel.exists(), "the fake PATH `uv` must never be invoked by the dispatcher"
+
+
+# --- P1-3: malformed --planned-operations-json must fail closed, not [] ---
+
+
+def _run_with_planned_operations_file(planned_ops_path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPTS_DIR / "workflow_capability_preflight.py"),
+            "--profile",
+            "issue-to-impl",
+            "--repo",
+            _DEFAULT_REPO,
+            "--planned-operations-json",
+            str(planned_ops_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_planned_operations_missing_file_fails_closed(tmp_path):
+    missing_path = tmp_path / "does_not_exist.json"
+    proc = _run_with_planned_operations_file(missing_path)
+    assert proc.returncode == 2
+    error_payload = json.loads(proc.stderr)
+    assert error_payload["error"] == "invalid_planned_operations_input"
+
+
+def test_planned_operations_invalid_json_fails_closed(tmp_path):
+    bad_json_path = tmp_path / "bad.json"
+    bad_json_path.write_text("{not valid json", encoding="utf-8")
+    proc = _run_with_planned_operations_file(bad_json_path)
+    assert proc.returncode == 2
+    error_payload = json.loads(proc.stderr)
+    assert error_payload["error"] == "invalid_planned_operations_input"
+
+
+def test_planned_operations_malformed_entry_fails_closed(tmp_path):
+    malformed_path = tmp_path / "malformed.json"
+    malformed_path.write_text(json.dumps([{"phase": "audit"}]), encoding="utf-8")
+    proc = _run_with_planned_operations_file(malformed_path)
+    assert proc.returncode == 2
+    error_payload = json.loads(proc.stderr)
+    assert error_payload["error"] == "invalid_planned_operations_input"
+
+
+def test_planned_operations_not_a_list_fails_closed(tmp_path):
+    not_a_list_path = tmp_path / "not_a_list.json"
+    not_a_list_path.write_text(json.dumps({"operation": "issue_comment"}), encoding="utf-8")
+    proc = _run_with_planned_operations_file(not_a_list_path)
+    assert proc.returncode == 2
+    error_payload = json.loads(proc.stderr)
+    assert error_payload["error"] == "invalid_planned_operations_input"
+
+
+def test_planned_operations_omitted_is_still_valid_empty_list():
+    """Sanity check that omitting `--planned-operations-json` entirely
+    (the legitimate no-planned-mutations case) is NOT treated as invalid
+    input -- only an explicitly supplied but malformed file is fail-closed
+    (P1-3 scope)."""
+
+    proc = _run_preflight_cli("issue-to-impl")
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["checks"]["github"]["operations"] == {}

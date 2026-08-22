@@ -157,24 +157,41 @@ def _operation_route(operation: str) -> str:
 
 
 def _load_planned_operations(path: str | None) -> list[dict]:
+    """Load and validate the caller-supplied planned-operations JSON.
+
+    When `path` is omitted (None/empty), an empty list is the legitimate
+    default (no planned mutation-requiring operations declared). When a path
+    IS explicitly supplied, any malformation (unreadable file, invalid JSON,
+    wrong top-level shape, malformed entry) is a caller input error and MUST
+    raise `ValueError` rather than silently degrade to an empty list -- a
+    silent `[]` would make a genuinely mutation-requiring operation set
+    disappear and let `assess()` PASS as if no mutation were planned (P1-3
+    fix)."""
+
     if not path:
         return []
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return []
+    except OSError as exc:
+        raise ValueError(f"cannot read planned-operations-json file {path!r}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"planned-operations-json is not valid JSON: {exc}") from exc
     if not isinstance(data, list):
-        return []
+        raise ValueError("planned-operations-json top-level value must be a JSON list")
     normalized = []
     for entry in data:
         if not isinstance(entry, dict):
-            continue
+            raise ValueError(f"planned-operations-json entry is not an object: {entry!r}")
         operation = entry.get("operation")
         phase = entry.get("phase")
         actor_role = entry.get("actor_role")
         if not isinstance(operation, str) or not operation:
-            continue
+            raise ValueError(f"planned-operations-json entry missing non-empty 'operation': {entry!r}")
+        if "requires_mutation" in entry and not isinstance(entry["requires_mutation"], bool):
+            raise ValueError(
+                f"planned-operations-json entry 'requires_mutation' must be a bool: {entry!r}"
+            )
         normalized.append(
             {
                 "phase": phase if isinstance(phase, str) else "unknown",
@@ -250,11 +267,11 @@ def assess(
                 f"{entry.get('actor_role', 'unknown')}; do not start this mutation-requiring phase"
             )
 
-    if missing_mutation_route or not github_auth:
+    if missing_mutation_route or not github_auth or not github_repo_read:
         decision = DECISION_BLOCKED
     elif not uv_ok or spark_status == SPARK_UNAVAILABLE:
         decision = DECISION_BLOCKED
-    elif spark_status == SPARK_FALLBACK_ONLY or not github_repo_read:
+    elif spark_status == SPARK_FALLBACK_ONLY:
         decision = DECISION_DEGRADED
     else:
         decision = DECISION_READY
@@ -291,7 +308,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
 
-    planned_operations = _load_planned_operations(args.planned_operations_json)
+    try:
+        planned_operations = _load_planned_operations(args.planned_operations_json)
+    except ValueError as exc:
+        error_payload = {
+            "schema": SCHEMA,
+            "error": "invalid_planned_operations_input",
+            "detail": str(exc),
+        }
+        print(json.dumps(error_payload, ensure_ascii=False), file=sys.stderr)
+        return 2
 
     result = assess(
         project_root=args.project_root,

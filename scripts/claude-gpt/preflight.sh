@@ -71,12 +71,14 @@ fi
 # a `set -e` caller does not lose the JSON payload.
 if [ "${1:-}" = "--workflow-profile" ]; then
   shift
-  UV_BIN_FOR_WORKFLOW_PROFILE=$(command -v uv 2>/dev/null || true)
-  if [ -z "$UV_BIN_FOR_WORKFLOW_PROFILE" ]; then
-    printf '{"schema":"CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1","profile":"%s","decision":"blocked","checks":{"uv":{"status":"trusted_uv_missing","reason":"uv_not_found"},"spark":{"status":"unavailable"},"github":{"auth":false,"repo_read":false,"operations":{}}},"reasons":["uv:not_found: uv binary not found on PATH; cannot dispatch workflow-profile preflight"]}\n' "${1:-}"
-    exit 0
-  fi
-  "$UV_BIN_FOR_WORKFLOW_PROFILE" run --locked python3 "$SCRIPT_DIR/workflow_capability_preflight.py" --profile "$@"
+  # P1-2 fix: `workflow_capability_preflight.py` judges trusted-`uv`
+  # availability itself (via `trusted_runtime_capabilities.check_trusted_uv`,
+  # which delegates to the canonical `skill_runtime_exec` resolver). Running
+  # an UNVERIFIED PATH `uv` here first, before that trusted judgment even
+  # runs, would execute untrusted code as a bootstrap step. Launch the
+  # Python module directly from system `python3` instead; it performs its
+  # own trusted-uv check as part of the assessment.
+  python3 "$SCRIPT_DIR/workflow_capability_preflight.py" --profile "$@"
   exit "$?"
 fi
 
