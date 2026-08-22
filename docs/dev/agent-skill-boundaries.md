@@ -433,6 +433,7 @@ speckit_implement_policy:
 ## Runtime Verification 責務分担
 
 詳細なポリシーは `docs/dev/runtime-verification-policy.md` を SSOT とする。本セクションは各 Agent / Skill の役割分担のみを記載する。
+Claude extension surface（`.claude/agents/**` / `.claude/hooks/**` / `.claude/skills/**` / `scripts/claude-gpt/**`）変更時の risk-trigger 判定 rule set は `docs/dev/extension-surface-runtime-policy.yaml` を正本とする（`docs/dev/runtime-verification-policy.md` セクション 11 参照。enforcement 配線は Issue #2290）。
 
 | 役割 | Runtime Verification に関する責務 |
 |---|---|
