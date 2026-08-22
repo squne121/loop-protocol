@@ -185,6 +185,7 @@ body AC7 / "proxy と Agent hook の bounded correlation" bullet).
 from __future__ import annotations
 
 import json
+import re
 import sys
 
 (
@@ -206,6 +207,38 @@ import sys
 ) = sys.argv[1:16]
 
 HOOK_LIFECYCLE = ("SubagentStart", "SubagentStop")
+
+# Issue #2274 AC18 correction (2026-08-22, corrective iteration superseding
+# the 2026-08-21 HUMAN_REVIEW_REQUIRED verdict): per Claude Code's official
+# hooks reference (code.claude.com/docs/en/hooks, "Agent" tool_response
+# table, verified against the raw page source -- not a search-engine
+# summary), `modelsUsed` is documented as "Models used in order, with
+# consecutive repeats collapsed; set only when the model was swapped
+# mid-run. Requires Claude Code v2.1.212 or later." `resolvedModel`
+# "Requires Claude Code v2.1.174 or later." An absent/empty `modelsUsed`
+# on a >= v2.1.212 runtime is therefore the documented steady state for a
+# run with no mid-run model swap -- not evidence of an unsupported schema.
+MODELS_USED_VERSION_FLOOR = (2, 1, 212)
+
+
+def _parse_claude_code_version(version_str):
+    """Best-effort semver-prefix parse of a `claude --version` string such
+    as "2.1.238 (Claude Code)". Returns None (never a guessed tuple) when
+    no leading MAJOR.MINOR.PATCH is found -- an unparsable version string
+    must never be treated as meeting any floor."""
+    if not isinstance(version_str, str):
+        return None
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version_str.strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _version_at_least(version_str, floor):
+    parsed = _parse_claude_code_version(version_str)
+    if parsed is None:
+        return False
+    return parsed >= floor
 
 
 def _iter_stream_events(path):
@@ -362,6 +395,12 @@ else:
             "status": status if isinstance(status, str) else None,
             "resolved_model": resolved_model if isinstance(resolved_model, str) else None,
             "models_used": models_used,
+            # Truthful raw-field presence, kept distinct from the
+            # normalized `models_used` list above so a genuinely-absent
+            # `modelsUsed` key is never conflated with a present-but-empty
+            # `[]` value in reported evidence (Issue #2274 corrective
+            # iteration instruction: never fabricate raw field presence).
+            "models_used_raw_present": "modelsUsed" in tur,
         }
         if not agent_info["agent_id"]:
             reasons.append("tool_result_missing_agent_id")
@@ -380,24 +419,43 @@ else:
         else:
             reasons.append("no_lifecycle_correlation_missing_agent_id")
 
-        # Issue #2274 AC18: BOTH resolvedModel and modelsUsed must be
-        # genuinely present for this runtime's Agent tool_use_result shape
-        # to count as version-floor-supported evidence -- a runtime that
-        # only ever surfaces one of the two fields (live-observed reality,
-        # 2026-08-21: this repository's installed Claude Code emits
-        # `resolvedModel` but never a non-empty `modelsUsed` on the
-        # synchronous-completion `tool_use_result` shape) is exactly the
-        # "field 欠損を null として許容し proxy log だけで一致判定する" shape
-        # AC18 forbids promoting to PASS. Never treat an absent/empty
-        # `modelsUsed` as vacuously satisfied just because `resolvedModel`
-        # happened to be present.
-        if agent_info["resolved_model"] is None or not agent_info["models_used"]:
+        # Issue #2274 AC18 (corrected 2026-08-22): `resolvedModel` is the
+        # v2.1.174+ floor's field and must always be present and correct.
+        # `modelsUsed` is a v2.1.212+ field that Claude Code sets ONLY when
+        # the model was swapped mid-run (official hooks reference, verified
+        # against raw page source 2026-08-22) -- an absent/empty
+        # `modelsUsed` on a runtime that meets the v2.1.212 floor is the
+        # documented no-swap steady state and must be treated as a PASS
+        # candidate, never as `claude_code_evidence_schema_unsupported`.
+        # Below the v2.1.212 floor, or when `resolvedModel` itself is
+        # missing/absent, the full contract genuinely cannot be observed on
+        # this runtime and stays typed `claude_code_evidence_schema_unsupported`.
+        # When `modelsUsed` IS present and non-empty (a swap was genuinely
+        # observed), every element must equal `expected_model` -- a silent
+        # swap to any other model is always a typed FAIL, never silently
+        # absorbed into a PASS.
+        runtime_meets_models_used_floor = _version_at_least(
+            claude_code_version, MODELS_USED_VERSION_FLOOR
+        )
+        if agent_info["resolved_model"] is None:
             reasons.append("claude_code_evidence_schema_unsupported")
-        else:
-            if agent_info["resolved_model"] != expected_model:
-                reasons.append("resolved_model_mismatch_%s" % agent_info["resolved_model"])
-            if expected_model not in agent_info["models_used"]:
-                reasons.append("models_used_missing_expected_model")
+        elif agent_info["resolved_model"] != expected_model:
+            reasons.append("resolved_model_mismatch_%s" % agent_info["resolved_model"])
+        elif not runtime_meets_models_used_floor:
+            # resolvedModel matched, but this runtime is below the
+            # documented v2.1.212 modelsUsed floor: whatever modelsUsed
+            # does or doesn't show cannot be trusted as swap evidence.
+            reasons.append("claude_code_evidence_schema_unsupported")
+        elif agent_info["models_used"]:
+            unexpected = [m for m in agent_info["models_used"] if m != expected_model]
+            if unexpected:
+                reasons.append(
+                    "models_used_silent_swap_detected_%s" % ",".join(sorted(set(unexpected)))
+                )
+        # else: modelsUsed absent/empty on a >=2.1.212 runtime with a
+        # matching resolvedModel is the documented no-swap steady state --
+        # not appended as a reason, and never fabricated as `[]` in place
+        # of the raw absent value for reporting purposes below.
 
 # --- Proxy log slice (bounded to this single-agent step window; see
 #     runtime_smoke_test.sh comment at the call site for the exact bound
@@ -488,6 +546,15 @@ runtime_block = {
     "proxy_version": proxy_version,
     "proxy_sha256": proxy_sha256,
     "proxy_absolute_path": proxy_absolute_path,
+    # Issue #2274 AC18 corrective iteration: explicit, non-fabricated
+    # record of whether this runtime meets the v2.1.212 floor documented
+    # for `modelsUsed` semantics (code.claude.com/docs/en/hooks). When
+    # true and `agent.models_used_raw_present` is false/empty, that is the
+    # documented no-swap steady state, not schema-unsupported evidence.
+    "models_used_semantics_version_floor": "%d.%d.%d" % MODELS_USED_VERSION_FLOOR,
+    "models_used_version_floor_met": _version_at_least(
+        claude_code_version, MODELS_USED_VERSION_FLOOR
+    ),
 }
 
 evidence = {
