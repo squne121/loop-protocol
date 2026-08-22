@@ -370,6 +370,18 @@ function extractRetrospectiveRunPayload(body) {
   ) {
     return { kind: 'blocked', reason: 'retrospective_run_identity_missing' }
   }
+  // Issue #2238 P0-7 fix_delta: the index entry's run_digest must reference
+  // the envelope's OWN verified publication_digest directly -- previously
+  // this recomputed sha256Digest(JSON.stringify(payload, null, 2)) instead,
+  // a digest of pretty-printed JSON that never matched the actual
+  // persist_retrospective_run.py publication_digest (sha256-sorted-json-v1
+  // over the canonicalized envelope, computed WITHOUT pretty-printing).
+  if (
+    typeof payload.publication_digest !== 'string'
+    || !/^sha256:[0-9a-f]{64}$/u.test(payload.publication_digest)
+  ) {
+    return { kind: 'blocked', reason: 'retrospective_run_publication_digest_missing' }
+  }
   return { kind: 'run', payload, runIdentity }
 }
 
@@ -399,7 +411,7 @@ function normalizeRetrospectiveRunComment(rawComment) {
     kind: 'run',
     entry: {
       run_comment_url: rawComment.html_url,
-      run_digest: sha256Digest(JSON.stringify(payload, null, 2)),
+      run_digest: payload.publication_digest,
       base_sha: runIdentity.base_sha,
       source_set_digest: runIdentity.source_set_digest,
       candidate_count: candidateRecords.length,

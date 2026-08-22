@@ -408,10 +408,50 @@ describe('update-retro-index', () => {
       candidate_count: 0,
       delta_summary: 'new:1',
     })
-    expect(built.index.retrospective_runs[0].run_digest).toMatch(/^sha256:[0-9a-f]{64}$/u)
+    // Issue #2238 P0-7 fix_delta: run_digest references the envelope's own
+    // verified publication_digest directly, not a separately-computed
+    // digest of pretty-printed JSON.
+    expect(built.index.retrospective_runs[0].run_digest).toBe(`sha256:${'3'.repeat(64)}`)
 
     // the additive key does not trigger the schema-migration guard
     expect(detectSchemaMigrationRequirement(built.index)).toBeNull()
+  })
+
+  it('GIVEN a retrospective-run comment missing publication_digest WHEN normalizeRetrospectiveRunComment runs THEN it is blocked (Issue #2238 P0-7)', () => {
+    const envelope = {
+      schema_version: 'agent_retrospective_run_publication/v1',
+      repository_id: 'squne121/loop-protocol',
+      target_issue: 2238,
+      request_id: 'req-no-digest',
+      scope: 'repository',
+      idempotency_key: `sha256:${'1'.repeat(64)}`,
+      expected_previous_digest: null,
+      parent_record_digest: null,
+      run: {
+        run_identity: {
+          run_id: 'run-1',
+          base_sha: 'a'.repeat(40),
+          source_set_digest: 'd'.repeat(64),
+          generated_at: '2026-08-22T00:00:00Z',
+          runtime_version: 'agent-retrospective-persist/v1',
+        },
+        source_observations: [
+          { source_type: 'repository', source_id: 'repository', source_status: 'complete', pagination_completeness: 'complete' },
+        ],
+      },
+      candidate_records: [],
+      delta_results: [],
+      // publication_digest intentionally omitted
+    }
+    const marker = `<!-- agent_retrospective_run:v1 repository_id=${envelope.repository_id} idempotency_key=${envelope.idempotency_key} -->`
+    const fenced = `\`\`\`json\n${JSON.stringify(envelope, null, 2)}\n\`\`\``
+    const blocked = normalizeRetrospectiveRunComment({
+      html_url: 'https://github.com/squne121/loop-protocol/issues/928#issuecomment-5000000003',
+      body: `${marker}\n\n${fenced}\n`,
+    })
+
+    expect(blocked.kind).toBe('blocked')
+    expect(blocked.reason).toBe('retrospective_run_publication_digest_missing')
   })
 
   it('GIVEN a malformed retrospective-run marker WHEN normalizeRetrospectiveRunComment runs THEN it is blocked without becoming an entries[]/orphan/ambiguous side effect', () => {

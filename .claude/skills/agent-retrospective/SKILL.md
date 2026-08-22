@@ -155,32 +155,45 @@ schema repair retry 上限 1。
 
 ## 永続化（run の実データを Issue comment として保存する。実装は Issue #2238 / Child 5）
 
-`run_retrospective.py main()` は `--state-backend` 引数（既定 `fixture`）で `PreviousStateProvider`
-backend を選択する。`--state-backend issue-comments` を指定すると、`resolve_previous_state_provider()`
-が sibling module `persist_retrospective_run.py` の `IssueCommentPreviousStateProvider` を実際に
-構築し `run_cli()` へ注入する（`fixture` は従来通り空の `FixturePreviousStateProvider`）。provider の
-`read_version`（直近 publication の digest）は `execute_run()`/`run_cli()` の `finalize()` 呼び出しへ
-`expected_previous_digest` として伝播する。
+`run_retrospective.py main()` は `--state-backend` 引数（既定 `issue-comments`、Issue #2238 P1-3
+fix_delta）で `PreviousStateProvider` backend を選択する。`issue-comments`（既定・本番）は
+`resolve_previous_state_provider()` が sibling module `persist_retrospective_run.py` の
+`IssueCommentPreviousStateProvider` を実際に構築し `run_cli()` へ注入する -- `gh auth` が使えない場合は
+`fixture` へ暗黙 fallback せず、型付き `GhAuthUnavailable` で fail-closed する。`fixture` backend
+（空の `FixturePreviousStateProvider`）が本当に必要な場合は `--state-backend fixture` を明示する。
+provider の `read_version`（直近 publication の digest）は `execute_run()`/`run_cli()` の
+`finalize()` 呼び出しへ `expected_previous_digest` として伝播する。`finalize()` は同時に、Child 3 の
+実際の per-collector `source_observations[]`（および `generated_at`/`runtime_version`）を
+`run_identity` へ additive に格納する（Issue #2238 P0-5 fix_delta -- 固定 placeholder ではなく
+実データ）。
 
 `persist_retrospective_run.py` は `run_retrospective.py` が生成した `PUBLISH_REQUEST_V1` を消費し、
-`agent_retrospective_run_publication/v1` envelope（`run_identity` + 単一 `source_observations` 項目 +
-`candidate_records` + `delta_results`、`sha256-jcs-v1` 準拠 `publication_digest` 付き）を構築して、
-以下を順に実行する:
+`agent_retrospective_run_publication/v1` envelope（`run_identity` + 実際の `source_observations[]` +
+`candidate_records` + `delta_results`、`sha256-sorted-json-v1` 準拠 `publication_digest` 付き）を
+構築する。CLI は 2 段階フロー（Issue #2238 P0-2 fix_delta）で公開する:
 
-1. **optimistic concurrency precheck**（best-effort、ADR 0007 Decision 5）: POST 前に現在の head
-   digest を再確認し `parent_record_digest` として束縛する
-2. **public-safety validator**: field allowlist（未知 top-level key 拒否）+ 値レベルの
-   credential/token/absolute-path パターン拒否 + size 事前確認。違反時は POST しない
-3. **idempotency guard**: `(repository_id, base_sha, source_set_digest, scope)` から publisher が
-   自前で再計算した key による `no_op`/`conflict`/`publish` の三値判定
-4. **human authorization gate**（fail-closed）: TTY 明示確認、または別コマンドが発行する短命な
-   `human_authorization_receipt/v1` ファイルの検証のいずれかが必須。単独の `--authorized-by-human`
-   相当の flag は存在しない
-5. **POST**（ambiguous failure からの `request_id`/idempotency-key ベース回収を含む）
-6. **post-write readback**（comment ID で GET → canonical JSON digest 再計算 → 一致確認）と
-   sibling rescan（同一 `parent_record_digest` を持つ comment が複数あれば `conflict_detected`）
-7. 任意の `agent_retro_index/v1` derived-index 更新。失敗しても一次記録はロールバックせず
-   `published_index_stale` を返す
+1. `prepare-publication` サブコマンド: `repository_id` と `--repo` の cross-check（不一致なら
+   transport 呼び出しゼロで拒否）→ stable `request_payload_digest`（`parent_record_digest`/
+   `generated_at` を含まない）による idempotency 判定（`no_op`/`conflict` はここで終端、authorization
+   不要）→ `publish` 決定のみ optimistic concurrency precheck（best-effort、ADR 0007 Decision 5、
+   `expected_previous_digest=None` は「head が None であること」を要求する厳格値）+ public-safety
+   validator（field allowlist + 値レベル credential/token/absolute-path パターン拒否 + size 事前
+   確認）→ envelope と `publication_digest` を file へ固定
+2. `authorize` サブコマンド: frozen file を人間へ提示し（TTY 明示確認）、または frozen file を参照する
+   `human_authorization_receipt/v1` を発行する（TTL <= 10分、`approved_at` の未来日時・TTL 超過は
+   拒否）
+3. `publish` サブコマンド: POST 直前に live head を再検証し、`prepare-publication` 時点から変化して
+   いれば POST せず再実行を要求する → human authorization gate 確認 → POST（ambiguous failure から
+   の `request_id`/idempotency-key ベース回収を毎回の ambiguous 結果ごとに実施）→ post-write
+   readback（comment ID で GET → 同一 author allowlist/schema/digest 検証関数で再検証、失敗時は
+   `published_unverified` で停止し index 更新を呼ばない）+ sibling rescan（同一
+   `parent_record_digest` を持つ comment が複数あれば `conflict_detected`。永続的な帰結は
+   `IssueCommentPreviousStateProvider.get()` の read-time fork 再構成が担う）→ 任意の
+   `--index-parent-issue` 指定時は `scripts/agent-logs/update-retro-index.mjs` を実行、失敗しても
+   一次記録はロールバックせず `published_index_stale` を返す
+
+単発呼び出し（`publish_run()`／サブコマンド無しの legacy CLI 呼び出し）は上記 3 段を 1 回で合成する
+薄い wrapper として残る。
 
 ### `human_authorization_receipt/v1`
 
@@ -193,6 +206,7 @@ human_authorization_receipt/v1:
   operation: "publish_retrospective_run"
   approved_at: <ISO 8601>
   expires_at: <ISO 8601>          # 検証時刻がこれ以降なら拒否（fail-closed）
+                                   # (approved_at, expires_at) の幅は 10分以内（Issue #2238 P0-2）
 ```
 
 既存 `PUBLISH_REQUEST_V1` の禁止 field（`authorized`/`authorized_by_human`/`authorization_token`/

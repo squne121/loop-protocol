@@ -155,6 +155,14 @@ WIRE_SCHEMA_PUBLISH_REQUEST = "publish_request/v1"
 #: extension the ``PreviousStateProvider`` port already supports.
 DEFAULT_PREVIOUS_STATE_SCOPE = "repository"
 
+#: Issue #2238 P0-5 fix_delta: the runtime_version this module's own
+#: execute_run()/run_cli() production call graph stamps into the extended
+#: run_identity dict it passes to finalize() -- distinct from
+#: persist_retrospective_run.py's own RUNTIME_VERSION (that module
+#: identifies the *publisher*; this one identifies the *observer/evaluator
+#: run* that produced the source_observations/candidate_records).
+RUNTIME_VERSION = "agent-retrospective-run/v1"
+
 #: forbidden fields on PUBLISH_REQUEST_V1 (Issue #2237 P0-4). These are never
 #: declared as PublishRequest dataclass fields, so the generic strict
 #: deserializer already rejects them as "unknown_field" -- listed here only
@@ -1057,6 +1065,8 @@ def finalize(
     idempotency_key: str,
     expected_previous_digest: str | None = None,
     delta_results: list[dict[str, Any]] | None = None,
+    source_observations: list[dict[str, Any]] | None = None,
+    runtime_version: str = RUNTIME_VERSION,
 ) -> PublishRequest:
     """``finalize`` phase: produce the proposal-only ``PublishRequest``. This
     function performs no I/O, no GitHub/Issue mutation, and no filesystem
@@ -1069,25 +1079,51 @@ def finalize(
     (matches every existing direct ``finalize()`` caller that doesn't wire a
     ``PreviousStateProvider``).
 
-    ``public_projection_digest`` (Issue #2237 P1-2) is bound to the full
-    ``run_identity`` (``run_id``/``base_sha``/``source_set_digest`` -- not
-    only ``run_id``/``base_sha`` as before) and to
-    ``expected_previous_digest`` (the optimistic-concurrency token) -- a
-    change to the source set or to the concurrency precondition now always
-    changes the digest, closing the previous under-binding gap."""
-    run_identity = {"run_id": ctx.run_id, "base_sha": ctx.base_sha, "source_set_digest": plan.source_set_digest}
+    ``source_observations`` (Issue #2238 P0-5 fix_delta) is the canonical
+    per-collector acquisition-window observation list ``prepare()`` produced
+    (each Child 3 ``CollectorResult.observation``) -- the caller
+    (``execute_run()``/``run_cli()``) passes the SAME observations that were
+    used to compute ``plan.source_set_digest``, so
+    ``persist_retrospective_run.py``'s ``build_run_envelope()`` can persist
+    the real acquisition-window coverage instead of inventing a fixed
+    single-entry placeholder that didn't match the declared
+    ``source_set_digest``. Additive-only: threaded into the EXISTING
+    ``run_identity`` dict field's VALUE (``run_identity: dict[str, Any]`` on
+    ``PublishRequest`` is untyped/free-form) alongside ``plan.generated_at``
+    and ``runtime_version`` -- this deliberately does NOT add a new
+    ``PublishRequest`` dataclass field, because
+    ``test_run_retrospective.py`` (outside this Issue's Allowed Paths) pins
+    ``{f.name for f in dataclasses.fields(rr.PublishRequest)}`` to an exact
+    set.
+
+    ``public_projection_digest`` (Issue #2237 P1-2) remains bound to the
+    ORIGINAL 3-key ``run_identity`` subset (``run_id``/``base_sha``/
+    ``source_set_digest``) and to ``expected_previous_digest`` -- unchanged
+    preimage shape, so no existing digest-comparison test's behavior
+    changes when ``source_observations``/``runtime_version`` are added."""
+    digest_run_identity = {
+        "run_id": ctx.run_id,
+        "base_sha": ctx.base_sha,
+        "source_set_digest": plan.source_set_digest,
+    }
     projection = {
-        "run_identity": run_identity,
+        "run_identity": digest_run_identity,
         "candidate_records": evaluation.candidate_records,
         "expected_previous_digest": expected_previous_digest,
     }
     canonical = json.dumps(projection, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    full_run_identity = dict(digest_run_identity)
+    full_run_identity["generated_at"] = plan.generated_at
+    full_run_identity["runtime_version"] = runtime_version
+    full_run_identity["source_observations"] = list(source_observations) if source_observations is not None else []
+
     return PublishRequest(
         request_id=request_id,
         repository_id=repository_id,
         target_issue=target_issue,
-        run_identity=run_identity,
+        run_identity=full_run_identity,
         candidate_records=evaluation.candidate_records,
         expected_previous_digest=expected_previous_digest,
         idempotency_key=idempotency_key,
@@ -1138,9 +1174,7 @@ def execute_run(
     ``finalize(..., delta_results=...)`` -- this is the actual production
     wiring point the standalone ``compute_delta()`` unit tests do not
     exercise."""
-    ctx, plan, _results = prepare(
-        base_sha_resolver=base_sha_resolver, collectors=collectors, clock=clock, run_id=run_id
-    )
+    ctx, plan, results = prepare(base_sha_resolver=base_sha_resolver, collectors=collectors, clock=clock, run_id=run_id)
     bundles = run_observer_wave(ctx, plan, invoke=invoke, observer_requests=observer_requests)
     finding_sets = build_finding_sets(ctx, plan, bundles)
     evaluator_request = prepare_evaluator_request(ctx, plan, finding_sets)
@@ -1164,6 +1198,7 @@ def execute_run(
         idempotency_key=idempotency_key,
         expected_previous_digest=previous_state.read_version,
         delta_results=delta_results,
+        source_observations=[r.observation for r in results],
     )
 
 
@@ -1203,9 +1238,7 @@ class PreviousStateProviderProtocol(typing.Protocol):
     parameter (Issue #2237 fix_delta iteration-4, Warning 1) -- this is what
     lets #2238 swap in the real provider without touching the call graph."""
 
-    def get(
-        self, *, repository_id: str, scope: str, finding_identity_algorithm: str
-    ) -> "PreviousStateResult": ...
+    def get(self, *, repository_id: str, scope: str, finding_identity_algorithm: str) -> "PreviousStateResult": ...
 
 
 class FixturePreviousStateProvider:
@@ -1230,6 +1263,33 @@ class FixturePreviousStateProvider:
 #: ``FixturePreviousStateProvider``); ``issue-comments`` is the real,
 #: persistence-backed production backend.
 STATE_BACKEND_CHOICES = ("fixture", "issue-comments")
+
+
+class GhAuthUnavailable(RuntimeError):
+    """Issue #2238 P1-3: raised when ``state_backend == "issue-comments"`` is
+    requested but ``gh`` authentication is not available/verifiable. This
+    module never silently substitutes the fixture backend in that case --
+    callers who actually want the fixture backend must pass
+    ``--state-backend fixture`` explicitly. ``main()`` converts this into the
+    same typed ``{"status": "failed", ...}`` stdout payload as every other
+    phase failure."""
+
+    reason_code = "gh_auth_unavailable"
+
+
+def _check_gh_auth_available(*, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> None:
+    """Issue #2238 P1-3: preflight check run before constructing a live
+    ``issue-comments`` backend. A module-level function (rather than inlined
+    into ``resolve_previous_state_provider``) so tests can
+    ``monkeypatch.setattr(rr, "_check_gh_auth_available", ...)`` to bypass
+    the real ``gh auth status`` subprocess call without needing a live
+    ``gh`` session."""
+    try:
+        completed = runner(["gh", "auth", "status"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise GhAuthUnavailable(f"gh_auth_status_unavailable:{exc}") from exc
+    if completed.returncode != 0:
+        raise GhAuthUnavailable(f"gh_auth_status_failed:{completed.stderr.strip()}")
 
 
 def resolve_previous_state_provider(
@@ -1257,11 +1317,13 @@ def resolve_previous_state_provider(
     if state_backend == "fixture":
         return FixturePreviousStateProvider(fixtures={})
     if state_backend == "issue-comments":
+        _check_gh_auth_available()
         persist_mod = _persist_retrospective_run_module()
         return persist_mod.IssueCommentPreviousStateProvider(
             repo=repository_id,
             target_issue=target_issue,
             transport=persist_mod.GhCliIssueCommentTransport(),
+            trusted_publisher_logins=persist_mod.resolve_trusted_publisher_logins(),
         )
     raise ValueError(f"unknown state_backend: {state_backend!r}. Choices: {STATE_BACKEND_CHOICES}")
 
@@ -1685,6 +1747,7 @@ def run_cli(
             idempotency_key=idempotency_key,
             expected_previous_digest=previous_state.read_version,
             delta_results=delta_results,
+            source_observations=[r.observation for r in results],
         )
     return publish_request
 
@@ -1713,12 +1776,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--state-backend",
         choices=STATE_BACKEND_CHOICES,
-        default="fixture",
+        default="issue-comments",
         help=(
-            "PreviousStateProvider backend (Issue #2238 AC1). 'fixture' (default) "
-            "preserves prior behavior (empty FixturePreviousStateProvider); "
-            "'issue-comments' reads real prior run publication comments via "
-            "persist_retrospective_run.py's IssueCommentPreviousStateProvider."
+            "PreviousStateProvider backend (Issue #2238 AC1, P1-3 fix_delta). "
+            "'issue-comments' (default, production) reads real prior run "
+            "publication comments via persist_retrospective_run.py's "
+            "IssueCommentPreviousStateProvider -- this never silently falls "
+            "back to 'fixture' if gh auth is unavailable, it fails closed "
+            "with a typed gh_auth_unavailable error instead. Tests that "
+            "actually want the empty FixturePreviousStateProvider must pass "
+            "'--state-backend fixture' explicitly."
         ),
     )
     args = parser.parse_args(argv)
@@ -1727,13 +1794,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.prompts_file:
         prompts = json.loads(Path(args.prompts_file).read_text(encoding="utf-8"))
 
-    previous_state_provider = resolve_previous_state_provider(
-        state_backend=args.state_backend,
-        repository_id=args.repository_id,
-        target_issue=args.target_issue,
-    )
-
     try:
+        previous_state_provider = resolve_previous_state_provider(
+            state_backend=args.state_backend,
+            repository_id=args.repository_id,
+            target_issue=args.target_issue,
+        )
         publish_request = run_cli(
             repo_root=Path(args.repo_root),
             repository_id=args.repository_id,
@@ -1744,7 +1810,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             prompts=prompts,
             previous_state_provider=previous_state_provider,
         )
-    except (ObserverWaveFailed, EvaluatorInvocationFailed, WireContractError, ValueError) as exc:
+    except (ObserverWaveFailed, EvaluatorInvocationFailed, WireContractError, ValueError, GhAuthUnavailable) as exc:
         reason_code = getattr(exc, "reason_code", type(exc).__name__)
         print(json.dumps({"status": "failed", "reason_code": reason_code, "reason": str(exc)}, sort_keys=True))
         return 1

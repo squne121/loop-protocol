@@ -7,6 +7,14 @@ boundary (``IssueCommentTransportProtocol``) is dependency-injected via
 ``FakeIssueCommentTransport`` throughout. Live smoke/security verification
 is Child 6 (#2239)'s responsibility.
 
+Issue #2238 fix_delta (OWNER adversarial review, PR #2304
+issuecomment-5381003316): this revision fixes every call site broken by the
+P0-1..P0-7/P1-1..P1-4 API changes (``trusted_publisher_logins`` threading,
+``build_run_envelope``'s ``source_observations``-driven pagination
+signaling, ``evaluate_idempotency``'s stable ``request_payload_digest``,
+receipt TTL bound) and adds the 10 required regression tests
+(``test_regression_1``..``test_regression_10``).
+
 Covers every Issue #2238 AC that is a pytest -k target:
   AC1  production_provider_used
   AC2  read_version_propagates_to_expected_previous_digest
@@ -20,6 +28,9 @@ Covers every Issue #2238 AC that is a pytest -k target:
   AC10 ambiguous_post_failure_recovery_by_request_id
   AC11 index_update_failure_does_not_rollback_primary_record
   AC12 public_safety_validator_runs_before_post
+
+Plus the 10 required regression tests from the fix_delta request
+(``test_regression_1``..``test_regression_10``).
 """
 
 from __future__ import annotations
@@ -46,6 +57,13 @@ _REPO_ID = "squne121/loop-protocol"
 _REPO = "squne121/loop-protocol"
 _TARGET_ISSUE = 2238
 
+#: Issue #2238 P0-6 fix_delta: the sole trusted publisher identity used
+#: throughout this test file's fakes -- FakeIssueCommentTransport stamps
+#: every comment it creates/seeds with this login by default.
+_TRUSTED_LOGIN = "agent-retrospective-bot"
+_TRUSTED = frozenset({_TRUSTED_LOGIN})
+_UNTRUSTED_LOGIN = "some-other-account"
+
 
 # ---------------------------------------------------------------------------
 # shared fakes / helpers
@@ -55,7 +73,10 @@ _TARGET_ISSUE = 2238
 class FakeIssueCommentTransport:
     """Hermetic, in-memory ``IssueCommentTransportProtocol`` implementation.
     Every persist_retrospective_run.py function under test is exercised
-    exclusively against this fake -- no subprocess, no network call."""
+    exclusively against this fake -- no subprocess, no network call. Every
+    comment carries a ``user.login`` (Issue #2238 P0-6) -- defaults to
+    ``_TRUSTED_LOGIN`` so existing AC tests keep exercising the "trusted"
+    path; regression test 5 overrides it explicitly."""
 
     def __init__(self) -> None:
         self._comments: dict[int, dict[str, Any]] = {}
@@ -66,20 +87,25 @@ class FakeIssueCommentTransport:
     def queue_create_side_effect(self, exc: Exception, *, also_create: bool = False) -> None:
         self._queued.append({"exc": exc, "also_create": also_create})
 
-    def _insert(self, *, issue_number: int, body: str, comment_id: int | None = None) -> dict[str, Any]:
+    def _insert(
+        self, *, issue_number: int, body: str, comment_id: int | None = None, login: str = _TRUSTED_LOGIN
+    ) -> dict[str, Any]:
         cid = comment_id if comment_id is not None else self._next_id
         self._next_id = max(self._next_id, cid + 1)
         comment = {
             "id": cid,
             "html_url": f"https://github.com/x/y/issues/{issue_number}#issuecomment-{cid}",
             "body": body,
+            "user": {"login": login},
             "_issue_number": issue_number,
         }
         self._comments[cid] = comment
         return dict(comment)
 
-    def seed_comment(self, *, issue_number: int, body: str, comment_id: int | None = None) -> dict[str, Any]:
-        return self._insert(issue_number=issue_number, body=body, comment_id=comment_id)
+    def seed_comment(
+        self, *, issue_number: int, body: str, comment_id: int | None = None, login: str = _TRUSTED_LOGIN
+    ) -> dict[str, Any]:
+        return self._insert(issue_number=issue_number, body=body, comment_id=comment_id, login=login)
 
     def list_comments(self, *, repo: str, issue_number: int) -> list[dict[str, Any]]:
         del repo
@@ -111,6 +137,8 @@ def _publish_request_dict(
     run_id: str = "run-1",
     base_sha: str | None = None,
     source_set_digest: str | None = None,
+    source_observations: list[dict[str, Any]] | None = None,
+    generated_at: str | None = None,
 ) -> dict[str, Any]:
     return {
         "run_identity": {
@@ -124,6 +152,17 @@ def _publish_request_dict(
         "candidate_records": candidate_records or [],
         "delta_results": delta_results or [],
         "expected_previous_digest": expected_previous_digest,
+        "source_observations": source_observations
+        if source_observations is not None
+        else [
+            {
+                "source_type": "repository",
+                "source_id": "repository",
+                "source_status": "complete",
+                "pagination_completeness": "complete",
+            }
+        ],
+        "generated_at": generated_at or "2026-08-22T00:00:00Z",
     }
 
 
@@ -138,6 +177,8 @@ def _iso(value: dt.datetime) -> str:
 def _valid_receipt(
     *, publication_digest: str, repository_id: str, target_issue: int, request_id: str
 ) -> dict[str, Any]:
+    # Issue #2238 P0-2 fix_delta: TTL must be <= MAX_AUTHORIZATION_RECEIPT_TTL_SECONDS
+    # (10 minutes) -- previously an arbitrary far-future expires_at.
     return {
         "schema_version": pr.HUMAN_AUTHORIZATION_RECEIPT_SCHEMA,
         "request_id": request_id,
@@ -146,8 +187,37 @@ def _valid_receipt(
         "target_issue": target_issue,
         "operation": "publish_retrospective_run",
         "approved_at": "2026-08-22T00:00:00Z",
-        "expires_at": "2099-01-01T00:00:00Z",
+        "expires_at": "2026-08-22T00:05:00Z",
     }
+
+
+def _build_envelope(
+    *,
+    request_id: str,
+    candidate_records: list[dict[str, Any]] | None = None,
+    delta_results: list[dict[str, Any]] | None = None,
+    run_identity: dict[str, Any] | None = None,
+    expected_previous_digest: str | None = None,
+    parent_record_digest: str | None = None,
+    generated_at: str = "2026-08-22T00:00:00Z",
+    source_observations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return pr.build_run_envelope(
+        repository_id=_REPO_ID,
+        target_issue=_TARGET_ISSUE,
+        request_id=request_id,
+        run_identity=run_identity or {"run_id": "run-1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
+        candidate_records=candidate_records or [],
+        delta_results=delta_results or [],
+        expected_previous_digest=expected_previous_digest,
+        parent_record_digest=parent_record_digest,
+        generated_at=generated_at,
+        source_observations=source_observations,
+    )
+
+
+def _new_candidate() -> dict[str, Any]:  # noqa: F811 -- intentional redefinition kept adjacent to first use
+    return _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.new.valid.json")
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +226,8 @@ def _valid_receipt(
 
 
 def test_production_provider_used(monkeypatch: pytest.MonkeyPatch) -> None:
-    # GIVEN main() is invoked with --state-backend issue-comments
     captured: dict[str, Any] = {}
+    monkeypatch.setattr(rr, "_check_gh_auth_available", lambda **kwargs: None)
 
     def fake_run_cli(**kwargs: Any) -> rr.PublishRequest:
         captured["provider"] = kwargs["previous_state_provider"]
@@ -173,11 +243,8 @@ def test_production_provider_used(monkeypatch: pytest.MonkeyPatch) -> None:
             authorization_required=True,
         )
 
-    # main() calls run_cli via the module-global name -- patching it here
-    # intercepts the exact production call graph, not a parallel path.
     monkeypatch.setattr(rr, "run_cli", fake_run_cli)
 
-    # WHEN main() runs (the actual production entrypoint, unmodified)
     exit_code = rr.main(
         [
             "--repository-id",
@@ -193,14 +260,6 @@ def test_production_provider_used(monkeypatch: pytest.MonkeyPatch) -> None:
         ]
     )
 
-    # THEN it constructed and passed the REAL persistence-backed provider --
-    # never a fixture fallback. ``rr.resolve_previous_state_provider()``
-    # loads persist_retrospective_run.py via its own lazy sibling-module
-    # loader (a fresh module object each call, like
-    # ``_validate_retrospective_schema_module()``), so structural checks
-    # are used instead of ``isinstance`` against this test file's own
-    # top-level import of the same source file under a different module
-    # identity.
     assert exit_code == 0
     provider = captured["provider"]
     assert type(provider).__name__ == "IssueCommentPreviousStateProvider"
@@ -210,8 +269,9 @@ def test_production_provider_used(monkeypatch: pytest.MonkeyPatch) -> None:
     assert hasattr(provider, "_transport") and type(provider._transport).__name__ == "GhCliIssueCommentTransport"
 
 
-def test_production_provider_used_fixture_backend_is_still_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
-    # GIVEN the default (--state-backend omitted / "fixture")
+def test_production_provider_used_explicit_fixture_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Issue #2238 P1-3 fix_delta: --state-backend default is now
+    # "issue-comments" (production); the fixture backend is now opt-in.
     captured: dict[str, Any] = {}
 
     def fake_run_cli(**kwargs: Any) -> rr.PublishRequest:
@@ -230,8 +290,34 @@ def test_production_provider_used_fixture_backend_is_still_fixture(monkeypatch: 
 
     monkeypatch.setattr(rr, "run_cli", fake_run_cli)
 
-    # WHEN main() runs without --state-backend
     rr.main(
+        [
+            "--repository-id",
+            _REPO_ID,
+            "--target-issue",
+            str(_TARGET_ISSUE),
+            "--request-id",
+            "req",
+            "--idempotency-key",
+            "idem",
+            "--state-backend",
+            "fixture",
+        ]
+    )
+
+    assert isinstance(captured["provider"], rr.FixturePreviousStateProvider)
+
+
+def test_production_provider_default_backend_requires_gh_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Issue #2238 P1-3 fix_delta: the new default ("issue-comments") never
+    # silently falls back to fixture when gh auth is unavailable -- it fails
+    # closed with a typed error instead.
+    def _boom(**kwargs: Any) -> None:
+        raise rr.GhAuthUnavailable("gh_auth_status_failed:not logged in")
+
+    monkeypatch.setattr(rr, "_check_gh_auth_available", _boom)
+
+    exit_code = rr.main(
         [
             "--repository-id",
             _REPO_ID,
@@ -244,8 +330,7 @@ def test_production_provider_used_fixture_backend_is_still_fixture(monkeypatch: 
         ]
     )
 
-    # THEN the exact prior fixture behavior is preserved byte-for-byte
-    assert isinstance(captured["provider"], rr.FixturePreviousStateProvider)
+    assert exit_code == 1
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +408,6 @@ def _make_evaluator_invoke(candidate_records: list[dict[str, Any]]):
 
 
 def test_read_version_propagates_to_expected_previous_digest() -> None:
-    # GIVEN a PreviousStateProvider whose read_version is a real prior
-    # publication_digest (Issue #2238's own digest format)
     read_version = "sha256:" + "7" * 64
     provider = rr.FixturePreviousStateProvider(
         fixtures={
@@ -335,8 +418,6 @@ def test_read_version_propagates_to_expected_previous_digest() -> None:
     )
     expected_digest = rr.compute_source_set_digest([_fake_collector_result("repository", _FULL_SHA).observation])
 
-    # WHEN execute_run() -- the production composition run_cli() also calls
-    # -- runs with that provider injected
     publish_request = rr.execute_run(
         base_sha_resolver=lambda: _FULL_SHA,
         collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
@@ -351,16 +432,19 @@ def test_read_version_propagates_to_expected_previous_digest() -> None:
         previous_state_provider=provider,
     )
 
-    # THEN the returned PublishRequest.expected_previous_digest is exactly
-    # the provider's read_version -- not None, not a hand-supplied value
     assert publish_request.expected_previous_digest == read_version
+    # Issue #2238 P0-5 fix_delta: the real per-collector source_observations
+    # (not a placeholder) is threaded through into run_identity additively.
+    assert publish_request.run_identity["source_observations"] == [
+        _fake_collector_result("repository", _FULL_SHA).observation
+    ]
+    assert publish_request.run_identity["generated_at"]
+    assert publish_request.run_identity["runtime_version"] == rr.RUNTIME_VERSION
 
 
 def test_read_version_propagates_to_expected_previous_digest_none_when_no_history() -> None:
-    # GIVEN the default (unwired) provider -- no_history, read_version=None
     expected_digest = rr.compute_source_set_digest([_fake_collector_result("repository", _FULL_SHA).observation])
 
-    # WHEN execute_run() runs without an explicit provider
     publish_request = rr.execute_run(
         base_sha_resolver=lambda: _FULL_SHA,
         collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
@@ -374,7 +458,6 @@ def test_read_version_propagates_to_expected_previous_digest_none_when_no_histor
         run_id="run-3",
     )
 
-    # THEN expected_previous_digest stays None (no_history has read_version=None)
     assert publish_request.expected_previous_digest is None
 
 
@@ -393,39 +476,14 @@ def test_publish_request_produces_publication_digest() -> None:
         }
     ]
 
-    # WHEN build_run_envelope() consumes a PUBLISH_REQUEST_V1-shaped input
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac3",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[candidate],
-        delta_results=delta_results,
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
+    envelope = _build_envelope(request_id="req-ac3", candidate_records=[candidate], delta_results=delta_results)
 
-    # THEN a well-formed sha256-jcs-v1 digest is produced
     assert envelope["publication_digest"].startswith("sha256:")
     assert len(envelope["publication_digest"]) == len("sha256:") + 64
 
-    # AND it is bound to delta_results (not only candidate_records) --
-    # changing delta_results alone changes the digest
-    other_envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac3",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[candidate],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
+    other_envelope = _build_envelope(request_id="req-ac3", candidate_records=[candidate], delta_results=[])
     assert other_envelope["publication_digest"] != envelope["publication_digest"]
 
-    # AND full candidate_records/delta_results are carried through verbatim
     assert envelope["candidate_records"] == [candidate]
     assert envelope["delta_results"] == delta_results
 
@@ -438,11 +496,11 @@ def test_publish_request_produces_publication_digest() -> None:
 def test_authorization_gate_blocks_without_receipt_or_confirmation() -> None:
     transport = FakeIssueCommentTransport()
     pub_req = _publish_request_dict(candidate_records=[_new_candidate()], request_id="req-ac4")
-    ctx = pr.AuthorizationContext()  # neither a receipt path nor a tty_confirm callback
+    ctx = pr.AuthorizationContext()
 
     with pytest.raises(pr.AuthorizationDenied) as excinfo:
         pr.publish_run(
-            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z"
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
         )
 
     assert excinfo.value.reason_code == "authorization_missing"
@@ -456,7 +514,7 @@ def test_authorization_gate_blocks_when_tty_confirm_present_but_not_a_tty() -> N
 
     with pytest.raises(pr.AuthorizationDenied) as excinfo:
         pr.publish_run(
-            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z"
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
         )
 
     assert excinfo.value.reason_code == "authorization_missing"
@@ -470,7 +528,7 @@ def test_authorization_gate_blocks_when_tty_confirm_declines() -> None:
 
     with pytest.raises(pr.AuthorizationDenied) as excinfo:
         pr.publish_run(
-            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z"
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
         )
 
     assert excinfo.value.reason_code == "tty_declined"
@@ -478,8 +536,6 @@ def test_authorization_gate_blocks_when_tty_confirm_declines() -> None:
 
 
 def test_authorization_gate_has_no_bare_authorized_flag_field() -> None:
-    # AuthorizationContext structurally cannot accept a bare
-    # --authorized-by-human-style flag as authorization.
     import dataclasses as dc
 
     field_names = {f.name for f in dc.fields(pr.AuthorizationContext)}
@@ -491,18 +547,7 @@ def test_authorization_gate_has_no_bare_authorized_flag_field() -> None:
 def test_authorization_gate_succeeds_with_valid_receipt(tmp_path: Path) -> None:
     transport = FakeIssueCommentTransport()
     pub_req = _publish_request_dict(candidate_records=[_new_candidate()], request_id="req-ac4d")
-    generated_at = "2026-08-22T00:00:00Z"
-    preview = pr.build_run_envelope(
-        repository_id=pub_req["repository_id"],
-        target_issue=pub_req["target_issue"],
-        request_id=pub_req["request_id"],
-        run_identity=pub_req["run_identity"],
-        candidate_records=pub_req["candidate_records"],
-        delta_results=pub_req["delta_results"],
-        expected_previous_digest=pub_req["expected_previous_digest"],
-        parent_record_digest=None,
-        generated_at=generated_at,
-    )
+    preview = _build_envelope(request_id=pub_req["request_id"], candidate_records=pub_req["candidate_records"])
     receipt_path = tmp_path / "receipt.json"
     receipt_path.write_text(
         json.dumps(
@@ -515,11 +560,11 @@ def test_authorization_gate_succeeds_with_valid_receipt(tmp_path: Path) -> None:
         )
     )
     ctx = pr.AuthorizationContext(
-        receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 5, tzinfo=dt.timezone.utc)
+        receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 2, tzinfo=dt.timezone.utc)
     )
 
     result = pr.publish_run(
-        publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at=generated_at
+        publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
     )
 
     assert result.status == "published"
@@ -529,25 +574,15 @@ def test_authorization_gate_succeeds_with_valid_receipt(tmp_path: Path) -> None:
 def test_authorization_gate_rejects_expired_receipt(tmp_path: Path) -> None:
     transport = FakeIssueCommentTransport()
     pub_req = _publish_request_dict(candidate_records=[_new_candidate()], request_id="req-ac4e")
-    generated_at = "2026-08-22T00:00:00Z"
-    preview = pr.build_run_envelope(
-        repository_id=pub_req["repository_id"],
-        target_issue=pub_req["target_issue"],
-        request_id=pub_req["request_id"],
-        run_identity=pub_req["run_identity"],
-        candidate_records=pub_req["candidate_records"],
-        delta_results=pub_req["delta_results"],
-        expected_previous_digest=pub_req["expected_previous_digest"],
-        parent_record_digest=None,
-        generated_at=generated_at,
-    )
+    preview = _build_envelope(request_id=pub_req["request_id"], candidate_records=pub_req["candidate_records"])
     receipt = _valid_receipt(
         publication_digest=preview["publication_digest"],
         repository_id=pub_req["repository_id"],
         target_issue=pub_req["target_issue"],
         request_id=pub_req["request_id"],
     )
-    receipt["expires_at"] = "2020-01-01T00:00:00Z"
+    receipt["approved_at"] = "2020-01-01T00:00:00Z"
+    receipt["expires_at"] = "2020-01-01T00:05:00Z"
     receipt_path = tmp_path / "receipt.json"
     receipt_path.write_text(json.dumps(receipt))
     ctx = pr.AuthorizationContext(
@@ -556,11 +591,66 @@ def test_authorization_gate_rejects_expired_receipt(tmp_path: Path) -> None:
 
     with pytest.raises(pr.AuthorizationDenied) as excinfo:
         pr.publish_run(
-            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at=generated_at
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
         )
 
     assert excinfo.value.reason_code == "receipt_expired"
     assert transport.create_call_count == 0
+
+
+def test_authorization_gate_rejects_ttl_exceeding_maximum(tmp_path: Path) -> None:
+    # Issue #2238 P0-2 fix_delta: a receipt's own (approved_at, expires_at)
+    # window cannot exceed MAX_AUTHORIZATION_RECEIPT_TTL_SECONDS, regardless
+    # of what the receipt file itself claims.
+    transport = FakeIssueCommentTransport()
+    pub_req = _publish_request_dict(candidate_records=[_new_candidate()], request_id="req-ac4f")
+    preview = _build_envelope(request_id=pub_req["request_id"], candidate_records=pub_req["candidate_records"])
+    receipt = _valid_receipt(
+        publication_digest=preview["publication_digest"],
+        repository_id=pub_req["repository_id"],
+        target_issue=pub_req["target_issue"],
+        request_id=pub_req["request_id"],
+    )
+    receipt["expires_at"] = "2099-01-01T00:00:00Z"
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps(receipt))
+    ctx = pr.AuthorizationContext(
+        receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 2, tzinfo=dt.timezone.utc)
+    )
+
+    with pytest.raises(pr.AuthorizationDenied) as excinfo:
+        pr.publish_run(
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
+        )
+
+    assert excinfo.value.reason_code == "receipt_ttl_exceeded"
+    assert transport.create_call_count == 0
+
+
+def test_authorization_gate_rejects_future_approved_at(tmp_path: Path) -> None:
+    transport = FakeIssueCommentTransport()
+    pub_req = _publish_request_dict(candidate_records=[_new_candidate()], request_id="req-ac4g")
+    preview = _build_envelope(request_id=pub_req["request_id"], candidate_records=pub_req["candidate_records"])
+    receipt = _valid_receipt(
+        publication_digest=preview["publication_digest"],
+        repository_id=pub_req["repository_id"],
+        target_issue=pub_req["target_issue"],
+        request_id=pub_req["request_id"],
+    )
+    receipt["approved_at"] = "2026-08-22T00:10:00Z"
+    receipt["expires_at"] = "2026-08-22T00:15:00Z"
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps(receipt))
+    ctx = pr.AuthorizationContext(
+        receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 2, tzinfo=dt.timezone.utc)
+    )
+
+    with pytest.raises(pr.AuthorizationDenied) as excinfo:
+        pr.publish_run(
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
+        )
+
+    assert excinfo.value.reason_code == "receipt_approved_at_future"
 
 
 # ---------------------------------------------------------------------------
@@ -578,56 +668,64 @@ def test_idempotency_key_noop_vs_conflict() -> None:
         source_set_digest=run_identity["source_set_digest"],
         scope=pr.DEFAULT_SCOPE,
     )
+    source_observations = [
+        {
+            "source_type": "repository",
+            "source_id": "repository",
+            "source_status": "complete",
+            "pagination_completeness": "complete",
+        }
+    ]
 
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
+    envelope = _build_envelope(
         request_id="req-ac5-a",
-        run_identity=run_identity,
         candidate_records=[candidate],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
+        run_identity=run_identity,
+        source_observations=source_observations,
     )
     transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope))
 
-    # WHEN the SAME idempotency_key + SAME publication_digest is evaluated
+    stable_digest = pr.compute_request_payload_digest(
+        repository_id=_REPO_ID,
+        target_issue=_TARGET_ISSUE,
+        scope=pr.DEFAULT_SCOPE,
+        run_identity=run_identity,
+        candidate_records=[candidate],
+        delta_results=[],
+        source_observations=source_observations,
+    )
+
+    # WHEN the SAME idempotency_key + SAME stable request_payload_digest is evaluated
     decision, existing = pr.evaluate_idempotency(
         transport,
         _REPO,
         _TARGET_ISSUE,
         idempotency_key=idempotency_key,
-        publication_digest=envelope["publication_digest"],
+        request_payload_digest=stable_digest,
+        trusted_publisher_logins=_TRUSTED,
     )
-    # THEN it is a no_op (existing record found, byte-identical content)
     assert decision == "no_op"
     assert existing is not None
 
-    # WHEN the SAME idempotency_key but a DIFFERENT publication_digest is
-    # evaluated (e.g. same run coordinates, different candidate content)
+    # WHEN the SAME idempotency_key but a DIFFERENT stable digest (different candidates)
     other_candidate = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.resolved.valid.json")
-    other_envelope = pr.build_run_envelope(
+    other_stable_digest = pr.compute_request_payload_digest(
         repository_id=_REPO_ID,
         target_issue=_TARGET_ISSUE,
-        request_id="req-ac5-b",
+        scope=pr.DEFAULT_SCOPE,
         run_identity=run_identity,
         candidate_records=[other_candidate],
         delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T01:00:00Z",
+        source_observations=source_observations,
     )
-    # the recomputed idempotency key is identical (same repository_id/base_sha/source_set_digest/scope)
-    assert other_envelope["idempotency_key"] == idempotency_key
     decision2, existing2 = pr.evaluate_idempotency(
         transport,
         _REPO,
         _TARGET_ISSUE,
         idempotency_key=idempotency_key,
-        publication_digest=other_envelope["publication_digest"],
+        request_payload_digest=other_stable_digest,
+        trusted_publisher_logins=_TRUSTED,
     )
-    # THEN it is a conflict
     assert decision2 == "conflict"
     assert existing2 is not None
 
@@ -636,30 +734,20 @@ def test_idempotency_key_noop_vs_conflict() -> None:
         repository_id=_REPO_ID, base_sha="b" * 40, source_set_digest=_DIGEST, scope=pr.DEFAULT_SCOPE
     )
     decision3, existing3 = pr.evaluate_idempotency(
-        transport, _REPO, _TARGET_ISSUE, idempotency_key=new_key, publication_digest="sha256:" + "0" * 64
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        idempotency_key=new_key,
+        request_payload_digest="sha256:" + "0" * 64,
+        trusted_publisher_logins=_TRUSTED,
     )
-    # THEN it is a fresh publish
     assert decision3 == "publish"
     assert existing3 is None
 
 
 def test_idempotency_key_recomputed_not_trusted_from_caller() -> None:
-    # A caller-supplied idempotency_key value is never trusted -- the
-    # publisher always recomputes it from (repository_id, base_sha,
-    # source_set_digest, scope) regardless of what a PUBLISH_REQUEST_V1
-    # producer put in its own idempotency_key field.
     run_identity = {"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST}
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac5-c",
-        run_identity=run_identity,
-        candidate_records=[],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
+    envelope = _build_envelope(request_id="req-ac5-c", run_identity=run_identity)
     recomputed = pr.compute_idempotency_key(
         repository_id=_REPO_ID,
         base_sha=run_identity["base_sha"],
@@ -679,26 +767,22 @@ def test_optimistic_concurrency_best_effort_conflict_detection() -> None:
     candidate = _new_candidate()
     run_identity = {"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST}
 
-    # GIVEN no prior record: head is None
     head0 = pr.check_optimistic_concurrency_precondition(
-        transport, _REPO, _TARGET_ISSUE, repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, expected_previous_digest=None
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        repository_id=_REPO_ID,
+        scope=pr.DEFAULT_SCOPE,
+        expected_previous_digest=None,
+        trusted_publisher_logins=_TRUSTED,
     )
     assert head0 is None
 
-    envelope0 = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac6-0",
-        run_identity=run_identity,
-        candidate_records=[candidate],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=head0,
-        generated_at="2026-08-22T00:00:00Z",
+    envelope0 = _build_envelope(
+        request_id="req-ac6-0", candidate_records=[candidate], run_identity=run_identity, parent_record_digest=head0
     )
     transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope0))
 
-    # WHEN a stale expected_previous_digest disagrees with the current head
     with pytest.raises(pr.StaleWriteDetected) as excinfo:
         pr.check_optimistic_concurrency_precondition(
             transport,
@@ -707,12 +791,10 @@ def test_optimistic_concurrency_best_effort_conflict_detection() -> None:
             repository_id=_REPO_ID,
             scope=pr.DEFAULT_SCOPE,
             expected_previous_digest="sha256:" + "0" * 64,
+            trusted_publisher_logins=_TRUSTED,
         )
     assert excinfo.value.reason_code == "stale_expected_previous_digest"
 
-    # GIVEN two "concurrent" runs both read the SAME head (this is the race
-    # window the best-effort guard cannot fully close -- GitHub Issue
-    # comment creation is not atomic compare-and-swap)
     head1 = pr.check_optimistic_concurrency_precondition(
         transport,
         _REPO,
@@ -720,27 +802,22 @@ def test_optimistic_concurrency_best_effort_conflict_detection() -> None:
         repository_id=_REPO_ID,
         scope=pr.DEFAULT_SCOPE,
         expected_previous_digest=envelope0["publication_digest"],
+        trusted_publisher_logins=_TRUSTED,
     )
     assert head1 == envelope0["publication_digest"]
 
-    envelope_a = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
+    envelope_a = _build_envelope(
         request_id="req-ac6-a",
-        run_identity=run_identity,
         candidate_records=[candidate],
-        delta_results=[],
+        run_identity=run_identity,
         expected_previous_digest=head1,
         parent_record_digest=head1,
         generated_at="2026-08-22T01:00:00Z",
     )
-    envelope_b = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
+    envelope_b = _build_envelope(
         request_id="req-ac6-b",
-        run_identity=run_identity,
         candidate_records=[candidate],
-        delta_results=[],
+        run_identity=run_identity,
         expected_previous_digest=head1,
         parent_record_digest=head1,
         generated_at="2026-08-22T02:00:00Z",
@@ -750,20 +827,23 @@ def test_optimistic_concurrency_best_effort_conflict_detection() -> None:
     )
     transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope_b))
 
-    # WHEN the post-write rescan runs for run A (AC6 step (c)/(d))
     conflict_detected = pr.detect_post_write_sibling_conflict(
-        transport, _REPO, _TARGET_ISSUE, parent_record_digest=head1, own_comment_id=comment_a["id"]
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        parent_record_digest=head1,
+        own_comment_id=comment_a["id"],
+        trusted_publisher_logins=_TRUSTED,
     )
-    # THEN it detects run B as a sibling appended against the same parent
     assert conflict_detected is True
 
-    # AND a record with a unique parent has no sibling conflict
     no_conflict = pr.detect_post_write_sibling_conflict(
         transport,
         _REPO,
         _TARGET_ISSUE,
         parent_record_digest=envelope_a["publication_digest"],
         own_comment_id=comment_a["id"],
+        trusted_publisher_logins=_TRUSTED,
     )
     assert no_conflict is False
 
@@ -776,49 +856,46 @@ def test_optimistic_concurrency_best_effort_conflict_detection() -> None:
 def test_canonical_get_readback_digest_match() -> None:
     transport = FakeIssueCommentTransport()
     candidate = _new_candidate()
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac7",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[candidate],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
+    envelope = _build_envelope(request_id="req-ac7", candidate_records=[candidate])
     comment = transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope))
 
-    # WHEN readback verification runs against the just-created comment
-    # THEN it succeeds (no exception)
     pr.verify_readback_digest(
-        transport, _REPO, comment_id=comment["id"], expected_publication_digest=envelope["publication_digest"]
+        transport,
+        _REPO,
+        comment_id=comment["id"],
+        expected_publication_digest=envelope["publication_digest"],
+        trusted_publisher_logins=_TRUSTED,
     )
 
-    # AND it is insensitive to raw Markdown formatting differences -- only
-    # the canonical (sha256-jcs-v1) digest is compared, never raw bytes
     marker = (
         f"<!-- agent_retrospective_run:v1 repository_id={envelope['repository_id']} "
         f"idempotency_key={envelope['idempotency_key']} -->"
     )
     reformatted_fenced = "```json\n" + json.dumps(envelope, indent=4, sort_keys=True) + "\n```"
     reformatted_body = f"{marker}\n\n{reformatted_fenced}\n"
-    assert reformatted_body != pr.render_comment_body(envelope)  # genuinely different raw bytes
+    assert reformatted_body != pr.render_comment_body(envelope)
     comment2 = transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=reformatted_body)
     pr.verify_readback_digest(
-        transport, _REPO, comment_id=comment2["id"], expected_publication_digest=envelope["publication_digest"]
+        transport,
+        _REPO,
+        comment_id=comment2["id"],
+        expected_publication_digest=envelope["publication_digest"],
+        trusted_publisher_logins=_TRUSTED,
     )
 
-    # AND a tampered stored body IS caught
     tampered_body = transport._comments[comment["id"]]["body"].replace(
         candidate["candidate_id"], "tampered-candidate-id"
     )
     transport._comments[comment["id"]]["body"] = tampered_body
     with pytest.raises(pr.ReadbackVerificationFailed) as excinfo:
         pr.verify_readback_digest(
-            transport, _REPO, comment_id=comment["id"], expected_publication_digest=envelope["publication_digest"]
+            transport,
+            _REPO,
+            comment_id=comment["id"],
+            expected_publication_digest=envelope["publication_digest"],
+            trusted_publisher_logins=_TRUSTED,
         )
-    assert excinfo.value.reason_code in ("readback_self_digest_mismatch", "readback_expected_digest_mismatch")
+    assert excinfo.value.reason_code == "digest_mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -837,23 +914,10 @@ def test_candidate_finding_delta_full_roundtrip() -> None:
             "delta_status": "recurrent",
         }
     ]
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac8",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[candidate],
-        delta_results=delta_results,
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
+    envelope = _build_envelope(request_id="req-ac8", candidate_records=[candidate], delta_results=delta_results)
 
-    # WHEN the envelope is rendered to a comment body and parsed back
     parsed = pr.extract_envelope_from_body(pr.render_comment_body(envelope))
 
-    # THEN the full candidate record, finding_contract sub-fields, and
-    # delta_results all round-trip byte-identically
     assert parsed is not None
     assert parsed["candidate_records"] == [candidate]
     assert parsed["delta_results"] == delta_results
@@ -867,34 +931,17 @@ def test_candidate_finding_delta_full_roundtrip() -> None:
         == candidate["finding_contract"]["evaluations"]
     )
 
-    # AND the round-tripped candidate is still canonical-schema-valid
     _validate_mod.validate_candidate(parsed["candidate_records"][0])
 
-    # AND candidate:finding is 1:1 -- exactly one finding_identity per
-    # candidate, no duplicates within delta_results
     identities = [entry["finding_identity"] for entry in parsed["delta_results"]]
     assert len(identities) == len(set(identities))
     assert len(identities) == len(parsed["candidate_records"])
 
 
 def test_candidate_finding_delta_full_roundtrip_legacy_candidate_has_no_identity() -> None:
-    # A legacy candidate (no finding_contract) round-trips too, but is
-    # excluded from delta correlation -- this is exercised at the
-    # provider/compute_delta layer (AC9), not by this envelope build/parse
-    # layer, which simply preserves whatever candidate_records it is given.
     legacy_candidate = _validate_mod.load_fixture("agent_improvement_candidate_v1.valid.json")
     assert "finding_contract" not in legacy_candidate
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac8-legacy",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[legacy_candidate],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
+    envelope = _build_envelope(request_id="req-ac8-legacy", candidate_records=[legacy_candidate])
     parsed = pr.extract_envelope_from_body(pr.render_comment_body(envelope))
     assert parsed["candidate_records"] == [legacy_candidate]
 
@@ -906,9 +953,13 @@ def test_candidate_finding_delta_full_roundtrip_legacy_candidate_has_no_identity
 
 def test_previous_state_status_classification_no_history() -> None:
     transport = FakeIssueCommentTransport()
-    provider = pr.IssueCommentPreviousStateProvider(repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport)
+    provider = pr.IssueCommentPreviousStateProvider(
+        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, trusted_publisher_logins=_TRUSTED
+    )
 
-    result = provider.get(repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-jcs-v1")
+    result = provider.get(
+        repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-sorted-json-v1"
+    )
 
     assert result.status == "no_history"
     assert result.read_version is None
@@ -917,15 +968,17 @@ def test_previous_state_status_classification_no_history() -> None:
 
 def test_previous_state_status_classification_legacy_unavailable() -> None:
     transport = FakeIssueCommentTransport()
-    # a pre-#2238 retrospective-adjacent comment this module cannot parse as
-    # its own envelope (no fenced JSON block, doesn't match the marker)
     transport.seed_comment(
         issue_number=_TARGET_ISSUE,
         body="agent_retrospective_run notes from before Issue #2238 (free text, no structured envelope)",
     )
-    provider = pr.IssueCommentPreviousStateProvider(repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport)
+    provider = pr.IssueCommentPreviousStateProvider(
+        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, trusted_publisher_logins=_TRUSTED
+    )
 
-    result = provider.get(repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-jcs-v1")
+    result = provider.get(
+        repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-sorted-json-v1"
+    )
 
     assert result.status == "legacy_unavailable"
     assert result.candidates == []
@@ -934,23 +987,21 @@ def test_previous_state_status_classification_legacy_unavailable() -> None:
 def test_previous_state_status_classification_available() -> None:
     transport = FakeIssueCommentTransport()
     now = dt.datetime(2026, 8, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac9-avail",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[_new_candidate()],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at=_iso(now - dt.timedelta(hours=1)),
+    envelope = _build_envelope(
+        request_id="req-ac9-avail", candidate_records=[_new_candidate()], generated_at=_iso(now - dt.timedelta(hours=1))
     )
     transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope))
     provider = pr.IssueCommentPreviousStateProvider(
-        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, clock=lambda: now
+        repo=_REPO,
+        target_issue=_TARGET_ISSUE,
+        transport=transport,
+        trusted_publisher_logins=_TRUSTED,
+        clock=lambda: now,
     )
 
-    result = provider.get(repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-jcs-v1")
+    result = provider.get(
+        repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-sorted-json-v1"
+    )
 
     assert result.status == "available"
     assert result.read_version == envelope["publication_digest"]
@@ -960,50 +1011,85 @@ def test_previous_state_status_classification_available() -> None:
 def test_previous_state_status_classification_partial() -> None:
     transport = FakeIssueCommentTransport()
     now = dt.datetime(2026, 8, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
+    envelope = _build_envelope(
         request_id="req-ac9-partial",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
         candidate_records=[_new_candidate()],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
         generated_at=_iso(now - dt.timedelta(minutes=1)),
-        pagination_completeness="partial",
+        source_observations=[
+            {
+                "source_type": "repository",
+                "source_id": "repository",
+                "source_status": "partial",
+                "pagination_completeness": "partial",
+            }
+        ],
     )
     transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope))
     provider = pr.IssueCommentPreviousStateProvider(
-        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, clock=lambda: now
+        repo=_REPO,
+        target_issue=_TARGET_ISSUE,
+        transport=transport,
+        trusted_publisher_logins=_TRUSTED,
+        clock=lambda: now,
     )
 
-    result = provider.get(repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-jcs-v1")
+    result = provider.get(
+        repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-sorted-json-v1"
+    )
 
     assert result.status == "partial"
 
 
-def test_previous_state_status_classification_stale() -> None:
+def test_previous_state_status_classification_stale_age_based_opt_in() -> None:
+    # Issue #2238 P1-4 fix_delta: age-based staleness is now opt-in --
+    # explicitly pass stale_after_seconds to get the legacy 7-day behavior.
     transport = FakeIssueCommentTransport()
     now = dt.datetime(2026, 8, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
+    envelope = _build_envelope(
+        request_id="req-ac9-stale", candidate_records=[_new_candidate()], generated_at=_iso(now - dt.timedelta(days=30))
+    )
+    transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope))
+    provider = pr.IssueCommentPreviousStateProvider(
+        repo=_REPO,
         target_issue=_TARGET_ISSUE,
-        request_id="req-ac9-stale",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
+        transport=transport,
+        trusted_publisher_logins=_TRUSTED,
+        clock=lambda: now,
+        stale_after_seconds=pr.STALE_AFTER_SECONDS_LEGACY_DEFAULT,
+    )
+
+    result = provider.get(
+        repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-sorted-json-v1"
+    )
+
+    assert result.status == "stale"
+
+
+def test_previous_state_status_classification_default_disables_age_based_staleness() -> None:
+    # Issue #2238 P1-4 fix_delta: the new DEFAULT (no stale_after_seconds
+    # passed) never classifies purely on age -- a 30-day-old, non-forked,
+    # non-partial record is still "available".
+    transport = FakeIssueCommentTransport()
+    now = dt.datetime(2026, 8, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
+    envelope = _build_envelope(
+        request_id="req-ac9-not-stale",
         candidate_records=[_new_candidate()],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
         generated_at=_iso(now - dt.timedelta(days=30)),
     )
     transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope))
     provider = pr.IssueCommentPreviousStateProvider(
-        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, clock=lambda: now
+        repo=_REPO,
+        target_issue=_TARGET_ISSUE,
+        transport=transport,
+        trusted_publisher_logins=_TRUSTED,
+        clock=lambda: now,
     )
 
-    result = provider.get(repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-jcs-v1")
+    result = provider.get(
+        repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-sorted-json-v1"
+    )
 
-    assert result.status == "stale"
+    assert result.status == "available"
 
 
 # ---------------------------------------------------------------------------
@@ -1013,20 +1099,8 @@ def test_previous_state_status_classification_stale() -> None:
 
 def test_ambiguous_post_failure_recovery_by_request_id_recovers_when_already_created() -> None:
     transport = FakeIssueCommentTransport()
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac10-recover",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[_new_candidate()],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
+    envelope = _build_envelope(request_id="req-ac10-recover", candidate_records=[_new_candidate()])
     body = pr.render_comment_body(envelope)
-    # simulate: the POST timed out from the caller's perspective, but it
-    # actually landed server-side (an ambiguous outcome)
     transport.queue_create_side_effect(pr.AmbiguousTransportError("simulated timeout"), also_create=True)
 
     comment, recovered = pr.create_comment_with_recovery(
@@ -1037,29 +1111,17 @@ def test_ambiguous_post_failure_recovery_by_request_id_recovers_when_already_cre
         request_id="req-ac10-recover",
         idempotency_key=envelope["idempotency_key"],
         publication_digest=envelope["publication_digest"],
+        trusted_publisher_logins=_TRUSTED,
     )
 
     assert recovered is True
     assert comment["id"] is not None
-    # no blind second POST was issued
     assert transport.create_call_count == 1
 
 
 def test_ambiguous_post_failure_recovery_by_request_id_conflict_on_digest_mismatch() -> None:
     transport = FakeIssueCommentTransport()
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac10-conflict",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[_new_candidate()],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
-    # a DIFFERENT envelope with the same request_id was actually created
-    # server-side (e.g. a prior distinct attempt)
+    envelope = _build_envelope(request_id="req-ac10-conflict", candidate_records=[_new_candidate()])
     other_envelope = dict(envelope)
     other_envelope["candidate_records"] = []
     other_envelope["publication_digest"] = pr.compute_publication_digest(
@@ -1077,6 +1139,7 @@ def test_ambiguous_post_failure_recovery_by_request_id_conflict_on_digest_mismat
             request_id="req-ac10-conflict",
             idempotency_key=envelope["idempotency_key"],
             publication_digest=envelope["publication_digest"],
+            trusted_publisher_logins=_TRUSTED,
         )
 
     assert excinfo.value.reason_code == "ambiguous_post_recovered_conflict"
@@ -1084,18 +1147,7 @@ def test_ambiguous_post_failure_recovery_by_request_id_conflict_on_digest_mismat
 
 def test_ambiguous_post_failure_recovery_by_request_id_bounded_retry_when_not_found() -> None:
     transport = FakeIssueCommentTransport()
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac10-retry",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[_new_candidate()],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
-    # first attempt is ambiguous AND did not actually land server-side
+    envelope = _build_envelope(request_id="req-ac10-retry", candidate_records=[_new_candidate()])
     transport.queue_create_side_effect(pr.AmbiguousTransportError("simulated timeout"), also_create=False)
 
     comment, recovered = pr.create_comment_with_recovery(
@@ -1106,11 +1158,11 @@ def test_ambiguous_post_failure_recovery_by_request_id_bounded_retry_when_not_fo
         request_id="req-ac10-retry",
         idempotency_key=envelope["idempotency_key"],
         publication_digest=envelope["publication_digest"],
+        trusted_publisher_logins=_TRUSTED,
     )
 
     assert recovered is False
     assert comment["id"] is not None
-    # first (ambiguous) attempt + one bounded retry that succeeded
     assert transport.create_call_count == 2
 
 
@@ -1122,18 +1174,7 @@ def test_ambiguous_post_failure_recovery_by_request_id_bounded_retry_when_not_fo
 def test_index_update_failure_does_not_rollback_primary_record(tmp_path: Path) -> None:
     transport = FakeIssueCommentTransport()
     pub_req = _publish_request_dict(candidate_records=[_new_candidate()], request_id="req-ac11")
-    generated_at = "2026-08-22T00:00:00Z"
-    preview = pr.build_run_envelope(
-        repository_id=pub_req["repository_id"],
-        target_issue=pub_req["target_issue"],
-        request_id=pub_req["request_id"],
-        run_identity=pub_req["run_identity"],
-        candidate_records=pub_req["candidate_records"],
-        delta_results=pub_req["delta_results"],
-        expected_previous_digest=pub_req["expected_previous_digest"],
-        parent_record_digest=None,
-        generated_at=generated_at,
-    )
+    preview = _build_envelope(request_id=pub_req["request_id"], candidate_records=pub_req["candidate_records"])
     receipt_path = tmp_path / "receipt.json"
     receipt_path.write_text(
         json.dumps(
@@ -1146,28 +1187,25 @@ def test_index_update_failure_does_not_rollback_primary_record(tmp_path: Path) -
         )
     )
     ctx = pr.AuthorizationContext(
-        receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 5, tzinfo=dt.timezone.utc)
+        receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 2, tzinfo=dt.timezone.utc)
     )
 
-    def _failing_index_updater() -> None:
+    def _failing_index_updater(**kwargs: Any) -> None:
         raise RuntimeError("index update boom")
 
-    # WHEN the primary POST succeeds but the derived-index update fails
     result = pr.publish_run(
         publish_request=pub_req,
         repo=_REPO,
         transport=transport,
         auth_ctx=ctx,
-        generated_at=generated_at,
+        trusted_publisher_logins=_TRUSTED,
         index_updater=_failing_index_updater,
     )
 
-    # THEN status is published_index_stale -- distinct from a hard failure
     assert result.status == "published_index_stale"
     assert result.comment_id is not None
     assert any("index update boom" in error for error in result.errors)
 
-    # AND the primary record was NOT rolled back -- it is still readable
     fetched = transport.get_comment(repo=_REPO, comment_id=result.comment_id)
     assert pr.extract_envelope_from_body(fetched["body"]) is not None
 
@@ -1183,8 +1221,8 @@ def test_index_update_success_reports_published() -> None:
         repo=_REPO,
         transport=transport,
         auth_ctx=ctx,
-        generated_at="2026-08-22T00:00:00Z",
-        index_updater=lambda: calls.append("updated"),
+        trusted_publisher_logins=_TRUSTED,
+        index_updater=lambda **kwargs: calls.append("updated"),
     )
 
     assert result.status == "published"
@@ -1214,11 +1252,10 @@ def test_public_safety_validator_runs_before_post_rejects_token_pattern() -> Non
 
     with pytest.raises(pr.PublicSafetyViolation) as excinfo:
         pr.publish_run(
-            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z"
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
         )
 
     assert excinfo.value.reason_code == "token_pattern_detected"
-    # the validator ran BEFORE any POST -- no comment was created
     assert transport.create_call_count == 0
 
 
@@ -1240,7 +1277,7 @@ def test_public_safety_validator_runs_before_post_rejects_absolute_path() -> Non
 
     with pytest.raises(pr.PublicSafetyViolation) as excinfo:
         pr.publish_run(
-            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z"
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
         )
 
     assert excinfo.value.reason_code == "absolute_path_detected"
@@ -1248,16 +1285,8 @@ def test_public_safety_validator_runs_before_post_rejects_absolute_path() -> Non
 
 
 def test_public_safety_validator_runs_before_post_rejects_smuggled_authority_field() -> None:
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac12-smuggle",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[],
-        delta_results=[{"finding_identity": "x", "raw_stdout": "leaked raw output"}],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
+    envelope = _build_envelope(
+        request_id="req-ac12-smuggle", delta_results=[{"finding_identity": "x", "raw_stdout": "leaked raw output"}]
     )
 
     with pytest.raises(pr.PublicSafetyViolation) as excinfo:
@@ -1267,17 +1296,7 @@ def test_public_safety_validator_runs_before_post_rejects_smuggled_authority_fie
 
 
 def test_public_safety_validator_runs_before_post_rejects_disallowed_top_level_field() -> None:
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac12-field",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
+    envelope = _build_envelope(request_id="req-ac12-field")
     envelope["mutation_capability"] = True
 
     with pytest.raises(pr.PublicSafetyViolation) as excinfo:
@@ -1287,16 +1306,282 @@ def test_public_safety_validator_runs_before_post_rejects_disallowed_top_level_f
 
 
 def test_public_safety_validator_runs_before_post_allows_clean_envelope() -> None:
-    envelope = pr.build_run_envelope(
-        repository_id=_REPO_ID,
-        target_issue=_TARGET_ISSUE,
-        request_id="req-ac12-clean",
-        run_identity={"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
-        candidate_records=[_new_candidate()],
-        delta_results=[],
-        expected_previous_digest=None,
-        parent_record_digest=None,
-        generated_at="2026-08-22T00:00:00Z",
-    )
-    # does not raise
+    envelope = _build_envelope(request_id="req-ac12-clean", candidate_records=[_new_candidate()])
     pr.run_public_safety_validator(envelope)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2238 fix_delta: 10 required regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_regression_1_same_logical_request_twice_single_post_second_is_no_op() -> None:
+    """P0-3: calling publish_run() twice with the identical logical request,
+    advancing a fake clock between calls, results in exactly 1 POST total;
+    the second call returns no_op."""
+    transport = FakeIssueCommentTransport()
+    pub_req = _publish_request_dict(candidate_records=[_new_candidate()], request_id="req-r1")
+    clock_box = {"now": dt.datetime(2026, 8, 22, 0, 1, tzinfo=dt.timezone.utc)}
+    ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: True, is_tty=lambda: True, clock=lambda: clock_box["now"])
+
+    result1 = pr.publish_run(
+        publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
+    )
+    assert result1.status == "published"
+    assert transport.create_call_count == 1
+
+    clock_box["now"] = dt.datetime(2026, 8, 22, 5, 0, tzinfo=dt.timezone.utc)
+    result2 = pr.publish_run(
+        publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
+    )
+
+    assert result2.status == "no_op"
+    assert transport.create_call_count == 1
+
+
+def test_regression_2_expected_previous_digest_none_is_not_wildcard() -> None:
+    """P0-3: expected_previous_digest=None with an existing head present and
+    a NEW idempotency key is rejected (None is a strict value to match, not
+    a wildcard)."""
+    transport = FakeIssueCommentTransport()
+    existing_envelope = _build_envelope(request_id="req-r2-existing", candidate_records=[_new_candidate()])
+    transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(existing_envelope))
+
+    pub_req = _publish_request_dict(
+        candidate_records=[_new_candidate()],
+        request_id="req-r2-new",
+        base_sha="b" * 40,  # different base_sha -> genuinely new idempotency key
+        expected_previous_digest=None,
+    )
+    ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: True, is_tty=lambda: True)
+
+    with pytest.raises(pr.StaleWriteDetected) as excinfo:
+        pr.publish_run(
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
+        )
+
+    assert excinfo.value.reason_code == "stale_expected_previous_digest"
+    assert transport.create_call_count == 0
+
+
+def test_regression_3_provider_fork_detection_via_shared_parent_digest() -> None:
+    """P0-4: two comments sharing the same parent_record_digest -> provider
+    get() reads status == 'stale' (read-time reconstruction, not a
+    separately persisted conflict flag)."""
+    transport = FakeIssueCommentTransport()
+    run_identity = {"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST}
+    envelope_a = _build_envelope(
+        request_id="req-r3-a",
+        candidate_records=[_new_candidate()],
+        run_identity=run_identity,
+        parent_record_digest=None,
+        generated_at="2026-08-22T01:00:00Z",
+    )
+    envelope_b = _build_envelope(
+        request_id="req-r3-b",
+        candidate_records=[_new_candidate()],
+        run_identity=run_identity,
+        parent_record_digest=None,
+        generated_at="2026-08-22T02:00:00Z",
+    )
+    transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope_a))
+    transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope_b))
+
+    provider = pr.IssueCommentPreviousStateProvider(
+        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, trusted_publisher_logins=_TRUSTED
+    )
+    result = provider.get(
+        repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-sorted-json-v1"
+    )
+
+    assert result.status == "stale"
+
+
+def test_regression_4_tampered_digest_rejected_by_provider_and_idempotency() -> None:
+    """P0-6: a marked comment with a tampered digest is rejected by BOTH the
+    provider AND the idempotency/OCC path -- never treated as valid prior
+    state."""
+    transport = FakeIssueCommentTransport()
+    envelope = _build_envelope(request_id="req-r4", candidate_records=[_new_candidate()])
+    comment = transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope))
+    tampered_body = transport._comments[comment["id"]]["body"].replace("classified", "TAMPERED")
+    transport._comments[comment["id"]]["body"] = tampered_body
+
+    provider = pr.IssueCommentPreviousStateProvider(
+        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, trusted_publisher_logins=_TRUSTED
+    )
+    result = provider.get(
+        repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-sorted-json-v1"
+    )
+    assert result.status == "no_history"
+
+    head = pr.check_optimistic_concurrency_precondition(
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        repository_id=_REPO_ID,
+        scope=pr.DEFAULT_SCOPE,
+        expected_previous_digest=None,
+        trusted_publisher_logins=_TRUSTED,
+    )
+    assert head is None
+
+    decision, existing = pr.evaluate_idempotency(
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        idempotency_key=envelope["idempotency_key"],
+        request_payload_digest="sha256:" + "1" * 64,
+        trusted_publisher_logins=_TRUSTED,
+    )
+    assert decision == "publish"
+    assert existing is None
+
+
+def test_regression_5_non_allowlisted_author_not_accepted_as_valid_state() -> None:
+    """P0-6: a full, well-formed record posted by a non-allowlisted login is
+    never accepted as valid durable state (author allowlist check)."""
+    transport = FakeIssueCommentTransport()
+    envelope = _build_envelope(request_id="req-r5", candidate_records=[_new_candidate()])
+    transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope), login=_UNTRUSTED_LOGIN)
+
+    provider = pr.IssueCommentPreviousStateProvider(
+        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, trusted_publisher_logins=_TRUSTED
+    )
+    result = provider.get(
+        repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-sorted-json-v1"
+    )
+    assert result.status == "no_history"
+
+    decision, existing = pr.evaluate_idempotency(
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        idempotency_key=envelope["idempotency_key"],
+        request_payload_digest="sha256:" + "2" * 64,
+        trusted_publisher_logins=_TRUSTED,
+    )
+    assert decision == "publish"
+    assert existing is None
+
+
+def test_regression_6_repository_mismatch_zero_transport_calls() -> None:
+    """P0-1: publish_request.repository_id != --repo -> zero transport
+    calls occur."""
+    transport = FakeIssueCommentTransport()
+    pub_req = _publish_request_dict(
+        candidate_records=[_new_candidate()], request_id="req-r6", repository_id="someone-else/other-repo"
+    )
+    ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: True, is_tty=lambda: True)
+
+    with pytest.raises(pr.RepositoryMismatch):
+        pr.publish_run(
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED
+        )
+
+    assert transport.create_call_count == 0
+    assert transport.list_comments(repo=_REPO, issue_number=_TARGET_ISSUE) == []
+
+
+def test_regression_7_head_change_between_prepare_and_publish_refuses_post() -> None:
+    """P0-2: the live head changes between prepare_publication() and
+    publish_prepared() -> POST does not happen; caller must re-run
+    prepare_publication()."""
+    transport = FakeIssueCommentTransport()
+    pub_req = _publish_request_dict(candidate_records=[_new_candidate()], request_id="req-r7")
+
+    prepared = pr.prepare_publication(
+        publish_request=pub_req, repo=_REPO, transport=transport, trusted_publisher_logins=_TRUSTED
+    )
+    assert prepared.status == "publish"
+
+    # simulate a concurrent publish landing a new head in between
+    intervening_envelope = _build_envelope(
+        request_id="req-r7-intervening",
+        candidate_records=[_new_candidate()],
+        run_identity={"run_id": "other", "base_sha": "c" * 40, "source_set_digest": "e" * 64},
+    )
+    transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=pr.render_comment_body(intervening_envelope))
+
+    ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: True, is_tty=lambda: True)
+    with pytest.raises(pr.StaleWriteDetected):
+        pr.publish_prepared(prepared, repo=_REPO, transport=transport, auth_ctx=ctx, trusted_publisher_logins=_TRUSTED)
+
+    # only the intervening comment exists -- no POST from publish_prepared()
+    assert transport.create_call_count == 1
+
+
+def test_regression_8_timeout_after_landed_post_recovers_no_duplicate() -> None:
+    """P1-2/AC10: a POST lands server-side but the response times out --
+    rescan-by-request_id recovers the already-landed comment; no duplicate
+    POST happens."""
+    transport = FakeIssueCommentTransport()
+    envelope = _build_envelope(request_id="req-r8", candidate_records=[_new_candidate()])
+    transport.queue_create_side_effect(pr.AmbiguousTransportError("simulated timeout"), also_create=True)
+
+    comment, recovered = pr.create_comment_with_recovery(
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        body=pr.render_comment_body(envelope),
+        request_id="req-r8",
+        idempotency_key=envelope["idempotency_key"],
+        publication_digest=envelope["publication_digest"],
+        trusted_publisher_logins=_TRUSTED,
+    )
+
+    assert recovered is True
+    assert transport.create_call_count == 1
+    assert len(transport.list_comments(repo=_REPO, issue_number=_TARGET_ISSUE)) == 1
+
+
+def test_regression_9_readback_verification_failure_is_published_unverified_no_index_update() -> None:
+    """P0-6/P0-7: a readback that fails schema/digest verification ->
+    result.status == 'published_unverified'; index_updater is NOT invoked."""
+
+    class _TamperingTransport(FakeIssueCommentTransport):
+        def get_comment(self, *, repo: str, comment_id: int) -> dict[str, Any]:
+            fetched = super().get_comment(repo=repo, comment_id=comment_id)
+            fetched["body"] = fetched["body"].replace("classified", "TAMPERED-ON-READBACK")
+            return fetched
+
+    transport = _TamperingTransport()
+    pub_req = _publish_request_dict(candidate_records=[_new_candidate()], request_id="req-r9")
+    ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: True, is_tty=lambda: True)
+    calls: list[str] = []
+
+    result = pr.publish_run(
+        publish_request=pub_req,
+        repo=_REPO,
+        transport=transport,
+        auth_ctx=ctx,
+        trusted_publisher_logins=_TRUSTED,
+        index_updater=lambda **kwargs: calls.append("updated"),
+    )
+
+    assert result.status == "published_unverified"
+    assert calls == []
+
+
+def test_regression_10_index_updater_failure_is_published_index_stale() -> None:
+    """P0-7: a CLI-level index updater failure after a verified publish ->
+    result.status == 'published_index_stale' (not an overall publish
+    failure)."""
+    transport = FakeIssueCommentTransport()
+    pub_req = _publish_request_dict(candidate_records=[_new_candidate()], request_id="req-r10")
+    ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: True, is_tty=lambda: True)
+
+    def _failing_index_updater(**kwargs: Any) -> None:
+        raise RuntimeError("update-retro-index.mjs exited 1")
+
+    result = pr.publish_run(
+        publish_request=pub_req,
+        repo=_REPO,
+        transport=transport,
+        auth_ctx=ctx,
+        trusted_publisher_logins=_TRUSTED,
+        index_updater=_failing_index_updater,
+    )
+
+    assert result.status == "published_index_stale"
+    assert any("update-retro-index.mjs exited 1" in error for error in result.errors)
