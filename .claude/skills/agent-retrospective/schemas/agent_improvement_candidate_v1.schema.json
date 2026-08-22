@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://loop-protocol.dev/schemas/agent_improvement_candidate_v1.schema.json",
   "title": "agent_improvement_candidate/v1",
-  "description": "Schema for a single improvement candidate proposed by an agent-retrospective run. candidate_status is a closed enum whose transitions are constrained by the state machine in validate_retrospective_schema.py (ALLOWED_TRANSITIONS / validate_transition()), not merely by this schema's enum. Per ADR 0007 Decision 4 (mutation boundary), transitioning a candidate to 'accepted' and beyond, and creating an implementation issue, are remediation / control-plane mutations that require prior explicit human authorization; this schema only describes the shape of a candidate record, it does not itself perform or authorize any mutation.",
+  "description": "Schema for a single improvement candidate proposed by an agent-retrospective run. candidate_status is a closed enum whose transitions are constrained by the state machine in validate_retrospective_schema.py (ALLOWED_TRANSITIONS / validate_transition()), not merely by this schema's enum. Per ADR 0007 Decision 4 (mutation boundary), transitioning a candidate to 'accepted' and beyond, and creating an implementation issue, are remediation / control-plane mutations that require prior explicit human authorization; this schema only describes the shape of a candidate record, it does not itself perform or authorize any mutation. `finding_contract` (Issue #2288) is an additive, optional versioned envelope: when absent, the record is a legacy lifecycle-only candidate with no delta-evaluation capability (delta_capability: legacy_unavailable, see compute_delta_capability() in validate_retrospective_schema.py -- this schema does not itself store a delta_capability field, nor does it auto-generate or backfill finding_contract.identity for legacy records). When present, finding_contract's internal keys (schema_version/identity/claim_class/evaluations) are all-or-none required by its own nested schema -- partial envelopes are rejected. candidate_id (this record's lifecycle identity) and finding_contract.identity (a cross-run semantic identity used to correlate the same underlying finding across separate agent-retrospective runs) are deliberately distinct identity concepts; this schema fixes candidate:finding cardinality at 1:1 (aggregating multiple findings under one candidate is out of scope; enforcing that cardinality at the persistence layer is #2238's responsibility, not this schema's).",
   "type": "object",
   "additionalProperties": false,
   "required": ["candidate_id", "candidate_status", "title", "description", "source_run_ref", "created_at", "updated_at"],
@@ -47,7 +47,7 @@
     },
     "candidate_status": {
       "type": "string",
-      "description": "Closed enum of candidate lifecycle states. Valid transitions between these states are enforced by validate_transition() in validate_retrospective_schema.py, not by this schema alone (e.g. 'rejected' -> 'implemented' is a value each individually valid but a transition rejected by the state machine). implementation_issue_created/implemented/validating/validated require implementation_issue_ref; rejected requires rejection_reason; superseded requires superseded_by (schema-enforced via the allOf/if/then invariants above).",
+      "description": "Closed enum of candidate lifecycle states. Valid transitions between these states are enforced by validate_transition() in validate_retrospective_schema.py, not by this schema alone (e.g. 'rejected' -> 'implemented' is a value each individually valid but a transition rejected by the state machine). implementation_issue_created/implemented/validating/validated require implementation_issue_ref; rejected requires rejection_reason; superseded requires superseded_by (schema-enforced via the allOf/if/then invariants above). This lifecycle enum and its ALLOWED_TRANSITIONS graph are independent of finding_contract.evaluations[].delta_status (Issue #2288): candidate_status is never derived from, nor mutated by, delta evaluation outcomes.",
       "enum": [
         "proposed",
         "accepted",
@@ -107,6 +107,495 @@
       "type": "string",
       "description": "Reference to the candidate that superseded this one. Required when candidate_status is superseded (schema-enforced).",
       "minLength": 1
+    },
+    "finding_contract": {
+      "$ref": "#/$defs/finding_contract"
+    }
+  },
+  "$defs": {
+    "claim_class": {
+      "type": "string",
+      "description": "ADR 0007 Decision 2 claim-class taxonomy (exact 9-value closed enum). Used both as finding_contract.claim_class (the overall claim class of the finding) and inside finding_contract.identity.key.claim_class (one of the typed identity key components). validate_claim_class_consistency() (validate_retrospective_schema.py) additionally enforces that these two occurrences are identical for any given candidate -- the schema alone cannot express a cross-field equality constraint.",
+      "enum": [
+        "code_content",
+        "code_authorship_timing",
+        "internal_loop_review_verdict",
+        "github_native_review_state",
+        "review_comment",
+        "mergeability",
+        "issue_intent",
+        "external_fact",
+        "runtime_behavior"
+      ]
+    },
+    "finding_identity": {
+      "type": "object",
+      "description": "FINDING_IDENTITY_V1: a stable, cross-run semantic identity for a finding, deterministically derived from a typed key via compute_finding_identity()/validate_finding_identity() (validate_retrospective_schema.py). Deliberately excludes run/occurrence-varying inputs (source_run_ref, base_sha, source_set_digest, any timestamp, evidence fingerprints) so the same underlying finding keeps the same identity across separate runs.",
+      "additionalProperties": false,
+      "required": ["algorithm", "key", "value"],
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "const": "sha256-jcs-v1",
+          "description": "Identity digest algorithm. Fixed at v1; a future algorithm value would be a different namespace and is out of scope for this schema version. compute_finding_identity()/validate_finding_identity() reject any algorithm outside SUPPORTED_FINDING_IDENTITY_ALGORITHMS fail-closed, independent of this schema-level const."
+        },
+        "key": {
+          "type": "object",
+          "description": "Typed identity key. Deliberately does not include source_run_ref/base_sha/source_set_digest/timestamps/evidence fingerprints -- see compute_finding_identity(). value = \"sha256:\" + SHA256(JCS(key)); the hash preimage is this key object alone (RFC 8785 JCS: object properties sorted recursively, array element order preserved, ensure_ascii=False UTF-8 serialization, NaN/Infinity rejected). This key currently has no array-typed fields.",
+          "additionalProperties": false,
+          "required": ["repository_id", "claim_class", "subject_ref", "rule_id"],
+          "properties": {
+            "repository_id": {
+              "type": "string",
+              "description": "Stable repository identity. `owner/repo` full names are permitted for display/lookup convenience, but are NOT stable long-term identity (a repository rename changes the full name while the underlying repository is unchanged); a provider-qualified stable identifier (e.g. a GitHub repository numeric `id`, or a GitHub GraphQL `node_id`) SHOULD be preferred where available. This pattern accepts any of: a decimal numeric id, a GitHub-style node_id token, or an `owner/repo` full name.",
+              "pattern": "^([0-9]+|[A-Za-z0-9_+/=-]{8,}|[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+)$",
+              "minLength": 1
+            },
+            "claim_class": {
+              "$ref": "#/$defs/claim_class"
+            },
+            "subject_ref": {
+              "$ref": "#/$defs/subject_ref"
+            },
+            "rule_id": {
+              "type": "string",
+              "description": "Controlled failure-mode identifier (not free text): a namespaced, lowercase, dot-separated token, e.g. `runtime_behavior.missing_evidence` or `example_rule`.",
+              "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)*$",
+              "minLength": 1
+            }
+          }
+        },
+        "value": {
+          "type": "string",
+          "description": "\"sha256:\" + SHA256(JCS(key)) as computed by compute_finding_identity(). validate_finding_identity() recomputes this from `key` and rejects the candidate if the stored value does not match (stale/copied/fabricated identity).",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "subject_ref": {
+      "type": "object",
+      "description": "A normalized, stable reference to the subject of a finding, discriminated by `kind`. `issue`/`pull_request` kinds require an integer (or normalized numeric-string) `value`; `repository_path` requires a normalized repository-relative POSIX path (no leading `/`, no leading `./`, no `../` segment anywhere); `workflow`/`runtime`/`external_resource` kinds accept any non-empty controlled reference (their normalized shape is provider/context-specific and not further constrained here).",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["repository_path", "issue", "pull_request", "workflow", "runtime", "external_resource"]
+        },
+        "value": {
+          "type": "string",
+          "description": "Normalized, stable reference within `kind` (e.g. a repository-relative path, an issue/PR number, a workflow id).",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "enum": ["issue", "pull_request"] } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "pattern": "^[0-9]+$",
+                "description": "issue/pull_request subject_ref.value must be a decimal integer (or normalized numeric string), not free text."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "repository_path" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "pattern": "^(?!/)(?!\\./)(?!.*(^|/)\\.\\.(/|$)).+$",
+                "description": "repository_path subject_ref.value must be a normalized repository-relative POSIX path: no leading '/', no leading './', and no '../' path segment."
+              }
+            }
+          }
+        }
+      ]
+    },
+    "signal": {
+      "description": "Typed union representing a single observed/expected signal value (baseline_signal / current_signal / expected_signal). `null` represents a legitimate absence (e.g. no baseline exists yet for a brand-new finding), and is distinct from an omitted key -- baseline_signal/current_signal/expected_signal are always present, but may be null. `signal_type` discriminates which of the typed branches below applies; `value`'s JSON type, the permitted `comparator` values, and whether `tolerance` may be supplied are all constrained per `signal_type` (Issue #2288 P0-4). `validate_signal_specs_consistency()` (validate_retrospective_schema.py) additionally requires that baseline_signal/current_signal/expected_signal within the same evaluation agree on signal_type/unit/comparator/worse_direction.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/signal_boolean" },
+        { "$ref": "#/$defs/signal_integer" },
+        { "$ref": "#/$defs/signal_number" },
+        { "$ref": "#/$defs/signal_enum" },
+        { "$ref": "#/$defs/signal_digest" }
+      ]
+    },
+    "signal_boolean": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signal_type", "value", "comparator", "worse_direction"],
+      "not": { "required": ["tolerance"] },
+      "properties": {
+        "signal_type": { "const": "boolean" },
+        "value": { "type": "boolean" },
+        "unit": { "type": "string" },
+        "comparator": { "type": "string", "enum": ["eq", "ne", "present", "absent"] },
+        "worse_direction": { "type": "string", "enum": ["different", "not_applicable"] }
+      }
+    },
+    "signal_integer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signal_type", "value", "comparator", "worse_direction"],
+      "properties": {
+        "signal_type": { "const": "integer" },
+        "value": { "type": "integer" },
+        "unit": { "type": "string" },
+        "comparator": { "type": "string", "enum": ["eq", "ne", "lt", "lte", "gt", "gte", "present", "absent"] },
+        "worse_direction": { "type": "string", "enum": ["higher", "lower", "not_applicable"] },
+        "tolerance": { "type": "number" }
+      }
+    },
+    "signal_number": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signal_type", "value", "comparator", "worse_direction"],
+      "properties": {
+        "signal_type": { "const": "number" },
+        "value": { "type": "number" },
+        "unit": { "type": "string" },
+        "comparator": { "type": "string", "enum": ["eq", "ne", "lt", "lte", "gt", "gte", "present", "absent"] },
+        "worse_direction": { "type": "string", "enum": ["higher", "lower", "not_applicable"] },
+        "tolerance": { "type": "number" }
+      }
+    },
+    "signal_enum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signal_type", "value", "comparator", "worse_direction"],
+      "not": { "required": ["tolerance"] },
+      "properties": {
+        "signal_type": { "const": "enum" },
+        "value": { "type": "string" },
+        "unit": { "type": "string" },
+        "comparator": { "type": "string", "enum": ["eq", "ne", "present", "absent"] },
+        "worse_direction": { "type": "string", "enum": ["different", "not_applicable"] }
+      }
+    },
+    "signal_digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signal_type", "value", "comparator", "worse_direction"],
+      "not": { "required": ["tolerance"] },
+      "properties": {
+        "signal_type": { "const": "digest" },
+        "value": { "type": "string" },
+        "unit": { "type": "string" },
+        "comparator": { "type": "string", "enum": ["eq", "ne", "present", "absent"] },
+        "worse_direction": { "type": "string", "enum": ["different", "not_applicable"] }
+      }
+    },
+    "evidence_ref": {
+      "type": "object",
+      "description": "Public-safe, typed evidence reference. Deliberately excludes any raw-evidence field (full transcript text, secrets, absolute local paths, unredacted private content) -- additionalProperties: false enforces the field allowlist; value-level redaction of resource_identity/projection_digest inputs is Issue #2239's responsibility, not this schema's. `ref_type` and `source_id` must agree (each ref_type has exactly one valid source_id), and `resource_identity` must match the shape expected for `ref_type` (Issue #2288 P1-1).",
+      "additionalProperties": false,
+      "required": ["ref_type", "source_id", "resource_identity", "projection_digest"],
+      "properties": {
+        "ref_type": {
+          "type": "string",
+          "enum": ["public_github_resource", "repository_blob", "runtime_receipt", "external_primary_source"]
+        },
+        "source_id": {
+          "type": "string",
+          "enum": ["github", "repository", "runtime", "web"]
+        },
+        "resource_identity": {
+          "type": "string",
+          "description": "Typed, normalized public-safe identifier (e.g. a public GitHub URL, a repository-relative path + commit SHA). MUST NOT be raw transcript text.",
+          "minLength": 1
+        },
+        "projection_digest": {
+          "type": "string",
+          "description": "sha256 digest of a redacted, public-safe projection of the evidence -- not a hash of raw/private content.",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "ref_type": { "const": "public_github_resource" } },
+            "required": ["ref_type"]
+          },
+          "then": {
+            "properties": {
+              "source_id": { "const": "github" },
+              "resource_identity": {
+                "pattern": "^(https://github\\.com/[^\\s]+|[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+)$"
+              }
+            },
+            "required": ["source_id"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "ref_type": { "const": "repository_blob" } },
+            "required": ["ref_type"]
+          },
+          "then": {
+            "properties": {
+              "source_id": { "const": "repository" },
+              "resource_identity": {
+                "pattern": "^[^\\s#]+\\.[A-Za-z0-9_-]+(#[^\\s]+)?$"
+              }
+            },
+            "required": ["source_id"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "ref_type": { "const": "runtime_receipt" } },
+            "required": ["ref_type"]
+          },
+          "then": {
+            "properties": {
+              "source_id": { "const": "runtime" }
+            },
+            "required": ["source_id"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "ref_type": { "const": "external_primary_source" } },
+            "required": ["ref_type"]
+          },
+          "then": {
+            "properties": {
+              "source_id": { "const": "web" },
+              "resource_identity": {
+                "pattern": "^https?://[^\\s]+$"
+              }
+            },
+            "required": ["source_id"]
+          }
+        }
+      ]
+    },
+    "evaluation": {
+      "type": "object",
+      "description": "A single delta-evaluation event for a finding, produced by a future retrospective-evaluator (Issue #2237; this schema only defines the representation, not the computation). Five separated judgement axes (evaluation_status / presence_delta / signal_delta / delta_status / indeterminate_reason) are kept mutually exclusive per the allOf invariants below: delta_status is required iff evaluation_status is 'classified' and forbidden when 'indeterminate'; indeterminate_reason is null iff evaluation_status is 'classified' and a non-null enum value iff 'indeterminate'; incomplete source_coverage forces evaluation_status to 'indeterminate' (an indeterminate evaluation is never reported as 'resolved'); presence_delta 'recurrent' takes summary precedence over a concurrently-held signal_delta 'regressed' for delta_status (both are preserved -- delta_status='recurrent', signal_delta='regressed' -- so recurrence and regression are both representable at once). Additional judgement-table invariants that depend on the relationship between this evaluation and earlier entries in the same `evaluations[]` history (e.g. 'recurrent' requiring a preceding 'resolved'/'still_absent' classified state, or observed/presence_delta/source_coverage agreement) are enforced by validate_finding_contract_history() in validate_retrospective_schema.py, not by this per-item schema alone.",
+      "additionalProperties": false,
+      "required": [
+        "evaluation_id",
+        "evaluated_run_ref",
+        "previous_evaluation_ref",
+        "observed",
+        "source_coverage",
+        "evaluation_status",
+        "presence_delta",
+        "signal_delta",
+        "indeterminate_reason",
+        "baseline_signal",
+        "current_signal",
+        "expected_signal",
+        "evidence_refs",
+        "classified_at",
+        "classifier_version"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "source_coverage": { "enum": ["partial", "unavailable", "blocked"] } },
+            "required": ["source_coverage"]
+          },
+          "then": {
+            "properties": { "evaluation_status": { "const": "indeterminate" } },
+            "required": ["evaluation_status"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "evaluation_status": { "const": "indeterminate" } },
+            "required": ["evaluation_status"]
+          },
+          "then": {
+            "properties": { "indeterminate_reason": { "type": "string" } },
+            "not": { "required": ["delta_status"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "evaluation_status": { "const": "classified" } },
+            "required": ["evaluation_status"]
+          },
+          "then": {
+            "properties": {
+              "indeterminate_reason": { "const": null },
+              "evidence_refs": { "minItems": 1 }
+            },
+            "required": ["delta_status"],
+            "not": {
+              "allOf": [
+                { "properties": { "baseline_signal": { "const": null } } },
+                { "properties": { "current_signal": { "const": null } } }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "presence_delta": { "const": "new" } },
+            "required": ["presence_delta"]
+          },
+          "then": {
+            "properties": { "delta_status": { "const": "new" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "presence_delta": { "const": "resolved" } },
+            "required": ["presence_delta"]
+          },
+          "then": {
+            "properties": { "delta_status": { "const": "resolved" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "presence_delta": { "const": "recurrent" } },
+            "required": ["presence_delta"]
+          },
+          "then": {
+            "properties": { "delta_status": { "const": "recurrent" } }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              { "properties": { "presence_delta": { "const": "active" } }, "required": ["presence_delta"] },
+              { "properties": { "signal_delta": { "const": "regressed" } }, "required": ["signal_delta"] }
+            ]
+          },
+          "then": {
+            "properties": { "delta_status": { "const": "regressed" } }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              { "properties": { "presence_delta": { "const": "active" } }, "required": ["presence_delta"] },
+              { "properties": { "signal_delta": { "enum": ["improved", "unchanged", "unknown"] } }, "required": ["signal_delta"] }
+            ]
+          },
+          "then": {
+            "properties": { "delta_status": { "const": "unchanged" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "presence_delta": { "const": "still_absent" } },
+            "required": ["presence_delta"]
+          },
+          "then": {
+            "properties": { "delta_status": { "const": "unchanged" } }
+          }
+        }
+      ],
+      "properties": {
+        "evaluation_id": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "evaluated_run_ref": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["base_sha", "source_set_digest"],
+          "properties": {
+            "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "source_set_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        },
+        "previous_evaluation_ref": {
+          "description": "evaluation_id of the immediately preceding evaluation for the same finding, or null for the first evaluation. Cross-checked against evaluation history ordering by validate_finding_contract_history() (validate_retrospective_schema.py), not merely this schema's type.",
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+          ]
+        },
+        "observed": {
+          "type": "boolean",
+          "description": "Whether the finding was observed to still be present in the current run."
+        },
+        "source_coverage": {
+          "type": "string",
+          "enum": ["complete", "partial", "unavailable", "blocked"]
+        },
+        "evaluation_status": {
+          "type": "string",
+          "enum": ["classified", "indeterminate"]
+        },
+        "presence_delta": {
+          "type": "string",
+          "enum": ["new", "active", "resolved", "recurrent", "still_absent"]
+        },
+        "signal_delta": {
+          "type": "string",
+          "enum": ["improved", "unchanged", "regressed", "unknown"]
+        },
+        "delta_status": {
+          "type": "string",
+          "description": "Backward-compatible single-enum summary of presence_delta/signal_delta. Required iff evaluation_status is 'classified'; forbidden when 'indeterminate' (an indeterminate evaluation must never be reported as 'resolved' or any other delta_status).",
+          "enum": ["new", "resolved", "recurrent", "regressed", "unchanged"]
+        },
+        "indeterminate_reason": {
+          "description": "Non-null iff evaluation_status is 'indeterminate'; null iff 'classified'.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "string",
+              "enum": ["source_partial", "source_unavailable", "source_blocked", "baseline_missing", "comparator_missing"]
+            }
+          ]
+        },
+        "baseline_signal": { "$ref": "#/$defs/signal" },
+        "current_signal": { "$ref": "#/$defs/signal" },
+        "expected_signal": { "$ref": "#/$defs/signal" },
+        "evidence_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidence_ref" }
+        },
+        "classified_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "classifier_version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "finding_contract": {
+      "type": "object",
+      "description": "Versioned envelope (Issue #2288). Optional at the top level (absent -> legacy lifecycle-only candidate, delta evaluation not available). When present, all of schema_version/identity/claim_class/evaluations are required (all-or-none; enforced simply by this $ref applying its own `required` list only when the `finding_contract` key itself is present).",
+      "additionalProperties": false,
+      "required": ["schema_version", "identity", "claim_class", "evaluations"],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "v1"
+        },
+        "identity": {
+          "$ref": "#/$defs/finding_identity"
+        },
+        "claim_class": {
+          "$ref": "#/$defs/claim_class"
+        },
+        "evaluations": {
+          "type": "array",
+          "description": "Evaluation event history, oldest first. At least one evaluation is required once finding_contract is present.",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evaluation" }
+        }
+      }
     }
   }
 }

@@ -1,0 +1,64 @@
+{
+  "candidate_id": "cand-finding-invalid-0004",
+  "candidate_status": "proposed",
+  "title": "finding_contract fixture: invalid_claim_class_rule",
+  "description": "Fixture candidate for finding_contract schema validation (Issue #2288).",
+  "source_run_ref": {
+    "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+    "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+  },
+  "created_at": "2026-08-22T00:00:00Z",
+  "updated_at": "2026-08-22T00:00:00Z",
+  "finding_contract": {
+    "schema_version": "v1",
+    "identity": {
+      "algorithm": "sha256-jcs-v1",
+      "key": {
+        "repository_id": "squne121/loop-protocol",
+        "claim_class": "runtime_behavior",
+        "subject_ref": {
+          "kind": "repository_path",
+          "value": "schemas/d.json"
+        },
+        "rule_id": "invalid_claim_class_rule"
+      },
+      "value": "sha256:bb0bb25ab1630d6035da3073eced05abe25537cbabaa44edeb5b5d468d52c2c0"
+    },
+    "claim_class": "not_a_real_claim_class",
+    "evaluations": [
+      {
+        "evaluation_id": "sha256:40d42f7faf90f49216fa54e6a4345d4d0ec51c668d712468eead476be5e205a2",
+        "evaluated_run_ref": {
+          "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+          "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+        },
+        "previous_evaluation_ref": null,
+        "observed": true,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "new",
+        "signal_delta": "unknown",
+        "indeterminate_reason": null,
+        "baseline_signal": null,
+        "current_signal": {
+          "signal_type": "boolean",
+          "value": true,
+          "comparator": "eq",
+          "worse_direction": "not_applicable"
+        },
+        "expected_signal": null,
+        "evidence_refs": [
+          {
+            "ref_type": "repository_blob",
+            "source_id": "repository",
+            "resource_identity": ".claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py#new-1",
+            "projection_digest": "sha256:9ab33e6c6fd149afe78cd467d2f4d0c599b10e31294fc3452881d8bd387669bf"
+          }
+        ],
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "delta-evaluator/v1",
+        "delta_status": "new"
+      }
+    ]
+  }
+}
