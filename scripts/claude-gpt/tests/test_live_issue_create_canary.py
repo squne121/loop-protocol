@@ -290,7 +290,11 @@ if resolve_target_issue_number {_q(REPO)} {_q(TITLE)} {_q(BODY)} {_q(MARKER)}; t
 else
   RC=1
 fi
-python3 -c "import json; print(json.dumps({{'rc': $RC, 'identity_status': '$IDENTITY_STATUS', 'fallback_status': '$FALLBACK_STATUS', 'fallback_candidate_count': '$FALLBACK_CANDIDATE_COUNT', 'resolved_issue_number': '$RESOLVED_ISSUE_NUMBER'}}))"
+python3 -c "import json; print(json.dumps({{'rc': $RC, \
+'identity_status': '$IDENTITY_STATUS', \
+'fallback_status': '$FALLBACK_STATUS', \
+'fallback_candidate_count': '$FALLBACK_CANDIDATE_COUNT', \
+'resolved_issue_number': '$RESOLVED_ISSUE_NUMBER'}}))"
 '''
 
 
