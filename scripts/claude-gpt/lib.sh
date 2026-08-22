@@ -34,20 +34,17 @@ claude_gpt_proxy_home_dir() {
   printf '%s/proxy-home\n' "$CLAUDE_GPT_HOME"
 }
 
-# --- Claude/AGY プロセス専用の隔離 HOME / GH_CONFIG_DIR / XDG directories（P0-6）。
+# --- Claude/AGY プロセス専用の隔離 HOME / XDG directories（P0-6）。
 # OWNER adversarial review（PR #2214 コメント）は、Claude process が proxy 専用 HOME
-# 分離とは独立に、呼び出し元の実 HOME をそのまま継承しているため ambient `gh auth`
-# credential（`$HOME/.config/gh` 等）へ到達可能である点を指摘した。ここで用意する
-# ディレクトリは空（`gh auth login` 未実行）のまま launch.sh が Claude 子プロセスの
-# `HOME` / `GH_CONFIG_DIR` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` として注入し、
-# raw `gh` を Claude/AGY プロセスから起動しても genuine auth context を利用できない
-# ようにする（GitHub write credential は broker のみが保持する。Outcome 節）。
+# 分離とは独立に、呼び出し元の実 HOME をそのまま継承しているため ambient 実 HOME 配下の
+# SSH key/GPG key 等の無関係な secret へ到達可能である点を指摘した。ここで用意する
+# ディレクトリは空のまま launch.sh が Claude 子プロセスの `HOME` / `XDG_CONFIG_HOME` /
+# `XDG_CACHE_HOME` として注入する。GitHub auth（`GH_TOKEN`/`GH_CONFIG_DIR` 系）は
+# Issue #2299 により native 同等に共有する方針へ変更したため、`GH_CONFIG_DIR` は
+# この隔離ディレクトリを使わず launch.sh が ambient 値をそのまま渡す
+# （`claude_gpt_claude_isolated_gh_config_dir` は撤去済み）。
 claude_gpt_claude_isolated_home_dir() {
   printf '%s/claude-home\n' "$CLAUDE_GPT_HOME"
-}
-
-claude_gpt_claude_isolated_gh_config_dir() {
-  printf '%s/claude-gh-config\n' "$CLAUDE_GPT_HOME"
 }
 
 claude_gpt_claude_isolated_xdg_config_dir() {

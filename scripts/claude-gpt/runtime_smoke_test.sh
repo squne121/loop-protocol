@@ -52,6 +52,25 @@ for _arg in "$@"; do
   esac
 done
 
+# --- Issue #2299 AC2/AC5: `--scenario issue_create` mode ---
+# genuine `issue-creator` SubAgent が、fake gh provider に対して通常の
+# create-issue skill procedure（dedupe read -> create_issue_txn.py 呼び出し
+# -> readback）を isolated Claude-GPT session 内で完走できることを、outcome
+# 指向（fake provider の state と authoritative readback の一致）で確認する
+# mode。Runtime Verification Applicability（Issue #2299 本文）の
+# `skip_conditions: SKIPしない` / `fallback_policy: 実行不能な場合はSKIPでは
+# なくFAILとする` に従い、他 mode の env-availability SKIP gate（下記）を
+# 通らず、実行不能な場合は exit 77 ではなく exit 1（FAIL）を返す。real
+# GitHub Issue は一切作成しない（fake gh provider のみを使う）。
+ISSUE_CREATE_SCENARIO=false
+_prev_arg=""
+for _arg in "$@"; do
+  if [ "$_prev_arg" = "--scenario" ] && [ "$_arg" = "issue_create" ]; then
+    ISSUE_CREATE_SCENARIO=true
+  fi
+  _prev_arg="$_arg"
+done
+
 SELF_PATH=$0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
 # shellcheck source=./lib.sh
@@ -84,6 +103,149 @@ if [ -n "$SUT_PROXY_BIN" ]; then
 fi
 if [ -z "$SUT_PROXY_BIN" ]; then
   SUT_PROXY_BIN="unknown"
+fi
+
+# --- Issue #2299 AC2/AC5: `--scenario issue_create` -- outcome-oriented,
+#     fake-provider-backed live scenario. Runs BEFORE the shared
+#     env-availability SKIP gate below: this mode never returns exit 77
+#     (SKIP); it either PASSes or FAILs (fallback_policy, Issue #2299本文
+#     Runtime Verification Applicability). ---
+if [ "$ISSUE_CREATE_SCENARIO" = "true" ]; then
+  ISSUE_CREATE_EVIDENCE_FILE="${EVIDENCE_DIR}/issue-create-scenario-${TIMESTAMP}.json"
+  ISSUE_CREATE_TXN_SHA256=$(claude_gpt_sha256_file "$SUT_REPO_ROOT/.claude/skills/create-issue/scripts/create_issue_txn.py")
+  SESSION_ID="issue-create-scenario-${TIMESTAMP}-$$"
+
+  ISSUE_CREATE_PREFLIGHT_JSON=$("$SCRIPT_DIR/preflight.sh" --env-only)
+  ISSUE_CREATE_PREFLIGHT_RC=$?
+  if [ "$ISSUE_CREATE_PREFLIGHT_RC" -eq 3 ] || [ "$ISSUE_CREATE_PREFLIGHT_RC" -eq 4 ]; then
+    FAIL_REASON="binary_unavailable"
+    if [ "$ISSUE_CREATE_PREFLIGHT_RC" -eq 4 ]; then
+      FAIL_REASON="chatgpt_subscription_auth_unavailable"
+    fi
+    printf '{"schema":"CLAUDE_GPT_ISSUE_CREATE_SCENARIO_RESULT_V1","status":"fail","reason":"%s","session_id":"%s","generated_at":"%s","sut":{"git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","create_issue_txn_sha256":"%s"},"preflight_env_only":%s}\n' \
+      "$FAIL_REASON" "$SESSION_ID" "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$ISSUE_CREATE_TXN_SHA256" "$ISSUE_CREATE_PREFLIGHT_JSON" > "$ISSUE_CREATE_EVIDENCE_FILE"
+    echo "FAIL: issue_create scenario の実行環境が利用不能です（reason=${FAIL_REASON}）。runtime harness fallback_policy によりSKIPではなくFAILとします。証跡: ${ISSUE_CREATE_EVIDENCE_FILE}"
+    exit 1
+  fi
+
+  FAKE_GH_FIXTURE="$SCRIPT_DIR/tests/fixtures/fake_gh.py"
+  if [ ! -f "$FAKE_GH_FIXTURE" ]; then
+    printf '{"schema":"CLAUDE_GPT_ISSUE_CREATE_SCENARIO_RESULT_V1","status":"fail","reason":"fake_gh_fixture_missing","session_id":"%s","generated_at":"%s"}\n' \
+      "$SESSION_ID" "$TIMESTAMP" > "$ISSUE_CREATE_EVIDENCE_FILE"
+    echo "FAIL: fake gh fixture が見つかりません（${FAKE_GH_FIXTURE}）。証跡: ${ISSUE_CREATE_EVIDENCE_FILE}"
+    exit 1
+  fi
+
+  ISSUE_CREATE_WORKDIR=$(mktemp -d)
+  FAKE_GH_STATE="${ISSUE_CREATE_WORKDIR}/fake_gh_state.json"
+  FAKE_BIN_DIR="${ISSUE_CREATE_WORKDIR}/fake-bin"
+  mkdir -p "$FAKE_BIN_DIR"
+  FAKE_GH_WRAPPER="${FAKE_BIN_DIR}/gh"
+  cat > "$FAKE_GH_WRAPPER" <<FAKE_GH_WRAPPER_EOF
+#!/bin/sh
+exec python3 "$FAKE_GH_FIXTURE" "\$@"
+FAKE_GH_WRAPPER_EOF
+  chmod +x "$FAKE_GH_WRAPPER"
+
+  # NOTE: the target repo string given to the fake provider is deliberately
+  # CLAUDE_GPT_TRUSTED_REPO (squne121/loop-protocol), not an arbitrary
+  # placeholder name. `gh` is fully PATH-shadowed to fake_gh.py above, so no
+  # network call to real GitHub happens regardless of the repo string -- but
+  # the launcher's autoMode second-gate classifier (lib.sh
+  # CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL) only allows Issue create/edit/
+  # comment/close scoped to this exact repo name; an out-of-scope repo name
+  # here causes the classifier to correctly deny the delegation (observed
+  # live: "Issue 作成の委譲が権限設定により拒否されました"), which is a real
+  # source of run-to-run flakiness unrelated to AC1/AC2 correctness.
+  CANARY_TITLE="claude-gpt runtime_smoke_test issue_create scenario probe (${TIMESTAMP})"
+  ISSUE_CREATE_STDERR_LOG="${ISSUE_CREATE_WORKDIR}/launch.stderr.log"
+
+  ISSUE_CREATE_PROMPT="Use the Task tool to invoke the issue-creator SubAgent \
+(subagent_type: \"issue-creator\"). Instruct it to follow the standard \
+create-issue skill procedure (dedupe read via 'gh issue list', then \
+create_issue_txn.py, then readback) to create exactly one new Issue in repo \
+\"squne121/loop-protocol\" with this exact title: \"${CANARY_TITLE}\" and this \
+exact body:
+
+## Acceptance Criteria
+
+- [ ] AC1: probe
+
+## Verification Commands
+
+\`\`\`bash
+true  # AC1
+\`\`\`
+
+## Allowed Paths
+
+- scripts/claude-gpt/**
+
+Do not perform any other GitHub read or write operation. After the SubAgent \
+finishes, report only: DONE"
+
+  # PATH の先頭に fake gh wrapper を挿入することで、SubAgent が呼ぶ dedupe の
+  # raw \`gh issue list\` と create_issue_txn.py 既定の \`gh\` の両方が fake
+  # provider へ解決される（real GitHub には一切到達しない）。
+  ISSUE_CREATE_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  CLAUDE_OUTPUT=$(FAKE_GH_STATE="$FAKE_GH_STATE" PATH="${FAKE_BIN_DIR}:${PATH}" \
+    "$SCRIPT_DIR/launch.sh" -- -p "$ISSUE_CREATE_PROMPT" --output-format text --no-session-persistence \
+    2>"$ISSUE_CREATE_STDERR_LOG")
+  ISSUE_CREATE_LAUNCH_RC=$?
+  ISSUE_CREATE_END_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  # --- authoritative readback: fake provider の state file を正本として判定する
+  #     （SubAgent の自己申告テキストは observability 用途のみで、PASS/FAIL 判定
+  #     には使わない）。 ---
+  ISSUE_CREATE_READBACK_JSON=$(FAKE_GH_STATE="$FAKE_GH_STATE" CANARY_TITLE="$CANARY_TITLE" python3 <<'ISSUE_CREATE_READBACK_PY_EOF'
+import json
+import os
+
+state_path = os.environ.get("FAKE_GH_STATE")
+title = os.environ.get("CANARY_TITLE")
+result = {"matched": False, "issue_number": None, "issue_url": None, "total_issues": 0}
+if state_path and os.path.exists(state_path):
+    with open(state_path, encoding="utf-8") as fh:
+        state = json.load(fh)
+    issues = state.get("issues", {})
+    result["total_issues"] = len(issues)
+    for number, info in issues.items():
+        if info.get("title") == title:
+            result["matched"] = True
+            result["issue_number"] = int(number)
+            result["issue_url"] = info.get("url")
+            break
+print(json.dumps(result))
+ISSUE_CREATE_READBACK_PY_EOF
+)
+
+  ISSUE_CREATE_MATCHED=$(printf '%s' "$ISSUE_CREATE_READBACK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["matched"])')
+  ISSUE_CREATE_ISSUE_NUMBER=$(printf '%s' "$ISSUE_CREATE_READBACK_JSON" | python3 -c 'import json,sys; v=json.load(sys.stdin)["issue_number"]; print(v if v is not None else "null")')
+
+  ISSUE_CREATE_STATUS="fail"
+  if [ "$ISSUE_CREATE_LAUNCH_RC" -eq 0 ] && [ "$ISSUE_CREATE_MATCHED" = "True" ]; then
+    ISSUE_CREATE_STATUS="pass"
+  fi
+
+  if [ "$ISSUE_CREATE_STATUS" = "fail" ] && [ -n "${CLAUDE_GPT_ISSUE_CREATE_SCENARIO_DEBUG_DIR:-}" ]; then
+    mkdir -p "$CLAUDE_GPT_ISSUE_CREATE_SCENARIO_DEBUG_DIR"
+    cp "$ISSUE_CREATE_STDERR_LOG" "$CLAUDE_GPT_ISSUE_CREATE_SCENARIO_DEBUG_DIR/launch.stderr.log" 2>/dev/null || true
+    printf '%s' "$CLAUDE_OUTPUT" > "$CLAUDE_GPT_ISSUE_CREATE_SCENARIO_DEBUG_DIR/claude.stdout.log" 2>/dev/null || true
+  fi
+
+  printf '{"schema":"CLAUDE_GPT_ISSUE_CREATE_SCENARIO_RESULT_V1","status":"%s","session_id":"%s","generated_at":"%s","started_at":"%s","completed_at":"%s","launch_exit_code":%s,"fake_provider":{"repository_id":"squne121/loop-protocol","issue_number":%s,"readback":%s},"sut":{"git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","create_issue_txn_sha256":"%s"}}\n' \
+    "$ISSUE_CREATE_STATUS" "$SESSION_ID" "$TIMESTAMP" "$ISSUE_CREATE_START_TS" "$ISSUE_CREATE_END_TS" \
+    "$ISSUE_CREATE_LAUNCH_RC" "$ISSUE_CREATE_ISSUE_NUMBER" "$ISSUE_CREATE_READBACK_JSON" \
+    "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$ISSUE_CREATE_TXN_SHA256" > "$ISSUE_CREATE_EVIDENCE_FILE"
+
+  rm -rf "$ISSUE_CREATE_WORKDIR"
+
+  if [ "$ISSUE_CREATE_STATUS" = "pass" ]; then
+    echo "PASS: issue_create scenario -- genuine issue-creator が fake provider 経由で create-issue workflow を完走しました（issue_number=${ISSUE_CREATE_ISSUE_NUMBER}）。証跡: ${ISSUE_CREATE_EVIDENCE_FILE}"
+    exit 0
+  fi
+  echo "FAIL: issue_create scenario が完走しませんでした（launch_exit_code=${ISSUE_CREATE_LAUNCH_RC}, readback=${ISSUE_CREATE_READBACK_JSON}）。証跡: ${ISSUE_CREATE_EVIDENCE_FILE}"
+  exit 1
 fi
 
 # --- 環境可用性判定（バイナリ / ChatGPT subscription 認証）。ディレクトリ/設定はまだ作らない。 ---

@@ -192,18 +192,23 @@ PROXY_HOME_TARGET=$(claude_gpt_proxy_home_dir)
 MCP_CONFIG_PATH=$(claude_gpt_mcp_config_path)
 SETTINGS_PATH=$(claude_gpt_session_settings_path)
 SPARK_AUTH_DIR_TARGET=$(claude_gpt_spark_auth_dir)
-# --- Claude/AGY プロセス専用の隔離 HOME/GH_CONFIG_DIR/XDG（P0-6）。credential を
-#     一切置かない空ディレクトリとして扱う。ambient `gh auth` credential を
-#     Claude/AGY プロセスから利用不能にすることが目的であり、broker（別プロセス、
-#     GitHub mutation transaction broker）はこの隔離ディレクトリを使わない。 ---
+# --- Claude/AGY プロセス専用の隔離 HOME/XDG（P0-6）。credential を一切置かない
+#     空ディレクトリとして扱う。ambient 実 HOME 配下の SSH key/GPG key 等の
+#     無関係な secret を Claude/AGY プロセスから利用不能にすることが目的。
+#     GitHub auth（GH_TOKEN/GH_CONFIG_DIR 系）のみは native 同等に共有する
+#     （Issue #2299 Outcome。isolated HOME を差し替える *前* の ambient
+#     GH_CONFIG_DIR をここで固定し、以降の HOME 差し替えの影響を受けないように
+#     する）。 ---
 CLAUDE_ISOLATED_HOME_TARGET=$(claude_gpt_claude_isolated_home_dir)
-CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET=$(claude_gpt_claude_isolated_gh_config_dir)
+CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET="${GH_CONFIG_DIR:-${HOME}/.config/gh}"
 CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_config_dir)
 CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_cache_dir)
 
-# --- canonical path safety（ディレクトリ作成前に必ず検証する） ---
+# --- canonical path safety（ディレクトリ作成前に必ず検証する）。
+#     CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET は既存の native gh config dir を指す
+#     （このディレクトリは作成せず、reject_if_under_repo の対象にもしない）。 ---
 for d in "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
-  "$CLAUDE_ISOLATED_HOME_TARGET" "$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET" \
+  "$CLAUDE_ISOLATED_HOME_TARGET" \
   "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET" \
   "$SPARK_AUTH_DIR_TARGET"; do
   if ! claude_gpt_reject_if_under_repo "$d" "$SELF_PATH"; then
@@ -231,7 +236,7 @@ umask 077
 
 # --- GPT 専用ディレクトリを準備する（既存なら idempotent） ---
 mkdir -p "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
-  "$CLAUDE_ISOLATED_HOME_TARGET" "$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET" \
+  "$CLAUDE_ISOLATED_HOME_TARGET" \
   "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET" \
   "$SPARK_AUTH_DIR_TARGET"
 
@@ -1576,20 +1581,24 @@ export STRICT_MCP_MODE
 # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB は設定しない（OS-level sandbox hardening は Phase 1
 # の merge 条件から除外。実機検証で launcher がネストした sandbox 実行環境下にある場合
 # Bash tool を破壊することを確認したため。Issue #2158 Scope Reframe, 2026-08-15）。
-# --- Claude/AGY プロセスから genuine `gh` auth context を利用不能にする（P0-6,
-#     PR #2214 OWNER adversarial review 反映）。GitHub write credential は
-#     GitHub mutation transaction broker（別プロセス、ambient 実 HOME/GH_CONFIG_DIR
-#     を使う）のみが保持する。ここで Claude 子プロセスの HOME/GH_CONFIG_DIR/
-#     XDG_CONFIG_HOME/XDG_CACHE_HOME を空の隔離ディレクトリへ差し替え、
-#     GH_TOKEN 系 / SSH_AUTH_SOCK / GIT_ASKPASS 系を scrub することで、raw `gh` /
-#     raw `git push`（SSH 経由を含む）を Claude セッション内から実行しても
-#     既存 authentication に到達できない状態にする。 ---
+# --- Claude/AGY プロセスの GitHub auth のみ native 同等に共有し、それ以外の
+#     無関係な secret は引き続き isolate する（Issue #2299。旧 P0-6/PR #2214 の
+#     「genuine `gh` auth context を利用不能にする」方針は、genuine `issue-creator`
+#     SubAgent が dedupe read 等で認証エラーになり通常 workflow を完走できない
+#     という owner 指摘（#2259 NOT_PLANNED, PR #2286 コメント）を受けて置き換えた。
+#     GitHub mutation の correctness は GitHub 側の server-side protection と
+#     mutation 前後の live readback で担保する（本 Issue Outcome 節）。
+#     `HOME` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` は引き続き空の隔離ディレクトリへ
+#     差し替え、host HOME 配下の SSH key/GPG key 等へは到達できないようにする。
+#     `GH_CONFIG_DIR` は isolation 前に固定した ambient 値（native gh config dir）
+#     をそのまま渡すことで、GitHub auth のみ native 相当を維持する。
+#     `GH_TOKEN` 系 / `GH_HOST` / `GH_REPO` も ambient 値をそのまま unset せず
+#     子プロセスへ引き継ぐ。`SSH_AUTH_SOCK` / `GIT_ASKPASS` 系（GitHub auth とは
+#     無関係）は引き続き scrub する。 ---
 export HOME="$CLAUDE_ISOLATED_HOME_TARGET"
-export GH_CONFIG_DIR="$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET"
+export GH_CONFIG_DIR="$CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET"
 export XDG_CONFIG_HOME="$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET"
 export XDG_CACHE_HOME="$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"
-unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
-unset GH_HOST GH_REPO
 unset SSH_AUTH_SOCK
 unset GIT_ASKPASS SSH_ASKPASS GIT_CREDENTIAL_HELPER
 
