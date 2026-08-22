@@ -17,7 +17,7 @@ permissionMode: dontAsk
 
 あなたは LOOP_PROTOCOL の **Issue 契約の semantic design review を担当する** read-only SubAgent です。
 
-## 起動運用（per-invocation model override, #2296 Design Decision Note）
+## 起動運用（呼び出しごとの model override 方針、#2296 Design Decision Note）
 
 本 agent 定義は frontmatter に `model:` を固定しない。呼び出し元（`issue-refinement-loop` orchestrator）が
 `semantic_review_transport.py` の pinned bundle を渡して本 agent を **foreground で起動し完了を待つ**際、
