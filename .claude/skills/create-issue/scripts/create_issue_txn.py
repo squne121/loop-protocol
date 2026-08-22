@@ -27,6 +27,7 @@ caller wiring at this time.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -34,8 +35,17 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from dataclasses import replace as _dataclass_replace
 from pathlib import Path
 from typing import Any, Literal
+
+# Default subprocess timeout (seconds) for `gh` invocations issued via
+# run_command(). Salvaged from the Issue #2259 bridge server's
+# `subprocess.run(..., timeout=180)` handling (PR #2286) and adapted to the
+# single native path (Issue #2299 AC4): a hung `gh` call must fail closed with
+# a TransactionError("timeout", ...) instead of blocking the transaction
+# indefinitely.
+_DEFAULT_GH_COMMAND_TIMEOUT_SECONDS = 180
 
 
 # ---------------------------------------------------------------------------
@@ -112,20 +122,36 @@ class TransactionResult:
     failed_readbacks: list[dict] = field(default_factory=list)
     pending_steps: list[str] = field(default_factory=list)
     audit_comment_posted: bool | None = None
+    # Authoritative post-create readback fields (salvaged from Issue #2259/
+    # PR #2286 AC7, Issue #2299 AC4). Populated by
+    # run_transaction_with_authoritative_readback(); left None for callers
+    # that invoke run_transaction() directly (unchanged, backward compatible).
+    node_id: str | None = None
+    body_sha256: str | None = None
 
 
 def run_command(
     command: list[str],
     *,
     check: bool = False,
-    capture_output: bool = True
+    capture_output: bool = True,
+    timeout: float | None = _DEFAULT_GH_COMMAND_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        text=True,
-        check=check,
-        capture_output=capture_output,
-    )
+    try:
+        return subprocess.run(
+            command,
+            text=True,
+            check=check,
+            capture_output=capture_output,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TransactionError(
+            "timeout",
+            f"command timed out after {timeout}s: {' '.join(command)}",
+            command=" ".join(command),
+            output=str(exc),
+        ) from exc
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2640,6 +2666,60 @@ def run_transaction(
             pending_steps=pending_steps,
             failed_readbacks=failed_readbacks,
         )
+
+
+def run_transaction_with_authoritative_readback(
+    *,
+    repo: str,
+    title: str,
+    body: str,
+    body_file: str,
+    labels: list[str],
+    issue_kind: str = "",
+    label_profile: str = "standard",
+    parent_issue_number: int,
+    dependency_issue_numbers: list[int | str],
+    gh_bin: str,
+    blocking_issue_numbers: list[int | str] | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> TransactionResult:
+    """Wrap run_transaction() with an authoritative post-create GraphQL readback
+    of node_id, plus a body_sha256 computed from the effective body text.
+
+    Salvaged from Issue #2259/PR #2286 AC7 (`node_id`/`body_sha256` readback,
+    originally implemented for the bridge dispatch path) and adapted to the
+    single native path (Issue #2299 AC4). run_transaction() itself is left
+    untouched for existing callers; this wrapper is opt-in.
+    """
+    result = run_transaction(
+        repo=repo,
+        title=title,
+        body=body,
+        body_file=body_file,
+        labels=labels,
+        issue_kind=issue_kind,
+        label_profile=label_profile,
+        parent_issue_number=parent_issue_number,
+        dependency_issue_numbers=dependency_issue_numbers,
+        gh_bin=gh_bin,
+        blocking_issue_numbers=blocking_issue_numbers,
+        sleep_fn=sleep_fn,
+    )
+    if result.issue_number is None:
+        return result
+    node_id: str | None = None
+    try:
+        node_id, _ = _issue_graphql_ids(repo, result.issue_number, gh_bin)
+    except TransactionError:
+        node_id = None
+    effective_body = body
+    if body_file:
+        try:
+            effective_body = Path(body_file).read_text(encoding="utf-8")
+        except OSError:
+            effective_body = body
+    body_sha256 = hashlib.sha256(effective_body.encode("utf-8")).hexdigest()
+    return _dataclass_replace(result, node_id=node_id, body_sha256=body_sha256)
 
 
 def reconcile_transaction(
