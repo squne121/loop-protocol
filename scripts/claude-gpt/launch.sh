@@ -359,6 +359,51 @@ DELEGATION_REQUIRED_KEYS = (
     "authorization_source",
 )
 
+
+# --- Issue #2274 AC11/AC13: effective-environment fail-closed detection ----
+#
+# `CLAUDE_CODE_SUBAGENT_MODEL` (and, separately, the fork/background
+# execution posture) can be re-injected into the actual `claude` child
+# process's environment via managed/user/project/local Claude Code settings
+# `env` blocks, not only via an ambient shell export -- launch.sh's own
+# `unset CLAUDE_CODE_SUBAGENT_MODEL` (see below) cannot observe or prevent
+# that re-injection from a settings layer. Rather than attempting to
+# hermetically reproduce every settings-layer merge (out of scope -- managed
+# settings in particular cannot be fully controlled from a test harness),
+# this hook inspects `os.environ` at the moment it actually runs inside the
+# `claude` child process: any re-injection from ANY source (shell export or
+# settings `env` block) surfaces identically in `os.environ` by the time
+# Claude Code invokes this hook, so a single check covers all sources without
+# over-claiming that managed settings were independently controlled.
+def effective_env_override_reason():
+    # Issue #2274 PR #2285 OWNER fix-delta P0-3: deny ANY non-empty
+    # CLAUDE_CODE_SUBAGENT_MODEL, including a value that happens to equal
+    # DELEGATION_MODEL. Per Claude Code's official model resolution
+    # precedence (CLAUDE_CODE_SUBAGENT_MODEL > per-invocation model >
+    # subagent definition frontmatter > main conversation model), the env
+    # var -- not the session-local agent definition -- is the true binding
+    # authority whenever it is set, even to a same-value override. Allowing
+    # a same-value override to pass would contradict the Issue's Outcome
+    # ("definition-only authority") and would make `definition.source:
+    # launcher_owned_agents_json` in SPARK_DELEGATION_EVIDENCE_V2 a false
+    # claim about which layer actually won model resolution for that run.
+    # (Also covers the literal string "inherit", which is non-empty.)
+    subagent_model = os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
+    if subagent_model not in (None, ""):
+        return "unsupported_effective_model_override"
+    fork_value = os.environ.get("CLAUDE_CODE_FORK_SUBAGENT", "")
+    disable_background_value = os.environ.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "")
+    fork_enabled = fork_value not in ("", "0")
+    disable_background_enabled = disable_background_value == "1"
+    if fork_enabled or not disable_background_enabled:
+        # Production invariant (Issue #2274 In Scope): `CLAUDE_CODE_FORK_SUBAGENT`
+        # unset/0 AND `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: 1`. Any of the 5
+        # distinguishable states outside that invariant (both unset, fork-only,
+        # disable-background-only, both, or re-injected via settings) denies
+        # BEFORE the Agent launches -- never a post-hoc detection.
+        return "background_execution_invariant_violation"
+    return None
+
 DIRECTIVE_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+?)\s*$")
 
 
@@ -753,9 +798,32 @@ def cmd_pre_tool_use_agent(payload):
     # otherwise have been consumed above (consumption already happened;
     # denying now is still fail-closed since the authorization is spent
     # either way).
-    if decision == "allow" and isinstance(tool_input, dict):
-        model_override = tool_input.get("model")
-        if model_override is not None and model_override != DELEGATION_MODEL:
+    # Issue #2274 (OWNER adversarial reframe of #2258 P0-3/P0-4): model
+    # binding for spark-codex is owned exclusively by the session-local
+    # custom agent definition (`--agents`). This hook no longer injects a
+    # `model` field into `updatedInput` -- it only inspects, normalizes, or
+    # rejects a `model` field the caller itself proposed, per the
+    # normalization contract:
+    #   * key absent                          -> allow, leave input untouched
+    #   * exact DELEGATION_MODEL string        -> allow, strip the key (the
+    #                                             definition route owns it)
+    #   * any other string (alias/`inherit`/
+    #     a different full model id)           -> deny
+    #                                             `explicit_model_override_mismatch`
+    #   * non-string JSON type (null/object/
+    #     array/number)                        -> deny
+    #                                             `invalid_model_field_type`
+    if decision == "allow" and subagent_type == SPARK_AGENT:
+        env_violation_reason = effective_env_override_reason()
+        if env_violation_reason is not None:
+            decision = "deny"
+            reason = env_violation_reason
+    if decision == "allow" and isinstance(tool_input, dict) and "model" in tool_input:
+        model_value = tool_input.get("model")
+        if not isinstance(model_value, str):
+            decision = "deny"
+            reason = "invalid_model_field_type"
+        elif model_value != DELEGATION_MODEL:
             decision = "deny"
             reason = "explicit_model_override_mismatch"
     output = {
@@ -774,9 +842,16 @@ def cmd_pre_tool_use_agent(payload):
         # run_in_background value Claude Code itself proposed. Paired with
         # `permissionDecision: "allow"` (never `"defer"`, since `defer`
         # drops `updatedInput` per the PreToolUse hook contract).
+        # Issue #2274 AC1/AC2: never generate/forward a `model` field --
+        # custom agent definition (session-local `--agents`) is the sole
+        # model binding authority. A caller-proposed `model` field that
+        # reached this point is guaranteed (by the normalization contract
+        # above) to be the exact DELEGATION_MODEL string, so stripping it
+        # here is a pure normalization (not a behavior change) rather than
+        # a pin.
         base_input = tool_input if isinstance(tool_input, dict) else {}
         updated_input = dict(base_input)
-        updated_input["model"] = DELEGATION_MODEL
+        updated_input.pop("model", None)
         updated_input["run_in_background"] = False
         output["hookSpecificOutput"]["updatedInput"] = updated_input
     if decision == "allow" and isinstance(record, dict) and session_id and AUTH_DIR:
@@ -832,6 +907,106 @@ def cmd_subagent_lifecycle(payload):
     return
 
 
+def detect_available_models_silent_fallback(payload):
+    """Issue #2274 AC12: given an evidence payload carrying
+    ``requested_model`` (the session-local custom agent definition's
+    declared model -- DELEGATION_MODEL), and whichever of
+    ``resolved_model`` / ``models_used`` / ``available_models`` the runtime
+    actually surfaced for a completed Agent invocation, detect a SILENT
+    fallback to an inherited/substituted model instead of ever promoting
+    such a run to PASS.
+
+    This is pure evidence analysis -- it never gates a tool call (unlike
+    ``cmd_pre_tool_use_agent``) and is never wired into the PreToolUse
+    authorization decision or the gate hook registration. It exists so the
+    live evidence pipeline (SPARK_DELEGATION_EVIDENCE_V2, Issue #2274
+    AC5/AC6/AC7) has a single, independently testable, typed classifier for
+    this specific failure shape instead of silently treating "no explicit
+    error" as success.
+
+    Returns a dict with ``status`` (``"pass"`` or ``"blocked"``, never a
+    bare boolean) and a typed ``reason`` (never ``None`` when blocked):
+
+    - ``requested_model_missing``: ``requested_model`` itself was not a
+      non-empty string -- nothing to compare against, fail closed.
+    - ``insufficient_evidence``: neither ``resolved_model`` nor
+      ``models_used`` was observed at all -- nothing to compare
+      ``requested_model`` against, fail closed (never assumed to match).
+    - ``available_models_excludes_requested_silent_fallback``: the runtime
+      surfaced a non-empty ``available_models`` list that does NOT contain
+      ``requested_model``, AND the observed ``resolved_model``/
+      ``models_used`` disagree with ``requested_model`` -- the exact
+      silent-substitution shape this AC exists to catch (Claude Code
+      falling back to an inherited model when the requested one is not in
+      ``availableModels``, per the Issue's Current Validated Scope
+      analysis of https://code.claude.com/docs/en/model-config).
+    - ``resolved_model_mismatch_despite_available``: ``available_models``
+      DID contain ``requested_model``, yet the observed resolved/used model
+      still disagrees -- a distinct anomaly, still never PASS.
+    - ``resolved_model_mismatch_without_available_models_evidence``: the
+      observed resolved/used model disagrees with ``requested_model`` but
+      ``available_models`` itself was never observed, so the more specific
+      exclusion reason above could not be confirmed -- still never PASS.
+    - ``match``: ``resolved_model`` (when observed) equals
+      ``requested_model``, and ``requested_model`` is present in
+      ``models_used`` (when that list was observed).
+
+    Fails closed on every field -- a comparison that cannot be honestly
+    made from the already-captured evidence never defaults to ``"pass"``.
+    """
+    requested_model = payload.get("requested_model") if isinstance(payload, dict) else None
+    resolved_model = payload.get("resolved_model") if isinstance(payload, dict) else None
+    models_used = payload.get("models_used") if isinstance(payload, dict) else None
+    available_models = payload.get("available_models") if isinstance(payload, dict) else None
+
+    result = {
+        "status": None,
+        "reason": None,
+        "requested_model": requested_model,
+        "resolved_model": resolved_model,
+        "models_used": models_used,
+        "available_models": available_models,
+    }
+
+    if not isinstance(requested_model, str) or not requested_model:
+        result["status"] = "blocked"
+        result["reason"] = "requested_model_missing"
+        return result
+
+    has_resolved_evidence = isinstance(resolved_model, str) and bool(resolved_model)
+    has_models_used_evidence = isinstance(models_used, list) and len(models_used) > 0
+
+    if not has_resolved_evidence and not has_models_used_evidence:
+        result["status"] = "blocked"
+        result["reason"] = "insufficient_evidence"
+        return result
+
+    resolved_match = (not has_resolved_evidence) or (resolved_model == requested_model)
+    models_used_match = (not has_models_used_evidence) or (requested_model in models_used)
+
+    if resolved_match and models_used_match:
+        result["status"] = "pass"
+        result["reason"] = "match"
+        return result
+
+    has_available_models_evidence = isinstance(available_models, list) and len(available_models) > 0
+    if has_available_models_evidence and requested_model not in available_models:
+        result["status"] = "blocked"
+        result["reason"] = "available_models_excludes_requested_silent_fallback"
+    elif has_available_models_evidence:
+        result["status"] = "blocked"
+        result["reason"] = "resolved_model_mismatch_despite_available"
+    else:
+        result["status"] = "blocked"
+        result["reason"] = "resolved_model_mismatch_without_available_models_evidence"
+    return result
+
+
+def cmd_detect_available_models_fallback(payload):
+    sys.stdout.write(json.dumps(detect_available_models_silent_fallback(payload)))
+    sys.exit(0)
+
+
 def main():
     event = sys.argv[1] if len(sys.argv) > 1 else ""
     payload = read_payload()
@@ -842,6 +1017,8 @@ def main():
             cmd_pre_tool_use_agent(payload)
         elif event in ("subagent-start", "subagent-stop"):
             cmd_subagent_lifecycle(payload)
+        elif event == "detect-available-models-fallback":
+            cmd_detect_available_models_fallback(payload)
     except SystemExit:
         raise
     except Exception:
@@ -887,6 +1064,52 @@ export CLAUDE_GPT_SPARK_AUTH_DIR="$SPARK_AUTH_DIR_TARGET"
 export SPARK_GATE_WRITER
 SPARK_AGENTS_JSON=$(claude_gpt_spark_agents_json_fragment)
 
+# --- Issue #2274 AC14/AC15 (PR #2285 OWNER fix-delta P0-1): runtime_smoke_test.sh
+#     専用 launcher-owned canary SubAgent fixture の内部合成経路。caller-owned
+#     `--agents` は CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由で引き続き無条件拒否する
+#     （上記の policy-weakening flag 拒否ループを一切変更しない）。
+#
+#     P0-1 corrective iteration: this channel used to accept a caller-supplied
+#     raw JSON fragment (`CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON`) merged via
+#     `claude_gpt_agents_json_merge_validate`, whose only checks were
+#     non-empty-object / no-duplicate-key / serialize-readback-match -- it
+#     never allowlist-validated the fragment's *content*, so an ordinary
+#     launch that set this raw env var directly could inject an arbitrary
+#     session-local agent definition (including `hooks`/`model`/
+#     `permissionMode`/`mcpServers`). That raw-JSON escape hatch is removed
+#     entirely. `runtime_smoke_test.sh` now passes only two opaque strings
+#     (an expected-output marker and a run-unique nonce) via
+#     `CLAUDE_GPT_SMOKE_CANARY_MARKER` / `CLAUDE_GPT_SMOKE_CANARY_NONCE`, and
+#     launch.sh itself calls the SAME strictly-validated
+#     `claude_gpt_smoke_canary_agents_json_fragment` function that
+#     `runtime_smoke_test.sh` used to call on the caller's behalf -- the
+#     caller can never supply the fixture's JSON *structure* any more, only
+#     the marker text embedded inside its fixed prompt template and the
+#     nonce used to derive its high-entropy agent name (both flow through
+#     `json.dumps`, never raw string concatenation, so neither can break out
+#     of the fixed {description, prompt, tools} shape). Marker/nonce
+#     presence without the other is rejected fail-closed (never silently
+#     ignored), and fixture synthesis failure (malformed input,
+#     reserved-name collision) is fail-closed too -- launch is aborted
+#     before `claude` is ever exec'd. ---
+if [ -n "${CLAUDE_GPT_SMOKE_CANARY_MARKER:-}" ] || [ -n "${CLAUDE_GPT_SMOKE_CANARY_NONCE:-}" ]; then
+  if [ -z "${CLAUDE_GPT_SMOKE_CANARY_MARKER:-}" ] || [ -z "${CLAUDE_GPT_SMOKE_CANARY_NONCE:-}" ]; then
+    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"smoke_canary_marker_or_nonce_missing"}\n' >&2
+    exit 2
+  fi
+  CANARY_FRAGMENT_JSON=$(claude_gpt_smoke_canary_agents_json_fragment "$CLAUDE_GPT_SMOKE_CANARY_MARKER" "$CLAUDE_GPT_SMOKE_CANARY_NONCE" "$CLAUDE_GPT_SPARK_AGENT_NAME")
+  if [ -z "$CANARY_FRAGMENT_JSON" ]; then
+    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"smoke_canary_fixture_synthesis_failed"}\n' >&2
+    exit 2
+  fi
+  MERGED_AGENTS_JSON=$(claude_gpt_agents_json_merge_validate "$SPARK_AGENTS_JSON" "$CANARY_FRAGMENT_JSON")
+  if [ -z "$MERGED_AGENTS_JSON" ]; then
+    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"smoke_canary_agents_merge_failed"}\n' >&2
+    exit 2
+  fi
+  SPARK_AGENTS_JSON="$MERGED_AGENTS_JSON"
+fi
+
 # --- explicit-only authorization gate hook groups (Issue #2186 P0 fix-delta,
 #     PR #2244 adversarial review) ---
 #
@@ -909,12 +1132,97 @@ STOPFAILURE_HOOK_GROUPS=""
 ENV_JSON_FRAGMENT=",
   \"env\": {\"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\"}"
 if [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-start-stop" ]; then
-  # Observation-only "cat" sinks appended as an additional matcher-group,
-  # alongside (never instead of) the gate's SubagentStart/SubagentStop
-  # audit entries above.
-  CAT_SINK_GROUP='{"hooks": [{"type": "command", "command": "cat"}]}'
+  # Issue #2274 AC17 corrective iteration (hook-time byte-offset causal
+  # correlation): this sink used to be a bare `cat` that only echoed the
+  # hook's own stdin payload (agent_id/agent_type) back onto the stream.
+  # That gave the evidence builder agent_id correlation, but never the
+  # hook's own execution-time proxy log byte offset --
+  # runtime_smoke_test.sh instead approximated the correlation window with
+  # offsets captured immediately before/after the ENTIRE `launch.sh`
+  # invocation, which is a step-wide approximation, not the
+  # SubagentStart/SubagentStop hook-time window the Issue requires
+  # (genuine implementation gap, corrective iteration finding). This sink
+  # now additionally `os.stat()`s the canonical, launcher-owned proxy log
+  # path (never a caller-supplied path -- sourced from this same
+  # PROXY_STATE_DIR_TARGET constant every other proxy-path reference in
+  # this file uses) at the moment THIS hook process itself runs, and
+  # echoes that byte offset back alongside the original payload -- still
+  # strictly observational (no permissionDecision, no authorization
+  # semantics touched, the gate's own SubagentStart/SubagentStop audit
+  # entries above are unmodified) and independent of the other hook
+  # entries' execution order (per Claude Code's hooks reference, matching
+  # hooks run in parallel with no ordering guarantee between them; this
+  # design never assumes one hook runs before another -- it only records
+  # this hook's own execution-time state).
+  SPARK_LIFECYCLE_OFFSET_LOG_PATH="${PROXY_STATE_DIR_TARGET}/claude-code-proxy/proxy.log"
+  SPARK_LIFECYCLE_OFFSET_WRITER="${PROXY_STATE_DIR_TARGET}/spark-lifecycle-offset-writer-${SPARK_LAUNCH_NONCE}.py"
+  ( umask 077 && cat > "$SPARK_LIFECYCLE_OFFSET_WRITER" <<'SPARK_LIFECYCLE_OFFSET_WRITER_EOF'
+import json
+import os
+import sys
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    log_path = os.environ.get("SPARK_LIFECYCLE_OFFSET_LOG_PATH")
+    offset = None
+    dev = None
+    ino = None
+    mtime_ns = None
+    # Issue #2274 PR #2285 OWNER fix-delta P1-5: a single fstat() on ONE
+    # opened fd (never a separate os.stat()-by-path call plus a later
+    # independent `wc -c`/`cp`) so size/dev/ino/mtime_ns are all read from
+    # the SAME underlying inode as one atomic snapshot -- a log
+    # rotation/truncation/replacement racing between two independent
+    # path-based reads can never tear this reading.
+    if isinstance(log_path, str) and log_path:
+        try:
+            fd = os.open(log_path, os.O_RDONLY)
+        except OSError:
+            fd = None
+        if fd is not None:
+            try:
+                st = os.fstat(fd)
+                offset = st.st_size
+                dev = st.st_dev
+                ino = st.st_ino
+                mtime_ns = st.st_mtime_ns
+            except OSError:
+                offset = None
+                dev = None
+                ino = None
+                mtime_ns = None
+            finally:
+                os.close(fd)
+    # This sink only ever ADDS its own observation to whatever the hook's
+    # stdin payload already carried (agent_id/agent_type/hook_event_name/
+    # etc.) -- it never removes or rewrites an existing field.
+    payload["proxy_log_byte_offset_at_hook_time"] = offset
+    payload["proxy_log_dev_at_hook_time"] = dev
+    payload["proxy_log_ino_at_hook_time"] = ino
+    payload["proxy_log_mtime_ns_at_hook_time"] = mtime_ns
+    sys.stdout.write(json.dumps(payload))
+
+
+if __name__ == "__main__":
+    main()
+SPARK_LIFECYCLE_OFFSET_WRITER_EOF
+  )
+  CAT_SINK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_LIFECYCLE_OFFSET_WRITER\""}]}'
   SAS_HOOK_GROUPS="${SAS_HOOK_GROUPS}, ${CAT_SINK_GROUP}"
   SAP_HOOK_GROUPS="${SAP_HOOK_GROUPS}, ${CAT_SINK_GROUP}"
+  ENV_JSON_FRAGMENT=",
+  \"env\": {
+    \"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\",
+    \"SPARK_LIFECYCLE_OFFSET_LOG_PATH\": \"${SPARK_LIFECYCLE_OFFSET_LOG_PATH}\",
+    \"SPARK_LIFECYCLE_OFFSET_WRITER\": \"${SPARK_LIFECYCLE_OFFSET_WRITER}\"
+  }"
+  export SPARK_LIFECYCLE_OFFSET_LOG_PATH SPARK_LIFECYCLE_OFFSET_WRITER
 elif [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "hook-sink-multi-turn" ]; then
   # --- Issue #2219 (OWNER anchor decision, hook-event evidence channel).
   #     Narrow addition to the same fixed-value gate above: a SECOND fixed
@@ -1261,6 +1569,13 @@ echo "CLAUDE_GPT_AUTO_MODE_CHECK_PATH=${AUTO_MODE_CHECK_PATH}" >&2
 #     （正常/エラー/timeout/SIGINT/SIGTERM）で確実に proxy を kill/wait する。 ---
 
 unset CLAUDE_CODE_SUBAGENT_MODEL
+# Issue #2274 AC13: pin the production fork/background invariant
+# (`CLAUDE_CODE_FORK_SUBAGENT` unset/0, `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: 1`)
+# for the real claude child process. `unset` (not merely absent) so a
+# leaked ambient export from the launching shell cannot survive into the
+# child process's environment.
+unset CLAUDE_CODE_FORK_SUBAGENT
+export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
 
 export CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_TARGET"
 export ANTHROPIC_BASE_URL="http://127.0.0.1:${PROXY_PORT}"
@@ -1420,6 +1735,23 @@ exec 9<&0
 #     Outcome 節）。caller 由来の `--permission-mode` は上記 forbidden-flag ループ
 #     （CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由）で既に全面拒否済みのため、ここに
 #     到達する時点で "$@" に `--permission-mode` トークンは含まれない。 ---
+# --- Issue #2274 PR #2285 OWNER fix-delta P0-3: best-effort audit record of
+#     the EXACT `--agents` JSON this invocation is about to pass to `claude`,
+#     written by launch.sh itself immediately before exec (never
+#     self-reported by an external observer after the fact).
+#     scripts/claude-gpt/runtime_smoke_test.sh's --spark-delegation evidence
+#     builder reads this file back and only reports `definition.source:
+#     "launcher_owned_agents_json"` when it can independently confirm
+#     agent_name/model from THIS file's real content -- never from a fixed
+#     string constant. Best-effort and never fatal: a write failure here
+#     must not block an otherwise-authorized launch, since this is an audit
+#     side-channel, not the authorization gate itself. Written under
+#     CLAUDE_GPT_HOME's spark-auth dir (never under the repo/worktree --
+#     see claude_gpt_reject_if_under_repo). ---
+SPARK_AGENTS_JSON_AUDIT_DIR="$(claude_gpt_spark_auth_dir)"
+mkdir -p "$SPARK_AGENTS_JSON_AUDIT_DIR" 2>/dev/null || true
+SPARK_AGENTS_JSON_AUDIT_PATH="${SPARK_AGENTS_JSON_AUDIT_DIR}/last-agents-json.json"
+( umask 077 && printf '%s' "$SPARK_AGENTS_JSON" > "$SPARK_AGENTS_JSON_AUDIT_PATH" ) 2>/dev/null || true
 # shellcheck disable=SC2086
 "$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" --permission-mode auto --agents "$SPARK_AGENTS_JSON" "$@" <&9 &
 CLAUDE_PID=$!
