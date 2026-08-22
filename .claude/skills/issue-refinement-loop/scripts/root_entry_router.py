@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Root-owned synchronous entry transition router (producer side, #2272).
+"""Root-owned synchronous entry transition (Issue #2272, root-direct redesign).
 
-Implements ``ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1`` a process-local,
-non-persistent route result produced and consumed only within the current
-root/main thread control flow. This module deliberately does NOT provide any
-save/load/persist API: the route result is a plain ``dict`` returned to the
-caller and MUST NOT be written to a GitHub comment, artifact file, digest, or
-environment variable as an authorization token (see
-``docs/dev/workflow.md`` and the Issue #2272 "Root-Owned Synchronous Entry
-Transition" section for the normative policy).
+Implements ``ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1``, a process-local,
+non-persistent route result produced and consumed within a SINGLE continuous
+call (``run_root_transition``). There is no separate producer/consumer
+process boundary and no re-presentable authorization token: the root/main
+thread calls ``run_root_transition`` once per attempt, and that same call
+fetches live state, runs a current-run ``issue-contract-review``, decides the
+route, and -- only when authorized -- invokes Step 1 directly, all within one
+Python call stack. Nothing about the route or the review result is ever
+accepted as caller-supplied input; every value that feeds the routing
+decision is fetched or computed by this function itself.
+
+This module deliberately does NOT provide any save/load/persist API: the
+route result is a plain ``dict`` returned to the immediate caller and MUST
+NOT be written to a GitHub comment, artifact file, digest, or environment
+variable as an authorization credential (see ``docs/dev/workflow.md`` and the
+Issue #2272 "Root-Owned Synchronous Entry Transition" section for the
+normative policy).
 
 Schema (fixed, do not add/remove keys -- #2272 Stop Condition):
 
@@ -29,14 +38,16 @@ Routing priority (lower number wins when multiple conditions are true):
     1. capability / live-fetch / identity unverifiable  -> stop
     2. Issue body / Allowed Paths drift                  -> rerun_contract_review
     3. base SHA drift only                                -> rerun_base_preflight
-       (bounded retry, MAX_BASE_PREFLIGHT_RETRIES=3; exhausted -> stop)
+       (bounded retry, MAX_BASE_PREFLIGHT_RETRIES=3, owned by this function's
+       own loop -- never a caller-supplied counter; exhausted -> stop)
     4. verdict blocked / request_changes                  -> stop
     5. current-run go AND live equality                   -> invoke_impl_review_loop
 
-No self-attested ``root_invocation_id`` is used for authorization. Process
-correlation uses either a host-supplied ``prompt_id`` or a process-local
-nonce that is never restored across process restarts (see
-``generate_root_invocation_nonce``).
+Correlation vs. authorization (P0-1 fix): ``generate_root_invocation_nonce``
+produces a process-local id used ONLY for audit/log correlation. It is never
+compared against anything, never required to match, and never gates
+``invoked``. Authorization is entirely a function of live-fetched state
+compared inside this same call -- not of any id, token, or prior artifact.
 """
 
 from __future__ import annotations
@@ -44,10 +55,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import sys
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 ROUTE_INVOKE = "invoke_impl_review_loop"
 ROUTE_RERUN_CONTRACT_REVIEW = "rerun_contract_review"
@@ -76,19 +88,25 @@ _ROUTE_V1_KEYS = (
 def compute_body_sha256(body: str) -> str:
     """Canonicalization matches issue-contract-review's ``sha256_of``
     convention (``sha256:<64 hex>``) without importing that skill's module
-    (out of scope: `.claude/skills/issue-contract-review/**` is not edited or
-    depended on by this module -- see #2272 Out of Scope)."""
+    (Out of Scope: `.claude/skills/issue-contract-review/**` is not edited
+    by this module -- see #2272 Out of Scope). ``run_root_transition`` DOES
+    call that skill's existing ``run_once`` production entry point (a
+    read-only current-run review invocation, not a parser/validator
+    change)."""
 
     return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def generate_root_invocation_nonce(prompt_id: Optional[str] = None) -> str:
-    """Process-local identifier for the current root invocation.
+    """Process-local correlation id for the current root invocation.
 
-    Never self-attested and never restored across process restarts (AC15).
-    If a host-supplied ``prompt_id`` is available it is used for
-    correlation; otherwise a fresh UUID4 nonce is minted. Callers MUST NOT
-    persist the return value anywhere outside process memory.
+    NON-AUTHORITATIVE (P0-1): this value is used only to tag audit/log
+    output. It is never compared against a prior value, never required to
+    match anything, and never gates whether Step 1 is invoked. It is never
+    restored across process restarts -- every call mints a fresh value (or
+    derives a fresh ``prompt:<id>`` label from the CURRENT host-supplied
+    prompt_id, itself never read from a file or persisted environment
+    value).
     """
 
     if prompt_id:
@@ -133,6 +151,30 @@ def _route_result(
     }
 
 
+def _stop_route(
+    issue_number: int,
+    reason: str,
+    *,
+    reviewed_body_sha256: Optional[str] = None,
+    observed_live_body_sha256: Optional[str] = None,
+    reviewed_base_sha: Optional[str] = None,
+    observed_base_sha: Optional[str] = None,
+    resume_from: Optional[str] = None,
+    retry_count: int = 0,
+) -> dict:
+    return {
+        "route": ROUTE_STOP,
+        "reason": reason,
+        "issue_number": issue_number,
+        "reviewed_body_sha256": reviewed_body_sha256,
+        "observed_live_body_sha256": observed_live_body_sha256,
+        "reviewed_base_sha": reviewed_base_sha,
+        "observed_base_sha": observed_base_sha,
+        "resume_from": resume_from,
+        "retry_count": retry_count,
+    }
+
+
 _MUTATION_RESUME_POINTS = {
     "capability_preflight": "capability_preflight",
     "live_fetch": "live_fetch",
@@ -144,8 +186,12 @@ _MUTATION_RESUME_POINTS = {
 
 def resume_from_after_mutation_failure(failed_phase: str) -> str:
     """AC10: after a partial mutation failure, return a safe ``resume_from``
-    computed purely from a fresh live readback context (the phase name that
-    failed), never from stale local state."""
+    computed purely from the failed phase name recorded at the moment of
+    failure (this repo's mutation phases are idempotent-safe re-entry
+    points); never from stale local state, and never a caller-invented
+    string outside the known phase set is treated as anything other than an
+    opaque resume marker -- ``run_root_transition`` never re-derives
+    additional state from it."""
 
     return _MUTATION_RESUME_POINTS.get(failed_phase, failed_phase)
 
@@ -153,9 +199,6 @@ def resume_from_after_mutation_failure(failed_phase: str) -> str:
 def decide_root_entry_route(req: RootEntryRequest) -> dict:
     """Pure routing decision function -- no I/O. AC1-AC6, AC10-AC13."""
 
-    # AC10: a previously recorded partial mutation failure takes precedence
-    # so that resume always starts from a live-readback-derived safe point,
-    # never blindly continuing into mutation again.
     if req.mutation_partial_failure_phase:
         return _route_result(
             req,
@@ -166,18 +209,12 @@ def decide_root_entry_route(req: RootEntryRequest) -> dict:
             ),
         )
 
-    # Priority 1: capability / live fetch / identity verification.
-    # AC11: this check happens strictly before any Issue mutation is
-    # attempted by callers (decide_root_entry_route performs no mutation
-    # itself; callers must not mutate before consuming this route).
     if not (req.capability_ok and req.live_fetch_ok and req.identity_ok):
         return _route_result(req, ROUTE_STOP, "capability_or_identity_unverifiable")
 
-    # Priority 2: body / Allowed Paths drift (review subject itself changed).
     if req.reviewed_body_sha256 != req.observed_live_body_sha256:
         return _route_result(req, ROUTE_RERUN_CONTRACT_REVIEW, "body_drift_detected")
 
-    # Priority 3: base SHA drift only (bounded retry).
     if req.reviewed_base_sha != req.observed_base_sha:
         if req.retry_count >= MAX_BASE_PREFLIGHT_RETRIES:
             return _route_result(
@@ -194,41 +231,64 @@ def decide_root_entry_route(req: RootEntryRequest) -> dict:
             retry_count=req.retry_count + 1,
         )
 
-    # Priority 4: verdict blocked / request_changes.
     if req.review_verdict in ("blocked", "request_changes"):
         return _route_result(req, ROUTE_STOP, f"review_verdict_{req.review_verdict}")
 
-    # Priority 5: current-run go AND live equality (already established by
-    # reaching this point: reviewed_* == observed_*).
     if req.review_verdict == "go":
         return _route_result(req, ROUTE_INVOKE, "fresh_review_go_live_equality")
 
-    # Missing / unrecognized verdict: never invoke; fail closed to stop so a
-    # human or a fresh review cycle decides (never fall through silently).
     return _route_result(req, ROUTE_STOP, "review_verdict_missing_or_unrecognized")
 
 
+def validate_route_schema(route: object, *, expected_issue_number: int) -> Optional[str]:
+    """In-process schema gate (P1-2). Runs in the SAME call stack as
+    ``decide_root_entry_route`` -- not a separate subprocess, not gated by
+    any token. Rejects malformed/incomplete routes and cross-checks the
+    issue number against the value this SAME invocation was called with
+    (never a value read back out of the route object itself)."""
+
+    if not isinstance(route, dict):
+        return "invalid_route_type"
+    if set(route.keys()) != set(_ROUTE_V1_KEYS):
+        return "invalid_route_schema_keys"
+    if route.get("route") not in VALID_ROUTES:
+        return "invalid_route_value"
+    if route.get("route") != ROUTE_INVOKE:
+        return f"route_not_invoke:{route.get('route')}"
+    issue_number = route.get("issue_number")
+    if not isinstance(issue_number, int) or issue_number != expected_issue_number:
+        return "missing_or_mismatched_issue_number"
+    retry_count = route.get("retry_count")
+    if not isinstance(retry_count, int) or retry_count < 0:
+        return "invalid_retry_count"
+    return None
+
+
 class GitHubEntryTransport(Protocol):
-    """Production-shape transport interface. A real implementation talks to
-    the GitHub API (out of scope for #2272); tests inject a fake that
-    satisfies this same interface (not internal monkeypatching)."""
+    """Production-shape transport interface. ``GhCliGitHubEntryTransport``
+    talks to the real GitHub API via ``gh``; tests inject
+    ``FileBackedFakeGitHubEntryTransport``, which satisfies this same
+    interface (dependency injection, not internal monkeypatching)."""
 
     def capability_preflight(self) -> bool: ...
 
-    def fetch_live_issue(self, issue_number: int) -> dict: ...  # {"body", "base_sha", "identity_ok"}
+    def fetch_live_issue(self, issue_number: int) -> dict: ...  # {"body", "base_sha", "identity_ok", "fetch_ok"}
 
     def post_comment(self, issue_number: int, body: str) -> dict: ...  # {"ok", "comment_id"?}
+
+    def canonical_repository_identity(self) -> str: ...
 
 
 @dataclass
 class FileBackedFakeGitHubEntryTransport:
-    """Fake transport for tests / subprocess CLI wiring. Reads canned state
-    from a JSON fixture file so the same interface can be constructed inside
-    a fresh subprocess (no in-memory callables cross process boundaries)."""
+    """Fake transport for tests. Reads canned state from a JSON fixture file
+    so the same interface can be constructed inside a fresh subprocess (no
+    in-memory callables cross process boundaries) for CLI-level tests."""
 
     fixture_path: str
     _state: dict = field(default_factory=dict, repr=False)
     _posted: list = field(default_factory=list, repr=False)
+    _fetch_calls: int = field(default=0, repr=False)
 
     def __post_init__(self) -> None:
         with open(self.fixture_path, "r", encoding="utf-8") as fh:
@@ -238,11 +298,20 @@ class FileBackedFakeGitHubEntryTransport:
         return bool(self._state.get("capability_ok", True))
 
     def fetch_live_issue(self, issue_number: int) -> dict:
+        self._fetch_calls += 1
         issues = self._state.get("issues", {})
         record = issues.get(str(issue_number), {})
+        # Fixtures may declare a list under "base_sha_sequence" to simulate
+        # base drift resolving after N re-fetches (bounded-retry tests).
+        seq = record.get("base_sha_sequence")
+        if seq:
+            idx = min(self._fetch_calls - 1, len(seq) - 1)
+            base_sha = seq[idx]
+        else:
+            base_sha = record.get("base_sha", "")
         return {
             "body": record.get("body", ""),
-            "base_sha": record.get("base_sha", ""),
+            "base_sha": base_sha,
             "identity_ok": record.get("identity_ok", True),
             "fetch_ok": record.get("fetch_ok", True),
         }
@@ -252,6 +321,100 @@ class FileBackedFakeGitHubEntryTransport:
             raise RuntimeError("simulated audit comment publish failure")
         self._posted.append({"issue_number": issue_number, "body": body})
         return {"ok": True, "comment_id": len(self._posted)}
+
+    def canonical_repository_identity(self) -> str:
+        return self._state.get("repo_identity", "fake/repo")
+
+
+@dataclass
+class GhCliGitHubEntryTransport:
+    """Production transport: talks to the REAL GitHub API via the ``gh``
+    CLI. This is the default transport used by the CLI entrypoint when
+    ``--fake-transport-file`` is NOT supplied (P0-3 production carrier)."""
+
+    repo: str
+    base_ref: str = "main"
+
+    def capability_preflight(self) -> bool:
+        try:
+            proc = subprocess.run(
+                ["gh", "auth", "status"], capture_output=True, text=True, timeout=30
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    def fetch_live_issue(self, issue_number: int) -> dict:
+        try:
+            proc = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "view",
+                    str(issue_number),
+                    "--repo",
+                    self.repo,
+                    "--json",
+                    "body",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc.returncode != 0:
+                return {"body": "", "base_sha": None, "identity_ok": False, "fetch_ok": False}
+            body = json.loads(proc.stdout).get("body", "")
+        except Exception:
+            return {"body": "", "base_sha": None, "identity_ok": False, "fetch_ok": False}
+
+        try:
+            ref_proc = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{self.repo}/git/refs/heads/{self.base_ref}",
+                    "--jq",
+                    ".object.sha",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            base_sha = ref_proc.stdout.strip() if ref_proc.returncode == 0 else None
+        except Exception:
+            base_sha = None
+
+        return {
+            "body": body,
+            "base_sha": base_sha,
+            "identity_ok": bool(base_sha),
+            "fetch_ok": True,
+        }
+
+    def post_comment(self, issue_number: int, body: str) -> dict:
+        try:
+            proc = subprocess.run(
+                ["gh", "issue", "comment", str(issue_number), "--repo", self.repo, "--body", body],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr)
+            return {"ok": True, "comment_id": None}
+        except Exception as exc:
+            raise RuntimeError(f"gh issue comment failed: {exc}") from exc
+
+    def canonical_repository_identity(self) -> str:
+        proc = subprocess.run(
+            ["gh", "repo", "view", self.repo, "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr)
+        return proc.stdout.strip()
 
 
 def publish_audit_comment_best_effort(
@@ -272,104 +435,228 @@ def publish_audit_comment_best_effort(
         return {"published": False, "warning": f"audit_publish_failed: {exc}"}
 
 
-def route_root_implementation_entry(
+def run_root_transition(
     *,
     issue_number: int,
-    reviewed_body_sha256: Optional[str],
-    reviewed_base_sha: Optional[str],
-    review_verdict: Optional[str],
+    repo: str,
     transport: GitHubEntryTransport,
-    retry_count: int = 0,
+    contract_reviewer: Callable[..., dict],
+    invoke_step1: Callable[[], object] = lambda: None,
+    mode: str = "static",
+    max_base_retries: int = MAX_BASE_PREFLIGHT_RETRIES,
     mutation_partial_failure_phase: Optional[str] = None,
     prompt_id: Optional[str] = None,
     publish_audit: bool = True,
+    expected_repository_identity: Optional[str] = None,
 ) -> dict:
-    """End-to-end producer entry point used by the root/main thread. Returns
-    an envelope: ``{"route": ROUTE_V1, "invocation_token": str, "audit": {...}}``.
+    """Single continuous root-owned entry point (P0-1/P0-2/P0-3/P1-1/P1-2
+    fix). Every input that feeds the routing decision (live body, live base,
+    review verdict, reviewed body hash) is fetched or computed by THIS call,
+    never accepted as a caller-supplied claim. ``invoke_step1`` is called at
+    most once, and only after live-derived equality and an exact schema
+    check both pass in this same call stack -- there is no route object,
+    token, or envelope handed to a separate process/consumer for later
+    replay (AC14/AC17/AC18 satisfied by construction: nothing here accepts a
+    previously-produced route as input at all).
 
-    ``invocation_token`` is the process-local nonce (or prompt_id-derived
-    correlation value) minted for THIS call. It is not part of the fixed
-    ROUTE_V1 schema -- it is delivery-envelope metadata used by the consumer
-    to reject replayed / cross-process-resumed route objects (AC14/AC18).
+    Returns ``{"route": ROUTE_V1, "invoked": bool, "correlation_id": str,
+    "audit": {...}}``. ``correlation_id`` is log-only (see
+    ``generate_root_invocation_nonce``) and never gates ``invoked``.
     """
 
-    capability_ok = False
-    live_fetch_ok = False
-    identity_ok = False
-    observed_live_body_sha256: Optional[str] = None
-    observed_base_sha: Optional[str] = None
+    correlation_id = generate_root_invocation_nonce(prompt_id)
+
+    def _finish(route: dict, invoked: bool) -> dict:
+        audit = {"published": None, "warning": None}
+        if publish_audit:
+            audit = publish_audit_comment_best_effort(transport, issue_number, route)
+        return {
+            "route": route,
+            "invoked": invoked,
+            "correlation_id": correlation_id,
+            "audit": audit,
+        }
+
+    # AC10/AC11: a previously recorded partial mutation failure takes
+    # precedence over everything else, including any fetch, so resume is
+    # always derived from the failed phase rather than silently retrying a
+    # mutation that may have partially applied.
+    if mutation_partial_failure_phase:
+        route = _stop_route(
+            issue_number,
+            "mutation_partial_failure",
+            resume_from=resume_from_after_mutation_failure(mutation_partial_failure_phase),
+        )
+        return _finish(route, False)
 
     try:
         capability_ok = bool(transport.capability_preflight())
     except Exception:
         capability_ok = False
+    if not capability_ok:
+        return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
 
-    if capability_ok:
+    if expected_repository_identity is not None:
+        try:
+            observed_identity = transport.canonical_repository_identity()
+        except Exception:
+            observed_identity = None
+        if observed_identity != expected_repository_identity:
+            return _finish(_stop_route(issue_number, "repository_identity_mismatch"), False)
+
+    def _fetch() -> tuple[bool, dict]:
         try:
             live = transport.fetch_live_issue(issue_number)
-            live_fetch_ok = bool(live.get("fetch_ok", True))
-            identity_ok = bool(live.get("identity_ok", True))
-            if live_fetch_ok:
-                observed_live_body_sha256 = compute_body_sha256(live.get("body", ""))
-                observed_base_sha = live.get("base_sha")
+            ok = bool(live.get("fetch_ok", True)) and bool(live.get("identity_ok", True))
+            return ok, live
         except Exception:
-            live_fetch_ok = False
-            identity_ok = False
+            return False, {}
 
-    req = RootEntryRequest(
-        issue_number=issue_number,
-        capability_ok=capability_ok,
-        live_fetch_ok=live_fetch_ok,
-        identity_ok=identity_ok,
-        reviewed_body_sha256=reviewed_body_sha256,
-        reviewed_base_sha=reviewed_base_sha,
-        observed_live_body_sha256=observed_live_body_sha256,
-        observed_base_sha=observed_base_sha,
-        review_verdict=review_verdict,
-        retry_count=retry_count,
-        mutation_partial_failure_phase=mutation_partial_failure_phase,
+    fetch_ok, live = _fetch()
+    if not fetch_ok:
+        return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
+
+    reviewed_base_sha = live.get("base_sha")
+    retry_count = 0
+    route: dict = _stop_route(issue_number, "unreachable")
+
+    while True:
+        try:
+            review_result = contract_reviewer(
+                issue_number=issue_number, repo=repo, mode=mode, reviewed_head_sha=reviewed_base_sha
+            )
+        except Exception:
+            return _finish(_stop_route(issue_number, "contract_reviewer_transport_failure"), False)
+
+        if not isinstance(review_result, dict):
+            return _finish(_stop_route(issue_number, "contract_reviewer_malformed_result"), False)
+
+        review_verdict = "go" if review_result.get("status") == "go" else "blocked"
+        reviewed_body_sha256 = review_result.get("body_sha256")
+
+        fetch_ok2, live2 = _fetch()
+        if not fetch_ok2:
+            return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
+
+        observed_live_body_sha256 = compute_body_sha256(live2.get("body", ""))
+        observed_base_sha = live2.get("base_sha")
+
+        req = RootEntryRequest(
+            issue_number=issue_number,
+            capability_ok=True,
+            live_fetch_ok=True,
+            identity_ok=True,
+            reviewed_body_sha256=reviewed_body_sha256,
+            reviewed_base_sha=reviewed_base_sha,
+            observed_live_body_sha256=observed_live_body_sha256,
+            observed_base_sha=observed_base_sha,
+            review_verdict=review_verdict,
+            retry_count=retry_count,
+        )
+        route = decide_root_entry_route(req)
+
+        if route["route"] == ROUTE_RERUN_BASE_PREFLIGHT and route["retry_count"] <= max_base_retries:
+            # Root-owned retry counter: `retry_count` is a local loop
+            # variable, never accepted from any caller, so it cannot be
+            # reset externally (P1-1 fix). Re-pin to the freshly observed
+            # base before the next attempt.
+            retry_count = route["retry_count"]
+            reviewed_base_sha = observed_base_sha
+            continue
+        break
+
+    invoked = False
+    if route["route"] == ROUTE_INVOKE:
+        schema_error = validate_route_schema(route, expected_issue_number=issue_number)
+        if schema_error is not None:
+            route = _stop_route(
+                issue_number,
+                schema_error,
+                reviewed_body_sha256=route.get("reviewed_body_sha256"),
+                observed_live_body_sha256=route.get("observed_live_body_sha256"),
+                reviewed_base_sha=route.get("reviewed_base_sha"),
+                observed_base_sha=route.get("observed_base_sha"),
+                retry_count=route.get("retry_count", 0),
+            )
+        else:
+            invoke_step1()
+            invoked = True
+
+    return _finish(route, invoked)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point. Computes and prints the routing decision only -- it does
+# NOT itself invoke impl-review-loop Step 1 (a subprocess cannot drive this
+# session's tool calls). The orchestrating root/main thread runs this CLI,
+# reads `invoked` from the SAME continuous turn, and -- only if true --
+# immediately proceeds to invoke impl-review-loop itself, in the same
+# session, with no intervening persistence of the route (P0-3).
+# ---------------------------------------------------------------------------
+
+
+def _select_transport(args: argparse.Namespace) -> GitHubEntryTransport:
+    if args.fake_transport_file:
+        return FileBackedFakeGitHubEntryTransport(args.fake_transport_file)
+    return GhCliGitHubEntryTransport(repo=args.repo, base_ref=args.base_ref)
+
+
+def _select_contract_reviewer(args: argparse.Namespace) -> Callable[..., dict]:
+    if args.fake_contract_review_file:
+        with open(args.fake_contract_review_file, "r", encoding="utf-8") as fh:
+            canned = json.load(fh)
+
+        def _fake_reviewer(**_kwargs: Any) -> dict:
+            return canned
+
+        return _fake_reviewer
+
+    # Production: import (not shell out to) issue-contract-review's existing
+    # run_once() -- a plain function call in the SAME process, not a
+    # separate subprocess whose stdout a caller could forge. This module
+    # never modifies `.claude/skills/issue-contract-review/**` (Out of
+    # Scope); it only imports the existing production entry point.
+    scripts_dir = str(
+        __import__("pathlib").Path(__file__).resolve().parents[2]
+        / "issue-contract-review"
+        / "scripts"
     )
-    route = decide_root_entry_route(req)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import run_contract_review_once as _icr  # noqa: E402
 
-    invocation_token = generate_root_invocation_nonce(prompt_id)
+    def _real_reviewer(*, issue_number: int, repo: str, mode: str, reviewed_head_sha: Optional[str]) -> dict:
+        return _icr.run_once(
+            issue_number=issue_number, repo=repo, mode=mode, reviewed_head_sha=reviewed_head_sha
+        )
 
-    audit = {"published": None, "warning": None}
-    if publish_audit and capability_ok:
-        audit = publish_audit_comment_best_effort(transport, issue_number, route)
-
-    return {"route": route, "invocation_token": invocation_token, "audit": audit}
-
-
-# ---------------------------------------------------------------------------
-# Subprocess CLI entry (AC8 process-level integration: strict JSON over
-# stdin/stdout; the consumer runs in a SEPARATE subprocess -- see
-# preparation_entry_router.py in impl-review-loop/scripts).
-# ---------------------------------------------------------------------------
+    return _real_reviewer
 
 
 def _main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fake-transport-file", required=True)
+    parser.add_argument("--issue-number", required=True, type=int)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--base-ref", default="main")
+    parser.add_argument("--mode", default="static")
+    parser.add_argument("--fake-transport-file", default=None)
+    parser.add_argument("--fake-contract-review-file", default=None)
+    parser.add_argument("--prompt-id", default=None)
+    parser.add_argument("--no-audit", action="store_true")
     args = parser.parse_args(argv)
 
-    try:
-        payload = json.load(sys.stdin)
-    except json.JSONDecodeError as exc:
-        print(json.dumps({"error": f"invalid_stdin_json: {exc}"}), file=sys.stderr)
-        return 2
+    transport = _select_transport(args)
+    contract_reviewer = _select_contract_reviewer(args)
 
-    transport = FileBackedFakeGitHubEntryTransport(args.fake_transport_file)
-
-    result = route_root_implementation_entry(
-        issue_number=int(payload["issue_number"]),
-        reviewed_body_sha256=payload.get("reviewed_body_sha256"),
-        reviewed_base_sha=payload.get("reviewed_base_sha"),
-        review_verdict=payload.get("review_verdict"),
+    result = run_root_transition(
+        issue_number=args.issue_number,
+        repo=args.repo,
         transport=transport,
-        retry_count=int(payload.get("retry_count", 0)),
-        mutation_partial_failure_phase=payload.get("mutation_partial_failure_phase"),
-        prompt_id=payload.get("prompt_id"),
-        publish_audit=bool(payload.get("publish_audit", True)),
+        contract_reviewer=contract_reviewer,
+        invoke_step1=lambda: None,  # CLI never invokes Step 1 itself; see module docstring
+        mode=args.mode,
+        prompt_id=args.prompt_id,
+        publish_audit=not args.no_audit,
     )
     sys.stdout.write(json.dumps(result))
     sys.stdout.write("\n")

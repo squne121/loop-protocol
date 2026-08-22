@@ -84,10 +84,11 @@ readiness を左右することはない。
 ### Entry Transition（Step 1 起動契約, #2272）
 
 Step 1 起動の実 authority は `CONTRACT_REVIEW_RESULT_V1.status: go` の telemetry
-確認だけでなく、root/main thread が同一 control flow 内で生成・消費する
-process-local `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` である（producer:
-`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`、consumer:
-`.claude/skills/impl-review-loop/scripts/preparation_entry_router.py`）。GitHub
+確認だけでなく、root/main thread が単一の継続した call stack の中で自ら実行する
+`ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` の生成・判定である
+（`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py` の
+`run_root_transition()`。root-direct 再設計、#2272。producer/consumer を別プロセスに
+分離し `invocation_token` の再提示で authorize する旧方式は撤回済み）。GitHub
 コメント上の過去 `LOOP_HANDOFF_RESULT_V1` は audit telemetry に過ぎず、単独では
 Step 1 を authorize しない。正本は
 `.claude/skills/issue-refinement-loop/references/termination-policy.md` の

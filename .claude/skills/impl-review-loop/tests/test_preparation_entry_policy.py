@@ -40,9 +40,10 @@ def test_ac9_no_conflicting_routing_rules():
         stale_heading
     )
 
-    # preparation.md must document precedence of the Root-Owned consumer
-    # section over the legacy Intake Gate for stale review handling.
-    precedence_marker = "Root-Owned Synchronous Entry Transition Consumer"
+    # preparation.md must document precedence of the Root-Owned Synchronous
+    # Entry Transition section over the legacy Intake Gate for stale review
+    # handling.
+    precedence_marker = "Root-Owned Synchronous Entry Transition"
     assert precedence_marker in preparation_text
     assert preparation_text.index(precedence_marker) < preparation_text.index(
         stale_heading

@@ -16,30 +16,35 @@ PR review の失敗など、artifact chain から独立した安全境界に限�
 
 ループ開始前に LOOP_STATE を初期化し、必要な前提を確認する。
 
-## Root-Owned Synchronous Entry Transition Consumer（ルート起点の同期エントリ遷移コンシューマ、統一 Entry Policy, #2272 正本）
+## Root-Owned Synchronous Entry Transition（ルート起点の同期エントリ遷移、統一 Entry Policy, #2272 正本、root-direct 再設計）
 
-`impl-review-loop` の Step 1 起動判断は、root/main thread が同一 control flow 内で
-生成する process-local `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1`（producer:
-`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`）を、本 skill 側の
-consumer（`.claude/skills/impl-review-loop/scripts/preparation_entry_router.py`
-`consume_root_entry_route()`）が実 consume することで確定する。詳細な routing 優先順位・
-body/base drift の区別・bounded retry・nonce 方針は
-`.claude/skills/issue-refinement-loop/references/termination-policy.md` の
-「Root-Owned Synchronous Entry Transition」節を正本として参照する。
+`impl-review-loop` の Step 1 起動判断は、root/main thread が単一の継続した control
+flow の中で完結させる（OWNER REQUEST_CHANGES
+https://github.com/squne121/loop-protocol/pull/2282#issuecomment-5371853364
+を受けた root-direct 再設計）。producer/consumer をまたぐ再提示可能な
+`invocation_token` は廃止済みで、以下は同一プロセス・同一呼び出しの中で順に実行される
+一続きの手順である（`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`
+の `run_root_transition()`）。詳細な routing 優先順位・body/base drift の区別・
+bounded retry 方針は `.claude/skills/issue-refinement-loop/references/termination-policy.md`
+の「Root-Owned Synchronous Entry Transition」節を正本として参照する。
 
-- `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1.route == invoke_impl_review_loop` かつ、
-  同一 invocation 内で発行された `invocation_token` が一致し、かつ consumer 自身の
-  独立 live 再検証（`reviewed_body_sha256` / `reviewed_base_sha` の直接比較）が
-  一致する場合にのみ Step 1 を起動する。
-- GitHub コメント上の過去 `LOOP_HANDOFF_RESULT_V1`（`status: impl_ready`）単独は
-  `invocation_token` を持たないため、consumer は常に拒否し fresh review へ差し戻す
-  （Handoff Rule: コメント再取得は audit telemetry であり、単独では実装を authorize
-  しない）。
+- root は capability preflight → live Issue fetch → 同一呼び出し内での current-run
+  `issue-contract-review`（既存 `run_once()` を関数として直接 import・呼び出し。
+  `.claude/skills/issue-contract-review/**` 自体は変更しない）→ 直後の live 再取得
+  → `decide_root_entry_route()` によるルーティング決定 → route が
+  `invoke_impl_review_loop` の場合のみ、同じ呼び出しの中で Step 1 を直接起動する、
+  という一続きの手順を実行する。`review_verdict` / `reviewed_body_sha256` /
+  `reviewed_base_sha` は呼び出し元から受け取る値ではなく、この呼び出し自身が実行した
+  current-run review と live fetch の結果から導出される。
+- GitHub コメント上の過去 `LOOP_HANDOFF_RESULT_V1`（`status: impl_ready`）は、
+  それ単独では `run_root_transition()` の入力にすらならない（同関数は route/envelope
+  を一切受理しない）。コメント再取得は audit telemetry であり、単独では実装を
+  authorize しない。
 - 下記「0. Intake Gate」で定義する優先順位付き停止理由（サブ理由）のうち、
   最高優先の理由（title prefix 欠落等）に次ぐ 2 番目の理由、すなわち陳腐化した
   契約レビュー（go コメント発行後に Issue 本文が更新された状態）を扱うサブ理由は、
-  `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` 経由で起動された invocation では
-  **終端 stop としては再適用しない**（body drift は producer 側で
+  `run_root_transition()` 経由で起動された invocation では
+  **終端 stop としては再適用しない**（body drift は `run_root_transition()` 内で
   `rerun_contract_review` route として既に処理済みのため）。同サブ理由は
   `contract_snapshot_url` が明示提供された legacy / 非 Root-routed 直接呼び出し
   経路にのみ適用される、後方互換のための限定ゲートである。

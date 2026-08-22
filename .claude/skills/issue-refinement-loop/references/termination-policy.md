@@ -485,43 +485,55 @@ route で exact base SHA を pin し、その SHA から worktree を作成す�
 drift が解消しない場合は `route: stop` / `reason: base_preflight_retry_exhausted` を
 terminal result として返す。
 
-### production carrier（送り手・受け手・呼び出し口を固定する運搬経路の定義）
+### production carrier（送り手・受け手・呼び出し口を固定する運搬経路の定義、root-direct 再設計）
+
+OWNER REQUEST_CHANGES
+（https://github.com/squne121/loop-protocol/pull/2282#issuecomment-5371853364 ）
+を受け、producer/consumer を別プロセス・別 script に分離し `invocation_token` の
+再提示で authorize する方式は撤回した。root/main thread は単一の継続した call
+stack の中で以下を自ら実行する（`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`
+の `run_root_transition()`）。
 
 ```yaml
 carrier:
-  producer: .claude/skills/issue-refinement-loop/scripts/root_entry_router.py
-  consumer: .claude/skills/impl-review-loop/scripts/preparation_entry_router.py
-  encoding: strict JSON
-  delivery: 同一プロセス内の直接関数呼出し（プロセス境界を越える場合は明示的な subprocess stdin JSON）
+  entry_point: .claude/skills/issue-refinement-loop/scripts/root_entry_router.py::run_root_transition
+  encoding: strict JSON（CLI 経由で呼ぶ場合の stdout。in-process 呼び出しの場合は plain dict）
+  delivery: 同一 call stack 内の直接関数呼出し。プロセス境界を越える必要がある場合
+    （例: root/main thread から独立した CLI 実行）も、CLI の標準出力は SAME
+    continuous turn 内で直ちに読み取られ次の判断に使われるのみで、再提示可能な
+    形で保存・再利用されない。
   forbidden:
     - GitHub comment discovery
     - ambient environment lookup
     - stale artifact lookup
     - transcript scraping
+    - re-presentable authorization token（invocation_token 相当のもの一切）
 ```
 
-producer は `route_root_implementation_entry()`、consumer は
-`consume_root_entry_route()`。プロセス境界を越える delivery が必要な場合は
-`subprocess.run(input=..., capture_output=True)` で strict JSON を stdin へ渡し、
-stdout を machine-readable result、stderr を diagnostics に分離する（両スクリプトとも
-`--fake-transport-file` 経由の CLI エントリを持ち、production 実装と同一の
-transport interface を満たす）。
+`run_root_transition()` は以下を1回の呼び出しの中で順に実行する: capability
+preflight → live Issue fetch → 同一呼び出し内での current-run
+`issue-contract-review`（既存 `run_once()` を関数として直接呼び出す。呼び出し元が
+`review_verdict` / `reviewed_body_sha256` / `reviewed_base_sha` を供給することは
+できない — これらのパラメータは公開 API に存在しない）→ 直後の live 再取得 →
+`decide_root_entry_route()` によるルーティング決定（base drift のみ、関数内部の
+ループでの bounded retry。retry_count は呼び出し元へ公開されない local state） →
+route が `invoke_impl_review_loop` の場合のみ、同じ呼び出しの中で
+`invoke_step1()` コールバックを直接実行する。
 
-### root invocation の識別（process-local nonce）
+### root invocation の識別（プロセスローカルな相関用ラベルであり認可根拠ではない）
 
 payload 内に自己申告の `root_invocation_id` を含めない。host から `prompt_id` が
-取得可能な場合は correlation に利用し（`generate_root_invocation_nonce(prompt_id)`）、
-取得不能な場合は process-local nonce を生成し root 側メモリにのみ保持する
-（`generate_root_invocation_nonce()`）。nonce を payload や audit comment から
-再取得しない。process restart 後は nonce を復元せず、常に fresh review
-（capability preflight → live fetch → current-run review）からやり直す。
+取得可能な場合は audit ログ相関にのみ利用し（`generate_root_invocation_nonce(prompt_id)`）、
+取得不能な場合は process-local nonce を生成する（`generate_root_invocation_nonce()`）。
+この nonce / prompt_id 由来の correlation id は **いかなる authorization 判断にも
+関与しない**（比較・照合されることが一切ない）。nonce を payload や audit comment
+から再取得することもない。process restart 後は nonce を復元せず、常に fresh
+review（capability preflight → live fetch → current-run review）からやり直す。
 
-consumer 側は producer が同一 invocation で発行した `invocation_token`
-（delivery-envelope metadata。固定スキーマ `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1`
-の一部ではない）が一致する場合のみ route を受理し、さらに独立した live 再検証
-（`reviewed_body_sha256` / `reviewed_base_sha` の直接比較）を行う。これにより
-GitHub コメントのみから再構成された route（`invocation_token` を持たない）や、
-process 再開後に古い route を再利用しようとする試みを拒否する。
+`ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` を受理する別 consumer は存在しない。
+GitHub コメントのみから再構成された route や、process 再開後に古い route を
+再利用しようとする試みは、`run_root_transition()` が route/envelope を一切
+外部入力として受理しない設計そのものによって構造的に不可能である。
 
 ### fingerprint の再利用範囲（AC13 の明確化）
 

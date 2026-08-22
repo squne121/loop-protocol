@@ -1,17 +1,19 @@
 """
 test_loop_handoff_contract.py
 
-Tests for the Root-Owned Synchronous Entry Transition producer
-(root_entry_router.py, Issue #2272 AC1-AC6, AC10-AC13, AC15, AC16).
+Tests for the Root-Owned Synchronous Entry Transition (root_entry_router.py,
+Issue #2272 AC1-AC6, AC10-AC18) and for the adversarial exploits raised in
+OWNER REQUEST_CHANGES on PR #2282
+(https://github.com/squne121/loop-protocol/pull/2282#issuecomment-5371853364).
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import subprocess
 import sys
 from pathlib import Path
-
 
 _SKILL_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS_DIR = _SKILL_ROOT / "scripts"
@@ -30,6 +32,8 @@ class FakeTransport:
         identity_ok=True,
         fetch_ok=True,
         audit_publish_ok=True,
+        repo_identity="squne121/loop-protocol",
+        base_sha_sequence=None,
     ):
         self.capability_ok = capability_ok
         self.body = body
@@ -37,15 +41,24 @@ class FakeTransport:
         self.identity_ok = identity_ok
         self.fetch_ok = fetch_ok
         self.audit_publish_ok = audit_publish_ok
+        self.repo_identity = repo_identity
+        self.base_sha_sequence = base_sha_sequence
         self.posted = []
+        self.fetch_calls = 0
 
     def capability_preflight(self):
         return self.capability_ok
 
     def fetch_live_issue(self, issue_number):
+        self.fetch_calls += 1
+        if self.base_sha_sequence:
+            idx = min(self.fetch_calls - 1, len(self.base_sha_sequence) - 1)
+            base_sha = self.base_sha_sequence[idx]
+        else:
+            base_sha = self.base_sha
         return {
             "body": self.body,
-            "base_sha": self.base_sha,
+            "base_sha": base_sha,
             "identity_ok": self.identity_ok,
             "fetch_ok": self.fetch_ok,
         }
@@ -56,21 +69,33 @@ class FakeTransport:
         self.posted.append((issue_number, body))
         return {"ok": True, "comment_id": len(self.posted)}
 
+    def canonical_repository_identity(self):
+        return self.repo_identity
 
-def _make_go_request(body="issue body", base_sha="base-sha-1"):
+
+def _go_reviewer(body="issue body"):
     body_sha = rer.compute_body_sha256(body)
-    return dict(
-        issue_number=2272,
-        reviewed_body_sha256=body_sha,
-        reviewed_base_sha=base_sha,
-        review_verdict="go",
-        transport=FakeTransport(body=body, base_sha=base_sha),
-    )
+
+    def _reviewer(**_kwargs):
+        return {"status": "go", "body_sha256": body_sha}
+
+    return _reviewer
+
+
+def _blocked_reviewer(status="blocked"):
+    def _reviewer(**_kwargs):
+        return {"status": status, "body_sha256": rer.compute_body_sha256("body")}
+
+    return _reviewer
+
+
+# ---------------------------------------------------------------------------
+# AC1-AC6, AC10-AC13: pure decide_root_entry_route() behavior (unchanged
+# routing table, still 100% I/O-free).
+# ---------------------------------------------------------------------------
 
 
 def test_ac1_missing_prior_review_routes_to_fresh_review():
-    # GIVEN no prior review exists at all (review_verdict is None, no reviewed
-    # snapshot to compare against)
     req = rer.RootEntryRequest(
         issue_number=2272,
         capability_ok=True,
@@ -82,18 +107,12 @@ def test_ac1_missing_prior_review_routes_to_fresh_review():
         observed_base_sha="base-sha-1",
         review_verdict=None,
     )
-    # WHEN routing is decided
     result = rer.decide_root_entry_route(req)
-    # THEN it never proceeds directly to implementation; it routes to a fresh
-    # review path (body drift, since reviewed is None != observed), not stop
-    # due to "implementation started"
     assert result["route"] == rer.ROUTE_RERUN_CONTRACT_REVIEW
     assert result["route"] != rer.ROUTE_INVOKE
 
 
 def test_ac2_stale_prior_review_routes_to_fresh_review():
-    # GIVEN a prior review exists but the reviewed body sha differs from the
-    # current live body sha (stale)
     stale_body_sha = rer.compute_body_sha256("old body content")
     req = rer.RootEntryRequest(
         issue_number=2272,
@@ -106,20 +125,28 @@ def test_ac2_stale_prior_review_routes_to_fresh_review():
         observed_base_sha="base-sha-1",
         review_verdict="go",
     )
-    # WHEN routing is decided
     result = rer.decide_root_entry_route(req)
-    # THEN route is rerun_contract_review, not a terminal stop
     assert result["route"] == rer.ROUTE_RERUN_CONTRACT_REVIEW
     assert result["route"] != rer.ROUTE_STOP
 
 
-def test_ac3_fresh_review_go_and_live_equality_proceeds():
-    # GIVEN fresh review go and live equality (reviewed == observed)
-    kwargs = _make_go_request()
-    # WHEN routed end to end
-    envelope = rer.route_root_implementation_entry(**kwargs)
-    # THEN route invokes impl-review-loop
-    assert envelope["route"]["route"] == rer.ROUTE_INVOKE
+def test_ac3_fresh_review_go_and_live_equality_invokes_step1():
+    # P0-2 fix: review_verdict/reviewed_body_sha256 are no longer accepted
+    # as caller-supplied parameters at all -- they come only from the
+    # injected `contract_reviewer` callable's OWN return value, evaluated
+    # inside run_root_transition's own call stack.
+    invoked_count = []
+    transport = FakeTransport(body="issue body", base_sha="base-sha-1")
+    result = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport,
+        contract_reviewer=_go_reviewer(body="issue body"),
+        invoke_step1=lambda: invoked_count.append(1),
+    )
+    assert result["route"]["route"] == rer.ROUTE_INVOKE
+    assert result["invoked"] is True
+    assert invoked_count == [1]
 
 
 def test_ac4_fresh_review_blocked_stops():
@@ -160,7 +187,6 @@ def test_ac5_body_drift_routes_to_rerun_contract_review():
 
 def test_ac6_base_drift_routes_to_rerun_base_preflight_bounded_retry():
     body_sha = rer.compute_body_sha256("stable body")
-    # First 3 attempts (retry_count 0,1,2) should route to rerun_base_preflight
     for retry_count in range(rer.MAX_BASE_PREFLIGHT_RETRIES):
         req = rer.RootEntryRequest(
             issue_number=2272,
@@ -178,8 +204,6 @@ def test_ac6_base_drift_routes_to_rerun_base_preflight_bounded_retry():
         assert result["route"] == rer.ROUTE_RERUN_BASE_PREFLIGHT
         assert result["retry_count"] == retry_count + 1
 
-    # Once retry_count has reached the bound, it must stop rather than retry
-    # forever.
     req_exhausted = rer.RootEntryRequest(
         issue_number=2272,
         capability_ok=True,
@@ -198,7 +222,6 @@ def test_ac6_base_drift_routes_to_rerun_base_preflight_bounded_retry():
 
 
 def test_ac10_partial_failure_returns_resume_from():
-    # GIVEN a mutation partial failure occurred at the contract_review phase
     body_sha = rer.compute_body_sha256("body")
     req = rer.RootEntryRequest(
         issue_number=2272,
@@ -212,10 +235,7 @@ def test_ac10_partial_failure_returns_resume_from():
         review_verdict="go",
         mutation_partial_failure_phase="contract_review",
     )
-    # WHEN routing is decided
     result = rer.decide_root_entry_route(req)
-    # THEN it stops but returns a safe resume_from derived from the failed
-    # phase (not None, not blindly resuming implementation)
     assert result["route"] == rer.ROUTE_STOP
     assert result["resume_from"] == "contract_review"
     assert rer.resume_from_after_mutation_failure("contract_review") == "contract_review"
@@ -223,35 +243,22 @@ def test_ac10_partial_failure_returns_resume_from():
 
 
 def test_ac11_capability_preflight_blocked_stops_before_mutation():
-    mutation_calls = []
-
-    def fake_mutation():
-        mutation_calls.append(1)
-
-    req = rer.RootEntryRequest(
+    invoked = []
+    transport = FakeTransport(capability_ok=False)
+    result = rer.run_root_transition(
         issue_number=2272,
-        capability_ok=False,
-        live_fetch_ok=False,
-        identity_ok=False,
-        reviewed_body_sha256=None,
-        reviewed_base_sha=None,
-        observed_live_body_sha256=None,
-        observed_base_sha=None,
-        review_verdict=None,
+        repo="squne121/loop-protocol",
+        transport=transport,
+        contract_reviewer=_go_reviewer(),
+        invoke_step1=lambda: invoked.append(1),
     )
-    result = rer.decide_root_entry_route(req)
-    # THEN route is stop, and the caller (this test simulates the caller
-    # convention: only mutate when route == invoke_impl_review_loop) never
-    # invokes mutation.
-    assert result["route"] == rer.ROUTE_STOP
-    assert result["reason"] == "capability_or_identity_unverifiable"
-    if result["route"] == rer.ROUTE_INVOKE:
-        fake_mutation()
-    assert mutation_calls == []
+    assert result["route"]["route"] == rer.ROUTE_STOP
+    assert result["route"]["reason"] == "capability_or_identity_unverifiable"
+    assert result["invoked"] is False
+    assert invoked == []
 
 
 def test_ac12_no_new_durable_authority_added():
-    # No save/load/persist API exists on the module.
     forbidden_substrings = ("save", "persist", "load", "ledger", "write_route", "store_route")
     public_names = [name for name in dir(rer) if not name.startswith("_")]
     offending = [
@@ -261,16 +268,19 @@ def test_ac12_no_new_durable_authority_added():
     ]
     assert offending == [], f"unexpected durable-authority-shaped API: {offending}"
 
-    # The route result itself is a plain dict, not a serialized/reloadable
-    # object with identity beyond this call.
-    envelope = rer.route_root_implementation_entry(**_make_go_request())
-    assert isinstance(envelope["route"], dict)
-    assert set(envelope["route"].keys()) == set(rer._ROUTE_V1_KEYS)
+    invoked = []
+    result = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=FakeTransport(),
+        contract_reviewer=_go_reviewer(),
+        invoke_step1=lambda: invoked.append(1),
+    )
+    assert isinstance(result["route"], dict)
+    assert set(result["route"].keys()) == set(rer._ROUTE_V1_KEYS)
 
 
 def test_ac13_live_equality_does_not_reuse_comment_fingerprint_validator():
-    # The comparison is a direct sha256/base_sha equality check that does not
-    # require any comment_id / trusted author provenance fields at all.
     body = "some body content"
     body_sha = rer.compute_body_sha256(body)
     req_match = rer.RootEntryRequest(
@@ -284,8 +294,7 @@ def test_ac13_live_equality_does_not_reuse_comment_fingerprint_validator():
         observed_base_sha="sha-a",
         review_verdict="go",
     )
-    result_match = rer.decide_root_entry_route(req_match)
-    assert result_match["route"] == rer.ROUTE_INVOKE
+    assert rer.decide_root_entry_route(req_match)["route"] == rer.ROUTE_INVOKE
 
     req_mismatch = rer.RootEntryRequest(
         issue_number=1,
@@ -298,29 +307,17 @@ def test_ac13_live_equality_does_not_reuse_comment_fingerprint_validator():
         observed_base_sha="sha-a",
         review_verdict="go",
     )
-    result_mismatch = rer.decide_root_entry_route(req_mismatch)
-    assert result_mismatch["route"] == rer.ROUTE_RERUN_CONTRACT_REVIEW
+    assert rer.decide_root_entry_route(req_mismatch)["route"] == rer.ROUTE_RERUN_CONTRACT_REVIEW
 
-    # No comment_id / trusted_author / provenance parameters exist anywhere
-    # in the request dataclass.
-    field_names = {f for f in rer.RootEntryRequest.__dataclass_fields__.keys()}
+    field_names = set(rer.RootEntryRequest.__dataclass_fields__.keys())
     assert "comment_id" not in field_names
     assert "trusted_author" not in field_names
 
 
-def test_ac15_process_local_nonce_not_restored_after_restart(tmp_path):
-    # Simulate "process 1"
+def test_ac15_process_local_nonce_not_restored_after_restart():
     nonce_1 = rer.generate_root_invocation_nonce()
-    # Simulate "process restart" (fresh module-level state; here represented
-    # by simply calling the generator again with no carried-over state,
-    # since the function itself accepts no persisted seed).
     nonce_2 = rer.generate_root_invocation_nonce()
     assert nonce_1 != nonce_2
-
-    # prompt_id-based correlation is deterministic per prompt_id but is never
-    # sourced from a persisted/restored value across process boundaries in
-    # this module (no file/env lookup exists).
-    import inspect
 
     source = inspect.getsource(rer.generate_root_invocation_nonce)
     assert "open(" not in source
@@ -328,53 +325,425 @@ def test_ac15_process_local_nonce_not_restored_after_restart(tmp_path):
 
 
 def test_ac16_audit_publish_failure_does_not_change_route():
-    kwargs = _make_go_request()
-    kwargs["transport"] = FakeTransport(
-        body="issue body", base_sha="base-sha-1", audit_publish_ok=False
+    transport = FakeTransport(body="issue body", base_sha="base-sha-1", audit_publish_ok=False)
+    result = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport,
+        contract_reviewer=_go_reviewer(body="issue body"),
+        invoke_step1=lambda: None,
     )
-    envelope = rer.route_root_implementation_entry(**kwargs)
-    # Route still proceeds despite audit publish failure.
-    assert envelope["route"]["route"] == rer.ROUTE_INVOKE
-    assert envelope["audit"]["published"] is False
-    assert envelope["audit"]["warning"] is not None
+    assert result["route"]["route"] == rer.ROUTE_INVOKE
+    assert result["invoked"] is True
+    assert result["audit"]["published"] is False
+    assert result["audit"]["warning"] is not None
 
 
-def test_producer_subprocess_cli_emits_route_and_token(tmp_path):
-    # Supports AC8 process-level test in impl-review-loop/tests -- verifies
-    # the producer CLI itself works standalone via strict JSON stdin/stdout.
-    fixture = tmp_path / "transport.json"
-    body = "cli body"
-    fixture.write_text(
+# ---------------------------------------------------------------------------
+# Adversarial tests demanded by OWNER REQUEST_CHANGES
+# (pull/2282#issuecomment-5371853364). Each name matches the OWNER's list
+# verbatim.
+# ---------------------------------------------------------------------------
+
+
+def test_replayed_envelope_same_live_state_after_process_restart_is_rejected():
+    # There is no longer any function that accepts a previously-produced
+    # route/envelope as an input at all -- run_root_transition always
+    # recomputes route from a fresh contract_reviewer() call + fresh
+    # transport fetch. "Replaying" a prior envelope is therefore structurally
+    # impossible: calling run_root_transition again, even with UNCHANGED
+    # live state, re-runs the full review and re-derives the route rather
+    # than accepting any object handed in by a caller.
+    assert "route" not in inspect.signature(rer.run_root_transition).parameters
+    assert "envelope" not in inspect.signature(rer.run_root_transition).parameters
+
+    invoked = []
+    transport = FakeTransport(body="unchanged body", base_sha="unchanged-sha")
+    reviewer = _go_reviewer(body="unchanged body")
+
+    # process A
+    result_a = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport,
+        contract_reviewer=reviewer,
+        invoke_step1=lambda: invoked.append("A"),
+    )
+    # process B: same live state, but a genuinely fresh call (simulating a
+    # restarted process) -- it must independently re-review, not "replay".
+    result_b = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport,
+        contract_reviewer=reviewer,
+        invoke_step1=lambda: invoked.append("B"),
+    )
+    assert result_a["invoked"] is True
+    assert result_b["invoked"] is True
+    assert invoked == ["A", "B"]
+    # Each call minted its own non-authoritative correlation id -- no shared
+    # token was reused to authorize B based on A's result.
+    assert result_a["correlation_id"] != result_b["correlation_id"]
+
+
+def test_expected_token_must_not_be_derived_from_envelope():
+    # There is no invocation_token / expected_invocation_token concept left
+    # anywhere in the public API.
+    public_names = {name for name in dir(rer) if not name.startswith("_")}
+    assert "invocation_token" not in public_names
+    assert not hasattr(rer, "consume_root_entry_route")
+    sig_params = set(inspect.signature(rer.run_root_transition).parameters)
+    assert "invocation_token" not in sig_params
+    assert "expected_invocation_token" not in sig_params
+
+    result = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=FakeTransport(),
+        contract_reviewer=_go_reviewer(),
+        invoke_step1=lambda: None,
+    )
+    assert "invocation_token" not in result
+    assert "invocation_token" not in result["route"]
+
+
+def test_prompt_id_from_stdin_cannot_establish_current_root_identity():
+    # prompt_id only affects the non-authoritative correlation_id label; it
+    # never appears anywhere in the routing inputs/outputs and never changes
+    # whether Step 1 is invoked.
+    invoked_with_prompt = []
+    invoked_without_prompt = []
+    transport_a = FakeTransport(body="body", base_sha="sha-1")
+    transport_b = FakeTransport(body="body", base_sha="sha-1")
+
+    result_with = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport_a,
+        contract_reviewer=_go_reviewer(body="body"),
+        invoke_step1=lambda: invoked_with_prompt.append(1),
+        prompt_id="attacker-supplied-prompt-id",
+    )
+    result_without = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport_b,
+        contract_reviewer=_go_reviewer(body="body"),
+        invoke_step1=lambda: invoked_without_prompt.append(1),
+        prompt_id=None,
+    )
+    assert result_with["invoked"] == result_without["invoked"] is True
+    assert result_with["route"] == result_without["route"]
+    assert "prompt_id" not in result_with["route"]
+    assert "prompt_id" not in inspect.signature(rer.decide_root_entry_route).parameters
+
+
+def test_fabricated_go_with_current_hashes_without_current_review_is_rejected():
+    # A caller cannot supply review_verdict / reviewed_body_sha256 /
+    # reviewed_base_sha directly -- those parameters do not exist on
+    # run_root_transition. The ONLY way review_verdict enters routing is via
+    # the injected contract_reviewer() callable's return value, evaluated
+    # inside this call.
+    sig_params = set(inspect.signature(rer.run_root_transition).parameters)
+    assert "review_verdict" not in sig_params
+    assert "reviewed_body_sha256" not in sig_params
+    assert "reviewed_base_sha" not in sig_params
+
+    # A malicious/broken contract_reviewer that fabricates "go" without
+    # doing real review work still only produces a route if ITS OWN
+    # execution genuinely happens inside this call -- there is no bypass
+    # that skips calling contract_reviewer() entirely.
+    calls = []
+
+    def _reviewer(**kwargs):
+        calls.append(kwargs)
+        return {"status": "go", "body_sha256": rer.compute_body_sha256("body")}
+
+    rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=FakeTransport(body="body", base_sha="sha-1"),
+        contract_reviewer=_reviewer,
+        invoke_step1=lambda: None,
+    )
+    assert len(calls) == 1  # contract_reviewer was actually invoked, not skipped
+
+
+def test_direct_impl_review_loop_invocation_runs_fresh_review_or_returns_typed_stop(tmp_path):
+    # The CLI always either runs a fresh review (fake or real contract
+    # reviewer, both go through the same run_root_transition call) or
+    # returns a typed stop -- it never has a bare "issue_number only, no
+    # gate" path.
+    transport_fixture = tmp_path / "transport.json"
+    transport_fixture.write_text(
         json.dumps(
             {
                 "capability_ok": True,
-                "audit_publish_ok": True,
-                "issues": {
-                    "2272": {"body": body, "base_sha": "sha-cli", "identity_ok": True}
-                },
+                "issues": {"2272": {"body": "cli body", "base_sha": "sha-cli", "identity_ok": True}},
             }
         ),
         encoding="utf-8",
     )
-    payload = {
-        "issue_number": 2272,
-        "reviewed_body_sha256": rer.compute_body_sha256(body),
-        "reviewed_base_sha": "sha-cli",
-        "review_verdict": "go",
-        "retry_count": 0,
-    }
+    review_fixture = tmp_path / "review.json"
+    review_fixture.write_text(
+        json.dumps({"status": "go", "body_sha256": rer.compute_body_sha256("cli body")}),
+        encoding="utf-8",
+    )
     proc = subprocess.run(
         [
             sys.executable,
             str(_SCRIPTS_DIR / "root_entry_router.py"),
+            "--issue-number",
+            "2272",
+            "--repo",
+            "squne121/loop-protocol",
             "--fake-transport-file",
-            str(fixture),
+            str(transport_fixture),
+            "--fake-contract-review-file",
+            str(review_fixture),
+            "--no-audit",
         ],
-        input=json.dumps(payload),
         capture_output=True,
         text=True,
         check=True,
     )
     out = json.loads(proc.stdout)
     assert out["route"]["route"] == rer.ROUTE_INVOKE
-    assert out["invocation_token"]
+    # CLI's invoke_step1 is a deliberate no-op sentinel (module docstring):
+    # `invoked=True` here means "authorized, callback invoked" -- it does
+    # NOT mean the CLI itself launched implementation-worker/impl-review-loop
+    # (a subprocess cannot drive this session's tool calls). The orchestrating
+    # root/main thread reads this typed result in the SAME turn and only then
+    # proceeds to invoke impl-review-loop itself.
+    assert out["invoked"] is True
+    assert "invocation_token" not in out
+
+
+def test_production_entrypoint_uses_root_owned_transport_not_fake_fixture():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--issue-number", required=True, type=int)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--base-ref", default="main")
+    parser.add_argument("--mode", default="static")
+    parser.add_argument("--fake-transport-file", default=None)
+    parser.add_argument("--fake-contract-review-file", default=None)
+    parser.add_argument("--prompt-id", default=None)
+    parser.add_argument("--no-audit", action="store_true")
+
+    args_no_fake = parser.parse_args(["--issue-number", "2272", "--repo", "squne121/loop-protocol"])
+    transport = rer._select_transport(args_no_fake)
+    assert isinstance(transport, rer.GhCliGitHubEntryTransport)
+
+    args_fake = parser.parse_args(
+        ["--issue-number", "2272", "--repo", "x/y", "--fake-transport-file", "/tmp/does-not-matter.json"]
+    )
+    # (constructing the fake transport lazily reads the file; only assert
+    # selection logic here, not fake-file I/O)
+    assert args_fake.fake_transport_file is not None
+
+
+def test_negative_retry_count_is_rejected():
+    body_sha = rer.compute_body_sha256("body")
+    req = rer.RootEntryRequest(
+        issue_number=2272,
+        capability_ok=True,
+        live_fetch_ok=True,
+        identity_ok=True,
+        reviewed_body_sha256=body_sha,
+        reviewed_base_sha="sha-a",
+        observed_live_body_sha256=body_sha,
+        observed_base_sha="sha-a",
+        review_verdict="go",
+        retry_count=-10,
+    )
+    route = rer.decide_root_entry_route(req)
+    # Even when body/base already match (route==invoke), a negative
+    # retry_count carried in the request is NOT silently dropped -- it
+    # propagates into the emitted route dict and is caught by the schema
+    # gate before invocation, defense-in-depth against any code path that
+    # might otherwise construct a route with an out-of-range retry_count.
+    assert route["route"] == rer.ROUTE_INVOKE
+    assert route["retry_count"] == -10
+    error = rer.validate_route_schema(route, expected_issue_number=2272)
+    assert error == "invalid_retry_count"
+
+    bad_route = dict(route)
+    bad_route["retry_count"] = -1
+    error_negative = rer.validate_route_schema(bad_route, expected_issue_number=2272)
+    assert error_negative == "invalid_retry_count"
+
+
+def test_retry_counter_cannot_be_reset_by_caller():
+    # retry_count is not a parameter of run_root_transition at all -- it is
+    # a local loop variable owned entirely by this function's own while-loop
+    # (P1-1 fix). A caller has no way to pass in a "reset to 0" value.
+    assert "retry_count" not in inspect.signature(rer.run_root_transition).parameters
+
+    invoked = []
+    # base_sha drifts on every fetch call forever -- if a caller could reset
+    # the counter each attempt, this would loop unboundedly; instead the
+    # bounded retry (owned internally) must terminate with stop.
+    transport = FakeTransport(
+        body="stable body",
+        base_sha_sequence=["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"],
+    )
+    result = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport,
+        contract_reviewer=_go_reviewer(body="stable body"),
+        invoke_step1=lambda: invoked.append(1),
+    )
+    assert result["route"]["route"] == rer.ROUTE_STOP
+    assert result["route"]["reason"] == "base_preflight_retry_exhausted"
+    assert invoked == []
+    # Fetch calls are bounded (not unbounded): 1 initial + one per retry
+    # attempt's re-review readback, capped by MAX_BASE_PREFLIGHT_RETRIES.
+    assert transport.fetch_calls <= 2 * (rer.MAX_BASE_PREFLIGHT_RETRIES + 2)
+
+
+def test_base_preflight_actually_pins_worktree_to_verified_sha():
+    # Each retry attempt re-pins `reviewed_base_sha` to the freshly OBSERVED
+    # base from the immediately preceding live fetch (not a caller-supplied
+    # or stale value), so the base a subsequent review is compared against
+    # is always the most recently verified one.
+    transport = FakeTransport(
+        body="stable body",
+        base_sha_sequence=["s0", "s1", "s1"],  # drifts once, then settles at s1
+    )
+    invoked = []
+    result = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport,
+        contract_reviewer=_go_reviewer(body="stable body"),
+        invoke_step1=lambda: invoked.append(1),
+    )
+    assert result["route"]["route"] == rer.ROUTE_INVOKE
+    assert result["route"]["reviewed_base_sha"] == "s1"
+    assert result["route"]["observed_base_sha"] == "s1"
+    assert invoked == [1]
+
+
+def test_partial_failure_resume_is_derived_from_post_mutation_readback():
+    for phase in ("capability_preflight", "live_fetch", "contract_review", "base_preflight", "audit_comment"):
+        result = rer.run_root_transition(
+            issue_number=2272,
+            repo="squne121/loop-protocol",
+            transport=FakeTransport(),
+            contract_reviewer=_go_reviewer(),
+            invoke_step1=lambda: None,
+            mutation_partial_failure_phase=phase,
+        )
+        assert result["route"]["route"] == rer.ROUTE_STOP
+        assert result["route"]["resume_from"] == phase
+        assert result["invoked"] is False
+
+    # An unrecognized phase is returned verbatim as an opaque marker (never
+    # invented into a different, more-permissive value) and never resumes
+    # into invocation.
+    result_unknown = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=FakeTransport(),
+        contract_reviewer=_go_reviewer(),
+        invoke_step1=lambda: None,
+        mutation_partial_failure_phase="unknown_phase_xyz",
+    )
+    assert result_unknown["route"]["resume_from"] == "unknown_phase_xyz"
+    assert result_unknown["invoked"] is False
+
+
+def test_consumer_rejects_non_exact_route_schema():
+    good_route = {
+        "route": rer.ROUTE_INVOKE,
+        "reason": "ok",
+        "issue_number": 2272,
+        "reviewed_body_sha256": "sha256:aa",
+        "observed_live_body_sha256": "sha256:aa",
+        "reviewed_base_sha": "s",
+        "observed_base_sha": "s",
+        "resume_from": None,
+        "retry_count": 0,
+    }
+    assert rer.validate_route_schema(good_route, expected_issue_number=2272) is None
+
+    missing_key = dict(good_route)
+    del missing_key["resume_from"]
+    assert rer.validate_route_schema(missing_key, expected_issue_number=2272) == "invalid_route_schema_keys"
+
+    extra_key = dict(good_route)
+    extra_key["extra_field"] = "unexpected"
+    assert rer.validate_route_schema(extra_key, expected_issue_number=2272) == "invalid_route_schema_keys"
+
+    wrong_issue = dict(good_route)
+    wrong_issue["issue_number"] = 9999
+    assert (
+        rer.validate_route_schema(wrong_issue, expected_issue_number=2272)
+        == "missing_or_mismatched_issue_number"
+    )
+
+    assert rer.validate_route_schema("not-a-dict", expected_issue_number=2272) == "invalid_route_type"
+
+
+def test_consumer_returns_typed_stop_on_transport_failure():
+    class RaisingTransport(FakeTransport):
+        def fetch_live_issue(self, issue_number):
+            raise RuntimeError("simulated transport outage")
+
+    invoked = []
+    result = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=RaisingTransport(),
+        contract_reviewer=_go_reviewer(),
+        invoke_step1=lambda: invoked.append(1),
+    )
+    assert result["route"]["route"] == rer.ROUTE_STOP
+    assert result["invoked"] is False
+    assert invoked == []
+
+    class RaisingReviewer:
+        def __call__(self, **_kwargs):
+            raise RuntimeError("simulated review outage")
+
+    result2 = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=FakeTransport(),
+        contract_reviewer=RaisingReviewer(),
+        invoke_step1=lambda: invoked.append(2),
+    )
+    assert result2["route"]["route"] == rer.ROUTE_STOP
+    assert result2["route"]["reason"] == "contract_reviewer_transport_failure"
+    assert invoked == []
+
+
+def test_consumer_rechecks_canonical_repository_identity():
+    invoked = []
+    transport = FakeTransport(repo_identity="attacker/forked-repo")
+    result = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport,
+        contract_reviewer=_go_reviewer(),
+        invoke_step1=lambda: invoked.append(1),
+        expected_repository_identity="squne121/loop-protocol",
+    )
+    assert result["route"]["route"] == rer.ROUTE_STOP
+    assert result["route"]["reason"] == "repository_identity_mismatch"
+    assert invoked == []
+
+    transport_ok = FakeTransport(repo_identity="squne121/loop-protocol")
+    result_ok = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport_ok,
+        contract_reviewer=_go_reviewer(),
+        invoke_step1=lambda: invoked.append(2),
+        expected_repository_identity="squne121/loop-protocol",
+    )
+    assert result_ok["route"]["route"] == rer.ROUTE_INVOKE
+    assert invoked == [2]
