@@ -145,6 +145,51 @@ ISSUE_CREATE_BODY_EOF
   chmod +x "$ISSUE_CREATE_FAKE_GH" 2>/dev/null
   ISSUE_CREATE_FAKE_GH_STATE=$(mktemp -u)
 
+  # --- fix_delta（root cause: Issue #2259 コメント参照）: create-issue SKILL.md の
+  #     Step 1.5（重複チェック preflight）は `gh issue list --search ... --state open
+  #     --json ...` を issue-creator SubAgent の Bash tool から直接実行する。これは
+  #     `CLAUDE_GPT_ISSUE_CREATE_BRIDGE_GH_BIN`（issue_create_bridge_server.py 専用の
+  #     入口）を経由しないため、raw `gh` が isolation profile の credential-stripped
+  #     環境で認証失敗し、SubAgent が STATUS: failure を返して create_issue_txn.py に
+  #     到達する前に停止していた（bridge_ledger_new_entry_confirmed=false の実根本原因。
+  #     Auto Mode / classifier 拒否ではない）。launch.sh は claude 子プロセスの PATH を
+  #     env -i でリセットしないため（proxy 起動時の env -i とは別経路）、PATH 上の
+  #     "gh" 自体を差し替えることで、Step 1.5 の dedupe 検索（`gh issue list`）だけを
+  #     透過的に fake_gh.py へ到達させる。create-issue SKILL.md 自体（重複チェック
+  #     手順）は一切変更しない。
+  #
+  #     実機再検証で判明した追加の罠: この wrapper が `gh issue create` /
+  #     `gh issue edit` 等 *全ての* サブコマンドを無条件に fake_gh.py へ転送すると、
+  #     issue-creator SubAgent が `create_issue_txn.py`（= parent bridge 経由の
+  #     mutation 正本）を呼ばず、Bash tool から `gh issue create` を直接実行して
+  #     AC10 が要求する bridge 経路自体をスキップしてしまう挙動が実機観測された
+  #     （bridge ledger.jsonl の byte-size が実行前後で完全に不変のまま
+  #     independent_fake_gh_state_match_ok だけ true になるケースで検出）。
+  #     そのため、この PATH 上の wrapper は `gh issue list`（dedupe 検索専用）
+  #     *のみ* を fake_gh.py へ転送し、それ以外の全サブコマンド（`issue create` /
+  #     `issue edit` 等）は本番の credential-stripped isolation profile と同様に
+  #     認証エラーで失敗させる。これにより、SubAgent は dedupe 検索だけは実行
+  #     できるが、実際の Issue 作成 mutation は従来どおり `create_issue_txn.py`
+  #     （→ bridge client → parent bridge server → fake_gh.py フルパス、
+  #     PATH とは無関係な固定 absolute path 経由）を通らざるを得ない。
+  ISSUE_CREATE_FAKE_GH_PATH_DIR=$(mktemp -d)
+  ISSUE_CREATE_FAKE_GH_WRAPPER="$ISSUE_CREATE_FAKE_GH_PATH_DIR/gh"
+  cat > "$ISSUE_CREATE_FAKE_GH_WRAPPER" <<WRAPPER_EOF
+#!/bin/sh
+# PATH 上の "gh" 差し替え（issue-creator SubAgent の Bash tool 呼び出し専用）。
+# dedupe 検索（"gh issue list"）だけを fake_gh.py へ透過転送し、それ以外の
+# サブコマンド（issue create/edit 等の実際の mutation）は、本番の
+# credential-stripped isolation profile を模した認証エラーで拒否する。
+# create_issue_txn.py が使う実際の mutation 経路（parent bridge 経由の
+# フルパス fake_gh.py 呼び出し）はこの wrapper を経由しないため影響を受けない。
+if [ "\$1" = "issue" ] && [ "\$2" = "list" ]; then
+  exec python3 "$ISSUE_CREATE_FAKE_GH" "\$@"
+fi
+echo "gh: To use GitHub CLI in a script, set the GH_TOKEN environment variable." >&2
+exit 4
+WRAPPER_EOF
+  chmod +x "$ISSUE_CREATE_FAKE_GH_WRAPPER"
+
   # --- 独立証跡チャネル 2: hook-sink-multi-turn （既存 launch.sh 機構の再利用） ---
   ISSUE_CREATE_HOOK_SINK_NONCE="hooksink-${ISSUE_CREATE_RUN_ID}"
   ISSUE_CREATE_HOOK_SINK_PATH="$(claude_gpt_proxy_state_dir)/hook-sink-${ISSUE_CREATE_HOOK_SINK_NONCE}.jsonl"
@@ -185,6 +230,7 @@ ISSUE_CREATE_BODY_EOF
   CLAUDE_GPT_ISSUE_CREATE_BRIDGE_GH_BIN="$ISSUE_CREATE_FAKE_GH" \
   CLAUDE_GPT_RUNTIME_SMOKE_HOOKS="hook-sink-multi-turn" \
   CLAUDE_GPT_HOOK_SINK_NONCE="$ISSUE_CREATE_HOOK_SINK_NONCE" \
+  PATH="$ISSUE_CREATE_FAKE_GH_PATH_DIR:$PATH" \
     "$SCRIPT_DIR/launch.sh" -- -p "$ISSUE_CREATE_PROMPT" --output-format text --no-session-persistence \
     --allowedTools "Task" \
     >"$ISSUE_CREATE_STDOUT" 2>"$ISSUE_CREATE_STDERR"
@@ -217,6 +263,7 @@ print("null")
     fi
   fi
   rm -f "$ISSUE_CREATE_FAKE_GH_STATE"
+  rm -rf "$ISSUE_CREATE_FAKE_GH_PATH_DIR"
 
   # --- 独立証跡 (a)/(b): genuine issue-creator SubAgent の spawn/stop を
   #     hook-sink-multi-turn JSONL から確認する（root model の自己申告
