@@ -62,6 +62,7 @@ import subprocess
 import sys
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
 
 ROUTE_INVOKE = "invoke_impl_review_loop"
@@ -391,11 +392,39 @@ class GhCliGitHubEntryTransport:
     base_ref: str = "main"
 
     def capability_preflight(self) -> bool:
+        """Consume the structured ``CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1``
+        result produced by
+        ``scripts/claude-gpt/workflow_capability_preflight.py`` (Issue #2273
+        AC15), rather than a bare ``gh auth status`` boolean gate.
+        ``decision: ready`` or ``decision: degraded`` route to ``True``
+        (proceed to the fresh-review phase); ``decision: blocked`` (or any
+        invocation failure -- missing script, non-JSON stdout, non-zero
+        exit, timeout) routes to ``False`` (fail closed, matching this
+        gate's prior behavior). This call is read-only: the underlying
+        module performs no GitHub mutation of its own (Issue #2273 AC12).
+        """
+        repo_root = Path(__file__).resolve().parents[4]
+        preflight_script = (
+            repo_root / "scripts" / "claude-gpt" / "workflow_capability_preflight.py"
+        )
         try:
             proc = subprocess.run(
-                ["gh", "auth", "status"], capture_output=True, text=True, timeout=30
+                [
+                    sys.executable,
+                    str(preflight_script),
+                    "--profile",
+                    "issue-to-impl",
+                    "--repo",
+                    self.repo,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
-            return proc.returncode == 0
+            if proc.returncode != 0:
+                return False
+            result = json.loads(proc.stdout)
+            return result.get("decision") in ("ready", "degraded")
         except Exception:
             return False
 

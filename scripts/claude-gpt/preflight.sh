@@ -59,6 +59,27 @@ fi
 #   3  = claude バイナリが見つからない（環境不可）
 #   8  = auto-mode 未対応 version・readback mismatch・classifyAllShell 未反映
 #        （launcher バグまたは host 側の不備。fail-closed）
+# --workflow-profile <profile>: Issue #2273. Thin dispatcher to the Python
+# `workflow_capability_preflight.py` module, which returns the structured
+# `CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1` JSON result (trusted `uv` / Spark
+# route capability / GitHub read capability / GitHub write (mutation)
+# capability, judged separately -- see that module's docstring and the
+# Issue's `## Result Schema` section). This branch does not duplicate any
+# of that judgment logic in shell; it only forwards CLI args and the exit
+# code. A well-formed assessment (including `decision: blocked`) exits 0;
+# non-zero exit codes are reserved for invalid input / internal errors so
+# a `set -e` caller does not lose the JSON payload.
+if [ "${1:-}" = "--workflow-profile" ]; then
+  shift
+  UV_BIN_FOR_WORKFLOW_PROFILE=$(command -v uv 2>/dev/null || true)
+  if [ -z "$UV_BIN_FOR_WORKFLOW_PROFILE" ]; then
+    printf '{"schema":"CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1","profile":"%s","decision":"blocked","checks":{"uv":{"status":"trusted_uv_missing","reason":"uv_not_found"},"spark":{"status":"unavailable"},"github":{"auth":false,"repo_read":false,"operations":{}}},"reasons":["uv:not_found: uv binary not found on PATH; cannot dispatch workflow-profile preflight"]}\n' "${1:-}"
+    exit 0
+  fi
+  "$UV_BIN_FOR_WORKFLOW_PROFILE" run --locked python3 "$SCRIPT_DIR/workflow_capability_preflight.py" --profile "$@"
+  exit "$?"
+fi
+
 if [ "${1:-}" = "--auto-mode-check" ]; then
   AUTO_MODE_SETTINGS_PATH="${2:-}"
   if [ -z "$AUTO_MODE_SETTINGS_PATH" ] || [ ! -f "$AUTO_MODE_SETTINGS_PATH" ]; then
