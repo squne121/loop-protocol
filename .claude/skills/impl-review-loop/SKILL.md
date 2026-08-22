@@ -20,6 +20,26 @@ cwd/branch/HEAD/dirty state、Allowed Paths、実テスト、CI、PR review に�
 
 implementation child issue を **実装 → 検証 → PR レビュー** の 3 ステップループで自律完了させるオーケストレーター skill。各ステップを SubAgent に委譲し、メインの control-plane（state tracking + routing）に責務を限定する。
 
+## Root-Owned Synchronous Entry Transition（Step 1 起動契約, #2272 正本、root-direct 再設計）
+
+Step 1（Implementation）の起動は、root/main thread が単一の継続した invocation
+（in-process 呼び出しなら同一 call stack、CLI subprocess 経由なら同一 continuous
+turn。詳細は `issue-refinement-loop/references/termination-policy.md` の
+production carrier `delivery` 定義参照）の中で、
+capability preflight → live Issue fetch → 同一呼び出し内での current-run
+`issue-contract-review`（`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`
+の `run_root_transition()` が既存 `run_once()` を関数として直接呼び出す。
+`.claude/skills/issue-contract-review/**` 自体は変更しない）→ 直後の live 再取得
+→ routing 決定 → 条件成立時のみ同じ呼び出しの中で Step 1 を直接起動する、という
+一続きの手順を自ら実行した場合にのみ許可される。producer/consumer を跨いで
+再提示可能な `invocation_token` は撤去済みで、`ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1`
+は authorization packet ではなく非永続の process-local route result であり、
+GitHub comment・artifact・digest・invocation ID のいずれも単独では Step 1 起動を
+authorize しない（`issue-refinement-loop/references/termination-policy.md` の
+「Root-Owned Synchronous Entry Transition」節が normative SSOT）。旧
+`implementation_entry_decision`（authorization packet 型）および producer/consumer
+subprocess 分離方式（`invocation_token` による再提示）は撤回済み。
+
 ## Inputs（入力）
 
 - `issue_number`（必須）: implementation child issue 番号
