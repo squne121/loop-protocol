@@ -12,13 +12,31 @@ and `gh api graphql` (node/database id readback). Any other invocation is
 rejected with a non-zero exit so a scenario relying on unsupported `gh`
 subcommands fails closed instead of silently no-op'ing.
 
+Issue #2306 (AC2) additionally teaches this fixture: `--body`/`--body-file`
+handling on `issue create`, `repo`/`state` persistence, `gh issue view
+<number> --repo R --json fields` (used by `live_issue_create_canary.sh`
+identity verification), `gh issue list --search Q --repo R --json fields`
+title/repo-filtered fallback search, real `gh issue close` state mutation
+(instead of the previous unconditional no-op), and a normalized `calls[]`
+trace (operation / repo / primary subcommand only -- not exact argv, not
+strict ordering, not exact-count assertions).
+
+Fault-injection knobs (env vars, deterministic-test-only, never read by
+production code):
+  FAKE_GH_CLOSE_SHOULD_FAIL=1  -- `issue close` exits 1 without mutating state.
+  FAKE_GH_CLOSE_NOOP=1         -- `issue close` exits 0 but leaves state
+                                   unmutated (simulates a state-readback
+                                   mismatch after an apparently successful
+                                   close).
+
 State is persisted across invocations (each `gh` call is a fresh subprocess)
 via a JSON file at $FAKE_GH_STATE.
 
 Originally salvaged from the Issue #2259 bridge test fixture
 (`.claude/worktrees/issue-2259-isolated-issue-create-bridge/scripts/
 claude-gpt/tests/fixtures/fake_gh.py`, never merged to main) and adapted for
-the native (non-bridge) live scenario harness (Issue #2299).
+the native (non-bridge) live scenario harness (Issue #2299), then extended
+for Issue #2306.
 """
 
 from __future__ import annotations
@@ -32,12 +50,44 @@ def _load(state_path: str) -> dict:
     if os.path.exists(state_path):
         with open(state_path, encoding="utf-8") as fh:
             return json.load(fh)
-    return {"next_number": 9001, "issues": {}}
+    return {"next_number": 9001, "issues": {}, "calls": []}
 
 
 def _save(state_path: str, state: dict) -> None:
     with open(state_path, "w", encoding="utf-8") as fh:
         json.dump(state, fh)
+
+
+def _record_call(state: dict, operation: str, repo, subcommand) -> None:
+    """Append a normalized call trace entry.
+
+    Only operation / repo / the primary (non-flag) subcommand tokens are
+    recorded -- callers must not assert exact argv, exact ordering across
+    unrelated operations, or exact call counts beyond what a given test
+    explicitly sets up (Issue #2306 In Scope wording).
+    """
+    calls = state.setdefault("calls", [])
+    calls.append({"operation": operation, "repo": repo, "subcommand": subcommand})
+
+
+def _extract_flag(args, flag):
+    for i, value in enumerate(args):
+        if value == flag and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def _resolve_body(args):
+    body = _extract_flag(args, "--body")
+    if body is not None:
+        return body
+    body_file = _extract_flag(args, "--body-file")
+    if body_file is not None:
+        if body_file == "-":
+            return sys.stdin.read()
+        with open(body_file, encoding="utf-8") as fh:
+            return fh.read()
+    return None
 
 
 def main() -> int:
@@ -49,33 +99,82 @@ def main() -> int:
     state = _load(state_path)
 
     if args[:2] == ["issue", "list"]:
-        out = [
-            {"number": int(number), "title": info["title"], "url": info["url"]}
-            for number, info in state["issues"].items()
-        ]
+        repo = _extract_flag(args, "--repo")
+        search = _extract_flag(args, "--search")
+        _record_call(state, "issue_list", repo, ["issue", "list"])
+        _save(state_path, state)
+        out = []
+        for number, info in state["issues"].items():
+            if repo is not None and info.get("repo") != repo:
+                continue
+            if search and search not in info.get("title", ""):
+                continue
+            out.append(
+                {
+                    "number": int(number),
+                    "title": info["title"],
+                    "url": info["url"],
+                    "body": info.get("body", ""),
+                    "state": info.get("state", "open"),
+                }
+            )
         print(json.dumps(out))
         return 0
 
     if args[:2] == ["issue", "create"]:
-        title = None
-        repo = None
-        for i, value in enumerate(args):
-            if value == "--title":
-                title = args[i + 1]
-            if value == "--repo":
-                repo = args[i + 1]
+        title = _extract_flag(args, "--title")
+        repo = _extract_flag(args, "--repo")
+        body = _resolve_body(args) or ""
         number = state["next_number"]
         state["next_number"] += 1
         url = f"https://github.com/{repo}/issues/{number}"
-        state["issues"][str(number)] = {"title": title, "url": url}
+        state["issues"][str(number)] = {
+            "title": title,
+            "url": url,
+            "repo": repo,
+            "body": body,
+            "state": "open",
+        }
+        _record_call(state, "issue_create", repo, ["issue", "create"])
         _save(state_path, state)
         print(url)
         return 0
 
+    if args[:2] == ["issue", "view"]:
+        number = args[2] if len(args) > 2 and not args[2].startswith("-") else None
+        repo = _extract_flag(args, "--repo")
+        _record_call(state, "issue_view", repo, ["issue", "view"])
+        _save(state_path, state)
+        info = state["issues"].get(str(number)) if number else None
+        if info is None or (repo is not None and info.get("repo") != repo):
+            print(f"no issue found for number {number}", file=sys.stderr)
+            return 1
+        payload = {
+            "number": int(number),
+            "title": info.get("title"),
+            "url": info.get("url"),
+            "body": info.get("body", ""),
+            "state": info.get("state", "open"),
+        }
+        print(json.dumps(payload))
+        return 0
+
     if args[:2] == ["issue", "close"]:
-        # accepted no-op (scenario harnesses that clean up disposable issues
-        # by number use this; state is left untouched since it's a fake
-        # provider, not real GitHub).
+        number = args[2] if len(args) > 2 and not args[2].startswith("-") else None
+        repo = _extract_flag(args, "--repo")
+        _record_call(state, "issue_close", repo, ["issue", "close"])
+        if os.environ.get("FAKE_GH_CLOSE_SHOULD_FAIL") == "1":
+            _save(state_path, state)
+            print("fake gh: forced issue close failure", file=sys.stderr)
+            return 1
+        info = state["issues"].get(str(number)) if number else None
+        if info is None or (repo is not None and info.get("repo") != repo):
+            _save(state_path, state)
+            print(f"no issue found for number {number}", file=sys.stderr)
+            return 1
+        if os.environ.get("FAKE_GH_CLOSE_NOOP") != "1":
+            info["state"] = "closed"
+        _save(state_path, state)
         return 0
 
     if args[:2] == ["api", "graphql"]:
