@@ -67,7 +67,7 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/semantic_re
 `.claude/artifacts/issue-refinement-loop/<issue>/<invocation_id>/semantic_review_result.json`
 へ保存し、`transport_status: ok` を返す。
 
-## 4. Join
+## 4. Join（結果の統合）
 
 ```bash
 uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/join_review_results.py \
