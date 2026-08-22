@@ -138,55 +138,88 @@ fi
 # exists there with the expected title), never by asserting a specific hop
 # chain (bridge/MCP) was used -- that mechanism does not exist in this
 # repository (Issue #2259/PR #2286 were closed NOT_PLANNED).
+#
+# Issue #2299 fix_delta (2026-08-22, AC5 flakiness investigation): live
+# reproduction (5 consecutive runs at a clean head) showed 1 FAIL out of 5,
+# with `launch_exit_code: 0` but `readback_confirmed: false`. The preserved
+# stdout of the failing run showed the genuine issue-creator SubAgent itself
+# reporting a permission denial while attempting the create-issue mutation
+# (e.g. "GitHub Issue 作成の外部書き込み権限が拒否されました") -- i.e. the
+# outer `claude -p` process completed cleanly, but the launched Claude Code
+# runtime's own tool-permission engine (under `--permission-mode auto`, the
+# non-interactive headless mode this launcher always uses) intermittently
+# required confirmation for the SubAgent's mutation Bash call and auto-denied
+# it in the absence of a human to ask. This is the same class of real,
+# backend-side non-determinism already documented and handled below for the
+# Bash/SubAgent marker canaries (see the `bash_attempt`/`subagent_attempt`
+# bounded-retry loops later in this file, and their 2026-08-14/2026-08-16
+# live-observation notes) -- NOT a bug in this script's own logic, the fake
+# gh fixture, or create_issue_txn.py. Per that same precedent, this scenario
+# now performs a bounded retry (max 3 attempts) of the FULL create+launch+
+# readback cycle, generating a fresh nonce/title/state file each attempt (so
+# a retried attempt can never be confused with a stale one), and only retries
+# when readback is NOT confirmed -- it never masks a genuine, reproducible
+# failure by silently discarding it: every attempt's outcome is recorded in
+# `attempts[]` in the evidence file, and the final `status`/`attempt_count`
+# honestly reflect how many tries were needed (attempt_count > 1 means real,
+# disclosed flakiness was encountered and retried, never hidden).
+SCENARIO_MAX_ATTEMPTS=3
 if [ "$SCENARIO" = "issue_create" ]; then
-  SCENARIO_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d " \n")
-  if [ -z "$SCENARIO_NONCE" ]; then
-    SCENARIO_NONCE="$$_${TIMESTAMP}"
-  fi
-  SCENARIO_TITLE="[fake-gh-smoke-${SCENARIO_NONCE}] issue_create scenario canary"
-  SCENARIO_STATE_FILE=$(mktemp)
-  printf '%s' '{"next_number": 1, "issues": {}}' > "$SCENARIO_STATE_FILE"
-  SCENARIO_FAKE_GH_DIR=$(mktemp -d)
-  # Use the CANONICAL fixture (not the thin forwarder) -- the forwarder resolves
-  # its target via a fixed __file__-relative path that breaks once copied out of
-  # its original tree location.
-  cp "$SCRIPT_DIR/../../.claude/skills/create-issue/tests/fixtures/fake_gh.py" "$SCENARIO_FAKE_GH_DIR/gh"
-  chmod +x "$SCENARIO_FAKE_GH_DIR/gh"
-
-  SCENARIO_BODY_FILE=$(mktemp)
-  {
-    printf '%s\n' "Disposable fake-provider canary body created by runtime_smoke_test.sh"
-    printf '%s\n' "--scenario issue_create (Issue #2299 AC2/AC5). Not a real GitHub Issue --"
-    printf '%s\n' "created against the fake gh provider fixture only."
-    printf '\n'
-    printf '%s\n' "## Acceptance Criteria"
-    printf '%s\n' "- [ ] AC1: disposable fake-provider canary issue"
-    printf '\n'
-    printf '%s\n' "## Verification Commands"
-    printf '%s\n' '```bash'
-    printf '%s\n' "# AC1"
-    printf '%s\n' '$ echo ok'
-    printf '%s\n' '```'
-    printf '\n'
-    printf '%s\n' "## Allowed Paths"
-    printf '%s\n' "- scripts/claude-gpt/runtime_smoke_test.sh"
-  } > "$SCENARIO_BODY_FILE"
-
-  SCENARIO_PROMPT="Use the Task tool to invoke the issue-creator SubAgent (subagent_type: issue-creator). Ask it to run the normal create-issue skill procedure (dedupe read, then create_issue_txn.py, then authoritative readback) to create exactly one Issue in repo squne121/loop-protocol with title exactly: ${SCENARIO_TITLE} and with the body read verbatim from the file ${SCENARIO_BODY_FILE}. Do not create any issue via any other path. Report back only whether the SubAgent reported success or failure."
-
-  SCENARIO_STDOUT=$(mktemp)
-  SCENARIO_STDERR=$(mktemp)
-  PATH="$SCENARIO_FAKE_GH_DIR:$PATH" FAKE_GH_STATE_FILE="$SCENARIO_STATE_FILE" \
-    "$SCRIPT_DIR/launch.sh" -- -p "$SCENARIO_PROMPT" --output-format text --no-session-persistence \
-    >"$SCENARIO_STDOUT" 2>"$SCENARIO_STDERR"
-  SCENARIO_LAUNCH_RC=$?
-
-  # Authoritative readback: independent of whatever the launched session
-  # self-reports, inspect the fake provider's own state file directly.
+  SCENARIO_ATTEMPTS_JSON="[]"
+  SCENARIO_ATTEMPT=0
   SCENARIO_READBACK_OK=false
   SCENARIO_READBACK_ISSUE_NUMBER="null"
-  if [ -f "$SCENARIO_STATE_FILE" ]; then
-    SCENARIO_READBACK_JSON=$(uv run --locked python3 - "$SCENARIO_STATE_FILE" "$SCENARIO_TITLE" <<'SCENARIO_READBACK_PY'
+  while [ "$SCENARIO_ATTEMPT" -lt "$SCENARIO_MAX_ATTEMPTS" ] && [ "$SCENARIO_READBACK_OK" != "true" ]; do
+    SCENARIO_ATTEMPT=$((SCENARIO_ATTEMPT + 1))
+
+    SCENARIO_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d " \n")
+    if [ -z "$SCENARIO_NONCE" ]; then
+      SCENARIO_NONCE="$$_${TIMESTAMP}_${SCENARIO_ATTEMPT}"
+    fi
+    SCENARIO_TITLE="[fake-gh-smoke-${SCENARIO_NONCE}] issue_create scenario canary"
+    SCENARIO_STATE_FILE=$(mktemp)
+    printf '%s' '{"next_number": 1, "issues": {}}' > "$SCENARIO_STATE_FILE"
+    SCENARIO_FAKE_GH_DIR=$(mktemp -d)
+    # Use the CANONICAL fixture (not the thin forwarder) -- the forwarder resolves
+    # its target via a fixed __file__-relative path that breaks once copied out of
+    # its original tree location.
+    cp "$SCRIPT_DIR/../../.claude/skills/create-issue/tests/fixtures/fake_gh.py" "$SCENARIO_FAKE_GH_DIR/gh"
+    chmod +x "$SCENARIO_FAKE_GH_DIR/gh"
+
+    SCENARIO_BODY_FILE=$(mktemp)
+    {
+      printf '%s\n' "Disposable fake-provider canary body created by runtime_smoke_test.sh"
+      printf '%s\n' "--scenario issue_create (Issue #2299 AC2/AC5). Not a real GitHub Issue --"
+      printf '%s\n' "created against the fake gh provider fixture only."
+      printf '\n'
+      printf '%s\n' "## Acceptance Criteria"
+      printf '%s\n' "- [ ] AC1: disposable fake-provider canary issue"
+      printf '\n'
+      printf '%s\n' "## Verification Commands"
+      printf '%s\n' '```bash'
+      printf '%s\n' "# AC1"
+      printf '%s\n' '$ echo ok'
+      printf '%s\n' '```'
+      printf '\n'
+      printf '%s\n' "## Allowed Paths"
+      printf '%s\n' "- scripts/claude-gpt/runtime_smoke_test.sh"
+    } > "$SCENARIO_BODY_FILE"
+
+    SCENARIO_PROMPT="Use the Task tool to invoke the issue-creator SubAgent (subagent_type: issue-creator). Ask it to run the normal create-issue skill procedure (dedupe read, then create_issue_txn.py, then authoritative readback) to create exactly one Issue in repo squne121/loop-protocol with title exactly: ${SCENARIO_TITLE} and with the body read verbatim from the file ${SCENARIO_BODY_FILE}. Do not create any issue via any other path. Report back only whether the SubAgent reported success or failure."
+
+    SCENARIO_STDOUT=$(mktemp)
+    SCENARIO_STDERR=$(mktemp)
+    PATH="$SCENARIO_FAKE_GH_DIR:$PATH" FAKE_GH_STATE_FILE="$SCENARIO_STATE_FILE" \
+      "$SCRIPT_DIR/launch.sh" -- -p "$SCENARIO_PROMPT" --output-format text --no-session-persistence \
+      >"$SCENARIO_STDOUT" 2>"$SCENARIO_STDERR"
+    SCENARIO_LAUNCH_RC=$?
+
+    # Authoritative readback: independent of whatever the launched session
+    # self-reports, inspect the fake provider's own state file directly.
+    SCENARIO_READBACK_OK=false
+    SCENARIO_READBACK_ISSUE_NUMBER="null"
+    if [ -f "$SCENARIO_STATE_FILE" ]; then
+      SCENARIO_READBACK_JSON=$(uv run --locked python3 - "$SCENARIO_STATE_FILE" "$SCENARIO_TITLE" <<'SCENARIO_READBACK_PY'
 import json, sys
 state_path, expected_title = sys.argv[1], sys.argv[2]
 try:
@@ -201,10 +234,28 @@ for issue in state.get("issues", {}).values():
         raise SystemExit(0)
 print("false null")
 SCENARIO_READBACK_PY
-    )
-    SCENARIO_READBACK_OK=$(echo "$SCENARIO_READBACK_JSON" | awk '{print $1}')
-    SCENARIO_READBACK_ISSUE_NUMBER=$(echo "$SCENARIO_READBACK_JSON" | awk '{print $2}')
-  fi
+      )
+      SCENARIO_READBACK_OK=$(echo "$SCENARIO_READBACK_JSON" | awk '{print $1}')
+      SCENARIO_READBACK_ISSUE_NUMBER=$(echo "$SCENARIO_READBACK_JSON" | awk '{print $2}')
+    fi
+
+    SCENARIO_ATTEMPT_STDOUT_TAIL=$(tail -c 2000 "$SCENARIO_STDOUT" 2>/dev/null | uv run --locked python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+    SCENARIO_ATTEMPTS_JSON=$(uv run --locked python3 -c '
+import json, sys
+attempts = json.loads(sys.argv[1])
+attempts.append({
+    "attempt": int(sys.argv[2]),
+    "launch_exit_code": int(sys.argv[3]),
+    "readback_confirmed": sys.argv[4] == "true",
+    "readback_issue_number": None if sys.argv[5] == "null" else int(sys.argv[5]),
+    "stdout_tail": json.loads(sys.argv[6]),
+})
+print(json.dumps(attempts))
+' "$SCENARIO_ATTEMPTS_JSON" "$SCENARIO_ATTEMPT" "$SCENARIO_LAUNCH_RC" "$SCENARIO_READBACK_OK" "$SCENARIO_READBACK_ISSUE_NUMBER" "$SCENARIO_ATTEMPT_STDOUT_TAIL")
+
+    rm -f "$SCENARIO_STATE_FILE" "$SCENARIO_BODY_FILE" "$SCENARIO_STDOUT" "$SCENARIO_STDERR" 2>/dev/null || true
+    rm -rf "$SCENARIO_FAKE_GH_DIR" 2>/dev/null || true
+  done
 
   SCENARIO_EVIDENCE_FILE="${EVIDENCE_DIR}/smoke-issue_create-${TIMESTAMP}.json"
   if [ "$SCENARIO_READBACK_OK" = "true" ]; then
@@ -215,12 +266,12 @@ SCENARIO_READBACK_PY
     SCENARIO_EXIT=1
   fi
   SCENARIO_TITLE_JSON=$(uv run --locked python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$SCENARIO_TITLE")
-  printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","scenario":"issue_create","status":"%s","launch_exit_code":%s,"expected_title":%s,"readback_confirmed":%s,"readback_issue_number":%s,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","lib_sh_sha256":"%s","runtime_smoke_sha256":"%s"}}\n' \
+  printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","scenario":"issue_create","status":"%s","launch_exit_code":%s,"expected_title":%s,"readback_confirmed":%s,"readback_issue_number":%s,"attempt_count":%s,"max_attempts":%s,"attempts":%s,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","lib_sh_sha256":"%s","runtime_smoke_sha256":"%s"}}\n' \
     "$SCENARIO_STATUS" "$SCENARIO_LAUNCH_RC" "$SCENARIO_TITLE_JSON" "$SCENARIO_READBACK_OK" "$SCENARIO_READBACK_ISSUE_NUMBER" \
+    "$SCENARIO_ATTEMPT" "$SCENARIO_MAX_ATTEMPTS" "$SCENARIO_ATTEMPTS_JSON" \
     "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
     > "$SCENARIO_EVIDENCE_FILE"
-  echo "issue_create scenario: status=${SCENARIO_STATUS} readback_confirmed=${SCENARIO_READBACK_OK} evidence=${SCENARIO_EVIDENCE_FILE}" >&2
-  rm -rf "$SCENARIO_FAKE_GH_DIR" "$SCENARIO_STATE_FILE" "$SCENARIO_BODY_FILE" "$SCENARIO_STDOUT" "$SCENARIO_STDERR" 2>/dev/null || true
+  echo "issue_create scenario: status=${SCENARIO_STATUS} readback_confirmed=${SCENARIO_READBACK_OK} attempt_count=${SCENARIO_ATTEMPT}/${SCENARIO_MAX_ATTEMPTS} evidence=${SCENARIO_EVIDENCE_FILE}" >&2
   exit "$SCENARIO_EXIT"
 fi
 
