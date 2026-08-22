@@ -21,7 +21,7 @@
   `build_finding_sets` / `run_evaluation` が observer wave の `EvidenceBundle`（strict schema
   validation 済み）のみを evaluator へ渡す構造そのものによって担保される。
 
-## production Agent invocation 層の permission policy
+## production Agent invocation 層の permission policy（本番呼び出し層の権限方針）
 
 `run_retrospective.DelegatedAgentPermissionPolicy` が、委譲した Agent が試みる以下の操作を拒否する:
 

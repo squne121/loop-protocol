@@ -11,7 +11,7 @@ disable-model-invocation: true
 `agent_improvement_candidate/v1`（#2288 で delta-evaluation 拡張済み）準拠の改善候補を **proposal-only** で
 生成する。GitHub Issue への実際の投稿・mutation は本 Skill のスコープ外（#2238）。
 
-## Orchestration owner
+## Orchestration owner（実行主体）
 
 ```yaml
 orchestration_owner: root Skill / main conversation
@@ -52,7 +52,7 @@ uv run --locked python3 .claude/skills/agent-retrospective/scripts/run_retrospec
 root Skill が用意するのはこの 1 回の Bash 呼び出しのみ。内部で `run_retrospective.run_cli()` が
 以下を順に実行する（各関数の詳細は `run_retrospective.py` 本体の docstring を正本とする）。
 
-### 2. prepare
+### 2. 準備（prepare）
 
 `manual_trigger_preflight()` → run-scoped temp dir（mode `0700`）確保 →
 `build_repository_collector()`（Child 3 `collect_snapshot.py` の `collect_repository_source` を
@@ -80,7 +80,7 @@ fail-closed で終了する（AC14）。
 と subprocess env（mutation credential を除去した allowlist）へ直接反映され、`git commit`/`git push`/
 `gh issue`/`gh pr`/filesystem write/unapproved Bash/対象 run 外 resume を拒否する。
 
-### 4. prepare-evaluator（fan-in）
+### 4. prepare-evaluator（評価準備・fan-in）
 
 全 observer が成功した場合のみ（`partial_agent_output: reject`）、
 `build_finding_sets()`（observer role から `finding_authority` を導出・`web` finding の digest 束縛を検証）
@@ -108,7 +108,7 @@ delta 算出 step 自体は毎回実行される（"任意" なのは provider �
 `run_cli()` はどちらも `PreviousStateProviderProtocol` を満たす任意の provider を受け取れるため、
 #2238 はこの call graph 自体を変更せず real provider を注入できる。
 
-### 7. finalize
+### 7. 確定処理（finalize）
 
 `finalize()` で proposal-only `PublishRequest`（`PUBLISH_REQUEST_V1`）を生成する。
 `public_projection_digest` は `run_identity`（`source_set_digest` を含む）と
@@ -118,7 +118,7 @@ delta 算出 step 自体は毎回実行される（"任意" なのは provider �
 別の trusted channel（`HUMAN_AUTHORIZATION_RECEIPT_V1`、#2238）が担う。`run_cli()` はこの
 `PublishRequest` を返し、`main()` がその `to_wire()` 文字列を stdout へ出力する。
 
-## Reused Agents（capability matrix）
+## Reused Agents（再利用エージェント・capability matrix）
 
 | Role | Authority | 再利用元 |
 |---|---|---|
@@ -145,7 +145,7 @@ cleanup_required: true
 `.claude/agents/retrospective-runtime-observer.md` / `.claude/agents/retrospective-evaluator.md`
 の frontmatter に固定されている。
 
-## Ephemeral wire contract
+## Ephemeral wire contract（一時的な通信契約）
 
 `SOURCE_PLAN_V1` / `OBSERVER_RESULT_V1` / `FINDING_SET_V1` / `EVALUATOR_REQUEST_V1` /
 `EVALUATION_RESULT_V1` / `PUBLISH_REQUEST_V1` の 6 envelope。詳細フィールド定義は

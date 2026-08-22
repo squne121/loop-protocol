@@ -7,7 +7,7 @@
 deterministic phase engine としてのみ動作する。理由: 二重所有は「どちらが実際に Agent を起動する
 権限を持つか」を曖昧にし、leaf 制約の enforcement 境界を不明瞭にする（OWNER review #2、P0-1）。
 
-## production Agent invocation 経路（headless CLI subprocess）
+## production Agent invocation 経路（headless CLI subprocess・本番呼び出し経路）
 
 現行 `pyproject.toml` は `pyyaml`/`jsonschema` のみに依存し、Claude Agent SDK 依存を追加すると
 Allowed Paths 外（`pyproject.toml`/lockfile）への変更が必要になる。既存 Allowed Paths を維持できる
