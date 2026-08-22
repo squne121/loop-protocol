@@ -1,10 +1,10 @@
 ---
 adr_id: "0008"
 title: "Deterministic Evidence vs Model-Based Semantic Judgment の役割分担"
-summary_ja: "決定論的に確認できる事実は script に委譲し、意味論的な設計判断は LLM の推論に委ねるという役割分担原則を定める決定記録。issue-refinement-loop が semantic design finding を未解決のまま処理完了扱いにした構造的欠陥（#2273）を踏まえ、deterministic gate と LLM semantic review lane の併用を採用する。"
-status: proposed
-decision_date: null
-confirmed_date: null
+summary_ja: "決定論的に確認できる事実は script に委譲し、意味論的な設計判断は LLM の推論に委ねるという役割分担原則を定める決定記録。issue-refinement-loop が semantic design finding を未解決のまま処理完了扱いにした構造的欠陥（#2273）を踏まえ、materiality-triggered な semantic review と advisory-by-default（個人開発向けの軽量運用）を採用する。"
+status: accepted
+decision_date: "2026-08-22"
+confirmed_date: "2026-08-22"
 related_issues:
   - "#2295"
   - "#2273"
@@ -93,7 +93,7 @@ LLM 裁量に完全に委ねる（追跡・強制の gate を新設しない）�
   loop 終了ゲートが semantic finding の解消状態を一切考慮しないため、finding が
   黙示的に握りつぶされても外部から検知できない。
 
-### Option C: deterministic gate + LLM semantic review lane を併用する（採用）
+### Option C: deterministic gate + LLM semantic review lane を併用する（無条件・毎回実施）
 
 facts/invariants/syntax/reproducible checks/routing mechanics/evidence
 collection/transactional mutation は deterministic script に委譲し続ける一方、
@@ -111,10 +111,40 @@ Child A（#2296）で追加予定）を新設する。deterministic gate は
 - 短所: 新しい review lane の追加によりコストが増える。ただし対象は
   「決定論的に解けない領域」に限定されるため、全 Issue に一律で高コストな
   semantic review を強制するわけではない（適用条件は Child A の実装 Issue で確定する）。
+  一方で Option C 自体は「semantic review を毎回無条件に実施する」ことのみを定めており、
+  finding の severity 区分や missing/stale artifact 時の挙動（advisory か hard stop か）を
+  規定していない。個人趣味開発の運用コストを踏まえると、この不足を放置したまま
+  Option C を採用すると、軽微な finding や artifact 取得失敗が過剰に loop をブロック
+  する運用に陥りやすい（Owner 敵対的レビュー、PR #2298 コメント参照）。
+
+### Option D: 実質変更時のみ semantic review を起動し既定は advisory とする（採用）
+
+Goal/Outcome/AC/schema/architecture/Owner Decision 等の実質変更、既存の重大 finding、
+または明示要求がある場合のみ semantic review を実施する。review artifact の
+missing/stale は一度だけ自動再実行し、それでも取得不能なら warning または
+main-thread review へ fallback する。hard block は fresh かつ重大な未解消 finding に
+限定する。個人開発では以下の二モードとする。
+
+- `advisory` — デフォルト。ワークフローを止めない。
+- `strict` — 明示指定時のみ、missing/stale も停止条件にする。
+
+- 長所: Option C が確立した deterministic/LLM 役割分担の原則（script は semantic
+  verdict を生成しない、境界は syntax/semantics ではなく形式化済みか否かで引く）は
+  そのまま維持しつつ、個人趣味開発の運用実態（Owner 自身が主要な実行者であり、
+  過剰な自動停止がむしろ生産性を損なう）に合わせてコストとブロッキング挙動を
+  最小化できる。severity/disposition による段階的な扱い（後述 Decision 規範3）で
+  「本当に重大な未解消 finding だけを止める」ことが可能になる。
+- 短所: `advisory` モードでは、Owner が能動的に review 結果を確認しない限り
+  finding が黙示的に見過ごされるリスクが Option C（毎回無条件実施）より高い。
+  この短所は「重大 finding は severity=blocker/high で hard block する」規範3で
+  部分的に緩和する設計とする。
 
 ## Decision（決定事項）
 
-Option C（deterministic gate + LLM semantic review lane 併用）を採用する。
+Option D（materiality-triggered semantic review + advisory-by-default）を採用する。
+Option C が定めた deterministic/LLM 役割分担の原則自体（下表）は維持し、
+役割分担の "適用トリガー" と "終了ゲートの厳格さ" のみを Option D の軽量方針へ
+置き換える。
 
 役割分担の原則を以下のとおり固定する。
 
@@ -137,7 +167,14 @@ Orchestrator:        context budgeting / delegation / result joining /
    AC の意味的十分性や architecture trade-off の当否を判定しない。これは
    `.claude/skills/pr-review-judge/SKILL.md#AC6` が既に確立している境界を Issue 側にも
    適用するものである。
-2. **決定論的に判定できないことを、それ自体で human escalation の理由にしない**。
+2. **semantic review は materiality-triggered とする**。以下のいずれかに該当する場合
+   にのみ semantic review lane を実行する。それ以外の変更（typo 修正、文言の言い換え、
+   既に形式化された contract に対する機械的な整合修正など）には semantic review を
+   強制しない。
+   - Goal / Outcome / AC / schema / architecture / Owner Decision に実質的な変更がある
+   - 既存の未解消 finding（severity: blocker または high）がある
+   - Owner またはワークフローから明示的に semantic review が要求されている
+   決定論的に判定できないことを、それ自体で human escalation の理由にはしない。
    LLM が repository evidence、外部一次資料、Owner Decision、Issue/PR history から
    十分な根拠を得て合理的に決定できる場合は、LLM が判断・修正案の作成まで担当する。
    human escalation は次のような genuinely human-only なケースに限定する。
@@ -146,23 +183,72 @@ Orchestrator:        context budgeting / delegation / result joining /
    - 現在の Agent/SubAgent の authority が不足している場合
    - bounded 調査を尽くしても dispositive な evidence が得られない場合
    - Owner が明示的に人間判断を要求した場合
-3. **loop 終了ゲートは semantic review lane の未解消 finding を考慮する**。deterministic
-   checker が `approve`/`go` を返しても、semantic review lane が検出した finding が
-   未解消のまま loop を正常終了させてはならない。終了判定の入力に「semantic finding の
-   解消状態」という事実を追加する（finding の意味内容の再判定は不要で、
-   「解消済みか未解消か」という deterministic に確認可能な状態のみを見ればよい）。
-「解消済みか未解消か」の値は、semantic review lane（LLM）が現在の Issue body / diff に
-対して都度再実行し出力した finding state（sidecar artifact のフィールド、run id +
-body_sha256 束縛）としてのみ確定させる。deterministic code は当該フィールドの
-schema 妥当性・現行 body_sha256 との freshness 一致・provenance のみを検証し、diff の
-有無・キーワードの消失・anchor comment の残存有無などから解消状態を自ら推測・再計算
-してはならない。これは規範1（deterministic script に semantic verdict を生成させない）の
-適用範囲に「finding の解消判定」も含まれることを明示するものである。
-4. **semantic review lane の追加は既存の固定 wire フォーマットを破壊しない**。
+3. **finding は severity と disposition を持ち、loop 停止条件はこの組み合わせに限定する**。
+   finding 単位に最低限、以下のフィールドを持たせる。
+   ```yaml
+   severity: blocker | high | medium | low
+   disposition: open | fixed | accepted | deferred | not_applicable
+   ```
+   通常モード（`advisory`）で loop を停止する条件は、次の論理積に限定する。
+   ```text
+   fresh model assessment
+   AND severity in {blocker, high}
+   AND disposition == open
+   ```
+   `medium` / `low` は warning 扱いとし loop を止めない。`accepted` / `deferred` は
+   終了を許可する。個人開発であることを踏まえ、`accepted` は Owner が理由を一行
+   記録すれば十分とする（記録先は sidecar artifact または PR/Issue コメント）。
+
+   ここで言う「fresh model assessment」とは、deterministic code が証明できる
+   **事実**（`artifact_valid` / `input_binding_valid` / `freshness_valid` の 3 つ）とは
+   区別される。`approve` / `needs_fix` に相当する判定（フィールド名は
+   `model_assessment` または `review_disposition` とし、`semantic_resolution_fact` の
+   ような「事実」を示唆する用語は用いない）は、現在の Issue body / diff に対して
+   都度再実行された LLM のフレッシュな判断であり、決定論的な真理ではない。
+   deterministic code は `model_assessment` / `review_disposition` フィールドの
+   schema 妥当性・現行 body_sha256 との freshness 一致・provenance のみを検証し、
+   diff の有無・キーワードの消失・anchor comment の残存有無などから解消状態を
+   自ら推測・再計算してはならない（規範1の適用範囲に「finding の解消判定」も
+   含まれることの明示）。同時に、単発の LLM 判定を repository-wide な最終
+   authority として扱ってはならない。判定はあくまで実行時点の model assessment
+   であり、次回実行や別モデル・別 reviewer による再評価で覆り得るものとして
+   運用する。
+4. **review artifact の missing/stale は原則 advisory とし、hard stop は strict モード
+   限定にする**。semantic review artifact が missing または stale（freshness 不一致）
+   の場合、まず一度だけ自動再実行を試みる。再実行後も取得不能な場合の扱いは
+   モードによって分岐する。
+   - `advisory`（デフォルト）: warning として記録し loop を継続する。必要に応じて
+     main-thread review へ fallback する。
+   - `strict`（明示指定時のみ）: hard stop（`ACTION_HUMAN_ESCALATION` 相当）とする。
+   通常運用（`advisory`）では missing/stale の存在だけで loop を停止しない。
+5. **semantic review lane の追加は既存の固定 wire フォーマットを破壊しない**。
    `ISSUE_REVIEW_RESULT_COMPACT_V2`（固定行数の wire）や
    `LOOP_REWRITE_ROUTER_STATE_V1`（`additionalProperties: false`）に直接フィールドを
    追加せず、新規の sidecar artifact として分離する（具体的なフィールド設計は
    Child A（#2296）の scope）。
+
+## 関連制約との関係（#1854 / #428 / pr-review-judge AC6）
+
+- **#1854 との関係**: #1854 は snapshot や preflight artifact の
+  missing/stale/invalid/runtime error で implementation や PR publication を止めない、
+  という既存方針を定めている。本 ADR は Decision 規範4で semantic sidecar artifact の
+  missing/stale を advisory-by-default（Option D）にすることで、この既存方針と整合
+  させる。artifact 取得失敗という運用上の摩擦要因が、個人開発のワークフロー全体を
+  止める理由にならないという扱いを、semantic review lane にも一貫して適用する。
+- **Issue #428 との関係**: #428 は security/auth/release 変更、canonical source との
+  矛盾、high-confidence overlap、人間明示要求という限定条件でのみ adversarial review
+  を起動する案である。この trigger 条件は、本 ADR の Decision 規範2が定める
+  materiality-triggered 条件（Goal/Outcome/AC/schema/architecture/Owner Decision の
+  実質変更、既存の重大 finding、明示要求）と概ね同種であり、Child A（#2296）実装時に
+  両者の統合を検討する。
+- **`pr-review-judge` AC6 との関係**: AC6 は script が semantic finding を生成することを
+  禁じるが、「deterministic gate の boolean を集約して APPROVE/REQUEST_CHANGES を出す
+  こと」自体は明示的に許容している。本 ADR が定める境界線は「syntax 対 semantics」
+  ではなく、次の 3 区分で置き換える。
+  - 既に形式化された要件は deterministic test で検証してよい
+  - 未形式化・曖昧・新規な設計判断は LLM が担当する
+  - 繰り返し発生し安定して形式化できる finding は、費用対効果が合えば
+    deterministic test へ昇格する
 
 ## Consequences（帰結）
 
@@ -170,16 +256,25 @@ schema 妥当性・現行 body_sha256 との freshness 一致・provenance の�
 
 - `issue-refinement-loop` に「Step 2.5」として semantic design review lane を追加する。
   過去に不採用となった「Step 3」（#428 の adversarial review 案）という番号は再利用しない。
+- semantic review lane は Decision 規範2の materiality-triggered 条件に基づいて
+  起動可否を判定する（無条件・毎回実施ではない）。
 - semantic review 用の新規 SubAgent は Sonnet 5 に `effort: high` を指定する
   （Claude Code 公式仕様 https://code.claude.com/docs/en/model-config#adjust-effort-level
   で対象 model への effort 指定が正式サポート済みと確認済み）。
 - 新規 sidecar artifact（`semantic_review_result_v1` 等）は既存の固定 wire フォーマット
-  （`ISSUE_REVIEW_RESULT_COMPACT_V2` / `LOOP_REWRITE_ROUTER_STATE_V1`）を変更せずに追加する。
-- loop 終了ゲート（`decide_next_loop_action.py` 等）に、semantic review lane の
-  未解消 finding を終了判定の入力として追加する。
+  （`ISSUE_REVIEW_RESULT_COMPACT_V2` / `LOOP_REWRITE_ROUTER_STATE_V1`）を変更せずに追加し、
+  finding には Decision 規範3の `severity` / `disposition` フィールドを持たせる。
+- loop 終了ゲート（`decide_next_loop_action.py` 等）に、Decision 規範3の停止条件
+  （fresh model assessment AND severity in {blocker, high} AND disposition == open）を
+  終了判定の入力として追加する。`medium`/`low` は warning、`accepted`/`deferred` は
+  終了を許可する。
+- artifact の missing/stale ハンドリングは Decision 規範4（一度だけ自動再実行 →
+  `advisory` は warning 継続、`strict` のみ hard stop）に従って実装する。
+  `advisory` をデフォルトモードとする。
 - #428（Step 3 adversarial review の例外ゲート化、narrow scope）との重複要否を
   Child A 実装時に判断し、重複する場合は #428 を close するか、#428 の残存部分を
-  Child A に統合するかを決める。
+  Child A に統合するかを決める（#428 の trigger 条件は本 ADR の materiality-triggered
+  条件と概ね同種であるため、統合の実務的コストは低いと見込む）。
 
 ### Child B（docs 明文化、#2297、Child A に blocked_by）への引き継ぎ事項
 
@@ -215,6 +310,11 @@ supersede/矛盾する関係になく、本 ADR は 0007 を補完する位置�
   https://github.com/squne121/loop-protocol/issues/2273#issuecomment-5378300709 ）
 - Issue #2294（本 ADR の parent、delivery-rollup tracking Issue、Child C/A/B の分割元）
 - Issue #428（Step 3 adversarial review の例外ゲート化、narrow scope、Child A で統合要否を判断）
+- Issue #1854（snapshot / preflight artifact の missing/stale/invalid/runtime error で
+  implementation や PR publication を止めない、という既存方針）
+- PR #2298 Owner レビューコメント（Option D 採用・severity/disposition 導入・
+  advisory-by-default への改訂根拠、
+  https://github.com/squne121/loop-protocol/pull/2298#issuecomment-5379760825 ）
 - `.claude/skills/pr-review-judge/SKILL.md#AC6`（Deterministic Processing Script の禁止事項）
 - `docs/dev/agent-skill-boundaries.md`
 - `docs/adr/TEMPLATE.md`
