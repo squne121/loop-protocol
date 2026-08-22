@@ -144,6 +144,23 @@ raw `gh` / raw `git push` 全般に対する production-grade な credential bou
 #2223（実装: raw gh/git push を deterministic deny し GitHub mutation production broker を
 実装する、OPEN）で対応する。
 
+**Issue #2299 による方針変更（#2203 の credential scrub 方針の一部を置換）:** 上記は
+canary 専用の `GitHubMutationBroker` の credential boundary であり、これとは別に、
+`scripts/claude-gpt/launch.sh` が起動する Claude/AGY 子プロセス（isolated Claude-GPT
+session 本体）自身の credential scrub 方針は Issue #2299 により変更された。旧方針
+（#2203/PR #2214）は GitHub auth 関連 env var（`GH_TOKEN`/`GH_CONFIG_DIR` 系）を含め
+すべて子プロセスから scrub していたが、これにより genuine `issue-creator` SubAgent が
+`create-issue` skill の dedupe read（`gh issue list`）で認証エラーとなり通常 workflow を
+完走できないという owner 指摘（Issue #2259 NOT_PLANNED, PR #2286 コメント）を受け、
+Issue #2299 で GitHub auth（`GH_TOKEN`/`GITHUB_TOKEN`/`GH_ENTERPRISE_TOKEN`/
+`GITHUB_ENTERPRISE_TOKEN`/`GH_HOST`/`GH_REPO`/`GH_CONFIG_DIR`）のみを ambient 値のまま
+native 同等に子プロセスへ共有する方針へ変更した。`HOME`/`XDG_CONFIG_HOME`/
+`XDG_CACHE_HOME` は引き続き空の隔離ディレクトリへ差し替え、`SSH_AUTH_SOCK`/
+`GIT_ASKPASS`/`SSH_ASKPASS`/`GIT_CREDENTIAL_HELPER`（GitHub auth とは無関係な secret）は
+引き続き scrub する。GitHub mutation の correctness は、この env 共有方針変更ではなく、
+GitHub 側の server-side protection（branch protection・required CI・repository
+permission）と mutation 前後の live readback によって担保する（Issue #2299 Outcome）。
+
 ---
 
 ### 5. `checkpoint_token` — session 記録ツール用 token
