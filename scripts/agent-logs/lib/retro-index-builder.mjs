@@ -324,6 +324,102 @@ function checkPublicObservationSources(payload, markerDigest) {
   return null
 }
 
+// ---------------------------------------------------------------------------
+// retrospective_runs[] (Issue #2238 Child 5, additive-only): derived index
+// entries summarizing agent_retrospective_run_publication/v1 Issue comments
+// persist_retrospective_run.py posts. Distinct marker/payload shape from
+// the agent_run_report/v1 comments normalizeSourceComment() above handles --
+// this module never reuses parseMarkerComment()/extractPayloadFromMarkdown()
+// for these (those are agent_run_report/v1-specific, github-comments.mjs is
+// outside this Issue's Allowed Paths). retrospective_runs[] is a summary
+// only -- it never becomes the state store for a run (ADR 0007 Decision 7);
+// the primary record remains the Issue comment itself.
+// ---------------------------------------------------------------------------
+
+const RETROSPECTIVE_RUN_MARKER_LINE = /^<!--\s*agent_retrospective_run:v1\s+repository_id=\S+\s+idempotency_key=\S+\s*-->$/u
+const FENCED_JSON_BLOCK = /```json\r?\n([\s\S]*?)\r?\n```/u
+
+function extractRetrospectiveRunPayload(body) {
+  if (typeof body !== 'string' || body.length === 0) {
+    return null
+  }
+  const firstLine = body.split('\n')[0]?.trim() ?? ''
+  if (!RETROSPECTIVE_RUN_MARKER_LINE.test(firstLine)) {
+    return null
+  }
+  const match = body.match(FENCED_JSON_BLOCK)
+  if (!match) {
+    return { kind: 'blocked', reason: 'retrospective_run_payload_unparsable' }
+  }
+  let payload
+  try {
+    payload = JSON.parse(match[1])
+  } catch {
+    return { kind: 'blocked', reason: 'retrospective_run_payload_unparsable' }
+  }
+  if (!payload || typeof payload !== 'object' || payload.schema_version !== 'agent_retrospective_run_publication/v1') {
+    return { kind: 'blocked', reason: 'retrospective_run_schema_version_mismatch' }
+  }
+  const runIdentity = payload.run?.run_identity
+  if (
+    !runIdentity
+    || typeof runIdentity.base_sha !== 'string'
+    || !/^[0-9a-f]{40}$/u.test(runIdentity.base_sha)
+    || typeof runIdentity.source_set_digest !== 'string'
+    || !/^[0-9a-f]{64}$/u.test(runIdentity.source_set_digest)
+  ) {
+    return { kind: 'blocked', reason: 'retrospective_run_identity_missing' }
+  }
+  // Issue #2238 P0-7 fix_delta: the index entry's run_digest must reference
+  // the envelope's OWN verified publication_digest directly -- previously
+  // this recomputed sha256Digest(JSON.stringify(payload, null, 2)) instead,
+  // a digest of pretty-printed JSON that never matched the actual
+  // persist_retrospective_run.py publication_digest (sha256-sorted-json-v1
+  // over the canonicalized envelope, computed WITHOUT pretty-printing).
+  if (
+    typeof payload.publication_digest !== 'string'
+    || !/^sha256:[0-9a-f]{64}$/u.test(payload.publication_digest)
+  ) {
+    return { kind: 'blocked', reason: 'retrospective_run_publication_digest_missing' }
+  }
+  return { kind: 'run', payload, runIdentity }
+}
+
+function summarizeDeltaResults(deltaResults) {
+  if (!Array.isArray(deltaResults) || deltaResults.length === 0) {
+    return 'no_delta_results'
+  }
+  const counts = new Map()
+  for (const entry of deltaResults) {
+    const status = typeof entry?.delta_status === 'string' ? entry.delta_status : (entry?.evaluation_status ?? 'unknown')
+    counts.set(status, (counts.get(status) ?? 0) + 1)
+  }
+  return [...counts.keys()].sort().map((key) => `${key}:${counts.get(key)}`).join(',')
+}
+
+function normalizeRetrospectiveRunComment(rawComment) {
+  const extraction = extractRetrospectiveRunPayload(rawComment.body)
+  if (extraction === null) {
+    return { kind: 'ignored' }
+  }
+  if (extraction.kind === 'blocked') {
+    return extraction
+  }
+  const { payload, runIdentity } = extraction
+  const candidateRecords = Array.isArray(payload.candidate_records) ? payload.candidate_records : []
+  return {
+    kind: 'run',
+    entry: {
+      run_comment_url: rawComment.html_url,
+      run_digest: payload.publication_digest,
+      base_sha: runIdentity.base_sha,
+      source_set_digest: runIdentity.source_set_digest,
+      candidate_count: candidateRecords.length,
+      delta_summary: summarizeDeltaResults(payload.delta_results),
+    },
+  }
+}
+
 function normalizeSourceComment(sourceComment) {
   const parsedUrl = parseIssueCommentUrl(sourceComment.html_url)
   if (!parsedUrl) {
@@ -526,9 +622,26 @@ export function buildRetroIndex({
   const ambiguousLinks = []
   const blockedReasons = []
   const sourceCommentRefs = []
+  const retrospectiveRuns = []
   const parentChildSet = new Set(parentChildIssueNumbers)
 
   for (const rawComment of sourceComments) {
+    // Issue #2238 Child 5 (additive-only): agent_retrospective_run_publication/v1
+    // comments are recognized by a distinct marker/schema and routed to
+    // retrospective_runs[] instead of entries[] -- never mixed into the
+    // agent_run_report/v1 resolution path below. A malformed retrospective-run
+    // comment is skipped here (not added to blockedReasons/generation_verdict)
+    // so this additive feature cannot regress the existing entries[]
+    // generation_verdict semantics.
+    const retrospectiveRun = normalizeRetrospectiveRunComment(rawComment)
+    if (retrospectiveRun.kind === 'run') {
+      retrospectiveRuns.push(retrospectiveRun.entry)
+      continue
+    }
+    if (retrospectiveRun.kind === 'blocked') {
+      continue
+    }
+
     const normalized = normalizeSourceComment(rawComment)
     if (normalized.kind === 'ignored') {
       continue
@@ -597,6 +710,7 @@ export function buildRetroIndex({
     entries,
     orphan_reports: orphanReports,
     ambiguous_links: ambiguousLinks,
+    retrospective_runs: retrospectiveRuns,
   }
 
   const canonicalIndexJson = JSON.stringify(retroPayload, null, 2)
@@ -616,7 +730,7 @@ export function buildRetroIndex({
 }
 
 export function detectSchemaMigrationRequirement(indexCandidate) {
-  const allowedKeys = new Set(['schema', 'generation_verdict', 'entries', 'orphan_reports', 'ambiguous_links'])
+  const allowedKeys = new Set(['schema', 'generation_verdict', 'entries', 'orphan_reports', 'ambiguous_links', 'retrospective_runs'])
   const extraKeys = Object.keys(indexCandidate).filter((key) => !allowedKeys.has(key))
   if (extraKeys.length === 0) {
     return null
@@ -627,4 +741,11 @@ export function detectSchemaMigrationRequirement(indexCandidate) {
   }
 }
 
-export { buildSourceCommentSetDigest, canonicalizeSourceCommentSet, normalizeSourceCommentSet, sha256Digest, sha256Hex }
+export {
+  buildSourceCommentSetDigest,
+  canonicalizeSourceCommentSet,
+  normalizeRetrospectiveRunComment,
+  normalizeSourceCommentSet,
+  sha256Digest,
+  sha256Hex,
+}
