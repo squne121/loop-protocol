@@ -143,7 +143,7 @@ contract snapshot で「動作検証 VC」として指定されたスクリプ�
 
 ## TEST_VERDICT 報告フォーマット（read-only report）
 
-test-runner は本フォーマットを **呼び出し元への read-only report として返すのみ**であり、PR へのコメント投稿は行わない（Issue #1648）。実際の PR 投稿は以下の2段を経由する:
+test-runner は本フォーマットを **呼び出し元への read-only report として返すのみ**であり、PR へコメントを投稿しない（Issue #1648, #88）。test-runner 自身は `gh pr comment` 等でこの TEST_VERDICT を投稿しない。実際の PR 投稿は以下の2段を経由する:
 
 1. **materializer**（`.claude/skills/impl-review-loop/scripts/materialize_test_verdict_artifact.py`）が、この read-only report と Child A（#1646）の producer receipt・execution record artifact、Child B（#1647）の `test_verdict.publish` request 相当の入力を突き合わせ、current Issue/PR/HEAD/body SHA/artifact digest binding を検証した上で `TEST_VERDICT_MACHINE/v2` input bundle を生成する。
 2. **dedicated publisher**（`scripts/agent-guards/controlled_skill_mutation_exec.py` の `test_verdict.publish` コマンド、Child B）が、その input bundle 由来の publish request のみを受け付けて実際に PR へコメントを投稿する。

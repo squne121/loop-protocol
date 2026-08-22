@@ -1,6 +1,31 @@
 # Step 4: PR Review
 
-Step 2 が `PASS` / `PARTIAL` で完了したら、`pr-reviewer` SubAgent に PR レビューを委譲する。Step 2 が `FAIL` の場合は本ステップをスキップして Step 5 に直行（REQUEST_CHANGES 確定）。
+Step 2 の `VC_ADJUDICATION_RESULT_V1.blocking == false` で完了したら、`pr-reviewer` SubAgent に PR レビューを委譲する。Step 2 が `blocking == true`（FAIL 相当）の場合は本ステップをスキップして Step 5 に直行（REQUEST_CHANGES 確定）。
+
+## current-head gate（Issue #88、Step 4 起動直前の再照合）
+
+linked Issue に Verification Commands がある場合、`pr-reviewer` の `spawn_agent` を送信する **直前** に、Step 2 が保持している `VC_ADJUDICATION_RESULT_V1` を current-head binding tuple
+（PR の現在の head SHA、linked Issue の現在の body SHA256、Verification Commands の
+literal command SHA256 一覧）に対して再照合する。この再照合は
+`.claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py` の
+`evaluate_step4_vc_gate()` を使い、以下のいずれかに該当する場合は
+`pr-reviewer` を起動しない（fail-closed）。
+
+- `VC_ADJUDICATION_RESULT_V1` が欠落・破損（malformed）
+- `blocking == true`（FAIL / SKIP / fallback 検出を含む）
+- head SHA が current PR head と不一致（stale head）
+- body SHA256 が現在の Issue 本文と不一致（stale body）
+- literal command SHA256 の集合が現在の Verification Commands と不一致（stale command）
+
+上記いずれにも該当しない場合のみ `pr-reviewer` を起動する。
+同一 root invocation 内で同一 binding tuple の有効な adjudication が既に存在する場合は
+`.claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py` の
+`Step4AdjudicationCache` を用いて再利用し、test-runner を再実行しない
+（binding tuple の head/body/command のいずれかが変われば別 key となり、
+旧 adjudication は自動的に stale として扱われ再実行される）。
+
+TEST_VERDICT comment/artifact（存在する場合）は diagnostics-only であり、
+この gate の判定入力にはならない。TEST_VERDICT だけを与えても Step 4 の gate は開かない。
 
 Codex CLI では `pr-reviewer` custom agent を起動し、root thread は file edit / test 実行 / commit / push / review judgment を直接行わない。
 

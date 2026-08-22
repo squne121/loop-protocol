@@ -1215,3 +1215,147 @@ def test_pr_review_only_requires_test_verdict_binding() -> None:
     )
     assert result["overall_status"] != "pass"
     assert result["errors"] == ["test_verdict_head_sha_mismatch"]
+
+
+# --- Issue #88 AC5/AC6: same-loop reuse + happy-path invocation counts ---
+# Step4AdjudicationCache is an in-memory, non-persistent reuse cache scoped
+# to a single impl-review-loop root invocation (Issue #88 Required Design
+# #6/#9 -- no new persistent ledger). These tests simulate a loop iteration
+# directly against adjudicate_vc_result() + evaluate_step4_vc_gate() so the
+# reuse/no-double-execution behavior is proven without any new schema,
+# hook, or publisher.
+
+
+def _ac5_ac6_fixture_head_sha() -> str:
+    return "head-ac5-ac6"
+
+
+def _ac5_ac6_command_hash() -> str:
+    return "sha256:" + "7" * 64
+
+
+def _ac5_ac6_body_sha256() -> str:
+    return "sha256:" + "e" * 64
+
+
+def _ac5_ac6_baseline_and_current():
+    baseline_item = {
+        "ac": "AC1",
+        "command_hash": _ac5_ac6_command_hash(),
+        "failure_keys": [{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}],
+        "exit_code": 4,
+        "category": "regression_gate",
+        "classification": "expected_fail",
+        "decision": "blocked",
+        "raw_command": "pytest tests/test_alpha.py",
+        "raw_stdout": "",
+        "raw_stderr": "",
+    }
+    current_item = {**baseline_item, "exit_code": 0, "failure_keys": []}
+    contract_snapshot = {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
+        "body_sha256": _ac5_ac6_body_sha256(),
+        "checks": {"vc_preflight": {"classifications": [baseline_item]}},
+    }
+    current_vc_result = {
+        "schema": "baseline_vc_preflight/v1",
+        "generated_at": "2026-08-23T00:00:00Z",
+        "status": "pass",
+        "errors": [],
+        "fallback_detected": False,
+        "human_review_required": False,
+        "stop_condition_triggered": False,
+        "source": {"body_sha256": _ac5_ac6_body_sha256()},
+        "results": [current_item],
+        "head_sha": _ac5_ac6_fixture_head_sha(),
+        "reviewed_head_sha": _ac5_ac6_fixture_head_sha(),
+    }
+    diff_summary = {
+        "changed_paths": [ADJUDICATOR_PATH],
+        "head_sha": _ac5_ac6_fixture_head_sha(),
+    }
+    return contract_snapshot, current_vc_result, diff_summary
+
+
+def _run_step4_loop_iteration(cache, binding_key, run_test_runner_and_adjudicate):
+    """Simulate a single Step 4 loop iteration: reuse-or-run test-runner,
+    then evaluate the gate and spawn pr-reviewer only when it opens."""
+    adjudication_result, reused = cache.get_or_run(binding_key, run_test_runner_and_adjudicate)
+    decision = mod.evaluate_step4_vc_gate(
+        adjudication_result,
+        expected_head_sha=_ac5_ac6_fixture_head_sha(),
+        expected_contract_body_sha256=_ac5_ac6_body_sha256(),
+        expected_command_hashes=[_ac5_ac6_command_hash()],
+    )
+    return decision, reused
+
+
+def test_ac5_same_binding_tuple_reused_without_reexecuting_test_runner():
+    contract_snapshot, current_vc_result, diff_summary = _ac5_ac6_baseline_and_current()
+    test_runner_calls = {"count": 0}
+
+    def _run_test_runner_and_adjudicate():
+        test_runner_calls["count"] += 1
+        return mod.adjudicate_vc_result(
+            contract_snapshot=contract_snapshot,
+            current_vc_result=current_vc_result,
+            diff_summary=diff_summary,
+            allowed_paths=[ADJUDICATOR_PATH],
+        )
+
+    cache = mod.Step4AdjudicationCache()
+    binding_key = mod.step4_binding_key(
+        head_sha=_ac5_ac6_fixture_head_sha(),
+        contract_body_sha256=_ac5_ac6_body_sha256(),
+        command_hashes=[_ac5_ac6_command_hash()],
+    )
+
+    # GIVEN test-runner already produced a valid adjudication for this binding tuple
+    first_decision, first_reused = _run_step4_loop_iteration(
+        cache, binding_key, _run_test_runner_and_adjudicate
+    )
+    assert first_decision["invoke_pr_reviewer"] is True
+    assert first_reused is False
+    assert test_runner_calls["count"] == 1
+
+    # WHEN the same binding tuple is evaluated again within the same loop
+    second_decision, second_reused = _run_step4_loop_iteration(
+        cache, binding_key, _run_test_runner_and_adjudicate
+    )
+
+    # THEN the cached adjudication is reused and test-runner is not re-executed
+    assert second_decision["invoke_pr_reviewer"] is True
+    assert second_reused is True
+    assert test_runner_calls["count"] == 1
+
+
+def test_ac6_happy_path_fixture_test_runner_once_pr_reviewer_once():
+    contract_snapshot, current_vc_result, diff_summary = _ac5_ac6_baseline_and_current()
+    test_runner_calls = {"count": 0}
+    pr_reviewer_calls = {"count": 0}
+
+    def _run_test_runner_and_adjudicate():
+        test_runner_calls["count"] += 1
+        return mod.adjudicate_vc_result(
+            contract_snapshot=contract_snapshot,
+            current_vc_result=current_vc_result,
+            diff_summary=diff_summary,
+            allowed_paths=[ADJUDICATOR_PATH],
+        )
+
+    cache = mod.Step4AdjudicationCache()
+    binding_key = mod.step4_binding_key(
+        head_sha=_ac5_ac6_fixture_head_sha(),
+        contract_body_sha256=_ac5_ac6_body_sha256(),
+        command_hashes=[_ac5_ac6_command_hash()],
+    )
+
+    # GIVEN a single happy-path binding tuple loop iteration
+    decision, _ = _run_step4_loop_iteration(cache, binding_key, _run_test_runner_and_adjudicate)
+    if decision["invoke_pr_reviewer"]:
+        pr_reviewer_calls["count"] += 1
+
+    # THEN test-runner ran exactly once and pr-reviewer ran exactly once
+    assert test_runner_calls["count"] == 1
+    assert pr_reviewer_calls["count"] == 1
