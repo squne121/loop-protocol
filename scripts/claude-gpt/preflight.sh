@@ -59,6 +59,29 @@ fi
 #   3  = claude バイナリが見つからない（環境不可）
 #   8  = auto-mode 未対応 version・readback mismatch・classifyAllShell 未反映
 #        （launcher バグまたは host 側の不備。fail-closed）
+# --workflow-profile <profile>: Issue #2273. Thin dispatcher to the Python
+# `workflow_capability_preflight.py` module, which returns the structured
+# `CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1` JSON result (trusted `uv` / Spark
+# route capability / GitHub read capability / GitHub write (mutation)
+# capability, judged separately -- see that module's docstring and the
+# Issue's `## Result Schema` section). This branch does not duplicate any
+# of that judgment logic in shell; it only forwards CLI args and the exit
+# code. A well-formed assessment (including `decision: blocked`) exits 0;
+# non-zero exit codes are reserved for invalid input / internal errors so
+# a `set -e` caller does not lose the JSON payload.
+if [ "${1:-}" = "--workflow-profile" ]; then
+  shift
+  # P1-2 fix: `workflow_capability_preflight.py` judges trusted-`uv`
+  # availability itself (via `trusted_runtime_capabilities.check_trusted_uv`,
+  # which delegates to the canonical `skill_runtime_exec` resolver). Running
+  # an UNVERIFIED PATH `uv` here first, before that trusted judgment even
+  # runs, would execute untrusted code as a bootstrap step. Launch the
+  # Python module directly from system `python3` instead; it performs its
+  # own trusted-uv check as part of the assessment.
+  python3 "$SCRIPT_DIR/workflow_capability_preflight.py" --profile "$@"
+  exit "$?"
+fi
+
 if [ "${1:-}" = "--auto-mode-check" ]; then
   AUTO_MODE_SETTINGS_PATH="${2:-}"
   if [ -z "$AUTO_MODE_SETTINGS_PATH" ] || [ ! -f "$AUTO_MODE_SETTINGS_PATH" ]; then
