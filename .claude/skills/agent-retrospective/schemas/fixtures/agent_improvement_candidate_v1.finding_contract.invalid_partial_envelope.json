@@ -22,7 +22,7 @@
         },
         "rule_id": "partial_envelope_rule"
       },
-      "value": "sha256:c199d3c0aba39be92ecebd16efd88711a6576fad1cccaa4da90a4b16e9fe0b97"
+      "value": "sha256:9758782d2525143f0c874cd7c8fc3e17885eced3d2f71ee8159c82d72d2b3977"
     },
     "claim_class": "runtime_behavior"
   }

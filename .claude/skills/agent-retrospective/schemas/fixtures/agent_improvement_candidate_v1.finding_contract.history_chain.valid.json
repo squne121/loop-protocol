@@ -22,7 +22,7 @@
         },
         "rule_id": "history_chain_rule"
       },
-      "value": "sha256:ad3289d196e63e2816ab1fe8d825832191f7c7e6115964e3cf61becb04143fa5"
+      "value": "sha256:09d28eae0e335ac6e269c00e89751bc43de58df09e12d36af949e533c36079d6"
     },
     "claim_class": "runtime_behavior",
     "evaluations": [
@@ -60,12 +60,45 @@
         "delta_status": "new"
       },
       {
-        "evaluation_id": "sha256:91e68c93a40f7f45b7ea4e738df9ef1dd596125aba842cd1ed3ab40687fb3b54",
+        "evaluation_id": "sha256:22ba9557ab353c9b739976dc4debd8f5feb9b149798c8e13bb1a8eff8886a74e",
         "evaluated_run_ref": {
           "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
           "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
         },
         "previous_evaluation_ref": "sha256:37273e0a9dd979d9d60ec87f7ec8d650181d800758805eb787af9eef7f955e8c",
+        "observed": false,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "resolved",
+        "signal_delta": "unknown",
+        "indeterminate_reason": null,
+        "baseline_signal": {
+          "signal_type": "boolean",
+          "value": true,
+          "comparator": "eq",
+          "worse_direction": "not_applicable"
+        },
+        "current_signal": null,
+        "expected_signal": null,
+        "evidence_refs": [
+          {
+            "ref_type": "repository_blob",
+            "source_id": "repository",
+            "resource_identity": ".claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py#chain-resolved-1",
+            "projection_digest": "sha256:281a499ac123ef55323b2aedea9b7d40206a2ec9b9b6debf627b31c80b9503a8"
+          }
+        ],
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "delta-evaluator/v1",
+        "delta_status": "resolved"
+      },
+      {
+        "evaluation_id": "sha256:91e68c93a40f7f45b7ea4e738df9ef1dd596125aba842cd1ed3ab40687fb3b54",
+        "evaluated_run_ref": {
+          "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+          "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+        },
+        "previous_evaluation_ref": "sha256:22ba9557ab353c9b739976dc4debd8f5feb9b149798c8e13bb1a8eff8886a74e",
         "observed": true,
         "source_coverage": "complete",
         "evaluation_status": "classified",

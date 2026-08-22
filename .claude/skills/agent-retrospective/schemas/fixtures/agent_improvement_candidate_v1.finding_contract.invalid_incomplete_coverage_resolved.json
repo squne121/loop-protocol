@@ -22,7 +22,7 @@
         },
         "rule_id": "incomplete_coverage_rule"
       },
-      "value": "sha256:85a6bdfb5773d93b978c712dbd8fbe13f2ec9e8d7a57a32212a1775423f1ebf2"
+      "value": "sha256:4dc881266dea7cf3be5b601c8bdce183e89ec9da8bd5f1ffde5578b858f69a26"
     },
     "claim_class": "runtime_behavior",
     "evaluations": [
@@ -35,10 +35,10 @@
         "previous_evaluation_ref": null,
         "observed": false,
         "source_coverage": "partial",
-        "evaluation_status": "classified",
+        "evaluation_status": "indeterminate",
         "presence_delta": "resolved",
         "signal_delta": "unknown",
-        "indeterminate_reason": null,
+        "indeterminate_reason": "source_partial",
         "baseline_signal": {
           "signal_type": "boolean",
           "value": true,
@@ -56,8 +56,7 @@
           }
         ],
         "classified_at": "2026-08-22T00:00:00Z",
-        "classifier_version": "delta-evaluator/v1",
-        "delta_status": "resolved"
+        "classifier_version": "delta-evaluator/v1"
       }
     ]
   }

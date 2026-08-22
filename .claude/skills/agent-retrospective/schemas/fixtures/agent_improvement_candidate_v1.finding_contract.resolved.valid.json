@@ -22,17 +22,50 @@
         },
         "rule_id": "resolved_rule"
       },
-      "value": "sha256:8c52cd08c55cc7f75f61af1f6f54ba58f7ba2091002513e3175f5a580d304e81"
+      "value": "sha256:ccfc63c4a975a5785c271d895f1d337ff7f74170221e77a59151e5efd8fd2476"
     },
     "claim_class": "runtime_behavior",
     "evaluations": [
+      {
+        "evaluation_id": "sha256:1c8609cae61e4f6dd48804c5b572765518357a2c1be0020d0f9f6ebde8ed4a92",
+        "evaluated_run_ref": {
+          "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+          "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+        },
+        "previous_evaluation_ref": null,
+        "observed": true,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "new",
+        "signal_delta": "unknown",
+        "indeterminate_reason": null,
+        "baseline_signal": null,
+        "current_signal": {
+          "signal_type": "boolean",
+          "value": true,
+          "comparator": "eq",
+          "worse_direction": "not_applicable"
+        },
+        "expected_signal": null,
+        "evidence_refs": [
+          {
+            "ref_type": "repository_blob",
+            "source_id": "repository",
+            "resource_identity": ".claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py#resolved-new-1",
+            "projection_digest": "sha256:a1c0c6e0b5377a1b7ba56751175a399649b2687d62a95a054b52c2cc4056e998"
+          }
+        ],
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "delta-evaluator/v1",
+        "delta_status": "new"
+      },
       {
         "evaluation_id": "sha256:2ed803797f2890e08d901b54026d51f672487eb6acf022fe273a8f12ba2ddb2c",
         "evaluated_run_ref": {
           "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
           "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
         },
-        "previous_evaluation_ref": null,
+        "previous_evaluation_ref": "sha256:1c8609cae61e4f6dd48804c5b572765518357a2c1be0020d0f9f6ebde8ed4a92",
         "observed": false,
         "source_coverage": "complete",
         "evaluation_status": "classified",

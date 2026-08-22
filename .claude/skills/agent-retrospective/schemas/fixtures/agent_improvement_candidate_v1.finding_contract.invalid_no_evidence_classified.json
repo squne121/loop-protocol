@@ -22,7 +22,7 @@
         },
         "rule_id": "no_evidence_rule"
       },
-      "value": "sha256:ac4753facf42005f8ea76592c3a3f3e6e3a0c1249783ebd6411cc58c98bfb373"
+      "value": "sha256:bfe27e520a302f358c1653aeebf83adb3560de76f918b6383b37acf87cccb621"
     },
     "claim_class": "runtime_behavior",
     "evaluations": [

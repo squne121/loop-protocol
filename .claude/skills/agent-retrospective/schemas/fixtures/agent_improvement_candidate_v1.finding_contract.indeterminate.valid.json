@@ -22,7 +22,7 @@
         },
         "rule_id": "indeterminate_rule"
       },
-      "value": "sha256:62de50cb8367cee023ca4abf75f0060c8294c38619d2344e34e5a6fa760bc381"
+      "value": "sha256:fb954622105772c70bb328001c6439d5b7523204d230fc50a09422a50a44b980"
     },
     "claim_class": "runtime_behavior",
     "evaluations": [

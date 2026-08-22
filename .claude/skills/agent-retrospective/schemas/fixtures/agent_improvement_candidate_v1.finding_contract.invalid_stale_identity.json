@@ -22,7 +22,7 @@
         },
         "rule_id": "stale_identity_rule"
       },
-      "value": "sha256:958bcbb9efc3f60dea9ca9b791efdbbd1ea2ce8d551374b006dca8496fa4cca7"
+      "value": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     },
     "claim_class": "runtime_behavior",
     "evaluations": [

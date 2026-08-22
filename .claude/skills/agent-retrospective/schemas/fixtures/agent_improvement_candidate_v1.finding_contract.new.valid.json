@@ -22,7 +22,7 @@
         },
         "rule_id": "missing_finding_identity_contract"
       },
-      "value": "sha256:d66bfacc55ce10eba3b8381e69e479cd34c5010a165652bb43f86cd27ba49cce"
+      "value": "sha256:f9c30c83ce8adebef843195d0f95fb2fb831702843c10faef65a04fc70ca2edd"
     },
     "claim_class": "runtime_behavior",
     "evaluations": [

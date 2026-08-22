@@ -22,7 +22,7 @@
         },
         "rule_id": "bad_history_rule"
       },
-      "value": "sha256:003b34546a8c9b2e401cea1096691e2bc4d97d3b3e0dc5bb33fd2e1491c0dd29"
+      "value": "sha256:fe3e83afc1e11d46a353be95bd2ce0e1259d0a294de252fbca7f5aabce29ba18"
     },
     "claim_class": "runtime_behavior",
     "evaluations": [

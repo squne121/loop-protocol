@@ -93,3 +93,33 @@ def test_evidence_ref_projection_digest_must_be_sha256():
     )
     with pytest.raises(jsonschema.exceptions.ValidationError):
         vrs.validate_candidate(candidate)
+
+
+def test_evidence_ref_type_and_source_id_must_match():
+    """Each `ref_type` has exactly one valid `source_id`; the schema's per-ref_type
+    allOf/if/then branches must reject a mismatched combination (Issue #2288 P1-1),
+    not merely validate ref_type/source_id independently against their own enums."""
+    candidate = _base_candidate()
+    evidence_ref = candidate["finding_contract"]["evaluations"][0]["evidence_refs"][0]
+    assert evidence_ref["ref_type"] == "repository_blob"
+    assert evidence_ref["source_id"] == "repository"
+    # 'github' is individually a valid source_id enum value, but is not the source_id
+    # that 'repository_blob' requires.
+    evidence_ref["source_id"] = "github"
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        vrs.validate_candidate(candidate)
+
+
+def test_evidence_ref_resource_identity_structure_by_ref_type():
+    """`resource_identity`'s expected shape depends on `ref_type` (Issue #2288 P1-1):
+    e.g. `external_primary_source` must be a URL; a bare non-URL token is rejected."""
+    candidate = _base_candidate()
+    evidence_ref = candidate["finding_contract"]["evaluations"][0]["evidence_refs"][0]
+    evidence_ref["ref_type"] = "external_primary_source"
+    evidence_ref["source_id"] = "web"
+    evidence_ref["resource_identity"] = "not-a-url"
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        vrs.validate_candidate(candidate)
+
+    evidence_ref["resource_identity"] = "https://example.com/some/primary/source"
+    vrs.validate_candidate(candidate)  # no error

@@ -76,3 +76,21 @@ def test_claim_class_invalid_in_identity_key_rejected():
     candidate["finding_contract"]["identity"]["key"]["claim_class"] = "not_a_real_claim_class"
     with pytest.raises(jsonschema.exceptions.ValidationError):
         vrs.validate_candidate(candidate)
+
+
+def test_claim_class_envelope_and_key_must_match():
+    """finding_contract.claim_class and finding_contract.identity.key.claim_class are
+    independently-defined schema fields; the schema alone cannot express that they
+    must agree. validate_claim_class_consistency() (validate_retrospective_schema.py)
+    enforces this cross-field equality (Issue #2288 P0-5)."""
+    candidate = copy.deepcopy(
+        vrs.load_fixture("agent_improvement_candidate_v1.finding_contract.new.valid.json")
+    )
+    assert (
+        candidate["finding_contract"]["claim_class"]
+        == candidate["finding_contract"]["identity"]["key"]["claim_class"]
+    )
+    # both are individually valid ADR 0007 enum values, but they now disagree.
+    candidate["finding_contract"]["claim_class"] = "external_fact"
+    with pytest.raises(vrs.RetrospectiveSchemaError):
+        vrs.validate_candidate(candidate)

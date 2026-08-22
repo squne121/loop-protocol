@@ -22,7 +22,7 @@
         },
         "rule_id": "invalid_claim_class_rule"
       },
-      "value": "sha256:b46d4f9245de17bc610ac379ce1127c24c92394b418117ac7cd8bfe5c70cdb41"
+      "value": "sha256:bb0bb25ab1630d6035da3073eced05abe25537cbabaa44edeb5b5d468d52c2c0"
     },
     "claim_class": "not_a_real_claim_class",
     "evaluations": [

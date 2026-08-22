@@ -52,16 +52,18 @@ Issue #2288 Out of Scope list, this module does NOT implement the actual delta
 ``presence_delta``/``signal_delta``/``delta_status`` -- that is Issue #2237's
 responsibility); ``validate_finding_contract_history()`` here only checks the
 *representation* of an already-produced ``evaluations`` list for self-consistency
-(``previous_evaluation_ref`` chains to an earlier entry in the same list, or is
-``null`` only for the first entry). ``compute_delta_capability()`` is a pure,
-non-mutating classifier used for the legacy-record migration story: it never adds,
-backfills, or auto-generates a ``finding_contract``/identity for a legacy record.
+(structural chain integrity plus the fixed judgement-table invariants that are not
+otherwise expressible in JSON Schema -- see that function's docstring for the exact
+rule set). ``compute_delta_capability()`` is a pure, non-mutating classifier used for
+the legacy-record migration story: it never adds, backfills, or auto-generates a
+``finding_contract``/identity for a legacy record.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -168,25 +170,51 @@ CLAIM_CLASSES: frozenset[str] = frozenset(
 
 FINDING_IDENTITY_ALGORITHM = "sha256-jcs-v1"
 
+#: The only ``finding_contract.identity.algorithm`` values ``compute_finding_identity``/
+#: ``validate_finding_identity`` will process. A caller-supplied algorithm outside this
+#: set is rejected fail-closed rather than silently hashed under an unspecified scheme
+#: (Issue #2288 P0-1: "未対応 algorithm は helper 側で fail-closed に reject される").
+SUPPORTED_FINDING_IDENTITY_ALGORITHMS: frozenset[str] = frozenset({FINDING_IDENTITY_ALGORITHM})
 
-def _canonicalize_for_identity(value: Any) -> Any:
-    """Recursively canonicalize `value` for FINDING_IDENTITY_V1 hashing.
 
-    Dict keys are sorted (order-independence, AC2(b)). Lists are treated as *sets*:
-    each element is independently canonicalized then the list is reordered by the
-    canonical-JSON string representation of each element (order-independence,
-    AC2(c)) -- this is a deliberate deviation from strict RFC 8785 JCS (which
-    preserves array order) because identity keys in this schema are not expected to
-    encode order-significant sequences.
+def _reject_non_finite(value: Any) -> None:
+    """Recursively reject NaN/Infinity float values anywhere within `value`.
+
+    RFC 8785 JCS has no representation for non-finite IEEE 754 values; Python's
+    ``json`` module (unlike the JSON spec) accepts ``NaN``/``Infinity``/``-Infinity``
+    by default (``allow_nan=True``), so a caller-supplied identity key containing one
+    of these would otherwise silently serialize to invalid JSON. Fail closed instead.
+    """
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        raise RetrospectiveSchemaError(
+            f"finding identity key contains a non-finite float value ({value!r}); "
+            "NaN/Infinity are not permitted in a FINDING_IDENTITY_V1 key (RFC 8785 "
+            "JCS has no representation for non-finite values)."
+        )
+    if isinstance(value, dict):
+        for item in value.values():
+            _reject_non_finite(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_non_finite(item)
+
+
+def _jcs_canonicalize(value: Any) -> Any:
+    """Recursively canonicalize `value` per RFC 8785 JCS (object-property-only sort).
+
+    Object (dict) properties are sorted by key, recursively. Array (list) element
+    order is preserved unchanged -- RFC 8785 JCS does NOT reorder arrays; only object
+    member ordering is normalized. `FINDING_IDENTITY_V1.key` has no array-typed
+    fields today, so this has no observable effect on the current schema, but the
+    function itself must not silently reorder arrays if one is ever added (an earlier,
+    non-normative implementation of this helper treated arrays as unordered sets --
+    that behavior was a deliberate deviation from RFC 8785 and has been removed; see
+    Issue #2288 P0-1).
     """
     if isinstance(value, dict):
-        return {key: _canonicalize_for_identity(value[key]) for key in sorted(value.keys())}
+        return {key: _jcs_canonicalize(value[key]) for key in sorted(value.keys())}
     if isinstance(value, list):
-        canonicalized_items = [_canonicalize_for_identity(item) for item in value]
-        canonicalized_items.sort(
-            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
-        )
-        return canonicalized_items
+        return [_jcs_canonicalize(item) for item in value]
     return value
 
 
@@ -195,26 +223,44 @@ def compute_finding_identity(
 ) -> str:
     """Deterministically compute a FINDING_IDENTITY_V1 ``value`` from a typed key.
 
-    ``value = "sha256:" + SHA256(JCS-like canonical form of {"algorithm": algorithm,
-    "key": identity_key})``. ``algorithm`` participates in the hashed payload so a
-    different algorithm value produces a different digest namespace (AC2(d)) even for
-    an otherwise-identical key. ``identity_key`` is expected to be limited to
-    run/occurrence-independent fields (e.g. repository_id/claim_class/subject_ref/
-    rule_id per FINDING_IDENTITY_V1) -- this function does not itself filter which
-    keys are "allowed"; callers (and the JSON Schema `$defs.finding_identity.key`)
-    are responsible for keeping run-varying fields (source_run_ref, base_sha,
-    source_set_digest, timestamps, evidence fingerprints) out of `identity_key`
-    (AC2(e)).
+    ``value = "sha256:" + SHA256(JCS(identity_key))`` -- the hash preimage is the
+    RFC 8785 JCS-canonicalized `identity_key` alone. `algorithm` is NOT part of the
+    hashed preimage (it is instead the envelope-level namespace identifier stored
+    separately as `finding_contract.identity.algorithm`); this function still takes
+    `algorithm` as a parameter purely to validate it against
+    `SUPPORTED_FINDING_IDENTITY_ALGORITHMS` and raise fail-closed for any value this
+    module does not know how to process (a future `sha256-jcs-v2` or similar would
+    need its own explicit support added here, not a silent fallback).
+
+    `identity_key` is expected to be limited to run/occurrence-independent fields
+    (e.g. repository_id/claim_class/subject_ref/rule_id per FINDING_IDENTITY_V1) --
+    this function does not itself filter which keys are "allowed"; callers (and the
+    JSON Schema `$defs.finding_identity.key`) are responsible for keeping
+    run-varying fields (source_run_ref, base_sha, source_set_digest, timestamps,
+    evidence fingerprints) out of `identity_key`.
 
     Calling this twice with structurally-equal `identity_key` inputs (regardless of
-    dict key order or list element order) always returns the same value (AC2(b)/(c)).
+    dict key order) always returns the same value. NaN/Infinity anywhere in
+    `identity_key` are rejected fail-closed (see `_reject_non_finite`). Non-ASCII
+    string values are serialized as UTF-8 (`ensure_ascii=False`), matching RFC 8785's
+    requirement that JCS output be valid UTF-8 text rather than `\\uXXXX`-escaped
+    ASCII.
     """
-    canonical_payload = json.dumps(
-        {"algorithm": algorithm, "key": _canonicalize_for_identity(identity_key)},
+    if algorithm not in SUPPORTED_FINDING_IDENTITY_ALGORITHMS:
+        raise RetrospectiveSchemaError(
+            f"unsupported finding identity algorithm: {algorithm!r}. Supported: "
+            f"{sorted(SUPPORTED_FINDING_IDENTITY_ALGORITHMS)!r}."
+        )
+    _reject_non_finite(identity_key)
+    canonical_key = _jcs_canonicalize(identity_key)
+    preimage = json.dumps(
+        canonical_key,
         sort_keys=True,
         separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
     )
-    digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(preimage.encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
 
 
@@ -222,10 +268,14 @@ def validate_finding_identity(candidate: dict[str, Any]) -> None:
     """Recompute and cross-check `candidate["finding_contract"]["identity"]`.
 
     No-op when `finding_contract` is absent (legacy candidate). Raises
-    RetrospectiveSchemaError if the stored `identity.value` does not match the value
-    recomputed from `identity.key` via `compute_finding_identity()` -- callers cannot
-    supply an arbitrary, stale/copied, or fabricated identity value and have it pass
-    validation (AC2(a)).
+    RetrospectiveSchemaError if:
+
+    - the stored `algorithm` is not in `SUPPORTED_FINDING_IDENTITY_ALGORITHMS`
+      (fail-closed rejection of an unrecognized/future algorithm namespace), or
+    - the stored `identity.value` does not match the value recomputed from
+      `identity.key` via `compute_finding_identity()` -- callers cannot supply an
+      arbitrary, stale/copied, or fabricated identity value and have it pass
+      validation.
     """
     finding_contract = candidate.get("finding_contract")
     if not finding_contract:
@@ -243,37 +293,218 @@ def validate_finding_identity(candidate: dict[str, Any]) -> None:
         )
 
 
-def validate_finding_contract_history(candidate: dict[str, Any]) -> None:
-    """Validate internal self-consistency of `finding_contract.evaluations[]`.
+def validate_claim_class_consistency(candidate: dict[str, Any]) -> None:
+    """Cross-check `finding_contract.claim_class` against `identity.key.claim_class`.
 
-    No-op when `finding_contract` is absent. This function checks *representation*
-    consistency only (each entry's `previous_evaluation_ref` is either `null`, for
-    the very first entry in the list, or equal to the `evaluation_id` of a strictly
-    earlier entry in the same list) -- it does NOT compute delta evaluations from a
-    prior run (that computation is Issue #2237's responsibility; see module
-    docstring).
+    No-op when `finding_contract` is absent. These two fields are independently
+    defined in the schema (the envelope-level "overall claim class of the finding"
+    vs. one component of the typed identity key) and the schema alone cannot express
+    that they must agree (Issue #2288 P0-5). A mismatch would let a candidate report
+    one claim_class in its envelope while its stable cross-run identity is keyed on a
+    *different* claim_class, silently corrupting identity stability.
     """
     finding_contract = candidate.get("finding_contract")
     if not finding_contract:
         return
+    envelope_claim_class = finding_contract["claim_class"]
+    key_claim_class = finding_contract["identity"]["key"]["claim_class"]
+    if envelope_claim_class != key_claim_class:
+        raise RetrospectiveSchemaError(
+            "finding_contract.claim_class "
+            f"({envelope_claim_class!r}) does not match "
+            f"finding_contract.identity.key.claim_class ({key_claim_class!r}); "
+            "these must be identical -- the envelope's claim_class and the identity "
+            "key's claim_class component describe the same claim and must not diverge."
+        )
+
+
+#: `presence_delta` values that assert the finding is currently present.
+_PRESENT_STATES: frozenset[str] = frozenset({"new", "active", "recurrent"})
+#: `presence_delta` values that assert the finding is currently absent.
+_ABSENT_STATES: frozenset[str] = frozenset({"resolved", "still_absent"})
+
+
+def validate_finding_contract_history(candidate: dict[str, Any]) -> None:
+    """Validate `finding_contract.evaluations[]` structural and judgement-table
+    self-consistency.
+
+    No-op when `finding_contract` is absent. This function checks *representation*
+    consistency of an already-produced `evaluations` list -- it does NOT compute
+    delta evaluations from a prior run (that computation is Issue #2237's
+    responsibility; see module docstring). Specifically it enforces (Issue #2288
+    P0-2/P0-3, none of which are expressible via JSON Schema alone because they
+    depend on relationships *between* array elements and/or precise semantic
+    interpretation of enum combinations):
+
+    - `evaluation_id` is unique within the history (no duplicate IDs).
+    - `previous_evaluation_ref` is `null` only for the first entry, and for every
+      other entry equals the `evaluation_id` of the *immediately preceding* entry in
+      the list (position i-1) -- forking or skipping ahead in the chain is rejected.
+    - `observed` and `presence_delta` must agree: `observed=true` cannot coexist with
+      an absence-asserting `presence_delta` (`resolved`/`still_absent`), and
+      `observed=false` cannot coexist with a presence-asserting `presence_delta`
+      (`new`/`active`/`recurrent`).
+    - An `indeterminate` evaluation must never assert `presence_delta` `resolved` or
+      `recurrent` (both are strong, evidence-backed conclusions that require
+      `classified` status).
+    - `presence_delta='resolved'` requires `source_coverage == 'complete'`.
+    - Among the `classified` evaluations only (indeterminate entries do not
+      participate in this chain):
+      - the first classified evaluation's `presence_delta` must be `new` or
+        `still_absent` (there is no earlier classified state to transition from).
+      - `presence_delta='new'` is only valid for that first classified evaluation
+        (a finding cannot become "new" again after having a classified history).
+      - `presence_delta='recurrent'` requires the immediately preceding *classified*
+        evaluation's `presence_delta` to have been `resolved` or `still_absent`.
+      - `presence_delta='resolved'` requires the immediately preceding *classified*
+        evaluation's `presence_delta` to have been `new`, `active`, or `recurrent`
+        (the finding must have previously been present to be resolved).
+    """
+    finding_contract = candidate.get("finding_contract")
+    if not finding_contract:
+        return
+    evaluations = finding_contract["evaluations"]
     seen_ids: set[str] = set()
-    for index, evaluation in enumerate(finding_contract["evaluations"]):
+    last_classified_presence: str | None = None
+
+    for index, evaluation in enumerate(evaluations):
+        evaluation_id = evaluation["evaluation_id"]
+        if evaluation_id in seen_ids:
+            raise RetrospectiveSchemaError(
+                f"finding_contract.evaluations[{index}].evaluation_id="
+                f"{evaluation_id!r} duplicates an earlier evaluation_id in the same "
+                "history (evaluation_id must be unique within evaluations[])."
+            )
+
         previous_ref = evaluation.get("previous_evaluation_ref")
-        if previous_ref is None:
-            if index != 0:
+        if index == 0:
+            if previous_ref is not None:
                 raise RetrospectiveSchemaError(
                     f"finding_contract.evaluations[{index}].previous_evaluation_ref "
-                    "is null but this is not the first evaluation in the history "
+                    "is non-null but this is the first evaluation in the history "
                     "(evaluation/history inconsistency)."
                 )
-        elif previous_ref not in seen_ids:
+        else:
+            expected_previous = evaluations[index - 1]["evaluation_id"]
+            if previous_ref != expected_previous:
+                raise RetrospectiveSchemaError(
+                    f"finding_contract.evaluations[{index}].previous_evaluation_ref="
+                    f"{previous_ref!r} does not equal the immediately preceding "
+                    f"evaluation's evaluation_id ({expected_previous!r}); forking or "
+                    "skipping ahead in the evaluation history is not permitted "
+                    "(evaluation/history inconsistency)."
+                )
+        seen_ids.add(evaluation_id)
+
+        observed = evaluation["observed"]
+        presence_delta = evaluation["presence_delta"]
+        evaluation_status = evaluation["evaluation_status"]
+        source_coverage = evaluation["source_coverage"]
+
+        if observed and presence_delta in _ABSENT_STATES:
             raise RetrospectiveSchemaError(
-                f"finding_contract.evaluations[{index}].previous_evaluation_ref="
-                f"{previous_ref!r} does not reference any strictly earlier "
-                "evaluation_id in finding_contract.evaluations "
-                "(evaluation/history inconsistency)."
+                f"finding_contract.evaluations[{index}]: observed=true but "
+                f"presence_delta={presence_delta!r} asserts absence (observed and "
+                "presence_delta are inconsistent)."
             )
-        seen_ids.add(evaluation["evaluation_id"])
+        if not observed and presence_delta in _PRESENT_STATES:
+            raise RetrospectiveSchemaError(
+                f"finding_contract.evaluations[{index}]: observed=false but "
+                f"presence_delta={presence_delta!r} asserts presence (observed and "
+                "presence_delta are inconsistent)."
+            )
+
+        if evaluation_status == "indeterminate" and presence_delta in {"resolved", "recurrent"}:
+            raise RetrospectiveSchemaError(
+                f"finding_contract.evaluations[{index}]: evaluation_status="
+                f"'indeterminate' cannot assert presence_delta={presence_delta!r}; "
+                "an indeterminate evaluation must never be reported as resolved or "
+                "recurrent."
+            )
+
+        if presence_delta == "resolved" and source_coverage != "complete":
+            raise RetrospectiveSchemaError(
+                f"finding_contract.evaluations[{index}]: presence_delta='resolved' "
+                f"requires source_coverage == 'complete' (was {source_coverage!r})."
+            )
+
+        if evaluation_status == "classified":
+            if last_classified_presence is None:
+                if presence_delta not in {"new", "still_absent"}:
+                    raise RetrospectiveSchemaError(
+                        f"finding_contract.evaluations[{index}]: the first classified "
+                        f"evaluation must have presence_delta 'new' or 'still_absent' "
+                        f"(was {presence_delta!r}); there is no earlier classified "
+                        "state to transition from."
+                    )
+            else:
+                if presence_delta == "new":
+                    raise RetrospectiveSchemaError(
+                        f"finding_contract.evaluations[{index}]: presence_delta='new' "
+                        "is only valid for the first classified evaluation in the "
+                        "history."
+                    )
+                if presence_delta == "recurrent" and last_classified_presence not in {
+                    "resolved",
+                    "still_absent",
+                }:
+                    raise RetrospectiveSchemaError(
+                        f"finding_contract.evaluations[{index}]: presence_delta="
+                        "'recurrent' requires the immediately preceding classified "
+                        "evaluation's presence_delta to be 'resolved' or "
+                        f"'still_absent' (was {last_classified_presence!r})."
+                    )
+                if presence_delta == "resolved" and last_classified_presence not in {
+                    "new",
+                    "active",
+                    "recurrent",
+                }:
+                    raise RetrospectiveSchemaError(
+                        f"finding_contract.evaluations[{index}]: presence_delta="
+                        "'resolved' requires the immediately preceding classified "
+                        "evaluation's presence_delta to be 'new', 'active', or "
+                        f"'recurrent' (was {last_classified_presence!r}); a finding "
+                        "must have previously been present to be resolved."
+                    )
+            last_classified_presence = presence_delta
+
+
+def validate_signal_specs_consistency(candidate: dict[str, Any]) -> None:
+    """Cross-check baseline/current/expected signal specs within each evaluation.
+
+    No-op when `finding_contract` is absent. Among the non-null
+    `baseline_signal`/`current_signal`/`expected_signal` of a single evaluation, the
+    `signal_type`/`unit`/`comparator`/`worse_direction` fields must agree -- three
+    different signals describing the same measurement axis cannot disagree on what
+    is being measured, how it is compared, or which direction is worse (Issue #2288
+    P0-4). `value`/`tolerance` are exempt (those legitimately vary: baseline/current/
+    expected are different observations of the same axis).
+    """
+    finding_contract = candidate.get("finding_contract")
+    if not finding_contract:
+        return
+    for index, evaluation in enumerate(finding_contract["evaluations"]):
+        signals = {
+            name: evaluation.get(name)
+            for name in ("baseline_signal", "current_signal", "expected_signal")
+        }
+        present = {name: signal for name, signal in signals.items() if signal is not None}
+        if len(present) < 2:
+            continue
+        reference_name, reference_signal = next(iter(present.items()))
+        for field in ("signal_type", "unit", "comparator", "worse_direction"):
+            reference_value = reference_signal.get(field)
+            for name, signal in present.items():
+                if name == reference_name:
+                    continue
+                if signal.get(field) != reference_value:
+                    raise RetrospectiveSchemaError(
+                        f"finding_contract.evaluations[{index}]: {name}.{field}="
+                        f"{signal.get(field)!r} does not match "
+                        f"{reference_name}.{field}={reference_value!r}; baseline/"
+                        "current/expected signal specs within the same evaluation "
+                        "must agree on signal_type/unit/comparator/worse_direction."
+                    )
 
 
 def compute_delta_capability(candidate: dict[str, Any]) -> str:
@@ -346,16 +577,26 @@ def validate_candidate(instance: dict[str, Any]) -> None:
     """Validate an agent_improvement_candidate/v1 instance.
 
     Raises jsonschema.exceptions.ValidationError on schema/format failure. When
-    `finding_contract` is present, additionally raises RetrospectiveSchemaError if
-    `finding_contract.identity.value` does not match the value recomputed from
-    `identity.key` (see validate_finding_identity()), or if
-    `finding_contract.evaluations[]` history is internally inconsistent (see
-    validate_finding_contract_history()). No-op (legacy candidate) when
-    `finding_contract` is absent.
+    `finding_contract` is present, additionally raises RetrospectiveSchemaError if:
+
+    - `finding_contract.identity.value` does not match the value recomputed from
+      `identity.key` (see `validate_finding_identity()`);
+    - `finding_contract.claim_class` does not match
+      `finding_contract.identity.key.claim_class` (see
+      `validate_claim_class_consistency()`);
+    - `finding_contract.evaluations[]` history is internally inconsistent, including
+      judgement-table invariant violations (see `validate_finding_contract_history()`);
+    - `baseline_signal`/`current_signal`/`expected_signal` within an evaluation
+      disagree on signal_type/unit/comparator/worse_direction (see
+      `validate_signal_specs_consistency()`).
+
+    No-op for all of the above (legacy candidate) when `finding_contract` is absent.
     """
     _validate_with_format_checking(instance, load_candidate_schema())
     validate_finding_identity(instance)
+    validate_claim_class_consistency(instance)
     validate_finding_contract_history(instance)
+    validate_signal_specs_consistency(instance)
 
 
 def is_valid_run(instance: dict[str, Any]) -> bool:

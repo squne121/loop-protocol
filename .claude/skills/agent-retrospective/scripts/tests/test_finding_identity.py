@@ -108,31 +108,112 @@ def test_compute_finding_identity_key_order_independent():
 
 
 # ---------------------------------------------------------------------------
-# (c) array element order independence (arrays treated as sets)
+# (b) RFC 8785 JCS: object properties are sorted recursively; array element order
+# is NOT part of this key's schema (FINDING_IDENTITY_V1.key has no array-typed
+# fields -- Issue #2288 AC2 explicitly scopes array-order normalization/set
+# treatment out). A prior, non-normative implementation of this helper treated
+# arrays as unordered sets; that was a deliberate deviation from RFC 8785 JCS and
+# has been removed (see `_jcs_canonicalize` docstring).
 # ---------------------------------------------------------------------------
 
 
-def test_compute_finding_identity_array_order_independent():
-    key_a = {**BASE_KEY, "related_tags": ["alpha", "beta", "gamma"]}
-    key_b = {**BASE_KEY, "related_tags": ["gamma", "alpha", "beta"]}
-    assert vrs.compute_finding_identity(key_a) == vrs.compute_finding_identity(key_b)
+def test_identity_matches_normative_jcs_golden_vector():
+    """`value` is a specific, reproducible digest of RFC 8785 JCS(key) alone --
+    NOT of `{"algorithm": algorithm, "key": key}` (a prior, superseded design).
+    This golden vector pins the exact preimage/algorithm so any accidental change
+    to the hashing scheme is caught, not just "still deterministic"."""
+    key = {
+        "repository_id": "squne121/loop-protocol",
+        "claim_class": "runtime_behavior",
+        "subject_ref": {"kind": "repository_path", "value": "scripts/foo.py"},
+        "rule_id": "example_rule",
+    }
+    expected_preimage = (
+        '{"claim_class":"runtime_behavior","repository_id":"squne121/loop-protocol",'
+        '"rule_id":"example_rule","subject_ref":{"kind":"repository_path",'
+        '"value":"scripts/foo.py"}}'
+    )
+    expected_digest = hashlib_sha256_hex(expected_preimage)
+    assert vrs.compute_finding_identity(key) == f"sha256:{expected_digest}"
 
 
-def test_compute_finding_identity_array_content_change_changes_id():
-    key_a = {**BASE_KEY, "related_tags": ["alpha", "beta"]}
-    key_b = {**BASE_KEY, "related_tags": ["alpha", "beta", "gamma"]}
-    assert vrs.compute_finding_identity(key_a) != vrs.compute_finding_identity(key_b)
+def hashlib_sha256_hex(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_identity_non_ascii_value_matches_rfc8785():
+    """Non-ASCII string values are serialized as UTF-8 (`ensure_ascii=False`), not
+    `\\uXXXX`-escaped ASCII -- RFC 8785 JCS output MUST be UTF-8 text."""
+    key = {
+        "repository_id": "squne121/loop-protocol",
+        "claim_class": "runtime_behavior",
+        "subject_ref": {"kind": "repository_path", "value": "スクリプト/foo.py"},
+        "rule_id": "example_rule",
+    }
+    expected_preimage = (
+        '{"claim_class":"runtime_behavior","repository_id":"squne121/loop-protocol",'
+        '"rule_id":"example_rule","subject_ref":{"kind":"repository_path",'
+        '"value":"スクリプト/foo.py"}}'
+    )
+    expected_digest = hashlib_sha256_hex(expected_preimage)
+    actual = vrs.compute_finding_identity(key)
+    assert actual == f"sha256:{expected_digest}"
+
+    # sanity: an ensure_ascii=True (\\uXXXX-escaped) serialization of the same
+    # canonical structure would produce a DIFFERENT digest -- proving the digest
+    # really was computed over UTF-8 text, not escaped ASCII.
+    import json
+
+    ascii_escaped_preimage = json.dumps(
+        {
+            "claim_class": "runtime_behavior",
+            "repository_id": "squne121/loop-protocol",
+            "rule_id": "example_rule",
+            "subject_ref": {"kind": "repository_path", "value": "スクリプト/foo.py"},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    ascii_escaped_digest = hashlib_sha256_hex(ascii_escaped_preimage)
+    assert ascii_escaped_digest != expected_digest
+    assert actual != f"sha256:{ascii_escaped_digest}"
+
+
+def test_identity_rejects_non_finite_float_values():
+    key = {**BASE_KEY, "rule_id": "example_rule"}
+    key_with_nan = copy.deepcopy(key)
+    key_with_nan["subject_ref"] = {"kind": "repository_path", "value": "scripts/foo.py"}
+    key_with_nan["_probe"] = float("nan")
+    with pytest.raises(vrs.RetrospectiveSchemaError):
+        vrs.compute_finding_identity(key_with_nan)
+
+    key_with_inf = copy.deepcopy(key)
+    key_with_inf["_probe"] = float("inf")
+    with pytest.raises(vrs.RetrospectiveSchemaError):
+        vrs.compute_finding_identity(key_with_inf)
 
 
 # ---------------------------------------------------------------------------
-# (d) algorithm version produces a different namespace
+# (d) algorithm: unsupported algorithm values are rejected fail-closed by the
+# helper itself (not silently hashed under an unspecified/future scheme).
 # ---------------------------------------------------------------------------
 
 
-def test_compute_finding_identity_algorithm_change_changes_namespace():
-    value_v1 = vrs.compute_finding_identity(BASE_KEY, algorithm="sha256-jcs-v1")
-    value_v2 = vrs.compute_finding_identity(BASE_KEY, algorithm="sha256-jcs-v2-hypothetical")
-    assert value_v1 != value_v2
+def test_identity_rejects_unsupported_algorithm():
+    with pytest.raises(vrs.RetrospectiveSchemaError):
+        vrs.compute_finding_identity(BASE_KEY, algorithm="sha256-jcs-v2-hypothetical")
+
+    candidate = copy.deepcopy(_load_valid_finding_candidate())
+    candidate["finding_contract"]["identity"]["algorithm"] = "sha256-jcs-v2-hypothetical"
+    with pytest.raises(vrs.RetrospectiveSchemaError):
+        vrs.validate_finding_identity(candidate)
+
+
+def test_supported_algorithm_set_is_exactly_v1():
+    assert vrs.SUPPORTED_FINDING_IDENTITY_ALGORITHMS == frozenset({"sha256-jcs-v1"})
 
 
 # ---------------------------------------------------------------------------
