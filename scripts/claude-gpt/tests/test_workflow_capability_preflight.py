@@ -117,6 +117,15 @@ def test_workflow_capability_accepts_pinned_local_bin_uv(monkeypatch, tmp_path):
 
 def test_workflow_capability_rejects_unpinned_local_bin_uv(monkeypatch, tmp_path):
     _patch_real_account_home(monkeypatch, tmp_path)
+    # `_resolve_trusted_executable` prefers hostedtoolcache and system
+    # standard directories over the account-home lane (see its ordering
+    # docstring). On a CI runner that already provisioned a correctly
+    # pinned `uv` via hostedtoolcache, `shutil.which` would resolve THAT
+    # one first and never reach this test's mismatched account-home fake,
+    # masking the rejection this test exists to prove. Isolate resolution
+    # to the account-home lane by emptying the higher-priority lanes.
+    monkeypatch.setattr(exec_mod, "_trusted_toolchain_dirs", lambda executable_name: [])
+    monkeypatch.setattr(exec_mod, "_SYSTEM_STANDARD_PATH_DIRS", ())
     required = exec_mod._required_uv_version(str(_REPO_ROOT))
     assert required
     mismatched = "0.0.1" if required != "0.0.1" else "0.0.2"
@@ -171,6 +180,13 @@ def test_workflow_capability_blocks_required_spark_incompatibility(monkeypatch):
 
 def test_workflow_capability_degrades_preferred_spark_incompatibility(monkeypatch):
     _no_spark_env(monkeypatch)
+    # Isolate this assertion to the Spark route judgment: without pinning
+    # GitHub auth/repo-read to available, a CI runner without `gh auth`
+    # configured would report decision=blocked via the (unrelated)
+    # `not github_auth` branch before the Spark fallback_only -> degraded
+    # branch is ever reached.
+    monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
+    monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: True)
     result = wcp.assess(
         project_root=str(_REPO_ROOT),
         profile="issue-to-impl",
