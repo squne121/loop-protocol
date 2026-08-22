@@ -35,8 +35,11 @@ script に委譲することで、繰り返し実行される loop の token/con
 "missing_contract_key", "unknown_contract_failure"}` は「Issue 本文の構文的完全性」しか
 判定対象にしておらず、schema 設計判断・AC の完全性・architecture のトレードオフといった
 semantic（意味論的）な設計判断は最初から scope 外である。`SKILL.md` も Step 3（adversarial
-review）を明示的に不採用として記載している（背景は #428 を参照。#428 は narrow な条件付き
-有効化案であり、本 ADR が定める原則の上位互換として Child A（#2296）で再設計される）。
+review）を明示的に不採用として記載している（背景は #428 を参照。#428 は `impl-review-loop` と `issue-refinement-loop` の両方を対象とする
+narrow な条件付き有効化案であり、Child A（#2296）は本 ADR が定める原則に沿って
+issue-refinement-loop 側の scope のみを Step 2.5 として再設計する。#428 の impl-review-loop 側
+residual scope は Child A の Allowed Paths に含まれず、Child A 完了後も別途 disposition
+（重複整理または独立実装）が必要である）。
 
 Issue #2273（「Claude-GPT に workflow-profile capability preflight と controlled GitHub route
 を配線する」実装 Issue）の敵対的レビューにおいて、`issue-refinement-loop` の 1 周が
@@ -148,6 +151,13 @@ Orchestrator:        context budgeting / delegation / result joining /
    未解消のまま loop を正常終了させてはならない。終了判定の入力に「semantic finding の
    解消状態」という事実を追加する（finding の意味内容の再判定は不要で、
    「解消済みか未解消か」という deterministic に確認可能な状態のみを見ればよい）。
+「解消済みか未解消か」の値は、semantic review lane（LLM）が現在の Issue body / diff に
+対して都度再実行し出力した finding state（sidecar artifact のフィールド、run id +
+body_sha256 束縛）としてのみ確定させる。deterministic code は当該フィールドの
+schema 妥当性・現行 body_sha256 との freshness 一致・provenance のみを検証し、diff の
+有無・キーワードの消失・anchor comment の残存有無などから解消状態を自ら推測・再計算
+してはならない。これは規範1（deterministic script に semantic verdict を生成させない）の
+適用範囲に「finding の解消判定」も含まれることを明示するものである。
 4. **semantic review lane の追加は既存の固定 wire フォーマットを破壊しない**。
    `ISSUE_REVIEW_RESULT_COMPACT_V2`（固定行数の wire）や
    `LOOP_REWRITE_ROUTER_STATE_V1`（`additionalProperties: false`）に直接フィールドを
