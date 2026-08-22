@@ -1098,12 +1098,71 @@ STOPFAILURE_HOOK_GROUPS=""
 ENV_JSON_FRAGMENT=",
   \"env\": {\"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\"}"
 if [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-start-stop" ]; then
-  # Observation-only "cat" sinks appended as an additional matcher-group,
-  # alongside (never instead of) the gate's SubagentStart/SubagentStop
-  # audit entries above.
-  CAT_SINK_GROUP='{"hooks": [{"type": "command", "command": "cat"}]}'
+  # Issue #2274 AC17 corrective iteration (hook-time byte-offset causal
+  # correlation): this sink used to be a bare `cat` that only echoed the
+  # hook's own stdin payload (agent_id/agent_type) back onto the stream.
+  # That gave the evidence builder agent_id correlation, but never the
+  # hook's own execution-time proxy log byte offset --
+  # runtime_smoke_test.sh instead approximated the correlation window with
+  # offsets captured immediately before/after the ENTIRE `launch.sh`
+  # invocation, which is a step-wide approximation, not the
+  # SubagentStart/SubagentStop hook-time window the Issue requires
+  # (genuine implementation gap, corrective iteration finding). This sink
+  # now additionally `os.stat()`s the canonical, launcher-owned proxy log
+  # path (never a caller-supplied path -- sourced from this same
+  # PROXY_STATE_DIR_TARGET constant every other proxy-path reference in
+  # this file uses) at the moment THIS hook process itself runs, and
+  # echoes that byte offset back alongside the original payload -- still
+  # strictly observational (no permissionDecision, no authorization
+  # semantics touched, the gate's own SubagentStart/SubagentStop audit
+  # entries above are unmodified) and independent of the other hook
+  # entries' execution order (per Claude Code's hooks reference, matching
+  # hooks run in parallel with no ordering guarantee between them; this
+  # design never assumes one hook runs before another -- it only records
+  # this hook's own execution-time state).
+  SPARK_LIFECYCLE_OFFSET_LOG_PATH="${PROXY_STATE_DIR_TARGET}/claude-code-proxy/proxy.log"
+  SPARK_LIFECYCLE_OFFSET_WRITER="${PROXY_STATE_DIR_TARGET}/spark-lifecycle-offset-writer-${SPARK_LAUNCH_NONCE}.py"
+  ( umask 077 && cat > "$SPARK_LIFECYCLE_OFFSET_WRITER" <<'SPARK_LIFECYCLE_OFFSET_WRITER_EOF'
+import json
+import os
+import sys
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    log_path = os.environ.get("SPARK_LIFECYCLE_OFFSET_LOG_PATH")
+    offset = None
+    if isinstance(log_path, str) and log_path:
+        try:
+            offset = os.stat(log_path).st_size
+        except OSError:
+            offset = None
+    # This sink only ever ADDS its own observation to whatever the hook's
+    # stdin payload already carried (agent_id/agent_type/hook_event_name/
+    # etc.) -- it never removes or rewrites an existing field.
+    payload["proxy_log_byte_offset_at_hook_time"] = offset
+    sys.stdout.write(json.dumps(payload))
+
+
+if __name__ == "__main__":
+    main()
+SPARK_LIFECYCLE_OFFSET_WRITER_EOF
+  )
+  CAT_SINK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_LIFECYCLE_OFFSET_WRITER\""}]}'
   SAS_HOOK_GROUPS="${SAS_HOOK_GROUPS}, ${CAT_SINK_GROUP}"
   SAP_HOOK_GROUPS="${SAP_HOOK_GROUPS}, ${CAT_SINK_GROUP}"
+  ENV_JSON_FRAGMENT=",
+  \"env\": {
+    \"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\",
+    \"SPARK_LIFECYCLE_OFFSET_LOG_PATH\": \"${SPARK_LIFECYCLE_OFFSET_LOG_PATH}\",
+    \"SPARK_LIFECYCLE_OFFSET_WRITER\": \"${SPARK_LIFECYCLE_OFFSET_WRITER}\"
+  }"
+  export SPARK_LIFECYCLE_OFFSET_LOG_PATH SPARK_LIFECYCLE_OFFSET_WRITER
 elif [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "hook-sink-multi-turn" ]; then
   # --- Issue #2219 (OWNER anchor decision, hook-event evidence channel).
   #     Narrow addition to the same fixed-value gate above: a SECOND fixed

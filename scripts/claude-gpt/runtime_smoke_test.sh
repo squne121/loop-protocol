@@ -143,21 +143,31 @@ fi
 #     scripts/agent-ops/run_worktree_agent_runtime_smoke.py が既に文書化・
 #     再利用している、実 live 観測済みの `tool_use_result` スキーマと
 #     同じもの）。
-#   - proxy 側の実効 model は、この1 step 実行前後で構造化 proxy log
-#     （`claude-code-proxy` が書く JSONL）へ新規追記されたバイト範囲だけを
-#     切り出し（既存の一般 canary smoke の各 step と同じオフセット手法）、
-#     `codex_upstream_request_started` イベントの `fields.model` から取得
-#     する。この 1 step には spark-codex への Agent 呼び出しがちょうど
-#     1 件しか存在しないことを SubagentStart/SubagentStop の
-#     exactly-one-pair 判定で構造的に強制するため、このバイト範囲全体を
-#     `proxy.correlation: "isolated_subagent_lifecycle_window"` の
-#     bounded window として扱う（hook event 発火の正確なバイトオフセット
-#     そのものを別チャネルで記録する実装ではない -- この近似の範囲は
-#     PR body に明記する）。zero match（Agent tool_use 0 件・tool_result
-#     不一致・lifecycle pair 0 件）・複数 window（lifecycle pair が
-#     複数）・欠損 lifecycle event はすべて `verdict.status: "fail"` の
-#     typed reason とする（下記ヒアドキュメントの spark_evidence.py 相当
-#     ロジック参照）。
+#   - proxy 側の実効 model は、SubagentStart/SubagentStop の
+#     観測用 hook（`CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop` が
+#     launch.sh へ追加登録する observational sink, `SPARK_LIFECYCLE_OFFSET_
+#     WRITER`）が「自分自身が実行された時点」で構造化 proxy log
+#     （`claude-code-proxy` が書く JSONL）に対して `os.stat().st_size` を
+#     取得し、hook stdout の payload へ `proxy_log_byte_offset_at_hook_time`
+#     として埋め込むことで得る（2026-08-22 corrective iteration: 従来の
+#     「launch.sh 呼び出し全体の前後」で `wc -c` する invocation-wide
+#     approximation を廃止し、hook 発火時点の実バイトオフセットそのものを
+#     記録する方式へ置き換えた）。evidence builder は同一 `agent_id` に
+#     相関する SubagentStart/SubagentStop の各 1 件からこの2つのオフセット
+#     を取り出し、`[start_offset, stop_offset)` の範囲だけを実際に
+#     `open().seek()/read()` して `codex_upstream_request_started` イベント
+#     の `fields.model` を解析する（`proxy.correlation:
+#     "hook_time_byte_offset_lifecycle_window"`）。この 1 invocation には
+#     spark-codex への Agent 呼び出しがちょうど 1 件しか存在しないことを
+#     SubagentStart/SubagentStop の exactly-one-pair 判定で構造的に強制する。
+#     offset 欠損・非整数・負値・start>stop・stop が capture 済み proxy log
+#     サイズを超える、はすべて typed FAIL とし、window の外側にある
+#     リクエスト（別 turn・別 agent の残留トラフィック等）は解析対象に一切
+#     含めない。zero match（Agent tool_use 0 件・tool_result 不一致・
+#     lifecycle pair 0 件・window 内 Spark リクエスト 0 件）・複数 window
+#     （lifecycle pair が複数）・欠損 lifecycle event はすべて
+#     `verdict.status: "fail"` の typed reason とする（下記ヒアドキュメント
+#     の spark_evidence.py 相当ロジック参照）。
 #   - `resolvedModel`/`modelsUsed` の両方が観測できない場合（Claude Code
 #     version floor 未満等）は `verdict.status: "blocked"`,
 #     `verdict.reason: "claude_code_evidence_schema_unsupported"` とする
@@ -190,7 +200,7 @@ import sys
 
 (
     stdout_path,
-    proxy_slice_path,
+    proxy_full_log_path,
     agent_name,
     expected_model,
     marker,
@@ -204,7 +214,8 @@ import sys
     proxy_sha256,
     claude_code_version,
     generated_at,
-) = sys.argv[1:16]
+    proxy_captured_log_size_raw,
+) = sys.argv[1:17]
 
 HOOK_LIFECYCLE = ("SubagentStart", "SubagentStop")
 
@@ -268,6 +279,27 @@ def _parse_embedded(text):
         return None
     return parsed if isinstance(parsed, dict) else None
 
+
+def _validate_offset(raw, label):
+    """Validate a hook-time byte offset extracted from a SubagentStart/
+    SubagentStop hook event (Issue #2274 AC17 corrective iteration). Never
+    promotes an ambiguous or malformed value to a usable int -- always
+    returns (None, typed_reason) in that case, so a missing / non-integer /
+    negative offset is always a typed FAIL, never silently coerced or
+    treated as zero."""
+    if raw is None:
+        return None, "spark_%s_offset_missing" % label
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, "spark_%s_offset_not_integer_%s" % (label, raw)
+    if raw < 0:
+        return None, "spark_%s_offset_negative_%d" % (label, raw)
+    return raw, None
+
+
+try:
+    proxy_captured_log_size = int(proxy_captured_log_size_raw)
+except (TypeError, ValueError):
+    proxy_captured_log_size = None
 
 events = list(_iter_stream_events(stdout_path))
 
@@ -344,7 +376,20 @@ for idx, ev in enumerate(events):
     hook_event = ev.get("hook_event")
     if hook_event not in HOOK_LIFECYCLE:
         continue
-    entry = {"hook_event": hook_event, "stream_index": idx, "agent_id": None, "agent_type": None}
+    entry = {
+        "hook_event": hook_event,
+        "stream_index": idx,
+        "agent_id": None,
+        "agent_type": None,
+        # Issue #2274 AC17 corrective iteration: raw (unvalidated) byte
+        # offset the SubagentStart/SubagentStop observational hook recorded
+        # AT ITS OWN EXECUTION TIME (see launch.sh's
+        # SPARK_LIFECYCLE_OFFSET_WRITER). Kept as the raw JSON value here
+        # (may be int, str, negative, or absent/None) -- type/range
+        # validation happens later via _validate_offset, never here, so a
+        # malformed value is never silently coerced during extraction.
+        "proxy_log_byte_offset_at_hook_time_raw": None,
+    }
     channel_parsed = {}
     for key in ("stdout", "output"):
         parsed = _parse_embedded(ev.get(key))
@@ -357,6 +402,10 @@ for idx, ev in enumerate(events):
             b = channel_parsed["output"].get(field_name)
             if isinstance(a, str) and a and isinstance(b, str) and b and a != b:
                 contradictory = True
+        oa = channel_parsed["stdout"].get("proxy_log_byte_offset_at_hook_time")
+        ob = channel_parsed["output"].get("proxy_log_byte_offset_at_hook_time")
+        if oa is not None and ob is not None and oa != ob:
+            contradictory = True
     entry["contradictory"] = contradictory
     if not contradictory:
         for parsed in channel_parsed.values():
@@ -364,11 +413,19 @@ for idx, ev in enumerate(events):
                 entry["agent_id"] = parsed.get("agent_id")
             if entry["agent_type"] is None and isinstance(parsed.get("agent_type"), str) and parsed.get("agent_type"):
                 entry["agent_type"] = parsed.get("agent_type")
+            if (
+                entry["proxy_log_byte_offset_at_hook_time_raw"] is None
+                and "proxy_log_byte_offset_at_hook_time" in parsed
+            ):
+                entry["proxy_log_byte_offset_at_hook_time_raw"] = parsed.get(
+                    "proxy_log_byte_offset_at_hook_time"
+                )
     lifecycle.append(entry)
 
 reasons: list[str] = []
 invocation = None
 agent_info = None
+lifecycle_window = None
 
 if len(agent_tool_uses) != 1:
     reasons.append("expected_exactly_one_spark_agent_tool_use_observed_%d" % len(agent_tool_uses))
@@ -416,6 +473,36 @@ else:
                 reasons.append("lifecycle_pair_not_exactly_one_starts_%d_stops_%d" % (len(starts), len(stops)))
             elif starts[0]["stream_index"] >= stops[0]["stream_index"]:
                 reasons.append("subagent_start_does_not_precede_stop")
+            else:
+                # Issue #2274 AC17 corrective iteration: the proxy
+                # correlation window is now bounded by the byte offsets the
+                # SubagentStart/SubagentStop hooks recorded AT THEIR OWN
+                # EXECUTION TIME, never by an invocation-wide
+                # before/after-the-whole-launch.sh-call approximation.
+                start_offset, start_reason = _validate_offset(
+                    starts[0]["proxy_log_byte_offset_at_hook_time_raw"], "start"
+                )
+                stop_offset, stop_reason = _validate_offset(
+                    stops[0]["proxy_log_byte_offset_at_hook_time_raw"], "stop"
+                )
+                if start_reason:
+                    reasons.append(start_reason)
+                if stop_reason:
+                    reasons.append(stop_reason)
+                if start_offset is not None and stop_offset is not None:
+                    if start_offset > stop_offset:
+                        reasons.append(
+                            "spark_start_offset_after_stop_offset_%d_gt_%d" % (start_offset, stop_offset)
+                        )
+                    elif proxy_captured_log_size is None:
+                        reasons.append("captured_proxy_log_size_not_integer")
+                    elif stop_offset > proxy_captured_log_size:
+                        reasons.append(
+                            "spark_stop_offset_beyond_captured_proxy_log_size_%d_gt_%d"
+                            % (stop_offset, proxy_captured_log_size)
+                        )
+                    else:
+                        lifecycle_window = (start_offset, stop_offset)
         else:
             reasons.append("no_lifecycle_correlation_missing_agent_id")
 
@@ -457,49 +544,65 @@ else:
         # not appended as a reason, and never fabricated as `[]` in place
         # of the raw absent value for reporting purposes below.
 
-# --- Proxy log slice (bounded to this single-agent step window; see
-#     runtime_smoke_test.sh comment at the call site for the exact bound
-#     semantics used). This window legitimately also contains the PARENT
-#     session's own (non-Spark) model traffic for the same turn (e.g. the
-#     main session's own reasoning-model requests, auto-generated title/
-#     summary requests) -- live-observed reality, 2026-08-21: a window
-#     containing exactly one genuine spark-codex delegation also contained
-#     unrelated gpt-5.6-terra/gpt-5.6-luna requests from the parent
-#     session/runtime itself. Only the request(s) whose own `model` field
-#     equals `expected_model` are Spark's own traffic; non-matching models
-#     in the same window are not a violation on their own and are never
-#     flagged as a mismatch. ---
+# --- Proxy log slice, bounded by the hook-time byte-offset window computed
+#     above (`lifecycle_window`), never by an invocation-wide
+#     before/after-the-whole-launch.sh-call approximation (Issue #2274
+#     AC17 corrective iteration). This window legitimately can still
+#     contain the PARENT session's own (non-Spark) model traffic for the
+#     same turn (e.g. the main session's own reasoning-model requests,
+#     auto-generated title/summary requests) -- live-observed reality,
+#     2026-08-21: a window containing exactly one genuine spark-codex
+#     delegation also contained unrelated gpt-5.6-terra/gpt-5.6-luna
+#     requests from the parent session/runtime itself. Only the request(s)
+#     whose own `model` field equals `expected_model` are Spark's own
+#     traffic; non-matching models in the same window are not a violation
+#     on their own and are never flagged as a mismatch. Traffic strictly
+#     BEFORE the hook-time start offset or AT/AFTER the hook-time stop
+#     offset (e.g. leftover requests from a prior turn/agent) is never read
+#     into `proxy_requests` at all -- it is outside the byte range this
+#     process ever opens (this is what makes a pre-window contaminating
+#     request structurally unable to be misread as this run's evidence). ---
 proxy_requests = []
-try:
-    with open(proxy_slice_path, encoding="utf-8", errors="replace") as fh:
-        proxy_lines = fh.readlines()
-except OSError:
-    proxy_lines = []
-for raw in proxy_lines:
-    raw = raw.strip()
-    if not raw:
-        continue
+if lifecycle_window is not None:
+    window_start, window_stop = lifecycle_window
     try:
-        obj = json.loads(raw)
-    except ValueError:
-        continue
-    if obj.get("msg") != "codex_upstream_request_started":
-        continue
-    fields = obj.get("fields") if isinstance(obj.get("fields"), dict) else {}
-    proxy_requests.append(
-        {
-            "req_id": fields.get("reqId") if isinstance(fields.get("reqId"), str) else None,
-            "model": fields.get("model") if isinstance(fields.get("model"), str) else None,
-            "transport": fields.get("transport") if isinstance(fields.get("transport"), str) else None,
-        }
-    )
+        with open(proxy_full_log_path, "rb") as fh:
+            fh.seek(window_start)
+            window_bytes = fh.read(window_stop - window_start)
+    except OSError:
+        window_bytes = b""
+    window_text = window_bytes.decode("utf-8", errors="replace")
+    for raw in window_text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if obj.get("msg") != "codex_upstream_request_started":
+            continue
+        fields = obj.get("fields") if isinstance(obj.get("fields"), dict) else {}
+        proxy_requests.append(
+            {
+                "req_id": fields.get("reqId") if isinstance(fields.get("reqId"), str) else None,
+                "model": fields.get("model") if isinstance(fields.get("model"), str) else None,
+                "transport": fields.get("transport") if isinstance(fields.get("transport"), str) else None,
+            }
+        )
 
 spark_proxy_requests = [r for r in proxy_requests if r.get("model") == expected_model]
 
-if not proxy_requests:
-    reasons.append("no_proxy_requests_observed_in_step_window")
+if lifecycle_window is None:
+    # A more specific typed reason (missing/invalid offset, lifecycle pair
+    # count, etc.) has already been appended above -- never additionally
+    # claim "no proxy requests observed" when the window itself could not
+    # be honestly resolved.
+    pass
+elif not proxy_requests:
+    reasons.append("no_proxy_requests_observed_in_lifecycle_window")
 elif not spark_proxy_requests:
-    reasons.append("no_proxy_spark_model_request_observed_in_step_window")
+    reasons.append("no_proxy_spark_model_request_observed_in_lifecycle_window")
 else:
     for r in spark_proxy_requests:
         if r.get("transport") != "http":
@@ -530,9 +633,11 @@ definition = {
     "source": "launcher_owned_agents_json",
 }
 proxy_block = {
-    "correlation": "isolated_subagent_lifecycle_window",
+    "correlation": "hook_time_byte_offset_lifecycle_window",
     "request_count": len(spark_proxy_requests),
     "requests": spark_proxy_requests,
+    "lifecycle_window_start_byte_offset": lifecycle_window[0] if lifecycle_window else None,
+    "lifecycle_window_stop_byte_offset": lifecycle_window[1] if lifecycle_window else None,
 }
 sut_block = {
     "git_head": sut_git_head,
@@ -603,32 +708,39 @@ Then print its exact output verbatim."
     spark_stdout_file=$(mktemp)
     spark_stderr_file=$(mktemp)
 
-    spark_offset_before=0
-    if [ -f "$SPARK_STRUCTURED_PROXY_LOG_PATH" ]; then
-      spark_offset_before=$(wc -c < "$SPARK_STRUCTURED_PROXY_LOG_PATH" 2>/dev/null || echo 0)
-    fi
-
+    # Issue #2274 AC17 corrective iteration: no invocation-wide
+    # before/after byte-offset approximation is captured here any more.
+    # The authoritative correlation window is instead computed INSIDE
+    # SPARK_EVIDENCE_PY from the hook-time byte offsets that the
+    # SubagentStart/SubagentStop observational hooks themselves recorded
+    # (see launch.sh's SPARK_LIFECYCLE_OFFSET_WRITER, wired via
+    # CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop below). This shell
+    # only captures a full snapshot of the proxy log AFTER the invocation
+    # completes (so every byte up to the SubagentStop offset is guaranteed
+    # flushed to disk) and passes that snapshot -- unsliced -- to the
+    # evidence builder, along with its captured size for beyond-EOF
+    # validation.
     CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop "$SCRIPT_DIR/launch.sh" -- -p "$SPARK_PROMPT" \
       --output-format stream-json --include-hook-events --no-session-persistence --verbose \
       --allowedTools "Task" --max-turns 6 \
       >"$spark_stdout_file" 2>"$spark_stderr_file"
     rm -f "$spark_stderr_file"
 
-    spark_offset_after=0
+    spark_full_proxy_log_size=0
     if [ -f "$SPARK_STRUCTURED_PROXY_LOG_PATH" ]; then
-      spark_offset_after=$(wc -c < "$SPARK_STRUCTURED_PROXY_LOG_PATH" 2>/dev/null || echo 0)
+      spark_full_proxy_log_size=$(wc -c < "$SPARK_STRUCTURED_PROXY_LOG_PATH" 2>/dev/null || echo 0)
     fi
-    spark_proxy_slice=$(mktemp)
-    if [ -f "$SPARK_STRUCTURED_PROXY_LOG_PATH" ] && [ "$spark_offset_after" -gt "$spark_offset_before" ]; then
-      tail -c "+$((spark_offset_before + 1))" "$SPARK_STRUCTURED_PROXY_LOG_PATH" \
-        | head -c "$((spark_offset_after - spark_offset_before))" > "$spark_proxy_slice" 2>/dev/null
+    spark_proxy_log_snapshot=$(mktemp)
+    if [ -f "$SPARK_STRUCTURED_PROXY_LOG_PATH" ]; then
+      cp "$SPARK_STRUCTURED_PROXY_LOG_PATH" "$spark_proxy_log_snapshot" 2>/dev/null || : > "$spark_proxy_log_snapshot"
     fi
 
-    SPARK_EVIDENCE_JSON=$(python3 "$SPARK_EVIDENCE_PY" "$spark_stdout_file" "$spark_proxy_slice" \
+    SPARK_EVIDENCE_JSON=$(python3 "$SPARK_EVIDENCE_PY" "$spark_stdout_file" "$spark_proxy_log_snapshot" \
       "$CLAUDE_GPT_SPARK_AGENT_NAME" "$CLAUDE_GPT_SPARK_MODEL" "$SPARK_MARKER" \
       "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
-      "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" "$SPARK_CLAUDE_CODE_VERSION" "$TIMESTAMP")
-    rm -f "$spark_stdout_file" "$spark_proxy_slice"
+      "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" "$SPARK_CLAUDE_CODE_VERSION" "$TIMESTAMP" \
+      "$spark_full_proxy_log_size")
+    rm -f "$spark_stdout_file" "$spark_proxy_log_snapshot"
 
     SPARK_ATTEMPTED=$(printf '%s' "$SPARK_EVIDENCE_JSON" | python3 -c '
 import json, sys
