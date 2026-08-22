@@ -149,6 +149,38 @@ missing_sections: []            # rewrite 後も残っている不足セクシ�
 missing_contract_keys: []       # rewrite 後も残っている不足 contract キー（空 = 解消済み）
 ```
 
+## SEMANTIC_REWRITE_CONSTRAINTS_V1 の rewrite payload 契約（Issue #2296 由来）
+
+`issue-refinement-loop` の Step 2.5（semantic design review lane）で `join_review_results.py`
+が `effective_verdict: needs-fix` を返した場合、以下のスキーマの入力を受け取る。これは
+`FAIL_CLOSED_REWRITE_CONSTRAINTS_V1`（Issue #995、fail-closed セクション/契約キー補完専用）
+とは別の契約として共存する。`FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` はそのまま維持され、本契約は
+semantic finding に基づく AC/VC/architecture 判断の書き換えを扱う。
+
+```yaml
+SEMANTIC_REWRITE_CONSTRAINTS_V1:
+  schema_version: "SEMANTIC_REWRITE_CONSTRAINTS_V1"
+  findings:
+    - severity: blocker | high | medium | low
+      summary: ...
+      evidence_refs: []
+      recommended_fix: ...
+  freeform_rewrite_forbidden: false
+  max_rewrite_attempts: 2
+  no_progress_route: "human_judgment_required"
+```
+
+### Rewrite 実行ルール (Rewrite Rules)
+
+1. `findings` のうち `severity: blocker|high` かつ `owner_disposition` が未記録のものだけが
+   rewrite 対象になる（`join_review_results.py` の `route_high_open_to_rewrite` policy と一致させる）
+2. `recommended_fix` を機械的に適用するのではなく、`summary` / `evidence_refs` を根拠として
+   Issue 契約（AC・VC・Allowed Paths・Stop Conditions 等）を修正する
+3. `freeform_rewrite_forbidden: false`（既定）の場合、semantic finding の解消に必要な範囲で
+   本文の自由記述を修正してよい。ただし `## In Scope` / `## Out of Scope` の境界を超える
+   スコープ拡張が必要と判明した場合は rewrite を実施せず `status: failed` + `human_judgment_required` を返す
+4. `max_rewrite_attempts` を超えて同じ finding が解消しない場合、`no_progress_route` に従う
+
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。

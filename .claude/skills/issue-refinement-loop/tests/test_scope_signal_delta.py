@@ -275,3 +275,46 @@ def test_legacy_fallback_and_delta_helper_tokenization_agree(
     delta_layers = {item["value"] for item in delta_items}
     assert legacy_layers == expected_layers
     assert delta_layers == expected_layers
+
+
+# --- Issue #2296 AC9: severity-tagged heading extraction ------------------
+
+
+def test_extract_directive_markers_detects_severity_tagged_heading():
+    """GIVEN a comment body with an owner adversarial-review severity
+    heading (## P0-1)
+    WHEN extract_directive_markers runs
+    THEN the uppercased tag is included in the returned marker list."""
+    text = "## P0-1\n\nSomething is broken.\n\n- fix it"
+    markers = delta.extract_directive_markers(text)
+    assert "P0-1" in markers
+
+
+def test_extract_directive_markers_detects_multiple_severity_tags_lowercase_heading():
+    text = "### p1-3\nlower body\n\n#### p2\nnot a match (missing dash-number)"
+    markers = delta.extract_directive_markers(text)
+    assert "P1-3" in markers
+    assert "P2" not in markers  # P2 alone (no "-N") is not the tagged pattern
+
+
+def test_extract_directive_markers_without_severity_heading_is_unaffected():
+    text = "Plain freeform comment with no heading at all."
+    markers = delta.extract_directive_markers(text)
+    assert markers == []
+
+
+def test_extract_directive_markers_still_detects_fixed_markers_alongside_severity_tag():
+    text = "## P0-2\n\nRevised Acceptance Criteria below.\n\n- item"
+    markers = delta.extract_directive_markers(text)
+    assert "P0-2" in markers
+    assert "revised acceptance criteria" in markers
+
+
+def test_extract_directive_items_and_confidence_classifier_are_unmodified():
+    """AC9: only extract_directive_markers() changes; other existing
+    functions in scope_signal_delta.py keep their prior behavior."""
+    text = "## P0-1\n\n- please fix this"
+    items = delta.extract_directive_items(text)
+    assert items == ["please fix this"]
+    confidence = delta.classify_directive_confidence(text)
+    assert confidence == delta.DIRECTIVE_CONFIDENCE_EXPLICIT

@@ -273,6 +273,10 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/decide_next
 常に hard-stop 判定する（呼び出しタイミングの制御が orchestrator 側の責務であり、
 スクリプト自身は phase 概念を持たない。AC4 / #919 回帰維持）。
 
+### Step 2.5: Semantic Design Review
+
+deterministic `VERDICT: approve` 確定後、`semantic_review_trigger.py` で `semantic_review_applicable` を判定する。`true` の場合のみ `semantic_review_transport.py` → `join_review_results.py` を実行し、返る `effective_verdict`（approve | needs-fix | human_judgment_required）を通常の VERDICT として上記 routing にそのまま渡す（approve→Step4.5 / needs-fix→Step4 / human_judgment_required→Step5）。`false` の場合は本 Step をスキップし直接 Step 4.5 へ 進む。詳細手順は `references/semantic-design-review.md` を参照する。`decide_next_loop_action.py` の既存呼び出し規約は一切変更しない。
+
 ### Step 4: 書き換え (Rewrite)
 
 `issue-editor` SubAgent に opaque forwarding payload を渡して本文を更新する（Issue #1734: `issue-author` は `issue-creator` / `issue-editor` に分割済み。既存 Issue の書き換えは `issue-editor` が担う）。AC/VC の baseline fail expectation と review 時の扱いを取り違えないこと。詳細な reflection guard は `references/ac-vc-reflection.md` を参照する。
@@ -422,6 +426,7 @@ downstream skill（impl-review-loop・implement-issue・issue-contract-review・
 | planner output contract | `references/refinement-loop-plan-output.md` |
 | scope rollup preflight | `references/scope-rollup-policy.md` |
 | command registry | `scripts/command_registry.py` — `ISSUE_REFINEMENT_COMMAND_REGISTRY_V1` |
+| semantic design review (Step 2.5) | `references/semantic-design-review.md` |
 | architecture review / design 判断・failure mode の詳細（`derived_design_note`。本 entrypoint と矛盾する場合は本 entrypoint が正本、#1876） | `docs/dev/workflows/issue-refinement-loop-design.md` |
 
 ## 安全策 (Guardrails)
@@ -460,13 +465,7 @@ test "$(wc -l < .claude/skills/issue-refinement-loop/SKILL.md)" -le 500
 
 # AC4 / AC6 / AC10
 rg -n "references/anchor-comment-handling\.md|references/web-research-routing\.md|references/follow-up-materialization\.md|references/termination-policy\.md|references/ac-vc-reflection\.md|references/scope-signal-guard\.md" .claude/skills/issue-refinement-loop/SKILL.md
-test -f .claude/skills/issue-refinement-loop/references/index.md
-test -f .claude/skills/issue-refinement-loop/references/anchor-comment-handling.md
-test -f .claude/skills/issue-refinement-loop/references/web-research-routing.md
-test -f .claude/skills/issue-refinement-loop/references/follow-up-materialization.md
-test -f .claude/skills/issue-refinement-loop/references/termination-policy.md
-test -f .claude/skills/issue-refinement-loop/references/ac-vc-reflection.md
-test -f .claude/skills/issue-refinement-loop/references/scope-signal-guard.md
+for f in index anchor-comment-handling web-research-routing follow-up-materialization termination-policy ac-vc-reflection scope-signal-guard; do test -f .claude/skills/issue-refinement-loop/references/$f.md; done
 rg -nq "\| topic \| file \| loaded_when \| owner \| moved_from \| must_not \|" .claude/skills/issue-refinement-loop/references/index.md
 
 # AC8 / AC9

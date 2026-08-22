@@ -916,10 +916,26 @@ def _has_explicit_exact_allowed_path_expansion(evidence: dict) -> bool:
     return False
 
 
+_SEVERITY_TAGGED_HEADING_RE = re.compile(
+    r"^\s*#+\s*(P[0-9]+-[0-9]+)\b", re.MULTILINE | re.IGNORECASE
+)
+
+
 def extract_directive_markers(text: "str | None") -> list:
-    """Detect known directive section markers (Revised AC, Stop Condition, ...)."""
+    """Detect known directive section markers (Revised AC, Stop Condition, ...).
+
+    #2296 AC9: also detects severity-tagged headings such as ``## P0-1``
+    (an owner adversarial-review-round severity marker) via
+    ``_SEVERITY_TAGGED_HEADING_RE`` and includes the matched tag (e.g.
+    ``P0-1``) uppercased in the returned marker list, alongside the
+    pre-existing fixed ``_DIRECTIVE_SECTION_MARKERS`` membership check. No
+    other behavior of this function changes.
+    """
     lowered = (text or "").lower()
-    return sorted({marker for marker in _DIRECTIVE_SECTION_MARKERS if marker in lowered})
+    markers = {marker for marker in _DIRECTIVE_SECTION_MARKERS if marker in lowered}
+    for match in _SEVERITY_TAGGED_HEADING_RE.finditer(text or ""):
+        markers.add(match.group(1).upper())
+    return sorted(markers)
 
 
 def extract_directive_items(text: "str | None") -> list:

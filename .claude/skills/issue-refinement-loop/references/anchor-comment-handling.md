@@ -260,3 +260,25 @@ trusted OWNER の multi-turn anchor で advisory route に入った後、候補�
 ### heavy mutation gate（重大変更ゲート・AC6）
 
 `run_refinement_preflight.py` の `_classify_heavy_mutation_gate()` は、`known_context.mutation_category` が heavy mutation カテゴリ（`close` / `not_planned` / `replacement_issue_creation` / `dependency_removal` / `parent_child_change`）に該当する場合、`scope_delta_decision` が owner 発言由来の明示的決定（`status: approved_by_trusted_anchor` かつ `anchor_author_association: OWNER`）でない限り `status: blocked` / `fail_closed: true` を返す。非 heavy な通常改善・追加調査・review 継続カテゴリは、owner 明示的決定がなくても `status: warn` で継続する。
+
+
+### Severity-tagged 見出しの構造化抽出（#2296 AC9）
+
+Owner の敵対的レビューコメントで頻出する `## P0-1` / `### P1-3` のような
+severity-tagged 見出し（`^#+\s*P[0-9]+-[0-9]+` 形式、大文字小文字を区別しない）は、
+`extract_directive_markers()`（`scope_signal_delta.py`）が既存の固定
+`_DIRECTIVE_SECTION_MARKERS` 判定に加えて `_SEVERITY_TAGGED_HEADING_RE` で
+抽出し、マッチしたタグ（例: `P0-1`）を大文字化して返り値の marker list に含める。
+
+この抽出は独立した新規関数としては実装しない（P1-5: `extract_directive_markers()`
+自体を拡張し、`_DIRECTIVE_SECTION_MARKERS` 判定ロジックや他の既存関数
+（`extract_directive_items()` / `classify_directive_confidence()` 等）には
+diff を出さない）。severity-tagged 見出しが 1 件でも検出された場合、
+`classify_directive_confidence()` は（bullet-list の有無次第で）通常の
+marker-present 経路に従って `explicit` / `ambiguous` を判定する — 見出し検出
+自体が新しい confidence 経路を追加するものではない。
+
+severity-tagged 見出し抽出は、`semantic_review_trigger.py` の
+`severity_tagged_anchor_findings` シグナル（#2296 Step 2.5）の入力として
+使われることを想定しているが、`scope_signal_delta.py` 自体はその上位レイヤーの
+呼び出し規約を知らない（責務分離を維持する）。
