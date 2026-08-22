@@ -273,7 +273,7 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/decide_next
 常に hard-stop 判定する（呼び出しタイミングの制御が orchestrator 側の責務であり、
 スクリプト自身は phase 概念を持たない。AC4 / #919 回帰維持）。
 
-### Step 2.5: Semantic Design Review
+### Step 2.5: セマンティック設計レビュー (Semantic Design Review)
 
 deterministic `VERDICT: approve` 確定後、`semantic_review_trigger.py` で `semantic_review_applicable` を判定する。`true` の場合のみ `semantic_review_transport.py` → `join_review_results.py` を実行し、返る `effective_verdict`（approve | needs-fix | human_judgment_required）を通常の VERDICT として上記 routing にそのまま渡す（approve→Step4.5 / needs-fix→Step4 / human_judgment_required→Step5）。`false` の場合は本 Step をスキップし直接 Step 4.5 へ 進む。詳細手順は `references/semantic-design-review.md` を参照する。`decide_next_loop_action.py` の既存呼び出し規約は一切変更しない。
 
