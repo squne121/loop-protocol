@@ -1233,6 +1233,7 @@ def test_publish_request_forbidden_fields_valid_envelope_accepted() -> None:
         "idempotency_key",
         "public_projection_digest",
         "authorization_required",
+        "delta_results",
     }
     assert {f.name for f in dataclasses.fields(rr.PublishRequest)} == expected_keys
     assert parsed == instance
@@ -1651,3 +1652,219 @@ def test_manual_trigger_preflight_rejects_non_git_root(tmp_path: Path) -> None:
 def test_manual_trigger_preflight_accepts_git_root() -> None:
     repo_root = _SCRIPTS_DIR.parents[3]
     rr.manual_trigger_preflight(repo_root=repo_root)  # no raise
+
+
+# ---------------------------------------------------------------------------
+# fix_delta iteration-4, Warning 1: compute_delta() actually wired into the
+# production execute_run()/run_cli() -> finalize() call graph (previously
+# only unit-tested standalone, never invoked from the production path)
+# ---------------------------------------------------------------------------
+
+
+def _make_execute_run_evaluator_invoke(candidate_records: list[dict[str, Any]]):
+    def _invoke(request: rr.EvaluatorRequest) -> rr.AgentInvocationResult:
+        evaluation = rr.Evaluation(
+            run_id=request.run_id,
+            base_sha=request.base_sha,
+            source_set_digest=request.source_set_digest,
+            candidate_records=candidate_records,
+            evidence_ref="evidence://evaluation",
+        )
+        return _ok_agent_result(json.loads(evaluation.to_wire()))
+
+    return _invoke
+
+
+def test_compute_delta_wired_into_production_publish_path_recurrent() -> None:
+    # GIVEN a PreviousStateProvider seeded with a previously-resolved finding
+    resolved_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.resolved.valid.json")
+    current_recurrence = copy.deepcopy(resolved_fixture)
+    repository_id = "squne121/loop-protocol"
+    provider = rr.FixturePreviousStateProvider(
+        fixtures={
+            (repository_id, rr.DEFAULT_PREVIOUS_STATE_SCOPE): rr.PreviousStateResult(
+                status="available", previous_run_ref="run-0", candidates=[resolved_fixture], read_version="v1"
+            )
+        }
+    )
+    call_log: list[str] = []
+    expected_digest = rr.compute_source_set_digest([_fake_collector_result("repository", _FULL_SHA).observation])
+
+    # WHEN execute_run() (the production composition, not a standalone
+    # compute_delta() unit test) runs the full pipeline with that provider
+    publish_request = rr.execute_run(
+        base_sha_resolver=lambda: _FULL_SHA,
+        collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
+        observer_requests=[_observer_request("retrospective-runtime-observer")],
+        invoke=_make_observer_invoke("run-delta-1", expected_digest, call_log),
+        invoke_evaluator=_make_execute_run_evaluator_invoke([current_recurrence]),
+        repository_id=repository_id,
+        target_issue=2237,
+        request_id="req-delta-1",
+        idempotency_key="idem-delta-1",
+        run_id="run-delta-1",
+        previous_state_provider=provider,
+    )
+
+    # THEN the PublishRequest actually returned by the production call graph
+    # (not a hand-called compute_delta()) carries the classified delta
+    assert publish_request.delta_results == [
+        {
+            "finding_identity": resolved_fixture["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "recurrent",
+        }
+    ]
+
+
+def test_compute_delta_wired_into_production_publish_path_forces_indeterminate() -> None:
+    # GIVEN a PreviousStateProvider reporting incomplete ("partial") coverage
+    new_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.new.valid.json")
+    repository_id = "squne121/loop-protocol"
+    provider = rr.FixturePreviousStateProvider(
+        fixtures={
+            (repository_id, rr.DEFAULT_PREVIOUS_STATE_SCOPE): rr.PreviousStateResult(
+                status="partial", previous_run_ref="run-0", candidates=[new_fixture], read_version="v1"
+            )
+        }
+    )
+    call_log: list[str] = []
+    expected_digest = rr.compute_source_set_digest([_fake_collector_result("repository", _FULL_SHA).observation])
+
+    # WHEN the production call graph runs with that (indeterminate-forcing)
+    # provider state
+    publish_request = rr.execute_run(
+        base_sha_resolver=lambda: _FULL_SHA,
+        collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
+        observer_requests=[_observer_request("retrospective-runtime-observer")],
+        invoke=_make_observer_invoke("run-delta-2", expected_digest, call_log),
+        invoke_evaluator=_make_execute_run_evaluator_invoke([new_fixture]),
+        repository_id=repository_id,
+        target_issue=2237,
+        request_id="req-delta-2",
+        idempotency_key="idem-delta-2",
+        run_id="run-delta-2",
+        previous_state_provider=provider,
+    )
+
+    # THEN the PublishRequest carries the forced-indeterminate classification
+    # end-to-end -- an indeterminate evaluation is never reported "resolved"
+    assert publish_request.delta_results == [
+        {
+            "finding_identity": new_fixture["finding_contract"]["identity"]["value"],
+            "evaluation_status": "indeterminate",
+            "delta_status": None,
+            "indeterminate_reason": "source_partial",
+        }
+    ]
+
+
+def test_compute_delta_wired_into_production_publish_path_default_provider_is_new() -> None:
+    # GIVEN no previous_state_provider is injected (the common/default case)
+    call_log: list[str] = []
+    expected_digest = rr.compute_source_set_digest([_fake_collector_result("repository", _FULL_SHA).observation])
+
+    # WHEN execute_run() runs without wiring a PreviousStateProvider
+    publish_request = rr.execute_run(
+        base_sha_resolver=lambda: _FULL_SHA,
+        collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
+        observer_requests=[_observer_request("retrospective-runtime-observer")],
+        invoke=_make_observer_invoke("run-delta-3", expected_digest, call_log),
+        invoke_evaluator=_make_execute_run_evaluator_invoke([_new_candidate()]),
+        repository_id="squne121/loop-protocol",
+        target_issue=2237,
+        request_id="req-delta-3",
+        idempotency_key="idem-delta-3",
+        run_id="run-delta-3",
+    )
+
+    # THEN the default FixturePreviousStateProvider(fixtures={}) still runs
+    # (a no-op default, not an unwired/absent field) and classifies as "new"
+    assert publish_request.delta_results == [
+        {
+            "finding_identity": _new_candidate()["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "new",
+        }
+    ]
+
+
+def test_compute_delta_wired_into_production_publish_path_run_cli(tmp_path: Path) -> None:
+    # GIVEN the same production entrypoint main()/run_cli() invokes, with a
+    # PreviousStateProvider that reports the finding as previously resolved
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    def _git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=_FULL_SHA + "\n", stderr="")
+
+    resolved_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.resolved.valid.json")
+    current_recurrence = copy.deepcopy(resolved_fixture)
+    repository_id = "squne121/loop-protocol"
+    provider = rr.FixturePreviousStateProvider(
+        fixtures={
+            (repository_id, rr.DEFAULT_PREVIOUS_STATE_SCOPE): rr.PreviousStateResult(
+                status="available", previous_run_ref="run-0", candidates=[resolved_fixture], read_version="v1"
+            )
+        }
+    )
+
+    real_observation = rr.build_repository_collector(repo_root)(_FULL_SHA).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        agent_name = argv[argv.index("--agent") + 1]
+        if agent_name == "retrospective-evaluator":
+            evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
+            evaluation = rr.Evaluation(
+                run_id=evaluator_request.run_id,
+                base_sha=_FULL_SHA,
+                source_set_digest=evaluator_request.source_set_digest,
+                candidate_records=[current_recurrence],
+                evidence_ref="e",
+            )
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(evaluation.to_wire()))), stderr=""
+            )
+        bundle = rr.EvidenceBundle(
+            run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
+            base_sha=kwargs["env"].get("AGENT_RETROSPECTIVE_BASE_SHA", ""),
+            source_set_digest=expected_digest,
+            observer_id=agent_name,
+            evidence_ref=f"evidence://{agent_name}",
+            findings=[{"claim": f"finding from {agent_name}", "claim_class": "process"}],
+        )
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(bundle.to_wire()))), stderr=""
+        )
+
+    # WHEN run_cli() -- the exact function main() calls -- runs with that
+    # provider injected
+    publish_request = rr.run_cli(
+        repo_root=repo_root,
+        repository_id=repository_id,
+        target_issue=2237,
+        request_id="req-cli-delta-1",
+        idempotency_key="idem-cli-delta-1",
+        schema_dir=schema_dir,
+        prompts={},
+        runner=_runner,
+        git_runner=_git_runner,
+        run_id="run-cli-delta-1",
+        temp_base_dir=tmp_path,
+        previous_state_provider=provider,
+    )
+
+    # THEN the PublishRequest run_cli() returns (the same object main()
+    # prints to stdout) carries the delta classification
+    assert publish_request.delta_results == [
+        {
+            "finding_identity": resolved_fixture["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "recurrent",
+        }
+    ]
+

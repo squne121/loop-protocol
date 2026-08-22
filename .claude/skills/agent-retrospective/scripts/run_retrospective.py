@@ -101,6 +101,14 @@ def _validate_retrospective_schema_module():
     return _load_sibling_module("agent_retrospective_validate_schema", "validate_retrospective_schema.py")
 
 
+def _default_finding_identity_algorithm() -> str:
+    """Reuse Child 2's canonical ``FINDING_IDENTITY_ALGORITHM`` constant
+    (Issue #2235/#2236) as the ``finding_identity_algorithm`` argument passed
+    to ``PreviousStateProvider.get()`` on the production call graph (Issue
+    #2237 fix_delta iteration-4, Warning 1: ``compute_delta()`` wiring)."""
+    return _validate_retrospective_schema_module().FINDING_IDENTITY_ALGORITHM
+
+
 def _collect_snapshot_module():
     return _load_sibling_module("agent_retrospective_collect_snapshot", "collect_snapshot.py")
 
@@ -130,6 +138,13 @@ WIRE_SCHEMA_FINDING_SET = "finding_set/v1"
 WIRE_SCHEMA_EVALUATOR_REQUEST = "evaluator_request/v1"
 WIRE_SCHEMA_EVALUATION = "evaluation_result/v1"
 WIRE_SCHEMA_PUBLISH_REQUEST = "publish_request/v1"
+
+#: default ``PreviousStateProvider.get()`` ``scope`` value used by
+#: ``execute_run()``/``run_cli()`` when the caller doesn't override it (Issue
+#: #2237 fix_delta iteration-4, Warning 1). This module scopes delta
+#: correlation to the whole repository; a narrower scope is a future
+#: extension the ``PreviousStateProvider`` port already supports.
+DEFAULT_PREVIOUS_STATE_SCOPE = "repository"
 
 #: forbidden fields on PUBLISH_REQUEST_V1 (Issue #2237 P0-4). These are never
 #: declared as PublishRequest dataclass fields, so the generic strict
@@ -445,6 +460,17 @@ class PublishRequest(_WireEnvelope):
     idempotency_key: str = ""
     public_projection_digest: str = ""
     authorization_required: bool = True
+    #: per-finding ``compute_delta()`` output (Issue #2237 fix_delta
+    #: iteration-4, Warning 1): each entry is one of the dicts
+    #: ``compute_delta()`` returns (``finding_identity``/``evaluation_status``/
+    #: ``delta_status``, plus ``indeterminate_reason`` when
+    #: ``evaluation_status == "indeterminate"``). Empty when the caller wires
+    #: no ``PreviousStateProvider`` result (e.g. direct ``finalize()`` callers
+    #: in tests that don't pass ``delta_results``). Not part of
+    #: ``public_projection_digest``'s hash preimage -- delta classification is
+    #: a deterministic function of ``run_identity``/``candidate_records`` plus
+    #: previously-persisted state, not itself a concurrency precondition.
+    delta_results: list[dict[str, Any]] = field(default_factory=list)
 
     def _post_validate(self) -> None:
         _require_schema_version(self, WIRE_SCHEMA_PUBLISH_REQUEST)
@@ -1021,10 +1047,18 @@ def finalize(
     request_id: str,
     idempotency_key: str,
     expected_previous_digest: str | None = None,
+    delta_results: list[dict[str, Any]] | None = None,
 ) -> PublishRequest:
     """``finalize`` phase: produce the proposal-only ``PublishRequest``. This
     function performs no I/O, no GitHub/Issue mutation, and no filesystem
-    write -- it only returns a value (AC11).
+    write -- it only returns a value (AC11). ``delta_results`` (Issue #2237
+    fix_delta iteration-4, Warning 1) is the already-computed
+    ``compute_delta()`` output the caller (``execute_run()``/``run_cli()``)
+    obtained from a ``PreviousStateProvider`` *before* calling ``finalize`` --
+    ``finalize`` itself never calls a provider or ``compute_delta``, so its
+    no-I/O guarantee is preserved; ``None``/omitted defaults to an empty list
+    (matches every existing direct ``finalize()`` caller that doesn't wire a
+    ``PreviousStateProvider``).
 
     ``public_projection_digest`` (Issue #2237 P1-2) is bound to the full
     ``run_identity`` (``run_id``/``base_sha``/``source_set_digest`` -- not
@@ -1050,6 +1084,7 @@ def finalize(
         idempotency_key=idempotency_key,
         public_projection_digest=digest,
         authorization_required=True,
+        delta_results=list(delta_results) if delta_results is not None else [],
     )
 
 
@@ -1074,12 +1109,26 @@ def execute_run(
     idempotency_key: str,
     run_id: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    previous_state_provider: "PreviousStateProviderProtocol | None" = None,
+    previous_state_scope: str = DEFAULT_PREVIOUS_STATE_SCOPE,
 ) -> PublishRequest:
     """Reference composition of ``prepare`` -> ``validate-observers`` ->
-    ``prepare-evaluator`` -> evaluator invocation -> ``finalize``. Raises
+    ``prepare-evaluator`` -> evaluator invocation -> delta computation ->
+    ``finalize``. Raises
     ``ObserverWaveFailed``/``EvaluatorInvocationFailed``/``WireContractError``
     fail-closed on any phase failure; never invokes the evaluator unless
-    every observer succeeded (AC9)."""
+    every observer succeeded (AC9).
+
+    ``previous_state_provider`` (Issue #2237 fix_delta iteration-4, Warning
+    1) is any ``PreviousStateProviderProtocol`` implementation -- defaults to
+    an empty ``FixturePreviousStateProvider`` (every finding classifies as
+    ``no_history`` -> ``new``) so this parameter is purely additive and every
+    existing caller keeps its prior behavior unless it opts in. The read
+    result is fed into ``compute_delta()`` and the resulting per-finding
+    classification is attached to the returned ``PublishRequest`` via
+    ``finalize(..., delta_results=...)`` -- this is the actual production
+    wiring point the standalone ``compute_delta()`` unit tests do not
+    exercise."""
     ctx, plan, _results = prepare(
         base_sha_resolver=base_sha_resolver, collectors=collectors, clock=clock, run_id=run_id
     )
@@ -1087,6 +1136,15 @@ def execute_run(
     finding_sets = build_finding_sets(ctx, plan, bundles)
     evaluator_request = prepare_evaluator_request(ctx, plan, finding_sets)
     evaluation = run_evaluation(ctx, evaluator_request, invoke_evaluator=invoke_evaluator)
+    resolved_provider = (
+        previous_state_provider if previous_state_provider is not None else FixturePreviousStateProvider(fixtures={})
+    )
+    previous_state = resolved_provider.get(
+        repository_id=repository_id,
+        scope=previous_state_scope,
+        finding_identity_algorithm=_default_finding_identity_algorithm(),
+    )
+    delta_results = compute_delta(previous_state, evaluation.candidate_records)
     return finalize(
         ctx,
         plan,
@@ -1095,6 +1153,7 @@ def execute_run(
         target_issue=target_issue,
         request_id=request_id,
         idempotency_key=idempotency_key,
+        delta_results=delta_results,
     )
 
 
@@ -1123,6 +1182,20 @@ class PreviousStateResult:
     def __post_init__(self) -> None:
         if self.status not in PREVIOUS_STATE_STATUSES:
             raise ValueError(f"invalid PreviousStateResult.status: {self.status!r}")
+
+
+class PreviousStateProviderProtocol(typing.Protocol):
+    """Structural type every ``PreviousStateProvider`` implementation
+    satisfies (this module's ``FixturePreviousStateProvider`` here; #2238's
+    real persistence-backed provider is expected to implement this exact
+    ``get()`` signature too). ``execute_run()``/``run_cli()`` accept any
+    object implementing this protocol via their ``previous_state_provider``
+    parameter (Issue #2237 fix_delta iteration-4, Warning 1) -- this is what
+    lets #2238 swap in the real provider without touching the call graph."""
+
+    def get(
+        self, *, repository_id: str, scope: str, finding_identity_algorithm: str
+    ) -> "PreviousStateResult": ...
 
 
 class FixturePreviousStateProvider:
@@ -1478,15 +1551,22 @@ def run_cli(
     clock: Callable[[], datetime] = _utcnow,
     run_id: str | None = None,
     temp_base_dir: Path | None = None,
+    previous_state_provider: "PreviousStateProviderProtocol | None" = None,
+    previous_state_scope: str = DEFAULT_PREVIOUS_STATE_SCOPE,
 ) -> PublishRequest:
     """The single production call graph (Issue #2237 P0-2): manual-trigger
     preflight -> run-scoped temp dir -> collector closures -> ``prepare`` ->
     exact-manifest observer wave (via the real headless CLI subprocess
     adapter, permission-policy-wrapped) -> fan-in with role-authority tagging
-    -> ``prepare-evaluator`` -> evaluator invocation -> ``finalize``. Returns
-    the proposal-only ``PublishRequest`` (raises a typed exception on any
-    phase failure -- ``main()`` converts that into a typed-failure stdout
-    payload and non-zero exit code)."""
+    -> ``prepare-evaluator`` -> evaluator invocation -> delta computation
+    (``PreviousStateProvider`` -> ``compute_delta()``, Issue #2237 fix_delta
+    iteration-4 Warning 1) -> ``finalize``. Returns the proposal-only
+    ``PublishRequest`` (raises a typed exception on any phase failure --
+    ``main()`` converts that into a typed-failure stdout payload and
+    non-zero exit code). ``previous_state_provider`` defaults to an empty
+    ``FixturePreviousStateProvider`` -- a real, persistence-backed provider
+    (#2238) can be injected here without any other change to this call
+    graph."""
     manual_trigger_preflight(repo_root=repo_root)
     resolved_run_id = run_id or str(uuid.uuid4())
     policy = DelegatedAgentPermissionPolicy(run_id=resolved_run_id)
@@ -1533,6 +1613,15 @@ def run_cli(
             return invoke_agent(evaluator_agent_request, runner=runner, policy=policy)
 
         evaluation = run_evaluation(ctx, evaluator_request, invoke_evaluator=_invoke_evaluator)
+        resolved_provider = (
+            previous_state_provider if previous_state_provider is not None else FixturePreviousStateProvider(fixtures={})
+        )
+        previous_state = resolved_provider.get(
+            repository_id=repository_id,
+            scope=previous_state_scope,
+            finding_identity_algorithm=_default_finding_identity_algorithm(),
+        )
+        delta_results = compute_delta(previous_state, evaluation.candidate_records)
         publish_request = finalize(
             ctx,
             plan,
@@ -1541,6 +1630,7 @@ def run_cli(
             target_issue=target_issue,
             request_id=request_id,
             idempotency_key=idempotency_key,
+            delta_results=delta_results,
         )
     return publish_request
 

@@ -94,13 +94,19 @@ fresh context で `retrospective-evaluator` を headless CLI subprocess で 1 �
 `candidate_records` は現行マージ済み `agent_improvement_candidate/v1`（#2288/#2289）の canonical
 schema を満たさない限り reject される。`evaluator_retries: 0`（再試行しない）。
 
-### 6. delta 算出（任意、`PreviousStateProvider` 経由）
+### 6. delta 算出（`execute_run()`/`run_cli()` の production call graph に配線済み、Issue #2237
+fix_delta iteration-4 Warning 1）
 
-`FixturePreviousStateProvider` を使い、`available`/`no_history`/`legacy_unavailable`/`partial`/`stale`
-の 5 状態から `compute_delta()` で `new`/`resolved`/`recurrent`/`regressed`/`unchanged`
-（`finding_contract.identity`/`evaluations[]` に基づく -- legacy `candidate_status` 由来ではない）
-を算出する。`partial`/`stale` は indeterminate を強制する。production provider（実際の永続化読み取り）
-は #2238 の責務。
+`execute_run()`/`run_cli()` は evaluator 起動直後に `previous_state_provider`（未指定時は空
+`FixturePreviousStateProvider(fixtures={})`）の `get()` を呼び、`available`/`no_history`/
+`legacy_unavailable`/`partial`/`stale` の 5 状態から `compute_delta()` で `new`/`resolved`/
+`recurrent`/`regressed`/`unchanged`（`finding_contract.identity`/`evaluations[]` に基づく -- legacy
+`candidate_status` 由来ではない）を算出し、結果を `finalize(..., delta_results=...)` 経由で
+`PublishRequest.delta_results` に格納する。`partial`/`stale` は indeterminate を強制する。この
+delta 算出 step 自体は毎回実行される（"任意" なのは provider を差し替えるかどうかであり、呼び出す
+かどうかではない）。production provider（実際の永続化読み取り）は #2238 の責務だが、`execute_run()`/
+`run_cli()` はどちらも `PreviousStateProviderProtocol` を満たす任意の provider を受け取れるため、
+#2238 はこの call graph 自体を変更せず real provider を注入できる。
 
 ### 7. finalize
 

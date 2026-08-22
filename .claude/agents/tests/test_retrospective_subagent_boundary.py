@@ -143,16 +143,35 @@ def test_leaf_frontmatter_contract_mcp_hooks_explicitly_empty(path: Path) -> Non
 
 
 @pytest.mark.parametrize("path", [_RUNTIME_OBSERVER_PATH, _EVALUATOR_PATH])
-def test_leaf_frontmatter_contract_memory_absent_or_falsy(path: Path) -> None:
-    # `memory`/`background`/`isolation`/`skills` have no official Claude Code
-    # SubAgent frontmatter sentinel value (Issue #2237 fix_delta P1-1 --
-    # OWNER review #2237#issuecomment-5378291560 confirmed no repository
-    # agent currently uses these keys). Per the Issue's live contract this
-    # fix_delta does not add speculative keys to production frontmatter;
-    # this test still tightens the invariant that IF present, it must be
-    # falsy (never silently enabling memory/background/isolation/skills).
+def test_leaf_frontmatter_contract_skills_explicitly_empty(path: Path) -> None:
+    # Issue #2237 fix_delta iteration-4 (Warning 2): `skills` IS a real,
+    # documented Claude Code SubAgent frontmatter field (used elsewhere in
+    # this repository, e.g. `.claude/agents/issue-editor.md`, to preload a
+    # non-empty skill list) -- unlike `memory`/`background`/`isolation` it
+    # has a well-defined explicit-empty value. Both leaf SubAgents preload no
+    # skills (they never call the `Skill` tool), so `skills: []` is now
+    # declared explicitly rather than omitted.
     frontmatter = _parse_frontmatter(path)
-    for key in ("memory", "background", "isolation", "skills"):
+    assert "skills" in frontmatter and frontmatter["skills"] == []
+
+
+@pytest.mark.parametrize("path", [_RUNTIME_OBSERVER_PATH, _EVALUATOR_PATH])
+def test_leaf_frontmatter_contract_memory_background_isolation_intentionally_omitted(path: Path) -> None:
+    # `memory`/`background`/`isolation` have no official Claude Code SubAgent
+    # frontmatter sentinel value that means "disabled" (Issue #2237 fix_delta
+    # iteration-4 Warning 2, carrying forward iteration-3's P1-1 finding --
+    # confirmed by grepping every `.claude/agents/*.md` in this repository:
+    # none declares `background:`/`isolation:` at all). Writing a fabricated
+    # value (e.g. `isolation: none`) would add an undefined frontmatter key
+    # rather than actually disabling anything, so this fix_delta keeps these
+    # two keys omitted -- and this test pins that as an *intentional*
+    # decision (not a leftover gap): if a future edit merely omits them by
+    # accident it would still pass (no assertion possible for a
+    # nonexistent-upstream-field), so the enforceable half of the intent is
+    # asserted the other way: IF either key is ever added, it must not
+    # silently enable memory/background/isolation.
+    frontmatter = _parse_frontmatter(path)
+    for key in ("memory", "background", "isolation"):
         if key in frontmatter:
             assert not frontmatter[key], f"{path.name}: {key} must be empty/false if present"
 

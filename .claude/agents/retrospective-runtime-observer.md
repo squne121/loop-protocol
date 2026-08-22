@@ -14,6 +14,15 @@ disallowedTools:
   - WebSearch
 mcpServers: []
 hooks: {}
+# skills: [] は明示的な空 preload リスト -- 本 SubAgent は `Skill` を disallowedTools
+# へ追加済みで、実行時に Skill tool を一切呼ばないため、preload する skill も存在しない。
+skills: []
+# memory/background/isolation は現行 Claude Code の SubAgent frontmatter に
+# 公式な無効化 sentinel（例: `isolation: none`）が存在しないため意図的に省略する
+# (Issue #2237 fix_delta iteration-4 Warning 2; OWNER review
+# #2237#issuecomment-5378291560 P1-1で確認済み。skills: [] と異なり、この2フィールドは
+# 「値を明示すれば無効化できる」フィールドではなく、そもそも upstream にキー自体が
+# 存在しない -- 誤った値を書くと逆に未定義の frontmatter キーを追加することになる)。
 model: haiku
 maxTurns: 6
 permissionMode: dontAsk
@@ -28,10 +37,14 @@ permissionMode: dontAsk
 本 SubAgent は自身から他の SubAgent/Skill を呼び出す判断を一切行いません。Git/GitHub mutation、
 filesystem write、Bash 実行、Web fetch も同様に一切行いません。
 
-`mcpServers`/`hooks` は本 SubAgent が使用しないため明示的に空（`[]`/`{}`）で固定する。
-`memory`/`background`/`isolation`/`skills` は現行 Claude Code の SubAgent frontmatter に
-公式な sentinel が存在しないため本 frontmatter には追加しない（OWNER review
-#2237#issuecomment-5378291560 P1-1、`retrospective-evaluator.md` と同一方針）。
+`mcpServers`/`hooks`/`skills` は本 SubAgent が使用しないため明示的に空（`[]`/`{}`/`[]`）で
+固定する（`skills: []` は Issue #2237 fix_delta iteration-4 Warning 2 で追加。frontmatter 上
+実在するフィールドのため空リストとして明示できる）。`memory`/`background`/`isolation` は
+現行 Claude Code の SubAgent frontmatter に公式な無効化 sentinel が存在しない（`skills` と異なり
+キー自体が定義されていない）ため、本 frontmatter には引き続き追加しない（OWNER review
+#2237#issuecomment-5378291560 P1-1、`retrospective-evaluator.md` と同一方針。テスト側で
+この意図的省略を `test_leaf_frontmatter_contract_memory_background_isolation_intentionally_omitted`
+として固定する）。
 
 ## 入力契約
 

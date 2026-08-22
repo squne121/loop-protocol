@@ -14,6 +14,15 @@ disallowedTools:
   - WebSearch
 mcpServers: []
 hooks: {}
+# skills: [] は明示的な空 preload リスト -- 本 SubAgent は `Skill` を disallowedTools
+# へ追加済みで、実行時に Skill tool を一切呼ばないため、preload する skill も存在しない。
+skills: []
+# memory/background/isolation は現行 Claude Code の SubAgent frontmatter に
+# 公式な無効化 sentinel（例: `isolation: none`）が存在しないため意図的に省略する
+# (Issue #2237 fix_delta iteration-4 Warning 2; OWNER review
+# #2237#issuecomment-5378291560 P1-1で確認済み。skills: [] と異なり、この2フィールドは
+# 「値を明示すれば無効化できる」フィールドではなく、そもそも upstream にキー自体が
+# 存在しない -- 誤った値を書くと逆に未定義の frontmatter キーを追加することになる)。
 model: sonnet
 maxTurns: 8
 permissionMode: dontAsk
@@ -29,12 +38,17 @@ Web fetch、Bash 実行、filesystem write も一切行いません。本 SubAge
 （root Skill）が渡す `EVALUATOR_REQUEST_V1` のプロンプト本文のみであり、それ以外のいかなる外部情報源
 （追加調査・Web 検索・repository への直接アクセス）も参照しません。
 
-`mcpServers`/`hooks` は本 SubAgent が使用しないため明示的に空（`[]`/`{}`）で固定する。
-`memory`/`background`/`isolation`/`skills` は現行 Claude Code の SubAgent frontmatter に
-公式な sentinel（例: `isolation: none`）が存在しないため、本 frontmatter には追加しない
-（OWNER review #2237#issuecomment-5378291560 P1-1）。本 SubAgent は `permissionMode: dontAsk`
-かつ leaf 制約（`tools: []`/`disallowedTools` フル指定）により foreground・no-memory・
-no-skill 相当の挙動が frontmatter 全体として達成されている。
+`mcpServers`/`hooks`/`skills` は本 SubAgent が使用しないため明示的に空（`[]`/`{}`/`[]`）で
+固定する（`skills: []` は Issue #2237 fix_delta iteration-4 Warning 2 で追加。frontmatter 上
+実在するフィールドのため空リストとして明示できる）。`memory`/`background`/`isolation` は
+現行 Claude Code の SubAgent frontmatter に公式な無効化 sentinel（例: `isolation: none`）が
+存在しない（`skills` と異なりキー自体が定義されていない）ため、本 frontmatter には
+引き続き追加しない（OWNER review #2237#issuecomment-5378291560 P1-1）。本 SubAgent は
+`permissionMode: dontAsk` かつ leaf 制約（`tools: []`/`disallowedTools` フル指定）により
+foreground・no-memory・no-skill 相当の挙動が frontmatter 全体として達成されている
+（テスト側でこの意図的省略を
+`test_leaf_frontmatter_contract_memory_background_isolation_intentionally_omitted`
+として固定する）。
 
 ## 起動タイミング制約
 
