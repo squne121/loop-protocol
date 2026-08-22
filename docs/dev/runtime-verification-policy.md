@@ -506,8 +506,13 @@ Claude extension surface（`.claude/agents/**` / `.claude/hooks/**` / `.claude/s
 ### 正本の所在
 
 `docs/dev/extension-surface-runtime-policy.yaml` が構造化正本（`schema_version` /
-`unknown_surface_policy` / `rules[]` を持つ YAML）であり、本セクションはその説明・
-表示用に留める。rule 本体のスキーマ変更・追加・改廃は同 YAML ファイルを直接編集する。
+`resolution` / `unknown_surface_policy` / `assumptions[]` / `verification_profiles` /
+`rules[]` を持つ YAML）であり、本セクションはその説明・表示用に留める。rule 本体の
+スキーマ変更・追加・改廃は同 YAML ファイルを直接編集する。`schema_version` の
+構造は `docs/dev/extension-surface-runtime-policy.schema.json`（JSON Schema,
+draft 2020-12）が closed validator として検証し、
+`docs/dev/tests/test_extension_surface_runtime_policy_schema.py` の pytest で
+`jsonschema.validate()` により機械検証する。
 
 ### rule set の概要
 
@@ -516,15 +521,20 @@ Claude extension surface（`.claude/agents/**` / `.claude/hooks/**` / `.claude/s
 | フィールド | 説明 |
 |---|---|
 | `id` | rule 識別子 |
-| `path_globs` | 対象パスの glob パターン |
-| `source_scopes` | `project` / `user` / `managed` / `plugin` のいずれか（複数可） |
-| `semantic_delta` | 何が変わったら risk-trigger と見なすか（例: `frontmatter_keys`、`markdown_body`） |
+| `selectors[]` | `source_scope`（`project` / `user` / `managed` / `plugin` / `session` / `cli`）ごとに `component` と、`project` は repository 相対 `path_globs`、それ以外は `runtime_resolved_only: true` + `evidence_source` を持つ構造 |
+| `semantic_detectors[]` | 型付き検出条件。`type`（`yaml_frontmatter_keys` / `markdown_body` / `json_config_keys` / `script_body_semantics`）と対象 `keys`/`classification`、対象 `change_types`（`add`/`modify`/`delete`/`rename`）を持つ |
 | `execution_context` | 実行文脈（例: `subagent_delegation`、`hook_concurrent_execution`） |
 | `default_decision` | 既定の Runtime Verification Applicability decision（通常 `immediate`） |
-| `verification_profile` | 対応する動作検証手段（例: `worktree-agent-runtime-smoke`） |
-| `exceptions` | 証明可能な predicate 形式の例外（`proven_not_runtime_loaded` 等） |
-| `last_verified` | 最終確認日 |
-| `min_claude_code_version` | 判定の前提となる最低対応 Claude Code version |
+| `verification_profile` | top-level `verification_profiles` object 内の profile ID への参照。参照先 profile は `runner` / `mode` / rule 固有の `assertions[]`（証明すべき postcondition）を持つ |
+| `exceptions[]` | 証明契約付きの例外。`predicate`（`proven_not_runtime_loaded` 等）に加え `evaluation_mode: human_evidence_required` / `default_when_unproven: not_applied` / `required_evidence[]` / `evidence_freshness: current_head` / `approval_authority: owner` を持つ |
+| `last_verified` | rule 単位の最終確認日 |
+| `assumption_refs` | top-level `assumptions[]` の `claim_id` への参照（任意） |
+
+トップレベルの `resolution` は複数 rule への同時一致時の合成方針
+（`multiple_matches: evaluate_all` / `final_decision: most_restrictive` /
+`exception_scope: per_rule`）を定義する。`min_claude_code_version` は rule 単位
+ではなく、トップレベル `assumptions[]`（`claim_id` 単位で
+`min_claude_code_version` / `last_verified` / `applicability` を持つ）で管理する。
 
 `docs/dev/extension-surface-runtime-policy.yaml` は agent / hook / skill /
 claude-gpt lifecycle、および SubAgent の start/stop・delegation・fallback
@@ -534,7 +544,10 @@ semantics のそれぞれに対応する rule を最低 1 件ずつ定義する�
 
 `docs-only` のようなファイル種別ベースの粗い例外は採用しない。以下のような
 runtime 非読込・非配布・意味不変を証明できる predicate 形式のみを例外として
-認める:
+認め、各 predicate は `evaluation_mode: human_evidence_required` /
+`default_when_unproven: not_applied`（証明不足時は例外を非適用とする） /
+`required_evidence[]` / `evidence_freshness: current_head` /
+`approval_authority: owner` を伴う evidence-backed contract として定義する:
 
 - `proven_not_runtime_loaded`: 現行 production 経路から到達不能であることの証明
 - `proven_not_distributed`: 配布・有効化経路が存在しないことの証明
@@ -546,8 +559,9 @@ runtime 非読込・非配布・意味不変を証明できる predicate 形式�
 
 上記 4 surface のいずれにも一致しない変更（未知の extension surface）は
 `not_applicable` へ黙って倒さない。`docs/dev/extension-surface-runtime-policy.yaml`
-の `unknown_surface_policy` に human_judgment（人間判断へのエスカレーション）を
-既定として明記する。
+の `unknown_surface_policy` は `decision: human_judgment`（人間判断への
+エスカレーション） / `gate: block`（人間判断が確定するまで進行を止める） /
+`override_requires`（block を解除できる権限）を持つ構造として定義する。
 
 ### 既存 decision enum との関係
 
