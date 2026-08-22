@@ -1,0 +1,230 @@
+# Claude Extension Surface Runtime Risk-Trigger Policy
+#
+# SSOT: この YAML が Claude extension surface（.claude/agents/**, .claude/hooks/**,
+# .claude/skills/**, scripts/claude-gpt/**）の risk-trigger 判定 rule set の正本。
+# `docs/dev/runtime-verification-policy.md` の「risk-trigger policy」セクションは
+# この YAML の説明・表示用であり、構造化正本はこのファイルとする。
+#
+# 本ファイルは policy definition のみを扱う。review-issue / issue-contract-review /
+# PR diff gate への実際の deterministic gate 配線は Issue #2290（実装: Claude
+# extension surface risk-trigger policy を review-issue / issue-contract-review の
+# deterministic gate に配線する）の責務であり、本ファイルの追加だけでは
+# enforcement は成立しない。
+#
+# 本 rule set は既存の Runtime Verification Applicability decision enum
+# （not_applicable / immediate / deferred。docs/dev/runtime-verification-policy.md
+# 参照）を再定義しない。以下の rule は「この surface / semantic_delta に該当する
+# 変更は decision: immediate の根拠として扱われるべきである」という判定材料を
+# 補強するものであり、decision そのものの値や意味を上書きしない。
+
+schema_version: v1
+
+# unknown_surface_policy:
+#   上記 4 surface（agent / hook / skill / claude-gpt）および SubAgent lifecycle の
+#   いずれにも一致しない変更（未知の extension surface）を検知した場合の既定方針。
+#   `not_applicable` へ黙って倒すことを禁止し、human_judgment（人間判断への
+#   エスカレーション）を既定とする。
+unknown_surface_policy: human_judgment
+
+# delivery_context:
+#   横断 SSOT として本ポリシーを扱う際の配布形態ごとの留意点。
+#   source_scopes（project/user/managed/plugin）は「誰が定義したか」の軸であり、
+#   delivery_context は「どう配布されているか」の軸として独立して考慮する。
+delivery_context:
+  source_checkout:
+    description: >-
+      リポジトリを直接 clone した checkout から `.claude/**` を読み込む既定経路。
+      本ファイルの rule はこの経路を主に想定して記述されている。
+  plugin_dir:
+    description: >-
+      Claude Code プラグインとして配布される `.claude/**` 相当のディレクトリ構成。
+      plugin frontmatter の `permissionMode` も Auto mode では無視される
+      （sub-agents ドキュメント参照）ため、source_scope: plugin の rule は
+      source_scope: project と同等の risk-trigger 判定を適用する。
+  marketplace_cached_install:
+    description: >-
+      marketplace 経由でローカルキャッシュされた install。キャッシュ更新タイミングと
+      実際に読み込まれる version の間にずれが生じうるため、`last_verified` と
+      `min_claude_code_version` の整合を rule 単位で再確認する必要がある。
+  agent_sdk_filesystem_discovery:
+    description: >-
+      Claude Agent SDK のファイルシステム探索経路（プロセス起動時の `.claude/**`
+      自動発見）。この経路は起動プロセスの working directory に強く依存するため、
+      worktree 配下の `.claude/**` を変更する際は「どの working directory から
+      起動されたプロセスが対象ディレクトリを発見するか」を rule の
+      exceptions.predicate 評価時に明示する。
+
+rules:
+  # --- .claude/agents/** : agent lifecycle -------------------------------
+  - id: agent-lifecycle-frontmatter-or-body-change
+    path_globs:
+      - ".claude/agents/**"
+    source_scopes:
+      - project
+      - user
+      - managed
+      - plugin
+    semantic_delta:
+      - frontmatter_keys # 例: permissionMode, disallowedTools, description
+      - markdown_body # SubAgent への instruction 本文
+    execution_context: subagent_delegation
+    default_decision: immediate
+    verification_profile: worktree-agent-runtime-smoke
+    exceptions:
+      - predicate: proven_not_runtime_loaded
+        description: >-
+          対象 agent 定義が現行 production delegation path から到達不能であることを
+          証明できる場合（例: 削除予定 legacy agent で呼び出し元が存在しない）。
+      - predicate: production_consumer_inventory_empty
+        description: >-
+          `.claude/agents/*.md` を参照する production skill / SubAgent の呼び出し
+          箇所が repo 全体に存在しないことを rg 等で確認できる場合。
+    last_verified: "2026-08-22"
+    min_claude_code_version: "2.0.0"
+    notes: >-
+      Auto mode では SubAgent frontmatter の permissionMode が無視され、親 session
+      の classifier が child tool call にも適用される
+      （https://code.claude.com/docs/en/sub-agents）。このため frontmatter の
+      permissionMode 変更だけを見て「権限が変わった」と静的に判断することはできず、
+      実際の delegation 経路での runtime 挙動確認（system test）が必要。
+
+  # --- .claude/hooks/** : hook lifecycle ----------------------------------
+  - id: hook-lifecycle-matcher-or-handler-change
+    path_globs:
+      - ".claude/hooks/**"
+      - ".claude/settings.json"
+    source_scopes:
+      - project
+      - user
+      - managed
+      - plugin
+    semantic_delta:
+      - matcher_pattern # PreToolUse/PostToolUse 等のイベント一致条件
+      - handler_script_body
+      - deny_allow_decision_logic
+    execution_context: hook_concurrent_execution
+    default_decision: immediate
+    verification_profile: worktree-agent-runtime-smoke
+    exceptions:
+      - predicate: proven_not_distributed
+        description: >-
+          settings.json 上で当該 hook が現在いずれの event にも登録されておらず、
+          配布・有効化経路が存在しないことを証明できる場合。
+      - predicate: executable_or_prompt_semantics_unchanged
+        description: >-
+          diff が実行可能セマンティクスを変えないこと（コメント追加・空白整形・
+          変数名リネームで分岐条件が不変であること）を diff で証明できる場合。
+    last_verified: "2026-08-22"
+    min_claude_code_version: "2.0.0"
+    notes: >-
+      複数 hook が同一イベントに一致した場合、全 hook が並行実行され、いずれかが
+      deny を返しても sibling hook の副作用は停止しない
+      （https://code.claude.com/docs/en/hooks-guide）。したがって単一 hook の
+      handler ロジックを静的に読むだけでは、他 hook との並行実行時の副作用有無を
+      判定できず、実 hook chain を通した runtime 確認が必要。
+
+  # --- .claude/skills/** : skill invocation lifecycle ---------------------
+  - id: skill-invocation-procedure-or-contract-change
+    path_globs:
+      - ".claude/skills/**/SKILL.md"
+      - ".claude/skills/**/scripts/**"
+    source_scopes:
+      - project
+      - user
+      - managed
+      - plugin
+    semantic_delta:
+      - procedure_steps # Procedure セクションの手順変更
+      - output_contract_schema # IMPLEMENT_RESULT_V1 等の出力契約
+      - script_execution_logic
+    execution_context: skill_invocation
+    default_decision: immediate
+    verification_profile: worktree-agent-runtime-smoke
+    exceptions:
+      - predicate: proven_not_runtime_loaded
+        description: >-
+          当該 skill を発動するトリガーワード・呼び出し経路が本文中に存在せず、
+          現行 production フローから到達不能であることを証明できる場合。
+      - predicate: executable_or_prompt_semantics_unchanged
+        description: >-
+          変更が説明文・コメント・typo 修正のみで、手順の実行順序・分岐条件・
+          出力契約フィールドが不変であることを diff で証明できる場合。
+    last_verified: "2026-08-22"
+    min_claude_code_version: "2.0.0"
+    notes: >-
+      skill 本文の記述変更は SubAgent の実際の delegation 挙動（何を呼び出し、
+      何を出力するか）に直結するため、静的な文言確認だけでなく、実際に skill を
+      経由した実行での runtime 確認が必要になりうる。
+
+  # --- scripts/claude-gpt/** : claude-gpt lifecycle -----------------------
+  - id: claude-gpt-lifecycle-invocation-change
+    path_globs:
+      - "scripts/claude-gpt/**"
+    source_scopes:
+      - project
+      - managed
+    semantic_delta:
+      - invocation_command_shape
+      - environment_variable_handling
+      - output_parsing_logic
+    execution_context: external_process_invocation
+    default_decision: immediate
+    verification_profile: worktree-agent-runtime-smoke
+    exceptions:
+      - predicate: proven_not_distributed
+        description: >-
+          当該スクリプトが現行 CI / production 呼び出し経路から一切参照されて
+          いないことを production consumer inventory で証明できる場合。
+      - predicate: production_consumer_inventory_empty
+        description: >-
+          repo 全体で当該スクリプトを呼び出す consumer が存在しないことを
+          rg 等で確認できる場合。
+    last_verified: "2026-08-22"
+    min_claude_code_version: "2.0.0"
+    notes: >-
+      claude-gpt lifecycle は外部プロセス起動・stdin/stdout 経由の通信を伴うため、
+      静的なスクリプト読解だけでは実際の I/O 挙動（環境変数の欠落時の fallback、
+      exit code 分岐等）を検証できない。
+
+  # --- SubAgent start/stop・delegation・fallback semantics -----------------
+  - id: subagent-lifecycle-start-stop-delegation-fallback
+    path_globs:
+      - ".claude/agents/**"
+      - ".claude/skills/**/SKILL.md"
+      - "scripts/agent-ops/**"
+    source_scopes:
+      - project
+      - managed
+    semantic_delta:
+      - delegation_trigger_condition
+      - fallback_path_logic
+      - start_stop_signal_handling
+    execution_context: subagent_lifecycle_transition
+    default_decision: immediate
+    verification_profile: worktree-agent-runtime-smoke
+    exceptions:
+      - predicate: proven_not_runtime_loaded
+        description: >-
+          delegation / fallback ロジックが変更対象コードパス上で到達不能である
+          ことを静的呼び出しグラフで証明できる場合。
+      - predicate: executable_or_prompt_semantics_unchanged
+        description: >-
+          delegation 条件・fallback 分岐・start/stop signal の処理順序が
+          変更前後で同一であることを diff とテストで証明できる場合。
+    last_verified: "2026-08-22"
+    min_claude_code_version: "2.0.0"
+    notes: >-
+      SubAgentStart/SubagentStop の causal evidence 相関要件
+      （docs/dev/runtime-verification-policy.md セクション10、Issue #2183 /
+      #2174 / PR #2214 / #2220 参照）が示す通り、marker 文字列の一致のみでは
+      delegation / fallback semantics の実際の runtime 挙動を証明できない。
+      hook ID 相関等の causal evidence を伴う runtime 確認が必要。
+
+# 参照:
+# - Claude Code sub-agents ドキュメント（permissionMode が Auto mode で無視される）:
+#   https://code.claude.com/docs/en/sub-agents
+# - Claude Code hooks-guide ドキュメント（並行実行・sibling 副作用停止不可）:
+#   https://code.claude.com/docs/en/hooks-guide
+# - enforcement follow-up: Issue #2290
+#   （実装: Claude extension surface risk-trigger policy を review-issue /
+#   issue-contract-review の deterministic gate に配線する）

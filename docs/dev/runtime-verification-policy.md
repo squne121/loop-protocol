@@ -493,6 +493,91 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
     lane では本要件は引き続き **opt-in**（`--require-subagent-causal-evidence` を明示した場合のみ exit を
     昇格）であり、interactive-lane 向け hook 出力チャネルの整備は別途 follow-up とする。
 
+## 11. Claude extension surface risk-trigger policy（拡張サーフェスの risk-trigger 判定）
+
+> 関連 Issue: #2259（OWNER レビュー P0-7 で明示）、#2283（本セクション新設）、#2290（enforcement 配線 follow-up）
+
+Claude extension surface（`.claude/agents/**` / `.claude/hooks/**` / `.claude/skills/**` /
+`scripts/claude-gpt/**`）の変更が、静的な frontmatter・宣言の確認だけで足りるか、
+実際の runtime 挙動確認（system test、`Runtime Verification Applicability: immediate`）を
+要求するかを判定する versioned machine-readable rule set を
+`docs/dev/extension-surface-runtime-policy.yaml` として新設する。
+
+### 正本の所在
+
+`docs/dev/extension-surface-runtime-policy.yaml` が構造化正本（`schema_version` /
+`unknown_surface_policy` / `rules[]` を持つ YAML）であり、本セクションはその説明・
+表示用に留める。rule 本体のスキーマ変更・追加・改廃は同 YAML ファイルを直接編集する。
+
+### rule set の概要
+
+各 rule は以下のフィールドを持つ:
+
+| フィールド | 説明 |
+|---|---|
+| `id` | rule 識別子 |
+| `path_globs` | 対象パスの glob パターン |
+| `source_scopes` | `project` / `user` / `managed` / `plugin` のいずれか（複数可） |
+| `semantic_delta` | 何が変わったら risk-trigger と見なすか（例: `frontmatter_keys`、`markdown_body`） |
+| `execution_context` | 実行文脈（例: `subagent_delegation`、`hook_concurrent_execution`） |
+| `default_decision` | 既定の Runtime Verification Applicability decision（通常 `immediate`） |
+| `verification_profile` | 対応する動作検証手段（例: `worktree-agent-runtime-smoke`） |
+| `exceptions` | 証明可能な predicate 形式の例外（`proven_not_runtime_loaded` 等） |
+| `last_verified` | 最終確認日 |
+| `min_claude_code_version` | 判定の前提となる最低対応 Claude Code version |
+
+`docs/dev/extension-surface-runtime-policy.yaml` は agent / hook / skill /
+claude-gpt lifecycle、および SubAgent の start/stop・delegation・fallback
+semantics のそれぞれに対応する rule を最低 1 件ずつ定義する。
+
+### 例外は証明可能な predicate として定義する
+
+`docs-only` のようなファイル種別ベースの粗い例外は採用しない。以下のような
+runtime 非読込・非配布・意味不変を証明できる predicate 形式のみを例外として
+認める:
+
+- `proven_not_runtime_loaded`: 現行 production 経路から到達不能であることの証明
+- `proven_not_distributed`: 配布・有効化経路が存在しないことの証明
+- `production_consumer_inventory_empty`: 呼び出し元が repo 全体に存在しないことの証明
+- `executable_or_prompt_semantics_unchanged`: 実行可能セマンティクス・prompt 意味が
+  変更前後で同一であることの証明
+
+### unknown surface の扱い
+
+上記 4 surface のいずれにも一致しない変更（未知の extension surface）は
+`not_applicable` へ黙って倒さない。`docs/dev/extension-surface-runtime-policy.yaml`
+の `unknown_surface_policy` に human_judgment（人間判断へのエスカレーション）を
+既定として明記する。
+
+### 既存 decision enum との関係
+
+本 rule set は `## Runtime Verification Applicability` の既存 decision enum
+（`not_applicable` / `immediate` / `deferred`。本ドキュメント冒頭セクション参照）を
+再定義しない。各 rule の `default_decision` は「この surface / semantic_delta に
+該当する変更は `immediate` の根拠として扱われるべきである」という判定材料を
+補強するものであり、decision enum の値・意味そのものを変更するものではない。
+
+### 根拠となる Claude Code 公式ドキュメント
+
+- Claude Code Auto mode では SubAgent frontmatter の `permissionMode` が無視され、
+  親 session の classifier が child tool call にも適用される
+  （https://code.claude.com/docs/en/sub-agents）。
+- 複数 hook が同一イベントに一致した場合、全 hook が並行実行され、いずれかが
+  deny を返しても sibling hook の副作用は停止しない
+  （https://code.claude.com/docs/en/hooks-guide）。
+
+### enforcement 配線は別 Issue
+
+本セクションおよび `docs/dev/extension-surface-runtime-policy.yaml` は
+policy definition のみを scope とする。`review-issue` / `issue-contract-review` /
+PR diff gate への実際の deterministic gate 配線は follow-up Issue #2290
+（実装: Claude extension surface risk-trigger policy を review-issue /
+issue-contract-review の deterministic gate に配線する）の責務であり、
+#2290 が完了するまで本セクションの追加をもって「機械的に強制済み」とは
+扱わない。
+
+---
+
 ## 関連ドキュメント
 
 - `docs/dev/session-recording-policy.md` — session 記録 Kill Switch policy（`session_recording_policy/v1` SSOT）。`secrets_mode` 遷移時の session 記録制御・Kill Switch 手順・checkpoint visibility 検証を定める
