@@ -75,3 +75,66 @@ dataclass に宣言されていないため、入力に含まれていれば汎�
 を正本として `validate_retrospective_schema.validate_candidate()` で検証される。私的な shadow dialect
 （`finding_identity`/`severity`/`candidate_status: open|resolved` 等）は canonical schema 不適合として
 reject される。同一リスト内の `candidate_id` 重複も reject する。
+
+## agent_retrospective_run_publication/v1（永続化された envelope の形式。Issue #2238 Child 5 で追加）
+
+`persist_retrospective_run.py` が `PUBLISH_REQUEST_V1` から構築し、Issue comment として投稿する envelope。
+Child 2 の `agent_retrospective_run/v1` schema（`schemas/agent_retrospective_run_v1.schema.json`）とは
+別の `schema_version` を持つ -- 後者が要求する publication-layer field（`idempotency_key`/
+`parent_record_digest`/`publication_digest`）を持たないための区別。
+
+フィールド: `schema_version`（`agent_retrospective_run_publication/v1` 固定）/ `repository_id` /
+`target_issue` / `request_id` / `scope` / `idempotency_key`（publisher 側で再計算、caller 供給値は
+信用しない）/ `expected_previous_digest` / `parent_record_digest`（optimistic concurrency の chain
+link）/ `run.run_identity`（`run_id`/`base_sha`/`source_set_digest`/`generated_at`/`runtime_version`）/
+`run.source_observations` / `candidate_records` / `delta_results`（`PublishRequest` の対応 field をそのまま
+carry through）/ `publication_digest`（`sha256-sorted-json-v1`。自分自身を preimage に含めない）。
+
+`publication_digest` は `run_retrospective.py`'s `public_projection_digest` とは別の digest -- 前者は
+「永続化された record」の binding digest（`parent_record_digest` を含む preimage）、後者は「proposal」の
+binding digest。
+
+投稿は Issue comment の marker 行（`<!-- agent_retrospective_run:v1 repository_id=... idempotency_key=... -->`）
++ fenced ```json block。post-write readback は comment ID で GET → fenced block 抽出 → canonical JSON
+digest 再計算 → `publication_digest` と比較（Markdown 生 bytes 比較はしない）。
+
+### Issue #2238 fix_delta（OWNER 敵対的レビュー issuecomment-5381003316、P0-1〜P0-7/P1-1〜P1-4）
+
+- **P0-5（`source_observations` の実データ化）**: `run_retrospective.py`'s `finalize()` は Child 3 の
+  実際の per-collector `CollectorResult.observation` 一覧（`execute_run()`/`run_cli()` が `prepare()`
+  から得る `results`）を、`PublishRequest.run_identity` dict の VALUE に追加キー
+  （`source_observations`/`generated_at`/`runtime_version`）として additive に格納する。
+  `PublishRequest` の dataclass field 集合自体は変更しない（`test_run_retrospective.py` がその集合を
+  厳密に pin しており、この Issue の Allowed Paths 外にあるため）。`public_projection_digest` の
+  preimage は元の 3-key `run_identity` サブセットのみで計算され続ける（既存 digest 比較テストへの
+  影響なし）。`persist_retrospective_run.py`'s `build_run_envelope()` はこの実データを
+  `run.source_observations` にそのまま永続化する（固定 placeholder は使わない）。
+- **P0-1（repository_id と `--repo` の cross-check）**: `prepare_publication()`/`publish_run()` は
+  最初に `publish_request["repository_id"] == repo` を検証し、不一致なら transport 呼び出しゼロで
+  `RepositoryMismatch` を raise する。
+- **P0-2（two-stage 公開フロー）**: `prepare_publication()`（envelope と `publication_digest` を
+  file に固定）→ `authorize`（frozen file 参照の `human_authorization_receipt/v1` を発行、
+  TTL <= `MAX_AUTHORIZATION_RECEIPT_TTL_SECONDS`＝10分、`approved_at` の未来日時/超過 TTL を拒否）→
+  `publish_prepared()`（POST 直前に live head を再検証し、prepare 時点から変化していれば POST せず
+  `StaleWriteDetected` を raise）の 3 段。CLI は `prepare-publication`/`authorize`/`publish`
+  サブコマンドとして公開する。
+- **P0-3（idempotency の stable digest 化）**: `compute_request_payload_digest()`（`parent_record_digest`/
+  `generated_at` を含まない）で idempotency を OCC より先に評価する。`expected_previous_digest=None`
+  は wildcard ではなく「head が None であること」を要求する厳格な値として扱う。
+- **P0-4（fork 検出の read-time 再構成）**: `IssueCommentPreviousStateProvider.get()` は毎回
+  `(repository_id, scope, parent_record_digest)` chain を全 verified record から再構成し、fork
+  （同一 parent を持つ複数 child）や tip に到達しない branch を `stale` と判定する。
+- **P0-6（`parse_verified_run_comment()`）**: 全読み取り経路（idempotency/OCC/provider/recovery/
+  readback）が同一の検証関数を経由する: author allowlist（`trusted_publisher_logins`）/
+  marker-payload cross-check / schema 形状 / public-safety re-scan / digest 再計算。自分自身の
+  直近 POST の readback 検証が失敗した場合のみ `published_unverified` で停止し、index 更新を呼ばない。
+- **P0-7（index wiring）**: `persist_retrospective_run.py`'s CLI に `--index-parent-issue` を追加し、
+  検証済み publish 成功後に `scripts/agent-logs/update-retro-index.mjs` を実行する。
+  `retro-index-builder.mjs`'s `run_digest` は envelope 自身の `publication_digest` を直接参照する
+  （pretty-printed JSON の再計算 digest ではない）。
+- **P1-1**: 内部識別子を `sha256-jcs-v1` から `sha256-sorted-json-v1` へ改名（実装は RFC 8785 JCS
+  ではなく Python `sorted()` キー順 + compact JSON であるため）。
+- **P1-2**: `create_comment_with_recovery()` は ambiguous な POST 結果が起きるたびに rescan する
+  （初回のみではない）。
+- **P1-4**: `IssueCommentPreviousStateProvider`'s age-based staleness はデフォルト無効
+  （`stale_after_seconds=None`）。opt-in で `STALE_AFTER_SECONDS_LEGACY_DEFAULT`（7日）を指定可能。

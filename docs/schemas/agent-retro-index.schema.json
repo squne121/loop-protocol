@@ -16,6 +16,13 @@
       "type": "string",
       "const": "agent_retro_index/v1"
     },
+    "retrospective_runs": {
+      "type": "array",
+      "description": "Optional, additive-only derived section (Issue #2238 Child 5) summarizing agent-retrospective run publication comments discovered while building this index. Distinct from `entries[]` (agent_run_report/v1-derived) and never a state store -- the primary record for a run remains the agent_retrospective_run_publication/v1 Issue comment persist_retrospective_run.py posts (docs/adr/0007-agent-retrospective-boundaries.md Decision 7). Omitting this key entirely is valid (older index artifacts remain schema-valid).",
+      "items": {
+        "$ref": "#/$defs/retrospectiveRunEntry"
+      }
+    },
     "generation_verdict": {
       "type": "string",
       "enum": [
@@ -125,6 +132,46 @@
             "type": "integer",
             "minimum": 1
           }
+        }
+      }
+    },
+    "retrospectiveRunEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_comment_url",
+        "run_digest",
+        "base_sha",
+        "source_set_digest",
+        "candidate_count",
+        "delta_summary"
+      ],
+      "properties": {
+        "run_comment_url": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 240,
+          "pattern": "^https://github\\.com/squne121/loop-protocol/(issues|pull)/[0-9]+#issuecomment-[0-9]+$"
+        },
+        "run_digest": {
+          "$ref": "#/$defs/sha256Digest"
+        },
+        "base_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "source_set_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "candidate_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "delta_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
         }
       }
     },

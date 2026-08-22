@@ -8,6 +8,48 @@ import { extractPayloadFromMarkdown } from '../../scripts/lib/agent-run-report-v
 import { parseChecklistIssueNumbers, updateRetroIndex, verifyRetroIndexArtifact } from '../../scripts/agent-logs/update-retro-index.mjs'
 import { buildAgentRunReportCommentBody } from '../../scripts/agent-logs/lib/github-comments.mjs'
 import { renderValidatedPublicMarkdown } from '../../scripts/agent-logs/lib/validate-final-report.mjs'
+import { buildRetroIndex, detectSchemaMigrationRequirement, normalizeRetrospectiveRunComment } from '../../scripts/agent-logs/lib/retro-index-builder.mjs'
+
+// Issue #2238 Child 5: agent_retrospective_run_publication/v1 Issue comment
+// fixture -- a distinct marker/schema from agent_run_report/v1 (see
+// createSourceComment() above), routed to the additive retrospective_runs[]
+// derived-index section rather than entries[].
+function createRetrospectiveRunComment() {
+  const envelope = {
+    schema_version: 'agent_retrospective_run_publication/v1',
+    repository_id: 'squne121/loop-protocol',
+    target_issue: 2238,
+    request_id: 'req-1',
+    scope: 'repository',
+    idempotency_key: `sha256:${'1'.repeat(64)}`,
+    expected_previous_digest: null,
+    parent_record_digest: null,
+    run: {
+      run_identity: {
+        run_id: 'run-1',
+        base_sha: 'a'.repeat(40),
+        source_set_digest: 'd'.repeat(64),
+        generated_at: '2026-08-22T00:00:00Z',
+        runtime_version: 'agent-retrospective-persist/v1',
+      },
+      source_observations: [
+        { source_type: 'repository', source_id: 'repository', source_status: 'complete', pagination_completeness: 'complete' },
+      ],
+    },
+    candidate_records: [],
+    delta_results: [{ finding_identity: `sha256:${'2'.repeat(64)}`, evaluation_status: 'classified', delta_status: 'new' }],
+    publication_digest: `sha256:${'3'.repeat(64)}`,
+  }
+  const marker = `<!-- agent_retrospective_run:v1 repository_id=${envelope.repository_id} idempotency_key=${envelope.idempotency_key} -->`
+  const fenced = `\`\`\`json\n${JSON.stringify(envelope, null, 2)}\n\`\`\``
+  return {
+    html_url: 'https://github.com/squne121/loop-protocol/issues/928#issuecomment-5000000001',
+    body: `${marker}\n\n${fenced}\n`,
+    linkedPrHints: [],
+    linkedIssueHints: [928],
+    branchHint: null,
+  }
+}
 
 function createSourceComment() {
   const report = createValidReport()
@@ -328,5 +370,102 @@ describe('update-retro-index', () => {
       '- #789',
       '- https://github.com/squne121/loop-protocol/issues/321',
     ].join('\n'))).toEqual([123, 456, 789, 321])
+  })
+
+  it('GIVEN an agent_retrospective_run_publication/v1 comment WHEN buildRetroIndex runs THEN retrospective_runs is populated additively without affecting entries', () => {
+    // Uses buildRetroIndex() directly (not updateRetroIndex()'s live/dry-run
+    // comment-body render+validate path -- that path's generic secret-like
+    // scanner is out of this Issue's Allowed Paths and is exercised by
+    // pre-existing entries[]/merge_sha coverage elsewhere, not by this
+    // Issue's additive retrospective_runs[] change).
+    const built = buildRetroIndex({
+      sourceComments: [createSourceComment(), createRetrospectiveRunComment()],
+      parentIssue: 928,
+      prMetadataByNumber: new Map([
+        [955, {
+          number: 955,
+          body: 'Closes #935',
+          mergeSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          headRefName: 'worktree-issue-935-agent-run-report',
+        }],
+      ]),
+      associatedPrByMergeSha: new Map([
+        ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 955],
+      ]),
+      parentChildIssueNumbers: [935],
+    })
+
+    // entries[] (agent_run_report/v1) is unaffected by the additive change
+    expect(built.index.generation_verdict).toBe('complete')
+    expect(built.index.entries).toHaveLength(1)
+
+    // retrospective_runs[] carries the additive derived summary
+    expect(built.index.retrospective_runs).toHaveLength(1)
+    expect(built.index.retrospective_runs[0]).toMatchObject({
+      run_comment_url: 'https://github.com/squne121/loop-protocol/issues/928#issuecomment-5000000001',
+      base_sha: 'a'.repeat(40),
+      source_set_digest: 'd'.repeat(64),
+      candidate_count: 0,
+      delta_summary: 'new:1',
+    })
+    // Issue #2238 P0-7 fix_delta: run_digest references the envelope's own
+    // verified publication_digest directly, not a separately-computed
+    // digest of pretty-printed JSON.
+    expect(built.index.retrospective_runs[0].run_digest).toBe(`sha256:${'3'.repeat(64)}`)
+
+    // the additive key does not trigger the schema-migration guard
+    expect(detectSchemaMigrationRequirement(built.index)).toBeNull()
+  })
+
+  it('GIVEN a retrospective-run comment missing publication_digest WHEN normalizeRetrospectiveRunComment runs THEN it is blocked (Issue #2238 P0-7)', () => {
+    const envelope = {
+      schema_version: 'agent_retrospective_run_publication/v1',
+      repository_id: 'squne121/loop-protocol',
+      target_issue: 2238,
+      request_id: 'req-no-digest',
+      scope: 'repository',
+      idempotency_key: `sha256:${'1'.repeat(64)}`,
+      expected_previous_digest: null,
+      parent_record_digest: null,
+      run: {
+        run_identity: {
+          run_id: 'run-1',
+          base_sha: 'a'.repeat(40),
+          source_set_digest: 'd'.repeat(64),
+          generated_at: '2026-08-22T00:00:00Z',
+          runtime_version: 'agent-retrospective-persist/v1',
+        },
+        source_observations: [
+          { source_type: 'repository', source_id: 'repository', source_status: 'complete', pagination_completeness: 'complete' },
+        ],
+      },
+      candidate_records: [],
+      delta_results: [],
+      // publication_digest intentionally omitted
+    }
+    const marker = `<!-- agent_retrospective_run:v1 repository_id=${envelope.repository_id} idempotency_key=${envelope.idempotency_key} -->`
+    const fenced = `\`\`\`json\n${JSON.stringify(envelope, null, 2)}\n\`\`\``
+    const blocked = normalizeRetrospectiveRunComment({
+      html_url: 'https://github.com/squne121/loop-protocol/issues/928#issuecomment-5000000003',
+      body: `${marker}\n\n${fenced}\n`,
+    })
+
+    expect(blocked.kind).toBe('blocked')
+    expect(blocked.reason).toBe('retrospective_run_publication_digest_missing')
+  })
+
+  it('GIVEN a malformed retrospective-run marker WHEN normalizeRetrospectiveRunComment runs THEN it is blocked without becoming an entries[]/orphan/ambiguous side effect', () => {
+    const blocked = normalizeRetrospectiveRunComment({
+      html_url: 'https://github.com/squne121/loop-protocol/issues/928#issuecomment-5000000002',
+      body: `<!-- agent_retrospective_run:v1 repository_id=squne121/loop-protocol idempotency_key=sha256:${'1'.repeat(64)} -->\n\nno fenced json block here`,
+    })
+
+    expect(blocked.kind).toBe('blocked')
+    expect(blocked.reason).toBe('retrospective_run_payload_unparsable')
+  })
+
+  it('GIVEN a comment with no retrospective-run marker WHEN normalizeRetrospectiveRunComment runs THEN it is ignored (not routed to retrospective_runs)', () => {
+    const ignored = normalizeRetrospectiveRunComment(createSourceComment())
+    expect(ignored.kind).toBe('ignored')
   })
 })
