@@ -214,8 +214,18 @@ import sys
     proxy_sha256,
     claude_code_version,
     generated_at,
-    proxy_captured_log_size_raw,
-) = sys.argv[1:17]
+    # Issue #2274 PR #2285 OWNER fix-delta P1-5: JSON blob
+    # {"size": int, "dev": int, "ino": int, "mtime_ns": int} describing the
+    # proxy log snapshot's identity, captured from a SINGLE opened fd (never
+    # a separate `wc -c` + `cp`) -- replaces the old bare-int byte count.
+    proxy_snapshot_stat_json,
+    # Issue #2274 PR #2285 OWNER fix-delta P0-3: the raw content of the
+    # `--agents` JSON that launch.sh itself wrote to its spark-auth audit
+    # file immediately before exec'ing `claude` for THIS invocation -- used
+    # to independently verify `definition.source` from real data instead of
+    # self-reporting a fixed string constant.
+    agents_json_audit_raw,
+) = sys.argv[1:18]
 
 HOOK_LIFECYCLE = ("SubagentStart", "SubagentStop")
 
@@ -296,10 +306,62 @@ def _validate_offset(raw, label):
     return raw, None
 
 
+def _validate_identity(dev_raw, ino_raw, label):
+    """Validate a hook-time proxy-log (dev, ino) identity pair extracted from
+    a SubagentStart/SubagentStop hook event (Issue #2274 PR #2285 OWNER
+    fix-delta P1-5). Never promotes a missing/malformed value to a usable
+    identity -- always returns (None, typed_reason) in that case, so a log
+    rotation/truncation/replacement between hook-time and snapshot-time can
+    always be typed-FAIL detected rather than silently misapplying a
+    stale-generation byte offset to a new-generation file."""
+    if dev_raw is None or ino_raw is None:
+        return None, "spark_%s_identity_missing" % label
+    if isinstance(dev_raw, bool) or not isinstance(dev_raw, int):
+        return None, "spark_%s_identity_dev_not_integer" % label
+    if isinstance(ino_raw, bool) or not isinstance(ino_raw, int):
+        return None, "spark_%s_identity_ino_not_integer" % label
+    return (dev_raw, ino_raw), None
+
+
 try:
-    proxy_captured_log_size = int(proxy_captured_log_size_raw)
+    _proxy_snapshot_stat = json.loads(proxy_snapshot_stat_json)
 except (TypeError, ValueError):
-    proxy_captured_log_size = None
+    _proxy_snapshot_stat = {}
+if not isinstance(_proxy_snapshot_stat, dict):
+    _proxy_snapshot_stat = {}
+
+
+def _int_or_none(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+proxy_captured_log_size = _int_or_none(_proxy_snapshot_stat.get("size"))
+proxy_captured_log_dev = _int_or_none(_proxy_snapshot_stat.get("dev"))
+proxy_captured_log_ino = _int_or_none(_proxy_snapshot_stat.get("ino"))
+proxy_captured_log_mtime_ns = _int_or_none(_proxy_snapshot_stat.get("mtime_ns"))
+
+# Issue #2274 PR #2285 OWNER fix-delta P0-3: independently verify
+# `definition.source` from the REAL `--agents` JSON launch.sh audited
+# immediately before exec, rather than self-reporting a fixed string
+# constant. Only reported as launcher-owned when the audited fragment
+# actually contains this exact agent_name with this exact expected_model --
+# any parse failure, missing key, or mismatch is a typed FAIL reason, and
+# `definition.source` falls back to an honest "unverified" value (never a
+# fabricated launcher_owned_agents_json claim).
+try:
+    _agents_json_audit = json.loads(agents_json_audit_raw)
+except (TypeError, ValueError):
+    _agents_json_audit = None
+_audited_agent = (
+    _agents_json_audit.get(agent_name)
+    if isinstance(_agents_json_audit, dict)
+    else None
+)
+definition_source_verified = (
+    isinstance(_audited_agent, dict) and _audited_agent.get("model") == expected_model
+)
 
 events = list(_iter_stream_events(stdout_path))
 
@@ -389,6 +451,14 @@ for idx, ev in enumerate(events):
         # validation happens later via _validate_offset, never here, so a
         # malformed value is never silently coerced during extraction.
         "proxy_log_byte_offset_at_hook_time_raw": None,
+        # Issue #2274 PR #2285 OWNER fix-delta P1-5: raw (unvalidated)
+        # dev/ino/mtime_ns identity of the proxy log AT THIS HOOK'S OWN
+        # EXECUTION TIME (same single-fstat() read as the offset above).
+        # Type/range validation happens later via _validate_identity, never
+        # here.
+        "proxy_log_dev_at_hook_time_raw": None,
+        "proxy_log_ino_at_hook_time_raw": None,
+        "proxy_log_mtime_ns_at_hook_time_raw": None,
     }
     channel_parsed = {}
     for key in ("stdout", "output"):
@@ -406,6 +476,15 @@ for idx, ev in enumerate(events):
         ob = channel_parsed["output"].get("proxy_log_byte_offset_at_hook_time")
         if oa is not None and ob is not None and oa != ob:
             contradictory = True
+        for identity_field in (
+            "proxy_log_dev_at_hook_time",
+            "proxy_log_ino_at_hook_time",
+            "proxy_log_mtime_ns_at_hook_time",
+        ):
+            ia = channel_parsed["stdout"].get(identity_field)
+            ib = channel_parsed["output"].get(identity_field)
+            if ia is not None and ib is not None and ia != ib:
+                contradictory = True
     entry["contradictory"] = contradictory
     if not contradictory:
         for parsed in channel_parsed.values():
@@ -419,6 +498,23 @@ for idx, ev in enumerate(events):
             ):
                 entry["proxy_log_byte_offset_at_hook_time_raw"] = parsed.get(
                     "proxy_log_byte_offset_at_hook_time"
+                )
+            if (
+                entry["proxy_log_dev_at_hook_time_raw"] is None
+                and "proxy_log_dev_at_hook_time" in parsed
+            ):
+                entry["proxy_log_dev_at_hook_time_raw"] = parsed.get("proxy_log_dev_at_hook_time")
+            if (
+                entry["proxy_log_ino_at_hook_time_raw"] is None
+                and "proxy_log_ino_at_hook_time" in parsed
+            ):
+                entry["proxy_log_ino_at_hook_time_raw"] = parsed.get("proxy_log_ino_at_hook_time")
+            if (
+                entry["proxy_log_mtime_ns_at_hook_time_raw"] is None
+                and "proxy_log_mtime_ns_at_hook_time" in parsed
+            ):
+                entry["proxy_log_mtime_ns_at_hook_time_raw"] = parsed.get(
+                    "proxy_log_mtime_ns_at_hook_time"
                 )
     lifecycle.append(entry)
 
@@ -489,6 +585,20 @@ else:
                     reasons.append(start_reason)
                 if stop_reason:
                     reasons.append(stop_reason)
+                start_identity, start_identity_reason = _validate_identity(
+                    starts[0]["proxy_log_dev_at_hook_time_raw"],
+                    starts[0]["proxy_log_ino_at_hook_time_raw"],
+                    "start",
+                )
+                stop_identity, stop_identity_reason = _validate_identity(
+                    stops[0]["proxy_log_dev_at_hook_time_raw"],
+                    stops[0]["proxy_log_ino_at_hook_time_raw"],
+                    "stop",
+                )
+                if start_identity_reason:
+                    reasons.append(start_identity_reason)
+                if stop_identity_reason:
+                    reasons.append(stop_identity_reason)
                 if start_offset is not None and stop_offset is not None:
                     if start_offset > stop_offset:
                         reasons.append(
@@ -501,6 +611,34 @@ else:
                             "spark_stop_offset_beyond_captured_proxy_log_size_%d_gt_%d"
                             % (stop_offset, proxy_captured_log_size)
                         )
+                    elif start_identity is None or stop_identity is None:
+                        # Already-appended start_identity_reason /
+                        # stop_identity_reason cover the specific typed
+                        # cause; never additionally construct a window on
+                        # unvalidated identity.
+                        pass
+                    elif start_identity != stop_identity:
+                        # Issue #2274 PR #2285 OWNER fix-delta P1-5: the
+                        # proxy log's (dev, ino) identity changed between
+                        # SubagentStart and SubagentStop hook-time -- a
+                        # rotation/truncation/replacement occurred DURING
+                        # the correlation window, so byte offsets from two
+                        # different generations of the file can never be
+                        # honestly compared as one window.
+                        reasons.append("spark_proxy_log_identity_changed_during_window")
+                    elif (
+                        proxy_captured_log_dev is None
+                        or proxy_captured_log_ino is None
+                    ):
+                        reasons.append("captured_proxy_log_identity_missing")
+                    elif stop_identity != (proxy_captured_log_dev, proxy_captured_log_ino):
+                        # Rotation/truncation/replacement occurred AFTER
+                        # SubagentStop but BEFORE the post-invocation
+                        # snapshot was taken -- the snapshot this evidence
+                        # builder actually reads from is a different
+                        # generation than the one the hooks observed, so the
+                        # recorded offsets could misapply to unrelated bytes.
+                        reasons.append("spark_proxy_log_identity_changed_before_snapshot")
                     else:
                         lifecycle_window = (start_offset, stop_offset)
         else:
@@ -607,9 +745,26 @@ else:
     for r in spark_proxy_requests:
         if r.get("transport") != "http":
             reasons.append("spark_proxy_transport_not_http_%s" % r.get("transport"))
+    # Issue #2274 PR #2285 OWNER fix-delta P0-2: zero/multiple/uncorrelated
+    # Spark proxy evidence must all FAIL -- only "zero" was previously
+    # enforced. A window containing more than one Spark-model request (or a
+    # single request with a missing/empty reqId) can never honestly be
+    # reported as `verdict.status: "pass"`, even though `request_count` was
+    # already faithfully recorded in the evidence for either case.
+    if len(spark_proxy_requests) != 1:
+        reasons.append(
+            "spark_proxy_request_cardinality_not_one_%d" % len(spark_proxy_requests)
+        )
+    else:
+        only_req_id = spark_proxy_requests[0].get("req_id")
+        if not isinstance(only_req_id, str) or not only_req_id:
+            reasons.append("spark_proxy_request_id_missing")
 
 if sut_git_dirty != "false":
     reasons.append("sut_git_dirty_%s" % sut_git_dirty)
+
+if not definition_source_verified:
+    reasons.append("agents_json_audit_missing_or_mismatched")
 
 schema_unsupported_only = reasons == ["claude_code_evidence_schema_unsupported"]
 
@@ -630,7 +785,11 @@ authorization = {
 definition = {
     "agent_name": agent_name,
     "declared_model": expected_model,
-    "source": "launcher_owned_agents_json",
+    # Issue #2274 PR #2285 OWNER fix-delta P0-3: only reported as
+    # launcher-owned when `definition_source_verified` (above) confirmed it
+    # from the REAL `--agents` JSON launch.sh audited before exec -- never a
+    # self-reported constant that could be true even when unverified.
+    "source": "launcher_owned_agents_json" if definition_source_verified else "unverified",
 }
 proxy_block = {
     "correlation": "hook_time_byte_offset_lifecycle_window",
@@ -726,20 +885,62 @@ Then print its exact output verbatim."
       >"$spark_stdout_file" 2>"$spark_stderr_file"
     rm -f "$spark_stderr_file"
 
-    spark_full_proxy_log_size=0
-    if [ -f "$SPARK_STRUCTURED_PROXY_LOG_PATH" ]; then
-      spark_full_proxy_log_size=$(wc -c < "$SPARK_STRUCTURED_PROXY_LOG_PATH" 2>/dev/null || echo 0)
-    fi
+    # Issue #2274 PR #2285 OWNER fix-delta P1-5: a single opened fd's
+    # fstat()+read() -- never a separate `wc -c` process plus an
+    # independent `cp` process -- so the size/dev/ino/mtime_ns identity
+    # recorded alongside the snapshot bytes is guaranteed to describe the
+    # SAME underlying inode as the bytes actually copied (a rotation racing
+    # between two independent external processes can no longer tear this).
     spark_proxy_log_snapshot=$(mktemp)
-    if [ -f "$SPARK_STRUCTURED_PROXY_LOG_PATH" ]; then
-      cp "$SPARK_STRUCTURED_PROXY_LOG_PATH" "$spark_proxy_log_snapshot" 2>/dev/null || : > "$spark_proxy_log_snapshot"
+    SPARK_PROXY_SNAPSHOT_STAT_JSON=$(python3 -c '
+import json
+import os
+import sys
+
+log_path, dest_path = sys.argv[1], sys.argv[2]
+result = {"size": 0, "dev": None, "ino": None, "mtime_ns": None}
+fd = None
+try:
+    fd = os.open(log_path, os.O_RDONLY)
+except OSError:
+    fd = None
+if fd is not None:
+    try:
+        st = os.fstat(fd)
+        data = os.read(fd, st.st_size)
+        result["size"] = len(data)
+        result["dev"] = st.st_dev
+        result["ino"] = st.st_ino
+        result["mtime_ns"] = st.st_mtime_ns
+        with open(dest_path, "wb") as out:
+            out.write(data)
+    finally:
+        os.close(fd)
+else:
+    open(dest_path, "wb").close()
+print(json.dumps(result))
+' "$SPARK_STRUCTURED_PROXY_LOG_PATH" "$spark_proxy_log_snapshot")
+    if [ -z "$SPARK_PROXY_SNAPSHOT_STAT_JSON" ]; then
+      SPARK_PROXY_SNAPSHOT_STAT_JSON='{"size": 0, "dev": null, "ino": null, "mtime_ns": null}'
+    fi
+
+    # Issue #2274 PR #2285 OWNER fix-delta P0-3: read back the EXACT
+    # `--agents` JSON launch.sh itself audited immediately before exec'ing
+    # `claude` for this attempt (written to the launcher-owned spark-auth
+    # dir, never a caller-controlled path). Read AFTER launch.sh has
+    # returned, so this reflects THIS attempt's real invocation, not a
+    # stale prior one.
+    SPARK_AGENTS_JSON_AUDIT_RAW=""
+    SPARK_AGENTS_JSON_AUDIT_PATH="$(claude_gpt_spark_auth_dir)/last-agents-json.json"
+    if [ -f "$SPARK_AGENTS_JSON_AUDIT_PATH" ]; then
+      SPARK_AGENTS_JSON_AUDIT_RAW=$(cat "$SPARK_AGENTS_JSON_AUDIT_PATH" 2>/dev/null || printf '')
     fi
 
     SPARK_EVIDENCE_JSON=$(python3 "$SPARK_EVIDENCE_PY" "$spark_stdout_file" "$spark_proxy_log_snapshot" \
       "$CLAUDE_GPT_SPARK_AGENT_NAME" "$CLAUDE_GPT_SPARK_MODEL" "$SPARK_MARKER" \
       "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
       "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" "$SPARK_CLAUDE_CODE_VERSION" "$TIMESTAMP" \
-      "$spark_full_proxy_log_size")
+      "$SPARK_PROXY_SNAPSHOT_STAT_JSON" "$SPARK_AGENTS_JSON_AUDIT_RAW")
     rm -f "$spark_stdout_file" "$spark_proxy_log_snapshot"
 
     SPARK_ATTEMPTED=$(printf '%s' "$SPARK_EVIDENCE_JSON" | python3 -c '
@@ -843,12 +1044,20 @@ SUBAGENT_MARKER="CLAUDE_GPT_CANARY_SUBAGENT_OK"
 #     生成直後に自身で parse/readback して malformed JSON・duplicate
 #     top-level key・予約済み spark 定義名との衝突を fail-closed で拒否する
 #     （lib.sh 側の実装参照）。 ---
-SMOKE_CANARY_NONCE="${TIMESTAMP}-$$-$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
-if [ -z "$SMOKE_CANARY_NONCE" ] || [ "$SMOKE_CANARY_NONCE" = "${TIMESTAMP}-$$-" ]; then
-  # /dev/urandom が利用不能な hermetic 環境向けの fallback（それでも
-  # $TIMESTAMP と $$ の組み合わせで run ごとに一意）。
-  SMOKE_CANARY_NONCE="${TIMESTAMP}-$$-$(date -u +%s%N 2>/dev/null || date -u +%s)"
+SMOKE_CANARY_CSPRNG_HEX=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+if [ -z "$SMOKE_CANARY_CSPRNG_HEX" ]; then
+  # Issue #2274 PR #2285 OWNER fix-delta P0-1: a CSPRNG-unavailable
+  # environment used to silently fall back to timestamp+PID+nanoseconds,
+  # which does not meet the AC's high-entropy nonce requirement (an
+  # attacker able to observe/predict process start time and PID could
+  # feasibly predict the derived canary agent name). This is now a typed
+  # fail-closed result -- never a low-entropy fallback.
+  printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"fail","reason":"csprng_unavailable_for_canary_nonce","generated_at":"%s","sut":{"git_head":"%s"}}\n' \
+    "$TIMESTAMP" "$SUT_GIT_HEAD" > "$EVIDENCE_FILE"
+  echo "FAIL: /dev/urandom（CSPRNG）が利用不能なため canary nonce を高エントロピーで生成できません。証跡: ${EVIDENCE_FILE}"
+  exit 1
 fi
+SMOKE_CANARY_NONCE="${TIMESTAMP}-$$-${SMOKE_CANARY_CSPRNG_HEX}"
 CANARY_AGENTS_JSON=$(claude_gpt_smoke_canary_agents_json_fragment "$SUBAGENT_MARKER" "$SMOKE_CANARY_NONCE" "$CLAUDE_GPT_SPARK_AGENT_NAME")
 if [ -z "$CANARY_AGENTS_JSON" ]; then
   printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"fail","reason":"canary_agent_fixture_synthesis_failed","generated_at":"%s","sut":{"git_head":"%s"}}\n' \
@@ -905,7 +1114,14 @@ run_convo_step() {
   step_name="$1"
   step_prompt="$2"
   step_allowed_tools="$3"
-  step_agents_json="$4"
+  # Issue #2274 PR #2285 OWNER fix-delta P0-1: this used to be the raw
+  # canary `--agents` JSON fragment forwarded verbatim into
+  # CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON. That raw-JSON escape hatch no
+  # longer exists on the launch.sh side -- this is now just a boolean
+  # ("1"/"") flag selecting whether this step should set
+  # CLAUDE_GPT_SMOKE_CANARY_MARKER/CLAUDE_GPT_SMOKE_CANARY_NONCE (opaque
+  # strings only; launch.sh synthesizes the fixture JSON itself).
+  step_use_canary_env="$4"
   step_stdout_file=$(mktemp)
   step_stderr_file=$(mktemp)
 
@@ -914,16 +1130,17 @@ run_convo_step() {
     step_log_offset_before=$(wc -c < "$STRUCTURED_PROXY_LOG_PATH" 2>/dev/null || echo 0)
   fi
 
-  if [ -n "$step_agents_json" ] && [ -n "$step_allowed_tools" ]; then
-    # Issue #2274 AC14/AC15: the canary SubAgent fixture is passed to
-    # launch.sh via a launcher-owned internal env channel
-    # (CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON), never as a caller-supplied
-    # `--agents` CLI flag -- launch.sh's own `--agents` forbidden-flag
-    # rejection (CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS) stays unconditional for
-    # caller argv, and launch.sh internally merges this fixture with the
-    # session-local spark-codex definition before invoking the real
-    # `claude` binary.
-    CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON="$step_agents_json" "$SCRIPT_DIR/launch.sh" -- -p "$step_prompt" --output-format text --no-session-persistence \
+  if [ -n "$step_use_canary_env" ] && [ -n "$step_allowed_tools" ]; then
+    # Issue #2274 AC14/AC15 (PR #2285 OWNER fix-delta P0-1): the canary
+    # SubAgent fixture is synthesized by launch.sh ITSELF (via the same
+    # `claude_gpt_smoke_canary_agents_json_fragment` function) from two
+    # opaque strings passed over a launcher-owned internal env channel
+    # (CLAUDE_GPT_SMOKE_CANARY_MARKER / CLAUDE_GPT_SMOKE_CANARY_NONCE) --
+    # never as a caller-supplied `--agents` CLI flag, and never as a
+    # caller-supplied raw JSON fragment any more either. launch.sh's own
+    # `--agents` forbidden-flag rejection (CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS)
+    # stays unconditional for caller argv.
+    CLAUDE_GPT_SMOKE_CANARY_MARKER="$SUBAGENT_MARKER" CLAUDE_GPT_SMOKE_CANARY_NONCE="$SMOKE_CANARY_NONCE" "$SCRIPT_DIR/launch.sh" -- -p "$step_prompt" --output-format text --no-session-persistence \
       --allowedTools "$step_allowed_tools" \
       >"$step_stdout_file" 2>"$step_stderr_file"
   elif [ -n "$step_allowed_tools" ]; then
@@ -1052,7 +1269,7 @@ SUBAGENT_RC=1
 subagent_attempt=0
 while [ "$subagent_attempt" -lt 3 ]; do
   subagent_attempt=$((subagent_attempt + 1))
-  run_convo_step "subagent" "You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Task tool right now (an actual tool call, not a description) to launch the subagent named ${CANARY_AGENT_NAME} with any instructions, then print its exact output verbatim." "Task" "$CANARY_AGENTS_JSON"
+  run_convo_step "subagent" "You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Task tool right now (an actual tool call, not a description) to launch the subagent named ${CANARY_AGENT_NAME} with any instructions, then print its exact output verbatim." "Task" "1"
   SUBAGENT_STDOUT="$STEP_STDOUT"
   SUBAGENT_RC="$STEP_RC"
   case "$SUBAGENT_STDOUT" in

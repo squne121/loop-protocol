@@ -31,6 +31,18 @@ events' `proxy_log_byte_offset_at_hook_time` field, plus a new
 hook-time window matrix (offset presence/type/range, and the
 contamination-before-start / bounded-window differential), not merely
 agent_id/tool_use_id correlation.
+
+PR #2285 OWNER fix-delta (iteration 1) argv/schema update: the former bare
+`proxy_captured_log_size` argv entry is now a JSON blob
+`{"size", "dev", "ino", "mtime_ns"}` describing a single-fd fstat() snapshot
+identity (P1-5), and a new trailing `agents_json_audit_raw` argv entry
+carries the real `--agents` JSON launch.sh audited before exec, used to
+independently verify `definition.source` (P0-3) instead of self-reporting a
+fixed constant. The lifecycle SubagentStart/SubagentStop hook payloads also
+now carry `proxy_log_dev_at_hook_time` / `proxy_log_ino_at_hook_time` /
+`proxy_log_mtime_ns_at_hook_time` identity fields alongside the byte offset,
+validated the same fail-closed way. The proxy-request cardinality/reqId
+matrix (P0-2) and the identity-consistency matrix (P1-5) are covered below.
 """
 from __future__ import annotations
 
@@ -73,6 +85,11 @@ def _stream_line(obj) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
 
+DEFAULT_DEV = 64512
+DEFAULT_INO = 1000001
+DEFAULT_MTIME_NS = 1700000000000000000
+
+
 def _build_stream(
     *,
     resolved_model,
@@ -91,6 +108,14 @@ def _build_stream(
     stop_byte_offset=None,
     omit_start_byte_offset=False,
     omit_stop_byte_offset=False,
+    start_dev=DEFAULT_DEV,
+    start_ino=DEFAULT_INO,
+    start_mtime_ns=DEFAULT_MTIME_NS,
+    stop_dev=DEFAULT_DEV,
+    stop_ino=DEFAULT_INO,
+    stop_mtime_ns=DEFAULT_MTIME_NS,
+    omit_start_identity=False,
+    omit_stop_identity=False,
 ) -> str:
     if stop_byte_offset is None:
         stop_byte_offset = _DEFAULT_PROXY_SLICE_LEN
@@ -116,6 +141,10 @@ def _build_stream(
         start_payload = {"agent_id": agent_id, "agent_type": AGENT_NAME}
         if not omit_start_byte_offset:
             start_payload["proxy_log_byte_offset_at_hook_time"] = start_byte_offset
+        if not omit_start_identity:
+            start_payload["proxy_log_dev_at_hook_time"] = start_dev
+            start_payload["proxy_log_ino_at_hook_time"] = start_ino
+            start_payload["proxy_log_mtime_ns_at_hook_time"] = start_mtime_ns
         lines.append(
             _stream_line(
                 {
@@ -165,6 +194,10 @@ def _build_stream(
         stop_payload = {"agent_id": stop_agent_id, "agent_type": AGENT_NAME}
         if not omit_stop_byte_offset:
             stop_payload["proxy_log_byte_offset_at_hook_time"] = stop_byte_offset
+        if not omit_stop_identity:
+            stop_payload["proxy_log_dev_at_hook_time"] = stop_dev
+            stop_payload["proxy_log_ino_at_hook_time"] = stop_ino
+            stop_payload["proxy_log_mtime_ns_at_hook_time"] = stop_mtime_ns
         lines.append(
             _stream_line(
                 {
@@ -204,12 +237,19 @@ _DEFAULT_PROXY_SLICE = (
 _DEFAULT_PROXY_SLICE_LEN = len(_DEFAULT_PROXY_SLICE.encode("utf-8"))
 
 
+DEFAULT_AGENTS_JSON_AUDIT = json.dumps({AGENT_NAME: {"model": EXPECTED_MODEL}})
+
+
 def _run_evidence(
     tmp_path,
     *,
     stream_text,
     proxy_slice_text=_DEFAULT_PROXY_SLICE,
     captured_log_size=None,
+    captured_log_dev=DEFAULT_DEV,
+    captured_log_ino=DEFAULT_INO,
+    captured_log_mtime_ns=DEFAULT_MTIME_NS,
+    agents_json_audit_raw=DEFAULT_AGENTS_JSON_AUDIT,
     claude_code_version="2.1.238 (Claude Code)",
 ):
     script = _extract_evidence_script()
@@ -227,6 +267,18 @@ def _run_evidence(
 
     if captured_log_size is None:
         captured_log_size = len(proxy_slice_text.encode("utf-8"))
+
+    # PR #2285 OWNER fix-delta P1-5: the former bare-int
+    # `proxy_captured_log_size` argv entry is now a JSON blob describing a
+    # single-fd fstat() identity snapshot (size/dev/ino/mtime_ns).
+    proxy_snapshot_stat_json = json.dumps(
+        {
+            "size": captured_log_size,
+            "dev": captured_log_dev,
+            "ino": captured_log_ino,
+            "mtime_ns": captured_log_mtime_ns,
+        }
+    )
 
     args = [
         sys.executable,
@@ -246,7 +298,8 @@ def _run_evidence(
         "proxysha",
         claude_code_version,
         "2026-08-22T00:00:00Z",
-        str(captured_log_size),
+        proxy_snapshot_stat_json,
+        agents_json_audit_raw,
     ]
     result = subprocess.run(args, capture_output=True, text=True, timeout=30)
     # The evidence builder intentionally exits 1 for any non-"pass" verdict
@@ -508,4 +561,245 @@ def test_valid_hook_time_offsets_default_window_is_not_flagged(tmp_path):
         r.startswith("spark_start_offset") or r.startswith("spark_stop_offset")
         for r in evidence["_debug_reasons"]
     )
+    assert evidence["verdict"]["status"] == "pass"
+
+
+
+# ---------------------------------------------------------------------------
+# proxy request cardinality / reqId matrix (PR #2285 OWNER fix-delta P0-2).
+# Only "zero matching requests" was previously fail-closed; multiple/
+# duplicate/uncorrelated Spark proxy evidence must ALL fail too.
+# ---------------------------------------------------------------------------
+
+
+def test_two_spark_requests_in_window_is_fail(tmp_path):
+    """Two distinct Spark HTTP requests inside the lifecycle window (e.g. a
+    genuine double-dispatch bug) must never PASS -- only exactly one is ever
+    trustworthy evidence of a single Agent delegation."""
+    line_a = _proxy_log_line(model=EXPECTED_MODEL, req_id="req-a")
+    line_b = _proxy_log_line(model=EXPECTED_MODEL, req_id="req-b")
+    full_log = line_a + line_b
+    stream = _build_stream(
+        resolved_model=EXPECTED_MODEL,
+        models_used_field=[EXPECTED_MODEL],
+        start_byte_offset=0,
+        stop_byte_offset=len(full_log.encode("utf-8")),
+    )
+    evidence = _run_evidence(tmp_path, stream_text=stream, proxy_slice_text=full_log)
+    assert evidence["verdict"]["status"] == "fail"
+    assert "spark_proxy_request_cardinality_not_one_2" in evidence["_debug_reasons"]
+    assert evidence["proxy"]["request_count"] == 2
+
+
+def test_two_requests_sharing_same_req_id_is_fail(tmp_path):
+    """Two Spark requests that share the SAME reqId (e.g. a retry that was
+    never de-duplicated) must still fail on cardinality -- duplicate reqId
+    must never be silently collapsed into "one trustworthy request"."""
+    line_a = _proxy_log_line(model=EXPECTED_MODEL, req_id="req-dup")
+    line_b = _proxy_log_line(model=EXPECTED_MODEL, req_id="req-dup")
+    full_log = line_a + line_b
+    stream = _build_stream(
+        resolved_model=EXPECTED_MODEL,
+        models_used_field=[EXPECTED_MODEL],
+        start_byte_offset=0,
+        stop_byte_offset=len(full_log.encode("utf-8")),
+    )
+    evidence = _run_evidence(tmp_path, stream_text=stream, proxy_slice_text=full_log)
+    assert evidence["verdict"]["status"] == "fail"
+    assert "spark_proxy_request_cardinality_not_one_2" in evidence["_debug_reasons"]
+
+
+def test_single_request_missing_req_id_is_fail(tmp_path):
+    """A single Spark request with a missing/empty reqId passes cardinality
+    (exactly one) but must still fail: an uncorrelated request is not
+    trustworthy evidence."""
+    line = json.dumps(
+        {
+            "msg": "codex_upstream_request_started",
+            "fields": {"reqId": "", "model": EXPECTED_MODEL, "transport": "http"},
+        },
+        separators=(",", ":"),
+    ) + "\n"
+    stream = _build_stream(
+        resolved_model=EXPECTED_MODEL,
+        models_used_field=[EXPECTED_MODEL],
+        start_byte_offset=0,
+        stop_byte_offset=len(line.encode("utf-8")),
+    )
+    evidence = _run_evidence(tmp_path, stream_text=stream, proxy_slice_text=line)
+    assert evidence["verdict"]["status"] == "fail"
+    assert evidence["proxy"]["request_count"] == 1
+    assert "spark_proxy_request_id_missing" in evidence["_debug_reasons"]
+
+
+def test_spark_request_immediately_followed_by_retry_shaped_request_is_fail(tmp_path):
+    """A genuine Spark request immediately followed by what looks like a
+    retry (same model, a different reqId, back-to-back in the log) must
+    fail on cardinality just like any other 2-request window -- a retry
+    shape is never silently treated as "the same" request."""
+    original = _proxy_log_line(model=EXPECTED_MODEL, req_id="req-original")
+    retry = _proxy_log_line(model=EXPECTED_MODEL, req_id="req-original-retry-1")
+    full_log = original + retry
+    stream = _build_stream(
+        resolved_model=EXPECTED_MODEL,
+        models_used_field=[EXPECTED_MODEL],
+        start_byte_offset=0,
+        stop_byte_offset=len(full_log.encode("utf-8")),
+    )
+    evidence = _run_evidence(tmp_path, stream_text=stream, proxy_slice_text=full_log)
+    assert evidence["verdict"]["status"] == "fail"
+    assert "spark_proxy_request_cardinality_not_one_2" in evidence["_debug_reasons"]
+
+
+def test_concurrent_session_spark_request_with_same_model_is_fail(tmp_path):
+    """A second, unrelated concurrent-session Spark request that happens to
+    land inside this run's bounded window (e.g. a raciness in test
+    infrastructure or a real concurrent delegation) must fail on
+    cardinality -- the bounded hook-time window alone is not sufficient
+    isolation without also requiring exactly one match."""
+    this_run = _proxy_log_line(model=EXPECTED_MODEL, req_id="req-this-run")
+    concurrent = _proxy_log_line(model=EXPECTED_MODEL, req_id="req-concurrent-session")
+    full_log = this_run + concurrent
+    stream = _build_stream(
+        resolved_model=EXPECTED_MODEL,
+        models_used_field=[EXPECTED_MODEL],
+        start_byte_offset=0,
+        stop_byte_offset=len(full_log.encode("utf-8")),
+    )
+    evidence = _run_evidence(tmp_path, stream_text=stream, proxy_slice_text=full_log)
+    assert evidence["verdict"]["status"] == "fail"
+    assert "spark_proxy_request_cardinality_not_one_2" in evidence["_debug_reasons"]
+
+
+def test_exactly_one_spark_request_with_unrelated_traffic_in_same_window_still_passes(tmp_path):
+    """Exactly one genuine Spark request PLUS unrelated non-Spark parent
+    traffic INSIDE the same bounded window must still PASS -- unrelated
+    models are never counted toward Spark's own cardinality (this is
+    live-observed reality per the AC5 2026-08-22 corrective note)."""
+    spark_line = _proxy_log_line(model=EXPECTED_MODEL, req_id="req-spark-only")
+    unrelated_line = _proxy_log_line(model=UNRELATED_MODEL, req_id="req-unrelated")
+    full_log = spark_line + unrelated_line
+    stream = _build_stream(
+        resolved_model=EXPECTED_MODEL,
+        models_used_field=[EXPECTED_MODEL],
+        start_byte_offset=0,
+        stop_byte_offset=len(full_log.encode("utf-8")),
+    )
+    evidence = _run_evidence(tmp_path, stream_text=stream, proxy_slice_text=full_log)
+    assert evidence["verdict"]["status"] == "pass"
+    assert evidence["proxy"]["request_count"] == 1
+    assert [r["req_id"] for r in evidence["proxy"]["requests"]] == ["req-spark-only"]
+
+
+# ---------------------------------------------------------------------------
+# definition.source real --agents JSON audit verification (PR #2285 OWNER
+# fix-delta P0-3). `definition.source` must never be a self-reported
+# constant -- only reported as launcher-owned when independently confirmed
+# from the real audited JSON.
+# ---------------------------------------------------------------------------
+
+
+def test_definition_source_verified_from_matching_real_audit_json(tmp_path):
+    stream = _build_stream(resolved_model=EXPECTED_MODEL, models_used_field=[EXPECTED_MODEL])
+    evidence = _run_evidence(tmp_path, stream_text=stream)
+    assert evidence["definition"]["source"] == "launcher_owned_agents_json"
+    assert "agents_json_audit_missing_or_mismatched" not in evidence["_debug_reasons"]
+
+
+def test_definition_source_unverified_when_audit_missing(tmp_path):
+    stream = _build_stream(resolved_model=EXPECTED_MODEL, models_used_field=[EXPECTED_MODEL])
+    evidence = _run_evidence(tmp_path, stream_text=stream, agents_json_audit_raw="")
+    assert evidence["definition"]["source"] == "unverified"
+    assert "agents_json_audit_missing_or_mismatched" in evidence["_debug_reasons"]
+    assert evidence["verdict"]["status"] == "fail"
+
+
+def test_definition_source_unverified_when_audit_model_mismatched(tmp_path):
+    stream = _build_stream(resolved_model=EXPECTED_MODEL, models_used_field=[EXPECTED_MODEL])
+    mismatched_audit = json.dumps({AGENT_NAME: {"model": "claude-haiku-4-5"}})
+    evidence = _run_evidence(tmp_path, stream_text=stream, agents_json_audit_raw=mismatched_audit)
+    assert evidence["definition"]["source"] == "unverified"
+    assert "agents_json_audit_missing_or_mismatched" in evidence["_debug_reasons"]
+    assert evidence["verdict"]["status"] == "fail"
+
+
+def test_definition_source_unverified_when_audit_json_malformed(tmp_path):
+    stream = _build_stream(resolved_model=EXPECTED_MODEL, models_used_field=[EXPECTED_MODEL])
+    evidence = _run_evidence(tmp_path, stream_text=stream, agents_json_audit_raw="{not valid json")
+    assert evidence["definition"]["source"] == "unverified"
+    assert "agents_json_audit_missing_or_mismatched" in evidence["_debug_reasons"]
+    assert evidence["verdict"]["status"] == "fail"
+
+
+def test_definition_source_unverified_when_audit_agent_name_absent(tmp_path):
+    stream = _build_stream(resolved_model=EXPECTED_MODEL, models_used_field=[EXPECTED_MODEL])
+    other_agent_audit = json.dumps({"some-other-agent": {"model": EXPECTED_MODEL}})
+    evidence = _run_evidence(tmp_path, stream_text=stream, agents_json_audit_raw=other_agent_audit)
+    assert evidence["definition"]["source"] == "unverified"
+    assert "agents_json_audit_missing_or_mismatched" in evidence["_debug_reasons"]
+
+
+# ---------------------------------------------------------------------------
+# proxy log identity (dev/ino) matrix (PR #2285 OWNER fix-delta P1-5). A
+# rotation/truncation/replacement between hook-time and snapshot-time must
+# be typed-FAIL detected, never silently misapplied as a stale-generation
+# byte offset onto a new-generation file.
+# ---------------------------------------------------------------------------
+
+
+def test_identity_missing_on_start_is_fail(tmp_path):
+    stream = _build_stream(
+        resolved_model=EXPECTED_MODEL,
+        models_used_field=[EXPECTED_MODEL],
+        omit_start_identity=True,
+    )
+    evidence = _run_evidence(tmp_path, stream_text=stream)
+    assert "spark_start_identity_missing" in evidence["_debug_reasons"]
+    assert evidence["verdict"]["status"] == "fail"
+
+
+def test_identity_missing_on_stop_is_fail(tmp_path):
+    stream = _build_stream(
+        resolved_model=EXPECTED_MODEL,
+        models_used_field=[EXPECTED_MODEL],
+        omit_stop_identity=True,
+    )
+    evidence = _run_evidence(tmp_path, stream_text=stream)
+    assert "spark_stop_identity_missing" in evidence["_debug_reasons"]
+    assert evidence["verdict"]["status"] == "fail"
+
+
+def test_identity_changed_during_window_is_fail(tmp_path):
+    """SubagentStart and SubagentStop recorded a DIFFERENT (dev, ino) --
+    i.e. the proxy log was rotated/truncated/replaced mid-window -- and the
+    window must never be trusted in that case."""
+    stream = _build_stream(
+        resolved_model=EXPECTED_MODEL,
+        models_used_field=[EXPECTED_MODEL],
+        start_ino=DEFAULT_INO,
+        stop_ino=DEFAULT_INO + 1,
+    )
+    evidence = _run_evidence(tmp_path, stream_text=stream)
+    assert "spark_proxy_log_identity_changed_during_window" in evidence["_debug_reasons"]
+    assert evidence["verdict"]["status"] == "fail"
+
+
+def test_identity_changed_before_snapshot_is_fail(tmp_path):
+    """SubagentStart and SubagentStop agree on identity, but the
+    post-invocation snapshot's own fstat() identity differs -- rotation
+    happened AFTER SubagentStop but BEFORE the snapshot was captured."""
+    stream = _build_stream(resolved_model=EXPECTED_MODEL, models_used_field=[EXPECTED_MODEL])
+    evidence = _run_evidence(tmp_path, stream_text=stream, captured_log_ino=DEFAULT_INO + 1)
+    assert "spark_proxy_log_identity_changed_before_snapshot" in evidence["_debug_reasons"]
+    assert evidence["verdict"]["status"] == "fail"
+
+
+def test_default_identity_is_consistent_and_not_flagged(tmp_path):
+    """The default fixture (consistent dev/ino across start/stop/snapshot)
+    must never surface any identity-related typed reason -- this
+    corrective addition must not regress the already-passing default
+    case."""
+    stream = _build_stream(resolved_model=EXPECTED_MODEL, models_used_field=[EXPECTED_MODEL])
+    evidence = _run_evidence(tmp_path, stream_text=stream)
+    assert not any(r.startswith("spark_") and "identity" in r for r in evidence["_debug_reasons"])
     assert evidence["verdict"]["status"] == "pass"

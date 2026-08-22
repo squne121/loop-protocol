@@ -376,14 +376,21 @@ DELEGATION_REQUIRED_KEYS = (
 # Claude Code invokes this hook, so a single check covers all sources without
 # over-claiming that managed settings were independently controlled.
 def effective_env_override_reason():
+    # Issue #2274 PR #2285 OWNER fix-delta P0-3: deny ANY non-empty
+    # CLAUDE_CODE_SUBAGENT_MODEL, including a value that happens to equal
+    # DELEGATION_MODEL. Per Claude Code's official model resolution
+    # precedence (CLAUDE_CODE_SUBAGENT_MODEL > per-invocation model >
+    # subagent definition frontmatter > main conversation model), the env
+    # var -- not the session-local agent definition -- is the true binding
+    # authority whenever it is set, even to a same-value override. Allowing
+    # a same-value override to pass would contradict the Issue's Outcome
+    # ("definition-only authority") and would make `definition.source:
+    # launcher_owned_agents_json` in SPARK_DELEGATION_EVIDENCE_V2 a false
+    # claim about which layer actually won model resolution for that run.
+    # (Also covers the literal string "inherit", which is non-empty.)
     subagent_model = os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
     if subagent_model not in (None, ""):
-        if subagent_model != DELEGATION_MODEL:
-            # Covers both a genuinely conflicting model AND the literal
-            # string "inherit" (Claude Code's own inherit sentinel is not a
-            # value this launcher ever wants to see re-injected here --
-            # session-local custom agent definition is the sole authority).
-            return "unsupported_effective_model_override"
+        return "unsupported_effective_model_override"
     fork_value = os.environ.get("CLAUDE_CODE_FORK_SUBAGENT", "")
     disable_background_value = os.environ.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "")
     fork_enabled = fork_value not in ("", "0")
@@ -1057,18 +1064,45 @@ export CLAUDE_GPT_SPARK_AUTH_DIR="$SPARK_AUTH_DIR_TARGET"
 export SPARK_GATE_WRITER
 SPARK_AGENTS_JSON=$(claude_gpt_spark_agents_json_fragment)
 
-# --- Issue #2274 AC14/AC15: runtime_smoke_test.sh 専用 launcher-owned canary
-#     SubAgent fixture の内部合成経路。caller-owned `--agents` は
-#     CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由で引き続き無条件拒否する（上記の
-#     policy-weakening flag 拒否ループを一切変更しない）。
-#     `runtime_smoke_test.sh` はこの環境変数（caller argv ではなく launcher が
-#     読む専用の内部チャネル）経由でのみ canary fixture JSON を渡し、ここで
-#     session-local spark-codex 定義（`$SPARK_AGENTS_JSON`）とマージ検証する。
-#     マージが失敗する（malformed JSON・agent name 衝突）場合は fail-closed で
-#     起動そのものを中断する（malformed な `--agents` をそのまま `claude` へ
-#     渡さない）。 ---
-if [ -n "${CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON:-}" ]; then
-  MERGED_AGENTS_JSON=$(claude_gpt_agents_json_merge_validate "$SPARK_AGENTS_JSON" "$CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON")
+# --- Issue #2274 AC14/AC15 (PR #2285 OWNER fix-delta P0-1): runtime_smoke_test.sh
+#     専用 launcher-owned canary SubAgent fixture の内部合成経路。caller-owned
+#     `--agents` は CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由で引き続き無条件拒否する
+#     （上記の policy-weakening flag 拒否ループを一切変更しない）。
+#
+#     P0-1 corrective iteration: this channel used to accept a caller-supplied
+#     raw JSON fragment (`CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON`) merged via
+#     `claude_gpt_agents_json_merge_validate`, whose only checks were
+#     non-empty-object / no-duplicate-key / serialize-readback-match -- it
+#     never allowlist-validated the fragment's *content*, so an ordinary
+#     launch that set this raw env var directly could inject an arbitrary
+#     session-local agent definition (including `hooks`/`model`/
+#     `permissionMode`/`mcpServers`). That raw-JSON escape hatch is removed
+#     entirely. `runtime_smoke_test.sh` now passes only two opaque strings
+#     (an expected-output marker and a run-unique nonce) via
+#     `CLAUDE_GPT_SMOKE_CANARY_MARKER` / `CLAUDE_GPT_SMOKE_CANARY_NONCE`, and
+#     launch.sh itself calls the SAME strictly-validated
+#     `claude_gpt_smoke_canary_agents_json_fragment` function that
+#     `runtime_smoke_test.sh` used to call on the caller's behalf -- the
+#     caller can never supply the fixture's JSON *structure* any more, only
+#     the marker text embedded inside its fixed prompt template and the
+#     nonce used to derive its high-entropy agent name (both flow through
+#     `json.dumps`, never raw string concatenation, so neither can break out
+#     of the fixed {description, prompt, tools} shape). Marker/nonce
+#     presence without the other is rejected fail-closed (never silently
+#     ignored), and fixture synthesis failure (malformed input,
+#     reserved-name collision) is fail-closed too -- launch is aborted
+#     before `claude` is ever exec'd. ---
+if [ -n "${CLAUDE_GPT_SMOKE_CANARY_MARKER:-}" ] || [ -n "${CLAUDE_GPT_SMOKE_CANARY_NONCE:-}" ]; then
+  if [ -z "${CLAUDE_GPT_SMOKE_CANARY_MARKER:-}" ] || [ -z "${CLAUDE_GPT_SMOKE_CANARY_NONCE:-}" ]; then
+    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"smoke_canary_marker_or_nonce_missing"}\n' >&2
+    exit 2
+  fi
+  CANARY_FRAGMENT_JSON=$(claude_gpt_smoke_canary_agents_json_fragment "$CLAUDE_GPT_SMOKE_CANARY_MARKER" "$CLAUDE_GPT_SMOKE_CANARY_NONCE" "$CLAUDE_GPT_SPARK_AGENT_NAME")
+  if [ -z "$CANARY_FRAGMENT_JSON" ]; then
+    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"smoke_canary_fixture_synthesis_failed"}\n' >&2
+    exit 2
+  fi
+  MERGED_AGENTS_JSON=$(claude_gpt_agents_json_merge_validate "$SPARK_AGENTS_JSON" "$CANARY_FRAGMENT_JSON")
   if [ -z "$MERGED_AGENTS_JSON" ]; then
     printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"smoke_canary_agents_merge_failed"}\n' >&2
     exit 2
@@ -1137,15 +1171,41 @@ def main() -> None:
         payload = {}
     log_path = os.environ.get("SPARK_LIFECYCLE_OFFSET_LOG_PATH")
     offset = None
+    dev = None
+    ino = None
+    mtime_ns = None
+    # Issue #2274 PR #2285 OWNER fix-delta P1-5: a single fstat() on ONE
+    # opened fd (never a separate os.stat()-by-path call plus a later
+    # independent `wc -c`/`cp`) so size/dev/ino/mtime_ns are all read from
+    # the SAME underlying inode as one atomic snapshot -- a log
+    # rotation/truncation/replacement racing between two independent
+    # path-based reads can never tear this reading.
     if isinstance(log_path, str) and log_path:
         try:
-            offset = os.stat(log_path).st_size
+            fd = os.open(log_path, os.O_RDONLY)
         except OSError:
-            offset = None
+            fd = None
+        if fd is not None:
+            try:
+                st = os.fstat(fd)
+                offset = st.st_size
+                dev = st.st_dev
+                ino = st.st_ino
+                mtime_ns = st.st_mtime_ns
+            except OSError:
+                offset = None
+                dev = None
+                ino = None
+                mtime_ns = None
+            finally:
+                os.close(fd)
     # This sink only ever ADDS its own observation to whatever the hook's
     # stdin payload already carried (agent_id/agent_type/hook_event_name/
     # etc.) -- it never removes or rewrites an existing field.
     payload["proxy_log_byte_offset_at_hook_time"] = offset
+    payload["proxy_log_dev_at_hook_time"] = dev
+    payload["proxy_log_ino_at_hook_time"] = ino
+    payload["proxy_log_mtime_ns_at_hook_time"] = mtime_ns
     sys.stdout.write(json.dumps(payload))
 
 
@@ -1607,6 +1667,23 @@ exec 9<&0
 #     Outcome 節）。caller 由来の `--permission-mode` は上記 forbidden-flag ループ
 #     （CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由）で既に全面拒否済みのため、ここに
 #     到達する時点で "$@" に `--permission-mode` トークンは含まれない。 ---
+# --- Issue #2274 PR #2285 OWNER fix-delta P0-3: best-effort audit record of
+#     the EXACT `--agents` JSON this invocation is about to pass to `claude`,
+#     written by launch.sh itself immediately before exec (never
+#     self-reported by an external observer after the fact).
+#     scripts/claude-gpt/runtime_smoke_test.sh's --spark-delegation evidence
+#     builder reads this file back and only reports `definition.source:
+#     "launcher_owned_agents_json"` when it can independently confirm
+#     agent_name/model from THIS file's real content -- never from a fixed
+#     string constant. Best-effort and never fatal: a write failure here
+#     must not block an otherwise-authorized launch, since this is an audit
+#     side-channel, not the authorization gate itself. Written under
+#     CLAUDE_GPT_HOME's spark-auth dir (never under the repo/worktree --
+#     see claude_gpt_reject_if_under_repo). ---
+SPARK_AGENTS_JSON_AUDIT_DIR="$(claude_gpt_spark_auth_dir)"
+mkdir -p "$SPARK_AGENTS_JSON_AUDIT_DIR" 2>/dev/null || true
+SPARK_AGENTS_JSON_AUDIT_PATH="${SPARK_AGENTS_JSON_AUDIT_DIR}/last-agents-json.json"
+( umask 077 && printf '%s' "$SPARK_AGENTS_JSON" > "$SPARK_AGENTS_JSON_AUDIT_PATH" ) 2>/dev/null || true
 # shellcheck disable=SC2086
 "$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" --permission-mode auto --agents "$SPARK_AGENTS_JSON" "$@" <&9 &
 CLAUDE_PID=$!

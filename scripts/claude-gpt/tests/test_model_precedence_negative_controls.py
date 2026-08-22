@@ -17,8 +17,13 @@ actually runs in a live claude-gpt session and what this suite verifies.
 
 Covers (see Issue #2274 Verification Commands, AC11):
 - unset `CLAUDE_CODE_SUBAGENT_MODEL` -> allow (positive control).
-- `CLAUDE_CODE_SUBAGENT_MODEL` == the Spark model -> allow (positive
-  control; matches, not a conflict).
+- `CLAUDE_CODE_SUBAGENT_MODEL` == the Spark model -> fail-closed deny,
+  `unsupported_effective_model_override` (PR #2285 OWNER fix-delta P0-3:
+  per Claude Code's official model resolution precedence, a same-value env
+  override is STILL the env var winning binding authority, not the
+  session-local agent definition -- allowing it would contradict this
+  Issue's "definition-only authority" Outcome, so it is denied identically
+  to a genuinely conflicting value).
 - `CLAUDE_CODE_SUBAGENT_MODEL` set to a conflicting model -> fail-closed
   deny, `unsupported_effective_model_override` (negative control).
 - `CLAUDE_CODE_SUBAGENT_MODEL` set to `inherit` -> fail-closed deny,
@@ -180,14 +185,22 @@ def test_subagent_model_unset_is_allowed(gate_script_source, tmp_path):
     assert _decision(result) == "allow"
 
 
-def test_subagent_model_matching_spark_value_is_allowed(gate_script_source, tmp_path):
+def test_subagent_model_matching_spark_value_is_denied(gate_script_source, tmp_path):
+    """PR #2285 OWNER fix-delta P0-3: a same-value `CLAUDE_CODE_SUBAGENT_MODEL`
+    override is now denied, not allowed -- the env var is still the true
+    binding authority per Claude Code's official model resolution
+    precedence even when it happens to match the Spark model, so allowing
+    it would make `definition.source: launcher_owned_agents_json` in
+    SPARK_DELEGATION_EVIDENCE_V2 a false claim about which layer actually
+    won for that run."""
     result = _authorize_and_invoke(
         gate_script_source,
         tmp_path,
         "matching",
         extra_env={"CLAUDE_CODE_SUBAGENT_MODEL": DELEGATION_MODEL},
     )
-    assert _decision(result) == "allow"
+    assert _decision(result) == "deny"
+    assert _reason(result) == "unsupported_effective_model_override"
 
 
 # --- negative controls --------------------------------------------------------

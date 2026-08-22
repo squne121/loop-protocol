@@ -774,6 +774,13 @@ if only_key != agent_name:
 entry = readback[only_key]
 if not isinstance(entry, dict):
     sys.exit(1)
+# Issue #2274 PR #2285 OWNER fix-delta P0-1: defense-in-depth exact key-set
+# check. The fixture dict literal above already structurally cannot contain
+# any other key, but this explicit check makes "no extra fields, ever" a
+# tested invariant of the readback rather than an implicit property of the
+# literal, and fails closed if a future edit to the literal ever widens it.
+if set(entry.keys()) != {"description", "prompt", "tools"}:
+    sys.exit(1)
 if entry.get("tools") != []:
     sys.exit(1)
 if "model" in entry:
