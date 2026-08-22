@@ -109,6 +109,22 @@ def _render_gate_script(directory: Path, source: str, launch_nonce: str) -> Path
     return gate_path
 
 
+# Issue #2274 AC11/AC13: the production launcher always exports the
+# fork/background invariant (`CLAUDE_CODE_FORK_SUBAGENT` unset,
+# `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`) and never re-exports
+# `CLAUDE_CODE_SUBAGENT_MODEL` before the real `claude` child process (and
+# therefore this hook) runs. Every pre-existing test in this suite implicitly
+# assumes that compliant baseline, so `_run_gate` applies it by default;
+# `extra_env` lets the AC11/AC13-specific negative-control tests override
+# individual variables to simulate a violation (ambient shell re-export or
+# settings-layer re-injection -- both surface identically in `os.environ`).
+_DEFAULT_COMPLIANT_EFFECTIVE_ENV = {
+    "CLAUDE_CODE_FORK_SUBAGENT": "",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "",
+}
+
+
 def _run_gate(
     gate_script_source: str,
     event: str,
@@ -116,9 +132,15 @@ def _run_gate(
     *,
     auth_dir: Path,
     launch_nonce: str = "nonce-fixture",
+    extra_env: dict | None = None,
 ) -> subprocess.CompletedProcess[str]:
     gate_script_path = _render_gate_script(auth_dir.parent / "gate-scripts", gate_script_source, launch_nonce)
-    env = {**os.environ, "CLAUDE_GPT_SPARK_AUTH_DIR": str(auth_dir)}
+    env = {**os.environ, **_DEFAULT_COMPLIANT_EFFECTIVE_ENV, "CLAUDE_GPT_SPARK_AUTH_DIR": str(auth_dir)}
+    # Empty-string entries model "unset" without actually removing the key
+    # from `env` (subprocess.run env dict never omits an empty-string value,
+    # and `os.environ.get(..., "")` treats "" the same as absent).
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [sys.executable, str(gate_script_path), event],
         input=json.dumps(payload),
@@ -152,7 +174,13 @@ def _user_prompt_submit(gate_script_source, auth_dir, session_id, prompt, *, lau
 
 
 def _pre_tool_use_agent(
-    gate_script_source, auth_dir, session_id, subagent_type="spark-codex", *, launch_nonce="nonce-fixture"
+    gate_script_source,
+    auth_dir,
+    session_id,
+    subagent_type="spark-codex",
+    *,
+    launch_nonce="nonce-fixture",
+    extra_env=None,
 ):
     return _run_gate(
         gate_script_source,
@@ -160,11 +188,12 @@ def _pre_tool_use_agent(
         {"session_id": session_id, "tool_input": {"subagent_type": subagent_type}},
         auth_dir=auth_dir,
         launch_nonce=launch_nonce,
+        extra_env=extra_env,
     )
 
 
 def _pre_tool_use_agent_full(
-    gate_script_source, auth_dir, session_id, tool_input, *, launch_nonce="nonce-fixture"
+    gate_script_source, auth_dir, session_id, tool_input, *, launch_nonce="nonce-fixture", extra_env=None
 ):
     return _run_gate(
         gate_script_source,
@@ -172,6 +201,7 @@ def _pre_tool_use_agent_full(
         {"session_id": session_id, "tool_input": tool_input},
         auth_dir=auth_dir,
         launch_nonce=launch_nonce,
+        extra_env=extra_env,
     )
 
 
@@ -531,9 +561,13 @@ def test_p0_2_required_lock_write_failure_is_fail_closed(gate_script_source, tmp
         os.chmod(auth_dir, 0o700)
 
 
-# P0-3: an explicit non-Spark `model` field in the actual tool_input is a
-# hard negative control (deny); an allow always pins `model` to the Spark
-# model via `updatedInput`.
+# Issue #2274 (AC1-AC4): model binding for spark-codex is owned exclusively
+# by the session-local custom agent definition. The PreToolUse(Agent) hook
+# never generates/forwards a `model` field in `updatedInput` -- it only
+# inspects a caller-proposed `model` field per the normalization contract
+# (absent -> allow untouched; exact match -> allow, key stripped; other
+# string -> deny `explicit_model_override_mismatch`; non-string JSON type
+# -> deny `invalid_model_field_type`).
 
 
 def test_p0_3_explicit_model_override_mismatch_denied(gate_script_source, tmp_path):
@@ -551,7 +585,9 @@ def test_p0_3_explicit_model_override_mismatch_denied(gate_script_source, tmp_pa
     assert "updatedInput" not in payload["hookSpecificOutput"]
 
 
-def test_p0_3_absent_model_key_allowed_and_pinned(gate_script_source, tmp_path):
+def test_ac2_absent_model_key_allowed_no_model_forwarded(gate_script_source, tmp_path):
+    # AC2: `tool_input.model` unspecified -> allow, and `updatedInput` never
+    # gains a `model` key (custom agent definition owns model resolution).
     auth_dir = tmp_path / "auth-p0-3-model-absent"
     _user_prompt_submit(gate_script_source, auth_dir, "sess-p0-3-absent", _required_directive())
     result = _pre_tool_use_agent_full(
@@ -559,10 +595,13 @@ def test_p0_3_absent_model_key_allowed_and_pinned(gate_script_source, tmp_path):
     )
     assert _decision(result) == "allow"
     payload = _output(result)
-    assert payload["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-5.3-codex-spark"
+    assert "model" not in payload["hookSpecificOutput"]["updatedInput"]
 
 
-def test_p0_3_already_pinned_model_allowed_and_consistent(gate_script_source, tmp_path):
+def test_ac1_exact_model_match_allowed_key_stripped(gate_script_source, tmp_path):
+    # AC1: an explicit `model` field that already exactly matches the Spark
+    # model is allowed, but the hook still does not *forward* the key in
+    # `updatedInput` -- it is stripped, not re-injected/pinned.
     auth_dir = tmp_path / "auth-p0-3-model-pinned"
     _user_prompt_submit(gate_script_source, auth_dir, "sess-p0-3-pinned", _required_directive())
     result = _pre_tool_use_agent_full(
@@ -573,7 +612,46 @@ def test_p0_3_already_pinned_model_allowed_and_consistent(gate_script_source, tm
     )
     assert _decision(result) == "allow"
     payload = _output(result)
-    assert payload["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-5.3-codex-spark"
+    assert "model" not in payload["hookSpecificOutput"]["updatedInput"]
+
+
+@pytest.mark.parametrize("alias_value", ["spark", "gpt-5.3-codex", "inherit"])
+def test_ac3_alias_or_inherit_model_denied(gate_script_source, tmp_path, alias_value):
+    # AC3: alias / `inherit` / any other full model id that is not an exact
+    # match is a hard negative control -- fail-closed deny, never a silent
+    # substitution.
+    auth_dir = tmp_path / f"auth-ac3-{alias_value}"
+    _user_prompt_submit(gate_script_source, auth_dir, f"sess-ac3-{alias_value}", _required_directive())
+    result = _pre_tool_use_agent_full(
+        gate_script_source,
+        auth_dir,
+        f"sess-ac3-{alias_value}",
+        {"subagent_type": "spark-codex", "model": alias_value},
+    )
+    assert _decision(result) == "deny"
+    payload = _output(result)
+    assert payload["hookSpecificOutput"]["permissionDecisionReason"] == "explicit_model_override_mismatch"
+    assert "updatedInput" not in payload["hookSpecificOutput"]
+
+
+@pytest.mark.parametrize("bad_value", [None, {}, [], 5, 5.3])
+def test_ac4_invalid_model_field_type_denied(gate_script_source, tmp_path, bad_value):
+    # AC4: a `model` field present but of a non-string JSON type (including
+    # explicit JSON `null`) is denied with a distinct typed reason, never
+    # silently coerced or treated as "absent".
+    auth_dir = tmp_path / f"auth-ac4-{type(bad_value).__name__}"
+    session_id = f"sess-ac4-{type(bad_value).__name__}"
+    _user_prompt_submit(gate_script_source, auth_dir, session_id, _required_directive())
+    result = _pre_tool_use_agent_full(
+        gate_script_source,
+        auth_dir,
+        session_id,
+        {"subagent_type": "spark-codex", "model": bad_value},
+    )
+    assert _decision(result) == "deny"
+    payload = _output(result)
+    assert payload["hookSpecificOutput"]["permissionDecisionReason"] == "invalid_model_field_type"
+    assert "updatedInput" not in payload["hookSpecificOutput"]
 
 
 # P0-4: on the allow path, `run_in_background` is force-pinned to `false` in
