@@ -493,6 +493,105 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
     lane では本要件は引き続き **opt-in**（`--require-subagent-causal-evidence` を明示した場合のみ exit を
     昇格）であり、interactive-lane 向け hook 出力チャネルの整備は別途 follow-up とする。
 
+## 11. Claude extension surface risk-trigger policy（拡張サーフェスの risk-trigger 判定）
+
+> 関連 Issue: #2259（OWNER レビュー P0-7 で明示）、#2283（本セクション新設）、#2290（enforcement 配線 follow-up）
+
+Claude extension surface（`.claude/agents/**` / `.claude/hooks/**` / `.claude/skills/**` /
+`scripts/claude-gpt/**`）の変更が、静的な frontmatter・宣言の確認だけで足りるか、
+実際の runtime 挙動確認（system test、`Runtime Verification Applicability: immediate`）を
+要求するかを判定する versioned machine-readable rule set を
+`docs/dev/extension-surface-runtime-policy.yaml` として新設する。
+
+### 正本の所在
+
+`docs/dev/extension-surface-runtime-policy.yaml` が構造化正本（`schema_version` /
+`resolution` / `unknown_surface_policy` / `assumptions[]` / `verification_profiles` /
+`rules[]` を持つ YAML）であり、本セクションはその説明・表示用に留める。rule 本体の
+スキーマ変更・追加・改廃は同 YAML ファイルを直接編集する。`schema_version` の
+構造は `docs/dev/extension-surface-runtime-policy.schema.json`（JSON Schema,
+draft 2020-12）が closed validator として検証し、
+`docs/dev/tests/test_extension_surface_runtime_policy_schema.py` の pytest で
+`jsonschema.validate()` により機械検証する。
+
+### rule set の概要
+
+各 rule は以下のフィールドを持つ:
+
+| フィールド | 説明 |
+|---|---|
+| `id` | rule 識別子 |
+| `selectors[]` | `source_scope`（`project` / `user` / `managed` / `plugin` / `session` / `cli`）ごとに `component` と、`project` は repository 相対 `path_globs`、それ以外は `runtime_resolved_only: true` + `evidence_source` を持つ構造 |
+| `semantic_detectors[]` | 型付き検出条件。`type`（`yaml_frontmatter_keys` / `markdown_body` / `json_config_keys` / `script_body_semantics`）と対象 `keys`/`classification`、対象 `change_types`（`add`/`modify`/`delete`/`rename`）を持つ |
+| `execution_context` | 実行文脈（例: `subagent_delegation`、`hook_concurrent_execution`） |
+| `default_decision` | 既定の Runtime Verification Applicability decision（通常 `immediate`） |
+| `verification_profile` | top-level `verification_profiles` object 内の profile ID への参照。参照先 profile は `runner` / `mode` / rule 固有の `assertions[]`（証明すべき postcondition）を持つ |
+| `exceptions[]` | 証明契約付きの例外。`predicate`（`proven_not_runtime_loaded` 等）に加え `evaluation_mode: human_evidence_required` / `default_when_unproven: not_applied` / `required_evidence[]` / `evidence_freshness: current_head` / `approval_authority: owner` を持つ |
+| `last_verified` | rule 単位の最終確認日 |
+| `assumption_refs` | top-level `assumptions[]` の `claim_id` への参照（任意） |
+
+トップレベルの `resolution` は複数 rule への同時一致時の合成方針
+（`multiple_matches: evaluate_all` / `final_decision: most_restrictive` /
+`exception_scope: per_rule`）を定義する。`min_claude_code_version` は rule 単位
+ではなく、トップレベル `assumptions[]`（`claim_id` 単位で
+`min_claude_code_version` / `last_verified` / `applicability` を持つ）で管理する。
+
+`docs/dev/extension-surface-runtime-policy.yaml` は agent / hook / skill /
+claude-gpt lifecycle、および SubAgent の start/stop・delegation・fallback
+semantics のそれぞれに対応する rule を最低 1 件ずつ定義する。
+
+### 例外は証明可能な predicate として定義する
+
+`docs-only` のようなファイル種別ベースの粗い例外は採用しない。以下のような
+runtime 非読込・非配布・意味不変を証明できる predicate 形式のみを例外として
+認め、各 predicate は `evaluation_mode: human_evidence_required` /
+`default_when_unproven: not_applied`（証明不足時は例外を非適用とする） /
+`required_evidence[]` / `evidence_freshness: current_head` /
+`approval_authority: owner` を伴う evidence-backed contract として定義する:
+
+- `proven_not_runtime_loaded`: 現行 production 経路から到達不能であることの証明
+- `proven_not_distributed`: 配布・有効化経路が存在しないことの証明
+- `production_consumer_inventory_empty`: 呼び出し元が repo 全体に存在しないことの証明
+- `executable_or_prompt_semantics_unchanged`: 実行可能セマンティクス・prompt 意味が
+  変更前後で同一であることの証明
+
+### unknown surface の扱い
+
+上記 4 surface のいずれにも一致しない変更（未知の extension surface）は
+`not_applicable` へ黙って倒さない。`docs/dev/extension-surface-runtime-policy.yaml`
+の `unknown_surface_policy` は `decision: human_judgment`（人間判断への
+エスカレーション） / `gate: block`（人間判断が確定するまで進行を止める） /
+`override_requires`（block を解除できる権限）を持つ構造として定義する。
+
+### 既存 decision enum との関係
+
+本 rule set は `## Runtime Verification Applicability` の既存 decision enum
+（`not_applicable` / `immediate` / `deferred`。本ドキュメント冒頭セクション参照）を
+再定義しない。各 rule の `default_decision` は「この surface / semantic_delta に
+該当する変更は `immediate` の根拠として扱われるべきである」という判定材料を
+補強するものであり、decision enum の値・意味そのものを変更するものではない。
+
+### 根拠となる Claude Code 公式ドキュメント
+
+- Claude Code Auto mode では SubAgent frontmatter の `permissionMode` が無視され、
+  親 session の classifier が child tool call にも適用される
+  （https://code.claude.com/docs/en/sub-agents）。
+- 複数 hook が同一イベントに一致した場合、全 hook が並行実行され、いずれかが
+  deny を返しても sibling hook の副作用は停止しない
+  （https://code.claude.com/docs/en/hooks-guide）。
+
+### enforcement 配線は別 Issue
+
+本セクションおよび `docs/dev/extension-surface-runtime-policy.yaml` は
+policy definition のみを scope とする。`review-issue` / `issue-contract-review` /
+PR diff gate への実際の deterministic gate 配線は follow-up Issue #2290
+（実装: Claude extension surface risk-trigger policy を review-issue /
+issue-contract-review の deterministic gate に配線する）の責務であり、
+#2290 が完了するまで本セクションの追加をもって「機械的に強制済み」とは
+扱わない。
+
+---
+
 ## 関連ドキュメント
 
 - `docs/dev/session-recording-policy.md` — session 記録 Kill Switch policy（`session_recording_policy/v1` SSOT）。`secrets_mode` 遷移時の session 記録制御・Kill Switch 手順・checkpoint visibility 検証を定める
