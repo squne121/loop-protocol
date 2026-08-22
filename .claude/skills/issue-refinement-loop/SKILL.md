@@ -275,7 +275,7 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/decide_next
 
 ### Step 2.5: セマンティック設計レビュー (Semantic Design Review)
 
-deterministic `VERDICT: approve` 確定後、`semantic_review_trigger.py` で `semantic_review_applicable` を判定する。`true` の場合のみ `semantic_review_transport.py` → `join_review_results.py` を実行し、返る `effective_verdict`（approve | needs-fix | human_judgment_required）を通常の VERDICT として上記 routing にそのまま渡す（approve→Step4.5 / needs-fix→Step4 / human_judgment_required→Step5）。`false` の場合は本 Step をスキップし直接 Step 4.5 へ 進む。詳細手順は `references/semantic-design-review.md` を参照する。`decide_next_loop_action.py` の既存呼び出し規約は一切変更しない。
+deterministic `VERDICT: approve` 確定後、`semantic_review_trigger.py` で `semantic_review_applicable` を判定する。`true` の場合のみ `semantic_review_transport.py` → `join_review_results.py` を実行する。`join_review_results.py` が返す `effective_verdict` は `approve` | `needs-fix` | `retry` | `human_judgment_required` の 4 値（#2296 fix_delta iteration 6, P0-3/P1-5）。`retry` は本 Step 2.5 の内部ループでのみ消費する（transport を一度だけ再実行し `retry_already_attempted: true` で再度 join する）中間状態であり、`decide_next_loop_action.py` には一切渡さない。`retry` 以外の 3 値（approve | needs-fix | human_judgment_required）だけを通常の VERDICT として上記 routing にそのまま渡す（approve→Step4.5 / needs-fix→Step4 / human_judgment_required→Step5）。`needs-fix` が semantic finding 由来の場合、結果には追加で `rewrite_lane: "semantic"` と `semantic_rewrite_constraints`（`SEMANTIC_REWRITE_CONSTRAINTS_V1`）が含まれ、Step 4 はこれを再構築せずそのまま `issue-editor` へ転送する（P0-4）。`semantic_review_applicable: false` の場合は本 Step をスキップし直接 Step 4.5 へ 進む。詳細手順は `references/semantic-design-review.md` を参照する。`decide_next_loop_action.py` の既存呼び出し規約は一切変更しない。
 
 ### Step 4: 書き換え (Rewrite)
 

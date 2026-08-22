@@ -924,18 +924,43 @@ _SEVERITY_TAGGED_HEADING_RE = re.compile(
 def extract_directive_markers(text: "str | None") -> list:
     """Detect known directive section markers (Revised AC, Stop Condition, ...).
 
-    #2296 AC9: also detects severity-tagged headings such as ``## P0-1``
-    (an owner adversarial-review-round severity marker) via
-    ``_SEVERITY_TAGGED_HEADING_RE`` and includes the matched tag (e.g.
-    ``P0-1``) uppercased in the returned marker list, alongside the
-    pre-existing fixed ``_DIRECTIVE_SECTION_MARKERS`` membership check. No
-    other behavior of this function changes.
+    #2296 fix_delta iteration 6 (OWNER adversarial review, P1-4): severity-
+    tagged headings (``## P0-1`` etc.) are NO LONGER merged into this
+    function's return value. A bare severity-tagged heading (e.g. a
+    heading literally named ``## P0-1`` followed by unrelated bullet text)
+    must never, by itself, be treated as a scope-authoritative directive
+    marker -- that conflated a severity LABEL with an actual scope-change
+    DIRECTIVE, and caused ``classify_directive_confidence()`` to
+    misclassify such headings as ``explicit`` via the generic
+    marker-present code path. Severity-tag extraction now lives in the
+    separate ``extract_severity_tags()`` function below; this function
+    only ever detects the pre-existing fixed ``_DIRECTIVE_SECTION_MARKERS``
+    set.
     """
     lowered = (text or "").lower()
     markers = {marker for marker in _DIRECTIVE_SECTION_MARKERS if marker in lowered}
-    for match in _SEVERITY_TAGGED_HEADING_RE.finditer(text or ""):
-        markers.add(match.group(1).upper())
     return sorted(markers)
+
+
+def extract_severity_tags(text: "str | None") -> list:
+    """Detect owner adversarial-review severity-tagged headings such as
+    ``## P0-1`` / ``### P1-3`` (``^#+\\s*P[0-9]+-[0-9]+`` form, case
+    insensitive) via ``_SEVERITY_TAGGED_HEADING_RE``, returning the matched
+    tags (e.g. ``P0-1``) uppercased and sorted.
+
+    #2296 fix_delta iteration 6 (P1-4): kept as an independent function
+    from ``extract_directive_markers()`` -- sharing only the regex
+    constant -- so that severity-tag detection never feeds
+    ``classify_directive_confidence()`` / contract_patch_operations via
+    that function's marker-present code path. Consumers that need the
+    ``severity_tagged_anchor_findings`` signal for
+    ``semantic_review_trigger.py`` (Step 2.5, #2296) call this function
+    directly (see ``build_semantic_review_trigger_input()``); this module
+    itself remains unaware of that downstream caller's contract
+    (responsibility separation preserved).
+    """
+    tags = {match.group(1).upper() for match in _SEVERITY_TAGGED_HEADING_RE.finditer(text or "")}
+    return sorted(tags)
 
 
 def extract_directive_items(text: "str | None") -> list:

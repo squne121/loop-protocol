@@ -126,6 +126,79 @@ def test_multiple_signals_all_recorded_in_triggered_by():
     assert set(result["triggered_by"]) == {"user_requested", "checker_gap_count"}
 
 
+def test_string_false_boolean_is_rejected_not_coerced_true():
+    """P1-3: bool("false") == True in Python -- a JSON string "false" must
+    be rejected, never silently coerced to True."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        trig.evaluate_semantic_review_applicable({"user_requested": "false"})
+
+
+def test_string_true_boolean_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError):
+        trig.evaluate_semantic_review_applicable({"owner_decision_conflict": "true"})
+
+
+def test_negative_checker_gap_count_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError):
+        trig.evaluate_semantic_review_applicable({"checker_gap_count": -1})
+
+
+def test_negative_heuristic_concern_count_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError):
+        trig.evaluate_semantic_review_applicable({"heuristic_concern_count": -3})
+
+
+def test_unknown_top_level_key_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError):
+        trig.evaluate_semantic_review_applicable({"totally_unknown_field": True})
+
+
+def test_unknown_cross_contract_change_key_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError):
+        trig.evaluate_semantic_review_applicable(
+            {"cross_contract_change": {"schema": True, "unknown_nested": True}}
+        )
+
+
+def test_build_semantic_review_trigger_input_counts_gaps_and_concerns():
+    raw = trig.build_semantic_review_trigger_input(
+        deterministic_checker_gaps=["gap1", "gap2"],
+        heuristic_concerns=["concern1"],
+    )
+    result = trig.evaluate_semantic_review_applicable(raw)
+    assert result["semantic_review_applicable"] is True
+    assert "checker_gap_count" in result["triggered_by"]
+    assert "heuristic_concern_count" in result["triggered_by"]
+
+
+def test_build_semantic_review_trigger_input_extracts_severity_tags_from_anchor_bodies():
+    raw = trig.build_semantic_review_trigger_input(
+        anchor_comment_bodies=["## P0-1\n\nSomething is broken.\n\n- fix it"]
+    )
+    assert raw["severity_tagged_anchor_findings"] == ["P0-1"]
+    result = trig.evaluate_semantic_review_applicable(raw)
+    assert result["semantic_review_applicable"] is True
+    assert "severity_tagged_anchor_findings" in result["triggered_by"]
+
+
+def test_build_semantic_review_trigger_input_all_defaults_not_applicable():
+    raw = trig.build_semantic_review_trigger_input()
+    result = trig.evaluate_semantic_review_applicable(raw)
+    assert result["semantic_review_applicable"] is False
+
+
 if __name__ == "__main__":
     import pytest
 

@@ -7,31 +7,49 @@ invocation's result is bound, validated, and persisted as a
 producer existed and an implementation of agent/trigger/schema/router/editor
 could ship with the reviewer never actually wired up).
 
-The actual FOREGROUND launch of the ``issue-design-reviewer`` SubAgent is
-performed by the orchestrator (main/root session) using the Agent tool --
-a Python script cannot itself invoke that tool.  This module instead
-provides the two halves of the contract around that launch:
+The actual launch of the ``issue-design-reviewer`` SubAgent is performed by
+the orchestrator (main/root session) using the Agent tool -- a Python
+script cannot itself invoke that tool. This module instead provides the
+two halves of the contract around that launch:
 
 1. ``pin_bundle()`` -- called BEFORE the orchestrator launches the SubAgent.
    Pins ``body_sha256`` at the moment deterministic verdict == approve,
    assembles the input bundle (current body + anchor feedback + deterministic
-   findings), and writes a ``.pending`` marker recording ``pinned_at``.
-   Same ``(issue_number, body_sha256, prompt_version, requested_model)``
-   reuses the same invocation directory (idempotent) and short-circuits with
-   ``cache_hit: true`` if a previously-recorded SUCCESSFUL result already
-   exists there (no relaunch needed).
+   findings), writes the pinned Issue body verbatim to a sibling ``body.md``
+   file in the same invocation directory (P0-1: a fresh subagent context
+   does not inherit parent conversation context, so the actual body text
+   must be delivered as a file the subagent is instructed to read -- a
+   ``body_sha256`` alone is not a delivery mechanism), and writes a
+   ``bundle.json`` recording ``pinned_at`` plus ``body_file: "body.md"``.
+   There is no cross-invocation result cache/reuse (P1-2, #2296 fix_delta
+   iteration 6): every ``pin_bundle()`` call always leads to a fresh review;
+   a prior successful result for the same ``(body_sha256, prompt_version,
+   requested_model)`` is never substituted for a fresh launch.
 
-2. ``record_result()`` -- called AFTER the orchestrator's foreground Agent
-   tool call returns.  Structurally enforces that the call actually waited:
-   the raw model-output file's mtime must postdate ``pinned_at``, and the
-   caller-supplied ``completed_at`` must be strictly after ``pinned_at``.  A
-   fake/stub transport that tries to fabricate a result without actually
-   running the agent (e.g. reusing a stale canned fixture, or racing ahead
-   of the pin) is rejected here (``reason_code: stale_result_reused`` /
-   ``foreground_not_verified``).  Strict JSON parsing rejects duplicate
-   keys.  Model output is restricted to ``assessment``/``findings`` --
-   presence of ``owner_disposition`` in the RAW model output (not the final
-   bound artifact) is rejected (P0-3: model must not self-adjudicate).
+2. ``record_result()`` -- called AFTER the orchestrator's Agent tool call
+   returns. This function enforces a **completion join barrier**: the
+   orchestrator must not call ``record_result()`` until the launched
+   SubAgent's output is actually in hand, and the caller-supplied
+   ``completed_at`` must be strictly after ``pinned_at``. Whether the
+   underlying Agent tool call ran in the foreground or the background is
+   NOT something this module asserts or depends on -- Claude Code does not
+   document a "foreground launch" contract, so this module never claims to
+   structurally prove one (P0-2). The raw model-output file's mtime being
+   at or after ``pinned_at`` is checked only as a weak staleness heuristic
+   (a stale canned fixture reused verbatim would normally retain an older
+   mtime); it is NOT treated as proof of genuine agent execution -- a test
+   harness or the orchestrator itself writing the file also satisfies an
+   mtime check, so no such claim is made anywhere in this module or its
+   docs. Strict JSON parsing rejects duplicate keys. Model output is
+   restricted to ``assessment``/``findings`` -- presence of
+   ``owner_disposition`` in the RAW model output (not the final bound
+   artifact) is rejected (P0-3: model must not self-adjudicate). The fully
+   assembled artifact is additionally validated against
+   ``schemas/semantic_review_result_v1.schema.json`` via ``jsonschema``,
+   plus an explicit correlation invariant (``assessment: clear`` <=>
+   ``findings`` empty, ``assessment: findings`` <=> ``findings`` non-empty)
+   that is enforced independently of the schema's own ``if``/``then``
+   correlation constraint (belt-and-suspenders, #2296 P0-3).
 """
 
 from __future__ import annotations
@@ -46,6 +64,24 @@ from typing import Any
 SCHEMA = "SEMANTIC_REVIEW_RESULT_V1"
 BUNDLE_SCHEMA = "SEMANTIC_REVIEW_BUNDLE_V1"
 DEFAULT_ARTIFACTS_ROOT = ".claude/artifacts/issue-refinement-loop"
+BODY_FILE_NAME = "body.md"
+
+# P0-3: repo-root-relative location of the canonical JSON Schema this module
+# validates every persisted artifact against. Resolved relative to this
+# file's own path (not CWD) so `record_result()` works regardless of the
+# caller's working directory.
+_SCHEMA_RELATIVE_PATH = Path("schemas") / "semantic_review_result_v1.schema.json"
+
+
+def _repo_root() -> Path:
+    # .claude/skills/issue-refinement-loop/scripts/semantic_review_transport.py
+    #   -> scripts -> issue-refinement-loop -> skills -> .claude -> repo root
+    return Path(__file__).resolve().parents[4]
+
+
+def _load_schema() -> "dict[str, Any]":
+    schema_path = _repo_root() / _SCHEMA_RELATIVE_PATH
+    return json.loads(schema_path.read_text(encoding="utf-8"))
 
 
 def _now_iso() -> str:
@@ -93,41 +129,32 @@ def pin_bundle(
     deterministic_findings: "list[dict[str, Any]] | None" = None,
     artifacts_root: "Path | None" = None,
 ) -> "dict[str, Any]":
+    """Pin the input bundle for a fresh semantic review invocation.
+
+    No cross-invocation cache/reuse (P1-2): every call always mkdir's the
+    invocation directory, writes a fresh ``body.md`` + ``bundle.json``, and
+    expects the caller to launch a fresh ``issue-design-reviewer`` -- a
+    previously recorded successful result for the same invocation key is
+    never substituted for a relaunch.
+    """
     artifacts_root = artifacts_root or Path(DEFAULT_ARTIFACTS_ROOT)
     body_sha256 = _sha256_hex(body_text.encode("utf-8"))
     invocation_id = _invocation_id(body_sha256, prompt_version, requested_model)
     inv_dir = _invocation_dir(artifacts_root, issue_number, invocation_id)
 
-    result_path = inv_dir / "semantic_review_result.json"
-    if result_path.exists():
-        try:
-            cached = _strict_json_loads(result_path.read_text(encoding="utf-8"))
-        except ValueError:
-            cached = None
-        if (
-            cached is not None
-            and cached.get("body_sha256") == body_sha256
-            and cached.get("prompt_version") == prompt_version
-            and cached.get("requested_model") == requested_model
-        ):
-            return {
-                "schema": BUNDLE_SCHEMA,
-                "issue_number": issue_number,
-                "invocation_id": invocation_id,
-                "invocation_dir": str(inv_dir),
-                "body_sha256": body_sha256,
-                "prompt_version": prompt_version,
-                "requested_model": requested_model,
-                "cache_hit": True,
-                "cached_result": cached,
-            }
-
     inv_dir.mkdir(parents=True, exist_ok=True)
     pinned_at = _now_iso()
+
+    # P0-1: persist the actual pinned body text alongside bundle.json so a
+    # fresh issue-design-reviewer subagent context (which does not inherit
+    # parent conversation context) has a concrete file to read.
+    (inv_dir / BODY_FILE_NAME).write_text(body_text, encoding="utf-8")
+
     bundle = {
         "schema": BUNDLE_SCHEMA,
         "issue_number": issue_number,
         "invocation_id": invocation_id,
+        "body_file": BODY_FILE_NAME,
         "body_sha256": body_sha256,
         "prompt_version": prompt_version,
         "requested_model": requested_model,
@@ -143,11 +170,11 @@ def pin_bundle(
         "issue_number": issue_number,
         "invocation_id": invocation_id,
         "invocation_dir": str(inv_dir),
+        "body_file": BODY_FILE_NAME,
         "body_sha256": body_sha256,
         "prompt_version": prompt_version,
         "requested_model": requested_model,
         "pinned_at": pinned_at,
-        "cache_hit": False,
     }
 
 
@@ -163,8 +190,14 @@ def record_result(
     invocation_dir: "str | Path",
     result_file: "str | Path",
     completed_at: str,
-    current_body_sha256: "str | None" = None,
+    current_body_sha256: str,
 ) -> "dict[str, Any]":
+    """Bind, validate, and persist a raw ``issue-design-reviewer`` result.
+
+    ``current_body_sha256`` is mandatory (P1-2): freshness must always be
+    explicitly checked against the invocation's pinned ``body_sha256``, it
+    is never optionally skipped.
+    """
     inv_dir = Path(invocation_dir)
     bundle = _load_bundle(inv_dir)
     pinned_at_epoch = _parse_iso(bundle["pinned_at"])
@@ -181,6 +214,10 @@ def record_result(
     if completed_at_epoch <= pinned_at_epoch:
         return _error_result(bundle, reason_code="foreground_not_verified")
 
+    # Weak staleness heuristic only (P0-2): this does NOT prove genuine
+    # agent execution. It only rejects the narrow case of a result file
+    # whose mtime predates the pin, which is enough to catch a naively
+    # reused stale fixture but is not a security/authenticity guarantee.
     result_mtime = result_path.stat().st_mtime
     if result_mtime < pinned_at_epoch:
         return _error_result(bundle, reason_code="stale_result_reused")
@@ -218,9 +255,14 @@ def record_result(
         if not finding.get("summary"):
             return _error_result(bundle, reason_code="invalid_finding_summary")
 
-    freshness_valid = (
-        current_body_sha256 is None or current_body_sha256 == bundle["body_sha256"]
-    )
+    # P0-3: explicit correlation invariant, independent of the schema's own
+    # if/then constraint below (belt-and-suspenders).
+    if assessment == "clear" and findings:
+        return _error_result(bundle, reason_code="assessment_findings_mismatch:clear_with_findings")
+    if assessment == "findings" and not findings:
+        return _error_result(bundle, reason_code="assessment_findings_mismatch:findings_empty")
+
+    freshness_valid = current_body_sha256 == bundle["body_sha256"]
 
     artifact = {
         "schema": SCHEMA,
@@ -234,6 +276,14 @@ def record_result(
         "input_binding_valid": True,
         "freshness_valid": freshness_valid,
     }
+
+    try:
+        import jsonschema
+
+        jsonschema.validate(instance=artifact, schema=_load_schema())
+    except Exception as exc:  # jsonschema.ValidationError or loader failure
+        return _error_result(bundle, reason_code=f"schema_validation_failed:{exc}")
+
     (inv_dir / "semantic_review_result.json").write_text(
         json.dumps(artifact, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8"
     )
@@ -309,7 +359,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     record.add_argument("--invocation-dir", required=True)
     record.add_argument("--result-file", required=True)
     record.add_argument("--completed-at", required=True)
-    record.add_argument("--current-body-sha256")
+    record.add_argument("--current-body-sha256", required=True)
     record.set_defaults(func=_cmd_record_result)
 
     return parser
