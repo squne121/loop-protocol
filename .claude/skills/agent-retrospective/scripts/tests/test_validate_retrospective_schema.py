@@ -67,6 +67,37 @@ def test_candidate_invalid_fixture_fails_schema_validation():
 
 
 # ---------------------------------------------------------------------------
+# AC7 (Issue #2288): finding_contract invariant-violation invalid fixtures fail
+# schema validation (regression alongside the pre-existing invalid fixture above)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "agent_improvement_candidate_v1.finding_contract.invalid_partial_envelope.json",
+        "agent_improvement_candidate_v1.finding_contract.invalid_malformed_identity.json",
+        "agent_improvement_candidate_v1.finding_contract.invalid_stale_identity.json",
+        "agent_improvement_candidate_v1.finding_contract.invalid_claim_class.json",
+        "agent_improvement_candidate_v1.finding_contract.invalid_incomplete_coverage_resolved.json",
+        "agent_improvement_candidate_v1.finding_contract.invalid_no_evidence_classified.json",
+        "agent_improvement_candidate_v1.finding_contract.invalid_raw_evidence.json",
+        "agent_improvement_candidate_v1.finding_contract.invalid_history_inconsistency.json",
+    ],
+)
+def test_finding_contract_invalid_fixtures_fail_schema_validation(fixture_name):
+    # GIVEN a fixture violating a finding_contract invariant (partial envelope,
+    # malformed/stale identity, invalid claim_class, incomplete-coverage resolved
+    # classification, evidence/baseline-less classified evaluation, raw evidence
+    # field, or evaluation-history inconsistency)
+    # WHEN validated THEN validation fails (ValidationError or RetrospectiveSchemaError)
+    instance = vrs.load_fixture(fixture_name)
+    with pytest.raises((jsonschema.exceptions.ValidationError, vrs.RetrospectiveSchemaError)):
+        vrs.validate_candidate(instance)
+    assert vrs.is_valid_candidate(instance) is False
+
+
+# ---------------------------------------------------------------------------
 # AC2: candidate_status closed enum contains all 8 states
 # ---------------------------------------------------------------------------
 

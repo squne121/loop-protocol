@@ -1,0 +1,74 @@
+{
+  "candidate_id": "cand-finding-improved-0001",
+  "candidate_status": "proposed",
+  "title": "finding_contract fixture: improved_rule",
+  "description": "Fixture candidate for finding_contract schema validation (Issue #2288).",
+  "source_run_ref": {
+    "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+    "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+  },
+  "created_at": "2026-08-22T00:00:00Z",
+  "updated_at": "2026-08-22T00:00:00Z",
+  "finding_contract": {
+    "schema_version": "v1",
+    "identity": {
+      "algorithm": "sha256-jcs-v1",
+      "key": {
+        "repository_id": "squne121/loop-protocol",
+        "claim_class": "runtime_behavior",
+        "subject_ref": {
+          "kind": "repository_path",
+          "value": "schemas/v.json"
+        },
+        "rule_id": "improved_rule"
+      },
+      "value": "sha256:b5fbf3612484f5763d902ee528b4cf44920663f05bb414fe94dce5e036a2e36c"
+    },
+    "claim_class": "runtime_behavior",
+    "evaluations": [
+      {
+        "evaluation_id": "sha256:2b10b81efbe0c9b8fd9cd7e1b27ea6508061dd1e26cee9ab6cf2a5fa2218cdcd",
+        "evaluated_run_ref": {
+          "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+          "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+        },
+        "previous_evaluation_ref": null,
+        "observed": true,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "active",
+        "signal_delta": "improved",
+        "indeterminate_reason": null,
+        "baseline_signal": {
+          "signal_type": "integer",
+          "value": 9,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "current_signal": {
+          "signal_type": "integer",
+          "value": 1,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "expected_signal": {
+          "signal_type": "integer",
+          "value": 0,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "evidence_refs": [
+          {
+            "ref_type": "repository_blob",
+            "source_id": "repository",
+            "resource_identity": ".claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py#improved-1",
+            "projection_digest": "sha256:c9f06a4514f7cfd10fbdcde63306bb854e71341cf71383ceeb6d76172fd5238c"
+          }
+        ],
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "delta-evaluator/v1",
+        "delta_status": "unchanged"
+      }
+    ]
+  }
+}

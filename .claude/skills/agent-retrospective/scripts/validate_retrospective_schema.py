@@ -43,6 +43,19 @@ Migration note (ADR 0007 Decision 7): the existing ``agent_retro_index/v1``
 (``docs/dev/agent-retro-index.md``) remains a *derived index* only. It does not hold
 run/candidate state and this module does not read from or write to it; run/candidate
 state is owned exclusively by the two schemas validated here.
+
+Finding identity / delta-evaluation contract (Issue #2288): this module additionally
+provides ``compute_finding_identity()`` / ``validate_finding_identity()`` for the
+optional ``finding_contract`` envelope on ``agent_improvement_candidate/v1``. Per the
+Issue #2288 Out of Scope list, this module does NOT implement the actual delta
+*computation* (comparing a prior run's evaluation to the current run to derive
+``presence_delta``/``signal_delta``/``delta_status`` -- that is Issue #2237's
+responsibility); ``validate_finding_contract_history()`` here only checks the
+*representation* of an already-produced ``evaluations`` list for self-consistency
+(``previous_evaluation_ref`` chains to an earlier entry in the same list, or is
+``null`` only for the first entry). ``compute_delta_capability()`` is a pure,
+non-mutating classifier used for the legacy-record migration story: it never adds,
+backfills, or auto-generates a ``finding_contract``/identity for a legacy record.
 """
 
 from __future__ import annotations
@@ -133,6 +146,147 @@ assert all(
     {"rejected", "superseded"} <= ALLOWED_TRANSITIONS[state] for state in _NON_TERMINAL_STATES
 )
 
+# ---------------------------------------------------------------------------
+# finding_contract (Issue #2288)
+# ---------------------------------------------------------------------------
+
+#: ADR 0007 Decision 2 claim-class taxonomy (exact 9-value closed enum). Mirrors
+#: schemas/agent_improvement_candidate_v1.schema.json ``$defs.claim_class.enum``.
+CLAIM_CLASSES: frozenset[str] = frozenset(
+    {
+        "code_content",
+        "code_authorship_timing",
+        "internal_loop_review_verdict",
+        "github_native_review_state",
+        "review_comment",
+        "mergeability",
+        "issue_intent",
+        "external_fact",
+        "runtime_behavior",
+    }
+)
+
+FINDING_IDENTITY_ALGORITHM = "sha256-jcs-v1"
+
+
+def _canonicalize_for_identity(value: Any) -> Any:
+    """Recursively canonicalize `value` for FINDING_IDENTITY_V1 hashing.
+
+    Dict keys are sorted (order-independence, AC2(b)). Lists are treated as *sets*:
+    each element is independently canonicalized then the list is reordered by the
+    canonical-JSON string representation of each element (order-independence,
+    AC2(c)) -- this is a deliberate deviation from strict RFC 8785 JCS (which
+    preserves array order) because identity keys in this schema are not expected to
+    encode order-significant sequences.
+    """
+    if isinstance(value, dict):
+        return {key: _canonicalize_for_identity(value[key]) for key in sorted(value.keys())}
+    if isinstance(value, list):
+        canonicalized_items = [_canonicalize_for_identity(item) for item in value]
+        canonicalized_items.sort(
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
+        )
+        return canonicalized_items
+    return value
+
+
+def compute_finding_identity(
+    identity_key: dict[str, Any], algorithm: str = FINDING_IDENTITY_ALGORITHM
+) -> str:
+    """Deterministically compute a FINDING_IDENTITY_V1 ``value`` from a typed key.
+
+    ``value = "sha256:" + SHA256(JCS-like canonical form of {"algorithm": algorithm,
+    "key": identity_key})``. ``algorithm`` participates in the hashed payload so a
+    different algorithm value produces a different digest namespace (AC2(d)) even for
+    an otherwise-identical key. ``identity_key`` is expected to be limited to
+    run/occurrence-independent fields (e.g. repository_id/claim_class/subject_ref/
+    rule_id per FINDING_IDENTITY_V1) -- this function does not itself filter which
+    keys are "allowed"; callers (and the JSON Schema `$defs.finding_identity.key`)
+    are responsible for keeping run-varying fields (source_run_ref, base_sha,
+    source_set_digest, timestamps, evidence fingerprints) out of `identity_key`
+    (AC2(e)).
+
+    Calling this twice with structurally-equal `identity_key` inputs (regardless of
+    dict key order or list element order) always returns the same value (AC2(b)/(c)).
+    """
+    canonical_payload = json.dumps(
+        {"algorithm": algorithm, "key": _canonicalize_for_identity(identity_key)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def validate_finding_identity(candidate: dict[str, Any]) -> None:
+    """Recompute and cross-check `candidate["finding_contract"]["identity"]`.
+
+    No-op when `finding_contract` is absent (legacy candidate). Raises
+    RetrospectiveSchemaError if the stored `identity.value` does not match the value
+    recomputed from `identity.key` via `compute_finding_identity()` -- callers cannot
+    supply an arbitrary, stale/copied, or fabricated identity value and have it pass
+    validation (AC2(a)).
+    """
+    finding_contract = candidate.get("finding_contract")
+    if not finding_contract:
+        return
+    identity = finding_contract["identity"]
+    algorithm = identity.get("algorithm", FINDING_IDENTITY_ALGORITHM)
+    expected_value = compute_finding_identity(identity["key"], algorithm)
+    actual_value = identity["value"]
+    if expected_value != actual_value:
+        raise RetrospectiveSchemaError(
+            "finding_contract.identity.value mismatch: stored value="
+            f"{actual_value!r} but compute_finding_identity(identity.key)="
+            f"{expected_value!r}. finding_contract.identity.value is derived from "
+            "identity.key and cannot be supplied, copied, or reused independently."
+        )
+
+
+def validate_finding_contract_history(candidate: dict[str, Any]) -> None:
+    """Validate internal self-consistency of `finding_contract.evaluations[]`.
+
+    No-op when `finding_contract` is absent. This function checks *representation*
+    consistency only (each entry's `previous_evaluation_ref` is either `null`, for
+    the very first entry in the list, or equal to the `evaluation_id` of a strictly
+    earlier entry in the same list) -- it does NOT compute delta evaluations from a
+    prior run (that computation is Issue #2237's responsibility; see module
+    docstring).
+    """
+    finding_contract = candidate.get("finding_contract")
+    if not finding_contract:
+        return
+    seen_ids: set[str] = set()
+    for index, evaluation in enumerate(finding_contract["evaluations"]):
+        previous_ref = evaluation.get("previous_evaluation_ref")
+        if previous_ref is None:
+            if index != 0:
+                raise RetrospectiveSchemaError(
+                    f"finding_contract.evaluations[{index}].previous_evaluation_ref "
+                    "is null but this is not the first evaluation in the history "
+                    "(evaluation/history inconsistency)."
+                )
+        elif previous_ref not in seen_ids:
+            raise RetrospectiveSchemaError(
+                f"finding_contract.evaluations[{index}].previous_evaluation_ref="
+                f"{previous_ref!r} does not reference any strictly earlier "
+                "evaluation_id in finding_contract.evaluations "
+                "(evaluation/history inconsistency)."
+            )
+        seen_ids.add(evaluation["evaluation_id"])
+
+
+def compute_delta_capability(candidate: dict[str, Any]) -> str:
+    """Classify a candidate's delta-evaluation capability without mutating it.
+
+    Returns `"legacy_unavailable"` when `finding_contract` is absent -- the record is
+    a legacy lifecycle-only candidate and is not eligible for delta evaluation.
+    Returns `"evaluated"` when `finding_contract` is present. This function never
+    adds, backfills, or auto-generates a `finding_contract`/identity on `candidate`;
+    it only inspects and classifies.
+    """
+    return "legacy_unavailable" if not candidate.get("finding_contract") else "evaluated"
+
 
 class RetrospectiveSchemaError(ValueError):
     """Raised for schema validation, digest-consistency, and state-transition failures."""
@@ -191,9 +345,17 @@ def validate_run(instance: dict[str, Any]) -> None:
 def validate_candidate(instance: dict[str, Any]) -> None:
     """Validate an agent_improvement_candidate/v1 instance.
 
-    Raises jsonschema.exceptions.ValidationError on schema/format failure.
+    Raises jsonschema.exceptions.ValidationError on schema/format failure. When
+    `finding_contract` is present, additionally raises RetrospectiveSchemaError if
+    `finding_contract.identity.value` does not match the value recomputed from
+    `identity.key` (see validate_finding_identity()), or if
+    `finding_contract.evaluations[]` history is internally inconsistent (see
+    validate_finding_contract_history()). No-op (legacy candidate) when
+    `finding_contract` is absent.
     """
     _validate_with_format_checking(instance, load_candidate_schema())
+    validate_finding_identity(instance)
+    validate_finding_contract_history(instance)
 
 
 def is_valid_run(instance: dict[str, Any]) -> bool:
@@ -207,7 +369,7 @@ def is_valid_run(instance: dict[str, Any]) -> bool:
 def is_valid_candidate(instance: dict[str, Any]) -> bool:
     try:
         validate_candidate(instance)
-    except jsonschema.exceptions.ValidationError:
+    except (jsonschema.exceptions.ValidationError, RetrospectiveSchemaError):
         return False
     return True
 

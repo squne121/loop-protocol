@@ -1,0 +1,107 @@
+{
+  "candidate_id": "cand-finding-history-0001",
+  "candidate_status": "proposed",
+  "title": "finding_contract fixture: history_chain_rule",
+  "description": "Fixture candidate for finding_contract schema validation (Issue #2288).",
+  "source_run_ref": {
+    "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+    "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+  },
+  "created_at": "2026-08-22T00:00:00Z",
+  "updated_at": "2026-08-22T00:00:00Z",
+  "finding_contract": {
+    "schema_version": "v1",
+    "identity": {
+      "algorithm": "sha256-jcs-v1",
+      "key": {
+        "repository_id": "squne121/loop-protocol",
+        "claim_class": "runtime_behavior",
+        "subject_ref": {
+          "kind": "repository_path",
+          "value": "schemas/t.json"
+        },
+        "rule_id": "history_chain_rule"
+      },
+      "value": "sha256:ad3289d196e63e2816ab1fe8d825832191f7c7e6115964e3cf61becb04143fa5"
+    },
+    "claim_class": "runtime_behavior",
+    "evaluations": [
+      {
+        "evaluation_id": "sha256:37273e0a9dd979d9d60ec87f7ec8d650181d800758805eb787af9eef7f955e8c",
+        "evaluated_run_ref": {
+          "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+          "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+        },
+        "previous_evaluation_ref": null,
+        "observed": true,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "new",
+        "signal_delta": "unknown",
+        "indeterminate_reason": null,
+        "baseline_signal": null,
+        "current_signal": {
+          "signal_type": "boolean",
+          "value": true,
+          "comparator": "eq",
+          "worse_direction": "not_applicable"
+        },
+        "expected_signal": null,
+        "evidence_refs": [
+          {
+            "ref_type": "repository_blob",
+            "source_id": "repository",
+            "resource_identity": ".claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py#chain-new-1",
+            "projection_digest": "sha256:ab3f0cf3a83155e80f8bc66357ab70a615dd1550457c11a39b9af3ec1bc1d911"
+          }
+        ],
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "delta-evaluator/v1",
+        "delta_status": "new"
+      },
+      {
+        "evaluation_id": "sha256:91e68c93a40f7f45b7ea4e738df9ef1dd596125aba842cd1ed3ab40687fb3b54",
+        "evaluated_run_ref": {
+          "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+          "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+        },
+        "previous_evaluation_ref": "sha256:37273e0a9dd979d9d60ec87f7ec8d650181d800758805eb787af9eef7f955e8c",
+        "observed": true,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "recurrent",
+        "signal_delta": "regressed",
+        "indeterminate_reason": null,
+        "baseline_signal": {
+          "signal_type": "integer",
+          "value": 1,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "current_signal": {
+          "signal_type": "integer",
+          "value": 5,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "expected_signal": {
+          "signal_type": "integer",
+          "value": 0,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "evidence_refs": [
+          {
+            "ref_type": "repository_blob",
+            "source_id": "repository",
+            "resource_identity": ".claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py#chain-recurrent-1",
+            "projection_digest": "sha256:d7f06f34b66c04b5f00a7e409c060cec50fde85da3b40ca75ee52576941ec250"
+          }
+        ],
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "delta-evaluator/v1",
+        "delta_status": "recurrent"
+      }
+    ]
+  }
+}

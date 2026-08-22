@@ -1,0 +1,74 @@
+{
+  "candidate_id": "cand-finding-unchanged-0001",
+  "candidate_status": "proposed",
+  "title": "finding_contract fixture: unchanged_rule",
+  "description": "Fixture candidate for finding_contract schema validation (Issue #2288).",
+  "source_run_ref": {
+    "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+    "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+  },
+  "created_at": "2026-08-22T00:00:00Z",
+  "updated_at": "2026-08-22T00:00:00Z",
+  "finding_contract": {
+    "schema_version": "v1",
+    "identity": {
+      "algorithm": "sha256-jcs-v1",
+      "key": {
+        "repository_id": "squne121/loop-protocol",
+        "claim_class": "runtime_behavior",
+        "subject_ref": {
+          "kind": "repository_path",
+          "value": "schemas/w.json"
+        },
+        "rule_id": "unchanged_rule"
+      },
+      "value": "sha256:12e3698761c362c6f8357a35b16b18deb76f20babd17266798d129eda4db9163"
+    },
+    "claim_class": "runtime_behavior",
+    "evaluations": [
+      {
+        "evaluation_id": "sha256:62e734d6767f3735c8fa456c581a2ed8bcaa53e6fdc3f88b5b41c890fc5894a6",
+        "evaluated_run_ref": {
+          "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+          "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+        },
+        "previous_evaluation_ref": null,
+        "observed": true,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "active",
+        "signal_delta": "unchanged",
+        "indeterminate_reason": null,
+        "baseline_signal": {
+          "signal_type": "integer",
+          "value": 3,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "current_signal": {
+          "signal_type": "integer",
+          "value": 3,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "expected_signal": {
+          "signal_type": "integer",
+          "value": 0,
+          "comparator": "lte",
+          "worse_direction": "higher"
+        },
+        "evidence_refs": [
+          {
+            "ref_type": "repository_blob",
+            "source_id": "repository",
+            "resource_identity": ".claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py#unchanged-1",
+            "projection_digest": "sha256:b898a48eeba8b8bdcfe7f4eafa2ba6c8f60c088d17d69305b1950bc2c7c1cda4"
+          }
+        ],
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "delta-evaluator/v1",
+        "delta_status": "unchanged"
+      }
+    ]
+  }
+}

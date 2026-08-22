@@ -1,0 +1,29 @@
+{
+  "candidate_id": "cand-finding-invalid-0001",
+  "candidate_status": "proposed",
+  "title": "finding_contract fixture: partial_envelope_rule",
+  "description": "Fixture candidate for finding_contract schema validation (Issue #2288).",
+  "source_run_ref": {
+    "base_sha": "f573d92b8cb5479230790898e77733a30efa9c67",
+    "source_set_digest": "5a771814e65ebe1732981f82972b46683614b0a9a7423f53dd0135c20f0cbe3b"
+  },
+  "created_at": "2026-08-22T00:00:00Z",
+  "updated_at": "2026-08-22T00:00:00Z",
+  "finding_contract": {
+    "schema_version": "v1",
+    "identity": {
+      "algorithm": "sha256-jcs-v1",
+      "key": {
+        "repository_id": "squne121/loop-protocol",
+        "claim_class": "runtime_behavior",
+        "subject_ref": {
+          "kind": "repository_path",
+          "value": "schemas/a.json"
+        },
+        "rule_id": "partial_envelope_rule"
+      },
+      "value": "sha256:c199d3c0aba39be92ecebd16efd88711a6576fad1cccaa4da90a4b16e9fe0b97"
+    },
+    "claim_class": "runtime_behavior"
+  }
+}
