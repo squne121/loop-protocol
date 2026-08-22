@@ -1614,7 +1614,9 @@ def run_cli(
 
         evaluation = run_evaluation(ctx, evaluator_request, invoke_evaluator=_invoke_evaluator)
         resolved_provider = (
-            previous_state_provider if previous_state_provider is not None else FixturePreviousStateProvider(fixtures={})
+            previous_state_provider
+            if previous_state_provider is not None
+            else FixturePreviousStateProvider(fixtures={})
         )
         previous_state = resolved_provider.get(
             repository_id=repository_id,
