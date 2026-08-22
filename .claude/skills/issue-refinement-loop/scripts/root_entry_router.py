@@ -8,7 +8,10 @@ process boundary and no re-presentable authorization token: the root/main
 thread calls ``run_root_transition`` once per attempt, and that same call
 fetches live state, runs a current-run ``issue-contract-review``, decides the
 route, and -- only when authorized -- invokes Step 1 directly, all within one
-Python call stack. Nothing about the route or the review result is ever
+Python call, in the SAME continuous turn (a subprocess CLI invocation of this
+module cannot itself drive the orchestrating turn's tool calls -- see the CLI
+entry point note below; the continuity guarantee is turn-level, not a single
+literal call stack when this module is run out-of-process). Nothing about the route or the review result is ever
 accepted as caller-supplied input; every value that feeds the routing
 decision is fetched or computed by this function itself.
 
@@ -185,15 +188,55 @@ _MUTATION_RESUME_POINTS = {
 
 
 def resume_from_after_mutation_failure(failed_phase: str) -> str:
-    """AC10: after a partial mutation failure, return a safe ``resume_from``
-    computed purely from the failed phase name recorded at the moment of
-    failure (this repo's mutation phases are idempotent-safe re-entry
-    points); never from stale local state, and never a caller-invented
-    string outside the known phase set is treated as anything other than an
-    opaque resume marker -- ``run_root_transition`` never re-derives
-    additional state from it."""
+    """Fallback ``resume_from`` for phases that never perform a real
+    mutation (capability_preflight/live_fetch/contract_review/
+    base_preflight are read-only fetches; a "failure" there is just a fetch
+    failure the normal capability/identity stop already covers). Kept for
+    ``decide_root_entry_route``'s pure/no-I/O unit-test surface. The ONE
+    phase this router actually mutates state for -- ``audit_comment`` -- is
+    NOT resolved by this echo; ``run_root_transition`` resolves it via
+    ``derive_resume_from_live_readback`` instead (AC10 fix, P1-1)."""
 
     return _MUTATION_RESUME_POINTS.get(failed_phase, failed_phase)
+
+
+def compute_audit_invocation_marker(
+    reviewed_body_sha256: Optional[str], reviewed_base_sha: Optional[str]
+) -> str:
+    """Deterministic marker derived purely from the values THIS invocation
+    observes (body sha + base sha) -- never persisted, never caller-
+    supplied, reproducible by any later call that observes the same live
+    state. Used to identify whether a prior attempt's audit comment for
+    this exact reviewed state was already published."""
+
+    raw = f"{reviewed_body_sha256}:{reviewed_base_sha}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _audit_marker_tag(invocation_marker: str) -> str:
+    return f"<!-- root-entry-audit-marker: {invocation_marker} -->"
+
+
+def derive_resume_from_live_readback(
+    transport: "GitHubEntryTransport", issue_number: int, invocation_marker: str
+) -> str:
+    """AC10 (P1-1 fix): after a partial ``audit_comment`` mutation failure,
+    derive ``resume_from`` from a LIVE re-read of the issue's comments --
+    not from the caller-supplied failure-phase string. If a comment
+    carrying THIS marker (recomputed from the currently-observed body/base
+    sha, not restored from any prior artifact) is already present, the
+    earlier publish attempt actually succeeded and no further action is
+    needed; otherwise it genuinely did not complete and must be retried."""
+
+    try:
+        comments = transport.list_recent_comments(issue_number)
+    except Exception:
+        return "publish_audit_comment"
+    marker_tag = _audit_marker_tag(invocation_marker)
+    for body in comments:
+        if isinstance(body, str) and marker_tag in body:
+            return "post_audit_comment_complete"
+    return "publish_audit_comment"
 
 
 def decide_root_entry_route(req: RootEntryRequest) -> dict:
@@ -241,8 +284,9 @@ def decide_root_entry_route(req: RootEntryRequest) -> dict:
 
 
 def validate_route_schema(route: object, *, expected_issue_number: int) -> Optional[str]:
-    """In-process schema gate (P1-2). Runs in the SAME call stack as
-    ``decide_root_entry_route`` -- not a separate subprocess, not gated by
+    """In-process schema gate (P1-2). Runs in the SAME Python call as
+    ``decide_root_entry_route`` within a single ``run_root_transition``
+    invocation -- not a separate subprocess, not gated by
     any token. Rejects malformed/incomplete routes and cross-checks the
     issue number against the value this SAME invocation was called with
     (never a value read back out of the route object itself)."""
@@ -277,6 +321,8 @@ class GitHubEntryTransport(Protocol):
     def post_comment(self, issue_number: int, body: str) -> dict: ...  # {"ok", "comment_id"?}
 
     def canonical_repository_identity(self) -> str: ...
+
+    def list_recent_comments(self, issue_number: int) -> list: ...
 
 
 @dataclass
@@ -324,6 +370,15 @@ class FileBackedFakeGitHubEntryTransport:
 
     def canonical_repository_identity(self) -> str:
         return self._state.get("repo_identity", "fake/repo")
+
+    def list_recent_comments(self, issue_number: int) -> list:
+        issues = self._state.get("issues", {})
+        record = issues.get(str(issue_number), {})
+        fixture_comments = list(record.get("comments", []))
+        posted_bodies = [
+            entry["body"] for entry in self._posted if entry["issue_number"] == issue_number
+        ]
+        return fixture_comments + posted_bodies
 
 
 @dataclass
@@ -416,6 +471,28 @@ class GhCliGitHubEntryTransport:
             raise RuntimeError(proc.stderr)
         return proc.stdout.strip()
 
+    def list_recent_comments(self, issue_number: int) -> list:
+        proc = subprocess.run(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(issue_number),
+                "--repo",
+                self.repo,
+                "--json",
+                "comments",
+                "--jq",
+                "[.comments[].body]",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr)
+        return json.loads(proc.stdout)
+
 
 def publish_audit_comment_best_effort(
     transport: GitHubEntryTransport, issue_number: int, route: dict
@@ -425,9 +502,13 @@ def publish_audit_comment_best_effort(
     only recorded as a warning."""
 
     try:
+        marker = compute_audit_invocation_marker(
+            route.get("reviewed_body_sha256"), route.get("reviewed_base_sha")
+        )
         body = (
             "## root-owned entry router audit\n\n"
-            f"route: {route['route']}\nreason: {route['reason']}\n"
+            f"route: {route['route']}\nreason: {route['reason']}\n\n"
+            f"{_audit_marker_tag(marker)}\n"
         )
         result = transport.post_comment(issue_number, body)
         return {"published": bool(result.get("ok")), "warning": None}
@@ -454,7 +535,7 @@ def run_root_transition(
     review verdict, reviewed body hash) is fetched or computed by THIS call,
     never accepted as a caller-supplied claim. ``invoke_step1`` is called at
     most once, and only after live-derived equality and an exact schema
-    check both pass in this same call stack -- there is no route object,
+    check both pass within this same function call -- there is no route object,
     token, or envelope handed to a separate process/consumer for later
     replay (AC14/AC17/AC18 satisfied by construction: nothing here accepts a
     previously-produced route as input at all).
@@ -478,10 +559,59 @@ def run_root_transition(
         }
 
     # AC10/AC11: a previously recorded partial mutation failure takes
-    # precedence over everything else, including any fetch, so resume is
-    # always derived from the failed phase rather than silently retrying a
-    # mutation that may have partially applied.
-    if mutation_partial_failure_phase:
+    # precedence over everything else, including any fetch. The ONE real
+    # mutation this router performs is the audit comment publish
+    # (publish_audit_comment_best_effort); resuming from an interrupted
+    # publish is resolved via a LIVE readback of the issue's comments
+    # (derive_resume_from_live_readback), not from the caller-supplied
+    # phase string echoed back verbatim (P1-1 fix). Non-mutation phases
+    # (capability_preflight/live_fetch/contract_review/base_preflight are
+    # read-only fetches, never partial mutations) keep the plain
+    # phase-name fallback since there is no live state to read back for
+    # them.
+    if mutation_partial_failure_phase == "audit_comment":
+        try:
+            capability_ok = bool(transport.capability_preflight())
+        except Exception:
+            capability_ok = False
+        if not capability_ok:
+            return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
+
+        try:
+            live0 = transport.fetch_live_issue(issue_number)
+            fetch_ok0 = bool(live0.get("fetch_ok", True)) and bool(live0.get("identity_ok", True))
+        except Exception:
+            fetch_ok0, live0 = False, {}
+        if not fetch_ok0:
+            return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
+
+        observed_body_sha0 = compute_body_sha256(live0.get("body", ""))
+        observed_base_sha0 = live0.get("base_sha")
+        marker0 = compute_audit_invocation_marker(observed_body_sha0, observed_base_sha0)
+        resume_from0 = derive_resume_from_live_readback(transport, issue_number, marker0)
+
+        if resume_from0 == "post_audit_comment_complete":
+            # Live readback proves the earlier publish for this exact
+            # reviewed state already landed -- nothing further to do, and
+            # we do not publish a duplicate audit comment for it.
+            route = _stop_route(
+                issue_number,
+                "mutation_partial_failure_already_complete",
+                observed_live_body_sha256=observed_body_sha0,
+                observed_base_sha=observed_base_sha0,
+                resume_from=resume_from0,
+            )
+            return {
+                "route": route,
+                "invoked": False,
+                "correlation_id": correlation_id,
+                "audit": {"published": None, "warning": None},
+            }
+        # Live readback proves the publish genuinely never completed --
+        # fall through to the normal flow below so this attempt retries
+        # the full fresh-review-and-route sequence (and, if it reaches
+        # ROUTE_INVOKE, publishes the audit comment for real).
+    elif mutation_partial_failure_phase:
         route = _stop_route(
             issue_number,
             "mutation_partial_failure",
@@ -626,8 +756,19 @@ def _select_contract_reviewer(args: argparse.Namespace) -> Callable[..., dict]:
     import run_contract_review_once as _icr  # noqa: E402
 
     def _real_reviewer(*, issue_number: int, repo: str, mode: str, reviewed_head_sha: Optional[str]) -> dict:
+        # P0-1 dedupe-bypass fix: root-direct requires a FRESH current-run
+        # review every attempt. run_once()'s default (skip_idempotency_check=
+        # False) short-circuits on a matching prior "go" comment without
+        # re-running readiness/blockers/product_spec/vc_preflight -- that
+        # short-circuit is correct for impl-review-loop's own iteration
+        # cache, but it is wrong for this entry gate, which must never treat
+        # a stale trusted comment as equivalent to a check that ran just now.
         return _icr.run_once(
-            issue_number=issue_number, repo=repo, mode=mode, reviewed_head_sha=reviewed_head_sha
+            issue_number=issue_number,
+            repo=repo,
+            mode=mode,
+            reviewed_head_sha=reviewed_head_sha,
+            skip_idempotency_check=True,
         )
 
     return _real_reviewer
@@ -648,6 +789,11 @@ def _main(argv: Optional[list] = None) -> int:
     transport = _select_transport(args)
     contract_reviewer = _select_contract_reviewer(args)
 
+    # P0-2 identity-bypass fix: the production CLI always binds identity
+    # verification to the operator-supplied --repo value. There is no CLI
+    # flag to opt out of this check -- expected_repository_identity is never
+    # None on the production path, so canonical_repository_identity() is
+    # always cross-checked against the trusted --repo argument.
     result = run_root_transition(
         issue_number=args.issue_number,
         repo=args.repo,
@@ -657,6 +803,7 @@ def _main(argv: Optional[list] = None) -> int:
         mode=args.mode,
         prompt_id=args.prompt_id,
         publish_audit=not args.no_audit,
+        expected_repository_identity=args.repo,
     )
     sys.stdout.write(json.dumps(result))
     sys.stdout.write("\n")

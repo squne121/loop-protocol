@@ -490,8 +490,10 @@ terminal result として返す。
 OWNER REQUEST_CHANGES
 （https://github.com/squne121/loop-protocol/pull/2282#issuecomment-5371853364 ）
 を受け、producer/consumer を別プロセス・別 script に分離し `invocation_token` の
-再提示で authorize する方式は撤回した。root/main thread は単一の継続した call
-stack の中で以下を自ら実行する（`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`
+再提示で authorize する方式は撤回した。root/main thread は単一の継続した invocation
+（in-process 呼び出しなら同一 call stack、CLI subprocess 経由なら同一 continuous
+turn — 後者は subprocess がこの turn の tool call を直接駆動できないための区別。
+下記 delivery 参照）の中で以下を自ら実行する（`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`
 の `run_root_transition()`）。
 
 ```yaml

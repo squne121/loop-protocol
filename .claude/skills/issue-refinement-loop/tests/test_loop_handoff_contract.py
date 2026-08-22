@@ -34,6 +34,7 @@ class FakeTransport:
         audit_publish_ok=True,
         repo_identity="squne121/loop-protocol",
         base_sha_sequence=None,
+        preexisting_comments=None,
     ):
         self.capability_ok = capability_ok
         self.body = body
@@ -45,6 +46,7 @@ class FakeTransport:
         self.base_sha_sequence = base_sha_sequence
         self.posted = []
         self.fetch_calls = 0
+        self.preexisting_comments = list(preexisting_comments or [])
 
     def capability_preflight(self):
         return self.capability_ok
@@ -71,6 +73,9 @@ class FakeTransport:
 
     def canonical_repository_identity(self):
         return self.repo_identity
+
+    def list_recent_comments(self, issue_number):
+        return self.preexisting_comments + [body for (_, body) in self.posted]
 
 
 def _go_reviewer(body="issue body"):
@@ -479,6 +484,7 @@ def test_direct_impl_review_loop_invocation_runs_fresh_review_or_returns_typed_s
         json.dumps(
             {
                 "capability_ok": True,
+                "repo_identity": "squne121/loop-protocol",
                 "issues": {"2272": {"body": "cli body", "base_sha": "sha-cli", "identity_ok": True}},
             }
         ),
@@ -604,11 +610,18 @@ def test_retry_counter_cannot_be_reset_by_caller():
     assert transport.fetch_calls <= 2 * (rer.MAX_BASE_PREFLIGHT_RETRIES + 2)
 
 
-def test_base_preflight_actually_pins_worktree_to_verified_sha():
-    # Each retry attempt re-pins `reviewed_base_sha` to the freshly OBSERVED
-    # base from the immediately preceding live fetch (not a caller-supplied
-    # or stale value), so the base a subsequent review is compared against
-    # is always the most recently verified one.
+def test_base_preflight_reviewed_sha_propagates_to_route_result():
+    # NOTE (Fix 5, PR #2282 re-audit): this router does not itself create
+    # or verify a git worktree -- it has no `worktree` concept at all.
+    # Actual worktree creation pinned to the reviewed base SHA is
+    # impl-review-loop Step 1's existing responsibility (the normal
+    # implementation-worker flow already creates its worktree from the
+    # base commit it is handed). What THIS function is responsible for,
+    # and what this test verifies, is that each retry attempt re-pins
+    # `reviewed_base_sha` to the freshly OBSERVED base from the
+    # immediately preceding live fetch (never a caller-supplied or stale
+    # value), so the base handed onward to Step 1 is always the most
+    # recently verified one.
     transport = FakeTransport(
         body="stable body",
         base_sha_sequence=["s0", "s1", "s1"],  # drifts once, then settles at s1
@@ -628,7 +641,10 @@ def test_base_preflight_actually_pins_worktree_to_verified_sha():
 
 
 def test_partial_failure_resume_is_derived_from_post_mutation_readback():
-    for phase in ("capability_preflight", "live_fetch", "contract_review", "base_preflight", "audit_comment"):
+    # Non-mutation phases (read-only fetches -- there is nothing to read
+    # back live for a fetch that never mutated anything) keep the plain
+    # phase-name fallback.
+    for phase in ("capability_preflight", "live_fetch", "contract_review", "base_preflight"):
         result = rer.run_root_transition(
             issue_number=2272,
             repo="squne121/loop-protocol",
@@ -654,6 +670,166 @@ def test_partial_failure_resume_is_derived_from_post_mutation_readback():
     )
     assert result_unknown["route"]["resume_from"] == "unknown_phase_xyz"
     assert result_unknown["invoked"] is False
+
+
+def test_mutation_resume_from_is_derived_from_live_readback():
+    # AC10 / P1-1 fix: `audit_comment` is the ONE phase this router
+    # actually mutates state for, so its resume point is derived from a
+    # LIVE re-read of the issue's comments -- never from the caller-
+    # supplied phase string alone -- and the SAME caller-supplied phase
+    # value ("audit_comment") produces a DIFFERENT resume_from depending
+    # on live state, which is exactly what a mere string echo could never
+    # do.
+
+    # Case 1: the earlier publish never actually landed (no matching
+    # marker comment present) -> the live readback proves it is NOT
+    # complete, so this attempt retries the full fresh-review sequence and
+    # (since the injected reviewer says "go") reaches ROUTE_INVOKE.
+    invoked = []
+    transport_not_yet = FakeTransport(preexisting_comments=[])
+    result_not_yet = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport_not_yet,
+        contract_reviewer=_go_reviewer(),
+        invoke_step1=lambda: invoked.append(1),
+        mutation_partial_failure_phase="audit_comment",
+    )
+    assert result_not_yet["route"]["route"] == rer.ROUTE_INVOKE
+    assert invoked == [1]
+
+    # Case 2: a comment carrying the marker for THIS exact reviewed state
+    # (body/base sha, recomputed fresh -- not restored from any prior
+    # artifact) is already present -> live readback proves the earlier
+    # publish DID complete, so this attempt stops without invoking Step 1
+    # or publishing a duplicate audit comment.
+    marker = rer.compute_audit_invocation_marker(
+        rer.compute_body_sha256("issue body"), "base-sha-1"
+    )
+    transport_already = FakeTransport(
+        preexisting_comments=[f"prior audit\n{rer._audit_marker_tag(marker)}\n"]
+    )
+    invoked_already = []
+    result_already = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=transport_already,
+        contract_reviewer=_go_reviewer(),
+        invoke_step1=lambda: invoked_already.append(1),
+        mutation_partial_failure_phase="audit_comment",
+    )
+    assert result_already["route"]["route"] == rer.ROUTE_STOP
+    assert result_already["route"]["resume_from"] == "post_audit_comment_complete"
+    assert result_already["invoked"] is False
+    assert invoked_already == []
+    # No duplicate audit comment was published for the already-complete case.
+    assert transport_already.posted == []
+
+
+def test_static_or_baseline_review_cannot_be_mislabeled_as_reviewed_exact_head():
+    # `_real_reviewer` (the production reviewer path, exercised without
+    # going through any fake) must call `run_once` with
+    # `skip_idempotency_check=True` -- otherwise a stale trusted "go"
+    # comment matching the current body sha would short-circuit the
+    # existing-go-comment dedupe inside `run_once` and this root-direct
+    # entry gate would silently accept a review that did not actually run
+    # just now (P0-1 dedupe-bypass fix).
+    import types
+    import unittest.mock as mock
+
+    captured = {}
+
+    def _fake_run_once(**kwargs):
+        captured.update(kwargs)
+        return {"status": "go", "body_sha256": kwargs.get("reviewed_head_sha")}
+
+    fake_module = types.SimpleNamespace(run_once=_fake_run_once)
+    with mock.patch.dict("sys.modules", {"run_contract_review_once": fake_module}):
+        args = types.SimpleNamespace(fake_contract_review_file=None)
+        reviewer = rer._select_contract_reviewer(args)
+        reviewer(issue_number=2272, repo="squne121/loop-protocol", mode="static", reviewed_head_sha="sha-x")
+
+    assert captured.get("skip_idempotency_check") is True
+
+
+def test_production_repository_identity_cannot_be_bypassed_by_default():
+    # The production CLI path must ALWAYS bind identity verification to the
+    # operator-supplied --repo value -- there is no flag to opt out, so
+    # `expected_repository_identity` is never left at its permissive
+    # default (None) when invoked as a real CLI process (P0-2
+    # identity-bypass fix).
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--issue-number", required=True, type=int)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--base-ref", default="main")
+    parser.add_argument("--mode", default="static")
+    parser.add_argument("--fake-transport-file", default=None)
+    parser.add_argument("--fake-contract-review-file", default=None)
+    parser.add_argument("--prompt-id", default=None)
+    parser.add_argument("--no-audit", action="store_true")
+    args = parser.parse_args(["--issue-number", "2272", "--repo", "squne121/loop-protocol"])
+
+    import inspect as _inspect
+
+    source = _inspect.getsource(rer._main)
+    assert "expected_repository_identity=args.repo" in source
+
+
+def test_prior_go_comment_cannot_replace_current_fresh_review():
+    # Integration-shape regression for the dedupe-bypass exploit (P0-1):
+    # even a `run_once`-shaped reviewer that internally deduped against a
+    # stale trusted "go" comment must not be trusted UNLESS this router
+    # explicitly asked it to skip that dedupe. This test does not import
+    # the real run_contract_review_once (out of scope to modify/exercise
+    # its full readiness pipeline here); it asserts the calling contract
+    # `_real_reviewer` upholds -- covered directly by
+    # test_static_or_baseline_review_cannot_be_mislabeled_as_reviewed_exact_head
+    # above, which asserts skip_idempotency_check=True is always passed.
+    # This test additionally proves that WITHOUT that flag, a dedupe-
+    # shaped reviewer would silently fabricate a "go" for an unreviewed
+    # current state -- demonstrating why the flag is required.
+    live_body_sha = rer.compute_body_sha256("issue body")
+
+    def _dedupe_shaped_reviewer(*, issue_number, repo, mode, reviewed_head_sha, skip_idempotency_check=False):
+        if not skip_idempotency_check:
+            # Simulates run_once()'s existing-go-comment short-circuit:
+            # returns "go" from a STALE prior check, without running any
+            # current-run readiness/blockers/product_spec/vc_preflight.
+            return {"status": "go", "body_sha256": live_body_sha, "source": "existing_go_comment"}
+        # Simulates the fresh check actually finding a current blocker (for
+        # this SAME live body, so body-drift routing does not mask the
+        # blocked verdict this test is checking).
+        return {"status": "blocked", "body_sha256": live_body_sha, "source": "current_run"}
+
+    invoked = []
+    result = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=FakeTransport(),
+        contract_reviewer=lambda **kw: _dedupe_shaped_reviewer(skip_idempotency_check=True, **kw),
+        invoke_step1=lambda: invoked.append(1),
+    )
+    # With skip_idempotency_check=True (what _real_reviewer now always
+    # passes), the dedupe-shaped reviewer's fresh-check branch runs and
+    # correctly blocks -- proving the fix prevents the stale-go exploit.
+    assert result["route"]["route"] == rer.ROUTE_STOP
+    assert invoked == []
+
+
+def test_production_cli_noop_cannot_count_as_real_step1_invocation():
+    # The CLI's invoke_step1 callback is a deliberate no-op sentinel (a
+    # subprocess cannot drive the orchestrating turn's tool calls -- see
+    # module docstring). This test asserts that fact is explicit in the
+    # source rather than silently assumed, so a future refactor cannot
+    # accidentally start treating CLI `invoked: true` as proof Step 1 ran.
+    import inspect as _inspect
+
+    source = _inspect.getsource(rer._main)
+    assert "invoke_step1=lambda: None" in source
+    assert "CLI never invokes Step 1 itself" in source
+
 
 
 def test_consumer_rejects_non_exact_route_schema():

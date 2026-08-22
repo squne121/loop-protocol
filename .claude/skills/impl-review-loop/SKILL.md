@@ -22,7 +22,10 @@ implementation child issue を **実装 → 検証 → PR レビュー** の 3 �
 
 ## Root-Owned Synchronous Entry Transition（Step 1 起動契約, #2272 正本、root-direct 再設計）
 
-Step 1（Implementation）の起動は、root/main thread が単一の継続した call stack の中で、
+Step 1（Implementation）の起動は、root/main thread が単一の継続した invocation
+（in-process 呼び出しなら同一 call stack、CLI subprocess 経由なら同一 continuous
+turn。詳細は `issue-refinement-loop/references/termination-policy.md` の
+production carrier `delivery` 定義参照）の中で、
 capability preflight → live Issue fetch → 同一呼び出し内での current-run
 `issue-contract-review`（`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`
 の `run_root_transition()` が既存 `run_once()` を関数として直接呼び出す。
