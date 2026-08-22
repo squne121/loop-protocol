@@ -651,3 +651,143 @@ claude_gpt_build_proxy_env() {
   printf 'CCP_LOG_STDERR=1\n'
   printf 'CCP_CODEX_TRANSPORT=%s\n' "$CLAUDE_GPT_CODEX_TRANSPORT_POLICY"
 }
+
+# --- Smoke harness canary agent fixture（Issue #2274 AC14/AC15）---
+#
+# claude_gpt_agents_json_merge_validate: 複数の `--agents` JSON fragment 文字列
+# （それぞれ単一 top-level key を持つ有効な JSON object であることを要求する）を
+# python3 の JSON serializer/parser だけを使って安全にマージし、生成後に
+# parse/readback して以下を fail-closed で拒否する:
+#   - 引数のいずれかが有効な JSON object としてパースできない場合（malformed JSON）
+#   - マージ後の top-level key 数が入力 fragment の合計 key 数と一致しない場合
+#     （＝ 複数 fragment 間で agent name が衝突し、後勝ちで上書きされた場合。
+#       duplicate agent name の検出）
+#   - readback したマージ結果が serialize 直後の値と一致しない場合
+# 成功時のみマージ結果 JSON を stdout へ書き、exit 0 を返す。失敗時は何も出力せず
+# 非 0 を返す（呼び出し元は戻り値を必ず検査すること）。python3 未対応環境は
+# fail-closed（何も出力せず exit 1）。
+claude_gpt_agents_json_merge_validate() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+  python3 - "$@" <<'CLAUDE_GPT_AGENTS_MERGE_VALIDATE_PY'
+import json
+import sys
+
+fragments = sys.argv[1:]
+if not fragments:
+    sys.exit(1)
+
+merged = {}
+expected_key_count = 0
+for raw in fragments:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        sys.exit(1)
+    if not isinstance(parsed, dict) or not parsed:
+        sys.exit(1)
+    expected_key_count += len(parsed)
+    merged.update(parsed)
+
+if len(merged) != expected_key_count:
+    sys.exit(1)
+
+serialized = json.dumps(merged)
+try:
+    readback = json.loads(serialized)
+except (json.JSONDecodeError, ValueError):
+    sys.exit(1)
+if readback != merged:
+    sys.exit(1)
+
+sys.stdout.write(serialized)
+CLAUDE_GPT_AGENTS_MERGE_VALIDATE_PY
+}
+
+# claude_gpt_smoke_canary_agents_json_fragment: `runtime_smoke_test.sh` 専用の
+# launcher-owned/session-owned canary SubAgent fixture を内部合成する（Issue #2274
+# AC14/AC15）。smoke mode 以外からの呼び出しは想定しない。呼び出し元から
+# name/prompt/model/tools を一切受け取らない（この関数のシグネチャ自体が受け取れる
+# のは expected marker と smoke run 固有 nonce の 2 つだけ -- caller override は
+# 構造的に不可能）。生成した agent name は smoke run 固有 nonce（呼び出し元が
+# 生成する高エントロピー値。推測困難な値であること）を組み込み、他 run や
+# session-local spark 定義名との衝突を避ける。tools は常に空配列、prompt は
+# 固定の canary prompt に expected marker を埋め込んだもの。
+#
+# JSON serializer（python3 の `json.dumps`）で一括生成した直後に自身で
+# parse/readback し、以下のいずれかを検出したら stdout へ何も書かず exit 1 する
+# （fail-closed。malformed JSON をそのまま `--agents` へ渡さない）:
+#   - marker/nonce が空
+#   - 生成した agent name が予約済み spark 定義名（$3 に渡された値）と衝突する
+#   - readback した object の top-level key が 1 個でない
+#   - readback した prompt/tools が固定 spec と一致しない（tools が空配列でない・
+#     model key が存在する等）
+#
+# 引数: $1=expected marker文字列  $2=smoke run 固有 nonce  $3=予約済み spark 定義名
+#       （$CLAUDE_GPT_SPARK_AGENT_NAME 等。衝突検査専用、この値自体は生成しない）
+claude_gpt_smoke_canary_agents_json_fragment() {
+  marker="$1"
+  nonce="$2"
+  reserved_name="$3"
+  if [ -z "$marker" ] || [ -z "$nonce" ]; then
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+  prompt_text="You are a launcher-owned canary SubAgent used only for claude-gpt runtime smoke test positive control (Issue #2274 AC14/AC15). You have no tools. When invoked, respond with exactly: ${marker} and nothing else."
+  python3 - "$nonce" "$prompt_text" "$marker" "$reserved_name" <<'CLAUDE_GPT_CANARY_FIXTURE_PY'
+import hashlib
+import json
+import sys
+
+nonce, prompt_text, marker, reserved_name = sys.argv[1:5]
+
+if not nonce or not prompt_text or not marker:
+    sys.exit(1)
+
+agent_name = "canary-smoke-" + hashlib.sha256(nonce.encode("utf-8")).hexdigest()[:32]
+if reserved_name and agent_name == reserved_name:
+    sys.exit(1)
+
+fixture = {
+    agent_name: {
+        "description": "Launcher-owned canary SubAgent for claude-gpt runtime smoke test positive control only (Issue #2274).",
+        "prompt": prompt_text,
+        "tools": [],
+    }
+}
+serialized = json.dumps(fixture)
+
+try:
+    readback = json.loads(serialized)
+except (json.JSONDecodeError, ValueError):
+    sys.exit(1)
+if not isinstance(readback, dict) or len(readback) != 1:
+    sys.exit(1)
+if reserved_name and reserved_name in readback:
+    sys.exit(1)
+only_key = next(iter(readback))
+if only_key != agent_name:
+    sys.exit(1)
+entry = readback[only_key]
+if not isinstance(entry, dict):
+    sys.exit(1)
+# Issue #2274 PR #2285 OWNER fix-delta P0-1: defense-in-depth exact key-set
+# check. The fixture dict literal above already structurally cannot contain
+# any other key, but this explicit check makes "no extra fields, ever" a
+# tested invariant of the readback rather than an implicit property of the
+# literal, and fails closed if a future edit to the literal ever widens it.
+if set(entry.keys()) != {"description", "prompt", "tools"}:
+    sys.exit(1)
+if entry.get("tools") != []:
+    sys.exit(1)
+if "model" in entry:
+    sys.exit(1)
+if entry.get("prompt") != prompt_text:
+    sys.exit(1)
+
+sys.stdout.write(serialized)
+CLAUDE_GPT_CANARY_FIXTURE_PY
+}
