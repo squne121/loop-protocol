@@ -504,5 +504,8 @@ def test_valid_hook_time_offsets_default_window_is_not_flagged(tmp_path):
     validation must not regress the already-passing default case."""
     stream = _build_stream(resolved_model=EXPECTED_MODEL, models_used_field=[EXPECTED_MODEL])
     evidence = _run_evidence(tmp_path, stream_text=stream)
-    assert not any(r.startswith("spark_start_offset") or r.startswith("spark_stop_offset") for r in evidence["_debug_reasons"])
+    assert not any(
+        r.startswith("spark_start_offset") or r.startswith("spark_stop_offset")
+        for r in evidence["_debug_reasons"]
+    )
     assert evidence["verdict"]["status"] == "pass"
