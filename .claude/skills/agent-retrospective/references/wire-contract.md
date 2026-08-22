@@ -57,3 +57,21 @@ dataclass に宣言されていないため、入力に含まれていれば汎�
 
 - `run_id` 一致検証: `validate_run_id_agreement(*envelopes)`
 - schema repair retry: `parse_agent_output_with_repair(...)`（上限 `SCHEMA_REPAIR_RETRIES = 1`）
+
+## nested smuggled-authority-field scan（Issue #2237 fix_delta P0-3）
+
+`findings: list[dict]` / `finding_sets: list[dict]` / `candidate_records: list[dict]` /
+`run_identity: dict` は dataclass レベルでは `dict[str, Any]`/`list[dict]` だが、`from_wire()` は
+デコード後の payload 全体を任意の深さまで再帰走査し、`SMUGGLED_AUTHORITY_KEYS`（`private_evidence`/
+`authorized`/`authorized_by_human`/`authorization_token`/`mutation_capability`/`raw_stdout`/
+`raw_stderr`/`raw_transcript`/`credential(s)`/`secret(s)`/`api_key`/`access_token`/`absolute_path`）
+のいずれかがどの階層に現れても `smuggled_authority_field` で reject する（top-level
+`additionalProperties: false` だけでは防げなかった nested smuggling への対策）。
+
+## candidate_records の canonical schema 検証（Issue #2237 fix_delta P0-3/P0-4）
+
+`Evaluation.candidate_records` / `PublishRequest.candidate_records` は、現行マージ済みの
+`agent_improvement_candidate/v1`（#2288/#2289、`schemas/agent_improvement_candidate_v1.schema.json`）
+を正本として `validate_retrospective_schema.validate_candidate()` で検証される。私的な shadow dialect
+（`finding_identity`/`severity`/`candidate_status: open|resolved` 等）は canonical schema 不適合として
+reject される。同一リスト内の `candidate_id` 重複も reject する。

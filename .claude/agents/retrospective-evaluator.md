@@ -12,6 +12,8 @@ disallowedTools:
   - Bash
   - WebFetch
   - WebSearch
+mcpServers: []
+hooks: {}
 model: sonnet
 maxTurns: 8
 permissionMode: dontAsk
@@ -26,6 +28,13 @@ permissionMode: dontAsk
 Web fetch、Bash 実行、filesystem write も一切行いません。本 SubAgent の入力は呼び出し元
 （root Skill）が渡す `EVALUATOR_REQUEST_V1` のプロンプト本文のみであり、それ以外のいかなる外部情報源
 （追加調査・Web 検索・repository への直接アクセス）も参照しません。
+
+`mcpServers`/`hooks` は本 SubAgent が使用しないため明示的に空（`[]`/`{}`）で固定する。
+`memory`/`background`/`isolation`/`skills` は現行 Claude Code の SubAgent frontmatter に
+公式な sentinel（例: `isolation: none`）が存在しないため、本 frontmatter には追加しない
+（OWNER review #2237#issuecomment-5378291560 P1-1）。本 SubAgent は `permissionMode: dontAsk`
+かつ leaf 制約（`tools: []`/`disallowedTools` フル指定）により foreground・no-memory・
+no-skill 相当の挙動が frontmatter 全体として達成されている。
 
 ## 起動タイミング制約
 
@@ -59,7 +68,21 @@ schema-controlled projection のみである。
   "base_sha": "<呼び出し元から受け取った base_sha>",
   "source_set_digest": "<呼び出し元から受け取った source_set_digest>",
   "candidate_records": [
-    {"finding_identity": "<opaque identity>", "severity": "<low|medium|high|critical>"}
+    {
+      "candidate_id": "<stable candidate identifier>",
+      "candidate_status": "proposed",
+      "title": "<short summary>",
+      "description": "<schema-controlled projection, no secrets/absolute paths/raw transcript>",
+      "source_run_ref": {"base_sha": "<base_sha>", "source_set_digest": "<source_set_digest>"},
+      "created_at": "<date-time>",
+      "updated_at": "<date-time>",
+      "finding_contract": {
+        "schema_version": "v1",
+        "identity": {"algorithm": "sha256-jcs-v1", "key": {"...": "..."}, "value": "sha256:<64 hex>"},
+        "claim_class": "<claim_class enum value>",
+        "evaluations": [{"...": "canonical agent_improvement_candidate/v1 evaluation entry"}]
+      }
+    }
   ],
   "evidence_ref": "<呼び出し元が付与する opaque 参照文字列>"
 }

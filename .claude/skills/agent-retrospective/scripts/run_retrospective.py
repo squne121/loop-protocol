@@ -1,39 +1,53 @@
 #!/usr/bin/env python3
-"""run_retrospective.py -- agent-retrospective deterministic phase engine (Issue #2237).
+"""run_retrospective.py -- agent-retrospective deterministic phase engine and
+stable executable entrypoint (Issue #2237, iteration-3 fix_delta for OWNER
+review #2237#issuecomment-5378291560).
 
-Implements the four deterministic phases owned by ``run_retrospective.py``
+Owns, as a single coherent call graph, the four deterministic phases
 (``prepare`` / ``validate-observers`` / ``prepare-evaluator`` / ``finalize``)
-plus the supporting building blocks fixed by Issue #2237's Outcome section:
+plus:
 
   - the ephemeral wire contract (``SourcePlan`` / ``EvidenceBundle`` /
     ``FindingSet`` / ``EvaluatorRequest`` / ``Evaluation`` / ``PublishRequest``)
-    as strict dataclasses with a round-trippable JSON serializer/deserializer
+    as strict dataclasses with a round-trippable JSON serializer/deserializer,
+    including nested smuggled-authority-field rejection and canonical
+    ``agent_improvement_candidate/v1`` (#2288/#2289) candidate validation
   - a production Agent invocation adapter (headless CLI subprocess:
-    ``claude -p --output-format json --json-schema``)
+    ``claude -p --agent <name> --output-format json --json-schema <schema
+    text> --no-session-persistence``, prompt via stdin)
   - a ``PreviousStateProvider`` read-only port (fixture/in-memory
-    implementation; the persistence-backed production provider is #2238)
+    implementation; the persistence-backed production provider is #2238) and
+    a delta engine that classifies against ``finding_contract.identity`` /
+    ``finding_contract.evaluations[]`` (never the legacy lifecycle enum)
   - the ``PUBLISH_REQUEST_V1`` producer schema (proposal-only, forbidden
-    fields rejected structurally)
-  - a delegated-Agent permission policy / tool callback
+    fields rejected structurally, digest bound to run_identity + concurrency
+    token)
+  - a delegated-Agent permission policy that is consumed by the real
+    invocation path (subprocess env sanitation + ``--disallowedTools`` argv)
+  - exact observer manifest / base_sha / role-authority enforcement for the
+    fan-in step
   - a run-scoped temp artifact directory with mode ``0700`` and cleanup on
     every exit path (success / exception / SIGINT / SIGTERM)
-
-Orchestration owner is the root Skill (``SKILL.md``'s procedure, run by the
-main conversation) -- this module never calls Claude Code's ``Agent`` tool
-itself; it only provides the deterministic phase functions the root Skill
-composes around each ``Agent`` tool call it makes directly. See the Issue
-#2237 body "Orchestration owner" section and
-``.claude/skills/agent-retrospective/references/`` for the full rationale.
+  - ``run_cli()``/``main()``: the single stable executable entrypoint the
+    root Skill (``SKILL.md``'s procedure) invokes via Bash. Root Skill owns
+    *triggering* the run (a single Bash call) and any high-level stop
+    decision; this module owns everything from collector closures through
+    the final ``PublishRequest`` (or typed failure) printed to stdout. This
+    module never calls Claude Code's interactive ``Agent`` tool -- the
+    headless CLI subprocess it shells out to is a distinct, non-interactive
+    invocation transport. See ``references/`` for the full rationale.
 """
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import dataclasses
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -87,6 +101,10 @@ def _validate_retrospective_schema_module():
     return _load_sibling_module("agent_retrospective_validate_schema", "validate_retrospective_schema.py")
 
 
+def _collect_snapshot_module():
+    return _load_sibling_module("agent_retrospective_collect_snapshot", "collect_snapshot.py")
+
+
 def compute_source_set_digest(source_observations: list[dict[str, Any]]) -> str:
     """Reuse Child 2's canonical ``source_set_digest`` computation (Issue
     #2235/#2236). Loaded lazily so importing this module never requires the
@@ -96,7 +114,7 @@ def compute_source_set_digest(source_observations: list[dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ephemeral wire contract (P0-2): strict dataclass serializer/deserializer
+# ephemeral wire contract (P0-2/P0-3): strict dataclass serializer/deserializer
 # ---------------------------------------------------------------------------
 
 #: byte-size bound for a single serialized ephemeral wire envelope.
@@ -121,11 +139,37 @@ PUBLISH_REQUEST_FORBIDDEN_FIELDS = frozenset(
     {"authorized", "authorized_by_human", "authorization_token", "mutation_capability"}
 )
 
+#: keys that must never appear anywhere in a wire envelope payload -- not
+#: merely at the top level. Any of these appearing at *any* nesting depth
+#: inside ``findings[]`` / ``finding_sets[]`` / ``candidate_records[]`` /
+#: ``run_identity`` (or anywhere else) is rejected fail-closed (Issue #2237
+#: P0-3: nested smuggled raw-evidence / mutation-authority fields).
+SMUGGLED_AUTHORITY_KEYS = frozenset(
+    {
+        "private_evidence",
+        "authorized",
+        "authorized_by_human",
+        "authorization_token",
+        "mutation_capability",
+        "raw_stdout",
+        "raw_stderr",
+        "raw_transcript",
+        "credential",
+        "credentials",
+        "secret",
+        "secrets",
+        "api_key",
+        "access_token",
+        "absolute_path",
+    }
+)
+
 
 class WireContractError(ValueError):
     """Raised for any ephemeral wire contract violation: JSON decode
     failure, missing field, unknown field, field-type mismatch, oversize
-    payload, or schema_version mismatch (Issue #2237 P0-2)."""
+    payload, schema_version mismatch, nested smuggled-authority field, or
+    invalid nested candidate record (Issue #2237 P0-2/P0-3)."""
 
     def __init__(self, message: str, *, reason_code: str) -> None:
         super().__init__(message)
@@ -169,13 +213,66 @@ def _check_field_type(value: Any, annotation: Any) -> bool:
     return True  # pragma: no cover - unmodeled typing construct, fail open on shape
 
 
+def _scan_for_smuggled_keys(value: Any, path: str = "$") -> None:
+    """Recursively scan ``value`` (already-decoded JSON) for any key in
+    ``SMUGGLED_AUTHORITY_KEYS`` at *any* nesting depth. This closes the P0-3
+    gap where only top-level ``additionalProperties: false`` was enforced --
+    ``findings[]`` / ``finding_sets[]`` / ``candidate_records[]`` /
+    ``run_identity`` are ``dict[str, Any]``/``list[dict]`` at the dataclass
+    level, so nested smuggled fields previously passed straight through."""
+    if isinstance(value, dict):
+        for key, sub_value in value.items():
+            if key in SMUGGLED_AUTHORITY_KEYS:
+                raise WireContractError(
+                    f"smuggled_authority_field:{path}.{key}", reason_code="smuggled_authority_field"
+                )
+            _scan_for_smuggled_keys(sub_value, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, sub_value in enumerate(value):
+            _scan_for_smuggled_keys(sub_value, f"{path}[{index}]")
+
+
+def _validate_candidate_records(records: Sequence[dict[str, Any]]) -> None:
+    """Validate every entry of ``records`` against the canonical, currently
+    merged ``agent_improvement_candidate/v1`` schema (#2288/#2289) -- the
+    same schema/validator ``validate_retrospective_schema.py`` uses -- and
+    reject duplicate ``candidate_id`` values within the same list (Issue
+    #2237 P0-3/P0-4). No-op on an empty list."""
+    import jsonschema
+
+    validator_mod = _validate_retrospective_schema_module()
+    seen_ids: set[Any] = set()
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise WireContractError(f"candidate_record_not_object[{index}]", reason_code="candidate_schema_invalid")
+        try:
+            validator_mod.validate_candidate(record)
+        except (validator_mod.RetrospectiveSchemaError, jsonschema.exceptions.ValidationError) as exc:
+            raise WireContractError(
+                f"candidate_schema_invalid[{index}]:{exc}", reason_code="candidate_schema_invalid"
+            ) from exc
+        candidate_id = record.get("candidate_id")
+        if candidate_id in seen_ids:
+            raise WireContractError(f"duplicate_candidate_id:{candidate_id}", reason_code="duplicate_identity")
+        seen_ids.add(candidate_id)
+
+
 @dataclass
 class _WireEnvelope:
     """Mixin base for every ephemeral wire contract dataclass. Subclasses
     MUST be ``@dataclass``. ``to_wire``/``from_wire`` implement the strict
     round-trippable serializer/deserializer required by AC7: unknown fields,
-    missing fields, field-type mismatches, oversize payloads, and malformed
-    JSON are all rejected fail-closed."""
+    missing fields, field-type mismatches, oversize payloads, malformed
+    JSON, and nested smuggled-authority fields are all rejected fail-closed.
+
+    ``__post_init__`` calls ``_post_validate()`` so subclass-specific checks
+    (e.g. ``Evaluation``/``PublishRequest``'s canonical candidate-schema
+    validation) run on *direct* dataclass construction too -- not only when
+    going through ``from_wire`` -- so a caller cannot bypass validation by
+    constructing the dataclass directly instead of parsing wire text."""
+
+    def __post_init__(self) -> None:
+        self._post_validate()
 
     def to_wire(self) -> str:
         payload = dataclasses.asdict(self)
@@ -210,6 +307,11 @@ class _WireEnvelope:
             if not _check_field_type(payload[name], annotation):
                 raise WireContractError(f"field_type_mismatch:{name}", reason_code="type_mismatch")
 
+        # nested smuggled-authority-field scan (P0-3): every nested dict/list
+        # value is walked, not just the top-level key set.
+        for name in declared_keys:
+            _scan_for_smuggled_keys(payload[name], f"$.{name}")
+
         try:
             instance = cls(**payload)
         except TypeError as exc:  # pragma: no cover - defensive, shape already checked above
@@ -219,10 +321,11 @@ class _WireEnvelope:
 
     def _post_validate(self) -> None:
         """Hook for subclass-specific structural checks beyond generic field
-        shape (e.g. ``schema_version`` must equal the canonical wire id).
-        Cross-envelope checks such as ``run_id`` agreement are the caller's
-        responsibility (see ``validate_run_id_agreement``), not this hook's,
-        because a single envelope cannot know about its peers."""
+        shape (e.g. ``schema_version`` must equal the canonical wire id, or
+        nested ``candidate_records`` must satisfy the canonical candidate
+        schema). Cross-envelope checks such as ``run_id`` agreement are the
+        caller's responsibility (see ``validate_run_id_agreement``), not this
+        hook's, because a single envelope cannot know about its peers."""
         return None
 
 
@@ -254,8 +357,9 @@ class EvidenceBundle(_WireEnvelope):
     """``OBSERVER_RESULT_V1``: a single observer's serialized output. Only a
     public-safe ``evidence_ref`` string is carried -- there is no field for
     raw payload / stdout / stderr / absolute paths / credentials, so an
-    attempt to smuggle a ``private_evidence`` (or similarly-shaped) key is
-    rejected as ``unknown_field`` by ``from_wire`` (AC10)."""
+    attempt to smuggle a ``private_evidence`` (or similarly-shaped) key --
+    at any nesting depth, including inside ``findings[]`` -- is rejected
+    (AC10/P0-3)."""
 
     schema_version: str = WIRE_SCHEMA_EVIDENCE_BUNDLE
     run_id: str = ""
@@ -305,7 +409,9 @@ class EvaluatorRequest(_WireEnvelope):
 @dataclass
 class Evaluation(_WireEnvelope):
     """``EVALUATION_RESULT_V1``: the evaluator's serialized output, consumed
-    only by the ``finalize`` phase."""
+    only by the ``finalize`` phase. ``candidate_records`` must each satisfy
+    the canonical, currently-merged ``agent_improvement_candidate/v1``
+    schema (#2288/#2289) -- not a private shadow dialect (Issue #2237 P0-4)."""
 
     schema_version: str = WIRE_SCHEMA_EVALUATION
     run_id: str = ""
@@ -316,6 +422,7 @@ class Evaluation(_WireEnvelope):
 
     def _post_validate(self) -> None:
         _require_schema_version(self, WIRE_SCHEMA_EVALUATION)
+        _validate_candidate_records(self.candidate_records)
 
 
 @dataclass
@@ -324,7 +431,7 @@ class PublishRequest(_WireEnvelope):
     Contains no mutation authority / human-approval trust root field --
     ``authorized``/``authorized_by_human``/``authorization_token``/
     ``mutation_capability`` are not declared fields, so any input containing
-    one of them is rejected as ``unknown_field`` by ``from_wire`` (AC16).
+    one of them (at any nesting depth) is rejected (AC16/P0-3).
     ``authorization_required`` is always ``True``; the receipt-based
     authorization channel is #2238's responsibility (out of scope here)."""
 
@@ -343,6 +450,7 @@ class PublishRequest(_WireEnvelope):
         _require_schema_version(self, WIRE_SCHEMA_PUBLISH_REQUEST)
         if self.authorization_required is not True:
             raise WireContractError("authorization_required_must_be_true", reason_code="invalid_value")
+        _validate_candidate_records(self.candidate_records)
 
 
 def validate_run_id_agreement(*envelopes: _WireEnvelope) -> None:
@@ -460,14 +568,37 @@ def prepare(
     return ctx, plan, results
 
 
+def build_source_digest_registry(results: Sequence[Any]) -> dict[str, str]:
+    """Derive a ``source_id -> per-source evidence digest`` registry from the
+    ``results`` returned by ``prepare()`` (each a Child 3 ``CollectorResult``
+    with a public ``.observation`` and a private ``.private_evidence``).
+    Used only in-process by ``build_finding_sets`` (never serialized into any
+    wire envelope) to bind a discovery-role (web) finding's claimed
+    ``evidence_digest`` to the independently, deterministically recomputed
+    digest -- never trusting the observing Agent's own claim alone (Issue
+    #2237 P0-6)."""
+    registry: dict[str, str] = {}
+    for result in results:
+        observation = getattr(result, "observation", {}) or {}
+        source_id = str(observation.get("source_id", ""))
+        private_evidence = getattr(result, "private_evidence", {}) or {}
+        digest = private_evidence.get("evidence_digest")
+        if source_id and digest:
+            registry[source_id] = str(digest)
+    return registry
+
+
 # ---------------------------------------------------------------------------
-# production Agent invocation adapter (AC13)
+# production Agent invocation adapter (AC13, P0-1)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class AgentInvocationRequest:
-    """Typed request for a single headless CLI subprocess Agent invocation."""
+    """Typed request for a single headless CLI subprocess Agent invocation.
+    ``json_schema_path`` is a path on disk to a JSON Schema file -- the
+    *contents* of that file (not the path string) are what the real
+    ``claude`` CLI's ``--json-schema`` flag expects (Issue #2237 P0-1)."""
 
     agent_name: str
     prompt: str
@@ -498,6 +629,11 @@ _AGENT_INVOCATION_STATUSES = frozenset(
 #: raw stdout blob (mirrors collect_snapshot.py's `_safe_diagnostic_text`).
 _MAX_STDOUT_EXCERPT = 200
 
+#: subprocess environment passthrough allowlist used when no
+#: ``DelegatedAgentPermissionPolicy`` is supplied (defensive fallback only --
+#: production callers always supply a policy; see ``run_cli``).
+_DEFAULT_ENV_PASSTHROUGH_ALLOWLIST = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ"})
+
 
 def _stdout_excerpt(text: str | None) -> str | None:
     if not text:
@@ -505,34 +641,66 @@ def _stdout_excerpt(text: str | None) -> str | None:
     return text[:_MAX_STDOUT_EXCERPT]
 
 
-def build_agent_invocation_argv(request: AgentInvocationRequest) -> list[str]:
-    """Construct the ``claude -p --output-format json --json-schema <schema>``
-    argv for ``request``. Subscription login is assumed (no ``--bare``)."""
-    return [
+def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
+    return {k: v for k, v in env.items() if k in _DEFAULT_ENV_PASSTHROUGH_ALLOWLIST}
+
+
+def build_agent_invocation_argv(
+    request: AgentInvocationRequest, *, policy: "DelegatedAgentPermissionPolicy | None" = None
+) -> list[str]:
+    """Construct the real ``claude`` CLI argv for ``request`` (Issue #2237
+    P0-1): ``--agent <name>`` selects the custom SubAgent, ``--json-schema``
+    receives the schema *file contents* (not a path), ``--output-format
+    json`` requests the metadata-wrapper JSON response, and
+    ``--no-session-persistence`` prevents the headless invocation from
+    persisting/resuming a session across runs. The prompt is NOT placed in
+    argv (see ``invoke_agent``'s ``input=`` stdin wiring) -- passing
+    arbitrary prompt text as an argv element is both a shell-quoting hazard
+    and an argv-length hazard. Subscription login is assumed (no ``--bare``).
+    """
+    schema_text = Path(request.json_schema_path).read_text(encoding="utf-8")
+    argv = [
         "claude",
         "-p",
-        request.prompt,
+        "--agent",
+        request.agent_name,
         "--output-format",
         "json",
         "--json-schema",
-        request.json_schema_path,
+        schema_text,
+        "--no-session-persistence",
     ]
+    if policy is not None:
+        argv += ["--disallowedTools", ",".join(sorted(policy.denied_tools))]
+    return argv
 
 
 def invoke_agent(
     request: AgentInvocationRequest,
     *,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    policy: "DelegatedAgentPermissionPolicy | None" = None,
 ) -> AgentInvocationResult:
     """Production Agent invocation adapter. ``runner`` is dependency-injected
     (defaults to ``subprocess.run``) so tests exercise this exact function
-    via a subprocess mock harness without starting a real process (AC13)."""
-    argv = build_agent_invocation_argv(request)
+    via a subprocess mock harness without starting a real process (AC13).
+
+    ``policy``, when supplied, is the *runtime mechanism* this invocation
+    actually consumes (Issue #2237 P0-5): its denied-tool set is serialized
+    into the real subprocess argv (``--disallowedTools``, see
+    ``build_agent_invocation_argv``) and its ``sanitize_subprocess_env`` is
+    used to build the child process environment, stripping mutation
+    credentials before the subprocess ever starts -- not merely checked by a
+    test that calls the policy directly and throws the result away."""
+    argv = build_agent_invocation_argv(request, policy=policy)
+    merged_env = {**os.environ, **request.env}
+    env = policy.sanitize_subprocess_env(merged_env) if policy is not None else _default_sanitized_env(merged_env)
     try:
         completed = runner(
             argv,
             cwd=request.cwd,
-            env={**os.environ, **request.env},
+            env=env,
+            input=request.prompt,
             capture_output=True,
             text=True,
             timeout=request.timeout_sec,
@@ -602,13 +770,78 @@ def invoke_agent(
             reason_code="api_error_with_partial_text",
         )
 
+    # Real `claude -p --output-format json` responses are a metadata wrapper
+    # (`type: "result"`, `subtype`, `is_error`, `result` (text), plus, when a
+    # `--json-schema` was supplied, `structured_output` carrying the actual
+    # schema-conformant business payload). Re-parsing the *wrapper* itself as
+    # the business schema (the pre-fix_delta behavior) silently accepted a
+    # malformed/absent business payload as long as the wrapper's own shape
+    # happened to satisfy the target dataclass -- Issue #2237 P0-1.
+    if payload.get("type") != "result":
+        return AgentInvocationResult(
+            status="malformed_output",
+            structured_output=None,
+            raw_stdout_excerpt=_stdout_excerpt(completed.stdout),
+            exit_code=completed.returncode,
+            reason_code="unexpected_wrapper_shape",
+        )
+    structured_output = payload.get("structured_output")
+    if not isinstance(structured_output, dict):
+        return AgentInvocationResult(
+            status="malformed_output",
+            structured_output=None,
+            raw_stdout_excerpt=_stdout_excerpt(completed.stdout),
+            exit_code=completed.returncode,
+            reason_code="missing_structured_output",
+        )
+
     return AgentInvocationResult(
         status="ok",
-        structured_output=payload,
+        structured_output=structured_output,
         raw_stdout_excerpt=None,
         exit_code=completed.returncode,
         reason_code=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# observer manifest / role authority (P0-6)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ObserverRoleSpec:
+    """One entry of the expected observer manifest: which observer_id must
+    appear in a run's observer wave, what authority role it holds
+    (``interpreter`` / ``advisory`` / ``discovery``), and which source_type
+    it corresponds to (Issue #2237 reused-Agent capability matrix)."""
+
+    observer_id: str
+    role: str
+    source_type: str
+
+
+#: the exact, fixed 3-observer manifest every full run must satisfy: no
+#: missing observer, no extra/unknown observer, no duplicate (Issue #2237
+#: P0-6). ``run_observer_wave``'s ``expected_manifest`` parameter defaults to
+#: ``None`` (manifest-completeness check skipped) so pre-existing unit tests
+#: exercising a subset of observers keep passing; the production entrypoint
+#: (``run_cli``) always passes this exact tuple.
+EXPECTED_OBSERVER_MANIFEST: tuple[ObserverRoleSpec, ...] = (
+    ObserverRoleSpec("retrospective-runtime-observer", "interpreter", "runtime"),
+    ObserverRoleSpec("codebase-investigator", "advisory", "repository"),
+    ObserverRoleSpec("web-researcher", "discovery", "web"),
+)
+
+
+class UnboundEvidenceAuthority(WireContractError):
+    """Raised when a discovery-role (web) finding claims an
+    ``evidence_digest`` that does not match the independently, deterministic
+    recomputed source digest registry (``build_source_digest_registry``).
+    Web findings are only ever a *candidate* evidence reference from the
+    observing Agent's own claim -- final finding authority requires the
+    deterministic Web collector's (Child 3) re-fetched, digest-bound
+    projection to agree (Issue #2237 P0-6)."""
 
 
 # ---------------------------------------------------------------------------
@@ -618,10 +851,11 @@ def invoke_agent(
 
 class ObserverWaveFailed(Exception):
     """Raised when any observer invocation in the wave fails (non-``ok``
-    status, schema repair exhaustion, or run/digest mismatch). Per
-    ``partial_agent_output: reject``, the caller MUST NOT invoke the
-    evaluator once this is raised -- see ``run_evaluation``'s precondition
-    and ``execute_run``'s ordering."""
+    status, schema repair exhaustion, run/digest/base_sha mismatch, an
+    observer outside the expected manifest, a duplicate observer_id, or an
+    incomplete manifest). Per ``partial_agent_output: reject``, the caller
+    MUST NOT invoke the evaluator once this is raised -- see
+    ``run_evaluation``'s precondition and ``execute_run``'s ordering."""
 
 
 def run_observer_wave(
@@ -631,13 +865,22 @@ def run_observer_wave(
     invoke: Callable[[AgentInvocationRequest], AgentInvocationResult],
     observer_requests: Sequence[AgentInvocationRequest],
     repair: Callable[[str, WireContractError], str] | None = None,
+    expected_manifest: Sequence[ObserverRoleSpec] | None = None,
 ) -> list[EvidenceBundle]:
     """``validate-observers`` phase (fan-out half): invoke every observer in
     ``observer_requests`` and strictly validate its serialized output into an
     ``EvidenceBundle``. All observers must succeed -- the first failure
     aborts the wave (fail-closed; ``observer_parallelism: 3`` is an execution
     budget for the caller's actual concurrency, not modeled by this
-    sequential reference implementation)."""
+    sequential reference implementation).
+
+    Every bundle's ``base_sha`` MUST equal ``ctx.base_sha`` (Issue #2237
+    P0-6 -- previously unchecked here, letting a mismatched ``base_sha`` slip
+    through and then be silently overwritten downstream). When
+    ``expected_manifest`` is supplied, the observer_id set MUST match it
+    exactly (no missing, no extra, no duplicate observer_id)."""
+    expected_ids = {spec.observer_id for spec in expected_manifest} if expected_manifest is not None else None
+    seen_ids: set[str] = set()
     bundles: list[EvidenceBundle] = []
     for request in observer_requests:
         result = invoke(request)
@@ -647,25 +890,71 @@ def run_observer_wave(
         bundle = parse_agent_output_with_repair(raw_text, EvidenceBundle, repair=repair)
         if bundle.run_id != ctx.run_id or bundle.source_set_digest != plan.source_set_digest:
             raise ObserverWaveFailed(f"observer_envelope_mismatch:{request.agent_name}")
+        if bundle.base_sha != ctx.base_sha:
+            raise ObserverWaveFailed(f"observer_base_sha_mismatch:{request.agent_name}")
+        if bundle.observer_id in seen_ids:
+            raise ObserverWaveFailed(f"duplicate_observer_id:{bundle.observer_id}")
+        if expected_ids is not None and bundle.observer_id not in expected_ids:
+            raise ObserverWaveFailed(f"observer_id_not_in_manifest:{bundle.observer_id}")
+        seen_ids.add(bundle.observer_id)
         bundles.append(bundle)
+    if expected_ids is not None and seen_ids != expected_ids:
+        raise ObserverWaveFailed(f"observer_manifest_incomplete:missing={sorted(expected_ids - seen_ids)}")
     return bundles
 
 
-def build_finding_sets(ctx: RunContext, plan: SourcePlan, bundles: Sequence[EvidenceBundle]) -> list[FindingSet]:
+def build_finding_sets(
+    ctx: RunContext,
+    plan: SourcePlan,
+    bundles: Sequence[EvidenceBundle],
+    *,
+    manifest: Sequence[ObserverRoleSpec] = EXPECTED_OBSERVER_MANIFEST,
+    source_digest_registry: dict[str, str] | None = None,
+) -> list[FindingSet]:
     """Fan-in half of ``validate-observers``: project each validated
     ``EvidenceBundle`` into a schema-controlled ``FindingSet`` (AC10 -- only
     this projection, never the bundle's ``evidence_ref``/raw channel, ever
-    reaches the evaluator)."""
-    return [
-        FindingSet(
-            run_id=ctx.run_id,
-            base_sha=ctx.base_sha,
-            source_set_digest=plan.source_set_digest,
-            observer_id=bundle.observer_id,
-            findings=bundle.findings,
+    reaches the evaluator).
+
+    Each projected finding is tagged with ``finding_authority`` derived from
+    the observer's manifest role (Issue #2237 P0-6 capability matrix
+    enforcement, not merely prose): ``interpreter`` role -> ``primary``;
+    every other role (``advisory``/``discovery``, and any observer_id not in
+    ``manifest``) -> ``advisory`` -- an advisory/discovery-role observer's
+    output is never elevated to ``primary`` finding authority by this
+    function. A discovery-role (web) finding that claims an
+    ``evidence_digest`` not matching ``source_digest_registry`` raises
+    ``UnboundEvidenceAuthority`` (fail-closed -- an unbound claim is rejected
+    outright rather than silently downgraded)."""
+    role_by_id = {spec.observer_id: spec.role for spec in manifest}
+    source_type_by_id = {spec.observer_id: spec.source_type for spec in manifest}
+    finding_sets: list[FindingSet] = []
+    for bundle in bundles:
+        role = role_by_id.get(bundle.observer_id, "advisory")
+        source_type = source_type_by_id.get(bundle.observer_id)
+        tagged_findings: list[dict[str, Any]] = []
+        for finding in bundle.findings:
+            tagged = dict(finding)
+            tagged["finding_authority"] = "primary" if role == "interpreter" else "advisory"
+            if role == "discovery" and source_digest_registry is not None:
+                claimed_digest = finding.get("evidence_digest")
+                expected_digest = source_digest_registry.get(source_type or "web")
+                if claimed_digest is not None and expected_digest is not None and claimed_digest != expected_digest:
+                    raise UnboundEvidenceAuthority(
+                        f"web_evidence_digest_mismatch:observer={bundle.observer_id}",
+                        reason_code="unbound_web_evidence",
+                    )
+            tagged_findings.append(tagged)
+        finding_sets.append(
+            FindingSet(
+                run_id=ctx.run_id,
+                base_sha=ctx.base_sha,
+                source_set_digest=plan.source_set_digest,
+                observer_id=bundle.observer_id,
+                findings=tagged_findings,
+            )
         )
-        for bundle in bundles
-    ]
+    return finding_sets
 
 
 # ---------------------------------------------------------------------------
@@ -684,8 +973,8 @@ def prepare_evaluator_request(
     """``prepare-evaluator`` phase: build the single ``EvaluatorRequest`` fed
     to the fresh-context evaluator invocation. This function's mere existence
     as a caller-invoked step (never auto-chained from ``run_observer_wave``)
-    is what lets ``execute_run`` prove observer-wave completion precedes
-    evaluator invocation (AC9)."""
+    is what lets ``execute_run``/``run_cli`` prove observer-wave completion
+    precedes evaluator invocation (AC9)."""
     return EvaluatorRequest(
         run_id=ctx.run_id,
         base_sha=ctx.base_sha,
@@ -704,9 +993,9 @@ def run_evaluation(
     """Invoke the evaluator exactly once with ``evaluator_request`` (built
     only from validated ``FindingSet`` projections -- see
     ``build_finding_sets``/``prepare_evaluator_request``) and strictly
-    validate its output. The caller (``execute_run``) is responsible for only
-    calling this after ``run_observer_wave`` has succeeded for every observer
-    in the wave (AC9)."""
+    validate its output. The caller (``execute_run``/``run_cli``) is
+    responsible for only calling this after ``run_observer_wave`` has
+    succeeded for every observer in the wave (AC9)."""
     result = invoke_evaluator(evaluator_request)
     if result.status != "ok":
         raise EvaluatorInvocationFailed(f"evaluator_failed:{result.status}")
@@ -735,11 +1024,19 @@ def finalize(
 ) -> PublishRequest:
     """``finalize`` phase: produce the proposal-only ``PublishRequest``. This
     function performs no I/O, no GitHub/Issue mutation, and no filesystem
-    write -- it only returns a value (AC11)."""
+    write -- it only returns a value (AC11).
+
+    ``public_projection_digest`` (Issue #2237 P1-2) is bound to the full
+    ``run_identity`` (``run_id``/``base_sha``/``source_set_digest`` -- not
+    only ``run_id``/``base_sha`` as before) and to
+    ``expected_previous_digest`` (the optimistic-concurrency token) -- a
+    change to the source set or to the concurrency precondition now always
+    changes the digest, closing the previous under-binding gap."""
+    run_identity = {"run_id": ctx.run_id, "base_sha": ctx.base_sha, "source_set_digest": plan.source_set_digest}
     projection = {
-        "run_id": ctx.run_id,
-        "base_sha": ctx.base_sha,
+        "run_identity": run_identity,
         "candidate_records": evaluation.candidate_records,
+        "expected_previous_digest": expected_previous_digest,
     }
     canonical = json.dumps(projection, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -747,7 +1044,7 @@ def finalize(
         request_id=request_id,
         repository_id=repository_id,
         target_issue=target_issue,
-        run_identity={"run_id": ctx.run_id, "base_sha": ctx.base_sha, "source_set_digest": plan.source_set_digest},
+        run_identity=run_identity,
         candidate_records=evaluation.candidate_records,
         expected_previous_digest=expected_previous_digest,
         idempotency_key=idempotency_key,
@@ -759,7 +1056,8 @@ def finalize(
 # ---------------------------------------------------------------------------
 # whole-run orchestration helper (composes the four phases; still performs
 # no Agent tool call itself -- `invoke`/`invoke_evaluator` are injected by
-# the root Skill)
+# the caller; `run_cli` is the production caller that injects real
+# `invoke_agent` callbacks)
 # ---------------------------------------------------------------------------
 
 
@@ -807,13 +1105,15 @@ def execute_run(
 PREVIOUS_STATE_STATUSES = frozenset({"available", "no_history", "legacy_unavailable", "partial", "stale"})
 DELTA_STATUSES = frozenset({"new", "resolved", "recurrent", "regressed", "unchanged"})
 
-_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
-
 
 @dataclass
 class PreviousStateResult:
     """``PREVIOUS_RETROSPECTIVE_STATE_V1``: the read-only port's output
-    shape. ``status`` is one of ``PREVIOUS_STATE_STATUSES``."""
+    shape. ``status`` is one of ``PREVIOUS_STATE_STATUSES``. ``candidates``
+    holds canonical ``agent_improvement_candidate/v1`` records (Issue #2288/
+    #2289) -- delta classification reads ``finding_contract.identity`` /
+    ``finding_contract.evaluations[]`` from them, never a private
+    ``candidate_status``/``severity`` dialect (Issue #2237 P0-4)."""
 
     status: str
     previous_run_ref: str | None
@@ -842,34 +1142,90 @@ class FixturePreviousStateProvider:
         return self._fixtures[key]
 
 
+def _finding_identity_value(candidate: dict[str, Any]) -> str | None:
+    finding_contract = candidate.get("finding_contract")
+    if not finding_contract:
+        return None
+    return finding_contract["identity"]["value"]
+
+
+def _last_evaluation(candidate: dict[str, Any]) -> dict[str, Any] | None:
+    finding_contract = candidate.get("finding_contract")
+    if not finding_contract:
+        return None
+    evaluations = finding_contract.get("evaluations") or []
+    return evaluations[-1] if evaluations else None
+
+
 def compute_delta(previous: PreviousStateResult, current_candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Classify each candidate in ``current_candidates`` (each must carry a
-    ``finding_identity`` and may carry ``candidate_status``/``severity``)
-    against ``previous`` into one of ``DELTA_STATUSES``."""
+    """Classify each canonical (``agent_improvement_candidate/v1``,
+    #2288/#2289) candidate in ``current_candidates`` against ``previous``
+    (Issue #2237 P0-4). Identity is read from
+    ``candidate["finding_contract"]["identity"]["value"]`` -- never a
+    top-level ``finding_identity`` field, which does not exist in the
+    canonical schema. Prior state is read from the *last* entry of
+    ``finding_contract.evaluations[]`` on each previous candidate -- never
+    from the (unrelated, independent) lifecycle ``candidate_status`` enum
+    (which has no ``open``/``resolved`` values; see ADR/#2288). A candidate
+    with no ``finding_contract`` (legacy lifecycle-only) has no identity to
+    correlate on and is excluded from delta classification.
+
+    Incomplete source coverage on the *previous* read (``partial``/``stale``)
+    forces every current candidate's classification to ``indeterminate`` --
+    an indeterminate evaluation is never reported as ``resolved`` (absence
+    observed under incomplete coverage is not evidence of resolution)."""
     if previous.status in ("no_history", "legacy_unavailable"):
-        return [{"finding_identity": c.get("finding_identity"), "delta_status": "new"} for c in current_candidates]
+        results: list[dict[str, Any]] = []
+        for candidate in current_candidates:
+            identity = _finding_identity_value(candidate)
+            if identity is None:
+                continue
+            results.append({"finding_identity": identity, "evaluation_status": "classified", "delta_status": "new"})
+        return results
 
-    prev_by_identity = {c.get("finding_identity"): c for c in previous.candidates}
-    current_identities: set[Any] = set()
-    results: list[dict[str, Any]] = []
+    source_incomplete = previous.status in ("partial", "stale")
 
+    prev_by_identity: dict[str, dict[str, Any] | None] = {}
+    for prev_candidate in previous.candidates:
+        identity = _finding_identity_value(prev_candidate)
+        if identity is not None:
+            prev_by_identity[identity] = _last_evaluation(prev_candidate)
+
+    current_identities: set[str] = set()
+    results = []
     for candidate in current_candidates:
-        identity = candidate.get("finding_identity")
+        identity = _finding_identity_value(candidate)
+        if identity is None:
+            continue
         current_identities.add(identity)
-        prev = prev_by_identity.get(identity)
-        if prev is None:
+        if source_incomplete:
+            results.append(
+                {
+                    "finding_identity": identity,
+                    "evaluation_status": "indeterminate",
+                    "delta_status": None,
+                    "indeterminate_reason": "source_partial" if previous.status == "partial" else "source_stale",
+                }
+            )
+            continue
+        prev_eval = prev_by_identity.get(identity)
+        if identity not in prev_by_identity:
             delta_status = "new"
-        elif prev.get("candidate_status") == "resolved" and candidate.get("candidate_status") != "resolved":
+        elif prev_eval is not None and prev_eval.get("presence_delta") in ("resolved", "still_absent"):
             delta_status = "recurrent"
         else:
-            prev_rank = _SEVERITY_RANK.get(prev.get("severity"), -1)
-            cur_rank = _SEVERITY_RANK.get(candidate.get("severity"), -1)
-            delta_status = "regressed" if cur_rank > prev_rank >= 0 else "unchanged"
-        results.append({"finding_identity": identity, "delta_status": delta_status})
+            delta_status = "unchanged"
+        results.append({"finding_identity": identity, "evaluation_status": "classified", "delta_status": delta_status})
 
-    for identity, prev in prev_by_identity.items():
-        if identity not in current_identities and prev.get("candidate_status") != "resolved":
-            results.append({"finding_identity": identity, "delta_status": "resolved"})
+    if not source_incomplete:
+        for identity, prev_eval in prev_by_identity.items():
+            if identity in current_identities:
+                continue
+            if prev_eval is not None and prev_eval.get("presence_delta") in ("resolved", "still_absent"):
+                continue  # already absent as of the previous run; nothing new to report
+            results.append(
+                {"finding_identity": identity, "evaluation_status": "classified", "delta_status": "resolved"}
+            )
 
     return results
 
@@ -878,16 +1234,54 @@ def compute_delta(previous: PreviousStateResult, current_candidates: Sequence[di
 # delegated-Agent permission policy / tool callback (P0-5)
 # ---------------------------------------------------------------------------
 
-_DENIED_BASH_SUBSTRINGS = (
-    "git commit",
-    "git push",
-    "gh issue",
-    "gh pr",
-    "gh api",
-    "gh comment",
-    "gh release",
-)
+#: (command, subcommand) pairs that are always denied regardless of
+#: allowlisting, matched via *tokenized* command parsing (``shlex.split``) so
+#: that flag/option insertion (``git -C . commit``, ``gh --repo x/y issue
+#: comment``) cannot bypass a naive substring match (Issue #2237 P0-5).
+_DENIED_BASH_VERB_PAIRS: dict[str, frozenset[str]] = {
+    "git": frozenset({"commit", "push"}),
+    "gh": frozenset({"issue", "pr", "api", "comment", "release"}),
+}
+#: standalone commands denied outright (network egress / remote exec tools).
+_DENIED_BASH_STANDALONE_COMMANDS = frozenset({"curl", "wget", "nc", "ncat", "ssh", "scp", "rsync"})
+#: shell metacharacters that always deny -- redirection can write files
+#: (`printf x > file`), pipes/chains can compose otherwise-innocuous tokens
+#: into a denied sequence.
+_DENIED_BASH_METACHAR_TOKENS = frozenset({">", ">>", "|", "&&", "||", ";", "`", "$("})
+#: interpreters whose inline-execution flag is denied (`python -c '...'` can
+#: perform arbitrary git/gh/network calls that a token scan of the outer
+#: command line would never see).
+_DENIED_INLINE_EXEC_INTERPRETERS = frozenset({"python", "python3"})
+_DENIED_INLINE_EXEC_FLAGS = frozenset({"-c"})
+
 _DENIED_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Agent", "Skill"})
+
+#: environment variable names never forwarded to a delegated Agent's
+#: subprocess, regardless of allowlist configuration -- these carry mutation
+#: authority (git/gh credentials, cloud credentials, SSH agent socket) that
+#: has no legitimate use inside a read-only observer/evaluator invocation
+#: (Issue #2237 P0-5).
+_MUTATION_CREDENTIAL_ENV_VARS = frozenset(
+    {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GIT_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "NPM_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "NPM_AUTH_TOKEN",
+    }
+)
+#: environment variables always safe to pass through unchanged.
+_ENV_PASSTHROUGH_ALLOWLIST = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ"})
+#: caller-supplied run-scoped variables (never credentials) are passed
+#: through when prefixed like this -- e.g. ``AGENT_RETROSPECTIVE_RUN_ID``.
+_RUN_SCOPED_ENV_PREFIX = "AGENT_RETROSPECTIVE_"
 
 
 class PermissionDenied(Exception):
@@ -897,12 +1291,25 @@ class PermissionDenied(Exception):
 
 
 class DelegatedAgentPermissionPolicy:
-    """Permission policy / tool callback enforced by the root Skill around
-    every delegated observer/evaluator Agent invocation (Issue #2237 P0-5
-    capability matrix "本番制約" column). Denies ``git commit``/``git push``,
+    """Permission policy / tool callback enforced by the real invocation path
+    (``invoke_agent``, see its ``policy=`` parameter) around every delegated
+    observer/evaluator Agent invocation (Issue #2237 P0-5 capability matrix
+    "本番制約" column). Denies ``git commit``/``git push``,
     ``gh issue``/``gh pr``/comment/api mutation, filesystem write, any
     non-allowlisted Bash command, and resuming a session belonging to a
-    different run."""
+    different run.
+
+    ``allowed_bash_commands`` defaults to the empty set, which now means
+    **deny all Bash** (Issue #2237 P0-5 fail-open fix -- the prior
+    implementation's ``if self.allowed_bash_commands and ...`` guard made an
+    *empty* allowlist mean "no restriction", i.e. every non-blacklisted Bash
+    command was permitted by default). A command must be both (a) present
+    verbatim in ``allowed_bash_commands`` AND (b) pass the tokenized
+    denylist scan below -- allowlisting a literal string does not bypass the
+    tokenized checks, closing the substring-blacklist bypasses identified in
+    OWNER review #2237#issuecomment-5378291560 (``git -C . commit -m x``,
+    ``gh --repo owner/repo issue comment 1 --body x``, ``python -c '...'``,
+    ``curl -X POST ...``, ``printf data > repository-file``)."""
 
     def __init__(self, *, run_id: str, allowed_bash_commands: frozenset[str] = frozenset()) -> None:
         self.run_id = run_id
@@ -910,11 +1317,26 @@ class DelegatedAgentPermissionPolicy:
 
     def check_bash(self, command: str) -> None:
         normalized = " ".join(command.split())
-        for pattern in _DENIED_BASH_SUBSTRINGS:
-            if pattern in normalized:
-                raise PermissionDenied(f"denied_bash_pattern:{pattern}", command=command)
-        if self.allowed_bash_commands and normalized not in self.allowed_bash_commands:
+        if normalized not in self.allowed_bash_commands:
             raise PermissionDenied("bash_not_allowlisted", command=command)
+        try:
+            tokens = shlex.split(command)
+        except ValueError as exc:
+            raise PermissionDenied(f"bash_unparsable:{exc}", command=command) from exc
+        if not tokens:
+            raise PermissionDenied("bash_empty", command=command)
+        lowered_tokens = [tok.lower() for tok in tokens]
+        token_set = set(lowered_tokens)
+        if token_set & _DENIED_BASH_METACHAR_TOKENS:
+            raise PermissionDenied("denied_bash_metacharacter", command=command)
+        head = Path(lowered_tokens[0]).name  # strip any leading path component
+        if head in _DENIED_BASH_STANDALONE_COMMANDS:
+            raise PermissionDenied(f"denied_bash_standalone:{head}", command=command)
+        for base_command, denied_subcommands in _DENIED_BASH_VERB_PAIRS.items():
+            if base_command in token_set and (token_set & denied_subcommands):
+                raise PermissionDenied(f"denied_bash_pattern:{base_command}_mutation", command=command)
+        if (token_set & _DENIED_INLINE_EXEC_INTERPRETERS) and (token_set & _DENIED_INLINE_EXEC_FLAGS):
+            raise PermissionDenied("denied_bash_pattern:inline_exec", command=command)
 
     def check_filesystem_write(self, path: str) -> None:
         raise PermissionDenied(f"filesystem_write_denied:{path}", command=f"write:{path}")
@@ -926,6 +1348,26 @@ class DelegatedAgentPermissionPolicy:
     def check_resume(self, session_run_id: str) -> None:
         if session_run_id != self.run_id:
             raise PermissionDenied(f"cross_run_resume_denied:{session_run_id}", command=f"resume:{session_run_id}")
+
+    @property
+    def denied_tools(self) -> frozenset[str]:
+        return _DENIED_TOOLS
+
+    def sanitize_subprocess_env(self, env: dict[str, str]) -> dict[str, str]:
+        """Build the environment actually forwarded to a delegated Agent's
+        subprocess (Issue #2237 P0-5): unconditionally excludes
+        ``_MUTATION_CREDENTIAL_ENV_VARS`` regardless of what else is
+        allowlisted, passes ``_ENV_PASSTHROUGH_ALLOWLIST`` unchanged, and
+        passes through caller-supplied run-scoped variables (prefixed
+        ``AGENT_RETROSPECTIVE_``, e.g. the run's ``run_id``/``base_sha``) --
+        never the full ambient ``os.environ``."""
+        sanitized: dict[str, str] = {}
+        for key, value in env.items():
+            if key in _MUTATION_CREDENTIAL_ENV_VARS:
+                continue
+            if key in _ENV_PASSTHROUGH_ALLOWLIST or key.startswith(_RUN_SCOPED_ENV_PREFIX):
+                sanitized[key] = value
+        return sanitized
 
 
 # ---------------------------------------------------------------------------
@@ -951,7 +1393,11 @@ def run_scoped_temp_dir(run_id: str, *, base_dir: Path | None = None):
     and guarantee its removal on every exit path: normal completion,
     exception, ``SIGINT``, and ``SIGTERM`` (AC18). Signal handlers installed
     here are process-global for the duration of the ``with`` block and are
-    always restored in ``finally``, regardless of how the block exits."""
+    always restored in ``finally``, regardless of how the block exits.
+    Cleanup failure (``shutil.rmtree`` raising) is surfaced -- not silently
+    swallowed -- so callers observe a leaked private temp directory rather
+    than believing cleanup silently succeeded (Issue #2237 fix_delta gate
+    #12: ``test_temp_scope_is_on_production_path_and_cleanup_failure_surfaces``)."""
     base = base_dir if base_dir is not None else Path(tempfile.gettempdir())
     path = base / f"agent-retrospective-run-{run_id}"
     path.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -969,13 +1415,181 @@ def run_scoped_temp_dir(run_id: str, *, base_dir: Path | None = None):
     finally:
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(path)
 
 
-if __name__ == "__main__":  # pragma: no cover - not a CLI entrypoint by itself
-    print(
-        "run_retrospective.py provides deterministic phase functions for the "
-        "agent-retrospective SKILL.md procedure; it is not invoked directly.",
-        file=sys.stderr,
+# ---------------------------------------------------------------------------
+# stable executable entrypoint (P0-2): the root Skill invokes this via Bash
+# (never the interactive Agent tool). This module then owns the whole
+# collector-closure -> observer-manifest -> fan-in -> evaluator ->
+# finalize call graph, itself invoking observers/evaluator only via the
+# headless CLI subprocess adapter above.
+# ---------------------------------------------------------------------------
+
+
+def build_repository_collector(repo_root: Path) -> Callable[[str], Any]:
+    """Bind ``collect_repository_source``'s ``repo_root`` keyword into a
+    ``Callable[[base_sha], CollectorResult]`` closure -- the shape
+    ``prepare()``'s ``collectors`` sequence requires (Issue #2237 P0-2: each
+    Child 3 collector has a different, role-specific required-argument
+    shape; only ``collect_repository_source`` takes solely ``base_sha`` as
+    its positional parameter, so every other collector MUST be bound into a
+    closure like this one before being handed to ``prepare()``)."""
+    collect_mod = _collect_snapshot_module()
+
+    def _collect(base_sha: str):
+        return collect_mod.collect_repository_source(base_sha, repo_root=repo_root)
+
+    return _collect
+
+
+def build_observer_requests(
+    *, schema_dir: Path, cwd: str, prompts: dict[str, str], timeout_sec: int = 300
+) -> list[AgentInvocationRequest]:
+    """Build the exact 3-observer ``AgentInvocationRequest`` list matching
+    ``EXPECTED_OBSERVER_MANIFEST`` (Issue #2237 P0-2/P0-6). ``prompts`` maps
+    each ``observer_id`` to the prompt text the root Skill (or ``main``'s
+    ``--prompts-file``) has already assembled -- this function never
+    resolves session/evidence content itself (that remains the root Skill's
+    trigger-time responsibility)."""
+    return [
+        AgentInvocationRequest(
+            agent_name=spec.observer_id,
+            prompt=prompts.get(spec.observer_id, ""),
+            json_schema_path=str(schema_dir / "observer_result_v1.schema.json"),
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+        )
+        for spec in EXPECTED_OBSERVER_MANIFEST
+    ]
+
+
+def run_cli(
+    *,
+    repo_root: Path,
+    repository_id: str,
+    target_issue: int,
+    request_id: str,
+    idempotency_key: str,
+    schema_dir: Path,
+    prompts: dict[str, str],
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    git_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    clock: Callable[[], datetime] = _utcnow,
+    run_id: str | None = None,
+    temp_base_dir: Path | None = None,
+) -> PublishRequest:
+    """The single production call graph (Issue #2237 P0-2): manual-trigger
+    preflight -> run-scoped temp dir -> collector closures -> ``prepare`` ->
+    exact-manifest observer wave (via the real headless CLI subprocess
+    adapter, permission-policy-wrapped) -> fan-in with role-authority tagging
+    -> ``prepare-evaluator`` -> evaluator invocation -> ``finalize``. Returns
+    the proposal-only ``PublishRequest`` (raises a typed exception on any
+    phase failure -- ``main()`` converts that into a typed-failure stdout
+    payload and non-zero exit code)."""
+    manual_trigger_preflight(repo_root=repo_root)
+    resolved_run_id = run_id or str(uuid.uuid4())
+    policy = DelegatedAgentPermissionPolicy(run_id=resolved_run_id)
+
+    def _base_sha_resolver() -> str:
+        completed = git_runner(
+            ["git", "rev-parse", "main"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
+        )
+        if completed.returncode != 0:
+            raise ValueError(f"base_sha_resolution_failed:{completed.stderr}")
+        return completed.stdout.strip()
+
+    with run_scoped_temp_dir(resolved_run_id, base_dir=temp_base_dir):
+        collectors = [build_repository_collector(repo_root)]
+        ctx, plan, results = prepare(
+            base_sha_resolver=_base_sha_resolver, collectors=collectors, clock=clock, run_id=resolved_run_id
+        )
+        observer_requests = build_observer_requests(schema_dir=schema_dir, cwd=str(repo_root), prompts=prompts)
+
+        def _invoke(request: AgentInvocationRequest) -> AgentInvocationResult:
+            run_scoped_env = {
+                **request.env,
+                f"{_RUN_SCOPED_ENV_PREFIX}RUN_ID": ctx.run_id,
+                f"{_RUN_SCOPED_ENV_PREFIX}BASE_SHA": ctx.base_sha,
+            }
+            return invoke_agent(dataclasses.replace(request, env=run_scoped_env), runner=runner, policy=policy)
+
+        bundles = run_observer_wave(
+            ctx, plan, invoke=_invoke, observer_requests=observer_requests, expected_manifest=EXPECTED_OBSERVER_MANIFEST
+        )
+        source_digest_registry = build_source_digest_registry(results)
+        finding_sets = build_finding_sets(ctx, plan, bundles, source_digest_registry=source_digest_registry)
+        evaluator_request = prepare_evaluator_request(ctx, plan, finding_sets)
+
+        evaluator_agent_request = AgentInvocationRequest(
+            agent_name="retrospective-evaluator",
+            prompt=evaluator_request.to_wire(),
+            json_schema_path=str(schema_dir / "evaluation_result_v1.schema.json"),
+            cwd=str(repo_root),
+            env={f"{_RUN_SCOPED_ENV_PREFIX}RUN_ID": ctx.run_id, f"{_RUN_SCOPED_ENV_PREFIX}BASE_SHA": ctx.base_sha},
+        )
+
+        def _invoke_evaluator(_request: EvaluatorRequest) -> AgentInvocationResult:
+            return invoke_agent(evaluator_agent_request, runner=runner, policy=policy)
+
+        evaluation = run_evaluation(ctx, evaluator_request, invoke_evaluator=_invoke_evaluator)
+        publish_request = finalize(
+            ctx,
+            plan,
+            evaluation,
+            repository_id=repository_id,
+            target_issue=target_issue,
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+        )
+    return publish_request
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Stable executable entrypoint (Issue #2237 P0-2). The root Skill (see
+    ``SKILL.md``'s Procedure) invokes this via a single Bash call; this
+    module owns everything downstream. Prints the ``PublishRequest``
+    envelope (success) or a typed ``{"status": "failed", "reason_code":
+    ..., "reason": ...}`` payload (failure) to stdout; exit code is ``0`` on
+    success and ``1`` on any typed phase failure."""
+    parser = argparse.ArgumentParser(
+        prog="run_retrospective.py",
+        description=(
+            "agent-retrospective stable executable entrypoint (Issue #2237). "
+            "Invoked by the root Skill via Bash -- never via the interactive Agent tool."
+        ),
     )
-    sys.exit(2)
+    parser.add_argument("--repo-root", default=str(_REPO_ROOT))
+    parser.add_argument("--repository-id", required=True)
+    parser.add_argument("--target-issue", type=int, required=True)
+    parser.add_argument("--request-id", required=True)
+    parser.add_argument("--idempotency-key", required=True)
+    parser.add_argument("--schema-dir", default=str(_SCRIPTS_DIR / "schemas"))
+    parser.add_argument("--prompts-file", default=None, help="JSON file: {observer_id: prompt_text}")
+    args = parser.parse_args(argv)
+
+    prompts: dict[str, str] = {}
+    if args.prompts_file:
+        prompts = json.loads(Path(args.prompts_file).read_text(encoding="utf-8"))
+
+    try:
+        publish_request = run_cli(
+            repo_root=Path(args.repo_root),
+            repository_id=args.repository_id,
+            target_issue=args.target_issue,
+            request_id=args.request_id,
+            idempotency_key=args.idempotency_key,
+            schema_dir=Path(args.schema_dir),
+            prompts=prompts,
+        )
+    except (ObserverWaveFailed, EvaluatorInvocationFailed, WireContractError, ValueError) as exc:
+        reason_code = getattr(exc, "reason_code", type(exc).__name__)
+        print(json.dumps({"status": "failed", "reason_code": reason_code, "reason": str(exc)}, sort_keys=True))
+        return 1
+
+    print(publish_request.to_wire())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -131,13 +131,30 @@ def test_leaf_frontmatter_contract_max_turns_is_concrete_int(path: Path) -> None
 
 
 @pytest.mark.parametrize("path", [_RUNTIME_OBSERVER_PATH, _EVALUATOR_PATH])
-def test_leaf_frontmatter_contract_mcp_hooks_memory_unused(path: Path) -> None:
+def test_leaf_frontmatter_contract_mcp_hooks_explicitly_empty(path: Path) -> None:
+    # Issue #2237 fix_delta (P1-1): `mcpServers`/`hooks` are real, documented
+    # Claude Code SubAgent frontmatter fields -- both leaf SubAgents MUST
+    # declare them explicitly (not merely "absent or empty if present" as
+    # the pre-fix_delta test allowed, which passed vacuously when the key
+    # was simply omitted).
     frontmatter = _parse_frontmatter(path)
-    for key in ("mcpServers", "hooks", "memory"):
-        # "明示的に空または不使用" -- either the key is absent (not used at
-        # all) or, if present, it is explicitly empty (falsy).
+    assert "mcpServers" in frontmatter and frontmatter["mcpServers"] == []
+    assert "hooks" in frontmatter and frontmatter["hooks"] == {}
+
+
+@pytest.mark.parametrize("path", [_RUNTIME_OBSERVER_PATH, _EVALUATOR_PATH])
+def test_leaf_frontmatter_contract_memory_absent_or_falsy(path: Path) -> None:
+    # `memory`/`background`/`isolation`/`skills` have no official Claude Code
+    # SubAgent frontmatter sentinel value (Issue #2237 fix_delta P1-1 --
+    # OWNER review #2237#issuecomment-5378291560 confirmed no repository
+    # agent currently uses these keys). Per the Issue's live contract this
+    # fix_delta does not add speculative keys to production frontmatter;
+    # this test still tightens the invariant that IF present, it must be
+    # falsy (never silently enabling memory/background/isolation/skills).
+    frontmatter = _parse_frontmatter(path)
+    for key in ("memory", "background", "isolation", "skills"):
         if key in frontmatter:
-            assert not frontmatter[key], f"{path.name}: {key} must be empty if present"
+            assert not frontmatter[key], f"{path.name}: {key} must be empty/false if present"
 
 
 @pytest.mark.parametrize("path", [_RUNTIME_OBSERVER_PATH, _EVALUATOR_PATH])

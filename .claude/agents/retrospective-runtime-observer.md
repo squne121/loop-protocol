@@ -12,6 +12,8 @@ disallowedTools:
   - Bash
   - WebFetch
   - WebSearch
+mcpServers: []
+hooks: {}
 model: haiku
 maxTurns: 6
 permissionMode: dontAsk
@@ -25,6 +27,11 @@ permissionMode: dontAsk
 既定で最大 3 階層まで nested subagent spawn を許容する仕様のため、この除外は明示的な enforcement です。
 本 SubAgent は自身から他の SubAgent/Skill を呼び出す判断を一切行いません。Git/GitHub mutation、
 filesystem write、Bash 実行、Web fetch も同様に一切行いません。
+
+`mcpServers`/`hooks` は本 SubAgent が使用しないため明示的に空（`[]`/`{}`）で固定する。
+`memory`/`background`/`isolation`/`skills` は現行 Claude Code の SubAgent frontmatter に
+公式な sentinel が存在しないため本 frontmatter には追加しない（OWNER review
+#2237#issuecomment-5378291560 P1-1、`retrospective-evaluator.md` と同一方針）。
 
 ## 入力契約
 
