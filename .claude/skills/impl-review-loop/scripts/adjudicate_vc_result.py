@@ -9,7 +9,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 SCHEMA_NAME = "VC_ADJUDICATION_RESULT_V1"
@@ -1109,6 +1109,118 @@ def adjudicate_vc_result(
         evidence_refs=evidence_refs,
         errors=[],
     )
+
+
+def _step4_command_hashes(adjudication_result: dict[str, Any]) -> list[str] | None:
+    """Return the sorted command hashes covered by a VC_ADJUDICATION_RESULT_V1."""
+    per_ac = adjudication_result.get("per_ac")
+    if not isinstance(per_ac, list) or not per_ac:
+        return None
+    hashes: list[str] = []
+    for entry in per_ac:
+        if not isinstance(entry, dict):
+            return None
+        command_hash = entry.get("command_hash")
+        if not isinstance(command_hash, str) or not command_hash:
+            return None
+        hashes.append(command_hash)
+    return sorted(hashes)
+
+
+def evaluate_step4_vc_gate(
+    adjudication_result: Any,
+    *,
+    expected_head_sha: str,
+    expected_contract_body_sha256: str,
+    expected_command_hashes: list[str],
+) -> dict[str, Any]:
+    """Decide whether pr-reviewer may be invoked (Issue #88 current-head gate).
+
+    Re-derives a fail-closed boolean decision from an existing
+    VC_ADJUDICATION_RESULT_V1 payload produced by adjudicate_vc_result() and
+    an explicit "expected" binding triple (current-head SHA, current live
+    Issue body SHA256, and the ordered literal Verification Command hashes
+    Step 4 is about to evaluate). This reuses the existing adjudication
+    result rather than re-classifying VC failures (Issue #88 Required
+    Design #2) and holds no state of its own -- no new persistent ledger,
+    authorization packet, publisher, or hook is introduced by this function
+    (Issue #88 Required Design #9 / Out of Scope). We do not add a new
+    persistent ledger anywhere in this module; any future persistent ledger
+    for this gate would require a separate Issue.
+
+    Returns a mapping with keys:
+      - invoke_pr_reviewer: bool
+      - reason_code: str | None -- one of "adjudication_missing_or_malformed",
+        "adjudication_blocking_true", "adjudication_ac_not_resolved",
+        "head_mismatch", "body_mismatch", "command_mismatch", or None when
+        invoke_pr_reviewer is True.
+    """
+    if not isinstance(adjudication_result, dict) or adjudication_result.get("schema") != SCHEMA_NAME:
+        return {"invoke_pr_reviewer": False, "reason_code": "adjudication_missing_or_malformed"}
+
+    per_ac = adjudication_result.get("per_ac")
+    source_integrity = adjudication_result.get("source_integrity")
+    if not isinstance(per_ac, list) or not per_ac or not isinstance(source_integrity, dict):
+        return {"invoke_pr_reviewer": False, "reason_code": "adjudication_missing_or_malformed"}
+
+    if adjudication_result.get("blocking") is not False:
+        return {"invoke_pr_reviewer": False, "reason_code": "adjudication_blocking_true"}
+
+    for entry in per_ac:
+        if not isinstance(entry, dict) or entry.get("status") not in {
+            "pass",
+            "pre_existing_fail",
+            "out_of_scope_fail",
+        }:
+            return {"invoke_pr_reviewer": False, "reason_code": "adjudication_ac_not_resolved"}
+
+    if source_integrity.get("head_sha") != expected_head_sha:
+        return {"invoke_pr_reviewer": False, "reason_code": "head_mismatch"}
+
+    if source_integrity.get("contract_body_sha256") != expected_contract_body_sha256:
+        return {"invoke_pr_reviewer": False, "reason_code": "body_mismatch"}
+
+    observed_hashes = _step4_command_hashes(adjudication_result)
+    if observed_hashes is None or observed_hashes != sorted(expected_command_hashes):
+        return {"invoke_pr_reviewer": False, "reason_code": "command_mismatch"}
+
+    return {"invoke_pr_reviewer": True, "reason_code": None}
+
+
+def step4_binding_key(
+    *, head_sha: str, contract_body_sha256: str, command_hashes: list[str]
+) -> tuple[str, str, tuple[str, ...]]:
+    """Identity of a Step 2/Step 4 binding tuple, used for same-loop reuse (AC5)."""
+    return (head_sha, contract_body_sha256, tuple(sorted(command_hashes)))
+
+
+class Step4AdjudicationCache:
+    """Same-root-invocation reuse cache keyed by Step 4 binding tuple.
+
+    Issue #88 Required Design #9 forbids a new persistent ledger. This cache
+    is a plain in-memory object scoped to a single impl-review-loop root
+    invocation: it is never serialized to disk and is discarded when the
+    process exits, so it is not a persistent ledger, authorization packet,
+    or publisher. It exists only to satisfy Required Design #6 -- avoid
+    re-running test-runner for a binding tuple that already has a valid
+    adjudication within the same loop.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
+
+    def get_or_run(
+        self,
+        binding_key: tuple[str, str, tuple[str, ...]],
+        run_test_runner_and_adjudicate: Callable[[], dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
+        """Return (adjudication_result, reused). Only calls the callback on a cache miss."""
+        cached = self._entries.get(binding_key)
+        if cached is not None:
+            return cached, True
+        result = run_test_runner_and_adjudicate()
+        self._entries[binding_key] = result
+        return result, False
 
 
 def _compact_payload(payload: dict[str, Any], *, truncated: bool, omitted_fields: list[str]) -> dict[str, Any]:

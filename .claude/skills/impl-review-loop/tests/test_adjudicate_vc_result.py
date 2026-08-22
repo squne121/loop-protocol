@@ -732,3 +732,123 @@ def test_unrecognized_changed_path_record_is_fail_closed_indeterminate():
     assert result["overall_status"] == "indeterminate"
     assert result["blocking"] is True
     assert "unrecognized_changed_path_record" in result["errors"]
+
+
+# --- Issue #88 AC2/AC3: Step 4 current-head gate binding triple ---
+# evaluate_step4_vc_gate() re-derives a fail-closed decision from an
+# existing VC_ADJUDICATION_RESULT_V1 (produced by adjudicate_vc_result()
+# above) plus the caller-supplied "expected" (live) head SHA / contract body
+# SHA256 / command hashes triple.
+
+
+def test_ac2_step4_gate_accepts_matching_binding_triple():
+    # GIVEN a certified current-head PASS adjudication for a single AC
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={
+            "changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+    )
+    assert result["blocking"] is False
+
+    # WHEN Step 4 evaluates the gate against the exact live (head, body, commands) triple
+    decision = mod.evaluate_step4_vc_gate(
+        result,
+        expected_head_sha="head1",
+        expected_contract_body_sha256="sha256:" + "b" * 64,
+        expected_command_hashes=[current_item["command_hash"]],
+    )
+
+    # THEN pr-reviewer may be invoked
+    assert decision["invoke_pr_reviewer"] is True
+    assert decision["reason_code"] is None
+
+
+def test_ac3_step4_gate_rejects_head_drift():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={
+            "changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+    )
+    assert result["blocking"] is False
+
+    # WHEN the live PR head has since drifted away from the adjudicated head
+    decision = mod.evaluate_step4_vc_gate(
+        result,
+        expected_head_sha="head2-drifted",
+        expected_contract_body_sha256="sha256:" + "b" * 64,
+        expected_command_hashes=[current_item["command_hash"]],
+    )
+
+    # THEN the stale adjudication does not open the gate
+    assert decision["invoke_pr_reviewer"] is False
+    assert decision["reason_code"] == "head_mismatch"
+
+
+def test_ac3_step4_gate_rejects_body_drift():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={
+            "changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+    )
+    assert result["blocking"] is False
+
+    # WHEN the live Issue body has since been edited (different body_sha256)
+    decision = mod.evaluate_step4_vc_gate(
+        result,
+        expected_head_sha="head1",
+        expected_contract_body_sha256="sha256:" + "c" * 64,
+        expected_command_hashes=[current_item["command_hash"]],
+    )
+
+    # THEN the stale adjudication does not open the gate
+    assert decision["invoke_pr_reviewer"] is False
+    assert decision["reason_code"] == "body_mismatch"
+
+
+def test_ac3_step4_gate_rejects_command_drift():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={
+            "changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+    )
+    assert result["blocking"] is False
+
+    # WHEN the live Verification Commands have since changed (different literal command hash)
+    decision = mod.evaluate_step4_vc_gate(
+        result,
+        expected_head_sha="head1",
+        expected_contract_body_sha256="sha256:" + "b" * 64,
+        expected_command_hashes=["sha256:" + "9" * 64],
+    )
+
+    # THEN the stale adjudication does not open the gate
+    assert decision["invoke_pr_reviewer"] is False
+    assert decision["reason_code"] == "command_mismatch"

@@ -55,7 +55,7 @@ subprocess 分離方式（`invocation_token` による再提示）は撤回済�
 [Step 1: Implementation]  → implementation-worker SubAgent (implement-issue skill)
         ↓
 [Step 2: Verification]    → test-runner SubAgent
-        ↓
+        ↓ (current-head gate: VC_ADJUDICATION_RESULT_V1.blocking == false のときのみ通過。Issue #88)
 [Step 4: PR Review]       → pr-reviewer SubAgent (pr-review-judge skill)
         ↓
 [Step 5: Judgment]        → reviewer_verdict + live_mergeability を route_loop_verdict_v2() で解析
