@@ -34,18 +34,26 @@ claude_gpt_proxy_home_dir() {
   printf '%s/proxy-home\n' "$CLAUDE_GPT_HOME"
 }
 
-# --- Claude/AGY プロセス専用の隔離 HOME / GH_CONFIG_DIR / XDG directories（P0-6）。
+# --- Claude/AGY プロセス専用の隔離 HOME / XDG directories（P0-6, Issue #2299 で
+# GitHub auth 部分を compatibility-first へ reverse）。
 # OWNER adversarial review（PR #2214 コメント）は、Claude process が proxy 専用 HOME
-# 分離とは独立に、呼び出し元の実 HOME をそのまま継承しているため ambient `gh auth`
-# credential（`$HOME/.config/gh` 等）へ到達可能である点を指摘した。ここで用意する
-# ディレクトリは空（`gh auth login` 未実行）のまま launch.sh が Claude 子プロセスの
-# `HOME` / `GH_CONFIG_DIR` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` として注入し、
-# raw `gh` を Claude/AGY プロセスから起動しても genuine auth context を利用できない
-# ようにする（GitHub write credential は broker のみが保持する。Outcome 節）。
+# 分離とは独立に、呼び出し元の実 HOME をそのまま継承しているため ambient
+# credential（SSH key・GPG key 等）へ到達可能である点を指摘した。ここで用意する
+# ディレクトリは空のまま launch.sh が Claude 子プロセスの `HOME` / `XDG_CONFIG_HOME`
+# / `XDG_CACHE_HOME` として注入し、SSH/GPG 等 GitHub auth と無関係な secret への
+# 到達を防ぐ。GitHub auth（`GH_TOKEN` 系・`GH_CONFIG_DIR` の config discovery）は
+# Issue #2299 により native Claude Code 相当に共有する方針へ変更されたため、この
+# 隔離 HOME はもはや `gh` の credential lookup を遮断する役割を持たない
+# （launch.sh は `GH_CONFIG_DIR` を ambient な実際の解決先へ明示的に export し
+# 直す）。
 claude_gpt_claude_isolated_home_dir() {
   printf '%s/claude-home\n' "$CLAUDE_GPT_HOME"
 }
 
+# claude_gpt_claude_isolated_gh_config_dir: Issue #2299 以降は launch.sh の
+# GH_CONFIG_DIR export には使われない（GitHub auth は native 相当に共有する方針の
+# ため）。互換性のため関数自体は残す（空ディレクトリの作成先として引き続き
+# mkdir -p される）。
 claude_gpt_claude_isolated_gh_config_dir() {
   printf '%s/claude-gh-config\n' "$CLAUDE_GPT_HOME"
 }

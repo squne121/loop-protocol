@@ -27,6 +27,7 @@ caller wiring at this time.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -112,20 +113,55 @@ class TransactionResult:
     failed_readbacks: list[dict] = field(default_factory=list)
     pending_steps: list[str] = field(default_factory=list)
     audit_comment_posted: bool | None = None
+    # Salvage from PR #2286 (credential-isolated bridge, NOT_PLANNED) -- kept independent
+    # of the bridge machinery it was originally built for (Issue #2299 AC4). node_id is the
+    # GraphQL node id of the created issue when it happens to already be known from another
+    # step in this transaction (e.g. dependency/blocking/sub-issue registration); it is not
+    # fetched via an extra API call solely to populate this field. body_sha256 is the sha256
+    # hex digest of the exact body text submitted to `gh issue create`, for authoritative
+    # content readback/verification by callers.
+    node_id: str | None = None
+    body_sha256: str | None = None
+
+
+# Salvage from PR #2286 (credential-isolated bridge, NOT_PLANNED) -- kept independent of
+# the bridge machinery it was originally built for (Issue #2299 AC4). Bounds how long a
+# single `gh`/`git` subprocess invocation may hang (e.g. stalled network) before this
+# transaction helper gives up on it instead of blocking indefinitely.
+_DEFAULT_GH_COMMAND_TIMEOUT_SECONDS = 60.0
 
 
 def run_command(
     command: list[str],
     *,
     check: bool = False,
-    capture_output: bool = True
+    capture_output: bool = True,
+    timeout: float | None = _DEFAULT_GH_COMMAND_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        text=True,
-        check=check,
-        capture_output=capture_output,
-    )
+    """Run a `gh`/`git` subprocess with a bounded timeout.
+
+    On timeout, returns a CompletedProcess with returncode 124 (matching the conventional
+    POSIX `timeout` exit code) instead of letting `subprocess.TimeoutExpired` propagate.
+    Existing callers (`_run_gh_text`/`_run_gh_json`) already treat any non-zero returncode
+    as a stage failure and raise `TransactionError`, so a hung invocation now surfaces as a
+    normal, diagnosable failure rather than hanging the whole transaction.
+    """
+    try:
+        return subprocess.run(
+            command,
+            text=True,
+            check=check,
+            capture_output=capture_output,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout_stderr = (exc.stderr or "") + f"\ncommand timed out after {timeout}s"
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=124,
+            stdout=(exc.stdout or ""),
+            stderr=timeout_stderr,
+        )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2384,6 +2420,15 @@ def run_transaction(
     issue_url = _issue_create(repo, title, body, body_file, gh_bin)
     issue_number = _issue_number_from_url(issue_url)
     completed.append("create")
+
+    # Salvage from PR #2286 (Issue #2299 AC4): authoritative content hash of the exact body
+    # text submitted, independent of any bridge/transport. Computed once here (pure hash,
+    # no extra gh call) and threaded through to the final TransactionResult below.
+    if body_file:
+        body_text_for_hash = Path(body_file).read_text(encoding="utf-8")
+    else:
+        body_text_for_hash = body or ""
+    body_sha256 = hashlib.sha256(body_text_for_hash.encode("utf-8")).hexdigest()
     matching_issue_numbers: list[int] = []
 
     # Blocker C: initialize step tracking fields before the try block so that all
@@ -2606,6 +2651,12 @@ def run_transaction(
             applied_steps=applied_steps,
             verified_steps=verified_steps,
             pending_steps=pending_steps,
+            # Salvage (Issue #2299 AC4): node_id is only populated when it was already
+            # resolved as a side effect of another step in this same transaction (see
+            # child_node_id above); we do not add an extra graphql lookup solely for
+            # this field.
+            node_id=child_node_id or None,
+            body_sha256=body_sha256,
         )
 
     except TransactionError as exc:

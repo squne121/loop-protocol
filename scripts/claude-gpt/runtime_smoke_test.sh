@@ -46,11 +46,28 @@
 # 記録して exit 1 する（static hook output test の結果を live smoke の代わりに
 # PASS へ昇格させることは絶対に行わない -- AC7 が明示的に禁止する）。
 SPARK_DELEGATION_MODE=false
+# Issue #2299 AC2/AC5: --scenario <name> selects an outcome-oriented workflow
+# scenario instead of the default canary smoke below. Only issue_create is
+# implemented; any other value is rejected (exit 2) rather than silently
+# falling back to the default canary smoke.
+SCENARIO=""
+_prev_arg=""
 for _arg in "$@"; do
   case "$_arg" in
     --spark-delegation) SPARK_DELEGATION_MODE=true ;;
+    --scenario) : ;;
+    *)
+      if [ "$_prev_arg" = "--scenario" ]; then
+        SCENARIO="$_arg"
+      fi
+      ;;
   esac
+  _prev_arg="$_arg"
 done
+if [ -n "$SCENARIO" ] && [ "$SCENARIO" != "issue_create" ]; then
+  echo "ERROR: unsupported --scenario value: $SCENARIO (only issue_create is implemented)" >&2
+  exit 2
+fi
 
 SELF_PATH=$0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
@@ -108,6 +125,103 @@ if [ "$PREFLIGHT_ENV_RC" -eq 3 ] || [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
     "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" > "$EVIDENCE_FILE"
   echo "SKIP: ${SKIP_REASON} のため runtime smoke test を実行できません。証跡: ${EVIDENCE_FILE}"
   exit 77
+fi
+
+# --- Issue #2299 AC2/AC5: --scenario issue_create outcome-oriented workflow ---
+# Launches a genuine issue-creator SubAgent (via the real Task tool, under a
+# real launch.sh-driven claude subprocess -- NOT root-Claude-direct-Bash) to
+# run the normal, now-unified (non-isolated) create-issue workflow against the
+# fake gh provider fixture (scripts/claude-gpt/tests/fixtures/fake_gh.py /
+# .claude/skills/create-issue/tests/fixtures/fake_gh.py -- the latter forwards
+# to the former, kept in sync). PASS/FAIL is determined by authoritative
+# readback of the fake provider's own state file (the created Issue actually
+# exists there with the expected title), never by asserting a specific hop
+# chain (bridge/MCP) was used -- that mechanism does not exist in this
+# repository (Issue #2259/PR #2286 were closed NOT_PLANNED).
+if [ "$SCENARIO" = "issue_create" ]; then
+  SCENARIO_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d " \n")
+  if [ -z "$SCENARIO_NONCE" ]; then
+    SCENARIO_NONCE="$$_${TIMESTAMP}"
+  fi
+  SCENARIO_TITLE="[fake-gh-smoke-${SCENARIO_NONCE}] issue_create scenario canary"
+  SCENARIO_STATE_FILE=$(mktemp)
+  printf '%s' '{"next_number": 1, "issues": {}}' > "$SCENARIO_STATE_FILE"
+  SCENARIO_FAKE_GH_DIR=$(mktemp -d)
+  # Use the CANONICAL fixture (not the thin forwarder) -- the forwarder resolves
+  # its target via a fixed __file__-relative path that breaks once copied out of
+  # its original tree location.
+  cp "$SCRIPT_DIR/../../.claude/skills/create-issue/tests/fixtures/fake_gh.py" "$SCENARIO_FAKE_GH_DIR/gh"
+  chmod +x "$SCENARIO_FAKE_GH_DIR/gh"
+
+  SCENARIO_BODY_FILE=$(mktemp)
+  {
+    printf '%s\n' "Disposable fake-provider canary body created by runtime_smoke_test.sh"
+    printf '%s\n' "--scenario issue_create (Issue #2299 AC2/AC5). Not a real GitHub Issue --"
+    printf '%s\n' "created against the fake gh provider fixture only."
+    printf '\n'
+    printf '%s\n' "## Acceptance Criteria"
+    printf '%s\n' "- [ ] AC1: disposable fake-provider canary issue"
+    printf '\n'
+    printf '%s\n' "## Verification Commands"
+    printf '%s\n' '```bash'
+    printf '%s\n' "# AC1"
+    printf '%s\n' '$ echo ok'
+    printf '%s\n' '```'
+    printf '\n'
+    printf '%s\n' "## Allowed Paths"
+    printf '%s\n' "- scripts/claude-gpt/runtime_smoke_test.sh"
+  } > "$SCENARIO_BODY_FILE"
+
+  SCENARIO_PROMPT="Use the Task tool to invoke the issue-creator SubAgent (subagent_type: issue-creator). Ask it to run the normal create-issue skill procedure (dedupe read, then create_issue_txn.py, then authoritative readback) to create exactly one Issue in repo squne121/loop-protocol with title exactly: ${SCENARIO_TITLE} and with the body read verbatim from the file ${SCENARIO_BODY_FILE}. Do not create any issue via any other path. Report back only whether the SubAgent reported success or failure."
+
+  SCENARIO_STDOUT=$(mktemp)
+  SCENARIO_STDERR=$(mktemp)
+  PATH="$SCENARIO_FAKE_GH_DIR:$PATH" FAKE_GH_STATE_FILE="$SCENARIO_STATE_FILE" \
+    "$SCRIPT_DIR/launch.sh" -- -p "$SCENARIO_PROMPT" --output-format text --no-session-persistence \
+    >"$SCENARIO_STDOUT" 2>"$SCENARIO_STDERR"
+  SCENARIO_LAUNCH_RC=$?
+
+  # Authoritative readback: independent of whatever the launched session
+  # self-reports, inspect the fake provider's own state file directly.
+  SCENARIO_READBACK_OK=false
+  SCENARIO_READBACK_ISSUE_NUMBER="null"
+  if [ -f "$SCENARIO_STATE_FILE" ]; then
+    SCENARIO_READBACK_JSON=$(uv run --locked python3 - "$SCENARIO_STATE_FILE" "$SCENARIO_TITLE" <<'SCENARIO_READBACK_PY'
+import json, sys
+state_path, expected_title = sys.argv[1], sys.argv[2]
+try:
+    with open(state_path, encoding="utf-8") as fh:
+        state = json.load(fh)
+except (OSError, ValueError):
+    print("false null")
+    raise SystemExit(0)
+for issue in state.get("issues", {}).values():
+    if issue.get("title") == expected_title:
+        print(f"true {issue.get('number')}")
+        raise SystemExit(0)
+print("false null")
+SCENARIO_READBACK_PY
+    )
+    SCENARIO_READBACK_OK=$(echo "$SCENARIO_READBACK_JSON" | awk '{print $1}')
+    SCENARIO_READBACK_ISSUE_NUMBER=$(echo "$SCENARIO_READBACK_JSON" | awk '{print $2}')
+  fi
+
+  SCENARIO_EVIDENCE_FILE="${EVIDENCE_DIR}/smoke-issue_create-${TIMESTAMP}.json"
+  if [ "$SCENARIO_READBACK_OK" = "true" ]; then
+    SCENARIO_STATUS="pass"
+    SCENARIO_EXIT=0
+  else
+    SCENARIO_STATUS="fail"
+    SCENARIO_EXIT=1
+  fi
+  SCENARIO_TITLE_JSON=$(uv run --locked python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$SCENARIO_TITLE")
+  printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","scenario":"issue_create","status":"%s","launch_exit_code":%s,"expected_title":%s,"readback_confirmed":%s,"readback_issue_number":%s,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","lib_sh_sha256":"%s","runtime_smoke_sha256":"%s"}}\n' \
+    "$SCENARIO_STATUS" "$SCENARIO_LAUNCH_RC" "$SCENARIO_TITLE_JSON" "$SCENARIO_READBACK_OK" "$SCENARIO_READBACK_ISSUE_NUMBER" \
+    "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
+    > "$SCENARIO_EVIDENCE_FILE"
+  echo "issue_create scenario: status=${SCENARIO_STATUS} readback_confirmed=${SCENARIO_READBACK_OK} evidence=${SCENARIO_EVIDENCE_FILE}" >&2
+  rm -rf "$SCENARIO_FAKE_GH_DIR" "$SCENARIO_STATE_FILE" "$SCENARIO_BODY_FILE" "$SCENARIO_STDOUT" "$SCENARIO_STDERR" 2>/dev/null || true
+  exit "$SCENARIO_EXIT"
 fi
 
 # --- Issue #2274 AC5/AC6/AC7/AC17/AC18: `--spark-delegation` live E2E harness ---

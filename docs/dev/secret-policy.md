@@ -144,6 +144,27 @@ raw `gh` / raw `git push` 全般に対する production-grade な credential bou
 #2223（実装: raw gh/git push を deterministic deny し GitHub mutation production broker を
 実装する、OPEN）で対応する。
 
+#### claude-gpt の Claude/AGY 子プロセスに対する GitHub auth 方針 — compatibility-first (#2299)
+
+Issue #2259（PR #2286）は `scripts/claude-gpt/launch.sh` が起動する Claude/AGY 子プロセスの
+`HOME`/`GH_CONFIG_DIR`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME` を空の隔離ディレクトリへ差し替え、
+`GH_TOKEN`/`GITHUB_TOKEN`/`GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN`/`GH_HOST`/`GH_REPO`/
+`SSH_AUTH_SOCK`/`GIT_ASKPASS`/`SSH_ASKPASS`/`GIT_CREDENTIAL_HELPER` を unset する full credential
+isolation を実装したが、owner はこの方針を明示的に reverse し（PR #2286 コメント）、Issue #2259 は
+`NOT_PLANNED` で close された。
+
+Issue #2299（実装済み）はこの reversal を反映し、Claude/AGY 子プロセスの GitHub auth を native
+Claude Code session と同等に共有する compatibility-first 方針へ変更した:
+
+- GitHub auth 関連（`GH_TOKEN`/`GITHUB_TOKEN`/`GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN`/
+  `GH_HOST`/`GH_REPO`、および `gh` の config discovery に使う `GH_CONFIG_DIR`）はもう scrub/isolate
+  しない。`launch.sh` は HOME 差し替え前に ambient な `GH_CONFIG_DIR` 解決先を捕捉し、Claude/AGY
+  子プロセスへ明示的に export し直す（`CLAUDE_GPT_AMBIENT_GH_CONFIG_DIR`）。
+- GitHub auth と無関係な secret（SSH agent socket・git askpass・git credential helper）は引き続き
+  isolate する。host HOME 全体をそのまま共有する実装は採用しない（SSH/GPG key 等が漏れるため）。
+- `.claude/skills/create-issue/scripts/create_issue_txn.py` の isolation-profile/bridge 分岐
+  （PR #2286 由来）は本 repo の `main` には一度もマージされていない。
+
 ---
 
 ### 5. `checkpoint_token` — session 記録ツール用 token

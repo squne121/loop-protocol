@@ -1576,20 +1576,33 @@ export STRICT_MCP_MODE
 # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB は設定しない（OS-level sandbox hardening は Phase 1
 # の merge 条件から除外。実機検証で launcher がネストした sandbox 実行環境下にある場合
 # Bash tool を破壊することを確認したため。Issue #2158 Scope Reframe, 2026-08-15）。
-# --- Claude/AGY プロセスから genuine `gh` auth context を利用不能にする（P0-6,
-#     PR #2214 OWNER adversarial review 反映）。GitHub write credential は
-#     GitHub mutation transaction broker（別プロセス、ambient 実 HOME/GH_CONFIG_DIR
-#     を使う）のみが保持する。ここで Claude 子プロセスの HOME/GH_CONFIG_DIR/
-#     XDG_CONFIG_HOME/XDG_CACHE_HOME を空の隔離ディレクトリへ差し替え、
-#     GH_TOKEN 系 / SSH_AUTH_SOCK / GIT_ASKPASS 系を scrub することで、raw `gh` /
-#     raw `git push`（SSH 経由を含む）を Claude セッション内から実行しても
-#     既存 authentication に到達できない状態にする。 ---
+# --- Claude/AGY プロセスの GitHub access を compatibility-first にする（Issue
+#     #2299。#2259/#2286 の full credential isolation 方針を owner が明示的に
+#     reverse した。GitHub auth（GH_TOKEN 系・GH_HOST・GH_REPO・GH_CONFIG_DIR の
+#     config discovery）は native Claude Code 相当に共有し、それ以外の無関係な
+#     secret（SSH agent socket・git askpass/credential-helper）は引き続き
+#     isolate する。host HOME 全体は共有しない（SSH/GPG key 等が漏れるため）。---
+#
+# `gh` の config directory 解決順は「GH_CONFIG_DIR > XDG_CONFIG_HOME/gh >
+# HOME/.config/gh」。HOME/XDG_CONFIG_HOME を隔離ディレクトリへ差し替えたままだと
+# GH_CONFIG_DIR を明示指定しない限り isolated 領域を見に行ってしまうため、HOME を
+# 差し替える前（このブロックの直前）に ambient な実際の GH_CONFIG_DIR 解決先を
+# CLAUDE_GPT_AMBIENT_GH_CONFIG_DIR として捕捉しておき、そこへ明示的に export
+# し直す。
+CLAUDE_GPT_AMBIENT_GH_CONFIG_DIR="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}"
+
 export HOME="$CLAUDE_ISOLATED_HOME_TARGET"
-export GH_CONFIG_DIR="$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET"
 export XDG_CONFIG_HOME="$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET"
 export XDG_CACHE_HOME="$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"
-unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
-unset GH_HOST GH_REPO
+# GH_CONFIG_DIR: ambient（isolate 前）の解決先へ明示的に向け直す。isolated
+# directory（$CLAUDE_ISOLATED_GH_CONFIG_DIR_TARGET）はもう使わない。
+if [ -n "$CLAUDE_GPT_AMBIENT_GH_CONFIG_DIR" ]; then
+  export GH_CONFIG_DIR="$CLAUDE_GPT_AMBIENT_GH_CONFIG_DIR"
+fi
+# GH_TOKEN / GITHUB_TOKEN / GH_ENTERPRISE_TOKEN / GITHUB_ENTERPRISE_TOKEN /
+# GH_HOST / GH_REPO は GitHub-auth 関連のため、もう unset しない（Issue #2299
+# compatibility-first reversal）。SSH/git-credential 系は GitHub auth と無関係の
+# ため引き続き isolate する。
 unset SSH_AUTH_SOCK
 unset GIT_ASKPASS SSH_ASKPASS GIT_CREDENTIAL_HELPER
 
