@@ -153,7 +153,7 @@ cleanup_required: true
 必須（`PUBLISH_REQUEST_V1` は `run_identity` object 経由）、未知フィールド拒否、oversize 拒否、
 schema repair retry 上限 1。
 
-## 永続化（Persistence, Issue #2238 / Child 5）
+## 永続化（run の実データを Issue comment として保存する。実装は Issue #2238 / Child 5）
 
 `run_retrospective.py main()` は `--state-backend` 引数（既定 `fixture`）で `PreviousStateProvider`
 backend を選択する。`--state-backend issue-comments` を指定すると、`resolve_previous_state_provider()`

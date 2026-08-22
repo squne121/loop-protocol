@@ -76,7 +76,7 @@ dataclass に宣言されていないため、入力に含まれていれば汎�
 （`finding_identity`/`severity`/`candidate_status: open|resolved` 等）は canonical schema 不適合として
 reject される。同一リスト内の `candidate_id` 重複も reject する。
 
-## agent_retrospective_run_publication/v1（永続化 envelope、Issue #2238 Child 5）
+## agent_retrospective_run_publication/v1（永続化された envelope の形式。Issue #2238 Child 5 で追加）
 
 `persist_retrospective_run.py` が `PUBLISH_REQUEST_V1` から構築し、Issue comment として投稿する envelope。
 Child 2 の `agent_retrospective_run/v1` schema（`schemas/agent_retrospective_run_v1.schema.json`）とは
