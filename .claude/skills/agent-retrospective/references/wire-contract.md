@@ -75,3 +75,28 @@ dataclass に宣言されていないため、入力に含まれていれば汎�
 を正本として `validate_retrospective_schema.validate_candidate()` で検証される。私的な shadow dialect
 （`finding_identity`/`severity`/`candidate_status: open|resolved` 等）は canonical schema 不適合として
 reject される。同一リスト内の `candidate_id` 重複も reject する。
+
+## agent_retrospective_run_publication/v1（永続化 envelope、Issue #2238 Child 5）
+
+`persist_retrospective_run.py` が `PUBLISH_REQUEST_V1` から構築し、Issue comment として投稿する envelope。
+Child 2 の `agent_retrospective_run/v1` schema（`schemas/agent_retrospective_run_v1.schema.json`）とは
+別の `schema_version` を持つ -- 後者が要求する per-source `source_observations[]`（acquisition window
+付き）は `PUBLISH_REQUEST_V1` が保持しないため、本 envelope は repository source のみの最小
+`source_observations` 単一項目で代替する（Child 2 の run identity 拡張は ADR 0007 "Remaining Parent
+Gaps" の別途フォローアップ）。
+
+フィールド: `schema_version`（`agent_retrospective_run_publication/v1` 固定）/ `repository_id` /
+`target_issue` / `request_id` / `scope` / `idempotency_key`（publisher 側で再計算、caller 供給値は
+信用しない）/ `expected_previous_digest` / `parent_record_digest`（optimistic concurrency の chain
+link）/ `run.run_identity`（`run_id`/`base_sha`/`source_set_digest`/`generated_at`/`runtime_version`）/
+`run.source_observations`（`source_type: repository` の単一項目）/ `candidate_records` / `delta_results`
+（`PublishRequest` の対応 field をそのまま carry through）/ `publication_digest`（`sha256-jcs-v1`。
+自分自身を preimage に含めない）。
+
+`publication_digest` は `run_retrospective.py`'s `public_projection_digest` とは別の digest -- 前者は
+「永続化された record」の binding digest（`parent_record_digest` を含む preimage）、後者は「proposal」の
+binding digest。
+
+投稿は Issue comment の marker 行（`<!-- agent_retrospective_run:v1 repository_id=... idempotency_key=... -->`）
++ fenced ```json block。post-write readback は comment ID で GET → fenced block 抽出 → canonical JSON
+digest 再計算 → `publication_digest` と比較（Markdown 生 bytes 比較はしない）。

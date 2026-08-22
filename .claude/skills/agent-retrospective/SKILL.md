@@ -9,7 +9,7 @@ disable-model-invocation: true
 `.claude/skills/agent-retrospective/` は、Claude Code / Claude-GPT のセッション証跡・repository・GitHub・Web
 の 5 source から収集した evidence を、独立 2 段の SubAgent（observer wave → evaluator）で解釈し、
 `agent_improvement_candidate/v1`（#2288 で delta-evaluation 拡張済み）準拠の改善候補を **proposal-only** で
-生成する。GitHub Issue への実際の投稿・mutation は本 Skill のスコープ外（#2238）。
+生成する。GitHub Issue への実際の投稿・mutation は `persist_retrospective_run.py`（#2238）が担う。
 
 ## Orchestration owner（実行主体）
 
@@ -153,6 +153,52 @@ cleanup_required: true
 必須（`PUBLISH_REQUEST_V1` は `run_identity` object 経由）、未知フィールド拒否、oversize 拒否、
 schema repair retry 上限 1。
 
+## 永続化（Persistence, Issue #2238 / Child 5）
+
+`run_retrospective.py main()` は `--state-backend` 引数（既定 `fixture`）で `PreviousStateProvider`
+backend を選択する。`--state-backend issue-comments` を指定すると、`resolve_previous_state_provider()`
+が sibling module `persist_retrospective_run.py` の `IssueCommentPreviousStateProvider` を実際に
+構築し `run_cli()` へ注入する（`fixture` は従来通り空の `FixturePreviousStateProvider`）。provider の
+`read_version`（直近 publication の digest）は `execute_run()`/`run_cli()` の `finalize()` 呼び出しへ
+`expected_previous_digest` として伝播する。
+
+`persist_retrospective_run.py` は `run_retrospective.py` が生成した `PUBLISH_REQUEST_V1` を消費し、
+`agent_retrospective_run_publication/v1` envelope（`run_identity` + 単一 `source_observations` 項目 +
+`candidate_records` + `delta_results`、`sha256-jcs-v1` 準拠 `publication_digest` 付き）を構築して、
+以下を順に実行する:
+
+1. **optimistic concurrency precheck**（best-effort、ADR 0007 Decision 5）: POST 前に現在の head
+   digest を再確認し `parent_record_digest` として束縛する
+2. **public-safety validator**: field allowlist（未知 top-level key 拒否）+ 値レベルの
+   credential/token/absolute-path パターン拒否 + size 事前確認。違反時は POST しない
+3. **idempotency guard**: `(repository_id, base_sha, source_set_digest, scope)` から publisher が
+   自前で再計算した key による `no_op`/`conflict`/`publish` の三値判定
+4. **human authorization gate**（fail-closed）: TTY 明示確認、または別コマンドが発行する短命な
+   `human_authorization_receipt/v1` ファイルの検証のいずれかが必須。単独の `--authorized-by-human`
+   相当の flag は存在しない
+5. **POST**（ambiguous failure からの `request_id`/idempotency-key ベース回収を含む）
+6. **post-write readback**（comment ID で GET → canonical JSON digest 再計算 → 一致確認）と
+   sibling rescan（同一 `parent_record_digest` を持つ comment が複数あれば `conflict_detected`）
+7. 任意の `agent_retro_index/v1` derived-index 更新。失敗しても一次記録はロールバックせず
+   `published_index_stale` を返す
+
+### `human_authorization_receipt/v1`
+
+```yaml
+human_authorization_receipt/v1:
+  request_id: <string>            # PUBLISH_REQUEST_V1.request_id と一致必須
+  publication_digest: <sha256:..> # 承認対象の envelope digest と一致必須
+  repository_id: <owner/repo>
+  target_issue: <int>
+  operation: "publish_retrospective_run"
+  approved_at: <ISO 8601>
+  expires_at: <ISO 8601>          # 検証時刻がこれ以降なら拒否（fail-closed）
+```
+
+既存 `PUBLISH_REQUEST_V1` の禁止 field（`authorized`/`authorized_by_human`/`authorization_token`/
+`mutation_capability`）は維持されたまま。承認は本 receipt ファイル、または TTY 明示確認という
+別チャネルでのみ確認する。
+
 ## Guardrails（ガードレール）
 
 - **Allowed Paths 外を編集しない**
@@ -165,6 +211,8 @@ schema repair retry 上限 1。
 
 - `.claude/skills/agent-retrospective/scripts/collect_snapshot.py`（Child 3、#2236）
 - `.claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py`（Child 2、#2235/#2288）
+- `.claude/skills/agent-retrospective/scripts/persist_retrospective_run.py`（Child 5、#2238）
+- `.claude/skills/agent-retrospective/references/wire-contract.md`（永続化 envelope の詳細）
 - `.claude/agents/codebase-investigator.md` / `.claude/agents/web-researcher.md`（既存再利用）
 - `docs/adr/0007-agent-retrospective-boundaries.md`
 - `docs/dev/agent-skill-boundaries.md`

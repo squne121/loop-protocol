@@ -113,6 +113,15 @@ def _collect_snapshot_module():
     return _load_sibling_module("agent_retrospective_collect_snapshot", "collect_snapshot.py")
 
 
+def _persist_retrospective_run_module():
+    """Lazily load Issue #2238's persistence module (``persist_retrospective_run.py``,
+    a sibling script in the same Allowed Paths set). Loaded lazily -- like the
+    other sibling loaders above -- so importing this module never requires
+    ``persist_retrospective_run.py`` to be importable unless a caller actually
+    resolves the ``issue-comments`` state backend (Issue #2238 AC1)."""
+    return _load_sibling_module("agent_retrospective_persist_run", "persist_retrospective_run.py")
+
+
 def compute_source_set_digest(source_observations: list[dict[str, Any]]) -> str:
     """Reuse Child 2's canonical ``source_set_digest`` computation (Issue
     #2235/#2236). Loaded lazily so importing this module never requires the
@@ -1153,6 +1162,7 @@ def execute_run(
         target_issue=target_issue,
         request_id=request_id,
         idempotency_key=idempotency_key,
+        expected_previous_digest=previous_state.read_version,
         delta_results=delta_results,
     )
 
@@ -1213,6 +1223,47 @@ class FixturePreviousStateProvider:
         if key not in self._fixtures:
             return PreviousStateResult(status="no_history", previous_run_ref=None, candidates=[], read_version=None)
         return self._fixtures[key]
+
+
+#: ``main()``'s ``--state-backend`` choices (Issue #2238 AC1). ``fixture`` is
+#: the default and preserves exact prior behavior (empty
+#: ``FixturePreviousStateProvider``); ``issue-comments`` is the real,
+#: persistence-backed production backend.
+STATE_BACKEND_CHOICES = ("fixture", "issue-comments")
+
+
+def resolve_previous_state_provider(
+    *, state_backend: str, repository_id: str, target_issue: int
+) -> "PreviousStateProviderProtocol":
+    """Build the ``previous_state_provider`` ``main()`` injects into
+    ``run_cli()`` (Issue #2238 AC1). This is the actual production wiring
+    point: ``main()`` calls this function (not a hand-rolled fixture) and
+    passes its result straight into ``run_cli(previous_state_provider=...)``,
+    so any test that stubs ``run_cli`` and asserts on the object this
+    function returned is exercising the real production call graph, not a
+    parallel/duplicate one.
+
+    ``state_backend == "fixture"`` (the default) reproduces the exact prior
+    ``main()`` behavior byte-for-byte: an empty ``FixturePreviousStateProvider``
+    (every finding classifies as ``no_history`` -> ``new``).
+
+    ``state_backend == "issue-comments"`` lazily loads the sibling
+    persistence module (Issue #2238's ``persist_retrospective_run.py``, in
+    this Issue's Allowed Paths) and constructs its real
+    ``IssueCommentPreviousStateProvider`` -- a persistence-backed provider
+    that reads actual prior run publication comments from
+    ``repository_id``/``target_issue`` instead of a caller-supplied
+    fixture."""
+    if state_backend == "fixture":
+        return FixturePreviousStateProvider(fixtures={})
+    if state_backend == "issue-comments":
+        persist_mod = _persist_retrospective_run_module()
+        return persist_mod.IssueCommentPreviousStateProvider(
+            repo=repository_id,
+            target_issue=target_issue,
+            transport=persist_mod.GhCliIssueCommentTransport(),
+        )
+    raise ValueError(f"unknown state_backend: {state_backend!r}. Choices: {STATE_BACKEND_CHOICES}")
 
 
 def _finding_identity_value(candidate: dict[str, Any]) -> str | None:
@@ -1632,6 +1683,7 @@ def run_cli(
             target_issue=target_issue,
             request_id=request_id,
             idempotency_key=idempotency_key,
+            expected_previous_digest=previous_state.read_version,
             delta_results=delta_results,
         )
     return publish_request
@@ -1658,11 +1710,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--idempotency-key", required=True)
     parser.add_argument("--schema-dir", default=str(_SCRIPTS_DIR / "schemas"))
     parser.add_argument("--prompts-file", default=None, help="JSON file: {observer_id: prompt_text}")
+    parser.add_argument(
+        "--state-backend",
+        choices=STATE_BACKEND_CHOICES,
+        default="fixture",
+        help=(
+            "PreviousStateProvider backend (Issue #2238 AC1). 'fixture' (default) "
+            "preserves prior behavior (empty FixturePreviousStateProvider); "
+            "'issue-comments' reads real prior run publication comments via "
+            "persist_retrospective_run.py's IssueCommentPreviousStateProvider."
+        ),
+    )
     args = parser.parse_args(argv)
 
     prompts: dict[str, str] = {}
     if args.prompts_file:
         prompts = json.loads(Path(args.prompts_file).read_text(encoding="utf-8"))
+
+    previous_state_provider = resolve_previous_state_provider(
+        state_backend=args.state_backend,
+        repository_id=args.repository_id,
+        target_issue=args.target_issue,
+    )
 
     try:
         publish_request = run_cli(
@@ -1673,6 +1742,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             idempotency_key=args.idempotency_key,
             schema_dir=Path(args.schema_dir),
             prompts=prompts,
+            previous_state_provider=previous_state_provider,
         )
     except (ObserverWaveFailed, EvaluatorInvocationFailed, WireContractError, ValueError) as exc:
         reason_code = getattr(exc, "reason_code", type(exc).__name__)
