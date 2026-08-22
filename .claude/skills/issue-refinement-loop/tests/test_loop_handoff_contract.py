@@ -769,7 +769,7 @@ def test_production_repository_identity_cannot_be_bypassed_by_default():
     parser.add_argument("--fake-contract-review-file", default=None)
     parser.add_argument("--prompt-id", default=None)
     parser.add_argument("--no-audit", action="store_true")
-    args = parser.parse_args(["--issue-number", "2272", "--repo", "squne121/loop-protocol"])
+    parser.parse_args(["--issue-number", "2272", "--repo", "squne121/loop-protocol"])
 
     import inspect as _inspect
 
