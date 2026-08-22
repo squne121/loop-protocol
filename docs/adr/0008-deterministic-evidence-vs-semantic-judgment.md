@@ -3,7 +3,7 @@ adr_id: "0008"
 title: "Deterministic Evidence vs Model-Based Semantic Judgment の役割分担"
 summary_ja: "決定論的に確認できる事実は script に委譲し、意味論的な設計判断は LLM の推論に委ねるという役割分担原則を定める決定記録。issue-refinement-loop が semantic design finding を未解決のまま処理完了扱いにした構造的欠陥（#2273）を踏まえ、deterministic gate と LLM semantic review lane の併用を採用する。"
 status: proposed
-decision_date: "2026-08-22"
+decision_date: null
 confirmed_date: null
 related_issues:
   - "#2295"
