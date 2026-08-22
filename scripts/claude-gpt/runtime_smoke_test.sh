@@ -159,15 +159,11 @@ FAKE_GH_WRAPPER_EOF
   # source of run-to-run flakiness unrelated to AC1/AC2 correctness.
   CANARY_TITLE="claude-gpt runtime_smoke_test issue_create scenario probe (${TIMESTAMP})"
   ISSUE_CREATE_STDERR_LOG="${ISSUE_CREATE_WORKDIR}/launch.stderr.log"
-
-  ISSUE_CREATE_PROMPT="Use the Task tool to invoke the issue-creator SubAgent \
-(subagent_type: \"issue-creator\"). Instruct it to follow the standard \
-create-issue skill procedure (dedupe read via 'gh issue list', then \
-create_issue_txn.py, then readback) to create exactly one new Issue in repo \
-\"squne121/loop-protocol\" with this exact title: \"${CANARY_TITLE}\" and this \
-exact body:
-
-## Acceptance Criteria
+  ISSUE_CREATE_EXPECTED_REPO="squne121/loop-protocol"
+  # Issue #2306 AC1: kept as a real variable (not inlined twice) so the
+  # post-run readback below can assert exact body equality against the same
+  # text the prompt actually requested, instead of only checking presence.
+  CANARY_BODY="## Acceptance Criteria
 
 - [ ] AC1: probe
 
@@ -179,7 +175,16 @@ true  # AC1
 
 ## Allowed Paths
 
-- scripts/claude-gpt/**
+- scripts/claude-gpt/**"
+
+  ISSUE_CREATE_PROMPT="Use the Task tool to invoke the issue-creator SubAgent \
+(subagent_type: \"issue-creator\"). Instruct it to follow the standard \
+create-issue skill procedure (dedupe read via 'gh issue list', then \
+create_issue_txn.py, then readback) to create exactly one new Issue in repo \
+\"${ISSUE_CREATE_EXPECTED_REPO}\" with this exact title: \"${CANARY_TITLE}\" and this \
+exact body:
+
+${CANARY_BODY}
 
 Do not perform any other GitHub read or write operation. After the SubAgent \
 finishes, report only: DONE"
@@ -197,13 +202,29 @@ finishes, report only: DONE"
   # --- authoritative readback: fake provider の state file を正本として判定する
   #     （SubAgent の自己申告テキストは observability 用途のみで、PASS/FAIL 判定
   #     には使わない）。 ---
-  ISSUE_CREATE_READBACK_JSON=$(FAKE_GH_STATE="$FAKE_GH_STATE" CANARY_TITLE="$CANARY_TITLE" python3 <<'ISSUE_CREATE_READBACK_PY_EOF'
+  # Issue #2306 AC1: the PASS judgment is strengthened beyond "an Issue with
+  # the expected title exists somewhere in state" -- it now requires exactly
+  # one Issue in fake-provider state (total_issues == 1), and that that one
+  # Issue's repo / title / body / state all match what the prompt requested
+  # (in addition to launch_exit_code == 0, checked below).
+  ISSUE_CREATE_READBACK_JSON=$(FAKE_GH_STATE="$FAKE_GH_STATE" CANARY_TITLE="$CANARY_TITLE" CANARY_BODY="$CANARY_BODY" ISSUE_CREATE_EXPECTED_REPO="$ISSUE_CREATE_EXPECTED_REPO" python3 <<'ISSUE_CREATE_READBACK_PY_EOF'
 import json
 import os
 
 state_path = os.environ.get("FAKE_GH_STATE")
 title = os.environ.get("CANARY_TITLE")
-result = {"matched": False, "issue_number": None, "issue_url": None, "total_issues": 0}
+expected_body = os.environ.get("CANARY_BODY")
+expected_repo = os.environ.get("ISSUE_CREATE_EXPECTED_REPO")
+result = {
+    "matched": False,
+    "issue_number": None,
+    "issue_url": None,
+    "total_issues": 0,
+    "title_match": False,
+    "repo_match": False,
+    "body_match": False,
+    "state_open": False,
+}
 if state_path and os.path.exists(state_path):
     with open(state_path, encoding="utf-8") as fh:
         state = json.load(fh)
@@ -211,10 +232,20 @@ if state_path and os.path.exists(state_path):
     result["total_issues"] = len(issues)
     for number, info in issues.items():
         if info.get("title") == title:
-            result["matched"] = True
+            result["title_match"] = True
             result["issue_number"] = int(number)
             result["issue_url"] = info.get("url")
+            result["repo_match"] = info.get("repo") == expected_repo
+            result["body_match"] = (info.get("body") or "").rstrip(chr(10)) == (expected_body or "").rstrip(chr(10))
+            result["state_open"] = info.get("state") == "open"
             break
+    result["matched"] = (
+        result["total_issues"] == 1
+        and result["title_match"]
+        and result["repo_match"]
+        and result["body_match"]
+        and result["state_open"]
+    )
 print(json.dumps(result))
 ISSUE_CREATE_READBACK_PY_EOF
 )
