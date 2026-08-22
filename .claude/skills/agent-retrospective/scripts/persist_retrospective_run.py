@@ -431,7 +431,11 @@ def _iter_run_records(
 def find_by_idempotency_key(
     transport: "IssueCommentTransportProtocol", repo: str, issue_number: int, idempotency_key: str
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    matches = [item for item in _iter_run_records(transport, repo, issue_number) if item[1].get("idempotency_key") == idempotency_key]
+    matches = [
+        item
+        for item in _iter_run_records(transport, repo, issue_number)
+        if item[1].get("idempotency_key") == idempotency_key
+    ]
     if not matches:
         return None
     matches.sort(key=lambda item: item[0].get("id", 0))
@@ -441,7 +445,11 @@ def find_by_idempotency_key(
 def find_by_request_id(
     transport: "IssueCommentTransportProtocol", repo: str, issue_number: int, request_id: str
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    matches = [item for item in _iter_run_records(transport, repo, issue_number) if item[1].get("request_id") == request_id]
+    matches = [
+        item
+        for item in _iter_run_records(transport, repo, issue_number)
+        if item[1].get("request_id") == request_id
+    ]
     if not matches:
         return None
     matches.sort(key=lambda item: item[0].get("id", 0))
@@ -470,7 +478,11 @@ def find_latest_run_record(
 def find_siblings_by_parent_digest(
     transport: "IssueCommentTransportProtocol", repo: str, issue_number: int, parent_record_digest: str | None
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    return [item for item in _iter_run_records(transport, repo, issue_number) if item[1].get("parent_record_digest") == parent_record_digest]
+    return [
+        item
+        for item in _iter_run_records(transport, repo, issue_number)
+        if item[1].get("parent_record_digest") == parent_record_digest
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +654,9 @@ def _load_authorization_receipt(path: Path) -> dict[str, Any]:
         raise AuthorizationDenied("receipt missing/incorrect schema_version", reason_code="receipt_schema_mismatch")
     missing = HUMAN_AUTHORIZATION_RECEIPT_REQUIRED_FIELDS - set(receipt.keys())
     if missing:
-        raise AuthorizationDenied(f"receipt missing required field(s): {sorted(missing)}", reason_code="receipt_incomplete")
+        raise AuthorizationDenied(
+            f"receipt missing required field(s): {sorted(missing)}", reason_code="receipt_incomplete"
+        )
     return receipt
 
 
@@ -687,7 +701,10 @@ def confirm_human_authorization(
         return
 
     if ctx.tty_confirm is not None and ctx.is_tty():
-        prompt = f"Publish agent-retrospective run to {repository_id}#{target_issue}? publication_digest={publication_digest}"
+        prompt = (
+            f"Publish agent-retrospective run to {repository_id}#{target_issue}? "
+            f"publication_digest={publication_digest}"
+        )
         if ctx.tty_confirm(prompt):
             return
         raise AuthorizationDenied("TTY confirmation declined", reason_code="tty_declined")
@@ -750,10 +767,14 @@ def _scan_value_patterns(value: Any, path: str = "$") -> None:
         return
     if isinstance(value, str):
         if _ABSOLUTE_PATH_RE.search(value):
-            raise PublicSafetyViolation(f"absolute local path pattern detected at {path}", reason_code="absolute_path_detected")
+            raise PublicSafetyViolation(
+                f"absolute local path pattern detected at {path}", reason_code="absolute_path_detected"
+            )
         for pattern in _TOKEN_PATTERNS:
             if pattern.search(value):
-                raise PublicSafetyViolation(f"credential/token pattern detected at {path}", reason_code="token_pattern_detected")
+                raise PublicSafetyViolation(
+                    f"credential/token pattern detected at {path}", reason_code="token_pattern_detected"
+                )
 
 
 def run_public_safety_validator(envelope: dict[str, Any]) -> None:
@@ -776,7 +797,9 @@ def run_public_safety_validator(envelope: dict[str, Any]) -> None:
     raises."""
     extra = set(envelope.keys()) - PUBLIC_SAFETY_ALLOWED_TOP_LEVEL_FIELDS
     if extra:
-        raise PublicSafetyViolation(f"disallowed top-level field(s): {sorted(extra)}", reason_code="field_not_allowlisted")
+        raise PublicSafetyViolation(
+            f"disallowed top-level field(s): {sorted(extra)}", reason_code="field_not_allowlisted"
+        )
 
     rr_mod = _run_retrospective_module()
     try:
@@ -926,8 +949,12 @@ class IssueCommentPreviousStateProvider:
                 for comment in self._transport.list_comments(repo=self._repo, issue_number=self._target_issue)
             )
             if legacy_present:
-                return rr_mod.PreviousStateResult(status="legacy_unavailable", previous_run_ref=None, candidates=[], read_version=None)
-            return rr_mod.PreviousStateResult(status="no_history", previous_run_ref=None, candidates=[], read_version=None)
+                return rr_mod.PreviousStateResult(
+                    status="legacy_unavailable", previous_run_ref=None, candidates=[], read_version=None
+                )
+            return rr_mod.PreviousStateResult(
+                status="no_history", previous_run_ref=None, candidates=[], read_version=None
+            )
 
         matching.sort(key=lambda item: item[0].get("id", 0))
         comment, envelope = matching[-1]
@@ -937,7 +964,12 @@ class IssueCommentPreviousStateProvider:
 
         source_observations = envelope.get("run", {}).get("source_observations", [])
         if any(obs.get("pagination_completeness") == "partial" for obs in source_observations):
-            return rr_mod.PreviousStateResult(status="partial", previous_run_ref=previous_run_ref, candidates=candidates, read_version=read_version)
+            return rr_mod.PreviousStateResult(
+                status="partial",
+                previous_run_ref=previous_run_ref,
+                candidates=candidates,
+                read_version=read_version,
+            )
 
         generated_at = envelope.get("run", {}).get("run_identity", {}).get("generated_at")
         if generated_at:
@@ -948,9 +980,19 @@ class IssueCommentPreviousStateProvider:
             if generated_dt is not None:
                 age_seconds = (self._clock() - generated_dt).total_seconds()
                 if age_seconds > STALE_AFTER_SECONDS:
-                    return rr_mod.PreviousStateResult(status="stale", previous_run_ref=previous_run_ref, candidates=candidates, read_version=read_version)
+                    return rr_mod.PreviousStateResult(
+                        status="stale",
+                        previous_run_ref=previous_run_ref,
+                        candidates=candidates,
+                        read_version=read_version,
+                    )
 
-        return rr_mod.PreviousStateResult(status="available", previous_run_ref=previous_run_ref, candidates=candidates, read_version=read_version)
+        return rr_mod.PreviousStateResult(
+            status="available",
+            previous_run_ref=previous_run_ref,
+            candidates=candidates,
+            read_version=read_version,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1071,7 +1113,9 @@ def publish_run(
 
     errors: list[str] = []
     try:
-        verify_readback_digest(transport, repo, comment_id=comment["id"], expected_publication_digest=publication_digest)
+        verify_readback_digest(
+            transport, repo, comment_id=comment["id"], expected_publication_digest=publication_digest
+        )
     except ReadbackVerificationFailed as exc:
         errors.append(str(exc))
 
@@ -1132,9 +1176,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     try:
-        result = publish_run(publish_request=publish_request, repo=args.repo, transport=transport, auth_ctx=auth_ctx, scope=args.scope)
+        result = publish_run(
+            publish_request=publish_request,
+            repo=args.repo,
+            transport=transport,
+            auth_ctx=auth_ctx,
+            scope=args.scope,
+        )
     except (AuthorizationDenied, PublicSafetyViolation, PublicationConflict, StaleWriteDetected) as exc:
-        print(json.dumps({"status": "failed", "reason_code": getattr(exc, "reason_code", "error"), "reason": str(exc)}, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "reason_code": getattr(exc, "reason_code", "error"),
+                    "reason": str(exc),
+                },
+                sort_keys=True,
+            )
+        )
         return 1
 
     print(json.dumps(dataclasses.asdict(result), sort_keys=True))

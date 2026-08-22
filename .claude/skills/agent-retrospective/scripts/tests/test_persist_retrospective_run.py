@@ -135,7 +135,9 @@ def _iso(value: dt.datetime) -> str:
     return value.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _valid_receipt(*, publication_digest: str, repository_id: str, target_issue: int, request_id: str) -> dict[str, Any]:
+def _valid_receipt(
+    *, publication_digest: str, repository_id: str, target_issue: int, request_id: str
+) -> dict[str, Any]:
     return {
         "schema_version": pr.HUMAN_AUTHORIZATION_RECEIPT_SCHEMA,
         "request_id": request_id,
@@ -229,7 +231,18 @@ def test_production_provider_used_fixture_backend_is_still_fixture(monkeypatch: 
     monkeypatch.setattr(rr, "run_cli", fake_run_cli)
 
     # WHEN main() runs without --state-backend
-    rr.main(["--repository-id", _REPO_ID, "--target-issue", str(_TARGET_ISSUE), "--request-id", "req", "--idempotency-key", "idem"])
+    rr.main(
+        [
+            "--repository-id",
+            _REPO_ID,
+            "--target-issue",
+            str(_TARGET_ISSUE),
+            "--request-id",
+            "req",
+            "--idempotency-key",
+            "idem",
+        ]
+    )
 
     # THEN the exact prior fixture behavior is preserved byte-for-byte
     assert isinstance(captured["provider"], rr.FixturePreviousStateProvider)
@@ -269,11 +282,15 @@ def _wrapper_payload(structured_output: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ok_agent_result(payload: dict[str, Any]) -> rr.AgentInvocationResult:
-    return rr.AgentInvocationResult(status="ok", structured_output=payload, raw_stdout_excerpt=None, exit_code=0, reason_code=None)
+    return rr.AgentInvocationResult(
+        status="ok", structured_output=payload, raw_stdout_excerpt=None, exit_code=0, reason_code=None
+    )
 
 
 def _observer_request(agent_name: str) -> rr.AgentInvocationRequest:
-    return rr.AgentInvocationRequest(agent_name=agent_name, prompt="observe", json_schema_path="/tmp/schema.json", cwd="/repo")
+    return rr.AgentInvocationRequest(
+        agent_name=agent_name, prompt="observe", json_schema_path="/tmp/schema.json", cwd="/repo"
+    )
 
 
 def _make_observer_invoke(run_id: str, digest: str):
@@ -368,7 +385,13 @@ def test_read_version_propagates_to_expected_previous_digest_none_when_no_histor
 
 def test_publish_request_produces_publication_digest() -> None:
     candidate = _new_candidate()
-    delta_results = [{"finding_identity": candidate["finding_contract"]["identity"]["value"], "evaluation_status": "classified", "delta_status": "new"}]
+    delta_results = [
+        {
+            "finding_identity": candidate["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "new",
+        }
+    ]
 
     # WHEN build_run_envelope() consumes a PUBLISH_REQUEST_V1-shaped input
     envelope = pr.build_run_envelope(
@@ -418,7 +441,9 @@ def test_authorization_gate_blocks_without_receipt_or_confirmation() -> None:
     ctx = pr.AuthorizationContext()  # neither a receipt path nor a tty_confirm callback
 
     with pytest.raises(pr.AuthorizationDenied) as excinfo:
-        pr.publish_run(publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z")
+        pr.publish_run(
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z"
+        )
 
     assert excinfo.value.reason_code == "authorization_missing"
     assert transport.create_call_count == 0
@@ -430,7 +455,9 @@ def test_authorization_gate_blocks_when_tty_confirm_present_but_not_a_tty() -> N
     ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: True, is_tty=lambda: False)
 
     with pytest.raises(pr.AuthorizationDenied) as excinfo:
-        pr.publish_run(publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z")
+        pr.publish_run(
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z"
+        )
 
     assert excinfo.value.reason_code == "authorization_missing"
     assert transport.create_call_count == 0
@@ -442,7 +469,9 @@ def test_authorization_gate_blocks_when_tty_confirm_declines() -> None:
     ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: False, is_tty=lambda: True)
 
     with pytest.raises(pr.AuthorizationDenied) as excinfo:
-        pr.publish_run(publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z")
+        pr.publish_run(
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z"
+        )
 
     assert excinfo.value.reason_code == "tty_declined"
     assert transport.create_call_count == 0
@@ -485,9 +514,13 @@ def test_authorization_gate_succeeds_with_valid_receipt(tmp_path: Path) -> None:
             )
         )
     )
-    ctx = pr.AuthorizationContext(receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 5, tzinfo=dt.timezone.utc))
+    ctx = pr.AuthorizationContext(
+        receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 5, tzinfo=dt.timezone.utc)
+    )
 
-    result = pr.publish_run(publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at=generated_at)
+    result = pr.publish_run(
+        publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at=generated_at
+    )
 
     assert result.status == "published"
     assert transport.create_call_count == 1
@@ -517,10 +550,14 @@ def test_authorization_gate_rejects_expired_receipt(tmp_path: Path) -> None:
     receipt["expires_at"] = "2020-01-01T00:00:00Z"
     receipt_path = tmp_path / "receipt.json"
     receipt_path.write_text(json.dumps(receipt))
-    ctx = pr.AuthorizationContext(receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 5, tzinfo=dt.timezone.utc))
+    ctx = pr.AuthorizationContext(
+        receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 5, tzinfo=dt.timezone.utc)
+    )
 
     with pytest.raises(pr.AuthorizationDenied) as excinfo:
-        pr.publish_run(publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at=generated_at)
+        pr.publish_run(
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at=generated_at
+        )
 
     assert excinfo.value.reason_code == "receipt_expired"
     assert transport.create_call_count == 0
@@ -536,7 +573,10 @@ def test_idempotency_key_noop_vs_conflict() -> None:
     candidate = _new_candidate()
     run_identity = {"run_id": "r1", "base_sha": _FULL_SHA, "source_set_digest": _DIGEST}
     idempotency_key = pr.compute_idempotency_key(
-        repository_id=_REPO_ID, base_sha=run_identity["base_sha"], source_set_digest=run_identity["source_set_digest"], scope=pr.DEFAULT_SCOPE
+        repository_id=_REPO_ID,
+        base_sha=run_identity["base_sha"],
+        source_set_digest=run_identity["source_set_digest"],
+        scope=pr.DEFAULT_SCOPE,
     )
 
     envelope = pr.build_run_envelope(
@@ -554,7 +594,11 @@ def test_idempotency_key_noop_vs_conflict() -> None:
 
     # WHEN the SAME idempotency_key + SAME publication_digest is evaluated
     decision, existing = pr.evaluate_idempotency(
-        transport, _REPO, _TARGET_ISSUE, idempotency_key=idempotency_key, publication_digest=envelope["publication_digest"]
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        idempotency_key=idempotency_key,
+        publication_digest=envelope["publication_digest"],
     )
     # THEN it is a no_op (existing record found, byte-identical content)
     assert decision == "no_op"
@@ -577,15 +621,23 @@ def test_idempotency_key_noop_vs_conflict() -> None:
     # the recomputed idempotency key is identical (same repository_id/base_sha/source_set_digest/scope)
     assert other_envelope["idempotency_key"] == idempotency_key
     decision2, existing2 = pr.evaluate_idempotency(
-        transport, _REPO, _TARGET_ISSUE, idempotency_key=idempotency_key, publication_digest=other_envelope["publication_digest"]
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        idempotency_key=idempotency_key,
+        publication_digest=other_envelope["publication_digest"],
     )
     # THEN it is a conflict
     assert decision2 == "conflict"
     assert existing2 is not None
 
     # WHEN a genuinely NEW idempotency key (different base_sha) is evaluated
-    new_key = pr.compute_idempotency_key(repository_id=_REPO_ID, base_sha="b" * 40, source_set_digest=_DIGEST, scope=pr.DEFAULT_SCOPE)
-    decision3, existing3 = pr.evaluate_idempotency(transport, _REPO, _TARGET_ISSUE, idempotency_key=new_key, publication_digest="sha256:" + "0" * 64)
+    new_key = pr.compute_idempotency_key(
+        repository_id=_REPO_ID, base_sha="b" * 40, source_set_digest=_DIGEST, scope=pr.DEFAULT_SCOPE
+    )
+    decision3, existing3 = pr.evaluate_idempotency(
+        transport, _REPO, _TARGET_ISSUE, idempotency_key=new_key, publication_digest="sha256:" + "0" * 64
+    )
     # THEN it is a fresh publish
     assert decision3 == "publish"
     assert existing3 is None
@@ -609,7 +661,10 @@ def test_idempotency_key_recomputed_not_trusted_from_caller() -> None:
         generated_at="2026-08-22T00:00:00Z",
     )
     recomputed = pr.compute_idempotency_key(
-        repository_id=_REPO_ID, base_sha=run_identity["base_sha"], source_set_digest=run_identity["source_set_digest"], scope=pr.DEFAULT_SCOPE
+        repository_id=_REPO_ID,
+        base_sha=run_identity["base_sha"],
+        source_set_digest=run_identity["source_set_digest"],
+        scope=pr.DEFAULT_SCOPE,
     )
     assert envelope["idempotency_key"] == recomputed
 
@@ -646,7 +701,12 @@ def test_optimistic_concurrency_best_effort_conflict_detection() -> None:
     # WHEN a stale expected_previous_digest disagrees with the current head
     with pytest.raises(pr.StaleWriteDetected) as excinfo:
         pr.check_optimistic_concurrency_precondition(
-            transport, _REPO, _TARGET_ISSUE, repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, expected_previous_digest="sha256:" + "0" * 64
+            transport,
+            _REPO,
+            _TARGET_ISSUE,
+            repository_id=_REPO_ID,
+            scope=pr.DEFAULT_SCOPE,
+            expected_previous_digest="sha256:" + "0" * 64,
         )
     assert excinfo.value.reason_code == "stale_expected_previous_digest"
 
@@ -654,7 +714,12 @@ def test_optimistic_concurrency_best_effort_conflict_detection() -> None:
     # window the best-effort guard cannot fully close -- GitHub Issue
     # comment creation is not atomic compare-and-swap)
     head1 = pr.check_optimistic_concurrency_precondition(
-        transport, _REPO, _TARGET_ISSUE, repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, expected_previous_digest=envelope0["publication_digest"]
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        repository_id=_REPO_ID,
+        scope=pr.DEFAULT_SCOPE,
+        expected_previous_digest=envelope0["publication_digest"],
     )
     assert head1 == envelope0["publication_digest"]
 
@@ -680,7 +745,9 @@ def test_optimistic_concurrency_best_effort_conflict_detection() -> None:
         parent_record_digest=head1,
         generated_at="2026-08-22T02:00:00Z",
     )
-    comment_a = transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope_a))
+    comment_a = transport.create_comment(
+        repo=_REPO, issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope_a)
+    )
     transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope_b))
 
     # WHEN the post-write rescan runs for run A (AC6 step (c)/(d))
@@ -692,7 +759,11 @@ def test_optimistic_concurrency_best_effort_conflict_detection() -> None:
 
     # AND a record with a unique parent has no sibling conflict
     no_conflict = pr.detect_post_write_sibling_conflict(
-        transport, _REPO, _TARGET_ISSUE, parent_record_digest=envelope_a["publication_digest"], own_comment_id=comment_a["id"]
+        transport,
+        _REPO,
+        _TARGET_ISSUE,
+        parent_record_digest=envelope_a["publication_digest"],
+        own_comment_id=comment_a["id"],
     )
     assert no_conflict is False
 
@@ -720,22 +791,33 @@ def test_canonical_get_readback_digest_match() -> None:
 
     # WHEN readback verification runs against the just-created comment
     # THEN it succeeds (no exception)
-    pr.verify_readback_digest(transport, _REPO, comment_id=comment["id"], expected_publication_digest=envelope["publication_digest"])
+    pr.verify_readback_digest(
+        transport, _REPO, comment_id=comment["id"], expected_publication_digest=envelope["publication_digest"]
+    )
 
     # AND it is insensitive to raw Markdown formatting differences -- only
     # the canonical (sha256-jcs-v1) digest is compared, never raw bytes
-    marker = f'<!-- agent_retrospective_run:v1 repository_id={envelope["repository_id"]} idempotency_key={envelope["idempotency_key"]} -->'
+    marker = (
+        f"<!-- agent_retrospective_run:v1 repository_id={envelope['repository_id']} "
+        f"idempotency_key={envelope['idempotency_key']} -->"
+    )
     reformatted_fenced = "```json\n" + json.dumps(envelope, indent=4, sort_keys=True) + "\n```"
     reformatted_body = f"{marker}\n\n{reformatted_fenced}\n"
     assert reformatted_body != pr.render_comment_body(envelope)  # genuinely different raw bytes
     comment2 = transport.create_comment(repo=_REPO, issue_number=_TARGET_ISSUE, body=reformatted_body)
-    pr.verify_readback_digest(transport, _REPO, comment_id=comment2["id"], expected_publication_digest=envelope["publication_digest"])
+    pr.verify_readback_digest(
+        transport, _REPO, comment_id=comment2["id"], expected_publication_digest=envelope["publication_digest"]
+    )
 
     # AND a tampered stored body IS caught
-    tampered_body = transport._comments[comment["id"]]["body"].replace(candidate["candidate_id"], "tampered-candidate-id")
+    tampered_body = transport._comments[comment["id"]]["body"].replace(
+        candidate["candidate_id"], "tampered-candidate-id"
+    )
     transport._comments[comment["id"]]["body"] = tampered_body
     with pytest.raises(pr.ReadbackVerificationFailed) as excinfo:
-        pr.verify_readback_digest(transport, _REPO, comment_id=comment["id"], expected_publication_digest=envelope["publication_digest"])
+        pr.verify_readback_digest(
+            transport, _REPO, comment_id=comment["id"], expected_publication_digest=envelope["publication_digest"]
+        )
     assert excinfo.value.reason_code in ("readback_self_digest_mismatch", "readback_expected_digest_mismatch")
 
 
@@ -745,9 +827,15 @@ def test_canonical_get_readback_digest_match() -> None:
 
 
 def test_candidate_finding_delta_full_roundtrip() -> None:
-    candidate = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.recurrent_regressed.valid.json")
+    candidate = _validate_mod.load_fixture(
+        "agent_improvement_candidate_v1.finding_contract.recurrent_regressed.valid.json"
+    )
     delta_results = [
-        {"finding_identity": candidate["finding_contract"]["identity"]["value"], "evaluation_status": "classified", "delta_status": "recurrent"}
+        {
+            "finding_identity": candidate["finding_contract"]["identity"]["value"],
+            "evaluation_status": "classified",
+            "delta_status": "recurrent",
+        }
     ]
     envelope = pr.build_run_envelope(
         repository_id=_REPO_ID,
@@ -770,8 +858,14 @@ def test_candidate_finding_delta_full_roundtrip() -> None:
     assert parsed["candidate_records"] == [candidate]
     assert parsed["delta_results"] == delta_results
     assert parsed["candidate_records"][0]["finding_contract"]["identity"] == candidate["finding_contract"]["identity"]
-    assert parsed["candidate_records"][0]["finding_contract"]["claim_class"] == candidate["finding_contract"]["claim_class"]
-    assert parsed["candidate_records"][0]["finding_contract"]["evaluations"] == candidate["finding_contract"]["evaluations"]
+    assert (
+        parsed["candidate_records"][0]["finding_contract"]["claim_class"]
+        == candidate["finding_contract"]["claim_class"]
+    )
+    assert (
+        parsed["candidate_records"][0]["finding_contract"]["evaluations"]
+        == candidate["finding_contract"]["evaluations"]
+    )
 
     # AND the round-tripped candidate is still canonical-schema-valid
     _validate_mod.validate_candidate(parsed["candidate_records"][0])
@@ -826,7 +920,8 @@ def test_previous_state_status_classification_legacy_unavailable() -> None:
     # a pre-#2238 retrospective-adjacent comment this module cannot parse as
     # its own envelope (no fenced JSON block, doesn't match the marker)
     transport.seed_comment(
-        issue_number=_TARGET_ISSUE, body="agent_retrospective_run notes from before Issue #2238 (free text, no structured envelope)"
+        issue_number=_TARGET_ISSUE,
+        body="agent_retrospective_run notes from before Issue #2238 (free text, no structured envelope)",
     )
     provider = pr.IssueCommentPreviousStateProvider(repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport)
 
@@ -851,7 +946,9 @@ def test_previous_state_status_classification_available() -> None:
         generated_at=_iso(now - dt.timedelta(hours=1)),
     )
     transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope))
-    provider = pr.IssueCommentPreviousStateProvider(repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, clock=lambda: now)
+    provider = pr.IssueCommentPreviousStateProvider(
+        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, clock=lambda: now
+    )
 
     result = provider.get(repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-jcs-v1")
 
@@ -876,7 +973,9 @@ def test_previous_state_status_classification_partial() -> None:
         pagination_completeness="partial",
     )
     transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope))
-    provider = pr.IssueCommentPreviousStateProvider(repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, clock=lambda: now)
+    provider = pr.IssueCommentPreviousStateProvider(
+        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, clock=lambda: now
+    )
 
     result = provider.get(repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-jcs-v1")
 
@@ -898,7 +997,9 @@ def test_previous_state_status_classification_stale() -> None:
         generated_at=_iso(now - dt.timedelta(days=30)),
     )
     transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(envelope))
-    provider = pr.IssueCommentPreviousStateProvider(repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, clock=lambda: now)
+    provider = pr.IssueCommentPreviousStateProvider(
+        repo=_REPO, target_issue=_TARGET_ISSUE, transport=transport, clock=lambda: now
+    )
 
     result = provider.get(repository_id=_REPO_ID, scope=pr.DEFAULT_SCOPE, finding_identity_algorithm="sha256-jcs-v1")
 
@@ -961,7 +1062,9 @@ def test_ambiguous_post_failure_recovery_by_request_id_conflict_on_digest_mismat
     # server-side (e.g. a prior distinct attempt)
     other_envelope = dict(envelope)
     other_envelope["candidate_records"] = []
-    other_envelope["publication_digest"] = pr.compute_publication_digest({k: v for k, v in other_envelope.items() if k != "publication_digest"})
+    other_envelope["publication_digest"] = pr.compute_publication_digest(
+        {k: v for k, v in other_envelope.items() if k != "publication_digest"}
+    )
     transport.seed_comment(issue_number=_TARGET_ISSUE, body=pr.render_comment_body(other_envelope))
     transport.queue_create_side_effect(pr.AmbiguousTransportError("simulated timeout"), also_create=False)
 
@@ -1042,14 +1145,21 @@ def test_index_update_failure_does_not_rollback_primary_record(tmp_path: Path) -
             )
         )
     )
-    ctx = pr.AuthorizationContext(receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 5, tzinfo=dt.timezone.utc))
+    ctx = pr.AuthorizationContext(
+        receipt_path=receipt_path, clock=lambda: dt.datetime(2026, 8, 22, 0, 5, tzinfo=dt.timezone.utc)
+    )
 
     def _failing_index_updater() -> None:
         raise RuntimeError("index update boom")
 
     # WHEN the primary POST succeeds but the derived-index update fails
     result = pr.publish_run(
-        publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at=generated_at, index_updater=_failing_index_updater
+        publish_request=pub_req,
+        repo=_REPO,
+        transport=transport,
+        auth_ctx=ctx,
+        generated_at=generated_at,
+        index_updater=_failing_index_updater,
     )
 
     # THEN status is published_index_stale -- distinct from a hard failure
@@ -1097,11 +1207,15 @@ def test_public_safety_validator_runs_before_post_rejects_token_pattern() -> Non
             "note": "leaked credential ghp_abcdefghijklmnopqrstuvwxyz012345",
         }
     ]
-    pub_req = _publish_request_dict(candidate_records=[candidate], delta_results=tainted_delta, request_id="req-ac12-token")
+    pub_req = _publish_request_dict(
+        candidate_records=[candidate], delta_results=tainted_delta, request_id="req-ac12-token"
+    )
     ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: True, is_tty=lambda: True)
 
     with pytest.raises(pr.PublicSafetyViolation) as excinfo:
-        pr.publish_run(publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z")
+        pr.publish_run(
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z"
+        )
 
     assert excinfo.value.reason_code == "token_pattern_detected"
     # the validator ran BEFORE any POST -- no comment was created
@@ -1119,11 +1233,15 @@ def test_public_safety_validator_runs_before_post_rejects_absolute_path() -> Non
             "note": "found at /home/squne/secrets/credentials.json",
         }
     ]
-    pub_req = _publish_request_dict(candidate_records=[candidate], delta_results=tainted_delta, request_id="req-ac12-path")
+    pub_req = _publish_request_dict(
+        candidate_records=[candidate], delta_results=tainted_delta, request_id="req-ac12-path"
+    )
     ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: True, is_tty=lambda: True)
 
     with pytest.raises(pr.PublicSafetyViolation) as excinfo:
-        pr.publish_run(publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z")
+        pr.publish_run(
+            publish_request=pub_req, repo=_REPO, transport=transport, auth_ctx=ctx, generated_at="2026-08-22T00:00:00Z"
+        )
 
     assert excinfo.value.reason_code == "absolute_path_detected"
     assert transport.create_call_count == 0
