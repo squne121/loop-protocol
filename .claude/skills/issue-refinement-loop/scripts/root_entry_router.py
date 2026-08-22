@@ -626,13 +626,14 @@ def run_root_transition(
     if not capability_ok:
         return _finish(_stop_route(issue_number, "capability_or_identity_unverifiable"), False)
 
-    if expected_repository_identity is not None:
-        try:
-            observed_identity = transport.canonical_repository_identity()
-        except Exception:
-            observed_identity = None
-        if observed_identity != expected_repository_identity:
-            return _finish(_stop_route(issue_number, "repository_identity_mismatch"), False)
+    if expected_repository_identity is None:
+        return _finish(_stop_route(issue_number, "expected_repository_identity_required"), False)
+    try:
+        observed_identity = transport.canonical_repository_identity()
+    except Exception:
+        observed_identity = None
+    if observed_identity != expected_repository_identity:
+        return _finish(_stop_route(issue_number, "repository_identity_mismatch"), False)
 
     def _fetch() -> tuple[bool, dict]:
         try:

@@ -145,6 +145,7 @@ def test_ac3_fresh_review_go_and_live_equality_invokes_step1():
     result = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport,
         contract_reviewer=_go_reviewer(body="issue body"),
         invoke_step1=lambda: invoked_count.append(1),
@@ -253,6 +254,7 @@ def test_ac11_capability_preflight_blocked_stops_before_mutation():
     result = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport,
         contract_reviewer=_go_reviewer(),
         invoke_step1=lambda: invoked.append(1),
@@ -277,6 +279,7 @@ def test_ac12_no_new_durable_authority_added():
     result = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=FakeTransport(),
         contract_reviewer=_go_reviewer(),
         invoke_step1=lambda: invoked.append(1),
@@ -334,6 +337,7 @@ def test_ac16_audit_publish_failure_does_not_change_route():
     result = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport,
         contract_reviewer=_go_reviewer(body="issue body"),
         invoke_step1=lambda: None,
@@ -370,6 +374,7 @@ def test_replayed_envelope_same_live_state_after_process_restart_is_rejected():
     result_a = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport,
         contract_reviewer=reviewer,
         invoke_step1=lambda: invoked.append("A"),
@@ -379,6 +384,7 @@ def test_replayed_envelope_same_live_state_after_process_restart_is_rejected():
     result_b = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport,
         contract_reviewer=reviewer,
         invoke_step1=lambda: invoked.append("B"),
@@ -404,6 +410,7 @@ def test_expected_token_must_not_be_derived_from_envelope():
     result = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=FakeTransport(),
         contract_reviewer=_go_reviewer(),
         invoke_step1=lambda: None,
@@ -424,6 +431,7 @@ def test_prompt_id_from_stdin_cannot_establish_current_root_identity():
     result_with = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport_a,
         contract_reviewer=_go_reviewer(body="body"),
         invoke_step1=lambda: invoked_with_prompt.append(1),
@@ -432,6 +440,7 @@ def test_prompt_id_from_stdin_cannot_establish_current_root_identity():
     result_without = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport_b,
         contract_reviewer=_go_reviewer(body="body"),
         invoke_step1=lambda: invoked_without_prompt.append(1),
@@ -467,6 +476,7 @@ def test_fabricated_go_with_current_hashes_without_current_review_is_rejected():
     rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=FakeTransport(body="body", base_sha="sha-1"),
         contract_reviewer=_reviewer,
         invoke_step1=lambda: None,
@@ -598,6 +608,7 @@ def test_retry_counter_cannot_be_reset_by_caller():
     result = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport,
         contract_reviewer=_go_reviewer(body="stable body"),
         invoke_step1=lambda: invoked.append(1),
@@ -630,6 +641,7 @@ def test_base_preflight_reviewed_sha_propagates_to_route_result():
     result = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport,
         contract_reviewer=_go_reviewer(body="stable body"),
         invoke_step1=lambda: invoked.append(1),
@@ -663,6 +675,7 @@ def test_partial_failure_resume_is_derived_from_post_mutation_readback():
     result_unknown = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=FakeTransport(),
         contract_reviewer=_go_reviewer(),
         invoke_step1=lambda: None,
@@ -690,6 +703,7 @@ def test_mutation_resume_from_is_derived_from_live_readback():
     result_not_yet = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport_not_yet,
         contract_reviewer=_go_reviewer(),
         invoke_step1=lambda: invoked.append(1),
@@ -713,6 +727,7 @@ def test_mutation_resume_from_is_derived_from_live_readback():
     result_already = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=transport_already,
         contract_reviewer=_go_reviewer(),
         invoke_step1=lambda: invoked_already.append(1),
@@ -777,6 +792,28 @@ def test_production_repository_identity_cannot_be_bypassed_by_default():
     assert "expected_repository_identity=args.repo" in source
 
 
+def test_missing_expected_repository_identity_fails_closed_not_skipped():
+    # Function-level regression for the P1 gap found by the adversarial
+    # re-audit: omitting `expected_repository_identity` (its permissive
+    # `None` default) must never silently skip identity verification --
+    # it must fail closed with a typed stop route instead. This protects
+    # any future in-process direct caller (per termination-policy.md's
+    # "same call stack" delivery mode) that forgets to pass the argument,
+    # not just the CLI wrapper (which is covered separately above).
+    invoked = []
+    result = rer.run_root_transition(
+        issue_number=2272,
+        repo="squne121/loop-protocol",
+        transport=FakeTransport(),
+        contract_reviewer=_go_reviewer(),
+        invoke_step1=lambda: invoked.append(1),
+    )
+    assert result["route"]["route"] == rer.ROUTE_STOP
+    assert result["route"]["reason"] == "expected_repository_identity_required"
+    assert result["invoked"] is False
+    assert invoked == []
+
+
 def test_prior_go_comment_cannot_replace_current_fresh_review():
     # Integration-shape regression for the dedupe-bypass exploit (P0-1):
     # even a `run_once`-shaped reviewer that internally deduped against a
@@ -807,6 +844,7 @@ def test_prior_go_comment_cannot_replace_current_fresh_review():
     result = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=FakeTransport(),
         contract_reviewer=lambda **kw: _dedupe_shaped_reviewer(skip_idempotency_check=True, **kw),
         invoke_step1=lambda: invoked.append(1),
@@ -873,6 +911,7 @@ def test_consumer_returns_typed_stop_on_transport_failure():
     result = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=RaisingTransport(),
         contract_reviewer=_go_reviewer(),
         invoke_step1=lambda: invoked.append(1),
@@ -888,6 +927,7 @@ def test_consumer_returns_typed_stop_on_transport_failure():
     result2 = rer.run_root_transition(
         issue_number=2272,
         repo="squne121/loop-protocol",
+        expected_repository_identity="squne121/loop-protocol",
         transport=FakeTransport(),
         contract_reviewer=RaisingReviewer(),
         invoke_step1=lambda: invoked.append(2),
