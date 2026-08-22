@@ -225,7 +225,14 @@ import sys
     # to independently verify `definition.source` from real data instead of
     # self-reporting a fixed string constant.
     agents_json_audit_raw,
-) = sys.argv[1:18]
+    # Issue #2274 PR #2285 OWNER fix-delta (iteration 2, AC12): absolute
+    # path to scripts/claude-gpt/launch.sh, used ONLY to extract the
+    # embedded SPARK_GATE_WRITER_PY source and wire the real
+    # `detect_available_models_silent_fallback()` classifier into this live
+    # evidence pipeline (see the `available_models_fallback_detection`
+    # block below). Never used for anything else.
+    launch_sh_source_path,
+) = sys.argv[1:19]
 
 HOOK_LIFECYCLE = ("SubagentStart", "SubagentStop")
 
@@ -682,6 +689,75 @@ else:
         # not appended as a reason, and never fabricated as `[]` in place
         # of the raw absent value for reporting purposes below.
 
+        # Issue #2274 PR #2285 OWNER fix-delta (iteration 2, AC12): wire the
+        # actual `detect_available_models_silent_fallback()` classifier
+        # embedded in launch.sh's SPARK_GATE_WRITER_PY source into THIS live
+        # evidence pipeline, instead of only exercising it via the
+        # synthetic-payload unit test in scripts/claude-gpt/tests/
+        # test_available_models_fallback_detection.py. No live signal
+        # anywhere in this codebase (no Claude Code hook field, no proxy log
+        # field) currently surfaces the runtime's effective `availableModels`
+        # configuration, so `available_models` below is honestly recorded as
+        # `None` (never observed, never fabricated). The detector still runs
+        # on the genuinely live `resolved_model`/`models_used` evidence
+        # already captured above -- using the exact same tested classifier
+        # as production, never a hand-duplicated reimplementation -- and its
+        # typed, fail-closed verdict is additively folded into `reasons` so
+        # a silent resolved/models_used mismatch can never be promoted to
+        # PASS through this pipeline. Only run when `resolved_model` itself
+        # is already trustworthy evidence (not None, and -- via the
+        # `models_used` gating below -- only above the modelsUsed version
+        # floor) so this addition can never turn the single, more specific
+        # `claude_code_evidence_schema_unsupported` reason into a different
+        # verdict bucket. If live `availableModels` observability is ever
+        # added to Claude Code's hook payloads, this wiring will surface the
+        # specific `available_models_excludes_requested_silent_fallback`
+        # reason without further changes here.
+        available_models_fallback_detection = None
+        if agent_info["resolved_model"] is not None:
+            try:
+                with open(launch_sh_source_path, "r", encoding="utf-8") as fh:
+                    launch_sh_text_for_detector = fh.read()
+            except OSError:
+                launch_sh_text_for_detector = None
+            if launch_sh_text_for_detector:
+                gw_begin = "# SPARK_GATE_WRITER_PY_BEGIN\n"
+                gw_end = "# SPARK_GATE_WRITER_PY_END\n"
+                gw_begin_idx = launch_sh_text_for_detector.find(gw_begin)
+                gw_end_idx = (
+                    launch_sh_text_for_detector.find(gw_end, gw_begin_idx + len(gw_begin))
+                    if gw_begin_idx != -1
+                    else -1
+                )
+                if gw_begin_idx != -1 and gw_end_idx != -1:
+                    gate_writer_source = launch_sh_text_for_detector[
+                        gw_begin_idx + len(gw_begin) : gw_end_idx
+                    ]
+                    gate_writer_ns = {}
+                    try:
+                        exec(compile(gate_writer_source, "<spark_gate_writer>", "exec"), gate_writer_ns)
+                        detector_fn = gate_writer_ns.get("detect_available_models_silent_fallback")
+                    except Exception:
+                        detector_fn = None
+                    if callable(detector_fn):
+                        detector_models_used = (
+                            agent_info["models_used"] if runtime_meets_models_used_floor else None
+                        )
+                        available_models_fallback_detection = detector_fn(
+                            {
+                                "requested_model": expected_model,
+                                "resolved_model": agent_info["resolved_model"],
+                                "models_used": detector_models_used,
+                                "available_models": None,
+                            }
+                        )
+                        if available_models_fallback_detection.get("status") != "pass":
+                            reasons.append(
+                                "ac12_silent_fallback_detector_%s"
+                                % available_models_fallback_detection.get("reason")
+                            )
+        agent_info["available_models_fallback_detection"] = available_models_fallback_detection
+
 # --- Proxy log slice, bounded by the hook-time byte-offset window computed
 #     above (`lifecycle_window`), never by an invocation-wide
 #     before/after-the-whole-launch.sh-call approximation (Issue #2274
@@ -940,7 +1016,7 @@ print(json.dumps(result))
       "$CLAUDE_GPT_SPARK_AGENT_NAME" "$CLAUDE_GPT_SPARK_MODEL" "$SPARK_MARKER" \
       "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
       "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" "$SPARK_CLAUDE_CODE_VERSION" "$TIMESTAMP" \
-      "$SPARK_PROXY_SNAPSHOT_STAT_JSON" "$SPARK_AGENTS_JSON_AUDIT_RAW")
+      "$SPARK_PROXY_SNAPSHOT_STAT_JSON" "$SPARK_AGENTS_JSON_AUDIT_RAW" "$SUT_LAUNCHER_PATH")
     rm -f "$spark_stdout_file" "$spark_proxy_log_snapshot"
 
     SPARK_ATTEMPTED=$(printf '%s' "$SPARK_EVIDENCE_JSON" | python3 -c '

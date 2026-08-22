@@ -56,6 +56,13 @@ import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 RUNTIME_SMOKE_SH = pathlib.Path(__file__).resolve().parents[1] / "runtime_smoke_test.sh"
+# Issue #2274 PR #2285 OWNER fix-delta (iteration 2, AC12): the real
+# launch.sh next to runtime_smoke_test.sh -- passed through unmodified so
+# the evidence builder subprocess can extract the SAME embedded
+# SPARK_GATE_WRITER_PY source (containing
+# `detect_available_models_silent_fallback`) that a live run would use,
+# proving the wiring runs against production source, never a test double.
+LAUNCH_SH_FOR_DETECTOR = pathlib.Path(__file__).resolve().parents[1] / "launch.sh"
 
 _HEREDOC_RE = re.compile(
     r"cat > \"\$SPARK_EVIDENCE_PY\" <<'SPARK_EVIDENCE_PY_EOF'\n(.*?)\nSPARK_EVIDENCE_PY_EOF\n",
@@ -300,6 +307,7 @@ def _run_evidence(
         "2026-08-22T00:00:00Z",
         proxy_snapshot_stat_json,
         agents_json_audit_raw,
+        str(LAUNCH_SH_FOR_DETECTOR),
     ]
     result = subprocess.run(args, capture_output=True, text=True, timeout=30)
     # The evidence builder intentionally exits 1 for any non-"pass" verdict
@@ -321,6 +329,76 @@ def test_below_floor_absent_models_used_is_blocked(tmp_path):
     evidence = _run_evidence(tmp_path, stream_text=stream, claude_code_version="2.1.211 (Claude Code)")
     assert evidence["verdict"]["status"] == "blocked"
     assert evidence["verdict"]["reason"] == "claude_code_evidence_schema_unsupported"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2274 PR #2285 OWNER fix-delta (iteration 2, AC12): live-path proof
+# that `detect_available_models_silent_fallback()` (scripts/claude-gpt/
+# launch.sh, unit-tested standalone by scripts/claude-gpt/tests/
+# test_available_models_fallback_detection.py) is genuinely WIRED into this
+# live evidence pipeline -- not just a synthetic-payload unit test. These
+# tests drive the same SPARK_EVIDENCE_PY subprocess as every test above,
+# with the real launch.sh passed alongside it, and assert on the new
+# `agent.available_models_fallback_detection` field the wiring adds. No live
+# `availableModels` signal exists anywhere in this codebase yet (see the
+# wiring comment in runtime_smoke_test.sh), so `available_models` is always
+# `None` here -- honestly reflecting "not observed", never fabricated.
+# ---------------------------------------------------------------------------
+
+
+def test_ac12_detector_wiring_reports_resolved_model_mismatch(tmp_path):
+    """The exact AC12 shape this classifier exists to catch: a silent
+    fallback to a different resolved model. Proves the REAL
+    `detect_available_models_silent_fallback()` function (not a
+    hand-duplicated reimplementation) ran against live resolved_model
+    evidence and its typed, fail-closed reason is present both in the
+    dedicated evidence field and folded into the overall verdict."""
+    stream = _build_stream(resolved_model="claude-sonnet-4-5", models_used_field=_ABSENT)
+    evidence = _run_evidence(tmp_path, stream_text=stream, claude_code_version="2.1.238 (Claude Code)")
+    detection = evidence["agent"]["available_models_fallback_detection"]
+    assert detection is not None
+    assert detection["status"] == "blocked"
+    assert detection["reason"] == "resolved_model_mismatch_without_available_models_evidence"
+    assert detection["requested_model"] == EXPECTED_MODEL
+    assert detection["resolved_model"] == "claude-sonnet-4-5"
+    # Never fabricated: this environment has no live availableModels signal.
+    assert detection["available_models"] is None
+    assert any(
+        r == "ac12_silent_fallback_detector_resolved_model_mismatch_without_available_models_evidence"
+        for r in evidence["_debug_reasons"]
+    )
+    assert evidence["verdict"]["status"] != "pass"
+
+
+def test_ac12_detector_wiring_reports_match_on_genuine_pass_path(tmp_path):
+    """The wired detector agrees with a genuinely passing evidence shape
+    (resolvedModel + modelsUsed both confirm the requested model) -- proving
+    the wiring does not spuriously block a real pass."""
+    stream = _build_stream(resolved_model=EXPECTED_MODEL, models_used_field=[EXPECTED_MODEL])
+    evidence = _run_evidence(tmp_path, stream_text=stream, claude_code_version="2.1.238 (Claude Code)")
+    detection = evidence["agent"]["available_models_fallback_detection"]
+    assert detection is not None
+    assert detection["status"] == "pass"
+    assert detection["reason"] == "match"
+    assert not any(r.startswith("ac12_silent_fallback_detector_") for r in evidence["_debug_reasons"])
+
+
+def test_ac12_detector_wiring_never_corrupts_below_floor_schema_unsupported_verdict(tmp_path):
+    """Below the modelsUsed version floor, the pipeline's own
+    `claude_code_evidence_schema_unsupported` reason must stay the SOLE
+    reason (this is what makes `verdict.status == "blocked"` rather than
+    "fail" -- see the `schema_unsupported_only` check in
+    runtime_smoke_test.sh). The AC12 wiring must never add a second reason
+    here and silently downgrade a `blocked` verdict into an unrelated
+    `fail`."""
+    stream = _build_stream(resolved_model=EXPECTED_MODEL, models_used_field=_ABSENT)
+    evidence = _run_evidence(tmp_path, stream_text=stream, claude_code_version="2.1.211 (Claude Code)")
+    assert evidence["verdict"]["status"] == "blocked"
+    assert evidence["verdict"]["reason"] == "claude_code_evidence_schema_unsupported"
+    assert evidence["_debug_reasons"] == ["claude_code_evidence_schema_unsupported"]
+    detection = evidence["agent"]["available_models_fallback_detection"]
+    assert detection is not None
+    assert detection["status"] == "pass"
 
 
 def test_at_floor_resolved_model_present_models_used_absent_is_pass_candidate(tmp_path):
