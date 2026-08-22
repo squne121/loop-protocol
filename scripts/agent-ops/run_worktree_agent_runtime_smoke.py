@@ -5060,6 +5060,22 @@ def build_parser() -> argparse.ArgumentParser:
             "every pre-existing --claude-bin caller's argv unchanged."
         ),
     )
+    parser.add_argument(
+        "--evidence-json",
+        default=None,
+        help=(
+            "Issue #2231: optional path to write the full schema_summary "
+            "(WORKTREE_AGENT_RUNTIME_SMOKE_RESULT_V1) as machine-generated "
+            "JSON, in addition to the existing summary.md written under "
+            "--output-dir. Enables callers (e.g. regression tests) to "
+            "assert on live evidence fields such as "
+            "causal_evidence_source and exit_code without re-parsing "
+            "summary.md's str()-rendered lines. The parent directory must "
+            "already exist; the file itself is created/overwritten. "
+            "Omitted by default (None), so every pre-existing caller's "
+            "behavior is unchanged."
+        ),
+    )
     parser.add_argument("--expect-marker", action="append", default=[])
     parser.add_argument(
         "--require-subagent-causal-evidence",
@@ -6432,6 +6448,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if exit_code == EXIT_OK:
         print(f"OK: runtime smoke evidence written to {output_dir}")
+
+    # Issue #2231: optional machine-generated JSON dump of the full
+    # schema_summary, written last (after every field -- including
+    # errors/exit_code -- is finalized above) so callers never observe a
+    # partially-populated evidence file. Best-effort: a write failure
+    # here (e.g. --evidence-json parent directory missing) is reported
+    # to stderr but never changes exit_code -- the JSON evidence option
+    # is additive to the existing summary.md contract, not a new gate.
+    if args.evidence_json:
+        try:
+            Path(args.evidence_json).write_text(
+                json.dumps(schema_summary, indent=2, sort_keys=True, default=str) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(f"[WARN] could not write --evidence-json to {args.evidence_json}: {exc}", file=sys.stderr)
 
     return exit_code
 
