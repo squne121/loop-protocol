@@ -63,7 +63,8 @@ def test_build_evidence_manifest_cli_mode_produces_valid_v2_manifest(tmp_path: P
                 {
                     "surface_id": "combat-hud-running",
                     "head_sha": "b" * 40,
-                    "workflow_run_id": "999",
+                    "workflow_run_id": 999,
+                    "run_attempt": 1,
                     "actual_sha256": "a" * 64,
                     "mismatched_pixels": 0,
                     "verify_succeeded": True,
@@ -141,7 +142,8 @@ def test_build_evidence_manifest_v2_consumed_end_to_end_by_evaluate_pr_policy(tm
                 {
                     "surface_id": "combat-hud-running",
                     "head_sha": "c" * 40,
-                    "workflow_run_id": "42",
+                    "workflow_run_id": 42,
+                    "run_attempt": 1,
                     "actual_sha256": "d" * 64,
                     "mismatched_pixels": 0,
                     "verify_succeeded": True,
@@ -206,6 +208,109 @@ def test_build_evidence_manifest_v2_consumed_end_to_end_by_evaluate_pr_policy(tm
         trusted_check_conclusion="success",
     )
     assert policy_result["ok"] is True, policy_result["failures"]
+
+
+def _run_build_evidence_manifest_cli(surface_inputs_path: Path, manifest_output: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            "uv",
+            "run",
+            "--locked",
+            "python3",
+            str(SCRIPT_PATH),
+            "--mode",
+            "build-evidence-manifest",
+            "--registry",
+            str(REGISTRY_PATH),
+            "--schema",
+            str(SCHEMA_PATH),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--surface-inputs-file",
+            str(surface_inputs_path),
+            "--manifest-output",
+            str(manifest_output),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_build_evidence_manifest_cli_rejects_string_typed_workflow_run_id_and_run_attempt(tmp_path: Path) -> None:
+    """Issue #2230 fix_delta P1-2: the real CLI path (`--mode
+    build-evidence-manifest`, the actual `component-vrt-report` producer
+    invocation) must reject a `surface_inputs.json` whose `workflow_run_id`/
+    `run_attempt` are JSON STRINGS -- simulating the real pre-fix `ci.yml`
+    heredoc's actual output shape (before its own `int()` fix) -- with a
+    clear error message, never silently accepting or coercing them."""
+    surface_inputs = tmp_path / "surface_inputs_string_identity.json"
+    surface_inputs.write_text(
+        json.dumps(
+            [
+                {
+                    "surface_id": "combat-hud-running",
+                    "head_sha": "e" * 40,
+                    "workflow_run_id": "123456",
+                    "run_attempt": "1",
+                    "actual_sha256": "f" * 64,
+                    "mismatched_pixels": 0,
+                    "verify_succeeded": True,
+                    "update_executed": False,
+                    "update_succeeded": False,
+                    "expected_artifact_id": "1",
+                    "actual_artifact_id": "2",
+                    "diff_artifact_id": "3",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manifest_output = tmp_path / "manifest_v2_rejected.json"
+    proc = _run_build_evidence_manifest_cli(surface_inputs, manifest_output)
+    assert proc.returncode == 1, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+    assert "workflow_run_id" in proc.stderr
+    assert "run_attempt" in proc.stderr
+    assert "must be a JSON integer" in proc.stderr
+
+
+def test_build_evidence_manifest_cli_accepts_real_int_workflow_run_id_and_run_attempt(tmp_path: Path) -> None:
+    """Companion positive case: real JSON integers (the shape `ci.yml`'s
+    fixed heredoc now produces after its own `int()` conversion) must be
+    accepted and threaded through into the manifest record verbatim."""
+    surface_inputs = tmp_path / "surface_inputs_int_identity.json"
+    surface_inputs.write_text(
+        json.dumps(
+            [
+                {
+                    "surface_id": "combat-hud-running",
+                    "head_sha": "1" * 40,
+                    "workflow_run_id": 123456,
+                    "run_attempt": 2,
+                    "actual_sha256": "2" * 64,
+                    "mismatched_pixels": 0,
+                    "verify_succeeded": True,
+                    "update_executed": False,
+                    "update_succeeded": False,
+                    "expected_artifact_id": "1",
+                    "actual_artifact_id": "2",
+                    "diff_artifact_id": "3",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manifest_output = tmp_path / "manifest_v2_accepted.json"
+    proc = _run_build_evidence_manifest_cli(surface_inputs, manifest_output)
+    assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+    manifest = json.loads(manifest_output.read_text(encoding="utf-8"))
+    record = manifest["surfaces"][0]
+    assert record["workflow_run_id"] == 123456
+    assert record["run_attempt"] == 2
+    assert type(record["workflow_run_id"]) is int
+    assert type(record["run_attempt"]) is int
 
 
 # ---------------------------------------------------------------------------

@@ -400,6 +400,20 @@ fresh isolated session から実証しなければならない**（Availability 
   「Runtime Verification Applicability」を正本とする。
 - fallback 経由の成功（例: `HOME` override での代替成功）を canonical positive workflow の実証として扱ってはならない。
 
+### Controlled（防御対象、Issue #2276 の決定記録で明示化）
+
+`scripts/agent-guards/skill_runtime_exec.py` の trusted `uv` resolver（`_resolve_trusted_executable` /
+`_safe_path_entries`）が防ぐことを主張する対象は以下に限定される（Issue #2276 / #2280）:
+
+- ambient `PATH` 汚染（trust root は固定候補リストからのみ構成され、環境変数由来のディレクトリを追加しない）
+- 偽の `HOME` 環境変数による trust path の誘導（account-home lane の解決は `pwd.getpwuid(os.getuid()).pw_dir`
+  由来であり、ambient `HOME` を参照しない）
+- CWD / project ディレクトリ配下への fake executable の紛れ込み（`project_root` containment チェック）
+- `uv --version` の pin 不一致（`pyproject.toml` の `[tool.uv].required-version` に対する exact match）
+
+これらは「意図しない executable selection」に対する防御であり、下記「Not Controlled」に区分される脅威とは
+区別される。
+
 ### Not Controlled（PR #2247 人間レビュー時点での既知の未解決事項）
 
 Issue #2241 / PR #2247 の実装範囲では、以下は意図的に「未解決」として明記する（過大な安全主張を避けるため）:
@@ -445,23 +459,29 @@ Issue #2241 / PR #2247 の実装範囲では、以下は意図的に「未解決
   - gh CLI 経由（非 isolated profile）の `_run_gh()` エラー文字列（stderr snippet を含む）は、この Issue の
     スコープである credentialless transport 側の closed taxonomy 化の対象外のまま維持している（AC8 の非退行要件
     を優先し、gh 経路の広範な改変は別 Issue とする）。
-- **`~/.local/bin` trust root の CWE-427 search-selection risk（Issue #2251 で解消済み）**: PR #2247 時点では
+- **`~/.local/bin` trust root（Issue #2251 で一時除外 → Issue #2276 / #2280 で再許可）**: PR #2247 時点では
   `scripts/agent-guards/skill_runtime_exec.py` の `_safe_path_entries()` が account-home `~/.local/bin` を trust root
   候補に含め、`_validate_account_local_bin_trust`（ancestor owner uid / group-world-writable 検証・symlink 解決先検証）
   と `_validate_local_bin_executable_version`（`--version` 出力の緩い pattern 照合）で防御していた。Issue #2251 は
   `~/.local/bin` を trust root 候補そのものから除外し（`_validate_account_local_bin_trust` は削除）、CWE-427 の
-  search-selection element（攻撃者が制御可能な search path 要素を trust root に含めてしまうリスク）自体を縮小した。
-  account-home `.local/bin` にしか `uv` が存在せず hostedtoolcache/system 標準ディレクトリからも解決できない場合、
-  resolver は silent fallback せず `uv_not_found` で deterministic に fail-closed する。
-- **同一 UID による executable 本体置換（引き続き Not Controlled）**: `~/.local/bin` を trust root 候補から除外して
-  も、`_safe_path_entries()` が残す hostedtoolcache（`/opt/hostedtoolcache/uv` 等）や `/usr/local/bin` 等の
-  システム標準ディレクトリ自体は、CI ランナーやホスト設定次第では依然としてこの実行アカウントと同一 UID で
+  search-selection element を縮小したが、no-sudo local-dev 環境で `uv` が hostedtoolcache/system 標準ディレクトリの
+  いずれにも存在しない場合に `uv_not_found` が発生する availability regression を引き起こした。OWNER が「開発
+  エージェントに sudo 要件を与えない」ことを固定制約として明示したことを受け、Issue #2276（decision record）は
+  この trade-off を再検討し、Issue #2280 で **real OS account home（`pwd.getpwuid(os.getuid()).pw_dir` 由来、ambient
+  `HOME` には依存しない）配下の `.local/bin` を no-sudo local-dev 向け trust root 候補として再許可**した。再許可した
+  lane も `_validate_trusted_executable_version` による `pyproject.toml` の exact version pin 照合を必須とし、
+  wrong-version や env-spoofed `HOME` 由来の `.local/bin` は引き続き fail-closed で拒否される。
+- **同一 UID による executable 本体置換（引き続き Not Controlled）**: `_safe_path_entries()` が候補とする
+  hostedtoolcache（`/opt/hostedtoolcache/uv` 等）、`/usr/local/bin` 等のシステム標準ディレクトリ、および
+  Issue #2276 / #2280 で再許可した real-account-home `.local/bin` は、いずれもこの実行アカウントと同一 UID で
   書き込み可能な場合がある。「この実行アカウント自身として既に任意コード実行を得た攻撃者が、trust root 配下の
-  `uv` 実体そのものを置き換える」ケースは、`_validate_trusted_executable_version` による `pyproject.toml`
-  `[tool.uv].required-version` 完全一致の `--version` 照合を加えても引き続き制御できない（同一 UID である限り、
-  攻撃者は正規に見える `--version` バナーを返す偽 binary を用意できるため）。完全な解決には launcher-owned・
-  child 非書き込みな専用 toolchain ディレクトリ、または dedicated user / OS-level sandbox の新設が必要であり、
-  これは Issue #2251 のスコープを超える（CWE-427 相当の構造的制約が残る）。
+  `uv` 実体そのもの、あるいは resolver の実装自体を置き換える」ケースは、`_validate_trusted_executable_version`
+  による `pyproject.toml` `[tool.uv].required-version` 完全一致の `--version` 照合を加えても引き続き制御できない
+  （同一 UID である限り、攻撃者は正規に見える `--version` バナーを返す偽 binary を用意できるため）。checksum /
+  signature / attestation 検証も、その expected value の authority 自体が同一 UID から書き換え可能な限り、この
+  same-UID containment の代替にはならない（Issue #2276 decision record）。完全な解決には launcher-owned・child
+  非書き込みな専用 toolchain ディレクトリ、または dedicated user / OS-level sandbox の新設が必要であり、これは
+  Issue #2251 / #2276 / #2280 いずれのスコープも超える（CWE-427 相当の構造的制約が残る）。
 
 ## SSOT Routing Table（SSOT ルーティング表）
 
