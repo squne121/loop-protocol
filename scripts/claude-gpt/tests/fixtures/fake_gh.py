@@ -29,6 +29,14 @@ production code):
                                    mismatch after an apparently successful
                                    close).
 
+Issue #2306 follow-up (P1-d): `gh auth status` is now also understood (always
+exits 0, no state read/write) so `scripts/claude-gpt/tests/
+test_live_issue_create_canary.py`'s real-subprocess `main()`/EXIT-trap tests
+(which run the unmodified production `live_issue_create_canary.sh` -- not
+just its sourced helper functions -- against this fake `gh`) can pass the
+production script's `gh auth status --hostname github.com` ambient-auth
+preflight check without touching real GitHub auth.
+
 State is persisted across invocations (each `gh` call is a fresh subprocess)
 via a JSON file at $FAKE_GH_STATE.
 
@@ -97,6 +105,12 @@ def main() -> int:
         return 1
     args = sys.argv[1:]
     state = _load(state_path)
+
+    if args[:2] == ["auth", "status"]:
+        # Always report authenticated; no state read/write. See module
+        # docstring (Issue #2306 follow-up P1-d).
+        print("Logged in to github.com account fake-test-user")
+        return 0
 
     if args[:2] == ["issue", "list"]:
         repo = _extract_flag(args, "--repo")

@@ -267,13 +267,17 @@ def test_close_and_verify_close_command_failure(fake_gh_setup):
 def test_close_and_verify_state_mismatch_after_apparent_success(fake_gh_setup):
     """AC5 'close 後 state 不一致': `gh issue close` reports success (exit 0)
     but the post-close readback shows the state was NOT actually mutated to
-    closed."""
+    closed. Issue #2306 follow-up P1-a: this must also be surfaced via a
+    non-zero return code, not just the JSON payload -- `cleanup_handler`
+    relies on the return code (not string-matching CLOSE_STATE) to decide
+    whether cleanup actually succeeded."""
     _seed_state(fake_gh_setup["state_path"], {"9010": _issue(TITLE, BODY)})
     result = _run(
         fake_gh_setup,
         f"close_and_verify 9010 {_q(REPO)} {_q('cleanup comment')}",
         fault_env={"FAKE_GH_CLOSE_NOOP": "1"},
     )
+    assert result.returncode != 0
     payload = json.loads(result.stdout)
     assert payload["close_ok"] is True
     assert payload["state"] == "open"  # NOT closed -- this is the fault
@@ -294,7 +298,8 @@ python3 -c "import json; print(json.dumps({{'rc': $RC, \
 'identity_status': '$IDENTITY_STATUS', \
 'fallback_status': '$FALLBACK_STATUS', \
 'fallback_candidate_count': '$FALLBACK_CANDIDATE_COUNT', \
-'resolved_issue_number': '$RESOLVED_ISSUE_NUMBER'}}))"
+'resolved_issue_number': '$RESOLVED_ISSUE_NUMBER', \
+'resolved_issue_state': '$RESOLVED_ISSUE_STATE'}}))"
 '''
 
 
@@ -371,21 +376,31 @@ def test_resolve_fallback_multiple_candidates_fails_closed(fake_gh_setup):
 def test_resolve_wrong_state_identity_match_but_prior_unexpected_state(fake_gh_setup):
     """AC5 'wrong state': the disposable probe Issue is found by number with
     matching title/body, but its state is unexpectedly already 'closed'
-    (e.g. a race/duplicate close elsewhere) -- resolve should still report
-    the match (state handling is a downstream cleanup concern, see
-    test_already_closed_target_still_confirms_close)."""
+    (e.g. a race/duplicate close elsewhere) -- `resolve_target_issue_number`
+    (the CLEANUP-target resolver) should still report the match so cleanup
+    can act on it. Issue #2306 follow-up P1-c: resolve/cleanup identity and
+    PASS-eligibility are now separate concerns -- `resolved_issue_state`
+    surfaces the non-open state precisely so main()'s PASS gate (which
+    additionally requires state == open, see
+    test_already_closed_target_still_confirms_close) can reject it while
+    cleanup still proceeds."""
     _seed_state(fake_gh_setup["state_path"], {"9010": _issue(TITLE, BODY, state="closed")})
     result = _run(fake_gh_setup, _resolve_script("9010"))
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload["rc"] == 0
     assert payload["identity_status"] == "match"
     assert payload["resolved_issue_number"] == "9010"
+    assert json.loads(payload["resolved_issue_state"]) == "closed"
 
 
 def test_already_closed_target_still_confirms_close(fake_gh_setup):
     """AC5 '対象が既に closed': resolve + close_and_verify end-to-end on a
     target that starts out already closed must still report a successful,
-    state-confirmed close (idempotent close semantics)."""
+    state-confirmed close (idempotent close semantics) -- cleanup succeeds
+    even though (per test_resolve_wrong_state_identity_match_but_prior_
+    unexpected_state / test_already_closed_candidate_resolves_for_cleanup_
+    but_is_not_pass_eligible) such a run is never PASS-eligible. Cleanup and
+    PASS determination are independent (Issue #2306 follow-up P1-c)."""
     _seed_state(fake_gh_setup["state_path"], {"9010": _issue(TITLE, BODY, state="closed")})
     script = _resolve_script("9010") + "\nclose_and_verify 9010 " + _q(REPO) + " " + _q("cleanup") + "\n"
     result = _run(fake_gh_setup, script)
@@ -407,4 +422,232 @@ def test_calls_trace_records_operations(fake_gh_setup):
     state = json.loads(fake_gh_setup["state_path"].read_text(encoding="utf-8"))
     operations = [c["operation"] for c in state["calls"]]
     assert "issue_view" in operations
+    assert "issue_close" in operations
+
+
+# --- Issue #2306 follow-up P1-d: real-subprocess main()/EXIT-trap coverage --
+#
+# The 21 tests above all exercise `verify_identity` / `fallback_search` /
+# `close_and_verify` / `resolve_target_issue_number` as sourced helper
+# functions -- none of them ever runs `cleanup_handler()` itself, `main()`,
+# or the EXIT trap wiring that connects the two to the actual process exit
+# code (the OWNER-identified structural gap). This section runs the
+# unmodified production `live_issue_create_canary.sh` as a real subprocess
+# (NOT sourced -- `main "$@"` at the bottom of the file executes normally)
+# with a fake `launch.sh` / `preflight.sh` standing in for the real ones and
+# the same fake `gh` provider used above, so `main()`'s full
+# `LAUNCH_RC -> resolve_target_issue_number -> FINAL_STATUS -> EXIT trap ->
+# cleanup_handler -> final process exit code` path is exercised end-to-end,
+# without ever launching a real claude-gpt session or touching real GitHub.
+
+FAKE_LAUNCH_SH = r"""#!/usr/bin/env bash
+set -u
+prompt=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-p" ]; then
+    prompt="$arg"
+  fi
+  prev="$arg"
+done
+
+title=$(printf '%s\n' "$prompt" | sed -n 's/^タイトル: //p')
+body=$(printf '%s\n' "$prompt" | awk '/^本文:$/{flag=1; next} flag{print}')
+repo="squne121/loop-protocol"
+mode="${FAKE_LAUNCH_MODE:-success}"
+
+case "$mode" in
+  success)
+    url=$(gh issue create --repo "$repo" --title "$title" --body "$body")
+    number=$(printf '%s\n' "$url" | grep -oE '[0-9]+$')
+    echo "CANARY_ISSUE_NUMBER=${number}"
+    exit 0
+    ;;
+  wrong_number_no_fallback)
+    echo "CANARY_ISSUE_NUMBER=${FAKE_LAUNCH_WRONG_NUMBER}"
+    exit 0
+    ;;
+  wrong_number_ambiguous_fallback)
+    gh issue create --repo "$repo" --title "$title" --body "$body" >/dev/null
+    gh issue create --repo "$repo" --title "$title" --body "$body" >/dev/null
+    echo "CANARY_ISSUE_NUMBER=${FAKE_LAUNCH_WRONG_NUMBER}"
+    exit 0
+    ;;
+  crash_after_create_no_number)
+    gh issue create --repo "$repo" --title "$title" --body "$body" >/dev/null
+    exit 1
+    ;;
+  already_closed_candidate)
+    url=$(gh issue create --repo "$repo" --title "$title" --body "$body")
+    number=$(printf '%s\n' "$url" | grep -oE '[0-9]+$')
+    gh issue close "$number" --repo "$repo" --comment "pre-closed by fixture" >/dev/null
+    echo "CANARY_ISSUE_NUMBER=${number}"
+    exit 0
+    ;;
+  *)
+    echo "unknown FAKE_LAUNCH_MODE: $mode" >&2
+    exit 9
+    ;;
+esac
+"""
+
+FAKE_PREFLIGHT_SH = """#!/usr/bin/env bash
+# --env-only always reports the environment as available (exit 0).
+echo '{"schema":"CLAUDE_GPT_PREFLIGHT_RESULT_V1","env_only":true}'
+exit 0
+"""
+
+
+@pytest.fixture()
+def subprocess_harness_setup(tmp_path: Path):
+    """Sets up a temp SCRIPT_DIR containing the REAL production
+    `live_issue_create_canary.sh` + `lib.sh`, plus a fake `launch.sh` /
+    `preflight.sh`, and a fake-`gh`-shadowed PATH, so `main()` (executed as
+    a genuine subprocess, not sourced) can be driven end-to-end."""
+    script_dir = tmp_path / "script_dir"
+    script_dir.mkdir()
+
+    live_canary_copy = script_dir / "live_issue_create_canary.sh"
+    live_canary_copy.write_text(LIVE_CANARY_SH.read_text(encoding="utf-8"), encoding="utf-8")
+    live_canary_copy.chmod(live_canary_copy.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    lib_sh_copy = script_dir / "lib.sh"
+    lib_sh_copy.write_text((SCRIPT_DIR / "lib.sh").read_text(encoding="utf-8"), encoding="utf-8")
+
+    fake_launch = script_dir / "launch.sh"
+    fake_launch.write_text(FAKE_LAUNCH_SH, encoding="utf-8")
+    fake_launch.chmod(fake_launch.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    fake_preflight = script_dir / "preflight.sh"
+    fake_preflight.write_text(FAKE_PREFLIGHT_SH, encoding="utf-8")
+    fake_preflight.chmod(fake_preflight.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    fake_bin_dir = tmp_path / "fake-bin"
+    fake_bin_dir.mkdir()
+    wrapper = fake_bin_dir / "gh"
+    wrapper.write_text(f'#!/bin/sh\nexec python3 "{FAKE_GH_FIXTURE}" "$@"\n', encoding="utf-8")
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    state_path = tmp_path / "fake_gh_state.json"
+
+    process_env = os.environ.copy()
+    process_env["PATH"] = f"{fake_bin_dir}:{process_env['PATH']}"
+    process_env["FAKE_GH_STATE"] = str(state_path)
+    process_env["CLAUDE_GPT_LIVE_ISSUE_CREATE_CANARY_CONFIRM"] = "1"
+    process_env.pop("FAKE_GH_CLOSE_SHOULD_FAIL", None)
+    process_env.pop("FAKE_GH_CLOSE_NOOP", None)
+    process_env.pop("LIVE_ISSUE_CREATE_CANARY_TEST_SOURCE", None)
+    return {
+        "script_path": live_canary_copy,
+        "process_env": process_env,
+        "state_path": state_path,
+    }
+
+
+def _run_main(subprocess_harness_setup: dict, *, fault_env: dict | None = None, timeout: float = 20):
+    process_env = dict(subprocess_harness_setup["process_env"])
+    if fault_env:
+        process_env.update(fault_env)
+    return subprocess.run(
+        [BASH_BIN, str(subprocess_harness_setup["script_path"]), "--confirm"],
+        capture_output=True,
+        text=True,
+        env=process_env,
+        timeout=timeout,
+    )
+
+
+def test_main_wrong_parsed_number_zero_fallback_candidates_no_close_exit1(subprocess_harness_setup):
+    """P1-d scenario 1: launcher emits a wrong/unrelated parsed number and
+    the fallback search finds zero title-matching candidates -- the
+    unrelated Issue must be left untouched (never closed) and the process
+    must exit 1."""
+    _seed_state(
+        subprocess_harness_setup["state_path"],
+        {"9010": _issue("an unrelated pre-existing issue", "unrelated body")},
+    )
+    result = _run_main(
+        subprocess_harness_setup,
+        fault_env={"FAKE_LAUNCH_MODE": "wrong_number_no_fallback", "FAKE_LAUNCH_WRONG_NUMBER": "9010"},
+    )
+    assert result.returncode == 1, result.stderr
+    state = json.loads(subprocess_harness_setup["state_path"].read_text(encoding="utf-8"))
+    assert state["issues"]["9010"]["state"] == "open"
+    operations = [c["operation"] for c in state["calls"]]
+    assert "issue_close" not in operations
+
+
+def test_main_wrong_parsed_number_ambiguous_fallback_no_close_exit1(subprocess_harness_setup):
+    """P1-d scenario 2: launcher emits a wrong parsed number, but the
+    fallback search finds >=2 exact-title candidates (ambiguous) -- neither
+    candidate may be closed and the process must exit 1."""
+    result = _run_main(
+        subprocess_harness_setup,
+        fault_env={"FAKE_LAUNCH_MODE": "wrong_number_ambiguous_fallback", "FAKE_LAUNCH_WRONG_NUMBER": "424242"},
+    )
+    assert result.returncode == 1, result.stderr
+    state = json.loads(subprocess_harness_setup["state_path"].read_text(encoding="utf-8"))
+    assert len(state["issues"]) == 2
+    for info in state["issues"].values():
+        assert info["state"] == "open"
+    operations = [c["operation"] for c in state["calls"]]
+    assert "issue_close" not in operations
+
+
+def test_main_launcher_nonzero_no_number_fallback_cleans_up_but_exit1(subprocess_harness_setup):
+    """P1-d scenario 3: the launcher creates the real disposable Issue but
+    then crashes (exit 1) before printing `CANARY_ISSUE_NUMBER=<n>` --
+    cleanup-target resolution must still run (Issue #2306 follow-up P1-b),
+    find and close the orphaned Issue via fallback, but the overall run must
+    still be reported FAIL (exit 1) because LAUNCH_RC != 0."""
+    result = _run_main(subprocess_harness_setup, fault_env={"FAKE_LAUNCH_MODE": "crash_after_create_no_number"})
+    assert result.returncode == 1, result.stderr
+    state = json.loads(subprocess_harness_setup["state_path"].read_text(encoding="utf-8"))
+    assert len(state["issues"]) == 1
+    (info,) = state["issues"].values()
+    assert info["state"] == "closed"
+    operations = [c["operation"] for c in state["calls"]]
+    assert "issue_close" in operations
+
+
+def test_main_otherwise_success_close_command_failure_exit1(subprocess_harness_setup):
+    """P1-d scenario 4: launch + identity verification succeed (would
+    otherwise be PASS), but the close command itself fails -- must be
+    reported FAIL (exit 1), and the Issue must remain open."""
+    result = _run_main(
+        subprocess_harness_setup,
+        fault_env={"FAKE_LAUNCH_MODE": "success", "FAKE_GH_CLOSE_SHOULD_FAIL": "1"},
+    )
+    assert result.returncode == 1, result.stderr
+    state = json.loads(subprocess_harness_setup["state_path"].read_text(encoding="utf-8"))
+    (info,) = state["issues"].values()
+    assert info["state"] == "open"
+
+
+def test_main_otherwise_success_close_noop_state_open_exit1(subprocess_harness_setup):
+    """P1-d scenario 5: launch + identity verification succeed, `gh issue
+    close` reports exit 0, but the post-close readback shows the Issue is
+    still open (close no-op) -- must be reported FAIL (exit 1), not PASS."""
+    result = _run_main(
+        subprocess_harness_setup,
+        fault_env={"FAKE_LAUNCH_MODE": "success", "FAKE_GH_CLOSE_NOOP": "1"},
+    )
+    assert result.returncode == 1, result.stderr
+    state = json.loads(subprocess_harness_setup["state_path"].read_text(encoding="utf-8"))
+    (info,) = state["issues"].values()
+    assert info["state"] == "open"
+
+
+def test_main_already_closed_candidate_cleanup_confirmed_but_not_pass(subprocess_harness_setup):
+    """P1-d scenario 6: the resolved candidate (exact title+body match) is
+    already CLOSED at resolution time -- identity IS confirmed so cleanup
+    still (idempotently) closes it, but the run must never be reported PASS
+    (Issue #2306 follow-up P1-c: PASS additionally requires state == open at
+    resolution time)."""
+    result = _run_main(subprocess_harness_setup, fault_env={"FAKE_LAUNCH_MODE": "already_closed_candidate"})
+    assert result.returncode == 1, result.stderr
+    state = json.loads(subprocess_harness_setup["state_path"].read_text(encoding="utf-8"))
+    (info,) = state["issues"].values()
+    assert info["state"] == "closed"
+    operations = [c["operation"] for c in state["calls"]]
     assert "issue_close" in operations

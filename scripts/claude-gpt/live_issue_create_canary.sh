@@ -24,10 +24,11 @@
 #
 # Exit codes:
 #   0   PASS (disposable Issue created via genuine isolated Claude-GPT
-#             issue-creator workflow, exact-identity-verified, then closed
-#             and closed-state-readback-confirmed)
+#             issue-creator workflow, exact-identity-verified as OPEN, then
+#             closed and closed-state-readback-confirmed)
 #   1   FAIL (opted-in but the workflow did not complete / identity could
-#             not be established / cleanup failed / close state mismatch)
+#             not be established as OPEN / cleanup failed / close state
+#             mismatch)
 #   77  SKIP (no explicit opt-in given -- the default, always-safe path)
 #
 # Out of Scope (Issue #2299): this canary does not expand to other
@@ -68,17 +69,86 @@
 #      `gh issue view --json state` readback (`state == "CLOSED"`), not just
 #      the exit code of `gh issue close`.
 #
+# --- Issue #2306 follow-up (OWNER REQUEST_CHANGES, issuecomment-5381684379,
+#     superseding the earlier pr-reviewer APPROVE on PR #2309) -------------
+# Adversarial review of `main -> EXIT trap -> cleanup_handler -> final exit
+# code` identified two further structural gaps, fixed here:
+#
+#   P0. `cleanup_handler` previously fell back to the raw, unverified
+#       `CANARY_ISSUE_NUMBER` (parsed straight from Claude stdout) whenever
+#       `RESOLVED_ISSUE_NUMBER` was still "null" (i.e. identity verification
+#       AND fallback search both failed to establish identity). This meant
+#       an unverified/possibly-hallucinated number could still be closed.
+#       Fixed: `cleanup_handler` now only ever acts on `RESOLVED_ISSUE_NUMBER`
+#       (identity-verified, either directly or via a fallback candidate that
+#       is itself re-confirmed against an authoritative `gh issue view`
+#       readback -- see P1-c below). If it is "null", nothing is closed.
+#
+#   P1-a. `cleanup_handler` previously ended with `return "$exit_code"`,
+#       where `$exit_code` was captured from `$?` at function entry (i.e.
+#       *before* the trap fired) -- but bash's EXIT trap does not use a
+#       trap handler's `return` value as the process's final exit status;
+#       once `main()` has already called `exit 0`, the process exits 0
+#       regardless of what `cleanup_handler` computes internally (e.g.
+#       downgrading `FINAL_STATUS` to "failure" on a close failure had no
+#       effect on the actual process exit code). Fixed:
+#       `cleanup_handler` now disables further trap re-entry (`trap - EXIT`)
+#       immediately, then explicitly calls `exit <code>` itself at the end,
+#       deriving the authoritative final code from (in priority order) an
+#       INT/TERM-original interrupt code (130/143, preserved verbatim), else
+#       0 iff `FINAL_STATUS == success`, else 1. `close_and_verify` now also
+#       returns non-zero (in addition to the JSON payload) whenever the
+#       post-close readback state is not "closed"/"CLOSED", so a `close_ok`
+#       apparent-success with a state mismatch is never silently treated as
+#       cleanup success by `cleanup_handler`.
+#
+#   P1-b. Cleanup-target resolution (`resolve_target_issue_number`) was
+#       previously only attempted when the launcher exited 0. If the
+#       launcher itself exited non-zero after already creating the
+#       disposable Issue (e.g. it crashed after `issue-creator` succeeded
+#       but before printing `CANARY_ISSUE_NUMBER=<n>`), the created Issue
+#       would never be discovered by fallback search and would leak. Fixed:
+#       `resolve_target_issue_number` is now always attempted regardless of
+#       `LAUNCH_RC`; only the PASS/FAIL determination (not cleanup attempt)
+#       is gated on `LAUNCH_RC == 0`.
+#
+#   P1-c. `verify_identity` never inspected `state`, so an already-CLOSED
+#       Issue that happened to match on title/body (e.g. a stale duplicate
+#       from a prior interrupted run) could be reported as a PASS. Also,
+#       `fallback_search`'s candidates are filtered by `gh issue list`
+#       title-only matching (never body), so a wrong-body candidate could
+#       previously be trusted without further check. Fixed: PASS
+#       (`FINAL_STATUS=success`) now additionally requires the resolved
+#       Issue's state to be OPEN at resolution time, and any fallback-search
+#       candidate is re-confirmed via a direct, authoritative `verify_identity`
+#       (`gh issue view` readback: title AND body AND state) before it is
+#       ever trusted as `RESOLVED_ISSUE_NUMBER` -- cleanup may still act on a
+#       wrong-body or already-closed candidate once identity is otherwise
+#       confirmed, but such a run is never reported PASS. The disposable
+#       probe Issue body additionally now embeds a machine-checkable run
+#       marker HTML comment (`<!-- claude-gpt-live-canary-run:<marker> -->`)
+#       to strengthen exact-identity confirmation.
+#
 # The functions below are intentionally kept import/source-able (guarded
 # by LIVE_ISSUE_CREATE_CANARY_TEST_SOURCE, see the bottom of this file) so
 # `scripts/claude-gpt/tests/test_live_issue_create_canary.py` (Issue #2306
 # AC5) can exercise verify_identity / fallback_search / close_and_verify /
-# cleanup_handler deterministically against the fake `gh` provider
+# cleanup_handler / main() end-to-end (via a real subprocess with faked
+# launcher/preflight/gh) deterministically against the fake `gh` provider
 # (scripts/claude-gpt/tests/fixtures/fake_gh.py) without ever launching a
 # real claude-gpt session or touching real GitHub.
 
 command set -u
 
-SELF_PATH=$0
+# Issue #2306 follow-up P1-d: `$0` only reflects the invoked script path
+# when this file is executed directly; when it is instead `source`d (as the
+# test suite does, guarded by LIVE_ISSUE_CREATE_CANARY_TEST_SOURCE=1) inside
+# a `bash -c '...'` one-liner, `$0` resolves to `bash` itself, not this
+# file, which previously broke `SCRIPT_DIR`/`lib.sh` source resolution
+# silently (no `set -e`, so the broken `. "$SCRIPT_DIR/lib.sh"` failure was
+# swallowed). `${BASH_SOURCE[0]:-$0}` always resolves to this file's own
+# path in both the direct-execution and sourced cases.
+SELF_PATH=${BASH_SOURCE[0]:-$0}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
 # shellcheck source=./lib.sh
 . "$SCRIPT_DIR/lib.sh"
@@ -99,15 +169,17 @@ gh_issue_view_json() {
 
 verify_identity() {
   # args: number repo expected_title expected_body
-  # Prints a JSON object {"status": "match"|"mismatch"|"not_found", ...}.
-  # "match" is only returned when BOTH title and body are exactly equal to
-  # what was requested -- existence alone is never sufficient (Issue #2306
-  # gap 1).
+  # Prints a JSON object {"status": "match"|"identity_mismatch"|"not_found",
+  # "state": "open"|"closed"|null, ...}. "match" is only returned when BOTH
+  # title and body are exactly equal to what was requested -- existence
+  # alone is never sufficient (Issue #2306 gap 1), and (Issue #2306
+  # follow-up P1-c) "match" says nothing about whether the Issue is OPEN --
+  # callers that need PASS-eligibility must additionally check "state".
   local number="$1" repo="$2" expected_title="$3" expected_body="$4"
   local json
   json=$(gh_issue_view_json "$number" "$repo")
   if [ -z "$json" ]; then
-    printf '{"status":"not_found","number":%s}' "$number"
+    printf '{"status":"not_found","number":%s,"state":null}' "$number"
     return 1
   fi
   IDENTITY_JSON="$json" IDENTITY_EXPECTED_TITLE="$expected_title" IDENTITY_EXPECTED_BODY="$expected_body" python3 <<'IDENTITY_PY_EOF'
@@ -135,7 +207,11 @@ fallback_search() {
   # Prints a JSON object {"status": "match"|"none"|"ambiguous",
   # "candidate_count": N, ...}. Only acts (status "match") on an unambiguous
   # single exact-title match among the search results; 0 or >=2 candidates
-  # never trigger a close (Issue #2306 AC3).
+  # never trigger a close (Issue #2306 AC3). Note: this candidate is
+  # title-matched only (gh issue list does not filter on body) -- callers
+  # MUST re-confirm identity via `verify_identity` (title AND body AND
+  # state) against an authoritative `gh issue view` readback before trusting
+  # a "match" candidate (Issue #2306 follow-up P1-c).
   local repo="$1" expected_title="$2" marker="$3"
   local json
   json=$(gh issue list --repo "$repo" --search "$marker" --state all --json number,title,body,state,url --limit 20 2>/dev/null)
@@ -165,10 +241,12 @@ FALLBACK_PY_EOF
 
 close_and_verify() {
   # args: number repo comment
-  # Prints a JSON object {"close_ok": true|false, "state": "..."|null}.
-  # A close is only ever reported successful when the post-close readback
-  # independently confirms state == "CLOSED" -- the exit code of
-  # `gh issue close` alone is not sufficient (Issue #2306 gap 2).
+  # Prints a JSON object {"close_ok": true|false, "state": "..."|null} and
+  # returns non-zero whenever cleanup did NOT authoritatively confirm the
+  # post-close state as closed -- this includes both `gh issue close`
+  # exiting non-zero AND the exit-0 case where the post-close readback state
+  # is not "closed"/"CLOSED" (Issue #2306 follow-up P1-a: the exit code of
+  # `gh issue close` alone is never sufficient).
   local number="$1" repo="$2" comment="$3"
   if ! gh issue close "$number" --repo "$repo" --comment "$comment" >/dev/null 2>&1; then
     printf '{"close_ok":false,"state":null}'
@@ -180,14 +258,21 @@ close_and_verify() {
     printf '{"close_ok":true,"state":null}'
     return 1
   fi
-  CLOSE_VERIFY_JSON="$json" python3 <<'CLOSE_VERIFY_PY_EOF'
+  local result rc
+  result=$(CLOSE_VERIFY_JSON="$json" python3 <<'CLOSE_VERIFY_PY_EOF'
 import json
 import os
+import sys
 
 data = json.loads(os.environ["CLOSE_VERIFY_JSON"])
 state = data.get("state")
 print(json.dumps({"close_ok": True, "state": state}))
+sys.exit(0 if (state or "").lower() == "closed" else 1)
 CLOSE_VERIFY_PY_EOF
+)
+  rc=$?
+  printf '%s' "$result"
+  return "$rc"
 }
 
 # --- AC4: cleanup handler (EXIT trap) ---------------------------------------
@@ -198,6 +283,14 @@ CLOSE_VERIFY_PY_EOF
 # see the trap registrations at the bottom of main()). Idempotent via
 # CLEANUP_DONE so INT/TERM followed by the script's own tail-end exit never
 # double-runs cleanup.
+#
+# Issue #2306 follow-up P0/P1-a: this function is now the SOLE authority for
+# both (a) which Issue number cleanup acts on (always RESOLVED_ISSUE_NUMBER,
+# the identity-verified target -- never the raw, unverified
+# CANARY_ISSUE_NUMBER) and (b) the final process exit code (explicit `exit`
+# at the end, after disabling further EXIT trap re-entry via `trap - EXIT`,
+# since bash does not propagate a trap handler's `return` value as the
+# process exit status).
 
 CLEANUP_DONE=false
 CANARY_ISSUE_NUMBER=""
@@ -212,63 +305,86 @@ IDENTITY_STATUS="not_attempted"
 FALLBACK_STATUS="not_attempted"
 FALLBACK_CANDIDATE_COUNT="null"
 RESOLVED_ISSUE_NUMBER="null"
+RESOLVED_ISSUE_STATE="null"
 CLOSE_OK="false"
 CLOSE_STATE="null"
+CLOSE_VERIFIED="false"
 FINAL_STATUS="failure"
 
 cleanup_handler() {
-  local exit_code=$?
+  local original_rc=$?
+  # Disable further EXIT trap re-entry immediately: this function ends with
+  # an explicit `exit`, which would otherwise re-trigger the same trap.
+  trap - EXIT
+
   if [ "$CLEANUP_DONE" = "true" ]; then
-    return 0
+    if [ "$original_rc" = "130" ] || [ "$original_rc" = "143" ]; then
+      exit "$original_rc"
+    fi
+    if [ "$FINAL_STATUS" = "success" ]; then
+      exit 0
+    fi
+    exit 1
   fi
   CLEANUP_DONE=true
 
-  if [ -n "$CANARY_ISSUE_NUMBER" ] || [ "$RESOLVED_ISSUE_NUMBER" != "null" ]; then
-    local target_number="$RESOLVED_ISSUE_NUMBER"
-    if [ "$target_number" = "null" ]; then
-      target_number="$CANARY_ISSUE_NUMBER"
-    fi
-    if [ -n "$target_number" ] && [ "$target_number" != "null" ]; then
-      local close_json
-      close_json=$(close_and_verify "$target_number" "$CANARY_REPO" "claude-gpt live_issue_create_canary: disposable probe cleanup (${CANARY_TIMESTAMP})")
-      CLOSE_OK=$(printf '%s' "$close_json" | python3 -c 'import json,sys; print(str(json.load(sys.stdin)["close_ok"]).lower())' 2>/dev/null || echo false)
-      CLOSE_STATE=$(printf '%s' "$close_json" | python3 -c 'import json,sys; v=json.load(sys.stdin)["state"]; print(json.dumps(v))' 2>/dev/null || echo null)
+  # P0: close target is EXCLUSIVELY the identity-verified
+  # RESOLVED_ISSUE_NUMBER. The raw, unverified CANARY_ISSUE_NUMBER parsed
+  # from launcher stdout is never used as a close-target fallback.
+  if [ "$RESOLVED_ISSUE_NUMBER" != "null" ]; then
+    local close_json close_rc
+    close_json=$(close_and_verify "$RESOLVED_ISSUE_NUMBER" "$CANARY_REPO" "claude-gpt live_issue_create_canary: disposable probe cleanup (${CANARY_TIMESTAMP})")
+    close_rc=$?
+    CLOSE_OK=$(printf '%s' "$close_json" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("close_ok", False)).lower())' 2>/dev/null || echo false)
+    CLOSE_STATE=$(printf '%s' "$close_json" | python3 -c 'import json,sys; v=json.load(sys.stdin).get("state"); print(json.dumps(v))' 2>/dev/null || echo null)
+    if [ "$close_rc" -eq 0 ]; then
+      CLOSE_VERIFIED="true"
+    else
+      CLOSE_VERIFIED="false"
     fi
   fi
 
-  local close_state_closed=false
-  if [ "$CLOSE_STATE" = '"CLOSED"' ] || [ "$CLOSE_STATE" = '"closed"' ]; then
-    close_state_closed=true
-  fi
-
-  if [ "$FINAL_STATUS" = "success" ] && { [ "$CLOSE_OK" != "true" ] || [ "$close_state_closed" != "true" ]; }; then
+  if [ "$FINAL_STATUS" = "success" ] && { [ "$RESOLVED_ISSUE_NUMBER" = "null" ] || [ "$CLOSE_VERIFIED" != "true" ]; }; then
     FINAL_STATUS="failure"
   fi
 
   if [ -n "$EVIDENCE_FILE" ]; then
-    printf '{"schema":"CLAUDE_GPT_LIVE_ISSUE_CREATE_CANARY_RESULT_V1","status":"%s","generated_at":"%s","repo":"%s","canary_issue_number":%s,"launch_exit_code":%s,"identity_status":"%s","fallback_status":"%s","fallback_candidate_count":%s,"resolved_issue_number":%s,"close_ok":%s,"close_state":%s}\n' \
+    printf '{"schema":"CLAUDE_GPT_LIVE_ISSUE_CREATE_CANARY_RESULT_V1","status":"%s","generated_at":"%s","repo":"%s","canary_issue_number":%s,"launch_exit_code":%s,"identity_status":"%s","fallback_status":"%s","fallback_candidate_count":%s,"resolved_issue_number":%s,"resolved_issue_state":%s,"close_ok":%s,"close_state":%s,"close_verified":%s}\n' \
       "$FINAL_STATUS" "$CANARY_TIMESTAMP" "$CANARY_REPO" "${CANARY_ISSUE_NUMBER:-null}" "${LAUNCH_RC:-null}" \
-      "$IDENTITY_STATUS" "$FALLBACK_STATUS" "$FALLBACK_CANDIDATE_COUNT" "$RESOLVED_ISSUE_NUMBER" "$CLOSE_OK" "$CLOSE_STATE" > "$EVIDENCE_FILE"
+      "$IDENTITY_STATUS" "$FALLBACK_STATUS" "$FALLBACK_CANDIDATE_COUNT" "$RESOLVED_ISSUE_NUMBER" "$RESOLVED_ISSUE_STATE" "$CLOSE_OK" "$CLOSE_STATE" "$CLOSE_VERIFIED" > "$EVIDENCE_FILE"
   fi
 
   if [ "$FINAL_STATUS" = "success" ]; then
-    echo "PASS: live_issue_create_canary が disposable Issue #${RESOLVED_ISSUE_NUMBER} を作成/identity検証/close/close状態確認しました。証跡: ${EVIDENCE_FILE}" >&2
+    echo "PASS: live_issue_create_canary が disposable Issue #${RESOLVED_ISSUE_NUMBER} を作成/identity検証(OPEN)/close/close状態確認しました。証跡: ${EVIDENCE_FILE}" >&2
   else
-    echo "FAIL: live_issue_create_canary が完走しませんでした（identity_status=${IDENTITY_STATUS} fallback_status=${FALLBACK_STATUS} close_ok=${CLOSE_OK} close_state=${CLOSE_STATE}）。証跡: ${EVIDENCE_FILE}" >&2
+    echo "FAIL: live_issue_create_canary が完走しませんでした（identity_status=${IDENTITY_STATUS} fallback_status=${FALLBACK_STATUS} resolved_issue_state=${RESOLVED_ISSUE_STATE} close_verified=${CLOSE_VERIFIED}）。証跡: ${EVIDENCE_FILE}" >&2
   fi
 
-  return "$exit_code"
+  if [ "$original_rc" = "130" ] || [ "$original_rc" = "143" ]; then
+    exit "$original_rc"
+  fi
+  if [ "$FINAL_STATUS" = "success" ]; then
+    exit 0
+  fi
+  exit 1
 }
 
 # --- AC3: resolve the actual disposable Issue number to act on -------------
 #
 # args: repo expected_title expected_body marker
 # Sets IDENTITY_STATUS / FALLBACK_STATUS / FALLBACK_CANDIDATE_COUNT /
-# RESOLVED_ISSUE_NUMBER globals. Never sets RESOLVED_ISSUE_NUMBER unless an
-# unambiguous identity match was established either directly (parsed number
-# + matching title/body) or via fallback (single exact-title candidate).
+# RESOLVED_ISSUE_NUMBER / RESOLVED_ISSUE_STATE globals. Never sets
+# RESOLVED_ISSUE_NUMBER unless an unambiguous identity match (title AND
+# body, via an authoritative `gh issue view` readback) was established
+# either directly (parsed number) or via fallback (single exact-title
+# candidate, re-confirmed -- Issue #2306 follow-up P1-c). This is the
+# CLEANUP-target identity resolution; it deliberately does NOT gate on
+# state == open (an already-closed or wrong-body-but-title-matching
+# candidate may still be resolved here so cleanup can act on it) -- PASS
+# eligibility is a separate, stricter check performed by main().
 resolve_target_issue_number() {
   local repo="$1" expected_title="$2" expected_body="$3" marker="$4"
+  RESOLVED_ISSUE_STATE="null"
 
   if [ -n "$CANARY_ISSUE_NUMBER" ]; then
     local identity_json
@@ -276,6 +392,7 @@ resolve_target_issue_number() {
     IDENTITY_STATUS=$(printf '%s' "$identity_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status","not_found"))' 2>/dev/null || echo not_found)
     if [ "$IDENTITY_STATUS" = "match" ]; then
       RESOLVED_ISSUE_NUMBER="$CANARY_ISSUE_NUMBER"
+      RESOLVED_ISSUE_STATE=$(printf '%s' "$identity_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d.get("state"); print(json.dumps(s.lower() if isinstance(s, str) else s))' 2>/dev/null || echo null)
       return 0
     fi
   else
@@ -288,8 +405,21 @@ resolve_target_issue_number() {
   FALLBACK_STATUS=$(printf '%s' "$fallback_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status","none"))' 2>/dev/null || echo none)
   FALLBACK_CANDIDATE_COUNT=$(printf '%s' "$fallback_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("candidate_count",0))' 2>/dev/null || echo 0)
   if [ "$FALLBACK_STATUS" = "match" ]; then
-    RESOLVED_ISSUE_NUMBER=$(printf '%s' "$fallback_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["number"])')
-    return 0
+    local fallback_number reverify_json reverify_status
+    fallback_number=$(printf '%s' "$fallback_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["number"])')
+    # Issue #2306 follow-up P1-c: fallback candidates are title-matched only
+    # (gh issue list never filters on body) -- always re-confirm identity
+    # (title AND body AND state) via a direct, authoritative `gh issue view`
+    # readback before ever trusting this candidate as the cleanup target.
+    reverify_json=$(verify_identity "$fallback_number" "$repo" "$expected_title" "$expected_body")
+    reverify_status=$(printf '%s' "$reverify_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status","not_found"))' 2>/dev/null || echo not_found)
+    FALLBACK_STATUS="$reverify_status"
+    if [ "$reverify_status" = "match" ]; then
+      RESOLVED_ISSUE_NUMBER="$fallback_number"
+      RESOLVED_ISSUE_STATE=$(printf '%s' "$reverify_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d.get("state"); print(json.dumps(s.lower() if isinstance(s, str) else s))' 2>/dev/null || echo null)
+      return 0
+    fi
+    return 1
   fi
   return 1
 }
@@ -307,7 +437,12 @@ main() {
   evidence_dir=$(claude_gpt_evidence_dir "$SELF_PATH")
   mkdir -p "$evidence_dir"
   CANARY_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
-  EVIDENCE_FILE="${evidence_dir}/live-issue-create-canary-${CANARY_TIMESTAMP}.json"
+  # Issue #2306 Background「title の一意性不足」対応 + follow-up P2「evidence
+  # filename が秒単位 timestamp のみで衝突しうる」対応: PID + 乱数を含めた
+  # marker を、title 一意化とevidence filename 衝突回避の双方に使う（同秒複数
+  # run でも title と証跡ファイルの両方が衝突しない）。
+  CANARY_MARKER="$$-${RANDOM}${RANDOM}"
+  EVIDENCE_FILE="${evidence_dir}/live-issue-create-canary-${CANARY_TIMESTAMP}-${CANARY_MARKER}.json"
 
   if [ "${CLAUDE_GPT_LIVE_ISSUE_CREATE_CANARY_CONFIRM:-}" != "1" ] || [ "$confirm_flag" != "true" ]; then
     printf '{"schema":"CLAUDE_GPT_LIVE_ISSUE_CREATE_CANARY_RESULT_V1","status":"skip","reason":"opt_in_not_given","generated_at":"%s"}\n' \
@@ -345,9 +480,6 @@ main() {
   #     -> authoritative readback）を real trusted repository に対して完走させる。
   #     作成した disposable Issue は EXIT trap（cleanup_handler、上で登録済み）
   #     により正常終了・失敗・INT・TERM いずれの経路でも close を試みる。 ---
-  # Issue #2306 Background「title の一意性不足」対応: PID + 乱数を含めることで
-  # 同秒複数実行での title 衝突可能性を下げる。
-  CANARY_MARKER="$$-${RANDOM}${RANDOM}"
   CANARY_TITLE="claude-gpt live_issue_create_canary disposable probe (${CANARY_TIMESTAMP}-${CANARY_MARKER})"
   CANARY_BODY="## Acceptance Criteria
 
@@ -364,7 +496,9 @@ true  # AC1
 - scripts/claude-gpt/**
 
 This is a disposable canary Issue created by \`scripts/claude-gpt/live_issue_create_canary.sh\`
-(Issue #2299 AC8, Issue #2306). It will be closed immediately by the same run."
+(Issue #2299 AC8, Issue #2306). It will be closed immediately by the same run.
+
+<!-- claude-gpt-live-canary-run:${CANARY_MARKER} -->"
 
   local prompt
   prompt="isolated claude-gpt live_issue_create_canary: create-issue skill の通常
@@ -389,14 +523,24 @@ ${CANARY_BODY}"
 
   CANARY_ISSUE_NUMBER=$(printf '%s\n' "$claude_output" | sed -n 's/^CANARY_ISSUE_NUMBER=\([0-9]\+\).*/\1/p' | head -n1)
 
-  if [ "$LAUNCH_RC" -eq 0 ]; then
-    if resolve_target_issue_number "$CANARY_REPO" "$CANARY_TITLE" "$CANARY_BODY" "$CANARY_MARKER"; then
-      FINAL_STATUS="success"
-    fi
+  # Issue #2306 follow-up P1-b: cleanup-target resolution is always attempted,
+  # regardless of LAUNCH_RC -- a launcher that exits non-zero AFTER already
+  # creating the disposable Issue (e.g. crashes before printing the number)
+  # must not leak it. Only the PASS/FAIL determination below is gated on
+  # LAUNCH_RC == 0.
+  resolve_target_issue_number "$CANARY_REPO" "$CANARY_TITLE" "$CANARY_BODY" "$CANARY_MARKER" || true
+
+  # Issue #2306 follow-up P1-c: PASS requires launch success AND an
+  # identity-verified target AND that target's state to be OPEN at
+  # resolution time (an already-closed or otherwise-tainted match is a
+  # cleanup concern, never a PASS).
+  if [ "$LAUNCH_RC" -eq 0 ] && [ "$RESOLVED_ISSUE_NUMBER" != "null" ] && [ "$RESOLVED_ISSUE_STATE" = '"open"' ]; then
+    FINAL_STATUS="success"
   fi
 
   # cleanup_handler runs via the EXIT trap registered above (also covers the
-  # close + close-state-readback that determines the final FINAL_STATUS).
+  # close + close-state-readback, and is the sole authority for the actual
+  # final process exit code -- see Issue #2306 follow-up P1-a).
   if [ "$FINAL_STATUS" = "success" ]; then
     exit 0
   fi
