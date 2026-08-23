@@ -23,7 +23,7 @@ required-version = "==0.11.29"
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib -m 'not github_live'"
 markers = [
-  "github_live: exercises real GitHub API write access via gh CLI against a disposable Issue (deselected by default addopts; opt in explicitly with -m github_live and an authenticated gh CLI).",
+  "github_live: exercises real GitHub network interaction (gh CLI write access against a disposable Issue, or unauthenticated live GitHub REST/API reads) that is structurally unavailable or unsafe in the default CI authentication context (deselected by default addopts; opt in explicitly with -m github_live).",
 ]
 
 [tool.ruff]

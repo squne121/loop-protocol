@@ -1293,13 +1293,13 @@ class TestBuildCompactStdout:
             "artifacts": {},
             "hashes": {},
             "reason_code": "rate_limited",
-            "source": "github_api",
-            "operation": "fetch_issue",
+            "source": "credentialless_transport",
+            "operation": "read_issue",
         }
         output = wrapper._build_compact_stdout(result)
         assert "REASON_CODE: rate_limited" in output
-        assert "SOURCE: github_api" in output
-        assert "OPERATION: fetch_issue" in output
+        assert "SOURCE: credentialless_transport" in output
+        assert "OPERATION: read_issue" in output
         assert sensitive not in output
 
     def test_non_environment_failure_omits_reason_code_source_operation(self):
@@ -1320,8 +1320,8 @@ class TestBuildCompactStdout:
             "artifacts": {},
             "hashes": {},
             "reason_code": "rate_limited",
-            "source": "github_api",
-            "operation": "fetch_issue",
+            "source": "credentialless_transport",
+            "operation": "read_issue",
         }
         output = wrapper._build_compact_stdout(result)
         assert "REASON_CODE:" not in output
