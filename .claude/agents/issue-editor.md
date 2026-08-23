@@ -149,6 +149,49 @@ missing_sections: []            # rewrite 後も残っている不足セクシ�
 missing_contract_keys: []       # rewrite 後も残っている不足 contract キー（空 = 解消済み）
 ```
 
+## SEMANTIC_REWRITE_CONSTRAINTS_V1 の rewrite payload 契約（Issue #2296 由来）
+
+`issue-refinement-loop` の Step 2.5（semantic design review lane）で `join_review_results.py`
+が `effective_verdict: needs-fix` を返した場合、以下のスキーマの入力を受け取る。これは
+`FAIL_CLOSED_REWRITE_CONSTRAINTS_V1`（Issue #995、fail-closed セクション/契約キー補完専用）
+とは別の契約として共存する。`FAIL_CLOSED_REWRITE_CONSTRAINTS_V1` はそのまま維持され、本契約は
+semantic finding に基づく AC/VC/architecture 判断の書き換えを扱う。
+
+```yaml
+SEMANTIC_REWRITE_CONSTRAINTS_V1:
+  schema_version: "SEMANTIC_REWRITE_CONSTRAINTS_V1"
+  source_artifact: "<join_review_results.py 呼び出し元が渡す、検証済み semantic_review_result.json への path>"
+  checked_body_sha256: "<pin 済み body_sha256>"
+  findings:
+    - severity: blocker | high | medium | low
+      summary: ...
+      evidence_refs: []
+      recommended_fix: ...
+  freeform_rewrite_forbidden: false
+  max_rewrite_attempts: 2
+  no_progress_route: "human_judgment_required"
+```
+
+`source_artifact` / `checked_body_sha256` は `join_review_results.py` が
+`effective_verdict: needs-fix` を semantic finding 由来で返す際に埋め込むフィールドである
+（#2296 fix_delta iteration 6, P0-4）。`issue-refinement-loop` の Step 4 はこの payload を
+**再構築せずそのまま** `edit-issue` へ転送する（`rewrite_lane: "semantic"` と併せて
+`edit_issue_txn.py` の入力に含める。詳細は
+`.claude/skills/issue-refinement-loop/references/semantic-design-review.md` の Step 4 節を参照する）。
+
+### Rewrite 実行ルール (Rewrite Rules)
+
+1. `findings` のうち `severity: blocker|high` かつ **有効な** `owner_disposition`
+   （`recorded_by: owner` かつ `status: accepted|deferred` かつ非空の `reason` を全て満たすもの、
+   #2296 fix_delta iteration 6 P1-1）が未記録のものだけが rewrite 対象になる
+   （`join_review_results.py` の `route_high_open_to_rewrite` policy と一致させる）
+2. `recommended_fix` を機械的に適用するのではなく、`summary` / `evidence_refs` を根拠として
+   Issue 契約（AC・VC・Allowed Paths・Stop Conditions 等）を修正する
+3. `freeform_rewrite_forbidden: false`（既定）の場合、semantic finding の解消に必要な範囲で
+   本文の自由記述を修正してよい。ただし `## In Scope` / `## Out of Scope` の境界を超える
+   スコープ拡張が必要と判明した場合は rewrite を実施せず `status: failed` + `human_judgment_required` を返す
+4. `max_rewrite_attempts` を超えて同じ finding が解消しない場合、`no_progress_route` に従う
+
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。
