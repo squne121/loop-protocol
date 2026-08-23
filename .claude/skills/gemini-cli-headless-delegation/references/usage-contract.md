@@ -1212,7 +1212,7 @@ Caller は REPO_EVIDENCE_REF_V1 インスタンスに対して以下の rules �
 - **Caller MAY emit a NEW REPO_EVIDENCE_REF_V1 object** with new `verified_at`, `verification_method`, and metadata if re-validation succeeds（既存の inconclusive object は削除せず並行保持）
 - **Caller MUST preserve the original inconclusive object** alongside the new verified object for audit trail（inconclusive predecessor を削除しない）
 
-## SOURCE_EVIDENCE_ACQUISITION_RESULT_V1（#2195）
+## SOURCE_EVIDENCE_ACQUISITION_RESULT_V1（証跡取得失敗の分類、#2195）
 
 ### 目的
 
@@ -1252,12 +1252,12 @@ SOURCE_EVIDENCE_ACQUISITION_RESULT_V1:
   terminal_artifact: <SOURCE_EVIDENCE_TERMINAL_ARTIFACT_V1 | null>
 ```
 
-### Producer / Consumer 境界
+### Producer と Consumer の責務境界
 
 - producer（`codebase-investigator` / source-evidence producer、実装: `.claude/skills/gemini-cli-headless-delegation/scripts/source_evidence_acquisition.py`）: claim_kind の分類、`evidence_kind` / `dependency_group` / capability に基づく ordered route plan の生成、primary route の実行、provider 内 retry 完了後の final result 受領、lane-specific failure の場合だけ alternate route を最大 1 回実行、envelope の返却。
 - consumer（issue-refinement-loop、実装: `.claude/skills/issue-refinement-loop/scripts/route_source_evidence_result.py`）: envelope schema の検証、claim / baseline binding の確認、run 横断の `cross_lane_recovery_budget` 残余管理（単一 invocation スコープのメモリ上のみ、永続 DB なし）、`disposition` に基づく routing のみ。provider の stderr・exit code・retry policy を再解釈しない。
 
-### cross_lane_recovery_budget
+### cross_lane_recovery_budget（lane 間 recovery の予算管理）
 
 `local_git` と `github_blob` は同じ `repo_blob_at_commit` evidence_kind を独立に生成できる lane であり、この 2 lane のペアだけが cross-lane recovery 候補になる。budget は `scope: refinement_run`、`max_total: 1`（run 全体で dispatch した延べ回数を消費条件とする試行ベース。recovery 失敗も消費する）、`per_claim_max: 1`。同一 route の再試行、複数 lane への fan-out、未許可 lane への拡張は行わない。
 
@@ -1272,7 +1272,7 @@ SOURCE_EVIDENCE_ACQUISITION_RESULT_V1:
 
 dispatch 後に terminal result が得られない場合、`dispatch_state: outcome_unknown` として attempted 扱いにする。同一 `run_id` / `claim_id` / `route_id` の組は同一 run 内で二度と dispatch しない（`ValueError` で fail-closed）。
 
-### Terminal Artifact（AC6）
+### Terminal Artifact の生成（AC6）
 
 全 route が不可、または evidence が不足する場合、`terminal_artifact`（schema: `source_evidence_terminal_artifact/v1`）を生成する。claim・baseline（bounded fields のみ）・attempts・failure taxonomy・`unresolved_reason` を含み、最大 16 KiB 以下、raw stderr・raw transcript・credential・absolute path は含めない（含まれる場合は `ValueError` で fail-closed）。
 
