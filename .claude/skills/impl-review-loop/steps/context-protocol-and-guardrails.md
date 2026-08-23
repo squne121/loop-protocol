@@ -11,7 +11,7 @@
 | SubAgent | 出力契約 | 受け取り方 |
 |---|---|---|
 | `implementation-worker` | `IMPLEMENT_RESULT_V1` YAML | `status` / `pr_url` / `verification` を LOOP_STATE へ |
-| `test-runner` | `TEST_VERDICT_MACHINE v1` マーカー付き PR コメント（non-authoritative advisory、Issue #1856） | `gh pr view --json comments` 経由で抽出。参考情報として LOOP_STATE に反映してよいが、通常レビューの APPROVE/REQUEST_CHANGES 判定の必須 blocking input としては扱わない（authoritative evidence は `CI_CHECK_RUN_SCOPED` と束縛済み独立実行 Issue VC。`.claude/skills/pr-review-judge/references/evidence-policy.md` 参照） |
+| `test-runner` | `TEST_VERDICT_MACHINE v2` マーカー付き read-only report（呼び出し元への直接返却。test-runner は PR へコメントを投稿しない、Issue #1648, #88） | `spawn_agent` / `list_agents` の final result から直接受け取る（`gh pr view --json comments` からのTEST_VERDICT 抽出は normal routing として扱わない）。current-head binding tuple の照合結果である`VC_ADJUDICATION_RESULT_V1` を LOOP_STATE へ反映し、Step 4 起動可否の gate に使う（diagnostics-only の TEST_VERDICT_MACHINE 自体は APPROVE/REQUEST_CHANGES 判定の必須 blocking inputとしては扱わない。authoritative evidence は `CI_CHECK_RUN_SCOPED` と束縛済み独立実行 Issue VC。`.claude/skills/pr-review-judge/references/evidence-policy.md` 参照） |
 | `pr-reviewer` | `LOOP_VERDICT` YAML（verdict コメント内） | step-5-mergeability-handling.md の抽出手順を使う |
 
 ## 外部仕様調査の判定根拠記録

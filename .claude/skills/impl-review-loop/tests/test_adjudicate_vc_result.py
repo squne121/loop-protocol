@@ -732,3 +732,407 @@ def test_unrecognized_changed_path_record_is_fail_closed_indeterminate():
     assert result["overall_status"] == "indeterminate"
     assert result["blocking"] is True
     assert "unrecognized_changed_path_record" in result["errors"]
+
+
+# --- Issue #88 AC2/AC3: Step 4 current-head gate binding triple ---
+# evaluate_step4_vc_gate() re-derives a fail-closed decision from an
+# existing VC_ADJUDICATION_RESULT_V1 (produced by adjudicate_vc_result()
+# above) plus the caller-supplied "expected" (live) head SHA / contract body
+# SHA256 / command hashes triple.
+
+
+def test_ac2_step4_gate_accepts_matching_binding_triple():
+    # GIVEN a certified current-head PASS adjudication for a single AC
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={
+            "changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+    )
+    assert result["blocking"] is False
+
+    # WHEN Step 4 evaluates the gate against the exact live (head, body, commands) triple
+    decision = mod.evaluate_step4_vc_gate(
+        result,
+        expected_head_sha="head1",
+        expected_contract_body_sha256="sha256:" + "b" * 64,
+        expected_command_hashes=[current_item["command_hash"]],
+    )
+
+    # THEN pr-reviewer may be invoked
+    assert decision["invoke_pr_reviewer"] is True
+    assert decision["reason_code"] is None
+
+
+def test_ac3_step4_gate_rejects_head_drift():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={
+            "changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+    )
+    assert result["blocking"] is False
+
+    # WHEN the live PR head has since drifted away from the adjudicated head
+    decision = mod.evaluate_step4_vc_gate(
+        result,
+        expected_head_sha="head2-drifted",
+        expected_contract_body_sha256="sha256:" + "b" * 64,
+        expected_command_hashes=[current_item["command_hash"]],
+    )
+
+    # THEN the stale adjudication does not open the gate
+    assert decision["invoke_pr_reviewer"] is False
+    assert decision["reason_code"] == "head_mismatch"
+
+
+def test_ac3_step4_gate_rejects_body_drift():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={
+            "changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+    )
+    assert result["blocking"] is False
+
+    # WHEN the live Issue body has since been edited (different body_sha256)
+    decision = mod.evaluate_step4_vc_gate(
+        result,
+        expected_head_sha="head1",
+        expected_contract_body_sha256="sha256:" + "c" * 64,
+        expected_command_hashes=[current_item["command_hash"]],
+    )
+
+    # THEN the stale adjudication does not open the gate
+    assert decision["invoke_pr_reviewer"] is False
+    assert decision["reason_code"] == "body_mismatch"
+
+
+def test_ac3_step4_gate_rejects_command_drift():
+    baseline_item = _payload_item("AC1", failure_keys=[], exit_code=4)
+    baseline_item["classification"] = "expected_fail"
+    current_item = _payload_item("AC1", failure_keys=[], exit_code=0)
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_snapshot_payload([baseline_item]),
+        current_vc_result=_current_payload([current_item], head_sha="head1", reviewed_head_sha="head1"),
+        diff_summary={
+            "changed_paths": [".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+            "head_sha": "head1",
+        },
+        allowed_paths=[".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py"],
+    )
+    assert result["blocking"] is False
+
+    # WHEN the live Verification Commands have since changed (different literal command hash)
+    decision = mod.evaluate_step4_vc_gate(
+        result,
+        expected_head_sha="head1",
+        expected_contract_body_sha256="sha256:" + "b" * 64,
+        expected_command_hashes=["sha256:" + "9" * 64],
+    )
+
+    # THEN the stale adjudication does not open the gate
+    assert decision["invoke_pr_reviewer"] is False
+    assert decision["reason_code"] == "command_mismatch"
+
+
+# --- Issue #88 fix_delta Blocker 1: canonical adapter -----------------------
+# (TEST_VERDICT_MACHINE/v2 -> baseline_vc_preflight/v1, and the `adapt` /
+# `step4-gate` CLI subcommands wired to LOOP_STATE.vc_adjudication)
+
+
+def _sample_test_verdict() -> dict:
+    return {
+        "schema": "TEST_VERDICT_MACHINE/v2",
+        "producer_kind": "test-runner",
+        "repository": "squne121/loop-protocol",
+        "issue_number": 88,
+        "pr_number": 2312,
+        "head_sha": "a" * 40,
+        "reviewed_head_sha": "a" * 40,
+        "diff_head_sha": "a" * 40,
+        "contract_body_sha256": "sha256:" + "b" * 64,
+        "generated_at": "2026-08-23T00:00:00Z",
+        "result": "PASS",
+        "mergeable": "MERGEABLE",
+        "merge_state_status": "CLEAN",
+        "branch_behind_main": False,
+        "baseline_only": False,
+        "verification_commands_pass": 1,
+        "verification_commands_fail": 0,
+        "verification_skipped_count": 0,
+        "runtime_ac_results": [
+            {
+                "ac": "AC1",
+                "command": "pnpm test",
+                "command_hash": "sha256:" + "c" * 64,
+                "exit_code": 0,
+                "status": "pass",
+                "fallback_detected": False,
+                "artifact_present": "not_required",
+                "human_review_required": False,
+                "stop_condition_triggered": False,
+                "notes": "",
+            }
+        ],
+    }
+
+
+def test_adapt_converts_pass_report_to_baseline_vc_preflight_shape():
+    converted, errors = mod.adapt_test_verdict_to_current_vc_result(_sample_test_verdict())
+
+    assert errors == []
+    assert converted is not None
+    assert converted["schema"] == "baseline_vc_preflight/v1"
+    assert converted["head_sha"] == "a" * 40
+    assert converted["reviewed_head_sha"] == "a" * 40
+    assert converted["source"]["body_sha256"] == "sha256:" + "b" * 64
+    assert converted["results"] == [
+        {
+            "ac": "AC1",
+            "command_hash": "sha256:" + "c" * 64,
+            "raw_command": "pnpm test",
+            "exit_code": 0,
+            "failure_keys": [],
+            "raw_stdout": "",
+            "raw_stderr": "",
+        }
+    ]
+    assert converted["fallback_detected"] is False
+    assert converted["human_review_required"] is False
+
+
+def test_adapt_rejects_wrong_source_schema():
+    converted, errors = mod.adapt_test_verdict_to_current_vc_result({"schema": "SOMETHING_ELSE"})
+
+    assert converted is None
+    assert errors == ["unsupported_source_schema:'SOMETHING_ELSE'"]
+
+
+def test_adapt_unwraps_test_verdict_key():
+    wrapped = {"TEST_VERDICT": _sample_test_verdict()}
+    converted, errors = mod.adapt_test_verdict_to_current_vc_result(wrapped)
+
+    assert errors == []
+    assert converted is not None
+    assert converted["head_sha"] == "a" * 40
+
+
+def test_adapted_output_feeds_adjudicate_vc_result_as_a_certified_pass():
+    command_hash = "sha256:" + "c" * 64
+    body_sha256 = "sha256:" + "b" * 64
+    head_sha = "a" * 40
+
+    converted, errors = mod.adapt_test_verdict_to_current_vc_result(_sample_test_verdict())
+    assert errors == []
+    assert converted is not None
+
+    baseline_item = {
+        "ac": "AC1",
+        "command_hash": command_hash,
+        "failure_keys": [],
+        "exit_code": 1,
+        "category": "regression_gate",
+        "classification": "expected_fail",
+        "decision": "blocked",
+        "raw_command": "pnpm test",
+        "raw_stdout": "",
+        "raw_stderr": "",
+    }
+    contract_snapshot = {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
+        "body_sha256": body_sha256,
+        "checks": {"vc_preflight": {"classifications": [baseline_item]}},
+    }
+    diff_summary = {"changed_paths": [".claude/skills/impl-review-loop/SKILL.md"], "head_sha": head_sha}
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=contract_snapshot,
+        current_vc_result=converted,
+        diff_summary=diff_summary,
+        allowed_paths=[".claude/skills/impl-review-loop/**"],
+    )
+
+    assert result["overall_status"] == "pass"
+    assert result["blocking"] is False
+
+
+def test_adapt_cli_subcommand_writes_converted_payload(tmp_path: Path):
+    test_verdict_file = tmp_path / "test_verdict.json"
+    test_verdict_file.write_text(json.dumps(_sample_test_verdict()), encoding="utf-8")
+    adapt_out = tmp_path / "current_vc_result.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "adapt",
+            "--test-verdict-file",
+            str(test_verdict_file),
+            "--adapt-out",
+            str(adapt_out),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    converted = json.loads(adapt_out.read_text(encoding="utf-8"))
+    assert converted["schema"] == "baseline_vc_preflight/v1"
+    assert converted["head_sha"] == "a" * 40
+
+
+def test_step4_gate_cli_end_to_end_via_loop_state(tmp_path: Path):
+    """End-to-end: adapt -> adjudicate -> LOOP_STATE.vc_adjudication ->
+    `adjudicate_vc_result.py step4-gate` CLI, exit code 0 (invoke)."""
+    command_hash = "sha256:" + "c" * 64
+    body_sha256 = "sha256:" + "b" * 64
+    head_sha = "a" * 40
+
+    converted, errors = mod.adapt_test_verdict_to_current_vc_result(_sample_test_verdict())
+    assert errors == []
+
+    baseline_item = {
+        "ac": "AC1",
+        "command_hash": command_hash,
+        "failure_keys": [],
+        "exit_code": 1,
+        "category": "regression_gate",
+        "classification": "expected_fail",
+        "decision": "blocked",
+        "raw_command": "pnpm test",
+        "raw_stdout": "",
+        "raw_stderr": "",
+    }
+    contract_snapshot = {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
+        "body_sha256": body_sha256,
+        "checks": {"vc_preflight": {"classifications": [baseline_item]}},
+    }
+    diff_summary = {"changed_paths": [".claude/skills/impl-review-loop/SKILL.md"], "head_sha": head_sha}
+
+    adjudication = mod.adjudicate_vc_result(
+        contract_snapshot=contract_snapshot,
+        current_vc_result=converted,
+        diff_summary=diff_summary,
+        allowed_paths=[".claude/skills/impl-review-loop/**"],
+    )
+    assert adjudication["blocking"] is False
+
+    loop_state: dict = {}
+    mod.step4_persist_vc_adjudication(
+        loop_state,
+        head_sha=head_sha,
+        contract_body_sha256=body_sha256,
+        command_hashes=[command_hash],
+        adjudication_result=adjudication,
+    )
+    assert loop_state["vc_adjudication"]
+
+    loop_state_file = tmp_path / "loop_state.json"
+    loop_state_file.write_text(json.dumps(loop_state), encoding="utf-8")
+    hashes_file = tmp_path / "expected_hashes.json"
+    hashes_file.write_text(json.dumps([command_hash]), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "step4-gate",
+            "--loop-state-file",
+            str(loop_state_file),
+            "--expected-head-sha",
+            head_sha,
+            "--expected-contract-body-sha256",
+            body_sha256,
+            "--expected-command-hashes-file",
+            str(hashes_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["invoke_pr_reviewer"] is True
+    assert payload["reused"] is True
+
+
+def test_step4_gate_cli_rerun_when_no_entry_yet(tmp_path: Path):
+    loop_state_file = tmp_path / "loop_state.json"
+    loop_state_file.write_text(json.dumps({}), encoding="utf-8")
+    hashes_file = tmp_path / "expected_hashes.json"
+    hashes_file.write_text(json.dumps(["sha256:" + "1" * 64]), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "step4-gate",
+            "--loop-state-file",
+            str(loop_state_file),
+            "--expected-head-sha",
+            "a" * 40,
+            "--expected-contract-body-sha256",
+            "sha256:" + "b" * 64,
+            "--expected-command-hashes-file",
+            str(hashes_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["invoke_pr_reviewer"] is False
+
+
+def test_step4_gate_cli_malformed_loop_state_file_exit_2(tmp_path: Path):
+    loop_state_file = tmp_path / "loop_state.json"
+    loop_state_file.write_text("not json", encoding="utf-8")
+    hashes_file = tmp_path / "expected_hashes.json"
+    hashes_file.write_text(json.dumps(["sha256:" + "1" * 64]), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "step4-gate",
+            "--loop-state-file",
+            str(loop_state_file),
+            "--expected-head-sha",
+            "a" * 40,
+            "--expected-contract-body-sha256",
+            "sha256:" + "b" * 64,
+            "--expected-command-hashes-file",
+            str(hashes_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
