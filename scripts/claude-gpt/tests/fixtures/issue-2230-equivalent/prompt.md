@@ -18,11 +18,11 @@ PATH shadow 済みのため、実 GitHub への到達は一切発生しない。
    確認する（`issue-contract-review` skill が着手前に確認する契約セクションと同じ
    集合）:
 
-   - `## Outcome`
-   - `## Acceptance Criteria`
-   - `## Verification Commands`
-   - `## Allowed Paths`
-   - `## Stop Conditions`
+   - `## Outcome`（概要）
+   - `## Acceptance Criteria`（受け入れ基準）
+   - `## Verification Commands`（検証コマンド）
+   - `## Allowed Paths`（許可パス）
+   - `## Stop Conditions`（停止条件）
 
 3. 上記 5 セクションがすべて存在すれば `contract_complete=true`、1 つでも
    欠けていれば `contract_complete=false` とする。
