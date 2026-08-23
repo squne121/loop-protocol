@@ -2882,17 +2882,22 @@ empty value と omission が同じ効果を持つのか異なる効果を持つ�
 制限したい場合は、`tools` allowlist から `Skill` を外すか `disallowedTools` に `Skill` を含める、
 という upstream の実際の contract を参照する（disallowedTools を使う）。
 
-### mcpServers（MCP サーバー接続の継承制御）
+### mcpServers（agent 固有の追加/参照 MCP サーバー設定）
 
-`mcpServers` は `skills` とは非対称である。
+公式 docs の基本モデルでは、SubAgent は main conversation で利用可能な built-in tools と
+MCP tools を継承し、その上で `tools` / `disallowedTools` で絞り込む。`mcpServers`
+frontmatter フィールドは、main conversation にない MCP server を当該 SubAgent に
+追加で与える／参照するための **agent 固有の追加設定**であり、string reference を書けば
+parent session の該当 server 接続を共有できる。
 
-- **省略**: main conversation が接続している MCP server 接続を継承する。
-- **`mcpServers: []`（明示的な empty list）**: 継承される MCP server 接続を明示的にゼロにする
-  （server 接続層の制御）。
-
-ただし、接続された server から実際にどの tool を呼べるかは別レイヤーであり、`tools` /
-`disallowedTools`（`mcp__<server>` 構文を含む）が governs する。「empty list = MCP 全面無効化」
-という短絡的な言い回しは、server 接続層と tool capability 層を混同するため使わない。
+`mcpServers: []`（明示的な empty list）が「main conversation から継承する MCP server
+接続をゼロにする」と断定してはならない。empty value と omission の間に接続継承の有無という
+観測可能な意味差が upstream 公式 docs 上で明示されていない限り、その断定は公式仕様から
+導出できない。MCP tool の利用を制限したい場合は、`mcpServers` を空値化することではなく
+`tools` / `disallowedTools`（`mcp__<server>` 構文を含む）で行う、という upstream の実際の
+contract を参照する。過去の #2300 敵対的レビューでも同種の断定（`mcpServers: []` を
+universal disable sentinel として正本化すること）への警告があった。本節はその警告に沿い、
+断定ではなく不確実性を明示する表現を維持する。
 
 ### hooks（agent-local な追加フック定義）
 
@@ -2912,20 +2917,30 @@ user / plugin のいずれの scope から読み込まれた Agent かによっ�
 
 ### memory（persistent memory の opt-in 設定）
 
-省略時、当該 SubAgent 固有の persistent memory は opt-in されず、SubAgent は毎回 fresh に
-起動する。ただし、これはグローバル `autoMemoryEnabled` 設定（デフォルト true）に依存しており、
-「frontmatter の値そのものが唯一の制御点」とは書かない。global setting とフィールド値の両方が
-関与する（例: `memory: user`）。
+`memory` の省略は、当該 SubAgent 固有の persistent memory が指定されないことのみを意味する。
+明示する場合は `memory: user` のように scope を指定する。これとは独立した別軸として、
+グローバル `autoMemoryEnabled` 設定（デフォルト true）があり、これが off の場合は
+`memory` field が frontmatter 上に存在していても機能全体が無効化される。「`memory` 省略」
+と「`autoMemoryEnabled` による無効化」を混同しない。
+
+「SubAgent は毎回 fresh に起動する」という言い方は、**新規 invocation**（同一 Agent の
+新しい呼び出し）に限定する。既存の Agent ID を resume する場合は full conversation
+history を保持するため、この限定なしに「毎回 fresh」と一般化しない。
 
 ### background（フォアグラウンド/バックグラウンド実行の制御）
 
-省略時の挙動は実行モードに依存し、foreground を無条件に保証しない。
+`background` の挙動は値と環境変数の組み合わせで決まる。fork mode の有無で場合分けする
+二分法ではなく、以下の4則で記述する（fork mode の有効/無効と interactive/non-interactive
+の別は独立した軸であり、単純な二分法にはならない）。
 
-- fork mode が有効な対話セッション（既定）: foreground が必要な場合を除き既定で background 実行
-- fork mode が無効な非対話実行（`-p` 等）: 同期的に結果が必要な場合のみ foreground、
-  そうでなければ background が既定
+1. **省略**: Claude が実行時に選択する。現行は background が既定であり、結果が直ちに
+   必要な場合のみ foreground を選択する。
+2. **`background: true`**: 通常の background-task 機構の下では常に background 実行になる。
+3. **`CLAUDE_CODE_FORK_SUBAGENT=1`**: interactive セッションか `-p` かに関わらず、
+   すべての SubAgent が background 実行になる。
+4. **`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`**: background task 機構自体を無効化し、
+   同期的（synchronous）に実行する。
 
-`background: true` を明示すればこれらのモードに関わらず background 実行を強制する。
 「省略 = foreground」という単純な断定はしない。
 
 ### isolation（worktree 分離の適用条件）
@@ -2944,7 +2959,7 @@ preload / 接続層の制御、`hooks` は lifecycle/operation policy の agent-
 `memory` / `background` / `isolation` は実行時の永続化・同期性・作業ディレクトリという
 実行モードの制御であって、いずれも `tools` / `disallowedTools` が扱う capability
 allowlist/denylist そのものを代替しない。Skill 利用の制限や `mcp__<server>` tool の制限は、
-`skills` / `mcpServers` の空値化ではなく `tools` / `disallowedTools を使う` のが upstream の
+`skills` / `mcpServers` の空値化ではなく `tools` / `disallowedTools` を使うのが upstream の
 実際の contract である。
 
 ### invocation context（起動コンテキストの違い）: Agent tool 経由 vs `claude --agent`
@@ -2955,8 +2970,16 @@ Agent tool 経由で spawn される SubAgent と、`claude --agent <name>`（`c
 
 - **system prompt の扱い**: Agent tool 経由は frontmatter body のみが prompt になるのに対し、
   `--agent` invocation では frontmatter body が既定の system prompt を丸ごと置き換える。
-- **tool filtering の有無**: Agent tool 経由は `tools` / `disallowedTools` と background
-  制約の対象になるが、`--agent` による main session 起動はそれらの background 制約を受けない。
+- **SubAgent-specific filters の追加（tool filtering を失うわけではない）**: `claude --agent
+  <name>` の main thread は、その Agent の system prompt・tool restrictions・model を
+  使用する点では通常の Agent 定義の利用と同様であり、tool filtering そのものを失うわけでは
+  ない。実際に書く価値がある差は、Agent tool 経由で spawn される SubAgent には background
+  実行時の built-in-tool reduction 等、**SubAgent としての起動そのものに付随する追加の
+  filter** がかかる一方、`--agent` による main session 起動はその SubAgent ではないため
+  この追加 filter の対象にならない、という点である。
+- **`Agent(worker, researcher)` 型 allowlist の scope**: この括弧内 type list は `--agent`
+  による main thread 起動では有効に機能するが、nested SubAgent definition の内側では
+  無視される。
 
 上記6フィールドの semantics は、invocation context が異なれば意味も変わりうるため、
 安易に同一視しない。
