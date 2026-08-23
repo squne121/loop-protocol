@@ -13,6 +13,7 @@ INPUT_CONTRACT
 
 OUTPUT_CONTRACT
 - `TEST_VERDICT` machine-readable summary だけを返す。
+- test-runner は PR へコメントを投稿しない（read-only report のみを呼び出し元へ返す。Issue #88）。
 - main thread context budget を守り、structured output・command results・runtime_ac_results だけを返す。
 - raw transcript、raw diff、raw logs は返さない。
 

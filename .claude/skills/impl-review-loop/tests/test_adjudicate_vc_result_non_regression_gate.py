@@ -1215,3 +1215,245 @@ def test_pr_review_only_requires_test_verdict_binding() -> None:
     )
     assert result["overall_status"] != "pass"
     assert result["errors"] == ["test_verdict_head_sha_mismatch"]
+
+
+# --- Issue #88 AC5/AC6: same-loop reuse + happy-path invocation counts ---
+# Step4AdjudicationCache (an in-memory, process-scoped object) was removed
+# in the Issue #88 fix_delta (Blocker 2): it could not survive across
+# separate CLI invocations of this script and had no API to seed a
+# Step-2-produced adjudication before Step 4 evaluates the gate. Reuse is
+# now expressed as a plain LOOP_STATE.vc_adjudication mapping via
+# step4_persist_vc_adjudication() / step4_gate_from_loop_state(), which is
+# YAML/JSON-serializable and reusable across process boundaries. These
+# tests simulate a loop iteration directly against those two functions so
+# the reuse/no-double-execution behavior is proven without any new schema,
+# hook, or publisher.
+
+
+def _ac5_ac6_fixture_head_sha() -> str:
+    return "head-ac5-ac6"
+
+
+def _ac5_ac6_command_hash() -> str:
+    return "sha256:" + "7" * 64
+
+
+def _ac5_ac6_body_sha256() -> str:
+    return "sha256:" + "e" * 64
+
+
+def _ac5_ac6_baseline_and_current():
+    baseline_item = {
+        "ac": "AC1",
+        "command_hash": _ac5_ac6_command_hash(),
+        "failure_keys": [{"kind": "pytest_nodeid", "key": "tests/test_alpha.py::test_ok"}],
+        "exit_code": 4,
+        "category": "regression_gate",
+        "classification": "expected_fail",
+        "decision": "blocked",
+        "raw_command": "pytest tests/test_alpha.py",
+        "raw_stdout": "",
+        "raw_stderr": "",
+    }
+    current_item = {**baseline_item, "exit_code": 0, "failure_keys": []}
+    contract_snapshot = {
+        "schema": "CONTRACT_REVIEW_RESULT_V1",
+        "status": "go",
+        "body_sha256": _ac5_ac6_body_sha256(),
+        "checks": {"vc_preflight": {"classifications": [baseline_item]}},
+    }
+    current_vc_result = {
+        "schema": "baseline_vc_preflight/v1",
+        "generated_at": "2026-08-23T00:00:00Z",
+        "status": "pass",
+        "errors": [],
+        "fallback_detected": False,
+        "human_review_required": False,
+        "stop_condition_triggered": False,
+        "source": {"body_sha256": _ac5_ac6_body_sha256()},
+        "results": [current_item],
+        "head_sha": _ac5_ac6_fixture_head_sha(),
+        "reviewed_head_sha": _ac5_ac6_fixture_head_sha(),
+    }
+    diff_summary = {
+        "changed_paths": [ADJUDICATOR_PATH],
+        "head_sha": _ac5_ac6_fixture_head_sha(),
+    }
+    return contract_snapshot, current_vc_result, diff_summary
+
+
+def _run_step4_loop_iteration(loop_state, run_test_runner_and_adjudicate):
+    """Simulate a single Step 4 loop iteration against a plain
+    LOOP_STATE.vc_adjudication mapping: reuse-or-run test-runner, persist a
+    valid adjudication into loop_state, then evaluate the gate and spawn
+    pr-reviewer only when it opens."""
+    lookup = mod.step4_gate_from_loop_state(
+        loop_state,
+        expected_head_sha=_ac5_ac6_fixture_head_sha(),
+        expected_contract_body_sha256=_ac5_ac6_body_sha256(),
+        expected_command_hashes=[_ac5_ac6_command_hash()],
+    )
+    if lookup["reused"]:
+        return lookup, True
+
+    adjudication_result = run_test_runner_and_adjudicate()
+    mod.step4_persist_vc_adjudication(
+        loop_state,
+        head_sha=_ac5_ac6_fixture_head_sha(),
+        contract_body_sha256=_ac5_ac6_body_sha256(),
+        command_hashes=[_ac5_ac6_command_hash()],
+        adjudication_result=adjudication_result,
+    )
+    decision = mod.evaluate_step4_vc_gate(
+        adjudication_result,
+        expected_head_sha=_ac5_ac6_fixture_head_sha(),
+        expected_contract_body_sha256=_ac5_ac6_body_sha256(),
+        expected_command_hashes=[_ac5_ac6_command_hash()],
+    )
+    return decision, False
+
+
+def test_ac5_same_binding_tuple_reused_without_reexecuting_test_runner():
+    contract_snapshot, current_vc_result, diff_summary = _ac5_ac6_baseline_and_current()
+    test_runner_calls = {"count": 0}
+
+    def _run_test_runner_and_adjudicate():
+        test_runner_calls["count"] += 1
+        return mod.adjudicate_vc_result(
+            contract_snapshot=contract_snapshot,
+            current_vc_result=current_vc_result,
+            diff_summary=diff_summary,
+            allowed_paths=[ADJUDICATOR_PATH],
+        )
+
+    # GIVEN an empty LOOP_STATE (no persisted vc_adjudication entries yet)
+    loop_state: dict = {}
+
+    first_decision, first_reused = _run_step4_loop_iteration(
+        loop_state, _run_test_runner_and_adjudicate
+    )
+    assert first_decision["invoke_pr_reviewer"] is True
+    assert first_reused is False
+    assert test_runner_calls["count"] == 1
+
+    # WHEN the same binding tuple is evaluated again within the same loop
+    second_decision, second_reused = _run_step4_loop_iteration(
+        loop_state, _run_test_runner_and_adjudicate
+    )
+
+    # THEN the LOOP_STATE-persisted adjudication is reused and test-runner
+    # is not re-executed
+    assert second_decision["invoke_pr_reviewer"] is True
+    assert second_reused is True
+    assert test_runner_calls["count"] == 1
+
+
+def test_ac6_happy_path_fixture_test_runner_once_pr_reviewer_once():
+    contract_snapshot, current_vc_result, diff_summary = _ac5_ac6_baseline_and_current()
+    test_runner_calls = {"count": 0}
+    pr_reviewer_calls = {"count": 0}
+
+    def _run_test_runner_and_adjudicate():
+        test_runner_calls["count"] += 1
+        return mod.adjudicate_vc_result(
+            contract_snapshot=contract_snapshot,
+            current_vc_result=current_vc_result,
+            diff_summary=diff_summary,
+            allowed_paths=[ADJUDICATOR_PATH],
+        )
+
+    loop_state: dict = {}
+
+    # GIVEN a single happy-path binding tuple loop iteration
+    decision, _ = _run_step4_loop_iteration(loop_state, _run_test_runner_and_adjudicate)
+    if decision["invoke_pr_reviewer"]:
+        pr_reviewer_calls["count"] += 1
+
+    # THEN test-runner ran exactly once and pr-reviewer ran exactly once
+    assert test_runner_calls["count"] == 1
+    assert pr_reviewer_calls["count"] == 1
+
+
+def test_persist_only_stores_valid_adjudication_result():
+    # GIVEN an adjudication result that does NOT satisfy evaluate_step4_vc_gate
+    # for its own asserted binding (blocking True)
+    contract_snapshot, current_vc_result, diff_summary = _ac5_ac6_baseline_and_current()
+    blocking_result = mod.adjudicate_vc_result(
+        contract_snapshot=contract_snapshot,
+        current_vc_result=current_vc_result,
+        diff_summary=diff_summary,
+        allowed_paths=[ADJUDICATOR_PATH],
+    )
+    blocking_result = {**blocking_result, "blocking": True}
+    loop_state: dict = {}
+
+    # WHEN Step 2 attempts to persist it into LOOP_STATE
+    mod.step4_persist_vc_adjudication(
+        loop_state,
+        head_sha=_ac5_ac6_fixture_head_sha(),
+        contract_body_sha256=_ac5_ac6_body_sha256(),
+        command_hashes=[_ac5_ac6_command_hash()],
+        adjudication_result=blocking_result,
+    )
+
+    # THEN nothing is stored (Issue #88 AC5: only a valid adjudication is reused)
+    assert loop_state.get("vc_adjudication", {}) == {}
+
+
+def test_command_hash_reorder_is_treated_as_stale_binding():
+    # GIVEN a valid adjudication bound to commands in order [A, B]
+    hash_a = "sha256:" + "a" * 64
+    hash_b = "sha256:" + "b" * 64
+    adjudication = {
+        "schema": mod.SCHEMA_NAME,
+        "schema_version": mod.SCHEMA_VERSION,
+        "overall_status": "pass",
+        "blocking": False,
+        "rerun_required": False,
+        "per_ac": [
+            {
+                "ac": "AC1",
+                "status": "pass",
+                "blocking": False,
+                "command_hash": hash_a,
+                "failure_keys": [],
+                "reason_code": "expected_pass_still_passes",
+                "summary": "ok",
+            },
+            {
+                "ac": "AC2",
+                "status": "pass",
+                "blocking": False,
+                "command_hash": hash_b,
+                "failure_keys": [],
+                "reason_code": "expected_pass_still_passes",
+                "summary": "ok",
+            },
+        ],
+        "evidence_refs": [],
+        "source_integrity": {
+            "head_sha": _ac5_ac6_fixture_head_sha(),
+            "contract_body_sha256": _ac5_ac6_body_sha256(),
+            "evidence_fresh": True,
+            "evidence_complete": True,
+        },
+        "errors": [],
+        "artifact_ref": None,
+        "artifact_digest": None,
+        "stdout_truncated": False,
+        "omitted_fields": [],
+    }
+
+    # WHEN Step 4 evaluates the gate expecting the same commands reordered [B, A]
+    decision = mod.evaluate_step4_vc_gate(
+        adjudication,
+        expected_head_sha=_ac5_ac6_fixture_head_sha(),
+        expected_contract_body_sha256=_ac5_ac6_body_sha256(),
+        expected_command_hashes=[hash_b, hash_a],
+    )
+
+    # THEN the gate treats it as a command mismatch (stale binding), even
+    # though the set of command hashes is identical (Issue #88 fix_delta
+    # Blocker 3)
+    assert decision["invoke_pr_reviewer"] is False
+    assert decision["reason_code"] == "command_mismatch"

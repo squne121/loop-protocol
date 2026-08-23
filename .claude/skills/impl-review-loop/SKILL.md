@@ -55,7 +55,7 @@ subprocess 分離方式（`invocation_token` による再提示）は撤回済�
 [Step 1: Implementation]  → implementation-worker SubAgent (implement-issue skill)
         ↓
 [Step 2: Verification]    → test-runner SubAgent
-        ↓
+        ↓ (current-head gate: VC_ADJUDICATION_RESULT_V1.blocking == false のときのみ通過。Issue #88)
 [Step 4: PR Review]       → pr-reviewer SubAgent (pr-review-judge skill)
         ↓
 [Step 5: Judgment]        → reviewer_verdict + live_mergeability を route_loop_verdict_v2() で解析
@@ -119,6 +119,17 @@ LOOP_STATE:
     result_schema: CONTRACT_SNAPSHOT_ENSURE_RESULT_V1
     contract_snapshot_url: null
     artifact_path: artifacts/contract-snapshot/...
+  vc_adjudication:
+    # Issue #88 fix_delta Blocker 1/2: Step 2 が独立検証で得た
+    # VC_ADJUDICATION_RESULT_V1 を Step 4 の current-head gate が再利用するための
+    # 永続化フィールド（`Step4AdjudicationCache` という in-memory object の代替）。
+    # key は `.claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py` の
+    # `step4_binding_key()` が (head_sha, contract_body_sha256, ordered command_hashes)
+    # から導出する文字列。Step 4 は `step4_gate_from_loop_state()`
+    # （CLI: `adjudicate_vc_result.py step4-gate`）でこの mapping を live binding に
+    # 再照合するだけで、test-runner を再起動しない。stale/invalid なら Step 2 へ
+    # 戻り新規 binding key で再度書き込む。
+    "<binding_key>": <VC_ADJUDICATION_RESULT_V1>
 ```
 
 ## 終了条件

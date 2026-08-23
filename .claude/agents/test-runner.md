@@ -105,7 +105,7 @@ PR 番号が渡された場合、verify 工程の冒頭で:
 gh pr view <PR番号> --json mergeable,mergeStateStatus
 ```
 
-- `mergeable: CONFLICTING` または `mergeStateStatus: DIRTY|BLOCKED` → `TEST_VERDICT: FAIL` + PR コメントに `mergeable=CONFLICTING` 明記。CONFLICTING 解消は `implementation-worker` の責務
+- `mergeable: CONFLICTING` または `mergeStateStatus: DIRTY|BLOCKED` → `TEST_VERDICT: FAIL` + read-only report に `mergeable=CONFLICTING` 明記。CONFLICTING 解消は `implementation-worker` の責務
 - `mergeStateStatus: BEHIND` → head ref が base branch より古いだけであり、CONFLICTING / DIRTY / BLOCKED と同一視しない。`TEST_VERDICT` を FAIL 化しない。通常の Verification Commands 実行へ進む。update-branch / rebase 自動化は Step 5 / #67 の責務
 - `mergeable: UNKNOWN` → 5 秒間隔で最大 3 回 retry し、それでも UNKNOWN なら `TEST_VERDICT: PARTIAL` で「mergeable=UNKNOWN（GitHub API 計算中）」と明記
 - `mergeable: MERGEABLE` → 通常の Verification Commands 実行へ進む
@@ -143,10 +143,10 @@ contract snapshot で「動作検証 VC」として指定されたスクリプ�
 
 ## TEST_VERDICT 報告フォーマット（read-only report）
 
-test-runner は本フォーマットを **呼び出し元への read-only report として返すのみ**であり、PR へのコメント投稿は行わない（Issue #1648）。実際の PR 投稿は以下の2段を経由する:
+test-runner は本フォーマットを **呼び出し元への read-only report として返すのみ**であり、PR へコメントを投稿しない（Issue #1648, #88）。test-runner 自身は `gh pr comment` 等でこの TEST_VERDICT を投稿しない。実際の PR 投稿は以下の2段を経由する:
 
-1. **materializer**（`.claude/skills/impl-review-loop/scripts/materialize_test_verdict_artifact.py`）が、この read-only report と Child A（#1646）の producer receipt・execution record artifact、Child B（#1647）の `test_verdict.publish` request 相当の入力を突き合わせ、current Issue/PR/HEAD/body SHA/artifact digest binding を検証した上で `TEST_VERDICT_MACHINE/v2` input bundle を生成する。
-2. **dedicated publisher**（`scripts/agent-guards/controlled_skill_mutation_exec.py` の `test_verdict.publish` コマンド、Child B）が、その input bundle 由来の publish request のみを受け付けて実際に PR へコメントを投稿する。
+1. **materializer**（`.claude/skills/impl-review-loop/scripts/materialize_test_verdict_artifact.py`、legacy diagnostics compatibility path）が、この read-only report と Child A（#1646）の producer receipt・execution record artifact、Child B（#1647）の `test_verdict.publish` request 相当の入力を突き合わせ、current Issue/PR/HEAD/body SHA/artifact digest binding を検証した上で `TEST_VERDICT_MACHINE/v2` input bundle を生成する。
+2. **dedicated publisher**（`scripts/agent-guards/controlled_skill_mutation_exec.py` の `test_verdict.publish` コマンド、Child B、legacy diagnostics compatibility path）が、その input bundle 由来の publish request のみを受け付けて実際に PR へコメントを投稿する。materializer/publisher は Step 2/Step 4 の判定正本ではない（`step-2-verification.md` の独立検証節参照）。
 
 以下は read-only report の内容（machine-readable marker と YAML ブロックにより、`pr-review-judge` / `impl-review-loop` / materializer が機械的に parse できる形式）:
 
@@ -203,7 +203,7 @@ TEST_VERDICT:
 ```
 ```
 
-**marker**: `<!-- TEST_VERDICT_MACHINE v2 -->` は test-runner が投稿するコメントにのみ含まれる正本マーカー。
+**marker**: `<!-- TEST_VERDICT_MACHINE v2 -->` は materializer/publisher（legacy diagnostics compatibility path）が投稿する場合の PR コメントにのみ含まれる正本マーカー。test-runner 自身はこの read-only report を呼び出し元へ返すのみで PR コメントを投稿しない。
 
 **`baseline_only: true` の判定基準**: 全失敗が main ブランチでも再現する既存問題で、PR diff に起因する新規失敗が 0 件である場合のみ true。1 件でも今回差分起因の失敗があれば false。
 
