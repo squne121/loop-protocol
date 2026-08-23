@@ -2221,6 +2221,25 @@ properties:
         type: array
         items:
           type: integer
+  rewrite_lane:
+    # Issue #2316: additive, optional discriminator. Omitting the field
+    # entirely is equivalent to fail_closed_repair (preserves pre-#2316
+    # behaviour exactly). join_review_results.py sets this to "semantic"
+    # when an open blocker/high semantic finding routes to rewrite.
+    enum: [fail_closed_repair, semantic]
+  semantic_rewrite_constraints:
+    # Issue #2316: additive, optional. Only accepted when rewrite_lane ==
+    # "semantic" (presence-correlation invariant); forbidden otherwise
+    # (including when rewrite_lane is omitted). The nested payload is a
+    # versioned opaque envelope produced by join_review_results.py --
+    # edit_issue_txn.py validates only schema_version and does not deep
+    # -validate source_artifact / checked_body_sha256 / findings /
+    # max_rewrite_attempts / no_progress_route.
+    type: [object, "null"]
+    required: [schema_version]
+    properties:
+      schema_version:
+        const: SEMANTIC_REWRITE_CONSTRAINTS_V1
 ```
 
 - `title_update.required == true` は non-empty の `proposed_title` と `reason` を必須とし、
