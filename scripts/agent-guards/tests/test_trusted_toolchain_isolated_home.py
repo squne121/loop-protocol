@@ -560,3 +560,120 @@ def test_sanitize_env_secret_canary_never_reaches_real_child_process(monkeypatch
     assert "GH_CONFIG_DIR" not in child_reported_env
     artifact_text = artifact_path.read_text(encoding="utf-8")
     assert canary not in artifact_text
+
+
+# ---------------------------------------------------------------------------
+# Issue #2275: `uv_not_found` gets a structured JSON diagnostic payload
+# instead of the bare `{name}_not_found` string, while every other trusted
+# executable name (`git`, `ssh`, ...) keeps its existing unchanged contract.
+# ---------------------------------------------------------------------------
+
+
+def test_uv_not_found_diagnostic_payload_keys(monkeypatch, tmp_path):
+    """GIVEN `uv` cannot be resolved anywhere on the trusted `uv` search
+    path
+    WHEN `_resolve_trusted_executable("uv", ...)` raises
+    THEN the `uv_not_found:` diagnostic payload's key set is exactly
+    `error`/`candidates_searched`/`expected_version`/
+    `recommended_install_dir`/`remediation_hint` (Issue #2275 AC1)."""
+    monkeypatch.setitem(
+        exec_mod._TRUSTED_TOOLCHAIN_HOSTED_ROOTS, "uv", tmp_path / "no-hostedtoolcache-here"
+    )
+    real_account_home = tmp_path / "real-account-home-empty"
+    real_account_home.mkdir()
+    _patch_real_account_home(monkeypatch, real_account_home)
+    monkeypatch.setattr(exec_mod.shutil, "which", lambda name, path=None: None)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        exec_mod._resolve_trusted_executable("uv", str(REPO_ROOT))
+
+    message = str(exc_info.value)
+    assert message.startswith("uv_not_found: ")
+    payload = json.loads(message[len("uv_not_found: "):])
+    assert set(payload.keys()) == {
+        "error",
+        "candidates_searched",
+        "expected_version",
+        "recommended_install_dir",
+        "remediation_hint",
+    }
+
+
+def test_uv_not_found_candidates_searched_matches_safe_entries(monkeypatch, tmp_path):
+    """GIVEN an env-spoofed `HOME` with a populated `.local/bin` and an
+    ambient `PATH` entry that is not part of the trusted `uv` search lane
+    WHEN `_resolve_trusted_executable("uv", ...)` raises `uv_not_found`
+    THEN `candidates_searched` exactly matches (same order) the `path=`
+    argument this call actually passed to `shutil.which`, and contains
+    neither the ambient `PATH` entry nor the env-spoofed-`HOME`-derived
+    path (Issue #2275 AC2)."""
+    monkeypatch.setitem(
+        exec_mod._TRUSTED_TOOLCHAIN_HOSTED_ROOTS, "uv", tmp_path / "no-hostedtoolcache-here"
+    )
+    real_account_home = tmp_path / "real-account-home-empty"
+    real_account_home.mkdir()
+    _patch_real_account_home(monkeypatch, real_account_home)
+    spoofed_home = tmp_path / "spoofed-home"
+    (spoofed_home / ".local" / "bin").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(spoofed_home))
+    ambient_path_dir = tmp_path / "ambient-path-dir"
+    ambient_path_dir.mkdir()
+    monkeypatch.setenv("PATH", str(ambient_path_dir))
+
+    captured_path_args = []
+
+    def _fake_which(name, path=None):
+        captured_path_args.append(path)
+        return None
+
+    monkeypatch.setattr(exec_mod.shutil, "which", _fake_which)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        exec_mod._resolve_trusted_executable("uv", str(REPO_ROOT))
+
+    assert len(captured_path_args) == 1
+    actual_safe_entries = captured_path_args[0].split(os.pathsep)
+    payload = json.loads(str(exc_info.value)[len("uv_not_found: "):])
+    assert payload["candidates_searched"] == actual_safe_entries
+    assert not any(str(spoofed_home) in entry for entry in payload["candidates_searched"])
+    assert str(ambient_path_dir) not in payload["candidates_searched"]
+
+
+def test_uv_not_found_recommended_install_dir_without_existing_dir(monkeypatch, tmp_path):
+    """GIVEN the real (`pwd`-resolved) account home has no `.local/bin`
+    directory yet
+    WHEN `_resolve_trusted_executable("uv", ...)` raises `uv_not_found`
+    THEN `recommended_install_dir` still equals
+    `pwd.getpwuid(os.getuid()).pw_dir + "/.local/bin"`, and that
+    nonexistent directory is NOT included in `candidates_searched`
+    (Issue #2275 AC3)."""
+    monkeypatch.setitem(
+        exec_mod._TRUSTED_TOOLCHAIN_HOSTED_ROOTS, "uv", tmp_path / "no-hostedtoolcache-here"
+    )
+    real_account_home = tmp_path / "real-account-home-no-local-bin"
+    real_account_home.mkdir()
+    _patch_real_account_home(monkeypatch, real_account_home)
+    monkeypatch.setattr(exec_mod.shutil, "which", lambda name, path=None: None)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        exec_mod._resolve_trusted_executable("uv", str(REPO_ROOT))
+
+    payload = json.loads(str(exc_info.value)[len("uv_not_found: "):])
+    expected_dir = str(real_account_home / ".local" / "bin")
+    assert payload["recommended_install_dir"] == expected_dir
+    assert not os.path.isdir(expected_dir)
+    assert expected_dir not in payload["candidates_searched"]
+
+
+def test_non_uv_not_found_unchanged(monkeypatch, tmp_path):
+    """GIVEN `name != "uv"` (e.g. `git`)
+    WHEN `_resolve_trusted_executable("git", ...)` fails to resolve
+    THEN the existing `{name}_not_found` string is unchanged (no
+    `uv_not_found:`-style JSON payload), and no account-home lane is
+    added to its search targets (Issue #2275 AC4)."""
+    monkeypatch.setattr(exec_mod.shutil, "which", lambda name, path=None: None)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        exec_mod._resolve_trusted_executable("git", str(REPO_ROOT))
+
+    assert str(exc_info.value) == "git_not_found"

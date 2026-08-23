@@ -483,6 +483,40 @@ Issue #2241 / PR #2247 の実装範囲では、以下は意図的に「未解決
   非書き込みな専用 toolchain ディレクトリ、または dedicated user / OS-level sandbox の新設が必要であり、これは
   Issue #2251 / #2276 / #2280 いずれのスコープも超える（CWE-427 相当の構造的制約が残る）。
 
+### Trusted uv のローカル開発復旧
+
+`scripts/agent-guards/skill_runtime_exec.py` の `_resolve_trusted_executable("uv", ...)` は、`uv` を
+以下 3 つの lane からこの優先順位で探索する（Issue #2251 / #2276 / #2280）。ローカル dev 環境で
+`uv_not_found` に遭遇した場合、まずどの lane が欠けているかを切り分ける。
+
+1. **CI hosted-toolcache lane**（例: `/opt/hostedtoolcache/uv/<version>/x86_64/uv`）: GitHub Actions
+   runner イメージが提供する、最も強く検証される trust root。ローカル dev マシンには通常存在しない。
+2. **system-directory lane**（`/usr/local/bin`、`/usr/bin` 等の固定システム標準ディレクトリ）: sudo で
+   インストールした `uv` を置く場所。
+3. **no-sudo user-local lane**（real OS account home 由来の `~/.local/bin`、`pwd.getpwuid(os.getuid()).pw_dir`
+   から算出。ambient `HOME` 環境変数には依存しない）: sudo 権限がない開発環境向けの lane（Issue #2276 decision
+   record）。この lane は `pyproject.toml` の `[tool.uv].required-version` に対する exact version pin 一致
+   時のみ有効になる（`_validate_trusted_executable_version`）。
+
+いずれの lane にも見つからない場合、`_resolve_trusted_executable("uv", ...)` は `uv_not_found: ` prefix に
+続けて `error` / `candidates_searched`（実際に `shutil.which()` へ渡した候補ディレクトリ列。存在しない
+ディレクトリを含まない）/ `expected_version`（`pyproject.toml` の pin） / `recommended_install_dir`（real
+account home の `.local/bin`。未作成でも算出される） / `remediation_hint` を含む構造化 JSON payload 付きで
+`RuntimeError` を送出する（Issue #2275）。
+
+**復旧手順（no-sudo user-local lane）:**
+
+1. `pyproject.toml` の `[tool.uv].required-version` から pin（例: `==0.11.29`）を取得する。
+2. 公式の versioned installer スクリプトを、そのバージョン番号を指定した URL から一旦ローカルへ保存する
+   （`https://astral.sh/uv/<バージョン番号>/install.sh` 相当。中身を確認してから実行し、fetch と実行を
+   同一コマンドで直結しない）。
+3. 保存したスクリプトを `UV_INSTALL_DIR` に real account home の `.local/bin`（例: `$HOME/.local/bin`）を
+   指定して実行する。
+4. `uv --version` を実行し、出力バージョンが手順 1 で取得した pin と完全一致することを確認する。
+
+`git` 等、`uv` 以外の trusted executable にはこの account-home lane も診断 payload も追加されない
+（探索対象・エラーメッセージともに変更なし）。
+
 ## SSOT Routing Table（SSOT ルーティング表）
 
 SSOT 追加時の参照先を集約した索引。AI エージェントは実装着手前に対象トピックの SSOT を本表から確認する。
