@@ -18,14 +18,56 @@ literal command SHA256 一覧）に対して再照合する。この再照合は
 - literal command SHA256 の集合が現在の Verification Commands と不一致（stale command）
 
 上記いずれにも該当しない場合のみ `pr-reviewer` を起動する。
-同一 root invocation 内で同一 binding tuple の有効な adjudication が既に存在する場合は
-`.claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py` の
-`Step4AdjudicationCache` を用いて再利用し、test-runner を再実行しない
+同一 binding tuple（head/body/command が全て一致）の有効な adjudication が
+`LOOP_STATE.vc_adjudication`（Step 2 が `step4_persist_vc_adjudication()` で
+書き込む、plain YAML/JSON シリアライズ可能なマッピング）に既に存在する場合は
+`step4_gate_from_loop_state()` がそれを再利用し、test-runner を再実行しない
 （binding tuple の head/body/command のいずれかが変われば別 key となり、
-旧 adjudication は自動的に stale として扱われ再実行される）。
+旧 adjudication は自動的に stale として扱われ再実行される。旧 `Step4AdjudicationCache`
+はプロセス内メモリのみに存在し CLI を複数回起動する構成では前回状態が残らなかったため、
+Issue #88 fix_delta で LOOP_STATE ベースの永続化へ置き換えられた）。
 
 TEST_VERDICT comment/artifact（存在する場合）は diagnostics-only であり、
 この gate の判定入力にはならない。TEST_VERDICT だけを与えても Step 4 の gate は開かない。
+
+### 実行コマンド例（current-head gate の具体的な呼び出し）
+
+Step 2 が test-runner の read-only report（`TEST_VERDICT_MACHINE/v2` 相当）を
+受け取ったら、まず canonical adapter で `adjudicate_vc_result.py --current-vc-result-file`
+が受理する `baseline_vc_preflight/v1` 形へ変換し、通常の adjudicate 呼び出しで
+`VC_ADJUDICATION_RESULT_V1` を得て `LOOP_STATE.vc_adjudication` へ永続化する
+（`step4_persist_vc_adjudication()`、Python から呼ぶか、同等の永続化を
+呼び出し元プロセスが行う）。
+
+```bash
+# 1) test-runner の read-only report(JSON) を current_vc_result schema へ変換
+#    （adapter は adjudicate_vc_result.py の adapt subcommand として同居する）
+uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py adapt \
+  --test-verdict-file /tmp/test_runner_report.json \
+  --adapt-out /tmp/current_vc_result.json
+
+# 2) 通常の adjudicate 呼び出し（LOOP_STATE への永続化は呼び出し元が
+#    step4_persist_vc_adjudication() で行う）
+uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py \
+  --contract-snapshot-file /tmp/contract_snapshot.json \
+  --current-vc-result-file /tmp/current_vc_result.json \
+  --diff-summary-file /tmp/diff_summary.json \
+  --allowed-paths-file /tmp/allowed_paths.json
+
+# 3) pr-reviewer を spawn_agent する直前に、live PR head / Issue body / literal
+#    command SHA256 を再取得して current-head gate を評価する
+uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py step4-gate \
+  --loop-state-file /tmp/loop_state.json \
+  --expected-head-sha "$(gh pr view <pr_number> --json headRefOid --jq .headRefOid)" \
+  --expected-contract-body-sha256 "$(gh issue view <issue_number> --json body --jq .body | sha256sum | awk '"'"'{print "sha256:" $1}'"'"')" \
+  --expected-command-hashes-file /tmp/expected_command_hashes.json
+```
+
+`step4-gate` は単一 JSON 決定を stdout に出力し、exit code は
+`0=invoke`（pr-reviewer 起動可）/ `1=rerun`（Step 2 再実行が必要）/
+`2=malformed`（`--loop-state-file` / `--expected-command-hashes-file` が
+壊れている、または LOOP_STATE が object でない）である。`exit 1` の場合は
+`pr-reviewer` を起動せず Step 2 に戻る。
 
 Codex CLI では `pr-reviewer` custom agent を起動し、root thread は file edit / test 実行 / commit / push / review judgment を直接行わない。
 

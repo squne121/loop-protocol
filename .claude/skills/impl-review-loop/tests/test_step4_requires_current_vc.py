@@ -1,10 +1,13 @@
 """Issue #88 AC1/AC4/AC7: pr-reviewer must not be invoked without a
 current-head, non-blocking VC_ADJUDICATION_RESULT_V1.
 
-These tests exercise `evaluate_step4_vc_gate` / `Step4AdjudicationCache`
-added to `adjudicate_vc_result.py`, using a lightweight in-process loop
-simulation (no persistent ledger, no new schema, no new hook -- Issue #88
-Required Design #9 / Out of Scope).
+These tests exercise `evaluate_step4_vc_gate` added to
+`adjudicate_vc_result.py`, using a lightweight in-process loop simulation
+(no persistent ledger, no new schema, no new hook -- Issue #88 Required
+Design #9 / Out of Scope). Same-loop reuse across separate LOOP_STATE
+lookups (`step4_gate_from_loop_state` / `step4_persist_vc_adjudication`,
+Issue #88 fix_delta Blocker 2) is covered separately in
+`test_adjudicate_vc_result_non_regression_gate.py`.
 """
 
 from __future__ import annotations
