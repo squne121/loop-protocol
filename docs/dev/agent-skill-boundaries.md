@@ -2874,7 +2874,7 @@ empty value と omission が同じ効果を持つのか異なる効果を持つ�
 **field ごとに個別の runtime semantics**（一般化した3分類 taxonomy にはしない。フィールドごとに
 挙動が異なるため）を記述する。
 
-### skills
+### skills（起動時に preload する Skill の指定）
 
 `skills: []`（明示的な empty list）と省略は**同一の効果**であり、いずれも「起動時に preload
 される Skill がない」ことのみを意味する。Skill 利用そのものの禁止ではない。`Skill` tool が
@@ -2882,7 +2882,7 @@ empty value と omission が同じ効果を持つのか異なる効果を持つ�
 制限したい場合は、`tools` allowlist から `Skill` を外すか `disallowedTools` に `Skill` を含める、
 という upstream の実際の contract を参照する（disallowedTools を使う）。
 
-### mcpServers
+### mcpServers（MCP サーバー接続の継承制御）
 
 `mcpServers` は `skills` とは非対称である。
 
@@ -2894,7 +2894,7 @@ empty value と omission が同じ効果を持つのか異なる効果を持つ�
 `disallowedTools`（`mcp__<server>` 構文を含む）が governs する。「empty list = MCP 全面無効化」
 という短絡的な言い回しは、server 接続層と tool capability 層を混同するため使わない。
 
-### hooks
+### hooks（agent-local な追加フック定義）
 
 `hooks: {}`（明示的な empty object）と省略は、当該 SubAgent の frontmatter が **agent-local** な
 追加 hook を定義しないことのみを意味する。settings ファイル・managed policy・plugin 由来の
@@ -2910,14 +2910,14 @@ deny / block しうる。したがって hook は `tools` / `disallowedTools` �
 user / plugin のいずれの scope から読み込まれた Agent かによって、上記フィールドの適用条件
 （workspace trust の要否等）が異なりうる点に注意する。
 
-### memory
+### memory（persistent memory の opt-in 設定）
 
 省略時、当該 SubAgent 固有の persistent memory は opt-in されず、SubAgent は毎回 fresh に
 起動する。ただし、これはグローバル `autoMemoryEnabled` 設定（デフォルト true）に依存しており、
 「frontmatter の値そのものが唯一の制御点」とは書かない。global setting とフィールド値の両方が
 関与する（例: `memory: user`）。
 
-### background
+### background（フォアグラウンド/バックグラウンド実行の制御）
 
 省略時の挙動は実行モードに依存し、foreground を無条件に保証しない。
 
@@ -2928,7 +2928,7 @@ user / plugin のいずれの scope から読み込まれた Agent かによっ�
 `background: true` を明示すればこれらのモードに関わらず background 実行を強制する。
 「省略 = foreground」という単純な断定はしない。
 
-### isolation
+### isolation（worktree 分離の適用条件）
 
 現行の有効値は `worktree` のみ。省略時は親 / main session と同じ作業ディレクトリで実行され、
 agent-specific な worktree isolation は要求されない。ただし、**親 / main session 自体が既に
@@ -2947,7 +2947,7 @@ allowlist/denylist そのものを代替しない。Skill 利用の制限や `mc
 `skills` / `mcpServers` の空値化ではなく `tools` / `disallowedTools を使う` のが upstream の
 実際の contract である。
 
-### invocation context: Agent tool 経由 vs `claude --agent`
+### invocation context（起動コンテキストの違い）: Agent tool 経由 vs `claude --agent`
 
 Agent tool 経由で spawn される SubAgent と、`claude --agent <name>`（`claude -p --agent <name>`
 を含む。PR #2293 の production path が実際に採用している invocation）で main session として
@@ -2961,7 +2961,7 @@ Agent tool 経由で spawn される SubAgent と、`claude --agent <name>`（`c
 上記6フィールドの semantics は、invocation context が異なれば意味も変わりうるため、
 安易に同一視しない。
 
-### historical incident と normative source
+### historical incident（教訓の出所）と normative source（規範的情報源）
 
 Issue #2237 / PR #2293 は本セクションの **historical incident**（教訓の出所）として参照する。
 Issue #2237 の fix_delta 対応中に `.claude/agents/retrospective-runtime-observer.md` /
