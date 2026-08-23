@@ -157,19 +157,18 @@ def test_leaf_frontmatter_contract_skills_explicitly_empty(path: Path) -> None:
 
 @pytest.mark.parametrize("path", [_RUNTIME_OBSERVER_PATH, _EVALUATOR_PATH])
 def test_leaf_frontmatter_contract_memory_background_isolation_intentionally_omitted(path: Path) -> None:
-    # `memory`/`background`/`isolation` have no official Claude Code SubAgent
-    # frontmatter sentinel value that means "disabled" (Issue #2237 fix_delta
-    # iteration-4 Warning 2, carrying forward iteration-3's P1-1 finding --
-    # confirmed by grepping every `.claude/agents/*.md` in this repository:
-    # none declares `background:`/`isolation:` at all). Writing a fabricated
-    # value (e.g. `isolation: none`) would add an undefined frontmatter key
-    # rather than actually disabling anything, so this fix_delta keeps these
-    # two keys omitted -- and this test pins that as an *intentional*
-    # decision (not a leftover gap): if a future edit merely omits them by
-    # accident it would still pass (no assertion possible for a
-    # nonexistent-upstream-field), so the enforceable half of the intent is
-    # asserted the other way: IF either key is ever added, it must not
-    # silently enable memory/background/isolation.
+    # `memory`/`background`/`isolation` ARE real, documented Claude Code
+    # SubAgent frontmatter fields (see docs/dev/agent-skill-boundaries.md
+    # "SubAgent frontmatter フィールド明示基準" -- Issue #2300 corrected the
+    # earlier, stale claim that these keys did not exist upstream at all).
+    # This fix_delta (Issue #2237 fix_delta iteration-4 Warning 2, carrying
+    # forward iteration-3's P1-1 finding) keeps both leaf SubAgents omitting
+    # these three keys as an *intentional* choice, not a leftover gap. This
+    # test does not -- and cannot -- assert the omission itself (there is no
+    # way to assert a key's absence proves an omission was intentional vs.
+    # accidental); it asserts the enforceable half of the intent instead:
+    # IF either key is ever added to one of these frontmatter files, it must
+    # not silently enable memory/background/isolation.
     frontmatter = _parse_frontmatter(path)
     for key in ("memory", "background", "isolation"):
         if key in frontmatter:
