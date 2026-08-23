@@ -1096,6 +1096,30 @@ def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
     # existing allowlist and PATH/trusted-executable behavior.
     if command_id == "preflight.run.fixture.with_human_context":
         allowed_keys.add("GH_CONFIG_DIR")
+    # Issue #2311 fix_delta (PR #2320 review P0-1): only the bare
+    # `preflight.run` command's first hop (`workflow_start_entry.py`) reads
+    # an invocation-scoped capability request off these three env vars as
+    # its CLI-flag fallback (the canonical bare `preflight.run` registry
+    # argv itself only ever carries `--issue-number`/`--repo` -- there is no
+    # `--spark-mode`/`--spark-fallback`/`--planned-operations-json` flag on
+    # that argv for a caller to use instead). Without this allowlist
+    # addition, a caller-declared capability request set via these env vars
+    # before invoking the canonical executor was silently dropped by this
+    # function, so `workflow_start_entry.py` always observed `None`/`None`/
+    # `[]` regardless of what the caller actually intended -- masking
+    # `unsupported_operation`/`required+forbidden` Spark blocks that should
+    # have stopped the inner preflight from ever starting. No other command
+    # id receives these three keys: sibling profiles
+    # (`preflight.run.with_anchor` / `.with_human_context` /
+    # `.with_agent_report` / `.fixture` / `.fixture.with_human_context`)
+    # first-hop into `run_refinement_preflight.py` directly and do not
+    # consume this env-based capability request at all.
+    if command_id == "preflight.run":
+        allowed_keys |= {
+            "LOOP_SPARK_MODE",
+            "LOOP_SPARK_FALLBACK",
+            "LOOP_PLANNED_OPERATIONS_JSON",
+        }
     env = {
         key: value
         for key, value in os.environ.items()

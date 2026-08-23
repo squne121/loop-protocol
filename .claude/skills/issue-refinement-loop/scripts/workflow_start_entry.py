@@ -14,17 +14,46 @@ Within a SINGLE continuous invocation, this module:
 
   1. Assembles the caller-declared, invocation-scoped capability request
      (`spark_mode` / `spark_fallback` / `planned_operations`, each operation
-     carrying `phase` / `actor_role` / `requires_mutation`). This request is
-     NOT a static global superset of every possible workflow_operation --
-     it is whatever THIS invocation's caller explicitly declares (via CLI
-     flags, or their `LOOP_SPARK_MODE` / `LOOP_SPARK_FALLBACK` /
-     `LOOP_PLANNED_OPERATIONS_JSON` environment-variable fallback, since the
-     canonical `preflight.run` registry argv itself only carries
-     `--issue-number` / `--repo` -- Issue #2311 P0-6 / AC1 keep that argv
-     shape byte-for-byte otherwise unchanged). A missing or malformed
-     request fails closed as `environment_failure` BEFORE the producer is
-     ever invoked (AC5) -- this is independent of, and checked earlier
-     than, the AC3 producer-response malformed case below.
+     carrying `phase` / `actor_role` / `operation` / `requires_mutation` --
+     matching `workflow_capability_preflight.py`'s own producer-side
+     `_load_planned_operations()` schema byte-for-byte, PR #2320 review
+     P0-2). This request is NOT a static global superset of every possible
+     workflow_operation -- it is whatever THIS invocation's caller
+     explicitly declares (via CLI flags, or their `LOOP_SPARK_MODE` /
+     `LOOP_SPARK_FALLBACK` / `LOOP_PLANNED_OPERATIONS_JSON`
+     environment-variable fallback, since the canonical `preflight.run`
+     registry argv itself only carries `--issue-number` / `--repo` -- Issue
+     #2311 P0-6 / AC1 keep that argv shape byte-for-byte otherwise
+     unchanged; the caller instead exports these three env vars scoped to
+     THIS ONE invocation only -- never as a persistent/exported shell
+     setting -- immediately before running the canonical `preflight.run`
+     executor, per `SKILL.md`'s capability-request setup procedure, PR
+     #2320 review P0-1 item 3). `scripts/agent-guards/skill_runtime_exec.py`
+     `_sanitize_env()` allowlists exactly these three env var names for the
+     `preflight.run` command id so this env-var transport actually reaches
+     this process when launched via the canonical executor (PR #2320
+     review P0-1 item 1 -- previously these three names were silently
+     stripped by the executor's allowlist, so a canonical
+     `skill_runtime_exec.py --command-id preflight.run ...` invocation
+     always observed `None`/`None`/absent regardless of what the caller
+     intended). A missing or malformed request -- including a genuinely
+     OMITTED `planned_operations` declaration -- fails closed as
+     `environment_failure` BEFORE the producer is ever invoked (AC5, PR
+     #2320 review P0-1 item 2: the "missing declaration is treated as an
+     empty-but-valid set" exception introduced by a prior fix_delta round
+     is REMOVED -- it papered over the fact that the request could not
+     reach this process at all, rather than fixing that reachability gap).
+     This is independent of, and checked earlier than, the AC3
+     producer-response malformed case below.
+  1a. `spark_mode` is restricted to `required` / `preferred` and
+     `spark_fallback` to `forbidden` / `allowed` (`workflow_capability_
+     preflight.py`'s own fixed enum, PR #2320 review P0-2 item 2). The CLI
+     flags reject any other value at the `argparse` boundary
+     (`choices=...`); the `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK`
+     environment-variable fallback is validated by the SAME
+     `_validate_spark_mode`/`_validate_spark_fallback` helpers explicitly
+     (env-var input bypasses `argparse`'s own `choices` enforcement, so it
+     cannot rely on that alone).
   2. Calls `root_entry_router.capability_preflight_result()` (imported, not
      reimplemented -- AC2) exactly once to run the workflow capability
      preflight producer.
@@ -76,11 +105,17 @@ import root_entry_router  # noqa: E402  (sys.path must be prepared first)
 
 SCHEMA_VERSION = "WORKFLOW_START_ENTRY_RESULT_V1"
 
-_REQUIRED_OPERATION_KEYS = ("phase", "actor_role", "requires_mutation")
+_REQUIRED_OPERATION_KEYS = ("phase", "actor_role", "operation", "requires_mutation")
 
 _ENV_SPARK_MODE = "LOOP_SPARK_MODE"
 _ENV_SPARK_FALLBACK = "LOOP_SPARK_FALLBACK"
 _ENV_PLANNED_OPERATIONS_JSON = "LOOP_PLANNED_OPERATIONS_JSON"
+
+# Fixed enums, matching `workflow_capability_preflight.py`'s own
+# `argparse` `choices=[...]` for `--spark-mode`/`--spark-fallback`
+# byte-for-byte (Issue #2311 fix_delta / PR #2320 review P0-2 item 2).
+_SPARK_MODE_CHOICES = ("required", "preferred")
+_SPARK_FALLBACK_CHOICES = ("forbidden", "allowed")
 
 
 class CapabilityRequestError(ValueError):
@@ -90,16 +125,51 @@ class CapabilityRequestError(ValueError):
     blocked result before the producer is ever invoked."""
 
 
+def _validate_spark_mode(value: Optional[str]) -> Optional[str]:
+    """Validate `spark_mode` against the fixed enum (PR #2320 review P0-2
+    item 2). `None` (Spark not requested at all) always passes through --
+    only a NON-None value outside the enum is rejected. Applied uniformly
+    to both the `--spark-mode` CLI flag and the `LOOP_SPARK_MODE`
+    environment-variable fallback (the latter bypasses `argparse`'s own
+    `choices=` enforcement, so it needs this same check explicitly)."""
+    if value is None:
+        return None
+    if value not in _SPARK_MODE_CHOICES:
+        raise CapabilityRequestError(f"spark_mode_invalid:{value}")
+    return value
+
+
+def _validate_spark_fallback(value: Optional[str]) -> Optional[str]:
+    """Validate `spark_fallback` against the fixed enum (PR #2320 review
+    P0-2 item 2). Same `None`-passthrough / CLI+env uniform-validation
+    contract as `_validate_spark_mode` above."""
+    if value is None:
+        return None
+    if value not in _SPARK_FALLBACK_CHOICES:
+        raise CapabilityRequestError(f"spark_fallback_invalid:{value}")
+    return value
+
+
 def _parse_planned_operations(raw: Optional[str]) -> list[dict]:
     """Parse and validate the caller-declared, invocation-scoped
     `planned_operations` JSON array. Raises `CapabilityRequestError` if the
     value is missing, non-JSON, not a non-empty list, or if any entry is
-    missing one of `phase` / `actor_role` / `requires_mutation` (AC5). This
+    missing one of `phase` / `actor_role` / `operation` / `requires_mutation`,
+    has a non-string/empty `operation`, or has a non-bool `requires_mutation`
+    (AC5; schema aligned with `workflow_capability_preflight.py`'s own
+    `_load_planned_operations()` -- PR #2320 review P0-2 item 1). This
     function never invents a default -- an absent declaration is a caller
-    error, not treated as an empty-but-valid set, since a workflow-start
+    error, not treated as an empty-but-valid set: a workflow-start
     invocation that intends zero downstream mutation must say so with an
-    explicit empty-operations declaration is still ambiguous; the caller
-    MUST declare its planned operations."""
+    explicit empty-operations declaration; the caller MUST declare its
+    planned operations (PR #2320 review P0-1 item 2 -- a prior fix_delta
+    round's `planned_operations_omitted` exception, which treated a
+    genuinely absent declaration as an implicit empty set, is REMOVED. That
+    exception existed only because the caller's real declaration could not
+    reach this process through the canonical executor at all; now that the
+    executor's env allowlist carries it through (see module docstring),
+    the original fail-closed contract is restored without loss of
+    reachability)."""
     if raw is None or not raw.strip():
         raise CapabilityRequestError("planned_operations_missing")
     try:
@@ -114,6 +184,10 @@ def _parse_planned_operations(raw: Optional[str]) -> list[dict]:
         missing = [key for key in _REQUIRED_OPERATION_KEYS if key not in operation]
         if missing:
             raise CapabilityRequestError(f"planned_operations_entry_missing_keys:{','.join(missing)}")
+        if not isinstance(operation["operation"], str) or not operation["operation"]:
+            raise CapabilityRequestError("planned_operations_entry_operation_not_nonempty_string")
+        if not isinstance(operation["requires_mutation"], bool):
+            raise CapabilityRequestError("planned_operations_entry_requires_mutation_not_bool")
     return data
 
 
@@ -122,29 +196,17 @@ def build_capability_request(
     spark_mode: Optional[str],
     spark_fallback: Optional[str],
     planned_operations_json: Optional[str],
-    planned_operations_omitted: bool = False,
 ) -> dict[str, Any]:
     """Assemble the caller-declared capability request. Raises
-    `CapabilityRequestError` if `planned_operations_json` is malformed
-    (AC5). `spark_mode` / `spark_fallback` are optional (a caller that
-    never needs Spark may omit both).
-
-    `planned_operations_omitted` is a CLI/env-resolution-level signal (set
-    by `main()`, never by a direct programmatic `run()` caller) meaning:
-    the caller never had any way to supply `--planned-operations-json` or
-    `LOOP_PLANNED_OPERATIONS_JSON` at all (the canonical bare `preflight.run`
-    registry argv only carries `--issue-number`/`--repo` -- Issue #2311
-    P0-6/AC1). When True, `planned_operations_json` is bypassed entirely
-    and the request is built with an empty operations list, matching
-    `workflow_capability_preflight.py`'s own producer semantics where an
-    omitted `planned_operations` argument is a valid, empty operations set.
-    Default is False, preserving this function's original strict
-    missing-or-malformed-fails-closed contract for every existing/direct
-    caller (AC5/AC9)."""
-    if planned_operations_omitted:
-        planned_operations: list[dict] = []
-    else:
-        planned_operations = _parse_planned_operations(planned_operations_json)
+    `CapabilityRequestError` if `planned_operations_json` is missing or
+    malformed (AC5 -- fail-closed, no omission exception; PR #2320 review
+    P0-1 item 2), or if `spark_mode` / `spark_fallback` are set to a value
+    outside their fixed enum (PR #2320 review P0-2 item 2). `spark_mode` /
+    `spark_fallback` being `None` is always valid (a caller that never
+    needs Spark may omit both)."""
+    planned_operations = _parse_planned_operations(planned_operations_json)
+    spark_mode = _validate_spark_mode(spark_mode)
+    spark_fallback = _validate_spark_fallback(spark_fallback)
     return {
         "spark_mode": spark_mode,
         "spark_fallback": spark_fallback,
@@ -201,7 +263,6 @@ def run(
     spark_mode: Optional[str],
     spark_fallback: Optional[str],
     planned_operations_json: Optional[str],
-    planned_operations_omitted: bool = False,
     capability_preflight_result_fn: Callable[..., dict] = root_entry_router.capability_preflight_result,
     invoke_inner_preflight_fn: Callable[..., int] = _default_invoke_inner_preflight,
 ) -> tuple[dict[str, Any], int]:
@@ -215,7 +276,6 @@ def run(
             spark_mode=spark_mode,
             spark_fallback=spark_fallback,
             planned_operations_json=planned_operations_json,
-            planned_operations_omitted=planned_operations_omitted,
         )
     except CapabilityRequestError as exc:
         # AC5: caller-side missing/malformed request. Fail closed WITHOUT
@@ -282,11 +342,37 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--issue-number", type=int, required=True)
     parser.add_argument("--repo", required=True)
-    parser.add_argument("--spark-mode", default=None)
-    parser.add_argument("--spark-fallback", default=None)
+    # `choices` rejects any non-enum value supplied via the CLI flag at the
+    # `argparse` boundary itself (PR #2320 review P0-2 item 2). `default=None`
+    # remains valid even though it is not itself listed in `choices`
+    # (argparse never validates the default value, only user-supplied
+    # values), matching `workflow_capability_preflight.py`'s own
+    # `--spark-mode`/`--spark-fallback` argparse definitions.
+    parser.add_argument("--spark-mode", default=None, choices=list(_SPARK_MODE_CHOICES))
+    parser.add_argument("--spark-fallback", default=None, choices=list(_SPARK_FALLBACK_CHOICES))
     parser.add_argument("--planned-operations-json", default=None)
     args = parser.parse_args(argv)
 
+    # `LOOP_SPARK_MODE` / `LOOP_SPARK_FALLBACK` / `LOOP_PLANNED_OPERATIONS_JSON`
+    # are this invocation's ONLY way to carry a capability request through
+    # the canonical bare `preflight.run` registry argv, which itself only
+    # ever carries `--issue-number`/`--repo` (Issue #2311 P0-6/AC1 keeps
+    # that argv shape byte-for-byte unchanged). The caller is expected to
+    # export these three env vars scoped to this ONE invocation only (never
+    # as a persistent/exported shell setting -- see `SKILL.md`'s capability
+    # request setup procedure, PR #2320 review P0-1 item 3), and
+    # `scripts/agent-guards/skill_runtime_exec.py`'s `_sanitize_env()`
+    # allowlists exactly these three names for the `preflight.run` command
+    # id so a canonical `skill_runtime_exec.py --command-id preflight.run
+    # ...` invocation actually carries them through to this process (PR
+    # #2320 review P0-1 item 1).
+    #
+    # A genuinely OMITTED declaration (neither the CLI flag nor the env var
+    # supplied) fails closed exactly like an explicitly malformed one --
+    # `_parse_planned_operations`/`run()` raise/return `environment_failure`
+    # for both cases with no special-cased bypass (PR #2320 review P0-1
+    # item 2: the prior fix_delta round's `planned_operations_omitted`
+    # exception is removed).
     spark_mode = args.spark_mode if args.spark_mode is not None else os.environ.get(_ENV_SPARK_MODE)
     spark_fallback = (
         args.spark_fallback if args.spark_fallback is not None else os.environ.get(_ENV_SPARK_FALLBACK)
@@ -296,18 +382,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.planned_operations_json is not None
         else os.environ.get(_ENV_PLANNED_OPERATIONS_JSON)
     )
-    # Neither `--planned-operations-json` nor `LOOP_PLANNED_OPERATIONS_JSON`
-    # was supplied at all. The canonical bare `preflight.run` registry argv
-    # only ever carries `--issue-number`/`--repo` (Issue #2311 P0-6/AC1
-    # keeps that argv shape byte-for-byte unchanged), so a real production
-    # canonical invocation always omits this flag and has no way to supply
-    # it. Mirror `workflow_capability_preflight.py` producer's own
-    # semantics, where an omitted `planned_operations` argument is a valid,
-    # empty operations set, rather than failing closed on every canonical
-    # invocation before the producer is ever reached. This is distinct from
-    # an explicitly-supplied-but-empty/malformed value, which still fails
-    # closed via `_parse_planned_operations` (AC5).
-    planned_operations_omitted = planned_operations_json is None
 
     result, exit_code = run(
         issue_number=args.issue_number,
@@ -315,7 +389,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         spark_mode=spark_mode,
         spark_fallback=spark_fallback,
         planned_operations_json=planned_operations_json,
-        planned_operations_omitted=planned_operations_omitted,
     )
     if not result.get("inner_preflight_invoked"):
         # The inner preflight's own stdout contract (`refinement_preflight_

@@ -28,10 +28,26 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 import workflow_start_entry as wse  # noqa: E402
 
+# PR #2320 review P0-2 item 3: import the REAL producer module
+# (`scripts/claude-gpt/workflow_capability_preflight.py`) via its file path
+# -- `scripts/claude-gpt` is not an importable package and the module's
+# on-disk name is not a valid dotted identifier prefix collision target, so
+# `importlib.util` is used instead of a `sys.path` + plain `import`.
+import importlib.util as _importlib_util
+
+_PRODUCER_PATH = _SCRIPTS_DIR.parents[3] / "scripts" / "claude-gpt" / "workflow_capability_preflight.py"
+_producer_spec = _importlib_util.spec_from_file_location(
+    "claude_gpt_workflow_capability_preflight", _PRODUCER_PATH
+)
+assert _producer_spec is not None and _producer_spec.loader is not None
+claude_gpt_workflow_capability_preflight = _importlib_util.module_from_spec(_producer_spec)
+sys.modules["claude_gpt_workflow_capability_preflight"] = claude_gpt_workflow_capability_preflight
+_producer_spec.loader.exec_module(claude_gpt_workflow_capability_preflight)
+
 _REPO = "squne121/loop-protocol"
 _VALID_PLANNED_OPERATIONS_JSON = (
     '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
-    '"requires_mutation": false}]'
+    '"operation": "issue_comment", "requires_mutation": false}]'
 )
 
 
@@ -138,16 +154,16 @@ def test_workflow_start_degraded_uses_declared_fallback_once():
     result, exit_code = wse.run(
         issue_number=1228,
         repo=_REPO,
-        spark_mode="sonnet",
-        spark_fallback="haiku",
+        spark_mode="preferred",
+        spark_fallback="allowed",
         planned_operations_json=_VALID_PLANNED_OPERATIONS_JSON,
         capability_preflight_result_fn=producer,
         invoke_inner_preflight_fn=inner,
     )
 
     assert len(producer_calls) == 1
-    assert producer_calls[0]["spark_mode"] == "sonnet"
-    assert producer_calls[0]["spark_fallback"] == "haiku"
+    assert producer_calls[0]["spark_mode"] == "preferred"
+    assert producer_calls[0]["spark_fallback"] == "allowed"
     assert len(inner_calls) == 1
     assert result["inner_preflight_invoked"] is True
     assert result["decision"] == "degraded"
@@ -165,16 +181,16 @@ def test_workflow_start_passes_exact_spark_and_planned_operations():
     inner, inner_calls = _make_recording_inner(returncode=0)
     planned_operations_json = (
         '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
-        '"requires_mutation": false}, '
+        '"operation": "issue_comment", "requires_mutation": false}, '
         '{"phase": "step0g_contract_update", "actor_role": "contract-repair", '
-        '"requires_mutation": true}]'
+        '"operation": "issue_edit", "requires_mutation": true}]'
     )
 
     wse.run(
         issue_number=1228,
         repo=_REPO,
-        spark_mode="opus",
-        spark_fallback="sonnet",
+        spark_mode="required",
+        spark_fallback="allowed",
         planned_operations_json=planned_operations_json,
         capability_preflight_result_fn=producer,
         invoke_inner_preflight_fn=inner,
@@ -183,11 +199,21 @@ def test_workflow_start_passes_exact_spark_and_planned_operations():
     assert len(producer_calls) == 1
     call = producer_calls[0]
     assert call["repo"] == _REPO
-    assert call["spark_mode"] == "opus"
-    assert call["spark_fallback"] == "sonnet"
+    assert call["spark_mode"] == "required"
+    assert call["spark_fallback"] == "allowed"
     assert call["planned_operations"] == [
-        {"phase": "workflow_start", "actor_role": "issue-refinement-loop", "requires_mutation": False},
-        {"phase": "step0g_contract_update", "actor_role": "contract-repair", "requires_mutation": True},
+        {
+            "phase": "workflow_start",
+            "actor_role": "issue-refinement-loop",
+            "operation": "issue_comment",
+            "requires_mutation": False,
+        },
+        {
+            "phase": "step0g_contract_update",
+            "actor_role": "contract-repair",
+            "operation": "issue_edit",
+            "requires_mutation": True,
+        },
     ]
     assert len(inner_calls) == 1
 
@@ -202,6 +228,14 @@ def test_workflow_start_passes_exact_spark_and_planned_operations():
         "[]",
         '[{"phase": "p"}]',
         '["not-an-object"]',
+        # PR #2320 review P0-2 item 1: schema now requires a non-empty
+        # 'operation' string and a strictly-bool 'requires_mutation'.
+        '[{"phase": "p", "actor_role": "r", "requires_mutation": true}]',
+        '[{"phase": "p", "actor_role": "r", "operation": "", "requires_mutation": true}]',
+        '[{"phase": "p", "actor_role": "r", "operation": 7, "requires_mutation": true}]',
+        '[{"phase": "p", "actor_role": "r", "operation": "issue_comment"}]',
+        '[{"phase": "p", "actor_role": "r", "operation": "issue_comment", "requires_mutation": "yes"}]',
+        '[{"phase": "p", "actor_role": "r", "operation": "issue_comment", "requires_mutation": 1}]',
     ],
 )
 def test_workflow_start_missing_planned_operations_fails_closed(planned_operations_json):
@@ -225,96 +259,134 @@ def test_workflow_start_missing_planned_operations_fails_closed(planned_operatio
 
 
 # ---------------------------------------------------------------------------
-# fix_delta (PR #2320 review B1): a genuine CLI/env-level OMISSION of
-# `--planned-operations-json` / `LOOP_PLANNED_OPERATIONS_JSON` -- exactly
-# what the canonical bare `preflight.run` registry argv produces, since it
-# only ever carries `--issue-number`/`--repo` -- must reach the producer
-# (empty operations set), matching `workflow_capability_preflight.py`'s own
-# omitted-is-valid-empty-list semantics. This is distinct from an
-# explicitly-supplied-but-malformed/empty value, which still fails closed
-# (covered by `test_workflow_start_missing_planned_operations_fails_closed`
-# above, unchanged).
+# PR #2320 review P0-1 item 2: the prior fix_delta round's
+# `planned_operations_omitted` exception (treating a genuinely OMITTED
+# `--planned-operations-json` / `LOOP_PLANNED_OPERATIONS_JSON` as an
+# implicit empty-but-valid operations set) is REMOVED. It papered over the
+# real defect -- the caller's declared request could not reach this
+# process through the canonical executor at all (P0-1 item 1, fixed via
+# `skill_runtime_exec.py`'s `_sanitize_env()` allowlist) -- rather than
+# fixing that reachability gap. The original Issue #2311 AC5 contract is
+# restored: a caller-declared request that is missing OR malformed fails
+# closed as `environment_failure` BEFORE the producer is ever invoked, with
+# no special-cased "omitted means empty" bypass. The registry-shaped
+# `--issue-number`/`--repo`-only CLI invocation from `command_registry.py`
+# is exercised directly below to prove this at the `main()` layer, matching
+# the real production invocation shape byte-for-byte.
 # ---------------------------------------------------------------------------
 
 
-def test_workflow_start_omitted_planned_operations_reaches_producer():
-    """`run(planned_operations_omitted=True)` must bypass the strict
-    missing/malformed check and reach the producer with an empty
-    operations list, unlike a direct `planned_operations_json=None` call
-    (see the parametrized negative test above, which is unaffected: it
-    never sets `planned_operations_omitted`)."""
-    producer, producer_calls = _make_recording_producer("ready")
-    inner, inner_calls = _make_recording_inner(returncode=0)
+def test_build_capability_request_no_longer_accepts_omitted_bypass():
+    """`build_capability_request()` no longer has a
+    `planned_operations_omitted` parameter at all -- a caller cannot bypass
+    the fail-closed check by any means."""
+    import inspect
 
-    result, exit_code = wse.run(
-        issue_number=2311,
-        repo=_REPO,
-        spark_mode=None,
-        spark_fallback=None,
-        planned_operations_json=None,
-        planned_operations_omitted=True,
-        capability_preflight_result_fn=producer,
-        invoke_inner_preflight_fn=inner,
-    )
-
-    assert len(producer_calls) == 1
-    assert producer_calls[0]["planned_operations"] == []
-    assert len(inner_calls) == 1
-    assert result["inner_preflight_invoked"] is True
-    assert result["status"] == "ready"
-    assert exit_code == 0
+    sig = inspect.signature(wse.build_capability_request)
+    assert "planned_operations_omitted" not in sig.parameters
+    with pytest.raises(wse.CapabilityRequestError):
+        wse.build_capability_request(spark_mode=None, spark_fallback=None, planned_operations_json=None)
 
 
-def test_build_capability_request_omitted_yields_empty_operations_list():
-    request = wse.build_capability_request(
-        spark_mode=None,
-        spark_fallback=None,
-        planned_operations_json=None,
-        planned_operations_omitted=True,
-    )
-    assert request["planned_operations"] == []
+def test_run_no_longer_accepts_omitted_bypass():
+    import inspect
+
+    sig = inspect.signature(wse.run)
+    assert "planned_operations_omitted" not in sig.parameters
 
 
-def test_main_cli_with_only_issue_number_and_repo_resolves_omitted_flag():
+def test_main_cli_with_only_issue_number_and_repo_fails_closed_without_env_request(monkeypatch):
     """Reproduces the real production registry-driven invocation shape
     (`--issue-number` / `--repo` only, matching `command_registry.py`'s
     bare `preflight.run` argv byte-for-byte) at the `main()` CLI-parsing
-    layer, and proves it resolves to `planned_operations_omitted=True` /
-    `planned_operations_json=None` rather than raising a missing-request
-    error before `run()` is ever reached. `wse.run` is monkeypatched (not
-    `capability_preflight_result_fn`, which is bound as an early-evaluated
-    default and would not observe a monkeypatch) so no live subprocess or
-    GitHub call is made -- this is a pure CLI-argument-resolution
-    regression test for the exact bug the reviewer reproduced (B1)."""
-    captured_kwargs: dict = {}
+    layer, WITHOUT any of the three `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK`/
+    `LOOP_PLANNED_OPERATIONS_JSON` env vars set (the canonical executor
+    lane before a caller has declared any capability request). This must
+    fail closed as `environment_failure` and the producer must never be
+    invoked (requirement 2 of PR #2320 review's minimum 6 verification
+    cases) -- unlike the removed omission-bypass behavior above. `wse.run`'s
+    real (non-monkeypatched) default `capability_preflight_result_fn` is
+    used deliberately: `run()` raises/catches `CapabilityRequestError`
+    BEFORE that default is ever called on this path, so no live subprocess
+    is spawned even though the default is not faked out here."""
+    for env_name in (
+        "LOOP_SPARK_MODE",
+        "LOOP_SPARK_FALLBACK",
+        "LOOP_PLANNED_OPERATIONS_JSON",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
 
-    def _fake_run(**kwargs):
-        captured_kwargs.update(kwargs)
-        return (
-            {
-                "schema": wse.SCHEMA_VERSION,
-                "status": "ready",
-                "reason": None,
-                "decision": "ready",
-                "checks": {},
-                "reasons": [],
-                "inner_preflight_invoked": True,
-            },
-            0,
+    exit_code = wse.main(["--issue-number", "2311", "--repo", _REPO])
+
+    assert exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# PR #2320 review P0-2 item 2: spark_mode/spark_fallback are restricted to a
+# fixed enum, matching `workflow_capability_preflight.py`'s own
+# `argparse(choices=...)`, and this validation applies to the env-var
+# fallback path too (not just the CLI-flag `choices=` boundary).
+# ---------------------------------------------------------------------------
+
+
+def test_build_capability_request_rejects_invalid_spark_mode():
+    with pytest.raises(wse.CapabilityRequestError):
+        wse.build_capability_request(
+            spark_mode="sonnet",
+            spark_fallback=None,
+            planned_operations_json=_VALID_PLANNED_OPERATIONS_JSON,
         )
 
-    original_run = wse.run
-    wse.run = _fake_run
-    try:
-        exit_code = wse.main(["--issue-number", "2311", "--repo", _REPO])
-    finally:
-        wse.run = original_run
 
-    assert exit_code == 0
-    assert captured_kwargs["planned_operations_json"] is None
-    assert captured_kwargs["planned_operations_omitted"] is True
-    assert captured_kwargs["issue_number"] == 2311
-    assert captured_kwargs["repo"] == _REPO
+def test_build_capability_request_rejects_invalid_spark_fallback():
+    with pytest.raises(wse.CapabilityRequestError):
+        wse.build_capability_request(
+            spark_mode="required",
+            spark_fallback="haiku",
+            planned_operations_json=_VALID_PLANNED_OPERATIONS_JSON,
+        )
+
+
+def test_build_capability_request_accepts_valid_spark_enum_values():
+    request = wse.build_capability_request(
+        spark_mode="required",
+        spark_fallback="forbidden",
+        planned_operations_json=_VALID_PLANNED_OPERATIONS_JSON,
+    )
+    assert request["spark_mode"] == "required"
+    assert request["spark_fallback"] == "forbidden"
+
+
+def test_main_cli_rejects_invalid_spark_mode_at_argparse_boundary():
+    with pytest.raises(SystemExit):
+        wse.main(
+            [
+                "--issue-number",
+                "2311",
+                "--repo",
+                _REPO,
+                "--spark-mode",
+                "sonnet",
+            ]
+        )
+
+
+def test_main_env_fallback_rejects_invalid_spark_mode(monkeypatch):
+    """The `LOOP_SPARK_MODE` env-var fallback bypasses argparse's own
+    `choices=` enforcement (it is read via `os.environ.get`, not parsed by
+    argparse), so `build_capability_request()` must validate it explicitly
+    -- this proves that validation actually runs on the env-var path, not
+    just the CLI-flag path. As above, the real (non-monkeypatched) producer
+    default is safe to leave wired in: the invalid `spark_mode` is rejected
+    by `build_capability_request()` before the producer default is ever
+    invoked."""
+    monkeypatch.setenv("LOOP_SPARK_MODE", "sonnet")
+    monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", _VALID_PLANNED_OPERATIONS_JSON)
+    monkeypatch.delenv("LOOP_SPARK_FALLBACK", raising=False)
+
+    exit_code = wse.main(["--issue-number", "2311", "--repo", _REPO])
+
+    assert exit_code != 0
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +451,56 @@ def test_workflow_start_malformed_producer_result_fails_closed():
     assert result["inner_preflight_invoked"] is False
     assert "producer_result_malformed:non_json_stdout" in result["reasons"]
     assert exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# PR #2320 review P0-2 item 3: cross-contract test proving a payload built
+# by wrapper-side `build_capability_request()` -> JSON-serialized ->
+# re-loaded by the REAL producer's own `_load_planned_operations()` (not a
+# fake) normalizes identically. This is what a real subprocess boundary
+# (`workflow_capability_preflight.py` invoked as a child process) actually
+# receives, so this test proves the wrapper and the real producer agree on
+# schema without requiring a live subprocess/E2E.
+# ---------------------------------------------------------------------------
+
+
+def test_wrapper_payload_is_accepted_by_real_producer_loader(tmp_path):
+    import json
+
+    import claude_gpt_workflow_capability_preflight as producer_mod
+
+    planned_operations_json = (
+        '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
+        '"operation": "issue_comment", "requires_mutation": false}, '
+        '{"phase": "step0g_contract_update", "actor_role": "contract-repair", '
+        '"operation": "issue_edit", "requires_mutation": true}]'
+    )
+
+    request = wse.build_capability_request(
+        spark_mode="required",
+        spark_fallback="forbidden",
+        planned_operations_json=planned_operations_json,
+    )
+
+    payload_path = tmp_path / "planned-operations.json"
+    payload_path.write_text(json.dumps(request["planned_operations"]), encoding="utf-8")
+
+    reloaded = producer_mod._load_planned_operations(str(payload_path))
+
+    assert reloaded == [
+        {
+            "phase": "workflow_start",
+            "actor_role": "issue-refinement-loop",
+            "operation": "issue_comment",
+            "requires_mutation": False,
+        },
+        {
+            "phase": "step0g_contract_update",
+            "actor_role": "contract-repair",
+            "operation": "issue_edit",
+            "requires_mutation": True,
+        },
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -108,15 +108,15 @@ repository evidence が disposition を独立に決定できない場合だけ h
 
 ### Step 0f: Planner 結果の消費 (Planner Consumption)
 
-canonical bare `preflight.run` は `workflow_start_entry.py` を first hop とし、Step 0g mutation・SubAgent dispatch・GitHub mutation より前に workflow capability preflight を一度だけ実行する（`decision: blocked` なら以降を起動しない。Step 0 のこの preflight と Step 5 の preflight は独立した fresh call であり、Step 0 の結果を Step 5 の implementation-entry authorization として再利用しない）。`run_refinement_preflight.py` wrapper を実行して Issue fetch・anchor comment 構造検証・planner stdin 組立・`REFINEMENT_LOOP_PLAN_V1` 生成を一括で実行する。wrapper は `plan_refinement_loop.py` を SSOT として呼び出す薄い adapter であり、判断ロジックは planner に委譲する。
+canonical bare `preflight.run` は `workflow_start_entry.py` を first hop とし、Step 0g mutation・SubAgent dispatch・GitHub mutation より前に workflow capability preflight を一度だけ実行する（`decision: blocked` なら以降を起動しない。Step 0 のこの preflight と Step 5 の preflight は独立した fresh call であり、Step 0 の結果を Step 5 の implementation-entry authorization として再利用しない）。`decision: ready`/`degraded` の場合のみ `workflow_start_entry.py` が `run_refinement_preflight.py` wrapper を trusted `uv` 経由で一度だけ起動し、Issue fetch・anchor comment 構造検証・planner stdin 組立・`REFINEMENT_LOOP_PLAN_V1` 生成を一括実行する（判断ロジックは `plan_refinement_loop.py` に委譲）。
 
-コマンドの canonical な argv 定義は `ISSUE_REFINEMENT_COMMAND_REGISTRY_V1`（`scripts/command_registry.py`）に集約されている。SubAgent / main thread は手書き shell string を消費せず、registry entry（`preflight.run` 等）を参照する。
+コマンドの canonical な argv 定義は `ISSUE_REFINEMENT_COMMAND_REGISTRY_V1`（`scripts/command_registry.py`）に集約されている。SubAgent / main thread は手書き shell string を消費せず、registry entry を参照する。bare `preflight.run` の production 実行はこれらのゲートを迂回するため `run_refinement_preflight.py` を直接起動してはならず、canonical executor 経由の呼び出しのみを使う（PR #2320 review P0-3）。capability request（`spark_mode`/`spark_fallback`/`planned_operations`）を宣言する場合は `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK`/`LOOP_PLANNED_OPERATIONS_JSON` を永続 export せずこの1回の invocation にだけ設定する（`_sanitize_env()` は `command_id == "preflight.run"` の場合のみこの3変数を child へ通す。未宣言時は producer を呼ばず `environment_failure` で fail-closed）:
 
 ```bash
-uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py \
-  --issue-number <N> \
-  --repo <owner/repo> \
-  [--anchor-comment-url <URL>]
+LOOP_SPARK_MODE=<required|preferred> LOOP_SPARK_FALLBACK=<forbidden|allowed> \
+LOOP_PLANNED_OPERATIONS_JSON='[{"phase":"<p>","actor_role":"<r>","operation":"<op>","requires_mutation":<bool>}]' \
+uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
+  --command-id preflight.run --issue-number <N> --repo <owner/repo>
 ```
 
 root checkout（canonical main root / default branch）から anchor comment を指定して preflight を実行する場合は、上記の直接 wrapper 呼び出しではなく、origin lane を明示する正規の privileged executor profile を使う。`preflight.run.with_anchor` は URL だけを扱う unlabeled profile であり、human origin を推定せず fail-closed にする。direct human context は `preflight.run.with_human_context`、agent report は read-only の `preflight.run.with_agent_report` を使う。以下は direct human context 用の厳密な token 列（`--locked` を含まない）そのものであり、`uv run --locked` governance policy の対象ではない:
@@ -201,7 +201,7 @@ isolation agent は `skill_runtime_exec.py`（exact executor）を自ら実行�
 
 `agent-*` 等の未保証な isolation worktree 命名パターンを `preflight.run` の認可根拠として追加しない。`skill_runtime_command_policy.py` の `required_cwd` / `required_branch` invariant は緩和せず、認可判定は canonical main root / default branch の実行コンテキストのみを根拠とする。
 
-既存の Step 0f 直接実行 bash block（`run_refinement_preflight.py` を直接呼ぶ例）は、orchestrator 自身が canonical main root もしくは canonically-named issue worktree から直接実行する場合に限定される。isolation worktree agent からは直接実行しない — isolation agent への委譲時は必ず上記の parent-owned preflight 方針に従い、parent が実行した結果のみを渡す。
+既存の Step 0f 直接実行 bash block（canonical executor 経由で `preflight.run` を呼ぶ例）は、orchestrator 自身が canonical main root もしくは canonically-named issue worktree から直接実行する場合に限定される。isolation worktree agent からは直接実行しない — isolation agent への委譲時は必ず上記の parent-owned preflight 方針に従い、parent が実行した結果のみを渡す。
 
 ### Step 1: 事前調査 (Investigation)
 
