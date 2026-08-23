@@ -114,6 +114,10 @@
 - Example 1 (`verified`): Caller can confidently use this excerpt as authoritative code reference.
 - Example 2 (`inconclusive`): Caller MUST escalate to human review or re-request file evidence with updated parameters. DO NOT use the provided line numbers as ground truth.
 
+## SOURCE_EVIDENCE_ACQUISITION_RESULT_V1（acquisition failure の分類、#2195）
+
+dispositive source claim の evidence acquisition が failure を返す場合、`CODEBASE_INVESTIGATION_RESULT_V1.source_evidence_result` に `SOURCE_EVIDENCE_ACQUISITION_RESULT_V1`（schema: `source_evidence_acquisition_result/v1`）を格納する。詳細スキーマ・producer/consumer 境界・`cross_lane_recovery_budget`・`disposition` の意味は `usage-contract.md` の `## SOURCE_EVIDENCE_ACQUISITION_RESULT_V1` を SSOT とする。`REPO_EVIDENCE_REF_V1` 自体は変更しない。
+
 ## Non-Goals
 
 - `response_text` 自体を削除すること

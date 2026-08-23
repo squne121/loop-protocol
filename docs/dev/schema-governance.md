@@ -371,6 +371,70 @@ schema に含めない（bounded な `redacted_*_sample` は `run_agy_github_res
 compound_shell・credential_display の各 probe_class が `denied_pre_execution: true`）を機械可読に記録する。
 `status: "skip"`（exit 77）はいずれの close_requirements も満たさない。
 
+## source_evidence_acquisition_result/v1 詳細登録
+
+**Compatibility Decision（Issue #2195）**: `source_evidence_acquisition_result/v1` は新規追加の schema であり、既存 `REPO_EVIDENCE_REF_V1` の required field set への破壊的変更は含まない（additive）。`CODEBASE_INVESTIGATION_RESULT_V1` へは `source_evidence_result`（1 フィールドのみ）を追加し、多数の route フィールドを直接追加しない。
+
+```yaml
+schema_id: source_evidence_acquisition_result/v1
+definition: .claude/skills/issue-refinement-loop/schemas/source_evidence_acquisition_result_v1.schema.json
+related_schema: .claude/skills/issue-refinement-loop/schemas/source_evidence_terminal_artifact_v1.schema.json
+related_issue: "#2195"
+producer:
+  - .claude/skills/gemini-cli-headless-delegation/scripts/source_evidence_acquisition.py（`run_acquisition()` / `build_route_plan()` / `collect_local_git_evidence()` / `collect_github_blob_evidence()` / `build_terminal_artifact()`）
+consumer:
+  - .claude/skills/issue-refinement-loop/scripts/route_source_evidence_result.py（`validate_envelope()` / `decide_routing_action()` / `reconcile_budget_consumption()`）
+  - .claude/agents/codebase-investigator.md（`CODEBASE_INVESTIGATION_RESULT_V1.source_evidence_result` として報告）
+  - .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md（SSOT セクション）
+  - .claude/skills/gemini-cli-headless-delegation/references/result-surface.md
+  - .claude/skills/gemini-cli-headless-delegation/tests/test_repo_evidence_ref.py
+  - .claude/skills/gemini-cli-headless-delegation/tests/test_source_evidence_adapter.py
+  - .claude/skills/issue-refinement-loop/tests/test_source_evidence_recovery.py
+shape: |
+  固定フィールド集合: schema（"source_evidence_acquisition_result/v1" 固定）、
+  claim（claim_id / claim_kind / evidence_kind / dependency_group）、
+  baseline（opaque）、route_plan[]（route_id / lane / evidence_kind /
+  eligible / reason）、attempts[]（route_id / lane / dispatch_state /
+  acquisition_outcome / failure_domain / provider_failure_code /
+  cross_lane_recovery）、evidence_refs[]（REPO_EVIDENCE_REF_V1、既存
+  required field set は変更しない）、semantic_verdict（supported /
+  contradicted / insufficient / not_evaluated）、disposition（proceed /
+  recover / human_review / environment_degraded）、
+  terminal_artifact（disposition が human_review / environment_degraded /
+  recover かつ evidence_refs が空の場合のみ存在）。
+control_flow_order: |
+  claim の evidence_kind から `build_route_plan()` が capability_snapshot
+  に基づく ordered route（現状 repo_blob_at_commit のみ、local_git /
+  github_blob の 2 lane）を生成 → primary route を dispatch（provider
+  内 retry は executor が既に完了済みの前提。final result のみ受領）→
+  失敗時、run 横断 `cross_lane_recovery_budget`（max_total 既定 1、
+  per_claim_max 既定 1、dispatch した延べ回数を消費条件とする試行ベース）
+  が許す場合のみ alternate lane を最大 1 回 dispatch → evidence_refs が
+  得られれば semantic_verdict を評価（既定は "supported"、evaluator 注入可）
+  → disposition を `_classify_disposition()` で決定 → 必要なら
+  bounded terminal artifact を生成。
+compatibility:
+  breaking_changes:
+    - REPO_EVIDENCE_REF_V1 の既存 required field set の変更
+    - disposition / semantic_verdict / failure_domain の既存値の意味変更・削除
+    - cross_lane_recovery_budget の scope・consumption 条件の変更
+  non_breaking_changes:
+    - 新規 evidence_kind とその lane 集合の _ROUTES_BY_EVIDENCE_KIND への追加
+    - terminal_artifact 内の任意フィールド追加（bounded サイズ制約は維持）
+detection_patterns:
+  - 'source_evidence_acquisition_result/v1'
+  - 'SOURCE_EVIDENCE_ACQUISITION_RESULT_V1'
+  - 'source_evidence_acquisition'
+  - 'cross_lane_recovery_budget'
+validation_commands:
+  - "uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_source_evidence_recovery.py -q"
+  - "uv run --locked pytest .claude/skills/gemini-cli-headless-delegation/tests/test_repo_evidence_ref.py -q"
+  - "uv run --locked pytest .claude/skills/gemini-cli-headless-delegation/tests/test_source_evidence_adapter.py -q"
+notes:
+  - "producer（source-evidence producer / codebase-investigator）が route plan 生成・実行・envelope 返却を担い、issue-refinement-loop は envelope 検証と disposition に基づく routing のみを行う（provider の stderr・exit code・retry policy を再解釈しない）。"
+  - "budget の残余管理は issue-refinement-loop が単一 refinement run の invocation スコープ内でのみメモリ上保持し、永続 DB は持たない。"
+```
+
 ## OVERLAP_GATE_BYPASS_V1（#1679 により削除・supersede 済み）
 
 `OVERLAP_GATE_BYPASS_V1`（Issue #1776 で導入された、open_pr.py の hard overlap gate を C2a/C3 経由で意図的にバイパスした場合の説明責任 fenced YAML 記録）は、元の overlap hard gate 自体が Issue #1679 で production path から完全に削除されたことに伴い、補助 gate として存続する意味を失ったため同 Issue で削除された。`validate_pr_body.py` の `_validate_overlap_gate_bypass()` / `LP059` / `E_OVERLAP_GATE_BYPASS_SCHEMA_INVALID` と `schemas/catalog.yaml` の該当エントリ、`.claude/skills/open-pr/tests/test_validate_pr_body_overlap_gate_bypass.py` は撤去済み。#1776 は overlap-bypass 補助 gate 部分のみ #1679 により superseded であり、#1776 の他の変更点には影響しない。

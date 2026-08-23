@@ -29,6 +29,12 @@ scripts_dir = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(scripts_dir))
 
 from validate_repo_evidence_ref import validate_repo_evidence_ref
+from source_evidence_acquisition import (
+    GithubBlobTransportError,
+    collect_github_blob_evidence,
+    collect_local_git_evidence,
+    run_acquisition,
+)
 
 
 def compute_excerpt_hash(content: bytes) -> str:
@@ -612,6 +618,207 @@ class TestRepoEvidenceRefValidator:
         # Validator output is inconclusive (separate from input, no in-place upgrade)
         assert result["ok"] is True
         assert result["status"] == "inconclusive"
+
+
+class TestLocalGitEvidenceCollector:
+    """local_git lane collector (#2195 AC1): produces REPO_EVIDENCE_REF_V1
+    without adding new required fields to it, and classifies failures by
+    failure_domain instead of leaking raw git stderr."""
+
+    def test_succeeds_and_produces_valid_repo_evidence_ref(self):
+        content = b"line1\nline2\nline3\n"
+        expected_hash = compute_excerpt_hash(b"line2\n")
+
+        def fake_getter(commit_sha, path):
+            return content
+
+        result = collect_local_git_evidence(
+            commit_sha="abc123def456abc123def456abc123def456abc1",
+            path="docs/adr/0001.md",
+            start_line=2,
+            end_line=2,
+            blob_bytes_getter=fake_getter,
+        )
+        assert result["acquisition_outcome"] == "succeeded"
+        assert result["failure_domain"] is None
+        ref = result["evidence_ref"]
+        assert ref["type"] == "REPO_EVIDENCE_REF_V1"
+        assert ref["excerpt_sha256"] == expected_hash
+        assert ref["verification_status"] == "verified"
+        # Re-validate through the existing REPO_EVIDENCE_REF_V1 validator to
+        # confirm no new required fields were introduced.
+        validated = validate_repo_evidence_ref(ref, blob_bytes_getter=fake_getter)
+        assert validated["ok"] is True
+        assert validated["status"] == "verified"
+
+    def test_out_of_range_line_is_reference_validation_failure(self):
+        def fake_getter(commit_sha, path):
+            return b"only one line\n"
+
+        result = collect_local_git_evidence(
+            commit_sha="abc123def456abc123def456abc123def456abc1",
+            path="docs/adr/0001.md",
+            start_line=5,
+            end_line=10,
+            blob_bytes_getter=fake_getter,
+        )
+        assert result["acquisition_outcome"] == "failed"
+        assert result["failure_domain"] == "reference_validation"
+        assert result["evidence_ref"] is None
+
+    def test_git_show_nonzero_exit_is_source_lookup_failure_not_raw_stderr(self):
+        import source_evidence_acquisition as sea
+
+        class FakeCompletedProcess:
+            returncode = 128
+            stdout = b""
+            stderr = b"fatal: Path 'docs/missing.md' does not exist in 'abc123'"
+
+        def fake_run(*args, **kwargs):
+            return FakeCompletedProcess()
+
+        original_run = sea.subprocess.run
+        sea.subprocess.run = fake_run
+        try:
+            result = collect_local_git_evidence(
+                commit_sha="abc123def456abc123def456abc123def456abc1",
+                path="docs/missing.md",
+                start_line=1,
+                end_line=1,
+                repo_root=Path("."),
+            )
+        finally:
+            sea.subprocess.run = original_run
+
+        assert result["acquisition_outcome"] == "failed"
+        assert result["failure_domain"] == "source_lookup"
+        # Raw stderr must not be forwarded into the classified result.
+        assert "stderr" not in result
+        assert "fatal:" not in str(result)
+
+
+class TestGithubBlobEvidenceCollector:
+    """github_blob lane collector (#2195 AC1): independent of local_git's
+    failure domain -- a GithubBlobTransportError must classify as
+    'transport', never conflated with local git's 'source_lookup'."""
+
+    def test_succeeds_and_produces_valid_repo_evidence_ref(self):
+        content = b"alpha\nbeta\ngamma\n"
+        expected_hash = compute_excerpt_hash(b"beta\ngamma\n")
+
+        def fake_getter(commit_sha, path):
+            return content
+
+        result = collect_github_blob_evidence(
+            commit_sha="def456abc123def456abc123def456abc123def4",
+            path="src/systems/combat.ts",
+            start_line=2,
+            end_line=3,
+            blob_bytes_getter=fake_getter,
+        )
+        assert result["acquisition_outcome"] == "succeeded"
+        ref = result["evidence_ref"]
+        assert ref["excerpt_sha256"] == expected_hash
+        validated = validate_repo_evidence_ref(ref, blob_bytes_getter=fake_getter)
+        assert validated["ok"] is True
+        assert validated["status"] == "verified"
+
+    def test_transport_error_is_classified_as_transport_not_source_lookup(self):
+        def raising_getter(commit_sha, path):
+            raise GithubBlobTransportError("connection reset")
+
+        result = collect_github_blob_evidence(
+            commit_sha="def456abc123def456abc123def456abc123def4",
+            path="src/systems/combat.ts",
+            start_line=1,
+            end_line=1,
+            blob_bytes_getter=raising_getter,
+        )
+        assert result["acquisition_outcome"] == "failed"
+        assert result["failure_domain"] == "transport"
+        assert result["evidence_ref"] is None
+
+
+class TestProviderRetryOwnershipBoundary:
+    """AC4: provider-internal retry is owned by the wrapper/executor. The
+    producer (run_acquisition) must only classify the *final* result an
+    executor returns -- it must never call the same lane's executor more
+    than once for a given route within a run."""
+
+    def test_run_acquisition_never_calls_primary_executor_twice(self):
+        call_count = {"local_git": 0}
+
+        def flaky_local_git():
+            call_count["local_git"] += 1
+            return {
+                "acquisition_outcome": "failed",
+                "failure_domain": "provider",
+                "provider_failure_code": "final_after_wrapper_retry",
+                "evidence_ref": None,
+            }
+
+        def working_github_blob():
+            return {
+                "acquisition_outcome": "succeeded",
+                "failure_domain": None,
+                "provider_failure_code": None,
+                "evidence_ref": {"type": "REPO_EVIDENCE_REF_V1"},
+            }
+
+        import source_evidence_acquisition as sea
+
+        budget = sea.RecoveryBudget(max_total=1, per_claim_max=1)
+        dispatched: set = set()
+        claim = {"claim_id": "C1", "claim_kind": "dispositive", "evidence_kind": "repo_blob_at_commit"}
+
+        envelope = run_acquisition(
+            claim=claim,
+            run_id="run-1",
+            executors={"local_git": flaky_local_git, "github_blob": working_github_blob},
+            budget=budget,
+            dispatched_routes=dispatched,
+        )
+
+        assert call_count["local_git"] == 1
+        assert envelope["disposition"] == "proceed"
+        assert len(envelope["evidence_refs"]) == 1
+        # The failed primary attempt's failure_domain is preserved verbatim
+        # (not reinterpreted into a different taxonomy) alongside the
+        # successful cross-lane recovery attempt.
+        failure_domains = [a["failure_domain"] for a in envelope["attempts"]]
+        assert "provider" in failure_domains
+
+    def test_run_acquisition_does_not_redispatch_same_route_across_calls(self):
+        def always_fails():
+            return {
+                "acquisition_outcome": "failed",
+                "failure_domain": "provider",
+                "provider_failure_code": "x",
+                "evidence_ref": None,
+            }
+
+        import source_evidence_acquisition as sea
+
+        budget = sea.RecoveryBudget(max_total=1, per_claim_max=1)
+        dispatched: set = set()
+        claim = {"claim_id": "C1", "claim_kind": "dispositive", "evidence_kind": "repo_blob_at_commit"}
+
+        run_acquisition(
+            claim=claim,
+            run_id="run-1",
+            executors={"local_git": always_fails, "github_blob": always_fails},
+            budget=budget,
+            dispatched_routes=dispatched,
+        )
+
+        with pytest.raises(ValueError, match="duplicate_dispatch_forbidden"):
+            run_acquisition(
+                claim=claim,
+                run_id="run-1",
+                executors={"local_git": always_fails, "github_blob": always_fails},
+                budget=sea.RecoveryBudget(max_total=1, per_claim_max=1),
+                dispatched_routes=dispatched,
+            )
 
 
 if __name__ == "__main__":

@@ -1212,6 +1212,70 @@ Caller は REPO_EVIDENCE_REF_V1 インスタンスに対して以下の rules �
 - **Caller MAY emit a NEW REPO_EVIDENCE_REF_V1 object** with new `verified_at`, `verification_method`, and metadata if re-validation succeeds（既存の inconclusive object は削除せず並行保持）
 - **Caller MUST preserve the original inconclusive object** alongside the new verified object for audit trail（inconclusive predecessor を削除しない）
 
+## SOURCE_EVIDENCE_ACQUISITION_RESULT_V1（#2195）
+
+### 目的
+
+dispositive source claim の evidence acquisition failure を、claim 単位で環境障害・証跡不足・意味的未解決を混同せずに表現する envelope。`REPO_EVIDENCE_REF_V1` は取得済み証跡の参照オブジェクトであり、`commit_sha` 等の必須フィールドを持つため、acquisition が完了していない failure ケースを同じスキーマに載せることはできない。この envelope は `REPO_EVIDENCE_REF_V1` を変更せず、claim 単位の acquisition 状態を分離して保持する。
+
+### Schema / スキーマ
+
+`schema: source_evidence_acquisition_result/v1`。定義: `.claude/skills/issue-refinement-loop/schemas/source_evidence_acquisition_result_v1.schema.json`。
+
+```yaml
+SOURCE_EVIDENCE_ACQUISITION_RESULT_V1:
+  schema: source_evidence_acquisition_result/v1
+  claim:
+    claim_id: <string>
+    claim_kind: dispositive | supporting
+    evidence_kind: <string>            # 例: repo_blob_at_commit
+    dependency_group: <string | null>
+  baseline: {}                         # opaque な claim baseline binding フィールド
+  route_plan:
+    - route_id: <string>               # 例: local_git:repo_blob_at_commit
+      lane: <string>                   # 例: local_git | github_blob
+      evidence_kind: <string>
+      eligible: <boolean>
+      reason: <string | null>
+  attempts:
+    - route_id: <string>
+      lane: <string>
+      dispatch_state: dispatched | outcome_unknown
+      acquisition_outcome: succeeded | failed | unknown_outcome
+      failure_domain: provider | transport | mcp_protocol | tool_execution | source_lookup | reference_validation | null
+      provider_failure_code: <string | null>
+      cross_lane_recovery: <boolean>
+  evidence_refs:
+    - <REPO_EVIDENCE_REF_V1>           # 既存 required field set は変更しない
+  semantic_verdict: supported | contradicted | insufficient | not_evaluated
+  disposition: proceed | recover | human_review | environment_degraded
+  terminal_artifact: <SOURCE_EVIDENCE_TERMINAL_ARTIFACT_V1 | null>
+```
+
+### Producer / Consumer 境界
+
+- producer（`codebase-investigator` / source-evidence producer、実装: `.claude/skills/gemini-cli-headless-delegation/scripts/source_evidence_acquisition.py`）: claim_kind の分類、`evidence_kind` / `dependency_group` / capability に基づく ordered route plan の生成、primary route の実行、provider 内 retry 完了後の final result 受領、lane-specific failure の場合だけ alternate route を最大 1 回実行、envelope の返却。
+- consumer（issue-refinement-loop、実装: `.claude/skills/issue-refinement-loop/scripts/route_source_evidence_result.py`）: envelope schema の検証、claim / baseline binding の確認、run 横断の `cross_lane_recovery_budget` 残余管理（単一 invocation スコープのメモリ上のみ、永続 DB なし）、`disposition` に基づく routing のみ。provider の stderr・exit code・retry policy を再解釈しない。
+
+### cross_lane_recovery_budget
+
+`local_git` と `github_blob` は同じ `repo_blob_at_commit` evidence_kind を独立に生成できる lane であり、この 2 lane のペアだけが cross-lane recovery 候補になる。budget は `scope: refinement_run`、`max_total: 1`（run 全体で dispatch した延べ回数を消費条件とする試行ベース。recovery 失敗も消費する）、`per_claim_max: 1`。同一 route の再試行、複数 lane への fan-out、未許可 lane への拡張は行わない。
+
+### disposition の意味
+
+- `proceed`: evidence が取得され `semantic_verdict` が `not_evaluated` 以外。
+- `recover`: eligible な alternate route が存在したが `cross_lane_recovery_budget` 不足で dispatch されなかった。
+- `human_review`: 許可された route を尽くしても evidence が得られず、genuine な内容レベル（`source_lookup` / `reference_validation` 等）の失敗、または eligible route が存在しない。
+- `environment_degraded`: 全 attempts の `failure_domain` が operational（`transport` / `mcp_protocol` / `tool_execution`）のみであり、claim の意味的未解決ではない。
+
+### 再ディスパッチ禁止（AC5）
+
+dispatch 後に terminal result が得られない場合、`dispatch_state: outcome_unknown` として attempted 扱いにする。同一 `run_id` / `claim_id` / `route_id` の組は同一 run 内で二度と dispatch しない（`ValueError` で fail-closed）。
+
+### Terminal Artifact（AC6）
+
+全 route が不可、または evidence が不足する場合、`terminal_artifact`（schema: `source_evidence_terminal_artifact/v1`）を生成する。claim・baseline（bounded fields のみ）・attempts・failure taxonomy・`unresolved_reason` を含み、最大 16 KiB 以下、raw stderr・raw transcript・credential・absolute path は含めない（含まれる場合は `ValueError` で fail-closed）。
+
 ## Fallback Handoff Contract / フォールバック引き継ぎ契約
 
 （`gemini-cli-headless-delegation` wrapper が file evidence を返せない場合の fail-closed パターン）

@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SOURCE_EVIDENCE_ACQUISITION_RESULT_V1",
+  "description": "Per-claim envelope for dispositive source claim evidence acquisition (#2195). Separates operational acquisition_outcome/failure_domain from semantic_verdict, carries an ordered route_plan across evidence-kind-matched lanes, and records at most one cross-lane recovery attempt per claim within a run-scoped budget. Does not modify REPO_EVIDENCE_REF_V1's existing required field set.",
+  "type": "object",
+  "required": ["schema", "claim", "baseline", "route_plan", "attempts", "evidence_refs", "semantic_verdict", "disposition"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "source_evidence_acquisition_result/v1"
+    },
+    "claim": {
+      "type": "object",
+      "required": ["claim_id", "claim_kind", "evidence_kind"],
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": { "type": "string" },
+        "claim_kind": {
+          "type": "string",
+          "enum": ["dispositive", "supporting"]
+        },
+        "evidence_kind": { "type": "string" },
+        "dependency_group": { "type": ["string", "null"] }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "description": "Opaque baseline binding fields controlled by the caller (e.g. claim_text_digest, source_hint). No raw secrets or absolute paths.",
+      "additionalProperties": true
+    },
+    "route_plan": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["route_id", "lane", "evidence_kind", "eligible"],
+        "additionalProperties": false,
+        "properties": {
+          "route_id": { "type": "string" },
+          "lane": { "type": "string" },
+          "evidence_kind": { "type": "string" },
+          "eligible": { "type": "boolean" },
+          "reason": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "attempts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["route_id", "lane", "dispatch_state", "acquisition_outcome", "failure_domain"],
+        "additionalProperties": false,
+        "properties": {
+          "route_id": { "type": "string" },
+          "lane": { "type": "string" },
+          "dispatch_state": {
+            "type": "string",
+            "enum": ["dispatched", "outcome_unknown"]
+          },
+          "acquisition_outcome": {
+            "type": "string",
+            "enum": ["succeeded", "failed", "unknown_outcome"]
+          },
+          "failure_domain": {
+            "type": ["string", "null"],
+            "enum": [
+              "provider",
+              "transport",
+              "mcp_protocol",
+              "tool_execution",
+              "source_lookup",
+              "reference_validation",
+              null
+            ]
+          },
+          "provider_failure_code": { "type": ["string", "null"] },
+          "cross_lane_recovery": { "type": "boolean" }
+        }
+      }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "description": "Each item is a REPO_EVIDENCE_REF_V1 instance. This schema does not redefine its required field set.",
+      "items": { "type": "object" }
+    },
+    "semantic_verdict": {
+      "type": "string",
+      "enum": ["supported", "contradicted", "insufficient", "not_evaluated"]
+    },
+    "disposition": {
+      "type": "string",
+      "enum": ["proceed", "recover", "human_review", "environment_degraded"]
+    },
+    "terminal_artifact": {
+      "type": ["object", "null"],
+      "description": "Present only when disposition is human_review or environment_degraded and no evidence_refs were obtained. Bounded to <= 16 KiB serialized, excludes raw stderr/transcript/credential/absolute paths."
+    }
+  }
+}
