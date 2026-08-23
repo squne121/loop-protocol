@@ -233,7 +233,7 @@ CODEBASE_INVESTIGATION_RESULT_V1:
   source_evidence_result: <SOURCE_EVIDENCE_ACQUISITION_RESULT_V1 | null> # schema: source_evidence_acquisition_result/v1（#2195）
 ```
 
-### source_evidence_result（dispositive source claim の acquisition failure 分類）(#2195)
+### source_evidence_result フィールド（dispositive な source claim の証跡取得失敗を分類する、#2195）
 
 dispositive source claim の evidence acquisition が failure を返した場合、本 SubAgent（producer）は `source_evidence_result` に単一の `SOURCE_EVIDENCE_ACQUISITION_RESULT_V1` envelope（schema: `source_evidence_acquisition_result/v1`）を格納する。定義は
 `.claude/skills/gemini-cli-headless-delegation/scripts/source_evidence_acquisition.py`、消費側の routing は
@@ -244,7 +244,7 @@ producer（本 SubAgent）の責務:
 - claim_kind の分類、`evidence_kind` / `dependency_group` / capability に基づく ordered route plan の生成（`local_git` / `github_blob` の 2 lane が `repo_blob_at_commit` を独立に生成できる）
 - primary route の実行、provider 内 retry 完了後の final result 受領（provider の stderr・exit code・retry policy を再解釈しない）
 - lane-specific failure の場合だけ、issue-refinement-loop から渡された `cross_lane_recovery_budget` の範囲内で alternate route を最大 1 回実行
-- `SOURCE_EVIDENCE_ACQUISITION_RESULT_V1` の返却（`claim` / `baseline` / `route_plan` / `attempts` / `evidence_refs[]` / `semantic_verdict` / `disposition`）
+- `SOURCE_EVIDENCE_ACQUISITION_RESULT_V1` を呼び出し元へ返却する。含まれるフィールドは `claim`（対象の主張）、`baseline`（基準コミット）、`route_plan`（取得経路の計画）、`attempts`（試行履歴）、`evidence_refs[]`（証跡参照の配列）、`semantic_verdict`（意味論的判定）、`disposition`（最終的な処理方針）である。
 
 issue-refinement-loop（consumer）は envelope schema の検証、claim/baseline binding の確認、run 横断の `cross_lane_recovery_budget` 残余管理（メモリ上のみ、永続 DB なし）、`disposition`（proceed / recover / human_review / environment_degraded）に基づく routing のみを行う。
 
