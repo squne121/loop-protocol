@@ -110,7 +110,7 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "id": "preflight.run",
         "argv": [
             "uv", "run", "python3",
-            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            f"{_SKILL_PREFIX}/workflow_start_entry.py",
             "--issue-number", "{issue_number}",
             "--repo", "{repo}",
         ],
