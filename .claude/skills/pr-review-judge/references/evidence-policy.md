@@ -16,6 +16,8 @@
 TEST_VERDICT comment/artifact の有無・内容は APPROVE/REQUEST_CHANGES の必須条件にしない。
 producer/publisher/materializer/schema の物理削除は Phase 3（別 Issue、未起票）に委ねる。
 
+**Issue #88**: `TEST_VERDICT_MACHINE` は diagnostics-only（診断専用）出力であり、通常 routing（`impl-review-loop` Step 4 の pr-reviewer 起動可否）の入力にはならない。Step 4 起動可否は Step 2（test-runner）が完了させた current-head の `VC_ADJUDICATION_RESULT_V1`（`.claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py`）が `blocking: false` を返した場合にのみ許可される（`step-4-pr-review.md` 参照）。
+
 ### テスト証跡のルール
 
 - PR本文の自己申告のみでは APPROVE 不可（変更なし）。

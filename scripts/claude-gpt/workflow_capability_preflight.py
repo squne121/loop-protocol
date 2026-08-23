@@ -281,7 +281,11 @@ def assess(
         "profile": profile,
         "decision": decision,
         "checks": {
-            "uv": {"status": uv_result["status"], "reason": uv_result["reason"]},
+            "uv": {
+                "status": uv_result["status"],
+                "reason": uv_result["reason"],
+                "diagnostic": uv_result.get("diagnostic"),
+            },
             "spark": {"status": spark_status},
             "github": {
                 "auth": github_auth,
