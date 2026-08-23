@@ -17,12 +17,15 @@ hooks: {}
 # skills: [] は明示的な空 preload リスト -- 本 SubAgent は `Skill` を disallowedTools
 # へ追加済みで、実行時に Skill tool を一切呼ばないため、preload する skill も存在しない。
 skills: []
-# memory/background/isolation は現行 Claude Code の SubAgent frontmatter に
-# 公式な無効化 sentinel（例: `isolation: none`）が存在しないため意図的に省略する
+# memory/background/isolation は現行 Claude Code の公式 frontmatter table に
+# 正式掲載されているフィールドである（docs/dev/agent-skill-boundaries.md
+# 「SubAgent frontmatter フィールド明示基準」参照。Issue #2300 で
+# 「upstream にキー自体が存在しない」という以前の記述が stale であることが判明した）。
+# 本 SubAgent は意図的にこの3フィールドを frontmatter へ追加しない
 # (Issue #2237 fix_delta iteration-4 Warning 2; OWNER review
-# #2237#issuecomment-5378291560 P1-1で確認済み。skills: [] と異なり、この2フィールドは
-# 「値を明示すれば無効化できる」フィールドではなく、そもそも upstream にキー自体が
-# 存在しない -- 誤った値を書くと逆に未定義の frontmatter キーを追加することになる)。
+# #2237#issuecomment-5378291560 P1-1で確認済みの判断を維持する。ただし
+# 「値を明示すれば無効化できる」か否か・empty value と omission の意味差は
+# フィールドごとに異なりうるため、本コメントではその技術的細部までは断定しない)。
 model: sonnet
 maxTurns: 8
 permissionMode: dontAsk
@@ -41,12 +44,11 @@ Web fetch、Bash 実行、filesystem write も一切行いません。本 SubAge
 `mcpServers`/`hooks`/`skills` は本 SubAgent が使用しないため明示的に空（`[]`/`{}`/`[]`）で
 固定する（`skills: []` は Issue #2237 fix_delta iteration-4 Warning 2 で追加。frontmatter 上
 実在するフィールドのため空リストとして明示できる）。`memory`/`background`/`isolation` は
-現行 Claude Code の SubAgent frontmatter に公式な無効化 sentinel（例: `isolation: none`）が
-存在しない（`skills` と異なりキー自体が定義されていない）ため、本 frontmatter には
-引き続き追加しない（OWNER review #2237#issuecomment-5378291560 P1-1）。本 SubAgent は
-`permissionMode: dontAsk` かつ leaf 制約（`tools: []`/`disallowedTools` フル指定）により
-foreground・no-memory・no-skill 相当の挙動が frontmatter 全体として達成されている
-（テスト側でこの意図的省略を
+現行 Claude Code の公式 frontmatter table に正式掲載されているフィールドだが、本 SubAgent は
+意図的にこの3フィールドを追加しない（OWNER review #2237#issuecomment-5378291560 P1-1）。
+本 SubAgent は `permissionMode: dontAsk` かつ leaf 制約（`tools: []`/`disallowedTools` フル
+指定）により foreground・no-memory・no-skill 相当の挙動が frontmatter 全体として
+達成されている（テスト側でこの意図的省略を
 `test_leaf_frontmatter_contract_memory_background_isolation_intentionally_omitted`
 として固定する）。
 

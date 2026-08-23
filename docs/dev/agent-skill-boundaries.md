@@ -2854,3 +2854,161 @@ artifact 境界、既存 `agent_retro_index/v1` との責務分離）は
 （schema、source adapter、Skill/SubAgent 実装、永続化、セキュリティ境界の自動テスト）
 は同 ADR の normative decision table を実装契約として参照する。JSON Schema 自体の
 実装は Child 2（#2235）の責務であり、本節および同 ADR はテキスト仕様に留まる。
+
+## SubAgent frontmatter フィールド明示基準（Issue #2300）
+
+SubAgent frontmatter の値をどう書くか（あるいは書かないか）は、
+**field presence（値が空でも書いてあるかどうか）や sentinel の有無を起点に決めない**。
+判断は常に次の順序で行う。
+
+1. desired runtime semantics（このフィールドで実際に何を起こしたい／起こしたくないか）
+2. invocation context（Agent tool 経由の SubAgent 呼び出しか、`claude --agent` による
+   main-session 起動か。project / user / plugin のどの scope の Agent か）
+3. upstream-supported representation（1 と 2 を Claude Code が実際にどう表現できるか。
+   フィールドごとに empty value・omission・inheritance の意味が異なる）
+
+`skills: []` のような明示的な empty list や `hooks: {}` のような empty object を書くこと自体は、
+「無効化された」ことの証明にはならない。各フィールドの upstream contract を個別に確認しない限り、
+empty value と omission が同じ効果を持つのか異なる効果を持つのかは分からない。以下、
+`skills` / `mcpServers` / `hooks` / `memory` / `background` / `isolation` の6フィールドについて、
+**field ごとに個別の runtime semantics**（一般化した3分類 taxonomy にはしない。フィールドごとに
+挙動が異なるため）を記述する。
+
+### skills（起動時に preload する Skill の指定）
+
+`skills: []`（明示的な empty list）と省略は**同一の効果**であり、いずれも「起動時に preload
+される Skill がない」ことのみを意味する。Skill 利用そのものの禁止ではない。`Skill` tool が
+利用可能であれば、frontmatter に列挙されていない Skill も実行時に呼び出せる。Skill 利用を
+制限したい場合は、`tools` allowlist から `Skill` を外すか `disallowedTools` に `Skill` を含める、
+という upstream の実際の contract を参照する（disallowedTools を使う）。
+
+### mcpServers（agent 固有の追加/参照 MCP サーバー設定）
+
+公式 docs の基本モデルでは、SubAgent は main conversation で利用可能な built-in tools と
+MCP tools を継承し、その上で `tools` / `disallowedTools` で絞り込む。`mcpServers`
+frontmatter フィールドは、main conversation にない MCP server を当該 SubAgent に
+追加で与える／参照するための **agent 固有の追加設定**であり、string reference を書けば
+parent session の該当 server 接続を共有できる。
+
+`mcpServers: []`（明示的な empty list）が「main conversation から継承する MCP server
+接続をゼロにする」と断定してはならない。empty value と omission の間に接続継承の有無という
+観測可能な意味差が upstream 公式 docs 上で明示されていない限り、その断定は公式仕様から
+導出できない。MCP tool の利用を制限したい場合は、`mcpServers` を空値化することではなく
+`tools` / `disallowedTools`（`mcp__<server>` 構文を含む）で行う、という upstream の実際の
+contract を参照する。過去の #2300 敵対的レビューでも同種の断定（`mcpServers: []` を
+universal disable sentinel として正本化すること）への警告があった。本節はその警告に沿い、
+断定ではなく不確実性を明示する表現を維持する。
+
+### hooks（agent-local な追加フック定義）
+
+`hooks: {}`（明示的な empty object）と省略は、当該 SubAgent の frontmatter が **agent-local** な
+追加 hook を定義しないことのみを意味する。settings ファイル・managed policy・plugin 由来の
+hook（`PreToolUse` 等）は、SubAgent 内のツール呼び出しに対しても main conversation と同じ
+設定で発火し続け、`agent_id` / `agent_type` 等で判別可能な形で該当ツール呼び出しを
+deny / block しうる。したがって hook は `tools` / `disallowedTools` が対象とする capability
+集合そのものとは異なる軸（lifecycle / operation policy）だが、「capability restriction という
+問い自体が適用されない」と断定はしない — hook は tool の実行可否そのものを block できる
+別種の制御点である。
+
+加えて、plugin 配布 Agent では `hooks`（および `mcpServers` / `permissionMode`）frontmatter
+フィールドがセキュリティ上の理由で無視される、という scope 依存の例外がある。project /
+user / plugin のいずれの scope から読み込まれた Agent かによって、上記フィールドの適用条件
+（workspace trust の要否等）が異なりうる点に注意する。
+
+### memory（persistent memory の opt-in 設定）
+
+`memory` の省略は、当該 SubAgent 固有の persistent memory が指定されないことのみを意味する。
+明示する場合は `memory: user` のように scope を指定する。これとは独立した別軸として、
+グローバル `autoMemoryEnabled` 設定（デフォルト true）があり、これが off の場合は
+`memory` field が frontmatter 上に存在していても機能全体が無効化される。「`memory` 省略」
+と「`autoMemoryEnabled` による無効化」を混同しない。
+
+「SubAgent は毎回 fresh に起動する」という言い方は、**新規 invocation**（同一 Agent の
+新しい呼び出し）に限定する。既存の Agent ID を resume する場合は full conversation
+history を保持するため、この限定なしに「毎回 fresh」と一般化しない。
+
+### background（フォアグラウンド/バックグラウンド実行の制御）
+
+`background` の挙動は値と環境変数の組み合わせで決まる。fork mode の有無で場合分けする
+二分法ではなく、以下の4則で記述する（fork mode の有効/無効と interactive/non-interactive
+の別は独立した軸であり、単純な二分法にはならない）。
+
+1. **省略**: Claude が実行時に選択する。現行は background が既定であり、結果が直ちに
+   必要な場合のみ foreground を選択する。
+2. **`background: true`**: 通常の background-task 機構の下では常に background 実行になる。
+3. **`CLAUDE_CODE_FORK_SUBAGENT=1`**: interactive セッションか `-p` かに関わらず、
+   すべての SubAgent が background 実行になる。
+4. **`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`**: background task 機構自体を無効化し、
+   同期的（synchronous）に実行する。
+
+「省略 = foreground」という単純な断定はしない。
+
+### isolation（worktree 分離の適用条件）
+
+現行の有効値は `worktree` のみ。省略時は親 / main session と同じ作業ディレクトリで実行され、
+agent-specific な worktree isolation は要求されない。ただし、**親 / main session 自体が既に
+`--in-worktree` 等で isolation 下にある場合**は、その worktree-scoping の制約が SubAgent
+自身の `isolation` フィールド設定（`isolation: worktree` の明示有無）に関わらず自動的に及ぶ。
+「省略 = isolation 無効」という単純な同一視はしない。
+
+### tools / disallowedTools との役割区別
+
+`tools` / `disallowedTools` は「どの capability（tool）を呼べるか」を制御する allowlist /
+denylist であり、上記6フィールドとは異なる役割を持つ。`skills` / `mcpServers` は
+preload / 接続層の制御、`hooks` は lifecycle/operation policy の agent-local な追加、
+`memory` / `background` / `isolation` は実行時の永続化・同期性・作業ディレクトリという
+実行モードの制御であって、いずれも `tools` / `disallowedTools` が扱う capability
+allowlist/denylist そのものを代替しない。Skill 利用の制限や `mcp__<server>` tool の制限は、
+`skills` / `mcpServers` の空値化ではなく `tools` / `disallowedTools` を使うのが upstream の
+実際の contract である。
+
+### invocation context（起動コンテキストの違い）: Agent tool 経由 vs `claude --agent`
+
+Agent tool 経由で spawn される SubAgent と、`claude --agent <name>`（`claude -p --agent <name>`
+を含む。PR #2293 の production path が実際に採用している invocation）で main session として
+起動される Agent とでは invocation context が異なる。
+
+- **system prompt の扱い**: Agent tool 経由は frontmatter body のみが prompt になるのに対し、
+  `--agent` invocation では frontmatter body が既定の system prompt を丸ごと置き換える。
+- **SubAgent-specific filters の追加（tool filtering を失うわけではない）**: `claude --agent
+  <name>` の main thread は、その Agent の system prompt・tool restrictions・model を
+  使用する点では通常の Agent 定義の利用と同様であり、tool filtering そのものを失うわけでは
+  ない。実際に書く価値がある差は、Agent tool 経由で spawn される SubAgent には background
+  実行時の built-in-tool reduction 等、**SubAgent としての起動そのものに付随する追加の
+  filter** がかかる一方、`--agent` による main session 起動はその SubAgent ではないため
+  この追加 filter の対象にならない、という点である。
+- **`Agent(worker, researcher)` 型 allowlist の scope**: この括弧内 type list は `--agent`
+  による main thread 起動では有効に機能するが、nested SubAgent definition の内側では
+  無視される。
+
+上記6フィールドの semantics は、invocation context が異なれば意味も変わりうるため、
+安易に同一視しない。
+
+### historical incident（教訓の出所）と normative source（規範的情報源）
+
+Issue #2237 / PR #2293 は本セクションの **historical incident**（教訓の出所）として参照する。
+Issue #2237 の fix_delta 対応中に `.claude/agents/retrospective-runtime-observer.md` /
+`.claude/agents/retrospective-evaluator.md` の frontmatter で `memory` / `background` /
+`isolation` を意図的に省略する判断が行われ、その judgement を pin する目的で
+`test_leaf_frontmatter_contract_memory_background_isolation_intentionally_omitted`
+（`.claude/agents/tests/test_retrospective_subagent_boundary.py`）が追加された。PR #2293 は
+その follow-up として `claude -p --agent <name>` の production path を実際に送出した。
+
+Claude Code 公式 sub-agents docs（`https://code.claude.com/docs/en/sub-agents`。hooks の
+詳細は `https://code.claude.com/docs/en/hooks`）を **current normative source** とする
+（verified_against: Claude Code official sub-agents docs, 2026-08-23）。upstream の特定
+バージョン番号（例: 特定の minor version で挙動が変わった、という主張）は、公式 docs 上で
+独立に確認できない場合は断定的に記載しない。
+
+`test_leaf_frontmatter_contract_memory_background_isolation_intentionally_omitted` は、実際には
+「キーが存在する場合に falsy であること」しか assert しておらず、omission（キー省略そのもの）
+を assert していない。本セクションはこのテストを「省略判断が意図的であったことの historical
+evidence」としてのみ参照し、「omission semantics の技術的証明」としては扱わない。
+
+### 本セクションの検証範囲
+
+本セクションの semantic correctness は grep 等の Verification Commands では証明しない。
+Verification Commands は見出し・6フィールド言及・参照 Issue/PR 番号等の presence /
+coverage / traceability の sanity check に限定し、意味論的な正しさは Claude Code 公式 docs を
+normative source とした semantic design review で評価する。本節の範囲では新規
+JSON Schema / pytest / linter / runtime harness を追加しない。
