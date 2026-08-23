@@ -275,3 +275,73 @@ def test_legacy_fallback_and_delta_helper_tokenization_agree(
     delta_layers = {item["value"] for item in delta_items}
     assert legacy_layers == expected_layers
     assert delta_layers == expected_layers
+
+
+# --- Issue #2296 fix_delta iteration 6 (P1-4): severity tags split out ----
+# extract_directive_markers() no longer merges severity-tagged headings
+# into its return value; that extraction now lives in the independent
+# extract_severity_tags() function so a bare severity heading never, by
+# itself, becomes a scope-authoritative directive marker.
+
+
+def test_extract_severity_tags_detects_severity_tagged_heading():
+    """GIVEN a comment body with an owner adversarial-review severity
+    heading (## P0-1)
+    WHEN extract_severity_tags runs
+    THEN the uppercased tag is included in the returned tag list."""
+    text = "## P0-1\n\nSomething is broken.\n\n- fix it"
+    tags = delta.extract_severity_tags(text)
+    assert "P0-1" in tags
+
+
+def test_extract_severity_tags_detects_multiple_severity_tags_lowercase_heading():
+    text = "### p1-3\nlower body\n\n#### p2\nnot a match (missing dash-number)"
+    tags = delta.extract_severity_tags(text)
+    assert "P1-3" in tags
+    assert "P2" not in tags  # P2 alone (no "-N") is not the tagged pattern
+
+
+def test_extract_severity_tags_without_severity_heading_is_empty():
+    text = "Plain freeform comment with no heading at all."
+    tags = delta.extract_severity_tags(text)
+    assert tags == []
+
+
+def test_extract_directive_markers_does_not_include_severity_tags():
+    """P1-4: extract_directive_markers() must NOT surface severity-tagged
+    headings -- only the fixed _DIRECTIVE_SECTION_MARKERS set."""
+    text = "## P0-1\n\nSomething is broken.\n\n- fix it"
+    markers = delta.extract_directive_markers(text)
+    assert "P0-1" not in markers
+    assert markers == []
+
+
+def test_extract_directive_markers_without_severity_heading_is_unaffected():
+    text = "Plain freeform comment with no heading at all."
+    markers = delta.extract_directive_markers(text)
+    assert markers == []
+
+
+def test_extract_directive_markers_still_detects_fixed_markers_alongside_severity_tag():
+    """A severity-tagged heading co-occurring with a fixed directive marker
+    heading: extract_directive_markers() surfaces only the fixed marker;
+    extract_severity_tags() surfaces only the severity tag."""
+    text = "## P0-2\n\nRevised Acceptance Criteria below.\n\n- item"
+    markers = delta.extract_directive_markers(text)
+    assert "P0-2" not in markers
+    assert "revised acceptance criteria" in markers
+    tags = delta.extract_severity_tags(text)
+    assert "P0-2" in tags
+
+
+def test_bare_severity_heading_does_not_produce_explicit_directive_confidence():
+    """P1-4 regression: a bare severity-tagged heading (e.g. '## P0-1') plus
+    an unrelated bullet must NOT, by itself, produce a scope-authoritative
+    directive_confidence:explicit classification via
+    extract_directive_markers()/classify_directive_confidence() -- that
+    conflated a severity label with an actual scope-change directive."""
+    text = "## P0-1\n\n- please fix this"
+    items = delta.extract_directive_items(text)
+    assert items == ["please fix this"]
+    confidence = delta.classify_directive_confidence(text)
+    assert confidence == delta.DIRECTIVE_CONFIDENCE_INFERRED
