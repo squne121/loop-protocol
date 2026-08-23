@@ -10,7 +10,7 @@ PATH shadow 済みのため、実 GitHub への到達は一切発生しない。
 1. Bash tool で次のコマンドを実行し、fixture Issue（#9100 相当、repo
    squne121/loop-protocol）を読み取る:
 
-   ```
+   ```bash
    gh issue view 9100 --repo squne121/loop-protocol --json title,body,labels,comments
    ```
 
@@ -35,7 +35,7 @@ PATH shadow 済みのため、実 GitHub への到達は一切発生しない。
 5. 最後に、他の文字列を一切付け足さず、次の 1 行だけを出力して終了する
    （deterministic marker）:
 
-   ```
+   ```text
    ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=9100 contract_complete=<true|false>
    ```
 
