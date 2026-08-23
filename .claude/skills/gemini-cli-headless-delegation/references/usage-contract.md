@@ -1263,10 +1263,26 @@ SOURCE_EVIDENCE_ACQUISITION_RESULT_V1:
 
 ### disposition の意味
 
-- `proceed`: evidence が取得され `semantic_verdict` が `not_evaluated` 以外。
+evidence が取得された場合、`semantic_verdict` に応じて以下のルールで `disposition` を決める（#2195 PR #2315 review fix）:
+
+| `semantic_verdict` | `claim_kind: dispositive` | `claim_kind: supporting` |
+|---|---|---|
+| `supported` | `proceed` | `proceed` |
+| `contradicted` | `proceed`（claim 側の修正が必要という前提で proceed） | `proceed` |
+| `insufficient` | `human_review` | `proceed`（insufficient である旨を caller が注記した上で継続可能） |
+| `not_evaluated` | `human_review`（evidence 取得 ≠ 意味的解決。`proceed` は禁止） | `human_review`（同左） |
+
+`semantic_evaluator` が注入されない場合、`semantic_verdict` は常に `not_evaluated` になる（evidence を取得できたことをもって自動的に `supported` へ昇格させない）。
+
+evidence が一切取得できなかった場合は以下のルールで `disposition` を決める:
+
 - `recover`: eligible な alternate route が存在したが `cross_lane_recovery_budget` 不足で dispatch されなかった。
 - `human_review`: 許可された route を尽くしても evidence が得られず、genuine な内容レベル（`source_lookup` / `reference_validation` 等）の失敗、または eligible route が存在しない。
-- `environment_degraded`: 全 attempts の `failure_domain` が operational（`transport` / `mcp_protocol` / `tool_execution`）のみであり、claim の意味的未解決ではない。
+- `environment_degraded`: 全 attempts の `failure_domain` が operational（`provider` / `transport` / `mcp_protocol` / `tool_execution`）のみであり、claim の意味的未解決ではない。
+
+`reference_validation` failure のうち、`line_range_out_of_bounds` のように同じ commit の同じ blob を読む限り他 lane でも同一結果になることが分かっている失敗は、cross-lane recovery の候補にしない（`cross_lane_recovery_budget` を無駄に消費しないため）。
+
+`recover` の progress rule: `disposition: recover` を受け取った issue-refinement-loop の caller は、同一 claim を次回の refinement-run 呼び出し（新しい `run_id`）で再試行する。dedupe key は `(run_id, claim_id, route_id)` のため、新しい `run_id` を使えば前回 budget 不足でブロックされた alternate route が改めて dispatch 候補になる。`RecoveryBudget` インスタンスを次回呼び出しでも使い回す場合は、`max_total` をリセットするか新しい budget を割り当てること。
 
 ### 再ディスパッチ禁止（AC5）
 

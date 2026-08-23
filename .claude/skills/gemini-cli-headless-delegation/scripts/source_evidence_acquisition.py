@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, TypedDict
 
+from validate_repo_evidence_ref import validate_repo_evidence_ref
+
 SCHEMA_ID = "source_evidence_acquisition_result/v1"
 TERMINAL_ARTIFACT_SCHEMA_ID = "source_evidence_terminal_artifact/v1"
 
@@ -48,7 +50,21 @@ SEMANTIC_VERDICTS = ("supported", "contradicted", "insufficient", "not_evaluated
 
 DISPOSITIONS = ("proceed", "recover", "human_review", "environment_degraded")
 
-_OPERATIONAL_FAILURE_DOMAINS = {"transport", "mcp_protocol", "tool_execution"}
+_OPERATIONAL_FAILURE_DOMAINS = {"provider", "transport", "mcp_protocol", "tool_execution"}
+
+# Failure codes that are lane-independent: the same commit-pinned blob is
+# read by every lane, so these content-shape failures (e.g. a line range
+# that is out of bounds for the file at that commit) will reproduce
+# identically on any other lane for the same evidence_kind. Recovery must
+# not be attempted for these codes -- doing so would only waste the
+# run-wide cross_lane_recovery_budget on a deterministically doomed retry.
+# This is narrower than the whole `reference_validation` failure_domain:
+# a malformed/structurally-invalid REPO_EVIDENCE_REF_V1 (a producer bug,
+# not a property of the underlying blob) also lands in
+# `reference_validation` but is *not* guaranteed to reproduce on another
+# lane's independent construction of the ref, so it remains eligible for
+# cross-lane recovery.
+_NON_RECOVERABLE_FAILURE_CODES = {"line_range_out_of_bounds"}
 
 MAX_TERMINAL_ARTIFACT_BYTES = 16 * 1024
 
@@ -159,13 +175,38 @@ def build_route_plan(
 
 def _classify_disposition(
     *,
+    claim_kind: str,
     evidence_refs: list[dict],
     semantic_verdict: str,
     attempts: list[RouteAttempt],
     budget_blocked: bool,
 ) -> str:
-    if evidence_refs and semantic_verdict != "not_evaluated":
-        return "proceed"
+    # Rule table (#2195 PR #2315 review fix):
+    #   supported / contradicted -> proceed (contradicted still proceeds,
+    #     but the caller is expected to revise the claim rather than treat
+    #     it as confirmed)
+    #   insufficient              -> dispositive claims stop for human
+    #     review; supporting claims may proceed with the insufficiency
+    #     noted by the caller
+    #   not_evaluated             -> never proceed, regardless of
+    #     evidence_refs having been acquired (acquiring bytes is not the
+    #     same as the claim being semantically resolved)
+    if evidence_refs:
+        if semantic_verdict in ("supported", "contradicted"):
+            return "proceed"
+        if semantic_verdict == "insufficient":
+            if claim_kind == "dispositive":
+                return "human_review"
+            return "proceed"
+        # semantic_verdict == "not_evaluated" but evidence *was* acquired:
+        # this is a distinct "evidence exists but nobody evaluated it"
+        # state, not an attempt/budget-classification problem -- do not
+        # fall through into the failure-domain bucketing below, which is
+        # scoped to the "no evidence was obtained at all" case and would
+        # otherwise misclassify a successful cross-lane recovery as
+        # environment_degraded because of the *primary* attempt's
+        # (already-superseded) failure_domain.
+        return "human_review"
 
     failure_domains = {a["failure_domain"] for a in attempts if a.get("failure_domain")}
 
@@ -200,6 +241,7 @@ def build_terminal_artifact(
     evidence_refs: list[dict],
     disposition: str,
     unresolved_reason: str,
+    baseline: Optional[dict] = None,
 ) -> dict:
     """Build a bounded (<= 16 KiB serialized), secret/path-free terminal
     artifact (AC6). Raises ValueError if forbidden content is detected or
@@ -233,10 +275,16 @@ def build_terminal_artifact(
             for a in attempts
         ]
 
-    baseline = claim.get("baseline") or {}
+    # `baseline` is passed explicitly by the caller because it lives at the
+    # envelope's top level (envelope["baseline"]), not on the claim sub-object
+    # (envelope["claim"]) -- claim.get("baseline") is always empty and would
+    # silently produce a terminal artifact with no baseline binding (#2195
+    # PR #2315 review fix: AC6 requires the terminal artifact to carry the
+    # claim's baseline).
+    resolved_baseline = baseline if baseline is not None else (claim.get("baseline") or {})
     bounded_baseline = {
         k: v
-        for k, v in baseline.items()
+        for k, v in resolved_baseline.items()
         if k in ("claim_text_digest", "source_hint") and isinstance(v, (str, int, float, bool, type(None)))
     }
 
@@ -316,6 +364,75 @@ def _build_repo_evidence_ref(
     }
 
 
+def _finalize_collected_evidence(
+    *,
+    content: bytes,
+    commit_sha: str,
+    path: str,
+    start_line: int,
+    end_line: int,
+    object_format: str,
+    owner: str,
+    repo: str,
+    anchor_text: Optional[str],
+) -> ExecutorResult:
+    """Shared tail for both collectors: slice+hash the excerpt, build the
+    REPO_EVIDENCE_REF_V1 candidate, and independently re-validate it via
+    the existing `validate_repo_evidence_ref()` validator (using the
+    already-fetched `content` bytes as the blob_bytes_getter) before
+    handing it back as acquired evidence (#2195 PR #2315 review fix: a
+    successfully *fetched* blob is not the same thing as a *verified*
+    REPO_EVIDENCE_REF_V1 -- a ref that fails structural or hash validation
+    must never be silently accepted as evidence)."""
+    excerpt_sha256, error = _slice_and_hash(content, start_line, end_line)
+    if error:
+        return {
+            "acquisition_outcome": "failed",
+            "failure_domain": "reference_validation",
+            "provider_failure_code": error,
+            "evidence_ref": None,
+        }
+
+    evidence_ref = _build_repo_evidence_ref(
+        commit_sha=commit_sha,
+        path=path,
+        start_line=start_line,
+        end_line=end_line,
+        excerpt_sha256=excerpt_sha256,
+        object_format=object_format,
+        owner=owner,
+        repo=repo,
+        anchor_text=anchor_text,
+    )
+
+    validation = validate_repo_evidence_ref(evidence_ref, blob_bytes_getter=lambda _cs, _p: content)
+    if validation["status"] == "rejected":
+        return {
+            "acquisition_outcome": "failed",
+            "failure_domain": "reference_validation",
+            "provider_failure_code": "evidence_ref_rejected",
+            "evidence_ref": None,
+        }
+    if validation["status"] != "verified":
+        # `inconclusive` from a backend that was actually supplied (the
+        # content bytes just fetched) means the hash could not be
+        # confirmed -- treat this the same as a content-level failure
+        # rather than silently proceeding with an unverified ref.
+        return {
+            "acquisition_outcome": "failed",
+            "failure_domain": "reference_validation",
+            "provider_failure_code": "evidence_ref_inconclusive",
+            "evidence_ref": None,
+        }
+
+    return {
+        "acquisition_outcome": "succeeded",
+        "failure_domain": None,
+        "provider_failure_code": None,
+        "evidence_ref": evidence_ref,
+    }
+
+
 def collect_local_git_evidence(
     *,
     commit_sha: str,
@@ -343,6 +460,7 @@ def collect_local_git_evidence(
                 cwd=repo_root,
                 capture_output=True,
                 check=False,
+                timeout=30,
             )
             if result.returncode != 0:
                 return {
@@ -352,6 +470,13 @@ def collect_local_git_evidence(
                     "evidence_ref": None,
                 }
             content = result.stdout
+    except subprocess.TimeoutExpired:
+        return {
+            "acquisition_outcome": "failed",
+            "failure_domain": "tool_execution",
+            "provider_failure_code": "git_show_timeout",
+            "evidence_ref": None,
+        }
     except FileNotFoundError:
         return {
             "acquisition_outcome": "failed",
@@ -367,32 +492,17 @@ def collect_local_git_evidence(
             "evidence_ref": None,
         }
 
-    excerpt_sha256, error = _slice_and_hash(content, start_line, end_line)
-    if error:
-        return {
-            "acquisition_outcome": "failed",
-            "failure_domain": "reference_validation",
-            "provider_failure_code": error,
-            "evidence_ref": None,
-        }
-
-    evidence_ref = _build_repo_evidence_ref(
+    return _finalize_collected_evidence(
+        content=content,
         commit_sha=commit_sha,
         path=path,
         start_line=start_line,
         end_line=end_line,
-        excerpt_sha256=excerpt_sha256,
         object_format=object_format,
         owner=owner,
         repo=repo,
         anchor_text=anchor_text,
     )
-    return {
-        "acquisition_outcome": "succeeded",
-        "failure_domain": None,
-        "provider_failure_code": None,
-        "evidence_ref": evidence_ref,
-    }
 
 
 def collect_github_blob_evidence(
@@ -420,10 +530,16 @@ def collect_github_blob_evidence(
         if blob_bytes_getter is not None:
             content = blob_bytes_getter(commit_sha, path)
         else:
+            # `--method GET` must be explicit: `gh api` silently switches to
+            # POST once a `-f` field is supplied without an explicit method,
+            # which would attempt to *create* content at this path instead
+            # of reading it (#2195 PR #2315 review fix).
             result = subprocess.run(
                 [
                     "gh",
                     "api",
+                    "--method",
+                    "GET",
                     f"repos/{owner}/{repo}/contents/{path}",
                     "-f",
                     f"ref={commit_sha}",
@@ -432,6 +548,7 @@ def collect_github_blob_evidence(
                 ],
                 capture_output=True,
                 check=False,
+                timeout=30,
             )
             if result.returncode != 0:
                 return {
@@ -441,6 +558,13 @@ def collect_github_blob_evidence(
                     "evidence_ref": None,
                 }
             content = base64.b64decode(result.stdout.strip() or b"")
+    except subprocess.TimeoutExpired:
+        return {
+            "acquisition_outcome": "failed",
+            "failure_domain": "transport",
+            "provider_failure_code": "gh_api_timeout",
+            "evidence_ref": None,
+        }
     except GithubBlobTransportError:
         return {
             "acquisition_outcome": "failed",
@@ -463,32 +587,17 @@ def collect_github_blob_evidence(
             "evidence_ref": None,
         }
 
-    excerpt_sha256, error = _slice_and_hash(content, start_line, end_line)
-    if error:
-        return {
-            "acquisition_outcome": "failed",
-            "failure_domain": "reference_validation",
-            "provider_failure_code": error,
-            "evidence_ref": None,
-        }
-
-    evidence_ref = _build_repo_evidence_ref(
+    return _finalize_collected_evidence(
+        content=content,
         commit_sha=commit_sha,
         path=path,
         start_line=start_line,
         end_line=end_line,
-        excerpt_sha256=excerpt_sha256,
         object_format=object_format,
         owner=owner,
         repo=repo,
         anchor_text=anchor_text,
     )
-    return {
-        "acquisition_outcome": "succeeded",
-        "failure_domain": None,
-        "provider_failure_code": None,
-        "evidence_ref": evidence_ref,
-    }
 
 
 def run_acquisition(
@@ -541,26 +650,49 @@ def run_acquisition(
             result = exec_fn()
 
         outcome = result.get("acquisition_outcome", "unknown_outcome")
+        failure_domain = result.get("failure_domain")
+        provider_failure_code = result.get("provider_failure_code")
+        evidence_ref = result.get("evidence_ref")
+
+        if outcome == "succeeded" and evidence_ref is not None:
+            # A succeeded acquisition_outcome only means the executor
+            # *fetched* something -- it does not mean the resulting
+            # REPO_EVIDENCE_REF_V1 is well-formed. Independently
+            # re-validate it (structurally, and by hash if the executor
+            # cached the underlying bytes via `evidence_bytes`) before
+            # counting it as evidence (#2195 PR #2315 review fix).
+            cached_bytes = result.get("evidence_bytes")
+            getter = (lambda _cs, _p, _b=cached_bytes: _b) if cached_bytes is not None else None
+            validation = validate_repo_evidence_ref(evidence_ref, blob_bytes_getter=getter)
+            if validation["status"] == "rejected":
+                outcome = "failed"
+                failure_domain = "reference_validation"
+                provider_failure_code = "evidence_ref_malformed"
+                evidence_ref = None
+
         dispatch_state = "outcome_unknown" if outcome == "unknown_outcome" else "dispatched"
         attempt: RouteAttempt = {
             "route_id": route["route_id"],
             "lane": route["lane"],
             "dispatch_state": dispatch_state,
             "acquisition_outcome": outcome,
-            "failure_domain": result.get("failure_domain"),
-            "provider_failure_code": result.get("provider_failure_code"),
+            "failure_domain": failure_domain,
+            "provider_failure_code": provider_failure_code,
             "cross_lane_recovery": cross_lane,
         }
-        if outcome == "succeeded" and result.get("evidence_ref") is not None:
-            evidence_refs.append(result["evidence_ref"])
+        if outcome == "succeeded" and evidence_ref is not None:
+            evidence_refs.append(evidence_ref)
         return attempt
 
     if eligible_routes:
         primary = eligible_routes[0]
         attempts.append(_dispatch(primary, cross_lane=False))
 
-        primary_failed = attempts[-1]["acquisition_outcome"] != "succeeded"
-        if primary_failed and len(eligible_routes) > 1:
+        primary_attempt = attempts[-1]
+        primary_failed = primary_attempt["acquisition_outcome"] != "succeeded"
+        primary_code = primary_attempt.get("provider_failure_code")
+        recovery_disallowed_by_code = primary_code in _NON_RECOVERABLE_FAILURE_CODES
+        if primary_failed and len(eligible_routes) > 1 and not recovery_disallowed_by_code:
             secondary = eligible_routes[1]
             if budget.can_recover(claim_id):
                 budget.consume(claim_id)
@@ -568,14 +700,19 @@ def run_acquisition(
             else:
                 budget_blocked = True
 
+    claim_kind = claim.get("claim_kind", "dispositive")
+
     semantic_verdict = "not_evaluated"
     if evidence_refs:
         if semantic_evaluator is not None:
             semantic_verdict = semantic_evaluator(claim, evidence_refs)
-        else:
-            semantic_verdict = "supported"
+        # When no evaluator is injected, semantic_verdict deliberately stays
+        # "not_evaluated": having *acquired* evidence bytes is not the same
+        # thing as the claim being semantically *supported* by it (#2195
+        # PR #2315 review fix -- do not auto-upgrade to "supported").
 
     disposition = _classify_disposition(
+        claim_kind=claim_kind,
         evidence_refs=evidence_refs,
         semantic_verdict=semantic_verdict,
         attempts=attempts,
@@ -608,6 +745,7 @@ def run_acquisition(
         envelope["terminal_artifact"] = build_terminal_artifact(
             run_id=run_id,
             claim=envelope["claim"],
+            baseline=envelope["baseline"],
             attempts=attempts,
             evidence_refs=evidence_refs,
             disposition=disposition,

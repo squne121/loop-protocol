@@ -41,7 +41,7 @@ def _ref(path="docs/adr/0001.md"):
     }
 
 
-def _run_end_to_end(*, run_id, claim, executors, budget):
+def _run_end_to_end(*, run_id, claim, executors, budget, semantic_evaluator=None):
     dispatched: set = set()
     envelope = run_acquisition(
         claim=claim,
@@ -49,6 +49,7 @@ def _run_end_to_end(*, run_id, claim, executors, budget):
         executors=executors,
         budget=budget,
         dispatched_routes=dispatched,
+        semantic_evaluator=semantic_evaluator or (lambda _claim, _refs: "supported"),
     )
     validation = validate_envelope(
         envelope,

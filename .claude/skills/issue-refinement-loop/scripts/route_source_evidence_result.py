@@ -2,10 +2,11 @@
 issue-refinement-loop side consumer/router for
 SOURCE_EVIDENCE_ACQUISITION_RESULT_V1 (#2195).
 
-Owns: envelope schema validation, claim/baseline binding checks, and
-run-scoped cross_lane_recovery_budget bookkeeping (residing here, in
-memory, for the duration of a single refinement-run invocation -- no
-persistent DB).
+Owns: envelope schema validation (via the real
+`source_evidence_acquisition_result_v1.schema.json` / `Draft202012Validator`,
+not a hand-rolled subset), claim/baseline binding checks, and run-scoped
+cross_lane_recovery_budget bookkeeping (residing here, in memory, for the
+duration of a single refinement-run invocation -- no persistent DB).
 
 Does NOT reinterpret provider stderr / exit code / retry policy, and does
 NOT re-run route selection -- both are entirely the producer's
@@ -16,9 +17,15 @@ routing action.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
+
+import jsonschema
+from referencing import Registry, Resource
+from referencing.jsonschema import DRAFT202012
 
 _GEMINI_SCRIPTS_DIR = (
     Path(__file__).resolve().parents[2] / "gemini-cli-headless-delegation" / "scripts"
@@ -42,6 +49,33 @@ __all__ = [
     "validate_envelope",
 ]
 
+_SCHEMAS_DIR = Path(__file__).resolve().parent.parent / "schemas"
+_ACQUISITION_SCHEMA_PATH = _SCHEMAS_DIR / "source_evidence_acquisition_result_v1.schema.json"
+_TERMINAL_ARTIFACT_SCHEMA_PATH = _SCHEMAS_DIR / "source_evidence_terminal_artifact_v1.schema.json"
+
+
+def _load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+_ACQUISITION_SCHEMA = _load_json(_ACQUISITION_SCHEMA_PATH)
+_TERMINAL_ARTIFACT_SCHEMA = _load_json(_TERMINAL_ARTIFACT_SCHEMA_PATH)
+
+# source_evidence_acquisition_result_v1.schema.json's `terminal_artifact`
+# property $refs this schema by its `$id`
+# ("source_evidence_terminal_artifact_v1.schema.json"). Register it as a
+# resource so jsonschema can resolve the $ref without a network fetch or a
+# filesystem-path-based resolver (#2195 PR #2315 review fix).
+_REGISTRY: Registry = Registry().with_resource(
+    "source_evidence_terminal_artifact_v1.schema.json",
+    Resource.from_contents(_TERMINAL_ARTIFACT_SCHEMA, default_specification=DRAFT202012),
+)
+
+_ENVELOPE_VALIDATOR = jsonschema.Draft202012Validator(_ACQUISITION_SCHEMA, registry=_REGISTRY)
+
+# Kept for callers that only need the field-name check without paying for a
+# full schema-validator error path (e.g. producing a fast rejection before
+# constructing an envelope at all).
 REQUIRED_ENVELOPE_FIELDS = (
     "schema",
     "claim",
@@ -56,14 +90,48 @@ REQUIRED_ENVELOPE_FIELDS = (
 ROUTE_ACTIONS = ("proceed", "recover", "human_review", "environment_degraded")
 
 
+def _baseline_digest(baseline: dict) -> str:
+    canonical = json.dumps(baseline or {}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_semantic_consistency(envelope: dict) -> list[str]:
+    """Cross-array relationships that JSON Schema's per-item validation
+    cannot express on its own: every attempt must reference a route_id
+    that is actually present in route_plan, and a cross_lane_recovery
+    attempt must never be the *only* attempt (there must be a preceding
+    primary attempt for it to be "cross-lane" recovery *from*)."""
+    errors: list[str] = []
+    route_ids = {r.get("route_id") for r in envelope.get("route_plan", [])}
+    attempts = envelope.get("attempts", [])
+    for attempt in attempts:
+        if attempt.get("route_id") not in route_ids:
+            errors.append(
+                f"attempt route_id '{attempt.get('route_id')}' is not present in route_plan"
+            )
+    cross_lane_attempts = [a for a in attempts if a.get("cross_lane_recovery")]
+    if cross_lane_attempts and len(attempts) < 2:
+        errors.append("cross_lane_recovery attempt present without a preceding primary attempt")
+    return errors
+
+
 def validate_envelope(
     envelope: dict,
     *,
     expected_claim_id: Optional[str] = None,
     expected_evidence_kind: Optional[str] = None,
+    expected_baseline: Optional[Union[dict, str]] = None,
 ) -> dict:
-    """Validate SOURCE_EVIDENCE_ACQUISITION_RESULT_V1 shape and claim /
-    baseline binding. Returns {"ok": bool, "errors": [str]}."""
+    """Validate SOURCE_EVIDENCE_ACQUISITION_RESULT_V1 shape (against the
+    real JSON Schema, including the terminal_artifact $ref and the
+    disposition/evidence_refs and disposition/failure_domain `if`/`then`
+    conditions) and claim / baseline binding. Returns
+    {"ok": bool, "errors": [str]}.
+
+    `expected_baseline` may be either the exact baseline dict to compare
+    against, or a precomputed digest string (sha256 of the canonical JSON
+    form of the baseline) -- both are checked for an exact match.
+    """
     errors: list[str] = []
 
     if envelope.get("schema") != SCHEMA_ID:
@@ -73,6 +141,14 @@ def validate_envelope(
     for field_name in REQUIRED_ENVELOPE_FIELDS:
         if field_name not in envelope:
             errors.append(f"required field missing: {field_name}")
+    if errors:
+        return {"ok": False, "errors": errors}
+
+    schema_errors = sorted(_ENVELOPE_VALIDATOR.iter_errors(envelope), key=lambda e: list(e.path))
+    for err in schema_errors:
+        loc = "/".join(str(p) for p in err.path) or "<root>"
+        errors.append(f"schema validation failed at '{loc}': {err.message}")
+
     if errors:
         return {"ok": False, "errors": errors}
 
@@ -92,6 +168,14 @@ def validate_envelope(
             f"'{expected_evidence_kind}', got '{claim.get('evidence_kind')}'"
         )
 
+    if expected_baseline is not None:
+        actual_baseline = envelope.get("baseline") or {}
+        if isinstance(expected_baseline, str):
+            if _baseline_digest(actual_baseline) != expected_baseline:
+                errors.append("baseline binding mismatch: baseline digest does not match expected_baseline")
+        elif actual_baseline != expected_baseline:
+            errors.append("baseline binding mismatch: envelope baseline does not equal expected_baseline")
+
     if envelope["semantic_verdict"] not in SEMANTIC_VERDICTS:
         errors.append(f"invalid semantic_verdict: {envelope['semantic_verdict']}")
 
@@ -108,6 +192,8 @@ def validate_envelope(
     # actually acquired.
     if not envelope.get("evidence_refs") and envelope.get("semantic_verdict") != "not_evaluated":
         errors.append("semantic_verdict must be 'not_evaluated' when evidence_refs is empty")
+
+    errors.extend(_validate_semantic_consistency(envelope))
 
     return {"ok": not errors, "errors": errors}
 

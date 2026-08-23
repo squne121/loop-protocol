@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "source_evidence_terminal_artifact_v1.schema.json",
   "title": "SOURCE_EVIDENCE_TERMINAL_ARTIFACT_V1",
   "description": "Bounded (<= 16 KiB serialized) terminal artifact emitted when a dispositive source claim's evidence acquisition exhausts all permitted recovery routes (#2195 AC6). Excludes raw stderr, raw transcript, credentials, and absolute paths.",
   "type": "object",

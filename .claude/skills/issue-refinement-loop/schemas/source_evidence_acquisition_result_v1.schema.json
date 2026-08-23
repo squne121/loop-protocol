@@ -21,7 +21,10 @@
           "enum": ["dispositive", "supporting"]
         },
         "evidence_kind": { "type": "string" },
-        "dependency_group": { "type": ["string", "null"] }
+        "dependency_group": {
+          "type": ["string", "null"],
+          "description": "Opaque passthrough field reported by the caller. Not currently consumed for producer-side route eligibility decisions (tracked as a follow-up; see docs/dev/schema-governance.md and the gemini-cli-headless-delegation usage-contract.md source_evidence_acquisition_result/v1 section for the current scope note)."
+        }
       }
     },
     "baseline": {
@@ -92,8 +95,41 @@
       "enum": ["proceed", "recover", "human_review", "environment_degraded"]
     },
     "terminal_artifact": {
-      "type": ["object", "null"],
-      "description": "Present only when disposition is human_review or environment_degraded and no evidence_refs were obtained. Bounded to <= 16 KiB serialized, excludes raw stderr/transcript/credential/absolute paths."
+      "description": "Present only when disposition is human_review or environment_degraded and no evidence_refs were obtained. Bounded to <= 16 KiB serialized, excludes raw stderr/transcript/credential/absolute paths.",
+      "oneOf": [
+        { "$ref": "source_evidence_terminal_artifact_v1.schema.json" },
+        { "type": "null" }
+      ]
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "disposition": { "const": "proceed" } },
+        "required": ["disposition"]
+      },
+      "then": {
+        "properties": { "evidence_refs": { "minItems": 1 } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "disposition": { "const": "environment_degraded" } },
+        "required": ["disposition"]
+      },
+      "then": {
+        "properties": {
+          "attempts": {
+            "items": {
+              "properties": {
+                "failure_domain": {
+                  "enum": ["provider", "transport", "mcp_protocol", "tool_execution", null]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

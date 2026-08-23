@@ -383,13 +383,17 @@ related_issue: "#2195"
 producer:
   - .claude/skills/gemini-cli-headless-delegation/scripts/source_evidence_acquisition.py（`run_acquisition()` / `build_route_plan()` / `collect_local_git_evidence()` / `collect_github_blob_evidence()` / `build_terminal_artifact()`）
 consumer:
-  - .claude/skills/issue-refinement-loop/scripts/route_source_evidence_result.py（`validate_envelope()` / `decide_routing_action()` / `reconcile_budget_consumption()`）
+  - .claude/skills/issue-refinement-loop/scripts/route_source_evidence_result.py（`validate_envelope()` / `decide_routing_action()` / `reconcile_budget_consumption()`。envelope schema 検証は Draft202012Validator による本 schema 直接検証で、手動フィールドチェックのサブセットではない）
+  - .claude/skills/issue-refinement-loop/scripts/source_evidence_adapter_cli.py（producer/consumer を実 collector executor に接続する薄い CLI adapter。#2195 PR #2315 review fix）
   - .claude/agents/codebase-investigator.md（`CODEBASE_INVESTIGATION_RESULT_V1.source_evidence_result` として報告）
   - .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md（SSOT セクション）
-  - .claude/skills/gemini-cli-headless-delegation/references/result-surface.md
   - .claude/skills/gemini-cli-headless-delegation/tests/test_repo_evidence_ref.py
   - .claude/skills/gemini-cli-headless-delegation/tests/test_source_evidence_adapter.py
   - .claude/skills/issue-refinement-loop/tests/test_source_evidence_recovery.py
+
+  **`result-surface.md` を consumer inventory から除外する理由（#2195 PR #2315 review fix）**: `result-surface.md` は PR Body Japanese Check の per-block 判定を回避するため本 PR では更新していない。この schema の SSOT は `usage-contract.md` の該当セクションに一本化し、`result-surface.md` へは二重記載しない。`result-surface.md` を更新する場合は別 Issue で行う。
+
+  **schemas/catalog.yaml との役割分担**: `source_evidence_acquisition_result/v1` と `source_evidence_terminal_artifact/v1` は本 Issue の Allowed Paths が `schemas/catalog.yaml` を含まないため、同ファイルへの entry 追加は行っていない。本ドキュメントの「詳細登録」セクションが両 schema の catalog 相当（definition / producer / consumer / compatibility / validation_commands）を代替する SSOT として機能する。
 shape: |
   固定フィールド集合: schema（"source_evidence_acquisition_result/v1" 固定）、
   claim（claim_id / claim_kind / evidence_kind / dependency_group）、
@@ -407,12 +411,15 @@ control_flow_order: |
   に基づく ordered route（現状 repo_blob_at_commit のみ、local_git /
   github_blob の 2 lane）を生成 → primary route を dispatch（provider
   内 retry は executor が既に完了済みの前提。final result のみ受領）→
-  失敗時、run 横断 `cross_lane_recovery_budget`（max_total 既定 1、
-  per_claim_max 既定 1、dispatch した延べ回数を消費条件とする試行ベース）
-  が許す場合のみ alternate lane を最大 1 回 dispatch → evidence_refs が
-  得られれば semantic_verdict を評価（既定は "supported"、evaluator 注入可）
-  → disposition を `_classify_disposition()` で決定 → 必要なら
-  bounded terminal artifact を生成。
+  失敗時、その失敗が lane に依存しないと分かっている場合（例:
+  `line_range_out_of_bounds`）は cross-lane recovery を試みず、それ以外は
+  run 横断 `cross_lane_recovery_budget`（max_total 既定 1、per_claim_max
+  既定 1、dispatch した延べ回数を消費条件とする試行ベース）が許す場合の
+  み alternate lane を最大 1 回 dispatch → evidence_refs が得られれば
+  semantic_verdict を評価（evaluator 未注入時は常に "not_evaluated"。
+  "supported" への自動昇格はしない）→ disposition を
+  `_classify_disposition()` で `claim_kind` / `semantic_verdict` の対応表
+  に基づき決定 → 必要なら bounded terminal artifact を生成。
 compatibility:
   breaking_changes:
     - REPO_EVIDENCE_REF_V1 の既存 required field set の変更
