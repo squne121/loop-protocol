@@ -112,6 +112,69 @@ REPO = "squne121/loop-protocol"
 ISSUE_NUMBER = 2197
 ANCHOR_COMMENT_ID = 5315264311
 
+# ---------------------------------------------------------------------------
+# Issue #2317: structured `REASON_CODE:` compact-stdout predicate/parser,
+# replacing the prior broad substring OR-chain (which matched the
+# `GH_API_FAILURE` blocker text on both stdout AND stderr and therefore
+# false-greened genuine failures). Only an exact-match, stdout-only,
+# closed-set `REASON_CODE:` value is ever treated as transient.
+# ---------------------------------------------------------------------------
+
+_TRANSIENT_ENVIRONMENT_FAILURE_REASON_CODES = frozenset(
+    {"rate_limited", "upstream_environment_failure", "transport_connectivity_failure"}
+)
+
+
+def _extract_reason_code_line_value(stdout: str) -> "str | None":
+    """Extract the value of the sole `REASON_CODE:` line from compact
+    stdout produced by the real production `_build_compact_stdout()`.
+
+    Returns `None` (never transient) unless exactly one `REASON_CODE:`
+    line is present -- absence or duplication both fail closed to "not
+    transient" so genuine failures are never silently skipped."""
+    matches = [
+        line[len("REASON_CODE:") :].strip() for line in stdout.splitlines() if line.startswith("REASON_CODE:")
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _is_transient_environment_failure_reason_code(reason_code: "str | None") -> bool:
+    """Closed-set exact-match predicate (Issue #2317 AC3/AC5/AC7): only the
+    reason codes production has already classified as transient/
+    environmental (`rate_limited` / `upstream_environment_failure` /
+    `transport_connectivity_failure`) are treated as skip-eligible. Any
+    unknown, future, malformed, or empty reason code is NOT transient
+    (fail-closed) so genuine failures never become false-green skips."""
+    if not reason_code:
+        return False
+    return reason_code in _TRANSIENT_ENVIRONMENT_FAILURE_REASON_CODES
+
+
+def _stdout_indicates_transient_environment_failure(stdout: str) -> bool:
+    """Combine the extraction helper and the closed-set predicate. `stderr`
+    is never consulted (Issue #2317: stdout is the sole judgment source)."""
+    return _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(stdout))
+
+
+def _load_run_refinement_preflight_module():
+    """Import the REAL `run_refinement_preflight.py` production module
+    in-process (never a copy, never a stub) under a private, session-unique
+    module name, following the same unique-module-name convention already
+    used elsewhere in this file, so this in-process load never collides
+    with another test file's own load of the same source file within the
+    same pytest session."""
+    spec = importlib.util.spec_from_file_location(
+        "run_refinement_preflight_2317_reason_code_stdout_projection",
+        str(_PREFLIGHT_SCRIPT),
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 _GH_MARKER_SCRIPT = """#!/bin/sh
 # Test-only marker executable: if this is ever invoked it proves the
 # isolated-profile fetch path fell back to the `gh` CLI, which must never
@@ -425,16 +488,13 @@ def test_ac5_ac6_skill_runtime_exec_with_human_context_live_subprocess_resolves_
         f"subprocess graph. stdout={stdout!r} stderr={result.stderr!r}"
     )
 
-    if result.returncode == 3 and (
-        "rate_limited" in stdout
-        or "upstream_environment_failure" in stdout
-        or "transport_connectivity_failure" in stdout
-        or "rate_limited" in result.stderr
-        or "upstream_environment_failure" in result.stderr
-        or "transport_connectivity_failure" in result.stderr
-    ):
+    # Issue #2317: replaced the prior broad substring OR-chain (which also
+    # matched stderr and could false-green a genuine `GH_API_FAILURE`
+    # blocker) with the structured, stdout-only, closed-set `REASON_CODE:`
+    # predicate defined above (AC3/AC4/AC5/AC6/AC7).
+    if result.returncode == 3 and _stdout_indicates_transient_environment_failure(stdout):
         pytest.skip(
-            f"network/rate-limit/upstream unavailable in this environment: "
+            f"transient environment failure reason_code in this environment: "
             f"stdout={stdout!r} stderr={result.stderr!r}"
         )
     assert "authentication" not in stdout and "gh_exit_4" not in stdout, (
@@ -462,3 +522,118 @@ def test_ac5_ac6_skill_runtime_exec_with_human_context_live_subprocess_resolves_
         f"AC5 unmet: resolved anchor_comment does not reference comment "
         f"{ANCHOR_COMMENT_ID}: {anchor_comment_state!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2317: deterministic unit tests for the REASON_CODE/SOURCE/OPERATION
+# stdout projection (AC1/AC2, against the REAL `_build_compact_stdout()`)
+# and for the transient-environment-failure predicate/parser (AC3/AC4/AC5/
+# AC7) defined above.
+# ---------------------------------------------------------------------------
+
+
+def test_reason_code_source_operation_lines_emitted_for_environment_failure_status() -> None:
+    """AC1: the REAL production `_build_compact_stdout()` emits
+    `REASON_CODE:` / `SOURCE:` / `OPERATION:` lines when `status ==
+    "environment_failure"`."""
+    module = _load_run_refinement_preflight_module()
+    result = {
+        "schema_version": "refinement_preflight_result/v1",
+        "status": "environment_failure",
+        "issue_number": ISSUE_NUMBER,
+        "repo": REPO,
+        "planner_exit_code": None,
+        "planner_fail_closed": None,
+        "next_action": "retry_later",
+        "must_read": [],
+        "do_not_read": [],
+        "commands": [],
+        "blockers": ["GH_API_FAILURE"],
+        "artifacts": {},
+        "hashes": {},
+        "reason_code": "rate_limited",
+        "source": "github_api",
+        "operation": "fetch_issue",
+    }
+    stdout = module._build_compact_stdout(result)
+    assert "REASON_CODE: rate_limited" in stdout
+    assert "SOURCE: github_api" in stdout
+    assert "OPERATION: fetch_issue" in stdout
+
+
+def test_reason_code_source_operation_lines_omitted_when_status_is_not_environment_failure() -> None:
+    """AC2: the REAL production `_build_compact_stdout()` never emits
+    `REASON_CODE:` / `SOURCE:` / `OPERATION:` lines when `status !=
+    "environment_failure"`, even if those keys are present in `result`."""
+    module = _load_run_refinement_preflight_module()
+    result = {
+        "schema_version": "refinement_preflight_result/v1",
+        "status": "pass",
+        "issue_number": ISSUE_NUMBER,
+        "repo": REPO,
+        "planner_exit_code": 0,
+        "planner_fail_closed": False,
+        "next_action": "proceed",
+        "must_read": [],
+        "do_not_read": [],
+        "commands": [],
+        "blockers": [],
+        "artifacts": {},
+        "hashes": {},
+        "reason_code": "rate_limited",
+        "source": "github_api",
+        "operation": "fetch_issue",
+    }
+    stdout = module._build_compact_stdout(result)
+    assert "REASON_CODE:" not in stdout
+    assert "SOURCE:" not in stdout
+    assert "OPERATION:" not in stdout
+
+
+def test_transient_environment_failure_predicate_true_for_transient_reason_codes() -> None:
+    """AC3: the predicate returns True for each closed-set transient
+    reason code."""
+    for code in ("rate_limited", "upstream_environment_failure", "transport_connectivity_failure"):
+        stdout = f"STATUS: environment_failure\nREASON_CODE: {code}\nSOURCE: github_api\nOPERATION: fetch_issue"
+        assert _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(stdout)) is True
+
+
+def test_transient_environment_failure_predicate_false_without_reason_code_line() -> None:
+    """AC4: with no `REASON_CODE:` line present and only a
+    `BLOCKERS: GH_API_FAILURE` entry, the predicate returns False (hard
+    failure is preserved -- this is the exact regression this Issue
+    fixes)."""
+    stdout = "STATUS: blocked\nBLOCKERS:\n  - GH_API_FAILURE"
+    assert _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(stdout)) is False
+
+
+def test_transient_environment_failure_predicate_false_for_genuine_reason_codes() -> None:
+    """AC5: genuine reason codes outside the transient closed set return
+    False (never silently skipped as transient)."""
+    genuine_reason_codes = (
+        "unexpected_authentication_dependency",
+        "http_403_forbidden",
+        "canonical_resource_missing",
+        "gh_auth_required",
+        "malformed_response_body",
+        "transport_internal_error",
+    )
+    for code in genuine_reason_codes:
+        stdout = f"STATUS: environment_failure\nREASON_CODE: {code}\nSOURCE: github_api\nOPERATION: fetch_issue"
+        assert _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(stdout)) is False
+
+
+def test_transient_environment_failure_predicate_false_for_duplicate_or_empty_reason_code() -> None:
+    """AC7: duplicate `REASON_CODE:` lines, or a `REASON_CODE:` line with
+    an empty value, both cause the predicate to return False."""
+    duplicate_stdout = (
+        "STATUS: environment_failure\n"
+        "REASON_CODE: rate_limited\n"
+        "REASON_CODE: rate_limited\n"
+        "SOURCE: github_api\n"
+        "OPERATION: fetch_issue"
+    )
+    assert _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(duplicate_stdout)) is False
+
+    empty_value_stdout = "STATUS: environment_failure\nREASON_CODE: \nSOURCE: github_api\nOPERATION: fetch_issue"
+    assert _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(empty_value_stdout)) is False

@@ -1274,6 +1274,60 @@ class TestBuildCompactStdout:
         assert "BLOCKERS:" in output
         assert "ANCHOR_NOT_IN_ISSUE" in output
 
+    def test_environment_failure_emits_reason_code_source_operation_and_no_raw_detail_leak(self):
+        """AC1/AC8: environment_failure status emits REASON_CODE/SOURCE/OPERATION
+        as three consistent stdout lines, and never leaks raw body/comment detail."""
+        sensitive = "MY_PRIVATE_RAW_DETAIL"
+        result = {
+            "schema_version": "refinement_preflight_result/v1",
+            "status": "environment_failure",
+            "issue_number": 1,
+            "repo": "o/r",
+            "planner_exit_code": None,
+            "planner_fail_closed": None,
+            "next_action": "retry_later",
+            "must_read": [],
+            "do_not_read": [],
+            "commands": [],
+            "blockers": ["GH_API_FAILURE"],
+            "artifacts": {},
+            "hashes": {},
+            "reason_code": "rate_limited",
+            "source": "github_api",
+            "operation": "fetch_issue",
+        }
+        output = wrapper._build_compact_stdout(result)
+        assert "REASON_CODE: rate_limited" in output
+        assert "SOURCE: github_api" in output
+        assert "OPERATION: fetch_issue" in output
+        assert sensitive not in output
+
+    def test_non_environment_failure_omits_reason_code_source_operation(self):
+        """AC2: non-environment_failure status must not emit REASON_CODE/SOURCE/OPERATION,
+        even when those keys are present in the result dict (e.g. leftover state)."""
+        result = {
+            "schema_version": "refinement_preflight_result/v1",
+            "status": "pass",
+            "issue_number": 1,
+            "repo": "o/r",
+            "planner_exit_code": 0,
+            "planner_fail_closed": False,
+            "next_action": "proceed",
+            "must_read": [],
+            "do_not_read": [],
+            "commands": [],
+            "blockers": [],
+            "artifacts": {},
+            "hashes": {},
+            "reason_code": "rate_limited",
+            "source": "github_api",
+            "operation": "fetch_issue",
+        }
+        output = wrapper._build_compact_stdout(result)
+        assert "REASON_CODE:" not in output
+        assert "SOURCE:" not in output
+        assert "OPERATION:" not in output
+
 
 # ---------------------------------------------------------------------------
 # B1: multi-page slurp flatten
