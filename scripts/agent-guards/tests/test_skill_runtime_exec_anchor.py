@@ -16,9 +16,15 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _pinned_uv_version(repo_root: Path) -> str:
+    data = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    return data["tool"]["uv"]["required-version"]
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -65,6 +71,21 @@ def _install_skill_runtime_exec_fixture(repo_root: Path) -> None:
         dest = repo_root / rel
         _write_text(dest, src.read_text())
 
+    pin = _pinned_uv_version(source_root)
+    _write_text(
+        repo_root / "pyproject.toml",
+        f'''[project]
+name = "skill-runtime-fixture"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+required-version = "{pin}"
+managed = false
+''',
+    )
+
     _write_text(
         repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
         """from __future__ import annotations
@@ -83,6 +104,27 @@ def select_issue_worktree(catalog, issue_number, root_realpath):
 """,
     )
     _write_text(
+        # Issue #2311 AC1 fixture parity: bare `preflight.run` first-hops
+        # into `workflow_start_entry.py` (a minimal fixture-local forwarder
+        # to `run_refinement_preflight.py` below -- see that file) instead
+        # of `run_refinement_preflight.py` directly. Sibling anchor-comment
+        # entries (`.with_anchor` / `.with_human_context` /
+        # `.with_agent_report`) below are unaffected and keep
+        # `run_refinement_preflight.py` as their first hop.
+        repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "workflow_start_entry.py",
+        """from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+if __name__ == "__main__":
+    _inner = Path(__file__).resolve().parent / "run_refinement_preflight.py"
+    _proc = subprocess.run([sys.executable, str(_inner), *sys.argv[1:]])
+    raise SystemExit(_proc.returncode)
+""",
+    )
+    _write_text(
         repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "command_registry.py",
         """from __future__ import annotations
 
@@ -91,7 +133,7 @@ REGISTRY = {
         "id": "preflight.run",
         "argv": [
             "uv", "run", "python3",
-            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            ".claude/skills/issue-refinement-loop/scripts/workflow_start_entry.py",
             "--issue-number", "{issue_number}", "--repo", "{repo}",
         ],
         "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime",

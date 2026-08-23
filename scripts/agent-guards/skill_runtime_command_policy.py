@@ -1784,7 +1784,7 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "uv",
         "run",
         "python3",
-        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        ".claude/skills/issue-refinement-loop/scripts/workflow_start_entry.py",
         "--issue-number",
         "{issue_number}",
         "--repo",

@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 import importlib.util as _ilu
 from pathlib import Path
 
@@ -40,6 +41,11 @@ from worktree_scope_guard_testkit import (
     _run_guard,
     _write_text,
 )
+
+
+def _pinned_uv_version(repo_root: Path) -> str:
+    data = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    return data["tool"]["uv"]["required-version"]
 
 # =============================================================================
 # Harness
@@ -88,6 +94,21 @@ def _install_skill_runtime_exec_fixture(repo_root: Path, catalog_mode: str = "ac
         dest = repo_root / rel
         _write_text(dest, src.read_text())
 
+    pin = _pinned_uv_version(source_root)
+    _write_text(
+        repo_root / "pyproject.toml",
+        f'''[project]
+name = "skill-runtime-fixture"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+required-version = "{pin}"
+managed = false
+''',
+    )
+
     _write_text(
         repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
         f"""from __future__ import annotations
@@ -121,6 +142,25 @@ def select_issue_worktree(catalog, issue_number, root_realpath):
     )
 
     _write_text(
+        # Issue #2311 AC1 fixture parity: bare `preflight.run` first-hops
+        # into `workflow_start_entry.py` (a minimal fixture-local forwarder
+        # to `run_refinement_preflight.py` below -- see that file) instead
+        # of `run_refinement_preflight.py` directly.
+        repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "workflow_start_entry.py",
+        """from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+if __name__ == "__main__":
+    _inner = Path(__file__).resolve().parent / "run_refinement_preflight.py"
+    _proc = subprocess.run([sys.executable, str(_inner), *sys.argv[1:]])
+    raise SystemExit(_proc.returncode)
+""",
+    )
+
+    _write_text(
         repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "command_registry.py",
         """from __future__ import annotations
 
@@ -133,7 +173,7 @@ REGISTRY = {
             "uv",
             "run",
             "python3",
-            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            ".claude/skills/issue-refinement-loop/scripts/workflow_start_entry.py",
             "--issue-number",
             "{issue_number}",
             "--repo",
