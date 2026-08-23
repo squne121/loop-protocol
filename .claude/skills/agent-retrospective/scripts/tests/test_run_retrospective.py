@@ -50,6 +50,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import jsonschema
 import pytest
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
@@ -1868,3 +1869,82 @@ def test_compute_delta_wired_into_production_publish_path_run_cli(tmp_path: Path
         }
     ]
 
+
+
+
+# ---------------------------------------------------------------------------
+# AC4 (Issue #2301): committed scripts/schemas/ canonical JSON Schema assets
+# -- the exact files build_observer_requests()/run_cli() point --schema-dir
+# at by default (_SCRIPTS_DIR / "schemas"). Parity-checked against the
+# EvidenceBundle/Evaluation wire-contract dataclasses that are the actual
+# ground truth for the business payload shape (never a private duplicate).
+# ---------------------------------------------------------------------------
+
+_SCHEMA_DIR = _SCRIPTS_DIR / "schemas"
+
+
+def _load_schema(filename: str) -> dict[str, Any]:
+    return json.loads((_SCHEMA_DIR / filename).read_text(encoding="utf-8"))
+
+
+def test_observer_result_schema_asset_exists_and_is_valid_json_schema() -> None:
+    schema = _load_schema("observer_result_v1.schema.json")
+    jsonschema.Draft7Validator.check_schema(schema)
+
+
+def test_evaluation_result_schema_asset_exists_and_is_valid_json_schema() -> None:
+    schema = _load_schema("evaluation_result_v1.schema.json")
+    jsonschema.Draft7Validator.check_schema(schema)
+
+
+def test_observer_result_schema_required_fields_match_evidence_bundle_dataclass() -> None:
+    schema = _load_schema("observer_result_v1.schema.json")
+    dataclass_fields = {f.name for f in dataclasses.fields(rr.EvidenceBundle)}
+    assert set(schema["required"]) == dataclass_fields
+    assert set(schema["properties"].keys()) == dataclass_fields
+
+
+def test_evaluation_result_schema_required_fields_match_evaluation_dataclass() -> None:
+    schema = _load_schema("evaluation_result_v1.schema.json")
+    dataclass_fields = {f.name for f in dataclasses.fields(rr.Evaluation)}
+    assert set(schema["required"]) == dataclass_fields
+    assert set(schema["properties"].keys()) == dataclass_fields
+
+
+def test_observer_result_schema_validates_real_evidence_bundle_wire_payload() -> None:
+    schema = _load_schema("observer_result_v1.schema.json")
+    bundle = rr.EvidenceBundle(
+        run_id="run-1",
+        base_sha=_FULL_SHA,
+        source_set_digest=_DIGEST,
+        observer_id="retrospective-runtime-observer",
+        evidence_ref="evidence://x",
+        findings=[{"claim": "observed something", "claim_class": "process"}],
+    )
+    payload = json.loads(bundle.to_wire())
+    jsonschema.validate(payload, schema)
+
+
+def test_evaluation_result_schema_validates_real_evaluation_wire_payload() -> None:
+    schema = _load_schema("evaluation_result_v1.schema.json")
+    evaluation = rr.Evaluation(
+        run_id="run-1",
+        base_sha=_FULL_SHA,
+        source_set_digest=_DIGEST,
+        candidate_records=[],
+        evidence_ref="evidence://x",
+    )
+    payload = json.loads(evaluation.to_wire())
+    jsonschema.validate(payload, schema)
+
+
+def test_build_observer_requests_default_schema_dir_points_at_committed_schemas(tmp_path: Path) -> None:
+    """The `--schema-dir` default (`_SCRIPTS_DIR / "schemas"`) that
+    `run_cli()`/`main()` use in production must resolve to the exact
+    directory containing the two schema assets this Issue adds -- not a
+    stale/placeholder path."""
+    requests = rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=str(tmp_path), prompts={})
+    assert requests
+    for request in requests:
+        assert Path(request.json_schema_path) == _SCHEMA_DIR / "observer_result_v1.schema.json"
+        assert Path(request.json_schema_path).is_file()

@@ -60,6 +60,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+import jsonschema
+
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 
@@ -688,6 +690,60 @@ def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if k in _DEFAULT_ENV_PASSTHROUGH_ALLOWLIST}
 
 
+#: matches a single leading/trailing markdown code fence around a JSON blob
+#: (```json ... ``` or bare ``` ... ```), used only by
+#: `_structured_output_from_result_fallback` below.
+_MARKDOWN_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*)\n```\s*$", re.DOTALL)
+
+
+def _extract_fenced_json_text(text: str) -> str:
+    """Strip a single leading/trailing markdown code fence from `text` if
+    present (returns `text` stripped of surrounding whitespace unchanged
+    otherwise). Pure string transform -- callers still parse/validate the
+    result themselves (Issue #2301 live verification fallback, see
+    `_structured_output_from_result_fallback`)."""
+    stripped = text.strip()
+    match = _MARKDOWN_JSON_FENCE_RE.match(stripped)
+    return match.group(1).strip() if match else stripped
+
+
+def _structured_output_from_result_fallback(
+    payload: dict[str, Any], *, json_schema_path: str
+) -> dict[str, Any] | None:
+    """Best-effort recovery of the schema-conformant business payload from
+    the wrapper's `result` text field when the `structured_output` wrapper
+    field itself is absent (Issue #2301 P0 adapter fix, discovered by live
+    verification against the real `claude` CLI, 2.1.241): a schema-less
+    (no `--agent`) `-p --json-schema ...` invocation populates
+    `structured_output` directly, but a `--agent <custom-subagent>
+    --json-schema ...` invocation does NOT -- the real CLI only ever puts the
+    schema-conformant JSON in `result` (frequently wrapped in a markdown
+    ```json code fence). This fallback is only reached when
+    `structured_output` is missing (never when it is present but a
+    non-dict -- that remains `missing_structured_output` unconditionally,
+    see the caller). The recovered payload is accepted only if it
+    independently, strictly validates against the exact schema file this
+    invocation was given (`request.json_schema_path`) -- mirrors the
+    Issue #2237 P0-1 rationale against re-parsing the *wrapper* itself as the
+    business schema: a malformed/absent `result`, or one that fails schema
+    validation, is never silently accepted as `ok`."""
+    result_text = payload.get("result")
+    if not isinstance(result_text, str) or not result_text.strip():
+        return None
+    try:
+        candidate = json.loads(_extract_fenced_json_text(result_text))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(candidate, dict):
+        return None
+    try:
+        schema = json.loads(Path(json_schema_path).read_text(encoding="utf-8"))
+        jsonschema.validate(candidate, schema)
+    except (OSError, json.JSONDecodeError, jsonschema.exceptions.ValidationError, jsonschema.exceptions.SchemaError):
+        return None
+    return candidate
+
+
 def build_agent_invocation_argv(
     request: AgentInvocationRequest, *, policy: "DelegatedAgentPermissionPolicy | None" = None
 ) -> list[str]:
@@ -829,6 +885,16 @@ def invoke_agent(
             reason_code="unexpected_wrapper_shape",
         )
     structured_output = payload.get("structured_output")
+    if not isinstance(structured_output, dict):
+        # Issue #2301 P0 adapter fix: real `--agent <custom-subagent>
+        # --json-schema ...` invocations (unlike schema-less/no-`--agent`
+        # `-p --json-schema ...` invocations) never populate the
+        # `structured_output` wrapper field -- see
+        # `_structured_output_from_result_fallback`'s docstring for the full
+        # rationale and why this fallback never loosens validation.
+        structured_output = _structured_output_from_result_fallback(
+            payload, json_schema_path=request.json_schema_path
+        )
     if not isinstance(structured_output, dict):
         return AgentInvocationResult(
             status="malformed_output",

@@ -21,9 +21,10 @@ dev = [
 required-version = "==0.11.29"
 
 [tool.pytest.ini_options]
-addopts = "--import-mode=importlib -m 'not github_live'"
+addopts = "--import-mode=importlib -m 'not github_live and not claude_live'"
 markers = [
   "github_live: exercises real GitHub network interaction (gh CLI write access against a disposable Issue, or unauthenticated live GitHub REST/API reads) that is structurally unavailable or unsafe in the default CI authentication context (deselected by default addopts; opt in explicitly with -m github_live).",
+  "claude_live: exercises a real claude CLI subprocess invocation (headless Agent invocation adapter round-trip against retrospective-runtime-observer or similar) that requires a local claude binary + authenticated subscription login and is structurally unavailable in the default CI authentication context (deselected by default addopts; opt in explicitly with -m claude_live, see .claude/skills/agent-retrospective/scripts/tests/verify_run_retrospective_live_cli.sh).",
 ]
 
 [tool.ruff]
