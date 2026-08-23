@@ -597,6 +597,13 @@ def test_uv_not_found_diagnostic_payload_keys(monkeypatch, tmp_path):
         "recommended_install_dir",
         "remediation_hint",
     }
+    # Issue #2275 fix_delta P2-2: assert actual VALUES, not just key
+    # presence -- a payload with the right keys but wrong/empty values
+    # would still pass a keys-only assertion.
+    assert payload["error"] == "uv_not_found"
+    assert payload["expected_version"] == exec_mod._required_uv_version(str(REPO_ROOT))
+    assert payload["recommended_install_dir"] == str(real_account_home / ".local" / "bin")
+    assert payload["remediation_hint"].strip()
 
 
 def test_uv_not_found_candidates_searched_matches_safe_entries(monkeypatch, tmp_path):

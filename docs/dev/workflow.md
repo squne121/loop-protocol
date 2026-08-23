@@ -486,17 +486,25 @@ Issue #2241 / PR #2247 の実装範囲では、以下は意図的に「未解決
 ### Trusted uv のローカル開発復旧
 
 `scripts/agent-guards/skill_runtime_exec.py` の `_resolve_trusted_executable("uv", ...)` は、`uv` を
-以下 3 つの lane からこの優先順位で探索する（Issue #2251 / #2276 / #2280）。ローカル dev 環境で
-`uv_not_found` に遭遇した場合、まずどの lane が欠けているかを切り分ける。
+以下 3 つの lane から**この優先順位**（実装は `_resolve_trusted_executable` の `if name == "uv":` 分岐、
+`hostedtoolcache -> account-home(user-local) -> system` の順で `_dedupe_path_entries()` に渡す）で探索する
+（Issue #2251 / #2276 / #2280）。ローカル dev 環境で `uv_not_found` に遭遇した場合、まずどの lane が
+欠けているかを切り分ける。
 
 1. **CI hosted-toolcache lane**（例: `/opt/hostedtoolcache/uv/<version>/x86_64/uv`）: GitHub Actions
    runner イメージが提供する、最も強く検証される trust root。ローカル dev マシンには通常存在しない。
-2. **system-directory lane**（`/usr/local/bin`、`/usr/bin` 等の固定システム標準ディレクトリ）: sudo で
-   インストールした `uv` を置く場所。
-3. **no-sudo user-local lane**（real OS account home 由来の `~/.local/bin`、`pwd.getpwuid(os.getuid()).pw_dir`
+2. **no-sudo user-local lane**（real OS account home 由来の `~/.local/bin`、`pwd.getpwuid(os.getuid()).pw_dir`
    から算出。ambient `HOME` 環境変数には依存しない）: sudo 権限がない開発環境向けの lane（Issue #2276 decision
    record）。この lane は `pyproject.toml` の `[tool.uv].required-version` に対する exact version pin 一致
    時のみ有効になる（`_validate_trusted_executable_version`）。
+3. **system-directory lane**（`/usr/local/bin`、`/usr/bin` 等の固定システム標準ディレクトリ）: sudo で
+   インストールした `uv` を置く場所。
+
+**実務上の含意**: hosted-toolcache が存在しないローカル dev 環境では、pin と一致しない
+`~/.local/bin/uv`（no-sudo user-local lane）が system lane より先に検査される。そのため、version が
+古い/新しい `~/.local/bin/uv` が存在すると、system lane に正しい version の `uv` があっても
+そちらへ silently fallback せず、version-mismatch エラー（`uv_version_mismatch`）で fail する。
+`~/.local/bin/uv` を復旧手順で pin と完全一致させることが、この fail-closed 挙動を解消する唯一の方法。
 
 いずれの lane にも見つからない場合、`_resolve_trusted_executable("uv", ...)` は `uv_not_found: ` prefix に
 続けて `error` / `candidates_searched`（実際に `shutil.which()` へ渡した候補ディレクトリ列。存在しない
@@ -506,13 +514,36 @@ account home の `.local/bin`。未作成でも算出される） / `remediation
 
 **復旧手順（no-sudo user-local lane）:**
 
-1. `pyproject.toml` の `[tool.uv].required-version` から pin（例: `==0.11.29`）を取得する。
-2. 公式の versioned installer スクリプトを、そのバージョン番号を指定した URL から一旦ローカルへ保存する
-   （`https://astral.sh/uv/<バージョン番号>/install.sh` 相当。中身を確認してから実行し、fetch と実行を
-   同一コマンドで直結しない）。
-3. 保存したスクリプトを `UV_INSTALL_DIR` に real account home の `.local/bin`（例: `$HOME/.local/bin`）を
-   指定して実行する。
-4. `uv --version` を実行し、出力バージョンが手順 1 で取得した pin と完全一致することを確認する。
+real account home は ambient `$HOME`（sandbox/isolated 環境では実 OS アカウントと乖離しうる。Issue
+#2276/#2280 design）ではなく、`python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)'` で
+求めた real OS account home を使う。バージョン pin は `pyproject.toml` の `[tool.uv].required-version`
+（`==X.Y.Z` 形式の PEP 440 specifier）から `tomllib` で bare な `X.Y.Z` を取り出し、それを versioned
+installer URL（`https://astral.sh/uv/<X.Y.Z>/install.sh`）にそのまま使う（`==` 付きのまま URL へ渡さない）。
+
+```bash
+account_home="$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')"
+uv_version="$(python3 - <<'PY'
+import re, tomllib
+with open("pyproject.toml", "rb") as f:
+    specifier = tomllib.load(f)["tool"]["uv"]["required-version"].strip()
+m = re.fullmatch(r"==(\d+\.\d+\.\d+)", specifier)
+if not m:
+    raise SystemExit(f"exact [tool.uv].required-version pin required: {specifier!r}")
+print(m.group(1))
+PY
+)"
+installer_path="$(mktemp)"
+trap 'rm -f "$installer_path"' EXIT
+curl -LsSf "https://astral.sh/uv/${uv_version}/install.sh" -o "$installer_path"
+less "$installer_path"
+env UV_INSTALL_DIR="${account_home}/.local/bin" UV_NO_MODIFY_PATH=1 sh "$installer_path"
+actual_version="$("${account_home}/.local/bin/uv" --version | awk '{print $2}')"
+test "$actual_version" = "$uv_version"
+```
+
+fetch（`curl`）と実行（`sh`）は同一コマンドへ直結せず、必ず `less` 等で中身を確認してから実行する。
+最後の version 確認は、ambient `PATH` 上の `uv` ではなく、いま `UV_INSTALL_DIR` へインストールした
+バイナリの絶対パス（`${account_home}/.local/bin/uv`）を明示的に呼び出して行う。
 
 `git` 等、`uv` 以外の trusted executable にはこの account-home lane も診断 payload も追加されない
 （探索対象・エラーメッセージともに変更なし）。

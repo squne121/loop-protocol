@@ -73,7 +73,7 @@ def test_workflow_capability_returns_structured_result():
     assert result["decision"] in ("ready", "degraded", "blocked")
     assert set(result.keys()) == {"schema", "profile", "decision", "checks", "reasons"}
     assert set(result["checks"].keys()) == {"uv", "spark", "github"}
-    assert set(result["checks"]["uv"].keys()) == {"status", "reason"}
+    assert set(result["checks"]["uv"].keys()) == {"status", "reason", "diagnostic"}
     assert set(result["checks"]["spark"].keys()) == {"status"}
     assert set(result["checks"]["github"].keys()) == {"auth", "repo_read", "operations"}
     assert isinstance(result["reasons"], list)
@@ -118,13 +118,16 @@ def test_workflow_capability_accepts_pinned_local_bin_uv(monkeypatch, tmp_path):
 
 def test_workflow_capability_rejects_unpinned_local_bin_uv(monkeypatch, tmp_path):
     _patch_real_account_home(monkeypatch, tmp_path)
-    # `_resolve_trusted_executable` prefers hostedtoolcache and system
-    # standard directories over the account-home lane (see its ordering
-    # docstring). On a CI runner that already provisioned a correctly
-    # pinned `uv` via hostedtoolcache, `shutil.which` would resolve THAT
-    # one first and never reach this test's mismatched account-home fake,
-    # masking the rejection this test exists to prove. Isolate resolution
-    # to the account-home lane by emptying the higher-priority lanes.
+    # `_resolve_trusted_executable`'s search order for `uv` is
+    # hostedtoolcache -> account-home (user-local) -> system standard
+    # directories (see its ordering docstring; corrected in Issue #2275
+    # fix_delta P1-3 -- account-home is checked BEFORE system, not after).
+    # On a CI runner that already provisioned a correctly pinned `uv` via
+    # hostedtoolcache, `shutil.which` would resolve THAT one first and
+    # never reach this test's mismatched account-home fake, masking the
+    # rejection this test exists to prove. Isolate resolution to the
+    # account-home lane by emptying the higher-priority hostedtoolcache
+    # lane and the lower-priority system lane.
     monkeypatch.setattr(exec_mod, "_trusted_toolchain_dirs", lambda executable_name: [])
     monkeypatch.setattr(exec_mod, "_SYSTEM_STANDARD_PATH_DIRS", ())
     required = exec_mod._required_uv_version(str(_REPO_ROOT))
@@ -354,6 +357,54 @@ def test_no_broker_dependency_reference():
     for term in forbidden_terms:
         assert term not in source, f"unexpected broker dependency reference: {term}"
 
+
+
+# --- Issue #2275 fix_delta P1-1: uv_not_found diagnostic reaches outer JSON -
+
+
+def test_workflow_capability_uv_not_found_reason_and_diagnostic_reach_outer_json(monkeypatch):
+    """GIVEN the trusted resolver reports `uv_not_found` (a structured
+    diagnostic payload embedded in the underlying `RuntimeError`)
+    THEN the outer `CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1.checks.uv` result
+    must expose a short stable `reason` string (never a JSON-in-a-string
+    double-encoding) AND the parsed `diagnostic` object, all the way
+    through `trusted_runtime_capabilities.check_trusted_uv()` ->
+    `workflow_capability_preflight.assess()` -> outer JSON (Issue #2275
+    fix_delta P1-1 consumer path). Uses `monkeypatch` on the resolver only
+    -- no real uv uninstall, no live canary."""
+    payload = {
+        "error": "uv_not_found",
+        "candidates_searched": ["/opt/hostedtoolcache/uv"],
+        "expected_version": "0.11.29",
+        "recommended_install_dir": "/fake/home/.local/bin",
+        "remediation_hint": "install the pinned uv version",
+    }
+    message = "uv_not_found: " + json.dumps(payload)
+
+    class _FakeResolverModule:
+        def _resolve_trusted_executable(self, name, project_root):  # noqa: ANN001
+            raise RuntimeError(message)
+
+    monkeypatch.setattr(trusted_uv_mod, "_load_skill_runtime_exec", lambda: _FakeResolverModule())
+
+    result = wcp.assess(
+        project_root=str(_REPO_ROOT),
+        profile="issue-to-impl",
+        repo=_DEFAULT_REPO,
+        spark_mode=None,
+        spark_fallback=None,
+        planned_operations=[],
+    )
+
+    uv_check = result["checks"]["uv"]
+    assert uv_check["status"] == trusted_uv_mod.STATUS_MISSING
+    assert uv_check["reason"] == "uv_not_found"
+    assert "{" not in uv_check["reason"]
+    assert uv_check["diagnostic"] == payload
+    assert result["decision"] == wcp.DECISION_BLOCKED
+    # `reasons` free-text must still surface a stable status code, not the
+    # raw JSON diagnostic blob, keeping the human-readable summary short.
+    assert any("uv:trusted_uv_missing" in reason for reason in result["reasons"])
 
 
 # --- P1-1: repo_read: false must be blocked, not degraded ------------------
