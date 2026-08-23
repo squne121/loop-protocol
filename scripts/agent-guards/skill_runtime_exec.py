@@ -1012,6 +1012,42 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     else:
         resolved = shutil.which(name, path=safe_path)
     if not resolved:
+        if name == "uv":
+            # Issue #2275: `uv_not_found` gets a structured diagnostic payload
+            # instead of the bare `{name}_not_found` string used by every
+            # other trusted executable name. `candidates_searched` is the
+            # exact `safe_entries` list already built above for this `uv`
+            # branch (never recomputed via `_safe_path_entries()`), so the
+            # reported candidates are byte-identical to what was actually
+            # passed to `shutil.which(name, path=safe_path)` -- no ambient
+            # `PATH` entries and no account-home lane leaked in from the
+            # shared, name-agnostic helper. `recommended_install_dir` is
+            # derived from the real OS account home (`_os_account_home()`,
+            # itself `pwd.getpwuid`-backed, never the ambient `HOME` env
+            # var) and is reported even when that directory does not yet
+            # exist -- unlike `candidates_searched`, which only ever
+            # contains directories this process actually searched.
+            account_home = _os_account_home()
+            recommended_install_dir = (
+                os.path.join(account_home, ".local", "bin") if account_home else None
+            )
+            diagnostic_payload = {
+                "error": "uv_not_found",
+                "candidates_searched": list(safe_entries),
+                "expected_version": _required_uv_version(project_root),
+                "recommended_install_dir": recommended_install_dir,
+                "remediation_hint": (
+                    "Install the pinned uv version with the official "
+                    "standalone installer, specifying UV_INSTALL_DIR="
+                    f"{recommended_install_dir or '<account-home>/.local/bin'} "
+                    "so it lands in the no-sudo user-local lane, then "
+                    "verify with `uv --version` for an exact match "
+                    "against pyproject.toml's [tool.uv].required-version. "
+                    "See docs/dev/workflow.md "
+                    "'### Trusted uv のローカル開発復旧'."
+                ),
+            }
+            raise RuntimeError("uv_not_found: " + json.dumps(diagnostic_payload))
         raise RuntimeError(f"{name}_not_found")
     real = os.path.realpath(resolved)
     project_root_real = os.path.realpath(project_root)
