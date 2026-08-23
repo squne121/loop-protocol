@@ -122,12 +122,29 @@ def build_capability_request(
     spark_mode: Optional[str],
     spark_fallback: Optional[str],
     planned_operations_json: Optional[str],
+    planned_operations_omitted: bool = False,
 ) -> dict[str, Any]:
     """Assemble the caller-declared capability request. Raises
-    `CapabilityRequestError` if `planned_operations_json` is missing or
-    malformed (AC5). `spark_mode` / `spark_fallback` are optional (a caller
-    that never needs Spark may omit both)."""
-    planned_operations = _parse_planned_operations(planned_operations_json)
+    `CapabilityRequestError` if `planned_operations_json` is malformed
+    (AC5). `spark_mode` / `spark_fallback` are optional (a caller that
+    never needs Spark may omit both).
+
+    `planned_operations_omitted` is a CLI/env-resolution-level signal (set
+    by `main()`, never by a direct programmatic `run()` caller) meaning:
+    the caller never had any way to supply `--planned-operations-json` or
+    `LOOP_PLANNED_OPERATIONS_JSON` at all (the canonical bare `preflight.run`
+    registry argv only carries `--issue-number`/`--repo` -- Issue #2311
+    P0-6/AC1). When True, `planned_operations_json` is bypassed entirely
+    and the request is built with an empty operations list, matching
+    `workflow_capability_preflight.py`'s own producer semantics where an
+    omitted `planned_operations` argument is a valid, empty operations set.
+    Default is False, preserving this function's original strict
+    missing-or-malformed-fails-closed contract for every existing/direct
+    caller (AC5/AC9)."""
+    if planned_operations_omitted:
+        planned_operations: list[dict] = []
+    else:
+        planned_operations = _parse_planned_operations(planned_operations_json)
     return {
         "spark_mode": spark_mode,
         "spark_fallback": spark_fallback,
@@ -184,6 +201,7 @@ def run(
     spark_mode: Optional[str],
     spark_fallback: Optional[str],
     planned_operations_json: Optional[str],
+    planned_operations_omitted: bool = False,
     capability_preflight_result_fn: Callable[..., dict] = root_entry_router.capability_preflight_result,
     invoke_inner_preflight_fn: Callable[..., int] = _default_invoke_inner_preflight,
 ) -> tuple[dict[str, Any], int]:
@@ -197,6 +215,7 @@ def run(
             spark_mode=spark_mode,
             spark_fallback=spark_fallback,
             planned_operations_json=planned_operations_json,
+            planned_operations_omitted=planned_operations_omitted,
         )
     except CapabilityRequestError as exc:
         # AC5: caller-side missing/malformed request. Fail closed WITHOUT
@@ -277,6 +296,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.planned_operations_json is not None
         else os.environ.get(_ENV_PLANNED_OPERATIONS_JSON)
     )
+    # Neither `--planned-operations-json` nor `LOOP_PLANNED_OPERATIONS_JSON`
+    # was supplied at all. The canonical bare `preflight.run` registry argv
+    # only ever carries `--issue-number`/`--repo` (Issue #2311 P0-6/AC1
+    # keeps that argv shape byte-for-byte unchanged), so a real production
+    # canonical invocation always omits this flag and has no way to supply
+    # it. Mirror `workflow_capability_preflight.py` producer's own
+    # semantics, where an omitted `planned_operations` argument is a valid,
+    # empty operations set, rather than failing closed on every canonical
+    # invocation before the producer is ever reached. This is distinct from
+    # an explicitly-supplied-but-empty/malformed value, which still fails
+    # closed via `_parse_planned_operations` (AC5).
+    planned_operations_omitted = planned_operations_json is None
 
     result, exit_code = run(
         issue_number=args.issue_number,
@@ -284,6 +315,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         spark_mode=spark_mode,
         spark_fallback=spark_fallback,
         planned_operations_json=planned_operations_json,
+        planned_operations_omitted=planned_operations_omitted,
     )
     if not result.get("inner_preflight_invoked"):
         # The inner preflight's own stdout contract (`refinement_preflight_

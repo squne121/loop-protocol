@@ -225,6 +225,99 @@ def test_workflow_start_missing_planned_operations_fails_closed(planned_operatio
 
 
 # ---------------------------------------------------------------------------
+# fix_delta (PR #2320 review B1): a genuine CLI/env-level OMISSION of
+# `--planned-operations-json` / `LOOP_PLANNED_OPERATIONS_JSON` -- exactly
+# what the canonical bare `preflight.run` registry argv produces, since it
+# only ever carries `--issue-number`/`--repo` -- must reach the producer
+# (empty operations set), matching `workflow_capability_preflight.py`'s own
+# omitted-is-valid-empty-list semantics. This is distinct from an
+# explicitly-supplied-but-malformed/empty value, which still fails closed
+# (covered by `test_workflow_start_missing_planned_operations_fails_closed`
+# above, unchanged).
+# ---------------------------------------------------------------------------
+
+
+def test_workflow_start_omitted_planned_operations_reaches_producer():
+    """`run(planned_operations_omitted=True)` must bypass the strict
+    missing/malformed check and reach the producer with an empty
+    operations list, unlike a direct `planned_operations_json=None` call
+    (see the parametrized negative test above, which is unaffected: it
+    never sets `planned_operations_omitted`)."""
+    producer, producer_calls = _make_recording_producer("ready")
+    inner, inner_calls = _make_recording_inner(returncode=0)
+
+    result, exit_code = wse.run(
+        issue_number=2311,
+        repo=_REPO,
+        spark_mode=None,
+        spark_fallback=None,
+        planned_operations_json=None,
+        planned_operations_omitted=True,
+        capability_preflight_result_fn=producer,
+        invoke_inner_preflight_fn=inner,
+    )
+
+    assert len(producer_calls) == 1
+    assert producer_calls[0]["planned_operations"] == []
+    assert len(inner_calls) == 1
+    assert result["inner_preflight_invoked"] is True
+    assert result["status"] == "ready"
+    assert exit_code == 0
+
+
+def test_build_capability_request_omitted_yields_empty_operations_list():
+    request = wse.build_capability_request(
+        spark_mode=None,
+        spark_fallback=None,
+        planned_operations_json=None,
+        planned_operations_omitted=True,
+    )
+    assert request["planned_operations"] == []
+
+
+def test_main_cli_with_only_issue_number_and_repo_resolves_omitted_flag():
+    """Reproduces the real production registry-driven invocation shape
+    (`--issue-number` / `--repo` only, matching `command_registry.py`'s
+    bare `preflight.run` argv byte-for-byte) at the `main()` CLI-parsing
+    layer, and proves it resolves to `planned_operations_omitted=True` /
+    `planned_operations_json=None` rather than raising a missing-request
+    error before `run()` is ever reached. `wse.run` is monkeypatched (not
+    `capability_preflight_result_fn`, which is bound as an early-evaluated
+    default and would not observe a monkeypatch) so no live subprocess or
+    GitHub call is made -- this is a pure CLI-argument-resolution
+    regression test for the exact bug the reviewer reproduced (B1)."""
+    captured_kwargs: dict = {}
+
+    def _fake_run(**kwargs):
+        captured_kwargs.update(kwargs)
+        return (
+            {
+                "schema": wse.SCHEMA_VERSION,
+                "status": "ready",
+                "reason": None,
+                "decision": "ready",
+                "checks": {},
+                "reasons": [],
+                "inner_preflight_invoked": True,
+            },
+            0,
+        )
+
+    original_run = wse.run
+    wse.run = _fake_run
+    try:
+        exit_code = wse.main(["--issue-number", "2311", "--repo", _REPO])
+    finally:
+        wse.run = original_run
+
+    assert exit_code == 0
+    assert captured_kwargs["planned_operations_json"] is None
+    assert captured_kwargs["planned_operations_omitted"] is True
+    assert captured_kwargs["issue_number"] == 2311
+    assert captured_kwargs["repo"] == _REPO
+
+
+# ---------------------------------------------------------------------------
 # AC7: blocked reason/checks/reasons are preserved verbatim in the compact
 # result (no boolean reduction on the Step 0 path).
 # ---------------------------------------------------------------------------
