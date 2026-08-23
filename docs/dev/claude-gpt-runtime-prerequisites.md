@@ -17,6 +17,9 @@ CI ランナーが提供する hostedtoolcache のいずれかに限定してい
 `scripts/agent-guards/skill_runtime_exec.py` の canonical resolver に委譲しており、
 このドキュメントの目的のために新しい trust boundary を追加で導入するものではない。
 
+詳細な探索lane・version pinの正規化・復旧コマンドは `docs/dev/workflow.md` の
+「Trusted uv のローカル開発復旧」を正本とする。
+
 ## Spark delegation route の判定範囲（P1-5 責務境界）
 
 `checks.spark.status`（`not_required` / `eligible` / `fallback_only` /
