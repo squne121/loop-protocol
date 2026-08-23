@@ -3043,10 +3043,25 @@ def main(argv: list[str] | None = None) -> int:
     # check below must validate the script the command_id actually reaches,
     # otherwise decide.run could never pass this check even though it never
     # touches run_refinement_preflight.py.
+    #
+    # Issue #2311 AC1: canonical bare `preflight.run` now first-hops into
+    # `workflow_start_entry.py` (not `run_refinement_preflight.py` directly).
+    # Sibling anchor-comment-driven profiles (`preflight.run.with_anchor` /
+    # `.with_human_context` / `.with_agent_report` / `.fixture` /
+    # `.fixture.with_human_context`) are unaffected by this Issue and
+    # continue to first-hop into `run_refinement_preflight.py`. This is a
+    # three-way branch (not a generalized/loosened check): each branch is an
+    # exact, explicit first-hop target for its command_id class.
+    if is_decide_command:
+        script_name = "decide_next_loop_action.py"
+    elif args.command_id == "preflight.run":
+        script_name = "workflow_start_entry.py"
+    else:
+        script_name = "run_refinement_preflight.py"
     script_path = (
         Path(project_root) / ".claude" / "skills" / "issue-refinement-loop"
         / "scripts"
-        / ("decide_next_loop_action.py" if is_decide_command else "run_refinement_preflight.py")
+        / script_name
     )
     if script_path.is_symlink() or not script_path.is_file():
         raise RuntimeError("preflight_script_invalid")
