@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "source_evidence_terminal_artifact_v1.schema.json",
+  "title": "SOURCE_EVIDENCE_TERMINAL_ARTIFACT_V1",
+  "description": "Bounded (<= 16 KiB serialized) terminal artifact emitted when a dispositive source claim's evidence acquisition exhausts all permitted recovery routes (#2195 AC6). Excludes raw stderr, raw transcript, credentials, and absolute paths.",
+  "type": "object",
+  "required": ["schema", "run_id", "claim_id", "claim_kind", "evidence_kind", "attempts", "failure_taxonomy", "disposition", "unresolved_reason", "evidence_ref_count"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "source_evidence_terminal_artifact/v1"
+    },
+    "run_id": { "type": "string" },
+    "claim_id": { "type": "string" },
+    "claim_kind": { "type": "string" },
+    "evidence_kind": { "type": "string" },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "attempts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["route_id", "lane", "dispatch_state", "acquisition_outcome"],
+        "additionalProperties": false,
+        "properties": {
+          "route_id": { "type": "string" },
+          "lane": { "type": "string" },
+          "dispatch_state": { "type": "string", "enum": ["dispatched", "outcome_unknown"] },
+          "acquisition_outcome": { "type": "string", "enum": ["succeeded", "failed", "unknown_outcome"] },
+          "failure_domain": {
+            "type": ["string", "null"],
+            "enum": [
+              "provider",
+              "transport",
+              "mcp_protocol",
+              "tool_execution",
+              "source_lookup",
+              "reference_validation",
+              null
+            ]
+          },
+          "provider_failure_code": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "failure_taxonomy": {
+      "type": "object",
+      "description": "Map of failure_domain (or 'none') to attempt count.",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "disposition": {
+      "type": "string",
+      "enum": ["proceed", "recover", "human_review", "environment_degraded"]
+    },
+    "unresolved_reason": { "type": ["string", "null"] },
+    "evidence_ref_count": { "type": "integer", "minimum": 0 }
+  }
+}
