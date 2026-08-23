@@ -1,0 +1,46 @@
+{
+  "schema": "ISSUE_TO_IMPL_EXPECTED_PHASES_V1",
+  "phases": [
+    {
+      "phase": "workflow_capability_preflight",
+      "description": "workflow_capability_preflight.py --profile issue-to-impl を fake gh 経由で実行し CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1 decision を得る",
+      "allowed_status": [
+        "completed",
+        "failed"
+      ]
+    },
+    {
+      "phase": "spark_delegation",
+      "description": "本 smoke シナリオでは Spark delegation を要求しないため常に not_applicable",
+      "allowed_status": [
+        "not_applicable"
+      ]
+    },
+    {
+      "phase": "issue_contract_repair",
+      "description": "fixture Issue の契約セクション充足を静的に確認する（不足があれば issue-refinement-loop 相当の修復が必要と判定）",
+      "allowed_status": [
+        "completed",
+        "expected_block",
+        "failed"
+      ]
+    },
+    {
+      "phase": "fresh_review",
+      "description": "launch.sh 経由の live Claude Code 呼び出しで fixture Issue を fake gh 経由で読み戻し、deterministic marker を確認する",
+      "allowed_status": [
+        "completed",
+        "failed"
+      ]
+    },
+    {
+      "phase": "impl_review_loop_entry",
+      "description": "impl-review-loop への handoff 直前の判定。本 smoke harness は実 git/PR mutation を意図的に実行しないため expected_block が既定",
+      "allowed_status": [
+        "expected_block",
+        "completed",
+        "failed"
+      ]
+    }
+  ]
+}

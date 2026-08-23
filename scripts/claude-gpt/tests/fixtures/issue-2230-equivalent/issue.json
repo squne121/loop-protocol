@@ -1,0 +1,15 @@
+{
+  "next_number": 9101,
+  "issues": {
+    "9100": {
+      "title": "実装: issue_to_impl runtime smoke fixture probe (Issue #2278 相当)",
+      "url": "https://github.com/squne121/loop-protocol/issues/9100",
+      "repo": "squne121/loop-protocol",
+      "body": "## Outcome\n\nfake #2230-equivalent smoke fixture: 単一 clean HEAD 上で issue_to_impl runtime smoke シナリオが workflow capability preflight から impl-review-loop handoff 直前までの phase を再現できることを確認する。\n\n## Acceptance Criteria\n\n- [ ] AC1: fake gh provider 上でこの Issue が `gh issue view` で正しく読み戻せる\n\n## Verification Commands\n\n```bash\ntrue  # AC1\n```\n\n## Allowed Paths\n\n```text\nscripts/claude-gpt/**\n```\n\n## Stop Conditions\n\n- fake provider 外への実 GitHub mutation が必要になった場合\n",
+      "state": "open",
+      "labels": [
+        "phase/implementation"
+      ]
+    }
+  }
+}

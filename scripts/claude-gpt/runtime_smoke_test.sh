@@ -71,6 +71,38 @@ for _arg in "$@"; do
   _prev_arg="$_arg"
 done
 
+# --- Issue #2278 AC2-AC11: `--scenario issue_to_impl` mode + generalized
+# --scenario validation. AC11: an unknown --scenario value is rejected with
+# exit 2 immediately (before any evidence directory/file is created) and
+# NEVER falls back to the default smoke scenario below. ---
+ISSUE_TO_IMPL_SCENARIO=false
+SCENARIO_VALUE=""
+FIXTURE_ARG_PATH=""
+EVIDENCE_OUT_ARG_PATH=""
+_prev_arg=""
+for _arg in "$@"; do
+  if [ "$_prev_arg" = "--scenario" ]; then
+    SCENARIO_VALUE="$_arg"
+  fi
+  if [ "$_prev_arg" = "--fixture" ]; then
+    FIXTURE_ARG_PATH="$_arg"
+  fi
+  if [ "$_prev_arg" = "--evidence-out" ]; then
+    EVIDENCE_OUT_ARG_PATH="$_arg"
+  fi
+  _prev_arg="$_arg"
+done
+if [ -n "$SCENARIO_VALUE" ]; then
+  case "$SCENARIO_VALUE" in
+    issue_create) : ;;
+    issue_to_impl) ISSUE_TO_IMPL_SCENARIO=true ;;
+    *)
+      echo "FAIL: unknown --scenario value '${SCENARIO_VALUE}' (known values: issue_create, issue_to_impl). Refusing to fall back to the default smoke scenario (Issue #2278 AC11)." >&2
+      exit 2
+      ;;
+  esac
+fi
+
 SELF_PATH=$0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
 # shellcheck source=./lib.sh
@@ -293,6 +325,13 @@ if [ "$PREFLIGHT_ENV_RC" -eq 3 ] || [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
       "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
       "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" "$SKIP_REASON" > "$EVIDENCE_FILE"
     echo "SKIP: ${SKIP_REASON} のため --spark-delegation live smoke を実行できません（fallback 実行なし）。証跡: ${EVIDENCE_FILE}"
+    exit 77
+  fi
+  if [ "$ISSUE_TO_IMPL_SCENARIO" = "true" ]; then
+    ISSUE_TO_IMPL_SKIP_EVIDENCE="${EVIDENCE_OUT_ARG_PATH:-${EVIDENCE_DIR}/issue-to-impl-${TIMESTAMP}.json}"
+    printf '{"schema":"ISSUE_TO_IMPL_E2E_RESULT_V1","scenario":"issue_to_impl","test_verdict":"skip","terminal_result":null,"reason_code":"%s","reached_phase":null,"phase_trace":[],"resume_from":null,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"claude_code_version":"unknown","proxy_version":"%s"}}\n' \
+      "$SKIP_REASON" "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_PROXY_VERSION" > "$ISSUE_TO_IMPL_SKIP_EVIDENCE"
+    echo "SKIP: ${SKIP_REASON} のため --scenario issue_to_impl live smoke を実行できません（Runtime Verification Applicability の skip_conditions に該当）。証跡: ${ISSUE_TO_IMPL_SKIP_EVIDENCE}"
     exit 77
   fi
   printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"skip","reason":"%s","preflight_env_only":%s,"generated_at":"%s","sut":{"launcher_path":"%s","repository_root":"%s","git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","lib_sh_sha256":"%s","runtime_smoke_sha256":"%s"},"proxy":{"absolute_path":"%s","version":"%s","sha256":"%s"}}\n' \
@@ -1243,6 +1282,219 @@ print("true" if d.get("invocation") else "false")
     exit 0
   fi
   echo "FAIL: --spark-delegation live Spark E2E smoke が ${SPARK_VERDICT_STATUS} でした（reason: ${SPARK_VERDICT_REASON}）。証跡: ${EVIDENCE_FILE}"
+  exit 1
+fi
+
+# =========================================================================
+# Issue #2278 AC2-AC11: `--scenario issue_to_impl` mode
+#
+# 薄い実装として、既存 `workflow_capability_preflight.py`（capability
+# preflight）・`launch.sh`（live Claude Code 起動）・`fake_gh.py`（GitHub
+# state fake 化）を再利用し、以下 5 phase の phase_trace を構築する:
+#   1. workflow_capability_preflight -- 既存スクリプトを fake gh 経由で
+#      直接呼び出す（LLM 不要、deterministic）
+#   2. spark_delegation -- 本シナリオは Spark delegation を要求しないため
+#      常に not_applicable（"optional Spark delegation" の optional 分岐）
+#   3. issue_contract_repair -- fixture Issue 本文の契約セクション充足を
+#      静的に確認する（issue-refinement-loop が判定する内容と同じ集合）
+#   4. fresh_review -- launch.sh 経由で実際に `claude` を 1 回起動し、
+#      fixture Issue を fake gh 経由で読み戻す live liveness 確認
+#   5. impl_review_loop_entry -- 本 harness は実 git worktree / 実 PR
+#      mutation を意図的に実行しない（smoke harness の scope 境界）ため、
+#      到達時点で expected_block とする
+#
+# terminal_result（ISSUE_TO_IMPL_E2E_RESULT_V1.terminal_result, Issue #2278
+# 本文で定義された typed terminal result の全集合）:
+#   draft_pr_ready | blocked | human_judgment_required | implementation_not_authorized
+# 本 smoke harness の現行実装は phase 5 で実 mutation を実行しないため
+# `blocked` または `human_judgment_required` のみを実際に返す。
+#
+# 単独の早期 blocked（phase 1-3 で terminal に達した場合）は Issue #2278
+# 本文 fallback_policy の指示どおり PASS へ昇格させない（AC4）。
+# =========================================================================
+if [ "$ISSUE_TO_IMPL_SCENARIO" = "true" ]; then
+  ISSUE_TO_IMPL_FIXTURE_PATH="${FIXTURE_ARG_PATH:-$SCRIPT_DIR/tests/fixtures/issue-2230-equivalent/issue.json}"
+  ISSUE_TO_IMPL_FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$ISSUE_TO_IMPL_FIXTURE_PATH")" 2>/dev/null && pwd -P)
+  ISSUE_TO_IMPL_EVIDENCE_FILE="${EVIDENCE_OUT_ARG_PATH:-${EVIDENCE_DIR}/issue-to-impl-${TIMESTAMP}.json}"
+  ISSUE_TO_IMPL_PROMPT_PATH="${ISSUE_TO_IMPL_FIXTURE_DIR}/prompt.md"
+  ISSUE_TO_IMPL_EXPECTED_PHASES_PATH="${ISSUE_TO_IMPL_FIXTURE_DIR}/expected-phases.json"
+
+  ISSUE_TO_IMPL_CLAUDE_BIN=$(claude_gpt_resolve_claude_bin)
+  ISSUE_TO_IMPL_CLAUDE_CODE_VERSION="unknown"
+  if [ -n "$ISSUE_TO_IMPL_CLAUDE_BIN" ]; then
+    ISSUE_TO_IMPL_CLAUDE_CODE_VERSION=$("$ISSUE_TO_IMPL_CLAUDE_BIN" --version 2>/dev/null | head -n1)
+    if [ -z "$ISSUE_TO_IMPL_CLAUDE_CODE_VERSION" ]; then
+      ISSUE_TO_IMPL_CLAUDE_CODE_VERSION="unknown"
+    fi
+  fi
+
+  if [ ! -f "$ISSUE_TO_IMPL_FIXTURE_PATH" ] || [ ! -f "$ISSUE_TO_IMPL_PROMPT_PATH" ] || [ ! -f "$ISSUE_TO_IMPL_EXPECTED_PHASES_PATH" ]; then
+    printf '{"schema":"ISSUE_TO_IMPL_E2E_RESULT_V1","scenario":"issue_to_impl","test_verdict":"fail","terminal_result":null,"reason_code":"fixture_missing","reached_phase":null,"phase_trace":[],"resume_from":null,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"claude_code_version":"%s","proxy_version":"%s"}}\n' \
+      "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$ISSUE_TO_IMPL_CLAUDE_CODE_VERSION" "$SUT_PROXY_VERSION" > "$ISSUE_TO_IMPL_EVIDENCE_FILE"
+    echo "FAIL: issue_to_impl fixture が見つかりません（${ISSUE_TO_IMPL_FIXTURE_PATH} / prompt.md / expected-phases.json）。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
+    exit 1
+  fi
+
+  ISSUE_TO_IMPL_PROMPT_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_PROMPT_PATH")
+  ISSUE_TO_IMPL_ISSUE_JSON_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_FIXTURE_PATH")
+  ISSUE_TO_IMPL_EXPECTED_PHASES_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_EXPECTED_PHASES_PATH")
+
+  ISSUE_TO_IMPL_WORKDIR=$(mktemp -d)
+  FAKE_GH_FIXTURE="$SCRIPT_DIR/tests/fixtures/fake_gh.py"
+  FAKE_GH_STATE="${ISSUE_TO_IMPL_WORKDIR}/fake_gh_state.json"
+  FAKE_BIN_DIR="${ISSUE_TO_IMPL_WORKDIR}/fake-bin"
+  mkdir -p "$FAKE_BIN_DIR"
+  FAKE_GH_WRAPPER="${FAKE_BIN_DIR}/gh"
+  cat > "$FAKE_GH_WRAPPER" <<FAKE_GH_WRAPPER_ITI_EOF
+#!/bin/sh
+exec python3 "$FAKE_GH_FIXTURE" "\$@"
+FAKE_GH_WRAPPER_ITI_EOF
+  chmod +x "$FAKE_GH_WRAPPER"
+
+  ISSUE_TO_IMPL_PHASE_TRACE_FILE="${ISSUE_TO_IMPL_WORKDIR}/phase_trace.jsonl"
+  : > "$ISSUE_TO_IMPL_PHASE_TRACE_FILE"
+  _iti_add_phase() {
+    printf '{"phase":"%s","status":"%s"}\n' "$1" "$2" >> "$ISSUE_TO_IMPL_PHASE_TRACE_FILE"
+  }
+
+  ISSUE_TO_IMPL_TERMINAL_RESULT_JSON="null"
+  ISSUE_TO_IMPL_REACHED_PHASE_JSON="null"
+  ISSUE_TO_IMPL_REASON_CODE="unknown"
+  ISSUE_TO_IMPL_TEST_VERDICT="fail"
+
+  # --- Phase 1: workflow_capability_preflight（deterministic, LLM 不要） ---
+  ISSUE_TO_IMPL_PLANNED_OPS_FILE="${ISSUE_TO_IMPL_WORKDIR}/planned_operations.json"
+  cat > "$ISSUE_TO_IMPL_PLANNED_OPS_FILE" <<'PLANNED_OPS_ITI_EOF'
+[
+  {"phase": "issue_contract_repair", "actor_role": "issue-refinement-loop", "operation": "issue_comment", "requires_mutation": true},
+  {"phase": "impl_review_loop_entry", "actor_role": "open-pr", "operation": "pr_create", "requires_mutation": true}
+]
+PLANNED_OPS_ITI_EOF
+
+  ISSUE_TO_IMPL_PREFLIGHT_JSON=$(FAKE_GH_AUTH_OK=1 FAKE_GH_REPO_READ_OK=1 FAKE_GH_STATE="$FAKE_GH_STATE" PATH="${FAKE_BIN_DIR}:${PATH}" \
+    python3 "$SCRIPT_DIR/workflow_capability_preflight.py" --profile issue-to-impl --repo squne121/loop-protocol --planned-operations-json "$ISSUE_TO_IMPL_PLANNED_OPS_FILE" 2>"${ISSUE_TO_IMPL_WORKDIR}/preflight.stderr.log")
+  ISSUE_TO_IMPL_PREFLIGHT_RC=$?
+
+  if [ "$ISSUE_TO_IMPL_PREFLIGHT_RC" -ne 0 ]; then
+    _iti_add_phase "workflow_capability_preflight" "failed"
+    ISSUE_TO_IMPL_REACHED_PHASE_JSON='"workflow_capability_preflight"'
+    ISSUE_TO_IMPL_TERMINAL_RESULT_JSON='"human_judgment_required"'
+    ISSUE_TO_IMPL_REASON_CODE="workflow_capability_preflight_execution_error"
+  else
+    _iti_add_phase "workflow_capability_preflight" "completed"
+    ISSUE_TO_IMPL_DECISION=$(printf '%s' "$ISSUE_TO_IMPL_PREFLIGHT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("decision","unknown"))' 2>/dev/null || echo unknown)
+
+    # --- Phase 2: spark_delegation（本シナリオでは常に not_applicable） ---
+    _iti_add_phase "spark_delegation" "not_applicable"
+
+    if [ "$ISSUE_TO_IMPL_DECISION" = "blocked" ]; then
+      ISSUE_TO_IMPL_REACHED_PHASE_JSON='"workflow_capability_preflight"'
+      ISSUE_TO_IMPL_TERMINAL_RESULT_JSON='"blocked"'
+      ISSUE_TO_IMPL_REASON_CODE="workflow_capability_preflight_blocked"
+    else
+      # --- Phase 3: issue_contract_repair（deterministic, fixture 静的確認） ---
+      ISSUE_TO_IMPL_CONTRACT_JSON=$(python3 - "$ISSUE_TO_IMPL_FIXTURE_PATH" <<'CONTRACT_CHECK_ITI_PY_EOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    data = json.load(fh)
+issues = data.get("issues", {})
+if not issues:
+    print(json.dumps({"ok": False, "missing": ["issues"], "issue_number": None}))
+else:
+    number, info = next(iter(issues.items()))
+    body = info.get("body", "")
+    required = [
+        "## Outcome",
+        "## Acceptance Criteria",
+        "## Verification Commands",
+        "## Allowed Paths",
+        "## Stop Conditions",
+    ]
+    missing = [h for h in required if h not in body]
+    print(json.dumps({"ok": len(missing) == 0, "missing": missing, "issue_number": int(number)}))
+CONTRACT_CHECK_ITI_PY_EOF
+)
+      ISSUE_TO_IMPL_CONTRACT_OK=$(printf '%s' "$ISSUE_TO_IMPL_CONTRACT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ok"])' 2>/dev/null || echo False)
+      ISSUE_TO_IMPL_FIXTURE_ISSUE_NUMBER=$(printf '%s' "$ISSUE_TO_IMPL_CONTRACT_JSON" | python3 -c 'import json,sys; v=json.load(sys.stdin)["issue_number"]; print(v if v is not None else "")' 2>/dev/null || echo "")
+
+      if [ "$ISSUE_TO_IMPL_CONTRACT_OK" != "True" ]; then
+        _iti_add_phase "issue_contract_repair" "expected_block"
+        ISSUE_TO_IMPL_REACHED_PHASE_JSON='"issue_contract_repair"'
+        ISSUE_TO_IMPL_TERMINAL_RESULT_JSON='"blocked"'
+        ISSUE_TO_IMPL_REASON_CODE="issue_contract_incomplete"
+      else
+        _iti_add_phase "issue_contract_repair" "completed"
+
+        # --- Phase 4: fresh_review（live launch.sh 起動、fake gh 経由で
+        #     fixture Issue を読み戻す liveness 確認） ---
+        ISSUE_TO_IMPL_PROMPT_TEXT=$(cat "$ISSUE_TO_IMPL_PROMPT_PATH")
+        ISSUE_TO_IMPL_STDERR_LOG="${ISSUE_TO_IMPL_WORKDIR}/launch.stderr.log"
+        ISSUE_TO_IMPL_CLAUDE_OUTPUT=$(FAKE_GH_STATE="$FAKE_GH_STATE" FAKE_GH_SEED_ISSUES_PATH="$ISSUE_TO_IMPL_FIXTURE_PATH" PATH="${FAKE_BIN_DIR}:${PATH}" \
+          "$SCRIPT_DIR/launch.sh" -- -p "$ISSUE_TO_IMPL_PROMPT_TEXT" --output-format text --no-session-persistence \
+          2>"$ISSUE_TO_IMPL_STDERR_LOG")
+        ISSUE_TO_IMPL_LAUNCH_RC=$?
+
+        ISSUE_TO_IMPL_FRESH_MARKER_JSON=$(printf '%s' "$ISSUE_TO_IMPL_CLAUDE_OUTPUT" | python3 -c '
+import json
+import re
+import sys
+
+text = sys.stdin.read()
+m = re.search(r"ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=(\d+) contract_complete=(true|false)", text)
+if m:
+    print(json.dumps({"issue_number": m.group(1), "contract_complete": m.group(2)}))
+else:
+    print(json.dumps({"issue_number": None, "contract_complete": None}))
+')
+        ISSUE_TO_IMPL_FRESH_MARKER_ISSUE=$(printf '%s' "$ISSUE_TO_IMPL_FRESH_MARKER_JSON" | python3 -c 'import json,sys; v=json.load(sys.stdin)["issue_number"]; print(v if v is not None else "")')
+        ISSUE_TO_IMPL_FRESH_MARKER_COMPLETE=$(printf '%s' "$ISSUE_TO_IMPL_FRESH_MARKER_JSON" | python3 -c 'import json,sys; v=json.load(sys.stdin)["contract_complete"]; print(v if v is not None else "")')
+
+        if [ "$ISSUE_TO_IMPL_LAUNCH_RC" -eq 0 ] && [ -n "$ISSUE_TO_IMPL_FRESH_MARKER_ISSUE" ] && [ "$ISSUE_TO_IMPL_FRESH_MARKER_ISSUE" = "$ISSUE_TO_IMPL_FIXTURE_ISSUE_NUMBER" ] && [ "$ISSUE_TO_IMPL_FRESH_MARKER_COMPLETE" = "true" ]; then
+          _iti_add_phase "fresh_review" "completed"
+
+          # --- Phase 5: impl_review_loop_entry（本 harness は実 mutation を
+          #     意図的に実行しない -- smoke harness の scope 境界） ---
+          _iti_add_phase "impl_review_loop_entry" "expected_block"
+          ISSUE_TO_IMPL_REACHED_PHASE_JSON='"impl_review_loop_entry"'
+          ISSUE_TO_IMPL_TERMINAL_RESULT_JSON='"blocked"'
+          ISSUE_TO_IMPL_REASON_CODE="smoke_harness_does_not_execute_real_mutation_by_design"
+          ISSUE_TO_IMPL_TEST_VERDICT="pass"
+        else
+          _iti_add_phase "fresh_review" "failed"
+          ISSUE_TO_IMPL_REACHED_PHASE_JSON='"fresh_review"'
+          ISSUE_TO_IMPL_TERMINAL_RESULT_JSON='"human_judgment_required"'
+          ISSUE_TO_IMPL_REASON_CODE="fresh_review_marker_not_observed"
+          if [ -n "${CLAUDE_GPT_ISSUE_TO_IMPL_DEBUG_DIR:-}" ]; then
+            mkdir -p "$CLAUDE_GPT_ISSUE_TO_IMPL_DEBUG_DIR"
+            cp "$ISSUE_TO_IMPL_STDERR_LOG" "$CLAUDE_GPT_ISSUE_TO_IMPL_DEBUG_DIR/launch.stderr.log" 2>/dev/null || true
+            printf '%s' "$ISSUE_TO_IMPL_CLAUDE_OUTPUT" > "$CLAUDE_GPT_ISSUE_TO_IMPL_DEBUG_DIR/claude.stdout.log" 2>/dev/null || true
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  ISSUE_TO_IMPL_PHASE_TRACE_JSON=$(python3 -c "import json,sys; entries=[json.loads(l) for l in open('${ISSUE_TO_IMPL_PHASE_TRACE_FILE}') if l.strip()]; print(json.dumps(entries))")
+
+  if [ "$ISSUE_TO_IMPL_TEST_VERDICT" != "pass" ]; then
+    ISSUE_TO_IMPL_TEST_VERDICT="fail"
+  fi
+
+  printf '{"schema":"ISSUE_TO_IMPL_E2E_RESULT_V1","scenario":"issue_to_impl","test_verdict":"%s","terminal_result":%s,"reason_code":"%s","reached_phase":%s,"phase_trace":%s,"resume_from":null,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"claude_code_version":"%s","proxy_version":"%s","launcher_path":"%s","repository_root":"%s","fixtures":{"prompt_md_sha256":"%s","issue_json_sha256":"%s","expected_phases_json_sha256":"%s"}}}\n' \
+    "$ISSUE_TO_IMPL_TEST_VERDICT" "$ISSUE_TO_IMPL_TERMINAL_RESULT_JSON" "$ISSUE_TO_IMPL_REASON_CODE" "$ISSUE_TO_IMPL_REACHED_PHASE_JSON" "$ISSUE_TO_IMPL_PHASE_TRACE_JSON" \
+    "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$ISSUE_TO_IMPL_CLAUDE_CODE_VERSION" "$SUT_PROXY_VERSION" "$SUT_LAUNCHER_PATH" "$SUT_REPO_ROOT" \
+    "$ISSUE_TO_IMPL_PROMPT_SHA256" "$ISSUE_TO_IMPL_ISSUE_JSON_SHA256" "$ISSUE_TO_IMPL_EXPECTED_PHASES_SHA256" > "$ISSUE_TO_IMPL_EVIDENCE_FILE"
+
+  rm -rf "$ISSUE_TO_IMPL_WORKDIR"
+
+  if [ "$ISSUE_TO_IMPL_TEST_VERDICT" = "pass" ]; then
+    echo "PASS: issue_to_impl scenario -- reached_phase=${ISSUE_TO_IMPL_REACHED_PHASE_JSON} terminal_result=${ISSUE_TO_IMPL_TERMINAL_RESULT_JSON}。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
+    exit 0
+  fi
+  echo "FAIL: issue_to_impl scenario -- reason_code=${ISSUE_TO_IMPL_REASON_CODE} reached_phase=${ISSUE_TO_IMPL_REACHED_PHASE_JSON}。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
   exit 1
 fi
 
