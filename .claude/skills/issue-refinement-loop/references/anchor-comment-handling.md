@@ -260,3 +260,32 @@ trusted OWNER の multi-turn anchor で advisory route に入った後、候補�
 ### heavy mutation gate（重大変更ゲート・AC6）
 
 `run_refinement_preflight.py` の `_classify_heavy_mutation_gate()` は、`known_context.mutation_category` が heavy mutation カテゴリ（`close` / `not_planned` / `replacement_issue_creation` / `dependency_removal` / `parent_child_change`）に該当する場合、`scope_delta_decision` が owner 発言由来の明示的決定（`status: approved_by_trusted_anchor` かつ `anchor_author_association: OWNER`）でない限り `status: blocked` / `fail_closed: true` を返す。非 heavy な通常改善・追加調査・review 継続カテゴリは、owner 明示的決定がなくても `status: warn` で継続する。
+
+
+### Severity-tagged 見出しの構造化抽出（#2296 AC9、fix_delta iteration 6 で P1-4 修正）
+
+Owner の敵対的レビューコメントで頻出する `## P0-1` / `### P1-3` のような
+severity-tagged 見出し（`^#+\s*P[0-9]+-[0-9]+` 形式、大文字小文字を区別しない）は、
+`scope_signal_delta.py` の **独立した専用関数** `extract_severity_tags()` が
+`_SEVERITY_TAGGED_HEADING_RE` で抽出し、マッチしたタグ（例: `P0-1`）を大文字化・
+ソートして返す。
+
+当初の実装（#2296 AC9 初版）は `extract_directive_markers()` 自体を拡張してこの
+抽出を組み込んでいたが、OWNER adversarial review（PR #2305, fix_delta iteration 6,
+P1-4）で構造的欠陥が指摘され修正した: severity heading は「重大度ラベル」であって
+「スコープ変更ディレクティブ」ではないにもかかわらず、`extract_directive_markers()`
+の戻り値に混入すると `classify_directive_confidence()` の marker-present 経路を
+経由して bullet-list 付きの severity heading を `explicit`（scope-authoritative）
+directive として誤分類してしまう（例: `## P0-1` 見出し + 無関係な箇条書きが
+Acceptance Criteria への追記ディレクティブとして扱われる）。
+
+修正後は `extract_directive_markers()` は severity heading を一切含まない
+（既存の固定 `_DIRECTIVE_SECTION_MARKERS` 判定のみ）。`extract_severity_tags()`
+は正規表現定数 `_SEVERITY_TAGGED_HEADING_RE` を共有するのみで、戻り値・呼び出し元
+は完全に分離されている。
+
+severity-tagged 見出し抽出は、`semantic_review_trigger.build_semantic_review_trigger_input()`
+（#2296 fix_delta iteration 6, P1-3）が `anchor_comment_bodies` を受け取って
+`severity_tagged_anchor_findings` シグナル（#2296 Step 2.5）を組み立てる際に使われる。
+`scope_signal_delta.py` 自体はその上位レイヤーの呼び出し規約を知らない
+（責務分離を維持する）。

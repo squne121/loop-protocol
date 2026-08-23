@@ -97,6 +97,23 @@ native `parent`／`blockedBy`／`blocking` を同期する場合は `native_rela
 - native relationship mutation は title/body content mutation より **先に** 実行され、失敗した場合は content mutation を一切開始しない（AC1/AC2）
 - 自然言語（`Part of #N`、`Related`、コメント等）からは parent／blocked_by／blocking を一切推測しない。structured input（この `native_relationships` フィールド）だけが source of truth
 
+### rewrite_lane（任意、Issue #2296 追加）
+
+`issue-refinement-loop` の Step 4（rewrite）がどちらの rewrite 契約を使って
+呼び出しているかを示す discriminator フィールド。省略時は `fail_closed_repair`
+として扱う（既存挙動と完全互換）。
+
+```json
+{
+  "rewrite_lane": "fail_closed_repair"
+}
+```
+
+- `fail_closed_repair`: `.claude/agents/issue-editor.md` の `FAIL_CLOSED_REWRITE_CONSTRAINTS_V1`
+  契約（必須セクション/契約キーの補完のみ、`freeform_rewrite_forbidden: true` が既定）
+- `semantic`: 同エージェントの `SEMANTIC_REWRITE_CONSTRAINTS_V1` 契約（Step 2.5 semantic
+  design review の finding を解消するための AC/VC/architecture 判断の書き換え）
+
 ## 手順
 
 ### 1. candidate body と readiness context を準備する
