@@ -37,8 +37,13 @@ import command_registry as reg  # noqa: E402
 _EXPECTED_PREFLIGHT_RUN_ENTRY = {
     "id": "preflight.run",
     "argv": [
+        # Issue #2311 AC1: canonical bare `preflight.run` now first-hops
+        # into `workflow_start_entry.py` (the workflow capability preflight
+        # carrier), not `run_refinement_preflight.py` directly. Sibling
+        # anchor-comment profiles (below) are unaffected and continue to
+        # first-hop into `run_refinement_preflight.py`.
         "uv", "run", "python3",
-        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        ".claude/skills/issue-refinement-loop/scripts/workflow_start_entry.py",
         "--issue-number", "{issue_number}",
         "--repo", "{repo}",
     ],

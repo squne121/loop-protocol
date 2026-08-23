@@ -382,6 +382,117 @@ class FileBackedFakeGitHubEntryTransport:
         return fixture_comments + posted_bodies
 
 
+def capability_preflight_result(
+    repo: str,
+    spark_mode: str | None = None,
+    spark_fallback: str | None = None,
+    planned_operations: "tuple[dict, ...] | list[dict]" = (),
+) -> dict:
+    """Invoke ``scripts/claude-gpt/workflow_capability_preflight.py`` once and
+    return the structured ``CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1`` result
+    verbatim (``decision`` / ``checks`` / ``reasons`` preserved -- Issue #2311
+    P0-4/AC6/AC7). This is a module-level function (not a transport method)
+    so callers such as ``workflow_start_entry.py`` can obtain the structured
+    result without constructing a ``GhCliGitHubEntryTransport`` and without
+    reimplementing the producer-invocation logic (Issue #2311 AC2).
+
+    Read-only: the underlying script performs no GitHub mutation of its own
+    (Issue #2273 AC12).
+
+    Fail-closed by construction: a subprocess invocation failure (missing
+    script, non-zero exit, timeout, OSError) or a malformed/non-JSON/
+    non-dict stdout payload is never raised to the caller -- it is
+    normalized into a synthetic ``decision: blocked`` result with a
+    ``reasons`` entry describing the failure, so every caller sees the same
+    3-value ``decision`` contract (``ready`` / ``degraded`` / ``blocked``)
+    regardless of whether the producer itself declared ``blocked`` or the
+    invocation failed outright (Issue #2311 AC3).
+    """
+    repo_root = Path(__file__).resolve().parents[4]
+    preflight_script = (
+        repo_root / "scripts" / "claude-gpt" / "workflow_capability_preflight.py"
+    )
+    argv = [
+        sys.executable,
+        str(preflight_script),
+        "--profile",
+        "issue-to-impl",
+        "--repo",
+        repo,
+    ]
+    if spark_mode is not None:
+        argv.extend(["--spark-mode", spark_mode])
+    if spark_fallback is not None:
+        argv.extend(["--spark-fallback", spark_fallback])
+    planned_ops_path: Optional[str] = None
+    try:
+        if planned_operations:
+            import tempfile
+
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".json",
+                prefix="planned-operations-",
+                delete=False,
+                encoding="utf-8",
+            )
+            try:
+                json.dump(list(planned_operations), tmp)
+            finally:
+                tmp.close()
+            planned_ops_path = tmp.name
+            argv.extend(["--planned-operations-json", planned_ops_path])
+
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001 -- fail-closed transport boundary
+            return {
+                "decision": "blocked",
+                "checks": {},
+                "reasons": [f"producer_invocation_failed:{exc.__class__.__name__}"],
+            }
+        if proc.returncode != 0:
+            return {
+                "decision": "blocked",
+                "checks": {},
+                "reasons": [f"producer_invocation_failed:exit_{proc.returncode}"],
+            }
+        try:
+            result = json.loads(proc.stdout)
+        except (json.JSONDecodeError, ValueError):
+            return {
+                "decision": "blocked",
+                "checks": {},
+                "reasons": ["producer_result_malformed:non_json_stdout"],
+            }
+        if not isinstance(result, dict) or result.get("decision") not in (
+            "ready",
+            "degraded",
+            "blocked",
+        ):
+            return {
+                "decision": "blocked",
+                "checks": {},
+                "reasons": ["producer_result_malformed:invalid_decision"],
+            }
+        return {
+            "decision": result.get("decision"),
+            "checks": result.get("checks", {}),
+            "reasons": result.get("reasons", []),
+        }
+    finally:
+        if planned_ops_path is not None:
+            try:
+                Path(planned_ops_path).unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001 -- best-effort temp file cleanup
+                pass
+
+
 @dataclass
 class GhCliGitHubEntryTransport:
     """Production transport: talks to the REAL GitHub API via the ``gh``
@@ -404,69 +515,28 @@ class GhCliGitHubEntryTransport:
     )
 
     def capability_preflight(self) -> bool:
-        """Consume the structured ``CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1``
-        result produced by
-        ``scripts/claude-gpt/workflow_capability_preflight.py`` (Issue #2273
-        AC15), rather than a bare ``gh auth status`` boolean gate.
+        """Backward-compatible boolean adapter (Issue #2311 P0-4/AC6) over
+        the structured module-level ``capability_preflight_result()``.
         ``decision: ready`` or ``decision: degraded`` route to ``True``
-        (proceed to the fresh-review phase); ``decision: blocked`` (or any
+        (proceed to the fresh-review phase); ``decision: blocked`` (which
+        ``capability_preflight_result()`` also synthesizes on any producer
         invocation failure -- missing script, non-JSON stdout, non-zero
         exit, timeout) routes to ``False`` (fail closed, matching this
-        gate's prior behavior). This call is read-only: the underlying
-        module performs no GitHub mutation of its own (Issue #2273 AC12).
+        gate's prior behavior, Issue #2273 AC15). This call is read-only:
+        the underlying module performs no GitHub mutation of its own
+        (Issue #2273 AC12). Existing callers of this method (Step 5 /
+        ``run_root_transition`` and its existing tests, e.g.
+        ``test_ac11_capability_preflight_blocked_stops_before_mutation``)
+        are unaffected by the Issue #2311 refactor -- this method's
+        observable behavior is unchanged.
         """
-        repo_root = Path(__file__).resolve().parents[4]
-        preflight_script = (
-            repo_root / "scripts" / "claude-gpt" / "workflow_capability_preflight.py"
+        result = capability_preflight_result(
+            repo=self.repo,
+            spark_mode=self.spark_mode,
+            spark_fallback=self.spark_fallback,
+            planned_operations=self.planned_operations,
         )
-        argv = [
-            sys.executable,
-            str(preflight_script),
-            "--profile",
-            "issue-to-impl",
-            "--repo",
-            self.repo,
-        ]
-        if self.spark_mode is not None:
-            argv.extend(["--spark-mode", self.spark_mode])
-        if self.spark_fallback is not None:
-            argv.extend(["--spark-fallback", self.spark_fallback])
-        planned_ops_path: Optional[str] = None
-        if self.planned_operations:
-            import tempfile
-
-            tmp = tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".json",
-                prefix="planned-operations-",
-                delete=False,
-                encoding="utf-8",
-            )
-            try:
-                json.dump(list(self.planned_operations), tmp)
-            finally:
-                tmp.close()
-            planned_ops_path = tmp.name
-            argv.extend(["--planned-operations-json", planned_ops_path])
-        try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if proc.returncode != 0:
-                return False
-            result = json.loads(proc.stdout)
-            return result.get("decision") in ("ready", "degraded")
-        except Exception:
-            return False
-        finally:
-            if planned_ops_path is not None:
-                try:
-                    Path(planned_ops_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
+        return result.get("decision") in ("ready", "degraded")
 
     def fetch_live_issue(self, issue_number: int) -> dict:
         try:
