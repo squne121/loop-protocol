@@ -17,6 +17,7 @@ occurred on that path (AC3's "no downstream GitHub mutation" claim).
 
 from __future__ import annotations
 
+import importlib.util as _importlib_util
 import sys
 from pathlib import Path
 
@@ -33,8 +34,6 @@ import workflow_start_entry as wse  # noqa: E402
 # -- `scripts/claude-gpt` is not an importable package and the module's
 # on-disk name is not a valid dotted identifier prefix collision target, so
 # `importlib.util` is used instead of a `sys.path` + plain `import`.
-import importlib.util as _importlib_util
-
 _PRODUCER_PATH = _SCRIPTS_DIR.parents[3] / "scripts" / "claude-gpt" / "workflow_capability_preflight.py"
 _producer_spec = _importlib_util.spec_from_file_location(
     "claude_gpt_workflow_capability_preflight", _PRODUCER_PATH
