@@ -112,6 +112,77 @@ REPO = "squne121/loop-protocol"
 ISSUE_NUMBER = 2197
 ANCHOR_COMMENT_ID = 5315264311
 
+# ---------------------------------------------------------------------------
+# Issue #2317: structured `REASON_CODE:` compact-stdout predicate/parser,
+# replacing the prior broad substring OR-chain (which matched the
+# `GH_API_FAILURE` blocker text on both stdout AND stderr and therefore
+# false-greened genuine failures). Only an exact-match, stdout-only,
+# closed-set `REASON_CODE:` value is ever treated as transient.
+# ---------------------------------------------------------------------------
+
+_TRANSIENT_ENVIRONMENT_FAILURE_REASON_CODES = frozenset(
+    {"rate_limited", "upstream_environment_failure", "transport_connectivity_failure"}
+)
+
+
+def _extract_reason_code_line_value(stdout: str) -> "str | None":
+    """Extract the value of the sole `REASON_CODE:` line from compact
+    stdout produced by the real production `_build_compact_stdout()`.
+
+    Returns `None` (never transient) unless exactly one `REASON_CODE:`
+    line is present -- absence or duplication both fail closed to "not
+    transient" so genuine failures are never silently skipped."""
+    matches = [
+        line[len("REASON_CODE:") :].strip() for line in stdout.splitlines() if line.startswith("REASON_CODE:")
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _is_transient_environment_failure_reason_code(reason_code: "str | None") -> bool:
+    """Closed-set exact-match predicate (Issue #2317 AC3/AC5/AC7): only the
+    reason codes production has already classified as transient/
+    environmental (`rate_limited` / `upstream_environment_failure` /
+    `transport_connectivity_failure`) are treated as skip-eligible. Any
+    unknown, future, malformed, or empty reason code is NOT transient
+    (fail-closed) so genuine failures never become false-green skips."""
+    if not reason_code:
+        return False
+    return reason_code in _TRANSIENT_ENVIRONMENT_FAILURE_REASON_CODES
+
+
+def _extract_status_line_value(stdout: str) -> "str | None":
+    """Extract the value of the sole `STATUS:` line from compact stdout.
+
+    Returns `None` (never transient) unless exactly one `STATUS:` line is
+    present -- absence or duplication both fail closed to "not transient"
+    (PR #2319 review fix_delta iteration 1 P1: STATUS is held to the same
+    exactly-once strictness as REASON_CODE; SOURCE/OPERATION are not, per
+    OWNER decision)."""
+    matches = [line[len("STATUS:") :].strip() for line in stdout.splitlines() if line.startswith("STATUS:")]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _stdout_indicates_transient_environment_failure(stdout: str) -> bool:
+    """Combine the extraction helpers and the closed-set predicate. `stderr`
+    is never consulted (Issue #2317: stdout is the sole judgment source).
+
+    PR #2319 review fix_delta iteration 1 P1: hardened to also require
+    `STATUS: environment_failure` to appear exactly once (in addition to
+    the pre-existing REASON_CODE exactly-once check) before ever
+    considering the REASON_CODE value. A missing, duplicated, or
+    non-`environment_failure` STATUS line fails closed to "not transient",
+    matching Issue #2317's original pre-review request. SOURCE and
+    OPERATION are not held to this same exactly-once strictness (OWNER
+    explicitly scoped the hardening to STATUS and REASON_CODE only)."""
+    if _extract_status_line_value(stdout) != "environment_failure":
+        return False
+    return _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(stdout))
+
+
 _GH_MARKER_SCRIPT = """#!/bin/sh
 # Test-only marker executable: if this is ever invoked it proves the
 # isolated-profile fetch path fell back to the `gh` CLI, which must never
@@ -158,6 +229,7 @@ def _install_gh_marker_executable(tmp_path: Path, env: dict[str, str]) -> Path:
     return invocation_marker_file
 
 
+@pytest.mark.github_live
 def test_isolated_anchor_comment_resolves_via_single_credentialless_authority(tmp_path: Path) -> None:
     """GIVEN a genuine `uv run python3` child subprocess of the REAL
     `run_refinement_preflight.py` production script (never a copy, never a
@@ -326,6 +398,7 @@ def _load_skill_runtime_exec_anchor_fixtures():
     return module
 
 
+@pytest.mark.github_live
 def test_ac5_ac6_skill_runtime_exec_with_human_context_live_subprocess_resolves_anchor_via_credentialless_authority(
     tmp_path: Path,
 ) -> None:
@@ -425,16 +498,13 @@ def test_ac5_ac6_skill_runtime_exec_with_human_context_live_subprocess_resolves_
         f"subprocess graph. stdout={stdout!r} stderr={result.stderr!r}"
     )
 
-    if result.returncode == 3 and (
-        "rate_limited" in stdout
-        or "upstream_environment_failure" in stdout
-        or "transport_connectivity_failure" in stdout
-        or "rate_limited" in result.stderr
-        or "upstream_environment_failure" in result.stderr
-        or "transport_connectivity_failure" in result.stderr
-    ):
+    # Issue #2317: replaced the prior broad substring OR-chain (which also
+    # matched stderr and could false-green a genuine `GH_API_FAILURE`
+    # blocker) with the structured, stdout-only, closed-set `REASON_CODE:`
+    # predicate defined above (AC3/AC4/AC5/AC6/AC7).
+    if result.returncode == 3 and _stdout_indicates_transient_environment_failure(stdout):
         pytest.skip(
-            f"network/rate-limit/upstream unavailable in this environment: "
+            f"transient environment failure reason_code in this environment: "
             f"stdout={stdout!r} stderr={result.stderr!r}"
         )
     assert "authentication" not in stdout and "gh_exit_4" not in stdout, (
@@ -462,3 +532,95 @@ def test_ac5_ac6_skill_runtime_exec_with_human_context_live_subprocess_resolves_
         f"AC5 unmet: resolved anchor_comment does not reference comment "
         f"{ANCHOR_COMMENT_ID}: {anchor_comment_state!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2317: deterministic unit tests for the transient-environment-failure
+# predicate/parser (AC3/AC4/AC5/AC7) defined above. The formatter-contract
+# tests for the REASON_CODE/SOURCE/OPERATION stdout projection (AC1/AC2,
+# against the REAL `_build_compact_stdout()`) live in
+# `test_refinement_preflight.py`, which already owns formatter contract
+# testing (PR #2319 review fix_delta iteration 1 P2: removed the
+# near-duplicate copies and the `_load_run_refinement_preflight_module()`
+# helper that were newly added to this file).
+# ---------------------------------------------------------------------------
+
+
+def test_transient_environment_failure_predicate_true_for_transient_reason_codes() -> None:
+    """AC3: the predicate returns True for each closed-set transient
+    reason code."""
+    for code in ("rate_limited", "upstream_environment_failure", "transport_connectivity_failure"):
+        stdout = f"STATUS: environment_failure\nREASON_CODE: {code}\nSOURCE: github_api\nOPERATION: fetch_issue"
+        assert _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(stdout)) is True
+
+
+def test_transient_environment_failure_predicate_false_without_reason_code_line() -> None:
+    """AC4: with no `REASON_CODE:` line present and only a
+    `BLOCKERS: GH_API_FAILURE` entry, the predicate returns False (hard
+    failure is preserved -- this is the exact regression this Issue
+    fixes)."""
+    stdout = "STATUS: blocked\nBLOCKERS:\n  - GH_API_FAILURE"
+    assert _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(stdout)) is False
+
+
+def test_transient_environment_failure_predicate_false_for_genuine_reason_codes() -> None:
+    """AC5: genuine reason codes outside the transient closed set return
+    False (never silently skipped as transient)."""
+    genuine_reason_codes = (
+        "unexpected_authentication_dependency",
+        "http_403_forbidden",
+        "canonical_resource_missing",
+        "gh_auth_required",
+        "malformed_response_body",
+        "transport_internal_error",
+    )
+    for code in genuine_reason_codes:
+        stdout = f"STATUS: environment_failure\nREASON_CODE: {code}\nSOURCE: github_api\nOPERATION: fetch_issue"
+        assert _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(stdout)) is False
+
+
+def test_transient_environment_failure_predicate_false_for_duplicate_or_empty_reason_code() -> None:
+    """AC7: duplicate `REASON_CODE:` lines, or a `REASON_CODE:` line with
+    an empty value, both cause the predicate to return False."""
+    duplicate_stdout = (
+        "STATUS: environment_failure\n"
+        "REASON_CODE: rate_limited\n"
+        "REASON_CODE: rate_limited\n"
+        "SOURCE: github_api\n"
+        "OPERATION: fetch_issue"
+    )
+    assert _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(duplicate_stdout)) is False
+
+    empty_value_stdout = "STATUS: environment_failure\nREASON_CODE: \nSOURCE: github_api\nOPERATION: fetch_issue"
+    assert _is_transient_environment_failure_reason_code(_extract_reason_code_line_value(empty_value_stdout)) is False
+
+
+def test_stdout_indicates_transient_environment_failure_requires_status_exactly_once() -> None:
+    """PR #2319 review fix_delta iteration 1 P1: `_stdout_indicates_transient_
+    environment_failure()` must also require `STATUS: environment_failure`
+    to appear exactly once, in addition to the pre-existing REASON_CODE
+    exactly-once check. Missing, duplicated, or non-`environment_failure`
+    STATUS lines all fail closed to "not transient", even when a
+    transient-eligible REASON_CODE line is present."""
+    missing_status = "REASON_CODE: rate_limited\nSOURCE: credentialless_transport\nOPERATION: read_issue"
+    assert _stdout_indicates_transient_environment_failure(missing_status) is False
+
+    duplicate_status = (
+        "STATUS: environment_failure\n"
+        "STATUS: environment_failure\n"
+        "REASON_CODE: rate_limited\n"
+        "SOURCE: credentialless_transport\n"
+        "OPERATION: read_issue"
+    )
+    assert _stdout_indicates_transient_environment_failure(duplicate_status) is False
+
+    wrong_status = "STATUS: blocked\nREASON_CODE: rate_limited\nSOURCE: credentialless_transport\nOPERATION: read_issue"
+    assert _stdout_indicates_transient_environment_failure(wrong_status) is False
+
+    well_formed = (
+        "STATUS: environment_failure\n"
+        "REASON_CODE: rate_limited\n"
+        "SOURCE: credentialless_transport\n"
+        "OPERATION: read_issue"
+    )
+    assert _stdout_indicates_transient_environment_failure(well_formed) is True

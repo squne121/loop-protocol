@@ -4843,6 +4843,11 @@ def _build_compact_stdout(result: dict) -> str:
         )
         lines.append(f"  {rewritten_repair_action}")
 
+    if result["status"] == "environment_failure":
+        lines.append(f"REASON_CODE: {result.get('reason_code')}")
+        lines.append(f"SOURCE: {result.get('source')}")
+        lines.append(f"OPERATION: {result.get('operation')}")
+
     artifacts = result.get("artifacts", {})
     if artifacts:
         lines.extend(_render_artifact_projection_lines(artifacts))
