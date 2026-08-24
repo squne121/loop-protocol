@@ -61,6 +61,33 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[5]
 
 
+def _parse_compact_stdout(stdout: str) -> dict:
+    """Minimal reader for the compact `STATUS:`/`NEXT_ACTION:`/`BLOCKERS:`
+    stdout line grammar (Issue #2323) -- the SAME grammar
+    `run_refinement_preflight.py::_build_compact_stdout()` renders. Only
+    extracts the handful of fields this test file's real-subprocess
+    assertions need; not a general-purpose grammar parser."""
+    status = None
+    next_action = None
+    blockers: list[str] = []
+    lines = stdout.splitlines()
+    in_blockers = False
+    for line in lines:
+        if line.startswith("STATUS: "):
+            status = line[len("STATUS: "):]
+            in_blockers = False
+        elif line.startswith("NEXT_ACTION: "):
+            next_action = line[len("NEXT_ACTION: "):]
+            in_blockers = False
+        elif line == "BLOCKERS:":
+            in_blockers = True
+        elif in_blockers and line.startswith("  - "):
+            blockers.append(line[len("  - "):])
+        elif in_blockers and not line.startswith("  "):
+            in_blockers = False
+    return {"status": status, "next_action": next_action, "blockers": blockers}
+
+
 def _pinned_uv_version(repo_root: Path) -> str:
     data = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
     return data["tool"]["uv"]["required-version"]
@@ -168,6 +195,25 @@ import os
 from pathlib import Path
 
 
+def _build_compact_stdout(result: dict) -> str:
+    # Issue #2323: minimal fixture stand-in for the real
+    # `run_refinement_preflight.py::_build_compact_stdout()` -- imported
+    # by `workflow_start_entry.py` at module load time (its blocked path
+    # renders the same compact grammar this real function renders for
+    # ready/degraded). Only the subset of fields this fixture's own
+    # blocked-path assertions need is implemented.
+    lines = [
+        f"STATUS: {result['status']}",
+        f"NEXT_ACTION: {result['next_action']}",
+    ]
+    blockers = result.get("blockers", [])
+    if blockers:
+        lines.append("BLOCKERS:")
+        for b in blockers:
+            lines.append(f"  - {b}")
+    return "\\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--issue-number", required=True)
@@ -253,20 +299,25 @@ def test_canonical_executor_blocks_unsupported_operation_and_required_forbidden_
     )
 
     assert result.returncode != 0, result.stdout + result.stderr
-    payload = json.loads(result.stdout)
-    assert payload["schema"] == "WORKFLOW_START_ENTRY_RESULT_V1"
-    assert payload["status"] == "blocked"
-    assert payload["inner_preflight_invoked"] is False
-    # `checks` non-empty proves the producer subprocess was actually
-    # invoked and returned structured checks (as opposed to the
-    # zero-checks `environment_failure` shape a missing/malformed request
-    # would produce -- see the companion negative test below).
-    assert payload["checks"], "producer must have been invoked and returned structured checks"
+    # Issue #2323: the blocked path now renders the SAME compact stdout
+    # line grammar (`STATUS:`/`NEXT_ACTION:`/`BLOCKERS:`) that
+    # `run_refinement_preflight.py` already uses for ready/degraded --
+    # instead of the previous raw `{"schema": "WORKFLOW_START_ENTRY_
+    # RESULT_V1", ...}` JSON dict -- so this is parsed with the compact
+    # line-grammar helper, not `json.loads`.
+    parsed = _parse_compact_stdout(result.stdout)
+    assert parsed["status"] == "blocked"
+    # A non-trivial `BLOCKERS:` list (beyond the single fixed
+    # `caller_capability_request_missing_or_malformed` marker the
+    # companion negative test below asserts) proves the producer
+    # subprocess was actually invoked and returned structured reasons (as
+    # opposed to the zero-blockers `environment_failure` shape a
+    # missing/malformed request would produce).
     assert any(
-        "definitely_unsupported_operation_xyz" in reason and "operation_route_unavailable" in reason
-        for reason in payload["reasons"]
-    ), payload["reasons"]
-    assert any(reason.startswith("spark:unavailable") for reason in payload["reasons"]), payload["reasons"]
+        "definitely_unsupported_operation_xyz" in blocker and "operation_route_unavailable" in blocker
+        for blocker in parsed["blockers"]
+    ), parsed["blockers"]
+    assert any(blocker.startswith("spark:unavailable") for blocker in parsed["blockers"]), parsed["blockers"]
     assert not inner_marker.exists(), "run_refinement_preflight.py must never have started"
 
 
@@ -285,9 +336,11 @@ def test_canonical_executor_fails_closed_with_no_declared_capability_request(tmp
     result = _run_executor(repo, inner_marker, extra_env=None)
 
     assert result.returncode != 0, result.stdout + result.stderr
-    payload = json.loads(result.stdout)
-    assert payload["status"] == "blocked"
-    assert payload["reason"].startswith("environment_failure:")
-    assert payload["inner_preflight_invoked"] is False
-    assert payload["checks"] == {}
+    # Issue #2323: same compact line-grammar shape as the positive case
+    # above -- `BLOCKERS:` carries exactly the single typed
+    # `caller_capability_request_missing_or_malformed` marker (no
+    # producer-specific reasons), proving the producer was never reached.
+    parsed = _parse_compact_stdout(result.stdout)
+    assert parsed["status"] == "blocked"
+    assert parsed["blockers"] == ["caller_capability_request_missing_or_malformed"]
     assert not inner_marker.exists()
