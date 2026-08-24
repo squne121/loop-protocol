@@ -3012,3 +3012,154 @@ Verification Commands は見出し・6フィールド言及・参照 Issue/PR �
 coverage / traceability の sanity check に限定し、意味論的な正しさは Claude Code 公式 docs を
 normative source とした semantic design review で評価する。本節の範囲では新規
 JSON Schema / pytest / linter / runtime harness を追加しない。
+
+## Deterministic Evidence vs Semantic Judgment の分離パターン（impl-review-loop / pr-reviewer / pr-review-judge / pr-reviewer-lite）
+
+本セクションは `docs/adr/0008-deterministic-evidence-vs-semantic-judgment.md`
+（ADR 0008、accepted）が定めた役割分担原則を、PR review 側の実装
+（`impl-review-loop` / `pr-reviewer` / `pr-review-judge` / `pr-reviewer-lite`）に
+即して要約する。ADR 0008 が正本であり、本セクションは重複記述ではなく
+参照・具体化のみを行う。
+
+### 境界の定義
+
+- **deterministic code（script）が扱う領域**: 既に形式化済みの fact / invariant /
+  policy aggregation。`check_pr_review_gates.py` の `finalize_verdict()` が
+  aggregate する gate status 群（`.claude/skills/pr-review-judge/SKILL.md` 参照）は
+  この側に属する。ゲートの個数は実装の進化に伴って増減しうる有限集合であり
+  （本ドキュメント執筆時点では `g1`〜`g6` が存在するが、具体的な個数や gate_id は
+  ここでは固定しない）、判定ルールが decision table として再現可能に書き下せる
+  領域はすべて script 側に置く。
+- **model（LLM）judgment が扱う領域**: requirement completeness（要求の充足性）・
+  architecture（設計の妥当性）・contradiction（既存方針との矛盾）・trade-off
+  （複数の妥当な選択肢の比較衡量）のように、有限のルールに還元できない判断。
+  新しい Issue / PR が提起する論点は事前に列挙不可能であるため、これらは
+  常に LLM 側の裁量に委ねる（ADR 0008 の Option A 却下理由と同一）。
+
+この境界は「script にできることは script にやらせ、script にできないこと
+（無限に近い論点空間の判断）だけを LLM に委ねる」という比較的単純な原則だが、
+`finalize_verdict()` の gate aggregation のような **一見 semantic に見える
+aggregation ロジックも、実際には既に形式化済みの deterministic 集約であるため
+script side に属する** という点が誤解されやすい。各 gate 自体は「AC が全部
+埋まっているか」等の LLM の自己申告を集約するものではなく、**script 自身が
+CI artifact・evidence binding・head SHA・fixture trace・Allowed Paths の
+producer-role 等、既に確定した事実群から直接計算する** gate status であり、
+`finalize_verdict()` はその gate status（FAIL の有無）を decision table で
+集約するだけである点に注意する。
+
+### `pr-reviewer-lite` deny-list ↔ Issue-native concept 対応表
+
+`pr-reviewer-lite`（`.claude/agents/pr-reviewer-lite.md`）の deny-list フィールドは
+diff-size ベースの適用判定であり、Issue 側の `issue-refinement-loop` /
+`issue-contract-review` が持つ概念とは設計目的が異なる。以下は両者の
+対応関係を明示する表であり、`mapping_type` は 4 値のいずれかを取る:
+
+- `direct_analogue`: 同一概念の別表現（1:1 で対応）
+- `conceptual_analogue`: 目的は類似するが実装形態が異なる（構造的な写像ではない）
+- `no_analogue`: Issue 側に対応する概念が存在しない（diff サイズ等、PR 固有の指標）
+- `do_not_port`: Issue 側へ意図的に移植しない（設計判断として非対応。字面が似ていても
+  由来する目的が異なるため、Issue 側の別概念の類似物として扱ってはならないものを含む）
+
+| `pr-reviewer-lite` deny-list field | 元々の目的（PR evidence-quality / lite routing） | Issue-native concept | mapping_type |
+|---|---|---|---|
+| `changed_path_matches` | Haiku→Sonnet ルーティング判定用の静的 sensitive-path 拒否リスト（`src/**` / `.github/workflows/**` / `.claude/skills/**` 等、コスト・複雑度に基づく振り分け） | Allowed Paths（Issue 本文 `## Allowed Paths`、Gate 6 `allowed_paths_gate_producer_role_presence` が linked Issue の Allowed Paths と PR の変更ファイル名を照合する producer-role 境界チェック） | `do_not_port`（別概念。同一エージェント内に併存する 2 つの独立した仕組みであり、字面の類似から 1:1 対応と誤読しない） |
+| `changed_files_count` | diff サイズによる Haiku 適用可否判定 | （該当なし。PR diff サイズ固有の指標） | `no_analogue` |
+| `additions_plus_deletions` | diff サイズによる Haiku 適用可否判定 | （該当なし。PR diff サイズ固有の指標） | `no_analogue` |
+| `schema_change_applicability` | schema 変更時の Haiku 適用除外判定 | C9 runtime verification applicability tag に類似する「事前に宣言された applicability 分類」という設計思想 | `conceptual_analogue` |
+| `runtime_verification_applicability` | runtime 検証必須時の Haiku 適用除外判定 | `## Runtime Verification Applicability`（`decision: not_applicable \| immediate \| deferred`） | `direct_analogue` |
+| `safety_sensitive` | transport / permission / sandbox / auth 変更時の Haiku 適用除外判定 | `cross_contract_change`（schema/.protocol/.orchestration の変更フラグ） | `conceptual_analogue` |
+| `verification_skipped_count` | PR 側 VC 実行の skip 件数（PR evidence-quality / lite routing 指標） | `checker_gap_count`（Issue 側 deterministic checker が検出した gap 件数） / `heuristic_concern_count`（Issue semantic-review 適用可否シグナル） | `do_not_port`（別概念。前者は PR 実行時の VC skip 検知、後者は Issue 側 semantic review の適用トリガーであり、verification-skip を semantic トリガーとして扱ってはならない） |
+| `fallback_detected` | PR 側の fallback 経路検知（PR evidence-quality / lite routing 指標） | `finding_kind: checker_gap` / `finding_kind: heuristic_concern`（Issue semantic-review 適用可否シグナル） | `do_not_port`（別概念。前者は PR 実行結果の fallback 検知、後者は Issue 側 semantic review の適用トリガーであり、同一視しない） |
+
+`changed_files_count` と `additions_plus_deletions` は diff サイズという
+PR 固有の量的指標であり、Issue 側（本文の構造的完全性を見る
+`issue-refinement-loop` / `issue-contract-review`）には対応する概念が
+存在しない。これらは Issue 側へ移植しない（`no_analogue`）。
+
+`changed_path_matches` / `verification_skipped_count` / `fallback_detected` は
+いずれも `do_not_port` に分類される。これらは PR review 側の evidence-quality /
+lite routing 指標であり、Issue 側の Allowed Paths（Gate 6）や semantic review
+適用シグナル（`checker_gap_count` 等）とは目的も判定対象も異なる独立した仕組みである。
+字面が似ているために「PR 側で検証 skip や fallback が起きたら Issue 側の semantic
+review トリガーとして扱ってよい」と誤読すると、#2297 の前段 adversarial review が
+確立した「これらは deterministic な VC/readiness シグナルであり semantic トリガーでは
+ない」という区別を崩すため、`do_not_port` として明示する。
+
+### `semantic_review_trigger.py` の applicability signal 一覧（#2296 / PR #2305、既にマージ済み）
+
+`issue-refinement-loop` の Step 2.5（semantic design review lane）は、
+`.claude/skills/issue-refinement-loop/scripts/semantic_review_trigger.py`
+（`evaluate_semantic_review_applicable()`）が判定する以下の明示シグナルの
+いずれかが true / 非ゼロ / 非空であれば `semantic_review_applicable: true` を返す:
+
+| signal | 型 | 意味 |
+|---|---|---|
+| `user_requested` | bool | 人間が明示的に semantic review を要求した |
+| `semantic_rewrite_requested` | bool | semantic rewrite lane が別経路で要求されている |
+| `checker_gap_count` | non-negative int | Step 2 deterministic checker（`check_issue_contract.py` 等）が検出した gap 件数 |
+| `heuristic_concern_count` | non-negative int | heuristic concern（機械的ルールでは断定できない懸念）の件数 |
+| `severity_tagged_anchor_findings` | string[] | anchor comment から `extract_severity_tags()` で抽出した severity-tagged 見出し |
+| `owner_decision_conflict` | bool | 既存 Owner Decision との矛盾が検出された |
+| `cross_contract_change`（`schema` / `protocol` / `orchestration`） | bool の 3 フィールド | schema / `.protocol` / `.orchestration` を跨ぐ変更 |
+
+これら全てが false / ゼロ / 空の場合のみ `semantic_review_applicable: false`
+となり、Step 2.5 レーンをスキップして直接 Step 4.5 へ進む
+（before/after 比較ではなく、明示シグナルのみに基づく適用可否分類）。
+
+ADR 0008 は accepted 時点では Option D（「実質変更時のみ semantic review を
+起動し既定は advisory とする」）を `materiality-triggered semantic review` と
+呼称して採用した。しかし、その後の #2296 rework で before/after 比較を行う
+baseline が実際には存在しないことが判明し、実装は before/after 比較ではなく
+本節が列挙する明示シグナルのみに基づく適用可否分類として具体化された
+（`semantic_review_required` から `semantic_review_applicable` への改称を含む、
+#2296 Design Decision Note P0-2）。本ドキュメントが `materiality` という呼称を
+使わないのは、ADR 0008 の呼称自体を否定するものではなく、現在の実装が
+before/after の実質性（materiality）を測る仕組みではないことを明確にするための
+用語選択である。
+
+**Step 2.5 の routing policy 要点**（詳細は
+`.claude/skills/issue-refinement-loop/references/semantic-design-review.md` 参照）:
+
+- **completion join barrier**: orchestrator は `issue-design-reviewer` SubAgent を
+  起動し、完了を待ってから次のステップへ進む。`record-result` は
+  `completed-at` が bundle の `pinned_at` より後であることを検証する
+- **strict JSON / schema validation**: モデル出力（`assessment` / `findings` のみ）は
+  重複キー拒否の strict JSON パースを経て
+  `schemas/semantic_review_result_v1.schema.json` に対し検証される
+- **`join_review_results.py`（#2296）が SSOT の `effective_verdict` 決定表**:
+  `deterministic_verdict`（既存 Step 2 pipeline） /
+  `semantic_assessment`（`clear` / `findings` / `not_required`） /
+  `transport_status`（`ok` / `missing` / `stale` / `error` / `not_required`）の
+  3 入力から、以下の優先順位で `effective_verdict` を計算する
+  （`decide_next_loop_action.py` には `approve` / `needs-fix` /
+  `human_judgment_required` の 3 値のみが渡り、`retry` は Step 2.5 内部で消費される）:
+
+  | 優先順位 | 条件 | `effective_verdict` |
+  |---|---|---|
+  | 1 | `deterministic_verdict != approve` | `needs-fix`（deterministic が常に優先） |
+  | 2 | open（有効な `owner_disposition` 未記録）な `severity: blocker\|high` finding が存在 | `needs-fix` + `rewrite_lane: "semantic"`（`finding_policy: route_high_open_to_rewrite`。transport 状態や `semantic_assessment` の値によらず優先） |
+  | 3 | `semantic_assessment == not_required` | `approve` |
+  | 4 | 既知の transport failure（`missing`/`stale`/`error`）かつ `transport_policy: required` | `human_judgment_required` |
+  | 5 | 既知の transport failure かつ `transport_policy: best_effort`（既定）で 1 回目 | `retry`（Step 2.5 内部でのみ観測される中間状態。transport を 1 回だけ自動再実行してから再評価） |
+  | 6 | 同上で再試行後も失敗（2 回目） | `approve` + `semantic_review_unavailable: true` + `SEMANTIC_REVIEW_UNAVAILABLE` warning（terminal report まで運ぶ） |
+  | 7 | 上記いずれにも該当しない（`transport_status == ok` かつ open blocking finding なし） | `approve`（non-blocking finding が残る場合は warning 付き） |
+
+### `issue-contract-review` は semantic finding の fallback destination ではない
+
+`issue-contract-review`（`.claude/skills/issue-contract-review/SKILL.md`）の
+description は以下の一文を含む:
+
+> 「Issue 内容・文脈レビューは review-issue / issue-refinement-loop の責務で、
+> 本 skill では扱わない。」
+
+`issue-contract-review` は実装着手直前の **決定論的 preflight**（VC が
+baseline で fail すること、AC が決定論的に検証可能であることの確認）に
+scope を限定した skill であり、`issue-refinement-loop` の Step 2.5 が
+検出した semantic design finding（schema 設計判断・AC 完全性・architecture
+trade-off）を代わりに引き受ける fallback destination ではない。ADR 0008 の
+Context セクションが記録する #2273 の失敗パターン（「機械的に直せないため
+次回 iteration や `issue-contract-review` に委ねる」という自己申告のまま
+loop を終了させてしまった構造的欠陥）は、まさにこの誤った委譲先想定が
+原因だった。semantic design finding の解消責務は常に
+`issue-refinement-loop` の Step 2.5（`issue-design-reviewer` SubAgent 経由）
+に留まり、`issue-contract-review` へ押し出してはならない。
