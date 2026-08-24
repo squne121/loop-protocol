@@ -53,6 +53,15 @@ force a failure via `FAKE_GH_AUTH_OK=0`.
 State is persisted across invocations (each `gh` call is a fresh subprocess)
 via a JSON file at $FAKE_GH_STATE.
 
+Issue #2278 (`runtime_smoke_test.sh --scenario issue_to_impl`) additionally
+teaches this fixture: `FAKE_GH_SEED_ISSUES_PATH` (a JSON file with the same
+`{"next_number": int, "issues": {...}}` shape as the persisted state file,
+consulted only when no `$FAKE_GH_STATE` file exists yet) so a fixture Issue
+can be pre-seeded before any live `gh issue view` call, and a `labels` field
+on `issue view`/`issue list` payloads (empty list when absent) so readers
+that request `--json ...,labels,...` observe the same field shape real `gh`
+returns.
+
 Originally salvaged from the Issue #2259 bridge test fixture
 (`.claude/worktrees/issue-2259-isolated-issue-create-bridge/scripts/
 claude-gpt/tests/fixtures/fake_gh.py`, never merged to main) and adapted for
@@ -71,6 +80,21 @@ def _load(state_path: str) -> dict:
     if os.path.exists(state_path):
         with open(state_path, encoding="utf-8") as fh:
             return json.load(fh)
+    # Issue #2278 AC2/AC3: `--scenario issue_to_impl` seeds the fake `gh`
+    # state with a fixture Issue (issue-2230-equivalent/issue.json) BEFORE
+    # any `gh issue create` call happens, so a live `gh issue view` against a
+    # pre-existing fixture Issue number succeeds on the very first
+    # invocation. Only consulted when no state file exists yet (first call of
+    # a fresh $FAKE_GH_STATE); once state has been persisted once, this seed
+    # path is never re-read (matches the existing single-source-of-truth
+    # persisted-state contract above).
+    seed_path = os.environ.get("FAKE_GH_SEED_ISSUES_PATH")
+    if seed_path and os.path.exists(seed_path):
+        with open(seed_path, encoding="utf-8") as fh:
+            seed = json.load(fh)
+        issues = seed.get("issues", {}) if isinstance(seed, dict) else {}
+        next_number = seed.get("next_number", 9001) if isinstance(seed, dict) else 9001
+        return {"next_number": next_number, "issues": issues, "calls": []}
     return {"next_number": 9001, "issues": {}, "calls": []}
 
 
@@ -79,16 +103,26 @@ def _save(state_path: str, state: dict) -> None:
         json.dump(state, fh)
 
 
-def _record_call(state: dict, operation: str, repo, subcommand) -> None:
+def _record_call(state: dict, operation: str, repo, subcommand, number=None) -> None:
     """Append a normalized call trace entry.
 
     Only operation / repo / the primary (non-flag) subcommand tokens are
     recorded -- callers must not assert exact argv, exact ordering across
     unrelated operations, or exact call counts beyond what a given test
     explicitly sets up (Issue #2306 In Scope wording).
+
+    Issue #2278 (`runtime_smoke_test.sh --scenario issue_to_impl`) PR #2325
+    fix_delta (P0-2): `number` is additionally recorded (when the caller
+    passes one) so a consumer can confirm CAUSALLY that a `gh issue view
+    <specific number>` call happened -- not merely that SOME `issue view`
+    call happened at some point -- without requiring exact-argv/exact-
+    ordering assertions on the rest of the trace.
     """
     calls = state.setdefault("calls", [])
-    calls.append({"operation": operation, "repo": repo, "subcommand": subcommand})
+    entry = {"operation": operation, "repo": repo, "subcommand": subcommand}
+    if number is not None:
+        entry["number"] = number
+    calls.append(entry)
 
 
 def _extract_flag(args, flag):
@@ -176,6 +210,7 @@ def main() -> int:
                     "url": info["url"],
                     "body": info.get("body", ""),
                     "state": info.get("state", "open"),
+                    "labels": info.get("labels", []),
                 }
             )
         print(json.dumps(out))
@@ -203,7 +238,11 @@ def main() -> int:
     if args[:2] == ["issue", "view"]:
         number = args[2] if len(args) > 2 and not args[2].startswith("-") else None
         repo = _extract_flag(args, "--repo")
-        _record_call(state, "issue_view", repo, ["issue", "view"])
+        # Issue #2278 PR #2325 fix_delta (P0-2): record the SPECIFIC issue
+        # number in the call trace (not just "some issue_view call
+        # happened"), so a consumer can confirm a `gh issue view <N>` call
+        # against a specific fixture Issue genuinely occurred.
+        _record_call(state, "issue_view", repo, ["issue", "view"], number=number)
         _save(state_path, state)
         info = state["issues"].get(str(number)) if number else None
         if info is None or (repo is not None and info.get("repo") != repo):
@@ -215,7 +254,24 @@ def main() -> int:
             "url": info.get("url"),
             "body": info.get("body", ""),
             "state": info.get("state", "open"),
+            # Issue #2278 AC3: additionally surface `labels` (when present in
+            # seeded/created state) so a live `gh issue view ... --json
+            # title,body,labels,comments` reader (the `implement-issue` /
+            # `issue-contract-review` skill shape) observes the same field
+            # set real `gh` would return, instead of a silently-absent key.
+            "labels": info.get("labels", []),
         }
+        json_fields_raw = _extract_flag(args, "--json")
+        requested_fields = set(json_fields_raw.split(",")) if json_fields_raw else set()
+        if not json_fields_raw or "comments" in requested_fields:
+            # Issue #2278 PR #2325 fix_delta (P1-2): a COMBINED `--json
+            # title,body,labels,comments` flag is a single argv token, so
+            # the "comments" in args" exact-token check above (kept for
+            # backward compatibility with its existing callers) never fires
+            # for it -- the generic payload previously silently omitted
+            # `comments` in that case. Real `gh issue view --json ...`
+            # always includes exactly the fields the caller asked for.
+            payload["comments"] = state.get("comments", {}).get(str(number), [])
         print(json.dumps(payload))
         return 0
 

@@ -71,6 +71,84 @@ for _arg in "$@"; do
   _prev_arg="$_arg"
 done
 
+# --- Issue #2278 AC2-AC11: `--scenario issue_to_impl` mode + generalized
+# --scenario validation. AC11: an unknown --scenario value is rejected with
+# exit 2 immediately (before any evidence directory/file is created) and
+# NEVER falls back to the default smoke scenario below.
+#
+# PR #2325 fix_delta (P1-4): the previous "record the value that FOLLOWS the
+# flag, whatever it is" two-pass scan silently accepted a MISSING flag value
+# (the flag was simply the last token, or its "value" was actually the next
+# recognized flag) and silently accepted DUPLICATE flags (last write wins,
+# with no rejection). This is now a single strict while/shift loop: a
+# missing value or a duplicate --scenario/--fixture/--evidence-out is
+# rejected with exit 2, matching the unknown-scenario-value contract below.
+# This loop is the LAST consumer of "$@" in this script (verified: no code
+# after this point reads $1/$@), so shifting it away here is safe. ---
+ISSUE_TO_IMPL_SCENARIO=false
+SCENARIO_VALUE=""
+FIXTURE_ARG_PATH=""
+EVIDENCE_OUT_ARG_PATH=""
+_scenario_flag_seen=false
+_fixture_flag_seen=false
+_evidence_out_flag_seen=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --scenario)
+      if [ "$_scenario_flag_seen" = "true" ]; then
+        echo "FAIL: --scenario specified more than once. Refusing to guess which value applies (Issue #2278 PR #2325 fix_delta P1-4)." >&2
+        exit 2
+      fi
+      _scenario_flag_seen=true
+      if [ $# -lt 2 ]; then
+        echo "FAIL: --scenario requires a value." >&2
+        exit 2
+      fi
+      SCENARIO_VALUE="$2"
+      shift 2
+      ;;
+    --fixture)
+      if [ "$_fixture_flag_seen" = "true" ]; then
+        echo "FAIL: --fixture specified more than once. Refusing to guess which value applies (Issue #2278 PR #2325 fix_delta P1-4)." >&2
+        exit 2
+      fi
+      _fixture_flag_seen=true
+      if [ $# -lt 2 ]; then
+        echo "FAIL: --fixture requires a value." >&2
+        exit 2
+      fi
+      FIXTURE_ARG_PATH="$2"
+      shift 2
+      ;;
+    --evidence-out)
+      if [ "$_evidence_out_flag_seen" = "true" ]; then
+        echo "FAIL: --evidence-out specified more than once. Refusing to guess which value applies (Issue #2278 PR #2325 fix_delta P1-4)." >&2
+        exit 2
+      fi
+      _evidence_out_flag_seen=true
+      if [ $# -lt 2 ]; then
+        echo "FAIL: --evidence-out requires a value." >&2
+        exit 2
+      fi
+      EVIDENCE_OUT_ARG_PATH="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [ -n "$SCENARIO_VALUE" ]; then
+  case "$SCENARIO_VALUE" in
+    issue_create) : ;;
+    issue_to_impl) ISSUE_TO_IMPL_SCENARIO=true ;;
+    *)
+      echo "FAIL: unknown --scenario value '${SCENARIO_VALUE}' (known values: issue_create, issue_to_impl). Refusing to fall back to the default smoke scenario (Issue #2278 AC11)." >&2
+      exit 2
+      ;;
+  esac
+fi
+
 SELF_PATH=$0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
 # shellcheck source=./lib.sh
@@ -279,6 +357,62 @@ ISSUE_CREATE_READBACK_PY_EOF
   exit 1
 fi
 
+# --- Issue #2278 fix_delta (PR #2325 CI failure repair): P1-1 dirty-HEAD /
+#     fixture-SHA256 integrity gate for `--scenario issue_to_impl`. This
+#     MUST run BEFORE the shared binary-availability SKIP gate immediately
+#     below -- it is a deterministic precondition that does not depend on
+#     whether a `claude` binary is installed on this runner. Previously this
+#     check lived only inside the later `ISSUE_TO_IMPL_SCENARIO` block
+#     (after the shared gate), so on CI runners without `claude` the shared
+#     gate short-circuited with `exit 77` (SKIP) before this check was ever
+#     reached, masking a dirty SUT worktree / corrupted fixtures instead of
+#     failing closed. The fixture path / SHA-256 values resolved here are
+#     plain shell globals and are re-used (not re-computed) by the later
+#     `ISSUE_TO_IMPL_SCENARIO` block further down this same script. ---
+if [ "$ISSUE_TO_IMPL_SCENARIO" = "true" ]; then
+  ISSUE_TO_IMPL_FIXTURE_PATH="${FIXTURE_ARG_PATH:-$SCRIPT_DIR/tests/fixtures/issue-2230-equivalent/issue.json}"
+  ISSUE_TO_IMPL_FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$ISSUE_TO_IMPL_FIXTURE_PATH")" 2>/dev/null && pwd -P)
+  ISSUE_TO_IMPL_EVIDENCE_FILE="${EVIDENCE_OUT_ARG_PATH:-${EVIDENCE_DIR}/issue-to-impl-${TIMESTAMP}.json}"
+  ISSUE_TO_IMPL_PROMPT_PATH="${ISSUE_TO_IMPL_FIXTURE_DIR}/prompt.md"
+  ISSUE_TO_IMPL_EXPECTED_PHASES_PATH="${ISSUE_TO_IMPL_FIXTURE_DIR}/expected-phases.json"
+
+  if [ ! -f "$ISSUE_TO_IMPL_FIXTURE_PATH" ] || [ ! -f "$ISSUE_TO_IMPL_PROMPT_PATH" ] || [ ! -f "$ISSUE_TO_IMPL_EXPECTED_PHASES_PATH" ]; then
+    printf '{"schema":"ISSUE_TO_IMPL_E2E_RESULT_V1","scenario":"issue_to_impl","test_verdict":"fail","terminal_result":null,"reason_code":"fixture_missing","reached_phase":null,"phase_trace":[],"resume_from":null,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"claude_code_version":"unknown","proxy_version":"%s"}}\n' \
+      "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_PROXY_VERSION" > "$ISSUE_TO_IMPL_EVIDENCE_FILE"
+    echo "FAIL: issue_to_impl fixture が見つかりません（${ISSUE_TO_IMPL_FIXTURE_PATH} / prompt.md / expected-phases.json）。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
+    exit 1
+  fi
+
+  ISSUE_TO_IMPL_PROMPT_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_PROMPT_PATH")
+  ISSUE_TO_IMPL_ISSUE_JSON_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_FIXTURE_PATH")
+  ISSUE_TO_IMPL_EXPECTED_PHASES_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_EXPECTED_PHASES_PATH")
+
+  # --- P1-1: enforce (not just record) clean integration HEAD + fixture
+  #     SHA-256 integrity BEFORE any binary-availability check, and BEFORE
+  #     Claude Code is ever launched. This is the single live copy of this
+  #     gate; the later `ISSUE_TO_IMPL_SCENARIO` block does not re-check it
+  #     (it can only be reached after this gate already passed). ---
+  ISSUE_TO_IMPL_EARLY_GATE_OK=true
+  ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE="unknown"
+  if ! printf '%s' "$SUT_GIT_HEAD" | grep -Eq '^[0-9a-f]{40}$'; then
+    ISSUE_TO_IMPL_EARLY_GATE_OK=false
+    ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE="sut_git_head_not_40_char_sha"
+  elif [ "$SUT_GIT_DIRTY" != "false" ]; then
+    ISSUE_TO_IMPL_EARLY_GATE_OK=false
+    ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE="sut_git_dirty"
+  elif [ -z "$ISSUE_TO_IMPL_PROMPT_SHA256" ] || [ -z "$ISSUE_TO_IMPL_ISSUE_JSON_SHA256" ] || [ -z "$ISSUE_TO_IMPL_EXPECTED_PHASES_SHA256" ]; then
+    ISSUE_TO_IMPL_EARLY_GATE_OK=false
+    ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE="fixture_sha256_empty"
+  fi
+
+  if [ "$ISSUE_TO_IMPL_EARLY_GATE_OK" != "true" ]; then
+    printf '{"schema":"ISSUE_TO_IMPL_E2E_RESULT_V1","scenario":"issue_to_impl","test_verdict":"fail","terminal_result":"human_judgment_required","reason_code":"%s","reached_phase":null,"phase_trace":[],"resume_from":null,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"claude_code_version":"unknown","proxy_version":"%s"}}\n' \
+      "$ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE" "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_PROXY_VERSION" > "$ISSUE_TO_IMPL_EVIDENCE_FILE"
+    echo "FAIL: issue_to_impl scenario の P1-1 preflight gate に失敗しました（reason_code=${ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE}）。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
+    exit 1
+  fi
+fi
+
 # --- 環境可用性判定（バイナリ / ChatGPT subscription 認証）。ディレクトリ/設定はまだ作らない。 ---
 PREFLIGHT_ENV_JSON=$("$SCRIPT_DIR/preflight.sh" --env-only)
 PREFLIGHT_ENV_RC=$?
@@ -293,6 +427,13 @@ if [ "$PREFLIGHT_ENV_RC" -eq 3 ] || [ "$PREFLIGHT_ENV_RC" -eq 4 ]; then
       "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$SUT_LIB_SH_SHA256" "$SUT_RUNTIME_SMOKE_SHA256" \
       "$SUT_PROXY_BIN" "$SUT_PROXY_VERSION" "$SUT_PROXY_SHA256" "$SKIP_REASON" > "$EVIDENCE_FILE"
     echo "SKIP: ${SKIP_REASON} のため --spark-delegation live smoke を実行できません（fallback 実行なし）。証跡: ${EVIDENCE_FILE}"
+    exit 77
+  fi
+  if [ "$ISSUE_TO_IMPL_SCENARIO" = "true" ]; then
+    ISSUE_TO_IMPL_SKIP_EVIDENCE="${EVIDENCE_OUT_ARG_PATH:-${EVIDENCE_DIR}/issue-to-impl-${TIMESTAMP}.json}"
+    printf '{"schema":"ISSUE_TO_IMPL_E2E_RESULT_V1","scenario":"issue_to_impl","test_verdict":"skip","terminal_result":null,"reason_code":"%s","reached_phase":null,"phase_trace":[],"resume_from":null,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"claude_code_version":"unknown","proxy_version":"%s"}}\n' \
+      "$SKIP_REASON" "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_PROXY_VERSION" > "$ISSUE_TO_IMPL_SKIP_EVIDENCE"
+    echo "SKIP: ${SKIP_REASON} のため --scenario issue_to_impl live smoke を実行できません（Runtime Verification Applicability の skip_conditions に該当）。証跡: ${ISSUE_TO_IMPL_SKIP_EVIDENCE}"
     exit 77
   fi
   printf '{"schema":"CLAUDE_GPT_SMOKE_RESULT_V1","status":"skip","reason":"%s","preflight_env_only":%s,"generated_at":"%s","sut":{"launcher_path":"%s","repository_root":"%s","git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","lib_sh_sha256":"%s","runtime_smoke_sha256":"%s"},"proxy":{"absolute_path":"%s","version":"%s","sha256":"%s"}}\n' \
@@ -1243,6 +1384,675 @@ print("true" if d.get("invocation") else "false")
     exit 0
   fi
   echo "FAIL: --spark-delegation live Spark E2E smoke が ${SPARK_VERDICT_STATUS} でした（reason: ${SPARK_VERDICT_REASON}）。証跡: ${EVIDENCE_FILE}"
+  exit 1
+fi
+
+# =========================================================================
+# Issue #2278 AC2-AC11: `--scenario issue_to_impl` mode
+#
+# PR #2325 fix_delta (REQUEST_CHANGES, reviewed_head_sha
+# 4937a1b9225a68faec34c20ae553b4e914dc6dee): this scenario's scope claim is
+# NARROWED per the reviewer's own accepted "最小修正構成" --
+#   workflow-start preflight -> live fixture readback -> root-router
+#   implementation-entry probe
+# `issue_contract_repair` / `fresh_review` / full "E2E" wording are retired;
+# phases below are renamed to `fixture_contract_shape_check` /
+# `live_fixture_readback` to match what they actually verify (P0-2). This
+# scenario is NOT a substitute for actually running `issue-contract-review`
+# against a fully faked GitHub environment -- it is a bounded liveness +
+# wiring probe of five specific hand-offs:
+#
+#   1. workflow_capability_preflight -- now delegates decision
+#      classification to the SAME canonical `workflow_start_entry.run()`
+#      function `command_registry.py`'s bare `preflight.run` reaches in
+#      production (Issue #2311), instead of shelling out to the raw
+#      `workflow_capability_preflight.py` producer and re-implementing a
+#      looser `decision == "blocked"` string comparison (P0-1/P0-4 fix).
+#      `invoke_inner_preflight_fn` is replaced with a call-counting spy so
+#      this phase classifies ready/degraded/blocked/malformed using
+#      production's own fail-closed logic WITHOUT actually executing the
+#      much heavier `run_refinement_preflight.py` chain end-to-end against a
+#      hand-built fake GitHub environment -- that remains separate, heavier
+#      scope (the reviewer explicitly accepts narrowing when the full chain
+#      is too costly to fake: "実 issue-contract-review を fake GitHub 上で
+#      動かす対応が重すぎる場合は…").
+#   2. spark_delegation -- always not_applicable (this scenario never
+#      declares a Spark requirement; unchanged).
+#   3. fixture_contract_shape_check (was issue_contract_repair) -- a purely
+#      static substring check of the fixture Issue body against the 5
+#      section headings `issue-contract-review` itself inspects FIRST. This
+#      does NOT run `issue-contract-review` (no dependency/VC-preflight/
+#      AC-VC-mapping/runtime-verification-applicability/worktree-collision/
+#      product-spec checks) and must never be described as such.
+#   4. live_fixture_readback (was fresh_review) -- one real `claude`
+#      invocation via `launch.sh`, using `--output-format json` (a
+#      structured envelope instead of raw free-text stdout) AND a
+#      `fake_gh.py` call-trace check that `gh issue view <fixture issue
+#      number>` against the fixture repo genuinely happened during that
+#      invocation. A marker string alone -- even inside the structured JSON
+#      envelope -- is never sufficient; the call trace is the causal proof
+#      that Bash/`gh` tool-use actually occurred (P0-2 fix).
+#   5. impl_review_loop_entry -- now genuinely calls
+#      `root_entry_router.run_root_transition()` (the actual production root
+#      entry point), using the existing `FileBackedFakeGitHubEntryTransport`
+#      / canned-contract-reviewer test seams and a no-op call-counting spy
+#      for `invoke_step1`, instead of a harness-synthesized
+#      `expected_block` the moment phase 4's marker was observed (P0-3 fix).
+#      No real git worktree, branch, or PR is ever created by this phase.
+#      When the live route resolves to `invoke_impl_review_loop` and the
+#      spy was actually invoked exactly once, `terminal_result` is the more
+#      precise `implementation_not_authorized` (this harness deliberately
+#      stops short of real mutation) rather than the vaguer `blocked`
+#      (reviewer's explicit suggestion).
+#
+# Additional fix_delta items:
+#   - P1-1: `git_head` (40-char sha) / `git_dirty` (must be `false`) /
+#     the 3 fixture SHA-256 values are now ENFORCED before Claude Code is
+#     ever launched (previously only recorded in evidence, never gating).
+#   - P1-3: `expected-phases.json` is now loaded and used as a runtime
+#     oracle -- exact phase order, allowed status values, `reached_phase`
+#     coherence, and terminal_result/last-phase-status coherence are all
+#     checked BEFORE `test_verdict: pass` can be emitted (previously only
+#     SHA-256'd into evidence and never consulted).
+#   - evidence JSON is now built with Python's `json.dumps` (embedded
+#     Python, not shell `printf` string interpolation) and re-parsed from
+#     disk before this scenario exits, so a malformed evidence write fails
+#     closed instead of silently shipping unparsable JSON.
+#
+# terminal_result（ISSUE_TO_IMPL_E2E_RESULT_V1.terminal_result, Issue #2278
+# 本文で定義された typed terminal result の全集合）:
+#   draft_pr_ready | blocked | human_judgment_required | implementation_not_authorized
+# 本 smoke harness は実 mutation を実行しないため `draft_pr_ready` は現行
+# 実装では到達しない（phase 5 は `implementation_not_authorized` / `blocked`
+# のいずれかで終端する）。
+#
+# 単独の早期 blocked（phase 1-4 で terminal に達した場合）は Issue #2278
+# 本文 fallback_policy の指示どおり PASS へ昇格させない（AC4）。
+# =========================================================================
+if [ "$ISSUE_TO_IMPL_SCENARIO" = "true" ]; then
+  # NOTE: ISSUE_TO_IMPL_FIXTURE_PATH / _FIXTURE_DIR / _EVIDENCE_FILE /
+  # _PROMPT_PATH / _EXPECTED_PHASES_PATH, the 3 fixture SHA-256 values, and
+  # the fixture-missing / P1-1 dirty-HEAD-and-fixture-integrity gate itself
+  # were already resolved and enforced earlier in this script (before the
+  # shared binary-availability SKIP gate) -- see the "Issue #2278 fix_delta"
+  # block above. Reaching this point means that gate already PASSed, so it
+  # is intentionally not re-checked here (single live copy of the gate
+  # avoids two copies disagreeing).
+  ISSUE_TO_IMPL_CLAUDE_BIN=$(claude_gpt_resolve_claude_bin)
+  ISSUE_TO_IMPL_CLAUDE_CODE_VERSION="unknown"
+  if [ -n "$ISSUE_TO_IMPL_CLAUDE_BIN" ]; then
+    ISSUE_TO_IMPL_CLAUDE_CODE_VERSION=$("$ISSUE_TO_IMPL_CLAUDE_BIN" --version 2>/dev/null | head -n1)
+    if [ -z "$ISSUE_TO_IMPL_CLAUDE_CODE_VERSION" ]; then
+      ISSUE_TO_IMPL_CLAUDE_CODE_VERSION="unknown"
+    fi
+  fi
+
+  ISSUE_TO_IMPL_WORKDIR=$(mktemp -d)
+  FAKE_GH_FIXTURE="$SCRIPT_DIR/tests/fixtures/fake_gh.py"
+  FAKE_GH_STATE="${ISSUE_TO_IMPL_WORKDIR}/fake_gh_state.json"
+  FAKE_BIN_DIR="${ISSUE_TO_IMPL_WORKDIR}/fake-bin"
+  mkdir -p "$FAKE_BIN_DIR"
+  FAKE_GH_WRAPPER="${FAKE_BIN_DIR}/gh"
+  cat > "$FAKE_GH_WRAPPER" <<FAKE_GH_WRAPPER_ITI_EOF
+#!/bin/sh
+exec python3 "$FAKE_GH_FIXTURE" "\$@"
+FAKE_GH_WRAPPER_ITI_EOF
+  chmod +x "$FAKE_GH_WRAPPER"
+
+  ISSUE_TO_IMPL_PHASE_TRACE_FILE="${ISSUE_TO_IMPL_WORKDIR}/phase_trace.jsonl"
+  : > "$ISSUE_TO_IMPL_PHASE_TRACE_FILE"
+  _iti_add_phase() {
+    printf '{"phase":"%s","status":"%s"}\n' "$1" "$2" >> "$ISSUE_TO_IMPL_PHASE_TRACE_FILE"
+  }
+
+  # reached_phase/terminal_result are kept as PLAIN (unquoted) shell strings
+  # throughout this scenario -- empty string means JSON null. They are only
+  # ever JSON-encoded once, by the embedded-Python evidence builder at the
+  # very end (P0-5 style fix: no more manual printf JSON-string quoting).
+  ISSUE_TO_IMPL_TERMINAL_RESULT=""
+  ISSUE_TO_IMPL_REACHED_PHASE=""
+  ISSUE_TO_IMPL_REASON_CODE="unknown"
+  ISSUE_TO_IMPL_TEST_VERDICT="fail"
+
+  # --- P1-1 gate already enforced earlier (see NOTE above); this flag is
+  #     kept only so the surrounding if/else control flow below (Phase 1-5)
+  #     is unchanged. ---
+  ISSUE_TO_IMPL_PREFLIGHT_GATE_OK=true
+
+  if [ "$ISSUE_TO_IMPL_PREFLIGHT_GATE_OK" != "true" ]; then
+    ISSUE_TO_IMPL_TERMINAL_RESULT="human_judgment_required"
+  else
+    # --- Fixture issue number is needed by BOTH Phase 1 (capability
+    #     request bookkeeping) and Phase 5 (root-router probe), so it is
+    #     resolved once, up front, instead of being re-derived per phase. ---
+    ISSUE_TO_IMPL_FIXTURE_ISSUE_NUMBER=$(python3 -c '
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+issues = data.get("issues", {})
+print(next(iter(issues.keys())) if issues else "")
+' "$ISSUE_TO_IMPL_FIXTURE_PATH")
+
+    if [ -z "$ISSUE_TO_IMPL_FIXTURE_ISSUE_NUMBER" ]; then
+      ISSUE_TO_IMPL_TERMINAL_RESULT="human_judgment_required"
+      ISSUE_TO_IMPL_REASON_CODE="fixture_issue_missing"
+    else
+      # --- Phase 1: workflow_capability_preflight -- canonical
+      #     `preflight.run` first-hop via `workflow_start_entry.run()`
+      #     (P0-1/P0-4 fix; see block comment above). ---
+      ISSUE_TO_IMPL_PLANNED_OPS_FILE="${ISSUE_TO_IMPL_WORKDIR}/planned_operations.json"
+      cat > "$ISSUE_TO_IMPL_PLANNED_OPS_FILE" <<'PLANNED_OPS_ITI_EOF'
+[
+  {"phase": "fixture_contract_shape_check", "actor_role": "issue-refinement-loop", "operation": "issue_comment", "requires_mutation": true},
+  {"phase": "impl_review_loop_entry", "actor_role": "open-pr", "operation": "pr_create", "requires_mutation": true}
+]
+PLANNED_OPS_ITI_EOF
+
+      ISSUE_TO_IMPL_SKILLS_SCRIPTS_DIR="${SUT_REPO_ROOT}/.claude/skills/issue-refinement-loop/scripts"
+
+      ISSUE_TO_IMPL_WSE_JSON=$(FAKE_GH_AUTH_OK=1 FAKE_GH_REPO_READ_OK=1 FAKE_GH_STATE="$FAKE_GH_STATE" PATH="${FAKE_BIN_DIR}:${PATH}" \
+        python3 - "$ISSUE_TO_IMPL_PLANNED_OPS_FILE" "$ISSUE_TO_IMPL_SKILLS_SCRIPTS_DIR" "$ISSUE_TO_IMPL_FIXTURE_ISSUE_NUMBER" "squne121/loop-protocol" 2>"${ISSUE_TO_IMPL_WORKDIR}/workflow_start_entry.stderr.log" <<'WORKFLOW_START_ENTRY_ITI_PY_EOF'
+import json
+import sys
+
+planned_ops_path, skills_scripts_dir, issue_number, repo = sys.argv[1:5]
+issue_number = int(issue_number)
+
+sys.path.insert(0, skills_scripts_dir)
+import workflow_start_entry as wse  # noqa: E402
+
+with open(planned_ops_path, encoding="utf-8") as fh:
+    planned_operations_json = fh.read()
+
+# Counting spy: proves `workflow_start_entry.run()`'s OWN ready/degraded
+# branch was reached (i.e. its own fail-closed classification, not a shell
+# re-implementation, decided to proceed) without actually executing the
+# much heavier `run_refinement_preflight.py` chain end-to-end (P0-1
+# module-level comment; same idiom as Phase 5's root_entry_router spy).
+inner_calls = []
+
+
+def _spy_invoke_inner_preflight(*, issue_number, repo):
+    inner_calls.append({"issue_number": issue_number, "repo": repo})
+    return 0
+
+
+result, exit_code = wse.run(
+    issue_number=issue_number,
+    repo=repo,
+    spark_mode=None,
+    spark_fallback="forbidden",
+    planned_operations_json=planned_operations_json,
+    invoke_inner_preflight_fn=_spy_invoke_inner_preflight,
+)
+print(json.dumps({
+    "result": result,
+    "exit_code": exit_code,
+    "inner_preflight_spy_call_count": len(inner_calls),
+}))
+WORKFLOW_START_ENTRY_ITI_PY_EOF
+)
+      ISSUE_TO_IMPL_WSE_RC=$?
+      ISSUE_TO_IMPL_WSE_STATUS=$(printf '%s' "$ISSUE_TO_IMPL_WSE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["status"])' 2>/dev/null || echo "")
+      ISSUE_TO_IMPL_WSE_DECISION=$(printf '%s' "$ISSUE_TO_IMPL_WSE_JSON" | python3 -c 'import json,sys; v=json.load(sys.stdin)["result"]["decision"]; print(v if v is not None else "")' 2>/dev/null || echo "")
+
+      if [ "$ISSUE_TO_IMPL_WSE_RC" -ne 0 ] || [ -z "$ISSUE_TO_IMPL_WSE_STATUS" ]; then
+        _iti_add_phase "workflow_capability_preflight" "failed"
+        ISSUE_TO_IMPL_REACHED_PHASE="workflow_capability_preflight"
+        ISSUE_TO_IMPL_TERMINAL_RESULT="human_judgment_required"
+        ISSUE_TO_IMPL_REASON_CODE="workflow_start_entry_execution_error"
+      else
+        _iti_add_phase "workflow_capability_preflight" "completed"
+
+        # --- Phase 2: spark_delegation（本シナリオでは常に not_applicable） ---
+        _iti_add_phase "spark_delegation" "not_applicable"
+
+        # `status` is a closed 3-value enum produced by
+        # `workflow_start_entry._compact_result()`: "blocked" |
+        # "ready" | "inner_preflight_failed" (unreachable here since the
+        # spy always returns 0). Exhaustive case/esac -- any OTHER value
+        # (a wiring regression in this heredoc itself, or a future schema
+        # change) explicitly fails closed instead of silently proceeding
+        # (P0-4 fix: no more open-ended "not exactly the string blocked"
+        # fallthrough).
+        case "$ISSUE_TO_IMPL_WSE_STATUS" in
+          blocked)
+            ISSUE_TO_IMPL_REACHED_PHASE="workflow_capability_preflight"
+            ISSUE_TO_IMPL_TERMINAL_RESULT="blocked"
+            ISSUE_TO_IMPL_REASON_CODE="workflow_capability_preflight_blocked:${ISSUE_TO_IMPL_WSE_DECISION:-unknown}"
+            ;;
+          ready)
+            ISSUE_TO_IMPL_PHASE1_READY=true
+            ;;
+          *)
+            ISSUE_TO_IMPL_REACHED_PHASE="workflow_capability_preflight"
+            ISSUE_TO_IMPL_TERMINAL_RESULT="human_judgment_required"
+            ISSUE_TO_IMPL_REASON_CODE="workflow_start_entry_unexpected_status:${ISSUE_TO_IMPL_WSE_STATUS}"
+            ;;
+        esac
+
+        if [ "${ISSUE_TO_IMPL_PHASE1_READY:-false}" = "true" ]; then
+          # --- Phase 3: fixture_contract_shape_check (was
+          #     issue_contract_repair) -- deterministic, static substring
+          #     check of the fixture Issue body. This is NOT
+          #     issue-contract-review (P0-2). ---
+          ISSUE_TO_IMPL_CONTRACT_JSON=$(python3 - "$ISSUE_TO_IMPL_FIXTURE_PATH" <<'CONTRACT_CHECK_ITI_PY_EOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    data = json.load(fh)
+issues = data.get("issues", {})
+if not issues:
+    print(json.dumps({"ok": False, "missing": ["issues"], "issue_number": None}))
+else:
+    number, info = next(iter(issues.items()))
+    body = info.get("body", "")
+    required = [
+        "## Outcome",
+        "## Acceptance Criteria",
+        "## Verification Commands",
+        "## Allowed Paths",
+        "## Stop Conditions",
+    ]
+    missing = [h for h in required if h not in body]
+    print(json.dumps({"ok": len(missing) == 0, "missing": missing, "issue_number": int(number)}))
+CONTRACT_CHECK_ITI_PY_EOF
+)
+          ISSUE_TO_IMPL_CONTRACT_OK=$(printf '%s' "$ISSUE_TO_IMPL_CONTRACT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ok"])' 2>/dev/null || echo False)
+
+          if [ "$ISSUE_TO_IMPL_CONTRACT_OK" != "True" ]; then
+            _iti_add_phase "fixture_contract_shape_check" "expected_block"
+            ISSUE_TO_IMPL_REACHED_PHASE="fixture_contract_shape_check"
+            ISSUE_TO_IMPL_TERMINAL_RESULT="blocked"
+            ISSUE_TO_IMPL_REASON_CODE="fixture_contract_shape_incomplete"
+          else
+            _iti_add_phase "fixture_contract_shape_check" "completed"
+
+            # --- Phase 4: live_fixture_readback (was fresh_review) -- one
+            #     real `claude` invocation via `launch.sh`, structured JSON
+            #     output, AND a fake_gh.py call-trace check that `gh issue
+            #     view <fixture issue number>` genuinely happened (P0-2). ---
+            ISSUE_TO_IMPL_PROMPT_TEXT=$(cat "$ISSUE_TO_IMPL_PROMPT_PATH")
+            ISSUE_TO_IMPL_STDERR_LOG="${ISSUE_TO_IMPL_WORKDIR}/launch.stderr.log"
+            ISSUE_TO_IMPL_CLAUDE_OUTPUT=$(FAKE_GH_STATE="$FAKE_GH_STATE" FAKE_GH_SEED_ISSUES_PATH="$ISSUE_TO_IMPL_FIXTURE_PATH" PATH="${FAKE_BIN_DIR}:${PATH}" \
+              "$SCRIPT_DIR/launch.sh" -- -p "$ISSUE_TO_IMPL_PROMPT_TEXT" --output-format json --no-session-persistence \
+              2>"$ISSUE_TO_IMPL_STDERR_LOG")
+            ISSUE_TO_IMPL_LAUNCH_RC=$?
+            ISSUE_TO_IMPL_CLAUDE_OUTPUT_FILE="${ISSUE_TO_IMPL_WORKDIR}/claude_output.raw"
+            printf '%s' "$ISSUE_TO_IMPL_CLAUDE_OUTPUT" > "$ISSUE_TO_IMPL_CLAUDE_OUTPUT_FILE"
+
+            ISSUE_TO_IMPL_READBACK_JSON=$(python3 - "$ISSUE_TO_IMPL_FIXTURE_ISSUE_NUMBER" "squne121/loop-protocol" "$FAKE_GH_STATE" "$ISSUE_TO_IMPL_CLAUDE_OUTPUT_FILE" <<'LIVE_FIXTURE_READBACK_ITI_PY_EOF'
+import json
+import re
+import sys
+
+fixture_issue_number, repo, fake_gh_state_path, claude_output_path = sys.argv[1:5]
+with open(claude_output_path, encoding="utf-8") as fh:
+    raw_stdout = fh.read()
+
+marker_issue = None
+marker_complete = None
+structured_output_ok = False
+try:
+    envelope = json.loads(raw_stdout)
+except (json.JSONDecodeError, ValueError):
+    envelope = None
+
+# Claude Code `--output-format json` (non-interactive, as invoked here via
+# `launch.sh`) emits EITHER a single top-level result object, or a JSON
+# ARRAY of the full session's structured events (system/assistant/user/
+# result), depending on invocation mode -- observed empirically to be the
+# latter shape in this harness's launch path. Normalize both shapes to the
+# one `type: "result"` event, which is the schema-known field carrying the
+# final assistant text (`result`) and the `is_error` flag.
+result_event = None
+if isinstance(envelope, dict):
+    result_event = envelope
+elif isinstance(envelope, list):
+    for item in envelope:
+        if isinstance(item, dict) and item.get("type") == "result":
+            result_event = item
+            break
+
+if result_event is not None:
+    # Extracting the deterministic marker from THIS isolated, schema-known
+    # field is more precise than the previous naive regex-over-raw-stdout
+    # approach (which could match spurious text anywhere in a raw stream)
+    # -- but, per the review, structured output alone still does not prove
+    # tool execution happened, hence the separate call-trace check below.
+    result_text = result_event.get("result")
+    if isinstance(result_text, str):
+        structured_output_ok = result_event.get("is_error") is not True
+        m = re.search(
+            r"ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=(\d+) contract_complete=(true|false)",
+            result_text,
+        )
+        if m:
+            marker_issue = m.group(1)
+            marker_complete = m.group(2)
+
+call_trace_ok = False
+try:
+    with open(fake_gh_state_path, encoding="utf-8") as fh:
+        state = json.load(fh)
+    for call in state.get("calls", []):
+        if (
+            call.get("operation") == "issue_view"
+            and call.get("repo") == repo
+            and str(call.get("number")) == fixture_issue_number
+        ):
+            call_trace_ok = True
+            break
+except (OSError, json.JSONDecodeError, ValueError):
+    call_trace_ok = False
+
+print(json.dumps({
+    "envelope_parsed": envelope is not None,
+    "structured_output_ok": structured_output_ok,
+    "marker_issue": marker_issue,
+    "marker_complete": marker_complete,
+    "call_trace_ok": call_trace_ok,
+}))
+LIVE_FIXTURE_READBACK_ITI_PY_EOF
+)
+            ISSUE_TO_IMPL_READBACK_ENVELOPE_PARSED=$(printf '%s' "$ISSUE_TO_IMPL_READBACK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["envelope_parsed"])' 2>/dev/null || echo False)
+            ISSUE_TO_IMPL_READBACK_STRUCTURED_OK=$(printf '%s' "$ISSUE_TO_IMPL_READBACK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["structured_output_ok"])' 2>/dev/null || echo False)
+            ISSUE_TO_IMPL_READBACK_MARKER_ISSUE=$(printf '%s' "$ISSUE_TO_IMPL_READBACK_JSON" | python3 -c 'import json,sys; v=json.load(sys.stdin)["marker_issue"]; print(v if v is not None else "")' 2>/dev/null || echo "")
+            ISSUE_TO_IMPL_READBACK_MARKER_COMPLETE=$(printf '%s' "$ISSUE_TO_IMPL_READBACK_JSON" | python3 -c 'import json,sys; v=json.load(sys.stdin)["marker_complete"]; print(v if v is not None else "")' 2>/dev/null || echo "")
+            ISSUE_TO_IMPL_READBACK_CALL_TRACE_OK=$(printf '%s' "$ISSUE_TO_IMPL_READBACK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["call_trace_ok"])' 2>/dev/null || echo False)
+
+            if [ "$ISSUE_TO_IMPL_LAUNCH_RC" -eq 0 ] \
+              && [ "$ISSUE_TO_IMPL_READBACK_ENVELOPE_PARSED" = "True" ] \
+              && [ "$ISSUE_TO_IMPL_READBACK_STRUCTURED_OK" = "True" ] \
+              && [ -n "$ISSUE_TO_IMPL_READBACK_MARKER_ISSUE" ] \
+              && [ "$ISSUE_TO_IMPL_READBACK_MARKER_ISSUE" = "$ISSUE_TO_IMPL_FIXTURE_ISSUE_NUMBER" ] \
+              && [ "$ISSUE_TO_IMPL_READBACK_MARKER_COMPLETE" = "true" ] \
+              && [ "$ISSUE_TO_IMPL_READBACK_CALL_TRACE_OK" = "True" ]; then
+              _iti_add_phase "live_fixture_readback" "completed"
+
+              # --- Phase 5: impl_review_loop_entry -- genuinely calls
+              #     `root_entry_router.run_root_transition()` with a no-op
+              #     counting spy for `invoke_step1` (P0-3 fix). No real git
+              #     worktree, branch, or PR is created. ---
+              ISSUE_TO_IMPL_FAKE_TRANSPORT_FILE="${ISSUE_TO_IMPL_WORKDIR}/root_router_fake_transport.json"
+              ISSUE_TO_IMPL_FAKE_CONTRACT_REVIEW_FILE="${ISSUE_TO_IMPL_WORKDIR}/root_router_fake_contract_review.json"
+              ISSUE_TO_IMPL_ROOT_ROUTER_JSON=$(python3 - "$ISSUE_TO_IMPL_SKILLS_SCRIPTS_DIR" "$ISSUE_TO_IMPL_FIXTURE_PATH" "$ISSUE_TO_IMPL_FIXTURE_ISSUE_NUMBER" "squne121/loop-protocol" "$ISSUE_TO_IMPL_FAKE_TRANSPORT_FILE" "$ISSUE_TO_IMPL_FAKE_CONTRACT_REVIEW_FILE" <<'ROOT_ENTRY_ROUTER_ITI_PY_EOF'
+import json
+import sys
+
+skills_scripts_dir, fixture_path, issue_number, repo, fake_transport_path, fake_contract_review_path = sys.argv[1:7]
+issue_number = int(issue_number)
+
+sys.path.insert(0, skills_scripts_dir)
+import root_entry_router as rer  # noqa: E402
+
+with open(fixture_path, encoding="utf-8") as fh:
+    fixture = json.load(fh)
+body = fixture["issues"][str(issue_number)]["body"]
+body_sha256 = rer.compute_body_sha256(body)
+
+# `base_sha` is a fixed synthetic value (this is a STATIC fixture -- the
+# fake transport returns the identical body/base_sha on every fetch, so
+# there is no drift across `run_root_transition`'s internal re-fetch, and
+# `review_verdict: go` cleanly resolves to ROUTE_INVOKE on the happy path).
+fake_transport_state = {
+    "capability_ok": True,
+    "repo_identity": repo,
+    "audit_publish_ok": True,
+    "issues": {
+        str(issue_number): {
+            "body": body,
+            "base_sha": "a" * 40,
+            "identity_ok": True,
+            "fetch_ok": True,
+            "comments": [],
+        }
+    },
+}
+with open(fake_transport_path, "w", encoding="utf-8") as fh:
+    json.dump(fake_transport_state, fh)
+
+fake_contract_review = {"status": "go", "body_sha256": body_sha256}
+with open(fake_contract_review_path, "w", encoding="utf-8") as fh:
+    json.dump(fake_contract_review, fh)
+
+transport = rer.FileBackedFakeGitHubEntryTransport(fake_transport_path)
+
+
+def _fake_reviewer(**_kwargs):
+    return fake_contract_review
+
+
+spy_calls = []
+
+
+def _spy_invoke_step1():
+    spy_calls.append(True)
+
+
+result = rer.run_root_transition(
+    issue_number=issue_number,
+    repo=repo,
+    transport=transport,
+    contract_reviewer=_fake_reviewer,
+    invoke_step1=_spy_invoke_step1,
+    mode="static",
+    publish_audit=False,
+    expected_repository_identity=repo,
+)
+
+route = result["route"]["route"]
+invoked = bool(result["invoked"])
+spy_call_count = len(spy_calls)
+
+# Never silently treat "the spy was never invoked" as success: only a
+# route of `invoke_impl_review_loop` WITH exactly one spy invocation
+# counts as `completed`. Any other combination (including the
+# should-never-happen "invoked without an invoke route" case) fails
+# closed instead of being synthesized as `expected_block` (P0-3 negative
+# case: "root_entry_router callback count == 0" must not silently pass
+# when the route legitimately WAS invoke_impl_review_loop).
+if route == "invoke_impl_review_loop":
+    if invoked and spy_call_count == 1:
+        phase_status = "completed"
+        terminal_result = "implementation_not_authorized"
+        reason_code = "smoke_harness_stops_before_real_mutation_by_design"
+    else:
+        phase_status = "failed"
+        terminal_result = "human_judgment_required"
+        reason_code = "root_entry_router_spy_not_invoked_exactly_once"
+elif invoked or spy_call_count != 0:
+    phase_status = "failed"
+    terminal_result = "human_judgment_required"
+    reason_code = "root_entry_router_spy_invoked_without_invoke_route"
+else:
+    phase_status = "expected_block"
+    terminal_result = "blocked"
+    reason_code = f"root_entry_router_route_{route}"
+
+print(json.dumps({
+    "phase_status": phase_status,
+    "terminal_result": terminal_result,
+    "reason_code": reason_code,
+    "route": route,
+    "invoked": invoked,
+    "spy_call_count": spy_call_count,
+}))
+ROOT_ENTRY_ROUTER_ITI_PY_EOF
+)
+              ISSUE_TO_IMPL_ROOT_ROUTER_RC=$?
+              ISSUE_TO_IMPL_ROOT_ROUTER_PHASE_STATUS=$(printf '%s' "$ISSUE_TO_IMPL_ROOT_ROUTER_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["phase_status"])' 2>/dev/null || echo "")
+
+              if [ "$ISSUE_TO_IMPL_ROOT_ROUTER_RC" -ne 0 ] || [ -z "$ISSUE_TO_IMPL_ROOT_ROUTER_PHASE_STATUS" ]; then
+                _iti_add_phase "impl_review_loop_entry" "failed"
+                ISSUE_TO_IMPL_REACHED_PHASE="impl_review_loop_entry"
+                ISSUE_TO_IMPL_TERMINAL_RESULT="human_judgment_required"
+                ISSUE_TO_IMPL_REASON_CODE="root_entry_router_execution_error"
+              else
+                _iti_add_phase "impl_review_loop_entry" "$ISSUE_TO_IMPL_ROOT_ROUTER_PHASE_STATUS"
+                ISSUE_TO_IMPL_REACHED_PHASE="impl_review_loop_entry"
+                ISSUE_TO_IMPL_TERMINAL_RESULT=$(printf '%s' "$ISSUE_TO_IMPL_ROOT_ROUTER_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["terminal_result"])')
+                ISSUE_TO_IMPL_REASON_CODE=$(printf '%s' "$ISSUE_TO_IMPL_ROOT_ROUTER_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["reason_code"])')
+                if [ "$ISSUE_TO_IMPL_ROOT_ROUTER_PHASE_STATUS" = "completed" ] || [ "$ISSUE_TO_IMPL_ROOT_ROUTER_PHASE_STATUS" = "expected_block" ]; then
+                  ISSUE_TO_IMPL_TEST_VERDICT="pass"
+                fi
+              fi
+            else
+              _iti_add_phase "live_fixture_readback" "failed"
+              ISSUE_TO_IMPL_REACHED_PHASE="live_fixture_readback"
+              ISSUE_TO_IMPL_TERMINAL_RESULT="human_judgment_required"
+              if [ "$ISSUE_TO_IMPL_READBACK_ENVELOPE_PARSED" != "True" ]; then
+                ISSUE_TO_IMPL_REASON_CODE="live_fixture_readback_output_not_json"
+              elif [ "$ISSUE_TO_IMPL_READBACK_CALL_TRACE_OK" != "True" ]; then
+                ISSUE_TO_IMPL_REASON_CODE="live_fixture_readback_call_trace_not_observed"
+              else
+                ISSUE_TO_IMPL_REASON_CODE="live_fixture_readback_marker_not_observed"
+              fi
+              if [ -n "${CLAUDE_GPT_ISSUE_TO_IMPL_DEBUG_DIR:-}" ]; then
+                mkdir -p "$CLAUDE_GPT_ISSUE_TO_IMPL_DEBUG_DIR"
+                cp "$ISSUE_TO_IMPL_STDERR_LOG" "$CLAUDE_GPT_ISSUE_TO_IMPL_DEBUG_DIR/launch.stderr.log" 2>/dev/null || true
+                printf '%s' "$ISSUE_TO_IMPL_CLAUDE_OUTPUT" > "$CLAUDE_GPT_ISSUE_TO_IMPL_DEBUG_DIR/claude.stdout.log" 2>/dev/null || true
+              fi
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  if [ "$ISSUE_TO_IMPL_TEST_VERDICT" != "pass" ]; then
+    ISSUE_TO_IMPL_TEST_VERDICT="fail"
+  fi
+
+  # --- P1-3: load expected-phases.json as a RUNTIME ORACLE (not just
+  #     SHA-256'd into evidence) -- exact phase order, allowed status
+  #     values, reached_phase coherence, and terminal_result/last-status
+  #     coherence are all checked BEFORE test_verdict: pass can stand. ---
+  ISSUE_TO_IMPL_ORACLE_JSON=$(python3 - "$ISSUE_TO_IMPL_EXPECTED_PHASES_PATH" "$ISSUE_TO_IMPL_PHASE_TRACE_FILE" "${ISSUE_TO_IMPL_REACHED_PHASE:-}" "${ISSUE_TO_IMPL_TERMINAL_RESULT:-}" "$ISSUE_TO_IMPL_TEST_VERDICT" <<'PHASE_ORACLE_ITI_PY_EOF'
+import json
+import sys
+
+expected_path, phase_trace_path, reached_phase, terminal_result, test_verdict = sys.argv[1:6]
+
+with open(expected_path, encoding="utf-8") as fh:
+    expected = json.load(fh)
+expected_order = [p["phase"] for p in expected["phases"]]
+allowed_status_by_phase = {p["phase"]: set(p["allowed_status"]) for p in expected["phases"]}
+
+entries = []
+with open(phase_trace_path, encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if line:
+            entries.append(json.loads(line))
+
+problems = []
+observed_order = [e["phase"] for e in entries]
+if observed_order != expected_order[: len(observed_order)]:
+    problems.append(f"phase_order_mismatch:{observed_order}")
+
+for entry in entries:
+    allowed = allowed_status_by_phase.get(entry["phase"])
+    if allowed is None:
+        problems.append(f"unknown_phase:{entry['phase']}")
+    elif entry["status"] not in allowed:
+        problems.append(f"disallowed_status:{entry['phase']}:{entry['status']}")
+
+if entries:
+    last_phase = entries[-1]["phase"]
+    if reached_phase and reached_phase != last_phase:
+        problems.append(f"reached_phase_mismatch:{reached_phase}!={last_phase}")
+
+if test_verdict == "pass":
+    if not terminal_result:
+        problems.append("pass_verdict_with_empty_terminal_result")
+    if not entries or entries[-1]["status"] not in ("completed", "expected_block"):
+        problems.append("pass_verdict_with_non_terminal_last_status")
+
+print(json.dumps({"ok": len(problems) == 0, "problems": problems}))
+PHASE_ORACLE_ITI_PY_EOF
+)
+  ISSUE_TO_IMPL_ORACLE_OK=$(printf '%s' "$ISSUE_TO_IMPL_ORACLE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ok"])' 2>/dev/null || echo False)
+  if [ "$ISSUE_TO_IMPL_ORACLE_OK" != "True" ]; then
+    ISSUE_TO_IMPL_TEST_VERDICT="fail"
+    ISSUE_TO_IMPL_REASON_CODE="phase_trace_oracle_mismatch"
+  fi
+
+  # --- Evidence: built with embedded Python `json.dumps` (P0-5 style fix --
+  #     no more manual printf JSON-string interpolation), then re-parsed
+  #     from disk to confirm it is valid JSON before this scenario exits. ---
+  python3 - "$ISSUE_TO_IMPL_EVIDENCE_FILE" "$ISSUE_TO_IMPL_PHASE_TRACE_FILE" \
+    "$ISSUE_TO_IMPL_TEST_VERDICT" "${ISSUE_TO_IMPL_TERMINAL_RESULT:-}" "$ISSUE_TO_IMPL_REASON_CODE" "${ISSUE_TO_IMPL_REACHED_PHASE:-}" \
+    "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$ISSUE_TO_IMPL_CLAUDE_CODE_VERSION" "$SUT_PROXY_VERSION" "$SUT_LAUNCHER_PATH" "$SUT_REPO_ROOT" \
+    "$ISSUE_TO_IMPL_PROMPT_SHA256" "$ISSUE_TO_IMPL_ISSUE_JSON_SHA256" "$ISSUE_TO_IMPL_EXPECTED_PHASES_SHA256" <<'EVIDENCE_BUILD_ITI_PY_EOF'
+import json
+import sys
+
+(
+    evidence_path, phase_trace_path,
+    test_verdict, terminal_result, reason_code, reached_phase,
+    timestamp, git_head, git_dirty, claude_code_version, proxy_version, launcher_path, repository_root,
+    prompt_sha256, issue_json_sha256, expected_phases_sha256,
+) = sys.argv[1:17]
+
+entries = []
+with open(phase_trace_path, encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if line:
+            entries.append(json.loads(line))
+
+evidence = {
+    "schema": "ISSUE_TO_IMPL_E2E_RESULT_V1",
+    "scenario": "issue_to_impl",
+    "test_verdict": test_verdict,
+    "terminal_result": terminal_result or None,
+    "reason_code": reason_code,
+    "reached_phase": reached_phase or None,
+    "phase_trace": entries,
+    "resume_from": None,
+    "generated_at": timestamp,
+    "sut": {
+        "git_head": git_head,
+        "git_dirty": git_dirty == "true",
+        "claude_code_version": claude_code_version,
+        "proxy_version": proxy_version,
+        "launcher_path": launcher_path,
+        "repository_root": repository_root,
+        "fixtures": {
+            "prompt_md_sha256": prompt_sha256,
+            "issue_json_sha256": issue_json_sha256,
+            "expected_phases_json_sha256": expected_phases_sha256,
+        },
+    },
+}
+
+with open(evidence_path, "w", encoding="utf-8") as fh:
+    json.dump(evidence, fh)
+
+# Re-parse from disk before this scenario is allowed to report PASS/FAIL --
+# a write that produced unparsable JSON must fail closed, not ship silently.
+with open(evidence_path, encoding="utf-8") as fh:
+    json.load(fh)
+EVIDENCE_BUILD_ITI_PY_EOF
+  ISSUE_TO_IMPL_EVIDENCE_BUILD_RC=$?
+
+  rm -rf "$ISSUE_TO_IMPL_WORKDIR"
+
+  if [ "$ISSUE_TO_IMPL_EVIDENCE_BUILD_RC" -ne 0 ]; then
+    echo "FAIL: issue_to_impl scenario -- evidence JSON の生成または再parseに失敗しました。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
+    exit 1
+  fi
+
+  if [ "$ISSUE_TO_IMPL_TEST_VERDICT" = "pass" ]; then
+    echo "PASS: issue_to_impl scenario -- reached_phase=${ISSUE_TO_IMPL_REACHED_PHASE} terminal_result=${ISSUE_TO_IMPL_TERMINAL_RESULT}。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
+    exit 0
+  fi
+  echo "FAIL: issue_to_impl scenario -- reason_code=${ISSUE_TO_IMPL_REASON_CODE} reached_phase=${ISSUE_TO_IMPL_REACHED_PHASE}。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
   exit 1
 fi
 
