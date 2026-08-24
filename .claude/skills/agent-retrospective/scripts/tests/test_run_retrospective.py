@@ -50,6 +50,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import jsonschema
 import pytest
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
@@ -817,6 +818,137 @@ def test_actual_claude_json_wrapper_rejects_unexpected_shape(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
+# PR #2324 review fix_delta P0-1 regression guards + P1-2 hermetic coverage:
+# `subtype` gate must run before any `result`/`structured_output` recovery,
+# and compat recovery (`_structured_output_from_result_compat`) must only
+# ever be attempted when `structured_output` is absent or explicitly `None`.
+# ---------------------------------------------------------------------------
+
+
+def _compat_schema(tmp_path: Path) -> Path:
+    schema_path = tmp_path / "compat_schema.json"
+    schema_path.write_text(
+        json.dumps({"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}}),
+        encoding="utf-8",
+    )
+    return schema_path
+
+
+def test_fix_delta_p01_result_recovered_when_structured_output_absent(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    business_payload = {"a": "from-result-raw"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": json.dumps(business_payload),
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "ok"
+    assert result.structured_output == business_payload
+
+
+def test_fix_delta_p01_result_recovered_when_structured_output_explicit_null(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    business_payload = {"a": "from-result-fenced"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "```json\n" + json.dumps(business_payload) + "\n```",
+            "structured_output": None,
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "ok"
+    assert result.structured_output == business_payload
+
+
+def test_fix_delta_p01_non_success_subtype_never_promoted_to_ok(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    business_payload = {"a": "should-not-be-accepted"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "error_max_structured_output_retries",
+            "is_error": False,
+            "result": json.dumps(business_payload),
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "partial_result"
+    assert result.reason_code == "result_subtype_not_success:error_max_structured_output_retries"
+
+
+def test_fix_delta_p01_present_wrong_type_structured_output_never_recovers_from_result(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    business_payload = {"a": "should-not-be-recovered"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": json.dumps(business_payload),
+            "structured_output": "not-a-dict",
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "malformed_output"
+    assert result.reason_code == "missing_structured_output"
+
+
+def test_fix_delta_p01_present_dict_structured_output_takes_priority_over_result(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    dict_payload = {"a": "from-structured-output-dict"}
+    mismatched_result_payload = {"a": "from-result-should-be-ignored"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": json.dumps(mismatched_result_payload),
+            "structured_output": dict_payload,
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "ok"
+    assert result.structured_output == dict_payload
+    assert result.structured_output != mismatched_result_payload
+
+
+def test_fix_delta_p01_result_failing_schema_validation_rejected(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    # missing the required "a" field -> fails schema validation
+    non_conformant_payload = {"b": "no-required-field"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": json.dumps(non_conformant_payload),
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "malformed_output"
+    assert result.reason_code == "missing_structured_output"
+
+
+# ---------------------------------------------------------------------------
 # fix_delta gate #4: single executable entrypoint, collectors -> PublishRequest
 # ---------------------------------------------------------------------------
 
@@ -1276,10 +1408,19 @@ def test_permission_policy_is_consumed_by_runtime_and_bypass_resistant(
     rr.invoke_agent(request, runner=_runner, policy=policy)
 
     # THE SAME policy instance's denied-tool set is what the real subprocess
-    # argv carries (not merely asserted against in isolation)
+    # argv carries (not merely asserted against in isolation). Each denied
+    # tool is its own argv element -- not a single comma-joined string --
+    # matching the official Claude CLI reference for `--disallowedTools`
+    # (PR #2324 review fix_delta P1-5).
     assert "--disallowedTools" in captured["argv"]
-    disallowed_csv = captured["argv"][captured["argv"].index("--disallowedTools") + 1]
-    assert set(disallowed_csv.split(",")) == policy.denied_tools
+    argv = captured["argv"]
+    start = argv.index("--disallowedTools") + 1
+    end = start
+    while end < len(argv) and not argv[end].startswith("--"):
+        end += 1
+    disallowed_elements = argv[start:end]
+    assert set(disallowed_elements) == policy.denied_tools
+    assert len(disallowed_elements) == len(policy.denied_tools)
 
     # mutation credentials never reach the subprocess env, even though they
     # were present in the ambient environment
@@ -1868,3 +2009,82 @@ def test_compute_delta_wired_into_production_publish_path_run_cli(tmp_path: Path
         }
     ]
 
+
+
+
+# ---------------------------------------------------------------------------
+# AC4 (Issue #2301): committed scripts/schemas/ canonical JSON Schema assets
+# -- the exact files build_observer_requests()/run_cli() point --schema-dir
+# at by default (_SCRIPTS_DIR / "schemas"). Parity-checked against the
+# EvidenceBundle/Evaluation wire-contract dataclasses that are the actual
+# ground truth for the business payload shape (never a private duplicate).
+# ---------------------------------------------------------------------------
+
+_SCHEMA_DIR = _SCRIPTS_DIR / "schemas"
+
+
+def _load_schema(filename: str) -> dict[str, Any]:
+    return json.loads((_SCHEMA_DIR / filename).read_text(encoding="utf-8"))
+
+
+def test_observer_result_schema_asset_exists_and_is_valid_json_schema() -> None:
+    schema = _load_schema("observer_result_v1.schema.json")
+    jsonschema.Draft7Validator.check_schema(schema)
+
+
+def test_evaluation_result_schema_asset_exists_and_is_valid_json_schema() -> None:
+    schema = _load_schema("evaluation_result_v1.schema.json")
+    jsonschema.Draft7Validator.check_schema(schema)
+
+
+def test_observer_result_schema_required_fields_match_evidence_bundle_dataclass() -> None:
+    schema = _load_schema("observer_result_v1.schema.json")
+    dataclass_fields = {f.name for f in dataclasses.fields(rr.EvidenceBundle)}
+    assert set(schema["required"]) == dataclass_fields
+    assert set(schema["properties"].keys()) == dataclass_fields
+
+
+def test_evaluation_result_schema_required_fields_match_evaluation_dataclass() -> None:
+    schema = _load_schema("evaluation_result_v1.schema.json")
+    dataclass_fields = {f.name for f in dataclasses.fields(rr.Evaluation)}
+    assert set(schema["required"]) == dataclass_fields
+    assert set(schema["properties"].keys()) == dataclass_fields
+
+
+def test_observer_result_schema_validates_real_evidence_bundle_wire_payload() -> None:
+    schema = _load_schema("observer_result_v1.schema.json")
+    bundle = rr.EvidenceBundle(
+        run_id="run-1",
+        base_sha=_FULL_SHA,
+        source_set_digest=_DIGEST,
+        observer_id="retrospective-runtime-observer",
+        evidence_ref="evidence://x",
+        findings=[{"claim": "observed something", "claim_class": "process"}],
+    )
+    payload = json.loads(bundle.to_wire())
+    jsonschema.validate(payload, schema)
+
+
+def test_evaluation_result_schema_validates_real_evaluation_wire_payload() -> None:
+    schema = _load_schema("evaluation_result_v1.schema.json")
+    evaluation = rr.Evaluation(
+        run_id="run-1",
+        base_sha=_FULL_SHA,
+        source_set_digest=_DIGEST,
+        candidate_records=[],
+        evidence_ref="evidence://x",
+    )
+    payload = json.loads(evaluation.to_wire())
+    jsonschema.validate(payload, schema)
+
+
+def test_build_observer_requests_default_schema_dir_points_at_committed_schemas(tmp_path: Path) -> None:
+    """The `--schema-dir` default (`_SCRIPTS_DIR / "schemas"`) that
+    `run_cli()`/`main()` use in production must resolve to the exact
+    directory containing the two schema assets this Issue adds -- not a
+    stale/placeholder path."""
+    requests = rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=str(tmp_path), prompts={})
+    assert requests
+    for request in requests:
+        assert Path(request.json_schema_path) == _SCHEMA_DIR / "observer_result_v1.schema.json"
+        assert Path(request.json_schema_path).is_file()
