@@ -53,6 +53,48 @@ Step 1 起動の authority ではない。正本は
 | `implementation-worker` | write | `acceptEdits` | Read, Grep, Glob, Bash, Edit, Write, MultiEdit | — |
 | `post-merge-cleanup-worker` | cleanup | `default` | Bash, Read | Agent, Edit, Write, MultiEdit |
 
+## Claude/Codex Agent Runtime Authority（#2160 Phase 2: agent/runtime parity contract migration）
+
+`.claude/agents/*.md` を `claude-native` / `claude-gpt` 共通の実行 authority とし、`.codex/agents/*.toml` を Phase 3（#2161）までの legacy compatibility（read-only）projection とする Authority 分離を、本節を正本として明記する（Parent #2154 アーキテクチャ決定 D の再定義、2026-08-24 OWNER 敵対的レビュー `recommended_disposition: reframe_in_place` 反映）。
+
+| 次元 | Authority | 備考 |
+|---|---|---|
+| Claude Code が読む実行宣言 | `.claude/agents/*.md` | claude-native / claude-gpt 共通の Claude Code 実行 authority |
+| repository 固有の分類・mutation/delegation/output policy | `tests/fixtures/codex-agent-config/expected-runtime-contract.json` | `asset_classification` ブロックが SSOT |
+| alias から runtime model への mapping | `claude-gpt` launcher（`scripts/claude-gpt/**`） | model_alias（sonnet/haiku/opus）→ 具体 model ID の変換はここに一本化する |
+| 実際に起動された runtime/model/SubAgent | 既存 runtime-smoke evidence（PR #2176 / #2220） | `run_worktree_agent_runtime_smoke.py` |
+| Codex CLI 互換 | `.codex/agents/*.toml` | legacy read-only projection。Phase 3（#2161）まで削除しない |
+| 人間向け説明 | 本節 | Authority 分離の正本 |
+
+### Asset inventory classification（AC2, #2160）
+
+`.claude/agents/**` と `.codex/agents/**` の全 asset は
+`tests/fixtures/codex-agent-config/expected-runtime-contract.json` の
+`asset_classification` ブロックで次の 5 値のいずれかへ一意分類する:
+
+- `shared_claude_runtime` — `.claude/agents/*.md`。claude-native / claude-gpt 共通の実行 authority
+- `claude_only` — Codex 側に対応 TOML を持たない Claude 専用 SubAgent（例: `issue-design-reviewer` / `retrospective-evaluator` / `retrospective-runtime-observer`）
+- `legacy_codex_projection` — `.claude/agents/*.md` とペアの `.codex/agents/*.toml`。Phase 3（#2161）まで legacy compatibility projection として維持
+- `legacy_codex_only` — Codex CLI ネイティブ専用（対応する Claude 側 asset なし。例: `spark-skim` / `spark-worker` / `spark-deep`）
+- `experimental` — 現時点で未使用（将来の実験的 asset 用に予約）
+
+unclassified reference は 0 を維持する
+（`tests/test_agent_portability_contract.py::test_all_agent_assets_classified_no_unclassified` で機械検証）。
+
+### phase_2_compatibility ブロック（AC9, Phase 3 / #2161 への引き継ぎ）
+
+```yaml
+phase_2_compatibility:
+  codex_assets_authoritative: false
+  legacy_validator_mode: compatibility_only
+  codex_asset_deletion: forbidden
+  removal_owner: "#2161"
+```
+
+Phase 2（本 #2160）では `.codex/**` を削除しない。削除対象・consumer・compatibility shim の inventory は
+`tests/fixtures/codex-agent-config/codex_removal_inventory.json`（`CODEX_ASSET_REMOVAL_INVENTORY_V1`）に checked-in artifact として保存し、
+Phase 3（#2161, removal_owner）が読み取る。
+
 ## Codex Dispatch Guardrail（Codex ディスパッチ境界）
 
 Codex の変更操作制御は標準の隔離環境と承認機構による

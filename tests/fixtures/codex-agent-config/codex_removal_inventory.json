@@ -1,0 +1,144 @@
+{
+  "schema": "CODEX_ASSET_REMOVAL_INVENTORY_V1",
+  "generated_for_issue": "#2160",
+  "consumed_by_issue": "#2161",
+  "codex_asset_deletion": "forbidden",
+  "note": "Phase 2 (#2160) does not delete anything under .codex/**. This artifact lists, per Codex agent TOML asset, its removal-target status, known consumers, and the compatibility shim that keeps it green during the Phase 2 legacy-projection window, so Phase 3 (#2161) can plan the actual removal safely.",
+  "assets": [
+    {
+      "path": ".codex/agents/codebase-investigator.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (role/permission/tool/schema/semantic-model-class/effort projection check)"
+    },
+    {
+      "path": ".codex/agents/implementation-worker.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
+    },
+    {
+      "path": ".codex/agents/issue-creator.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
+    },
+    {
+      "path": ".codex/agents/issue-editor.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
+    },
+    {
+      "path": ".codex/agents/issue-reviewer.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
+    },
+    {
+      "path": ".codex/agents/post-merge-cleanup-worker.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
+    },
+    {
+      "path": ".codex/agents/pr-reviewer-lite.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
+    },
+    {
+      "path": ".codex/agents/pr-reviewer.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
+    },
+    {
+      "path": ".codex/agents/review-issue.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
+    },
+    {
+      "path": ".codex/agents/scope-rollup-runner.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (permission_parity excluded, see expected-runtime-contract.json)"
+    },
+    {
+      "path": ".codex/agents/test-runner.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
+    },
+    {
+      "path": ".codex/agents/web-researcher.toml",
+      "classification": "legacy_codex_projection",
+      "removal_target": true,
+      "consumers": [
+        "Codex CLI runtime (legacy compatibility only)"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
+    },
+    {
+      "path": ".codex/agents/spark-deep.toml",
+      "classification": "legacy_codex_only",
+      "removal_target": false,
+      "consumers": [
+        "Codex CLI native explicit-only @agent-spark-codex delegation"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (codex_only parity_mode)"
+    },
+    {
+      "path": ".codex/agents/spark-skim.toml",
+      "classification": "legacy_codex_only",
+      "removal_target": false,
+      "consumers": [
+        "Codex CLI native explicit-only @agent-spark-codex delegation"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (codex_only parity_mode)"
+    },
+    {
+      "path": ".codex/agents/spark-worker.toml",
+      "classification": "legacy_codex_only",
+      "removal_target": false,
+      "consumers": [
+        "Codex CLI native explicit-only @agent-spark-codex delegation"
+      ],
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (codex_only parity_mode)"
+    }
+  ]
+}

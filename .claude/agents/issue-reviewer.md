@@ -2,6 +2,7 @@
 name: issue-reviewer
 description: issue-refinement-loop の Step 2 loop worker として、review-issue skill を実行して ISSUE_REVIEW_RESULT_COMPACT_V2 を返す read-only SubAgent。Issue の mutation（gh issue edit / comment / close / reopen）を行わない。loop orchestrator からのみ呼ばれ、compact stdout（SCHEMA / STATUS / VERDICT / SUMMARY / BLOCKERS / NEXT_ACTION / MUST_READ / REVIEWED_BODY_SHA256 / ATTEMPT_ID / ARTIFACT / ARTIFACT_SHA256）を返して routing 判断を委ねる。
 model: haiku
+effort: medium
 tools:
   - Bash
   - Read

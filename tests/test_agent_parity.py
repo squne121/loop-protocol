@@ -221,7 +221,7 @@ def _write_minimal_contract(tmp_path: Path, agent_name: str = "issue-reviewer") 
             agent_name: {
                 "path": f".codex/agents/{agent_name}.toml",
                 "claude_agent_path": f".claude/agents/{agent_name}.md",
-                "claude_model": "haiku",
+                "model_alias": "haiku",
                 "claude_permission_mode": "dontAsk",
                 "model": "gpt-5.4-mini",
                 "model_reasoning_effort": "medium",

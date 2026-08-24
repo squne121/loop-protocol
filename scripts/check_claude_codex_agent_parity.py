@@ -26,8 +26,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPECTATION_PATH = REPO_ROOT / "tests/fixtures/codex-agent-config/expected-runtime-contract.json"
 CODEX_CONFIG_PATH = REPO_ROOT / ".codex/config.toml"
 
-# Agents in scope for parity check (issue-reviewer and the split Issue roles)
-PARITY_AGENTS = {"issue-reviewer", "issue-creator", "issue-editor", "scope-rollup-runner"}
+# AC6: the former 4-agent PARITY_AGENTS allowlist has been removed in-place;
+# the extended-check agent set is now resolved dynamically by
+# resolve_shared_claude_runtime_agents() from the asset inventory
+# classification (see below).
 CODEX_ONLY_ALLOWED_AGENTS = {"spark-skim", "spark-worker", "spark-deep"}
 CODEX_ONLY_PARITY_REASON = "manual_codex_spark_agent"
 CODEX_ONLY_MODEL = "gpt-5.3-codex-spark"
@@ -37,14 +39,120 @@ MUTATION_BOUNDARY_MAP = {
     "loop-protocol-readonly": "readonly",
     "loop-protocol-rtk": "issue-mutation",
     "loop-protocol-bootstrap": "repo-write",
+    "loop-protocol-web-research": "readonly",
 }
 
 # Claude permissionMode -> declared permission level
+#
+# This map is a *base* declaration only. It is NOT sufficient on its own to
+# derive `mutation_class` (Issue #2160 AC4 / re-definition review P0-3):
+# `permissionMode` is a prompt-handling policy (whether Claude Code asks
+# before running a tool), independent of the actual tool allowlist and the
+# mutation boundary of any skill the agent invokes. `derive_mutation_class()`
+# below combines this base with the declared tool set before producing the
+# final `mutation_class` / `mutation_boundary` value.
 CLAUDE_PERMISSION_LEVEL_MAP = {
     "dontAsk": "readonly",
     "acceptEdits": "issue-mutation",
     "default": "repo-write",
 }
+
+# Tools whose mere presence in an *allowed* tool set is direct evidence of
+# repo-mutation capability, regardless of permissionMode.
+MUTATION_CAPABLE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+# Tool alias normalization applied before any tool-set comparison (AC7).
+# "Task" is a historical/alternate name for the SubAgent-delegation tool
+# that this repository canonically calls "Agent".
+TOOL_ALIAS_NORMALIZE = {"Task": "Agent"}
+
+# Semantic model class: a coarse, repository-local classification of a
+# Claude model_alias / Codex model, used for role-level comparison instead
+# of exact provider-specific model ID equality (AC6).
+SEMANTIC_MODEL_CLASS_MAP = {
+    "haiku": "fast_cheap",
+    "sonnet": "balanced",
+    "opus": "deep_reasoning",
+}
+
+# Asset inventory classification enum (AC2, AC9).
+ALLOWED_CLASSIFICATIONS = {
+    "shared_claude_runtime",
+    "claude_only",
+    "legacy_codex_projection",
+    "legacy_codex_only",
+    "experimental",
+}
+
+
+class FrontmatterParseError(ValueError):
+    """Raised when Claude agent frontmatter contains unsupported YAML syntax.
+
+    AC7: unsupported syntax must fail loudly, never silently skip.
+    """
+
+
+def normalize_tool_alias(tool: str) -> str:
+    """Normalize a tool token, mapping known aliases (e.g. Task -> Agent).
+
+    Handles both bare tokens ("Task") and parameterized tokens
+    ("Task(subagent_type:...)").
+    """
+    base, _, rest = tool.partition("(")
+    normalized_base = TOOL_ALIAS_NORMALIZE.get(base, base)
+    return normalized_base if not rest else f"{normalized_base}({rest}"
+
+
+def normalize_tool_list(tools: list[str]) -> list[str]:
+    return [normalize_tool_alias(t) for t in tools]
+
+
+def derive_mutation_class(
+    permission_mode: str,
+    tools: list[str],
+    disallowed_tools: list[str],
+) -> str:
+    """Derive mutation_class from permission_mode AND the declared tool set.
+
+    AC4: mutation_class must not be derived from permissionMode alone -- it
+    is a function of (permission_mode, declared tool allowlist). This is a
+    repository-local *behavioral* contract, not a security boundary (actual
+    enforcement is PreToolUse hooks / branch protection / CI).
+
+    Rule: start from the permissionMode base declaration
+    (CLAUDE_PERMISSION_LEVEL_MAP). If base == "readonly" but the agent's
+    `tools:` allowlist actually grants a mutation-capable tool (Edit/Write/
+    MultiEdit/NotebookEdit) that is not itself explicitly denied via
+    `disallowedTools:`, the permissionMode declaration is contradicted by
+    the tool allowlist and mutation_class escalates to "repo-write".
+
+    This deliberately does NOT treat `Bash` presence alone as evidence of
+    mutation capability: in this repository, `dontAsk` + `Bash`-only agents
+    (e.g. issue-reviewer, codebase-investigator, pr-reviewer, test-runner,
+    web-researcher) are read-only by design (Bash is used only for
+    read-only `gh`/`git` query commands per each agent's declared role) and
+    that declared behavioral contract is out of scope to re-validate here
+    (see docs/dev/runtime-verification-policy.md; actual enforcement is via
+    PreToolUse hooks, not this checker). A `dontAsk` agent whose *tool
+    allowlist* additionally grants a real mutation-capable tool (e.g.
+    `tools: [Bash, Edit]`) is the concrete contradiction this function
+    detects -- so `dontAsk + Bash` is not, by itself, sufficient evidence
+    of "read_only" once a mutation-capable tool is also present.
+    """
+    base = CLAUDE_PERMISSION_LEVEL_MAP.get(permission_mode, "unknown")
+    if base != "readonly":
+        return base
+
+    tool_bases = {normalize_tool_alias(t).split("(")[0] for t in tools}
+    disallowed_bases = {normalize_tool_alias(t).split("(")[0] for t in disallowed_tools}
+
+    mutation_tools_allowed = tool_bases & MUTATION_CAPABLE_TOOLS
+    mutation_tools_denied = mutation_tools_allowed <= disallowed_bases
+
+    if mutation_tools_allowed and not mutation_tools_denied:
+        return "repo-write"
+
+    return base
 
 # Keywords in Codex developer_instructions that indicate nested delegation.
 # These are advisory prose hints only; they are not runtime capability or
@@ -129,6 +237,8 @@ class AgentParityFacts:
         delegation_intent_evidence: str = "",
         model_declaration: str | None = None,
         reasoning_effort_declaration: str | None = None,
+        semantic_model_class: str = "unknown",
+        effort_declared: str | None = None,
         evidence: list[DriftEvidence] | None = None,
         # For permission report (B7)
         claude_tools: list[str] | None = None,
@@ -153,6 +263,8 @@ class AgentParityFacts:
         # Model config (advisory; not runtime proof)
         self.model_declaration = model_declaration
         self.reasoning_effort_declaration = reasoning_effort_declaration
+        self.semantic_model_class = semantic_model_class
+        self.effort_declared = effort_declared
         # Raw evidence list
         self.evidence: list[DriftEvidence] = evidence if evidence is not None else []
         # B7: store raw tools lists for permission report
@@ -175,18 +287,25 @@ def is_codex_only_parity(expected: dict) -> bool:
     return expected.get("parity_mode") == "codex_only"
 
 
-def excludes_permission_parity(expected: dict) -> bool:
+def excludes_permission_parity(agent_name: str, expected: dict) -> bool:
+    """Return True when this agent's permission comparison is explicitly
+    allowlisted out of strict PERMISSION_BOUNDARY_001 drift comparison.
+
+    Generalized (Issue #2160 AC6) from a single scope-rollup-runner literal
+    dict comparison to any agent whose expectation entry declares
+    permission_parity: excluded with a well-formed permission_exclusion
+    record naming itself as allowlisted_agent. This does not silently widen
+    scope: every excluded agent must be individually declared in the
+    checked-in expected-runtime-contract.json fixture with a reason and a
+    follow_up_issue, which is reviewable in the PR diff.
+    """
     exclusion = expected.get("permission_exclusion")
-    return (
-        expected.get("permission_parity") == "excluded"
-        and isinstance(exclusion, dict)
-        and exclusion == {
-            "allowlisted_agent": "scope-rollup-runner",
-            "reason": "claude_auto_permission_is_not_comparable_to_codex_ephemeral_write_profile",
-            "follow_up_issue": "#1686",
-            "expires_on": "2026-12-31",
-        }
-    )
+    if expected.get("permission_parity") != "excluded" or not isinstance(exclusion, dict):
+        return False
+    required_keys = {"allowlisted_agent", "reason", "follow_up_issue", "expires_on"}
+    if not required_keys <= exclusion.keys():
+        return False
+    return exclusion.get("allowlisted_agent") == agent_name
 
 
 def validate_codex_only_expectation(agent_name: str, expected: dict) -> list[str]:
@@ -219,33 +338,113 @@ def read_toml(path: Path) -> dict:
         return tomllib.load(fh)
 
 
-def extract_frontmatter(text: str) -> dict[str, object]:
+def _strip_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("\"", "'"):
+        return value[1:-1]
+    return value
+
+
+def _parse_inline_list(value: str) -> list[str]:
+    inner = value[1:-1].strip()
+    if not inner:
+        return []
+    return [_strip_quotes(item.strip()) for item in inner.split(",") if item.strip()]
+
+
+def extract_frontmatter(text: str, source_path: str = "<unknown>") -> dict[str, object]:
+    """Parse Claude agent markdown frontmatter (`key: value` subset of YAML).
+
+    AC7: unsupported syntax raises FrontmatterParseError instead of being
+    silently skipped. Supported forms only:
+    - `key:` (starts an empty/blank value, possibly followed by `  - item`
+      bullet continuation lines)
+    - `key: value` / `key: "value"` / `key: 'value'` (scalar, optionally
+      quoted)
+    - `key: []` / `key: [a, b, "c"]` (inline list)
+    - `key: {}` (inline empty mapping -- real files use this, e.g.
+      `hooks: {}` / `mcpServers: []`)
+    - `key: >-` / `key: >` / `key: |` / `key: |-` (folded/literal block
+      scalar; subsequent indented lines up to the next 0-indent key are
+      consumed as the block body)
+    - `  - item` (bullet continuation of the most recently seen key)
+    - blank lines and full-line `#` comments
+    """
     if not text.startswith("---\n"):
         return {}
     _, _, remainder = text.partition("---\n")
-    frontmatter, _, _ = remainder.partition("\n---\n")
+    frontmatter, sep, _ = remainder.partition("\n---\n")
+    if not sep:
+        raise FrontmatterParseError(
+            f"{source_path}: frontmatter block is not terminated by a closing '---' line"
+        )
     result: dict[str, object] = {}
     current_key: str | None = None
-    for raw_line in frontmatter.splitlines():
+    lines = frontmatter.splitlines()
+    i = 0
+    n = len(lines)
+    block_scalar_headers = {"|", ">", "|-", ">-", "|+", ">+"}
+    while i < n:
+        raw_line = lines[i]
+        line_no = i + 1
         if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            i += 1
             continue
         if raw_line.startswith("  - ") and current_key:
             result.setdefault(current_key, [])
             cast_list = result[current_key]
             if isinstance(cast_list, list):
-                cast_list.append(raw_line[4:].strip())
+                cast_list.append(_strip_quotes(raw_line[4:].strip()))
+            i += 1
             continue
+        if raw_line.startswith("  ") and not raw_line.startswith("  - "):
+            raise FrontmatterParseError(
+                f"{source_path}: unsupported frontmatter syntax at line {line_no}: "
+                f"{raw_line!r} (nested mappings / non-bullet indentation are not supported)"
+            )
         if ":" not in raw_line:
-            continue
+            raise FrontmatterParseError(
+                f"{source_path}: unsupported frontmatter syntax at line {line_no}: "
+                f"{raw_line!r} (expected 'key: value')"
+            )
         key, value = raw_line.split(":", 1)
+        if key != key.strip() or not key.strip():
+            raise FrontmatterParseError(
+                f"{source_path}: unsupported frontmatter key at line {line_no}: {raw_line!r}"
+            )
         current_key = key.strip()
         parsed = value.strip()
         if not parsed:
             result[current_key] = []
-        else:
-            result[current_key] = parsed
+            i += 1
+            continue
+        if parsed in block_scalar_headers:
+            folded = parsed.startswith(">")
+            i += 1
+            block_lines: list[str] = []
+            while i < n and (not lines[i].strip() or lines[i].startswith("  ")):
+                if lines[i].strip():
+                    block_lines.append(lines[i].strip())
+                i += 1
+            result[current_key] = (
+                " ".join(block_lines) if folded else "\n".join(block_lines)
+            )
+            continue
+        if parsed == "{}":
+            result[current_key] = {}
+            i += 1
+            continue
+        if parsed.startswith("[") and parsed.endswith("]"):
+            result[current_key] = _parse_inline_list(parsed)
+            i += 1
+            continue
+        if parsed.startswith("{") or parsed.startswith("|") or parsed.startswith(">"):
+            raise FrontmatterParseError(
+                f"{source_path}: unsupported frontmatter syntax at line {line_no}: "
+                f"{raw_line!r} (nested inline objects / unsupported block scalar header)"
+            )
+        result[current_key] = _strip_quotes(parsed)
+        i += 1
     return result
-
 
 def extract_runtime_field(instructions: str, field: str) -> str | None:
     match = re.search(rf"{re.escape(field)}:\s*([a-zA-Z0-9._|-]+)", instructions)
@@ -363,7 +562,7 @@ def extract_claude_facts(
 ) -> AgentParityFacts:
     """Extract AgentParityFacts from a Claude agent markdown file."""
     facts = AgentParityFacts(agent_name=agent_name)
-    fm = extract_frontmatter(claude_text)
+    fm = extract_frontmatter(claude_text, source_path=str(claude_path))
 
     # Final output schema
     facts.final_output_schema = extract_final_output_schema_from_claude(claude_text)
@@ -373,20 +572,24 @@ def extract_claude_facts(
         claude_text, facts.final_output_schema
     )
 
-    # Permission layers
-    permission_mode = str(fm.get("permissionMode", ""))
-    facts.declared_permission = f"claude.permissionMode={permission_mode}"
-    facts.mutation_boundary = CLAUDE_PERMISSION_LEVEL_MAP.get(permission_mode, "unknown")
-
-    # B7: store raw tools lists
+    # B7: store raw tools lists (AC7: Task/Agent alias normalized before any
+    # tool-set comparison)
     disallowed = fm.get("disallowedTools", [])
     if not isinstance(disallowed, list):
         disallowed = []
     tools = fm.get("tools", [])
     if not isinstance(tools, list):
         tools = []
+    disallowed = normalize_tool_list([str(t) for t in disallowed])
+    tools = normalize_tool_list([str(t) for t in tools])
     facts.claude_tools = list(tools)
     facts.claude_disallowed_tools = list(disallowed)
+
+    # Permission layers (AC4: mutation_class is derived from permission_mode
+    # AND the declared tool set, never from permission_mode alone)
+    permission_mode = str(fm.get("permissionMode", ""))
+    facts.declared_permission = f"claude.permissionMode={permission_mode}"
+    facts.mutation_boundary = derive_mutation_class(permission_mode, tools, disallowed)
 
     # B5: Nested delegation — 3-value logic
     # True = blocked, False = allowed, None = unknown (no tools key and no disallowed)
@@ -427,12 +630,23 @@ def extract_claude_facts(
     )
     facts.delegation_intent_evidence = facts.nested_delegation_evidence
 
-    # Model declaration (advisory)
+    # Model declaration (advisory). model is treated as a Claude-side
+    # model_alias (AC5/AC6); semantic_model_class buckets it into a coarse
+    # role class instead of comparing concrete provider model IDs.
     model = str(fm.get("model", ""))
-    facts.model_declaration = f"config: model={model} (advisory, not runtime proof)"
-    facts.reasoning_effort_declaration = (
-        "config: reasoning_effort not declared in Claude frontmatter (advisory)"
-    )
+    facts.model_declaration = f"config: model_alias={model} (advisory, not runtime proof)"
+    facts.semantic_model_class = SEMANTIC_MODEL_CLASS_MAP.get(model, "unknown")
+    effort = fm.get("effort")
+    if effort:
+        facts.reasoning_effort_declaration = (
+            f"config: effort={effort} (advisory, not runtime proof)"
+        )
+        facts.effort_declared = str(effort)
+    else:
+        facts.reasoning_effort_declaration = (
+            "config: effort not declared in Claude frontmatter (advisory)"
+        )
+        facts.effort_declared = None
 
     return facts
 
@@ -490,10 +704,16 @@ def extract_codex_facts(
         "developer_instructions prose heuristic; advisory only, not strict authority"
     )
 
-    # Model declaration (advisory)
+    # Model declaration (advisory). Codex model remains a concrete
+    # provider model ID (required for check-codex-agents.mjs TOML
+    # validation, out of Allowed Paths); semantic_model_class is derived
+    # from the paired Claude model_alias by the caller, not here, since a
+    # Codex TOML alone does not declare a Claude-side alias.
     model = str(codex_doc.get("model", ""))
     reasoning_effort = str(codex_doc.get("model_reasoning_effort", ""))
     facts.model_declaration = f"config: model={model} (advisory, not runtime proof)"
+    facts.semantic_model_class = "unknown"
+    facts.effort_declared = reasoning_effort or None
     facts.reasoning_effort_declaration = (
         f"config: reasoning_effort={reasoning_effort} (advisory, not runtime proof)"
     )
@@ -635,20 +855,47 @@ def build_model_report(
     claude_facts: AgentParityFacts,
     codex_facts: AgentParityFacts,
 ) -> dict:
-    """Build model/reasoning_effort config declaration report (AC3)."""
+    """Build model/reasoning_effort config declaration report (AC3, AC6).
+
+    semantic_model_class (AC6): a coarse role-level bucket derived from the
+    Claude-side model_alias (SEMANTIC_MODEL_CLASS_MAP), used instead of
+    provider-specific model ID equality.
+
+    effort_requirement (AC6): compares the Claude `effort` frontmatter
+    declaration (when present) against the Codex `model_reasoning_effort`
+    declaration. Advisory-only (config declaration, not runtime proof); a
+    missing Claude `effort` field is reported as "not_declared" rather than
+    treated as a hard failure, since AC1 requires only issue-reviewer.md to
+    carry the field at minimum.
+    """
+    claude_effort = claude_facts.effort_declared
+    codex_effort = codex_facts.effort_declared
+    if claude_effort is None:
+        effort_match: bool | str = "not_declared"
+    else:
+        effort_match = claude_effort == codex_effort
     return {
         "agent": agent_name,
         "model_declaration": {
             "claude": claude_facts.model_declaration,
             "codex": codex_facts.model_declaration,
         },
+        "semantic_model_class": {
+            "claude": claude_facts.semantic_model_class,
+        },
         "reasoning_effort_declaration": {
             "claude": claude_facts.reasoning_effort_declaration,
             "codex": codex_facts.reasoning_effort_declaration,
         },
+        "effort_requirement": {
+            "claude": claude_effort,
+            "codex": codex_effort,
+            "match": effort_match,
+        },
         "note": (
-            "Model and reasoning_effort are config-level declarations only. "
-            "They are NOT runtime proof of actual model used."
+            "Model, semantic_model_class and reasoning_effort/effort_requirement "
+            "are config-level declarations only. They are NOT runtime proof of "
+            "actual model used."
         ),
     }
 
@@ -709,6 +956,100 @@ def format_text_report(
     lines.append("")
 
     return "\n".join(lines)
+
+
+def resolve_shared_claude_runtime_agents(expectations: dict) -> list[str]:
+    """Resolve the agent set for extended parity checks (AC6).
+
+    Prefers the checked-in asset_classification block (shared_claude_runtime
+    entries under .claude/agents/); falls back to "any required_agents entry
+    that declares a non-null claude_agent_path" for fixtures that predate
+    the classification block (e.g. isolated unit-test fixtures built via
+    _write_minimal_contract in tests/test_agent_parity.py).
+    """
+    classification = expectations.get("asset_classification")
+    if classification:
+        agents = {
+            Path(path).stem
+            for path, cls in classification.items()
+            if cls == "shared_claude_runtime"
+            and path.startswith(".claude/agents/")
+            and path.endswith(".md")
+        }
+        if agents:
+            return sorted(agents)
+    return sorted(
+        name
+        for name, exp in expectations.get("required_agents", {}).items()
+        if exp.get("claude_agent_path")
+    )
+
+
+def check_asset_classification_complete(
+    classification: dict,
+    claude_agent_dir: Path,
+    codex_agent_dir: Path,
+) -> list[str]:
+    """AC2/AC9: every discovered .claude/agents/*.md and .codex/agents/*.toml
+    asset must have a classification entry with a value in
+    ALLOWED_CLASSIFICATIONS. Returns a list of failure strings (empty when
+    the inventory is complete)."""
+    failures: list[str] = []
+    discovered: list[str] = []
+    if claude_agent_dir.is_dir():
+        discovered.extend(
+            f".claude/agents/{p.name}" for p in sorted(claude_agent_dir.glob("*.md"))
+        )
+    if codex_agent_dir.is_dir():
+        discovered.extend(
+            f".codex/agents/{p.name}" for p in sorted(codex_agent_dir.glob("*.toml"))
+        )
+    for rel_path in discovered:
+        cls = classification.get(rel_path)
+        if cls is None:
+            failures.append(f"asset_classification: {rel_path} is unclassified")
+        elif cls not in ALLOWED_CLASSIFICATIONS:
+            failures.append(
+                f"asset_classification: {rel_path} has unknown classification {cls!r}"
+                f" (expected one of {sorted(ALLOWED_CLASSIFICATIONS)!r})"
+            )
+    return failures
+
+
+def check_duplicate_agent_names(claude_agent_dir: Path, codex_agent_dir: Path) -> list[str]:
+    """AC7: duplicate agent `name:`/`name =` values within a launcher's
+    agent directory are detected as errors."""
+    failures: list[str] = []
+    if claude_agent_dir.is_dir():
+        seen: dict[str, Path] = {}
+        for md_path in sorted(claude_agent_dir.glob("*.md")):
+            fm = extract_frontmatter(md_path.read_text(encoding="utf-8"), source_path=str(md_path))
+            name = fm.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            if name in seen:
+                failures.append(
+                    f"duplicate Claude agent name {name!r}: {seen[name]} and {md_path}"
+                )
+            else:
+                seen[name] = md_path
+    if codex_agent_dir.is_dir():
+        seen_codex: dict[str, Path] = {}
+        for toml_path in sorted(codex_agent_dir.glob("*.toml")):
+            try:
+                doc = read_toml(toml_path)
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+            name = doc.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            if name in seen_codex:
+                failures.append(
+                    f"duplicate Codex agent name {name!r}: {seen_codex[name]} and {toml_path}"
+                )
+            else:
+                seen_codex[name] = toml_path
+    return failures
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -784,13 +1125,13 @@ def main(argv: list[str] | None = None) -> int:
             failures.append(f"{expected['path']}: name must be {agent_name}")
         if not codex_only:
             claude_text = claude_path.read_text(encoding="utf-8")
-            claude_frontmatter = extract_frontmatter(claude_text)
+            claude_frontmatter = extract_frontmatter(claude_text, source_path=str(claude_path))
             if claude_frontmatter.get("name") != agent_name:
                 failures.append(f"{expected['claude_agent_path']}: frontmatter name must be {agent_name}")
-            if claude_frontmatter.get("model") != expected["claude_model"]:
+            if claude_frontmatter.get("model") != expected["model_alias"]:
                 failures.append(
-                    f"{expected['claude_agent_path']}: model expected"
-                    f" {expected['claude_model']!r} got {claude_frontmatter.get('model')!r}"
+                    f"{expected['claude_agent_path']}: model_alias expected"
+                    f" {expected['model_alias']!r} got {claude_frontmatter.get('model')!r}"
                 )
             if claude_frontmatter.get("permissionMode") != expected["claude_permission_mode"]:
                 failures.append(
@@ -828,7 +1169,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if not codex_only:
-            if not excludes_permission_parity(expected):
+            if not excludes_permission_parity(agent_name, expected):
                 permission_expected = (
                     "acceptEdits"
                     if expected["default_permissions"] == "loop-protocol-rtk"
@@ -842,8 +1183,23 @@ def main(argv: list[str] | None = None) -> int:
                         f" Codex permission profile {expected['default_permissions']}"
                     )
 
-    # --- Extended parity checks for PARITY_AGENTS ---
-    for agent_name in PARITY_AGENTS:
+    # --- Asset inventory checks (AC2, AC7, AC9): unclassified references
+    # and duplicate agent names are hard failures, not silent skips. ---
+    classification = expectations.get("asset_classification")
+    if classification:
+        failures.extend(
+            check_asset_classification_complete(classification, claude_agent_dir, codex_agent_dir)
+        )
+    failures.extend(check_duplicate_agent_names(claude_agent_dir, codex_agent_dir))
+
+    # --- Extended parity checks: role/permission/tool/output-schema/
+    # semantic-model-class/effort-requirement (AC6). The former 4-agent
+    # PARITY_AGENTS allowlist has been removed; the agent set is now
+    # resolved from the asset inventory classification (shared_claude_runtime
+    # entries) when available, falling back to "any required_agents entry
+    # that declares a claude_agent_path" for isolated/unit-test fixtures
+    # that do not carry an asset_classification block.
+    for agent_name in resolve_shared_claude_runtime_agents(expectations):
         expected = expectations["required_agents"].get(agent_name)
         if expected is None:
             continue
@@ -866,7 +1222,7 @@ def main(argv: list[str] | None = None) -> int:
             codex_path,
             claude_facts,
             codex_facts,
-            compare_permission=not excludes_permission_parity(expected),
+            compare_permission=not excludes_permission_parity(agent_name, expected),
         )
         all_drifts.extend(drifts)
 

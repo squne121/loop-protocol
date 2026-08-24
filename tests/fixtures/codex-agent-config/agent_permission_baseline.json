@@ -1,0 +1,205 @@
+{
+  "codebase-investigator.md": {
+    "disallowedTools": [
+      "Edit",
+      "Glob",
+      "Grep",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "implementation-worker.md": {
+    "disallowedTools": [],
+    "tools": [
+      "Bash",
+      "Edit",
+      "Glob",
+      "Grep",
+      "MultiEdit",
+      "Read",
+      "Write"
+    ]
+  },
+  "issue-creator.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Skill",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "issue-design-reviewer.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Skill",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "issue-editor.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Skill",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "issue-reviewer.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Skill",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "post-merge-cleanup-worker.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "pr-reviewer-lite.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Skill",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "pr-reviewer.md": {
+    "disallowedTools": [
+      "Edit",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "retrospective-evaluator.md": {
+    "disallowedTools": [
+      "Agent",
+      "Bash",
+      "Edit",
+      "MultiEdit",
+      "NotebookEdit",
+      "Skill",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ],
+    "tools": []
+  },
+  "retrospective-runtime-observer.md": {
+    "disallowedTools": [
+      "Agent",
+      "Bash",
+      "Edit",
+      "MultiEdit",
+      "NotebookEdit",
+      "Skill",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ],
+    "tools": []
+  },
+  "review-issue.md": {
+    "disallowedTools": [
+      "Edit",
+      "MultiEdit"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read",
+      "Write"
+    ]
+  },
+  "scope-rollup-runner.md": {
+    "disallowedTools": [
+      "Edit",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "test-runner.md": {
+    "disallowedTools": [
+      "Edit",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "web-researcher.md": {
+    "disallowedTools": [
+      "Edit",
+      "Glob",
+      "Grep",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Read",
+      "WebFetch",
+      "WebSearch"
+    ]
+  }
+}

@@ -11,6 +11,7 @@ disallowedTools:
   - Write
   - MultiEdit
 model: haiku
+effort: medium
 maxTurns: 15
 permissionMode: auto
 ---
