@@ -19,8 +19,18 @@ from typing import Any
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SCRIPTS_DIR))
+_DEFAULT_REPO_ROOT = _SCRIPTS_DIR.parents[3]
+sys.path.insert(0, str(_DEFAULT_REPO_ROOT / "scripts" / "agent-ops"))
 
 import run_retrospective as rr  # noqa: E402
+
+# Issue #2239 AC7 fix_delta: reuse -- do not re-implement -- the
+# claude-gpt launcher receipt / proxy PID-port-log side-channel parser /
+# INDEPENDENT PID-listen-socket cleanup reconfirmation already implemented
+# for `worktree-agent-runtime-smoke` (Issue #2174 AC8, #2219 AC1/AC7). No
+# new attestation schema is introduced here; this verifier only calls the
+# same production functions the existing runner already uses.
+import run_worktree_agent_runtime_smoke as rwars  # noqa: E402
 
 _RESULT_SCHEMA = "AGENT_RETROSPECTIVE_LIVE_SMOKE_RESULT_V1"
 _OBSERVER_SCHEMA_PATH = _SCRIPTS_DIR / "schemas" / "observer_result_v1.schema.json"
@@ -179,6 +189,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     policy = rr.DelegatedAgentPermissionPolicy(run_id=run_id)
     claude_gpt_launcher_receipt: dict[str, Any] | None = None
+    claude_gpt_proxy_sidechannel: dict[str, Any] | None = None
+    claude_gpt_proxy_cleanup_independent: dict[str, Any] | None = None
 
     if is_claude_gpt:
         schema_text = _OBSERVER_SCHEMA_PATH.read_text(encoding="utf-8")
@@ -217,6 +229,29 @@ def main(argv: list[str] | None = None) -> int:
                 "claude-gpt launcher invocation returned non-zero exit",
                 extra={"exit_code": completed.returncode, "stderr_excerpt": completed.stderr[:400]},
             )
+        # Issue #2239 AC7 fix_delta: reuse the launcher's own already-parsed
+        # CLAUDE_GPT_LAUNCH_RESULT_V1 receipt and proxy PID/port/log
+        # side-channel (Issue #2174 AC8, #2219 AC1/AC7), then INDEPENDENTLY
+        # re-confirm proxy cleanup (never trusting the launcher's own
+        # CLAUDE_GPT_PROXY_CLEANUP_OK self-report).
+        launcher_result = rwars.extract_claude_gpt_launcher_receipt(completed.stderr)
+        claude_gpt_proxy_sidechannel = rwars.extract_claude_gpt_proxy_sidechannel(completed.stderr)
+        claude_gpt_proxy_cleanup_independent = rwars.verify_claude_gpt_proxy_cleanup_independent(
+            claude_gpt_proxy_sidechannel["proxy_pid"], claude_gpt_proxy_sidechannel["proxy_port"]
+        )
+        if (
+            claude_gpt_proxy_cleanup_independent["checked"]
+            and not claude_gpt_proxy_cleanup_independent["cleanup_confirmed"]
+        ):
+            return _fail(
+                "claude_gpt_proxy_cleanup_not_independently_confirmed",
+                "claude-gpt proxy cleanup was not independently reconfirmed via PID/listen-socket check "
+                f"(self-reported={claude_gpt_proxy_sidechannel['proxy_cleanup_ok_self_reported']})",
+                extra={
+                    "claude_gpt_proxy_sidechannel": claude_gpt_proxy_sidechannel,
+                    "claude_gpt_proxy_cleanup_independent": claude_gpt_proxy_cleanup_independent,
+                },
+            )
         try:
             wrapper_payload = json.loads(completed.stdout)
             structured_output = wrapper_payload.get("structured_output")
@@ -230,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         claude_gpt_launcher_receipt = {
             "resolved_executable": resolved_executable,
             "resolved_executable_digest": _sha256_file(Path(resolved_executable)),
+            "launcher_result": launcher_result,
         }
     else:
         result = rr.invoke_agent(request, policy=policy)
@@ -309,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
     }
     if claude_gpt_launcher_receipt is not None:
         receipt["claude_gpt_launcher_receipt"] = claude_gpt_launcher_receipt
+        receipt["claude_gpt_proxy_sidechannel"] = claude_gpt_proxy_sidechannel
+        receipt["claude_gpt_proxy_cleanup_independent"] = claude_gpt_proxy_cleanup_independent
 
     artifact_path = artifacts_dir / f"live_smoke_{args.runtime_profile}_{int(time.time())}_{nonce}.json"
     artifact_path.write_text(json.dumps(receipt, sort_keys=True, indent=2), encoding="utf-8")

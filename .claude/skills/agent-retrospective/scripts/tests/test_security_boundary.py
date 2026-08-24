@@ -439,6 +439,27 @@ def _run_live_smoke(runtime_profile: str) -> None:
     assert payload["fallback_used"] is False
     assert payload["repository_fingerprint_diff_clean"] is True
     assert payload["tested_head"]
+    if runtime_profile == "claude_gpt":
+        # AC7: the claude-gpt path must record the same oracle the existing
+        # worktree-agent-runtime-smoke runner already produces (Issue #2174
+        # AC8, #2219 AC1/AC7) -- launcher receipt, proxy PID/port/log
+        # side-channel, cleanup self-report, and an INDEPENDENT
+        # PID/listen-socket cleanup reconfirmation. No new attestation
+        # schema is asserted here.
+        launcher_receipt = payload["claude_gpt_launcher_receipt"]
+        assert launcher_receipt["resolved_executable"]
+        assert launcher_receipt["resolved_executable_digest"]
+        proxy_sidechannel = payload["claude_gpt_proxy_sidechannel"]
+        assert "proxy_pid" in proxy_sidechannel
+        assert "proxy_port" in proxy_sidechannel
+        assert "proxy_log" in proxy_sidechannel
+        assert "proxy_cleanup_ok_self_reported" in proxy_sidechannel
+        proxy_cleanup_independent = payload["claude_gpt_proxy_cleanup_independent"]
+        assert "cleanup_confirmed" in proxy_cleanup_independent
+        assert "pid_alive" in proxy_cleanup_independent
+        assert "port_listening" in proxy_cleanup_independent
+        if proxy_cleanup_independent["checked"]:
+            assert proxy_cleanup_independent["cleanup_confirmed"] is True
 
 
 def test_live_smoke_claude_code_operator_run() -> None:
