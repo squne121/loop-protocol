@@ -103,16 +103,26 @@ def _save(state_path: str, state: dict) -> None:
         json.dump(state, fh)
 
 
-def _record_call(state: dict, operation: str, repo, subcommand) -> None:
+def _record_call(state: dict, operation: str, repo, subcommand, number=None) -> None:
     """Append a normalized call trace entry.
 
     Only operation / repo / the primary (non-flag) subcommand tokens are
     recorded -- callers must not assert exact argv, exact ordering across
     unrelated operations, or exact call counts beyond what a given test
     explicitly sets up (Issue #2306 In Scope wording).
+
+    Issue #2278 (`runtime_smoke_test.sh --scenario issue_to_impl`) PR #2325
+    fix_delta (P0-2): `number` is additionally recorded (when the caller
+    passes one) so a consumer can confirm CAUSALLY that a `gh issue view
+    <specific number>` call happened -- not merely that SOME `issue view`
+    call happened at some point -- without requiring exact-argv/exact-
+    ordering assertions on the rest of the trace.
     """
     calls = state.setdefault("calls", [])
-    calls.append({"operation": operation, "repo": repo, "subcommand": subcommand})
+    entry = {"operation": operation, "repo": repo, "subcommand": subcommand}
+    if number is not None:
+        entry["number"] = number
+    calls.append(entry)
 
 
 def _extract_flag(args, flag):
@@ -228,7 +238,11 @@ def main() -> int:
     if args[:2] == ["issue", "view"]:
         number = args[2] if len(args) > 2 and not args[2].startswith("-") else None
         repo = _extract_flag(args, "--repo")
-        _record_call(state, "issue_view", repo, ["issue", "view"])
+        # Issue #2278 PR #2325 fix_delta (P0-2): record the SPECIFIC issue
+        # number in the call trace (not just "some issue_view call
+        # happened"), so a consumer can confirm a `gh issue view <N>` call
+        # against a specific fixture Issue genuinely occurred.
+        _record_call(state, "issue_view", repo, ["issue", "view"], number=number)
         _save(state_path, state)
         info = state["issues"].get(str(number)) if number else None
         if info is None or (repo is not None and info.get("repo") != repo):
@@ -247,6 +261,17 @@ def main() -> int:
             # set real `gh` would return, instead of a silently-absent key.
             "labels": info.get("labels", []),
         }
+        json_fields_raw = _extract_flag(args, "--json")
+        requested_fields = set(json_fields_raw.split(",")) if json_fields_raw else set()
+        if not json_fields_raw or "comments" in requested_fields:
+            # Issue #2278 PR #2325 fix_delta (P1-2): a COMBINED `--json
+            # title,body,labels,comments` flag is a single argv token, so
+            # the "comments" in args" exact-token check above (kept for
+            # backward compatibility with its existing callers) never fires
+            # for it -- the generic payload previously silently omitted
+            # `comments` in that case. Real `gh issue view --json ...`
+            # always includes exactly the fields the caller asked for.
+            payload["comments"] = state.get("comments", {}).get(str(number), [])
         print(json.dumps(payload))
         return 0
 

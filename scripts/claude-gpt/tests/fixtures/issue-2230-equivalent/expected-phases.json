@@ -3,7 +3,7 @@
   "phases": [
     {
       "phase": "workflow_capability_preflight",
-      "description": "workflow_capability_preflight.py --profile issue-to-impl を fake gh 経由で実行し CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1 decision を得る",
+      "description": "canonical preflight.run first-hop (workflow_start_entry.run()) を fake gh 経由で実行し、ready/degraded/blocked を production の fail-closed 分類でそのまま消費する",
       "allowed_status": [
         "completed",
         "failed"
@@ -17,8 +17,8 @@
       ]
     },
     {
-      "phase": "issue_contract_repair",
-      "description": "fixture Issue の契約セクション充足を静的に確認する（不足があれば issue-refinement-loop 相当の修復が必要と判定）",
+      "phase": "fixture_contract_shape_check",
+      "description": "fixture Issue 本文に issue-contract-review が最初に確認する5見出しが揃っているかを静的に確認する（issue-contract-review 本体は実行しない）",
       "allowed_status": [
         "completed",
         "expected_block",
@@ -26,8 +26,8 @@
       ]
     },
     {
-      "phase": "fresh_review",
-      "description": "launch.sh 経由の live Claude Code 呼び出しで fixture Issue を fake gh 経由で読み戻し、deterministic marker を確認する",
+      "phase": "live_fixture_readback",
+      "description": "launch.sh 経由の live Claude Code 呼び出し（--output-format json）で fixture Issue を fake gh 経由で読み戻し、deterministic marker と fake_gh.py 側の issue_view call trace の両方を確認する",
       "allowed_status": [
         "completed",
         "failed"
@@ -35,7 +35,7 @@
     },
     {
       "phase": "impl_review_loop_entry",
-      "description": "impl-review-loop への handoff 直前の判定。本 smoke harness は実 git/PR mutation を意図的に実行しないため expected_block が既定",
+      "description": "root_entry_router.run_root_transition() を no-op spy 付きで実行し、route/invoked/spy呼び出し回数を実測する。実 git worktree / PR mutation は行わない",
       "allowed_status": [
         "expected_block",
         "completed",
