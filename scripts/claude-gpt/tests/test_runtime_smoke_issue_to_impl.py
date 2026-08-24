@@ -436,8 +436,21 @@ def test_live_fixture_readback_passes_with_marker_and_matching_call_trace():
     result = _run_live_fixture_readback(
         "9100",
         "squne121/loop-protocol",
-        {"calls": [{"operation": "issue_view", "repo": "squne121/loop-protocol", "subcommand": ["issue", "view"], "number": "9100"}]},
-        {"type": "result", "is_error": False, "result": "ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=9100 contract_complete=true"},
+        {
+            "calls": [
+                {
+                    "operation": "issue_view",
+                    "repo": "squne121/loop-protocol",
+                    "subcommand": ["issue", "view"],
+                    "number": "9100",
+                }
+            ]
+        },
+        {
+            "type": "result",
+            "is_error": False,
+            "result": "ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=9100 contract_complete=true",
+        },
     )
     assert result["marker_issue"] == "9100"
     assert result["marker_complete"] == "true"
@@ -453,7 +466,11 @@ def test_live_fixture_readback_fails_when_marker_present_but_no_matching_gh_call
         "9100",
         "squne121/loop-protocol",
         {"calls": []},
-        {"type": "result", "is_error": False, "result": "ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=9100 contract_complete=true"},
+        {
+            "type": "result",
+            "is_error": False,
+            "result": "ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=9100 contract_complete=true",
+        },
     )
     assert result["marker_issue"] == "9100"
     assert result["call_trace_ok"] is False
@@ -463,8 +480,21 @@ def test_live_fixture_readback_fails_when_call_trace_is_for_a_different_issue_nu
     result = _run_live_fixture_readback(
         "9100",
         "squne121/loop-protocol",
-        {"calls": [{"operation": "issue_view", "repo": "squne121/loop-protocol", "subcommand": ["issue", "view"], "number": "9999"}]},
-        {"type": "result", "is_error": False, "result": "ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=9100 contract_complete=true"},
+        {
+            "calls": [
+                {
+                    "operation": "issue_view",
+                    "repo": "squne121/loop-protocol",
+                    "subcommand": ["issue", "view"],
+                    "number": "9999",
+                }
+            ]
+        },
+        {
+            "type": "result",
+            "is_error": False,
+            "result": "ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=9100 contract_complete=true",
+        },
     )
     assert result["call_trace_ok"] is False
 
@@ -485,8 +515,21 @@ def test_live_fixture_readback_treats_is_error_true_as_not_ok():
     result = _run_live_fixture_readback(
         "9100",
         "squne121/loop-protocol",
-        {"calls": [{"operation": "issue_view", "repo": "squne121/loop-protocol", "subcommand": ["issue", "view"], "number": "9100"}]},
-        {"type": "result", "is_error": True, "result": "ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=9100 contract_complete=true"},
+        {
+            "calls": [
+                {
+                    "operation": "issue_view",
+                    "repo": "squne121/loop-protocol",
+                    "subcommand": ["issue", "view"],
+                    "number": "9100",
+                }
+            ]
+        },
+        {
+            "type": "result",
+            "is_error": True,
+            "result": "ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=9100 contract_complete=true",
+        },
     )
     assert result["structured_output_ok"] is False
 
@@ -494,7 +537,12 @@ def test_live_fixture_readback_treats_is_error_true_as_not_ok():
 # --- P0-3: root_entry_router spy-invocation classifier ----------------------
 
 
-def _run_root_entry_router_probe(body: str, review_body_sha256, issue_number: int = 9100, repo: str = "squne121/loop-protocol") -> dict:
+def _run_root_entry_router_probe(
+    body: str,
+    review_body_sha256,
+    issue_number: int = 9100,
+    repo: str = "squne121/loop-protocol",
+) -> dict:
     """Drive the extracted Phase 5 heredoc directly (it builds its own fake
     transport/contract-review files from the fixture JSON + an injected
     `review_body_sha256`, so tests can force either a `go` or `not go`
