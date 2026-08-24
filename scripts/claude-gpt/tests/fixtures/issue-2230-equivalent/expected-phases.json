@@ -1,0 +1,46 @@
+{
+  "schema": "ISSUE_TO_IMPL_EXPECTED_PHASES_V1",
+  "phases": [
+    {
+      "phase": "workflow_capability_preflight",
+      "description": "canonical preflight.run first-hop (workflow_start_entry.run()) を fake gh 経由で実行し、ready/degraded/blocked を production の fail-closed 分類でそのまま消費する",
+      "allowed_status": [
+        "completed",
+        "failed"
+      ]
+    },
+    {
+      "phase": "spark_delegation",
+      "description": "本 smoke シナリオでは Spark delegation を要求しないため常に not_applicable",
+      "allowed_status": [
+        "not_applicable"
+      ]
+    },
+    {
+      "phase": "fixture_contract_shape_check",
+      "description": "fixture Issue 本文に issue-contract-review が最初に確認する5見出しが揃っているかを静的に確認する（issue-contract-review 本体は実行しない）",
+      "allowed_status": [
+        "completed",
+        "expected_block",
+        "failed"
+      ]
+    },
+    {
+      "phase": "live_fixture_readback",
+      "description": "launch.sh 経由の live Claude Code 呼び出し（--output-format json）で fixture Issue を fake gh 経由で読み戻し、deterministic marker と fake_gh.py 側の issue_view call trace の両方を確認する",
+      "allowed_status": [
+        "completed",
+        "failed"
+      ]
+    },
+    {
+      "phase": "impl_review_loop_entry",
+      "description": "root_entry_router.run_root_transition() を no-op spy 付きで実行し、route/invoked/spy呼び出し回数を実測する。実 git worktree / PR mutation は行わない",
+      "allowed_status": [
+        "expected_block",
+        "completed",
+        "failed"
+      ]
+    }
+  ]
+}
