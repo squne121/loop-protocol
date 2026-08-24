@@ -95,6 +95,8 @@ Phase 2（本 #2160）では `.codex/**` を削除しない。削除対象・con
 `tests/fixtures/codex-agent-config/codex_removal_inventory.json`（`CODEX_ASSET_REMOVAL_INVENTORY_V1`）に checked-in artifact として保存し、
 Phase 3（#2161, removal_owner）が読み取る。
 
+Spark 系 3 asset（`spark-skim` / `spark-worker` / `spark-deep`）は `legacy_codex_only` のまま維持しつつ、`codex_removal_inventory.json` 上は removal_target: true（follow-up: #2186）として明記する。将来の Spark 設計は #2186 が所有する claude-gpt-session 上のカスタム SubAgent `spark-codex` であり、Codex CLI `.toml` を継続保持する設計ではない（2026-08-25 人間レビュー反映）。
+
 ## Codex Dispatch Guardrail（Codex ディスパッチ境界）
 
 Codex の変更操作制御は標準の隔離環境と承認機構による

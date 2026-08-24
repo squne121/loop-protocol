@@ -10,7 +10,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l codebase-investigator`: .claude/skills/agent-retrospective/SKILL.md, .claude/skills/agent-retrospective/references/capability-matrix.md, .claude/skills/agent-retrospective/scripts/run_retrospective.py, .claude/skills/agent-retrospective/scripts/tests/test_run_retrospective.py, .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md, .claude/skills/gemini-cli-headless-delegation/scripts/validate_repo_evidence_ref.py"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (role/permission/tool/schema/semantic-model-class/effort projection check)"
     },
@@ -19,7 +20,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l implementation-worker`: .claude/skills/ci-test-performance/SKILL.md, .claude/skills/impl-review-loop/SKILL.md, .claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py, .claude/skills/impl-review-loop/steps/conflicting-pr-escalation-runbook.md, .claude/skills/impl-review-loop/steps/context-protocol-and-guardrails.md, .claude/skills/impl-review-loop/steps/preparation.md"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
     },
@@ -28,7 +30,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l issue-creator`: .claude/skills/edit-issue/SKILL.md, .claude/skills/edit-issue/tests/test_edit_issue_txn.py, .claude/skills/impl-review-loop/steps/step-5-feedback-and-termination.md, .claude/skills/issue-refinement-loop/SKILL.md, .claude/skills/issue-refinement-loop/references/ac-vc-reflection.md, .claude/skills/issue-refinement-loop/references/follow-up-materialization.md"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
     },
@@ -37,7 +40,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l issue-editor`: .claude/skills/create-issue/references/body-authoring.md, .claude/skills/edit-issue/SKILL.md, .claude/skills/edit-issue/scripts/edit_issue_txn.py, .claude/skills/edit-issue/tests/test_edit_issue_txn.py, .claude/skills/issue-refinement-loop/SKILL.md, .claude/skills/issue-refinement-loop/references/ac-vc-reflection.md"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
     },
@@ -46,7 +50,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l issue-reviewer`: .claude/skills/issue-contract-review/scripts/contract_readiness_check.py, .claude/skills/issue-refinement-loop/SKILL.md, .claude/skills/issue-refinement-loop/references/loop-state.md, .claude/skills/issue-refinement-loop/references/termination-policy.md, .claude/skills/issue-refinement-loop/scripts/command_registry.py, .claude/skills/issue-refinement-loop/scripts/decide_next_loop_action.py"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
     },
@@ -55,7 +60,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l post-merge-cleanup-worker`: .claude/skills/post-merge-cleanup-executor/SKILL.md, .claude/skills/post-merge-cleanup/SKILL.md, docs/dev/agent-skill-boundaries.md, docs/dev/workflow.md, scripts/agent-ops/run_worktree_agent_runtime_smoke.py, scripts/agent-ops/tests/test_run_worktree_agent_runtime_smoke.py"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
     },
@@ -64,7 +70,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l pr-reviewer-lite`: .claude/skills/impl-review-loop/tests/test_handoff_pr_hygiene_regression.py, .claude/skills/impl-review-loop/tests/test_wait_ci_checks.py, .claude/skills/pr-review-judge/SKILL.md, .claude/skills/pr-review-judge/references/ci-verdict-summary.md, docs/adr/0008-deterministic-evidence-vs-semantic-judgment.md, docs/dev/agent-skill-boundaries.md"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
     },
@@ -73,7 +80,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l pr-reviewer`: .claude/skills/ci-test-performance/SKILL.md, .claude/skills/impl-review-loop/SKILL.md, .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py, .claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py, .claude/skills/impl-review-loop/steps/conflicting-pr-escalation-runbook.md, .claude/skills/impl-review-loop/steps/context-protocol-and-guardrails.md"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
     },
@@ -82,7 +90,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l review-issue`: .claude/skills/create-issue/SKILL.md, .claude/skills/create-issue/references/body-authoring.md, .claude/skills/create-issue/scripts/mrc_contract_parser.py, .claude/skills/create-issue/scripts/tests/test_lp010_ac_extraction_regression.py, .claude/skills/create-issue/scripts/tests/test_path_classification.py, .claude/skills/edit-issue/scripts/issue_contract_hygiene_autofix.py"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
     },
@@ -91,7 +100,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l scope-rollup-runner`: .claude/skills/impl-review-loop/scripts/parse_scope_rollup_run_result.py, .claude/skills/impl-review-loop/steps/preparation.md, .claude/skills/impl-review-loop/tests/test_parse_scope_rollup_run_result.py, docs/dev/hook-boundaries.md, docs/dev/session-recording-policy.md, scripts/agent-guards/run_scope_rollup_preflight.py"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (permission_parity excluded, see expected-runtime-contract.json)"
     },
@@ -100,7 +110,8 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l test-runner`: .claude/skills/ci-test-performance/SKILL.md, .claude/skills/ci-test-performance/references/decision-matrix.md, .claude/skills/create-issue/references/body-authoring.md, .claude/skills/impl-review-loop/SKILL.md, .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py, .claude/skills/impl-review-loop/scripts/materialize_test_verdict_artifact.py"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
     },
@@ -109,36 +120,43 @@
       "classification": "legacy_codex_projection",
       "removal_target": true,
       "consumers": [
-        "Codex CLI runtime (legacy compatibility only)"
+        "Codex CLI runtime (legacy compatibility only)",
+        "repo-local references (docs/scripts/skills) matched via `git grep -l web-researcher`: .claude/skills/agent-retrospective/SKILL.md, .claude/skills/agent-retrospective/references/capability-matrix.md, .claude/skills/agent-retrospective/scripts/run_retrospective.py, .claude/skills/agent-retrospective/scripts/tests/test_run_retrospective.py, .claude/skills/gemini-cli-headless-delegation/SKILL.md, .claude/skills/gemini-cli-headless-delegation/references/model-routing.md"
       ],
       "compatibility_shim": "scripts/check_claude_codex_agent_parity.py"
     },
     {
       "path": ".codex/agents/spark-deep.toml",
       "classification": "legacy_codex_only",
-      "removal_target": false,
+      "removal_target": true,
       "consumers": [
         "Codex CLI native explicit-only @agent-spark-codex delegation"
       ],
-      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (codex_only parity_mode)"
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (codex_only parity_mode)",
+      "removal_followup_issue": "#2186",
+      "removal_note": "Phase 3 (#2161) removal target. Future Spark design is a claude-gpt-session custom SubAgent `spark-codex` (#2186), not a retained Codex CLI .toml carrier."
     },
     {
       "path": ".codex/agents/spark-skim.toml",
       "classification": "legacy_codex_only",
-      "removal_target": false,
+      "removal_target": true,
       "consumers": [
         "Codex CLI native explicit-only @agent-spark-codex delegation"
       ],
-      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (codex_only parity_mode)"
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (codex_only parity_mode)",
+      "removal_followup_issue": "#2186",
+      "removal_note": "Phase 3 (#2161) removal target. Future Spark design is a claude-gpt-session custom SubAgent `spark-codex` (#2186), not a retained Codex CLI .toml carrier."
     },
     {
       "path": ".codex/agents/spark-worker.toml",
       "classification": "legacy_codex_only",
-      "removal_target": false,
+      "removal_target": true,
       "consumers": [
         "Codex CLI native explicit-only @agent-spark-codex delegation"
       ],
-      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (codex_only parity_mode)"
+      "compatibility_shim": "scripts/check_claude_codex_agent_parity.py (codex_only parity_mode)",
+      "removal_followup_issue": "#2186",
+      "removal_note": "Phase 3 (#2161) removal target. Future Spark design is a claude-gpt-session custom SubAgent `spark-codex` (#2186), not a retained Codex CLI .toml carrier."
     }
   ]
 }
