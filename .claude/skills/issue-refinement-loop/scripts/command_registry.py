@@ -122,6 +122,18 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
         "network_effect": "github_read_only",
         "stdin_contract": "none",
+        # Issue #2323: this declared value already matches the ACTUAL
+        # stdout shape on every decision branch -- `workflow_start_entry.py`
+        # renders the SAME compact stdout line grammar
+        # (`STATUS:`/`NEXT_ACTION:`/`BLOCKERS:` etc., via
+        # `run_refinement_preflight.py::_build_compact_stdout()`) whether
+        # the producer decision is `ready`/`degraded` (passthrough) or
+        # `blocked`/caller-capability-request-malformed (rendered directly
+        # by `workflow_start_entry.py` itself). Prior to Issue #2323, the
+        # blocked/malformed branches instead emitted a raw
+        # `{"schema": "WORKFLOW_START_ENTRY_RESULT_V1", ...}` JSON dict --
+        # this declared value did not change, only the actual branch
+        # behavior was brought into alignment with it.
         "stdout_contract": "refinement_preflight_result/v1",
         "timeout_seconds": 120,
         "mutation": False,
