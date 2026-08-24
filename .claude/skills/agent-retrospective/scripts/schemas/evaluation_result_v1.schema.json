@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://loop-protocol.internal/schemas/agent-retrospective/evaluation_result_v1.schema.json",
+  "title": "evaluation_result/v1",
+  "description": "Canonical wire-contract schema for the claude CLI --json-schema flag when invoking the agent-retrospective evaluator Agent. Mirrors run_retrospective.py's Evaluation dataclass (WIRE_SCHEMA_EVALUATION = \"evaluation_result/v1\", Issue #2301). candidate_records[] entries must each independently satisfy the canonical agent_improvement_candidate/v1 schema (#2288/#2289) -- this schema intentionally does not re-embed that full contract inline and only requires candidate_records to be an array of objects at the wire-contract layer; the stricter per-record validation is enforced by run_retrospective.py's _validate_candidate_records() after structured_output parsing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "base_sha",
+    "source_set_digest",
+    "candidate_records",
+    "evidence_ref"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "evaluation_result/v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "base_sha": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_set_digest": {
+      "type": "string",
+      "minLength": 1
+    },
+    "candidate_records": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "evidence_ref": {
+      "type": "string"
+    }
+  }
+}
