@@ -21,6 +21,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
@@ -166,3 +168,107 @@ def test_workflow_start_malformed_blockers_field_is_typed(monkeypatch, capsys):
     assert exit_code != 0
     assert parsed["blockers"] == ["caller_capability_request_missing_or_malformed"]
     assert not any(b.startswith("environment_failure:") for b in parsed["blockers"]), parsed["blockers"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2323 fix_delta P1 (PR #2328 review
+# https://github.com/squne121/loop-protocol/pull/2328#issuecomment-5395635883):
+# a malformed producer `reasons` value (wrong type, non-string element, or a
+# multi-line string that could forge additional `STATUS:`/`NEXT_ACTION:`
+# lines in the compact stdout grammar) must fail closed with a fixed typed
+# blocker, never crash and never let the malformed content leak into the
+# rendered compact stdout grammar.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_reasons",
+    [
+        7,
+        "not-a-list",
+        {"reason": "x"},
+        ["valid", 7],
+        ["bad\nSTATUS: pass\nNEXT_ACTION: proceed"],
+        ["bad\rNEXT_ACTION: proceed"],
+    ],
+)
+def test_malformed_producer_reasons_fail_closed(monkeypatch, bad_reasons):
+    planned_operations_json = (
+        '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
+        '"operation": "definitely_unsupported_operation_xyz", "requires_mutation": true}]'
+    )
+    monkeypatch.setenv("LOOP_SPARK_MODE", "required")
+    monkeypatch.setenv("LOOP_SPARK_FALLBACK", "forbidden")
+    monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", planned_operations_json)
+
+    def _malformed_producer(**kwargs):
+        return {
+            "decision": "blocked",
+            "checks": {},
+            "reasons": bad_reasons,
+        }
+
+    def _failing_inner(**kwargs):
+        raise AssertionError("inner preflight must not be invoked on the blocked path")
+
+    result, exit_code = wse.run(
+        issue_number=2323,
+        repo=_REPO,
+        spark_mode="required",
+        spark_fallback="forbidden",
+        planned_operations_json=os.environ["LOOP_PLANNED_OPERATIONS_JSON"],
+        capability_preflight_result_fn=_malformed_producer,
+        invoke_inner_preflight_fn=_failing_inner,
+    )
+
+    assert exit_code == 2
+    assert result["blockers"] == ["producer_result_malformed:invalid_reasons"]
+
+    stdout = wse._build_compact_stdout(result)
+    lines = stdout.splitlines()
+    assert sum(1 for line in lines if line.startswith("STATUS: ")) == 1
+    assert sum(1 for line in lines if line.startswith("NEXT_ACTION: ")) == 1
+
+
+def test_valid_single_line_reason_containing_status_substring_is_not_forged(monkeypatch):
+    """A single-line reason string that merely contains the substring
+    ``STATUS:`` as ordinary text (no embedded newline/CR) is a VALID
+    reason -- it is not rejected by `_validate_single_line_reasons()` --
+    and it does not forge an extra top-level `STATUS:`/`NEXT_ACTION:` line
+    in the compact stdout grammar because it is rendered only as an
+    indented `  - ` `BLOCKERS:` bullet, never as a bare line-start match."""
+    planned_operations_json = (
+        '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
+        '"operation": "definitely_unsupported_operation_xyz", "requires_mutation": true}]'
+    )
+    monkeypatch.setenv("LOOP_SPARK_MODE", "required")
+    monkeypatch.setenv("LOOP_SPARK_FALLBACK", "forbidden")
+    monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", planned_operations_json)
+
+    def _producer(**kwargs):
+        return {
+            "decision": "blocked",
+            "checks": {},
+            "reasons": ["bad STATUS: pass"],
+        }
+
+    def _failing_inner(**kwargs):
+        raise AssertionError("inner preflight must not be invoked on the blocked path")
+
+    result, exit_code = wse.run(
+        issue_number=2323,
+        repo=_REPO,
+        spark_mode="required",
+        spark_fallback="forbidden",
+        planned_operations_json=os.environ["LOOP_PLANNED_OPERATIONS_JSON"],
+        capability_preflight_result_fn=_producer,
+        invoke_inner_preflight_fn=_failing_inner,
+    )
+
+    assert exit_code == 2
+    assert result["blockers"] == ["bad STATUS: pass"]
+
+    stdout = wse._build_compact_stdout(result)
+    lines = stdout.splitlines()
+    assert sum(1 for line in lines if line.startswith("STATUS: ")) == 1
+    assert sum(1 for line in lines if line.startswith("NEXT_ACTION: ")) == 1

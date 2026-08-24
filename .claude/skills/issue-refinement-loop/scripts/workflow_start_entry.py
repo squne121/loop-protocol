@@ -284,6 +284,29 @@ def _default_invoke_inner_preflight(*, issue_number: int, repo: str) -> int:
     return proc.returncode
 
 
+def _validate_single_line_reasons(value: object) -> Optional[list[str]]:
+    """Validate that `value` is a list of non-empty, single-line strings
+    (Issue #2323 fix_delta P1: PR #2328 review
+    https://github.com/squne121/loop-protocol/pull/2328#issuecomment-5395635883).
+    Returns the validated list, or `None` if `value` fails validation (not a
+    list, or any element is not a non-empty single-line string). A "single
+    line" element is one where `item.splitlines(keepends=True) == [item]`
+    (rejects embedded `\n`, `\r`, and other Unicode line-boundary
+    characters that `str.splitlines()` recognizes, e.g. `\u2028`), so a
+    malformed producer `reasons` value can never forge additional
+    `STATUS:`/`NEXT_ACTION:` lines in the compact stdout grammar."""
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not item
+            or item.splitlines(keepends=True) != [item]
+        ):
+            return None
+    return value
+
+
 def run(
     *,
     issue_number: int,
@@ -336,6 +359,22 @@ def run(
     decision = producer_result.get("decision")
     checks = producer_result.get("checks", {})
     reasons = producer_result.get("reasons", [])
+
+    validated_reasons = _validate_single_line_reasons(reasons)
+    if validated_reasons is None:
+        malformed_reason = "producer_result_malformed:invalid_reasons"
+        result = _compact_result(
+            status="blocked",
+            reason=malformed_reason,
+            checks={},
+            reasons=[malformed_reason],
+            decision="blocked",
+            inner_preflight_invoked=False,
+            next_action="fix_environment",
+            blockers=[malformed_reason],
+        )
+        return result, 2
+    reasons = validated_reasons
 
     if decision not in ("ready", "degraded"):
         # AC3/AC7: `blocked` decision, or a producer invocation
