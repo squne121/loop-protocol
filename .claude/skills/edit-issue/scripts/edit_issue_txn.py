@@ -79,8 +79,24 @@ TOP_LEVEL_KEYS = frozenset(
         "expected_previous_updated_at",
         "title_update",
         "native_relationships",
+        "rewrite_lane",
+        "semantic_rewrite_constraints",
     }
 )
+
+# Issue #2316: ISSUE_EDIT_TXN_INPUT_V1 additive extension. rewrite_lane is an
+# optional discriminator (omitted == "fail_closed_repair", preserving pre-#2316
+# behaviour exactly). semantic_rewrite_constraints is only accepted when
+# rewrite_lane == "semantic" (presence-correlation invariant). Its nested
+# payload (source_artifact / checked_body_sha256 / findings /
+# max_rewrite_attempts / no_progress_route etc.) is a versioned opaque
+# envelope produced by join_review_results.py -- edit_issue_txn.py validates
+# only the schema_version discriminator and does not deep-validate nested
+# fields (responsibility for applying the constraints belongs to
+# issue-editor, not this transaction helper).
+REWRITE_LANE_VALUES = frozenset({"fail_closed_repair", "semantic"})
+DEFAULT_REWRITE_LANE = "fail_closed_repair"
+SEMANTIC_REWRITE_CONSTRAINTS_SCHEMA = "SEMANTIC_REWRITE_CONSTRAINTS_V1"
 
 # Issue #1883: ISSUE_EDIT_TXN_INPUT_V1 additive extension. native_relationships
 # is optional -- omitting it entirely preserves the pre-#1883 body/comment-only
@@ -222,6 +238,45 @@ def _validate_input_payload(data: dict[str, Any]) -> None:
         if not isinstance(native_relationships, dict):
             raise ValueError("native_relationships_invalid")
         _validate_native_relationships_shape(native_relationships)
+
+    _validate_rewrite_lane_and_constraints(data)
+
+
+def _validate_rewrite_lane_and_constraints(data: dict[str, Any]) -> None:
+    """Issue #2316: validate the additive rewrite_lane discriminator and its
+    presence-correlation invariant with semantic_rewrite_constraints.
+
+    rewrite_lane is optional; omitting it is equivalent to
+    "fail_closed_repair" (backward compatible with pre-#2316 callers).
+    semantic_rewrite_constraints is only accepted when rewrite_lane ==
+    "semantic"; it is rejected outright for any other (including omitted)
+    lane. When present, only the schema_version discriminator is validated --
+    the nested envelope (source_artifact / checked_body_sha256 / findings /
+    max_rewrite_attempts / no_progress_route etc.) is treated as an opaque,
+    versioned payload and is not deep-validated here (see Background /
+    responsibility-boundary note in the Issue #2316 contract).
+    """
+    rewrite_lane = data.get("rewrite_lane", DEFAULT_REWRITE_LANE)
+    if not isinstance(rewrite_lane, str) or rewrite_lane not in REWRITE_LANE_VALUES:
+        raise ValueError("rewrite_lane_invalid")
+
+    # Issue #2316 fix_delta (P1-1): presence and value must be checked
+    # separately. data.get(...) alone conflates "key absent" with "key
+    # present and explicitly null"; both must be rejected for the
+    # semantic lane (absent) and both must be rejected for any other lane
+    # (present, whether null or an object).
+    constraints_present = "semantic_rewrite_constraints" in data
+    constraints = data.get("semantic_rewrite_constraints")
+    if rewrite_lane == "semantic":
+        if not constraints_present:
+            raise ValueError("semantic_rewrite_constraints_required_for_semantic_lane")
+        if not isinstance(constraints, dict):
+            raise ValueError("semantic_rewrite_constraints_invalid")
+        if constraints.get("schema_version") != SEMANTIC_REWRITE_CONSTRAINTS_SCHEMA:
+            raise ValueError("semantic_rewrite_constraints_schema_version_invalid")
+    else:
+        if constraints_present:
+            raise ValueError("semantic_rewrite_constraints_forbidden_without_semantic_lane")
 
 
 def _validate_native_relationships_shape(data: dict[str, Any]) -> None:
