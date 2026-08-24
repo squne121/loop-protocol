@@ -17,11 +17,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../.." && pwd)"
 TEST_FILE="$SCRIPT_DIR/test_run_retrospective_live_cli.py"
 
+TESTED_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+echo "verify_run_retrospective_live_cli.sh: tested HEAD: $TESTED_HEAD"
+
 SELECT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --select)
-      SELECT="${2:-}"
+      if [ -z "${2:-}" ] || [ "${2#--}" != "$2" ]; then
+        echo "verify_run_retrospective_live_cli.sh: --select requires a non-empty value" >&2
+        exit 2
+      fi
+      SELECT="$2"
       shift 2
       ;;
     *)

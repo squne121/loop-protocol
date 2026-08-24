@@ -692,7 +692,7 @@ def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
 
 #: matches a single leading/trailing markdown code fence around a JSON blob
 #: (```json ... ``` or bare ``` ... ```), used only by
-#: `_structured_output_from_result_fallback` below.
+#: `_structured_output_from_result_compat` below.
 _MARKDOWN_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*)\n```\s*$", re.DOTALL)
 
 
@@ -700,33 +700,38 @@ def _extract_fenced_json_text(text: str) -> str:
     """Strip a single leading/trailing markdown code fence from `text` if
     present (returns `text` stripped of surrounding whitespace unchanged
     otherwise). Pure string transform -- callers still parse/validate the
-    result themselves (Issue #2301 live verification fallback, see
-    `_structured_output_from_result_fallback`)."""
+    result themselves (Issue #2301 live verification compat recovery, see
+    `_structured_output_from_result_compat`)."""
     stripped = text.strip()
     match = _MARKDOWN_JSON_FENCE_RE.match(stripped)
     return match.group(1).strip() if match else stripped
 
 
-def _structured_output_from_result_fallback(
+def _structured_output_from_result_compat(
     payload: dict[str, Any], *, json_schema_path: str
 ) -> dict[str, Any] | None:
     """Best-effort recovery of the schema-conformant business payload from
-    the wrapper's `result` text field when the `structured_output` wrapper
-    field itself is absent (Issue #2301 P0 adapter fix, discovered by live
-    verification against the real `claude` CLI, 2.1.241): a schema-less
-    (no `--agent`) `-p --json-schema ...` invocation populates
-    `structured_output` directly, but a `--agent <custom-subagent>
-    --json-schema ...` invocation does NOT -- the real CLI only ever puts the
-    schema-conformant JSON in `result` (frequently wrapped in a markdown
-    ```json code fence). This fallback is only reached when
-    `structured_output` is missing (never when it is present but a
-    non-dict -- that remains `missing_structured_output` unconditionally,
-    see the caller). The recovered payload is accepted only if it
-    independently, strictly validates against the exact schema file this
-    invocation was given (`request.json_schema_path`) -- mirrors the
-    Issue #2237 P0-1 rationale against re-parsing the *wrapper* itself as the
-    business schema: a malformed/absent `result`, or one that fails schema
-    validation, is never silently accepted as `ok`."""
+    the wrapper's `result` text field, attempted only when the
+    `structured_output` wrapper field is absent or explicitly `None`
+    (Issue #2301 P0-1 adapter fix; PR #2324 review fix_delta narrowed the
+    trigger condition to absent/null only -- a present-but-wrong-type value,
+    e.g. a string, list, or number, is never routed through this recovery
+    path, since the CLI would only ever legitimately omit the field, not
+    populate it with the wrong shape). This behavior was observed against
+    the real `claude` CLI, version 2.1.241, for `--agent <custom-subagent>
+    --json-schema ...` invocations: unlike schema-less (no `--agent`) `-p
+    --json-schema ...` invocations, which populate `structured_output`
+    directly, these custom-subagent invocations were observed to omit
+    `structured_output` and instead carry the schema-conformant JSON in
+    `result` (frequently wrapped in a markdown ```json code fence). This is
+    an observation about invocations actually exercised, not an absolute
+    claim covering every possible custom-subagent invocation. The recovered
+    payload is accepted only if it independently, strictly validates against
+    the exact schema file this invocation was given (`request.
+    json_schema_path`) -- mirrors the Issue #2237 P0-1 rationale against
+    re-parsing the *wrapper* itself as the business schema: a
+    malformed/absent `result`, or one that fails schema validation, is never
+    silently accepted as `ok`."""
     result_text = payload.get("result")
     if not isinstance(result_text, str) or not result_text.strip():
         return None
@@ -770,7 +775,7 @@ def build_agent_invocation_argv(
         "--no-session-persistence",
     ]
     if policy is not None:
-        argv += ["--disallowedTools", ",".join(sorted(policy.denied_tools))]
+        argv += ["--disallowedTools", *sorted(policy.denied_tools)]
     return argv
 
 
@@ -884,17 +889,42 @@ def invoke_agent(
             exit_code=completed.returncode,
             reason_code="unexpected_wrapper_shape",
         )
-    structured_output = payload.get("structured_output")
-    if not isinstance(structured_output, dict):
-        # Issue #2301 P0 adapter fix: real `--agent <custom-subagent>
-        # --json-schema ...` invocations (unlike schema-less/no-`--agent`
-        # `-p --json-schema ...` invocations) never populate the
-        # `structured_output` wrapper field -- see
-        # `_structured_output_from_result_fallback`'s docstring for the full
-        # rationale and why this fallback never loosens validation.
-        structured_output = _structured_output_from_result_fallback(
+
+    # PR #2324 review fix_delta (P0-1): the wrapper's own `subtype` must be
+    # checked *before* any `result`/`structured_output` recovery is
+    # attempted. A non-`"success"` subtype (e.g.
+    # `error_max_structured_output_retries`) signals the CLI itself did not
+    # consider this a successful structured-output invocation, even when
+    # `result` happens to contain schema-conformant JSON text -- promoting
+    # such a response to `status="ok"` would silently mask the CLI's own
+    # failure signal.
+    subtype = payload.get("subtype")
+    if subtype != "success":
+        return AgentInvocationResult(
+            status="partial_result",
+            structured_output=None,
+            raw_stdout_excerpt=None,
+            exit_code=completed.returncode,
+            reason_code=f"result_subtype_not_success:{subtype or 'missing'}",
+        )
+
+    # Issue #2301 P0-1 adapter fix, narrowed by PR #2324 review fix_delta:
+    # `_structured_output_from_result_compat` recovery is attempted ONLY
+    # when `structured_output` is absent or explicitly `None` -- never when
+    # it is present but a non-dict, wrong-type value (string/list/number/
+    # bool), which remains `missing_structured_output` unconditionally. See
+    # `_structured_output_from_result_compat`'s docstring for the full
+    # rationale.
+    _MISSING = object()
+    raw_structured_output = payload.get("structured_output", _MISSING)
+    if isinstance(raw_structured_output, dict):
+        structured_output = raw_structured_output
+    elif raw_structured_output is _MISSING or raw_structured_output is None:
+        structured_output = _structured_output_from_result_compat(
             payload, json_schema_path=request.json_schema_path
         )
+    else:
+        structured_output = None
     if not isinstance(structured_output, dict):
         return AgentInvocationResult(
             status="malformed_output",

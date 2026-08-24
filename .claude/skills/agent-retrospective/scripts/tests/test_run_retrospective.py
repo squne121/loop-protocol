@@ -818,6 +818,137 @@ def test_actual_claude_json_wrapper_rejects_unexpected_shape(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
+# PR #2324 review fix_delta P0-1 regression guards + P1-2 hermetic coverage:
+# `subtype` gate must run before any `result`/`structured_output` recovery,
+# and compat recovery (`_structured_output_from_result_compat`) must only
+# ever be attempted when `structured_output` is absent or explicitly `None`.
+# ---------------------------------------------------------------------------
+
+
+def _compat_schema(tmp_path: Path) -> Path:
+    schema_path = tmp_path / "compat_schema.json"
+    schema_path.write_text(
+        json.dumps({"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}}),
+        encoding="utf-8",
+    )
+    return schema_path
+
+
+def test_fix_delta_p01_result_recovered_when_structured_output_absent(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    business_payload = {"a": "from-result-raw"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": json.dumps(business_payload),
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "ok"
+    assert result.structured_output == business_payload
+
+
+def test_fix_delta_p01_result_recovered_when_structured_output_explicit_null(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    business_payload = {"a": "from-result-fenced"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "```json\n" + json.dumps(business_payload) + "\n```",
+            "structured_output": None,
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "ok"
+    assert result.structured_output == business_payload
+
+
+def test_fix_delta_p01_non_success_subtype_never_promoted_to_ok(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    business_payload = {"a": "should-not-be-accepted"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "error_max_structured_output_retries",
+            "is_error": False,
+            "result": json.dumps(business_payload),
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "partial_result"
+    assert result.reason_code == "result_subtype_not_success:error_max_structured_output_retries"
+
+
+def test_fix_delta_p01_present_wrong_type_structured_output_never_recovers_from_result(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    business_payload = {"a": "should-not-be-recovered"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": json.dumps(business_payload),
+            "structured_output": "not-a-dict",
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "malformed_output"
+    assert result.reason_code == "missing_structured_output"
+
+
+def test_fix_delta_p01_present_dict_structured_output_takes_priority_over_result(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    dict_payload = {"a": "from-structured-output-dict"}
+    mismatched_result_payload = {"a": "from-result-should-be-ignored"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": json.dumps(mismatched_result_payload),
+            "structured_output": dict_payload,
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "ok"
+    assert result.structured_output == dict_payload
+    assert result.structured_output != mismatched_result_payload
+
+
+def test_fix_delta_p01_result_failing_schema_validation_rejected(tmp_path: Path) -> None:
+    schema_path = _compat_schema(tmp_path)
+    # missing the required "a" field -> fails schema validation
+    non_conformant_payload = {"b": "no-required-field"}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        wrapper = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": json.dumps(non_conformant_payload),
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(wrapper), stderr="")
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=_runner)
+    assert result.status == "malformed_output"
+    assert result.reason_code == "missing_structured_output"
+
+
+# ---------------------------------------------------------------------------
 # fix_delta gate #4: single executable entrypoint, collectors -> PublishRequest
 # ---------------------------------------------------------------------------
 
@@ -1277,10 +1408,19 @@ def test_permission_policy_is_consumed_by_runtime_and_bypass_resistant(
     rr.invoke_agent(request, runner=_runner, policy=policy)
 
     # THE SAME policy instance's denied-tool set is what the real subprocess
-    # argv carries (not merely asserted against in isolation)
+    # argv carries (not merely asserted against in isolation). Each denied
+    # tool is its own argv element -- not a single comma-joined string --
+    # matching the official Claude CLI reference for `--disallowedTools`
+    # (PR #2324 review fix_delta P1-5).
     assert "--disallowedTools" in captured["argv"]
-    disallowed_csv = captured["argv"][captured["argv"].index("--disallowedTools") + 1]
-    assert set(disallowed_csv.split(",")) == policy.denied_tools
+    argv = captured["argv"]
+    start = argv.index("--disallowedTools") + 1
+    end = start
+    while end < len(argv) and not argv[end].startswith("--"):
+        end += 1
+    disallowed_elements = argv[start:end]
+    assert set(disallowed_elements) == policy.denied_tools
+    assert len(disallowed_elements) == len(policy.denied_tools)
 
     # mutation credentials never reach the subprocess env, even though they
     # were present in the ambient environment

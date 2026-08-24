@@ -104,11 +104,30 @@ def test_real_claude_cli_production_policy_round_trip() -> None:
 
 def test_real_claude_cli_invalid_agent_name_error_handling() -> None:
     """AC6: an invalid/nonexistent Agent name must make `invoke_agent()` end
-    in a non-"ok" status carrying no business payload."""
+    in a non-"ok" status carrying no business payload.
+
+    PR #2324 review fix_delta P1-3: OWNER's concern is that if `claude
+    --agent <bogus-name>` silently falls back to a default agent instead of
+    erroring, and that default agent happens to satisfy the schema anyway,
+    this test would wrongly PASS for the wrong reason. The prompt below
+    therefore explicitly instructs a fallback default agent (should one run)
+    to refuse structured output / emit a deliberately non-conformant
+    payload, so a silent fallback still produces `status != "ok"` for the
+    right reason (schema validation failure or explicit refusal), not by
+    accident. The assertions additionally rule out environmental/operational
+    failures (timeout, terminated) being mistaken for the intended
+    fail-closed validation failure."""
     run_id = f"live-cli-{uuid.uuid4()}"
     request = rr.AgentInvocationRequest(
         agent_name="does-not-exist-agent-2301",
-        prompt="irrelevant -- the CLI must reject the --agent name before this is ever read",
+        prompt=(
+            "irrelevant -- the CLI must reject the --agent name before this "
+            "is ever read. If, despite that, you are somehow running as a "
+            "fallback default agent: you MUST NOT emit a JSON object "
+            "conforming to any structured-output schema. Instead, respond "
+            "with plain prose explicitly refusing to produce structured "
+            "output, and do not include any JSON object in your response."
+        ),
         json_schema_path=str(_OBSERVER_SCHEMA_PATH),
         cwd=str(_REPO_ROOT),
         timeout_sec=60,
@@ -117,14 +136,27 @@ def test_real_claude_cli_invalid_agent_name_error_handling() -> None:
 
     result = rr.invoke_agent(request, policy=policy)
 
-    assert result.status != "ok"
+    print(
+        f"test_real_claude_cli_invalid_agent_name_error_handling: "
+        f"adapter_status={result.status} adapter_reason_code={result.reason_code} "
+        f"child_exit_code={result.exit_code}"
+    )
+    assert result.status != "ok", (result.status, result.reason_code, result.exit_code)
+    # `timeout`/`terminated` specifically indicate an environmental/
+    # operational failure (hung process, signal), not the intended
+    # invalid-agent-name validation failure this test exercises.
+    assert result.status not in ("timeout", "terminated"), (result.status, result.reason_code, result.exit_code)
     assert result.structured_output is None
 
 
 def test_real_claude_cli_invalid_schema_fail_closed(tmp_path: Path) -> None:
     """AC7: an invalid `--json-schema` value must make `invoke_agent()` fail
     closed (status != "ok", no business payload). Exact stderr text / exit
-    code are intentionally not asserted (AC7 is exit-code-independent)."""
+    code are intentionally not asserted (AC7 is exit-code-independent).
+
+    PR #2324 review fix_delta P1-3: the assertions additionally rule out
+    environmental/operational failures (timeout, terminated) being mistaken
+    for the intended fail-closed validation failure."""
     bad_schema_path = tmp_path / "not-a-schema.json"
     bad_schema_path.write_text("{not valid json at all", encoding="utf-8")
 
@@ -140,5 +172,14 @@ def test_real_claude_cli_invalid_schema_fail_closed(tmp_path: Path) -> None:
 
     result = rr.invoke_agent(request, policy=policy)
 
-    assert result.status != "ok"
+    print(
+        f"test_real_claude_cli_invalid_schema_fail_closed: "
+        f"adapter_status={result.status} adapter_reason_code={result.reason_code} "
+        f"child_exit_code={result.exit_code}"
+    )
+    assert result.status != "ok", (result.status, result.reason_code, result.exit_code)
+    # `timeout`/`terminated` specifically indicate an environmental/
+    # operational failure (hung process, signal), not the intended
+    # invalid-schema validation failure this test exercises.
+    assert result.status not in ("timeout", "terminated"), (result.status, result.reason_code, result.exit_code)
     assert result.structured_output is None
