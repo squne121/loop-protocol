@@ -4,7 +4,9 @@ import json
 import sys
 from pathlib import Path
 
+import jsonschema
 import pytest
+import yaml
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
@@ -94,17 +96,109 @@ def _semantic_producer_shaped_constraints() -> dict:
     return {
         "schema_version": "SEMANTIC_REWRITE_CONSTRAINTS_V1",
         "source_artifact": "artifacts/2296/semantic-review/2026-08-01T00-00-00Z.json",
-        "checked_body_sha256": "sha256:abc123",
+        # Issue #2316 fix_delta (P2-1): real sha256 hex digest shape, not a
+        # short placeholder -- join_review_results.py forwards the actual
+        # body_sha256 from the SEMANTIC_REVIEW_RESULT_V1 sidecar, which is
+        # constrained to ^[0-9a-f]{64}$ by schemas/semantic_review_result_v1.schema.json.
+        "checked_body_sha256": "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff",
+        # SEMANTIC_REVIEW_RESULT_V1 findings entries are additionalProperties:
+        # false with only severity/summary required (plus optional
+        # evidence_refs / recommended_fix / requires_owner_choice /
+        # owner_disposition) -- there is no "id" field in the real producer
+        # shape, so it is omitted here.
         "findings": [
             {
-                "id": "F1",
                 "severity": "blocker",
                 "summary": "AC の VC が Allowed Paths 外を参照している",
             }
         ],
         "max_rewrite_attempts": 2,
-        "no_progress_route": "human_judgment",
+        # Issue #2316 fix_delta (P2-1): matches
+        # join_review_results.DEFAULT_NO_PROGRESS_ROUTE exactly.
+        "no_progress_route": "human_judgment_required",
     }
+
+
+def _extract_issue_edit_txn_input_schema() -> dict:
+    # Issue #2316 fix_delta (P1-2): reuse the same doc-slicing approach as
+    # test_schema_contracts_are_closed above (locate the section between the
+    # ISSUE_EDIT_TXN_INPUT_V1 and ISSUE_EDIT_TXN_RESULT_V1 headings, then pull
+    # out the fenced ```yaml block) so the extraction logic never split-brains
+    # between the two tests.
+    docs = (
+        Path(__file__).resolve().parents[4] / "docs" / "dev" / "agent-skill-boundaries.md"
+    ).read_text(encoding="utf-8")
+    input_section = docs.split("### ISSUE_EDIT_TXN_INPUT_V1", 1)[1].split("### ISSUE_EDIT_TXN_RESULT_V1", 1)[0]
+    block = input_section.split("```yaml", 1)[1].split("```", 1)[0]
+    return yaml.safe_load(block)
+
+
+def _base_schema_instance() -> dict:
+    # Minimal but otherwise-valid ISSUE_EDIT_TXN_INPUT_V1 instance (reuses the
+    # same shape as _minimal_input(), without the repo_tmp-bound file paths
+    # that only matter for the executable validator, not the JSON Schema).
+    return {
+        "schema": "ISSUE_EDIT_TXN_INPUT_V1",
+        "issue_number": 1287,
+        "repo": "squne121/loop-protocol",
+        "new_body_file": "tmp/new_body.md",
+        "readiness_forwarding_payload": {
+            "readiness_result": {
+                "status": "go",
+                "body_sha256": "sha256:old",
+                "source_checks": ["contract_readiness_check.py --mode static"],
+                "errors": [],
+                "readiness_result_ref": "artifact.json",
+            }
+        },
+        "comment_mode": {"mode": "skip"},
+        "expected_previous_body_sha256": "0" * 64,
+        "expected_previous_updated_at": "2026-07-03T10:40:51Z",
+        "title_update": {"required": False, "proposed_title": None, "reason": None},
+    }
+
+
+@pytest.mark.parametrize(
+    ("rewrite_lane", "constraints", "expect_valid"),
+    [
+        pytest.param(None, "omit", True, id="legacy_both_fields_omitted"),
+        pytest.param("semantic", _semantic_producer_shaped_constraints(), True, id="semantic_plus_object"),
+        pytest.param("semantic", "omit", False, id="semantic_plus_missing_constraints_key"),
+        pytest.param("semantic", None, False, id="semantic_plus_null_constraints"),
+        pytest.param(
+            None, _semantic_producer_shaped_constraints(), False, id="omitted_lane_plus_constraints_object"
+        ),
+        pytest.param(None, None, False, id="omitted_lane_plus_constraints_null"),
+        pytest.param(
+            "fail_closed_repair",
+            _semantic_producer_shaped_constraints(),
+            False,
+            id="fail_closed_repair_lane_plus_constraints_object",
+        ),
+        pytest.param("fail_closed_repair", None, False, id="fail_closed_repair_lane_plus_constraints_null"),
+        pytest.param("bogus", "omit", False, id="invalid_lane_value_plus_no_constraints"),
+    ],
+)
+def test_issue_edit_txn_input_schema_presence_correlation(
+    rewrite_lane: "str | None", constraints: object, expect_valid: bool
+) -> None:
+    # Issue #2316 fix_delta (P1-2): validate the canonical
+    # ISSUE_EDIT_TXN_INPUT_V1 JSON Schema block itself (not just token
+    # strings) against the full presence-correlation state matrix from the
+    # human REQUEST_CHANGES review, using the real jsonschema library so a
+    # regression in the doc's allOf/if/then/else block is actually caught.
+    schema = _extract_issue_edit_txn_input_schema()
+    instance = _base_schema_instance()
+    if rewrite_lane is not None:
+        instance["rewrite_lane"] = rewrite_lane
+    if constraints != "omit":
+        instance["semantic_rewrite_constraints"] = constraints
+
+    if expect_valid:
+        jsonschema.validate(instance, schema)
+    else:
+        with pytest.raises(jsonschema.exceptions.ValidationError):
+            jsonschema.validate(instance, schema)
 
 
 def test_rewrite_lane_omitted_legacy_payload_still_accepted(repo_tmp: Path) -> None:

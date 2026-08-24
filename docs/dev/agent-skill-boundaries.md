@@ -2235,11 +2235,23 @@ properties:
     # edit_issue_txn.py validates only schema_version and does not deep
     # -validate source_artifact / checked_body_sha256 / findings /
     # max_rewrite_attempts / no_progress_route.
-    type: [object, "null"]
+    type: object
     required: [schema_version]
+    additionalProperties: true
     properties:
       schema_version:
         const: SEMANTIC_REWRITE_CONSTRAINTS_V1
+allOf:
+  - if:
+      required: [rewrite_lane]
+      properties:
+        rewrite_lane:
+          const: semantic
+    then:
+      required: [semantic_rewrite_constraints]
+    else:
+      not:
+        required: [semantic_rewrite_constraints]
 ```
 
 - `title_update.required == true` は non-empty の `proposed_title` と `reason` を必須とし、

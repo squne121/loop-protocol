@@ -260,16 +260,22 @@ def _validate_rewrite_lane_and_constraints(data: dict[str, Any]) -> None:
     if not isinstance(rewrite_lane, str) or rewrite_lane not in REWRITE_LANE_VALUES:
         raise ValueError("rewrite_lane_invalid")
 
+    # Issue #2316 fix_delta (P1-1): presence and value must be checked
+    # separately. data.get(...) alone conflates "key absent" with "key
+    # present and explicitly null"; both must be rejected for the
+    # semantic lane (absent) and both must be rejected for any other lane
+    # (present, whether null or an object).
+    constraints_present = "semantic_rewrite_constraints" in data
     constraints = data.get("semantic_rewrite_constraints")
     if rewrite_lane == "semantic":
-        if constraints is None:
+        if not constraints_present:
             raise ValueError("semantic_rewrite_constraints_required_for_semantic_lane")
         if not isinstance(constraints, dict):
             raise ValueError("semantic_rewrite_constraints_invalid")
         if constraints.get("schema_version") != SEMANTIC_REWRITE_CONSTRAINTS_SCHEMA:
             raise ValueError("semantic_rewrite_constraints_schema_version_invalid")
     else:
-        if constraints is not None:
+        if constraints_present:
             raise ValueError("semantic_rewrite_constraints_forbidden_without_semantic_lane")
 
 
