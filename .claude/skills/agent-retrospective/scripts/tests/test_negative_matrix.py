@@ -289,13 +289,22 @@ def test_negative_matrix_pagination_exhaustion_forces_indeterminate_never_resolv
 
 
 def test_negative_matrix_stale_head_git_history_advanced_forces_indeterminate() -> None:
-    """'stale-head' (Git base SHA comparison): the previous published run was
-    generated for an older base_sha than the current run and has since aged
-    past the opt-in freshness bound -- classified 'stale' (the only
-    production status IssueCommentPreviousStateProvider exposes for a
-    previous read no longer trustworthy as a base for the current run),
-    forcing every current candidate to 'indeterminate' -- never a false
-    'resolved'."""
+    """'stale-head' (age-based staleness): the previous published run has
+    aged past the opt-in freshness bound (`stale_after_seconds`) -- classified
+    'stale' (the only production status IssueCommentPreviousStateProvider
+    exposes for a previous read no longer trustworthy as a base for the
+    current run), forcing every current candidate to 'indeterminate' -- never
+    a false 'resolved'.
+
+    Issue #2239 PR #2331 fix_delta P0-3: this docstring previously said
+    "Git base SHA comparison", which was inaccurate -- confirmed against
+    production `persist_retrospective_run.py`, no Git base SHA comparison
+    mechanism exists there; the only stale-detection mechanism implemented
+    is age-based (`generated_at` + `stale_after_seconds`), which is what
+    this test actually exercises below. `old_base_sha` is retained only to
+    exercise `run_identity.base_sha`'s field type/shape on the seeded
+    previous envelope -- it is never compared against the current run's
+    base_sha to determine staleness."""
     transport = _FakeTransport()
     old_base_sha = "c" * 40
     stale_envelope = pr.build_run_envelope(
@@ -492,6 +501,83 @@ def test_evaluator_ordering_or_unauthorized_publication_evaluator_waits_for_obse
     assert isinstance(publish_request, rr.PublishRequest)
     assert call_log[-1] == "retrospective-evaluator"
     assert set(call_log[:-1]) == {spec.observer_id for spec in rr.EXPECTED_OBSERVER_MANIFEST}
+
+
+def test_evaluator_ordering_or_unauthorized_publication_evaluator_never_invoked_on_observer_failure() -> None:
+    """Issue #2239 PR #2331 fix_delta P1-4: the happy-path AC10 test above
+    only exercises the ordering when every observer succeeds. This makes ONE
+    observer fail (`status != "ok"`, triggering `ObserverWaveFailed` inside
+    `run_observer_wave()`) and asserts `execute_run()` raises before ever
+    invoking the evaluator -- the `invoke_evaluator` callback's call count
+    must be exactly 0."""
+    call_log: list[str] = []
+    evaluator_call_count = 0
+
+    _, precomputed_plan, _ = rr.prepare(base_sha_resolver=lambda: _FULL_SHA, collectors=[], run_id="run-ac10-fail")
+    expected_digest = precomputed_plan.source_set_digest
+    failing_observer_id = rr.EXPECTED_OBSERVER_MANIFEST[0].observer_id
+
+    def _invoke(request: "rr.AgentInvocationRequest") -> "rr.AgentInvocationResult":
+        call_log.append(request.agent_name)
+        if request.agent_name == failing_observer_id:
+            return rr.AgentInvocationResult(
+                status="error", structured_output=None, raw_stdout_excerpt=None, exit_code=1, reason_code="boom"
+            )
+        bundle = rr.EvidenceBundle(
+            run_id="run-ac10-fail",
+            base_sha=_FULL_SHA,
+            source_set_digest=expected_digest,
+            observer_id=request.agent_name,
+            evidence_ref=f"evidence://{request.agent_name}",
+            findings=[{"claim": "x", "claim_class": "process"}],
+        )
+        return rr.AgentInvocationResult(
+            status="ok",
+            structured_output=json.loads(bundle.to_wire()),
+            raw_stdout_excerpt=None,
+            exit_code=0,
+            reason_code=None,
+        )
+
+    def _invoke_evaluator(request: "rr.EvaluatorRequest") -> "rr.AgentInvocationResult":
+        nonlocal evaluator_call_count
+        evaluator_call_count += 1
+        call_log.append("retrospective-evaluator")
+        evaluation = rr.Evaluation(
+            run_id="run-ac10-fail",
+            base_sha=_FULL_SHA,
+            source_set_digest=expected_digest,
+            candidate_records=[],
+            evidence_ref="e",
+        )
+        return rr.AgentInvocationResult(
+            status="ok",
+            structured_output=json.loads(evaluation.to_wire()),
+            raw_stdout_excerpt=None,
+            exit_code=0,
+            reason_code=None,
+        )
+
+    observer_requests = [
+        rr.AgentInvocationRequest(agent_name=spec.observer_id, prompt="p", json_schema_path="/dev/null", cwd="/repo")
+        for spec in rr.EXPECTED_OBSERVER_MANIFEST
+    ]
+
+    with pytest.raises(rr.ObserverWaveFailed):
+        rr.execute_run(
+            base_sha_resolver=lambda: _FULL_SHA,
+            collectors=[],
+            observer_requests=observer_requests,
+            invoke=_invoke,
+            invoke_evaluator=_invoke_evaluator,
+            repository_id=_REPO_ID,
+            target_issue=_TARGET_ISSUE,
+            request_id="req-ac10-fail",
+            idempotency_key="idem-ac10-fail",
+            run_id="run-ac10-fail",
+        )
+    assert evaluator_call_count == 0
+    assert "retrospective-evaluator" not in call_log
 
 
 def test_evaluator_ordering_or_unauthorized_publication_denied_without_authorization_zero_post() -> None:

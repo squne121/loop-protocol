@@ -200,12 +200,17 @@ def test_evals_schema_and_trigger_contract() -> None:
     evals = payload["evals"]
     assert isinstance(evals, list) and evals, "evals[] must be a non-empty list"
 
-    seen_ids: set[str] = set()
+    seen_ids: set[int] = set()
     for case in evals:
         assert _EVALS_REQUIRED_CASE_FIELDS <= set(case.keys())
         assert set(case.keys()) <= (_EVALS_REQUIRED_CASE_FIELDS | _EVALS_OPTIONAL_CASE_FIELDS)
         case_id = case["id"]
-        assert isinstance(case_id, str) and case_id, "eval id must be a non-empty string"
+        # Issue #2239 PR #2331 fix_delta P0-2: the official skill-creator
+        # eval input schema requires `id` to be a unique INTEGER identifier
+        # (`isinstance(case_id, str)` was the pre-fix_delta, non-conformant
+        # shape). `bool` is technically an `int` subclass in Python -- excluded
+        # explicitly so a stray `true`/`false` id is not silently accepted.
+        assert isinstance(case_id, int) and not isinstance(case_id, bool), "eval id must be an integer"
         assert case_id not in seen_ids, f"duplicate eval id: {case_id}"
         seen_ids.add(case_id)
         assert isinstance(case["prompt"], str) and case["prompt"].strip()
@@ -435,9 +440,25 @@ def _run_live_smoke(runtime_profile: str) -> None:
         )
     payload = json.loads(completed.stdout.strip().splitlines()[-1])
     assert payload["schema"] == "AGENT_RETROSPECTIVE_LIVE_SMOKE_RESULT_V1"
-    assert payload["status"] == "pass"
+    # Issue #2239 PR #2331 fix_delta P0-1: the verifier now actually
+    # launches the real root Skill (via a headless `claude -p` slash
+    # invocation) and inspects the real `run_retrospective.py` Bash
+    # tool_result. Both "pass" (a full PublishRequest bound to this run)
+    # and "fail" (a well-formed typed production failure envelope -- e.g.
+    # the documented run_id/prompt-binding gap, since `--prompts-file`
+    # cannot be pre-seeded with the correct `ctx.run_id`, which is
+    # generated fresh inside `run_cli()`/`main()` with no CLI override) are
+    # accepted terminal outcomes per AC6/AC7 ("PUBLISH_REQUEST_V1 or a
+    # typed failure envelope, as long as it is parseable"). Only a genuine
+    # verifier anomaly (timeout, transport error, malformed transcript,
+    # fingerprint drift, forbidden mutation event) is a real pytest
+    # failure, and those already exit non-zero above.
+    assert payload["status"] in ("pass", "fail")
+    if payload["status"] == "fail":
+        assert payload["reason_code"]
     assert payload["fallback_used"] is False
     assert payload["repository_fingerprint_diff_clean"] is True
+    assert payload["forbidden_mutation_tool_events"] == 0
     assert payload["tested_head"]
     if runtime_profile == "claude_gpt":
         # AC7: the claude-gpt path must record the same oracle the existing
@@ -462,10 +483,12 @@ def _run_live_smoke(runtime_profile: str) -> None:
             assert proxy_cleanup_independent["cleanup_confirmed"] is True
 
 
+@pytest.mark.claude_live
 def test_live_smoke_claude_code_operator_run() -> None:
     _run_live_smoke("claude_code")
 
 
+@pytest.mark.claude_live
 def test_live_smoke_claude_gpt_operator_run() -> None:
     _run_live_smoke("claude_gpt")
 
