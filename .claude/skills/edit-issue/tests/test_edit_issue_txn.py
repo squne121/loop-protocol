@@ -4,7 +4,9 @@ import json
 import sys
 from pathlib import Path
 
+import jsonschema
 import pytest
+import yaml
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
@@ -78,6 +80,233 @@ def test_schema_contracts_are_closed() -> None:
     assert docs.count("additionalProperties: false") >= 2
     assert "body_update:" in docs
     assert "comment_publish:" in docs
+    # Issue #2316: canonical schema must declare both additive properties
+    # (not just the heading/additionalProperties count) so the Python
+    # validator (TOP_LEVEL_KEYS) and the canonical schema never split-brain.
+    input_section = docs.split("### ISSUE_EDIT_TXN_INPUT_V1", 1)[1].split("### ISSUE_EDIT_TXN_RESULT_V1", 1)[0]
+    assert "  rewrite_lane:" in input_section
+    assert "  semantic_rewrite_constraints:" in input_section
+
+
+def _semantic_producer_shaped_constraints() -> dict:
+    # Mirrors the exact shape join_review_results.py's
+    # _semantic_rewrite_constraints() emits (scripts/issue-refinement-loop,
+    # lines ~132-145), including the fields it forwards from
+    # _result(rewrite_lane="semantic", ...) at lines ~226-237.
+    return {
+        "schema_version": "SEMANTIC_REWRITE_CONSTRAINTS_V1",
+        "source_artifact": "artifacts/2296/semantic-review/2026-08-01T00-00-00Z.json",
+        # Issue #2316 fix_delta (P2-1): real sha256 hex digest shape, not a
+        # short placeholder -- join_review_results.py forwards the actual
+        # body_sha256 from the SEMANTIC_REVIEW_RESULT_V1 sidecar, which is
+        # constrained to ^[0-9a-f]{64}$ by schemas/semantic_review_result_v1.schema.json.
+        "checked_body_sha256": "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff",
+        # SEMANTIC_REVIEW_RESULT_V1 findings entries are additionalProperties:
+        # false with only severity/summary required (plus optional
+        # evidence_refs / recommended_fix / requires_owner_choice /
+        # owner_disposition) -- there is no "id" field in the real producer
+        # shape, so it is omitted here.
+        "findings": [
+            {
+                "severity": "blocker",
+                "summary": "AC の VC が Allowed Paths 外を参照している",
+            }
+        ],
+        "max_rewrite_attempts": 2,
+        # Issue #2316 fix_delta (P2-1): matches
+        # join_review_results.DEFAULT_NO_PROGRESS_ROUTE exactly.
+        "no_progress_route": "human_judgment_required",
+    }
+
+
+def _extract_issue_edit_txn_input_schema() -> dict:
+    # Issue #2316 fix_delta (P1-2): reuse the same doc-slicing approach as
+    # test_schema_contracts_are_closed above (locate the section between the
+    # ISSUE_EDIT_TXN_INPUT_V1 and ISSUE_EDIT_TXN_RESULT_V1 headings, then pull
+    # out the fenced ```yaml block) so the extraction logic never split-brains
+    # between the two tests.
+    docs = (
+        Path(__file__).resolve().parents[4] / "docs" / "dev" / "agent-skill-boundaries.md"
+    ).read_text(encoding="utf-8")
+    input_section = docs.split("### ISSUE_EDIT_TXN_INPUT_V1", 1)[1].split("### ISSUE_EDIT_TXN_RESULT_V1", 1)[0]
+    block = input_section.split("```yaml", 1)[1].split("```", 1)[0]
+    return yaml.safe_load(block)
+
+
+def _base_schema_instance() -> dict:
+    # Minimal but otherwise-valid ISSUE_EDIT_TXN_INPUT_V1 instance (reuses the
+    # same shape as _minimal_input(), without the repo_tmp-bound file paths
+    # that only matter for the executable validator, not the JSON Schema).
+    return {
+        "schema": "ISSUE_EDIT_TXN_INPUT_V1",
+        "issue_number": 1287,
+        "repo": "squne121/loop-protocol",
+        "new_body_file": "tmp/new_body.md",
+        "readiness_forwarding_payload": {
+            "readiness_result": {
+                "status": "go",
+                "body_sha256": "sha256:old",
+                "source_checks": ["contract_readiness_check.py --mode static"],
+                "errors": [],
+                "readiness_result_ref": "artifact.json",
+            }
+        },
+        "comment_mode": {"mode": "skip"},
+        "expected_previous_body_sha256": "0" * 64,
+        "expected_previous_updated_at": "2026-07-03T10:40:51Z",
+        "title_update": {"required": False, "proposed_title": None, "reason": None},
+    }
+
+
+@pytest.mark.parametrize(
+    ("rewrite_lane", "constraints", "expect_valid"),
+    [
+        pytest.param(None, "omit", True, id="legacy_both_fields_omitted"),
+        pytest.param("semantic", _semantic_producer_shaped_constraints(), True, id="semantic_plus_object"),
+        pytest.param("semantic", "omit", False, id="semantic_plus_missing_constraints_key"),
+        pytest.param("semantic", None, False, id="semantic_plus_null_constraints"),
+        pytest.param(
+            None, _semantic_producer_shaped_constraints(), False, id="omitted_lane_plus_constraints_object"
+        ),
+        pytest.param(None, None, False, id="omitted_lane_plus_constraints_null"),
+        pytest.param(
+            "fail_closed_repair",
+            _semantic_producer_shaped_constraints(),
+            False,
+            id="fail_closed_repair_lane_plus_constraints_object",
+        ),
+        pytest.param("fail_closed_repair", None, False, id="fail_closed_repair_lane_plus_constraints_null"),
+        pytest.param("bogus", "omit", False, id="invalid_lane_value_plus_no_constraints"),
+    ],
+)
+def test_issue_edit_txn_input_schema_presence_correlation(
+    rewrite_lane: "str | None", constraints: object, expect_valid: bool
+) -> None:
+    # Issue #2316 fix_delta (P1-2): validate the canonical
+    # ISSUE_EDIT_TXN_INPUT_V1 JSON Schema block itself (not just token
+    # strings) against the full presence-correlation state matrix from the
+    # human REQUEST_CHANGES review, using the real jsonschema library so a
+    # regression in the doc's allOf/if/then/else block is actually caught.
+    schema = _extract_issue_edit_txn_input_schema()
+    instance = _base_schema_instance()
+    if rewrite_lane is not None:
+        instance["rewrite_lane"] = rewrite_lane
+    if constraints != "omit":
+        instance["semantic_rewrite_constraints"] = constraints
+
+    if expect_valid:
+        jsonschema.validate(instance, schema)
+    else:
+        with pytest.raises(jsonschema.exceptions.ValidationError):
+            jsonschema.validate(instance, schema)
+
+
+def test_rewrite_lane_omitted_legacy_payload_still_accepted(repo_tmp: Path) -> None:
+    # GIVEN a legacy input omitting both rewrite_lane and
+    # semantic_rewrite_constraints (pre-#2316 shape)
+    payload = _minimal_input(repo_tmp)
+    assert "rewrite_lane" not in payload
+    assert "semantic_rewrite_constraints" not in payload
+    # WHEN validated
+    # THEN it is accepted unchanged (AC2 -- no regression in fail_closed_repair lane)
+    txn._validate_input_payload(payload)
+
+
+def test_rewrite_lane_fail_closed_repair_explicit_without_constraints_accepted(repo_tmp: Path) -> None:
+    # GIVEN an explicit fail_closed_repair lane with no constraints
+    payload = _minimal_input(repo_tmp)
+    payload["rewrite_lane"] = "fail_closed_repair"
+    # WHEN validated THEN it is accepted
+    txn._validate_input_payload(payload)
+
+
+def test_rewrite_lane_semantic_with_producer_shaped_constraints_accepted(repo_tmp: Path) -> None:
+    # GIVEN a rewrite_lane=semantic input bound to the real producer
+    # (join_review_results.py) shape (AC3)
+    payload = _minimal_input(repo_tmp)
+    payload["rewrite_lane"] = "semantic"
+    payload["semantic_rewrite_constraints"] = _semantic_producer_shaped_constraints()
+    # WHEN validated THEN it is accepted without input_unknown_keys
+    txn._validate_input_payload(payload)
+
+
+def test_invalid_rewrite_lane_rejected(repo_tmp: Path) -> None:
+    # GIVEN a rewrite_lane outside the enum (AC4)
+    payload = _minimal_input(repo_tmp)
+    payload["rewrite_lane"] = "invalid_lane"
+    # WHEN validated THEN it is fail-closed rejected with a clear reason code
+    with pytest.raises(ValueError, match="rewrite_lane_invalid"):
+        txn._validate_input_payload(payload)
+
+
+def test_semantic_rewrite_lane_without_constraints_rejected(repo_tmp: Path) -> None:
+    # GIVEN rewrite_lane=semantic but semantic_rewrite_constraints omitted (AC5)
+    payload = _minimal_input(repo_tmp)
+    payload["rewrite_lane"] = "semantic"
+    # WHEN validated THEN it is fail-closed rejected
+    with pytest.raises(ValueError, match="semantic_rewrite_constraints_required_for_semantic_lane"):
+        txn._validate_input_payload(payload)
+
+
+def test_semantic_rewrite_constraints_without_semantic_rewrite_lane_rejected(repo_tmp: Path) -> None:
+    # GIVEN semantic_rewrite_constraints present but rewrite_lane omitted
+    # (defaults to fail_closed_repair) (AC6)
+    payload = _minimal_input(repo_tmp)
+    payload["semantic_rewrite_constraints"] = _semantic_producer_shaped_constraints()
+    # WHEN validated THEN it is fail-closed rejected
+    with pytest.raises(ValueError, match="semantic_rewrite_constraints_forbidden_without_semantic_lane"):
+        txn._validate_input_payload(payload)
+
+
+def test_semantic_rewrite_constraints_with_fail_closed_repair_lane_rejected(repo_tmp: Path) -> None:
+    # GIVEN semantic_rewrite_constraints present with an explicit
+    # fail_closed_repair lane (AC6, non-omitted variant)
+    payload = _minimal_input(repo_tmp)
+    payload["rewrite_lane"] = "fail_closed_repair"
+    payload["semantic_rewrite_constraints"] = _semantic_producer_shaped_constraints()
+    with pytest.raises(ValueError, match="semantic_rewrite_constraints_forbidden_without_semantic_lane"):
+        txn._validate_input_payload(payload)
+
+
+def test_semantic_rewrite_constraints_wrong_schema_version_missing_rejected(repo_tmp: Path) -> None:
+    # GIVEN semantic_rewrite_constraints missing schema_version (AC7)
+    payload = _minimal_input(repo_tmp)
+    payload["rewrite_lane"] = "semantic"
+    constraints = _semantic_producer_shaped_constraints()
+    del constraints["schema_version"]
+    payload["semantic_rewrite_constraints"] = constraints
+    with pytest.raises(ValueError, match="semantic_rewrite_constraints_schema_version_invalid"):
+        txn._validate_input_payload(payload)
+
+
+def test_semantic_rewrite_constraints_wrong_schema_version_mismatched_rejected(repo_tmp: Path) -> None:
+    # GIVEN semantic_rewrite_constraints with a mismatched schema_version (AC7)
+    payload = _minimal_input(repo_tmp)
+    payload["rewrite_lane"] = "semantic"
+    constraints = _semantic_producer_shaped_constraints()
+    constraints["schema_version"] = "SEMANTIC_REWRITE_CONSTRAINTS_V2"
+    payload["semantic_rewrite_constraints"] = constraints
+    with pytest.raises(ValueError, match="semantic_rewrite_constraints_schema_version_invalid"):
+        txn._validate_input_payload(payload)
+
+
+def test_semantic_rewrite_constraints_not_object_rejected(repo_tmp: Path) -> None:
+    # GIVEN semantic_rewrite_constraints that is not an object (AC7)
+    payload = _minimal_input(repo_tmp)
+    payload["rewrite_lane"] = "semantic"
+    payload["semantic_rewrite_constraints"] = "not-an-object"
+    with pytest.raises(ValueError, match="semantic_rewrite_constraints_invalid"):
+        txn._validate_input_payload(payload)
+
+
+def test_input_unknown_keys_still_rejected(repo_tmp: Path) -> None:
+    # GIVEN a top-level key outside TOP_LEVEL_KEYS, including the two new
+    # additive keys added by Issue #2316 (AC8 -- _require_closed_keys
+    # fail-closed behaviour is preserved)
+    payload = _minimal_input(repo_tmp)
+    payload["totally_unknown_key"] = True
+    with pytest.raises(ValueError, match="input_unknown_keys"):
+        txn._validate_input_payload(payload)
 
 
 def test_no_raw_issue_mutation_or_shell_escape_in_production_path() -> None:
