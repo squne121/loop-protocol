@@ -103,6 +103,15 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 import root_entry_router  # noqa: E402  (sys.path must be prepared first)
 
+# Issue #2323: the blocked / caller-capability-request-malformed paths below
+# reuse the SAME compact stdout line-grammar renderer
+# (`STATUS:`/`NEXT_ACTION:`/`MUST_READ:`/`COMMANDS_JSON:`/`BLOCKERS:`/
+# `ARTIFACT:` etc.) that `run_refinement_preflight.py` already uses for its
+# own ready/degraded stdout, instead of a separate raw-JSON shape. This is a
+# stdout-grammar unification only -- `refinement_preflight_result_v1.schema.json`
+# (the JSON artifact schema) itself is not produced or validated here.
+from run_refinement_preflight import _build_compact_stdout  # noqa: E402
+
 SCHEMA_VERSION = "WORKFLOW_START_ENTRY_RESULT_V1"
 
 _REQUIRED_OPERATION_KEYS = ("phase", "actor_role", "operation", "requires_mutation")
@@ -222,7 +231,24 @@ def _compact_result(
     reasons: list,
     decision: Optional[str],
     inner_preflight_invoked: bool,
+    next_action: Optional[str] = None,
+    blockers: Optional[list] = None,
 ) -> dict[str, Any]:
+    """Build this module's own blocked/malformed result dict.
+
+    Issue #2323: in addition to the pre-existing `schema`/`status`/`reason`/
+    `decision`/`checks`/`reasons`/`inner_preflight_invoked` keys (kept for
+    `run()`'s return-value contract, consumed directly by tests), this dict
+    also carries `next_action` / `blockers` -- the minimal key set
+    `run_refinement_preflight.py::_build_compact_stdout()` needs to render
+    the SAME compact stdout line grammar
+    (`STATUS:`/`NEXT_ACTION:`/`BLOCKERS:` etc.) that the ready/degraded path
+    already emits, instead of this module's previous raw-JSON stdout shape.
+    `status` here reuses an existing `refinement_preflight_result_v1.schema
+    .json` `status` enum value (`"blocked"`) already used before this Issue.
+    `blockers` reuses the existing typed `reasons` values verbatim (AC3) --
+    no new `reason_code` enum value is introduced.
+    """
     return {
         "schema": SCHEMA_VERSION,
         "status": status,
@@ -231,6 +257,8 @@ def _compact_result(
         "checks": checks,
         "reasons": reasons,
         "inner_preflight_invoked": inner_preflight_invoked,
+        "next_action": next_action,
+        "blockers": blockers if blockers is not None else [],
     }
 
 
@@ -254,6 +282,29 @@ def _default_invoke_inner_preflight(*, issue_number: int, repo: str) -> int:
         check=False,
     )
     return proc.returncode
+
+
+def _validate_single_line_reasons(value: object) -> Optional[list[str]]:
+    """Validate that `value` is a list of non-empty, single-line strings
+    (Issue #2323 fix_delta P1: PR #2328 review
+    https://github.com/squne121/loop-protocol/pull/2328#issuecomment-5395635883).
+    Returns the validated list, or `None` if `value` fails validation (not a
+    list, or any element is not a non-empty single-line string). A "single
+    line" element is one where `item.splitlines(keepends=True) == [item]`
+    (rejects embedded `\n`, `\r`, and other Unicode line-boundary
+    characters that `str.splitlines()` recognizes, e.g. `\u2028`), so a
+    malformed producer `reasons` value can never forge additional
+    `STATUS:`/`NEXT_ACTION:` lines in the compact stdout grammar."""
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not item
+            or item.splitlines(keepends=True) != [item]
+        ):
+            return None
+    return value
 
 
 def run(
@@ -280,6 +331,12 @@ def run(
     except CapabilityRequestError as exc:
         # AC5: caller-side missing/malformed request. Fail closed WITHOUT
         # ever calling the producer.
+        # Issue #2323 AC1/AC3: `blockers` carries the existing typed
+        # `caller_capability_request_missing_or_malformed` reason verbatim
+        # (no `"environment_failure:"` free-text prefix a consumer would
+        # need to parse -- the specific exception detail is still preserved
+        # in `reason` for diagnostics, but stdout's `BLOCKERS:` line is the
+        # canonical typed signal now).
         result = _compact_result(
             status="blocked",
             reason=f"environment_failure:{exc}",
@@ -287,6 +344,8 @@ def run(
             reasons=["caller_capability_request_missing_or_malformed"],
             decision=None,
             inner_preflight_invoked=False,
+            next_action="human_judgment_required",
+            blockers=["caller_capability_request_missing_or_malformed"],
         )
         return result, 2
 
@@ -301,12 +360,34 @@ def run(
     checks = producer_result.get("checks", {})
     reasons = producer_result.get("reasons", [])
 
+    validated_reasons = _validate_single_line_reasons(reasons)
+    if validated_reasons is None:
+        malformed_reason = "producer_result_malformed:invalid_reasons"
+        result = _compact_result(
+            status="blocked",
+            reason=malformed_reason,
+            checks={},
+            reasons=[malformed_reason],
+            decision="blocked",
+            inner_preflight_invoked=False,
+            next_action="fix_environment",
+            blockers=[malformed_reason],
+        )
+        return result, 2
+    reasons = validated_reasons
+
     if decision not in ("ready", "degraded"):
         # AC3/AC7: `blocked` decision, or a producer invocation
         # failure/malformed result already normalized to `decision:
         # "blocked"` by `capability_preflight_result_fn`. Either way,
         # `run_refinement_preflight.py` is NEVER invoked on this path, and
         # the producer's own `checks`/`reasons` are preserved verbatim.
+        # Issue #2323 AC2: `blockers` reuses the producer's own typed
+        # `reasons` list verbatim (falling back to a single
+        # `capability_preflight_<decision>` marker only when the producer
+        # returned no typed reasons at all), so the compact stdout grammar's
+        # `BLOCKERS:` line stays consumer-parseable without a free-text
+        # prefix.
         result = _compact_result(
             status="blocked",
             reason=f"capability_preflight_{decision or 'unknown'}",
@@ -314,6 +395,8 @@ def run(
             reasons=reasons,
             decision=decision,
             inner_preflight_invoked=False,
+            next_action="human_judgment_required",
+            blockers=list(reasons) if reasons else [f"capability_preflight_{decision or 'unknown'}"],
         )
         return result, 2
 
@@ -395,7 +478,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         # result/v1`) already passed through unmodified when it WAS
         # invoked; only print this module's own compact result on the
         # blocked path, where there is no inner stdout to preserve.
-        print(json.dumps(result))
+        # Issue #2323 AC1/AC2: render the SAME compact stdout line grammar
+        # (`STATUS:`/`NEXT_ACTION:`/`BLOCKERS:` etc.) the ready/degraded
+        # path already emits via `run_refinement_preflight.py`, instead of
+        # this module's previous raw `{"schema": "WORKFLOW_START_ENTRY_
+        # RESULT_V1", ...}` JSON dict.
+        print(_build_compact_stdout(result))
     return exit_code
 
 
