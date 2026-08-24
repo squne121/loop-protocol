@@ -357,6 +357,62 @@ ISSUE_CREATE_READBACK_PY_EOF
   exit 1
 fi
 
+# --- Issue #2278 fix_delta (PR #2325 CI failure repair): P1-1 dirty-HEAD /
+#     fixture-SHA256 integrity gate for `--scenario issue_to_impl`. This
+#     MUST run BEFORE the shared binary-availability SKIP gate immediately
+#     below -- it is a deterministic precondition that does not depend on
+#     whether a `claude` binary is installed on this runner. Previously this
+#     check lived only inside the later `ISSUE_TO_IMPL_SCENARIO` block
+#     (after the shared gate), so on CI runners without `claude` the shared
+#     gate short-circuited with `exit 77` (SKIP) before this check was ever
+#     reached, masking a dirty SUT worktree / corrupted fixtures instead of
+#     failing closed. The fixture path / SHA-256 values resolved here are
+#     plain shell globals and are re-used (not re-computed) by the later
+#     `ISSUE_TO_IMPL_SCENARIO` block further down this same script. ---
+if [ "$ISSUE_TO_IMPL_SCENARIO" = "true" ]; then
+  ISSUE_TO_IMPL_FIXTURE_PATH="${FIXTURE_ARG_PATH:-$SCRIPT_DIR/tests/fixtures/issue-2230-equivalent/issue.json}"
+  ISSUE_TO_IMPL_FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$ISSUE_TO_IMPL_FIXTURE_PATH")" 2>/dev/null && pwd -P)
+  ISSUE_TO_IMPL_EVIDENCE_FILE="${EVIDENCE_OUT_ARG_PATH:-${EVIDENCE_DIR}/issue-to-impl-${TIMESTAMP}.json}"
+  ISSUE_TO_IMPL_PROMPT_PATH="${ISSUE_TO_IMPL_FIXTURE_DIR}/prompt.md"
+  ISSUE_TO_IMPL_EXPECTED_PHASES_PATH="${ISSUE_TO_IMPL_FIXTURE_DIR}/expected-phases.json"
+
+  if [ ! -f "$ISSUE_TO_IMPL_FIXTURE_PATH" ] || [ ! -f "$ISSUE_TO_IMPL_PROMPT_PATH" ] || [ ! -f "$ISSUE_TO_IMPL_EXPECTED_PHASES_PATH" ]; then
+    printf '{"schema":"ISSUE_TO_IMPL_E2E_RESULT_V1","scenario":"issue_to_impl","test_verdict":"fail","terminal_result":null,"reason_code":"fixture_missing","reached_phase":null,"phase_trace":[],"resume_from":null,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"claude_code_version":"unknown","proxy_version":"%s"}}\n' \
+      "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_PROXY_VERSION" > "$ISSUE_TO_IMPL_EVIDENCE_FILE"
+    echo "FAIL: issue_to_impl fixture が見つかりません（${ISSUE_TO_IMPL_FIXTURE_PATH} / prompt.md / expected-phases.json）。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
+    exit 1
+  fi
+
+  ISSUE_TO_IMPL_PROMPT_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_PROMPT_PATH")
+  ISSUE_TO_IMPL_ISSUE_JSON_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_FIXTURE_PATH")
+  ISSUE_TO_IMPL_EXPECTED_PHASES_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_EXPECTED_PHASES_PATH")
+
+  # --- P1-1: enforce (not just record) clean integration HEAD + fixture
+  #     SHA-256 integrity BEFORE any binary-availability check, and BEFORE
+  #     Claude Code is ever launched. This is the single live copy of this
+  #     gate; the later `ISSUE_TO_IMPL_SCENARIO` block does not re-check it
+  #     (it can only be reached after this gate already passed). ---
+  ISSUE_TO_IMPL_EARLY_GATE_OK=true
+  ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE="unknown"
+  if ! printf '%s' "$SUT_GIT_HEAD" | grep -Eq '^[0-9a-f]{40}$'; then
+    ISSUE_TO_IMPL_EARLY_GATE_OK=false
+    ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE="sut_git_head_not_40_char_sha"
+  elif [ "$SUT_GIT_DIRTY" != "false" ]; then
+    ISSUE_TO_IMPL_EARLY_GATE_OK=false
+    ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE="sut_git_dirty"
+  elif [ -z "$ISSUE_TO_IMPL_PROMPT_SHA256" ] || [ -z "$ISSUE_TO_IMPL_ISSUE_JSON_SHA256" ] || [ -z "$ISSUE_TO_IMPL_EXPECTED_PHASES_SHA256" ]; then
+    ISSUE_TO_IMPL_EARLY_GATE_OK=false
+    ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE="fixture_sha256_empty"
+  fi
+
+  if [ "$ISSUE_TO_IMPL_EARLY_GATE_OK" != "true" ]; then
+    printf '{"schema":"ISSUE_TO_IMPL_E2E_RESULT_V1","scenario":"issue_to_impl","test_verdict":"fail","terminal_result":"human_judgment_required","reason_code":"%s","reached_phase":null,"phase_trace":[],"resume_from":null,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"claude_code_version":"unknown","proxy_version":"%s"}}\n' \
+      "$ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE" "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_PROXY_VERSION" > "$ISSUE_TO_IMPL_EVIDENCE_FILE"
+    echo "FAIL: issue_to_impl scenario の P1-1 preflight gate に失敗しました（reason_code=${ISSUE_TO_IMPL_EARLY_GATE_REASON_CODE}）。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
+    exit 1
+  fi
+fi
+
 # --- 環境可用性判定（バイナリ / ChatGPT subscription 認証）。ディレクトリ/設定はまだ作らない。 ---
 PREFLIGHT_ENV_JSON=$("$SCRIPT_DIR/preflight.sh" --env-only)
 PREFLIGHT_ENV_RC=$?
@@ -1414,12 +1470,14 @@ fi
 # 本文 fallback_policy の指示どおり PASS へ昇格させない（AC4）。
 # =========================================================================
 if [ "$ISSUE_TO_IMPL_SCENARIO" = "true" ]; then
-  ISSUE_TO_IMPL_FIXTURE_PATH="${FIXTURE_ARG_PATH:-$SCRIPT_DIR/tests/fixtures/issue-2230-equivalent/issue.json}"
-  ISSUE_TO_IMPL_FIXTURE_DIR=$(CDPATH= cd -- "$(dirname -- "$ISSUE_TO_IMPL_FIXTURE_PATH")" 2>/dev/null && pwd -P)
-  ISSUE_TO_IMPL_EVIDENCE_FILE="${EVIDENCE_OUT_ARG_PATH:-${EVIDENCE_DIR}/issue-to-impl-${TIMESTAMP}.json}"
-  ISSUE_TO_IMPL_PROMPT_PATH="${ISSUE_TO_IMPL_FIXTURE_DIR}/prompt.md"
-  ISSUE_TO_IMPL_EXPECTED_PHASES_PATH="${ISSUE_TO_IMPL_FIXTURE_DIR}/expected-phases.json"
-
+  # NOTE: ISSUE_TO_IMPL_FIXTURE_PATH / _FIXTURE_DIR / _EVIDENCE_FILE /
+  # _PROMPT_PATH / _EXPECTED_PHASES_PATH, the 3 fixture SHA-256 values, and
+  # the fixture-missing / P1-1 dirty-HEAD-and-fixture-integrity gate itself
+  # were already resolved and enforced earlier in this script (before the
+  # shared binary-availability SKIP gate) -- see the "Issue #2278 fix_delta"
+  # block above. Reaching this point means that gate already PASSed, so it
+  # is intentionally not re-checked here (single live copy of the gate
+  # avoids two copies disagreeing).
   ISSUE_TO_IMPL_CLAUDE_BIN=$(claude_gpt_resolve_claude_bin)
   ISSUE_TO_IMPL_CLAUDE_CODE_VERSION="unknown"
   if [ -n "$ISSUE_TO_IMPL_CLAUDE_BIN" ]; then
@@ -1428,17 +1486,6 @@ if [ "$ISSUE_TO_IMPL_SCENARIO" = "true" ]; then
       ISSUE_TO_IMPL_CLAUDE_CODE_VERSION="unknown"
     fi
   fi
-
-  if [ ! -f "$ISSUE_TO_IMPL_FIXTURE_PATH" ] || [ ! -f "$ISSUE_TO_IMPL_PROMPT_PATH" ] || [ ! -f "$ISSUE_TO_IMPL_EXPECTED_PHASES_PATH" ]; then
-    printf '{"schema":"ISSUE_TO_IMPL_E2E_RESULT_V1","scenario":"issue_to_impl","test_verdict":"fail","terminal_result":null,"reason_code":"fixture_missing","reached_phase":null,"phase_trace":[],"resume_from":null,"generated_at":"%s","sut":{"git_head":"%s","git_dirty":%s,"claude_code_version":"%s","proxy_version":"%s"}}\n' \
-      "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$ISSUE_TO_IMPL_CLAUDE_CODE_VERSION" "$SUT_PROXY_VERSION" > "$ISSUE_TO_IMPL_EVIDENCE_FILE"
-    echo "FAIL: issue_to_impl fixture が見つかりません（${ISSUE_TO_IMPL_FIXTURE_PATH} / prompt.md / expected-phases.json）。証跡: ${ISSUE_TO_IMPL_EVIDENCE_FILE}"
-    exit 1
-  fi
-
-  ISSUE_TO_IMPL_PROMPT_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_PROMPT_PATH")
-  ISSUE_TO_IMPL_ISSUE_JSON_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_FIXTURE_PATH")
-  ISSUE_TO_IMPL_EXPECTED_PHASES_SHA256=$(claude_gpt_sha256_file "$ISSUE_TO_IMPL_EXPECTED_PHASES_PATH")
 
   ISSUE_TO_IMPL_WORKDIR=$(mktemp -d)
   FAKE_GH_FIXTURE="$SCRIPT_DIR/tests/fixtures/fake_gh.py"
@@ -1467,19 +1514,10 @@ FAKE_GH_WRAPPER_ITI_EOF
   ISSUE_TO_IMPL_REASON_CODE="unknown"
   ISSUE_TO_IMPL_TEST_VERDICT="fail"
 
-  # --- P1-1: enforce (not just record) clean integration HEAD + fixture
-  #     SHA-256 integrity BEFORE Claude Code is ever launched. ---
+  # --- P1-1 gate already enforced earlier (see NOTE above); this flag is
+  #     kept only so the surrounding if/else control flow below (Phase 1-5)
+  #     is unchanged. ---
   ISSUE_TO_IMPL_PREFLIGHT_GATE_OK=true
-  if ! printf '%s' "$SUT_GIT_HEAD" | grep -Eq '^[0-9a-f]{40}$'; then
-    ISSUE_TO_IMPL_PREFLIGHT_GATE_OK=false
-    ISSUE_TO_IMPL_REASON_CODE="sut_git_head_not_40_char_sha"
-  elif [ "$SUT_GIT_DIRTY" != "false" ]; then
-    ISSUE_TO_IMPL_PREFLIGHT_GATE_OK=false
-    ISSUE_TO_IMPL_REASON_CODE="sut_git_dirty"
-  elif [ -z "$ISSUE_TO_IMPL_PROMPT_SHA256" ] || [ -z "$ISSUE_TO_IMPL_ISSUE_JSON_SHA256" ] || [ -z "$ISSUE_TO_IMPL_EXPECTED_PHASES_SHA256" ]; then
-    ISSUE_TO_IMPL_PREFLIGHT_GATE_OK=false
-    ISSUE_TO_IMPL_REASON_CODE="fixture_sha256_empty"
-  fi
 
   if [ "$ISSUE_TO_IMPL_PREFLIGHT_GATE_OK" != "true" ]; then
     ISSUE_TO_IMPL_TERMINAL_RESULT="human_judgment_required"
