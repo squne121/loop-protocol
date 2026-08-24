@@ -53,7 +53,7 @@ Step 1 起動の authority ではない。正本は
 | `implementation-worker` | write | `acceptEdits` | Read, Grep, Glob, Bash, Edit, Write, MultiEdit | — |
 | `post-merge-cleanup-worker` | cleanup | `default` | Bash, Read | Agent, Edit, Write, MultiEdit |
 
-## Claude/Codex Agent Runtime Authority（#2160 Phase 2: agent/runtime parity contract migration）
+## Claude/Codex Agent Runtime Authority（実行権限の正本、#2160 Phase 2: agent/runtime parity 契約移行）
 
 `.claude/agents/*.md` を `claude-native` / `claude-gpt` 共通の実行 authority とし、`.codex/agents/*.toml` を Phase 3（#2161）までの legacy compatibility（read-only）projection とする Authority 分離を、本節を正本として明記する（Parent #2154 アーキテクチャ決定 D の再定義、2026-08-24 OWNER 敵対的レビュー `recommended_disposition: reframe_in_place` 反映）。
 
@@ -66,7 +66,7 @@ Step 1 起動の authority ではない。正本は
 | Codex CLI 互換 | `.codex/agents/*.toml` | legacy read-only projection。Phase 3（#2161）まで削除しない |
 | 人間向け説明 | 本節 | Authority 分離の正本 |
 
-### Asset inventory classification（AC2, #2160）
+### Asset inventory classification（資産の分類一覧, AC2, #2160）
 
 `.claude/agents/**` と `.codex/agents/**` の全 asset は
 `tests/fixtures/codex-agent-config/expected-runtime-contract.json` の
