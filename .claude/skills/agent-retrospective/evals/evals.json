@@ -1,0 +1,32 @@
+{
+  "skill_name": "agent-retrospective",
+  "evals": [
+    {
+      "id": "explicit-invocation-proposal-only-candidates",
+      "prompt": "/agent-retrospective の起動条件・proposal-only の性質を説明してください。",
+      "expected_output": "agent-retrospective は人間の明示トリガー（例: /agent-retrospective スラッシュコマンド）でのみ起動し、通常の会話プロンプトからは自動起動しないこと（disable-model-invocation: true）、生成される agent_improvement_candidate/v1 は proposal-only であり GitHub Issue への実際の投稿は persist_retrospective_run.py が担うことを説明する。"
+    },
+    {
+      "id": "run-retrospective-cli-single-bash-invocation",
+      "prompt": "agent-retrospective の root Skill はどのように run_retrospective.py を起動しますか。",
+      "expected_output": "root Skill は単一の Bash 呼び出しで scripts/run_retrospective.py を実行するのみであり、その1プロセス内で prepare・observer wave・prepare-evaluator・evaluator 起動・delta 算出・finalize を一続きで実行し、最終的な proposal-only な PublishRequest（または型付き failure）を stdout に出力することを説明する。"
+    },
+    {
+      "id": "observer-wave-manifest-and-authority",
+      "prompt": "agent-retrospective の observer wave はどの3つの observer から構成され、それぞれの finding authority はどう決まりますか。",
+      "expected_output": "retrospective-runtime-observer（interpreter、primary authority）・codebase-investigator（advisory）・web-researcher（discovery、evidence_digest 束縛が必要）の3 observer から構成され、interpreter role のみが primary finding authority に昇格し、他は advisory に留まることを説明する。",
+      "files": [
+        ".claude/skills/agent-retrospective/scripts/run_retrospective.py"
+      ]
+    },
+    {
+      "id": "publish-request-no-mutation-authority",
+      "prompt": "PublishRequest に authorized や authorization_token のようなフィールドは含まれますか。",
+      "expected_output": "PublishRequest dataclass には authorized / authorized_by_human / authorization_token / mutation_capability のいずれのフィールドも存在せず、これらはスキーマレベルで禁止されているため、人間承認や実際の GitHub mutation は persist_retrospective_run.py 側の別チャネル（HUMAN_AUTHORIZATION_RECEIPT_V1）が担うことを説明する。",
+      "expectations": [
+        "authorized/authorization_token/mutation_capability という単語がフィールド名として言及されないこと",
+        "proposal-only であることが明言されること"
+      ]
+    }
+  ]
+}
