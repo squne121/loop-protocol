@@ -143,6 +143,33 @@ def _find_repo_root_for_contract() -> Path:
     return Path(__file__).resolve().parent.parent.parent.parent.parent
 
 
+def _load_extension_surface_policy_matcher():
+    """Dynamically load `scripts/agent-guards/extension_surface_policy_matcher.py`.
+
+    Mirrors the existing dynamic-load pattern in
+    `.claude/skills/issue-contract-review/scripts/declared_path_overlap.py`
+    (Issue #2290 "Notes for Reviewer": no new static import boundary /
+    package). Returns `None` if the shared evaluator module cannot be
+    located, so callers degrade to CheckResult.NA rather than raising.
+    """
+    import importlib.util
+
+    matcher_path = (
+        _find_repo_root_for_contract() / "scripts" / "agent-guards" / "extension_surface_policy_matcher.py"
+    )
+    if not matcher_path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "extension_surface_policy_matcher_for_check_issue_contract", matcher_path
+    )
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
 class IssueKindPolicyLoadError(RuntimeError):
     """Raised when ISSUE_KIND_POLICY_V1 cannot be loaded from SSOT.
 
@@ -1022,6 +1049,7 @@ class DeterministicChecks:
     C11_decision_tag_consistency: str = CheckResult.NA
     C12_product_trace_fields_structure: str = CheckResult.NA
     C13_vc_preflight_decision_consistency: str = CheckResult.NA
+    C14_extension_surface_risk_trigger: str = CheckResult.NA
 
 
 @dataclass
@@ -1526,6 +1554,46 @@ def check_c11_decision_tag_consistency(body: str) -> tuple[str, list[str]]:
             f"decision: {decision} なのに AC に <!-- runtime-verification: true --> タグが存在する（矛盾 blocker）"
         ]
 
+    return CheckResult.PASS, []
+
+
+def check_c14_extension_surface_risk_trigger(body: str, issue_kind: str) -> tuple[str, list[str]]:
+    """C14 (Issue #2290): declared Allowed Paths vs. extension-surface risk-trigger policy.
+
+    Uses the shared evaluator (`scripts/agent-guards/extension_surface_policy_matcher.py`)
+    to detect a syntactic candidate overlap between the Issue's declared
+    Allowed Paths and `docs/dev/extension-surface-runtime-policy.yaml`
+    selectors, and (when `decision: immediate` is declared) whether the
+    Runtime Verification Applicability contract's required immediate
+    fields are present. This is candidate discovery only -- not a semantic
+    diff judgment of the actual PR change (Issue #2290 Out of Scope).
+    """
+    if issue_kind != "implementation":
+        return CheckResult.NA, []
+
+    allowed_path_entries = pc_extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return CheckResult.NA, []
+
+    rva_section = extract_section(body, "Runtime Verification Applicability")
+    decision_match = re.search(r"decision:\s*(\S+)", rva_section) if rva_section else None
+    declared_decision = decision_match.group(1).strip() if decision_match else None
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return CheckResult.NA, []
+
+    try:
+        verdict = evaluator.evaluate_issue_risk_trigger(
+            allowed_path_entries=allowed_path_entries,
+            declared_decision=declared_decision,
+            rva_section_text=rva_section or "",
+        )
+    except evaluator.PolicyLoadError:
+        return CheckResult.NA, []
+
+    if verdict["verdict"] == "needs_fix":
+        return CheckResult.FAIL, verdict["reasons"]
     return CheckResult.PASS, []
 
 
@@ -2405,6 +2473,19 @@ def run_checks(
         blocking=checks.C13_vc_preflight_decision_consistency != CheckResult.PASS,
     )
 
+    # C14: Extension surface risk-trigger policy (Issue #2290)
+    checks.C14_extension_surface_risk_trigger, issues = check_c14_extension_surface_risk_trigger(
+        body, issue_kind
+    )
+    result.blocking_issues.extend(issues)
+    _append_findings(
+        result,
+        issues,
+        deterministic_domain_key="extension_surface_risk_trigger",
+        finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+        blocking=checks.C14_extension_surface_risk_trigger == CheckResult.FAIL,
+    )
+
     # Non-blocking warnings（structured: code/severity/evidence/suggested_action）
     detect_warning_scope_cvs_in_scope_mismatch(body, result)
     detect_warning_vc_untracked_false_negative(body, result)
@@ -2426,6 +2507,7 @@ def run_checks(
         checks.C11_decision_tag_consistency,
         checks.C12_product_trace_fields_structure,
         checks.C13_vc_preflight_decision_consistency,
+        checks.C14_extension_surface_risk_trigger,
     ]
     has_fail = any(v in (CheckResult.FAIL, CheckResult.LEGACY_MISSING) for v in all_check_values)
     has_structured_blockers = bool(result.structured_blockers)
