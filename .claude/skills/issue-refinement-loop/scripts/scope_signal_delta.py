@@ -742,6 +742,13 @@ def _normalize_exact_repository_path_literal(candidate: str) -> str | None:
         return None
     if "\\" in candidate or "://" in candidate or candidate.startswith("/"):
         return None
+    # #2333 AC4: an exact Allowed Paths literal must never carry an HTML/CF_HTML
+    # marker token. `<`/`>` reject any stray HTML tag or entity boundary, and
+    # the explicit CF_HTML marker check is a defense-in-depth guard should the
+    # marker ever appear pre-normalized without a plain `<` (e.g. through an
+    # upstream partial decode).
+    if "<" in candidate or ">" in candidate or "<!--StartFragment" in candidate:
+        return None
     normalized = _normalize_path(candidate)
     if not normalized or "/" not in normalized or normalized.startswith("/"):
         return None
@@ -763,6 +770,12 @@ def _is_unsafe_path_literal(candidate: str) -> bool:
     if "\x00" in candidate or "\n" in candidate or "\r" in candidate:
         return True
     if "\\" in candidate or "://" in candidate or candidate.startswith("/"):
+        return True
+    # #2333 AC4: an HTML/CF_HTML-tagged token (e.g. an injected <script> tag
+    # riding along a legitimate-looking path segment) must make the whole
+    # mixed directive unsafe, not merely fail to normalize into a silently
+    # dropped literal.
+    if "<" in candidate or ">" in candidate or "<!--StartFragment" in candidate:
         return True
     return any(part in {"", ".", ".."} for part in candidate.split("/"))
 
@@ -963,10 +976,85 @@ def extract_severity_tags(text: "str | None") -> list:
     return sorted(tags)
 
 
+# #2333: CF_HTML/clipboard envelope boundary. A CF_HTML clipboard paste
+# (produced by rich-text editors, see #2290) wraps a fragment of HTML between
+# ``<!--StartFragment-->``/``<!--EndFragment-->`` markers. When such a paste
+# lands in a GitHub anchor comment unmodified, the literal HTML precedes a
+# trailing Markdown rendition of the *same* content. This is intentionally a
+# narrow, deterministic marker-driven boundary -- not a general HTML
+# sanitizer/parser -- so legitimate GFM raw HTML (``<details>``/``<summary>``
+# etc., already used in Issue bodies) that never carries these CF_HTML
+# markers is left untouched.
+_CF_HTML_START_FRAGMENT_RE = re.compile(r"<!--\s*StartFragment\s*-->", re.IGNORECASE)
+_CF_HTML_END_FRAGMENT_RE = re.compile(r"<!--\s*EndFragment\s*-->", re.IGNORECASE)
+_CF_HTML_TRAILING_WRAPPER_CLOSE_RE = re.compile(
+    r"^\s*(?:</body>\s*)?(?:</html>\s*)*", re.IGNORECASE
+)
+
+
+def _canonicalize_cf_html_envelope(text: "str | None") -> "str | None":
+    """Canonicalize (or reject) a CF_HTML/clipboard-contaminated comment body.
+
+    Returns ``text`` unchanged when no ``<!--StartFragment-->`` marker is
+    present (the overwhelming majority of anchor comments, including ones
+    that legitimately contain unrelated raw HTML such as
+    ``<details>``/``<summary>``).
+
+    When a ``<!--StartFragment-->`` marker is present, the text after the
+    *last* ``<!--EndFragment-->`` marker (with an immediately-following HTML
+    wrapper close tag sequence such as ``</body></html>`` stripped) is taken
+    as the canonical trailing Markdown-only content -- this is the
+    #2290/#40/#77-shaped envelope: HTML wrapper -> StartFragment -> HTML
+    fragment -> EndFragment -> wrapper close -> duplicated Markdown.
+
+    Returns None (meaning: the caller must treat the directive as
+    disabled / not extractable) when:
+
+    - a ``<!--StartFragment-->`` marker is present without a matching
+      ``<!--EndFragment-->`` marker, or
+    - the trailing content after the last ``<!--EndFragment-->`` marker is
+      itself empty/whitespace-only, or still contains a nested/second
+      ``<!--StartFragment-->`` marker or HTML wrapper tags -- i.e. the
+      Markdown-only tail cannot be uniquely identified.
+    """
+    if not text:
+        return text
+    if not _CF_HTML_START_FRAGMENT_RE.search(text):
+        return text
+    end_matches = list(_CF_HTML_END_FRAGMENT_RE.finditer(text))
+    if not end_matches:
+        return None
+    trailing = text[end_matches[-1].end():]
+    trailing = _CF_HTML_TRAILING_WRAPPER_CLOSE_RE.sub("", trailing, count=1)
+    if _CF_HTML_START_FRAGMENT_RE.search(trailing):
+        return None
+    lowered_trailing = trailing.lower()
+    if "<html" in lowered_trailing or "<body" in lowered_trailing:
+        return None
+    canonical = trailing.strip()
+    if not canonical:
+        return None
+    return canonical
+
+
 def extract_directive_items(text: "str | None") -> list:
-    """Extract bullet-list lines (candidate directive text) from a comment body."""
+    """Extract bullet-list lines (candidate directive text) from a comment body.
+
+    #2333: raw anchor comment bodies may contain a CF_HTML/clipboard envelope
+    (``<!--StartFragment-->``/``<!--EndFragment-->`` markers wrapping HTML
+    that duplicates a trailing Markdown rendition of the same content, see
+    #2290). Such an envelope is canonicalized -- or the whole comment is
+    treated as having no extractable directive -- via
+    ``_canonicalize_cf_html_envelope()`` *before* bullet-line extraction, so
+    contamination never reaches the bullet items this function returns (and
+    therefore never reaches the downstream contract-patch operations built
+    from them).
+    """
+    canonical = _canonicalize_cf_html_envelope(text)
+    if canonical is None:
+        return []
     items = []
-    for line in (text or "").splitlines():
+    for line in (canonical or "").splitlines():
         stripped = line.strip()
         if stripped.startswith("- ") or stripped.startswith("* "):
             content = stripped[2:].strip()
