@@ -1664,17 +1664,31 @@ try:
 except (json.JSONDecodeError, ValueError):
     envelope = None
 
+# Claude Code `--output-format json` (non-interactive, as invoked here via
+# `launch.sh`) emits EITHER a single top-level result object, or a JSON
+# ARRAY of the full session's structured events (system/assistant/user/
+# result), depending on invocation mode -- observed empirically to be the
+# latter shape in this harness's launch path. Normalize both shapes to the
+# one `type: "result"` event, which is the schema-known field carrying the
+# final assistant text (`result`) and the `is_error` flag.
+result_event = None
 if isinstance(envelope, dict):
-    # Claude Code `--output-format json` envelope: the final assistant
-    # message text lives in `result` (a plain string). Extracting the
-    # deterministic marker from THIS isolated, schema-known field is more
-    # precise than the previous naive regex-over-raw-stdout approach
-    # (which could match spurious text anywhere in a raw stream) -- but,
-    # per the review, structured output alone still does not prove tool
-    # execution happened, hence the separate call-trace check below.
-    result_text = envelope.get("result")
+    result_event = envelope
+elif isinstance(envelope, list):
+    for item in envelope:
+        if isinstance(item, dict) and item.get("type") == "result":
+            result_event = item
+            break
+
+if result_event is not None:
+    # Extracting the deterministic marker from THIS isolated, schema-known
+    # field is more precise than the previous naive regex-over-raw-stdout
+    # approach (which could match spurious text anywhere in a raw stream)
+    # -- but, per the review, structured output alone still does not prove
+    # tool execution happened, hence the separate call-trace check below.
+    result_text = result_event.get("result")
     if isinstance(result_text, str):
-        structured_output_ok = envelope.get("is_error") is not True
+        structured_output_ok = result_event.get("is_error") is not True
         m = re.search(
             r"ISSUE_TO_IMPL_FRESH_REVIEW_OK issue_number=(\d+) contract_complete=(true|false)",
             result_text,
