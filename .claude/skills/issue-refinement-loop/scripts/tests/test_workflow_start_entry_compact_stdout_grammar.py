@@ -1,0 +1,168 @@
+"""
+.claude/skills/issue-refinement-loop/scripts/tests/test_workflow_start_entry_compact_stdout_grammar.py
+
+Issue #2323: proves the `workflow_start_entry.py` blocked / caller
+capability-request-malformed paths render the SAME compact stdout line
+grammar (`STATUS:`/`NEXT_ACTION:`/`BLOCKERS:` etc.) that
+`run_refinement_preflight.py::_build_compact_stdout()` already renders for
+the ready/degraded path, instead of the previous raw
+`{"schema": "WORKFLOW_START_ENTRY_RESULT_V1", ...}` JSON dict.
+
+These tests call `workflow_start_entry.main()` / `.run()` directly with
+`capsys` (not a real subprocess -- the real-subprocess boundary proof for
+the SAME grammar lives in `test_workflow_start_entry_canonical_executor.py`,
+AC6) and parse the captured stdout with the minimal compact-grammar reader
+below.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+import workflow_start_entry as wse  # noqa: E402
+
+_REPO = "squne121/loop-protocol"
+
+_LOOP_ENV_NAMES = (
+    "LOOP_SPARK_MODE",
+    "LOOP_SPARK_FALLBACK",
+    "LOOP_PLANNED_OPERATIONS_JSON",
+)
+
+
+def _parse_compact_stdout(stdout: str) -> dict:
+    """Minimal reader for the compact `STATUS:`/`NEXT_ACTION:`/`BLOCKERS:`
+    stdout line grammar -- the SAME grammar
+    `run_refinement_preflight.py::_build_compact_stdout()` renders. Only
+    extracts the fields this test file's assertions need; not a
+    general-purpose grammar parser."""
+    status = None
+    next_action = None
+    blockers: list[str] = []
+    in_blockers = False
+    for line in stdout.splitlines():
+        if line.startswith("STATUS: "):
+            status = line[len("STATUS: "):]
+            in_blockers = False
+        elif line.startswith("NEXT_ACTION: "):
+            next_action = line[len("NEXT_ACTION: "):]
+            in_blockers = False
+        elif line == "BLOCKERS:":
+            in_blockers = True
+        elif in_blockers and line.startswith("  - "):
+            blockers.append(line[len("  - "):])
+        elif in_blockers and not line.startswith("  "):
+            in_blockers = False
+    return {"status": status, "next_action": next_action, "blockers": blockers}
+
+
+def _clear_loop_env(monkeypatch) -> None:
+    for env_name in _LOOP_ENV_NAMES:
+        monkeypatch.delenv(env_name, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# AC1: caller capability request malformed/missing path uses the compact
+# stdout line grammar (first line `STATUS: blocked`), not the old raw JSON
+# dict shape.
+# ---------------------------------------------------------------------------
+
+
+def test_workflow_start_malformed_producer_result_uses_compact_stdout_grammar(monkeypatch, capsys):
+    """AC1: with none of the three `LOOP_*` capability-request env vars set
+    (mirrors the real bare `preflight.run` registry argv, which has no CLI
+    flag for them), `main()`'s stdout starts with `STATUS: blocked` and is
+    NOT a raw JSON object -- old callers that did `json.loads(stdout)` on
+    this path would now fail (that is the point of this test)."""
+    _clear_loop_env(monkeypatch)
+
+    exit_code = wse.main(["--issue-number", "2323", "--repo", _REPO])
+    captured = capsys.readouterr()
+
+    assert exit_code != 0
+    assert captured.out.startswith("STATUS: blocked") or captured.out.startswith(
+        "STATUS: environment_failure"
+    ), captured.out
+    assert not captured.out.lstrip().startswith("{"), (
+        "stdout must be the compact line grammar, not a raw JSON dict: " + captured.out
+    )
+    assert "WORKFLOW_START_ENTRY_RESULT_V1" not in captured.out, captured.out
+
+
+# ---------------------------------------------------------------------------
+# AC2: capability preflight `blocked` decision path uses the compact stdout
+# line grammar (first line `STATUS: blocked`), not the old raw JSON dict
+# shape.
+# ---------------------------------------------------------------------------
+
+
+def test_workflow_start_blocked_uses_compact_stdout_grammar(monkeypatch, capsys):
+    """AC2: a producer `decision: blocked` result (a fake producer stands
+    in, mirroring what the real producer returns for a declared-but-
+    unsupported operation) renders `STATUS: blocked` via the compact line
+    grammar, not the old raw JSON dict shape."""
+    planned_operations_json = (
+        '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
+        '"operation": "definitely_unsupported_operation_xyz", "requires_mutation": true}]'
+    )
+    monkeypatch.setenv("LOOP_SPARK_MODE", "required")
+    monkeypatch.setenv("LOOP_SPARK_FALLBACK", "forbidden")
+    monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", planned_operations_json)
+
+    def _blocked_producer(**kwargs):
+        return {
+            "decision": "blocked",
+            "checks": {"spark": {"available": False}},
+            "reasons": ["operation_route_unavailable:definitely_unsupported_operation_xyz"],
+        }
+
+    def _failing_inner(**kwargs):
+        raise AssertionError("inner preflight must not be invoked on the blocked path")
+
+    result, exit_code = wse.run(
+        issue_number=2323,
+        repo=_REPO,
+        spark_mode="required",
+        spark_fallback="forbidden",
+        planned_operations_json=os.environ["LOOP_PLANNED_OPERATIONS_JSON"],
+        capability_preflight_result_fn=_blocked_producer,
+        invoke_inner_preflight_fn=_failing_inner,
+    )
+    stdout = wse._build_compact_stdout(result)
+
+    assert exit_code != 0
+    assert stdout.startswith("STATUS: blocked")
+    assert not stdout.lstrip().startswith("{"), (
+        "stdout must be the compact line grammar, not a raw JSON dict: " + stdout
+    )
+    assert "WORKFLOW_START_ENTRY_RESULT_V1" not in stdout
+
+
+# ---------------------------------------------------------------------------
+# AC3: the AC1 path's `BLOCKERS:` line carries the existing typed `reasons`
+# value verbatim -- no `"environment_failure:"` free-text prefix a consumer
+# would need to parse.
+# ---------------------------------------------------------------------------
+
+
+def test_workflow_start_malformed_blockers_field_is_typed(monkeypatch, capsys):
+    """AC3: `main()`'s stdout for the caller-side malformed/missing
+    capability-request path carries a `BLOCKERS:` line whose value is
+    exactly the existing typed
+    `caller_capability_request_missing_or_malformed` reason (no
+    `"environment_failure:"` prefix embedding required to extract it)."""
+    _clear_loop_env(monkeypatch)
+
+    exit_code = wse.main(["--issue-number", "2323", "--repo", _REPO])
+    captured = capsys.readouterr()
+    parsed = _parse_compact_stdout(captured.out)
+
+    assert exit_code != 0
+    assert parsed["blockers"] == ["caller_capability_request_missing_or_malformed"]
+    assert not any(b.startswith("environment_failure:") for b in parsed["blockers"]), parsed["blockers"]
