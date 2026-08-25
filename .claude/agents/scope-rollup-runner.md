@@ -1,6 +1,6 @@
 ---
 name: scope-rollup-runner
-description: 手動 advisory diagnostic として on-demand 起動する scope rollup preflight 専用 SubAgent（#1869 fix_delta P1-1: impl-review-loop の automatic dispatch からは外れている）。ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 marker を stdout に返す。read-only 実行のみ許可（GitHub / repo への書き込み禁止）。
+description: "手動 advisory diagnostic として on-demand 起動する scope rollup preflight 専用 SubAgent（#1869 fix_delta P1-1: impl-review-loop の automatic dispatch からは外れている）。ISSUE_SCOPE_ROLLUP_RUN_RESULT_V1 marker を stdout に返す。read-only 実行のみ許可（GitHub / repo への書き込み禁止）。"
 tools:
   - Read
   - Grep
@@ -11,6 +11,7 @@ disallowedTools:
   - Write
   - MultiEdit
 model: haiku
+effort: medium
 maxTurns: 15
 permissionMode: auto
 ---

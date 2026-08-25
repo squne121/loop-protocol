@@ -3,8 +3,8 @@
     "implementation-worker": {
       "path": ".codex/agents/implementation-worker.toml",
       "claude_agent_path": ".claude/agents/implementation-worker.md",
-      "claude_model": "sonnet",
       "claude_permission_mode": "acceptEdits",
+      "mutation_class": "issue-mutation",
       "model": "gpt-5.6-terra",
       "model_reasoning_effort": "high",
       "default_permissions": "loop-protocol-rtk",
@@ -12,13 +12,14 @@
       "runtime_followup_route": "implement-issue",
       "repo_local_skill_surfaces": [
         ".agents/skills/implement-issue/SKILL.md"
-      ]
+      ],
+      "model_alias": "sonnet"
     },
     "issue-creator": {
       "path": ".codex/agents/issue-creator.toml",
       "claude_agent_path": ".claude/agents/issue-creator.md",
-      "claude_model": "sonnet",
       "claude_permission_mode": "acceptEdits",
+      "mutation_class": "issue-mutation",
       "model": "gpt-5.6-terra",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-rtk",
@@ -26,13 +27,14 @@
       "runtime_followup_route": "create-issue",
       "repo_local_skill_surfaces": [
         ".agents/skills/create-issue/SKILL.md"
-      ]
+      ],
+      "model_alias": "sonnet"
     },
     "issue-editor": {
       "path": ".codex/agents/issue-editor.toml",
       "claude_agent_path": ".claude/agents/issue-editor.md",
-      "claude_model": "sonnet",
       "claude_permission_mode": "acceptEdits",
+      "mutation_class": "issue-mutation",
       "model": "gpt-5.6-terra",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-rtk",
@@ -40,13 +42,14 @@
       "runtime_followup_route": "edit-issue",
       "repo_local_skill_surfaces": [
         ".agents/skills/edit-issue/SKILL.md"
-      ]
+      ],
+      "model_alias": "sonnet"
     },
     "issue-reviewer": {
       "path": ".codex/agents/issue-reviewer.toml",
       "claude_agent_path": ".claude/agents/issue-reviewer.md",
-      "claude_model": "haiku",
       "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
       "model": "gpt-5.6-terra",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-readonly",
@@ -54,13 +57,14 @@
       "runtime_followup_route": "review-issue",
       "repo_local_skill_surfaces": [
         ".agents/skills/review-issue/SKILL.md"
-      ]
+      ],
+      "model_alias": "haiku"
     },
     "review-issue": {
       "path": ".codex/agents/review-issue.toml",
       "claude_agent_path": ".claude/agents/review-issue.md",
-      "claude_model": "sonnet",
       "claude_permission_mode": "acceptEdits",
+      "mutation_class": "issue-mutation",
       "model": "gpt-5.6-terra",
       "model_reasoning_effort": "high",
       "default_permissions": "loop-protocol-rtk",
@@ -68,13 +72,14 @@
       "runtime_followup_route": "review-issue",
       "repo_local_skill_surfaces": [
         ".agents/skills/review-issue/SKILL.md"
-      ]
+      ],
+      "model_alias": "sonnet"
     },
     "scope-rollup-runner": {
       "path": ".codex/agents/scope-rollup-runner.toml",
       "claude_agent_path": ".claude/agents/scope-rollup-runner.md",
-      "claude_model": "haiku",
       "claude_permission_mode": "auto",
+      "mutation_class": "readonly",
       "model": "gpt-5.6-terra",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-readonly",
@@ -89,7 +94,8 @@
       },
       "semantic_mutation_boundary": "repo_remote_readonly_with_ephemeral_local_write",
       "required_effective_permission_profile": "loop-protocol-scope-rollup",
-      "release_pin": "codex-0.145.0"
+      "release_pin": "codex-0.145.0",
+      "model_alias": "haiku"
     },
     "spark-deep": {
       "path": ".codex/agents/spark-deep.toml",
@@ -130,19 +136,20 @@
     "test-runner": {
       "path": ".codex/agents/test-runner.toml",
       "claude_agent_path": ".claude/agents/test-runner.md",
-      "claude_model": "haiku",
       "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
       "model": "gpt-5.6-luna",
       "model_reasoning_effort": "low",
       "default_permissions": "loop-protocol-readonly",
       "runtime_dependency_status": "codex_native",
-      "runtime_followup_route": "none"
+      "runtime_followup_route": "none",
+      "model_alias": "haiku"
     },
     "pr-reviewer": {
       "path": ".codex/agents/pr-reviewer.toml",
       "claude_agent_path": ".claude/agents/pr-reviewer.md",
-      "claude_model": "sonnet",
       "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
       "model": "gpt-5.6-terra",
       "model_reasoning_effort": "high",
       "default_permissions": "loop-protocol-readonly",
@@ -150,13 +157,14 @@
       "runtime_followup_route": "pr-review-judge",
       "repo_local_skill_surfaces": [
         ".agents/skills/pr-review-judge/SKILL.md"
-      ]
+      ],
+      "model_alias": "sonnet"
     },
     "pr-reviewer-lite": {
       "path": ".codex/agents/pr-reviewer-lite.toml",
       "claude_agent_path": ".claude/agents/pr-reviewer-lite.md",
-      "claude_model": "haiku",
       "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
       "model": "gpt-5.6-luna",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-readonly",
@@ -164,13 +172,14 @@
       "runtime_followup_route": "pr-review-judge",
       "repo_local_skill_surfaces": [
         ".agents/skills/pr-review-judge/SKILL.md"
-      ]
+      ],
+      "model_alias": "haiku"
     },
     "post-merge-cleanup-worker": {
       "path": ".codex/agents/post-merge-cleanup-worker.toml",
       "claude_agent_path": ".claude/agents/post-merge-cleanup-worker.md",
-      "claude_model": "haiku",
       "claude_permission_mode": "default",
+      "mutation_class": "repo-write",
       "model": "gpt-5.6-luna",
       "model_reasoning_effort": "low",
       "default_permissions": "loop-protocol-rtk",
@@ -178,13 +187,21 @@
       "runtime_followup_route": "post-merge-cleanup-executor",
       "repo_local_skill_surfaces": [
         ".agents/skills/post-merge-cleanup-executor/SKILL.md"
-      ]
+      ],
+      "model_alias": "haiku",
+      "permission_parity": "excluded",
+      "permission_exclusion": {
+        "allowlisted_agent": "post-merge-cleanup-worker",
+        "reason": "claude_permissionMode_default_repo_write_vs_codex_loop_protocol_rtk_issue_mutation_pre_existing_mismatch",
+        "follow_up_issue": "#2161",
+        "expires_on": "2026-12-31"
+      }
     },
     "codebase-investigator": {
       "path": ".codex/agents/codebase-investigator.toml",
       "claude_agent_path": ".claude/agents/codebase-investigator.md",
-      "claude_model": "haiku",
       "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
       "model": "gpt-5.6-luna",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-readonly",
@@ -197,13 +214,14 @@
         "local_asset_research",
         "github_research"
       ],
-      "agy_builder_provider": "agy"
+      "agy_builder_provider": "agy",
+      "model_alias": "haiku"
     },
     "web-researcher": {
       "path": ".codex/agents/web-researcher.toml",
       "claude_agent_path": ".claude/agents/web-researcher.md",
-      "claude_model": "haiku",
       "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
       "model": "gpt-5.6-luna",
       "model_reasoning_effort": "medium",
       "default_permissions": "loop-protocol-web-research",
@@ -212,7 +230,8 @@
       "agy_builder_profiles": [
         "grounded_research"
       ],
-      "agy_builder_provider": "agy"
+      "agy_builder_provider": "agy",
+      "model_alias": "haiku"
     }
   },
   "required_instruction_tokens": [
@@ -228,5 +247,37 @@
     "SubagentStart",
     "PreToolUse"
   ],
-  "required_hook_command_fragment": "scripts/check-codex-agents.mjs"
+  "required_hook_command_fragment": "scripts/check-codex-agents.mjs",
+  "asset_classification": {
+    ".claude/agents/codebase-investigator.md": "shared_claude_runtime",
+    ".codex/agents/codebase-investigator.toml": "legacy_codex_projection",
+    ".claude/agents/implementation-worker.md": "shared_claude_runtime",
+    ".codex/agents/implementation-worker.toml": "legacy_codex_projection",
+    ".claude/agents/issue-creator.md": "shared_claude_runtime",
+    ".codex/agents/issue-creator.toml": "legacy_codex_projection",
+    ".claude/agents/issue-editor.md": "shared_claude_runtime",
+    ".codex/agents/issue-editor.toml": "legacy_codex_projection",
+    ".claude/agents/issue-reviewer.md": "shared_claude_runtime",
+    ".codex/agents/issue-reviewer.toml": "legacy_codex_projection",
+    ".claude/agents/post-merge-cleanup-worker.md": "shared_claude_runtime",
+    ".codex/agents/post-merge-cleanup-worker.toml": "legacy_codex_projection",
+    ".claude/agents/pr-reviewer-lite.md": "shared_claude_runtime",
+    ".codex/agents/pr-reviewer-lite.toml": "legacy_codex_projection",
+    ".claude/agents/pr-reviewer.md": "shared_claude_runtime",
+    ".codex/agents/pr-reviewer.toml": "legacy_codex_projection",
+    ".claude/agents/review-issue.md": "shared_claude_runtime",
+    ".codex/agents/review-issue.toml": "legacy_codex_projection",
+    ".claude/agents/scope-rollup-runner.md": "shared_claude_runtime",
+    ".codex/agents/scope-rollup-runner.toml": "legacy_codex_projection",
+    ".claude/agents/test-runner.md": "shared_claude_runtime",
+    ".codex/agents/test-runner.toml": "legacy_codex_projection",
+    ".claude/agents/web-researcher.md": "shared_claude_runtime",
+    ".codex/agents/web-researcher.toml": "legacy_codex_projection",
+    ".claude/agents/issue-design-reviewer.md": "claude_only",
+    ".claude/agents/retrospective-evaluator.md": "claude_only",
+    ".claude/agents/retrospective-runtime-observer.md": "claude_only",
+    ".codex/agents/spark-deep.toml": "legacy_codex_only",
+    ".codex/agents/spark-skim.toml": "legacy_codex_only",
+    ".codex/agents/spark-worker.toml": "legacy_codex_only"
+  }
 }

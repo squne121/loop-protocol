@@ -11,6 +11,7 @@ disallowedTools:
   - Write
   - MultiEdit
 model: haiku
+effort: low
 permissionMode: dontAsk
 ---
 
