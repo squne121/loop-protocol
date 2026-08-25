@@ -48,9 +48,9 @@ uv run --locked python3 .claude/skills/agent-retrospective/scripts/run_retrospec
   --prompts-file <observer_id -> prompt テキストの JSON ファイル>
 ```
 
-`--schema-dir` は observer/evaluator 用 JSON Schema の配置先を差し替える場合のみ指定する
-override option で、通常は省略する。省略時は `run_retrospective.py` と同梱された
-`scripts/schemas/`（実装上 `_SCRIPTS_DIR / "schemas"`）を使用する。
+`--schema-dir` は observer/evaluator 用 JSON Schema の配置先を差し替える場合にのみ指定する
+override option であり、通常は省略してよい。省略時の既定値は scripts/schemas（`run_retrospective.py` の
+`_SCRIPTS_DIR / "schemas"`）。
 
 root Skill が用意するのはこの 1 回の Bash 呼び出しのみ。内部で `run_retrospective.run_cli()` が
 以下を順に実行する（各関数の詳細は `run_retrospective.py` 本体の docstring を正本とする）。
