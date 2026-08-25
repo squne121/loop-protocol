@@ -29,6 +29,21 @@
 #   6   read 制限 settings が未生成または不正
 #   7   proxy 起動失敗（loopback bind / readiness / model alias を確認できない）
 
+# --- Herdr Agents session hint: self-reexec (#2332) ---
+# Herdr 内(HERDR_ENV=1)かつ呼び出し側が HERDR_AGENT を設定していない場合だけ、
+# foreground process 自身の初期環境に HERDR_AGENT=claude を設定して exactly once
+# self-reexec する。exec は "$0"/"$@" を保持するため、既存の
+# positional-argument parser(--check-only/--dry-run/--claude-bin/--)の挙動には
+# 影響しない。呼び出し側が既に非空の HERDR_AGENT を設定している場合はその値を
+# exact に温存し、上書き・reexec のいずれも行わない。Herdr 外
+# (HERDR_ENV が unset または 1 以外)では常に no-op。
+# 2 回目の実行では HERDR_AGENT が既に非空になっているため、この分岐は
+# 自然に再発火しない(loop counter / state file は使わない)。
+if [ "$HERDR_ENV" = "1" ] && [ -z "$HERDR_AGENT" ]; then
+  export HERDR_AGENT=claude
+  exec /bin/sh "$0" "$@"
+fi
+
 SELF_PATH=$0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
 # shellcheck source=./lib.sh
