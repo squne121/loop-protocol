@@ -1,5 +1,3 @@
-## Revised Acceptance Criteria
-
 <html>
 <body>
 <!--StartFragment-->
@@ -8,6 +6,6 @@
 </ul>
 <!--EndFragment-->
 </body>
-</html>
+</html>## Revised Acceptance Criteria
 
 - Add retry handling to the sync worker for transient network failures.
