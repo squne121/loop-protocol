@@ -1,5 +1,39 @@
 name: retro-live-verification
 
+# Issue #2341 AC6 -- compensating control note (this workflow file governs
+# only the *unrelated* retro_live_verification/v2/v3 pnpm-based post/verify
+# feature; see this file's job comments below and Issue #2341 Background for
+# why). A real scheduled GitHub Actions job that runs
+# `.claude/skills/agent-retrospective/scripts/tests/verify_run_retrospective_live_cli.sh`
+# (the `claude_live`-marked `test_run_retrospective_live_cli.py` suite,
+# Issue #2301/#2341) is NOT added here: that suite's own documented
+# `skip_conditions` require a `claude` binary in PATH AND a pre-established,
+# authenticated Claude Code subscription login (`claude auth status` exiting
+# 0) -- see the script's own comments. GitHub-hosted runners have neither by
+# default, and provisioning one would mean persisting a subscription-session
+# credential as a repository secret purely to make a scheduled job stop
+# SKIPping (exit 77) -- an out-of-scope credential/secret-governance
+# escalation this Issue's Stop Conditions explicitly forbid ("外部サービス
+# 利用・権限昇格"). A `schedule:`-triggered job added under that constraint
+# would, in practice, always hit skip_condition 2 (`claude auth status`
+# failure) and therefore provide zero real regression-detection value while
+# projecting false confidence that CI continuously exercises this path.
+#
+# Compensating control (Issue #2341 In Scope 4): `verify_run_retrospective_live_cli.sh`
+# (which now also runs `test_real_claude_cli_analytical_prompt_structured_output_shape`,
+# the Issue #2341 AC4 regression test reproducing this exact failure shape)
+# is invoked manually by a human operator or an agent session with a real
+# authenticated `claude` CLI login -- prior to any Draft PR that changes
+# `run_retrospective.py`'s Agent invocation adapter (`build_agent_invocation_argv`
+# / `invoke_agent`) or its observer/evaluator wave logic -- with the raw
+# stdout (bounded, sanitized) attached as PR evidence, exactly as this
+# Issue's own `## Runtime Verification Applicability` `artifact_requirements`
+# require. Once local `claude` CLI headless authentication becomes provisionable
+# in a GitHub Actions runner without a standing subscription-session secret
+# (or an organizational decision accepts that tradeoff), a `schedule:`
+# trigger invoking `verify_run_retrospective_live_cli.sh` can be added here
+# as a follow-up -- tracked separately, not in this Issue's scope.
+
 on:
   workflow_dispatch:
     inputs:

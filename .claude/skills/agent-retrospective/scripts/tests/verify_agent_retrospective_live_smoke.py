@@ -23,13 +23,32 @@ composing `--prompts-file` observer prompts -- so this verifier does not
 try to guess it (previous versions of the observer-wave-bypassing test
 data are not reused here). No `--prompts-file` is passed at all, so
 `run_retrospective.py` runs with the documented empty-prompts default
-(`prompts.get(observer_id, "")` -> `""`), and the real observer wave
-against the real `retrospective-runtime-observer` leaf SubAgent
-deterministically resolves to a typed failure at bundle validation
-(`ObserverWaveFailed`, see `run_observer_wave()`'s `bundle.run_id !=
-ctx.run_id` check) -- never a false "resolved". Issue #2239 AC6/AC7
-explicitly accept either outcome ("PUBLISH_REQUEST_V1 or a typed failure
-envelope, as long as it is parseable"), so this verifier treats a
+(`prompts.get(observer_id, "")` -> `""`).
+
+Correction (PR #2342 fix_delta, OWNER review
+https://github.com/squne121/loop-protocol/pull/2342#issuecomment-5411607690,
+P2 item 3): this module previously documented that the empty-prompts
+default deterministically resolves to `ObserverWaveFailed`'s
+`bundle.run_id != ctx.run_id` bundle-validation check. That claim does NOT
+hold against the real `claude` CLI as actually observed (Claude Code
+2.1.245): `claude -p` rejects an empty prompt argument *before* any
+observer output is produced at all --
+``Error: Input must be provided either through stdin or as a prompt
+argument when using --print``, exit code 1 -- which
+`run_retrospective.py`'s `invoke_agent()` surfaces as
+`status="api_error"` / `reason_code="nonzero_exit"` on the
+`observer_failed:<agent>:<status>` `ObserverWaveFailed` raise site (never
+reaching the `bundle.run_id != ctx.run_id` check). `nonzero_exit` is
+intentionally NOT allowlisted below (see
+`_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES`), so this verifier
+currently FAILs (exit 1) on this path rather than reaching the exit-0
+typed-failure branch this docstring previously (incorrectly) documented as
+the deterministic outcome. This is a separately-tracked follow-up, not
+`run_retrospective.py`'s `ObserverWaveFailed` reason_code diagnosability
+work Issue #2341 / PR #2342 itself addresses -- see Issue #2345
+(https://github.com/squne121/loop-protocol/issues/2345). Issue #2239
+AC6/AC7 still accept either a `PUBLISH_REQUEST_V1` or a typed failure
+envelope, as long as it is parseable, so this verifier treats a
 well-formed typed failure as `status: "fail"` (not `"skip"`) and asserts
 the invariants that are meaningful regardless of which branch production
 took: schema-parseable output, `tested_head` match, repository fingerprint
@@ -77,6 +96,63 @@ _RUNTIME_PROFILES = {
 }
 
 _FORBIDDEN_MUTATION_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+
+#: Issue #2341 AC2 -- regression coverage gap fix. This verifier does not
+#: pass `--prompts-file` to `run_retrospective.py` (see the module
+#: docstring above), so an observer wave that actually reaches bundle
+#: validation against the real `retrospective-runtime-observer` leaf
+#: SubAgent can resolve to `ObserverWaveFailed` at `bundle.run_id !=
+#: ctx.run_id` (see `run_observer_wave()`) -- a KNOWN, expected, benign
+#: failure this verifier's docstring (and Issue #2239 AC6/AC7) explicitly
+#: accept as a well-formed typed-failure terminal outcome.
+#:
+#: PR #2342 fix_delta (OWNER review
+#: https://github.com/squne121/loop-protocol/pull/2342#issuecomment-5411607690,
+#: P1): `run_observer_wave()` previously left every envelope/base_sha/
+#: duplicate/manifest raise site without a granular `reason_code`, so all
+#: of them (run_id mismatch, `source_set_digest` mismatch, `base_sha`
+#: mismatch, duplicate `observer_id`, an `observer_id` outside the
+#: manifest, and an incomplete manifest) fell back to the generic
+#: `ObserverWaveFailed` exception-class-name `reason_code`. Allowlisting
+#: that generic name here would have accepted ALL of those distinct
+#: failure modes as "the known run_id-binding gap" -- including a mutated
+#: `base_sha` or a corrupted manifest, which are not benign. Each raise
+#: site now carries its own specific `reason_code` (see
+#: `run_observer_wave()`), so only the ONE known, accepted case --
+#: `observer_run_id_mismatch` -- is allowlisted below. `source_set_digest`/
+#: `base_sha` mismatches, duplicate/unexpected/missing `observer_id`s, and
+#: every `AgentInvocationResult.reason_code` an `observer_failed`
+#: `ObserverWaveFailed` can carry (`missing_structured_output`,
+#: `json_decode_failure`, `payload_not_object`,
+#: `api_error_with_partial_text`, `unexpected_wrapper_shape`,
+#: `result_subtype_not_success:*`, `timeout`, `sigterm`, `nonzero_exit`,
+#: and any `OSError` subclass name) remain genuine, undiagnosed production
+#: failures this verifier must FAIL on -- allowlisting is closed-world
+#: (deny-by-default), not open-world.
+_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES = frozenset(
+    {
+        # the known, accepted run_id-binding gap this verifier's own
+        # docstring documents (no `--prompts-file` -> `ctx.run_id` cannot be
+        # pre-seeded into observer prompts). See `run_observer_wave()`'s
+        # `bundle.run_id != ctx.run_id` raise site.
+        "observer_run_id_mismatch",
+    }
+)
+
+#: explicitly NOT allowlisted (Issue #2341 regression coverage gap fix,
+#: sharpened by PR #2342 fix_delta P1): `missing_structured_output` and
+#: every other granular `AgentInvocationResult.reason_code` an
+#: `observer_failed` `ObserverWaveFailed` can carry (json_decode_failure,
+#: payload_not_object, api_error_with_partial_text,
+#: unexpected_wrapper_shape, result_subtype_not_success:*, timeout,
+#: sigterm, nonzero_exit, any OSError subclass name), plus the now-granular
+#: envelope/manifest reason_codes that are NOT `observer_run_id_mismatch`
+#: (`observer_source_set_digest_mismatch`, `observer_base_sha_mismatch`,
+#: `duplicate_observer_id`, `observer_id_not_in_manifest`,
+#: `observer_manifest_incomplete`) are genuine, undiagnosed production
+#: failures this verifier must FAIL on, never silently accept as the one
+#: benign run_id-binding-gap case above.
+_DISALLOWED_OBSERVER_WAVE_FAILED_REASON_CODE_EXAMPLE = "missing_structured_output"
 _FORBIDDEN_BASH_SUBSTRINGS = (
     "git commit",
     "git push",
@@ -469,10 +545,29 @@ def main(argv: list[str] | None = None) -> int:
         "inner_result": inner_payload,
     }
 
+    unallowlisted_observer_wave_failure = False
     if inner_payload.get("status") == "failed" and "reason_code" in inner_payload:
+        observed_reason_code = inner_payload["reason_code"]
         receipt["status"] = "fail"
-        receipt["reason_code"] = inner_payload["reason_code"]
-        receipt["message"] = "real /agent-retrospective invocation produced a typed production failure envelope"
+        receipt["reason_code"] = observed_reason_code
+        if observed_reason_code not in _ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES:
+            # Issue #2341 AC2: an unallowlisted ObserverWaveFailed
+            # reason_code (e.g. `missing_structured_output`) is a genuine,
+            # undiagnosed production failure -- never silently accepted as
+            # the known, benign run_id-binding-gap envelope mismatch. This
+            # verifier must FAIL (non-zero exit) for it, not the exit-0
+            # "well-formed typed failure envelope" path Issue #2239 AC6/AC7
+            # otherwise accept.
+            unallowlisted_observer_wave_failure = True
+            receipt["message"] = (
+                "real /agent-retrospective invocation produced a typed production failure envelope with an "
+                f"unallowlisted reason_code={observed_reason_code!r} (allowlisted: "
+                f"{sorted(_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES)}) -- treated as a genuine verifier "
+                "FAIL, not the known run_id-binding-gap envelope mismatch (Issue #2341 regression coverage gap "
+                "fix)"
+            )
+        else:
+            receipt["message"] = "real /agent-retrospective invocation produced a typed production failure envelope"
     elif "run_identity" in inner_payload and "request_id" in inner_payload:
         run_identity = inner_payload.get("run_identity") or {}
         expected_base_sha = _git(repo_root, "rev-parse", "main").stdout.strip()
@@ -515,15 +610,27 @@ def main(argv: list[str] | None = None) -> int:
         receipt["message"] = f"{forbidden_event_count} forbidden mutation tool event(s) observed"
         _emit(receipt)
         return 1
+    if unallowlisted_observer_wave_failure:
+        # Issue #2341 AC2: an unallowlisted ObserverWaveFailed reason_code
+        # (e.g. `missing_structured_output`) is a genuine, undiagnosed
+        # production failure -- exit 1, not the exit-0 "well-formed typed
+        # failure envelope" path below.
+        _emit(receipt)
+        return 1
 
     # Both "pass" (a full PublishRequest bound to this run) and "fail" (a
     # well-formed typed production failure envelope, e.g. the documented
-    # run_id-prompt-binding gap above) are legitimate, expected completions
-    # of this live verification per Issue #2239 AC6/AC7 ("PUBLISH_REQUEST_V1
-    # or a typed failure envelope, as long as it is parseable") -- exit 0
-    # either way. Exit 1 (via `_fail()` above) is reserved for genuine
-    # verifier/production anomalies (timeouts, transport errors, malformed
-    # transcripts, fingerprint drift, forbidden mutation events).
+    # run_id-prompt-binding gap above -- i.e. an ALLOWLISTED
+    # ObserverWaveFailed reason_code, see
+    # `_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES`) are legitimate,
+    # expected completions of this live verification per Issue #2239 AC6/AC7
+    # ("PUBLISH_REQUEST_V1 or a typed failure envelope, as long as it is
+    # parseable") -- exit 0 either way. Exit 1 (via `_fail()` above, the
+    # fingerprint/forbidden-event checks above, or the unallowlisted
+    # ObserverWaveFailed reason_code check above, Issue #2341 AC2) is
+    # reserved for genuine verifier/production anomalies (timeouts,
+    # transport errors, malformed transcripts, fingerprint drift, forbidden
+    # mutation events, and unallowlisted typed-failure reason_codes).
     _emit(receipt)
     return 0
 
