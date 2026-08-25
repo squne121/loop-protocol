@@ -1589,8 +1589,13 @@ def check_c14_extension_surface_risk_trigger(body: str, issue_kind: str) -> tupl
             declared_decision=declared_decision,
             rva_section_text=rva_section or "",
         )
-    except evaluator.PolicyLoadError:
-        return CheckResult.NA, []
+    except evaluator.PolicyLoadError as exc:
+        # Distinguishable from the "matcher module not found" NA above
+        # (Issue #2290 P1-2, PR #2335): WARN (not NA, not FAIL) surfaces
+        # that the policy itself was unusable -- a non-blocking advisory
+        # finding rather than silently looking identical to "no candidate
+        # match found" (NA) or forcing a hard block (FAIL).
+        return CheckResult.WARN, [f"extension-surface risk-trigger policy unavailable: {exc}"]
 
     if verdict["verdict"] == "needs_fix":
         return CheckResult.FAIL, verdict["reasons"]

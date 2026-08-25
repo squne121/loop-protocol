@@ -234,3 +234,157 @@ def test_load_policy_reads_real_policy_yaml():
     result = evaluate_allowed_paths([".claude/hooks/some_hook.py"], policy=policy)
     assert result["has_match"] is True
     assert result["final_decision"] == "immediate"
+
+
+# ---------------------------------------------------------------------------
+# P0 (Issue #2290, PR #2335 OWNER review fix_delta -- highest priority):
+# Issue #2290's own declared Allowed Paths must not self-violate the gate it
+# introduces. `.claude/skills/**/scripts/**` matches are candidate-discovery
+# only ("advisory") and must not force needs_fix, unlike
+# `.claude/skills/**/SKILL.md` matches which remain a hard block.
+# ---------------------------------------------------------------------------
+
+
+def test_self_application_skill_scripts_only_is_advisory_not_hard_block():
+    # Issue #2290's own Allowed Paths (as declared in the live Issue body):
+    # only touches skill *script* files, not any SKILL.md, and declares
+    # decision: not_applicable. This must resolve to `approve`, not
+    # `needs_fix` -- otherwise the gate this Issue introduces would
+    # self-violate on its own contract.
+    result = evaluate_issue_risk_trigger(
+        allowed_path_entries=[
+            ".claude/skills/review-issue/scripts/check_issue_contract.py",
+            ".claude/skills/issue-contract-review/scripts/contract_readiness_check.py",
+        ],
+        declared_decision="not_applicable",
+        rva_section_text="decision: not_applicable",
+    )
+    assert result["verdict"] == "approve"
+    assert result["reasons"] == []
+    policy_evaluation = result["policy_evaluation"]
+    assert policy_evaluation["has_match"] is True
+    assert policy_evaluation["final_decision"] is None
+    matched_rule = policy_evaluation["matched_rules"][0]
+    assert matched_rule["enforcement"] == "advisory"
+    assert all(
+        match["path_glob"] == ".claude/skills/**/scripts/**" for match in matched_rule["matches"]
+    )
+
+
+def test_skill_md_match_remains_hard_block():
+    # Contrast case: a SKILL.md match (skill runtime semantics itself) must
+    # keep forcing needs_fix as before -- only the scripts/** selector was
+    # downgraded to advisory.
+    result = evaluate_issue_risk_trigger(
+        allowed_path_entries=[".claude/skills/some-skill/SKILL.md"],
+        declared_decision="not_applicable",
+        rva_section_text="decision: not_applicable",
+    )
+    assert result["verdict"] == "needs_fix"
+    matched_rule = result["policy_evaluation"]["matched_rules"][0]
+    assert matched_rule["enforcement"] == "hard"
+
+
+def test_mixed_scripts_and_skill_md_match_is_hard():
+    # A rule with at least one hard hit (SKILL.md) alongside an advisory hit
+    # (scripts/**) must still be classified "hard" overall for that rule.
+    result = evaluate_allowed_paths(
+        allowed_path_entries=[
+            ".claude/skills/foo/scripts/bar.py",
+            ".claude/skills/foo/SKILL.md",
+        ],
+    )
+    matched_rule = next(
+        r for r in result["matched_rules"] if r["rule_id"] == "skill-invocation-procedure-or-contract-change"
+    )
+    assert matched_rule["enforcement"] == "hard"
+    assert result["final_decision"] == "immediate"
+
+
+# ---------------------------------------------------------------------------
+# P1-2 (Issue #2290, PR #2335 OWNER review fix_delta): load_policy() must
+# fail closed (raise PolicyLoadError) on structurally incompatible policy
+# YAML instead of silently degrading to a normal "no candidate match".
+# ---------------------------------------------------------------------------
+
+
+def test_load_policy_rejects_unsupported_schema_version(tmp_path):
+    from extension_surface_policy_matcher import PolicyLoadError
+
+    bad_policy_path = tmp_path / "bad_schema_version.yaml"
+    bad_policy_path.write_text(
+        "schema_version: v1\n"
+        "resolution:\n"
+        "  multiple_matches: evaluate_all\n"
+        "  final_decision: most_restrictive\n"
+        "rules:\n"
+        "  - id: r1\n"
+        "    selectors:\n"
+        "      - source_scope: project\n"
+        "        path_globs: ['foo/**']\n"
+        "    default_decision: immediate\n"
+    )
+    try:
+        load_policy(bad_policy_path)
+        assert False, "expected PolicyLoadError"
+    except PolicyLoadError:
+        pass
+
+
+def test_load_policy_rejects_empty_rules(tmp_path):
+    from extension_surface_policy_matcher import PolicyLoadError
+
+    bad_policy_path = tmp_path / "empty_rules.yaml"
+    bad_policy_path.write_text(
+        "schema_version: v2\n"
+        "resolution:\n"
+        "  multiple_matches: evaluate_all\n"
+        "  final_decision: most_restrictive\n"
+        "rules: []\n"
+    )
+    try:
+        load_policy(bad_policy_path)
+        assert False, "expected PolicyLoadError"
+    except PolicyLoadError:
+        pass
+
+
+def test_load_policy_rejects_unknown_resolution_value(tmp_path):
+    from extension_surface_policy_matcher import PolicyLoadError
+
+    bad_policy_path = tmp_path / "unknown_resolution.yaml"
+    bad_policy_path.write_text(
+        "schema_version: v2\n"
+        "resolution:\n"
+        "  multiple_matches: first_match_only\n"
+        "  final_decision: most_restrictive\n"
+        "rules:\n"
+        "  - id: r1\n"
+        "    selectors:\n"
+        "      - source_scope: project\n"
+        "        path_globs: ['foo/**']\n"
+        "    default_decision: immediate\n"
+    )
+    try:
+        load_policy(bad_policy_path)
+        assert False, "expected PolicyLoadError"
+    except PolicyLoadError:
+        pass
+
+
+def test_load_policy_accepts_minimal_valid_policy(tmp_path):
+    good_policy_path = tmp_path / "good.yaml"
+    good_policy_path.write_text(
+        "schema_version: v2\n"
+        "resolution:\n"
+        "  multiple_matches: evaluate_all\n"
+        "  final_decision: most_restrictive\n"
+        "rules:\n"
+        "  - id: r1\n"
+        "    selectors:\n"
+        "      - source_scope: project\n"
+        "        path_globs: ['foo/**']\n"
+        "    default_decision: immediate\n"
+    )
+    policy = load_policy(good_policy_path)
+    assert policy["schema_version"] == "v2"

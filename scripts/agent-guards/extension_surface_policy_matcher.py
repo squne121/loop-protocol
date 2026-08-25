@@ -80,13 +80,97 @@ DECISION_RANK: dict[str, int] = {
     "immediate": 2,
 }
 
+# Path globs whose match is treated as "candidate discovery only" -- it is
+# recorded in ``matched_rules`` (and its ``verification_profile`` is still
+# surfaced) but never forces ``final_decision`` / ``needs_fix`` on its own
+# (PR #2335 OWNER review fix_delta, Issue #2290 P0).
+#
+# Rationale: a file living under ``.claude/skills/**/scripts/**`` being a
+# "skill script" is not the same fact as "skill runtime semantics changed".
+# This evaluator module's own consumers -- ``check_issue_contract.py`` and
+# ``contract_readiness_check.py`` -- are themselves under
+# ``.claude/skills/**/scripts/**``, and forcing ``decision: immediate`` on
+# every Issue whose Allowed Paths merely touch a skill script (static
+# checker edits, docstring fixes, refactors with no runtime-behavior change)
+# would make the gate self-contradicting for Issue #2290 itself. The
+# semantic judgment of whether a given script change actually alters skill
+# runtime behavior remains a PR-time responsibility (Out of Scope for
+# Issue #2290; see the module docstring).
+#
+# ``.claude/skills/**/SKILL.md`` is intentionally NOT included here: it
+# directly encodes skill runtime semantics (Procedure steps / output
+# contract schema) and keeps forcing its rule's ``default_decision`` at
+# Issue-time as before.
+CANDIDATE_ONLY_PATH_GLOBS: frozenset[str] = frozenset({".claude/skills/**/scripts/**"})
+
 
 class PolicyLoadError(RuntimeError):
-    """Raised when the policy YAML cannot be loaded or does not parse to a mapping."""
+    """Raised when the policy YAML cannot be loaded, does not parse to a
+    mapping, or does not satisfy the cheap structural contract this module
+    depends on (PR #2335 OWNER review fix_delta, Issue #2290 P1-2).
+
+    This is intentionally NOT a full ``jsonschema.validate()`` run against
+    ``docs/dev/extension-surface-runtime-policy.schema.json`` (that already
+    happens separately in
+    ``docs/dev/tests/test_extension_surface_runtime_policy_schema.py``).
+    This is a cheap, targeted check of only the fields this module's own
+    logic reads, so that a malformed/incompatible policy file fails closed
+    with an explicit, distinguishable error instead of silently degrading
+    to "no match" behaviour that looks identical to a legitimately clean
+    Allowed Paths set.
+    """
+
+
+# `resolution` values this module's evaluation logic actually implements.
+# A policy YAML declaring any other `resolution.multiple_matches` /
+# `resolution.final_decision` value is not safely interpretable by this
+# evaluator and must fail closed rather than silently mis-evaluate.
+_SUPPORTED_RESOLUTION_MULTIPLE_MATCHES = {"evaluate_all"}
+_SUPPORTED_RESOLUTION_FINAL_DECISION = {"most_restrictive"}
+
+
+def _validate_policy_contract(data: dict[str, Any], path: Path) -> None:
+    """Cheap structural validation of the fields this module depends on.
+
+    Raises ``PolicyLoadError`` (not a bare assertion) so callers can
+    distinguish "policy unavailable" from a normal "no candidate match"
+    result (Issue #2290 P1-2).
+    """
+    if data.get("schema_version") != "v2":
+        raise PolicyLoadError(
+            f"policy yaml at {path} has unsupported schema_version "
+            f"{data.get('schema_version')!r} (expected 'v2')"
+        )
+
+    rules = data.get("rules")
+    if not isinstance(rules, list) or not rules:
+        raise PolicyLoadError(f"policy yaml at {path} has an empty or missing 'rules' list")
+
+    resolution = data.get("resolution")
+    if not isinstance(resolution, dict):
+        raise PolicyLoadError(f"policy yaml at {path} is missing a 'resolution' mapping")
+    multiple_matches = resolution.get("multiple_matches")
+    if multiple_matches not in _SUPPORTED_RESOLUTION_MULTIPLE_MATCHES:
+        raise PolicyLoadError(
+            f"policy yaml at {path} declares unsupported "
+            f"resolution.multiple_matches {multiple_matches!r} "
+            f"(supported: {sorted(_SUPPORTED_RESOLUTION_MULTIPLE_MATCHES)})"
+        )
+    final_decision_strategy = resolution.get("final_decision")
+    if final_decision_strategy not in _SUPPORTED_RESOLUTION_FINAL_DECISION:
+        raise PolicyLoadError(
+            f"policy yaml at {path} declares unsupported "
+            f"resolution.final_decision {final_decision_strategy!r} "
+            f"(supported: {sorted(_SUPPORTED_RESOLUTION_FINAL_DECISION)})"
+        )
 
 
 def load_policy(policy_path: Optional[Path] = None) -> dict[str, Any]:
-    """Load and parse the extension-surface risk-trigger policy YAML."""
+    """Load, parse, and cheaply validate the extension-surface risk-trigger
+    policy YAML. Raises ``PolicyLoadError`` (never returns a partially
+    unusable mapping) if the file cannot be read/parsed, does not parse to
+    a mapping, or fails the cheap structural contract in
+    ``_validate_policy_contract`` (Issue #2290 P1-2)."""
     path = policy_path or _DEFAULT_POLICY_YAML_PATH
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -97,6 +181,7 @@ def load_policy(policy_path: Optional[Path] = None) -> dict[str, Any]:
         raise PolicyLoadError(f"failed to parse policy yaml at {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise PolicyLoadError(f"policy yaml at {path} did not parse to a mapping")
+    _validate_policy_contract(data, path)
     return data
 
 
@@ -203,6 +288,9 @@ def evaluate_allowed_paths(
         if not match_hits:
             continue
 
+        hard_hits = [hit for hit in match_hits if hit["path_glob"] not in CANDIDATE_ONLY_PATH_GLOBS]
+        enforcement = "hard" if hard_hits else "advisory"
+
         rule_decision = rule.get("default_decision")
         rule_profile = rule.get("verification_profile")
         matched_rules.append(
@@ -211,11 +299,16 @@ def evaluate_allowed_paths(
                 "default_decision": rule_decision,
                 "verification_profile": rule_profile,
                 "matches": match_hits,
+                "enforcement": enforcement,
             }
         )
         if rule_profile:
             verification_profiles.add(rule_profile)
-        if rule_decision in DECISION_RANK:
+        # Advisory-only matches (every hit's path_glob is in
+        # CANDIDATE_ONLY_PATH_GLOBS) are candidate discovery signals, not a
+        # hard block -- they never contribute to final_decision (Issue #2290
+        # P0 fix delta, PR #2335).
+        if enforcement == "hard" and rule_decision in DECISION_RANK:
             if final_decision is None or DECISION_RANK[rule_decision] > DECISION_RANK[final_decision]:
                 final_decision = rule_decision
 
