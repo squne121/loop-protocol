@@ -27,6 +27,7 @@ skills: []
 # 「値を明示すれば無効化できる」か否か・empty value と omission の意味差は
 # フィールドごとに異なりうるため、本コメントではその技術的細部までは断定しない)。
 model: sonnet
+effort: medium
 maxTurns: 8
 permissionMode: dontAsk
 ---
