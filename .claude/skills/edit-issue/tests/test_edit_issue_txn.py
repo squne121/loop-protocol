@@ -96,11 +96,10 @@ def _semantic_producer_shaped_constraints() -> dict:
     return {
         "schema_version": "SEMANTIC_REWRITE_CONSTRAINTS_V1",
         "source_artifact": "artifacts/2296/semantic-review/2026-08-01T00-00-00Z.json",
-        # Issue #2316 fix_delta (P2-1): real sha256 hex digest shape, not a
-        # short placeholder -- join_review_results.py forwards the actual
-        # body_sha256 from the SEMANTIC_REVIEW_RESULT_V1 sidecar, which is
-        # constrained to ^[0-9a-f]{64}$ by schemas/semantic_review_result_v1.schema.json.
-        "checked_body_sha256": "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff",
+        # deterministic placeholder with the real sha256 hex digest shape:
+        # a 64-character lowercase hex string, matching the constraint
+        # ^[0-9a-f]{64}$ from schemas/semantic_review_result_v1.schema.json.
+        "checked_body_sha256": "a" * 64,
         # SEMANTIC_REVIEW_RESULT_V1 findings entries are additionalProperties:
         # false with only severity/summary required (plus optional
         # evidence_refs / recommended_fix / requires_owner_choice /
@@ -225,7 +224,15 @@ def test_rewrite_lane_semantic_with_producer_shaped_constraints_accepted(repo_tm
     # (join_review_results.py) shape (AC3)
     payload = _minimal_input(repo_tmp)
     payload["rewrite_lane"] = "semantic"
-    payload["semantic_rewrite_constraints"] = _semantic_producer_shaped_constraints()
+    constraints = _semantic_producer_shaped_constraints()
+    payload["semantic_rewrite_constraints"] = constraints
+    # AND the fixture's checked_body_sha256 matches the real producer shape:
+    # a 64-character lowercase hex digest, per
+    # schemas/semantic_review_result_v1.schema.json (^[0-9a-f]{64}$) (Issue #2329)
+    digest = constraints["checked_body_sha256"]
+    assert isinstance(digest, str)
+    assert len(digest) == 64
+    assert all(c in "0123456789abcdef" for c in digest)
     # WHEN validated THEN it is accepted without input_unknown_keys
     txn._validate_input_payload(payload)
 
