@@ -97,6 +97,7 @@ def _claude_md(
     output_schema: str = "ISSUE_REVIEW_RESULT_COMPACT_V1",
     artifact_only: str | None = None,
     extra_body: str = "",
+    effort: str | None = None,
 ) -> str:
     if disallowed_tools is None:
         disallowed_tools = ["Agent", "Edit", "Write"]
@@ -114,6 +115,8 @@ def _claude_md(
     ]
     lines.extend(f"  - {t}" for t in tools)
     lines.append(f"permissionMode: {permission_mode}")
+    if effort is not None:
+        lines.append(f"effort: {effort}")
     lines.append("disallowedTools:")
     lines.extend(f"  - {t}" for t in disallowed_tools)
     lines.append("---")
@@ -221,7 +224,7 @@ def _write_minimal_contract(tmp_path: Path, agent_name: str = "issue-reviewer") 
             agent_name: {
                 "path": f".codex/agents/{agent_name}.toml",
                 "claude_agent_path": f".claude/agents/{agent_name}.md",
-                "claude_model": "haiku",
+                "model_alias": "haiku",
                 "claude_permission_mode": "dontAsk",
                 "model": "gpt-5.4-mini",
                 "model_reasoning_effort": "medium",
@@ -471,6 +474,69 @@ class TestModelDeclaration:
         mr = data["model_declaration_report"][0]
         codex_model_decl = mr["model_declaration"]["codex"]
         assert "advisory" in codex_model_decl or "not runtime proof" in codex_model_decl
+
+
+# ---------------------------------------------------------------------------
+# AC6: effort_requirement mismatch is a real warn-level drift (human PR
+# reviewer P1 blocker, PR #2334 comment 5401806450) -- it is no longer
+# report-only STATUS: ok. Static declaration comparison only, not runtime
+# proof.
+# ---------------------------------------------------------------------------
+
+class TestEffortRequirementRealDrift:
+    def test_effort_mismatch_produces_warn_status_and_evidence(self, tmp_path: Path):
+        """AC6: a declared Claude effort that differs from the Codex
+        model_reasoning_effort declaration produces a real
+        EFFORT_REQUIREMENT_001 warn_drift entry and STATUS: warn (not a
+        silent STATUS: ok)."""
+        result = _run_cli(
+            tmp_path,
+            _claude_md(effort="high"),
+        )
+        data = json.loads(result.stdout)
+        assert data["STATUS"] == "warn", data
+        warn_drifts = [d for d in data["warn_drift"] if d["rule_id"] == "EFFORT_REQUIREMENT_001"]
+        assert len(warn_drifts) == 1
+        assert warn_drifts[0]["actual"] == "high"
+        assert warn_drifts[0]["expected"] == "medium"
+
+    def test_effort_match_produces_no_warn_drift(self, tmp_path: Path):
+        """AC6: matching effort declarations produce no warn drift and
+        STATUS: ok."""
+        result = _run_cli(
+            tmp_path,
+            _claude_md(effort="medium"),
+        )
+        data = json.loads(result.stdout)
+        assert data["STATUS"] == "ok", data
+        assert data["warn_drift"] == []
+
+    def test_effort_mismatch_with_strict_exits_nonzero(self, tmp_path: Path):
+        """AC6: STATUS: warn participates in --strict (nonzero exit)."""
+        result = _run_cli(
+            tmp_path,
+            _claude_md(effort="high"),
+            extra_args=["--strict"],
+        )
+        assert result.returncode == 1, result.stdout
+
+    def test_effort_mismatch_without_strict_exits_zero(self, tmp_path: Path):
+        """AC6: STATUS: warn does not fail the build without --strict."""
+        result = _run_cli(
+            tmp_path,
+            _claude_md(effort="high"),
+        )
+        assert result.returncode == 0, result.stdout
+
+    def test_effort_not_declared_is_not_a_warn_drift(self, tmp_path: Path):
+        """Regression guard: an agent that does not declare `effort` at all
+        reports 'not_declared' (advisory) and must not produce a
+        EFFORT_REQUIREMENT_001 warn drift."""
+        result = _run_cli(tmp_path, _claude_md())
+        data = json.loads(result.stdout)
+        assert data["STATUS"] == "ok", data
+        assert data["warn_drift"] == []
+        assert data["model_declaration_report"][0]["effort_requirement"]["match"] == "not_declared"
 
 
 # ---------------------------------------------------------------------------

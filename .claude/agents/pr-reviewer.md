@@ -11,6 +11,7 @@ disallowedTools:
   - Write
   - MultiEdit
 model: sonnet
+effort: high
 permissionMode: dontAsk
 skills:
   - pr-review-judge
