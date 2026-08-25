@@ -216,13 +216,60 @@ def _project_path_globs(rule: dict[str, Any]) -> list[str]:
     return globs
 
 
+def _selector_remainder_after_prefix(normalized_selector: str, prefix_len: int) -> list[str]:
+    """Segments of ``normalized_selector`` after its first ``prefix_len`` segments."""
+    return normalized_selector.split("/")[prefix_len:]
+
+
+def _is_single_file_at_any_depth_selector(normalized_selector: str, selector_prefix: list[str]) -> bool:
+    """True if, past its static prefix, ``normalized_selector`` is exactly one
+    ``**`` segment followed by exactly one literal terminal segment and
+    nothing else (e.g. ``.claude/skills/**/SKILL.md``).
+
+    This pattern shape means "a specific named file, located directly under
+    whatever the ``**`` expands to" -- by this repository's own Claude Code
+    skill convention (see this module's docstring: ``SKILL.md`` always sits
+    directly under ``.claude/skills/<name>/``, never nested inside a further
+    named subdirectory such as ``tests/``, ``fixtures/`` or ``schemas/``).
+    Selectors with a *different* trailing shape (e.g.
+    ``.claude/skills/**/scripts/**``, which ends in another ``**`` and thus
+    describes an entire subtree, not a single fixed-depth file) do not
+    qualify.
+    """
+    remainder = _selector_remainder_after_prefix(normalized_selector, len(selector_prefix))
+    return len(remainder) == 2 and remainder[0] == "**" and remainder[1] not in ("*", "**")
+
+
 def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Return a match-info dict if ``entry`` is a candidate for ``rule``, else ``None``."""
+    """Return a match-info dict if ``entry`` is a candidate for ``rule``, else ``None``.
+
+    A rule may declare more than one ``path_glob`` (e.g.
+    ``skill-invocation-procedure-or-contract-change`` declares both
+    ``.claude/skills/**/SKILL.md`` and ``.claude/skills/**/scripts/**``).
+    For a *wildcard* Allowed Path entry, the conservative static-prefix
+    comparison can match several of the rule's globs at once with equal
+    confidence (e.g. an entry whose prefix is ``.claude/skills/foo`` is an
+    equally valid conservative match against both globs above). Picking
+    only the first glob encountered is an ordering artifact, not a
+    judgment -- if picking the "wrong" glob silently turns a
+    candidate-discovery-only match (``CANDIDATE_ONLY_PATH_GLOBS``) into a
+    hard-block match, the gate self-contradicts on its own declared
+    Allowed Paths (PR #2335 OWNER review fix_delta, Issue #2290 P0
+    re-fix). To stay on the documented "conservative" side (false
+    negatives are acceptable, false positives are not; but a hard block
+    triggered purely by glob-iteration order is itself a false positive
+    here), a wildcard entry that ambiguously matches both a
+    candidate-only glob and a non-candidate-only glob within the same
+    rule is resolved to the candidate-only (advisory) match. An entry
+    that matches only candidate-only globs, or only non-candidate-only
+    globs, is unambiguous and keeps its natural classification.
+    """
     normalized_entry_pattern = AllowedPathsMatcher.normalize_allowed_pattern(entry)
     if normalized_entry_pattern is None:
         return None
     is_wildcard = "*" in normalized_entry_pattern
 
+    matches: list[dict[str, Any]] = []
     for path_glob in _project_path_globs(rule):
         normalized_selector = AllowedPathsMatcher.normalize_allowed_pattern(path_glob)
         if normalized_selector is None:
@@ -235,6 +282,11 @@ def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[
             if normalized_file is None:
                 continue
             if AllowedPathsMatcher.matches_pattern(normalized_file, normalized_selector):
+                # An exact repo-relative path is unambiguous: it cannot
+                # simultaneously live under two structurally distinct
+                # globs of the same rule in practice, so the first match
+                # found is authoritative (unaffected by the wildcard
+                # ambiguity handling below).
                 return {
                     "match_kind": "exact",
                     "allowed_path_entry": entry,
@@ -247,17 +299,54 @@ def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[
         # (Issue #2290 In Scope, bullet 1). Either prefix being a prefix of
         # the other means the two path spaces *could* overlap once the
         # wildcard segments are expanded; this over-flags rather than
-        # silently missing a candidate.
+        # silently missing a candidate. Unlike the exact-path case above,
+        # evaluate every glob in the rule (not just the first hit) so
+        # ambiguous multi-glob matches can be detected below.
         entry_prefix = _static_prefix_segments(normalized_entry_pattern)
         selector_prefix = _static_prefix_segments(normalized_selector)
-        if _one_is_prefix_of_other(entry_prefix, selector_prefix):
-            return {
+        if not _one_is_prefix_of_other(entry_prefix, selector_prefix):
+            continue
+
+        if len(entry_prefix) > len(selector_prefix) + 1 and _is_single_file_at_any_depth_selector(
+            normalized_selector, selector_prefix
+        ):
+            # The entry's static prefix drills more than one segment past
+            # this selector's own static prefix, while the selector names a
+            # single specific file located directly under whatever its
+            # "**" expands to (e.g. "SKILL.md" at the skill root). Per this
+            # repository's Claude Code skill convention, such files are
+            # never nested inside a further named subdirectory (tests/,
+            # fixtures/, schemas/, ...), so a wildcard entry scoped to such
+            # a subdirectory cannot conservatively be a candidate for this
+            # selector -- unlike ``.claude/skills/**/scripts/**``-shaped
+            # selectors (an entire-subtree pattern, unaffected by this
+            # check), which is why this only applies to single-file-shaped
+            # selectors (PR #2335 second OWNER review fix_delta, Issue
+            # #2290 P0 re-fix).
+            continue
+
+        matches.append(
+            {
                 "match_kind": "conservative_wildcard_prefix",
                 "allowed_path_entry": entry,
                 "path_glob": path_glob,
             }
+        )
 
-    return None
+    if not matches:
+        return None
+
+    candidate_only_hits = [m for m in matches if m["path_glob"] in CANDIDATE_ONLY_PATH_GLOBS]
+    non_candidate_only_hits = [m for m in matches if m["path_glob"] not in CANDIDATE_ONLY_PATH_GLOBS]
+    if candidate_only_hits and non_candidate_only_hits:
+        # Ambiguous: the same wildcard entry's conservative prefix matched
+        # both a candidate-only glob and a non-candidate-only glob within
+        # this rule, with no basis to prefer one over the other. Resolve
+        # to the candidate-only (advisory) match rather than the hard
+        # match to avoid a glob-iteration-order-dependent hard block.
+        return candidate_only_hits[0]
+
+    return matches[0]
 
 
 def evaluate_allowed_paths(
