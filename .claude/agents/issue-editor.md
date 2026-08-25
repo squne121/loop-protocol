@@ -11,6 +11,7 @@ disallowedTools:
   - Write
   - Skill
 model: sonnet
+effort: medium
 permissionMode: acceptEdits
 skills:
   - edit-issue

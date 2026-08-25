@@ -2,6 +2,7 @@
 name: pr-reviewer-lite
 description: docs-only / small diff PR 向けの軽量 Haiku reviewer。適用条件（changed_files_count ≤ 3、additions_plus_deletions ≤ 200 等）を満たす PR のみを処理し、deny-list に該当する場合は Sonnet pr-reviewer へ fail-closed する。pr-review-judge の必須 gate（linked issue 確認 / CI 確認 / AC coverage / SKIP/fallback APPROVE 禁止）を必ず実行する。
 model: haiku
+effort: medium
 tools:
   - Bash
   - Read
