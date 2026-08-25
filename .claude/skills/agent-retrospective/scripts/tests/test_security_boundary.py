@@ -51,7 +51,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import collect_snapshot as cs  # noqa: E402
 import persist_retrospective_run as pr  # noqa: E402
 import run_retrospective as rr  # noqa: E402
-import verify_agent_retrospective_live_smoke as vals  # noqa: E402
 
 _validate_mod = rr._validate_retrospective_schema_module()
 
@@ -461,19 +460,20 @@ def _run_live_smoke(runtime_profile: str) -> None:
     # failure, and those already exit non-zero above.
     assert payload["status"] in ("pass", "fail")
     if payload["status"] == "fail":
+        # PR #2342 fix_delta P2 item 2 (OWNER review
+        # https://github.com/squne121/loop-protocol/pull/2342#issuecomment-5411607690):
+        # the previous version of this block re-imported the verifier's own
+        # `_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES` constant and
+        # asserted `payload["reason_code"] in` it here, claiming
+        # "defense-in-depth". That was not actually independent (it is the
+        # same module's own constant) and was unreachable in the case it
+        # claimed to guard: `verify_agent_retrospective_live_smoke.py`
+        # itself already exits non-zero for an unallowlisted reason_code, so
+        # this function's `pytest.fail()` on nonzero exit above fires first
+        # and this line never runs for that case. See
+        # `test_observer_wave_failed_reason_code_classification_hermetic`
+        # below for the actual independent, hermetic classification oracle.
         assert payload["reason_code"]
-        # Issue #2341 AC3: independent, in-test assertion (defense-in-depth
-        # alongside the verifier's own AC2 allowlist enforcement, which
-        # already makes an unallowlisted reason_code exit non-zero and thus
-        # fail earlier via pytest.fail() above) that a "fail" status is only
-        # ever the known, allowlisted ObserverWaveFailed reason_code -- e.g.
-        # missing_structured_output (the Issue #2341 regression) or any
-        # other unallowlisted reason_code must never reach this assertion as
-        # a "fail"-status payload with exit 0.
-        assert payload["reason_code"] in vals._ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES, (
-            f"unallowlisted reason_code observed on a status=fail payload with exit 0: "
-            f"{payload['reason_code']!r} (allowlisted: {sorted(vals._ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES)})"
-        )
     assert payload["fallback_used"] is False
     assert payload["repository_fingerprint_diff_clean"] is True
     assert payload["forbidden_mutation_tool_events"] == 0
@@ -531,6 +531,44 @@ def test_live_smoke_verifier_unknown_runtime_profile_is_rejected() -> None:
         timeout=30,
     )
     assert completed.returncode == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #2341 AC3 / PR #2342 fix_delta P2 item 2 (OWNER review
+# https://github.com/squne121/loop-protocol/pull/2342#issuecomment-5411607690):
+# a small, hermetic, independent classification oracle for the
+# ObserverWaveFailed reason_code allowlist. This table intentionally does
+# NOT import `verify_agent_retrospective_live_smoke`'s own
+# `_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES` constant -- asserting a
+# module's constant against itself is not an independent check (see the
+# removed assertion this replaces, above in `_run_live_smoke`). This is a
+# hand-maintained specification: only `observer_run_id_mismatch` (the
+# known, accepted run_id-binding gap the empty-prompts default in
+# `verify_agent_retrospective_live_smoke.py` triggers, per
+# `run_observer_wave()`'s `bundle.run_id != ctx.run_id` check) is
+# allowlisted -- every other typed `ObserverWaveFailed`/observer-invocation
+# reason_code, including `missing_structured_output` (the Issue #2341
+# regression itself), must NOT be.
+# ---------------------------------------------------------------------------
+
+_EXPECTED_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES = frozenset({"observer_run_id_mismatch"})
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "allowed"),
+    [
+        ("observer_run_id_mismatch", True),
+        ("observer_source_set_digest_mismatch", False),
+        ("observer_base_sha_mismatch", False),
+        ("duplicate_observer_id", False),
+        ("observer_id_not_in_manifest", False),
+        ("observer_manifest_incomplete", False),
+        ("missing_structured_output", False),
+        ("nonzero_exit", False),
+    ],
+)
+def test_observer_wave_failed_reason_code_classification_hermetic(reason_code: str, allowed: bool) -> None:
+    assert (reason_code in _EXPECTED_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES) is allowed
 
 
 # ---------------------------------------------------------------------------

@@ -117,21 +117,28 @@ def test_real_claude_cli_analytical_prompt_structured_output_shape() -> None:
     Background, and the suspected upstream nested-schema shape reported at
     https://github.com/anthropics/claude-agent-sdk-typescript/issues/277).
 
-    This test is intentionally tolerant of BOTH outcomes so it keeps
-    providing CI signal instead of becoming permanently red on an upstream
-    defect this repository does not control:
+    PR #2342 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2342#issuecomment-5411607690,
+    P2 item 1): this test is intentionally tolerant of exactly one outcome
+    besides a clean PASS, and hard-FAILs on everything else -- it is a real
+    `claude_live`-marked regression check, not a canary that never turns
+    red:
       - if the CLI now returns a fully conformant `status="ok"` result for
         this prompt shape, the test PASSES outright (the regression is
         resolved upstream);
       - if the CLI reproduces the diagnosed `missing_structured_output`
         signature exactly (`exit_code == 0`,
-        `reason_code == "missing_structured_output"`), the test is marked
-        `xfail` -- a *known*, tracked regression, not a silent PASS and
-        not a hard FAIL (`pyproject.toml` does not set `xfail_strict`, so
-        an eventual XPASS here is informational, never a failure);
+        `reason_code == "missing_structured_output"`), the test FAILS via
+        `pytest.fail()` (previously `pytest.xfail()` -- pytest's default
+        XFAIL does not fail the suite, and `pyproject.toml` does not set
+        `xfail_strict`, so the previous form was an observation-only
+        canary, not a detector). `claude_live` remains excluded from
+        normal/automated CI (see `pyproject.toml`'s marker filter), so this
+        change only affects manual `claude_live` runs: they now go red for
+        real when this known regression reproduces;
       - any OTHER adapter outcome (timeout, terminated, a different
-        reason_code, a non-zero exit_code) is a genuine, undiagnosed
-        regression and fails the test for real.
+        reason_code, a non-zero exit_code) is likewise a genuine,
+        undiagnosed regression and fails the test for real.
     """
     run_id = f"live-cli-{uuid.uuid4()}"
     nonce = uuid.uuid4().hex
@@ -194,12 +201,15 @@ def test_real_claude_cli_analytical_prompt_structured_output_shape() -> None:
         and result.reason_code == "missing_structured_output"
         and result.exit_code == 0
     ):
-        pytest.xfail(
+        pytest.fail(
             "Issue #2341 known regression reproduced: exit_code=0, wrapper "
             "subtype=success, structured_output missing for a substantive "
             "analysis prompt against the nested `findings` schema "
             "(suspected upstream Claude Code CLI structured-output defect, "
-            "see Issue #2341 Background)."
+            "see Issue #2341 Background). PR #2342 fix_delta P2 item 1: "
+            "this is now a hard FAIL (was `pytest.xfail()`), so a manual "
+            "`claude_live` run actually goes red when this regression "
+            "reproduces."
         )
 
     pytest.fail(

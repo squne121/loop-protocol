@@ -1050,18 +1050,38 @@ def run_observer_wave(
             )
         raw_text = json.dumps(result.structured_output, sort_keys=True, separators=(",", ":"))
         bundle = parse_agent_output_with_repair(raw_text, EvidenceBundle, repair=repair)
-        if bundle.run_id != ctx.run_id or bundle.source_set_digest != plan.source_set_digest:
-            raise ObserverWaveFailed(f"observer_envelope_mismatch:{request.agent_name}")
+        if bundle.run_id != ctx.run_id:
+            raise ObserverWaveFailed(
+                f"observer_run_id_mismatch:{request.agent_name}",
+                reason_code="observer_run_id_mismatch",
+            )
+        if bundle.source_set_digest != plan.source_set_digest:
+            raise ObserverWaveFailed(
+                f"observer_source_set_digest_mismatch:{request.agent_name}",
+                reason_code="observer_source_set_digest_mismatch",
+            )
         if bundle.base_sha != ctx.base_sha:
-            raise ObserverWaveFailed(f"observer_base_sha_mismatch:{request.agent_name}")
+            raise ObserverWaveFailed(
+                f"observer_base_sha_mismatch:{request.agent_name}",
+                reason_code="observer_base_sha_mismatch",
+            )
         if bundle.observer_id in seen_ids:
-            raise ObserverWaveFailed(f"duplicate_observer_id:{bundle.observer_id}")
+            raise ObserverWaveFailed(
+                f"duplicate_observer_id:{bundle.observer_id}",
+                reason_code="duplicate_observer_id",
+            )
         if expected_ids is not None and bundle.observer_id not in expected_ids:
-            raise ObserverWaveFailed(f"observer_id_not_in_manifest:{bundle.observer_id}")
+            raise ObserverWaveFailed(
+                f"observer_id_not_in_manifest:{bundle.observer_id}",
+                reason_code="observer_id_not_in_manifest",
+            )
         seen_ids.add(bundle.observer_id)
         bundles.append(bundle)
     if expected_ids is not None and seen_ids != expected_ids:
-        raise ObserverWaveFailed(f"observer_manifest_incomplete:missing={sorted(expected_ids - seen_ids)}")
+        raise ObserverWaveFailed(
+            f"observer_manifest_incomplete:missing={sorted(expected_ids - seen_ids)}",
+            reason_code="observer_manifest_incomplete",
+        )
     return bundles
 
 
