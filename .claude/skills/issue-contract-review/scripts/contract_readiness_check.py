@@ -1331,6 +1331,130 @@ def _is_canonical_implementation_issue(body: str) -> bool:
     return contract.ok and contract.get("issue_kind") == "implementation"
 
 
+def _load_extension_surface_policy_matcher():
+    """Dynamically load `scripts/agent-guards/extension_surface_policy_matcher.py`.
+
+    Mirrors this file's own `declared_path_overlap.py`-adjacent dynamic-load
+    pattern for `scripts/agent-guards/changed_file_matcher.py` (Issue #2290
+    "Notes for Reviewer": no new static import boundary / package). Returns
+    `None` if the shared evaluator module cannot be located, so callers
+    degrade gracefully rather than raising.
+    """
+    import importlib.util
+
+    matcher_path = _REPO_ROOT / "scripts" / "agent-guards" / "extension_surface_policy_matcher.py"
+    if not matcher_path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "extension_surface_policy_matcher_for_contract_readiness_check", matcher_path
+    )
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+def check_extension_surface_risk_trigger(body: str) -> list[dict]:
+    """Issue #2290: declared Allowed Paths vs. extension-surface risk-trigger policy.
+
+    Same-type addition as `check_rva_immediate_fields()` above -- uses the
+    shared evaluator to detect a syntactic candidate overlap between the
+    Issue's declared Allowed Paths and
+    `docs/dev/extension-surface-runtime-policy.yaml` selectors, and (when
+    `decision: immediate` is declared) whether the Runtime Verification
+    Applicability contract's required immediate fields are present.
+    Candidate discovery only -- not a semantic diff judgment of the actual
+    PR change (Issue #2290 Out of Scope).
+    """
+    # Issue #2290 P1-1 fix delta (PR #2335 OWNER review): parity with
+    # review-issue's `check_c14_extension_surface_risk_trigger()`, which
+    # already guards on `issue_kind != "implementation"`. Non-implementation
+    # Issues (research/etc.) do not declare a Runtime Verification
+    # Applicability contract in the same sense, so this check is
+    # not-applicable for them.
+    if not _is_canonical_implementation_issue(body):
+        return []
+
+    allowed_path_entries = _extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return []
+
+    section = _extract_rva_section(body)
+    rva_section_text = section[0] if section is not None else ""
+    decision_match = re.search(r"decision:\s*(\S+)", rva_section_text)
+    declared_decision = decision_match.group(1).strip() if decision_match else None
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+
+    try:
+        verdict = evaluator.evaluate_issue_risk_trigger(
+            allowed_path_entries=allowed_path_entries,
+            declared_decision=declared_decision,
+            rva_section_text=rva_section_text,
+        )
+    except evaluator.PolicyLoadError as exc:
+        # Issue #2290 P1-2 fix delta (PR #2335 OWNER review): distinguishable
+        # from the "matcher module not found" [] above, and from an ordinary
+        # "no candidate match" []. A malformed/incompatible policy file must
+        # not silently look identical to "nothing to flag" -- it fail-closes
+        # to a `human_judgment`-severity finding (see the
+        # `extension_surface_risk_trigger_policy_unavailable` category branch
+        # in the `run_contract_readiness_check` aggregate-status wiring)
+        # instead of a body-author-fixable `needs_fix`.
+        section_start_line = section[1] if section is not None else 0
+        section_end_line = section[2] if section is not None else 0
+        return [
+            {
+                "rule_id": "EXTSURF002",
+                "severity": "error",
+                "source_check": "contract_readiness_check",
+                "category": "extension_surface_risk_trigger_policy_unavailable",
+                "section": "Runtime Verification Applicability",
+                "line_start": section_start_line,
+                "line_end": section_end_line,
+                "minimal_context": [f"extension-surface risk-trigger policy unavailable: {exc}"],
+                "fix_hint": (
+                    "The extension-surface risk-trigger policy "
+                    "(docs/dev/extension-surface-runtime-policy.yaml) failed its "
+                    "structural contract check and cannot be evaluated. This is "
+                    "not body-author-fixable; escalate to a human/owner to repair "
+                    "or restore the policy file."
+                ),
+                "autofixable": False,
+            }
+        ]
+
+    if verdict["verdict"] != "needs_fix":
+        return []
+
+    section_start_line = section[1] if section is not None else 0
+    section_end_line = section[2] if section is not None else 0
+
+    return [
+        {
+            "rule_id": "EXTSURF001",
+            "severity": "error",
+            "source_check": "contract_readiness_check",
+            "category": "extension_surface_risk_trigger",
+            "section": "Runtime Verification Applicability",
+            "line_start": section_start_line,
+            "line_end": section_end_line,
+            "minimal_context": verdict["reasons"],
+            "fix_hint": (
+                "Reconcile the declared Allowed Paths / Runtime Verification "
+                "Applicability decision with the extension-surface risk-trigger "
+                "policy (docs/dev/extension-surface-runtime-policy.yaml): "
+                + "; ".join(verdict["reasons"])
+            ),
+            "autofixable": False,
+        }
+    ]
+
+
 def check_rva_immediate_fields(body: str) -> list[dict]:
     """
     AC4: Check that `decision: immediate` RVA section has all required fields.
@@ -1724,6 +1848,7 @@ def build_result(
     existing_readiness_errors = check_existing_issue_readiness_semantics(body)
     rva_errors = check_rva_immediate_fields(body)
     rdr_errors = check_required_design_references(body)
+    ext_surface_errors = check_extension_surface_risk_trigger(body)
 
     preflight_errors: list[dict] = []
     preflight_aggregate = "go"
@@ -1742,6 +1867,7 @@ def build_result(
         + existing_readiness_errors
         + rva_errors
         + rdr_errors
+        + ext_surface_errors
         + static_vc_errors
         + preflight_errors
     )
@@ -1756,6 +1882,18 @@ def build_result(
     )
     if rdr_errors:
         overall_status = _raise_status(overall_status, "needs_fix")
+    if ext_surface_errors:
+        # Issue #2290 P1-2 fix delta (PR #2335 OWNER review): a policy-load
+        # failure is not body-author-fixable, so it escalates to
+        # human_judgment instead of the ordinary needs_fix path used by a
+        # genuine Allowed-Paths-vs-policy candidate match.
+        if any(
+            e.get("category") == "extension_surface_risk_trigger_policy_unavailable"
+            for e in ext_surface_errors
+        ):
+            overall_status = _raise_status(overall_status, "human_judgment")
+        else:
+            overall_status = _raise_status(overall_status, "needs_fix")
 
     fix_hint: Optional[str] = None
     minimal_context: list = []

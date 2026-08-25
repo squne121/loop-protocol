@@ -151,11 +151,19 @@ $ uv run --locked pytest {_TIMEOUT_NODE_ID} -q
 ## Runtime Verification Applicability
 
 ```yaml
-decision: not_applicable
+decision: immediate
+applicable_acs: [AC1]
+execution_environment: local
+skip_conditions: none
+fallback_policy: none
+artifact_requirements: none
 reason: >
-  RVA section was missing in fixture and caused false-positive failure.
-  This contract uses this VC only to validate baseline timeout false-positive
-  classification and does not require runtime verification.
+  Allowed Paths include .claude/skills/issue-contract-review/scripts/, which
+  matches the extension-surface risk-trigger policy's
+  skill-invocation-procedure-or-contract-change selector (Issue #2290:
+  docs/dev/extension-surface-runtime-policy.yaml). decision: immediate keeps
+  this fixture internally consistent with that policy; this contract still
+  uses its VC only to validate baseline timeout false-positive classification.
 ```
 """
 
