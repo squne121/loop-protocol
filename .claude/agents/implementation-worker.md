@@ -16,6 +16,7 @@ tools:
 # git push / gh pr create は open-pr skill 経由のみ。
 # 新規 SubAgent ファイル（.claude/agents/*.md）の追加は禁止 — PR repair 機能を新 SubAgent として分離してはならない。
 model: sonnet
+effort: high
 permissionMode: acceptEdits
 ---
 

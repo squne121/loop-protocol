@@ -12,6 +12,7 @@ disallowedTools:
 skills:
   - post-merge-cleanup-executor
 model: haiku
+effort: low
 permissionMode: default
 ---
 

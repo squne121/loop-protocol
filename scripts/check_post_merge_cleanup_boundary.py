@@ -570,12 +570,56 @@ def check_boundary_docs_catalog(docs_path: Path) -> ValidationResult:
 
 def check_agent_parity_strict(repo_root: Path = REPO_ROOT) -> ValidationResult:
     """AC10: scripts/check_claude_codex_agent_parity.py --strict does not
-    regress, and PARITY_AGENTS is not silently extended with
-    post-merge-cleanup-worker (Out of Scope)."""
+    regress, and post-merge-cleanup-worker does not silently re-enter the
+    extended parity check scope via a hardcoded allowlist.
+
+    Historically this guard checked that the PARITY_AGENTS allowlist dict
+    (the extended-parity-check agent set) did not literally include
+    "post-merge-cleanup-worker" (Out of Scope). Issue #2160 AC6 removed the
+    PARITY_AGENTS dict entirely and replaced it with an
+    asset_classification-driven resolution
+    (resolve_shared_claude_runtime_agents() in
+    check_claude_codex_agent_parity.py), under which
+    post-merge-cleanup-worker is now intentionally classified
+    shared_claude_runtime in
+    tests/fixtures/codex-agent-config/expected-runtime-contract.json and is
+    therefore validated like any other shared Claude-runtime agent -- this
+    is a deliberate, documented design change, not a regression.
+
+    This guard is adapted to the new structure: it fails loudly if (a) a
+    PARITY_AGENTS-shaped allowlist dict is reintroduced, or (b) the
+    checker script gains any literal "post-merge-cleanup-worker" reference
+    outside the one documented special case (the default permissionMode
+    exception), which would indicate an undocumented, hardcoded
+    scope-inclusion branch bypassing the asset_classification fixture --
+    preserving the original protective intent (no silent scope extension)
+    against the new checker shape."""
     parity_script = repo_root / "scripts" / "check_claude_codex_agent_parity.py"
     parity_text = parity_script.read_text(encoding="utf-8")
-    if "post-merge-cleanup-worker" in re.search(r"PARITY_AGENTS = \{[^}]*\}", parity_text, re.S).group(0):
-        return ValidationResult(False, ["PARITY_AGENTS must not include post-merge-cleanup-worker (Out of Scope)"])
+
+    if re.search(r"^PARITY_AGENTS\s*=\s*\{", parity_text, re.M):
+        return ValidationResult(
+            False,
+            ["PARITY_AGENTS allowlist dict must not be reintroduced (Out of Scope, Issue #2160 AC6)"],
+        )
+
+    occurrence_lines = [
+        line for line in parity_text.splitlines() if "post-merge-cleanup-worker" in line
+    ]
+    unexpected = [
+        line
+        for line in occurrence_lines
+        if 'agent_name == "post-merge-cleanup-worker"' not in line
+    ]
+    if unexpected:
+        return ValidationResult(
+            False,
+            [
+                "Unexpected post-merge-cleanup-worker reference(s) in "
+                "check_claude_codex_agent_parity.py outside the documented "
+                f"permissionMode special-case: {unexpected!r}"
+            ],
+        )
 
     proc = subprocess.run(
         [sys.executable, str(parity_script), "--strict"],

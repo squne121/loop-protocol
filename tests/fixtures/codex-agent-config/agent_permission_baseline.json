@@ -1,0 +1,210 @@
+{
+  "_provenance": {
+    "note": "Captured via git show <merge_base_commit>:.claude/agents/<name>.md for every agent that existed before Issue #2160s migration commits. This snapshot is a CI-safe fallback guard only (used when a shallow CI checkout lacks the git history to run the primary git-history diff-proof test in test_agent_portability_contract.py); the primary AC1 proof re-derives directly from git history at test time and does not trust this file blindly.",
+    "merge_base_commit": "1752fe9bb418b95d161ec91e4fb61fdfeebb8d82",
+    "merge_base_commit_subject": "feat: runtime_smoke_test.sh に --scenario issue_to_impl を追加し統合 E2E を live 実行検証する (#2325)"
+  },
+  "codebase-investigator.md": {
+    "disallowedTools": [
+      "Edit",
+      "Glob",
+      "Grep",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "implementation-worker.md": {
+    "disallowedTools": [],
+    "tools": [
+      "Bash",
+      "Edit",
+      "Glob",
+      "Grep",
+      "MultiEdit",
+      "Read",
+      "Write"
+    ]
+  },
+  "issue-creator.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Skill",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "issue-design-reviewer.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Skill",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "issue-editor.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Skill",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "issue-reviewer.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Skill",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "post-merge-cleanup-worker.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  "pr-reviewer-lite.md": {
+    "disallowedTools": [
+      "Agent",
+      "Edit",
+      "MultiEdit",
+      "Skill",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "pr-reviewer.md": {
+    "disallowedTools": [
+      "Edit",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "retrospective-evaluator.md": {
+    "disallowedTools": [
+      "Agent",
+      "Bash",
+      "Edit",
+      "MultiEdit",
+      "NotebookEdit",
+      "Skill",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ],
+    "tools": []
+  },
+  "retrospective-runtime-observer.md": {
+    "disallowedTools": [
+      "Agent",
+      "Bash",
+      "Edit",
+      "MultiEdit",
+      "NotebookEdit",
+      "Skill",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ],
+    "tools": []
+  },
+  "review-issue.md": {
+    "disallowedTools": [
+      "Edit",
+      "MultiEdit"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read",
+      "Write"
+    ]
+  },
+  "scope-rollup-runner.md": {
+    "disallowedTools": [
+      "Edit",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "test-runner.md": {
+    "disallowedTools": [
+      "Edit",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read"
+    ]
+  },
+  "web-researcher.md": {
+    "disallowedTools": [
+      "Edit",
+      "Glob",
+      "Grep",
+      "MultiEdit",
+      "Write"
+    ],
+    "tools": [
+      "Bash",
+      "Read",
+      "WebFetch",
+      "WebSearch"
+    ]
+  }
+}

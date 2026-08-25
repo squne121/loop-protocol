@@ -11,6 +11,7 @@ disallowedTools:
   - Grep
   - Glob
 model: haiku
+effort: medium
 permissionMode: dontAsk
 ---
 
