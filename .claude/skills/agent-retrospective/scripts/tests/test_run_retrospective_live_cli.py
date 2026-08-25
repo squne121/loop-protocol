@@ -102,6 +102,114 @@ def test_real_claude_cli_production_policy_round_trip() -> None:
     assert result.structured_output == expected_payload
 
 
+def test_real_claude_cli_analytical_prompt_structured_output_shape() -> None:
+    """Issue #2341 AC4 regression test: reproduces the Issue #2341 failure
+    shape -- a *substantive* analysis prompt (unlike the trivial
+    field-echo prompt `test_real_claude_cli_production_policy_round_trip`
+    uses) issued to the real `retrospective-runtime-observer` Agent
+    against the same committed `observer_result_v1.schema.json` (a nested
+    array-of-objects schema via `findings`). At the time Issue #2341 was
+    filed, this invocation shape deterministically (2/2 observed runs)
+    resolved to `invoke_agent()`'s `status="malformed_output"` /
+    `reason_code="missing_structured_output"` branch -- `exit_code == 0`
+    and the wrapper's own `subtype == "success"`, yet the
+    `structured_output` wrapper field was absent (see Issue #2341
+    Background, and the suspected upstream nested-schema shape reported at
+    https://github.com/anthropics/claude-agent-sdk-typescript/issues/277).
+
+    This test is intentionally tolerant of BOTH outcomes so it keeps
+    providing CI signal instead of becoming permanently red on an upstream
+    defect this repository does not control:
+      - if the CLI now returns a fully conformant `status="ok"` result for
+        this prompt shape, the test PASSES outright (the regression is
+        resolved upstream);
+      - if the CLI reproduces the diagnosed `missing_structured_output`
+        signature exactly (`exit_code == 0`,
+        `reason_code == "missing_structured_output"`), the test is marked
+        `xfail` -- a *known*, tracked regression, not a silent PASS and
+        not a hard FAIL (`pyproject.toml` does not set `xfail_strict`, so
+        an eventual XPASS here is informational, never a failure);
+      - any OTHER adapter outcome (timeout, terminated, a different
+        reason_code, a non-zero exit_code) is a genuine, undiagnosed
+        regression and fails the test for real.
+    """
+    run_id = f"live-cli-{uuid.uuid4()}"
+    nonce = uuid.uuid4().hex
+    base_sha = "c" * 40
+    source_set_digest = "d" * 64
+    observer_id = "retrospective-runtime-observer"
+    evidence_ref = f"evidence://live-cli-analysis/{nonce}"
+
+    prompt = (
+        "You are the retrospective-runtime-observer for a real engineering "
+        "retrospective (Issue #2341 live-CLI regression coverage, nonce "
+        f"{nonce}). Investigate this exact question and produce genuine "
+        "analytical findings (not a placeholder/echo): what are the "
+        "concrete tradeoffs between fail-closed and fail-open error "
+        "handling for a subprocess adapter that wraps an external CLI "
+        "tool, in the context of a multi-stage pipeline where a later "
+        "stage (an evaluator) must never run on malformed/partial output "
+        "from an earlier stage (an observer)? Produce at least two "
+        "distinct findings, each with genuine analytical content (not a "
+        "copy of this prompt).\n\n"
+        "Output ONLY a single JSON object conforming exactly to the "
+        "observer_result/v1 schema, with these exact envelope field "
+        f'values: schema_version="observer_result/v1", run_id="{run_id}", '
+        f'base_sha="{base_sha}", source_set_digest="{source_set_digest}", '
+        f'observer_id="{observer_id}", evidence_ref="{evidence_ref}", and '
+        "a `findings` array of at least two objects, each with a `claim` "
+        "(your genuine analysis, non-empty string) and `claim_class` set "
+        'to "process".'
+    )
+
+    request = rr.AgentInvocationRequest(
+        agent_name=observer_id,
+        prompt=prompt,
+        json_schema_path=str(_OBSERVER_SCHEMA_PATH),
+        cwd=str(_REPO_ROOT),
+        timeout_sec=_LIVE_TIMEOUT_SEC,
+    )
+    policy = rr.DelegatedAgentPermissionPolicy(run_id=run_id)
+
+    result = rr.invoke_agent(request, policy=policy)
+
+    print(
+        f"test_real_claude_cli_analytical_prompt_structured_output_shape: "
+        f"adapter_status={result.status} adapter_reason_code={result.reason_code} "
+        f"child_exit_code={result.exit_code}"
+    )
+
+    if result.status == "ok":
+        # Issue #2341 regression resolved (or never reproduced in this
+        # run): a real analytical prompt against the nested `findings`
+        # schema produced a fully conformant structured_output.
+        assert result.exit_code == 0
+        assert result.reason_code is None
+        assert isinstance(result.structured_output, dict)
+        assert result.structured_output.get("run_id") == run_id
+        return
+
+    if (
+        result.status == "malformed_output"
+        and result.reason_code == "missing_structured_output"
+        and result.exit_code == 0
+    ):
+        pytest.xfail(
+            "Issue #2341 known regression reproduced: exit_code=0, wrapper "
+            "subtype=success, structured_output missing for a substantive "
+            "analysis prompt against the nested `findings` schema "
+            "(suspected upstream Claude Code CLI structured-output defect, "
+            "see Issue #2341 Background)."
+        )
+
+    pytest.fail(
+        "undiagnosed adapter outcome for the Issue #2341 analytical-prompt "
+        f"regression shape: status={result.status} reason_code={result.reason_code} "
+        f"exit_code={result.exit_code} (expected either status='ok' or the "
+        "documented missing_structured_output signature)"
+    )
+
+
 def test_real_claude_cli_invalid_agent_name_error_handling() -> None:
     """AC6: an invalid/nonexistent Agent name must make `invoke_agent()` end
     in a non-"ok" status carrying no business payload.

@@ -77,6 +77,55 @@ _RUNTIME_PROFILES = {
 }
 
 _FORBIDDEN_MUTATION_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+
+#: Issue #2341 AC2 -- regression coverage gap fix. This verifier does not
+#: pass `--prompts-file` to `run_retrospective.py` (see the module
+#: docstring above), so the real observer wave against the real
+#: `retrospective-runtime-observer` leaf SubAgent deterministically
+#: resolves to `ObserverWaveFailed` at bundle-envelope validation
+#: (`bundle.run_id != ctx.run_id`, see `run_observer_wave()`'s
+#: `observer_envelope_mismatch` check) -- a KNOWN, expected, benign failure
+#: this verifier's docstring (and Issue #2239 AC6/AC7) explicitly accept as
+#: a well-formed typed-failure terminal outcome. Since Issue #2341 AC1 wired
+#: `ObserverWaveFailed.reason_code` through to `main()`'s stdout, that known
+#: envelope-mismatch failure surfaces here as `reason_code ==
+#: "ObserverWaveFailed"` (the exception class name -- `run_observer_wave()`
+#: does not attribute a granular `AgentInvocationResult.reason_code` to the
+#: envelope/base_sha/manifest-mismatch raise sites, only to the
+#: `observer_failed:<agent>:<status>` raise site).
+#:
+#: Prior to this fix, ANY `reason_code` on a `status: "failed"` payload was
+#: accepted unconditionally (see the pre-#2341 diff of the branch below),
+#: which silently also accepted `missing_structured_output` -- the Issue
+#: #2341 regression, where the real observer invocation itself failed
+#: (`invoke_agent()`'s `status="malformed_output"` /
+#: `reason_code="missing_structured_output"` branch, exit_code 0, wrapper
+#: subtype "success", `structured_output` field absent) rather than the
+#: benign, already-known run_id-binding-gap envelope mismatch. This verifier
+#: must FAIL (non-zero exit), not silently pass, when it observes
+#: `missing_structured_output` or any other unallowlisted `ObserverWaveFailed`
+#: reason_code -- allowlisting is closed-world (deny-by-default), not
+#: open-world.
+_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES = frozenset(
+    {
+        # generic ObserverWaveFailed class-name fallback: covers the known,
+        # accepted run_id/source_set_digest/base_sha envelope-binding gap
+        # this verifier's own docstring documents (no `--prompts-file` ->
+        # ctx.run_id cannot be pre-seeded into observer prompts).
+        "ObserverWaveFailed",
+    }
+)
+
+#: explicitly NOT allowlisted (Issue #2341 regression coverage gap fix):
+#: `missing_structured_output` and every other granular
+#: `AgentInvocationResult.reason_code` an observer_failed ObserverWaveFailed
+#: can now carry (json_decode_failure, payload_not_object,
+#: api_error_with_partial_text, unexpected_wrapper_shape,
+#: result_subtype_not_success:*, timeout, sigterm, nonzero_exit, and any
+#: OSError subclass name) are genuine, undiagnosed production failures this
+#: verifier must FAIL on, never silently accept as the benign envelope-
+#: mismatch case above.
+_DISALLOWED_OBSERVER_WAVE_FAILED_REASON_CODE_EXAMPLE = "missing_structured_output"
 _FORBIDDEN_BASH_SUBSTRINGS = (
     "git commit",
     "git push",
@@ -469,10 +518,29 @@ def main(argv: list[str] | None = None) -> int:
         "inner_result": inner_payload,
     }
 
+    unallowlisted_observer_wave_failure = False
     if inner_payload.get("status") == "failed" and "reason_code" in inner_payload:
+        observed_reason_code = inner_payload["reason_code"]
         receipt["status"] = "fail"
-        receipt["reason_code"] = inner_payload["reason_code"]
-        receipt["message"] = "real /agent-retrospective invocation produced a typed production failure envelope"
+        receipt["reason_code"] = observed_reason_code
+        if observed_reason_code not in _ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES:
+            # Issue #2341 AC2: an unallowlisted ObserverWaveFailed
+            # reason_code (e.g. `missing_structured_output`) is a genuine,
+            # undiagnosed production failure -- never silently accepted as
+            # the known, benign run_id-binding-gap envelope mismatch. This
+            # verifier must FAIL (non-zero exit) for it, not the exit-0
+            # "well-formed typed failure envelope" path Issue #2239 AC6/AC7
+            # otherwise accept.
+            unallowlisted_observer_wave_failure = True
+            receipt["message"] = (
+                "real /agent-retrospective invocation produced a typed production failure envelope with an "
+                f"unallowlisted reason_code={observed_reason_code!r} (allowlisted: "
+                f"{sorted(_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES)}) -- treated as a genuine verifier "
+                "FAIL, not the known run_id-binding-gap envelope mismatch (Issue #2341 regression coverage gap "
+                "fix)"
+            )
+        else:
+            receipt["message"] = "real /agent-retrospective invocation produced a typed production failure envelope"
     elif "run_identity" in inner_payload and "request_id" in inner_payload:
         run_identity = inner_payload.get("run_identity") or {}
         expected_base_sha = _git(repo_root, "rev-parse", "main").stdout.strip()
@@ -515,15 +583,27 @@ def main(argv: list[str] | None = None) -> int:
         receipt["message"] = f"{forbidden_event_count} forbidden mutation tool event(s) observed"
         _emit(receipt)
         return 1
+    if unallowlisted_observer_wave_failure:
+        # Issue #2341 AC2: an unallowlisted ObserverWaveFailed reason_code
+        # (e.g. `missing_structured_output`) is a genuine, undiagnosed
+        # production failure -- exit 1, not the exit-0 "well-formed typed
+        # failure envelope" path below.
+        _emit(receipt)
+        return 1
 
     # Both "pass" (a full PublishRequest bound to this run) and "fail" (a
     # well-formed typed production failure envelope, e.g. the documented
-    # run_id-prompt-binding gap above) are legitimate, expected completions
-    # of this live verification per Issue #2239 AC6/AC7 ("PUBLISH_REQUEST_V1
-    # or a typed failure envelope, as long as it is parseable") -- exit 0
-    # either way. Exit 1 (via `_fail()` above) is reserved for genuine
-    # verifier/production anomalies (timeouts, transport errors, malformed
-    # transcripts, fingerprint drift, forbidden mutation events).
+    # run_id-prompt-binding gap above -- i.e. an ALLOWLISTED
+    # ObserverWaveFailed reason_code, see
+    # `_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES`) are legitimate,
+    # expected completions of this live verification per Issue #2239 AC6/AC7
+    # ("PUBLISH_REQUEST_V1 or a typed failure envelope, as long as it is
+    # parseable") -- exit 0 either way. Exit 1 (via `_fail()` above, the
+    # fingerprint/forbidden-event checks above, or the unallowlisted
+    # ObserverWaveFailed reason_code check above, Issue #2341 AC2) is
+    # reserved for genuine verifier/production anomalies (timeouts,
+    # transport errors, malformed transcripts, fingerprint drift, forbidden
+    # mutation events, and unallowlisted typed-failure reason_codes).
     _emit(receipt)
     return 0
 

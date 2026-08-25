@@ -42,10 +42,16 @@ _SKILL_DIR = _SCRIPTS_DIR.parent
 _AGENTS_DIR = _SKILL_DIR.parents[1] / "agents"
 _REPO_ROOT = _SCRIPTS_DIR.parents[3]
 sys.path.insert(0, str(_SCRIPTS_DIR))
+# Issue #2341 AC3: verify_agent_retrospective_live_smoke.py lives in this
+# same tests/ directory (not _SCRIPTS_DIR) -- add it explicitly so the
+# allowlist constant below can be imported and reused (DRY) instead of
+# duplicated, keeping the two independent enforcement points in sync.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import collect_snapshot as cs  # noqa: E402
 import persist_retrospective_run as pr  # noqa: E402
 import run_retrospective as rr  # noqa: E402
+import verify_agent_retrospective_live_smoke as vals  # noqa: E402
 
 _validate_mod = rr._validate_retrospective_schema_module()
 
@@ -456,6 +462,18 @@ def _run_live_smoke(runtime_profile: str) -> None:
     assert payload["status"] in ("pass", "fail")
     if payload["status"] == "fail":
         assert payload["reason_code"]
+        # Issue #2341 AC3: independent, in-test assertion (defense-in-depth
+        # alongside the verifier's own AC2 allowlist enforcement, which
+        # already makes an unallowlisted reason_code exit non-zero and thus
+        # fail earlier via pytest.fail() above) that a "fail" status is only
+        # ever the known, allowlisted ObserverWaveFailed reason_code -- e.g.
+        # missing_structured_output (the Issue #2341 regression) or any
+        # other unallowlisted reason_code must never reach this assertion as
+        # a "fail"-status payload with exit 0.
+        assert payload["reason_code"] in vals._ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES, (
+            f"unallowlisted reason_code observed on a status=fail payload with exit 0: "
+            f"{payload['reason_code']!r} (allowlisted: {sorted(vals._ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES)})"
+        )
     assert payload["fallback_used"] is False
     assert payload["repository_fingerprint_diff_clean"] is True
     assert payload["forbidden_mutation_tool_events"] == 0

@@ -994,7 +994,22 @@ class ObserverWaveFailed(Exception):
     observer outside the expected manifest, a duplicate observer_id, or an
     incomplete manifest). Per ``partial_agent_output: reject``, the caller
     MUST NOT invoke the evaluator once this is raised -- see
-    ``run_evaluation``'s precondition and ``execute_run``'s ordering."""
+    ``run_evaluation``'s precondition and ``execute_run``'s ordering.
+
+    Issue #2341 AC1: ``reason_code``/``exit_code`` are additive diagnostic
+    attributes (never required by callers) so ``main()``'s top-level failure
+    output can surface the underlying ``AgentInvocationResult.reason_code``
+    (e.g. ``missing_structured_output``) instead of only the generic
+    ``observer_failed:<agent>:<status>`` message text. When the raise site
+    does not have an underlying ``AgentInvocationResult`` to attribute this
+    to (envelope/base_sha/manifest mismatches), ``reason_code`` falls back
+    to this exception class's own name -- exactly matching this module's
+    pre-#2341 behavior for those cases."""
+
+    def __init__(self, message: str, *, reason_code: str | None = None, exit_code: int | None = None) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code if reason_code is not None else type(self).__name__
+        self.exit_code = exit_code
 
 
 def run_observer_wave(
@@ -1024,7 +1039,15 @@ def run_observer_wave(
     for request in observer_requests:
         result = invoke(request)
         if result.status != "ok":
-            raise ObserverWaveFailed(f"observer_failed:{request.agent_name}:{result.status}")
+            # Issue #2341 AC1: thread the underlying adapter-level
+            # reason_code/exit_code through so main()'s top-level failure
+            # output is diagnosable (e.g. distinguishes
+            # missing_structured_output from other observer_failed causes).
+            raise ObserverWaveFailed(
+                f"observer_failed:{request.agent_name}:{result.status}",
+                reason_code=result.reason_code,
+                exit_code=result.exit_code,
+            )
         raw_text = json.dumps(result.structured_output, sort_keys=True, separators=(",", ":"))
         bundle = parse_agent_output_with_repair(raw_text, EvidenceBundle, repair=repair)
         if bundle.run_id != ctx.run_id or bundle.source_set_digest != plan.source_set_digest:
@@ -1103,7 +1126,17 @@ def build_finding_sets(
 
 class EvaluatorInvocationFailed(Exception):
     """Raised when the evaluator invocation itself fails or returns an
-    envelope that fails cross-validation against the run."""
+    envelope that fails cross-validation against the run.
+
+    Issue #2341 AC1: ``reason_code``/``exit_code`` are additive diagnostic
+    attributes mirroring ``ObserverWaveFailed`` (see its docstring); falls
+    back to this class's own name when no underlying
+    ``AgentInvocationResult`` applies (envelope mismatch)."""
+
+    def __init__(self, message: str, *, reason_code: str | None = None, exit_code: int | None = None) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code if reason_code is not None else type(self).__name__
+        self.exit_code = exit_code
 
 
 def prepare_evaluator_request(
@@ -1137,7 +1170,13 @@ def run_evaluation(
     succeeded for every observer in the wave (AC9)."""
     result = invoke_evaluator(evaluator_request)
     if result.status != "ok":
-        raise EvaluatorInvocationFailed(f"evaluator_failed:{result.status}")
+        # Issue #2341 AC1: thread the underlying adapter-level
+        # reason_code/exit_code through, mirroring run_observer_wave().
+        raise EvaluatorInvocationFailed(
+            f"evaluator_failed:{result.status}",
+            reason_code=result.reason_code,
+            exit_code=result.exit_code,
+        )
     raw_text = json.dumps(result.structured_output, sort_keys=True, separators=(",", ":"))
     evaluation = parse_agent_output_with_repair(raw_text, Evaluation, repair=repair)
     if evaluation.run_id != ctx.run_id or evaluation.source_set_digest != evaluator_request.source_set_digest:
@@ -1907,8 +1946,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             previous_state_provider=previous_state_provider,
         )
     except (ObserverWaveFailed, EvaluatorInvocationFailed, WireContractError, ValueError, GhAuthUnavailable) as exc:
+        # Issue #2341 AC1: additive diagnosability -- exit_code (when the
+        # underlying failure traces back to a real subprocess Agent
+        # invocation, e.g. ObserverWaveFailed/EvaluatorInvocationFailed) is
+        # now included alongside reason_code. Exceptions that never carry an
+        # exit_code (WireContractError, ValueError, GhAuthUnavailable) fall
+        # back to None via getattr's default, unchanged from prior behavior.
         reason_code = getattr(exc, "reason_code", type(exc).__name__)
-        print(json.dumps({"status": "failed", "reason_code": reason_code, "reason": str(exc)}, sort_keys=True))
+        exit_code = getattr(exc, "exit_code", None)
+        print(
+            json.dumps(
+                {"status": "failed", "reason_code": reason_code, "exit_code": exit_code, "reason": str(exc)},
+                sort_keys=True,
+            )
+        )
         return 1
 
     print(publish_request.to_wire())
