@@ -22,33 +22,57 @@ launched below) therefore cannot know `ctx.run_id` ahead of time when
 composing `--prompts-file` observer prompts -- so this verifier does not
 try to guess it (previous versions of the observer-wave-bypassing test
 data are not reused here). No `--prompts-file` is passed at all, so
-`run_retrospective.py` runs with the documented empty-prompts default
-(`prompts.get(observer_id, "")` -> `""`).
+`run_retrospective.py` runs with its `--prompts-file`-omitted default
+prompt generation (see the Correction/Fix paragraphs below -- this default
+was an empty string per observer_id prior to Issue #2345, and is now a
+genuinely non-empty placeholder-identity prompt per
+`_default_observer_prompt()`).
 
 Correction (PR #2342 fix_delta, OWNER review
 https://github.com/squne121/loop-protocol/pull/2342#issuecomment-5411607690,
 P2 item 3): this module previously documented that the empty-prompts
 default deterministically resolves to `ObserverWaveFailed`'s
-`bundle.run_id != ctx.run_id` bundle-validation check. That claim does NOT
+`bundle.run_id != ctx.run_id` bundle-validation check. That claim did NOT
 hold against the real `claude` CLI as actually observed (Claude Code
-2.1.245): `claude -p` rejects an empty prompt argument *before* any
-observer output is produced at all --
+2.1.245): `claude -p` rejected an empty prompt argument *before* any
+observer output was produced at all --
 ``Error: Input must be provided either through stdin or as a prompt
 argument when using --print``, exit code 1 -- which
-`run_retrospective.py`'s `invoke_agent()` surfaces as
+`run_retrospective.py`'s `invoke_agent()` surfaced as
 `status="api_error"` / `reason_code="nonzero_exit"` on the
 `observer_failed:<agent>:<status>` `ObserverWaveFailed` raise site (never
 reaching the `bundle.run_id != ctx.run_id` check). `nonzero_exit` is
 intentionally NOT allowlisted below (see
-`_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES`), so this verifier
-currently FAILs (exit 1) on this path rather than reaching the exit-0
+`_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES`) -- this verifier used to
+unintentionally FAIL (exit 1) on this path rather than reach the exit-0
 typed-failure branch this docstring previously (incorrectly) documented as
-the deterministic outcome. This is a separately-tracked follow-up, not
-`run_retrospective.py`'s `ObserverWaveFailed` reason_code diagnosability
-work Issue #2341 / PR #2342 itself addresses -- see Issue #2345
-(https://github.com/squne121/loop-protocol/issues/2345). Issue #2239
-AC6/AC7 still accept either a `PUBLISH_REQUEST_V1` or a typed failure
-envelope, as long as it is parseable, so this verifier treats a
+the deterministic outcome. This regression, and its fix, are tracked
+separately from `run_retrospective.py`'s `ObserverWaveFailed` reason_code
+diagnosability work Issue #2341 / PR #2342 itself addresses -- see Issue
+#2345 (https://github.com/squne121/loop-protocol/issues/2345).
+
+Fix (Issue #2345): `run_retrospective.py`'s `main()` no longer defaults an
+omitted `--prompts-file` to an empty-string prompt per observer_id.
+Instead it populates every manifest entry's prompt with
+`_default_observer_prompt()`'s output -- a genuinely non-empty prompt that
+asks the observer to echo explicit placeholder identity fields (never the
+real `ctx.run_id`, which no caller of this CLI entrypoint can know ahead
+of time either way -- see `build_observer_requests`'s docstring) back as a
+schema-conformant `OBSERVER_RESULT_V1` envelope. A real, successful
+invocation of this default prompt therefore no longer trips the CLI's own
+empty-prompt rejection, and instead deterministically reaches
+`run_observer_wave()`'s `bundle.run_id != ctx.run_id` check -- the
+ALLOWLISTED, intentionally-benign `observer_run_id_mismatch` typed
+failure this verifier's allowlist below has always existed for. The
+`nonzero_exit` path this correction previously documented as this
+verifier's actual (regressed) outcome is expected to no longer occur in
+practice against `--prompts-file`-omitted invocations post-#2345; it
+remains correctly NOT allowlisted below regardless (a `nonzero_exit` from
+any other cause -- e.g. a genuine CLI/auth/runtime fault -- must still
+FAIL this verifier, not be silently accepted).
+
+Issue #2239 AC6/AC7 still accept either a `PUBLISH_REQUEST_V1` or a typed
+failure envelope, as long as it is parseable, so this verifier treats a
 well-formed typed failure as `status: "fail"` (not `"skip"`) and asserts
 the invariants that are meaningful regardless of which branch production
 took: schema-parseable output, `tested_head` match, repository fingerprint

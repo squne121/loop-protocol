@@ -1784,6 +1784,77 @@ def build_repository_collector(repo_root: Path) -> Callable[[str], Any]:
     return _collect
 
 
+#: placeholder identity fields used only by ``_default_observer_prompt``
+#: below (Issue #2345). No caller of this CLI entrypoint -- including this
+#: default-prompt path -- can know ``ctx.run_id`` ahead of time (``run_id``
+#: is a fresh ``uuid.uuid4()`` generated only inside ``run_cli()``, with no
+#: CLI flag to pre-seed it; see ``build_observer_requests``'s docstring
+#: below), so these placeholders are deliberately NOT real identity values --
+#: they exist only so the resulting prompt is non-empty and the observer's
+#: response is schema-conformant, letting the observer wave's own
+#: ``bundle.run_id != ctx.run_id`` envelope check (an ALLOWLISTED,
+#: intentionally-benign outcome -- see
+#: ``_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES`` in
+#: ``verify_agent_retrospective_live_smoke.py``) run to completion instead
+#: of the CLI itself rejecting an empty prompt before that check is ever
+#: reached.
+_DEFAULT_PROMPT_PLACEHOLDER_RUN_ID = "unset-default-prompt-run-id"
+_DEFAULT_PROMPT_PLACEHOLDER_BASE_SHA = "0" * 40
+_DEFAULT_PROMPT_PLACEHOLDER_SOURCE_SET_DIGEST = "0" * 64
+_DEFAULT_PROMPT_PLACEHOLDER_EVIDENCE_REF = "default-prompt-evidence-ref"
+
+
+def _default_observer_prompt(observer_id: str) -> str:
+    """Issue #2345: the genuinely non-empty default prompt used for
+    ``observer_id`` when ``main()``'s ``--prompts-file`` is not supplied.
+
+    Background: prior to this Issue, the ``--prompts-file``-omitted default
+    was an empty string per observer (``prompts.get(observer_id, "") ->
+    ""``). Against the real ``claude`` CLI (observed on Claude Code 2.1.245)
+    an empty prompt is rejected by ``claude -p`` itself -- ``Error: Input
+    must be provided either through stdin or as a prompt argument when
+    using --print``, exit code 1 -- *before* ``run_observer_wave()``'s own
+    envelope validation (``bundle.run_id != ctx.run_id``) is ever reached,
+    so ``invoke_agent()`` observed ``status="api_error"`` /
+    ``reason_code="nonzero_exit"`` instead of the intended
+    ``observer_run_id_mismatch`` typed-failure path (see Issue #2345,
+    https://github.com/squne121/loop-protocol/issues/2345).
+
+    This default asks ``observer_id`` to emit a schema-conformant
+    ``OBSERVER_RESULT_V1`` (``EvidenceBundle``) JSON envelope that echoes
+    explicit placeholder identity fields verbatim. Because those
+    placeholders can never legitimately equal the real, freshly-generated
+    ``ctx.run_id`` (this function cannot know it ahead of time -- see the
+    module-level placeholder constants above), a real, non-empty,
+    successful invocation deterministically reaches
+    ``run_observer_wave()``'s ``bundle.run_id != ctx.run_id`` check and
+    raises the ALLOWLISTED ``observer_run_id_mismatch`` typed failure --
+    the same benign, expected outcome this module's callers (including
+    ``verify_agent_retrospective_live_smoke.py``) have always documented as
+    the deterministic result of not pre-seeding ``run_id`` into observer
+    prompts, now actually reached in practice instead of being pre-empted
+    by the CLI's own empty-prompt rejection."""
+    return (
+        f"observer_id={observer_id}. No caller-supplied evidence was "
+        "provided (this is run_retrospective.py's own default prompt, used "
+        "only when --prompts-file is omitted -- Issue #2345). Respond with "
+        "EXACTLY one JSON object (no markdown fence, no prose) conforming "
+        "to OBSERVER_RESULT_V1 (EvidenceBundle):\n"
+        "{\n"
+        '  "schema_version": "observer_result/v1",\n'
+        f'  "run_id": "{_DEFAULT_PROMPT_PLACEHOLDER_RUN_ID}",\n'
+        f'  "base_sha": "{_DEFAULT_PROMPT_PLACEHOLDER_BASE_SHA}",\n'
+        f'  "source_set_digest": "{_DEFAULT_PROMPT_PLACEHOLDER_SOURCE_SET_DIGEST}",\n'
+        f'  "observer_id": "{observer_id}",\n'
+        f'  "evidence_ref": "{_DEFAULT_PROMPT_PLACEHOLDER_EVIDENCE_REF}",\n'
+        '  "findings": []\n'
+        "}\n"
+        "Echo the run_id/base_sha/source_set_digest/observer_id/"
+        "evidence_ref fields above verbatim; do not invent evidence or "
+        "findings beyond an empty findings list."
+    )
+
+
 def build_observer_requests(
     *, schema_dir: Path, cwd: str, prompts: dict[str, str], timeout_sec: int = 300
 ) -> list[AgentInvocationRequest]:
@@ -1792,7 +1863,12 @@ def build_observer_requests(
     each ``observer_id`` to the prompt text the root Skill (or ``main``'s
     ``--prompts-file``) has already assembled -- this function never
     resolves session/evidence content itself (that remains the root Skill's
-    trigger-time responsibility)."""
+    trigger-time responsibility). ``main()`` populates ``prompts`` with
+    ``_default_observer_prompt()`` output for every manifest entry when
+    ``--prompts-file`` is omitted (Issue #2345) -- ``prompts.get(...,  "")``
+    below is defensive only (kept for direct unit-test callers that pass a
+    partial ``prompts`` dict); the production CLI entrypoint never actually
+    falls through to the ``""`` default anymore."""
     return [
         AgentInvocationRequest(
             agent_name=spec.observer_id,
@@ -1948,6 +2024,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     prompts: dict[str, str] = {}
     if args.prompts_file:
         prompts = json.loads(Path(args.prompts_file).read_text(encoding="utf-8"))
+    else:
+        # Issue #2345: a genuinely non-empty default prompt per observer_id
+        # (see `_default_observer_prompt`'s docstring) -- an empty-string
+        # prompt is rejected by the real `claude` CLI before any observer
+        # output is produced, pre-empting the observer wave's own
+        # `bundle.run_id != ctx.run_id` envelope check this default is
+        # designed to actually reach.
+        prompts = {spec.observer_id: _default_observer_prompt(spec.observer_id) for spec in EXPECTED_OBSERVER_MANIFEST}
 
     try:
         previous_state_provider = resolve_previous_state_provider(
