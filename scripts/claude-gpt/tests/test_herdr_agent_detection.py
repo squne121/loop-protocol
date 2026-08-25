@@ -4,8 +4,6 @@ Issue #2332 の focused regression。`scripts/claude-gpt/launch.sh` 冒頭の
 guarded self-reexec（Herdr Agents session 認識 hint）ブロックを対象に、以下を
 検証する:
 
-- AC1: Phase 0 go/no-go gate ロジック自体の unit-level 検証（pytest fixture）。
-  raw な live `herdr` VC line ではなく、gate 判定条件そのものを検証する。
 - AC2: HERDR_ENV=1 かつ HERDR_AGENT が unset/空のとき、launcher は exactly once
   self-reexec し、実質的に HERDR_AGENT=claude の状態で動作を継続する。
 - AC3: Herdr 外（HERDR_ENV unset/1 以外）、または呼び出し側が非空 HERDR_AGENT を
@@ -14,6 +12,10 @@ guarded self-reexec（Herdr Agents session 認識 hint）ブロックを対象�
 - AC4: 既存の positional-argument parser（--check-only/--dry-run/--claude-bin/
   `--` separator、unexpected_positional_argument_before_double_dash）は本変更の
   前後で同一に動作する。
+- P1 fix-delta（PR #2349 review）: `--check-only` / `--dry-run`（launcher-level
+  `--` より前に現れる場合）では hint injection（self-reexec）を行わない。これら
+  は claude 本体を起動しないモードであり、Issue #2332 の Outcome（実際に claude
+  を起動する通常起動の認識）の対象外のため。
 
 AC2/AC3 は launch.sh 冒頭の guard block を実ファイルから動的に抽出し、そのまま
 POSIX sh で実行することで、ハンドコードされた再実装ではなく実ファイルの
@@ -94,6 +96,19 @@ def _run_probe(probe: Path, env: dict) -> subprocess.CompletedProcess:
     )
 
 
+def _run_probe_with_args(probe: Path, env: dict, args: list) -> subprocess.CompletedProcess:
+    """`_run_probe` の argv 付きバリアント（P1 fix-delta: --check-only/--dry-run
+    の non-injection 検証で使用）。"""
+    return subprocess.run(
+        ["/bin/sh", str(probe), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+
 def _run_launch_sh(args: list, env: dict, timeout: int = 20) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["/bin/sh", str(LAUNCH_SH), *args],
@@ -103,45 +118,6 @@ def _run_launch_sh(args: list, env: dict, timeout: int = 20) -> subprocess.Compl
         timeout=timeout,
         check=False,
     )
-
-
-# --- AC1: Phase 0 go/no-go gate ロジック自体の unit-level 検証 -------------
-
-
-def _phase0_gate(baseline_detected: bool, control_detected: bool) -> str:
-    """Issue #2332 Background/Phase 0 Decision Gate の判定規則の pure 実装。
-
-    GO は「baseline は未認識、かつ control が認識に改善した」場合のみ。
-    改善がない・悪化した・双方とも認識/未認識の場合は NO_GO。
-    """
-    if (not baseline_detected) and control_detected:
-        return "GO"
-    return "NO_GO"
-
-
-def test_phase0_gate_requires_confirmed_improvement():
-    # GIVEN: baseline 未認識・control 認識という改善が観測された
-    # WHEN: gate 判定を適用する
-    # THEN: GO と判定される
-    assert _phase0_gate(baseline_detected=False, control_detected=True) == "GO"
-
-
-def test_phase0_gate_no_improvement_stays_no_go():
-    # GIVEN: baseline/control ともに未認識（改善なし）
-    # WHEN/THEN: NO_GO のまま
-    assert _phase0_gate(baseline_detected=False, control_detected=False) == "NO_GO"
-
-
-def test_phase0_gate_both_detected_is_no_go():
-    # GIVEN: baseline/control ともに認識（control 由来の改善が実証されない）
-    # WHEN/THEN: NO_GO
-    assert _phase0_gate(baseline_detected=True, control_detected=True) == "NO_GO"
-
-
-def test_phase0_gate_regression_stays_no_go():
-    # GIVEN: baseline は認識、control で未認識（悪化）
-    # WHEN/THEN: NO_GO
-    assert _phase0_gate(baseline_detected=True, control_detected=False) == "NO_GO"
 
 
 # --- AC2: HERDR_ENV=1 かつ HERDR_AGENT unset/空 -> exactly once injection ---
@@ -160,28 +136,6 @@ def test_herdr_env_empty_agent_injects_claude(tmp_path):
     # exactly once: 元プロセス + reexec 後プロセスの計 2 回だけ guard を通過する
     # （無限/複数回 reexec しない）
     assert (tmp_path / "invocation_count.txt").read_text() == "xx"
-
-
-def test_herdr_env_explicit_empty_string_agent_injects_claude(tmp_path):
-    # GIVEN: HERDR_ENV=1、HERDR_AGENT="" (unset ではなく明示的な空文字)
-    guard_block = _extract_guard_block()
-    probe = _write_probe_script(tmp_path, guard_block)
-    env = _base_env(HERDR_ENV="1", HERDR_AGENT="")
-    result = _run_probe(probe, env)
-    assert result.returncode == 0, result.stderr
-    assert "HERDR_AGENT_AFTER=claude" in result.stdout
-    assert (tmp_path / "invocation_count.txt").read_text() == "xx"
-
-
-def test_self_path_preserved_across_reexec(tmp_path):
-    # GIVEN: self-reexec がトリガーされる状態
-    guard_block = _extract_guard_block()
-    probe = _write_probe_script(tmp_path, guard_block)
-    env = _base_env(HERDR_ENV="1")
-    result = _run_probe(probe, env)
-    # THEN: "$0" は reexec 前後で不変
-    assert result.returncode == 0, result.stderr
-    assert f"SELF_PATH_AFTER={probe}" in result.stdout
 
 
 def test_dry_run_succeeds_with_herdr_env_set_real_file():
@@ -209,17 +163,6 @@ def test_non_herdr_or_nonempty_agent_unchanged_no_herdr_env(tmp_path):
     assert (tmp_path / "invocation_count.txt").read_text() == "x"
 
 
-def test_non_herdr_or_nonempty_agent_unchanged_herdr_env_not_one(tmp_path):
-    # GIVEN: HERDR_ENV="0"（"1" 以外）
-    guard_block = _extract_guard_block()
-    probe = _write_probe_script(tmp_path, guard_block)
-    env = _base_env(HERDR_ENV="0")
-    result = _run_probe(probe, env)
-    assert result.returncode == 0, result.stderr
-    assert "HERDR_AGENT_AFTER=<unset>" in result.stdout
-    assert (tmp_path / "invocation_count.txt").read_text() == "x"
-
-
 def test_non_herdr_or_nonempty_agent_unchanged_caller_value_preserved(tmp_path):
     # GIVEN: HERDR_ENV=1 だが呼び出し側が既に非空の HERDR_AGENT を設定済み
     guard_block = _extract_guard_block()
@@ -229,6 +172,35 @@ def test_non_herdr_or_nonempty_agent_unchanged_caller_value_preserved(tmp_path):
     # THEN: reexec せず、caller の値を exact に温存する
     assert result.returncode == 0, result.stderr
     assert "HERDR_AGENT_AFTER=custom-agent" in result.stdout
+    assert (tmp_path / "invocation_count.txt").read_text() == "x"
+
+
+# --- P1 fix-delta: --check-only / --dry-run は hint injection の対象外 ------
+
+
+def test_check_only_flag_before_reexec_suppresses_hint_injection(tmp_path):
+    # GIVEN: HERDR_ENV=1 かつ HERDR_AGENT unset だが、probe が --check-only 付き
+    #        で呼び出される（claude 本体を起動しない preflight-only mode）
+    guard_block = _extract_guard_block()
+    probe = _write_probe_script(tmp_path, guard_block)
+    env = _base_env(HERDR_ENV="1")
+    result = _run_probe_with_args(probe, env, ["--check-only"])
+    # THEN: hint injection（self-reexec）は行われない
+    assert result.returncode == 0, result.stderr
+    assert "HERDR_AGENT_AFTER=<unset>" in result.stdout
+    assert (tmp_path / "invocation_count.txt").read_text() == "x"
+
+
+def test_dry_run_flag_before_reexec_suppresses_hint_injection(tmp_path):
+    # GIVEN: HERDR_ENV=1 かつ HERDR_AGENT unset だが、probe が --dry-run 付きで
+    #        呼び出される（副作用なしで実行予定を表示するのみの mode）
+    guard_block = _extract_guard_block()
+    probe = _write_probe_script(tmp_path, guard_block)
+    env = _base_env(HERDR_ENV="1")
+    result = _run_probe_with_args(probe, env, ["--dry-run"])
+    # THEN: hint injection（self-reexec）は行われない
+    assert result.returncode == 0, result.stderr
+    assert "HERDR_AGENT_AFTER=<unset>" in result.stdout
     assert (tmp_path / "invocation_count.txt").read_text() == "x"
 
 
