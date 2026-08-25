@@ -690,21 +690,29 @@ def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if k in _DEFAULT_ENV_PASSTHROUGH_ALLOWLIST}
 
 
-#: matches a single leading/trailing markdown code fence around a JSON blob
-#: (```json ... ``` or bare ``` ... ```), used only by
-#: `_structured_output_from_result_compat` below.
-_MARKDOWN_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*)\n```\s*$", re.DOTALL)
+#: matches every markdown fenced code block (```json ... ``` or bare
+#: ``` ... ```) that may appear anywhere within a larger text, including one
+#: surrounded by explanatory prose before and/or after the fence (Issue
+#: #2348) -- non-greedy so multiple distinct fences in the same text are
+#: enumerated separately rather than collapsed into one greedy match. Used
+#: only by `_structured_output_from_result_compat` below.
+_FENCED_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
 
 
-def _extract_fenced_json_text(text: str) -> str:
-    """Strip a single leading/trailing markdown code fence from `text` if
-    present (returns `text` stripped of surrounding whitespace unchanged
-    otherwise). Pure string transform -- callers still parse/validate the
-    result themselves (Issue #2301 live verification compat recovery, see
-    `_structured_output_from_result_compat`)."""
-    stripped = text.strip()
-    match = _MARKDOWN_JSON_FENCE_RE.match(stripped)
-    return match.group(1).strip() if match else stripped
+def _iter_fenced_json_candidates(text: str) -> list[str]:
+    """Enumerate the body text of every markdown fenced code block found
+    anywhere within `text`, in encounter order, non-greedy and
+    non-overlapping (Issue #2348). Pure string transform -- callers still
+    parse/validate each candidate themselves
+    (`_structured_output_from_result_compat`). Unlike the prior
+    `_extract_fenced_json_text` helper this superseded, this does NOT
+    require the fence to span the entire (stripped) input: fenced JSON
+    preceded and/or followed by prose is now discoverable, which is the
+    common real-world `--agent <custom-subagent>` response shape (fenced
+    JSON block followed, or surrounded, by explanatory text) that the prior
+    whole-string `^...$` anchor regex silently failed to match, producing a
+    spurious `missing_structured_output`."""
+    return [match.group(1).strip() for match in _FENCED_JSON_BLOCK_RE.finditer(text)]
 
 
 def _structured_output_from_result_compat(
@@ -723,30 +731,60 @@ def _structured_output_from_result_compat(
     --json-schema ...` invocations, which populate `structured_output`
     directly, these custom-subagent invocations were observed to omit
     `structured_output` and instead carry the schema-conformant JSON in
-    `result` (frequently wrapped in a markdown ```json code fence). This is
-    an observation about invocations actually exercised, not an absolute
-    claim covering every possible custom-subagent invocation. The recovered
-    payload is accepted only if it independently, strictly validates against
+    `result` (frequently wrapped in a markdown ```json code fence, with the
+    fence itself sometimes preceded and/or followed by explanatory prose --
+    Issue #2348 root cause: the prior whole-string anchor regex required the
+    fence to be the *entire* `result` text and silently failed on this
+    common shape). This is an observation about invocations actually
+    exercised, not an absolute claim covering every possible custom-subagent
+    invocation.
+
+    Recovery strategy (Issue #2348): every markdown fenced code block found
+    anywhere in `result` (see `_iter_fenced_json_candidates`) is treated as
+    an independent JSON candidate; if `result` contains no fence at all, the
+    whole (stripped) `result` text is treated as the sole candidate
+    (preserves the pre-#2348 behavior for unfenced `result` text). Each
+    candidate is independently parsed with `json.loads` and, only if that
+    succeeds and yields a dict, independently, strictly validated against
     the exact schema file this invocation was given (`request.
     json_schema_path`) -- mirrors the Issue #2237 P0-1 rationale against
-    re-parsing the *wrapper* itself as the business schema: a
-    malformed/absent `result`, or one that fails schema validation, is never
-    silently accepted as `ok`."""
+    re-parsing the *wrapper* itself as the business schema. The recovered
+    payload is returned only when EXACTLY ONE candidate both parses as JSON
+    and passes schema validation: zero schema-valid candidates is the
+    pre-existing `missing_structured_output` fail-closed outcome, and MORE
+    THAN ONE schema-valid candidate is treated as ambiguous and also
+    rejected (fail-closed) rather than guessing which fence is the intended
+    business payload. A malformed/absent `result`, or one where no
+    candidate passes schema validation, is never silently accepted as
+    `ok`."""
     result_text = payload.get("result")
     if not isinstance(result_text, str) or not result_text.strip():
         return None
     try:
-        candidate = json.loads(_extract_fenced_json_text(result_text))
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(candidate, dict):
-        return None
-    try:
         schema = json.loads(Path(json_schema_path).read_text(encoding="utf-8"))
-        jsonschema.validate(candidate, schema)
-    except (OSError, json.JSONDecodeError, jsonschema.exceptions.ValidationError, jsonschema.exceptions.SchemaError):
+    except (OSError, json.JSONDecodeError):
         return None
-    return candidate
+
+    fenced_candidates = _iter_fenced_json_candidates(result_text)
+    candidate_texts = fenced_candidates if fenced_candidates else [result_text.strip()]
+
+    schema_valid_candidates: list[dict[str, Any]] = []
+    for candidate_text in candidate_texts:
+        try:
+            candidate = json.loads(candidate_text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            jsonschema.validate(candidate, schema)
+        except (jsonschema.exceptions.ValidationError, jsonschema.exceptions.SchemaError):
+            continue
+        schema_valid_candidates.append(candidate)
+
+    if len(schema_valid_candidates) != 1:
+        return None
+    return schema_valid_candidates[0]
 
 
 def build_agent_invocation_argv(
