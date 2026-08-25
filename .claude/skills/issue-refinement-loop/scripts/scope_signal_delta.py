@@ -742,6 +742,13 @@ def _normalize_exact_repository_path_literal(candidate: str) -> str | None:
         return None
     if "\\" in candidate or "://" in candidate or candidate.startswith("/"):
         return None
+    # #2333 AC4: an exact Allowed Paths literal must never carry an HTML/CF_HTML
+    # marker token. `<`/`>` reject any stray HTML tag or entity boundary, and
+    # the explicit CF_HTML marker check is a defense-in-depth guard should the
+    # marker ever appear pre-normalized without a plain `<` (e.g. through an
+    # upstream partial decode).
+    if "<" in candidate or ">" in candidate or "<!--StartFragment" in candidate:
+        return None
     normalized = _normalize_path(candidate)
     if not normalized or "/" not in normalized or normalized.startswith("/"):
         return None
@@ -763,6 +770,12 @@ def _is_unsafe_path_literal(candidate: str) -> bool:
     if "\x00" in candidate or "\n" in candidate or "\r" in candidate:
         return True
     if "\\" in candidate or "://" in candidate or candidate.startswith("/"):
+        return True
+    # #2333 AC4: an HTML/CF_HTML-tagged token (e.g. an injected <script> tag
+    # riding along a legitimate-looking path segment) must make the whole
+    # mixed directive unsafe, not merely fail to normalize into a silently
+    # dropped literal.
+    if "<" in candidate or ">" in candidate or "<!--StartFragment" in candidate:
         return True
     return any(part in {"", ".", ".."} for part in candidate.split("/"))
 
@@ -893,8 +906,16 @@ def detect_boundary_flags(text: "str | None", *, expands_allowed_paths: bool = F
     service usage, destructive/non-idempotent operations, or a need to split
     into a separate Issue. `expands_allowed_paths` is supplied by the caller
     (derived from an actual Allowed Paths diff, not text matching).
+
+    #2333 fix_delta (OWNER REQUEST_CHANGES P0-1): `text` is canonicalized via
+    `_cf_html_canonical_text()` before scanning so a CF_HTML/clipboard-
+    contaminated comment body is scanned on the SAME canonical view as
+    `extract_directive_markers()` / `extract_directive_items()` /
+    `classify_directive_confidence()` -- never the raw HTML+Markdown
+    envelope. See `_cf_html_canonical_text()` for why this must be the one
+    and only place each of those functions derives its working text from.
     """
-    haystack = text or ""
+    haystack = _cf_html_canonical_text(text)
     flags = {name: bool(pattern.search(haystack)) for name, pattern in _BOUNDARY_KEYWORD_PATTERNS.items()}
     flags["expands_allowed_paths"] = bool(
         expands_allowed_paths
@@ -936,8 +957,15 @@ def extract_directive_markers(text: "str | None") -> list:
     separate ``extract_severity_tags()`` function below; this function
     only ever detects the pre-existing fixed ``_DIRECTIVE_SECTION_MARKERS``
     set.
+
+    #2333 fix_delta (OWNER REQUEST_CHANGES P0-1): `text` is canonicalized
+    via `_cf_html_canonical_text()` before scanning, so a CF_HTML/clipboard-
+    contaminated comment body is scanned on the SAME canonical view as
+    `extract_directive_items()` / `detect_boundary_flags()` /
+    `classify_directive_confidence()` -- never the raw HTML+Markdown
+    envelope.
     """
-    lowered = (text or "").lower()
+    lowered = _cf_html_canonical_text(text).lower()
     markers = {marker for marker in _DIRECTIVE_SECTION_MARKERS if marker in lowered}
     return sorted(markers)
 
@@ -963,10 +991,154 @@ def extract_severity_tags(text: "str | None") -> list:
     return sorted(tags)
 
 
+# #2333: CF_HTML/clipboard envelope boundary. A CF_HTML clipboard paste
+# (produced by rich-text editors, see #2290) wraps a fragment of HTML between
+# ``<!--StartFragment-->``/``<!--EndFragment-->`` markers. When such a paste
+# lands in a GitHub anchor comment unmodified, the literal HTML precedes a
+# trailing Markdown rendition of the *same* content. This is intentionally a
+# narrow, deterministic marker-driven boundary scoped to the OBSERVED
+# #2290/#40/#77 artifact shape -- not a general Microsoft CF_HTML clipboard
+# format parser (that broader format allows arbitrary surrounding context,
+# multiple fragment pairs, etc. -- all out of scope here) -- so legitimate
+# GFM raw HTML (``<details>``/``<summary>`` etc., already used in Issue
+# bodies) that never carries these CF_HTML markers is left untouched.
+_CF_HTML_START_FRAGMENT_RE = re.compile(r"<!--\s*StartFragment\s*-->", re.IGNORECASE)
+_CF_HTML_END_FRAGMENT_RE = re.compile(r"<!--\s*EndFragment\s*-->", re.IGNORECASE)
+# #2333 fix_delta (OWNER REQUEST_CHANGES P0-2): the observed #2290/#40/#77
+# envelope always OPENS at the very start of the comment body with an outer
+# ``<html>``/``<body>`` wrapper immediately followed by the StartFragment
+# marker. Anchoring on this exact opening shape (rather than merely
+# searching for a StartFragment marker anywhere in the text) is what lets an
+# ordinary Markdown/prose mention of the marker strings -- including a
+# trailing Markdown tail that itself *explains* this exact technique in
+# backticks (the #2333 OWNER review comment that reported this bug is
+# itself such a case) -- pass through unmodified instead of being
+# misidentified as contamination.
+_CF_HTML_ENVELOPE_OPEN_RE = re.compile(
+    r"^\s*<html[^>]*>\s*<body[^>]*>\s*<!--\s*StartFragment\s*-->",
+    re.IGNORECASE | re.DOTALL,
+)
+# Outer wrapper close tags (``</body>``/``</html>``) that immediately follow
+# the genuine terminating EndFragment marker in the observed envelope shape.
+_CF_HTML_WRAPPER_CLOSE_RE = re.compile(
+    r"^\s*(?:</body>\s*)?(?:</html>\s*)?", re.IGNORECASE
+)
+
+
+def _canonicalize_cf_html_envelope(text: "str | None") -> "str | None":
+    """Canonicalize (or reject) a CF_HTML/clipboard-contaminated comment body.
+
+    Returns ``text`` unchanged when the text does not open with the
+    observed #2290/#40/#77 envelope shape -- an outer ``<html>``/``<body>``
+    wrapper immediately followed by a ``<!--StartFragment-->`` marker at the
+    very START of the comment body (see ``_CF_HTML_ENVELOPE_OPEN_RE``). This
+    covers both the overwhelming majority of anchor comments that carry no
+    CF_HTML marker at all, AND ordinary Markdown/prose that merely
+    *mentions* the marker strings (e.g. in backticks, to explain this exact
+    technique) without actually being wrapped in the envelope -- #2333
+    fix_delta (OWNER REQUEST_CHANGES P0-2): a bare marker-string mention
+    must never, by itself, invalidate an otherwise-clean directive.
+
+    When the envelope-open shape IS matched, the text from the end of the
+    FIRST ``<!--EndFragment-->`` marker that follows the opening
+    StartFragment (never the *last* EndFragment anywhere in the string --
+    a later, unrelated EndFragment mention further down in a duplicated
+    Markdown tail must never be mistaken for the genuine terminator; #2333
+    fix_delta OWNER REQUEST_CHANGES P0-2) -- with an immediately-following
+    HTML wrapper close tag sequence such as ``</body></html>`` stripped --
+    is taken as the canonical trailing Markdown-only content. This is the
+    #2290/#40/#77-shaped envelope: HTML wrapper -> StartFragment -> HTML
+    fragment -> EndFragment -> wrapper close -> duplicated Markdown.
+
+    Returns None (meaning: the caller must treat the directive as
+    disabled / not extractable) only when the envelope-open shape is
+    matched but the boundary genuinely cannot be uniquely determined:
+
+    - no ``<!--EndFragment-->`` marker follows the opening StartFragment at
+      all, or
+    - the trailing content (after stripping the wrapper-close tags) is
+      itself empty/whitespace-only, or immediately begins with another
+      nested/duplicate ``<!--StartFragment-->`` marker -- i.e. the
+      Markdown-only tail cannot be uniquely identified.
+
+    A mere mention of the marker strings, or of ``<html``/``<body`` text,
+    ANYWHERE INSIDE an otherwise-valid canonical tail (for example, a
+    regression-test fixture excerpt embedded later in the Markdown body)
+    does NOT trigger rejection -- only genuine structural ambiguity at the
+    tail's own boundary does.
+    """
+    if not text:
+        return text
+    open_match = _CF_HTML_ENVELOPE_OPEN_RE.match(text)
+    if open_match is None:
+        # Either no StartFragment marker anywhere, or one appears without
+        # the observed envelope-open shape at the start of the body -- an
+        # unrelated mention in ordinary Markdown/prose. Pass through
+        # byte-for-byte unchanged.
+        return text
+    end_match = _CF_HTML_END_FRAGMENT_RE.search(text, open_match.end())
+    if end_match is None:
+        # A genuine envelope open with no terminator anywhere -- the
+        # fragment boundary cannot be uniquely determined.
+        return None
+    trailing = text[end_match.end():]
+    wrapper_close_match = _CF_HTML_WRAPPER_CLOSE_RE.match(trailing)
+    if wrapper_close_match:
+        trailing = trailing[wrapper_close_match.end():]
+    if _CF_HTML_START_FRAGMENT_RE.match(trailing.lstrip()):
+        # A nested/duplicate envelope immediately follows -- the
+        # Markdown-only tail cannot be uniquely identified.
+        return None
+    canonical = trailing.strip()
+    if not canonical:
+        return None
+    return canonical
+
+
+def _cf_html_canonical_text(text: "str | None") -> str:
+    """Canonicalize CF_HTML/clipboard contamination exactly once, so every
+    semantic extractor (`extract_directive_markers`, `detect_boundary_flags`,
+    `classify_directive_confidence`, `extract_directive_items`) observes the
+    SAME canonical view of a comment body for the same raw input -- never a
+    mix of the raw HTML+Markdown envelope and the canonicalized Markdown-only
+    tail.
+
+    #2333 fix_delta (OWNER REQUEST_CHANGES P0-1): the production call site
+    (`_build_scope_delta_authority_evidence()` in `run_refinement_preflight.py`)
+    calls each of those four functions independently with the SAME raw
+    `comment_body`. Because `_canonicalize_cf_html_envelope()` is a pure,
+    deterministic function of its input, having every one of those four
+    functions canonicalize via this single helper -- rather than relying on
+    the call site to canonicalize once and thread a shared value through --
+    is behaviorally equivalent (same raw input -> same canonical output,
+    every time) while keeping the boundary entirely inside this module.
+
+    Returns `""` (not `None`) when canonicalization determines the directive
+    is disabled/unextractable, so every caller can treat the return value as
+    ordinary text without a separate `None` branch.
+    """
+    canonical = _canonicalize_cf_html_envelope(text)
+    return canonical if canonical is not None else ""
+
+
 def extract_directive_items(text: "str | None") -> list:
-    """Extract bullet-list lines (candidate directive text) from a comment body."""
+    """Extract bullet-list lines (candidate directive text) from a comment body.
+
+    #2333: raw anchor comment bodies may contain a CF_HTML/clipboard envelope
+    (``<!--StartFragment-->``/``<!--EndFragment-->`` markers wrapping HTML
+    that duplicates a trailing Markdown rendition of the same content, see
+    #2290). Such an envelope is canonicalized -- or the whole comment is
+    treated as having no extractable directive -- via
+    ``_canonicalize_cf_html_envelope()`` *before* bullet-line extraction, so
+    contamination never reaches the bullet items this function returns (and
+    therefore never reaches the downstream contract-patch operations built
+    from them).
+    """
+    canonical = _canonicalize_cf_html_envelope(text)
+    if canonical is None:
+        return []
     items = []
-    for line in (text or "").splitlines():
+    for line in (canonical or "").splitlines():
         stripped = line.strip()
         if stripped.startswith("- ") or stripped.startswith("* "):
             content = stripped[2:].strip()
@@ -1001,7 +1173,18 @@ def classify_directive_confidence(
     entirely by the caller-supplied ``operator_asserted_human_context`` flag,
     which is only ever ``True`` for the human-context lane -- see
     ``_resolve_scope_delta_source_kind()`` in ``run_refinement_preflight.py``).
+
+    #2333 fix_delta (OWNER REQUEST_CHANGES P0-1): `text` is canonicalized
+    via `_cf_html_canonical_text()` at entry, before the bullet check and
+    before falling back to `extract_directive_markers(text)`, so this
+    function's own view of the comment body is the SAME canonical view as
+    `extract_directive_markers()` / `detect_boundary_flags()` /
+    `extract_directive_items()` -- never a mix of the raw HTML+Markdown
+    envelope and the canonicalized Markdown-only tail. A caller-supplied
+    `markers` argument is trusted as-is (it is expected to already be the
+    canonical-view output of `extract_directive_markers()`).
     """
+    text = _cf_html_canonical_text(text)
     marker_list = markers if markers is not None else extract_directive_markers(text)
     has_bullets = bool(_BULLET_LINE_RE.search(text or ""))
     if not marker_list:
