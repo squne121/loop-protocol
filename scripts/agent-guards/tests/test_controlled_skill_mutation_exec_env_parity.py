@@ -167,6 +167,15 @@ def test_edit_issue_txn_sanitize_key_list_matches_controlled_executor():
     assert set(_txn._GH_ENV_SANITIZE_KEYS) == set(ENV_SANITIZE_KEYS)
 
 
+def test_workflow_capability_preflight_sanitize_key_list_matches_controlled_executor():
+    claude_gpt_dir = Path(__file__).resolve().parents[3] / "scripts" / "claude-gpt"
+    if str(claude_gpt_dir) not in sys.path:
+        sys.path.insert(0, str(claude_gpt_dir))
+    import workflow_capability_preflight as _wcp
+
+    assert set(_wcp._ENV_SANITIZE_KEYS) == set(ENV_SANITIZE_KEYS)
+
+
 def test_edit_issue_txn_fetch_issue_uses_sanitized_env(monkeypatch):
     if str(_EDIT_ISSUE_SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(_EDIT_ISSUE_SCRIPTS_DIR))

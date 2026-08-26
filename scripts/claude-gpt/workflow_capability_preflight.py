@@ -53,16 +53,46 @@ if str(_GUARDS_DIR) not in sys.path:
 import trusted_runtime_capabilities as trusted_uv_mod  # noqa: E402
 
 # Issue #2340 AC2/AC3: the `controlled_github_read` actor-scoped probe below
-# reuses the SAME ambient-env sanitize-key set as
+# needs the SAME ambient-env sanitize-key set as
 # `controlled_skill_mutation_exec.py::_build_metadata_sanitized_env()`
-# (imported, not duplicated, since this module already adds
-# `scripts/agent-guards` to `sys.path` for `trusted_runtime_capabilities`
-# above) so this preflight's `controlled_github_read` verdict reflects the
-# EXACT credential/host context the downstream issue-editor / contract-update
-# lane executes its GitHub read/write subprocess calls under (Issue #2340
-# AC1 fixed that lane's own internal read/write asymmetry; this module must
-# not reintroduce a second, divergent sanitize-key list).
-from controlled_skill_mutation_policy import ENV_SANITIZE_KEYS  # noqa: E402
+# (`controlled_skill_mutation_policy.ENV_SANITIZE_KEYS`), so this preflight's
+# `controlled_github_read` verdict reflects the EXACT credential/host
+# context the downstream issue-editor / contract-update lane executes its
+# GitHub read/write subprocess calls under.
+#
+# This list is intentionally DUPLICATED here (not imported), matching the
+# same pattern `.claude/skills/edit-issue/scripts/edit_issue_txn.py`
+# already uses for the identical reason (see that module's
+# `_GH_ENV_SANITIZE_KEYS` comment): `workflow_capability_preflight.py` is
+# copied verbatim -- WITHOUT `controlled_skill_mutation_policy.py` -- into
+# fixture harnesses that exercise the real
+# `skill_runtime_exec.py -> workflow_start_entry.py ->
+# root_entry_router.capability_preflight_result() ->
+# workflow_capability_preflight.py` chain (see
+# `.claude/skills/issue-refinement-loop/scripts/tests/
+# test_workflow_start_entry_canonical_executor.py`). A top-level import of
+# `controlled_skill_mutation_policy` here would make this module
+# unimportable inside that fixture even though it only exercises the plain
+# GitHub-read capability path, not any controlled-mutation policy. A parity
+# test (`scripts/agent-guards/tests/
+# test_controlled_skill_mutation_exec_env_parity.py`) asserts this list stays
+# in sync with the canonical source.
+_ENV_SANITIZE_KEYS = (
+    "PUBLISH_ARTIFACT_DIR",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "GH_EDITOR",
+    "EDITOR",
+    "VISUAL",
+    "BROWSER",
+    "GH_HOST",
+    "GH_REPO",
+    "GH_CONFIG_DIR",
+    "GH_DEBUG",
+    "DEBUG",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
 
 SCHEMA = "CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1"
 SUPPORTED_PROFILES = ("issue-to-impl",)
@@ -192,10 +222,11 @@ def _sanitized_controlled_env() -> dict[str, str]:
     """Build the sanitized environment for the `controlled_github_read` probe
     below -- byte-for-byte the same policy
     `controlled_skill_mutation_exec.py::_build_metadata_sanitized_env()` uses
-    (Issue #2340 AC1/AC2), imported via the shared `ENV_SANITIZE_KEYS`
-    constant so the two never drift independently."""
+    (Issue #2340 AC1/AC2). Uses the locally duplicated `_ENV_SANITIZE_KEYS`
+    (see the import-boundary comment above -- kept in sync by a parity
+    test, not by a shared import)."""
     env = os.environ.copy()
-    for key in ENV_SANITIZE_KEYS:
+    for key in _ENV_SANITIZE_KEYS:
         env.pop(key, None)
     env["GH_PROMPT_DISABLED"] = "1"
     env["GH_NO_UPDATE_NOTIFIER"] = "1"
