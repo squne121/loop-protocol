@@ -1845,19 +1845,115 @@ def build_repository_collector(repo_root: Path) -> Callable[[str], Any]:
     return _collect
 
 
+#: fixed, non-identity fields used by ``_default_observer_prompt`` below
+#: (Issue #2345 fix_delta, OWNER review
+#: https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+#: P1 item 1). The *identity* fields (``run_id``/``base_sha``/
+#: ``source_set_digest``) are never fixed placeholders -- ``run_cli()``
+#: calls ``_default_observer_prompt`` only AFTER its own internal
+#: ``prepare()`` step has produced the real ``ctx``/``plan`` for this run,
+#: and threads those real values in (see ``run_cli``'s prompt-building
+#: step below). An earlier version of this function embedded a fixed
+#: placeholder ``run_id`` that could never equal the real one, which made
+#: every invocation using it construct-to-fail at
+#: ``run_observer_wave()``'s ``bundle.run_id != ctx.run_id`` check instead
+#: of exercising the real, functional production call graph end-to-end --
+#: that design is no longer used (see the OWNER review URL above).
+_DEFAULT_PROMPT_EVIDENCE_REF = "default-prompt-evidence-ref"
+
+
+def _default_observer_prompt(observer_id: str, *, run_id: str, base_sha: str, source_set_digest: str) -> str:
+    """Issue #2345 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+    P1 items 1-2): the genuinely non-empty, REAL-identity default prompt
+    used for ``observer_id`` when ``main()``'s ``--prompts-file`` is not
+    supplied. ``run_cli()`` passes this function the SAME ``ctx.run_id`` /
+    ``ctx.base_sha`` / ``plan.source_set_digest`` its internal ``prepare()``
+    step produced for this run (never a fixed placeholder) -- see
+    ``run_cli``'s prompt-building step, executed after ``prepare()``
+    returns.
+
+    Background: prior to Issue #2345, the ``--prompts-file``-omitted
+    default was an empty string per observer (``prompts.get(observer_id,
+    "") -> ""``). Against the real ``claude`` CLI (observed on Claude Code
+    2.1.245), ``claude -p`` rejects an empty prompt argument before any
+    observer output is produced at all -- ``Error: Input must be provided
+    either through stdin or as a prompt argument when using --print``, exit
+    code 1. This is an empty-prompt invocation contract mismatch between
+    this module's (former) default and the real CLI's documented ``-p``
+    contract (a caller-side default that never supplied a prompt at all),
+    not a Claude Code CLI-side regression -- rejecting an explicitly empty
+    prompt is a reasonable caller-contract enforcement on the CLI's part
+    (see Issue #2345, https://github.com/squne121/loop-protocol/issues/2345).
+
+    This default asks ``observer_id`` to emit a schema-conformant
+    ``OBSERVER_RESULT_V1`` (``EvidenceBundle``) JSON envelope that echoes
+    the run's REAL identity fields verbatim, with an empty ``findings``
+    list (no caller-supplied evidence is provided along this
+    ``--prompts-file``-omitted path). A real, successful invocation
+    therefore satisfies ``run_observer_wave()``'s ``bundle.run_id !=
+    ctx.run_id`` / ``source_set_digest`` / ``base_sha`` checks and lets the
+    production call graph continue past the observer wave into the
+    evaluator, delta, and ``finalize`` phases -- the genuine end-to-end
+    completion this default is now designed to reach, rather than a
+    construct-to-fail identity mismatch."""
+    return (
+        f"observer_id={observer_id}. No caller-supplied evidence was "
+        "provided (this is run_retrospective.py's own default prompt, used "
+        "only when --prompts-file is omitted -- Issue #2345). Respond with "
+        "EXACTLY one JSON object (no markdown fence, no prose) conforming "
+        "to OBSERVER_RESULT_V1 (EvidenceBundle):\n"
+        "{\n"
+        '  "schema_version": "observer_result/v1",\n'
+        f'  "run_id": "{run_id}",\n'
+        f'  "base_sha": "{base_sha}",\n'
+        f'  "source_set_digest": "{source_set_digest}",\n'
+        f'  "observer_id": "{observer_id}",\n'
+        f'  "evidence_ref": "{_DEFAULT_PROMPT_EVIDENCE_REF}",\n'
+        '  "findings": []\n'
+        "}\n"
+        "Echo the run_id/base_sha/source_set_digest/observer_id/"
+        "evidence_ref fields above verbatim; do not invent evidence or "
+        "findings beyond an empty findings list."
+    )
+
+
 def build_observer_requests(
     *, schema_dir: Path, cwd: str, prompts: dict[str, str], timeout_sec: int = 300
 ) -> list[AgentInvocationRequest]:
     """Build the exact 3-observer ``AgentInvocationRequest`` list matching
     ``EXPECTED_OBSERVER_MANIFEST`` (Issue #2237 P0-2/P0-6). ``prompts`` maps
-    each ``observer_id`` to the prompt text the root Skill (or ``main``'s
-    ``--prompts-file``) has already assembled -- this function never
-    resolves session/evidence content itself (that remains the root Skill's
-    trigger-time responsibility)."""
+    each ``observer_id`` to the prompt text the caller (the root Skill via
+    ``main``'s ``--prompts-file``, or ``run_cli``'s own
+    ``_default_observer_prompt`` fallback -- Issue #2345) has already
+    assembled -- this function never resolves session/evidence content
+    itself (that remains the root Skill's trigger-time responsibility).
+
+    Issue #2345 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+    P2 item 3): every ``observer_id`` in ``EXPECTED_OBSERVER_MANIFEST``
+    MUST have a non-empty (post-``strip()``) prompt in ``prompts`` -- a
+    missing key or an empty/whitespace-only string is rejected fail-closed
+    with a typed ``WireContractError`` (``reason_code=
+    "invalid_observer_prompts"``) here, locally, before any ``claude`` CLI
+    subprocess is ever invoked. This replaces the previous silent
+    ``prompts.get(spec.observer_id, "")`` fallback, which let an
+    incomplete/partial caller-supplied ``prompts`` dict silently reproduce
+    the original empty-prompt-reaches-the-CLI bug this Issue fixes."""
+    missing_or_empty = [
+        spec.observer_id
+        for spec in EXPECTED_OBSERVER_MANIFEST
+        if not str(prompts.get(spec.observer_id, "")).strip()
+    ]
+    if missing_or_empty:
+        raise WireContractError(
+            f"invalid_observer_prompts:missing_or_empty={sorted(missing_or_empty)}",
+            reason_code="invalid_observer_prompts",
+        )
     return [
         AgentInvocationRequest(
             agent_name=spec.observer_id,
-            prompt=prompts.get(spec.observer_id, ""),
+            prompt=prompts[spec.observer_id],
             json_schema_path=str(schema_dir / "observer_result_v1.schema.json"),
             cwd=cwd,
             timeout_sec=timeout_sec,
@@ -1874,7 +1970,7 @@ def run_cli(
     request_id: str,
     idempotency_key: str,
     schema_dir: Path,
-    prompts: dict[str, str],
+    prompts: dict[str, str] | None = None,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     git_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     clock: Callable[[], datetime] = _utcnow,
@@ -1895,7 +1991,19 @@ def run_cli(
     non-zero exit code). ``previous_state_provider`` defaults to an empty
     ``FixturePreviousStateProvider`` -- a real, persistence-backed provider
     (#2238) can be injected here without any other change to this call
-    graph."""
+    graph.
+
+    ``prompts`` (Issue #2345 fix_delta, OWNER review
+    https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+    P1 item 1): ``None`` (the default, matching ``main()`` when
+    ``--prompts-file`` is omitted) means "build the default observer
+    prompts AFTER this call graph's own ``prepare()`` step below has
+    produced the REAL ``ctx.run_id``/``ctx.base_sha``/
+    ``plan.source_set_digest`` for this run" -- never a fixed placeholder
+    identity. A caller-supplied dict (from ``--prompts-file``, or a direct
+    test/Skill caller) is used as-is and validated by
+    ``build_observer_requests`` (every manifest ``observer_id`` must map to
+    a non-empty prompt)."""
     manual_trigger_preflight(repo_root=repo_root)
     resolved_run_id = run_id or str(uuid.uuid4())
     policy = DelegatedAgentPermissionPolicy(run_id=resolved_run_id)
@@ -1913,7 +2021,22 @@ def run_cli(
         ctx, plan, results = prepare(
             base_sha_resolver=_base_sha_resolver, collectors=collectors, clock=clock, run_id=resolved_run_id
         )
-        observer_requests = build_observer_requests(schema_dir=schema_dir, cwd=str(repo_root), prompts=prompts)
+        resolved_prompts = (
+            prompts
+            if prompts is not None
+            else {
+                spec.observer_id: _default_observer_prompt(
+                    spec.observer_id,
+                    run_id=ctx.run_id,
+                    base_sha=ctx.base_sha,
+                    source_set_digest=plan.source_set_digest,
+                )
+                for spec in EXPECTED_OBSERVER_MANIFEST
+            }
+        )
+        observer_requests = build_observer_requests(
+            schema_dir=schema_dir, cwd=str(repo_root), prompts=resolved_prompts
+        )
 
         def _invoke(request: AgentInvocationRequest) -> AgentInvocationResult:
             run_scoped_env = {
@@ -2006,7 +2129,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    prompts: dict[str, str] = {}
+    # Issue #2345 fix_delta (OWNER review
+    # https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+    # P1 item 1): when `--prompts-file` is omitted, `prompts` is left as
+    # `None` -- `run_cli()` builds the default prompts itself, AFTER its
+    # own internal `prepare()` step has produced this run's REAL
+    # `ctx.run_id`/`ctx.base_sha`/`plan.source_set_digest` (see
+    # `_default_observer_prompt`'s docstring). `main()` cannot build those
+    # defaults here because `run_id`/`base_sha` do not exist yet at this
+    # point in the call graph.
+    prompts: dict[str, str] | None = None
     if args.prompts_file:
         prompts = json.loads(Path(args.prompts_file).read_text(encoding="utf-8"))
 

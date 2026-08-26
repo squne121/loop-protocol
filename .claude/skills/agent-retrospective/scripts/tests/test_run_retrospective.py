@@ -1006,7 +1006,14 @@ def test_executable_entrypoint_collectors_to_publish_request(tmp_path: Path) -> 
         request_id="req-cli-1",
         idempotency_key="idem-cli-1",
         schema_dir=schema_dir,
-        prompts={},
+        # Issue #2345 fix_delta P1/P2: `prompts=None` exercises the
+        # production `--prompts-file`-omitted default-prompt path
+        # (`run_cli()` builds real-identity default prompts itself); the
+        # fake `_runner` above derives observer identity from `kwargs["env"]`
+        # (the same run-scoped env `run_cli()` always injects) rather than
+        # prompt content, so this default-prompt path is exercised without
+        # changing this test's own assertions.
+        prompts=None,
         runner=_runner,
         git_runner=_git_runner,
         run_id="run-cli-1",
@@ -1760,7 +1767,11 @@ def test_temp_scope_is_on_production_path_and_cleanup_failure_surfaces(tmp_path:
             request_id="req",
             idempotency_key="idem",
             schema_dir=schema_dir,
-            prompts={},
+            # Issue #2345 fix_delta P1/P2: `prompts=None` exercises the
+            # production default-prompt path (built from real ctx/plan
+            # identity); `_runner` below forces `api_error` regardless of
+            # prompt content, so `ObserverWaveFailed` is still reached.
+            prompts=None,
             runner=_runner,
             git_runner=_git_runner,
             run_id="run-temp-1",
@@ -1991,7 +2002,10 @@ def test_compute_delta_wired_into_production_publish_path_run_cli(tmp_path: Path
         request_id="req-cli-delta-1",
         idempotency_key="idem-cli-delta-1",
         schema_dir=schema_dir,
-        prompts={},
+        # Issue #2345 fix_delta P1/P2: `prompts=None` exercises the
+        # production default-prompt path; `_runner` above derives observer
+        # identity from `kwargs["env"]`, not prompt content.
+        prompts=None,
         runner=_runner,
         git_runner=_git_runner,
         run_id="run-cli-delta-1",
@@ -2083,8 +2097,125 @@ def test_build_observer_requests_default_schema_dir_points_at_committed_schemas(
     `run_cli()`/`main()` use in production must resolve to the exact
     directory containing the two schema assets this Issue adds -- not a
     stale/placeholder path."""
-    requests = rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=str(tmp_path), prompts={})
+    # Issue #2345 fix_delta P2: build_observer_requests() now rejects an
+    # empty/missing prompt per manifest entry -- supply a valid non-empty
+    # prompt for every observer_id so this test only exercises what it
+    # actually asserts (schema_dir resolution).
+    valid_prompts = {spec.observer_id: f"prompt for {spec.observer_id}" for spec in rr.EXPECTED_OBSERVER_MANIFEST}
+    requests = rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=str(tmp_path), prompts=valid_prompts)
     assert requests
     for request in requests:
         assert Path(request.json_schema_path) == _SCHEMA_DIR / "observer_result_v1.schema.json"
         assert Path(request.json_schema_path).is_file()
+
+
+# ---------------------------------------------------------------------------
+# Issue #2345 fix_delta (OWNER review
+# https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+# P2 item 4): hermetic (non-live, fake-runner-based) regression coverage
+# for the `--prompts-file`-omitted default-prompt path.
+# ---------------------------------------------------------------------------
+
+
+def test_default_observer_prompts_use_real_run_identity_not_placeholder(tmp_path: Path) -> None:
+    """(a) every default observer prompt `run_cli()` generates when
+    `prompts=None` (the `--prompts-file`-omitted case) is non-empty, and
+    (b) reflects the REAL run identity (`ctx.run_id`/`ctx.base_sha`/
+    `plan.source_set_digest`) rather than a fixed placeholder that could
+    never legitimately match -- the construct-to-fail design this
+    fix_delta replaces (see `_default_observer_prompt`'s docstring). The
+    production `run_cli()` call graph completing end-to-end into a real
+    `PublishRequest` (never raising `ObserverWaveFailed` at
+    `observer_run_id_mismatch`) is itself proof the threaded identity
+    matched."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    def _git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=_FULL_SHA + "\n", stderr="")
+
+    real_observation = rr.build_repository_collector(repo_root)(_FULL_SHA).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+
+    captured_prompts: dict[str, str] = {}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        agent_name = argv[argv.index("--agent") + 1]
+        if agent_name == "retrospective-evaluator":
+            evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
+            evaluation = rr.Evaluation(
+                run_id=evaluator_request.run_id,
+                base_sha=_FULL_SHA,
+                source_set_digest=evaluator_request.source_set_digest,
+                candidate_records=[],
+                evidence_ref="e",
+            )
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(evaluation.to_wire()))), stderr=""
+            )
+        captured_prompts[agent_name] = kwargs["input"]
+        bundle = rr.EvidenceBundle(
+            run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
+            base_sha=kwargs["env"].get("AGENT_RETROSPECTIVE_BASE_SHA", ""),
+            source_set_digest=expected_digest,
+            observer_id=agent_name,
+            evidence_ref="evidence://default",
+            findings=[],
+        )
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(bundle.to_wire()))), stderr=""
+        )
+
+    publish_request = rr.run_cli(
+        repo_root=repo_root,
+        repository_id="squne121/loop-protocol",
+        target_issue=2237,
+        request_id="req-default-prompt-1",
+        idempotency_key="idem-default-prompt-1",
+        schema_dir=schema_dir,
+        prompts=None,
+        runner=_runner,
+        git_runner=_git_runner,
+        run_id="run-default-prompt-1",
+        temp_base_dir=tmp_path,
+    )
+
+    # THEN the real production call graph completed end-to-end into a
+    # PublishRequest -- it never raised ObserverWaveFailed at
+    # observer_run_id_mismatch, proving the default-prompt path's
+    # run_id/base_sha/source_set_digest genuinely matched this run.
+    assert isinstance(publish_request, rr.PublishRequest)
+    assert sorted(captured_prompts) == sorted(spec.observer_id for spec in rr.EXPECTED_OBSERVER_MANIFEST)
+    for observer_id, prompt in captured_prompts.items():
+        # (a) never empty
+        assert prompt.strip(), f"default prompt for {observer_id} must be non-empty"
+        # (b) reflects the REAL run identity, never a fixed placeholder
+        assert "run-default-prompt-1" in prompt
+        assert _FULL_SHA in prompt
+        assert expected_digest in prompt
+        assert "unset-default-prompt-run-id" not in prompt
+
+
+def test_build_observer_requests_rejects_missing_or_empty_prompt() -> None:
+    """(c) Issue #2345 fix_delta P2 item 3: a partial/incomplete
+    caller-supplied `prompts` dict -- a missing manifest key, or an
+    empty/whitespace-only string value -- is rejected locally with a typed
+    `invalid_observer_prompts` `WireContractError`, never silently
+    defaulted to `""` and passed through toward the `claude` CLI (the
+    original empty-prompt bug this Issue exists to fix)."""
+    complete_prompts = {spec.observer_id: "real prompt text" for spec in rr.EXPECTED_OBSERVER_MANIFEST}
+    missing_key_id = rr.EXPECTED_OBSERVER_MANIFEST[0].observer_id
+
+    partial_prompts = {k: v for k, v in complete_prompts.items() if k != missing_key_id}
+    with pytest.raises(rr.WireContractError) as missing_key_excinfo:
+        rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=".", prompts=partial_prompts)
+    assert missing_key_excinfo.value.reason_code == "invalid_observer_prompts"
+
+    empty_value_prompts = dict(complete_prompts)
+    empty_value_prompts[missing_key_id] = "   "  # whitespace-only -- empty after strip()
+    with pytest.raises(rr.WireContractError) as empty_value_excinfo:
+        rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=".", prompts=empty_value_prompts)
+    assert empty_value_excinfo.value.reason_code == "invalid_observer_prompts"
