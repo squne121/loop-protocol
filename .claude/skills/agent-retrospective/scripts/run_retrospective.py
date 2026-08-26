@@ -690,21 +690,52 @@ def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if k in _DEFAULT_ENV_PASSTHROUGH_ALLOWLIST}
 
 
-#: matches a single leading/trailing markdown code fence around a JSON blob
-#: (```json ... ``` or bare ``` ... ```), used only by
-#: `_structured_output_from_result_compat` below.
-_MARKDOWN_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*)\n```\s*$", re.DOTALL)
+#: Matches every markdown fence *delimiter* line (an opening line such as
+#: ```json / ```text / ```python / bare ``` , OR a closing bare ``` line),
+#: allowing up to 3 leading spaces of indent per GFM. `_iter_fenced_json_candidates`
+#: below pairs up consecutive fence-delimiter matches (1st+2nd, 3rd+4th, ...)
+#: as (opener, closer) regardless of the opener's info string, then filters
+#: pairs down to those whose opener info string is "" or "json"
+#: (case-insensitive). This fixes Issue #2348's regression where a
+#: foreign-language fenced block (e.g. ```text ... ```) appearing before the
+#: real ```json ... ``` block had its own *closing* fence misread as a new
+#: bare *opening* fence by the prior opener-only regex, silently swallowing
+#: the real JSON block's closing fence and making the real candidate vanish
+#: from `finditer()` results entirely.
+_FENCE_DELIMITER_RE = re.compile(r"^[ \t]{0,3}```([^\n`]*)$", re.MULTILINE)
 
 
-def _extract_fenced_json_text(text: str) -> str:
-    """Strip a single leading/trailing markdown code fence from `text` if
-    present (returns `text` stripped of surrounding whitespace unchanged
-    otherwise). Pure string transform -- callers still parse/validate the
-    result themselves (Issue #2301 live verification compat recovery, see
-    `_structured_output_from_result_compat`)."""
-    stripped = text.strip()
-    match = _MARKDOWN_JSON_FENCE_RE.match(stripped)
-    return match.group(1).strip() if match else stripped
+def _iter_fenced_json_candidates(text: str) -> list[str]:
+    """Enumerate the body text of every JSON-eligible markdown fenced code
+    block found anywhere within `text`, in encounter order (Issue #2348).
+
+    Unlike the pre-#2348 implementation, which matched only ```json / bare
+    ``` *opener* fences directly via a single regex (and thus silently
+    misread a foreign-language fence's *closing* delimiter as a new bare
+    opener, corrupting subsequent fence pairing -- see
+    `_FENCE_DELIMITER_RE` docstring), this scans every backtick fence
+    delimiter line first, regardless of its info string, and pairs them up
+    sequentially (1st opener + 2nd closer, 3rd opener + 4th closer, ...).
+    Only pairs whose opener info string is "" or "json" (case-insensitive)
+    are returned as JSON candidates; foreign-language fences (```text,
+    ```python, ...) are paired and skipped, not misread as delimiters of an
+    unrelated block. An unpaired trailing fence (odd total delimiter count)
+    is ignored. Pure string transform -- callers still parse/validate each
+    candidate themselves (`_structured_output_from_result_compat`)."""
+    fence_matches = list(_FENCE_DELIMITER_RE.finditer(text))
+    candidates: list[str] = []
+    for opener, closer in zip(fence_matches[0::2], fence_matches[1::2]):
+        info = opener.group(1).strip().lower()
+        if info not in ("", "json"):
+            continue
+        content_start = opener.end()
+        if content_start < len(text) and text[content_start] == "\n":
+            content_start += 1
+        content = text[content_start:closer.start()]
+        if content.endswith("\n"):
+            content = content[:-1]
+        candidates.append(content.strip())
+    return candidates
 
 
 def _structured_output_from_result_compat(
@@ -723,30 +754,60 @@ def _structured_output_from_result_compat(
     --json-schema ...` invocations, which populate `structured_output`
     directly, these custom-subagent invocations were observed to omit
     `structured_output` and instead carry the schema-conformant JSON in
-    `result` (frequently wrapped in a markdown ```json code fence). This is
-    an observation about invocations actually exercised, not an absolute
-    claim covering every possible custom-subagent invocation. The recovered
-    payload is accepted only if it independently, strictly validates against
+    `result` (frequently wrapped in a markdown ```json code fence, with the
+    fence itself sometimes preceded and/or followed by explanatory prose --
+    Issue #2348 root cause: the prior whole-string anchor regex required the
+    fence to be the *entire* `result` text and silently failed on this
+    common shape). This is an observation about invocations actually
+    exercised, not an absolute claim covering every possible custom-subagent
+    invocation.
+
+    Recovery strategy (Issue #2348): every markdown fenced code block found
+    anywhere in `result` (see `_iter_fenced_json_candidates`) is treated as
+    an independent JSON candidate; if `result` contains no fence at all, the
+    whole (stripped) `result` text is treated as the sole candidate
+    (preserves the pre-#2348 behavior for unfenced `result` text). Each
+    candidate is independently parsed with `json.loads` and, only if that
+    succeeds and yields a dict, independently, strictly validated against
     the exact schema file this invocation was given (`request.
     json_schema_path`) -- mirrors the Issue #2237 P0-1 rationale against
-    re-parsing the *wrapper* itself as the business schema: a
-    malformed/absent `result`, or one that fails schema validation, is never
-    silently accepted as `ok`."""
+    re-parsing the *wrapper* itself as the business schema. The recovered
+    payload is returned only when EXACTLY ONE candidate both parses as JSON
+    and passes schema validation: zero schema-valid candidates is the
+    pre-existing `missing_structured_output` fail-closed outcome, and MORE
+    THAN ONE schema-valid candidate is treated as ambiguous and also
+    rejected (fail-closed) rather than guessing which fence is the intended
+    business payload. A malformed/absent `result`, or one where no
+    candidate passes schema validation, is never silently accepted as
+    `ok`."""
     result_text = payload.get("result")
     if not isinstance(result_text, str) or not result_text.strip():
         return None
     try:
-        candidate = json.loads(_extract_fenced_json_text(result_text))
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(candidate, dict):
-        return None
-    try:
         schema = json.loads(Path(json_schema_path).read_text(encoding="utf-8"))
-        jsonschema.validate(candidate, schema)
-    except (OSError, json.JSONDecodeError, jsonschema.exceptions.ValidationError, jsonschema.exceptions.SchemaError):
+    except (OSError, json.JSONDecodeError):
         return None
-    return candidate
+
+    fenced_candidates = _iter_fenced_json_candidates(result_text)
+    candidate_texts = fenced_candidates if fenced_candidates else [result_text.strip()]
+
+    schema_valid_candidates: list[dict[str, Any]] = []
+    for candidate_text in candidate_texts:
+        try:
+            candidate = json.loads(candidate_text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            jsonschema.validate(candidate, schema)
+        except (jsonschema.exceptions.ValidationError, jsonschema.exceptions.SchemaError):
+            continue
+        schema_valid_candidates.append(candidate)
+
+    if len(schema_valid_candidates) != 1:
+        return None
+    return schema_valid_candidates[0]
 
 
 def build_agent_invocation_argv(
