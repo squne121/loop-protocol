@@ -29,6 +29,48 @@
 #   6   read 制限 settings が未生成または不正
 #   7   proxy 起動失敗（loopback bind / readiness / model alias を確認できない）
 
+# --- Herdr Agents session hint: self-reexec (#2332) ---
+# Herdr 内(HERDR_ENV=1)かつ呼び出し側が HERDR_AGENT を設定していない場合だけ、
+# foreground process 自身の初期環境に HERDR_AGENT=claude を設定して exactly once
+# self-reexec する。exec は "$0"/"$@" を保持するため、既存の
+# positional-argument parser(--check-only/--dry-run/--claude-bin/--)の挙動には
+# 影響しない。呼び出し側が既に非空の HERDR_AGENT を設定している場合はその値を
+# exact に温存し、上書き・reexec のいずれも行わない。Herdr 外
+# (HERDR_ENV が unset または 1 以外)では常に no-op。
+# 2 回目の実行では HERDR_AGENT が既に非空になっているため、この分岐は
+# 自然に再発火しない(loop counter / state file は使わない)。
+#
+# P1 fix-delta (OWNER REQUEST_CHANGES, PR #2349 review comment): Issue #2332 の
+# Outcome は「Herdr 内の通常起動(実際に claude 本体を起動するモード)を claude と
+# 認識させる」ことに限定される。`--check-only`(claude 本体を起動しない
+# preflight-only mode。runtime_smoke_test.sh から使用)や `--dry-run`(副作用なしで
+# 実行予定を JSON 表示するのみ)は claude を一切起動しないため、これらの
+# invocation にまで hint を付けるのは false-positive recognition になる。
+# 完全な positional-argument parser(下記)を複製せず、副作用のない小さな
+# argv pre-scan だけを行う: launcher-level `--` より前の位置に
+# `--check-only` または `--dry-run` が現れる invocation だけを
+# 「claude を起動しない non-agent mode」と判定し、その場合は hint injection
+# (export + exec) を丸ごと skip する。self-reexec 自体の配置(lib.sh source より
+# 前)は変更しない。
+_herdr_hint_launcher_mode=true
+for _herdr_hint_arg in "$@"; do
+  case "$_herdr_hint_arg" in
+    --)
+      break
+      ;;
+    --check-only | --dry-run)
+      _herdr_hint_launcher_mode=false
+      break
+      ;;
+  esac
+done
+
+if [ "$HERDR_ENV" = "1" ] && [ -z "$HERDR_AGENT" ] && [ "$_herdr_hint_launcher_mode" = "true" ]; then
+  export HERDR_AGENT=claude
+  exec /bin/sh "$0" "$@"
+fi
+unset _herdr_hint_launcher_mode _herdr_hint_arg
+
 SELF_PATH=$0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
 # shellcheck source=./lib.sh
