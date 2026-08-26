@@ -29,6 +29,10 @@ Covers AC1/AC2 (In Scope items 1-2 of Issue #2348):
       negative case: ambiguous multi-fence match is fail-closed, not
       silently resolved by picking one candidate or greedily merging fences
       (guards the Stop Condition against a new cross-fence-merge defect)
+  test_prose_fence_foreign_language_fence_before_json_fence_recovered
+      P1 regression: foreign-language fence (e.g. ```text) before the
+      real ```json fence must not corrupt fence pairing and swallow the
+      real JSON candidate
 """
 
 from __future__ import annotations
@@ -172,3 +176,35 @@ def test_prose_fence_multiple_schema_valid_candidates_ambiguous_rejected(tmp_pat
 
     assert result.status == "malformed_output"
     assert result.reason_code == "missing_structured_output"
+
+
+def test_prose_fence_foreign_language_fence_before_json_fence_recovered(tmp_path: Path) -> None:
+    """GIVEN a `result` text containing a foreign-language fenced block
+    (e.g. ```text) BEFORE the real fenced JSON block (Issue #2348 P1
+    regression: the opener-only fence regex misread the foreign block's own
+    closing fence as a new bare opening fence, corrupting fence pairing so
+    the real ```json block's closing fence -- and thus the real JSON
+    candidate itself -- never appeared in `finditer()` results, reproducing
+    `missing_structured_output` for the common "analysis with a text/code
+    example, then the final JSON answer" LLM response shape)
+    WHEN `invoke_agent` runs compatibility recovery
+    THEN the real fenced JSON block is still correctly extracted and
+    schema-validated as `structured_output`."""
+    schema_path = _schema(tmp_path)
+    business_payload = {"a": "from-json-fence-after-foreign-fence"}
+    result_text = (
+        "Here is an example of the input format:\n\n"
+        "```text\n"
+        "some non-json illustrative content\n"
+        "```\n\n"
+        "Final answer:\n\n"
+        "```json\n"
+        + json.dumps(business_payload)
+        + "\n```\n"
+    )
+    runner = _runner_for_result(result_text)
+
+    result = rr.invoke_agent(_invocation_request(str(schema_path)), runner=runner)
+
+    assert result.status == "ok"
+    assert result.structured_output == business_payload

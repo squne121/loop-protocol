@@ -690,29 +690,52 @@ def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if k in _DEFAULT_ENV_PASSTHROUGH_ALLOWLIST}
 
 
-#: matches every markdown fenced code block (```json ... ``` or bare
-#: ``` ... ```) that may appear anywhere within a larger text, including one
-#: surrounded by explanatory prose before and/or after the fence (Issue
-#: #2348) -- non-greedy so multiple distinct fences in the same text are
-#: enumerated separately rather than collapsed into one greedy match. Used
-#: only by `_structured_output_from_result_compat` below.
-_FENCED_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
+#: Matches every markdown fence *delimiter* line (an opening line such as
+#: ```json / ```text / ```python / bare ``` , OR a closing bare ``` line),
+#: allowing up to 3 leading spaces of indent per GFM. `_iter_fenced_json_candidates`
+#: below pairs up consecutive fence-delimiter matches (1st+2nd, 3rd+4th, ...)
+#: as (opener, closer) regardless of the opener's info string, then filters
+#: pairs down to those whose opener info string is "" or "json"
+#: (case-insensitive). This fixes Issue #2348's regression where a
+#: foreign-language fenced block (e.g. ```text ... ```) appearing before the
+#: real ```json ... ``` block had its own *closing* fence misread as a new
+#: bare *opening* fence by the prior opener-only regex, silently swallowing
+#: the real JSON block's closing fence and making the real candidate vanish
+#: from `finditer()` results entirely.
+_FENCE_DELIMITER_RE = re.compile(r"^[ \t]{0,3}```([^\n`]*)$", re.MULTILINE)
 
 
 def _iter_fenced_json_candidates(text: str) -> list[str]:
-    """Enumerate the body text of every markdown fenced code block found
-    anywhere within `text`, in encounter order, non-greedy and
-    non-overlapping (Issue #2348). Pure string transform -- callers still
-    parse/validate each candidate themselves
-    (`_structured_output_from_result_compat`). Unlike the prior
-    `_extract_fenced_json_text` helper this superseded, this does NOT
-    require the fence to span the entire (stripped) input: fenced JSON
-    preceded and/or followed by prose is now discoverable, which is the
-    common real-world `--agent <custom-subagent>` response shape (fenced
-    JSON block followed, or surrounded, by explanatory text) that the prior
-    whole-string `^...$` anchor regex silently failed to match, producing a
-    spurious `missing_structured_output`."""
-    return [match.group(1).strip() for match in _FENCED_JSON_BLOCK_RE.finditer(text)]
+    """Enumerate the body text of every JSON-eligible markdown fenced code
+    block found anywhere within `text`, in encounter order (Issue #2348).
+
+    Unlike the pre-#2348 implementation, which matched only ```json / bare
+    ``` *opener* fences directly via a single regex (and thus silently
+    misread a foreign-language fence's *closing* delimiter as a new bare
+    opener, corrupting subsequent fence pairing -- see
+    `_FENCE_DELIMITER_RE` docstring), this scans every backtick fence
+    delimiter line first, regardless of its info string, and pairs them up
+    sequentially (1st opener + 2nd closer, 3rd opener + 4th closer, ...).
+    Only pairs whose opener info string is "" or "json" (case-insensitive)
+    are returned as JSON candidates; foreign-language fences (```text,
+    ```python, ...) are paired and skipped, not misread as delimiters of an
+    unrelated block. An unpaired trailing fence (odd total delimiter count)
+    is ignored. Pure string transform -- callers still parse/validate each
+    candidate themselves (`_structured_output_from_result_compat`)."""
+    fence_matches = list(_FENCE_DELIMITER_RE.finditer(text))
+    candidates: list[str] = []
+    for opener, closer in zip(fence_matches[0::2], fence_matches[1::2]):
+        info = opener.group(1).strip().lower()
+        if info not in ("", "json"):
+            continue
+        content_start = opener.end()
+        if content_start < len(text) and text[content_start] == "\n":
+            content_start += 1
+        content = text[content_start:closer.start()]
+        if content.endswith("\n"):
+            content = content[:-1]
+        candidates.append(content.strip())
+    return candidates
 
 
 def _structured_output_from_result_compat(
