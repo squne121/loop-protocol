@@ -200,6 +200,25 @@ def test_workflow_capability_degrades_preferred_spark_incompatibility(monkeypatc
     # branch is ever reached.
     monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
     monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: True)
+    # Issue #2340 AC2: `controlled_github_read` is a REQUIRED capability that
+    # fails closed with priority over the Spark route's OPTIONAL `degraded`
+    # signal (see `test_actor_scoped_capability_probe.py::
+    # test_root_read_pass_controlled_read_fail_blocks_before_downstream_actor`,
+    # which asserts `controlled_github_unavailable` blocks regardless of any
+    # other signal). Without pinning this probe to `ready`, a CI runner
+    # without a live, sanitized-env `gh api` route would report
+    # decision=blocked via `controlled_github_unavailable` before the Spark
+    # fallback_only -> degraded branch under test is ever reached.
+    monkeypatch.setattr(
+        wcp,
+        "_controlled_github_read_capability",
+        lambda repo: {
+            "status": wcp.ACTOR_CAPABILITY_READY,
+            "reason_code": None,
+            "fallback_route": None,
+            "probe_execution_class": "controlled_gh_api_repo_read",
+        },
+    )
     result = wcp.assess(
         project_root=str(_REPO_ROOT),
         profile="issue-to-impl",
