@@ -71,7 +71,16 @@ def test_workflow_capability_returns_structured_result():
     assert result["schema"] == "CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1"
     assert result["profile"] == "issue-to-impl"
     assert result["decision"] in ("ready", "degraded", "blocked")
-    assert set(result.keys()) == {"schema", "profile", "decision", "checks", "reasons"}
+    assert set(result.keys()) == {
+        "schema", "profile", "decision", "checks", "reasons", "actor_capabilities",
+    }
+    # Issue #2340 AC2: actor/execution-substrate-scoped capability entries.
+    assert set(result["actor_capabilities"].keys()) == {
+        "root_github_read", "controlled_github_read", "delegated_research_agy", "spark_delegation",
+    }
+    for entry in result["actor_capabilities"].values():
+        assert set(entry.keys()) == {"status", "reason_code", "fallback_route", "probe_execution_class"}
+        assert entry["status"] in ("ready", "degraded", "unavailable")
     assert set(result["checks"].keys()) == {"uv", "spark", "github"}
     assert set(result["checks"]["uv"].keys()) == {"status", "reason", "diagnostic"}
     assert set(result["checks"]["spark"].keys()) == {"status"}

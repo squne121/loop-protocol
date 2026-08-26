@@ -293,6 +293,22 @@ def main() -> int:
         _save(state_path, state)
         return 0
 
+    if args[:2] == ["api", "--hostname"]:
+        # Issue #2340 AC2/AC6: `workflow_capability_preflight.py`'s
+        # `controlled_github_read` probe issues exactly
+        # `gh api --hostname <host> repos/<repo> --jq {name}` (sanitized-env,
+        # trusted-host-pinned, same shape the controlled executor's own read
+        # helpers use). Independent toggle from `FAKE_GH_REPO_READ_OK` (the
+        # plain `gh repo view` root-shell check) so a fixture can express the
+        # exact root-read-passes/controlled-read-fails asymmetry AC2 exists to
+        # catch. Defaults to "1" (succeeds) so callers that don't care about
+        # this distinction are unaffected.
+        if os.environ.get("FAKE_GH_CONTROLLED_READ_OK", "1") != "1":
+            print("fake gh: forced controlled-read probe failure", file=sys.stderr)
+            return 1
+        print(json.dumps({"name": "loop-protocol"}))
+        return 0
+
     if args[:2] == ["api", "graphql"]:
         number = None
         for i, value in enumerate(args):

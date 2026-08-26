@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -50,6 +52,18 @@ if str(_GUARDS_DIR) not in sys.path:
 
 import trusted_runtime_capabilities as trusted_uv_mod  # noqa: E402
 
+# Issue #2340 AC2/AC3: the `controlled_github_read` actor-scoped probe below
+# reuses the SAME ambient-env sanitize-key set as
+# `controlled_skill_mutation_exec.py::_build_metadata_sanitized_env()`
+# (imported, not duplicated, since this module already adds
+# `scripts/agent-guards` to `sys.path` for `trusted_runtime_capabilities`
+# above) so this preflight's `controlled_github_read` verdict reflects the
+# EXACT credential/host context the downstream issue-editor / contract-update
+# lane executes its GitHub read/write subprocess calls under (Issue #2340
+# AC1 fixed that lane's own internal read/write asymmetry; this module must
+# not reintroduce a second, divergent sanitize-key list).
+from controlled_skill_mutation_policy import ENV_SANITIZE_KEYS  # noqa: E402
+
 SCHEMA = "CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1"
 SUPPORTED_PROFILES = ("issue-to-impl",)
 
@@ -61,6 +75,14 @@ SPARK_NOT_REQUIRED = "not_required"
 SPARK_ELIGIBLE = "eligible"
 SPARK_FALLBACK_ONLY = "fallback_only"
 SPARK_UNAVAILABLE = "unavailable"
+
+# Issue #2340 AC2: actor/execution-substrate-scoped capability status enum.
+# Distinct from the overall `decision` enum (`ready`/`degraded`/`blocked`) --
+# these are per-actor entries reported ALONGSIDE the overall verdict, not a
+# replacement for it.
+ACTOR_CAPABILITY_READY = "ready"
+ACTOR_CAPABILITY_DEGRADED = "degraded"
+ACTOR_CAPABILITY_UNAVAILABLE = "unavailable"
 
 # A small, static registry of GitHub operations this repository has an
 # actual implemented route for (Issue #2223: NOT a persistent
@@ -128,13 +150,27 @@ def _spark_capability(
     return SPARK_UNAVAILABLE
 
 
+# Issue #2340 AC8: this module does not own timeout/deadline management
+# (Issue #2322 owns nested-timeout / shared-deadline unification -- this
+# Issue does not reimplement it, per Out of Scope). The constant below is
+# scoped narrowly to exception-handling correctness: `subprocess.
+# TimeoutExpired` is NOT a subclass of `OSError`, so the pre-existing
+# `except OSError:` guards on the two functions below (and the new
+# `_controlled_github_read_capability` further down) silently let a `gh`
+# subprocess hang propagate as an UNCAUGHT exception instead of failing
+# closed into this module's existing `unavailable`/`False` return contract.
+# No new timeout reason-code taxonomy is introduced by this fix -- a future
+# shared-deadline abstraction (#2322) can still wrap these calls unchanged.
+_SUBPROCESS_TIMEOUT_EXCEPTIONS = (OSError, subprocess.TimeoutExpired)
+
+
 def _github_auth_ok() -> bool:
     try:
         proc = subprocess.run(
             ["gh", "auth", "status"], capture_output=True, text=True, timeout=30, check=False
         )
         return proc.returncode == 0
-    except OSError:
+    except _SUBPROCESS_TIMEOUT_EXCEPTIONS:
         return False
 
 
@@ -148,8 +184,135 @@ def _github_repo_read_ok(repo: str) -> bool:
             check=False,
         )
         return proc.returncode == 0
-    except OSError:
+    except _SUBPROCESS_TIMEOUT_EXCEPTIONS:
         return False
+
+
+def _sanitized_controlled_env() -> dict[str, str]:
+    """Build the sanitized environment for the `controlled_github_read` probe
+    below -- byte-for-byte the same policy
+    `controlled_skill_mutation_exec.py::_build_metadata_sanitized_env()` uses
+    (Issue #2340 AC1/AC2), imported via the shared `ENV_SANITIZE_KEYS`
+    constant so the two never drift independently."""
+    env = os.environ.copy()
+    for key in ENV_SANITIZE_KEYS:
+        env.pop(key, None)
+    env["GH_PROMPT_DISABLED"] = "1"
+    env["GH_NO_UPDATE_NOTIFIER"] = "1"
+    return env
+
+
+def _root_github_read_capability(github_auth: bool, github_repo_read: bool) -> dict:
+    """Actor-scoped entry (Issue #2340 AC2): the root/main process's own
+    `gh auth status` + `gh repo view` probe, ambient-env, unsanitized. This is
+    the check root preflight has ALWAYS made -- kept here unchanged so its
+    result can be compared side-by-side against `controlled_github_read`
+    below (AC2/AC7 `same_identity` comparison input)."""
+    if github_auth and github_repo_read:
+        return {
+            "status": ACTOR_CAPABILITY_READY,
+            "reason_code": None,
+            "fallback_route": None,
+            "probe_execution_class": "root_shell_gh_repo_view",
+        }
+    reason_code = "root_github_auth_unavailable" if not github_auth else "root_github_repo_read_failed"
+    return {
+        "status": ACTOR_CAPABILITY_UNAVAILABLE,
+        "reason_code": reason_code,
+        "fallback_route": None,
+        "probe_execution_class": "root_shell_gh_repo_view",
+    }
+
+
+def _controlled_github_read_capability(repo: str) -> dict:
+    """Actor-scoped entry (Issue #2340 AC2/AC3): a read-only,
+    consumer-equivalent probe that uses the SAME sanitized env + trusted-host
+    pin the controlled executor's GitHub read/write helpers use (after the
+    AC1 parity fix), instead of substituting the root shell's ambient
+    `gh auth status`. This lets a credential/host context that would only
+    surface downstream as `gh_issue_fetch_failed_rc_4` (inside
+    `issue_body.update`) be classified BEFORE that actor is ever launched."""
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "--hostname", "github.com", f"repos/{repo}", "--jq", "{name}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env=_sanitized_controlled_env(),
+        )
+    except _SUBPROCESS_TIMEOUT_EXCEPTIONS:
+        return {
+            "status": ACTOR_CAPABILITY_UNAVAILABLE,
+            "reason_code": "controlled_github_unavailable",
+            "fallback_route": None,
+            "probe_execution_class": "controlled_gh_api_repo_read",
+        }
+    if proc.returncode == 0:
+        return {
+            "status": ACTOR_CAPABILITY_READY,
+            "reason_code": None,
+            "fallback_route": None,
+            "probe_execution_class": "controlled_gh_api_repo_read",
+        }
+    return {
+        "status": ACTOR_CAPABILITY_UNAVAILABLE,
+        "reason_code": "controlled_github_unavailable",
+        "fallback_route": None,
+        "probe_execution_class": "controlled_gh_api_repo_read",
+    }
+
+
+def _delegated_research_agy_capability() -> dict:
+    """Actor-scoped entry (Issue #2340 AC2/AC3): a lightweight, read-only
+    availability probe for the AGY delegation route (`agy` binary presence
+    only -- no OAuth/keyring behavior change, per Out of Scope). AGY is an
+    advisory/optional provider: absence degrades to the existing
+    `agy_not_found` taxonomy value (`.claude/skills/gemini-cli-headless-
+    delegation/references/failure-class-taxonomy.md`) with a non-AGY fallback
+    route, rather than being reported `unavailable` outright -- the caller
+    (`issue-refinement-loop`) decides escalate-vs-fallback per AC3, this
+    preflight only reports observable availability."""
+    if shutil.which("agy"):
+        return {
+            "status": ACTOR_CAPABILITY_READY,
+            "reason_code": None,
+            "fallback_route": None,
+            "probe_execution_class": "agy_binary_which",
+        }
+    return {
+        "status": ACTOR_CAPABILITY_DEGRADED,
+        "reason_code": "agy_not_found",
+        "fallback_route": "codebase_investigator_non_agy",
+        "probe_execution_class": "agy_binary_which",
+    }
+
+
+def _spark_delegation_capability(spark_status: str) -> dict:
+    """Actor-scoped entry (Issue #2340 AC2): maps the existing
+    `_spark_capability()` verdict onto the shared ready/degraded/unavailable
+    enum (no new Spark judgment logic -- AC4/AC5 lazy-fallback semantics are
+    unchanged)."""
+    if spark_status in (SPARK_NOT_REQUIRED, SPARK_ELIGIBLE):
+        return {
+            "status": ACTOR_CAPABILITY_READY,
+            "reason_code": None,
+            "fallback_route": None,
+            "probe_execution_class": "spark_directive_env_probe",
+        }
+    if spark_status == SPARK_FALLBACK_ONLY:
+        return {
+            "status": ACTOR_CAPABILITY_DEGRADED,
+            "reason_code": "spark_fallback_only",
+            "fallback_route": "non_spark_agent",
+            "probe_execution_class": "spark_directive_env_probe",
+        }
+    return {
+        "status": ACTOR_CAPABILITY_UNAVAILABLE,
+        "reason_code": "spark_unavailable",
+        "fallback_route": None,
+        "probe_execution_class": "spark_directive_env_probe",
+    }
 
 
 def _operation_route(operation: str) -> str:
@@ -267,7 +430,29 @@ def assess(
                 f"{entry.get('actor_role', 'unknown')}; do not start this mutation-requiring phase"
             )
 
-    if missing_mutation_route or not github_auth or not github_repo_read:
+    # Issue #2340 AC2/AC3: actor/execution-substrate-scoped capability
+    # results, alongside (not replacing) the overall `decision` verdict
+    # above. `controlled_github_read` is the consumer-equivalent probe (#2/#3
+    # In Scope): if it is unavailable while root's own `gh auth status` still
+    # passed, that divergence is exactly the failure mode this Issue exists
+    # to catch BEFORE issue-editor / contract-update actors start (rather
+    # than surfacing only as their own `gh_issue_fetch_failed_rc_4`).
+    controlled_github_read = _controlled_github_read_capability(repo)
+    actor_capabilities = {
+        "root_github_read": _root_github_read_capability(github_auth, github_repo_read),
+        "controlled_github_read": controlled_github_read,
+        "delegated_research_agy": _delegated_research_agy_capability(),
+        "spark_delegation": _spark_delegation_capability(spark_status),
+    }
+    controlled_github_unavailable = controlled_github_read["status"] == ACTOR_CAPABILITY_UNAVAILABLE
+    if controlled_github_unavailable:
+        reasons.append(
+            "controlled_github_unavailable: the consumer-equivalent read-only GitHub probe "
+            "(same sanitized env / trusted host the issue-editor / contract-update lane uses) "
+            "failed; do not start those actors until this is resolved"
+        )
+
+    if missing_mutation_route or not github_auth or not github_repo_read or controlled_github_unavailable:
         decision = DECISION_BLOCKED
     elif not uv_ok or spark_status == SPARK_UNAVAILABLE:
         decision = DECISION_BLOCKED
@@ -293,6 +478,7 @@ def assess(
                 "operations": operations,
             },
         },
+        "actor_capabilities": actor_capabilities,
         "reasons": reasons,
     }
 

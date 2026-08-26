@@ -651,11 +651,38 @@ def _extract_http_status(stderr: str) -> int | None:
     return None
 
 
+# Issue #2340 AC5: actor capability artifact / worklog sanitization. `gh`
+# does not normally echo credential values into stderr, but this is a
+# defense-in-depth belt for the one branch below (`_classify_gh_error`'s
+# unknown-pattern fallback) that ever includes ANY caller-observed process
+# output in its return value -- every other branch here already returns a
+# fixed, credential-free canonical string. Redaction runs BEFORE bounding, so
+# a token that happens to fall within the truncation window never survives.
+_SECRET_LIKE_PATTERNS = (
+    _re.compile(r"gh[oprsu]_[A-Za-z0-9]{20,}"),
+    _re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    _re.compile(r"(?i)\bauthorization:\s*bearer\s+\S+"),
+    _re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]{16,}"),
+)
+
+
+def _redact_secret_like_tokens(text: str) -> str:
+    """Redact GitHub-token-shaped and Authorization-header-shaped
+    substrings from a diagnostic string before it is ever bounded/returned
+    (Issue #2340 AC5)."""
+    redacted = text
+    for pattern in _SECRET_LIKE_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
 def _classify_gh_error(prefix: str, stderr: str) -> str:
     """Classify a gh api failure into a deterministic error code.
 
     403 -> permission_denied, 404/410 -> ambiguous_no_retry, 422 -> validation_failed,
-    429/503 -> rate_limited, unknown -> the raw truncated stderr.
+    429/503 -> rate_limited, unknown -> the redacted, truncated stderr (Issue
+    #2340 AC5: reason_code / bounded sanitized diagnostic only -- never a raw
+    credential/token value, even in this fallback branch).
     """
     status = _extract_http_status(stderr)
     if status == 403:
@@ -666,7 +693,7 @@ def _classify_gh_error(prefix: str, stderr: str) -> str:
         return f"{prefix}_validation_failed_http_422"
     if status in (429, 503):
         return f"{prefix}_rate_limited_http_{status}"
-    return f"{prefix}: {stderr.strip()[:200]}"
+    return f"{prefix}: {_redact_secret_like_tokens(stderr.strip())[:200]}"
 
 
 # -- Issue #1284: issue body / comment mutation helpers ------------------------
@@ -746,7 +773,16 @@ def _fetch_issue_body_and_updated_at(issue_number: int, repo: str, gh_bin: str) 
 
 
 def _patch_issue_body(issue_number: int, repo: str, new_body: str, gh_bin: str) -> str:
-    """PATCH issue body via gh api argv-list (no gh issue edit CLI). Returns error or ''."""
+    """PATCH issue body via gh api argv-list (no gh issue edit CLI). Returns error or ''.
+
+    Issue #2340 AC1 (P0 credential parity): this write path previously
+    inherited the caller's ambient environment while the sibling read helpers
+    (`_fetch_issue_content` / `_fetch_issue_body_and_updated_at`) explicitly
+    passed `env=_build_metadata_sanitized_env()`. That asymmetry let a read
+    and a write in the same logical transaction execute under different
+    GitHub credential/host contexts. This now pins the trusted host and
+    sanitized env identically to the read helpers.
+    """
     import tempfile
 
     try:
@@ -758,6 +794,8 @@ def _patch_issue_body(issue_number: int, repo: str, new_body: str, gh_bin: str) 
                 [
                     gh_bin,
                     "api",
+                    "--hostname",
+                    _TRUSTED_GITHUB_HOST,
                     "--method",
                     "PATCH",
                     f"repos/{repo}/issues/{issue_number}",
@@ -768,6 +806,7 @@ def _patch_issue_body(issue_number: int, repo: str, new_body: str, gh_bin: str) 
                 text=True,
                 timeout=15,
                 shell=False,
+                env=_build_metadata_sanitized_env(),
             )
         finally:
             try:
@@ -821,7 +860,12 @@ def _patch_issue_content(issue_number: int, repo: str, title: str, body: str, gh
 
 
 def _post_gh_comment(issue_number: int, repo: str, body: str, gh_bin: str) -> tuple[str, str, str]:
-    """POST a comment via gh api argv-list. Returns (comment_url, comment_id, error)."""
+    """POST a comment via gh api argv-list. Returns (comment_url, comment_id, error).
+
+    Issue #2340 AC1: same-transaction issue comment publish route -- pinned to
+    the trusted host and sanitized env for parity with the issue body
+    read/write helpers above (previously inherited ambient env unsanitized).
+    """
     import tempfile
 
     try:
@@ -833,6 +877,8 @@ def _post_gh_comment(issue_number: int, repo: str, body: str, gh_bin: str) -> tu
                 [
                     gh_bin,
                     "api",
+                    "--hostname",
+                    _TRUSTED_GITHUB_HOST,
                     "--method",
                     "POST",
                     f"repos/{repo}/issues/{issue_number}/comments",
@@ -843,6 +889,7 @@ def _post_gh_comment(issue_number: int, repo: str, body: str, gh_bin: str) -> tu
                 text=True,
                 timeout=15,
                 shell=False,
+                env=_build_metadata_sanitized_env(),
             )
         finally:
             try:

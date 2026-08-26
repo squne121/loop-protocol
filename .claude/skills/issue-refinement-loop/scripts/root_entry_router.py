@@ -454,12 +454,14 @@ def capability_preflight_result(
             return {
                 "decision": "blocked",
                 "checks": {},
+                "actor_capabilities": {},
                 "reasons": [f"producer_invocation_failed:{exc.__class__.__name__}"],
             }
         if proc.returncode != 0:
             return {
                 "decision": "blocked",
                 "checks": {},
+                "actor_capabilities": {},
                 "reasons": [f"producer_invocation_failed:exit_{proc.returncode}"],
             }
         try:
@@ -468,6 +470,7 @@ def capability_preflight_result(
             return {
                 "decision": "blocked",
                 "checks": {},
+                "actor_capabilities": {},
                 "reasons": ["producer_result_malformed:non_json_stdout"],
             }
         if not isinstance(result, dict) or result.get("decision") not in (
@@ -478,11 +481,16 @@ def capability_preflight_result(
             return {
                 "decision": "blocked",
                 "checks": {},
+                "actor_capabilities": {},
                 "reasons": ["producer_result_malformed:invalid_decision"],
             }
         return {
             "decision": result.get("decision"),
             "checks": result.get("checks", {}),
+            # Issue #2340 AC2: forward the producer's actor/execution-substrate
+            # -scoped capability results verbatim (empty dict default keeps this
+            # backward compatible with any caller written before this Issue).
+            "actor_capabilities": result.get("actor_capabilities", {}),
             "reasons": result.get("reasons", []),
         }
     finally:
@@ -491,6 +499,86 @@ def capability_preflight_result(
                 Path(planned_ops_path).unlink(missing_ok=True)
             except Exception:  # noqa: BLE001 -- best-effort temp file cleanup
                 pass
+
+
+# Issue #2340 AC3: existing `.claude/skills/gemini-cli-headless-delegation`
+# failure_class taxonomy values this advisory-fallback decision consumes
+# verbatim (`references/failure-class-taxonomy.md`) -- no new reason code
+# names invented (In Scope item 4). Kept as an explicit allowlist so an
+# unrecognized/typo'd failure_class fails closed to escalation instead of
+# silently routing to a fallback for a failure this function cannot classify.
+_AGY_ADVISORY_FALLBACK_FAILURE_CLASSES = frozenset(
+    {
+        "agy_rate_limited",
+        "agy_capacity_exhausted",
+        "agy_web_grounding_quota_exhausted",
+        "agy_auth_required",
+        "agy_permission_denied",
+        "agy_not_found",
+        "agy_timeout",
+        "agy_exit_nonzero",
+        "agy_empty_stdout",
+        "agy_output_missing",
+        "agy_unexpected_error",
+        "agy_invocation_policy_denied",
+        "agy_permission_boundary_unavailable",
+        "agy_permission_boundary_inconclusive",
+    }
+)
+
+AGY_ROUTE_AGY = "agy"
+AGY_ROUTE_NON_AGY_FALLBACK = "codebase_investigator_non_agy"
+AGY_ROUTE_BLOCKED = "blocked"
+
+
+def resolve_agy_advisory_route(
+    *,
+    failure_class: Optional[str],
+    agy_required: bool,
+    fallback_allowed: bool,
+) -> dict:
+    """Issue #2340 AC3: decide whether an AGY-provider failure observed
+    during an ADVISORY (non-required) repository investigation should
+    escalate to terminal human judgment, or fall back to the non-AGY
+    `codebase-investigator` route.
+
+    Consumes the EXISTING `.claude/skills/gemini-cli-headless-delegation`
+    failure_class taxonomy verbatim -- this function invents no new
+    reason-code names (In Scope item 4). That skill's production behavior
+    itself is unchanged (Out of Scope): this is purely a routing decision
+    made by the CALLER of that skill.
+
+    - ``failure_class=None`` (no failure observed): route stays on AGY.
+    - ``agy_required=True``: AGY is not advisory for this task -- any
+      failure fails closed (``blocked``), regardless of ``fallback_allowed``.
+    - ``agy_required=False`` and ``fallback_allowed=True``: degrade to the
+      non-AGY fallback route instead of terminal human escalation.
+    - ``agy_required=False`` and ``fallback_allowed=False``: no fallback is
+      permitted for this invocation -- fail closed (``blocked``).
+    - An unrecognized ``failure_class`` (not in the existing taxonomy) fails
+      closed regardless of the other inputs.
+    """
+    if failure_class is None:
+        return {"route": AGY_ROUTE_AGY, "status": "ready", "reason_code": None}
+
+    if failure_class not in _AGY_ADVISORY_FALLBACK_FAILURE_CLASSES:
+        return {
+            "route": AGY_ROUTE_BLOCKED,
+            "status": "unavailable",
+            "reason_code": f"unrecognized_failure_class:{failure_class}",
+        }
+
+    if agy_required:
+        return {"route": AGY_ROUTE_BLOCKED, "status": "unavailable", "reason_code": failure_class}
+
+    if fallback_allowed:
+        return {
+            "route": AGY_ROUTE_NON_AGY_FALLBACK,
+            "status": "degraded",
+            "reason_code": failure_class,
+        }
+
+    return {"route": AGY_ROUTE_BLOCKED, "status": "unavailable", "reason_code": failure_class}
 
 
 @dataclass

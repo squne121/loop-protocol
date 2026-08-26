@@ -53,6 +53,58 @@ READINESS_SCRIPT = (
 # relationships.
 AGENT_GUARDS_IMPORT_ROOT = SCRIPT_PATH.parents[4] / "scripts" / "agent-guards"
 
+# Issue #2340 AC1 (P0 credential parity, item 3 in scope): every direct `gh`
+# invocation in this module is a pre-read / pre-check that feeds the same
+# controlled-executor transaction as the actual mutation
+# (`controlled_skill_mutation_exec.py`, invoked below via
+# `_invoke_controlled_exec`). That executor's GitHub read/write subprocess
+# calls run under `_build_metadata_sanitized_env()`, which strips
+# `GH_HOST` / `GH_REPO` / `GH_CONFIG_DIR` / `GH_TOKEN` / `GITHUB_TOKEN` (etc.)
+# from the ambient environment before calling `gh`. Before this fix, the `gh`
+# calls made directly from this module (`_fetch_issue`,
+# `_relationship_capability_preflight`, `_fetch_native_relationships`)
+# inherited the fully unsanitized ambient environment, so a pre-read could
+# observe a different GitHub identity/host/config than the write it gates.
+#
+# This list is intentionally duplicated (not imported) from
+# `scripts/agent-guards/controlled_skill_mutation_policy.ENV_SANITIZE_KEYS`:
+# title/body-only edit calls in this module must remain importable without
+# the `scripts/agent-guards` module tree present (see the comment on
+# `_load_validate_relationship_graph_invariants` below -- that tree is
+# excluded from the fake-git-repo harness used by
+# `scripts/agent-guards/tests/test_skill_runtime_exec_anchor.py`, which only
+# swaps in `controlled_skill_mutation_exec.py` at that boundary). A parity
+# test (`scripts/agent-guards/tests/test_controlled_skill_mutation_exec_env_parity.py`)
+# asserts both lists stay in sync.
+_GH_ENV_SANITIZE_KEYS = (
+    "PUBLISH_ARTIFACT_DIR",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "GH_EDITOR",
+    "EDITOR",
+    "VISUAL",
+    "BROWSER",
+    "GH_HOST",
+    "GH_REPO",
+    "GH_CONFIG_DIR",
+    "GH_DEBUG",
+    "DEBUG",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+
+def _sanitized_gh_env() -> dict[str, str]:
+    """Build the sanitized environment used for direct `gh` pre-read/pre-check
+    calls in this module (Issue #2340 AC1)."""
+    env = os.environ.copy()
+    for key in _GH_ENV_SANITIZE_KEYS:
+        env.pop(key, None)
+    env["GH_PROMPT_DISABLED"] = "1"
+    env["GH_NO_UPDATE_NOTIFIER"] = "1"
+    env["GH_HOST"] = "github.com"
+    return env
+
 
 def _load_validate_relationship_graph_invariants():
     if str(AGENT_GUARDS_IMPORT_ROOT) not in sys.path:
@@ -322,7 +374,7 @@ def _relationship_capability_preflight() -> tuple[bool, str]:
     gh = shutil.which("gh")
     if not gh:
         return False, "gh_binary_not_found"
-    cp = _run_command([gh, "auth", "status", "--hostname", "github.com"])
+    cp = _run_command([gh, "auth", "status", "--hostname", "github.com"], env=_sanitized_gh_env())
     if cp.returncode != 0:
         return False, "gh_auth_status_unreachable"
     return True, ""
@@ -360,7 +412,8 @@ def _fetch_native_relationships(issue_number: int, repo: str) -> tuple[dict[str,
             f"name={name}",
             "-F",
             f"number={issue_number}",
-        ]
+        ],
+        env=_sanitized_gh_env(),
     )
     if cp.returncode != 0:
         return None, _bounded(cp.stderr.strip() or cp.stdout.strip())
@@ -710,7 +763,7 @@ def _read_text_file(relative_path: str) -> str:
     return _safe_repo_file(relative_path).read_text(encoding="utf-8")
 
 
-def _run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_command(args: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             args,
@@ -719,6 +772,7 @@ def _run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
             shell=False,
             cwd=str(REPO_ROOT),
             timeout=CONTROLLED_EXEC_TIMEOUT_SECONDS,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(
@@ -741,7 +795,8 @@ def _child_error(cp: subprocess.CompletedProcess[str], code: str) -> dict[str, s
 def _fetch_issue(issue_number: int, repo: str) -> tuple[dict[str, Any] | None, str]:
     gh = shutil.which("gh") or "gh"
     cp = _run_command(
-        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "title,body,updatedAt"]
+        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "title,body,updatedAt"],
+        env=_sanitized_gh_env(),
     )
     if cp.returncode != 0:
         return None, _bounded(cp.stderr.strip() or cp.stdout.strip())
